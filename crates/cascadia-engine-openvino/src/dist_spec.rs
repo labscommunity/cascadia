@@ -2681,6 +2681,9 @@ impl OvDistSpecEngine {
         // catches the draft up so both align before `start_task` feeds one shared suffix.
         let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
         let Some((blob, len, plane_pulled)) = self.kv.take_warm(tenant, &prompt_i32) else {
+            tracing::info!(target: "cascadia::kv", event = "kv_warm_take_miss",
+                partner_hash = crate::kv_coordination::fnv1a64(tenant.as_bytes()),
+                prefix_len = prompt_i32.len());
             return 0;
         };
         let Some(parts) = crate::kv_coordination::unframe_blobs(&blob) else {

@@ -1294,6 +1294,9 @@ impl Qwen36Engine {
                             }
                         }
                         None => {
+                            tracing::info!(target: "cascadia::kv", event = "kv_warm_take_miss",
+                                partner_hash = crate::kv_coordination::fnv1a64(task.tenant.as_bytes()),
+                                prefix_len = prompt_i32.len());
                             cold_admit!();
                             0
                         }
@@ -1930,6 +1933,13 @@ impl Qwen36Engine {
                                 "qwen36 single-box warm-resumed from KV blob"
                             );
                             warm
+                        }
+                        None => {
+                            tracing::info!(target: "cascadia::kv", event = "kv_warm_take_miss",
+                                partner_hash = crate::kv_coordination::fnv1a64(task.tenant.as_bytes()),
+                                prefix_len = prompt_i32.len());
+                            self.reset_all();
+                            0
                         }
                         _ => {
                             self.reset_all();

@@ -949,6 +949,10 @@ impl Gemma4Engine {
                             warn!("gemma4: pipeline restore incomplete; cold reprefill");
                         }
                     }
+                } else {
+                    tracing::info!(target: "cascadia::kv", event = "kv_warm_take_miss",
+                        partner_hash = crate::kv_coordination::fnv1a64(task.tenant.as_bytes()),
+                        prefix_len = prompt_i32.len());
                 }
             }
             if warm_prefix == 0 {

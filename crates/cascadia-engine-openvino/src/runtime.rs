@@ -2165,6 +2165,10 @@ impl OvRuntimeEngine {
                             let _ = self.runtime.reset_state();
                         }
                     }
+                } else {
+                    tracing::info!(target: "cascadia::kv", event = "kv_warm_take_miss",
+                        partner_hash = crate::kv_coordination::fnv1a64(task.tenant.as_bytes()),
+                        prefix_len = prompt_i32.len());
                 }
             }
             if warm_prefix == 0 && self.static_kv.is_none() {
