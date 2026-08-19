@@ -250,6 +250,10 @@ impl crate::KvWarmHandoff for KvHandoffMailbox {
     fn clear(&self, epoch: u64) -> bool {
         KvHandoffMailbox::clear(self, epoch)
     }
+
+    fn set_on_take(&self, hook: Box<dyn Fn(u64) + Send + Sync>) {
+        KvHandoffMailbox::set_on_take(self, hook);
+    }
 }
 
 #[cfg(test)]
@@ -328,5 +332,39 @@ mod tests {
             mb.take(0x9).is_none(),
             "second take on an empty mailbox is a no-op"
         );
+    }
+
+    /// `Engine::kv_handoff` is the only handle an enterprise wrapper ever gets, and it returns
+    /// `Arc<dyn KvWarmHandoff>` — not the concrete `KvHandoffMailbox`. `take()` (the engine's own
+    /// drain) is inherent-only, so this mirrors the real wiring: register through the erased
+    /// trait object, drain through the concrete `Arc` the engine holds — same underlying mailbox,
+    /// reached two different ways, exactly as it will be split between enterprise and engine.
+    #[test]
+    fn on_take_is_reachable_through_the_kv_warm_handoff_trait_object() {
+        let mailbox = Arc::new(KvHandoffMailbox::new());
+        let handoff: Arc<dyn crate::KvWarmHandoff> = mailbox.clone();
+
+        let fires = Arc::new(AtomicU64::new(0));
+        let seen = Arc::new(AtomicU64::new(0));
+        let (fires2, seen2) = (Arc::clone(&fires), Arc::clone(&seen));
+        handoff.set_on_take(Box::new(move |epoch| {
+            fires2.fetch_add(1, Ordering::SeqCst);
+            seen2.store(epoch, Ordering::SeqCst);
+        }));
+
+        handoff.put(0x99, manifest(), vec![]);
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            0,
+            "hook must not fire before a take"
+        );
+
+        assert!(mailbox.take(0x99).is_some(), "drain must still succeed");
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            1,
+            "hook registered via the trait object must fire on the concrete mailbox's drain"
+        );
+        assert_eq!(seen.load(Ordering::SeqCst), 0x99);
     }
 }
