@@ -893,7 +893,12 @@ impl Gemma4Engine {
                     // level on THIS device? gemma4's head IR uniquely has cross_kv side-consumers on the
                     // KV concat. Mismatch ⇒ plugin set_state infidelity (mode A); exact ⇒ the warm≠cold
                     // delta is the cross_kv side-output reading a stale buffer (mode B, exporter fix).
-                    if set_ok {
+                    if set_ok
+                        && std::env::var("CASCADIA_GEMMA4_POSTPREFILL_FP")
+                            .ok()
+                            .as_deref()
+                            == Some("1")
+                    {
                         match self.runtime.get_state_blob() {
                             Ok(rt) => {
                                 let a = crate::kv_coordination::fnv1a64(&blob);
