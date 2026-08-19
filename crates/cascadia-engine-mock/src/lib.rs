@@ -42,8 +42,18 @@ impl Engine for MockEngine {
         }
         // Option B resume: the seed ids are already-emitted, so start the
         // echo cursor past them. They are never re-emitted by step().
-        let seed_len = cascadia_types::resume_generated_seed(task.resume_ids()).len();
-        self.pending.push((task, seed_len));
+        //
+        // Id-FIDELITY, not just length: the mock's own emitted id for position
+        // i is exactly `i` (see step()), so a resume seed claiming this stream
+        // must be [0..K). Length-only checking let a splicer that shuffled or
+        // corrupted ids pass every mock-based integration test (review).
+        let seed = task.resume_ids().map(<[i32]>::to_vec).unwrap_or_default();
+        if let Some((i, &bad)) = seed.iter().enumerate().find(|(i, &id)| id != *i as i32) {
+            return Err(EngineError::Backend(format!(
+                "mock resume seed id mismatch at {i}: got {bad}, this stream emitted {i}"
+            )));
+        }
+        self.pending.push((task, seed.len()));
         Ok(())
     }
 
