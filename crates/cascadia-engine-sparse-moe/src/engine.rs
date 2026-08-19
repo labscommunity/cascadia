@@ -1724,6 +1724,7 @@ impl SparseMoEEngine {
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
         chunk.n_tokens = Some(n_tokens);
         chunk.token_ids = generated;
+        chunk.prompt_tokens = Some(prompt_ids.len() as u32);
         chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
         vec![(task.task_id.clone(), chunk)]
     }
@@ -3795,6 +3796,7 @@ impl OvMoeEngine {
         );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
         chunk.n_tokens = Some(n_tokens);
+        chunk.prompt_tokens = Some(prompt_ids.len() as u32);
         chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
         vec![(task.task_id.clone(), chunk)]
     }
@@ -4285,6 +4287,7 @@ impl OvMoeEngine {
         );
         let mut chunk = Chunk::final_marker(a.id.clone(), "");
         chunk.n_tokens = Some(0);
+        chunk.prompt_tokens = Some(a.prompt_ids.len() as u32);
         chunk.finish_reason = Some(finish_reason_for(n_new as usize, a.max_new));
         vec![(a.id, chunk)]
     }

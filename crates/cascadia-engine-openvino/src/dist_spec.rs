@@ -1375,6 +1375,9 @@ struct ActiveSpec {
     /// Issue-34: the prompt tokens (capture key = prompt ++ out). `kv_coord` only.
     #[cfg(feature = "kv_coord")]
     prompt_ids: Vec<i64>,
+    /// Prompt token count, kept outside the `kv_coord` gate above so the
+    /// final chunk can always report `prompt_tokens`.
+    prompt_len: usize,
     /// Accumulated accepted tokens (including the first sampled token;
     /// preceded by the resume seed on a resumed turn).
     out: Vec<i64>,
@@ -1728,6 +1731,7 @@ impl OvDistSpecEngine {
             task,
             #[cfg(feature = "kv_coord")]
             prompt_ids: prompt_ids.to_vec(),
+            prompt_len: prompt_ids.len(),
             out,
             emitted,
             resume_seed_len,
@@ -1893,7 +1897,7 @@ impl OvDistSpecEngine {
                 is_final: true,
                 logprobs: None,
                 n_tokens: if n_tokens > 0 { Some(n_tokens) } else { None },
-                prompt_tokens: None,
+                prompt_tokens: Some(active.prompt_len as u32),
                 error: None,
                 token_ids,
                 finish_reason: None,
