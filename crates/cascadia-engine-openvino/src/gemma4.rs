@@ -1726,17 +1726,6 @@ impl cascadia_engine::KvCoordination for Gemma4Engine {
         Ok(())
     }
 
-    fn apply_warm_resume(&mut self, epoch: u64) -> bool {
-        // Plane path (§0(B), multi-rank downstream): the pull staged this rank's slice under `epoch`;
-        // set_state it now. Mirrors the RESTORE handler's local apply. step_first's take_warm then
-        // re-warms + sets position (idempotent double-set; gemma4 keeps no warm flag). Not on the
-        // total=1 path (the head warms its own rank-0 slice via take_warm).
-        match self.kv.take_capture(epoch) {
-            Some((_, blob)) => self.restore_blob_clean(&blob),
-            None => false,
-        }
-    }
-
     fn abort_warm_resume(&mut self, epoch: u64) {
         // Drop a STAGED slice first so a later commit cannot resurrect it.
         let _ = self.kv.take_capture(epoch);

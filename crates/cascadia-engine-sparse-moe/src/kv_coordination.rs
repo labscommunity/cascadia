@@ -503,10 +503,10 @@ impl KvCoordination for SparseMoEEngine {
         payloads: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ()> {
         let snap = wire_to_snapshot(manifest, payloads).ok_or(())?;
-        // Stage under the CONTENT EPOCH too. `apply_warm_resume` — the plane's commit — reads
-        // `kv_capture[epoch]`, but this only wrote the prefix cache (keyed by tokens), so a plane
-        // consumer-insert staged a slice the commit could never find and EVERY plane warm-resume
-        // silently voted cold. Done before the `enabled()` early-return: the plane path needs the
+        // Stage under the CONTENT EPOCH too. The worker RESTORE handler reads `kv_capture[epoch]`,
+        // but this only wrote the prefix cache (keyed by tokens), so a plane consumer-insert staged
+        // a slice the restore could never find and EVERY plane warm-resume silently voted cold.
+        // Done before the `enabled()` early-return: the plane path needs the
         // staging even where the prefix cache is off. Bounded by the same cap as
         // `capture_under_epoch` so staging cannot grow unbounded.
         {
@@ -547,30 +547,6 @@ impl KvCoordination for SparseMoEEngine {
         self.kv_prefix_cache
             .insert_pulled(partner, prefix, &fp, snap);
         Ok(())
-    }
-
-    fn apply_warm_resume(&mut self, epoch: u64) -> bool {
-        // Plane-driven warm-resume: restore the head's own rank-0 slice staged under `epoch`, then
-        // RESTORE the whole downstream chain (all-or-nothing). Mirrors the worker RESTORE handler's
-        // local apply. A head-local miss ⇒ false (the caller cold-runs; never a partial restore).
-        //
-        // Drain FIRST, never `local_ok || self.drain_kv_handoff()`. The node parks EVERY rank's
-        // slice — rank 0 included — so on a cross-chain pull this head holds both a mailbox slice
-        // and, from an earlier turn, its own same-epoch capture. A trailing `||` short-circuits the
-        // drain away: the head warms from the stale local capture, the pulled slice is never
-        // applied, and the verdict still reads true — a hollow warm nothing aborts (07d9bf2/a8fc4b4).
-        let local_ok = if self.drain_kv_handoff(epoch) {
-            true
-        } else {
-            match self.kv_capture.get(&epoch).cloned() {
-                Some((_ns, _t, snap)) => self.runner.restore_kv(&snap).is_ok(),
-                None => false,
-            }
-        };
-        if !local_ok {
-            return false;
-        }
-        self.forward_restore_downstream(epoch)
     }
 }
 

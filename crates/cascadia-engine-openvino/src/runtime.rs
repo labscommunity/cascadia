@@ -3914,7 +3914,7 @@ impl OvRuntimeEngine {
     }
 
     /// Plane warm-resume (§0(B)): set_state a pulled rank blob directly + arm warm, off the inference
-    /// chain. Mirrors the carried-blob RESTORE path; the holder loop drives it via `apply_warm_resume`.
+    /// chain. Mirrors the carried-blob RESTORE path.
     #[cfg(feature = "kv_coord")]
     pub(crate) fn apply_warm_resume_blob(&mut self, blob: &[u8]) -> bool {
         // Captured BEFORE set_state so the ledger can show whether the engine had already advanced past

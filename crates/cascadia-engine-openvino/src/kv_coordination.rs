@@ -1066,15 +1066,6 @@ impl KvCoordination for OvRuntimeEngine {
         Ok(())
     }
 
-    fn apply_warm_resume(&mut self, epoch: u64) -> bool {
-        // The pull staged this rank's slice under `epoch` (capture cache); set_state it now (plane path).
-        let blob = match self.kv_cache_mut().take_capture(epoch) {
-            Some((_tokens, blob)) => blob,
-            None => return false,
-        };
-        self.apply_warm_resume_blob(&blob)
-    }
-
     fn abort_warm_resume(&mut self, epoch: u64) {
         // Two cases, both handled: the slice is still STAGED (trigger ran, no commit) ⇒ drop it from the
         // capture cache so a later commit can't resurrect it; or it was already APPLIED (legacy/raced

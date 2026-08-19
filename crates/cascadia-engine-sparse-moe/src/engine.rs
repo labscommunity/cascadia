@@ -2406,9 +2406,9 @@ impl SparseMoEEngine {
 
     /// Issue-34 consume (§8): broadcast `RESTORE(epoch)` down the chain and return the all-or-nothing
     /// verdict (true ⇒ every downstream rank restored its slice). Used by the head admission trigger
-    /// (`step_first`) and the plane's `apply_warm_resume`. `total <= 1` or no downstream ⇒ nothing to
-    /// restore ⇒ true. Any transport error, a non-`RestoreAck` reply, or a verdict 0 ⇒ false ⇒ the
-    /// caller cold-falls-back (never a partial/corrupt warm).
+    /// (`step_first`). `total <= 1` or no downstream ⇒ nothing to restore ⇒ true. Any transport error,
+    /// a non-`RestoreAck` reply, or a verdict 0 ⇒ false ⇒ the caller cold-falls-back (never a
+    /// partial/corrupt warm).
     #[cfg(feature = "kv_coord")]
     pub(crate) fn forward_restore_downstream(&mut self, epoch: u64) -> bool {
         if self.total <= 1 {
@@ -3948,10 +3948,10 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
         payloads: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ()> {
         let snap = crate::ov_kv_coordination::ov_wire_to_snapshot(manifest, payloads).ok_or(())?;
-        // Stage under the CONTENT EPOCH too. `apply_warm_resume` — the plane's commit — reads
-        // `kv_capture[epoch]`, but this only wrote the prefix cache (keyed by tokens), so a plane
-        // consumer-insert staged a slice the commit could never find and EVERY plane warm-resume
-        // silently voted cold. Done before the `enabled()` early-return: the plane path needs the
+        // Stage under the CONTENT EPOCH too. `handle_restore` reads `kv_capture[epoch]`, but this
+        // only wrote the prefix cache (keyed by tokens), so a plane consumer-insert staged a slice
+        // the restore could never find and EVERY plane warm-resume silently voted cold. Done before
+        // the `enabled()` early-return: the plane path needs the
         // staging even where the prefix cache is off (sharded/total>1). Bounded by the same cap as
         // `capture_under_epoch` so staging cannot grow unbounded.
         {
@@ -4035,23 +4035,6 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
         }
         self.kv_downstream.insert(epoch, blob);
         Ok(())
-    }
-
-    fn apply_warm_resume(&mut self, epoch: u64) -> bool {
-        // Drain FIRST — the node parks EVERY rank's slice, rank 0 included, so a `||` here would let
-        // a stale local capture mask the pulled one. See `handle_restore`.
-        let local_ok = if self.drain_kv_handoff(epoch) {
-            true
-        } else {
-            match self.kv_capture.get(&epoch).cloned() {
-                Some((_ns, _t, snap)) => self.runner.restore_kv(&snap).is_ok(),
-                None => false,
-            }
-        };
-        if !local_ok {
-            return false;
-        }
-        self.forward_restore_downstream(epoch)
     }
 }
 

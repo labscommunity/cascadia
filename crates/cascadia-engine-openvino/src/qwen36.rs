@@ -2238,8 +2238,7 @@ impl Qwen36Engine {
     /// same two reasons ov-runtime calls it from `OPCODE_RESTORE`: it lands before the turn's forward,
     /// and it is the only site on the same stream as the commit that parks the slice.
     ///
-    /// Position 0 because this engine has no KV cursor to protect — see the note in
-    /// `apply_warm_resume`, where the same absence is why the plane depth is logged, not guarded.
+    /// Position 0 because this engine has no KV cursor to protect.
     fn drain_kv_handoff(&mut self, expected_epoch: u64) -> bool {
         let mailbox = std::sync::Arc::clone(&self.kv_handoff);
         let fp = self.kv_fingerprint();
@@ -2449,37 +2448,6 @@ impl cascadia_engine::KvCoordination for Qwen36Engine {
         let epoch = crate::kv_coordination::synth_epoch(&manifest.token_ids);
         self.kv.stash_downstream(epoch, rank, blob);
         Ok(())
-    }
-
-    fn apply_warm_resume(&mut self, epoch: u64) -> bool {
-        // Plane path (§0(B), multi-rank downstream): the pull staged this rank's slice under `epoch`;
-        // restore it now. Mirrors the InFrame::Restore handler's local apply. Not on the total=1 path
-        // (the head warms its own rank-0 slice via take_warm in step_first).
-        match self.kv.take_capture(epoch) {
-            Some((_, blob)) => {
-                // The head computes `warm` from RANK 0's slice alone and ships it to every rank as the
-                // FORWARD `pos`; this rank never computes its own restored depth, so a stage whose
-                // attention shape[2] differs folds the suffix at the wrong absolute offset (wrong
-                // RoPE/mask) with nothing to catch it. Within one healthy chain all ranks fold the same
-                // tokens, so depths agree by construction; the plane can break that, because its epoch
-                // is content-keyed (`synth_epoch(prefix)`) and two ranks may legitimately pull from
-                // DIFFERENT donor chains that captured at different lengths.
-                //
-                // A guard is cheap and does NOT need new wire fields: the head's value already arrives
-                // as the FORWARD header `pos` (see frame_header / the FORWARD parse), so stashing this
-                // depth and comparing on the next FORWARD would do it. Logged rather than guarded only
-                // because it is not on bar #1's path. Note a mis-phased conv/ssm state is invisible to
-                // any such check — those carry no depth at all.
-                //
-                // (ov-runtime's `kv_handoff_too_late` is NOT this guard: it compares its own advancing
-                // `position` against blob depth on a single-rank engine. qwen36 has no `self.position`.)
-                let depth = crate::kv_coordination::kv_seq_from_framed_blob(&blob).unwrap_or(0);
-                info!(epoch, rank_depth = depth, blob_len = blob.len(),
-                    "qwen36: plane apply — THIS rank's restored depth (compare vs head warm_prefix)");
-                self.restore_local_stages(&blob)
-            }
-            None => false,
-        }
     }
 
     fn abort_warm_resume(&mut self, epoch: u64) {
