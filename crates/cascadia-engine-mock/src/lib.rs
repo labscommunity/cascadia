@@ -256,6 +256,18 @@ mod tests {
     }
 
     #[test]
+    fn resume_with_wrong_ids_is_rejected() {
+        let mut e = MockEngine::new();
+        let mut task = GenerationTask::new("t1", "a b c d").with_max_tokens(64);
+        // Shuffled ids: right length, wrong content — a corrupted accumulator.
+        task.resume_token_ids = Some(vec![1, 0]);
+        assert!(
+            e.submit(task).is_err(),
+            "length-only consumption would have accepted a corrupt prefix"
+        );
+    }
+
+    #[test]
     fn resume_at_full_budget_emits_zero_new_tokens() {
         let mut e = MockEngine::new();
         // resume_token_ids covers the whole prompt and max_tokens equals
