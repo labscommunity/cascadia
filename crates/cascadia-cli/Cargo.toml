@@ -15,6 +15,13 @@ openvino = [
     "cascadia-engine-sparse-moe/openvino",
     "cascadia-ov-genai-shim/openvino",
 ]
+# Issue-34 Option C: the engine KV-coordination surface (holder + multi-stage capture/RESTORE +
+# the total>1 prefix cache). Off by default; needed to exercise cross-chain / multi-stage warm-resume
+# from the CLI (e.g. the 2-stage sparse-moe RESTORE validation).
+kv_coord = [
+    "cascadia-engine-sparse-moe/kv_coord",
+    "cascadia-engine-openvino/kv_coord",
+]
 # Embed the built SPA (crates/cascadia-dashboard/web/dist) into the binary.
 # Off by default so a fresh `cargo build` doesn't require `npm run build`
 # to have been run first. With this on, `cascadia worker --api` serves the

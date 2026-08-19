@@ -18,6 +18,11 @@ use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec,
 use futures::Stream;
 use thiserror::Error;
 
+#[cfg(feature = "kv_coord")]
+pub mod kv_handoff;
+#[cfg(feature = "kv_coord")]
+pub use kv_handoff::{KvHandoffMailbox, KvHandoffSlot};
+
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error("invalid configuration: {0}")]
@@ -183,6 +188,130 @@ pub type LoadStream = Pin<Box<dyn Stream<Item = LoadProgress> + Send>>;
 ///
 /// Implementations are not required to be `Send` themselves but the
 /// runner holds them behind a `Mutex`, so they MUST be `Send`.
+/// Issue-34 Option C: the engine's host-side KV export/import contract (the plane's `KvCoordination`
+/// boundary). An engine that holds a prefix KV cache returns `Some` from [`Engine::kv_coordination`];
+/// engines without one (mock / openvino) keep the default `None`. Wire-typed (`cascadia_kv_wire`) so
+/// the enterprise plane needs no engine-internal types. All host-side buffer ops — no device FFI.
+#[cfg(feature = "kv_coord")]
+pub trait KvCoordination {
+    /// This rank's model fingerprint — cache key + cross-rev guard.
+    fn model_fingerprint(&self) -> u64;
+    /// KV buffer layout version (codec rejects a mismatch).
+    fn layout_version(&self) -> u16;
+    /// Engine build revision (codec rejects a mismatch).
+    fn engine_rev(&self) -> u64;
+    /// Tokenize a rendered prompt with the engine's own tokenizer, so the head's NEGOTIATE uses the
+    /// exact token sequence the prefill will key the prefix cache on. `None` if no tokenizer.
+    fn tokenize(&self, text: &str) -> Option<Vec<i32>>;
+    /// NEGOTIATE: longest-common-prefix of `token_ids` against this holder's cache for `partner`.
+    /// Returns the stamped `(snapshot_epoch, prefix_token_len)`, or `None` ⇒ NotFound.
+    fn lookup(&mut self, partner: &str, token_ids: &[i32]) -> Option<(u64, u32)>;
+    /// GET: export the snapshot asserted by `(epoch, len)` → wire `Manifest` + per-layer `(k, v)`
+    /// byte payloads. `None` if the holder's `(epoch, len)` ≠ asserted (evicted / drifted).
+    fn export(
+        &mut self,
+        partner: &str,
+        expected_epoch: u64,
+        expected_len: u32,
+    ) -> Option<(cascadia_kv_wire::Manifest, Vec<(Vec<u8>, Vec<u8>)>)>;
+    /// Consumer INSERT: materialize a pulled, validated snapshot into the cache so the next prefill
+    /// auto-hits. `Err(())` ⇒ rejected / OOM (the rank votes fail).
+    ///
+    /// `partner` is the tenant the PULLER asserted in its own GET — never `manifest.partner`, which
+    /// the serving holder stamps and nothing validates (H.1b hard gate, design §12.10.0a). Keying on
+    /// the echoed value lets a hostile or misconfigured holder return a blob stamped `tenant-b` for
+    /// `tenant-a`'s pull: `tenant-a`'s warm resume silently goes cold, and `tenant-b`'s next
+    /// NEGOTIATE against this node answers `Some((epoch, len))` for a prefix it never sent — the
+    /// incremental length oracle H.1 exists to close, re-opened by a remote party.
+    #[allow(clippy::result_unit_err)]
+    fn insert(
+        &mut self,
+        partner: &str,
+        manifest: &cascadia_kv_wire::Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()>;
+    /// Issue-34 multi-stage: stash a pulled DOWNSTREAM rank's snapshot (rank ≠ this head) for inline
+    /// delivery in the head's `RESTORE` frame — the head can't use a downstream rank's KV locally.
+    /// Default: unsupported (single-stage engines never see a rank > 0 insert) ⇒ that rank votes cold.
+    #[allow(clippy::result_unit_err)]
+    fn stash_downstream_rank(
+        &mut self,
+        _rank: u16,
+        _manifest: &cascadia_kv_wire::Manifest,
+        _payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
+        Err(())
+    }
+    /// Plane-based cross-chain warm-resume: applies the rank's pulled KV staged under `epoch` in this
+    /// engine's cache (splice-agnostic; §0(B)). Returns true on success (state set + warm armed).
+    /// Default: unsupported.
+    #[allow(clippy::result_unit_err)]
+    fn apply_warm_resume(&mut self, _epoch: u64) -> bool {
+        false
+    }
+    /// Undo an [`Self::apply_warm_resume`] that the chain-wide verdict then rejected: drop the armed
+    /// state and fall back to cold. The plane's verdict is meant to be all-or-nothing, but each rank
+    /// applies BEFORE it confirms, so a later rank's failure would otherwise leave this rank warm while
+    /// the head goes cold — the head then prefills a full cold prompt through a rank whose KV is
+    /// pre-seeded, producing wrong tokens. A stale arm also contaminates the NEXT request, so this must
+    /// be safe to call at any time, including for an epoch this rank never armed.
+    ///
+    /// Default: no-op — correct for engines whose `apply_warm_resume` is itself unsupported.
+    fn abort_warm_resume(&mut self, _epoch: u64) {}
+    /// Number of ranks in an N-stage chain that bear OWN KV (the cross-chain pull must GET + restore
+    /// only these). Default: all `total_ranks` (every rank has its own KV — ov-runtime/qwen36/dist-spec).
+    /// KV-sharing engines (gemma4: all own-KV in stage_0) override to return fewer.
+    fn kv_bearing_ranks(&self, total_ranks: usize) -> usize {
+        total_ranks
+    }
+}
+
+/// Issue-34 Option C: the **holder-serve** half of [`KvCoordination`], decoupled from the engine
+/// lock. `lookup`/`export` read the captured-snapshot cache only (no live inference state), so this is
+/// `&self` + `Send + Sync` and serves over a shared handle the engine hands out via
+/// [`Engine::kv_holder`]. The point: a node is moved-away-from *because* it is busy generating (which
+/// holds the engine lock); routing the holder through that lock would starve every pull. Serving from
+/// this handle instead lets a busy node still answer NEGOTIATE/GET — it touches only the snapshot
+/// cache's own (uncontended-mid-generation) lock.
+#[cfg(feature = "kv_coord")]
+pub trait KvSnapshotHolder: Send + Sync {
+    /// This rank's model fingerprint (static; cache key + cross-rev guard).
+    fn model_fingerprint(&self) -> u64;
+    /// NEGOTIATE: longest-common-prefix of `token_ids` against the captured cache.
+    fn lookup(&self, partner: &str, token_ids: &[i32]) -> Option<(u64, u32)>;
+    /// GET: export the snapshot asserted by `(epoch, len)` as wire `Manifest` + per-layer payloads.
+    fn export(
+        &self,
+        partner: &str,
+        expected_epoch: u64,
+        expected_len: u32,
+    ) -> Option<(cascadia_kv_wire::Manifest, Vec<(Vec<u8>, Vec<u8>)>)>;
+}
+
+/// Issue-34 plane warm-resume: the **hand-off** half, decoupled from the engine lock in the other
+/// direction from [`KvSnapshotHolder`]. The plane's commit path runs while the engine is usually
+/// parked inside `step()` holding the engine mutex, so it cannot reach the engine to apply a pulled
+/// slice — that is the deadlock this exists to avoid. Instead it parks the slice behind this handle's
+/// own lock and the engine drains it from inside its recv loop, before the turn's forward.
+#[cfg(feature = "kv_coord")]
+pub trait KvWarmHandoff: Send + Sync {
+    /// Park a pulled slice for the engine to apply. Never blocks on engine work.
+    fn put(
+        &self,
+        epoch: u64,
+        manifest: cascadia_kv_wire::Manifest,
+        payloads: Vec<(Vec<u8>, Vec<u8>)>,
+    );
+
+    /// Retract a parked slice when the head aborts a set this rank had already committed. `true` only
+    /// if the slice was still parked; `false` means it is gone — the engine already took it, so this
+    /// rank MAY be warm under a cold head — and the caller must report that, not treat the abort as
+    /// clean.
+    ///
+    /// Deliberately no default: an impl that cannot retract has to say so in its own body.
+    fn clear(&self, epoch: u64) -> bool;
+}
+
 pub trait Engine: Send {
     /// One short forward to compile kernels and warm device caches.
     fn warmup(&mut self);
@@ -227,6 +356,30 @@ pub trait Engine: Send {
     /// until the task finishes on its own.
     fn cancel(&mut self, _task_id: &TaskId) {}
 
+    /// Issue-34 Option C: the engine's KV export/import surface, if it holds a prefix cache. Default
+    /// `None` — engines without KV coordination opt out. `&mut` because lookup/export/insert mutate
+    /// the cache (LRU touch, restore). Gated so the wire crate stays out of default trees.
+    #[cfg(feature = "kv_coord")]
+    fn kv_coordination(&mut self) -> Option<&mut dyn KvCoordination> {
+        None
+    }
+
+    /// Issue-34 Option C: a lock-free **holder** handle over this engine's captured-snapshot cache, if
+    /// any. Default `None`. Grabbed once at engine load (cheap `Arc` clone) and served from a holder
+    /// task, so a pull never contends the engine lock the live inference holds. `&self` because it
+    /// shares the cache rather than mutating engine state.
+    #[cfg(feature = "kv_coord")]
+    fn kv_holder(&self) -> Option<std::sync::Arc<dyn KvSnapshotHolder>> {
+        None
+    }
+
+    /// Issue-34 plane warm-resume: the mailbox a plane commit parks a pulled slice in, if this engine
+    /// applies one itself. Default `None`. Grabbed once at engine load, like [`Self::kv_holder`].
+    #[cfg(feature = "kv_coord")]
+    fn kv_handoff(&self) -> Option<std::sync::Arc<dyn KvWarmHandoff>> {
+        None
+    }
+
     /// Tear down the engine. Idempotent.
     fn close(&mut self) {}
 }
@@ -257,6 +410,37 @@ pub trait Builder: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two "frame-start" errors are NOT the same error, and conflating them is easy: both
+    /// start with the same words and both mention a timeout. Only one is fatal.
+    ///
+    ///   frame-start WAIT TIMED OUT after <deadline> ... (retryable)  -> NON-fatal, retry on the
+    ///       same socket. Zero bytes were consumed, so the frame stays aligned. A slow upstream
+    ///       stage must NOT tear the chain down.
+    ///   frame-start IDLE CEILING hit after <ceiling> ... dropped     -> FATAL. The connection was
+    ///       actually dropped (black-holed peer); the loopback is gone.
+    ///
+    /// A rig report attributed a `worker_relay_connection_fatal` exit to the retryable one; the
+    /// archived logs showed every such exit carried "idle ceiling" or "socket closed" instead.
+    /// Pin both directions so a rewording cannot silently flip either.
+    #[test]
+    fn frame_start_retryable_is_not_confused_with_the_fatal_idle_ceiling() {
+        let retryable = "frame-start wait timed out after 59.9999999s with no bytes (retryable)";
+        let fatal =
+            "frame-start idle ceiling hit after 900s; connection dropped (black-holed peer?)";
+
+        assert!(
+            !EngineError::Backend(retryable.into()).is_connection_fatal(),
+            "the retryable frame-start wait must not exit the worker relay loop"
+        );
+        assert!(
+            EngineError::Backend(fatal.into()).is_connection_fatal(),
+            "the idle-ceiling drop is a real dead connection and must stay fatal"
+        );
+        // The discriminator is the substring, not the shared "frame-start"/"timed out" prefix.
+        assert!(retryable.contains("frame-start") && fatal.contains("frame-start"));
+        assert!(!retryable.contains("idle ceiling"));
+    }
 
     #[test]
     fn connection_fatal_classification() {
@@ -297,6 +481,25 @@ mod tests {
         assert!(!EngineError::Io(IoError::from(ErrorKind::NotFound)).is_connection_fatal());
         // Recoverable / unrelated failures are NOT fatal.
         assert!(!EngineError::Backend("bad kind 7".into()).is_connection_fatal());
+        // #40: the bounded frame-start token wait timing out is NON-fatal — it
+        // flattens to this Backend string, which contains "timed out" but NOT
+        // "recv_exact timed out", so it must classify recoverable (the caller
+        // retries on the same live socket). Pin it so a reworded message can't
+        // silently flip it to fatal + drop the once-dialed engine loopback.
+        // The literal duration used to be hardcoded here as "120s", which never matched what
+        // production emits: the message is formatted from the ACTUAL deadline
+        // (`TransportError::FrameStartTimeout(Duration)` → `{0:?}`), and the deadline is
+        // `base.min(TOKEN_RECV_DEADLINE_CEILING)` — so a 60s operator timeout logs ~60s while
+        // the 120s ceiling only caps it. A reader comparing the log against this fixture would
+        // conclude two deadlines disagreed. Assert across a range instead: the classification
+        // must not depend on the number at all.
+        for secs in [1u64, 60, 120, 900] {
+            let msg = format!("frame-start wait timed out after {secs}s with no bytes (retryable)");
+            assert!(
+                !EngineError::Backend(msg.clone()).is_connection_fatal(),
+                "retryable frame-start timeout must NOT be connection-fatal: {msg}"
+            );
+        }
         assert!(
             !EngineError::Backend("worker received LOGITS_RESPONSE".into()).is_connection_fatal()
         );

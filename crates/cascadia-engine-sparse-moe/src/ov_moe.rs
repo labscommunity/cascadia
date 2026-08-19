@@ -46,7 +46,9 @@ use tracing::info;
 
 use cascadia_ov_genai_shim::{DType, Error as OvError, PluginConfig, Runtime};
 
+use crate::kv_prefix_cache::ModelFingerprint;
 use crate::manifest::{Manifest, ManifestError};
+use crate::ov_kv_cache::{OvLayerKvSlice, OvMoeKvPrefixCache, OvMoeKvSnapshot};
 use crate::sampling::{init_rng, sample, SamplingConfig};
 
 /// Group size of the int4_bin quantization (cols per scale group).
@@ -518,6 +520,97 @@ impl OvMoeRunner {
         }
     }
 
+    /// [`ModelFingerprint`] for this rank — the KV-prefix cache key. Same
+    /// rule as the K2.6 runner: any field that changes the KV bits (arch,
+    /// dims, this rank's layer slice) is baked in, so a snapshot from a
+    /// different model or rank can never be restored.
+    pub fn fingerprint(&self) -> ModelFingerprint {
+        let layer_start = self.layer_ids.first().copied().unwrap_or(0);
+        let layer_end = self.layer_ids.last().map(|&l| l + 1).unwrap_or(0);
+        ModelFingerprint {
+            arch: self.manifest.arch.clone(),
+            num_layers: self.manifest.num_layers,
+            num_experts: self.manifest.num_experts,
+            top_k: self.manifest.top_k,
+            hidden_size: self.manifest.hidden_size,
+            num_kv_heads: self.manifest.num_kv_heads,
+            qk_head_dim: self.manifest.qk_head_dim,
+            v_head_dim: self.manifest.v_head_dim,
+            vocab_size: self.manifest.vocab_size,
+            layer_start,
+            layer_end,
+            is_first: self.is_first,
+            is_last: self.is_last,
+        }
+    }
+
+    /// Snapshot this rank's KV (only its owned layers) into an
+    /// [`OvMoeKvSnapshot`]. The `f32` buffers are cloned verbatim — no
+    /// precision loss — so a later [`Self::restore_kv`] is bit-identical to
+    /// a cold prefill. Every owned layer must agree on `seq` (they advance
+    /// in lockstep through `forward_layers`); a mismatch is an engine bug,
+    /// not recoverable state.
+    /// This rank's current KV depth, or 0 if it owns no layers. Unlike [`Self::snapshot_kv`] this
+    /// never errors on a cross-layer disagreement — the plane's depth guard wants a cursor, not a
+    /// consistency verdict, and a disagreeing rank is caught by the snapshot path anyway.
+    pub fn kv_past_seq_len(&self) -> usize {
+        self.kv.first().map(|l| l.seq).unwrap_or(0)
+    }
+
+    pub fn snapshot_kv(&self) -> Result<OvMoeKvSnapshot, OvMoeError> {
+        let ps = match self.kv.first() {
+            Some(l) => l.seq,
+            None => {
+                return Err(OvMoeError::Internal(
+                    "snapshot_kv: rank holds no layers".into(),
+                ))
+            }
+        };
+        for (idx, l) in self.kv.iter().enumerate() {
+            if l.seq != ps {
+                return Err(OvMoeError::Internal(format!(
+                    "snapshot_kv: layer {idx} seq {} != expected {ps}",
+                    l.seq
+                )));
+            }
+        }
+        let layers = self
+            .kv
+            .iter()
+            .map(|l| OvLayerKvSlice {
+                k: l.k.clone(),
+                v: l.v.clone(),
+                seq: l.seq,
+            })
+            .collect();
+        Ok(OvMoeKvSnapshot {
+            past_seq_len: ps,
+            layers,
+        })
+    }
+
+    /// Restore a previously-captured snapshot into this rank's KV. The
+    /// snapshot must have one slice per owned layer (fingerprint check
+    /// upstream guarantees the same rank/model; this is defence in depth).
+    /// After Ok, every layer's `seq` equals the snapshot's `past_seq_len`
+    /// and the next `forward_layers` writes its slot at that offset —
+    /// exactly as after a fresh prefill of the matched prefix.
+    pub fn restore_kv(&mut self, snap: &OvMoeKvSnapshot) -> Result<(), OvMoeError> {
+        if snap.layers.len() != self.kv.len() {
+            return Err(OvMoeError::Internal(format!(
+                "restore_kv: snapshot has {} layers, rank owns {}",
+                snap.layers.len(),
+                self.kv.len()
+            )));
+        }
+        for (dst, src) in self.kv.iter_mut().zip(&snap.layers) {
+            dst.k = src.k.clone();
+            dst.v = src.v.clone();
+            dst.seq = src.seq;
+        }
+        Ok(())
+    }
+
     pub fn eos_token_ids(&self) -> &[u32] {
         &self.manifest.eos_token_ids
     }
@@ -775,6 +868,92 @@ impl OvMoeRunner {
         max_new: usize,
     ) -> Result<Vec<u32>, OvMoeError> {
         self.generate(prompt_ids, max_new, &SamplingConfig::default())
+    }
+
+    /// Generate with an optional KV-prefix cache (Issue-34: local warm-resume + cross-chain source).
+    /// On a cache HIT, restores the matched prefix's KV and prefills only the suffix; on a MISS,
+    /// snapshots the FULL prompt's KV (depth == prompt.len, taken at the prefill boundary before
+    /// decode — no off-by-one) and inserts it keyed by the prompt. Returns the generated tokens plus
+    /// the snapshot inserted on a miss, so the engine can mirror it into its lock-free holder cache.
+    /// `cache = None` is byte-identical to [`Self::generate`]. Prefill uses `step_logits` (no
+    /// sampling), so the rep-penalty `history` covers generated tokens only — a warm run matches cold.
+    pub fn generate_with_cache(
+        &mut self,
+        prompt_ids: &[u32],
+        max_new: usize,
+        cfg: &SamplingConfig,
+        mut cache: Option<&mut OvMoeKvPrefixCache>,
+    ) -> Result<(Vec<u32>, Option<OvMoeKvSnapshot>), OvMoeError> {
+        if prompt_ids.is_empty() || max_new == 0 {
+            return Ok((Vec::new(), None));
+        }
+        self.reset();
+        let mut rng = init_rng(cfg.seed);
+        let eos = self.manifest.eos_token_ids.clone();
+        let prompt64: Vec<i64> = prompt_ids.iter().map(|&t| i64::from(t)).collect();
+
+        // Cache lookup / restore. `fp` computed only when the cache is present + enabled, so the
+        // `None` path stays allocation-identical to `generate`.
+        let mut fp: Option<ModelFingerprint> = None;
+        let mut cache_skip = 0usize;
+        let mut cache_hit = false;
+        if let Some(c) = cache.as_mut() {
+            if c.enabled() {
+                let fingerprint = fp.insert(self.fingerprint());
+                if let Some((snap, _)) = c.lookup_local(&prompt64, fingerprint) {
+                    cache_skip = snap.past_seq_len;
+                    self.restore_kv(&snap)?;
+                    cache_hit = true;
+                }
+            }
+        }
+
+        // Prefill the suffix (positions [cache_skip, prompt.len)); the restored prefix's KV is already
+        // in place. `pos` advances for skipped tokens too so past_seq_len stays correct.
+        let mut pos = 0usize;
+        let mut logits: Vec<f32> = Vec::new();
+        for (i, &t) in prompt_ids.iter().enumerate() {
+            if i < cache_skip {
+                pos += 1;
+                continue;
+            }
+            logits = self.step_logits(t, pos)?;
+            pos += 1;
+        }
+
+        // On a miss, snapshot the full prompt's KV and insert it (keyed by the prompt).
+        let mut cached_snap: Option<OvMoeKvSnapshot> = None;
+        if !cache_hit {
+            if let Some(c) = cache.as_mut() {
+                if c.enabled() {
+                    let fingerprint = fp.get_or_insert_with(|| self.fingerprint());
+                    if let Ok(snap) = self.snapshot_kv() {
+                        c.insert(prompt64.clone(), fingerprint, snap.clone());
+                        cached_snap = Some(snap);
+                    }
+                }
+            }
+        }
+
+        // First generated token from the last prefill step's logits, then decode.
+        let mut history: Vec<i64> = Vec::with_capacity(max_new);
+        let mut out: Vec<u32> = Vec::with_capacity(max_new);
+        if logits.is_empty() {
+            // No suffix token (cache_skip == prompt.len) — the lookup contract forbids this, but
+            // return safely rather than sample from stale logits.
+            return Ok((out, cached_snap));
+        }
+        loop {
+            let next = sample(&logits, &history, cfg, &mut rng) as u32;
+            out.push(next);
+            history.push(next as i64);
+            if out.len() >= max_new || eos.contains(&next) {
+                break;
+            }
+            logits = self.step_logits(next, pos)?;
+            pos += 1;
+        }
+        Ok((out, cached_snap))
     }
 }
 

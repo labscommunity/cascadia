@@ -41,7 +41,7 @@ async fn roundtrip(n: usize, nosample: bool) {
                 .await
                 .unwrap();
         } else {
-            send_forward(&cb, 7, &cfgb, &hib, [1, 1, n as u32])
+            send_forward(&cb, 7, &cfgb, &hib, [1, 1, n as u32], true)
                 .await
                 .unwrap();
         }
@@ -52,7 +52,7 @@ async fn roundtrip(n: usize, nosample: bool) {
         FrameKind::Forward
     };
     assert_eq!(recv_kind_server(&s).await.unwrap(), Some(want_kind));
-    let (pos, _cfg, got, shape) = recv_forward_body_server(&s).await.unwrap();
+    let (pos, _cfg, _ph, got, shape) = recv_forward_body_server(&s).await.unwrap();
     send.await.unwrap();
 
     assert_eq!(pos, 7, "past_seq_len corrupted at n={n}");

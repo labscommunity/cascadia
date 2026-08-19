@@ -796,13 +796,28 @@ async fn send_hidden_frames(
 /// the stage for the whole idle ceiling (#75 mid-pair protection, carried over
 /// to the seq-prefixed wire). Note this deadlines the hidden on the STATEFUL
 /// path too, which the pre-seq wire left lenient.
+///
+/// A stateful (non-static) stage may instead be handed a bare I8 KV control
+/// frame (CAPTURE/RESTORE) between turns. That frame stands ALONE — no hidden
+/// follows it — so it returns as `(frame, None)` and the caller handles it and
+/// waits again. Peeking here rather than in the caller is what keeps this the
+/// literal body of `recv_hidden_from_upstream`, and so keeps the loopback tests
+/// below covering it: a peek inlined at the call site would be untested.
 async fn recv_hidden_frames(
     upstream: &Arc<tokio::sync::Mutex<ActivationServer>>,
-) -> Result<(WireTensor, WireTensor), cascadia_transport::TransportError> {
+    want_pos: bool,
+) -> Result<(WireTensor, Option<WireTensor>), cascadia_transport::TransportError> {
     let mut guard = upstream.lock().await;
     let lead = guard.recv().await?.0;
+    // A static shard never receives control frames, and its lead is I64 either
+    // way — so the check costs nothing there and cannot shadow an activation.
+    #[cfg(feature = "kv_coord")]
+    if !want_pos && lead.dtype == WireDType::I8 {
+        return Ok((lead, None));
+    }
+    let _ = want_pos;
     let hid = guard.recv_reply().await?.0;
-    Ok((lead, hid))
+    Ok((lead, Some(hid)))
 }
 
 /// Hard ceiling on the active token-response wait, independent of the body
@@ -812,6 +827,11 @@ async fn recv_hidden_frames(
 /// exists to cap (internal tracker, issue #40). A token *response* of an ACTIVE
 /// generation has a tight real deadline regardless, so cap it here.
 const TOKEN_RECV_DEADLINE_CEILING: std::time::Duration = std::time::Duration::from_secs(120);
+// Issue-34 warm-resume: bound the downstream RESTORE/ABORT ack. A lost or raced ack must degrade
+// to cold reprefill (the caller aborts + reprefills on Err), never hang the serve at the client
+// deadline. Warm-resume is an optimization, not a correctness gate — generous enough for a valid
+// tail restore, well under any client timeout.
+const RESTORE_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Overall budget for one token wait.
 ///
@@ -1388,6 +1408,10 @@ struct ActiveTask {
     emitted: Vec<u8>,
     prefilled: bool,
     last_token: i32,
+    /// Issue-34: number of leading prompt tokens already warm in the OV state (restored from a
+    /// pulled/cached KV blob). The prefill feeds only `prompt_ids[warm_prefix..]`. 0 ⇒ cold (full
+    /// prefill), so the default path is unchanged.
+    warm_prefix: usize,
     /// Wall-clock when the task became active. Used to compute the
     /// final tok/s the engine prints in its `task done` log line.
     started: std::time::Instant,
@@ -1472,6 +1496,27 @@ pub struct OvRuntimeEngine {
     /// link. Reset by any answer at all (a token, a NACK, even a malformed
     /// frame). Drives `escalate_if_downstream_is_gone`.
     consecutive_token_timeouts: u32,
+    /// Issue-34 Option C: opaque KV blob cache + NEGOTIATE/GET offers for the coordination plane.
+    #[cfg(feature = "kv_coord")]
+    kv: crate::kv_coordination::OvKvCache,
+    /// Issue-34 Option C: lock-free holder mirror of `kv` — the capture sites write both, and
+    /// `kv_holder()` hands this out so a busy engine answers pulls without contending the engine lock.
+    #[cfg(feature = "kv_coord")]
+    kv_share: crate::kv_coordination::SharedKvCache,
+    /// Issue-34 plane warm-resume: mailbox the plane's commit parks a pulled slice in. Drained from the
+    /// `OPCODE_RESTORE` arm — its lock is independent of the engine lock, which is what lets the commit
+    /// path deposit while this engine is mid-`step()`.
+    #[cfg(feature = "kv_coord")]
+    kv_handoff: std::sync::Arc<crate::kv_coordination::KvHandoffMailbox>,
+    /// Issue-34 consume: set by a `RESTORE` control frame; suppresses the next prefill's implicit
+    /// `reset_state` (this worker's KV is already warm). Cleared by that prefill or by `ABORT`.
+    #[cfg(feature = "kv_coord")]
+    kv_warm_pending: bool,
+    /// Issue-34 plane-restore MODE, read once from `CASCADIA_KV_PLANE_RESTORE` at build. Since the
+    /// plane arm moved in-band (`drain_kv_handoff` under `OPCODE_RESTORE`) the chain verdict is binding
+    /// in both modes, so this only labels the mode in the warm-resume logs the cert greps.
+    #[cfg(feature = "kv_coord")]
+    plane_restore: bool,
 }
 
 impl OvRuntimeEngine {
@@ -1949,44 +1994,68 @@ impl OvRuntimeEngine {
     }
 
     fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], Option<i64>)> {
-        let upstream = self
-            .upstream
-            .clone()
-            .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
         // Wire order is [lead] [hidden] (see send_hidden_frames), where lead is
         // [seq] or [seq, position]. The LEAD frame's wait is lenient
         // (idle-between-requests); the hidden that must follow it is deadlined,
         // and the bounded token deadline lives on the active wait downstream.
+        //
+        // `recv_hidden_frames` yields no hidden for a bare I8 KV control frame:
+        // handle it and wait again, since the upstream still owes an activation.
         let want_pos = self.static_kv.is_some();
-        debug!(want_pos, "upstream recv: waiting");
-        let (lead, tensor) = self
-            .block_on(recv_hidden_frames(&upstream))
-            .map_err(|e| EngineError::Backend(e.to_string()))?;
-        debug!("upstream recv: frames arrived");
-        // Record the seq this stage must echo back on the token it sends
-        // upstream; decode/validate outside the transport closure so a bad
-        // frame yields a clear EngineError, not a desync.
-        let (inbound_seq, position) = decode_wire_lead(&lead, want_pos)?;
-        self.inbound_seq = Some(inbound_seq);
-        let shape = [
-            tensor.shape[0] as usize,
-            tensor.shape[1] as usize,
-            tensor.shape[2] as usize,
-        ];
-        let floats = match tensor.dtype {
-            WireDType::F32 => tensor
-                .data
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-            WireDType::F16 => f16_bytes_to_f32(&tensor.data),
-            other => {
-                return Err(EngineError::Backend(format!(
-                    "unexpected upstream dtype {other:?}"
-                )))
-            }
-        };
-        Ok((floats, shape, position))
+        // Re-iterates only on the kv_coord control-frame path; without kv_coord that
+        // branch is compiled out and the body runs exactly once.
+        #[cfg_attr(not(feature = "kv_coord"), allow(clippy::never_loop))]
+        loop {
+            let upstream = self
+                .upstream
+                .clone()
+                .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
+            debug!(want_pos, "upstream recv: waiting");
+            let (lead, hidden) = self
+                .block_on(recv_hidden_frames(&upstream, want_pos))
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+            info!(dtype = ?lead.dtype, len = lead.data.len(), want_pos, "ov_tail_upstream_frame_recv");
+            let tensor = match hidden {
+                Some(t) => t,
+                #[cfg(feature = "kv_coord")]
+                None => {
+                    self.handle_inbound_control(&lead)?;
+                    continue;
+                }
+                // Unreachable without kv_coord: the peek that yields `None` is compiled out.
+                #[cfg(not(feature = "kv_coord"))]
+                None => {
+                    return Err(EngineError::Backend(
+                        "upstream sent a bare KV control frame, but kv_coord is not built".into(),
+                    ))
+                }
+            };
+            debug!("upstream recv: frames arrived");
+            // Record the seq this stage must echo back on the token it sends
+            // upstream; decode/validate outside the transport closure so a bad
+            // frame yields a clear EngineError, not a desync.
+            let (inbound_seq, position) = decode_wire_lead(&lead, want_pos)?;
+            self.inbound_seq = Some(inbound_seq);
+            let shape = [
+                tensor.shape[0] as usize,
+                tensor.shape[1] as usize,
+                tensor.shape[2] as usize,
+            ];
+            let floats = match tensor.dtype {
+                WireDType::F32 => tensor
+                    .data
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+                WireDType::F16 => f16_bytes_to_f32(&tensor.data),
+                other => {
+                    return Err(EngineError::Backend(format!(
+                        "unexpected upstream dtype {other:?}"
+                    )))
+                }
+            };
+            return Ok((floats, shape, position));
+        }
     }
 
     fn send_token_to_upstream(&mut self, token: i32) -> EngineResult<()> {
@@ -2019,6 +2088,7 @@ impl OvRuntimeEngine {
         }
         if self.active.is_none() && !self.pending.is_empty() {
             let task = self.pending.remove(0);
+            info!(prompt_len = task.prompt.len(), "ov_prefill_begin");
             let tok = self
                 .tokenizer
                 .clone()
@@ -2027,13 +2097,84 @@ impl OvRuntimeEngine {
                 .encode(task.prompt.clone(), false)
                 .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?;
             let prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
+            // Issue-34 warm-resume: if a pulled/cached KV blob covers a strict prefix of this
+            // prompt, restore it and prefill only the suffix. Gated + best-effort — off-rig
+            // set_state_blob returns Stub, so this stays cold. Only the stateful (non-static) path.
+            #[cfg_attr(not(feature = "kv_coord"), allow(unused_mut))]
+            let mut warm_prefix = 0usize;
+            #[cfg(feature = "kv_coord")]
             if self.static_kv.is_none() {
+                let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
+                if let Some((blob, len, plane_pulled)) =
+                    self.kv.take_warm(&task.tenant, &prompt_i32)
+                {
+                    match self.runtime.set_state_blob(&blob) {
+                        Ok(()) => {
+                            // Multi-stage: RESTORE the whole downstream chain too (all-or-nothing).
+                            // Any rank short ⇒ ABORT everyone + cold (never a partial/corrupt warm).
+                            // Dropping the frame skipped the SAME-CHAIN restore too (where no plane pull
+                            // ever armed the downstream ranks), leaving head-warm/tail-cold with no
+                            // verdict and no fallback; it also starved the downstream `peer_epoch`.
+                            let multi = self.downstream.is_some() && !self.spec.is_last_stage;
+                            // Effective mode for THIS turn, not the process — what a cert should read.
+                            let plane_turn = self.plane_restore && plane_pulled;
+                            // Raw bit alongside: the AND is identically false in chain mode, which
+                            // hides whether this blob was pulled cross-chain or captured locally.
+                            info!(
+                                plane_restore = plane_turn,
+                                plane_pulled, "ov_step_first_warm_mode"
+                            );
+                            let chain_ok = !multi || {
+                                let epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
+                                // Binding in BOTH modes: a plane rank now arms in-band, inside its own
+                                // `OPCODE_RESTORE` handler, so a `false` here means it really is cold.
+                                // The old `chain_verdict` override existed for the out-of-band arm and
+                                // would now mask exactly that.
+                                let ok = matches!(self.send_restore_downstream(epoch), Ok(true));
+                                if !ok {
+                                    let _ = self.send_abort_downstream();
+                                }
+                                ok
+                            };
+                            if chain_ok {
+                                // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
+                                warm_prefix = crate::kv_coordination::kv_seq_from_blob(&blob)
+                                    .map(|s| s.min(len))
+                                    .unwrap_or(len);
+                                // Probe A on the HEAD. Every probe so far looked only at the tail; in
+                                // plane mode the head self-pulls (possibly from a different store than
+                                // chain mode negotiates against), so if the head's digest differs
+                                // between modes the defect is one rank up from where we have been
+                                // looking.
+                                info!(
+                                    warm_prefix,
+                                    matched = len,
+                                    blob_digest = crate::kv_coordination::byte_digest(&blob),
+                                    blob_len = blob.len(),
+                                    plane = plane_turn,
+                                    plane_pulled,
+                                    "ov-runtime warm-resumed from KV blob"
+                                );
+                            } else {
+                                let _ = self.runtime.reset_state();
+                                warn!("ov-runtime: pipeline restore incomplete; cold reprefill");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "set_state_blob failed; cold reprefill");
+                            let _ = self.runtime.reset_state();
+                        }
+                    }
+                }
+            }
+            if warm_prefix == 0 && self.static_kv.is_none() {
                 self.runtime.reset_state().map_err(map_ov_err)?;
             }
-            self.position = 0;
+            self.position = warm_prefix as i64;
             info!(
                 task = %task.task_id,
                 prompt_tokens = prompt_ids.len(),
+                warm_prefix,
                 "task active (ov-runtime)"
             );
             self.active = Some(ActiveTask {
@@ -2043,6 +2184,7 @@ impl OvRuntimeEngine {
                 emitted: Vec::new(),
                 prefilled: false,
                 last_token: 0,
+                warm_prefix,
                 started: std::time::Instant::now(),
                 t_alpha_compute: std::time::Duration::ZERO,
                 t_wire: std::time::Duration::ZERO,
@@ -2607,7 +2749,8 @@ impl OvRuntimeEngine {
             let a = self.active.as_mut().unwrap();
             if !a.prefilled {
                 a.prefilled = true;
-                (true, a.prompt_ids.clone())
+                // warm_prefix is 0 on the cold/default path ⇒ full prompt (unchanged behaviour).
+                (true, a.prompt_ids[a.warm_prefix..].to_vec())
             } else {
                 (false, vec![a.last_token as i64])
             }
@@ -2744,8 +2887,10 @@ impl OvRuntimeEngine {
             }
             nt
         } else {
-            // Stateful: the whole prompt (prefill) or one decode token in a
-            // single multi-token inference; the IR keeps KV internally.
+            // Stateful: KV is internal, all dims dynamic. Cold feeds the whole prompt at position 0;
+            // warm-resume feeds the suffix at position = real KV depth, where mask_len = kv_depth +
+            // input_len holds, so one batched forward works. (The per-token feed it replaces was a
+            // workaround for the now-fixed off-by-one and stalled the suffix past the gateway deadline.)
             let position = self.position;
             let ts = std::time::Instant::now();
             let (out, shape) = self.run_first(&tokens, position)?;
@@ -2912,6 +3057,40 @@ impl OvRuntimeEngine {
             );
             if std::env::var("CASCADIA_PERF_DUMP").is_ok_and(|v| v == "1") {
                 dump_decode_profile(&self.runtime);
+            }
+            // Issue-34: capture the full post-turn KV under (prompt + generated) for warm-pull.
+            // Best-effort + gated — off-rig get_state_blob returns Stub, so nothing is cached.
+            #[cfg(feature = "kv_coord")]
+            {
+                let mut full: Vec<i32> = active.prompt_ids.iter().map(|&t| t as i32).collect();
+                full.extend_from_slice(&active.generated);
+                // H.1b R2: the namespace this turn belongs to, read off THIS task's own state —
+                // never off a plane-asserted value, which describes a pulled entry, not this turn.
+                let tenant = active.task.tenant.clone();
+                match self.runtime.get_state_blob() {
+                    Ok(blob) => {
+                        // Multi-stage head: broadcast CAPTURE so every downstream rank snapshots its
+                        // slice under this turn's content epoch. Best-effort. Single-stage (no
+                        // downstream) skips straight to the local stash.
+                        if self.kv_stateful()
+                            && self.downstream.is_some()
+                            && !self.spec.is_last_stage
+                        {
+                            let epoch = crate::kv_coordination::synth_epoch(&full);
+                            if let Err(e) = self.send_capture_downstream(epoch, &full, &tenant) {
+                                warn!(error = %e, "ov-runtime: CAPTURE broadcast failed (best-effort)");
+                            }
+                        }
+                        // Mirror into the lock-free holder cache so a busy node can serve this turn's
+                        // KV to a moved peer without the engine lock.
+                        self.kv_share
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .capture(&tenant, full.clone(), blob.clone());
+                        self.kv.capture(&tenant, full, blob);
+                    }
+                    Err(e) => tracing::debug!(error = %e, "get_state_blob skipped (no KV capture)"),
+                }
             }
             self.active = None;
         }
@@ -3254,6 +3433,19 @@ impl OvRuntimeEngine {
         }
     }
 
+    /// Issue-34: consume the one-shot warm-resume flag. `true` ⇒ this prefill continues a RESTOREd
+    /// state, so the worker must NOT reset. Always `false` in the default build (no-op).
+    fn kv_consume_warm_pending(&mut self) -> bool {
+        #[cfg(feature = "kv_coord")]
+        {
+            std::mem::take(&mut self.kv_warm_pending)
+        }
+        #[cfg(not(feature = "kv_coord"))]
+        {
+            false
+        }
+    }
+
     fn step_last(&mut self) -> EngineResult<()> {
         if self.packed.is_some() {
             return self.step_relay_packed();
@@ -3286,7 +3478,10 @@ impl OvRuntimeEngine {
             // (reset at 0); seq is always 1.
             Some(pos) => self.run_relay(&hidden, shape, pos)?,
             None => {
-                if shape[1] > 1 {
+                // Reset on a fresh prefill UNLESS a RESTORE warm-resumed this rank (keep that state +
+                // its position). The flag is consumed every prefill so it never leaks across turns.
+                let warm = self.kv_consume_warm_pending();
+                if shape[1] > 1 && !warm {
                     self.runtime.reset_state().map_err(map_ov_err)?;
                     self.position = 0;
                 }
@@ -3382,7 +3577,8 @@ impl OvRuntimeEngine {
                 (o, s, pos)
             }
             None => {
-                if shape[1] > 1 {
+                let warm = self.kv_consume_warm_pending();
+                if shape[1] > 1 && !warm {
                     self.runtime.reset_state().map_err(map_ov_err)?;
                     self.position = 0;
                 }
@@ -3615,6 +3811,138 @@ impl Engine for OvRuntimeEngine {
             self.park_prefill_model();
         }
     }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
+        Some(self)
+    }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_holder(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvSnapshotHolder>> {
+        Some(std::sync::Arc::new(crate::kv_coordination::OvKvHolder {
+            cache: std::sync::Arc::clone(&self.kv_share),
+            model_fp: self.kv_model_fingerprint(),
+        }))
+    }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_handoff(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>> {
+        Some(std::sync::Arc::clone(&self.kv_handoff)
+            as std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>)
+    }
+}
+
+#[cfg(feature = "kv_coord")]
+impl OvRuntimeEngine {
+    pub(crate) fn shard_spec(&self) -> &ShardSpec {
+        &self.spec
+    }
+    pub(crate) fn tokenizer_ref(&self) -> Option<&Tokenizer> {
+        self.tokenizer.as_deref()
+    }
+    pub(crate) fn kv_cache_mut(&mut self) -> &mut crate::kv_coordination::OvKvCache {
+        &mut self.kv
+    }
+    /// Undo a plane arm: the local-state half of the chain `OPCODE_ABORT` rollback. The mailbox
+    /// retraction that handler also does is `clear(epoch)` on this path. Idempotent.
+    #[cfg(feature = "kv_coord")]
+    pub(crate) fn abort_warm_resume_local(&mut self) {
+        let _ = self.runtime.reset_state();
+        self.kv_warm_pending = false;
+        self.position = 0;
+    }
+    /// Drain the plane hand-off mailbox and apply the parked slice, if any. `true` ⇒ this rank is now
+    /// armed warm, which is what makes the `RESTORE` verdict truthful in plane mode.
+    ///
+    /// Called from the `OPCODE_RESTORE` arm, not from the node's relay loop: the relay only iterates
+    /// once `step()` has returned, by which point this rank has already cold-prefilled the whole turn
+    /// and zeroed `position`, so a `set_state` there snaps the state backwards mid-turn and the output
+    /// diverges. RESTORE lands before the turn's forward, so `kv_consume_warm_pending()` sees the arm
+    /// and the prefill skips its implicit `reset_state`.
+    ///
+    /// It is also the only call site on the SAME stream as the commit that parks the slice. Driving it
+    /// off the activation stream instead left the two unordered: at a short warm prefix the drain
+    /// routinely ran first and the slice sat parked forever — rank cold under a warm head.
+    #[cfg(feature = "kv_coord")]
+    pub(crate) fn drain_kv_handoff(&mut self, expected_epoch: u64) -> bool {
+        use crate::kv_coordination::HandoffReject;
+        let Some(slot) = self.kv_handoff.take(expected_epoch) else {
+            return false;
+        };
+        let fp = self.kv_model_fingerprint();
+        let blob = match crate::kv_coordination::handoff_decision(&slot, fp, self.position) {
+            Ok(blob) => blob,
+            Err(HandoffReject::Validate) => {
+                warn!(target: "cascadia::kv", event = "kv_handoff_validate_failed",
+                    epoch = slot.epoch, rev = crate::kv_coordination::KV_ENGINE_REV, fp);
+                return false;
+            }
+            Err(HandoffReject::Decode) => {
+                warn!(target: "cascadia::kv", event = "kv_handoff_decode_failed", epoch = slot.epoch);
+                return false;
+            }
+            Err(HandoffReject::TooLate(depth)) => {
+                warn!(target: "cascadia::kv", event = "kv_handoff_too_late",
+                    epoch = slot.epoch, position = self.position, depth);
+                return false;
+            }
+        };
+        if self.apply_warm_resume_blob(&blob) {
+            info!(target: "cascadia::kv", event = "kv_handoff_applied_inline",
+                epoch = slot.epoch, position = self.position,
+                blob_digest = crate::kv_coordination::byte_digest(&blob));
+            true
+        } else {
+            // set_state failed ⇒ this rank stays cold on a turn the commit path armed as warm, and
+            // nothing on this side can undo that. The arm exists to make the failure greppable.
+            warn!(target: "cascadia::kv", event = "kv_handoff_apply_failed",
+                epoch = slot.epoch, position = self.position);
+            false
+        }
+    }
+
+    /// Plane warm-resume (§0(B)): set_state a pulled rank blob directly + arm warm, off the inference
+    /// chain. Mirrors the carried-blob RESTORE path; the holder loop drives it via `apply_warm_resume`.
+    #[cfg(feature = "kv_coord")]
+    pub(crate) fn apply_warm_resume_blob(&mut self, blob: &[u8]) -> bool {
+        // Captured BEFORE set_state so the ledger can show whether the engine had already advanced past
+        // the resume depth when this landed — the timing candidate's signature.
+        let pos_before = self.position;
+        // Gate A attributes ~21.7 s of the warm turn to this call, but that figure is a DELTA between
+        // two whole runs on different builds. Time it directly: our Rust-side marshalling measures
+        // 147 ms on a 114.6 MB payload (`apply_path_cost_split`), so whatever lands here is
+        // `ov::VariableState::set_state` and nothing else.
+        let t_set_state = std::time::Instant::now();
+        let set_state = self.runtime.set_state_blob(blob);
+        let set_state_ms = t_set_state.elapsed().as_millis() as u64;
+        match set_state {
+            Ok(()) => {
+                self.position = crate::kv_coordination::kv_seq_from_blob(blob).unwrap_or(0) as i64;
+                // Probe A+B (PLANE apply site). `position` settled the depth question (head 97 == tail
+                // 97, mismatch refuted). What remains is whether the BYTES differ from the chain path's
+                // and WHEN this lands relative to the turn — hence the digest plus the pre-apply
+                // position. Compare `blob_digest` here against `ov_tail_restore_carried`'s for the same
+                // prompt: equal ⇒ blob-content refuted and the timing ledger decides; unequal ⇒ the two
+                // modes are applying different state and the keying/store path is the defect.
+                info!(
+                    position = self.position,
+                    position_before = pos_before,
+                    blob_digest = crate::kv_coordination::byte_digest(blob),
+                    blob_len = blob.len(),
+                    set_state_ms,
+                    mode = "plane",
+                    "ov-runtime: apply_warm_resume set position"
+                );
+                crate::kv_coordination::log_blob_tensors("apply_plane", 0, blob);
+                self.kv_warm_pending = true;
+                true
+            }
+            Err(e) => {
+                warn!(error = %e, "ov-runtime: apply_warm_resume set_state failed; cold");
+                false
+            }
+        }
+    }
 }
 
 /// CASCADIA_PERF_DUMP=1 (spike diagnostics): after a task finishes, print an
@@ -3780,6 +4108,315 @@ fn resolve_static_layers(runtime: &OvRuntime, what: &str) -> EngineResult<Vec<St
         )));
     }
     Ok(layers)
+}
+
+// -------- Issue-34 §8 multi-stage CAPTURE over ov-runtime's frameless transport --------
+//
+// ov-runtime's wire has no frame-kind header — it's a bare positional WireTensor exchange (F16
+// hidden, I64 position, I32 token). A control frame is an **I8** tensor (a dtype no real frame
+// uses ⇒ collision-free): `[opcode | capture_body_bytes]`. Stateful shards only (static/NPU shards
+// drive a host-side KV ring, not OV state, so they don't participate). All `kv_coord`-gated.
+#[cfg(feature = "kv_coord")]
+const OPCODE_CAPTURE: u8 = 1;
+#[cfg(feature = "kv_coord")]
+const OPCODE_CAPTURE_ACK: u8 = 2;
+/// Consume: `RESTORE(epoch)` set_states a rank's pulled slice; the ACK's data[1] is an all-or-nothing
+/// verdict. On a fail verdict the head `ABORT`s — every rank resets cold (a partial restore corrupts
+/// output). `ABORT` also clears a stray `kv_warm_pending` so a cold turn re-prefills clean.
+#[cfg(feature = "kv_coord")]
+const OPCODE_RESTORE: u8 = 3;
+#[cfg(feature = "kv_coord")]
+const OPCODE_RESTORE_ACK: u8 = 4;
+#[cfg(feature = "kv_coord")]
+const OPCODE_ABORT: u8 = 5;
+#[cfg(feature = "kv_coord")]
+const OPCODE_ABORT_ACK: u8 = 6;
+/// H.1b (R2): CAPTURE whose body also carries the TENANT the turn belongs to
+/// (`capture_body_bytes_v2`). A separate opcode, not a wider `OPCODE_CAPTURE` body: the v1 codec
+/// enforces an exact length and hard-errors `"bad CAPTURE body"` mid-chain on a mismatch, so
+/// widening it in place would break any chain whose ranks run different builds. Emitted only for a
+/// non-empty tenant, so a chain that never names one stays byte-for-byte on the v1 frame.
+#[cfg(feature = "kv_coord")]
+const OPCODE_CAPTURE_V2: u8 = 7;
+
+#[cfg(feature = "kv_coord")]
+impl OvRuntimeEngine {
+    /// True once this rank holds OV state worth coordinating (stateful, post-load).
+    fn kv_stateful(&self) -> bool {
+        self.static_kv.is_none()
+    }
+
+    /// Head/middle → downstream: send `CAPTURE(epoch, tokens)` as an I8 control tensor, await the ACK.
+    /// A non-empty `tenant` upgrades the frame to `OPCODE_CAPTURE_V2` so the downstream rank — which
+    /// never sees the `GenerationTask` — can tag its own capture with the same namespace.
+    fn send_capture_downstream(
+        &mut self,
+        epoch: u64,
+        tokens: &[i32],
+        tenant: &str,
+    ) -> EngineResult<()> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        let mut data = if tenant.is_empty() {
+            vec![OPCODE_CAPTURE]
+        } else {
+            vec![OPCODE_CAPTURE_V2]
+        };
+        if tenant.is_empty() {
+            data.extend_from_slice(&crate::kv_coordination::capture_body_bytes(epoch, tokens));
+        } else {
+            data.extend_from_slice(&crate::kv_coordination::capture_body_bytes_v2(
+                epoch, tokens, tenant,
+            ));
+        }
+        let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
+        let ack = self.block_on(async move {
+            let mut g = downstream.lock().await;
+            g.send(&t)
+                .await
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+            // Bounded like the RESTORE ack: a peer that errors on the frame (e.g. an old build
+            // meeting CAPTURE_V2) never ACKs, and an unbounded wait wedges the head while it holds
+            // the downstream lock. Timing out degrades exactly as a failed capture already does —
+            // the caller warns and the turn simply isn't cached.
+            match tokio::time::timeout(RESTORE_ACK_TIMEOUT, g.recv()).await {
+                Ok(Ok((ack, _))) => Ok(ack),
+                Ok(Err(e)) => Err(EngineError::Backend(e.to_string())),
+                Err(_) => Err(EngineError::Backend(
+                    "ov-runtime: CAPTURE ack timed out; turn not cached".into(),
+                )),
+            }
+        })?;
+        if ack.dtype == WireDType::I8 && ack.data.first() == Some(&OPCODE_CAPTURE_ACK) {
+            Ok(())
+        } else {
+            Err(EngineError::Backend("ov-runtime: bad CAPTURE ack".into()))
+        }
+    }
+
+    /// Worker → upstream: ACK a control frame (`payload` carries e.g. the RESTORE verdict).
+    fn send_control_ack_upstream(&mut self, ack_opcode: u8, payload: &[u8]) -> EngineResult<()> {
+        let upstream = self
+            .upstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
+        let mut data = vec![ack_opcode];
+        data.extend_from_slice(payload);
+        let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
+        self.block_on(async move {
+            let mut g = upstream.lock().await;
+            g.send(&t).await
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))?;
+        info!(ack_opcode, "ov_tail_ctrl_ack_sent");
+        Ok(())
+    }
+
+    /// Head/middle → downstream: `RESTORE(epoch)`; returns the chain's all-or-nothing verdict
+    /// (ACK data[1] == 1 ⇒ every downstream rank restored). `Ok(false)` ⇒ caller must `ABORT` + cold.
+    fn send_restore_downstream(&mut self, epoch: u64) -> EngineResult<bool> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        let mut data = vec![OPCODE_RESTORE];
+        data.extend_from_slice(&epoch.to_le_bytes());
+        // Issue-34 multi-stage cross-chain: ship the downstream rank's pulled blob inline so it can
+        // `set_state` (it has no local capture for a foreign chain's epoch). Absent ⇒ bare RESTORE
+        // (same-chain path, where the rank restores from its own CAPTURE stash).
+        // Prefer the epoch-keyed slot; on a miss fall back to the single stashed blob (2-stage move
+        // stashes exactly one downstream slice per turn — see take_downstream_single). The miss is a
+        // stash/restore epoch-key drift: the head keys the stash by the pulled rank's manifest tokens
+        // while restore keys by its own warm prefix; log both so the residual drift is diagnosable
+        // (3+-stage needs per-(epoch,rank) keying — follow-up).
+        // This engine is the DRIVER, which is rank 0 by construction (rank>0 runs the worker engine),
+        // so the RESTORE it sends always addresses rank 1.
+        let down_rank: u16 = 1;
+        let carried = self.kv.take_downstream(epoch, down_rank).or_else(|| {
+            let n = self.kv.downstream_len();
+            let single = self.kv.take_downstream_single(down_rank);
+            warn!(
+                epoch,
+                stashed = n,
+                recovered = single.is_some(),
+                "ov_restore_carry_epoch_miss; single-slot fallback"
+            );
+            single
+        });
+        if let Some(blob) = carried {
+            info!(epoch, blob_len = blob.len(), "ov_restore_carry_downstream");
+            data.extend_from_slice(&blob);
+        }
+        let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
+        let ack = self.block_on(async move {
+            let mut g = downstream.lock().await;
+            g.send(&t)
+                .await
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+            match tokio::time::timeout(RESTORE_ACK_TIMEOUT, g.recv()).await {
+                Ok(Ok((ack, _))) => Ok(ack),
+                Ok(Err(e)) => Err(EngineError::Backend(e.to_string())),
+                Err(_) => Err(EngineError::Backend(
+                    "ov-runtime: RESTORE ack timed out; cold reprefill".into(),
+                )),
+            }
+        })?;
+        if ack.dtype == WireDType::I8 && ack.data.first() == Some(&OPCODE_RESTORE_ACK) {
+            Ok(ack.data.get(1) == Some(&1))
+        } else {
+            Err(EngineError::Backend("ov-runtime: bad RESTORE ack".into()))
+        }
+    }
+
+    /// Head/middle → downstream: `ABORT` (reset cold + clear warm); await ACK. Best-effort.
+    fn send_abort_downstream(&mut self) -> EngineResult<()> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        let t = WireTensor::new(WireDType::I8, [1, 1, 1], vec![OPCODE_ABORT]);
+        self.block_on(async move {
+            let mut g = downstream.lock().await;
+            g.send(&t).await?;
+            // Best-effort ack, bounded: a silent downstream must not wedge the abort path.
+            let _ = tokio::time::timeout(RESTORE_ACK_TIMEOUT, g.recv()).await;
+            Ok::<_, cascadia_transport::TransportError>(())
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))
+    }
+
+    /// Handle an inbound I8 control tensor on a worker (called transparently inside the recv loop).
+    fn handle_inbound_control(&mut self, t: &WireTensor) -> EngineResult<()> {
+        info!(opcode = ?t.data.first().copied(), is_last = self.spec.is_last_stage, "ov_tail_ctrl_recv");
+        match t.data.first().copied() {
+            // CAPTURE: snapshot this rank's KV under the head's epoch, chain downstream, ack up.
+            // V2 additionally carries the turn's tenant, which tags the stash and rides the chain on.
+            Some(op @ (OPCODE_CAPTURE | OPCODE_CAPTURE_V2)) => {
+                let (epoch, tokens, tenant) = if op == OPCODE_CAPTURE_V2 {
+                    crate::kv_coordination::parse_capture_body_v2(&t.data[1..]).ok_or_else(
+                        || EngineError::Backend("ov-runtime: bad CAPTURE_V2 body".into()),
+                    )?
+                } else {
+                    let (e, tk) = crate::kv_coordination::parse_capture_body(&t.data[1..])
+                        .ok_or_else(|| {
+                            EngineError::Backend("ov-runtime: bad CAPTURE body".into())
+                        })?;
+                    (e, tk, crate::kv_coordination::LOCAL_NS.to_string())
+                };
+                if let Ok(blob) = self.runtime.get_state_blob() {
+                    // Mirror into the lock-free holder cache (worker rank serves rank-N GET from here).
+                    self.kv_share
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .capture_under_epoch_ns(&tenant, epoch, tokens.clone(), blob.clone());
+                    self.kv
+                        .capture_under_epoch_ns(&tenant, epoch, tokens.clone(), blob);
+                }
+                if !self.spec.is_last_stage {
+                    if let Err(e) = self.send_capture_downstream(epoch, &tokens, &tenant) {
+                        warn!(error = %e, "ov-runtime: CAPTURE chain downstream failed (best-effort)");
+                    }
+                }
+                self.send_control_ack_upstream(OPCODE_CAPTURE_ACK, &[])
+            }
+            // RESTORE: set_state this rank's pulled slice + arm warm_pending; chain downstream; ack
+            // the all-or-nothing verdict. A miss anywhere ⇒ verdict 0 ⇒ head ABORTs the chain.
+            Some(OPCODE_RESTORE) => {
+                let epoch = t
+                    .data
+                    .get(1..9)
+                    .and_then(|b| b.try_into().ok())
+                    .map(u64::from_le_bytes)
+                    .ok_or_else(|| EngineError::Backend("ov-runtime: bad RESTORE body".into()))?;
+                // Issue-34 multi-stage cross-chain: the head ships THIS rank's pulled blob inline
+                // (bytes past the 8-byte epoch). Use it directly; else restore from a local CAPTURE
+                // stash (the same-chain path, where the rank captured its own slice).
+                let carried = t.data.get(9..).filter(|b| !b.is_empty());
+                // Drain FIRST. In plane mode the head parks this rank's slice in the mailbox AND
+                // still carries a blob inline, so a `||` placed after the carried/capture branch
+                // short-circuits the drain away: the rank warms from the carried blob while the
+                // plane slice is never read, `kv_handoff_applied_inline` never fires, and the
+                // verdict is true so nothing aborts — a hollow warm. The parked slice is the
+                // authoritative cross-chain data, so it wins; chain mode parks nothing, so this is
+                // a false no-op there and the carried/capture path is unchanged.
+                let local_ok = if self.drain_kv_handoff(epoch) {
+                    true
+                } else if let Some(blob) = carried {
+                    let pos_before = self.position;
+                    match self.runtime.set_state_blob(blob) {
+                        Ok(()) => {
+                            self.position =
+                                crate::kv_coordination::kv_seq_from_blob(blob).unwrap_or(0) as i64;
+                            self.kv_warm_pending = true;
+                            // Probe A REFERENCE point: this is the certified byte-identical path, so
+                            // its digest is the known-good value the plane apply must match.
+                            info!(
+                                epoch,
+                                blob_len = blob.len(),
+                                blob_digest = crate::kv_coordination::byte_digest(blob),
+                                position = self.position,
+                                position_before = pos_before,
+                                mode = "chain",
+                                "ov_tail_restore_carried"
+                            );
+                            crate::kv_coordination::log_blob_tensors("restore_chain", epoch, blob);
+                            true
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "ov-runtime: set_state(carried) failed; rank cold");
+                            false
+                        }
+                    }
+                } else {
+                    match self.kv.take_capture(epoch) {
+                        Some((tokens, blob)) => match self.runtime.set_state_blob(&blob) {
+                            Ok(()) => {
+                                // Real KV depth, not the token count (off-by-one, see kv_seq_from_blob).
+                                self.position = crate::kv_coordination::kv_seq_from_blob(&blob)
+                                    .map(|s| s.min(tokens.len()))
+                                    .unwrap_or(tokens.len())
+                                    as i64;
+                                self.kv_warm_pending = true;
+                                true
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "ov-runtime: set_state failed; rank cold");
+                                false
+                            }
+                        },
+                        None => false,
+                    }
+                };
+                let down_ok = if self.spec.is_last_stage {
+                    true
+                } else {
+                    self.send_restore_downstream(epoch).unwrap_or(false)
+                };
+                self.send_control_ack_upstream(OPCODE_RESTORE_ACK, &[u8::from(local_ok && down_ok)])
+            }
+            // ABORT: reset cold + clear warm_pending; chain downstream; ack.
+            Some(OPCODE_ABORT) => {
+                let _ = self.runtime.reset_state();
+                self.kv_warm_pending = false;
+                self.position = 0;
+                // Zeroing `position` disarms the drain's depth guard, so a still-parked slice would
+                // apply on a later turn — warm rank under a cold head. This frame carries no epoch,
+                // hence the epoch-blind discard.
+                if self.kv_handoff.discard_any() {
+                    info!(target: "cascadia::kv", event = "kv_handoff_discarded_on_abort");
+                }
+                if !self.spec.is_last_stage {
+                    let _ = self.send_abort_downstream();
+                }
+                self.send_control_ack_upstream(OPCODE_ABORT_ACK, &[])
+            }
+            other => Err(EngineError::Backend(format!(
+                "ov-runtime: unknown control opcode {other:?}"
+            ))),
+        }
+    }
 }
 
 // -------- Builder --------
@@ -4634,6 +5271,20 @@ impl Builder for OvRuntimeBuilder {
             awaiting_token_seq: 0,
             inbound_seq: None,
             consecutive_token_timeouts: 0,
+            #[cfg(feature = "kv_coord")]
+            kv: crate::kv_coordination::OvKvCache::default(),
+            #[cfg(feature = "kv_coord")]
+            kv_share: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::kv_coordination::OvKvCache::default(),
+            )),
+            #[cfg(feature = "kv_coord")]
+            kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
+            #[cfg(feature = "kv_coord")]
+            kv_warm_pending: false,
+            #[cfg(feature = "kv_coord")]
+            plane_restore: std::env::var("CASCADIA_KV_PLANE_RESTORE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }))
     }
 }
@@ -5960,7 +6611,8 @@ mod tests {
             .await
             .unwrap();
 
-        let (lead, hid_t) = recv_hidden_frames(&upstream).await.unwrap();
+        let (lead, hid_t) = recv_hidden_frames(&upstream, false).await.unwrap();
+        let hid_t = hid_t.expect("an activation lead is always followed by its hidden");
         let (inbound, pos) = decode_wire_lead(&lead, false).unwrap();
         assert!(pos.is_none());
         assert_eq!(inbound, stamped, "seq must survive the hidden hop");
@@ -5980,6 +6632,41 @@ mod tests {
         assert_eq!(tok, 55);
     }
 
+    /// A bare I8 KV control frame arrives BETWEEN turns and stands alone. It must
+    /// come back with no hidden (nothing to wait for — waiting would wedge the
+    /// stage for the frame-idle ceiling), and the activation sent after it must
+    /// still read back intact: the peek must not consume a frame it did not own.
+    #[cfg(feature = "kv_coord")]
+    #[tokio::test]
+    async fn bare_control_frame_yields_no_hidden_and_does_not_desync_the_next_activation() {
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+
+        let ctrl = WireTensor::new(WireDType::I8, [1, 1, 1], vec![OPCODE_CAPTURE]);
+        downstream.lock().await.send(&ctrl).await.unwrap();
+
+        let (frame, hidden) = recv_hidden_frames(&upstream, false).await.unwrap();
+        assert_eq!(frame.dtype, WireDType::I8, "control frame comes back as-is");
+        assert!(
+            hidden.is_none(),
+            "a control frame promises no hidden — waiting for one would wedge the stage"
+        );
+
+        // The very next activation must be unaffected.
+        let hid = WireTensor::new(WireDType::F16, [1, 1, 2], vec![4, 3, 2, 1]);
+        send_hidden_frames(&downstream, 9, None, hid.clone())
+            .await
+            .unwrap();
+        let (lead, hid_t) = recv_hidden_frames(&upstream, false).await.unwrap();
+        let hid_t = hid_t.expect("an activation lead is always followed by its hidden");
+        assert_eq!(decode_wire_lead(&lead, false).unwrap(), (9, None));
+        assert_eq!(
+            hid_t.data, hid.data,
+            "stream stayed aligned across the control frame"
+        );
+    }
+
     #[tokio::test]
     async fn static_shard_wire_is_lead_then_hidden() {
         // Static path: lead carries [seq, position], hidden follows. Distinct
@@ -5993,7 +6680,8 @@ mod tests {
             .await
             .unwrap();
 
-        let (lead, hid_t) = recv_hidden_frames(&upstream).await.unwrap();
+        let (lead, hid_t) = recv_hidden_frames(&upstream, true).await.unwrap();
+        let hid_t = hid_t.expect("an activation lead is always followed by its hidden");
         assert_eq!(
             decode_wire_lead(&lead, true).unwrap(),
             (3, Some(11)),

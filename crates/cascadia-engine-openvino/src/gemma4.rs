@@ -54,6 +54,8 @@ struct PipelineConfig {
     num_stages: u32,
     #[serde(default)]
     num_layers: u32,
+    #[serde(default)]
+    num_kv_shared_layers: u32,
 }
 
 fn default_true() -> bool {
@@ -394,6 +396,9 @@ struct ActiveTask {
     last_text: String,
     prefilled: bool,
     last_token: i32,
+    /// Issue-34: leading prompt tokens already warm in the OV state (RESTOREd). Prefill feeds only
+    /// `prompt_ids[warm_prefix..]`. 0 ⇒ cold (default path unchanged).
+    warm_prefix: usize,
     /// Wall-clock when the task became active. Used to compute the
     /// final tok/s the engine prints in its `task done` log line.
     started: std::time::Instant,
@@ -404,8 +409,34 @@ struct ActiveTask {
     t_wire: std::time::Duration,
 }
 
+/// Effective prefill span. Default `usize::MAX` = the whole span in ONE pass (unchanged, fastest).
+///
+/// `CASCADIA_GEMMA4_FORCE_T1_PREFILL=1` ⇒ 1: fold EVERY token through the same T=1 path. A warm-resumed
+/// SUFFIX prefill (e.g. 22 tokens at position 71) and a cold FULL prefill (93 tokens at 0) otherwise hit
+/// different GEMM batch shapes; over int4 weights the rounding delta flips a token, so cross-chain
+/// warm != cold byte-identical. Under T=1 both traverse the identical per-token kernel ⇒ bit-identical.
+/// Opt-in only — production keeps the single-pass prefill (warm-resume stays greedy-equivalent there,
+/// not bit-identical). Mirrors `qwen36::prefill_chunk`.
+fn prefill_chunk() -> usize {
+    if std::env::var("CASCADIA_GEMMA4_FORCE_T1_PREFILL")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        1
+    } else {
+        usize::MAX
+    }
+}
+
 pub struct Gemma4Engine {
     spec: ShardSpec,
+    /// Count of layers whose own KV lives entirely in stage_0 and is SHARED by later stages
+    /// (Gemma 4 E2B/E4B KV-sharing). Own-KV layers are `[0, total_layers - num_kv_shared_layers)`.
+    /// Zero for dense models (every stage bears its own KV).
+    num_kv_shared_layers: u32,
+    /// Total pipeline stages (= `Gemma4Builder::total`). Used to map own-KV layers → KV-bearing ranks.
+    num_stages: u32,
     runtime: OvRuntime,
     tokenizer: Option<Arc<Tokenizer>>,
     /// All EOS token ids configured for the model. Generation stops on
@@ -415,6 +446,11 @@ pub struct Gemma4Engine {
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
     runtime_handle: tokio::runtime::Handle,
     position: i64,
+    /// Issue-34: a warm restore (`set_state_blob`) leaves residue this model's cheap
+    /// `reset_state` cannot scrub (see shim.cpp). Track it so the next reset rebuilds the
+    /// request instead — mirrors qwen36. Without it, restore-over-live-state corrupts the
+    /// warm continuation AND leaks (reasoning-channel `***`) into the following cold turn.
+    state_restored: bool,
     /// Map of canonical name (e.g. "input_ids", "attention_mask") to the
     /// IR's primary port name. Resolved at engine build time via the
     /// alias lookup (the IR's primary name is sometimes an internal
@@ -436,6 +472,13 @@ pub struct Gemma4Engine {
     /// to feed into the `external_kv.*` inputs. Rebuilt each step.
     pending_external_kv: std::collections::HashMap<i64, (Vec<usize>, Vec<u8>)>,
     step_warn: StepWarnLimiter,
+    /// Issue-34 Option C: opaque KV blob cache for the coordination plane.
+    #[cfg(feature = "kv_coord")]
+    kv: crate::kv_coordination::OvKvCache,
+    /// Issue-34 Option C: lock-free holder mirror of `kv` — the capture sites write both, and
+    /// `kv_holder()` hands this out so a busy engine answers pulls without contending the engine lock.
+    #[cfg(feature = "kv_coord")]
+    kv_share: crate::kv_coordination::SharedKvCache,
 }
 
 impl Gemma4Engine {
@@ -609,6 +652,23 @@ impl Gemma4Engine {
         let mut cross_frames = Vec::with_capacity(outs.len());
         for o in &outs {
             let (dt, oshape, bytes) = self.runtime.output(o.out_idx).map_err(map_ov_err)?;
+            // Issue-34 diag: on a PREFILL send (multi-token), log this shared-KV frame's context
+            // depth. Warm-resume must ship cat(restored_prefix, suffix) — i.e. ctx == full prompt
+            // len. If warm ctx == suffix len only, the cross_kv side-output is NOT reading the
+            // set_state-restored variable (stale/unfused copy) ⇒ that is the warm≠cold root cause.
+            // `kv_coordination` (and so `fnv1a64`) only exists under the `kv_coord` feature, so this
+            // diagnostic must be gated with it — ungated it broke `cargo check` with default features.
+            #[cfg(feature = "kv_coord")]
+            if shape[1] > 1 && oshape.len() == 4 {
+                info!(
+                    tag = o.tag,
+                    ctx = oshape[2],
+                    tokens = shape[1],
+                    position,
+                    fnv = crate::kv_coordination::fnv1a64(&bytes),
+                    "gemma4_cross_kv_prefill_ctx"
+                );
+            }
             cross_frames.push(pack_cross_kv_frame(dt, &oshape, bytes)?);
             tags.push(o.tag);
         }
@@ -638,9 +698,17 @@ impl Gemma4Engine {
                 // MID-TASK reply — deadlined; see `recv_tensor_reply` (Item 5).
                 // A prefill reply waits on every remaining stage's
                 // whole-prompt compute — widened budget (see
-                // `recv_tensor_reply_prefill`).
+                // `recv_tensor_reply_prefill`), CEILINGED here: the transport
+                // budget multiplies the operator's frame-transfer knob
+                // (recv_timeout × 10 — the rig's 600 s made it 6000 s), and the
+                // waiting head holds its admission slot the whole time, so one
+                // dead downstream turned the node into a refuse-everything wall
+                // for 100 minutes (2026-08-17 incident). ov-runtime ceilings
+                // the same coupling at TOKEN_RECV_DEADLINE_CEILING. Measured
+                // legit worst here: 51 s (4.2k tokens, 2-stage); the ceiling
+                // leaves ~6x headroom for deeper pipelines / longer prompts.
                 if prefill {
-                    guard.recv_reply_prefill().await
+                    recv_prefill_reply_ceilinged(&mut guard).await
                 } else {
                     guard.recv_reply().await
                 }
@@ -662,23 +730,25 @@ impl Gemma4Engine {
     }
 
     fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], i64)> {
+        // Wire order per step: position frame, hidden frame, cross-KV header, then `count` cross-KV
+        // frames. The position read transparently absorbs any I8 control frame (CAPTURE/RESTORE)
+        // that arrives between turns (stateful workers only).
+        let pos_t = self.recv_position_or_control()?;
         let upstream = self
             .upstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
-        // Wire order per step: position frame, hidden frame, cross-KV header,
-        // then `count` cross-KV frames (count from the header). Read the first
-        // three, decode the header to learn `count`, then read that many.
-        let (pos_t, hid_t, header_t) = self
-            .block_on(async {
+        let (hid_t, header_t) = self
+            .block_on(async move {
                 let mut guard = upstream.lock().await;
-                // First frame of the step is the IDLE wait; the frames that
-                // must follow it are mid-sequence replies — deadlined so a
-                // half-sent step can't wedge the stage (Item 5).
-                let pos = guard.recv().await?.0;
+                // pos was already read via recv_position_or_control (the IDLE
+                // wait that also absorbs a CAPTURE/RESTORE control frame between
+                // turns); the hid + cross-KV header that FOLLOW are mid-step
+                // replies — deadline them so a half-sent step can't wedge the
+                // stage (Item 5).
                 let hid = guard.recv_reply().await?.0;
                 let hdr = guard.recv_reply().await?.0;
-                Ok::<_, cascadia_transport::TransportError>((pos, hid, hdr))
+                Ok::<_, cascadia_transport::TransportError>((hid, hdr))
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
         // Decode + strictly validate the position + header outside the transport
@@ -752,6 +822,32 @@ impl Gemma4Engine {
         Ok((floats, shape, position))
     }
 
+    /// Read one frame from upstream, transparently handling any I8 control frame (CAPTURE/RESTORE/
+    /// ABORT) and looping until a real (non-control) frame — the position tensor — arrives.
+    fn recv_position_or_control(&mut self) -> EngineResult<WireTensor> {
+        // Re-iterates only on the kv_coord control-frame path (I8 → continue); without kv_coord
+        // that branch is compiled out and the body runs exactly once.
+        #[cfg_attr(not(feature = "kv_coord"), allow(clippy::never_loop))]
+        loop {
+            let upstream = self
+                .upstream
+                .clone()
+                .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
+            let t = self
+                .block_on(async move {
+                    let mut guard = upstream.lock().await;
+                    Ok::<_, cascadia_transport::TransportError>(guard.recv().await?.0)
+                })
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+            #[cfg(feature = "kv_coord")]
+            if t.dtype == WireDType::I8 {
+                self.handle_inbound_control(&t)?;
+                continue;
+            }
+            return Ok(t);
+        }
+    }
+
     fn send_token_to_upstream(&mut self, token: i32) -> EngineResult<()> {
         let upstream = self
             .upstream
@@ -778,11 +874,99 @@ impl Gemma4Engine {
                 .encode(task.prompt.clone(), false)
                 .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?;
             let prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
-            self.runtime.reset_state().map_err(map_ov_err)?;
-            self.position = 0;
+            // Issue-34 warm-resume (gated, single-stage for now — multi-stage needs the RESTORE
+            // broadcast). Restore a cached strict-prefix blob and prefill only the suffix; else cold.
+            #[cfg_attr(not(feature = "kv_coord"), allow(unused_mut))]
+            let mut warm_prefix = 0usize;
+            #[cfg(feature = "kv_coord")]
+            {
+                let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
+                if let Some((blob, len, plane_pulled)) =
+                    self.kv.take_warm(&task.tenant, &prompt_i32)
+                {
+                    // Restore must land on a CLEAN request: this model's `reset_state` leaves residue
+                    // (shim.cpp), and set_state over the prior throwaway turn's live state corrupts the
+                    // warm continuation + leaks into the next cold turn. Rebuild first, mark restored so
+                    // the following cold reset upgrades to a rebuild too.
+                    let set_ok = self.restore_blob_clean(&blob);
+                    // Issue-34 diag (mirror qwen36 70687b9): does set_state round-trip at the DECLARED
+                    // level on THIS device? gemma4's head IR uniquely has cross_kv side-consumers on the
+                    // KV concat. Mismatch ⇒ plugin set_state infidelity (mode A); exact ⇒ the warm≠cold
+                    // delta is the cross_kv side-output reading a stale buffer (mode B, exporter fix).
+                    if set_ok
+                        && std::env::var("CASCADIA_GEMMA4_POSTPREFILL_FP")
+                            .ok()
+                            .as_deref()
+                            == Some("1")
+                    {
+                        match self.runtime.get_state_blob() {
+                            Ok(rt) => {
+                                let a = crate::kv_coordination::fnv1a64(&blob);
+                                let b = crate::kv_coordination::fnv1a64(&rt);
+                                if a != b {
+                                    warn!(set_fnv = a, rt_fnv = b, set_len = blob.len(), rt_len = rt.len(),
+                                        "gemma4_state_roundtrip_mismatch (set_state lossy at declared level)");
+                                } else {
+                                    info!(
+                                        fnv = a,
+                                        len = blob.len(),
+                                        "gemma4_state_roundtrip_exact (declared state faithful)"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "gemma4: get_state_blob round-trip diag failed")
+                            }
+                        }
+                    }
+                    if set_ok {
+                        // Multi-stage: RESTORE the whole downstream chain (all-or-nothing); any rank
+                        // short ⇒ ABORT everyone + cold (never a partial/corrupt warm).
+                        let multi = self.downstream.is_some() && !self.spec.is_last_stage;
+                        let chain_ok = !multi || {
+                            let epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
+                            match self.send_restore_downstream(epoch) {
+                                Ok(true) => true,
+                                _ => {
+                                    let _ = self.send_abort_downstream();
+                                    false
+                                }
+                            }
+                        };
+                        if chain_ok {
+                            // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
+                            warm_prefix = crate::kv_coordination::kv_seq_from_blob(&blob)
+                                .map(|s| s.min(len))
+                                .unwrap_or(len);
+                            info!(
+                                warm_prefix,
+                                matched = len,
+                                plane_pulled,
+                                "gemma4 warm-resumed from KV blob"
+                            );
+                        } else {
+                            let _ = self.runtime.reset_state();
+                            warn!("gemma4: pipeline restore incomplete; cold reprefill");
+                        }
+                    }
+                }
+            }
+            if warm_prefix == 0 {
+                // A prior restore leaves residue cheap reset_state can't scrub — rebuild the request so
+                // this cold turn (incl. a fresh session after a warm-migrated turn on the same runtime)
+                // starts truly clean, not in the donor's reasoning-channel trajectory.
+                if self.state_restored {
+                    self.runtime.recreate_request().map_err(map_ov_err)?;
+                    self.state_restored = false;
+                } else {
+                    self.runtime.reset_state().map_err(map_ov_err)?;
+                }
+            }
+            self.position = warm_prefix as i64;
             info!(
                 task = %task.task_id,
                 prompt_tokens = prompt_ids.len(),
+                warm_prefix,
                 "gemma4 task active"
             );
             self.active = Some(ActiveTask {
@@ -792,6 +976,7 @@ impl Gemma4Engine {
                 last_text: String::new(),
                 prefilled: false,
                 last_token: 0,
+                warm_prefix,
                 started: std::time::Instant::now(),
                 t_alpha_compute: std::time::Duration::ZERO,
                 t_wire: std::time::Duration::ZERO,
@@ -839,7 +1024,8 @@ impl Gemma4Engine {
             let a = self.active.as_mut().unwrap();
             if !a.prefilled {
                 a.prefilled = true;
-                (true, a.prompt_ids.clone())
+                // warm_prefix is 0 on the cold/default path ⇒ full prompt (unchanged).
+                (true, a.prompt_ids[a.warm_prefix..].to_vec())
             } else {
                 (false, vec![a.last_token as i64])
             }
@@ -858,21 +1044,57 @@ impl Gemma4Engine {
         // multi-token inference; the IR keeps own KV internally. The absolute
         // start-position is sent downstream so relay stages align position_ids
         // and reset on 0.
+        // Issue-34: fold the prefill in `prefill_chunk()`-sized spans. Default = whole span (one pass,
+        // unchanged/fastest). CASCADIA_GEMMA4_FORCE_T1_PREFILL=1 ⇒ T=1, so a warm-resumed SUFFIX prefill
+        // and a cold FULL prefill traverse the identical per-token kernel. Without it the two use
+        // different GEMM batch shapes (e.g. 22 vs 93 tokens) over int4 weights, and the rounding delta
+        // flips a token ⇒ cross-chain warm != cold. Mirrors qwen36's FORCE_T1_PREFILL.
+        let chunk = prefill_chunk();
+        let mut alpha = std::time::Duration::ZERO;
+        let mut wire = std::time::Duration::ZERO;
+        let mut next_token: i32;
         let position = self.position;
-        let ts = std::time::Instant::now();
-        let (out, shape) = self.run_first(&tokens, position)?;
-        let alpha = ts.elapsed();
-        self.position += tokens.len() as i64;
-        // 1-token prompt prefill costs the same downstream as a decode step —
-        // keep the strict deadline (mirrors step_middle's shape[1] > 1) so
-        // wedge eviction stays fast.
-        let (next_token, wire) = self.resolve_next_token(
-            &out,
-            &shape,
-            single_stage,
-            position,
-            prefill && tokens.len() > 1,
-        )?;
+        if prefill && tokens.len() > 1 && chunk < tokens.len() {
+            let mut i = 0usize;
+            loop {
+                let end = (i + chunk).min(tokens.len());
+                let span = &tokens[i..end];
+                let pos = self.position;
+                let ts = std::time::Instant::now();
+                let (out, shape) = self.run_first(span, pos)?;
+                alpha += ts.elapsed();
+                self.position += span.len() as i64;
+                // Every span goes downstream so each stage folds the same way; the tokens from all but
+                // the final span are discarded (the last one is the first decode token).
+                // Always use the PREFILL (widened) deadline here even for T=1 spans: this is a prefill,
+                // and the first span after a warm RESTORE follows a heavy set_state on the downstream
+                // stage — the strict decode budget wedges there and the turn returns empty.
+                let (tok, w) = self.resolve_next_token(&out, &shape, single_stage, pos, true)?;
+                wire += w;
+                next_token = tok;
+                i = end;
+                if i >= tokens.len() {
+                    break;
+                }
+            }
+        } else {
+            let ts = std::time::Instant::now();
+            let (out, shape) = self.run_first(&tokens, position)?;
+            alpha = ts.elapsed();
+            self.position += tokens.len() as i64;
+            // 1-token prompt prefill costs the same downstream as a decode step —
+            // keep the strict deadline (mirrors step_middle's shape[1] > 1) so
+            // wedge eviction stays fast.
+            let (tok, w) = self.resolve_next_token(
+                &out,
+                &shape,
+                single_stage,
+                position,
+                prefill && tokens.len() > 1,
+            )?;
+            wire = w;
+            next_token = tok;
+        }
         if let Some(a) = self.active.as_mut() {
             a.t_alpha_compute += alpha;
             a.t_wire += wire;
@@ -971,6 +1193,40 @@ impl Gemma4Engine {
                 other_ms,
                 "gemma4 task done"
             );
+            // Issue-34: capture this stage's KV under (prompt + generated) for warm-pull. Best-effort
+            // + gated. (Multi-stage CAPTURE broadcast added with the control protocol.)
+            #[cfg(feature = "kv_coord")]
+            {
+                let full: Vec<i32> = active
+                    .prompt_ids
+                    .iter()
+                    .map(|&t| t as i32)
+                    .chain(active.generated.iter().copied())
+                    .collect();
+                // H.1b R2: this turn's namespace, read off THIS task's own state — never off a
+                // plane-asserted value, which describes a pulled entry, not this turn.
+                let tenant = active.task.tenant.clone();
+                match self.runtime.get_state_blob() {
+                    Ok(blob) => {
+                        // Multi-stage head: broadcast CAPTURE so every downstream rank snapshots its
+                        // slice under this turn's content epoch. Best-effort.
+                        if self.downstream.is_some() && !self.spec.is_last_stage {
+                            let epoch = crate::kv_coordination::synth_epoch(&full);
+                            if let Err(e) = self.send_capture_downstream(epoch, &full, &tenant) {
+                                warn!(error = %e, "gemma4: CAPTURE broadcast failed (best-effort)");
+                            }
+                        }
+                        // Mirror into the lock-free holder cache so a busy node can serve this turn's
+                        // KV to a moved peer without the engine lock.
+                        self.kv_share
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .capture(&tenant, full.clone(), blob.clone());
+                        self.kv.capture(&tenant, full, blob);
+                    }
+                    Err(e) => tracing::debug!(error = %e, "gemma4 get_state_blob skipped"),
+                }
+            }
             self.active = None;
         }
 
@@ -1119,6 +1375,388 @@ impl Engine for Gemma4Engine {
         }
         result
     }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
+        Some(self)
+    }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_holder(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvSnapshotHolder>> {
+        Some(std::sync::Arc::new(crate::kv_coordination::OvKvHolder {
+            cache: std::sync::Arc::clone(&self.kv_share),
+            model_fp: self.kv_model_fingerprint(),
+        }))
+    }
+}
+
+// -------- Issue-34 §8 multi-stage CAPTURE/RESTORE over gemma4's frameless transport --------
+// Same I8-control-tensor scheme as ov-runtime (real frames are F16/I64/F32, never I8 ⇒ collision
+// -free). Stateful shards only; `kv_coord`-gated. gemma4's recv reads pos+hidden+cross-KV, so the
+// demux peeks the FIRST frame's dtype before the multi-frame read.
+#[cfg(feature = "kv_coord")]
+const G_OPCODE_CAPTURE: u8 = 1;
+#[cfg(feature = "kv_coord")]
+const G_OPCODE_CAPTURE_ACK: u8 = 2;
+#[cfg(feature = "kv_coord")]
+const G_OPCODE_RESTORE: u8 = 3;
+#[cfg(feature = "kv_coord")]
+const G_OPCODE_RESTORE_ACK: u8 = 4;
+#[cfg(feature = "kv_coord")]
+const G_OPCODE_ABORT: u8 = 5;
+#[cfg(feature = "kv_coord")]
+const G_OPCODE_ABORT_ACK: u8 = 6;
+/// H.1b (R2): CAPTURE whose body also carries the turn's TENANT (`capture_body_bytes_v2`). Separate
+/// opcode, not a wider v1 body — the v1 codec enforces an exact length and hard-errors mid-chain on
+/// a mismatch. Emitted only for a non-empty tenant, so a chain that names none stays on v1.
+/// Ceiling on the widened prefill-reply wait (transport budget = recv_timeout × 10, which is
+/// operator-frame-knob-coupled, not compute-coupled). Measured legit worst: 51 s. See the call site.
+const G_PREFILL_REPLY_CEILING: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The prefill reply wait, ceilinged. One definition for the call site and its test — a test that
+/// re-implements the pattern inline pins nothing (deleting the call-site ceiling would leave it
+/// green; this file has shipped that mistake before).
+async fn recv_prefill_reply_ceilinged(
+    g: &mut cascadia_transport::ActivationClient,
+) -> Result<
+    (
+        cascadia_transport::Tensor,
+        cascadia_transport::TransferStats,
+    ),
+    cascadia_transport::TransportError,
+> {
+    match tokio::time::timeout(G_PREFILL_REPLY_CEILING, g.recv_reply_prefill()).await {
+        Ok(r) => r,
+        Err(_) => Err(cascadia_transport::TransportError::SocketClosed),
+    }
+}
+#[cfg(feature = "kv_coord")]
+/// Bound on a downstream CAPTURE/RESTORE/ABORT ack; mirrors ov-runtime's RESTORE_ACK_TIMEOUT.
+/// Every driver-side control exchange is bounded (qwen36 does the same via `reply_bounded`):
+/// a dead peer must error the exchange, not wedge the engine step forever.
+const G_CONTROL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Bounded control-ack recv shared by the CAPTURE/RESTORE/ABORT exchanges. A
+/// peer that dies without acking must surface as an error here — the caller
+/// holds the downstream lock, so an unbounded wait wedges the engine step (and
+/// with it the whole rank) forever.
+#[cfg(feature = "kv_coord")]
+async fn recv_control_ack_bounded(
+    g: &mut cascadia_transport::ActivationClient,
+) -> Result<WireTensor, cascadia_transport::TransportError> {
+    let (ack, _) = tokio::time::timeout(G_CONTROL_ACK_TIMEOUT, g.recv())
+        .await
+        .map_err(|_| cascadia_transport::TransportError::SocketClosed)??;
+    Ok(ack)
+}
+const G_OPCODE_CAPTURE_V2: u8 = 7;
+
+#[cfg(feature = "kv_coord")]
+impl Gemma4Engine {
+    /// A non-empty `tenant` upgrades the frame to `G_OPCODE_CAPTURE_V2` so the downstream rank —
+    /// which never sees the `GenerationTask` — can tag its own capture with the same namespace.
+    fn send_capture_downstream(
+        &mut self,
+        epoch: u64,
+        tokens: &[i32],
+        tenant: &str,
+    ) -> EngineResult<()> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        let mut data = if tenant.is_empty() {
+            vec![G_OPCODE_CAPTURE]
+        } else {
+            vec![G_OPCODE_CAPTURE_V2]
+        };
+        if tenant.is_empty() {
+            data.extend_from_slice(&crate::kv_coordination::capture_body_bytes(epoch, tokens));
+        } else {
+            data.extend_from_slice(&crate::kv_coordination::capture_body_bytes_v2(
+                epoch, tokens, tenant,
+            ));
+        }
+        let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
+        let ack = self
+            .block_on(async move {
+                let mut g = downstream.lock().await;
+                g.send(&t).await?;
+                // Bounded, for the same reason ov-runtime bounds its CAPTURE ack: a peer on an
+                // older build that meets G_OPCODE_CAPTURE_V2 errors WITHOUT acking, and an
+                // unbounded wait here wedges this rank while it holds the downstream lock.
+                let ack = recv_control_ack_bounded(&mut g).await?;
+                Ok::<_, cascadia_transport::TransportError>(ack)
+            })
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        if ack.dtype == WireDType::I8 && ack.data.first() == Some(&G_OPCODE_CAPTURE_ACK) {
+            Ok(())
+        } else {
+            Err(EngineError::Backend("gemma4: bad CAPTURE ack".into()))
+        }
+    }
+
+    fn send_restore_downstream(&mut self, epoch: u64) -> EngineResult<bool> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        let mut data = vec![G_OPCODE_RESTORE];
+        data.extend_from_slice(&epoch.to_le_bytes());
+        let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
+        let ack = self
+            .block_on(async move {
+                let mut g = downstream.lock().await;
+                g.send(&t).await?;
+                // Bounded like CAPTURE above: an unbounded wait on a dead peer
+                // wedges this rank while it holds the downstream lock.
+                let ack = recv_control_ack_bounded(&mut g).await?;
+                Ok::<_, cascadia_transport::TransportError>(ack)
+            })
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        if ack.dtype == WireDType::I8 && ack.data.first() == Some(&G_OPCODE_RESTORE_ACK) {
+            Ok(ack.data.get(1) == Some(&1))
+        } else {
+            Err(EngineError::Backend("gemma4: bad RESTORE ack".into()))
+        }
+    }
+
+    fn send_abort_downstream(&mut self) -> EngineResult<()> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        let t = WireTensor::new(WireDType::I8, [1, 1, 1], vec![G_OPCODE_ABORT]);
+        self.block_on(async move {
+            let mut g = downstream.lock().await;
+            g.send(&t).await?;
+            // Bounded like CAPTURE above: an unbounded wait on a dead peer
+            // wedges this rank while it holds the downstream lock.
+            let _ = recv_control_ack_bounded(&mut g).await?;
+            Ok::<_, cascadia_transport::TransportError>(())
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))
+    }
+
+    fn send_control_ack_upstream(&mut self, ack_opcode: u8, payload: &[u8]) -> EngineResult<()> {
+        let upstream = self
+            .upstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
+        let mut data = vec![ack_opcode];
+        data.extend_from_slice(payload);
+        let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
+        self.block_on(async move {
+            let mut g = upstream.lock().await;
+            g.send(&t).await
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Handle an inbound I8 control tensor on a worker (called transparently inside the recv loop).
+    fn handle_inbound_control(&mut self, t: &WireTensor) -> EngineResult<()> {
+        match t.data.first().copied() {
+            // V2 additionally carries the turn's tenant, which tags the stash and rides the chain on.
+            Some(op @ (G_OPCODE_CAPTURE | G_OPCODE_CAPTURE_V2)) => {
+                let (epoch, tokens, tenant) = if op == G_OPCODE_CAPTURE_V2 {
+                    crate::kv_coordination::parse_capture_body_v2(&t.data[1..])
+                        .ok_or_else(|| EngineError::Backend("gemma4: bad CAPTURE_V2 body".into()))?
+                } else {
+                    let (e, tk) = crate::kv_coordination::parse_capture_body(&t.data[1..])
+                        .ok_or_else(|| EngineError::Backend("gemma4: bad CAPTURE body".into()))?;
+                    (e, tk, crate::kv_coordination::LOCAL_NS.to_string())
+                };
+                if let Ok(blob) = self.runtime.get_state_blob() {
+                    // Mirror into the lock-free holder cache (worker rank serves rank-N GET from here).
+                    self.kv_share
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .capture_under_epoch_ns(&tenant, epoch, tokens.clone(), blob.clone());
+                    self.kv
+                        .capture_under_epoch_ns(&tenant, epoch, tokens.clone(), blob);
+                }
+                if !self.spec.is_last_stage {
+                    if let Err(e) = self.send_capture_downstream(epoch, &tokens, &tenant) {
+                        warn!(error = %e, "gemma4: CAPTURE chain downstream failed (best-effort)");
+                    }
+                }
+                self.send_control_ack_upstream(G_OPCODE_CAPTURE_ACK, &[])
+            }
+            Some(G_OPCODE_RESTORE) => {
+                let epoch = t
+                    .data
+                    .get(1..9)
+                    .and_then(|b| b.try_into().ok())
+                    .map(u64::from_le_bytes)
+                    .ok_or_else(|| EngineError::Backend("gemma4: bad RESTORE body".into()))?;
+                // No warm flag needed: gemma4 workers reset on the carried frame position, so the
+                // head's warm prefill (position = warm_len > 0) skips reset, and a cold turn
+                // (position 0) resets everyone — restored or not.
+                let local_ok = if !self.has_own_kv() {
+                    // KV-sharing tail: this stage holds no own KV (all shared upstream), so there is
+                    // nothing to restore — a trivial success (never abort the chain on this rank).
+                    true
+                } else {
+                    match self.kv.take_capture(epoch) {
+                        Some((_, blob)) => self.restore_blob_clean(&blob),
+                        None => false,
+                    }
+                };
+                let down_ok = if self.spec.is_last_stage {
+                    true
+                } else {
+                    self.send_restore_downstream(epoch).unwrap_or(false)
+                };
+                self.send_control_ack_upstream(
+                    G_OPCODE_RESTORE_ACK,
+                    &[u8::from(local_ok && down_ok)],
+                )
+            }
+            Some(G_OPCODE_ABORT) => {
+                let _ = self.runtime.reset_state();
+                self.position = 0;
+                if !self.spec.is_last_stage {
+                    let _ = self.send_abort_downstream();
+                }
+                self.send_control_ack_upstream(G_OPCODE_ABORT_ACK, &[])
+            }
+            other => Err(EngineError::Backend(format!(
+                "gemma4: unknown control opcode {other:?}"
+            ))),
+        }
+    }
+}
+
+#[cfg(feature = "kv_coord")]
+impl Gemma4Engine {
+    /// Stable model+stage fingerprint — a stage only matches the identical stage on a peer chain.
+    fn kv_model_fingerprint(&self) -> u64 {
+        let s = &self.spec;
+        let mut buf = s.model_id.clone().into_bytes();
+        buf.extend_from_slice(&s.layer_start.to_le_bytes());
+        buf.extend_from_slice(&s.layer_end.to_le_bytes());
+        buf.extend_from_slice(&s.total_layers.to_le_bytes());
+        crate::kv_coordination::fnv1a64(&buf)
+    }
+    /// Whether this stage bears any OWN KV: true iff its layer range starts before the own-KV
+    /// layers `[0, total_layers - num_kv_shared_layers)`. Dense stages are always true (shared = 0);
+    /// gemma4's KV-sharing tail (all own-KV upstream in stage_0) is false.
+    /// `set_state_blob` onto a CLEAN request. gemma4's `reset_state` leaves residue (shim.cpp), so a
+    /// bare set over the prior turn's live state corrupts the warm continuation AND leaks into the next
+    /// cold turn. The head path established this as load-bearing, but the worker RESTORE handler and the
+    /// plane `apply_warm_resume` were doing a bare set — so any non-head rank that bears own KV restored
+    /// over dirty state. Returns false (⇒ that rank votes cold) if the rebuild fails, instead of
+    /// proceeding into exactly the corruption the rebuild exists to prevent.
+    #[cfg(feature = "kv_coord")]
+    fn restore_blob_clean(&mut self, blob: &[u8]) -> bool {
+        if let Err(e) = self.runtime.recreate_request() {
+            warn!(error = %e, "gemma4: recreate_request before restore failed; cold reprefill");
+            self.state_restored = true;
+            return false;
+        }
+        self.state_restored = true;
+        self.runtime.set_state_blob(blob).is_ok()
+    }
+
+    fn has_own_kv(&self) -> bool {
+        self.spec.layer_start
+            < self
+                .spec
+                .total_layers
+                .saturating_sub(self.num_kv_shared_layers)
+    }
+}
+
+#[cfg(feature = "kv_coord")]
+impl cascadia_engine::KvCoordination for Gemma4Engine {
+    fn model_fingerprint(&self) -> u64 {
+        self.kv_model_fingerprint()
+    }
+    fn layout_version(&self) -> u16 {
+        cascadia_kv_wire::OPAQUE_KV_LAYOUT
+    }
+    fn engine_rev(&self) -> u64 {
+        crate::kv_coordination::KV_ENGINE_REV
+    }
+    fn tokenize(&self, text: &str) -> Option<Vec<i32>> {
+        let enc = self.tokenizer.as_ref()?.encode(text, false).ok()?;
+        Some(enc.get_ids().iter().map(|&u| u as i32).collect())
+    }
+    fn lookup(&mut self, partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
+        self.kv.lookup(partner, token_ids)
+    }
+    fn export(
+        &mut self,
+        partner: &str,
+        expected_epoch: u64,
+        expected_len: u32,
+    ) -> Option<(cascadia_kv_wire::Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
+        let fp = self.kv_model_fingerprint();
+        let (prefix, blob) = self.kv.serve(partner, expected_epoch, expected_len)?;
+        Some(crate::kv_coordination::blob_to_wire(
+            &prefix,
+            &blob,
+            partner,
+            fp,
+            expected_epoch,
+        ))
+    }
+    fn insert(
+        &mut self,
+        partner: &str,
+        manifest: &cascadia_kv_wire::Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
+        let (tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
+        // H.1b hard gate (§12.10.0a): key on the ASSERTED partner, never `manifest.partner`, which
+        // the serving holder stamps and nothing validates.
+        self.kv.insert_both(partner, tokens, blob);
+        Ok(())
+    }
+
+    fn apply_warm_resume(&mut self, epoch: u64) -> bool {
+        // Plane path (§0(B), multi-rank downstream): the pull staged this rank's slice under `epoch`;
+        // set_state it now. Mirrors the RESTORE handler's local apply. step_first's take_warm then
+        // re-warms + sets position (idempotent double-set; gemma4 keeps no warm flag). Not on the
+        // total=1 path (the head warms its own rank-0 slice via take_warm).
+        match self.kv.take_capture(epoch) {
+            Some((_, blob)) => self.restore_blob_clean(&blob),
+            None => false,
+        }
+    }
+
+    fn abort_warm_resume(&mut self, epoch: u64) {
+        // Drop a STAGED slice first so a later commit cannot resurrect it.
+        let _ = self.kv.take_capture(epoch);
+        // Verdict rejected after this rank applied — rebuild the request to drop the restored state.
+        // gemma4 keeps no warm flag, so the rebuild alone returns it to cold; `state_restored` makes
+        // the following cold reset upgrade to a rebuild too (this model's reset_state leaves residue).
+        if let Err(e) = self.runtime.recreate_request() {
+            warn!(error = %e, "gemma4: recreate_request on warm-resume abort failed");
+        }
+        self.state_restored = true;
+    }
+
+    fn kv_bearing_ranks(&self, total_ranks: usize) -> usize {
+        // A stage bears own KV iff its layer range starts before the own-KV layers [0, own).
+        // Layers split ceil(total/num_stages) per stage (matches export_gemma4.py).
+        let own = self
+            .spec
+            .total_layers
+            .saturating_sub(self.num_kv_shared_layers);
+        if own == 0 || self.num_stages == 0 {
+            return total_ranks;
+        }
+        let per_stage = self.spec.total_layers.div_ceil(self.num_stages);
+        if per_stage == 0 {
+            return total_ranks;
+        }
+        let n = (0..self.num_stages)
+            .filter(|k| (k * per_stage) < own)
+            .count();
+        n.max(1).min(total_ranks)
+    }
 }
 
 // -------- Builder --------
@@ -1136,6 +1774,9 @@ pub struct Gemma4Builder {
     pub ov_properties: Vec<(String, String)>,
     runtime: Option<OvRuntime>,
     spec: Option<ShardSpec>,
+    /// KV-sharing layer count from pipeline_config.json, stashed in load() for build(). See
+    /// [`Gemma4Engine::num_kv_shared_layers`].
+    num_kv_shared_layers: u32,
     tokenizer: Option<Arc<Tokenizer>>,
     eos_token_ids: Vec<u32>,
     upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
@@ -1332,6 +1973,7 @@ impl Builder for Gemma4Builder {
             tp_rank: 0,
         };
         self.spec = Some(spec);
+        self.num_kv_shared_layers = pipeline_cfg.num_kv_shared_layers;
 
         events.push(LoadProgress::message(format!(
             "compiling stage {} on {}",
@@ -1459,6 +2101,8 @@ impl Builder for Gemma4Builder {
 
         Ok(Box::new(Gemma4Engine {
             spec,
+            num_kv_shared_layers: self.num_kv_shared_layers,
+            num_stages: self.total,
             runtime,
             tokenizer: self.tokenizer,
             eos_token_ids: self.eos_token_ids.clone(),
@@ -1466,6 +2110,7 @@ impl Builder for Gemma4Builder {
             downstream: self.downstream,
             runtime_handle: tokio::runtime::Handle::current(),
             position: 0,
+            state_restored: false,
             canonical_inputs,
             pending: Vec::new(),
             active: None,
@@ -1473,6 +2118,12 @@ impl Builder for Gemma4Builder {
             external_kv_in,
             pending_external_kv: std::collections::HashMap::new(),
             step_warn: StepWarnLimiter::default(),
+            #[cfg(feature = "kv_coord")]
+            kv: crate::kv_coordination::OvKvCache::default(),
+            #[cfg(feature = "kv_coord")]
+            kv_share: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::kv_coordination::OvKvCache::default(),
+            )),
         }))
     }
 }
@@ -1481,6 +2132,77 @@ impl Builder for Gemma4Builder {
 mod tests {
     use super::*;
     use cascadia_types::PeerLayout;
+
+    /// Rig incident (2026-08-17): RESTORE/ABORT ack recvs were UNBOUNDED while
+    /// CAPTURE's was bounded, so a peer that died without acking wedged the
+    /// engine step forever (holding the downstream lock). Every control-ack
+    /// recv now routes through `recv_control_ack_bounded`, which must ERROR on
+    /// a silent peer once the budget lapses, never wedge.
+    #[cfg(feature = "kv_coord")]
+    #[tokio::test]
+    async fn control_ack_recv_errors_instead_of_wedging_on_a_silent_peer() {
+        // A peer that accepts and then never writes — the dead-peer shape.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let mut client = cascadia_transport::ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        let _held_open = accept.await.unwrap();
+
+        // Pause AFTER the real connect so auto-advance only drives the recv
+        // bound (and the test's own backstop), not the connect timeout.
+        tokio::time::pause();
+        let res = tokio::time::timeout(
+            G_CONTROL_ACK_TIMEOUT * 4,
+            super::recv_control_ack_bounded(&mut client),
+        )
+        .await;
+        match res {
+            Ok(Err(_)) => {} // bounded: the dead peer surfaces as an error
+            Ok(Ok(_)) => panic!("a silent peer cannot produce an ack"),
+            Err(_) => panic!("control-ack recv wedged past its bound on a silent peer"),
+        }
+    }
+
+    /// Same incident, prefill flavor: the transport's widened prefill budget is
+    /// recv_timeout × 10 — the rig's 600 s knob made it 6000 s, and the waiting
+    /// head held its admission slot the whole time (a one-slot node refused
+    /// everything for 100 minutes). The ceiling must error a silent downstream
+    /// at G_PREFILL_REPLY_CEILING regardless of how large the operator knob is.
+    #[tokio::test]
+    async fn prefill_reply_wait_is_ceilinged_on_a_silent_downstream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let mut client = cascadia_transport::ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        let _held_open = accept.await.unwrap();
+
+        tokio::time::pause();
+        // Under a paused clock BOTH the ceiling and the transport's own 10× budget fire instantly
+        // in real time, so "errors eventually" cannot distinguish them (a first draft of this test
+        // passed with the ceiling deleted). Discriminate on ELAPSED VIRTUAL TIME: with the ceiling,
+        // the error lands at exactly G_PREFILL_REPLY_CEILING; without it, at the transport budget.
+        let budget = cascadia_transport::recv_timeout()
+            .saturating_mul(cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR);
+        assert!(
+            budget > G_PREFILL_REPLY_CEILING,
+            "precondition: the transport budget ({budget:?}) must exceed the ceiling in this test \
+             env or the assertion below cannot discriminate — raise the ceiling gap or the env knob"
+        );
+        let t0 = tokio::time::Instant::now();
+        let res = super::recv_prefill_reply_ceilinged(&mut client).await;
+        let elapsed = t0.elapsed();
+        assert!(
+            res.is_err(),
+            "a silent downstream cannot produce a prefill reply"
+        );
+        assert!(
+            elapsed <= G_PREFILL_REPLY_CEILING + std::time::Duration::from_secs(1),
+            "prefill reply errored only after {elapsed:?} — the ceiling was not applied \
+             (transport budget is {budget:?})"
+        );
+    }
 
     #[tokio::test]
     async fn rejects_missing_pipeline_config() {

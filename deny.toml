@@ -15,6 +15,7 @@
 ignore = [
     "RUSTSEC-2025-0119", # number_prefix 0.4.0 (unmaintained) — transitive via indicatif → hf-hub → cascadia-download; no safe upgrade.
     "RUSTSEC-2024-0436", # paste 1.0.15 (unmaintained) — transitive via tokenizers; no safe upgrade.
+    "RUSTSEC-2025-0141", # bincode 2.0.1 (unmaintained) — direct dep of cascadia-kv-wire for KV snapshot codec; team ceased development but considers 2.x complete/stable, no vulnerability. Keep until a maintained equivalent is vetted.
 ]
 # Never ship a version that has been yanked from the registry.
 yanked = "deny"

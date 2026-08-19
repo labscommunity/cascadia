@@ -34,7 +34,7 @@ use cascadia_ov_genai_shim::{
 };
 use cascadia_transport::{
     recv_tensor, send_tensor, ActivationClient, ActivationServer, DType as WireDType,
-    Tensor as WireTensor, MAX_RANK,
+    Tensor as WireTensor, MAX_RANK, MAX_RAW_BYTES,
 };
 use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId};
 use futures::stream;
@@ -45,12 +45,36 @@ use tracing::{info, warn};
 
 // -------- frame protocol --------
 
+/// Ceiling on a carried RESTORE blob; guards against a desynced frame stream misreading the length
+/// as garbage and triggering an unbounded read. One rank's whole-state KV is tens of MB.
+#[cfg(feature = "kv_coord")]
+const MAX_CARRY_BLOB_BYTES: usize = 256 * 1024 * 1024;
+
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameKind {
     Forward = 1,
     Reset = 3,
     LogitsResponse = 4,
+    // Issue-34 §8 multi-stage KV coordination (append-only; `kv_coord`-gated). CAPTURE snapshots a
+    // rank's KV under the head epoch; RESTORE set_states a pulled slice (ACK body carries the
+    // all-or-nothing verdict). The existing RESET is the cold fallback.
+    #[cfg(feature = "kv_coord")]
+    Capture = 5,
+    #[cfg(feature = "kv_coord")]
+    CaptureAck = 6,
+    #[cfg(feature = "kv_coord")]
+    Restore = 7,
+    #[cfg(feature = "kv_coord")]
+    RestoreAck = 8,
+    /// H.1b (R2): CAPTURE whose body also carries the turn's TENANT
+    /// (`capture_body_bytes_masked_v2`). A separate kind, not a wider `Capture` body: `from_u32`
+    /// hard-errors on an unknown kind and the masked codec enforces an exact length, so widening
+    /// in place would break any chain whose ranks run different builds. dist-spec's CAPTURE always
+    /// carries a valid_mask, and mask and tenant are byte-indistinguishable suffixes — the kind is
+    /// the ONLY thing that tells the two bodies apart.
+    #[cfg(feature = "kv_coord")]
+    CaptureV2 = 9,
 }
 
 impl FrameKind {
@@ -59,6 +83,16 @@ impl FrameKind {
             1 => Some(Self::Forward),
             3 => Some(Self::Reset),
             4 => Some(Self::LogitsResponse),
+            #[cfg(feature = "kv_coord")]
+            5 => Some(Self::Capture),
+            #[cfg(feature = "kv_coord")]
+            6 => Some(Self::CaptureAck),
+            #[cfg(feature = "kv_coord")]
+            7 => Some(Self::Restore),
+            #[cfg(feature = "kv_coord")]
+            8 => Some(Self::RestoreAck),
+            #[cfg(feature = "kv_coord")]
+            9 => Some(Self::CaptureV2),
             _ => None,
         }
     }
@@ -362,6 +396,33 @@ pub struct MaskedReq {
     inputs: std::collections::HashMap<String, String>,
 }
 
+#[cfg(feature = "kv_coord")]
+impl MaskedReq {
+    pub(crate) fn kv_blob(&mut self) -> Option<Vec<u8>> {
+        self.runtime.get_state_blob().ok()
+    }
+    pub(crate) fn kv_restore(&mut self, b: &[u8]) -> bool {
+        self.runtime.set_state_blob(b).is_ok()
+    }
+    /// After a warm `set_state_blob`, align the host-side cursors to the restored prefix length so
+    /// the next `feed` appends the suffix at the right position (mirrors `reset`, but to `len`).
+    pub(crate) fn kv_set_pos(&mut self, len: usize) {
+        if len + 1 > self.valid_mask.len() {
+            self.valid_mask.resize((len + 1) * 2, 1);
+        }
+        for m in self.valid_mask.iter_mut() {
+            *m = 1;
+        }
+        self.cache_len = len;
+        self.logical_pos = len;
+    }
+    /// Host valid_mask over the live KV ([0..cache_len)): 1=accepted, 0=rejected draft. Feeds
+    /// `kv_compact_blob` at capture so the stored blob drops speculative positions.
+    pub(crate) fn valid_prefix(&self) -> &[i64] {
+        &self.valid_mask[..self.cache_len.min(self.valid_mask.len())]
+    }
+}
+
 impl MaskedReq {
     pub fn new(runtime: OvRuntime) -> Result<Self, EngineError> {
         let n_inputs = runtime.input_count();
@@ -552,6 +613,107 @@ pub struct DistributedMaskedReq {
     pub t_alpha_infer: std::time::Duration,
     pub t_alpha_output: std::time::Duration,
     pub t_wire: std::time::Duration,
+}
+
+#[cfg(feature = "kv_coord")]
+impl DistributedMaskedReq {
+    pub(crate) fn stage0_blob(&mut self) -> Option<Vec<u8>> {
+        self.stage0.get_state_blob().ok()
+    }
+    pub(crate) fn stage0_restore(&mut self, b: &[u8]) -> bool {
+        self.stage0.set_state_blob(b).is_ok()
+    }
+    /// Align host-side cursors to a restored prefix (see `MaskedReq::kv_set_pos`).
+    pub(crate) fn kv_set_pos(&mut self, len: usize) {
+        if len + 1 > self.valid_mask.len() {
+            self.valid_mask.resize((len + 1) * 2, 1);
+        }
+        for m in self.valid_mask.iter_mut() {
+            *m = 1;
+        }
+        self.cache_len = len;
+        self.logical_pos = len;
+    }
+
+    /// Driver valid_mask over the target chain's live KV ([0..cache_len)). Every stage shares the
+    /// driver's per-FORWARD attn, so this one mask compacts stage0 locally AND every worker's blob.
+    pub(crate) fn valid_prefix(&self) -> &[i64] {
+        &self.valid_mask[..self.cache_len.min(self.valid_mask.len())]
+    }
+
+    /// §8 CAPTURE: broadcast `(epoch, tokens, valid_mask)` down the target chain; await the aggregate
+    /// ACK. The mask lets each worker compact its own padded KV blob (workers hold no mask of their own).
+    /// A non-empty `tenant` upgrades the frame to `CaptureV2` so each worker — which never sees the
+    /// `GenerationTask` — can tag its own capture with the same namespace.
+    pub(crate) fn capture_downstream(
+        &mut self,
+        epoch: u64,
+        tokens: &[i32],
+        tenant: &str,
+    ) -> Result<(), EngineError> {
+        let (kind, body) = if tenant.is_empty() {
+            (
+                FrameKind::Capture,
+                crate::kv_coordination::capture_body_bytes_masked(
+                    epoch,
+                    tokens,
+                    self.valid_prefix(),
+                ),
+            )
+        } else {
+            (
+                FrameKind::CaptureV2,
+                crate::kv_coordination::capture_body_bytes_masked_v2(
+                    epoch,
+                    tokens,
+                    self.valid_prefix(),
+                    tenant,
+                ),
+            )
+        };
+        let downstream = self.downstream.clone();
+        run_async(&self.runtime_handle, async move {
+            let mut g = downstream.lock().await;
+            g.send_raw(&(kind as u32).to_be_bytes()).await?;
+            g.send_raw(&(body.len() as u32).to_be_bytes()).await?;
+            g.send_raw(&body).await?;
+            let kb = g.recv_raw(4).await?;
+            if u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]) != FrameKind::CaptureAck as u32 {
+                return Err(cascadia_transport::TransportError::SocketClosed);
+            }
+            Ok(())
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))
+    }
+
+    /// §8 RESTORE: broadcast `epoch` (+ the downstream rank's carried blob, if any) down the target
+    /// chain; return the all-or-nothing verdict. `carried` is the head-pulled slice for the next rank on
+    /// a cross-chain move (empty ⇒ same-chain: the rank restores from its own CAPTURE). Wire: [epoch:8]
+    /// [carried_len:8 LE][carried].
+    pub(crate) fn restore_downstream(
+        &mut self,
+        epoch: u64,
+        carried: Vec<u8>,
+    ) -> Result<bool, EngineError> {
+        let downstream = self.downstream.clone();
+        run_async(&self.runtime_handle, async move {
+            let mut g = downstream.lock().await;
+            g.send_raw(&(FrameKind::Restore as u32).to_be_bytes())
+                .await?;
+            g.send_raw(&epoch.to_le_bytes()).await?;
+            g.send_raw(&(carried.len() as u64).to_le_bytes()).await?;
+            if !carried.is_empty() {
+                g.send_raw(&carried).await?;
+            }
+            let kb = g.recv_raw(4).await?;
+            if u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]) != FrameKind::RestoreAck as u32 {
+                return Err(cascadia_transport::TransportError::SocketClosed);
+            }
+            let vb = g.recv_raw(1).await?;
+            Ok(vb.first() == Some(&1))
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))
+    }
 }
 
 impl DistributedMaskedReq {
@@ -1135,6 +1297,9 @@ pub fn spec_decode_greedy(
 /// of buffering all output and emitting one giant final chunk.
 struct ActiveSpec {
     task: GenerationTask,
+    /// Issue-34: the prompt tokens (capture key = prompt ++ out). `kv_coord` only.
+    #[cfg(feature = "kv_coord")]
+    prompt_ids: Vec<i64>,
     /// Accumulated accepted tokens (including the first sampled token).
     out: Vec<i64>,
     /// Cumulative byte-length of the detokenized text emitted so far.
@@ -1163,6 +1328,15 @@ pub struct OvDistSpecEngine {
     k: usize,
     pending: Vec<GenerationTask>,
     active: Option<ActiveSpec>,
+    /// Issue-34: opaque KV blob cache + a stable model id (the target pipeline dir) for the
+    /// coordination-plane fingerprint. `kv_coord` only.
+    #[cfg(feature = "kv_coord")]
+    kv: crate::kv_coordination::OvKvCache,
+    /// Lock-free holder mirror of `kv` so a busy driver still answers cross-chain pulls.
+    #[cfg(feature = "kv_coord")]
+    kv_share: crate::kv_coordination::SharedKvCache,
+    #[cfg(feature = "kv_coord")]
+    kv_model_id: String,
 }
 
 impl Engine for OvDistSpecEngine {
@@ -1339,6 +1513,20 @@ impl Engine for OvDistSpecEngine {
         };
         Ok(chunks)
     }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
+        Some(self)
+    }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_holder(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvSnapshotHolder>> {
+        Some(std::sync::Arc::new(crate::kv_coordination::OvKvHolder {
+            cache: std::sync::Arc::clone(&self.kv_share),
+            // Same fp the engine advertises via `model_fingerprint()` (model-level; see kv_fingerprint).
+            model_fp: self.kv_fingerprint(),
+        }))
+    }
 }
 
 struct RoundResult {
@@ -1359,15 +1547,24 @@ impl OvDistSpecEngine {
         task: GenerationTask,
         prompt_ids: &[i64],
     ) -> Result<ActiveSpec, EngineError> {
-        self.target.reset()?;
+        // Issue-34: warm-resume a cached strict prefix (restores draft+target+chain, all-or-nothing)
+        // and feed only the suffix; else cold-reset + feed the full prompt. 0 on the default build.
+        #[cfg(feature = "kv_coord")]
+        let warm_len = self.kv_try_warm_resume(&task.tenant, prompt_ids);
+        #[cfg(not(feature = "kv_coord"))]
+        let warm_len = 0usize;
+        if warm_len == 0 {
+            self.target.reset()?;
+            self.draft.reset()?;
+        }
         self.target.t_alpha_setup = std::time::Duration::ZERO;
         self.target.t_alpha_infer = std::time::Duration::ZERO;
         self.target.t_alpha_output = std::time::Duration::ZERO;
         self.target.t_wire = std::time::Duration::ZERO;
-        self.draft.reset()?;
 
-        let (t_logits, t_shape) = self.target.feed(prompt_ids)?;
-        self.draft.feed(prompt_ids)?;
+        let feed_ids = &prompt_ids[warm_len..];
+        let (t_logits, t_shape) = self.target.feed(feed_ids)?;
+        self.draft.feed(feed_ids)?;
         let vocab = t_shape[2];
         let first = argmax(&t_logits[t_logits.len() - vocab..]) as i64;
 
@@ -1377,6 +1574,8 @@ impl OvDistSpecEngine {
 
         Ok(ActiveSpec {
             task,
+            #[cfg(feature = "kv_coord")]
+            prompt_ids: prompt_ids.to_vec(),
             out: vec![first],
             emitted: Vec::new(),
             prev_correction: first,
@@ -1492,6 +1691,20 @@ impl OvDistSpecEngine {
         let Some(active) = self.active.take() else {
             return vec![(task_id.clone(), Chunk::final_marker(task_id, last_delta))];
         };
+        // Issue-34: capture draft+target KV under (prompt ++ accepted) before the next start_task
+        // resets. Best-effort + gated.
+        #[cfg(feature = "kv_coord")]
+        {
+            let tokens: Vec<i32> = active
+                .prompt_ids
+                .iter()
+                .chain(active.out.iter())
+                .map(|&t| t as i32)
+                .collect();
+            // H.1b R2: this turn's namespace, read off THIS task's own state — never off a
+            // plane-asserted value, which describes a pulled entry, not this turn.
+            self.kv_capture(&active.task.tenant, tokens);
+        }
         info!(
             task = %active.task.task_id,
             tokens = active.out.len(),
@@ -1731,6 +1944,8 @@ impl Builder for OvDistSpecBuilder {
             DistributedMaskedReq::new(stage0, downstream, tokio::runtime::Handle::current())?;
         let masked_draft = MaskedReq::new(draft)?;
         Ok(Box::new(OvDistSpecEngine {
+            #[cfg(feature = "kv_coord")]
+            kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
             target,
             draft: masked_draft,
             tokenizer,
@@ -1738,6 +1953,12 @@ impl Builder for OvDistSpecBuilder {
             k: self.k as usize,
             pending: Vec::new(),
             active: None,
+            #[cfg(feature = "kv_coord")]
+            kv: crate::kv_coordination::OvKvCache::default(),
+            #[cfg(feature = "kv_coord")]
+            kv_share: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::kv_coordination::OvKvCache::default(),
+            )),
         }))
     }
 }
@@ -1751,6 +1972,20 @@ pub struct OvDistSpecWorkerEngine {
     upstream: Arc<tokio::sync::Mutex<ActivationServer>>,
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
     runtime_handle: tokio::runtime::Handle,
+    /// Issue-34: opaque KV blob cache + a model-level id for the coordination-plane fingerprint.
+    /// `kv_coord` only.
+    #[cfg(feature = "kv_coord")]
+    kv: crate::kv_coordination::OvKvCache,
+    /// Lock-free holder mirror of `kv` so a busy worker still answers cross-chain per-rank GETs.
+    #[cfg(feature = "kv_coord")]
+    kv_share: crate::kv_coordination::SharedKvCache,
+    /// Issue-34 plane warm-resume: mailbox the plane's commit parks this rank's pulled slice in.
+    /// Drained from the `FrameKind::Restore` handler; its lock is independent of the engine lock, so
+    /// the commit path can deposit while this worker is mid-`step()`.
+    #[cfg(feature = "kv_coord")]
+    kv_handoff: std::sync::Arc<crate::kv_coordination::KvHandoffMailbox>,
+    #[cfg(feature = "kv_coord")]
+    kv_model_id: String,
 }
 
 impl Engine for OvDistSpecWorkerEngine {
@@ -1813,6 +2048,27 @@ impl Engine for OvDistSpecWorkerEngine {
         }
         result.map(|_| Vec::new())
     }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
+        Some(self)
+    }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_holder(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvSnapshotHolder>> {
+        Some(std::sync::Arc::new(crate::kv_coordination::OvKvHolder {
+            cache: std::sync::Arc::clone(&self.kv_share),
+            // Same model-level fp the engine advertises (see kv_fingerprint) so the pull's single
+            // asserted fingerprint matches this rank's GET.
+            model_fp: self.kv_fingerprint(),
+        }))
+    }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_handoff(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>> {
+        Some(std::sync::Arc::clone(&self.kv_handoff)
+            as std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>)
+    }
 }
 
 impl OvDistSpecWorkerEngine {
@@ -1847,6 +2103,131 @@ impl OvDistSpecWorkerEngine {
             }
             FrameKind::LogitsResponse => Err(EngineError::Backend(
                 "worker received LOGITS_RESPONSE".into(),
+            )),
+            // Issue-34 §8: snapshot this rank's KV under the head epoch, chain downstream, ack up.
+            // V2 additionally carries the turn's tenant, which tags the stash and rides the chain on.
+            #[cfg(feature = "kv_coord")]
+            kind @ (FrameKind::Capture | FrameKind::CaptureV2) => {
+                let up = self.upstream.clone();
+                let body = run_async(&self.runtime_handle, async move {
+                    let mut g = up.lock().await;
+                    let lb = g.recv_raw(4).await?;
+                    let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
+                    g.recv_raw(n).await
+                })
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+                let (epoch, tokens, valid, tenant) = if kind == FrameKind::CaptureV2 {
+                    crate::kv_coordination::parse_capture_body_masked_v2(&body).ok_or_else(
+                        || EngineError::Backend("ov-dist-spec: bad CAPTURE_V2 body".into()),
+                    )?
+                } else {
+                    let (e, tk, v) = crate::kv_coordination::parse_capture_body_masked(&body)
+                        .ok_or_else(|| {
+                            EngineError::Backend("ov-dist-spec: bad CAPTURE body".into())
+                        })?;
+                    (e, tk, v, crate::kv_coordination::LOCAL_NS.to_string())
+                };
+                // Compact this rank's KV with the driver's mask (shared across the target chain).
+                if let Ok(blob) = self.runtime.get_state_blob() {
+                    match crate::kv_coordination::kv_compact_blob(&blob, &valid) {
+                        Some(blob) => {
+                            // Mirror into the lock-free holder cache so this rank serves its slice unblocked.
+                            self.kv_share
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .capture_under_epoch_ns(
+                                    &tenant,
+                                    epoch,
+                                    tokens.clone(),
+                                    blob.clone(),
+                                );
+                            self.kv
+                                .capture_under_epoch_ns(&tenant, epoch, tokens.clone(), blob);
+                        }
+                        None => warn!("ov-dist-spec worker: KV compaction failed; skip capture"),
+                    }
+                }
+                if !self.is_last {
+                    let _ = self.kv_chain_capture(epoch, &tokens, &valid, &tenant);
+                }
+                self.kv_ack_upstream(FrameKind::CaptureAck as u32, &[])
+            }
+            // RESTORE: set_state this rank's pulled slice; chain; ack the all-or-nothing verdict.
+            #[cfg(feature = "kv_coord")]
+            FrameKind::Restore => {
+                let up = self.upstream.clone();
+                // [epoch:8][carried_len:8 LE][carried] — carried is the head's inline cross-chain slice.
+                let (eb, carried) = run_async(&self.runtime_handle, async move {
+                    let mut g = up.lock().await;
+                    let eb = g.recv_raw(8).await?;
+                    let lb = g.recv_raw(8).await?;
+                    let n =
+                        u64::from_le_bytes(lb.as_slice().try_into().unwrap_or([0u8; 8])) as usize;
+                    // recv_raw caps each read at MAX_RAW_BYTES; a whole-state KV blob is far larger, so
+                    // drain it in capped chunks (matching the send-side write_all) or the stream desyncs.
+                    let blob = if n == 0 {
+                        Vec::new()
+                    } else if n > MAX_CARRY_BLOB_BYTES {
+                        return Err(cascadia_transport::TransportError::SocketClosed);
+                    } else {
+                        let mut buf = Vec::with_capacity(n);
+                        while buf.len() < n {
+                            let take = (n - buf.len()).min(MAX_RAW_BYTES);
+                            buf.extend_from_slice(&g.recv_raw(take).await?);
+                        }
+                        buf
+                    };
+                    Ok::<_, cascadia_transport::TransportError>((eb, blob))
+                })
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+                let epoch =
+                    u64::from_le_bytes(eb.as_slice().try_into().map_err(|_| {
+                        EngineError::Backend("ov-dist-spec: bad RESTORE body".into())
+                    })?);
+                // A non-empty carried slice IS the cross-chain move — the head pulled and handed this
+                // rank its slice, so use it (mirrors the certified ov-runtime tail path). Only when
+                // carried is empty (same-chain restore) fall back to this rank's own CAPTURE. Preferring
+                // a stale local CAPTURE would shadow the carried path whenever the content epoch already
+                // exists locally (e.g. the cert's B-chain warm-up serves the same prompt).
+                // Drain FIRST — same reason as ov-runtime's RESTORE arm: in plane mode the head
+                // parks this rank's slice AND still carries a blob inline, so a `||` after the
+                // carried branch short-circuits the drain away and the rank warms from carried data
+                // while the plane slice goes unread. Chain mode parks nothing, so this is a false
+                // no-op there and the carried/capture path below is unchanged.
+                let local_ok = if self.drain_kv_handoff(epoch) {
+                    true
+                } else if !carried.is_empty() {
+                    let ok = self.runtime.set_state_blob(&carried).is_ok();
+                    if ok {
+                        info!(
+                            epoch,
+                            blob_len = carried.len(),
+                            "distspec_tail_restore_carried"
+                        );
+                    }
+                    ok
+                } else if let Some((_, blob)) = self.kv.take_capture(epoch) {
+                    self.runtime.set_state_blob(&blob).is_ok()
+                } else {
+                    false
+                };
+                // Plane mode parks this rank's slice in the mailbox instead of carrying it on the
+                // RESTORE, so without this both arms above come up empty and the verdict is
+                // structurally false — the head then aborts and falls back to its local KV.
+
+                let down_ok = if self.is_last {
+                    true
+                } else {
+                    self.kv_chain_restore(epoch).unwrap_or(false)
+                };
+                self.kv_ack_upstream(
+                    FrameKind::RestoreAck as u32,
+                    &[u8::from(local_ok && down_ok)],
+                )
+            }
+            #[cfg(feature = "kv_coord")]
+            FrameKind::CaptureAck | FrameKind::RestoreAck => Err(EngineError::Backend(
+                "ov-dist-spec worker: unexpected ack frame from upstream".into(),
             )),
             FrameKind::Forward => {
                 // 2. Read FORWARD body (logical_pos, attn, hidden) from upstream.
@@ -2233,7 +2614,376 @@ impl Builder for OvDistSpecWorkerBuilder {
             upstream,
             downstream: self.downstream,
             runtime_handle: tokio::runtime::Handle::current(),
+            #[cfg(feature = "kv_coord")]
+            kv: crate::kv_coordination::OvKvCache::default(),
+            #[cfg(feature = "kv_coord")]
+            kv_share: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::kv_coordination::OvKvCache::default(),
+            )),
+            #[cfg(feature = "kv_coord")]
+            kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
+            #[cfg(feature = "kv_coord")]
+            kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
         }))
+    }
+}
+
+// -------- Issue-34 §8: KvCoordination for the dist-spec head + worker --------
+
+#[cfg(feature = "kv_coord")]
+impl OvDistSpecEngine {
+    /// head = rank 0 (holds draft + target stage0); workers are ranks 1.. .
+    /// MODEL-level fp (the target pipeline dir — identical on every rank of a chain), NOT per-rank: a
+    /// cross-chain pull asserts ONE fingerprint (the entry head's) for every rank's GET, so a per-rank
+    /// fp would reject rank>0. Mirrors qwen36 (fcd3e4e). Identical sharding across chains guards the
+    /// stage span, replacing the dropped per-rank component.
+    fn kv_fingerprint(&self) -> u64 {
+        crate::kv_coordination::fnv1a64(self.kv_model_id.as_bytes())
+    }
+    /// Snapshot draft + target stage0 into one bundle keyed by `tokens`, and broadcast CAPTURE down
+    /// the target chain so every worker rank stashes its slice. Best-effort.
+    fn kv_capture(&mut self, tenant: &str, tokens: Vec<i32>) {
+        let (Some(d), Some(s)) = (self.draft.kv_blob(), self.target.stage0_blob()) else {
+            return;
+        };
+        // Compact away spec-decode's proposed-then-rejected positions so the stored blob is dense +
+        // self-describing (draft and target each use their own mask). Skip capture if either fails —
+        // a padded blob would crash/attend junk on warm-resume (next resume falls back to cold).
+        let (Some(d), Some(s)) = (
+            crate::kv_coordination::kv_compact_blob(&d, self.draft.valid_prefix()),
+            crate::kv_coordination::kv_compact_blob(&s, self.target.valid_prefix()),
+        ) else {
+            warn!("ov-dist-spec: KV compaction failed; skip capture");
+            return;
+        };
+        let blob = crate::kv_coordination::frame_blobs(&[d, s]);
+        let epoch = crate::kv_coordination::synth_epoch(&tokens);
+        if let Err(e) = self.target.capture_downstream(epoch, &tokens, tenant) {
+            warn!(error = %e, "ov-dist-spec: CAPTURE broadcast failed (best-effort)");
+        }
+        // Mirror into the lock-free holder cache so a busy driver serves this turn's KV unblocked.
+        self.kv_share
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .capture(tenant, tokens.clone(), blob.clone());
+        self.kv.capture(tenant, tokens, blob);
+    }
+
+    /// Try to warm-resume: restore draft + target-stage0 + the whole target chain (all-or-nothing)
+    /// for a cached strict prefix. Returns the warm prefix length (0 ⇒ cold). On partial restore,
+    /// resets everything cold (a partial restore would corrupt spec-decode).
+    fn kv_try_warm_resume(&mut self, tenant: &str, prompt_ids: &[i64]) -> usize {
+        // Spec-decode leaves the KV padded with proposed-then-rejected tokens (rig: draft 148 / target
+        // 168 deep for a 98-token accepted prefix). `kv_capture` now compacts every rank's blob with its
+        // host valid_mask (shipped down the CAPTURE chain), so stored blobs are dense + self-describing —
+        // restorable like any other engine. After compaction the draft sits exactly one token behind the
+        // target (the target holds the last bonus token the draft hasn't fed yet); the resume below
+        // catches the draft up so both align before `start_task` feeds one shared suffix.
+        let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
+        let Some((blob, len, plane_pulled)) = self.kv.take_warm(tenant, &prompt_i32) else {
+            return 0;
+        };
+        let Some(parts) = crate::kv_coordination::unframe_blobs(&blob) else {
+            return 0;
+        };
+        if parts.len() != 2 {
+            return 0;
+        }
+        let epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
+        // Cross-chain: hand the pulled downstream slice to the tail inline (stash_downstream_rank stashed
+        // it under `epoch`; single-slot fallback for the 2-stage move). Empty ⇒ same-chain (tail restores
+        // from its own CAPTURE).
+        let carried = self
+            .kv
+            // Driver is rank 0 (rank>0 runs the worker engine), so this RESTORE addresses rank 1.
+            .take_downstream(epoch, 1)
+            .or_else(|| self.kv.take_downstream_single(1))
+            .unwrap_or_default();
+        let ok = self.draft.kv_restore(&parts[0])
+            && self.target.stage0_restore(&parts[1])
+            && self
+                .target
+                .restore_downstream(epoch, carried)
+                .unwrap_or(false);
+        if ok {
+            // Each model's cursor = its real KV depth, not the token count (off-by-one — see
+            // kv_seq_from_blob). Steady state: draft is 0..=1 behind the target. Align to the target by
+            // feeding the draft the gap token(s) (their KV is exactly what the target already holds), so
+            // `start_task`'s single shared suffix feed lands at the right position on both. Draft ahead,
+            // or a wider gap, can't be reconciled by one suffix ⇒ cold.
+            // Neither position may be CLAMPED or GUESSED. The guard below exists to reject a draft that
+            // is ahead of the target, and both `.min(len)` and `unwrap_or(len)` erased exactly that
+            // signal: a draft deeper than the matched prefix — or one whose depth failed to parse — came
+            // back as `d_pos == len == t_pos`, which reads as a legal zero gap. `kv_set_pos` then pointed
+            // the draft past what its tensors actually hold and the next shared-suffix feed died inside
+            // OpenVINO's eltwise broadcast ("Argument shapes are inconsistent"), taking the turn (and the
+            // engine) with it. Rig: warm_prefix=98/d_pos=97 resumed cleanly; warm_prefix=154/d_pos=154
+            // faulted. Unknown depth is now cold, not a fabricated position — cold is always recoverable.
+            let (Some(d_pos), Some(t_raw)) = (
+                crate::kv_coordination::kv_seq_from_blob(&parts[0]),
+                crate::kv_coordination::kv_seq_from_blob(&parts[1]),
+            ) else {
+                warn!("ov-dist-spec: draft/target KV depth unreadable; cold reprefill");
+                let _ = self.target.reset();
+                let _ = self.draft.reset();
+                return 0;
+            };
+            // The target defines the resume point, so it alone clamps to the matched prefix.
+            let t_pos = t_raw.min(len);
+            if d_pos <= t_pos && t_pos - d_pos <= 1 {
+                self.target.kv_set_pos(t_pos);
+                self.draft.kv_set_pos(d_pos);
+                // Catch the draft up to the target (gap is prompt[d_pos..t_pos], the accepted tail).
+                if d_pos < t_pos && self.draft.feed(&prompt_ids[d_pos..t_pos]).is_err() {
+                    let _ = self.target.reset();
+                    let _ = self.draft.reset();
+                    return 0;
+                }
+                info!(
+                    warm_prefix = t_pos,
+                    d_pos,
+                    matched = len,
+                    plane_pulled,
+                    "ov-dist-spec pipeline warm-resumed"
+                );
+                t_pos
+            } else {
+                warn!(
+                    d_pos,
+                    t_pos, len, "ov-dist-spec: draft/target KV depth out of range; cold reprefill"
+                );
+                let _ = self.target.reset();
+                let _ = self.draft.reset();
+                0
+            }
+        } else {
+            let _ = self.target.reset();
+            let _ = self.draft.reset();
+            0
+        }
+    }
+}
+
+#[cfg(feature = "kv_coord")]
+impl cascadia_engine::KvCoordination for OvDistSpecEngine {
+    fn model_fingerprint(&self) -> u64 {
+        self.kv_fingerprint()
+    }
+    fn layout_version(&self) -> u16 {
+        cascadia_kv_wire::OPAQUE_KV_LAYOUT
+    }
+    fn engine_rev(&self) -> u64 {
+        crate::kv_coordination::KV_ENGINE_REV
+    }
+    fn tokenize(&self, text: &str) -> Option<Vec<i32>> {
+        let enc = self.tokenizer.encode(text, false).ok()?;
+        Some(enc.get_ids().iter().map(|&u| u as i32).collect())
+    }
+    fn lookup(&mut self, partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
+        self.kv.lookup(partner, token_ids)
+    }
+    fn export(
+        &mut self,
+        partner: &str,
+        expected_epoch: u64,
+        expected_len: u32,
+    ) -> Option<(cascadia_kv_wire::Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
+        let fp = self.kv_fingerprint();
+        let (prefix, blob) = self.kv.serve(partner, expected_epoch, expected_len)?;
+        Some(crate::kv_coordination::blob_to_wire(
+            &prefix,
+            &blob,
+            partner,
+            fp,
+            expected_epoch,
+        ))
+    }
+    fn insert(
+        &mut self,
+        partner: &str,
+        manifest: &cascadia_kv_wire::Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
+        let (tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
+        // H.1b hard gate (§12.10.0a): key on the ASSERTED partner, never `manifest.partner`, which
+        // the serving holder stamps and nothing validates.
+        self.kv.insert_both(partner, tokens, blob);
+        Ok(())
+    }
+    // Issue-34 cross-chain CHAIN path: a downstream rank's pulled blob can't be used locally; stash it
+    // under the content epoch so `restore_downstream` ships it inline in the RESTORE frame to that rank.
+    // Without this the trait default returns Err ⇒ the head drops every downstream rank's pulled blob,
+    // the pull votes cold (no hit), and the tail never receives a carried slice. Mirrors ov-runtime/qwen36.
+    fn stash_downstream_rank(
+        &mut self,
+        rank: u16,
+        manifest: &cascadia_kv_wire::Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
+        let (_tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
+        let epoch = crate::kv_coordination::synth_epoch(&manifest.token_ids);
+        self.kv.stash_downstream(epoch, rank, blob);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "kv_coord")]
+impl OvDistSpecWorkerEngine {
+    /// MODEL-level fp — identical on every rank so a cross-chain pull's single asserted fingerprint
+    /// matches rank>0 GETs. See the driver's `kv_fingerprint` for the full rationale (fcd3e4e).
+    fn kv_fingerprint(&self) -> u64 {
+        crate::kv_coordination::fnv1a64(self.kv_model_id.as_bytes())
+    }
+    /// Drain the plane hand-off mailbox and apply the parked slice, if any. See
+    /// [`crate::kv_coordination::drain_handoff`]; called from `FrameKind::Restore` for the same two
+    /// reasons ov-runtime calls it from `OPCODE_RESTORE`: it lands before the turn's forward, and it
+    /// is the only site on the same stream as the commit that parks the slice.
+    ///
+    /// Position 0 because a worker holds no KV cursor of its own — the driver owns the spec-decode
+    /// positions — so the depth guard has nothing to compare against.
+    fn drain_kv_handoff(&mut self, expected_epoch: u64) -> bool {
+        let mailbox = std::sync::Arc::clone(&self.kv_handoff);
+        let fp = self.kv_fingerprint();
+        crate::kv_coordination::drain_handoff(&mailbox, fp, 0, expected_epoch, |blob| {
+            self.runtime.set_state_blob(blob).is_ok()
+        })
+    }
+    fn kv_ack_upstream(&mut self, ack_kind: u32, payload: &[u8]) -> Result<(), EngineError> {
+        let up = self.upstream.clone();
+        let payload = payload.to_vec();
+        run_async(&self.runtime_handle, async move {
+            let mut g = up.lock().await;
+            g.send_raw(&ack_kind.to_be_bytes()).await?;
+            if !payload.is_empty() {
+                g.send_raw(&payload).await?;
+            }
+            Ok::<_, cascadia_transport::TransportError>(())
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))
+    }
+    /// Relay CAPTURE on. `tenant` is the one the frame carried (empty on a v1 frame) — a worker has
+    /// no other source for it, so the relayed frame keeps whatever shape it arrived in.
+    fn kv_chain_capture(
+        &mut self,
+        epoch: u64,
+        tokens: &[i32],
+        valid: &[i64],
+        tenant: &str,
+    ) -> Result<(), EngineError> {
+        let Some(down) = self.downstream.clone() else {
+            return Ok(());
+        };
+        let (kind, body) = if tenant.is_empty() {
+            (
+                FrameKind::Capture,
+                crate::kv_coordination::capture_body_bytes_masked(epoch, tokens, valid),
+            )
+        } else {
+            (
+                FrameKind::CaptureV2,
+                crate::kv_coordination::capture_body_bytes_masked_v2(epoch, tokens, valid, tenant),
+            )
+        };
+        run_async(&self.runtime_handle, async move {
+            let mut g = down.lock().await;
+            g.send_raw(&(kind as u32).to_be_bytes()).await?;
+            g.send_raw(&(body.len() as u32).to_be_bytes()).await?;
+            g.send_raw(&body).await?;
+            let kb = g.recv_raw(4).await?;
+            if u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]) != FrameKind::CaptureAck as u32 {
+                return Err(cascadia_transport::TransportError::SocketClosed);
+            }
+            Ok(())
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))
+    }
+    fn kv_chain_restore(&mut self, epoch: u64) -> Result<bool, EngineError> {
+        let Some(down) = self.downstream.clone() else {
+            return Ok(true);
+        };
+        run_async(&self.runtime_handle, async move {
+            let mut g = down.lock().await;
+            g.send_raw(&(FrameKind::Restore as u32).to_be_bytes())
+                .await?;
+            g.send_raw(&epoch.to_le_bytes()).await?;
+            // MUST match the reader's [epoch:8][carried_len:8 LE][carried]. Omitting carried_len made
+            // every rank1→rank2 hop malformed: the receiver blocks reading a length that never arrives
+            // while this side blocks on the ack (or, if any later bytes land, reads them AS the length).
+            // Zero-length is the correct value here — a mid-chain rank only ever receives its OWN
+            // carried slice, never the next rank's, so downstream restores from its own CAPTURE. On a
+            // cross-chain move a 3rd+ rank has no capture under the donor epoch, so it verdicts 0 and
+            // the chain cold-resets: correct-and-cold rather than a desynced stream.
+            g.send_raw(&0u64.to_le_bytes()).await?;
+            let kb = g.recv_raw(4).await?;
+            if u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]) != FrameKind::RestoreAck as u32 {
+                return Err(cascadia_transport::TransportError::SocketClosed);
+            }
+            let vb = g.recv_raw(1).await?;
+            Ok(vb.first() == Some(&1))
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))
+    }
+}
+
+#[cfg(feature = "kv_coord")]
+impl cascadia_engine::KvCoordination for OvDistSpecWorkerEngine {
+    fn model_fingerprint(&self) -> u64 {
+        self.kv_fingerprint()
+    }
+    fn layout_version(&self) -> u16 {
+        cascadia_kv_wire::OPAQUE_KV_LAYOUT
+    }
+    fn engine_rev(&self) -> u64 {
+        crate::kv_coordination::KV_ENGINE_REV
+    }
+    fn tokenize(&self, _text: &str) -> Option<Vec<i32>> {
+        None // workers have no tokenizer + never NEGOTIATE
+    }
+    fn lookup(&mut self, _partner: &str, _token_ids: &[i32]) -> Option<(u64, u32)> {
+        None
+    }
+    fn export(
+        &mut self,
+        partner: &str,
+        expected_epoch: u64,
+        expected_len: u32,
+    ) -> Option<(cascadia_kv_wire::Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
+        let fp = self.kv_fingerprint();
+        let (prefix, blob) = self.kv.serve(partner, expected_epoch, expected_len)?;
+        Some(crate::kv_coordination::blob_to_wire(
+            &prefix,
+            &blob,
+            partner,
+            fp,
+            expected_epoch,
+        ))
+    }
+    fn insert(
+        &mut self,
+        partner: &str,
+        manifest: &cascadia_kv_wire::Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
+        let (tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
+        // H.1b hard gate (§12.10.0a): key on the ASSERTED partner, never `manifest.partner`, which
+        // the serving holder stamps and nothing validates.
+        self.kv.insert_both(partner, tokens, blob);
+        Ok(())
+    }
+    // Issue-34 cross-chain CHAIN path: a downstream rank's pulled blob can't be used locally; stash it
+    // under the content epoch so `restore_downstream` ships it inline in the RESTORE frame to that rank.
+    // Without this the trait default returns Err ⇒ the head drops every downstream rank's pulled blob,
+    // the pull votes cold (no hit), and the tail never receives a carried slice. Mirrors ov-runtime/qwen36.
+    fn stash_downstream_rank(
+        &mut self,
+        rank: u16,
+        manifest: &cascadia_kv_wire::Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
+        let (_tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
+        let epoch = crate::kv_coordination::synth_epoch(&manifest.token_ids);
+        self.kv.stash_downstream(epoch, rank, blob);
+        Ok(())
     }
 }
 

@@ -11,10 +11,15 @@ description = "Sparse-MoE engine for Kimi K2.6 style models. Runs per-layer shel
 [features]
 default = []
 openvino = ["cascadia-ov-genai-shim/openvino"]
+# Issue-34 Option C: implement the engine KvCoordination surface. Pulls the wire crate + enables the
+# trait on cascadia-engine. Off by default.
+kv_coord = ["dep:cascadia-kv-wire", "dep:crc32fast", "cascadia-engine/kv_coord"]
 
 [dependencies]
 cascadia-types = { workspace = true }
 cascadia-engine = { workspace = true }
+cascadia-kv-wire = { path = "../cascadia-kv-wire", optional = true }
+crc32fast = { version = "1.4", optional = true }
 cascadia-ov-genai-shim = { workspace = true }
 cascadia-int4-gemm = { workspace = true }
 cascadia-runner = { workspace = true }

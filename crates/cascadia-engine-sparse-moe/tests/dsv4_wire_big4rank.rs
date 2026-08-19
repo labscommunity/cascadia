@@ -86,12 +86,12 @@ async fn relay(
         recv_kind_server(up).await.unwrap(),
         Some(FrameKind::Forward)
     );
-    let (_p, _c, hw, _s) = recv_forward_body_server(up).await.unwrap();
+    let (_p, _c, _ph, hw, _s) = recv_forward_body_server(up).await.unwrap();
     let hmid = r.forward_layers(hw, pos, None);
     let downb = down.clone();
     let cfgb = cfg.clone();
     tokio::spawn(async move {
-        send_forward(&downb, pos as u32, &cfgb, &hmid, [1, 1, h])
+        send_forward(&downb, pos as u32, &cfgb, &hmid, [1, 1, h], true)
             .await
             .unwrap();
     })
@@ -113,7 +113,7 @@ async fn drive(
     let c01 = links[0].1.clone();
     let cfgb = cfg.clone();
     let st = tokio::spawn(async move {
-        send_forward(&c01, pos as u32, &cfgb, &hid, [1, 1, h])
+        send_forward(&c01, pos as u32, &cfgb, &hid, [1, 1, h], true)
             .await
             .unwrap();
     });
@@ -124,7 +124,7 @@ async fn drive(
         recv_kind_server(&links[2].0).await.unwrap(),
         Some(FrameKind::Forward)
     );
-    let (_p, _c, hw, _s) = recv_forward_body_server(&links[2].0).await.unwrap();
+    let (_p, _c, _ph, hw, _s) = recv_forward_body_server(&links[2].0).await.unwrap();
     let hlast = r3.forward_layers(hw, pos, None);
     argmax(&r3.head_logits(&hlast))
 }
