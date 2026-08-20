@@ -983,6 +983,43 @@ fn resume_max_new(max_tokens: u32, resume_token_ids: Option<&[i32]>) -> usize {
     (max_tokens as usize).saturating_sub(already)
 }
 
+/// Option B resume seed for a streaming path. Normalizes/validates the wire
+/// prefix, appends it to the prompt ids (concat, not replace), and returns the
+/// accumulator seed. `Ok(None)` = not resuming (including wire-legal
+/// `Some([])`). `emitted` is the BYTE LENGTH of the decoded prefix — the value
+/// `utf8_safe_delta` needs so the first streamed delta starts exactly after
+/// the prefix text.
+#[doc(hidden)]
+pub struct ResumeSeed {
+    pub generated_u32: Vec<u32>,
+    pub emitted: usize,
+    pub seed_len: usize,
+}
+
+#[doc(hidden)]
+pub fn prepare_resume(
+    task: &GenerationTask,
+    tokenizer: &tokenizers::Tokenizer,
+    prompt_ids_i64: &mut Vec<i64>,
+) -> Result<Option<ResumeSeed>, String> {
+    let Some(r) = task.resume_ids() else {
+        return Ok(None);
+    };
+    let vocab = tokenizer.get_vocab_size(true) as u32;
+    cascadia_types::validate_resume_ids(r, Some(vocab))
+        .map_err(|e| format!("invalid resume prefix: {e}"))?;
+    cascadia_types::append_resume_ids(prompt_ids_i64, Some(r));
+    let generated_u32: Vec<u32> = r.iter().map(|&i| i as u32).collect();
+    let prefix_text = tokenizer
+        .decode(&generated_u32, true)
+        .map_err(|e| format!("resume seed decode failed: {e}"))?;
+    Ok(Some(ResumeSeed {
+        emitted: prefix_text.len(),
+        seed_len: generated_u32.len(),
+        generated_u32,
+    }))
+}
+
 fn sampling_from_task(task: &GenerationTask) -> crate::sampling::SamplingConfig {
     let s = &task.sampling;
     crate::sampling::SamplingConfig {
