@@ -47,11 +47,19 @@ fn prepare_resume_seeds_and_appends() {
     };
     let mut ids: Vec<i64> = vec![1, 2];
     let seed = prepare_resume(&task, &tok, &mut ids).unwrap().unwrap();
-    assert_eq!(ids, vec![1, 2, 5, 6], "resume ids appended after the prompt");
+    assert_eq!(
+        ids,
+        vec![1, 2, 5, 6],
+        "resume ids appended after the prompt"
+    );
     assert_eq!(seed.generated_u32, vec![5u32, 6]);
     assert_eq!(seed.seed_len, 2);
     let prefix_text = tok.decode(&[5, 6], true).unwrap();
-    assert_eq!(seed.emitted, prefix_text.len(), "emitted = prefix byte length");
+    assert_eq!(
+        seed.emitted,
+        prefix_text.len(),
+        "emitted = prefix byte length"
+    );
 }
 
 #[test]
