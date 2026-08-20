@@ -31,3 +31,14 @@ pub use genai::{OvGenaiBuilder, OvGenaiCbEngine, OvGenaiEngine};
 pub use qwen36::{Qwen36Builder, Qwen36Engine};
 pub use rotary::{ModelTextConfig, RopeScalingConfig, Rotary};
 pub use runtime::{OvRuntimeBuilder, OvRuntimeEngine};
+
+/// Tests that touch the process-global activation-timeout knob (or read a
+/// value derived from it under a precondition) must hold this lock: three
+/// runtime.rs tests set it to 1 s and back while gemma4's ceiling test asserts
+/// the budget exceeds the ceiling — racing them made the full-workspace suite
+/// flake with "transport budget (10s) must exceed the ceiling".
+#[cfg(test)]
+pub(crate) fn timeout_knob_lock() -> std::sync::MutexGuard<'static, ()> {
+    static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    L.lock().unwrap_or_else(|e| e.into_inner())
+}

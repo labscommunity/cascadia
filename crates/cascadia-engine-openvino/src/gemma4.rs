@@ -2253,6 +2253,7 @@ mod tests {
     /// at G_PREFILL_REPLY_CEILING regardless of how large the operator knob is.
     #[tokio::test]
     async fn prefill_reply_wait_is_ceilinged_on_a_silent_downstream() {
+        let _knob = crate::timeout_knob_lock();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
