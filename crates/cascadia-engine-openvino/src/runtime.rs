@@ -6373,6 +6373,7 @@ mod tests {
     #[tokio::test]
     async fn a_wait_that_only_discards_reports_the_discards() {
         let (client, mut server) = loopback().await;
+        let _knob = crate::timeout_knob_lock();
         cascadia_transport::set_activation_timeout_secs(1);
         // Three frames, none of them echoing the seq we are waiting on.
         for s in [11u32, 12, 13] {
@@ -6397,6 +6398,7 @@ mod tests {
     #[tokio::test]
     async fn a_silent_wait_says_no_frame_arrived() {
         let (client, _server) = loopback().await;
+        let _knob = crate::timeout_knob_lock();
         cascadia_transport::set_activation_timeout_secs(1);
         let downstream = Arc::new(tokio::sync::Mutex::new(client));
         let err = recv_token_seq_checked(&downstream, 7, false)
@@ -6519,6 +6521,7 @@ mod tests {
         // Silent peer → the bounded frame-start elapses → TimedOut.
         let (client, _server) = loopback().await;
         let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let _knob = crate::timeout_knob_lock();
         cascadia_transport::set_activation_timeout_secs(1);
         let err = recv_token_seq_checked(&downstream, 0, false)
             .await
