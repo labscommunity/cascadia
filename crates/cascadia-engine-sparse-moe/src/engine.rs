@@ -170,6 +170,8 @@ pub struct SparseMoEBuilderConfig {
     pub k3_max_seq: Option<usize>,
     /// Exact KV-prefix-cache budget in bytes. `Some(0)` disables it; `None`
     /// defers to `CASCADIA_K3_PREFIX_CACHE`, then to a slice of free RAM.
+    /// The rank-0 index's own cap is a separate knob, `CASCADIA_K3_PREFIX_INDEX`
+    /// — it never reads the glm5-named `CASCADIA_GLM5_PREFIX_CACHE`.
     pub k3_prefix_cache_bytes: Option<u64>,
     /// Explicit concurrent `pread` per routed expert. `None` ⇒ env, then on.
     pub k3_read: Option<bool>,
@@ -821,8 +823,11 @@ impl Builder for SparseMoEBuilder {
                 rank,
                 total,
                 // dsv4 has no config-threaded prefix cache; `None` keeps its
-                // existing env-only behaviour byte-for-byte.
+                // existing env-only behaviour byte-for-byte, including reading
+                // the glm5-named var (out of scope here — dsv4 never had its
+                // own knob, so this preserves rather than fixes that gap).
                 None,
+                "CASCADIA_GLM5_PREFIX_CACHE",
             )));
         }
         if let Some(runner) = self.glm_runner {
@@ -846,6 +851,7 @@ impl Builder for SparseMoEBuilder {
                 // Same value the per-rank SliceKvCache got, so the rank-0 index
                 // and the per-rank caches stay in lockstep.
                 self.config.prefix_cache_depth.map(|d| d as usize),
+                "CASCADIA_GLM5_PREFIX_CACHE",
             )));
         }
         if let Some(runner) = self.k3_runner {
@@ -872,6 +878,9 @@ impl Builder for SparseMoEBuilder {
                 // store; taking glm5's `prefix_cache_depth` here would let a
                 // glm-scoped knob zero K3's index and kill prefix reuse.
                 None,
+                // K3's own env override, NOT the glm5 one below — a glm5-named
+                // knob must never zero or cap K3's rank-0 prefix index.
+                "CASCADIA_K3_PREFIX_INDEX",
             )));
         }
         if let Some(ov) = self.ov_runner {
@@ -2997,13 +3006,28 @@ fn prefix_index_cap(env_override: Option<&str>, store_enabled: bool) -> usize {
         })
 }
 
+/// `explicit` wins; failing that, reads `env_var` by NAME. The caller picks
+/// the name, so an arch-scoped knob (e.g. `CASCADIA_GLM5_PREFIX_CACHE`) can
+/// never reach a different arch's engine — see the two `PipelineEngine::new`
+/// call sites in `Builder::build`, each of which passes its own runner's var.
+fn resolve_prefix_cap(explicit: Option<usize>, env_var: &str, store_enabled: bool) -> usize {
+    explicit
+        .unwrap_or_else(|| prefix_index_cap(std::env::var(env_var).ok().as_deref(), store_enabled))
+}
+
 impl<R: StagedRunner> PipelineEngine<R> {
     /// `prefix_cap`: rank-0 KV-prefix-cache depth. `None` defers to
-    /// `CASCADIA_GLM5_PREFIX_CACHE`, and failing that to whether the runner's
-    /// store is enabled — NOT to zero, which disabled the index for every
-    /// runner not named glm. This
-    /// index must stay in lockstep with every rank's `SliceKvCache`, so the
-    /// value threaded here is the same one handed to `StageOpts`.
+    /// `prefix_cap_env_var`, and failing that to whether the runner's store is
+    /// enabled — NOT to zero, which disabled the index for every runner not
+    /// named glm. This index must stay in lockstep with every rank's
+    /// `SliceKvCache`, so the value threaded here is the same one handed to
+    /// `StageOpts`.
+    ///
+    /// `prefix_cap_env_var`: the env var name to fall back to when `prefix_cap`
+    /// is `None`. Callers pass their own arch's var — `PipelineEngine` is
+    /// shared by glm5 and kimi_k3, and a glm5-named var must never zero or cap
+    /// K3's index (or vice versa).
+    #[allow(clippy::too_many_arguments)]
     fn new(
         runner: R,
         tokenizer: Option<Tokenizer>,
@@ -3012,17 +3036,13 @@ impl<R: StagedRunner> PipelineEngine<R> {
         rank: u32,
         total: u32,
         prefix_cap: Option<usize>,
+        prefix_cap_env_var: &str,
     ) -> Self {
-        // An explicit cap from the caller wins; `None` falls back to the env
-        // var, and failing that to whether the runner's store is on at all.
-        // Shadowing the parameter unconditionally here would silently discard
-        // the caller's value.
-        let prefix_cap = prefix_cap.unwrap_or_else(|| {
-            prefix_index_cap(
-                std::env::var("CASCADIA_GLM5_PREFIX_CACHE").ok().as_deref(),
-                runner.prefix_cache_enabled(),
-            )
-        });
+        let prefix_cap = resolve_prefix_cap(
+            prefix_cap,
+            prefix_cap_env_var,
+            runner.prefix_cache_enabled(),
+        );
         Self {
             runner,
             tokenizer,
@@ -4297,6 +4317,60 @@ mod tests {
         // Garbage falls back to the store-derived default rather than panicking
         // or silently disabling the feature.
         assert_eq!(super::prefix_index_cap(Some("not-a-number"), true), 4);
+    }
+
+    /// The bug this pins: `PipelineEngine::new` used to hardcode
+    /// `CASCADIA_GLM5_PREFIX_CACHE` for every runner sharing it (glm5 and
+    /// kimi_k3 both), so an operator setting the glm5-documented knob silently
+    /// zeroed or capped K3's rank-0 prefix index too — even with
+    /// `k3_prefix_cache_bytes` explicitly funding K3's store.
+    /// `resolve_prefix_cap` now takes the env var NAME from the caller; this
+    /// proves K3's name (`CASCADIA_K3_PREFIX_INDEX`) never falls back to
+    /// reading glm5's, and that glm5's own resolution is unaffected.
+    #[test]
+    fn k3s_prefix_env_var_ignores_the_glm5_named_one() {
+        // Env vars are process-global and unit tests run in parallel within
+        // this binary, so set-then-read has to be atomic across tests, and
+        // the vars must be cleared even if an assert panics mid-test —
+        // otherwise a failure here poisons every test after it.
+        static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var("CASCADIA_GLM5_PREFIX_CACHE");
+                std::env::remove_var("CASCADIA_K3_PREFIX_INDEX");
+            }
+        }
+        let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard;
+
+        // An operator sets the glm5-documented knob to 0 ("off") and never
+        // touches K3's own var. If the leak were still present, K3's
+        // resolution would read this 0 and kill its index.
+        std::env::set_var("CASCADIA_GLM5_PREFIX_CACHE", "0");
+        std::env::remove_var("CASCADIA_K3_PREFIX_INDEX");
+        assert_eq!(
+            super::resolve_prefix_cap(None, "CASCADIA_K3_PREFIX_INDEX", true),
+            4,
+            "K3 must ignore the glm5-named var and fall back to the \
+             store-derived default (4), not read the glm5 value (0)"
+        );
+
+        // K3's own var, when set, is honored normally.
+        std::env::set_var("CASCADIA_K3_PREFIX_INDEX", "7");
+        assert_eq!(
+            super::resolve_prefix_cap(None, "CASCADIA_K3_PREFIX_INDEX", true),
+            7,
+            "K3's own env override must still take effect"
+        );
+
+        // glm5's own resolution is untouched by any of the above — same name,
+        // same semantics, unaffected by K3's var being set alongside it.
+        assert_eq!(
+            super::resolve_prefix_cap(None, "CASCADIA_GLM5_PREFIX_CACHE", true),
+            0,
+            "glm5 must keep reading its own var byte-for-byte"
+        );
     }
 
     #[test]
