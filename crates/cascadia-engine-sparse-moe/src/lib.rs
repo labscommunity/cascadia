@@ -56,6 +56,8 @@ pub mod staged;
 pub mod tensors;
 
 pub use engine::{SparseMoEBuilder, SparseMoEBuilderConfig, SparseMoEEngine};
+#[doc(hidden)]
+pub use engine::{prepare_resume, ResumeSeed};
 pub use kv_prefix_cache::{KvPrefixCache, KvSnapshot, LayerKvSlice, ModelFingerprint};
 pub use manifest::Manifest;
 pub use ngram_draft::{Draft, DEFAULT_DRAFT_K, MAX_NGRAM, MIN_NGRAM};
