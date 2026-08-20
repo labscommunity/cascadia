@@ -2126,10 +2126,15 @@ impl SparseMoEEngine {
         }
         let downstream = self.active.as_ref().unwrap().downstream.clone();
         let cfg = self.active.as_ref().unwrap().cfg.clone();
-        let history = self.active.as_ref().unwrap().history.clone();
+        // Take, not clone: a per-token clone of the growing history is O(n^2)
+        // memcpy over the turn. forward only reads the slice; put it back on
+        // success (the Err arm drops the whole slot, history with it).
+        let history = std::mem::take(&mut self.active.as_mut().unwrap().history);
         match self.forward_one_token_first(&history, &cfg, &downstream, true) {
             Ok(tok_back) => {
-                self.active.as_mut().unwrap().next = tok_back;
+                let a = self.active.as_mut().unwrap();
+                a.history = history;
+                a.next = tok_back;
                 vec![(id, token_chunk)]
             }
             Err(e) => {
@@ -5243,6 +5248,10 @@ impl<R: StagedRunner> PipelineEngine<R> {
         };
         let mut token_chunk = Chunk::token(id.clone(), next, delta);
         token_chunk.n_tokens = Some(1);
+        // Splicer poison bypass (spec §4.1, same stamp as the sparse/ovmoe
+        // decode paths): token_id==0 with empty token_ids reads as id-less and
+        // makes the stream resume-ineligible; token 0 is a legal sample.
+        token_chunk.token_ids = vec![next];
 
         let (gen_len, max_new, is_eos, pos, max_seq) = {
             let a = self.active.as_ref().unwrap();
