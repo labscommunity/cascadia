@@ -479,9 +479,17 @@ impl KvCoordination for SparseMoEEngine {
             }
             (tokens.clone(), snap.clone())
         } else {
+            // Same diagnosability as the share-holder export: a silent None here reads as
+            // `pull_not_found` on the puller with no donor-side trace.
+            tracing::info!(target: "cascadia::kv", event = "kv_serve_capture_miss",
+                epoch = expected_epoch,
+                n_captures = self.kv_capture.len(),
+                held_epochs = ?self.kv_capture.keys().copied().collect::<Vec<u64>>());
             return None;
         };
         if snap.past_seq_len as u32 != expected_len {
+            tracing::info!(target: "cascadia::kv", event = "kv_serve_len_drift",
+                epoch = expected_epoch, got = snap.past_seq_len, want = expected_len);
             return None; // drifted from what was negotiated
         }
         let (manifest, payloads) =
@@ -666,9 +674,17 @@ impl cascadia_engine::KvSnapshotHolder for SparseMoeKvHolder {
             }
             (tokens.clone(), snap.clone())
         } else {
+            // The refusal arms here are otherwise SILENT on the donor — the puller's
+            // `pull_not_found` cannot be told apart from a missing capture vs a length drift.
+            // Log what this holder actually holds so a rig-side miss is diagnosable.
+            tracing::info!(target: "cascadia::kv", event = "kv_serve_capture_miss",
+                epoch = expected_epoch, n_captures = g.captures.len(),
+                held_epochs = ?g.captures.keys().copied().collect::<Vec<u64>>());
             return None;
         };
         if snap.past_seq_len as u32 != expected_len {
+            tracing::info!(target: "cascadia::kv", event = "kv_serve_len_drift",
+                epoch = expected_epoch, got = snap.past_seq_len, want = expected_len);
             return None; // drifted from what was negotiated
         }
         Some(snapshot_to_wire(
