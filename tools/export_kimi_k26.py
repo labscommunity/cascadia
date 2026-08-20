@@ -230,6 +230,37 @@ def write_tokenizer(path, vocab_size):
         json.dump(doc, f)
 
 
+def write_head_ir(out_dir, vocab, seed):
+    """head/openvino_model.xml: RMSNorm(HIDDEN) -> Linear(HIDDEN, vocab), random weights.
+
+    The native runner's last stage compiles EXACTLY this file (runner.rs `head_xml`)
+    and asserts the output's last dim == manifest.vocab_size; input is [1,1,HIDDEN]
+    bf16 at input 0 (name-agnostic). Mirrors export_minimax_m2.py's HeadWrapper.
+    Lazy imports: torch/openvino are only needed when --head is given, keeping the
+    default export numpy-only.
+    """
+    import torch
+    import openvino as ov
+
+    torch.manual_seed(seed)
+
+    class Head(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm_w = torch.nn.Parameter(torch.ones(HIDDEN) + 0.01 * torch.randn(HIDDEN))
+            self.lm = torch.nn.Linear(HIDDEN, vocab, bias=False)
+
+        def forward(self, x):  # x: [1,1,HIDDEN]
+            v = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * self.norm_w
+            return self.lm(v)
+
+    head_dir = os.path.join(out_dir, "head")
+    os.makedirs(head_dir, exist_ok=True)
+    m = ov.convert_model(Head().eval(), example_input=torch.zeros((1, 1, HIDDEN)))
+    ov.save_model(m, os.path.join(head_dir, "openvino_model.xml"))
+    print(f"[head] wrote {head_dir}/openvino_model.xml (vocab={vocab})", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tiny", action="store_true", help="synthetic random-init tree (the only mode)")
@@ -243,6 +274,9 @@ def main():
     ap.add_argument("--no-experts", action="store_true",
                     help="omit expert weights (load-only tree; experts are lazy)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--head", action="store_true",
+                    help="also emit head/openvino_model.xml (RMSNorm + lm_head as OV IR) so the "
+                         "tree can serve a LAST stage — requires torch + openvino installed")
     args = ap.parse_args()
 
     if not args.tiny:
@@ -294,14 +328,19 @@ def main():
     with open(os.path.join(args.out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
 
+    if args.head:
+        write_head_ir(args.out, args.vocab, args.seed)
+
     write_tokenizer(os.path.join(args.out, "tokenizer.json"), args.vocab)
 
     print(f"wrote {args.out}: {w.offset / 2**20:.1f} MiB, "
           f"{len(moe_ids)} MoE shell(s), "
           f"{0 if args.no_experts else args.experts} expert(s)/layer, "
           f"layer0={'no' if args.no_layer0 else 'yes'}", file=sys.stderr)
-    print("NOTE: no head/openvino_model.xml — the native head is OV-IR only, so this "
-          "tree can only be loaded by a non-last stage (see the test).", file=sys.stderr)
+    if not args.head:
+        print("NOTE: no head/openvino_model.xml — the native head is OV-IR only, so this "
+              "tree can only be loaded by a non-last stage (pass --head for a rig-servable tree).",
+              file=sys.stderr)
 
 
 if __name__ == "__main__":
