@@ -257,6 +257,12 @@ def write_head_ir(out_dir, vocab, seed):
     head_dir = os.path.join(out_dir, "head")
     os.makedirs(head_dir, exist_ok=True)
     m = ov.convert_model(Head().eval(), example_input=torch.zeros((1, 1, HIDDEN)))
+    # The runner sets input 0 as bf16 (forward_head_last); the f32 trace above would make
+    # OV reject that with ParameterMismatch. Re-type the input tensor to bf16 — OV inserts
+    # the bf16->f32 convert, output logits stay f32 (runner accepts f32/f16/bf16).
+    ppp = ov.preprocess.PrePostProcessor(m)
+    ppp.input(0).tensor().set_element_type(ov.Type.bf16)
+    m = ppp.build()
     ov.save_model(m, os.path.join(head_dir, "openvino_model.xml"))
     print(f"[head] wrote {head_dir}/openvino_model.xml (vocab={vocab})", file=sys.stderr)
 
