@@ -928,6 +928,8 @@ impl Builder for SparseMoEBuilder {
             #[cfg(feature = "kv_coord")]
             kv_capture: std::collections::HashMap::new(),
             #[cfg(feature = "kv_coord")]
+            kv_downstream: std::collections::HashMap::new(),
+            #[cfg(feature = "kv_coord")]
             kv_share,
             #[cfg(feature = "kv_coord")]
             kv_handoff_mailbox: std::sync::Arc::new(
@@ -1221,6 +1223,11 @@ pub struct SparseMoEEngine {
     #[cfg(feature = "kv_coord")]
     pub(crate) kv_capture:
         std::collections::HashMap<u64, (String, Vec<i32>, crate::kv_prefix_cache::KvSnapshot)>,
+    /// Issue-34 cross-chain multi-stage: a DOWNSTREAM rank's pulled slice, staged by
+    /// `stash_downstream_rank` until `forward_restore_downstream` ships it inline via
+    /// RESTORE_CARRY. Epoch-keyed, bounded by the prefix-cache capacity (mirror of OvMoe's).
+    #[cfg(feature = "kv_coord")]
+    pub(crate) kv_downstream: std::collections::HashMap<u64, Vec<u8>>,
     /// Issue-34 Option C (holder mirror): the lock-free snapshot cache the [`crate::kv_coordination::
     /// SparseMoeKvHolder`] serves from. Populated alongside `kv_prefix_cache` / `kv_offers` /
     /// `kv_capture` so a busy engine answers cross-chain KV pulls without the engine lock.
@@ -2928,10 +2935,27 @@ impl SparseMoEEngine {
         let Some(down) = self.transport.downstream.clone() else {
             return true;
         };
+        // One-shot: take the carried blob (if any) before the async send. Cross-chain, the
+        // downstream rank's pulled slice was staged by `stash_downstream_rank`; same-chain there is
+        // nothing stashed and a bare RESTORE restores the rank from its own capture. Logged either
+        // way — a bare RESTORE and a never-stashed slice are otherwise indistinguishable.
+        let carried = self.kv_downstream.remove(&epoch);
+        tracing::info!(target: "cascadia::kv", event = "kv_carry_send", epoch,
+            carried = carried.is_some(), bytes = carried.as_ref().map_or(0, |b| b.len()),
+            stashed_epochs = self.kv_downstream.len());
         let verdict = self.block_on(async {
-            send_restore(&down, epoch)
-                .await
-                .map_err(|e| format!("send_restore: {e}"))?;
+            match &carried {
+                Some(blob) if blob.len() <= crate::dist::MAX_RESTORE_BLOB_BYTES as usize => {
+                    send_restore_carry(&down, epoch, blob)
+                        .await
+                        .map_err(|e| format!("send_restore_carry: {e}"))?
+                }
+                // None, or an oversized blob (guards the u32 len field + the peer's recv alloc) ⇒
+                // bare RESTORE ⇒ the moved-to tail misses the foreign epoch ⇒ deliberate clean cold.
+                _ => send_restore(&down, epoch)
+                    .await
+                    .map_err(|e| format!("send_restore: {e}"))?,
+            }
             // Bounded + close-on-timeout: RESTORE runs at admission, so an unbounded wait
             // here stalls every warm-hit request behind a silent downstream.
             recv_restore_verdict(&down).await
@@ -3203,9 +3227,43 @@ impl SparseMoEEngine {
                 "rank {} received unexpected RESTORE_ACK from upstream",
                 self.rank
             )),
-            // Cross-chain carried-slice restore is an OvMoe-only path; K2.6 sparse-moe never emits it.
+            // Issue-34 cross-chain carried-slice restore: the moved-to head pulled THIS rank's
+            // slice from the prior chain and ships it inline (this rank has no local capture for a
+            // foreign chain's epoch). Apply, relay a bare RESTORE downstream (deeper ranks own
+            // their own carry frames), ack the all-or-nothing verdict. Mirror of the OvMoe handler.
+            #[cfg(feature = "kv_coord")]
+            FrameKind::RestoreCarry => {
+                let (epoch, blob) = self
+                    .block_on(recv_restore_carry_body_server(upstream))
+                    .map_err(|e| format!("recv_restore_carry: {e}"))?;
+                let local_ok = match crate::kv_coordination::blob_decode(&blob) {
+                    Some(snap) => self.runner.restore_kv(&snap).is_ok(),
+                    None => false,
+                };
+                tracing::info!(target: "cascadia::kv", event = "sparse_tail_restore_carried",
+                    rank = self.rank, epoch, ok = local_ok, blob_len = blob.len());
+                let down_ok = if let Some(down) = downstream.as_ref() {
+                    self.block_on(async {
+                        send_restore(down, epoch)
+                            .await
+                            .map_err(|e| format!("send_restore: {e}"))?;
+                        recv_restore_verdict(down).await
+                    })
+                    .unwrap_or(false)
+                } else {
+                    true
+                };
+                self.block_on(send_restore_ack_upstream(
+                    upstream,
+                    epoch,
+                    u8::from(local_ok && down_ok),
+                ))
+                .map_err(|e| format!("send_restore_ack: {e}"))?;
+                Ok(())
+            }
+            #[cfg(not(feature = "kv_coord"))]
             FrameKind::RestoreCarry => Err(format!(
-                "rank {} received RESTORE_CARRY but K2.6 sparse-moe has no carried-slice restore",
+                "rank {} received RESTORE_CARRY but kv_coord is not built",
                 self.rank
             )),
         }

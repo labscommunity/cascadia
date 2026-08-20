@@ -298,6 +298,98 @@ fn wire_to_snapshot(manifest: &Manifest, payloads: &[(Vec<u8>, Vec<u8>)]) -> Opt
     })
 }
 
+/// Flat carry-blob codec for RESTORE_CARRY — the native mirror of `ov_kv_coordination`'s
+/// `ov_blob_encode`/`ov_blob_decode`, with bf16-as-u16 words. Only the moved-to head and its own
+/// downstream ranks ever see these bytes (same pinned build both ends), so no versioning field.
+pub(crate) fn blob_encode(snap: &KvSnapshot) -> Vec<u8> {
+    fn put_u32(out: &mut Vec<u8>, v: u32) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    fn put_u16s(out: &mut Vec<u8>, xs: &[u16]) {
+        put_u32(out, xs.len() as u32);
+        for x in xs {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    fn put_slice(out: &mut Vec<u8>, l: &LayerKvSlice) {
+        put_u32(out, l.lid);
+        put_u16s(out, &l.past_k);
+        put_u16s(out, &l.past_v);
+    }
+    let mut out = Vec::new();
+    put_u32(&mut out, snap.past_seq_len as u32);
+    put_u32(&mut out, snap.num_heads);
+    put_u32(&mut out, snap.qk_head_dim);
+    put_u32(&mut out, snap.v_head_dim);
+    put_u32(&mut out, u32::from(snap.layer0.is_some()));
+    if let Some(l0) = &snap.layer0 {
+        put_slice(&mut out, l0);
+    }
+    put_u32(&mut out, snap.shells.len() as u32);
+    for s in &snap.shells {
+        put_slice(&mut out, s);
+    }
+    out
+}
+
+pub(crate) fn blob_decode(blob: &[u8]) -> Option<KvSnapshot> {
+    struct Reader<'a> {
+        b: &'a [u8],
+        pos: usize,
+    }
+    impl Reader<'_> {
+        fn u32(&mut self) -> Option<u32> {
+            let e = self.pos.checked_add(4)?;
+            let v = u32::from_le_bytes(self.b.get(self.pos..e)?.try_into().ok()?);
+            self.pos = e;
+            Some(v)
+        }
+        fn u16s(&mut self) -> Option<Vec<u16>> {
+            let n = self.u32()? as usize;
+            let bytes = n.checked_mul(2)?;
+            let e = self.pos.checked_add(bytes)?;
+            let out = self
+                .b
+                .get(self.pos..e)?
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            self.pos = e;
+            Some(out)
+        }
+        fn slice(&mut self) -> Option<LayerKvSlice> {
+            Some(LayerKvSlice {
+                lid: self.u32()?,
+                past_k: self.u16s()?,
+                past_v: self.u16s()?,
+            })
+        }
+    }
+    let mut r = Reader { b: blob, pos: 0 };
+    let past_seq_len = r.u32()? as usize;
+    let num_heads = r.u32()?;
+    let qk_head_dim = r.u32()?;
+    let v_head_dim = r.u32()?;
+    let layer0 = if r.u32()? == 1 {
+        Some(r.slice()?)
+    } else {
+        None
+    };
+    let n = r.u32()? as usize;
+    let mut shells = Vec::with_capacity(n.min(1024));
+    for _ in 0..n {
+        shells.push(r.slice()?);
+    }
+    (r.pos == blob.len()).then_some(KvSnapshot {
+        past_seq_len,
+        num_heads,
+        qk_head_dim,
+        v_head_dim,
+        layer0,
+        shells,
+    })
+}
+
 /// FNV-1a over every payload byte in wire order, so a donor's serve digest and a consumer's
 /// applied digest are comparable across ranks.
 ///
@@ -554,6 +646,48 @@ impl KvCoordination for SparseMoEEngine {
             .insert_pulled(partner, prefix.clone(), &fp, snap.clone());
         self.kv_prefix_cache
             .insert_pulled(partner, prefix, &fp, snap);
+        Ok(())
+    }
+
+    fn stash_downstream_rank(
+        &mut self,
+        _rank: u16,
+        manifest: &Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
+        // Issue-34 cross-chain multi-stage: a DOWNSTREAM rank's pulled slice can't be applied on
+        // this (head) rank locally; stash it under the content epoch so `forward_restore_downstream`
+        // ships it inline via RESTORE_CARRY. Decode eagerly so a corrupt pull votes fail here (not
+        // mid-restore). Mirror of the OvMoe impl — without an override the trait default is
+        // `Err(())`, which made every native rank>0 pull vote cold (`pull_rank_fail reason=insert`).
+        let Some(snap) = wire_to_snapshot(manifest, payloads) else {
+            tracing::warn!(target: "cascadia::kv", event = "kv_carry_stash_rejected",
+                reason = "decode", rank = _rank, n_payloads = payloads.len());
+            return Err(());
+        };
+        let blob = blob_encode(&snap);
+        let epoch = synth_epoch(&manifest.token_ids);
+        tracing::info!(target: "cascadia::kv", event = "kv_carry_stash", epoch, rank = _rank,
+            bytes = blob.len(), n_tokens = manifest.token_ids.len());
+        // Same collision guard as OvMoe: with >1 downstream rank one epoch would key two blobs;
+        // reject a colliding DIFFERENT blob so a 3+-stage chain degrades to a clean cold instead of
+        // a wrong-rank restore. A 2-stage chain never collides; a same-blob re-stash is idempotent.
+        if let Some(existing) = self.kv_downstream.get(&epoch) {
+            let same = existing == &blob;
+            if !same {
+                tracing::warn!(target: "cascadia::kv", event = "kv_carry_stash_rejected",
+                    reason = "epoch_collision", epoch, rank = _rank);
+            }
+            return if same { Ok(()) } else { Err(()) };
+        }
+        let cap = self.kv_prefix_cache.capacity().max(1);
+        while self.kv_downstream.len() >= cap && !self.kv_downstream.contains_key(&epoch) {
+            let Some(k) = self.kv_downstream.keys().next().copied() else {
+                break;
+            };
+            self.kv_downstream.remove(&k);
+        }
+        self.kv_downstream.insert(epoch, blob);
         Ok(())
     }
 
