@@ -933,6 +933,7 @@ impl Builder for SparseMoEBuilder {
             kv_handoff_mailbox: std::sync::Arc::new(
                 cascadia_engine::kv_handoff::KvHandoffMailbox::new(),
             ),
+            active: None,
         }))
     }
 }
@@ -1133,6 +1134,31 @@ const MAX_PENDING_TASKS: usize = 8;
 /// dist_spec uses for the same situation.
 const WORKER_BACKOFF: Duration = Duration::from_millis(200);
 
+/// In-flight multi-stage generation on rank 0 (one at a time; queued tasks
+/// wait in `pending`). This is the streamed replacement for the deleted
+/// whole-turn `drive_generation_first`.
+struct SparseActive {
+    id: TaskId,
+    downstream: Arc<TokioMutex<ActivationClient>>,
+    cfg: crate::sampling::SamplingConfig,
+    eos: Vec<i64>,
+    max_new: usize,
+    started: std::time::Instant,
+    /// prompt ++ resume-prefix ++ generated — `forward_one_token_first`
+    /// derives past_seq_len from this, so warm-skipped tokens are pushed too.
+    history: Vec<i64>,
+    /// Generated ids INCLUDING the resume seed (positions [0, seed_len)).
+    generated: Vec<u32>,
+    /// Byte length of decoded output already streamed (utf8_safe_delta cursor).
+    /// Seeded to the resume prefix's decoded byte length on a resumed turn.
+    emitted: usize,
+    resume_seed_len: usize,
+    /// The token to emit on the next decode_step (sampled by the last rank).
+    next: i64,
+    prompt_ids: Vec<i64>,
+    tenant: String,
+}
+
 pub struct SparseMoEEngine {
     pub(crate) runner: Runner,
     pub(crate) tokenizer: Option<Tokenizer>,
@@ -1202,6 +1228,8 @@ pub struct SparseMoEEngine {
     /// `step()` — so it only parks bytes here and the recv loop drains them at `RESTORE`.
     #[cfg(feature = "kv_coord")]
     pub(crate) kv_handoff_mailbox: std::sync::Arc<cascadia_engine::kv_handoff::KvHandoffMailbox>,
+    /// In-flight multi-stage generation, streamed one token per `step()`.
+    active: Option<SparseActive>,
 }
 
 impl SparseMoEEngine {
@@ -1320,6 +1348,11 @@ impl Engine for SparseMoEEngine {
         // cannot interrupt one already decoding. Mid-generation interruption
         // would need an out-of-mutex cancel token threaded into the decode
         // loop (architectural follow-up).
+        if self.active.as_ref().is_some_and(|a| &a.id == task_id) {
+            self.active = None; // free the slot; a zombie here never trips the
+                                 // runner's empty-step guard (lib.rs:1006 counts
+                                 // produced before the cancelled-filter)
+        }
         self.pending.retain(|t| &t.task_id != task_id);
     }
 
@@ -1620,12 +1653,31 @@ impl SparseMoEEngine {
         vec![(task.task_id.clone(), chunk)]
     }
 
-    /// Rank 0 driver: tokenize, drive prefill + decode through the
-    /// transport pipeline, return one final chunk for the task.
+    /// Rank 0 driver: token-streaming state machine (PipelineEngine pattern,
+    /// see `decode_step` below) — one active task at a time; queued tasks
+    /// wait in `pending`. This is the streamed replacement for the deleted
+    /// whole-turn `drive_generation_first`.
     fn step_first(&mut self) -> Vec<(TaskId, Chunk)> {
+        if self.active.is_none() {
+            if let Some(terminal) = self.begin_generation_sparse() {
+                return terminal;
+            }
+        }
+        self.decode_step_sparse()
+    }
+
+    /// Admit the next pending task and drive it through prefill. Only the
+    /// LAST prefill step samples a token (the others discard their sample so
+    /// the last rank's rep-penalty history isn't poisoned by prompt tokens),
+    /// so prefill is unavoidably whole-turn work; decode after that streams
+    /// one token per `step()` via `decode_step_sparse`. Returns `Some` for
+    /// every terminal outcome that doesn't reach decode (errors, the
+    /// zero-budget resume case, spec-decode's burst path, EOS on the very
+    /// first generated token); `None` means `self.active` is now armed.
+    fn begin_generation_sparse(&mut self) -> Option<Vec<(TaskId, Chunk)>> {
         let task = match self.pending.pop_front() {
             Some(t) => t,
-            None => return Vec::new(),
+            None => return Some(Vec::new()),
         };
         #[cfg(feature = "kv_coord")]
         self.kv_set_turn_tenant(&task.tenant);
@@ -1634,86 +1686,80 @@ impl SparseMoEEngine {
             let Some(tok) = self.tokenizer.as_ref() else {
                 warn!(task = %task.task_id, "rank-0 engine has no tokenizer");
                 let e = Chunk::error(task.task_id.clone(), "engine has no tokenizer".to_string());
-                return vec![(task.task_id, e)];
+                return Some(vec![(task.task_id, e)]);
             };
             match tok.encode(task.prompt.as_str(), true) {
                 Ok(enc) => enc.get_ids().iter().map(|&u| u as i64).collect(),
                 Err(e) => {
                     warn!(task = %task.task_id, "tokenizer encode failed: {e}");
-                    return vec![(
+                    return Some(vec![(
                         task.task_id.clone(),
                         Chunk::error(task.task_id, format!("tokenizer encode failed: {e}")),
-                    )];
+                    )]);
                 }
             }
         };
         // Option B forced-prefix resume: append the already-emitted assistant
-        // tokens after the rendered prompt (concat, not replace) — the
-        // distributed prefill loop below is agnostic to id origin, so the
-        // appended ids prefill naturally. No-op when not resuming.
-        // `resume_ids()` normalizes a wire-legal `Some([])` to "not resuming" —
-        // the old `is_some()` predicate forced greedy decode on such a turn.
-        let resume = task.resume_ids().map(<[i32]>::to_vec);
-        if let Some(r) = resume.as_deref() {
-            // Peer-supplied indices reach native prefill; bound them first
-            // (also makes the u32 casts below safe).
-            // `tok` above is scoped to the prompt_ids block; re-borrow. The
-            // else-branch there already returned when the tokenizer is absent,
-            // so unwrap_or(0) is unreachable-but-safe.
-            let vocab = self
-                .tokenizer
-                .as_ref()
-                .map(|t| t.get_vocab_size(true))
-                .unwrap_or(0) as u32;
-            if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
+        // tokens after the rendered prompt (concat, not replace) and seed the
+        // streaming accumulator from them — the distributed prefill loop
+        // below is agnostic to id origin, so the appended ids prefill
+        // naturally. `Ok(None)` on a plain (non-resume) turn.
+        let mut seed_opt = match self
+            .tokenizer
+            .as_ref()
+            .map(|t| prepare_resume(&task, t, &mut prompt_ids))
+            .unwrap() // tokenizer presence already checked above
+        {
+            Ok(s) => s,
+            Err(e) => {
                 let id = task.task_id.clone();
-                return vec![(
-                    id.clone(),
-                    Chunk::error(id, format!("invalid resume prefix: {e}")),
-                )];
+                return Some(vec![(id.clone(), Chunk::error(id, e))]);
             }
+        };
+        if seed_opt.is_some() {
+            info!(task = %task.task_id, event = "resume_admitted",
+                  seed_len = seed_opt.as_ref().unwrap().seed_len,
+                  "Option B resume admitted (multi-stage, streamed)");
         }
-        append_resume_ids(&mut prompt_ids, resume.as_deref());
         // Non-resume keeps the base contract: max_tokens == 0 still yields one
         // token (`.max(1)`, matching gemma4/qwen36/ov-runtime). Only a RESUMED
         // turn may land at zero new tokens (budget exhausted by the prefix) —
         // review found this branch had silently flipped the plain max_tokens=0
         // behavior from 1 token to 0.
-        let max_new = if resume.is_some() {
-            resume_max_new(task.max_tokens, resume.as_deref())
+        let max_new = if seed_opt.is_some() {
+            resume_max_new(task.max_tokens, task.resume_ids())
         } else {
             task.max_tokens.max(1) as usize
         };
         let mut sampling_cfg = sampling_from_task(&task);
         // Option B: force greedy decode on a resumed turn so the continuation
         // is deterministic (see step_single_stage for rationale).
-        if resume.is_some() {
+        if seed_opt.is_some() {
             sampling_cfg.temperature = 0.0;
         }
         if max_new == 0 {
-            // Budget already exhausted by the resume prefix. Both
-            // drive_generation_first and drive_generation_first_spec
-            // unconditionally sample one token off the last prefill step
-            // regardless of max_new, so we must not drive generation at all
-            // — the only way to guarantee zero new tokens here.
+            // Budget already exhausted by the resume prefix. The prefill loop
+            // below unconditionally samples one token off the last prefill
+            // step regardless of max_new, so we must not drive generation at
+            // all — the only way to guarantee zero new tokens here.
             let elapsed = started.elapsed().as_secs_f64();
             info!(task = %task.task_id, elapsed_s = elapsed, "task done (rank-0 driver, resume budget exhausted)");
             let mut chunk = Chunk::final_marker(task.task_id.clone(), "");
             chunk.n_tokens = Some(0);
             chunk.finish_reason = Some(FinishReason::Length);
-            return vec![(task.task_id, chunk)];
+            return Some(vec![(task.task_id, chunk)]);
         }
         let downstream = match self.transport.downstream.clone() {
             Some(d) => d,
             None => {
                 warn!("rank 0 has no downstream peer in multi-stage mode");
-                return vec![(
+                return Some(vec![(
                     task.task_id.clone(),
                     Chunk::error(
                         task.task_id,
                         "rank 0 has no downstream peer in multi-stage mode".to_string(),
                     ),
-                )];
+                )]);
             }
         };
 
@@ -1721,26 +1767,40 @@ impl SparseMoEEngine {
         self.runner.reset_kv();
         if let Err(e) = self.block_on(send_reset(&downstream)) {
             warn!(task = %task.task_id, "send_reset: {e}");
-            return vec![(
+            return Some(vec![(
                 task.task_id.clone(),
                 Chunk::error(task.task_id, format!("send_reset: {e}")),
-            )];
+            )]);
         }
 
-        // Drive the full generation. result_tokens collects new tokens
-        // generated AFTER the prompt (we discard the prefill responses).
         // If spec-decode is enabled AND we're greedy (temp==0), use the
-        // batched ForwardBatch path; otherwise fall back to the
-        // per-token Forward driver.
+        // batched ForwardBatch path; otherwise fall back to the per-token
+        // Forward driver (streamed below).
         let use_spec =
             self.spec_decode_k.map(|k| k > 0).unwrap_or(false) && sampling_cfg.temperature <= 0.0;
+        if use_spec && seed_opt.is_some() {
+            // Spec-decode verifies K tokens per round and stays burst (spec §3.2);
+            // it cannot honor a forced prefix mid-round. Decline BEFORE any chunk so
+            // the scheduler's first-frame peek sees the sentinel (B6 retry).
+            let id = task.task_id.clone();
+            return Some(vec![(
+                id.clone(),
+                Chunk::error(
+                    id,
+                    format!(
+                        "resume_unsupported: spec-decode path cannot force-prefix (task {})",
+                        task.task_id
+                    ),
+                ),
+            )]);
+        }
 
         // Issue-34 consume (§8): SAME-CHAIN warm-resume. On a kv-prefix-cache hit, restore the head's
         // own rank-0 slice and RESTORE the whole downstream chain (all-or-nothing); on success skip
         // re-prefilling the matched prefix (`warm_prefix`). Any rank short ⇒ discard: re-RESET local +
         // downstream and cold-run. Runs after the admission RESET above and before generation (rule §2).
         // Inert unless kv_coord + cache enabled + a hit on the non-spec path; `warm_prefix == 0` leaves
-        // `drive_generation_first` byte-identical to the cold path. Spec-decode stays cold (parity with
+        // the prefill loop byte-identical to the cold path. Spec-decode stays cold (parity with
         // the single-stage cache bypass).
         #[cfg(feature = "kv_coord")]
         let warm_prefix: usize = if !use_spec && self.kv_prefix_cache.enabled() {
@@ -1770,10 +1830,10 @@ impl SparseMoEEngine {
                         self.runner.reset_kv();
                         if let Err(e) = self.block_on(send_reset(&downstream)) {
                             warn!(task = %task.task_id, "cold-fallback send_reset: {e}");
-                            return vec![(
+                            return Some(vec![(
                                 task.task_id.clone(),
                                 Chunk::final_marker(task.task_id, ""),
-                            )];
+                            )]);
                         }
                         0
                     }
@@ -1786,14 +1846,16 @@ impl SparseMoEEngine {
         #[cfg(not(feature = "kv_coord"))]
         let warm_prefix: usize = 0;
 
-        let result_tokens = if use_spec {
+        // Spec-decode: unchanged burst path (seed_opt is guaranteed None here
+        // — the decline above already returned for a resumed+spec turn).
+        if use_spec {
             let k = self.spec_decode_k.unwrap();
             info!(
                 task = %task.task_id,
                 draft_k = k,
                 "using n-gram speculative decode (pipeline-parallel)"
             );
-            match self.drive_generation_first_spec(
+            let result_tokens = match self.drive_generation_first_spec(
                 &prompt_ids,
                 max_new,
                 k as usize,
@@ -1803,56 +1865,316 @@ impl SparseMoEEngine {
                 Ok(g) => g,
                 Err(e) => {
                     warn!(task = %task.task_id, "rank-0 spec-decode driver failed: {e}");
-                    return vec![(
+                    return Some(vec![(
                         task.task_id.clone(),
                         Chunk::error(
                             task.task_id,
                             format!("rank-0 spec-decode driver failed: {e}"),
                         ),
-                    )];
+                    )]);
                 }
-            }
-        } else {
-            match self.drive_generation_first(
-                &prompt_ids,
-                max_new,
-                &sampling_cfg,
-                &downstream,
-                warm_prefix,
-            ) {
-                Ok(g) => g,
-                Err(e) => {
-                    warn!(task = %task.task_id, "rank-0 driver failed: {e}");
-                    return vec![(
-                        task.task_id.clone(),
-                        Chunk::error(task.task_id, format!("rank-0 driver failed: {e}")),
-                    )];
-                }
-            }
-        };
+            };
 
+            // Issue-34 Task 1.3 (§8): capture the full post-turn sequence's KV across the whole chain so
+            // a forced move can warm-resume. The head mints E = synth_epoch(full tokens) and broadcasts
+            // CAPTURE(E, tokens) downstream; each stage snapshots its slice under E and acks back up; the
+            // head's single ack means every stage captured. Then the head seeds its own prefix cache so a
+            // later NEGOTIATE maps the prefix → E. Best-effort: any transport/snapshot error just skips the
+            // cache (warm-pull degrades to cold) and never affects the already-complete served output.
+            #[cfg(feature = "kv_coord")]
+            if self.kv_prefix_cache.enabled() && !result_tokens.is_empty() {
+                let mut full_tokens: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
+                full_tokens.extend(result_tokens.iter().map(|&t| t as i32));
+                let epoch = crate::kv_coordination::synth_epoch(&full_tokens);
+                // Bounded: an older peer that meets CaptureV2 errors WITHOUT acking, and the only
+                // ceiling otherwise is the transport frame-idle default — reached before this turn's
+                // already-complete chunks are returned. Timeout ⇒ capture skipped, turn delivered.
+                let acked = self.block_on(async {
+                    match tokio::time::timeout(CAPTURE_ACK_TIMEOUT, async {
+                        send_capture(&downstream, epoch, &full_tokens, &task.tenant)
+                            .await
+                            .map_err(|e| format!("send_capture: {e}"))?;
+                        match recv_kind_client(&downstream).await {
+                            Ok(Some(FrameKind::CaptureAck)) => {
+                                recv_capture_ack_body_client(&downstream)
+                                    .await
+                                    .map(|_| ())
+                                    .map_err(|e| format!("recv_capture_ack: {e}"))
+                            }
+                            Ok(Some(other)) => Err(format!("expected CaptureAck, got {other:?}")),
+                            Ok(None) => Err("downstream closed during capture".into()),
+                            Err(e) => Err(format!("recv_kind (capture): {e}")),
+                        }
+                    })
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => Err(format!(
+                            "capture ack timed out after {CAPTURE_ACK_TIMEOUT:?}"
+                        )),
+                    }
+                });
+                match acked {
+                    Ok(()) => {
+                        if let Ok(snap) = self.runner.snapshot_kv() {
+                            let fp = self.runner.fingerprint();
+                            let prompt64: Vec<i64> =
+                                full_tokens.iter().map(|&t| i64::from(t)).collect();
+                            // Mirror into the holder cache so a busy engine still serves this prefix.
+                            self.kv_share
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .prefix
+                                .insert(prompt64.clone(), &fp, snap.clone());
+                            self.kv_prefix_cache.insert(prompt64, &fp, snap);
+                        }
+                    }
+                    Err(e) => warn!(task = %task.task_id, "kv multi-stage capture skipped: {e}"),
+                }
+            }
+
+            let n_tokens = result_tokens.len() as u32;
+            let Some(tokenizer) = self.tokenizer.as_ref() else {
+                warn!("tokenizer disappeared mid-task");
+                return Some(vec![(
+                    task.task_id.clone(),
+                    Chunk::error(task.task_id, "tokenizer disappeared mid-task".to_string()),
+                )]);
+            };
+            let ids_u32: Vec<u32> = result_tokens.iter().map(|&i| i as u32).collect();
+            let mut text = tokenizer
+                .decode(&ids_u32, true)
+                .unwrap_or_else(|_| String::new());
+            if let Some(stripped) = text.strip_prefix(&task.prompt) {
+                text = stripped.trim_start().to_string();
+            }
+            let elapsed = started.elapsed().as_secs_f64();
+            info!(
+                task = %task.task_id,
+                tokens = n_tokens,
+                elapsed_s = elapsed,
+                tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
+                rank = self.rank,
+                total = self.total,
+                "task done (rank-0 driver)"
+            );
+            let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
+            chunk.n_tokens = Some(n_tokens);
+            chunk.token_ids = result_tokens;
+            chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
+            return Some(vec![(task.task_id.clone(), chunk)]);
+        }
+
+        // Non-spec path: PREFILL ONLY. The very last prompt token's sampled
+        // reply becomes the first generated token, stashed in `active.next`
+        // — `decode_step_sparse` emits it (and drives every token after) on
+        // the following `step()` calls.
+        let eos: Vec<i64> = self
+            .runner
+            .manifest
+            .eos_token_ids
+            .iter()
+            .map(|&x| x as i64)
+            .collect();
+        let mut history: Vec<i64> = Vec::with_capacity(prompt_ids.len() + max_new);
+
+        info!(
+            prompt_len = prompt_ids.len(),
+            warm_prefix, "prefill (token-by-token, distributed)"
+        );
+        // Streamed-prefill sync window: every N intermediate tokens go as a
+        // blocking ForwardNoSample (which acks) instead of a one-way
+        // ForwardPrefill. This bounds the number of un-acked frames in flight
+        // so rank 0's single final recv can't exceed the transport frame-idle
+        // ceiling on a very long prompt, and it surfaces a mid-prefill failure
+        // within one window rather than only at the very end.
+        const PREFILL_SYNC_EVERY: usize = 256;
+        let mut token_back: i64 = -1;
+        for (i, &t) in prompt_ids.iter().enumerate() {
+            history.push(t);
+            if i < warm_prefix {
+                // KV already restored for this token; skip its forward but keep `history` growing so
+                // `forward_one_token_first`'s `past_seq_len` stays correct. The prefix-cache `lookup`
+                // guarantees `warm_prefix < prompt_ids.len()`, so a suffix token always follows.
+                continue;
+            }
+            if i + 1 == prompt_ids.len() {
+                // Last prompt token: a sampling Forward; the token it returns
+                // is the first generated token.
+                match self.forward_one_token_first(&history, &sampling_cfg, &downstream, true) {
+                    Ok(t) => token_back = t,
+                    Err(e) => {
+                        return Some(vec![(
+                            task.task_id.clone(),
+                            Chunk::error(task.task_id, format!("prefill final step {i}: {e}")),
+                        )]);
+                    }
+                }
+            } else if (i + 1) % PREFILL_SYNC_EVERY == 0 {
+                // Periodic blocking sync (discards the dummy Token(-1) ack).
+                if let Err(e) =
+                    self.forward_one_token_first(&history, &sampling_cfg, &downstream, false)
+                {
+                    return Some(vec![(
+                        task.task_id.clone(),
+                        Chunk::error(task.task_id, format!("prefill sync step {i}: {e}")),
+                    )]);
+                }
+            } else {
+                // Intermediate prompt tokens stream one-way (no ack) so they
+                // pipeline through the ranks — the compute overlaps instead of
+                // one blocking round-trip each. See FrameKind::ForwardPrefill.
+                if let Err(e) =
+                    self.forward_prefill_step_first(&history, &sampling_cfg, &downstream)
+                {
+                    return Some(vec![(
+                        task.task_id.clone(),
+                        Chunk::error(task.task_id, format!("prefill stream step {i}: {e}")),
+                    )]);
+                }
+            }
+        }
+
+        // SparseMoE EXCLUDES the EOS token: `active` is not set yet at this
+        // point, so an EOS on the very first generated token can't route
+        // through `finalize_sparse` — build the empty final inline (old
+        // behavior: empty `generated` → 0-token final; capture skipped, same
+        // as the old block's `!result_tokens.is_empty()` gate).
+        if eos.contains(&token_back) {
+            let mut chunk = Chunk::final_marker(task.task_id.clone(), "");
+            chunk.n_tokens = Some(0);
+            chunk.finish_reason = Some(finish_reason_for(0, max_new));
+            return Some(vec![(task.task_id, chunk)]);
+        }
+
+        let (generated, emitted, resume_seed_len) = match seed_opt.take() {
+            Some(s) => (s.generated_u32, s.emitted, s.seed_len),
+            None => (Vec::with_capacity(max_new), 0usize, 0usize),
+        };
+        self.active = Some(SparseActive {
+            id: task.task_id.clone(),
+            downstream,
+            cfg: sampling_cfg,
+            eos,
+            max_new,
+            started,
+            history,
+            generated,
+            emitted,
+            resume_seed_len,
+            next: token_back,
+            prompt_ids,
+            tenant: task.tenant.clone(),
+        });
+        None
+    }
+
+    /// Emit one token from the in-flight task, or finalize when it ends.
+    /// Adapted from `PipelineEngine::decode_step` with SparseMoE's EOS
+    /// EXCLUSION (test BEFORE push, emit nothing for it) and history-based
+    /// forward (`forward_one_token_first` derives `past_seq_len` from
+    /// `history.len()`, not a separate `pos` counter).
+    fn decode_step_sparse(&mut self) -> Vec<(TaskId, Chunk)> {
+        let (id, next) = {
+            let a = self.active.as_ref().unwrap();
+            (a.id.clone(), a.next)
+        };
+        // SparseMoE EXCLUDES the EOS token (runner.rs, old decode loop): test
+        // BEFORE push, emit nothing for it, finalize with what we have.
+        let is_eos = self.active.as_ref().unwrap().eos.contains(&next);
+        if is_eos {
+            return self.finalize_sparse(true);
+        }
+        let next_u = next as u32;
+        {
+            let a = self.active.as_mut().unwrap();
+            a.generated.push(next_u);
+            a.history.push(next);
+        }
+        let full = self
+            .tokenizer
+            .as_ref()
+            .unwrap()
+            .decode(&self.active.as_ref().unwrap().generated, true)
+            .unwrap_or_default();
+        let delta = {
+            let a = self.active.as_mut().unwrap();
+            utf8_safe_delta(&full, &mut a.emitted)
+        };
+        let mut token_chunk = Chunk::token(id.clone(), next, delta);
+        token_chunk.n_tokens = Some(1);
+        // Splicer poison bypass (spec §4.1): token_id==0 with empty token_ids
+        // reads as id-less; stamp the single id explicitly.
+        token_chunk.token_ids = vec![next];
+        let (gen_new, max_new) = {
+            let a = self.active.as_ref().unwrap();
+            (a.generated.len() - a.resume_seed_len, a.max_new)
+        };
+        if gen_new >= max_new {
+            let mut out = vec![(id, token_chunk)];
+            out.extend(self.finalize_sparse(true));
+            return out;
+        }
+        let downstream = self.active.as_ref().unwrap().downstream.clone();
+        let cfg = self.active.as_ref().unwrap().cfg.clone();
+        let history = self.active.as_ref().unwrap().history.clone();
+        match self.forward_one_token_first(&history, &cfg, &downstream, true) {
+            Ok(tok_back) => {
+                self.active.as_mut().unwrap().next = tok_back;
+                vec![(id, token_chunk)]
+            }
+            Err(e) => {
+                // Spec §4.1: a mid-decode forward failure is the chain-death signal
+                // Option B splices on. Emitting a final marker here would trip the
+                // scheduler's saw_final latch and permanently block the resume —
+                // surface an ERROR chunk instead (deliberate divergence from
+                // PipelineEngine's partial-final, which predates Option B). No
+                // capture; clear the slot.
+                warn!(task = %id, "decode forward failed; surfacing error for resume: {e}");
+                self.active = None;
+                vec![
+                    (id.clone(), token_chunk),
+                    (id.clone(), Chunk::error(id, format!("decode forward failed: {e}"))),
+                ]
+            }
+        }
+    }
+
+    /// Finalize the in-flight task: best-effort whole-chain KV capture (so a
+    /// forced move can warm-resume this turn), then the empty final marker.
+    /// `capture` lets a caller skip the KV round-trip on an already-dead
+    /// chain (mirrors `PipelineEngine::finalize_pipeline`'s `cache` flag);
+    /// every current call site passes `true`.
+    fn finalize_sparse(&mut self, capture: bool) -> Vec<(TaskId, Chunk)> {
+        let Some(a) = self.active.take() else {
+            return Vec::new();
+        };
+        let n_new = (a.generated.len() - a.resume_seed_len) as u32;
         // Issue-34 Task 1.3 (§8): capture the full post-turn sequence's KV across the whole chain so
         // a forced move can warm-resume. The head mints E = synth_epoch(full tokens) and broadcasts
         // CAPTURE(E, tokens) downstream; each stage snapshots its slice under E and acks back up; the
         // head's single ack means every stage captured. Then the head seeds its own prefix cache so a
         // later NEGOTIATE maps the prefix → E. Best-effort: any transport/snapshot error just skips the
         // cache (warm-pull degrades to cold) and never affects the already-complete served output.
+        // §4.3.3: the capture key is prompt_ids ++ NEW tokens — `a.prompt_ids` already contains the
+        // appended resume prefix, so slicing generated at `resume_seed_len` prevents double-counting it.
+        let should_capture = capture && n_new > 0;
         #[cfg(feature = "kv_coord")]
-        if self.kv_prefix_cache.enabled() && !result_tokens.is_empty() {
-            let mut full_tokens: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
-            full_tokens.extend(result_tokens.iter().map(|&t| t as i32));
+        if should_capture && self.kv_prefix_cache.enabled() {
+            let mut full_tokens: Vec<i32> = a.prompt_ids.iter().map(|&t| t as i32).collect();
+            full_tokens.extend(a.generated[a.resume_seed_len..].iter().map(|&t| t as i32));
             let epoch = crate::kv_coordination::synth_epoch(&full_tokens);
             // Bounded: an older peer that meets CaptureV2 errors WITHOUT acking, and the only
             // ceiling otherwise is the transport frame-idle default — reached before this turn's
             // already-complete chunks are returned. Timeout ⇒ capture skipped, turn delivered.
             let acked = self.block_on(async {
                 match tokio::time::timeout(CAPTURE_ACK_TIMEOUT, async {
-                    send_capture(&downstream, epoch, &full_tokens, &task.tenant)
+                    send_capture(&a.downstream, epoch, &full_tokens, &a.tenant)
                         .await
                         .map_err(|e| format!("send_capture: {e}"))?;
-                    match recv_kind_client(&downstream).await {
+                    match recv_kind_client(&a.downstream).await {
                         Ok(Some(FrameKind::CaptureAck)) => {
-                            recv_capture_ack_body_client(&downstream)
+                            recv_capture_ack_body_client(&a.downstream)
                                 .await
                                 .map(|_| ())
                                 .map_err(|e| format!("recv_capture_ack: {e}"))
@@ -1885,174 +2207,17 @@ impl SparseMoEEngine {
                         self.kv_prefix_cache.insert(prompt64, &fp, snap);
                     }
                 }
-                Err(e) => warn!(task = %task.task_id, "kv multi-stage capture skipped: {e}"),
+                Err(e) => warn!(task = %a.id, "kv multi-stage capture skipped: {e}"),
             }
         }
-
-        let n_tokens = result_tokens.len() as u32;
-        let Some(tokenizer) = self.tokenizer.as_ref() else {
-            warn!("tokenizer disappeared mid-task");
-            return vec![(
-                task.task_id.clone(),
-                Chunk::error(task.task_id, "tokenizer disappeared mid-task".to_string()),
-            )];
-        };
-        // Option B §17: see step_single_stage for why a resumed turn must
-        // decode prefix+tail together (preserves the seam space that a
-        // tail-only decode would strip at sequence-start).
-        let text = if let Some(r) = resume.as_deref() {
-            let prefix_u32: Vec<u32> = r.iter().map(|&i| i as u32).collect();
-            // Propagate decode errors — `unwrap_or_default()` on the PREFIX
-            // decode made the slice offset 0, re-emitting the entire forced
-            // prefix to the client (the exact defect dist_spec's comment warns
-            // about); on the FULL decode it silently dropped the whole tail.
-            let prefix_text = match tokenizer.decode(&prefix_u32, true) {
-                Ok(t) => t,
-                Err(e) => {
-                    let id = task.task_id.clone();
-                    return vec![(
-                        id.clone(),
-                        Chunk::error(id, format!("resume seed decode failed: {e}")),
-                    )];
-                }
-            };
-            let mut full_u32 = prefix_u32;
-            full_u32.extend(result_tokens.iter().map(|&i| i as u32));
-            let full_text = match tokenizer.decode(&full_u32, true) {
-                Ok(t) => t,
-                Err(e) => {
-                    let id = task.task_id.clone();
-                    return vec![(
-                        id.clone(),
-                        Chunk::error(id, format!("resume tail decode failed: {e}")),
-                    )];
-                }
-            };
-            // Divergence guard: the blind byte-offset slice assumes the prefix
-            // decode is a byte-prefix of the full decode. A byte-level seam
-            // (chain A held back a partial UTF-8 char whose token IS in the
-            // prefix) breaks that: U+FFFD bytes in `prefix_text` resolve to
-            // different bytes in `full_text`, and an unlucky boundary silently
-            // re-emits prefix bytes or drops seam text. Re-anchor instead —
-            // emit only what provably follows the prefix (same contract as the
-            // shim's `advance_emitted`).
-            if full_text.as_bytes().starts_with(prefix_text.as_bytes()) {
-                full_text.get(prefix_text.len()..).unwrap_or("").to_string()
-            } else {
-                warn!(task = %task.task_id, "resume seam diverged; re-anchoring (tail delta dropped)");
-                String::new()
-            }
-        } else {
-            let ids_u32: Vec<u32> = result_tokens.iter().map(|&i| i as u32).collect();
-            let mut t = tokenizer
-                .decode(&ids_u32, true)
-                .unwrap_or_else(|_| String::new());
-            if let Some(stripped) = t.strip_prefix(&task.prompt) {
-                t = stripped.trim_start().to_string();
-            }
-            t
-        };
-        let elapsed = started.elapsed().as_secs_f64();
-        info!(
-            task = %task.task_id,
-            tokens = n_tokens,
-            elapsed_s = elapsed,
-            tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
-            rank = self.rank,
-            total = self.total,
-            "task done (rank-0 driver)"
-        );
-        let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
-        chunk.n_tokens = Some(n_tokens);
-        chunk.token_ids = result_tokens;
-        chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
-        vec![(task.task_id.clone(), chunk)]
-    }
-
-    /// Rank 0 generation loop. For each prompt token + each decode
-    /// step: embed → forward through my shells → send hidden
-    /// downstream → recv sampled token back. Discards prefill samples
-    /// except the last (which becomes the first generated token).
-    fn drive_generation_first(
-        &mut self,
-        prompt_ids: &[i64],
-        max_new: usize,
-        cfg: &crate::sampling::SamplingConfig,
-        downstream: &Arc<TokioMutex<ActivationClient>>,
-        // Issue-34 (§8): count of leading prompt tokens whose KV is already in the chain's restored
-        // caches (same-chain warm-resume). Those tokens are pushed into `history` for the past_seq_len
-        // accounting but NOT forwarded. `0` on every cold path ⇒ the loop below is byte-identical.
-        warm_prefix: usize,
-    ) -> Result<Vec<i64>, String> {
-        let hidden = self.runner.manifest.hidden_size as usize;
-        let eos: Vec<i64> = self
-            .runner
-            .manifest
-            .eos_token_ids
-            .iter()
-            .map(|&x| x as i64)
-            .collect();
-        let mut history: Vec<i64> = Vec::with_capacity(prompt_ids.len() + max_new);
-        let mut generated: Vec<i64> = Vec::with_capacity(max_new);
-
-        // Prefill: feed each prompt token; the very last response from
-        // last-rank becomes the first generated token.
-        info!(
-            prompt_len = prompt_ids.len(),
-            warm_prefix, "prefill (token-by-token, distributed)"
-        );
-        // Streamed-prefill sync window: every N intermediate tokens go as a
-        // blocking ForwardNoSample (which acks) instead of a one-way
-        // ForwardPrefill. This bounds the number of un-acked frames in flight
-        // so rank 0's single final recv can't exceed the transport frame-idle
-        // ceiling on a very long prompt, and it surfaces a mid-prefill failure
-        // within one window rather than only at the very end.
-        const PREFILL_SYNC_EVERY: usize = 256;
-        for (i, &t) in prompt_ids.iter().enumerate() {
-            history.push(t);
-            if i < warm_prefix {
-                // KV already restored for this token; skip its forward but keep `history` growing so
-                // `forward_one_token_first`'s `past_seq_len` stays correct. The prefix-cache `lookup`
-                // guarantees `warm_prefix < prompt_ids.len()`, so a suffix token always follows.
-                continue;
-            }
-            if i + 1 == prompt_ids.len() {
-                // Last prompt token: a sampling Forward; the token it returns
-                // is the first generated token.
-                let token_back = self
-                    .forward_one_token_first(&history, cfg, downstream, true)
-                    .map_err(|e| format!("prefill final step {i}: {e}"))?;
-                if eos.contains(&token_back) {
-                    return Ok(generated);
-                }
-                generated.push(token_back);
-                history.push(token_back);
-            } else if (i + 1) % PREFILL_SYNC_EVERY == 0 {
-                // Periodic blocking sync (discards the dummy Token(-1) ack).
-                self.forward_one_token_first(&history, cfg, downstream, false)
-                    .map_err(|e| format!("prefill sync step {i}: {e}"))?;
-            } else {
-                // Intermediate prompt tokens stream one-way (no ack) so they
-                // pipeline through the ranks — the compute overlaps instead of
-                // one blocking round-trip each. See FrameKind::ForwardPrefill.
-                self.forward_prefill_step_first(&history, cfg, downstream)
-                    .map_err(|e| format!("prefill stream step {i}: {e}"))?;
-            }
-        }
-
-        // Decode loop.
-        for step_i in 1..max_new {
-            let token_back = self
-                .forward_one_token_first(&history, cfg, downstream, true)
-                .map_err(|e| format!("decode step {step_i}: {e}"))?;
-            if eos.contains(&token_back) {
-                break;
-            }
-            generated.push(token_back);
-            history.push(token_back);
-        }
-        let _ = hidden;
-        Ok(generated)
+        let elapsed = a.started.elapsed().as_secs_f64();
+        info!(task = %a.id, tokens = n_new, elapsed_s = elapsed,
+            tok_s = if elapsed > 0.0 { f64::from(n_new) / elapsed } else { 0.0 },
+            rank = self.rank, total = self.total, "task done (rank-0 driver, streamed)");
+        let mut chunk = Chunk::final_marker(a.id.clone(), "");
+        chunk.n_tokens = Some(0);
+        chunk.finish_reason = Some(finish_reason_for(n_new as usize, a.max_new));
+        vec![(a.id, chunk)]
     }
 
     /// Rank-0 streamed-prefill step: embed + run my shells on the most
@@ -2229,7 +2394,8 @@ impl SparseMoEEngine {
     ///
     /// Greedy-only by construction — temperature > 0 would change the
     /// distribution under greedy acceptance; callers must dispatch the
-    /// non-greedy path to `drive_generation_first` instead.
+    /// non-greedy path to the streamed prefill loop in
+    /// `begin_generation_sparse` instead.
     fn drive_generation_first_spec(
         &mut self,
         prompt_ids: &[i64],
