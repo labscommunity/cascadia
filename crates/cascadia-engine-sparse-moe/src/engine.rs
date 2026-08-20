@@ -1350,8 +1350,8 @@ impl Engine for SparseMoEEngine {
         // loop (architectural follow-up).
         if self.active.as_ref().is_some_and(|a| &a.id == task_id) {
             self.active = None; // free the slot; a zombie here never trips the
-                                 // runner's empty-step guard (lib.rs:1006 counts
-                                 // produced before the cancelled-filter)
+                                // runner's empty-step guard (lib.rs:1006 counts
+                                // produced before the cancelled-filter)
         }
         self.pending.retain(|t| &t.task_id != task_id);
     }
@@ -2137,7 +2137,10 @@ impl SparseMoEEngine {
                 self.active = None;
                 vec![
                     (id.clone(), token_chunk),
-                    (id.clone(), Chunk::error(id, format!("decode forward failed: {e}"))),
+                    (
+                        id.clone(),
+                        Chunk::error(id, format!("decode forward failed: {e}")),
+                    ),
                 ]
             }
         }
@@ -3266,6 +3269,30 @@ const OV_MAX_PENDING: usize = 64;
 ///   upstream. The wire protocol is the engine-agnostic [`crate::dist`]
 ///   one the K2.6 path uses (Forward / Reset / Token frames). No
 ///   spec-decode (M2 sends only per-token Forward frames).
+/// In-flight OvMoe (MiniMax-M2) multi-stage generation, streamed one token
+/// per `step()`. Mirrors `SparseActive`, but `forward_one_token_first` here
+/// takes `(token, pos)` rather than a `history` slice, so we track `pos`
+/// directly instead of replaying history.
+struct OvMoeActive {
+    id: TaskId,
+    downstream: Arc<TokioMutex<ActivationClient>>,
+    cfg: crate::sampling::SamplingConfig,
+    eos: Vec<u32>,
+    max_new: usize,
+    started: Instant,
+    /// Generated ids INCLUDING the resume seed (positions [0, seed_len)).
+    /// OvMoe INCLUDES EOS in this accumulator (push-then-test).
+    generated: Vec<u32>,
+    emitted: usize,
+    resume_seed_len: usize,
+    /// The token to feed on the next decode_step (sampled by the last rank).
+    next: i64,
+    pos: usize,
+    /// prompt ++ resume-prefix (already includes the appended seed).
+    prompt_ids: Vec<u32>,
+    tenant: String,
+}
+
 pub struct OvMoeEngine {
     runner: OvMoeRunner,
     tokenizer: Option<Tokenizer>,
@@ -3318,6 +3345,8 @@ pub struct OvMoeEngine {
     /// `step()` — so it only parks bytes here and the recv loop drains them at `RESTORE`.
     #[cfg(feature = "kv_coord")]
     kv_handoff_mailbox: std::sync::Arc<cascadia_engine::kv_handoff::KvHandoffMailbox>,
+    /// In-flight multi-stage generation, streamed one token per `step()`.
+    active_ov: Option<OvMoeActive>,
 }
 
 impl OvMoeEngine {
@@ -3368,6 +3397,7 @@ impl OvMoeEngine {
             kv_handoff_mailbox: std::sync::Arc::new(
                 cascadia_engine::kv_handoff::KvHandoffMailbox::new(),
             ),
+            active_ov: None,
         }
     }
 
@@ -3431,6 +3461,21 @@ impl OvMoeEngine {
             let e = Chunk::error(task.task_id.clone(), "engine has no tokenizer".to_string());
             return vec![(task.task_id, e)];
         };
+        if task.resume_ids().is_some() {
+            // Option B: this path has no resume implementation — silently dropping
+            // the prefix would regenerate from scratch and the gateway would splice
+            // that after the client's prefix (spec §4.2). Decline; the scheduler's
+            // B6 retry excludes this peer and re-routes.
+            let id = task.task_id.clone();
+            return vec![(
+                id.clone(),
+                Chunk::error(
+                    id,
+                    "resume_unsupported: minimax single-stage has no forced-prefix path"
+                        .to_string(),
+                ),
+            )];
+        }
         let started = Instant::now();
         let prompt_ids: Vec<u32> = match tok.encode(task.prompt.as_str(), true) {
             Ok(enc) => enc.get_ids().to_vec(),
@@ -3536,24 +3581,47 @@ impl OvMoeEngine {
         })
     }
 
-    /// Rank-0 pipeline driver: tokenize, reset the ring, drive prefill +
-    /// decode one token per wire round-trip, decode, emit one final chunk.
+    /// Rank 0 driver: token-streaming state machine (mirrors
+    /// `SparseMoEEngine::step_first`/`begin_generation_sparse`/
+    /// `decode_step_sparse`) — one active task at a time; queued tasks wait
+    /// in `pending`. Streamed replacement for the deleted whole-turn
+    /// pipeline driver.
     fn step_first(&mut self) -> Vec<(TaskId, Chunk)> {
+        if self.active_ov.is_none() {
+            if let Some(terminal) = self.begin_generation_ovmoe() {
+                return terminal;
+            }
+        }
+        self.decode_step_ovmoe()
+    }
+
+    /// Admit the next pending task and drive it through prefill. Only the
+    /// LAST prefill step samples a token (others go as ForwardNoSample so
+    /// discarded prefill tokens never pollute the last rank's penalty
+    /// history), so prefill is unavoidably whole-turn work; decode after that
+    /// streams one token per `step()` via `decode_step_ovmoe`. Returns `Some`
+    /// for every terminal outcome that doesn't reach decode (errors, empty
+    /// prompt, the zero-budget resume case); `None` means `self.active_ov` is
+    /// now armed.
+    fn begin_generation_ovmoe(&mut self) -> Option<Vec<(TaskId, Chunk)>> {
         let task = match self.pending.pop_front() {
             Some(t) => t,
-            None => return Vec::new(),
+            None => return Some(Vec::new()),
         };
         #[cfg(feature = "kv_coord")]
         self.kv_set_turn_tenant(&task.tenant);
         let id = task.task_id.clone();
         let Some(downstream) = self.transport.downstream.clone() else {
             warn!(task = %id, "rank 0 has no downstream; cannot drive pipeline");
-            return vec![(id.clone(), Chunk::error(id, "rank 0 missing downstream"))];
+            return Some(vec![(
+                id.clone(),
+                Chunk::error(id, "rank 0 missing downstream"),
+            )]);
         };
         if self.tokenizer.is_none() {
             warn!(task = %id, "MiniMax-M2 rank 0 has no tokenizer");
             let e = Chunk::error(id.clone(), "engine has no tokenizer".to_string());
-            return vec![(id, e)];
+            return Some(vec![(id, e)]);
         }
         let started = Instant::now();
         let prompt_ids: Vec<u32> = match self
@@ -3565,24 +3633,68 @@ impl OvMoeEngine {
             Ok(enc) => enc.get_ids().to_vec(),
             Err(e) => {
                 warn!(task = %id, "tokenizer encode failed: {e}");
-                return vec![(
+                return Some(vec![(
                     id.clone(),
                     Chunk::error(id, format!("tokenizer encode failed: {e}")),
-                )];
+                )]);
             }
         };
         if prompt_ids.is_empty() {
-            return vec![(id.clone(), Chunk::final_marker(id, ""))];
+            return Some(vec![(id.clone(), Chunk::final_marker(id, ""))]);
         }
-        let max_new = task.max_tokens.max(1) as usize;
-        let cfg = sampling_from_task(&task);
+        // Option B forced-prefix resume: append the already-emitted assistant
+        // tokens after the rendered prompt (concat, not replace) and seed the
+        // streaming accumulator from them. `prepare_resume` works in i64 —
+        // OvMoe's prompt ids are u32, so round-trip at this boundary.
+        let mut prompt64: Vec<i64> = prompt_ids.iter().map(|&t| i64::from(t)).collect();
+        let mut seed_opt = match self
+            .tokenizer
+            .as_ref()
+            .map(|t| prepare_resume(&task, t, &mut prompt64))
+            .unwrap() // tokenizer presence already checked above
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let id = task.task_id.clone();
+                return Some(vec![(id.clone(), Chunk::error(id, e))]);
+            }
+        };
+        if seed_opt.is_some() {
+            info!(task = %id, event = "resume_admitted",
+                  seed_len = seed_opt.as_ref().unwrap().seed_len,
+                  "Option B resume admitted (MiniMax-M2 pipeline-parallel, streamed)");
+        }
+        let prompt_ids: Vec<u32> = prompt64.iter().map(|&t| t as u32).collect(); // validated in-vocab
+
+        // Non-resume keeps the base contract: max_tokens == 0 still yields one
+        // token (`.max(1)`). Only a RESUMED turn may land at zero new tokens
+        // (budget exhausted by the prefix).
+        let max_new = if seed_opt.is_some() {
+            resume_max_new(task.max_tokens, task.resume_ids())
+        } else {
+            task.max_tokens.max(1) as usize
+        };
+        let mut cfg = sampling_from_task(&task);
+        // Option B: a resumed turn MUST decode greedily — sampling would let
+        // the continuation diverge from what the client already has.
+        if seed_opt.is_some() {
+            cfg.temperature = 0.0;
+        }
+        if max_new == 0 {
+            // Budget exhausted by the resume prefix. The decode loop below pushes
+            // BEFORE testing (spec §4.2): entering it would emit one token.
+            let mut chunk = Chunk::final_marker(id.clone(), "");
+            chunk.n_tokens = Some(0);
+            chunk.finish_reason = Some(FinishReason::Length);
+            return Some(vec![(id, chunk)]);
+        }
         let eos = self.runner.eos_token_ids().to_vec();
 
         // Reset KV across the whole pipeline before the new generation.
         self.runner.reset();
         if let Err(e) = self.block_on(send_reset(&downstream)) {
             warn!(task = %id, "send_reset failed: {e}");
-            return vec![(id.clone(), Chunk::error(id, format!("reset: {e}")))];
+            return Some(vec![(id.clone(), Chunk::error(id, format!("reset: {e}")))]);
         }
 
         // Issue-34 consume (§8): same-chain warm-resume. On a kv-prefix-cache hit, restore the head's
@@ -3619,10 +3731,10 @@ impl OvMoeEngine {
                         self.runner.reset();
                         if let Err(e) = self.block_on(send_reset(&downstream)) {
                             warn!(task = %id, "cold-fallback send_reset: {e}");
-                            return vec![(
+                            return Some(vec![(
                                 id.clone(),
                                 Chunk::error(id, format!("cold-fallback send_reset: {e}")),
-                            )];
+                            )]);
                         }
                         0
                     }
@@ -3635,13 +3747,15 @@ impl OvMoeEngine {
         #[cfg(not(feature = "kv_coord"))]
         let warm_prefix: usize = 0;
 
-        // Prefill: feed every prompt token past the warm-resumed prefix. The
-        // sample produced after the LAST prompt token is the first generated
-        // token — matching `OvMoeRunner::generate_timed`. Intermediate steps go
-        // as ForwardNoSample so their discarded tokens never enter the last
-        // rank's penalty history (see FrameKind::ForwardNoSample). The cache
-        // lookup guarantees `warm_prefix < prompt_ids.len()`, so a suffix token
-        // always follows.
+        // Prefill: feed every prompt token past the warm-resumed prefix
+        // (which now includes the appended resume prefix — the prefill loop
+        // is agnostic to id origin, so it force-prefills the resume ids
+        // naturally). The sample produced after the LAST prompt token is the
+        // first generated token — matching `OvMoeRunner::generate_timed`.
+        // Intermediate steps go as ForwardNoSample so their discarded tokens
+        // never enter the last rank's penalty history (see
+        // FrameKind::ForwardNoSample). The cache lookup guarantees
+        // `warm_prefix < prompt_ids.len()`, so a suffix token always follows.
         let mut pos = warm_prefix;
         let mut next: i64 = -1;
         let n_prompt = prompt_ids.len();
@@ -3651,31 +3765,118 @@ impl OvMoeEngine {
                 Ok(tok_back) => next = tok_back,
                 Err(e) => {
                     warn!(task = %id, "prefill forward failed: {e}");
-                    return vec![(id.clone(), Chunk::error(id, e))];
+                    return Some(vec![(id.clone(), Chunk::error(id, e))]);
                 }
             }
             pos += 1;
         }
 
-        // Decode: like generate_timed, push the token then stop on max_new
-        // or EOS (the EOS token is included in the output).
-        let mut generated: Vec<u32> = Vec::with_capacity(max_new);
-        loop {
-            let next_u = next as u32;
-            generated.push(next_u);
-            if generated.len() >= max_new || eos.contains(&next_u) {
-                break;
-            }
-            match self.forward_one_token_first(next_u, pos, &cfg, &downstream, true) {
-                Ok(tok_back) => next = tok_back,
-                Err(e) => {
-                    warn!(task = %id, "decode forward failed; emitting partial output: {e}");
-                    break;
-                }
-            }
-            pos += 1;
-        }
+        // Non-spec path: PREFILL ONLY. `next` is the first generated token
+        // (stashed below); `decode_step_ovmoe` pushes it (OvMoe INCLUDES
+        // EOS — push-then-test) and drives every token after on the
+        // following `step()` calls.
+        let (generated, emitted, resume_seed_len) = match seed_opt.take() {
+            Some(s) => (s.generated_u32, s.emitted, s.seed_len),
+            None => (Vec::with_capacity(max_new), 0usize, 0usize),
+        };
+        self.active_ov = Some(OvMoeActive {
+            id: id.clone(),
+            downstream,
+            cfg,
+            eos,
+            max_new,
+            started,
+            generated,
+            emitted,
+            resume_seed_len,
+            next,
+            pos,
+            prompt_ids,
+            tenant: task.tenant.clone(),
+        });
+        None
+    }
 
+    /// Emit one token from the in-flight task, or finalize when it ends.
+    /// OvMoe INCLUDES the EOS token (push-then-test, old monolithic decode
+    /// loop's `generated.push(next_u)` BEFORE the `eos.contains` check) —
+    /// deliberately the opposite order from `decode_step_sparse`'s exclusion.
+    fn decode_step_ovmoe(&mut self) -> Vec<(TaskId, Chunk)> {
+        let (id, next) = {
+            let a = self.active_ov.as_ref().unwrap();
+            (a.id.clone(), a.next)
+        };
+        let next_u = next as u32;
+        {
+            let a = self.active_ov.as_mut().unwrap();
+            a.generated.push(next_u);
+        }
+        let full = self
+            .tokenizer
+            .as_ref()
+            .unwrap()
+            .decode(&self.active_ov.as_ref().unwrap().generated, true)
+            .unwrap_or_default();
+        let delta = {
+            let a = self.active_ov.as_mut().unwrap();
+            utf8_safe_delta(&full, &mut a.emitted)
+        };
+        let mut token_chunk = Chunk::token(id.clone(), next, delta);
+        token_chunk.n_tokens = Some(1);
+        // Splicer poison bypass (spec §4.1): token_id==0 with empty token_ids
+        // reads as id-less; stamp the single id explicitly.
+        token_chunk.token_ids = vec![next];
+        let (gen_new, max_new, is_eos, pos) = {
+            let a = self.active_ov.as_ref().unwrap();
+            (
+                a.generated.len() - a.resume_seed_len,
+                a.max_new,
+                a.eos.contains(&next_u),
+                a.pos,
+            )
+        };
+        if gen_new >= max_new || is_eos {
+            let mut out = vec![(id, token_chunk)];
+            out.extend(self.finalize_ovmoe(true));
+            return out;
+        }
+        let downstream = self.active_ov.as_ref().unwrap().downstream.clone();
+        let cfg = self.active_ov.as_ref().unwrap().cfg.clone();
+        match self.forward_one_token_first(next_u, pos, &cfg, &downstream, true) {
+            Ok(tok_back) => {
+                let a = self.active_ov.as_mut().unwrap();
+                a.next = tok_back;
+                a.pos += 1;
+                vec![(id, token_chunk)]
+            }
+            Err(e) => {
+                // Same rationale as decode_step_sparse: an error chunk, never a
+                // final (a final would trip the scheduler's saw_final latch and
+                // permanently block the resume) — deliberate divergence from the
+                // old break-to-partial-success decode loop above. No capture;
+                // clear the slot.
+                warn!(task = %id, "decode forward failed; surfacing error for resume: {e}");
+                self.active_ov = None;
+                vec![
+                    (id.clone(), token_chunk),
+                    (
+                        id.clone(),
+                        Chunk::error(id, format!("decode forward failed: {e}")),
+                    ),
+                ]
+            }
+        }
+    }
+
+    /// Finalize the in-flight task: best-effort whole-chain KV capture (so a
+    /// forced move can warm-resume this turn), then the empty final marker.
+    /// `capture` lets a caller skip the KV round-trip on an already-dead
+    /// chain; every current call site passes `true`.
+    fn finalize_ovmoe(&mut self, capture: bool) -> Vec<(TaskId, Chunk)> {
+        let Some(a) = self.active_ov.take() else {
+            return Vec::new();
+        };
+        let n_new = (a.generated.len() - a.resume_seed_len) as u32;
         // Issue-34 §8: capture the post-turn KV across the whole chain so a later request extending
         // this sequence can warm-resume. Snapshot the head's slice FIRST to learn the true KV depth —
         // the final sampled token is never fed, so depth == (prompt + generated) - 1 — and key the
@@ -3685,15 +3886,19 @@ impl OvMoeEngine {
         // snapshots its slice under E and acks up; the head's single ack ⇒ every stage captured. Then
         // seed the head's prefix cache. Best-effort: any error skips the cache (warm-pull degrades to
         // cold) and never touches the already-served output.
+        // §4.3.3: the capture key is prompt_ids ++ NEW tokens — `a.prompt_ids` already contains the
+        // appended resume prefix, so slicing generated at `resume_seed_len` prevents double-counting it.
+        let should_capture = capture && n_new > 0;
         #[cfg(feature = "kv_coord")]
-        if self.kv_prefix_cache.enabled() && !generated.is_empty() {
+        if should_capture && self.kv_prefix_cache.enabled() {
             match self.runner.snapshot_kv() {
                 Ok(snap) => {
                     let depth = snap.past_seq_len;
-                    let mut full_tokens: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
-                    full_tokens.extend(generated.iter().map(|&t| t as i32));
+                    let mut full_tokens: Vec<i32> =
+                        a.prompt_ids.iter().map(|&t| t as i32).collect();
+                    full_tokens.extend(a.generated[a.resume_seed_len..].iter().map(|&t| t as i32));
                     tracing::debug!(target: "cascadia::kv", event = "ovmoe_ms_capture_attempt",
-                        depth, full_len = full_tokens.len(), gen = generated.len(),
+                        depth, full_len = full_tokens.len(), gen = n_new,
                         in_range = (depth >= 1 && depth <= full_tokens.len()));
                     if depth >= 1 && depth <= full_tokens.len() {
                         let captured: Vec<i32> = full_tokens[..depth].to_vec();
@@ -3702,12 +3907,12 @@ impl OvMoeEngine {
                         // peer errors on CaptureV2 without acking; never withhold the turn.
                         let acked = self.block_on(async {
                             match tokio::time::timeout(CAPTURE_ACK_TIMEOUT, async {
-                                send_capture(&downstream, epoch, &captured, &task.tenant)
+                                send_capture(&a.downstream, epoch, &captured, &a.tenant)
                                     .await
                                     .map_err(|e| format!("send_capture: {e}"))?;
-                                match recv_kind_client(&downstream).await {
+                                match recv_kind_client(&a.downstream).await {
                                     Ok(Some(FrameKind::CaptureAck)) => {
-                                        recv_capture_ack_body_client(&downstream)
+                                        recv_capture_ack_body_client(&a.downstream)
                                             .await
                                             .map(|_| ())
                                             .map_err(|e| format!("recv_capture_ack: {e}"))
@@ -3726,7 +3931,7 @@ impl OvMoeEngine {
                                     // Close on elapse — the late CaptureAck has no sequence
                                     // number, so a reused connection would hand it to the
                                     // next exchange as its reply.
-                                    downstream.lock().await.close().await;
+                                    a.downstream.lock().await.close().await;
                                     Err(format!(
                                         "capture ack timed out after {CAPTURE_ACK_TIMEOUT:?}; \
                                          connection dropped to avoid reading the late ack as \
@@ -3754,34 +3959,27 @@ impl OvMoeEngine {
                                     "mirrored multi-stage capture into holder");
                                 self.kv_prefix_cache.insert(captured64, &fp, snap);
                             }
-                            Err(e) => warn!(task = %id, "kv multi-stage capture skipped: {e}"),
+                            Err(e) => warn!(task = %a.id, "kv multi-stage capture skipped: {e}"),
                         }
                     }
                 }
-                Err(e) => warn!(task = %id, "kv capture: snapshot_kv failed: {e}"),
+                Err(e) => warn!(task = %a.id, "kv capture: snapshot_kv failed: {e}"),
             }
         }
 
-        let n_tokens = generated.len() as u32;
-        let text = self
-            .tokenizer
-            .as_ref()
-            .unwrap()
-            .decode(&generated, true)
-            .unwrap_or_default();
-        let elapsed = started.elapsed().as_secs_f64();
+        let elapsed = a.started.elapsed().as_secs_f64();
         info!(
-            task = %id,
-            tokens = n_tokens,
+            task = %a.id,
+            tokens = n_new,
             total = self.total,
             elapsed_s = elapsed,
-            tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
-            "task done (MiniMax-M2 pipeline-parallel)"
+            tok_s = if elapsed > 0.0 { f64::from(n_new) / elapsed } else { 0.0 },
+            "task done (MiniMax-M2 pipeline-parallel, streamed)"
         );
-        let mut chunk = Chunk::final_marker(id.clone(), text);
-        chunk.n_tokens = Some(n_tokens);
-        chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
-        vec![(id, chunk)]
+        let mut chunk = Chunk::final_marker(a.id.clone(), "");
+        chunk.n_tokens = Some(0);
+        chunk.finish_reason = Some(finish_reason_for(n_new as usize, a.max_new));
+        vec![(a.id, chunk)]
     }
 
     /// Snapshot this rank's KV under `epoch` for a later RESTORE. Bounded by the prefix-cache
@@ -4244,8 +4442,12 @@ impl Engine for OvMoeEngine {
     }
 
     fn cancel(&mut self, task_id: &TaskId) {
-        // Same as the dense sparse-MoE engine: drop queued tasks; an in-flight
-        // monolithic generation runs to its step boundary.
+        // Same as SparseMoEEngine: drop queued tasks; free the active slot if
+        // it belongs to this task (a zombie here never trips the runner's
+        // empty-step guard — produced is counted before the cancelled-filter).
+        if self.active_ov.as_ref().is_some_and(|a| &a.id == task_id) {
+            self.active_ov = None;
+        }
         self.pending.retain(|t| &t.task_id != task_id);
     }
 

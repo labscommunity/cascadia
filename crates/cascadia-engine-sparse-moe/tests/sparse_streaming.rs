@@ -154,7 +154,11 @@ fn multi_stage_streams_per_token_with_empty_final() {
     assert!(!toks.is_empty(), "interior token chunks must exist");
     for (_, c) in &toks {
         assert_eq!(c.n_tokens, Some(1));
-        assert_eq!(c.token_ids, vec![c.token_id], "token_ids stamped (poison bypass)");
+        assert_eq!(
+            c.token_ids,
+            vec![c.token_id],
+            "token_ids stamped (poison bypass)"
+        );
     }
 }
 
@@ -218,5 +222,8 @@ fn cancel_mid_decode_clears_active() {
     assert!(!first.is_empty());
     head.cancel(&"t4".to_string());
     let after = head.step().unwrap();
-    assert!(after.is_empty(), "cancelled task must emit nothing and free the slot");
+    assert!(
+        after.is_empty(),
+        "cancelled task must emit nothing and free the slot"
+    );
 }
