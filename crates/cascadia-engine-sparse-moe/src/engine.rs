@@ -2765,6 +2765,13 @@ impl SparseMoEEngine {
     #[cfg(feature = "kv_coord")]
     fn capture_under_epoch(&mut self, tenant: &str, epoch: u64, tokens: Vec<i32>) {
         if !self.kv_prefix_cache.enabled() {
+            // The CAPTURE handler acks upstream regardless, so a skip here is otherwise invisible:
+            // the head believes every stage captured while this rank stored nothing and every
+            // later GET for its slice answers `get_none`.
+            warn!(
+                rank = self.rank,
+                epoch, "kv capture skipped: prefix cache disabled (capacity 0) — ack still sent"
+            );
             return;
         }
         let snap = match self.runner.snapshot_kv() {
@@ -2797,6 +2804,8 @@ impl SparseMoEEngine {
             g.captures
                 .insert(epoch, (tenant.to_string(), tokens.clone(), snap.clone()));
         }
+        tracing::info!(target: "cascadia::kv", event = "kv_capture_stored",
+            rank = self.rank, epoch, n_tokens = tokens.len(), past_seq_len = snap.past_seq_len);
         self.kv_capture
             .insert(epoch, (tenant.to_string(), tokens, snap));
     }
