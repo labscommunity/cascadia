@@ -1155,7 +1155,10 @@ struct SparseActive {
     resume_seed_len: usize,
     /// The token to emit on the next decode_step (sampled by the last rank).
     next: i64,
+    /// Only read by the finalize-time KV capture path (kv_coord).
+    #[cfg_attr(not(feature = "kv_coord"), allow(dead_code))]
     prompt_ids: Vec<i64>,
+    #[cfg_attr(not(feature = "kv_coord"), allow(dead_code))]
     tenant: String,
 }
 
@@ -1342,12 +1345,13 @@ impl Engine for SparseMoEEngine {
     }
 
     fn cancel(&mut self, task_id: &TaskId) {
-        // Drop the queued task. step() runs one task end-to-end and holds the
-        // engine mutex for that whole generation, so cancel() (also &mut self)
-        // runs only between tasks — it prevents a queued task from starting but
-        // cannot interrupt one already decoding. Mid-generation interruption
-        // would need an out-of-mutex cancel token threaded into the decode
-        // loop (architectural follow-up).
+        // Drop it from the queue if it hasn't started. If it's the in-flight
+        // streamed task (rank 0, multi-stage), drop `active` too so decoding
+        // stops at the current token boundary instead of grinding out the rest
+        // of a completion no one will read — an SSE client that disconnects
+        // mid-stream triggers this via `ChunkStream::drop`. The next task's
+        // `begin_generation_sparse` issues a fresh reset + send_reset, so
+        // abandoning mid-sequence leaves no stale KV state to clean up here.
         if self.active.as_ref().is_some_and(|a| &a.id == task_id) {
             self.active = None; // free the slot; a zombie here never trips the
                                 // runner's empty-step guard (lib.rs:1006 counts
@@ -1360,8 +1364,8 @@ impl Engine for SparseMoEEngine {
         if self.total == 1 {
             return Ok(self.step_single_stage());
         }
-        // step_first handles its own errors terminally (final-marker chunk on
-        // the driver), so rank 0 never surfaces an Err here.
+        // step_first handles its own errors terminally (final-marker/error
+        // chunk on the driver), so rank 0 never surfaces an Err here.
         if self.rank == 0 {
             return Ok(self.step_first());
         }
@@ -1699,6 +1703,12 @@ impl SparseMoEEngine {
                 }
             }
         };
+        if prompt_ids.is_empty() {
+            return Some(vec![(
+                task.task_id.clone(),
+                Chunk::final_marker(task.task_id, ""),
+            )]);
+        }
         // Option B forced-prefix resume: append the already-emitted assistant
         // tokens after the rendered prompt (concat, not replace) and seed the
         // streaming accumulator from them — the distributed prefill loop
@@ -1708,7 +1718,7 @@ impl SparseMoEEngine {
             .tokenizer
             .as_ref()
             .map(|t| prepare_resume(&task, t, &mut prompt_ids))
-            .unwrap() // tokenizer presence already checked above
+            .expect("tokenizer presence checked above")
         {
             Ok(s) => s,
             Err(e) => {
@@ -1775,25 +1785,12 @@ impl SparseMoEEngine {
 
         // If spec-decode is enabled AND we're greedy (temp==0), use the
         // batched ForwardBatch path; otherwise fall back to the per-token
-        // Forward driver (streamed below).
-        let use_spec =
-            self.spec_decode_k.map(|k| k > 0).unwrap_or(false) && sampling_cfg.temperature <= 0.0;
-        if use_spec && seed_opt.is_some() {
-            // Spec-decode verifies K tokens per round and stays burst (spec §3.2);
-            // it cannot honor a forced prefix mid-round. Decline BEFORE any chunk so
-            // the scheduler's first-frame peek sees the sentinel (B6 retry).
-            let id = task.task_id.clone();
-            return Some(vec![(
-                id.clone(),
-                Chunk::error(
-                    id,
-                    format!(
-                        "resume_unsupported: spec-decode path cannot force-prefix (task {})",
-                        task.task_id
-                    ),
-                ),
-            )]);
-        }
+        // Forward driver (streamed below). A resumed turn always takes the
+        // per-token streamed driver instead: resumed turns stream so the
+        // forced prefix is honored; spec-decode is an optimization only.
+        let use_spec = self.spec_decode_k.map(|k| k > 0).unwrap_or(false)
+            && sampling_cfg.temperature <= 0.0
+            && seed_opt.is_none();
 
         // Issue-34 consume (§8): SAME-CHAIN warm-resume. On a kv-prefix-cache hit, restore the head's
         // own rank-0 slice and RESTORE the whole downstream chain (all-or-nothing); on success skip
@@ -1847,7 +1844,8 @@ impl SparseMoEEngine {
         let warm_prefix: usize = 0;
 
         // Spec-decode: unchanged burst path (seed_opt is guaranteed None here
-        // — the decline above already returned for a resumed+spec turn).
+        // — `use_spec` requires `seed_opt.is_none()`, so a resumed turn never
+        // reaches this branch).
         if use_spec {
             let k = self.spec_decode_k.unwrap();
             info!(
@@ -2034,6 +2032,14 @@ impl SparseMoEEngine {
                 }
             }
         }
+        if token_back < 0 {
+            // Non-empty prompt (guarded above) but the sampling forward never ran —
+            // the deleted burst driver returned Err here; keep that contract.
+            return Some(vec![(
+                task.task_id.clone(),
+                Chunk::error(task.task_id, "prefill produced no token"),
+            )]);
+        }
 
         // SparseMoE EXCLUDES the EOS token: `active` is not set yet at this
         // point, so an EOS on the very first generated token can't route
@@ -2161,6 +2167,7 @@ impl SparseMoEEngine {
         // cache (warm-pull degrades to cold) and never affects the already-complete served output.
         // §4.3.3: the capture key is prompt_ids ++ NEW tokens — `a.prompt_ids` already contains the
         // appended resume prefix, so slicing generated at `resume_seed_len` prevents double-counting it.
+        #[cfg_attr(not(feature = "kv_coord"), allow(unused_variables))]
         let should_capture = capture && n_new > 0;
         #[cfg(feature = "kv_coord")]
         if should_capture && self.kv_prefix_cache.enabled() {
@@ -3279,8 +3286,11 @@ struct OvMoeActive {
     /// The token to feed on the next decode_step (sampled by the last rank).
     next: i64,
     pos: usize,
-    /// prompt ++ resume-prefix (already includes the appended seed).
+    /// prompt ++ resume-prefix (already includes the appended seed). Only
+    /// read by the finalize-time KV capture path (kv_coord).
+    #[cfg_attr(not(feature = "kv_coord"), allow(dead_code))]
     prompt_ids: Vec<u32>,
+    #[cfg_attr(not(feature = "kv_coord"), allow(dead_code))]
     tenant: String,
 }
 
@@ -3642,7 +3652,7 @@ impl OvMoeEngine {
             .tokenizer
             .as_ref()
             .map(|t| prepare_resume(&task, t, &mut prompt64))
-            .unwrap() // tokenizer presence already checked above
+            .expect("tokenizer presence checked above")
         {
             Ok(s) => s,
             Err(e) => {
@@ -3876,6 +3886,7 @@ impl OvMoeEngine {
         // cold) and never touches the already-served output.
         // §4.3.3: the capture key is prompt_ids ++ NEW tokens — `a.prompt_ids` already contains the
         // appended resume prefix, so slicing generated at `resume_seed_len` prevents double-counting it.
+        #[cfg_attr(not(feature = "kv_coord"), allow(unused_variables))]
         let should_capture = capture && n_new > 0;
         #[cfg(feature = "kv_coord")]
         if should_capture && self.kv_prefix_cache.enabled() {
