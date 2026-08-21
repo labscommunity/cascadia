@@ -66,10 +66,6 @@ shorten). The default (Rust mmap expert) decode path was optimized ~2×:
   `ForwardPrefill` frame belongs to the K2.6 sparse-MoE engine and is **not**
   wired into dsv4. The largest prefill win would be a direct node↔node LAN
   rather than a relayed link.
-- **Rank-0 KV-prefix reuse** across turns is capped by
-  `CASCADIA_DSV4_PREFIX_CACHE` (entries; unset/`0` = off). The glm5-named
-  `CASCADIA_GLM5_PREFIX_CACHE` is still honoured as a deprecated fallback for
-  one release and logs a warning when used.
 
 Evaluated and **rejected with measurement** (recorded so they aren't re-tried):
 FP8-e4m3 shell (bit-exact, but `proj` is compute- not bandwidth-bound after the

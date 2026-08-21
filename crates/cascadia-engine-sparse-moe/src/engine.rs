@@ -720,7 +720,9 @@ impl Builder for SparseMoEBuilder {
                 runtime_handle,
                 rank,
                 total,
-                // dsv4 has no config-threaded prefix cache; env-only.
+                // dsv4's runner has no prefix hooks yet, so this cap is inert;
+                // resolve it under dsv4's own name anyway so a glm5 setting can
+                // never reach a dsv4 engine (#139).
                 dsv4_prefix_cap(
                     std::env::var("CASCADIA_DSV4_PREFIX_CACHE").ok().as_deref(),
                     std::env::var("CASCADIA_GLM5_PREFIX_CACHE").ok().as_deref(),
