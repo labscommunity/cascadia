@@ -1307,6 +1307,38 @@ fn prefill_chunk() -> usize {
     }
 }
 
+/// Issue 7 escape hatch. Strict (default): every restore site takes `position` from
+/// `installed_depth` of the blob it installs, and an unparseable depth REFUSES the restore —
+/// clamping or flooring installs the state and then lies about its depth, which is how §12.16's §6
+/// turned an intermittent fault deterministic. `CASCADIA_RUNTIME_STRICT_DEPTH=0` restores the
+/// head warm-resume site's legacy `.min(len)` clamp (the rule certified for months) — site A only;
+/// to be removed after two green matrices.
+#[cfg(feature = "kv_coord")]
+fn strict_depth() -> bool {
+    std::env::var("CASCADIA_RUNTIME_STRICT_DEPTH")
+        .ok()
+        .as_deref()
+        != Some("0")
+}
+
+/// Head warm-resume depth rule (site A), split out so the strict-vs-legacy arms are unit-testable.
+/// `None` ⇒ refuse the restore (serve cold). Legacy keeps today's certified behaviour exactly:
+/// clamp to the matched token count, fall back to it when unparseable.
+#[cfg(feature = "kv_coord")]
+fn warm_resume_depth(blob: &[u8], matched_len: usize, strict: bool) -> Option<usize> {
+    if strict {
+        crate::kv_coordination::installed_depth(blob)
+            .ok()
+            .map(|d| d as usize)
+    } else {
+        Some(
+            crate::kv_coordination::kv_seq_from_blob(blob)
+                .map(|s| s.min(matched_len))
+                .unwrap_or(matched_len),
+        )
+    }
+}
+
 /// Primary input of one prefill chunk: prompt ids on the embed stage, hidden
 /// rows (`hid` floats per token, row-major) on relay/head stages. Conversion
 /// into the IR's dtype happens directly inside the reusable `primary_buf`.
@@ -2171,9 +2203,31 @@ impl OvRuntimeEngine {
             #[cfg(feature = "kv_coord")]
             if self.static_kv.is_none() {
                 let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
-                if let Some((blob, len, plane_pulled)) =
-                    self.kv.take_warm(&task.tenant, &prompt_i32)
-                {
+                let taken = self.kv.take_warm(&task.tenant, &prompt_i32);
+                if taken.is_none() {
+                    tracing::info!(target: "cascadia::kv", event = "kv_warm_take_miss",
+                        partner_hash = crate::kv_coordination::fnv1a64(task.tenant.as_bytes()),
+                        prefix_len = prompt_i32.len());
+                }
+                // Issue 7: derive the depth from the blob BEFORE installing it. Unknown depth ⇒
+                // refuse the restore outright (nothing installed, the turn serves cold) — see
+                // `warm_resume_depth` for the strict-vs-legacy split.
+                let depth = taken.and_then(|(blob, len, plane_pulled)| {
+                    match warm_resume_depth(&blob, len, strict_depth()) {
+                        Some(d) => Some((blob, len, plane_pulled, d)),
+                        None => {
+                            warn!(
+                                blob_len = blob.len(),
+                                matched = len,
+                                plane_pulled,
+                                "ov-runtime: warm blob depth unparseable; refusing restore \
+                                     (cold reprefill)"
+                            );
+                            None
+                        }
+                    }
+                });
+                if let Some((blob, len, plane_pulled, depth)) = depth {
                     if let Err(e) = self.prime_if_never_inferred() {
                         warn!(error = %e, "ov-runtime: priming before warm-resume failed");
                     }
@@ -2206,10 +2260,9 @@ impl OvRuntimeEngine {
                                 ok
                             };
                             if chain_ok {
-                                // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
-                                warm_prefix = crate::kv_coordination::kv_seq_from_blob(&blob)
-                                    .map(|s| s.min(len))
-                                    .unwrap_or(len);
+                                // Real KV depth, not the token count (off-by-one — see
+                                // kv_seq_from_blob); derived pre-install by `warm_resume_depth`.
+                                warm_prefix = depth;
                                 // Probe A on the HEAD. Every probe so far looked only at the tail; in
                                 // plane mode the head self-pulls (possibly from a different store than
                                 // chain mode negotiates against), so if the head's digest differs
@@ -2228,8 +2281,7 @@ impl OvRuntimeEngine {
                                 // above is identically false in chain mode and would hide a real
                                 // cross-chain pull behind "local".
                                 let source = if plane_pulled { "pulled" } else { "local" };
-                                let epoch =
-                                    crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
+                                let epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
                                 tracing::info!(target: "cascadia::kv", event = "kv_warm_provenance",
                                     source, epoch, len);
                             } else {
@@ -2242,10 +2294,6 @@ impl OvRuntimeEngine {
                             let _ = self.runtime.reset_state();
                         }
                     }
-                } else {
-                    tracing::info!(target: "cascadia::kv", event = "kv_warm_take_miss",
-                        partner_hash = crate::kv_coordination::fnv1a64(task.tenant.as_bytes()),
-                        prefix_len = prompt_i32.len());
                 }
             }
             if warm_prefix == 0 && self.static_kv.is_none() {
@@ -4007,6 +4055,11 @@ impl OvRuntimeEngine {
                     epoch = slot.epoch, position = self.position, depth);
                 return false;
             }
+            Err(HandoffReject::DepthUnknown) => {
+                warn!(target: "cascadia::kv", event = "kv_handoff_depth_unknown",
+                    epoch = slot.epoch, position = self.position);
+                return false;
+            }
         };
         if self.apply_warm_resume_blob(&blob) {
             info!(target: "cascadia::kv", event = "kv_handoff_applied_inline",
@@ -4029,6 +4082,15 @@ impl OvRuntimeEngine {
         // Captured BEFORE set_state so the ledger can show whether the engine had already advanced past
         // the resume depth when this landed — the timing candidate's signature.
         let pos_before = self.position;
+        // Issue 7: refuse BEFORE installing. The old `unwrap_or(0)` floor was the worst case in the
+        // set — full state installed, mask width 0, positions from 0.
+        let depth = match crate::kv_coordination::installed_depth(blob) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(error = %e, "ov-runtime: plane warm-resume blob depth unparseable; refusing (cold)");
+                return false;
+            }
+        };
         if let Err(e) = self.prime_if_never_inferred() {
             warn!(error = %e, "ov-runtime: priming before plane warm-resume failed");
         }
@@ -4041,7 +4103,7 @@ impl OvRuntimeEngine {
         let set_state_ms = t_set_state.elapsed().as_millis() as u64;
         match set_state {
             Ok(()) => {
-                self.position = crate::kv_coordination::kv_seq_from_blob(blob).unwrap_or(0) as i64;
+                self.position = depth;
                 // Probe A+B (PLANE apply site). `position` settled the depth question (head 97 == tail
                 // 97, mismatch refuted). What remains is whether the BYTES differ from the chain path's
                 // and WHEN this lands relative to the turn — hence the digest plus the pre-apply
@@ -4469,52 +4531,73 @@ impl OvRuntimeEngine {
                     true
                 } else if let Some(blob) = carried {
                     let pos_before = self.position;
-                    if let Err(e) = self.prime_if_never_inferred() {
-                        warn!(error = %e, "ov-runtime: priming before carried-blob restore failed");
-                    }
-                    match self.runtime.set_state_blob(blob) {
-                        Ok(()) => {
-                            self.position =
-                                crate::kv_coordination::kv_seq_from_blob(blob).unwrap_or(0) as i64;
-                            self.kv_warm_pending = true;
-                            // Probe A REFERENCE point: this is the certified byte-identical path, so
-                            // its digest is the known-good value the plane apply must match.
-                            info!(
-                                epoch,
-                                blob_len = blob.len(),
-                                blob_digest = crate::kv_coordination::byte_digest(blob),
-                                position = self.position,
-                                position_before = pos_before,
-                                mode = "chain",
-                                "ov_tail_restore_carried"
-                            );
-                            crate::kv_coordination::log_blob_tensors("restore_chain", epoch, blob);
-                            true
-                        }
+                    // Issue 7: refuse BEFORE installing; `false` feeds the ANDed RESTORE verdict,
+                    // so the head ABORTs the chain rather than run over an undescribed state.
+                    match crate::kv_coordination::installed_depth(blob) {
                         Err(e) => {
-                            warn!(error = %e, "ov-runtime: set_state(carried) failed; rank cold");
+                            warn!(error = %e, epoch, "ov-runtime: carried blob depth unparseable; refusing restore; rank cold");
                             false
+                        }
+                        Ok(depth) => {
+                            if let Err(e) = self.prime_if_never_inferred() {
+                                warn!(error = %e, "ov-runtime: priming before carried-blob restore failed");
+                            }
+                            match self.runtime.set_state_blob(blob) {
+                                Ok(()) => {
+                                    self.position = depth;
+                                    self.kv_warm_pending = true;
+                                    // Probe A REFERENCE point: this is the certified byte-identical
+                                    // path, so its digest is the known-good value the plane apply
+                                    // must match.
+                                    info!(
+                                        epoch,
+                                        blob_len = blob.len(),
+                                        blob_digest = crate::kv_coordination::byte_digest(blob),
+                                        position = self.position,
+                                        position_before = pos_before,
+                                        mode = "chain",
+                                        "ov_tail_restore_carried"
+                                    );
+                                    crate::kv_coordination::log_blob_tensors(
+                                        "restore_chain",
+                                        epoch,
+                                        blob,
+                                    );
+                                    true
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "ov-runtime: set_state(carried) failed; rank cold");
+                                    false
+                                }
+                            }
                         }
                     }
                 } else {
                     match self.kv.take_capture(epoch) {
-                        Some((tokens, blob)) => {
-                            if let Err(e) = self.prime_if_never_inferred() {
-                                warn!(error = %e, "ov-runtime: priming before capture restore failed");
-                            }
-                            match self.runtime.set_state_blob(&blob) {
-                                Ok(()) => {
-                                    // Real KV depth, not the token count (off-by-one, see kv_seq_from_blob).
-                                    self.position = crate::kv_coordination::kv_seq_from_blob(&blob)
-                                        .map(|s| s.min(tokens.len()))
-                                        .unwrap_or(tokens.len())
-                                        as i64;
-                                    self.kv_warm_pending = true;
-                                    true
-                                }
+                        // Issue 7: depth from the blob being installed, refused BEFORE set_state on
+                        // an unparseable one; the token-count clamp/fallback is deleted (capture now
+                        // refuses a blob deeper than its token list at the source).
+                        Some((_tokens, blob)) => {
+                            match crate::kv_coordination::installed_depth(&blob) {
                                 Err(e) => {
-                                    warn!(error = %e, "ov-runtime: set_state failed; rank cold");
+                                    warn!(error = %e, epoch, "ov-runtime: captured blob depth unparseable; refusing restore; rank cold");
                                     false
+                                }
+                                Ok(depth) => {
+                                    if let Err(e) = self.prime_if_never_inferred() {
+                                        warn!(error = %e, "ov-runtime: priming before capture restore failed");
+                                    }
+                                    match self.runtime.set_state_blob(&blob) {
+                                        Ok(()) => {
+                                            self.position = depth;
+                                            self.kv_warm_pending = true;
+                                            true
+                                        }
+                                        Err(e) => {
+                                            warn!(error = %e, "ov-runtime: set_state failed; rank cold");
+                                            false
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -5456,6 +5539,37 @@ mod tests {
             !needs_priming(true, true),
             "static + already-primed: still no"
         );
+    }
+
+    /// Issue 7, site A (head warm-resume): strict derives the depth from the blob and REFUSES an
+    /// unreadable one (`None` ⇒ serve cold, nothing installed); the `=0` escape hatch restores the
+    /// certified legacy rule exactly — clamp to the matched count, fall back to it on a parse miss.
+    /// Mutation check: a strict arm that clamps or falls back fails the `85` / `None` assertions.
+    #[cfg(feature = "kv_coord")]
+    #[test]
+    fn warm_resume_depth_is_strict_by_default_and_legacy_only_under_the_hatch() {
+        // One rank-4 attention state at fold depth 85 (data elided; the parser reads shape only).
+        let name = "past_key_values.0.key";
+        let mut blob = 1u32.to_le_bytes().to_vec();
+        blob.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        blob.extend_from_slice(name.as_bytes());
+        blob.extend_from_slice(&[1, 4]); // dtype, rank
+        for d in [1u64, 8, 85, 128] {
+            blob.extend_from_slice(&d.to_le_bytes());
+        }
+        blob.extend_from_slice(&0u64.to_le_bytes()); // nbytes
+
+        // Strict: the installed state's own depth, unclamped — the mask must describe what is
+        // actually in the VariableStates, not what the token list wishes were there.
+        assert_eq!(warm_resume_depth(&blob, 40, true), Some(85));
+        assert_eq!(warm_resume_depth(&blob, 100, true), Some(85));
+        // Strict: unparseable ⇒ refuse, never a fallback.
+        assert_eq!(warm_resume_depth(&[0u8; 3], 40, true), None);
+
+        // Legacy hatch: today's certified site-A rule, byte for byte.
+        assert_eq!(warm_resume_depth(&blob, 40, false), Some(40)); // .min(len)
+        assert_eq!(warm_resume_depth(&blob, 100, false), Some(85));
+        assert_eq!(warm_resume_depth(&[0u8; 3], 40, false), Some(40)); // unwrap_or(len)
     }
 
     /// §12.16 F1/F2 regression: pins the `ever_inferred` state machine `run_first`/`run_relay`

@@ -209,6 +209,29 @@ pub(crate) fn kv_seq_from_blob(blob: &[u8]) -> Option<usize> {
     (seq > 0).then_some(seq)
 }
 
+/// A blob whose installed depth cannot be derived (issue 7). Carries the blob length — the only
+/// structural fact the caller has left to log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DepthError {
+    pub(crate) blob_len: usize,
+}
+
+impl std::fmt::Display for DepthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KV blob depth unparseable ({} bytes)", self.blob_len)
+    }
+}
+
+/// [`kv_seq_from_blob`] with "unknown" as an ERROR, never a fallback (issue 7): every restore site
+/// derives `position` from the state it installs, and a depth the parser cannot read means the mask
+/// the next step builds would be a guess. The old fallbacks (`unwrap_or(0)`, `unwrap_or(len)`,
+/// `.min(len)`) all installed the state and then lied about its depth — the §12.16 amplifier.
+pub(crate) fn installed_depth(blob: &[u8]) -> Result<i64, DepthError> {
+    kv_seq_from_blob(blob).map(|s| s as i64).ok_or(DepthError {
+        blob_len: blob.len(),
+    })
+}
+
 /// [`kv_seq_from_blob`] for a framed multi-stage blob (`frame_blobs`): max depth over its parts (stages
 /// share the sequence length, `max` is a safe tie-break). For qwen36 stages / dist-spec draft+target;
 /// raw single-stage blobs use [`kv_seq_from_blob`] directly. `None` if unparseable.
@@ -643,13 +666,23 @@ impl OvKvCache {
         if blob.is_empty() {
             return;
         }
+        // Issue 7 capture-side assertion: a blob deeper than its token list is a capture defect
+        // (`epoch = synth_epoch(tokens)` is structurally incapable of tracking KV depth, so nothing
+        // downstream would catch it), and every restore site would install a state whose mask the
+        // token list cannot describe. Refuse to cache it, loudly.
+        let seq = kv_seq_from_blob(&blob).unwrap_or(0);
+        if seq > tokens.len() {
+            tracing::warn!(target: "cascadia::kv", event = "kv_cap_skip_deep_blob",
+                epoch, tokens = tokens.len(), seq, blob = blob.len());
+            return;
+        }
         if self.captures.len() >= KV_MAX_ENTRIES && !self.captures.contains_key(&epoch) {
             if let Some(k) = self.captures.keys().next().copied() {
                 self.captures.remove(&k);
             }
         }
         tracing::info!(target: "cascadia::kv", event = "kv_cap_under_epoch",
-            epoch, tokens = tokens.len(), blob = blob.len());
+            epoch, tokens = tokens.len(), seq, blob = blob.len());
         self.captures
             .insert(epoch, (partner.to_string(), tokens, blob));
     }
@@ -1092,6 +1125,10 @@ pub(crate) enum HandoffReject {
     Decode,
     /// The slice's KV depth, which this rank is already past.
     TooLate(i64),
+    /// The decoded blob's depth is unparseable (issue 7): a slice whose true depth is unknown
+    /// cannot be resumed into — accepting it at depth 0 fed straight into the `unwrap_or(0)`
+    /// restore floor.
+    DepthUnknown,
 }
 
 /// The pure part of `OvRuntimeEngine::drain_kv_handoff` — structural validation, opaque decode, depth
@@ -1129,7 +1166,7 @@ pub(crate) fn handoff_decision(
         wire_to_blob(&slot.manifest, &slot.payloads).ok_or(HandoffReject::Decode)?;
     // Snapping back is what produced the two-item divergence: a slice shallower than where this rank
     // already is cannot be resumed into, so drop it and let the turn stay cold.
-    let depth = kv_seq_from_blob(&blob).unwrap_or(0) as i64;
+    let depth = installed_depth(&blob).map_err(|_| HandoffReject::DepthUnknown)?;
     if position > depth {
         return Err(HandoffReject::TooLate(depth));
     }
@@ -1174,6 +1211,11 @@ pub(crate) fn drain_handoff(
         Err(HandoffReject::TooLate(depth)) => {
             tracing::warn!(target: "cascadia::kv", event = "kv_handoff_too_late",
                 epoch = slot.epoch, position, depth);
+            return false;
+        }
+        Err(HandoffReject::DepthUnknown) => {
+            tracing::warn!(target: "cascadia::kv", event = "kv_handoff_depth_unknown",
+                epoch = slot.epoch, position);
             return false;
         }
     };
@@ -1357,6 +1399,71 @@ mod tests {
         // Garbage/truncated ⇒ None so the caller falls back to the matched token count.
         assert_eq!(kv_seq_from_blob(&[0u8; 3]), None);
         assert_eq!(kv_seq_from_blob(&1u32.to_le_bytes()), None); // count=1, no state body
+    }
+    /// Issue 7: `installed_depth` is `kv_seq_from_blob` with "unknown" as an ERROR. The mutation
+    /// this pins: re-introducing any fallback (`unwrap_or(0)` / token count / clamp) at a restore
+    /// site would need this to yield a depth for an unreadable blob — the `Err` assertions kill it.
+    #[test]
+    fn installed_depth_errors_instead_of_falling_back() {
+        fn state(name: &str, shape: &[u64], data_len: usize) -> Vec<u8> {
+            let mut b = (name.len() as u32).to_le_bytes().to_vec();
+            b.extend_from_slice(name.as_bytes());
+            b.push(1); // dtype code
+            b.push(shape.len() as u8);
+            for &d in shape {
+                b.extend_from_slice(&d.to_le_bytes());
+            }
+            b.extend_from_slice(&(data_len as u64).to_le_bytes());
+            b.extend(std::iter::repeat(0u8).take(data_len));
+            b
+        }
+        // Well-formed attention-only blob ⇒ the fold depth.
+        let mut plain = 1u32.to_le_bytes().to_vec();
+        plain.extend(state("past_key_values.0.key", &[1, 8, 85, 128], 16));
+        assert_eq!(installed_depth(&plain), Ok(85));
+        // Hybrid (qwen36): conv/ssm recurrent widths are constants in shape[2] and must not
+        // poison the depth.
+        let mut hybrid = 3u32.to_le_bytes().to_vec();
+        hybrid.extend(state("past_key_values.0.key", &[1, 8, 85, 128], 16));
+        hybrid.extend(state("cache_params.past.conv.0", &[1, 1, 128, 4], 8));
+        hybrid.extend(state("cache_params.past.ssm.0", &[1, 1, 128, 16], 8));
+        assert_eq!(installed_depth(&hybrid), Ok(85));
+        // Truncated / garbage ⇒ Err — never 0, never a token count.
+        assert_eq!(installed_depth(&[0u8; 3]), Err(DepthError { blob_len: 3 }));
+        assert_eq!(
+            installed_depth(&1u32.to_le_bytes()), // count=1, no state body
+            Err(DepthError { blob_len: 4 })
+        );
+    }
+    /// Issue 7 capture-side assertion: a blob deeper than its token list is a capture defect and
+    /// must not be cached — whatever lands in this stash is what a restore site later installs.
+    /// Depth == token count stays capturable (KV depth is normally matched_len - 1, and equality is
+    /// the boundary the restore-side guard also allows).
+    #[test]
+    fn capture_refuses_a_blob_deeper_than_its_token_list() {
+        fn depth_blob(depth: u64) -> Vec<u8> {
+            let name = "past_key_values.0.key";
+            let mut b = 1u32.to_le_bytes().to_vec();
+            b.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            b.extend_from_slice(name.as_bytes());
+            b.extend_from_slice(&[1, 4]); // dtype, rank
+            for d in [1u64, 1, depth, 1] {
+                b.extend_from_slice(&d.to_le_bytes());
+            }
+            b.extend_from_slice(&0u64.to_le_bytes()); // nbytes
+            b
+        }
+        let mut c = OvKvCache::default();
+        c.capture_under_epoch(0xE0, vec![1, 2, 3], depth_blob(4));
+        assert!(
+            c.take_capture(0xE0).is_none(),
+            "a blob deeper than its token list must be refused at capture"
+        );
+        c.capture_under_epoch(0xE1, vec![1, 2, 3, 4], depth_blob(4));
+        assert!(
+            c.take_capture(0xE1).is_some(),
+            "depth == tokens is the boundary; still cached"
+        );
     }
     #[test]
     fn kv_compact_blob_gathers_valid_positions() {
@@ -2007,6 +2114,21 @@ mod tests {
         assert_eq!(
             handoff_decision(&slot_of(&[]), DECISION_FP, 0),
             Err(HandoffReject::Decode)
+        );
+    }
+
+    /// Issue 7: a slice whose decoded blob has no parseable depth is refused outright — it used to
+    /// be ACCEPTED at depth 0 and fall straight into the restore sites' `unwrap_or(0)` floor.
+    #[test]
+    fn handoff_decision_rejects_an_unparseable_depth() {
+        assert_eq!(
+            handoff_decision(&slot_of(&[0, 0, 0]), DECISION_FP, 0),
+            Err(HandoffReject::DepthUnknown)
+        );
+        // count=0 (an empty state list) has no depth either: nothing resumable is in there.
+        assert_eq!(
+            handoff_decision(&slot_of(&0u32.to_le_bytes()), DECISION_FP, 0),
+            Err(HandoffReject::DepthUnknown)
         );
     }
 
