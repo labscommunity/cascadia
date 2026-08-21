@@ -101,11 +101,17 @@ jobs:
           INTEL_OPENVINO_DIR: ${{ vars.INTEL_OPENVINO_DIR }}
         run: |
           $ov = $env:INTEL_OPENVINO_DIR
-          if (-not (Test-Path "$ov\runtime\bin\intel64\Release")) {
-            Write-Host "::warning::OpenVINO Release bin not found at $ov\runtime\bin\intel64\Release"
+          if ([string]::IsNullOrWhiteSpace($ov)) {
+            Write-Host "::error::repository variable INTEL_OPENVINO_DIR is not set for this runner"
+            exit 1
           }
-          "$ov\runtime\bin\intel64\Release" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          "$ov\runtime\3rdparty\tbb\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          foreach ($d in "$ov\runtime\bin\intel64\Release", "$ov\runtime\3rdparty\tbb\bin") {
+            if (-not (Test-Path $d)) {
+              Write-Host "::error::OpenVINO DLL dir not found: $d - tests would die with STATUS_DLL_NOT_FOUND (0xC0000135)"
+              exit 1
+            }
+            $d | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
           Write-Host "Added OpenVINO DLLs to PATH from $ov"
 
       # Real OpenVINO build (mirrors `just build-ov`).
