@@ -97,8 +97,10 @@ jobs:
 
       - name: Add OpenVINO DLLs to PATH (Windows)
         shell: powershell
+        env:
+          INTEL_OPENVINO_DIR: ${{ vars.INTEL_OPENVINO_DIR }}
         run: |
-          $ov = "${{ vars.INTEL_OPENVINO_DIR }}"
+          $ov = $env:INTEL_OPENVINO_DIR
           if (-not (Test-Path "$ov\runtime\bin\intel64\Release")) {
             Write-Host "::warning::OpenVINO Release bin not found at $ov\runtime\bin\intel64\Release"
           }
