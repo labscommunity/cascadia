@@ -6,6 +6,8 @@
 #   - self-hosted runners online with labels [self-hosted, ai-pc, windows]
 #   - repository variable INTEL_OPENVINO_DIR pointing at the OpenVINO GenAI SDK
 #     root on the runners.
+#   - Git for Windows on the runners (dtolnay/rust-toolchain needs bash; the
+#     runner service PATH gets only Git\cmd, not Git\bin).
 #
 # SECURITY — fork PRs must NEVER run on the self-hosted runners. Untrusted fork
 # code here = arbitrary code execution on our hardware. The job-level `if` below
@@ -72,6 +74,30 @@ jobs:
           # Persistent self-hosted runner: don't leave the token in .git config.
           persist-credentials: false
 
+      # dtolnay/rust-toolchain declares `shell: bash` on every composite step,
+      # but the runner service PATH has only Git\cmd (git.exe), not Git\bin
+      # (bash.exe). usr\bin is needed too — the action's scripts use sed, which
+      # lives there. Known tradeoff: GITHUB_PATH entries land ahead of
+      # System32, so GNU link/find/sort shadow the Windows ones for later
+      # steps; harmless today because rustc locates the MSVC link.exe by
+      # absolute path, not PATH search.
+      # `shell: powershell` (5.1) here and below because pwsh is not
+      # guaranteed on the self-hosted boxes.
+      - name: Ensure bash on Windows self-hosted
+        shell: powershell
+        run: |
+          $bash = "C:\Program Files\Git\bin\bash.exe"
+          if (Test-Path $bash) {
+            "C:\Program Files\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            "C:\Program Files\Git\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            Write-Host "Added Git bash to PATH"
+          } elseif (Get-Command bash -ErrorAction SilentlyContinue) {
+            Write-Host "bash already on PATH: $((Get-Command bash).Source)"
+          } else {
+            Write-Host "::error::bash.exe not found at the default Git for Windows path ($bash) or on PATH - install Git for Windows on this AI-PC runner (winget install --id Git.Git -e)"
+            exit 1
+          }
+
       # SHA-pinned: the `stable` channel now comes from `toolchain:`, not the ref.
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
@@ -81,6 +107,29 @@ jobs:
         with:
           shared-key: ai-pc-openvino
           cache-on-failure: true
+
+      # Test binaries load openvino*.dll and tbb12.dll at process start, and
+      # the runner service PATH does not include them — a miss surfaces only
+      # as an opaque STATUS_DLL_NOT_FOUND (0xC0000135) at the test step, after
+      # the full release build. Verify and fail here instead.
+      - name: Add OpenVINO DLLs to PATH (Windows)
+        shell: powershell
+        env:
+          INTEL_OPENVINO_DIR: ${{ vars.INTEL_OPENVINO_DIR }}
+        run: |
+          $ov = $env:INTEL_OPENVINO_DIR
+          if ([string]::IsNullOrWhiteSpace($ov)) {
+            Write-Host "::error::repository variable INTEL_OPENVINO_DIR is not set for this runner"
+            exit 1
+          }
+          foreach ($d in "$ov\runtime\bin\intel64\Release", "$ov\runtime\3rdparty\tbb\bin") {
+            if (-not (Test-Path $d)) {
+              Write-Host "::error::OpenVINO DLL dir not found: $d - tests would die with STATUS_DLL_NOT_FOUND (0xC0000135)"
+              exit 1
+            }
+            $d | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+          Write-Host "Added OpenVINO DLLs to PATH from $ov"
 
       # Real OpenVINO build (mirrors `just build-ov`).
       - name: Build cascadia with the openvino feature
