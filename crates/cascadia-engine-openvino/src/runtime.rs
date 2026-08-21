@@ -1578,6 +1578,12 @@ pub struct OvRuntimeEngine {
     /// `reset_state` (this worker's KV is already warm). Cleared by that prefill or by `ABORT`.
     #[cfg(feature = "kv_coord")]
     kv_warm_pending: bool,
+    /// Issue 8: latched once this link has ever delivered an `OPCODE_TURN_BEGIN`. From then on the
+    /// opcode is the SOLE turn-boundary reset trigger and the relay bodies' `shape[1] > 1` proxy is
+    /// retired for good — leaving both active would re-reset a turn the opcode already scrubbed.
+    /// Never cleared: an old-head fallback is only for a head that never sends the opcode at all.
+    #[cfg(feature = "kv_coord")]
+    saw_turn_begin: bool,
     /// Issue-34 plane-restore MODE, read once from `CASCADIA_KV_PLANE_RESTORE` at build. Since the
     /// plane arm moved in-band (`drain_kv_handoff` under `OPCODE_RESTORE`) the chain verdict is binding
     /// in both modes, so this only labels the mode in the warm-resume logs the cert greps.
@@ -2895,6 +2901,17 @@ impl OvRuntimeEngine {
             ));
         }
 
+        // Issue 8: mark the turn boundary in-band before the turn's first forward frame. The
+        // stateful relay's only other reset trigger is the `shape[1] > 1` proxy, which a T=1
+        // prefill never satisfies. Static shards carry an absolute position instead (ring reset at
+        // 0), so they need no boundary. Emitted unconditionally — see the opcode doc for the
+        // lockstep/flag-day requirement. A send failure is fatal to the step: a turn the tail never
+        // saw begin would fold onto the previous one, which is exactly the accumulation this ends.
+        #[cfg(feature = "kv_coord")]
+        if prefill && !single_stage && self.static_kv.is_none() {
+            self.send_turn_begin_downstream(self.position)?;
+        }
+
         let next_token = if self.static_kv.is_some() {
             // Static (NPU): one token per inference (static_seq == 1). Prefill
             // round-trips the whole pipeline once per prompt token so every
@@ -3615,6 +3632,26 @@ impl OvRuntimeEngine {
         }
     }
 
+    /// Turn-boundary reset for the stateful relay path (shared by both relay bodies so the two
+    /// copies cannot drift). Once `TURN_BEGIN` has ever been seen on this link, the opcode is the
+    /// SOLE reset trigger (its handler already scrubbed and consumed the warm flag) and the
+    /// `shape[1] > 1` proxy is retired — it is defeated by a T=1 prefill anyway (issue 8). Without
+    /// it (an old head), the legacy proxy gate runs exactly as before.
+    fn reset_on_fresh_prefill(&mut self, seq: usize) -> EngineResult<()> {
+        #[cfg(feature = "kv_coord")]
+        if self.saw_turn_begin {
+            return Ok(());
+        }
+        // Reset on a fresh prefill UNLESS a RESTORE warm-resumed this rank (keep that state + its
+        // position). The flag is consumed every prefill so it never leaks across turns.
+        let warm = self.kv_consume_warm_pending();
+        if seq > 1 && !warm {
+            self.runtime.reset_state().map_err(map_ov_err)?;
+            self.position = 0;
+        }
+        Ok(())
+    }
+
     fn step_last(&mut self) -> EngineResult<()> {
         if self.packed.is_some() {
             return self.step_relay_packed();
@@ -3647,13 +3684,7 @@ impl OvRuntimeEngine {
             // (reset at 0); seq is always 1.
             Some(pos) => self.run_relay(&hidden, shape, pos)?,
             None => {
-                // Reset on a fresh prefill UNLESS a RESTORE warm-resumed this rank (keep that state +
-                // its position). The flag is consumed every prefill so it never leaks across turns.
-                let warm = self.kv_consume_warm_pending();
-                if shape[1] > 1 && !warm {
-                    self.runtime.reset_state().map_err(map_ov_err)?;
-                    self.position = 0;
-                }
+                self.reset_on_fresh_prefill(shape[1])?;
                 let r = self.run_relay(&hidden, shape, self.position)?;
                 self.position += shape[1] as i64;
                 r
@@ -3746,11 +3777,7 @@ impl OvRuntimeEngine {
                 (o, s, pos)
             }
             None => {
-                let warm = self.kv_consume_warm_pending();
-                if shape[1] > 1 && !warm {
-                    self.runtime.reset_state().map_err(map_ov_err)?;
-                    self.position = 0;
-                }
+                self.reset_on_fresh_prefill(shape[1])?;
                 let (o, s) = self.run_relay(&hidden, shape, self.position)?;
                 self.position += shape[1] as i64;
                 (o, s, 0)
@@ -4324,12 +4351,47 @@ const OPCODE_ABORT_ACK: u8 = 6;
 /// non-empty tenant, so a chain that never names one stays byte-for-byte on the v1 frame.
 #[cfg(feature = "kv_coord")]
 const OPCODE_CAPTURE_V2: u8 = 7;
+/// Issue 8: in-band turn boundary, sent by the head immediately before the turn's first forward
+/// frame; body = the head's `position` (i64 LE). A T=1 prefill makes every relayed frame
+/// `shape[1] == 1`, so the relay bodies' fresh-prefill reset proxy never fires and the tail folds
+/// turn on turn — this opcode is the reset trigger that survives T=1. The carried head position
+/// also makes head/tail restored-position divergence observable in-band for the first time (the
+/// stateful lead frame carries no position by construction).
+///
+/// A separate opcode, not a wider body — the `OPCODE_CAPTURE_V2` precedent. Emitted
+/// UNCONDITIONALLY: ADR-005's lockstep premise (whole fleet, one build) is the flag-day
+/// `CAPTURE_V2` already shipped on; an old tail errors its step on the unknown opcode and never
+/// ACKs, so a mixed-version chain must never see this frame. If mixed-version becomes real, copy
+/// qwen36's HELLO capability negotiation — deliberately deferred.
+#[cfg(feature = "kv_coord")]
+const OPCODE_TURN_BEGIN: u8 = 8;
 
 #[cfg(feature = "kv_coord")]
 impl OvRuntimeEngine {
     /// True once this rank holds OV state worth coordinating (stateful, post-load).
     fn kv_stateful(&self) -> bool {
         self.static_kv.is_none()
+    }
+
+    /// Head/middle → downstream: `TURN_BEGIN(head position)` — issue 8, see the opcode doc. One-way,
+    /// no ACK: the stream is ordered, so the frame lands before the prefill hidden it precedes, and
+    /// an ACK wait here would put a wire round-trip on every turn for a fire-and-forget signal.
+    /// `head_pos` is the HEAD's restored position even when a middle rank relays the frame on —
+    /// every rank compares itself against the head, not its neighbour.
+    fn send_turn_begin_downstream(&mut self, head_pos: i64) -> EngineResult<()> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        let mut data = vec![OPCODE_TURN_BEGIN];
+        data.extend_from_slice(&head_pos.to_le_bytes());
+        let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
+        self.block_on(async move {
+            let mut g = downstream.lock().await;
+            g.send(&t).await
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))?;
+        Ok(())
     }
 
     /// Head/middle → downstream: send `CAPTURE(epoch, tokens)` as an I8 control tensor, await the ACK.
@@ -4626,6 +4688,43 @@ impl OvRuntimeEngine {
                     let _ = self.send_abort_downstream();
                 }
                 self.send_control_ack_upstream(OPCODE_ABORT_ACK, &[])
+            }
+            // TURN_BEGIN: a new turn starts — scrub unless a RESTORE just warm-armed this rank.
+            // Consuming `kv_warm_pending` HERE is what retires the relay bodies' consume: once this
+            // opcode is the reset trigger, it must also be the warm-flag consumer, or the flag
+            // would leak into a later turn. One-way (no ACK); chained downstream so every rank in
+            // the pipeline sees the boundary.
+            Some(OPCODE_TURN_BEGIN) => {
+                let head_pos = t
+                    .data
+                    .get(1..9)
+                    .and_then(|b| b.try_into().ok())
+                    .map(i64::from_le_bytes)
+                    .ok_or_else(|| {
+                        EngineError::Backend("ov-runtime: bad TURN_BEGIN body".into())
+                    })?;
+                let warm = std::mem::take(&mut self.kv_warm_pending);
+                if !warm {
+                    let _ = self.runtime.reset_state();
+                    self.position = 0;
+                }
+                // Issue 8 invariant: tail restored position == head restored position. Carried
+                // in-band because the stateful lead frame has no position lane — this is the first
+                // place the divergence is observable at all.
+                if self.position != head_pos {
+                    warn!(
+                        head_pos,
+                        tail_pos = self.position,
+                        warm,
+                        "ov_turn_begin_position_mismatch"
+                    );
+                }
+                self.saw_turn_begin = true;
+                if !self.spec.is_last_stage {
+                    // Forward the HEAD's position, not ours: every rank compares against the head.
+                    self.send_turn_begin_downstream(head_pos)?;
+                }
+                Ok(())
             }
             other => Err(EngineError::Backend(format!(
                 "ov-runtime: unknown control opcode {other:?}"
@@ -5498,6 +5597,8 @@ impl Builder for OvRuntimeBuilder {
             #[cfg(feature = "kv_coord")]
             kv_warm_pending: false,
             #[cfg(feature = "kv_coord")]
+            saw_turn_begin: false,
+            #[cfg(feature = "kv_coord")]
             plane_restore: std::env::var("CASCADIA_KV_PLANE_RESTORE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
@@ -5570,6 +5671,130 @@ mod tests {
         assert_eq!(warm_resume_depth(&blob, 40, false), Some(40)); // .min(len)
         assert_eq!(warm_resume_depth(&blob, 100, false), Some(85));
         assert_eq!(warm_resume_depth(&[0u8; 3], 40, false), Some(40)); // unwrap_or(len)
+    }
+
+    /// Issue 8: `OPCODE_TURN_BEGIN` must stay collision-free in the I8 control opcode space —
+    /// colliding with an allocated opcode would misparse mid-chain, and the unknown-opcode arm
+    /// (which must keep erroring for genuinely unknown bytes) would not catch it.
+    #[cfg(feature = "kv_coord")]
+    #[test]
+    fn turn_begin_opcode_is_outside_the_allocated_range() {
+        let allocated = [
+            OPCODE_CAPTURE,
+            OPCODE_CAPTURE_ACK,
+            OPCODE_RESTORE,
+            OPCODE_RESTORE_ACK,
+            OPCODE_ABORT,
+            OPCODE_ABORT_ACK,
+            OPCODE_CAPTURE_V2,
+        ];
+        assert!(!allocated.contains(&OPCODE_TURN_BEGIN));
+    }
+
+    /// Issue 8: the T=1 tail-reset gate. There is no `OvRuntime` seam in this crate (see the
+    /// `ever_inferred` test above), so this pins the control-flow shape `reset_on_fresh_prefill`
+    /// and the `OPCODE_TURN_BEGIN` arm follow, via a toy mirroring their exact gates; the real
+    /// path is rig-verified (`ov-runtime` both planes, `RUNTIME_T1=1` and `=0`).
+    #[cfg(feature = "kv_coord")]
+    #[test]
+    fn turn_begin_resets_where_the_t1_shape_proxy_cannot() {
+        struct Tail {
+            position: i64,
+            warm_pending: bool,
+            saw_turn_begin: bool,
+            resets: u32,
+        }
+        impl Tail {
+            /// Mirrors the `OPCODE_TURN_BEGIN` arm: consume the warm flag, scrub unless warm,
+            /// latch; returns whether the position-equality invariant would warn.
+            fn turn_begin(&mut self, head_pos: i64) -> bool {
+                let warm = std::mem::take(&mut self.warm_pending);
+                if !warm {
+                    self.resets += 1;
+                    self.position = 0;
+                }
+                self.saw_turn_begin = true;
+                self.position != head_pos
+            }
+            /// Mirrors `reset_on_fresh_prefill` + the relay bodies' position advance.
+            fn relay(&mut self, seq: usize) {
+                if !self.saw_turn_begin {
+                    let warm = std::mem::take(&mut self.warm_pending);
+                    if seq > 1 && !warm {
+                        self.resets += 1;
+                        self.position = 0;
+                    }
+                }
+                self.position += seq as i64;
+            }
+        }
+        fn tail() -> Tail {
+            Tail {
+                position: 0,
+                warm_pending: false,
+                saw_turn_begin: false,
+                resets: 0,
+            }
+        }
+
+        // WITHOUT the opcode a T=1 prefill never trips the shape proxy: three 5-token turns fold
+        // onto each other — the measured 37→134→…→365 accumulation. Pinning the broken fallback
+        // is the mutation check: a proxy "fixed" to reset on seq == 1 would reset mid-decode too.
+        let mut old_head = tail();
+        for _ in 0..3 {
+            for _ in 0..5 {
+                old_head.relay(1);
+            }
+        }
+        assert_eq!(old_head.resets, 0);
+        assert_eq!(old_head.position, 15, "turns accumulate without TURN_BEGIN");
+
+        // WITH the opcode every turn returns to 0 — the sole trigger a T=1 prefill cannot defeat.
+        let mut new_head = tail();
+        for _ in 0..3 {
+            assert!(
+                !new_head.turn_begin(0),
+                "cold head and cold tail agree at 0"
+            );
+            for _ in 0..5 {
+                new_head.relay(1);
+            }
+            assert_eq!(new_head.position, 5, "each turn starts from 0");
+        }
+        assert_eq!(new_head.resets, 3);
+
+        // The shape[1] > 1 fallback still fires when no TURN_BEGIN was ever seen (old head).
+        let mut fallback = tail();
+        fallback.position = 37;
+        fallback.relay(7);
+        assert_eq!(fallback.resets, 1);
+        assert_eq!(fallback.position, 7);
+
+        // Once TURN_BEGIN is the trigger, a wide frame must NOT re-reset — the opcode already
+        // scrubbed, and a warm restore between the two would be destroyed by a second reset.
+        let mut warm = tail();
+        warm.warm_pending = true;
+        warm.position = 85; // RESTORE armed this rank at depth 85
+        assert!(
+            !warm.turn_begin(85),
+            "warm tail keeps its restored position"
+        );
+        warm.relay(7); // warm suffix prefill, T>1
+        assert_eq!(
+            warm.resets, 0,
+            "TURN_BEGIN is the sole reset trigger once seen"
+        );
+        assert_eq!(warm.position, 92);
+
+        // The carried head position makes divergence observable: a tail restored at 85 under a
+        // head that resumed at 97 warns.
+        let mut diverged = tail();
+        diverged.warm_pending = true;
+        diverged.position = 85;
+        assert!(
+            diverged.turn_begin(97),
+            "restored-position divergence must warn"
+        );
     }
 
     /// §12.16 F1/F2 regression: pins the `ever_inferred` state machine `run_first`/`run_relay`
