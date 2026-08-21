@@ -720,9 +720,11 @@ impl Builder for SparseMoEBuilder {
                 runtime_handle,
                 rank,
                 total,
-                // dsv4 has no config-threaded prefix cache; `None` keeps its
-                // existing env-only behaviour byte-for-byte.
-                None,
+                // dsv4 has no config-threaded prefix cache; env-only.
+                dsv4_prefix_cap(
+                    std::env::var("CASCADIA_DSV4_PREFIX_CACHE").ok().as_deref(),
+                    std::env::var("CASCADIA_GLM5_PREFIX_CACHE").ok().as_deref(),
+                ),
             )));
         }
         if let Some(runner) = self.glm_runner {
@@ -745,7 +747,10 @@ impl Builder for SparseMoEBuilder {
                 total,
                 // Same value the per-rank SliceKvCache got, so the rank-0 index
                 // and the per-rank caches stay in lockstep.
-                self.config.prefix_cache_depth.map(|d| d as usize),
+                resolve_prefix_cap(
+                    self.config.prefix_cache_depth.map(|d| d as usize),
+                    "CASCADIA_GLM5_PREFIX_CACHE",
+                ),
             )));
         }
         if let Some(ov) = self.ov_runner {
@@ -2838,11 +2843,47 @@ struct PipeActive {
     hit_context_cap: bool,
 }
 
+fn parse_prefix_cap(raw: &str) -> Option<usize> {
+    raw.trim().parse::<usize>().ok()
+}
+
+/// `explicit` wins; failing that, reads `env_var` by NAME. The caller picks
+/// the name, so an arch-scoped knob (e.g. `CASCADIA_GLM5_PREFIX_CACHE`) can
+/// never reach a different arch's engine. Unset/unparseable → 0 (off).
+fn resolve_prefix_cap(explicit: Option<usize>, env_var: &str) -> usize {
+    explicit
+        .or_else(|| {
+            std::env::var(env_var)
+                .ok()
+                .as_deref()
+                .and_then(parse_prefix_cap)
+        })
+        .unwrap_or(0)
+}
+
+/// dsv4 rank-0 prefix cap from the raw values of `CASCADIA_DSV4_PREFIX_CACHE`
+/// and the legacy `CASCADIA_GLM5_PREFIX_CACHE`. The dsv4 var wins whenever it
+/// is set; the glm5 name is honoured with a deprecation warning only while the
+/// dsv4 var is unset (issue #139). Drop the fallback after one release.
+fn dsv4_prefix_cap(dsv4: Option<&str>, glm5: Option<&str>) -> usize {
+    match (dsv4, glm5) {
+        (Some(raw), _) => parse_prefix_cap(raw).unwrap_or(0),
+        (None, Some(raw)) => {
+            warn!(
+                "CASCADIA_GLM5_PREFIX_CACHE is deprecated for the dsv4 engine; \
+                 set CASCADIA_DSV4_PREFIX_CACHE instead (fallback removed next release)"
+            );
+            parse_prefix_cap(raw).unwrap_or(0)
+        }
+        (None, None) => 0,
+    }
+}
+
 impl<R: StagedRunner> PipelineEngine<R> {
-    /// `prefix_cap`: rank-0 KV-prefix-cache depth. `None` defers to
-    /// `CASCADIA_GLM5_PREFIX_CACHE`, preserving the env-only behaviour. This
-    /// index must stay in lockstep with every rank's `SliceKvCache`, so the
-    /// value threaded here is the same one handed to `StageOpts`.
+    /// `prefix_cap`: rank-0 KV-prefix-cache depth (0 = off), already resolved
+    /// by the caller via `resolve_prefix_cap` / `dsv4_prefix_cap`. This index
+    /// must stay in lockstep with every rank's `SliceKvCache`, so the value
+    /// threaded here is the same one handed to `StageOpts`.
     fn new(
         runner: R,
         tokenizer: Option<Tokenizer>,
@@ -2850,7 +2891,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         runtime_handle: tokio::runtime::Handle,
         rank: u32,
         total: u32,
-        prefix_cap: Option<usize>,
+        prefix_cap: usize,
     ) -> Self {
         Self {
             runner,
@@ -2867,13 +2908,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             last_rank_rng_seeded: false,
             prefix_index: Vec::new(),
             prefix_next_key: 0,
-            prefix_cap: prefix_cap
-                .or_else(|| {
-                    std::env::var("CASCADIA_GLM5_PREFIX_CACHE")
-                        .ok()
-                        .and_then(|s| s.trim().parse::<usize>().ok())
-                })
-                .unwrap_or(0),
+            prefix_cap,
             active: None,
         }
     }
@@ -4070,5 +4105,33 @@ mod tests {
             prefill_reply_budget(recv_timeout, Some(ceiling)),
             std::time::Duration::from_secs(600)
         );
+    }
+
+    /// Issue #139: dsv4's prefix cap reads its own `CASCADIA_DSV4_PREFIX_CACHE`
+    /// and only falls back to the glm5-named var while it is unset.
+    #[test]
+    fn dsv4_prefix_cap_new_var_wins_over_legacy() {
+        assert_eq!(dsv4_prefix_cap(Some("3"), Some("7")), 3);
+    }
+
+    #[test]
+    fn dsv4_prefix_cap_honours_legacy_var_when_new_unset() {
+        assert_eq!(dsv4_prefix_cap(None, Some("7")), 7);
+    }
+
+    #[test]
+    fn dsv4_prefix_cap_defaults_off_when_neither_set() {
+        assert_eq!(dsv4_prefix_cap(None, None), 0);
+    }
+
+    #[test]
+    fn dsv4_prefix_cap_unparseable_new_var_does_not_fall_back() {
+        assert_eq!(dsv4_prefix_cap(Some("lots"), Some("7")), 0);
+    }
+
+    #[test]
+    fn dsv4_prefix_cap_trims_whitespace() {
+        assert_eq!(dsv4_prefix_cap(Some(" 5 "), None), 5);
+        assert_eq!(dsv4_prefix_cap(None, Some(" 9\n")), 9);
     }
 }
