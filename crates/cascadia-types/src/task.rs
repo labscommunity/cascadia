@@ -90,10 +90,62 @@ pub struct GenerationTask {
     /// the two must flip together.
     #[serde(default)]
     pub tenant: String,
+    /// Option B resumable generation: already-emitted assistant token-ids to
+    /// force-prefix. When `Some`, the engine APPENDS these to the rendered
+    /// prompt-ids and pre-seeds `generated` with them — they are NEVER re-emitted.
+    #[serde(default)]
+    pub resume_token_ids: Option<Vec<i32>>,
 }
 
 fn default_max_tokens() -> u32 {
     256
+}
+
+/// Append the caller's already-emitted assistant token-ids to the engine's
+/// rendered prompt-ids. No-op when not resuming. Concatenation, NOT replacement —
+/// the rendered prompt is KEPT as context.
+pub fn append_resume_ids(prompt_ids: &mut Vec<i64>, resume: Option<&[i32]>) {
+    if let Some(r) = resume {
+        prompt_ids.extend(r.iter().map(|&t| t as i64));
+    }
+}
+
+/// Tokens to pre-seed the engine's `generated` accumulator with on a resumed
+/// turn: makes `generated.len() >= max_tokens` bound total = prefix + new, and
+/// makes tail tokens decode WITH the prefix as context. Empty for a normal turn.
+pub fn resume_generated_seed(resume: Option<&[i32]>) -> Vec<i64> {
+    resume
+        .map(|r| r.iter().map(|&t| t as i64).collect())
+        .unwrap_or_default()
+}
+
+/// Peer-supplied resume ids are indices into the embedding table, so they must
+/// be validated BEFORE any engine feeds them to a native runtime: a negative or
+/// out-of-vocab id is an out-of-range gather in OpenVINO — crash/UB, not a typed
+/// error. `vocab_size: None` skips the upper bound for engines that cannot
+/// cheaply know it; the sign check always applies.
+pub fn validate_resume_ids(ids: &[i32], vocab_size: Option<u32>) -> Result<(), String> {
+    for (i, &id) in ids.iter().enumerate() {
+        if id < 0 {
+            return Err(format!("resume_token_ids[{i}] = {id} is negative"));
+        }
+        if let Some(v) = vocab_size {
+            if id as u32 >= v {
+                return Err(format!("resume_token_ids[{i}] = {id} >= vocab_size {v}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+impl GenerationTask {
+    /// The normalized resume prefix: `Some(&ids)` only when non-empty. Engines
+    /// MUST branch on this, never on `resume_token_ids.is_some()` — a wire-legal
+    /// `Some([])` is "not resuming", and predicate drift here already produced
+    /// one engine forcing greedy decode on a non-resumed turn.
+    pub fn resume_ids(&self) -> Option<&[i32]> {
+        self.resume_token_ids.as_deref().filter(|r| !r.is_empty())
+    }
 }
 
 impl GenerationTask {
@@ -108,6 +160,7 @@ impl GenerationTask {
             enable_thinking: false,
             trust_remote_code: false,
             tenant: String::new(), // LOCAL_NS — see the field doc
+            resume_token_ids: None,
         }
     }
 
@@ -131,5 +184,79 @@ impl GenerationTask {
     pub fn with_sampling(mut self, sampling: SamplingParams) -> Self {
         self.sampling = sampling;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_token_ids_defaults_none_and_is_additive() {
+        let t = GenerationTask {
+            task_id: "t1".to_string(),
+            prompt: "hello".to_string(),
+            max_tokens: default_max_tokens(),
+            temperature: 0.0,
+            logprobs: 0,
+            sampling: SamplingParams::default(),
+            enable_thinking: false,
+            trust_remote_code: false,
+            tenant: String::new(),
+            resume_token_ids: None,
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let back: GenerationTask = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.resume_token_ids, None);
+
+        // Additivity: a payload encoded WITHOUT the field still decodes,
+        // defaulting to None.
+        let without_field = serde_json::json!({
+            "task_id": "t1",
+            "prompt": "hello",
+        });
+        let back: GenerationTask = serde_json::from_value(without_field).unwrap();
+        assert_eq!(back.resume_token_ids, None);
+    }
+
+    #[test]
+    fn append_resume_ids_concatenates_and_is_noop_when_absent() {
+        let mut ids = vec![1i64, 2, 3];
+        append_resume_ids(&mut ids, None);
+        assert_eq!(ids, vec![1, 2, 3]);
+        append_resume_ids(&mut ids, Some(&[11, 12]));
+        assert_eq!(ids, vec![1, 2, 3, 11, 12]);
+    }
+
+    #[test]
+    fn resume_generated_seed_maps_and_defaults_empty() {
+        assert_eq!(resume_generated_seed(None), Vec::<i64>::new());
+        assert_eq!(resume_generated_seed(Some(&[5, 6, 7])), vec![5i64, 6, 7]);
+    }
+    #[test]
+    fn resume_ids_normalizes_empty_to_none() {
+        let mut t = GenerationTask::new("t", "p");
+        assert_eq!(t.resume_ids(), None);
+        t.resume_token_ids = Some(vec![]);
+        assert_eq!(t.resume_ids(), None, "wire-legal Some([]) is NOT resuming");
+        t.resume_token_ids = Some(vec![7]);
+        assert_eq!(t.resume_ids(), Some(&[7][..]));
+    }
+
+    #[test]
+    fn validate_resume_ids_bounds() {
+        assert!(validate_resume_ids(&[0, 1, 2], Some(3)).is_ok());
+        assert!(
+            validate_resume_ids(&[3], Some(3)).is_err(),
+            ">= vocab rejected"
+        );
+        assert!(
+            validate_resume_ids(&[-1], None).is_err(),
+            "negative always rejected"
+        );
+        assert!(
+            validate_resume_ids(&[i32::MAX], None).is_ok(),
+            "no vocab => only sign-checked"
+        );
     }
 }

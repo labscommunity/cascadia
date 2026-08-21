@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
-use cascadia_ov_genai_shim::{DType, PluginConfig, Runtime};
+use cascadia_ov_genai_shim::{advance_emitted, DType, PluginConfig, Runtime};
 use cascadia_transport::{
     ActivationClient, ActivationServer, DType as WireDType, Tensor as WireTensor, TransportError,
     MAX_RAW_BYTES,
@@ -603,8 +603,16 @@ struct ActiveTask {
     /// Pipeline rank 0: next token returned by the downstream argmax.
     next_token: Option<u32>,
     gen_ids: Vec<u32>,
-    /// Byte length of the decoded prefix already emitted as chunks.
-    emitted: usize,
+    /// Bytes already handed to the client (the seed's decoded bytes on a
+    /// resumed turn). Deltas come from the shim's `advance_emitted`, which
+    /// holds back an unresolved U+FFFD run and RE-ANCHORS on a diverged
+    /// re-decode — the old byte-offset arithmetic silently duplicated or
+    /// dropped seam text when a diverged decode landed on a char boundary.
+    emitted: Vec<u8>,
+    /// Option B: leading entries of `gen_ids` that are the resume seed. The
+    /// kv_coord capture key must SKIP them — `prompt_ids` already carries the
+    /// resume ids (same defect dist_spec fixed).
+    resume_seed_len: usize,
     max_tokens: usize,
     started: Instant,
     /// Pipeline rank 0: per-frame FORWARD→TOKEN round-trip times for
@@ -817,10 +825,13 @@ impl Qwen36Engine {
         // it. Keyed by the full sequence (session-resume). Gated + best-effort (stub ⇒ no-op).
         #[cfg(feature = "kv_coord")]
         {
+            // Skip the resume seed: `prompt_ids` already carries those ids, so
+            // counting them again keys the blob at a depth that never matches
+            // the fed sequence (same defect dist_spec fixed).
             let tokens: Vec<i32> = t
                 .prompt_ids
                 .iter()
-                .chain(t.gen_ids.iter())
+                .chain(t.gen_ids.iter().skip(t.resume_seed_len))
                 .map(|&u| u as i32)
                 .collect();
             // Pipeline head: broadcast CAPTURE so every downstream rank snapshots its slice under the
@@ -1218,6 +1229,25 @@ impl Qwen36Engine {
                     prompt_ids.extend(e.get_ids());
                 }
             }
+            // Option B forced-prefix resume: append the already-emitted assistant
+            // tokens after the rendered prompt (concat, not replace) so the cold
+            // prefill below carries them as context. No-op when not resuming.
+            // `resume_ids()` normalizes `Some([])`; validation bounds peer-supplied
+            // indices before they reach native prefill (and makes the u32 casts safe).
+            let resume = task.resume_ids().map(<[i32]>::to_vec);
+            if let Some(r) = resume.as_deref() {
+                let vocab = tokenizer.get_vocab_size(true) as u32;
+                if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
+                    let id = task.task_id.clone();
+                    let c = Chunk::error(id.clone(), format!("invalid resume prefix: {e}"));
+                    return vec![(id, c)];
+                }
+            }
+            {
+                let mut prompt_ids_i64: Vec<i64> = prompt_ids.iter().map(|&u| u as i64).collect();
+                cascadia_types::append_resume_ids(&mut prompt_ids_i64, resume.as_deref());
+                prompt_ids = prompt_ids_i64.into_iter().map(|t| t as u32).collect();
+            }
             // An empty prompt leaves next_token None through prefill and would
             // panic the decode branch (`expect`); reject at admission.
             if prompt_ids.is_empty() {
@@ -1228,6 +1258,26 @@ impl Qwen36Engine {
                 );
                 return vec![(task.task_id, e)];
             }
+            // Option B: pre-seed `gen_ids` + `emitted` with the resumed tokens so the
+            // budget check bounds prefix+new (not just new) and the first NEW tail
+            // token's delta decode starts after the prefix text. Empty on a normal turn.
+            let resume_gen_ids: Vec<u32> = cascadia_types::resume_generated_seed(resume.as_deref())
+                .into_iter()
+                .map(|t| t as u32)
+                .collect();
+            let resume_seed_len = resume_gen_ids.len();
+            let resume_emitted: Vec<u8> = if resume_gen_ids.is_empty() {
+                Vec::new()
+            } else {
+                match tokenizer.decode(&resume_gen_ids, true) {
+                    Ok(s) => s.into_bytes(),
+                    Err(e) => {
+                        warn!(task = %task.task_id, error = %e, "resume seed decode failed");
+                        let reason = format!("resume seed decode failed: {e}");
+                        return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
+                    }
+                }
+            };
             let max_tokens = if task.max_tokens > 0 {
                 task.max_tokens
             } else {
@@ -1313,8 +1363,9 @@ impl Qwen36Engine {
                 step: warm_prefix,
                 logits: Vec::new(),
                 next_token: None,
-                gen_ids: Vec::new(),
-                emitted: 0,
+                gen_ids: resume_gen_ids,
+                emitted: resume_emitted,
+                resume_seed_len,
                 max_tokens,
                 started: Instant::now(),
                 wire_ms: Vec::new(),
@@ -1462,13 +1513,14 @@ impl Qwen36Engine {
                         .decode(self.active.as_ref().unwrap().gen_ids.as_slice(), true)
                         .unwrap_or_default();
                     let t = self.active.as_mut().unwrap();
-                    let delta = if full.ends_with('\u{FFFD}') {
-                        String::new()
-                    } else {
-                        let d = full.get(t.emitted..).unwrap_or("").to_string();
-                        t.emitted = full.len();
-                        d
-                    };
+                    // Shim `advance_emitted`: FFFD-run holdback + starts_with
+                    // re-anchor, one implementation shared with ov-runtime so
+                    // the two cannot drift.
+                    let (delta, reanchored) =
+                        advance_emitted(&mut t.emitted, full.as_bytes(), true);
+                    if reanchored {
+                        warn!(task = %task_id, "decode diverged from the emitted prefix; re-anchored (delta dropped)");
+                    }
                     vec![(task_id.clone(), Chunk::token(task_id, next as i64, delta))]
                 }
                 Err(e) => {
@@ -1894,6 +1946,25 @@ impl Qwen36Engine {
                     prompt_ids.extend(e.get_ids());
                 }
             }
+            // Option B forced-prefix resume: append the already-emitted assistant
+            // tokens after the rendered prompt (concat, not replace) so the cold
+            // prefill below carries them as context. No-op when not resuming.
+            // `resume_ids()` normalizes `Some([])`; validation bounds peer-supplied
+            // indices before they reach native prefill (and makes the u32 casts safe).
+            let resume = task.resume_ids().map(<[i32]>::to_vec);
+            if let Some(r) = resume.as_deref() {
+                let vocab = tokenizer.get_vocab_size(true) as u32;
+                if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
+                    let id = task.task_id.clone();
+                    let c = Chunk::error(id.clone(), format!("invalid resume prefix: {e}"));
+                    return vec![(id, c)];
+                }
+            }
+            {
+                let mut prompt_ids_i64: Vec<i64> = prompt_ids.iter().map(|&u| u as i64).collect();
+                cascadia_types::append_resume_ids(&mut prompt_ids_i64, resume.as_deref());
+                prompt_ids = prompt_ids_i64.into_iter().map(|t| t as u32).collect();
+            }
             // An empty prompt leaves logits empty and would fabricate token 0
             // (garbage decode); reject at admission to match the pipeline path.
             if prompt_ids.is_empty() {
@@ -1904,6 +1975,26 @@ impl Qwen36Engine {
                 );
                 return vec![(task.task_id, e)];
             }
+            // Option B: pre-seed `gen_ids` + `emitted` with the resumed tokens so the
+            // budget check bounds prefix+new (not just new) and the first NEW tail
+            // token's delta decode starts after the prefix text. Empty on a normal turn.
+            let resume_gen_ids: Vec<u32> = cascadia_types::resume_generated_seed(resume.as_deref())
+                .into_iter()
+                .map(|t| t as u32)
+                .collect();
+            let resume_seed_len = resume_gen_ids.len();
+            let resume_emitted: Vec<u8> = if resume_gen_ids.is_empty() {
+                Vec::new()
+            } else {
+                match tokenizer.decode(&resume_gen_ids, true) {
+                    Ok(s) => s.into_bytes(),
+                    Err(e) => {
+                        warn!(task = %task.task_id, error = %e, "resume seed decode failed");
+                        let reason = format!("resume seed decode failed: {e}");
+                        return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
+                    }
+                }
+            };
             let max_tokens = if task.max_tokens > 0 {
                 task.max_tokens
             } else {
@@ -1951,8 +2042,9 @@ impl Qwen36Engine {
                 step: warm_prefix,
                 logits: Vec::new(),
                 next_token: None,
-                gen_ids: Vec::new(),
-                emitted: 0,
+                gen_ids: resume_gen_ids,
+                emitted: resume_emitted,
+                resume_seed_len,
                 max_tokens,
                 started: Instant::now(),
                 wire_ms: Vec::new(),
@@ -2073,13 +2165,14 @@ impl Qwen36Engine {
                         .decode(self.active.as_ref().unwrap().gen_ids.as_slice(), true)
                         .unwrap_or_default();
                     let t = self.active.as_mut().unwrap();
-                    let delta = if full.ends_with('\u{FFFD}') {
-                        String::new()
-                    } else {
-                        let d = full.get(t.emitted..).unwrap_or("").to_string();
-                        t.emitted = full.len();
-                        d
-                    };
+                    // Shim `advance_emitted`: FFFD-run holdback + starts_with
+                    // re-anchor, one implementation shared with ov-runtime so
+                    // the two cannot drift.
+                    let (delta, reanchored) =
+                        advance_emitted(&mut t.emitted, full.as_bytes(), true);
+                    if reanchored {
+                        warn!(task = %task_id, "decode diverged from the emitted prefix; re-anchored (delta dropped)");
+                    }
                     vec![(task_id.clone(), Chunk::token(task_id, next as i64, delta))]
                 }
                 Err(e) => {
@@ -2686,7 +2779,8 @@ mod tests {
             logits: Vec::new(),
             next_token: Some(5),
             gen_ids: vec![5],
-            emitted: 0,
+            emitted: Vec::new(),
+            resume_seed_len: 0,
             max_tokens: 16,
             started: Instant::now(),
             wire_ms: Vec::new(),

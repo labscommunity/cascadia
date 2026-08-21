@@ -1412,6 +1412,12 @@ struct ActiveTask {
     /// pulled/cached KV blob). The prefill feeds only `prompt_ids[warm_prefix..]`. 0 ⇒ cold (full
     /// prefill), so the default path is unchanged.
     warm_prefix: usize,
+    /// Option B: how many leading entries of `generated` are the resume seed.
+    /// The kv_coord capture key must SKIP them — `prompt_ids` already carries
+    /// the resume ids (appended before prefill), so counting the seed again
+    /// would key the blob at an inflated depth that never matches the real
+    /// fed sequence (dist_spec fixed the same defect; this mirrors it).
+    resume_seed_len: usize,
     /// Wall-clock when the task became active. Used to compute the
     /// final tok/s the engine prints in its `task done` log line.
     started: std::time::Instant,
@@ -2096,7 +2102,36 @@ impl OvRuntimeEngine {
             let enc = tok
                 .encode(task.prompt.clone(), false)
                 .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?;
-            let prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
+            let mut prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
+            // Option B forced-prefix resume: append the already-emitted assistant
+            // tokens after the rendered prompt (concat, not replace) so the cold
+            // prefill below carries them as context. No-op when not resuming.
+            // `resume_ids()` normalizes a wire-legal `Some([])` to "not resuming".
+            let resume = task.resume_ids().map(<[i32]>::to_vec);
+            if let Some(r) = resume.as_deref() {
+                // Peer-supplied indices go straight into native prefill; an
+                // out-of-range id is an OV embedding gather crash, not a typed
+                // error — bound them here.
+                let vocab = tok.get_vocab_size(true) as u32;
+                if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
+                    let id = task.task_id.clone();
+                    return Ok(vec![(
+                        id.clone(),
+                        Chunk::error(id, format!("invalid resume prefix: {e}")),
+                    )]);
+                }
+                // Budget already exhausted by the prefix (total = prefix + new
+                // must equal max_tokens): finish Length with ZERO new tokens.
+                // The old flow sampled the first token before its length check
+                // and overshot the budget by one on peer-supplied input.
+                if r.len() >= task.max_tokens.max(1) as usize {
+                    let mut c = Chunk::final_marker(task.task_id.clone(), "");
+                    c.n_tokens = Some(0);
+                    c.finish_reason = Some(cascadia_types::FinishReason::Length);
+                    return Ok(vec![(task.task_id.clone(), c)]);
+                }
+            }
+            cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
             // Issue-34 warm-resume: if a pulled/cached KV blob covers a strict prefix of this
             // prompt, restore it and prefill only the suffix. Gated + best-effort — off-rig
             // set_state_blob returns Stub, so this stays cold. Only the stateful (non-static) path.
@@ -2177,14 +2212,37 @@ impl OvRuntimeEngine {
                 warm_prefix,
                 "task active (ov-runtime)"
             );
+            // Option B: pre-seed `generated` + `emitted` with the resumed tokens
+            // so the budget check bounds prefix+new (not just new) and the first
+            // NEW tail token decodes WITH the prefix as context. Seeding `emitted`
+            // with the DECODED PREFIX BYTES is what keeps the client stream a
+            // single continuous completion: `advance_emitted` only hands over
+            // `full[emitted.len()..]`, so the forced prefix is never re-emitted.
+            // A prefix that is not a byte-prefix of the re-decode (SentencePiece
+            // merge at the seam) hits that fn's re-anchor arm and degrades to a
+            // resync instead of corrupting. Empty seed on a normal turn ⇒
+            // identical to today.
+            let resume_seed: Vec<i32> = cascadia_types::resume_generated_seed(resume.as_deref())
+                .into_iter()
+                .map(|t| t as i32)
+                .collect();
+            let resume_seed_len = resume_seed.len();
+            let resume_last_text = if resume_seed.is_empty() {
+                String::new()
+            } else {
+                let seed_u32: Vec<u32> = resume_seed.iter().map(|&t| t as u32).collect();
+                tok.decode(&seed_u32, true)
+                    .map_err(|e| EngineError::Backend(format!("tokenizer decode: {e}")))?
+            };
             self.active = Some(ActiveTask {
                 task,
                 prompt_ids,
-                generated: Vec::new(),
-                emitted: Vec::new(),
+                generated: resume_seed,
+                emitted: resume_last_text.into_bytes(),
                 prefilled: false,
                 last_token: 0,
                 warm_prefix,
+                resume_seed_len,
                 started: std::time::Instant::now(),
                 t_alpha_compute: std::time::Duration::ZERO,
                 t_wire: std::time::Duration::ZERO,
@@ -2271,6 +2329,22 @@ impl OvRuntimeEngine {
                 break;
             };
             let task = self.pending.remove(0);
+            // Option B: the packed path has no forced-prefix support — it neither
+            // appends `resume_token_ids` to the prompt nor seeds `generated`/`emitted`.
+            // Admitting a resume task here would regenerate the turn FROM SCRATCH and
+            // report success, i.e. silently hand the client a different completion than
+            // the prefix it already received. Refuse loudly so the scheduler can surface
+            // or re-route it, rather than being told the resume succeeded.
+            // (Unreachable at the `packed_slots = 0` default; guards enabling it.)
+            if task.resume_ids().is_some() {
+                // Attributed to the refused task: a bare Err from step() fails
+                // whichever packed stream happened to poll and leaves THIS task
+                // hanging with no error chunk (review finding).
+                return Err(EngineError::Backend(
+                    "resume (Option B forced prefix) is unsupported on packed slots".into(),
+                )
+                .for_task(task.task_id));
+            }
             let tok = self
                 .tokenizer
                 .clone()
@@ -3018,6 +3092,7 @@ impl OvRuntimeEngine {
                 n_tokens: None,
                 prompt_tokens: None,
                 error: None,
+                token_ids: Vec::new(),
                 // ov-runtime doesn't yet distinguish length vs stop here; the
                 // API falls back to "stop" (unchanged behavior). #14 follow-up.
                 finish_reason: None,
@@ -3063,7 +3138,10 @@ impl OvRuntimeEngine {
             #[cfg(feature = "kv_coord")]
             {
                 let mut full: Vec<i32> = active.prompt_ids.iter().map(|&t| t as i32).collect();
-                full.extend_from_slice(&active.generated);
+                // Skip the resume seed: `prompt_ids` already carries those ids.
+                full.extend_from_slice(
+                    &active.generated[active.resume_seed_len.min(active.generated.len())..],
+                );
                 // H.1b R2: the namespace this turn belongs to, read off THIS task's own state —
                 // never off a plane-asserted value, which describes a pulled entry, not this turn.
                 let tenant = active.task.tenant.clone();
@@ -6264,6 +6342,7 @@ mod tests {
     #[tokio::test]
     async fn a_wait_that_only_discards_reports_the_discards() {
         let (client, mut server) = loopback().await;
+        let _knob = crate::timeout_knob_lock();
         cascadia_transport::set_activation_timeout_secs(1);
         // Three frames, none of them echoing the seq we are waiting on.
         for s in [11u32, 12, 13] {
@@ -6288,6 +6367,7 @@ mod tests {
     #[tokio::test]
     async fn a_silent_wait_says_no_frame_arrived() {
         let (client, _server) = loopback().await;
+        let _knob = crate::timeout_knob_lock();
         cascadia_transport::set_activation_timeout_secs(1);
         let downstream = Arc::new(tokio::sync::Mutex::new(client));
         let err = recv_token_seq_checked(&downstream, 7, false)
@@ -6410,6 +6490,7 @@ mod tests {
         // Silent peer → the bounded frame-start elapses → TimedOut.
         let (client, _server) = loopback().await;
         let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let _knob = crate::timeout_knob_lock();
         cascadia_transport::set_activation_timeout_secs(1);
         let err = recv_token_seq_checked(&downstream, 0, false)
             .await

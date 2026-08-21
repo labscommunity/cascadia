@@ -396,6 +396,11 @@ struct ActiveTask {
     last_text: String,
     prefilled: bool,
     last_token: i32,
+    /// Option B: leading entries of `generated` that are the resume seed. The
+    /// kv_coord capture key must SKIP them — `prompt_ids` already carries the
+    /// resume ids, so counting the seed again keys the blob at a depth that
+    /// never matches the fed sequence (same defect dist_spec fixed).
+    resume_seed_len: usize,
     /// Issue-34: leading prompt tokens already warm in the OV state (RESTOREd). Prefill feeds only
     /// `prompt_ids[warm_prefix..]`. 0 ⇒ cold (default path unchanged).
     warm_prefix: usize,
@@ -873,7 +878,33 @@ impl Gemma4Engine {
             let enc = tok
                 .encode(task.prompt.clone(), false)
                 .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?;
-            let prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
+            let mut prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
+            // Option B forced-prefix resume: append the already-emitted assistant
+            // tokens after the rendered prompt (concat, not replace) so the cold
+            // prefill below carries them as context. No-op when not resuming
+            // (`resume_ids()` normalizes a wire-legal `Some([])` too).
+            let resume = task.resume_ids().map(<[i32]>::to_vec);
+            if let Some(r) = resume.as_deref() {
+                // Peer-supplied indices reach native OV prefill — bound them first.
+                let vocab = tok.get_vocab_size(true) as u32;
+                if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
+                    let id = task.task_id.clone();
+                    return Ok(vec![(
+                        id.clone(),
+                        Chunk::error(id, format!("invalid resume prefix: {e}")),
+                    )]);
+                }
+                // Exhausted budget: finish Length with ZERO new tokens — the old
+                // flow pushed the first token before its length check and
+                // overshot prefix+new past max_tokens.
+                if r.len() >= task.max_tokens.max(1) as usize {
+                    let mut c = Chunk::final_marker(task.task_id.clone(), "");
+                    c.n_tokens = Some(0);
+                    c.finish_reason = Some(cascadia_types::FinishReason::Length);
+                    return Ok(vec![(task.task_id.clone(), c)]);
+                }
+            }
+            cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
             // Issue-34 warm-resume (gated, single-stage for now — multi-stage needs the RESTORE
             // broadcast). Restore a cached strict-prefix blob and prefill only the suffix; else cold.
             #[cfg_attr(not(feature = "kv_coord"), allow(unused_mut))]
@@ -969,14 +1000,31 @@ impl Gemma4Engine {
                 warm_prefix,
                 "gemma4 task active"
             );
+            // Option B: pre-seed `generated` + `last_text` with the resumed
+            // tokens so the budget check bounds prefix+new (not just new) and
+            // the first NEW tail token decodes WITH the prefix as context.
+            // Empty seed on a normal turn ⇒ identical to today.
+            let resume_seed: Vec<i32> = cascadia_types::resume_generated_seed(resume.as_deref())
+                .into_iter()
+                .map(|t| t as i32)
+                .collect();
+            let resume_seed_len = resume_seed.len();
+            let resume_last_text = if resume_seed.is_empty() {
+                String::new()
+            } else {
+                let seed_u32: Vec<u32> = resume_seed.iter().map(|&t| t as u32).collect();
+                tok.decode(&seed_u32, true)
+                    .map_err(|e| EngineError::Backend(format!("tokenizer decode: {e}")))?
+            };
             self.active = Some(ActiveTask {
                 task,
                 prompt_ids,
-                generated: Vec::new(),
-                last_text: String::new(),
+                generated: resume_seed,
+                last_text: resume_last_text,
                 prefilled: false,
                 last_token: 0,
                 warm_prefix,
+                resume_seed_len,
                 started: std::time::Instant::now(),
                 t_alpha_compute: std::time::Duration::ZERO,
                 t_wire: std::time::Duration::ZERO,
@@ -1149,11 +1197,37 @@ impl Gemma4Engine {
         // emit a partial UTF-8 sequence on token N and complete the
         // glyph on token N+1, in which case the prefix bytes change).
         // Slicing past a UTF-8 boundary panics.
-        let delta = full_text
-            .strip_prefix(active.last_text.as_str())
-            .unwrap_or(&full_text)
-            .to_string();
-        active.last_text = full_text;
+        //
+        // On divergence RE-ANCHOR (empty delta), never `unwrap_or(&full_text)`:
+        // that re-emits everything decoded so far, which under Option B resume is
+        // the whole forced prefix duplicated into the client stream. Same contract
+        // as the shim's `advance_emitted` — bounded loss at the seam, never
+        // duplication.
+        // A trailing U+FFFD means the newest token ends mid-glyph (byte-fallback
+        // BPE): the decode is TRANSIENT, not diverged. Hold — emit nothing and
+        // keep `last_text`, so the next token completes the glyph and the strip
+        // emits it whole. Updating `last_text` here (the old behavior) baked the
+        // replacement char into the anchor, so the completed glyph then failed
+        // strip_prefix and was dropped as a fake divergence.
+        let delta = if full_text.ends_with('\u{FFFD}') {
+            String::new()
+        } else {
+            match full_text.strip_prefix(active.last_text.as_str()) {
+                Some(d) => {
+                    let d = d.to_string();
+                    active.last_text = full_text;
+                    d
+                }
+                None => {
+                    warn!(
+                        task = %active.task.task_id,
+                        "decode diverged from the emitted prefix; re-anchoring (delta dropped)"
+                    );
+                    active.last_text = full_text;
+                    String::new()
+                }
+            }
+        };
 
         let max_tokens = active.task.max_tokens.max(1) as usize;
         let is_eos = self.eos_token_ids.contains(&(next_token as u32));
@@ -1170,6 +1244,7 @@ impl Gemma4Engine {
                 n_tokens: None,
                 prompt_tokens: None,
                 error: None,
+                token_ids: Vec::new(),
                 finish_reason: None,
             }
         } else {
@@ -1197,11 +1272,18 @@ impl Gemma4Engine {
             // + gated. (Multi-stage CAPTURE broadcast added with the control protocol.)
             #[cfg(feature = "kv_coord")]
             {
+                // Skip the resume seed: `prompt_ids` already carries those ids.
                 let full: Vec<i32> = active
                     .prompt_ids
                     .iter()
                     .map(|&t| t as i32)
-                    .chain(active.generated.iter().copied())
+                    .chain(
+                        active
+                            .generated
+                            .iter()
+                            .skip(active.resume_seed_len)
+                            .copied(),
+                    )
                     .collect();
                 // H.1b R2: this turn's namespace, read off THIS task's own state — never off a
                 // plane-asserted value, which describes a pulled entry, not this turn.
@@ -2171,6 +2253,7 @@ mod tests {
     /// at G_PREFILL_REPLY_CEILING regardless of how large the operator knob is.
     #[tokio::test]
     async fn prefill_reply_wait_is_ceilinged_on_a_silent_downstream() {
+        let _knob = crate::timeout_knob_lock();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
