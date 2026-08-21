@@ -4136,4 +4136,31 @@ mod tests {
         assert_eq!(dsv4_prefix_cap(Some(" 5 "), None), 5);
         assert_eq!(dsv4_prefix_cap(None, Some(" 9\n")), 9);
     }
+
+    /// Set-but-empty counts as set (→ off), same as the glm5 var always has:
+    /// falling through to the legacy value would re-create the cross-arch
+    /// bleed for templates that pass every key empty.
+    #[test]
+    fn dsv4_prefix_cap_empty_new_var_is_off_not_fallback() {
+        assert_eq!(dsv4_prefix_cap(Some(""), Some("7")), 0);
+    }
+
+    /// Test-unique var name so this never races another test's env.
+    #[test]
+    fn resolve_prefix_cap_explicit_then_env_then_off() {
+        let k = "CASCADIA_TEST_RESOLVE_PREFIX_CAP_139";
+        std::env::set_var(k, "9");
+        assert_eq!(resolve_prefix_cap(Some(3), k), 3, "explicit wins over env");
+        assert_eq!(
+            resolve_prefix_cap(None, k),
+            9,
+            "env honoured when no explicit"
+        );
+        std::env::set_var(k, " 4\n");
+        assert_eq!(resolve_prefix_cap(None, k), 4, "env value trimmed");
+        std::env::set_var(k, "lots");
+        assert_eq!(resolve_prefix_cap(None, k), 0, "unparseable env → off");
+        std::env::remove_var(k);
+        assert_eq!(resolve_prefix_cap(None, k), 0, "unset → off");
+    }
 }
