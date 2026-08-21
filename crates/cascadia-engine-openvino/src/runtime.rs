@@ -1311,8 +1311,9 @@ fn prefill_chunk() -> usize {
 /// `installed_depth` of the blob it installs, and an unparseable depth REFUSES the restore —
 /// clamping or flooring installs the state and then lies about its depth, which is how §12.16's §6
 /// turned an intermittent fault deterministic. `CASCADIA_RUNTIME_STRICT_DEPTH=0` restores the
-/// head warm-resume site's legacy `.min(len)` clamp (the rule certified for months) — site A only;
-/// to be removed after two green matrices.
+/// certified legacy token-count clamp at BOTH ends of the chain path (head site A + tail site C2,
+/// via the shared `warm_resume_depth`) so hatch mode stays chain-consistent; B/C1's `unwrap_or(0)`
+/// floor was never certified and stays strict. To be removed after two green matrices.
 #[cfg(feature = "kv_coord")]
 fn strict_depth() -> bool {
     std::env::var("CASCADIA_RUNTIME_STRICT_DEPTH")
@@ -1321,9 +1322,12 @@ fn strict_depth() -> bool {
         != Some("0")
 }
 
-/// Head warm-resume depth rule (site A), split out so the strict-vs-legacy arms are unit-testable.
-/// `None` ⇒ refuse the restore (serve cold). Legacy keeps today's certified behaviour exactly:
-/// clamp to the matched token count, fall back to it when unparseable.
+/// Warm-resume depth rule for the certified chain path's two ends — the head (site A) and the
+/// tail's own-capture restore (site C2) — split out so both share ONE rule (a strict head over a
+/// legacy tail, or vice versa, would disagree on a turn's depth and trip a spurious `TURN_BEGIN`
+/// position-mismatch warn) and so the strict-vs-legacy arms are unit-testable. `None` ⇒ refuse the
+/// restore (serve cold). Legacy keeps today's certified behaviour exactly: clamp to the matched
+/// token count, fall back to it when unparseable.
 #[cfg(feature = "kv_coord")]
 fn warm_resume_depth(blob: &[u8], matched_len: usize, strict: bool) -> Option<usize> {
     if strict {
@@ -4642,15 +4646,19 @@ impl OvRuntimeEngine {
                 } else {
                     match self.kv.take_capture(epoch) {
                         // Issue 7: depth from the blob being installed, refused BEFORE set_state on
-                        // an unparseable one; the token-count clamp/fallback is deleted (capture now
-                        // refuses a blob deeper than its token list at the source).
-                        Some((_tokens, blob)) => {
-                            match crate::kv_coordination::installed_depth(&blob) {
-                                Err(e) => {
-                                    warn!(error = %e, epoch, "ov-runtime: captured blob depth unparseable; refusing restore; rank cold");
+                        // an unparseable one. Same rule as the head's site A — `warm_resume_depth`
+                        // — so head and tail stay chain-consistent in BOTH modes: under the
+                        // `STRICT_DEPTH=0` hatch this restores C2's legacy token-count clamp
+                        // alongside A's, and strict-A-over-legacy-C2 (or vice versa) can never
+                        // disagree on a turn's depth and trip a spurious TURN_BEGIN mismatch warn.
+                        Some((tokens, blob)) => {
+                            match warm_resume_depth(&blob, tokens.len(), strict_depth()) {
+                                None => {
+                                    warn!(epoch, blob_len = blob.len(), "ov-runtime: captured blob depth unparseable; refusing restore; rank cold");
                                     false
                                 }
-                                Ok(depth) => {
+                                Some(depth) => {
+                                    let depth = depth as i64;
                                     if let Err(e) = self.prime_if_never_inferred() {
                                         warn!(error = %e, "ov-runtime: priming before capture restore failed");
                                     }
@@ -5671,6 +5679,9 @@ mod tests {
         assert_eq!(warm_resume_depth(&blob, 100, true), Some(85));
         // Strict: unparseable ⇒ refuse, never a fallback.
         assert_eq!(warm_resume_depth(&[0u8; 3], 40, true), None);
+        // Strict: a FRAMED multi-stage bundle is a valid depth (review F1).
+        let framed = crate::kv_coordination::frame_blobs(&[blob.clone(), blob.clone()]);
+        assert_eq!(warm_resume_depth(&framed, 40, true), Some(85));
 
         // Legacy hatch: today's certified site-A rule, byte for byte.
         assert_eq!(warm_resume_depth(&blob, 40, false), Some(40)); // .min(len)

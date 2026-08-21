@@ -226,10 +226,22 @@ impl std::fmt::Display for DepthError {
 /// derives `position` from the state it installs, and a depth the parser cannot read means the mask
 /// the next step builds would be a guess. The old fallbacks (`unwrap_or(0)`, `unwrap_or(len)`,
 /// `.min(len)`) all installed the state and then lied about its depth — the §12.16 amplifier.
+///
+/// Accepts BOTH blob formats in circulation: a raw single-stage `get_state_blob` (ov-runtime), and
+/// a [`frame_blobs`] bundle (qwen36 stages, dist-spec target+draft — see `blob_local_stages`). The
+/// framed arm is load-bearing: `kv_seq_from_blob` cannot parse a framed bundle, so without it
+/// every framed hand-off slice would be refused as depth-unknown — killing the certified qwen36
+/// plane warm path while the raw-blob rig cells stayed green. Framed is tried FIRST: `unframe_blobs`
+/// demands the frame table tile the whole blob exactly, which a raw blob cannot satisfy by
+/// accident, whereas the raw parser ignores trailing bytes and so could mis-read a framed bundle
+/// into a garbage depth.
 pub(crate) fn installed_depth(blob: &[u8]) -> Result<i64, DepthError> {
-    kv_seq_from_blob(blob).map(|s| s as i64).ok_or(DepthError {
-        blob_len: blob.len(),
-    })
+    kv_seq_from_framed_blob(blob)
+        .or_else(|| kv_seq_from_blob(blob))
+        .map(|s| s as i64)
+        .ok_or(DepthError {
+            blob_len: blob.len(),
+        })
 }
 
 /// [`kv_seq_from_blob`] for a framed multi-stage blob (`frame_blobs`): max depth over its parts (stages
@@ -1428,6 +1440,10 @@ mod tests {
         hybrid.extend(state("cache_params.past.conv.0", &[1, 1, 128, 4], 8));
         hybrid.extend(state("cache_params.past.ssm.0", &[1, 1, 128, 16], 8));
         assert_eq!(installed_depth(&hybrid), Ok(85));
+        // FRAMED bundle (qwen36 stages / dist-spec target+draft): a valid depth, max over parts —
+        // the raw parser cannot read it, and refusing it would kill the framed plane warm path.
+        let framed = frame_blobs(&[plain.clone(), hybrid.clone()]);
+        assert_eq!(installed_depth(&framed), Ok(85));
         // Truncated / garbage ⇒ Err — never 0, never a token count.
         assert_eq!(installed_depth(&[0u8; 3]), Err(DepthError { blob_len: 3 }));
         assert_eq!(
@@ -2114,6 +2130,35 @@ mod tests {
         assert_eq!(
             handoff_decision(&slot_of(&[]), DECISION_FP, 0),
             Err(HandoffReject::Decode)
+        );
+    }
+
+    /// Issue 7 (review F1): a FRAMED hand-off slice — qwen36's per-rank plane slice is
+    /// `frame_blobs` output (`blob_local_stages`), as is dist-spec's target+draft bundle — carries
+    /// a real depth and must be ACCEPTED at it. Refusing it as depth-unknown silently kills the
+    /// certified framed plane warm path while every raw-blob rig cell stays green.
+    #[test]
+    fn handoff_decision_accepts_a_framed_slice_at_its_framed_depth() {
+        fn raw_at_depth(depth: u64) -> Vec<u8> {
+            let name = "past_key_values.0.key";
+            let mut b = 1u32.to_le_bytes().to_vec();
+            b.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            b.extend_from_slice(name.as_bytes());
+            b.extend_from_slice(&[1, 4]); // dtype, rank
+            for d in [1u64, 1, depth, 1] {
+                b.extend_from_slice(&d.to_le_bytes());
+            }
+            b.extend_from_slice(&0u64.to_le_bytes()); // nbytes
+            b
+        }
+        let framed = frame_blobs(&[raw_at_depth(4), raw_at_depth(4)]);
+        let blob = handoff_decision(&slot_of(&framed), DECISION_FP, 0)
+            .expect("a framed depth is a valid depth");
+        assert_eq!(kv_seq_from_framed_blob(&blob), Some(4));
+        // The too-late guard binds on the framed depth too.
+        assert_eq!(
+            handoff_decision(&slot_of(&framed), DECISION_FP, 5),
+            Err(HandoffReject::TooLate(4))
         );
     }
 
