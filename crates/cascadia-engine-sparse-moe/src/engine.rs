@@ -57,6 +57,10 @@ pub struct SparseMoEBuilderConfig {
     // `OnceLock` process global in the decode loop, which no config can reach;
     // it stays env-only rather than becoming a field that silently does nothing.
     /// Context budget. `None` → `CASCADIA_GLM5_MAX_SEQ`, else [`crate::glm::stage::GLM5_DEFAULT_MAX_SEQ`].
+    ///
+    /// glm5 only, despite the generic name: the dsv4 arm reads
+    /// `CASCADIA_DSV4_MAX_SEQ` and the kimi_k3 arm reads [`Self::k3_max_seq`],
+    /// so setting this for either backend is a silent no-op.
     pub max_seq: Option<usize>,
     /// KV-prefix-cache depth. `None` → `CASCADIA_GLM5_PREFIX_CACHE` (0 = off).
     pub prefix_cache_depth: Option<u32>,
@@ -160,6 +164,26 @@ pub struct SparseMoEBuilderConfig {
     /// Only meaningful while the AXPY-form path is active — the
     /// non-AXPY (bf16 boundary) path doesn't surface `silu(gate)`.
     pub ffn_sparsity_capture_dir: Option<PathBuf>,
+    /// K3 context budget. `None` defers to `CASCADIA_K3_MAX_SEQ`, then to
+    /// `K3_DEFAULT_MAX_SEQ`. K3's `max_position_embeddings` is 1M; sizing the
+    /// caches from that would preallocate TB-scale state.
+    pub k3_max_seq: Option<usize>,
+    /// Exact KV-prefix-cache budget in bytes. `Some(0)` disables it; `None`
+    /// defers to `CASCADIA_K3_PREFIX_CACHE`, then to a slice of free RAM.
+    /// The rank-0 index's own cap is a separate knob, `CASCADIA_K3_PREFIX_INDEX`
+    /// — it never reads the glm5-named `CASCADIA_GLM5_PREFIX_CACHE`.
+    pub k3_prefix_cache_bytes: Option<u64>,
+    /// Explicit concurrent `pread` per routed expert. `None` ⇒ env, then on.
+    pub k3_read: Option<bool>,
+    /// `MADV_WILLNEED` after routing. `None` ⇒ env, then on.
+    pub k3_prefetch: Option<bool>,
+    /// AVX2 mxfp4 kernel. `None` ⇒ env, then on.
+    pub k3_simd: Option<bool>,
+    /// `mlock` the hottest experts from the learned histogram. `None` ⇒ env,
+    /// then off.
+    pub k3_autopin: Option<bool>,
+    /// Autopin budget override in bytes. Only meaningful with autopin on.
+    pub k3_pin_bytes: Option<u64>,
 }
 
 impl SparseMoEBuilderConfig {
@@ -195,6 +219,13 @@ impl SparseMoEBuilderConfig {
             ffn_axpy_prebuild: false,
             ffn_sparsity_thresholds_file: None,
             ffn_sparsity_capture_dir: None,
+            k3_max_seq: None,
+            k3_prefix_cache_bytes: None,
+            k3_read: None,
+            k3_prefetch: None,
+            k3_simd: None,
+            k3_autopin: None,
+            k3_pin_bytes: None,
         }
     }
 
@@ -305,6 +336,7 @@ pub struct SparseMoEBuilder {
     dsv4_runner: Option<crate::dsv4::stage::Dsv4Runner>,
     /// Set when the manifest's arch is "glm5" (Rust glm5 shell + int4 experts).
     glm_runner: Option<crate::glm::stage::GlmRunner>,
+    k3_runner: Option<crate::k3::stage::K3Runner>,
     tokenizer: Option<Tokenizer>,
     listen_host: String,
     listen_port: Option<u16>,
@@ -319,6 +351,7 @@ impl SparseMoEBuilder {
             ov_runner: None,
             dsv4_runner: None,
             glm_runner: None,
+            k3_runner: None,
             tokenizer: None,
             listen_host: "0.0.0.0".into(),
             listen_port: None,
@@ -531,6 +564,75 @@ impl Builder for SparseMoEBuilder {
             )])));
         }
 
+        // Kimi-K3: hybrid KDA (linear attention) + gated NoPE MLA, LatentMoE
+        // experts in fp4. Rust shell; the inter-stage wire is WIDENED to carry
+        // the AttnRes block-residual stack alongside the prefix sum.
+        let is_k3 = std::fs::read_to_string(self.config.model_dir.join("manifest.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .map(|v| v.get("arch").and_then(|a| a.as_str()) == Some("kimi_k3"))
+            .unwrap_or(false);
+        if is_k3 {
+            // Checked before anything process-global is seeded, so a rejected
+            // spec leaves no state behind.
+            if k3_rejects_explicit_range(shard.layer_end) {
+                return Err(EngineError::Backend(format!(
+                    "kimi_k3 does not support an explicit per-rank layer range \
+                     (layer_start={}, layer_end={}): the K3 loader always derives its \
+                     slice via even_layer_split(num_hidden_layers, rank, total). \
+                     Remove layer_start/layer_end from the shard spec — otherwise the \
+                     rank would load a different slice than the descriptor advertises.",
+                    shard.layer_start, shard.layer_end
+                )));
+            }
+            crate::k3::knobs::seed(crate::k3::knobs::Overrides {
+                prefix_cache_bytes: self.config.k3_prefix_cache_bytes,
+                read: self.config.k3_read,
+                prefetch: self.config.k3_prefetch,
+                simd: self.config.k3_simd,
+                autopin: self.config.k3_autopin,
+                pin_bytes: self.config.k3_pin_bytes,
+            });
+            let total = self.config.total.max(1);
+            let rank = self.config.rank.min(total - 1);
+            let max_seq = self
+                .config
+                .k3_max_seq
+                .or_else(|| {
+                    std::env::var("CASCADIA_K3_MAX_SEQ")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                })
+                .filter(|&n| n > 0)
+                .unwrap_or(crate::k3::stage::K3_DEFAULT_MAX_SEQ);
+            let runner = crate::k3::stage::K3Runner::load(
+                &self.config.model_dir,
+                rank,
+                total,
+                max_seq,
+                self.config.top_k_override,
+            )
+            .map_err(|e| EngineError::Backend(format!("kimi_k3 load: {e}")))?;
+            if rank == 0 {
+                let tok_path = self.config.model_dir.join("tokenizer.json");
+                if tok_path.exists() {
+                    self.tokenizer =
+                        Some(Tokenizer::from_file(&tok_path).map_err(|e| {
+                            EngineError::Backend(format!("load tokenizer.json: {e}"))
+                        })?);
+                } else {
+                    warn!(
+                        "no tokenizer.json at {} — k3 engine will only accept pre-tokenized inputs",
+                        tok_path.display()
+                    );
+                }
+            }
+            self.k3_runner = Some(runner);
+            return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
+                "loaded kimi_k3 stage (k3 Rust shell)",
+            )])));
+        }
+
         // OV-IR shell backend (MiniMax-M2): the whole architecture lives in
         // the traced graphs, so we run a dedicated runner instead of the
         // K2.6 MLA kernel. Single-stage loads the whole model; multi-stage
@@ -720,9 +822,10 @@ impl Builder for SparseMoEBuilder {
                 runtime_handle,
                 rank,
                 total,
-                // dsv4 has no config-threaded prefix cache; `None` keeps its
-                // existing env-only behaviour byte-for-byte.
-                None,
+                // dsv4's runner implements none of the prefix hooks, so the
+                // rank-0 index is never consulted — the cap is inert. Pass 0
+                // rather than reading any arch-named env var for it.
+                0,
             )));
         }
         if let Some(runner) = self.glm_runner {
@@ -736,6 +839,13 @@ impl Builder for SparseMoEBuilder {
             let runtime_handle = tokio::runtime::Handle::try_current()
                 .map_err(|_| EngineError::Backend("Builder::build outside tokio context".into()))?;
             info!(rank, total, "built glm5 engine");
+            // Same value the per-rank SliceKvCache got, so the rank-0 index
+            // and the per-rank caches stay in lockstep.
+            let prefix_cap = resolve_prefix_cap(
+                self.config.prefix_cache_depth.map(|d| d as usize),
+                "CASCADIA_GLM5_PREFIX_CACHE",
+                runner.prefix_cache_enabled(),
+            );
             return Ok(Box::new(PipelineEngine::new(
                 runner,
                 self.tokenizer,
@@ -743,9 +853,40 @@ impl Builder for SparseMoEBuilder {
                 runtime_handle,
                 rank,
                 total,
-                // Same value the per-rank SliceKvCache got, so the rank-0 index
-                // and the per-rank caches stay in lockstep.
-                self.config.prefix_cache_depth.map(|d| d as usize),
+                prefix_cap,
+            )));
+        }
+        if let Some(runner) = self.k3_runner {
+            let total = self.config.total.max(1);
+            let rank = self.config.rank.min(total - 1);
+            if rank == 0 && self.tokenizer.is_none() {
+                return Err(EngineError::Backend(
+                    "tokenizer.json missing (required for the kimi_k3 API rank)".into(),
+                ));
+            }
+            let runtime_handle = tokio::runtime::Handle::try_current()
+                .map_err(|_| EngineError::Backend("Builder::build outside tokio context".into()))?;
+            info!(rank, total, "built kimi_k3 engine");
+            // K3 has no SliceKvCache to stay in lockstep with — its per-rank
+            // store is the byte-budgeted PrefixStore fed by
+            // `k3_prefix_cache_bytes`. `None` so the cap derives from that
+            // store; taking glm5's `prefix_cache_depth` here would let a
+            // glm-scoped knob zero K3's index and kill prefix reuse. K3's own
+            // env override, NOT the glm5 one — a glm5-named knob must never
+            // zero or cap K3's rank-0 prefix index.
+            let prefix_cap = resolve_prefix_cap(
+                None,
+                "CASCADIA_K3_PREFIX_INDEX",
+                runner.prefix_cache_enabled(),
+            );
+            return Ok(Box::new(PipelineEngine::new(
+                runner,
+                self.tokenizer,
+                self.transport,
+                runtime_handle,
+                rank,
+                total,
+                prefix_cap,
             )));
         }
         if let Some(ov) = self.ov_runner {
@@ -1002,6 +1143,17 @@ fn prefill_reply_budget(
         Some(ceiling) => widened.min(ceiling.saturating_sub(PREFILL_BUDGET_CEILING_MARGIN)),
         None => widened,
     }
+}
+
+/// Whether a `ShardSpec` carries a per-rank layer range the K3 loader cannot
+/// honour. `layer_end == 0` is the "unset" encoding the dsv4/glm/OV arms use.
+///
+/// K3's loader is built around `even_layer_split`: the AttnRes block structure
+/// and the KDA recurrent state both assume that split, so an arbitrary range
+/// would load a different slice than the descriptor advertises. Rejecting is
+/// the only outcome that isn't silent drift. Pure, for testing.
+fn k3_rejects_explicit_range(layer_end: u32) -> bool {
+    layer_end != 0
 }
 
 /// Hard cap on the pending-task queue. step() processes one task end-to-end
@@ -2838,11 +2990,45 @@ struct PipeActive {
     hit_context_cap: bool,
 }
 
+/// How many prefix keys the engine index may hold.
+///
+/// The index and the runner's store have to switch on together: the store
+/// decides whether snapshots are KEPT, the index decides whether their keys can
+/// be FOUND. This used to read one engine-specific variable and default to 0, so
+/// a runner enabled under any other name got an index of capacity zero — every
+/// prefix was evicted on the line after it was recorded, and the feature looked
+/// exactly like a cache that only ever missed.
+///
+/// Entries, not bytes: the store already bounds bytes. Keep this at or below
+/// what the store can hold, so a key cannot outlive its snapshot.
+fn prefix_index_cap(env_override: Option<&str>, store_enabled: bool) -> usize {
+    const DEFAULT_PREFIX_ENTRIES: usize = 4;
+    env_override
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(if store_enabled {
+            DEFAULT_PREFIX_ENTRIES
+        } else {
+            0
+        })
+}
+
+/// `explicit` wins; failing that, reads `env_var` by NAME. The caller picks
+/// the name, so an arch-scoped knob (e.g. `CASCADIA_GLM5_PREFIX_CACHE`) can
+/// never reach a different arch's engine — each arm of `Builder::build`
+/// resolves with its own runner's var before handing the cap to
+/// `PipelineEngine::new`, which never reads env itself.
+fn resolve_prefix_cap(explicit: Option<usize>, env_var: &str, store_enabled: bool) -> usize {
+    explicit
+        .unwrap_or_else(|| prefix_index_cap(std::env::var(env_var).ok().as_deref(), store_enabled))
+}
+
 impl<R: StagedRunner> PipelineEngine<R> {
-    /// `prefix_cap`: rank-0 KV-prefix-cache depth. `None` defers to
-    /// `CASCADIA_GLM5_PREFIX_CACHE`, preserving the env-only behaviour. This
-    /// index must stay in lockstep with every rank's `SliceKvCache`, so the
-    /// value threaded here is the same one handed to `StageOpts`.
+    /// `prefix_cap`: rank-0 KV-prefix-cache depth (0 = off), already resolved
+    /// by the caller via `resolve_prefix_cap` with its own arch's env var —
+    /// `PipelineEngine` is shared by glm5, kimi_k3 and dsv4, so it never reads
+    /// env itself. For glm5 this index must stay in lockstep with every rank's
+    /// `SliceKvCache`, so the value threaded here is the same one handed to
+    /// `StageOpts`.
     fn new(
         runner: R,
         tokenizer: Option<Tokenizer>,
@@ -2850,7 +3036,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         runtime_handle: tokio::runtime::Handle,
         rank: u32,
         total: u32,
-        prefix_cap: Option<usize>,
+        prefix_cap: usize,
     ) -> Self {
         Self {
             runner,
@@ -2867,13 +3053,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             last_rank_rng_seeded: false,
             prefix_index: Vec::new(),
             prefix_next_key: 0,
-            prefix_cap: prefix_cap
-                .or_else(|| {
-                    std::env::var("CASCADIA_GLM5_PREFIX_CACHE")
-                        .ok()
-                        .and_then(|s| s.trim().parse::<usize>().ok())
-                })
-                .unwrap_or(0),
+            prefix_cap,
             active: None,
         }
     }
@@ -2968,11 +3148,45 @@ impl<R: StagedRunner> PipelineEngine<R> {
                  the response answers only the first {max_seq} tokens"
             );
         }
-        let (generated, hit_context_cap) =
-            self.runner
-                .generate_reason(&prompt_ids, max_new, &sampling_cfg);
+        // Same prefix reuse the pipeline path gets. Without this a single-rank
+        // deployment accepts a cache budget and never uses it, which is
+        // indistinguishable from a cache that only ever misses.
+        let reuse = if self.runner.prefix_cache_enabled() {
+            self.prefix_reuse(&prompt_ids)
+        } else {
+            None
+        };
+        if let Some((_, k)) = reuse {
+            info!(
+                task = %task.task_id,
+                reused = k,
+                prompt = prompt_ids.len(),
+                suffix = prompt_ids.len() - k,
+                "kv-prefix cache HIT: prefilling suffix only"
+            );
+        }
+        let (generated, hit_context_cap) = self.runner.generate_reason_from(
+            &prompt_ids,
+            reuse.map(|(key, _)| key),
+            max_new,
+            &sampling_cfg,
+        );
         let n_tokens = generated.len() as u32;
         let text = tok.decode(&generated, true).unwrap_or_default();
+        if self.runner.prefix_cache_enabled() {
+            // Key on exactly the positions the state covers — prompt plus the
+            // generated tokens that were actually forwarded, which is not all of
+            // them: the last sampled token never goes back through the layers.
+            // Ask the runner rather than counting, since only it knows.
+            if let Some(covered) = self.runner.covered_positions() {
+                if covered >= prompt_ids.len() && covered <= prompt_ids.len() + generated.len() {
+                    let mut key_tokens = prompt_ids.clone();
+                    key_tokens.extend_from_slice(&generated[..covered - prompt_ids.len()]);
+                    let key = self.prefix_remember(&key_tokens);
+                    self.runner.cache_prefix(key);
+                }
+            }
+        }
         let elapsed = started.elapsed().as_secs_f64();
         info!(
             task = %task.task_id,
@@ -4070,5 +4284,98 @@ mod tests {
             prefill_reply_budget(recv_timeout, Some(ceiling)),
             std::time::Duration::from_secs(600)
         );
+    }
+
+    #[test]
+    fn the_prefix_index_switches_on_with_the_runners_store() {
+        // The bug this pins: the cap defaulted to 0 whatever the runner said, so
+        // a store enabled under a different env name got an index that evicted
+        // every key the instant it was recorded. Indistinguishable from a cache
+        // that only misses, and it cost several full measurement runs to find.
+        assert_eq!(
+            super::prefix_index_cap(None, true),
+            4,
+            "store on, index must hold keys"
+        );
+        assert_eq!(
+            super::prefix_index_cap(None, false),
+            0,
+            "store off, index stays empty"
+        );
+
+        // An explicit override wins either way, including switching it off while
+        // the store is on.
+        assert_eq!(super::prefix_index_cap(Some("16"), false), 16);
+        assert_eq!(super::prefix_index_cap(Some("0"), true), 0);
+        assert_eq!(super::prefix_index_cap(Some(" 8 "), true), 8);
+
+        // Garbage falls back to the store-derived default rather than panicking
+        // or silently disabling the feature.
+        assert_eq!(super::prefix_index_cap(Some("not-a-number"), true), 4);
+    }
+
+    /// The bug this pins: `PipelineEngine::new` used to hardcode
+    /// `CASCADIA_GLM5_PREFIX_CACHE` for every runner sharing it (glm5 and
+    /// kimi_k3 both), so an operator setting the glm5-documented knob silently
+    /// zeroed or capped K3's rank-0 prefix index too — even with
+    /// `k3_prefix_cache_bytes` explicitly funding K3's store.
+    /// `resolve_prefix_cap` now takes the env var NAME from the caller; this
+    /// proves K3's name (`CASCADIA_K3_PREFIX_INDEX`) never falls back to
+    /// reading glm5's, and that glm5's own resolution is unaffected.
+    #[test]
+    fn k3s_prefix_env_var_ignores_the_glm5_named_one() {
+        // Env vars are process-global and unit tests run in parallel within
+        // this binary, so set-then-read has to be atomic across tests, and
+        // the vars must be cleared even if an assert panics mid-test —
+        // otherwise a failure here poisons every test after it.
+        static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var("CASCADIA_GLM5_PREFIX_CACHE");
+                std::env::remove_var("CASCADIA_K3_PREFIX_INDEX");
+            }
+        }
+        let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard;
+
+        // An operator sets the glm5-documented knob to 0 ("off") and never
+        // touches K3's own var. If the leak were still present, K3's
+        // resolution would read this 0 and kill its index.
+        std::env::set_var("CASCADIA_GLM5_PREFIX_CACHE", "0");
+        std::env::remove_var("CASCADIA_K3_PREFIX_INDEX");
+        assert_eq!(
+            super::resolve_prefix_cap(None, "CASCADIA_K3_PREFIX_INDEX", true),
+            4,
+            "K3 must ignore the glm5-named var and fall back to the \
+             store-derived default (4), not read the glm5 value (0)"
+        );
+
+        // K3's own var, when set, is honored normally.
+        std::env::set_var("CASCADIA_K3_PREFIX_INDEX", "7");
+        assert_eq!(
+            super::resolve_prefix_cap(None, "CASCADIA_K3_PREFIX_INDEX", true),
+            7,
+            "K3's own env override must still take effect"
+        );
+
+        // glm5's own resolution is untouched by any of the above — same name,
+        // same semantics, unaffected by K3's var being set alongside it.
+        assert_eq!(
+            super::resolve_prefix_cap(None, "CASCADIA_GLM5_PREFIX_CACHE", true),
+            0,
+            "glm5 must keep reading its own var byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn k3_refuses_an_explicit_layer_range() {
+        // `layer_end == 0` is the "unset" encoding every other arm uses, and is
+        // the only shape K3 can serve: its split is even_layer_split, full stop.
+        assert!(!super::k3_rejects_explicit_range(0));
+        // Anything else would have loaded a slice the descriptor did not
+        // advertise — silently, before this check existed.
+        assert!(super::k3_rejects_explicit_range(24));
+        assert!(super::k3_rejects_explicit_range(93));
     }
 }

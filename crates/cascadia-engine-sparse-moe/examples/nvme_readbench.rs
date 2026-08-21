@@ -10,34 +10,57 @@
 //!
 //!   cargo run --release --example nvme_readbench -- <dir-of-bins-on-nvme> [K=8] [tokens=16]
 //!
-//! (Linux; uses std::os::unix::fs::FileExt::read_at.)
+//! Runs on Linux and Windows; the positioned read is behind a small shim.
 
-// `read_at` is the point of the B) phase and is unix-only, so the bench only
-// exists there. The fleet is Windows, where `--all-targets` builds every
-// example — without this gate the workspace does not compile at all.
-#[cfg(not(unix))]
+// The positioned read has per-target shims for unix and windows; any other
+// target gets a stub main so `--all-targets` still compiles the workspace.
+#[cfg(not(any(unix, windows)))]
 fn main() {
     eprintln!(
-        "nvme_readbench measures std::os::unix::fs::FileExt::read_at against mmap \
-         faulting; there is nothing to run on this platform."
+        "nvme_readbench needs a positioned read (unix read_at / windows seek_read); \
+         there is nothing to run on this platform."
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::fs::File;
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
-#[cfg(unix)]
 use std::path::PathBuf;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::time::Instant;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use memmap2::Mmap;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use rayon::prelude::*;
 
-#[cfg(unix)]
+/// Positioned read, on both targets.
+///
+/// `FileExt` exists under `std::os::unix` and `std::os::windows` with different
+/// method names and semantics, so this example used to be Unix-only — which meant
+/// `cargo test -p cascadia-engine-sparse-moe` could not complete on the Windows
+/// AI-PCs this benchmark is FOR.
+fn read_at(f: &File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        f.read_at(buf, off)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        f.seek_read(buf, off)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (f, buf, off);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no positioned read on this target",
+        ))
+    }
+}
+
+#[cfg(any(unix, windows))]
 fn list_bins(dir: &PathBuf) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
         .expect("read dir")
@@ -49,7 +72,7 @@ fn list_bins(dir: &PathBuf) -> Vec<PathBuf> {
 }
 
 // Deterministic LCG so token->expert selection is reproducible without rand.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn lcg(state: &mut u64) -> u64 {
     *state = state
         .wrapping_mul(6364136223846793005)
@@ -57,7 +80,7 @@ fn lcg(state: &mut u64) -> u64 {
     *state >> 16
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = PathBuf::from(
@@ -84,7 +107,12 @@ fn main() {
         bins.len(),
         total_gb
     );
-    println!("[readbench] NOTE: drop caches before each phase — `sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'`");
+    #[cfg(unix)]
+    println!(
+        "[readbench] NOTE: drop caches first — `sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'`"
+    );
+    #[cfg(windows)]
+    println!("[readbench] NOTE: Windows has no drop_caches; point this at a bin set larger than RAM or the numbers are page-cache hits");
 
     // Reproducible per-token expert picks (same for both phases).
     let mut st = 0x1234_5678_9abc_def0u64;
@@ -147,7 +175,7 @@ fn main() {
                     let mut buf = vec![0u8; len];
                     let mut off = 0usize;
                     while off < len {
-                        let n = f.read_at(&mut buf[off..], off as u64).unwrap();
+                        let n = read_at(&f, &mut buf[off..], off as u64).unwrap();
                         if n == 0 {
                             break;
                         }

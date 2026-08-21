@@ -1,0 +1,75 @@
+{
+  "situ": {
+    "rows": 9,
+    "dim": 48,
+    "beta": 4.0,
+    "linear_beta": 25.0
+  },
+  "gate": {
+    "T": 7,
+    "E": 32,
+    "top_k": 6,
+    "scale": 1.0,
+    "renormalize": true
+  },
+  "attnres": {
+    "T": 7,
+    "H": 64,
+    "n_blocks": 4,
+    "eps": 1e-05
+  },
+  "conv": {
+    "T": 7,
+    "D": 24,
+    "K": 4
+  },
+  "kdagate": {
+    "T": 7,
+    "H": 6,
+    "D": 32,
+    "lower_bound": -5.0
+  },
+  "kda": {
+    "T": 7,
+    "H": 4,
+    "K": 16,
+    "V": 16,
+    "note": "q is pre-scaled by K**-0.5; q/k pre-L2-normalised"
+  },
+  "model": {
+    "hidden_size": 64,
+    "num_hidden_layers": 6,
+    "first_k_dense_replace": 1,
+    "attn_res_block_size": 2,
+    "kda_layers": [
+      1,
+      2,
+      4,
+      5
+    ],
+    "rms_norm_eps": 1e-05,
+    "situ_beta": 4.0,
+    "situ_linear_beta": 25.0,
+    "num_heads": 4,
+    "head_dim": 16,
+    "conv_size": 4,
+    "gate_lower_bound": -5.0,
+    "q_lora_rank": 24,
+    "kv_lora_rank": 16,
+    "qk_nope_head_dim": 16,
+    "qk_rope_head_dim": 8,
+    "v_head_dim": 16,
+    "num_experts": 8,
+    "top_k": 2,
+    "num_shared_experts": 2,
+    "routed_expert_hidden_size": 32,
+    "moe_intermediate_size": 32,
+    "routed_scaling_factor": 1.0,
+    "moe_renormalize": true,
+    "latent_moe_use_norm": true,
+    "intermediate_size": 48,
+    "vocab_size": 33,
+    "seed": 0,
+    "n_tokens": 7
+  }
+}

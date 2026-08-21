@@ -439,3 +439,205 @@ pub fn linear_f32(x: &[f32], w: &[f32], out_dim: usize, in_dim: usize, y: &mut [
         *yy = dot(row, x);
     });
 }
+
+/// Accumulator-count experiment for [`dot_bf16w_avx2`].
+///
+/// The shipped kernel uses TWO accumulators. On the fp4 expert kernel, going
+/// from one chained accumulator to four was worth 5.84x, and the bf16 shell is
+/// the LARGER of the two workloads per token (112 GFLOP vs the experts' 97.2),
+/// so the same question is worth asking here.
+///
+/// It is only a question, though, not a diagnosis. Every FMA here is preceded by
+/// a `widen` — load, `cvtepu16_epi32`, `slli` — and `cvtepu16_epi32` occupies the
+/// shuffle port. If this loop is port-bound rather than latency-bound, extra
+/// accumulators buy nothing and the fix is a different one. These variants exist
+/// so that question is settled by measurement rather than by analogy.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod bf16_acc_experiment {
+    use core::arch::x86_64::*;
+    use std::time::Instant;
+
+    #[inline(always)]
+    unsafe fn widen(p: *const u16) -> __m256 {
+        let bits = _mm_loadu_si128(p as *const __m128i);
+        _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(bits), 16))
+    }
+
+    unsafe fn hsum(v: __m256) -> f32 {
+        let hi = _mm256_extractf128_ps(v, 1);
+        let lo = _mm256_castps256_ps128(v);
+        let s = _mm_add_ps(lo, hi);
+        let shuf = _mm_movehdup_ps(s);
+        let sums = _mm_add_ps(s, shuf);
+        let shuf2 = _mm_movehl_ps(shuf, sums);
+        _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
+    }
+
+    /// `NACC` independent accumulators, `8 * NACC` elements per iteration.
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn dot_nacc<const NACC: usize>(w: &[u16], x: &[f32]) -> f32 {
+        let n = w.len().min(x.len());
+        let (pw, px) = (w.as_ptr(), x.as_ptr());
+        let mut acc = [_mm256_setzero_ps(); NACC];
+        let step = 8 * NACC;
+        let mut i = 0usize;
+        while i + step <= n {
+            for (a, acc_a) in acc.iter_mut().enumerate() {
+                let o = i + a * 8;
+                *acc_a = _mm256_fmadd_ps(widen(pw.add(o)), _mm256_loadu_ps(px.add(o)), *acc_a);
+            }
+            i += step;
+        }
+        // Pairwise tree so the reduction itself is not a serial chain.
+        let mut span = 1usize;
+        while span < NACC {
+            let mut a = 0usize;
+            while a + span < NACC {
+                acc[a] = _mm256_add_ps(acc[a], acc[a + span]);
+                a += span * 2;
+            }
+            span *= 2;
+        }
+        let mut total = hsum(acc[0]);
+        while i < n {
+            total += f32::from_bits((*pw.add(i) as u32) << 16) * *px.add(i);
+            i += 1;
+        }
+        total
+    }
+
+    /// Real K3 shell GEMV shapes. KDA qkvo dominates the resident bf16 at
+    /// 60.7 GB; shared experts are next at 24.3 GB.
+    const SHAPES: &[(&str, usize, usize)] = &[
+        ("kda qkvo   [12288,7168]", 12288, 7168),
+        ("shared w1  [ 6144,7168]", 6144, 7168),
+        ("up_proj    [ 7168,3584]", 7168, 3584),
+    ];
+
+    fn lcg(s: &mut u64) -> u32 {
+        *s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*s >> 33) as u32
+    }
+
+    /// `cargo test -p cascadia-engine-sparse-moe bf16_accumulator_sweep -- --nocapture`
+    #[test]
+    fn bf16_accumulator_sweep() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            println!("bf16_accumulator_sweep: no avx2/fma, nothing measured");
+            return;
+        }
+        for &(label, out_dim, in_dim) in SHAPES {
+            let mut s = 0xb16_0000u64 ^ in_dim as u64;
+            // Real bf16 VALUES, not random u16 patterns: ~0.4% of the u16 space
+            // is a bf16 Inf/NaN exponent, which makes every dot NaN and every
+            // comparison below vacuous. (First version of this test did exactly
+            // that and the correctness assert caught it.)
+            let w: Vec<u16> = (0..out_dim * in_dim)
+                .map(|_| {
+                    let v = (lcg(&mut s) as f32 / u32::MAX as f32) * 0.2 - 0.1;
+                    (v.to_bits() >> 16) as u16
+                })
+                .collect();
+            let x: Vec<f32> = (0..in_dim)
+                .map(|_| (lcg(&mut s) as f32 / u32::MAX as f32) * 2.0 - 1.0)
+                .collect();
+
+            // Correctness first: every variant must agree with the shipped
+            // kernel before any timing means anything.
+            let base = unsafe { super::dot_bf16w_avx2(&w[..in_dim], &x) };
+            let mag: f32 = (0..in_dim)
+                .map(|k| (f32::from_bits((w[k] as u32) << 16) * x[k]).abs())
+                .sum();
+            for (nacc, got) in [
+                (2usize, unsafe { dot_nacc::<2>(&w[..in_dim], &x) }),
+                (4, unsafe { dot_nacc::<4>(&w[..in_dim], &x) }),
+                (8, unsafe { dot_nacc::<8>(&w[..in_dim], &x) }),
+            ] {
+                assert!(
+                    (got - base).abs() <= 1e-5 * mag,
+                    "{label} nacc={nacc}: {got} vs shipped {base} (mag {mag})"
+                );
+            }
+
+            let reps = 7;
+            let run = |f: &dyn Fn(&[u16], &[f32]) -> f32| {
+                for o in 0..out_dim {
+                    std::hint::black_box(f(&w[o * in_dim..(o + 1) * in_dim], &x));
+                }
+            };
+            // Round-robin the four variants and keep each one's BEST time.
+            // Timing them in sequence lets the clock ramp across the group, so
+            // whichever runs last looks fastest — on a laptop part that bias
+            // exceeded the effect. Min-of-N also rejects one-sided interference,
+            // which a mean would absorb.
+            let (mut shipped, mut n2, mut n4, mut n8) = (f64::MAX, f64::MAX, f64::MAX, f64::MAX);
+            run(&|a, b| unsafe { super::dot_bf16w_avx2(a, b) });
+            for _ in 0..reps {
+                let t = Instant::now();
+                run(&|a, b| unsafe { super::dot_bf16w_avx2(a, b) });
+                shipped = shipped.min(t.elapsed().as_secs_f64());
+                let t = Instant::now();
+                run(&|a, b| unsafe { dot_nacc::<2>(a, b) });
+                n2 = n2.min(t.elapsed().as_secs_f64());
+                let t = Instant::now();
+                run(&|a, b| unsafe { dot_nacc::<4>(a, b) });
+                n4 = n4.min(t.elapsed().as_secs_f64());
+                let t = Instant::now();
+                run(&|a, b| unsafe { dot_nacc::<8>(a, b) });
+                n8 = n8.min(t.elapsed().as_secs_f64());
+            }
+
+            // GEMV is one pass over the weights, so GB/s is the number that says
+            // whether this is anywhere near the memory roof.
+            let bytes = (out_dim * in_dim * 2) as f64;
+            let gbs = |t: f64| bytes / t / 1e9;
+            println!(
+                "{label}: shipped {:.2} ms ({:.1} GB/s) | 2acc {:.2} ({:.1}) | 4acc {:.2} ({:.1}) | 8acc {:.2} ({:.1}) | best {:.2}x",
+                shipped * 1e3, gbs(shipped),
+                n2 * 1e3, gbs(n2),
+                n4 * 1e3, gbs(n4),
+                n8 * 1e3, gbs(n8),
+                shipped / n2.min(n4).min(n8)
+            );
+        }
+        println!(
+            "Above is SINGLE-THREADED — one row at a time. Production goes through\n\
+             linear_bf16_w, which is rayon-parallel over rows, so those GB/s are not\n\
+             comparable to a system memory roof. The parallel path is what matters:"
+        );
+
+        // The shipped entry point, measured the way it actually runs. This is
+        // the number that says whether the resident bf16 shell has any headroom
+        // left — the accumulator question above turned out not to be it.
+        for &(label, out_dim, in_dim) in SHAPES {
+            let mut s = 0x9a5e_0000u64 ^ in_dim as u64;
+            let w: Vec<u16> = (0..out_dim * in_dim)
+                .map(|_| {
+                    let v = (lcg(&mut s) as f32 / u32::MAX as f32) * 0.2 - 0.1;
+                    (v.to_bits() >> 16) as u16
+                })
+                .collect();
+            let x: Vec<f32> = (0..in_dim)
+                .map(|_| (lcg(&mut s) as f32 / u32::MAX as f32) * 2.0 - 1.0)
+                .collect();
+            let mut y = vec![0.0f32; out_dim];
+
+            super::linear_bf16_w(&x, &w, out_dim, in_dim, &mut y);
+            let reps = 5;
+            let t = Instant::now();
+            for _ in 0..reps {
+                super::linear_bf16_w(&x, &w, out_dim, in_dim, &mut y);
+            }
+            let dt = t.elapsed().as_secs_f64() / reps as f64;
+            let bytes = (out_dim * in_dim * 2) as f64;
+            println!(
+                "{label}: linear_bf16_w {:.2} ms -> {:.1} GB/s across {} threads",
+                dt * 1e3,
+                bytes / dt / 1e9,
+                rayon::current_num_threads()
+            );
+        }
+    }
+}

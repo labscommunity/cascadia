@@ -40,6 +40,7 @@ pub mod dist;
 pub mod dsv4;
 pub mod engine;
 pub mod glm;
+pub mod k3;
 pub mod kv_prefix_cache;
 pub mod manifest;
 pub mod ngram_draft;
@@ -50,6 +51,21 @@ pub mod spec_decode;
 pub mod staged;
 pub mod tensors;
 
+/// Contiguous even split of `n` layers across `total` ranks, half-open
+/// `(lo, hi)`. Re-exported so an embedding host can report the same layer
+/// range the runner loads instead of reimplementing the formula.
+///
+/// ```
+/// use cascadia_engine_sparse_moe::even_layer_split;
+/// // 93 layers over 4 ranks: the first remainder ranks take one extra.
+/// assert_eq!(even_layer_split(93, 0, 4), (0, 24));
+/// assert_eq!(even_layer_split(93, 3, 4), (70, 93));
+/// // Adjacent ranks are contiguous — what scheduler rule-3 requires.
+/// assert_eq!(even_layer_split(93, 1, 4).1, even_layer_split(93, 2, 4).0);
+/// // total = 1 spans the whole model.
+/// assert_eq!(even_layer_split(93, 0, 1), (0, 93));
+/// ```
+pub use dsv4::stage::even_layer_split;
 pub use engine::{SparseMoEBuilder, SparseMoEBuilderConfig, SparseMoEEngine};
 pub use kv_prefix_cache::{KvPrefixCache, KvSnapshot, LayerKvSlice, ModelFingerprint};
 pub use manifest::Manifest;
