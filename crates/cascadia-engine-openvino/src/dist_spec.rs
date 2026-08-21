@@ -1812,6 +1812,7 @@ impl OvDistSpecEngine {
             tokens = active.out.len(),
             steps = active.stats.n_steps,
             accept = active.stats.accept_rate(),
+            event = "engine_task_done",
             "ov-dist-spec done"
         );
         vec![(

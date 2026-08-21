@@ -1463,6 +1463,7 @@ impl SparseMoEEngine {
             tokens = n_tokens,
             elapsed_s = elapsed,
             tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
+            event = "engine_task_done",
             "task done (single-stage)"
         );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
@@ -1715,6 +1716,7 @@ impl SparseMoEEngine {
             tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
             rank = self.rank,
             total = self.total,
+            event = "engine_task_done",
             "task done (rank-0 driver)"
         );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
@@ -3065,6 +3067,7 @@ impl OvMoeEngine {
             tokens = n_tokens,
             elapsed_s = elapsed,
             tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
+            event = "engine_task_done",
             "task done (MiniMax-M2 single-stage)"
         );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
@@ -3350,6 +3353,7 @@ impl OvMoeEngine {
             total = self.total,
             elapsed_s = elapsed,
             tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
+            event = "engine_task_done",
             "task done (MiniMax-M2 pipeline-parallel)"
         );
         let mut chunk = Chunk::final_marker(id.clone(), text);
@@ -4253,6 +4257,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             tokens = n_tokens,
             elapsed_s = elapsed,
             tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
+            event = "engine_task_done",
             "task done (dsv4 single-stage)"
         );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
@@ -4678,6 +4683,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             total = self.total,
             elapsed_s = elapsed,
             tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
+            event = "engine_task_done",
             "task done (dsv4 pipeline-parallel)"
         );
         // Cache the full [prompt + generated] KV (positions [0, pos)) on every

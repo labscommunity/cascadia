@@ -1202,6 +1202,7 @@ impl Gemma4Engine {
                 alpha_ms,
                 wire_ms,
                 other_ms,
+                event = "engine_task_done",
                 "gemma4 task done"
             );
             // Issue-34: capture this stage's KV under (prompt + generated) for warm-pull. Best-effort

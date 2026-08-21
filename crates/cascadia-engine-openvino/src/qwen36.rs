@@ -136,6 +136,23 @@ fn postprefill_fp() -> bool {
         == Some("1")
 }
 
+/// Issue 1(b) determinism candidate: opt-in `NUM_STREAMS` / `INFERENCE_NUM_THREADS` pinning
+/// (`CASCADIA_QWEN36_OV_STREAMS` / `CASCADIA_QWEN36_OV_THREADS`). Pinning both to the SAME values
+/// on every node removes the machine-to-machine partition difference — the only lever that exists,
+/// the MoE kernel itself being opaque (see the f16-router note at the `PluginConfig` build site).
+/// Unset ⇒ identity: today's config byte-for-byte, matching the `kv_cache_precision` / `dyn_quant`
+/// precedent. A candidate, not a guarantee — an f16 fused kernel can still reduce differently
+/// across Arc driver revisions.
+fn apply_ov_pin_env(mut plugin: PluginConfig) -> PluginConfig {
+    if let Ok(v) = std::env::var("CASCADIA_QWEN36_OV_STREAMS") {
+        plugin = plugin.with("NUM_STREAMS", v);
+    }
+    if let Ok(v) = std::env::var("CASCADIA_QWEN36_OV_THREADS") {
+        plugin = plugin.with("INFERENCE_NUM_THREADS", v);
+    }
+    plugin
+}
+
 fn prefill_chunk() -> usize {
     if std::env::var("CASCADIA_QWEN36_FORCE_T1_PREFILL")
         .ok()
@@ -428,6 +445,7 @@ impl Builder for Qwen36Builder {
         if let Some(g) = &self.dyn_quant_group {
             plugin = plugin.with("DYNAMIC_QUANTIZATION_GROUP_SIZE", g);
         }
+        let plugin = apply_ov_pin_env(plugin);
 
         // Embeddings + tokenizer + eos live with the decode driver only.
         if self.rank == 0 {
@@ -847,6 +865,7 @@ impl Qwen36Engine {
             tokens = t.gen_ids.len(),
             elapsed_s = elapsed,
             tok_s,
+            event = "engine_task_done",
             "qwen36 task done"
         );
         if !t.wire_ms.is_empty() {
@@ -1424,10 +1443,20 @@ impl Qwen36Engine {
                 return self.finalize();
             }
             let step = t.step;
+            // Issue 1(a): the cross-stage activation is the one value the per-stage state digests
+            // cannot see — hash it as it leaves this rank. Same gate as the line it lands on.
+            #[cfg(feature = "kv_coord")]
+            let mut hidden_fp = 0u64;
             let res = self
                 .embed_seq(&[next])
                 .and_then(|e| self.chain_pass(&e, step, step + 1))
-                .and_then(|h| self.send_forward_recv_token(h, 1, step));
+                .and_then(|h| {
+                    #[cfg(feature = "kv_coord")]
+                    if decode_fp() {
+                        hidden_fp = crate::kv_coordination::fnv1a64(&le_bytes_f32(&h));
+                    }
+                    self.send_forward_recv_token(h, 1, step)
+                });
             match res {
                 Ok((tok, wire_ms)) => {
                     let t = self.active.as_mut().unwrap();
@@ -1462,7 +1491,7 @@ impl Qwen36Engine {
                                 Err(_) => fps.push(0),
                             }
                         }
-                        info!(task = %task_id, pos = step_now, tok, ?fps, "qwen36_decode_fp");
+                        info!(task = %task_id, pos = step_now, tok, hidden_fp, ?fps, "qwen36_decode_fp");
                     }
                     let full = self
                         .tokenizer
@@ -1813,6 +1842,26 @@ impl Qwen36Engine {
                         .max_by(|a, b| a.1.total_cmp(b.1))
                         .map(|(i, _)| i as i32)
                         .unwrap_or(0);
+                    // Issue 1(a): top-2 logit margin of the emitted token — the DIVERGE
+                    // discriminator. Near-zero at the first divergent step ⇒ two float paths
+                    // disagreeing on a near-tie (numerical); large ⇒ structural (restore-position /
+                    // double-fold). Logits exist only on the last rank, so the margin is emitted
+                    // here rather than on rank 0's `qwen36_decode_fp` line; the dump joins on
+                    // `pos`. Same gate; nothing emitted unless CASCADIA_QWEN36_DECODE_FP=1.
+                    #[cfg(feature = "kv_coord")]
+                    if decode_fp() {
+                        let (mut top, mut second) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+                        for &v in &logits {
+                            if v > top {
+                                second = top;
+                                top = v;
+                            } else if v > second {
+                                second = v;
+                            }
+                        }
+                        let margin = top - second;
+                        info!(pos = t0 + n, tok = next, margin, "qwen36_decode_fp");
+                    }
                     (next, 0u32)
                 } else {
                     // Middle: pass the hidden span on; the chain end's
@@ -2468,6 +2517,26 @@ mod tests {
     fn header_roundtrip() {
         let h = frame_header(FRAME_FORWARD, 7, 4096);
         assert_eq!(parse_header(&h), (FRAME_FORWARD, 7, 4096));
+    }
+
+    /// Issue 1(b): unset pinning envs ⇒ the PluginConfig comes back byte-for-byte — pinning is
+    /// strictly opt-in, like `kv_cache_precision`/`dyn_quant`. The set-env arm is not exercised
+    /// here: tests share the process environment.
+    #[test]
+    fn ov_pin_env_unset_leaves_the_plugin_config_untouched() {
+        assert!(std::env::var("CASCADIA_QWEN36_OV_STREAMS").is_err());
+        assert!(std::env::var("CASCADIA_QWEN36_OV_THREADS").is_err());
+        let base = PluginConfig::new().with("CACHE_DIR", "/tmp/x");
+        let out = apply_ov_pin_env(base.clone());
+        assert_eq!(out.entries, base.entries);
+    }
+
+    /// Issue 1(a): the new `hidden_fp`/`margin` fields ride the `decode_fp()` gate, which must
+    /// answer false with the env unset — nothing new is emitted on the certified path.
+    #[test]
+    fn decode_fp_gate_defaults_off() {
+        assert!(std::env::var("CASCADIA_QWEN36_DECODE_FP").is_err());
+        assert!(!decode_fp());
     }
 
     fn bare_engine(total: u32, manifest: &str) -> Qwen36Engine {

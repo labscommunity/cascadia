@@ -2871,6 +2871,7 @@ impl OvRuntimeEngine {
             elapsed_s = elapsed.as_secs_f64(),
             tok_s = n_tokens as f64 / elapsed.as_secs_f64().max(1e-9),
             in_flight = packed.occupied(),
+            event = "engine_task_done",
             "packed task done"
         );
         Ok(Some((task_id, chunk)))
@@ -3239,6 +3240,10 @@ impl OvRuntimeEngine {
                 alpha_ms,
                 wire_ms,
                 other_ms,
+                // Issue 2 Bar B: engine-agnostic `event` so the harness can stop grepping the
+                // per-engine message strings (`ov-dist-spec done` has no "task"). One field, all
+                // eleven task-done sites across the runtime crates.
+                event = "engine_task_done",
                 "ov-runtime task done"
             );
             if std::env::var("CASCADIA_PERF_DUMP").is_ok_and(|v| v == "1") {
