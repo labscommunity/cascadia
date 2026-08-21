@@ -822,12 +822,10 @@ impl Builder for SparseMoEBuilder {
                 runtime_handle,
                 rank,
                 total,
-                // dsv4 has no config-threaded prefix cache; `None` keeps its
-                // existing env-only behaviour byte-for-byte, including reading
-                // the glm5-named var (out of scope here — dsv4 never had its
-                // own knob, so this preserves rather than fixes that gap).
-                None,
-                "CASCADIA_GLM5_PREFIX_CACHE",
+                // dsv4's runner implements none of the prefix hooks, so the
+                // rank-0 index is never consulted — the cap is inert. Pass 0
+                // rather than reading any arch-named env var for it.
+                0,
             )));
         }
         if let Some(runner) = self.glm_runner {
@@ -841,6 +839,13 @@ impl Builder for SparseMoEBuilder {
             let runtime_handle = tokio::runtime::Handle::try_current()
                 .map_err(|_| EngineError::Backend("Builder::build outside tokio context".into()))?;
             info!(rank, total, "built glm5 engine");
+            // Same value the per-rank SliceKvCache got, so the rank-0 index
+            // and the per-rank caches stay in lockstep.
+            let prefix_cap = resolve_prefix_cap(
+                self.config.prefix_cache_depth.map(|d| d as usize),
+                "CASCADIA_GLM5_PREFIX_CACHE",
+                runner.prefix_cache_enabled(),
+            );
             return Ok(Box::new(PipelineEngine::new(
                 runner,
                 self.tokenizer,
@@ -848,10 +853,7 @@ impl Builder for SparseMoEBuilder {
                 runtime_handle,
                 rank,
                 total,
-                // Same value the per-rank SliceKvCache got, so the rank-0 index
-                // and the per-rank caches stay in lockstep.
-                self.config.prefix_cache_depth.map(|d| d as usize),
-                "CASCADIA_GLM5_PREFIX_CACHE",
+                prefix_cap,
             )));
         }
         if let Some(runner) = self.k3_runner {
@@ -865,6 +867,18 @@ impl Builder for SparseMoEBuilder {
             let runtime_handle = tokio::runtime::Handle::try_current()
                 .map_err(|_| EngineError::Backend("Builder::build outside tokio context".into()))?;
             info!(rank, total, "built kimi_k3 engine");
+            // K3 has no SliceKvCache to stay in lockstep with — its per-rank
+            // store is the byte-budgeted PrefixStore fed by
+            // `k3_prefix_cache_bytes`. `None` so the cap derives from that
+            // store; taking glm5's `prefix_cache_depth` here would let a
+            // glm-scoped knob zero K3's index and kill prefix reuse. K3's own
+            // env override, NOT the glm5 one — a glm5-named knob must never
+            // zero or cap K3's rank-0 prefix index.
+            let prefix_cap = resolve_prefix_cap(
+                None,
+                "CASCADIA_K3_PREFIX_INDEX",
+                runner.prefix_cache_enabled(),
+            );
             return Ok(Box::new(PipelineEngine::new(
                 runner,
                 self.tokenizer,
@@ -872,15 +886,7 @@ impl Builder for SparseMoEBuilder {
                 runtime_handle,
                 rank,
                 total,
-                // K3 has no SliceKvCache to stay in lockstep with — its per-rank
-                // store is the byte-budgeted PrefixStore fed by
-                // `k3_prefix_cache_bytes`. `None` so the cap derives from that
-                // store; taking glm5's `prefix_cache_depth` here would let a
-                // glm-scoped knob zero K3's index and kill prefix reuse.
-                None,
-                // K3's own env override, NOT the glm5 one below — a glm5-named
-                // knob must never zero or cap K3's rank-0 prefix index.
-                "CASCADIA_K3_PREFIX_INDEX",
+                prefix_cap,
             )));
         }
         if let Some(ov) = self.ov_runner {
@@ -3008,26 +3014,21 @@ fn prefix_index_cap(env_override: Option<&str>, store_enabled: bool) -> usize {
 
 /// `explicit` wins; failing that, reads `env_var` by NAME. The caller picks
 /// the name, so an arch-scoped knob (e.g. `CASCADIA_GLM5_PREFIX_CACHE`) can
-/// never reach a different arch's engine — see the two `PipelineEngine::new`
-/// call sites in `Builder::build`, each of which passes its own runner's var.
+/// never reach a different arch's engine — each arm of `Builder::build`
+/// resolves with its own runner's var before handing the cap to
+/// `PipelineEngine::new`, which never reads env itself.
 fn resolve_prefix_cap(explicit: Option<usize>, env_var: &str, store_enabled: bool) -> usize {
     explicit
         .unwrap_or_else(|| prefix_index_cap(std::env::var(env_var).ok().as_deref(), store_enabled))
 }
 
 impl<R: StagedRunner> PipelineEngine<R> {
-    /// `prefix_cap`: rank-0 KV-prefix-cache depth. `None` defers to
-    /// `prefix_cap_env_var`, and failing that to whether the runner's store is
-    /// enabled — NOT to zero, which disabled the index for every runner not
-    /// named glm. This index must stay in lockstep with every rank's
+    /// `prefix_cap`: rank-0 KV-prefix-cache depth (0 = off), already resolved
+    /// by the caller via `resolve_prefix_cap` with its own arch's env var —
+    /// `PipelineEngine` is shared by glm5, kimi_k3 and dsv4, so it never reads
+    /// env itself. For glm5 this index must stay in lockstep with every rank's
     /// `SliceKvCache`, so the value threaded here is the same one handed to
     /// `StageOpts`.
-    ///
-    /// `prefix_cap_env_var`: the env var name to fall back to when `prefix_cap`
-    /// is `None`. Callers pass their own arch's var — `PipelineEngine` is
-    /// shared by glm5 and kimi_k3, and a glm5-named var must never zero or cap
-    /// K3's index (or vice versa).
-    #[allow(clippy::too_many_arguments)]
     fn new(
         runner: R,
         tokenizer: Option<Tokenizer>,
@@ -3035,14 +3036,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
         runtime_handle: tokio::runtime::Handle,
         rank: u32,
         total: u32,
-        prefix_cap: Option<usize>,
-        prefix_cap_env_var: &str,
+        prefix_cap: usize,
     ) -> Self {
-        let prefix_cap = resolve_prefix_cap(
-            prefix_cap,
-            prefix_cap_env_var,
-            runner.prefix_cache_enabled(),
-        );
         Self {
             runner,
             tokenizer,
