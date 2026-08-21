@@ -315,6 +315,13 @@ fn to_shape3(shape: &[usize]) -> [usize; 3] {
     }
 }
 
+/// §12.16 guard: prime only a virgin, stateful `InferRequest`. Already-primed requests skip the
+/// throwaway forward; the static-KV (NPU) path manages its own KV host-side and never calls
+/// `set_state_blob`, so it never needs priming either.
+fn needs_priming(ever_inferred: bool, is_static_kv: bool) -> bool {
+    !ever_inferred && !is_static_kv
+}
+
 /// Refuse a packed variant whose query window is narrower than its slot count.
 ///
 /// A decode step lays down one row per ready slot, but the plan is only
@@ -1461,6 +1468,11 @@ pub struct OvRuntimeEngine {
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
     runtime_handle: tokio::runtime::Handle,
     position: i64,
+    /// §12.16: whether `self.runtime`'s `InferRequest` has completed at least one real
+    /// inference. A virgin request has no materialized per-layer state shapes, so a bare
+    /// `set_state_blob` onto it throws `Argument shapes are inconsistent` on the next `infer()` —
+    /// see `prime_if_never_inferred`.
+    ever_inferred: bool,
     input_names: Vec<String>,
     /// Map of canonical name (e.g. "input_ids", "attention_mask") to the
     /// IR's primary port name. Resolved at engine build time via the
@@ -1781,6 +1793,31 @@ impl OvRuntimeEngine {
         self.runtime.infer().map_err(map_ov_err)?;
         let (dtype, out_shape, bytes) = self.runtime.output(0).map_err(map_ov_err)?;
         Ok((bytes_to_f32(dtype, &bytes)?, out_shape))
+    }
+
+    /// §12.16: prime a never-inferred `InferRequest` before any `set_state_blob` call. A
+    /// virgin request has no materialized per-layer state shapes; its first `infer()` after a
+    /// bare restore throws `Argument shapes are inconsistent` on the attention `Add`
+    /// (A/B-confirmed: a byte-identical blob restores clean on an already-primed engine — one
+    /// prior inference, any inference, is the discriminator). Runs a throwaway 1-token forward
+    /// through the normal path, then `reset_state` to discard the garbage KV it produced.
+    /// `reset_state`, not `recreate_request`: rebuilding the request would hand back a fresh
+    /// virgin one and undo the priming — a primed engine stays primed across `reset_state`
+    /// (confirmed by every cold-turn cycle a long-lived engine already goes through). Idempotent
+    /// and a no-op on the static-KV (NPU) path, which never calls `set_state_blob`.
+    fn prime_if_never_inferred(&mut self) -> EngineResult<()> {
+        if !needs_priming(self.ever_inferred, self.static_kv.is_some()) {
+            return Ok(());
+        }
+        if self.spec.is_first_stage {
+            self.run_first(&[0i64], 0)?;
+        } else {
+            let hs = self.hidden_size;
+            self.run_relay(&vec![0f32; hs], [1, 1, hs], 0)?;
+        }
+        self.runtime.reset_state().map_err(map_ov_err)?;
+        self.ever_inferred = true;
+        Ok(())
     }
 
     /// Relay/head handling of a multi-token prefill chunk `[1, r, hidden]` on
@@ -2130,6 +2167,9 @@ impl OvRuntimeEngine {
                 if let Some((blob, len, plane_pulled)) =
                     self.kv.take_warm(&task.tenant, &prompt_i32)
                 {
+                    if let Err(e) = self.prime_if_never_inferred() {
+                        warn!(error = %e, "ov-runtime: priming before warm-resume failed");
+                    }
                     match self.runtime.set_state_blob(&blob) {
                         Ok(()) => {
                             // Multi-stage: RESTORE the whole downstream chain too (all-or-nothing).
@@ -3982,6 +4022,9 @@ impl OvRuntimeEngine {
         // Captured BEFORE set_state so the ledger can show whether the engine had already advanced past
         // the resume depth when this landed — the timing candidate's signature.
         let pos_before = self.position;
+        if let Err(e) = self.prime_if_never_inferred() {
+            warn!(error = %e, "ov-runtime: priming before plane warm-resume failed");
+        }
         // Gate A attributes ~21.7 s of the warm turn to this call, but that figure is a DELTA between
         // two whole runs on different builds. Time it directly: our Rust-side marshalling measures
         // 147 ms on a 114.6 MB payload (`apply_path_cost_split`), so whatever lands here is
@@ -4419,6 +4462,9 @@ impl OvRuntimeEngine {
                     true
                 } else if let Some(blob) = carried {
                     let pos_before = self.position;
+                    if let Err(e) = self.prime_if_never_inferred() {
+                        warn!(error = %e, "ov-runtime: priming before carried-blob restore failed");
+                    }
                     match self.runtime.set_state_blob(blob) {
                         Ok(()) => {
                             self.position =
@@ -4445,21 +4491,26 @@ impl OvRuntimeEngine {
                     }
                 } else {
                     match self.kv.take_capture(epoch) {
-                        Some((tokens, blob)) => match self.runtime.set_state_blob(&blob) {
-                            Ok(()) => {
-                                // Real KV depth, not the token count (off-by-one, see kv_seq_from_blob).
-                                self.position = crate::kv_coordination::kv_seq_from_blob(&blob)
-                                    .map(|s| s.min(tokens.len()))
-                                    .unwrap_or(tokens.len())
-                                    as i64;
-                                self.kv_warm_pending = true;
-                                true
+                        Some((tokens, blob)) => {
+                            if let Err(e) = self.prime_if_never_inferred() {
+                                warn!(error = %e, "ov-runtime: priming before capture restore failed");
                             }
-                            Err(e) => {
-                                warn!(error = %e, "ov-runtime: set_state failed; rank cold");
-                                false
+                            match self.runtime.set_state_blob(&blob) {
+                                Ok(()) => {
+                                    // Real KV depth, not the token count (off-by-one, see kv_seq_from_blob).
+                                    self.position = crate::kv_coordination::kv_seq_from_blob(&blob)
+                                        .map(|s| s.min(tokens.len()))
+                                        .unwrap_or(tokens.len())
+                                        as i64;
+                                    self.kv_warm_pending = true;
+                                    true
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "ov-runtime: set_state failed; rank cold");
+                                    false
+                                }
                             }
-                        },
+                        }
                         None => false,
                     }
                 };
@@ -5332,6 +5383,7 @@ impl Builder for OvRuntimeBuilder {
             downstream: self.downstream,
             runtime_handle: tokio::runtime::Handle::current(),
             position: 0,
+            ever_inferred: false,
             input_names: self.input_names,
             canonical_inputs,
             pending: Vec::new(),
@@ -5373,6 +5425,29 @@ mod tests {
         let mut b = OvRuntimeBuilder::new("/non/existent", 0, 1, "CPU");
         let res = b.load(ShardSpec::single_stage("m", "CPU")).await;
         assert!(res.is_err());
+    }
+
+    /// §12.16 guard: prime a virgin stateful request exactly once; never re-prime an
+    /// already-primed one, and never prime the static-KV (NPU) path, which owns its KV
+    /// host-side and never calls `set_state_blob`.
+    #[test]
+    fn needs_priming_only_before_first_inference_on_the_stateful_path() {
+        assert!(
+            needs_priming(false, false),
+            "a virgin stateful request must prime before the first set_state_blob"
+        );
+        assert!(
+            !needs_priming(true, false),
+            "an already-primed request must not re-prime"
+        );
+        assert!(
+            !needs_priming(false, true),
+            "static-KV path manages state host-side; it never primes"
+        );
+        assert!(
+            !needs_priming(true, true),
+            "static + already-primed: still no"
+        );
     }
 
     /// Byte-level detokenizers emit one U+FFFD per byte they cannot yet decode,

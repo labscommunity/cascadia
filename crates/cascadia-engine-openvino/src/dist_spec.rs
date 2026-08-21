@@ -394,6 +394,10 @@ pub struct MaskedReq {
     cache_len: usize,
     logical_pos: usize,
     inputs: std::collections::HashMap<String, String>,
+    /// §12.16: whether `runtime`'s `InferRequest` has completed at least one real inference. See
+    /// `prime_if_never_inferred`.
+    #[cfg(feature = "kv_coord")]
+    ever_inferred: bool,
 }
 
 #[cfg(feature = "kv_coord")]
@@ -401,7 +405,26 @@ impl MaskedReq {
     pub(crate) fn kv_blob(&mut self) -> Option<Vec<u8>> {
         self.runtime.get_state_blob().ok()
     }
+    /// §12.16: prime a never-inferred `InferRequest` with a throwaway 1-token forward before the
+    /// first `set_state_blob` — a virgin request has no materialized per-layer state shapes and
+    /// throws `Argument shapes are inconsistent` on the first real `infer()` after a bare
+    /// restore. `reset_state` afterward discards the garbage KV the throwaway feed produced;
+    /// `feed`'s host-side cursors (`cache_len`/`logical_pos`) are left as the primer set them —
+    /// the caller always calls `kv_set_pos` right after a successful restore, which overwrites
+    /// them, and resets them on failure.
+    fn prime_if_never_inferred(&mut self) -> Result<(), EngineError> {
+        if self.ever_inferred {
+            return Ok(());
+        }
+        self.feed(&[0i64])?;
+        self.runtime.reset_state().map_err(map_ov_err)?;
+        self.ever_inferred = true;
+        Ok(())
+    }
     pub(crate) fn kv_restore(&mut self, b: &[u8]) -> bool {
+        if let Err(e) = self.prime_if_never_inferred() {
+            warn!(error = %e, "ov-dist-spec: draft priming before restore failed");
+        }
         self.runtime.set_state_blob(b).is_ok()
     }
     /// After a warm `set_state_blob`, align the host-side cursors to the restored prefix length so
@@ -451,6 +474,8 @@ impl MaskedReq {
             cache_len: 0,
             logical_pos: 0,
             inputs,
+            #[cfg(feature = "kv_coord")]
+            ever_inferred: false,
         })
     }
 
@@ -613,6 +638,10 @@ pub struct DistributedMaskedReq {
     pub t_alpha_infer: std::time::Duration,
     pub t_alpha_output: std::time::Duration,
     pub t_wire: std::time::Duration,
+    /// §12.16: whether `stage0`'s `InferRequest` has completed at least one real inference. See
+    /// `prime_stage0_if_never_inferred`.
+    #[cfg(feature = "kv_coord")]
+    ever_inferred: bool,
 }
 
 #[cfg(feature = "kv_coord")]
@@ -620,7 +649,56 @@ impl DistributedMaskedReq {
     pub(crate) fn stage0_blob(&mut self) -> Option<Vec<u8>> {
         self.stage0.get_state_blob().ok()
     }
+    /// §12.16: prime stage0's never-inferred `InferRequest` with a throwaway local 1-token
+    /// forward before the first `set_state_blob`. LOCAL ONLY — no downstream network round-trip;
+    /// each worker rank primes itself independently at its own RESTORE handler
+    /// (`OvDistSpecWorkerEngine::prime_if_never_inferred`). See `MaskedReq::prime_if_never_inferred`
+    /// for the full rationale.
+    fn prime_stage0_if_never_inferred(&mut self) -> Result<(), EngineError> {
+        if self.ever_inferred {
+            return Ok(());
+        }
+        let in_ids = self
+            .stage0_inputs
+            .get("input_ids")
+            .cloned()
+            .ok_or_else(|| EngineError::Backend("missing input_ids input".into()))?;
+        let attn_name = self
+            .stage0_inputs
+            .get("attention_mask")
+            .cloned()
+            .ok_or_else(|| EngineError::Backend("missing attention_mask input".into()))?;
+        let pos_name = self
+            .stage0_inputs
+            .get("position_ids")
+            .cloned()
+            .ok_or_else(|| EngineError::Backend("missing position_ids input".into()))?;
+        let beam_name = self
+            .stage0_inputs
+            .get("beam_idx")
+            .cloned()
+            .ok_or_else(|| EngineError::Backend("missing beam_idx input".into()))?;
+        self.stage0
+            .set_input(&in_ids, ShimDType::I64, &[1, 1], &i64_to_bytes(&[0i64]))
+            .map_err(map_ov_err)?;
+        self.stage0
+            .set_input(&attn_name, ShimDType::I64, &[1, 1], &i64_to_bytes(&[1i64]))
+            .map_err(map_ov_err)?;
+        self.stage0
+            .set_input(&pos_name, ShimDType::I64, &[1, 1], &i64_to_bytes(&[0i64]))
+            .map_err(map_ov_err)?;
+        self.stage0
+            .set_input(&beam_name, ShimDType::I32, &[1], &0i32.to_le_bytes())
+            .map_err(map_ov_err)?;
+        self.stage0.infer().map_err(map_ov_err)?;
+        self.stage0.reset_state().map_err(map_ov_err)?;
+        self.ever_inferred = true;
+        Ok(())
+    }
     pub(crate) fn stage0_restore(&mut self, b: &[u8]) -> bool {
+        if let Err(e) = self.prime_stage0_if_never_inferred() {
+            warn!(error = %e, "ov-dist-spec: stage0 priming before restore failed");
+        }
         self.stage0.set_state_blob(b).is_ok()
     }
     /// Align host-side cursors to a restored prefix (see `MaskedReq::kv_set_pos`).
@@ -742,6 +820,8 @@ impl DistributedMaskedReq {
             t_alpha_infer: std::time::Duration::ZERO,
             t_alpha_output: std::time::Duration::ZERO,
             t_wire: std::time::Duration::ZERO,
+            #[cfg(feature = "kv_coord")]
+            ever_inferred: false,
         })
     }
 
@@ -1990,6 +2070,10 @@ pub struct OvDistSpecWorkerEngine {
     kv_handoff: std::sync::Arc<crate::kv_coordination::KvHandoffMailbox>,
     #[cfg(feature = "kv_coord")]
     kv_model_id: String,
+    /// §12.16: whether `runtime`'s `InferRequest` has completed at least one real inference. See
+    /// `prime_if_never_inferred`.
+    #[cfg(feature = "kv_coord")]
+    ever_inferred: bool,
 }
 
 impl Engine for OvDistSpecWorkerEngine {
@@ -2201,6 +2285,9 @@ impl OvDistSpecWorkerEngine {
                 let local_ok = if self.drain_kv_handoff(epoch) {
                     true
                 } else if !carried.is_empty() {
+                    if let Err(e) = self.prime_if_never_inferred() {
+                        warn!(error = %e, "ov-dist-spec worker: priming before carried-blob restore failed");
+                    }
                     let ok = self.runtime.set_state_blob(&carried).is_ok();
                     if ok {
                         info!(
@@ -2211,6 +2298,9 @@ impl OvDistSpecWorkerEngine {
                     }
                     ok
                 } else if let Some((_, blob)) = self.kv.take_capture(epoch) {
+                    if let Err(e) = self.prime_if_never_inferred() {
+                        warn!(error = %e, "ov-dist-spec worker: priming before capture restore failed");
+                    }
                     self.runtime.set_state_blob(&blob).is_ok()
                 } else {
                     false
@@ -2628,6 +2718,8 @@ impl Builder for OvDistSpecWorkerBuilder {
             kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
             #[cfg(feature = "kv_coord")]
             kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
+            #[cfg(feature = "kv_coord")]
+            ever_inferred: false,
         }))
     }
 }
@@ -2845,6 +2937,71 @@ impl OvDistSpecWorkerEngine {
     fn kv_fingerprint(&self) -> u64 {
         crate::kv_coordination::fnv1a64(self.kv_model_id.as_bytes())
     }
+    /// Resolve the static hidden dim of a v5 input port by name, for the priming forward below.
+    /// The pre-allocated tensor reports 0 for a dynamic dim (batch/seq) but the model's true
+    /// static hidden-size dim regardless — see the shim's `cascadia_runtime_input_shape` doc.
+    fn worker_hidden_size(&self, port_name: &str) -> Option<usize> {
+        (0..self.runtime.input_count())
+            .find(|&idx| self.runtime.input_name(idx).ok().as_deref() == Some(port_name))
+            .and_then(|idx| self.runtime.input_shape(idx).ok())
+            .and_then(|shape| shape.last().copied())
+            .filter(|&d| d > 0)
+    }
+    /// §12.16: prime a never-inferred `InferRequest` with a throwaway 1-token forward before any
+    /// `set_state_blob` — a virgin request has no materialized per-layer state shapes and throws
+    /// `Argument shapes are inconsistent` on the first real `infer()` after a bare restore. See
+    /// `MaskedReq::prime_if_never_inferred` for the full rationale. Best-effort: if the hidden dim
+    /// can't be resolved, skips rather than risking a garbage-shaped forward — the caller's
+    /// `set_state_blob` then takes its chances exactly as it did before this fix.
+    fn prime_if_never_inferred(&mut self) -> Result<(), EngineError> {
+        if self.ever_inferred {
+            return Ok(());
+        }
+        let in_hs = self
+            .inputs
+            .get("hidden_states")
+            .cloned()
+            .ok_or_else(|| EngineError::Backend("missing hidden_states input".into()))?;
+        let in_attn = self
+            .inputs
+            .get("attention_mask")
+            .cloned()
+            .ok_or_else(|| EngineError::Backend("missing attention_mask input".into()))?;
+        let in_pos = self
+            .inputs
+            .get("position_ids")
+            .cloned()
+            .ok_or_else(|| EngineError::Backend("missing position_ids input".into()))?;
+        let in_beam = self
+            .inputs
+            .get("beam_idx")
+            .cloned()
+            .ok_or_else(|| EngineError::Backend("missing beam_idx input".into()))?;
+        let hidden = self.worker_hidden_size(&in_hs).ok_or_else(|| {
+            EngineError::Backend("could not resolve hidden_states dim for priming".into())
+        })?;
+        self.runtime
+            .set_input(
+                &in_hs,
+                ShimDType::F16,
+                &[1, 1, hidden],
+                &f32_to_f16_bytes(&vec![0f32; hidden]),
+            )
+            .map_err(map_ov_err)?;
+        self.runtime
+            .set_input(&in_attn, ShimDType::I64, &[1, 1], &i64_to_bytes(&[1i64]))
+            .map_err(map_ov_err)?;
+        self.runtime
+            .set_input(&in_pos, ShimDType::I64, &[1, 1], &i64_to_bytes(&[0i64]))
+            .map_err(map_ov_err)?;
+        self.runtime
+            .set_input(&in_beam, ShimDType::I32, &[1], &0i32.to_le_bytes())
+            .map_err(map_ov_err)?;
+        self.runtime.infer().map_err(map_ov_err)?;
+        self.runtime.reset_state().map_err(map_ov_err)?;
+        self.ever_inferred = true;
+        Ok(())
+    }
     /// Drain the plane hand-off mailbox and apply the parked slice, if any. See
     /// [`crate::kv_coordination::drain_handoff`]; called from `FrameKind::Restore` for the same two
     /// reasons ov-runtime calls it from `OPCODE_RESTORE`: it lands before the turn's forward, and it
@@ -2855,6 +3012,9 @@ impl OvDistSpecWorkerEngine {
     fn drain_kv_handoff(&mut self, expected_epoch: u64) -> bool {
         let mailbox = std::sync::Arc::clone(&self.kv_handoff);
         let fp = self.kv_fingerprint();
+        if let Err(e) = self.prime_if_never_inferred() {
+            warn!(error = %e, "ov-dist-spec worker: priming before handoff drain failed");
+        }
         crate::kv_coordination::drain_handoff(&mailbox, fp, 0, expected_epoch, |blob| {
             self.runtime.set_state_blob(blob).is_ok()
         })
