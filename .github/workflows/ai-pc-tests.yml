@@ -6,6 +6,8 @@
 #   - self-hosted runners online with labels [self-hosted, ai-pc, windows]
 #   - repository variable INTEL_OPENVINO_DIR pointing at the OpenVINO GenAI SDK
 #     root on the runners.
+#   - Git for Windows on the runners (dtolnay/rust-toolchain needs bash; the
+#     runner service PATH gets only Git\cmd, not Git\bin).
 #
 # SECURITY — fork PRs must NEVER run on the self-hosted runners. Untrusted fork
 # code here = arbitrary code execution on our hardware. The job-level `if` below
@@ -80,8 +82,10 @@ jobs:
             "C:\Program Files\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
             "C:\Program Files\Git\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
             Write-Host "Added Git bash to PATH"
+          } elseif (Get-Command bash -ErrorAction SilentlyContinue) {
+            Write-Host "bash already on PATH: $((Get-Command bash).Source)"
           } else {
-            Write-Host "::error::bash.exe not found at $bash - install Git for Windows on this AI-PC runner (winget install --id Git.Git -e)"
+            Write-Host "::error::bash.exe not found at the default Git for Windows path ($bash) or on PATH - install Git for Windows on this AI-PC runner (winget install --id Git.Git -e)"
             exit 1
           }
 
