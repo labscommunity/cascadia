@@ -24,12 +24,18 @@ fn fixtures_dir() -> PathBuf {
 }
 
 /// Both the golden tensors and the tiny export are gitignored, so a fresh
-/// checkout skips rather than fails.
+/// checkout skips rather than fails. `CASCADIA_REQUIRE_FIXTURES=1` turns the
+/// skip into a failure, same as k3_pipeline.rs.
 macro_rules! need {
     ($p:expr, $how:expr) => {{
         let p = $p;
         if !p.exists() {
-            eprintln!("SKIP: {} absent ({})", p.display(), $how);
+            let msg = format!("{} absent ({})", p.display(), $how);
+            assert!(
+                std::env::var("CASCADIA_REQUIRE_FIXTURES").as_deref() != Ok("1"),
+                "CASCADIA_REQUIRE_FIXTURES=1 but {msg}"
+            );
+            eprintln!("SKIP: {msg}");
             return;
         }
         p

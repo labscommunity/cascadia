@@ -112,7 +112,14 @@ impl PrefixStore {
             return b as usize;
         }
         if let Ok(v) = std::env::var("CASCADIA_K3_PREFIX_CACHE") {
-            return v.trim().parse::<usize>().unwrap_or(0);
+            match v.trim().parse::<usize>() {
+                Ok(b) => return b,
+                // Same shape as the engine's index cap: an unparsable value
+                // must not silently turn the cache off.
+                Err(_) => tracing::warn!(
+                    "CASCADIA_K3_PREFIX_CACHE={v:?} is not a byte count; deriving the budget from free RAM"
+                ),
+            }
         }
         (residency::mem_available() as f64 * PREFIX_CACHE_FRACTION) as usize
     }

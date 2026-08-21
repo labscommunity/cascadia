@@ -12,26 +12,25 @@
 //!
 //! Runs on Linux and Windows; the positioned read is behind a small shim.
 
-// `read_at` is the point of the B) phase and is unix-only, so the bench only
-// exists there. The fleet is Windows, where `--all-targets` builds every
-// example — without this gate the workspace does not compile at all.
-#[cfg(not(unix))]
+// The positioned read has per-target shims for unix and windows; any other
+// target gets a stub main so `--all-targets` still compiles the workspace.
+#[cfg(not(any(unix, windows)))]
 fn main() {
     eprintln!(
-        "nvme_readbench measures std::os::unix::fs::FileExt::read_at against mmap \
-         faulting; there is nothing to run on this platform."
+        "nvme_readbench needs a positioned read (unix read_at / windows seek_read); \
+         there is nothing to run on this platform."
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::fs::File;
 use std::path::PathBuf;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::time::Instant;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use memmap2::Mmap;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use rayon::prelude::*;
 
 /// Positioned read, on both targets.
@@ -61,6 +60,7 @@ fn read_at(f: &File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
     }
 }
 
+#[cfg(any(unix, windows))]
 fn list_bins(dir: &PathBuf) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
         .expect("read dir")
@@ -72,7 +72,7 @@ fn list_bins(dir: &PathBuf) -> Vec<PathBuf> {
 }
 
 // Deterministic LCG so token->expert selection is reproducible without rand.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn lcg(state: &mut u64) -> u64 {
     *state = state
         .wrapping_mul(6364136223846793005)
@@ -80,7 +80,7 @@ fn lcg(state: &mut u64) -> u64 {
     *state >> 16
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = PathBuf::from(

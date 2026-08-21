@@ -58,6 +58,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let dir = PathBuf::from(&args[1]);
     let raw_ids = args[2] == "--ids";
+    if raw_ids && args.len() < 4 {
+        eprintln!("usage: k3_run <model_dir> --ids \"1 2 3\" [n_gen]");
+        std::process::exit(2);
+    }
     let prompt_arg = if raw_ids { &args[3] } else { &args[2] };
     let n_gen: usize = args
         .get(if raw_ids { 4 } else { 3 })

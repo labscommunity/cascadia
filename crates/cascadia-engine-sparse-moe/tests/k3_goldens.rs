@@ -15,15 +15,22 @@ use cascadia_engine_sparse_moe::k3::{attn_res::apply_attn_res, kda, situ::situ_s
 /// Open the gen_fixtures.py output, or SKIP the test when it is absent. The
 /// *.safetensors fixtures are gitignored, so a fresh checkout does not have
 /// them; they exist after running gen_fixtures.py.
+/// `CASCADIA_REQUIRE_FIXTURES=1` turns the skip into a failure, same as
+/// k3_pipeline.rs, so a gate can demand real coverage.
 macro_rules! fixtures {
     () => {{
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/kimi_k3/fixtures.safetensors");
         if !p.exists() {
-            eprintln!(
-                "SKIP: {} absent (run tools/kimi_k3_ref/gen_fixtures.py)",
+            let msg = format!(
+                "{} absent (run tools/kimi_k3_ref/gen_fixtures.py)",
                 p.display()
             );
+            assert!(
+                std::env::var("CASCADIA_REQUIRE_FIXTURES").as_deref() != Ok("1"),
+                "CASCADIA_REQUIRE_FIXTURES=1 but {msg}"
+            );
+            eprintln!("SKIP: {msg}");
             return;
         }
         StFile::open(&p).expect("open fixtures")
