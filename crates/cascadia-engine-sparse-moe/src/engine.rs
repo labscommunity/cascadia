@@ -83,9 +83,11 @@ pub struct SparseMoEBuilderConfig {
     /// env/heuristic ([`crate::dsv4::stage::resolve_experts_mode`]); glm5's
     /// `or_else` short-circuits, so a typo there masks the env silently.
     ///
-    /// dsv4 does NOT accept `"ov"` — its OpenVINO expert backend is gated on
-    /// `CASCADIA_DSV4_OV_EXPERTS`, so routing `ov_experts` through this field
-    /// reaches the unknown-value path and leaves the Rust kernel selected.
+    /// NEITHER arch accepts `"ov"`: both match only `"eager"`/`"mmap"`, and both
+    /// OpenVINO expert backends are gated on env (`CASCADIA_DSV4_OV_EXPERTS` /
+    /// `CASCADIA_GLM5_OV_EXPERTS`). Routing an `ov_experts` knob through this
+    /// field reaches the unknown-value path and leaves the Rust kernel
+    /// selected.
     pub experts_mode: Option<String>,
     /// OV expert cache count backstop. `None` → `CASCADIA_GLM5_OV_CACHE` (64).
     pub ov_cache_entries: Option<u32>,
@@ -3940,7 +3942,8 @@ mod tests {
         let mut cfg = SparseMoEBuilderConfig::new(dir.clone(), "CPU");
         cfg.max_seq = Some(48);
         let mut b = SparseMoEBuilder::new(cfg);
-        b.load(ShardSpec::single_stage("dsv4-test", "CPU"))
+        let _ = b
+            .load(ShardSpec::single_stage("dsv4-test", "CPU"))
             .await
             .expect("dsv4 load");
         assert_eq!(
@@ -3949,17 +3952,23 @@ mod tests {
             "config.max_seq must reach the runner, not the env fallback"
         );
 
-        // Absent config falls through to the default (no env set in test env).
+        // Absent config falls through to env-then-default. Resolve the expected
+        // value the same way rather than asserting the bare constant: an
+        // exported CASCADIA_DSV4_MAX_SEQ (the very variable a long-context
+        // deployment sets) would otherwise fail this test spuriously.
+        let expected =
+            resolve_dsv4_max_seq(None, std::env::var("CASCADIA_DSV4_MAX_SEQ").ok().as_deref());
         let mut cfg = SparseMoEBuilderConfig::new(dir, "CPU");
         cfg.max_seq = None;
         let mut b = SparseMoEBuilder::new(cfg);
-        b.load(ShardSpec::single_stage("dsv4-test", "CPU"))
+        let _ = b
+            .load(ShardSpec::single_stage("dsv4-test", "CPU"))
             .await
             .expect("dsv4 load");
         assert_eq!(
             b.dsv4_runner.as_ref().expect("dsv4 runner").max_seq(),
-            crate::dsv4::stage::DSV4_DEFAULT_MAX_SEQ,
-            "None must fall through to the dsv4 default"
+            expected,
+            "None must fall through to env-then-default"
         );
     }
 

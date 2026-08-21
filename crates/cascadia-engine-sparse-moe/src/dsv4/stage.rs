@@ -23,8 +23,9 @@ pub const DSV4_DEFAULT_MAX_SEQ: usize = 4096;
 pub struct Dsv4Runner {
     model: DsV4Model,
     eos: Vec<u32>,
-    hidden: usize,  // hc * dim (wire width)
-    max_seq: usize, // context budget the caches were sized for
+    hidden: usize,             // hc * dim (wire width)
+    max_seq: usize,            // context budget the caches were sized for
+    experts_mode: ExpertsMode, // resolved mode the experts were loaded in
     pub rank: u32,
     pub total: u32,
 }
@@ -33,7 +34,8 @@ pub struct Dsv4Runner {
 /// caller's read of `CASCADIA_DSV4_EXPERTS`) → the `n_routed_experts > 32`
 /// size heuristic (real-model expert sets don't fit in RAM dequantized;
 /// tiny/dev ones are faster eager). An unrecognized `override_val` is logged
-/// and treated as absent rather than panicking.
+/// and treated as absent rather than panicking. `override_val` is trimmed (it
+/// arrives from a config file); `env_val` is not, matching glm5.
 ///
 /// Takes the env value as a parameter (rather than reading `std::env` itself)
 /// so it's a pure function tests can exercise without mutating process-global
@@ -50,7 +52,7 @@ pub fn resolve_experts_mode(
         _ if n_routed_experts > 32 => ExpertsMode::Mmap,
         _ => ExpertsMode::Eager,
     };
-    match override_val {
+    match override_val.map(str::trim) {
         Some("eager") => ExpertsMode::Eager,
         Some("mmap") => ExpertsMode::Mmap,
         Some(other) => {
@@ -145,6 +147,7 @@ impl Dsv4Runner {
             eos,
             hidden,
             max_seq,
+            experts_mode: mode,
             rank,
             total,
         })
@@ -160,6 +163,12 @@ impl Dsv4Runner {
     /// and indexer caches all have exactly this many rows.
     pub fn max_seq(&self) -> usize {
         self.max_seq
+    }
+
+    /// The expert storage mode this stage actually resolved to. Exposed so a
+    /// caller's override can be observed — otherwise both modes just load.
+    pub fn experts_mode(&self) -> ExpertsMode {
+        self.experts_mode
     }
 
     pub fn eos_token_ids(&self) -> &[u32] {
