@@ -72,6 +72,19 @@ jobs:
           # Persistent self-hosted runner: don't leave the token in .git config.
           persist-credentials: false
 
+      - name: Ensure bash on Windows self-hosted (dtolnay/rust-toolchain needs it)
+        shell: powershell
+        run: |
+          $bash = "C:\Program Files\Git\bin\bash.exe"
+          if (Test-Path $bash) {
+            "C:\Program Files\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            "C:\Program Files\Git\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            Write-Host "Added Git bash to PATH"
+          } else {
+            Write-Host "::error::bash.exe not found at $bash - install Git for Windows on this AI-PC runner (winget install --id Git.Git -e)"
+            exit 1
+          }
+
       # SHA-pinned: the `stable` channel now comes from `toolchain:`, not the ref.
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
@@ -81,6 +94,17 @@ jobs:
         with:
           shared-key: ai-pc-openvino
           cache-on-failure: true
+
+      - name: Add OpenVINO DLLs to PATH (Windows)
+        shell: powershell
+        run: |
+          $ov = "${{ vars.INTEL_OPENVINO_DIR }}"
+          if (-not (Test-Path "$ov\runtime\bin\intel64\Release")) {
+            Write-Host "::warning::OpenVINO Release bin not found at $ov\runtime\bin\intel64\Release"
+          }
+          "$ov\runtime\bin\intel64\Release" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "$ov\runtime\3rdparty\tbb\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "Added OpenVINO DLLs to PATH from $ov"
 
       # Real OpenVINO build (mirrors `just build-ov`).
       - name: Build cascadia with the openvino feature
