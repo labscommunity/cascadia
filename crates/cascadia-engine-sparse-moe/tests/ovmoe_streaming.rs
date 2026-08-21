@@ -223,6 +223,10 @@ fn resume_seed_streams_continuation_only() {
     let streamed: String = toks.iter().map(|(_, c)| c.text.as_str()).collect();
     let seed_text = tokenizer.decode(&[3u32, 4], true).unwrap();
     assert!(
+        !seed_text.is_empty(),
+        "fixture ids must decode to text or the re-emission assertion below is vacuous"
+    );
+    assert!(
         !streamed.starts_with(&seed_text) || seed_text.is_empty(),
         "streamed deltas re-emitted the forced prefix: {streamed:?}"
     );
@@ -289,6 +293,6 @@ fn single_stage_declines_seeded_task_with_sentinel_first_chunk() {
         .expect("decline is an error chunk (Chunk.error field)");
     assert!(
         reason.starts_with("resume_unsupported:"),
-        "sentinel must PREFIX the reason (enterprise starts_with carve-out)"
+        "sentinel must PREFIX the reason (callers match it with a starts_with check)"
     );
 }

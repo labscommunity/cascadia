@@ -380,6 +380,21 @@ pub(crate) fn blob_decode(blob: &[u8]) -> Option<KvSnapshot> {
     for _ in 0..n {
         shells.push(r.slice()?);
     }
+    // Cross-check every slice against the declared dims: a corrupt blob claiming
+    // a huge `past_seq_len` over tiny payloads would otherwise reach
+    // `restore_kv`, which grows KV capacity toward the claimed length before its
+    // own per-layer check rejects the mismatch — bounded (`try_reserve_exact`
+    // fails cleanly) but a pile of doubling allocations for nothing. Reject here.
+    let k_len = (num_heads as usize)
+        .checked_mul(past_seq_len)
+        .and_then(|x| x.checked_mul(qk_head_dim as usize))?;
+    let v_len = (num_heads as usize)
+        .checked_mul(past_seq_len)
+        .and_then(|x| x.checked_mul(v_head_dim as usize))?;
+    let dims_ok = |l: &LayerKvSlice| l.past_k.len() == k_len && l.past_v.len() == v_len;
+    if !(layer0.iter().all(dims_ok) && shells.iter().all(dims_ok)) {
+        return None;
+    }
     (r.pos == blob.len()).then_some(KvSnapshot {
         past_seq_len,
         num_heads,
@@ -574,8 +589,8 @@ impl KvCoordination for SparseMoEEngine {
             // Same diagnosability as the share-holder export: a silent None here reads as
             // `pull_not_found` on the puller with no donor-side trace.
             tracing::info!(target: "cascadia::kv", event = "kv_serve_capture_miss",
-                epoch = expected_epoch,
-                n_captures = self.kv_capture.len(),
+                epoch = expected_epoch, n_captures = self.kv_capture.len());
+            tracing::debug!(target: "cascadia::kv",
                 held_epochs = ?self.kv_capture.keys().copied().collect::<Vec<u64>>());
             return None;
         };
@@ -812,7 +827,8 @@ impl cascadia_engine::KvSnapshotHolder for SparseMoeKvHolder {
             // `pull_not_found` cannot be told apart from a missing capture vs a length drift.
             // Log what this holder actually holds so a rig-side miss is diagnosable.
             tracing::info!(target: "cascadia::kv", event = "kv_serve_capture_miss",
-                epoch = expected_epoch, n_captures = g.captures.len(),
+                epoch = expected_epoch, n_captures = g.captures.len());
+            tracing::debug!(target: "cascadia::kv",
                 held_epochs = ?g.captures.keys().copied().collect::<Vec<u64>>());
             return None;
         };
@@ -1186,5 +1202,69 @@ mod tests {
         let (_m, served) = snapshot_to_wire(&[11, 22, 33], &snap(), "peer", 7, 0xE0);
         let slot = slot_of(&[11, 22, 33], &snap(), 7);
         assert_eq!(payload_digest(&served), payload_digest(&slot.payloads));
+    }
+
+    // ── RESTORE_CARRY blob codec (native mirror of the OvMoe round-trip tests) ──
+
+    /// A dims-consistent 2-heads × 3-slots × 2-dim snapshot, with or without layer 0.
+    fn carry_snap(with_layer0: bool) -> KvSnapshot {
+        let slice = |lid: u32| LayerKvSlice {
+            lid,
+            past_k: (0..12).map(|i| i as u16).collect(),
+            past_v: (100..112).map(|i| i as u16).collect(),
+        };
+        KvSnapshot {
+            past_seq_len: 3,
+            num_heads: 2,
+            qk_head_dim: 2,
+            v_head_dim: 2,
+            layer0: with_layer0.then(|| slice(0)),
+            shells: vec![slice(1), slice(2)],
+        }
+    }
+
+    #[test]
+    fn carry_blob_round_trips_with_and_without_layer0() {
+        for with_l0 in [true, false] {
+            let snap = carry_snap(with_l0);
+            let blob = blob_encode(&snap);
+            let back = blob_decode(&blob).expect("round trip");
+            assert_eq!(back.past_seq_len, snap.past_seq_len);
+            assert_eq!(back.num_heads, snap.num_heads);
+            assert_eq!(back.layer0.is_some(), with_l0);
+            assert_eq!(back.shells.len(), 2);
+            let all = |s: &KvSnapshot| -> Vec<u16> {
+                s.layer0
+                    .iter()
+                    .chain(s.shells.iter())
+                    .flat_map(|l| l.past_k.iter().chain(l.past_v.iter()).copied())
+                    .collect()
+            };
+            assert_eq!(all(&back), all(&snap));
+        }
+    }
+
+    #[test]
+    fn carry_blob_rejects_truncated_input() {
+        let blob = blob_encode(&carry_snap(true));
+        for cut in [0, 1, 4, blob.len() / 2, blob.len() - 1] {
+            assert!(blob_decode(&blob[..cut]).is_none(), "cut at {cut} decoded");
+        }
+    }
+
+    #[test]
+    fn carry_blob_rejects_trailing_garbage() {
+        let mut blob = blob_encode(&carry_snap(true));
+        blob.push(0);
+        assert!(blob_decode(&blob).is_none());
+    }
+
+    #[test]
+    fn carry_blob_rejects_dims_payload_mismatch() {
+        // Claim a huge past_seq_len over the same tiny payloads: must be
+        // rejected in decode, before restore_kv burns grow-allocations on it.
+        let mut blob = blob_encode(&carry_snap(true));
+        blob[0..4].copy_from_slice(&1_000_000u32.to_le_bytes());
+        assert!(blob_decode(&blob).is_none());
     }
 }

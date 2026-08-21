@@ -997,6 +997,10 @@ pub struct ResumeSeed {
     pub generated_u32: Vec<u32>,
     pub emitted: usize,
     pub seed_len: usize,
+    /// Decoded prefix text, kept for the streamed paths' one-shot seam
+    /// divergence check (the growing decode may render the seam region
+    /// differently than the prefix-only decode that seeded `emitted`).
+    pub seed_text: String,
 }
 
 #[doc(hidden)]
@@ -1020,6 +1024,7 @@ pub fn prepare_resume(
         emitted: prefix_text.len(),
         seed_len: generated_u32.len(),
         generated_u32,
+        seed_text: prefix_text,
     }))
 }
 
@@ -1155,6 +1160,9 @@ struct SparseActive {
     /// Seeded to the resume prefix's decoded byte length on a resumed turn.
     emitted: usize,
     resume_seed_len: usize,
+    /// One-shot seam divergence check for a resumed turn: the decoded prefix
+    /// text `emitted` was seeded from. Taken on the first delta; `None` after.
+    seam_check: Option<String>,
     /// The token to emit on the next decode_step (sampled by the last rank).
     next: i64,
     /// Only read by the finalize-time KV capture path (kv_coord).
@@ -1590,7 +1598,7 @@ impl SparseMoEEngine {
             }
         };
         let n_tokens = generated.len() as u32;
-        // Option B §17: decoding `generated` in isolation puts the first new
+        // Resumed-turn seam: decoding `generated` in isolation puts the first new
         // token at sequence-start, so SentencePiece/Metaspace strips its
         // leading space — fine for a fresh turn, but on a resumed turn the
         // tail CONTINUES the prefix and that dropped space corrupts the seam
@@ -2097,9 +2105,9 @@ impl SparseMoEEngine {
             return Some(vec![(task.task_id, chunk)]);
         }
 
-        let (generated, emitted, resume_seed_len) = match seed_opt.take() {
-            Some(s) => (s.generated_u32, s.emitted, s.seed_len),
-            None => (Vec::with_capacity(max_new), 0usize, 0usize),
+        let (generated, emitted, resume_seed_len, seam_check) = match seed_opt.take() {
+            Some(s) => (s.generated_u32, s.emitted, s.seed_len, Some(s.seed_text)),
+            None => (Vec::with_capacity(max_new), 0usize, 0usize, None),
         };
         self.active = Some(SparseActive {
             id: task.task_id.clone(),
@@ -2111,6 +2119,7 @@ impl SparseMoEEngine {
             history,
             generated,
             emitted,
+            seam_check,
             resume_seed_len,
             next: token_back,
             prompt_ids,
@@ -2149,11 +2158,24 @@ impl SparseMoEEngine {
             .unwrap_or_default();
         let delta = {
             let a = self.active.as_mut().unwrap();
+            // One-shot Option-B seam guard (mirror of the single-stage
+            // divergence guard): `emitted` was seeded from decode(prefix)
+            // alone, and a BPE merge across the seam can make the growing
+            // decode render those bytes differently — a blind byte-offset
+            // then re-emits prefix bytes or garbles the seam. Diverged ⇒
+            // warn and drop this step's delta (cursor jumps to the current
+            // end); later tokens stream normally.
+            if let Some(seed) = a.seam_check.take() {
+                if !full.as_bytes().starts_with(seed.as_bytes()) {
+                    warn!(task = %a.id, "resume seam diverged; re-anchoring (seam delta dropped)");
+                    a.emitted = full.len();
+                }
+            }
             utf8_safe_delta(&full, &mut a.emitted)
         };
         let mut token_chunk = Chunk::token(id.clone(), next, delta);
         token_chunk.n_tokens = Some(1);
-        // Splicer poison bypass (spec §4.1): token_id==0 with empty token_ids
+        // Splicer poison bypass (id-less chunks read as resume-ineligible): token_id==0 with empty token_ids
         // reads as id-less; stamp the single id explicitly.
         token_chunk.token_ids = vec![next];
         let (gen_new, max_new) = {
@@ -2179,7 +2201,7 @@ impl SparseMoEEngine {
                 vec![(id, token_chunk)]
             }
             Err(e) => {
-                // Spec §4.1: a mid-decode forward failure is the chain-death signal
+                // A mid-decode forward failure is the chain-death signal
                 // Option B splices on. Emitting a final marker here would trip the
                 // scheduler's saw_final latch and permanently block the resume —
                 // surface an ERROR chunk instead (deliberate divergence from
@@ -2214,7 +2236,7 @@ impl SparseMoEEngine {
         // head's single ack means every stage captured. Then the head seeds its own prefix cache so a
         // later NEGOTIATE maps the prefix → E. Best-effort: any transport/snapshot error just skips the
         // cache (warm-pull degrades to cold) and never affects the already-complete served output.
-        // §4.3.3: the capture key is prompt_ids ++ NEW tokens — `a.prompt_ids` already contains the
+        // The capture key is prompt_ids ++ NEW tokens — `a.prompt_ids` already contains the
         // appended resume prefix, so slicing generated at `resume_seed_len` prevents double-counting it.
         #[cfg_attr(not(feature = "kv_coord"), allow(unused_variables))]
         let should_capture = capture && n_new > 0;
@@ -3251,7 +3273,10 @@ impl SparseMoEEngine {
                     })
                     .unwrap_or(false)
                 } else {
-                    true
+                    // No downstream socket: verdict-true only when this genuinely
+                    // IS the last rank — mirror of the OvMoe handler, so the two
+                    // never disagree on the all-or-nothing verdict.
+                    self.is_last()
                 };
                 self.block_on(send_restore_ack_upstream(
                     upstream,
@@ -3419,6 +3444,8 @@ struct OvMoeActive {
     generated: Vec<u32>,
     emitted: usize,
     resume_seed_len: usize,
+    /// One-shot seam divergence check for a resumed turn (see `SparseActive`).
+    seam_check: Option<String>,
     /// The token to feed on the next decode_step (sampled by the last rank).
     next: i64,
     pos: usize,
@@ -3601,8 +3628,8 @@ impl OvMoeEngine {
         if task.resume_ids().is_some() {
             // Option B: this path has no resume implementation — silently dropping
             // the prefix would regenerate from scratch and the gateway would splice
-            // that after the client's prefix (spec §4.2). Decline; the scheduler's
-            // B6 retry excludes this peer and re-routes.
+            // that after the client's prefix (silent regeneration presented as a resume). Decline; the caller
+            // excludes this peer and re-routes.
             let id = task.task_id.clone();
             return vec![(
                 id.clone(),
@@ -3819,7 +3846,7 @@ impl OvMoeEngine {
         }
         if max_new == 0 {
             // Budget exhausted by the resume prefix. The decode loop below pushes
-            // BEFORE testing (spec §4.2): entering it would emit one token.
+            // BEFORE testing (silent regeneration presented as a resume): entering it would emit one token.
             let mut chunk = Chunk::final_marker(id.clone(), "");
             chunk.n_tokens = Some(0);
             chunk.finish_reason = Some(FinishReason::Length);
@@ -3912,9 +3939,9 @@ impl OvMoeEngine {
         // (stashed below); `decode_step_ovmoe` pushes it (OvMoe INCLUDES
         // EOS — push-then-test) and drives every token after on the
         // following `step()` calls.
-        let (generated, emitted, resume_seed_len) = match seed_opt.take() {
-            Some(s) => (s.generated_u32, s.emitted, s.seed_len),
-            None => (Vec::with_capacity(max_new), 0usize, 0usize),
+        let (generated, emitted, resume_seed_len, seam_check) = match seed_opt.take() {
+            Some(s) => (s.generated_u32, s.emitted, s.seed_len, Some(s.seed_text)),
+            None => (Vec::with_capacity(max_new), 0usize, 0usize, None),
         };
         self.active_ov = Some(OvMoeActive {
             id: id.clone(),
@@ -3925,6 +3952,7 @@ impl OvMoeEngine {
             started,
             generated,
             emitted,
+            seam_check,
             resume_seed_len,
             next,
             pos,
@@ -3956,11 +3984,24 @@ impl OvMoeEngine {
             .unwrap_or_default();
         let delta = {
             let a = self.active_ov.as_mut().unwrap();
+            // One-shot Option-B seam guard (mirror of the single-stage
+            // divergence guard): `emitted` was seeded from decode(prefix)
+            // alone, and a BPE merge across the seam can make the growing
+            // decode render those bytes differently — a blind byte-offset
+            // then re-emits prefix bytes or garbles the seam. Diverged ⇒
+            // warn and drop this step's delta (cursor jumps to the current
+            // end); later tokens stream normally.
+            if let Some(seed) = a.seam_check.take() {
+                if !full.as_bytes().starts_with(seed.as_bytes()) {
+                    warn!(task = %a.id, "resume seam diverged; re-anchoring (seam delta dropped)");
+                    a.emitted = full.len();
+                }
+            }
             utf8_safe_delta(&full, &mut a.emitted)
         };
         let mut token_chunk = Chunk::token(id.clone(), next, delta);
         token_chunk.n_tokens = Some(1);
-        // Splicer poison bypass (spec §4.1): token_id==0 with empty token_ids
+        // Splicer poison bypass (id-less chunks read as resume-ineligible): token_id==0 with empty token_ids
         // reads as id-less; stamp the single id explicitly.
         token_chunk.token_ids = vec![next];
         let (gen_new, max_new, is_eos, pos) = {
@@ -4023,7 +4064,7 @@ impl OvMoeEngine {
         // snapshots its slice under E and acks up; the head's single ack ⇒ every stage captured. Then
         // seed the head's prefix cache. Best-effort: any error skips the cache (warm-pull degrades to
         // cold) and never touches the already-served output.
-        // §4.3.3: the capture key is prompt_ids ++ NEW tokens — `a.prompt_ids` already contains the
+        // The capture key is prompt_ids ++ NEW tokens — `a.prompt_ids` already contains the
         // appended resume prefix, so slicing generated at `resume_seed_len` prevents double-counting it.
         #[cfg_attr(not(feature = "kv_coord"), allow(unused_variables))]
         let should_capture = capture && n_new > 0;
@@ -4126,6 +4167,13 @@ impl OvMoeEngine {
     #[cfg(feature = "kv_coord")]
     fn capture_under_epoch(&mut self, tenant: &str, epoch: u64, tokens: Vec<i32>) {
         if !self.kv_prefix_cache.enabled() {
+            // The CAPTURE handler acks upstream regardless, so a skip here is
+            // otherwise invisible: the head believes every stage captured while
+            // this rank stored nothing and every later GET answers `get_none`.
+            warn!(
+                rank = self.rank,
+                epoch, "kv capture skipped: prefix cache disabled (capacity 0) — ack still sent"
+            );
             return;
         }
         let snap = match self.runner.snapshot_kv() {
@@ -5144,6 +5192,21 @@ impl<R: StagedRunner> PipelineEngine<R> {
             Some(t) => t,
             None => return Some(Vec::new()),
         };
+        // No forced-prefix path here: silently ignoring the ids would regenerate
+        // from scratch and the caller would splice that after the client's
+        // already-received prefix as if it were the resumed tail. Decline with the
+        // sentinel first chunk so the caller excludes this peer and re-routes —
+        // same shape as the MiniMax single-stage decline above.
+        if task.resume_ids().is_some() {
+            let id = task.task_id.clone();
+            return Some(vec![(
+                id.clone(),
+                Chunk::error(
+                    id,
+                    "resume_unsupported: pipeline engine has no forced-prefix path".to_string(),
+                ),
+            )]);
+        }
         let id = task.task_id.clone();
         let Some(downstream) = self.transport.downstream.clone() else {
             warn!(task = %id, "rank 0 has no downstream; cannot drive pipeline");
@@ -5370,7 +5433,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         };
         let mut token_chunk = Chunk::token(id.clone(), next, delta);
         token_chunk.n_tokens = Some(1);
-        // Splicer poison bypass (spec §4.1, same stamp as the sparse/ovmoe
+        // Splicer poison bypass (same stamp as the sparse/ovmoe
         // decode paths): token_id==0 with empty token_ids reads as id-less and
         // makes the stream resume-ineligible; token 0 is a legal sample.
         token_chunk.token_ids = vec![next];

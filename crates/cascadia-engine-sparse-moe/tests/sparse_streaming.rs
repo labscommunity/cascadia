@@ -9,7 +9,7 @@
 //!
 //! Gated on `K26_TINY_DIR` (see `tests/k26_native_tiny.rs`): the fixture
 //! cannot be committed (~1.4 GiB, K2.6 dims pinned at compile time). CI skips
-//! this file; the rig cert (Task 9) is the enforcement gate for what's below.
+//! this file; the hardware cert is the enforcement gate for what's below.
 //!
 //! `Engine::step` is SYNC and `block_on`s internally (`engine.rs`'s
 //! `SparseMoEEngine::block_on`) — every test here drives `head.step()` from a
@@ -186,6 +186,10 @@ fn resume_seed_streams_continuation_only() {
     // after the decoded prefix (emitted-cursor seeding).
     let streamed: String = toks.iter().map(|(_, c)| c.text.as_str()).collect();
     let seed_text = test_tokenizer().decode(&[3u32, 4], true).unwrap();
+    assert!(
+        !seed_text.is_empty(),
+        "fixture ids must decode to text or the re-emission assertion below is vacuous"
+    );
     assert!(
         !streamed.starts_with(&seed_text) || seed_text.is_empty(),
         "streamed deltas re-emitted the forced prefix: {streamed:?}"

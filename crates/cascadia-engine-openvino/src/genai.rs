@@ -380,6 +380,15 @@ impl Engine for OvGenaiEngine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        // No forced-prefix path in the ov-genai pipelines: accepting a resumed task
+        // would regenerate from scratch and report success on a corrupt "resume".
+        // The embedding backend declines these pre-submit; this is the engine-side
+        // backstop for any caller that misses that guard.
+        if task.resume_ids().is_some() {
+            return Err(EngineError::Backend(
+                "resume_unsupported: ov-genai has no forced-prefix path".to_string(),
+            ));
+        }
         if self.pending.iter().any(|t| t.task_id == task.task_id) {
             return Ok(());
         }
@@ -657,6 +666,15 @@ impl Engine for OvGenaiCbEngine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        // No forced-prefix path in the ov-genai pipelines: accepting a resumed task
+        // would regenerate from scratch and report success on a corrupt "resume".
+        // The embedding backend declines these pre-submit; this is the engine-side
+        // backstop for any caller that misses that guard.
+        if task.resume_ids().is_some() {
+            return Err(EngineError::Backend(
+                "resume_unsupported: ov-genai has no forced-prefix path".to_string(),
+            ));
+        }
         if self.active.iter().any(|t| t.task_id == task.task_id) {
             return Ok(());
         }
