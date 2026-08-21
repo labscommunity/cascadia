@@ -6065,6 +6065,72 @@ mod tests {
         assert_eq!(resume_max_new(8, Some(&prefix)), 0);
     }
 
+    /// Minimal `StagedRunner` for tests that never reach a forward pass.
+    struct StubRunner;
+    impl StagedRunner for StubRunner {
+        fn arch_name(&self) -> &'static str {
+            "stub"
+        }
+        fn hidden_size(&self) -> usize {
+            8
+        }
+        fn max_seq(&self) -> usize {
+            32
+        }
+        fn eos_token_ids(&self) -> &[u32] {
+            &[]
+        }
+        fn reset(&mut self) {}
+        fn embed_token(&self, _token: u32) -> Vec<f32> {
+            vec![0.0; 8]
+        }
+        fn forward_layers(
+            &mut self,
+            hidden: Vec<f32>,
+            _pos: usize,
+            _token: Option<u32>,
+        ) -> Vec<f32> {
+            hidden
+        }
+        fn head_logits(&self, _hidden: &[f32]) -> Vec<f32> {
+            vec![0.0]
+        }
+    }
+
+    /// The staged shells (glm5 / dsv4) have no forced-prefix path: a resumed
+    /// task must be declined with the sentinel FIRST chunk, never silently
+    /// regenerated — the caller would splice the regeneration after the
+    /// client's prefix as a fake resumed tail. Un-gated (no model dir): the
+    /// decline fires before any runner or transport work.
+    #[test]
+    fn pipeline_engine_declines_seeded_task_with_sentinel_first_chunk() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut eng = PipelineEngine::new(
+            StubRunner,
+            None,
+            StageTransport {
+                upstream: None,
+                downstream: None,
+            },
+            rt.handle().clone(),
+            0,
+            2,
+            None,
+        );
+        let mut task = GenerationTask::new("t", "hi").with_max_tokens(4);
+        task.resume_token_ids = Some(vec![3]);
+        eng.pending.push_back(task);
+        let chunks = eng.begin_generation().expect("decline is terminal");
+        assert_eq!(chunks.len(), 1, "decline must be the FIRST and only chunk");
+        let reason = chunks[0].1.error.as_deref().expect("error chunk");
+        assert!(
+            reason.starts_with("resume_unsupported:"),
+            "sentinel must PREFIX the reason (callers match with starts_with): {reason}"
+        );
+    }
+
     #[test]
     fn even_moe_split_uniform() {
         assert_eq!(even_moe_split(60, 0, 2), (1, 31));
