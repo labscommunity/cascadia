@@ -74,7 +74,16 @@ jobs:
           # Persistent self-hosted runner: don't leave the token in .git config.
           persist-credentials: false
 
-      - name: Ensure bash on Windows self-hosted (dtolnay/rust-toolchain needs it)
+      # dtolnay/rust-toolchain declares `shell: bash` on every composite step,
+      # but the runner service PATH has only Git\cmd (git.exe), not Git\bin
+      # (bash.exe). usr\bin is needed too — the action's scripts use sed, which
+      # lives there. Known tradeoff: GITHUB_PATH entries land ahead of
+      # System32, so GNU link/find/sort shadow the Windows ones for later
+      # steps; harmless today because rustc locates the MSVC link.exe by
+      # absolute path, not PATH search.
+      # `shell: powershell` (5.1) here and below because pwsh is not
+      # guaranteed on the self-hosted boxes.
+      - name: Ensure bash on Windows self-hosted
         shell: powershell
         run: |
           $bash = "C:\Program Files\Git\bin\bash.exe"
@@ -99,6 +108,10 @@ jobs:
           shared-key: ai-pc-openvino
           cache-on-failure: true
 
+      # Test binaries load openvino*.dll and tbb12.dll at process start, and
+      # the runner service PATH does not include them — a miss surfaces only
+      # as an opaque STATUS_DLL_NOT_FOUND (0xC0000135) at the test step, after
+      # the full release build. Verify and fail here instead.
       - name: Add OpenVINO DLLs to PATH (Windows)
         shell: powershell
         env:
