@@ -3930,12 +3930,11 @@ mod tests {
     /// is private to this module.
     #[tokio::test]
     async fn dsv4_builder_threads_config_max_seq_into_the_runner() {
+        // No absence guard: the fixture is checked in, and the sibling tests in
+        // tests/dsv4_config_tunables.rs load it unguarded. A skip here would
+        // report green having asserted nothing.
         let dir =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dsv4_export");
-        if !dir.join("manifest.json").exists() {
-            eprintln!("dsv4 export fixture absent; skipping");
-            return;
-        }
 
         // Config value must win and reach the runner verbatim.
         let mut cfg = SparseMoEBuilderConfig::new(dir.clone(), "CPU");
