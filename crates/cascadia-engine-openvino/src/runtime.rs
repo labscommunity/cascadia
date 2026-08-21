@@ -1767,6 +1767,10 @@ impl OvRuntimeEngine {
         }
         self.build_feed_first(input_ids, position)?;
         self.runtime.infer().map_err(map_ov_err)?;
+        // §12.16 F1: this IS a real inference (the priming throwaway included) — mark the
+        // request no longer virgin here, not only inside the prime helper, so traffic that
+        // never restores never takes the prime path on a later restore.
+        self.ever_inferred = true;
         let (dtype, shape, bytes) = self.runtime.output(0).map_err(map_ov_err)?;
         Ok((bytes_to_f32(dtype, &bytes)?, shape))
     }
@@ -1791,6 +1795,8 @@ impl OvRuntimeEngine {
         }
         self.build_feed_relay(hidden, shape, position)?;
         self.runtime.infer().map_err(map_ov_err)?;
+        // §12.16 F1: see the matching note in `run_first`.
+        self.ever_inferred = true;
         let (dtype, out_shape, bytes) = self.runtime.output(0).map_err(map_ov_err)?;
         Ok((bytes_to_f32(dtype, &bytes)?, out_shape))
     }
@@ -1800,11 +1806,14 @@ impl OvRuntimeEngine {
     /// bare restore throws `Argument shapes are inconsistent` on the attention `Add`
     /// (A/B-confirmed: a byte-identical blob restores clean on an already-primed engine — one
     /// prior inference, any inference, is the discriminator). Runs a throwaway 1-token forward
-    /// through the normal path, then `reset_state` to discard the garbage KV it produced.
-    /// `reset_state`, not `recreate_request`: rebuilding the request would hand back a fresh
-    /// virgin one and undo the priming — a primed engine stays primed across `reset_state`
-    /// (confirmed by every cold-turn cycle a long-lived engine already goes through). Idempotent
-    /// and a no-op on the static-KV (NPU) path, which never calls `set_state_blob`.
+    /// through the normal path (`run_first`/`run_relay` set `ever_inferred` themselves on
+    /// success, same as real traffic would) and stops there — deliberately no `reset_state`
+    /// after it. `set_state_blob` overwrites every `VariableState` unconditionally, so the
+    /// throwaway KV is discarded by the restore regardless; an explicit clear in between is not
+    /// just redundant but risky (qwen36.rs:82-101's measured A/B: an extra pre-restore clear
+    /// caused a silent multi-step token divergence invisible to `get_state_blob`, not a crash —
+    /// removing it took that engine's cert from 5/6+7/8 to 6/6+8/8). Idempotent and a no-op on
+    /// the static-KV (NPU) path, which never calls `set_state_blob`.
     fn prime_if_never_inferred(&mut self) -> EngineResult<()> {
         if !needs_priming(self.ever_inferred, self.static_kv.is_some()) {
             return Ok(());
@@ -1815,8 +1824,6 @@ impl OvRuntimeEngine {
             let hs = self.hidden_size;
             self.run_relay(&vec![0f32; hs], [1, 1, hs], 0)?;
         }
-        self.runtime.reset_state().map_err(map_ov_err)?;
-        self.ever_inferred = true;
         Ok(())
     }
 
@@ -5427,9 +5434,10 @@ mod tests {
         assert!(res.is_err());
     }
 
-    /// §12.16 guard: prime a virgin stateful request exactly once; never re-prime an
-    /// already-primed one, and never prime the static-KV (NPU) path, which owns its KV
-    /// host-side and never calls `set_state_blob`.
+    /// §12.16 guard predicate: this is the exact call made at every one of the 9 guarded
+    /// restore sites (`if !needs_priming(...) { return Ok(()); }`) — prime a virgin stateful
+    /// request; never re-prime an already-primed one; never prime the static-KV (NPU) path,
+    /// which owns its KV host-side and never calls `set_state_blob`.
     #[test]
     fn needs_priming_only_before_first_inference_on_the_stateful_path() {
         assert!(
@@ -5447,6 +5455,88 @@ mod tests {
         assert!(
             !needs_priming(true, true),
             "static + already-primed: still no"
+        );
+    }
+
+    /// §12.16 F1/F2 regression: pins the `ever_inferred` state machine `run_first`/`run_relay`
+    /// and `prime_if_never_inferred` now share — a real inference marks the request primed
+    /// exactly like a priming inference would (F1: traffic that never restores must never take
+    /// the prime path on a later one), priming itself only fires while unset (via
+    /// `needs_priming`, the real guard), and a failed throwaway inference leaves the flag unset
+    /// so the next restore attempt retries rather than false-claiming the request is safe.
+    ///
+    /// There is no `OvRuntime` trait seam in this crate (it's a concrete FFI-backed struct), so
+    /// this cannot drive the real `infer()`/`set_state_blob` calls — it pins the control-flow
+    /// pattern `run_first`, `run_relay`, and `prime_if_never_inferred` all follow, via a local
+    /// toy that mirrors their exact `needs_priming` guard + flag-write shape. The real path is
+    /// rig-verified.
+    #[test]
+    fn ever_inferred_converges_whether_set_by_real_traffic_or_by_priming() {
+        struct Toy {
+            ever_inferred: bool,
+            prime_calls: u32,
+        }
+        impl Toy {
+            /// Mirrors `prime_if_never_inferred`: guarded by `needs_priming`, and — since F2 —
+            /// sets the flag only as a side effect of the (simulated) real inference succeeding,
+            /// never on its own.
+            fn prime(&mut self, infer_ok: bool) {
+                if !needs_priming(self.ever_inferred, false) {
+                    return;
+                }
+                self.prime_calls += 1;
+                self.real_infer(infer_ok);
+            }
+            /// Mirrors the `self.ever_inferred = true` line added directly after `infer()` in
+            /// `run_first`/`run_relay` (F1): any real inference sets it, prime or not.
+            fn real_infer(&mut self, ok: bool) {
+                if ok {
+                    self.ever_inferred = true;
+                }
+            }
+        }
+
+        // Traffic that never restores primes itself by construction — the exact population
+        // §3's A/B evidence shows needs nothing extra.
+        let mut never_restores = Toy {
+            ever_inferred: false,
+            prime_calls: 0,
+        };
+        never_restores.real_infer(true);
+        assert!(never_restores.ever_inferred);
+        assert_eq!(
+            never_restores.prime_calls, 0,
+            "real traffic must never trigger the prime path"
+        );
+
+        // An engine whose first traffic IS a restore: primes exactly once, not on every restore.
+        let mut restores_first = Toy {
+            ever_inferred: false,
+            prime_calls: 0,
+        };
+        restores_first.prime(true);
+        assert!(restores_first.ever_inferred);
+        restores_first.prime(true); // a second restore on the same engine
+        assert_eq!(
+            restores_first.prime_calls, 1,
+            "an already-primed engine must not prime again"
+        );
+
+        // A prime whose throwaway inference itself fails must not falsely mark the engine
+        // primed — the next restore has to retry, not walk into the unguarded fault.
+        let mut prime_fails = Toy {
+            ever_inferred: false,
+            prime_calls: 0,
+        };
+        prime_fails.prime(false);
+        assert!(
+            !prime_fails.ever_inferred,
+            "a failed prime must not falsely mark the engine primed"
+        );
+        prime_fails.prime(true);
+        assert_eq!(
+            prime_fails.prime_calls, 2,
+            "the next restore must retry priming after a failed attempt"
         );
     }
 

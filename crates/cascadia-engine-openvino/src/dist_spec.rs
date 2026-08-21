@@ -408,7 +408,11 @@ impl MaskedReq {
     /// §12.16: prime a never-inferred `InferRequest` with a throwaway 1-token forward before the
     /// first `set_state_blob` — a virgin request has no materialized per-layer state shapes and
     /// throws `Argument shapes are inconsistent` on the first real `infer()` after a bare
-    /// restore. `reset_state` afterward discards the garbage KV the throwaway feed produced;
+    /// restore. `feed` sets `ever_inferred` itself on a successful infer (F1: same as real
+    /// traffic), so this stops there — deliberately no `reset_state` after it. `set_state_blob`
+    /// overwrites every `VariableState` unconditionally, so the throwaway KV is discarded by the
+    /// restore regardless; see `OvRuntimeEngine::prime_if_never_inferred` for why an explicit
+    /// clear in between is not just redundant but risky (qwen36.rs:82-101's measured A/B).
     /// `feed`'s host-side cursors (`cache_len`/`logical_pos`) are left as the primer set them —
     /// the caller always calls `kv_set_pos` right after a successful restore, which overwrites
     /// them, and resets them on failure.
@@ -417,8 +421,6 @@ impl MaskedReq {
             return Ok(());
         }
         self.feed(&[0i64])?;
-        self.runtime.reset_state().map_err(map_ov_err)?;
-        self.ever_inferred = true;
         Ok(())
     }
     pub(crate) fn kv_restore(&mut self, b: &[u8]) -> bool {
@@ -554,6 +556,12 @@ impl MaskedReq {
         let setup_us = _ts_setup.elapsed().as_micros();
         let _ts_infer = std::time::Instant::now();
         self.runtime.infer().map_err(map_ov_err)?;
+        // §12.16 F1: a real inference — the priming throwaway included, since it also flows
+        // through `feed` — marks the request no longer virgin. See `runtime.rs`'s matching note.
+        #[cfg(feature = "kv_coord")]
+        {
+            self.ever_inferred = true;
+        }
         let infer_us = _ts_infer.elapsed().as_micros();
         let _ts_out = std::time::Instant::now();
         let (dtype, shape, bytes) = self.runtime.output(0).map_err(map_ov_err)?;
@@ -652,8 +660,9 @@ impl DistributedMaskedReq {
     /// §12.16: prime stage0's never-inferred `InferRequest` with a throwaway local 1-token
     /// forward before the first `set_state_blob`. LOCAL ONLY — no downstream network round-trip;
     /// each worker rank primes itself independently at its own RESTORE handler
-    /// (`OvDistSpecWorkerEngine::prime_if_never_inferred`). See `MaskedReq::prime_if_never_inferred`
-    /// for the full rationale.
+    /// (`OvDistSpecWorkerEngine::prime_if_never_inferred`). Deliberately no `reset_state` after
+    /// the throwaway infer — see `MaskedReq::prime_if_never_inferred` for the full rationale on
+    /// both counts.
     fn prime_stage0_if_never_inferred(&mut self) -> Result<(), EngineError> {
         if self.ever_inferred {
             return Ok(());
@@ -691,7 +700,6 @@ impl DistributedMaskedReq {
             .set_input(&beam_name, ShimDType::I32, &[1], &0i32.to_le_bytes())
             .map_err(map_ov_err)?;
         self.stage0.infer().map_err(map_ov_err)?;
-        self.stage0.reset_state().map_err(map_ov_err)?;
         self.ever_inferred = true;
         Ok(())
     }
@@ -889,6 +897,11 @@ impl DistributedMaskedReq {
         let setup_us = _ts.elapsed().as_micros();
         let _ts = std::time::Instant::now();
         self.stage0.infer().map_err(map_ov_err)?;
+        // §12.16 F1: real inference marks the request no longer virgin — see `runtime.rs`.
+        #[cfg(feature = "kv_coord")]
+        {
+            self.ever_inferred = true;
+        }
         let infer_us = _ts.elapsed().as_micros();
         let _ts = std::time::Instant::now();
         let (dtype, hidden_shape, hidden_bytes) = self.stage0.output(0).map_err(map_ov_err)?;
@@ -1025,6 +1038,11 @@ impl DistributedMaskedReq {
         let setup_us = _ts.elapsed().as_micros();
         let _ts = std::time::Instant::now();
         self.stage0.infer().map_err(map_ov_err)?;
+        // §12.16 F1: real inference marks the request no longer virgin — see `runtime.rs`.
+        #[cfg(feature = "kv_coord")]
+        {
+            self.ever_inferred = true;
+        }
         let infer_us = _ts.elapsed().as_micros();
         let _ts = std::time::Instant::now();
         let (dtype, hidden_shape, hidden_bytes) = self.stage0.output(0).map_err(map_ov_err)?;
@@ -2074,6 +2092,14 @@ pub struct OvDistSpecWorkerEngine {
     /// `prime_if_never_inferred`.
     #[cfg(feature = "kv_coord")]
     ever_inferred: bool,
+    /// §12.16 F4: `(hidden_size, dtype)` observed on the most recent real FORWARD frame. A
+    /// virgin worker's introspection of its own dynamic-shape hidden_states port can fail before
+    /// any real traffic has told it a concrete shape (`worker_hidden_size` returns `None`); this
+    /// is the fallback for exactly that rank>0 first-restore case. Never populated on a worker
+    /// that has never forwarded, which is the one case it can't help — see the priming method's
+    /// doc for why that's still worth having.
+    #[cfg(feature = "kv_coord")]
+    hidden_hint: Option<(usize, ShimDType)>,
 }
 
 impl Engine for OvDistSpecWorkerEngine {
@@ -2394,6 +2420,14 @@ impl OvDistSpecWorkerEngine {
                         )))
                     }
                 };
+                // §12.16 F4/F5: remember this real frame's hidden dim + dtype for the priming
+                // forward's fallback — a virgin worker's own introspection of a dynamic-shape
+                // port can fail (see `worker_hidden_size`), but every real FORWARD tells us both
+                // exactly.
+                #[cfg(feature = "kv_coord")]
+                {
+                    self.hidden_hint = Some((hidden_shape[2], shim_dtype));
+                }
                 let _ts_setup = std::time::Instant::now();
                 self.runtime
                     .set_input(&in_hs, shim_dtype, &hidden_shape, &hidden_bytes)
@@ -2420,6 +2454,11 @@ impl OvDistSpecWorkerEngine {
                 let setup_us = _ts_setup.elapsed().as_micros();
                 let _ts_infer = std::time::Instant::now();
                 self.runtime.infer().map_err(map_ov_err)?;
+                // §12.16 F1: real inference marks the request no longer virgin — see `runtime.rs`.
+                #[cfg(feature = "kv_coord")]
+                {
+                    self.ever_inferred = true;
+                }
                 let infer_us = _ts_infer.elapsed().as_micros();
                 let _ts_out = std::time::Instant::now();
                 let (out_dtype, out_shape, out_bytes) =
@@ -2720,6 +2759,8 @@ impl Builder for OvDistSpecWorkerBuilder {
             kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
             #[cfg(feature = "kv_coord")]
             ever_inferred: false,
+            #[cfg(feature = "kv_coord")]
+            hidden_hint: None,
         }))
     }
 }
@@ -2937,22 +2978,35 @@ impl OvDistSpecWorkerEngine {
     fn kv_fingerprint(&self) -> u64 {
         crate::kv_coordination::fnv1a64(self.kv_model_id.as_bytes())
     }
-    /// Resolve the static hidden dim of a v5 input port by name, for the priming forward below.
-    /// The pre-allocated tensor reports 0 for a dynamic dim (batch/seq) but the model's true
-    /// static hidden-size dim regardless — see the shim's `cascadia_runtime_input_shape` doc.
-    fn worker_hidden_size(&self, port_name: &str) -> Option<usize> {
-        (0..self.runtime.input_count())
-            .find(|&idx| self.runtime.input_name(idx).ok().as_deref() == Some(port_name))
-            .and_then(|idx| self.runtime.input_shape(idx).ok())
+    /// Resolve the static hidden dim + dtype of a v5 input port by name, for the priming forward
+    /// below. The pre-allocated tensor reports 0 for a dynamic dim (batch/seq) but the model's
+    /// true static hidden-size dim regardless — see the shim's `cascadia_runtime_input_shape`
+    /// doc. Dtype comes from the same port's declared element type (`input_dtype`), matching
+    /// what the real FORWARD handler feeds (F5) rather than assuming F16.
+    fn worker_hidden_shape(&self, port_name: &str) -> Option<(usize, ShimDType)> {
+        let idx = (0..self.runtime.input_count())
+            .find(|&idx| self.runtime.input_name(idx).ok().as_deref() == Some(port_name))?;
+        let hidden = self
+            .runtime
+            .input_shape(idx)
+            .ok()
             .and_then(|shape| shape.last().copied())
-            .filter(|&d| d > 0)
+            .filter(|&d| d > 0)?;
+        let dtype = self.runtime.input_dtype(idx).ok().unwrap_or(ShimDType::F16);
+        Some((hidden, dtype))
     }
     /// §12.16: prime a never-inferred `InferRequest` with a throwaway 1-token forward before any
     /// `set_state_blob` — a virgin request has no materialized per-layer state shapes and throws
     /// `Argument shapes are inconsistent` on the first real `infer()` after a bare restore. See
-    /// `MaskedReq::prime_if_never_inferred` for the full rationale. Best-effort: if the hidden dim
-    /// can't be resolved, skips rather than risking a garbage-shaped forward — the caller's
-    /// `set_state_blob` then takes its chances exactly as it did before this fix.
+    /// `MaskedReq::prime_if_never_inferred` for the full rationale, including why there is
+    /// deliberately no `reset_state` after the throwaway infer.
+    ///
+    /// Hidden dim + dtype: prefer live introspection (`worker_hidden_shape`); on a dynamic-shape
+    /// port that can legitimately fail before any real frame has run (F4), so fall back to
+    /// `hidden_hint`, cached from the most recent real FORWARD (F5: same dtype selection the
+    /// FORWARD handler itself uses). Best-effort: if neither resolves, skip rather than risk a
+    /// garbage-shaped forward — the caller's `set_state_blob` then takes its chances exactly as
+    /// it did before this fix.
     fn prime_if_never_inferred(&mut self) -> Result<(), EngineError> {
         if self.ever_inferred {
             return Ok(());
@@ -2977,15 +3031,21 @@ impl OvDistSpecWorkerEngine {
             .get("beam_idx")
             .cloned()
             .ok_or_else(|| EngineError::Backend("missing beam_idx input".into()))?;
-        let hidden = self.worker_hidden_size(&in_hs).ok_or_else(|| {
-            EngineError::Backend("could not resolve hidden_states dim for priming".into())
-        })?;
+        let (hidden, dtype) = self
+            .worker_hidden_shape(&in_hs)
+            .or(self.hidden_hint)
+            .ok_or_else(|| {
+                EngineError::Backend("could not resolve hidden_states dim for priming".into())
+            })?;
         self.runtime
             .set_input(
                 &in_hs,
-                ShimDType::F16,
+                dtype,
                 &[1, 1, hidden],
-                &f32_to_f16_bytes(&vec![0f32; hidden]),
+                &match dtype {
+                    ShimDType::F16 => f32_to_f16_bytes(&vec![0f32; hidden]),
+                    _ => vec![0u8; hidden * 4],
+                },
             )
             .map_err(map_ov_err)?;
         self.runtime
@@ -2998,7 +3058,6 @@ impl OvDistSpecWorkerEngine {
             .set_input(&in_beam, ShimDType::I32, &[1], &0i32.to_le_bytes())
             .map_err(map_ov_err)?;
         self.runtime.infer().map_err(map_ov_err)?;
-        self.runtime.reset_state().map_err(map_ov_err)?;
         self.ever_inferred = true;
         Ok(())
     }
@@ -3009,13 +3068,20 @@ impl OvDistSpecWorkerEngine {
     ///
     /// Position 0 because a worker holds no KV cursor of its own — the driver owns the spec-decode
     /// positions — so the depth guard has nothing to compare against.
+    ///
+    /// §12.16 F3: prime happens *inside* the `apply` closure, after `drain_handoff` has already
+    /// found a slot to restore — not unconditionally up front. In chain mode nothing is ever
+    /// parked here, so an unconditional prime would wipe this rank's state on every drain that
+    /// finds nothing, right before falling through to the carried/capture branches that never
+    /// asked for that wipe. `mailbox.take()` has already released its lock by the time `apply`
+    /// runs, so nothing is held across the throwaway infer.
     fn drain_kv_handoff(&mut self, expected_epoch: u64) -> bool {
         let mailbox = std::sync::Arc::clone(&self.kv_handoff);
         let fp = self.kv_fingerprint();
-        if let Err(e) = self.prime_if_never_inferred() {
-            warn!(error = %e, "ov-dist-spec worker: priming before handoff drain failed");
-        }
         crate::kv_coordination::drain_handoff(&mailbox, fp, 0, expected_epoch, |blob| {
+            if let Err(e) = self.prime_if_never_inferred() {
+                warn!(error = %e, "ov-dist-spec worker: priming before handoff apply failed");
+            }
             self.runtime.set_state_blob(blob).is_ok()
         })
     }
