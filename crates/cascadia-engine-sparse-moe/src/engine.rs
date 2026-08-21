@@ -1591,7 +1591,7 @@ impl SparseMoEEngine {
             // step regardless of `max_tokens`, so we must not call them at
             // all — the only way to guarantee zero new tokens here.
             let elapsed = started.elapsed().as_secs_f64();
-            info!(task = %task.task_id, elapsed_s = elapsed, "task done (single-stage, resume budget exhausted)");
+            info!(task = %task.task_id, elapsed_s = elapsed, event = "engine_task_done", "task done (single-stage, resume budget exhausted)");
             let mut chunk = Chunk::final_marker(task.task_id.clone(), "");
             chunk.n_tokens = Some(0);
             chunk.finish_reason = Some(FinishReason::Length);
@@ -1719,6 +1719,7 @@ impl SparseMoEEngine {
             tokens = n_tokens,
             elapsed_s = elapsed,
             tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
+            event = "engine_task_done",
             "task done (single-stage)"
         );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
@@ -1832,7 +1833,7 @@ impl SparseMoEEngine {
             // step regardless of max_new, so we must not drive generation at
             // all — the only way to guarantee zero new tokens here.
             let elapsed = started.elapsed().as_secs_f64();
-            info!(task = %task.task_id, elapsed_s = elapsed, "task done (rank-0 driver, resume budget exhausted)");
+            info!(task = %task.task_id, elapsed_s = elapsed, event = "engine_task_done", "task done (rank-0 driver, resume budget exhausted)");
             let mut chunk = Chunk::final_marker(task.task_id.clone(), "");
             chunk.n_tokens = Some(0);
             chunk.finish_reason = Some(FinishReason::Length);
@@ -1991,6 +1992,7 @@ impl SparseMoEEngine {
                 tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
                 rank = self.rank,
                 total = self.total,
+                event = "engine_task_done",
                 "task done (rank-0 driver)"
             );
             let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
@@ -2362,7 +2364,7 @@ impl SparseMoEEngine {
         let elapsed = a.started.elapsed().as_secs_f64();
         info!(task = %a.id, tokens = n_new, elapsed_s = elapsed,
             tok_s = if elapsed > 0.0 { f64::from(n_new) / elapsed } else { 0.0 },
-            rank = self.rank, total = self.total, "task done (rank-0 driver, streamed)");
+            rank = self.rank, total = self.total, event = "engine_task_done", "task done (rank-0 driver, streamed)");
         let mut chunk = Chunk::final_marker(a.id.clone(), "");
         chunk.n_tokens = Some(0);
         chunk.finish_reason = Some(finish_reason_for(n_new as usize, a.max_new));
@@ -3792,6 +3794,7 @@ impl OvMoeEngine {
             tokens = n_tokens,
             elapsed_s = elapsed,
             tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
+            event = "engine_task_done",
             "task done (MiniMax-M2 single-stage)"
         );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
@@ -4283,6 +4286,7 @@ impl OvMoeEngine {
             total = self.total,
             elapsed_s = elapsed,
             tok_s = if elapsed > 0.0 { f64::from(n_new) / elapsed } else { 0.0 },
+            event = "engine_task_done",
             "task done (MiniMax-M2 pipeline-parallel, streamed)"
         );
         let mut chunk = Chunk::final_marker(a.id.clone(), "");
@@ -5211,6 +5215,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             tokens = n_tokens,
             elapsed_s = elapsed,
             tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
+            event = "engine_task_done",
             "task done (dsv4 single-stage)"
         );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
@@ -5655,6 +5660,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             total = self.total,
             elapsed_s = elapsed,
             tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
+            event = "engine_task_done",
             "task done (dsv4 pipeline-parallel)"
         );
         // Cache the full [prompt + generated] KV (positions [0, pos)) on every
