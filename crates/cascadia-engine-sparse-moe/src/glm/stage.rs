@@ -30,6 +30,12 @@ pub const GLM5_DEFAULT_MAX_SEQ: usize = 4096;
 /// always-active shared expert). ~4x top_k covers the common routes.
 const PREFETCH_EXPERTS: usize = 32;
 
+/// Minimum batch rows before Gated prefill layer streaming engages. Below
+/// this, the batch's routed union is a small fraction of the next layer's
+/// expert set and whole-layer warming would over-read (see
+/// `forward_layers_batch`). 64 rows × top-8 draws ≈ full-set coverage.
+const PREFILL_STREAM_MIN_ROWS: usize = 64;
+
 /// The layer range `[lo, hi)` that rank `rank` of `total` owns.
 ///
 /// Single source of truth for the split: [`GlmRunner::load_staged`] derives its
@@ -906,12 +912,24 @@ impl StagedRunner for GlmRunner {
         // computes, and layer 0's before the loop so its warm overlaps layer
         // 0's per-row attention. Enqueue-only + best-effort — output is
         // identical whether or not a warm lands in time.
-        if let (Some(mode), Some(lk)) = (self.prefill_stream, self.lookahead.as_ref()) {
+        //
+        // Whole-layer warming assumes the batch's routed union covers most of
+        // the next layer (true for wide batches: 64 rows × top-8 draws ≈ the
+        // full expert set). A narrow batch's union is far smaller, so the warm
+        // would over-read cold bins the prefill never touches — measured 1552
+        // warmed vs a few-hundred-bin union on a 16-row prompt — hence Gated
+        // streaming stands down below the row threshold. `All` stays
+        // unconditional: it is the explicit test/bench lever.
+        let stream = match self.prefill_stream {
+            Some(PrefillStream::Gated) if rows < PREFILL_STREAM_MIN_ROWS => None,
+            m => m,
+        };
+        if let (Some(mode), Some(lk)) = (stream, self.lookahead.as_ref()) {
             lk.set_cur_layer(0);
             Self::stream_enqueue_layer(lk, &self.layers, 0, mode);
         }
         for i in 0..n {
-            if let (Some(mode), Some(lk)) = (self.prefill_stream, self.lookahead.as_ref()) {
+            if let (Some(mode), Some(lk)) = (stream, self.lookahead.as_ref()) {
                 lk.set_cur_layer(i);
                 if i + 1 < n {
                     Self::stream_enqueue_layer(lk, &self.layers, i + 1, mode);
