@@ -127,6 +127,10 @@ impl EngineError {
     /// dead-peer case), and a mid-frame stall ("recv_exact timed out"). A
     /// connected-but-misbehaving peer (bad frame kind, stray response) is
     /// NOT fatal — that link can still deliver a good frame next.
+    /// Exception, deliberate: a framing with no resync point overrides that at
+    /// its own call site — dist-spec's FORWARD wire wraps a misaligned failure
+    /// in `desync_fatal` (`cascadia-engine-openvino/src/dist_spec.rs`), because
+    /// a desynced `[kind][body]` stream cannot deliver a good frame next.
     ///
     /// [`EngineError::BatchAborted`] is answered structurally, ahead of any
     /// string inspection: an aborted batch leaves a healthy link, so the

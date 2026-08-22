@@ -224,6 +224,94 @@ fn desync_fatal(e: EngineError) -> EngineError {
     ))
 }
 
+/// Last rank: send LOGITS_RESPONSE back to upstream. The window closes BEFORE the first byte: a
+/// send that fails part-way leaves a half-written response, and appending a STEP_ERROR behind it
+/// is exactly the desync the window guards against.
+///
+/// Free-standing rather than a method so the transition is reachable in a test — constructing an
+/// `OvDistSpecWorkerEngine` needs a real OpenVINO runtime.
+fn send_logits_response(
+    handle: &tokio::runtime::Handle,
+    upstream: Arc<tokio::sync::Mutex<ActivationServer>>,
+    out_shape_wire: [u32; MAX_RANK],
+    out_f16_bytes: Vec<u8>,
+    window: &mut FrameWindow,
+) -> Result<(), EngineError> {
+    *window = FrameWindow::Desynced;
+    run_async(handle, async move {
+        let mut g = upstream.lock().await;
+        g.send_raw(&(FrameKind::LogitsResponse as u32).to_be_bytes())
+            .await?;
+        let t = WireTensor::new(WireDType::F16, out_shape_wire, out_f16_bytes);
+        g.send(&t).await
+    })
+    .map_err(|e| EngineError::Backend(e.to_string()))?;
+    Ok(())
+}
+
+/// Middle rank: forward downstream, then relay LOGITS_RESPONSE upstream. The window closes for the
+/// whole block: a half-written FORWARD or a half-read downstream response misaligns the downstream
+/// link, which wedges the next turn one hop down just as surely. It reopens only for the one case
+/// where both wires are provably back on a boundary — a downstream STEP_ERROR whose body drained
+/// cleanly.
+///
+/// Free-standing for the same reason as [`send_logits_response`].
+#[allow(clippy::too_many_arguments)]
+fn relay_forward_downstream(
+    handle: &tokio::runtime::Handle,
+    upstream: Arc<tokio::sync::Mutex<ActivationServer>>,
+    downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
+    logical_pos_start: u32,
+    attn: Vec<i64>,
+    out_shape_wire: [u32; MAX_RANK],
+    out_f16_bytes: Vec<u8>,
+    window: &mut FrameWindow,
+) -> Result<(), EngineError> {
+    *window = FrameWindow::Desynced;
+    let downstream = downstream.ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+    let relay_window = &mut *window;
+    run_async(handle, async move {
+        // Send FORWARD downstream
+        let attn_t = WireTensor::new(
+            WireDType::I64,
+            [1, 1, attn.len() as u32],
+            i64_to_bytes(&attn),
+        );
+        let mut header = [0u8; 8];
+        header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
+        header[4..8].copy_from_slice(&logical_pos_start.to_be_bytes());
+        {
+            let mut dg = downstream.lock().await;
+            dg.send_raw(&header).await?;
+            dg.send(&attn_t).await?;
+            let t = WireTensor::new(WireDType::F16, out_shape_wire, out_f16_bytes.clone());
+            dg.send(&t).await?;
+            let kind_bytes = dg.recv_raw(4).await?;
+            let kv =
+                u32::from_be_bytes([kind_bytes[0], kind_bytes[1], kind_bytes[2], kind_bytes[3]]);
+            if kv == FrameKind::StepError as u32 {
+                // Downstream rank's step threw. Its body drains here (a `?` failure leaves the
+                // window shut), and nothing has gone upstream yet — so both wires are back on a
+                // boundary and the caller may relay a STEP_ERROR of its own.
+                let msg = recv_step_error_msg(&mut dg).await?;
+                *relay_window = FrameWindow::Clean;
+                return Err(step_failed_transport_err(&msg));
+            }
+            if kv != FrameKind::LogitsResponse as u32 {
+                return Err(cascadia_transport::TransportError::SocketClosed);
+            }
+            let (logits_t, _) = dg.recv().await?;
+            let mut g = upstream.lock().await;
+            g.send_raw(&(FrameKind::LogitsResponse as u32).to_be_bytes())
+                .await?;
+            g.send(&logits_t).await?;
+        }
+        Ok::<_, cascadia_transport::TransportError>(())
+    })
+    .map_err(|e| EngineError::Backend(e.to_string()))?;
+    Ok(())
+}
+
 fn argmax(slice: &[f32]) -> usize {
     // NaN propagates: `*v > best_v` is false for any NaN, so an all-NaN
     // logits row would silently return index 0 (often EOS-adjacent or
@@ -2523,8 +2611,9 @@ impl OvDistSpecWorkerEngine {
     /// reported upstream as STEP_ERROR instead of dying locally while the head waits.
     ///
     /// `window` records where a failure would leave the wires; the caller may only answer with a
-    /// STEP_ERROR while it reads [`FrameWindow::Clean`]. Every assignment below marks a point
-    /// where the wire state actually changes.
+    /// STEP_ERROR while it reads [`FrameWindow::Clean`]. It opens here once the body is drained;
+    /// the response paths ([`send_logits_response`], [`relay_forward_downstream`]) shut it again
+    /// before their first byte.
     fn handle_forward_frame(
         &mut self,
         upstream: Arc<tokio::sync::Mutex<ActivationServer>>,
@@ -2674,20 +2763,14 @@ impl OvDistSpecWorkerEngine {
         }
 
         if self.is_last {
-            // Send LOGITS_RESPONSE back to upstream. The window closes BEFORE the first byte: a
-            // send that fails part-way leaves a half-written response, and appending a STEP_ERROR
-            // behind it is exactly the desync this guard exists for.
-            *window = FrameWindow::Desynced;
-            let upstream3 = upstream.clone();
             let _ts_send = std::time::Instant::now();
-            run_async(&self.runtime_handle, async move {
-                let mut g = upstream3.lock().await;
-                g.send_raw(&(FrameKind::LogitsResponse as u32).to_be_bytes())
-                    .await?;
-                let t = WireTensor::new(WireDType::F16, out_shape_wire, out_f16_bytes);
-                g.send(&t).await
-            })
-            .map_err(|e| EngineError::Backend(e.to_string()))?;
+            send_logits_response(
+                &self.runtime_handle,
+                upstream,
+                out_shape_wire,
+                out_f16_bytes,
+                window,
+            )?;
             let send_us = _ts_send.elapsed().as_micros();
             tracing::debug!(
                 recv_kind_us,
@@ -2696,59 +2779,16 @@ impl OvDistSpecWorkerEngine {
                 "worker.frame wire timing (last stage)"
             );
         } else {
-            // Forward downstream, then relay LOGITS_RESPONSE upstream. The window closes for the
-            // whole block: a half-written FORWARD or a half-read downstream response misaligns the
-            // downstream link, which wedges the next turn one hop down just as surely. It reopens
-            // only for the one case where both wires are provably back on a boundary — a
-            // downstream STEP_ERROR whose body drained cleanly.
-            *window = FrameWindow::Desynced;
-            let downstream =
-                downstream.ok_or_else(|| EngineError::Backend("no downstream".into()))?;
-            let upstream3 = upstream.clone();
-            let relay_window = &mut *window;
-            run_async(&self.runtime_handle, async move {
-                // Send FORWARD downstream
-                let attn_t = WireTensor::new(
-                    WireDType::I64,
-                    [1, 1, attn.len() as u32],
-                    i64_to_bytes(&attn),
-                );
-                let mut header = [0u8; 8];
-                header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
-                header[4..8].copy_from_slice(&logical_pos_start.to_be_bytes());
-                {
-                    let mut dg = downstream.lock().await;
-                    dg.send_raw(&header).await?;
-                    dg.send(&attn_t).await?;
-                    let t = WireTensor::new(WireDType::F16, out_shape_wire, out_f16_bytes.clone());
-                    dg.send(&t).await?;
-                    let kind_bytes = dg.recv_raw(4).await?;
-                    let kv = u32::from_be_bytes([
-                        kind_bytes[0],
-                        kind_bytes[1],
-                        kind_bytes[2],
-                        kind_bytes[3],
-                    ]);
-                    if kv == FrameKind::StepError as u32 {
-                        // Downstream rank's step threw. Its body drains here (a `?` failure leaves
-                        // the window shut), and nothing has gone upstream yet — so both wires are
-                        // back on a boundary and the caller may relay a STEP_ERROR of its own.
-                        let msg = recv_step_error_msg(&mut dg).await?;
-                        *relay_window = FrameWindow::Clean;
-                        return Err(step_failed_transport_err(&msg));
-                    }
-                    if kv != FrameKind::LogitsResponse as u32 {
-                        return Err(cascadia_transport::TransportError::SocketClosed);
-                    }
-                    let (logits_t, _) = dg.recv().await?;
-                    let mut g = upstream3.lock().await;
-                    g.send_raw(&(FrameKind::LogitsResponse as u32).to_be_bytes())
-                        .await?;
-                    g.send(&logits_t).await?;
-                }
-                Ok::<_, cascadia_transport::TransportError>(())
-            })
-            .map_err(|e| EngineError::Backend(e.to_string()))?;
+            relay_forward_downstream(
+                &self.runtime_handle,
+                upstream,
+                downstream,
+                logical_pos_start,
+                attn,
+                out_shape_wire,
+                out_f16_bytes,
+                window,
+            )?;
         }
         Ok(())
     }
@@ -3805,6 +3845,142 @@ mod tests {
         );
         // An unknown kind is desync by definition — this framing has no resync point.
         assert!(desync_fatal(EngineError::Backend("bad kind 7".into())).is_connection_fatal());
+    }
+
+    /// Connected (server, client) pair on loopback — the worker owns the server end of its
+    /// upstream link and the client end of its downstream link.
+    fn connected_pair(rt: &tokio::runtime::Runtime) -> (ActivationServer, ActivationClient) {
+        rt.block_on(async {
+            let mut server = ActivationServer::new("127.0.0.1", 0);
+            server.start().await.unwrap();
+            let port = server.port();
+            let accept = tokio::spawn(async move {
+                server.accept().await.unwrap();
+                server
+            });
+            let mut client = ActivationClient::new("127.0.0.1", port);
+            client.connect().await.unwrap();
+            (accept.await.unwrap(), client)
+        })
+    }
+
+    fn test_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// M9: pin the window transition the last rank makes. Losing it lets a later failure answer
+    /// with a STEP_ERROR appended behind an already-written LOGITS_RESPONSE — the desync that
+    /// wedges the head's NEXT turn, which is the whole reason the window exists.
+    #[test]
+    fn writing_the_response_shuts_the_step_error_window() {
+        let rt = test_rt();
+        let (upstream, mut head) = connected_pair(&rt);
+        let upstream = Arc::new(tokio::sync::Mutex::new(upstream));
+
+        let mut window = FrameWindow::Clean;
+        send_logits_response(rt.handle(), upstream, [1, 1, 1], vec![0u8; 2], &mut window).unwrap();
+        assert_eq!(
+            window,
+            FrameWindow::Desynced,
+            "a written response must shut the STEP_ERROR window"
+        );
+        // Bytes really reached the wire, so the assertion above is not vacuous.
+        rt.block_on(async {
+            let kb = head.recv_raw(4).await.unwrap();
+            assert_eq!(
+                u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]),
+                FrameKind::LogitsResponse as u32
+            );
+        });
+    }
+
+    /// M9: pin both middle-rank transitions — the block-wide shut, and the single reopen for a
+    /// downstream STEP_ERROR whose body drained cleanly.
+    #[test]
+    fn relay_shuts_the_window_and_reopens_only_for_a_drained_step_error() {
+        let rt = test_rt();
+        // Never accepted: no relay path below reaches upstream before it returns.
+        let upstream = Arc::new(tokio::sync::Mutex::new(ActivationServer::new(
+            "127.0.0.1",
+            0,
+        )));
+
+        // Config fault, zero bytes on the wire — still shut, because the window is a property of
+        // the block, not of how far into it the failure got.
+        let mut window = FrameWindow::Clean;
+        let e = relay_forward_downstream(
+            rt.handle(),
+            upstream.clone(),
+            None,
+            0,
+            vec![0i64],
+            [1, 1, 1],
+            vec![0u8; 2],
+            &mut window,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("no downstream"), "{e}");
+        assert_eq!(
+            window,
+            FrameWindow::Desynced,
+            "entering the relay block must shut the window"
+        );
+
+        // Downstream answered STEP_ERROR and its body drained: both wires are back on a boundary,
+        // so this rank may relay a STEP_ERROR of its own.
+        for (reply_kind, want, why) in [
+            (
+                FrameKind::StepError,
+                FrameWindow::Clean,
+                "a drained downstream STEP_ERROR reopens the window",
+            ),
+            (
+                FrameKind::Reset,
+                FrameWindow::Desynced,
+                "an unexpected downstream kind leaves the window shut",
+            ),
+        ] {
+            let (next_rank, downstream) = connected_pair(&rt);
+            let peer = rt.spawn(async move {
+                let mut s = next_rank;
+                s.recv_raw(8).await.unwrap(); // FORWARD header
+                s.recv().await.unwrap(); // attention_mask
+                s.recv().await.unwrap(); // hidden_states
+                if reply_kind == FrameKind::StepError {
+                    s.send_raw(&encode_step_error_frame("tail infer blew up"))
+                        .await
+                        .unwrap();
+                } else {
+                    s.send_raw(&(reply_kind as u32).to_be_bytes())
+                        .await
+                        .unwrap();
+                }
+            });
+
+            let mut window = FrameWindow::Clean;
+            let e = relay_forward_downstream(
+                rt.handle(),
+                upstream.clone(),
+                Some(Arc::new(tokio::sync::Mutex::new(downstream))),
+                0,
+                vec![0i64],
+                [1, 1, 1],
+                vec![0u8; 2],
+                &mut window,
+            )
+            .unwrap_err();
+            assert_eq!(window, want, "{why}: {e}");
+            if reply_kind == FrameKind::StepError {
+                assert!(
+                    e.to_string().contains("tail infer blew up"),
+                    "the downstream message must ride the relayed error: {e}"
+                );
+            }
+            rt.block_on(peer).unwrap();
+        }
     }
 
     #[test]
