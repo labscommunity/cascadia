@@ -79,16 +79,18 @@ pub enum FrameKind {
     /// the ONLY thing that tells the two bodies apart.
     #[cfg(feature = "kv_coord")]
     CaptureV2 = 9,
-    /// Worker → upstream, sent IN PLACE of `LogitsResponse` when FORWARD processing fails after
-    /// the frame body has been consumed (set_input/infer/output). Body:
+    /// Worker → upstream, sent IN PLACE of `LogitsResponse` when FORWARD processing fails inside a
+    /// provably-clean frame window — body fully consumed, no response bytes written yet, every
+    /// link this rank owns still frame-aligned (see [`FrameWindow`]). Body:
     /// `[len: u32 BE][utf8 message]`, message capped at `MAX_STEP_ERROR_MSG_BYTES`. Without it a
     /// tail whose step throws dies silently and the head waits out the full first-token timeout
     /// while holding its serve slot.
     ///
     /// Compat (`OPCODE_TURN_BEGIN` precedent, lockstep fleet): an OLD head reads the kind, sees
-    /// non-LOGITS_RESPONSE, and errors the turn immediately — same fail-fast outcome, message
-    /// lost, link rebuilt by the relay loop. A NEW head consumes the body and fails the turn with
-    /// the worker's message while the link stays aligned for the next turn.
+    /// non-LOGITS_RESPONSE, and returns `TransportError::SocketClosed`, whose text
+    /// `EngineError::is_connection_fatal` matches — so it tears the LINK down (relay exit,
+    /// supervisor rebuild), not just the turn. Fail-fast is preserved; link reuse is not. A NEW
+    /// head consumes the body and fails only the turn, link still aligned.
     StepError = 10,
 }
 
@@ -163,31 +165,63 @@ fn encode_step_error_frame(msg: &str) -> Vec<u8> {
     out
 }
 
-/// Drain a STEP_ERROR body off `g` (the kind has already been read) and shape it into the error
-/// the recv sites return. The message deliberately avoids the connection-fatal substrings — the
-/// link is healthy, only the turn failed.
-async fn recv_step_error(g: &mut ActivationClient) -> cascadia_transport::TransportError {
-    let msg = async {
-        let lb = g.recv_raw(4).await?;
-        let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
-        if n > MAX_STEP_ERROR_MSG_BYTES {
-            // Desynced stream, not a well-formed error frame.
-            return Err(cascadia_transport::TransportError::SocketClosed);
-        }
-        let body = if n == 0 {
-            Vec::new()
-        } else {
-            g.recv_raw(n).await?
-        };
-        Ok::<_, cascadia_transport::TransportError>(String::from_utf8_lossy(&body).into_owned())
+/// Drain a STEP_ERROR body off `g` (the kind has already been read). `Ok` leaves the stream on a
+/// frame boundary; `Err` means it is desynced and the caller must not write another frame.
+async fn recv_step_error_msg(
+    g: &mut ActivationClient,
+) -> Result<String, cascadia_transport::TransportError> {
+    let lb = g.recv_raw(4).await?;
+    let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
+    if n > MAX_STEP_ERROR_MSG_BYTES {
+        // Desynced stream, not a well-formed error frame.
+        return Err(cascadia_transport::TransportError::SocketClosed);
     }
-    .await;
-    match msg {
-        Ok(m) => cascadia_transport::TransportError::Io(std::io::Error::other(format!(
-            "dist-spec worker step failed: {m}"
-        ))),
+    let body = if n == 0 {
+        Vec::new()
+    } else {
+        g.recv_raw(n).await?
+    };
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Shape a drained STEP_ERROR into the error the head's recv sites return. The message
+/// deliberately avoids the connection-fatal substrings — the link is healthy, only the turn failed.
+async fn recv_step_error(g: &mut ActivationClient) -> cascadia_transport::TransportError {
+    match recv_step_error_msg(g).await {
+        Ok(m) => step_failed_transport_err(&m),
         Err(e) => e,
     }
+}
+
+fn step_failed_transport_err(msg: &str) -> cascadia_transport::TransportError {
+    cascadia_transport::TransportError::Io(std::io::Error::other(format!(
+        "dist-spec worker step failed: {msg}"
+    )))
+}
+
+/// Where a FORWARD failure left this rank's wires. A STEP_ERROR is a frame like any other: it may
+/// only be written while the upstream stream sits exactly on a frame boundary AND every link this
+/// rank owns is still aligned. Written anywhere else it lands behind unread body bytes or a
+/// half-written response, and the head reads the *next* turn misaligned — which is the 600s wedge
+/// STEP_ERROR exists to prevent. Failures outside the window take [`desync_fatal`] instead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FrameWindow {
+    /// Body fully consumed, nothing written back: a STEP_ERROR here is well-formed.
+    Clean,
+    /// Body partly read, response partly written, or a downstream frame half-consumed.
+    Desynced,
+}
+
+/// Reclassify a failure that left a wire misaligned as connection-fatal, so `step()` drops both
+/// ends and the relay loop exits for a supervisor rebuild — the only recovery this framing has
+/// (there is no resync point in a bare `[kind][body]` stream). The head's pending recv dies with
+/// the socket, so the turn still fails in seconds. Typed `Io(UnexpectedEof)` rather than a
+/// hand-crafted string; see `EngineError::is_connection_fatal`.
+fn desync_fatal(e: EngineError) -> EngineError {
+    EngineError::Io(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        format!("dist-spec worker: frame failed on a desynced stream, dropping link: {e}"),
+    ))
 }
 
 fn argmax(slice: &[f32]) -> usize {
@@ -484,10 +518,8 @@ impl MaskedReq {
         Ok(())
     }
     pub(crate) fn kv_restore(&mut self, b: &[u8]) -> bool {
-        if let Err(e) = self.prime_if_never_inferred() {
-            warn!(error = %e, "ov-dist-spec: draft priming before restore failed");
-        }
-        self.runtime.set_state_blob(b).is_ok()
+        let prime = self.prime_if_never_inferred();
+        restore_gated_on_prime(prime, "draft", || self.runtime.set_state_blob(b).is_ok())
     }
     /// After a warm `set_state_blob`, align the host-side cursors to the restored prefix length so
     /// the next `feed` appends the suffix at the right position (mirrors `reset`, but to `len`).
@@ -764,10 +796,8 @@ impl DistributedMaskedReq {
         Ok(())
     }
     pub(crate) fn stage0_restore(&mut self, b: &[u8]) -> bool {
-        if let Err(e) = self.prime_stage0_if_never_inferred() {
-            warn!(error = %e, "ov-dist-spec: stage0 priming before restore failed");
-        }
-        self.stage0.set_state_blob(b).is_ok()
+        let prime = self.prime_stage0_if_never_inferred();
+        restore_gated_on_prime(prime, "stage0", || self.stage0.set_state_blob(b).is_ok())
     }
     /// Align host-side cursors to a restored prefix (see `MaskedReq::kv_set_pos`).
     pub(crate) fn kv_set_pos(&mut self, len: usize) {
@@ -1608,8 +1638,7 @@ impl Engine for OvDistSpecEngine {
                 Ok(active) => self.active = Some(active),
                 Err(e) => {
                     warn!(task = %task_id, error = %e, "ov-dist-spec start failed");
-                    let c = Chunk::error(task_id.clone(), format!("start failed: {e}"));
-                    return Ok(vec![(task_id, c)]);
+                    return Ok(failed_turn_chunk(task_id, format!("start failed: {e}")));
                 }
             }
         }
@@ -1652,7 +1681,7 @@ impl Engine for OvDistSpecEngine {
             match self.do_one_round(max_tokens) {
                 Err(e) => {
                     warn!(task = %task_id, error = %e, "ov-dist-spec round failed");
-                    self.finish_task(task_id, String::new(), 0)
+                    self.fail_task(task_id, format!("round failed: {e}"))
                 }
                 Ok(RoundResult {
                     delta,
@@ -1852,6 +1881,17 @@ impl OvDistSpecEngine {
         })
     }
 
+    /// Kill the active turn with an error chunk. Deliberately NOT `finish_task`: a mid-generation
+    /// failure (a tail's STEP_ERROR, a dead link, a throwing round) is a FAILED turn, not a short
+    /// one. `finish_task` would emit a clean final chunk with `error: None` — which the API layer
+    /// renders as a 200 with `finish_reason: "stop"` — plus an `engine_task_done` event the cert
+    /// harness counts for bar B, plus a `kv_capture` of post-failure state that the next warm
+    /// resume would restore from.
+    fn fail_task(&mut self, task_id: TaskId, reason: String) -> Vec<(TaskId, Chunk)> {
+        self.active = None;
+        failed_turn_chunk(task_id, reason)
+    }
+
     /// Drop the active task, log the spec-decode summary, and return a
     /// final-marker chunk carrying the last text delta + token count.
     fn finish_task(
@@ -1900,6 +1940,14 @@ impl OvDistSpecEngine {
             },
         )]
     }
+}
+
+/// The terminal chunk of a turn that FAILED — `is_final` with `error: Some(..)`, so the runner
+/// ends the stream on it and the API answers an error instead of a truncated 200. Shared by the
+/// first-token (`start_task`) and mid-generation (`do_one_round`) failure paths: both must look
+/// the same to the caller, and neither may pass through `finish_task`.
+fn failed_turn_chunk(task_id: TaskId, reason: String) -> Vec<(TaskId, Chunk)> {
+    vec![(task_id.clone(), Chunk::error(task_id, reason))]
 }
 
 /// Detokenize `tokens` and return only the text added since the last call.
@@ -2276,8 +2324,12 @@ impl OvDistSpecWorkerEngine {
         })
         .map_err(|e| EngineError::Backend(e.to_string()))?;
         let recv_kind_us = _ts_recv_kind.elapsed().as_micros();
+        // An unknown kind means the stream is ALREADY misaligned (every legal kind is enumerated,
+        // and a peer only ever writes those). Cooling off 200 ms and reading the next 4 bytes just
+        // slices more garbage while the head waits out its first-token timeout — drop the link and
+        // let the supervisor rebuild an aligned stage.
         let kind = FrameKind::from_u32(kind)
-            .ok_or_else(|| EngineError::Backend(format!("bad kind {kind}")))?;
+            .ok_or_else(|| desync_fatal(EngineError::Backend(format!("bad kind {kind}"))))?;
 
         match kind {
             FrameKind::Reset => {
@@ -2429,16 +2481,24 @@ impl OvDistSpecWorkerEngine {
                 "ov-dist-spec worker: unexpected STEP_ERROR frame from upstream".into(),
             )),
             FrameKind::Forward => {
-                let result = self.handle_forward_frame(upstream, downstream, recv_kind_us);
-                if let Err(ref e) = result {
-                    if !e.is_connection_fatal() {
+                // Starts Desynced: nothing has been read off the body yet. `handle_forward_frame`
+                // opens the window when the body is fully drained and closes it again before it
+                // writes anything back — see `FrameWindow`.
+                let mut window = FrameWindow::Desynced;
+                match self.handle_forward_frame(upstream, downstream, recv_kind_us, &mut window) {
+                    Ok(()) => Ok(()),
+                    // Link already dead: step() drops both ends, relay loop exits, supervisor
+                    // rebuilds. Nothing to send and nowhere to send it.
+                    Err(e) if e.is_connection_fatal() => Err(e),
+                    Err(e) if window == FrameWindow::Clean => {
                         // The head is blocked awaiting LOGITS_RESPONSE — a local step failure
                         // must fail its turn in seconds, not wedge its serve slot until the
                         // 600s first-token timeout. Best-effort; step()'s cool-off still applies.
                         self.send_step_error_upstream(&e.to_string());
+                        Err(e)
                     }
+                    Err(e) => Err(desync_fatal(e)),
                 }
-                result
             }
         }
     }
@@ -2461,11 +2521,16 @@ impl OvDistSpecWorkerEngine {
     /// FORWARD frame: run this stage, then respond (last rank) or relay downstream (middle
     /// rank). Split out of `handle_one_frame` so a non-connection-fatal failure here is
     /// reported upstream as STEP_ERROR instead of dying locally while the head waits.
+    ///
+    /// `window` records where a failure would leave the wires; the caller may only answer with a
+    /// STEP_ERROR while it reads [`FrameWindow::Clean`]. Every assignment below marks a point
+    /// where the wire state actually changes.
     fn handle_forward_frame(
         &mut self,
         upstream: Arc<tokio::sync::Mutex<ActivationServer>>,
         downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
         recv_kind_us: u128,
+        window: &mut FrameWindow,
     ) -> Result<(), EngineError> {
         // 2. Read FORWARD body (logical_pos, attn, hidden) from upstream.
         //    Keep hidden as raw bytes (f16 wire format) — the IR
@@ -2497,6 +2562,9 @@ impl OvDistSpecWorkerEngine {
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
         let recv_body_us = _ts_recv_body.elapsed().as_micros();
+        // Body drained, nothing written back: the upstream stream is on a frame boundary, so
+        // everything from here to the response write can answer with a STEP_ERROR.
+        *window = FrameWindow::Clean;
 
         // 3. Run inference on this stage.
         let new_tokens = hidden_shape[1];
@@ -2606,7 +2674,10 @@ impl OvDistSpecWorkerEngine {
         }
 
         if self.is_last {
-            // Send LOGITS_RESPONSE back to upstream
+            // Send LOGITS_RESPONSE back to upstream. The window closes BEFORE the first byte: a
+            // send that fails part-way leaves a half-written response, and appending a STEP_ERROR
+            // behind it is exactly the desync this guard exists for.
+            *window = FrameWindow::Desynced;
             let upstream3 = upstream.clone();
             let _ts_send = std::time::Instant::now();
             run_async(&self.runtime_handle, async move {
@@ -2625,10 +2696,16 @@ impl OvDistSpecWorkerEngine {
                 "worker.frame wire timing (last stage)"
             );
         } else {
-            // Forward downstream, then relay LOGITS_RESPONSE upstream
+            // Forward downstream, then relay LOGITS_RESPONSE upstream. The window closes for the
+            // whole block: a half-written FORWARD or a half-read downstream response misaligns the
+            // downstream link, which wedges the next turn one hop down just as surely. It reopens
+            // only for the one case where both wires are provably back on a boundary — a
+            // downstream STEP_ERROR whose body drained cleanly.
+            *window = FrameWindow::Desynced;
             let downstream =
                 downstream.ok_or_else(|| EngineError::Backend("no downstream".into()))?;
             let upstream3 = upstream.clone();
+            let relay_window = &mut *window;
             run_async(&self.runtime_handle, async move {
                 // Send FORWARD downstream
                 let attn_t = WireTensor::new(
@@ -2653,9 +2730,12 @@ impl OvDistSpecWorkerEngine {
                         kind_bytes[3],
                     ]);
                     if kv == FrameKind::StepError as u32 {
-                        // Downstream rank's step threw. Bubble the message up: the
-                        // caller relays a STEP_ERROR of its own to upstream.
-                        return Err(recv_step_error(&mut dg).await);
+                        // Downstream rank's step threw. Its body drains here (a `?` failure leaves
+                        // the window shut), and nothing has gone upstream yet — so both wires are
+                        // back on a boundary and the caller may relay a STEP_ERROR of its own.
+                        let msg = recv_step_error_msg(&mut dg).await?;
+                        *relay_window = FrameWindow::Clean;
+                        return Err(step_failed_transport_err(&msg));
                     }
                     if kv != FrameKind::LogitsResponse as u32 {
                         return Err(cascadia_transport::TransportError::SocketClosed);
@@ -3096,24 +3176,28 @@ impl cascadia_engine::KvCoordination for OvDistSpecEngine {
 
 /// §12.16 F4→F5→config: the hidden `(dim, dtype)` the priming forward uses, in strict preference
 /// order — live port introspection, the FORWARD-cached hint, then the stage config's static
-/// `hidden_size` (dtype from the port's declared element type). `None` means the caller must
-/// REFUSE the restore — never fall through to a bare `set_state_blob` on a never-inferred request.
+/// `hidden_size` paired with the port's declared element type. The config arm needs BOTH halves
+/// resolved and a non-zero dim: a `"hidden_size": 0` in a hand-edited `stage_config.json` would
+/// otherwise prime `[1, 1, 0]` and fail opaquely inside OpenVINO, and an unresolvable port dtype
+/// would prime with a guess. `None` means the caller must REFUSE the restore — never fall through
+/// to a bare `set_state_blob` on a never-inferred request.
 #[cfg(feature = "kv_coord")]
 fn resolve_prime_hint(
     introspected: Option<(usize, ShimDType)>,
     forward_hint: Option<(usize, ShimDType)>,
     config_hidden: Option<usize>,
-    port_dtype: ShimDType,
+    port_dtype: Option<ShimDType>,
 ) -> Option<(usize, ShimDType)> {
     introspected
         .or(forward_hint)
-        .or_else(|| config_hidden.map(|dim| (dim, port_dtype)))
+        .or_else(|| Some((config_hidden.filter(|&d| d > 0)?, port_dtype?)))
 }
 
 /// §12.16: gate a KV restore on the prime verdict. A failed prime (hint unavailable, or the
-/// throwaway infer itself threw) REFUSES the restore — `set_state` is never called, the ANDed
-/// RestoreAck goes false, and the head falls back to cold instead of wedging its first real
-/// infer on the virgin-InferRequest shape fault.
+/// throwaway infer itself threw) REFUSES the restore — `set_state` is never called and the caller
+/// verdicts false, instead of wedging the first real infer on the virgin-InferRequest shape fault.
+/// On a worker that false is ANDed into the RestoreAck; on the head it short-circuits
+/// `kv_try_warm_resume`. Either way the turn falls back to cold, which is always recoverable.
 #[cfg(feature = "kv_coord")]
 fn restore_gated_on_prime(
     prime: Result<(), EngineError>,
@@ -3158,13 +3242,13 @@ impl OvDistSpecWorkerEngine {
         Some((hidden, dtype))
     }
     /// The declared element type of a v5 input port — resolvable even when the port's dims are
-    /// fully dynamic (the case where `worker_hidden_shape` fails). F16 default matches the v5
-    /// shard's hidden_states port.
-    fn worker_port_dtype(&self, port_name: &str) -> ShimDType {
+    /// fully dynamic (the case where `worker_hidden_shape` fails). `None` if the port or its dtype
+    /// cannot be read: the config-derived prime then refuses rather than guessing F16, since a
+    /// runtime that cannot answer a dtype query is in no state to be primed blind.
+    fn worker_port_dtype(&self, port_name: &str) -> Option<ShimDType> {
         (0..self.runtime.input_count())
             .find(|&idx| self.runtime.input_name(idx).ok().as_deref() == Some(port_name))
             .and_then(|idx| self.runtime.input_dtype(idx).ok())
-            .unwrap_or(ShimDType::F16)
     }
     /// §12.16: prime a never-inferred `InferRequest` with a throwaway 1-token forward before any
     /// `set_state_blob` — a virgin request has no materialized per-layer state shapes and throws
@@ -3212,7 +3296,8 @@ impl OvDistSpecWorkerEngine {
         .ok_or_else(|| {
             EngineError::Backend(
                 "could not resolve hidden_states dim for priming \
-                 (no introspection, no FORWARD hint, no stage_config hidden_size)"
+                 (no introspection, no FORWARD hint, no usable stage_config hidden_size + \
+                 port dtype)"
                     .into(),
             )
         })?;
@@ -3221,10 +3306,10 @@ impl OvDistSpecWorkerEngine {
                 &in_hs,
                 dtype,
                 &[1, 1, hidden],
-                &match dtype {
-                    ShimDType::F16 => f32_to_f16_bytes(&vec![0f32; hidden]),
-                    _ => vec![0u8; hidden * 4],
-                },
+                // Zero at the port's own element width. f16/bf16/f32 zero is all-zero bits, so
+                // one sizing rule covers every dtype a hidden_states port can declare — the old
+                // `_ => hidden * 4` handed a bf16 port a double-width buffer.
+                &vec![0u8; hidden * dtype.bytes_per_element()],
             )
             .map_err(map_ov_err)?;
         self.runtime
@@ -3617,21 +3702,28 @@ mod tests {
         let intro = Some((1024usize, ShimDType::F32));
         let hint = Some((2048usize, ShimDType::F16));
         let cfg = Some(3072usize);
+        // BF16 as the port dtype throughout: an assertion that passes with F16 in this slot
+        // cannot tell "threaded from the port" from "hardcoded F16", which is the whole claim.
+        let port = Some(ShimDType::Bf16);
         assert_eq!(
-            resolve_prime_hint(intro, hint, cfg, ShimDType::F16),
+            resolve_prime_hint(intro, hint, cfg, port),
             Some((1024, ShimDType::F32))
         );
         assert_eq!(
-            resolve_prime_hint(None, hint, cfg, ShimDType::F16),
+            resolve_prime_hint(None, hint, cfg, port),
             Some((2048, ShimDType::F16))
         );
         // The virgin-tail warm-move case: dynamic port (no introspection), never forwarded
-        // (no hint) — the stage_config hidden_size must carry the prime.
+        // (no hint) — the stage_config hidden_size must carry the prime, with the PORT's dtype.
         assert_eq!(
-            resolve_prime_hint(None, None, cfg, ShimDType::F16),
-            Some((3072, ShimDType::F16))
+            resolve_prime_hint(None, None, cfg, port),
+            Some((3072, ShimDType::Bf16))
         );
-        assert_eq!(resolve_prime_hint(None, None, None, ShimDType::F16), None);
+        assert_eq!(resolve_prime_hint(None, None, None, port), None);
+        // M6/M7: the config arm needs both halves. A zero dim would prime `[1, 1, 0]` and fail
+        // opaquely inside OV; an unresolvable port dtype would prime with a guess.
+        assert_eq!(resolve_prime_hint(None, None, Some(0), port), None);
+        assert_eq!(resolve_prime_hint(None, None, cfg, None), None);
     }
 
     /// §12.16 mutation check: a failed prime REFUSES the restore — `set_state` must never run
@@ -3660,6 +3752,59 @@ mod tests {
             true
         });
         assert!(ok && called, "a successful prime lets the restore proceed");
+    }
+
+    /// I4: a turn that FAILS mid-generation must terminate with an error chunk, not `finish_task`'s
+    /// clean final marker. `error: None` there would render as a 200 with `finish_reason: "stop"`,
+    /// tick the `engine_task_done` event the cert harness counts for bar B, and capture
+    /// post-failure KV — a dead tail would grade GREEN.
+    #[test]
+    fn failed_turn_terminates_with_an_error_chunk() {
+        for reason in [
+            "start failed: dist-spec worker step failed: 'Add_51': Argument shapes are inconsistent",
+            "round failed: dist-spec worker step failed: 'Add_51': Argument shapes are inconsistent",
+        ] {
+            let out = failed_turn_chunk(TaskId::from("t1"), reason.to_string());
+            assert_eq!(out.len(), 1);
+            let (id, chunk) = &out[0];
+            assert_eq!(id.as_str(), "t1");
+            assert!(chunk.is_final, "a failed turn must end the stream");
+            assert_eq!(
+                chunk.error.as_deref(),
+                Some(reason),
+                "the worker's message must ride the error chunk"
+            );
+            assert!(
+                chunk.finish_reason.is_none(),
+                "a failed turn must not look like a completed one"
+            );
+        }
+    }
+
+    /// I1: STEP_ERROR may only be written from a clean frame window. A failure anywhere else is
+    /// reclassified connection-fatal so the link is dropped and rebuilt, instead of a well-formed
+    /// frame being appended to a misaligned stream (which desyncs the head's NEXT turn — the wedge
+    /// this whole path exists to prevent).
+    #[test]
+    fn desynced_forward_failure_is_connection_fatal() {
+        // A transport failure that is NOT itself fatal — mid-body PayloadTooLarge is the live
+        // case — would otherwise be answered with a STEP_ERROR behind unread body bytes.
+        let non_fatal = EngineError::Backend("payload too large: 70000 > 65536".into());
+        assert!(
+            !non_fatal.is_connection_fatal(),
+            "precondition: this error alone does not drop the link"
+        );
+        let escalated = desync_fatal(non_fatal);
+        assert!(
+            escalated.is_connection_fatal(),
+            "a desynced-window failure must drop the link: {escalated}"
+        );
+        assert!(
+            escalated.to_string().contains("payload too large"),
+            "the original cause must survive: {escalated}"
+        );
+        // An unknown kind is desync by definition — this framing has no resync point.
+        assert!(desync_fatal(EngineError::Backend("bad kind 7".into())).is_connection_fatal());
     }
 
     #[test]
