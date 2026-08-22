@@ -50,6 +50,10 @@ use tracing::{info, warn};
 #[cfg(feature = "kv_coord")]
 const MAX_CARRY_BLOB_BYTES: usize = 256 * 1024 * 1024;
 
+/// Ceiling on a STEP_ERROR message body; must stay under the transport's `MAX_RAW_BYTES` so the
+/// head can drain it in a single `recv_raw`.
+const MAX_STEP_ERROR_MSG_BYTES: usize = 16 * 1024;
+
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameKind {
@@ -75,6 +79,17 @@ pub enum FrameKind {
     /// the ONLY thing that tells the two bodies apart.
     #[cfg(feature = "kv_coord")]
     CaptureV2 = 9,
+    /// Worker → upstream, sent IN PLACE of `LogitsResponse` when FORWARD processing fails after
+    /// the frame body has been consumed (set_input/infer/output). Body:
+    /// `[len: u32 BE][utf8 message]`, message capped at `MAX_STEP_ERROR_MSG_BYTES`. Without it a
+    /// tail whose step throws dies silently and the head waits out the full first-token timeout
+    /// while holding its serve slot.
+    ///
+    /// Compat (`OPCODE_TURN_BEGIN` precedent, lockstep fleet): an OLD head reads the kind, sees
+    /// non-LOGITS_RESPONSE, and errors the turn immediately — same fail-fast outcome, message
+    /// lost, link rebuilt by the relay loop. A NEW head consumes the body and fails the turn with
+    /// the worker's message while the link stays aligned for the next turn.
+    StepError = 10,
 }
 
 impl FrameKind {
@@ -93,6 +108,7 @@ impl FrameKind {
             8 => Some(Self::RestoreAck),
             #[cfg(feature = "kv_coord")]
             9 => Some(Self::CaptureV2),
+            10 => Some(Self::StepError),
             _ => None,
         }
     }
@@ -134,6 +150,44 @@ fn bytes_to_i64(bytes: &[u8]) -> Vec<i64> {
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
         .collect()
+}
+
+/// Build a complete STEP_ERROR frame: `[kind:4 BE][len:4 BE][utf8 msg]`, message truncated to
+/// `MAX_STEP_ERROR_MSG_BYTES` (mid-char truncation is fine — the head decodes lossily).
+fn encode_step_error_frame(msg: &str) -> Vec<u8> {
+    let body = &msg.as_bytes()[..msg.len().min(MAX_STEP_ERROR_MSG_BYTES)];
+    let mut out = Vec::with_capacity(8 + body.len());
+    out.extend_from_slice(&(FrameKind::StepError as u32).to_be_bytes());
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+/// Drain a STEP_ERROR body off `g` (the kind has already been read) and shape it into the error
+/// the recv sites return. The message deliberately avoids the connection-fatal substrings — the
+/// link is healthy, only the turn failed.
+async fn recv_step_error(g: &mut ActivationClient) -> cascadia_transport::TransportError {
+    let msg = async {
+        let lb = g.recv_raw(4).await?;
+        let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
+        if n > MAX_STEP_ERROR_MSG_BYTES {
+            // Desynced stream, not a well-formed error frame.
+            return Err(cascadia_transport::TransportError::SocketClosed);
+        }
+        let body = if n == 0 {
+            Vec::new()
+        } else {
+            g.recv_raw(n).await?
+        };
+        Ok::<_, cascadia_transport::TransportError>(String::from_utf8_lossy(&body).into_owned())
+    }
+    .await;
+    match msg {
+        Ok(m) => cascadia_transport::TransportError::Io(std::io::Error::other(format!(
+            "dist-spec worker step failed: {m}"
+        ))),
+        Err(e) => e,
+    }
 }
 
 fn argmax(slice: &[f32]) -> usize {
@@ -242,6 +296,12 @@ struct StageConfig {
     has_head: bool,
     #[serde(default)]
     export_version: Option<String>,
+    /// Model hidden size, written by every v5 export (`tools/export_shards.py` stage meta).
+    /// §12.16: the static last-resort source for the priming forward's hidden dim on a virgin
+    /// worker whose port is dynamic and which has never seen a FORWARD.
+    #[cfg(feature = "kv_coord")]
+    #[serde(default)]
+    hidden_size: Option<usize>,
 }
 
 fn read_pipeline_config(p: &std::path::Path) -> Result<PipelineConfig, EngineError> {
@@ -955,6 +1015,11 @@ impl DistributedMaskedReq {
             let kind_bytes = g.recv_raw(4).await?;
             let kind =
                 u32::from_be_bytes([kind_bytes[0], kind_bytes[1], kind_bytes[2], kind_bytes[3]]);
+            if kind == FrameKind::StepError as u32 {
+                // A worker's step threw: fail this turn NOW instead of waiting out the
+                // first-token timeout. The link itself stays aligned and healthy.
+                return Err(recv_step_error(&mut g).await);
+            }
             if kind != FrameKind::LogitsResponse as u32 {
                 return Err(cascadia_transport::TransportError::SocketClosed);
             }
@@ -1102,6 +1167,11 @@ impl DistributedMaskedReq {
             let recv_kind_dur = _ts_kind.elapsed();
             let kind =
                 u32::from_be_bytes([kind_bytes[0], kind_bytes[1], kind_bytes[2], kind_bytes[3]]);
+            if kind == FrameKind::StepError as u32 {
+                // A worker's step threw: fail this turn NOW instead of waiting out the
+                // first-token timeout. The link itself stays aligned and healthy.
+                return Err(recv_step_error(&mut g).await);
+            }
             if kind != FrameKind::LogitsResponse as u32 {
                 return Err(cascadia_transport::TransportError::SocketClosed);
             }
@@ -2101,6 +2171,11 @@ pub struct OvDistSpecWorkerEngine {
     /// doc for why that's still worth having.
     #[cfg(feature = "kv_coord")]
     hidden_hint: Option<(usize, ShimDType)>,
+    /// §12.16: static hidden size from this stage's `stage_config.json` — the config-derived
+    /// last resort for the priming forward when the port is dynamic (F4 introspection fails) AND
+    /// no FORWARD has ever populated `hidden_hint` (a truly virgin tail on a warm move).
+    #[cfg(feature = "kv_coord")]
+    config_hidden_size: Option<usize>,
 }
 
 impl Engine for OvDistSpecWorkerEngine {
@@ -2312,10 +2387,10 @@ impl OvDistSpecWorkerEngine {
                 let local_ok = if self.drain_kv_handoff(epoch) {
                     true
                 } else if !carried.is_empty() {
-                    if let Err(e) = self.prime_if_never_inferred() {
-                        warn!(error = %e, "ov-dist-spec worker: priming before carried-blob restore failed");
-                    }
-                    let ok = self.runtime.set_state_blob(&carried).is_ok();
+                    let prime = self.prime_if_never_inferred();
+                    let ok = restore_gated_on_prime(prime, "carried-blob", || {
+                        self.runtime.set_state_blob(&carried).is_ok()
+                    });
                     if ok {
                         info!(
                             epoch,
@@ -2325,10 +2400,10 @@ impl OvDistSpecWorkerEngine {
                     }
                     ok
                 } else if let Some((_, blob)) = self.kv.take_capture(epoch) {
-                    if let Err(e) = self.prime_if_never_inferred() {
-                        warn!(error = %e, "ov-dist-spec worker: priming before capture restore failed");
-                    }
-                    self.runtime.set_state_blob(&blob).is_ok()
+                    let prime = self.prime_if_never_inferred();
+                    restore_gated_on_prime(prime, "capture", || {
+                        self.runtime.set_state_blob(&blob).is_ok()
+                    })
                 } else {
                     false
                 };
@@ -2350,216 +2425,252 @@ impl OvDistSpecWorkerEngine {
             FrameKind::CaptureAck | FrameKind::RestoreAck => Err(EngineError::Backend(
                 "ov-dist-spec worker: unexpected ack frame from upstream".into(),
             )),
+            FrameKind::StepError => Err(EngineError::Backend(
+                "ov-dist-spec worker: unexpected STEP_ERROR frame from upstream".into(),
+            )),
             FrameKind::Forward => {
-                // 2. Read FORWARD body (logical_pos, attn, hidden) from upstream.
-                //    Keep hidden as raw bytes (f16 wire format) — the IR
-                //    expects f16 for the hidden_states port and we want
-                //    to avoid the f16→f32→f16 round-trip the previous
-                //    impl did per spec round.
-                let upstream2 = upstream.clone();
-                let _ts_recv_body = std::time::Instant::now();
-                let (logical_pos_start, attn, hidden_bytes, hidden_dtype, hidden_shape) =
-                    run_async(&self.runtime_handle, async move {
-                        let mut g = upstream2.lock().await;
-                        let pos_bytes = g.recv_raw(4).await?;
-                        let logical_pos_start = u32::from_be_bytes([
-                            pos_bytes[0],
-                            pos_bytes[1],
-                            pos_bytes[2],
-                            pos_bytes[3],
-                        ]);
-                        let (attn_t, _) = g.recv().await?;
-                        let attn_i64 = bytes_to_i64(&attn_t.data);
-                        let (hidden_t, _) = g.recv().await?;
-                        Ok::<_, cascadia_transport::TransportError>((
-                            logical_pos_start,
-                            attn_i64,
-                            hidden_t.data,
-                            hidden_t.dtype,
-                            [
-                                hidden_t.shape[0] as usize,
-                                hidden_t.shape[1] as usize,
-                                hidden_t.shape[2] as usize,
-                            ],
-                        ))
-                    })
-                    .map_err(|e| EngineError::Backend(e.to_string()))?;
-                let recv_body_us = _ts_recv_body.elapsed().as_micros();
-
-                // 3. Run inference on this stage.
-                let new_tokens = hidden_shape[1];
-                let pos: Vec<i64> = (logical_pos_start as i64
-                    ..(logical_pos_start as i64 + new_tokens as i64))
-                    .collect();
-                let in_hs =
-                    self.inputs.get("hidden_states").cloned().ok_or_else(|| {
-                        EngineError::Backend("missing hidden_states input".into())
-                    })?;
-                let in_attn =
-                    self.inputs.get("attention_mask").cloned().ok_or_else(|| {
-                        EngineError::Backend("missing attention_mask input".into())
-                    })?;
-                let in_pos = self
-                    .inputs
-                    .get("position_ids")
-                    .cloned()
-                    .ok_or_else(|| EngineError::Backend("missing position_ids input".into()))?;
-                let in_beam = self
-                    .inputs
-                    .get("beam_idx")
-                    .cloned()
-                    .ok_or_else(|| EngineError::Backend("missing beam_idx input".into()))?;
-
-                // The v5 shard's hidden_states port is f16. Pass the wire
-                // bytes through directly to avoid f16→f32→f16 round-trip.
-                let shim_dtype = match hidden_dtype {
-                    WireDType::F16 => ShimDType::F16,
-                    WireDType::F32 => ShimDType::F32,
-                    _ => {
-                        return Err(EngineError::Backend(format!(
-                            "unexpected hidden dtype on wire {hidden_dtype:?}"
-                        )))
+                let result = self.handle_forward_frame(upstream, downstream, recv_kind_us);
+                if let Err(ref e) = result {
+                    if !e.is_connection_fatal() {
+                        // The head is blocked awaiting LOGITS_RESPONSE — a local step failure
+                        // must fail its turn in seconds, not wedge its serve slot until the
+                        // 600s first-token timeout. Best-effort; step()'s cool-off still applies.
+                        self.send_step_error_upstream(&e.to_string());
                     }
-                };
-                // §12.16 F4/F5: remember this real frame's hidden dim + dtype for the priming
-                // forward's fallback — a virgin worker's own introspection of a dynamic-shape
-                // port can fail (see `worker_hidden_size`), but every real FORWARD tells us both
-                // exactly.
-                #[cfg(feature = "kv_coord")]
-                {
-                    self.hidden_hint = Some((hidden_shape[2], shim_dtype));
                 }
-                let _ts_setup = std::time::Instant::now();
-                self.runtime
-                    .set_input(&in_hs, shim_dtype, &hidden_shape, &hidden_bytes)
-                    .map_err(map_ov_err)?;
-                self.runtime
-                    .set_input(
-                        &in_attn,
-                        ShimDType::I64,
-                        &[1, attn.len()],
-                        &i64_to_bytes(&attn),
-                    )
-                    .map_err(map_ov_err)?;
-                self.runtime
-                    .set_input(
-                        &in_pos,
-                        ShimDType::I64,
-                        &[1, new_tokens],
-                        &i64_to_bytes(&pos),
-                    )
-                    .map_err(map_ov_err)?;
-                self.runtime
-                    .set_input(&in_beam, ShimDType::I32, &[1], &0i32.to_le_bytes())
-                    .map_err(map_ov_err)?;
-                let setup_us = _ts_setup.elapsed().as_micros();
-                let _ts_infer = std::time::Instant::now();
-                self.runtime.infer().map_err(map_ov_err)?;
-                // §12.16 F1: real inference marks the request no longer virgin — see `runtime.rs`.
-                #[cfg(feature = "kv_coord")]
-                {
-                    self.ever_inferred = true;
-                }
-                let infer_us = _ts_infer.elapsed().as_micros();
-                let _ts_out = std::time::Instant::now();
-                let (out_dtype, out_shape, out_bytes) =
-                    self.runtime.output(0).map_err(map_ov_err)?;
-                let output_us = _ts_out.elapsed().as_micros();
-                tracing::debug!(
-                    n = new_tokens,
-                    setup_us,
-                    infer_us,
-                    output_us,
-                    "worker.frame timing"
-                );
-                let out_f16_bytes = match out_dtype {
-                    ShimDType::F16 => out_bytes,
-                    ShimDType::F32 => {
-                        // Convert to f16 for wire transport
-                        let f: Vec<f32> = out_bytes
-                            .chunks_exact(4)
-                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                            .collect();
-                        f32_to_f16_bytes(&f)
-                    }
-                    other => {
-                        return Err(EngineError::Backend(format!(
-                            "unexpected output dtype {other:?}"
-                        )))
-                    }
-                };
-                let mut out_shape_wire = [1u32; MAX_RANK];
-                for (i, d) in out_shape.iter().enumerate().take(MAX_RANK) {
-                    out_shape_wire[i] = *d as u32;
-                }
-
-                if self.is_last {
-                    // Send LOGITS_RESPONSE back to upstream
-                    let upstream3 = upstream.clone();
-                    let _ts_send = std::time::Instant::now();
-                    run_async(&self.runtime_handle, async move {
-                        let mut g = upstream3.lock().await;
-                        g.send_raw(&(FrameKind::LogitsResponse as u32).to_be_bytes())
-                            .await?;
-                        let t = WireTensor::new(WireDType::F16, out_shape_wire, out_f16_bytes);
-                        g.send(&t).await
-                    })
-                    .map_err(|e| EngineError::Backend(e.to_string()))?;
-                    let send_us = _ts_send.elapsed().as_micros();
-                    tracing::debug!(
-                        recv_kind_us,
-                        recv_body_us,
-                        send_us,
-                        "worker.frame wire timing (last stage)"
-                    );
-                } else {
-                    // Forward downstream, then relay LOGITS_RESPONSE upstream
-                    let downstream =
-                        downstream.ok_or_else(|| EngineError::Backend("no downstream".into()))?;
-                    let upstream3 = upstream.clone();
-                    run_async(&self.runtime_handle, async move {
-                        // Send FORWARD downstream
-                        let attn_t = WireTensor::new(
-                            WireDType::I64,
-                            [1, 1, attn.len() as u32],
-                            i64_to_bytes(&attn),
-                        );
-                        let mut header = [0u8; 8];
-                        header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
-                        header[4..8].copy_from_slice(&logical_pos_start.to_be_bytes());
-                        {
-                            let mut dg = downstream.lock().await;
-                            dg.send_raw(&header).await?;
-                            dg.send(&attn_t).await?;
-                            let t = WireTensor::new(
-                                WireDType::F16,
-                                out_shape_wire,
-                                out_f16_bytes.clone(),
-                            );
-                            dg.send(&t).await?;
-                            let kind_bytes = dg.recv_raw(4).await?;
-                            let kv = u32::from_be_bytes([
-                                kind_bytes[0],
-                                kind_bytes[1],
-                                kind_bytes[2],
-                                kind_bytes[3],
-                            ]);
-                            if kv != FrameKind::LogitsResponse as u32 {
-                                return Err(cascadia_transport::TransportError::SocketClosed);
-                            }
-                            let (logits_t, _) = dg.recv().await?;
-                            let mut g = upstream3.lock().await;
-                            g.send_raw(&(FrameKind::LogitsResponse as u32).to_be_bytes())
-                                .await?;
-                            g.send(&logits_t).await?;
-                        }
-                        Ok::<_, cascadia_transport::TransportError>(())
-                    })
-                    .map_err(|e| EngineError::Backend(e.to_string()))?;
-                }
-                Ok(())
+                result
             }
         }
+    }
+
+    /// Best-effort STEP_ERROR to the upstream head (or the next rank up, which relays it on).
+    /// Never escalates: if the send itself fails the link is already dying and the relay loop's
+    /// connection-fatal path takes over.
+    fn send_step_error_upstream(&mut self, msg: &str) {
+        let frame = encode_step_error_frame(msg);
+        let up = self.upstream.clone();
+        let r = run_async(&self.runtime_handle, async move {
+            let mut g = up.lock().await;
+            g.send_raw(&frame).await
+        });
+        if let Err(e) = r {
+            warn!(error = %e, "ov-dist-spec worker: STEP_ERROR send failed (best-effort)");
+        }
+    }
+
+    /// FORWARD frame: run this stage, then respond (last rank) or relay downstream (middle
+    /// rank). Split out of `handle_one_frame` so a non-connection-fatal failure here is
+    /// reported upstream as STEP_ERROR instead of dying locally while the head waits.
+    fn handle_forward_frame(
+        &mut self,
+        upstream: Arc<tokio::sync::Mutex<ActivationServer>>,
+        downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
+        recv_kind_us: u128,
+    ) -> Result<(), EngineError> {
+        // 2. Read FORWARD body (logical_pos, attn, hidden) from upstream.
+        //    Keep hidden as raw bytes (f16 wire format) — the IR
+        //    expects f16 for the hidden_states port and we want
+        //    to avoid the f16→f32→f16 round-trip the previous
+        //    impl did per spec round.
+        let upstream2 = upstream.clone();
+        let _ts_recv_body = std::time::Instant::now();
+        let (logical_pos_start, attn, hidden_bytes, hidden_dtype, hidden_shape) =
+            run_async(&self.runtime_handle, async move {
+                let mut g = upstream2.lock().await;
+                let pos_bytes = g.recv_raw(4).await?;
+                let logical_pos_start =
+                    u32::from_be_bytes([pos_bytes[0], pos_bytes[1], pos_bytes[2], pos_bytes[3]]);
+                let (attn_t, _) = g.recv().await?;
+                let attn_i64 = bytes_to_i64(&attn_t.data);
+                let (hidden_t, _) = g.recv().await?;
+                Ok::<_, cascadia_transport::TransportError>((
+                    logical_pos_start,
+                    attn_i64,
+                    hidden_t.data,
+                    hidden_t.dtype,
+                    [
+                        hidden_t.shape[0] as usize,
+                        hidden_t.shape[1] as usize,
+                        hidden_t.shape[2] as usize,
+                    ],
+                ))
+            })
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        let recv_body_us = _ts_recv_body.elapsed().as_micros();
+
+        // 3. Run inference on this stage.
+        let new_tokens = hidden_shape[1];
+        let pos: Vec<i64> =
+            (logical_pos_start as i64..(logical_pos_start as i64 + new_tokens as i64)).collect();
+        let in_hs = self
+            .inputs
+            .get("hidden_states")
+            .cloned()
+            .ok_or_else(|| EngineError::Backend("missing hidden_states input".into()))?;
+        let in_attn = self
+            .inputs
+            .get("attention_mask")
+            .cloned()
+            .ok_or_else(|| EngineError::Backend("missing attention_mask input".into()))?;
+        let in_pos = self
+            .inputs
+            .get("position_ids")
+            .cloned()
+            .ok_or_else(|| EngineError::Backend("missing position_ids input".into()))?;
+        let in_beam = self
+            .inputs
+            .get("beam_idx")
+            .cloned()
+            .ok_or_else(|| EngineError::Backend("missing beam_idx input".into()))?;
+
+        // The v5 shard's hidden_states port is f16. Pass the wire
+        // bytes through directly to avoid f16→f32→f16 round-trip.
+        let shim_dtype = match hidden_dtype {
+            WireDType::F16 => ShimDType::F16,
+            WireDType::F32 => ShimDType::F32,
+            _ => {
+                return Err(EngineError::Backend(format!(
+                    "unexpected hidden dtype on wire {hidden_dtype:?}"
+                )))
+            }
+        };
+        // §12.16 F4/F5: remember this real frame's hidden dim + dtype for the priming
+        // forward's fallback — a virgin worker's own introspection of a dynamic-shape
+        // port can fail (see `worker_hidden_size`), but every real FORWARD tells us both
+        // exactly.
+        #[cfg(feature = "kv_coord")]
+        {
+            self.hidden_hint = Some((hidden_shape[2], shim_dtype));
+        }
+        let _ts_setup = std::time::Instant::now();
+        self.runtime
+            .set_input(&in_hs, shim_dtype, &hidden_shape, &hidden_bytes)
+            .map_err(map_ov_err)?;
+        self.runtime
+            .set_input(
+                &in_attn,
+                ShimDType::I64,
+                &[1, attn.len()],
+                &i64_to_bytes(&attn),
+            )
+            .map_err(map_ov_err)?;
+        self.runtime
+            .set_input(
+                &in_pos,
+                ShimDType::I64,
+                &[1, new_tokens],
+                &i64_to_bytes(&pos),
+            )
+            .map_err(map_ov_err)?;
+        self.runtime
+            .set_input(&in_beam, ShimDType::I32, &[1], &0i32.to_le_bytes())
+            .map_err(map_ov_err)?;
+        let setup_us = _ts_setup.elapsed().as_micros();
+        let _ts_infer = std::time::Instant::now();
+        self.runtime.infer().map_err(map_ov_err)?;
+        // §12.16 F1: real inference marks the request no longer virgin — see `runtime.rs`.
+        #[cfg(feature = "kv_coord")]
+        {
+            self.ever_inferred = true;
+        }
+        let infer_us = _ts_infer.elapsed().as_micros();
+        let _ts_out = std::time::Instant::now();
+        let (out_dtype, out_shape, out_bytes) = self.runtime.output(0).map_err(map_ov_err)?;
+        let output_us = _ts_out.elapsed().as_micros();
+        tracing::debug!(
+            n = new_tokens,
+            setup_us,
+            infer_us,
+            output_us,
+            "worker.frame timing"
+        );
+        let out_f16_bytes = match out_dtype {
+            ShimDType::F16 => out_bytes,
+            ShimDType::F32 => {
+                // Convert to f16 for wire transport
+                let f: Vec<f32> = out_bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                f32_to_f16_bytes(&f)
+            }
+            other => {
+                return Err(EngineError::Backend(format!(
+                    "unexpected output dtype {other:?}"
+                )))
+            }
+        };
+        let mut out_shape_wire = [1u32; MAX_RANK];
+        for (i, d) in out_shape.iter().enumerate().take(MAX_RANK) {
+            out_shape_wire[i] = *d as u32;
+        }
+
+        if self.is_last {
+            // Send LOGITS_RESPONSE back to upstream
+            let upstream3 = upstream.clone();
+            let _ts_send = std::time::Instant::now();
+            run_async(&self.runtime_handle, async move {
+                let mut g = upstream3.lock().await;
+                g.send_raw(&(FrameKind::LogitsResponse as u32).to_be_bytes())
+                    .await?;
+                let t = WireTensor::new(WireDType::F16, out_shape_wire, out_f16_bytes);
+                g.send(&t).await
+            })
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
+            let send_us = _ts_send.elapsed().as_micros();
+            tracing::debug!(
+                recv_kind_us,
+                recv_body_us,
+                send_us,
+                "worker.frame wire timing (last stage)"
+            );
+        } else {
+            // Forward downstream, then relay LOGITS_RESPONSE upstream
+            let downstream =
+                downstream.ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+            let upstream3 = upstream.clone();
+            run_async(&self.runtime_handle, async move {
+                // Send FORWARD downstream
+                let attn_t = WireTensor::new(
+                    WireDType::I64,
+                    [1, 1, attn.len() as u32],
+                    i64_to_bytes(&attn),
+                );
+                let mut header = [0u8; 8];
+                header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
+                header[4..8].copy_from_slice(&logical_pos_start.to_be_bytes());
+                {
+                    let mut dg = downstream.lock().await;
+                    dg.send_raw(&header).await?;
+                    dg.send(&attn_t).await?;
+                    let t = WireTensor::new(WireDType::F16, out_shape_wire, out_f16_bytes.clone());
+                    dg.send(&t).await?;
+                    let kind_bytes = dg.recv_raw(4).await?;
+                    let kv = u32::from_be_bytes([
+                        kind_bytes[0],
+                        kind_bytes[1],
+                        kind_bytes[2],
+                        kind_bytes[3],
+                    ]);
+                    if kv == FrameKind::StepError as u32 {
+                        // Downstream rank's step threw. Bubble the message up: the
+                        // caller relays a STEP_ERROR of its own to upstream.
+                        return Err(recv_step_error(&mut dg).await);
+                    }
+                    if kv != FrameKind::LogitsResponse as u32 {
+                        return Err(cascadia_transport::TransportError::SocketClosed);
+                    }
+                    let (logits_t, _) = dg.recv().await?;
+                    let mut g = upstream3.lock().await;
+                    g.send_raw(&(FrameKind::LogitsResponse as u32).to_be_bytes())
+                        .await?;
+                    g.send(&logits_t).await?;
+                }
+                Ok::<_, cascadia_transport::TransportError>(())
+            })
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        }
+        Ok(())
     }
 }
 
@@ -2579,6 +2690,9 @@ pub struct OvDistSpecWorkerBuilder {
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
     listen_host: String,
     listen_port: Option<u16>,
+    /// From this stage's `stage_config.json`; see `StageConfig::hidden_size`.
+    #[cfg(feature = "kv_coord")]
+    config_hidden_size: Option<usize>,
 }
 
 impl OvDistSpecWorkerBuilder {
@@ -2603,6 +2717,8 @@ impl OvDistSpecWorkerBuilder {
             downstream: None,
             listen_host: "0.0.0.0".into(),
             listen_port: None,
+            #[cfg(feature = "kv_coord")]
+            config_hidden_size: None,
         }
     }
 
@@ -2692,6 +2808,10 @@ impl Builder for OvDistSpecWorkerBuilder {
             }
         };
         let stage_cfg = read_stage_config(&stage_dir)?;
+        #[cfg(feature = "kv_coord")]
+        {
+            self.config_hidden_size = stage_cfg.hidden_size;
+        }
         let is_last = self.rank == self.total - 1;
         if is_last && !stage_cfg.has_head {
             return Err(EngineError::ShardRejected(format!(
@@ -2762,6 +2882,8 @@ impl Builder for OvDistSpecWorkerBuilder {
             ever_inferred: false,
             #[cfg(feature = "kv_coord")]
             hidden_hint: None,
+            #[cfg(feature = "kv_coord")]
+            config_hidden_size: self.config_hidden_size,
         }))
     }
 }
@@ -2972,6 +3094,45 @@ impl cascadia_engine::KvCoordination for OvDistSpecEngine {
     }
 }
 
+/// §12.16 F4→F5→config: the hidden `(dim, dtype)` the priming forward uses, in strict preference
+/// order — live port introspection, the FORWARD-cached hint, then the stage config's static
+/// `hidden_size` (dtype from the port's declared element type). `None` means the caller must
+/// REFUSE the restore — never fall through to a bare `set_state_blob` on a never-inferred request.
+#[cfg(feature = "kv_coord")]
+fn resolve_prime_hint(
+    introspected: Option<(usize, ShimDType)>,
+    forward_hint: Option<(usize, ShimDType)>,
+    config_hidden: Option<usize>,
+    port_dtype: ShimDType,
+) -> Option<(usize, ShimDType)> {
+    introspected
+        .or(forward_hint)
+        .or_else(|| config_hidden.map(|dim| (dim, port_dtype)))
+}
+
+/// §12.16: gate a KV restore on the prime verdict. A failed prime (hint unavailable, or the
+/// throwaway infer itself threw) REFUSES the restore — `set_state` is never called, the ANDed
+/// RestoreAck goes false, and the head falls back to cold instead of wedging its first real
+/// infer on the virgin-InferRequest shape fault.
+#[cfg(feature = "kv_coord")]
+fn restore_gated_on_prime(
+    prime: Result<(), EngineError>,
+    context: &'static str,
+    set_state: impl FnOnce() -> bool,
+) -> bool {
+    match prime {
+        Ok(()) => set_state(),
+        Err(e) => {
+            warn!(
+                error = %e,
+                context,
+                "prime_hint_unavailable: refusing KV restore onto a never-inferred InferRequest"
+            );
+            false
+        }
+    }
+}
+
 #[cfg(feature = "kv_coord")]
 impl OvDistSpecWorkerEngine {
     /// MODEL-level fp — identical on every rank so a cross-chain pull's single asserted fingerprint
@@ -2996,6 +3157,15 @@ impl OvDistSpecWorkerEngine {
         let dtype = self.runtime.input_dtype(idx).ok().unwrap_or(ShimDType::F16);
         Some((hidden, dtype))
     }
+    /// The declared element type of a v5 input port — resolvable even when the port's dims are
+    /// fully dynamic (the case where `worker_hidden_shape` fails). F16 default matches the v5
+    /// shard's hidden_states port.
+    fn worker_port_dtype(&self, port_name: &str) -> ShimDType {
+        (0..self.runtime.input_count())
+            .find(|&idx| self.runtime.input_name(idx).ok().as_deref() == Some(port_name))
+            .and_then(|idx| self.runtime.input_dtype(idx).ok())
+            .unwrap_or(ShimDType::F16)
+    }
     /// §12.16: prime a never-inferred `InferRequest` with a throwaway 1-token forward before any
     /// `set_state_blob` — a virgin request has no materialized per-layer state shapes and throws
     /// `Argument shapes are inconsistent` on the first real `infer()` after a bare restore. See
@@ -3004,10 +3174,11 @@ impl OvDistSpecWorkerEngine {
     ///
     /// Hidden dim + dtype: prefer live introspection (`worker_hidden_shape`); on a dynamic-shape
     /// port that can legitimately fail before any real frame has run (F4), so fall back to
-    /// `hidden_hint`, cached from the most recent real FORWARD (F5: same dtype selection the
-    /// FORWARD handler itself uses). Best-effort: if neither resolves, skip rather than risk a
-    /// garbage-shaped forward — the caller's `set_state_blob` then takes its chances exactly as
-    /// it did before this fix.
+    /// `hidden_hint`, cached from the most recent real FORWARD (F5), then to the stage config's
+    /// static `hidden_size` (a truly virgin tail — never forwarded, dynamic port — has neither of
+    /// the first two; see `resolve_prime_hint`). NOT best-effort: if none resolves this errors,
+    /// and every restore caller REFUSES the restore (`restore_gated_on_prime`) — a bare
+    /// `set_state_blob` on a never-inferred request is exactly the §12.16 shape fault.
     fn prime_if_never_inferred(&mut self) -> Result<(), EngineError> {
         if self.ever_inferred {
             return Ok(());
@@ -3032,12 +3203,19 @@ impl OvDistSpecWorkerEngine {
             .get("beam_idx")
             .cloned()
             .ok_or_else(|| EngineError::Backend("missing beam_idx input".into()))?;
-        let (hidden, dtype) = self
-            .worker_hidden_shape(&in_hs)
-            .or(self.hidden_hint)
-            .ok_or_else(|| {
-                EngineError::Backend("could not resolve hidden_states dim for priming".into())
-            })?;
+        let (hidden, dtype) = resolve_prime_hint(
+            self.worker_hidden_shape(&in_hs),
+            self.hidden_hint,
+            self.config_hidden_size,
+            self.worker_port_dtype(&in_hs),
+        )
+        .ok_or_else(|| {
+            EngineError::Backend(
+                "could not resolve hidden_states dim for priming \
+                 (no introspection, no FORWARD hint, no stage_config hidden_size)"
+                    .into(),
+            )
+        })?;
         self.runtime
             .set_input(
                 &in_hs,
@@ -3080,10 +3258,10 @@ impl OvDistSpecWorkerEngine {
         let mailbox = std::sync::Arc::clone(&self.kv_handoff);
         let fp = self.kv_fingerprint();
         crate::kv_coordination::drain_handoff(&mailbox, fp, 0, expected_epoch, |blob| {
-            if let Err(e) = self.prime_if_never_inferred() {
-                warn!(error = %e, "ov-dist-spec worker: priming before handoff apply failed");
-            }
-            self.runtime.set_state_blob(blob).is_ok()
+            let prime = self.prime_if_never_inferred();
+            restore_gated_on_prime(prime, "handoff", || {
+                self.runtime.set_state_blob(blob).is_ok()
+            })
         })
     }
     fn kv_ack_upstream(&mut self, ack_kind: u32, payload: &[u8]) -> Result<(), EngineError> {
@@ -3299,6 +3477,7 @@ mod tests {
             FrameKind::Forward,
             FrameKind::Reset,
             FrameKind::LogitsResponse,
+            FrameKind::StepError,
         ] {
             let bytes = (k as u32).to_be_bytes();
             let v = u32::from_be_bytes(bytes);
@@ -3427,5 +3606,105 @@ mod tests {
         let (kind, rx) = h.await.unwrap();
         assert_eq!(kind, FrameKind::LogitsResponse);
         assert_eq!(rx, logits);
+    }
+
+    /// §12.16 hint precedence: introspection > FORWARD hint > config hidden size; a
+    /// config-derived hint pairs the static dim with the port's declared dtype; nothing
+    /// resolvable ⇒ `None` (restore must be refused).
+    #[cfg(feature = "kv_coord")]
+    #[test]
+    fn prime_hint_prefers_introspection_then_hint_then_config() {
+        let intro = Some((1024usize, ShimDType::F32));
+        let hint = Some((2048usize, ShimDType::F16));
+        let cfg = Some(3072usize);
+        assert_eq!(
+            resolve_prime_hint(intro, hint, cfg, ShimDType::F16),
+            Some((1024, ShimDType::F32))
+        );
+        assert_eq!(
+            resolve_prime_hint(None, hint, cfg, ShimDType::F16),
+            Some((2048, ShimDType::F16))
+        );
+        // The virgin-tail warm-move case: dynamic port (no introspection), never forwarded
+        // (no hint) — the stage_config hidden_size must carry the prime.
+        assert_eq!(
+            resolve_prime_hint(None, None, cfg, ShimDType::F16),
+            Some((3072, ShimDType::F16))
+        );
+        assert_eq!(resolve_prime_hint(None, None, None, ShimDType::F16), None);
+    }
+
+    /// §12.16 mutation check: a failed prime REFUSES the restore — `set_state` must never run
+    /// (the pre-fix behavior was warn-and-proceed to a bare `set_state_blob`).
+    #[cfg(feature = "kv_coord")]
+    #[test]
+    fn failed_prime_refuses_restore_without_touching_state() {
+        let mut called = false;
+        let ok = restore_gated_on_prime(
+            Err(EngineError::Backend("no hint".into())),
+            "carried-blob",
+            || {
+                called = true;
+                true
+            },
+        );
+        assert!(!ok, "a refused restore must ack false");
+        assert!(
+            !called,
+            "set_state_blob must never run after a failed prime"
+        );
+
+        let mut called = false;
+        let ok = restore_gated_on_prime(Ok(()), "carried-blob", || {
+            called = true;
+            true
+        });
+        assert!(ok && called, "a successful prime lets the restore proceed");
+    }
+
+    #[test]
+    fn step_error_frame_truncates_oversized_message() {
+        let long = "x".repeat(MAX_STEP_ERROR_MSG_BYTES + 100);
+        let frame = encode_step_error_frame(&long);
+        assert_eq!(frame.len(), 8 + MAX_STEP_ERROR_MSG_BYTES);
+        let n = u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]) as usize;
+        assert_eq!(n, MAX_STEP_ERROR_MSG_BYTES);
+    }
+
+    /// FIX 2 loopback: a worker whose step throws sends STEP_ERROR in place of LOGITS_RESPONSE;
+    /// the head's receive path surfaces it as an immediate error carrying the worker's message —
+    /// not a hang, and NOT a connection-fatal error (the link stays usable for the next turn).
+    #[tokio::test]
+    async fn step_error_frame_fails_head_receive_fast() {
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            // Worker side: step failed → STEP_ERROR upstream (what
+            // send_step_error_upstream puts on the wire).
+            let frame =
+                encode_step_error_frame("infer failed: 'Add_51': Argument shapes are inconsistent");
+            server.send_raw(&frame).await.unwrap();
+        });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        // Head side: the exact kind-dispatch the feed paths run.
+        let kb = client.recv_raw(4).await.unwrap();
+        let kind = u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]);
+        assert_eq!(kind, FrameKind::StepError as u32);
+        let err = recv_step_error(&mut client).await;
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Argument shapes are inconsistent"),
+            "worker message must ride the error: {msg}"
+        );
+        // Flattened the way feed() flattens it, the error must fail the TURN, not the LINK.
+        let engine_err = EngineError::Backend(msg);
+        assert!(
+            !engine_err.is_connection_fatal(),
+            "STEP_ERROR must not be classified connection-fatal"
+        );
+        h.await.unwrap();
     }
 }
