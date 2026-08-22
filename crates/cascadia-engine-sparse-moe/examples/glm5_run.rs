@@ -9,6 +9,14 @@
 //!
 //! Needs tokenizer.json in <model_dir> for text prompts (stage it from the FP8
 //! checkpoint). With `--ids` no tokenizer is required.
+//!
+//! `--force "<ids>"` is the teacher-forced DECODE bench: every id is driven
+//! through the per-token decode path (`forward_layers`, not batch-union
+//! prefill), so each step routes from a genuinely different hidden state —
+//! the expert-streaming regime greedy generation can't reach on a synthetic
+//! model whose argmax collapses to a fixed point. No sampling; prints tok/s
+//! plus an FNV-1a hash of the final head logits as a cross-config parity
+//! anchor (read-path changes must reproduce it bit-for-bit).
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -25,7 +33,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(2);
     }
     let dir = PathBuf::from(&args[1]);
-    let raw_ids = args[2] == "--ids";
+    let forced = args[2] == "--force";
+    let raw_ids = args[2] == "--ids" || forced;
     let prompt_arg = if raw_ids { &args[3] } else { &args[2] };
     let n_gen: usize = args
         .get(if raw_ids { 4 } else { 3 })
@@ -67,6 +76,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         t_load.elapsed().as_secs_f64(),
         runner.arch_name()
     );
+
+    if forced {
+        assert!(
+            prompt.len() <= runner.max_seq(),
+            "forced ids ({}) exceed max_seq ({})",
+            prompt.len(),
+            runner.max_seq()
+        );
+        runner.reset();
+        let t0 = Instant::now();
+        let mut h = Vec::new();
+        for (pos, &t) in prompt.iter().enumerate() {
+            let e = runner.embed_token(t);
+            h = runner.forward_layers(e, pos, Some(t));
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        let logits = runner.head_logits(&h);
+        let argmax = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let mut fnv: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in logits.iter().flat_map(|v| v.to_le_bytes()) {
+            fnv ^= b as u64;
+            fnv = fnv.wrapping_mul(0x0100_0000_01b3);
+        }
+        println!(
+            "[glm5_run] forced {} tokens in {:.1}s = {:.3} tok/s",
+            prompt.len(),
+            dt,
+            prompt.len() as f64 / dt.max(1e-9)
+        );
+        println!("[glm5_run] forced argmax={argmax} logits_fnv={fnv:#018x}");
+        return Ok(());
+    }
 
     let t_gen = Instant::now();
     let out = runner.generate_argmax(&prompt, n_gen);
