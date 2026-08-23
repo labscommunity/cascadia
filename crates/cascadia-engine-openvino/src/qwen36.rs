@@ -267,6 +267,111 @@ fn restore_depth_admits(
     }
 }
 
+/// Header of a RESTORE frame. The ONE place that field is filled: `pos` was hard-zero, and
+/// re-zeroing it un-does the depth binding without failing any other test.
+#[cfg(feature = "kv_coord")]
+fn restore_frame_header(task_epoch: u32, head_pos: u32) -> [u8; 12] {
+    frame_header(FRAME_RESTORE, task_epoch, head_pos)
+}
+
+/// Head warm-resume position: the blob's own depth (issue 7's rule, shared with ov-runtime), refused
+/// when unreadable or past the matched prefix. Both qwen36 head sites go through here so they cannot
+/// drift apart, and so the `<= matched_len` guard is pinnable — `take_warm` guarantees a STRICT
+/// prefix, and a deeper slice would skip prefill entirely and decode off a `None` next-token.
+#[cfg(feature = "kv_coord")]
+fn head_resume_pos(blob: &[u8], matched_len: usize) -> Option<usize> {
+    crate::kv_coordination::warm_resume_depth(
+        blob,
+        matched_len,
+        crate::kv_coordination::strict_depth(),
+    )
+    .filter(|&d| d <= matched_len)
+}
+
+/// rank>0 RESTORE: which slice this rank installs, and whether it may. Ordered drain → carried →
+/// own capture, with [`restore_depth_admits`] in front of every install (the plane mailbox gates its
+/// own slice already). Returns the `local_ok` half of the all-or-nothing verdict.
+///
+/// Free-standing, with the install passed as a closure, so the ORDERING and the GATE are testable
+/// without a live pipeline transport or a compiled stage. A pure test of `carried_restore_admits`
+/// alone stays green if a refactor drops the call site, which is precisely how this defect would
+/// come back.
+#[cfg(feature = "kv_coord")]
+fn restore_local_ok(
+    drained: bool,
+    carried: &[u8],
+    own_capture: Option<&[u8]>,
+    kv_epoch: u64,
+    head_pos: u32,
+    mut install: impl FnMut(&[u8]) -> bool,
+) -> bool {
+    if drained {
+        return true;
+    }
+    // Carried blob wins over the own-capture stash: on a CROSS-chain move this rank has no capture
+    // under the source chain's epoch, so only the head's inline copy exists.
+    if !carried.is_empty() {
+        let Some(depth) = restore_depth_admits(carried, kv_epoch, head_pos, "carried") else {
+            return false;
+        };
+        let ok = install(carried);
+        // Cert marker: proves the CARRIED (cross-chain) branch ran, not the same-chain capture
+        // fallback — the two are indistinguishable in the verdict alone. Emitted ONLY on success,
+        // matching `ov_tail_restore_carried`, so the cert's gate counts successes for both engines
+        // rather than attempts for one of them. `depth`/`head_pos` are new: a future skew is one
+        // grep away instead of unobservable.
+        if ok {
+            info!(
+                kv_epoch,
+                blob_len = carried.len(),
+                depth,
+                head_pos,
+                "qwen36_tail_restore_carried"
+            );
+        } else {
+            warn!(
+                kv_epoch,
+                blob_len = carried.len(),
+                depth,
+                head_pos,
+                "qwen36_tail_restore_carried_failed"
+            );
+        }
+        return ok;
+    }
+    // Same-chain: this rank's own CAPTURE stash. Same gate, and the same blind spot it closes — B's
+    // greedy answer to A's prompt is token-identical, so `synth_epoch` collides exactly and this rank
+    // can genuinely hold a capture under a foreign chain's epoch. Depth is what catches it.
+    // Separate event name from the carried branch so the cert's carried-gate keeps its meaning.
+    match own_capture {
+        Some(blob) => {
+            let Some(depth) = restore_depth_admits(blob, kv_epoch, head_pos, "capture") else {
+                return false;
+            };
+            let ok = install(blob);
+            if ok {
+                info!(
+                    kv_epoch,
+                    blob_len = blob.len(),
+                    depth,
+                    head_pos,
+                    "qwen36_tail_restore_capture"
+                );
+            } else {
+                warn!(
+                    kv_epoch,
+                    blob_len = blob.len(),
+                    depth,
+                    head_pos,
+                    "qwen36_tail_restore_capture_failed"
+                );
+            }
+            ok
+        }
+        None => false,
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct Manifest {
     arch: String,
@@ -1231,7 +1336,7 @@ impl Qwen36Engine {
             &h,
             reply_bounded(async move {
                 let mut g = downstream.lock().await;
-                g.send_raw(&frame_header(FRAME_RESTORE, task_epoch, head_pos))
+                g.send_raw(&restore_frame_header(task_epoch, head_pos))
                     .await?;
                 g.send_raw(&kv_epoch.to_le_bytes()).await?;
                 g.send_raw(&(blob.len() as u32).to_be_bytes()).await?;
@@ -1335,16 +1440,8 @@ impl Qwen36Engine {
                             // then asserted `len` anyway. Behaviour-neutral on the certified case
                             // (depth == len == 75); it is the head half of the depth contract the
                             // tail now asserts against.
-                            match crate::kv_coordination::warm_resume_depth(
-                                &blob,
-                                len,
-                                crate::kv_coordination::strict_depth(),
-                            )
-                            .filter(|&d| d <= len)
-                            {
-                                // Unreadable, or deeper than the matched prefix. `take_warm`
-                                // guarantees a STRICT prefix, so a deeper slice would skip prefill
-                                // entirely and decode off a `None` next-token; cold instead of
+                            match head_resume_pos(&blob, len) {
+                                // Unreadable, or deeper than the matched prefix; cold instead of
                                 // clamping — clamping is the "install it and lie about its depth"
                                 // arm this change deletes.
                                 None => {
@@ -1808,59 +1905,26 @@ impl Qwen36Engine {
                 // ack with the all-or-nothing verdict (local && downstream restored). A miss anywhere
                 // ⇒ verdict 0 ⇒ the head re-RESETs the chain cold (never a partial/corrupt restore).
                 self.peer_epoch = task_epoch;
-                // Carried blob wins: on a CROSS-chain move this rank has no capture under the source
-                // chain's epoch, so the local stash is empty and only the head's inline copy exists.
                 // Drain FIRST — same reason as ov-runtime's RESTORE arm: in plane mode the head
                 // parks this rank's slice AND still carries a blob inline, so a `||` after the
                 // carried branch short-circuits the drain away and the rank warms from carried data
                 // while the plane slice goes unread. Chain mode parks nothing, so this is a false
-                // no-op there and the carried/capture path below is unchanged.
-                let local_ok = if self.drain_kv_handoff(kv_epoch) {
-                    true
-                } else if !blob.is_empty() {
-                    match restore_depth_admits(&blob, kv_epoch, head_pos, "carried") {
-                        None => false,
-                        Some(depth) => {
-                            let ok = self.restore_local_stages(&blob);
-                            // Cert marker: proves the CARRIED (cross-chain) branch ran, not the
-                            // same-chain capture fallback — the two are indistinguishable in the
-                            // verdict alone. Emitted ONLY on success, matching
-                            // `ov_tail_restore_carried`, so the cert's gate counts successes for both
-                            // engines rather than attempts for one of them. `depth`/`head_pos` are
-                            // new: a future skew is one grep away instead of unobservable.
-                            if ok {
-                                info!(
-                                    kv_epoch,
-                                    blob_len = blob.len(),
-                                    depth,
-                                    head_pos,
-                                    "qwen36_tail_restore_carried"
-                                );
-                            } else {
-                                warn!(
-                                    kv_epoch,
-                                    blob_len = blob.len(),
-                                    depth,
-                                    head_pos,
-                                    "qwen36_tail_restore_carried_failed"
-                                );
-                            }
-                            ok
-                        }
-                    }
+                // no-op there and the carried/capture path is unchanged. Ordering + the depth gate
+                // live in `restore_local_ok`; this arm only supplies the inputs.
+                let drained = self.drain_kv_handoff(kv_epoch);
+                let own_capture = if drained || !blob.is_empty() {
+                    None
                 } else {
-                    match self.kv.take_capture(kv_epoch) {
-                        // Same rule for the own-capture fallback, which has the same blind spot: B's
-                        // greedy answer to A's prompt is token-identical, so `synth_epoch` collides
-                        // exactly and this rank can genuinely hold a capture under a foreign chain's
-                        // epoch. Depth is the only thing that catches it.
-                        Some((_, blob)) => {
-                            restore_depth_admits(&blob, kv_epoch, head_pos, "capture").is_some()
-                                && self.restore_local_stages(&blob)
-                        }
-                        None => false,
-                    }
+                    self.kv.take_capture(kv_epoch).map(|(_, b)| b)
                 };
+                let local_ok = restore_local_ok(
+                    drained,
+                    &blob,
+                    own_capture.as_deref(),
+                    kv_epoch,
+                    head_pos,
+                    |b| self.restore_local_stages(b),
+                );
                 let down_ok = if is_last {
                     true
                 } else {
@@ -2079,13 +2143,7 @@ impl Qwen36Engine {
                         // the blob and is derived BEFORE it is installed; unreadable or past the
                         // matched (strict) prefix ⇒ refuse and reprefill cold, never clamp.
                         Some((blob, len, plane_pulled)) => {
-                            match crate::kv_coordination::warm_resume_depth(
-                                &blob,
-                                len,
-                                crate::kv_coordination::strict_depth(),
-                            )
-                            .filter(|&d| d <= len)
-                            {
+                            match head_resume_pos(&blob, len) {
                                 Some(warm) if self.restore_local_stages(&blob) => {
                                     info!(
                                         warm_prefix = warm,
@@ -2924,6 +2982,104 @@ mod tests {
     // green. The cover is the rig cert's `kv_handoff_epoch_mismatch` bar (OV engines only) — sparse-moe
     // has no cert cell, so sites 4-7 are uncovered. Do not replace this note with a test that drives
     // the drain directly.
+
+    /// Issue-34 follow-up J wiring, head half. The RESTORE header's `pos` field was hard-zero; the
+    /// tail's whole depth assertion is inert if the head stops filling it, and no other test in this
+    /// crate reads that field. Mutation check: `frame_header(FRAME_RESTORE, task_epoch, 0)` fails here.
+    #[cfg(feature = "kv_coord")]
+    #[test]
+    fn a_restore_frame_carries_the_heads_resume_position() {
+        assert_eq!(
+            parse_header(&restore_frame_header(9, 75)),
+            (FRAME_RESTORE, 9, 75)
+        );
+        // 0 is the mixed-pin "not asserted" value and must stay reachable, not be synthesised.
+        assert_eq!(parse_header(&restore_frame_header(9, 0)).2, 0);
+    }
+
+    /// Issue-34 follow-up J wiring, tail half: the gate must sit IN FRONT of the install on every
+    /// arm, not merely exist. A spy install records what actually reached `set_state`.
+    ///
+    /// Mutation check: deleting the `restore_depth_admits` call from either arm makes the skewed and
+    /// unparseable cases install, failing the `installed.is_empty()` assertions.
+    #[cfg(feature = "kv_coord")]
+    #[test]
+    fn a_skewed_or_undescribed_slice_never_reaches_set_state() {
+        fn framed_at(depth: u64) -> Vec<u8> {
+            let name = "past_key_values.0.key";
+            let mut b = 1u32.to_le_bytes().to_vec();
+            b.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            b.extend_from_slice(name.as_bytes());
+            b.extend_from_slice(&[1, 4]); // dtype, rank
+            for d in [1u64, 8, depth, 128] {
+                b.extend_from_slice(&d.to_le_bytes());
+            }
+            b.extend_from_slice(&0u64.to_le_bytes()); // nbytes
+            crate::kv_coordination::frame_blobs(&[b])
+        }
+        // Records every blob the closure was actually asked to install.
+        let run = |drained: bool, carried: &[u8], capture: Option<&[u8]>, head_pos: u32| {
+            let mut installed: Vec<Vec<u8>> = Vec::new();
+            let ok = restore_local_ok(drained, carried, capture, 0xE7, head_pos, |b| {
+                installed.push(b.to_vec());
+                true
+            });
+            (ok, installed)
+        };
+
+        let good = framed_at(75);
+        // Carried arm: matching depth installs, skewed and unparseable do not.
+        assert_eq!(run(false, &good, None, 75), (true, vec![good.clone()]));
+        let (ok, installed) = run(false, &good, None, 74);
+        assert!(!ok && installed.is_empty(), "a 74/75 skew must not install");
+        let (ok, installed) = run(false, &[0u8; 3], None, 75);
+        assert!(
+            !ok && installed.is_empty(),
+            "an undescribed slice must not install"
+        );
+        // Own-capture arm carries the same gate (synth_epoch collides across chains).
+        let (ok, installed) = run(false, &[], Some(&good), 74);
+        assert!(!ok && installed.is_empty(), "capture arm is gated too");
+        assert_eq!(run(false, &[], Some(&good), 75), (true, vec![good.clone()]));
+        // A head that asserts nothing (older pin) keeps the previous behaviour.
+        assert_eq!(run(false, &good, None, 0), (true, vec![good.clone()]));
+        // Ordering: a drained plane slice wins and nothing else is installed (it gated itself).
+        assert_eq!(run(true, &good, Some(&good), 74), (true, vec![]));
+        // Carried wins over the own capture.
+        assert_eq!(run(false, &good, Some(&[0u8; 3]), 75), (true, vec![good]));
+        // Nothing anywhere ⇒ cold.
+        assert_eq!(run(false, &[], None, 75), (false, vec![]));
+    }
+
+    /// Both head sites derive the resume position through one rule, including the `<= matched_len`
+    /// guard that keeps a too-deep slice from skipping prefill and decoding off a `None` next-token.
+    #[cfg(feature = "kv_coord")]
+    #[test]
+    fn head_resume_pos_refuses_an_unreadable_or_too_deep_slice() {
+        let name = "past_key_values.0.key";
+        let mut raw = 1u32.to_le_bytes().to_vec();
+        raw.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        raw.extend_from_slice(name.as_bytes());
+        raw.extend_from_slice(&[1, 4]);
+        for d in [1u64, 8, 75, 128] {
+            raw.extend_from_slice(&d.to_le_bytes());
+        }
+        raw.extend_from_slice(&0u64.to_le_bytes());
+        let framed = crate::kv_coordination::frame_blobs(&[raw]);
+        assert_eq!(head_resume_pos(&framed, 75), Some(75)); // the certified case
+        assert_eq!(head_resume_pos(&framed, 100), Some(75)); // depth, not the token count
+        assert_eq!(head_resume_pos(&framed, 74), None, "deeper than the prefix");
+        assert_eq!(head_resume_pos(&[0u8; 3], 75), None, "never unwrap_or(len)");
+    }
+
+    // NOT UNIT-TESTABLE, stated rather than faked (same reason as the drain-call-site note above):
+    // that `step_pipe_first` passes its `warm` — and not 0 — into `forward_restore_downstream`, and
+    // that `step_pipe_relay`'s Restore arm feeds `restore_local_ok` the frame's own `head_pos`. Both
+    // arms need a live pipeline transport and a compiled stage, so no test in this crate reaches
+    // them; the seams either side (`head_resume_pos`, `restore_frame_header`, `restore_local_ok`) are
+    // pinned above. The cover for the join is the rig cert's warm==cold bar plus the new
+    // `depth`/`head_pos` fields on `qwen36_tail_restore_carried`, which make a wrong value visible in
+    // the log rather than only in the output.
 
     #[test]
     fn submit_caps_pending_queue() {

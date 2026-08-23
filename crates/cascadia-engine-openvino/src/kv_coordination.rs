@@ -690,6 +690,10 @@ pub(crate) struct OvKvCache {
     /// than a cold fallback. Invisible at 2 stages (exactly one downstream rank, nothing to overwrite),
     /// which is why the rig certs never caught it. Bounded.
     downstream: HashMap<(u64, u16), Vec<u8>>,
+    /// Carry takes that missed while OTHER slices were stashed — i.e. real stash/restore epoch-key
+    /// drift, cumulative. Mirrors `KvHandoffMailbox::epoch_mismatches`, and for the same reason: the
+    /// warn is what a rig run is read by, and only a counter makes "did it fire?" assertable off-rig.
+    carry_epoch_misses: u64,
 }
 
 impl OvKvCache {
@@ -822,16 +826,29 @@ impl OvKvCache {
     /// clears `downstream` — so that recovery hands the tail another turn's tensors to install under
     /// this turn's position. On the chain leg nothing downstream re-validated them, which is wrong
     /// output; carrying nothing costs a cold reprefill instead.
+    ///
+    /// Only a miss with something ELSE still stashed is drift — that is the case the deleted
+    /// fallback used to paper over. An EMPTY stash is the ordinary same-chain turn (nothing pulled,
+    /// so `stash_downstream_rank` never fired) and every middle rank (only the head pulls all ranks),
+    /// so warning there would assert a drift that did not happen on nearly every warm turn.
     pub(crate) fn take_downstream_carry(&mut self, epoch: u64, rank: u16) -> Option<Vec<u8>> {
         let hit = self.downstream.remove(&(epoch, rank));
-        if hit.is_none() {
+        if hit.is_none() && !self.downstream.is_empty() {
             // The cert gates on this name: a silent fallback is what made the epoch drift
             // undiagnosable in the first place (ov-runtime at least warned).
+            self.carry_epoch_misses += 1;
             tracing::warn!(target: "cascadia::kv", event = "qwen36_restore_carry_epoch_miss",
                 epoch, rank, stashed = self.downstream.len(),
-                "no slice stashed under this turn's epoch; carrying nothing (rank votes cold)");
+                stashed_keys = ?self.downstream.keys().copied().collect::<Vec<_>>(),
+                "slices are stashed but none under this turn's (epoch, rank); carrying nothing (rank votes cold)");
         }
         hit
+    }
+
+    /// Cumulative real carry-epoch drifts (see [`Self::take_downstream_carry`]). An ordinary
+    /// same-chain turn or a middle rank leaves this at 0.
+    pub(crate) fn carry_epoch_misses(&self) -> u64 {
+        self.carry_epoch_misses
     }
 
     /// Head: epoch-agnostic fallback for the ONE stashed blob belonging to `rank`. Covers stash/restore
@@ -1563,11 +1580,37 @@ mod tests {
         );
         // The epoch-blind method still exists for ov-runtime, and still would have handed it over.
         assert_eq!(c.take_downstream_single(1), Some(vec![1, 2, 3]));
+        assert_eq!(
+            c.carry_epoch_misses(),
+            1,
+            "a miss with another slice still stashed IS drift and must be reported"
+        );
         // The turn's OWN slice still carries.
         c.stash_downstream(0xCCCC_CCCC, 1, vec![4, 5, 6]);
         assert_eq!(c.take_downstream_carry(0xCCCC_CCCC, 1), Some(vec![4, 5, 6]));
         // ...and is consumed on take (one carry per turn).
         assert!(c.take_downstream_carry(0xCCCC_CCCC, 1).is_none());
+    }
+
+    /// The drift warn must not fire on the ordinary same-chain turn or on a middle rank — only the
+    /// head pulls all ranks, so `stash_downstream_rank` never fires elsewhere and the stash is empty.
+    /// An event that cries drift on nearly every warm turn makes a rig run unreadable: `stashed`
+    /// would be the only thing separating benign from real.
+    ///
+    /// Mutation check: dropping the `!self.downstream.is_empty()` gate fails the first assertion.
+    #[test]
+    fn an_empty_downstream_stash_is_not_reported_as_epoch_drift() {
+        let mut c = OvKvCache::default();
+        assert!(c.take_downstream_carry(0xAAAA_AAAA, 1).is_none());
+        assert_eq!(
+            c.carry_epoch_misses(),
+            0,
+            "nothing stashed ⇒ nothing drifted; this is every same-chain turn and every middle rank"
+        );
+        // A miss for a DIFFERENT rank while this rank's slice sits there is still drift.
+        c.stash_downstream(0xAAAA_AAAA, 1, vec![1, 2, 3]);
+        assert!(c.take_downstream_carry(0xAAAA_AAAA, 2).is_none());
+        assert_eq!(c.carry_epoch_misses(), 1);
     }
 
     /// Issue-34 follow-up J, the defect itself: the chain leg installed a carried slice without ever
