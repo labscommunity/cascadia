@@ -1307,41 +1307,11 @@ fn prefill_chunk() -> usize {
     }
 }
 
-/// Issue 7 escape hatch. Strict (default): every restore site takes `position` from
-/// `installed_depth` of the blob it installs, and an unparseable depth REFUSES the restore —
-/// clamping or flooring installs the state and then lies about its depth, which is how §12.16's §6
-/// turned an intermittent fault deterministic. `CASCADIA_RUNTIME_STRICT_DEPTH=0` restores the
-/// certified legacy token-count clamp at BOTH ends of the chain path (head site A + tail site C2,
-/// via the shared `warm_resume_depth`) so hatch mode stays chain-consistent; B/C1's `unwrap_or(0)`
-/// floor was never certified and stays strict. To be removed after two green matrices.
+// The issue-7 depth rule (`strict_depth` / `warm_resume_depth`) now lives in `kv_coordination`,
+// beside `installed_depth`, so ov-runtime's two sites and qwen36's two head sites share ONE rule
+// instead of three — qwen36 was the last engine still on the legacy clamp.
 #[cfg(feature = "kv_coord")]
-fn strict_depth() -> bool {
-    std::env::var("CASCADIA_RUNTIME_STRICT_DEPTH")
-        .ok()
-        .as_deref()
-        != Some("0")
-}
-
-/// Warm-resume depth rule for the certified chain path's two ends — the head (site A) and the
-/// tail's own-capture restore (site C2) — split out so both share ONE rule (a strict head over a
-/// legacy tail, or vice versa, would disagree on a turn's depth and trip a spurious `TURN_BEGIN`
-/// position-mismatch warn) and so the strict-vs-legacy arms are unit-testable. `None` ⇒ refuse the
-/// restore (serve cold). Legacy keeps today's certified behaviour exactly: clamp to the matched
-/// token count, fall back to it when unparseable.
-#[cfg(feature = "kv_coord")]
-fn warm_resume_depth(blob: &[u8], matched_len: usize, strict: bool) -> Option<usize> {
-    if strict {
-        crate::kv_coordination::installed_depth(blob)
-            .ok()
-            .map(|d| d as usize)
-    } else {
-        Some(
-            crate::kv_coordination::kv_seq_from_blob(blob)
-                .map(|s| s.min(matched_len))
-                .unwrap_or(matched_len),
-        )
-    }
-}
+use crate::kv_coordination::{strict_depth, warm_resume_depth};
 
 /// Primary input of one prefill chunk: prompt ids on the embed stage, hidden
 /// rows (`hid` floats per token, row-major) on relay/head stages. Conversion
