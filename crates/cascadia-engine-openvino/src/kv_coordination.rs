@@ -252,6 +252,66 @@ pub(crate) fn kv_seq_from_framed_blob(blob: &[u8]) -> Option<usize> {
     parts.iter().filter_map(|p| kv_seq_from_blob(p)).max()
 }
 
+/// Issue 7 escape hatch. Strict (default): every restore site takes `position` from
+/// [`installed_depth`] of the blob it installs, and an unparseable depth REFUSES the restore —
+/// clamping or flooring installs the state and then lies about its depth, which is how §12.16's §6
+/// turned an intermittent fault deterministic. `CASCADIA_RUNTIME_STRICT_DEPTH=0` restores the
+/// certified legacy token-count clamp at every site that shares [`warm_resume_depth`] (ov-runtime's
+/// head site A + tail site C2, and both qwen36 head sites) so hatch mode stays chain-consistent;
+/// ov-runtime B/C1's `unwrap_or(0)` floor was never certified and stays strict. To be removed after
+/// two green matrices.
+pub(crate) fn strict_depth() -> bool {
+    std::env::var("CASCADIA_RUNTIME_STRICT_DEPTH")
+        .ok()
+        .as_deref()
+        != Some("0")
+}
+
+/// Warm-resume depth rule for every head-side restore, shared so the chain's two ends cannot
+/// disagree on a turn's depth (a strict head over a legacy tail trips a spurious `TURN_BEGIN`
+/// position-mismatch warn) and so the strict-vs-legacy arms are unit-testable. `None` ⇒ refuse the
+/// restore (serve cold). Legacy keeps today's certified behaviour exactly: clamp to the matched
+/// token count, fall back to it when unparseable — framed-first, so a qwen36 stage bundle reads at
+/// its true depth under the hatch instead of degrading to the raw parser's `None`.
+pub(crate) fn warm_resume_depth(blob: &[u8], matched_len: usize, strict: bool) -> Option<usize> {
+    if strict {
+        installed_depth(blob).ok().map(|d| d as usize)
+    } else {
+        Some(
+            kv_seq_from_framed_blob(blob)
+                .or_else(|| kv_seq_from_blob(blob))
+                .map(|s| s.min(matched_len))
+                .unwrap_or(matched_len),
+        )
+    }
+}
+
+/// Why a chain-carried RESTORE slice was refused. Both arms mean "install nothing": the ANDed
+/// RESTORE verdict goes 0 and the head cold-admits, which is a correct (if slower) turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CarriedReject {
+    /// The slice describes no depth, so the mask the next fold builds would be a guess (issue 7).
+    DepthUnknown(DepthError),
+    /// The slice is folded to a different depth than the head resumes at. Nothing raises a shape
+    /// error on this — OV tolerates the short mask and the position-free DeltaNet layers carry no
+    /// mask at all — so the chain simply runs the turn out of step and emits wrong tokens.
+    Skew { depth: i64, head_pos: u32 },
+}
+
+/// Chain-carried restore admission: the slice's own depth must be readable AND must equal the
+/// head's asserted resume position, both checked BEFORE anything is installed.
+///
+/// `head_pos == 0` ⇒ an older head that asserts nothing (the RESTORE header's `pos` field was
+/// hard-zero before this), so a mixed-pin chain degrades to the previous behaviour rather than
+/// colding every turn.
+pub(crate) fn carried_restore_admits(blob: &[u8], head_pos: u32) -> Result<i64, CarriedReject> {
+    let depth = installed_depth(blob).map_err(CarriedReject::DepthUnknown)?;
+    if head_pos != 0 && depth != i64::from(head_pos) {
+        return Err(CarriedReject::Skew { depth, head_pos });
+    }
+    Ok(depth)
+}
+
 /// Compact a `get_state_blob` blob along the seq dim (index 2): keep position `i` only where
 /// `valid[i] != 0` (positions past `valid.len()` are kept), packed in order, rewriting each rank≥3
 /// state's `shape[2]` + data to the kept count. Rank<3 **and recurrent (conv/ssm)** states copy
@@ -751,6 +811,27 @@ impl OvKvCache {
     /// Count of stashed downstream blobs (diagnostic + single-slot fallback guard).
     pub(crate) fn downstream_len(&self) -> usize {
         self.downstream.len()
+    }
+
+    /// Head → downstream carry (qwen36 chain leg): the slice stashed under THIS turn's content
+    /// epoch for THIS recipient rank, or nothing, and loud on a miss.
+    ///
+    /// Deliberately has NO epoch-blind single-slot recovery (ov-runtime still uses
+    /// [`Self::take_downstream_single`]). Nothing distinguishes a drifted stash key from a slice
+    /// stranded by an earlier turn that pulled and then failed to warm — `abort_warm_resume` never
+    /// clears `downstream` — so that recovery hands the tail another turn's tensors to install under
+    /// this turn's position. On the chain leg nothing downstream re-validated them, which is wrong
+    /// output; carrying nothing costs a cold reprefill instead.
+    pub(crate) fn take_downstream_carry(&mut self, epoch: u64, rank: u16) -> Option<Vec<u8>> {
+        let hit = self.downstream.remove(&(epoch, rank));
+        if hit.is_none() {
+            // The cert gates on this name: a silent fallback is what made the epoch drift
+            // undiagnosable in the first place (ov-runtime at least warned).
+            tracing::warn!(target: "cascadia::kv", event = "qwen36_restore_carry_epoch_miss",
+                epoch, rank, stashed = self.downstream.len(),
+                "no slice stashed under this turn's epoch; carrying nothing (rank votes cold)");
+        }
+        hit
     }
 
     /// Head: epoch-agnostic fallback for the ONE stashed blob belonging to `rank`. Covers stash/restore
@@ -1451,6 +1532,90 @@ mod tests {
             Err(DepthError { blob_len: 4 })
         );
     }
+    /// One rank-4 attention state at fold `depth`, raw `get_state_blob` layout (data elided — the
+    /// parser reads shape only).
+    fn raw_at_depth(depth: u64) -> Vec<u8> {
+        let name = "past_key_values.0.key";
+        let mut b = 1u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        b.extend_from_slice(name.as_bytes());
+        b.extend_from_slice(&[1, 4]); // dtype, rank
+        for d in [1u64, 8, depth, 128] {
+            b.extend_from_slice(&d.to_le_bytes());
+        }
+        b.extend_from_slice(&0u64.to_le_bytes()); // nbytes
+        b
+    }
+
+    /// Issue-34 follow-up J. A slice stranded by an earlier turn — `abort_warm_resume` never clears
+    /// `downstream` — must not ride a DIFFERENT turn's RESTORE. qwen36's head takes epoch-strict
+    /// through `take_downstream_carry`; the epoch-blind `take_downstream_single` it used to fall back
+    /// to hands over another turn's tensors for the chain leg to install unvalidated.
+    ///
+    /// Mutation check: restoring the `.or_else(take_downstream_single)` fallback fails the `is_none`.
+    #[test]
+    fn a_stranded_downstream_slice_is_not_carried_under_a_different_epoch() {
+        let mut c = OvKvCache::default();
+        c.stash_downstream(0xAAAA_AAAA, 1, vec![1, 2, 3]); // stranded by a turn that never warmed
+        assert!(
+            c.take_downstream_carry(0xBBBB_BBBB, 1).is_none(),
+            "a foreign epoch must carry nothing, even when exactly one slice is stashed"
+        );
+        // The epoch-blind method still exists for ov-runtime, and still would have handed it over.
+        assert_eq!(c.take_downstream_single(1), Some(vec![1, 2, 3]));
+        // The turn's OWN slice still carries.
+        c.stash_downstream(0xCCCC_CCCC, 1, vec![4, 5, 6]);
+        assert_eq!(c.take_downstream_carry(0xCCCC_CCCC, 1), Some(vec![4, 5, 6]));
+        // ...and is consumed on take (one carry per turn).
+        assert!(c.take_downstream_carry(0xCCCC_CCCC, 1).is_none());
+    }
+
+    /// Issue-34 follow-up J, the defect itself: the chain leg installed a carried slice without ever
+    /// deriving its depth, so a rank-1 slice folded to 74 under a head resuming at 75 was applied
+    /// silently — no shape error, just a chain running the turn one token out of step.
+    ///
+    /// Mutation check: dropping the skew arm fails the `74` assertion; dropping the depth arm fails
+    /// the unparseable one; making `head_pos == 0` assert fails the mixed-pin assertion.
+    #[test]
+    fn a_carried_slice_whose_depth_disagrees_with_the_head_is_refused() {
+        let blob = frame_blobs(&[raw_at_depth(75), raw_at_depth(75)]);
+        assert_eq!(carried_restore_admits(&blob, 75), Ok(75));
+        assert_eq!(
+            carried_restore_admits(&blob, 74),
+            Err(CarriedReject::Skew {
+                depth: 75,
+                head_pos: 74
+            }),
+            "the skew this bug is made of"
+        );
+        assert_eq!(
+            carried_restore_admits(&[0u8; 3], 75),
+            Err(CarriedReject::DepthUnknown(DepthError { blob_len: 3 })),
+            "depth unparseable ⇒ cold, never install"
+        );
+        // A head at a pin that does not assert (`pos` was hard-zero) keeps the previous behaviour
+        // rather than colding every turn of a mixed-pin chain.
+        assert_eq!(carried_restore_admits(&blob, 0), Ok(75));
+        assert!(carried_restore_admits(&[0u8; 3], 0).is_err());
+        // Raw (unframed) slices go through the same rule — ov-runtime's blob shape.
+        assert_eq!(carried_restore_admits(&raw_at_depth(75), 75), Ok(75));
+    }
+
+    /// Parity guard: all four warm-resume head sites (ov-runtime A/C2, both qwen36 heads) share ONE
+    /// rule, and the legacy hatch reads a FRAMED qwen36 bundle at its true depth instead of
+    /// degrading to the raw parser's `None` (which would silently become the token count).
+    #[test]
+    fn warm_resume_depth_reads_framed_bundles_under_both_arms() {
+        let framed = frame_blobs(&[raw_at_depth(85), raw_at_depth(85)]);
+        assert_eq!(warm_resume_depth(&framed, 40, true), Some(85));
+        assert_eq!(warm_resume_depth(&framed, 100, true), Some(85));
+        assert_eq!(warm_resume_depth(&[0u8; 3], 40, true), None);
+        // Legacy: qwen36's certified rule, byte for byte — clamp to the matched count.
+        assert_eq!(warm_resume_depth(&framed, 40, false), Some(40));
+        assert_eq!(warm_resume_depth(&framed, 100, false), Some(85));
+        assert_eq!(warm_resume_depth(&[0u8; 3], 40, false), Some(40));
+    }
+
     /// Issue 7 capture-side assertion: a blob deeper than its token list is a capture defect and
     /// must not be cached — whatever lands in this stash is what a restore site later installs.
     /// Depth == token count stays capturable (KV depth is normally matched_len - 1, and equality is

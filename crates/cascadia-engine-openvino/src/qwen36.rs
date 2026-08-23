@@ -228,6 +228,45 @@ fn parse_header(b: &[u8]) -> (u32, u32, u32) {
     (f(0), f(4), f(8))
 }
 
+/// rank>0 RESTORE admission, checked BEFORE anything is installed: the slice's own depth must be
+/// readable and must equal the head's resume position (`head_pos`, the RESTORE header's `pos`).
+/// `None` ⇒ install nothing, which feeds the ANDed verdict, cold-admits the head, and serves a
+/// correct (if slower) turn.
+///
+/// Until this existed the chain leg installed whatever `Vec<u8>` reached it and never derived a
+/// depth, so a rank-1 slice folded to a depth other than the head's was applied silently — no shape
+/// error (OV tolerates the short mask and the position-free DeltaNet layers carry none), the chain
+/// just ran the turn out of step. The plane leg was immune only because its mailbox epoch-binds,
+/// codec-validates and depth-checks the same slice before applying it.
+#[cfg(feature = "kv_coord")]
+fn restore_depth_admits(
+    blob: &[u8],
+    kv_epoch: u64,
+    head_pos: u32,
+    source: &'static str,
+) -> Option<i64> {
+    use crate::kv_coordination::CarriedReject;
+    match crate::kv_coordination::carried_restore_admits(blob, head_pos) {
+        Ok(depth) => Some(depth),
+        Err(CarriedReject::DepthUnknown(e)) => {
+            warn!(error = %e, kv_epoch, source, blob_len = blob.len(),
+                "qwen36: restore slice depth unparseable; refusing restore; rank cold");
+            None
+        }
+        Err(CarriedReject::Skew { depth, head_pos }) => {
+            warn!(
+                kv_epoch,
+                source,
+                depth,
+                head_pos,
+                blob_len = blob.len(),
+                "qwen36: restore slice depth disagrees with the head's resume position; rank cold"
+            );
+            None
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct Manifest {
     arch: String,
@@ -687,11 +726,13 @@ enum InFrame {
     /// Issue-34 consume RESTORE: `set_state` the pulled slice stashed under `kv_epoch`. `task_epoch`
     /// (frame header) advances `peer_epoch` exactly like RESET. `blob` is the head's inline carry for
     /// the CROSS-chain case (this rank has no local capture for a foreign chain's epoch); empty on
-    /// the same-chain path, where the rank restores from its own CAPTURE stash.
+    /// the same-chain path, where the rank restores from its own CAPTURE stash. `head_pos` (frame
+    /// header `pos`) is the head's resume position; `0` ⇒ an older head that asserts nothing.
     #[cfg(feature = "kv_coord")]
     Restore {
         task_epoch: u32,
         kv_epoch: u64,
+        head_pos: u32,
         blob: Vec<u8>,
     },
 }
@@ -1146,8 +1187,18 @@ impl Qwen36Engine {
     /// Issue-34 consume: send `RESTORE(kv_epoch)` downstream and return the chain's all-or-nothing
     /// verdict (ACK `pos` == 1 ⇒ every downstream rank restored). Used by the head (admission) and
     /// chained by each middle. `Ok(false)` ⇒ the head must fall back to a cold RESET.
+    ///
+    /// `head_pos` is the head's resume position, carried in the frame header's `pos` field (hard-zero
+    /// before this) and asserted by every rank against the depth of the slice it is about to install.
+    /// A middle chains the value it received, so one position governs the whole chain. `0` ⇒ not
+    /// asserted, which is what an older head sends.
     #[cfg(feature = "kv_coord")]
-    fn forward_restore_downstream(&mut self, task_epoch: u32, kv_epoch: u64) -> EngineResult<bool> {
+    fn forward_restore_downstream(
+        &mut self,
+        task_epoch: u32,
+        kv_epoch: u64,
+        head_pos: u32,
+    ) -> EngineResult<bool> {
         let downstream = self
             .downstream
             .clone()
@@ -1159,16 +1210,19 @@ impl Qwen36Engine {
         // Take THIS frame's recipient (self.rank + 1), not "whatever was stashed for this epoch":
         // every rank of one pull shares the content epoch, so an epoch-only take returned the
         // last-stashed rank's tensors — wrong state for any chain deeper than 2 stages.
+        // Epoch-STRICT (see take_downstream_carry): the epoch-blind single-slot fallback that used to
+        // sit here could hand this rank a slice stranded by an earlier turn, and nothing on the chain
+        // leg re-validated it. It was also silent, unlike ov-runtime's.
         let down_rank = (self.rank + 1) as u16;
         let blob = self
             .kv
-            .take_downstream(kv_epoch, down_rank)
-            .or_else(|| self.kv.take_downstream_single(down_rank))
+            .take_downstream_carry(kv_epoch, down_rank)
             .unwrap_or_default();
         if !blob.is_empty() {
             info!(
                 kv_epoch,
                 blob_len = blob.len(),
+                head_pos,
                 "qwen36_restore_carry_downstream"
             );
         }
@@ -1177,7 +1231,7 @@ impl Qwen36Engine {
             &h,
             reply_bounded(async move {
                 let mut g = downstream.lock().await;
-                g.send_raw(&frame_header(FRAME_RESTORE, task_epoch, 0))
+                g.send_raw(&frame_header(FRAME_RESTORE, task_epoch, head_pos))
                     .await?;
                 g.send_raw(&kv_epoch.to_le_bytes()).await?;
                 g.send_raw(&(blob.len() as u32).to_be_bytes()).await?;
@@ -1275,47 +1329,73 @@ impl Qwen36Engine {
                     match self.kv.take_warm(&task.tenant, &prompt_i32) {
                         Some((blob, len, plane_pulled)) => {
                             let kv_epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
-                            let local_ok = self.restore_local_stages(&blob);
-                            // ALWAYS send the RESTORE, including in plane mode. It is the only thing on
-                            // the warm path that advances the downstream ranks' `peer_epoch` (their
-                            // InFrame::Restore sets it) and `self.epoch` was already bumped at
-                            // admission — short-circuiting it left every subsequent FORWARD dropped as
-                            // "stale frame". It is also the real restore on the same-chain path, where
-                            // no plane pull ever armed the downstream ranks.
-                            let plane_turn = self.plane_restore && plane_pulled;
-                            let chain_ok = local_ok && {
-                                // Binding in BOTH modes, matching ov-runtime: a plane rank arms
-                                // in-band inside its own OPCODE_RESTORE handler, so a `false` here
-                                // means it really is cold. The old `chain_verdict` override existed
-                                // for the out-of-band arm and would now mask exactly that — turning
-                                // a retracted or dropped downstream slice into a warm head over a
-                                // cold rank, which is wrong output rather than a cold reprefill.
-                                self.forward_restore_downstream(self.epoch, kv_epoch)
-                                    .unwrap_or(false)
-                            };
-                            if chain_ok {
-                                // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
-                                // kv_seq_from_framed_blob now ignores the fixed-shape DeltaNet conv/ssm
-                                // states (they poisoned the depth max with a constant 128), so it returns
-                                // the TRUE attention fold depth. Resume there (`.min(len)`, matching the
-                                // GREEN ov-runtime path). Resuming at len-1 re-fed the last folded token,
-                                // which the position-free DeltaNet layers double-applied ⇒ cross-chain
-                                // DIVERGE; the attention-only depth is correct for both attention and SSM.
-                                let warm = crate::kv_coordination::kv_seq_from_framed_blob(&blob)
-                                    .map(|s| s.min(len))
-                                    .unwrap_or(len);
-                                info!(task = %task.task_id, warm_prefix = warm, matched = len, plane_pulled, plane_turn, "qwen36 pipeline warm-resumed");
-                                // Anti-self-deception: raw provenance, not `plane_turn` — the AND
-                                // above is identically false in chain mode and would hide a real
-                                // cross-chain pull behind "local".
-                                let source = if plane_pulled { "pulled" } else { "local" };
-                                tracing::info!(target: "cascadia::kv", event = "kv_warm_provenance",
-                                    source, epoch = kv_epoch, len);
-                                warm
-                            } else {
-                                warn!(task = %task.task_id, "qwen36: pipeline restore incomplete; cold reset");
-                                cold_admit!();
-                                0
+                            // Issue 7 rule, now shared with ov-runtime: derive the resume depth from
+                            // the blob BEFORE installing it, and refuse an unreadable one. The old
+                            // `unwrap_or(len)` installed a state whose depth it could not read and
+                            // then asserted `len` anyway. Behaviour-neutral on the certified case
+                            // (depth == len == 75); it is the head half of the depth contract the
+                            // tail now asserts against.
+                            match crate::kv_coordination::warm_resume_depth(
+                                &blob,
+                                len,
+                                crate::kv_coordination::strict_depth(),
+                            )
+                            .filter(|&d| d <= len)
+                            {
+                                // Unreadable, or deeper than the matched prefix. `take_warm`
+                                // guarantees a STRICT prefix, so a deeper slice would skip prefill
+                                // entirely and decode off a `None` next-token; cold instead of
+                                // clamping — clamping is the "install it and lie about its depth"
+                                // arm this change deletes.
+                                None => {
+                                    warn!(task = %task.task_id, blob_len = blob.len(), matched = len,
+                                        "qwen36: warm blob depth unreadable or past the matched prefix; cold reprefill");
+                                    cold_admit!();
+                                    0
+                                }
+                                Some(warm) => {
+                                    let local_ok = self.restore_local_stages(&blob);
+                                    // ALWAYS send the RESTORE, including in plane mode. It is the only thing on
+                                    // the warm path that advances the downstream ranks' `peer_epoch` (their
+                                    // InFrame::Restore sets it) and `self.epoch` was already bumped at
+                                    // admission — short-circuiting it left every subsequent FORWARD dropped as
+                                    // "stale frame". It is also the real restore on the same-chain path, where
+                                    // no plane pull ever armed the downstream ranks.
+                                    let plane_turn = self.plane_restore && plane_pulled;
+                                    let chain_ok = local_ok && {
+                                        // Binding in BOTH modes, matching ov-runtime: a plane rank arms
+                                        // in-band inside its own OPCODE_RESTORE handler, so a `false` here
+                                        // means it really is cold. The old `chain_verdict` override existed
+                                        // for the out-of-band arm and would now mask exactly that — turning
+                                        // a retracted or dropped downstream slice into a warm head over a
+                                        // cold rank, which is wrong output rather than a cold reprefill.
+                                        //
+                                        // `warm` rides the frame header's `pos` field: it is the head's
+                                        // resume position, and the tail refuses any carried slice folded
+                                        // to a different depth. Nothing bound the two before, so a skewed
+                                        // rank-1 slice installed silently and the chain ran out of step.
+                                        self.forward_restore_downstream(
+                                            self.epoch,
+                                            kv_epoch,
+                                            warm as u32,
+                                        )
+                                        .unwrap_or(false)
+                                    };
+                                    if chain_ok {
+                                        info!(task = %task.task_id, warm_prefix = warm, matched = len, plane_pulled, plane_turn, "qwen36 pipeline warm-resumed");
+                                        // Anti-self-deception: raw provenance, not `plane_turn` — the AND
+                                        // above is identically false in chain mode and would hide a real
+                                        // cross-chain pull behind "local".
+                                        let source = if plane_pulled { "pulled" } else { "local" };
+                                        tracing::info!(target: "cascadia::kv", event = "kv_warm_provenance",
+                                            source, epoch = kv_epoch, len);
+                                        warm
+                                    } else {
+                                        warn!(task = %task.task_id, "qwen36: pipeline restore incomplete; cold reset");
+                                        cold_admit!();
+                                        0
+                                    }
+                                }
                             }
                         }
                         None => {
@@ -1597,6 +1677,7 @@ impl Qwen36Engine {
                     Ok(InFrame::Restore {
                         task_epoch: epoch,
                         kv_epoch,
+                        head_pos: pos,
                         blob,
                     })
                 }
@@ -1720,6 +1801,7 @@ impl Qwen36Engine {
             InFrame::Restore {
                 task_epoch,
                 kv_epoch,
+                head_pos,
                 blob,
             } => {
                 // Consume warm-resume: set_state this rank's pulled slice, chain RESTORE downstream,
@@ -1736,35 +1818,54 @@ impl Qwen36Engine {
                 let local_ok = if self.drain_kv_handoff(kv_epoch) {
                     true
                 } else if !blob.is_empty() {
-                    let ok = self.restore_local_stages(&blob);
-                    // Cert marker: proves the CARRIED (cross-chain) branch ran, not the same-chain
-                    // capture fallback — the two are indistinguishable in the verdict alone. Emitted
-                    // ONLY on success, matching `ov_tail_restore_carried`, so the cert's gate counts
-                    // successes for both engines rather than attempts for one of them.
-                    if ok {
-                        info!(
-                            kv_epoch,
-                            blob_len = blob.len(),
-                            "qwen36_tail_restore_carried"
-                        );
-                    } else {
-                        warn!(
-                            kv_epoch,
-                            blob_len = blob.len(),
-                            "qwen36_tail_restore_carried_failed"
-                        );
+                    match restore_depth_admits(&blob, kv_epoch, head_pos, "carried") {
+                        None => false,
+                        Some(depth) => {
+                            let ok = self.restore_local_stages(&blob);
+                            // Cert marker: proves the CARRIED (cross-chain) branch ran, not the
+                            // same-chain capture fallback — the two are indistinguishable in the
+                            // verdict alone. Emitted ONLY on success, matching
+                            // `ov_tail_restore_carried`, so the cert's gate counts successes for both
+                            // engines rather than attempts for one of them. `depth`/`head_pos` are
+                            // new: a future skew is one grep away instead of unobservable.
+                            if ok {
+                                info!(
+                                    kv_epoch,
+                                    blob_len = blob.len(),
+                                    depth,
+                                    head_pos,
+                                    "qwen36_tail_restore_carried"
+                                );
+                            } else {
+                                warn!(
+                                    kv_epoch,
+                                    blob_len = blob.len(),
+                                    depth,
+                                    head_pos,
+                                    "qwen36_tail_restore_carried_failed"
+                                );
+                            }
+                            ok
+                        }
                     }
-                    ok
                 } else {
                     match self.kv.take_capture(kv_epoch) {
-                        Some((_, blob)) => self.restore_local_stages(&blob),
+                        // Same rule for the own-capture fallback, which has the same blind spot: B's
+                        // greedy answer to A's prompt is token-identical, so `synth_epoch` collides
+                        // exactly and this rank can genuinely hold a capture under a foreign chain's
+                        // epoch. Depth is the only thing that catches it.
+                        Some((_, blob)) => {
+                            restore_depth_admits(&blob, kv_epoch, head_pos, "capture").is_some()
+                                && self.restore_local_stages(&blob)
+                        }
                         None => false,
                     }
                 };
                 let down_ok = if is_last {
                     true
                 } else {
-                    self.forward_restore_downstream(task_epoch, kv_epoch)
+                    // Chain the head's position on unchanged: one position governs every rank.
+                    self.forward_restore_downstream(task_epoch, kv_epoch, head_pos)
                         .unwrap_or(false)
                 };
                 let verdict = u32::from(local_ok && down_ok);
@@ -1974,34 +2075,46 @@ impl Qwen36Engine {
                 {
                     let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
                     match self.kv.take_warm(&task.tenant, &prompt_i32) {
-                        Some((blob, len, plane_pulled)) if self.restore_local_stages(&blob) => {
-                            // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
-                            // See the sibling site: kv_seq_from_framed_blob now skips conv/ssm and returns
-                            // the true attention depth, so resume at `.min(len)` (matching ov-runtime).
-                            let warm = crate::kv_coordination::kv_seq_from_framed_blob(&blob)
-                                .map(|s| s.min(len))
-                                .unwrap_or(len);
-                            info!(
-                                warm_prefix = warm,
-                                matched = len,
-                                plane_pulled,
-                                "qwen36 single-box warm-resumed from KV blob"
-                            );
-                            // Anti-self-deception: unconditional provenance for the cert scrape.
-                            let source = if plane_pulled { "pulled" } else { "local" };
-                            let epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
-                            tracing::info!(target: "cascadia::kv", event = "kv_warm_provenance",
-                                source, epoch, len);
-                            warm
+                        // Same issue-7 rule as the pipeline head and ov-runtime: the depth comes from
+                        // the blob and is derived BEFORE it is installed; unreadable or past the
+                        // matched (strict) prefix ⇒ refuse and reprefill cold, never clamp.
+                        Some((blob, len, plane_pulled)) => {
+                            match crate::kv_coordination::warm_resume_depth(
+                                &blob,
+                                len,
+                                crate::kv_coordination::strict_depth(),
+                            )
+                            .filter(|&d| d <= len)
+                            {
+                                Some(warm) if self.restore_local_stages(&blob) => {
+                                    info!(
+                                        warm_prefix = warm,
+                                        matched = len,
+                                        plane_pulled,
+                                        "qwen36 single-box warm-resumed from KV blob"
+                                    );
+                                    // Anti-self-deception: unconditional provenance for the cert scrape.
+                                    let source = if plane_pulled { "pulled" } else { "local" };
+                                    let epoch =
+                                        crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
+                                    tracing::info!(target: "cascadia::kv", event = "kv_warm_provenance",
+                                        source, epoch, len);
+                                    warm
+                                }
+                                depth => {
+                                    if depth.is_none() {
+                                        warn!(blob_len = blob.len(), matched = len,
+                                            "qwen36: warm blob depth unreadable or past the matched prefix; cold reprefill");
+                                    }
+                                    self.reset_all();
+                                    0
+                                }
+                            }
                         }
                         None => {
                             tracing::info!(target: "cascadia::kv", event = "kv_warm_take_miss",
                                 partner_hash = crate::kv_coordination::fnv1a64(task.tenant.as_bytes()),
                                 prefix_len = prompt_i32.len());
-                            self.reset_all();
-                            0
-                        }
-                        _ => {
                             self.reset_all();
                             0
                         }
