@@ -17,7 +17,33 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  OV_LINUX_URL: https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/2026.2/linux/openvino_genai_ubuntu22_2026.2.0.0_x86_64.tar.gz
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
 jobs:
+  changes:
+    name: detect linux-relevant changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      linux: ${{ steps.filter.outputs.linux }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: filter
+        with:
+          filters: |
+            linux:
+              - 'crates/cascadia-ov-genai-shim/**'
+              - 'crates/cascadia-engine-openvino/**'
+              - 'crates/cascadia-engine-sparse-moe/examples/**'
+
   test:
     name: cargo test (stub)
     runs-on: ubuntu-latest
@@ -90,3 +116,59 @@ jobs:
         run: |
           cargo clippy -p cascadia-dashboard --features embed-spa --all-targets
           cargo test -p cascadia-dashboard --features embed-spa
+
+  # Pre-flight the Linux release compile: the openvino C++ shim (gemv_offload.cpp)
+  # is only built with --features openvino on ubuntu-22.04 + g++-12 + OV SDK.
+  # ci's stub build never touches it, so GCC errors like v0.1.3/v0.1.4
+  # (inconsistent bool/int lambda return) passed CI and broke the release
+  # mid-publish (tag already created). This job mirrors release.yml's
+  # build-linux prerequisites but runs only when Linux-touched paths change,
+  # so unrelated PRs pay no extra cycles.
+  linux-openvino-check:
+    name: linux openvino check (shim + engine)
+    needs: changes
+    permissions:
+      contents: read
+    if: needs.changes.outputs.linux == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    # Only pay the OV SDK download + C++ compile when it could affect Linux release
+    # Note: paths filters on workflow-level `pull_request` don't gate `push` to main;
+    # for pushes this job always runs. Use job-level `if` with changed-files is
+    # overkill — a no-op build on main push is cheap and verifies the tagline.
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: ci-linux-openvino
+          cache-on-failure: false
+
+      - name: Install g++-12
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-12
+
+      - name: Download + extract OpenVINO GenAI SDK (linux)
+        env:
+          OV_LINUX_URL: https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/2026.2/linux/openvino_genai_ubuntu22_2026.2.0.0_x86_64.tar.gz
+        run: |
+          mkdir -p "$RUNNER_TEMP/ov"
+          curl -fSL "$OV_LINUX_URL" -o "$RUNNER_TEMP/ov.tgz"
+          tar -xzf "$RUNNER_TEMP/ov.tgz" -C "$RUNNER_TEMP/ov" --strip-components=1
+          echo "INTEL_OPENVINO_DIR=$RUNNER_TEMP/ov" >> "$GITHUB_ENV"
+
+      - name: Check Linux openvino build (no upload)
+        env:
+          CXX: g++-12
+          RUSTFLAGS: "-C link-arg=-Wl,-rpath,$ORIGIN/lib -C link-arg=-Wl,--disable-new-dtags"
+        run: cargo check -p cascadia --features openvino
+
+      - name: Verify bundled licensing layout (fails fast if SDK moved)
+        run: test -d "$INTEL_OPENVINO_DIR/docs/licensing" || (echo "::error::OV licensing dir missing at $INTEL_OPENVINO_DIR/docs/licensing"; exit 1)
