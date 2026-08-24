@@ -1085,7 +1085,9 @@ static bool kv_canonical_key(const std::string& name, uint64_t* out_key) {
 }
 
 // Two-call: pass buf=nullptr/cap=0 to learn the size in *len_out, then call again with a buffer of
-// that size. Returns 0 on success (incl. the size-query); 1 on error. `*len_out` is always set.
+// that size. Returns 0 on success (incl. the size-query); 1 on error, including a non-null buffer
+// smaller than the required size. `*len_out` is set whenever the size is known (every 0-return and
+// the too-small error), not on the early null-arg or exception paths.
 int32_t cascadia_runtime_get_state_blob(cascadia_runtime_t* handle, uint8_t* buf, size_t cap,
                                         size_t* len_out) {
     if (!handle || !handle->request || !len_out) {
@@ -1114,7 +1116,16 @@ int32_t cascadia_runtime_get_state_blob(cascadia_runtime_t* handle, uint8_t* buf
             snaps.emplace_back(std::move(name), t);
         }
         *len_out = total;
-        if (!buf || cap < total) return 0; // size query
+        if (!buf) return 0; // size query
+        if (cap < total) {
+            // A non-null under-sized buffer is an error, not a silent size query: the caller's
+            // two-call dance would otherwise treat its untouched (zero-filled) buffer as a valid
+            // snapshot if the state grew between the size query and the fill call.
+            std::ostringstream oss;
+            oss << "get_state_blob: buffer of " << cap << " bytes < required " << total;
+            set_last_error(oss.str().c_str());
+            return 1;
+        }
         // Emit states in canonical (layer, key/value) order parsed from the name, so a consumer on a
         // DIFFERENTLY-compiled instance realigns by identity even when its own query_state() order or
         // raw state names differ. Non-canonical names (other models) keep query_state() order.
