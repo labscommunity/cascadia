@@ -387,6 +387,13 @@ fn io_err(e: cascadia_transport::TransportError) -> std::io::Error {
 
 // -------- MaskedReq (local draft / target wrapper with mask-based rewind) --------
 
+/// Bound on every §8 CAPTURE/RESTORE ack wait — a reply to in-flight work must use a strict
+/// deadline, never the transport's ~900 s frame-idle ceiling (capture runs inside
+/// `finalize_active` holding the downstream lock; restore runs at admission). Matches
+/// ov-runtime's `RESTORE_ACK_TIMEOUT`; every sibling engine bounds these waits.
+#[cfg(feature = "kv_coord")]
+const KV_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 pub struct MaskedReq {
     runtime: OvRuntime,
     has_beam: bool,
@@ -663,6 +670,8 @@ impl DistributedMaskedReq {
 
     /// §8 CAPTURE: broadcast `(epoch, tokens, valid_mask)` down the target chain; await the aggregate
     /// ACK. The mask lets each worker compact its own padded KV blob (workers hold no mask of their own).
+    ///
+    /// (Timeout const lives at module level: [`KV_ACK_TIMEOUT`].)
     /// A non-empty `tenant` upgrades the frame to `CaptureV2` so each worker — which never sees the
     /// `GenerationTask` — can tag its own capture with the same namespace.
     pub(crate) fn capture_downstream(
@@ -697,11 +706,29 @@ impl DistributedMaskedReq {
             g.send_raw(&(kind as u32).to_be_bytes()).await?;
             g.send_raw(&(body.len() as u32).to_be_bytes()).await?;
             g.send_raw(&body).await?;
-            let kb = g.recv_raw(4).await?;
-            if u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]) != FrameKind::CaptureAck as u32 {
-                return Err(cascadia_transport::TransportError::SocketClosed);
+            // Bounded: a reply to in-flight work must not ride the ~900 s frame-idle ceiling —
+            // this runs inside finalize_active holding the downstream lock, so an unbounded wait
+            // withholds a finished turn behind a silent peer (every sibling engine bounds this).
+            // Close on elapse: the late ack has no sequence number and would pair with the next
+            // exchange on a reused connection.
+            match tokio::time::timeout(KV_ACK_TIMEOUT, g.recv_raw(4)).await {
+                Ok(kb) => {
+                    let kb = kb?;
+                    if u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]])
+                        != FrameKind::CaptureAck as u32
+                    {
+                        return Err(cascadia_transport::TransportError::SocketClosed);
+                    }
+                    Ok(())
+                }
+                Err(_) => {
+                    g.close().await;
+                    Err(cascadia_transport::TransportError::Io(std::io::Error::other(
+                        "capture ack timed out; connection dropped to avoid pairing the late \
+                         ack with the next exchange",
+                    )))
+                }
             }
-            Ok(())
         })
         .map_err(|e| EngineError::Backend(e.to_string()))
     }
@@ -725,12 +752,28 @@ impl DistributedMaskedReq {
             if !carried.is_empty() {
                 g.send_raw(&carried).await?;
             }
-            let kb = g.recv_raw(4).await?;
-            if u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]) != FrameKind::RestoreAck as u32 {
-                return Err(cascadia_transport::TransportError::SocketClosed);
+            // Bounded + close-on-elapse, same rationale as capture_downstream above — RESTORE
+            // runs at admission, so an unbounded wait stalls every warm-hit request.
+            match tokio::time::timeout(KV_ACK_TIMEOUT, async {
+                let kb = g.recv_raw(4).await?;
+                if u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]) != FrameKind::RestoreAck as u32
+                {
+                    return Err(cascadia_transport::TransportError::SocketClosed);
+                }
+                let vb = g.recv_raw(1).await?;
+                Ok(vb.first() == Some(&1))
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    g.close().await;
+                    Err(cascadia_transport::TransportError::Io(std::io::Error::other(
+                        "restore ack timed out; connection dropped to avoid pairing the late \
+                         ack with the next exchange",
+                    )))
+                }
             }
-            let vb = g.recv_raw(1).await?;
-            Ok(vb.first() == Some(&1))
         })
         .map_err(|e| EngineError::Backend(e.to_string()))
     }
@@ -2944,11 +2987,26 @@ impl OvDistSpecWorkerEngine {
             g.send_raw(&(kind as u32).to_be_bytes()).await?;
             g.send_raw(&(body.len() as u32).to_be_bytes()).await?;
             g.send_raw(&body).await?;
-            let kb = g.recv_raw(4).await?;
-            if u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]) != FrameKind::CaptureAck as u32 {
-                return Err(cascadia_transport::TransportError::SocketClosed);
+            // Bounded + close-on-elapse (see KV_ACK_TIMEOUT): a mid-rank wedged on a silent
+            // downstream otherwise never acks upstream either, wedging the whole chain.
+            match tokio::time::timeout(KV_ACK_TIMEOUT, g.recv_raw(4)).await {
+                Ok(kb) => {
+                    let kb = kb?;
+                    if u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]])
+                        != FrameKind::CaptureAck as u32
+                    {
+                        return Err(cascadia_transport::TransportError::SocketClosed);
+                    }
+                    Ok(())
+                }
+                Err(_) => {
+                    g.close().await;
+                    Err(cascadia_transport::TransportError::Io(std::io::Error::other(
+                        "capture relay ack timed out; connection dropped to avoid pairing the \
+                         late ack with the next exchange",
+                    )))
+                }
             }
-            Ok(())
         })
         .map_err(|e| EngineError::Backend(e.to_string()))
     }
@@ -2969,12 +3027,27 @@ impl OvDistSpecWorkerEngine {
             // cross-chain move a 3rd+ rank has no capture under the donor epoch, so it verdicts 0 and
             // the chain cold-resets: correct-and-cold rather than a desynced stream.
             g.send_raw(&0u64.to_le_bytes()).await?;
-            let kb = g.recv_raw(4).await?;
-            if u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]) != FrameKind::RestoreAck as u32 {
-                return Err(cascadia_transport::TransportError::SocketClosed);
+            // Bounded + close-on-elapse (see KV_ACK_TIMEOUT).
+            match tokio::time::timeout(KV_ACK_TIMEOUT, async {
+                let kb = g.recv_raw(4).await?;
+                if u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]) != FrameKind::RestoreAck as u32
+                {
+                    return Err(cascadia_transport::TransportError::SocketClosed);
+                }
+                let vb = g.recv_raw(1).await?;
+                Ok(vb.first() == Some(&1))
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    g.close().await;
+                    Err(cascadia_transport::TransportError::Io(std::io::Error::other(
+                        "restore relay ack timed out; connection dropped to avoid pairing the \
+                         late ack with the next exchange",
+                    )))
+                }
             }
-            let vb = g.recv_raw(1).await?;
-            Ok(vb.first() == Some(&1))
         })
         .map_err(|e| EngineError::Backend(e.to_string()))
     }
