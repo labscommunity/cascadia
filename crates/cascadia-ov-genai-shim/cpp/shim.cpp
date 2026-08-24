@@ -1099,6 +1099,17 @@ int32_t cascadia_runtime_get_state_blob(cascadia_runtime_t* handle, uint8_t* buf
         for (auto& s : states) {
             std::string name = s.get_name();
             ov::Tensor t = s.get_state();
+            // Fail the CAPTURE, not the peer's later restore: an unmappable element type (e.g.
+            // compressed-KV u4/f8 states) used to export dtype code 255, report success, and then
+            // fail on every consumer as "applied 0 of N" — a donor-side defect surfacing as a
+            // permanent, misattributed cold fallback on the other node.
+            if (ov_type_to_code(t.get_element_type()) == 255) {
+                std::ostringstream oss;
+                oss << "get_state_blob: unsupported element type " << t.get_element_type()
+                    << " for state " << name;
+                set_last_error(oss.str().c_str());
+                return 1;
+            }
             total += 4 + name.size() + 1 + 1 + 8 * t.get_shape().size() + 8 + t.get_byte_size();
             snaps.emplace_back(std::move(name), t);
         }
