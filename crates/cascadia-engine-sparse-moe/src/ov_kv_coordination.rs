@@ -84,6 +84,13 @@ pub(crate) fn ov_blob_decode(blob: &[u8]) -> Option<OvMoeKvSnapshot> {
     let mut r = Reader { b: blob, pos: 0 };
     let past_seq_len = r.u32()? as usize;
     let n = r.u32()? as usize;
+    // A layer occupies at least 12 bytes (seq + two length prefixes), so a count the
+    // remaining bytes cannot hold is corrupt/hostile. Reject it BEFORE sizing the
+    // allocation from it — `n` is a raw wire u32, and this blob reaches the decoder
+    // unvalidated via RESTORE_CARRY (same DoS class 8c7862e4 closed in frame.rs).
+    if n > (blob.len() - r.pos) / 12 {
+        return None;
+    }
     let mut layers = Vec::with_capacity(n);
     for _ in 0..n {
         let seq = r.u32()? as usize;
@@ -394,6 +401,19 @@ mod tests {
             is_first: true,
             is_last: true,
         }
+    }
+
+    #[test]
+    fn a_forged_layer_count_is_refused_not_allocated() {
+        // 12 bytes claiming u32::MAX layers: past_seq_len=0, num_layers=MAX, then 4
+        // stray bytes. Before the bound, Vec::with_capacity(u32::MAX) requested
+        // ~240 GB (56 B per OvLayerKvSlice) and aborted the process; now the count
+        // is rejected against the bytes actually present.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        blob.extend_from_slice(&u32::MAX.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        assert!(ov_blob_decode(&blob).is_none());
     }
 
     #[test]
