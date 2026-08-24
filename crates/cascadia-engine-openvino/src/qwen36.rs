@@ -198,6 +198,40 @@ const CAPTURE_V2_CAP: u32 = 1;
 #[cfg(not(feature = "kv_coord"))]
 const CAPTURE_V2_CAP: u32 = 0;
 
+/// Read exactly `n` body bytes in ≤`MAX_RAW_BYTES` chunks, bounded by [`MAX_CARRY_BLOB_BYTES`].
+/// `recv_raw` refuses a single over-cap read BEFORE consuming a byte, so an unchunked body read
+/// (or an over-ceiling length rejected without draining) leaves the payload in the stream and
+/// desyncs every later frame. A CAPTURE body passes 64 KiB at ≈16k tokens — reachable in any
+/// long session, since `tokens = prompt ++ generated`. Over-ceiling lengths are drained
+/// (discarded) to stay framed, then rejected.
+#[cfg(feature = "kv_coord")]
+async fn recv_kv_body_chunked(
+    g: &mut ActivationServer,
+    n: usize,
+    what: &str,
+) -> Result<Vec<u8>, TransportError> {
+    let accept = n <= MAX_CARRY_BLOB_BYTES;
+    let mut buf = Vec::new();
+    let mut remaining = n;
+    while remaining > 0 {
+        let take = remaining.min(MAX_RAW_BYTES);
+        let chunk = g.recv_raw(take).await?;
+        if chunk.len() != take {
+            return Err(TransportError::SocketClosed);
+        }
+        if accept {
+            buf.extend_from_slice(&chunk);
+        }
+        remaining -= take;
+    }
+    if !accept {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "{what} length {n} exceeds {MAX_CARRY_BLOB_BYTES}; drained to stay framed"
+        ))));
+    }
+    Ok(buf)
+}
+
 fn frame_header(kind: u32, epoch: u32, pos: u32) -> [u8; 12] {
     let mut h = [0u8; 12];
     h[0..4].copy_from_slice(&kind.to_be_bytes());
@@ -1505,7 +1539,7 @@ impl Qwen36Engine {
                 FRAME_CAPTURE => {
                     let lb = g.recv_raw(4).await?;
                     let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
-                    let body = g.recv_raw(n).await?;
+                    let body = recv_kv_body_chunked(&mut g, n, "capture body").await?;
                     let (kv_epoch, tokens) = crate::kv_coordination::parse_capture_body(&body)
                         .ok_or(TransportError::SocketClosed)?;
                     Ok(InFrame::Capture {
@@ -1518,7 +1552,7 @@ impl Qwen36Engine {
                 FRAME_CAPTURE_V2 => {
                     let lb = g.recv_raw(4).await?;
                     let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
-                    let body = g.recv_raw(n).await?;
+                    let body = recv_kv_body_chunked(&mut g, n, "capture v2 body").await?;
                     let (kv_epoch, tokens, partner) =
                         crate::kv_coordination::parse_capture_body_v2(&body)
                             .ok_or(TransportError::SocketClosed)?;
@@ -1543,18 +1577,12 @@ impl Qwen36Engine {
                             .try_into()
                             .map_err(|_| TransportError::SocketClosed)?,
                     ) as usize;
+                    // Chunked + drain-on-reject: an over-ceiling blob rejected WITHOUT consuming
+                    // it stays in the stream and desyncs every later frame.
                     let blob = if blob_len == 0 {
                         Vec::new()
                     } else {
-                        if blob_len > MAX_CARRY_BLOB_BYTES {
-                            return Err(TransportError::SocketClosed);
-                        }
-                        let mut buf = Vec::new();
-                        while buf.len() < blob_len {
-                            let n = (blob_len - buf.len()).min(MAX_RAW_BYTES);
-                            buf.extend_from_slice(&g.recv_raw(n).await?);
-                        }
-                        buf
+                        recv_kv_body_chunked(&mut g, blob_len, "restore carried blob").await?
                     };
                     Ok(InFrame::Restore {
                         task_epoch: epoch,

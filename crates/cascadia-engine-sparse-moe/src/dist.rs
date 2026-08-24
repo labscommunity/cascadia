@@ -701,15 +701,9 @@ pub async fn recv_capture_body_server(
         ))));
     }
     let n = count as usize;
-    let body = if n > 0 {
-        guard.recv_raw(n * 4).await?
-    } else {
-        Vec::new()
-    };
+    // Chunked: n*4 can exceed the transport's single-read cap (see recv_exact_chunked).
+    let body = recv_exact_chunked(&mut guard, n * 4).await?;
     drop(guard);
-    if body.len() != n * 4 {
-        return Err(TransportError::SocketClosed);
-    }
     let mut tokens = Vec::with_capacity(n);
     for c in body.chunks_exact(4) {
         tokens.push(i32::from_be_bytes([c[0], c[1], c[2], c[3]]));
@@ -750,20 +744,38 @@ pub async fn recv_capture_v2_body_server(
         ))));
     }
     let n = count as usize;
-    let body = if n > 0 {
-        guard.recv_raw(n * 4).await?
-    } else {
-        Vec::new()
-    };
+    // Chunked: n*4 can exceed the transport's single-read cap (see recv_exact_chunked).
+    let body = recv_exact_chunked(&mut guard, n * 4).await?;
     drop(guard);
-    if body.len() != n * 4 {
-        return Err(TransportError::SocketClosed);
-    }
     let mut tokens = Vec::with_capacity(n);
     for c in body.chunks_exact(4) {
         tokens.push(i32::from_be_bytes([c[0], c[1], c[2], c[3]]));
     }
     Ok((epoch, tokens, tenant))
+}
+
+/// Read exactly `total` bytes as ≤[`MAX_RAW_BYTES`] chunks. `recv_raw` refuses any single read
+/// over the transport cap BEFORE consuming a byte, so one over-cap read of an in-band frame body
+/// leaves the body in the stream and desyncs every later frame (token payload parsed as frame
+/// kinds). RESTORE's carried blob already reads chunked; CAPTURE's token body was missed — its
+/// ceiling was ≈16,381 tokens, and `tokens = prompt ++ generated` grows past that in any long
+/// session. `total` must already be validated against its own cap by the caller.
+async fn recv_exact_chunked(
+    guard: &mut ActivationServer,
+    total: usize,
+) -> TransportResult<Vec<u8>> {
+    let mut out = Vec::with_capacity(total);
+    let mut remaining = total;
+    while remaining > 0 {
+        let take = remaining.min(MAX_RAW_BYTES);
+        let chunk = guard.recv_raw(take).await?;
+        if chunk.len() != take {
+            return Err(TransportError::SocketClosed);
+        }
+        out.extend_from_slice(&chunk);
+        remaining -= take;
+    }
+    Ok(out)
 }
 
 /// Send a CaptureAck frame upstream (stage → head-ward). Body: 8 B BE epoch.

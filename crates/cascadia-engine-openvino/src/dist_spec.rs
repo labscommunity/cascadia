@@ -394,6 +394,12 @@ fn io_err(e: cascadia_transport::TransportError) -> std::io::Error {
 #[cfg(feature = "kv_coord")]
 const KV_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Cap on a §8 CAPTURE body (recv-side allocation bound). Worst case at `MAX_CAPTURE_TOKENS`
+/// (1 Mi): 4 B/token + 8 B/mask-entry + headers ≈ 12 MiB; 16 MiB leaves headroom without
+/// letting a corrupt length reserve unbounded memory.
+#[cfg(feature = "kv_coord")]
+const MAX_CAPTURE_BODY_BYTES: usize = 16 << 20;
+
 pub struct MaskedReq {
     runtime: OvRuntime,
     has_beam: bool,
@@ -2176,7 +2182,33 @@ impl OvDistSpecWorkerEngine {
                     let mut g = up.lock().await;
                     let lb = g.recv_raw(4).await?;
                     let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
-                    g.recv_raw(n).await
+                    // Chunked + drain-on-reject: recv_raw refuses a single over-cap read BEFORE
+                    // consuming a byte, and a rejected-but-unconsumed body stays in the stream
+                    // and desyncs every later frame. The body grows with the session
+                    // (tokens ++ mask), so it passes 64 KiB at ≈5k tokens. Consume in capped
+                    // chunks either way; assemble only an acceptable length.
+                    let accept = n <= MAX_CAPTURE_BODY_BYTES;
+                    let mut buf = Vec::new();
+                    let mut remaining = n;
+                    while remaining > 0 {
+                        let take = remaining.min(MAX_RAW_BYTES);
+                        let chunk = g.recv_raw(take).await?;
+                        if chunk.len() != take {
+                            return Err(cascadia_transport::TransportError::SocketClosed);
+                        }
+                        if accept {
+                            buf.extend_from_slice(&chunk);
+                        }
+                        remaining -= take;
+                    }
+                    if !accept {
+                        return Err(cascadia_transport::TransportError::Io(
+                            std::io::Error::other(format!(
+                                "capture body {n} exceeds MAX_CAPTURE_BODY_BYTES {MAX_CAPTURE_BODY_BYTES}"
+                            )),
+                        ));
+                    }
+                    Ok(buf)
                 })
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
                 let (epoch, tokens, valid, tenant) = if kind == FrameKind::CaptureV2 {
@@ -2228,18 +2260,32 @@ impl OvDistSpecWorkerEngine {
                         u64::from_le_bytes(lb.as_slice().try_into().unwrap_or([0u8; 8])) as usize;
                     // recv_raw caps each read at MAX_RAW_BYTES; a whole-state KV blob is far larger, so
                     // drain it in capped chunks (matching the send-side write_all) or the stream desyncs.
-                    let blob = if n == 0 {
-                        Vec::new()
-                    } else if n > MAX_CARRY_BLOB_BYTES {
-                        return Err(cascadia_transport::TransportError::SocketClosed);
-                    } else {
-                        let mut buf = Vec::with_capacity(n);
-                        while buf.len() < n {
-                            let take = (n - buf.len()).min(MAX_RAW_BYTES);
-                            buf.extend_from_slice(&g.recv_raw(take).await?);
+                    // That includes an OVER-CEILING blob: rejecting without consuming it leaves the
+                    // whole payload in the stream — drain, then reject.
+                    let accept = n <= MAX_CARRY_BLOB_BYTES;
+                    let blob = {
+                        let mut buf = Vec::new();
+                        let mut remaining = n;
+                        while remaining > 0 {
+                            let take = remaining.min(MAX_RAW_BYTES);
+                            let chunk = g.recv_raw(take).await?;
+                            if chunk.len() != take {
+                                return Err(cascadia_transport::TransportError::SocketClosed);
+                            }
+                            if accept {
+                                buf.extend_from_slice(&chunk);
+                            }
+                            remaining -= take;
                         }
                         buf
                     };
+                    if !accept {
+                        return Err(cascadia_transport::TransportError::Io(
+                            std::io::Error::other(format!(
+                                "restore carried blob {n} exceeds MAX_CARRY_BLOB_BYTES {MAX_CARRY_BLOB_BYTES}"
+                            )),
+                        ));
+                    }
                     Ok::<_, cascadia_transport::TransportError>((eb, blob))
                 })
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
