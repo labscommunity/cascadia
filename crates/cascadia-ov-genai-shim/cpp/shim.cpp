@@ -1229,7 +1229,16 @@ int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_
                 }
                 size_ok = size_ok && esz != 0 && elems <= UINT64_MAX / esz && elems * esz == nb;
             }
-            if (identity_ok && size_ok) {
+            bool apply_ok = identity_ok && size_ok;
+            if (apply_ok) {
+                // The donor's element type must also match the destination state's: f16 vs bf16
+                // share a byte size, so a size-only guard reinterprets the payload with the wrong
+                // exponent/mantissa split — same fingerprint, same length, garbage tokens.
+                // KV_CACHE_PRECISION is a per-node knob, so two nodes serving the same model can
+                // legitimately differ. (get_state() is gated behind the cheap checks above.)
+                apply_ok = states[dst].get_state().get_element_type() == etype;
+            }
+            if (apply_ok) {
                 ov::Tensor t(etype, shape);
                 std::memcpy(t.data(), p, nb);
                 states[dst].set_state(t);
