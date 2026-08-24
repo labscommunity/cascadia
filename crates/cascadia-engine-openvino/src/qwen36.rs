@@ -2466,6 +2466,10 @@ impl cascadia_engine::KvCoordination for Qwen36Engine {
         // an APPLIED one back to cold. `reset_all` is the same scrub the cold-admit path uses;
         // `state_restored` upgrades the following reset to a rebuild (reset_state alone leaves residue).
         let _ = self.kv.take_capture(epoch);
+        // Retract pulled DOWNSTREAM stashes too — they key by a different epoch than the abort's,
+        // and an orphan from an aborted move would ride the single-slot fallback on a later,
+        // unrelated RESTORE (another session's KV served warm with an all-green verdict).
+        self.kv.clear_downstream();
         self.state_restored = true;
         self.reset_all();
     }

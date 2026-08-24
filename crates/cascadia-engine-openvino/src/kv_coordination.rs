@@ -703,6 +703,20 @@ impl OvKvCache {
         self.downstream.remove(&(epoch, rank))
     }
 
+    /// Head: drop EVERY stashed downstream blob. Called on plane abort: the stash keys by the
+    /// pulled rank's manifest tokens while the abort carries the head's epoch (the acknowledged
+    /// drift `take_downstream_single` bridges), so an epoch-keyed remove cannot find the orphan —
+    /// and an orphaned blob from an aborted move would otherwise satisfy the single-slot fallback
+    /// on a LATER, unrelated `RESTORE`, warming a rank from another session's KV with an all-green
+    /// verdict. There is no TTL; abort is the only retraction point.
+    pub(crate) fn clear_downstream(&mut self) {
+        if !self.downstream.is_empty() {
+            tracing::info!(target: "cascadia::kv", event = "kv_downstream_cleared_on_abort",
+                n = self.downstream.len());
+            self.downstream.clear();
+        }
+    }
+
     /// Count of stashed downstream blobs (diagnostic + single-slot fallback guard).
     pub(crate) fn downstream_len(&self) -> usize {
         self.downstream.len()
@@ -1080,6 +1094,9 @@ impl KvCoordination for OvRuntimeEngine {
         // capture cache so a later commit can't resurrect it; or it was already APPLIED (legacy/raced
         // commit) ⇒ scrub the engine back to cold. Safe for an epoch this rank never armed.
         let _ = self.kv_cache_mut().take_capture(epoch);
+        // Also retract the pulled DOWNSTREAM stashes (see clear_downstream: they key by a
+        // different epoch, and an orphan rides the single-slot fallback on a later RESTORE).
+        self.kv_cache_mut().clear_downstream();
         self.abort_warm_resume_local();
     }
 }
