@@ -94,11 +94,11 @@ pub enum FrameKind {
     // byte stream with no message boundary, so an old peer reading the new body
     // would leave the extra byte in the stream and shift every later field by one.
     // The batch forwards did not gain the byte and keep their codes.
-    Forward = 0x53_4D_45_0C,      // "SME\x0C" — was 0x04 (no push_history byte)
-    Reset = 0x53_4D_45_10,        // "SME\x10"
-    Token = 0x53_4D_45_20,        // "SME\x20"
+    Forward = 0x53_4D_45_0C, // "SME\x0C" — was 0x04 (no push_history byte)
+    Reset = 0x53_4D_45_10,   // "SME\x10"
+    Token = 0x53_4D_45_20,   // "SME\x20"
     ForwardBatch = 0x53_4D_45_05, // "SME\x05" — was 0x03; batched K-step verify
-    TokenBatch = 0x53_4D_45_21,   // "SME\x21" — batched K-step response
+    TokenBatch = 0x53_4D_45_21, // "SME\x21" — batched K-step response
     /// Prefill-intermediate Forward (0x06): identical body to `Forward`,
     /// but the last rank must run its layers WITHOUT head/sample/record and
     /// reply with a dummy `Token(-1)`. Rank 0 discards intermediate prefill
@@ -135,7 +135,7 @@ pub enum FrameKind {
     /// current KV slice under the key after prefill. Runners without prefix
     /// caching (dsv4) treat both as no-ops.
     RestorePrefix = 0x53_4D_45_09, // "SME\x09"
-    CachePrefix = 0x53_4D_45_0A,  // "SME\x0A"
+    CachePrefix = 0x53_4D_45_0A, // "SME\x0A"
     /// Intermediate batched prefill (0x0B): identical body to `ForwardBatchPrefill`,
     /// but the last rank advances KV over ALL rows and samples NOTHING — it replies
     /// with a dummy `Token(-1)` ack and records no penalty history. Lets rank 0

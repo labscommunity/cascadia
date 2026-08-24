@@ -76,8 +76,8 @@ pub fn decode_frame(buf: &[u8]) -> Result<(KvMessage, usize), FrameError> {
     if buf.len() < end {
         return Err(FrameError::Incomplete);
     }
-    let (msg, consumed) = bincode::serde::decode_from_slice(&buf[4..end], wire_config())
-        .map_err(|e| match e {
+    let (msg, consumed) =
+        bincode::serde::decode_from_slice(&buf[4..end], wire_config()).map_err(|e| match e {
             // The byte-budget guard (see `wire_config`) — an embedded collection length over the
             // frame cap. Distinguished from garbled bytes so an operator can tell a DoS attempt
             // from corruption, and so the regression test below can only pass via the limit.

@@ -1570,7 +1570,10 @@ impl SparseMoEEngine {
                             warn!(task = %task.task_id, "cold-fallback send_reset: {e}");
                             return vec![(
                                 task.task_id.clone(),
-                                Chunk::error(task.task_id, format!("cold-fallback send_reset: {e}")),
+                                Chunk::error(
+                                    task.task_id,
+                                    format!("cold-fallback send_reset: {e}"),
+                                ),
                             )];
                         }
                         0
@@ -2669,7 +2672,10 @@ impl SparseMoEEngine {
                         recv_restore_verdict(down).await
                     })
                     .unwrap_or_else(|e| {
-                        warn!(rank = self.rank, epoch, "downstream restore chain failed: {e}");
+                        warn!(
+                            rank = self.rank,
+                            epoch, "downstream restore chain failed: {e}"
+                        );
                         false
                     })
                 } else {
@@ -3555,7 +3561,10 @@ impl OvMoeEngine {
                 recv_restore_verdict(down).await
             })
             .unwrap_or_else(|e| {
-                warn!(rank = self.rank, epoch, "downstream restore chain failed: {e}");
+                warn!(
+                    rank = self.rank,
+                    epoch, "downstream restore chain failed: {e}"
+                );
                 false
             })
         } else {
@@ -3598,7 +3607,10 @@ impl OvMoeEngine {
                 recv_restore_verdict(down).await
             })
             .unwrap_or_else(|e| {
-                warn!(rank = self.rank, epoch, "downstream restore chain failed: {e}");
+                warn!(
+                    rank = self.rank,
+                    epoch, "downstream restore chain failed: {e}"
+                );
                 false
             })
         } else {

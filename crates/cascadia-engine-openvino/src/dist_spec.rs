@@ -729,10 +729,12 @@ impl DistributedMaskedReq {
                 }
                 Err(_) => {
                     g.close().await;
-                    Err(cascadia_transport::TransportError::Io(std::io::Error::other(
-                        "capture ack timed out; connection dropped to avoid pairing the late \
+                    Err(cascadia_transport::TransportError::Io(
+                        std::io::Error::other(
+                            "capture ack timed out; connection dropped to avoid pairing the late \
                          ack with the next exchange",
-                    )))
+                        ),
+                    ))
                 }
             }
         })
@@ -774,10 +776,12 @@ impl DistributedMaskedReq {
                 Ok(r) => r,
                 Err(_) => {
                     g.close().await;
-                    Err(cascadia_transport::TransportError::Io(std::io::Error::other(
-                        "restore ack timed out; connection dropped to avoid pairing the late \
+                    Err(cascadia_transport::TransportError::Io(
+                        std::io::Error::other(
+                            "restore ack timed out; connection dropped to avoid pairing the late \
                          ack with the next exchange",
-                    )))
+                        ),
+                    ))
                 }
             }
         })
@@ -3047,10 +3051,12 @@ impl OvDistSpecWorkerEngine {
                 }
                 Err(_) => {
                     g.close().await;
-                    Err(cascadia_transport::TransportError::Io(std::io::Error::other(
-                        "capture relay ack timed out; connection dropped to avoid pairing the \
+                    Err(cascadia_transport::TransportError::Io(
+                        std::io::Error::other(
+                            "capture relay ack timed out; connection dropped to avoid pairing the \
                          late ack with the next exchange",
-                    )))
+                        ),
+                    ))
                 }
             }
         })
@@ -3088,10 +3094,12 @@ impl OvDistSpecWorkerEngine {
                 Ok(r) => r,
                 Err(_) => {
                     g.close().await;
-                    Err(cascadia_transport::TransportError::Io(std::io::Error::other(
-                        "restore relay ack timed out; connection dropped to avoid pairing the \
+                    Err(cascadia_transport::TransportError::Io(
+                        std::io::Error::other(
+                            "restore relay ack timed out; connection dropped to avoid pairing the \
                          late ack with the next exchange",
-                    )))
+                        ),
+                    ))
                 }
             }
         })
