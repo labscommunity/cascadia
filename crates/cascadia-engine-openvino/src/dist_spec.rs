@@ -41,7 +41,7 @@ use futures::stream;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 use tokio::net::TcpStream;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 // -------- frame protocol --------
 
@@ -404,6 +404,17 @@ impl MaskedReq {
     pub(crate) fn kv_restore(&mut self, b: &[u8]) -> bool {
         self.runtime.set_state_blob(b).is_ok()
     }
+    /// Scrub after a `set_state_blob` this turn is abandoning — failed (the request may be
+    /// PARTIALLY restored; entries apply as the blob parses) or applied-then-discarded (chain
+    /// NAK). `reset_state` cannot clear post-`set_state` residue (see the shim's
+    /// `recreate_request` doc), so rebuild the request, then `reset` the host cursors — the
+    /// cold reprefill must not run over half the donor's KV.
+    pub(crate) fn kv_scrub(&mut self) {
+        if let Err(e) = self.runtime.recreate_request() {
+            error!(error = %e, "ov-dist-spec: draft recreate_request scrub failed; KV state may be dirty");
+        }
+        let _ = self.reset();
+    }
     /// After a warm `set_state_blob`, align the host-side cursors to the restored prefix length so
     /// the next `feed` appends the suffix at the right position (mirrors `reset`, but to `len`).
     pub(crate) fn kv_set_pos(&mut self, len: usize) {
@@ -622,6 +633,15 @@ impl DistributedMaskedReq {
     }
     pub(crate) fn stage0_restore(&mut self, b: &[u8]) -> bool {
         self.stage0.set_state_blob(b).is_ok()
+    }
+    /// Scrub after an abandoned `set_state_blob` (see `MaskedReq::kv_scrub`): rebuild the
+    /// stage-0 request — `reset_state` cannot clear post-`set_state` residue — then `reset`,
+    /// which also re-broadcasts Reset down the chain.
+    pub(crate) fn kv_scrub(&mut self) {
+        if let Err(e) = self.stage0.recreate_request() {
+            error!(error = %e, "ov-dist-spec: target recreate_request scrub failed; KV state may be dirty");
+        }
+        let _ = self.reset();
     }
     /// Align host-side cursors to a restored prefix (see `MaskedReq::kv_set_pos`).
     pub(crate) fn kv_set_pos(&mut self, len: usize) {
@@ -2197,17 +2217,30 @@ impl OvDistSpecWorkerEngine {
                 let local_ok = if self.drain_kv_handoff(epoch) {
                     true
                 } else if !carried.is_empty() {
-                    let ok = self.runtime.set_state_blob(&carried).is_ok();
-                    if ok {
-                        info!(
-                            epoch,
-                            blob_len = carried.len(),
-                            "distspec_tail_restore_carried"
-                        );
+                    match self.runtime.set_state_blob(&carried) {
+                        Ok(()) => {
+                            info!(
+                                epoch,
+                                blob_len = carried.len(),
+                                "distspec_tail_restore_carried"
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            warn!(error = %e, epoch, "ov-dist-spec worker: set_state(carried) failed; rank cold");
+                            self.kv_worker_scrub();
+                            false
+                        }
                     }
-                    ok
                 } else if let Some((_, blob)) = self.kv.take_capture(epoch) {
-                    self.runtime.set_state_blob(&blob).is_ok()
+                    match self.runtime.set_state_blob(&blob) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            warn!(error = %e, epoch, "ov-dist-spec worker: set_state(capture) failed; rank cold");
+                            self.kv_worker_scrub();
+                            false
+                        }
+                    }
                 } else {
                     false
                 };
@@ -2724,8 +2757,8 @@ impl OvDistSpecEngine {
                 crate::kv_coordination::kv_seq_from_blob(&parts[1]),
             ) else {
                 warn!("ov-dist-spec: draft/target KV depth unreadable; cold reprefill");
-                let _ = self.target.reset();
-                let _ = self.draft.reset();
+                self.target.kv_scrub();
+                self.draft.kv_scrub();
                 return 0;
             };
             // The target defines the resume point, so it alone clamps to the matched prefix.
@@ -2735,8 +2768,8 @@ impl OvDistSpecEngine {
                 self.draft.kv_set_pos(d_pos);
                 // Catch the draft up to the target (gap is prompt[d_pos..t_pos], the accepted tail).
                 if d_pos < t_pos && self.draft.feed(&prompt_ids[d_pos..t_pos]).is_err() {
-                    let _ = self.target.reset();
-                    let _ = self.draft.reset();
+                    self.target.kv_scrub();
+                    self.draft.kv_scrub();
                     return 0;
                 }
                 info!(
@@ -2752,13 +2785,16 @@ impl OvDistSpecEngine {
                     d_pos,
                     t_pos, len, "ov-dist-spec: draft/target KV depth out of range; cold reprefill"
                 );
-                let _ = self.target.reset();
-                let _ = self.draft.reset();
+                self.target.kv_scrub();
+                self.draft.kv_scrub();
                 0
             }
         } else {
-            let _ = self.target.reset();
-            let _ = self.draft.reset();
+            // Restore failed (possibly partial) or the chain NAK'd after a full apply — either
+            // way donor state may be live; reset_state alone cannot clear it.
+            warn!("ov-dist-spec: warm restore abandoned; scrubbing cold");
+            self.target.kv_scrub();
+            self.draft.kv_scrub();
             0
         }
     }
@@ -2844,9 +2880,28 @@ impl OvDistSpecWorkerEngine {
     fn drain_kv_handoff(&mut self, expected_epoch: u64) -> bool {
         let mailbox = std::sync::Arc::clone(&self.kv_handoff);
         let fp = self.kv_fingerprint();
+        let runtime = &mut self.runtime;
         crate::kv_coordination::drain_handoff(&mailbox, fp, 0, expected_epoch, |blob| {
-            self.runtime.set_state_blob(blob).is_ok()
+            match runtime.set_state_blob(blob) {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(error = %e, "ov-dist-spec worker: set_state(handoff) failed; rank cold");
+                    // A failed set_state may be PARTIAL; reset_state cannot scrub it.
+                    if let Err(e2) = runtime.recreate_request() {
+                        error!(error = %e2, "ov-dist-spec worker: recreate_request scrub failed; KV state may be dirty");
+                    }
+                    false
+                }
+            }
         })
+    }
+    /// Scrub the worker request after a failed (possibly partial) `set_state_blob` —
+    /// `reset_state` cannot clear post-`set_state` residue, and the head's cold fallback
+    /// only sends Reset, which bottoms out in exactly that insufficient scrub.
+    fn kv_worker_scrub(&mut self) {
+        if let Err(e) = self.runtime.recreate_request() {
+            error!(error = %e, "ov-dist-spec worker: recreate_request scrub failed; KV state may be dirty");
+        }
     }
     fn kv_ack_upstream(&mut self, ack_kind: u32, payload: &[u8]) -> Result<(), EngineError> {
         let up = self.upstream.clone();

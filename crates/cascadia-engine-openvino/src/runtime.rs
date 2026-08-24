@@ -2156,13 +2156,14 @@ impl OvRuntimeEngine {
                                     "ov-runtime warm-resumed from KV blob"
                                 );
                             } else {
-                                let _ = self.runtime.reset_state();
+                                // The blob WAS applied — reset_state cannot un-apply it.
+                                self.scrub_after_set_state("head chain-restore incomplete");
                                 warn!("ov-runtime: pipeline restore incomplete; cold reprefill");
                             }
                         }
                         Err(e) => {
                             warn!(error = %e, "set_state_blob failed; cold reprefill");
-                            let _ = self.runtime.reset_state();
+                            self.scrub_after_set_state("head set_state failed");
                         }
                     }
                 }
@@ -3843,6 +3844,19 @@ impl OvRuntimeEngine {
     pub(crate) fn kv_cache_mut(&mut self) -> &mut crate::kv_coordination::OvKvCache {
         &mut self.kv
     }
+    /// Scrub the request after any `set_state_blob` — failed OR successfully applied then
+    /// abandoned. `reset_state` only calls `VariableState::reset()`, which provably cannot clear
+    /// post-`set_state` residue (see the shim's `recreate_request` doc); on `Err` the request may
+    /// already be PARTIALLY restored, so the "cold" fallback would otherwise reprefill over half
+    /// the donor's KV and emit wrong tokens with every guard green. Loud on failure — a failed
+    /// scrub leaves donor state live, and every later turn on this request serves garbage.
+    #[cfg(feature = "kv_coord")]
+    fn scrub_after_set_state(&mut self, context: &str) {
+        if let Err(e) = self.runtime.recreate_request() {
+            error!(error = %e, context,
+                "ov-runtime: recreate_request scrub failed; KV state may be dirty");
+        }
+    }
     /// Undo a plane arm: the local-state half of the chain `OPCODE_ABORT` rollback. The mailbox
     /// retraction that handler also does is `clear(epoch)` on this path. Idempotent.
     #[cfg(feature = "kv_coord")]
@@ -3939,6 +3953,7 @@ impl OvRuntimeEngine {
             }
             Err(e) => {
                 warn!(error = %e, "ov-runtime: apply_warm_resume set_state failed; cold");
+                self.scrub_after_set_state("plane apply_warm_resume failed");
                 false
             }
         }
@@ -4366,6 +4381,7 @@ impl OvRuntimeEngine {
                         }
                         Err(e) => {
                             warn!(error = %e, "ov-runtime: set_state(carried) failed; rank cold");
+                            self.scrub_after_set_state("worker set_state(carried) failed");
                             false
                         }
                     }
@@ -4383,6 +4399,7 @@ impl OvRuntimeEngine {
                             }
                             Err(e) => {
                                 warn!(error = %e, "ov-runtime: set_state failed; rank cold");
+                                self.scrub_after_set_state("worker set_state(capture) failed");
                                 false
                             }
                         },
