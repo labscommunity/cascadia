@@ -1158,8 +1158,9 @@ int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_
         // are guaranteed equal to ours. Sorting BOTH ends by the identity parsed from the name (and
         // asserting the identities agree per slot) is the only cross-instance-stable alignment — it is
         // what OvMoe achieves by restoring per layer ordinal. Non-canonical names fall back to
-        // positional (same-instance round-trips stay byte-identical; other models unaffected). Byte-size
-        // + count + identity guards degrade any genuine mismatch to an all-or-nothing cold reprefill.
+        // positional, which is only accepted when each blob name equals the destination state's name
+        // verbatim (a same-instance round-trip; other models unaffected). Byte-size + count + identity
+        // guards degrade any genuine mismatch to an all-or-nothing cold reprefill.
         auto states = handle->request->query_state();
         std::vector<size_t> order(states.size());
         for (size_t i = 0; i < states.size(); ++i) order[i] = i;
@@ -1198,11 +1199,18 @@ int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_
             const size_t dst = order[i];
             // In canonical mode the donor's slot identity must equal the destination's — a divergent
             // set (wrong rank/model, or a donor that couldn't emit canonically) leaves applied<count ⇒
-            // the all-or-nothing cold fallback below, never a silent mis-map.
-            bool identity_ok = true;
+            // the all-or-nothing cold fallback below, never a silent mis-map. In positional mode the
+            // blob name must equal the destination state's name verbatim: positional order is only
+            // sound for a same-instance round-trip (where names are identical). Without this, a
+            // canonically-SORTED donor blob restored on a recipient whose names fail to parse would
+            // apply positionally — every KV entry shares a byte size, so the scramble passed the size
+            // guard and returned rc=0.
+            bool identity_ok;
             if (canonical) {
                 uint64_t bkey;
                 identity_ok = kv_canonical_key(bname, &bkey) && bkey == mkeys[dst];
+            } else {
+                identity_ok = (bname == states[dst].get_name());
             }
             // Validate the declared dtype + dims against nb BEFORE constructing the tensor:
             // ov::Tensor allocates from the declared shape, so a corrupt/hostile blob declaring
