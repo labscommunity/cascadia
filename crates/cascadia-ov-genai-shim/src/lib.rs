@@ -1365,10 +1365,14 @@ impl Runtime {
     }
 
     /// Issue-34: restore KV variable-states from a blob produced by [`Runtime::get_state_blob`] on the
-    /// same model IR. States are matched by POSITION (blob order == `query_state()` order), so a blob
-    /// from a different engine instance restores cleanly (VariableState names are not portable across
-    /// instances). If ANY entry fails to apply the call returns `Err` rather than silently
-    /// half-restoring.
+    /// same model IR. States are matched by canonical KV IDENTITY (layer/kind ordinal parsed from the
+    /// state name) — both ends sort by it, and each slot's identity is asserted — so a blob from a
+    /// differently-compiled engine instance restores correctly even though raw `query_state()` order
+    /// and state names are not portable across instances. Names that don't parse canonically fall back
+    /// to positional matching, accepted only when each blob name equals the destination state's name
+    /// verbatim (a same-instance round-trip); plain positional cross-instance restore is exactly what
+    /// put states in the wrong slots. If ANY entry fails to apply (identity, byte-size, or element-type
+    /// mismatch) the call returns `Err` rather than silently half-restoring.
     ///
     /// On `Err` the request may already be **partially restored** — entries are applied as the blob
     /// is parsed. Callers must scrub with [`Runtime::recreate_request`] (or `reset_state` where that
