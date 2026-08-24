@@ -77,7 +77,13 @@ pub fn decode_frame(buf: &[u8]) -> Result<(KvMessage, usize), FrameError> {
         return Err(FrameError::Incomplete);
     }
     let (msg, consumed) = bincode::serde::decode_from_slice(&buf[4..end], wire_config())
-        .map_err(|_| FrameError::Decode)?;
+        .map_err(|e| match e {
+            // The byte-budget guard (see `wire_config`) — an embedded collection length over the
+            // frame cap. Distinguished from garbled bytes so an operator can tell a DoS attempt
+            // from corruption, and so the regression test below can only pass via the limit.
+            bincode::error::DecodeError::LimitExceeded => FrameError::TooLarge,
+            _ => FrameError::Decode,
+        })?;
     // The declared length must match the bincode encoding exactly — trailing junk inside a frame is a
     // structural anomaly; reject rather than silently swallow it.
     if consumed != len as usize {
@@ -213,12 +219,17 @@ mod tests {
     #[test]
     fn a_forged_giant_string_length_is_refused_not_allocated() {
         // body: [tag=5][varint len ~ 0x7000_0000_0000_0000] — a valid-looking Error(String) header
-        // whose declared length dwarfs any real input. bincode varint: 0xFB marks a u64 follows.
-        let mut body = vec![5u8, 0xFBu8];
+        // whose declared length dwarfs any real input. bincode varint: 0xFD marks a u64 follows
+        // (0xFB marks a u16 — the original marker here, which decoded as a length-0 string and
+        // passed via the trailing-junk check WITHOUT ever touching the allocation limit, leaving
+        // this regression test green even with the limit removed).
+        let mut body = vec![5u8, 0xFDu8];
         body.extend_from_slice(&0x7000_0000_0000_0000u64.to_le_bytes());
         let mut frame = (body.len() as u32).to_be_bytes().to_vec();
         frame.extend_from_slice(&body);
-        // len is well under MAX_FRAME_LEN, so the outer check passes; the inner budget must catch it.
-        assert!(matches!(decode_frame(&frame), Err(FrameError::Decode)));
+        // len is well under MAX_FRAME_LEN, so the outer check passes; the inner budget must catch
+        // it. TooLarge (not Decode) is asserted because on this input it can ONLY come from the
+        // LimitExceeded mapping — so the test fails if wire_config ever loses its byte budget.
+        assert_eq!(decode_frame(&frame), Err(FrameError::TooLarge));
     }
 }
