@@ -1570,7 +1570,7 @@ impl SparseMoEEngine {
                             warn!(task = %task.task_id, "cold-fallback send_reset: {e}");
                             return vec![(
                                 task.task_id.clone(),
-                                Chunk::final_marker(task.task_id, ""),
+                                Chunk::error(task.task_id, format!("cold-fallback send_reset: {e}")),
                             )];
                         }
                         0
@@ -3193,7 +3193,10 @@ impl OvMoeEngine {
                         self.runner.reset();
                         if let Err(e) = self.block_on(send_reset(&downstream)) {
                             warn!(task = %id, "cold-fallback send_reset: {e}");
-                            return vec![(id.clone(), Chunk::final_marker(id, ""))];
+                            return vec![(
+                                id.clone(),
+                                Chunk::error(id, format!("cold-fallback send_reset: {e}")),
+                            )];
                         }
                         0
                     }
