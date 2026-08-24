@@ -1017,26 +1017,30 @@ static ov::element::Type code_to_ov_type(uint8_t c) {
 static bool kv_canonical_key(const std::string& name, uint64_t* out_key) {
     // Family A — llama/genai stateful KV: "past_key_values.<layer>.<key|value>". A KV VariableState fuses
     // the past_key_values input + present output tensors, and a separate compilation can surface
-    // get_name() as the two aliases JOINED ("past_key_values.1.valuepresent.1.value"), so match the kv
-    // token as a PREFIX of the suffix, not the whole remainder (exact-suffix rejected the donor form ⇒
-    // applied 0 of N ⇒ cold). key = layer*2 + {key:0, value:1}.
+    // get_name() as the two aliases JOINED — in EITHER order ("past_key_values.1.valuepresent.1.value"
+    // or present-first), so SEARCH for the past.* alias like Family B does rather than anchoring at
+    // position 0 (an anchored match parsed non-canonical on a present-first compilation, silently
+    // dropping the identity guard into positional mode). The kv token is likewise matched as a PREFIX
+    // of the suffix, not the whole remainder (exact-suffix rejected the donor form ⇒ applied 0 of N ⇒
+    // cold). key = layer*2 + {key:0, value:1}.
     {
         static const char PFX[] = "past_key_values.";
         const size_t L = sizeof(PFX) - 1;
-        if (name.size() > L && name.compare(0, L, PFX) == 0) {
-            size_t dot = name.find('.', L);
-            if (dot != std::string::npos && dot != L) {
+        size_t at = name.find(PFX);
+        if (at != std::string::npos) {
+            const size_t lstart = at + L;
+            size_t dot = name.find('.', lstart);
+            if (dot != std::string::npos && dot != lstart) {
                 bool digits = true;
                 uint64_t layer = 0;
-                for (size_t i = L; i < dot; ++i) {
+                for (size_t i = lstart; i < dot; ++i) {
                     char c = name[i];
                     if (c < '0' || c > '9') { digits = false; break; }
                     layer = layer * 10 + static_cast<uint64_t>(c - '0');
                 }
                 if (digits) {
-                    const std::string suffix = name.substr(dot + 1);
-                    if (suffix.rfind("value", 0) == 0) { *out_key = layer * 2 + 1; return true; }
-                    if (suffix.rfind("key", 0) == 0)   { *out_key = layer * 2 + 0; return true; }
+                    if (name.compare(dot + 1, 5, "value") == 0) { *out_key = layer * 2 + 1; return true; }
+                    if (name.compare(dot + 1, 3, "key") == 0)   { *out_key = layer * 2 + 0; return true; }
                 }
             }
         }
