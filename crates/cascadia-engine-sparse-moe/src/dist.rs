@@ -908,6 +908,44 @@ pub async fn recv_restore_ack_body_client(
     Ok((epoch, raw[8]))
 }
 
+/// Bound on every RestoreAck wait. Same design rule as [`recv_token_reply`]: a reply to in-flight
+/// work uses a strict deadline, never the ~900 s frame-idle ceiling — RESTORE runs at admission
+/// (`step_first`), so an unbounded wait stalls every warm-hit request behind a silent downstream,
+/// and an older peer that errors on the frame never acks at all. Matches ov-runtime's
+/// `RESTORE_ACK_TIMEOUT`.
+pub const RESTORE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Await the RestoreAck verdict for a RESTORE/RESTORE_CARRY just sent on `down`, bounded by
+/// [`RESTORE_ACK_TIMEOUT`]. On timeout the connection is dropped — same hazard
+/// [`recv_token_reply`] documents: the late ack (13 raw bytes, no sequence number) would otherwise
+/// be read as the next exchange's reply on a reused connection.
+pub async fn recv_restore_verdict(down: &Mutex<ActivationClient>) -> Result<bool, String> {
+    match tokio::time::timeout(RESTORE_ACK_TIMEOUT, async {
+        match recv_kind_client(down).await {
+            Ok(Some(FrameKind::RestoreAck)) => recv_restore_ack_body_client(down)
+                .await
+                .map(|(_, v)| v == 1)
+                .map_err(|e| format!("recv_restore_ack: {e}")),
+            Ok(Some(other)) => Err(format!("expected RestoreAck, got {other:?}")),
+            Ok(None) => Err("downstream closed during restore-ack".into()),
+            Err(e) => Err(format!("recv_kind (restore-ack): {e}")),
+        }
+    })
+    .await
+    {
+        Ok(res) => res,
+        Err(_) => {
+            // The inner future — and any guard it held mid-read — is dropped by
+            // the time we get here, so re-locking cannot deadlock.
+            down.lock().await.close().await;
+            Err(format!(
+                "restore ack timeout after {RESTORE_ACK_TIMEOUT:?}: downstream silent (dead peer?); \
+                 connection dropped to avoid reading the late ack as the next exchange's reply"
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod capture_frame_tests {
     use super::*;

@@ -37,9 +37,9 @@ use crate::dist::{
 #[cfg(feature = "kv_coord")]
 use crate::dist::{
     recv_capture_ack_body_client, recv_capture_body_server, recv_capture_v2_body_server,
-    recv_restore_ack_body_client, recv_restore_body_server, recv_restore_carry_body_server,
-    send_capture, send_capture_ack_upstream, send_restore, send_restore_ack_upstream,
-    send_restore_carry, CAPTURE_ACK_TIMEOUT,
+    recv_restore_body_server, recv_restore_carry_body_server, recv_restore_verdict, send_capture,
+    send_capture_ack_upstream, send_restore, send_restore_ack_upstream, send_restore_carry,
+    CAPTURE_ACK_TIMEOUT,
 };
 use crate::kv_prefix_cache::KvPrefixCache;
 use crate::manifest::Manifest;
@@ -2417,15 +2417,9 @@ impl SparseMoEEngine {
             send_restore(&down, epoch)
                 .await
                 .map_err(|e| format!("send_restore: {e}"))?;
-            match recv_kind_client(&down).await {
-                Ok(Some(FrameKind::RestoreAck)) => recv_restore_ack_body_client(&down)
-                    .await
-                    .map(|(_, v)| v == 1)
-                    .map_err(|e| format!("recv_restore_ack: {e}")),
-                Ok(Some(other)) => Err(format!("expected RestoreAck, got {other:?}")),
-                Ok(None) => Err("downstream closed during restore-ack".to_string()),
-                Err(e) => Err(format!("recv_kind (restore-ack): {e}")),
-            }
+            // Bounded + close-on-timeout: RESTORE runs at admission, so an unbounded wait
+            // here stalls every warm-hit request behind a silent downstream.
+            recv_restore_verdict(&down).await
         });
         match verdict {
             Ok(v) => v,
@@ -2656,19 +2650,12 @@ impl SparseMoEEngine {
                         send_restore(down, epoch)
                             .await
                             .map_err(|e| format!("send_restore: {e}"))?;
-                        match recv_kind_client(down).await {
-                            Ok(Some(FrameKind::RestoreAck)) => recv_restore_ack_body_client(down)
-                                .await
-                                .map(|(_, v)| v == 1)
-                                .map_err(|e| format!("recv_restore_ack: {e}")),
-                            Ok(Some(other)) => {
-                                Err(format!("expected RestoreAck downstream, got {other:?}"))
-                            }
-                            Ok(None) => Err("downstream closed during restore-ack".into()),
-                            Err(e) => Err(format!("recv_kind (restore-ack): {e}")),
-                        }
+                        recv_restore_verdict(down).await
                     })
-                    .unwrap_or(false)
+                    .unwrap_or_else(|e| {
+                        warn!(rank = self.rank, epoch, "downstream restore chain failed: {e}");
+                        false
+                    })
                 } else {
                     false
                 };
@@ -3431,15 +3418,9 @@ impl OvMoeEngine {
                     .await
                     .map_err(|e| format!("send_restore: {e}"))?,
             }
-            match recv_kind_client(&down).await {
-                Ok(Some(FrameKind::RestoreAck)) => recv_restore_ack_body_client(&down)
-                    .await
-                    .map(|(_, v)| v == 1)
-                    .map_err(|e| format!("recv_restore_ack: {e}")),
-                Ok(Some(other)) => Err(format!("expected RestoreAck, got {other:?}")),
-                Ok(None) => Err("downstream closed during restore-ack".to_string()),
-                Err(e) => Err(format!("recv_kind (restore-ack): {e}")),
-            }
+            // Bounded + close-on-timeout: RESTORE runs at admission, so an unbounded wait
+            // here stalls every warm-hit request behind a silent downstream.
+            recv_restore_verdict(&down).await
         });
         match verdict {
             Ok(v) => v,
@@ -3540,19 +3521,12 @@ impl OvMoeEngine {
                 send_restore(down, epoch)
                     .await
                     .map_err(|e| format!("send_restore: {e}"))?;
-                match recv_kind_client(down).await {
-                    Ok(Some(FrameKind::RestoreAck)) => recv_restore_ack_body_client(down)
-                        .await
-                        .map(|(_, v)| v == 1)
-                        .map_err(|e| format!("recv_restore_ack: {e}")),
-                    Ok(Some(other)) => {
-                        Err(format!("expected RestoreAck downstream, got {other:?}"))
-                    }
-                    Ok(None) => Err("downstream closed during restore-ack".into()),
-                    Err(e) => Err(format!("recv_kind (restore-ack): {e}")),
-                }
+                recv_restore_verdict(down).await
             })
-            .unwrap_or(false)
+            .unwrap_or_else(|e| {
+                warn!(rank = self.rank, epoch, "downstream restore chain failed: {e}");
+                false
+            })
         } else {
             false
         };
@@ -3590,19 +3564,12 @@ impl OvMoeEngine {
                 send_restore(down, epoch)
                     .await
                     .map_err(|e| format!("send_restore: {e}"))?;
-                match recv_kind_client(down).await {
-                    Ok(Some(FrameKind::RestoreAck)) => recv_restore_ack_body_client(down)
-                        .await
-                        .map(|(_, v)| v == 1)
-                        .map_err(|e| format!("recv_restore_ack: {e}")),
-                    Ok(Some(other)) => {
-                        Err(format!("expected RestoreAck downstream, got {other:?}"))
-                    }
-                    Ok(None) => Err("downstream closed during restore-ack".into()),
-                    Err(e) => Err(format!("recv_kind (restore-ack): {e}")),
-                }
+                recv_restore_verdict(down).await
             })
-            .unwrap_or(false)
+            .unwrap_or_else(|e| {
+                warn!(rank = self.rank, epoch, "downstream restore chain failed: {e}");
+                false
+            })
         } else {
             false
         };
