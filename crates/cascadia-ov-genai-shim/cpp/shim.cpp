@@ -1200,8 +1200,25 @@ int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_
                 uint64_t bkey;
                 identity_ok = kv_canonical_key(bname, &bkey) && bkey == mkeys[dst];
             }
-            ov::Tensor t(code_to_ov_type(dcode), shape);
-            if (identity_ok && t.get_byte_size() == nb) {
+            // Validate the declared dtype + dims against nb BEFORE constructing the tensor:
+            // ov::Tensor allocates from the declared shape, so a corrupt/hostile blob declaring
+            // dims like [1,1,1,2^50] would drive a multi-TB allocation attempt ahead of the old
+            // post-construction byte-size guard (the wire-level frame bound cannot see inside an
+            // opaque blob). Overflow-checked product; any disagreement skips the entry, and
+            // applied<count fails the whole restore below.
+            const ov::element::Type etype = code_to_ov_type(dcode);
+            bool size_ok = etype != ov::element::dynamic;
+            if (size_ok) {
+                const uint64_t esz = etype.size(); // bytes/element; every supported code is byte-aligned
+                uint64_t elems = 1;
+                for (size_t d : shape) {
+                    if (d != 0 && elems > UINT64_MAX / d) { size_ok = false; break; }
+                    elems *= static_cast<uint64_t>(d);
+                }
+                size_ok = size_ok && esz != 0 && elems <= UINT64_MAX / esz && elems * esz == nb;
+            }
+            if (identity_ok && size_ok) {
+                ov::Tensor t(etype, shape);
                 std::memcpy(t.data(), p, nb);
                 states[dst].set_state(t);
                 ++applied;
