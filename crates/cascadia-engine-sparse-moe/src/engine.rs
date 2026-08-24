@@ -1663,9 +1663,18 @@ impl SparseMoEEngine {
                 .await
                 {
                     Ok(r) => r,
-                    Err(_) => Err(format!(
-                        "capture ack timed out after {CAPTURE_ACK_TIMEOUT:?}"
-                    )),
+                    Err(_) => {
+                        // Same hazard recv_token_reply drops the socket for: the peer is
+                        // usually alive and its CaptureAck (no sequence number) lands after
+                        // we stopped waiting — a reused connection hands it to the NEXT
+                        // exchange as its reply.
+                        downstream.lock().await.close().await;
+                        Err(format!(
+                            "capture ack timed out after {CAPTURE_ACK_TIMEOUT:?}; \
+                             connection dropped to avoid reading the late ack as the next \
+                             exchange's reply"
+                        ))
+                    }
                 }
             });
             match acked {
@@ -2390,9 +2399,16 @@ impl SparseMoEEngine {
                 .await
                 {
                     Ok(r) => r,
-                    Err(_) => Err(format!(
-                        "capture relay ack timed out after {CAPTURE_ACK_TIMEOUT:?}"
-                    )),
+                    Err(_) => {
+                        // Close on elapse — the late CaptureAck has no sequence number, so a
+                        // reused connection would hand it to the next exchange as its reply.
+                        down.lock().await.close().await;
+                        Err(format!(
+                            "capture relay ack timed out after {CAPTURE_ACK_TIMEOUT:?}; \
+                             connection dropped to avoid reading the late ack as the next \
+                             exchange's reply"
+                        ))
+                    }
                 }
             })?;
         }
@@ -3283,9 +3299,17 @@ impl OvMoeEngine {
                             .await
                             {
                                 Ok(r) => r,
-                                Err(_) => Err(format!(
-                                    "capture ack timed out after {CAPTURE_ACK_TIMEOUT:?}"
-                                )),
+                                Err(_) => {
+                                    // Close on elapse — the late CaptureAck has no sequence
+                                    // number, so a reused connection would hand it to the
+                                    // next exchange as its reply.
+                                    downstream.lock().await.close().await;
+                                    Err(format!(
+                                        "capture ack timed out after {CAPTURE_ACK_TIMEOUT:?}; \
+                                         connection dropped to avoid reading the late ack as \
+                                         the next exchange's reply"
+                                    ))
+                                }
                             }
                         });
                         match acked {
@@ -3476,9 +3500,16 @@ impl OvMoeEngine {
                 .await
                 {
                     Ok(r) => r,
-                    Err(_) => Err(format!(
-                        "capture relay ack timed out after {CAPTURE_ACK_TIMEOUT:?}"
-                    )),
+                    Err(_) => {
+                        // Close on elapse — the late CaptureAck has no sequence number, so a
+                        // reused connection would hand it to the next exchange as its reply.
+                        down.lock().await.close().await;
+                        Err(format!(
+                            "capture relay ack timed out after {CAPTURE_ACK_TIMEOUT:?}; \
+                             connection dropped to avoid reading the late ack as the next \
+                             exchange's reply"
+                        ))
+                    }
                 }
             })?;
         }
