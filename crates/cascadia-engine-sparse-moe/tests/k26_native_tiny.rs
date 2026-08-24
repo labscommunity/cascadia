@@ -81,7 +81,11 @@ fn fixture_selects_the_native_branch() {
 /// Mirrors the fixture into a temp dir (symlinks — the shard is >1 GiB) and
 /// adds a `head/openvino_model.xml`, so the failure is the compile stub and
 /// not merely the missing-file check that precedes it.
+///
+/// Unix-only: `std::os::unix::fs::symlink` does not exist on Windows, and an
+/// ungated use is a compile error for the whole test binary on the fleet nodes.
 #[test]
+#[cfg(unix)]
 fn native_last_stage_requires_openvino() {
     let Some(src) = tiny_dir() else {
         eprintln!("K26_TINY_DIR not set; skipping");
