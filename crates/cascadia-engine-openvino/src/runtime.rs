@@ -2132,7 +2132,11 @@ impl OvRuntimeEngine {
                                 // would now mask exactly that.
                                 let ok = matches!(self.send_restore_downstream(epoch), Ok(true));
                                 if !ok {
-                                    let _ = self.send_abort_downstream();
+                                    if let Err(e) = self.send_abort_downstream() {
+                                        error!(error = %e,
+                                            "ov-runtime: ABORT after failed chain restore failed; \
+                                             downstream ranks may stay armed warm");
+                                    }
                                 }
                                 ok
                             };
@@ -3861,7 +3865,9 @@ impl OvRuntimeEngine {
     /// retraction that handler also does is `clear(epoch)` on this path. Idempotent.
     #[cfg(feature = "kv_coord")]
     pub(crate) fn abort_warm_resume_local(&mut self) {
-        let _ = self.runtime.reset_state();
+        // The abort exists to undo a restore, and reset_state cannot scrub post-set_state
+        // residue — rebuild the request (rare path; loud on failure via the helper).
+        self.scrub_after_set_state("abort_warm_resume");
         self.kv_warm_pending = false;
         self.position = 0;
     }
@@ -4415,7 +4421,12 @@ impl OvRuntimeEngine {
             }
             // ABORT: reset cold + clear warm_pending; chain downstream; ack.
             Some(OPCODE_ABORT) => {
-                let _ = self.runtime.reset_state();
+                // The rollback must be effective and LOUD: this rank may have already applied a
+                // restore, reset_state cannot scrub that (the very state the abort exists to
+                // undo), and ABORT_ACK carries no verdict byte — a swallowed failure acks clean
+                // while the rank stays warm under a cold head, and the next prefill runs over
+                // pre-seeded KV: wrong tokens, not a degraded mode.
+                self.scrub_after_set_state("chain OPCODE_ABORT");
                 self.kv_warm_pending = false;
                 self.position = 0;
                 // Zeroing `position` disarms the drain's depth guard, so a still-parked slice would
@@ -4425,7 +4436,10 @@ impl OvRuntimeEngine {
                     info!(target: "cascadia::kv", event = "kv_handoff_discarded_on_abort");
                 }
                 if !self.spec.is_last_stage {
-                    let _ = self.send_abort_downstream();
+                    if let Err(e) = self.send_abort_downstream() {
+                        error!(error = %e,
+                            "ov-runtime: ABORT relay downstream failed; ranks below may stay armed warm");
+                    }
                 }
                 self.send_control_ack_upstream(OPCODE_ABORT_ACK, &[])
             }
