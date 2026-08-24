@@ -128,18 +128,20 @@ fn sampling_wire_round_trips_defaults_and_explicit_values() {
     assert_eq!(back.seed, cfg.seed);
 
     // The Forward frame kind was bumped to a new code alongside the wider
-    // sampling block so a 28-byte-layout peer fails fast (#14).
+    // sampling block so a 28-byte-layout peer fails fast (#14), and again for
+    // the push_history byte (issue #34, 0x04→0x0C).
     assert_eq!(
-        FrameKind::from_code(0x53_4D_45_04),
+        FrameKind::from_code(0x53_4D_45_0C),
         Some(FrameKind::Forward)
     );
     assert_eq!(
         FrameKind::from_code(0x53_4D_45_05),
         Some(FrameKind::ForwardBatch)
     );
-    // The old 28-byte Forward/ForwardBatch codes are now unknown → rejected.
+    // The retired Forward-layout codes are now unknown → rejected.
     assert_eq!(FrameKind::from_code(0x53_4D_45_02), None);
     assert_eq!(FrameKind::from_code(0x53_4D_45_03), None);
+    assert_eq!(FrameKind::from_code(0x53_4D_45_04), None);
 }
 
 #[test]
@@ -431,15 +433,22 @@ fn frame_kind_codes_remain_stable() {
     // Reset/Token carry no sampling block and keep their original codes.
     // Forward/ForwardBatch were bumped 0x02→0x04 / 0x03→0x05 in #14 when the
     // sampling block grew 28→40 bytes, so a peer on the old layout fails fast
-    // at parse_kind rather than mis-reading the wider frame.
-    assert_eq!(FrameKind::Forward as u32, 0x53_4D_45_04);
+    // at parse_kind rather than mis-reading the wider frame. The single-token
+    // Forward family was bumped again (0x04→0x0C, 0x06→0x0D, 0x07→0x0E) when
+    // the 1-byte push_history flag was added (issue #34).
+    assert_eq!(FrameKind::Forward as u32, 0x53_4D_45_0C);
     assert_eq!(FrameKind::Reset as u32, 0x53_4D_45_10);
     assert_eq!(FrameKind::Token as u32, 0x53_4D_45_20);
     assert_eq!(FrameKind::ForwardBatch as u32, 0x53_4D_45_05);
     assert_eq!(FrameKind::TokenBatch as u32, 0x53_4D_45_21);
-    // The retired 28-byte-layout codes must now be rejected as unknown.
+    assert_eq!(FrameKind::ForwardNoSample as u32, 0x53_4D_45_0D);
+    assert_eq!(FrameKind::ForwardPrefill as u32, 0x53_4D_45_0E);
+    // The retired codes must now be rejected as unknown.
     assert_eq!(FrameKind::from_code(0x53_4D_45_02), None);
     assert_eq!(FrameKind::from_code(0x53_4D_45_03), None);
+    assert_eq!(FrameKind::from_code(0x53_4D_45_04), None);
+    assert_eq!(FrameKind::from_code(0x53_4D_45_06), None);
+    assert_eq!(FrameKind::from_code(0x53_4D_45_07), None);
 
     // And round-trip every variant through from_code.
     for k in [

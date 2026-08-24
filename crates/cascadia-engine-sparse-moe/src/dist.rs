@@ -87,7 +87,14 @@ pub enum FrameKind {
     // the old 28-byte layout trips the unknown-kind check in `parse_kind`
     // instead of mis-reading the larger frame. Reset/Token carry no sampling
     // and keep their codes.
-    Forward = 0x53_4D_45_04,      // "SME\x04" — was 0x02 (28-byte sampling)
+    //
+    // The single-token Forward family (Forward / ForwardNoSample / ForwardPrefill)
+    // then grew the 1-byte `push_history` flag (issue #34), so those three codes
+    // were bumped again (0x04→0x0C, 0x06→0x0D, 0x07→0x0E): the transport is a raw
+    // byte stream with no message boundary, so an old peer reading the new body
+    // would leave the extra byte in the stream and shift every later field by one.
+    // The batch forwards did not gain the byte and keep their codes.
+    Forward = 0x53_4D_45_0C,      // "SME\x0C" — was 0x04 (no push_history byte)
     Reset = 0x53_4D_45_10,        // "SME\x10"
     Token = 0x53_4D_45_20,        // "SME\x20"
     ForwardBatch = 0x53_4D_45_05, // "SME\x05" — was 0x03; batched K-step verify
@@ -104,7 +111,7 @@ pub enum FrameKind {
     /// 1.05 demotes the real " Paris"). Single-stage `generate()` never
     /// records prompt-loop samples, so only distributed runs corrupted.
     /// Also skips the pointless vocab-width head GEMV per prompt token.
-    ForwardNoSample = 0x53_4D_45_06, // "SME\x06"
+    ForwardNoSample = 0x53_4D_45_0D, // "SME\x0D" — was 0x06 (no push_history byte)
     /// Streamed prefill Forward (0x07): identical body to `ForwardNoSample`
     /// (the receiver advances KV but skips head/sample/record), except it is
     /// **one-way** — no `Token(-1)` ack. Rank 0 fires one per prompt token
@@ -113,7 +120,7 @@ pub enum FrameKind {
     /// ranks (per-rank compute overlaps) instead of one blocking 6-hop
     /// round-trip each. The final prompt token still goes as a sampling
     /// `Forward`, whose returned token is the first generated token.
-    ForwardPrefill = 0x53_4D_45_07, // "SME\x07"
+    ForwardPrefill = 0x53_4D_45_0E, // "SME\x0E" — was 0x07 (no push_history byte)
     /// Batched prefill Forward (0x08): identical body to `ForwardBatch`, but the
     /// last rank runs its layers over ALL rows (batch-union) and samples ONLY
     /// the final row — the first generated token — pushing just that one into
@@ -343,8 +350,10 @@ fn sanitize_f32(x: f32, fallback: f32, min: f32) -> f32 {
 /// discarded prefill sample (false). It lets the multi-stage rep-penalty window
 /// cover generated tokens only — matching the single-stage path — and is what
 /// makes a warm-resumed run byte-identical to a cold one (the skipped prefill
-/// forwards would otherwise desync the history). Both pipeline ends are the same
-/// build, so the wire layout is extended unconditionally (no version byte).
+/// forwards would otherwise desync the history). The layout is extended
+/// unconditionally (no version byte); mixed builds are covered by the frame-kind
+/// bump (0x04→0x0C etc.) — an old peer rejects the new code at `parse_kind`
+/// instead of leaving the extra byte in the raw stream.
 async fn send_forward_kind(
     cli: &Mutex<ActivationClient>,
     kind: FrameKind,
