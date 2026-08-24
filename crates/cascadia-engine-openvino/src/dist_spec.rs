@@ -41,7 +41,9 @@ use futures::stream;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 use tokio::net::TcpStream;
-use tracing::{error, info, warn};
+#[cfg(feature = "kv_coord")]
+use tracing::error;
+use tracing::{info, warn};
 
 // -------- frame protocol --------
 
