@@ -66,8 +66,9 @@ permissions:
 
 env:
   # OpenVINO GenAI SDK archives (the single source of truth for the version).
-  # To bump: edit BOTH full URLs and re-confirm them against the storage index
-  # in the header banner above.
+  # To bump: edit BOTH full URLs here plus OV_LINUX_URL in ci.yml (the Linux
+  # release pre-flight must stay in lockstep), and re-confirm them against
+  # the storage index in the header banner above.
   OV_LINUX_URL: "https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/2026.2/linux/openvino_genai_ubuntu22_2026.2.0.0_x86_64.tar.gz"
   OV_WINDOWS_URL: "https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/2026.2/windows/openvino_genai_windows_2026.2.0.0_x86_64.zip"
   CARGO_TERM_COLOR: always

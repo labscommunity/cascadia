@@ -18,6 +18,8 @@ permissions:
   contents: read
 
 env:
+  # Must match release.yml's OV_LINUX_URL — linux-openvino-check below
+  # pre-flights that build, and a version skew would quietly un-mirror it.
   OV_LINUX_URL: https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/2026.2/linux/openvino_genai_ubuntu22_2026.2.0.0_x86_64.tar.gz
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -40,9 +42,19 @@ jobs:
         with:
           filters: |
             linux:
+              # This workflow defines the check itself (job steps, OV SDK
+              # URL) — changes to it must exercise the job before merge.
+              - '.github/workflows/ci.yml'
               - 'crates/cascadia-ov-genai-shim/**'
               - 'crates/cascadia-engine-openvino/**'
               - 'crates/cascadia-engine-sparse-moe/examples/**'
+              # openvino-gated code the stub build never compiles also
+              # lives in cascadia-cli (engine wiring) and the cascadia
+              # bin crate's feature plumbing.
+              - 'crates/cascadia-cli/**'
+              - 'crates/cascadia/**'
+              # A dependency bump can break the openvino-only build.
+              - 'Cargo.lock'
 
   test:
     name: cargo test (stub)
@@ -132,10 +144,12 @@ jobs:
     if: needs.changes.outputs.linux == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-22.04
     timeout-minutes: 30
-    # Only pay the OV SDK download + C++ compile when it could affect Linux release
-    # Note: paths filters on workflow-level `pull_request` don't gate `push` to main;
-    # for pushes this job always runs. Use job-level `if` with changed-files is
-    # overkill — a no-op build on main push is cheap and verifies the tagline.
+    # PRs: gated by the `changes` job so unrelated PRs skip the OV SDK
+    # download + C++ compile. (A workflow-level `on.pull_request.paths`
+    # filter can't do this — it would skip the whole workflow, stub tests
+    # included.) Pushes to main and manual dispatches always run: a
+    # redundant pass there is cheap, and it keeps main verifiably
+    # releasable right up to the commit release-please tags.
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -148,7 +162,6 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: ci-linux-openvino
-          cache-on-failure: false
 
       - name: Install g++-12
         run: |
@@ -156,8 +169,6 @@ jobs:
           sudo apt-get install -y g++-12
 
       - name: Download + extract OpenVINO GenAI SDK (linux)
-        env:
-          OV_LINUX_URL: https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/2026.2/linux/openvino_genai_ubuntu22_2026.2.0.0_x86_64.tar.gz
         run: |
           mkdir -p "$RUNNER_TEMP/ov"
           curl -fSL "$OV_LINUX_URL" -o "$RUNNER_TEMP/ov.tgz"
@@ -167,8 +178,16 @@ jobs:
       - name: Check Linux openvino build (no upload)
         env:
           CXX: g++-12
+          # Inert under `cargo check` (nothing links); kept identical to
+          # release.yml so a future switch to `cargo build` stays faithful.
           RUSTFLAGS: "-C link-arg=-Wl,-rpath,$ORIGIN/lib -C link-arg=-Wl,--disable-new-dtags"
-        run: cargo check -p cascadia --features openvino
+        run: |
+          cargo check -p cascadia --features openvino
+          # Examples aren't in `-p cascadia`'s build graph (cargo only
+          # builds the named package's own targets), so compile them
+          # explicitly — otherwise example-only PRs trigger this job but
+          # never compile the files that changed.
+          cargo check -p cascadia-engine-sparse-moe --examples --features openvino
 
       - name: Verify bundled licensing layout (fails fast if SDK moved)
         run: test -d "$INTEL_OPENVINO_DIR/docs/licensing" || (echo "::error::OV licensing dir missing at $INTEL_OPENVINO_DIR/docs/licensing"; exit 1)
