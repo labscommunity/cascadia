@@ -1372,7 +1372,10 @@ impl Runtime {
     /// to positional matching, accepted only when each blob name equals the destination state's name
     /// verbatim (a same-instance round-trip); plain positional cross-instance restore is exactly what
     /// put states in the wrong slots. If ANY entry fails to apply (identity, byte-size, or element-type
-    /// mismatch) the call returns `Err` rather than silently half-restoring.
+    /// mismatch) the call returns `Err` rather than silently half-restoring. The element-type check
+    /// compares against a dtype cached from a materialized read (capture, or a prior probe); a dynamic
+    /// destination state that has never materialized cannot be read without throwing, so such entries
+    /// apply on the size + identity guards alone (noted on stderr).
     ///
     /// On `Err` the request may already be **partially restored** — entries are applied as the blob
     /// is parsed. Callers must scrub with [`Runtime::recreate_request`] (or `reset_state` where that

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -17,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <unordered_map>
 #include <vector>
 
 #include <openvino/openvino.hpp>
@@ -204,6 +206,13 @@ struct cascadia_runtime_t {
     std::vector<std::string> output_names;
     std::vector<std::string> input_aliases;   // ALL aliases joined by '\n'
     std::vector<std::string> output_aliases;
+    // Runtime element type per VariableState name, learned from materialized reads
+    // (get_state_blob capture, or a successful probe in set_state_blob). Needed because
+    // querying a DYNAMIC state's tensor before any forward pass throws ("Cannot get length
+    // of dynamic dimension") — a fresh recipient's attention KV states on a cross-chain
+    // restore are exactly that. Deliberately survives recreate_request: the CompiledModel
+    // (and thus the plugin's KV precision) is retained, so the types cannot change.
+    std::unordered_map<std::string, ov::element::Type> state_dtypes;
 };
 
 extern "C" {
@@ -1112,6 +1121,9 @@ int32_t cascadia_runtime_get_state_blob(cascadia_runtime_t* handle, uint8_t* buf
                 set_last_error(oss.str().c_str());
                 return 1;
             }
+            // Capture runs post-generation (states materialized), so this read is the
+            // authoritative source for the dtype cache set_state_blob's guard consults.
+            handle->state_dtypes[name] = t.get_element_type();
             total += 4 + name.size() + 1 + 1 + 8 * t.get_shape().size() + 8 + t.get_byte_size();
             snaps.emplace_back(std::move(name), t);
         }
@@ -1207,6 +1219,7 @@ int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_
             return 1;
         }
         uint32_t applied = 0;
+        uint32_t dtype_unverified = 0; // states applied without a destination-dtype check
         std::string dbg_b0, dbg_blast; // diagnostic: first/last blob state names
         for (uint32_t i = 0; i < count; ++i) {
             uint32_t nl = get32(); need(nl);
@@ -1253,12 +1266,35 @@ int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_
             }
             bool apply_ok = identity_ok && size_ok;
             if (apply_ok) {
-                // The donor's element type must also match the destination state's: f16 vs bf16
-                // share a byte size, so a size-only guard reinterprets the payload with the wrong
-                // exponent/mantissa split — same fingerprint, same length, garbage tokens.
+                // Donor↔destination dtype guard: f16 vs bf16 share a byte size, so a size-only
+                // guard lets the payload be read with the wrong exponent/mantissa split —
                 // KV_CACHE_PRECISION is a per-node knob, so two nodes serving the same model can
-                // legitimately differ. (get_state() is gated behind the cheap checks above.)
-                apply_ok = states[dst].get_state().get_element_type() == etype;
+                // legitimately differ. The destination's RUNTIME dtype is only observable via
+                // get_state(), but on a FRESH request the attention KV states of a dynamic-in-T
+                // model (qwen36) have an unmaterialized dynamic dim and get_state() throws
+                // "Cannot get length of dynamic dimension" — which is precisely the cross-chain
+                // recipient's situation, and threw every such restore to cold. (set_state itself
+                // materializes the dim, which is why the pre-guard code never hit this.) So:
+                // compare against the dtype cached from a prior MATERIALIZED read (capture, or an
+                // earlier successful probe), probing-and-caching here when get_state() works; a
+                // state that is dynamic and has never materialized is unverifiable this call —
+                // apply it on the size + identity guards and say so below.
+                const std::string dname = states[dst].get_name();
+                auto cached = handle->state_dtypes.find(dname);
+                if (cached == handle->state_dtypes.end()) {
+                    try {
+                        const ov::element::Type live =
+                            states[dst].get_state().get_element_type();
+                        cached = handle->state_dtypes.emplace(dname, live).first;
+                    } catch (const std::exception&) {
+                        // dynamic + unmaterialized — fall through to the unverified path
+                    }
+                }
+                if (cached != handle->state_dtypes.end()) {
+                    apply_ok = cached->second == etype;
+                } else {
+                    ++dtype_unverified;
+                }
             }
             if (apply_ok) {
                 ov::Tensor t(etype, shape);
@@ -1267,6 +1303,16 @@ int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_
                 ++applied;
             }
             p += nb;
+        }
+        if (dtype_unverified > 0) {
+            // The shim has no logging facility (set_last_error is error-only), and this is a
+            // successful-but-weaker apply the operator should be able to see: these states were
+            // restored on the size + identity guards alone, because their destination dtype
+            // could not be read without materializing a dynamic state.
+            std::fprintf(stderr,
+                         "[cascadia-shim] set_state_blob: destination dtype unverifiable for %u "
+                         "of %u states (dynamic, never materialized); applied on size+identity\n",
+                         dtype_unverified, count);
         }
         // A skipped state (byte-size mismatch) leaves that variable at its CURRENT value while its
         // siblings carry the donor's — a silent half-restore the caller then treats as a good warm
