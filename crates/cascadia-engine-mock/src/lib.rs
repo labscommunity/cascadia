@@ -92,7 +92,8 @@ impl Engine for MockEngine {
             )]);
         }
         let token = words[emitted].to_string();
-        let chunk = Chunk::token(&task.task_id, emitted as i64, token + " ");
+        let chunk =
+            Chunk::token(&task.task_id, emitted as i64, token + " ").with_token_ids(vec![emitted as i64]);
         let task_id = task.task_id.clone();
         self.pending.push((task, emitted + 1));
         Ok(vec![(task_id, chunk)])

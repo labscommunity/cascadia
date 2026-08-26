@@ -1869,11 +1869,12 @@ impl OvDistSpecEngine {
             accept = active.stats.accept_rate(),
             "ov-dist-spec done"
         );
-        // Multi-token final round (do_one_round's finished=true path): surface
-        // every id this round appended, in order. Single/zero-token finals
-        // (first-chunk-hits-max/EOS) leave it empty — `token_id` alone already
-        // identifies the single accepted token.
-        let token_ids = if n_tokens > 1 {
+        // Surface every id this round appended, in order — including a
+        // single-token final: `token_id == 0` with an empty `token_ids` reads
+        // as id-less, and token 0 is a legal sample. A ZERO-token final keeps
+        // it empty (this round appended nothing; `token_id` there is a prior
+        // round's last token, not this chunk's).
+        let token_ids = if n_tokens > 0 {
             let start = active.out.len().saturating_sub(n_tokens as usize);
             active.out[start..].to_vec()
         } else {

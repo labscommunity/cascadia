@@ -2804,7 +2804,9 @@ impl OvRuntimeEngine {
             // the next chunk (BPE splitting a glyph) would otherwise count 0.
             return Ok(Some((
                 task_id.clone(),
-                Chunk::token(task_id, token as i64, delta).with_n_tokens(1),
+                Chunk::token(task_id, token as i64, delta)
+                    .with_n_tokens(1)
+                    .with_token_ids(vec![token as i64]),
             )));
         }
         let n_tokens = t.generated.len() as u32;
@@ -3121,6 +3123,7 @@ impl OvRuntimeEngine {
             }
         } else {
             Chunk::token(task_id.clone(), next_token as i64, delta)
+                .with_token_ids(vec![next_token as i64])
         };
 
         if is_final {

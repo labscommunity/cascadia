@@ -1555,7 +1555,11 @@ impl Qwen36Engine {
                     if reanchored {
                         warn!(task = %task_id, "decode diverged from the emitted prefix; re-anchored (delta dropped)");
                     }
-                    vec![(task_id.clone(), Chunk::token(task_id, next as i64, delta))]
+                    vec![(
+                        task_id.clone(),
+                        Chunk::token(task_id, next as i64, delta)
+                            .with_token_ids(vec![next as i64]),
+                    )]
                 }
                 Err(e) => {
                     warn!(task = %task_id, error = %e, "pipeline decode failed");
@@ -2201,7 +2205,11 @@ impl Qwen36Engine {
                     if reanchored {
                         warn!(task = %task_id, "decode diverged from the emitted prefix; re-anchored (delta dropped)");
                     }
-                    vec![(task_id.clone(), Chunk::token(task_id, next as i64, delta))]
+                    vec![(
+                        task_id.clone(),
+                        Chunk::token(task_id, next as i64, delta)
+                            .with_token_ids(vec![next as i64]),
+                    )]
                 }
                 Err(e) => {
                     warn!(task = %task_id, error = %e, "decode failed");

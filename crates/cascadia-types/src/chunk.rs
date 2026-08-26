@@ -83,11 +83,14 @@ pub struct Chunk {
     /// falls back to `"stop"` (the historical behavior).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<FinishReason>,
-    /// Every generated token-id in this chunk, in order. Multi-token chunks
-    /// (dist-spec spec-rounds, sparse-moe batches) fill this so a resume source
-    /// can accumulate EXACT ids; single-token chunks leave it empty and callers
-    /// fall back to `token_id`. `#[serde(default)]` keeps the wire additive.
-    #[serde(default)]
+    /// Every generated token-id in this chunk, in order, so a resume source can
+    /// accumulate EXACT ids. Engines that know the ids fill it on EVERY chunk —
+    /// including single-token chunks, where `token_id == 0` with an empty vec is
+    /// indistinguishable from an id-less chunk (token 0 is a legal sample).
+    /// Chunks whose text is not token-addressed (whole-turn ov-genai bursts,
+    /// synthetic markers with `token_id = 0`) leave it empty; such streams are
+    /// not resume sources. `#[serde(default)]` keeps the wire additive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub token_ids: Vec<i64>,
 }
 
@@ -148,6 +151,14 @@ impl Chunk {
     /// Tag the final chunk with why generation stopped (length vs stop).
     pub fn with_finish_reason(mut self, reason: FinishReason) -> Self {
         self.finish_reason = Some(reason);
+        self
+    }
+
+    /// Stamp the exact generated ids this chunk carries (see `token_ids` docs:
+    /// per-token producers stamp every chunk so a legal token-0 sample can't
+    /// read as id-less).
+    pub fn with_token_ids(mut self, ids: Vec<i64>) -> Self {
+        self.token_ids = ids;
         self
     }
 

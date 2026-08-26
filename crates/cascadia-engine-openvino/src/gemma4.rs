@@ -1261,6 +1261,7 @@ impl Gemma4Engine {
             }
         } else {
             Chunk::token(task_id.clone(), next_token as i64, delta)
+                .with_token_ids(vec![next_token as i64])
         };
 
         if is_final {
