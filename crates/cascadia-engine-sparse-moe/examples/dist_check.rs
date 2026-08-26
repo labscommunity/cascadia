@@ -75,7 +75,7 @@ async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
                 println!("[server] recv RESET");
             }
             FrameKind::Forward => {
-                let (past_seq_len, _sampling, hidden, shape) =
+                let (past_seq_len, _sampling, _push_history, hidden, shape) =
                     recv_forward_body_server(&server).await?;
                 let mean: f32 = hidden.iter().copied().sum::<f32>() / hidden.len() as f32;
                 frame_count += 1;
@@ -96,13 +96,13 @@ async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
             FrameKind::ForwardNoSample => {
                 // Prefill-intermediate: consume the body, ack with a dummy
                 // Token(-1) — same shape the real worker uses.
-                let (_p, _s, _h, _sh) = recv_forward_body_server(&server).await?;
+                let (_p, _s, _ph, _h, _sh) = recv_forward_body_server(&server).await?;
                 frame_count += 1;
                 send_token_upstream(&server, -1).await?;
             }
             FrameKind::ForwardPrefill => {
                 // Streamed prefill: consume the body, no ack (one-way).
-                let (_p, _s, _h, _sh) = recv_forward_body_server(&server).await?;
+                let (_p, _s, _ph, _h, _sh) = recv_forward_body_server(&server).await?;
                 frame_count += 1;
             }
             FrameKind::ForwardBatch => {
@@ -116,6 +116,12 @@ async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
             }
             FrameKind::RestorePrefix | FrameKind::CachePrefix => {
                 println!("[server] prefix-cache frame not handled in dist_check — ignoring");
+            }
+            FrameKind::Capture | FrameKind::CaptureV2 | FrameKind::CaptureAck => {
+                println!("[server] CAPTURE/CAPTURE_ACK not handled in dist_check — ignoring");
+            }
+            FrameKind::Restore | FrameKind::RestoreAck | FrameKind::RestoreCarry => {
+                println!("[server] RESTORE/RESTORE_ACK/RESTORE_CARRY not handled in dist_check — ignoring");
             }
         }
     }
@@ -149,7 +155,7 @@ async fn run_client(peer: &str, port: u16, rounds: u32) -> Result<(), Box<dyn st
         }
         let cfg = cascadia_engine_sparse_moe::SamplingConfig::default();
         let t0 = Instant::now();
-        send_forward(&client, round, &cfg, &hidden, shape).await?;
+        send_forward(&client, round, &cfg, &hidden, shape, false).await?;
         let kind = recv_kind_client(&client).await?;
         let Some(FrameKind::Token) = kind else {
             return Err(format!("expected TOKEN, got {kind:?}").into());

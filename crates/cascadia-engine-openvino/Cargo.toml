@@ -11,6 +11,9 @@ description = "OpenVINO-backed engines for cascadia — wraps cascadia-ov-genai-
 [features]
 default = []
 openvino = ["cascadia-ov-genai-shim/openvino"]
+# Issue-34 Option C: KV coordination plane support (opaque OV state blobs). Off by default so the
+# wire crate stays out of the default build graph (mirrors cascadia-engine-sparse-moe).
+kv_coord = ["dep:cascadia-kv-wire", "dep:crc32fast", "cascadia-engine/kv_coord"]
 
 [dependencies]
 cascadia-types = { workspace = true }
@@ -18,6 +21,8 @@ cascadia-engine = { workspace = true }
 cascadia-runner = { workspace = true }
 cascadia-transport = { workspace = true }
 cascadia-ov-genai-shim = { workspace = true }
+cascadia-kv-wire = { path = "../cascadia-kv-wire", optional = true }
+crc32fast = { version = "1.4", optional = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
@@ -29,5 +34,7 @@ tokenizers = { workspace = true }
 half = "2"
 
 [dev-dependencies]
-tokio = { workspace = true }
+# `test-util` for tokio::time::pause — the control-ack bound test drives a 15 s
+# timeout on the paused clock instead of sleeping it for real.
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }

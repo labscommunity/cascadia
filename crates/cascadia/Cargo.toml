@@ -11,6 +11,8 @@ description = "cascadia binary — distributed LLM inference for Intel hardware.
 [features]
 default = []
 openvino = ["cascadia-cli/openvino"]
+# Issue-34 Option C: KV-coordination surface (holder + multi-stage capture/RESTORE + total>1 cache).
+kv_coord = ["cascadia-cli/kv_coord"]
 dashboard-embed = ["cascadia-cli/dashboard-embed"]
 
 [[bin]]

@@ -9,9 +9,10 @@ use std::sync::Arc;
 
 use cascadia_engine_sparse_moe::dist::{
     decode_sampling, encode_sampling, recv_forward_batch_body_server, recv_forward_body_server,
-    recv_kind_client, recv_kind_server, recv_token_batch_body_client, recv_token_body_client,
-    send_forward, send_forward_batch, send_reset, send_token_batch_upstream, send_token_upstream,
-    FrameKind, MAX_BATCH_COUNT, SAMPLING_WIRE_BYTES,
+    recv_kind_client, recv_kind_server, recv_restore_carry_body_server,
+    recv_token_batch_body_client, recv_token_body_client, send_forward, send_forward_batch,
+    send_reset, send_restore_carry, send_token_batch_upstream, send_token_upstream, FrameKind,
+    MAX_BATCH_COUNT, SAMPLING_WIRE_BYTES,
 };
 use cascadia_engine_sparse_moe::SamplingConfig;
 use cascadia_transport::{ActivationClient, ActivationServer};
@@ -57,15 +58,16 @@ async fn forward_frame_round_trips_hidden_state() {
     let cfg_for_assert = cfg.clone();
 
     let send_task = tokio::spawn(async move {
-        send_forward(&client, 17, &cfg, &hidden, shape)
+        send_forward(&client, 17, &cfg, &hidden, shape, true)
             .await
             .unwrap()
     });
 
     let kind = recv_kind_server(&server).await.unwrap();
     assert_eq!(kind, Some(FrameKind::Forward));
-    let (past_seq_len, cfg_back, h_back, in_shape) =
+    let (past_seq_len, cfg_back, push_hist, h_back, in_shape) =
         recv_forward_body_server(&server).await.unwrap();
+    assert!(push_hist, "push_history flag must round-trip");
     assert_eq!(past_seq_len, 17);
     assert_eq!(in_shape, shape);
     assert_eq!(h_back.len(), 1024);
@@ -126,18 +128,20 @@ fn sampling_wire_round_trips_defaults_and_explicit_values() {
     assert_eq!(back.seed, cfg.seed);
 
     // The Forward frame kind was bumped to a new code alongside the wider
-    // sampling block so a 28-byte-layout peer fails fast (#14).
+    // sampling block so a 28-byte-layout peer fails fast (#14), and again for
+    // the push_history byte (issue #34, 0x04→0x0C).
     assert_eq!(
-        FrameKind::from_code(0x53_4D_45_04),
+        FrameKind::from_code(0x53_4D_45_0C),
         Some(FrameKind::Forward)
     );
     assert_eq!(
         FrameKind::from_code(0x53_4D_45_05),
         Some(FrameKind::ForwardBatch)
     );
-    // The old 28-byte Forward/ForwardBatch codes are now unknown → rejected.
+    // The retired Forward-layout codes are now unknown → rejected.
     assert_eq!(FrameKind::from_code(0x53_4D_45_02), None);
     assert_eq!(FrameKind::from_code(0x53_4D_45_03), None);
+    assert_eq!(FrameKind::from_code(0x53_4D_45_04), None);
 }
 
 #[test]
@@ -218,7 +222,7 @@ async fn sequence_reset_then_forward_then_token() {
     let cfg = SamplingConfig::default();
     let send_task = tokio::spawn(async move {
         send_reset(&client).await.unwrap();
-        send_forward(&client, 0, &cfg, &hidden_for_send, shape)
+        send_forward(&client, 0, &cfg, &hidden_for_send, shape, false)
             .await
             .unwrap();
     });
@@ -231,7 +235,7 @@ async fn sequence_reset_then_forward_then_token() {
         recv_kind_server(&server).await.unwrap(),
         Some(FrameKind::Forward)
     );
-    let (past, _cfg_back, h_back, sh) = recv_forward_body_server(&server).await.unwrap();
+    let (past, _cfg_back, _push, h_back, sh) = recv_forward_body_server(&server).await.unwrap();
     assert_eq!(past, 0);
     assert_eq!(sh, shape);
     assert_eq!(h_back.len(), 7168);
@@ -429,15 +433,22 @@ fn frame_kind_codes_remain_stable() {
     // Reset/Token carry no sampling block and keep their original codes.
     // Forward/ForwardBatch were bumped 0x02→0x04 / 0x03→0x05 in #14 when the
     // sampling block grew 28→40 bytes, so a peer on the old layout fails fast
-    // at parse_kind rather than mis-reading the wider frame.
-    assert_eq!(FrameKind::Forward as u32, 0x53_4D_45_04);
+    // at parse_kind rather than mis-reading the wider frame. The single-token
+    // Forward family was bumped again (0x04→0x0C, 0x06→0x0D, 0x07→0x0E) when
+    // the 1-byte push_history flag was added (issue #34).
+    assert_eq!(FrameKind::Forward as u32, 0x53_4D_45_0C);
     assert_eq!(FrameKind::Reset as u32, 0x53_4D_45_10);
     assert_eq!(FrameKind::Token as u32, 0x53_4D_45_20);
     assert_eq!(FrameKind::ForwardBatch as u32, 0x53_4D_45_05);
     assert_eq!(FrameKind::TokenBatch as u32, 0x53_4D_45_21);
-    // The retired 28-byte-layout codes must now be rejected as unknown.
+    assert_eq!(FrameKind::ForwardNoSample as u32, 0x53_4D_45_0D);
+    assert_eq!(FrameKind::ForwardPrefill as u32, 0x53_4D_45_0E);
+    // The retired codes must now be rejected as unknown.
     assert_eq!(FrameKind::from_code(0x53_4D_45_02), None);
     assert_eq!(FrameKind::from_code(0x53_4D_45_03), None);
+    assert_eq!(FrameKind::from_code(0x53_4D_45_04), None);
+    assert_eq!(FrameKind::from_code(0x53_4D_45_06), None);
+    assert_eq!(FrameKind::from_code(0x53_4D_45_07), None);
 
     // And round-trip every variant through from_code.
     for k in [
@@ -450,4 +461,30 @@ fn frame_kind_codes_remain_stable() {
         assert_eq!(FrameKind::from_code(k as u32), Some(k));
     }
     assert_eq!(FrameKind::from_code(0xDEAD_BEEF), None);
+}
+
+/// RestoreCarry with a blob larger than `MAX_RAW_BYTES` (64 KiB) — exercises the chunked recv:
+/// `recv_restore_carry_body_server` must reassemble the blob across multiple `recv_raw` reads and
+/// round-trip it byte-identically (a real model's KV slice is many MiB).
+#[tokio::test]
+async fn restore_carry_round_trips_blob_larger_than_max_raw() {
+    let (server, client) = make_pair().await;
+    // 200 KiB > 64 KiB ⇒ spans ~4 chunks on the recv side.
+    let blob: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let epoch = 0xABCD_1234_5678_9F00u64;
+    let blob_send = blob.clone();
+    let send_task = tokio::spawn(async move {
+        send_restore_carry(&client, epoch, &blob_send)
+            .await
+            .unwrap();
+    });
+    let kind = recv_kind_server(&server).await.unwrap();
+    assert_eq!(kind, Some(FrameKind::RestoreCarry));
+    let (got_epoch, got_blob) = recv_restore_carry_body_server(&server).await.unwrap();
+    assert_eq!(got_epoch, epoch);
+    assert_eq!(
+        got_blob, blob,
+        "chunked recv must reassemble the blob byte-identically"
+    );
+    send_task.await.unwrap();
 }

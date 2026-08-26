@@ -54,6 +54,7 @@ use std::sync::Arc;
 
 use cascadia_transport::{
     ActivationClient, ActivationServer, DType, Tensor, TransportError, TransportResult,
+    MAX_RAW_BYTES,
 };
 use tokio::sync::Mutex;
 
@@ -86,11 +87,18 @@ pub enum FrameKind {
     // the old 28-byte layout trips the unknown-kind check in `parse_kind`
     // instead of mis-reading the larger frame. Reset/Token carry no sampling
     // and keep their codes.
-    Forward = 0x53_4D_45_04,      // "SME\x04" — was 0x02 (28-byte sampling)
-    Reset = 0x53_4D_45_10,        // "SME\x10"
-    Token = 0x53_4D_45_20,        // "SME\x20"
+    //
+    // The single-token Forward family (Forward / ForwardNoSample / ForwardPrefill)
+    // then grew the 1-byte `push_history` flag (issue #34), so those three codes
+    // were bumped again (0x04→0x0C, 0x06→0x0D, 0x07→0x0E): the transport is a raw
+    // byte stream with no message boundary, so an old peer reading the new body
+    // would leave the extra byte in the stream and shift every later field by one.
+    // The batch forwards did not gain the byte and keep their codes.
+    Forward = 0x53_4D_45_0C, // "SME\x0C" — was 0x04 (no push_history byte)
+    Reset = 0x53_4D_45_10,   // "SME\x10"
+    Token = 0x53_4D_45_20,   // "SME\x20"
     ForwardBatch = 0x53_4D_45_05, // "SME\x05" — was 0x03; batched K-step verify
-    TokenBatch = 0x53_4D_45_21,   // "SME\x21" — batched K-step response
+    TokenBatch = 0x53_4D_45_21, // "SME\x21" — batched K-step response
     /// Prefill-intermediate Forward (0x06): identical body to `Forward`,
     /// but the last rank must run its layers WITHOUT head/sample/record and
     /// reply with a dummy `Token(-1)`. Rank 0 discards intermediate prefill
@@ -103,7 +111,7 @@ pub enum FrameKind {
     /// 1.05 demotes the real " Paris"). Single-stage `generate()` never
     /// records prompt-loop samples, so only distributed runs corrupted.
     /// Also skips the pointless vocab-width head GEMV per prompt token.
-    ForwardNoSample = 0x53_4D_45_06, // "SME\x06"
+    ForwardNoSample = 0x53_4D_45_0D, // "SME\x0D" — was 0x06 (no push_history byte)
     /// Streamed prefill Forward (0x07): identical body to `ForwardNoSample`
     /// (the receiver advances KV but skips head/sample/record), except it is
     /// **one-way** — no `Token(-1)` ack. Rank 0 fires one per prompt token
@@ -112,7 +120,7 @@ pub enum FrameKind {
     /// ranks (per-rank compute overlaps) instead of one blocking 6-hop
     /// round-trip each. The final prompt token still goes as a sampling
     /// `Forward`, whose returned token is the first generated token.
-    ForwardPrefill = 0x53_4D_45_07, // "SME\x07"
+    ForwardPrefill = 0x53_4D_45_0E, // "SME\x0E" — was 0x07 (no push_history byte)
     /// Batched prefill Forward (0x08): identical body to `ForwardBatch`, but the
     /// last rank runs its layers over ALL rows (batch-union) and samples ONLY
     /// the final row — the first generated token — pushing just that one into
@@ -127,7 +135,7 @@ pub enum FrameKind {
     /// current KV slice under the key after prefill. Runners without prefix
     /// caching (dsv4) treat both as no-ops.
     RestorePrefix = 0x53_4D_45_09, // "SME\x09"
-    CachePrefix = 0x53_4D_45_0A,  // "SME\x0A"
+    CachePrefix = 0x53_4D_45_0A, // "SME\x0A"
     /// Intermediate batched prefill (0x0B): identical body to `ForwardBatchPrefill`,
     /// but the last rank advances KV over ALL rows and samples NOTHING — it replies
     /// with a dummy `Token(-1)` ack and records no penalty history. Lets rank 0
@@ -135,6 +143,26 @@ pub enum FrameKind {
     /// windows: every window but the last is `NoSample`, and only the final
     /// `ForwardBatchPrefill` samples the first generated token.
     ForwardBatchPrefillNoSample = 0x53_4D_45_0B, // "SME\x0B"
+    // Issue-34 Task 1.3 (multi-stage KV capture, §8). Appended codes only — never reorder existing
+    // ones; an older peer that lacks these rejects them in `from_code` (loud, not silent corruption).
+    Capture = 0x53_4D_45_30, // "SME\x30" — head→down: snapshot each stage's KV under epoch E
+    CaptureAck = 0x53_4D_45_31, // "SME\x31" — up: "captured @ E" (propagates head-ward like Token)
+    // Issue-34 consume path (§8). Appended codes only — never reorder existing ones. RESTORE(E) flows
+    // downstream like Capture; each rank restores its slice captured under E from its own stash.
+    // RestoreAck(E, verdict) flows upstream like CaptureAck, carrying the all-or-nothing verdict
+    // (1 ⇒ that rank AND its whole downstream restored). An older peer lacking these rejects them in
+    // `from_code` (loud, not silent corruption).
+    Restore = 0x53_4D_45_40, // "SME\x40" — head→down: restore each stage's KV captured under epoch E
+    RestoreAck = 0x53_4D_45_41, // "SME\x41" — up: verdict byte (1 = restored, 0 = missed ⇒ head cold)
+    // Issue-34 cross-chain: like Restore but CARRIES the pulled slice blob inline (epoch + len + blob).
+    // The moved-to head sends this to a moved-to tail that has NO local capture for a FOREIGN chain's
+    // epoch; the tail applies the carried blob directly. Appended code — never reorder existing ones.
+    RestoreCarry = 0x53_4D_45_42, // "SME\x42" — head→down: RESTORE carrying the pulled slice blob
+    // H.1a close: CAPTURE carrying the head's turn tenant, so a worker rank — which never sees the
+    // GenerationTask — can tag its stashed slice and `export` can confine it to that tenant. Sent
+    // only when the tenant is non-empty; an empty tenant keeps sending the legacy `Capture` frame
+    // byte-identical to today. Appended code — never reorder existing ones.
+    CaptureV2 = 0x53_4D_4532, // "SME\x32" — head→down: CAPTURE(epoch, tenant, tokens)
 }
 
 impl FrameKind {
@@ -153,6 +181,12 @@ impl FrameKind {
             }
             x if x == FrameKind::RestorePrefix as u32 => Some(FrameKind::RestorePrefix),
             x if x == FrameKind::CachePrefix as u32 => Some(FrameKind::CachePrefix),
+            x if x == FrameKind::Capture as u32 => Some(FrameKind::Capture),
+            x if x == FrameKind::CaptureAck as u32 => Some(FrameKind::CaptureAck),
+            x if x == FrameKind::Restore as u32 => Some(FrameKind::Restore),
+            x if x == FrameKind::RestoreAck as u32 => Some(FrameKind::RestoreAck),
+            x if x == FrameKind::RestoreCarry as u32 => Some(FrameKind::RestoreCarry),
+            x if x == FrameKind::CaptureV2 as u32 => Some(FrameKind::CaptureV2),
             _ => None,
         }
     }
@@ -307,8 +341,19 @@ fn sanitize_f32(x: f32, fallback: f32, min: f32) -> f32 {
 }
 
 /// Send a Forward-shaped frame downstream: kind + past_seq_len (u32 BE) +
-/// SamplingConfig block + hidden tensor. Shared by [`send_forward`] and
-/// [`send_forward_nosample`] — the two kinds carry identical bodies.
+/// SamplingConfig block + 1 B `push_history` flag + hidden tensor. Shared by
+/// [`send_forward`], [`send_forward_nosample`] and [`send_forward_prefill`] —
+/// the kinds carry identical bodies.
+///
+/// `push_history` tells the last rank whether this forward's sampled token is a
+/// *kept* generated token (true ⇒ include it in the rep-penalty history) vs a
+/// discarded prefill sample (false). It lets the multi-stage rep-penalty window
+/// cover generated tokens only — matching the single-stage path — and is what
+/// makes a warm-resumed run byte-identical to a cold one (the skipped prefill
+/// forwards would otherwise desync the history). The layout is extended
+/// unconditionally (no version byte); mixed builds are covered by the frame-kind
+/// bump (0x04→0x0C etc.) — an old peer rejects the new code at `parse_kind`
+/// instead of leaving the extra byte in the raw stream.
 async fn send_forward_kind(
     cli: &Mutex<ActivationClient>,
     kind: FrameKind,
@@ -316,13 +361,15 @@ async fn send_forward_kind(
     sampling: &SamplingConfig,
     hidden_f32: &[f32],
     hidden_shape: [u32; 3],
+    push_history: bool,
 ) -> TransportResult<()> {
-    let mut header = [0u8; 8 + SAMPLING_WIRE_BYTES];
+    let mut header = [0u8; 8 + SAMPLING_WIRE_BYTES + 1];
     header[0..4].copy_from_slice(&(kind as u32).to_be_bytes());
     header[4..8].copy_from_slice(&past_seq_len.to_be_bytes());
     let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
     encode_sampling(sampling, &mut sbytes);
     header[8..8 + SAMPLING_WIRE_BYTES].copy_from_slice(&sbytes);
+    header[8 + SAMPLING_WIRE_BYTES] = u8::from(push_history);
     let tensor = hidden_to_tensor(hidden_f32, hidden_shape);
     let mut guard = cli.lock().await;
     guard.send_raw(&header).await?;
@@ -330,14 +377,15 @@ async fn send_forward_kind(
     Ok(())
 }
 
-/// Send a Forward frame downstream: kind + past_seq_len (u32 BE) + 28 B
-/// SamplingConfig + hidden tensor.
+/// Send a sampling Forward frame downstream: kind + past_seq_len (u32 BE) +
+/// 28 B SamplingConfig + 1 B `push_history` + hidden tensor.
 pub async fn send_forward(
     cli: &Mutex<ActivationClient>,
     past_seq_len: u32,
     sampling: &SamplingConfig,
     hidden_f32: &[f32],
     hidden_shape: [u32; 3],
+    push_history: bool,
 ) -> TransportResult<()> {
     send_forward_kind(
         cli,
@@ -346,6 +394,7 @@ pub async fn send_forward(
         sampling,
         hidden_f32,
         hidden_shape,
+        push_history,
     )
     .await
 }
@@ -369,6 +418,8 @@ pub async fn send_forward_nosample(
         sampling,
         hidden_f32,
         hidden_shape,
+        // the sample is discarded, so it never enters the rep-penalty history
+        false,
     )
     .await
 }
@@ -391,29 +442,32 @@ pub async fn send_forward_prefill(
         sampling,
         hidden_f32,
         hidden_shape,
+        // the sample is discarded, so it never enters the rep-penalty history
+        false,
     )
     .await
 }
 
 /// Receive a Forward frame's body (the kind code has already been
 /// consumed by `recv_kind_*`). Returns
-/// `(past_seq_len, sampling, hidden_f32, shape)`.
+/// `(past_seq_len, sampling, push_history, hidden_f32, shape)`.
 pub async fn recv_forward_body_server(
     srv: &Mutex<ActivationServer>,
-) -> TransportResult<(u32, SamplingConfig, Vec<f32>, [u32; 3])> {
+) -> TransportResult<(u32, SamplingConfig, bool, Vec<f32>, [u32; 3])> {
     let mut guard = srv.lock().await;
-    let raw = guard.recv_raw(4 + SAMPLING_WIRE_BYTES).await?;
-    if raw.len() != 4 + SAMPLING_WIRE_BYTES {
+    let raw = guard.recv_raw(4 + SAMPLING_WIRE_BYTES + 1).await?;
+    if raw.len() != 4 + SAMPLING_WIRE_BYTES + 1 {
         return Err(TransportError::SocketClosed);
     }
     let past_seq_len = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
     let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
     sbytes.copy_from_slice(&raw[4..4 + SAMPLING_WIRE_BYTES]);
     let sampling = decode_sampling(&sbytes);
+    let push_history = raw[4 + SAMPLING_WIRE_BYTES] != 0;
     let (tensor, _) = guard.recv().await?;
     drop(guard);
     let (h, shape) = tensor_to_hidden(&tensor)?;
-    Ok((past_seq_len, sampling, h, shape))
+    Ok((past_seq_len, sampling, push_history, h, shape))
 }
 
 /// Send a Reset frame downstream — clears KV state for a new task.
@@ -547,6 +601,524 @@ pub async fn recv_token_reply(
                  connection dropped to avoid reading this reply as the next request's"
             ))
         }
+    }
+}
+
+// ───────────────────────── Issue-34 Task 1.3: multi-stage KV capture (§8) ─────────────────────────
+//
+// CAPTURE(epoch, tokens) flows downstream like Forward; each stage snapshots its KV slice under the
+// head-assigned `epoch` (so workers never derive it locally, §8) and keys it by `tokens` (so its
+// served Manifest carries the prefix the consumer re-validates). CaptureAck(epoch) flows upstream like
+// Token; a mid-stage acks up only after its downstream acked, so the head's single ack = "all captured".
+
+/// Hard cap on a Capture frame's token count — bounds the recv-side allocation from the 4-byte count
+/// field against a corrupt/adversarial peer (mirrors `MAX_BATCH_COUNT`). 1 Mi ids = 4 MiB worst case.
+pub const MAX_CAPTURE_TOKENS: u32 = 1 << 20;
+
+/// Cap on a CaptureV2 frame's tenant byte length — bounds the recv-side allocation the same way
+/// `MAX_CAPTURE_TOKENS` does, and no legitimate tenant id approaches it.
+pub const MAX_CAPTURE_TENANT_BYTES: u16 = 256;
+
+/// Bound on every CaptureAck wait. An older peer that meets `CaptureV2` errors WITHOUT acking
+/// (`from_code` → None), and the only ceiling otherwise is the transport's frame-idle default —
+/// reached BEFORE the turn's chunks are returned, so an unbounded wait withholds a finished turn.
+/// Capture is best-effort: on timeout the sender warns, skips the capture, and delivers the turn.
+pub const CAPTURE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Pure frame encoder (testable): kind(4) + epoch(8 BE) + count(4 BE) + count×i32 (BE).
+fn capture_frame_bytes(epoch: u64, tokens: &[i32]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(16 + tokens.len() * 4);
+    b.extend_from_slice(&(FrameKind::Capture as u32).to_be_bytes());
+    b.extend_from_slice(&epoch.to_be_bytes());
+    b.extend_from_slice(&(tokens.len() as u32).to_be_bytes());
+    for &t in tokens {
+        b.extend_from_slice(&t.to_be_bytes());
+    }
+    b
+}
+
+/// Pure V2 frame encoder (testable): kind(4) + epoch(8 BE) + tenant_len(2 BE) + tenant UTF-8 +
+/// count(4 BE) + count×i32 (BE). Only ever built with a non-empty tenant (empty stays v1).
+fn capture_frame_bytes_v2(epoch: u64, tokens: &[i32], tenant: &str) -> Vec<u8> {
+    let t = tenant.as_bytes();
+    debug_assert!(!t.is_empty() && t.len() <= MAX_CAPTURE_TENANT_BYTES as usize);
+    let mut b = Vec::with_capacity(18 + t.len() + tokens.len() * 4);
+    b.extend_from_slice(&(FrameKind::CaptureV2 as u32).to_be_bytes());
+    b.extend_from_slice(&epoch.to_be_bytes());
+    b.extend_from_slice(&(t.len() as u16).to_be_bytes());
+    b.extend_from_slice(t);
+    b.extend_from_slice(&(tokens.len() as u32).to_be_bytes());
+    for &tok in tokens {
+        b.extend_from_slice(&tok.to_be_bytes());
+    }
+    b
+}
+
+/// Send a Capture frame downstream (head/mid → next stage). A non-empty `tenant` upgrades the
+/// frame to `CaptureV2` so the downstream rank — which never sees the `GenerationTask` — can tag
+/// its stashed slice; an empty tenant sends the legacy `Capture` frame byte-identical to today.
+pub async fn send_capture(
+    cli: &Mutex<ActivationClient>,
+    epoch: u64,
+    tokens: &[i32],
+    tenant: &str,
+) -> TransportResult<()> {
+    // An oversized tenant must FAIL the capture, never silently fall back to the untagged v1
+    // frame: untagged ("") stashes are deliberately servable to ANY partner, so the fallback
+    // would convert a length overrun into a cross-tenant read with every guard passing. The
+    // caller treats the error as "capture skipped" (best-effort; the turn is still delivered).
+    if tenant.len() > MAX_CAPTURE_TENANT_BYTES as usize {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "capture tenant of {} bytes exceeds MAX_CAPTURE_TENANT_BYTES {MAX_CAPTURE_TENANT_BYTES}; \
+             refusing the untagged-v1 downgrade",
+            tenant.len()
+        ))));
+    }
+    let bytes = if tenant.is_empty() {
+        capture_frame_bytes(epoch, tokens)
+    } else {
+        capture_frame_bytes_v2(epoch, tokens, tenant)
+    };
+    let mut guard = cli.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Receive a Capture body from upstream (kind already consumed). Returns `(epoch, tokens)`.
+pub async fn recv_capture_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u64, Vec<i32>)> {
+    let mut guard = srv.lock().await;
+    let head = guard.recv_raw(12).await?;
+    if head.len() != 12 {
+        return Err(TransportError::SocketClosed);
+    }
+    let epoch = u64::from_be_bytes(head[0..8].try_into().unwrap());
+    let count = u32::from_be_bytes(head[8..12].try_into().unwrap());
+    if count > MAX_CAPTURE_TOKENS {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "capture token count {count} exceeds MAX_CAPTURE_TOKENS {MAX_CAPTURE_TOKENS}"
+        ))));
+    }
+    let n = count as usize;
+    // Chunked: n*4 can exceed the transport's single-read cap (see recv_exact_chunked).
+    let body = recv_exact_chunked(&mut guard, n * 4).await?;
+    drop(guard);
+    let mut tokens = Vec::with_capacity(n);
+    for c in body.chunks_exact(4) {
+        tokens.push(i32::from_be_bytes([c[0], c[1], c[2], c[3]]));
+    }
+    Ok((epoch, tokens))
+}
+
+/// Receive a CaptureV2 body from upstream (kind already consumed). Returns `(epoch, tokens, tenant)`.
+pub async fn recv_capture_v2_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u64, Vec<i32>, String)> {
+    let mut guard = srv.lock().await;
+    let head = guard.recv_raw(10).await?;
+    if head.len() != 10 {
+        return Err(TransportError::SocketClosed);
+    }
+    let epoch = u64::from_be_bytes(head[0..8].try_into().unwrap());
+    let t_len = u16::from_be_bytes(head[8..10].try_into().unwrap());
+    if t_len == 0 || t_len > MAX_CAPTURE_TENANT_BYTES {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "capture tenant length {t_len} outside (0, {MAX_CAPTURE_TENANT_BYTES}]"
+        ))));
+    }
+    let t_raw = guard.recv_raw(t_len as usize).await?;
+    if t_raw.len() != t_len as usize {
+        return Err(TransportError::SocketClosed);
+    }
+    let tenant = String::from_utf8(t_raw)
+        .map_err(|_| TransportError::Io(std::io::Error::other("capture tenant not UTF-8")))?;
+    let cnt_raw = guard.recv_raw(4).await?;
+    if cnt_raw.len() != 4 {
+        return Err(TransportError::SocketClosed);
+    }
+    let count = u32::from_be_bytes(cnt_raw[0..4].try_into().unwrap());
+    if count > MAX_CAPTURE_TOKENS {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "capture token count {count} exceeds MAX_CAPTURE_TOKENS {MAX_CAPTURE_TOKENS}"
+        ))));
+    }
+    let n = count as usize;
+    // Chunked: n*4 can exceed the transport's single-read cap (see recv_exact_chunked).
+    let body = recv_exact_chunked(&mut guard, n * 4).await?;
+    drop(guard);
+    let mut tokens = Vec::with_capacity(n);
+    for c in body.chunks_exact(4) {
+        tokens.push(i32::from_be_bytes([c[0], c[1], c[2], c[3]]));
+    }
+    Ok((epoch, tokens, tenant))
+}
+
+/// Read exactly `total` bytes as ≤[`MAX_RAW_BYTES`] chunks. `recv_raw` refuses any single read
+/// over the transport cap BEFORE consuming a byte, so one over-cap read of an in-band frame body
+/// leaves the body in the stream and desyncs every later frame (token payload parsed as frame
+/// kinds). RESTORE's carried blob already reads chunked; CAPTURE's token body was missed — its
+/// ceiling was ≈16,381 tokens, and `tokens = prompt ++ generated` grows past that in any long
+/// session. `total` must already be validated against its own cap by the caller.
+async fn recv_exact_chunked(
+    guard: &mut ActivationServer,
+    total: usize,
+) -> TransportResult<Vec<u8>> {
+    let mut out = Vec::with_capacity(total);
+    let mut remaining = total;
+    while remaining > 0 {
+        let take = remaining.min(MAX_RAW_BYTES);
+        let chunk = guard.recv_raw(take).await?;
+        if chunk.len() != take {
+            return Err(TransportError::SocketClosed);
+        }
+        out.extend_from_slice(&chunk);
+        remaining -= take;
+    }
+    Ok(out)
+}
+
+/// Send a CaptureAck frame upstream (stage → head-ward). Body: 8 B BE epoch.
+pub async fn send_capture_ack_upstream(
+    srv: &Mutex<ActivationServer>,
+    epoch: u64,
+) -> TransportResult<()> {
+    let mut bytes = [0u8; 12];
+    bytes[0..4].copy_from_slice(&(FrameKind::CaptureAck as u32).to_be_bytes());
+    bytes[4..12].copy_from_slice(&epoch.to_be_bytes());
+    let mut guard = srv.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Receive a CaptureAck body from downstream (kind already consumed). Returns the acked epoch.
+pub async fn recv_capture_ack_body_client(cli: &Mutex<ActivationClient>) -> TransportResult<u64> {
+    let mut guard = cli.lock().await;
+    let raw = guard.recv_raw(8).await?;
+    drop(guard);
+    if raw.len() != 8 {
+        return Err(TransportError::SocketClosed);
+    }
+    Ok(u64::from_be_bytes(raw[0..8].try_into().unwrap()))
+}
+
+// ───────────────────────── Issue-34 consume path: multi-stage KV RESTORE (§8) ─────────────────────────
+//
+// RESTORE(epoch) flows downstream like Capture but carries NO token body — the epoch alone keys each
+// rank's existing CAPTURE stash. RestoreAck(epoch, verdict) flows upstream like CaptureAck; a mid-stage
+// folds its downstream verdict into its own (local && down) so the head's single verdict==1 means every
+// stage restored. Any miss anywhere ⇒ verdict 0 ⇒ the head discards and cold-runs (all-or-nothing).
+
+/// Pure frame encoder (testable): kind(4) + epoch(8 BE). No token body (unlike Capture).
+fn restore_frame_bytes(epoch: u64) -> Vec<u8> {
+    let mut b = Vec::with_capacity(12);
+    b.extend_from_slice(&(FrameKind::Restore as u32).to_be_bytes());
+    b.extend_from_slice(&epoch.to_be_bytes());
+    b
+}
+
+/// Pure ack encoder (testable): kind(4) + epoch(8 BE) + verdict(1).
+fn restore_ack_bytes(epoch: u64, verdict: u8) -> [u8; 13] {
+    let mut bytes = [0u8; 13];
+    bytes[0..4].copy_from_slice(&(FrameKind::RestoreAck as u32).to_be_bytes());
+    bytes[4..12].copy_from_slice(&epoch.to_be_bytes());
+    bytes[12] = verdict;
+    bytes
+}
+
+/// Send a Restore frame downstream (head/mid → next stage).
+pub async fn send_restore(cli: &Mutex<ActivationClient>, epoch: u64) -> TransportResult<()> {
+    let bytes = restore_frame_bytes(epoch);
+    let mut guard = cli.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Receive a Restore body from upstream (kind already consumed). Returns the epoch to restore under.
+pub async fn recv_restore_body_server(srv: &Mutex<ActivationServer>) -> TransportResult<u64> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(8).await?;
+    drop(guard);
+    if raw.len() != 8 {
+        return Err(TransportError::SocketClosed);
+    }
+    Ok(u64::from_be_bytes(raw[0..8].try_into().unwrap()))
+}
+
+/// Hard cap on a RestoreCarry blob — bounds the recv-side allocation from the 4-byte length field
+/// against a corrupt/adversarial peer (mirrors `MAX_CAPTURE_TOKENS`). The opaque f32 KV slice is
+/// ~tens of MiB for a small model; 512 MiB is a generous upper bound.
+pub const MAX_RESTORE_BLOB_BYTES: u32 = 512 << 20;
+
+/// Pure RestoreCarry encoder (testable): kind(4) + epoch(8 BE) + blob_len(4 BE) + blob.
+fn restore_carry_bytes(epoch: u64, blob: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(16 + blob.len());
+    b.extend_from_slice(&(FrameKind::RestoreCarry as u32).to_be_bytes());
+    b.extend_from_slice(&epoch.to_be_bytes());
+    b.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+    b.extend_from_slice(blob);
+    b
+}
+
+/// Send a RestoreCarry frame downstream (head → next stage), carrying the pulled slice blob inline.
+pub async fn send_restore_carry(
+    cli: &Mutex<ActivationClient>,
+    epoch: u64,
+    blob: &[u8],
+) -> TransportResult<()> {
+    let bytes = restore_carry_bytes(epoch, blob);
+    let mut guard = cli.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Receive a RestoreCarry body from upstream (kind already consumed). Returns `(epoch, blob)`.
+///
+/// The KV blob routinely exceeds `recv_raw`'s per-read cap ([`MAX_RAW_BYTES`], 64 KiB) — a real
+/// model's slice is many MiB — so read it in `MAX_RAW_BYTES` chunks. ALWAYS consume exactly `len`
+/// bytes off the wire (accept OR drain), so a rejected/oversized frame never leaves the framed pipeline
+/// stream desynced. A blob over [`MAX_RESTORE_BLOB_BYTES`] is drained in-chunks (bounded allocation)
+/// and rejected. The sender writes the blob contiguously (`send_raw` is uncapped), so the wire format
+/// is unchanged — only the read is chunked.
+pub async fn recv_restore_carry_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u64, Vec<u8>)> {
+    let mut guard = srv.lock().await;
+    let head = guard.recv_raw(12).await?;
+    if head.len() != 12 {
+        return Err(TransportError::SocketClosed);
+    }
+    let epoch = u64::from_be_bytes(head[0..8].try_into().unwrap());
+    let len = u32::from_be_bytes(head[8..12].try_into().unwrap()) as usize;
+    // Over the accept ceiling ⇒ drain (discard) rather than assemble, but still consume every byte.
+    let accept = len <= MAX_RESTORE_BLOB_BYTES as usize;
+    let mut blob = Vec::new();
+    let mut remaining = len;
+    while remaining > 0 {
+        let take = remaining.min(MAX_RAW_BYTES);
+        let chunk = guard.recv_raw(take).await?;
+        if chunk.len() != take {
+            return Err(TransportError::SocketClosed);
+        }
+        if accept {
+            blob.extend_from_slice(&chunk);
+        }
+        remaining -= take;
+    }
+    drop(guard);
+    if !accept {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "restore-carry blob {len} exceeds MAX_RESTORE_BLOB_BYTES {MAX_RESTORE_BLOB_BYTES}"
+        ))));
+    }
+    Ok((epoch, blob))
+}
+
+/// Send a RestoreAck frame upstream (stage → head-ward). Body: kind(4) + epoch(8 BE) + verdict(1).
+pub async fn send_restore_ack_upstream(
+    srv: &Mutex<ActivationServer>,
+    epoch: u64,
+    verdict: u8,
+) -> TransportResult<()> {
+    let bytes = restore_ack_bytes(epoch, verdict);
+    let mut guard = srv.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Receive a RestoreAck body from downstream (kind already consumed). Returns `(epoch, verdict)`.
+pub async fn recv_restore_ack_body_client(
+    cli: &Mutex<ActivationClient>,
+) -> TransportResult<(u64, u8)> {
+    let mut guard = cli.lock().await;
+    let raw = guard.recv_raw(9).await?;
+    drop(guard);
+    if raw.len() != 9 {
+        return Err(TransportError::SocketClosed);
+    }
+    let epoch = u64::from_be_bytes(raw[0..8].try_into().unwrap());
+    Ok((epoch, raw[8]))
+}
+
+/// Bound on every RestoreAck wait. Same design rule as [`recv_token_reply`]: a reply to in-flight
+/// work uses a strict deadline, never the ~900 s frame-idle ceiling — RESTORE runs at admission
+/// (`step_first`), so an unbounded wait stalls every warm-hit request behind a silent downstream,
+/// and an older peer that errors on the frame never acks at all. Matches ov-runtime's
+/// `RESTORE_ACK_TIMEOUT`.
+pub const RESTORE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Await the RestoreAck verdict for a RESTORE/RESTORE_CARRY just sent on `down`, bounded by
+/// [`RESTORE_ACK_TIMEOUT`]. On timeout the connection is dropped — same hazard
+/// [`recv_token_reply`] documents: the late ack (13 raw bytes, no sequence number) would otherwise
+/// be read as the next exchange's reply on a reused connection.
+pub async fn recv_restore_verdict(down: &Mutex<ActivationClient>) -> Result<bool, String> {
+    match tokio::time::timeout(RESTORE_ACK_TIMEOUT, async {
+        match recv_kind_client(down).await {
+            Ok(Some(FrameKind::RestoreAck)) => recv_restore_ack_body_client(down)
+                .await
+                .map(|(_, v)| v == 1)
+                .map_err(|e| format!("recv_restore_ack: {e}")),
+            Ok(Some(other)) => Err(format!("expected RestoreAck, got {other:?}")),
+            Ok(None) => Err("downstream closed during restore-ack".into()),
+            Err(e) => Err(format!("recv_kind (restore-ack): {e}")),
+        }
+    })
+    .await
+    {
+        Ok(res) => res,
+        Err(_) => {
+            // The inner future — and any guard it held mid-read — is dropped by
+            // the time we get here, so re-locking cannot deadlock.
+            down.lock().await.close().await;
+            Err(format!(
+                "restore ack timeout after {RESTORE_ACK_TIMEOUT:?}: downstream silent (dead peer?); \
+                 connection dropped to avoid reading the late ack as the next exchange's reply"
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod capture_frame_tests {
+    use super::*;
+
+    #[test]
+    fn capture_frame_bytes_layout_roundtrips() {
+        let toks = vec![1, -2, 300, i32::MIN, i32::MAX, 0];
+        let epoch = 0xDEAD_BEEF_0000_0001u64;
+        let b = capture_frame_bytes(epoch, &toks);
+        assert_eq!(b[0..4], (FrameKind::Capture as u32).to_be_bytes());
+        assert_eq!(u64::from_be_bytes(b[4..12].try_into().unwrap()), epoch);
+        assert_eq!(
+            u32::from_be_bytes(b[12..16].try_into().unwrap()),
+            toks.len() as u32
+        );
+        let got: Vec<i32> = b[16..]
+            .chunks_exact(4)
+            .map(|c| i32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(got, toks);
+        assert_eq!(b.len(), 16 + toks.len() * 4);
+    }
+
+    #[test]
+    fn capture_v2_frame_bytes_layout_roundtrips() {
+        let toks = vec![7, -8, 0, i32::MAX];
+        let epoch = 0xCAFE_F00D_0000_0002u64;
+        let tenant = "tenant-a";
+        let b = capture_frame_bytes_v2(epoch, &toks, tenant);
+        assert_eq!(b[0..4], (FrameKind::CaptureV2 as u32).to_be_bytes());
+        assert_eq!(u64::from_be_bytes(b[4..12].try_into().unwrap()), epoch);
+        let t_len = u16::from_be_bytes(b[12..14].try_into().unwrap()) as usize;
+        assert_eq!(t_len, tenant.len());
+        assert_eq!(&b[14..14 + t_len], tenant.as_bytes());
+        let c0 = 14 + t_len;
+        assert_eq!(
+            u32::from_be_bytes(b[c0..c0 + 4].try_into().unwrap()),
+            toks.len() as u32
+        );
+        let got: Vec<i32> = b[c0 + 4..]
+            .chunks_exact(4)
+            .map(|c| i32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(got, toks);
+        assert_eq!(b.len(), 18 + t_len + toks.len() * 4);
+    }
+
+    #[test]
+    fn capture_v2_code_is_appended_and_distinct() {
+        // The legacy v1 frame must stay byte-identical (an empty tenant keeps sending it), and the
+        // v2 code must collide with nothing existing.
+        assert_eq!(FrameKind::CaptureV2 as u32, 0x53_4D_4532);
+        for k in [
+            FrameKind::Forward,
+            FrameKind::Reset,
+            FrameKind::Token,
+            FrameKind::ForwardBatch,
+            FrameKind::TokenBatch,
+            FrameKind::ForwardNoSample,
+            FrameKind::ForwardPrefill,
+            FrameKind::Capture,
+            FrameKind::CaptureAck,
+            FrameKind::Restore,
+            FrameKind::RestoreAck,
+            FrameKind::RestoreCarry,
+        ] {
+            assert_ne!(FrameKind::CaptureV2 as u32, k as u32);
+        }
+        assert_eq!(
+            FrameKind::from_code(FrameKind::CaptureV2 as u32),
+            Some(FrameKind::CaptureV2)
+        );
+    }
+
+    #[test]
+    fn restore_carry_bytes_layout_roundtrips() {
+        let blob = vec![0u8, 1, 2, 255, 128, 7, 42];
+        let epoch = 0x0102_0304_0506_0708u64;
+        let b = restore_carry_bytes(epoch, &blob);
+        assert_eq!(b[0..4], (FrameKind::RestoreCarry as u32).to_be_bytes());
+        assert_eq!(u64::from_be_bytes(b[4..12].try_into().unwrap()), epoch);
+        assert_eq!(
+            u32::from_be_bytes(b[12..16].try_into().unwrap()),
+            blob.len() as u32
+        );
+        assert_eq!(&b[16..], &blob[..]);
+        assert_eq!(b.len(), 16 + blob.len());
+        // Empty blob: header only, len field 0.
+        let e = restore_carry_bytes(epoch, &[]);
+        assert_eq!(u32::from_be_bytes(e[12..16].try_into().unwrap()), 0);
+        assert_eq!(e.len(), 16);
+        // Appended code, distinct from Restore/RestoreAck.
+        assert_ne!(FrameKind::RestoreCarry as u32, FrameKind::Restore as u32);
+        assert_eq!(
+            FrameKind::from_code(FrameKind::RestoreCarry as u32),
+            Some(FrameKind::RestoreCarry)
+        );
+    }
+
+    #[test]
+    fn capture_frame_bytes_empty_tokens() {
+        let b = capture_frame_bytes(7, &[]);
+        assert_eq!(b.len(), 16);
+        assert_eq!(u32::from_be_bytes(b[12..16].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn restore_frame_bytes_layout() {
+        let epoch = 0xDEAD_BEEF_0000_0001u64;
+        let b = restore_frame_bytes(epoch);
+        assert_eq!(b.len(), 12);
+        assert_eq!(b[0..4], (FrameKind::Restore as u32).to_be_bytes());
+        assert_eq!(u64::from_be_bytes(b[4..12].try_into().unwrap()), epoch);
+    }
+
+    #[test]
+    fn restore_ack_bytes_verdict_roundtrips() {
+        let epoch = 0x0102_0304_0506_0708u64;
+        for verdict in [0u8, 1u8] {
+            let b = restore_ack_bytes(epoch, verdict);
+            assert_eq!(b.len(), 13);
+            assert_eq!(b[0..4], (FrameKind::RestoreAck as u32).to_be_bytes());
+            // Decode exactly as `recv_restore_ack_body_client` does (after the 4-byte kind is consumed).
+            assert_eq!(u64::from_be_bytes(b[4..12].try_into().unwrap()), epoch);
+            assert_eq!(b[12], verdict);
+        }
+    }
+
+    #[test]
+    fn restore_and_ack_codes_are_distinct_and_recognized() {
+        // Appended codes must round-trip through `from_code` and not collide with existing kinds.
+        assert_eq!(
+            FrameKind::from_code(FrameKind::Restore as u32),
+            Some(FrameKind::Restore)
+        );
+        assert_eq!(
+            FrameKind::from_code(FrameKind::RestoreAck as u32),
+            Some(FrameKind::RestoreAck)
+        );
+        assert_ne!(FrameKind::Restore as u32, FrameKind::Capture as u32);
+        assert_ne!(FrameKind::RestoreAck as u32, FrameKind::CaptureAck as u32);
     }
 }
 

@@ -93,6 +93,9 @@ def main():
     sargs = argparse.Namespace(model=str(src), tiny=False, out=str(out),
                                layers="", no_quant=True, experts_int8=False,
                                experts="ov_ir", shell_quant="int4", head_quant="int4",
+                               # export_full_streaming reads these unconditionally; keep the selftest
+                               # Namespace in sync with the exporter's arg surface.
+                               expert_quant="int4", expert_group_size=0,
                                free_source_shards=True)
     E.export_full_streaming(sargs, out)
     (out / "reference.json").write_text(json.dumps(reference))

@@ -363,3 +363,235 @@ fn minimax_m2_full_generate_smoke() {
     assert!(!generated.is_empty(), "model produced no tokens");
     assert!(!text.trim().is_empty(), "decoded completion is empty");
 }
+
+/// Snapshot/restore round-trip must be byte-identical to a continuous run.
+/// Isolates the OvMoeEngine warm-resume: a warm resume (prefill a prefix,
+/// snapshot, reset, restore, continue) must produce the SAME greedy tokens
+/// as a single continuous generation. Runs on ONE runner (all layers) so it
+/// bypasses the multi-stage transport — if this fails, the bug is in
+/// `snapshot_kv`/`restore_kv`/`forward_layers` (e.g. hidden OV graph state
+/// beyond the host-held KV); if it passes, the bug is multi-stage-only.
+/// Gated on `M2_MODEL_DIR`.
+#[test]
+fn minimax_m2_snapshot_restore_matches_continuous() {
+    let Some(model_dir) = env_dir("M2_MODEL_DIR") else {
+        eprintln!("M2_MODEL_DIR not set / missing; skipping snapshot/restore test");
+        return;
+    };
+    let device = std::env::var("CASCADIA_DEVICE").unwrap_or_else(|_| "CPU".to_string());
+    let mut r = OvMoeRunner::load(model_dir, &device, PluginConfig::new(), None).expect("load");
+
+    // Pure argmax step (no rep-penalty), mirroring the engine's temp=0 path.
+    fn step(r: &mut OvMoeRunner, tok: u32, pos: usize) -> u32 {
+        let h = r.embed_token(tok).expect("embed");
+        let h = r.forward_layers(h, pos).expect("forward");
+        let logits = r.head_logits(&h).expect("head");
+        logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i as u32)
+            .expect("argmax")
+    }
+
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let n_gen = 8usize;
+
+    // COLD: prefill prompt, decode n_gen.
+    r.reset();
+    let mut pos = 0usize;
+    let mut next = 0u32;
+    for &t in &prompt {
+        next = step(&mut r, t, pos);
+        pos += 1;
+    }
+    let mut cold = Vec::new();
+    for _ in 0..n_gen {
+        cold.push(next);
+        next = step(&mut r, next, pos);
+        pos += 1;
+    }
+
+    // WARM: prefill all but the last prompt token, snapshot, reset, restore,
+    // feed the last prompt token from the restored depth, decode n_gen.
+    let split = prompt.len() - 1;
+    r.reset();
+    let mut pos = 0usize;
+    let mut next = 0u32;
+    for &t in &prompt[..split] {
+        next = step(&mut r, t, pos);
+        pos += 1;
+    }
+    let snap = r.snapshot_kv().expect("snapshot");
+    assert_eq!(snap.past_seq_len, split, "snapshot depth == fed tokens");
+    r.reset();
+    r.restore_kv(&snap).expect("restore");
+    let mut pos = split;
+    let mut next = 0u32;
+    for &t in &prompt[split..] {
+        next = step(&mut r, t, pos);
+        pos += 1;
+    }
+    let mut warm = Vec::new();
+    for _ in 0..n_gen {
+        warm.push(next);
+        next = step(&mut r, next, pos);
+        pos += 1;
+    }
+
+    eprintln!("cold: {cold:?}");
+    eprintln!("warm: {warm:?}");
+    assert_eq!(
+        warm, cold,
+        "snapshot/restore warm run must match continuous cold run"
+    );
+}
+
+/// Two-stage (rank0 + rank1, in-process, no wire) snapshot/restore round-trip
+/// must match a continuous run. Isolates the per-rank capture/restore under a
+/// pipeline split from the frame/epoch transport layer: if this fails the bug
+/// is in per-rank restore; if it passes the bug is in the CAPTURE/RESTORE
+/// frame plumbing. Gated on `M2_MODEL_DIR`.
+#[test]
+fn minimax_m2_two_stage_snapshot_restore_matches_continuous() {
+    let Some(model_dir) = env_dir("M2_MODEL_DIR") else {
+        eprintln!("M2_MODEL_DIR not set / missing; skipping 2-stage snapshot/restore test");
+        return;
+    };
+    let dev = std::env::var("CASCADIA_DEVICE").unwrap_or_else(|_| "CPU".to_string());
+    let mut r0 = OvMoeRunner::load_staged(
+        model_dir.clone(),
+        &dev,
+        PluginConfig::new(),
+        None,
+        0,
+        2,
+        0,
+        0,
+        false,
+    )
+    .expect("load rank0");
+    let mut r1 = OvMoeRunner::load_staged(
+        model_dir,
+        &dev,
+        PluginConfig::new(),
+        None,
+        1,
+        2,
+        0,
+        0,
+        false,
+    )
+    .expect("load rank1");
+
+    // One pipeline step: rank0 (embed+its layers) -> rank1 (its layers+head) -> argmax.
+    fn pstep(r0: &mut OvMoeRunner, r1: &mut OvMoeRunner, tok: u32, pos: usize) -> u32 {
+        let h = r0.embed_token(tok).expect("embed");
+        let h = r0.forward_layers(h, pos).expect("r0 forward");
+        let h = r1.forward_layers(h, pos).expect("r1 forward");
+        let logits = r1.head_logits(&h).expect("head");
+        logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i as u32)
+            .expect("argmax")
+    }
+
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let n_gen = 8usize;
+
+    // COLD
+    r0.reset();
+    r1.reset();
+    let mut pos = 0usize;
+    let mut next = 0u32;
+    for &t in &prompt {
+        next = pstep(&mut r0, &mut r1, t, pos);
+        pos += 1;
+    }
+    let mut cold = Vec::new();
+    for _ in 0..n_gen {
+        cold.push(next);
+        next = pstep(&mut r0, &mut r1, next, pos);
+        pos += 1;
+    }
+
+    // WARM: prefill all but last prompt token, snapshot BOTH ranks, reset BOTH,
+    // restore BOTH, feed the last prompt token, decode n_gen.
+    let split = prompt.len() - 1;
+    r0.reset();
+    r1.reset();
+    let mut pos = 0usize;
+    let mut next = 0u32;
+    for &t in &prompt[..split] {
+        next = pstep(&mut r0, &mut r1, t, pos);
+        pos += 1;
+    }
+    let s0 = r0.snapshot_kv().expect("snap r0");
+    let s1 = r1.snapshot_kv().expect("snap r1");
+    assert_eq!(s0.past_seq_len, split);
+    assert_eq!(s1.past_seq_len, split);
+    r0.reset();
+    r1.reset();
+    r0.restore_kv(&s0).expect("restore r0");
+    r1.restore_kv(&s1).expect("restore r1");
+    let mut pos = split;
+    let mut next = 0u32;
+    for &t in &prompt[split..] {
+        next = pstep(&mut r0, &mut r1, t, pos);
+        pos += 1;
+    }
+    let mut warm = Vec::new();
+    for _ in 0..n_gen {
+        warm.push(next);
+        next = pstep(&mut r0, &mut r1, next, pos);
+        pos += 1;
+    }
+
+    eprintln!("2stage cold: {cold:?}");
+    eprintln!("2stage warm: {warm:?}");
+    assert_eq!(warm, cold, "2-stage snapshot/restore must match continuous");
+}
+
+/// Single-stage `generate_with_cache` warm-resume must match a cold run (Issue-34 Phase 2). Prime a
+/// base prompt (miss → caches base→base-KV), then generate a longer prompt sharing that prefix (hit
+/// → restores base KV, prefills only the suffix). The warm continuation must equal a cold generation
+/// of the full prompt. Gated on `M2_MODEL_DIR`.
+#[test]
+fn minimax_m2_generate_with_cache_warm_matches_cold() {
+    let Some(model_dir) = env_dir("M2_MODEL_DIR") else {
+        eprintln!("M2_MODEL_DIR not set / missing; skipping generate_with_cache test");
+        return;
+    };
+    let dev = std::env::var("CASCADIA_DEVICE").unwrap_or_else(|_| "CPU".to_string());
+    let mut r = OvMoeRunner::load(model_dir, &dev, PluginConfig::new(), None).expect("load");
+    let cfg = cascadia_engine_sparse_moe::sampling::SamplingConfig::default(); // greedy
+    let n = 8usize;
+
+    let base: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let full: Vec<u32> = {
+        let mut v = base.clone();
+        v.extend_from_slice(&[11, 12, 13, 14]);
+        v
+    };
+
+    // Cold: full prompt, no cache.
+    let (cold, _) = r
+        .generate_with_cache(&full, n, &cfg, None)
+        .expect("cold generate");
+
+    // Warm: prime `base` (miss, caches it), then `full` (hit on base → warm-resume).
+    let mut cache = cascadia_engine_sparse_moe::ov_kv_cache::OvMoeKvPrefixCache::new(4);
+    let (_prime, cached) = r
+        .generate_with_cache(&base, 1, &cfg, Some(&mut cache))
+        .expect("prime");
+    assert!(cached.is_some(), "prime should cache the base prompt");
+    let (warm, _) = r
+        .generate_with_cache(&full, n, &cfg, Some(&mut cache))
+        .expect("warm generate");
+
+    eprintln!("cold: {cold:?}");
+    eprintln!("warm: {warm:?}");
+    assert_eq!(warm, cold, "generate_with_cache warm run must match cold");
+}

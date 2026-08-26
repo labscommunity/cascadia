@@ -15,7 +15,7 @@
 //! whitespace tokenize to different keys — accepted; the cache only
 //! ever returns hits when the *token stream* matches byte-identically.
 //! Hash collisions are guarded by re-comparing the full token slice on
-//! lookup (see [`KvPrefixCache::lookup`]).
+//! lookup (see [`KvPrefixCache::lookup_local`]).
 //!
 //! The cached value is a [`KvSnapshot`] holding the populated K/V
 //! prefix for layer 0 and every MoE shell layer the rank owns. Capacity
@@ -40,6 +40,13 @@ use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
+
+/// Namespace for a capture made outside any admitted-tenant context (local generation — nothing
+/// plumbs a tenant as far as the engine at this rev, see `GenerationTask`). [`KvPrefixCache::insert`]
+/// tags entries with this; [`KvPrefixCache::lookup_ns`] (the cross-chain wire path) filters on it, so
+/// a NEGOTIATE under a real tenant never matches a purely-local capture. Mirrors the OpenVINO engines'
+/// `LOCAL_NS` (issue-34 H.1a).
+pub(crate) const LOCAL_NS: &str = "";
 
 /// Per-layer slice of the KV cache as it would sit at `past_seq_len = N`
 /// after a fresh prefill. The buffers are stored packed: exactly `N`
@@ -139,12 +146,34 @@ impl ModelFingerprint {
         self.hash(&mut h);
         h.finish()
     }
+
+    /// Issue-34 cross-chain PLANE digest: hashes only the model-identity fields, EXCLUDING the
+    /// per-stage slice (`layer_start/layer_end/is_first/is_last`). A move A→B pulls every rank's KV
+    /// keyed by ONE fingerprint (the moved-to head's), so a tail holder's fp must match despite its
+    /// different layer span — a per-stage digest would wrongly reject the worker ranks of a legitimate
+    /// move. LOCAL cache keys keep the full `digest()` (a rank-0 snapshot must never restore on rank 1);
+    /// this is used only for `model_fingerprint`/holder/export on the plane. Mirrors the OV engines'
+    /// deliberately model-level plane fingerprint.
+    pub fn plane_digest(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        let mut h = DefaultHasher::new();
+        self.arch.hash(&mut h);
+        self.num_layers.hash(&mut h);
+        self.num_experts.hash(&mut h);
+        self.top_k.hash(&mut h);
+        self.hidden_size.hash(&mut h);
+        self.num_kv_heads.hash(&mut h);
+        self.qk_head_dim.hash(&mut h);
+        self.v_head_dim.hash(&mut h);
+        self.vocab_size.hash(&mut h);
+        h.finish()
+    }
 }
 
 /// Cache key: model fingerprint digest + 64-bit hash of the token-id
 /// prefix. Stored as a single 128-bit pair so equal keys imply both
 /// digest and prefix-hash matched. The prefix-hash alone is not unique
-/// — see [`KvPrefixCache::lookup`] for the full-slice re-comparison.
+/// — see [`KvPrefixCache::lookup_local`] for the full-slice re-comparison.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CacheKey {
     model_digest: u64,
@@ -152,10 +181,18 @@ struct CacheKey {
 }
 
 /// One cached entry. The token prefix is held alongside the snapshot
-/// so `lookup` can re-compare and reject hash collisions.
+/// so lookup can re-compare and reject hash collisions.
 struct Entry {
+    /// Issue-34 H.1a: the namespace this entry is visible in over the wire.
+    /// [`KvPrefixCache::lookup_local`] (local resume) does not filter on this — see that method's
+    /// doc. [`KvPrefixCache::lookup_ns`] (cross-chain NEGOTIATE) does, so a cross-tenant probe reads
+    /// as an empty cache.
+    partner: String,
     prefix: Vec<i64>,
     snapshot: KvSnapshot,
+    /// Pulled over the KV plane (`insert_pulled`) rather than captured from this rank's own turn.
+    /// Read back by [`KvPrefixCache::lookup_local`] so a cert bar can tell the two apart.
+    plane_pulled: bool,
 }
 
 /// LRU KV-prefix cache.
@@ -188,6 +225,13 @@ pub struct KvPrefixCache {
     pub inserts: u64,
     /// Total evictions due to capacity overflow.
     pub evictions: u64,
+    /// H.1b R2: namespace [`Self::insert`] (this rank's own turn) files entries under. Seeded from
+    /// `GenerationTask.tenant` at admission via [`Self::set_local_ns`]; `LOCAL_NS` until something
+    /// names a tenant, which is what keeps the local-capture path unchanged today.
+    ///
+    /// Held here rather than threaded through `generate_with_cache`: the deepest insert sites sit
+    /// inside the runner, which has no task. Single task in flight per engine, set at admission.
+    local_ns: String,
 }
 
 impl KvPrefixCache {
@@ -201,7 +245,16 @@ impl KvPrefixCache {
             misses: 0,
             inserts: 0,
             evictions: 0,
+            local_ns: LOCAL_NS.to_string(),
         }
+    }
+
+    /// Set the namespace [`Self::insert`] files this turn's capture under. Call at task admission
+    /// with `GenerationTask.tenant` — NEVER with a plane-asserted partner, which describes a pulled
+    /// entry rather than the turn being run.
+    pub fn set_local_ns(&mut self, ns: &str) {
+        self.local_ns.clear();
+        self.local_ns.push_str(ns);
     }
 
     /// True if the cache will store anything. `capacity == 0` returns false.
@@ -222,7 +275,7 @@ impl KvPrefixCache {
     }
 
     /// Look up the longest cached prefix that matches the start of
-    /// `prompt`. Returns `Some((matched_len, snapshot))` for the
+    /// `prompt`. Returns `Some((snapshot, plane_pulled))` for the
     /// best match, `None` if nothing matches.
     ///
     /// "Best" = longest prefix length. We scan every entry and pick
@@ -232,7 +285,42 @@ impl KvPrefixCache {
     /// Side effect: on a hit, the matched entry is moved to MRU
     /// position (front of the deque) so it survives the next eviction.
     /// `hits`/`misses` counters are bumped accordingly.
-    pub fn lookup(&mut self, prompt: &[i64], fingerprint: &ModelFingerprint) -> Option<KvSnapshot> {
+    ///
+    /// LOCAL RESUME ONLY — not tenant-namespaced. Wire-facing paths MUST use [`Self::lookup_ns`].
+    pub fn lookup_local(
+        &mut self,
+        prompt: &[i64],
+        fingerprint: &ModelFingerprint,
+    ) -> Option<(KvSnapshot, bool)> {
+        self.lookup_impl(None, prompt, fingerprint)
+    }
+
+    /// As [`Self::lookup_local`], but confined to entries tagged `partner` (issue-34 H.1a). Backs the
+    /// cross-chain wire plane (`KvCoordination::lookup`/`KvSnapshotHolder::lookup`) — the surface a
+    /// remote peer's NEGOTIATE reaches. The namespace filter is applied BEFORE the longest-prefix
+    /// scan, not after: filtering the global-best match after the fact would let another tenant's
+    /// coincidentally-longer entry mask the caller's own legitimate (shorter) hit, which is a
+    /// same-namespace regression, not just a security fix.
+    ///
+    /// [`Self::lookup_local`] itself stays unconfined — it backs the LOCAL resume path (this node's
+    /// own next `generate_with_cache` call), which never crosses the wire. Cross-tenant KV *reuse* on
+    /// that path is a deliberate H.1 non-goal (§5); only the network-visible LENGTH oracle is closed
+    /// here. Mirrors the OpenVINO engines' `longest_prefix` vs `take_warm` split.
+    pub fn lookup_ns(
+        &mut self,
+        partner: &str,
+        prompt: &[i64],
+        fingerprint: &ModelFingerprint,
+    ) -> Option<(KvSnapshot, bool)> {
+        self.lookup_impl(Some(partner), prompt, fingerprint)
+    }
+
+    fn lookup_impl(
+        &mut self,
+        partner_filter: Option<&str>,
+        prompt: &[i64],
+        fingerprint: &ModelFingerprint,
+    ) -> Option<(KvSnapshot, bool)> {
         if !self.enabled() {
             return None;
         }
@@ -242,6 +330,11 @@ impl KvPrefixCache {
         for (i, (key, entry)) in self.entries.iter().enumerate() {
             if key.model_digest != model_digest {
                 continue;
+            }
+            if let Some(partner) = partner_filter {
+                if entry.partner != partner {
+                    continue;
+                }
             }
             let plen = entry.prefix.len();
             // The prefix must wholly precede `prompt` AND leave at
@@ -271,9 +364,9 @@ impl KvPrefixCache {
                     .entries
                     .remove(i)
                     .expect("index from enumerate must be valid");
-                let snapshot = entry.1.snapshot.clone();
+                let hit = (entry.1.snapshot.clone(), entry.1.plane_pulled);
                 self.entries.push_front(entry);
-                Some(snapshot)
+                Some(hit)
             }
         }
     }
@@ -284,11 +377,42 @@ impl KvPrefixCache {
     ///
     /// Returns the number of evicted entries (0 in the steady state
     /// once the cache is full and we replace rather than grow).
+    ///
+    /// Local capture — this rank's own turn. Cross-chain consumer-inserts
+    /// go through [`Self::insert_pulled`].
     pub fn insert(
         &mut self,
         prefix: Vec<i64>,
         fingerprint: &ModelFingerprint,
         snapshot: KvSnapshot,
+    ) -> usize {
+        let ns = std::mem::take(&mut self.local_ns);
+        let n = self.store(&ns, prefix, fingerprint, snapshot, false);
+        self.local_ns = ns;
+        n
+    }
+
+    /// As [`Self::insert`], but marks the entry as pulled over the KV plane so a later warm resume
+    /// off it is attributable to the cross-chain pull, not to a local capture, and tags it with
+    /// `partner` — the tenant this pull was served to (issue-34 H.1a) — so [`Self::lookup_ns`] can
+    /// confine a later NEGOTIATE to it.
+    pub fn insert_pulled(
+        &mut self,
+        partner: &str,
+        prefix: Vec<i64>,
+        fingerprint: &ModelFingerprint,
+        snapshot: KvSnapshot,
+    ) -> usize {
+        self.store(partner, prefix, fingerprint, snapshot, true)
+    }
+
+    fn store(
+        &mut self,
+        partner: &str,
+        prefix: Vec<i64>,
+        fingerprint: &ModelFingerprint,
+        snapshot: KvSnapshot,
+        plane_pulled: bool,
     ) -> usize {
         if !self.enabled() {
             return 0;
@@ -298,13 +422,15 @@ impl KvPrefixCache {
             model_digest: fingerprint.digest(),
             prefix_hash: hash_prefix(&prefix),
         };
-        // Replace any exact-match entry first so capacity accounting
-        // doesn't double-count it.
-        if let Some(pos) = self
-            .entries
-            .iter()
-            .position(|(k, e)| *k == key && e.prefix.len() == prefix.len() && e.prefix == prefix)
-        {
+        // Replace any exact-match entry first so capacity accounting doesn't double-count it.
+        // De-dup within (partner, key, prefix) only: matching on tokens alone would let one tenant
+        // evict/overwrite another's entry by inserting the same sequence — a cross-tenant delete.
+        if let Some(pos) = self.entries.iter().position(|(k, e)| {
+            *k == key
+                && e.partner == partner
+                && e.prefix.len() == prefix.len()
+                && e.prefix == prefix
+        }) {
             self.entries.remove(pos);
         }
         let mut evicted = 0;
@@ -315,7 +441,15 @@ impl KvPrefixCache {
             evicted += 1;
         }
         self.evictions += evicted as u64;
-        self.entries.push_front((key, Entry { prefix, snapshot }));
+        self.entries.push_front((
+            key,
+            Entry {
+                partner: partner.to_string(),
+                prefix,
+                snapshot,
+                plane_pulled,
+            },
+        ));
         self.inserts += 1;
         evicted
     }
@@ -373,6 +507,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn plane_digest_ignores_stage_slice_but_not_model() {
+        // Same model, different stage slice ⇒ SAME plane_digest (cross-chain pull asserts one fp for
+        // every rank), but DIFFERENT full digest (local cache must never cross ranks).
+        let head = fp_a(); // layers 0..MAX, is_first=is_last=true
+        let mut tail = fp_a();
+        tail.layer_start = 30;
+        tail.layer_end = 61;
+        tail.is_first = false;
+        assert_eq!(
+            head.plane_digest(),
+            tail.plane_digest(),
+            "stage slice must not change the plane fp"
+        );
+        assert_ne!(
+            head.digest(),
+            tail.digest(),
+            "full digest must reflect the stage slice"
+        );
+        // A different MODEL must change the plane fp.
+        assert_ne!(
+            head.plane_digest(),
+            fp_b().plane_digest(),
+            "different arch/num_layers must change the plane fp"
+        );
+    }
+
     /// Minimal snapshot for tests: 2 heads, head_dim 2, n_slots = past_seq_len.
     /// `fill` is treated as the raw u16 storage value (bf16-as-u16); the
     /// tests only check round-trip identity, not numeric semantics.
@@ -402,7 +563,7 @@ mod tests {
         let mut c = KvPrefixCache::new(0);
         assert!(!c.enabled());
         c.insert(vec![1, 2, 3], &fp_a(), mk_snapshot(3, 1));
-        assert!(c.lookup(&[1, 2, 3, 4], &fp_a()).is_none());
+        assert!(c.lookup_local(&[1, 2, 3, 4], &fp_a()).is_none());
         assert_eq!(c.len(), 0);
         // Stats untouched on disabled cache (lookup early-returns).
         assert_eq!(c.hits, 0);
@@ -415,8 +576,8 @@ mod tests {
         let mut c = KvPrefixCache::new(4);
         let snap = mk_snapshot(3, 7);
         c.insert(vec![10, 20, 30], &fp_a(), snap.clone());
-        let got = c
-            .lookup(&[10, 20, 30, 40, 50], &fp_a())
+        let (got, _) = c
+            .lookup_local(&[10, 20, 30, 40, 50], &fp_a())
             .expect("hit expected");
         // Byte-identical restore: this is the load-bearing test the
         // task brief calls out — cached KV bits must match what a
@@ -444,7 +605,7 @@ mod tests {
         let mut c = KvPrefixCache::new(4);
         c.insert(vec![1, 2, 3], &fp_a(), mk_snapshot(3, 1));
         c.insert(vec![1, 2, 3, 4, 5], &fp_a(), mk_snapshot(5, 2));
-        let got = c.lookup(&[1, 2, 3, 4, 5, 6], &fp_a()).expect("hit");
+        let (got, _) = c.lookup_local(&[1, 2, 3, 4, 5, 6], &fp_a()).expect("hit");
         assert_eq!(got.past_seq_len, 5);
     }
 
@@ -454,7 +615,7 @@ mod tests {
         c.insert(vec![10, 20, 30], &fp_a(), mk_snapshot(3, 1));
         // Prompt diverges at position 1 — must miss, not silently
         // return a wrong snapshot.
-        assert!(c.lookup(&[10, 99, 30, 40], &fp_a()).is_none());
+        assert!(c.lookup_local(&[10, 99, 30, 40], &fp_a()).is_none());
         assert_eq!(c.misses, 1);
     }
 
@@ -465,7 +626,7 @@ mod tests {
         // Same prefix, different model — must miss. Critical for
         // correctness: restoring K2.6 KV into a Qwen runner would
         // segfault or produce garbage.
-        assert!(c.lookup(&[1, 2, 3, 4], &fp_b()).is_none());
+        assert!(c.lookup_local(&[1, 2, 3, 4], &fp_b()).is_none());
     }
 
     #[test]
@@ -475,7 +636,7 @@ mod tests {
         // have nothing to sample from. Treat as miss.
         let mut c = KvPrefixCache::new(4);
         c.insert(vec![1, 2, 3], &fp_a(), mk_snapshot(3, 1));
-        assert!(c.lookup(&[1, 2, 3], &fp_a()).is_none());
+        assert!(c.lookup_local(&[1, 2, 3], &fp_a()).is_none());
     }
 
     #[test]
@@ -486,9 +647,9 @@ mod tests {
         // Cap=2; inserting a third evicts the oldest ([1,1,1]).
         c.insert(vec![3, 3, 3], &fp_a(), mk_snapshot(3, 3));
         assert_eq!(c.len(), 2);
-        assert!(c.lookup(&[1, 1, 1, 9], &fp_a()).is_none());
-        assert!(c.lookup(&[2, 2, 2, 9], &fp_a()).is_some());
-        assert!(c.lookup(&[3, 3, 3, 9], &fp_a()).is_some());
+        assert!(c.lookup_local(&[1, 1, 1, 9], &fp_a()).is_none());
+        assert!(c.lookup_local(&[2, 2, 2, 9], &fp_a()).is_some());
+        assert!(c.lookup_local(&[3, 3, 3, 9], &fp_a()).is_some());
         assert_eq!(c.evictions, 1);
     }
 
@@ -500,19 +661,102 @@ mod tests {
         let mut c = KvPrefixCache::new(2);
         c.insert(vec![1, 1, 1], &fp_a(), mk_snapshot(3, 1));
         c.insert(vec![2, 2, 2], &fp_a(), mk_snapshot(3, 2));
-        let _ = c.lookup(&[1, 1, 1, 9], &fp_a()).expect("A still present");
+        let _ = c
+            .lookup_local(&[1, 1, 1, 9], &fp_a())
+            .expect("A still present");
         c.insert(vec![3, 3, 3], &fp_a(), mk_snapshot(3, 3));
         assert!(
-            c.lookup(&[1, 1, 1, 9], &fp_a()).is_some(),
+            c.lookup_local(&[1, 1, 1, 9], &fp_a()).is_some(),
             "A promoted; should survive"
         );
         assert!(
-            c.lookup(&[2, 2, 2, 9], &fp_a()).is_none(),
+            c.lookup_local(&[2, 2, 2, 9], &fp_a()).is_none(),
             "B was LRU; should be evicted"
         );
         assert!(
-            c.lookup(&[3, 3, 3, 9], &fp_a()).is_some(),
+            c.lookup_local(&[3, 3, 3, 9], &fp_a()).is_some(),
             "C just inserted"
+        );
+    }
+
+    #[test]
+    fn lookup_reports_entry_provenance() {
+        let mut c = KvPrefixCache::new(4);
+        c.insert(vec![1, 2, 3], &fp_a(), mk_snapshot(3, 1));
+        let (_, pulled) = c.lookup_local(&[1, 2, 3, 4], &fp_a()).expect("hit");
+        assert!(!pulled, "locally captured");
+        c.insert_pulled("peer", vec![1, 2, 3], &fp_a(), mk_snapshot(3, 2));
+        let (_, pulled) = c.lookup_local(&[1, 2, 3, 4], &fp_a()).expect("hit");
+        assert!(pulled, "consumer-inserted over the plane");
+    }
+
+    /// LRU must fail safe: once the pulled entry is evicted, the local entry that still
+    /// matches carries its own mark, so a plane assertion can't green off a local capture.
+    #[test]
+    fn evicting_a_pulled_entry_leaves_a_local_mark() {
+        let mut c = KvPrefixCache::new(2);
+        c.insert_pulled("peer", vec![1, 1, 1], &fp_a(), mk_snapshot(3, 1));
+        c.insert(vec![2, 2, 2], &fp_a(), mk_snapshot(3, 2));
+        c.insert(vec![3, 3, 3], &fp_a(), mk_snapshot(3, 3));
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.evictions, 1);
+        assert!(
+            c.lookup_local(&[1, 1, 1, 9], &fp_a()).is_none(),
+            "pulled was LRU"
+        );
+        let (_, pulled) = c.lookup_local(&[2, 2, 2, 9], &fp_a()).expect("hit");
+        assert!(!pulled);
+    }
+
+    /// Issue-34 H.1a: `lookup_ns` is the cross-chain wire path — a cross-tenant probe must read as
+    /// an empty cache (`None`), never a truncated length. `lookup` (unqualified, local resume) is
+    /// unaffected — a deliberate H.1 §5 non-goal, not tested here.
+    #[test]
+    fn lookup_ns_is_confined_to_the_callers_namespace() {
+        let mut c = KvPrefixCache::new(4);
+        c.insert_pulled("tenant-a", vec![11, 22, 33], &fp_a(), mk_snapshot(3, 1));
+        assert!(
+            c.lookup_ns("tenant-b", &[11, 22, 33, 44], &fp_a())
+                .is_none(),
+            "cross-tenant probe must miss"
+        );
+        assert_eq!(
+            c.lookup_ns("tenant-a", &[11, 22, 33, 44], &fp_a())
+                .map(|(s, _)| s.past_seq_len),
+            Some(3),
+            "the owner still hits"
+        );
+    }
+
+    /// The namespace filter must run BEFORE the longest-prefix scan, not after: filtering the
+    /// global-best match after the fact would let another tenant's coincidentally-longer entry mask
+    /// the caller's own legitimate (shorter) hit — a same-namespace behaviour regression.
+    #[test]
+    fn lookup_ns_does_not_let_a_longer_other_tenant_entry_mask_the_callers_own_hit() {
+        let mut c = KvPrefixCache::new(4);
+        // tenant-a's entry is LONGER and also a prefix of the shared probe.
+        c.insert_pulled("tenant-a", vec![1, 2, 3, 4, 5], &fp_a(), mk_snapshot(5, 9));
+        // tenant-b's own entry is shorter, but still a legitimate hit for tenant-b.
+        c.insert_pulled("tenant-b", vec![1, 2, 3], &fp_a(), mk_snapshot(3, 7));
+        let (snap, _) = c
+            .lookup_ns("tenant-b", &[1, 2, 3, 4, 5, 6], &fp_a())
+            .expect("tenant-b's own shorter entry must still hit");
+        assert_eq!(snap.past_seq_len, 3);
+    }
+
+    /// De-dup on insert must be scoped to `(partner, tokens)`, not tokens alone — matching on tokens
+    /// alone would let tenant-b's insert silently delete tenant-a's entry for the same sequence.
+    #[test]
+    fn insert_dedup_is_scoped_to_partner() {
+        let mut c = KvPrefixCache::new(4);
+        c.insert_pulled("tenant-a", vec![1, 2, 3], &fp_a(), mk_snapshot(3, 1));
+        c.insert_pulled("tenant-b", vec![1, 2, 3], &fp_a(), mk_snapshot(3, 2));
+        assert_eq!(c.len(), 2, "both tenants' entries survive");
+        assert_eq!(
+            c.lookup_ns("tenant-a", &[1, 2, 3, 9], &fp_a())
+                .map(|(s, _)| s.layer0.unwrap().past_k[0]),
+            Some(1),
+            "tenant-a's entry must be intact, not overwritten by tenant-b's insert"
         );
     }
 
@@ -523,7 +767,7 @@ mod tests {
         c.insert(vec![1, 2, 3], &fp_a(), mk_snapshot(3, 1));
         c.insert(vec![1, 2, 3], &fp_a(), mk_snapshot(3, 9));
         assert_eq!(c.len(), 1);
-        let got = c.lookup(&[1, 2, 3, 4], &fp_a()).expect("hit");
+        let (got, _) = c.lookup_local(&[1, 2, 3, 4], &fp_a()).expect("hit");
         // Second insert wins — value should be 9, not 1.
         assert_eq!(got.layer0.as_ref().unwrap().past_k[0], 9);
     }
@@ -534,7 +778,7 @@ mod tests {
         c.insert(vec![1, 2, 3], &fp_a(), mk_snapshot(3, 1));
         c.clear();
         assert_eq!(c.len(), 0);
-        assert!(c.lookup(&[1, 2, 3, 4], &fp_a()).is_none());
+        assert!(c.lookup_local(&[1, 2, 3, 4], &fp_a()).is_none());
     }
 
     #[test]

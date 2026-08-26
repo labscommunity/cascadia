@@ -13,6 +13,8 @@
 pub mod dist_spec;
 pub mod gemma4;
 pub mod genai;
+#[cfg(feature = "kv_coord")]
+pub mod kv_coordination;
 pub mod packed;
 mod packed_exec;
 pub mod qwen36;

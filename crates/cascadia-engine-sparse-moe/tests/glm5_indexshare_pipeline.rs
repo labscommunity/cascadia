@@ -90,13 +90,13 @@ async fn pipeline_generate(
             let cfg2 = cfg.clone();
             let hsend = h;
             let send = tokio::spawn(async move {
-                send_forward(&client, pos as u32, &cfg2, &hsend, [1, 1, hsz])
+                send_forward(&client, pos as u32, &cfg2, &hsend, [1, 1, hsz], true)
                     .await
                     .unwrap();
             });
             let k = recv_kind_server(&servers[i]).await.unwrap();
             assert_eq!(k, Some(FrameKind::Forward));
-            let (_p, _c, hw, _s) = recv_forward_body_server(&servers[i]).await.unwrap();
+            let (_p, _c, _ph, hw, _s) = recv_forward_body_server(&servers[i]).await.unwrap();
             send.await.unwrap();
             h = ranks[i + 1].forward_layers(hw, pos, None);
         }

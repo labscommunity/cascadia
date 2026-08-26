@@ -79,6 +79,17 @@ pub struct GenerationTask {
     /// Treat as a security boundary — opt in only.
     #[serde(default)]
     pub trust_remote_code: bool,
+    /// Issue-34 H.1b: the tenant this turn belongs to. The engine namespaces its KV cache by it at
+    /// BOTH ends — `capture` tags the entry, `take_warm` only resumes from an entry with the same
+    /// value — so one tenant can never warm-resume off another's prefix.
+    ///
+    /// Defaults to `""` (`kv_coordination::LOCAL_NS`), which is exactly today's single-namespace
+    /// behaviour, so plumbing this through is inert until the plane starts asserting a real tenant.
+    /// Landing the plane's assertion while captures are still tagged `""` would send cross-node warm
+    /// pull cold for that tenant — fail-closed, but a silent performance cliff (design §12.10.0), so
+    /// the two must flip together.
+    #[serde(default)]
+    pub tenant: String,
 }
 
 fn default_max_tokens() -> u32 {
@@ -96,7 +107,15 @@ impl GenerationTask {
             sampling: SamplingParams::default(),
             enable_thinking: false,
             trust_remote_code: false,
+            tenant: String::new(), // LOCAL_NS — see the field doc
         }
+    }
+
+    /// Issue-34 H.1b: set the tenant this turn's KV is namespaced under (both capture and resume).
+    #[must_use]
+    pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = tenant.into();
+        self
     }
 
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {

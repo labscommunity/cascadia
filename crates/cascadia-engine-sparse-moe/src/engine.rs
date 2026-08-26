@@ -34,6 +34,13 @@ use crate::dist::{
     send_forward_batch_prefill_nosample, send_forward_nosample, send_forward_prefill, send_reset,
     send_restore_prefix, send_token_batch_upstream, send_token_upstream, FrameKind, StageTransport,
 };
+#[cfg(feature = "kv_coord")]
+use crate::dist::{
+    recv_capture_ack_body_client, recv_capture_body_server, recv_capture_v2_body_server,
+    recv_restore_body_server, recv_restore_carry_body_server, recv_restore_verdict, send_capture,
+    send_capture_ack_upstream, send_restore, send_restore_ack_upstream, send_restore_carry,
+    CAPTURE_ACK_TIMEOUT,
+};
 use crate::kv_prefix_cache::KvPrefixCache;
 use crate::manifest::Manifest;
 use crate::ov_moe::OvMoeRunner;
@@ -768,6 +775,30 @@ impl Builder for SparseMoEBuilder {
             } else {
                 info!("built MiniMax-M2 OV-IR engine (single-stage)");
             }
+            // Issue-34: KV warm-resume prefix cache. Under `kv_coord`, enabled for BOTH single-stage
+            // (cross-chain warm-pull + local warm-resume, Phase 2) and multi-stage (per-stage
+            // CAPTURE/RESTORE over the transport, Phase 1). Without the feature there is no warm
+            // plane, so the cache stays off (allocating it would only waste memory).
+            #[cfg(feature = "kv_coord")]
+            let ov_kv_cache_size = self.config.kv_prefix_cache_size;
+            #[cfg(not(feature = "kv_coord"))]
+            let ov_kv_cache_size = {
+                if self.config.kv_prefix_cache_size > 0 {
+                    warn!(
+                        requested = self.config.kv_prefix_cache_size,
+                        total, "kv-prefix-cache disabled: warm-resume needs the kv_coord feature"
+                    );
+                }
+                0u32
+            };
+            let ov_kv_cache =
+                crate::ov_kv_cache::OvMoeKvPrefixCache::new(ov_kv_cache_size as usize);
+            if ov_kv_cache.enabled() {
+                info!(
+                    capacity = ov_kv_cache_size,
+                    rank, total, "OvMoe kv-prefix-cache enabled (warm-resume)"
+                );
+            }
             return Ok(Box::new(OvMoeEngine::new(
                 ov,
                 self.tokenizer,
@@ -775,6 +806,7 @@ impl Builder for SparseMoEBuilder {
                 runtime_handle,
                 rank,
                 total,
+                ov_kv_cache,
             )));
         }
         let runner = self.runner.ok_or(EngineError::NotLoaded)?;
@@ -798,14 +830,23 @@ impl Builder for SparseMoEBuilder {
         // error) on multi-stage configs so the same CLI flag works in
         // both topologies — the multi-stage path silently ignores it.
         let kv_cache_size = if total > 1 {
-            if self.config.kv_prefix_cache_size > 0 {
-                warn!(
-                    requested = self.config.kv_prefix_cache_size,
-                    total,
-                    "kv-prefix-cache disabled: multi-stage cache requires per-stage snapshot exchange (not implemented yet)"
-                );
-            }
-            0
+            // Issue-34 Task 1.3: multi-stage capture is wired under `kv_coord` (per-stage CAPTURE@E
+            // over the pipeline transport, §8). Without the feature there is no warm-pull plane, so
+            // the per-stage cache stays off (allocating it would only waste memory).
+            #[cfg(feature = "kv_coord")]
+            let v = self.config.kv_prefix_cache_size;
+            #[cfg(not(feature = "kv_coord"))]
+            let v = {
+                if self.config.kv_prefix_cache_size > 0 {
+                    warn!(
+                        requested = self.config.kv_prefix_cache_size,
+                        total,
+                        "kv-prefix-cache disabled: multi-stage capture needs the kv_coord feature"
+                    );
+                }
+                0
+            };
+            v
         } else {
             self.config.kv_prefix_cache_size
         };
@@ -852,6 +893,16 @@ impl Builder for SparseMoEBuilder {
                 );
             }
         }
+        // Snapshot the holder mirror before the struct literal moves `runner` / `kv_prefix_cache`
+        // (fingerprint()/capacity() are `&self`; the struct-literal field shorthands below would
+        // otherwise move them first).
+        #[cfg(feature = "kv_coord")]
+        let kv_share = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::kv_coordination::SparseHolderState::new(
+                kv_prefix_cache.capacity(),
+                runner.fingerprint(),
+            ),
+        ));
         Ok(Box::new(SparseMoEEngine {
             runner,
             tokenizer: self.tokenizer,
@@ -867,6 +918,20 @@ impl Builder for SparseMoEBuilder {
             last_rank_rng_seeded: false,
             spec_decode_k,
             kv_prefix_cache,
+            #[cfg(feature = "kv_coord")]
+            kv_offers: crate::kv_coordination::KvOfferStash::new(
+                crate::kv_coordination::KV_MAX_OFFERS,
+                crate::kv_coordination::KV_MAX_OFFER_BYTES,
+                crate::kv_prefix_cache::KvSnapshot::approx_bytes,
+            ),
+            #[cfg(feature = "kv_coord")]
+            kv_capture: std::collections::HashMap::new(),
+            #[cfg(feature = "kv_coord")]
+            kv_share,
+            #[cfg(feature = "kv_coord")]
+            kv_handoff_mailbox: std::sync::Arc::new(
+                cascadia_engine::kv_handoff::KvHandoffMailbox::new(),
+            ),
         }))
     }
 }
@@ -1019,8 +1084,8 @@ const MAX_PENDING_TASKS: usize = 8;
 const WORKER_BACKOFF: Duration = Duration::from_millis(200);
 
 pub struct SparseMoEEngine {
-    runner: Runner,
-    tokenizer: Option<Tokenizer>,
+    pub(crate) runner: Runner,
+    pub(crate) tokenizer: Option<Tokenizer>,
     pending: VecDeque<GenerationTask>,
     transport: StageTransport,
     runtime_handle: tokio::runtime::Handle,
@@ -1058,7 +1123,35 @@ pub struct SparseMoEEngine {
     /// the longest matching prefix's snapshot into the runner so the
     /// generate path skips that portion of prefill. See
     /// [`crate::kv_prefix_cache`] for the cache semantics.
-    kv_prefix_cache: KvPrefixCache,
+    pub(crate) kv_prefix_cache: KvPrefixCache,
+    /// Issue-34 Option C: NEGOTIATE→GET correlation. A `lookup` stashes the offered `(prefix_tokens,
+    /// snapshot)` keyed by its content-derived `snapshot_epoch`; the paired `export` retrieves it by
+    /// that epoch (the wire `Get` carries no token_ids). Bounded by `KV_MAX_OFFERS` and
+    /// `KV_MAX_OFFER_BYTES`.
+    #[cfg(feature = "kv_coord")]
+    pub(crate) kv_offers: crate::kv_coordination::KvOfferStash<crate::kv_prefix_cache::KvSnapshot>,
+    /// Issue-34 Task 1.3 (multi-stage capture, §8): PERSISTENT per-rank capture store, keyed by the
+    /// head-assigned epoch. Multi-stage `CAPTURE(E,tokens)` stashes each stage's `snapshot_kv()` here;
+    /// the per-rank `GET(E)` serves from it. Unlike `kv_offers` (short-lived NEGOTIATE→GET correlation
+    /// on the head), these must survive across turns — a forced move can pull a prefix captured many
+    /// turns earlier. Bounded by `kv_prefix_cache.capacity()`; eviction is oldest-arbitrary.
+    // Tenant carried as a VALUE, key stays epoch-only: partner-KEYING would file every legacy
+    // (v1-frame) capture under a local namespace and turn the certified multi-stage cross-chain
+    // warm pull cold. `""` = untagged (legacy frame or tenant-less turn) — served to any partner;
+    // a non-empty tenant confines the entry (H.1a).
+    #[cfg(feature = "kv_coord")]
+    pub(crate) kv_capture:
+        std::collections::HashMap<u64, (String, Vec<i32>, crate::kv_prefix_cache::KvSnapshot)>,
+    /// Issue-34 Option C (holder mirror): the lock-free snapshot cache the [`crate::kv_coordination::
+    /// SparseMoeKvHolder`] serves from. Populated alongside `kv_prefix_cache` / `kv_offers` /
+    /// `kv_capture` so a busy engine answers cross-chain KV pulls without the engine lock.
+    #[cfg(feature = "kv_coord")]
+    pub(crate) kv_share: crate::kv_coordination::SharedHolderCache,
+    /// Issue-34 plane warm-resume: where the node's commit path parks a pulled slice for this rank.
+    /// The commit cannot reach the engine — it usually runs while the engine mutex is held inside
+    /// `step()` — so it only parks bytes here and the recv loop drains them at `RESTORE`.
+    #[cfg(feature = "kv_coord")]
+    pub(crate) kv_handoff_mailbox: std::sync::Arc<cascadia_engine::kv_handoff::KvHandoffMailbox>,
 }
 
 impl SparseMoEEngine {
@@ -1074,6 +1167,27 @@ impl SparseMoEEngine {
 
     fn is_last(&self) -> bool {
         self.transport.is_last()
+    }
+
+    /// Apply a plane-parked slice, if one is waiting. `true` ⇒ this rank is armed warm from the
+    /// plane, which is what makes its `RESTORE` verdict truthful in plane mode.
+    ///
+    /// MUST run BEFORE the local capture branch, never as `local_ok || drain()` — see the
+    /// `FrameKind::Restore` arm for why that shape silently produces a hollow warm.
+    #[cfg(feature = "kv_coord")]
+    pub(crate) fn drain_kv_handoff(&mut self, expected_epoch: u64) -> bool {
+        // Plane fp, matching `KvCoordination::model_fingerprint` and this engine's holder.
+        let model_fp = self.runner.fingerprint().plane_digest();
+        let position = self.runner.kv_past_seq_len();
+        let mailbox = std::sync::Arc::clone(&self.kv_handoff_mailbox);
+        let runner = &mut self.runner;
+        crate::kv_coordination::drain_handoff(
+            &mailbox,
+            model_fp,
+            position,
+            expected_epoch,
+            |snap| runner.restore_kv(snap).is_ok(),
+        )
     }
 
     /// Worker-side helper: if the runner's KV is AHEAD of the driver's
@@ -1183,6 +1297,31 @@ impl Engine for SparseMoEEngine {
         Ok(produced)
     }
 
+    #[cfg(feature = "kv_coord")]
+    fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
+        // Issue-34 Option C: the sparse-MoE engine holds a `KvPrefixCache`, so it participates.
+        Some(self)
+    }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_holder(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvSnapshotHolder>> {
+        // Lock-free holder over the mirrored snapshot cache; a pull never contends the engine lock.
+        Some(std::sync::Arc::new(
+            crate::kv_coordination::SparseMoeKvHolder {
+                cache: std::sync::Arc::clone(&self.kv_share),
+                // Plane-level fp (model identity only): a cross-chain pull asserts the moved-to
+                // head's fp for EVERY rank's GET, so this holder must match despite its layer span.
+                model_fp: self.runner.fingerprint().plane_digest(),
+            },
+        ))
+    }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_handoff(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>> {
+        Some(std::sync::Arc::clone(&self.kv_handoff_mailbox)
+            as std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>)
+    }
+
     fn close(&mut self) {
         // Issue #38: dump the gate-capture histograms before tearing
         // down the runner. A clean shutdown (SIGTERM via
@@ -1219,11 +1358,27 @@ impl Engine for SparseMoEEngine {
 }
 
 impl SparseMoEEngine {
+    /// H.1b R2: file this turn's LOCAL capture under the task's tenant, on both the engine cache
+    /// and the holder mirror (either can be the one a later NEGOTIATE reads). Seeded from
+    /// `GenerationTask.tenant` at admission — never from a plane-asserted partner, which describes
+    /// a pulled entry rather than the turn being run. Inert while nothing names a tenant.
+    #[cfg(feature = "kv_coord")]
+    fn kv_set_turn_tenant(&mut self, tenant: &str) {
+        self.kv_prefix_cache.set_local_ns(tenant);
+        self.kv_share
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prefix
+            .set_local_ns(tenant);
+    }
+
     fn step_single_stage(&mut self) -> Vec<(TaskId, Chunk)> {
         let task = match self.pending.pop_front() {
             Some(t) => t,
             None => return Vec::new(),
         };
+        #[cfg(feature = "kv_coord")]
+        self.kv_set_turn_tenant(&task.tenant);
         let tokenizer = match self.tokenizer.as_ref() {
             Some(t) => t,
             None => {
@@ -1323,6 +1478,8 @@ impl SparseMoEEngine {
             Some(t) => t,
             None => return Vec::new(),
         };
+        #[cfg(feature = "kv_coord")]
+        self.kv_set_turn_tenant(&task.tenant);
         let started = std::time::Instant::now();
         let prompt_ids: Vec<i64> = {
             let Some(tok) = self.tokenizer.as_ref() else {
@@ -1375,6 +1532,61 @@ impl SparseMoEEngine {
         // per-token Forward driver.
         let use_spec =
             self.spec_decode_k.map(|k| k > 0).unwrap_or(false) && sampling_cfg.temperature <= 0.0;
+
+        // Issue-34 consume (§8): SAME-CHAIN warm-resume. On a kv-prefix-cache hit, restore the head's
+        // own rank-0 slice and RESTORE the whole downstream chain (all-or-nothing); on success skip
+        // re-prefilling the matched prefix (`warm_prefix`). Any rank short ⇒ discard: re-RESET local +
+        // downstream and cold-run. Runs after the admission RESET above and before generation (rule §2).
+        // Inert unless kv_coord + cache enabled + a hit on the non-spec path; `warm_prefix == 0` leaves
+        // `drive_generation_first` byte-identical to the cold path. Spec-decode stays cold (parity with
+        // the single-stage cache bypass).
+        #[cfg(feature = "kv_coord")]
+        let warm_prefix: usize = if !use_spec && self.kv_prefix_cache.enabled() {
+            let fp = self.runner.fingerprint();
+            match self.kv_prefix_cache.lookup_local(&prompt_ids, &fp) {
+                Some((snap, plane_pulled)) => {
+                    let matched = snap.past_seq_len;
+                    let prefix32: Vec<i32> =
+                        prompt_ids[..matched].iter().map(|&t| t as i32).collect();
+                    // Same epoch the chain captured under: the head stashes the FULL prior sequence in
+                    // the prefix cache under the token vector it broadcast CAPTURE with, so a matched
+                    // prefix of that sequence hashes to the workers' capture epoch. A partial match
+                    // hashes elsewhere ⇒ workers miss ⇒ verdict 0 ⇒ safe cold fallback below.
+                    let epoch = crate::kv_coordination::synth_epoch(&prefix32);
+                    let local_ok = self.runner.restore_kv(&snap).is_ok();
+                    if local_ok && self.forward_restore_downstream(epoch) {
+                        info!(
+                            task = %task.task_id,
+                            warm_prefix = matched,
+                            prompt_len = prompt_ids.len(),
+                            plane_pulled,
+                            "multi-stage warm-resumed"
+                        );
+                        matched
+                    } else {
+                        warn!(task = %task.task_id, "multi-stage restore incomplete; cold reset");
+                        self.runner.reset_kv();
+                        if let Err(e) = self.block_on(send_reset(&downstream)) {
+                            warn!(task = %task.task_id, "cold-fallback send_reset: {e}");
+                            return vec![(
+                                task.task_id.clone(),
+                                Chunk::error(
+                                    task.task_id,
+                                    format!("cold-fallback send_reset: {e}"),
+                                ),
+                            )];
+                        }
+                        0
+                    }
+                }
+                None => 0,
+            }
+        } else {
+            0
+        };
+        #[cfg(not(feature = "kv_coord"))]
+        let warm_prefix: usize = 0;
+
         let result_tokens = if use_spec {
             let k = self.spec_decode_k.unwrap();
             info!(
@@ -1402,7 +1614,13 @@ impl SparseMoEEngine {
                 }
             }
         } else {
-            match self.drive_generation_first(&prompt_ids, max_new, &sampling_cfg, &downstream) {
+            match self.drive_generation_first(
+                &prompt_ids,
+                max_new,
+                &sampling_cfg,
+                &downstream,
+                warm_prefix,
+            ) {
                 Ok(g) => g,
                 Err(e) => {
                     warn!(task = %task.task_id, "rank-0 driver failed: {e}");
@@ -1413,6 +1631,73 @@ impl SparseMoEEngine {
                 }
             }
         };
+
+        // Issue-34 Task 1.3 (§8): capture the full post-turn sequence's KV across the whole chain so
+        // a forced move can warm-resume. The head mints E = synth_epoch(full tokens) and broadcasts
+        // CAPTURE(E, tokens) downstream; each stage snapshots its slice under E and acks back up; the
+        // head's single ack means every stage captured. Then the head seeds its own prefix cache so a
+        // later NEGOTIATE maps the prefix → E. Best-effort: any transport/snapshot error just skips the
+        // cache (warm-pull degrades to cold) and never affects the already-complete served output.
+        #[cfg(feature = "kv_coord")]
+        if self.kv_prefix_cache.enabled() && !result_tokens.is_empty() {
+            let mut full_tokens: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
+            full_tokens.extend(result_tokens.iter().map(|&t| t as i32));
+            let epoch = crate::kv_coordination::synth_epoch(&full_tokens);
+            // Bounded: an older peer that meets CaptureV2 errors WITHOUT acking, and the only
+            // ceiling otherwise is the transport frame-idle default — reached before this turn's
+            // already-complete chunks are returned. Timeout ⇒ capture skipped, turn delivered.
+            let acked = self.block_on(async {
+                match tokio::time::timeout(CAPTURE_ACK_TIMEOUT, async {
+                    send_capture(&downstream, epoch, &full_tokens, &task.tenant)
+                        .await
+                        .map_err(|e| format!("send_capture: {e}"))?;
+                    match recv_kind_client(&downstream).await {
+                        Ok(Some(FrameKind::CaptureAck)) => {
+                            recv_capture_ack_body_client(&downstream)
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| format!("recv_capture_ack: {e}"))
+                        }
+                        Ok(Some(other)) => Err(format!("expected CaptureAck, got {other:?}")),
+                        Ok(None) => Err("downstream closed during capture".into()),
+                        Err(e) => Err(format!("recv_kind (capture): {e}")),
+                    }
+                })
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        // Same hazard recv_token_reply drops the socket for: the peer is
+                        // usually alive and its CaptureAck (no sequence number) lands after
+                        // we stopped waiting — a reused connection hands it to the NEXT
+                        // exchange as its reply.
+                        downstream.lock().await.close().await;
+                        Err(format!(
+                            "capture ack timed out after {CAPTURE_ACK_TIMEOUT:?}; \
+                             connection dropped to avoid reading the late ack as the next \
+                             exchange's reply"
+                        ))
+                    }
+                }
+            });
+            match acked {
+                Ok(()) => {
+                    if let Ok(snap) = self.runner.snapshot_kv() {
+                        let fp = self.runner.fingerprint();
+                        let prompt64: Vec<i64> =
+                            full_tokens.iter().map(|&t| i64::from(t)).collect();
+                        // Mirror into the holder cache so a busy engine still serves this prefix.
+                        self.kv_share
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .prefix
+                            .insert(prompt64.clone(), &fp, snap.clone());
+                        self.kv_prefix_cache.insert(prompt64, &fp, snap);
+                    }
+                }
+                Err(e) => warn!(task = %task.task_id, "kv multi-stage capture skipped: {e}"),
+            }
+        }
 
         let n_tokens = result_tokens.len() as u32;
         let ids_u32: Vec<u32> = result_tokens.iter().map(|&i| i as u32).collect();
@@ -1455,6 +1740,10 @@ impl SparseMoEEngine {
         max_new: usize,
         cfg: &crate::sampling::SamplingConfig,
         downstream: &Arc<TokioMutex<ActivationClient>>,
+        // Issue-34 (§8): count of leading prompt tokens whose KV is already in the chain's restored
+        // caches (same-chain warm-resume). Those tokens are pushed into `history` for the past_seq_len
+        // accounting but NOT forwarded. `0` on every cold path ⇒ the loop below is byte-identical.
+        warm_prefix: usize,
     ) -> Result<Vec<i64>, String> {
         let hidden = self.runner.manifest.hidden_size as usize;
         let eos: Vec<i64> = self
@@ -1471,7 +1760,7 @@ impl SparseMoEEngine {
         // last-rank becomes the first generated token.
         info!(
             prompt_len = prompt_ids.len(),
-            "prefill (token-by-token, distributed)"
+            warm_prefix, "prefill (token-by-token, distributed)"
         );
         // Streamed-prefill sync window: every N intermediate tokens go as a
         // blocking ForwardNoSample (which acks) instead of a one-way
@@ -1482,6 +1771,12 @@ impl SparseMoEEngine {
         const PREFILL_SYNC_EVERY: usize = 256;
         for (i, &t) in prompt_ids.iter().enumerate() {
             history.push(t);
+            if i < warm_prefix {
+                // KV already restored for this token; skip its forward but keep `history` growing so
+                // `forward_one_token_first`'s `past_seq_len` stays correct. The prefix-cache `lookup`
+                // guarantees `warm_prefix < prompt_ids.len()`, so a suffix token always follows.
+                continue;
+            }
             if i + 1 == prompt_ids.len() {
                 // Last prompt token: a sampling Forward; the token it returns
                 // is the first generated token.
@@ -1569,7 +1864,7 @@ impl SparseMoEEngine {
         upstream: &Arc<TokioMutex<ActivationServer>>,
         downstream: Option<Arc<TokioMutex<ActivationClient>>>,
     ) -> Result<(), String> {
-        let (past_seq_len, sampling_cfg, hidden_f32, in_shape) = self
+        let (past_seq_len, sampling_cfg, _push_history, hidden_f32, in_shape) = self
             .block_on(recv_forward_body_server(upstream))
             .map_err(|e| format!("recv_forward(prefill): {e}"))?;
         let hidden = self.runner.manifest.hidden_size as usize;
@@ -1643,6 +1938,8 @@ impl SparseMoEEngine {
                     cfg,
                     &h_after_shells,
                     [1, 1, hidden as u32],
+                    // K2.6 keeps its rep-penalty behaviour: every SAMPLED token is kept.
+                    true,
                 )
                 .await
                 .map_err(|e| format!("send_forward: {e}"))?;
@@ -2029,6 +2326,129 @@ impl SparseMoEEngine {
         }
     }
 
+    /// Issue-34 Task 1.3: snapshot THIS rank's KV slice and stash it under the head-assigned `epoch`
+    /// for a later per-rank `GET`. Best-effort — a snapshot error logs + skips (the turn already
+    /// served; warm-pull just loses this rank → consumer degrades to cold). Bounded by the prefix
+    /// cache capacity; on overflow an arbitrary older capture is evicted.
+    #[cfg(feature = "kv_coord")]
+    fn capture_under_epoch(&mut self, tenant: &str, epoch: u64, tokens: Vec<i32>) {
+        if !self.kv_prefix_cache.enabled() {
+            return;
+        }
+        let snap = match self.runner.snapshot_kv() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    rank = self.rank,
+                    epoch, "kv capture: snapshot_kv failed: {e}"
+                );
+                return;
+            }
+        };
+        let cap = self.kv_prefix_cache.capacity().max(1);
+        while self.kv_capture.len() >= cap && !self.kv_capture.contains_key(&epoch) {
+            let Some(k) = self.kv_capture.keys().next().copied() else {
+                break;
+            };
+            self.kv_capture.remove(&k);
+        }
+        // Mirror into the holder cache, bounded by the SAME `cap` as `kv_capture` above — else the
+        // holder mirror grows one ~GiB snapshot per epoch forever while the engine's map stays bounded.
+        {
+            let mut g = self.kv_share.lock().unwrap_or_else(|e| e.into_inner());
+            while g.captures.len() >= cap && !g.captures.contains_key(&epoch) {
+                let Some(k) = g.captures.keys().next().copied() else {
+                    break;
+                };
+                g.captures.remove(&k);
+            }
+            g.captures
+                .insert(epoch, (tenant.to_string(), tokens.clone(), snap.clone()));
+        }
+        self.kv_capture
+            .insert(epoch, (tenant.to_string(), tokens, snap));
+    }
+
+    /// Relay CAPTURE downstream (preserving the v1/v2 form via `tenant`), await its ack bounded,
+    /// then ack upstream. The bound matters: an older peer that meets CaptureV2 errors WITHOUT
+    /// acking, and an unbounded wait wedges this rank while it holds the downstream lock.
+    #[cfg(feature = "kv_coord")]
+    fn relay_capture_and_ack(
+        &mut self,
+        tenant: &str,
+        epoch: u64,
+        tokens: &[i32],
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+    ) -> Result<(), String> {
+        if let Some(down) = downstream {
+            self.block_on(async {
+                match tokio::time::timeout(CAPTURE_ACK_TIMEOUT, async {
+                    send_capture(down, epoch, tokens, tenant)
+                        .await
+                        .map_err(|e| format!("send_capture: {e}"))?;
+                    match recv_kind_client(down).await {
+                        Ok(Some(FrameKind::CaptureAck)) => recv_capture_ack_body_client(down)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| format!("recv_capture_ack: {e}")),
+                        Ok(Some(other)) => {
+                            Err(format!("expected CaptureAck downstream, got {other:?}"))
+                        }
+                        Ok(None) => Err("downstream closed during capture-ack".into()),
+                        Err(e) => Err(format!("recv_kind (capture-ack): {e}")),
+                    }
+                })
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        // Close on elapse — the late CaptureAck has no sequence number, so a
+                        // reused connection would hand it to the next exchange as its reply.
+                        down.lock().await.close().await;
+                        Err(format!(
+                            "capture relay ack timed out after {CAPTURE_ACK_TIMEOUT:?}; \
+                             connection dropped to avoid reading the late ack as the next \
+                             exchange's reply"
+                        ))
+                    }
+                }
+            })?;
+        }
+        self.block_on(send_capture_ack_upstream(upstream, epoch))
+            .map_err(|e| format!("send_capture_ack: {e}"))
+    }
+
+    /// Issue-34 consume (§8): broadcast `RESTORE(epoch)` down the chain and return the all-or-nothing
+    /// verdict (true ⇒ every downstream rank restored its slice). Used by the head admission trigger
+    /// (`step_first`) and the plane's `apply_warm_resume`. `total <= 1` or no downstream ⇒ nothing to
+    /// restore ⇒ true. Any transport error, a non-`RestoreAck` reply, or a verdict 0 ⇒ false ⇒ the
+    /// caller cold-falls-back (never a partial/corrupt warm).
+    #[cfg(feature = "kv_coord")]
+    pub(crate) fn forward_restore_downstream(&mut self, epoch: u64) -> bool {
+        if self.total <= 1 {
+            return true;
+        }
+        let Some(down) = self.transport.downstream.clone() else {
+            return true;
+        };
+        let verdict = self.block_on(async {
+            send_restore(&down, epoch)
+                .await
+                .map_err(|e| format!("send_restore: {e}"))?;
+            // Bounded + close-on-timeout: RESTORE runs at admission, so an unbounded wait
+            // here stalls every warm-hit request behind a silent downstream.
+            recv_restore_verdict(&down).await
+        });
+        match verdict {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(rank = self.rank, epoch, "restore broadcast failed: {e}");
+                false
+            }
+        }
+    }
+
     fn handle_one_frame(
         &mut self,
         upstream: &Arc<TokioMutex<ActivationServer>>,
@@ -2079,7 +2499,7 @@ impl SparseMoEEngine {
                 // and acks with a dummy Token(-1) — keeps phantom prefill
                 // samples out of the penalty history.
                 let sample = matches!(k, FrameKind::Forward);
-                let (past_seq_len, sampling_cfg, hidden_f32, in_shape) = self
+                let (past_seq_len, sampling_cfg, push_history, hidden_f32, in_shape) = self
                     .block_on(recv_forward_body_server(upstream))
                     .map_err(|e| format!("recv_forward: {e}"))?;
                 let hidden = self.runner.manifest.hidden_size as usize;
@@ -2141,6 +2561,7 @@ impl SparseMoEEngine {
                                 &sampling_cfg,
                                 &h_after,
                                 [1, 1, hidden as u32],
+                                push_history,
                             )
                             .await
                             .map_err(|e| format!("send_forward: {e}"))?;
@@ -2189,6 +2610,106 @@ impl SparseMoEEngine {
             }
             FrameKind::RestorePrefix | FrameKind::CachePrefix => Err(format!(
                 "rank {} received a KV-prefix-cache frame (glm5 pipeline engine only)",
+                self.rank
+            )),
+            // Issue-34 Task 1.3 (§8): snapshot this stage's KV under the head-assigned epoch, propagate
+            // CAPTURE downstream, and ack upstream only after the downstream ack (so the head's single
+            // ack == every stage captured). Best-effort: capture failure degrades the consumer to cold.
+            #[cfg(feature = "kv_coord")]
+            FrameKind::Capture => {
+                let (epoch, tokens) = self
+                    .block_on(recv_capture_body_server(upstream))
+                    .map_err(|e| format!("recv_capture: {e}"))?;
+                self.capture_under_epoch("", epoch, tokens.clone());
+                self.relay_capture_and_ack("", epoch, &tokens, upstream, downstream.as_ref())
+            }
+            // H.1a: CAPTURE carrying the head's turn tenant; the stash entry is tagged so `export`
+            // confines it to that tenant. Relay preserves the v2 form downstream.
+            #[cfg(feature = "kv_coord")]
+            FrameKind::CaptureV2 => {
+                let (epoch, tokens, tenant) = self
+                    .block_on(recv_capture_v2_body_server(upstream))
+                    .map_err(|e| format!("recv_capture_v2: {e}"))?;
+                self.capture_under_epoch(&tenant, epoch, tokens.clone());
+                self.relay_capture_and_ack(&tenant, epoch, &tokens, upstream, downstream.as_ref())
+            }
+            // Issue-34 consume (§8): restore THIS rank's KV from its own CAPTURE stash under `epoch`,
+            // chain RESTORE downstream, then ack upstream with the all-or-nothing verdict (local && down).
+            // Any miss ⇒ verdict 0 ⇒ the head cold-resets the whole chain (never a partial restore).
+            #[cfg(feature = "kv_coord")]
+            FrameKind::Restore => {
+                let epoch = self
+                    .block_on(recv_restore_body_server(upstream))
+                    .map_err(|e| format!("recv_restore: {e}"))?;
+                // Drain the plane mailbox FIRST — never `local_ok || self.drain_kv_handoff()`. A
+                // cross-chain pull parks this rank's slice in the mailbox while the head may ALSO
+                // hold a same-chain capture under the same epoch, so a trailing `||` short-circuits
+                // the drain away: the rank warms from its own stale capture, the pulled slice is
+                // never applied, and the verdict still reads true — a silent hollow warm that
+                // nothing aborts. That exact bug shipped in three OV engines and cost a full cert
+                // cycle (fixed in 07d9bf2 / a8fc4b4).
+                //
+                // Fallback is same-chain: restore from this rank's own capture stash. `.get`+clone
+                // (not remove) — a repeat warm-resume over the same epoch may legitimately restore
+                // again.
+                let local_ok = if self.drain_kv_handoff(epoch) {
+                    true
+                } else {
+                    match self.kv_capture.get(&epoch).cloned() {
+                        Some((_ns, _toks, snap)) => self.runner.restore_kv(&snap).is_ok(),
+                        None => false,
+                    }
+                };
+                // Chain downstream unless we're the last rank. A transport error folds into verdict 0
+                // (all-or-nothing) rather than aborting — the head still gets a definite NAK and cold-runs.
+                let down_ok = if self.is_last() {
+                    true
+                } else if let Some(down) = downstream.as_ref() {
+                    self.block_on(async {
+                        send_restore(down, epoch)
+                            .await
+                            .map_err(|e| format!("send_restore: {e}"))?;
+                        recv_restore_verdict(down).await
+                    })
+                    .unwrap_or_else(|e| {
+                        warn!(
+                            rank = self.rank,
+                            epoch, "downstream restore chain failed: {e}"
+                        );
+                        false
+                    })
+                } else {
+                    false
+                };
+                self.block_on(send_restore_ack_upstream(
+                    upstream,
+                    epoch,
+                    u8::from(local_ok && down_ok),
+                ))
+                .map_err(|e| format!("send_restore_ack: {e}"))?;
+                Ok(())
+            }
+            #[cfg(not(feature = "kv_coord"))]
+            FrameKind::Capture | FrameKind::CaptureV2 => Err(format!(
+                "rank {} received CAPTURE but kv_coord is not built",
+                self.rank
+            )),
+            #[cfg(not(feature = "kv_coord"))]
+            FrameKind::Restore => Err(format!(
+                "rank {} received RESTORE but kv_coord is not built",
+                self.rank
+            )),
+            FrameKind::CaptureAck => Err(format!(
+                "rank {} received unexpected CAPTURE_ACK from upstream",
+                self.rank
+            )),
+            FrameKind::RestoreAck => Err(format!(
+                "rank {} received unexpected RESTORE_ACK from upstream",
+                self.rank
+            )),
+            // Cross-chain carried-slice restore is an OvMoe-only path; K2.6 sparse-moe never emits it.
+            FrameKind::RestoreCarry => Err(format!(
+                "rank {} received RESTORE_CARRY but K2.6 sparse-moe has no carried-slice restore",
                 self.rank
             )),
         }
@@ -2348,6 +2869,38 @@ pub struct OvMoeEngine {
     last_rank_history: Vec<i64>,
     last_rank_rng: u64,
     last_rank_rng_seeded: bool,
+    /// Multi-stage warm-resume (Issue-34 §8): head (rank 0) maps a prompt
+    /// prefix → its own KV snapshot; a hit restores locally and broadcasts
+    /// RESTORE@epoch downstream. Disabled (capacity 0) on single-stage or
+    /// without `kv_coord`. f32-native (`ov_kv_cache`) — the OV-IR KV is
+    /// host-held `f32`, so the snapshot is byte-identical to a cold prefill.
+    kv_prefix_cache: crate::ov_kv_cache::OvMoeKvPrefixCache,
+    /// Worker ranks: `epoch → (prompt tokens, this rank's KV snapshot)`,
+    /// stashed on a CAPTURE frame and restored on a matching RESTORE. Bounded
+    /// by the prefix-cache capacity.
+    #[cfg(feature = "kv_coord")]
+    // Tenant as value, epoch-only key — same rule as SparseMoEEngine::kv_capture ("" = untagged).
+    kv_capture:
+        std::collections::HashMap<u64, (String, Vec<i32>, crate::ov_kv_cache::OvMoeKvSnapshot)>,
+    /// Cross-chain (Issue-34 Option C) head/single-stage NEGOTIATE→GET offers:
+    /// `epoch → (prefix tokens, snapshot)`, short-lived (created on NEGOTIATE, consumed on GET).
+    #[cfg(feature = "kv_coord")]
+    kv_offers: crate::kv_coordination::KvOfferStash<crate::ov_kv_cache::OvMoeKvSnapshot>,
+    /// Holder-side mirror of the prefix/offer/capture caches, served lock-free by
+    /// [`crate::ov_kv_coordination::OvMoeKvHolder`] for cross-chain NEGOTIATE/GET.
+    #[cfg(feature = "kv_coord")]
+    kv_share: crate::ov_kv_coordination::OvSharedHolderCache,
+    /// Issue-34 cross-chain multi-stage: a moved-to head (rank 0) stashes each PULLED downstream
+    /// rank's slice as an opaque blob keyed by content epoch, then ships it inline in `RESTORE_CARRY`
+    /// so the moved-to tail — which has NO local capture for a FOREIGN chain's epoch — applies it.
+    /// One-shot: removed on send. Bounded by the prefix-cache capacity.
+    #[cfg(feature = "kv_coord")]
+    kv_downstream: std::collections::HashMap<u64, Vec<u8>>,
+    /// Issue-34 plane warm-resume: where the node's commit path parks a pulled slice for this rank.
+    /// The commit cannot reach the engine — it usually runs while the engine mutex is held inside
+    /// `step()` — so it only parks bytes here and the recv loop drains them at `RESTORE`.
+    #[cfg(feature = "kv_coord")]
+    kv_handoff_mailbox: std::sync::Arc<cascadia_engine::kv_handoff::KvHandoffMailbox>,
 }
 
 impl OvMoeEngine {
@@ -2358,7 +2911,17 @@ impl OvMoeEngine {
         runtime_handle: tokio::runtime::Handle,
         rank: u32,
         total: u32,
+        kv_prefix_cache: crate::ov_kv_cache::OvMoeKvPrefixCache,
     ) -> Self {
+        // Build the holder mirror before `runner`/`kv_prefix_cache` move into the struct literal
+        // (fingerprint()/capacity() are `&self`).
+        #[cfg(feature = "kv_coord")]
+        let kv_share = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::ov_kv_coordination::OvHolderState::new(
+                kv_prefix_cache.capacity(),
+                runner.fingerprint(),
+            ),
+        ));
         Self {
             runner,
             tokenizer,
@@ -2371,6 +2934,23 @@ impl OvMoeEngine {
             last_rank_history: Vec::new(),
             last_rank_rng: 0,
             last_rank_rng_seeded: false,
+            kv_prefix_cache,
+            #[cfg(feature = "kv_coord")]
+            kv_capture: std::collections::HashMap::new(),
+            #[cfg(feature = "kv_coord")]
+            kv_offers: crate::kv_coordination::KvOfferStash::new(
+                crate::ov_kv_coordination::KV_MAX_OFFERS,
+                crate::ov_kv_coordination::KV_MAX_OFFER_BYTES,
+                crate::ov_kv_cache::OvMoeKvSnapshot::approx_bytes,
+            ),
+            #[cfg(feature = "kv_coord")]
+            kv_share,
+            #[cfg(feature = "kv_coord")]
+            kv_downstream: std::collections::HashMap::new(),
+            #[cfg(feature = "kv_coord")]
+            kv_handoff_mailbox: std::sync::Arc::new(
+                cascadia_engine::kv_handoff::KvHandoffMailbox::new(),
+            ),
         }
     }
 
@@ -2384,12 +2964,51 @@ impl OvMoeEngine {
         self.transport.is_last()
     }
 
+    /// Apply a plane-parked slice, if one is waiting. `true` ⇒ this rank is armed warm from the
+    /// plane, which is what makes its `RESTORE` verdict truthful in plane mode.
+    ///
+    /// MUST run BEFORE the local capture branch, never as `local_ok || drain()` — see
+    /// `handle_restore` for why that shape silently produces a hollow warm.
+    #[cfg(feature = "kv_coord")]
+    fn drain_kv_handoff(&mut self, expected_epoch: u64) -> bool {
+        // PLANE-level fp, matching this engine's `KvCoordination::model_fingerprint` and its holder:
+        // a cross-chain pull asserts the moved-to head's single fp for every rank, so validating a
+        // parked slice against the per-stage `digest()` would reject every pull this rank receives.
+        let model_fp = self.runner.fingerprint().plane_digest();
+        let position = self.runner.kv_past_seq_len();
+        let mailbox = std::sync::Arc::clone(&self.kv_handoff_mailbox);
+        let runner = &mut self.runner;
+        crate::ov_kv_coordination::ov_drain_handoff(
+            &mailbox,
+            model_fp,
+            position,
+            expected_epoch,
+            |snap| runner.restore_kv(snap).is_ok(),
+        )
+    }
+
     /// Single-stage path: tokenize, run the whole model, decode.
+    /// H.1b R2: file this turn's LOCAL capture under the task's tenant, on both the engine cache
+    /// and the holder mirror (either can be the one a later NEGOTIATE reads). Seeded from
+    /// `GenerationTask.tenant` at admission — never from a plane-asserted partner, which describes
+    /// a pulled entry rather than the turn being run. Inert while nothing names a tenant.
+    #[cfg(feature = "kv_coord")]
+    fn kv_set_turn_tenant(&mut self, tenant: &str) {
+        self.kv_prefix_cache.set_local_ns(tenant);
+        self.kv_share
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prefix
+            .set_local_ns(tenant);
+    }
+
     fn step_single_stage(&mut self) -> Vec<(TaskId, Chunk)> {
         let task = match self.pending.pop_front() {
             Some(t) => t,
             None => return Vec::new(),
         };
+        #[cfg(feature = "kv_coord")]
+        self.kv_set_turn_tenant(&task.tenant);
         let Some(tok) = self.tokenizer.as_ref() else {
             warn!(task = %task.task_id, "MiniMax-M2 engine has no tokenizer");
             let e = Chunk::error(task.task_id.clone(), "engine has no tokenizer".to_string());
@@ -2408,16 +3027,39 @@ impl OvMoeEngine {
         };
         let max_new = task.max_tokens.max(1) as usize;
         let sampling_cfg = sampling_from_task(&task);
-        let generated = match self.runner.generate(&prompt_ids, max_new, &sampling_cfg) {
-            Ok(g) => g,
-            Err(e) => {
-                warn!(task = %task.task_id, "MiniMax-M2 generate failed: {e}");
-                return vec![(
-                    task.task_id.clone(),
-                    Chunk::error(task.task_id, format!("MiniMax-M2 generate failed: {e}")),
-                )];
-            }
-        };
+        // Warm-resume + capture via the prefix cache (Issue-34 Phase 2). Disabled cache ⇒
+        // byte-identical to a plain `generate`. On a fresh prompt, `_cached` is the prompt's KV
+        // snapshot — mirror it into the lock-free holder so a cross-chain GET can serve this prefix.
+        let cache_opt: Option<&mut crate::ov_kv_cache::OvMoeKvPrefixCache> =
+            if self.kv_prefix_cache.enabled() {
+                Some(&mut self.kv_prefix_cache)
+            } else {
+                None
+            };
+        let (generated, _cached) =
+            match self
+                .runner
+                .generate_with_cache(&prompt_ids, max_new, &sampling_cfg, cache_opt)
+            {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!(task = %task.task_id, "MiniMax-M2 generate failed: {e}");
+                    return vec![(
+                        task.task_id.clone(),
+                        Chunk::error(task.task_id, format!("MiniMax-M2 generate failed: {e}")),
+                    )];
+                }
+            };
+        #[cfg(feature = "kv_coord")]
+        if let Some(snap) = _cached {
+            let fp = self.runner.fingerprint();
+            let prompt64: Vec<i64> = prompt_ids.iter().map(|&t| i64::from(t)).collect();
+            self.kv_share
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .prefix
+                .insert(prompt64, &fp, snap);
+        }
         let n_tokens = generated.len() as u32;
         let text = tok.decode(&generated, true).unwrap_or_default();
         let elapsed = started.elapsed().as_secs_f64();
@@ -2458,7 +3100,7 @@ impl OvMoeEngine {
         let h = self.runner.hidden_size() as u32;
         self.block_on(async {
             if sample_back {
-                send_forward(downstream, pos as u32, cfg, &hidden, [1, 1, h])
+                send_forward(downstream, pos as u32, cfg, &hidden, [1, 1, h], true)
                     .await
                     .map_err(|e| format!("send_forward: {e}"))?;
             } else {
@@ -2484,6 +3126,8 @@ impl OvMoeEngine {
             Some(t) => t,
             None => return Vec::new(),
         };
+        #[cfg(feature = "kv_coord")]
+        self.kv_set_turn_tenant(&task.tenant);
         let id = task.task_id.clone();
         let Some(downstream) = self.transport.downstream.clone() else {
             warn!(task = %id, "rank 0 has no downstream; cannot drive pipeline");
@@ -2524,15 +3168,67 @@ impl OvMoeEngine {
             return vec![(id.clone(), Chunk::error(id, format!("reset: {e}")))];
         }
 
-        // Prefill: feed every prompt token. The sample produced after the
-        // LAST prompt token is the first generated token — matching
-        // `OvMoeRunner::generate_timed`. Intermediate steps go as
-        // ForwardNoSample so their discarded tokens never enter the last
-        // rank's penalty history (see FrameKind::ForwardNoSample).
-        let mut pos = 0usize;
+        // Issue-34 consume (§8): same-chain warm-resume. On a kv-prefix-cache hit, restore the head's
+        // rank-0 slice and RESTORE the whole downstream chain (all-or-nothing); on success skip
+        // re-prefilling the matched prefix (`warm_prefix`). Any rank short ⇒ cold-reset local +
+        // downstream and cold-run. Runs after the admission RESET, before prefill. Inert unless
+        // kv_coord + cache enabled + a hit; `warm_prefix == 0` leaves prefill byte-identical to cold.
+        #[cfg(feature = "kv_coord")]
+        let warm_prefix: usize = if self.kv_prefix_cache.enabled() {
+            let prompt64: Vec<i64> = prompt_ids.iter().map(|&t| i64::from(t)).collect();
+            let fp = self.runner.fingerprint();
+            match self.kv_prefix_cache.lookup_local(&prompt64, &fp) {
+                Some((snap, plane_pulled)) => {
+                    let matched = snap.past_seq_len;
+                    // The workers stashed their slices under E = synth_epoch(the captured token
+                    // vector), and that captured vector is exactly this matched prefix (capture keys
+                    // on `full_tokens[..past_seq_len]`, see below). So the matched prefix hashes to
+                    // the workers' capture epoch; a partial/other match hashes elsewhere ⇒ verdict 0.
+                    let prefix32: Vec<i32> =
+                        prompt_ids[..matched].iter().map(|&t| t as i32).collect();
+                    let epoch = crate::kv_coordination::synth_epoch(&prefix32);
+                    let local_ok = self.runner.restore_kv(&snap).is_ok();
+                    if local_ok && self.forward_restore_downstream(epoch) {
+                        info!(
+                            task = %id,
+                            warm_prefix = matched,
+                            prompt_len = prompt_ids.len(),
+                            plane_pulled,
+                            "multi-stage warm-resumed"
+                        );
+                        matched
+                    } else {
+                        warn!(task = %id, "multi-stage restore incomplete; cold reset");
+                        self.runner.reset();
+                        if let Err(e) = self.block_on(send_reset(&downstream)) {
+                            warn!(task = %id, "cold-fallback send_reset: {e}");
+                            return vec![(
+                                id.clone(),
+                                Chunk::error(id, format!("cold-fallback send_reset: {e}")),
+                            )];
+                        }
+                        0
+                    }
+                }
+                None => 0,
+            }
+        } else {
+            0
+        };
+        #[cfg(not(feature = "kv_coord"))]
+        let warm_prefix: usize = 0;
+
+        // Prefill: feed every prompt token past the warm-resumed prefix. The
+        // sample produced after the LAST prompt token is the first generated
+        // token — matching `OvMoeRunner::generate_timed`. Intermediate steps go
+        // as ForwardNoSample so their discarded tokens never enter the last
+        // rank's penalty history (see FrameKind::ForwardNoSample). The cache
+        // lookup guarantees `warm_prefix < prompt_ids.len()`, so a suffix token
+        // always follows.
+        let mut pos = warm_prefix;
         let mut next: i64 = -1;
         let n_prompt = prompt_ids.len();
-        for (i, &t) in prompt_ids.iter().enumerate() {
+        for (i, &t) in prompt_ids.iter().enumerate().skip(warm_prefix) {
             let sample_back = i + 1 == n_prompt;
             match self.forward_one_token_first(t, pos, &cfg, &downstream, sample_back) {
                 Ok(tok_back) => next = tok_back,
@@ -2563,6 +3259,92 @@ impl OvMoeEngine {
             pos += 1;
         }
 
+        // Issue-34 §8: capture the post-turn KV across the whole chain so a later request extending
+        // this sequence can warm-resume. Snapshot the head's slice FIRST to learn the true KV depth —
+        // the final sampled token is never fed, so depth == (prompt + generated) - 1 — and key the
+        // capture epoch + prefix cache on exactly `full_tokens[..depth]`, so the workers' capture epoch
+        // and a future restore epoch agree (avoids the off-by-one that would silently NAK every warm
+        // resume). The head mints E = synth_epoch(captured), broadcasts CAPTURE(E, captured); each stage
+        // snapshots its slice under E and acks up; the head's single ack ⇒ every stage captured. Then
+        // seed the head's prefix cache. Best-effort: any error skips the cache (warm-pull degrades to
+        // cold) and never touches the already-served output.
+        #[cfg(feature = "kv_coord")]
+        if self.kv_prefix_cache.enabled() && !generated.is_empty() {
+            match self.runner.snapshot_kv() {
+                Ok(snap) => {
+                    let depth = snap.past_seq_len;
+                    let mut full_tokens: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
+                    full_tokens.extend(generated.iter().map(|&t| t as i32));
+                    tracing::debug!(target: "cascadia::kv", event = "ovmoe_ms_capture_attempt",
+                        depth, full_len = full_tokens.len(), gen = generated.len(),
+                        in_range = (depth >= 1 && depth <= full_tokens.len()));
+                    if depth >= 1 && depth <= full_tokens.len() {
+                        let captured: Vec<i32> = full_tokens[..depth].to_vec();
+                        let epoch = crate::kv_coordination::synth_epoch(&captured);
+                        // Bounded ack — same rationale as the SparseMoE head site: an older
+                        // peer errors on CaptureV2 without acking; never withhold the turn.
+                        let acked = self.block_on(async {
+                            match tokio::time::timeout(CAPTURE_ACK_TIMEOUT, async {
+                                send_capture(&downstream, epoch, &captured, &task.tenant)
+                                    .await
+                                    .map_err(|e| format!("send_capture: {e}"))?;
+                                match recv_kind_client(&downstream).await {
+                                    Ok(Some(FrameKind::CaptureAck)) => {
+                                        recv_capture_ack_body_client(&downstream)
+                                            .await
+                                            .map(|_| ())
+                                            .map_err(|e| format!("recv_capture_ack: {e}"))
+                                    }
+                                    Ok(Some(other)) => {
+                                        Err(format!("expected CaptureAck, got {other:?}"))
+                                    }
+                                    Ok(None) => Err("downstream closed during capture".into()),
+                                    Err(e) => Err(format!("recv_kind (capture): {e}")),
+                                }
+                            })
+                            .await
+                            {
+                                Ok(r) => r,
+                                Err(_) => {
+                                    // Close on elapse — the late CaptureAck has no sequence
+                                    // number, so a reused connection would hand it to the
+                                    // next exchange as its reply.
+                                    downstream.lock().await.close().await;
+                                    Err(format!(
+                                        "capture ack timed out after {CAPTURE_ACK_TIMEOUT:?}; \
+                                         connection dropped to avoid reading the late ack as \
+                                         the next exchange's reply"
+                                    ))
+                                }
+                            }
+                        });
+                        match acked {
+                            Ok(()) => {
+                                let fp = self.runner.fingerprint();
+                                let captured64: Vec<i64> =
+                                    captured.iter().map(|&t| i64::from(t)).collect();
+                                // Mirror into the holder cache (kv_share) so an ejected/busy engine
+                                // still serves this prefix over the cross-chain KV plane — matches the
+                                // single-stage path + SparseMoEEngine. Without it the holder is empty
+                                // and every cross-chain NEGOTIATE misses (warm-pull degrades to cold).
+                                self.kv_share
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .prefix
+                                    .insert(captured64.clone(), &fp, snap.clone());
+                                tracing::debug!(target: "cascadia::kv", event = "ovmoe_ms_holder_mirror",
+                                    captured_len = captured64.len(),
+                                    "mirrored multi-stage capture into holder");
+                                self.kv_prefix_cache.insert(captured64, &fp, snap);
+                            }
+                            Err(e) => warn!(task = %id, "kv multi-stage capture skipped: {e}"),
+                        }
+                    }
+                }
+                Err(e) => warn!(task = %id, "kv capture: snapshot_kv failed: {e}"),
+            }
+        }
+
         let n_tokens = generated.len() as u32;
         let text = self
             .tokenizer
@@ -2583,6 +3365,263 @@ impl OvMoeEngine {
         chunk.n_tokens = Some(n_tokens);
         chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
         vec![(id, chunk)]
+    }
+
+    /// Snapshot this rank's KV under `epoch` for a later RESTORE. Bounded by the prefix-cache
+    /// capacity; on overflow an arbitrary older capture is evicted. Best-effort — a snapshot failure
+    /// just skips it (that rank's warm-pull degrades to cold).
+    #[cfg(feature = "kv_coord")]
+    fn capture_under_epoch(&mut self, tenant: &str, epoch: u64, tokens: Vec<i32>) {
+        if !self.kv_prefix_cache.enabled() {
+            return;
+        }
+        let snap = match self.runner.snapshot_kv() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    rank = self.rank,
+                    epoch, "kv capture: snapshot_kv failed: {e}"
+                );
+                return;
+            }
+        };
+        let cap = self.kv_prefix_cache.capacity().max(1);
+        while self.kv_capture.len() >= cap && !self.kv_capture.contains_key(&epoch) {
+            let Some(k) = self.kv_capture.keys().next().copied() else {
+                break;
+            };
+            self.kv_capture.remove(&k);
+        }
+        // Mirror into the holder cache (epoch-keyed) so a cross-chain GET for THIS rank's slice
+        // resolves — the moved-to head fetches each downstream rank by epoch. Matches
+        // SparseMoEEngine; bounded by the same cap so the mirror can't grow unbounded.
+        {
+            let mut g = self.kv_share.lock().unwrap_or_else(|e| e.into_inner());
+            while g.captures.len() >= cap && !g.captures.contains_key(&epoch) {
+                let Some(k) = g.captures.keys().next().copied() else {
+                    break;
+                };
+                g.captures.remove(&k);
+            }
+            g.captures
+                .insert(epoch, (tenant.to_string(), tokens.clone(), snap.clone()));
+        }
+        tracing::info!(target: "cascadia::kv", event = "ovmoe_tail_capture_mirror",
+            rank = self.rank, epoch, "mirrored tail capture into holder");
+        self.kv_capture
+            .insert(epoch, (tenant.to_string(), tokens, snap));
+    }
+
+    /// Broadcast RESTORE(epoch) down the chain; return the all-or-nothing verdict (true ⇒ every
+    /// downstream rank restored its slice). `total <= 1` or no downstream ⇒ true. Any transport error,
+    /// a non-`RestoreAck` reply, or verdict 0 ⇒ false ⇒ the caller cold-falls-back (never a partial
+    /// warm). Used by the head admission trigger in `step_first`. Cross-chain: if this rank stashed a
+    /// pulled downstream slice under `epoch` (`stash_downstream_rank`), ship it INLINE via RESTORE_CARRY
+    /// (the moved-to tail has no local capture for a foreign chain's epoch); else a bare RESTORE
+    /// (same-chain, byte-identical to before).
+    #[cfg(feature = "kv_coord")]
+    fn forward_restore_downstream(&mut self, epoch: u64) -> bool {
+        if self.total <= 1 {
+            return true;
+        }
+        let Some(down) = self.transport.downstream.clone() else {
+            return true;
+        };
+        // One-shot: take the carried blob (if any) before the async send.
+        let carried = self.kv_downstream.remove(&epoch);
+        // Whether a downstream slice is riding along is the difference between a warm tail and a
+        // cold one, and every site that could drop it was previously silent — a bare RESTORE and a
+        // never-stashed slice look identical from the logs.
+        tracing::info!(target: "cascadia::kv", event = "kv_carry_send", epoch,
+            carried = carried.is_some(), bytes = carried.as_ref().map_or(0, |b| b.len()),
+            stashed_epochs = self.kv_downstream.len());
+        let verdict = self.block_on(async {
+            match &carried {
+                Some(blob) if blob.len() <= crate::dist::MAX_RESTORE_BLOB_BYTES as usize => {
+                    send_restore_carry(&down, epoch, blob)
+                        .await
+                        .map_err(|e| format!("send_restore_carry: {e}"))?
+                }
+                // None, or an oversized blob (guards the u32 len field + the peer's recv alloc) ⇒ bare
+                // RESTORE ⇒ the moved-to tail misses the foreign epoch ⇒ deliberate clean cold.
+                _ => send_restore(&down, epoch)
+                    .await
+                    .map_err(|e| format!("send_restore: {e}"))?,
+            }
+            // Bounded + close-on-timeout: RESTORE runs at admission, so an unbounded wait
+            // here stalls every warm-hit request behind a silent downstream.
+            recv_restore_verdict(&down).await
+        });
+        match verdict {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(rank = self.rank, epoch, "restore broadcast failed: {e}");
+                false
+            }
+        }
+    }
+
+    /// Worker CAPTURE handler: snapshot this stage's KV under the head-assigned `epoch`, relay CAPTURE
+    /// downstream (awaiting its ack), then ack upstream — so the head's single ack means every stage
+    /// captured.
+    #[cfg(feature = "kv_coord")]
+    fn handle_capture(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+        v2: bool,
+    ) -> Result<(), String> {
+        // v2 carries the head's turn tenant so this rank can tag its stash (H.1a); v1 stays
+        // untagged (""). Relay preserves the form it received.
+        let (epoch, tokens, tenant) = if v2 {
+            self.block_on(recv_capture_v2_body_server(upstream))
+                .map_err(|e| format!("recv_capture_v2: {e}"))?
+        } else {
+            let (epoch, tokens) = self
+                .block_on(recv_capture_body_server(upstream))
+                .map_err(|e| format!("recv_capture: {e}"))?;
+            (epoch, tokens, String::new())
+        };
+        self.capture_under_epoch(&tenant, epoch, tokens.clone());
+        if let Some(down) = downstream {
+            self.block_on(async {
+                // Bounded — an older peer that meets CaptureV2 errors WITHOUT acking, and an
+                // unbounded wait wedges this rank while it holds the downstream lock.
+                match tokio::time::timeout(CAPTURE_ACK_TIMEOUT, async {
+                    send_capture(down, epoch, &tokens, &tenant)
+                        .await
+                        .map_err(|e| format!("send_capture: {e}"))?;
+                    match recv_kind_client(down).await {
+                        Ok(Some(FrameKind::CaptureAck)) => recv_capture_ack_body_client(down)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| format!("recv_capture_ack: {e}")),
+                        Ok(Some(other)) => {
+                            Err(format!("expected CaptureAck downstream, got {other:?}"))
+                        }
+                        Ok(None) => Err("downstream closed during capture-ack".into()),
+                        Err(e) => Err(format!("recv_kind (capture-ack): {e}")),
+                    }
+                })
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        // Close on elapse — the late CaptureAck has no sequence number, so a
+                        // reused connection would hand it to the next exchange as its reply.
+                        down.lock().await.close().await;
+                        Err(format!(
+                            "capture relay ack timed out after {CAPTURE_ACK_TIMEOUT:?}; \
+                             connection dropped to avoid reading the late ack as the next \
+                             exchange's reply"
+                        ))
+                    }
+                }
+            })?;
+        }
+        self.block_on(send_capture_ack_upstream(upstream, epoch))
+            .map_err(|e| format!("send_capture_ack: {e}"))
+    }
+
+    /// Worker RESTORE handler: restore THIS rank's KV from its own capture stash under `epoch`, chain
+    /// RESTORE downstream, then ack upstream with the all-or-nothing verdict (local && downstream). Any
+    /// miss ⇒ verdict 0 ⇒ the head cold-resets the whole chain (never a partial restore).
+    #[cfg(feature = "kv_coord")]
+    fn handle_restore(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+    ) -> Result<(), String> {
+        let epoch = self
+            .block_on(recv_restore_body_server(upstream))
+            .map_err(|e| format!("recv_restore: {e}"))?;
+        // Drain the plane mailbox FIRST — never `local_ok || self.drain_kv_handoff()`. A cross-chain
+        // pull parks this rank's slice in the mailbox while a same-epoch local capture may also
+        // exist, so a trailing `||` short-circuits the drain away: the rank warms from its own stale
+        // capture, the pulled slice is never applied, and the verdict still reads true — a silent
+        // hollow warm that nothing aborts (07d9bf2 / a8fc4b4).
+        //
+        // Fallback is same-chain. `.get`+clone (not remove) — a repeat warm-resume over the same
+        // epoch may restore again.
+        let local_ok = if self.drain_kv_handoff(epoch) {
+            true
+        } else {
+            match self.kv_capture.get(&epoch).cloned() {
+                Some((_ns, _toks, snap)) => self.runner.restore_kv(&snap).is_ok(),
+                None => false,
+            }
+        };
+        let down_ok = if self.is_last() {
+            true
+        } else if let Some(down) = downstream {
+            self.block_on(async {
+                send_restore(down, epoch)
+                    .await
+                    .map_err(|e| format!("send_restore: {e}"))?;
+                recv_restore_verdict(down).await
+            })
+            .unwrap_or_else(|e| {
+                warn!(
+                    rank = self.rank,
+                    epoch, "downstream restore chain failed: {e}"
+                );
+                false
+            })
+        } else {
+            false
+        };
+        self.block_on(send_restore_ack_upstream(
+            upstream,
+            epoch,
+            u8::from(local_ok && down_ok),
+        ))
+        .map_err(|e| format!("send_restore_ack: {e}"))
+    }
+
+    /// Cross-chain worker RESTORE handler: the moved-to head shipped THIS rank's pulled slice inline
+    /// (the tail has no local capture for a foreign chain's epoch). Decode + restore, chain downstream
+    /// for 3+ stages (bare RESTORE — those ranks carry their own slice; 2-stage never hits this), then
+    /// ack the all-or-nothing verdict upstream.
+    #[cfg(feature = "kv_coord")]
+    fn handle_restore_carry(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+    ) -> Result<(), String> {
+        let (epoch, blob) = self
+            .block_on(recv_restore_carry_body_server(upstream))
+            .map_err(|e| format!("recv_restore_carry: {e}"))?;
+        let local_ok = match crate::ov_kv_coordination::ov_blob_decode(&blob) {
+            Some(snap) => self.runner.restore_kv(&snap).is_ok(),
+            None => false,
+        };
+        tracing::info!(target: "cascadia::kv", event = "ovmoe_tail_restore_carried",
+            rank = self.rank, epoch, ok = local_ok, blob_len = blob.len());
+        let down_ok = if self.is_last() {
+            true
+        } else if let Some(down) = downstream {
+            self.block_on(async {
+                send_restore(down, epoch)
+                    .await
+                    .map_err(|e| format!("send_restore: {e}"))?;
+                recv_restore_verdict(down).await
+            })
+            .unwrap_or_else(|e| {
+                warn!(
+                    rank = self.rank,
+                    epoch, "downstream restore chain failed: {e}"
+                );
+                false
+            })
+        } else {
+            false
+        };
+        self.block_on(send_restore_ack_upstream(
+            upstream,
+            epoch,
+            u8::from(local_ok && down_ok),
+        ))
+        .map_err(|e| format!("send_restore_ack: {e}"))
     }
 
     /// Worker rank (rank > 0): service one frame from upstream per call.
@@ -2625,6 +3664,18 @@ impl OvMoeEngine {
             FrameKind::ForwardNoSample => {
                 self.handle_forward(&upstream, downstream.as_ref(), false)
             }
+            // Issue-34 §8: multi-stage capture/restore. CAPTURE snapshots this stage's KV under the
+            // head-assigned epoch and relays downstream; RESTORE restores it from the local stash and
+            // acks the all-or-nothing verdict upstream. Reuses the engine-agnostic `dist` codec (the
+            // frame carries only the epoch + token vector — KV bytes stay per-rank).
+            #[cfg(feature = "kv_coord")]
+            FrameKind::Capture => self.handle_capture(&upstream, downstream.as_ref(), false),
+            #[cfg(feature = "kv_coord")]
+            FrameKind::CaptureV2 => self.handle_capture(&upstream, downstream.as_ref(), true),
+            #[cfg(feature = "kv_coord")]
+            FrameKind::Restore => self.handle_restore(&upstream, downstream.as_ref()),
+            #[cfg(feature = "kv_coord")]
+            FrameKind::RestoreCarry => self.handle_restore_carry(&upstream, downstream.as_ref()),
             other => Err(format!(
                 "worker received unsupported frame {other:?} (MiniMax-M2 has no spec-decode batching)"
             )),
@@ -2648,7 +3699,7 @@ impl OvMoeEngine {
         downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
         sample: bool,
     ) -> Result<(), String> {
-        let (past_seq_len, sampling_cfg, hidden_f32, _shape) = self
+        let (past_seq_len, sampling_cfg, push_history, hidden_f32, _shape) = self
             .block_on(recv_forward_body_server(upstream))
             .map_err(|e| format!("recv_forward_body: {e}"))?;
         let pos = past_seq_len as usize;
@@ -2670,13 +3721,35 @@ impl OvMoeEngine {
                 self.last_rank_rng = crate::sampling::init_rng(sampling_cfg.seed);
                 self.last_rank_rng_seeded = true;
             }
-            let token = crate::sampling::sample(
-                &logits,
-                &self.last_rank_history,
-                &sampling_cfg,
-                &mut self.last_rank_rng,
-            );
-            self.last_rank_history.push(token);
+            // A DISCARDED prefill sample must not advance the RNG. `sample` draws one uniform per
+            // call when temperature > 0, and a warm-resumed run skips `warm_prefix` of these
+            // forwards — so drawing here left the warm run's RNG at a different offset and made
+            // warm != cold for every temperature > 0 request (invisible to the greedy cert). The
+            // head throws these tokens away, so take the deterministic argmax via a temperature-0
+            // config, which returns before touching the RNG.
+            let token = if push_history {
+                crate::sampling::sample(
+                    &logits,
+                    &self.last_rank_history,
+                    &sampling_cfg,
+                    &mut self.last_rank_rng,
+                )
+            } else {
+                let mut discard_cfg = sampling_cfg.clone();
+                discard_cfg.temperature = 0.0;
+                crate::sampling::sample(
+                    &logits,
+                    &self.last_rank_history,
+                    &discard_cfg,
+                    &mut self.last_rank_rng,
+                )
+            };
+            // Only kept (generated) tokens enter the rep-penalty history — discarded prefill samples
+            // do not. Keeps the window generated-only (matching single-stage) so a warm-resumed run,
+            // which skips the prefill forwards, is byte-identical to a cold one.
+            if push_history {
+                self.last_rank_history.push(token);
+            }
             self.block_on(send_token_upstream(upstream, token))
                 .map_err(|e| format!("send_token: {e}"))?;
             Ok(())
@@ -2685,9 +3758,16 @@ impl OvMoeEngine {
             let h = self.runner.hidden_size() as u32;
             self.block_on(async {
                 if sample {
-                    send_forward(down, past_seq_len, &sampling_cfg, &hidden, [1, 1, h])
-                        .await
-                        .map_err(|e| format!("send_forward: {e}"))?;
+                    send_forward(
+                        down,
+                        past_seq_len,
+                        &sampling_cfg,
+                        &hidden,
+                        [1, 1, h],
+                        push_history,
+                    )
+                    .await
+                    .map_err(|e| format!("send_forward: {e}"))?;
                 } else {
                     send_forward_nosample(down, past_seq_len, &sampling_cfg, &hidden, [1, 1, h])
                         .await
@@ -2765,6 +3845,218 @@ impl Engine for OvMoeEngine {
         } else {
             self.step_worker()
         })
+    }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
+        Some(self)
+    }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_holder(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvSnapshotHolder>> {
+        Some(std::sync::Arc::new(
+            crate::ov_kv_coordination::OvMoeKvHolder {
+                cache: std::sync::Arc::clone(&self.kv_share),
+                // Plane-level fp (model-identity only): a cross-chain pull asserts the moved-to head's fp
+                // for EVERY rank's GET, so this tail holder must match despite its per-stage layer span.
+                model_fp: self.runner.fingerprint().plane_digest(),
+            },
+        ))
+    }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_handoff(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>> {
+        Some(std::sync::Arc::clone(&self.kv_handoff_mailbox)
+            as std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>)
+    }
+}
+
+/// Cross-chain (Issue-34 Option C) warm-pull for OvMoe: NEGOTIATE→GET→insert, mirroring
+/// `SparseMoEEngine` but over the OPAQUE f32 wire (see `ov_kv_coordination`).
+#[cfg(feature = "kv_coord")]
+impl cascadia_engine::KvCoordination for OvMoeEngine {
+    fn model_fingerprint(&self) -> u64 {
+        // Plane-level (model-identity only) so a moved-to head's single asserted fp matches EVERY
+        // prior-chain rank's holder/export (each rank has a different per-stage layer span).
+        self.runner.fingerprint().plane_digest()
+    }
+
+    fn layout_version(&self) -> u16 {
+        cascadia_kv_wire::OPAQUE_KV_LAYOUT
+    }
+
+    fn engine_rev(&self) -> u64 {
+        crate::ov_kv_coordination::KV_ENGINE_REV
+    }
+
+    fn tokenize(&self, text: &str) -> Option<Vec<i32>> {
+        let enc = self.tokenizer.as_ref()?.encode(text, true).ok()?;
+        Some(enc.get_ids().iter().map(|&u| u as i32).collect())
+    }
+
+    fn lookup(&mut self, partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
+        if !self.kv_prefix_cache.enabled() {
+            return None;
+        }
+        let fp = self.runner.fingerprint();
+        let prompt: Vec<i64> = token_ids.iter().map(|&t| i64::from(t)).collect();
+        // Namespaced (issue-34 H.1a): a cross-tenant NEGOTIATE reads as an empty cache, not a
+        // truncated length — see `OvMoeKvPrefixCache::lookup_ns`.
+        let (snap, _) = self.kv_prefix_cache.lookup_ns(partner, &prompt, &fp)?;
+        let len = snap.past_seq_len;
+        let prefix = token_ids.get(..len)?.to_vec();
+        let epoch = crate::kv_coordination::synth_epoch(&prefix);
+        self.kv_offers.stash(partner, epoch, prefix, snap);
+        Some((epoch, len as u32))
+    }
+
+    fn export(
+        &mut self,
+        partner: &str,
+        expected_epoch: u64,
+        expected_len: u32,
+    ) -> Option<(cascadia_kv_wire::Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
+        // Plane-level fp so a cross-chain consumer validating against the moved-to head's fp accepts
+        // this (differently-sliced) rank's manifest.
+        let model_fp = self.runner.fingerprint().plane_digest();
+        let (prefix, snap) = if let Some(off) = self.kv_offers.take(partner, expected_epoch) {
+            off
+        } else if let Some((cap_ns, tokens, snap)) = self.kv_capture.get(&expected_epoch) {
+            // Tagged captures are confined to their tenant; untagged ("" — legacy v1 frames and
+            // tenant-less turns) serve any partner, keeping the certified cross-chain pull
+            // unchanged. See `SparseMoEEngine::export`.
+            if !cap_ns.is_empty() && cap_ns != partner {
+                tracing::info!(target: "cascadia::kv", event = "kv_serve_ns_mismatch",
+                    epoch = expected_epoch);
+                return None;
+            }
+            (tokens.clone(), snap.clone())
+        } else {
+            return None;
+        };
+        if snap.past_seq_len as u32 != expected_len {
+            return None;
+        }
+        Some(crate::ov_kv_coordination::ov_snapshot_to_wire(
+            &prefix,
+            &snap,
+            partner,
+            model_fp,
+            expected_epoch,
+        ))
+    }
+
+    fn insert(
+        &mut self,
+        partner: &str,
+        manifest: &cascadia_kv_wire::Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
+        let snap = crate::ov_kv_coordination::ov_wire_to_snapshot(manifest, payloads).ok_or(())?;
+        // Stage under the CONTENT EPOCH too. `apply_warm_resume` — the plane's commit — reads
+        // `kv_capture[epoch]`, but this only wrote the prefix cache (keyed by tokens), so a plane
+        // consumer-insert staged a slice the commit could never find and EVERY plane warm-resume
+        // silently voted cold. Done before the `enabled()` early-return: the plane path needs the
+        // staging even where the prefix cache is off (sharded/total>1). Bounded by the same cap as
+        // `capture_under_epoch` so staging cannot grow unbounded.
+        {
+            let epoch = crate::kv_coordination::synth_epoch(&manifest.token_ids);
+            let cap = self.kv_prefix_cache.capacity().max(1);
+            while self.kv_capture.len() >= cap && !self.kv_capture.contains_key(&epoch) {
+                let Some(k) = self.kv_capture.keys().next().copied() else {
+                    break;
+                };
+                self.kv_capture.remove(&k);
+            }
+            // Tagged with the ASSERTED partner, never `manifest.partner` — see
+            // `SparseMoEEngine::insert` for the full rationale (§12.10.0a).
+            self.kv_capture.insert(
+                epoch,
+                (
+                    partner.to_string(),
+                    manifest.token_ids.clone(),
+                    snap.clone(),
+                ),
+            );
+        }
+        if !self.kv_prefix_cache.enabled() {
+            return Ok(());
+        }
+        let fp = self.runner.fingerprint();
+        let prefix: Vec<i64> = manifest.token_ids.iter().map(|&t| i64::from(t)).collect();
+        // Mirror into the holder cache so a busy engine still serves this prefix lock-free. Tagged
+        // with the ASSERTED partner (H.1b §12.10.0a) — never manifest.partner, which the serving
+        // holder stamps and nothing validates.
+        self.kv_share
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prefix
+            .insert_pulled(partner, prefix.clone(), &fp, snap.clone());
+        self.kv_prefix_cache
+            .insert_pulled(partner, prefix, &fp, snap);
+        Ok(())
+    }
+
+    fn stash_downstream_rank(
+        &mut self,
+        _rank: u16,
+        manifest: &cascadia_kv_wire::Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
+        // Issue-34 cross-chain multi-stage: a DOWNSTREAM rank's pulled slice can't be applied on this
+        // (head) rank locally; stash it under the content epoch so `forward_restore_downstream` ships it
+        // inline via RESTORE_CARRY. Decode eagerly so a corrupt pull votes fail here (not mid-restore).
+        let Some(snap) = crate::ov_kv_coordination::ov_wire_to_snapshot(manifest, payloads) else {
+            tracing::warn!(target: "cascadia::kv", event = "kv_carry_stash_rejected",
+                reason = "decode", rank = _rank, n_payloads = payloads.len());
+            return Err(());
+        };
+        let blob = crate::ov_kv_coordination::ov_blob_encode(&snap);
+        let epoch = crate::kv_coordination::synth_epoch(&manifest.token_ids);
+        tracing::info!(target: "cascadia::kv", event = "kv_carry_stash", epoch, rank = _rank,
+            bytes = blob.len(), n_tokens = manifest.token_ids.len());
+        // Carried-slice RESTORE addresses each downstream rank BY EPOCH, and every rank's manifest in
+        // one pull shares the same token_ids ⇒ the same epoch. With >1 downstream rank (a 3+-stage
+        // chain) a second rank's blob would overwrite the first, and `restore_kv` checks only layer
+        // COUNT — so a rank could restore ANOTHER rank's KV (silent wrong output). Reject a colliding
+        // stash of a DIFFERENT blob ⇒ that rank votes cold ⇒ clean all-or-nothing cold, never a
+        // wrong-rank restore. A 2-stage chain has one downstream rank and never collides; an idempotent
+        // same-blob re-stash (retry) is allowed. (3+-stage carried restore needs per-rank keying — a
+        // follow-up; today it degrades to a safe cold.)
+        if let Some(existing) = self.kv_downstream.get(&epoch) {
+            let same = existing == &blob;
+            if !same {
+                tracing::warn!(target: "cascadia::kv", event = "kv_carry_stash_rejected",
+                    reason = "epoch_collision", epoch, rank = _rank);
+            }
+            return if same { Ok(()) } else { Err(()) };
+        }
+        let cap = self.kv_prefix_cache.capacity().max(1);
+        while self.kv_downstream.len() >= cap && !self.kv_downstream.contains_key(&epoch) {
+            let Some(k) = self.kv_downstream.keys().next().copied() else {
+                break;
+            };
+            self.kv_downstream.remove(&k);
+        }
+        self.kv_downstream.insert(epoch, blob);
+        Ok(())
+    }
+
+    fn apply_warm_resume(&mut self, epoch: u64) -> bool {
+        // Drain FIRST — the node parks EVERY rank's slice, rank 0 included, so a `||` here would let
+        // a stale local capture mask the pulled one. See `handle_restore`.
+        let local_ok = if self.drain_kv_handoff(epoch) {
+            true
+        } else {
+            match self.kv_capture.get(&epoch).cloned() {
+                Some((_ns, _t, snap)) => self.runner.restore_kv(&snap).is_ok(),
+                None => false,
+            }
+        };
+        if !local_ok {
+            return false;
+        }
+        self.forward_restore_downstream(epoch)
     }
 }
 
@@ -3014,7 +4306,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let h = self.runner.hidden_size() as u32;
         self.block_on(async {
             if sample_back {
-                send_forward(downstream, pos as u32, cfg, &hidden, [1, 1, h])
+                send_forward(downstream, pos as u32, cfg, &hidden, [1, 1, h], true)
                     .await
                     .map_err(|e| format!("send_forward: {e}"))?;
             } else {
@@ -3566,7 +4858,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
         sample: bool,
     ) -> Result<(), String> {
-        let (past_seq_len, sampling_cfg, hidden_f32, _shape) = self
+        let (past_seq_len, sampling_cfg, push_history, hidden_f32, _shape) = self
             .block_on(recv_forward_body_server(upstream))
             .map_err(|e| format!("recv_forward_body: {e}"))?;
         let pos = past_seq_len as usize;
@@ -3625,9 +4917,16 @@ impl<R: StagedRunner> PipelineEngine<R> {
             let reply_deadline = Self::reply_deadline();
             self.block_on(async {
                 if sample {
-                    send_forward(down, past_seq_len, &sampling_cfg, &hidden, [1, 1, h])
-                        .await
-                        .map_err(|e| format!("send_forward: {e}"))?;
+                    send_forward(
+                        down,
+                        past_seq_len,
+                        &sampling_cfg,
+                        &hidden,
+                        [1, 1, h],
+                        push_history,
+                    )
+                    .await
+                    .map_err(|e| format!("send_forward: {e}"))?;
                 } else {
                     send_forward_nosample(down, past_seq_len, &sampling_cfg, &hidden, [1, 1, h])
                         .await

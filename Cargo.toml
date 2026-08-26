@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/cascadia-types",
+    "crates/cascadia-kv-wire",
     "crates/cascadia-topology",
     "crates/cascadia-transport",
     "crates/cascadia-engine",
