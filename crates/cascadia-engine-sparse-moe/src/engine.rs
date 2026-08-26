@@ -3285,7 +3285,15 @@ impl SparseMoEEngine {
                             .map_err(|e| format!("send_restore: {e}"))?;
                         recv_restore_verdict(down).await
                     })
-                    .unwrap_or(false)
+                    .unwrap_or_else(|e| {
+                        // Verdict-0 cold fallback is the designed outcome, but the
+                        // CAUSE must not vanish — mirror the OvMoe handler's warn.
+                        warn!(
+                            rank = self.rank,
+                            epoch, "downstream restore chain failed: {e}"
+                        );
+                        false
+                    })
                 } else {
                     // No downstream socket: verdict-true only when this genuinely
                     // IS the last rank — mirror of the OvMoe handler, so the two
