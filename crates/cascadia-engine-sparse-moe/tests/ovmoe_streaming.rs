@@ -15,6 +15,8 @@
 //! test runtime `step()` tries to re-enter).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use cascadia_engine::{Builder, Engine};
@@ -61,6 +63,14 @@ fn free_port() -> u16 {
 /// through the real `Engine`/wire path instead of driving `OvMoeRunner`
 /// directly.
 fn two_rank_harness() -> (Box<dyn Engine>, JoinHandle<()>) {
+    let (head, worker, _kill) = two_rank_harness_killable();
+    (head, worker)
+}
+
+/// `two_rank_harness` plus a kill switch: setting the flag makes the worker
+/// loop return (dropping the engine + its runtime, closing the sockets), so a
+/// test can simulate mid-decode chain death and join the worker thread.
+fn two_rank_harness_killable() -> (Box<dyn Engine>, JoinHandle<()>, Arc<AtomicBool>) {
     let dir = model_dir().expect("caller must gate on model_dir() first");
     let port = free_port();
 
@@ -69,6 +79,8 @@ fn two_rank_harness() -> (Box<dyn Engine>, JoinHandle<()>) {
     // head then blocks in connect for CASCADIA_CONNECT_TIMEOUT_SECS
     // (default 300s) with the real cause invisible.
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let kill = Arc::new(AtomicBool::new(false));
+    let kill_worker = Arc::clone(&kill);
     let worker_dir = dir.clone();
     let worker_thread = std::thread::spawn(move || {
         let worker_rt = tokio::runtime::Runtime::new().expect("worker runtime");
@@ -101,6 +113,11 @@ fn two_rank_harness() -> (Box<dyn Engine>, JoinHandle<()>) {
         // Drive the worker for the rest of the test process; no explicit
         // stop signal needed (matches sparse_streaming.rs).
         loop {
+            if kill_worker.load(Ordering::Relaxed) {
+                // Simulated chain death: return, dropping the engine and its
+                // runtime — sockets close and the head's next forward fails.
+                return;
+            }
             let _ = worker.step();
         }
     });
@@ -142,7 +159,7 @@ fn two_rank_harness() -> (Box<dyn Engine>, JoinHandle<()>) {
         Err(_) => panic!("worker not ready within 300s"),
     }
 
-    (head, worker_thread)
+    (head, worker_thread, kill)
 }
 
 /// Single-stage (`total == 1`) OV-IR engine, used only to exercise the
@@ -260,7 +277,23 @@ fn resume_seed_streams_continuation_only() {
     }
     // resume_max_new: 6 - 2 = at most 4 NEW tokens; the seed ids are never re-emitted.
     let toks: Vec<_> = chunks.iter().filter(|(_, c)| !c.is_final).collect();
+    assert!(
+        !toks.is_empty(),
+        "resume must stream at least one continuation token — an empty stream \
+         passes every assertion below vacuously"
+    );
     assert!(toks.len() <= 4);
+    let fin = chunks
+        .iter()
+        .find(|(_, c)| c.is_final)
+        .expect("a final chunk");
+    if fin.1.finish_reason == Some(FinishReason::Length) {
+        assert_eq!(
+            toks.len(),
+            4,
+            "Length final => exactly max_tokens - seed_len interior chunks"
+        );
+    }
     let streamed: String = toks.iter().map(|(_, c)| c.text.as_str()).collect();
     let seed_text = tokenizer.decode(&[3u32, 4], true).unwrap();
     assert!(
@@ -268,7 +301,7 @@ fn resume_seed_streams_continuation_only() {
         "fixture ids must decode to text or the re-emission assertion below is vacuous"
     );
     assert!(
-        !streamed.starts_with(&seed_text) || seed_text.is_empty(),
+        !streamed.starts_with(&seed_text),
         "streamed deltas re-emitted the forced prefix: {streamed:?}"
     );
 }
@@ -301,11 +334,32 @@ fn cancel_mid_decode_clears_active() {
         .unwrap();
     let first = head.step().unwrap(); // begin + first token
     assert!(!first.is_empty());
+    assert!(
+        !first[0].1.is_final,
+        "first step must be an interior token — a final here means no \
+         generation was active and the cancel below tests nothing"
+    );
     head.cancel(&"t4".to_string());
     let after = head.step().unwrap();
     assert!(
         after.is_empty(),
         "cancelled task must emit nothing and free the slot"
+    );
+    // Recovery: the worker was abandoned mid-sequence; the next task's begin
+    // issues a fresh chain reset, so a full turn must still complete cleanly
+    // (protocol desync here is the actual failure cancel risks).
+    head.submit(GenerationTask::new("t5", "hello again").with_max_tokens(3))
+        .unwrap();
+    let mut chunks = Vec::new();
+    for _ in 0..64 {
+        chunks.extend(head.step().unwrap());
+        if chunks.iter().any(|(_, c)| c.is_final) {
+            break;
+        }
+    }
+    assert!(
+        chunks.iter().any(|(_, c)| c.is_final && c.error.is_none()),
+        "post-cancel task must complete cleanly: {chunks:?}"
     );
 }
 
@@ -336,4 +390,49 @@ fn single_stage_declines_seeded_task_with_sentinel_first_chunk() {
         reason.starts_with("resume_unsupported:"),
         "sentinel must PREFIX the reason (callers match it with a starts_with check)"
     );
+}
+
+/// The headline Option B invariant: a mid-decode chain death surfaces an
+/// ERROR chunk and NEVER a success-shaped final — a final marker would trip
+/// the scheduler's saw_final latch and permanently block the forced-prefix
+/// rescue. (Deliberate divergence from PipelineEngine's partial-final; see
+/// the decode step's Err arm.) Reverting that arm to the old partial-final
+/// behavior passes every other test in this suite.
+#[test]
+fn mid_decode_chain_death_is_an_error_chunk_never_a_final() {
+    let Some(_dir) = model_dir() else {
+        eprintln!("M2_MODEL_DIR not set; skipping");
+        return;
+    };
+    let (mut head, worker, kill) = two_rank_harness_killable();
+    head.submit(GenerationTask::new("tkill", "hello").with_max_tokens(400))
+        .unwrap();
+    // Stream a few tokens first so the death is genuinely MID-decode.
+    let mut chunks = Vec::new();
+    for _ in 0..3 {
+        chunks.extend(head.step().unwrap());
+    }
+    assert!(
+        chunks.iter().all(|(_, c)| !c.is_final),
+        "budget 400 must not finish within 3 steps: {chunks:?}"
+    );
+    kill.store(true, Ordering::Relaxed);
+    worker.join().expect("worker thread exits on kill");
+    // Keep stepping until the failure surfaces (the in-flight recv trips its
+    // bounded transport timeout first).
+    let mut saw_error = false;
+    'outer: for _ in 0..64 {
+        let out = head.step().unwrap();
+        for (_, c) in &out {
+            assert!(
+                c.error.is_some() || !c.is_final,
+                "chain death must never produce a success-shaped final: {c:?}"
+            );
+            if c.error.is_some() {
+                saw_error = true;
+                break 'outer;
+            }
+        }
+    }
+    assert!(saw_error, "chain death must surface an error chunk");
 }

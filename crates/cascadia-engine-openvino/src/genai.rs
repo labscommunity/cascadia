@@ -1132,6 +1132,26 @@ mod tests {
         GenerationTask::new(id, "hello").with_max_tokens(max_tokens)
     }
 
+    /// Option B: the CB engine has no forced-prefix path — a resumed submit
+    /// must be declined with the `resume_unsupported:` sentinel in the error,
+    /// BEFORE any request is admitted (silently accepting would regenerate
+    /// from scratch and present it as a resume). Any rewording that drops the
+    /// sentinel silently breaks the scheduler's re-route matching.
+    #[test]
+    fn cb_submit_declines_resumed_task_with_sentinel() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        let mut t = task("t1", 8);
+        t.resume_token_ids = Some(vec![1, 2]);
+        let err = e.submit(t).expect_err("resumed submit must be declined");
+        assert!(
+            err.to_string().contains("resume_unsupported:"),
+            "decline must carry the sentinel the scheduler matches on: {err}"
+        );
+        // Nothing was admitted.
+        assert!(e.active.is_empty());
+    }
+
     /// The B1 fix: a step that progressed the batch without producing a token
     /// must still report progress, or the runner's no-progress guard kills a
     /// perfectly healthy request mid-prefill. n_tokens must be an explicit 0 —

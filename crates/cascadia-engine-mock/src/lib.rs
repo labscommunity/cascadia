@@ -271,16 +271,22 @@ mod tests {
     #[test]
     fn resume_at_full_budget_emits_zero_new_tokens() {
         let mut e = MockEngine::new();
-        // resume_token_ids covers the whole prompt and max_tokens equals
-        // the prefix length, so the task finals immediately with no new
-        // tokens.
-        let mut task = GenerationTask::new("t1", "a b c d").with_max_tokens(4);
+        // The seed alone exhausts max_tokens, so the task finals immediately
+        // with no new tokens. The prompt has MORE words than the budget so the
+        // finish reason provably comes from the BUDGET branch (Length), not
+        // word exhaustion (Stop) — with a 4-word prompt both conditions were
+        // true and the tie-break masked which branch fired.
+        let mut task = GenerationTask::new("t1", "a b c d e f").with_max_tokens(4);
         task.resume_token_ids = Some(vec![0, 1, 2, 3]);
         e.submit(task).unwrap();
         let emitted = e.step().unwrap();
         assert_eq!(emitted.len(), 1);
         assert!(emitted[0].1.is_final);
-        assert_eq!(emitted[0].1.token_id, 0);
+        assert_eq!(
+            emitted[0].1.finish_reason,
+            Some(cascadia_types::FinishReason::Length),
+            "an exhausted resume budget is a Length stop, like every real engine"
+        );
     }
 
     #[test]
