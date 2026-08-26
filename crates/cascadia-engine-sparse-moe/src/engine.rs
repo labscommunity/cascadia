@@ -2989,16 +2989,25 @@ impl SparseMoEEngine {
         // nothing stashed and a bare RESTORE restores the rank from its own capture. Logged either
         // way — a bare RESTORE and a never-stashed slice are otherwise indistinguishable.
         let carried = self.kv_downstream.remove(&epoch);
-        tracing::info!(target: "cascadia::kv", event = "kv_carry_send", epoch,
-            carried = carried.is_some(), bytes = carried.as_ref().map_or(0, |b| b.len()),
+        // `frame` names what is actually SENT: an oversized blob degrades to a
+        // bare RESTORE (deliberate clean cold), and logging carried=true alone
+        // would claim a carry that never went out.
+        let oversized = carried
+            .as_ref()
+            .is_some_and(|b| b.len() > crate::dist::MAX_RESTORE_BLOB_BYTES as usize);
+        let frame = match (&carried, oversized) {
+            (Some(_), false) => "carry",
+            (Some(_), true) => "bare_oversized",
+            (None, _) => "bare",
+        };
+        tracing::info!(target: "cascadia::kv", event = "kv_carry_send", epoch, frame,
+            bytes = carried.as_ref().map_or(0, |b| b.len()),
             stashed_epochs = self.kv_downstream.len());
         let verdict = self.block_on(async {
             match &carried {
-                Some(blob) if blob.len() <= crate::dist::MAX_RESTORE_BLOB_BYTES as usize => {
-                    send_restore_carry(&down, epoch, blob)
-                        .await
-                        .map_err(|e| format!("send_restore_carry: {e}"))?
-                }
+                Some(blob) if !oversized => send_restore_carry(&down, epoch, blob)
+                    .await
+                    .map_err(|e| format!("send_restore_carry: {e}"))?,
                 // None, or an oversized blob (guards the u32 len field + the peer's recv alloc) ⇒
                 // bare RESTORE ⇒ the moved-to tail misses the foreign epoch ⇒ deliberate clean cold.
                 _ => send_restore(&down, epoch)
@@ -3285,12 +3294,20 @@ impl SparseMoEEngine {
                 let (epoch, blob) = self
                     .block_on(recv_restore_carry_body_server(upstream))
                     .map_err(|e| format!("recv_restore_carry: {e}"))?;
-                let local_ok = match crate::kv_coordination::blob_decode(&blob) {
-                    Some(snap) => self.runner.restore_kv(&snap).is_ok(),
-                    None => false,
+                // Differentiate the two failure classes: wire corruption
+                // (decode) vs an apply failure (restore) — this is the one
+                // path where the blob crossed chains, so shape/version skew
+                // is the most likely and the least diagnosable.
+                let (local_ok, fail) = match crate::kv_coordination::blob_decode(&blob) {
+                    Some(snap) => match self.runner.restore_kv(&snap) {
+                        Ok(()) => (true, String::new()),
+                        Err(e) => (false, format!("restore: {e:?}")),
+                    },
+                    None => (false, "decode".to_string()),
                 };
                 tracing::info!(target: "cascadia::kv", event = "sparse_tail_restore_carried",
-                    rank = self.rank, epoch, ok = local_ok, blob_len = blob.len());
+                    rank = self.rank, epoch, ok = local_ok, blob_len = blob.len(),
+                    reason = %fail);
                 let down_ok = if let Some(down) = downstream.as_ref() {
                     self.block_on(async {
                         send_restore(down, epoch)
@@ -4281,17 +4298,25 @@ impl OvMoeEngine {
         let carried = self.kv_downstream.remove(&epoch);
         // Whether a downstream slice is riding along is the difference between a warm tail and a
         // cold one, and every site that could drop it was previously silent — a bare RESTORE and a
-        // never-stashed slice look identical from the logs.
-        tracing::info!(target: "cascadia::kv", event = "kv_carry_send", epoch,
-            carried = carried.is_some(), bytes = carried.as_ref().map_or(0, |b| b.len()),
+        // never-stashed slice look identical from the logs. `frame` names what is actually SENT:
+        // an oversized blob degrades to a bare RESTORE (deliberate clean cold), and logging
+        // carried=true alone would claim a carry that never went out.
+        let oversized = carried
+            .as_ref()
+            .is_some_and(|b| b.len() > crate::dist::MAX_RESTORE_BLOB_BYTES as usize);
+        let frame = match (&carried, oversized) {
+            (Some(_), false) => "carry",
+            (Some(_), true) => "bare_oversized",
+            (None, _) => "bare",
+        };
+        tracing::info!(target: "cascadia::kv", event = "kv_carry_send", epoch, frame,
+            bytes = carried.as_ref().map_or(0, |b| b.len()),
             stashed_epochs = self.kv_downstream.len());
         let verdict = self.block_on(async {
             match &carried {
-                Some(blob) if blob.len() <= crate::dist::MAX_RESTORE_BLOB_BYTES as usize => {
-                    send_restore_carry(&down, epoch, blob)
-                        .await
-                        .map_err(|e| format!("send_restore_carry: {e}"))?
-                }
+                Some(blob) if !oversized => send_restore_carry(&down, epoch, blob)
+                    .await
+                    .map_err(|e| format!("send_restore_carry: {e}"))?,
                 // None, or an oversized blob (guards the u32 len field + the peer's recv alloc) ⇒ bare
                 // RESTORE ⇒ the moved-to tail misses the foreign epoch ⇒ deliberate clean cold.
                 _ => send_restore(&down, epoch)
@@ -4441,12 +4466,20 @@ impl OvMoeEngine {
         let (epoch, blob) = self
             .block_on(recv_restore_carry_body_server(upstream))
             .map_err(|e| format!("recv_restore_carry: {e}"))?;
-        let local_ok = match crate::ov_kv_coordination::ov_blob_decode(&blob) {
-            Some(snap) => self.runner.restore_kv(&snap).is_ok(),
-            None => false,
+        // Differentiate the two failure classes: wire corruption (decode) vs
+        // an apply failure (restore) — this is the one path where the blob
+        // crossed chains, so shape/version skew is the most likely and the
+        // least diagnosable. Mirror of the SparseMoE handler.
+        let (local_ok, fail) = match crate::ov_kv_coordination::ov_blob_decode(&blob) {
+            Some(snap) => match self.runner.restore_kv(&snap) {
+                Ok(()) => (true, String::new()),
+                Err(e) => (false, format!("restore: {e:?}")),
+            },
+            None => (false, "decode".to_string()),
         };
         tracing::info!(target: "cascadia::kv", event = "ovmoe_tail_restore_carried",
-            rank = self.rank, epoch, ok = local_ok, blob_len = blob.len());
+            rank = self.rank, epoch, ok = local_ok, blob_len = blob.len(),
+            reason = %fail);
         let down_ok = if self.is_last() {
             true
         } else if let Some(down) = downstream {
@@ -4886,11 +4919,16 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
             return if same { Ok(()) } else { Err(()) };
         }
         let cap = self.kv_prefix_cache.capacity().max(1);
-        while self.kv_downstream.len() >= cap && !self.kv_downstream.contains_key(&epoch) {
+        // (`epoch` is never already present here — the collision guard above
+        // returned for that case.) Eviction silently downgrades the dropped
+        // epoch's future cross-chain restore to cold, so it must be visible.
+        while self.kv_downstream.len() >= cap {
             let Some(k) = self.kv_downstream.keys().next().copied() else {
                 break;
             };
             self.kv_downstream.remove(&k);
+            tracing::warn!(target: "cascadia::kv", event = "kv_carry_stash_evicted",
+                evicted_epoch = k, for_epoch = epoch, cap);
         }
         self.kv_downstream.insert(epoch, blob);
         Ok(())

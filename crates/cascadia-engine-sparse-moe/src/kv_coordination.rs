@@ -696,11 +696,16 @@ impl KvCoordination for SparseMoEEngine {
             return if same { Ok(()) } else { Err(()) };
         }
         let cap = self.kv_prefix_cache.capacity().max(1);
-        while self.kv_downstream.len() >= cap && !self.kv_downstream.contains_key(&epoch) {
+        // (`epoch` is never already present here — the collision guard above
+        // returned for that case.) Eviction silently downgrades the dropped
+        // epoch's future cross-chain restore to cold, so it must be visible.
+        while self.kv_downstream.len() >= cap {
             let Some(k) = self.kv_downstream.keys().next().copied() else {
                 break;
             };
             self.kv_downstream.remove(&k);
+            tracing::warn!(target: "cascadia::kv", event = "kv_carry_stash_evicted",
+                evicted_epoch = k, for_epoch = epoch, cap);
         }
         self.kv_downstream.insert(epoch, blob);
         Ok(())
