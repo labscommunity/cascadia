@@ -1916,96 +1916,13 @@ impl SparseMoEEngine {
                 }
             };
 
-            // Issue-34 Task 1.3 (§8): capture the full post-turn sequence's KV across the whole chain so
-            // a forced move can warm-resume. The head mints E = synth_epoch(full tokens) and broadcasts
-            // CAPTURE(E, tokens) downstream; each stage snapshots its slice under E and acks back up; the
-            // head's single ack means every stage captured. Then the head seeds its own prefix cache so a
-            // later NEGOTIATE maps the prefix → E. Best-effort: any transport/snapshot error just skips the
-            // cache (warm-pull degrades to cold) and never affects the already-complete served output.
+            // Issue-34 (§8): whole-chain KV capture so a forced move can
+            // warm-resume this turn — see `capture_multi_stage`.
             #[cfg(feature = "kv_coord")]
             if self.kv_prefix_cache.enabled() && !result_tokens.is_empty() {
-                // Snapshot FIRST and key the epoch over `full_tokens[..depth]` — the prefix the KV
-                // actually covers. Test-before-push EOS semantics leave the final sampled token
-                // un-pushed, so the turn's token vector runs one LONGER than the KV: an epoch over
-                // the full vector can never match a later NEGOTIATE's offer epoch (computed over
-                // `tokens[..past_seq_len]`), and every worker GET answers `get_none`. Mirrors the
-                // OvMoe multi-stage site, which had this right.
-                match self.runner.snapshot_kv() {
-                    Ok(snap) => {
-                        let depth = snap.past_seq_len;
-                        let mut full_tokens: Vec<i32> =
-                            prompt_ids.iter().map(|&t| t as i32).collect();
-                        full_tokens.extend(result_tokens.iter().map(|&t| t as i32));
-                        if depth >= 1 && depth <= full_tokens.len() {
-                            let captured: Vec<i32> = full_tokens[..depth].to_vec();
-                            let epoch = crate::kv_coordination::synth_epoch(&captured);
-                            // Bounded: an older peer that meets CaptureV2 errors WITHOUT acking, and
-                            // the only ceiling otherwise is the transport frame-idle default —
-                            // reached before this turn's already-complete chunks are returned.
-                            // Timeout ⇒ capture skipped, turn delivered.
-                            let acked = self.block_on(async {
-                                match tokio::time::timeout(CAPTURE_ACK_TIMEOUT, async {
-                                    send_capture(&downstream, epoch, &captured, &task.tenant)
-                                        .await
-                                        .map_err(|e| format!("send_capture: {e}"))?;
-                                    match recv_kind_client(&downstream).await {
-                                        Ok(Some(FrameKind::CaptureAck)) => {
-                                            recv_capture_ack_body_client(&downstream)
-                                                .await
-                                                .map(|_| ())
-                                                .map_err(|e| format!("recv_capture_ack: {e}"))
-                                        }
-                                        Ok(Some(other)) => {
-                                            Err(format!("expected CaptureAck, got {other:?}"))
-                                        }
-                                        Ok(None) => {
-                                            Err("downstream closed during capture".to_string())
-                                        }
-                                        Err(e) => Err(format!("recv_kind (capture): {e}")),
-                                    }
-                                })
-                                .await
-                                {
-                                    Ok(r) => r,
-                                    Err(_) => {
-                                        // Same hazard recv_token_reply drops the socket for: the
-                                        // peer is usually alive and its CaptureAck (no sequence
-                                        // number) lands after we stopped waiting — a reused
-                                        // connection hands it to the NEXT exchange as its reply.
-                                        downstream.lock().await.close().await;
-                                        Err(format!(
-                                            "capture ack timed out after {CAPTURE_ACK_TIMEOUT:?}; \
-                                             connection dropped to avoid reading the late ack as \
-                                             the next exchange's reply"
-                                        ))
-                                    }
-                                }
-                            });
-                            match acked {
-                                Ok(()) => {
-                                    let fp = self.runner.fingerprint();
-                                    let prompt64: Vec<i64> =
-                                        captured.iter().map(|&t| i64::from(t)).collect();
-                                    // Mirror into the holder cache so a busy engine still serves
-                                    // this prefix.
-                                    self.kv_share
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .prefix
-                                        .insert(prompt64.clone(), &fp, snap.clone());
-                                    self.kv_prefix_cache.insert(prompt64, &fp, snap);
-                                }
-                                Err(e) => {
-                                    warn!(task = %task.task_id, "kv multi-stage capture skipped: {e}")
-                                }
-                            }
-                        } else {
-                            warn!(task = %task.task_id, depth, full_len = full_tokens.len(),
-                                "kv capture skipped: KV depth outside token range");
-                        }
-                    }
-                    Err(e) => warn!(task = %task.task_id, "kv capture: snapshot_kv failed: {e}"),
-                }
+                let mut full_tokens: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
+                full_tokens.extend(result_tokens.iter().map(|&t| t as i32));
+                self.capture_multi_stage(&downstream, &task.tenant, &task.task_id, &full_tokens);
             }
 
             let n_tokens = result_tokens.len() as u32;
@@ -2259,6 +2176,106 @@ impl SparseMoEEngine {
         }
     }
 
+    /// Issue-34 Task 1.3 (§8): best-effort whole-chain KV capture of a
+    /// completed turn. The head snapshots its own slice, mints
+    /// E = synth_epoch(covered prefix), broadcasts CAPTURE(E, tokens)
+    /// downstream (each stage snapshots under E and acks up — one head-side
+    /// ack means every stage captured), then seeds its prefix cache so a
+    /// later NEGOTIATE maps the prefix → E. Best-effort: any error skips the
+    /// cache (warm-pull degrades to cold) and never affects the served
+    /// output. Shared by the spec-decode burst path and the streamed
+    /// finalize — they previously carried verbatim ~90-line copies, and the
+    /// duplicated timeout arm is exactly where a rebase misgraft landed once.
+    #[cfg(feature = "kv_coord")]
+    fn capture_multi_stage(
+        &mut self,
+        downstream: &Arc<TokioMutex<ActivationClient>>,
+        tenant: &str,
+        task_id: &TaskId,
+        full_tokens: &[i32],
+    ) {
+        // Snapshot FIRST and key the epoch over `full_tokens[..depth]` — the
+        // prefix the KV actually covers. The length-capped streamed path
+        // pushes its final sampled token without ever feeding it, so the
+        // turn's token vector can run one LONGER than the KV (an
+        // EOS-terminated turn — whose un-pushed token is the un-fed EOS —
+        // lands exactly equal): an epoch over the full vector then never
+        // matches a later NEGOTIATE's offer epoch (computed over
+        // `tokens[..past_seq_len]`) and every worker GET answers `get_none`.
+        // Mirrors the OvMoe multi-stage site.
+        match self.runner.snapshot_kv() {
+            Ok(snap) => {
+                let depth = snap.past_seq_len;
+                if depth >= 1 && depth <= full_tokens.len() {
+                    let captured: Vec<i32> = full_tokens[..depth].to_vec();
+                    let epoch = crate::kv_coordination::synth_epoch(&captured);
+                    // Bounded: an older peer that meets CaptureV2 errors WITHOUT
+                    // acking, and the only ceiling otherwise is the transport
+                    // frame-idle default — reached before this turn's
+                    // already-complete chunks are returned. Timeout ⇒ capture
+                    // skipped, turn delivered (the connection is dropped, so the
+                    // NEXT turn on this chain pays the reconnect).
+                    let acked = self.block_on(async {
+                        match tokio::time::timeout(CAPTURE_ACK_TIMEOUT, async {
+                            send_capture(downstream, epoch, &captured, tenant)
+                                .await
+                                .map_err(|e| format!("send_capture: {e}"))?;
+                            match recv_kind_client(downstream).await {
+                                Ok(Some(FrameKind::CaptureAck)) => {
+                                    recv_capture_ack_body_client(downstream)
+                                        .await
+                                        .map(|_| ())
+                                        .map_err(|e| format!("recv_capture_ack: {e}"))
+                                }
+                                Ok(Some(other)) => {
+                                    Err(format!("expected CaptureAck, got {other:?}"))
+                                }
+                                Ok(None) => Err("downstream closed during capture".to_string()),
+                                Err(e) => Err(format!("recv_kind (capture): {e}")),
+                            }
+                        })
+                        .await
+                        {
+                            Ok(r) => r,
+                            Err(_) => {
+                                // Same hazard recv_token_reply drops the socket for: the
+                                // peer is usually alive and its CaptureAck (no sequence
+                                // number) lands after we stopped waiting — a reused
+                                // connection hands it to the NEXT exchange as its reply.
+                                downstream.lock().await.close().await;
+                                Err(format!(
+                                    "capture ack timed out after {CAPTURE_ACK_TIMEOUT:?}; \
+                                     connection dropped to avoid reading the late ack as \
+                                     the next exchange's reply"
+                                ))
+                            }
+                        }
+                    });
+                    match acked {
+                        Ok(()) => {
+                            let fp = self.runner.fingerprint();
+                            let prompt64: Vec<i64> =
+                                captured.iter().map(|&t| i64::from(t)).collect();
+                            // Mirror into the holder cache so a busy engine still
+                            // serves this prefix.
+                            self.kv_share
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .prefix
+                                .insert(prompt64.clone(), &fp, snap.clone());
+                            self.kv_prefix_cache.insert(prompt64, &fp, snap);
+                        }
+                        Err(e) => warn!(task = %task_id, "kv multi-stage capture skipped: {e}"),
+                    }
+                } else {
+                    warn!(task = %task_id, depth, full_len = full_tokens.len(),
+                        "kv capture skipped: KV depth outside token range");
+                }
+            }
+            Err(e) => warn!(task = %task_id, "kv capture: snapshot_kv failed: {e}"),
+        }
+    }
+
     /// Finalize the in-flight task: best-effort whole-chain KV capture (so a
     /// forced move can warm-resume this turn), then the empty final marker.
     /// `capture` lets a caller skip the KV round-trip on an already-dead
@@ -2269,96 +2286,17 @@ impl SparseMoEEngine {
             return Vec::new();
         };
         let n_new = (a.generated.len() - a.resume_seed_len) as u32;
-        // Issue-34 Task 1.3 (§8): capture the full post-turn sequence's KV across the whole chain so
-        // a forced move can warm-resume. The head mints E = synth_epoch(full tokens) and broadcasts
-        // CAPTURE(E, tokens) downstream; each stage snapshots its slice under E and acks back up; the
-        // head's single ack means every stage captured. Then the head seeds its own prefix cache so a
-        // later NEGOTIATE maps the prefix → E. Best-effort: any transport/snapshot error just skips the
-        // cache (warm-pull degrades to cold) and never affects the already-complete served output.
-        // The capture key is prompt_ids ++ NEW tokens — `a.prompt_ids` already contains the
-        // appended resume prefix, so slicing generated at `resume_seed_len` prevents double-counting it.
+        // §4.3.3: the capture key is prompt_ids ++ NEW tokens — `a.prompt_ids`
+        // already contains the appended resume prefix, so slicing `generated`
+        // at `resume_seed_len` prevents double-counting it. Capture mechanics
+        // in `capture_multi_stage`.
         #[cfg_attr(not(feature = "kv_coord"), allow(unused_variables))]
         let should_capture = capture && n_new > 0;
         #[cfg(feature = "kv_coord")]
         if should_capture && self.kv_prefix_cache.enabled() {
-            // Snapshot FIRST and key the epoch over `full_tokens[..depth]` — the prefix the KV
-            // actually covers. Test-before-push EOS semantics leave the final sampled token
-            // un-pushed, so the turn's token vector runs one LONGER than the KV: an epoch over the
-            // full vector can never match a later NEGOTIATE's offer epoch (computed over
-            // `tokens[..past_seq_len]`), and every worker GET answers `get_none`. Mirrors the OvMoe
-            // multi-stage site, which had this right.
-            match self.runner.snapshot_kv() {
-                Ok(snap) => {
-                    let depth = snap.past_seq_len;
-                    let mut full_tokens: Vec<i32> =
-                        a.prompt_ids.iter().map(|&t| t as i32).collect();
-                    full_tokens.extend(a.generated[a.resume_seed_len..].iter().map(|&t| t as i32));
-                    if depth >= 1 && depth <= full_tokens.len() {
-                        let captured: Vec<i32> = full_tokens[..depth].to_vec();
-                        let epoch = crate::kv_coordination::synth_epoch(&captured);
-                        // Bounded: an older peer that meets CaptureV2 errors WITHOUT acking, and
-                        // the only ceiling otherwise is the transport frame-idle default — reached
-                        // before this turn's already-complete chunks are returned. Timeout ⇒
-                        // capture skipped, turn delivered.
-                        let acked = self.block_on(async {
-                            match tokio::time::timeout(CAPTURE_ACK_TIMEOUT, async {
-                                send_capture(&a.downstream, epoch, &captured, &a.tenant)
-                                    .await
-                                    .map_err(|e| format!("send_capture: {e}"))?;
-                                match recv_kind_client(&a.downstream).await {
-                                    Ok(Some(FrameKind::CaptureAck)) => {
-                                        recv_capture_ack_body_client(&a.downstream)
-                                            .await
-                                            .map(|_| ())
-                                            .map_err(|e| format!("recv_capture_ack: {e}"))
-                                    }
-                                    Ok(Some(other)) => {
-                                        Err(format!("expected CaptureAck, got {other:?}"))
-                                    }
-                                    Ok(None) => Err("downstream closed during capture".into()),
-                                    Err(e) => Err(format!("recv_kind (capture): {e}")),
-                                }
-                            })
-                            .await
-                            {
-                                Ok(r) => r,
-                                Err(_) => {
-                                    // Same hazard recv_token_reply drops the socket for: the
-                                    // peer is usually alive and its CaptureAck (no sequence
-                                    // number) lands after we stopped waiting — a reused
-                                    // connection hands it to the NEXT exchange as its reply.
-                                    a.downstream.lock().await.close().await;
-                                    Err(format!(
-                                        "capture ack timed out after {CAPTURE_ACK_TIMEOUT:?}; \
-                                         connection dropped to avoid reading the late ack as \
-                                         the next exchange's reply"
-                                    ))
-                                }
-                            }
-                        });
-                        match acked {
-                            Ok(()) => {
-                                let fp = self.runner.fingerprint();
-                                let prompt64: Vec<i64> =
-                                    captured.iter().map(|&t| i64::from(t)).collect();
-                                // Mirror into the holder cache so a busy engine still serves this
-                                // prefix.
-                                self.kv_share
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .prefix
-                                    .insert(prompt64.clone(), &fp, snap.clone());
-                                self.kv_prefix_cache.insert(prompt64, &fp, snap);
-                            }
-                            Err(e) => warn!(task = %a.id, "kv multi-stage capture skipped: {e}"),
-                        }
-                    } else {
-                        warn!(task = %a.id, depth, full_len = full_tokens.len(),
-                            "kv capture skipped: KV depth outside token range");
-                    }
-                }
-                Err(e) => warn!(task = %a.id, "kv capture: snapshot_kv failed: {e}"),
-            }
+            let mut full_tokens: Vec<i32> = a.prompt_ids.iter().map(|&t| t as i32).collect();
+            full_tokens.extend(a.generated[a.resume_seed_len..].iter().map(|&t| t as i32));
+            self.capture_multi_stage(&a.downstream, &a.tenant, &a.id, &full_tokens);
         }
         let elapsed = a.started.elapsed().as_secs_f64();
         info!(task = %a.id, tokens = n_new, elapsed_s = elapsed,
