@@ -146,7 +146,8 @@ fn two_rank_harness_killable() -> (Box<dyn Engine>, JoinHandle<()>, Arc<AtomicBo
             wb.connect(PeerLayout::last_of(PeerEndpoint::new("127.0.0.1", port)))
                 .await
                 .map_err(|e| format!("worker connect: {e:?}"))?;
-            wb.load(worker_shard)
+            let _progress = wb
+                .load(worker_shard)
                 .await
                 .map_err(|e| format!("worker load: {e:?}"))?;
             Box::new(wb)
@@ -188,7 +189,8 @@ fn two_rank_harness_killable() -> (Box<dyn Engine>, JoinHandle<()>, Arc<AtomicBo
         hb.connect(PeerLayout::first_of(PeerEndpoint::new("127.0.0.1", port)))
             .await
             .map_err(|e| format!("head connect: {e:?}"))?;
-        hb.load(head_shard)
+        let _progress = hb
+            .load(head_shard)
             .await
             .map_err(|e| format!("head load: {e:?}"))?;
         Box::new(hb)
