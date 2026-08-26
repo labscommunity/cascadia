@@ -1270,7 +1270,7 @@ impl Qwen36Engine {
             // indices before they reach native prefill (and makes the u32 casts safe).
             let resume = task.resume_ids().map(<[i32]>::to_vec);
             if let Some(r) = resume.as_deref() {
-                let vocab = tokenizer.get_vocab_size(true) as u32;
+                let vocab = crate::resume_vocab_bound(tokenizer);
                 if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
                     let id = task.task_id.clone();
                     let c = Chunk::error(id.clone(), format!("invalid resume prefix: {e}"));
@@ -1557,8 +1557,7 @@ impl Qwen36Engine {
                     }
                     vec![(
                         task_id.clone(),
-                        Chunk::token(task_id, next as i64, delta)
-                            .with_token_ids(vec![next as i64]),
+                        Chunk::token(task_id, next as i64, delta).with_token_ids(vec![next as i64]),
                     )]
                 }
                 Err(e) => {
@@ -1985,7 +1984,7 @@ impl Qwen36Engine {
             // indices before they reach native prefill (and makes the u32 casts safe).
             let resume = task.resume_ids().map(<[i32]>::to_vec);
             if let Some(r) = resume.as_deref() {
-                let vocab = tokenizer.get_vocab_size(true) as u32;
+                let vocab = crate::resume_vocab_bound(tokenizer);
                 if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
                     let id = task.task_id.clone();
                     let c = Chunk::error(id.clone(), format!("invalid resume prefix: {e}"));
@@ -2207,8 +2206,7 @@ impl Qwen36Engine {
                     }
                     vec![(
                         task_id.clone(),
-                        Chunk::token(task_id, next as i64, delta)
-                            .with_token_ids(vec![next as i64]),
+                        Chunk::token(task_id, next as i64, delta).with_token_ids(vec![next as i64]),
                     )]
                 }
                 Err(e) => {

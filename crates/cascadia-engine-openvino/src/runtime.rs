@@ -2112,7 +2112,7 @@ impl OvRuntimeEngine {
                 // Peer-supplied indices go straight into native prefill; an
                 // out-of-range id is an OV embedding gather crash, not a typed
                 // error — bound them here.
-                let vocab = tok.get_vocab_size(true) as u32;
+                let vocab = crate::resume_vocab_bound(&tok);
                 if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
                     let id = task.task_id.clone();
                     return Ok(vec![(

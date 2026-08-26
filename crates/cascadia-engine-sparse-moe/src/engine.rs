@@ -1003,6 +1003,19 @@ pub struct ResumeSeed {
     pub seed_text: String,
 }
 
+/// Exclusive id bound for `validate_resume_ids`: max assigned id + 1 — NOT
+/// `get_vocab_size(true)`, which returns the ENTRY COUNT and under-counts the
+/// bound on a sparse vocab (added tokens with gapped ids), wrongly rejecting
+/// legitimate resume ids. Falls back to the count for an empty vocab map.
+fn resume_vocab_bound(tok: &tokenizers::Tokenizer) -> u32 {
+    tok.get_vocab(true)
+        .values()
+        .max()
+        .map(|&m| m.saturating_add(1))
+        .unwrap_or(0)
+        .max(tok.get_vocab_size(true) as u32)
+}
+
 #[doc(hidden)]
 pub fn prepare_resume(
     task: &GenerationTask,
@@ -1012,7 +1025,7 @@ pub fn prepare_resume(
     let Some(r) = task.resume_ids() else {
         return Ok(None);
     };
-    let vocab = tokenizer.get_vocab_size(true) as u32;
+    let vocab = resume_vocab_bound(tokenizer);
     cascadia_types::validate_resume_ids(r, Some(vocab))
         .map_err(|e| format!("invalid resume prefix: {e}"))?;
     cascadia_types::append_resume_ids(prompt_ids_i64, Some(r));
@@ -1511,7 +1524,7 @@ impl SparseMoEEngine {
         if let Some(r) = resume.as_deref() {
             // Peer-supplied indices reach native prefill; bound them first
             // (also makes the u32 casts below safe).
-            let vocab = tokenizer.get_vocab_size(true) as u32;
+            let vocab = resume_vocab_bound(tokenizer);
             if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
                 let id = task.task_id.clone();
                 return vec![(

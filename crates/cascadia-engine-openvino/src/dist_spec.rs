@@ -1513,7 +1513,7 @@ impl Engine for OvDistSpecEngine {
             let resume = task.resume_ids().map(<[i32]>::to_vec);
             if let Some(r) = resume.as_deref() {
                 // Peer-supplied indices reach native OV prefill — bound them first.
-                let vocab = self.tokenizer.get_vocab_size(true) as u32;
+                let vocab = crate::resume_vocab_bound(&self.tokenizer);
                 if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
                     let task_id = task.task_id.clone();
                     let c = Chunk::error(task.task_id, format!("invalid resume prefix: {e}"));
