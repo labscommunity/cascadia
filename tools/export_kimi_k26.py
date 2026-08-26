@@ -35,6 +35,11 @@ numerically meaningful (nothing here is — see the module docstring).
 Usage:
     python tools/export_kimi_k26.py --tiny --out /tmp/k26_tiny
     python tools/export_kimi_k26.py --tiny --out /tmp/k26_mid --no-layer0
+    python tools/export_kimi_k26.py --tiny --out /tmp/k26_tiny_head --head
+        # --head also writes head/openvino_model.xml so the tree can serve a
+        # LAST stage (tests/sparse_streaming.rs, K26_TINY_HEAD_DIR). Requires
+        # torch + openvino. Keep --head trees SEPARATE from the head-less tree
+        # K26_TINY_DIR points at: tests/k26_native_tiny.rs asserts head absence.
 """
 
 import argparse
@@ -289,6 +294,16 @@ def main():
         ap.error("only --tiny is implemented; a real K2.6 export is export_shards.py's job")
     if args.experts > N_ROUTED_EXPERTS:
         ap.error(f"--experts must be <= {N_ROUTED_EXPERTS}")
+    if args.head:
+        # write_head_ir imports these lazily, but it runs LAST — after the
+        # multi-GiB shard write — and a missing dep there leaves a tree that
+        # LOOKS complete yet has no head (the runner later rejects it with
+        # MissingFile). Fail in a second instead, like the ap.error checks.
+        import importlib.util
+        for mod in ("torch", "openvino"):
+            if importlib.util.find_spec(mod) is None:
+                ap.error(f"--head requires {mod} (pip install {mod}); "
+                         "refusing to start a multi-GiB export that would fail at the head step")
 
     rng = np.random.default_rng(args.seed)
     os.makedirs(args.out, exist_ok=True)
