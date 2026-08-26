@@ -2342,13 +2342,18 @@ impl OvRuntimeEngine {
             // or re-route it, rather than being told the resume succeeded.
             // (Unreachable at the `packed_slots = 0` default; guards enabling it.)
             if task.resume_ids().is_some() {
-                // Attributed to the refused task: a bare Err from step() fails
-                // whichever packed stream happened to poll and leaves THIS task
-                // hanging with no error chunk (review finding).
-                return Err(EngineError::Backend(
-                    "resume (Option B forced prefix) is unsupported on packed slots".into(),
-                )
-                .for_task(task.task_id));
+                // Declined as THIS task's error chunk, sentinel-prefixed: the
+                // scheduler matches `resume_unsupported:` with starts_with on
+                // the chunk reason to re-route instead of surfacing a fault,
+                // and an engine-level Err would fail the other packed streams.
+                out.push((
+                    task.task_id.clone(),
+                    Chunk::error(
+                        task.task_id,
+                        "resume_unsupported: packed slots have no forced-prefix path".to_string(),
+                    ),
+                ));
+                continue;
             }
             let tok = self
                 .tokenizer
