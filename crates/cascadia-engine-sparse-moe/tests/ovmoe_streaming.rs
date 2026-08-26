@@ -64,10 +64,15 @@ fn two_rank_harness() -> (Box<dyn Engine>, JoinHandle<()>) {
     let dir = model_dir().expect("caller must gate on model_dir() first");
     let port = free_port();
 
+    // The worker's startup errors must reach the test: its JoinHandle is
+    // never joined, so a bare `expect` panic there is swallowed and the
+    // head then blocks in connect for CASCADIA_CONNECT_TIMEOUT_SECS
+    // (default 300s) with the real cause invisible.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let worker_dir = dir.clone();
     let worker_thread = std::thread::spawn(move || {
         let worker_rt = tokio::runtime::Runtime::new().expect("worker runtime");
-        let mut worker: Box<dyn Engine> = worker_rt.block_on(async move {
+        let built: Result<Box<dyn Engine>, String> = worker_rt.block_on(async move {
             let mut wb = SparseMoEBuilder::new(
                 SparseMoEBuilderConfig::new(worker_dir.to_str().expect("utf8 path"), "CPU")
                     .with_rank(1, 2),
@@ -75,10 +80,24 @@ fn two_rank_harness() -> (Box<dyn Engine>, JoinHandle<()>) {
             wb.configure_listen("127.0.0.1", port);
             wb.connect(PeerLayout::last_of(PeerEndpoint::new("127.0.0.1", port)))
                 .await
-                .expect("worker connect");
-            let _progress = wb.load(shard(false, true)).await.expect("worker load");
-            Box::new(wb).build().expect("worker build")
+                .map_err(|e| format!("worker connect: {e:?}"))?;
+            wb.load(shard(false, true))
+                .await
+                .map_err(|e| format!("worker load: {e:?}"))?;
+            Box::new(wb)
+                .build()
+                .map_err(|e| format!("worker build: {e:?}"))
         });
+        let mut worker = match built {
+            Ok(w) => {
+                let _ = ready_tx.send(Ok(()));
+                w
+            }
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        };
         // Drive the worker for the rest of the test process; no explicit
         // stop signal needed (matches sparse_streaming.rs).
         loop {
@@ -86,20 +105,42 @@ fn two_rank_harness() -> (Box<dyn Engine>, JoinHandle<()>) {
         }
     });
 
+    // The worker's accept only unblocks once the head dials in, so the head
+    // MUST be built concurrently — readiness is checked after, not before.
     let head_shard_dir = dir.clone();
     let head_rt = tokio::runtime::Runtime::new().expect("head runtime");
-    let head: Box<dyn Engine> = head_rt.block_on(async move {
+    let head_res: Result<Box<dyn Engine>, String> = head_rt.block_on(async move {
         let mut hb = SparseMoEBuilder::new(
             SparseMoEBuilderConfig::new(head_shard_dir.to_str().expect("utf8 path"), "CPU")
                 .with_rank(0, 2),
         );
         hb.connect(PeerLayout::first_of(PeerEndpoint::new("127.0.0.1", port)))
             .await
-            .expect("head connect");
-        let _progress = hb.load(shard(true, false)).await.expect("head load");
-        Box::new(hb).build().expect("head build")
+            .map_err(|e| format!("head connect: {e:?}"))?;
+        hb.load(shard(true, false))
+            .await
+            .map_err(|e| format!("head load: {e:?}"))?;
+        Box::new(hb)
+            .build()
+            .map_err(|e| format!("head build: {e:?}"))
     });
     std::mem::forget(head_rt);
+    let head = match head_res {
+        Ok(h) => h,
+        Err(e) => {
+            // Surface the worker's failure as the likely root cause.
+            let worker_err = match ready_rx.try_recv() {
+                Ok(Err(w)) => format!(" (worker: {w})"),
+                _ => String::new(),
+            };
+            panic!("head startup failed: {e}{worker_err}");
+        }
+    };
+    match ready_rx.recv_timeout(std::time::Duration::from_secs(300)) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("worker startup failed: {e}"),
+        Err(_) => panic!("worker not ready within 300s"),
+    }
 
     (head, worker_thread)
 }

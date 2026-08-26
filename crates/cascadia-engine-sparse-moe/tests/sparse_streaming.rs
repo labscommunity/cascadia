@@ -7,9 +7,14 @@
 //! decode, or in the resume-seed streaming shape, shows up here instead of
 //! only in the rig cert.
 //!
-//! Gated on `K26_TINY_DIR` (see `tests/k26_native_tiny.rs`): the fixture
-//! cannot be committed (~1.4 GiB, K2.6 dims pinned at compile time). CI skips
-//! this file; the hardware cert is the enforcement gate for what's below.
+//! Gated on `K26_TINY_HEAD_DIR`: a K2.6 tiny tree exported WITH
+//! `tools/export_kimi_k26.py --head`, built `--features openvino`. The worker
+//! rank here is a LAST stage, which hard-requires `head/openvino_model.xml`
+//! and a real OV runtime to compile it — deliberately a DIFFERENT env var
+//! from `K26_TINY_DIR`, whose tree `tests/k26_native_tiny.rs` asserts is
+//! head-LESS (one tree cannot satisfy both files). The fixture cannot be
+//! committed (~1.4 GiB, K2.6 dims pinned at compile time). CI skips this
+//! file; the hardware cert is the enforcement gate for what's below.
 //!
 //! `Engine::step` is SYNC and `block_on`s internally (`engine.rs`'s
 //! `SparseMoEEngine::block_on`) — every test here drives `head.step()` from a
@@ -25,7 +30,28 @@ use cascadia_engine_sparse_moe::{Manifest, SparseMoEBuilder, SparseMoEBuilderCon
 use cascadia_types::{FinishReason, GenerationTask, PeerEndpoint, PeerLayout, ShardSpec};
 
 fn tiny_dir() -> Option<PathBuf> {
-    std::env::var("K26_TINY_DIR").ok().map(PathBuf::from)
+    if cfg!(not(feature = "openvino")) {
+        eprintln!(
+            "sparse_streaming: skipping (build with --features openvino — \
+             the last-stage worker compiles the OV head IR)"
+        );
+        return None;
+    }
+    let dir = match std::env::var("K26_TINY_HEAD_DIR") {
+        Ok(d) => PathBuf::from(d),
+        Err(_) => {
+            eprintln!("K26_TINY_HEAD_DIR not set; skipping");
+            return None;
+        }
+    };
+    if !dir.join("head").join("openvino_model.xml").exists() {
+        eprintln!(
+            "K26_TINY_HEAD_DIR tree has no head/openvino_model.xml \
+             (re-export with export_kimi_k26.py --head); skipping"
+        );
+        return None;
+    }
+    Some(dir)
 }
 
 /// `layer_end` covering every MoE layer in the manifest (ids are 1-based) —
@@ -86,11 +112,16 @@ fn two_rank_harness() -> (Box<dyn Engine>, JoinHandle<()>) {
     let manifest = Manifest::load(&dir).expect("manifest");
     let port = free_port();
 
+    // The worker's startup errors must reach the test: its JoinHandle is
+    // never joined, so a bare `expect` panic there is swallowed and the
+    // head then blocks in connect for CASCADIA_CONNECT_TIMEOUT_SECS
+    // (default 300s) with the real cause invisible.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let worker_dir = dir.clone();
     let worker_shard = shard(&manifest, false, true);
     let worker_thread = std::thread::spawn(move || {
         let worker_rt = tokio::runtime::Runtime::new().expect("worker runtime");
-        let mut worker: Box<dyn Engine> = worker_rt.block_on(async move {
+        let built: Result<Box<dyn Engine>, String> = worker_rt.block_on(async move {
             let mut wb = SparseMoEBuilder::new(
                 SparseMoEBuilderConfig::new(worker_dir.to_str().expect("utf8 path"), "CPU")
                     .with_rank(1, 2),
@@ -98,10 +129,24 @@ fn two_rank_harness() -> (Box<dyn Engine>, JoinHandle<()>) {
             wb.configure_listen("127.0.0.1", port);
             wb.connect(PeerLayout::last_of(PeerEndpoint::new("127.0.0.1", port)))
                 .await
-                .expect("worker connect");
-            let _progress = wb.load(worker_shard).await.expect("worker load");
-            Box::new(wb).build().expect("worker build")
+                .map_err(|e| format!("worker connect: {e:?}"))?;
+            wb.load(worker_shard)
+                .await
+                .map_err(|e| format!("worker load: {e:?}"))?;
+            Box::new(wb)
+                .build()
+                .map_err(|e| format!("worker build: {e:?}"))
         });
+        let mut worker = match built {
+            Ok(w) => {
+                let _ = ready_tx.send(Ok(()));
+                w
+            }
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        };
         // Drive the worker for the rest of the test process. When the head
         // side eventually drops (process exit), `step_worker` degrades to
         // its WORKER_BACKOFF idle loop rather than erroring hard, so this
@@ -111,19 +156,41 @@ fn two_rank_harness() -> (Box<dyn Engine>, JoinHandle<()>) {
         }
     });
 
+    // The worker's accept only unblocks once the head dials in, so the head
+    // MUST be built concurrently — readiness is checked after, not before.
     let head_shard = shard(&manifest, true, false);
     let head_rt = tokio::runtime::Runtime::new().expect("head runtime");
-    let head: Box<dyn Engine> = head_rt.block_on(async move {
+    let head_res: Result<Box<dyn Engine>, String> = head_rt.block_on(async move {
         let mut hb = SparseMoEBuilder::new(
             SparseMoEBuilderConfig::new(dir.to_str().expect("utf8 path"), "CPU").with_rank(0, 2),
         );
         hb.connect(PeerLayout::first_of(PeerEndpoint::new("127.0.0.1", port)))
             .await
-            .expect("head connect");
-        let _progress = hb.load(head_shard).await.expect("head load");
-        Box::new(hb).build().expect("head build")
+            .map_err(|e| format!("head connect: {e:?}"))?;
+        hb.load(head_shard)
+            .await
+            .map_err(|e| format!("head load: {e:?}"))?;
+        Box::new(hb)
+            .build()
+            .map_err(|e| format!("head build: {e:?}"))
     });
     std::mem::forget(head_rt);
+    let head = match head_res {
+        Ok(h) => h,
+        Err(e) => {
+            // Surface the worker's failure as the likely root cause.
+            let worker_err = match ready_rx.try_recv() {
+                Ok(Err(w)) => format!(" (worker: {w})"),
+                _ => String::new(),
+            };
+            panic!("head startup failed: {e}{worker_err}");
+        }
+    };
+    match ready_rx.recv_timeout(std::time::Duration::from_secs(300)) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("worker startup failed: {e}"),
+        Err(_) => panic!("worker not ready within 300s"),
+    }
 
     (head, worker_thread)
 }
@@ -133,8 +200,7 @@ fn two_rank_harness() -> (Box<dyn Engine>, JoinHandle<()>) {
 #[test]
 fn multi_stage_streams_per_token_with_empty_final() {
     let Some(_dir) = tiny_dir() else {
-        eprintln!("K26_TINY_DIR not set; skipping");
-        return;
+        return; // gate already printed why
     };
     let (mut head, _worker) = two_rank_harness();
     head.submit(GenerationTask::new("t1", "hello").with_max_tokens(4))
@@ -165,8 +231,7 @@ fn multi_stage_streams_per_token_with_empty_final() {
 #[test]
 fn resume_seed_streams_continuation_only() {
     let Some(_dir) = tiny_dir() else {
-        eprintln!("K26_TINY_DIR not set; skipping");
-        return;
+        return; // gate already printed why
     };
     let (mut head, _worker) = two_rank_harness();
     let mut task = GenerationTask::new("t2", "hello").with_max_tokens(6);
@@ -199,8 +264,7 @@ fn resume_seed_streams_continuation_only() {
 #[test]
 fn zero_budget_resume_finals_immediately_length() {
     let Some(_dir) = tiny_dir() else {
-        eprintln!("K26_TINY_DIR not set; skipping");
-        return;
+        return; // gate already printed why
     };
     let (mut head, _worker) = two_rank_harness();
     let mut task = GenerationTask::new("t3", "hello").with_max_tokens(2);
@@ -216,8 +280,7 @@ fn zero_budget_resume_finals_immediately_length() {
 #[test]
 fn cancel_mid_decode_clears_active() {
     let Some(_dir) = tiny_dir() else {
-        eprintln!("K26_TINY_DIR not set; skipping");
-        return;
+        return; // gate already printed why
     };
     let (mut head, _worker) = two_rank_harness();
     head.submit(GenerationTask::new("t4", "hello").with_max_tokens(50))
