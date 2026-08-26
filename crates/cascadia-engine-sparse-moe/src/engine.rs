@@ -2150,12 +2150,26 @@ impl SparseMoEEngine {
             a.generated.push(next_u);
             a.history.push(next);
         }
-        let full = self
+        // A decode Err must NOT fall through as "" — utf8_safe_delta would
+        // reset `emitted` to 0 and the next successful decode would re-emit
+        // the whole turn (on a resumed turn: the forced prefix). Terminal
+        // error chunk, same shape as the forward-failure arm below.
+        let full = match self
             .tokenizer
             .as_ref()
             .unwrap()
             .decode(&self.active.as_ref().unwrap().generated, true)
-            .unwrap_or_default();
+        {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(task = %id, "mid-stream decode failed; surfacing error: {e}");
+                self.active = None;
+                return vec![(
+                    id.clone(),
+                    Chunk::error(id, format!("mid-stream decode failed: {e}")),
+                )];
+            }
+        };
         let delta = {
             let a = self.active.as_mut().unwrap();
             // One-shot Option-B seam guard (mirror of the single-stage
@@ -3976,12 +3990,26 @@ impl OvMoeEngine {
             let a = self.active_ov.as_mut().unwrap();
             a.generated.push(next_u);
         }
-        let full = self
+        // A decode Err must NOT fall through as "" — utf8_safe_delta would
+        // reset `emitted` to 0 and the next successful decode would re-emit
+        // the whole turn (on a resumed turn: the forced prefix). Terminal
+        // error chunk, same shape as the forward-failure arm below.
+        let full = match self
             .tokenizer
             .as_ref()
             .unwrap()
             .decode(&self.active_ov.as_ref().unwrap().generated, true)
-            .unwrap_or_default();
+        {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(task = %id, "mid-stream decode failed; surfacing error: {e}");
+                self.active_ov = None;
+                return vec![(
+                    id.clone(),
+                    Chunk::error(id, format!("mid-stream decode failed: {e}")),
+                )];
+            }
+        };
         let delta = {
             let a = self.active_ov.as_mut().unwrap();
             // One-shot Option-B seam guard (mirror of the single-stage
