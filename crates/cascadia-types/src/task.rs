@@ -97,8 +97,22 @@ pub struct GenerationTask {
     /// `resume_generated_seed`); one that cannot honor a forced prefix
     /// declines with a `resume_unsupported:`-prefixed error. Either way the
     /// ids are NEVER re-emitted, and never silently ignored.
-    #[serde(default)]
+    ///
+    /// Wire-normalized: a legal `Some([])` payload means "not resuming" and
+    /// deserializes to `None`, so `Some` ⇒ non-empty is a DATA invariant at
+    /// the wire boundary (`resume_ids()` stays the accessor of record — it
+    /// also covers tasks constructed in-process).
+    #[serde(default, deserialize_with = "de_resume_ids")]
     pub resume_token_ids: Option<Vec<i32>>,
+}
+
+/// See `resume_token_ids`: `Some([])` on the wire normalizes to `None`.
+fn de_resume_ids<'de, D>(d: D) -> Result<Option<Vec<i32>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<Vec<i32>>::deserialize(d)?;
+    Ok(v.filter(|ids| !ids.is_empty()))
 }
 
 fn default_max_tokens() -> u32 {
@@ -219,6 +233,28 @@ mod tests {
         });
         let back: GenerationTask = serde_json::from_value(without_field).unwrap();
         assert_eq!(back.resume_token_ids, None);
+    }
+
+    #[test]
+    fn wire_empty_resume_ids_normalize_to_none() {
+        // A wire-legal `[]` means "not resuming" — the deserializer makes
+        // `Some` ⇒ non-empty a data invariant so no consumer can branch on a
+        // raw `is_some()` and force resume semantics onto a plain turn.
+        let payload = serde_json::json!({
+            "task_id": "t1",
+            "prompt": "hello",
+            "resume_token_ids": [],
+        });
+        let back: GenerationTask = serde_json::from_value(payload).unwrap();
+        assert_eq!(back.resume_token_ids, None);
+
+        let payload = serde_json::json!({
+            "task_id": "t1",
+            "prompt": "hello",
+            "resume_token_ids": [7, 8],
+        });
+        let back: GenerationTask = serde_json::from_value(payload).unwrap();
+        assert_eq!(back.resume_token_ids, Some(vec![7, 8]));
     }
 
     #[test]
