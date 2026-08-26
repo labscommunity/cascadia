@@ -1375,7 +1375,8 @@ struct ActiveSpec {
     /// Issue-34: the prompt tokens (capture key = prompt ++ out). `kv_coord` only.
     #[cfg(feature = "kv_coord")]
     prompt_ids: Vec<i64>,
-    /// Accumulated accepted tokens (including the first sampled token).
+    /// Accumulated accepted tokens (including the first sampled token;
+    /// preceded by the resume seed on a resumed turn).
     out: Vec<i64>,
     /// Option B: length of the resume-seed prefix at the front of `out` (0 when
     /// not resuming). Unconditional (not `kv_coord`-gated) so both builds see

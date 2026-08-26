@@ -63,6 +63,10 @@ fn moe_end(m: &Manifest) -> u32 {
     m.moe_layer_ids().last().copied().unwrap_or(0) + 1
 }
 
+/// BOTH ranks get the full MoE layer range: these tests target the WIRE path
+/// (streaming shape, resume seams, chain death), not memory economy, and the
+/// tiny fixture makes a duplicate stack cheap. Contrast ovmoe_streaming.rs,
+/// whose 0/0 layer_end gets a real even split for free from `load_staged`.
 fn shard(m: &Manifest, is_first: bool, is_last: bool) -> ShardSpec {
     ShardSpec {
         model_id: "k26_tiny".into(),

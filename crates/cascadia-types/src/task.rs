@@ -91,8 +91,12 @@ pub struct GenerationTask {
     #[serde(default)]
     pub tenant: String,
     /// Option B resumable generation: already-emitted assistant token-ids to
-    /// force-prefix. When `Some`, the engine APPENDS these to the rendered
-    /// prompt-ids and pre-seeds `generated` with them — they are NEVER re-emitted.
+    /// force-prefix. An engine that supports resume APPENDS these to the
+    /// rendered prompt-ids and accounts prefix + new against `max_tokens`
+    /// (by pre-seeding its accumulator or by subtracting — see
+    /// `resume_generated_seed`); one that cannot honor a forced prefix
+    /// declines with a `resume_unsupported:`-prefixed error. Either way the
+    /// ids are NEVER re-emitted, and never silently ignored.
     #[serde(default)]
     pub resume_token_ids: Option<Vec<i32>>,
 }
@@ -146,9 +150,7 @@ impl GenerationTask {
     pub fn resume_ids(&self) -> Option<&[i32]> {
         self.resume_token_ids.as_deref().filter(|r| !r.is_empty())
     }
-}
 
-impl GenerationTask {
     pub fn new(task_id: impl Into<TaskId>, prompt: impl Into<String>) -> Self {
         Self {
             task_id: task_id.into(),

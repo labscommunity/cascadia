@@ -974,12 +974,12 @@ fn utf8_safe_delta(full: &str, emitted: &mut usize) -> String {
     d
 }
 
-/// Option B resume budget: total (prefix + new) must equal `max_tokens`, the
-/// same invariant the streaming engines enforce by seeding their `generated`
-/// accumulator with the K resume ids. sparse-moe's generate helpers always
-/// start `generated` EMPTY (single-shot decode, no seedable accumulator), so
-/// this subtracts K from the caller's budget instead — the opposite lever,
-/// same total-length result. Saturating, no `.max(1)`: an exhausted budget
+/// Option B resume budget: total (prefix + new) must equal `max_tokens`.
+/// The single-stage whole-turn helper starts `generated` EMPTY, so this
+/// subtracts K from its budget; the streamed begin paths ALSO use this value,
+/// seeding `generated` with the K resume ids and counting
+/// `generated.len() - resume_seed_len` against it — opposite levers, same
+/// total-length result. Saturating, no `.max(1)`: an exhausted budget
 /// (K >= max_tokens) must yield exactly zero new tokens.
 fn resume_max_new(max_tokens: u32, resume_token_ids: Option<&[i32]>) -> usize {
     let already = resume_token_ids.map_or(0, |v| v.len());
@@ -1382,8 +1382,9 @@ impl Engine for SparseMoEEngine {
         // abandoning mid-sequence leaves no stale KV state to clean up here.
         if self.active.as_ref().is_some_and(|a| &a.id == task_id) {
             self.active = None; // free the slot; a zombie here never trips the
-                                // runner's empty-step guard (lib.rs:1006 counts
-                                // produced before the cancelled-filter)
+                                // runner's empty-step guard (cascadia_runner's
+                                // poll loop counts `produced` before filtering
+                                // cancelled task-ids)
         }
         self.pending.retain(|t| &t.task_id != task_id);
     }
@@ -1535,7 +1536,8 @@ impl SparseMoEEngine {
         }
         append_resume_ids(&mut prompt_ids, resume.as_deref());
         // Non-resume keeps the base contract: max_tokens == 0 still yields one
-        // token (`.max(1)`, matching gemma4/qwen36/ov-runtime). Only a RESUMED
+        // token (`.max(1)`, matching gemma4/ov-runtime; qwen36 instead falls back
+        // to its configured max_tokens_default). Only a RESUMED
         // turn may land at zero new tokens (budget exhausted by the prefix) —
         // review found this branch had silently flipped the plain max_tokens=0
         // behavior from 1 token to 0.
@@ -1712,9 +1714,9 @@ impl SparseMoEEngine {
     /// the last rank's rep-penalty history isn't poisoned by prompt tokens),
     /// so prefill is unavoidably whole-turn work; decode after that streams
     /// one token per `step()` via `decode_step_sparse`. Returns `Some` for
-    /// every terminal outcome that doesn't reach decode (errors, the
-    /// zero-budget resume case, spec-decode's burst path, EOS on the very
-    /// first generated token); `None` means `self.active` is now armed.
+    /// every terminal outcome that doesn't reach decode (errors, the empty
+    /// prompt, the zero-budget resume case, spec-decode's burst path, EOS on
+    /// the very first generated token); `None` means `self.active` is armed.
     fn begin_generation_sparse(&mut self) -> Option<Vec<(TaskId, Chunk)>> {
         let task = match self.pending.pop_front() {
             Some(t) => t,
@@ -1772,7 +1774,8 @@ impl SparseMoEEngine {
                   "Option B resume admitted (multi-stage, streamed)");
         }
         // Non-resume keeps the base contract: max_tokens == 0 still yields one
-        // token (`.max(1)`, matching gemma4/qwen36/ov-runtime). Only a RESUMED
+        // token (`.max(1)`, matching gemma4/ov-runtime; qwen36 instead falls back
+        // to its configured max_tokens_default). Only a RESUMED
         // turn may land at zero new tokens (budget exhausted by the prefix) —
         // review found this branch had silently flipped the plain max_tokens=0
         // behavior from 1 token to 0.
@@ -1783,7 +1786,10 @@ impl SparseMoEEngine {
         };
         let mut sampling_cfg = sampling_from_task(&task);
         // Option B: force greedy decode on a resumed turn so the continuation
-        // is deterministic (see step_single_stage for rationale).
+        // is deterministic (see step_single_stage for rationale). Only the
+        // sparse-moe engines need the explicit force — the OV engine family
+        // (ov-runtime/gemma4/qwen36) is argmax-only, so the same invariant
+        // holds there by construction.
         if seed_opt.is_some() {
             sampling_cfg.temperature = 0.0;
         }
@@ -2211,10 +2217,12 @@ impl SparseMoEEngine {
                     let epoch = crate::kv_coordination::synth_epoch(&captured);
                     // Bounded: an older peer that meets CaptureV2 errors WITHOUT
                     // acking, and the only ceiling otherwise is the transport
-                    // frame-idle default — reached before this turn's
-                    // already-complete chunks are returned. Timeout ⇒ capture
-                    // skipped, turn delivered (the connection is dropped, so the
-                    // NEXT turn on this chain pays the reconnect).
+                    // frame-idle default — reached before this turn's terminal
+                    // chunk is returned (the burst path's whole output, the
+                    // streamed path's final marker; token chunks already went
+                    // out). Timeout ⇒ capture skipped, the turn still completes
+                    // (the connection is dropped, so the NEXT turn on this
+                    // chain pays the reconnect).
                     let acked = self.block_on(async {
                         match tokio::time::timeout(CAPTURE_ACK_TIMEOUT, async {
                             send_capture(downstream, epoch, &captured, tenant)
@@ -3237,8 +3245,11 @@ impl SparseMoEEngine {
             )),
             // Issue-34 cross-chain carried-slice restore: the moved-to head pulled THIS rank's
             // slice from the prior chain and ships it inline (this rank has no local capture for a
-            // foreign chain's epoch). Apply, relay a bare RESTORE downstream (deeper ranks own
-            // their own carry frames), ack the all-or-nothing verdict. Mirror of the OvMoe handler.
+            // foreign chain's epoch). Apply, then relay a bare RESTORE downstream and ack the
+            // all-or-nothing verdict. Only the FIRST downstream rank ever receives a carry frame
+            // today — the head's stash rejects a second rank's blob on epoch collision, so a
+            // 3+-stage cross-chain move deliberately degrades to a clean cold (see
+            // `stash_downstream_rank`). Mirror of the OvMoe handler.
             #[cfg(feature = "kv_coord")]
             FrameKind::RestoreCarry => {
                 let (epoch, blob) = self

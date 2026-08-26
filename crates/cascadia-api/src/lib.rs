@@ -1839,6 +1839,10 @@ async fn chat_completions(
         // client that could set it from request JSON could name another tenant's namespace and
         // resume off its prefix. The real value is assigned server-side from the admitted identity.
         tenant: String::new(),
+        // Never client-settable, same class as `tenant`: a client that could
+        // seed it from request JSON would inject arbitrary token-ids into the
+        // model's context PAST the rendered prompt. Only the scheduler's
+        // rescue path sets it, engine-side of this API.
         resume_token_ids: None,
     };
 
@@ -2056,6 +2060,7 @@ async fn completions(
         trust_remote_code: false,
         // H.1b: hardcoded server-side; see the note on the chat endpoint's task above.
         tenant: String::new(),
+        // Never client-settable; see the chat endpoint's note.
         resume_token_ids: None,
     };
 
