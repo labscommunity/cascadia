@@ -1657,7 +1657,16 @@ impl SparseMoEEngine {
             if full_text.as_bytes().starts_with(prefix_text.as_bytes()) {
                 full_text.get(prefix_text.len()..).unwrap_or("").to_string()
             } else {
-                warn!(task = %task.task_id, "resume seam diverged; re-anchoring (tail delta dropped)");
+                // Whole-turn path: re-anchoring here withholds the ENTIRE
+                // tail text, and the final below still reads as a clean
+                // success (token_ids carries the real ids for id-based
+                // splicing). This event is the only signal of that, so it
+                // is structured, not just prose.
+                tracing::warn!(target: "cascadia::engine",
+                    event = "resume_seam_diverged_whole_turn",
+                    task = %task.task_id,
+                    full_len = full_text.len(), prefix_len = prefix_text.len(),
+                    "resume seam diverged; whole-turn tail TEXT withheld, ids still surfaced");
                 String::new()
             }
         } else {
@@ -1731,17 +1740,14 @@ impl SparseMoEEngine {
                 }
             }
         };
-        if prompt_ids.is_empty() {
-            return Some(vec![(
-                task.task_id.clone(),
-                Chunk::final_marker(task.task_id, ""),
-            )]);
-        }
         // Option B forced-prefix resume: append the already-emitted assistant
         // tokens after the rendered prompt (concat, not replace) and seed the
         // streaming accumulator from them — the distributed prefill loop
         // below is agnostic to id origin, so the appended ids prefill
-        // naturally. `Ok(None)` on a plain (non-resume) turn.
+        // naturally. `Ok(None)` on a plain (non-resume) turn. Runs BEFORE the
+        // empty-prompt early return so a resumed task with an empty rendered
+        // prompt streams its seed instead of getting a success-shaped final
+        // with the forced prefix silently ignored.
         let mut seed_opt = match self
             .tokenizer
             .as_ref()
@@ -1754,9 +1760,15 @@ impl SparseMoEEngine {
                 return Some(vec![(id.clone(), Chunk::error(id, e))]);
             }
         };
-        if seed_opt.is_some() {
+        if prompt_ids.is_empty() {
+            return Some(vec![(
+                task.task_id.clone(),
+                Chunk::final_marker(task.task_id, ""),
+            )]);
+        }
+        if let Some(seed) = seed_opt.as_ref() {
             info!(task = %task.task_id, event = "resume_admitted",
-                  seed_len = seed_opt.as_ref().unwrap().seed_len,
+                  seed_len = seed.seed_len,
                   "Option B resume admitted (multi-stage, streamed)");
         }
         // Non-resume keeps the base contract: max_tokens == 0 still yields one
@@ -3855,13 +3867,13 @@ impl OvMoeEngine {
                 )]);
             }
         };
-        if prompt_ids.is_empty() {
-            return Some(vec![(id.clone(), Chunk::final_marker(id, ""))]);
-        }
         // Option B forced-prefix resume: append the already-emitted assistant
         // tokens after the rendered prompt (concat, not replace) and seed the
         // streaming accumulator from them. `prepare_resume` works in i64 —
-        // OvMoe's prompt ids are u32, so round-trip at this boundary.
+        // OvMoe's prompt ids are u32, so round-trip at this boundary. Runs
+        // BEFORE the empty-prompt early return so a resumed task with an
+        // empty rendered prompt streams its seed instead of getting a
+        // success-shaped final with the forced prefix silently ignored.
         let mut prompt64: Vec<i64> = prompt_ids.iter().map(|&t| i64::from(t)).collect();
         let mut seed_opt = match self
             .tokenizer
@@ -3875,9 +3887,12 @@ impl OvMoeEngine {
                 return Some(vec![(id.clone(), Chunk::error(id, e))]);
             }
         };
-        if seed_opt.is_some() {
+        if prompt64.is_empty() {
+            return Some(vec![(id.clone(), Chunk::final_marker(id, ""))]);
+        }
+        if let Some(seed) = seed_opt.as_ref() {
             info!(task = %id, event = "resume_admitted",
-                  seed_len = seed_opt.as_ref().unwrap().seed_len,
+                  seed_len = seed.seed_len,
                   "Option B resume admitted (MiniMax-M2 pipeline-parallel, streamed)");
         }
         let prompt_ids: Vec<u32> = prompt64.iter().map(|&t| t as u32).collect(); // validated in-vocab

@@ -1562,7 +1562,10 @@ impl Engine for OvDistSpecEngine {
             // Option B: resume seeds a prefix ahead of the freshly sampled token,
             // so the newly sampled token is `out.last()`, not `out[0]` — checking
             // `out[0]` would test a RESUMED token for EOS and finalize instantly.
-            let first_new = *active.out.last().unwrap_or(&0);
+            // `out` is seeded + first-sample-pushed before this runs; an
+            // empty vec is a broken invariant, and silently reading token 0
+            // here would test a fabricated id for EOS.
+            let first_new = *active.out.last().expect("out seeded before init step");
             let hit_eos = self.eos_token_ids.contains(&(first_new as u32));
             let finished = active.out.len() >= max_tokens || hit_eos;
             let new_text =
