@@ -2236,8 +2236,20 @@ impl OvRuntimeEngine {
                 String::new()
             } else {
                 let seed_u32: Vec<u32> = resume_seed.iter().map(|&t| t as u32).collect();
-                tok.decode(&seed_u32, true)
-                    .map_err(|e| EngineError::Backend(format!("tokenizer decode: {e}")))?
+                match tok.decode(&seed_u32, true) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        // Attributed like the validation branch above: the task is
+                        // already popped from pending, so a bare Err from step()
+                        // fails whichever queued stream happens to poll while THIS
+                        // task's stream hangs with nothing further.
+                        let id = task.task_id.clone();
+                        return Ok(vec![(
+                            id.clone(),
+                            Chunk::error(id, format!("resume seed decode failed: {e}")),
+                        )]);
+                    }
+                }
             };
             self.active = Some(ActiveTask {
                 task,
