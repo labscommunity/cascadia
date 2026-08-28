@@ -1098,8 +1098,20 @@ fn worker_should_report_disconnect(peer_disconnected: bool, already_reported: bo
 /// (split out, same as `prefill_reply_budget` below, purely so a test can pin
 /// "prefill exceeds per-token" against the real function instead of a
 /// disconnected literal). Pure, for testing.
+/// Hard ceiling on the decode-phase token-reply wait, independent of the
+/// operator-tunable `recv_timeout` — mirror of ov-runtime's issue-#40
+/// `TOKEN_RECV_DEADLINE_CEILING`. The rig certs legitimately export
+/// `CASCADIA_ACTIVATION_TIMEOUT_SECS=600` for slow cold prefills; uncapped,
+/// that became THIS budget, and a 600 s bound never beats the gateway's 180 s
+/// inter-token deadline — the tail-kill stall surfaced as a gateway Stall
+/// with nothing for the resume splicer to rescue (rig 2026-08-28, sparse-moe
+/// resume cert at 021a14c2: the bound was armed but had not elapsed). A token
+/// REPLY of an active generation has a tight real deadline regardless of how
+/// slow prefill is allowed to be.
+const TOKEN_RECV_DEADLINE_CEILING: std::time::Duration = std::time::Duration::from_secs(120);
+
 fn per_token_reply_budget(recv_timeout: std::time::Duration) -> std::time::Duration {
-    recv_timeout
+    recv_timeout.min(TOKEN_RECV_DEADLINE_CEILING)
 }
 
 /// Safety margin the clamped prefill budget must stay under the frame-idle
@@ -6336,6 +6348,22 @@ mod tests {
             prefill_reply_budget(recv_timeout, None),
             std::time::Duration::from_secs(600)
         );
+    }
+
+    #[test]
+    fn per_token_budget_beats_the_gateway_inter_token_deadline() {
+        // The rig resume certs export CASCADIA_ACTIVATION_TIMEOUT_SECS=600
+        // for slow cold prefills. The DECODE reply bound must stay under the
+        // gateway's 180 s inter-token deadline anyway, or a dead downstream
+        // stalls to a gateway Stall with nothing for the resume splicer to
+        // rescue (rig 2026-08-28: 600 s armed-but-unelapsed == the pre-fix
+        // signature, byte for byte).
+        let rig = std::time::Duration::from_secs(600);
+        assert_eq!(per_token_reply_budget(rig), TOKEN_RECV_DEADLINE_CEILING);
+        assert!(per_token_reply_budget(rig) < std::time::Duration::from_secs(180));
+        // The default stays untouched below the ceiling.
+        let dflt = std::time::Duration::from_secs(60);
+        assert_eq!(per_token_reply_budget(dflt), dflt);
     }
 
     #[test]
