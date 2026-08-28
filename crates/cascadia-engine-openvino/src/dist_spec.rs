@@ -1375,8 +1375,15 @@ struct ActiveSpec {
     /// Issue-34: the prompt tokens (capture key = prompt ++ out). `kv_coord` only.
     #[cfg(feature = "kv_coord")]
     prompt_ids: Vec<i64>,
-    /// Accumulated accepted tokens (including the first sampled token).
+    /// Accumulated accepted tokens (including the first sampled token;
+    /// preceded by the resume seed on a resumed turn).
     out: Vec<i64>,
+    /// Option B: length of the resume-seed prefix at the front of `out` (0 when
+    /// not resuming). Unconditional (not `kv_coord`-gated) so both builds see
+    /// the same `ActiveSpec` layout; used to keep the kv-capture key from
+    /// double-counting the resume ids (they're already in `prompt_ids`).
+    #[cfg_attr(not(feature = "kv_coord"), allow(dead_code))]
+    resume_seed_len: usize,
     /// Cumulative byte-length of the detokenized text emitted so far.
     /// Used to compute the streaming delta on each step.
     /// Bytes already handed to the client (see `decode_delta`).
@@ -1499,7 +1506,31 @@ impl Engine for OvDistSpecEngine {
                     return Ok(vec![(task_id, c)]);
                 }
             };
-            let prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
+            let mut prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
+            // Option B forced-prefix resume: append the already-emitted assistant
+            // tokens after the rendered prompt (concat, not replace) — flows into
+            // BOTH the draft and target prefill via start_task's shared feed_ids.
+            // No-op when not resuming (`resume_ids()` normalizes `Some([])` too).
+            let resume = task.resume_ids().map(<[i32]>::to_vec);
+            if let Some(r) = resume.as_deref() {
+                // Peer-supplied indices reach native OV prefill — bound them first.
+                let vocab = crate::resume_vocab_bound(&self.tokenizer);
+                if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
+                    let task_id = task.task_id.clone();
+                    let c = Chunk::error(task.task_id, format!("invalid resume prefix: {e}"));
+                    return Ok(vec![(task_id, c)]);
+                }
+                // Exhausted budget (prefix >= max_tokens): finish Length with ZERO
+                // new tokens BEFORE start_task — start_task unconditionally samples
+                // and pushes the first token, which would overshoot the budget.
+                if r.len() >= task.max_tokens.max(1) as usize {
+                    let mut c = Chunk::final_marker(task.task_id.clone(), "");
+                    c.n_tokens = Some(0);
+                    c.finish_reason = Some(cascadia_types::FinishReason::Length);
+                    return Ok(vec![(task.task_id.clone(), c)]);
+                }
+            }
+            cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
             info!(
                 task = %task.task_id,
                 prompt_tokens = prompt_ids.len(),
@@ -1529,7 +1560,14 @@ impl Engine for OvDistSpecEngine {
             // If the first token already hits max_tokens or EOS, finalize now.
             // Decided before decoding: it is what makes this the terminal read,
             // which tells decode_delta whether it may hold anything back.
-            let hit_eos = self.eos_token_ids.contains(&(active.out[0] as u32));
+            // Option B: resume seeds a prefix ahead of the freshly sampled token,
+            // so the newly sampled token is `out.last()`, not `out[0]` — checking
+            // `out[0]` would test a RESUMED token for EOS and finalize instantly.
+            // `out` is seeded + first-sample-pushed before this runs; an
+            // empty vec is a broken invariant, and silently reading token 0
+            // here would test a fabricated id for EOS.
+            let first_new = *active.out.last().expect("out seeded before init step");
+            let hit_eos = self.eos_token_ids.contains(&(first_new as u32));
             let finished = active.out.len() >= max_tokens || hit_eos;
             let new_text =
                 decode_delta(&self.tokenizer, &active.out, &mut active.emitted, !finished);
@@ -1540,13 +1578,14 @@ impl Engine for OvDistSpecEngine {
                     task_id,
                     Chunk {
                         task_id: active.task.task_id.clone(),
-                        token_id: active.out[0],
+                        token_id: first_new,
                         text: new_text,
                         is_final: false,
                         logprobs: None,
                         n_tokens: Some(1),
                         prompt_tokens: None,
                         error: None,
+                        token_ids: Vec::new(),
                         finish_reason: None,
                     },
                 )]
@@ -1556,12 +1595,22 @@ impl Engine for OvDistSpecEngine {
             match self.do_one_round(max_tokens) {
                 Err(e) => {
                     warn!(task = %task_id, error = %e, "ov-dist-spec round failed");
-                    self.finish_task(task_id, String::new(), 0)
+                    // Surface, don't `finish_task`: finishing turns a dead-peer transport
+                    // error into a clean `[DONE]`, so the client gets a truncated answer
+                    // presented as complete and issue-34's splicer — which only triggers on
+                    // a surfaced error — never fires. Clearing `active` first (as runtime.rs
+                    // does) keeps a stale task from wedging the next `submit()`.
+                    // `for_task` is load-bearing: an unattributed Err from step() makes the
+                    // runner fail whichever queued stream happened to poll, while THIS
+                    // task's stream hangs with nothing further (review finding).
+                    self.active = None;
+                    return Err(e.for_task(task_id));
                 }
                 Ok(RoundResult {
                     delta,
                     finished,
                     n_tokens,
+                    token_ids,
                 }) => {
                     if finished {
                         self.finish_task(task_id, delta, n_tokens)
@@ -1579,6 +1628,7 @@ impl Engine for OvDistSpecEngine {
                                 n_tokens: Some(n_tokens),
                                 prompt_tokens: None,
                                 error: None,
+                                token_ids,
                                 finish_reason: None,
                             },
                         )]
@@ -1611,6 +1661,10 @@ struct RoundResult {
     /// Chunk::n_tokens so downstream tok/s metrics stay accurate when
     /// each chunk carries multiple tokens (1..=K+1).
     n_tokens: u32,
+    /// The token ids added to `out` this round, in order (accepted drafts
+    /// plus the correction). Surfaced via `Chunk::token_ids` so a dist-spec
+    /// multi-token chunk can serve as a resume source.
+    token_ids: Vec<i64>,
 }
 
 impl OvDistSpecEngine {
@@ -1647,12 +1701,36 @@ impl OvDistSpecEngine {
         let dv = d_shape[2];
         let d_last_logit = d_logits[d_logits.len() - dv..].to_vec();
 
+        // Option B: pre-seed `out` with the resumed tokens so `out.len()` bounds
+        // prefix+new against max_tokens (no separate subtraction needed), and seed
+        // `emitted` with the seed's DECODED BYTES so `decode_delta` hands the client
+        // only `full[emitted.len()..]` — the forced prefix is never re-emitted.
+        // Empty on a normal turn ⇒ identical to today.
+        let mut out = cascadia_types::resume_generated_seed(task.resume_ids());
+        // Captured BEFORE `out.push(first)`: the kv_coord capture key must count
+        // only the resumed prefix, not the freshly sampled token.
+        let resume_seed_len = out.len();
+        let emitted: Vec<u8> = if out.is_empty() {
+            Vec::new()
+        } else {
+            let seed_u32: Vec<u32> = out.iter().map(|&t| t as u32).collect();
+            // Propagate, never `unwrap_or_default()`: an empty seed here would make the
+            // first delta re-emit the entire forced prefix to the client. Failing the
+            // task is the honest outcome — same call as the qwen36 seed-decode fix.
+            self.tokenizer
+                .decode(&seed_u32, true)
+                .map_err(|e| EngineError::Backend(format!("resume seed decode failed: {e}")))?
+                .into_bytes()
+        };
+        out.push(first);
+
         Ok(ActiveSpec {
             task,
             #[cfg(feature = "kv_coord")]
             prompt_ids: prompt_ids.to_vec(),
-            out: vec![first],
-            emitted: Vec::new(),
+            out,
+            emitted,
+            resume_seed_len,
             prev_correction: first,
             d_last_logit,
             stats: SpecDecodeStats::default(),
@@ -1727,6 +1805,9 @@ impl OvDistSpecEngine {
             active.out.push(t);
         }
         let n_tokens_added = (active.out.len() - out_len_before) as u32;
+        // Slice the ids this round actually appended to `out`, in order — the
+        // per-round accepted-ids source for `Chunk::token_ids`.
+        let token_ids_added: Vec<i64> = active.out[out_len_before..].to_vec();
 
         // Rewind any rejected drafts from the target's KV cache.
         self.target.rewind(drafts.len() - accepted);
@@ -1752,6 +1833,7 @@ impl OvDistSpecEngine {
             delta,
             finished: hit_eos || hit_max,
             n_tokens: n_tokens_added,
+            token_ids: token_ids_added,
         })
     }
 
@@ -1770,10 +1852,14 @@ impl OvDistSpecEngine {
         // resets. Best-effort + gated.
         #[cfg(feature = "kv_coord")]
         {
+            // `prompt_ids` already carries the resume ids (Option B appends them
+            // before start_task); `out` is seeded with the same ids so the fed
+            // sequence lines up round-to-round. Skip the seed here so the capture
+            // key matches the real fed depth instead of double-counting it.
             let tokens: Vec<i32> = active
                 .prompt_ids
                 .iter()
-                .chain(active.out.iter())
+                .chain(active.out.iter().skip(active.resume_seed_len))
                 .map(|&t| t as i32)
                 .collect();
             // H.1b R2: this turn's namespace, read off THIS task's own state — never off a
@@ -1787,6 +1873,17 @@ impl OvDistSpecEngine {
             accept = active.stats.accept_rate(),
             "ov-dist-spec done"
         );
+        // Surface every id this round appended, in order — including a
+        // single-token final: `token_id == 0` with an empty `token_ids` reads
+        // as id-less, and token 0 is a legal sample. A ZERO-token final keeps
+        // it empty (this round appended nothing; `token_id` there is a prior
+        // round's last token, not this chunk's).
+        let token_ids = if n_tokens > 0 {
+            let start = active.out.len().saturating_sub(n_tokens as usize);
+            active.out[start..].to_vec()
+        } else {
+            Vec::new()
+        };
         vec![(
             task_id.clone(),
             Chunk {
@@ -1798,6 +1895,7 @@ impl OvDistSpecEngine {
                 n_tokens: if n_tokens > 0 { Some(n_tokens) } else { None },
                 prompt_tokens: None,
                 error: None,
+                token_ids,
                 finish_reason: None,
             },
         )]

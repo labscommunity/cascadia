@@ -55,6 +55,8 @@ pub mod spec_decode;
 pub mod staged;
 pub mod tensors;
 
+#[doc(hidden)]
+pub use engine::{prepare_resume, ResumeSeed};
 pub use engine::{SparseMoEBuilder, SparseMoEBuilderConfig, SparseMoEEngine};
 pub use kv_prefix_cache::{KvPrefixCache, KvSnapshot, LayerKvSlice, ModelFingerprint};
 pub use manifest::Manifest;

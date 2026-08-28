@@ -40,7 +40,20 @@ impl Engine for MockEngine {
         if self.pending.iter().any(|(t, _)| t.task_id == task.task_id) {
             return Ok(());
         }
-        self.pending.push((task, 0));
+        // Option B resume: the seed ids are already-emitted, so start the
+        // echo cursor past them. They are never re-emitted by step().
+        //
+        // Id-FIDELITY, not just length: the mock's own emitted id for position
+        // i is exactly `i` (see step()), so a resume seed claiming this stream
+        // must be [0..K). Length-only checking let a splicer that shuffled or
+        // corrupted ids pass every mock-based integration test (review).
+        let seed = task.resume_ids().map(<[i32]>::to_vec).unwrap_or_default();
+        if let Some((i, &bad)) = seed.iter().enumerate().find(|(i, &id)| id != *i as i32) {
+            return Err(EngineError::Backend(format!(
+                "mock resume seed id mismatch at {i}: got {bad}, this stream emitted {i}"
+            )));
+        }
+        self.pending.push((task, seed.len()));
         Ok(())
     }
 
@@ -79,7 +92,8 @@ impl Engine for MockEngine {
             )]);
         }
         let token = words[emitted].to_string();
-        let chunk = Chunk::token(&task.task_id, emitted as i64, token + " ");
+        let chunk = Chunk::token(&task.task_id, emitted as i64, token + " ")
+            .with_token_ids(vec![emitted as i64]);
         let task_id = task.task_id.clone();
         self.pending.push((task, emitted + 1));
         Ok(vec![(task_id, chunk)])
@@ -218,6 +232,61 @@ mod tests {
             .unwrap();
         // The very next step serves t2 — no draining of the abandoned t1.
         assert_eq!(e.step().unwrap()[0].0, "t2");
+    }
+
+    #[test]
+    fn resume_emits_only_tail_tokens() {
+        let mut e = MockEngine::new();
+        // Prompt echoes to [a b c d]; resume_token_ids covers [a b] (the
+        // mock's own ids for the first two positions), so only c/d are new.
+        let mut task = GenerationTask::new("t1", "a b c d").with_max_tokens(64);
+        task.resume_token_ids = Some(vec![0, 1]);
+        e.submit(task).unwrap();
+        let mut emitted = Vec::new();
+        for _ in 0..8 {
+            for (_, chunk) in e.step().unwrap() {
+                emitted.push(chunk);
+            }
+        }
+        // Exactly 2 new tokens (c, d) then a final marker — the prefix a/b
+        // is never re-emitted.
+        assert_eq!(emitted.len(), 3);
+        assert!(emitted[0].text.starts_with('c'));
+        assert!(emitted[1].text.starts_with('d'));
+        assert!(emitted[2].is_final);
+    }
+
+    #[test]
+    fn resume_with_wrong_ids_is_rejected() {
+        let mut e = MockEngine::new();
+        let mut task = GenerationTask::new("t1", "a b c d").with_max_tokens(64);
+        // Shuffled ids: right length, wrong content — a corrupted accumulator.
+        task.resume_token_ids = Some(vec![1, 0]);
+        assert!(
+            e.submit(task).is_err(),
+            "length-only consumption would have accepted a corrupt prefix"
+        );
+    }
+
+    #[test]
+    fn resume_at_full_budget_emits_zero_new_tokens() {
+        let mut e = MockEngine::new();
+        // The seed alone exhausts max_tokens, so the task finals immediately
+        // with no new tokens. The prompt has MORE words than the budget so the
+        // finish reason provably comes from the BUDGET branch (Length), not
+        // word exhaustion (Stop) — with a 4-word prompt both conditions were
+        // true and the tie-break masked which branch fired.
+        let mut task = GenerationTask::new("t1", "a b c d e f").with_max_tokens(4);
+        task.resume_token_ids = Some(vec![0, 1, 2, 3]);
+        e.submit(task).unwrap();
+        let emitted = e.step().unwrap();
+        assert_eq!(emitted.len(), 1);
+        assert!(emitted[0].1.is_final);
+        assert_eq!(
+            emitted[0].1.finish_reason,
+            Some(cascadia_types::FinishReason::Length),
+            "an exhausted resume budget is a Length stop, like every real engine"
+        );
     }
 
     #[test]

@@ -35,6 +35,11 @@ numerically meaningful (nothing here is — see the module docstring).
 Usage:
     python tools/export_kimi_k26.py --tiny --out /tmp/k26_tiny
     python tools/export_kimi_k26.py --tiny --out /tmp/k26_mid --no-layer0
+    python tools/export_kimi_k26.py --tiny --out /tmp/k26_tiny_head --head
+        # --head also writes head/openvino_model.xml so the tree can serve a
+        # LAST stage (tests/sparse_streaming.rs, K26_TINY_HEAD_DIR). Requires
+        # torch + openvino. Keep --head trees SEPARATE from the head-less tree
+        # K26_TINY_DIR points at: tests/k26_native_tiny.rs asserts head absence.
 """
 
 import argparse
@@ -230,6 +235,43 @@ def write_tokenizer(path, vocab_size):
         json.dump(doc, f)
 
 
+def write_head_ir(out_dir, vocab, seed):
+    """head/openvino_model.xml: RMSNorm(HIDDEN) -> Linear(HIDDEN, vocab), random weights.
+
+    The native runner's last stage compiles EXACTLY this file (runner.rs `head_xml`)
+    and asserts the output's last dim == manifest.vocab_size; input is [1,1,HIDDEN]
+    bf16 at input 0 (name-agnostic). Mirrors export_minimax_m2.py's HeadWrapper.
+    Lazy imports: torch/openvino are only needed when --head is given, keeping the
+    default export numpy-only.
+    """
+    import torch
+    import openvino as ov
+
+    torch.manual_seed(seed)
+
+    class Head(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm_w = torch.nn.Parameter(torch.ones(HIDDEN) + 0.01 * torch.randn(HIDDEN))
+            self.lm = torch.nn.Linear(HIDDEN, vocab, bias=False)
+
+        def forward(self, x):  # x: [1,1,HIDDEN]
+            v = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * self.norm_w
+            return self.lm(v)
+
+    head_dir = os.path.join(out_dir, "head")
+    os.makedirs(head_dir, exist_ok=True)
+    m = ov.convert_model(Head().eval(), example_input=torch.zeros((1, 1, HIDDEN)))
+    # The runner sets input 0 as bf16 (forward_head_last); the f32 trace above would make
+    # OV reject that with ParameterMismatch. Re-type the input tensor to bf16 — OV inserts
+    # the bf16->f32 convert, output logits stay f32 (runner accepts f32/f16/bf16).
+    ppp = ov.preprocess.PrePostProcessor(m)
+    ppp.input(0).tensor().set_element_type(ov.Type.bf16)
+    m = ppp.build()
+    ov.save_model(m, os.path.join(head_dir, "openvino_model.xml"))
+    print(f"[head] wrote {head_dir}/openvino_model.xml (vocab={vocab})", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tiny", action="store_true", help="synthetic random-init tree (the only mode)")
@@ -243,12 +285,25 @@ def main():
     ap.add_argument("--no-experts", action="store_true",
                     help="omit expert weights (load-only tree; experts are lazy)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--head", action="store_true",
+                    help="also emit head/openvino_model.xml (RMSNorm + lm_head as OV IR) so the "
+                         "tree can serve a LAST stage — requires torch + openvino installed")
     args = ap.parse_args()
 
     if not args.tiny:
         ap.error("only --tiny is implemented; a real K2.6 export is export_shards.py's job")
     if args.experts > N_ROUTED_EXPERTS:
         ap.error(f"--experts must be <= {N_ROUTED_EXPERTS}")
+    if args.head:
+        # write_head_ir imports these lazily, but it runs LAST — after the
+        # multi-GiB shard write — and a missing dep there leaves a tree that
+        # LOOKS complete yet has no head (the runner later rejects it with
+        # MissingFile). Fail in a second instead, like the ap.error checks.
+        import importlib.util
+        for mod in ("torch", "openvino"):
+            if importlib.util.find_spec(mod) is None:
+                ap.error(f"--head requires {mod} (pip install {mod}); "
+                         "refusing to start a multi-GiB export that would fail at the head step")
 
     rng = np.random.default_rng(args.seed)
     os.makedirs(args.out, exist_ok=True)
@@ -294,14 +349,19 @@ def main():
     with open(os.path.join(args.out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
 
+    if args.head:
+        write_head_ir(args.out, args.vocab, args.seed)
+
     write_tokenizer(os.path.join(args.out, "tokenizer.json"), args.vocab)
 
     print(f"wrote {args.out}: {w.offset / 2**20:.1f} MiB, "
           f"{len(moe_ids)} MoE shell(s), "
           f"{0 if args.no_experts else args.experts} expert(s)/layer, "
           f"layer0={'no' if args.no_layer0 else 'yes'}", file=sys.stderr)
-    print("NOTE: no head/openvino_model.xml — the native head is OV-IR only, so this "
-          "tree can only be loaded by a non-last stage (see the test).", file=sys.stderr)
+    if not args.head:
+        print("NOTE: no head/openvino_model.xml — the native head is OV-IR only, so this "
+              "tree can only be loaded by a non-last stage (pass --head for a rig-servable tree).",
+              file=sys.stderr)
 
 
 if __name__ == "__main__":

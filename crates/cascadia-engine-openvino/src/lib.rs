@@ -31,3 +31,27 @@ pub use genai::{OvGenaiBuilder, OvGenaiCbEngine, OvGenaiEngine};
 pub use qwen36::{Qwen36Builder, Qwen36Engine};
 pub use rotary::{ModelTextConfig, RopeScalingConfig, Rotary};
 pub use runtime::{OvRuntimeBuilder, OvRuntimeEngine};
+
+/// Tests that touch the process-global activation-timeout knob (or read a
+/// value derived from it under a precondition) must hold this lock: three
+/// runtime.rs tests set it to 1 s and back while gemma4's ceiling test asserts
+/// the budget exceeds the ceiling — racing them made the full-workspace suite
+/// flake with "transport budget (10s) must exceed the ceiling".
+#[cfg(test)]
+pub(crate) fn timeout_knob_lock() -> std::sync::MutexGuard<'static, ()> {
+    static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    L.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Exclusive id bound for `validate_resume_ids`: max assigned id + 1 — NOT
+/// `get_vocab_size(true)`, which returns the ENTRY COUNT and under-counts the
+/// bound on a sparse vocab (added tokens with gapped ids), wrongly rejecting
+/// legitimate resume ids. Falls back to the count for an empty vocab map.
+pub(crate) fn resume_vocab_bound(tok: &tokenizers::Tokenizer) -> u32 {
+    tok.get_vocab(true)
+        .values()
+        .max()
+        .map(|&m| m.saturating_add(1))
+        .unwrap_or(0)
+        .max(tok.get_vocab_size(true) as u32)
+}
