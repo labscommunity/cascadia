@@ -1140,6 +1140,26 @@ fn prefill_reply_budget(
     }
 }
 
+/// Decode-phase bound on a Forward's owed Token reply. The enterprise bridge
+/// PARKS a dead pipeline leg for re-pair instead of closing the engine-side
+/// loopback socket, so a SIGKILLed downstream never surfaces as a transport
+/// error on this wait — only a deadline can. Unbounded, the wait outlives the
+/// gateway's inter-token budget and the stream dies as a Stall with no error
+/// chunk for the resume splicer to rescue (rig 2026-08-27, sparse-moe +
+/// sparse-moe-k26 resume certs).
+fn decode_reply_deadline() -> std::time::Duration {
+    per_token_reply_budget(cascadia_transport::recv_timeout())
+}
+
+/// Prefill-phase bound for the same wait (widened: a prefill step can follow
+/// a heavy downstream set_state after a warm RESTORE).
+fn prefill_reply_deadline() -> std::time::Duration {
+    prefill_reply_budget(
+        cascadia_transport::recv_timeout(),
+        cascadia_transport::frame_idle_ceiling(),
+    )
+}
+
 /// Hard cap on the pending-task queue. step() processes one task end-to-end
 /// per call, so the OS-level backpressure of returning QueueFull is
 /// preferable to silently accreting tasks the engine will not reach for
@@ -1999,7 +2019,13 @@ impl SparseMoEEngine {
             if i + 1 == prompt_ids.len() {
                 // Last prompt token: a sampling Forward; the token it returns
                 // is the first generated token.
-                match self.forward_one_token_first(&history, &sampling_cfg, &downstream, true) {
+                match self.forward_one_token_first(
+                    &history,
+                    &sampling_cfg,
+                    &downstream,
+                    true,
+                    prefill_reply_deadline(),
+                ) {
                     Ok(t) => token_back = t,
                     Err(e) => {
                         return Some(vec![(
@@ -2010,9 +2036,13 @@ impl SparseMoEEngine {
                 }
             } else if (i + 1) % PREFILL_SYNC_EVERY == 0 {
                 // Periodic blocking sync (discards the dummy Token(-1) ack).
-                if let Err(e) =
-                    self.forward_one_token_first(&history, &sampling_cfg, &downstream, false)
-                {
+                if let Err(e) = self.forward_one_token_first(
+                    &history,
+                    &sampling_cfg,
+                    &downstream,
+                    false,
+                    prefill_reply_deadline(),
+                ) {
                     return Some(vec![(
                         task.task_id.clone(),
                         Chunk::error(task.task_id, format!("prefill sync step {i}: {e}")),
@@ -2155,7 +2185,13 @@ impl SparseMoEEngine {
         // memcpy over the turn. forward only reads the slice; put it back on
         // success (the Err arm drops the whole slot, history with it).
         let history = std::mem::take(&mut self.active.as_mut().unwrap().history);
-        match self.forward_one_token_first(&history, &cfg, &downstream, true) {
+        match self.forward_one_token_first(
+            &history,
+            &cfg,
+            &downstream,
+            true,
+            decode_reply_deadline(),
+        ) {
             Ok(tok_back) => {
                 let a = self.active.as_mut().unwrap();
                 a.history = history;
@@ -2405,6 +2441,7 @@ impl SparseMoEEngine {
         cfg: &crate::sampling::SamplingConfig,
         downstream: &Arc<TokioMutex<ActivationClient>>,
         sample_back: bool,
+        reply_deadline: std::time::Duration,
     ) -> Result<i64, String> {
         let hidden = self.runner.manifest.hidden_size as usize;
         let past_seq_len: u32 = history
@@ -2455,17 +2492,11 @@ impl SparseMoEEngine {
                 .map_err(|e| format!("send_forward_nosample: {e}"))?;
             }
             let send_done_us = wire_t0.elapsed().as_micros() as u64;
-            match recv_kind_client(downstream).await {
-                Ok(Some(FrameKind::Token)) => {
-                    let token = recv_token_body_client(downstream)
-                        .await
-                        .map_err(|e| format!("recv_token: {e}"))?;
-                    Ok((token, send_done_us))
-                }
-                Ok(Some(other)) => Err(format!("unexpected frame after forward: {other:?}")),
-                Ok(None) => Err("downstream closed during recv_kind".into()),
-                Err(e) => Err(format!("recv_kind: {e}")),
-            }
+            // BOUNDED reply wait (closes the connection on elapse — the late
+            // Token would otherwise pair with the next request). See
+            // `decode_reply_deadline` for why a dead peer never errors here.
+            let token = crate::dist::recv_token_reply(downstream, reply_deadline).await?;
+            Ok((token, send_done_us))
         });
         match result {
             Ok((token, send_done_us)) => {
@@ -2529,7 +2560,13 @@ impl SparseMoEEngine {
             // samples; intermediates go as ForwardNoSample so their
             // discarded tokens never pollute the last rank's history.
             let token_back = self
-                .forward_one_token_first(&history, cfg, downstream, i + 1 == prompt_ids.len())
+                .forward_one_token_first(
+                    &history,
+                    cfg,
+                    downstream,
+                    i + 1 == prompt_ids.len(),
+                    prefill_reply_deadline(),
+                )
                 .map_err(|e| format!("spec prefill step {i}: {e}"))?;
             if i + 1 == prompt_ids.len() {
                 if eos.contains(&token_back) {
@@ -2557,7 +2594,13 @@ impl SparseMoEEngine {
             // No proposal → fall back to one standard forward step.
             if drafts.is_empty() {
                 let token_back = self
-                    .forward_one_token_first(&history, cfg, downstream, true)
+                    .forward_one_token_first(
+                        &history,
+                        cfg,
+                        downstream,
+                        true,
+                        decode_reply_deadline(),
+                    )
                     .map_err(|e| format!("spec fallback step: {e}"))?;
                 if eos.contains(&token_back) {
                     break;
@@ -2593,8 +2636,14 @@ impl SparseMoEEngine {
                 // get the next round's prev_correction. Same as the
                 // single-stage path; kept as a single-token Forward so
                 // we don't introduce a 1-token ForwardBatch frame.
-                self.forward_one_token_first(&history, cfg, downstream, true)
-                    .map_err(|e| format!("spec bonus forward (round {n_rounds}): {e}"))?
+                self.forward_one_token_first(
+                    &history,
+                    cfg,
+                    downstream,
+                    true,
+                    decode_reply_deadline(),
+                )
+                .map_err(|e| format!("spec bonus forward (round {n_rounds}): {e}"))?
             };
 
             // Reconciliation: pop rejected drafts from history, then
@@ -2758,16 +2807,35 @@ impl SparseMoEEngine {
             .await
             .map_err(|e| format!("send_forward_batch: {e}"))?;
             let send_done_us = wire_t0.elapsed().as_micros() as u64;
-            match recv_kind_client(downstream).await {
-                Ok(Some(FrameKind::TokenBatch)) => {
-                    let tokens = recv_token_batch_body_client(downstream)
-                        .await
-                        .map_err(|e| format!("recv_token_batch: {e}"))?;
-                    Ok((tokens, send_done_us))
+            // BOUNDED like the single-token reply (and close on elapse for the
+            // same late-pairing hazard) — a parked bridge leg never errors
+            // this recv on its own; see `decode_reply_deadline`.
+            match tokio::time::timeout(decode_reply_deadline(), async {
+                match recv_kind_client(downstream).await {
+                    Ok(Some(FrameKind::TokenBatch)) => {
+                        let tokens = recv_token_batch_body_client(downstream)
+                            .await
+                            .map_err(|e| format!("recv_token_batch: {e}"))?;
+                        Ok((tokens, send_done_us))
+                    }
+                    Ok(Some(other)) => {
+                        Err(format!("unexpected frame after forward_batch: {other:?}"))
+                    }
+                    Ok(None) => Err("downstream closed during recv_kind (batch)".into()),
+                    Err(e) => Err(format!("recv_kind (batch): {e}")),
                 }
-                Ok(Some(other)) => Err(format!("unexpected frame after forward_batch: {other:?}")),
-                Ok(None) => Err("downstream closed during recv_kind (batch)".into()),
-                Err(e) => Err(format!("recv_kind (batch): {e}")),
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    downstream.lock().await.close().await;
+                    Err(format!(
+                        "batch reply timeout after {:?}: downstream silent (dead peer?); \
+                         connection dropped to avoid reading this reply as the next request's",
+                        decode_reply_deadline()
+                    ))
+                }
             }
         });
         match result {
@@ -3727,6 +3795,7 @@ impl OvMoeEngine {
         cfg: &crate::sampling::SamplingConfig,
         downstream: &Arc<TokioMutex<ActivationClient>>,
         sample_back: bool,
+        reply_deadline: std::time::Duration,
     ) -> Result<i64, String> {
         let hidden = self
             .runner
@@ -3747,14 +3816,9 @@ impl OvMoeEngine {
                     .await
                     .map_err(|e| format!("send_forward_nosample: {e}"))?;
             }
-            match recv_kind_client(downstream).await {
-                Ok(Some(FrameKind::Token)) => recv_token_body_client(downstream)
-                    .await
-                    .map_err(|e| format!("recv_token: {e}")),
-                Ok(Some(other)) => Err(format!("rank 0 expected Token, got {other:?}")),
-                Ok(None) => Err("downstream closed before Token".into()),
-                Err(e) => Err(format!("recv_kind: {e}")),
-            }
+            // BOUNDED reply wait — see `decode_reply_deadline` for why a dead
+            // peer never errors this recv on its own (bridge parks the leg).
+            crate::dist::recv_token_reply(downstream, reply_deadline).await
         })
     }
 
@@ -3941,7 +4005,14 @@ impl OvMoeEngine {
         let n_prompt = prompt_ids.len();
         for (i, &t) in prompt_ids.iter().enumerate().skip(warm_prefix) {
             let sample_back = i + 1 == n_prompt;
-            match self.forward_one_token_first(t, pos, &cfg, &downstream, sample_back) {
+            match self.forward_one_token_first(
+                t,
+                pos,
+                &cfg,
+                &downstream,
+                sample_back,
+                prefill_reply_deadline(),
+            ) {
                 Ok(tok_back) => next = tok_back,
                 Err(e) => {
                     warn!(task = %id, "prefill forward failed: {e}");
@@ -4050,7 +4121,14 @@ impl OvMoeEngine {
         }
         let downstream = self.active_ov.as_ref().unwrap().downstream.clone();
         let cfg = self.active_ov.as_ref().unwrap().cfg.clone();
-        match self.forward_one_token_first(next_u, pos, &cfg, &downstream, true) {
+        match self.forward_one_token_first(
+            next_u,
+            pos,
+            &cfg,
+            &downstream,
+            true,
+            decode_reply_deadline(),
+        ) {
             Ok(tok_back) => {
                 let a = self.active_ov.as_mut().unwrap();
                 a.next = tok_back;

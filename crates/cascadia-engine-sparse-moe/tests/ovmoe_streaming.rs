@@ -71,6 +71,21 @@ fn two_rank_harness() -> (Box<dyn Engine>, JoinHandle<()>) {
 /// loop return (dropping the engine + its runtime, closing the sockets), so a
 /// test can simulate mid-decode chain death and join the worker thread.
 fn two_rank_harness_killable() -> (Box<dyn Engine>, JoinHandle<()>, Arc<AtomicBool>) {
+    let (head, worker, kill, _mute) = two_rank_harness_faultable();
+    (head, worker, kill)
+}
+
+/// `two_rank_harness_killable` plus a MUTE switch: setting it makes the worker
+/// loop spin WITHOUT stepping — its sockets stay open but it never replies.
+/// This is the rig's real mid-decode death shape: the enterprise bridge parks
+/// a dead pipeline leg instead of closing the engine-side loopback, so the
+/// head sees silence, not a transport error (rig 2026-08-27 resume stall).
+fn two_rank_harness_faultable() -> (
+    Box<dyn Engine>,
+    JoinHandle<()>,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+) {
     let dir = model_dir().expect("caller must gate on model_dir() first");
     let port = free_port();
 
@@ -81,6 +96,8 @@ fn two_rank_harness_killable() -> (Box<dyn Engine>, JoinHandle<()>, Arc<AtomicBo
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let kill = Arc::new(AtomicBool::new(false));
     let kill_worker = Arc::clone(&kill);
+    let mute = Arc::new(AtomicBool::new(false));
+    let mute_worker = Arc::clone(&mute);
     let worker_dir = dir.clone();
     let worker_thread = std::thread::spawn(move || {
         let worker_rt = tokio::runtime::Runtime::new().expect("worker runtime");
@@ -118,6 +135,11 @@ fn two_rank_harness_killable() -> (Box<dyn Engine>, JoinHandle<()>, Arc<AtomicBo
                 // Simulated chain death: return, dropping the engine and its
                 // runtime — sockets close and the head's next forward fails.
                 return;
+            }
+            if mute_worker.load(Ordering::Relaxed) {
+                // Mute: alive, sockets open, never replies.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
             }
             let _ = worker.step();
         }
@@ -161,7 +183,7 @@ fn two_rank_harness_killable() -> (Box<dyn Engine>, JoinHandle<()>, Arc<AtomicBo
         Err(_) => panic!("worker not ready within 300s"),
     }
 
-    (head, worker_thread, kill)
+    (head, worker_thread, kill, mute)
 }
 
 /// Single-stage (`total == 1`) OV-IR engine, used only to exercise the
@@ -437,4 +459,46 @@ fn mid_decode_chain_death_is_an_error_chunk_never_a_final() {
         }
     }
     assert!(saw_error, "chain death must surface an error chunk");
+}
+
+/// The 2026-08-27 rig stall: a downstream that goes SILENT (socket open, no
+/// replies — the bridge parks dead legs, it does not close them) must surface
+/// an error chunk within the engine's bounded reply deadline, well under the
+/// gateway's 180 s inter-token budget — not hang until the gateway kills the
+/// stream with nothing for the resume splicer to rescue.
+#[test]
+fn mid_decode_silent_worker_errors_within_deadline() {
+    let Some(_dir) = model_dir() else {
+        eprintln!("M2_MODEL_DIR not set; skipping");
+        return;
+    };
+    let (mut head, _worker, _kill, mute) = two_rank_harness_faultable();
+    head.submit(GenerationTask::new("tmute", "hello").with_max_tokens(400))
+        .unwrap();
+    let mut chunks = Vec::new();
+    for _ in 0..3 {
+        chunks.extend(head.step().unwrap());
+    }
+    assert!(chunks.iter().all(|(_, c)| !c.is_final));
+    mute.store(true, Ordering::Relaxed);
+    let t0 = std::time::Instant::now();
+    let mut saw_error = false;
+    'outer: while t0.elapsed() < std::time::Duration::from_secs(170) {
+        let out = head.step().unwrap();
+        for (_, c) in &out {
+            assert!(
+                c.error.is_some() || !c.is_final,
+                "silent worker must never produce a success-shaped final: {c:?}"
+            );
+            if c.error.is_some() {
+                saw_error = true;
+                break 'outer;
+            }
+        }
+    }
+    assert!(
+        saw_error,
+        "no error chunk within 170s — the bounded reply deadline did not fire \
+         (gateway inter-token budget is 180s; the engine must beat it)"
+    );
 }
