@@ -1,5 +1,83 @@
 # Changelog
 
+## [0.2.2](https://github.com/labscommunity/cascadia/compare/v0.2.1...v0.2.2) (2026-08-28)
+
+
+### Features
+
+* **dist-spec:** concat forced-prefix into draft+target + per-token id surfacing (Option B) ([f78aff0](https://github.com/labscommunity/cascadia/commit/f78aff08779febb8e39a759b4bc0d1dd25de6fe8))
+* **engine-mock:** concat+seed resume support (Option B contract vehicle) ([ec5c8ff](https://github.com/labscommunity/cascadia/commit/ec5c8ffb72e3769694add76a4f2c5be09a8509fa))
+* **engines:** forced-prefix resume + sparse-moe per-token streaming ([adc15aa](https://github.com/labscommunity/cascadia/commit/adc15aaaec1d0d9d3e8c0b872382a66250a37476))
+* **gemma4:** concat forced-prefix + seed generated/last_text (Option B) ([6c0ce8a](https://github.com/labscommunity/cascadia/commit/6c0ce8a110551d00257bca046c1e1f77af1149d3))
+* **ov-runtime:** concat forced-prefix + seed generated/last_text (Option B) ([e3b45f6](https://github.com/labscommunity/cascadia/commit/e3b45f6de66729d71a31954782d4a5d6728dcd28))
+* **qwen36:** concat forced-prefix + seed; think-splice stays unguarded (Option B) ([b7cb306](https://github.com/labscommunity/cascadia/commit/b7cb3066affc663188a76633e1c4928b1ec3ff24))
+* **sparse-moe:** close three observability gaps on the carry paths ([a340fd8](https://github.com/labscommunity/cascadia/commit/a340fd8c136517baa4105f6192a76968e3467a1d))
+* **sparse-moe:** concat forced-prefix + seed + greedy-forced resume + per-token id surfacing (Option B) ([2d858a4](https://github.com/labscommunity/cascadia/commit/2d858a4e71778928c8e0027234dc00577a099918))
+* **sparse-moe:** log donor-side KV serve refusals + capture stores ([636ddc5](https://github.com/labscommunity/cascadia/commit/636ddc55d11415cf59d630e08a93d98923671a96))
+* **sparse-moe:** native cross-chain carried-slice restore (RESTORE_CARRY) ([955e39b](https://github.com/labscommunity/cascadia/commit/955e39bee8d32959205845d4dfb71bf7a3ecaf59))
+* **sparse-moe:** prepare_resume helper for streamed Option B seeding ([7cac20a](https://github.com/labscommunity/cascadia/commit/7cac20a209863385ce08325f856277b9894265c2))
+* **sparse-moe:** stream OvMoeEngine multi-stage + streamed Option B resume ([2d382c4](https://github.com/labscommunity/cascadia/commit/2d382c4fe3b628c44b580966e851877b9196a207))
+* **sparse-moe:** stream SparseMoEEngine multi-stage per-token (Option B) ([f1b6141](https://github.com/labscommunity/cascadia/commit/f1b614182a42db0ade09f974dae29535dba90bcb))
+* **tools:** export_kimi_k26 --head — emit head/openvino_model.xml so the native tree serves a LAST stage ([ece6bca](https://github.com/labscommunity/cascadia/commit/ece6bca53a6ea00aca00507f3ddd50c21e009bd1))
+* **types:** Chunk.token_ids surfaces every generated id for multi-token chunks (Option B) ([8f124e8](https://github.com/labscommunity/cascadia/commit/8f124e87ad0f9deb8c784e6b1b9e12877289d791))
+* **types:** normalize a wire-legal Some([]) resume prefix to None at deserialization ([f62f19b](https://github.com/labscommunity/cascadia/commit/f62f19bd0032f6408f9d6ca2255643d2528fc61e))
+* **types:** resume_token_ids + append_resume_ids/resume_generated_seed helpers (Option B) ([7a9e311](https://github.com/labscommunity/cascadia/commit/7a9e311df44c425f32a429ed7faf9275228909dc))
+
+
+### Bug Fixes
+
+* **dist-spec:** kv_coord capture key excludes seeded resume prefix (Option B+C) ([da8cc6b](https://github.com/labscommunity/cascadia/commit/da8cc6b2e1601e78fe2e2de904167e77f816bb98))
+* **dist-spec:** surface round failures instead of finishing cleanly ([4711b11](https://github.com/labscommunity/cascadia/commit/4711b11eecb6e80b93aff1ec28505db7fa59231f))
+* **engines:** attribute resume-seed decode failures to the resumed task ([946ae78](https://github.com/labscommunity/cascadia/commit/946ae7894876066c9a93a37c861a1949dbe42758))
+* **engines:** final-review wave — pipeline/genai resume declines, streamed seam guard, carry hardening ([9c54d8a](https://github.com/labscommunity/cascadia/commit/9c54d8a85b06164130ddbae21677c282e9c53f8e))
+* **engines:** propagate Chunk.token_ids to engine Chunk literals after T2 field add ([5dad4e7](https://github.com/labscommunity/cascadia/commit/5dad4e725b7778e8fddfbd1660d547049e55c783))
+* **engines:** resume vocab bound is max assigned id + 1, not the entry count ([ee133a4](https://github.com/labscommunity/cascadia/commit/ee133a468c14579b09df9d4a609a558340c38ff8))
+* **engines:** review fixes — attribution, budgets, seams, peer-id validation ([aba7e10](https://github.com/labscommunity/cascadia/commit/aba7e10afc796653cf8d1c04edaf7cba742ab417))
+* **engines:** seam divergence must re-anchor, never re-emit the forced prefix (Option B) ([fa327ff](https://github.com/labscommunity/cascadia/commit/fa327ff140e695f7c452a668e6795bdd1937af09))
+* **engines:** three review follow-ups on the resume edges ([88d840c](https://github.com/labscommunity/cascadia/commit/88d840c11099b9be8e67163d1313d2c49b0cb83c))
+* **gemma4:** resumed prefill folds the seed at T=1 — reproduce the donor, not a new batch shape ([021a14c](https://github.com/labscommunity/cascadia/commit/021a14c2e18eb69c2e2d4901ea803701fe5eedf8))
+* **ov-runtime:** packed-slots resume decline carries the resume_unsupported: sentinel ([9e2d291](https://github.com/labscommunity/cascadia/commit/9e2d29187530d0d470d9bf494187aa92ea3df7f9))
+* **qwen36:** propagate resume-seed decode error instead of unwrap_or_default (Option B hardening) ([4cb6b84](https://github.com/labscommunity/cascadia/commit/4cb6b849743262e4940aaf2741d3b1efc3373866))
+* **sparse-moe:** bound every rank-0 downstream reply wait — a silent peer must error, not stall ([35b498e](https://github.com/labscommunity/cascadia/commit/35b498e23fb59e3d127543ee6ccb7036ec4dfe63))
+* **sparse-moe:** cap the decode reply budget at 120s — the activation timeout must not govern it ([9da0316](https://github.com/labscommunity/cascadia/commit/9da0316c5e0f1dee6d93eebe3f0de36f60f76705))
+* **sparse-moe:** fix-wave review items R1-R6 (empty prompt, spec-decode resume, warnings, stale docs) ([8375971](https://github.com/labscommunity/cascadia/commit/8375971d5f1b9e96ab93505df3383e8a0d30bda6))
+* **sparse-moe:** key multi-stage capture epoch over KV-covered prefix ([053463e](https://github.com/labscommunity/cascadia/commit/053463e78a44e90ba8022ecf89eba8261da381c6))
+* **sparse-moe:** log the RestoreCarry relay failure instead of folding it silently ([d583382](https://github.com/labscommunity/cascadia/commit/d583382a1a0c0ad2c90153ff395d1be57eb65fe8))
+* **sparse-moe:** mid-stream decode failure surfaces an error, never resets the emit cursor ([c767567](https://github.com/labscommunity/cascadia/commit/c767567418799756d4ea64c33912332b9221e7b2))
+* **sparse-moe:** resume budget subtracts prefix len so total==max_tokens (Option B) ([b482951](https://github.com/labscommunity/cascadia/commit/b4829513c891ae072e084f038a8d60bb54258176))
+* **sparse-moe:** resume decodes tail with prefix context to preserve the seam (Option B §17) ([00069f1](https://github.com/labscommunity/cascadia/commit/00069f1261210e626b116317b6b77607dd353b3a))
+* **sparse-moe:** retire two Option-D follow-ups ([210e7b4](https://github.com/labscommunity/cascadia/commit/210e7b453893b6e1e844e10f8b53df6944006b0f))
+* **test:** re-bind the discarded LoadStream in the streaming harnesses ([5486c17](https://github.com/labscommunity/cascadia/commit/5486c17da6e21ce347442ef629554c39ee703da0))
+* **test:** un-wedge the gated streaming suites — K26_TINY_HEAD_DIR gate + worker failure surfacing ([9b2048c](https://github.com/labscommunity/cascadia/commit/9b2048c6024e01b9fce42fbedcc4b40689740449))
+* **tools:** --head fails fast on missing torch/openvino, and the usage block documents it ([d83a14e](https://github.com/labscommunity/cascadia/commit/d83a14e2596f71270f121b448c923c27595bf4c0))
+* **tools:** export K2.6 head IR with bf16 input ([7fae762](https://github.com/labscommunity/cascadia/commit/7fae762c40bc6d8eeec6a7ce83ce23ceb143f183))
+* **types:** stamp token_ids on every per-token chunk from resume-capable engines ([2f87f1f](https://github.com/labscommunity/cascadia/commit/2f87f1f24f0303bbc4d05db828726c1d4a7a4a97))
+* **types:** supply the base's new tenant field in the Option B test literal ([0d661ba](https://github.com/labscommunity/cascadia/commit/0d661ba4c9c100aa6da7eb4023f5afd33c3df445))
+
+
+### Refactor
+
+* **sparse-moe:** one capture_multi_stage helper for the two head capture sites ([cb8da09](https://github.com/labscommunity/cascadia/commit/cb8da091b8fa9e0750f44f9b6092f2ff95859730))
+
+
+### Documentation
+
+* comment-accuracy fixes from the review ([3e7bfa7](https://github.com/labscommunity/cascadia/commit/3e7bfa7a90fc17fe82494f1526935f1fbfa4f693))
+
+
+### Testing
+
+* **engine-mock:** negative case — shuffled resume seed ids are rejected ([48e068c](https://github.com/labscommunity/cascadia/commit/48e068cf85cc2e50baf25f2d95be7be43c5ef040))
+* **engine-mock:** resume seed ids must match the mock's own echo ids ([c5b6de0](https://github.com/labscommunity/cascadia/commit/c5b6de0dbfbc549621dfff6f039b68c64219431a))
+* **engines:** close the review-flagged coverage gaps ([c7ec5a6](https://github.com/labscommunity/cascadia/commit/c7ec5a64e44d650c76a059fe125ec0471d92569e))
+* **openvino:** serialize activation-timeout knob tests — full-workspace flake ([fbea6c0](https://github.com/labscommunity/cascadia/commit/fbea6c0426e53b8e5326080ff0d1a16394867abb))
+* **sparse-moe:** un-gated PipelineEngine resume decline test ([64223a8](https://github.com/labscommunity/cascadia/commit/64223a892058b3d0f1cb3505654e9c6e2f5211f3))
+
+
+### Miscellaneous
+
+* **engines:** fmt + gate resume_seed_len dead_code under kv_coord (Option B T9 sweep) ([44cbd01](https://github.com/labscommunity/cascadia/commit/44cbd01faa51aa5bcf02827bcdfc09c6ab107d3a))
+
 ## [0.2.1](https://github.com/labscommunity/cascadia/compare/v0.2.0...v0.2.1) (2026-08-26)
 
 
