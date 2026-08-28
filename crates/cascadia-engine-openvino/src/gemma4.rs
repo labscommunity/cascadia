@@ -414,6 +414,19 @@ struct ActiveTask {
     t_wire: std::time::Duration,
 }
 
+/// One prefill span's end. Prompt segment (`i < seed_split`): the engine's
+/// normal folding, `prefill_chunk()`-sized. Seed segment (`i >= seed_split`):
+/// T=1, mirroring the donor's token-by-token decode fold — see the resumed-
+/// prefill comment in `step_first_body`. `seed_split == tokens.len()` (no
+/// resume seed) reduces to the pre-Option-B behavior exactly.
+fn prefill_span_end(i: usize, chunk: usize, seed_split: usize) -> usize {
+    if i < seed_split {
+        i.saturating_add(chunk).min(seed_split)
+    } else {
+        i + 1
+    }
+}
+
 /// Effective prefill span. Default `usize::MAX` = the whole span in ONE pass (unchanged, fastest).
 ///
 /// `CASCADIA_GEMMA4_FORCE_T1_PREFILL=1` ⇒ 1: fold EVERY token through the same T=1 path. A warm-resumed
@@ -1080,14 +1093,18 @@ impl Gemma4Engine {
         if self.active.is_none() {
             return Ok(Vec::new());
         }
-        let (prefill, tokens) = {
+        let (prefill, tokens, seed_len) = {
             let a = self.active.as_mut().unwrap();
             if !a.prefilled {
                 a.prefilled = true;
                 // warm_prefix is 0 on the cold/default path ⇒ full prompt (unchanged).
-                (true, a.prompt_ids[a.warm_prefix..].to_vec())
+                (
+                    true,
+                    a.prompt_ids[a.warm_prefix..].to_vec(),
+                    a.resume_seed_len,
+                )
             } else {
-                (false, vec![a.last_token as i64])
+                (false, vec![a.last_token as i64], 0)
             }
         };
         let single_stage = self.spec.is_first_stage && self.spec.is_last_stage;
@@ -1110,14 +1127,30 @@ impl Gemma4Engine {
         // different GEMM batch shapes (e.g. 22 vs 93 tokens) over int4 weights, and the rounding delta
         // flips a token ⇒ cross-chain warm != cold. Mirrors qwen36's FORCE_T1_PREFILL.
         let chunk = prefill_chunk();
+        // Option B: a resumed prefill must reproduce the DONOR's compute
+        // pattern — the rendered prompt in the engine's normal (batched)
+        // prefill shape, then the resume SEED folded one token at a time,
+        // exactly as the donor generated it token-by-token. Folding the seed
+        // into the prompt batch changes the int4 GEMM batch shape, and the
+        // rounding delta at the seam flips the first continued token under
+        // greedy (rig 2026-08-27: the alternate gemma4 continued 3 tokens
+        // then bailed to its EOS mode — REGENERATED verdict). Same numerics
+        // class the FORCE_T1_PREFILL knob exists for, but resume needs the
+        // SPLIT shape (all-T=1 would instead diverge the PROMPT segment from
+        // the donor's batched prefill), and needs it unconditionally.
+        let seed_split = if prefill {
+            tokens.len().saturating_sub(seed_len)
+        } else {
+            tokens.len()
+        };
         let mut alpha = std::time::Duration::ZERO;
         let mut wire = std::time::Duration::ZERO;
         let mut next_token: i32;
         let position = self.position;
-        if prefill && tokens.len() > 1 && chunk < tokens.len() {
+        if prefill && tokens.len() > 1 && (chunk < tokens.len() || seed_split < tokens.len()) {
             let mut i = 0usize;
             loop {
-                let end = (i + chunk).min(tokens.len());
+                let end = prefill_span_end(i, chunk, seed_split);
                 let span = &tokens[i..end];
                 let pos = self.position;
                 let ts = std::time::Instant::now();
@@ -2363,5 +2396,37 @@ mod tests {
                 panic!("expected ShardRejected for non-adjacent KV sharing, but load() succeeded")
             }
         }
+    }
+    #[test]
+    fn prefill_spans_without_seed_match_the_old_folding() {
+        // chunk = usize::MAX (default single-pass): one span over everything.
+        assert_eq!(prefill_span_end(0, usize::MAX, 10), 10);
+        // explicit chunking, no seed: plain min(i+chunk, len).
+        assert_eq!(prefill_span_end(0, 4, 10), 4);
+        assert_eq!(prefill_span_end(4, 4, 10), 8);
+        assert_eq!(prefill_span_end(8, 4, 10), 10);
+    }
+
+    #[test]
+    fn prefill_spans_fold_the_resume_seed_at_t1() {
+        // 10 tokens, last 3 are the seed: prompt in one MAX-chunk span, then
+        // three T=1 spans — the donor's exact compute pattern.
+        let (chunk, split, len) = (usize::MAX, 7, 10);
+        let mut i = 0;
+        let mut spans = Vec::new();
+        while i < len {
+            let end = prefill_span_end(i, chunk, split);
+            spans.push((i, end));
+            i = end;
+        }
+        assert_eq!(spans, vec![(0, 7), (7, 8), (8, 9), (9, 10)]);
+    }
+
+    #[test]
+    fn prefill_spans_warm_covered_seed_is_all_t1() {
+        // warm_prefix ate into the seed: seed_split saturates to 0 ⇒ every
+        // remaining token folds at T=1.
+        assert_eq!(prefill_span_end(0, usize::MAX, 0), 1);
+        assert_eq!(prefill_span_end(1, usize::MAX, 0), 2);
     }
 }
