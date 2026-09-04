@@ -162,9 +162,32 @@ HF reference exactly wherever the reference is not tied — the export is
 correct — and the int4 IR's residual differences are quantisation
 near-ties, with every factual answer intact.
 
-**Q2 — throughput through the real entry point** (`cascadia run` → `/v1/chat/completions`) and **Q3 — context capacity** (weights resident, growing synthetic prompt): see the tables below, filled from the same box.
+**Q2 — throughput through the real entry point.** `cascadia run … --api`
+then `POST /v1/chat/completions` (`enable_thinking: false`, `max_tokens 96`,
+greedy). `completion_tps` = completion tokens / whole-request wall time, so
+it includes prefill of the 19-token prompt and HTTP.
 
-_(results appended as the measurement chain completes)_
+| path | binary / SDK | device | load | 96-token request | 17×23 |
+|---|---|---|---|---|---|
+| `--engine qwen35`, Qwopus 2-stage chain (`cascadia shard --num-stages 2`) | MSVC, GenAI 2026.2.1 | GPU (B390) | 41 s (both stages) | **15.0–15.6 s → 6.2–6.4 tok/s** | `391` |
+| `--engine qwen35`, same chain | MSVC, GenAI 2026.2.1 | CPU | ~80 s | 32.2 s → 3.0 tok/s | `391` |
+| `--engine ov-genai`, Qwopus int4 (whole IR, `VLMPipeline` text-only) | MSVC, GenAI **2026.3.0** | GPU (B390) | ~60 s | **13.2 s → 7.3 tok/s** | `391` |
+| `--engine ov-genai`, Qwopus int4 | MSVC, GenAI 2026.2.1 | GPU | — | `pipeline_create_vlm` throws | — |
+| `--engine ov-genai`, Intel `Qwen3.8-27B-int4-ov` | MSVC, GenAI 2026.2.1 **and** 2026.3.0 | GPU | — | `pipeline_create_vlm` throws | — |
+
+So on this box the single-stage GenAI path is the fastest (its PagedAttention
+backend has the optimised GatedDeltaNet kernel), the staged path is ~15 %
+behind on GPU and works on the 2026.2 SDK the repo pins, and Intel's
+published IR needs a newer GenAI than 2026.3: its tokenizer IRs were built
+with openvino-tokenizers 2026.4 nightly (stateful `ReadValue`/`Assign` +
+a bare `Truncate` op) and its `chat_template.jinja` is the full multimodal
+template GenAI only parses since the Aug-14 nightly. Re-exporting with the
+2026.3 toolchain (the recipe above) sidesteps both.
+
+**Q3 — context capacity** (weights resident, growing synthetic prompt):
+see the table below, filled from the same box.
+
+_(context sweep appended as it completes)_
 
 ## Limits and follow-ups
 
