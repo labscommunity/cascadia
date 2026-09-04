@@ -172,12 +172,14 @@ it includes prefill of the 19-token prompt and HTTP.
 | `--engine qwen35`, Qwopus 2-stage chain (`cascadia shard --num-stages 2`) | MSVC, GenAI 2026.2.1 | GPU (B390) | 41 s (both stages) | **15.0–15.6 s → 6.2–6.4 tok/s** | `391` |
 | `--engine qwen35`, same chain | MSVC, GenAI 2026.2.1 | CPU | ~80 s | 32.2 s → 3.0 tok/s | `391` |
 | `--engine ov-genai`, Qwopus int4 (whole IR, `VLMPipeline` text-only) | MSVC, GenAI **2026.3.0** | GPU (B390) | ~60 s | **13.2 s → 7.3 tok/s** | `391` |
-| `--engine ov-genai`, Qwopus int4 | MSVC, GenAI 2026.2.1 | GPU | — | `pipeline_create_vlm` throws | — |
-| `--engine ov-genai`, Intel `Qwen3.8-27B-int4-ov` | MSVC, GenAI 2026.2.1 **and** 2026.3.0 | GPU | — | `pipeline_create_vlm` throws | — |
+| `--engine ov-genai`, Qwopus int4 | MSVC, GenAI 2026.2.1 | CPU | ~40 s | serves (`391`; throughput not measured on CPU) | `391` |
+| `--engine ov-genai`, Intel `Qwen3.8-27B-int4-ov` as published | MSVC, GenAI 2026.2.1 **and** 2026.3.0 | GPU | — | `pipeline_create_vlm` throws (tokenizer IRs, see below) | — |
+| `--engine ov-genai`, Intel IR after `convert_tokenizer` | MSVC, GenAI 2026.2.1 and 2026.3.0 | CPU | ~40 s | serves | `391` |
 
 So on this box the single-stage GenAI path is the fastest (its PagedAttention
-backend has the optimised GatedDeltaNet kernel), and the staged path is ~15 %
-behind on GPU and works on the 2026.2 SDK the repo pins.
+backend has the optimised GatedDeltaNet kernel) and works on both the
+2026.2.1 SDK the repo pins and 2026.3; the staged path is ~15 % behind on
+GPU.
 
 **Why Intel's published IR throws, and the fix.** Its `openvino_tokenizer`
 / `openvino_detokenizer` IRs were built with openvino-tokenizers **2026.4
@@ -219,7 +221,7 @@ OVMS node was paused so the box was otherwise idle):
 | 32 K | 78.5 s | 417 | 5.1 | 20.8 GB |
 | 64 K | 219 s | 299 | 4.0 | 21.9 GB |
 | 128 K | 667 s | 196 | 3.1 | 25.1 GB |
-| 256 K (native max) | _see below_ | | | |
+| 256 K (native max) | 3256 s (54 min) | 81 | 2.5 | 31.9 GB at decode (~43 GB peak during prefill) |
 
 Memory is not the limit on a 64 GB box: state grows ~60–120 KB per
 context token (16 attention layers × 4 KV heads × 256 × f16 = 64 KB/token
@@ -229,7 +231,10 @@ weights. What degrades is time: prefill falls from ~500 tok/s to ~200
 tok/s as attention over the growing KV dominates, and decode from 6.4 to
 3.1 tok/s by 128 K. Practical guidance on this hardware: ≤32 K tokens
 stays interactive (TTFT ≲ 80 s, decode ≥ 5 tok/s); 64–128 K works but
-TTFT is 4–11 minutes.
+TTFT is 4–11 minutes; the full 262 K window fits (peak ~43 GB of 64 GB)
+but costs 54 minutes of prefill, so it is a capacity fact, not a usable
+setting on an iGPU. (The 256 K prompt was 4 tokens over the model's
+`max_position_embeddings`; mRoPE extrapolated without error.)
 
 ## Limits and follow-ups
 
