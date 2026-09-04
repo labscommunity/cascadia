@@ -257,7 +257,7 @@ fn legacy_hidden() -> usize {
     LEGACY_HIDDEN
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct Manifest {
     /// HF model_type of the source IR: `qwen3_5_moe` (Qwen3.5/3.6) or
     /// `qwen3_5` (dense Qwen3.8). Anything else is not a surgery tree
@@ -292,7 +292,7 @@ impl Manifest {
     }
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct StageInfo {
     stage: usize,
     layer_start: u32,
