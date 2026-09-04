@@ -204,10 +204,32 @@ convert_tokenizer /path/to/Qwen3.8-27B-int4-ov --with-detokenizer -o /path/to/Qw
 
 Exports made with the 2026.3 toolchain (the recipe above) need nothing.
 
-**Q3 — context capacity** (weights resident, growing synthetic prompt):
-see the table below, filled from the same box.
+**Q3 — context capacity** (weights resident, growing synthetic prompt).
+Qwopus int4 on the B390 via the raw stateful IR (512-token prefill chunks,
+16 greedy tokens after the prompt), one run per point, fresh process each
+(RSS = host-visible resident set incl. the iGPU's UMA allocations; the
+OVMS node was paused so the box was otherwise idle):
 
-_(context sweep appended as it completes)_
+| prompt tokens | TTFT | prefill tok/s | decode tok/s | resident |
+|---|---|---|---|---|
+| 1 K | 2.4 s | 425 | 6.1 | 17.1 GB |
+| 4 K | 8.1 s | 505 | 6.4 | 18.1 GB |
+| 8 K | 15.5 s | 527 | 6.1 | 19.1 GB |
+| 16 K | 32.8 s | 500 | 6.2 | 19.5 GB |
+| 32 K | 78.5 s | 417 | 5.1 | 20.8 GB |
+| 64 K | 219 s | 299 | 4.0 | 21.9 GB |
+| 128 K | 667 s | 196 | 3.1 | 25.1 GB |
+| 256 K (native max) | _see below_ | | | |
+
+Memory is not the limit on a 64 GB box: state grows ~60–120 KB per
+context token (16 attention layers × 4 KV heads × 256 × f16 = 64 KB/token
+of KV; the 48 DeltaNet layers hold fixed-size recurrent state), so even
+the full 262 K window costs well under 32 GB on top of the 16 GB of
+weights. What degrades is time: prefill falls from ~500 tok/s to ~200
+tok/s as attention over the growing KV dominates, and decode from 6.4 to
+3.1 tok/s by 128 K. Practical guidance on this hardware: ≤32 K tokens
+stays interactive (TTFT ≲ 80 s, decode ≥ 5 tok/s); 64–128 K works but
+TTFT is 4–11 minutes.
 
 ## Limits and follow-ups
 
