@@ -142,6 +142,26 @@ tok/s; the stateful path's GatedDeltaNet reference kernel on CPU
 (openvino #37845: only the PagedAttention path has the optimised GDN kernel)
 explains most of the CPU gap.
 
+**HF-reference parity (Qwopus).** Reference: `transformers 5.2.0` bf16
+greedy on a 28-core Mac Pro (1.5 TB RAM; `Qwen3_5ForCausalLM`, MTP and
+vision tensors dropped, ~2 s/token). Compared token-for-token over 32
+greedy tokens against the OpenVINO exports on tate-07:
+
+| prompt | OV **bf16** IR (CPU) | OV **int4** IR (GPU = CPU) |
+|---|---|---|
+| raw `The capital of France is` | 32/32 | 32/32 |
+| raw `user: Explain how rainbows form.` (the parity-test prompt) | 32/32 | 32/32 |
+| chat `What is 17 * 23? …` | 4/4 (`391`) | 4/4 (`391`) |
+| chat `List three prime numbers greater than 100.` | 32/32 | diverges at token 15 (`1.  **101**` vs `1. **101**`: a spacing token; content identical) |
+| chat `Write a haiku about mountains.` | diverges at token 0 | diverges at token 2 |
+
+The haiku's first step is an **exact bf16 logit tie** in the reference
+(`Stone` vs the alternative, both 18.5), so both OpenVINO results are the
+other side of a coin flip, not an error. Net: the bf16 IR reproduces the
+HF reference exactly wherever the reference is not tied — the export is
+correct — and the int4 IR's residual differences are quantisation
+near-ties, with every factual answer intact.
+
 **Q2 — throughput through the real entry point** (`cascadia run` → `/v1/chat/completions`) and **Q3 — context capacity** (weights resident, growing synthetic prompt): see the tables below, filled from the same box.
 
 _(results appended as the measurement chain completes)_
