@@ -47,7 +47,7 @@ fn engine_name(kind: EngineKind) -> &'static str {
         EngineKind::OvDistSpec => "ov-dist-spec",
         EngineKind::Gemma4 => "gemma4",
         EngineKind::SparseMoe => "sparse-moe",
-        EngineKind::Qwen36Moe => "qwen36-moe",
+        EngineKind::Qwen36Moe => "qwen35",
     }
 }
 
@@ -211,10 +211,13 @@ pub enum EngineKind {
     /// per token (not all 384) and runs the expert matmuls through the
     /// hand-rolled AVX-512 int4 GEMM kernel. Single-stage, CPU-targeted.
     SparseMoe,
-    /// Qwen3.6-35B-A3B staged engine. Runs the IR-surgery shard chain
+    /// Qwen3.5-family staged engine (`qwen35`; `qwen36-moe` kept as an
+    /// alias). Runs the IR-surgery shard chain
     /// (`tools/qwen36_surgery/export_qwen36_moe.py` output dir with
-    /// manifest.json) in-process; greedy-only, batch=1. CPU-targeted
-    /// for decode (see docs/architectures/qwen36-moe-support.md).
+    /// manifest.json) in-process for both `qwen3_5_moe` (Qwen3.5/3.6-35B-A3B)
+    /// and dense `qwen3_5` (Qwen3.8-27B); greedy-only, batch=1 (see
+    /// docs/architectures/qwen36-moe-support.md and qwen3.8.md).
+    #[value(name = "qwen35", alias = "qwen36-moe")]
     Qwen36Moe,
 }
 
@@ -699,8 +702,9 @@ const DEFAULT_STATIC_CONTEXT: u32 = 1024;
 #[derive(Parser, Debug, Clone)]
 pub struct ShardArgs {
     /// HuggingFace repo id (e.g. unsloth/Meta-Llama-3.1-8B-Instruct), a local
-    /// directory with safetensors + config.json, or — for the Gemma-4 / Qwen3.6
-    /// surgery paths — an already-exported OpenVINO IR directory.
+    /// directory with safetensors + config.json, or — for the Gemma-4 /
+    /// Qwen3.5-family (3.6 MoE, 3.8 dense) surgery paths — an
+    /// already-exported OpenVINO IR directory.
     #[arg(long)]
     pub model: String,
 
@@ -912,7 +916,7 @@ fn cmd_engines() -> Result<()> {
     println!("  ov-dist-spec   multi-stage spec decode (mask-based KV rewind); v5 shards");
     println!("  gemma4         Gemma 4 multi-stage (per-layer-type attn, KV-sharing, PLI); gemma4_cached_v1 shards");
     println!("  sparse-moe     Kimi K2.6 (AVX-512 int4 GEMM + Rust MLA shells) or MiniMax-M2 (OV-IR shells); single-stage top-k expert dispatch");
-    println!("  qwen36-moe     Qwen3.6-35B-A3B staged chain (GatedDeltaNet + MoE); qwen3_5_moe IR-surgery shards");
+    println!("  qwen35         Qwen3.5-family staged chain (GatedDeltaNet; 3.5/3.6 MoE or 3.8 dense); qwen3_5* IR-surgery shards (alias: qwen36-moe)");
     Ok(())
 }
 
@@ -1068,12 +1072,12 @@ fn warn_ignored_ov_perf_flags(args: &WorkerArgs) {
         );
     }
 
-    // qwen36-moe compiles with a fixed plugin config and receives no OV perf
+    // qwen35 compiles with a fixed plugin config and receives no OV perf
     // properties (some hints break its IRs — see qwen36.rs). If the user set
     // general hints, warn they won't take effect on this engine.
     if matches!(args.engine, EngineKind::Qwen36Moe) && !ov_perf_properties(args).is_empty() {
         tracing::warn!(
-            "ignoring --ov-* performance flags: the qwen36-moe engine compiles \
+            "ignoring --ov-* performance flags: the qwen35 engine compiles \
              with a fixed plugin config and does not apply them"
         );
     }
@@ -1123,8 +1127,8 @@ fn export_hint(model: &str, engine: EngineKind) -> String {
              cascadia worker --engine gemma4 --model ./{stem}-2stage ..."
         ),
         EngineKind::Qwen36Moe => format!(
-            "  cascadia shard --model <qwen3.6 int4-ov dir> --output-dir ./{stem}-2stage --num-stages 2\n    \
-             cascadia run ./{stem}-2stage --engine qwen36-moe"
+            "  cascadia shard --model <qwen3.6/3.8 int4-ov dir> --output-dir ./{stem}-2stage --num-stages 2\n    \
+             cascadia run ./{stem}-2stage --engine qwen35"
         ),
         // sparse-moe consumes a manifest.json expert tree, not a shard tree.
         EngineKind::SparseMoe => {
@@ -2106,8 +2110,9 @@ const ALIASES_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tools/model_aliases.py"
 ));
-/// Qwen3.5/3.6 hybrid-MoE exporter (IR surgery on the official int4 IR),
-/// dispatched by export_shards.py for model_type qwen3_5_moe.
+/// Qwen3.5-family exporter (IR surgery on the official int4 IR),
+/// dispatched by export_shards.py for model_type qwen3_5_moe (Qwen3.5/3.6
+/// MoE) and qwen3_5 (dense Qwen3.8).
 const QWEN36_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tools/qwen36_surgery/export_qwen36_moe.py"
@@ -2374,7 +2379,7 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
             status
         ));
     }
-    // qwen3_5_moe shards run the in-process stage chain, not the
+    // qwen3_5-family shards run the in-process stage chain, not the
     // per-stage worker mesh; give the right invocation per manifest arch.
     let arch =
         std::fs::read_to_string(std::path::Path::new(&args.output_dir).join("manifest.json"))
@@ -2382,10 +2387,10 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .and_then(|v| v["arch"].as_str().map(String::from))
             .unwrap_or_default();
-    if arch == "qwen3_5_moe" {
+    if arch.starts_with("qwen3_5") {
         eprintln!(
             "\nShard tree written to {}. Run with:\n  cascadia run {} \
-             --engine qwen36-moe --device CPU --api :8000",
+             --engine qwen35 --device CPU --api :8000",
             args.output_dir, args.output_dir
         );
     } else if args.num_stages == 1 {
@@ -2694,7 +2699,7 @@ mod python_tests {
         // Each engine reads a different tree; don't send them all to ov-runtime.
         for (engine, needle) in [
             (EngineKind::Gemma4, "--engine gemma4"),
-            (EngineKind::Qwen36Moe, "--engine qwen36-moe"),
+            (EngineKind::Qwen36Moe, "--engine qwen35"),
             (EngineKind::SparseMoe, "manifest.json"),
             (EngineKind::OvGenai, "optimum-cli"),
             (EngineKind::OvRuntime, "--engine ov-runtime"),

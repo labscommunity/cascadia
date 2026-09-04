@@ -1,25 +1,35 @@
 #!/usr/bin/env python3
-"""Qwen3.6-35B-A3B shard exporter — IR surgery on the official int4 IR.
+"""Qwen3.5-family shard exporter — IR surgery on the official int4 IR.
+
+Covers every `qwen3_5*` model_type that optimum-intel exports with the
+VLM layout (`openvino_language_model.xml` + text-embeddings IR):
+
+  * `qwen3_5_moe` — Qwen3.5/3.6-35B-A3B (hybrid GatedDeltaNet + 256-expert
+    MoE; 40 layers, hidden 2048)
+  * `qwen3_5`     — Qwen3.8-27B (hybrid GatedDeltaNet, dense MLP; 64 layers,
+    hidden 5120)
 
 Cuts the whole-model `openvino_language_model.xml` into per-stage stateful
 IRs at decoder-layer boundaries. No re-export, no re-quantization: stages
 inherit Intel's artifacts byte-for-byte (probes proved bit-exact parity —
 see probe_shell_extract*.py and docs/architectures/qwen36-moe-support.md).
+The MoE block is opaque to the surgery (no expert slicing), which is why
+the dense sibling needs nothing but the model shape.
 
-Boundary contract (proven):
+Model shape (hidden size, layer count, per-layer attention type) is read
+from the model dir's `config.json` (`text_config` when nested), never
+hard-coded: state-variable ids are numbered by LAYER-TYPE SEQUENCE, so
+the exporter walks `layer_types` to map a global layer index onto its
+`past.{conv,ssm}.<m>cache` / `past.{key,value}.<k>cache` pair.
+
+Boundary contract (proven on the 35B, re-validated on the 27B):
   * stage input  = input_value(0) of `layers.A.input_layernorm/aten::pow/Power`
                    (replaced with a `stage_hidden` Parameter; first stage
                    keeps the natural `inputs_embeds` path instead)
   * stage output = output of `layers.B/aten::add/Add_1`
                    (last stage keeps the natural `logits` output instead)
   * per-layer state rides along as ReadValue/Assign sinks, selected by
-    semantic variable_id: cache_params.past.{conv,ssm}.<global> for
-    DeltaNet layers, cache_params.past.{key,value}.<(global-3)//4> for
-    full-attention layers (3:1 pattern, full-attn at 4k+3).
-
-Known v1 wart (documented in spec): mid stages keep `inputs_embeds` as a
-dummy input — upstream mask/position ShapeOf chains reference it. Feed
-zeros of shape [1,1,hidden]; values are never read, only shapes.
+    semantic variable_id (see layer_state_vids).
 
 Usage (on a node with the model dir):
   python export_qwen36_moe.py --model <int4-ov dir> --out <dir> \
@@ -29,44 +39,139 @@ import argparse
 import json
 import os
 import time
+from dataclasses import dataclass, field
 
 import numpy as np
-import openvino as ov
-from openvino import opset13 as ops
 
-HIDDEN = 2048
-NUM_LAYERS = 40
-FULL_ATTN_INTERVAL = 4  # layers 3, 7, ..., 39 are full attention
+# `openvino` is imported lazily inside the functions that touch IRs so the
+# pure shape helpers (read_model_spec / layer_state_vids / stage_ranges)
+# stay unit-testable on hosts without the runtime.
+
+LINEAR = "linear_attention"
+FULL = "full_attention"
+DEFAULT_FULL_ATTN_INTERVAL = 4  # 3× DeltaNet : 1× full attention
 
 
-def layer_state_vids(global_idx: int) -> list[str]:
+@dataclass
+class ModelSpec:
+    """Shape facts the surgery needs, read from config.json."""
+
+    model_type: str  # outer model_type: qwen3_5 | qwen3_5_moe
+    hidden: int
+    num_layers: int
+    layer_types: list = field(default_factory=list)
+    vocab: int = 0
+
+    @property
+    def family(self) -> str:
+        return "qwen3_5"
+
+
+def synth_layer_types(num_layers: int, interval: int = DEFAULT_FULL_ATTN_INTERVAL) -> list:
+    """`full_attention_interval` fallback: full attention at every
+    `interval`-th layer (4k+3 for interval 4), DeltaNet elsewhere."""
+    return [FULL if (i + 1) % interval == 0 else LINEAR for i in range(num_layers)]
+
+
+def spec_from_config(raw: dict) -> ModelSpec:
+    """Build a ModelSpec from a parsed config.json dict (outer VLM wrapper
+    or bare text config)."""
+    outer_mt = (raw.get("model_type") or "").lower()
+    cfg = raw.get("text_config") or raw
+    inner_mt = (cfg.get("model_type") or "").lower()
+    mt = outer_mt or inner_mt
+    if not (mt.startswith("qwen3_5") or inner_mt.startswith("qwen3_5")):
+        raise ValueError(
+            f"model_type {outer_mt or inner_mt!r} is not a qwen3_5-family "
+            f"model (expected qwen3_5 / qwen3_5_moe); this exporter does IR "
+            f"surgery on the official Qwen3.5/3.6/3.8 OpenVINO IRs only"
+        )
+    hidden = cfg.get("hidden_size")
+    num_layers = cfg.get("num_hidden_layers")
+    if not isinstance(hidden, int) or not isinstance(num_layers, int):
+        raise ValueError(
+            "config.json lacks integer hidden_size / num_hidden_layers "
+            "(looked under text_config and at the top level)"
+        )
+    layer_types = cfg.get("layer_types")
+    if not isinstance(layer_types, list) or len(layer_types) != num_layers:
+        interval = cfg.get("full_attention_interval") or DEFAULT_FULL_ATTN_INTERVAL
+        layer_types = synth_layer_types(num_layers, int(interval))
+    unknown = sorted(set(layer_types) - {LINEAR, FULL})
+    if unknown:
+        raise ValueError(f"unsupported layer_types {unknown}; expected only {LINEAR}/{FULL}")
+    # Normalise to the HF family name (qwen3_5 / qwen3_5_moe) even when
+    # handed a bare text config (qwen3_5_text / qwen3_5_moe_text).
+    arch = outer_mt or inner_mt
+    if arch.endswith("_text"):
+        arch = arch[: -len("_text")]
+    return ModelSpec(
+        model_type=arch,
+        hidden=hidden,
+        num_layers=num_layers,
+        layer_types=list(layer_types),
+        vocab=int(cfg.get("vocab_size") or 0),
+    )
+
+
+def read_model_spec(model_dir: str) -> ModelSpec:
+    path = os.path.join(model_dir, "config.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{path} not found — the surgery exporter reads hidden_size / "
+            f"num_hidden_layers / layer_types from the model dir's config.json"
+        )
+    with open(path) as f:
+        return spec_from_config(json.load(f))
+
+
+def layer_state_vids(layer_types: list, global_idx: int) -> list:
     """variable_id match strings owned by a global layer index.
 
     State vars are numbered by LAYER-TYPE SEQUENCE, not globally:
-    conv/ssm 0..29 over the 30 DeltaNet layers, key/value 0..9 over the
-    10 full-attention layers. The `past.X.<n>cache` form is the junction
-    inside the concatenated variable_id and is collision-proof
+    conv/ssm over the DeltaNet layers in order, key/value over the
+    full-attention layers in order (0..29 / 0..9 on the 40-layer 35B,
+    0..47 / 0..15 on the 64-layer 27B). The `past.X.<n>cache` form is the
+    junction inside the concatenated variable_id and is collision-proof
     (`conv.3cache` never matches `conv.30cache`).
     """
-    if (global_idx + 1) % FULL_ATTN_INTERVAL == 0:
-        k = global_idx // FULL_ATTN_INTERVAL
-        return [f"past.key.{k}cache", f"past.value.{k}cache"]
-    m = global_idx - (global_idx + 1) // FULL_ATTN_INTERVAL
-    return [f"past.conv.{m}cache", f"past.ssm.{m}cache"]
+    kind = layer_types[global_idx]
+    n = sum(1 for t in layer_types[:global_idx] if t == kind)
+    if kind == FULL:
+        return [f"past.key.{n}cache", f"past.value.{n}cache"]
+    return [f"past.conv.{n}cache", f"past.ssm.{n}cache"]
 
 
-def stage_ranges(total: int) -> list[tuple[int, int]]:
-    per = NUM_LAYERS // total
+def stage_ranges(num_layers: int, total: int) -> list:
+    if total < 1 or total > num_layers:
+        raise ValueError(f"--total must be in 1..{num_layers}, got {total}")
+    per = num_layers // total
     ranges = []
     start = 0
     for i in range(total):
-        end = start + per - 1 if i < total - 1 else NUM_LAYERS - 1
+        end = start + per - 1 if i < total - 1 else num_layers - 1
         ranges.append((start, end))
         start = end + 1
     return ranges
 
 
-def find_boundary_ports(model: ov.Model, a: int, b: int):
+def check_stage_ranges(spec: ModelSpec, ranges: list) -> None:
+    """Every stage must OWN at least one full-attention layer: the orphan
+    rewire (extract_stage) redirects the global mask/past-length chains'
+    reads of early-layer caches onto a same-kind cache the stage owns, and
+    a stage with no attention layer has no key/value substitute."""
+    for i, (a, b) in enumerate(ranges):
+        kinds = set(spec.layer_types[a : b + 1])
+        if FULL not in kinds:
+            raise ValueError(
+                f"stage{i} (layers {a}..{b}) owns no {FULL} layer; with "
+                f"{spec.num_layers} layers in a 3:1 pattern the stage count "
+                f"is bounded by the number of full-attention layers "
+                f"({spec.layer_types.count(FULL)})"
+            )
+
+
+def find_boundary_ports(model, a: int, b: int):
     b_in = b_out = None
     in_name = f"layers.{a}.input_layernorm/aten::pow/Power"
     out_name = f"layers.{b}/aten::add/Add_1"
@@ -79,7 +184,10 @@ def find_boundary_ports(model: ov.Model, a: int, b: int):
     return b_in, b_out
 
 
-def extract_stage(xml_path: str, a: int, b: int, first: bool, last: bool) -> ov.Model:
+def extract_stage(xml_path: str, spec: ModelSpec, a: int, b: int, first: bool, last: bool):
+    import openvino as ov
+    from openvino import opset13 as ops
+
     core = ov.Core()
     model = core.read_model(xml_path)
     b_in, b_out = find_boundary_ports(model, a, b)
@@ -135,13 +243,20 @@ def extract_stage(xml_path: str, a: int, b: int, first: bool, last: bool) -> ov.
     # per-layer state sinks for this range
     want = []
     for g in range(a, b + 1):
-        want.extend(layer_state_vids(g))
+        want.extend(layer_state_vids(spec.layer_types, g))
     sinks = []
     for op in model.get_ops():
         if op.get_type_name() == "Assign":
             vid = op.get_variable_id()
             if any(w in vid for w in want):
                 sinks.append(op)
+    expect = 2 * (b - a + 1)
+    if len(sinks) != expect:
+        raise RuntimeError(
+            f"stage layers {a}..{b}: found {len(sinks)} state sinks, expected "
+            f"{expect} (2 per layer) — variable_id numbering does not match "
+            f"layer_types {spec.layer_types[a:b + 1]}"
+        )
 
     # original Parameters still reachable from results+sinks
     seen, reach = set(), set()
@@ -158,7 +273,7 @@ def extract_stage(xml_path: str, a: int, b: int, first: bool, last: bool) -> ov.
             stack.append(src)
     orig = [p for p in model.get_parameters() if p in reach]
 
-    stage = ov.Model(results, sinks, params_new + orig, f"qwen36_stage_{a}_{b}")
+    stage = ov.Model(results, sinks, params_new + orig, f"qwen35_stage_{a}_{b}")
 
     # Orphan-state rewire: global bookkeeping (past-length / mask chains)
     # derives shapes from EARLY layers' caches (e.g. ShapeOf(key.0)), so
@@ -189,7 +304,7 @@ def extract_stage(xml_path: str, a: int, b: int, first: bool, last: bool) -> ov.
     return stage
 
 
-def build_feeds(model, hidden=None, embeds=None):
+def build_feeds(model, hidden_size: int, hidden=None, embeds=None):
     feeds = {}
     for inp in model.inputs:
         nm = inp.get_any_name()
@@ -198,7 +313,7 @@ def build_feeds(model, hidden=None, embeds=None):
         if nm == "stage_hidden":
             feeds[nm] = hidden.astype(et)
         elif "embed" in nm:
-            dims[-1] = HIDDEN
+            dims[-1] = hidden_size
             feeds[nm] = (embeds if embeds is not None else np.zeros(dims)).astype(et)
         elif "attention_mask" in nm:
             feeds[nm] = np.ones(dims, dtype=et)
@@ -211,16 +326,30 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False):
     """Cut the official int4 OV IR in `model_dir` into `num_stages` stage
     dirs under `output_dir` + manifest + aux files. Entry point for
     `cascadia shard` dispatch (export_shards.py) and for main() below."""
+    import openvino as ov
+
     xml = os.path.join(model_dir, "openvino_language_model.xml")
     if not os.path.exists(xml):
         raise FileNotFoundError(
-            f"{xml} not found — the qwen3_5_moe exporter does IR surgery on "
-            f"the official int4 OpenVINO IR (e.g. an *-int4-ov model dir), "
+            f"{xml} not found — the qwen3_5-family exporter does IR surgery "
+            f"on the official int4 OpenVINO IR (e.g. an *-int4-ov model dir), "
             f"not on safetensors"
         )
-    ranges = stage_ranges(num_stages)
+    spec = read_model_spec(model_dir)
+    ranges = stage_ranges(spec.num_layers, num_stages)
+    check_stage_ranges(spec, ranges)
+    print(
+        f"model: {spec.model_type} hidden={spec.hidden} layers={spec.num_layers} "
+        f"({spec.layer_types.count(LINEAR)} {LINEAR} + "
+        f"{spec.layer_types.count(FULL)} {FULL}) vocab={spec.vocab}",
+        flush=True,
+    )
     manifest = {
-        "arch": "qwen3_5_moe", "hidden_size": HIDDEN, "num_layers": NUM_LAYERS,
+        "arch": spec.model_type,
+        "family": spec.family,
+        "hidden_size": spec.hidden,
+        "num_layers": spec.num_layers,
+        "layer_types": spec.layer_types,
         "source": os.path.basename(os.path.abspath(model_dir)),
         "last_logits_only": True,
         "stages": [],
@@ -229,7 +358,7 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False):
     for i, (a, b) in enumerate(ranges):
         first, last = i == 0, i == len(ranges) - 1
         t0 = time.time()
-        stage = extract_stage(xml, a, b, first, last)
+        stage = extract_stage(xml, spec, a, b, first, last)
         sdir = os.path.join(output_dir, f"stage{i}")
         os.makedirs(sdir, exist_ok=True)
         ov.save_model(stage, os.path.join(sdir, "stage.xml"), compress_to_fp16=False)
@@ -260,10 +389,12 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False):
     if not validate:
         return
 
-    _validate(model_dir, output_dir, xml, ranges)
+    _validate(model_dir, output_dir, xml, ranges, spec.hidden)
 
 
-def _validate(model_dir, output_dir, xml, ranges):
+def _validate(model_dir, output_dir, xml, ranges, hidden_size):
+    import openvino as ov
+
     core = ov.Core()
     # Real token embedding (degenerate random embeds make logits near-flat
     # and top-1 noise-sensitive): embed a fixed token via the model dir's
@@ -272,13 +403,13 @@ def _validate(model_dir, output_dir, xml, ranges):
     emb_comp = core.compile_model(emb_model, "CPU")
     token = np.array([[1000]], dtype=np.int64)
     embeds = emb_comp.create_infer_request().infer({emb_comp.inputs[0].get_any_name(): token})
-    embeds = embeds[emb_comp.outputs[0]].astype(np.float32).reshape(1, 1, HIDDEN)
+    embeds = embeds[emb_comp.outputs[0]].astype(np.float32).reshape(1, 1, hidden_size)
     del emb_comp, emb_model
 
     # reference: full model logits
     full = core.read_model(xml)
     comp = core.compile_model(full, "CPU")
-    ref = comp.create_infer_request().infer(build_feeds(full, embeds=embeds))
+    ref = comp.create_infer_request().infer(build_feeds(full, hidden_size, embeds=embeds))
     logits_ref = ref[comp.outputs[0]].astype(np.float32)
     del comp, full
 
@@ -288,11 +419,10 @@ def _validate(model_dir, output_dir, xml, ranges):
     for i in range(len(ranges)):
         sm = core.read_model(os.path.join(output_dir, f"stage{i}", "stage.xml"))
         sc = core.compile_model(sm, "CPU")
-        feeds = build_feeds(sm, hidden=hidden, embeds=embeds if i == 0 else None)
+        feeds = build_feeds(sm, hidden_size, hidden=hidden, embeds=embeds if i == 0 else None)
         out = sc.create_infer_request().infer(feeds)
         hidden = out[sc.outputs[0]].astype(np.float32)
         print(f"stage{i} ran, out shape {hidden.shape}", flush=True)
-        last_outputs = sc.outputs
         del sc, sm
     logits_chain = hidden  # last stage's first output = logits
 
@@ -331,7 +461,7 @@ def _validate(model_dir, output_dir, xml, ranges):
         a = np.array([[t]], dtype=np.int64)
         r = emb_req2.create_infer_request().infer(
             {emb_req2.inputs[0].get_any_name(): a})
-        return r[emb_req2.outputs[0]].astype(np.float32).reshape(1, 1, HIDDEN)
+        return r[emb_req2.outputs[0]].astype(np.float32).reshape(1, 1, hidden_size)
 
     def step_feeds(comp, step, hidden=None, embeds=None):
         f = {}
@@ -342,7 +472,7 @@ def _validate(model_dir, output_dir, xml, ranges):
                 f[nm] = hidden.astype(et)
             elif "embed" in nm:
                 f[nm] = (embeds if embeds is not None
-                         else np.zeros((1, 1, HIDDEN))).astype(et)
+                         else np.zeros((1, 1, hidden_size))).astype(et)
             elif "attention_mask" in nm:
                 f[nm] = np.ones((1, step + 1), dtype=et)
             elif "position" in nm:

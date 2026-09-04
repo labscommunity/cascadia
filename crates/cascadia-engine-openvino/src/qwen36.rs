@@ -1,7 +1,11 @@
-//! Qwen3.6-35B-A3B staged engine: runs the IR-surgery shard chain
-//! (tools/qwen36_surgery/export_qwen36_moe.py) in-process on one box
-//! (single-box, --total 1) or as an N-node stage pipeline (--rank R
-//! --total N). Greedy-only, batch=1; the decode loop is a port of
+//! Qwen3.5-family staged engine (`--engine qwen35`, alias `qwen36-moe`):
+//! runs the IR-surgery shard chain (tools/qwen36_surgery/export_qwen36_moe.py)
+//! in-process on one box (single-box, --total 1) or as an N-node stage
+//! pipeline (--rank R --total N). Serves both `qwen3_5_moe` (Qwen3.5/
+//! 3.6-35B-A3B, hidden 2048, 40 layers) and dense `qwen3_5` (Qwen3.8-27B,
+//! hidden 5120, 64 layers): the stage IRs are opaque to the engine, which
+//! only needs the hidden width — read from `manifest.json` — to size the
+//! activation frames. Greedy-only, batch=1; the decode loop is a port of
 //! `tools/qwen36_surgery/proto_m3_decode.py`, which measured 64/64
 //! greedy token parity vs the whole model.
 //!
@@ -40,10 +44,14 @@ use futures::stream;
 use tokenizers::Tokenizer;
 use tracing::{error, info, warn};
 
-const HIDDEN: usize = 2048;
+/// Hidden width of shard trees exported before `manifest.hidden_size`
+/// existed (the Qwen3.6-35B-A3B surgery, hidden 2048). Newer manifests
+/// carry the width explicitly; the 27B dense export is 5120.
+const LEGACY_HIDDEN: usize = 2048;
 /// Prefill span per chain pass; bounds the transient [1, T, vocab]
 /// logits buffer (~254 MB f32 at 256 with the 248320 vocab) and the
-/// per-chunk wire frame (256 * 2048 * 4 B = 2 MiB, day-0 probe sized).
+/// per-chunk wire frame (256 * hidden * 4 B: 2 MiB at hidden 2048,
+/// 5 MiB at 5120 — both far under the transport's 256 MiB tensor cap).
 const PREFILL_CHUNK: usize = 256;
 
 /// Effective prefill span. Default = PREFILL_CHUNK (T>1 batched, ~4.2x TTFT win).
@@ -245,15 +253,43 @@ fn parse_header(b: &[u8]) -> (u32, u32, u32) {
     (f(0), f(4), f(8))
 }
 
+fn legacy_hidden() -> usize {
+    LEGACY_HIDDEN
+}
+
 #[derive(serde::Deserialize)]
 struct Manifest {
+    /// HF model_type of the source IR: `qwen3_5_moe` (Qwen3.5/3.6) or
+    /// `qwen3_5` (dense Qwen3.8). Anything else is not a surgery tree
+    /// this engine can drive.
     arch: String,
+    /// Activation width the stage IRs exchange ([1, T, hidden_size]).
+    /// Absent in trees cut before the exporter wrote it (Qwen3.6 era,
+    /// always 2048).
+    #[serde(default = "legacy_hidden")]
+    hidden_size: usize,
     /// Exporter sliced the last stage's logits to the final position
     /// ([1,1,vocab]); the engine then skips its own row slicing. Absent
     /// in pre-slice shard trees (default false).
     #[serde(default)]
     last_logits_only: bool,
     stages: Vec<StageInfo>,
+}
+
+impl Manifest {
+    fn parse(raw: &str) -> Result<Self, String> {
+        let m: Manifest = serde_json::from_str(raw).map_err(|e| format!("manifest.json: {e}"))?;
+        if !m.arch.starts_with("qwen3_5") {
+            return Err(format!(
+                "manifest arch {:?} is not a Qwen3.5-family surgery tree (qwen3_5 / qwen3_5_moe)",
+                m.arch
+            ));
+        }
+        if m.hidden_size == 0 {
+            return Err("manifest hidden_size must be > 0".into());
+        }
+        Ok(m)
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -280,6 +316,8 @@ pub struct Qwen36Builder {
     tokenizer: Option<Tokenizer>,
     eos: Option<u32>,
     last_logits_only: bool,
+    /// Activation width from the manifest (set by `load`).
+    hidden: usize,
     /// Issue-34: KV-cache STORAGE precision. Distinct from the compute-precision hints noted at the
     /// PluginConfig site (those are f16-only on the fused MoE gemm and fail to compile).
     ///
@@ -333,6 +371,7 @@ impl Qwen36Builder {
             tokenizer: None,
             eos: None,
             last_logits_only: false,
+            hidden: LEGACY_HIDDEN,
             kv_cache_precision: None,
             dyn_quant_group: None,
             cache_dir: None,
@@ -417,14 +456,7 @@ impl Builder for Qwen36Builder {
         let manifest_path = dir.join("manifest.json");
         let manifest_raw = std::fs::read_to_string(&manifest_path)
             .map_err(|e| EngineError::ModelNotFound(format!("{}: {e}", manifest_path.display())))?;
-        let manifest: Manifest = serde_json::from_str(&manifest_raw)
-            .map_err(|e| EngineError::InvalidConfig(format!("manifest.json: {e}")))?;
-        if manifest.arch != "qwen3_5_moe" {
-            return Err(EngineError::InvalidConfig(format!(
-                "manifest arch {:?} is not qwen3_5_moe",
-                manifest.arch
-            )));
-        }
+        let manifest = Manifest::parse(&manifest_raw).map_err(EngineError::InvalidConfig)?;
         if pipeline && manifest.stages.len() != self.total as usize {
             return Err(EngineError::ShardRejected(format!(
                 "--total ({}) does not match manifest stage count ({})",
@@ -434,7 +466,9 @@ impl Builder for Qwen36Builder {
         }
 
         let mut progress = vec![LoadProgress::message(format!(
-            "qwen36-moe: {} stages from {} (rank {}/{})",
+            "qwen35 ({}, hidden {}): {} stages from {} (rank {}/{})",
+            manifest.arch,
+            manifest.hidden_size,
             manifest.stages.len(),
             dir.display(),
             self.rank,
@@ -498,6 +532,7 @@ impl Builder for Qwen36Builder {
 
         self.manifest_json = Some(manifest_raw);
         self.last_logits_only = manifest.last_logits_only;
+        self.hidden = manifest.hidden_size;
         self.stages = Some(stages);
         progress.push(LoadProgress::ready());
         Ok(Box::pin(stream::iter(progress)))
@@ -514,6 +549,7 @@ impl Builder for Qwen36Builder {
             eos: self.eos,
             max_tokens_default: self.max_tokens_default,
             last_logits_only: self.last_logits_only,
+            hidden: self.hidden,
             rank: self.rank,
             total: self.total,
             upstream: self.upstream,
@@ -568,6 +604,10 @@ pub struct Qwen36Engine {
     eos: Option<u32>,
     max_tokens_default: u32,
     last_logits_only: bool,
+    /// Activation width ([1, T, hidden]) the stage IRs exchange; sizes
+    /// the dummy embeds, the FORWARD wire frame, and the relay-side
+    /// frame check. From `manifest.hidden_size`.
+    hidden: usize,
     rank: u32,
     total: u32,
     upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
@@ -721,7 +761,7 @@ enum InFrame {
 }
 
 impl Qwen36Engine {
-    /// Embed a token span: [1, n] ids -> flattened [1, n, HIDDEN] f32.
+    /// Embed a token span: [1, n] ids -> flattened [1, n, hidden] f32.
     fn embed_seq(&mut self, toks: &[u32]) -> EngineResult<Vec<f32>> {
         let emb = self
             .emb
@@ -757,7 +797,8 @@ impl Qwen36Engine {
         let pos: Vec<i64> = (0..MROPE_ROWS)
             .flat_map(|_| (t0 as i64)..(t1 as i64))
             .collect();
-        let zeros_embeds = vec![0f32; n * HIDDEN];
+        let width = self.hidden;
+        let zeros_embeds = vec![0f32; n * width];
         let first_global = self.rank == 0;
         let mut hidden: Vec<f32> = embeds.to_vec();
         for (j, st) in self.stages.iter_mut().enumerate() {
@@ -765,7 +806,7 @@ impl Qwen36Engine {
             for name in &names {
                 match name.as_str() {
                     "stage_hidden" => st
-                        .set_input(name, DType::F32, &[1, n, HIDDEN], &le_bytes_f32(&hidden))
+                        .set_input(name, DType::F32, &[1, n, width], &le_bytes_f32(&hidden))
                         .map_err(map_ov)?,
                     s if s.contains("embed") => {
                         // global first stage: real embeds; later stages:
@@ -775,7 +816,7 @@ impl Qwen36Engine {
                         } else {
                             &zeros_embeds
                         };
-                        st.set_input(name, DType::F32, &[1, n, HIDDEN], &le_bytes_f32(data))
+                        st.set_input(name, DType::F32, &[1, n, width], &le_bytes_f32(data))
                             .map_err(map_ov)?;
                     }
                     s if s.contains("attention_mask") => st
@@ -1004,7 +1045,7 @@ impl Qwen36Engine {
         .map_err(|e| EngineError::Backend(format!("qwen36 pipeline RESET not acked: {e}")))
     }
 
-    /// One lockstep FORWARD([1,n,HIDDEN] f32 at pos t0) → TOKEN exchange
+    /// One lockstep FORWARD([1,n,hidden] f32 at pos t0) → TOKEN exchange
     /// with the downstream peer. Returns the chain-end argmax token and
     /// the accumulated downstream infer time (µs) the TOKEN carried.
     fn forward_downstream(
@@ -1021,7 +1062,7 @@ impl Qwen36Engine {
         let h = self.handle()?;
         let tensor = WireTensor::new(
             WireDType::F32,
-            [1, n as u32, HIDDEN as u32],
+            [1, n as u32, self.hidden as u32],
             le_bytes_f32(hidden),
         );
         run_async(
@@ -1843,10 +1884,11 @@ impl Qwen36Engine {
                     );
                     return Ok(());
                 }
-                if hidden.len() != n * HIDDEN {
+                if hidden.len() != n * self.hidden {
                     return Err(EngineError::Backend(format!(
-                        "forward frame size {} != n({n}) * HIDDEN",
-                        hidden.len()
+                        "forward frame size {} != n({n}) * hidden({})",
+                        hidden.len(),
+                        self.hidden
                     )));
                 }
                 let infer_started = Instant::now();
@@ -2612,6 +2654,31 @@ mod tests {
         assert_eq!(parse_header(&h), (FRAME_FORWARD, 7, 4096));
     }
 
+    /// A Qwen3.6-era tree (no hidden_size) keeps the 2048 width; a dense
+    /// Qwen3.8 tree carries 5120 and the `qwen3_5` arch.
+    #[test]
+    fn manifest_hidden_defaults_to_legacy_and_reads_dense() {
+        let legacy = Manifest::parse(r#"{"arch":"qwen3_5_moe","stages":[]}"#).unwrap();
+        assert_eq!(legacy.hidden_size, 2048);
+        assert!(!legacy.last_logits_only);
+        let dense = Manifest::parse(
+            r#"{"arch":"qwen3_5","hidden_size":5120,"num_layers":64,"last_logits_only":true,
+                "stages":[{"stage":0,"layer_start":0,"layer_end":31}]}"#,
+        )
+        .unwrap();
+        assert_eq!(dense.hidden_size, 5120);
+        assert!(dense.last_logits_only);
+        assert_eq!(dense.stages.len(), 1);
+    }
+
+    #[test]
+    fn manifest_rejects_foreign_arch_and_zero_width() {
+        let err = Manifest::parse(r#"{"arch":"llama","stages":[]}"#).unwrap_err();
+        assert!(err.contains("not a Qwen3.5-family"), "{err}");
+        let err = Manifest::parse(r#"{"arch":"qwen3_5","hidden_size":0,"stages":[]}"#).unwrap_err();
+        assert!(err.contains("hidden_size"), "{err}");
+    }
+
     fn bare_engine(total: u32, manifest: &str) -> Qwen36Engine {
         Qwen36Engine {
             emb: None,
@@ -2620,6 +2687,7 @@ mod tests {
             eos: None,
             max_tokens_default: 256,
             last_logits_only: false,
+            hidden: LEGACY_HIDDEN,
             rank: 1,
             total,
             upstream: None,
