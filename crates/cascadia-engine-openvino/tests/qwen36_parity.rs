@@ -104,11 +104,11 @@ async fn run_parity(shards: &str, write_env: &str, file: &str) {
         return;
     }
 
-    let g: Golden =
-        serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            panic!("golden missing ({e}); run once with {write_env}=1")
-        }))
-        .expect("golden parse");
+    let g: Golden = serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("golden missing ({e}); run once with {write_env}=1")),
+    )
+    .expect("golden parse");
     assert_eq!(
         g.prompt, PROMPT,
         "golden was blessed for a different prompt"

@@ -46,7 +46,7 @@ network).
 
 | Flag | Meaning |
 |------|---------|
-| `--model` | HF repo id (`unsloth/Meta-Llama-3.1-8B-Instruct`), a local dir with `config.json` + `*.safetensors`, or (Gemma-4 / Qwen3.6 only) an exported OpenVINO IR dir. HF repos auto-download into `~/.cache/cascadia/models/`. |
+| `--model` | HF repo id (`unsloth/Meta-Llama-3.1-8B-Instruct`), a local dir with `config.json` + `*.safetensors`, or (Gemma-4 / Qwen3.5-family: 3.6 MoE, 3.8 dense) an exported OpenVINO IR dir. HF repos auto-download into `~/.cache/cascadia/models/`. |
 | `-o`, `--output-dir` | Where to write the shard tree. |
 | `--num-stages N` | Pipeline stages to split into. 2 is the common case for 2-machine setups; use 3+ for larger clusters. |
 | `--quantization` | `int4` (default — typical), `int4-asym`, `int8`, or `fp16`. INT4 needs nncf installed. |

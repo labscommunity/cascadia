@@ -1,8 +1,12 @@
 # qwen36_surgery
 
-IR-surgery toolkit for the Qwen3.6-35B-A3B (`qwen3_5_moe`) staged engine —
-slices the official `OpenVINO/Qwen3.6-35B-A3B-int4-ov` IR into per-stage
-shards (no re-quantization). Design: `docs/architectures/qwen36-moe-support.md`.
+IR-surgery toolkit for the Qwen3.5-family staged engine (`--engine qwen35`):
+slices an official int4 IR — `OpenVINO/Qwen3.6-35B-A3B-int4-ov`
+(`qwen3_5_moe`) or `OpenVINO/Qwen3.8-27B-int4-ov` (dense `qwen3_5`) — into
+per-stage shards (no re-quantization). The exporter reads hidden size,
+layer count and per-layer attention type from the model dir's
+`config.json`. Design: `docs/architectures/qwen36-moe-support.md`;
+Qwen3.8 specifics: `docs/architectures/qwen3.8.md`.
 
 ## Producer (this is what you run)
 - `export_qwen36_moe.py` — cuts the official IR into stage shards + manifest.
