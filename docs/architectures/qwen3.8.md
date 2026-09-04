@@ -176,13 +176,33 @@ it includes prefill of the 19-token prompt and HTTP.
 | `--engine ov-genai`, Intel `Qwen3.8-27B-int4-ov` | MSVC, GenAI 2026.2.1 **and** 2026.3.0 | GPU | — | `pipeline_create_vlm` throws | — |
 
 So on this box the single-stage GenAI path is the fastest (its PagedAttention
-backend has the optimised GatedDeltaNet kernel), the staged path is ~15 %
-behind on GPU and works on the 2026.2 SDK the repo pins, and Intel's
-published IR needs a newer GenAI than 2026.3: its tokenizer IRs were built
-with openvino-tokenizers 2026.4 nightly (stateful `ReadValue`/`Assign` +
-a bare `Truncate` op) and its `chat_template.jinja` is the full multimodal
-template GenAI only parses since the Aug-14 nightly. Re-exporting with the
-2026.3 toolchain (the recipe above) sidesteps both.
+backend has the optimised GatedDeltaNet kernel), and the staged path is ~15 %
+behind on GPU and works on the 2026.2 SDK the repo pins.
+
+**Why Intel's published IR throws, and the fix.** Its `openvino_tokenizer`
+/ `openvino_detokenizer` IRs were built with openvino-tokenizers **2026.4
+nightly** (stateful `ReadValue`/`Assign` ops and a bare `Truncate` op that
+the 2026.2/2026.3 tokenizer extension cannot load); GenAI's `VLMPipeline`
+constructor loads them and throws. Isolated with hard-linked variants of
+the Intel directory served by the same binary:
+
+| variant of `OpenVINO/Qwen3.8-27B-int4-ov` | `ov-genai` |
+|---|---|
+| as published | throws in `pipeline_create_vlm` |
+| + our `chat_template.jinja` only | throws |
+| + tokenizer/detokenizer IRs from a 2026.3.1 export (Intel's template kept) | **serves** (`391`) |
+| + tokenizer/detokenizer IRs regenerated in place with `convert_tokenizer` 2026.3.1 | **serves** (`391`) |
+| as published, GenAI **2026.5 nightly** Python `VLMPipeline` | creates in 9 s, generates correctly (`LLMPipeline` still rejects the template's `is undefined`) |
+
+The chat template is not the problem on Cascadia's path (the API renders it
+itself). So, until the shim is built against a 2026.4+ GenAI SDK, serve
+Intel's IR after one command with the *installed* openvino-tokenizers:
+
+```bash
+convert_tokenizer /path/to/Qwen3.8-27B-int4-ov --with-detokenizer -o /path/to/Qwen3.8-27B-int4-ov
+```
+
+Exports made with the 2026.3 toolchain (the recipe above) need nothing.
 
 **Q3 — context capacity** (weights resident, growing synthetic prompt):
 see the table below, filled from the same box.
