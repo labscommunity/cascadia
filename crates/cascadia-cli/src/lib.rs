@@ -318,6 +318,13 @@ pub struct WorkerArgs {
     #[arg(long, default_value_t = 16.0)]
     pub prefix_cache_gb: f64,
 
+    /// Largest `/v1/chat/completions` request body (MiB); the rendered prompt
+    /// is capped at the same size. 4 MiB is ~1M characters ≈ a 262 K-token
+    /// window. Lower it on an exposed endpoint; the engine's own prompt-length
+    /// guard and the bounded admission queue still apply.
+    #[arg(long, default_value_t = 4.0)]
+    pub api_max_body_mb: f64,
+
     /// OV performance hint (PERFORMANCE_HINT). LATENCY suits single-user
     /// decode; THROUGHPUT enables NUM_STREAMS auto-tuning. See OpenVINO
     /// high-level-performance-hints docs (2026).
@@ -637,6 +644,11 @@ pub struct RunArgs {
     /// `cascadia worker --help`.
     #[arg(long, default_value_t = 16.0)]
     pub prefix_cache_gb: f64,
+
+    /// Largest chat-completions request body in MiB (rendered prompt capped
+    /// alike). See `cascadia worker --help`.
+    #[arg(long, default_value_t = 4.0)]
+    pub api_max_body_mb: f64,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -665,6 +677,7 @@ impl WorkerArgs {
             device,
             engine,
             prefix_cache_gb: 16.0,
+            api_max_body_mb: 4.0,
             ov_cache_dir: None,
             ov_kv_precision: None,
             ov_dyn_quant_group: None,
@@ -906,6 +919,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     info!(model = %args.model, device = %args.device, engine = ?args.engine, "cascadia run (single machine)");
     let mut worker = WorkerArgs::single_node(args.model, args.device, args.engine, args.api);
     worker.prefix_cache_gb = args.prefix_cache_gb;
+    worker.api_max_body_mb = args.api_max_body_mb;
     cmd_worker(worker).await
 }
 
@@ -1920,6 +1934,12 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         }
         let mut cfg = cascadia_api::Config::default();
         cfg.chat_template = chat_template;
+        // Long-context serving: the 64 KiB body / 32 KiB prompt defaults hold
+        // ~8 K tokens, a fraction of what the Qwen3.5-family and Llama-3.1
+        // windows admit. Both caps follow one operator-facing knob.
+        let max_body = (args.api_max_body_mb.max(0.001) * (1u64 << 20) as f64) as usize;
+        cfg.max_body_bytes = max_body;
+        cfg.max_prompt_bytes = max_body;
         // ov-genai owns native templating: render the template API-side only for
         // the thinking-OFF path (engine sets apply_chat_template=false then);
         // thinking-ON stays on ov-genai's native template, untouched.

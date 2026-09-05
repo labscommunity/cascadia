@@ -73,6 +73,7 @@ cascadia run [OPTIONS] <MODEL>
 | `--engine <ENGINE>` | `ov-genai` | Inference engine. Use `ov-runtime` for a `cascadia shard` tree. |
 | `--api <API>` | `:8000` | API bind address. `127.0.0.1:8000` binds loopback only. |
 | `--prefix-cache-gb <GB>` | `16` | `qwen35` only: budget of the in-process prefix cache (chat-boundary + turn-end state snapshots, restored for prompts that extend a cached prefix). `0` disables. |
+| `--api-max-body-mb <MB>` | `4` | Largest chat-completions request body; the rendered prompt is capped at the same size (~1M characters ≈ a 262K-token window). Lower it on an exposed endpoint. |
 
 Note the defaults differ from `worker` (`GPU`/`ov-genai` here, `CPU`/`mock`
 there): `run` assumes you want real inference on the accelerator.
@@ -134,6 +135,7 @@ a few each. MiniMax-M2 `sparse-moe` only.
 | `--ov-allow-auto-batching` | off | Allow GPU-plugin internal auto-batching. |
 | `--ov-execution-mode <MODE>` | — | `ACCURACY` / `PERFORMANCE`. |
 | `--prefix-cache-gb <GB>` | `16` | `qwen35` only, single-process (`--total 1`): byte budget of the chain-state prefix cache; a Qwen3.8-27B snapshot is ~64 KB per context token (+~150 MB). `0` disables. See [qwen3.8.md](architectures/qwen3.8.md). |
+| `--api-max-body-mb <MB>` | `4` | Largest `/v1/chat/completions` body (MiB); the rendered prompt is capped alike. Was a fixed 64 KiB / 32 KiB (~8K tokens) before. |
 
 **`--ov-cache-dir` is on by default and matters.** For `ov-genai`, `ov-runtime`,
 `gemma4` and `sparse-moe`, leaving it unset defaults to
