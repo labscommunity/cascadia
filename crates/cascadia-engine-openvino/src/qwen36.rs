@@ -605,6 +605,7 @@ impl Builder for Qwen36Builder {
             kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
             prefix_cache: crate::prefix_cache::PrefixCache::new(prefix_cache_bytes),
             im_start_id: self.im_start_id,
+            primed: false,
         }))
     }
 }
@@ -687,6 +688,12 @@ pub struct Qwen36Engine {
     /// restored at admission for a prompt that extends a cached prefix. Budget 0 ⇒ off.
     prefix_cache: crate::prefix_cache::PrefixCache,
     im_start_id: Option<u32>,
+    /// The stage requests have executed at least once since their last reset/recreate. A
+    /// `set_state_blob` onto a request that has NOT is silently discarded by the plugin on the
+    /// next inference (measured on the GPU plugin: KV depth = tokens folded since, logits off by
+    /// ~19), while the same restore onto a request that has run holds bit-exactly. Restores
+    /// therefore prime un-run stages with one dummy fold first.
+    primed: bool,
 }
 
 /// In-flight task state. `step()` advances one token per call so the
@@ -828,6 +835,7 @@ impl Qwen36Engine {
     /// output otherwise. Returns the last stage's full first output,
     /// flattened [1, T, width].
     fn chain_pass(&mut self, embeds: &[f32], t0: usize, t1: usize) -> EngineResult<Vec<f32>> {
+        self.primed = true;
         let n = t1 - t0;
         let mask = vec![1i64; t1];
         let pos: Vec<i64> = (0..MROPE_ROWS)
@@ -899,6 +907,7 @@ impl Qwen36Engine {
     }
 
     fn reset_all(&mut self) {
+        self.primed = false;
         // After a restore, `reset_state` leaves residue on this model, so rebuild the request
         // instead — the flag keeps the ordinary turn-to-turn path on the cheap reset.
         let recreate = self.state_restored;
@@ -2563,6 +2572,16 @@ impl Qwen36Engine {
         if parts.len() != self.stages.len() {
             return false;
         }
+        // Prime un-run requests: one dummy single-token fold at position 0 so the plugin has
+        // materialised its state buffers — otherwise the `set_state_blob` below is dropped on the
+        // next inference (see `primed`). The fold's garbage state is overwritten by the restore.
+        if !self.primed {
+            let zeros = vec![0f32; self.hidden];
+            if let Err(e) = self.chain_pass(&zeros, 0, 1) {
+                warn!(error = %e, "qwen36: priming fold before restore failed; cold reprefill");
+                return false;
+            }
+        }
         for (st, part) in self.stages.iter_mut().zip(parts.iter()) {
             // Restore writes over the LIVE request — no pre-clear. See restore_clear_mode: clearing is
             // what breaks bar #1, and `set_state_blob` overwrites every VariableState, so there is no
@@ -2865,6 +2884,7 @@ mod tests {
             kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
             prefix_cache: crate::prefix_cache::PrefixCache::new(0),
             im_start_id: None,
+            primed: false,
         }
     }
 

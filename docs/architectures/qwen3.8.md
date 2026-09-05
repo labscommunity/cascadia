@@ -267,8 +267,14 @@ only the tail. Two snapshots per turn:
   does preserve history verbatim.
 
 Lookups are non-consuming, so a shared system prompt serves every
-conversation that starts with it. Snapshots are taken only on **cold**
-turns: after a `set_state_blob` the request's attention KV reads back
+conversation that starts with it. A restore lands on the live requests
+after one **priming** fold when they have not run since their last reset:
+measured on the GPU plugin, a `set_state` onto a request that has never
+executed since reset is silently discarded on the next inference (KV depth
+= tokens folded since, logits off by ~19), while the same restore onto a
+request that has run holds bit-exactly (Δ logits 0.0) — the engine's
+turn-end reset made every warm admission the discard case until this was
+found. Snapshots are taken only on **cold** turns: after a `set_state_blob` the request's attention KV reads back
 shallow (only the tokens folded since the restore) while the DeltaNet state
 carries the whole history, so a snapshot taken then is inconsistent — the
 first certification run hit exactly that (turn 3 answered from a corrupted
