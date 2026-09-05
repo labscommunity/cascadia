@@ -72,6 +72,8 @@ cascadia run [OPTIONS] <MODEL>
 | `--device <DEVICE>` | `GPU` | `GPU` / `CPU` / `NPU`. Also the indexed and compound OpenVINO forms — see [`--device` forms](#device-forms). |
 | `--engine <ENGINE>` | `ov-genai` | Inference engine. Use `ov-runtime` for a `cascadia shard` tree. |
 | `--api <API>` | `:8000` | API bind address. `127.0.0.1:8000` binds loopback only. |
+| `--prefix-cache-gb <GB>` | `16` | `qwen35` only: budget of the in-process prefix cache (chat-boundary + turn-end state snapshots, restored for prompts that extend a cached prefix). `0` disables. |
+| `--api-max-body-mb <MB>` | `4` | Largest chat-completions request body; the rendered prompt is capped at the same size (~1M characters ≈ a 262K-token window). Lower it on an exposed endpoint. |
 
 Note the defaults differ from `worker` (`GPU`/`ov-genai` here, `CPU`/`mock`
 there): `run` assumes you want real inference on the accelerator.
@@ -132,6 +134,8 @@ a few each. MiniMax-M2 `sparse-moe` only.
 | `--ov-num-threads <N>` | — | Host CPU thread cap (`INFERENCE_NUM_THREADS`). CPU plugin only. |
 | `--ov-allow-auto-batching` | off | Allow GPU-plugin internal auto-batching. |
 | `--ov-execution-mode <MODE>` | — | `ACCURACY` / `PERFORMANCE`. |
+| `--prefix-cache-gb <GB>` | `16` | `qwen35` only, single-process (`--total 1`): byte budget of the chain-state prefix cache; a Qwen3.8-27B snapshot is ~64 KB per context token (+~150 MB). `0` disables. See [qwen3.8.md](architectures/qwen3.8.md). |
+| `--api-max-body-mb <MB>` | `4` | Largest `/v1/chat/completions` body (MiB); the rendered prompt is capped alike. Was a fixed 64 KiB / 32 KiB (~8K tokens) before. |
 
 **`--ov-cache-dir` is on by default and matters.** For `ov-genai`, `ov-runtime`,
 `gemma4` and `sparse-moe`, leaving it unset defaults to
@@ -141,7 +145,7 @@ macOS, `%LOCALAPPDATA%` on Windows). This turns a ~20 s cold GPU compile into a
 `ov-genai` path. Pass `--ov-cache-dir ""` to disable.
 
 Two engines don't get that default: `ov-dist-spec` uses the flag verbatim (so it
-is off unless you pass a path), and `qwen36-moe` ignores it entirely.
+is off unless you pass a path), and `qwen35` ignores it entirely.
 
 On **Xe2 / Battlemage** GPUs, set `--ov-inference-precision f16` explicitly: f16
 and bf16 share XMX throughput, but the default can silently fall back to f32.
@@ -220,7 +224,7 @@ cascadia shard --model <MODEL> -o <DIR> --num-stages <N> [OPTIONS]
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--model <MODEL>` | *required* | HF repo id, a local dir with safetensors + `config.json`, or — for the Gemma-4 / Qwen3.6 surgery paths — an already-exported OpenVINO IR dir. |
+| `--model <MODEL>` | *required* | HF repo id, a local dir with safetensors + `config.json`, or — for the Gemma-4 / Qwen3.5-family (3.6 MoE, 3.8 dense) surgery paths — an already-exported OpenVINO IR dir. |
 | `-o, --output-dir <DIR>` | *required* | Output shard tree (created for you). |
 | `--num-stages <N>` | *required* | Pipeline stages to split into. |
 | `--quantization <Q>` | `int4` | `fp16` / `int4` / `int4-asym` / `int8`. INT4 is the typical choice on Intel; FP16 if NNCF is unavailable or you want max quality. |
@@ -412,7 +416,7 @@ OpenVINO GPU plugin can see.
 | `ov-dist-spec` | `cascadia shard` tree | Distributed speculative decode. Every rank must use it. |
 | `gemma4` | `gemma4_cached_v1` shards | Per-layer-type asymmetric attention, KV-sharing, baked softcap. |
 | `sparse-moe` | `manifest.json` + expert tree | Top-k expert routing through an AVX-512 int4 GEMM. CPU-targeted; single-stage or pipeline-parallel (`--total >= 2`). |
-| `qwen36-moe` | Qwen3.6 surgery output | Greedy-only, batch=1. CPU-targeted decode. |
+| `qwen35` (alias `qwen36-moe`) | Qwen3.5-family surgery output (Qwen3.6 MoE, dense Qwen3.8) | Greedy-only, batch=1. CPU or iGPU decode. In-process prefix cache (`--prefix-cache-gb`, default 16, 0 = off): chat-boundary + turn-end state snapshots restored for prompts that extend a cached prefix. |
 
 Per-engine deep dives: [engines/](engines/). Per-family export notes:
 [architectures/](architectures/).

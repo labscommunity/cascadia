@@ -4,7 +4,7 @@ Cascadia is a Cargo workspace at the repo root. Each crate has a single responsi
 
 ## Design decisions
 
-- **Engine plurality: OpenVINO-first, pluggable.** The `Engine` + `Builder` traits live in `cascadia-engine`; seven engines ship behind them (`mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec`, `gemma4`, `sparse-moe`, `qwen36-moe`). Future engines (IPEX, OneAPI direct) plug behind the same trait.
+- **Engine plurality: OpenVINO-first, pluggable.** The `Engine` + `Builder` traits live in `cascadia-engine`; seven engines ship behind them (`mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec`, `gemma4`, `sparse-moe`, `qwen35`). Future engines (IPEX, OneAPI direct) plug behind the same trait.
 - **Discovery: zero-config peer-to-peer.** Workers find each other over mDNS; no central control plane.
 - **Topology stores measured latency + bandwidth.** Latency is the dominant placement signal on Intel fleets — a 50 ms WAN hop drops throughput 65% — so Cascadia's topology graph stores per-link measurements, not just edge types.
 - **Rust-only workers.** One static binary per node; no runtime Python dependency, no pip install on workers. Python is only needed at export time (`cascadia shard`).

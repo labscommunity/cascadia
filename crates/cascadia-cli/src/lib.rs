@@ -47,7 +47,7 @@ fn engine_name(kind: EngineKind) -> &'static str {
         EngineKind::OvDistSpec => "ov-dist-spec",
         EngineKind::Gemma4 => "gemma4",
         EngineKind::SparseMoe => "sparse-moe",
-        EngineKind::Qwen36Moe => "qwen36-moe",
+        EngineKind::Qwen36Moe => "qwen35",
     }
 }
 
@@ -211,10 +211,13 @@ pub enum EngineKind {
     /// per token (not all 384) and runs the expert matmuls through the
     /// hand-rolled AVX-512 int4 GEMM kernel. Single-stage, CPU-targeted.
     SparseMoe,
-    /// Qwen3.6-35B-A3B staged engine. Runs the IR-surgery shard chain
+    /// Qwen3.5-family staged engine (`qwen35`; `qwen36-moe` kept as an
+    /// alias). Runs the IR-surgery shard chain
     /// (`tools/qwen36_surgery/export_qwen36_moe.py` output dir with
-    /// manifest.json) in-process; greedy-only, batch=1. CPU-targeted
-    /// for decode (see docs/architectures/qwen36-moe-support.md).
+    /// manifest.json) in-process for both `qwen3_5_moe` (Qwen3.5/3.6-35B-A3B)
+    /// and dense `qwen3_5` (Qwen3.8-27B); greedy-only, batch=1 (see
+    /// docs/architectures/qwen36-moe-support.md and qwen3.8.md).
+    #[value(name = "qwen35", alias = "qwen36-moe")]
     Qwen36Moe,
 }
 
@@ -306,6 +309,21 @@ pub struct WorkerArgs {
     /// OV GPU dynamic-quantization group size.
     #[arg(long)]
     pub ov_dyn_quant_group: Option<String>,
+
+    /// `qwen35` only: byte budget (GiB) of the in-process prefix cache that
+    /// snapshots the chain state at chat-turn boundaries and restores it for
+    /// a prompt that extends a cached prefix (TTFT ≈ restore + the new tail
+    /// instead of a full re-prefill). 0 disables. Single-process (`--total
+    /// 1`) only; a Qwen3.8-27B snapshot is ~64 KB per context token.
+    #[arg(long, default_value_t = 16.0)]
+    pub prefix_cache_gb: f64,
+
+    /// Largest `/v1/chat/completions` request body (MiB); the rendered prompt
+    /// is capped at the same size. 4 MiB is ~1M characters ≈ a 262 K-token
+    /// window. Lower it on an exposed endpoint; the engine's own prompt-length
+    /// guard and the bounded admission queue still apply.
+    #[arg(long, default_value_t = 4.0)]
+    pub api_max_body_mb: f64,
 
     /// OV performance hint (PERFORMANCE_HINT). LATENCY suits single-user
     /// decode; THROUGHPUT enables NUM_STREAMS auto-tuning. See OpenVINO
@@ -621,6 +639,16 @@ pub struct RunArgs {
     /// 8000). Pass e.g. `127.0.0.1:8000` to bind loopback only.
     #[arg(long, default_value = ":8000")]
     pub api: String,
+
+    /// `--engine qwen35` only: prefix-cache budget in GiB (0 disables). See
+    /// `cascadia worker --help`.
+    #[arg(long, default_value_t = 16.0)]
+    pub prefix_cache_gb: f64,
+
+    /// Largest chat-completions request body in MiB (rendered prompt capped
+    /// alike). See `cascadia worker --help`.
+    #[arg(long, default_value_t = 4.0)]
+    pub api_max_body_mb: f64,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -648,6 +676,8 @@ impl WorkerArgs {
             api: Some(api),
             device,
             engine,
+            prefix_cache_gb: 16.0,
+            api_max_body_mb: 4.0,
             ov_cache_dir: None,
             ov_kv_precision: None,
             ov_dyn_quant_group: None,
@@ -699,8 +729,9 @@ const DEFAULT_STATIC_CONTEXT: u32 = 1024;
 #[derive(Parser, Debug, Clone)]
 pub struct ShardArgs {
     /// HuggingFace repo id (e.g. unsloth/Meta-Llama-3.1-8B-Instruct), a local
-    /// directory with safetensors + config.json, or — for the Gemma-4 / Qwen3.6
-    /// surgery paths — an already-exported OpenVINO IR directory.
+    /// directory with safetensors + config.json, or — for the Gemma-4 /
+    /// Qwen3.5-family (3.6 MoE, 3.8 dense) surgery paths — an
+    /// already-exported OpenVINO IR directory.
     #[arg(long)]
     pub model: String,
 
@@ -886,7 +917,9 @@ pub async fn run(cli: Cli) -> Result<()> {
 
 async fn cmd_run(args: RunArgs) -> Result<()> {
     info!(model = %args.model, device = %args.device, engine = ?args.engine, "cascadia run (single machine)");
-    let worker = WorkerArgs::single_node(args.model, args.device, args.engine, args.api);
+    let mut worker = WorkerArgs::single_node(args.model, args.device, args.engine, args.api);
+    worker.prefix_cache_gb = args.prefix_cache_gb;
+    worker.api_max_body_mb = args.api_max_body_mb;
     cmd_worker(worker).await
 }
 
@@ -912,7 +945,7 @@ fn cmd_engines() -> Result<()> {
     println!("  ov-dist-spec   multi-stage spec decode (mask-based KV rewind); v5 shards");
     println!("  gemma4         Gemma 4 multi-stage (per-layer-type attn, KV-sharing, PLI); gemma4_cached_v1 shards");
     println!("  sparse-moe     Kimi K2.6 (AVX-512 int4 GEMM + Rust MLA shells) or MiniMax-M2 (OV-IR shells); single-stage top-k expert dispatch");
-    println!("  qwen36-moe     Qwen3.6-35B-A3B staged chain (GatedDeltaNet + MoE); qwen3_5_moe IR-surgery shards");
+    println!("  qwen35         Qwen3.5-family staged chain (GatedDeltaNet; 3.5/3.6 MoE or 3.8 dense); qwen3_5* IR-surgery shards (alias: qwen36-moe)");
     Ok(())
 }
 
@@ -1068,12 +1101,12 @@ fn warn_ignored_ov_perf_flags(args: &WorkerArgs) {
         );
     }
 
-    // qwen36-moe compiles with a fixed plugin config and receives no OV perf
+    // qwen35 compiles with a fixed plugin config and receives no OV perf
     // properties (some hints break its IRs — see qwen36.rs). If the user set
     // general hints, warn they won't take effect on this engine.
     if matches!(args.engine, EngineKind::Qwen36Moe) && !ov_perf_properties(args).is_empty() {
         tracing::warn!(
-            "ignoring --ov-* performance flags: the qwen36-moe engine compiles \
+            "ignoring --ov-* performance flags: the qwen35 engine compiles \
              with a fixed plugin config and does not apply them"
         );
     }
@@ -1123,8 +1156,8 @@ fn export_hint(model: &str, engine: EngineKind) -> String {
              cascadia worker --engine gemma4 --model ./{stem}-2stage ..."
         ),
         EngineKind::Qwen36Moe => format!(
-            "  cascadia shard --model <qwen3.6 int4-ov dir> --output-dir ./{stem}-2stage --num-stages 2\n    \
-             cascadia run ./{stem}-2stage --engine qwen36-moe"
+            "  cascadia shard --model <qwen3.6/3.8 int4-ov dir> --output-dir ./{stem}-2stage --num-stages 2\n    \
+             cascadia run ./{stem}-2stage --engine qwen35"
         ),
         // sparse-moe consumes a manifest.json expert tree, not a shard tree.
         EngineKind::SparseMoe => {
@@ -1382,6 +1415,8 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             if let Some(group) = &args.ov_dyn_quant_group {
                 b = b.with_dyn_quant_group(group);
             }
+            let budget = (args.prefix_cache_gb.max(0.0) * (1u64 << 30) as f64) as usize;
+            b = b.with_prefix_cache_bytes(budget);
             Ok(Box::new(b))
         }
     }
@@ -1899,6 +1934,12 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         }
         let mut cfg = cascadia_api::Config::default();
         cfg.chat_template = chat_template;
+        // Long-context serving: the 64 KiB body / 32 KiB prompt defaults hold
+        // ~8 K tokens, a fraction of what the Qwen3.5-family and Llama-3.1
+        // windows admit. Both caps follow one operator-facing knob.
+        let max_body = (args.api_max_body_mb.max(0.001) * (1u64 << 20) as f64) as usize;
+        cfg.max_body_bytes = max_body;
+        cfg.max_prompt_bytes = max_body;
         // ov-genai owns native templating: render the template API-side only for
         // the thinking-OFF path (engine sets apply_chat_template=false then);
         // thinking-ON stays on ov-genai's native template, untouched.
@@ -2106,8 +2147,9 @@ const ALIASES_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tools/model_aliases.py"
 ));
-/// Qwen3.5/3.6 hybrid-MoE exporter (IR surgery on the official int4 IR),
-/// dispatched by export_shards.py for model_type qwen3_5_moe.
+/// Qwen3.5-family exporter (IR surgery on the official int4 IR),
+/// dispatched by export_shards.py for model_type qwen3_5_moe (Qwen3.5/3.6
+/// MoE) and qwen3_5 (dense Qwen3.8).
 const QWEN36_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tools/qwen36_surgery/export_qwen36_moe.py"
@@ -2374,7 +2416,7 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
             status
         ));
     }
-    // qwen3_5_moe shards run the in-process stage chain, not the
+    // qwen3_5-family shards run the in-process stage chain, not the
     // per-stage worker mesh; give the right invocation per manifest arch.
     let arch =
         std::fs::read_to_string(std::path::Path::new(&args.output_dir).join("manifest.json"))
@@ -2382,10 +2424,10 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .and_then(|v| v["arch"].as_str().map(String::from))
             .unwrap_or_default();
-    if arch == "qwen3_5_moe" {
+    if arch.starts_with("qwen3_5") {
         eprintln!(
             "\nShard tree written to {}. Run with:\n  cascadia run {} \
-             --engine qwen36-moe --device CPU --api :8000",
+             --engine qwen35 --device CPU --api :8000",
             args.output_dir, args.output_dir
         );
     } else if args.num_stages == 1 {
@@ -2694,7 +2736,7 @@ mod python_tests {
         // Each engine reads a different tree; don't send them all to ov-runtime.
         for (engine, needle) in [
             (EngineKind::Gemma4, "--engine gemma4"),
-            (EngineKind::Qwen36Moe, "--engine qwen36-moe"),
+            (EngineKind::Qwen36Moe, "--engine qwen35"),
             (EngineKind::SparseMoe, "manifest.json"),
             (EngineKind::OvGenai, "optimum-cli"),
             (EngineKind::OvRuntime, "--engine ov-runtime"),

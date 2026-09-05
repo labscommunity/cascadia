@@ -539,3 +539,43 @@ def test_is_moe_config_rejects_nested_text_config_experts():
         ),
     )
     assert export_shards.is_moe_config(cfg) is True
+
+
+def test_is_moe_config_accepts_qwen35_dense():
+    """Qwen3.8-27B is the DENSE member of the qwen3_5 family: outer
+    model_type qwen3_5, nested text_config qwen3_5_text, no expert fields.
+    It must not be mistaken for the MoE sibling."""
+    cfg = _FakeConfig(
+        model_type="qwen3_5",
+        architectures=["Qwen3_5ForConditionalGeneration"],
+        text_config=_FakeConfig(model_type="qwen3_5_text", hidden_size=5120),
+    )
+    assert export_shards.is_moe_config(cfg) is False
+
+
+def test_detect_arch_rejects_qwen35_dense_hybrid():
+    """"qwen3_5" contains "qwen3": without an explicit guard the dense
+    hybrid would fall through to the Qwen3 decoder path and be silently
+    mis-exported. The rejection must point at the surgery route."""
+    cfg = _FakeConfig(
+        model_type="qwen3_5", architectures=["Qwen3_5ForConditionalGeneration"]
+    )
+    with pytest.raises(export_shards.UnsupportedModelError, match="surgery|int4-ov"):
+        export_shards.detect_architecture(cfg)
+
+
+def test_detect_arch_rejects_qwen35_text_inner_type():
+    cfg = _FakeConfig(model_type="qwen3_5_text", architectures=["Qwen3_5ForCausalLM"])
+    with pytest.raises(export_shards.UnsupportedModelError):
+        export_shards.detect_architecture(cfg)
+
+
+def test_quirks_linear_attention_is_hard():
+    """Gated DeltaNet layers are a different model, not a lossy quirk."""
+    cfg = _FakeConfig(
+        layer_types=["linear_attention"] * 3 + ["full_attention"],
+        head_dim=256,
+    )
+    hard, soft = export_shards.check_export_quirks(cfg, "qwen3")
+    assert any("linear_attention" in h for h in hard), (hard, soft)
+    assert not any("mixed layer_types" in s for s in soft), soft

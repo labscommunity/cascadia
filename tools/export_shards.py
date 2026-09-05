@@ -241,6 +241,25 @@ def detect_architecture(config) -> str:
             "OpenVINO IR exporter does not implement. Out of scope."
         )
 
+    # Qwen3.5 family (qwen3_5 dense = Qwen3.8-27B; qwen3_5_moe = Qwen3.5/
+    # 3.6-35B-A3B): 3 of every 4 layers are Gated DeltaNet (linear
+    # attention with recurrent + conv state, no KV), plus gated attention
+    # with interleaved mRoPE. None of that is a `Qwen3DecoderLayer`, yet
+    # "qwen3_5" CONTAINS "qwen3", so without this branch a safetensors
+    # checkpoint would silently mis-export through the Qwen3 path. The
+    # supported route is IR surgery on the official OpenVINO IR (main()
+    # dispatches it config-first when the input is an *-int4-ov dir).
+    if _has("qwen3_5") or _has("qwen3.5"):
+        raise UnsupportedModelError(
+            "Qwen3.5-family hybrid models (model_type 'qwen3_5' / "
+            "'qwen3_5_moe' — Qwen3.5, Qwen3.6, Qwen3.8) use Gated DeltaNet "
+            "linear-attention layers + mRoPE that the generic dense exporter "
+            "does not model. Point --model at the official OpenVINO IR "
+            "directory (e.g. OpenVINO/Qwen3.8-27B-int4-ov) instead: "
+            "`cascadia shard` cuts it into stage shards for `--engine "
+            "qwen35` (docs/architectures/qwen3.8.md)."
+        )
+
     # ---- Accept list — families that load and run.
 
     if _has("llama"):
@@ -379,7 +398,18 @@ def check_export_quirks(config, arch_tag: str):
     # Mixed per-layer attention types (sliding/full) — correct within the
     # sliding window, attends to too much context beyond it.
     layer_types = getattr(cfg, "layer_types", None)
-    if isinstance(layer_types, list) and len(set(layer_types)) > 1:
+    if isinstance(layer_types, list) and "linear_attention" in layer_types:
+        # Gated DeltaNet / linear-attention layers carry recurrent state
+        # instead of a KV cache; a dense SDPA layer in their place is not
+        # "lossy", it is a different model (Qwen3.5 family).
+        hard.append(
+            f"linear_attention layers in layer_types "
+            f"({layer_types.count('linear_attention')}/{len(layer_types)}); "
+            "the generic exporter has no Gated DeltaNet kernel and would "
+            "emit garbage. Use the IR-surgery path on the official OpenVINO "
+            "IR (docs/architectures/qwen3.8.md)."
+        )
+    elif isinstance(layer_types, list) and len(set(layer_types)) > 1:
         sw = getattr(cfg, "sliding_window", "?")
         soft.append(
             f"mixed layer_types {sorted(set(layer_types))} (sliding_window={sw}); "
@@ -1976,18 +2006,22 @@ def main():
     # cannot go through the generic dense stage builder, and re-exporting
     # from safetensors would need a ~133 GB host). The --model must be an
     # *-int4-ov style IR directory (local or HF repo), NOT safetensors.
-    if any(t == "qwen3_5_moe" for t in (_outer_mt, _inner_mt)):
+    # The same surgery covers the dense sibling (`qwen3_5`, Qwen3.8-27B):
+    # the MoE block is opaque to the cut, and the exporter reads hidden /
+    # layer count / layer types from config.json.
+    if any(t.startswith("qwen3_5") for t in (_outer_mt, _inner_mt)):
         print(
-            "Detected Qwen3.5/3.6 hybrid MoE - dispatching to the IR-surgery "
-            "exporter (stages inherit the official int4 IR byte-for-byte; "
-            "--quantization is ignored).",
+            f"Detected Qwen3.5-family hybrid GatedDeltaNet model "
+            f"(model_type {_outer_mt or _inner_mt}) - dispatching to the "
+            f"IR-surgery exporter (stages inherit the official int4 IR "
+            f"byte-for-byte; --quantization is ignored).",
             flush=True,
         )
         if args.layer_split is not None or args.stage is not None:
             print(
                 "ERROR: --layer-split/--stage are not supported for "
-                "qwen3_5_moe (stages split uniformly at decoder-layer "
-                "boundaries).",
+                "qwen3_5-family models (stages split uniformly at "
+                "decoder-layer boundaries).",
                 flush=True,
             )
             sys.exit(2)
@@ -2004,7 +2038,7 @@ def main():
             snapshot_download(
                 repo_id=args.model,
                 local_dir=_model_dir,
-                allow_patterns=["*.xml", "*.bin", "*.json", "tokenizer*"],
+                allow_patterns=["*.xml", "*.bin", "*.json", "*.jinja", "tokenizer*"],
                 max_workers=8,
             )
         _here = os.path.dirname(os.path.abspath(__file__))
@@ -2036,10 +2070,11 @@ def main():
         f"layers (one MLP per layer); MoE routing + per-expert MLPs are not "
         f"implemented, and falling back to a dense layer would silently emit "
         f"garbage. Aborting rather than producing a broken shard.\n"
-        f"NOTE: hybrid Qwen3.5/Qwen3.6 MoE (model_type qwen3_5_moe) IS\n"
-        f"supported via a dedicated IR-surgery exporter (dispatched above when\n"
-        f"detected), or single-stage with `--engine ov-genai` on OV GenAI >=\n"
-        f"2026.2 — see docs/architectures/qwen36-moe-support.md."
+        f"NOTE: the hybrid Qwen3.5 family (model_type qwen3_5_moe for\n"
+        f"Qwen3.5/3.6 MoE, qwen3_5 for dense Qwen3.8) IS supported via a\n"
+        f"dedicated IR-surgery exporter (dispatched above when detected), or\n"
+        f"single-stage with `--engine ov-genai` on OV GenAI >= 2026.2 — see\n"
+        f"docs/architectures/qwen36-moe-support.md and qwen3.8.md."
     )
 
     # Read the config FIRST (cheap — just config.json, no weights) so we can

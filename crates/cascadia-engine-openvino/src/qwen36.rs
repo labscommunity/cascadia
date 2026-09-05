@@ -1,7 +1,11 @@
-//! Qwen3.6-35B-A3B staged engine: runs the IR-surgery shard chain
-//! (tools/qwen36_surgery/export_qwen36_moe.py) in-process on one box
-//! (single-box, --total 1) or as an N-node stage pipeline (--rank R
-//! --total N). Greedy-only, batch=1; the decode loop is a port of
+//! Qwen3.5-family staged engine (`--engine qwen35`, alias `qwen36-moe`):
+//! runs the IR-surgery shard chain (tools/qwen36_surgery/export_qwen36_moe.py)
+//! in-process on one box (single-box, --total 1) or as an N-node stage
+//! pipeline (--rank R --total N). Serves both `qwen3_5_moe` (Qwen3.5/
+//! 3.6-35B-A3B, hidden 2048, 40 layers) and dense `qwen3_5` (Qwen3.8-27B,
+//! hidden 5120, 64 layers): the stage IRs are opaque to the engine, which
+//! only needs the hidden width — read from `manifest.json` — to size the
+//! activation frames. Greedy-only, batch=1; the decode loop is a port of
 //! `tools/qwen36_surgery/proto_m3_decode.py`, which measured 64/64
 //! greedy token parity vs the whole model.
 //!
@@ -40,10 +44,14 @@ use futures::stream;
 use tokenizers::Tokenizer;
 use tracing::{error, info, warn};
 
-const HIDDEN: usize = 2048;
+/// Hidden width of shard trees exported before `manifest.hidden_size`
+/// existed (the Qwen3.6-35B-A3B surgery, hidden 2048). Newer manifests
+/// carry the width explicitly; the 27B dense export is 5120.
+const LEGACY_HIDDEN: usize = 2048;
 /// Prefill span per chain pass; bounds the transient [1, T, vocab]
 /// logits buffer (~254 MB f32 at 256 with the 248320 vocab) and the
-/// per-chunk wire frame (256 * 2048 * 4 B = 2 MiB, day-0 probe sized).
+/// per-chunk wire frame (256 * hidden * 4 B: 2 MiB at hidden 2048,
+/// 5 MiB at 5120 — both far under the transport's 256 MiB tensor cap).
 const PREFILL_CHUNK: usize = 256;
 
 /// Effective prefill span. Default = PREFILL_CHUNK (T>1 batched, ~4.2x TTFT win).
@@ -245,9 +253,21 @@ fn parse_header(b: &[u8]) -> (u32, u32, u32) {
     (f(0), f(4), f(8))
 }
 
-#[derive(serde::Deserialize)]
+fn legacy_hidden() -> usize {
+    LEGACY_HIDDEN
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct Manifest {
+    /// HF model_type of the source IR: `qwen3_5_moe` (Qwen3.5/3.6) or
+    /// `qwen3_5` (dense Qwen3.8). Anything else is not a surgery tree
+    /// this engine can drive.
     arch: String,
+    /// Activation width the stage IRs exchange ([1, T, hidden_size]).
+    /// Absent in trees cut before the exporter wrote it (Qwen3.6 era,
+    /// always 2048).
+    #[serde(default = "legacy_hidden")]
+    hidden_size: usize,
     /// Exporter sliced the last stage's logits to the final position
     /// ([1,1,vocab]); the engine then skips its own row slicing. Absent
     /// in pre-slice shard trees (default false).
@@ -256,7 +276,23 @@ struct Manifest {
     stages: Vec<StageInfo>,
 }
 
-#[derive(serde::Deserialize)]
+impl Manifest {
+    fn parse(raw: &str) -> Result<Self, String> {
+        let m: Manifest = serde_json::from_str(raw).map_err(|e| format!("manifest.json: {e}"))?;
+        if !m.arch.starts_with("qwen3_5") {
+            return Err(format!(
+                "manifest arch {:?} is not a Qwen3.5-family surgery tree (qwen3_5 / qwen3_5_moe)",
+                m.arch
+            ));
+        }
+        if m.hidden_size == 0 {
+            return Err("manifest hidden_size must be > 0".into());
+        }
+        Ok(m)
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct StageInfo {
     stage: usize,
     layer_start: u32,
@@ -280,6 +316,8 @@ pub struct Qwen36Builder {
     tokenizer: Option<Tokenizer>,
     eos: Option<u32>,
     last_logits_only: bool,
+    /// Activation width from the manifest (set by `load`).
+    hidden: usize,
     /// Issue-34: KV-cache STORAGE precision. Distinct from the compute-precision hints noted at the
     /// PluginConfig site (those are f16-only on the fused MoE gemm and fail to compile).
     ///
@@ -300,6 +338,10 @@ pub struct Qwen36Builder {
     /// plugin-property change forces a full uncached rebuild that can exceed the rig's serve window).
     /// runtime/gemma4/dist_spec all set this; qwen36 did not.
     pub cache_dir: Option<String>,
+    /// Byte budget of the always-on prefix cache (`crate::prefix_cache`); 0 disables it.
+    pub prefix_cache_bytes: usize,
+    /// `<|im_start|>` id from the tokenizer (rank 0), the chat-boundary marker for snapshots.
+    im_start_id: Option<u32>,
 }
 
 impl Qwen36Builder {
@@ -313,6 +355,11 @@ impl Qwen36Builder {
     }
     pub fn with_dyn_quant_group(mut self, group: impl Into<String>) -> Self {
         self.dyn_quant_group = Some(group.into());
+        self
+    }
+    /// Prefix-cache byte budget (0 = off). Default [`crate::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES`].
+    pub fn with_prefix_cache_bytes(mut self, bytes: usize) -> Self {
+        self.prefix_cache_bytes = bytes;
         self
     }
     pub fn new(shards_dir: impl Into<String>, device: impl Into<String>) -> Self {
@@ -333,9 +380,12 @@ impl Qwen36Builder {
             tokenizer: None,
             eos: None,
             last_logits_only: false,
+            hidden: LEGACY_HIDDEN,
             kv_cache_precision: None,
             dyn_quant_group: None,
             cache_dir: None,
+            prefix_cache_bytes: crate::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES,
+            im_start_id: None,
         }
     }
 
@@ -417,14 +467,7 @@ impl Builder for Qwen36Builder {
         let manifest_path = dir.join("manifest.json");
         let manifest_raw = std::fs::read_to_string(&manifest_path)
             .map_err(|e| EngineError::ModelNotFound(format!("{}: {e}", manifest_path.display())))?;
-        let manifest: Manifest = serde_json::from_str(&manifest_raw)
-            .map_err(|e| EngineError::InvalidConfig(format!("manifest.json: {e}")))?;
-        if manifest.arch != "qwen3_5_moe" {
-            return Err(EngineError::InvalidConfig(format!(
-                "manifest arch {:?} is not qwen3_5_moe",
-                manifest.arch
-            )));
-        }
+        let manifest = Manifest::parse(&manifest_raw).map_err(EngineError::InvalidConfig)?;
         if pipeline && manifest.stages.len() != self.total as usize {
             return Err(EngineError::ShardRejected(format!(
                 "--total ({}) does not match manifest stage count ({})",
@@ -434,7 +477,9 @@ impl Builder for Qwen36Builder {
         }
 
         let mut progress = vec![LoadProgress::message(format!(
-            "qwen36-moe: {} stages from {} (rank {}/{})",
+            "qwen35 ({}, hidden {}): {} stages from {} (rank {}/{})",
+            manifest.arch,
+            manifest.hidden_size,
             manifest.stages.len(),
             dir.display(),
             self.rank,
@@ -477,6 +522,10 @@ impl Builder for Qwen36Builder {
                 Tokenizer::from_file(dir.join("tokenizer.json"))
                     .map_err(|e| EngineError::InvalidConfig(format!("tokenizer.json: {e}")))?,
             );
+            self.im_start_id = self
+                .tokenizer
+                .as_ref()
+                .and_then(|t| t.token_to_id("<|im_start|>"));
             self.eos = read_eos(&dir);
         }
 
@@ -498,6 +547,7 @@ impl Builder for Qwen36Builder {
 
         self.manifest_json = Some(manifest_raw);
         self.last_logits_only = manifest.last_logits_only;
+        self.hidden = manifest.hidden_size;
         self.stages = Some(stages);
         progress.push(LoadProgress::ready());
         Ok(Box::pin(stream::iter(progress)))
@@ -507,6 +557,18 @@ impl Builder for Qwen36Builder {
         if self.rank == 0 && (self.emb.is_none() || self.tokenizer.is_none()) {
             return Err(EngineError::NotLoaded);
         }
+        // Single-process only: in pipeline mode the downstream ranks' state is not ours to snapshot
+        // (the kv_coord plane covers that with CAPTURE/RESTORE frames).
+        let prefix_cache_bytes = if self.total == 1 {
+            self.prefix_cache_bytes
+        } else {
+            0
+        };
+        info!(
+            budget_gib = prefix_cache_bytes >> 30,
+            im_start = ?self.im_start_id,
+            "qwen35 prefix cache"
+        );
         Ok(Box::new(Qwen36Engine {
             emb: self.emb,
             stages: self.stages.ok_or(EngineError::NotLoaded)?,
@@ -514,6 +576,7 @@ impl Builder for Qwen36Builder {
             eos: self.eos,
             max_tokens_default: self.max_tokens_default,
             last_logits_only: self.last_logits_only,
+            hidden: self.hidden,
             rank: self.rank,
             total: self.total,
             upstream: self.upstream,
@@ -533,7 +596,6 @@ impl Builder for Qwen36Builder {
             plane_restore: std::env::var("CASCADIA_KV_PLANE_RESTORE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
-            #[cfg(feature = "kv_coord")]
             state_restored: false,
             #[cfg(feature = "kv_coord")]
             kv_share: std::sync::Arc::new(std::sync::Mutex::new(
@@ -541,6 +603,9 @@ impl Builder for Qwen36Builder {
             )),
             #[cfg(feature = "kv_coord")]
             kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
+            prefix_cache: crate::prefix_cache::PrefixCache::new(prefix_cache_bytes),
+            im_start_id: self.im_start_id,
+            primed: false,
         }))
     }
 }
@@ -568,6 +633,10 @@ pub struct Qwen36Engine {
     eos: Option<u32>,
     max_tokens_default: u32,
     last_logits_only: bool,
+    /// Activation width ([1, T, hidden]) the stage IRs exchange; sizes
+    /// the dummy embeds, the FORWARD wire frame, and the relay-side
+    /// frame check. From `manifest.hidden_size`.
+    hidden: usize,
     rank: u32,
     total: u32,
     upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
@@ -614,8 +683,17 @@ pub struct Qwen36Engine {
     /// does not scrub that residue on this model (its DeltaNet recurrent states are fixed-shape, so
     /// there is no seq dim to collapse to zero), which left every post-migration turn serving
     /// garbage until the process restarted. Makes the next `reset_all` rebuild the InferRequest.
-    #[cfg(feature = "kv_coord")]
     state_restored: bool,
+    /// Always-on snapshot LRU (`crate::prefix_cache`): chat-boundary + end-of-turn state blobs,
+    /// restored at admission for a prompt that extends a cached prefix. Budget 0 ⇒ off.
+    prefix_cache: crate::prefix_cache::PrefixCache,
+    im_start_id: Option<u32>,
+    /// The stage requests have executed at least once since their last reset/recreate. A
+    /// `set_state_blob` onto a request that has NOT is silently discarded by the plugin on the
+    /// next inference (measured on the GPU plugin: KV depth = tokens folded since, logits off by
+    /// ~19), while the same restore onto a request that has run holds bit-exactly. Restores
+    /// therefore prime un-run stages with one dummy fold first.
+    primed: bool,
 }
 
 /// In-flight task state. `step()` advances one token per call so the
@@ -632,6 +710,12 @@ struct ActiveTask {
     prompt_ids: Vec<u32>,
     prefill_idx: usize,
     step: usize,
+    /// Tokens restored from a cached prefix at admission (0 = cold prefill).
+    warm_prefix: usize,
+    /// Single-box: prefill span boundaries (ascending) at which the chain state is snapshotted
+    /// into the prefix cache — the end of the system block and the position before the prompt's
+    /// last `<|im_start|>` (`prefix_cache::chat_boundaries`). Empty = no snapshot.
+    snapshot_at: Vec<usize>,
     /// Single-box: last position's logits row. Unused in pipeline mode.
     logits: Vec<f32>,
     /// Pipeline rank 0: next token returned by the downstream argmax.
@@ -721,7 +805,7 @@ enum InFrame {
 }
 
 impl Qwen36Engine {
-    /// Embed a token span: [1, n] ids -> flattened [1, n, HIDDEN] f32.
+    /// Embed a token span: [1, n] ids -> flattened [1, n, hidden] f32.
     fn embed_seq(&mut self, toks: &[u32]) -> EngineResult<Vec<f32>> {
         let emb = self
             .emb
@@ -752,12 +836,14 @@ impl Qwen36Engine {
     /// output otherwise. Returns the last stage's full first output,
     /// flattened [1, T, width].
     fn chain_pass(&mut self, embeds: &[f32], t0: usize, t1: usize) -> EngineResult<Vec<f32>> {
+        self.primed = true;
         let n = t1 - t0;
         let mask = vec![1i64; t1];
         let pos: Vec<i64> = (0..MROPE_ROWS)
             .flat_map(|_| (t0 as i64)..(t1 as i64))
             .collect();
-        let zeros_embeds = vec![0f32; n * HIDDEN];
+        let width = self.hidden;
+        let zeros_embeds = vec![0f32; n * width];
         let first_global = self.rank == 0;
         let mut hidden: Vec<f32> = embeds.to_vec();
         for (j, st) in self.stages.iter_mut().enumerate() {
@@ -765,7 +851,7 @@ impl Qwen36Engine {
             for name in &names {
                 match name.as_str() {
                     "stage_hidden" => st
-                        .set_input(name, DType::F32, &[1, n, HIDDEN], &le_bytes_f32(&hidden))
+                        .set_input(name, DType::F32, &[1, n, width], &le_bytes_f32(&hidden))
                         .map_err(map_ov)?,
                     s if s.contains("embed") => {
                         // global first stage: real embeds; later stages:
@@ -775,7 +861,7 @@ impl Qwen36Engine {
                         } else {
                             &zeros_embeds
                         };
-                        st.set_input(name, DType::F32, &[1, n, HIDDEN], &le_bytes_f32(data))
+                        st.set_input(name, DType::F32, &[1, n, width], &le_bytes_f32(data))
                             .map_err(map_ov)?;
                     }
                     s if s.contains("attention_mask") => st
@@ -822,12 +908,10 @@ impl Qwen36Engine {
     }
 
     fn reset_all(&mut self) {
+        self.primed = false;
         // After a restore, `reset_state` leaves residue on this model, so rebuild the request
         // instead — the flag keeps the ordinary turn-to-turn path on the cheap reset.
-        #[cfg(feature = "kv_coord")]
         let recreate = self.state_restored;
-        #[cfg(not(feature = "kv_coord"))]
-        let recreate = false;
         let mut all_ok = true;
         for st in self.stages.iter_mut() {
             let r = if recreate {
@@ -843,11 +927,9 @@ impl Qwen36Engine {
                 error!(error = %e, recreate, "qwen36: stage reset failed; state may be dirty");
             }
         }
-        #[cfg(feature = "kv_coord")]
         if all_ok {
             self.state_restored = false;
         }
-        let _ = all_ok;
     }
 
     /// Finish the active task: reset state, log, emit the final marker.
@@ -879,6 +961,21 @@ impl Qwen36Engine {
             }
             self.kv_capture_local(&t.tenant, tokens);
         }
+        // Always-on prefix cache: the whole turn (prompt + generated) is the key a template that
+        // preserves history verbatim will extend next turn. Only from a cold turn (see the
+        // snapshot_at note at admission), and only when no chat-boundary snapshot was taken —
+        // each copy costs ~2 s per GB of state, and the boundary key is the one chat traffic hits.
+        if self.prefix_cache.enabled() && t.warm_prefix == 0 && t.snapshot_at.is_empty() {
+            let key: Vec<u32> = t
+                .prompt_ids
+                .iter()
+                .copied()
+                .chain(t.gen_ids.iter().copied().skip(t.resume_seed_len))
+                .collect();
+            if !self.prefix_cache.contains(&key) {
+                self.prefix_cache_snapshot(&t.task_id, key);
+            }
+        }
         self.reset_all();
         let elapsed = t.started.elapsed().as_secs_f64();
         let tok_s = if elapsed > 0.0 {
@@ -889,6 +986,7 @@ impl Qwen36Engine {
         info!(
             task = %t.task_id,
             prompt_tokens = t.prompt_ids.len(),
+            warm_prefix = t.warm_prefix,
             tokens = t.gen_ids.len(),
             elapsed_s = elapsed,
             tok_s,
@@ -1004,7 +1102,7 @@ impl Qwen36Engine {
         .map_err(|e| EngineError::Backend(format!("qwen36 pipeline RESET not acked: {e}")))
     }
 
-    /// One lockstep FORWARD([1,n,HIDDEN] f32 at pos t0) → TOKEN exchange
+    /// One lockstep FORWARD([1,n,hidden] f32 at pos t0) → TOKEN exchange
     /// with the downstream peer. Returns the chain-end argmax token and
     /// the accumulated downstream infer time (µs) the TOKEN carried.
     fn forward_downstream(
@@ -1021,7 +1119,7 @@ impl Qwen36Engine {
         let h = self.handle()?;
         let tensor = WireTensor::new(
             WireDType::F32,
-            [1, n as u32, HIDDEN as u32],
+            [1, n as u32, self.hidden as u32],
             le_bytes_f32(hidden),
         );
         run_async(
@@ -1395,6 +1493,8 @@ impl Qwen36Engine {
                 prompt_ids,
                 prefill_idx: warm_prefix,
                 step: warm_prefix,
+                warm_prefix,
+                snapshot_at: Vec::new(),
                 logits: Vec::new(),
                 next_token: None,
                 gen_ids: resume_gen_ids,
@@ -1843,10 +1943,11 @@ impl Qwen36Engine {
                     );
                     return Ok(());
                 }
-                if hidden.len() != n * HIDDEN {
+                if hidden.len() != n * self.hidden {
                     return Err(EngineError::Backend(format!(
-                        "forward frame size {} != n({n}) * HIDDEN",
-                        hidden.len()
+                        "forward frame size {} != n({n}) * hidden({})",
+                        hidden.len(),
+                        self.hidden
                     )));
                 }
                 let infer_started = Instant::now();
@@ -2053,24 +2154,38 @@ impl Qwen36Engine {
                             );
                             warm
                         }
-                        _ => {
-                            self.reset_all();
-                            0
-                        }
+                        _ => self.local_warm_or_cold(&prompt_ids),
                     }
                 }
                 #[cfg(not(feature = "kv_coord"))]
                 {
-                    self.reset_all();
-                    0
+                    self.local_warm_or_cold(&prompt_ids)
                 }
             };
+            // Snapshot point for THIS turn: the position before the prompt's last `<|im_start|>`,
+            // which the next turn re-sends verbatim. Only on a COLD turn: after a `set_state_blob`
+            // the request's attention KV reads back shallow (only the tokens folded since the
+            // restore) while the DeltaNet state holds the whole history, so a snapshot taken then
+            // is inconsistent and a later hit on it corrupts the context (measured: wrong answers
+            // on turn 3). `local_warm_or_cold` forces a cold prefill once the warm tail grows past
+            // MAX_WARM_TAIL, which is when fresh snapshots get taken. Also skipped when the cache
+            // already holds the key (a shared system prompt).
+            let snapshot_at: Vec<usize> = self
+                .im_start_id
+                .filter(|_| self.prefix_cache.enabled() && warm_prefix == 0)
+                .map(|im| crate::prefix_cache::chat_boundaries(&prompt_ids, im))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|&b| !self.prefix_cache.contains(&prompt_ids[..b]))
+                .collect();
             self.active = Some(ActiveTask {
                 task_id: task.task_id,
                 tenant: task.tenant,
                 prompt_ids,
                 prefill_idx: warm_prefix,
                 step: warm_prefix,
+                warm_prefix,
+                snapshot_at,
                 logits: Vec::new(),
                 next_token: None,
                 gen_ids: resume_gen_ids,
@@ -2094,7 +2209,12 @@ impl Qwen36Engine {
                 < self.active.as_ref().unwrap().prompt_ids.len()
             {
                 let t = self.active.as_ref().unwrap();
-                let end = (t.prefill_idx + prefill_chunk()).min(t.prompt_ids.len());
+                let end = crate::prefix_cache::next_prefill_end(
+                    t.prefill_idx,
+                    t.prompt_ids.len(),
+                    prefill_chunk(),
+                    &t.snapshot_at,
+                );
                 let toks: Vec<u32> = t.prompt_ids[t.prefill_idx..end].to_vec();
                 let t0 = t.step;
                 match self.run_span(&toks, t0) {
@@ -2103,11 +2223,16 @@ impl Qwen36Engine {
                         t.logits = l;
                         t.prefill_idx = end;
                         t.step += toks.len();
+                        let snap_key =
+                            (t.snapshot_at.contains(&end)).then(|| t.prompt_ids[..end].to_vec());
                         // Same diagnostics as the multi-stage loop, mirrored onto the SINGLE-STAGE
                         // path. On a 1-stage (single-box) topology every stage is local, so these
                         // fingerprints cover the WHOLE model state — the 2-stage head-only view left
                         // the tail unmeasured, and head/tail disagreed there.
                         let reached = t.step;
+                        if let Some(key) = snap_key {
+                            self.prefix_cache_snapshot(&task_id, key);
+                        }
                         #[cfg(feature = "kv_coord")]
                         if selfchk_at() == Some(reached) && !self.state_restored {
                             match self.blob_local_stages() {
@@ -2353,6 +2478,79 @@ impl Qwen36Engine {
             self.restore_local_stages(blob)
         })
     }
+}
+
+impl Qwen36Engine {
+    /// Admission on the single-process path when the plane had no warm blob (or is not compiled
+    /// in): restore the longest cached prefix of `prompt_ids` over the live (already reset)
+    /// requests and return the resume depth, else cold-reset and return 0.
+    fn local_warm_or_cold(&mut self, prompt_ids: &[u32]) -> usize {
+        if self.prefix_cache.enabled() {
+            if let Some((blob, len)) = self.prefix_cache.longest_prefix(prompt_ids) {
+                // Snapshots are only taken on cold turns, so the tail past the cached prefix grows
+                // with every warm turn of a conversation. Past MAX_WARM_TAIL a cold prefill is the
+                // better deal: it costs one full prefill now and refreshes the boundary snapshot,
+                // so the tail shrinks back to one turn.
+                let tail = prompt_ids.len() - len;
+                if tail > crate::prefix_cache::MAX_WARM_TAIL {
+                    info!(
+                        matched = len,
+                        tail,
+                        "qwen35 prefix-cache: tail past MAX_WARM_TAIL; cold prefill to refresh"
+                    );
+                    self.reset_all();
+                    return 0;
+                }
+                let started = Instant::now();
+                if self.restore_local_stages(&blob) {
+                    // Attention depth from the blob, not the token count (see kv_seq_from_blob).
+                    let warm = crate::prefix_cache::kv_seq_from_framed_blob(&blob)
+                        .map(|s| s.min(len))
+                        .unwrap_or(len);
+                    let (hits, misses) = self.prefix_cache.stats();
+                    info!(
+                        warm_prefix = warm,
+                        matched = len,
+                        prompt = prompt_ids.len(),
+                        restore_ms = started.elapsed().as_millis() as u64,
+                        hits,
+                        misses,
+                        "qwen35 prefix-cache hit"
+                    );
+                    return warm;
+                }
+                warn!(
+                    matched = len,
+                    "qwen35 prefix-cache restore failed; cold prefill"
+                );
+            }
+        }
+        self.reset_all();
+        0
+    }
+
+    /// Snapshot the chain state under `key` into the prefix cache (best-effort).
+    fn prefix_cache_snapshot(&mut self, task_id: &TaskId, key: Vec<u32>) {
+        let started = Instant::now();
+        let pos = key.len();
+        match self.blob_local_stages() {
+            Some(blob) => {
+                let bytes = blob.len();
+                let stored = self.prefix_cache.insert(key, blob);
+                info!(
+                    task = %task_id,
+                    pos,
+                    bytes,
+                    stored,
+                    snapshot_ms = started.elapsed().as_millis() as u64,
+                    live_mib = self.prefix_cache.live_bytes() >> 20,
+                    entries = self.prefix_cache.len(),
+                    "qwen35 prefix-cache snapshot"
+                );
+            }
+            None => warn!(task = %task_id, pos, "qwen35 prefix-cache snapshot failed"),
+        }
+    }
 
     /// Snapshot every local stage's OV KV state into one framed opaque blob (emb is stateless).
     /// `None` if any stage can't snapshot (e.g. stub build) — capture degrades to cold reprefill.
@@ -2367,16 +2565,26 @@ impl Qwen36Engine {
                 }
             }
         }
-        (!blobs.is_empty()).then(|| crate::kv_coordination::frame_blobs(&blobs))
+        (!blobs.is_empty()).then(|| crate::prefix_cache::frame_blobs(&blobs))
     }
 
     /// Restore each local stage from a framed blob (inverse of [`Self::blob_local_stages`]).
     fn restore_local_stages(&mut self, blob: &[u8]) -> bool {
-        let Some(parts) = crate::kv_coordination::unframe_blobs(blob) else {
+        let Some(parts) = crate::prefix_cache::unframe_blobs(blob) else {
             return false;
         };
         if parts.len() != self.stages.len() {
             return false;
+        }
+        // Prime un-run requests: one dummy single-token fold at position 0 so the plugin has
+        // materialised its state buffers — otherwise the `set_state_blob` below is dropped on the
+        // next inference (see `primed`). The fold's garbage state is overwritten by the restore.
+        if !self.primed {
+            let zeros = vec![0f32; self.hidden];
+            if let Err(e) = self.chain_pass(&zeros, 0, 1) {
+                warn!(error = %e, "qwen36: priming fold before restore failed; cold reprefill");
+                return false;
+            }
         }
         for (st, part) in self.stages.iter_mut().zip(parts.iter()) {
             // Restore writes over the LIVE request — no pre-clear. See restore_clear_mode: clearing is
@@ -2400,6 +2608,7 @@ impl Qwen36Engine {
             // full tensor-dump rig run produced zero lines. Logs (name, rank, seq, nbytes, digest) per
             // state so an A-capture vs B-restore diff can say WHICH tensor differs — attention-only
             // points at layout mapping, conv/ssm-only at recurrent state handled as sequence-addressable.
+            #[cfg(feature = "kv_coord")]
             crate::kv_coordination::log_blob_tensors("qwen36_restore", 0, part);
             if let Err(e) = st.set_state_blob(part) {
                 warn!(error = %e, "qwen36: set_state_blob failed; cold reprefill");
@@ -2411,6 +2620,7 @@ impl Qwen36Engine {
             // round-trip at the DECLARED level? get_state_blob right after set — if it differs from
             // `part`, set_state is lossy (fixable serialization). If it matches yet warm still flips vs
             // cold, the delta is OV-internal (blocked layout / higher precision) = a floor at this OV version.
+            #[cfg(feature = "kv_coord")]
             if postprefill_fp() {
                 match st.get_state_blob() {
                     Ok(rt) => {
@@ -2440,6 +2650,7 @@ impl Qwen36Engine {
         }
         // Warm side of CASCADIA_QWEN36_FP_AT: the state as restored, before any suffix fold. Compare
         // against the cold path's "qwen36_fp_at (cold fold)" at the same pos.
+        #[cfg(feature = "kv_coord")]
         if fp_at().is_some() {
             let fps: Vec<u64> = self
                 .stages
@@ -2455,7 +2666,10 @@ impl Qwen36Engine {
         self.state_restored = true;
         true
     }
+}
 
+#[cfg(feature = "kv_coord")]
+impl Qwen36Engine {
     /// MODEL-level fingerprint (the manifest alone — identical on every rank of a tree), NOT per-rank.
     /// A cross-chain pull asserts ONE fingerprint — the entry head's — for EVERY rank's GET, so all
     /// ranks must share it; folding in `rank`/`total` made rank>0 GETs reject a legitimate move.
@@ -2612,6 +2826,31 @@ mod tests {
         assert_eq!(parse_header(&h), (FRAME_FORWARD, 7, 4096));
     }
 
+    /// A Qwen3.6-era tree (no hidden_size) keeps the 2048 width; a dense
+    /// Qwen3.8 tree carries 5120 and the `qwen3_5` arch.
+    #[test]
+    fn manifest_hidden_defaults_to_legacy_and_reads_dense() {
+        let legacy = Manifest::parse(r#"{"arch":"qwen3_5_moe","stages":[]}"#).unwrap();
+        assert_eq!(legacy.hidden_size, 2048);
+        assert!(!legacy.last_logits_only);
+        let dense = Manifest::parse(
+            r#"{"arch":"qwen3_5","hidden_size":5120,"num_layers":64,"last_logits_only":true,
+                "stages":[{"stage":0,"layer_start":0,"layer_end":31}]}"#,
+        )
+        .unwrap();
+        assert_eq!(dense.hidden_size, 5120);
+        assert!(dense.last_logits_only);
+        assert_eq!(dense.stages.len(), 1);
+    }
+
+    #[test]
+    fn manifest_rejects_foreign_arch_and_zero_width() {
+        let err = Manifest::parse(r#"{"arch":"llama","stages":[]}"#).unwrap_err();
+        assert!(err.contains("not a Qwen3.5-family"), "{err}");
+        let err = Manifest::parse(r#"{"arch":"qwen3_5","hidden_size":0,"stages":[]}"#).unwrap_err();
+        assert!(err.contains("hidden_size"), "{err}");
+    }
+
     fn bare_engine(total: u32, manifest: &str) -> Qwen36Engine {
         Qwen36Engine {
             emb: None,
@@ -2620,6 +2859,7 @@ mod tests {
             eos: None,
             max_tokens_default: 256,
             last_logits_only: false,
+            hidden: LEGACY_HIDDEN,
             rank: 1,
             total,
             upstream: None,
@@ -2639,7 +2879,6 @@ mod tests {
             plane_restore: std::env::var("CASCADIA_KV_PLANE_RESTORE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
-            #[cfg(feature = "kv_coord")]
             state_restored: false,
             #[cfg(feature = "kv_coord")]
             kv_share: std::sync::Arc::new(std::sync::Mutex::new(
@@ -2647,6 +2886,9 @@ mod tests {
             )),
             #[cfg(feature = "kv_coord")]
             kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
+            prefix_cache: crate::prefix_cache::PrefixCache::new(0),
+            im_start_id: None,
+            primed: false,
         }
     }
 
@@ -2814,6 +3056,8 @@ mod tests {
             prompt_ids: vec![1, 2, 3],
             prefill_idx: 3,
             step: 4,
+            warm_prefix: 0,
+            snapshot_at: Vec::new(),
             logits: Vec::new(),
             next_token: Some(5),
             gen_ids: vec![5],
