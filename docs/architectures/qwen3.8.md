@@ -262,11 +262,21 @@ only the tail. Two snapshots per turn:
   carries, so a snapshot keyed on the previous turn's full sequence would
   never match. The prefill span is split at that position so the state is
   captured exactly there.
-- at **turn end** (prompt + generated), which pays off whenever a template
+- at **turn end** (prompt + generated) when no boundary snapshot was taken
+  (legacy prompts without `<|im_start|>`), which pays off whenever a template
   does preserve history verbatim.
 
 Lookups are non-consuming, so a shared system prompt serves every
-conversation that starts with it. DeltaNet state cannot be trimmed, so this
+conversation that starts with it. Snapshots are taken only on **cold**
+turns: after a `set_state_blob` the request's attention KV reads back
+shallow (only the tokens folded since the restore) while the DeltaNet state
+carries the whole history, so a snapshot taken then is inconsistent — the
+first certification run hit exactly that (turn 3 answered from a corrupted
+context). Because the tail past the cached prefix therefore grows by one
+turn per warm turn, admission prefers a cold prefill once the tail exceeds
+`MAX_WARM_TAIL` (4096 tokens), which refreshes the boundary snapshot; the
+per-turn cost is bounded by that tail, and the periodic cold prefill
+amortises over several turns. DeltaNet state cannot be trimmed, so this
 is snapshot-at-boundary caching: a hit costs one `set_state_blob` per stage
 (a memcpy of ~64 KB per cached token plus ~150 MB of recurrent state) and
 the tail's prefill; a miss costs a full prefill plus one snapshot copy of
