@@ -72,6 +72,7 @@ cascadia run [OPTIONS] <MODEL>
 | `--device <DEVICE>` | `GPU` | `GPU` / `CPU` / `NPU`. Also the indexed and compound OpenVINO forms — see [`--device` forms](#device-forms). |
 | `--engine <ENGINE>` | `ov-genai` | Inference engine. Use `ov-runtime` for a `cascadia shard` tree. |
 | `--api <API>` | `:8000` | API bind address. `127.0.0.1:8000` binds loopback only. |
+| `--prefix-cache-gb <GB>` | `16` | `qwen35` only: budget of the in-process prefix cache (chat-boundary + turn-end state snapshots, restored for prompts that extend a cached prefix). `0` disables. |
 
 Note the defaults differ from `worker` (`GPU`/`ov-genai` here, `CPU`/`mock`
 there): `run` assumes you want real inference on the accelerator.
@@ -132,6 +133,7 @@ a few each. MiniMax-M2 `sparse-moe` only.
 | `--ov-num-threads <N>` | — | Host CPU thread cap (`INFERENCE_NUM_THREADS`). CPU plugin only. |
 | `--ov-allow-auto-batching` | off | Allow GPU-plugin internal auto-batching. |
 | `--ov-execution-mode <MODE>` | — | `ACCURACY` / `PERFORMANCE`. |
+| `--prefix-cache-gb <GB>` | `16` | `qwen35` only, single-process (`--total 1`): byte budget of the chain-state prefix cache; a Qwen3.8-27B snapshot is ~64 KB per context token (+~150 MB). `0` disables. See [qwen3.8.md](architectures/qwen3.8.md). |
 
 **`--ov-cache-dir` is on by default and matters.** For `ov-genai`, `ov-runtime`,
 `gemma4` and `sparse-moe`, leaving it unset defaults to
@@ -412,7 +414,7 @@ OpenVINO GPU plugin can see.
 | `ov-dist-spec` | `cascadia shard` tree | Distributed speculative decode. Every rank must use it. |
 | `gemma4` | `gemma4_cached_v1` shards | Per-layer-type asymmetric attention, KV-sharing, baked softcap. |
 | `sparse-moe` | `manifest.json` + expert tree | Top-k expert routing through an AVX-512 int4 GEMM. CPU-targeted; single-stage or pipeline-parallel (`--total >= 2`). |
-| `qwen35` (alias `qwen36-moe`) | Qwen3.5-family surgery output (Qwen3.6 MoE, dense Qwen3.8) | Greedy-only, batch=1. CPU or iGPU decode. |
+| `qwen35` (alias `qwen36-moe`) | Qwen3.5-family surgery output (Qwen3.6 MoE, dense Qwen3.8) | Greedy-only, batch=1. CPU or iGPU decode. In-process prefix cache (`--prefix-cache-gb`, default 16, 0 = off): chat-boundary + turn-end state snapshots restored for prompts that extend a cached prefix. |
 
 Per-engine deep dives: [engines/](engines/). Per-family export notes:
 [architectures/](architectures/).

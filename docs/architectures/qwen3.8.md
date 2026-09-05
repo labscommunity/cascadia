@@ -249,32 +249,37 @@ manifest stripped to the Qwen3.6-era keys (`arch`, `source`,
 the `--engine qwen36-moe` alias, so existing shard trees and scripts keep
 working.
 
-**Prefix caching / warm resume.** The staged engine already carries a
-strict-prefix warm-resume cache behind the `kv_coord` build feature (issue
-34): after each turn it captures the chain's full state blob keyed by tenant
-+ prompt tokens, and a later prompt that starts with those tokens restores
-the blob and prefills only the tail (`take_warm`, one-shot). It was
-certified on Qwen3.6, not re-run here. The `ov-genai` path has no prefix
-caching for this model (`--cb`, which carries GenAI's KV-block prefix cache,
-is refused on VLM-layout exports). DeltaNet state cannot be trimmed, so any
-prefix cache on this family is snapshot-at-boundary, never "drop the tail".
+**Prefix caching (always on in `qwen35`).** The engine keeps a byte-bounded
+LRU of chain-state snapshots keyed by exact token prefix
+(`crates/cascadia-engine-openvino/src/prefix_cache.rs`) and restores the
+longest cached strict prefix of each new prompt at admission, prefilling
+only the tail. Two snapshots per turn:
 
-What a hit is worth on the B390 (raw-IR probe: prefill the prefix, snapshot
-all 128 state variables, restore into a fresh request, prefill a 12-token
-suffix):
+- at the **chat boundary** — the position before the prompt's last
+  `<|im_start|>` (the generation prompt). This is the part the next turn
+  re-sends verbatim: the family's chat template renders a history
+  assistant turn *without* the `<think>` block the live generation prompt
+  carries, so a snapshot keyed on the previous turn's full sequence would
+  never match. The prefill span is split at that position so the state is
+  captured exactly there.
+- at **turn end** (prompt + generated), which pays off whenever a template
+  does preserve history verbatim.
 
-| prefix | uncached TTFT | snapshot | restore | TTFT after restore |
-|---|---|---|---|---|
-| 8 K | 20.0 s | 1.2 GB, 1.5 s | 1.7 s | **2.0 s** |
-| 32 K | 128 s | 4.2 GB, 5.9 s | 6.2 s | **6.6 s** |
+Lookups are non-consuming, so a shared system prompt serves every
+conversation that starts with it. DeltaNet state cannot be trimmed, so this
+is snapshot-at-boundary caching: a hit costs one `set_state_blob` per stage
+(a memcpy of ~64 KB per cached token plus ~150 MB of recurrent state) and
+the tail's prefill; a miss costs a full prefill plus one snapshot copy of
+the same size. `--prefix-cache-gb` sets the budget (default 16; 0 disables;
+a Qwen3.8-27B snapshot is 2.2 GB at 32 K tokens, 8.5 GB at 128 K). Single
+process only: in pipeline mode (`--total > 1`) the downstream ranks' state
+is not local, which the `kv_coord` coordination plane covers with its
+CAPTURE/RESTORE frames (that plane's blob framing is shared with this cache).
+The `ov-genai` path has its own prefix cache inside GenAI's PagedAttention
+backend (1.2 s repeat-prompt TTFT at 8 K in the table below).
 
-So a hit turns a 32 K-token agent turn from two minutes into ~7 s, and the
-snapshot itself costs about as much as one restore. Caveat: that probe
-restored into a freshly created request and its suffix logits did **not**
-match the uncached run — the same trap the engine's design notes describe
-(restore over the live request, never after a reset/recreate). The timing
-is the bound; fidelity on Qwen3.8 has to be certified through the engine's
-`kv_coord` path, which does it the right way.
+_Certification (multi-turn through the API, cache on vs off, greedy text
+compared) is appended below as it completes._
 
 **Cold-TTFT levers in the staged engine (measured, 8K prompt, B390, with
 the OVMS node running alongside — ~10–20 % slower than the quiet-box sweep):**

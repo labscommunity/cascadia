@@ -338,6 +338,10 @@ pub struct Qwen36Builder {
     /// plugin-property change forces a full uncached rebuild that can exceed the rig's serve window).
     /// runtime/gemma4/dist_spec all set this; qwen36 did not.
     pub cache_dir: Option<String>,
+    /// Byte budget of the always-on prefix cache (`crate::prefix_cache`); 0 disables it.
+    pub prefix_cache_bytes: usize,
+    /// `<|im_start|>` id from the tokenizer (rank 0), the chat-boundary marker for snapshots.
+    im_start_id: Option<u32>,
 }
 
 impl Qwen36Builder {
@@ -351,6 +355,11 @@ impl Qwen36Builder {
     }
     pub fn with_dyn_quant_group(mut self, group: impl Into<String>) -> Self {
         self.dyn_quant_group = Some(group.into());
+        self
+    }
+    /// Prefix-cache byte budget (0 = off). Default [`crate::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES`].
+    pub fn with_prefix_cache_bytes(mut self, bytes: usize) -> Self {
+        self.prefix_cache_bytes = bytes;
         self
     }
     pub fn new(shards_dir: impl Into<String>, device: impl Into<String>) -> Self {
@@ -375,6 +384,8 @@ impl Qwen36Builder {
             kv_cache_precision: None,
             dyn_quant_group: None,
             cache_dir: None,
+            prefix_cache_bytes: crate::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES,
+            im_start_id: None,
         }
     }
 
@@ -511,6 +522,10 @@ impl Builder for Qwen36Builder {
                 Tokenizer::from_file(dir.join("tokenizer.json"))
                     .map_err(|e| EngineError::InvalidConfig(format!("tokenizer.json: {e}")))?,
             );
+            self.im_start_id = self
+                .tokenizer
+                .as_ref()
+                .and_then(|t| t.token_to_id("<|im_start|>"));
             self.eos = read_eos(&dir);
         }
 
@@ -542,6 +557,18 @@ impl Builder for Qwen36Builder {
         if self.rank == 0 && (self.emb.is_none() || self.tokenizer.is_none()) {
             return Err(EngineError::NotLoaded);
         }
+        // Single-process only: in pipeline mode the downstream ranks' state is not ours to snapshot
+        // (the kv_coord plane covers that with CAPTURE/RESTORE frames).
+        let prefix_cache_bytes = if self.total == 1 {
+            self.prefix_cache_bytes
+        } else {
+            0
+        };
+        info!(
+            budget_gib = prefix_cache_bytes >> 30,
+            im_start = ?self.im_start_id,
+            "qwen35 prefix cache"
+        );
         Ok(Box::new(Qwen36Engine {
             emb: self.emb,
             stages: self.stages.ok_or(EngineError::NotLoaded)?,
@@ -569,7 +596,6 @@ impl Builder for Qwen36Builder {
             plane_restore: std::env::var("CASCADIA_KV_PLANE_RESTORE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
-            #[cfg(feature = "kv_coord")]
             state_restored: false,
             #[cfg(feature = "kv_coord")]
             kv_share: std::sync::Arc::new(std::sync::Mutex::new(
@@ -577,6 +603,8 @@ impl Builder for Qwen36Builder {
             )),
             #[cfg(feature = "kv_coord")]
             kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
+            prefix_cache: crate::prefix_cache::PrefixCache::new(prefix_cache_bytes),
+            im_start_id: self.im_start_id,
         }))
     }
 }
@@ -654,8 +682,11 @@ pub struct Qwen36Engine {
     /// does not scrub that residue on this model (its DeltaNet recurrent states are fixed-shape, so
     /// there is no seq dim to collapse to zero), which left every post-migration turn serving
     /// garbage until the process restarted. Makes the next `reset_all` rebuild the InferRequest.
-    #[cfg(feature = "kv_coord")]
     state_restored: bool,
+    /// Always-on snapshot LRU (`crate::prefix_cache`): chat-boundary + end-of-turn state blobs,
+    /// restored at admission for a prompt that extends a cached prefix. Budget 0 ⇒ off.
+    prefix_cache: crate::prefix_cache::PrefixCache,
+    im_start_id: Option<u32>,
 }
 
 /// In-flight task state. `step()` advances one token per call so the
@@ -672,6 +703,11 @@ struct ActiveTask {
     prompt_ids: Vec<u32>,
     prefill_idx: usize,
     step: usize,
+    /// Tokens restored from a cached prefix at admission (0 = cold prefill).
+    warm_prefix: usize,
+    /// Single-box: prefill span boundary at which the chain state is snapshotted into the prefix
+    /// cache (the position before the prompt's last `<|im_start|>`). `None` = no snapshot.
+    snapshot_at: Option<usize>,
     /// Single-box: last position's logits row. Unused in pipeline mode.
     logits: Vec<f32>,
     /// Pipeline rank 0: next token returned by the downstream argmax.
@@ -865,10 +901,7 @@ impl Qwen36Engine {
     fn reset_all(&mut self) {
         // After a restore, `reset_state` leaves residue on this model, so rebuild the request
         // instead — the flag keeps the ordinary turn-to-turn path on the cheap reset.
-        #[cfg(feature = "kv_coord")]
         let recreate = self.state_restored;
-        #[cfg(not(feature = "kv_coord"))]
-        let recreate = false;
         let mut all_ok = true;
         for st in self.stages.iter_mut() {
             let r = if recreate {
@@ -884,11 +917,9 @@ impl Qwen36Engine {
                 error!(error = %e, recreate, "qwen36: stage reset failed; state may be dirty");
             }
         }
-        #[cfg(feature = "kv_coord")]
         if all_ok {
             self.state_restored = false;
         }
-        let _ = all_ok;
     }
 
     /// Finish the active task: reset state, log, emit the final marker.
@@ -920,6 +951,19 @@ impl Qwen36Engine {
             }
             self.kv_capture_local(&t.tenant, tokens);
         }
+        // Always-on prefix cache: the whole turn (prompt + generated) is the key a template that
+        // preserves history verbatim will extend next turn. Best-effort; single-process only.
+        if self.prefix_cache.enabled() {
+            let key: Vec<u32> = t
+                .prompt_ids
+                .iter()
+                .copied()
+                .chain(t.gen_ids.iter().copied().skip(t.resume_seed_len))
+                .collect();
+            if !self.prefix_cache.contains(&key) {
+                self.prefix_cache_snapshot(&t.task_id, key);
+            }
+        }
         self.reset_all();
         let elapsed = t.started.elapsed().as_secs_f64();
         let tok_s = if elapsed > 0.0 {
@@ -930,6 +974,7 @@ impl Qwen36Engine {
         info!(
             task = %t.task_id,
             prompt_tokens = t.prompt_ids.len(),
+            warm_prefix = t.warm_prefix,
             tokens = t.gen_ids.len(),
             elapsed_s = elapsed,
             tok_s,
@@ -1436,6 +1481,8 @@ impl Qwen36Engine {
                 prompt_ids,
                 prefill_idx: warm_prefix,
                 step: warm_prefix,
+                warm_prefix,
+                snapshot_at: None,
                 logits: Vec::new(),
                 next_token: None,
                 gen_ids: resume_gen_ids,
@@ -2095,24 +2142,30 @@ impl Qwen36Engine {
                             );
                             warm
                         }
-                        _ => {
-                            self.reset_all();
-                            0
-                        }
+                        _ => self.local_warm_or_cold(&prompt_ids),
                     }
                 }
                 #[cfg(not(feature = "kv_coord"))]
                 {
-                    self.reset_all();
-                    0
+                    self.local_warm_or_cold(&prompt_ids)
                 }
             };
+            // Snapshot point for THIS turn: the position before the prompt's last `<|im_start|>`,
+            // which the next turn re-sends verbatim. Skipped when the cache already holds it (a
+            // shared system prompt) or the restore already covered it.
+            let snapshot_at = self
+                .im_start_id
+                .filter(|_| self.prefix_cache.enabled())
+                .and_then(|im| crate::prefix_cache::chat_boundary(&prompt_ids, im))
+                .filter(|&b| b > warm_prefix && !self.prefix_cache.contains(&prompt_ids[..b]));
             self.active = Some(ActiveTask {
                 task_id: task.task_id,
                 tenant: task.tenant,
                 prompt_ids,
                 prefill_idx: warm_prefix,
                 step: warm_prefix,
+                warm_prefix,
+                snapshot_at,
                 logits: Vec::new(),
                 next_token: None,
                 gen_ids: resume_gen_ids,
@@ -2136,7 +2189,12 @@ impl Qwen36Engine {
                 < self.active.as_ref().unwrap().prompt_ids.len()
             {
                 let t = self.active.as_ref().unwrap();
-                let end = (t.prefill_idx + prefill_chunk()).min(t.prompt_ids.len());
+                let end = crate::prefix_cache::next_prefill_end(
+                    t.prefill_idx,
+                    t.prompt_ids.len(),
+                    prefill_chunk(),
+                    t.snapshot_at,
+                );
                 let toks: Vec<u32> = t.prompt_ids[t.prefill_idx..end].to_vec();
                 let t0 = t.step;
                 match self.run_span(&toks, t0) {
@@ -2145,11 +2203,16 @@ impl Qwen36Engine {
                         t.logits = l;
                         t.prefill_idx = end;
                         t.step += toks.len();
+                        let snap_key =
+                            (t.snapshot_at == Some(end)).then(|| t.prompt_ids[..end].to_vec());
                         // Same diagnostics as the multi-stage loop, mirrored onto the SINGLE-STAGE
                         // path. On a 1-stage (single-box) topology every stage is local, so these
                         // fingerprints cover the WHOLE model state — the 2-stage head-only view left
                         // the tail unmeasured, and head/tail disagreed there.
                         let reached = t.step;
+                        if let Some(key) = snap_key {
+                            self.prefix_cache_snapshot(&task_id, key);
+                        }
                         #[cfg(feature = "kv_coord")]
                         if selfchk_at() == Some(reached) && !self.state_restored {
                             match self.blob_local_stages() {
@@ -2395,6 +2458,65 @@ impl Qwen36Engine {
             self.restore_local_stages(blob)
         })
     }
+}
+
+impl Qwen36Engine {
+    /// Admission on the single-process path when the plane had no warm blob (or is not compiled
+    /// in): restore the longest cached prefix of `prompt_ids` over the live (already reset)
+    /// requests and return the resume depth, else cold-reset and return 0.
+    fn local_warm_or_cold(&mut self, prompt_ids: &[u32]) -> usize {
+        if self.prefix_cache.enabled() {
+            if let Some((blob, len)) = self.prefix_cache.longest_prefix(prompt_ids) {
+                let started = Instant::now();
+                if self.restore_local_stages(&blob) {
+                    // Attention depth from the blob, not the token count (see kv_seq_from_blob).
+                    let warm = crate::prefix_cache::kv_seq_from_framed_blob(&blob)
+                        .map(|s| s.min(len))
+                        .unwrap_or(len);
+                    let (hits, misses) = self.prefix_cache.stats();
+                    info!(
+                        warm_prefix = warm,
+                        matched = len,
+                        prompt = prompt_ids.len(),
+                        restore_ms = started.elapsed().as_millis() as u64,
+                        hits,
+                        misses,
+                        "qwen35 prefix-cache hit"
+                    );
+                    return warm;
+                }
+                warn!(
+                    matched = len,
+                    "qwen35 prefix-cache restore failed; cold prefill"
+                );
+            }
+        }
+        self.reset_all();
+        0
+    }
+
+    /// Snapshot the chain state under `key` into the prefix cache (best-effort).
+    fn prefix_cache_snapshot(&mut self, task_id: &TaskId, key: Vec<u32>) {
+        let started = Instant::now();
+        let pos = key.len();
+        match self.blob_local_stages() {
+            Some(blob) => {
+                let bytes = blob.len();
+                let stored = self.prefix_cache.insert(key, blob);
+                info!(
+                    task = %task_id,
+                    pos,
+                    bytes,
+                    stored,
+                    snapshot_ms = started.elapsed().as_millis() as u64,
+                    live_mib = self.prefix_cache.live_bytes() >> 20,
+                    entries = self.prefix_cache.len(),
+                    "qwen35 prefix-cache snapshot"
+                );
+            }
+            None => warn!(task = %task_id, pos, "qwen35 prefix-cache snapshot failed"),
+        }
+    }
 
     /// Snapshot every local stage's OV KV state into one framed opaque blob (emb is stateless).
     /// `None` if any stage can't snapshot (e.g. stub build) — capture degrades to cold reprefill.
@@ -2409,12 +2531,12 @@ impl Qwen36Engine {
                 }
             }
         }
-        (!blobs.is_empty()).then(|| crate::kv_coordination::frame_blobs(&blobs))
+        (!blobs.is_empty()).then(|| crate::prefix_cache::frame_blobs(&blobs))
     }
 
     /// Restore each local stage from a framed blob (inverse of [`Self::blob_local_stages`]).
     fn restore_local_stages(&mut self, blob: &[u8]) -> bool {
-        let Some(parts) = crate::kv_coordination::unframe_blobs(blob) else {
+        let Some(parts) = crate::prefix_cache::unframe_blobs(blob) else {
             return false;
         };
         if parts.len() != self.stages.len() {
@@ -2442,6 +2564,7 @@ impl Qwen36Engine {
             // full tensor-dump rig run produced zero lines. Logs (name, rank, seq, nbytes, digest) per
             // state so an A-capture vs B-restore diff can say WHICH tensor differs — attention-only
             // points at layout mapping, conv/ssm-only at recurrent state handled as sequence-addressable.
+            #[cfg(feature = "kv_coord")]
             crate::kv_coordination::log_blob_tensors("qwen36_restore", 0, part);
             if let Err(e) = st.set_state_blob(part) {
                 warn!(error = %e, "qwen36: set_state_blob failed; cold reprefill");
@@ -2453,6 +2576,7 @@ impl Qwen36Engine {
             // round-trip at the DECLARED level? get_state_blob right after set — if it differs from
             // `part`, set_state is lossy (fixable serialization). If it matches yet warm still flips vs
             // cold, the delta is OV-internal (blocked layout / higher precision) = a floor at this OV version.
+            #[cfg(feature = "kv_coord")]
             if postprefill_fp() {
                 match st.get_state_blob() {
                     Ok(rt) => {
@@ -2482,6 +2606,7 @@ impl Qwen36Engine {
         }
         // Warm side of CASCADIA_QWEN36_FP_AT: the state as restored, before any suffix fold. Compare
         // against the cold path's "qwen36_fp_at (cold fold)" at the same pos.
+        #[cfg(feature = "kv_coord")]
         if fp_at().is_some() {
             let fps: Vec<u64> = self
                 .stages
@@ -2497,7 +2622,10 @@ impl Qwen36Engine {
         self.state_restored = true;
         true
     }
+}
 
+#[cfg(feature = "kv_coord")]
+impl Qwen36Engine {
     /// MODEL-level fingerprint (the manifest alone — identical on every rank of a tree), NOT per-rank.
     /// A cross-chain pull asserts ONE fingerprint — the entry head's — for EVERY rank's GET, so all
     /// ranks must share it; folding in `rank`/`total` made rank>0 GETs reject a legitimate move.
@@ -2707,7 +2835,6 @@ mod tests {
             plane_restore: std::env::var("CASCADIA_KV_PLANE_RESTORE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
-            #[cfg(feature = "kv_coord")]
             state_restored: false,
             #[cfg(feature = "kv_coord")]
             kv_share: std::sync::Arc::new(std::sync::Mutex::new(
@@ -2715,6 +2842,8 @@ mod tests {
             )),
             #[cfg(feature = "kv_coord")]
             kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
+            prefix_cache: crate::prefix_cache::PrefixCache::new(0),
+            im_start_id: None,
         }
     }
 
@@ -2882,6 +3011,8 @@ mod tests {
             prompt_ids: vec![1, 2, 3],
             prefill_idx: 3,
             step: 4,
+            warm_prefix: 0,
+            snapshot_at: None,
             logits: Vec::new(),
             next_token: Some(5),
             gen_ids: vec![5],

@@ -310,6 +310,14 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub ov_dyn_quant_group: Option<String>,
 
+    /// `qwen35` only: byte budget (GiB) of the in-process prefix cache that
+    /// snapshots the chain state at chat-turn boundaries and restores it for
+    /// a prompt that extends a cached prefix (TTFT ≈ restore + the new tail
+    /// instead of a full re-prefill). 0 disables. Single-process (`--total
+    /// 1`) only; a Qwen3.8-27B snapshot is ~64 KB per context token.
+    #[arg(long, default_value_t = 16.0)]
+    pub prefix_cache_gb: f64,
+
     /// OV performance hint (PERFORMANCE_HINT). LATENCY suits single-user
     /// decode; THROUGHPUT enables NUM_STREAMS auto-tuning. See OpenVINO
     /// high-level-performance-hints docs (2026).
@@ -624,6 +632,11 @@ pub struct RunArgs {
     /// 8000). Pass e.g. `127.0.0.1:8000` to bind loopback only.
     #[arg(long, default_value = ":8000")]
     pub api: String,
+
+    /// `--engine qwen35` only: prefix-cache budget in GiB (0 disables). See
+    /// `cascadia worker --help`.
+    #[arg(long, default_value_t = 16.0)]
+    pub prefix_cache_gb: f64,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -651,6 +664,7 @@ impl WorkerArgs {
             api: Some(api),
             device,
             engine,
+            prefix_cache_gb: 16.0,
             ov_cache_dir: None,
             ov_kv_precision: None,
             ov_dyn_quant_group: None,
@@ -890,7 +904,8 @@ pub async fn run(cli: Cli) -> Result<()> {
 
 async fn cmd_run(args: RunArgs) -> Result<()> {
     info!(model = %args.model, device = %args.device, engine = ?args.engine, "cascadia run (single machine)");
-    let worker = WorkerArgs::single_node(args.model, args.device, args.engine, args.api);
+    let mut worker = WorkerArgs::single_node(args.model, args.device, args.engine, args.api);
+    worker.prefix_cache_gb = args.prefix_cache_gb;
     cmd_worker(worker).await
 }
 
@@ -1386,6 +1401,8 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             if let Some(group) = &args.ov_dyn_quant_group {
                 b = b.with_dyn_quant_group(group);
             }
+            let budget = (args.prefix_cache_gb.max(0.0) * (1u64 << 30) as f64) as usize;
+            b = b.with_prefix_cache_bytes(budget);
             Ok(Box::new(b))
         }
     }
