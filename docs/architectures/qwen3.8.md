@@ -253,18 +253,21 @@ working.
 LRU of chain-state snapshots keyed by exact token prefix
 (`crates/cascadia-engine-openvino/src/prefix_cache.rs`) and restores the
 longest cached strict prefix of each new prompt at admission, prefilling
-only the tail. Two snapshots per turn:
+only the tail. Snapshot positions on a cold turn:
 
-- at the **chat boundary** — the position before the prompt's last
-  `<|im_start|>` (the generation prompt). This is the part the next turn
-  re-sends verbatim: the family's chat template renders a history
-  assistant turn *without* the `<think>` block the live generation prompt
-  carries, so a snapshot keyed on the previous turn's full sequence would
-  never match. The prefill span is split at that position so the state is
-  captured exactly there.
-- at **turn end** (prompt + generated) when no boundary snapshot was taken
-  (legacy prompts without `<|im_start|>`), which pays off whenever a template
-  does preserve history verbatim.
+- the **chat boundary** — the position before the prompt's last
+  `<|im_start|>` (the generation prompt). This is the part the next turn of
+  the same conversation re-sends verbatim: the family's chat template
+  renders a history assistant turn *without* the `<think>` block the live
+  generation prompt carries, so a snapshot keyed on the previous turn's
+  full sequence would never match. The prefill span is split at that
+  position so the state is captured exactly there.
+- the **end of the system block** — before the second `<|im_start|>` — so a
+  new conversation on the same system prompt (a RAG document, an agent's
+  tool manifest) starts warm too.
+- **turn end** (prompt + generated) only when neither applies (legacy
+  prompts without `<|im_start|>`), for templates that preserve history
+  verbatim.
 
 Lookups are non-consuming, so a shared system prompt serves every
 conversation that starts with it. A restore lands on the live requests
