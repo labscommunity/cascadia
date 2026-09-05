@@ -297,8 +297,42 @@ CAPTURE/RESTORE frames (that plane's blob framing is shared with this cache).
 The `ov-genai` path has its own prefix cache inside GenAI's PagedAttention
 backend (1.2 s repeat-prompt TTFT at 8 K in the table below).
 
-_Certification (multi-turn through the API, cache on vs off, greedy text
-compared) is appended below as it completes._
+**Certification (tate-07, B390, Qwopus 2-stage `qwen35`, `cascadia run …
+--api`, greedy, `enable_thinking: false`; the same 4-turn script against a
+server with the cache on and one with `--prefix-cache-gb 0`; wall time of
+the whole request, `_ttft` rows are `max_tokens: 1`).** Turn 1 carries an
+~N-token system document; turns 2–3 extend the conversation; turn 4 is a
+new conversation on the same system prompt. Warm text equalled cold text
+on every one of the 14 comparisons.
+
+| first turn | turn | prompt tokens | cache off | cache on | speed-up |
+|---|---|---|---|---|---|
+| 8 K | 1 (cold, + two snapshots) | 8218 | 18.1 s | 24.0 s | 0.8× |
+| 8 K | 2 TTFT | 8247 | 16.6 s | **2.5 s** | 6.6× |
+| 8 K | 2 (7 tokens) | 8247 | 17.3 s | 3.2 s | 5.4× |
+| 8 K | 3 TTFT | 8276 | 15.8 s | **2.4 s** | 6.5× |
+| 8 K | 3 (5 tokens) | 8276 | 16.5 s | 2.9 s | 5.7× |
+| 8 K | new conversation, same system prompt, TTFT | 8215 | 16.3 s | **2.3 s** | 7.0× |
+| 8 K | same, 15 tokens | 8215 | 18.0 s | 4.5 s | 4.0× |
+| 32 K | 1 (cold, + two snapshots) | 32800 | 93.0 s | 113.0 s | 0.8× |
+| 32 K | 2 TTFT | 32829 | 92.0 s | **7.9 s** | 11.6× |
+| 32 K | 2 (7 tokens) | 32829 | 91.9 s | 8.8 s | 10.4× |
+| 32 K | 3 TTFT | 32858 | 91.4 s | **6.9 s** | 13.3× |
+| 32 K | 3 (5 tokens) | 32858 | 91.4 s | 7.5 s | 12.1× |
+| 32 K | new conversation, same system prompt, TTFT | 32797 | 90.4 s | **7.2 s** | 12.5× |
+| 32 K | same, 15 tokens | 32797 | 92.6 s | 10.2 s | 9.1× |
+
+Engine-side: a 1.2 GB snapshot (8 K) costs 2.6–2.7 s and its restore 1.75 s;
+a 4.5 GB snapshot (32 K) costs 9.9 s and its restore 5.8 s — both are
+host↔device copies at ~0.5–0.8 GB/s on this iGPU. The cold turn pays for
+two snapshots (system block + chat boundary); every later turn of the
+conversation, and every new conversation on the same system prompt, is a
+restore plus the prefill of its own tail.
+
+Two defects were found and fixed by this certification, both recorded
+above: a restore onto a request that has not executed since its reset is
+silently discarded by the GPU plugin (priming fold), and a snapshot taken
+after a restore is inconsistent (cold-turn snapshots + `MAX_WARM_TAIL`).
 
 **Cold-TTFT levers in the staged engine (measured, 8K prompt, B390, with
 the OVMS node running alongside — ~10–20 % slower than the quiet-box sweep):**
