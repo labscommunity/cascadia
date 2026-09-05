@@ -236,6 +236,19 @@ but costs 54 minutes of prefill, so it is a capacity fact, not a usable
 setting on an iGPU. (The 256 K prompt was 4 tokens over the model's
 `max_position_embeddings`; mRoPE extrapolated without error.)
 
+**Regression — Qwen3.6-35B-A3B on the same exporter and engine** (tate-07,
+B390). The config-driven exporter cut `OpenVINO/Qwen3.6-35B-A3B-int4-ov`
+exactly as before (`qwen3_5_moe`, 40 layers = 30 linear + 10 full, 40 state
+variables per 20-layer stage; `--validate`: top-1 match, top-5 5/5, 8/8
+greedy chain-vs-whole). Served through `cascadia run --engine qwen35 --device
+GPU --api`: `391` for 17×23 and a correct 64-token rainbow answer at
+**19–20 tok/s** end-to-end (the MoE reads ~1.7 GB per token; the Lunar Lake
+numbers in qwen36-moe-support.md were 4.7–8.8). The same tree with its
+manifest stripped to the Qwen3.6-era keys (`arch`, `source`,
+`last_logits_only`, `stages` — no `hidden_size`) served identically through
+the `--engine qwen36-moe` alias, so existing shard trees and scripts keep
+working.
+
 ## Limits and follow-ups
 
 - **Greedy-only, batch=1** on the staged path (DeltaNet state cannot be
