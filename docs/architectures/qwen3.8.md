@@ -276,6 +276,26 @@ match the uncached run — the same trap the engine's design notes describe
 is the bound; fidelity on Qwen3.8 has to be certified through the engine's
 `kv_coord` path, which does it the right way.
 
+**Cold-TTFT levers in the staged engine (measured, 8K prompt, B390, with
+the OVMS node running alongside — ~10–20 % slower than the quiet-box sweep):**
+
+| what | TTFT | prefill tok/s |
+|---|---|---|
+| stateful IR, chunk 256 (the engine's hard-coded `PREFILL_CHUNK`) | 20.2 s | 407 |
+| stateful IR, chunk 512 | 18.3 s | 449 |
+| stateful IR, chunk 1024 / 2048 | 20.1 s / 21.3 s | 407 / 385 |
+| GenAI `VLMPipeline` (PagedAttention backend), cold | **10.8 s** | 760 |
+| GenAI `VLMPipeline`, same prompt again (its own prefix cache) | 1.2 s | — |
+
+So: the chunk constant is worth ~10 % (512 is the sweet spot; bigger is
+worse); the stateful path's prefill kernels are ~1.9× behind GenAI's
+PagedAttention path at 8K, which is the big cold-TTFT gap and needs a
+paged-KV execution model in the engine, not a constant; in pipeline mode
+each chunk crosses all stages before the next starts, so multi-box prefill
+does not overlap stages today; and GenAI's path already prefix-caches
+repeated prompts by default, which the staged engine matches only through
+the `kv_coord` warm resume above.
+
 ## Limits and follow-ups
 
 - **Greedy-only, batch=1** on the staged path (DeltaNet state cannot be
