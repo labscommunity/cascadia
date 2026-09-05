@@ -215,6 +215,27 @@ def _make_traced_rotary_class():
 # ---------------------------------------------------------------------------
 
 
+def resolve_sliding_window(text_config):
+    """Window to bake into `sliding_attention` layers, or None for no bound.
+
+    `text_config.sliding_window` absent, None or 0 disables the bound (the
+    layers then run full-causal). A negative value is a configuration error
+    rather than something to pass through: `build_attention_mask` would mask
+    every key and softmax would return NaN, and the export would still
+    succeed.
+    """
+    raw = getattr(text_config, "sliding_window", None)
+    if raw is None:
+        return None
+    window = int(raw)
+    if window < 0:
+        raise ValueError(
+            f"text_config.sliding_window must be >= 0 (got {window}); "
+            "0 or absent disables the window"
+        )
+    return window or None
+
+
 def build_attention_mask(seq_len, full_seq_len, sliding_window, device, dtype):
     """Additive attention mask for one Gemma 4 decoder layer.
 
@@ -231,6 +252,10 @@ def build_attention_mask(seq_len, full_seq_len, sliding_window, device, dtype):
     `j - i <= past - sliding_window`. Without it every layer runs as full
     attention, which agrees with HF only while the sequence is shorter than
     the window -- so short prompts look correct and long ones silently drift.
+
+    Raises `ValueError` for `sliding_window <= 0`: a zero or negative band
+    would cover the diagonal, every row would be fully masked, and softmax
+    would return NaN.
     """
     import torch
 
@@ -244,6 +269,11 @@ def build_attention_mask(seq_len, full_seq_len, sliding_window, device, dtype):
         diagonal=full_seq_len - seq_len + 1,
     )
     if sliding_window is not None:
+        if sliding_window < 1:
+            raise ValueError(
+                f"sliding_window must be >= 1 (got {sliding_window}); "
+                "pass None for full attention"
+            )
         mask = mask + torch.tril(
             torch.full(
                 (seq_len, full_seq_len),
@@ -718,11 +748,10 @@ def build_cached_wrapper(model, text_config, stage_plan):
             self._cross_stage_sources = cross_stage_sources
             self._n_external = len(external_shared_sources)
             self._final_softcap = final_softcap
-            # sliding_attention layers attend to a bounded window; full_attention
-            # layers see the whole prefix. 0/absent disables the bound.
-            self._sliding_window = (
-                int(getattr(text_config, "sliding_window", 0) or 0) or None
-            )
+            # sliding_attention layers attend to a bounded window;
+            # full_attention layers see the whole prefix. 0/absent disables
+            # the bound; a negative value is rejected by the helper.
+            self._sliding_window = resolve_sliding_window(text_config)
 
         def forward(self, main_input, position_ids, *args):
             # args layout: [*external_shared_kv, *own_past_kv]
@@ -1150,6 +1179,10 @@ def export_single_stage(model, text_config, stage_plan, output_dir, quantization
         # Per-layer (Gemma 4-specific) — list length == num_layers_in_stage.
         "head_dims": head_dims,
         "layer_types": list(text_config.layer_types[ls:le]),
+        # Window compiled into this stage's sliding_attention layers (None =
+        # full causal). Exports before gemma4_cached_v1.1 lack this key and
+        # let those layers attend past the window.
+        "sliding_window": resolve_sliding_window(text_config),
         "is_shared": is_shared,
         "own_kv_head_dims": own_kv_head_dims,
         "cross_stage_sources_local": cross_stage_sources,
@@ -1162,7 +1195,7 @@ def export_single_stage(model, text_config, stage_plan, output_dir, quantization
         "final_logit_softcapping": final_softcap,
         "arch_tag": "gemma4",
         "stateful": True,
-        "export_version": "gemma4_cached_v1",
+        "export_version": "gemma4_cached_v1.1",
         "inputs": (
             "input_ids/hidden_states+downstream_pli, position_ids, "
             "external_kv.*.key/value (n=n_external_kv); KV cache is "
@@ -1400,13 +1433,15 @@ def run_export(
         "pli_dim": text_config.hidden_size_per_layer_input or 0,
         "num_kv_shared_layers": text_config.num_kv_shared_layers or 0,
         "layer_types": list(text_config.layer_types),
+        # See the stage_config.json comment in export_single_stage.
+        "sliding_window": resolve_sliding_window(text_config),
         "final_logit_softcapping": float(
             getattr(text_config, "final_logit_softcapping", 0.0) or 0.0
         ),
         "rope_parameters": getattr(text_config, "rope_parameters", None),
         "arch_tag": "gemma4",
         "quantization": quantization,
-        "export_version": "gemma4_cached_v1",
+        "export_version": "gemma4_cached_v1.1",
     }
     with open(os.path.join(output_dir, "pipeline_config.json"), "w") as f:
         json.dump(pipeline_meta, f, indent=2)
