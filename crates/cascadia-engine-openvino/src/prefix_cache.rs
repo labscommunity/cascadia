@@ -281,13 +281,38 @@ pub fn chat_boundary(prompt: &[u32], im_start: u32) -> Option<usize> {
     (pos >= MIN_PREFIX_TOKENS).then_some(pos)
 }
 
+/// Snapshot positions for a chat prompt, ascending: the end of the leading
+/// system block (the position before the SECOND `im_start`, which a new
+/// conversation on the same system prompt re-sends verbatim) and the
+/// [`chat_boundary`] (before the last `im_start`, which the next turn of
+/// this conversation re-sends). De-duplicated; each ≥ [`MIN_PREFIX_TOKENS`].
+pub fn chat_boundaries(prompt: &[u32], im_start: u32) -> Vec<usize> {
+    let marks: Vec<usize> = prompt
+        .iter()
+        .enumerate()
+        .filter(|(_, &t)| t == im_start)
+        .map(|(i, _)| i)
+        .collect();
+    let mut out = Vec::with_capacity(2);
+    if marks.len() >= 2 && marks[1] >= MIN_PREFIX_TOKENS {
+        out.push(marks[1]);
+    }
+    if let Some(&last) = marks.last() {
+        if last >= MIN_PREFIX_TOKENS && Some(&last) != out.last() {
+            out.push(last);
+        }
+    }
+    out
+}
+
 /// End of the next prefill span starting at `idx`: `chunk` tokens, clamped
-/// to the prompt length and to `snapshot_at` so a span ends exactly on the
-/// snapshot boundary (the chain state is captured right after that span).
-pub fn next_prefill_end(idx: usize, len: usize, chunk: usize, snapshot_at: Option<usize>) -> usize {
+/// to the prompt length and to the first snapshot position past `idx` so a
+/// span ends exactly on it (the chain state is captured right after that
+/// span). `snapshot_at` is ascending.
+pub fn next_prefill_end(idx: usize, len: usize, chunk: usize, snapshot_at: &[usize]) -> usize {
     let mut end = (idx + chunk.max(1)).min(len);
-    if let Some(b) = snapshot_at {
-        if idx < b && b < end {
+    if let Some(&b) = snapshot_at.iter().find(|&&b| b > idx) {
+        if b < end {
             end = b;
         }
     }
@@ -386,25 +411,65 @@ mod tests {
 
     #[test]
     fn prefill_span_ends_on_the_snapshot_boundary() {
-        assert_eq!(next_prefill_end(0, 1000, 256, None), 256);
-        assert_eq!(next_prefill_end(900, 1000, 256, None), 1000);
-        assert_eq!(next_prefill_end(0, 1000, 256, Some(100)), 100);
+        assert_eq!(next_prefill_end(0, 1000, 256, &[]), 256);
+        assert_eq!(next_prefill_end(900, 1000, 256, &[]), 1000);
+        assert_eq!(next_prefill_end(0, 1000, 256, &[100]), 100);
         assert_eq!(
-            next_prefill_end(100, 1000, 256, Some(100)),
+            next_prefill_end(100, 1000, 256, &[100]),
             356,
             "boundary behind"
         );
         assert_eq!(
-            next_prefill_end(0, 1000, 256, Some(256)),
+            next_prefill_end(0, 1000, 256, &[256]),
             256,
             "boundary on the edge"
         );
         assert_eq!(
-            next_prefill_end(0, 1000, 256, Some(2000)),
+            next_prefill_end(0, 1000, 256, &[2000]),
             256,
             "boundary past the end"
         );
-        assert_eq!(next_prefill_end(0, 10, 0, None), 1, "chunk never zero");
+        assert_eq!(
+            next_prefill_end(0, 1000, 256, &[100, 300]),
+            100,
+            "first boundary first"
+        );
+        assert_eq!(
+            next_prefill_end(100, 1000, 256, &[100, 300]),
+            300,
+            "then the next"
+        );
+        assert_eq!(
+            next_prefill_end(300, 1000, 256, &[100, 300]),
+            556,
+            "none left"
+        );
+        assert_eq!(next_prefill_end(0, 10, 0, &[]), 1, "chunk never zero");
+    }
+
+    #[test]
+    fn chat_boundaries_cover_system_block_and_last_turn() {
+        let im = 248045u32;
+        // [im system(30)] [im user(10)] [im assistant...]
+        let mut p = vec![im];
+        p.extend(std::iter::repeat_n(5u32, 30));
+        p.push(im); // index 31: end of the system block
+        p.extend(std::iter::repeat_n(6u32, 10));
+        p.push(im); // index 42: generation prompt
+        p.extend([7u32, 8, 9]);
+        assert_eq!(chat_boundaries(&p, im), vec![31, 42]);
+        // Single-turn prompt without a system block: one boundary.
+        let mut q = vec![im];
+        q.extend(std::iter::repeat_n(5u32, 30));
+        q.push(im);
+        q.extend([7u32, 8]);
+        assert_eq!(chat_boundaries(&q, im), vec![31]);
+        // Short system block is skipped; the last boundary still counts.
+        let mut r = vec![im, 1, 2, im];
+        r.extend(std::iter::repeat_n(6u32, 30));
+        r.push(im);
+        assert_eq!(chat_boundaries(&r, im), vec![34]);
+        assert!(chat_boundaries(&[1, 2, 3], im).is_empty());
     }
 
     #[test]

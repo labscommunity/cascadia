@@ -712,9 +712,10 @@ struct ActiveTask {
     step: usize,
     /// Tokens restored from a cached prefix at admission (0 = cold prefill).
     warm_prefix: usize,
-    /// Single-box: prefill span boundary at which the chain state is snapshotted into the prefix
-    /// cache (the position before the prompt's last `<|im_start|>`). `None` = no snapshot.
-    snapshot_at: Option<usize>,
+    /// Single-box: prefill span boundaries (ascending) at which the chain state is snapshotted
+    /// into the prefix cache — the end of the system block and the position before the prompt's
+    /// last `<|im_start|>` (`prefix_cache::chat_boundaries`). Empty = no snapshot.
+    snapshot_at: Vec<usize>,
     /// Single-box: last position's logits row. Unused in pipeline mode.
     logits: Vec<f32>,
     /// Pipeline rank 0: next token returned by the downstream argmax.
@@ -964,7 +965,7 @@ impl Qwen36Engine {
         // preserves history verbatim will extend next turn. Only from a cold turn (see the
         // snapshot_at note at admission), and only when no chat-boundary snapshot was taken —
         // each copy costs ~2 s per GB of state, and the boundary key is the one chat traffic hits.
-        if self.prefix_cache.enabled() && t.warm_prefix == 0 && t.snapshot_at.is_none() {
+        if self.prefix_cache.enabled() && t.warm_prefix == 0 && t.snapshot_at.is_empty() {
             let key: Vec<u32> = t
                 .prompt_ids
                 .iter()
@@ -1493,7 +1494,7 @@ impl Qwen36Engine {
                 prefill_idx: warm_prefix,
                 step: warm_prefix,
                 warm_prefix,
-                snapshot_at: None,
+                snapshot_at: Vec::new(),
                 logits: Vec::new(),
                 next_token: None,
                 gen_ids: resume_gen_ids,
@@ -2169,11 +2170,14 @@ impl Qwen36Engine {
             // on turn 3). `local_warm_or_cold` forces a cold prefill once the warm tail grows past
             // MAX_WARM_TAIL, which is when fresh snapshots get taken. Also skipped when the cache
             // already holds the key (a shared system prompt).
-            let snapshot_at = self
+            let snapshot_at: Vec<usize> = self
                 .im_start_id
                 .filter(|_| self.prefix_cache.enabled() && warm_prefix == 0)
-                .and_then(|im| crate::prefix_cache::chat_boundary(&prompt_ids, im))
-                .filter(|&b| !self.prefix_cache.contains(&prompt_ids[..b]));
+                .map(|im| crate::prefix_cache::chat_boundaries(&prompt_ids, im))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|&b| !self.prefix_cache.contains(&prompt_ids[..b]))
+                .collect();
             self.active = Some(ActiveTask {
                 task_id: task.task_id,
                 tenant: task.tenant,
@@ -2209,7 +2213,7 @@ impl Qwen36Engine {
                     t.prefill_idx,
                     t.prompt_ids.len(),
                     prefill_chunk(),
-                    t.snapshot_at,
+                    &t.snapshot_at,
                 );
                 let toks: Vec<u32> = t.prompt_ids[t.prefill_idx..end].to_vec();
                 let t0 = t.step;
@@ -2220,7 +2224,7 @@ impl Qwen36Engine {
                         t.prefill_idx = end;
                         t.step += toks.len();
                         let snap_key =
-                            (t.snapshot_at == Some(end)).then(|| t.prompt_ids[..end].to_vec());
+                            (t.snapshot_at.contains(&end)).then(|| t.prompt_ids[..end].to_vec());
                         // Same diagnostics as the multi-stage loop, mirrored onto the SINGLE-STAGE
                         // path. On a 1-stage (single-box) topology every stage is local, so these
                         // fingerprints cover the WHOLE model state — the 2-stage head-only view left
@@ -3053,7 +3057,7 @@ mod tests {
             prefill_idx: 3,
             step: 4,
             warm_prefix: 0,
-            snapshot_at: None,
+            snapshot_at: Vec::new(),
             logits: Vec::new(),
             next_token: Some(5),
             gen_ids: vec![5],
