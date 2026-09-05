@@ -952,8 +952,10 @@ impl Qwen36Engine {
             self.kv_capture_local(&t.tenant, tokens);
         }
         // Always-on prefix cache: the whole turn (prompt + generated) is the key a template that
-        // preserves history verbatim will extend next turn. Best-effort; single-process only.
-        if self.prefix_cache.enabled() {
+        // preserves history verbatim will extend next turn. Only from a cold turn (see the
+        // snapshot_at note at admission), and only when no chat-boundary snapshot was taken —
+        // each copy costs ~2 s per GB of state, and the boundary key is the one chat traffic hits.
+        if self.prefix_cache.enabled() && t.warm_prefix == 0 && t.snapshot_at.is_none() {
             let key: Vec<u32> = t
                 .prompt_ids
                 .iter()
@@ -2151,13 +2153,18 @@ impl Qwen36Engine {
                 }
             };
             // Snapshot point for THIS turn: the position before the prompt's last `<|im_start|>`,
-            // which the next turn re-sends verbatim. Skipped when the cache already holds it (a
-            // shared system prompt) or the restore already covered it.
+            // which the next turn re-sends verbatim. Only on a COLD turn: after a `set_state_blob`
+            // the request's attention KV reads back shallow (only the tokens folded since the
+            // restore) while the DeltaNet state holds the whole history, so a snapshot taken then
+            // is inconsistent and a later hit on it corrupts the context (measured: wrong answers
+            // on turn 3). `local_warm_or_cold` forces a cold prefill once the warm tail grows past
+            // MAX_WARM_TAIL, which is when fresh snapshots get taken. Also skipped when the cache
+            // already holds the key (a shared system prompt).
             let snapshot_at = self
                 .im_start_id
-                .filter(|_| self.prefix_cache.enabled())
+                .filter(|_| self.prefix_cache.enabled() && warm_prefix == 0)
                 .and_then(|im| crate::prefix_cache::chat_boundary(&prompt_ids, im))
-                .filter(|&b| b > warm_prefix && !self.prefix_cache.contains(&prompt_ids[..b]));
+                .filter(|&b| !self.prefix_cache.contains(&prompt_ids[..b]));
             self.active = Some(ActiveTask {
                 task_id: task.task_id,
                 tenant: task.tenant,
@@ -2467,6 +2474,20 @@ impl Qwen36Engine {
     fn local_warm_or_cold(&mut self, prompt_ids: &[u32]) -> usize {
         if self.prefix_cache.enabled() {
             if let Some((blob, len)) = self.prefix_cache.longest_prefix(prompt_ids) {
+                // Snapshots are only taken on cold turns, so the tail past the cached prefix grows
+                // with every warm turn of a conversation. Past MAX_WARM_TAIL a cold prefill is the
+                // better deal: it costs one full prefill now and refreshes the boundary snapshot,
+                // so the tail shrinks back to one turn.
+                let tail = prompt_ids.len() - len;
+                if tail > crate::prefix_cache::MAX_WARM_TAIL {
+                    info!(
+                        matched = len,
+                        tail,
+                        "qwen35 prefix-cache: tail past MAX_WARM_TAIL; cold prefill to refresh"
+                    );
+                    self.reset_all();
+                    return 0;
+                }
                 let started = Instant::now();
                 if self.restore_local_stages(&blob) {
                     // Attention depth from the blob, not the token count (see kv_seq_from_blob).

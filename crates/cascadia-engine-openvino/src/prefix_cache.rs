@@ -143,6 +143,14 @@ pub const DEFAULT_PREFIX_CACHE_BYTES: usize = 16 << 30;
 /// Snapshots shorter than this are not worth a `get_state_blob` copy.
 pub const MIN_PREFIX_TOKENS: usize = 16;
 
+/// Longest tail (prompt tokens past the cached prefix) a warm turn prefills
+/// before the engine prefers a cold prefill. Snapshots come only from cold
+/// turns (a request's attention KV reads back shallow after a restore), so
+/// a conversation's tail grows by one turn per warm turn; at ~400 tok/s on
+/// an iGPU this bounds the warm-turn prefill to ~10 s and makes the cold
+/// refresh amortise over several turns.
+pub const MAX_WARM_TAIL: usize = 4096;
+
 struct Entry {
     tokens: Vec<u32>,
     blob: Arc<Vec<u8>>,
