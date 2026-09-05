@@ -249,6 +249,33 @@ manifest stripped to the Qwen3.6-era keys (`arch`, `source`,
 the `--engine qwen36-moe` alias, so existing shard trees and scripts keep
 working.
 
+**Prefix caching / warm resume.** The staged engine already carries a
+strict-prefix warm-resume cache behind the `kv_coord` build feature (issue
+34): after each turn it captures the chain's full state blob keyed by tenant
++ prompt tokens, and a later prompt that starts with those tokens restores
+the blob and prefills only the tail (`take_warm`, one-shot). It was
+certified on Qwen3.6, not re-run here. The `ov-genai` path has no prefix
+caching for this model (`--cb`, which carries GenAI's KV-block prefix cache,
+is refused on VLM-layout exports). DeltaNet state cannot be trimmed, so any
+prefix cache on this family is snapshot-at-boundary, never "drop the tail".
+
+What a hit is worth on the B390 (raw-IR probe: prefill the prefix, snapshot
+all 128 state variables, restore into a fresh request, prefill a 12-token
+suffix):
+
+| prefix | uncached TTFT | snapshot | restore | TTFT after restore |
+|---|---|---|---|---|
+| 8 K | 20.0 s | 1.2 GB, 1.5 s | 1.7 s | **2.0 s** |
+| 32 K | 128 s | 4.2 GB, 5.9 s | 6.2 s | **6.6 s** |
+
+So a hit turns a 32 K-token agent turn from two minutes into ~7 s, and the
+snapshot itself costs about as much as one restore. Caveat: that probe
+restored into a freshly created request and its suffix logits did **not**
+match the uncached run — the same trap the engine's design notes describe
+(restore over the live request, never after a reset/recreate). The timing
+is the bound; fidelity on Qwen3.8 has to be certified through the engine's
+`kv_coord` path, which does it the right way.
+
 ## Limits and follow-ups
 
 - **Greedy-only, batch=1** on the staged path (DeltaNet state cannot be
