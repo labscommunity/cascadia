@@ -257,7 +257,14 @@ working.
 LRU of chain-state snapshots keyed by exact token prefix
 (`crates/cascadia-engine-openvino/src/prefix_cache.rs`) and restores the
 longest cached strict prefix of each new prompt at admission, prefilling
-only the tail. Snapshot positions on a cold turn:
+only the tail. A lookup marks *every* entry the prompt extends as used, not
+only the longest, and among equally-recent entries the longest is evicted
+first: a shared system-block entry stays hot while any conversation on it
+is active instead of becoming the LRU victim of that conversation's own
+boundary refreshes (measured before the fix: the fourth 4.45 GB snapshot at
+32 K pushed the 16 GiB budget over, evicted the system block, and the next
+conversation on that prompt went cold at 110 s). Snapshot positions on a
+cold turn:
 
 - the **chat boundary** — the position before the prompt's last
   `<|im_start|>` (the generation prompt). This is the part the next turn of
