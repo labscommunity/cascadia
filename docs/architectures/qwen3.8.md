@@ -317,31 +317,56 @@ server with the cache on and one with `--prefix-cache-gb 0`; wall time of
 the whole request, `_ttft` rows are `max_tokens: 1`).** Turn 1 carries an
 ~N-token system document; turns 2–3 extend the conversation; turn 4 is a
 new conversation on the same system prompt. Warm text equalled cold text
-on every one of the 14 comparisons.
+on every one of the 14 comparisons (and on the 7 of the eviction-pressure
+run below). Binary = this branch's head (`825f8267`).
 
 | first turn | turn | prompt tokens | cache off | cache on | speed-up |
 |---|---|---|---|---|---|
-| 8 K | 1 (cold, + two snapshots) | 8218 | 18.1 s | 24.0 s | 0.8× |
-| 8 K | 2 TTFT | 8247 | 16.6 s | **2.5 s** | 6.6× |
-| 8 K | 2 (7 tokens) | 8247 | 17.3 s | 3.2 s | 5.4× |
-| 8 K | 3 TTFT | 8276 | 15.8 s | **2.4 s** | 6.5× |
-| 8 K | 3 (5 tokens) | 8276 | 16.5 s | 2.9 s | 5.7× |
-| 8 K | new conversation, same system prompt, TTFT | 8215 | 16.3 s | **2.3 s** | 7.0× |
-| 8 K | same, 15 tokens | 8215 | 18.0 s | 4.5 s | 4.0× |
-| 32 K | 1 (cold, + two snapshots) | 32800 | 93.0 s | 113.0 s | 0.8× |
-| 32 K | 2 TTFT | 32829 | 92.0 s | **7.9 s** | 11.6× |
-| 32 K | 2 (7 tokens) | 32829 | 91.9 s | 8.8 s | 10.4× |
-| 32 K | 3 TTFT | 32858 | 91.4 s | **6.9 s** | 13.3× |
-| 32 K | 3 (5 tokens) | 32858 | 91.4 s | 7.5 s | 12.1× |
-| 32 K | new conversation, same system prompt, TTFT | 32797 | 90.4 s | **7.2 s** | 12.5× |
-| 32 K | same, 15 tokens | 32797 | 92.6 s | 10.2 s | 9.1× |
+| 8 K | 1 (cold, + two snapshots) | 8218 | 17.8 s | 23.4 s | 0.8× |
+| 8 K | 2 TTFT | 8247 | 16.9 s | **2.1 s** | 7.9× |
+| 8 K | 2 (7 tokens) | 8247 | 16.6 s | 2.8 s | 5.9× |
+| 8 K | 3 TTFT | 8276 | 16.5 s | **2.0 s** | 8.3× |
+| 8 K | 3 (5 tokens) | 8276 | 17.0 s | 2.5 s | 6.8× |
+| 8 K | new conversation, same system prompt, TTFT | 8215 | 15.8 s | **1.9 s** | 8.5× |
+| 8 K | same, 15 tokens | 8215 | 17.8 s | 4.0 s | 4.4× |
+| 32 K | 1 (cold, + two snapshots) | 32800 | 92.9 s | 111.3 s | 0.8× |
+| 32 K | 2 TTFT | 32829 | 91.5 s | **5.5 s** | 16.6× |
+| 32 K | 2 (7 tokens) | 32829 | 91.6 s | 6.1 s | 15.1× |
+| 32 K | 3 TTFT | 32858 | 91.0 s | **5.7 s** | 16.0× |
+| 32 K | 3 (5 tokens) | 32858 | 91.6 s | 6.2 s | 14.9× |
+| 32 K | new conversation, same system prompt, TTFT | 32797 | 89.9 s | **5.8 s** | 15.4× |
+| 32 K | same, 15 tokens | 32797 | 92.9 s | 7.4 s | 12.6× |
 
-Engine-side: a 1.2 GB snapshot (8 K) costs 2.6–2.7 s and its restore 1.75 s;
-a 4.5 GB snapshot (32 K) costs 9.9 s and its restore 5.8 s — both are
-host↔device copies at ~0.5–0.8 GB/s on this iGPU. The cold turn pays for
-two snapshots (system block + chat boundary); every later turn of the
-conversation, and every new conversation on the same system prompt, is a
-restore plus the prefill of its own tail.
+Engine-side: a 1.2 GB snapshot (8 K) costs 2.5 s and its restore 1.4 s; a
+4.45 GB snapshot (32 K) costs 8.9–9.2 s and its restore 4.3–5.1 s — both are
+host↔device copies on this iGPU. The cold turn pays for two snapshots
+(system block + chat boundary); every later turn of the conversation, and
+every new conversation on the same system prompt, is a restore plus the
+prefill of its own tail. For comparison, the intermediate "snapshot every
+boundary on every turn" policy measured 5.1 s / 15.8 s for the 8 K / 32 K
+follow-up TTFT (a copy inside every warm turn), and under it the fourth
+4.45 GB snapshot at 32 K evicted the system-block entry so the new
+conversation on that prompt went cold (109.8 s) — the two defects the
+refresh rule and the eviction rule above fix.
+
+**Eviction-pressure run** (same box, 8 K, `--prefix-cache-gb 3`, a
+2,500-token user turn inserted after turn 2 so a refresh is worth taking
+and the third snapshot must evict something):
+
+| turn | prompt tokens | cache on (3 GiB) | engine decision |
+|---|---|---|---|
+| 1 (cold, + two snapshots: 2.35 GB of a 3 GiB budget) | 8218 | 23.3 s | both stored |
+| 2 TTFT | 8247 | 2.2 s | hit boundary; tail 36 tokens → no refresh |
+| 2b TTFT (2,500-token user turn) | 10786 | 11.8 s | hit boundary; tail 2,568 tokens ≈ 5.4 s ≥ 2.5 s copy → refresh; insert evicted the OLD boundary (8211), not the system block |
+| 2b (10 tokens) | 10786 | 3.8 s | hit the refreshed boundary (10779) |
+| 3 TTFT | 10818 | 2.3 s | hit 10779; no refresh |
+| new conversation, same system prompt, TTFT | 8215 | 1.9 s | hit the system block (8194) — still cached |
+| same, 15 tokens | 8215 | 4.1 s |  |
+
+The tail re-prefill of turn 2b (2,568 tokens at the measured 474 tok/s)
+plus the 3.2 s refresh copy gave an 11.8 s TTFT against ~24 s cold; under
+the old LRU marking the system block would have been the victim and turn 4
+would have re-prefilled 8 K tokens (~16 s).
 
 One defect was found and fixed by this certification, recorded above: a
 restore onto a request that has not executed since its reset is silently
