@@ -12,10 +12,10 @@
 //! assistant turn WITHOUT the `<think>` block the live generation prompt
 //! carries, so a snapshot keyed on the previous turn's full sequence never
 //! matches the next request. The reusable prefix is everything before the
-//! prompt's last `<|im_start|>` (the generation prompt) — [`chat_boundary`] —
-//! and the engine splits its prefill chunk there to snapshot exactly at that
-//! position. It also snapshots at the end of the turn (prompt + generated),
-//! which pays off whenever a template does preserve history verbatim.
+//! prompt's last `<|im_start|>` (the generation prompt), and the end of the
+//! system block before it (shared across conversations) — [`chat_boundaries`]
+//! — and the engine splits its prefill chunk there to snapshot exactly at
+//! those positions, on every turn that prefills past them.
 //!
 //! [`PrefixCache`] is a byte-bounded LRU keyed by the exact token sequence;
 //! lookups are longest-strict-prefix and non-consuming (a shared system
@@ -32,9 +32,11 @@ use std::sync::Arc;
 /// Restored KV depth (max `shape[2]` over rank≥3 states) from a `get_state_blob` blob — `[u32 count]`
 /// then per state `[u32 name_len][name][u8 dtype][u8 rank][u64×rank shape][u64 nb][data]` (LE).
 ///
-/// Warm-resume drives position/mask off this, not the matched token count: a turn's last sampled token
-/// is never fed back, so KV depth = matched_len-1; using the token count overshoots the mask by one and
-/// the attention `Add` fails on shape. `None` if unparseable (caller falls back to the token count).
+/// Warm-resume drives position/mask off this, not the matched token count. For the kv_coord plane's
+/// turn-end keys a turn's last sampled token is never fed back, so KV depth = matched_len-1 and using
+/// the token count overshoots the mask by one (the attention `Add` fails on shape); prefix-cache keys
+/// are snapshotted at a fold boundary, so depth == key length there. `None` if unparseable (callers
+/// fall back to the token count, clamped with `.min(len)`).
 pub(crate) fn kv_seq_from_blob(blob: &[u8]) -> Option<usize> {
     fn u32_at(b: &[u8], p: usize) -> Option<u32> {
         Some(u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?))
@@ -81,17 +83,23 @@ pub(crate) fn kv_seq_from_blob(blob: &[u8]) -> Option<usize> {
     (seq > 0).then_some(seq)
 }
 
-/// [`kv_seq_from_blob`] for a framed multi-stage blob (`frame_blobs`): max depth over its parts (stages
-/// share the sequence length, `max` is a safe tie-break). For qwen36 stages / dist-spec draft+target;
-/// raw single-stage blobs use [`kv_seq_from_blob`] directly. `None` if unparseable.
-pub(crate) fn kv_seq_from_framed_blob(blob: &[u8]) -> Option<usize> {
-    let parts = unframe_blobs(blob)?;
+/// [`kv_seq_from_blob`] over per-stage parts: max depth over them (stages share the sequence length,
+/// `max` is a safe tie-break). `None` if every part is unparseable.
+pub(crate) fn kv_seq_from_parts(parts: &[Vec<u8>]) -> Option<usize> {
     parts.iter().filter_map(|p| kv_seq_from_blob(p)).max()
+}
+
+/// [`kv_seq_from_parts`] for a framed multi-stage blob (`frame_blobs`). For qwen36 plane captures /
+/// dist-spec draft+target; raw single-stage blobs use [`kv_seq_from_blob`] directly.
+pub(crate) fn kv_seq_from_framed_blob(blob: &[u8]) -> Option<usize> {
+    kv_seq_from_parts(&unframe_blobs(blob)?)
 }
 
 /// Frame N opaque per-stage blobs into one: `u32 count | (u32 len | bytes)×count`. A rank that holds
 /// several local stages (qwen36 `stages`, dist-spec target+draft) snapshots each and ships the bundle
-/// as a single opaque blob — `OvKvCache` and the wire treat it as one payload.
+/// as a single opaque blob — `OvKvCache` and the wire treat it as one payload. The u32 length is a
+/// wire-format fact (plane blobs are capped at 256 MiB); the in-process prefix cache keeps the parts
+/// unframed, so multi-GB snapshots never go through here.
 pub(crate) fn frame_blobs(blobs: &[Vec<u8>]) -> Vec<u8> {
     let total: usize = 4 + blobs.iter().map(|b| 4 + b.len()).sum::<usize>();
     let mut out = Vec::with_capacity(total);
@@ -143,18 +151,16 @@ pub const DEFAULT_PREFIX_CACHE_BYTES: usize = 16 << 30;
 /// Snapshots shorter than this are not worth a `get_state_blob` copy.
 pub const MIN_PREFIX_TOKENS: usize = 16;
 
-/// Longest tail (prompt tokens past the cached prefix) a warm turn prefills
-/// before the engine prefers a cold prefill. Snapshots come only from cold
-/// turns (a request's attention KV reads back shallow after a restore), so
-/// a conversation's tail grows by one turn per warm turn; at ~400 tok/s on
-/// an iGPU this bounds the warm-turn prefill to ~10 s and makes the cold
-/// refresh amortise over several turns.
-pub const MAX_WARM_TAIL: usize = 4096;
-
 struct Entry {
     tokens: Vec<u32>,
-    blob: Arc<Vec<u8>>,
+    /// One `get_state_blob` per stage, unframed (no u32 length field, no copy on hit).
+    parts: Arc<Vec<Vec<u8>>>,
+    bytes: usize,
     last_used: u64,
+}
+
+fn parts_bytes(parts: &[Vec<u8>]) -> usize {
+    parts.iter().map(Vec::len).sum()
 }
 
 /// Byte-bounded LRU of state snapshots keyed by exact token prefix.
@@ -183,10 +189,6 @@ impl PrefixCache {
         self.budget > 0
     }
 
-    pub fn budget_bytes(&self) -> usize {
-        self.budget
-    }
-
     pub fn live_bytes(&self) -> usize {
         self.live
     }
@@ -209,19 +211,26 @@ impl PrefixCache {
         self.entries.iter().any(|e| e.tokens == tokens)
     }
 
-    /// Cache `blob` under `tokens`, replacing an entry with the same key and
-    /// evicting least-recently-used entries until it fits. A blob larger than
-    /// the whole budget (or a key shorter than [`MIN_PREFIX_TOKENS`]) is
-    /// dropped; returns whether it was stored.
-    pub fn insert(&mut self, tokens: Vec<u32>, blob: Vec<u8>) -> bool {
-        if !self.enabled() || tokens.len() < MIN_PREFIX_TOKENS || blob.len() > self.budget {
+    /// Would a snapshot of `bytes` fit the budget at all? Callers check this
+    /// BEFORE paying for the state copy.
+    pub fn accepts(&self, tokens: usize, bytes: usize) -> bool {
+        self.enabled() && tokens >= MIN_PREFIX_TOKENS && bytes <= self.budget
+    }
+
+    /// Cache the per-stage `parts` under `tokens`, replacing an entry with the
+    /// same key and evicting least-recently-used entries until it fits. A
+    /// snapshot larger than the whole budget (or a key shorter than
+    /// [`MIN_PREFIX_TOKENS`]) is dropped; returns whether it was stored.
+    pub fn insert(&mut self, tokens: Vec<u32>, parts: Vec<Vec<u8>>) -> bool {
+        let bytes = parts_bytes(&parts);
+        if !self.accepts(tokens.len(), bytes) {
             return false;
         }
         if let Some(i) = self.entries.iter().position(|e| e.tokens == tokens) {
             let old = self.entries.remove(i);
-            self.live -= old.blob.len();
+            self.live -= old.bytes;
         }
-        while self.live + blob.len() > self.budget {
+        while self.live + bytes > self.budget {
             let Some((i, _)) = self
                 .entries
                 .iter()
@@ -231,22 +240,24 @@ impl PrefixCache {
                 break;
             };
             let old = self.entries.remove(i);
-            self.live -= old.blob.len();
+            self.live -= old.bytes;
         }
         self.tick += 1;
-        self.live += blob.len();
+        self.live += bytes;
         self.entries.push(Entry {
             tokens,
-            blob: Arc::new(blob),
+            parts: Arc::new(parts),
+            bytes,
             last_used: self.tick,
         });
         true
     }
 
     /// Longest cached entry whose key is a STRICT prefix of `prompt`
-    /// (`key.len() < prompt.len()`): the blob and the matched token count.
-    /// Non-consuming; marks the entry most-recently-used.
-    pub fn longest_prefix(&mut self, prompt: &[u32]) -> Option<(Arc<Vec<u8>>, usize)> {
+    /// (`key.len() < prompt.len()`): the per-stage parts and the matched token
+    /// count. Non-consuming (an `Arc` clone, no byte copy); marks the entry
+    /// most-recently-used.
+    pub fn longest_prefix(&mut self, prompt: &[u32]) -> Option<(Arc<Vec<Vec<u8>>>, usize)> {
         let best = self
             .entries
             .iter()
@@ -260,7 +271,7 @@ impl PrefixCache {
                 self.hits += 1;
                 let e = &mut self.entries[i];
                 e.last_used = self.tick;
-                Some((Arc::clone(&e.blob), e.tokens.len()))
+                Some((Arc::clone(&e.parts), e.tokens.len()))
             }
             None => {
                 self.misses += 1;
@@ -270,22 +281,12 @@ impl PrefixCache {
     }
 }
 
-/// Position of the reusable chat boundary in `prompt`: the number of tokens
-/// before the LAST `im_start` token, which begins the generation prompt
-/// (`<|im_start|>assistant\n…`). Everything before it is re-sent verbatim by
-/// the next turn of the conversation. `None` when the marker is absent
-/// (legacy prompts), leads the prompt, or the prefix is too short to be
-/// worth a snapshot.
-pub fn chat_boundary(prompt: &[u32], im_start: u32) -> Option<usize> {
-    let pos = prompt.iter().rposition(|&t| t == im_start)?;
-    (pos >= MIN_PREFIX_TOKENS).then_some(pos)
-}
-
 /// Snapshot positions for a chat prompt, ascending: the end of the leading
 /// system block (the position before the SECOND `im_start`, which a new
 /// conversation on the same system prompt re-sends verbatim) and the
-/// [`chat_boundary`] (before the last `im_start`, which the next turn of
-/// this conversation re-sends). De-duplicated; each ≥ [`MIN_PREFIX_TOKENS`].
+/// chat boundary (before the last `im_start`, which begins the generation
+/// prompt and is what the next turn of this conversation re-sends verbatim).
+/// De-duplicated; each ≥ [`MIN_PREFIX_TOKENS`].
 pub fn chat_boundaries(prompt: &[u32], im_start: u32) -> Vec<usize> {
     let marks: Vec<usize> = prompt
         .iter()
@@ -323,8 +324,8 @@ pub fn next_prefill_end(idx: usize, len: usize, chunk: usize, snapshot_at: &[usi
 mod tests {
     use super::*;
 
-    fn blob(n: usize) -> Vec<u8> {
-        vec![7u8; n]
+    fn blob(n: usize) -> Vec<Vec<u8>> {
+        vec![vec![7u8; n]]
     }
 
     fn key(len: usize, seed: u32) -> Vec<u32> {
@@ -338,8 +339,8 @@ mod tests {
         assert!(c.insert(p[..20].to_vec(), blob(10)));
         assert!(c.insert(p[..60].to_vec(), blob(10)));
         assert!(c.insert(key(60, 1), blob(10)), "unrelated key");
-        let (b, len) = c.longest_prefix(&p).expect("hit");
-        assert_eq!((b.len(), len), (10, 60));
+        let (parts, len) = c.longest_prefix(&p).expect("hit");
+        assert_eq!((parts[0].len(), len), (10, 60));
         // Non-consuming: the same lookup hits again.
         assert_eq!(c.longest_prefix(&p).map(|(_, l)| l), Some(60));
         // An exact match is NOT a strict prefix (nothing left to prefill), so
@@ -371,6 +372,8 @@ mod tests {
     #[test]
     fn oversize_short_and_disabled_are_refused() {
         let mut c = PrefixCache::new(50);
+        assert!(!c.accepts(20, 51));
+        assert!(c.accepts(20, 50));
         assert!(!c.insert(key(20, 0), blob(51)), "blob over budget");
         assert!(
             !c.insert(key(MIN_PREFIX_TOKENS - 1, 0), blob(1)),
@@ -383,30 +386,24 @@ mod tests {
     }
 
     #[test]
+    fn multi_part_snapshots_account_every_stage() {
+        let mut c = PrefixCache::new(100);
+        assert!(c.insert(key(20, 0), vec![vec![1u8; 30], vec![2u8; 30]]));
+        assert_eq!(c.live_bytes(), 60);
+        assert!(
+            !c.insert(key(20, 1), vec![vec![1u8; 60], vec![2u8; 60]]),
+            "120 > budget"
+        );
+        let (parts, _) = c.longest_prefix(&key(30, 0)).unwrap();
+        assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
     fn same_key_replaces_and_reaccounts() {
         let mut c = PrefixCache::new(100);
         assert!(c.insert(key(20, 0), blob(30)));
         assert!(c.insert(key(20, 0), blob(60)));
         assert_eq!((c.len(), c.live_bytes()), (1, 60));
-    }
-
-    #[test]
-    fn chat_boundary_is_before_last_im_start() {
-        let im = 248045u32;
-        // [im, system..., im, user..., im, assistant, think...]
-        let mut p = vec![im];
-        p.extend(std::iter::repeat_n(5u32, 30));
-        p.push(im);
-        p.extend(std::iter::repeat_n(6u32, 10));
-        p.push(im);
-        p.extend([7u32, 8, 9]);
-        assert_eq!(chat_boundary(&p, im), Some(42));
-        assert_eq!(chat_boundary(&[1, 2, 3], im), None, "no marker");
-        assert_eq!(chat_boundary(&[im, 1, 2], im), None, "leading marker only");
-        let mut short = vec![im];
-        short.extend([1u32; 5]);
-        short.push(im);
-        assert_eq!(chat_boundary(&short, im), None, "too short to snapshot");
     }
 
     #[test]
@@ -485,5 +482,6 @@ mod tests {
             kv_seq_from_framed_blob(&framed).is_none(),
             "not state blobs"
         );
+        assert!(kv_seq_from_parts(&parts).is_none());
     }
 }
