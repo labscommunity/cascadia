@@ -1,8 +1,10 @@
 //! Gemma 4 multi-stage OpenVINO engine (`--engine gemma4`).
 //!
-//! Serves per-stage `gemma4_cached_v1` OV IR shards (exported by
+//! Serves per-stage `gemma4_cached_v1.x` OV IR shards (exported by
 //! `tools/export_gemma4.py`) across the TCP activation transport, single-stage
 //! or pipeline-parallel. Own KV is OV internal state, reset between tasks.
+//! `gemma4_cached_v1` trees (pre `sliding_window`) still load but attend past
+//! the sliding window on long prompts; `read_stage_config` warns about them.
 //!
 //! Pipeline-dir layout:
 //! ```text
@@ -90,6 +92,19 @@ struct StageConfig {
     /// to match an incoming wire frame to the right `external_kv.*` input.
     #[serde(default)]
     external_shared_sources: Vec<ExternalSrc>,
+    /// `gemma4_cached_v1` (no window band) or `gemma4_cached_v1.1` (sliding
+    /// layers masked to `sliding_window`). Informational except for the
+    /// load-time warning below.
+    #[serde(default)]
+    export_version: Option<String>,
+    /// Per-layer attention type of this stage's layers (`sliding_attention` /
+    /// `full_attention`), as exported.
+    #[serde(default)]
+    layer_types: Vec<String>,
+    /// Window baked into the stage's `sliding_attention` layers. Absent on
+    /// pre-v1.1 exports, which let those layers attend to the whole prefix.
+    #[serde(default)]
+    sliding_window: Option<u32>,
 }
 
 /// One entry of `external_shared_sources` in stage_config.json. Only the global
@@ -108,8 +123,27 @@ fn read_pipeline_config(p: &Path) -> Result<PipelineConfig, EngineError> {
 
 fn read_stage_config(p: &Path) -> Result<StageConfig, EngineError> {
     let bytes = std::fs::read(p.join("stage_config.json"))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| EngineError::InvalidConfig(format!("stage_config.json: {e}")))
+    let cfg: StageConfig = serde_json::from_slice(&bytes)
+        .map_err(|e| EngineError::InvalidConfig(format!("stage_config.json: {e}")))?;
+    warn_if_unwindowed(&cfg, p);
+    Ok(cfg)
+}
+
+/// A stage exported before `gemma4_cached_v1.1` has sliding layers that attend
+/// to the whole prefix (correct only while the prompt is shorter than the
+/// window, 512–1024 tokens on shipped Gemma 4 checkpoints). Nothing else
+/// consumes `export_version`, so this is the one place a stale tree is named.
+fn warn_if_unwindowed(cfg: &StageConfig, p: &Path) {
+    let has_sliding = cfg.layer_types.iter().any(|t| t == "sliding_attention");
+    if has_sliding && cfg.sliding_window.is_none() {
+        warn!(
+            stage_dir = %p.display(),
+            export_version = cfg.export_version.as_deref().unwrap_or("?"),
+            "gemma4: sliding_attention layers carry no sliding_window (pre-v1.1 export): \
+             prompts longer than the model's window will degrade; re-export with \
+             `cascadia shard` to get gemma4_cached_v1.1"
+        );
+    }
 }
 
 // -------- generation_config.json (eos_token_id lookup) --------

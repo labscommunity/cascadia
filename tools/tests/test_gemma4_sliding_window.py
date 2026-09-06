@@ -20,10 +20,15 @@ Three layers of coverage:
   `<= 0` must raise (it would mask every key and softmax would return NaN).
 * `resolve_sliding_window` -- how `text_config.sliding_window` becomes the
   baked value: 0/absent disables, negative is a configuration error.
-* `cached_gemma4_layer_forward` / `cached_gemma4_shared_layer_forward` -- the
-  production call sites, driven with a tiny fake decoder layer, so a forward
-  that stops passing the window (or re-inlines a plain causal mask) fails
-  here rather than only in a long-context eval.
+* `cached_gemma4_layer_forward` / `cached_gemma4_shared_layer_forward` --
+  driven with a tiny fake decoder layer, including an exact oracle (a
+  windowed step equals a full-attention step over the truncated cache), so
+  a forward that stops passing the window, re-inlines a plain causal mask,
+  or widens the band by one fails here rather than only in a long-context
+  eval.
+* `build_cached_wrapper` -- the production call site: a tiny random-init HF
+  `Gemma4ForCausalLM` is exported through the wrapper and compared with HF's
+  own logits past the window (skipped when transformers lacks Gemma 4).
 """
 
 from __future__ import annotations
@@ -91,6 +96,28 @@ def test_mask_matches_window_rule(seq_len, full_seq_len, window):
     assert visible(mask) == expected(seq_len, full_seq_len, window)
 
 
+@pytest.mark.parametrize(
+    "seq_len,full_seq_len,window",
+    [(8, 8, 4), (1, 9, 4), (5, 12, 3), (4, 8, 8), (3, 10, 1)],
+)
+def test_mask_matches_hf_mask_function(seq_len, full_seq_len, window):
+    """The hand-written oracle and the exporter could share one misreading of
+    HF's boundary; pin both to transformers' own mask function."""
+    mu = pytest.importorskip("transformers.masking_utils")
+    fn = mu.sliding_window_causal_mask_function(window)
+    past = full_seq_len - seq_len
+    hf = {
+        (i, j)
+        for i in range(seq_len)
+        for j in range(full_seq_len)
+        if bool(fn(0, 0, torch.tensor(past + i), torch.tensor(j)))
+    }
+    mask = export_gemma4.build_attention_mask(
+        seq_len, full_seq_len, window, CPU, torch.float32
+    )
+    assert visible(mask) == hf
+
+
 def test_window_is_a_strict_subset_of_causal():
     """A windowed layer never sees more than the same layer without a window."""
     causal = visible(
@@ -152,6 +179,36 @@ def test_resolve_sliding_window_rejects_negative(raw):
     cfg = types.SimpleNamespace(sliding_window=raw)
     with pytest.raises(ValueError, match="text_config.sliding_window"):
         export_gemma4.resolve_sliding_window(cfg)
+
+
+@pytest.mark.parametrize("raw", [True, 0.5, "1024"])
+def test_resolve_sliding_window_rejects_non_integers(raw):
+    """`int(True)` is 1 and `int(0.5)` is 0: refuse instead of coercing."""
+    cfg = types.SimpleNamespace(sliding_window=raw)
+    with pytest.raises(ValueError, match="integer"):
+        export_gemma4.resolve_sliding_window(cfg)
+
+
+SF = ["sliding_attention", "sliding_attention", "full_attention"]
+
+
+@pytest.mark.parametrize("raw", [0, None])
+def test_resolve_sliding_window_refuses_windowless_sliding_layers(raw):
+    """A config with sliding layers but no window is the pre-v1.1 bug; the
+    exporter must not stamp such a tree v1.1."""
+    cfg = types.SimpleNamespace(sliding_window=raw)
+    with pytest.raises(ValueError, match="sliding_attention layers but no"):
+        export_gemma4.resolve_sliding_window(cfg, SF)
+    with pytest.raises(ValueError, match="sliding_attention layers but no"):
+        export_gemma4.resolve_sliding_window(types.SimpleNamespace(), SF)
+
+
+def test_resolve_sliding_window_allows_windowless_full_only_models():
+    cfg = types.SimpleNamespace(sliding_window=None)
+    assert export_gemma4.resolve_sliding_window(cfg, ["full_attention"]) is None
+    assert export_gemma4.resolve_sliding_window(
+        types.SimpleNamespace(sliding_window=1024), SF
+    ) == 1024
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +292,26 @@ def run_layer(layer, seq_len, past, sliding_window):
         )
 
 
+def run_layer_with_cache(layer, seq_len, past, past_k, past_v, sliding_window):
+    """Like `run_layer` (same seeded hidden states + rope for `past`), but with
+    an explicit cache — so a truncated cache can stand in for a window."""
+    x, cos, sin, _, _ = step_inputs(seq_len, past)
+    with torch.no_grad():
+        return export_gemma4.cached_gemma4_layer_forward(
+            layer,
+            x,
+            cos,
+            sin,
+            past_k,
+            past_v,
+            NUM_HEADS,
+            NUM_KV_HEADS,
+            HEAD_DIM,
+            None,
+            sliding_window=sliding_window,
+        )
+
+
 def run_shared_layer(layer, seq_len, past, source_k, source_v, sliding_window):
     x, cos, sin, _, _ = step_inputs(seq_len, past)
     with torch.no_grad():
@@ -288,6 +365,30 @@ def test_layer_forward_window_is_noop_when_cache_fits(seq_len, past, window):
     assert torch.allclose(h_full, h_win)
 
 
+@pytest.mark.parametrize("window", [1, 2, 4])
+def test_layer_forward_window_equals_full_attention_over_truncated_cache(window):
+    """Exact oracle: a decode step with window W over a long cache must equal a
+    full-attention step over only the last W-1 cached keys (+ the new token).
+    "Some masking happened" tests pass a band that is one key too wide; this
+    does not."""
+    layer = make_fake_layer()
+    past = 10
+    x, cos, sin, past_k, past_v = step_inputs(1, past)
+    h_win, _, _ = run_layer_with_cache(layer, 1, past, past_k, past_v, window)
+    keep = window - 1
+    trunc_k = past_k[:, :, past - keep :, :]
+    trunc_v = past_v[:, :, past - keep :, :]
+    with torch.no_grad():
+        h_ref, _, _ = export_gemma4.cached_gemma4_layer_forward(
+            layer, x, cos, sin, trunc_k, trunc_v, NUM_HEADS, NUM_KV_HEADS,
+            HEAD_DIM, None, sliding_window=None,
+        )
+    assert torch.allclose(h_win, h_ref, atol=1e-6)
+    # Teeth: one key wider is a different answer.
+    h_wide, _, _ = run_layer_with_cache(layer, 1, past, past_k, past_v, window + 1)
+    assert not torch.allclose(h_wide, h_ref, atol=1e-6)
+
+
 def test_shared_layer_forward_applies_window():
     """KV-shared layers (E2B/E4B) mask the borrowed KV by their own type."""
     layer = make_fake_layer()
@@ -310,3 +411,98 @@ def test_shared_layer_forward_window_is_noop_when_cache_fits():
     h_full = run_shared_layer(layer, seq_len, 0, k_src, v_src, None)
     h_win = run_shared_layer(layer, seq_len, 0, k_src, v_src, WINDOW)
     assert torch.allclose(h_full, h_win)
+
+
+def test_shared_layer_forward_decode_against_long_source_cache():
+    """E2B/E4B decode: the borrowed source cache is `past + seq_len` long, so
+    the shared forward must derive `past` from the source length, not from
+    the query block. Exact oracle as for the own-KV layer."""
+    layer = make_fake_layer()
+    past, window = 10, WINDOW
+    _, k_src, v_src = run_layer(layer, 1, past, None)  # length past + 1
+    assert k_src.shape[2] == past + 1
+    h_win = run_shared_layer(layer, 1, past, k_src, v_src, window)
+    keep = window  # last W-1 cached keys + the current token
+    h_ref = run_shared_layer(
+        layer, 1, past, k_src[:, :, -keep:, :], v_src[:, :, -keep:, :], None
+    )
+    assert torch.allclose(h_win, h_ref, atol=1e-6)
+    h_full = run_shared_layer(layer, 1, past, k_src, v_src, None)
+    assert not torch.allclose(h_win, h_full)
+
+
+# ---------------------------------------------------------------------------
+# build_cached_wrapper vs HF (the production call site, end to end)
+# ---------------------------------------------------------------------------
+
+SLIDING, FULL = "sliding_attention", "full_attention"
+
+
+def _tiny_gemma4():
+    """Random-init Gemma 4 small enough to run on CPU in a second, with a
+    4-token window so a 12-token prefill crosses it on every sliding layer."""
+    cfg_mod = pytest.importorskip("transformers.models.gemma4.configuration_gemma4")
+    mdl_mod = pytest.importorskip("transformers.models.gemma4.modeling_gemma4")
+    layer_types = [SLIDING, SLIDING, FULL, SLIDING, SLIDING, FULL, SLIDING, FULL]
+    try:
+        cfg = cfg_mod.Gemma4TextConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=len(layer_types),
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            global_head_dim=8,
+            num_global_key_value_heads=2,
+            layer_types=layer_types,
+            sliding_window=4,
+            hidden_size_per_layer_input=0,
+            vocab_size_per_layer_input=64,
+            final_logit_softcapping=None,
+            tie_word_embeddings=False,
+            attention_k_eq_v=False,
+            num_kv_shared_layers=0,
+        )
+        cfg._attn_implementation = "eager"
+        # transformers >= 5.5 registers head_dim/num_key_value_heads as
+        # per-layer attributes and refuses global reads; this config is
+        # homogeneous, so the exporter's global reads are exact.
+        if hasattr(cfg, "allow_global_per_layer_attribute_access"):
+            cfg.allow_global_per_layer_attribute_access = True
+        torch.manual_seed(0)
+        model = mdl_mod.Gemma4ForCausalLM(cfg).eval()
+    except Exception as e:  # pragma: no cover - depends on the transformers version
+        pytest.skip(f"cannot build a tiny Gemma 4 on this transformers: {e}")
+    export_gemma4.fix_zero_dim_buffers(model)
+    return cfg, model
+
+
+def _wrapper_logits(cfg, model, ids, sliding_window):
+    plan = export_gemma4.compute_stage_plan(cfg.num_hidden_layers, 1)[0]
+    wrapper, head_dims, nkv, share = export_gemma4.build_cached_wrapper(
+        model, cfg, plan, sliding_window=sliding_window
+    )
+    kv = []
+    for i, shared in enumerate(share["is_shared"]):
+        if not shared:
+            kv.append(torch.zeros(1, nkv[i], 0, head_dims[i]))
+            kv.append(torch.zeros(1, nkv[i], 0, head_dims[i]))
+    pos = torch.arange(ids.shape[1]).unsqueeze(0)
+    with torch.no_grad():
+        return wrapper(ids, pos, *kv)[0]
+
+
+def test_wrapper_matches_hf_past_the_window():
+    """The whole stage wrapper (layer-type gating, mask hoisting, both call
+    sites) against HF's own forward, on a prompt three times the window."""
+    cfg, model = _tiny_gemma4()
+    torch.manual_seed(1)
+    ids = torch.randint(0, cfg.vocab_size, (1, 12))
+    with torch.no_grad():
+        ref = model(input_ids=ids).logits
+    ours = _wrapper_logits(cfg, model, ids, sliding_window=cfg.sliding_window)
+    assert torch.allclose(ours, ref, atol=1e-4), (ours - ref).abs().max()
+    # Teeth: exporting the sliding layers unbounded (the v1 behaviour) differs.
+    unbounded = _wrapper_logits(cfg, model, ids, sliding_window=None)
+    assert not torch.allclose(unbounded, ref, atol=1e-4)
