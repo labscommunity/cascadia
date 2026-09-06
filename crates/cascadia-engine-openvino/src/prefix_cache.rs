@@ -231,16 +231,24 @@ impl PrefixCache {
             self.live -= old.bytes;
         }
         while self.live + bytes > self.budget {
+            // Least recently used first; among entries used at the same tick (a prompt marks
+            // every prefix it extends), the LONGEST goes first — it is the most specific one
+            // (one conversation's boundary) and a shorter one is shared by more prompts.
             let Some((i, _)) = self
                 .entries
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, e)| e.last_used)
+                .min_by_key(|(_, e)| (e.last_used, std::cmp::Reverse(e.tokens.len())))
             else {
                 break;
             };
             let old = self.entries.remove(i);
             self.live -= old.bytes;
+            tracing::info!(
+                key_len = old.tokens.len(),
+                mib = old.bytes >> 20,
+                "qwen35 prefix-cache evicted"
+            );
         }
         self.tick += 1;
         self.live += bytes;
@@ -255,23 +263,29 @@ impl PrefixCache {
 
     /// Longest cached entry whose key is a STRICT prefix of `prompt`
     /// (`key.len() < prompt.len()`): the per-stage parts and the matched token
-    /// count. Non-consuming (an `Arc` clone, no byte copy); marks the entry
-    /// most-recently-used.
+    /// count. Non-consuming (an `Arc` clone, no byte copy). EVERY entry the
+    /// prompt extends is marked most-recently-used, not only the longest: a
+    /// shared system-block entry is in use by every conversation on it even
+    /// though those conversations always match their own, longer boundary
+    /// entry — under the old rule it was the LRU victim of its own
+    /// conversations' refreshes (measured: a 16 GiB budget at 32 K holds three
+    /// 4.45 GB snapshots; the fourth evicted the system block and the next
+    /// conversation on that prompt went cold, 110 s).
     pub fn longest_prefix(&mut self, prompt: &[u32]) -> Option<(Arc<Vec<Vec<u8>>>, usize)> {
-        let best = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.tokens.len() < prompt.len() && prompt.starts_with(&e.tokens))
-            .max_by_key(|(_, e)| e.tokens.len())
-            .map(|(i, _)| i);
-        match best {
-            Some(i) => {
-                self.tick += 1;
-                self.hits += 1;
-                let e = &mut self.entries[i];
+        self.tick += 1;
+        let mut best: Option<(usize, usize)> = None; // (index, key len)
+        for (i, e) in self.entries.iter_mut().enumerate() {
+            if e.tokens.len() < prompt.len() && prompt.starts_with(&e.tokens) {
                 e.last_used = self.tick;
-                Some((Arc::clone(&e.parts), e.tokens.len()))
+                if best.is_none_or(|(_, len)| len < e.tokens.len()) {
+                    best = Some((i, e.tokens.len()));
+                }
+            }
+        }
+        match best {
+            Some((i, len)) => {
+                self.hits += 1;
+                Some((Arc::clone(&self.entries[i].parts), len))
             }
             None => {
                 self.misses += 1;
@@ -416,6 +430,28 @@ mod tests {
         let mut off = PrefixCache::new(0);
         assert!(!off.enabled());
         assert!(!off.insert(key(20, 0), blob(1)));
+    }
+
+    #[test]
+    fn shared_system_block_survives_its_conversations_refreshes() {
+        // Budget holds three 30-byte snapshots. sys (20 tokens) is the shared system block;
+        // A1 (40) is conversation A's boundary; a refresh A2 (60) must evict A1, not sys.
+        let mut c = PrefixCache::new(100);
+        assert!(c.insert(key(20, 0), blob(30)), "sys");
+        assert!(c.insert(key(40, 0), blob(30)), "A1");
+        // Conversation A's next turn: matches A1, and marks sys as used too.
+        assert_eq!(c.longest_prefix(&key(50, 0)).unwrap().1, 40);
+        assert!(c.insert(key(60, 0), blob(30)), "A2 refresh (fits: 90)");
+        assert!(
+            c.insert(key(70, 0), blob(30)),
+            "A3 refresh (120 > 100: evicts)"
+        );
+        assert_eq!(c.len(), 3);
+        // sys is still there: a new conversation on the same system prompt starts warm.
+        assert_eq!(c.longest_prefix(&key(30, 0)).unwrap().1, 20);
+        // And the victim was A1 (the oldest boundary), not sys and not the newer refreshes.
+        assert!(!c.contains(&key(40, 0)));
+        assert!(c.contains(&key(60, 0)) && c.contains(&key(70, 0)));
     }
 
     #[test]
