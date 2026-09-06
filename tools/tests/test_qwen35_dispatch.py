@@ -45,6 +45,17 @@ def _stub_ir(dirpath, model_type, inner=None):
     return dirpath
 
 
+@pytest.fixture(autouse=True)
+def _restore_torch_default_dtype():
+    """`export_shards.main()` sets torch's default dtype (fp16 by default)
+    before the config-first dispatch exits; undo it so the rotary tests in
+    test_arch_detection.py are not poisoned by test ordering."""
+    torch = pytest.importorskip("torch")
+    before = torch.get_default_dtype()
+    yield
+    torch.set_default_dtype(before)
+
+
 def _argv(model, out, *extra):
     return [
         "export_shards.py",
@@ -73,3 +84,11 @@ def test_qwen35_family_dispatches_to_surgery(tmp_path, monkeypatch, capsys, oute
     assert "IR-surgery" in out, out
     assert outer in out, out
     assert "--layer-split" in out, out
+
+
+def test_qwen35_ir_dispatch_rejects_npu_target(tmp_path, monkeypatch):
+    model = _stub_ir(tmp_path / "ir", "qwen3_5", "qwen3_5_text")
+    monkeypatch.setattr(
+        sys, "argv", _argv(model, tmp_path / "out", "--target", "npu"))
+    with pytest.raises(SystemExit, match="npu"):
+        export_shards.main()

@@ -45,6 +45,17 @@ def _stub_gemma4_ir(dirpath):
     return dirpath
 
 
+@pytest.fixture(autouse=True)
+def _restore_torch_default_dtype():
+    """`export_shards.main()` sets torch's default dtype (fp16 by default)
+    before the config-first dispatch exits; undo it so the rotary tests in
+    test_arch_detection.py are not poisoned by test ordering."""
+    torch = pytest.importorskip("torch")
+    before = torch.get_default_dtype()
+    yield
+    torch.set_default_dtype(before)
+
+
 def _argv(model, out, *extra):
     return [
         "export_shards.py",

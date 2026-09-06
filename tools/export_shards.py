@@ -2025,6 +2025,15 @@ def main():
                 flush=True,
             )
             sys.exit(2)
+        if getattr(args, "target", "cpu") == "npu":
+            # Same guard the gemma-4 IR branch has: the surgery writes
+            # dynamic-shape stateful stages, which the NPU compiler rejects
+            # on-device, minutes after this point.
+            raise SystemExit(
+                "qwen3_5-family IR sharding does not support --target npu "
+                "(the surgery emits dynamic stateful stages); drop --target "
+                "or use --engine ov-genai on a static NPU export."
+            )
         if os.path.isdir(args.model):
             _model_dir = args.model
         else:
