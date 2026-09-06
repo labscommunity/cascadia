@@ -313,16 +313,18 @@ pub struct WorkerArgs {
     /// `qwen35` only: byte budget (GiB) of the in-process prefix cache that
     /// snapshots the chain state at chat-turn boundaries and restores it for
     /// a prompt that extends a cached prefix (TTFT ≈ restore + the new tail
-    /// instead of a full re-prefill). 0 disables. Single-process (`--total
-    /// 1`) only; a Qwen3.8-27B snapshot is ~64 KB per context token.
-    #[arg(long, default_value_t = 16.0)]
-    pub prefix_cache_gb: f64,
+    /// instead of a full re-prefill). Default: the smaller of 16 GiB and a
+    /// quarter of physical RAM. 0 disables. Single-process (`--total 1`) only;
+    /// a Qwen3.8-27B snapshot is ~64 KB per context token (2.2 GB at 32 K).
+    #[arg(long)]
+    pub prefix_cache_gb: Option<f64>,
 
     /// Largest `/v1/chat/completions` request body (MiB); the rendered prompt
-    /// is capped at the same size. 4 MiB is ~1M characters ≈ a 262 K-token
-    /// window. Lower it on an exposed endpoint; the engine's own prompt-length
-    /// guard and the bounded admission queue still apply.
-    #[arg(long, default_value_t = 4.0)]
+    /// is capped at the same size. 1 MiB ≈ 250 K tokens of English, the
+    /// window of the largest served models. Only `qwen35` also bounds the
+    /// prompt in TOKENS (against `max_position_embeddings`); on other engines
+    /// this byte cap is the whole guard, so lower it on an exposed endpoint.
+    #[arg(long, default_value_t = 1.0)]
     pub api_max_body_mb: f64,
 
     /// OV performance hint (PERFORMANCE_HINT). LATENCY suits single-user
@@ -640,14 +642,14 @@ pub struct RunArgs {
     #[arg(long, default_value = ":8000")]
     pub api: String,
 
-    /// `--engine qwen35` only: prefix-cache budget in GiB (0 disables). See
-    /// `cascadia worker --help`.
-    #[arg(long, default_value_t = 16.0)]
-    pub prefix_cache_gb: f64,
+    /// `--engine qwen35` only: prefix-cache budget in GiB (0 disables; default
+    /// min(16 GiB, RAM/4)). See `cascadia worker --help`.
+    #[arg(long)]
+    pub prefix_cache_gb: Option<f64>,
 
     /// Largest chat-completions request body in MiB (rendered prompt capped
     /// alike). See `cascadia worker --help`.
-    #[arg(long, default_value_t = 4.0)]
+    #[arg(long, default_value_t = 1.0)]
     pub api_max_body_mb: f64,
 }
 
@@ -676,8 +678,8 @@ impl WorkerArgs {
             api: Some(api),
             device,
             engine,
-            prefix_cache_gb: 16.0,
-            api_max_body_mb: 4.0,
+            prefix_cache_gb: None,
+            api_max_body_mb: 1.0,
             ov_cache_dir: None,
             ov_kv_precision: None,
             ov_dyn_quant_group: None,
@@ -976,6 +978,45 @@ fn parse_addr(s: &str, default_host: &str) -> Result<(String, u16)> {
 /// Lunar Lake), versus ~1 s when the cache is warm. PowerInfer's
 /// SmallThinker fork ships an equivalent default in `llama-cli`. We
 /// match that operator UX.
+/// Byte budget for the qwen35 prefix cache: the flag when given (0 = off), else the smaller
+/// of 16 GiB and a quarter of physical RAM (a 64 GB box gets 16 GiB, a 32 GB UMA box 8 GiB —
+/// the weights already take 16-28 GB there).
+fn resolve_prefix_cache_bytes(flag: Option<f64>) -> Result<usize> {
+    const GIB: f64 = (1u64 << 30) as f64;
+    match flag {
+        Some(gb) if !gb.is_finite() || gb < 0.0 => Err(anyhow!(
+            "--prefix-cache-gb must be a finite, non-negative number (got {gb})"
+        )),
+        Some(gb) => Ok((gb * GIB) as usize),
+        None => {
+            let ram = {
+                use sysinfo::{MemoryRefreshKind, RefreshKind, System};
+                System::new_with_specifics(
+                    RefreshKind::nothing().with_memory(MemoryRefreshKind::nothing().with_ram()),
+                )
+                .total_memory() as f64
+            };
+            let default = cascadia_engine_openvino::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES as f64;
+            Ok(if ram > 0.0 {
+                default.min(ram / 4.0)
+            } else {
+                default
+            } as usize)
+        }
+    }
+}
+
+/// `--api-max-body-mb` → bytes; 0/negative/non-finite are configuration errors (0 would make
+/// every real request a 413, inf would remove the cap).
+fn resolve_api_max_body_bytes(mb: f64) -> Result<usize> {
+    if !mb.is_finite() || mb <= 0.0 || mb > 4096.0 {
+        return Err(anyhow!(
+            "--api-max-body-mb must be a finite number in (0, 4096] (got {mb})"
+        ));
+    }
+    Ok((mb * (1u64 << 20) as f64) as usize)
+}
+
 fn resolve_ov_cache_dir(arg: Option<&str>) -> Option<String> {
     match arg {
         Some("") => None,
@@ -1415,7 +1456,11 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             if let Some(group) = &args.ov_dyn_quant_group {
                 b = b.with_dyn_quant_group(group);
             }
-            let budget = (args.prefix_cache_gb.max(0.0) * (1u64 << 30) as f64) as usize;
+            let budget = resolve_prefix_cache_bytes(args.prefix_cache_gb)?;
+            info!(
+                prefix_cache_gib = budget >> 30,
+                "qwen35 prefix-cache budget"
+            );
             b = b.with_prefix_cache_bytes(budget);
             Ok(Box::new(b))
         }
@@ -1937,7 +1982,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // Long-context serving: the 64 KiB body / 32 KiB prompt defaults hold
         // ~8 K tokens, a fraction of what the Qwen3.5-family and Llama-3.1
         // windows admit. Both caps follow one operator-facing knob.
-        let max_body = (args.api_max_body_mb.max(0.001) * (1u64 << 20) as f64) as usize;
+        let max_body = resolve_api_max_body_bytes(args.api_max_body_mb)?;
         cfg.max_body_bytes = max_body;
         cfg.max_prompt_bytes = max_body;
         // ov-genai owns native templating: render the template API-side only for
@@ -2729,6 +2774,20 @@ mod python_tests {
             "{err}"
         );
         assert!(err.contains("HuggingFace repo id"), "{err}");
+    }
+
+    #[test]
+    fn flag_resolvers_reject_nonsense_and_size_the_cache_default() {
+        assert!(resolve_api_max_body_bytes(0.0).is_err());
+        assert!(resolve_api_max_body_bytes(f64::INFINITY).is_err());
+        assert!(resolve_api_max_body_bytes(f64::NAN).is_err());
+        assert_eq!(resolve_api_max_body_bytes(1.0).unwrap(), 1 << 20);
+        assert!(resolve_prefix_cache_bytes(Some(-1.0)).is_err());
+        assert!(resolve_prefix_cache_bytes(Some(f64::INFINITY)).is_err());
+        assert_eq!(resolve_prefix_cache_bytes(Some(0.0)).unwrap(), 0);
+        assert_eq!(resolve_prefix_cache_bytes(Some(2.0)).unwrap(), 2 << 30);
+        let auto = resolve_prefix_cache_bytes(None).unwrap();
+        assert!(auto <= cascadia_engine_openvino::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES);
     }
 
     #[test]
