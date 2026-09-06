@@ -280,9 +280,16 @@ request that has run holds bit-exactly (Δ logits 0.0) — the engine's
 turn-end reset made every warm admission the discard case until this was
 found, and it is also why the first certification run saw "snapshots taken
 after a restore" read back shallow: the restore they followed had been
-dropped. With priming, a primed restore reads back the full state, so
-snapshots are taken on every turn (positions past the restored prefix) and
-the re-prefilled tail is always one turn. Snapshots are skipped while a
+dropped. With priming, a primed restore reads back the full state, so a
+warm turn can snapshot too. Each copy is paid inside that turn's TTFT,
+though, so on a warm turn a boundary snapshot is a **refresh** taken only
+once the tail it would save (tokens between the restored prefix and the
+boundary, which every later turn re-prefills otherwise) has grown to cost
+as much as the copy — the break-even is computed from the engine's own
+measured prefill rate and snapshot copy rate, not a constant, so a CPU box
+that prefills slowly refreshes sooner than an iGPU. Short follow-ups thus
+pay restore + tail only, the tail can never grow past one copy's worth of
+prefill, and a conversation never goes cold. Snapshots are skipped while a
 stage reset has failed (`stages_dirty`), and `cancel()` resets so the next
 admission always starts from the certified reset → prime → restore order.
 DeltaNet state cannot be trimmed, so this
@@ -333,8 +340,8 @@ One defect was found and fixed by this certification, recorded above: a
 restore onto a request that has not executed since its reset is silently
 discarded by the GPU plugin (priming fold). The first run's "snapshot after
 a restore reads back shallow" was the same defect seen from the other side
-(the restore it followed had been dropped), so snapshots are now taken on
-every turn rather than cold turns only.
+(the restore it followed had been dropped), so warm turns may snapshot too
+(the measured-break-even refresh above) rather than cold turns only.
 
 **Cold-TTFT levers in the staged engine (measured, 8K prompt, B390, with
 the OVMS node running alongside — ~10–20 % slower than the quiet-box sweep):**

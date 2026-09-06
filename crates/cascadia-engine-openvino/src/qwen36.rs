@@ -611,6 +611,8 @@ impl Builder for Qwen36Builder {
             primed: false,
             stages_dirty: false,
             max_ctx: self.max_ctx,
+            refresh_costs: Default::default(),
+            last_restore_bytes: 0,
         }))
     }
 }
@@ -722,6 +724,12 @@ pub struct Qwen36Engine {
     /// `max_position_embeddings` of the model (from the tree's config.json); prompts at or past it
     /// are refused at submit rather than prefilled for hours on the single batch=1 slot.
     max_ctx: usize,
+    /// Measured prefill and snapshot-copy rates for the warm-turn refresh rule
+    /// (`prefix_cache::RefreshCosts::refresh_pays`).
+    refresh_costs: crate::prefix_cache::RefreshCosts,
+    /// Bytes of the parts restored by the latest prefix-cache hit: the size estimate for the
+    /// state a refresh snapshot of this conversation would copy.
+    last_restore_bytes: usize,
 }
 
 /// In-flight task state. `step()` advances one token per call so the
@@ -760,7 +768,12 @@ struct ActiveTask {
     /// resume ids (same defect dist_spec fixed).
     resume_seed_len: usize,
     max_tokens: usize,
+    /// Set after admission (after any prefix-cache restore), so `started.elapsed()` at the end of
+    /// prefill is prefill wall time plus the snapshot copies taken inside it.
     started: Instant,
+    /// Seconds spent in prefix-cache snapshot copies during this turn's prefill, excluded from
+    /// the prefill-rate measurement.
+    snapshot_secs: f64,
     /// Pipeline rank 0: per-frame FORWARD→TOKEN round-trip times for
     /// decode frames (n=1), for the pipeline gate-4 wire histogram.
     wire_ms: Vec<f64>,
@@ -1524,6 +1537,7 @@ impl Qwen36Engine {
                 resume_seed_len,
                 max_tokens,
                 started: Instant::now(),
+                snapshot_secs: 0.0,
                 wire_ms: Vec::new(),
             });
         }
@@ -2191,19 +2205,40 @@ impl Qwen36Engine {
                 }
             };
             // Snapshot points for THIS turn (end of the system block, and the position before the
-            // prompt's last `<|im_start|>`, which the next turn re-sends verbatim). Taken on warm
-            // turns too — a restore that was primed reads back the full state (OV-level probe: depth
-            // and logits identical to the cold fold) — but only for positions this turn actually
-            // prefills (past `warm_prefix`), never from stages whose reset failed, and not for keys
-            // the cache already holds (a shared system prompt).
+            // prompt's last `<|im_start|>`, which the next turn re-sends verbatim): only positions
+            // this turn actually prefills (past `warm_prefix`), never from stages whose reset
+            // failed, and not for keys the cache already holds (a shared system prompt). A cold
+            // turn snapshots every boundary. A warm turn may too — a primed restore reads back the
+            // full state (OV-level probe: depth and logits identical to the cold fold) — but each
+            // copy is paid inside this turn's TTFT, so it is a *refresh* taken only once the tail
+            // it would save has grown to cost as much as the copy (measured rates, see
+            // `RefreshCosts::refresh_pays`); a conversation therefore never goes cold, and short
+            // follow-ups pay restore + tail only.
+            let state_bytes = self.last_restore_bytes;
             let snapshot_at: Vec<usize> = self
                 .im_start_id
                 .filter(|_| self.prefix_cache.enabled() && !self.stages_dirty)
                 .map(|im| crate::prefix_cache::chat_boundaries(&prompt_ids, im))
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|&b| b > warm_prefix && !self.prefix_cache.contains(&prompt_ids[..b]))
+                .filter(|&b| {
+                    b > warm_prefix
+                        && !self.prefix_cache.contains(&prompt_ids[..b])
+                        && (warm_prefix == 0
+                            || self
+                                .refresh_costs
+                                .refresh_pays(b - warm_prefix, state_bytes))
+                })
                 .collect();
+            if self.prefix_cache.enabled() {
+                info!(
+                    warm_prefix,
+                    ?snapshot_at,
+                    prompt = prompt_ids.len(),
+                    prefill_tok_s = ?self.refresh_costs.prefill_tok_s,
+                    "qwen35 prefix-cache snapshot plan"
+                );
+            }
             self.active = Some(ActiveTask {
                 task_id: task.task_id,
                 tenant: task.tenant,
@@ -2219,6 +2254,7 @@ impl Qwen36Engine {
                 resume_seed_len,
                 max_tokens,
                 started: Instant::now(),
+                snapshot_secs: 0.0,
                 wire_ms: Vec::new(),
             });
         }
@@ -2289,6 +2325,18 @@ impl Qwen36Engine {
                         warn!(task = %task_id, error = %e, "prefill failed");
                         return self.finalize_error(format!("prefill failed: {e}"));
                     }
+                }
+            }
+            // Prefill rate for the refresh rule: this turn's prefilled tokens over the wall time
+            // since admission minus the snapshot copies inside it. Short tails are dominated by
+            // per-span overhead and would under-read the rate, so only spans of a full chunk or
+            // more update it.
+            {
+                let t = self.active.as_ref().unwrap();
+                let prefilled = t.prompt_ids.len() - t.warm_prefix;
+                let secs = t.started.elapsed().as_secs_f64() - t.snapshot_secs;
+                if prefilled >= prefill_chunk() && secs > 0.0 {
+                    self.refresh_costs.prefill_tok_s = Some(prefilled as f64 / secs);
                 }
             }
             #[cfg(feature = "kv_coord")]
@@ -2534,6 +2582,7 @@ impl Qwen36Engine {
             if let Some((parts, len)) = self.prefix_cache.longest_prefix(prompt_ids) {
                 let started = Instant::now();
                 if self.restore_local_parts(&parts) {
+                    self.last_restore_bytes = parts.iter().map(Vec::len).sum();
                     // Attention depth from the blob, not the token count (see kv_seq_from_blob).
                     let warm = crate::prefix_cache::kv_seq_from_parts(&parts)
                         .map(|s| s.min(len))
@@ -2573,12 +2622,19 @@ impl Qwen36Engine {
             Some(parts) => {
                 let bytes: usize = parts.iter().map(Vec::len).sum();
                 let stored = self.prefix_cache.insert(key, parts);
+                let secs = started.elapsed().as_secs_f64();
+                if bytes > 0 && secs > 0.0 {
+                    self.refresh_costs.snapshot_s_per_byte = Some(secs / bytes as f64);
+                }
+                if let Some(t) = self.active.as_mut() {
+                    t.snapshot_secs += secs;
+                }
                 info!(
                     task = %task_id,
                     pos,
                     bytes,
                     stored,
-                    snapshot_ms = started.elapsed().as_millis() as u64,
+                    snapshot_ms = (secs * 1000.0) as u64,
                     live_mib = self.prefix_cache.live_bytes() >> 20,
                     entries = self.prefix_cache.len(),
                     "qwen35 prefix-cache snapshot"
@@ -2967,6 +3023,8 @@ mod tests {
             primed: false,
             stages_dirty: false,
             max_ctx: 0,
+            refresh_costs: Default::default(),
+            last_restore_bytes: 0,
         }
     }
 
@@ -3143,6 +3201,7 @@ mod tests {
             resume_seed_len: 0,
             max_tokens: 16,
             started: Instant::now(),
+            snapshot_secs: 0.0,
             wire_ms: Vec::new(),
         });
 

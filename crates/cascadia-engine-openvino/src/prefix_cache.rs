@@ -281,6 +281,39 @@ impl PrefixCache {
     }
 }
 
+/// The two measured rates the warm-turn refresh rule needs. Both come from
+/// the engine's own timings on this box and model, so the rule has no
+/// device-dependent constant: an iGPU that prefills at 450 tok/s and copies
+/// state at 0.7 GB/s and a CPU that prefills at 60 tok/s and copies at
+/// memcpy speed each get their own break-even.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RefreshCosts {
+    /// Prompt tokens prefilled per second (restore and snapshot time excluded).
+    pub prefill_tok_s: Option<f64>,
+    /// Seconds per byte of the last snapshot copy.
+    pub snapshot_s_per_byte: Option<f64>,
+}
+
+impl RefreshCosts {
+    /// Should a warm turn refresh the boundary snapshot? A cold turn always
+    /// snapshots; on a warm turn a snapshot is a *refresh*: it costs one state
+    /// copy now and saves re-prefilling `tail` (the tokens between the
+    /// restored prefix and the boundary) on every later turn of the
+    /// conversation. Taken once re-prefilling the tail would cost at least as
+    /// much as the copy of `state_bytes`, so short follow-ups pay restore +
+    /// tail only, the tail can never grow past one copy's worth of prefill
+    /// before a refresh, and a conversation never goes cold. Unknown rates
+    /// refresh.
+    pub fn refresh_pays(&self, tail: usize, state_bytes: usize) -> bool {
+        match (self.prefill_tok_s, self.snapshot_s_per_byte) {
+            (Some(tok_s), Some(s_per_b)) if tok_s > 0.0 => {
+                tail as f64 / tok_s >= state_bytes as f64 * s_per_b
+            }
+            _ => true,
+        }
+    }
+}
+
 /// Snapshot positions for a chat prompt, ascending: the end of the leading
 /// system block (the position before the SECOND `im_start`, which a new
 /// conversation on the same system prompt re-sends verbatim) and the
@@ -383,6 +416,30 @@ mod tests {
         let mut off = PrefixCache::new(0);
         assert!(!off.enabled());
         assert!(!off.insert(key(20, 0), blob(1)));
+    }
+
+    #[test]
+    fn refresh_rule_is_the_measured_break_even() {
+        // Unknown rates: always refresh (never a cold conversation).
+        assert!(RefreshCosts::default().refresh_pays(1, 1 << 30));
+        // tate-07 at 8 K: 455 tok/s prefill, 1.2 GB copied in 2.6 s.
+        let c = RefreshCosts {
+            prefill_tok_s: Some(455.0),
+            snapshot_s_per_byte: Some(2.6 / 1.2e9),
+        };
+        let bytes = 1_200_000_000;
+        assert!(
+            !c.refresh_pays(50, bytes),
+            "a one-line follow-up: restore + tail only"
+        );
+        assert!(!c.refresh_pays(1000, bytes), "2.2 s of tail < 2.6 s copy");
+        assert!(c.refresh_pays(1300, bytes), "2.9 s of tail >= 2.6 s copy");
+        // Same tail, a CPU box that copies at memcpy speed but prefills slowly: refresh sooner.
+        let cpu = RefreshCosts {
+            prefill_tok_s: Some(60.0),
+            snapshot_s_per_byte: Some(0.4 / 1.2e9),
+        };
+        assert!(cpu.refresh_pays(50, bytes));
     }
 
     #[test]
