@@ -39,13 +39,18 @@ vision IRs, no `openvino_model.xml`); the `ov-genai` engine auto-detects that
 and serves text-only through `VLMPipeline`, exactly as for Qwen3.6:
 
 ```bash
-cascadia run OpenVINO/Qwen3.8-27B-int4-ov --engine ov-genai --device GPU --api :8000
-# alias: cascadia run qwen3.8-27b --engine ov-genai --device GPU
+hf download OpenVINO/Qwen3.8-27B-int4-ov --local-dir ./Qwen3.8-27B-int4-ov
+# Intel's published IR carries tokenizer IRs built with a nightly
+# openvino-tokenizers; regenerate them with the installed one first
+# (details under "Why Intel's published IR throws" below):
+convert_tokenizer ./Qwen3.8-27B-int4-ov --with-detokenizer -o ./Qwen3.8-27B-int4-ov
+cascadia run ./Qwen3.8-27B-int4-ov --engine ov-genai --device GPU --api :8000
 ```
 
-Nothing in Cascadia inspects `model_type` on this path; support is OpenVINO
-GenAI's (2026.2+ has the fused GatedDeltaNet op and the Qwen3.5 VLM
-pipeline).
+`cascadia run` takes a local directory only (it never downloads); the
+`qwen3.8-27b` alias is for `cascadia shard`. Nothing in Cascadia inspects
+`model_type` on this path; support is OpenVINO GenAI's (2026.2+ has the fused
+GatedDeltaNet op and the Qwen3.5 VLM pipeline).
 
 ## Serving path B — staged `qwen35` (IR surgery, 1–16 stages)
 
@@ -54,8 +59,7 @@ the official IR at decoder-layer boundaries (no re-export, no
 re-quantisation; stages inherit the int4 weights byte-for-byte):
 
 ```bash
-cascadia shard --model /path/to/Qwen3.8-27B-int4-ov \
-    --output-dir ./qwen38-2stage --num-stages 2
+cascadia shard --model qwen3.8-27b --output-dir ./qwen38-2stage --num-stages 2
 cascadia run ./qwen38-2stage --engine qwen35 --device GPU --api :8000
 ```
 
@@ -265,9 +269,6 @@ only the tail. Snapshot positions on a cold turn:
 - the **end of the system block** — before the second `<|im_start|>` — so a
   new conversation on the same system prompt (a RAG document, an agent's
   tool manifest) starts warm too.
-- **turn end** (prompt + generated) only when neither applies (legacy
-  prompts without `<|im_start|>`), for templates that preserve history
-  verbatim.
 
 Lookups are non-consuming, so a shared system prompt serves every
 conversation that starts with it. A restore lands on the live requests
@@ -277,19 +278,18 @@ executed since reset is silently discarded on the next inference (KV depth
 = tokens folded since, logits off by ~19), while the same restore onto a
 request that has run holds bit-exactly (Δ logits 0.0) — the engine's
 turn-end reset made every warm admission the discard case until this was
-found. Snapshots are taken only on **cold** turns: after a `set_state_blob` the request's attention KV reads back
-shallow (only the tokens folded since the restore) while the DeltaNet state
-carries the whole history, so a snapshot taken then is inconsistent — the
-first certification run hit exactly that (turn 3 answered from a corrupted
-context). Because the tail past the cached prefix therefore grows by one
-turn per warm turn, admission prefers a cold prefill once the tail exceeds
-`MAX_WARM_TAIL` (4096 tokens), which refreshes the boundary snapshot; the
-per-turn cost is bounded by that tail, and the periodic cold prefill
-amortises over several turns. DeltaNet state cannot be trimmed, so this
+found, and it is also why the first certification run saw "snapshots taken
+after a restore" read back shallow: the restore they followed had been
+dropped. With priming, a primed restore reads back the full state, so
+snapshots are taken on every turn (positions past the restored prefix) and
+the re-prefilled tail is always one turn. Snapshots are skipped while a
+stage reset has failed (`stages_dirty`), and `cancel()` resets so the next
+admission always starts from the certified reset → prime → restore order.
+DeltaNet state cannot be trimmed, so this
 is snapshot-at-boundary caching: a hit costs one `set_state_blob` per stage
 (a memcpy of ~64 KB per cached token plus ~150 MB of recurrent state) and
 the tail's prefill; a miss costs a full prefill plus one snapshot copy of
-the same size. `--prefix-cache-gb` sets the budget (default 16; 0 disables;
+the same size. `--prefix-cache-gb` sets the budget (default min(16 GiB, RAM/4); 0 disables;
 a Qwen3.8-27B snapshot is 2.2 GB at 32 K tokens, 8.5 GB at 128 K). Single
 process only: in pipeline mode (`--total > 1`) the downstream ranks' state
 is not local, which the `kv_coord` coordination plane covers with its
@@ -329,10 +329,12 @@ two snapshots (system block + chat boundary); every later turn of the
 conversation, and every new conversation on the same system prompt, is a
 restore plus the prefill of its own tail.
 
-Two defects were found and fixed by this certification, both recorded
-above: a restore onto a request that has not executed since its reset is
-silently discarded by the GPU plugin (priming fold), and a snapshot taken
-after a restore is inconsistent (cold-turn snapshots + `MAX_WARM_TAIL`).
+One defect was found and fixed by this certification, recorded above: a
+restore onto a request that has not executed since its reset is silently
+discarded by the GPU plugin (priming fold). The first run's "snapshot after
+a restore reads back shallow" was the same defect seen from the other side
+(the restore it followed had been dropped), so snapshots are now taken on
+every turn rather than cold turns only.
 
 **Cold-TTFT levers in the staged engine (measured, 8K prompt, B390, with
 the OVMS node running alongside — ~10–20 % slower than the quiet-box sweep):**

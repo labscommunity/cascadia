@@ -32,7 +32,7 @@ Five engines:
 - `ov-runtime` — multi-stage stateful KV cache. Pre-exported per-stage v3+ shards; each stage owns its layer range and runs SDPA attention with internal RoPE.
 - `ov-dist-spec` — multi-stage spec decode with mask-based KV-cache rewind on rejected drafts. v5 shards (canonical optimum-style inputs).
 - `gemma4` — Gemma 4 multi-stage: per-layer-type attention, KV-sharing, per-layer-input embeddings. `gemma4_cached_v1` shards.
-- `qwen36-moe` — Qwen3.6-35B-A3B staged chain (GatedDeltaNet + MoE) from `qwen3_5_moe` IR-surgery shards; single-box or N-rank pipeline. See [architectures/qwen36-moe-support.md](architectures/qwen36-moe-support.md).
+- `qwen35` (alias `qwen36-moe`) — Qwen3.5-family staged chain (GatedDeltaNet; Qwen3.6 MoE or dense Qwen3.8) from `qwen3_5*` IR-surgery shards; single-box or N-rank pipeline; in-process prefix cache. See [architectures/qwen36-moe-support.md](architectures/qwen36-moe-support.md).
 
 ## `cascadia-engine-mock`
 
