@@ -203,7 +203,7 @@ pub enum EngineKind {
     OvGenai,
     OvRuntime,
     OvDistSpec,
-    /// Gemma 4 multi-stage engine. Drives `gemma4_cached_v1` shards
+    /// Gemma 4 multi-stage engine. Drives `gemma4_cached_v1.x` shards
     /// (per-layer-type asymmetric attention, KV-sharing, per-layer
     /// embeddings, baked softcap) produced by `tools/export_gemma4.py`.
     Gemma4,
@@ -910,7 +910,7 @@ fn cmd_engines() -> Result<()> {
     println!("  ov-genai       single-stage openvino_genai.LLMPipeline; FastDraft + Prompt Lookup");
     println!("  ov-runtime     multi-stage stateful KV cache; pre-exported per-stage v3+ shards");
     println!("  ov-dist-spec   multi-stage spec decode (mask-based KV rewind); v5 shards");
-    println!("  gemma4         Gemma 4 multi-stage (per-layer-type attn, KV-sharing, PLI); gemma4_cached_v1 shards");
+    println!("  gemma4         Gemma 4 multi-stage (per-layer-type attn, KV-sharing, PLI, sliding window); gemma4_cached_v1.x shards");
     println!("  sparse-moe     Kimi K2.6 (AVX-512 int4 GEMM + Rust MLA shells) or MiniMax-M2 (OV-IR shells); single-stage top-k expert dispatch");
     println!("  qwen36-moe     Qwen3.6-35B-A3B staged chain (GatedDeltaNet + MoE); qwen3_5_moe IR-surgery shards");
     Ok(())

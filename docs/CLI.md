@@ -410,7 +410,7 @@ OpenVINO GPU plugin can see.
 | `ov-genai` | whole-model OpenVINO IR | Default for `run`. Adds FastDraft speculative decode + prompt lookup. |
 | `ov-runtime` | `cascadia shard` tree | The staged pipeline engine. |
 | `ov-dist-spec` | `cascadia shard` tree | Distributed speculative decode. Every rank must use it. |
-| `gemma4` | `gemma4_cached_v1` shards | Per-layer-type asymmetric attention, KV-sharing, baked softcap. |
+| `gemma4` | `gemma4_cached_v1.x` shards | Per-layer-type asymmetric attention, KV-sharing, baked softcap; v1.1 masks sliding layers to their window (v1 trees warn at load). |
 | `sparse-moe` | `manifest.json` + expert tree | Top-k expert routing through an AVX-512 int4 GEMM. CPU-targeted; single-stage or pipeline-parallel (`--total >= 2`). |
 | `qwen36-moe` | Qwen3.6 surgery output | Greedy-only, batch=1. CPU-targeted decode. |
 
