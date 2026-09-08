@@ -674,6 +674,31 @@ fn read_max_ctx(dir: &Path) -> Option<usize> {
     max
 }
 
+/// The empty think block the official chat template injects for `enable_thinking=false`.
+const THINK_BLOCK: &str = "\n<think>\n\n</think>\n\n";
+
+/// The ids admission prefills for `task`, ahead of any Option-B resume prefix: the rendered
+/// prompt plus the think block when hybrid reasoning is off (prefilling it makes decode start at
+/// the answer instead of reasoning; legacy-rendered prompts only — a chat template injects it
+/// itself, and the API passes `enable_thinking` into the render).
+///
+/// One implementation so `submit`'s window guard and `step_local` cannot size different sequences:
+/// counting the bare prompt let a `max_ctx - 1` prompt through and then prefilled past
+/// `max_position_embeddings`.
+fn admitted_prompt_ids(tok: &Tokenizer, task: &GenerationTask) -> Result<Vec<u32>, String> {
+    let mut ids = tok
+        .encode(task.prompt.as_str(), true)
+        .map_err(|e| e.to_string())?
+        .get_ids()
+        .to_vec();
+    if !task.enable_thinking && !task.prompt.trim_end().ends_with("</think>") {
+        if let Ok(e) = tok.encode(THINK_BLOCK, false) {
+            ids.extend(e.get_ids());
+        }
+    }
+    Ok(ids)
+}
+
 fn map_wire(err: TransportError) -> EngineError {
     EngineError::Backend(format!("qwen36 pipeline wire: {err}"))
 }
@@ -2129,24 +2154,14 @@ impl Qwen36Engine {
             let task = self.pending.remove(0);
             // reset moved below — Issue-34 warm-resume may restore a cached prefix blob instead.
             let tokenizer = self.tokenizer.as_ref().expect("single-box has tokenizer");
-            let mut prompt_ids: Vec<u32> = match tokenizer.encode(task.prompt.as_str(), true) {
-                Ok(e) => e.get_ids().to_vec(),
+            let mut prompt_ids: Vec<u32> = match admitted_prompt_ids(tokenizer, &task) {
+                Ok(ids) => ids,
                 Err(e) => {
                     warn!(task = %task.task_id, error = %e, "tokenize failed");
                     let reason = format!("tokenize failed: {e}");
                     return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
                 }
             };
-            if !task.enable_thinking && !task.prompt.trim_end().ends_with("</think>") {
-                // Hybrid-reasoning off: prefill the empty think block the
-                // official chat template injects for enable_thinking=false,
-                // so decode starts at the answer instead of reasoning.
-                // Legacy-rendered prompts only — a chat template injects
-                // it itself (API passes enable_thinking into the render).
-                if let Ok(e) = tokenizer.encode("\n<think>\n\n</think>\n\n", false) {
-                    prompt_ids.extend(e.get_ids());
-                }
-            }
             // Option B forced-prefix resume: append the already-emitted assistant
             // tokens after the rendered prompt (concat, not replace) so the cold
             // prefill below carries them as context. No-op when not resuming.
@@ -2201,6 +2216,14 @@ impl Qwen36Engine {
             } else {
                 self.max_tokens_default
             } as usize;
+            // The window bounds prompt + completion, not just the prompt: `submit` refuses prompts
+            // at or past `max_ctx`, and this caps the budget so the existing max_tokens stop ends
+            // the turn AT the window instead of decoding past `max_position_embeddings`. `gen_ids`
+            // is pre-seeded with the resume tokens, which `prompt_ids` already carries.
+            let max_tokens = match self.max_ctx {
+                Some(max) => max_tokens.min(resume_seed_len + max.saturating_sub(prompt_ids.len())),
+                None => max_tokens,
+            };
             // Issue-34 warm-resume: restore a cached strict-prefix blob and prefill only the suffix;
             // else cold reset. Gated + best-effort (stub ⇒ no blob ⇒ cold). 0 on the default path.
             let warm_prefix: usize = {
@@ -2519,8 +2542,11 @@ impl Engine for Qwen36Engine {
         // multi-MB prompt is a 413, not an hours-long prefill holding the batch=1 slot.
         if let Some(max) = self.max_ctx {
             if let Some(tok) = &self.tokenizer {
-                if let Ok(enc) = tok.encode(task.prompt.as_str(), true) {
-                    let n = enc.get_ids().len();
+                // The SEQUENCE admission prefills, not the bare prompt: it also carries the
+                // injected think block and the resume prefix, either of which can push a prompt
+                // that passed this guard past the window.
+                if let Ok(ids) = admitted_prompt_ids(tok, &task) {
+                    let n = ids.len() + task.resume_ids().map_or(0, <[i32]>::len);
                     if n >= max {
                         return Err(EngineError::PromptTooLong(format!(
                             "prompt is {n} tokens; the model's window is {max} (max_position_embeddings)"
@@ -3192,13 +3218,78 @@ mod tests {
     /// Minimal real tokenizer: whitespace pre-tokenizer over a one-word
     /// vocab. Enough to reach the post-tokenize admission checks without a
     /// model — `""` encodes to zero ids, which is the case under test.
+    /// The extra pieces are the ones `THINK_BLOCK` splits into, so the
+    /// window guard's think-block arm is reachable here too.
     fn tiny_tokenizer() -> Tokenizer {
         let json = r#"{"version":"1.0","truncation":null,"padding":null,
             "added_tokens":[],"normalizer":null,
             "pre_tokenizer":{"type":"Whitespace"},
             "post_processor":null,"decoder":null,
-            "model":{"type":"WordLevel","vocab":{"hi":0},"unk_token":"[UNK]"}}"#;
+            "model":{"type":"WordLevel",
+                "vocab":{"hi":0,"<":1,">":2,"</":3,"think":4},"unk_token":"[UNK]"}}"#;
         Tokenizer::from_bytes(json.as_bytes()).expect("build tiny tokenizer")
+    }
+
+    /// One `hi` per token, so a prompt's length is its word count.
+    fn windowed_task(id: &str, prompt: &str) -> GenerationTask {
+        let mut t = GenerationTask::new(id, prompt);
+        // Isolate the prompt's own length from the think-block injection.
+        t.enable_thinking = true;
+        t
+    }
+
+    /// "At or past" the window is refused — at-limit is the case the PR promises and the one a
+    /// `>` would leak. An unknown window admits everything (no config.json to read it from).
+    #[test]
+    fn submit_refuses_prompts_at_or_past_the_window() {
+        let mut e = bare_engine(1, "{}");
+        e.tokenizer = Some(tiny_tokenizer());
+        e.max_ctx = Some(4);
+
+        assert!(e.submit(windowed_task("under", "hi hi hi")).is_ok());
+        assert!(matches!(
+            e.submit(windowed_task("at", "hi hi hi hi")),
+            Err(EngineError::PromptTooLong(_))
+        ));
+        assert!(matches!(
+            e.submit(windowed_task("past", "hi hi hi hi hi")),
+            Err(EngineError::PromptTooLong(_))
+        ));
+
+        e.max_ctx = None;
+        assert!(
+            e.submit(windowed_task("no-window", "hi hi hi hi hi hi"))
+                .is_ok(),
+            "an unstated max_position_embeddings must not refuse anything"
+        );
+    }
+
+    /// The guard must size the sequence admission PREFILLS, not the bare prompt: admission appends
+    /// the injected think block and the Option-B resume prefix after the point this used to check,
+    /// so a prompt just under the window prefilled past `max_position_embeddings`.
+    #[test]
+    fn submit_counts_the_think_block_and_the_resume_prefix() {
+        let mut e = bare_engine(1, "{}");
+        e.tokenizer = Some(tiny_tokenizer());
+        e.max_ctx = Some(5);
+
+        // Same 3-token prompt: fits with hybrid reasoning on, refused with it off because
+        // admission then prefills the empty think block too.
+        assert!(e.submit(windowed_task("thinking", "hi hi hi")).is_ok());
+        assert!(
+            matches!(
+                e.submit(GenerationTask::new("no-thinking", "hi hi hi")),
+                Err(EngineError::PromptTooLong(_))
+            ),
+            "the injected think block is prefilled, so it counts against the window"
+        );
+
+        let mut resuming = windowed_task("resuming", "hi hi");
+        resuming.resume_token_ids = Some(vec![0, 0, 0]);
+        assert!(
+            matches!(e.submit(resuming), Err(EngineError::PromptTooLong(_))),
+            "the resume prefix is prefilled with the prompt, so it counts too"
+        );
     }
 
     /// A prompt that tokenizes to nothing is REJECTED at admission — the
