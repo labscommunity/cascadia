@@ -315,7 +315,10 @@ pub struct WorkerArgs {
     /// a prompt that extends a cached prefix (TTFT ≈ restore + the new tail
     /// instead of a full re-prefill). Default: the smaller of 16 GiB and a
     /// quarter of physical RAM. 0 disables. Single-process (`--total 1`) only;
-    /// a Qwen3.8-27B snapshot is ~64 KB per context token (2.2 GB at 32 K).
+    /// a Qwen3.8-27B snapshot is ~130 KB per context token as serialised
+    /// (1.2 GB at 8 K, 4.45 GB at 32 K). The cache is process-wide and not
+    /// tenant-scoped, so a multi-tenant deployment should run one process per
+    /// tenant or pass 0.
     #[arg(long)]
     pub prefix_cache_gb: Option<f64>,
 
@@ -994,6 +997,19 @@ fn parse_addr(s: &str, default_host: &str) -> Result<(String, u16)> {
 /// Lunar Lake), versus ~1 s when the cache is warm. PowerInfer's
 /// SmallThinker fork ships an equivalent default in `llama-cli`. We
 /// match that operator UX.
+fn resolve_ov_cache_dir(arg: Option<&str>) -> Option<String> {
+    match arg {
+        Some("") => None,
+        Some(p) => Some(p.to_string()),
+        None => dirs::cache_dir().map(|p| {
+            p.join("cascadia")
+                .join("ov-cache")
+                .to_string_lossy()
+                .into_owned()
+        }),
+    }
+}
+
 /// Byte budget for the qwen35 prefix cache: the flag when given (0 = off), else the smaller
 /// of 16 GiB and a quarter of physical RAM (a 64 GB box gets 16 GiB, a 32 GB UMA box 8 GiB —
 /// the weights already take 16-28 GB there).
@@ -1062,19 +1078,6 @@ fn resolve_api_max_body_bytes(mb: f64) -> Result<usize> {
         ));
     }
     Ok((mb * (1u64 << 20) as f64) as usize)
-}
-
-fn resolve_ov_cache_dir(arg: Option<&str>) -> Option<String> {
-    match arg {
-        Some("") => None,
-        Some(p) => Some(p.to_string()),
-        None => dirs::cache_dir().map(|p| {
-            p.join("cascadia")
-                .join("ov-cache")
-                .to_string_lossy()
-                .into_owned()
-        }),
-    }
 }
 
 /// True when `device` names an OpenVINO NPU plugin (e.g. "NPU", "NPU.0").
