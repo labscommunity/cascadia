@@ -12,8 +12,12 @@ Qwen3.8 specifics: `docs/architectures/qwen3.8.md`.
 - `export_qwen36_moe.py` — cuts the official IR into stage shards + manifest.
 
 ## Fixtures
-- `golden/qwen36_parity_64.json` — token-parity golden consumed by
-  `crates/cascadia-engine-openvino/tests/qwen36_parity.rs`.
+- `golden/qwen36_parity_64.json`, `golden/qwen38_parity_64.json` —
+  token-parity goldens consumed by
+  `crates/cascadia-engine-openvino/tests/qwen36_parity.rs`. Point it at an
+  exported tree with `QWEN36_SHARDS` / `QWEN38_SHARDS`; rewrite a golden
+  after an intentional change with `QWEN36_WRITE_GOLDEN=1` /
+  `QWEN38_WRITE_GOLDEN=1`.
 - `golden/promptset_*.json`, `promptset.json` — prompt sets for the
   diagnostics below.
 

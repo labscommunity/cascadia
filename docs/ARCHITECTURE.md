@@ -11,7 +11,7 @@ Cascadia is a Cargo workspace at the repo root. Each crate has a single responsi
 
 ## `cascadia-api`
 
-OpenAI-compatible HTTP server (axum). Routes: `/health`, `/v1/models`, `/v1/chat/completions` (non-streaming + SSE streaming), `/v1/cancel/<task_id>`. Backpressure via a concurrent-request semaphore (default 16); request body cap (default 64 KiB) and prompt cap (default 32 KiB) enforce 413 / 503 responses on oversized or over-capacity input.
+OpenAI-compatible HTTP server (axum). Routes: `/health`, `/v1/models`, `/v1/chat/completions` (non-streaming + SSE streaming), `/v1/cancel/<task_id>`. Backpressure via a concurrent-request semaphore (default 16); request body cap and rendered-prompt cap (both `--api-max-body-mb`, default 1 MiB, on every engine) enforce 413 / 503 responses on oversized or over-capacity input.
 
 ## `cascadia-runner`
 

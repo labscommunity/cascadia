@@ -134,7 +134,7 @@ a few each. MiniMax-M2 `sparse-moe` only.
 | `--ov-num-threads <N>` | — | Host CPU thread cap (`INFERENCE_NUM_THREADS`). CPU plugin only. |
 | `--ov-allow-auto-batching` | off | Allow GPU-plugin internal auto-batching. |
 | `--ov-execution-mode <MODE>` | — | `ACCURACY` / `PERFORMANCE`. |
-| `--prefix-cache-gb <GB>` | min(16, RAM/4) | `qwen35` only, single-process (`--total 1`): byte budget of the chain-state prefix cache; a Qwen3.8-27B snapshot is ~64 KB per context token (+~150 MB). `0` disables. See [qwen3.8.md](architectures/qwen3.8.md). |
+| `--prefix-cache-gb <GB>` | min(16, RAM/4) | `qwen35` only, single-process (`--total 1`): byte budget of the chain-state prefix cache; a Qwen3.8-27B snapshot is ~130 KB per context token as serialised (1.2 GB at 8 K, 4.45 GB at 32 K). `0` disables. See [qwen3.8.md](architectures/qwen3.8.md). |
 | `--api-max-body-mb <MB>` | `1` | Largest `/v1/chat/completions` body (MiB); the rendered prompt is capped alike. Was a fixed 64 KiB / 32 KiB (~8K tokens) before. `qwen35` additionally rejects prompts at or past `max_position_embeddings` (413). |
 
 **`--ov-cache-dir` is on by default and matters.** For `ov-genai`, `ov-runtime`,

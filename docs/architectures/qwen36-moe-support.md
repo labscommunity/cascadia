@@ -386,11 +386,12 @@ must be up before its upstream dials:
 
 ```bash
 # Node B (rank 1 of 2: stage 1 + logits head):
-cascadia worker --rank 1 --total 2 --engine qwen36-moe \
+# (`qwen36-moe` remains an alias for `qwen35`.)
+cascadia worker --rank 1 --total 2 --engine qwen35 \
   --model /path/to/qwen36-shards-2stage --device CPU --listen :9100
 
 # Node A (rank 0: embeddings + stage 0 + tokenizer + API):
-cascadia worker --rank 0 --total 2 --engine qwen36-moe \
+cascadia worker --rank 0 --total 2 --engine qwen35 \
   --model /path/to/qwen36-shards-2stage --device CPU \
   --next <node-b-host>:9100 --api :8000
 ```
