@@ -410,6 +410,88 @@ prompts by default, which the staged engine's always-on prefix cache (above)
 now covers for the same repeated-prefix case — what remains is the cold
 prefill throughput gap.
 
+### Second pass — 2026-09-08, review-fix tip `62d8daa6`
+
+Same box, same trees (`qwopus-2stage`, the Qwopus int4 whole IR), same
+scripts and budgets as the first pass, rebuilt from the branch tip after the
+2026-09-08 review round (msvc, GenAI 2026.2.1 for `qwen35`; GenAI 2026.3.0
+for the `ov-genai` row). First-pass values in parentheses. Every answer
+below was correct and every warm text equalled its cold text (7 of 7 turns
+at 8 K, 7 of 7 at 32 K, 9 of 9 on the eviction run).
+
+**Functional** (`qwen35`, 2-stage, B390, greedy, thinking off): capital of
+France → `Paris`; `17 * 23` → `391`; first five primes → `2, 3, 5, 7, 11`;
+a two-turn conversation recalls the user's name; `max_tokens: 8` ends with
+`finish_reason: "length"` and a natural stop with `"stop"`; a streaming
+request emits its chunks, a final chunk carrying the reason, then `[DONE]`;
+a 1.5 MB body is a 413 at the default 1 MiB cap; thinking on with the
+default, `low`, `medium`, `xhigh` and thinking off all 200.
+
+**Throughput** (19-token prompt, 96-token completion, greedy, `tok/s` =
+completion tokens / whole-request wall time; load = launch → `/v1/models`):
+
+| path | SDK | device | load | 96-token request | tok/s |
+|---|---|---|---|---|---|
+| `--engine qwen35`, 2-stage | GenAI 2026.2.1 | B390 iGPU | 28 s (41 s) | 14.5–14.6 s (15.0–15.6 s) | **6.6** (6.2–6.4) |
+| `--engine qwen35`, 2-stage | GenAI 2026.2.1 | CPU | 35 s (~80 s) | 33.4–34.5 s (32.2 s) | 2.8–2.9 (3.0) |
+| `--engine ov-genai`, whole IR | GenAI 2026.3.0 | B390 iGPU | 35 s (~60 s) | 12.7–13.1 s (13.2 s) | **7.4–7.6** (7.3) |
+
+**Context capacity** (raw IR probe, Qwopus int4, B390, 512-token prefill
+chunks, 16 greedy tokens, fresh process per point):
+
+| prompt tokens | TTFT | prefill tok/s | decode tok/s | resident at decode |
+|---|---|---|---|---|
+| 1 K | 2.4 s (2.4) | 428 (425) | 6.2 (6.1) | 17.1 GB (17.1) |
+| 4 K | 8.5 s (8.1) | 482 (505) | 6.4 (6.4) | 18.2 GB (18.1) |
+| 8 K | 16.0 s (15.5) | 512 (527) | 6.0 (6.1) | 19.1 GB (19.1) |
+| 16 K | 33.5 s (32.8) | 489 (500) | 6.2 (6.2) | 19.6 GB (19.5) |
+| 32 K | 79.1 s (78.5) | 414 (417) | 5.0 (5.1) | 20.5 GB (20.8) |
+| 64 K | 209 s (219) | 313 (299) | 4.1 (4.0) | 21.9 GB (21.9) |
+| 128 K | 651 s (667) | 201 (196) | 3.1 (3.1) | 26.9 GB (25.1) |
+| 256 K | 2813 s = 47 min (3256 s) | 93 (81) | 2.4 (2.5) | 31.9 GB (31.9) |
+
+**Prefix cache** (same 4-turn script, cache off → on, whole-request wall
+time; `_ttft` rows are `max_tokens: 1`):
+
+| first turn | turn | prompt tokens | cache off | cache on | speed-up |
+|---|---|---|---|---|---|
+| 8 K | 1 (cold, + two snapshots) | 8218 | 18.3 s (17.8) | 23.8 s (23.4) | 0.8× |
+| 8 K | 2 TTFT | 8247 | 17.7 s | **2.2 s** (2.1) | 7.9× |
+| 8 K | 2 (7 tokens) | 8247 | 16.7 s | 2.8 s | 5.9× |
+| 8 K | 3 TTFT | 8276 | 16.6 s | **2.1 s** (2.0) | 7.9× |
+| 8 K | 3 (5 tokens) | 8276 | 17.0 s | 2.5 s | 6.8× |
+| 8 K | new conversation, same system prompt, TTFT | 8215 | 16.0 s | **1.9 s** (1.9) | 8.6× |
+| 8 K | same, 15 tokens | 8215 | 18.5 s | 4.0 s | 4.6× |
+| 32 K | 1 (cold, + two snapshots) | 32800 | 91.8 s (92.9) | 112.6 s (111.3) | 0.8× |
+| 32 K | 2 TTFT | 32829 | 91.2 s | **5.8 s** (5.5) | 15.7× |
+| 32 K | 2 (7 tokens) | 32829 | 90.4 s | 6.9 s | 13.1× |
+| 32 K | 3 TTFT | 32858 | 90.1 s | **5.6 s** (5.7) | 16.2× |
+| 32 K | 3 (5 tokens) | 32858 | 91.5 s | 6.3 s | 14.5× |
+| 32 K | new conversation, same system prompt, TTFT | 32797 | 90.6 s | **5.8 s** (5.8) | 15.6× |
+| 32 K | same, 15 tokens | 32797 | 92.9 s | 7.4 s | 12.6× |
+
+Snapshots: 1.23 GB in 2.5 s at 8 K, 4.45 GB in 9.4–10.1 s at 32 K; restores
+1.36–1.39 s at 8 K, 4.3–5.1 s at 32 K. Eviction-pressure run (8 K,
+`--prefix-cache-gb 3`, 2,500-token turn): the refresh evicted the old
+boundary (`key_len=8211`), the long turn's TTFT was 12.6 s (11.8), the next
+turn 2.4 s (2.3), and the new conversation on the shared system prompt
+started warm at 1.9 s (1.9).
+
+**Post-turn reset cost** (the `reset_s` / `recreate` fields on the
+`qwen36 task done` log line, added in this round). Every warm turn ends in
+`recreate_request()` per stage: measured **0.6–0.9 ms** on every warm turn
+at both 8 K and 32 K. The cold turns' `reset_state` is the slower path
+(2–45 ms at 8 K, 82–135 ms at 32 K). Nothing to optimise.
+
+**Parity goldens**: `qwen38_greedy_parity` and `qwen36_greedy_parity`
+both verify against their blessed goldens through the harness that now
+sets `enable_thinking = true` (54.5 s and 60.9 s).
+
+**Regression** (Qwen3.6-35B-A3B, 2-stage): `--engine qwen35` 20.2 tok/s
+over 64 tokens; the manifest stripped to the Qwen3.6-era keys served
+through the `--engine qwen36-moe` alias at 21.2 tok/s (the `hidden_size`
+default is now `qwen3_5_moe`-only); `17 * 23` → `391` on both.
+
 ## Limits and follow-ups
 
 - **Greedy-only, batch=1** on the staged path (DeltaNet state cannot be
