@@ -3416,6 +3416,45 @@ mod tests {
         assert!(e.active.is_none(), "failed task must clear active state");
     }
 
+    /// `cancel()` must reset the stage requests, not just drop the task. A prefix-cache hit
+    /// restores over the LIVE requests with no reset of its own (the certified sequence is
+    /// reset → prime → set_state), so a cancelled turn's mid-prefill state would be the base the
+    /// next restore writes onto. `reset_all` clears `primed` unconditionally, which is the part
+    /// observable without a compiled stage.
+    #[test]
+    fn cancel_resets_the_stage_requests() {
+        let mut e = bare_engine(1, "{}");
+        e.primed = true;
+        e.active = Some(ActiveTask {
+            task_id: "t0".into(),
+            tenant: String::new(),
+            prompt_ids: vec![1, 2, 3],
+            prefill_idx: 2,
+            step: 2,
+            warm_prefix: 0,
+            snapshot_at: Vec::new(),
+            logits: Vec::new(),
+            next_token: None,
+            gen_ids: Vec::new(),
+            emitted: Vec::new(),
+            resume_seed_len: 0,
+            max_tokens: 16,
+            started: Instant::now(),
+            snapshot_secs: 0.0,
+            wire_ms: Vec::new(),
+        });
+
+        let id: TaskId = "t0".into();
+        e.cancel(&id);
+
+        assert!(e.active.is_none(), "cancel must free the engine slot");
+        assert!(
+            !e.primed,
+            "cancel must reset the stage requests, or the next restore lands on the cancelled \
+             turn's mid-prefill state"
+        );
+    }
+
     /// Without a mailbox this rank refuses the plane trigger, the head falls back to its local KV,
     /// and the whole plane no-ops on qwen36 (rig: dist-spec PLANE 6/10, `plane_pulled=false`).
     #[cfg(feature = "kv_coord")]
