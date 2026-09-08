@@ -300,6 +300,12 @@ impl PrefixCache {
             bytes,
             last_used: self.tick,
         });
+        // `live` is what bounds a multi-GB cache; every add, replace and evict has to
+        // agree with the entries it accounts for.
+        debug_assert_eq!(
+            self.live,
+            self.entries.iter().map(|e| e.bytes).sum::<usize>()
+        );
         true
     }
 
@@ -429,6 +435,9 @@ pub fn plan_snapshots(
 /// span ends exactly on it (the chain state is captured right after that
 /// span). `snapshot_at` is ascending.
 pub fn next_prefill_end(idx: usize, len: usize, chunk: usize, snapshot_at: &[usize]) -> usize {
+    // The search below takes the first entry past `idx` in LIST order, which is the
+    // nearest boundary only while the list ascends.
+    debug_assert!(snapshot_at.windows(2).all(|w| w[0] < w[1]));
     let mut end = (idx + chunk.max(1)).min(len);
     if let Some(&b) = snapshot_at.iter().find(|&&b| b > idx) {
         if b < end {
@@ -481,10 +490,27 @@ mod tests {
         assert!(c.longest_prefix(&key(30, 0)).is_some());
         assert!(c.insert(key(20, 200), blob(40)));
         assert_eq!(c.len(), 2);
-        assert!(c.live_bytes() <= 100);
+        assert_eq!(c.live_bytes(), 80, "one victim was enough for 40 + 40");
         assert!(c.contains(&key(20, 0)), "recently used survives");
         assert!(!c.contains(&key(20, 100)), "LRU evicted");
         assert!(c.contains(&key(20, 200)));
+    }
+
+    #[test]
+    fn evicts_as_many_entries_as_the_new_one_needs() {
+        // Three 30-byte entries fill 90 of 100; a 70-byte snapshot needs two victims.
+        let mut c = PrefixCache::new(100);
+        for seed in [0, 100, 200] {
+            assert!(c.insert(key(20, seed), blob(30)));
+        }
+        assert_eq!((c.len(), c.live_bytes()), (3, 90));
+        assert!(c.insert(key(20, 300), blob(70)));
+        assert_eq!((c.len(), c.live_bytes()), (2, 100));
+        assert!(
+            !c.contains(&key(20, 0)) && !c.contains(&key(20, 100)),
+            "the two oldest go"
+        );
+        assert!(c.contains(&key(20, 200)) && c.contains(&key(20, 300)));
     }
 
     #[test]
