@@ -252,21 +252,19 @@ fn parse_header(b: &[u8]) -> (u32, u32, u32) {
     (f(0), f(4), f(8))
 }
 
-fn legacy_hidden() -> usize {
-    LEGACY_HIDDEN
-}
-
 #[derive(Debug, serde::Deserialize)]
 struct Manifest {
-    /// HF model_type of the source IR: `qwen3_5_moe` (Qwen3.5/3.6) or
-    /// `qwen3_5` (dense Qwen3.8). Anything else is not a surgery tree
-    /// this engine can drive.
+    /// HF model_type of the source IR. Any `qwen3_5`-PREFIXED type is
+    /// accepted — `qwen3_5_moe` (Qwen3.5/3.6) and `qwen3_5` (dense
+    /// Qwen3.8) are the ones that ship, and a later `qwen3_5*` cut of
+    /// the same surgery drives the same way. Anything else is not a
+    /// surgery tree this engine can drive.
     arch: String,
     /// Activation width the stage IRs exchange ([1, T, hidden_size]).
-    /// Absent in trees cut before the exporter wrote it (Qwen3.6 era,
-    /// always 2048).
-    #[serde(default = "legacy_hidden")]
-    hidden_size: usize,
+    /// Required except on `qwen3_5_moe`, the one arch whose trees were
+    /// cut before the exporter wrote the key (always 2048 there) — see
+    /// [`Manifest::hidden`].
+    hidden_size: Option<usize>,
     /// Exporter sliced the last stage's logits to the final position
     /// ([1,1,vocab]); the engine then skips its own row slicing. Absent
     /// in pre-slice shard trees (default false).
@@ -284,10 +282,35 @@ impl Manifest {
                 m.arch
             ));
         }
-        if m.hidden_size == 0 {
+        // A missing key defaults to 2048 only for the arch that shipped without it. Anywhere else
+        // (a dense tree with the key misspelled, say) the default is a wrong width that survives
+        // load and dies at the first inference as an opaque OV shape error.
+        if m.hidden_size.is_none() && m.arch != "qwen3_5_moe" {
+            return Err(format!(
+                "manifest.json: hidden_size is required for arch {:?}",
+                m.arch
+            ));
+        }
+        if m.hidden() == 0 {
             return Err("manifest hidden_size must be > 0".into());
         }
+        // The chain is built in manifest order, so an entry that declares a different index would
+        // silently chain the stages in the wrong order.
+        for (i, s) in m.stages.iter().enumerate() {
+            if s.stage != i {
+                return Err(format!(
+                    "manifest.json: stages are chained in manifest order, but entry {i} declares stage {}",
+                    s.stage
+                ));
+            }
+        }
         Ok(m)
+    }
+
+    /// Activation width. `parse` has rejected an absent key on every arch but `qwen3_5_moe`, whose
+    /// pre-key trees are all 2048.
+    fn hidden(&self) -> usize {
+        self.hidden_size.unwrap_or(LEGACY_HIDDEN)
     }
 }
 
@@ -481,7 +504,7 @@ impl Builder for Qwen36Builder {
         let mut progress = vec![LoadProgress::message(format!(
             "qwen35 ({}, hidden {}): {} stages from {} (rank {}/{})",
             manifest.arch,
-            manifest.hidden_size,
+            manifest.hidden(),
             manifest.stages.len(),
             dir.display(),
             self.rank,
@@ -556,7 +579,7 @@ impl Builder for Qwen36Builder {
 
         self.manifest_json = Some(manifest_raw);
         self.last_logits_only = manifest.last_logits_only;
-        self.hidden = manifest.hidden_size;
+        self.hidden = manifest.hidden();
         self.stages = Some(stages);
         progress.push(LoadProgress::ready());
         Ok(Box::pin(stream::iter(progress)))
@@ -919,10 +942,19 @@ impl Qwen36Engine {
         emb.set_input(&name, DType::I64, &[1, toks.len()], &le_bytes_i64(&ids))
             .map_err(map_ov)?;
         emb.infer().map_err(map_ov)?;
-        let (dtype, _shape, bytes) = emb.output(0).map_err(map_ov)?;
+        let (dtype, shape, bytes) = emb.output(0).map_err(map_ov)?;
         if !matches!(dtype, DType::F32) {
             return Err(EngineError::Backend(format!(
                 "embeddings output dtype {dtype:?}, expected f32"
+            )));
+        }
+        // The IR's own width against the manifest's: a wrong `hidden_size` otherwise reaches the
+        // stages as a shape the chain declares differently, and OV reports it as an opaque
+        // reshape failure deep in stage0. Free here, and it fires at warmup.
+        if shape.last() != Some(&self.hidden) {
+            return Err(EngineError::Backend(format!(
+                "embeddings output shape {shape:?} does not end in the manifest's hidden_size {}",
+                self.hidden
             )));
         }
         Ok(f32_from_le(&bytes))
@@ -3018,16 +3050,42 @@ mod tests {
     #[test]
     fn manifest_hidden_defaults_to_legacy_and_reads_dense() {
         let legacy = Manifest::parse(r#"{"arch":"qwen3_5_moe","stages":[]}"#).unwrap();
-        assert_eq!(legacy.hidden_size, 2048);
+        assert_eq!(legacy.hidden(), 2048);
         assert!(!legacy.last_logits_only);
         let dense = Manifest::parse(
             r#"{"arch":"qwen3_5","hidden_size":5120,"num_layers":64,"last_logits_only":true,
                 "stages":[{"stage":0,"layer_start":0,"layer_end":31}]}"#,
         )
         .unwrap();
-        assert_eq!(dense.hidden_size, 5120);
+        assert_eq!(dense.hidden(), 5120);
         assert!(dense.last_logits_only);
         assert_eq!(dense.stages.len(), 1);
+    }
+
+    /// 2048 is the width of the trees that shipped BEFORE the key existed, all of them
+    /// `qwen3_5_moe`. Defaulting a dense tree to it produces a manifest that loads and then dies
+    /// at the first inference on an opaque OV shape error (the IR emits [1,n,5120]).
+    #[test]
+    fn manifest_requires_hidden_size_off_the_legacy_arch() {
+        let err = Manifest::parse(r#"{"arch":"qwen3_5","stages":[]}"#).unwrap_err();
+        assert!(err.contains("hidden_size"), "{err}");
+        assert!(
+            err.contains("qwen3_5"),
+            "the error must name the arch: {err}"
+        );
+    }
+
+    /// The chain is built in manifest order, so a mis-ordered entry would chain the stages wrong
+    /// (and, in pipeline mode, hand a rank the other rank's layers) without a word.
+    #[test]
+    fn manifest_rejects_stages_out_of_order() {
+        let err = Manifest::parse(
+            r#"{"arch":"qwen3_5","hidden_size":5120,"stages":[
+                {"stage":1,"layer_start":32,"layer_end":63},
+                {"stage":0,"layer_start":0,"layer_end":31}]}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("stage"), "{err}");
     }
 
     #[test]
