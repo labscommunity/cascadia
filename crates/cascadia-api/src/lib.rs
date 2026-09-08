@@ -1271,33 +1271,39 @@ fn render_or_fallback(
     // vocabulary reject it with raise_exception — Qwen3.8's accepts only
     // xhigh/medium/low and `default('xhigh')`s the undefined case — which
     // turned every default chat request into a 400. When the rejection names
-    // the effort, render again with the caller's own word (a template with a
-    // low/medium scale honours it directly), then with it undefined so the
-    // template's own default applies. A word the caller chose that no
-    // vocabulary accepts still ends at the template default rather than a 400:
-    // the mapped value, not the caller's, is what the template saw first.
-    let rejects_effort = |r: &Result<String, PromptRenderError>| matches!(r, Err(PromptRenderError::Rejected(m)) if m.to_ascii_lowercase().contains("reasoning effort"));
+    // the effort, render again once: with the caller's own word if it differs
+    // from the mapping (a template with a low/medium scale honours it
+    // directly), otherwise with the effort undefined so the template's own
+    // default applies. Only the API's own word is discarded that way. A
+    // distinct word the caller chose and the template rejected stays a
+    // rejection (the 400 below) — serving it at the template's default would
+    // silently drop a parameter the caller believed had taken effect.
+    //
+    // Substring match, coupled to the templates' `raise_exception` prose:
+    // Qwen3.8 says "Unexpected reasoning effort ...", and the underscore
+    // spelling covers a template that names the parameter instead.
+    let rejects_effort = |r: &Result<String, PromptRenderError>| {
+        matches!(r, Err(PromptRenderError::Rejected(m)) if {
+            let m = m.to_ascii_lowercase();
+            m.contains("reasoning effort") || m.contains("reasoning_effort")
+        })
+    };
     if reasoning_effort.is_some() && rejects_effort(&first) {
-        let raw = raw_effort.filter(|r| Some(*r) != reasoning_effort);
-        for candidate in raw.into_iter().map(Some).chain(std::iter::once(None)) {
-            tracing::info!(
-                mapped = ?reasoning_effort,
-                retry = ?candidate,
-                "chat_template rejected the mapped reasoning_effort; rendering again"
-            );
-            first = render_with_chat_env(
-                env,
-                messages,
-                bos_token,
-                eos_token,
-                enable_thinking,
-                candidate,
-                tools,
-            );
-            if !rejects_effort(&first) {
-                break;
-            }
-        }
+        let retry = raw_effort.filter(|r| Some(*r) != reasoning_effort);
+        tracing::info!(
+            mapped = ?reasoning_effort,
+            retry = ?retry,
+            "chat_template rejected the mapped reasoning_effort; rendering again"
+        );
+        first = render_with_chat_env(
+            env,
+            messages,
+            bos_token,
+            eos_token,
+            enable_thinking,
+            retry,
+            tools,
+        );
     }
     match first {
         Ok(s) => Ok(s),
@@ -1804,8 +1810,9 @@ async fn chat_completions(
     // applied to every model this server serves, not just GLM-5. A template
     // with its own scale (Qwen3.8: xhigh/medium/low) rejects the mapped word;
     // render_or_fallback then retries with the caller's own word, so a
-    // client's "low" reaches such a template unescalated, and last with the
-    // effort undefined (the template's default).
+    // client's "low" reaches such a template unescalated — or, when the caller
+    // sent nothing of their own, with the effort undefined (the template's
+    // default). A caller word the template also rejects is a 400.
     let prompt = match render_prompt(
         &state,
         &req.messages,
@@ -4439,7 +4446,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "effort=low");
-        // A caller word no vocabulary accepts ends at the template default.
+        // The caller sent the API's own word: nothing of theirs is lost by
+        // falling through to the template default.
         let out = render_or_fallback(
             Some(&env),
             &msgs,
@@ -4447,11 +4455,29 @@ mod tests {
             "",
             true,
             Some("high"),
-            Some("bogus"),
+            Some("high"),
             None,
         )
         .unwrap();
         assert_eq!(out, "effort=xhigh");
+        // A caller word of their own that the template rejects is a 400, not a
+        // silent downgrade to the template default: "hgih" is a typo, and
+        // answering at xhigh hides that the parameter was discarded.
+        let err = render_or_fallback(
+            Some(&env),
+            &msgs,
+            "",
+            "",
+            true,
+            Some("high"),
+            Some("hgih"),
+            None,
+        )
+        .expect_err("the caller's own rejected word must surface");
+        assert!(
+            matches!(&err, PromptRenderError::Rejected(m) if m.contains("hgih")),
+            "expected the template's message about the caller's word: {err:?}"
+        );
         // A rejection that is not about the effort is still surfaced.
         let env = build_chat_env("{{ raise_exception('no tools here') }}").unwrap();
         assert!(matches!(
@@ -4467,6 +4493,68 @@ mod tests {
             ),
             Err(PromptRenderError::Rejected(_))
         ));
+    }
+
+    /// End to end over HTTP: the handler must hand `req.reasoning_effort` to
+    /// `render_or_fallback` as the raw word, or a caller's "low" is lost when
+    /// the family's template rejects the GLM mapping. The mock engine echoes
+    /// the prompt back word by word, so the completion text *is* the rendered
+    /// prompt.
+    #[tokio::test]
+    async fn http_request_reaches_the_template_with_the_callers_effort() {
+        const T: &str = "{%- if reasoning_effort is defined and reasoning_effort not in ['xhigh', 'medium', 'low'] -%}\
+{{ raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh (default), medium, and low.') }}\
+{%- endif -%}effort={{ reasoning_effort | default('xhigh') }}";
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some(T.to_string()),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "low",
+                "stream": false,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {v}");
+        let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+        assert_eq!(
+            content.trim(),
+            "effort=low",
+            "the template saw the mapped word, not the caller's"
+        );
+    }
+
+    /// The rejection match is a substring test against the template's own
+    /// prose. A template that spells the parameter `reasoning_effort` must
+    /// trigger the same retry, not the blanket 400 this ladder exists to fix.
+    #[test]
+    fn underscore_wording_in_the_rejection_still_triggers_the_retry() {
+        const T: &str = "{%- if reasoning_effort is defined and reasoning_effort not in ['xhigh', 'medium', 'low'] -%}\
+{{ raise_exception('reasoning_effort ' ~ reasoning_effort ~ ' is not supported') }}\
+{%- endif -%}effort={{ reasoning_effort | default('xhigh') }}";
+        let env = build_chat_env(T).unwrap();
+        let msgs = [msg("user", "hi")];
+        let out =
+            render_or_fallback(Some(&env), &msgs, "", "", true, Some("high"), None, None).unwrap();
+        assert_eq!(out, "effort=xhigh");
     }
 
     #[test]
