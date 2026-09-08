@@ -301,13 +301,27 @@ stage reset has failed (`stages_dirty`), and `cancel()` resets so the next
 admission always starts from the certified reset → prime → restore order.
 DeltaNet state cannot be trimmed, so this
 is snapshot-at-boundary caching: a hit costs one `set_state_blob` per stage
-(a memcpy of ~64 KB per cached token plus ~150 MB of recurrent state) and
-the tail's prefill; a miss costs a full prefill plus one snapshot copy of
-the same size. `--prefix-cache-gb` sets the budget (default min(16 GiB, RAM/4); 0 disables;
-a Qwen3.8-27B snapshot is 2.2 GB at 32 K tokens, 8.5 GB at 128 K). Single
-process only: in pipeline mode (`--total > 1`) the downstream ranks' state
-is not local, which the `kv_coord` coordination plane covers with its
-CAPTURE/RESTORE frames (that plane's blob framing is shared with this cache).
+(a memcpy of ~130 KB per context token as serialised by `get_state_blob`,
+plus ~150 MB of recurrent state) and the tail's prefill; a miss costs a full
+prefill plus one snapshot copy of the same size. That is roughly 2× the f16
+KV footprint quoted above (the serialised form is what `get_state_blob`
+returns; the cause was not isolated). `--prefix-cache-gb` sets the budget (default
+min(16 GiB, RAM/4); 0 disables; measured 1.2 GB at 8 K and 4.45 GB at 32 K,
+so ~17 GB at 128 K — a single 128 K snapshot does not fit the default
+budget). Single process only: in pipeline mode (`--total > 1`) the
+downstream ranks' state is not local, which the `kv_coord` coordination
+plane covers with its CAPTURE/RESTORE frames (the framing helpers
+`frame_blobs`/`unframe_blobs` live in `prefix_cache.rs` and are re-exported
+to that plane; the in-process cache stores its parts unframed, so no u32
+length bound applies to them).
+
+The cache is **process-wide and not tenant-scoped**: entries are keyed by
+token prefix alone, unlike the `kv_coord` plane, which namespaces captures
+by tenant and is never cross-tenant. The community API never sets a tenant,
+so nothing crosses tenants today, but a hit or miss is observable through
+TTFT — a multi-tenant deployment should run one process per tenant or pass
+`--prefix-cache-gb 0`.
+
 The `ov-genai` path has its own prefix cache inside GenAI's PagedAttention
 backend (1.2 s repeat-prompt TTFT at 8 K in the table below).
 
@@ -391,9 +405,10 @@ worse); the stateful path's prefill kernels are ~1.9× behind GenAI's
 PagedAttention path at 8K, which is the big cold-TTFT gap and needs a
 paged-KV execution model in the engine, not a constant; in pipeline mode
 each chunk crosses all stages before the next starts, so multi-box prefill
-does not overlap stages today; and GenAI's path already prefix-caches
-repeated prompts by default, which the staged engine matches only through
-the `kv_coord` warm resume above.
+does not overlap stages today; and GenAI's path prefix-caches repeated
+prompts by default, which the staged engine's always-on prefix cache (above)
+now covers for the same repeated-prefix case — what remains is the cold
+prefill throughput gap.
 
 ## Limits and follow-ups
 
