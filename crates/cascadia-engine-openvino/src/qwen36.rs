@@ -1110,13 +1110,21 @@ impl Qwen36Engine {
             }
             self.kv_capture_local(&t.tenant, tokens);
         }
-        self.reset_all();
+        // Measured BEFORE the reset: the scrub is teardown, not generation, and
+        // folding it in was deflating the reported decode rate.
         let elapsed = t.started.elapsed().as_secs_f64();
         let tok_s = if elapsed > 0.0 {
             t.gen_ids.len() as f64 / elapsed
         } else {
             0.0
         };
+        // Which branch `reset_all` will take, sampled before the call clears
+        // `state_restored`. With the prefix cache always on, every warm turn
+        // pays `recreate_request()` per stage — `reset_s` is what that costs.
+        let recreate = self.state_restored || self.stages_dirty;
+        let reset_t0 = Instant::now();
+        self.reset_all();
+        let reset_s = reset_t0.elapsed().as_secs_f64();
         info!(
             task = %t.task_id,
             prompt_tokens = t.prompt_ids.len(),
@@ -1124,6 +1132,8 @@ impl Qwen36Engine {
             tokens = t.gen_ids.len(),
             elapsed_s = elapsed,
             tok_s,
+            reset_s,
+            recreate,
             "qwen36 task done"
         );
         if !t.wire_ms.is_empty() {
