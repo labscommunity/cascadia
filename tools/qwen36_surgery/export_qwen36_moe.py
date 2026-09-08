@@ -94,9 +94,25 @@ def spec_from_config(raw: dict) -> ModelSpec:
             "(looked under text_config and at the top level)"
         )
     layer_types = cfg.get("layer_types")
-    if not isinstance(layer_types, list) or len(layer_types) != num_layers:
+    if layer_types is None:
+        # Absent is expected on the older configs: synthesise from the
+        # family's full_attention_interval.
         interval = cfg.get("full_attention_interval") or DEFAULT_FULL_ATTN_INTERVAL
         layer_types = synth_layer_types(num_layers, int(interval))
+    elif not isinstance(layer_types, list):
+        raise ValueError(
+            f"config.json layer_types is {type(layer_types).__name__}, expected a "
+            f"list of {num_layers} entries"
+        )
+    elif len(layer_types) != num_layers:
+        # A present-but-mismatched list is a corrupt config, not a missing
+        # one: the state-variable ids walk layer_types, so silently
+        # synthesising over it would cut the wrong layers.
+        raise ValueError(
+            f"config.json layer_types has {len(layer_types)} entries but "
+            f"num_hidden_layers is {num_layers}; fix the config (the "
+            f"state-variable mapping walks layer_types)"
+        )
     unknown = sorted(set(layer_types) - {LINEAR, FULL})
     if unknown:
         raise ValueError(f"unsupported layer_types {unknown}; expected only {LINEAR}/{FULL}")

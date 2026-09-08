@@ -90,6 +90,24 @@ def test_spec_synthesises_layer_types_from_interval():
     assert spec.layer_types == _layer_types(64)
 
 
+@pytest.mark.parametrize("n", [63, 65])
+def test_spec_rejects_layer_types_of_the_wrong_length(n):
+    """Present-but-mismatched is a corrupt config, not a missing one: the
+    state-variable ids walk layer_types, so synthesising over it silently
+    would cut the wrong layers."""
+    cfg = _qwen38_cfg()
+    cfg["text_config"]["layer_types"] = _layer_types(n)
+    with pytest.raises(ValueError, match=f"{n} entries.*num_hidden_layers is 64"):
+        sx.spec_from_config(cfg)
+
+
+def test_spec_rejects_non_list_layer_types():
+    cfg = _qwen38_cfg()
+    cfg["text_config"]["layer_types"] = "full_attention"
+    with pytest.raises(ValueError, match="layer_types is str"):
+        sx.spec_from_config(cfg)
+
+
 def test_spec_bare_text_config_strips_text_suffix():
     cfg = _qwen38_cfg()["text_config"]
     spec = sx.spec_from_config(cfg)
