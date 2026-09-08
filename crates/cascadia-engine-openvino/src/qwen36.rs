@@ -957,8 +957,9 @@ impl Qwen36Engine {
     fn reset_all(&mut self) {
         self.primed = false;
         // After a restore, `reset_state` leaves residue on this model, so rebuild the request
-        // instead — the flag keeps the ordinary turn-to-turn path on the cheap reset.
-        let recreate = self.state_restored;
+        // instead — the flag keeps the ordinary turn-to-turn path on the cheap reset. A dirty
+        // engine escalates the same way: the cheap reset is exactly what failed last time.
+        let recreate = self.state_restored || self.stages_dirty;
         let mut all_ok = true;
         for st in self.stages.iter_mut() {
             let r = if recreate {
@@ -2204,6 +2205,23 @@ impl Qwen36Engine {
                     self.local_warm_or_cold(&prompt_ids)
                 }
             };
+            // Every arm above resets (or restores over) the stage requests. If the reset FAILED the
+            // previous turn's DeltaNet state is still live, and a prefill on top of it decodes
+            // confident garbage that the API would return as a 200. Refuse the turn instead — the
+            // snapshot path already refuses to cache from this state; serving from it is worse.
+            if self.stages_dirty {
+                error!(task = %task.task_id, "qwen35: stage reset failed; refusing to serve");
+                // The warm arm restores over the LIVE requests without a reset of its own, so
+                // nothing else would retry the rebuild and every cache-hitting turn would refuse:
+                // try it here (dirty ⇒ `recreate_request`) so the next turn can serve.
+                self.reset_all();
+                let id = task.task_id.clone();
+                let c = Chunk::error(
+                    id.clone(),
+                    "stage state reset failed; refusing to serve on unknown state",
+                );
+                return vec![(id, c)];
+            }
             // Snapshot points for THIS turn (end of the system block, and the position before the
             // prompt's last `<|im_start|>`, which the next turn re-sends verbatim): only positions
             // this turn actually prefills (past `warm_prefix`), never from stages whose reset
@@ -3266,6 +3284,13 @@ mod tests {
     // green. The cover is the rig cert's `kv_handoff_epoch_mismatch` bar (OV engines only) — sparse-moe
     // has no cert cell, so sites 4-7 are uncovered. Do not replace this note with a test that drives
     // the drain directly.
+
+    // NOT UNIT-TESTABLE, stated rather than faked: the admission refusal on `stages_dirty` (and the
+    // `recreate_request` escalation `reset_all` takes when it is set) needs a stage whose reset can
+    // FAIL. `bare_engine` has zero stages, so `reset_all` succeeds trivially and clears the flag on
+    // the way into admission — a test that pre-sets `stages_dirty` asserts nothing about the guard.
+    // Certified on hardware only: cancel mid-turn so `recreate_request` fails on a stage, then submit
+    // again and expect the error chunk instead of a 200 carrying the previous turn's state.
 
     #[test]
     fn submit_caps_pending_queue() {
