@@ -2319,23 +2319,23 @@ impl Qwen36Engine {
             // copy is paid inside this turn's TTFT, so it is a *refresh* taken only once the tail
             // it would save has grown to cost as much as the copy (measured rates, see
             // `RefreshCosts::refresh_pays`); a conversation therefore never goes cold, and short
-            // follow-ups pay restore + tail only.
+            // follow-ups pay restore + tail only. A boundary at or past a length the budget has
+            // already refused is dropped by `plan_snapshots` before the copy, not by `insert`
+            // after it (`PrefixCache::worth_copying`).
             let state_bytes = self.last_restore_bytes;
-            let snapshot_at: Vec<usize> = self
+            let boundaries = self
                 .im_start_id
                 .filter(|_| self.prefix_cache.enabled() && !self.stages_dirty)
                 .map(|im| crate::prefix_cache::chat_boundaries(&prompt_ids, im))
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|&b| {
-                    b > warm_prefix
-                        && !self.prefix_cache.contains(&prompt_ids[..b])
-                        && (warm_prefix == 0
-                            || self
-                                .refresh_costs
-                                .refresh_pays(b - warm_prefix, state_bytes))
-                })
-                .collect();
+                .unwrap_or_default();
+            let snapshot_at = crate::prefix_cache::plan_snapshots(
+                &prompt_ids,
+                &boundaries,
+                warm_prefix,
+                &self.prefix_cache,
+                &self.refresh_costs,
+                state_bytes,
+            );
             if self.prefix_cache.enabled() {
                 info!(
                     warm_prefix,
@@ -2720,7 +2720,9 @@ impl Qwen36Engine {
     }
 
     /// Snapshot the chain state under `key` into the prefix cache (best-effort). The copy costs
-    /// ~2 s per GB of state, so a snapshot the budget could never hold is skipped before it.
+    /// ~2 s per GB of state, so `prefix_cache::plan_snapshots` no longer routes a boundary here
+    /// once one at or below that length has been refused for exceeding the budget: the first
+    /// refusal is what measures the threshold, and `PrefixCache::insert` reports it.
     fn prefix_cache_snapshot(&mut self, task_id: &TaskId, key: Vec<u32>) {
         let started = Instant::now();
         let pos = key.len();
@@ -2731,6 +2733,7 @@ impl Qwen36Engine {
         match self.parts_local_stages() {
             Some(parts) => {
                 let bytes: usize = parts.iter().map(Vec::len).sum();
+                debug_assert_eq!(parts.len(), self.stages.len());
                 let stored = self.prefix_cache.insert(key, parts);
                 let secs = started.elapsed().as_secs_f64();
                 if bytes > 0 && secs > 0.0 {

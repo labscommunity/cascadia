@@ -171,6 +171,12 @@ pub struct PrefixCache {
     tick: u64,
     hits: u64,
     misses: u64,
+    /// Shortest key length whose blob `insert` refused for exceeding the
+    /// budget. See [`Self::worth_copying`].
+    refused_len: Option<usize>,
+    /// The over-budget refusal has been reported once; the condition holds for
+    /// every later turn, so warning again would bury the line.
+    warned: bool,
 }
 
 impl PrefixCache {
@@ -182,6 +188,8 @@ impl PrefixCache {
             tick: 0,
             hits: 0,
             misses: 0,
+            refused_len: None,
+            warned: false,
         }
     }
 
@@ -211,18 +219,52 @@ impl PrefixCache {
         self.entries.iter().any(|e| e.tokens == tokens)
     }
 
-    /// Would a snapshot of `bytes` fit the budget at all? Callers check this
-    /// BEFORE paying for the state copy.
+    /// Would a snapshot of `bytes` under a `tokens`-long key fit the budget at
+    /// all? [`insert`](Self::insert) gates on this AFTER the copy is paid;
+    /// [`worth_copying`](Self::worth_copying) is the gate that comes before it.
     pub fn accepts(&self, tokens: usize, bytes: usize) -> bool {
         self.enabled() && tokens >= MIN_PREFIX_TOKENS && bytes <= self.budget
+    }
+
+    /// Is a snapshot at `len` tokens still worth the `get_state_blob` copy? A
+    /// snapshot's size is monotone non-decreasing in key length (fixed DeltaNet
+    /// state plus KV that only grows), so once a key of length `r` has been
+    /// refused for exceeding the budget, no key ≥ `r` can ever fit and the
+    /// multi-second copy is pure loss. Without this the copy was paid on every
+    /// turn and dropped by [`insert`](Self::insert) every time, which made a
+    /// too-small budget strictly slower than `--prefix-cache-gb 0`, forever, at
+    /// a 0% hit rate. The threshold is measured, not modelled: the waste is one
+    /// refused copy per distinct size class.
+    pub fn worth_copying(&self, len: usize) -> bool {
+        self.refused_len.is_none_or(|r| len < r)
     }
 
     /// Cache the per-stage `parts` under `tokens`, replacing an entry with the
     /// same key and evicting least-recently-used entries until it fits. A
     /// snapshot larger than the whole budget (or a key shorter than
-    /// [`MIN_PREFIX_TOKENS`]) is dropped; returns whether it was stored.
+    /// [`MIN_PREFIX_TOKENS`]) is dropped; returns whether it was stored. An
+    /// over-budget blob also records its key length as the
+    /// [`worth_copying`](Self::worth_copying) cut-off, so the next turn does
+    /// not pay the same copy again.
     pub fn insert(&mut self, tokens: Vec<u32>, parts: Vec<Vec<u8>>) -> bool {
         let bytes = parts_bytes(&parts);
+        if self.enabled() && bytes > self.budget {
+            self.refused_len = Some(
+                self.refused_len
+                    .map_or(tokens.len(), |r| r.min(tokens.len())),
+            );
+            if !self.warned {
+                self.warned = true;
+                tracing::warn!(
+                    key_len = tokens.len(),
+                    bytes,
+                    budget = self.budget,
+                    "qwen35 prefix-cache: snapshot does not fit the budget and was dropped; \
+                     no boundary this long or longer will be copied again. Raise \
+                     --prefix-cache-gb, or set it to 0 to turn the cache off."
+                );
+            }
+        }
         if !self.accepts(tokens.len(), bytes) {
             return false;
         }
@@ -353,6 +395,35 @@ pub fn chat_boundaries(prompt: &[u32], im_start: u32) -> Vec<usize> {
     out
 }
 
+/// Which of `boundaries` (from [`chat_boundaries`], ascending) this turn should
+/// snapshot. A boundary is taken when it lies past the restored prefix
+/// (`warm_prefix`, 0 on a cold turn), the cache does not already hold that
+/// exact key, and — on a warm turn — the tail it would save has grown to cost
+/// as much as the copy of `state_bytes` ([`RefreshCosts::refresh_pays`]).
+///
+/// A boundary the budget has already proved it cannot hold
+/// ([`PrefixCache::worth_copying`]) is dropped here, before the multi-second
+/// copy, rather than by [`PrefixCache::insert`] after it.
+pub fn plan_snapshots(
+    prompt: &[u32],
+    boundaries: &[usize],
+    warm_prefix: usize,
+    cache: &PrefixCache,
+    costs: &RefreshCosts,
+    state_bytes: usize,
+) -> Vec<usize> {
+    boundaries
+        .iter()
+        .copied()
+        .filter(|&b| {
+            b > warm_prefix
+                && cache.worth_copying(b)
+                && !cache.contains(&prompt[..b])
+                && (warm_prefix == 0 || costs.refresh_pays(b - warm_prefix, state_bytes))
+        })
+        .collect()
+}
+
 /// End of the next prefill span starting at `idx`: `chunk` tokens, clamped
 /// to the prompt length and to the first snapshot position past `idx` so a
 /// span ends exactly on it (the chain state is captured right after that
@@ -458,11 +529,7 @@ mod tests {
     fn refresh_rule_is_the_measured_break_even() {
         // Unknown rates: always refresh (never a cold conversation).
         assert!(RefreshCosts::default().refresh_pays(1, 1 << 30));
-        // tate-07 at 8 K: 455 tok/s prefill, 1.2 GB copied in 2.6 s.
-        let c = RefreshCosts {
-            prefill_tok_s: Some(455.0),
-            snapshot_s_per_byte: Some(2.6 / 1.2e9),
-        };
+        let c = measured_costs();
         let bytes = 1_200_000_000;
         assert!(
             !c.refresh_pays(50, bytes),
@@ -476,6 +543,68 @@ mod tests {
             snapshot_s_per_byte: Some(0.4 / 1.2e9),
         };
         assert!(cpu.refresh_pays(50, bytes));
+    }
+
+    /// tate-07 at 8 K: 455 tok/s prefill, 1.2 GB copied in 2.6 s.
+    fn measured_costs() -> RefreshCosts {
+        RefreshCosts {
+            prefill_tok_s: Some(455.0),
+            snapshot_s_per_byte: Some(2.6 / 1.2e9),
+        }
+    }
+
+    #[test]
+    fn plan_snapshots_follows_the_cold_warm_and_cached_rules() {
+        let p = key(4000, 0);
+        let mut c = PrefixCache::new(1 << 20);
+        let costs = measured_costs();
+        let bytes = 1_200_000_000;
+        // Cold turn (nothing restored): every boundary.
+        assert_eq!(
+            plan_snapshots(&p, &[31, 1500], 0, &c, &costs, bytes),
+            vec![31, 1500]
+        );
+        // Warm turn, short tail: re-prefilling 80 tokens is far cheaper than the copy.
+        assert!(plan_snapshots(&p, &[1500], 1420, &c, &costs, bytes).is_empty());
+        // Warm turn, long tail: 1400 tokens of prefill >= one copy, so refresh.
+        assert_eq!(
+            plan_snapshots(&p, &[1500], 100, &c, &costs, bytes),
+            vec![1500]
+        );
+        // Behind the restored prefix: nothing to snapshot there.
+        assert!(plan_snapshots(&p, &[1500], 1500, &c, &costs, bytes).is_empty());
+        // Already cached under that exact key (a shared system block): skipped.
+        assert!(c.insert(p[..31].to_vec(), blob(10)));
+        assert_eq!(
+            plan_snapshots(&p, &[31, 1500], 0, &c, &costs, bytes),
+            vec![1500]
+        );
+    }
+
+    #[test]
+    fn plan_snapshots_stops_at_the_refused_length() {
+        let p = key(200, 0);
+        let costs = RefreshCosts::default();
+        // Nothing refused yet: the copy is worth attempting at any length.
+        let mut c = PrefixCache::new(100);
+        assert_eq!(
+            plan_snapshots(&p, &[20, 40], 0, &c, &costs, 0),
+            vec![20, 40]
+        );
+        // A 40-token key overruns the budget. That refusal is the threshold:
+        // a snapshot only grows with the key, so 40 and beyond are hopeless.
+        assert!(!c.insert(key(40, 0), blob(101)));
+        assert!(c.worth_copying(39) && !c.worth_copying(40) && !c.worth_copying(4000));
+        assert_eq!(
+            plan_snapshots(&p, &[20, 40, 120], 0, &c, &costs, 0),
+            vec![20]
+        );
+        // A shorter refusal lowers the threshold; a longer one leaves it alone.
+        assert!(!c.insert(key(60, 0), blob(101)));
+        assert!(!c.worth_copying(40) && c.worth_copying(39));
+        assert!(!c.insert(key(20, 0), blob(101)));
+        assert!(!c.worth_copying(20) && c.worth_copying(19));
+        assert!(plan_snapshots(&p, &[20, 40, 120], 0, &c, &costs, 0).is_empty());
     }
 
     #[test]
