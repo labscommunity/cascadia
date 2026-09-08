@@ -182,3 +182,28 @@ def test_check_stage_ranges_requires_an_attention_layer_per_stage():
     sx.check_stage_ranges(spec, sx.stage_ranges(64, 16))  # one attn layer each
     with pytest.raises(ValueError, match="full_attention"):
         sx.check_stage_ranges(spec, sx.stage_ranges(64, 32))  # 2-layer stages
+
+
+# ---------------------------------------------------------------------------
+# validate_verdict — the gate that decides whether a tree may be served
+# ---------------------------------------------------------------------------
+
+
+def test_validate_verdict_accepts_a_passing_run():
+    # top-1 match, full top-5 overlap, drift well inside the band, 8/8 greedy
+    assert sx.validate_verdict(True, 5, 1e-1, 20.0, 8)
+    # the loosest run still accepted: 4/5 overlap, 6/8 greedy
+    assert sx.validate_verdict(True, 4, 9.0, 20.0, 6)
+
+
+@pytest.mark.parametrize(
+    "top1,overlap,d,n,m",
+    [
+        (False, 5, 1e-1, 20.0, 8),  # top-1 differs: greedy decode diverges
+        (True, 3, 1e-1, 20.0, 8),  # top-5 overlap below 4/5
+        (True, 5, 11.0, 20.0, 8),  # raw drift past half the logit scale
+        (True, 5, 1e-1, 20.0, 5),  # only 5/8 greedy tokens agree
+    ],
+)
+def test_validate_verdict_rejects_a_failing_run(top1, overlap, d, n, m):
+    assert not sx.validate_verdict(top1, overlap, d, n, m)

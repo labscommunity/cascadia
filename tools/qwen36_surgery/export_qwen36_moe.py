@@ -304,6 +304,17 @@ def extract_stage(xml_path: str, spec: ModelSpec, a: int, b: int, first: bool, l
     return stage
 
 
+def validate_verdict(top1: bool, overlap: int, d: float, n: float, m: int) -> bool:
+    """Acceptance for `--validate` (see the rationale in `_validate`):
+    top-1 must match, top-5 must overlap >= 4/5, the raw drift must stay
+    under half the logit scale, and >= 6/8 greedy tokens must agree.
+
+    Pure so the gate that decides whether a tree may be served is unit
+    testable without openvino.
+    """
+    return bool(top1) and overlap >= 4 and d / n < 0.5 and m >= 6
+
+
 def build_feeds(model, hidden_size: int, hidden=None, embeds=None):
     feeds = {}
     for inp in model.inputs:
@@ -443,7 +454,6 @@ def _validate(model_dir, output_dir, xml, ranges, hidden_size):
     overlap = len(top5_c & top5_r)
     print(f"CHAIN logits max_abs={d:.3e} rel={d/n:.3e} top1_match={top1} "
           f"top5_overlap={overlap}/{k}", flush=True)
-    ok = top1 and overlap >= 4 and d / n < 0.5
 
     # Multi-token greedy: 8 decode tokens from a synthetic prompt, chain
     # vs full at T=1 steps (proto_m3_decode.py measured 64/64 in this
@@ -511,13 +521,21 @@ def _validate(model_dir, output_dir, xml, ranges, hidden_size):
     full_gen = greedy([xml], "full")
     m = sum(1 for x, y in zip(chain_gen, full_gen) if x == y)
     print(f"MULTI_TOKEN_PARITY {m}/{N_DEC}", flush=True)
-    ok = ok and m >= 6
 
+    ok = validate_verdict(top1, overlap, d, n, m)
     print("EXPORT_VALIDATE_OK" if ok else "EXPORT_VALIDATE_FAIL", flush=True)
-    if ok:
-        print("note: >=64-token greedy parity is the engine-level "
-              "criterion (qwen36_parity golden test); this validates one "
-              f"step token-level + {N_DEC}-token greedy.", flush=True)
+    if not ok:
+        # Non-zero exit: `cascadia shard` only checks the subprocess status,
+        # so a verdict printed on stdout alone would still tell the user to
+        # serve a tree that failed parity.
+        raise SystemExit(
+            f"EXPORT_VALIDATE_FAIL: top1_match={top1} top5_overlap={overlap}/{k} "
+            f"rel={d/n:.3e} multi_token_parity={m}/{N_DEC} — the stage tree does "
+            f"not reproduce the whole model; do not serve it."
+        )
+    print("note: >=64-token greedy parity is the engine-level "
+          "criterion (qwen36_parity golden test); this validates one "
+          f"step token-level + {N_DEC}-token greedy.", flush=True)
 
 
 def main():
