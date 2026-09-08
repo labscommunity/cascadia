@@ -341,8 +341,8 @@ pub struct Qwen36Builder {
     pub prefix_cache_bytes: usize,
     /// `<|im_start|>` id from the tokenizer (rank 0), the chat-boundary marker for snapshots.
     im_start_id: Option<u32>,
-    /// `max_position_embeddings` from the tree's config.json (0 = unknown, no guard).
-    max_ctx: usize,
+    /// `max_position_embeddings` from the tree's config.json (`None` = unknown, no guard).
+    max_ctx: Option<usize>,
 }
 
 impl Qwen36Builder {
@@ -387,7 +387,7 @@ impl Qwen36Builder {
             cache_dir: None,
             prefix_cache_bytes: crate::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES,
             im_start_id: None,
-            max_ctx: 0,
+            max_ctx: None,
         }
     }
 
@@ -528,6 +528,12 @@ impl Builder for Qwen36Builder {
                 .tokenizer
                 .as_ref()
                 .and_then(|t| t.token_to_id("<|im_start|>"));
+            if self.im_start_id.is_none() {
+                warn!(
+                    "qwen35: tokenizer has no <|im_start|>; the prefix cache has no chat boundary \
+                     to snapshot at and stays empty (every turn cold)"
+                );
+            }
             self.max_ctx = read_max_ctx(&dir);
             self.eos = read_eos(&dir);
         }
@@ -565,11 +571,17 @@ impl Builder for Qwen36Builder {
         let prefix_cache_bytes = if self.total == 1 {
             self.prefix_cache_bytes
         } else {
+            warn!(
+                total = self.total,
+                "qwen35: the prefix cache is single-process only; disabled for this pipeline \
+                 (the kv_coord plane's CAPTURE/RESTORE covers multi-rank)"
+            );
             0
         };
         info!(
             budget_gib = prefix_cache_bytes >> 30,
             im_start = ?self.im_start_id,
+            max_ctx = ?self.max_ctx,
             "qwen35 prefix cache"
         );
         Ok(Box::new(Qwen36Engine {
@@ -627,20 +639,39 @@ fn map_ov(err: cascadia_ov_genai_shim::Error) -> EngineError {
     }
 }
 
-/// `max_position_embeddings` from the tree's config.json (`text_config` when nested); 0 if absent.
-fn read_max_ctx(dir: &Path) -> usize {
-    let Ok(raw) = std::fs::read_to_string(dir.join("config.json")) else {
-        return 0;
+/// `max_position_embeddings` from the tree's config.json (`text_config` when nested). `None` when
+/// the tree does not state it — the prompt-window guard in `submit` is then off, so say which of
+/// the three ways that happened rather than letting an unreadable config disable it silently.
+fn read_max_ctx(dir: &Path) -> Option<usize> {
+    let raw = match std::fs::read_to_string(dir.join("config.json")) {
+        Ok(raw) => raw,
+        Err(e) => {
+            warn!(error = %e, "qwen35: no readable config.json; the prompt-window guard is OFF");
+            return None;
+        }
     };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return 0;
+    let v: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "qwen35: config.json is not valid JSON; the prompt-window guard is OFF");
+            return None;
+        }
     };
     let cfg = if v.get("text_config").is_some() {
         &v["text_config"]
     } else {
         &v
     };
-    cfg["max_position_embeddings"].as_u64().unwrap_or(0) as usize
+    let max = cfg["max_position_embeddings"]
+        .as_u64()
+        .filter(|&m| m > 0)
+        .map(|m| m as usize);
+    if max.is_none() {
+        warn!(
+            "qwen35: config.json states no max_position_embeddings; the prompt-window guard is OFF"
+        );
+    }
+    max
 }
 
 fn map_wire(err: TransportError) -> EngineError {
@@ -722,8 +753,9 @@ pub struct Qwen36Engine {
     /// the next successful reset.
     stages_dirty: bool,
     /// `max_position_embeddings` of the model (from the tree's config.json); prompts at or past it
-    /// are refused at submit rather than prefilled for hours on the single batch=1 slot.
-    max_ctx: usize,
+    /// are refused at submit rather than prefilled for hours on the single batch=1 slot. `None`
+    /// when the tree does not state it (guard off; `read_max_ctx` warns which case it was).
+    max_ctx: Option<usize>,
     /// Measured prefill and snapshot-copy rates for the warm-turn refresh rule
     /// (`prefix_cache::RefreshCosts::refresh_pays`).
     refresh_costs: crate::prefix_cache::RefreshCosts,
@@ -2485,14 +2517,13 @@ impl Engine for Qwen36Engine {
         }
         // The API bounds request BYTES; this bounds tokens against the model's window so a
         // multi-MB prompt is a 413, not an hours-long prefill holding the batch=1 slot.
-        if self.max_ctx > 0 {
+        if let Some(max) = self.max_ctx {
             if let Some(tok) = &self.tokenizer {
                 if let Ok(enc) = tok.encode(task.prompt.as_str(), true) {
                     let n = enc.get_ids().len();
-                    if n >= self.max_ctx {
+                    if n >= max {
                         return Err(EngineError::PromptTooLong(format!(
-                            "prompt is {n} tokens; the model's window is {} (max_position_embeddings)",
-                            self.max_ctx
+                            "prompt is {n} tokens; the model's window is {max} (max_position_embeddings)"
                         )));
                     }
                 }
@@ -2982,23 +3013,25 @@ mod tests {
     }
 
     #[test]
-    fn read_max_ctx_prefers_nested_text_config_and_defaults_to_zero() {
+    fn read_max_ctx_prefers_nested_text_config_and_is_none_when_unstated() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(read_max_ctx(dir.path()), 0, "no config.json");
+        assert_eq!(read_max_ctx(dir.path()), None, "no config.json");
         std::fs::write(
             dir.path().join("config.json"),
             r#"{"model_type":"qwen3_5","text_config":{"max_position_embeddings":262144},"max_position_embeddings":4096}"#,
         )
         .unwrap();
-        assert_eq!(read_max_ctx(dir.path()), 262144);
+        assert_eq!(read_max_ctx(dir.path()), Some(262144));
         std::fs::write(
             dir.path().join("config.json"),
             r#"{"model_type":"qwen3_5_moe","max_position_embeddings":40960}"#,
         )
         .unwrap();
-        assert_eq!(read_max_ctx(dir.path()), 40960);
+        assert_eq!(read_max_ctx(dir.path()), Some(40960));
         std::fs::write(dir.path().join("config.json"), "{}").unwrap();
-        assert_eq!(read_max_ctx(dir.path()), 0);
+        assert_eq!(read_max_ctx(dir.path()), None, "key absent");
+        std::fs::write(dir.path().join("config.json"), "{ not json").unwrap();
+        assert_eq!(read_max_ctx(dir.path()), None, "unparseable config.json");
     }
 
     fn bare_engine(total: u32, manifest: &str) -> Qwen36Engine {
@@ -3040,7 +3073,7 @@ mod tests {
             im_start_id: None,
             primed: false,
             stages_dirty: false,
-            max_ctx: 0,
+            max_ctx: None,
             refresh_costs: Default::default(),
             last_restore_bytes: 0,
         }
