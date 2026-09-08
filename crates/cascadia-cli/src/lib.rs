@@ -982,27 +982,58 @@ fn parse_addr(s: &str, default_host: &str) -> Result<(String, u16)> {
 /// of 16 GiB and a quarter of physical RAM (a 64 GB box gets 16 GiB, a 32 GB UMA box 8 GiB —
 /// the weights already take 16-28 GB there).
 fn resolve_prefix_cache_bytes(flag: Option<f64>) -> Result<usize> {
+    resolve_prefix_cache_bytes_with(physical_ram_bytes(), flag)
+}
+
+/// Physical RAM in bytes, or `None` when the platform does not report it
+/// (containers, unsupported targets) — a figure of 0 is "unreadable", not
+/// "no memory".
+fn physical_ram_bytes() -> Option<u64> {
+    use sysinfo::{MemoryRefreshKind, RefreshKind, System};
+    let total = System::new_with_specifics(
+        RefreshKind::nothing().with_memory(MemoryRefreshKind::nothing().with_ram()),
+    )
+    .total_memory();
+    (total > 0).then_some(total)
+}
+
+/// [`resolve_prefix_cache_bytes`] with the RAM figure injected (`None` =
+/// unreadable), so the sizing decisions are testable off the host's memory.
+fn resolve_prefix_cache_bytes_with(ram: Option<u64>, flag: Option<f64>) -> Result<usize> {
     const GIB: f64 = (1u64 << 30) as f64;
+    let default = cascadia_engine_openvino::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES;
     match flag {
         Some(gb) if !gb.is_finite() || gb < 0.0 => Err(anyhow!(
             "--prefix-cache-gb must be a finite, non-negative number (got {gb})"
         )),
-        Some(gb) => Ok((gb * GIB) as usize),
-        None => {
-            let ram = {
-                use sysinfo::{MemoryRefreshKind, RefreshKind, System};
-                System::new_with_specifics(
-                    RefreshKind::nothing().with_memory(MemoryRefreshKind::nothing().with_ram()),
-                )
-                .total_memory() as f64
-            };
-            let default = cascadia_engine_openvino::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES as f64;
-            Ok(if ram > 0.0 {
-                default.min(ram / 4.0)
-            } else {
-                default
-            } as usize)
+        // `as usize` saturates, so an unbounded value would become usize::MAX
+        // and the LRU would never evict. Physical RAM is the ceiling — the
+        // weights and the OS live in the same RAM as the snapshots.
+        Some(gb) if ram.is_some_and(|r| gb * GIB > r as f64) => {
+            let ram_gib = ram.unwrap_or(0) as f64 / GIB;
+            Err(anyhow!(
+                "--prefix-cache-gb {gb} exceeds this machine's physical RAM ({ram_gib:.1} GiB), \
+                 which the model weights already share — pick a smaller budget (0 disables)"
+            ))
         }
+        Some(gb) => {
+            if ram.is_none() {
+                warn!(
+                    "physical RAM is unreadable here; accepting --prefix-cache-gb {gb} unvalidated"
+                );
+            }
+            Ok((gb * GIB) as usize)
+        }
+        None => match ram {
+            Some(ram) => Ok((default as f64).min(ram as f64 / 4.0) as usize),
+            None => {
+                warn!(
+                    default_gib = default >> 30,
+                    "physical RAM is unreadable here; using the full default prefix-cache budget"
+                );
+                Ok(default)
+            }
+        },
     }
 }
 
@@ -2782,12 +2813,62 @@ mod python_tests {
         assert!(resolve_api_max_body_bytes(f64::INFINITY).is_err());
         assert!(resolve_api_max_body_bytes(f64::NAN).is_err());
         assert_eq!(resolve_api_max_body_bytes(1.0).unwrap(), 1 << 20);
+        // The upper bound is a bound, not decoration.
+        assert_eq!(resolve_api_max_body_bytes(4096.0).unwrap(), 4096 << 20);
+        assert!(resolve_api_max_body_bytes(4097.0).is_err());
         assert!(resolve_prefix_cache_bytes(Some(-1.0)).is_err());
         assert!(resolve_prefix_cache_bytes(Some(f64::INFINITY)).is_err());
         assert_eq!(resolve_prefix_cache_bytes(Some(0.0)).unwrap(), 0);
-        assert_eq!(resolve_prefix_cache_bytes(Some(2.0)).unwrap(), 2 << 30);
         let auto = resolve_prefix_cache_bytes(None).unwrap();
         assert!(auto <= cascadia_engine_openvino::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES);
+        // `auto <= DEFAULT` is also true of 0, which would disable the cache
+        // the default exists to enable.
+        assert!(auto > 0, "auto-sized budget must not disable the cache");
+    }
+
+    #[test]
+    fn prefix_cache_budget_is_bounded_by_physical_ram() {
+        const GIB: u64 = 1 << 30;
+        let ram = Some(64 * GIB);
+        // Saturating `as usize` used to turn this into usize::MAX, and the LRU
+        // that bound never evicted anything.
+        let err = resolve_prefix_cache_bytes_with(ram, Some(1e30))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("physical RAM"), "{err}");
+        assert!(err.contains("64.0 GiB"), "{err}");
+        assert!(resolve_prefix_cache_bytes_with(ram, Some(65.0)).is_err());
+        // The whole of RAM is the boundary and is allowed: an operator who
+        // means it can still hand the cache every byte the box has.
+        assert_eq!(
+            resolve_prefix_cache_bytes_with(ram, Some(64.0)).unwrap(),
+            (64 * GIB) as usize
+        );
+        assert_eq!(
+            resolve_prefix_cache_bytes_with(ram, Some(2.0)).unwrap(),
+            (2 * GIB) as usize
+        );
+        // A quarter of RAM when it is below the 16 GiB default.
+        assert_eq!(
+            resolve_prefix_cache_bytes_with(Some(32 * GIB), None).unwrap(),
+            (8 * GIB) as usize
+        );
+    }
+
+    #[test]
+    fn unreadable_ram_falls_back_to_the_default_and_accepts_explicit_values() {
+        // sysinfo reports 0 in some containers; the budget must still be sane.
+        assert_eq!(
+            resolve_prefix_cache_bytes_with(None, None).unwrap(),
+            cascadia_engine_openvino::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES
+        );
+        // Nothing to validate an explicit value against — take the operator's
+        // word for it (warned), but keep rejecting outright nonsense.
+        assert_eq!(
+            resolve_prefix_cache_bytes_with(None, Some(4.0)).unwrap(),
+            4usize << 30
+        );
+        assert!(resolve_prefix_cache_bytes_with(None, Some(-1.0)).is_err());
     }
 
     #[test]
