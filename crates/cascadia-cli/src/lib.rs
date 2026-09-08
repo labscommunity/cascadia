@@ -665,7 +665,18 @@ impl WorkerArgs {
     /// reduced `cascadia run` surface, leaving every advanced knob at its
     /// `worker` default. Keeping this here (rather than spreading defaults
     /// into `cmd_run`) means `run` and `worker` can't silently drift.
-    fn single_node(model: String, device: String, engine: EngineKind, api: String) -> Self {
+    ///
+    /// The knobs `run` also exposes are parameters, not post-construction
+    /// patches: `cmd_run` overwriting them afterwards meant deleting a line
+    /// here silently turned `cascadia run --prefix-cache-gb 0` back on.
+    fn single_node(
+        model: String,
+        device: String,
+        engine: EngineKind,
+        api: String,
+        prefix_cache_gb: Option<f64>,
+        api_max_body_mb: f64,
+    ) -> Self {
         WorkerArgs {
             rank: 0,
             total: 1,
@@ -678,8 +689,8 @@ impl WorkerArgs {
             api: Some(api),
             device,
             engine,
-            prefix_cache_gb: None,
-            api_max_body_mb: 1.0,
+            prefix_cache_gb,
+            api_max_body_mb,
             ov_cache_dir: None,
             ov_kv_precision: None,
             ov_dyn_quant_group: None,
@@ -919,9 +930,14 @@ pub async fn run(cli: Cli) -> Result<()> {
 
 async fn cmd_run(args: RunArgs) -> Result<()> {
     info!(model = %args.model, device = %args.device, engine = ?args.engine, "cascadia run (single machine)");
-    let mut worker = WorkerArgs::single_node(args.model, args.device, args.engine, args.api);
-    worker.prefix_cache_gb = args.prefix_cache_gb;
-    worker.api_max_body_mb = args.api_max_body_mb;
+    let worker = WorkerArgs::single_node(
+        args.model,
+        args.device,
+        args.engine,
+        args.api,
+        args.prefix_cache_gb,
+        args.api_max_body_mb,
+    );
     cmd_worker(worker).await
 }
 
@@ -2546,7 +2562,14 @@ mod python_tests {
     use super::*;
 
     fn worker(model: &str, engine: EngineKind) -> WorkerArgs {
-        let mut a = WorkerArgs::single_node(model.into(), "GPU".into(), engine, ":8000".into());
+        let mut a = WorkerArgs::single_node(
+            model.into(),
+            "GPU".into(),
+            engine,
+            ":8000".into(),
+            None,
+            1.0,
+        );
         a.engine = engine;
         a
     }
@@ -2956,6 +2979,8 @@ mod ov_property_tests {
             device.into(),
             engine,
             "127.0.0.1:8080".into(),
+            None,
+            1.0,
         )
     }
 
@@ -3369,5 +3394,54 @@ mod tests {
             panic!("expected shard subcommand");
         };
         assert_eq!(args.target, ShardTarget::CpuGpu);
+    }
+
+    /// `run`'s two forwarded knobs must survive the trip into `WorkerArgs`.
+    /// They used to be written over `single_node`'s hard-coded defaults after
+    /// construction, so `--prefix-cache-gb 0` would have quietly left the
+    /// cache on if either patch line went missing.
+    #[test]
+    fn run_forwards_the_prefix_cache_and_body_flags_to_the_worker() {
+        let cli = Cli::try_parse_from([
+            "cascadia",
+            "run",
+            "some-model-dir",
+            "--engine",
+            "qwen35",
+            "--prefix-cache-gb",
+            "0",
+            "--api-max-body-mb",
+            "2",
+        ])
+        .expect("parse run argv");
+        let Command::Run(args) = cli.cmd else {
+            panic!("expected run subcommand");
+        };
+        let worker = WorkerArgs::single_node(
+            args.model,
+            args.device,
+            args.engine,
+            args.api,
+            args.prefix_cache_gb,
+            args.api_max_body_mb,
+        );
+        assert_eq!(worker.prefix_cache_gb, Some(0.0));
+        assert_eq!(worker.api_max_body_mb, 2.0);
+        assert_eq!(worker.rank, 0);
+        assert_eq!(worker.total, 1);
+    }
+
+    /// The engine renamed from `qwen36-moe` to `qwen35`; the old spelling is
+    /// kept as a clap alias, so both must land on the same variant.
+    #[test]
+    fn qwen35_and_its_qwen36_moe_alias_parse_to_one_engine() {
+        for spelling in ["qwen35", "qwen36-moe"] {
+            let cli = Cli::try_parse_from(["cascadia", "run", "m", "--engine", spelling])
+                .unwrap_or_else(|e| panic!("parse --engine {spelling}: {e}"));
+            let Command::Run(args) = cli.cmd else {
+                panic!("expected run subcommand");
+            };
+            assert_eq!(args.engine, EngineKind::Qwen36Moe, "--engine {spelling}");
+        }
     }
 }
