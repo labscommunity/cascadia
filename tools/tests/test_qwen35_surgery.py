@@ -115,6 +115,19 @@ def test_spec_bare_text_config_strips_text_suffix():
     assert spec.hidden == 5120
 
 
+def test_spec_takes_arch_from_the_inner_type_when_the_wrapper_is_foreign():
+    """A fine-tune can carry its own outer model_type over a qwen3_5 text
+    config. The engine requires a `qwen3_5*` arch, so the manifest must
+    record the model_type that matched the family, not the wrapper's —
+    otherwise the tree exports cleanly and then fails to load."""
+    cfg = _qwen38_cfg()
+    cfg["model_type"] = "qwopus_vl"
+    spec = sx.spec_from_config(cfg)
+    assert spec.model_type == "qwen3_5"
+    assert spec.family == "qwen3_5"
+    assert spec.hidden == 5120
+
+
 @pytest.mark.parametrize("mt", ["llama", "qwen3", "qwen3_moe", "gemma4"])
 def test_spec_rejects_non_family(mt):
     with pytest.raises(ValueError, match="qwen3_5"):

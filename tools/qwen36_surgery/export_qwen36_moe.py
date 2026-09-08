@@ -117,8 +117,11 @@ def spec_from_config(raw: dict) -> ModelSpec:
     if unknown:
         raise ValueError(f"unsupported layer_types {unknown}; expected only {LINEAR}/{FULL}")
     # Normalise to the HF family name (qwen3_5 / qwen3_5_moe) even when
-    # handed a bare text config (qwen3_5_text / qwen3_5_moe_text).
-    arch = outer_mt or inner_mt
+    # handed a bare text config (qwen3_5_text / qwen3_5_moe_text) or a
+    # wrapper whose own model_type is outside the family — the manifest's
+    # arch must be the one that matched, since the engine requires a
+    # `qwen3_5*` arch and would otherwise reject the finished tree.
+    arch = outer_mt if outer_mt.startswith("qwen3_5") else inner_mt
     if arch.endswith("_text"):
         arch = arch[: -len("_text")]
     return ModelSpec(
