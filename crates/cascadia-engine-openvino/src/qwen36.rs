@@ -1046,8 +1046,9 @@ impl Qwen36Engine {
     fn reset_all(&mut self) {
         self.primed = false;
         // After a restore, `reset_state` leaves residue on this model, so rebuild the request
-        // instead — the flag keeps the ordinary turn-to-turn path on the cheap reset. A dirty
-        // engine escalates the same way: the cheap reset is exactly what failed last time.
+        // instead. With the prefix cache always on that is every WARM turn — `state_restored` is
+        // set by each hit — and the cheap reset is what a cold turn (no hit, nothing restored)
+        // gets. A dirty engine escalates the same way: the cheap reset is exactly what failed.
         let recreate = self.state_restored || self.stages_dirty;
         let mut all_ok = true;
         for st in self.stages.iter_mut() {
@@ -2681,9 +2682,11 @@ impl Qwen36Engine {
 }
 
 impl Qwen36Engine {
-    /// Admission on the single-process path when the plane had no warm blob (or is not compiled
-    /// in): restore the longest cached prefix of `prompt_ids` over the live (already reset)
-    /// requests and return the resume depth, else cold-reset and return 0.
+    /// Admission on the single-process path when the plane had no warm blob for this turn: it is
+    /// not compiled in, it held nothing, or the blob it held FAILED to restore (that arm scrubs
+    /// the half-applied state first, then falls through here). Restores the longest cached prefix
+    /// of `prompt_ids` over the live (already reset) requests and returns the resume depth, else
+    /// cold-resets and returns 0.
     fn local_warm_or_cold(&mut self, prompt_ids: &[u32]) -> usize {
         if self.prefix_cache.enabled() {
             if let Some((parts, len)) = self.prefix_cache.longest_prefix(prompt_ids) {
