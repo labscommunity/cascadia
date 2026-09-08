@@ -786,8 +786,9 @@ pub struct Qwen36Engine {
     /// there is no seq dim to collapse to zero), which left every post-migration turn serving
     /// garbage until the process restarted. Makes the next `reset_all` rebuild the InferRequest.
     state_restored: bool,
-    /// Always-on snapshot LRU (`crate::prefix_cache`): chat-boundary + end-of-turn state blobs,
-    /// restored at admission for a prompt that extends a cached prefix. Budget 0 ⇒ off.
+    /// Always-on snapshot LRU (`crate::prefix_cache`): system-block-end + chat-boundary state
+    /// blobs (`prefix_cache::chat_boundaries`), restored at admission for a prompt that extends
+    /// a cached prefix. Budget 0 ⇒ off.
     prefix_cache: crate::prefix_cache::PrefixCache,
     im_start_id: Option<u32>,
     /// The stage requests have executed at least once since their last reset/recreate. A
@@ -2435,8 +2436,8 @@ impl Qwen36Engine {
             }
             // Prefill rate for the refresh rule: this turn's prefilled tokens over the wall time
             // since admission minus the snapshot copies inside it. Short tails are dominated by
-            // per-span overhead and would under-read the rate, so only spans of a full chunk or
-            // more update it.
+            // per-span overhead and would under-read the rate, so only a tail of a full chunk or
+            // more updates it.
             {
                 let t = self.active.as_ref().unwrap();
                 let prefilled = t.prompt_ids.len() - t.warm_prefix;

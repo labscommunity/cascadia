@@ -1,12 +1,14 @@
 //! Always-on prefix cache for the Qwen3.5-family staged engine (`qwen35`).
 //!
-//! The engine's turns are stateful OpenVINO requests: 16 attention layers' KV
-//! plus 48 fixed-size Gated-DeltaNet recurrent states. Linear state cannot be
-//! trimmed, so a prefix cache on this family is snapshot-at-boundary: the
-//! engine snapshots the whole chain's state (`get_state_blob` per stage,
-//! framed by [`frame_blobs`]) at positions the NEXT prompt will share
+//! The engine's turns are stateful OpenVINO requests: attention layers' KV
+//! plus fixed-size Gated-DeltaNet recurrent states (16 + 48 on the 27B,
+//! 10 + 30 of 40 on the Qwen3.6-35B-A3B this cache also serves). Linear state
+//! cannot be trimmed, so a prefix cache on this family is
+//! snapshot-at-boundary: the engine snapshots the whole chain's state (one
+//! `get_state_blob` per stage, kept unframed — [`frame_blobs`] is the
+//! `kv_coord` wire format, not this) at positions the NEXT prompt will share
 //! verbatim, and a later prompt that starts with those exact tokens restores
-//! the blob and prefills only the tail.
+//! the parts and prefills only the tail.
 //!
 //! Which positions? Chat templates in this family render the history
 //! assistant turn WITHOUT the `<think>` block the live generation prompt
@@ -15,7 +17,12 @@
 //! prompt's last `<|im_start|>` (the generation prompt), and the end of the
 //! system block before it (shared across conversations) — [`chat_boundaries`]
 //! — and the engine splits its prefill chunk there to snapshot exactly at
-//! those positions, on every turn that prefills past them.
+//! those positions. Which of them a given turn takes is [`plan_snapshots`]:
+//! every boundary on a cold turn; on a warm turn only as a *refresh*, once
+//! re-prefilling the tail would cost as much as the copy
+//! ([`RefreshCosts::refresh_pays`]); never a key the cache already holds, and
+//! never one at least as long as a key the budget has already refused
+//! ([`PrefixCache::worth_copying`]).
 //!
 //! [`PrefixCache`] is a byte-bounded LRU keyed by the exact token sequence;
 //! lookups are longest-strict-prefix and non-consuming (a shared system
@@ -142,10 +149,16 @@ pub(crate) fn unframe_blobs(b: &[u8]) -> Option<Vec<Vec<u8>>> {
 }
 
 /// Default byte budget for the snapshot LRU. A Qwen3.8-27B snapshot is
-/// ~64 KB per context token (KV) + ~150 MB (DeltaNet state): 2.2 GB at 32 K
-/// tokens, 8.5 GB at 128 K. 16 GiB keeps several long-context turns hot
-/// without competing with the ~16 GB of int4 weights on a 64 GB box; raise
-/// it with `--prefix-cache-gb` for 128 K-class contexts.
+/// ~150 MB of fixed DeltaNet state plus ~130 KB per context token as
+/// serialised by `get_state_blob` — about twice the f16 KV footprint —
+/// measured on the B390 at 1.2 GB for 8 K and 4.45 GB for 32 K, so ~17 GB at
+/// 128 K: a 128 K snapshot needs a budget above this default. Note the fixed
+/// term: bytes-per-token read off a short snapshot does not extrapolate.
+/// 16 GiB keeps several long-context turns hot without competing
+/// with the ~16 GB of int4 weights on a 64 GB box; raise it with
+/// `--prefix-cache-gb` for 128 K-class contexts. The CLI clamps this default
+/// to a quarter of physical RAM (`resolve_prefix_cache_bytes`), so a 32 GB
+/// box gets 8 GiB of it.
 pub const DEFAULT_PREFIX_CACHE_BYTES: usize = 16 << 30;
 
 /// Snapshots shorter than this are not worth a `get_state_blob` copy.
@@ -346,8 +359,9 @@ impl PrefixCache {
 /// The two measured rates the warm-turn refresh rule needs. Both come from
 /// the engine's own timings on this box and model, so the rule has no
 /// device-dependent constant: an iGPU that prefills at 450 tok/s and copies
-/// state at 0.7 GB/s and a CPU that prefills at 60 tok/s and copies at
-/// memcpy speed each get their own break-even.
+/// state at ~0.5 GB/s (measured on the B390: 1.2 GB in 2.5 s, 4.45 GB in 9 s)
+/// and a CPU that prefills at 60 tok/s and copies at memcpy speed each get
+/// their own break-even.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RefreshCosts {
     /// Prompt tokens prefilled per second (restore and snapshot time excluded).
@@ -376,11 +390,13 @@ impl RefreshCosts {
     }
 }
 
-/// Snapshot positions for a chat prompt, ascending: the end of the leading
-/// system block (the position before the SECOND `im_start`, which a new
-/// conversation on the same system prompt re-sends verbatim) and the
-/// chat boundary (before the last `im_start`, which begins the generation
-/// prompt and is what the next turn of this conversation re-sends verbatim).
+/// Snapshot positions for a chat prompt, ascending: the end of the first
+/// `<|im_start|>` block (the system block when the prompt has one — only
+/// `im_start` occurrences are counted, no role is read), which is the
+/// position before the SECOND `im_start` and what a new conversation on the
+/// same system prompt re-sends verbatim; and the chat boundary (before the
+/// last `im_start`, which begins the generation prompt and is what the next
+/// turn of this conversation re-sends verbatim).
 /// De-duplicated; each ≥ [`MIN_PREFIX_TOKENS`].
 pub fn chat_boundaries(prompt: &[u32], im_start: u32) -> Vec<usize> {
     let marks: Vec<usize> = prompt
@@ -703,7 +719,8 @@ mod tests {
         p.push(im); // index 42: generation prompt
         p.extend([7u32, 8, 9]);
         assert_eq!(chat_boundaries(&p, im), vec![31, 42]);
-        // Single-turn prompt without a system block: one boundary.
+        // First turn: the system-block end and the chat boundary are the same
+        // position (two `im_start`s), so the two rules de-duplicate to one.
         let mut q = vec![im];
         q.extend(std::iter::repeat_n(5u32, 30));
         q.push(im);
