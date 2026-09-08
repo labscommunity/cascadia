@@ -90,5 +90,8 @@ def test_qwen35_ir_dispatch_rejects_npu_target(tmp_path, monkeypatch):
     model = _stub_ir(tmp_path / "ir", "qwen3_5", "qwen3_5_text")
     monkeypatch.setattr(
         sys, "argv", _argv(model, tmp_path / "out", "--target", "npu"))
-    with pytest.raises(SystemExit, match="npu"):
+    with pytest.raises(
+        SystemExit,
+        match="qwen3_5-family IR sharding does not support --target npu",
+    ):
         export_shards.main()

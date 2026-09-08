@@ -323,6 +323,29 @@ def extract_stage(xml_path: str, spec: ModelSpec, a: int, b: int, first: bool, l
     return stage
 
 
+def build_manifest(spec: ModelSpec, source: str) -> dict:
+    """The manifest.json head the engine reads (`Manifest::parse` in
+    crates/cascadia-engine-openvino/src/qwen36.rs); `stages` is filled in
+    as the stages are written.
+
+    The key names are the contract with the engine: a missing `hidden_size`
+    is an error for `qwen3_5` and the Qwen3.6-era 2048 only for
+    `qwen3_5_moe`, and `last_logits_only` defaults to false — so a renamed
+    key fails at load for the dense tree but serves a mis-shaped one for the
+    MoE. Pure, so those names are pinned by unit test.
+    """
+    return {
+        "arch": spec.model_type,
+        "family": spec.family,
+        "hidden_size": spec.hidden,
+        "num_layers": spec.num_layers,
+        "layer_types": spec.layer_types,
+        "source": source,
+        "last_logits_only": True,
+        "stages": [],
+    }
+
+
 def validate_verdict(top1: bool, overlap: int, d: float, n: float, m: int) -> bool:
     """Acceptance for `--validate` (see the rationale in `_validate`):
     top-1 must match, top-5 must overlap >= 4/5, the raw drift must stay
@@ -374,16 +397,7 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False):
         f"{spec.layer_types.count(FULL)} {FULL}) vocab={spec.vocab}",
         flush=True,
     )
-    manifest = {
-        "arch": spec.model_type,
-        "family": spec.family,
-        "hidden_size": spec.hidden,
-        "num_layers": spec.num_layers,
-        "layer_types": spec.layer_types,
-        "source": os.path.basename(os.path.abspath(model_dir)),
-        "last_logits_only": True,
-        "stages": [],
-    }
+    manifest = build_manifest(spec, os.path.basename(os.path.abspath(model_dir)))
 
     for i, (a, b) in enumerate(ranges):
         first, last = i == 0, i == len(ranges) - 1

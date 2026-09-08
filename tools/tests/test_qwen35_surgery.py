@@ -216,6 +216,41 @@ def test_check_stage_ranges_requires_an_attention_layer_per_stage():
 
 
 # ---------------------------------------------------------------------------
+# build_manifest — the key names are the contract with the engine
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_pins_the_keys_the_engine_reads():
+    """`Manifest::parse` (crates/cascadia-engine-openvino/src/qwen36.rs)
+    defaults hidden_size to the Qwen3.6-era 2048 and last_logits_only to
+    false when they are absent, so a renamed key here serves a mis-shaped
+    tree instead of failing."""
+    m = sx.build_manifest(sx.spec_from_config(_qwen38_cfg()), "Qwen3.8-27B-int4-ov")
+    assert set(m) == {
+        "arch", "family", "hidden_size", "num_layers", "layer_types",
+        "source", "last_logits_only", "stages",
+    }
+    assert m["arch"] == "qwen3_5"
+    assert m["family"] == "qwen3_5"
+    assert m["hidden_size"] == 5120
+    assert m["num_layers"] == 64
+    assert m["layer_types"] == _layer_types(64)
+    assert m["source"] == "Qwen3.8-27B-int4-ov"
+    assert m["last_logits_only"] is True
+    assert m["stages"] == []
+
+
+def test_manifest_records_the_moe_arch_for_qwen36():
+    m = sx.build_manifest(sx.spec_from_config(_qwen36_cfg()), "Qwen3.6-35B-A3B-int4-ov")
+    assert (m["arch"], m["family"], m["hidden_size"]) == ("qwen3_5_moe", "qwen3_5", 2048)
+
+
+def test_manifest_is_json_serialisable():
+    m = sx.build_manifest(sx.spec_from_config(_qwen38_cfg()), "src")
+    assert json.loads(json.dumps(m)) == m
+
+
+# ---------------------------------------------------------------------------
 # validate_verdict — the gate that decides whether a tree may be served
 # ---------------------------------------------------------------------------
 
