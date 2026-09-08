@@ -2731,7 +2731,7 @@ impl Qwen36Engine {
             return;
         }
         match self.parts_local_stages() {
-            Some(parts) => {
+            Ok(parts) => {
                 let bytes: usize = parts.iter().map(Vec::len).sum();
                 debug_assert_eq!(parts.len(), self.stages.len());
                 let stored = self.prefix_cache.insert(key, parts);
@@ -2753,31 +2753,41 @@ impl Qwen36Engine {
                     "qwen35 prefix-cache snapshot"
                 );
             }
-            None => warn!(task = %task_id, pos, "qwen35 prefix-cache snapshot failed"),
+            Err(e) => {
+                warn!(task = %task_id, pos, error = %e, "qwen35 prefix-cache snapshot failed")
+            }
         }
     }
 
     /// Snapshot every local stage's OV KV state into one framed opaque blob (emb is stateless).
-    /// `None` if any stage can't snapshot (e.g. stub build) — capture degrades to cold reprefill.
+    /// `None` if any stage can't snapshot (e.g. stub build) — capture degrades to cold reprefill,
+    /// which is best-effort on the plane path, so the reason stays at `debug!` here.
     fn blob_local_stages(&mut self) -> Option<Vec<u8>> {
-        self.parts_local_stages()
-            .map(|parts| crate::prefix_cache::frame_blobs(&parts))
+        match self.parts_local_stages() {
+            Ok(parts) => Some(crate::prefix_cache::frame_blobs(&parts)),
+            Err(e) => {
+                tracing::debug!(error = %e, "qwen36: get_state_blob skipped (no KV capture)");
+                None
+            }
+        }
     }
 
     /// One `get_state_blob` per local stage, unframed (the prefix cache stores these as-is; the
-    /// kv_coord plane frames them with [`crate::prefix_cache::frame_blobs`]).
-    fn parts_local_stages(&mut self) -> Option<Vec<Vec<u8>>> {
+    /// kv_coord plane frames them with [`crate::prefix_cache::frame_blobs`]). The failure reason
+    /// is returned rather than logged: it is the only signal the always-on prefix cache has when
+    /// a snapshot does not happen, and that caller reports it at `warn!`.
+    fn parts_local_stages(&mut self) -> Result<Vec<Vec<u8>>, String> {
         let mut blobs = Vec::with_capacity(self.stages.len());
         for st in self.stages.iter_mut() {
             match st.get_state_blob() {
                 Ok(b) => blobs.push(b),
-                Err(e) => {
-                    tracing::debug!(error = %e, "qwen36: get_state_blob skipped (no KV capture)");
-                    return None;
-                }
+                Err(e) => return Err(e.to_string()),
             }
         }
-        (!blobs.is_empty()).then_some(blobs)
+        if blobs.is_empty() {
+            return Err("no local stages".into());
+        }
+        Ok(blobs)
     }
 
     /// Restore each local stage from a framed blob (inverse of [`Self::blob_local_stages`]).
