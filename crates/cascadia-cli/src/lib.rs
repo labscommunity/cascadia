@@ -1183,6 +1183,16 @@ fn warn_ignored_ov_perf_flags(args: &WorkerArgs) {
         );
     }
 
+    // The prefix cache lives in the qwen35 engine; no other builder has
+    // anywhere to put a budget, so an explicit --prefix-cache-gb would be
+    // dropped on the floor and the operator would keep measuring cold TTFTs.
+    if args.prefix_cache_gb.is_some() && !matches!(args.engine, EngineKind::Qwen36Moe) {
+        tracing::warn!(
+            engine = ?args.engine,
+            "ignoring --prefix-cache-gb: the prefix cache is qwen35-only"
+        );
+    }
+
     // --cb on CPU is a narrow win and has a severe failure mode. Measured on
     // Lunar Lake across Phi-3.5-mini and Qwen3-8B: short prompts at concurrency
     // gain 1.6-2.1x, but a ~1200-token prompt collapses to ~0.2x — a five-fold
@@ -1299,7 +1309,9 @@ fn preflight_model_path(args: &WorkerArgs) -> Result<()> {
     Ok(())
 }
 
-fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
+/// `prefix_cache_bytes` is resolved by the caller before the model loads (see
+/// [`cmd_worker`]); only the qwen35 arm has anywhere to put it.
+fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn Builder>> {
     warn_ignored_ov_perf_flags(args);
     match args.engine {
         EngineKind::Mock => Ok(Box::new(MockBuilder::new())),
@@ -1487,12 +1499,11 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             if let Some(group) = &args.ov_dyn_quant_group {
                 b = b.with_dyn_quant_group(group);
             }
-            let budget = resolve_prefix_cache_bytes(args.prefix_cache_gb)?;
             info!(
-                prefix_cache_gib = budget >> 30,
+                prefix_cache_gib = prefix_cache_bytes >> 30,
                 "qwen35 prefix-cache budget"
             );
-            b = b.with_prefix_cache_bytes(budget);
+            b = b.with_prefix_cache_bytes(prefix_cache_bytes);
             Ok(Box::new(b))
         }
     }
@@ -1726,6 +1737,13 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         ));
     }
     validate_worker_runtime_flags(&args)?;
+    // Resolve the sizing flags before anything compiles or loads a model: a
+    // 27B takes 40-80 s warm and minutes cold, and both of these used to be
+    // validated after that (`--api-max-body-mb`) or only on the qwen35 arm
+    // (`--prefix-cache-gb`, so nonsense passed silently on every other
+    // engine). Cheap, pure, and the same answer either side of the load.
+    let prefix_cache_bytes = resolve_prefix_cache_bytes(args.prefix_cache_gb)?;
+    let max_body = resolve_api_max_body_bytes(args.api_max_body_mb)?;
     let is_first = args.rank == 0;
     let is_last = args.rank == args.total - 1;
 
@@ -1779,7 +1797,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     };
 
     preflight_model_path(&args)?;
-    let builder = build_builder(&args)?;
+    let builder = build_builder(&args, prefix_cache_bytes)?;
     let runner = Arc::new(Runner::new(builder));
     let listen = if !is_first {
         Some((listen_host.as_str(), listen_port))
@@ -2013,7 +2031,6 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // Long-context serving: the 64 KiB body / 32 KiB prompt defaults hold
         // ~8 K tokens, a fraction of what the Qwen3.5-family and Llama-3.1
         // windows admit. Both caps follow one operator-facing knob.
-        let max_body = resolve_api_max_body_bytes(args.api_max_body_mb)?;
         cfg.max_body_bytes = max_body;
         cfg.max_prompt_bytes = max_body;
         // ov-genai owns native templating: render the template API-side only for
