@@ -38,7 +38,9 @@ use cascadia_ov_genai_shim::{advance_emitted, DType, PluginConfig, Runtime};
 use cascadia_transport::{
     ActivationClient, ActivationServer, DType as WireDType, Tensor as WireTensor, TransportError,
 };
-use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId};
+use cascadia_types::{
+    Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId,
+};
 use futures::stream;
 use tokenizers::Tokenizer;
 use tracing::{error, info, warn};
@@ -1075,7 +1077,12 @@ impl Qwen36Engine {
     }
 
     /// Finish the active task: reset state, log, emit the final marker.
-    fn finalize(&mut self) -> Vec<(TaskId, Chunk)> {
+    ///
+    /// `reason` is why decode stopped and rides on the final marker: without
+    /// it the API layer falls back to its `"stop"` default, so a turn cut off
+    /// at `max_tokens` (or at the context window, which admission folds into
+    /// `max_tokens`) was indistinguishable from a natural EOS.
+    fn finalize(&mut self, reason: FinishReason) -> Vec<(TaskId, Chunk)> {
         let Some(t) = self.active.take() else {
             return Vec::new();
         };
@@ -1136,7 +1143,9 @@ impl Qwen36Engine {
         }
         vec![(
             t.task_id.clone(),
-            Chunk::final_marker(t.task_id, "").with_prompt_tokens(t.prompt_ids.len() as u32),
+            Chunk::final_marker(t.task_id, "")
+                .with_prompt_tokens(t.prompt_ids.len() as u32)
+                .with_finish_reason(reason),
         )]
     }
 
@@ -1721,11 +1730,11 @@ impl Qwen36Engine {
             Vec::new()
         } else {
             if t.gen_ids.len() >= t.max_tokens {
-                return self.finalize();
+                return self.finalize(FinishReason::Length);
             }
             let next = t.next_token.expect("pipeline decode without pending token");
             if Some(next) == self.eos {
-                return self.finalize();
+                return self.finalize(FinishReason::Stop);
             }
             let step = t.step;
             let res = self
@@ -2472,7 +2481,7 @@ impl Qwen36Engine {
             Vec::new()
         } else {
             if t.gen_ids.len() >= t.max_tokens {
-                return self.finalize();
+                return self.finalize(FinishReason::Length);
             }
             let next = t
                 .logits
@@ -2482,7 +2491,7 @@ impl Qwen36Engine {
                 .map(|(i, _)| i as u32)
                 .unwrap_or(0);
             if Some(next) == self.eos {
-                return self.finalize();
+                return self.finalize(FinishReason::Stop);
             }
             let step = t.step;
             match self.run_span(&[next], step) {
@@ -3431,6 +3440,82 @@ mod tests {
             Some("pipeline decode failed: wire closed")
         );
         assert!(e.active.is_none(), "failed task must clear active state");
+    }
+
+    /// An `ActiveTask` parked at the decode stop, ready for `finalize`.
+    fn finalizable_task(max_tokens: usize, gen: usize) -> ActiveTask {
+        ActiveTask {
+            task_id: "t0".into(),
+            tenant: String::new(),
+            prompt_ids: vec![1, 2, 3],
+            prefill_idx: 3,
+            step: 3 + gen,
+            warm_prefix: 0,
+            snapshot_at: Vec::new(),
+            logits: Vec::new(),
+            next_token: Some(5),
+            gen_ids: vec![5; gen],
+            emitted: Vec::new(),
+            resume_seed_len: 0,
+            max_tokens,
+            started: Instant::now(),
+            snapshot_secs: 0.0,
+            wire_ms: Vec::new(),
+        }
+    }
+
+    /// A turn cut off at `max_tokens` must say so on the final marker. Without
+    /// a `finish_reason` the API layer defaults to `"stop"`, so a truncated
+    /// completion reads to the client as a natural end and the retry/continue
+    /// logic that keys on `"length"` never fires. Admission also caps
+    /// `max_tokens` at the context window, so hitting the window lands here too.
+    #[test]
+    fn finalize_reports_length_on_the_final_marker() {
+        let mut e = bare_engine(1, "{}");
+        e.active = Some(finalizable_task(4, 4));
+
+        let out = e.finalize(FinishReason::Length);
+        assert_eq!(out.len(), 1);
+        let (_, chunk) = &out[0];
+        assert!(chunk.is_final);
+        assert_eq!(
+            chunk.finish_reason,
+            Some(FinishReason::Length),
+            "a max_tokens stop must not read as a natural stop"
+        );
+        assert_eq!(
+            chunk.prompt_tokens,
+            Some(3),
+            "the finish reason must not displace the prompt-token count"
+        );
+        assert!(e.active.is_none());
+    }
+
+    /// The EOS path keeps reporting `Stop` — the reason is carried, not guessed.
+    #[test]
+    fn finalize_reports_stop_on_the_final_marker() {
+        let mut e = bare_engine(1, "{}");
+        e.active = Some(finalizable_task(16, 1));
+
+        let out = e.finalize(FinishReason::Stop);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1.finish_reason, Some(FinishReason::Stop));
+    }
+
+    /// End to end through the local decode loop: a task already at
+    /// `max_tokens` stops on the next `step_local` and that marker carries
+    /// `Length`. Prefill is complete and the stop check precedes any stage
+    /// call, so this runs on a stage-less engine.
+    #[test]
+    fn local_decode_max_tokens_stop_reports_length() {
+        let mut e = bare_engine(1, "{}");
+        e.active = Some(finalizable_task(4, 4));
+
+        let out = e.step_local();
+        assert_eq!(out.len(), 1);
+        let (_, chunk) = &out[0];
+        assert!(chunk.is_final);
+        assert_eq!(chunk.finish_reason, Some(FinishReason::Length));
     }
 
     /// `cancel()` must reset the stage requests, not just drop the task. A prefix-cache hit
