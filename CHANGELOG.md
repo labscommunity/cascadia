@@ -1,5 +1,82 @@
 # Changelog
 
+## [0.2.3](https://github.com/labscommunity/cascadia/compare/v0.2.2...v0.2.3) (2026-09-09)
+
+
+### Features
+
+* **cli:** --api-max-body-mb — lift the 64 KiB body / 32 KiB prompt caps for long-context serving (default 4 MiB) ([30af305](https://github.com/labscommunity/cascadia/commit/30af3053978c6bf77fe449e64ba50094b2a22353))
+* **cli:** validate --prefix-cache-gb/--api-max-body-mb; RAM-aware cache default ([3121f2f](https://github.com/labscommunity/cascadia/commit/3121f2fc10d87b2d2dea6cd64c404c2564b6186e))
+* **qwen35:** always-on prefix cache — chat-boundary + turn-end state snapshots, restored at admission ([97220fa](https://github.com/labscommunity/cascadia/commit/97220fac06cb1202cd2e385adeed2a91fbf03754))
+* **qwen35:** dense Qwen3.8-27B (qwen3_5) through the Qwen3.6 surgery + staged engine ([79666df](https://github.com/labscommunity/cascadia/commit/79666dfda378992ac4c9740aa6994e73a2ce287d))
+* **qwen35:** prefix-cache snapshot at the end of the system block too (shared-system-prompt hits) ([a2371a5](https://github.com/labscommunity/cascadia/commit/a2371a54c38210ed9f09b5164d836eb8a7429d11))
+* **qwen35:** serve dense qwen3_5 (Qwen3.8-27B) through the Qwen3.6 surgery + staged engine ([8a4a38e](https://github.com/labscommunity/cascadia/commit/8a4a38e02746caf6b2ae154206f33905b394da1b))
+
+
+### Bug Fixes
+
+* **api:** a caller's own rejected reasoning_effort is a 400, not the template default ([4069e01](https://github.com/labscommunity/cascadia/commit/4069e013c980a9a4382a5e934f79ec8a1274d720))
+* **api:** render again when a template rejects the mapped reasoning_effort ([16bdce0](https://github.com/labscommunity/cascadia/commit/16bdce0a84650109aad5470c5dccb7942ebd2408))
+* **cli:** bound --prefix-cache-gb by physical RAM and warn when RAM is unreadable ([da4230a](https://github.com/labscommunity/cascadia/commit/da4230a8d67c95cb512c6f0c76dde12bdfe2c367))
+* **cli:** pass the run-only flags through single_node instead of patching ([230b47c](https://github.com/labscommunity/cascadia/commit/230b47c5caac61ef36adadfa2771acc606b70d5f))
+* **cli:** validate --api-max-body-mb and --prefix-cache-gb before the model loads ([6c1439b](https://github.com/labscommunity/cascadia/commit/6c1439b0e59d13949797d93a7f5e54d1f45f3ac1))
+* **export:** a failed --validate exits non-zero ([4e85c1d](https://github.com/labscommunity/cascadia/commit/4e85c1d982591c017325bb96fb03a499b4d16917))
+* **export:** manifest arch is the family model_type, not the wrapper's ([d277d9f](https://github.com/labscommunity/cascadia/commit/d277d9f69c2d8a352f86478b037a40e98045e349))
+* **export:** reject --target npu on the qwen3_5 IR-surgery dispatch ([8825a17](https://github.com/labscommunity/cascadia/commit/8825a173ee04cc41c7ecdeb11ef5ee4a6309d785))
+* **export:** reject a layer_types list of the wrong length ([2c306e0](https://github.com/labscommunity/cascadia/commit/2c306e08ac469ace5d26bf6583e4892eca469014))
+* **qwen35:** derive Debug on the manifest types (unwrap_err in tests) ([ec6aa4a](https://github.com/labscommunity/cascadia/commit/ec6aa4afdd431c07841ae09dc3d2bf9dcba4cf52))
+* **qwen35:** keep the shared system-block snapshot out of the LRU victim slot ([825f826](https://github.com/labscommunity/cascadia/commit/825f826793204f8837f8b0ecbaa250c5eb6b17ad))
+* **qwen35:** prefix-cache review fixes (parts, every-turn snapshots, restore order) ([f72cf18](https://github.com/labscommunity/cascadia/commit/f72cf1865af9a8935ecaeaf1461d3125e16ddd77))
+* **qwen35:** prefix-cache snapshots only from cold turns; bound the warm tail ([3010bda](https://github.com/labscommunity/cascadia/commit/3010bda4f9338ea3c3650ecd9f644b743819c8d3))
+* **qwen35:** prime un-run stage requests before a state restore (GPU plugin drops set_state on a never-run request) ([b2e5740](https://github.com/labscommunity/cascadia/commit/b2e574096a784874a46d84d96c3dcd320775074d))
+* **qwen35:** refuse to serve on a stage whose reset failed ([bdbccdf](https://github.com/labscommunity/cascadia/commit/bdbccdf0eaf4b26ab69713161cc930b4dd91ce25))
+* **qwen35:** report finish_reason on the final chunk ([0544a31](https://github.com/labscommunity/cascadia/commit/0544a31ac42fb36beb8e5c0eaf15cf63154551dc))
+* **qwen35:** require hidden_size for dense qwen3_5 manifests ([ea7227a](https://github.com/labscommunity/cascadia/commit/ea7227a6f6d00fe672427e9ef6934a28ebd5ebcc))
+* **qwen35:** size the 413 guard on the sequence admission prefills ([554c3ab](https://github.com/labscommunity/cascadia/commit/554c3ab3455a2112d1d93cb726e82adb62133168))
+* **qwen35:** stop copying snapshots the budget has refused ([8ac470c](https://github.com/labscommunity/cascadia/commit/8ac470c2cd945b360b3e57bd2a47d25865c97d82))
+* **qwen35:** surface the state-capture error at warn ([5fe1d5f](https://github.com/labscommunity/cascadia/commit/5fe1d5fa306f45ed2a9899fd161a5af4e0235c7f))
+* **qwen35:** warn when a load-time detection disables a guard ([39bcb29](https://github.com/labscommunity/cascadia/commit/39bcb29e6408bbadcafd599e2e2f0f8d4b745a80))
+
+
+### Performance
+
+* **qwen35:** log the post-turn reset time ([62d8daa](https://github.com/labscommunity/cascadia/commit/62d8daa631a57d01941b121c7369b7f83e7a96e8))
+* **qwen35:** refresh warm-turn snapshots at the measured break-even ([58cf278](https://github.com/labscommunity/cascadia/commit/58cf2785ca26d7a5bed543c18548e1a6f9fba530))
+
+
+### Documentation
+
+* **cli:** reattach resolve_ov_cache_dir's rustdoc; correct the snapshot-size help text ([c6f8df5](https://github.com/labscommunity/cascadia/commit/c6f8df542b99517e566468aa833cb4a4d20d7901))
+* **qwen3.8:** 256K sweep point; ov-genai serves on the 2026.2.1 SDK too (corrected row) ([9b4d54c](https://github.com/labscommunity/cascadia/commit/9b4d54cf7957cbfffef9be25edcb0097c0e2b5fb))
+* **qwen3.8:** architecture page — serving paths, fine-tune export recipe, tate-07 validation record ([0465cd9](https://github.com/labscommunity/cascadia/commit/0465cd93080245c95506cd447b61ad38246d842f))
+* **qwen3.8:** context-capacity sweep on the B390 (1K–128K) ([22eeffa](https://github.com/labscommunity/cascadia/commit/22eeffa21490dd2e56e2539ec17973d78f79eb5b))
+* **qwen3.8:** correct the snapshot-size figures, the ov-genai cross-reference, and the framing note ([26905e0](https://github.com/labscommunity/cascadia/commit/26905e0c1d9848a57f7e9b50c78d9580a001ff12))
+* **qwen3.8:** end-to-end API throughput table (qwen35 staged vs ov-genai) and the GenAI-version finding ([a4f5c63](https://github.com/labscommunity/cascadia/commit/a4f5c63290f52b4f5e7110d01087810cf0f91ead))
+* **qwen3.8:** headline run recipe, snapshot policy, engine-name sweep ([0b590e6](https://github.com/labscommunity/cascadia/commit/0b590e6e697bd206e1c4234fe71da53bbcdf07b8))
+* **qwen3.8:** HF bf16 reference parity table for the Qwopus exports ([80a8959](https://github.com/labscommunity/cascadia/commit/80a8959874862207176a04637a705cc0cbe87f5b))
+* **qwen3.8:** Intel IR tokenizer-IR incompatibility isolated + convert_tokenizer fix ([7bda7c5](https://github.com/labscommunity/cascadia/commit/7bda7c54347c67d7cc4c4f4eae817219a2ce2301))
+* **qwen3.8:** measured cold-TTFT levers (prefill chunk, PagedAttention gap, stage overlap, prefix cache) ([5dee2ec](https://github.com/labscommunity/cascadia/commit/5dee2ecd5d71265b2137a389f24707d8a90d38ae))
+* **qwen3.8:** prefix caching — what exists (kv_coord warm resume) and measured restore vs prefill ([fffb78e](https://github.com/labscommunity/cascadia/commit/fffb78ebf3127f7645556735e6761d1050d80a7b))
+* **qwen3.8:** prefix-cache certification table (8K/32K, cache on vs off, warm == cold) ([1775504](https://github.com/labscommunity/cascadia/commit/1775504d87e68528fb1216a201a509220f489ec1))
+* **qwen3.8:** prefix-cache eviction rule (shared system block stays hot) ([471c806](https://github.com/labscommunity/cascadia/commit/471c80636e4ada256fdff39f2555983cdfe9556f))
+* **qwen3.8:** prefix-cache snapshot policy (cold turns, bounded warm tail) ([99dd5a8](https://github.com/labscommunity/cascadia/commit/99dd5a807710cc8828a95bfe97f05e3a56c3d4f6))
+* **qwen3.8:** prefix-cache snapshot positions (chat boundary, system block, turn end) ([27307b2](https://github.com/labscommunity/cascadia/commit/27307b2ccd2a224cad02e3f6dc9097faef2268e0))
+* **qwen3.8:** Qwen3.6 regression record (exporter, qwen35 engine, legacy manifest via alias) ([347363b](https://github.com/labscommunity/cascadia/commit/347363ba002460ca7d08bfa08f304bd0734db81e))
+* **qwen3.8:** re-certification tables (refresh rule + eviction-pressure run) ([8bce208](https://github.com/labscommunity/cascadia/commit/8bce208d3a818b264f65578e63d4cdbcb3fbd1bc))
+* **qwen3.8:** second certification pass on tate-07 at the review-fix tip ([492a4c6](https://github.com/labscommunity/cascadia/commit/492a4c6e8eaa151c7c4468999c143af08556df30))
+* **qwen35:** correct stale prefix-cache comments ([4a46794](https://github.com/labscommunity/cascadia/commit/4a4679467b257d3e82e85d4fe1494db343141f6f))
+* **qwen35:** rename qwen36-moe mentions to qwen35 and point at the Qwen3.8 page ([2b0bf88](https://github.com/labscommunity/cascadia/commit/2b0bf881ef2986b870aa48d9070aaa5087954bad))
+* **qwen35:** reset/admission comments match the always-on cache ([66ed709](https://github.com/labscommunity/cascadia/commit/66ed7096c2fe4eb3ec3b6449857a0da2011ef220))
+* sweep stale flag defaults, engine names, and fixture lists ([791973c](https://github.com/labscommunity/cascadia/commit/791973c47ba775ee032cc217bb26a40b1347d925))
+
+
+### Testing
+
+* **export:** tighten the npu-rejection match; pin the manifest keys ([9a089db](https://github.com/labscommunity/cascadia/commit/9a089db04a8a8602dd2488718c21e493cf71df9d))
+* **qwen35:** bless the Qwen3.8 (Qwopus 2-stage) 64-token greedy parity golden ([e4bf52f](https://github.com/labscommunity/cascadia/commit/e4bf52f246ec878703d8c49e2604fbec2afeff7e))
+* **qwen35:** cancel() resets the stage requests ([6b740e8](https://github.com/labscommunity/cascadia/commit/6b740e8606cacaa815023691d293cd051b7e752b))
+* **qwen35:** pin multi-entry eviction and byte accounting ([7db54ab](https://github.com/labscommunity/cascadia/commit/7db54ab7c4463dabd8e6a4fa716b7e870ec2668e))
+
 ## [0.2.2](https://github.com/labscommunity/cascadia/compare/v0.2.1...v0.2.2) (2026-08-28)
 
 
