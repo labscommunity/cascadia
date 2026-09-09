@@ -1,0 +1,510 @@
+# Qwen3.8-27B (dense `qwen3_5`) — and fine-tunes like Qwopus3.8-27B-Flash
+
+Status: **served two ways, hardware-validated on a Panther Lake AI PC
+(2026-09-04)**: single-stage through `ov-genai`, and staged through the
+`qwen35` engine (the Qwen3.6 IR-surgery machinery, made config-driven).
+
+## The model
+
+`Qwen/Qwen3.8-27B` (Apache-2.0, 2026-08-14) is `Qwen3_5ForConditionalGeneration`,
+`model_type: qwen3_5` — the **dense** member of the Qwen3.5 architecture
+family whose MoE member (`qwen3_5_moe`, Qwen3.5/3.6-35B-A3B) Cascadia already
+serves ([qwen3.6.md](./qwen3.6.md), [qwen36-moe-support.md](./qwen36-moe-support.md)).
+There is no `qwen3_8` model type anywhere (HF, optimum-intel, llama.cpp).
+
+- 64 layers in the 3:1 pattern: 48× Gated DeltaNet (linear attention —
+  recurrent `ssm` + `conv` state, **no KV cache**; 16 K-heads / 48 V-heads ×
+  128, conv kernel 4) + 16× gated full attention (GQA 24/4, head_dim 256,
+  `attn_output_gate`, partial-rotary 0.25, interleaved mRoPE `[11,11,10]`,
+  `rope_theta 1e7`). Full attention at layers 4k+3.
+- `hidden_size 5120`, `intermediate_size 17408` (dense SwiGLU MLP — no
+  experts), `vocab_size 248320`, untied embeddings, 262K native context,
+  `mtp_num_hidden_layers 1`, 27-layer vision tower (text-only here).
+- The `state_dict` also carries `mtp.*` (one MTP layer + `fc`) and
+  `visual.*`. Fine-tunes such as `Jackrong/Qwopus3.8-27B-Flash` keep the
+  identical config and tensor set, so the same export recipe applies.
+
+**GGUF is not the way in.** `Qwopus3.8-27B-Flash-GGUF` (llama.cpp arch
+`qwen35`, MTP layer stored as `blk.64.*`) is rejected by OpenVINO GenAI's
+GGUF reader (`llama` / `qwen2` / `qwen3` only) and by
+`transformers(gguf_file=)`; OpenVINO core's native GGUF frontend lists
+`qwen35` only in 2026.4 nightlies (greedy, batch 1). Export from the
+safetensors sibling repo instead — the fine-tune author publishes both.
+
+## Serving path A — single-stage `ov-genai` (whole-model IR)
+
+Any `*-int4-ov`-layout export (Intel's `OpenVINO/Qwen3.8-27B-int4-ov`, or your
+own — below) is VLM-layout (`openvino_language_model.xml` + text-embeddings +
+vision IRs, no `openvino_model.xml`); the `ov-genai` engine auto-detects that
+and serves text-only through `VLMPipeline`, exactly as for Qwen3.6:
+
+```bash
+hf download OpenVINO/Qwen3.8-27B-int4-ov --local-dir ./Qwen3.8-27B-int4-ov
+# Intel's published IR carries tokenizer IRs built with a nightly
+# openvino-tokenizers; regenerate them with the installed one first
+# (details under "Why Intel's published IR throws" below):
+convert_tokenizer ./Qwen3.8-27B-int4-ov --with-detokenizer -o ./Qwen3.8-27B-int4-ov
+cascadia run ./Qwen3.8-27B-int4-ov --engine ov-genai --device GPU --api :8000
+```
+
+`cascadia run` takes a local directory only (it never downloads); the
+`qwen3.8-27b` alias is for `cascadia shard`. Nothing in Cascadia inspects
+`model_type` on this path; support is OpenVINO GenAI's (2026.2+ has the fused
+GatedDeltaNet op and the Qwen3.5 VLM pipeline).
+
+## Serving path B — staged `qwen35` (IR surgery, 1–16 stages)
+
+`cascadia shard` recognises `qwen3_5` / `qwen3_5_moe` config-first and cuts
+the official IR at decoder-layer boundaries (no re-export, no
+re-quantisation; stages inherit the int4 weights byte-for-byte):
+
+```bash
+cascadia shard --model qwen3.8-27b --output-dir ./qwen38-2stage --num-stages 2
+cascadia run ./qwen38-2stage --engine qwen35 --device GPU --api :8000
+```
+
+What changed versus the Qwen3.6-only exporter (`tools/qwen36_surgery/export_qwen36_moe.py`):
+
+- hidden size, layer count and per-layer attention type are read from the
+  model dir's `config.json` (`text_config`); the 27B's `past.{conv,ssm}.0..47`
+  / `past.{key,value}.0..15` state ids are found by walking `layer_types`
+  instead of the 40-layer interval formula.
+- every stage must own at least one full-attention layer (the orphan-state
+  rewire needs a same-kind cache to redirect global mask/past-length reads
+  onto) ⇒ **at most 16 stages** for the 64-layer 27B; the exporter refuses
+  finer splits up front.
+- the manifest records `arch` (`qwen3_5`), `family`, `hidden_size`,
+  `num_layers`, `layer_types`; the engine sizes its activation frames from
+  `hidden_size` (5120 here; 2048 default for Qwen3.6-era manifests without it).
+  A 256-token prefill chunk is a 5 MiB wire frame — far under the 256 MiB
+  transport cap.
+
+The MoE block was always opaque to the cut, so the engine, the pipeline
+frames, DeltaNet reset semantics and the greedy-only / batch=1 invariants
+(qwen36-moe-support.md §4.1) carry over unchanged.
+
+## Exporting a fine-tune (Qwopus3.8-27B-Flash recipe)
+
+Toolchain that worked (isolated venv): `transformers==5.2.0` (optimum-intel
+pins `5.2.x` for `qwen3_5`; 5.0.0 fails with
+`cannot import name 'Qwen3_5DynamicCache'`), `optimum-intel` main
+(≥ 2.2.0.dev0 — includes the MTP head export), `nncf 3.3.0`,
+`openvino 2026.3.1`, torch CPU. The task **must** be `image-text-to-text`
+(`text-generation-with-past` is rejected for `qwen3_5`; the vision IRs it
+emits are small and ignored at serve time).
+
+```bash
+optimum-cli export openvino --model Jackrong/Qwopus3.8-27B-Flash \
+    --task image-text-to-text --weight-format int4 --group-size 128 \
+    --ratio 1.0 --group-size-fallback ignore ./Qwopus3.8-27B-Flash-int4-ov
+```
+
+That is Intel's published recipe (INT4_ASYM, g128, ratio 1.0). Notes from the
+run on a 64 GB box:
+
+- the bf16 checkpoint is 52 GB and loads whole; export peaks right at a
+  64 GB box's commit limit (auto-managed pagefile grew 67 → 70 GB). Stop
+  anything else memory-heavy first.
+- fine-tune repos may lack `preprocessor_config.json` /
+  `video_preprocessor_config.json` — copy them from `Qwen/Qwen3.8-27B`.
+- `main_export()` from Python writes the **bf16** IR (51 GB) and does not
+  compress; the CLI compresses as a second step. Equivalent by hand:
+  `OVModelForVisualCausalLM.from_pretrained(bf16_dir, quantization_config=
+  OVWeightQuantizationConfig(bits=4, sym=False, group_size=128, ratio=1.0,
+  group_size_fallback="ignore")).save_pretrained(int4_dir)` (2.6 min).
+  The bf16 IR is worth keeping as a lossless on-device reference.
+- output matches Intel's layout byte-for-byte in size: 13.93 GB language
+  model, 1.27 GB text embeddings, 0.26 GB MTP head, 0.46 GB vision merger.
+
+## Validation record — tate-07 (Intel Core Ultra X7 358H, Arc B390, 64 GB)
+
+Panther Lake: 16 cores (4P+8E+4LPE), 64 GB LPDDR5X-8533 (~136 GB/s), Arc
+B390 iGPU (12 Xe3 cores, 33.5 GiB UMA visible to OpenVINO), NPU 5; Windows
+11; driver 32.0.101.8860. Runtime: OpenVINO 2026.3.x Python for the raw-IR
+probes, GenAI 2026.2.1 SDK for the `cascadia` binary (MSVC build — the
+MinGW toolchain cannot link the C++ GenAI API). Raw-IR numbers use the
+stateful IR directly (`inputs_embeds` / `attention_mask` / `position_ids
+[4,1,T]` all mRoPE rows equal / `beam_idx`), chunked prefill, T=1 greedy
+decode — the same contract the staged engine feeds.
+
+**Q1 — does it export properly?** Yes. Intel's `Qwen3.8-27B-int4-ov` and our
+Qwopus int4 export both load and decode correctly on CPU and GPU, and the
+2-stage surgery of the Qwopus IR validates (`--validate`: top-1 match,
+top-5 overlap 5/5, 8/8 multi-token greedy parity chain vs whole model,
+relative logit drift 1.6e-2 from stage-boundary f16 fusion order).
+
+| IR | device | decode tok/s | notes |
+|---|---|---|---|
+| Intel `Qwen3.8-27B-int4-ov` | GPU (B390) | **6.3–6.4** (3 runs × 63 tok) | compile 60 s, 16 GB resident, TTFT 0.23–0.26 s at 5-token prompt |
+| Intel `Qwen3.8-27B-int4-ov` | CPU | 3.67 | first run (20–28 s JIT warm-up on the first inference), 28 GB resident |
+| Qwopus int4 (ours) | GPU (B390) | **6.4–6.7** (six prompts) | identical answers to CPU; 391 for 17×23, primes 101/103, haiku, `<think>` on raw prompts |
+| Qwopus int4 (ours) | CPU | 3.8 | 28 GB resident |
+
+Greedy text is identical between CPU and GPU for the same prompt on both
+IRs. The bandwidth ceiling for ~14 GB of int4 weights at 136 GB/s is ~9–10
+tok/s; the stateful path's GatedDeltaNet reference kernel on CPU
+(openvino #37845: only the PagedAttention path has the optimised GDN kernel)
+explains most of the CPU gap.
+
+**HF-reference parity (Qwopus).** Reference: `transformers 5.2.0` bf16
+greedy on a 28-core Mac Pro (1.5 TB RAM; `Qwen3_5ForCausalLM`, MTP and
+vision tensors dropped, ~2 s/token). Compared token-for-token over 32
+greedy tokens against the OpenVINO exports on tate-07:
+
+| prompt | OV **bf16** IR (CPU) | OV **int4** IR (GPU = CPU) |
+|---|---|---|
+| raw `The capital of France is` | 32/32 | 32/32 |
+| raw `user: Explain how rainbows form.` (the parity-test prompt) | 32/32 | 32/32 |
+| chat `What is 17 * 23? …` | 4/4 (`391`) | 4/4 (`391`) |
+| chat `List three prime numbers greater than 100.` | 32/32 | diverges at token 15 (`1.  **101**` vs `1. **101**`: a spacing token; content identical) |
+| chat `Write a haiku about mountains.` | diverges at token 0 | diverges at token 2 |
+
+The haiku's first step is an **exact bf16 logit tie** in the reference
+(`Stone` vs the alternative, both 18.5), so both OpenVINO results are the
+other side of a coin flip, not an error. Net: the bf16 IR reproduces the
+HF reference exactly wherever the reference is not tied — the export is
+correct — and the int4 IR's residual differences are quantisation
+near-ties, with every factual answer intact.
+
+**Q2 — throughput through the real entry point.** `cascadia run … --api`
+then `POST /v1/chat/completions` (`enable_thinking: false`, `max_tokens 96`,
+greedy). `completion_tps` = completion tokens / whole-request wall time, so
+it includes prefill of the 19-token prompt and HTTP.
+
+| path | binary / SDK | device | load | 96-token request | 17×23 |
+|---|---|---|---|---|---|
+| `--engine qwen35`, Qwopus 2-stage chain (`cascadia shard --num-stages 2`) | MSVC, GenAI 2026.2.1 | GPU (B390) | 41 s (both stages) | **15.0–15.6 s → 6.2–6.4 tok/s** | `391` |
+| `--engine qwen35`, same chain | MSVC, GenAI 2026.2.1 | CPU | ~80 s | 32.2 s → 3.0 tok/s | `391` |
+| `--engine ov-genai`, Qwopus int4 (whole IR, `VLMPipeline` text-only) | MSVC, GenAI **2026.3.0** | GPU (B390) | ~60 s | **13.2 s → 7.3 tok/s** | `391` |
+| `--engine ov-genai`, Qwopus int4 | MSVC, GenAI 2026.2.1 | CPU | ~40 s | serves (`391`; throughput not measured on CPU) | `391` |
+| `--engine ov-genai`, Intel `Qwen3.8-27B-int4-ov` as published | MSVC, GenAI 2026.2.1 **and** 2026.3.0 | GPU | — | `pipeline_create_vlm` throws (tokenizer IRs, see below) | — |
+| `--engine ov-genai`, Intel IR after `convert_tokenizer` | MSVC, GenAI 2026.2.1 and 2026.3.0 | CPU | ~40 s | serves | `391` |
+
+So on this box the single-stage GenAI path is the fastest (its PagedAttention
+backend has the optimised GatedDeltaNet kernel) and works on both the
+2026.2.1 SDK the repo pins and 2026.3; the staged path is ~15 % behind on
+GPU.
+
+**Why Intel's published IR throws, and the fix.** Its `openvino_tokenizer`
+/ `openvino_detokenizer` IRs were built with openvino-tokenizers **2026.4
+nightly** (stateful `ReadValue`/`Assign` ops and a bare `Truncate` op that
+the 2026.2/2026.3 tokenizer extension cannot load); GenAI's `VLMPipeline`
+constructor loads them and throws. Isolated with hard-linked variants of
+the Intel directory served by the same binary:
+
+| variant of `OpenVINO/Qwen3.8-27B-int4-ov` | `ov-genai` |
+|---|---|
+| as published | throws in `pipeline_create_vlm` |
+| + our `chat_template.jinja` only | throws |
+| + tokenizer/detokenizer IRs from a 2026.3.1 export (Intel's template kept) | **serves** (`391`) |
+| + tokenizer/detokenizer IRs regenerated in place with `convert_tokenizer` 2026.3.1 | **serves** (`391`) |
+| as published, GenAI **2026.5 nightly** Python `VLMPipeline` | creates in 9 s, generates correctly (`LLMPipeline` still rejects the template's `is undefined`) |
+
+The chat template is not the problem on Cascadia's path (the API renders it
+itself). So, until the shim is built against a 2026.4+ GenAI SDK, serve
+Intel's IR after one command with the *installed* openvino-tokenizers:
+
+```bash
+convert_tokenizer /path/to/Qwen3.8-27B-int4-ov --with-detokenizer -o /path/to/Qwen3.8-27B-int4-ov
+```
+
+Exports made with the 2026.3 toolchain (the recipe above) need nothing.
+
+**Q3 — context capacity** (weights resident, growing synthetic prompt).
+Qwopus int4 on the B390 via the raw stateful IR (512-token prefill chunks,
+16 greedy tokens after the prompt), one run per point, fresh process each
+(RSS = host-visible resident set incl. the iGPU's UMA allocations; the
+OVMS node was paused so the box was otherwise idle):
+
+| prompt tokens | TTFT | prefill tok/s | decode tok/s | resident |
+|---|---|---|---|---|
+| 1 K | 2.4 s | 425 | 6.1 | 17.1 GB |
+| 4 K | 8.1 s | 505 | 6.4 | 18.1 GB |
+| 8 K | 15.5 s | 527 | 6.1 | 19.1 GB |
+| 16 K | 32.8 s | 500 | 6.2 | 19.5 GB |
+| 32 K | 78.5 s | 417 | 5.1 | 20.8 GB |
+| 64 K | 219 s | 299 | 4.0 | 21.9 GB |
+| 128 K | 667 s | 196 | 3.1 | 25.1 GB |
+| 256 K (native max) | 3256 s (54 min) | 81 | 2.5 | 31.9 GB at decode (~43 GB peak during prefill) |
+
+Memory is not the limit on a 64 GB box: state grows ~60–120 KB per
+context token (16 attention layers × 4 KV heads × 256 × f16 = 64 KB/token
+of KV; the 48 DeltaNet layers hold fixed-size recurrent state), so even
+the full 262 K window costs well under 32 GB on top of the 16 GB of
+weights. What degrades is time: prefill falls from ~500 tok/s to ~200
+tok/s as attention over the growing KV dominates, and decode from 6.4 to
+3.1 tok/s by 128 K. Practical guidance on this hardware: ≤32 K tokens
+stays interactive (TTFT ≲ 80 s, decode ≥ 5 tok/s); 64–128 K works but
+TTFT is 4–11 minutes; the full 262 K window fits (peak ~43 GB of 64 GB)
+but costs 54 minutes of prefill, so it is a capacity fact, not a usable
+setting on an iGPU. (The 256 K prompt was 4 tokens over the model's
+`max_position_embeddings`; mRoPE extrapolated without error.)
+
+**Regression — Qwen3.6-35B-A3B on the same exporter and engine** (tate-07,
+B390). The config-driven exporter cut `OpenVINO/Qwen3.6-35B-A3B-int4-ov`
+exactly as before (`qwen3_5_moe`, 40 layers = 30 linear + 10 full, 40 state
+variables per 20-layer stage; `--validate`: top-1 match, top-5 5/5, 8/8
+greedy chain-vs-whole). Served through `cascadia run --engine qwen35 --device
+GPU --api`: `391` for 17×23 and a correct 64-token rainbow answer at
+**19–20 tok/s** end-to-end (the MoE reads ~1.7 GB per token; the Lunar Lake
+numbers in qwen36-moe-support.md were 4.7–8.8). The same tree with its
+manifest stripped to the Qwen3.6-era keys (`arch`, `source`,
+`last_logits_only`, `stages` — no `hidden_size`) served identically through
+the `--engine qwen36-moe` alias, so existing shard trees and scripts keep
+working.
+
+**Prefix caching (always on in `qwen35`).** The engine keeps a byte-bounded
+LRU of chain-state snapshots keyed by exact token prefix
+(`crates/cascadia-engine-openvino/src/prefix_cache.rs`) and restores the
+longest cached strict prefix of each new prompt at admission, prefilling
+only the tail. A lookup marks *every* entry the prompt extends as used, not
+only the longest, and among equally-recent entries the longest is evicted
+first: a shared system-block entry stays hot while any conversation on it
+is active instead of becoming the LRU victim of that conversation's own
+boundary refreshes (measured before the fix: the fourth 4.45 GB snapshot at
+32 K pushed the 16 GiB budget over, evicted the system block, and the next
+conversation on that prompt went cold at 110 s). Snapshot positions on a
+cold turn:
+
+- the **chat boundary** — the position before the prompt's last
+  `<|im_start|>` (the generation prompt). This is the part the next turn of
+  the same conversation re-sends verbatim: the family's chat template
+  renders a history assistant turn *without* the `<think>` block the live
+  generation prompt carries, so a snapshot keyed on the previous turn's
+  full sequence would never match. The prefill span is split at that
+  position so the state is captured exactly there.
+- the **end of the system block** — before the second `<|im_start|>` — so a
+  new conversation on the same system prompt (a RAG document, an agent's
+  tool manifest) starts warm too.
+
+Lookups are non-consuming, so a shared system prompt serves every
+conversation that starts with it. A restore lands on the live requests
+after one **priming** fold when they have not run since their last reset:
+measured on the GPU plugin, a `set_state` onto a request that has never
+executed since reset is silently discarded on the next inference (KV depth
+= tokens folded since, logits off by ~19), while the same restore onto a
+request that has run holds bit-exactly (Δ logits 0.0) — the engine's
+turn-end reset made every warm admission the discard case until this was
+found, and it is also why the first certification run saw "snapshots taken
+after a restore" read back shallow: the restore they followed had been
+dropped. With priming, a primed restore reads back the full state, so a
+warm turn can snapshot too. Each copy is paid inside that turn's TTFT,
+though, so on a warm turn a boundary snapshot is a **refresh** taken only
+once the tail it would save (tokens between the restored prefix and the
+boundary, which every later turn re-prefills otherwise) has grown to cost
+as much as the copy — the break-even is computed from the engine's own
+measured prefill rate and snapshot copy rate, not a constant, so a CPU box
+that prefills slowly refreshes sooner than an iGPU. Short follow-ups thus
+pay restore + tail only, the tail can never grow past one copy's worth of
+prefill, and a conversation never goes cold. Snapshots are skipped while a
+stage reset has failed (`stages_dirty`), and `cancel()` resets so the next
+admission always starts from the certified reset → prime → restore order.
+DeltaNet state cannot be trimmed, so this
+is snapshot-at-boundary caching: a hit costs one `set_state_blob` per stage
+(a memcpy of ~130 KB per context token as serialised by `get_state_blob`,
+plus ~150 MB of recurrent state) and the tail's prefill; a miss costs a full
+prefill plus one snapshot copy of the same size. That is roughly 2× the f16
+KV footprint quoted above (the serialised form is what `get_state_blob`
+returns; the cause was not isolated). `--prefix-cache-gb` sets the budget (default
+min(16 GiB, RAM/4); 0 disables; measured 1.2 GB at 8 K and 4.45 GB at 32 K,
+so ~17 GB at 128 K — a single 128 K snapshot does not fit the default
+budget). Single process only: in pipeline mode (`--total > 1`) the
+downstream ranks' state is not local, which the `kv_coord` coordination
+plane covers with its CAPTURE/RESTORE frames (the framing helpers
+`frame_blobs`/`unframe_blobs` live in `prefix_cache.rs` and are re-exported
+to that plane; the in-process cache stores its parts unframed, so no u32
+length bound applies to them).
+
+The cache is **process-wide and not tenant-scoped**: entries are keyed by
+token prefix alone, unlike the `kv_coord` plane, which namespaces captures
+by tenant and is never cross-tenant. The community API never sets a tenant,
+so nothing crosses tenants today, but a hit or miss is observable through
+TTFT — a multi-tenant deployment should run one process per tenant or pass
+`--prefix-cache-gb 0`.
+
+The `ov-genai` path has its own prefix cache inside GenAI's PagedAttention
+backend (1.2 s repeat-prompt TTFT at 8 K in the table below).
+
+**Certification (tate-07, B390, Qwopus 2-stage `qwen35`, `cascadia run …
+--api`, greedy, `enable_thinking: false`; the same 4-turn script against a
+server with the cache on and one with `--prefix-cache-gb 0`; wall time of
+the whole request, `_ttft` rows are `max_tokens: 1`).** Turn 1 carries an
+~N-token system document; turns 2–3 extend the conversation; turn 4 is a
+new conversation on the same system prompt. Warm text equalled cold text
+on every one of the 14 comparisons (and on the 7 of the eviction-pressure
+run below). Binary = this branch's head (`825f8267`).
+
+| first turn | turn | prompt tokens | cache off | cache on | speed-up |
+|---|---|---|---|---|---|
+| 8 K | 1 (cold, + two snapshots) | 8218 | 17.8 s | 23.4 s | 0.8× |
+| 8 K | 2 TTFT | 8247 | 16.9 s | **2.1 s** | 7.9× |
+| 8 K | 2 (7 tokens) | 8247 | 16.6 s | 2.8 s | 5.9× |
+| 8 K | 3 TTFT | 8276 | 16.5 s | **2.0 s** | 8.3× |
+| 8 K | 3 (5 tokens) | 8276 | 17.0 s | 2.5 s | 6.8× |
+| 8 K | new conversation, same system prompt, TTFT | 8215 | 15.8 s | **1.9 s** | 8.5× |
+| 8 K | same, 15 tokens | 8215 | 17.8 s | 4.0 s | 4.4× |
+| 32 K | 1 (cold, + two snapshots) | 32800 | 92.9 s | 111.3 s | 0.8× |
+| 32 K | 2 TTFT | 32829 | 91.5 s | **5.5 s** | 16.6× |
+| 32 K | 2 (7 tokens) | 32829 | 91.6 s | 6.1 s | 15.1× |
+| 32 K | 3 TTFT | 32858 | 91.0 s | **5.7 s** | 16.0× |
+| 32 K | 3 (5 tokens) | 32858 | 91.6 s | 6.2 s | 14.9× |
+| 32 K | new conversation, same system prompt, TTFT | 32797 | 89.9 s | **5.8 s** | 15.4× |
+| 32 K | same, 15 tokens | 32797 | 92.9 s | 7.4 s | 12.6× |
+
+Engine-side: a 1.2 GB snapshot (8 K) costs 2.5 s and its restore 1.4 s; a
+4.45 GB snapshot (32 K) costs 8.9–9.2 s and its restore 4.3–5.1 s — both are
+host↔device copies on this iGPU. The cold turn pays for two snapshots
+(system block + chat boundary); every later turn of the conversation, and
+every new conversation on the same system prompt, is a restore plus the
+prefill of its own tail. For comparison, the intermediate "snapshot every
+boundary on every turn" policy measured 5.1 s / 15.8 s for the 8 K / 32 K
+follow-up TTFT (a copy inside every warm turn), and under it the fourth
+4.45 GB snapshot at 32 K evicted the system-block entry so the new
+conversation on that prompt went cold (109.8 s) — the two defects the
+refresh rule and the eviction rule above fix.
+
+**Eviction-pressure run** (same box, 8 K, `--prefix-cache-gb 3`, a
+2,500-token user turn inserted after turn 2 so a refresh is worth taking
+and the third snapshot must evict something):
+
+| turn | prompt tokens | cache on (3 GiB) | engine decision |
+|---|---|---|---|
+| 1 (cold, + two snapshots: 2.35 GB of a 3 GiB budget) | 8218 | 23.3 s | both stored |
+| 2 TTFT | 8247 | 2.2 s | hit boundary; tail 36 tokens → no refresh |
+| 2b TTFT (2,500-token user turn) | 10786 | 11.8 s | hit boundary; tail 2,568 tokens ≈ 5.4 s ≥ 2.5 s copy → refresh; insert evicted the OLD boundary (8211), not the system block |
+| 2b (10 tokens) | 10786 | 3.8 s | hit the refreshed boundary (10779) |
+| 3 TTFT | 10818 | 2.3 s | hit 10779; no refresh |
+| new conversation, same system prompt, TTFT | 8215 | 1.9 s | hit the system block (8194) — still cached |
+| same, 15 tokens | 8215 | 4.1 s |  |
+
+The tail re-prefill of turn 2b (2,568 tokens at the measured 474 tok/s)
+plus the 3.2 s refresh copy gave an 11.8 s TTFT against ~24 s cold; under
+the old LRU marking the system block would have been the victim and turn 4
+would have re-prefilled 8 K tokens (~16 s).
+
+One defect was found and fixed by this certification, recorded above: a
+restore onto a request that has not executed since its reset is silently
+discarded by the GPU plugin (priming fold). The first run's "snapshot after
+a restore reads back shallow" was the same defect seen from the other side
+(the restore it followed had been dropped), so warm turns may snapshot too
+(the measured-break-even refresh above) rather than cold turns only.
+
+**Cold-TTFT levers in the staged engine (measured, 8K prompt, B390, with
+the OVMS node running alongside — ~10–20 % slower than the quiet-box sweep):**
+
+| what | TTFT | prefill tok/s |
+|---|---|---|
+| stateful IR, chunk 256 (the engine's hard-coded `PREFILL_CHUNK`) | 20.2 s | 407 |
+| stateful IR, chunk 512 | 18.3 s | 449 |
+| stateful IR, chunk 1024 / 2048 | 20.1 s / 21.3 s | 407 / 385 |
+| GenAI `VLMPipeline` (PagedAttention backend), cold | **10.8 s** | 760 |
+| GenAI `VLMPipeline`, same prompt again (its own prefix cache) | 1.2 s | — |
+
+So: the chunk constant is worth ~10 % (512 is the sweet spot; bigger is
+worse); the stateful path's prefill kernels are ~1.9× behind GenAI's
+PagedAttention path at 8K, which is the big cold-TTFT gap and needs a
+paged-KV execution model in the engine, not a constant; in pipeline mode
+each chunk crosses all stages before the next starts, so multi-box prefill
+does not overlap stages today; and GenAI's path prefix-caches repeated
+prompts by default, which the staged engine's always-on prefix cache (above)
+now covers for the same repeated-prefix case — what remains is the cold
+prefill throughput gap.
+
+### Second pass — 2026-09-08, review-fix tip `62d8daa6`
+
+Same box, same trees (`qwopus-2stage`, the Qwopus int4 whole IR), same
+scripts and budgets as the first pass, rebuilt from the branch tip after the
+2026-09-08 review round (msvc, GenAI 2026.2.1 for `qwen35`; GenAI 2026.3.0
+for the `ov-genai` row). First-pass values in parentheses. Every answer
+below was correct and every warm text equalled its cold text (7 of 7 turns
+at 8 K, 7 of 7 at 32 K, 9 of 9 on the eviction run).
+
+**Functional** (`qwen35`, 2-stage, B390, greedy, thinking off): capital of
+France → `Paris`; `17 * 23` → `391`; first five primes → `2, 3, 5, 7, 11`;
+a two-turn conversation recalls the user's name; `max_tokens: 8` ends with
+`finish_reason: "length"` and a natural stop with `"stop"`; a streaming
+request emits its chunks, a final chunk carrying the reason, then `[DONE]`;
+a 1.5 MB body is a 413 at the default 1 MiB cap; thinking on with the
+default, `low`, `medium`, `xhigh` and thinking off all 200.
+
+**Throughput** (19-token prompt, 96-token completion, greedy, `tok/s` =
+completion tokens / whole-request wall time; load = launch → `/v1/models`):
+
+| path | SDK | device | load | 96-token request | tok/s |
+|---|---|---|---|---|---|
+| `--engine qwen35`, 2-stage | GenAI 2026.2.1 | B390 iGPU | 28 s (41 s) | 14.5–14.6 s (15.0–15.6 s) | **6.6** (6.2–6.4) |
+| `--engine qwen35`, 2-stage | GenAI 2026.2.1 | CPU | 35 s (~80 s) | 33.4–34.5 s (32.2 s) | 2.8–2.9 (3.0) |
+| `--engine ov-genai`, whole IR | GenAI 2026.3.0 | B390 iGPU | 35 s (~60 s) | 12.7–13.1 s (13.2 s) | **7.4–7.6** (7.3) |
+
+**Context capacity** (raw IR probe, Qwopus int4, B390, 512-token prefill
+chunks, 16 greedy tokens, fresh process per point):
+
+| prompt tokens | TTFT | prefill tok/s | decode tok/s | resident at decode |
+|---|---|---|---|---|
+| 1 K | 2.4 s (2.4) | 428 (425) | 6.2 (6.1) | 17.1 GB (17.1) |
+| 4 K | 8.5 s (8.1) | 482 (505) | 6.4 (6.4) | 18.2 GB (18.1) |
+| 8 K | 16.0 s (15.5) | 512 (527) | 6.0 (6.1) | 19.1 GB (19.1) |
+| 16 K | 33.5 s (32.8) | 489 (500) | 6.2 (6.2) | 19.6 GB (19.5) |
+| 32 K | 79.1 s (78.5) | 414 (417) | 5.0 (5.1) | 20.5 GB (20.8) |
+| 64 K | 209 s (219) | 313 (299) | 4.1 (4.0) | 21.9 GB (21.9) |
+| 128 K | 651 s (667) | 201 (196) | 3.1 (3.1) | 26.9 GB (25.1) |
+| 256 K | 2813 s = 47 min (3256 s) | 93 (81) | 2.4 (2.5) | 31.9 GB (31.9) |
+
+**Prefix cache** (same 4-turn script, cache off → on, whole-request wall
+time; `_ttft` rows are `max_tokens: 1`):
+
+| first turn | turn | prompt tokens | cache off | cache on | speed-up |
+|---|---|---|---|---|---|
+| 8 K | 1 (cold, + two snapshots) | 8218 | 18.3 s (17.8) | 23.8 s (23.4) | 0.8× |
+| 8 K | 2 TTFT | 8247 | 17.7 s | **2.2 s** (2.1) | 7.9× |
+| 8 K | 2 (7 tokens) | 8247 | 16.7 s | 2.8 s | 5.9× |
+| 8 K | 3 TTFT | 8276 | 16.6 s | **2.1 s** (2.0) | 7.9× |
+| 8 K | 3 (5 tokens) | 8276 | 17.0 s | 2.5 s | 6.8× |
+| 8 K | new conversation, same system prompt, TTFT | 8215 | 16.0 s | **1.9 s** (1.9) | 8.6× |
+| 8 K | same, 15 tokens | 8215 | 18.5 s | 4.0 s | 4.6× |
+| 32 K | 1 (cold, + two snapshots) | 32800 | 91.8 s (92.9) | 112.6 s (111.3) | 0.8× |
+| 32 K | 2 TTFT | 32829 | 91.2 s | **5.8 s** (5.5) | 15.7× |
+| 32 K | 2 (7 tokens) | 32829 | 90.4 s | 6.9 s | 13.1× |
+| 32 K | 3 TTFT | 32858 | 90.1 s | **5.6 s** (5.7) | 16.2× |
+| 32 K | 3 (5 tokens) | 32858 | 91.5 s | 6.3 s | 14.5× |
+| 32 K | new conversation, same system prompt, TTFT | 32797 | 90.6 s | **5.8 s** (5.8) | 15.6× |
+| 32 K | same, 15 tokens | 32797 | 92.9 s | 7.4 s | 12.6× |
+
+Snapshots: 1.23 GB in 2.5 s at 8 K, 4.45 GB in 9.4–10.1 s at 32 K; restores
+1.36–1.39 s at 8 K, 4.3–5.1 s at 32 K. Eviction-pressure run (8 K,
+`--prefix-cache-gb 3`, 2,500-token turn): the refresh evicted the old
+boundary (`key_len=8211`), the long turn's TTFT was 12.6 s (11.8), the next
+turn 2.4 s (2.3), and the new conversation on the shared system prompt
+started warm at 1.9 s (1.9).
+
+**Post-turn reset cost** (the `reset_s` / `recreate` fields on the
+`qwen36 task done` log line, added in this round). Every warm turn ends in
+`recreate_request()` per stage: measured **0.6–0.9 ms** on every warm turn
+at both 8 K and 32 K. The cold turns' `reset_state` is the slower path
+(2–45 ms at 8 K, 82–135 ms at 32 K). Nothing to optimise.
+
+**Parity goldens**: `qwen38_greedy_parity` and `qwen36_greedy_parity`
+both verify against their blessed goldens through the harness that now
+sets `enable_thinking = true` (54.5 s and 60.9 s).
+
+**Regression** (Qwen3.6-35B-A3B, 2-stage): `--engine qwen35` 20.2 tok/s
+over 64 tokens; the manifest stripped to the Qwen3.6-era keys served
+through the `--engine qwen36-moe` alias at 21.2 tok/s (the `hidden_size`
+default is now `qwen3_5_moe`-only); `17 * 23` → `391` on both.
+
+## Limits and follow-ups
+
+- **Greedy-only, batch=1** on the staged path (DeltaNet state cannot be
+  rolled back; position-0 reset is the only recovery — qwen36-moe-support.md §4.1).
+- **NPU**: out of scope (dynamic-shape, 14 GB int4).
+- **MTP head** (`openvino_mtp_model.xml`, 264 MB, one full-attention layer
+  fed with `hidden_states` + `inputs_embeds`) is exported but unused.
+  Qwopus's whole point is 80.7 % MTP draft acceptance; GenAI grew MTP
+  drafting for this family in the 2026.4 nightlies (ContinuousBatching /
+  PagedAttention only). For the staged engine the missing piece is a
+  DeltaNet state snapshot/restore around each verify step (~40 MB/step
+  at hidden 5120).
+- **Vision** input is not supported on either path (text-only).
+- Long-context OpenVINO-side knobs (`KV_CACHE_PRECISION`, PagedAttention)
+  only reach the `ov-genai` path; the staged path's caches are graph-level
+  `ReadValue`/`Assign` variables.

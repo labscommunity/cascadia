@@ -164,7 +164,9 @@ fn check_tokenizer_irs(dir: &str) -> EngineResult<()> {
     ) {
         (Some(v), _) if v.starts_with("gemma4") => Some("gemma4"),
         (Some(_), _) => Some("ov-runtime"),
-        (_, Some(a)) if a == "qwen3_5_moe" => Some("qwen36-moe"),
+        // qwen3_5 (dense Qwen3.8) and qwen3_5_moe (Qwen3.5/3.6) share the
+        // surgery exporter and the staged engine.
+        (_, Some(a)) if a.starts_with("qwen3_5") => Some("qwen35"),
         (_, Some(_)) => Some("sparse-moe"),
         _ => None,
     };
@@ -1586,7 +1588,8 @@ mod tests {
                 "gemma4_cached_v1",
                 "gemma4",
             ),
-            ("manifest.json", "arch", "qwen3_5_moe", "qwen36-moe"),
+            ("manifest.json", "arch", "qwen3_5_moe", "qwen35"),
+            ("manifest.json", "arch", "qwen3_5", "qwen35"),
             ("manifest.json", "arch", "minimax_m2", "sparse-moe"),
         ] {
             let dir = tempfile::tempdir().unwrap();

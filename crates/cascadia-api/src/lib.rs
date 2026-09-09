@@ -1164,14 +1164,17 @@ fn render_with_chat_env(
         messages => messages_value,
         add_generation_prompt => true,
         enable_thinking => enable_thinking,
-        // Left undefined when None so the template's own default applies —
-        // GLM-5 resolves undefined to 'max'. Passing an empty string instead
-        // would define it and still resolve to 'max', but would misrepresent
-        // "caller said nothing" as "caller chose".
-        reasoning_effort => reasoning_effort,
         bos_token => bos_token,
         eos_token => eos_token,
         tools => tools_value,
+    };
+    // `reasoning_effort` is added only when Some: a `None` value renders as
+    // Jinja `none`, which `is defined` / `default()` treat as a caller's choice.
+    // Left out entirely, the template's own default applies (GLM-5 resolves
+    // undefined to 'max'; Qwen3.8 to 'xhigh').
+    let ctx = match reasoning_effort {
+        Some(effort) => context! { reasoning_effort => effort, ..ctx },
+        None => ctx,
     };
     tmpl.render(ctx).map_err(|e| classify_render_error(&e))
 }
@@ -1240,6 +1243,7 @@ fn render_or_fallback(
     eos_token: &str,
     enable_thinking: bool,
     reasoning_effort: Option<&str>,
+    raw_effort: Option<&str>,
     tools: Option<&[Tool]>,
 ) -> Result<String, PromptRenderError> {
     let has_tools = tools.is_some_and(|t| !t.is_empty());
@@ -1253,7 +1257,7 @@ fn render_or_fallback(
         }
         return Ok(render_prompt_legacy(messages));
     };
-    match render_with_chat_env(
+    let mut first = render_with_chat_env(
         env,
         messages,
         bos_token,
@@ -1261,7 +1265,47 @@ fn render_or_fallback(
         enable_thinking,
         reasoning_effort,
         tools,
-    ) {
+    );
+    // The API maps OpenAI's effort words onto GLM's high/max vocabulary and
+    // passes one on every thinking request. Templates with a different
+    // vocabulary reject it with raise_exception — Qwen3.8's accepts only
+    // xhigh/medium/low and `default('xhigh')`s the undefined case — which
+    // turned every default chat request into a 400. When the rejection names
+    // the effort, render again once: with the caller's own word if it differs
+    // from the mapping (a template with a low/medium scale honours it
+    // directly), otherwise with the effort undefined so the template's own
+    // default applies. Only the API's own word is discarded that way. A
+    // distinct word the caller chose and the template rejected stays a
+    // rejection (the 400 below) — serving it at the template's default would
+    // silently drop a parameter the caller believed had taken effect.
+    //
+    // Substring match, coupled to the templates' `raise_exception` prose:
+    // Qwen3.8 says "Unexpected reasoning effort ...", and the underscore
+    // spelling covers a template that names the parameter instead.
+    let rejects_effort = |r: &Result<String, PromptRenderError>| {
+        matches!(r, Err(PromptRenderError::Rejected(m)) if {
+            let m = m.to_ascii_lowercase();
+            m.contains("reasoning effort") || m.contains("reasoning_effort")
+        })
+    };
+    if reasoning_effort.is_some() && rejects_effort(&first) {
+        let retry = raw_effort.filter(|r| Some(*r) != reasoning_effort);
+        tracing::info!(
+            mapped = ?reasoning_effort,
+            retry = ?retry,
+            "chat_template rejected the mapped reasoning_effort; rendering again"
+        );
+        first = render_with_chat_env(
+            env,
+            messages,
+            bos_token,
+            eos_token,
+            enable_thinking,
+            retry,
+            tools,
+        );
+    }
+    match first {
         Ok(s) => Ok(s),
         // A raise_exception is the template validating its own input; other
         // engines surface it rather than papering over it.
@@ -1282,6 +1326,7 @@ fn render_prompt(
     messages: &[ChatMessage],
     enable_thinking: bool,
     reasoning_effort: Option<&str>,
+    raw_effort: Option<&str>,
     tools: Option<&[Tool]>,
 ) -> Result<String, PromptRenderError> {
     // ov-genai applies the model's own template, so the engine gets raw text.
@@ -1305,6 +1350,7 @@ fn render_prompt(
         &state.eos_token,
         enable_thinking,
         reasoning_effort,
+        raw_effort,
         tools,
     )
 }
@@ -1729,6 +1775,7 @@ impl ChatPromptRenderer {
             &self.eos_token,
             enable_thinking,
             reasoning_effort,
+            None,
             tools,
         )
     }
@@ -1760,16 +1807,18 @@ async fn chat_completions(
     let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
     let enable_thinking = req.effective_enable_thinking();
     // effective_reasoning_effort() hardcodes GLM's high/max vocabulary and is
-    // applied to every model this server serves, not just GLM-5. Latent
-    // today because no other served template (Qwen3, minimax-m2, r1-distill)
-    // reads `reasoning_effort`, but a future template that honours a
-    // low/medium/high scale would see e.g. a client's "low" silently
-    // escalated to "high". Template-gating this is a follow-up, not this fix.
+    // applied to every model this server serves, not just GLM-5. A template
+    // with its own scale (Qwen3.8: xhigh/medium/low) rejects the mapped word;
+    // render_or_fallback then retries with the caller's own word, so a
+    // client's "low" reaches such a template unescalated — or, when the caller
+    // sent nothing of their own, with the effort undefined (the template's
+    // default). A caller word the template also rejects is a 400.
     let prompt = match render_prompt(
         &state,
         &req.messages,
         enable_thinking,
         Some(req.effective_reasoning_effort()),
+        req.reasoning_effort.as_deref(),
         req.tools.as_deref(),
     ) {
         Ok(p) => p,
@@ -4302,13 +4351,13 @@ mod tests {
         // Renders fine without tools; explodes inside the tools branch.
         let env = build_chat_env("{% if tools %}{{ nope.missing.deeper }}{% endif %}ok").unwrap();
 
-        let err = render_or_fallback(Some(&env), &msgs, "", "", true, None, Some(&tools))
+        let err = render_or_fallback(Some(&env), &msgs, "", "", true, None, None, Some(&tools))
             .expect_err("a tools request must not fall back");
         assert!(matches!(err, PromptRenderError::Failed(_)), "{err:?}");
 
         // Same broken template, no tools: fallback is still allowed, because a
         // degraded prompt beats a dead endpoint.
-        let out = render_or_fallback(Some(&env), &msgs, "", "", true, None, None)
+        let out = render_or_fallback(Some(&env), &msgs, "", "", true, None, None, None)
             .expect("tool-less requests keep the fallback");
         assert_eq!(out, "ok");
     }
@@ -4356,6 +4405,156 @@ mod tests {
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
         serde_json::from_value(v).unwrap()
+    }
+
+    /// Qwen3.8's template accepts only xhigh/medium/low and raises for anything
+    /// else; the API's GLM-mapped default ("high") must not turn into a 400.
+    #[test]
+    fn template_rejecting_the_mapped_effort_is_rendered_with_it_undefined() {
+        const T: &str = "{%- if reasoning_effort is defined and reasoning_effort not in ['xhigh', 'medium', 'low'] -%}\
+{{ raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh (default), medium, and low.') }}\
+{%- endif -%}effort={{ reasoning_effort | default('xhigh') }}";
+        let cfg = ChatTemplateConfig {
+            template: Some(T.to_string()),
+            bos_token: None,
+            eos_token: None,
+        };
+        let renderer = ChatPromptRenderer::new(&cfg);
+        let msgs = [msg("user", "hi")];
+        // The mapped default is rejected by the template → rendered undefined.
+        let out = renderer
+            .render_with_effort(&msgs, None, true, Some("high"))
+            .expect("second render with effort undefined");
+        assert_eq!(out, "effort=xhigh");
+        // An accepted value goes through untouched.
+        let out = renderer
+            .render_with_effort(&msgs, None, true, Some("low"))
+            .unwrap();
+        assert_eq!(out, "effort=low");
+        // Through the API: the caller said "low", the GLM mapping made it
+        // "high"; the template rejects "high" and gets the caller's "low".
+        let env = build_chat_env(T).unwrap();
+        let out = render_or_fallback(
+            Some(&env),
+            &msgs,
+            "",
+            "",
+            true,
+            Some("high"),
+            Some("low"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out, "effort=low");
+        // The caller sent the API's own word: nothing of theirs is lost by
+        // falling through to the template default.
+        let out = render_or_fallback(
+            Some(&env),
+            &msgs,
+            "",
+            "",
+            true,
+            Some("high"),
+            Some("high"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out, "effort=xhigh");
+        // A caller word of their own that the template rejects is a 400, not a
+        // silent downgrade to the template default: "hgih" is a typo, and
+        // answering at xhigh hides that the parameter was discarded.
+        let err = render_or_fallback(
+            Some(&env),
+            &msgs,
+            "",
+            "",
+            true,
+            Some("high"),
+            Some("hgih"),
+            None,
+        )
+        .expect_err("the caller's own rejected word must surface");
+        assert!(
+            matches!(&err, PromptRenderError::Rejected(m) if m.contains("hgih")),
+            "expected the template's message about the caller's word: {err:?}"
+        );
+        // A rejection that is not about the effort is still surfaced.
+        let env = build_chat_env("{{ raise_exception('no tools here') }}").unwrap();
+        assert!(matches!(
+            render_or_fallback(
+                Some(&env),
+                &msgs,
+                "",
+                "",
+                true,
+                Some("high"),
+                Some("low"),
+                None
+            ),
+            Err(PromptRenderError::Rejected(_))
+        ));
+    }
+
+    /// End to end over HTTP: the handler must hand `req.reasoning_effort` to
+    /// `render_or_fallback` as the raw word, or a caller's "low" is lost when
+    /// the family's template rejects the GLM mapping. The mock engine echoes
+    /// the prompt back word by word, so the completion text *is* the rendered
+    /// prompt.
+    #[tokio::test]
+    async fn http_request_reaches_the_template_with_the_callers_effort() {
+        const T: &str = "{%- if reasoning_effort is defined and reasoning_effort not in ['xhigh', 'medium', 'low'] -%}\
+{{ raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh (default), medium, and low.') }}\
+{%- endif -%}effort={{ reasoning_effort | default('xhigh') }}";
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some(T.to_string()),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "low",
+                "stream": false,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {v}");
+        let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+        assert_eq!(
+            content.trim(),
+            "effort=low",
+            "the template saw the mapped word, not the caller's"
+        );
+    }
+
+    /// The rejection match is a substring test against the template's own
+    /// prose. A template that spells the parameter `reasoning_effort` must
+    /// trigger the same retry, not the blanket 400 this ladder exists to fix.
+    #[test]
+    fn underscore_wording_in_the_rejection_still_triggers_the_retry() {
+        const T: &str = "{%- if reasoning_effort is defined and reasoning_effort not in ['xhigh', 'medium', 'low'] -%}\
+{{ raise_exception('reasoning_effort ' ~ reasoning_effort ~ ' is not supported') }}\
+{%- endif -%}effort={{ reasoning_effort | default('xhigh') }}";
+        let env = build_chat_env(T).unwrap();
+        let msgs = [msg("user", "hi")];
+        let out =
+            render_or_fallback(Some(&env), &msgs, "", "", true, Some("high"), None, None).unwrap();
+        assert_eq!(out, "effort=xhigh");
     }
 
     #[test]
@@ -4489,12 +4688,12 @@ mod tests {
             r#type: "function".into(),
             function: serde_json::json!({"name": "get_weather"}),
         }];
-        let err = render_or_fallback(None, &msgs, "", "", true, None, Some(&tools))
+        let err = render_or_fallback(None, &msgs, "", "", true, None, None, Some(&tools))
             .expect_err("no template + tools must not be answered");
         assert!(matches!(err, PromptRenderError::Rejected(_)), "{err:?}");
 
         assert!(
-            render_or_fallback(None, &msgs, "", "", true, None, None).is_ok(),
+            render_or_fallback(None, &msgs, "", "", true, None, None, None).is_ok(),
             "tool-less requests still render without a template"
         );
     }
@@ -4513,7 +4712,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
         }];
-        match render_or_fallback(Some(&env), &msgs, "", "", true, None, None) {
+        match render_or_fallback(Some(&env), &msgs, "", "", true, None, None, None) {
             Err(PromptRenderError::Rejected(m)) => {
                 assert!(m.contains("system role not supported"), "{m}")
             }

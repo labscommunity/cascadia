@@ -47,7 +47,7 @@ fn engine_name(kind: EngineKind) -> &'static str {
         EngineKind::OvDistSpec => "ov-dist-spec",
         EngineKind::Gemma4 => "gemma4",
         EngineKind::SparseMoe => "sparse-moe",
-        EngineKind::Qwen36Moe => "qwen36-moe",
+        EngineKind::Qwen36Moe => "qwen35",
     }
 }
 
@@ -211,10 +211,13 @@ pub enum EngineKind {
     /// per token (not all 384) and runs the expert matmuls through the
     /// hand-rolled AVX-512 int4 GEMM kernel. Single-stage, CPU-targeted.
     SparseMoe,
-    /// Qwen3.6-35B-A3B staged engine. Runs the IR-surgery shard chain
+    /// Qwen3.5-family staged engine (`qwen35`; `qwen36-moe` kept as an
+    /// alias). Runs the IR-surgery shard chain
     /// (`tools/qwen36_surgery/export_qwen36_moe.py` output dir with
-    /// manifest.json) in-process; greedy-only, batch=1. CPU-targeted
-    /// for decode (see docs/architectures/qwen36-moe-support.md).
+    /// manifest.json) in-process for both `qwen3_5_moe` (Qwen3.5/3.6-35B-A3B)
+    /// and dense `qwen3_5` (Qwen3.8-27B); greedy-only, batch=1 (see
+    /// docs/architectures/qwen36-moe-support.md and qwen3.8.md).
+    #[value(name = "qwen35", alias = "qwen36-moe")]
     Qwen36Moe,
 }
 
@@ -306,6 +309,26 @@ pub struct WorkerArgs {
     /// OV GPU dynamic-quantization group size.
     #[arg(long)]
     pub ov_dyn_quant_group: Option<String>,
+
+    /// `qwen35` only: byte budget (GiB) of the in-process prefix cache that
+    /// snapshots the chain state at chat-turn boundaries and restores it for
+    /// a prompt that extends a cached prefix (TTFT ≈ restore + the new tail
+    /// instead of a full re-prefill). Default: the smaller of 16 GiB and a
+    /// quarter of physical RAM. 0 disables. Single-process (`--total 1`) only;
+    /// a Qwen3.8-27B snapshot is ~130 KB per context token as serialised
+    /// (1.2 GB at 8 K, 4.45 GB at 32 K). The cache is process-wide and not
+    /// tenant-scoped, so a multi-tenant deployment should run one process per
+    /// tenant or pass 0.
+    #[arg(long)]
+    pub prefix_cache_gb: Option<f64>,
+
+    /// Largest `/v1/chat/completions` request body (MiB); the rendered prompt
+    /// is capped at the same size. 1 MiB ≈ 250 K tokens of English, the
+    /// window of the largest served models. Only `qwen35` also bounds the
+    /// prompt in TOKENS (against `max_position_embeddings`); on other engines
+    /// this byte cap is the whole guard, so lower it on an exposed endpoint.
+    #[arg(long, default_value_t = 1.0)]
+    pub api_max_body_mb: f64,
 
     /// OV performance hint (PERFORMANCE_HINT). LATENCY suits single-user
     /// decode; THROUGHPUT enables NUM_STREAMS auto-tuning. See OpenVINO
@@ -621,6 +644,16 @@ pub struct RunArgs {
     /// 8000). Pass e.g. `127.0.0.1:8000` to bind loopback only.
     #[arg(long, default_value = ":8000")]
     pub api: String,
+
+    /// `--engine qwen35` only: prefix-cache budget in GiB (0 disables; default
+    /// min(16 GiB, RAM/4)). See `cascadia worker --help`.
+    #[arg(long)]
+    pub prefix_cache_gb: Option<f64>,
+
+    /// Largest chat-completions request body in MiB (rendered prompt capped
+    /// alike). See `cascadia worker --help`.
+    #[arg(long, default_value_t = 1.0)]
+    pub api_max_body_mb: f64,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -635,7 +668,18 @@ impl WorkerArgs {
     /// reduced `cascadia run` surface, leaving every advanced knob at its
     /// `worker` default. Keeping this here (rather than spreading defaults
     /// into `cmd_run`) means `run` and `worker` can't silently drift.
-    fn single_node(model: String, device: String, engine: EngineKind, api: String) -> Self {
+    ///
+    /// The knobs `run` also exposes are parameters, not post-construction
+    /// patches: `cmd_run` overwriting them afterwards meant deleting a line
+    /// here silently turned `cascadia run --prefix-cache-gb 0` back on.
+    fn single_node(
+        model: String,
+        device: String,
+        engine: EngineKind,
+        api: String,
+        prefix_cache_gb: Option<f64>,
+        api_max_body_mb: f64,
+    ) -> Self {
         WorkerArgs {
             rank: 0,
             total: 1,
@@ -648,6 +692,8 @@ impl WorkerArgs {
             api: Some(api),
             device,
             engine,
+            prefix_cache_gb,
+            api_max_body_mb,
             ov_cache_dir: None,
             ov_kv_precision: None,
             ov_dyn_quant_group: None,
@@ -699,8 +745,9 @@ const DEFAULT_STATIC_CONTEXT: u32 = 1024;
 #[derive(Parser, Debug, Clone)]
 pub struct ShardArgs {
     /// HuggingFace repo id (e.g. unsloth/Meta-Llama-3.1-8B-Instruct), a local
-    /// directory with safetensors + config.json, or — for the Gemma-4 / Qwen3.6
-    /// surgery paths — an already-exported OpenVINO IR directory.
+    /// directory with safetensors + config.json, or — for the Gemma-4 /
+    /// Qwen3.5-family (3.6 MoE, 3.8 dense) surgery paths — an
+    /// already-exported OpenVINO IR directory.
     #[arg(long)]
     pub model: String,
 
@@ -886,7 +933,14 @@ pub async fn run(cli: Cli) -> Result<()> {
 
 async fn cmd_run(args: RunArgs) -> Result<()> {
     info!(model = %args.model, device = %args.device, engine = ?args.engine, "cascadia run (single machine)");
-    let worker = WorkerArgs::single_node(args.model, args.device, args.engine, args.api);
+    let worker = WorkerArgs::single_node(
+        args.model,
+        args.device,
+        args.engine,
+        args.api,
+        args.prefix_cache_gb,
+        args.api_max_body_mb,
+    );
     cmd_worker(worker).await
 }
 
@@ -912,7 +966,7 @@ fn cmd_engines() -> Result<()> {
     println!("  ov-dist-spec   multi-stage spec decode (mask-based KV rewind); v5 shards");
     println!("  gemma4         Gemma 4 multi-stage (per-layer-type attn, KV-sharing, PLI); gemma4_cached_v1 shards");
     println!("  sparse-moe     Kimi K2.6 (AVX-512 int4 GEMM + Rust MLA shells) or MiniMax-M2 (OV-IR shells); single-stage top-k expert dispatch");
-    println!("  qwen36-moe     Qwen3.6-35B-A3B staged chain (GatedDeltaNet + MoE); qwen3_5_moe IR-surgery shards");
+    println!("  qwen35         Qwen3.5-family staged chain (GatedDeltaNet; 3.5/3.6 MoE or 3.8 dense); qwen3_5* IR-surgery shards (alias: qwen36-moe)");
     Ok(())
 }
 
@@ -954,6 +1008,76 @@ fn resolve_ov_cache_dir(arg: Option<&str>) -> Option<String> {
                 .into_owned()
         }),
     }
+}
+
+/// Byte budget for the qwen35 prefix cache: the flag when given (0 = off), else the smaller
+/// of 16 GiB and a quarter of physical RAM (a 64 GB box gets 16 GiB, a 32 GB UMA box 8 GiB —
+/// the weights already take 16-28 GB there).
+fn resolve_prefix_cache_bytes(flag: Option<f64>) -> Result<usize> {
+    resolve_prefix_cache_bytes_with(physical_ram_bytes(), flag)
+}
+
+/// Physical RAM in bytes, or `None` when the platform does not report it
+/// (containers, unsupported targets) — a figure of 0 is "unreadable", not
+/// "no memory".
+fn physical_ram_bytes() -> Option<u64> {
+    use sysinfo::{MemoryRefreshKind, RefreshKind, System};
+    let total = System::new_with_specifics(
+        RefreshKind::nothing().with_memory(MemoryRefreshKind::nothing().with_ram()),
+    )
+    .total_memory();
+    (total > 0).then_some(total)
+}
+
+/// [`resolve_prefix_cache_bytes`] with the RAM figure injected (`None` =
+/// unreadable), so the sizing decisions are testable off the host's memory.
+fn resolve_prefix_cache_bytes_with(ram: Option<u64>, flag: Option<f64>) -> Result<usize> {
+    const GIB: f64 = (1u64 << 30) as f64;
+    let default = cascadia_engine_openvino::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES;
+    match flag {
+        Some(gb) if !gb.is_finite() || gb < 0.0 => Err(anyhow!(
+            "--prefix-cache-gb must be a finite, non-negative number (got {gb})"
+        )),
+        // `as usize` saturates, so an unbounded value would become usize::MAX
+        // and the LRU would never evict. Physical RAM is the ceiling — the
+        // weights and the OS live in the same RAM as the snapshots.
+        Some(gb) if ram.is_some_and(|r| gb * GIB > r as f64) => {
+            let ram_gib = ram.unwrap_or(0) as f64 / GIB;
+            Err(anyhow!(
+                "--prefix-cache-gb {gb} exceeds this machine's physical RAM ({ram_gib:.1} GiB), \
+                 which the model weights already share — pick a smaller budget (0 disables)"
+            ))
+        }
+        Some(gb) => {
+            if ram.is_none() {
+                warn!(
+                    "physical RAM is unreadable here; accepting --prefix-cache-gb {gb} unvalidated"
+                );
+            }
+            Ok((gb * GIB) as usize)
+        }
+        None => match ram {
+            Some(ram) => Ok((default as f64).min(ram as f64 / 4.0) as usize),
+            None => {
+                warn!(
+                    default_gib = default >> 30,
+                    "physical RAM is unreadable here; using the full default prefix-cache budget"
+                );
+                Ok(default)
+            }
+        },
+    }
+}
+
+/// `--api-max-body-mb` → bytes; 0/negative/non-finite are configuration errors (0 would make
+/// every real request a 413, inf would remove the cap).
+fn resolve_api_max_body_bytes(mb: f64) -> Result<usize> {
+    if !mb.is_finite() || mb <= 0.0 || mb > 4096.0 {
+        return Err(anyhow!(
+            "--api-max-body-mb must be a finite number in (0, 4096] (got {mb})"
+        ));
+    }
+    Ok((mb * (1u64 << 20) as f64) as usize)
 }
 
 /// True when `device` names an OpenVINO NPU plugin (e.g. "NPU", "NPU.0").
@@ -1068,13 +1192,23 @@ fn warn_ignored_ov_perf_flags(args: &WorkerArgs) {
         );
     }
 
-    // qwen36-moe compiles with a fixed plugin config and receives no OV perf
+    // qwen35 compiles with a fixed plugin config and receives no OV perf
     // properties (some hints break its IRs — see qwen36.rs). If the user set
     // general hints, warn they won't take effect on this engine.
     if matches!(args.engine, EngineKind::Qwen36Moe) && !ov_perf_properties(args).is_empty() {
         tracing::warn!(
-            "ignoring --ov-* performance flags: the qwen36-moe engine compiles \
+            "ignoring --ov-* performance flags: the qwen35 engine compiles \
              with a fixed plugin config and does not apply them"
+        );
+    }
+
+    // The prefix cache lives in the qwen35 engine; no other builder has
+    // anywhere to put a budget, so an explicit --prefix-cache-gb would be
+    // dropped on the floor and the operator would keep measuring cold TTFTs.
+    if args.prefix_cache_gb.is_some() && !matches!(args.engine, EngineKind::Qwen36Moe) {
+        tracing::warn!(
+            engine = ?args.engine,
+            "ignoring --prefix-cache-gb: the prefix cache is qwen35-only"
         );
     }
 
@@ -1123,8 +1257,8 @@ fn export_hint(model: &str, engine: EngineKind) -> String {
              cascadia worker --engine gemma4 --model ./{stem}-2stage ..."
         ),
         EngineKind::Qwen36Moe => format!(
-            "  cascadia shard --model <qwen3.6 int4-ov dir> --output-dir ./{stem}-2stage --num-stages 2\n    \
-             cascadia run ./{stem}-2stage --engine qwen36-moe"
+            "  cascadia shard --model <qwen3.6/3.8 int4-ov dir> --output-dir ./{stem}-2stage --num-stages 2\n    \
+             cascadia run ./{stem}-2stage --engine qwen35"
         ),
         // sparse-moe consumes a manifest.json expert tree, not a shard tree.
         EngineKind::SparseMoe => {
@@ -1194,7 +1328,9 @@ fn preflight_model_path(args: &WorkerArgs) -> Result<()> {
     Ok(())
 }
 
-fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
+/// `prefix_cache_bytes` is resolved by the caller before the model loads (see
+/// [`cmd_worker`]); only the qwen35 arm has anywhere to put it.
+fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn Builder>> {
     warn_ignored_ov_perf_flags(args);
     match args.engine {
         EngineKind::Mock => Ok(Box::new(MockBuilder::new())),
@@ -1382,6 +1518,11 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             if let Some(group) = &args.ov_dyn_quant_group {
                 b = b.with_dyn_quant_group(group);
             }
+            info!(
+                prefix_cache_gib = prefix_cache_bytes >> 30,
+                "qwen35 prefix-cache budget"
+            );
+            b = b.with_prefix_cache_bytes(prefix_cache_bytes);
             Ok(Box::new(b))
         }
     }
@@ -1615,6 +1756,13 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         ));
     }
     validate_worker_runtime_flags(&args)?;
+    // Resolve the sizing flags before anything compiles or loads a model: a
+    // 27B takes 40-80 s warm and minutes cold, and both of these used to be
+    // validated after that (`--api-max-body-mb`) or only on the qwen35 arm
+    // (`--prefix-cache-gb`, so nonsense passed silently on every other
+    // engine). Cheap, pure, and the same answer either side of the load.
+    let prefix_cache_bytes = resolve_prefix_cache_bytes(args.prefix_cache_gb)?;
+    let max_body = resolve_api_max_body_bytes(args.api_max_body_mb)?;
     let is_first = args.rank == 0;
     let is_last = args.rank == args.total - 1;
 
@@ -1668,7 +1816,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     };
 
     preflight_model_path(&args)?;
-    let builder = build_builder(&args)?;
+    let builder = build_builder(&args, prefix_cache_bytes)?;
     let runner = Arc::new(Runner::new(builder));
     let listen = if !is_first {
         Some((listen_host.as_str(), listen_port))
@@ -1899,6 +2047,11 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         }
         let mut cfg = cascadia_api::Config::default();
         cfg.chat_template = chat_template;
+        // Long-context serving: the 64 KiB body / 32 KiB prompt defaults hold
+        // ~8 K tokens, a fraction of what the Qwen3.5-family and Llama-3.1
+        // windows admit. Both caps follow one operator-facing knob.
+        cfg.max_body_bytes = max_body;
+        cfg.max_prompt_bytes = max_body;
         // ov-genai owns native templating: render the template API-side only for
         // the thinking-OFF path (engine sets apply_chat_template=false then);
         // thinking-ON stays on ov-genai's native template, untouched.
@@ -2106,8 +2259,9 @@ const ALIASES_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tools/model_aliases.py"
 ));
-/// Qwen3.5/3.6 hybrid-MoE exporter (IR surgery on the official int4 IR),
-/// dispatched by export_shards.py for model_type qwen3_5_moe.
+/// Qwen3.5-family exporter (IR surgery on the official int4 IR),
+/// dispatched by export_shards.py for model_type qwen3_5_moe (Qwen3.5/3.6
+/// MoE) and qwen3_5 (dense Qwen3.8).
 const QWEN36_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tools/qwen36_surgery/export_qwen36_moe.py"
@@ -2374,7 +2528,7 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
             status
         ));
     }
-    // qwen3_5_moe shards run the in-process stage chain, not the
+    // qwen3_5-family shards run the in-process stage chain, not the
     // per-stage worker mesh; give the right invocation per manifest arch.
     let arch =
         std::fs::read_to_string(std::path::Path::new(&args.output_dir).join("manifest.json"))
@@ -2382,10 +2536,10 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .and_then(|v| v["arch"].as_str().map(String::from))
             .unwrap_or_default();
-    if arch == "qwen3_5_moe" {
+    if arch.starts_with("qwen3_5") {
         eprintln!(
             "\nShard tree written to {}. Run with:\n  cascadia run {} \
-             --engine qwen36-moe --device CPU --api :8000",
+             --engine qwen35 --device CPU --api :8000",
             args.output_dir, args.output_dir
         );
     } else if args.num_stages == 1 {
@@ -2411,7 +2565,14 @@ mod python_tests {
     use super::*;
 
     fn worker(model: &str, engine: EngineKind) -> WorkerArgs {
-        let mut a = WorkerArgs::single_node(model.into(), "GPU".into(), engine, ":8000".into());
+        let mut a = WorkerArgs::single_node(
+            model.into(),
+            "GPU".into(),
+            engine,
+            ":8000".into(),
+            None,
+            1.0,
+        );
         a.engine = engine;
         a
     }
@@ -2690,11 +2851,75 @@ mod python_tests {
     }
 
     #[test]
+    fn flag_resolvers_reject_nonsense_and_size_the_cache_default() {
+        assert!(resolve_api_max_body_bytes(0.0).is_err());
+        assert!(resolve_api_max_body_bytes(f64::INFINITY).is_err());
+        assert!(resolve_api_max_body_bytes(f64::NAN).is_err());
+        assert_eq!(resolve_api_max_body_bytes(1.0).unwrap(), 1 << 20);
+        // The upper bound is a bound, not decoration.
+        assert_eq!(resolve_api_max_body_bytes(4096.0).unwrap(), 4096 << 20);
+        assert!(resolve_api_max_body_bytes(4097.0).is_err());
+        assert!(resolve_prefix_cache_bytes(Some(-1.0)).is_err());
+        assert!(resolve_prefix_cache_bytes(Some(f64::INFINITY)).is_err());
+        assert_eq!(resolve_prefix_cache_bytes(Some(0.0)).unwrap(), 0);
+        let auto = resolve_prefix_cache_bytes(None).unwrap();
+        assert!(auto <= cascadia_engine_openvino::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES);
+        // `auto <= DEFAULT` is also true of 0, which would disable the cache
+        // the default exists to enable.
+        assert!(auto > 0, "auto-sized budget must not disable the cache");
+    }
+
+    #[test]
+    fn prefix_cache_budget_is_bounded_by_physical_ram() {
+        const GIB: u64 = 1 << 30;
+        let ram = Some(64 * GIB);
+        // Saturating `as usize` used to turn this into usize::MAX, and the LRU
+        // that bound never evicted anything.
+        let err = resolve_prefix_cache_bytes_with(ram, Some(1e30))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("physical RAM"), "{err}");
+        assert!(err.contains("64.0 GiB"), "{err}");
+        assert!(resolve_prefix_cache_bytes_with(ram, Some(65.0)).is_err());
+        // The whole of RAM is the boundary and is allowed: an operator who
+        // means it can still hand the cache every byte the box has.
+        assert_eq!(
+            resolve_prefix_cache_bytes_with(ram, Some(64.0)).unwrap(),
+            (64 * GIB) as usize
+        );
+        assert_eq!(
+            resolve_prefix_cache_bytes_with(ram, Some(2.0)).unwrap(),
+            (2 * GIB) as usize
+        );
+        // A quarter of RAM when it is below the 16 GiB default.
+        assert_eq!(
+            resolve_prefix_cache_bytes_with(Some(32 * GIB), None).unwrap(),
+            (8 * GIB) as usize
+        );
+    }
+
+    #[test]
+    fn unreadable_ram_falls_back_to_the_default_and_accepts_explicit_values() {
+        // sysinfo reports 0 in some containers; the budget must still be sane.
+        assert_eq!(
+            resolve_prefix_cache_bytes_with(None, None).unwrap(),
+            cascadia_engine_openvino::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES
+        );
+        // Nothing to validate an explicit value against — take the operator's
+        // word for it (warned), but keep rejecting outright nonsense.
+        assert_eq!(
+            resolve_prefix_cache_bytes_with(None, Some(4.0)).unwrap(),
+            4usize << 30
+        );
+        assert!(resolve_prefix_cache_bytes_with(None, Some(-1.0)).is_err());
+    }
+
+    #[test]
     fn preflight_advice_matches_the_engine() {
         // Each engine reads a different tree; don't send them all to ov-runtime.
         for (engine, needle) in [
             (EngineKind::Gemma4, "--engine gemma4"),
-            (EngineKind::Qwen36Moe, "--engine qwen36-moe"),
+            (EngineKind::Qwen36Moe, "--engine qwen35"),
             (EngineKind::SparseMoe, "manifest.json"),
             (EngineKind::OvGenai, "optimum-cli"),
             (EngineKind::OvRuntime, "--engine ov-runtime"),
@@ -2757,6 +2982,8 @@ mod ov_property_tests {
             device.into(),
             engine,
             "127.0.0.1:8080".into(),
+            None,
+            1.0,
         )
     }
 
@@ -3170,5 +3397,54 @@ mod tests {
             panic!("expected shard subcommand");
         };
         assert_eq!(args.target, ShardTarget::CpuGpu);
+    }
+
+    /// `run`'s two forwarded knobs must survive the trip into `WorkerArgs`.
+    /// They used to be written over `single_node`'s hard-coded defaults after
+    /// construction, so `--prefix-cache-gb 0` would have quietly left the
+    /// cache on if either patch line went missing.
+    #[test]
+    fn run_forwards_the_prefix_cache_and_body_flags_to_the_worker() {
+        let cli = Cli::try_parse_from([
+            "cascadia",
+            "run",
+            "some-model-dir",
+            "--engine",
+            "qwen35",
+            "--prefix-cache-gb",
+            "0",
+            "--api-max-body-mb",
+            "2",
+        ])
+        .expect("parse run argv");
+        let Command::Run(args) = cli.cmd else {
+            panic!("expected run subcommand");
+        };
+        let worker = WorkerArgs::single_node(
+            args.model,
+            args.device,
+            args.engine,
+            args.api,
+            args.prefix_cache_gb,
+            args.api_max_body_mb,
+        );
+        assert_eq!(worker.prefix_cache_gb, Some(0.0));
+        assert_eq!(worker.api_max_body_mb, 2.0);
+        assert_eq!(worker.rank, 0);
+        assert_eq!(worker.total, 1);
+    }
+
+    /// The engine renamed from `qwen36-moe` to `qwen35`; the old spelling is
+    /// kept as a clap alias, so both must land on the same variant.
+    #[test]
+    fn qwen35_and_its_qwen36_moe_alias_parse_to_one_engine() {
+        for spelling in ["qwen35", "qwen36-moe"] {
+            let cli = Cli::try_parse_from(["cascadia", "run", "m", "--engine", spelling])
+                .unwrap_or_else(|e| panic!("parse --engine {spelling}: {e}"));
+            let Command::Run(args) = cli.cmd else {
+                panic!("expected run subcommand");
+            };
+            assert_eq!(args.engine, EngineKind::Qwen36Moe, "--engine {spelling}");
+        }
     }
 }

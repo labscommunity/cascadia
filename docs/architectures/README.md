@@ -28,8 +28,12 @@ This directory holds per-family deep-dives for non-trivial cases.
 - [`qwen3.6.md`](./qwen3.6.md) — Qwen3.6-35B-A3B single-stage support:
   hybrid GatedDeltaNet + MoE facts, serving paths, hardware validation.
 - [`qwen36-moe-support.md`](./qwen36-moe-support.md) — Qwen3.6 staged
-  serving: IR-surgery exporter, the `qwen36-moe` engine, and multi-node
-  pipeline mode with acceptance gates.
+  serving: IR-surgery exporter, the `qwen35` engine (formerly
+  `qwen36-moe`), and multi-node pipeline mode with acceptance gates.
+- [`qwen3.8.md`](./qwen3.8.md) — Qwen3.8-27B (dense `qwen3_5`): the same
+  surgery + staged engine, the `ov-genai` single-stage path, Panther Lake
+  iGPU/CPU throughput and context-capacity measurements, fine-tune
+  (Qwopus) export recipe.
 - [`minimax-m2.md`](./minimax-m2.md) — MiniMax-M2 on the sparse-MoE
   engine: export pipeline, quantization configs, measured throughput.
 

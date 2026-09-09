@@ -17,6 +17,7 @@ pub mod genai;
 pub mod kv_coordination;
 pub mod packed;
 mod packed_exec;
+pub mod prefix_cache;
 pub mod qwen36;
 pub mod rotary;
 pub mod runtime;

@@ -26,6 +26,10 @@ use cascadia_kv_wire::{
 };
 
 use crate::runtime::OvRuntimeEngine;
+// Blob framing + depth helpers live with the always-on prefix cache; the plane shares them.
+pub(crate) use crate::prefix_cache::{
+    frame_blobs, kv_seq_from_blob, kv_seq_from_framed_blob, unframe_blobs,
+};
 
 /// KV codec/engine revision — bump on any change to the blob *envelope* (the shim's
 /// `get_state_blob` framing). Producer (export) and consumer (`consumer_engine_rev`) both read this.
@@ -155,66 +159,6 @@ pub(crate) fn log_blob_tensors(tag: &str, epoch: u64, blob: &[u8]) {
         let Some(np) = p.checked_add(nb) else { return };
         p = np;
     }
-}
-
-/// Restored KV depth (max `shape[2]` over rank≥3 states) from a `get_state_blob` blob — `[u32 count]`
-/// then per state `[u32 name_len][name][u8 dtype][u8 rank][u64×rank shape][u64 nb][data]` (LE).
-///
-/// Warm-resume drives position/mask off this, not the matched token count: a turn's last sampled token
-/// is never fed back, so KV depth = matched_len-1; using the token count overshoots the mask by one and
-/// the attention `Add` fails on shape. `None` if unparseable (caller falls back to the token count).
-pub(crate) fn kv_seq_from_blob(blob: &[u8]) -> Option<usize> {
-    fn u32_at(b: &[u8], p: usize) -> Option<u32> {
-        Some(u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?))
-    }
-    fn u64_at(b: &[u8], p: usize) -> Option<u64> {
-        Some(u64::from_le_bytes(b.get(p..p + 8)?.try_into().ok()?))
-    }
-    let mut p = 0usize;
-    let count = u32_at(blob, p)?;
-    p += 4;
-    let mut seq = 0usize;
-    for _ in 0..count {
-        let name_len = u32_at(blob, p)? as usize;
-        let name_at = p.checked_add(4)?;
-        // Hybrid models (qwen36) mix attention KV — whose shape[2] IS the fold depth — with fixed-shape
-        // DeltaNet/SSM recurrent states (conv/ssm) whose shape[2] is a constant (e.g. 128) that would
-        // poison the depth max. Only attention states carry the true resume depth; skip the recurrent
-        // ones. Pure-attention models (llama/dist-spec) have no conv/ssm names ⇒ unchanged.
-        let is_recurrent = blob
-            .get(name_at..name_at.checked_add(name_len)?)
-            .map(|b| {
-                let n = String::from_utf8_lossy(b);
-                n.contains("conv") || n.contains("ssm")
-            })
-            .unwrap_or(false);
-        p = name_at.checked_add(name_len)?; // skip name_len + name
-        let _dtype = *blob.get(p)?;
-        let rank = *blob.get(p.checked_add(1)?)? as usize;
-        p = p.checked_add(2)?;
-        let mut seq_dim = 0usize;
-        for i in 0..rank {
-            let d = u64_at(blob, p)? as usize;
-            p = p.checked_add(8)?;
-            if i == 2 {
-                seq_dim = d;
-            }
-        }
-        if rank >= 3 && !is_recurrent {
-            seq = seq.max(seq_dim);
-        }
-        let nb = u64_at(blob, p)? as usize;
-        p = p.checked_add(8)?.checked_add(nb)?; // skip nbytes + data
-    }
-    (seq > 0).then_some(seq)
-}
-
-/// [`kv_seq_from_blob`] for a framed multi-stage blob (`frame_blobs`): max depth over its parts (stages
-/// share the sequence length, `max` is a safe tie-break). For qwen36 stages / dist-spec draft+target;
-/// raw single-stage blobs use [`kv_seq_from_blob`] directly. `None` if unparseable.
-pub(crate) fn kv_seq_from_framed_blob(blob: &[u8]) -> Option<usize> {
-    let parts = unframe_blobs(blob)?;
-    parts.iter().filter_map(|p| kv_seq_from_blob(p)).max()
 }
 
 /// Compact a `get_state_blob` blob along the seq dim (index 2): keep position `i` only where
@@ -490,50 +434,6 @@ pub(crate) fn parse_capture_body_masked_v2(b: &[u8]) -> Option<(u64, Vec<i32>, V
     }
     let partner = std::str::from_utf8(&rest[4..]).ok()?.to_string();
     Some((epoch, tokens, valid, partner))
-}
-
-/// Frame N opaque per-stage blobs into one: `u32 count | (u32 len | bytes)×count`. A rank that holds
-/// several local stages (qwen36 `stages`, dist-spec target+draft) snapshots each and ships the bundle
-/// as a single opaque blob — `OvKvCache` and the wire treat it as one payload.
-pub(crate) fn frame_blobs(blobs: &[Vec<u8>]) -> Vec<u8> {
-    let total: usize = 4 + blobs.iter().map(|b| 4 + b.len()).sum::<usize>();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
-    for b in blobs {
-        out.extend_from_slice(&(b.len() as u32).to_le_bytes());
-        out.extend_from_slice(b);
-    }
-    out
-}
-
-/// Inverse of [`frame_blobs`]. `None` on truncation / over-bound count (forged or corrupt bundle).
-pub(crate) fn unframe_blobs(b: &[u8]) -> Option<Vec<Vec<u8>>> {
-    if b.len() < 4 {
-        return None;
-    }
-    let count = u32::from_le_bytes(b[0..4].try_into().ok()?) as usize;
-    // A rank holds at most a model's worth of stages; cap defensively.
-    if count > 1024 {
-        return None;
-    }
-    let mut off = 4;
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
-        if off + 4 > b.len() {
-            return None;
-        }
-        let len = u32::from_le_bytes(b[off..off + 4].try_into().ok()?) as usize;
-        off += 4;
-        if off + len > b.len() {
-            return None;
-        }
-        out.push(b[off..off + len].to_vec());
-        off += len;
-    }
-    if off != b.len() {
-        return None; // trailing junk
-    }
-    Some(out)
 }
 
 /// Namespace for a capture made outside any admitted-tenant context. A local turn carries no tenant

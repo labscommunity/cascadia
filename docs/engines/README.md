@@ -17,7 +17,7 @@ The remaining engines are documented with their model families under
 - `sparse-moe` — [`../architectures/minimax-m2.md`](../architectures/minimax-m2.md)
   (MiniMax-M2 pipeline) and [`../architectures/moe.md`](../architectures/moe.md)
   (MoE family background)
-- `qwen36-moe` — [`../architectures/qwen36-moe-support.md`](../architectures/qwen36-moe-support.md)
+- `qwen35` (alias `qwen36-moe`) — [`../architectures/qwen36-moe-support.md`](../architectures/qwen36-moe-support.md), [`../architectures/qwen3.8.md`](../architectures/qwen3.8.md)
 
 `mock` (deterministic word-echo test engine) needs no deep-dive; see
 [`../ARCHITECTURE.md`](../ARCHITECTURE.md).

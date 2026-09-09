@@ -25,6 +25,8 @@ from model_aliases import ALIASES, resolve  # noqa: E402
         ("phi-4", "microsoft/phi-4"),
         ("phi-4-mini", "microsoft/Phi-4-mini-instruct"),
         ("qwen3-1.7b", "Qwen/Qwen3-1.7B"),
+        ("qwen3.8-27b", "OpenVINO/Qwen3.8-27B-int4-ov"),
+        ("qwen3.6-35b-ov", "OpenVINO/Qwen3.6-35B-A3B-int4-ov"),
     ],
 )
 def test_known_aliases_resolve(alias, expected):

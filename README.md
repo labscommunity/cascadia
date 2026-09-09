@@ -22,7 +22,7 @@ Frontier models don't fit on a single laptop. Cloud APIs are expensive, opaque, 
 - **OpenAI-compatible API**: `/v1/chat/completions` with SSE streaming; point existing clients at it unchanged
 - **Pipeline parallelism**: shard a model into stages and run each stage on a different machine, activations relayed over TCP
 - **Built-in sharder**: `cascadia shard` cuts a HuggingFace model into INT4 per-stage shards; no external tooling
-- **Seven engines**: `mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec` (distributed speculative decoding), `gemma4`, a CPU-targeted `sparse-moe` engine for large mixture-of-experts models like Kimi K2.6 and MiniMax-M2, and `qwen36-moe` for Qwen3.6's hybrid MoE
+- **Seven engines**: `mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec` (distributed speculative decoding), `gemma4`, a CPU-targeted `sparse-moe` engine for large mixture-of-experts models like Kimi K2.6 and MiniMax-M2, and `qwen35` for the Qwen3.5 hybrid family (Qwen3.6 MoE, dense Qwen3.8)
 - **Single static binary per node**: Rust only at runtime; no Python on workers
 - **Zero-config peer discovery**: `cascadia discover` finds LAN peers over mDNS
 - **`cascadia doctor`**: diagnoses the one failure everyone hits: OpenVINO silently not seeing your GPU
@@ -187,7 +187,7 @@ $ cascadia engines
   ov-dist-spec   multi-stage spec decode (mask-based KV rewind); v5 shards
   gemma4         Gemma 4 multi-stage (per-layer-type attn, KV-sharing, PLI); gemma4_cached_v1 shards
   sparse-moe     Kimi K2.6 (AVX-512 int4 GEMM + Rust MLA shells) or MiniMax-M2 (OV-IR shells); single-stage top-k expert dispatch
-  qwen36-moe     Qwen3.6-35B-A3B staged chain (GatedDeltaNet + MoE); qwen3_5_moe IR-surgery shards
+  qwen35         Qwen3.5-family staged chain (GatedDeltaNet; 3.5/3.6 MoE or 3.8 dense); qwen3_5* IR-surgery shards (alias: qwen36-moe)
 ```
 
 `sparse-moe` consumes a `manifest.json` + per-expert artefact tree, not `cascadia shard` output, see [docs/architectures/minimax-m2.md](docs/architectures/minimax-m2.md) and [docs/architectures/moe.md](docs/architectures/moe.md). MiniMax-M2 is the in-repo export path (`tools/export_minimax_m2.py`); the Kimi K2.6 artefacts come from an external pipeline that is not part of this repo. Tuning: [docs/perf/A3_TOPK_REDUCTION.md](docs/perf/A3_TOPK_REDUCTION.md), [docs/perf/CHESS_PER_CHANNEL.md](docs/perf/CHESS_PER_CHANNEL.md).
@@ -196,7 +196,7 @@ $ cascadia engines
 
 `cascadia shard` works today with Llama (1–3.3), Mistral (7B, NeMo, Small 3.x text), Qwen2 / Qwen2.5, Qwen3 dense, DeepSeek R1 Distills (Qwen and Llama variants), Phi-3, Phi-4 / Phi-4-mini (partial rotary), and Gemma 1 / Gemma 2 (logit softcapping + the 4-norm structure; sliding-window attention is treated as full-causal, so output is exact within the window). Gemma 4 (E2B / E4B / 31B) exports through a dedicated path (`tools/export_gemma4.py`, auto-dispatched by `cascadia shard`).
 
-Qwen3.5/3.6 hybrid MoE (`model_type: qwen3_5_moe`) is special-cased: `cascadia shard` dispatches it to a dedicated IR-surgery exporter and it serves through the `qwen36-moe` engine ([docs/architectures/qwen36-moe-support.md](docs/architectures/qwen36-moe-support.md)). Other mixture-of-experts and architecturally-incompatible families like Llama 4, Qwen3-MoE, Mixtral, gpt-oss, full DeepSeek-V2/V3, Gemma 3, the Gemma 4 26B-A4B MoE variant, and Mamba hybrids are detected and rejected up front with a clear error. See [docs/SHARDING.md](docs/SHARDING.md) and [docs/architectures/](docs/architectures/) for the full per-family status table and deep-dives.
+Qwen3.5/3.6 hybrid MoE (`model_type: qwen3_5_moe`) is special-cased: `cascadia shard` dispatches it to a dedicated IR-surgery exporter and it serves through the `qwen35` engine (alias `qwen36-moe`) ([docs/architectures/qwen36-moe-support.md](docs/architectures/qwen36-moe-support.md)). Other mixture-of-experts and architecturally-incompatible families like Llama 4, Qwen3-MoE, Mixtral, gpt-oss, full DeepSeek-V2/V3, Gemma 3, the Gemma 4 26B-A4B MoE variant, and Mamba hybrids are detected and rejected up front with a clear error. See [docs/SHARDING.md](docs/SHARDING.md) and [docs/architectures/](docs/architectures/) for the full per-family status table and deep-dives.
 
 ## Architecture
 
@@ -206,7 +206,7 @@ Cascadia is a Cargo workspace; one concern per crate. The `Engine` + `Builder` t
 - `cascadia-metrics/`: Prometheus metric registry shared by the API, runner, and transport
 - `cascadia-runner/`: Per-stage runner; concurrent-safe chunk streaming
 - `cascadia-engine/`: `Engine` + `Builder` traits (the plugin seam)
-- `cascadia-engine-openvino/`: Five OV engines (`ov-genai`, `ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen36-moe`)
+- `cascadia-engine-openvino/`: Five OV engines (`ov-genai`, `ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`)
 - `cascadia-engine-sparse-moe/`: Sparse-MoE engine; routes only the top-k experts per token
 - `cascadia-int4-gemm/`: hand-rolled AVX-512 INT4 GEMM kernels for the MoE expert path
 - `cascadia-ov-genai-shim/`: C++ FFI shim wrapping `openvino-genai`
