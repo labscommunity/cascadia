@@ -22,7 +22,7 @@ Frontier models don't fit on a single laptop. Cloud APIs are expensive, opaque, 
 - **OpenAI-compatible API**: `/v1/chat/completions` with SSE streaming; point existing clients at it unchanged
 - **Pipeline parallelism**: shard a model into stages and run each stage on a different machine, activations relayed over TCP
 - **Built-in sharder**: `cascadia shard` cuts a HuggingFace model into INT4 per-stage shards; no external tooling
-- **Seven engines**: `mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec` (distributed speculative decoding), `gemma4`, a CPU-targeted `sparse-moe` engine for large mixture-of-experts models like Kimi K2.6 and MiniMax-M2, and `qwen35` for the Qwen3.5 hybrid family (Qwen3.6 MoE, dense Qwen3.8)
+- **Seven engines**: `mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec` (distributed speculative decoding), `gemma4`, a CPU-targeted `sparse-moe` engine for large mixture-of-experts models (Kimi K2.6, MiniMax-M2, GLM-5, DeepSeek-V4, Inkling), and `qwen35` for the Qwen3.5 hybrid family (Qwen3.6 MoE, dense Qwen3.8)
 - **Single static binary per node**: Rust only at runtime; no Python on workers
 - **Zero-config peer discovery**: `cascadia discover` finds LAN peers over mDNS
 - **`cascadia doctor`**: diagnoses the one failure everyone hits: OpenVINO silently not seeing your GPU
@@ -186,11 +186,11 @@ $ cascadia engines
   ov-runtime     multi-stage stateful KV cache; pre-exported per-stage v3+ shards
   ov-dist-spec   multi-stage spec decode (mask-based KV rewind); v5 shards
   gemma4         Gemma 4 multi-stage (per-layer-type attn, KV-sharing, PLI); gemma4_cached_v1 shards
-  sparse-moe     Kimi K2.6 (AVX-512 int4 GEMM + Rust MLA shells) or MiniMax-M2 (OV-IR shells); single-stage top-k expert dispatch
+  sparse-moe     sparse mixture-of-experts on CPU: Kimi K2.6 (AVX-512 int4 GEMM), MiniMax-M2 (OV-IR shells), GLM-5 / DeepSeek-V4 / Inkling (Rust shells + int4 mmap experts, N-rank pipeline)
   qwen35         Qwen3.5-family staged chain (GatedDeltaNet; 3.5/3.6 MoE or 3.8 dense); qwen3_5* IR-surgery shards (alias: qwen36-moe)
 ```
 
-`sparse-moe` consumes a `manifest.json` + per-expert artefact tree, not `cascadia shard` output, see [docs/architectures/minimax-m2.md](docs/architectures/minimax-m2.md) and [docs/architectures/moe.md](docs/architectures/moe.md). MiniMax-M2 is the in-repo export path (`tools/export_minimax_m2.py`); the Kimi K2.6 artefacts come from an external pipeline that is not part of this repo. Tuning: [docs/perf/A3_TOPK_REDUCTION.md](docs/perf/A3_TOPK_REDUCTION.md), [docs/perf/CHESS_PER_CHANNEL.md](docs/perf/CHESS_PER_CHANNEL.md).
+`sparse-moe` consumes a `manifest.json` + per-expert artefact tree, not `cascadia shard` output, see [docs/architectures/moe.md](docs/architectures/moe.md). In-repo exporters: `tools/export_minimax_m2.py`, `export_glm5.py`, `export_deepseek_v4.py`, `export_inkling.py` (per-family pages under `docs/architectures/`); the Kimi K2.6 artefacts come from an external pipeline that is not part of this repo. Tuning: [docs/perf/A3_TOPK_REDUCTION.md](docs/perf/A3_TOPK_REDUCTION.md), [docs/perf/CHESS_PER_CHANNEL.md](docs/perf/CHESS_PER_CHANNEL.md).
 
 ### Supported model families
 

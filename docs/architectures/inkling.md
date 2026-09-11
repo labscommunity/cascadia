@@ -192,8 +192,9 @@ cascadia worker --rank 0 --total 2 --engine sparse-moe --model /data/inkling-int
 ```
 
 Knobs: `CASCADIA_INKLING_MAX_SEQ` (global-layer KV rows; default 4096 — the
-sliding layers' rings are fixed at 512 + 32), `CASCADIA_INKLING_EXPERTS=eager|mmap`
-(default mmap for real-sized expert sets), `--max-seq`, `--experts-mode`.
+sliding layers' rings are fixed at 512 + 32) and `CASCADIA_INKLING_EXPERTS=eager|mmap`
+(default mmap for real-sized expert sets); in-process hosts set the same two
+through `SparseMoEBuilderConfig::{max_seq, experts_mode}`.
 
 ## Sizing and the hardware honesty note
 
