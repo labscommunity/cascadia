@@ -242,6 +242,36 @@ int4 artifact (512 GB) resident: a ≥640 GB-RAM box, or an N-rank pipeline
 whose ranks together hold it (e.g. 4 × 160 GB), plus the prefix cache and
 expert-residency follow-ups below.
 
+### Expert-parallel dispatch (star topology)
+
+Beside the layer pipeline, the family can run as a **driver + expert
+workers**: the driver (`--ep-workers a:p,b:p,…`, a single stage) holds every
+layer's attention, norms, convs, router, dense MLPs, embed and head, and no
+expert weights; worker `N` of `W` (`--ep-worker-index N --ep-worker-count W
+--listen :port`) holds, for every MoE layer, the experts with `id % W == N`
+(the two shared experts are dispatched like routed ones, with their gammas as
+weights) and nothing else. Per MoE layer the driver routes locally, sends each
+involved worker the rows' hidden states plus the expert ids it must serve
+(`ExpertDispatch`, all workers in flight together), receives each expert's raw
+output (`ExpertResult`), applies the weights and sums in gate order — so the
+result is **bit-identical** to the single-process `MoeLayer::forward`
+(asserted by `tests/inkling_ep.rs` over loopback TCP). Workers are stateless:
+no reset, no prefix frames, no KV.
+
+```bash
+# workers first (each holds ~1/W of the 490 GB of routed experts, mmap'd)
+cascadia worker --engine sparse-moe --model /data/inkling-int4 --ep-worker-index 0 --ep-worker-count 3 --listen :9200
+cascadia worker --engine sparse-moe --model /data/inkling-int4 --ep-worker-index 1 --ep-worker-count 3 --listen :9201
+cascadia worker --engine sparse-moe --model /data/inkling-int4 --ep-worker-index 2 --ep-worker-count 3 --listen :9202
+# then the driver
+cascadia run /data/inkling-int4 --engine sparse-moe --ep-workers hostA:9200,hostB:9201,hostC:9202 --api :8000
+```
+
+When it pays and when it does not — one network round per MoE layer, the
+driver's own attention reads as the serial floor — is worked through in the
+scaling note; measured numbers for this topology are recorded there as they
+land.
+
 Topology, bandwidth ceilings and what expert-level routing across boxes would
 buy: [`../perf/INKLING_SCALING.md`](../perf/INKLING_SCALING.md).
 
