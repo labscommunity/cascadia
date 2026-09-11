@@ -163,6 +163,12 @@ pub enum FrameKind {
     // only when the tenant is non-empty; an empty tenant keeps sending the legacy `Capture` frame
     // byte-identical to today. Appended code — never reorder existing ones.
     CaptureV2 = 0x53_4D_4532, // "SME\x32" — head→down: CAPTURE(epoch, tenant, tokens)
+    // Inkling expert-parallel dispatch (star topology: one driver, W expert workers; see
+    // `crate::inkling::ep`). Appended codes — never reorder existing ones. The driver sends one
+    // `ExpertDispatch` per involved worker per MoE layer and awaits one `ExpertResult` from each;
+    // a worker is stateless and replies `ExpertResult{status 1}` to any other kind.
+    ExpertDispatch = 0x53_4D_45_50, // "SME\x50" — driver → worker: layer, rows, k, hidden, ids
+    ExpertResult = 0x53_4D_45_51,   // "SME\x51" — worker → driver: status + outputs | message
 }
 
 impl FrameKind {
@@ -187,6 +193,8 @@ impl FrameKind {
             x if x == FrameKind::RestoreAck as u32 => Some(FrameKind::RestoreAck),
             x if x == FrameKind::RestoreCarry as u32 => Some(FrameKind::RestoreCarry),
             x if x == FrameKind::CaptureV2 as u32 => Some(FrameKind::CaptureV2),
+            x if x == FrameKind::ExpertDispatch as u32 => Some(FrameKind::ExpertDispatch),
+            x if x == FrameKind::ExpertResult as u32 => Some(FrameKind::ExpertResult),
             _ => None,
         }
     }
@@ -1363,5 +1371,314 @@ impl StageTransport {
 
     pub fn is_last(&self) -> bool {
         self.downstream.is_none()
+    }
+}
+
+// ───────────────────── Inkling expert-parallel dispatch (`crate::inkling::ep`) ─────────────────────
+//
+// Star topology: the driver (rank 0 of a `total = 1` pipeline) routes every MoE layer locally and
+// sends each involved expert worker the layer's hidden rows plus the expert ids that worker must
+// serve; the worker replies with the RAW expert outputs (no weights applied — the driver applies
+// the gate weights and sums in gate order, so the result is bit-identical to the single-process
+// `MoeLayer`). Bodies, after the 4-byte kind:
+//
+//   ExpertDispatch:  u32 layer | u32 rows | u32 k        (big-endian, like every header field)
+//                    Tensor F32 [rows, hidden, 1]         the MoE input rows
+//                    Tensor I32 [rows, k, 1]              expert ids; EXPERT_PAD (-1) = padding slot
+//   ExpertResult:    u8 status                            0 = ok, 1 = error
+//                    ok:  Tensor F32 [rows, k, hidden]    E_id(h_row) per slot; zeros in pad slots
+//                    err: u32 len | UTF-8 message         (len <= MAX_EXPERT_ERR_BYTES)
+//
+// Tensor payloads are little-endian element bytes (the transport's convention — see
+// `hidden_to_tensor`). `rows` is capped at MAX_BATCH_COUNT per frame; the driver chunks longer
+// prefills. A worker owns no sequence state, so no Reset / prefix frame is ever sent to it.
+
+/// Padding expert id in an `ExpertDispatch` ids tensor: the worker skips the slot and returns
+/// zeros for it; the driver never reads a pad slot back.
+pub const EXPERT_PAD: i32 = -1;
+
+/// Cap on an `ExpertResult` error message (bounds the recv-side allocation from the 4-byte length
+/// field; must fit one `recv_raw`, i.e. <= [`MAX_RAW_BYTES`]).
+pub const MAX_EXPERT_ERR_BYTES: usize = 4096;
+
+/// A decoded `ExpertDispatch` body. Shapes are returned as carried on the wire; the worker
+/// validates them against `rows` / `k` / its hidden size (a mismatch is a status-1 reply, not a
+/// transport error — the frame has been consumed whole, so the stream stays aligned).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpertDispatchBody {
+    pub layer: u32,
+    pub rows: u32,
+    pub k: u32,
+    /// `[rows · hidden]` row-major (`hidden` = `hidden_shape[1]`).
+    pub hidden: Vec<f32>,
+    pub hidden_shape: [u32; 3],
+    /// `[rows · k]` row-major; [`EXPERT_PAD`] marks an unused slot.
+    pub ids: Vec<i32>,
+    pub ids_shape: [u32; 3],
+}
+
+impl ExpertDispatchBody {
+    /// The hidden width this frame carries (`hidden_shape[1]`).
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_shape[1] as usize
+    }
+}
+
+fn ids_to_tensor(ids: &[i32], shape3: [u32; 3]) -> Tensor {
+    let mut bytes = Vec::with_capacity(ids.len() * 4);
+    for v in ids {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    Tensor::new(DType::I32, shape3, bytes)
+}
+
+fn tensor_to_ids(t: &Tensor) -> TransportResult<(Vec<i32>, [u32; 3])> {
+    if t.dtype != DType::I32 {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "expected I32 expert-id tensor, got {:?}",
+            t.dtype
+        ))));
+    }
+    let out = t
+        .data
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    Ok((out, t.shape))
+}
+
+/// Send an `ExpertDispatch` frame to one expert worker: kind + layer + rows + k (u32 BE each) +
+/// the hidden rows `[rows, hidden, 1]` (F32) + the expert ids `[rows, k, 1]` (I32, [`EXPERT_PAD`]
+/// in unused slots). `hidden` is `[rows · hidden_size]`, `ids` is `[rows · k]`, both row-major.
+pub async fn send_expert_dispatch(
+    cli: &Mutex<ActivationClient>,
+    layer: u32,
+    rows: u32,
+    k: u32,
+    hidden_size: u32,
+    hidden: &[f32],
+    ids: &[i32],
+) -> TransportResult<()> {
+    if rows == 0 || rows > MAX_BATCH_COUNT {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "send_expert_dispatch: rows {rows} out of range 1..={MAX_BATCH_COUNT}"
+        ))));
+    }
+    if k == 0 {
+        return Err(TransportError::Io(std::io::Error::other(
+            "send_expert_dispatch: k must be >= 1 (an uninvolved worker gets no frame)",
+        )));
+    }
+    if hidden.len() != rows as usize * hidden_size as usize {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "send_expert_dispatch: hidden.len={} != rows·hidden={}",
+            hidden.len(),
+            rows as usize * hidden_size as usize
+        ))));
+    }
+    if ids.len() != rows as usize * k as usize {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "send_expert_dispatch: ids.len={} != rows·k={}",
+            ids.len(),
+            rows as usize * k as usize
+        ))));
+    }
+    let mut header = [0u8; 16];
+    header[0..4].copy_from_slice(&(FrameKind::ExpertDispatch as u32).to_be_bytes());
+    header[4..8].copy_from_slice(&layer.to_be_bytes());
+    header[8..12].copy_from_slice(&rows.to_be_bytes());
+    header[12..16].copy_from_slice(&k.to_be_bytes());
+    let ht = hidden_to_tensor(hidden, [rows, hidden_size, 1]);
+    let it = ids_to_tensor(ids, [rows, k, 1]);
+    let mut guard = cli.lock().await;
+    guard.send_raw(&header).await?;
+    guard.send(&ht).await?;
+    guard.send(&it).await?;
+    Ok(())
+}
+
+/// Receive an `ExpertDispatch` body on the worker (kind already consumed). Reads the whole frame
+/// (header + both tensors) before returning so a semantic mismatch can be answered with a status-1
+/// reply on an aligned stream; only dtype / transport failures are errors here. `rows` above
+/// [`MAX_BATCH_COUNT`] is rejected AFTER the tensors are consumed (their own byte caps bound the
+/// allocation).
+pub async fn recv_expert_dispatch_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<ExpertDispatchBody> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(12).await?;
+    if raw.len() != 12 {
+        return Err(TransportError::SocketClosed);
+    }
+    let layer = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let rows = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    let k = u32::from_be_bytes([raw[8], raw[9], raw[10], raw[11]]);
+    let (ht, _) = guard.recv().await?;
+    let (it, _) = guard.recv().await?;
+    drop(guard);
+    if rows == 0 || rows > MAX_BATCH_COUNT {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "recv_expert_dispatch_body: rows {rows} out of range 1..={MAX_BATCH_COUNT}"
+        ))));
+    }
+    let (hidden, hidden_shape) = tensor_to_hidden(&ht)?;
+    let (ids, ids_shape) = tensor_to_ids(&it)?;
+    Ok(ExpertDispatchBody {
+        layer,
+        rows,
+        k,
+        hidden,
+        hidden_shape,
+        ids,
+        ids_shape,
+    })
+}
+
+/// Reply `ExpertResult{status 0}` from the worker: kind + status byte + the outputs
+/// `[rows, k, hidden]` (F32; `out` is `[rows · k · hidden]` row-major, zeros in pad slots).
+pub async fn send_expert_result_ok(
+    srv: &Mutex<ActivationServer>,
+    rows: u32,
+    k: u32,
+    hidden_size: u32,
+    out: &[f32],
+) -> TransportResult<()> {
+    let want = rows as usize * k as usize * hidden_size as usize;
+    if out.len() != want {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "send_expert_result_ok: out.len={} != rows·k·hidden={want}",
+            out.len()
+        ))));
+    }
+    let mut header = [0u8; 5];
+    header[0..4].copy_from_slice(&(FrameKind::ExpertResult as u32).to_be_bytes());
+    header[4] = 0;
+    let t = hidden_to_tensor(out, [rows, k, hidden_size]);
+    let mut guard = srv.lock().await;
+    guard.send_raw(&header).await?;
+    guard.send(&t).await?;
+    Ok(())
+}
+
+/// Reply `ExpertResult{status 1}` from the worker: kind + status byte + u32 BE length + UTF-8
+/// message (truncated to [`MAX_EXPERT_ERR_BYTES`] on a char boundary).
+pub async fn send_expert_result_err(
+    srv: &Mutex<ActivationServer>,
+    msg: &str,
+) -> TransportResult<()> {
+    let mut end = msg.len().min(MAX_EXPERT_ERR_BYTES);
+    while end > 0 && !msg.is_char_boundary(end) {
+        end -= 1;
+    }
+    let m = &msg.as_bytes()[..end];
+    let mut bytes = Vec::with_capacity(9 + m.len());
+    bytes.extend_from_slice(&(FrameKind::ExpertResult as u32).to_be_bytes());
+    bytes.push(1);
+    bytes.extend_from_slice(&(m.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(m);
+    let mut guard = srv.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Receive an `ExpertResult` body on the driver (kind already consumed). `Ok(Ok((out, shape)))`
+/// for status 0 — `out` is `[rows · k · hidden]`, `shape` is `[rows, k, hidden]` as carried;
+/// `Ok(Err(message))` for status 1; `Err` only for transport / framing failures.
+pub async fn recv_expert_result_body_client(
+    cli: &Mutex<ActivationClient>,
+) -> TransportResult<Result<(Vec<f32>, [u32; 3]), String>> {
+    let mut guard = cli.lock().await;
+    let status = guard.recv_raw(1).await?;
+    if status.len() != 1 {
+        return Err(TransportError::SocketClosed);
+    }
+    match status[0] {
+        0 => {
+            let (t, _) = guard.recv().await?;
+            drop(guard);
+            let (out, shape) = tensor_to_hidden(&t)?;
+            Ok(Ok((out, shape)))
+        }
+        1 => {
+            let raw = guard.recv_raw(4).await?;
+            if raw.len() != 4 {
+                return Err(TransportError::SocketClosed);
+            }
+            let len = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+            if len > MAX_EXPERT_ERR_BYTES {
+                return Err(TransportError::Io(std::io::Error::other(format!(
+                    "expert result error message of {len} bytes exceeds MAX_EXPERT_ERR_BYTES {MAX_EXPERT_ERR_BYTES}"
+                ))));
+            }
+            let msg = if len == 0 {
+                Vec::new()
+            } else {
+                let m = guard.recv_raw(len).await?;
+                if m.len() != len {
+                    return Err(TransportError::SocketClosed);
+                }
+                m
+            };
+            drop(guard);
+            Ok(Err(String::from_utf8_lossy(&msg).into_owned()))
+        }
+        s => Err(TransportError::Io(std::io::Error::other(format!(
+            "expert result: unknown status byte {s}"
+        )))),
+    }
+}
+
+#[cfg(test)]
+mod expert_frame_tests {
+    use super::*;
+
+    #[test]
+    fn expert_codes_are_appended_and_distinct() {
+        assert_eq!(FrameKind::ExpertDispatch as u32, 0x53_4D_45_50);
+        assert_eq!(FrameKind::ExpertResult as u32, 0x53_4D_45_51);
+        for k in [
+            FrameKind::Forward,
+            FrameKind::Reset,
+            FrameKind::Token,
+            FrameKind::ForwardBatch,
+            FrameKind::TokenBatch,
+            FrameKind::ForwardNoSample,
+            FrameKind::ForwardPrefill,
+            FrameKind::ForwardBatchPrefill,
+            FrameKind::ForwardBatchPrefillNoSample,
+            FrameKind::RestorePrefix,
+            FrameKind::CachePrefix,
+            FrameKind::Capture,
+            FrameKind::CaptureAck,
+            FrameKind::Restore,
+            FrameKind::RestoreAck,
+            FrameKind::RestoreCarry,
+            FrameKind::CaptureV2,
+        ] {
+            assert_ne!(FrameKind::ExpertDispatch as u32, k as u32);
+            assert_ne!(FrameKind::ExpertResult as u32, k as u32);
+        }
+        assert_eq!(
+            FrameKind::from_code(FrameKind::ExpertDispatch as u32),
+            Some(FrameKind::ExpertDispatch)
+        );
+        assert_eq!(
+            FrameKind::from_code(FrameKind::ExpertResult as u32),
+            Some(FrameKind::ExpertResult)
+        );
+    }
+
+    #[test]
+    fn ids_tensor_roundtrips_including_pad() {
+        let ids = [3i32, EXPERT_PAD, 0, i32::MAX, -7];
+        let t = ids_to_tensor(&ids, [1, 5, 1]);
+        assert_eq!(t.dtype, DType::I32);
+        assert_eq!(t.data.len(), 20);
+        let (back, shape) = tensor_to_ids(&t).unwrap();
+        assert_eq!(back, ids);
+        assert_eq!(shape, [1, 5, 1]);
+        // An F32 tensor where ids are expected is a framing error, not a silent reinterpretation.
+        let f = hidden_to_tensor(&[1.0, 2.0], [1, 2, 1]);
+        assert!(tensor_to_ids(&f).is_err());
     }
 }

@@ -103,6 +103,15 @@ impl Layer {
         }
     }
 
+    /// Mutable access to the MoE block (to attach an expert-parallel client —
+    /// [`MoeLayer::attach_remote`]).
+    pub fn moe_mut(&mut self) -> Option<&mut MoeLayer> {
+        match &mut self.mlp {
+            LayerMlp::Moe(m) => Some(m),
+            LayerMlp::Dense(_) => None,
+        }
+    }
+
     /// Cached positions (attention and convs agree).
     pub fn len(&self) -> usize {
         debug_assert_eq!(self.attn.len(), self.attn_sconv.len());

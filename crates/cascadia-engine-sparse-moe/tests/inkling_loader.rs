@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use cascadia_engine_sparse_moe::dsv4::loader::ExpertsMode;
 use cascadia_engine_sparse_moe::dsv4::st::StFile;
 use cascadia_engine_sparse_moe::inkling::loader::{
-    load_layer, load_model, load_model_with, read_manifest,
+    load_layer, load_model, load_model_with, read_manifest, ExpertSet,
 };
 use cascadia_engine_sparse_moe::inkling::model::argmax;
 use cascadia_engine_sparse_moe::inkling::stage::InklingRunner;
@@ -71,7 +71,7 @@ fn loader_greedy_matches_hf_reference() {
 fn staged_runner_single_rank_matches_model() {
     let Some(r) = reference() else { return };
     let mut runner =
-        InklingRunner::load_staged(&export_dir(), 64, 0, 1, 0, 0, Some("eager".into()))
+        InklingRunner::load_staged(&export_dir(), 64, 0, 1, 0, 0, Some("eager".into()), None)
             .expect("load rank 0 of 1");
     runner.reset();
     // Token-by-token drive (the pipeline's decode path).
@@ -396,7 +396,8 @@ fn mmap_overlapped_reads_match_the_mmap_kernel_bit_for_bit() {
     let li = (0..m.num_layers)
         .find(|li| !m.dense_layers.contains(li))
         .expect("a MoE layer");
-    let layer = load_layer(&dir, &m, li, 64, ExpertsMode::Mmap).expect("mmap layer");
+    let layer =
+        load_layer(&dir, &m, li, 64, ExpertsMode::Mmap, ExpertSet::All).expect("mmap layer");
     let moe = layer.moe().expect("MoE layer");
     let hidden = m.hidden_size;
     let rows = 6;

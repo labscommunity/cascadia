@@ -31,7 +31,8 @@
 //!
 //! Module map: [`conv`] (ShortConv), [`relpos`] (RelPos), [`gate`]
 //! (`inkling_gate`), [`attn`] (AttentionLayer), [`ffn`] (SwiGLU re-exports +
-//! w13 de-interleave), [`moe`] (MoeLayer / DenseMlp), [`model`] (Layer / Model).
+//! w13 de-interleave), [`moe`] (MoeLayer / DenseMlp), [`model`] (Layer / Model),
+//! [`ep`] (expert-parallel dispatch: driver client + expert worker engine).
 //! `loader` / `stage` / the engine arm are built on top of these types.
 
 /// `CASCADIA_INKLING_*` switch parsing — the glm helper (unset / empty / `0` /
@@ -66,6 +67,7 @@ pub fn rmsnorm_f32(x: &mut [f32], w: &[f32], eps: f32) {
 
 pub mod attn;
 pub mod conv;
+pub mod ep;
 pub mod ffn;
 pub mod gate;
 pub mod loader;

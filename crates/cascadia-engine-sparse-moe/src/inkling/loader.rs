@@ -25,6 +25,7 @@ use serde::Deserialize;
 
 use super::attn::{AttentionLayer, AttnDims, AttnWeights};
 use super::conv::ShortConv;
+use super::ep::expert_home;
 use super::ffn::AnyExpert;
 use super::model::{Head, Layer, LayerMlp, Model, WideTable};
 use super::moe::{DenseMlp, MoeLayer, MoeWeights};
@@ -32,6 +33,86 @@ use super::relpos::RelPos;
 use crate::dsv4::loader::{ExpertsMode, LoadError};
 use crate::dsv4::st::StFile;
 use crate::glm::loader::load_expert_bin;
+
+/// Which of a MoE layer's experts a load opens. Expert ids run `0..n_routed`
+/// for the routed experts and `n_routed + s` for the `n_shared` shared ones
+/// (the expert-parallel placement treats both alike — `docs/perf/INKLING_SCALING.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertSet {
+    /// Every routed + shared expert (single-process / pipeline stage).
+    All,
+    /// No expert bins at all: the layer holds its router only (the
+    /// expert-parallel DRIVER — experts are dispatched to workers).
+    None,
+    /// The ids homed on worker `index` of `count`
+    /// ([`expert_home`]`(id, count) == index`) — what
+    /// [`super::ep::load_expert_bank`] opens for a worker. A layer shell never
+    /// holds a partial table, so [`load_layer`] rejects this variant.
+    Shard { index: u32, count: u32 },
+}
+
+impl ExpertSet {
+    /// Whether expert `id` (routed or shared) is in this set.
+    pub fn owns(&self, id: usize) -> bool {
+        match *self {
+            ExpertSet::All => true,
+            ExpertSet::None => false,
+            ExpertSet::Shard { index, count } => expert_home(id, count as usize) == index as usize,
+        }
+    }
+}
+
+/// Open the expert bins of MoE layer `li` that `experts` owns, as
+/// `(expert id, expert)` in ascending id order — routed ids `0..n_routed`
+/// from `expert_EEE.bin`, shared ids `n_routed + s` from
+/// `expert_shared{s}.bin`. `li` must be a MoE layer (not in `dense_layers`).
+pub fn load_moe_experts(
+    dir: &Path,
+    m: &InklingManifest,
+    li: usize,
+    mode: ExpertsMode,
+    experts: ExpertSet,
+) -> Result<Vec<(usize, AnyExpert)>, LoadError> {
+    if m.dense_layers.contains(&li) {
+        return Err(LoadError::Manifest(format!(
+            "layer {li} is dense; it has no MoE experts"
+        )));
+    }
+    if let ExpertSet::Shard { index, count } = experts {
+        if count == 0 || index >= count {
+            return Err(LoadError::Manifest(format!(
+                "expert shard index {index} of {count} is out of range"
+            )));
+        }
+    }
+    let (hidden, inter) = (m.hidden_size, m.moe_intermediate);
+    let edir = dir.join("experts").join(format!("layer_{li:02}"));
+    let mut out = Vec::new();
+    for e in 0..m.num_experts {
+        if experts.owns(e) {
+            let x = load_expert_bin(
+                &edir.join(format!("expert_{e:03}.bin")),
+                hidden,
+                inter,
+                mode,
+            )?;
+            out.push((e, x));
+        }
+    }
+    for s in 0..m.n_shared_experts {
+        let id = m.num_experts + s;
+        if experts.owns(id) {
+            let x = load_expert_bin(
+                &edir.join(format!("expert_shared{s}.bin")),
+                hidden,
+                inter,
+                mode,
+            )?;
+            out.push((id, x));
+        }
+    }
+    Ok(out)
+}
 
 /// The subset of `manifest.json` the Inkling shell needs (`PORT_SPEC.md` §1).
 ///
@@ -198,12 +279,19 @@ fn conv_from(st: &StFile, name: &str, k: usize) -> Result<ShortConv, LoadError> 
 }
 
 /// Build one transformer layer `li` from its shell safetensors + expert bins.
+/// `experts` selects the MoE layers' expert bins: [`ExpertSet::All`] opens
+/// every routed + shared expert, [`ExpertSet::None`] builds the MoE block
+/// with its router only (the expert-parallel driver attaches an
+/// [`super::ep::EpClient`] afterwards); [`ExpertSet::Shard`] is rejected —
+/// a shell never holds a partial expert table (workers use
+/// [`super::ep::load_expert_bank`], which opens no shells at all).
 pub fn load_layer(
     dir: &Path,
     m: &InklingManifest,
     li: usize,
     max_seq: usize,
     mode: ExpertsMode,
+    experts: ExpertSet,
 ) -> Result<Layer, LoadError> {
     let (hidden, eps, k) = (m.hidden_size, m.rms_norm_eps, m.conv_kernel_size);
     let st = StFile::open(&dir.join(format!("shells/layer_{li:02}.safetensors")))?;
@@ -266,28 +354,44 @@ pub fn load_layer(
         ))
     } else {
         let inter = m.moe_intermediate;
-        let mut experts: Vec<AnyExpert> = Vec::with_capacity(m.num_experts);
-        for e in 0..m.num_experts {
-            experts.push(load_expert_bin(
-                &edir.join(format!("expert_{e:03}.bin")),
-                hidden,
-                inter,
-                mode,
-            )?);
-        }
-        let mut shared = Vec::with_capacity(m.n_shared_experts);
-        for s in 0..m.n_shared_experts {
-            shared.push(load_expert_bin(
-                &edir.join(format!("expert_shared{s}.bin")),
-                hidden,
-                inter,
-                mode,
-            )?);
-        }
+        let (experts, shared) = match experts {
+            ExpertSet::All => {
+                let mut routed: Vec<AnyExpert> = Vec::with_capacity(m.num_experts);
+                let mut shared = Vec::with_capacity(m.n_shared_experts);
+                for (id, x) in load_moe_experts(dir, m, li, mode, ExpertSet::All)? {
+                    if id < m.num_experts {
+                        routed.push(x);
+                    } else {
+                        shared.push(x);
+                    }
+                }
+                (routed, shared)
+            }
+            ExpertSet::None => (Vec::new(), Vec::new()),
+            ExpertSet::Shard { index, count } => {
+                return Err(LoadError::Manifest(format!(
+                    "layer {li}: a layer shell cannot hold expert shard {index}/{count}; \
+                     expert workers load their shard with inkling::ep::load_expert_bank"
+                )));
+            }
+        };
         let gs = g("mlp.gate.global_scale")?;
+        let router_w = g("mlp.gate.weight")?;
+        let router_bias = g("mlp.gate.bias")?;
+        if router_bias.len() != m.num_experts
+            || router_w.len() != (m.num_experts + m.n_shared_experts) * hidden
+        {
+            return Err(LoadError::Manifest(format!(
+                "layer {li}: router shapes (bias {}, weight {}) do not match {} routed + {} shared experts × hidden {hidden}",
+                router_bias.len(),
+                router_w.len(),
+                m.num_experts,
+                m.n_shared_experts
+            )));
+        }
         let mw = MoeWeights {
-            router_w: g("mlp.gate.weight")?,
-            router_bias: g("mlp.gate.bias")?,
+            router_w,
+            router_bias,
             global_scale: gs.first().copied().unwrap_or(1.0),
             experts,
             shared,
@@ -335,7 +439,10 @@ fn wide_table(
 }
 
 /// Load the layer slice `[lo, hi)`. Reads embed only when `first`, head only
-/// when `last`. `max_seq` sizes the global layers' KV caches.
+/// when `last`. `max_seq` sizes the global layers' KV caches. `experts` is
+/// passed to every [`load_layer`] (`All` for a self-contained stage, `None`
+/// for an expert-parallel driver).
+#[allow(clippy::too_many_arguments)]
 pub fn load_stage(
     dir: &Path,
     max_seq: usize,
@@ -344,6 +451,7 @@ pub fn load_stage(
     first: bool,
     last: bool,
     mode: ExpertsMode,
+    experts: ExpertSet,
 ) -> Result<InklingStage, LoadError> {
     let m = read_manifest(dir)?;
     let (vocab, hidden) = (m.vocab_size, m.hidden_size);
@@ -377,7 +485,7 @@ pub fn load_stage(
     };
     let mut layers = Vec::with_capacity(hi.saturating_sub(lo));
     for li in lo..hi {
-        layers.push(load_layer(dir, &m, li, max_seq, mode)?);
+        layers.push(load_layer(dir, &m, li, max_seq, mode, experts)?);
     }
     Ok(InklingStage {
         embed,
@@ -396,7 +504,16 @@ pub fn load_model(dir: &Path, max_seq: usize) -> Result<Model, LoadError> {
 
 pub fn load_model_with(dir: &Path, max_seq: usize, mode: ExpertsMode) -> Result<Model, LoadError> {
     let m = read_manifest(dir)?;
-    let s = load_stage(dir, max_seq, 0, m.num_layers, true, true, mode)?;
+    let s = load_stage(
+        dir,
+        max_seq,
+        0,
+        m.num_layers,
+        true,
+        true,
+        mode,
+        ExpertSet::All,
+    )?;
     let (embed, embed_norm) = s.embed.expect("full model has an embed");
     let Head { norm, unembed, .. } = s.head.expect("full model has a head");
     Ok(Model::new(

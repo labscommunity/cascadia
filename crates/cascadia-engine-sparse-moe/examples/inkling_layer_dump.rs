@@ -35,7 +35,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use cascadia_engine_sparse_moe::dsv4::loader::ExpertsMode;
-use cascadia_engine_sparse_moe::inkling::loader::{load_stage, read_manifest, InklingStage};
+use cascadia_engine_sparse_moe::inkling::loader::{
+    load_stage, read_manifest, ExpertSet, InklingStage,
+};
 use cascadia_engine_sparse_moe::inkling::model::argmax;
 use cascadia_engine_sparse_moe::inkling::rmsnorm_f32;
 use cascadia_engine_sparse_moe::inkling::stage::INKLING_DEFAULT_MAX_SEQ;
@@ -254,7 +256,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let t_load = Instant::now();
-    let mut stage = load_stage(&args.export, max_seq, 0, k, true, last, mode)?;
+    let mut stage = load_stage(
+        &args.export,
+        max_seq,
+        0,
+        k,
+        true,
+        last,
+        mode,
+        ExpertSet::All,
+    )?;
     let cache_bytes: usize = stage.layers.iter().map(|l| l.cache_bytes()).sum();
     println!(
         "[inkling_layer_dump] loaded {} layer(s) in {:.1}s (sequence state {} MiB)",

@@ -45,10 +45,10 @@ async fn inkling_two_rank_over_real_transport_matches_reference() {
     let prompt: Vec<u32> = ids("prompt_ids");
     let want: Vec<u32> = ids("greedy_ids"); // HF reference greedy on the exported weights
 
-    let mut r0 =
-        InklingRunner::load_staged(&dir, 64, 0, 2, 0, 0, Some("eager".into())).expect("rank0");
-    let mut r1 =
-        InklingRunner::load_staged(&dir, 64, 1, 2, 0, 0, Some("eager".into())).expect("rank1");
+    let mut r0 = InklingRunner::load_staged(&dir, 64, 0, 2, 0, 0, Some("eager".into()), None)
+        .expect("rank0");
+    let mut r1 = InklingRunner::load_staged(&dir, 64, 1, 2, 0, 0, Some("eager".into()), None)
+        .expect("rank1");
     r0.reset();
     r1.reset();
     let hsz = r0.hidden_size() as u32;

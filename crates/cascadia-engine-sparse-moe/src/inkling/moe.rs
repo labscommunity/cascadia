@@ -29,16 +29,30 @@
 //! batch-union prefill prefetches every expert with rows before its expert
 //! pass and computes from the mmap (each expert's pages are touched once per
 //! block anyway).
+//!
+//! Expert-parallel (remote) experts: a layer built with
+//! [`ExpertSet::None`](super::loader::ExpertSet::None) holds the router only
+//! and, once [`MoeLayer::attach_remote`] hands it an [`EpClient`], routes
+//! locally and dispatches every expert evaluation (routed AND shared — the
+//! shared experts are dispatched like routed ones with their gammas as
+//! weights) to the expert workers. The workers return raw `E(h)`; the driver
+//! applies the weights and sums in the same gate order as the local path, so
+//! the output is bit-identical to a single-process layer on the same weights
+//! (`tests/inkling_ep.rs` asserts exact equality).
+
+use std::sync::Arc;
 
 use super::env_flag;
+use super::ep::EpClient;
 use super::ffn::AnyExpert;
 use super::gate::{inkling_gate, GateOut};
 use crate::dsv4::math::linear_f32;
 
 /// `CASCADIA_INKLING_SEQ_READS`: serial expert reads (fault each mmap'd
 /// expert's pages in during its own GEMV) instead of the concurrent
-/// whole-bin reads. Read once.
-fn seq_reads() -> bool {
+/// whole-bin reads. Read once. Shared with the expert worker
+/// ([`super::ep::ExpertBank`]), which mirrors the decode read path.
+pub(crate) fn seq_reads() -> bool {
     use std::sync::OnceLock;
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| env_flag("CASCADIA_INKLING_SEQ_READS"))
@@ -53,9 +67,12 @@ pub struct MoeWeights {
     pub router_bias: Vec<f32>,
     /// `mlp.gate.global_scale` — multiplies routed weights AND shared gammas.
     pub global_scale: f32,
-    /// The routed experts, each `inter` wide.
+    /// The routed experts, each `inter` wide — `n_routed` of them, or EMPTY
+    /// for a router-only layer (expert-parallel driver: the experts live on
+    /// the workers; see [`MoeLayer::attach_remote`]).
     pub experts: Vec<AnyExpert>,
-    /// The shared experts (2), each `inter` wide, each with its own gamma.
+    /// The shared experts (2), each `inter` wide, each with its own gamma —
+    /// `n_shared` of them, or empty alongside an empty `experts`.
     pub shared: Vec<AnyExpert>,
 }
 
@@ -68,6 +85,9 @@ pub struct MoeLayer {
     pub inter: usize,
     pub route_scale: f32,
     w: MoeWeights,
+    /// Expert-parallel dispatch: `(absolute layer index, client)`. When set,
+    /// every expert evaluation goes to the workers ([`Self::forward_remote`]).
+    remote: Option<(u32, Arc<EpClient>)>,
 }
 
 impl MoeLayer {
@@ -75,23 +95,40 @@ impl MoeLayer {
     /// `ROW_BLOCK · top_k · hidden` f32; correctness is independent of it).
     const ROW_BLOCK: usize = 128;
 
+    /// `n_routed` / `n_shared` come from the router (`router_bias` is
+    /// `[n_routed]`, `router_w` is `[n_routed + n_shared, hidden]`), so the
+    /// expert tables may be either complete (`n_routed` routed + `n_shared`
+    /// shared) or both empty — a router-only layer that must have a remote
+    /// attached ([`Self::attach_remote`]) before it can run.
     pub fn new(hidden: usize, inter: usize, top_k: usize, route_scale: f32, w: MoeWeights) -> Self {
-        let (n_routed, n_shared) = (w.experts.len(), w.shared.len());
-        assert!(n_routed > 0, "moe: no routed experts");
+        assert!(hidden > 0, "moe: hidden must be > 0");
+        let n_routed = w.router_bias.len();
+        assert!(n_routed > 0, "moe: no routed experts (empty router_bias)");
+        assert!(
+            w.router_w.len() >= n_routed * hidden && w.router_w.len().is_multiple_of(hidden),
+            "moe: router_w len {} is not [n_routed + n_shared, hidden] for hidden {hidden}, n_routed {n_routed}",
+            w.router_w.len()
+        );
+        let n_shared = w.router_w.len() / hidden - n_routed;
         assert!(
             top_k >= 1 && top_k <= n_routed,
             "moe: top_k {top_k} vs {n_routed} experts"
         );
-        assert_eq!(
-            w.router_w.len(),
-            (n_routed + n_shared) * hidden,
-            "moe: router_w must be [n_routed + n_shared, hidden]"
-        );
-        assert_eq!(
-            w.router_bias.len(),
-            n_routed,
-            "moe: router_bias len != n_routed"
-        );
+        let local = !w.experts.is_empty() || !w.shared.is_empty();
+        if local {
+            assert_eq!(
+                w.experts.len(),
+                n_routed,
+                "moe: {} routed experts loaded for a {n_routed}-expert router",
+                w.experts.len()
+            );
+            assert_eq!(
+                w.shared.len(),
+                n_shared,
+                "moe: {} shared experts loaded for a router with {n_shared}",
+                w.shared.len()
+            );
+        }
         Self {
             hidden,
             n_routed,
@@ -100,6 +137,87 @@ impl MoeLayer {
             inter,
             route_scale,
             w,
+            remote: None,
+        }
+    }
+
+    /// Whether this layer holds its experts locally (routed + shared). False
+    /// for a router-only layer built with `ExpertSet::None`.
+    pub fn has_local_experts(&self) -> bool {
+        !self.w.experts.is_empty()
+    }
+
+    /// Dispatch every expert evaluation of this layer to the expert workers
+    /// behind `client`, as absolute layer `layer` (the worker's bank is
+    /// indexed by absolute layer number). Overrides any local experts.
+    /// Panics if the client's dims disagree with the layer — a driver
+    /// misconfiguration ([`super::stage::InklingRunner::load_staged`] checks
+    /// first and returns an error).
+    pub fn attach_remote(&mut self, layer: u32, client: Arc<EpClient>) {
+        assert_eq!(
+            client.hidden(),
+            self.hidden,
+            "moe layer {layer}: expert client hidden {} != layer hidden {}",
+            client.hidden(),
+            self.hidden
+        );
+        assert_eq!(
+            client.n_routed(),
+            self.n_routed,
+            "moe layer {layer}: expert client n_routed {} != layer n_routed {}",
+            client.n_routed(),
+            self.n_routed
+        );
+        assert_eq!(
+            client.n_shared(),
+            self.n_shared,
+            "moe layer {layer}: expert client n_shared {} != layer n_shared {}",
+            client.n_shared(),
+            self.n_shared
+        );
+        self.remote = Some((layer, client));
+    }
+
+    /// The attached expert-parallel client and this layer's absolute index.
+    pub fn remote(&self) -> Option<(u32, &Arc<EpClient>)> {
+        self.remote.as_ref().map(|(l, c)| (*l, c))
+    }
+
+    /// Route `rows` tokens (`xs` is `[rows, hidden]`) and evaluate their
+    /// experts on the workers. Per row the `(expert id, weight)` list is the
+    /// routed selection in gate order followed by the shared experts
+    /// (`n_routed + s`, gamma_s); [`EpClient::dispatch`] accumulates
+    /// `Σ w · E(h)` in exactly that order, so the result is bit-identical to
+    /// [`Self::forward`] / [`Self::forward_batch`] on local experts. A
+    /// worker / transport failure is a hard error of the forward (there is
+    /// no error channel through the layer stack): it panics with the
+    /// worker's message, which names the worker index and the layer.
+    fn forward_remote(&self, xs: &[f32], rows: usize) -> Vec<f32> {
+        let (layer, client) = self
+            .remote
+            .as_ref()
+            .expect("forward_remote without a remote client");
+        assert_eq!(xs.len(), rows * self.hidden, "moe forward_remote: xs len");
+        let per_row: Vec<Vec<(usize, f32)>> = xs
+            .chunks_exact(self.hidden)
+            .map(|x| {
+                let gate = self.route(x);
+                gate.idx
+                    .iter()
+                    .zip(&gate.w)
+                    .map(|(&e, &w)| (e, w))
+                    .chain(
+                        gate.gammas
+                            .iter()
+                            .enumerate()
+                            .map(|(s, &g)| (self.n_routed + s, g)),
+                    )
+                    .collect()
+            })
+            .collect();
+        match client.dispatch(*layer, xs, &per_row) {
+            Ok(out) => out,
+            Err(e) => panic!("inkling expert-parallel dispatch failed (layer {layer}): {e}"),
         }
     }
 
@@ -124,6 +242,14 @@ impl MoeLayer {
     /// `[hidden]`. Routed experts accumulate in gate order, then the shared
     /// experts — the order [`Self::forward_batch`] reproduces per row.
     pub fn forward(&self, x: &[f32]) -> Vec<f32> {
+        if self.remote.is_some() {
+            return self.forward_remote(x, 1);
+        }
+        assert!(
+            self.has_local_experts(),
+            "inkling MoE layer has no local experts and no expert-parallel client attached \
+             (a driver built with ExpertSet::None must attach_remote before running)"
+        );
         let gate = self.route(x);
         // Every expert this token touches, in accumulation order, with its weight.
         let sel: Vec<&AnyExpert> = gate
@@ -179,6 +305,14 @@ impl MoeLayer {
     /// prefill / batched-verify path.
     pub fn forward_batch(&self, xs: &[f32], rows: usize) -> Vec<f32> {
         assert_eq!(xs.len(), rows * self.hidden, "moe forward_batch: xs len");
+        if self.remote.is_some() {
+            return self.forward_remote(xs, rows);
+        }
+        assert!(
+            self.has_local_experts(),
+            "inkling MoE layer has no local experts and no expert-parallel client attached \
+             (a driver built with ExpertSet::None must attach_remote before running)"
+        );
         let mut out = vec![0.0f32; rows * self.hidden];
         let mut lo = 0;
         while lo < rows {

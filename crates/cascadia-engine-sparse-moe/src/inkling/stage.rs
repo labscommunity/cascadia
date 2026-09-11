@@ -6,8 +6,10 @@
 //! [`crate::engine::PipelineEngine`] drives it exactly like glm5 / dsv4.
 
 use std::path::Path;
+use std::sync::Arc;
 
-use super::loader::{load_stage, read_manifest, InklingManifest};
+use super::ep::EpClient;
+use super::loader::{load_stage, read_manifest, ExpertSet, InklingManifest};
 use super::model::{Head, Layer, WideTable};
 use super::rmsnorm_f32;
 use crate::dsv4::loader::{ExpertsMode, LoadError};
@@ -63,7 +65,11 @@ impl InklingRunner {
     /// Load rank `rank` of `total`. `layer_start/layer_end` from the ShardSpec
     /// override the even split when nonzero. `experts_mode` (`"eager"` |
     /// `"mmap"`) falls back to `CASCADIA_INKLING_EXPERTS`, then to mmap for any
-    /// real-sized expert set (> 32 experts).
+    /// real-sized expert set (> 32 experts). `remote` makes this rank an
+    /// expert-parallel DRIVER: no expert bins are opened (`ExpertSet::None`)
+    /// and every MoE layer dispatches to the client's workers, keyed by its
+    /// absolute layer index; the client's dims must match the manifest.
+    #[allow(clippy::too_many_arguments)]
     pub fn load_staged(
         dir: &Path,
         max_seq: usize,
@@ -72,11 +78,34 @@ impl InklingRunner {
         layer_start: u32,
         layer_end: u32,
         experts_mode: Option<String>,
+        remote: Option<Arc<EpClient>>,
     ) -> Result<Self, LoadError> {
         let m = read_manifest(dir)?;
         let n = m.num_layers;
         let total = total.max(1);
         let rank = rank.min(total - 1);
+        if let Some(c) = remote.as_ref() {
+            if c.n_workers() == 0 {
+                return Err(LoadError::Manifest(
+                    "expert-parallel driver: the expert client has no workers".into(),
+                ));
+            }
+            if c.hidden() != m.hidden_size
+                || c.n_routed() != m.num_experts
+                || c.n_shared() != m.n_shared_experts
+            {
+                return Err(LoadError::Manifest(format!(
+                    "expert-parallel driver: client dims (hidden {}, routed {}, shared {}) do not \
+                     match the manifest (hidden {}, routed {}, shared {})",
+                    c.hidden(),
+                    c.n_routed(),
+                    c.n_shared(),
+                    m.hidden_size,
+                    m.num_experts,
+                    m.n_shared_experts
+                )));
+            }
+        }
         let (lo, hi) = if layer_end > 0 {
             (layer_start as usize, layer_end as usize)
         } else {
@@ -96,7 +125,19 @@ impl InklingRunner {
             _ if m.num_experts > 32 => ExpertsMode::Mmap,
             _ => ExpertsMode::Eager,
         };
-        let s = load_stage(dir, max_seq, lo, hi, first, last, mode)?;
+        let experts = if remote.is_some() {
+            ExpertSet::None
+        } else {
+            ExpertSet::All
+        };
+        let mut s = load_stage(dir, max_seq, lo, hi, first, last, mode, experts)?;
+        if let Some(client) = remote.as_ref() {
+            for (i, l) in s.layers.iter_mut().enumerate() {
+                if let Some(moe) = l.moe_mut() {
+                    moe.attach_remote((lo + i) as u32, Arc::clone(client));
+                }
+            }
+        }
         let cache_bytes: usize = s.layers.iter().map(Layer::cache_bytes).sum();
         tracing::info!(
             rank,
@@ -105,6 +146,7 @@ impl InklingRunner {
             hi,
             max_seq,
             experts = ?mode,
+            expert_workers = remote.as_ref().map_or(0, |c| c.n_workers()),
             cache_mib = cache_bytes >> 20,
             "inkling stage loaded"
         );
