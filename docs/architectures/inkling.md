@@ -117,6 +117,19 @@ Tier 1–4 of the family test ladder (all synthetic, no downloads, `cargo test
 Python: `tools/tests/test_inkling_export.py` (contract, de-interleave vs
 transformers' op, tiny round-trip).
 
+**Real-weight per-layer parity** (`examples/inkling_layer_dump.rs` +
+`tools/inkling_ref/real_layer_parity.py`, exercised on the tiny export by
+`tools/tests/test_inkling_real_parity.py`): the Rust example loads the first
+`K` layers of an export, runs a token list through the decode path
+(`forward_token`) and the batched prefill path and dumps every residual-stream
+tensor; the Python side builds a `K`-layer `InklingForCausalLM` from the same
+int4-dequantised weights (meta-device init, no head unless `K == num_layers`)
+and reports max |diff| / row RMS, rms(diff) / rms and cosine per layer and
+path. This is how the 975B export is validated layer by layer on a box that
+cannot run HF end to end (`K = 3`, float32 ≈ 67 GB: layers 0–1 dense + the
+first MoE layer). Tiny export, float32: worst element ≤ 0.26 % of its row RMS,
+rms(diff)/rms ≤ 0.06 %, argmax 19/19, decode == prefill bit for bit.
+
 Real model (miner, Xeon Gold 6252 48T / 172 GB / SATA SSD scratch): _pending —
 export streaming in progress; per-layer parity against checkpoint slices and
 factual prompts end to end follow._

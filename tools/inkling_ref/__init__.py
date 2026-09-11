@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 
 import numpy as np
@@ -205,18 +206,24 @@ def checkpoint_state_to_hf(ckpt: dict[str, torch.Tensor]) -> dict[str, torch.Ten
 # --------------------------------------------------------------------------
 # manifest -> HF config, tiny model, prompt
 # --------------------------------------------------------------------------
-def hf_config_from_manifest(man: dict):
+def hf_config_from_manifest(man: dict, num_layers: int | None = None):
     """`InklingTextConfig` for an export manifest (eager attention: the relative-position bias is
-    a `position_bias` kwarg; eager is the path we validated against)."""
+    a `position_bias` kwarg; eager is the path we validated against). `num_layers` (default: all)
+    builds the config for the first `num_layers` decoder layers only — `layer_types` /
+    `mlp_layer_types` sliced to match — for the partial-model parity harness
+    (`real_layer_parity.py`), where a 975B export is compared K layers at a time."""
     from transformers import InklingTextConfig
 
+    n = man["num_layers"] if num_layers is None else int(num_layers)
+    if not 1 <= n <= man["num_layers"]:
+        raise ValueError(f"num_layers {n} out of range 1..{man['num_layers']}")
     dense = set(man["dense_layers"])
     eos = man.get("eos_token_ids") or []
     return InklingTextConfig(
         vocab_size=man["vocab_size"],
         unpadded_vocab_size=man["unpadded_vocab_size"],
         hidden_size=man["hidden_size"],
-        num_hidden_layers=man["num_layers"],
+        num_hidden_layers=n,
         num_attention_heads=man["num_attention_heads"],
         num_key_value_heads=man["num_kv_heads"],
         head_dim=man["head_dim"],
@@ -228,8 +235,8 @@ def hf_config_from_manifest(man: dict):
         rel_extent=man["rel_extent"],
         log_scaling_n_floor=man["log_scaling_n_floor"],
         log_scaling_alpha=man["log_scaling_alpha"],
-        layer_types=["hybrid_sliding" if t == "sliding" else "hybrid" for t in man["layer_types"]],
-        mlp_layer_types=["dense" if i in dense else "sparse" for i in range(man["num_layers"])],
+        layer_types=["hybrid_sliding" if t == "sliding" else "hybrid" for t in man["layer_types"][:n]],
+        mlp_layer_types=["dense" if i in dense else "sparse" for i in range(n)],
         rms_norm_eps=man["rms_norm_eps"],
         conv_kernel_size=man["conv_kernel_size"],
         intermediate_size=man["dense_intermediate"] or man["moe_intermediate"],
@@ -432,55 +439,90 @@ def dequant_expert_bin(path, hidden: int, inter: int):
     return gate, up, down
 
 
-def load_export_as_hf(export_dir):
-    """Read an `export_inkling.py` output dir back into a fresh `InklingForCausalLM` (f32):
-    bf16 shells as-is (lossless), int4 bins DEQUANTIZED. Returns (model, manifest)."""
-    from safetensors.torch import load_file
-    from transformers import InklingForCausalLM
-
+def read_manifest(export_dir) -> dict:
+    """`manifest.json` of an `export_inkling.py` output dir (arch checked)."""
     d = Path(export_dir)
     man = json.loads((d / "manifest.json").read_text())
     if man.get("arch") != "inkling":
         raise ValueError(f"{d}: manifest arch {man.get('arch')!r} != 'inkling'")
+    return man
+
+
+def load_export_state(export_dir, layers=None, dtype=torch.float32, with_embed: bool = True,
+                      with_head: bool = True, log=None):
+    """HF-named state dict for `layers` (default: every layer) of an `export_inkling.py` output
+    dir: bf16 shells as-is (lossless), int4 bins DEQUANTIZED. Returns (state_dict, manifest).
+
+    `dtype` casts everything except the four short-conv weights per layer, which stay float32 —
+    what transformers' `_keep_in_fp32_modules_strict` does on `from_pretrained`, and what the Rust
+    shell computes them in. Expert stacks are written into preallocated `[E, 2I, H]` / `[E, H, I]`
+    tensors expert by expert, so a layer costs one copy of itself at peak (a 975B MoE layer is
+    ~58 GB in float32; `torch.stack` over a list would transiently double that). `log(msg)` gets
+    progress lines when given."""
+    from safetensors.torch import load_file
+
+    d = Path(export_dir)
+    man = read_manifest(d)
     H, I, Id = man["hidden_size"], man["moe_intermediate"], man["dense_intermediate"]
     dense = set(man["dense_layers"])
+    layers = list(range(man["num_layers"])) if layers is None else [int(li) for li in layers]
     sd: dict[str, torch.Tensor] = {}
-    emb = load_file(str(d / "embed.safetensors"))
-    sd["model.embed_tokens.weight"] = emb["embed.weight"].float()
-    sd["model.embed_norm.weight"] = emb["embed_norm.weight"].float()
-    head = load_file(str(d / "head.safetensors"))
-    sd["lm_head.weight"] = head["unembed.weight"].float()
-    sd["model.norm.weight"] = head["norm.weight"].float()
-    for li in range(man["num_layers"]):
+    if with_embed:
+        emb = load_file(str(d / "embed.safetensors"))
+        sd["model.embed_tokens.weight"] = emb["embed.weight"].to(dtype)
+        sd["model.embed_norm.weight"] = emb["embed_norm.weight"].to(dtype)
+    if with_head:
+        head = load_file(str(d / "head.safetensors"))
+        sd["lm_head.weight"] = head["unembed.weight"].to(dtype)
+        sd["model.norm.weight"] = head["norm.weight"].to(dtype)
+    for li in layers:
+        t0 = time.time()
         p = f"model.layers.{li}."
         sh = load_file(str(d / "shells" / f"layer_{li:02d}.safetensors"))
         for suf, t in sh.items():
             hf = _LAYER_CKPT_TO_HF[suf]
-            t = t.float()
-            if suf.endswith("sconv.weight"):  # stored [C, K]; HF conv1d wants [C, 1, K]
-                t = t.unsqueeze(1)
+            if suf.endswith("sconv.weight"):  # stored [C, K]; HF conv1d wants [C, 1, K]; f32 always
+                t = t.float().unsqueeze(1)
+            else:
+                t = t.to(dtype)
             sd[p + hf] = t.contiguous()
         edir = d / "experts" / f"layer_{li:02d}"
         if li in dense:
             g, u, dn = dequant_expert_bin(edir / "dense.bin", H, Id)
-            sd[p + "mlp.gate_proj.weight"], sd[p + "mlp.up_proj.weight"], sd[p + "mlp.down_proj.weight"] = g, u, dn
+            sd[p + "mlp.gate_proj.weight"] = g.to(dtype)
+            sd[p + "mlp.up_proj.weight"] = u.to(dtype)
+            sd[p + "mlp.down_proj.weight"] = dn.to(dtype)
         else:
-            gu, dw = [], []
-            for e in range(man["num_experts"]):
+            E, S = man["num_experts"], man["n_shared_experts"]
+            gu = torch.empty(E, 2 * I, H, dtype=dtype)
+            dw = torch.empty(E, H, I, dtype=dtype)
+            for e in range(E):
                 g, u, dn = dequant_expert_bin(edir / f"expert_{e:03d}.bin", H, I)
-                gu.append(torch.cat([g, u], dim=0))
-                dw.append(dn)
-            sd[p + "mlp.experts.gate_up_proj"] = torch.stack(gu)
-            sd[p + "mlp.experts.down_proj"] = torch.stack(dw)
-            sg, su, sdn = [], [], []
-            for s in range(man["n_shared_experts"]):
+                gu[e, :I], gu[e, I:], dw[e] = g, u, dn
+                if log and (e + 1) % 64 == 0:
+                    log(f"  layer {li}: {e + 1}/{E} experts dequantised ({time.time() - t0:.0f}s)")
+            sd[p + "mlp.experts.gate_up_proj"] = gu
+            sd[p + "mlp.experts.down_proj"] = dw
+            sg = torch.empty(S, I, H, dtype=dtype)
+            su = torch.empty(S, I, H, dtype=dtype)
+            sdn = torch.empty(S, H, I, dtype=dtype)
+            for s in range(S):
                 g, u, dn = dequant_expert_bin(edir / f"expert_shared{s}.bin", H, I)
-                sg.append(g)
-                su.append(u)
-                sdn.append(dn)
-            sd[p + "mlp.shared_experts.gate_proj"] = torch.stack(sg)
-            sd[p + "mlp.shared_experts.up_proj"] = torch.stack(su)
-            sd[p + "mlp.shared_experts.down_proj"] = torch.stack(sdn)
+                sg[s], su[s], sdn[s] = g, u, dn
+            sd[p + "mlp.shared_experts.gate_proj"] = sg
+            sd[p + "mlp.shared_experts.up_proj"] = su
+            sd[p + "mlp.shared_experts.down_proj"] = sdn
+        if log:
+            log(f"  layer {li} ({'dense' if li in dense else 'moe'}) loaded in {time.time() - t0:.1f}s")
+    return sd, man
+
+
+def load_export_as_hf(export_dir):
+    """Read an `export_inkling.py` output dir back into a fresh `InklingForCausalLM` (f32):
+    bf16 shells as-is (lossless), int4 bins DEQUANTIZED. Returns (model, manifest)."""
+    from transformers import InklingForCausalLM
+
+    sd, man = load_export_state(export_dir)
     model = InklingForCausalLM(hf_config_from_manifest(man)).float().eval()
     model.load_state_dict(sd, strict=True)
     return model, man
@@ -492,5 +534,6 @@ __all__ = [
     "hf_config_from_manifest", "build_tiny_model", "prompt_ids", "select_prompt", "argmax_margins",
     "argmax_margins_batched", "int4_roundtrip_state", "int4_roundtrip_model", "greedy_reference",
     "UNEMBED_STD", "MIN_ARGMAX_MARGIN", "N_PROMPT_CANDIDATES",
-    "int4_bin_bytes", "dequant_int4_section", "dequant_expert_bin", "load_export_as_hf",
+    "int4_bin_bytes", "dequant_int4_section", "dequant_expert_bin", "read_manifest",
+    "load_export_state", "load_export_as_hf",
 ]
