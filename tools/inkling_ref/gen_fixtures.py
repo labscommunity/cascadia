@@ -22,6 +22,11 @@ Writes fixtures.safetensors (+ fixtures.json sidecar for humans):
   moe_x [1, 64] -> moe_out [1, 64]                     InklingMoE of layer 1
   model.llm.* (every weight, checkpoint names)         gate/up RE-INTERLEAVED into the w13 layout
 
+The relative-position bias is load-bearing: per layer, rms|bias| / rms|q.k/D| over the allowed (q, k)
+pairs of the prompt prefill is measured, printed and recorded (`relpos_bias_to_score_rms` in the
+sidecar) and must be >= MIN_BIAS_TO_SCORE on every layer, so a Rust attention that drops the bias
+fails the hidden-state goldens instead of hiding inside their 2 % row-scale band.
+
 Sliding-window rule observed in transformers 5.16.1 (`masking_utils.sliding_window_overlay`,
 AND-ed with the causal mask by `sliding_window_causal_mask_function`):
     allowed(q_idx, kv_idx) = (kv_idx <= q_idx) and (kv_idx > q_idx - sliding_window)
@@ -37,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -47,11 +53,14 @@ if str(_TOOLS) not in sys.path:
     sys.path.insert(0, str(_TOOLS))
 
 import export_inkling  # noqa: E402
-from inkling_ref import (MIN_ARGMAX_MARGIN, N_GEN, TINY_CONFIG, TINY_SEED, UNEMBED_STD,  # noqa: E402
+from inkling_ref import (MIN_ARGMAX_MARGIN, N_GEN, REL_PROJ_STD, TINY_CONFIG, TINY_SEED, UNEMBED_STD,  # noqa: E402
                          build_tiny_model, greedy_reference, hf_state_to_checkpoint, select_prompt)
 from inkling_ref import spec_ref  # noqa: E402
 
 DEFAULT_OUT = _TOOLS.parent / "crates" / "cascadia-engine-sparse-moe" / "tests" / "fixtures" / "inkling"
+# rms|bias| / rms|q.k/D| floor per layer (see REL_PROJ_STD): below ~0.3 zeroing the bias stays inside
+# the model golden's 2 % row-scale band; 0.5 is the reviewer's bar, the fixture sits at 1.3-2.3.
+MIN_BIAS_TO_SCORE = 0.5
 
 FX: dict[str, torch.Tensor] = {}
 CHECKS: dict[str, float] = {}
@@ -73,6 +82,36 @@ def check(name, a, b, tol=1e-4):
     CHECKS[name] = rel
     if rel > tol:
         raise AssertionError(f"[spec-vs-HF] {name}: rel err {rel:.3e} > {tol:.1e} (abs {err:.3e})")
+
+
+@torch.no_grad()
+def bias_to_score_rms(ckpt: dict, man: dict, li: int, x_in: torch.Tensor) -> dict:
+    """rms of the content score q.k/D and of the relative-position bias (both tau-scaled on a global
+    layer, as HF adds them) over the allowed (q, k) pairs of a prefill of layer `li` on its input
+    `x_in` [T, H] — the spec's attention, instrumented."""
+    W = spec_ref.layer_weights(ckpt, li)
+    d = spec_ref.layer_dims(man, li)
+    heads, kv_heads, head_dim, d_rel, window = d["heads"], d["kv_heads"], d["head_dim"], d["d_rel"], d["window"]
+    h = spec_ref.rmsnorm(x_in, W["attn_norm.weight"], d["eps"])
+    T = h.shape[0]
+    q = spec_ref.rmsnorm((h @ W["attn.wq_du.weight"].T).view(T, heads, head_dim), W["attn.q_norm.weight"], d["eps"])
+    kc = spec_ref.sconv(W["attn.k_sconv.weight"], h @ W["attn.wk_dv.weight"].T)
+    k = spec_ref.rmsnorm(kc.view(T, kv_heads, head_dim), W["attn.k_norm.weight"], d["eps"])
+    r = (h @ W["attn.wr_du.weight"].T).view(T, heads, d_rel)
+    proj, grp = W["attn.rel_logits_proj.proj"], heads // kv_heads
+    scores, biases = [], []
+    for p in range(T):
+        tau = 1.0
+        if window is None and d["n_floor"] is not None:
+            tau = 1.0 + d["alpha"] * math.log(max((p + 1) / d["n_floor"], 1.0))
+        js = [j for j in range(p + 1) if window is None or p - j < window]
+        bias = spec_ref.relpos_bias(r[p], proj, p, js) * tau
+        for hh in range(heads):
+            scores.append((k[js, hh // grp] @ (q[p, hh] * tau)) / head_dim)
+            biases.append(bias[hh])
+    s, b = torch.cat(scores), torch.cat(biases)
+    s_rms, b_rms = float(s.pow(2).mean().sqrt()), float(b.pow(2).mean().sqrt())
+    return {"score_rms": s_rms, "bias_rms": b_rms, "ratio": b_rms / s_rms, "pairs": int(s.numel())}
 
 
 def canonical_gate_order(logits, bias, top_k):
@@ -120,9 +159,11 @@ def main():
     #         the same prompt), so "argmax EXACT" survives bf16 write-back on the Rust side.
     prompt, prompt_seed, prompt_margin = select_prompt(man, model)
     ids = torch.tensor([prompt], dtype=torch.long)
-    layer_outs = {}
+    layer_ins, layer_outs = {}, {}
     hooks = [layer.register_forward_hook(lambda m, i, o, li=li: layer_outs.__setitem__(li, o.detach().clone()))
              for li, layer in enumerate(model.model.layers)]
+    hooks += [layer.register_forward_pre_hook(lambda m, a, li=li: layer_ins.__setitem__(li, a[0].detach().clone()))
+              for li, layer in enumerate(model.model.layers)]
     o = model(ids, use_cache=False, output_hidden_states=True)
     for h in hooks:
         h.remove()
@@ -141,6 +182,16 @@ def main():
     for li in range(man["num_layers"]):
         check(f"layer{li}_out", layer_outs[li][0], spec_outs[li])
     check("final_logits", o.logits[0], spec_logits)
+
+    # ---- 1b. the relative-position bias must be load-bearing on every layer (sliding and global)
+    bias_ratio = {}
+    for li in range(man["num_layers"]):
+        m = bias_to_score_rms(ckpt, man, li, layer_ins[li][0])
+        bias_ratio[str(li)] = m
+        print(f"[relpos] layer {li} ({man['layer_types'][li]}): rms|q.k/D| {m['score_rms']:.4f} "
+              f"rms|bias| {m['bias_rms']:.4f} ratio {m['ratio']:.3f} over {m['pairs']} (q, k) pairs", flush=True)
+        assert m["ratio"] >= MIN_BIAS_TO_SCORE, \
+            f"layer {li}: rms|bias| / rms|q.k/D| = {m['ratio']:.3f} < {MIN_BIAS_TO_SCORE}: raise REL_PROJ_STD"
 
     # ---- 2. sconv: InklingShortConvolution on [1, T, C], no cache ----
     C, Tc = 8, 6
@@ -237,7 +288,8 @@ def main():
         "transformers_version": transformers.__version__,
         "torch_version": torch.__version__,
         "seed": TINY_SEED,
-        "weight_init": f"N(0, 0.05) bf16-rounded; norms/global_scale 1 + N(0, 0.05); unembed N(0, {UNEMBED_STD})",
+        "weight_init": f"N(0, 0.05) bf16-rounded; norms/global_scale 1 + N(0, 0.05); unembed N(0, {UNEMBED_STD}); "
+                       f"attn.rel_logits_proj.proj N(0, {REL_PROJ_STD})",
         "tiny_config": TINY_CONFIG,
         "manifest": man,
         "prompt_ids": prompt,
@@ -246,6 +298,9 @@ def main():
         "first_logits_argmax": ref["first_logits_argmax"],
         "argmax_top2_logit_margins": margins,
         "argmax_margin_floor": {"required": MIN_ARGMAX_MARGIN, "f32_and_int4_roundtrip": prompt_margin},
+        "relpos_bias_to_score_rms": {"required_ratio": MIN_BIAS_TO_SCORE, "per_layer": bias_ratio,
+                                     "note": "rms over the allowed (q,k) pairs of the prompt prefill; "
+                                             "score = q.k/head_dim, bias = r.proj[:, dist], both tau-scaled"},
         "gate": {"layer": 1, "idx_order": "selection score (sigmoid(logit)+bias) descending, ties -> lower id",
                  "logits": "[num_experts + n_shared]: routed first, shared last"},
         "conventions": {

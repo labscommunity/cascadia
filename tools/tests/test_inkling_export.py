@@ -8,8 +8,10 @@ Covers: the config contract (real config.json semantics accepted, non-sigmoid ga
 the de-interleave rule vs transformers' own `Interleave` op, the torch int4 packer vs
 export_glm5's numpy reference (byte-identical), the --tiny round-trip (bins dequantize within
 int4 tolerance, shells lossless, manifest fields, reference.json == a direct HF run on the
-dequantized weights), idempotent re-runs, and the streaming --skip-missing-shards /
---delete-consumed-shards passes over a synthetic sharded checkpoint.
+dequantized weights), the --tiny output-dir guard (never wipes a dir that is not ours without
+--force), idempotent re-runs, and the streaming --skip-missing-shards / --delete-consumed-shards
+passes over a synthetic sharded checkpoint: a unit whose sources are all readable is written
+directly (no .staging entry), one with a shard pending is staged, then completed when it lands.
 """
 from __future__ import annotations
 
@@ -313,13 +315,56 @@ def test_tiny_rerun_is_idempotent(tiny_export):
     ckpt = hf_state_to_checkpoint(build_tiny_model(man).state_dict())
     summary = export_inkling.Exporter(export_inkling.DictSource(ckpt), man, out, workers=2).run()
     n_units = 2 + 4 + 1 + 3 * (8 + 2)
-    assert summary["counts"] == {"skipped": n_units, "staged": 0, "assembled": 0, "pending": 0}
+    assert summary["counts"] == {"direct": 0, "staged": 0, "assembled": 0, "skipped": n_units, "pending": 0}
     assert summary["complete"] and summary["staged_parts"] == 0 and not (out / ".staging").exists()
     after = {p: p.stat().st_mtime_ns for p in out.rglob("*") if p.is_file()}
     for p, m in before.items():
         if p.name != "manifest.json":
             assert after[p] == m, p
     assert export_inkling.layers_done_check(out) is True
+
+
+def test_tiny_refuses_to_wipe_unrelated_dir_unless_forced(tmp_path):
+    out = tmp_path / "precious"
+    (out / "sub").mkdir(parents=True)
+    (out / "notes.txt").write_text("keep me")
+    (out / "sub" / "data.bin").write_bytes(b"\x00" * 16)
+    (out / "manifest.json").write_text(json.dumps({"arch": "glm5"}))  # another exporter's output
+    before = sorted(p.relative_to(out) for p in out.rglob("*"))
+    assert not export_inkling.is_tiny_export_dir(out)
+    with pytest.raises(SystemExit, match="--force"):
+        export_inkling.export_tiny(out, workers=2)
+    assert sorted(p.relative_to(out) for p in out.rglob("*")) == before
+    assert (out / "notes.txt").read_text() == "keep me"
+    # the CLI refuses the same way and leaves the dir alone
+    r = subprocess.run([sys.executable, os.path.join(_TOOLS_DIR, "export_inkling.py"), "--tiny", str(out)],
+                       capture_output=True, text=True)
+    assert r.returncode != 0 and "--force" in r.stdout + r.stderr
+    assert sorted(p.relative_to(out) for p in out.rglob("*")) == before
+    # a plain file is refused too
+    f = tmp_path / "a_file"
+    f.write_text("x")
+    with pytest.raises(SystemExit, match="--force"):
+        export_inkling.export_tiny(f, workers=2)
+    assert f.read_text() == "x"
+    # --force wipes it and exports
+    s = export_inkling.export_tiny(out, workers=2, force=True)
+    assert s["complete"] and not (out / "notes.txt").exists() and not (out / "sub").exists()
+    assert json.loads((out / "manifest.json").read_text())["arch"] == "inkling"
+
+
+def test_tiny_replaces_empty_dir_or_previous_export(tmp_path):
+    out = tmp_path / "prev"
+    assert export_inkling.is_tiny_export_dir(out)  # absent
+    out.mkdir()
+    assert export_inkling.is_tiny_export_dir(out)  # empty
+    (out / "source_config.json").write_text("{}")
+    (out / "stale.bin").write_bytes(b"old")
+    assert not export_inkling.is_tiny_export_dir(out)  # no manifest: could be anything
+    (out / "manifest.json").write_text(json.dumps({"arch": "inkling"}))
+    assert export_inkling.is_tiny_export_dir(out)  # our markers
+    s = export_inkling.export_tiny(out, workers=2)
+    assert s["complete"] and not (out / "stale.bin").exists() and (out / "reference.json").exists()
 
 
 def test_layers_done_check_detects_missing_and_truncated(tiny_export):
@@ -336,8 +381,10 @@ def test_layers_done_check_detects_missing_and_truncated(tiny_export):
         man = export_inkling.load_and_validate_config(TINY_CONFIG)
         ckpt = hf_state_to_checkpoint(build_tiny_model(man).state_dict())
         summary = export_inkling.Exporter(export_inkling.DictSource(ckpt), man, out, workers=2).run()
-        assert summary["counts"]["staged"] == 2 and summary["counts"]["assembled"] == 1 and summary["complete"]
-        assert victim.read_bytes() == data and summary["staged_parts"] == 0
+        # every source readable, nothing staged: the one missing unit is written directly
+        assert summary["counts"]["direct"] == 1 and summary["counts"]["staged"] == 0
+        assert summary["counts"]["assembled"] == 0 and summary["complete"]
+        assert victim.read_bytes() == data and summary["staged_parts"] == 0 and not (out / ".staging").exists()
         assert export_inkling.layers_done_check(out) is True
     finally:
         victim.write_bytes(data)
@@ -393,9 +440,15 @@ def test_streaming_export_over_sharded_checkpoint(tmp_path, tiny_export):
 
     with pytest.raises(SystemExit, match="not on disk"):
         export_inkling.export_real(model_dir, out, workers=2)  # without --skip-missing-shards: loud
+    # ... but embed, head and layers 0-2 were whole and got written directly before it died on layer 3
+    assert (out / "embed.safetensors").is_file() and (out / "shells" / "layer_02.safetensors").is_file()
+    assert (out / ".layer_02.done").exists() and not (out / ".staging").exists()
     s1 = export_inkling.export_real(model_dir, out, skip_missing=True, delete_consumed=True, workers=2)
     assert not s1["complete"] and s1["layers_done"] == 3 and s1["embed_done"] and s1["head_done"]
     assert s1["pending_shards"] == [names[2]] and s1["staged_parts"] == 0
+    # layer 3 (17 shell + 10 x 2 bin parts) waits; nothing of it can be staged, so no .staging dir
+    assert s1["counts"] == {"direct": 0, "staged": 0, "assembled": 0, "skipped": 2 + 2 + 11 + 11, "pending": 37}
+    assert not (out / ".staging").exists()
     assert sorted(s1["shards_deleted"]) == [names[0], names[1]] and s1["shards_consumed"] == 2
     assert not (model_dir / names[0]).exists() and not (model_dir / names[1]).exists()
     assert not (out / "manifest.json").exists()
@@ -407,7 +460,8 @@ def test_streaming_export_over_sharded_checkpoint(tmp_path, tiny_export):
     assert s2["complete"] and s2["layers_done"] == 4 and s2["pending_shards"] == []
     assert s2["shards_deleted"] == [names[2]] and s2["shards_consumed"] == 3
     assert s2["counts"]["skipped"] == 2 + (1 + 1) + 2 * (1 + 10)  # embed, head, layer 0, layers 1-2
-    assert s2["counts"]["assembled"] == 11 and s2["staged_parts"] == 0 and not (out / ".staging").exists()
+    assert s2["counts"]["direct"] == 11 and s2["counts"]["assembled"] == 0 and s2["counts"]["staged"] == 0
+    assert s2["staged_parts"] == 0 and not (out / ".staging").exists()
     assert (out / "manifest.json").exists() and (out / "tokenizer_config.json").exists()
     assert export_inkling.layers_done_check(out, model_dir) is True
     _assert_same_export(tiny_out, out)
@@ -432,9 +486,22 @@ def _assert_same_export(a_dir: Path, b_dir: Path):
     assert json.loads((a_dir / "manifest.json").read_text()) == json.loads((b_dir / "manifest.json").read_text())
 
 
+def _plan_units(man, out, wm):
+    """(every unit of the full plan, id(unit) -> the shards its source tensors live in)."""
+    units, _, _ = export_inkling.build_plan(man, out)
+    return units, {id(u): {wm[p.source] for p in u.parts} for u in units}
+
+
+def _assert_final(u):
+    assert u.output.is_file() and (u.size is None or u.output.stat().st_size == u.size), u.output
+    assert not any(p.path.exists() for p in u.parts), u.output
+
+
 def test_streaming_spread_shards_consumed_one_at_a_time(tmp_path, tiny_export):
     """The real index scatters a layer's tensors over the whole shard range: a shard must become
-    consumable after ONE pass regardless of what else has downloaded (per-tensor staging)."""
+    consumable after ONE pass regardless of what else has downloaded (per-tensor staging), while a
+    unit whose sources are all readable goes straight to its final file (no .staging entry) and a
+    unit with a shard pending stages what it can, then completes the moment the shard lands."""
     tiny_out, _ = tiny_export
     man = export_inkling.load_and_validate_config(TINY_CONFIG)
     ckpt = hf_state_to_checkpoint(build_tiny_model(man).state_dict())
@@ -447,45 +514,123 @@ def test_streaming_spread_shards_consumed_one_at_a_time(tmp_path, tiny_export):
         assert wm[p + "mlp.experts.w13_weight"] != wm[p + "mlp.experts.w2_weight"]
         assert len({wm[k] for k in wm if k.startswith(p)}) == 3
     out = tmp_path / "export"
+    n0, n1, n2 = names[0], names[1], names[2]
+    units, shards = _plan_units(man, out, wm)
+
+    def whole_in(*present):  # units whose every source tensor sits in the `present` shards
+        return [u for u in units if shards[id(u)] <= set(present)]
+
+    def parts_in(us, shard):
+        return sum(1 for u in us for p in u.parts if wm[p.source] == shard)
+
     parked = {i: tmp_path / names[i] for i in (1, 2)}
     for i in parked:
         (model_dir / names[i]).rename(parked[i])
 
-    # shard 0 alone: nothing can be assembled (every unit needs the other shards), but every tensor
-    # of shard 0 gets staged, so the shard is consumed and deleted in this very pass
+    # shard 0 alone: units entirely inside it are written directly; every other tensor of shard 0
+    # is staged, so the shard is consumed and deleted in this very pass
+    direct1 = whole_in(n0)
+    split = [u for u in units if u not in direct1]  # need a shard that is not here yet
     s1 = export_inkling.export_real(model_dir, out, skip_missing=True, delete_consumed=True, workers=2)
-    assert s1["shards_deleted"] == [names[0]] and s1["shards_consumed"] == 1
-    assert s1["pending_shards"] == [names[1], names[2]]
+    assert s1["shards_deleted"] == [n0] and s1["shards_consumed"] == 1
+    assert s1["pending_shards"] == [n1, n2]
     assert s1["layers_done"] == 0 and not s1["complete"]
-    assert s1["counts"]["staged"] > 0 and s1["counts"]["assembled"] == 0
-    assert s1["staged_parts"] == s1["counts"]["staged"] > 0
-    n_shard0 = sum(1 for k, v in wm.items() if v == names[0])
-    assert s1["counts"]["staged"] >= n_shard0  # w13/w2 tensors fan out into many parts
+    assert s1["counts"]["direct"] == len(direct1) and s1["counts"]["assembled"] == 0
+    assert s1["counts"]["staged"] == parts_in(split, n0) > 0
+    assert s1["staged_parts"] == s1["counts"]["staged"]
+    for u in direct1:
+        _assert_final(u)
+    # an int4 unit with one row in shard 0 and the other elsewhere: that part staged, the rest pending
+    probe = next(u for u in split if u.size is not None and any(wm[p.source] == n0 for p in u.parts))
+    (here,), (there,) = ([p for p in probe.parts if wm[p.source] == n0],
+                         [p for p in probe.parts if wm[p.source] != n0])
+    assert here.path.stat().st_size == here.size and not there.path.exists() and not probe.output.exists()
     assert not (out / "manifest.json").exists()
 
     # idempotent re-run with nothing new: everything already staged is skipped, no assembly
     s1b = export_inkling.export_real(model_dir, out, skip_missing=True, delete_consumed=True, workers=2)
-    assert s1b["counts"]["staged"] == 0 and s1b["counts"]["assembled"] == 0
+    assert s1b["counts"]["staged"] == 0 and s1b["counts"]["assembled"] == 0 and s1b["counts"]["direct"] == 0
     assert s1b["staged_parts"] == s1["staged_parts"] and s1b["shards_deleted"] == []
+    assert here.path.stat().st_size == here.size and not there.path.exists()
 
-    # shard 1 arrives: consumed + deleted; still nothing whole (shard 2 holds the rest)
-    parked[1].rename(model_dir / names[1])
+    # shard 1 arrives: consumed + deleted; units whole inside shard 1 go direct, units split over
+    # shards 0+1 get their last parts staged and are assembled (parts deleted); the rest still waits
+    parked[1].rename(model_dir / n1)
+    direct2 = whole_in(n1)
+    assembled2 = [u for u in whole_in(n0, n1) if u not in direct1 and u not in direct2]
+    assert assembled2  # the stage-then-complete path is exercised
     s2 = export_inkling.export_real(model_dir, out, skip_missing=True, delete_consumed=True, workers=2)
-    assert s2["shards_deleted"] == [names[1]] and s2["shards_consumed"] == 2 and s2["pending_shards"] == [names[2]]
-    assert s2["counts"]["staged"] > 0 and not s2["complete"]
-    # units whose parts all sit in shards 0+1 are assembled now (2 parts -> 1 final each)
-    assert s2["staged_parts"] == s1["staged_parts"] + s2["counts"]["staged"] - 2 * s2["counts"]["assembled"]
+    assert s2["shards_deleted"] == [n1] and s2["shards_consumed"] == 2 and s2["pending_shards"] == [n2]
+    assert not s2["complete"]
+    assert s2["counts"]["direct"] == len(direct2) and s2["counts"]["assembled"] == len(assembled2)
+    assert s2["counts"]["staged"] == parts_in([u for u in split if u not in direct2], n1)
+    assert s2["staged_parts"] == s1["staged_parts"] + s2["counts"]["staged"] - sum(len(u.parts) for u in assembled2)
+    for u in direct2 + assembled2:
+        _assert_final(u)
+    if wm[there.source] == n1:
+        _assert_final(probe)
+    else:
+        assert here.path.stat().st_size == here.size and not there.path.exists() and not probe.output.exists()
     assert export_inkling.layers_done_check(out, model_dir) is False
 
     # shard 2 arrives: remaining parts staged, every unit assembled, parts gone, manifest written
-    parked[2].rename(model_dir / names[2])
+    parked[2].rename(model_dir / n2)
+    direct3 = whole_in(n2)
     s3 = export_inkling.export_real(model_dir, out, skip_missing=True, delete_consumed=True, workers=2)
     assert s3["complete"] and s3["layers_done"] == 4 and s3["pending_shards"] == []
-    assert s3["shards_deleted"] == [names[2]] and s3["shards_consumed"] == 3
-    assert s2["counts"]["assembled"] + s3["counts"]["assembled"] == 2 + 4 + 1 + 3 * 10
-    assert s3["staged_parts"] == 0 and s3["counts"]["staged"] > 0
+    assert s3["shards_deleted"] == [n2] and s3["shards_consumed"] == 3
+    assert s3["counts"]["direct"] == len(direct3) and s3["counts"]["staged"] > 0
+    n_units = 2 + 4 + 1 + 3 * 10
+    assert len(direct1) + len(direct2) + len(direct3) + len(assembled2) + s3["counts"]["assembled"] == n_units
+    assert s3["staged_parts"] == 0
+    _assert_final(probe)
     assert not (out / ".staging").exists() and not list(out.rglob("*.part")) and not list(out.rglob("*.tmp"))
     assert export_inkling.layers_done_check(out, model_dir) is True
+    _assert_same_export(tiny_out, out)
+
+
+def test_streaming_spread_direct_when_every_source_is_present(tmp_path, tiny_export):
+    """Spread layout, but shards 1 and 2 arrive first: units whose sources all sit in {1, 2} are
+    written directly (no .staging entry), units straddling shard 0 stage their present rows and
+    complete when shard 0 lands; the result is byte-identical to the one-shot --tiny export."""
+    tiny_out, _ = tiny_export
+    man = export_inkling.load_and_validate_config(TINY_CONFIG)
+    ckpt = hf_state_to_checkpoint(build_tiny_model(man).state_dict())
+    model_dir = tmp_path / "ckpt"
+    names = _write_sharded_checkpoint(model_dir, ckpt, layout="spread")
+    wm = json.loads((model_dir / "model.safetensors.index.json").read_text())["weight_map"]
+    out = tmp_path / "export"
+    n0, n1, n2 = names[0], names[1], names[2]
+    units, shards = _plan_units(man, out, wm)
+    direct1 = [u for u in units if shards[id(u)] <= {n1, n2}]
+    rest = [u for u in units if u not in direct1]
+    assert direct1 and rest and any(len(u.parts) == 2 for u in direct1)  # int4 units on both paths
+    parked = tmp_path / n0
+    (model_dir / n0).rename(parked)
+
+    s1 = export_inkling.export_real(model_dir, out, skip_missing=True, delete_consumed=True, workers=2)
+    assert sorted(s1["shards_deleted"]) == [n1, n2] and s1["pending_shards"] == [n0] and not s1["complete"]
+    assert s1["counts"]["direct"] == len(direct1) and s1["counts"]["assembled"] == 0
+    assert s1["counts"]["staged"] == sum(1 for u in rest for p in u.parts if wm[p.source] != n0) > 0
+    assert s1["staged_parts"] == s1["counts"]["staged"]
+    for u in direct1:
+        _assert_final(u)
+    staged_dirs = {p.path.parent for u in rest for p in u.parts if wm[p.source] != n0}
+    assert all(d.is_dir() for d in staged_dirs)
+    for u in rest:  # nothing final yet, only the present rows staged
+        assert not u.output.exists()
+        for p in u.parts:
+            assert p.path.exists() == (wm[p.source] != n0), p.path
+
+    parked.rename(model_dir / n0)
+    s2 = export_inkling.export_real(model_dir, out, skip_missing=True, delete_consumed=True, workers=2)
+    assert s2["complete"] and s2["shards_deleted"] == [n0] and s2["shards_consumed"] == 3
+    assert s2["counts"]["direct"] == 0 and s2["counts"]["assembled"] == len(rest)
+    assert s2["counts"]["staged"] == sum(1 for u in rest for p in u.parts if wm[p.source] == n0)
+    assert s2["counts"]["skipped"] == len(direct1) and s2["staged_parts"] == 0
+    assert not (out / ".staging").exists()
+    for u in rest:
+        _assert_final(u)
     _assert_same_export(tiny_out, out)
 
 
@@ -566,3 +711,7 @@ def test_gen_fixtures_writes_spec_tensor_set(tmp_path):
     assert max(meta["spec_vs_hf_max_rel_err"].values()) < 1e-4
     m = meta["argmax_top2_logit_margins"]
     assert min(m["prompt"] + m["greedy"]) >= MIN_ARGMAX_MARGIN
+    # the relative-position bias is load-bearing on every layer (sliding 0-2, global 3)
+    ratios = meta["relpos_bias_to_score_rms"]["per_layer"]
+    assert sorted(ratios) == ["0", "1", "2", "3"]
+    assert all(r["ratio"] >= gen_fixtures.MIN_BIAS_TO_SCORE >= 0.5 for r in ratios.values()), ratios

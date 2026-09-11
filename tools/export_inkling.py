@@ -3,8 +3,10 @@
 
 Modes:
   --validate CONFIG.json          hard-fail config contract (PORT_SPEC §1); prints the derived manifest
-  --tiny OUT                      synthetic tiny model (transformers InklingForCausalLM, seed 7) exported
-                                  through the SAME code path as a real checkpoint + OUT/reference.json
+  --tiny OUT [--force]            synthetic tiny model (transformers InklingForCausalLM, seed 7) exported
+                                  through the SAME code path as a real checkpoint + OUT/reference.json;
+                                  OUT is replaced only if absent, empty or a previous export of ours
+                                  (source_config.json + manifest.json arch "inkling") unless --force
   --model DIR --out OUT           convert a local thinkingmachines/Inkling{,-Small} checkpoint
       [--layers a-b]              only layers a..b inclusive (embed/head still exported unless --shards-only)
       [--shards-only]             only the int4 expert/dense bins: skip embed, head, shells, manifest
@@ -33,15 +35,18 @@ On-disk layout (PORT_SPEC §1-§2; read by crates/cascadia-engine-sparse-moe/src
   <out>/experts/layer_NN/dense.bin             dense-layer MLP (w13_dn / w2_md)
   <out>/source_config.json                     copy of the source config.json (for --layers-done-check)
 
-Stage-then-assemble: a real checkpoint scatters one layer's tensors over the whole shard range (w13 and
-w2 of a layer usually sit in different shards), so every TENSOR is converted the moment its shard is
+Direct when whole, stage-then-assemble otherwise: a real checkpoint scatters one layer's tensors over
+the whole shard range (w13 and w2 of a layer usually sit in different shards). A unit (= one final
+output file) whose source tensors are ALL readable right now, none of them staged yet, is converted in
+memory and its final file written once. Otherwise every TENSOR is converted the moment its shard is
 readable and staged under <out>/.staging/ — `layer_NN/expert_EEE.gateup.part` (packed gate+up sections
 from one w13 row), `expert_EEE.down.part` (from one w2 row), same for `expert_sharedS` / `dense`, and
-one-tensor safetensors `layer_NN/shell.<suffix>.st`, `embed/<key>.st`, `head/<key>.st`. A unit's final
-file is assembled (concatenated / merged) once all its parts exist, then the parts are deleted. Every
+one-tensor safetensors `layer_NN/shell.<suffix>.st`, `embed/<key>.st`, `head/<key>.st`; the unit's
+final file is assembled (concatenated / merged) once all its parts exist, then the parts are deleted.
+Both paths write the same bytes (an int4 bin IS the concatenation of its gateup and down parts). Every
 write goes to `<name>.tmp`, is fsynced, then renamed, so a kill mid-tensor never leaves a truncated
 file that looks done. Re-runs reuse finals and parts by presence + size (and `.layer_NN.done` markers)
-in seconds. Per-tensor timing is printed for every part staged.
+in seconds. Per-tensor timing is printed for every part converted.
 """
 from __future__ import annotations
 
@@ -125,12 +130,6 @@ def pack_sections(*ws):
         p, s = pack_int4(w)
         chunks += [p, s]
     return chunks
-
-
-def expert_bin_chunks(gate, up, down):
-    """SwiGLU FFN bin = gate, up, down sections. Matches MmapExpert::open's
-    `2*section(inter,dim) + section(dim,inter)`."""
-    return pack_sections(gate, up, down)
 
 
 def _section_bytes(o: int, i: int) -> int:
@@ -690,7 +689,7 @@ class Exporter:
         self._lock = threading.Lock()
         self.pending_shards: set[str] = set()
         self.deleted_shards: list[str] = []
-        self.counts = defaultdict(int)
+        self.counts = {"direct": 0, "staged": 0, "assembled": 0, "skipped": 0, "pending": 0}
         self.stats = None
 
     # ---- done bookkeeping (final outputs + staged parts; markers as a fast path)
@@ -726,14 +725,12 @@ class Exporter:
             self.pending_shards.add(shard)
         return False
 
-    def _bump(self, key, dt=0.0, nbytes=0):
-        with self._lock:
-            if self.stats is not None:
-                self.stats[key] += dt
-                self.stats["bytes"] += nbytes
-
-    # ---- stage one part
-    def stage_part(self, p: Part) -> None:
+    # ---- convert one part: read its source tensor (or expert row), cast / quantise. The write is
+    #      the caller's (a staged part file, or the unit's final file on the direct path).
+    def convert_part(self, p: Part):
+        """-> (payload, n_weights, t_read, t_quant). `payload` is `{key: tensor}` for an "st" part
+        (bf16 / f32 / conv reshaped [C, K]) and the list of int4 byte chunks (packed nibbles, then
+        bf16 scales, per matrix) for a gateup / down part — exactly what its staged file holds."""
         import torch
 
         t0 = time.perf_counter()
@@ -746,37 +743,75 @@ class Exporter:
                 t = t.to(torch.float32)
             else:  # conv [C, 1, K] -> [C, K] f32
                 t = t.to(torch.float32).reshape(p.shape[0], p.shape[2])
-            nw = t.numel()
-            t1 = t2 = time.perf_counter()
-            nbytes = atomic_save_safetensors({p.key: t.contiguous()}, p.path)
+            return {p.key: t.contiguous()}, t.numel(), time.perf_counter() - t0, 0.0
+        if p.row is None:
+            w = self.src.get(p.source)
         else:
-            if p.row is None:
-                w = self.src.get(p.source)
-            else:
-                _shape_check(p.source, self.src.shape(p.source), p.parent_shape)  # header read only
-                w = self.src.get_row(p.source, p.row)
-            _shape_check(p.source if p.row is None else f"{p.source}[{p.row}]", w.shape, p.shape)
-            w = w.to(torch.float32)
-            nw = w.numel()
-            t1 = time.perf_counter()
-            # transformers Interleave(dim=1): gate = rows 0::2, up = rows 1::2
-            chunks = pack_sections(w[0::2], w[1::2]) if p.kind == "gateup" else pack_sections(w)
-            t2 = time.perf_counter()
-            nbytes = atomic_write_bytes(p.path, chunks)
-            if nbytes != p.size:
-                raise SystemExit(f"[export_inkling] {p.path}: wrote {nbytes} bytes, expected {p.size}")
-        t3 = time.perf_counter()
-        with self._lock:
-            self._pdone[id(p)] = True
-        log(f"[{p.label}] read {t1 - t0:.3f}s quant {t2 - t1:.3f}s write {t3 - t2:.3f}s | "
-            f"{nw / 1e6:.1f}M weights -> {nbytes / 1e6:.1f} MB")
+            _shape_check(p.source, self.src.shape(p.source), p.parent_shape)  # header read only
+            w = self.src.get_row(p.source, p.row)
+        _shape_check(p.source if p.row is None else f"{p.source}[{p.row}]", w.shape, p.shape)
+        w = w.to(torch.float32)
+        t1 = time.perf_counter()
+        # transformers Interleave(dim=1): gate = rows 0::2, up = rows 1::2
+        chunks = pack_sections(w[0::2], w[1::2]) if p.kind == "gateup" else pack_sections(w)
+        t2 = time.perf_counter()
+        n = sum(len(c) for c in chunks)
+        if n != p.size:
+            raise SystemExit(f"[export_inkling] {p.label}: packed {n} bytes, expected {p.size}")
+        return chunks, w.numel(), t1 - t0, t2 - t1
+
+    def _account(self, key, nbytes, t_read=0.0, t_quant=0.0, t_write=0.0, t_assemble=0.0):
         with self._lock:
             if self.stats is not None:
-                self.stats["staged"] += 1
-                self.stats["read"] += t1 - t0
-                self.stats["quant"] += t2 - t1
-                self.stats["write"] += t3 - t2
+                self.stats[key] += 1
+                self.stats["read"] += t_read
+                self.stats["quant"] += t_quant
+                self.stats["write"] += t_write
+                self.stats["assemble"] += t_assemble
                 self.stats["bytes"] += nbytes
+
+    # ---- stage one part under <out>/.staging (its unit still waits for another shard)
+    def stage_part(self, p: Part) -> None:
+        payload, nw, t_read, t_quant = self.convert_part(p)
+        t2 = time.perf_counter()
+        if p.kind == "st":
+            nbytes = atomic_save_safetensors(payload, p.path)
+        else:
+            nbytes = atomic_write_bytes(p.path, payload)
+        t_write = time.perf_counter() - t2
+        with self._lock:
+            self._pdone[id(p)] = True
+        log(f"[{p.label}] read {t_read:.3f}s quant {t_quant:.3f}s write {t_write:.3f}s | "
+            f"{nw / 1e6:.1f}M weights -> {nbytes / 1e6:.1f} MB (staged)")
+        self._account("staged", nbytes, t_read, t_quant, t_write)
+
+    # ---- direct path: every source tensor of the unit is readable and nothing of it is staged
+    def write_unit_direct(self, u: Unit) -> None:
+        """Convert all parts in memory and write the final file once: the same bytes as
+        stage + assemble (an int4 bin is the plain concatenation of its gateup and down parts in
+        part order; a safetensors unit is the same {key: tensor} dict), and no .staging entry is
+        ever created for the unit."""
+        tensors, chunks, nw, t_read, t_quant = {}, [], 0, 0.0, 0.0
+        for p in u.parts:
+            payload, n, tr, tq = self.convert_part(p)
+            nw, t_read, t_quant = nw + n, t_read + tr, t_quant + tq
+            if p.kind == "st":
+                tensors.update(payload)
+            else:
+                chunks += payload
+        t2 = time.perf_counter()
+        if u.kind in ("embed", "head", "shell"):
+            nbytes = atomic_save_safetensors(tensors, u.output)
+        else:
+            nbytes = atomic_write_bytes(u.output, chunks)
+            if nbytes != u.size:
+                raise SystemExit(f"[export_inkling] {u.output}: wrote {nbytes} bytes, expected {u.size}")
+        t_write = time.perf_counter() - t2
+        with self._lock:
+            self._udone[id(u)] = True
+        log(f"[{u.label}] read {t_read:.3f}s quant {t_quant:.3f}s write {t_write:.3f}s | "
+            f"{nw / 1e6:.1f}M weights -> {u.output.name} ({nbytes / 1e6:.1f} MB, direct)")
+        self._account("direct", nbytes, t_read, t_quant, t_write)
 
     # ---- assemble one unit from its parts, then drop the parts
     def assemble_unit(self, u: Unit) -> None:
@@ -796,34 +831,34 @@ class Exporter:
             p.path.unlink(missing_ok=True)
         with self._lock:
             self._udone[id(u)] = True
-            if self.stats is not None:
-                self.stats["assembled"] += 1
-                self.stats["assemble"] += time.perf_counter() - t0
+        self._account("assembled", 0, t_assemble=time.perf_counter() - t0)  # bytes were counted when staged
         log(f"[{u.label}] assembled {len(u.parts)} parts -> {u.output.name} ({nbytes / 1e6:.1f} MB, "
             f"{(time.perf_counter() - t0) * 1e3:.0f} ms)")
 
-    # ---- one group of units (embed/head, or one layer): stage what is readable, assemble what is whole
+    # ---- one group of units (embed/head, or one layer): write whole units directly, stage what
+    #      else is readable, assemble what has become whole
     def process(self, units, ex) -> dict:
-        stage, n_skip, n_pend = [], 0, 0
+        direct, stage, n_skip, n_pend = [], [], 0, 0
         for u in units:
             if self.unit_done(u):
                 n_skip += 1
                 continue
-            for p in u.parts:
-                if self.part_done(p):
-                    continue
-                if self.available(p):
-                    stage.append(p)
-                else:
-                    n_pend += 1
+            todo = [p for p in u.parts if not self.part_done(p)]
+            avail = [p for p in todo if self.available(p)]
+            if len(avail) == len(u.parts):  # nothing staged, every source readable: one final write
+                direct.append(u)
+            else:  # a shard is missing now (or was on the pass that staged a part): per-part staging
+                stage += avail
+                n_pend += len(todo) - len(avail)
+        list(ex.map(self.write_unit_direct, direct))
         list(ex.map(self.stage_part, stage))
         assemble = [u for u in units if not self.unit_done(u) and all(self.part_done(p) for p in u.parts)]
         list(ex.map(self.assemble_unit, assemble))
-        self.counts["staged"] += len(stage)
-        self.counts["assembled"] += len(assemble)
-        self.counts["skipped"] += n_skip
-        self.counts["pending"] += n_pend
-        return {"staged": len(stage), "assembled": len(assemble), "skipped": n_skip, "pending": n_pend}
+        r = {"direct": len(direct), "staged": len(stage), "assembled": len(assemble), "skipped": n_skip,
+             "pending": n_pend}
+        for k, v in r.items():
+            self.counts[k] += v
+        return r
 
     def pass_bytes(self, units) -> int:
         """What this pass can write: parts of these units that are neither staged nor final and
@@ -883,8 +918,8 @@ class Exporter:
         with ThreadPoolExecutor(max_workers=self.workers) as ex:
             if not self.shards_only:
                 r = self.process(self.units[:2], ex)
-                log(f"[embed/head] staged {r['staged']} assembled {r['assembled']} skipped {r['skipped']} "
-                    f"pending {r['pending']}")
+                log(f"[embed/head] direct {r['direct']} staged {r['staged']} assembled {r['assembled']} "
+                    f"skipped {r['skipped']} pending {r['pending']}")
             for li in range(lo, hi + 1):
                 lunits = [u for u in self.per_layer[li] if not (self.shards_only and u.kind == "shell")]
                 if layer_marker(out, li).exists():
@@ -902,10 +937,11 @@ class Exporter:
                 else:
                     state = "partial"
                 dt = time.perf_counter() - t0
-                log(f"[layer {li:02d}/{L}] {state}: staged {r['staged']} parts ({st['bytes'] / 1e9:.2f} GB; read "
-                    f"{st['read']:.1f}s quant {st['quant']:.1f}s write {st['write']:.1f}s), assembled "
-                    f"{r['assembled']} units ({st['assemble']:.1f}s), skipped {r['skipped']}, pending "
-                    f"{r['pending']} parts; {dt:.1f}s, {st['bytes'] / 1e9 / max(dt, 1e-9):.2f} GB/s")
+                log(f"[layer {li:02d}/{L}] {state}: wrote {r['direct']} units directly, staged {r['staged']} "
+                    f"parts, assembled {r['assembled']} units ({st['bytes'] / 1e9:.2f} GB; read {st['read']:.1f}s "
+                    f"quant {st['quant']:.1f}s write {st['write']:.1f}s assemble {st['assemble']:.1f}s), skipped "
+                    f"{r['skipped']}, pending {r['pending']} parts; {dt:.1f}s, "
+                    f"{st['bytes'] / 1e9 / max(dt, 1e-9):.2f} GB/s")
                 self.sweep_shards()
         self.sweep_shards()
 
@@ -962,17 +998,40 @@ def export_real(model_dir: Path, out: Path, *, layers=None, shards_only=False, s
     return summary
 
 
-def export_tiny(out: Path, workers: int = 2) -> dict:
-    """Deterministic tiny model (PORT_SPEC §4) through the real export path + reference.json."""
+def is_tiny_export_dir(out: Path) -> bool:
+    """True when `--tiny` may wipe `out` without --force: absent, an empty directory, or a previous
+    export of ours (source_config.json + manifest.json with arch "inkling")."""
+    if not out.exists():
+        return True
+    if not out.is_dir():
+        return False
+    if not any(out.iterdir()):
+        return True
+    try:
+        man = json.loads((out / "manifest.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return (out / "source_config.json").is_file() and isinstance(man, dict) and man.get("arch") == "inkling"
+
+
+def export_tiny(out: Path, workers: int = 2, force: bool = False) -> dict:
+    """Deterministic tiny model (PORT_SPEC §4) through the real export path + reference.json.
+    `out` is REPLACED (a fixture generator never resumes onto stale weights), but only when it is
+    absent, empty or a previous export of ours (`is_tiny_export_dir`); anything else needs `force`."""
     from inkling_ref import (MIN_ARGMAX_MARGIN, N_GEN, TINY_CONFIG, build_tiny_model, greedy_reference,
                              hf_state_to_checkpoint, load_export_as_hf, select_prompt)
 
     out = Path(out)
+    if not force and not is_tiny_export_dir(out):
+        raise SystemExit(f"[tiny] refusing to replace {out}: not empty and not a previous inkling export "
+                         "(no source_config.json + manifest.json with arch 'inkling'). Pass --force to wipe it.")
     man = load_and_validate_config(TINY_CONFIG)
     model = build_tiny_model(man)
     ckpt = hf_state_to_checkpoint(model.state_dict())
-    if out.exists():  # a fixture generator, not a resumable job: never resume onto stale weights
+    if out.is_dir():
         shutil.rmtree(out)
+    elif out.exists():
+        out.unlink()
     out.mkdir(parents=True, exist_ok=True)
     (out / "source_config.json").write_text(json.dumps(TINY_CONFIG, indent=2))
     _set_threads(workers)
@@ -1032,6 +1091,8 @@ def main():
     ap.add_argument("--validate", type=Path, help="validate a config.json against the inkling contract")
     ap.add_argument("--strict", action="store_true", help="also fail when a contract flag is absent")
     ap.add_argument("--tiny", type=Path, help="write the deterministic tiny model to this dir")
+    ap.add_argument("--force", action="store_true",
+                    help="--tiny: wipe OUT even when it is neither empty nor a previous inkling export")
     ap.add_argument("--model", type=Path, help="local checkpoint dir (config.json + safetensors shards)")
     ap.add_argument("--out", type=Path, help="output dir")
     ap.add_argument("--layers", type=_parse_layers, help="layer range a-b (inclusive)")
@@ -1056,7 +1117,7 @@ def main():
             ap.error("--layers-done-check needs --out")
         sys.exit(0 if layers_done_check(args.out, args.model) else 1)
     if args.tiny:
-        export_tiny(args.tiny, workers=args.workers)
+        export_tiny(args.tiny, workers=args.workers, force=args.force)
         return
     if args.model and args.out:
         export_real(args.model, args.out, layers=args.layers, shards_only=args.shards_only,

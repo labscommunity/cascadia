@@ -8,9 +8,10 @@ Shared by `tools/export_inkling.py --tiny`, `tools/inkling_ref/gen_fixtures.py` 
   weight drawn from seed 7 and ROUNDED TO bf16 (so the engine's bf16 storage is lossless);
 - the HF-module-name <-> checkpoint-name mapping (the reverse of transformers'
   `conversion_mapping.py` "inkling_mm_model" entry), incl. the gate/up (de)interleave rule;
-- int4 group-32 dequant + `load_export_as_hf`: read an `export_inkling.py` output dir back
-  into a fresh HF model, so `reference.json` compares like with like (int4-dequantized weights
-  on both sides of the Rust/Python parity test).
+- `load_export_as_hf`: read an `export_inkling.py` output dir back into a fresh HF model (int4
+  bins dequantised with `tools/glm5_ref/load_export.py`'s reader: same group-32 layout, one source
+  of truth), so `reference.json` compares like with like (int4-dequantized weights on both sides
+  of the Rust/Python parity test).
 
 transformers >= 5.16 ships `models/inkling` natively; HF *is* the oracle for this port.
 """
@@ -21,8 +22,10 @@ import re
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
+# int4 group-32 section -> f32: the bins are byte-for-byte export_glm5's layout, so the dequant is
+# glm5_ref's (mirrors the Rust `dequant_int4`); tools/ is on sys.path for every entry point.
+from glm5_ref.load_export import _dequant_section as dequant_int4_section
 
 TINY_SEED = 7
 PROMPT_LEN = 12
@@ -262,6 +265,13 @@ def _is_unit_param(name: str) -> bool:
 
 
 UNEMBED_STD = 0.5   # 10x the other weights: keeps top-1/top-2 logit gaps far above bf16 noise
+# attn.rel_logits_proj.proj at 10x the other weights so the learned relative-position bias is
+# LOAD-BEARING in the goldens: bias = r . proj[:, dist] with r = h @ Wr^T (rms ~0.4), so at 0.05
+# rms|bias| is ~0.04 against rms|q.k/D| ~0.25 (ratio 0.13-0.23) and a Rust attention that drops
+# the bias still passes the 2 % row-scale hidden-state goldens; at 0.5 the ratio is 1.3-2.3 on
+# every layer (gen_fixtures.py measures and records it) and zeroing the bias moves the layer
+# outputs by 4-10 % of their row scale. Only the product wr_std * proj_std matters.
+REL_PROJ_STD = 0.5
 # Sanity floor on the top-2 logit gap at every prompt position + greedy step (logits have std ~2,
 # |max| ~6; bf16 write-back moves them by ~0.5%, so 0.15 is ~5x the expected noise). The chosen
 # prompt is the best of N_PROMPT_CANDIDATES (typically ~0.22).
@@ -273,8 +283,9 @@ def build_tiny_model(man: dict, seed: int = TINY_SEED):
     """transformers `InklingForCausalLM` on the tiny config, float32. Every state_dict entry is
     drawn from one seeded generator in state_dict order — N(0, 0.05) for weights, 1 + N(0, 0.05)
     for norms / global scales, N(0, UNEMBED_STD) for `unembed` (with 0.05 the logits have std 0.2
-    over 120 candidates and the argmax ties at bf16 precision) — then ROUNDED TO bf16 and stored as
-    f32 (bf16 shells lossless)."""
+    over 120 candidates and the argmax ties at bf16 precision), N(0, REL_PROJ_STD) for the
+    relative-position `proj` banks (see REL_PROJ_STD) — then ROUNDED TO bf16 and stored as f32
+    (bf16 shells lossless)."""
     from transformers import InklingForCausalLM
 
     cfg = hf_config_from_manifest(man)
@@ -283,7 +294,8 @@ def build_tiny_model(man: dict, seed: int = TINY_SEED):
     g = torch.Generator().manual_seed(seed)
     new = {}
     for k, v in model.state_dict().items():
-        t = torch.randn(v.shape, generator=g) * (UNEMBED_STD if k == "lm_head.weight" else 0.05)
+        std = UNEMBED_STD if k == "lm_head.weight" else REL_PROJ_STD if k.endswith("rel_logits_proj.proj") else 0.05
+        t = torch.randn(v.shape, generator=g) * std
         if _is_unit_param(k):
             t = t + 1.0
         new[k] = t.to(torch.bfloat16).to(torch.float32)
@@ -402,7 +414,8 @@ def greedy_reference(model, prompt: list[int], n_gen: int = N_GEN):
 
 
 # --------------------------------------------------------------------------
-# int4 group-32 bins (export_glm5._pack_int4_grouped layout) -> f32
+# int4 group-32 bins (export_glm5._pack_int4_grouped layout) -> f32. `dequant_int4_section` is
+# glm5_ref.load_export._dequant_section (imported above); only the whole-bin size check is ours.
 # --------------------------------------------------------------------------
 def int4_bin_bytes(hidden: int, inter: int) -> int:
     def sec(o, i):
@@ -410,26 +423,9 @@ def int4_bin_bytes(hidden: int, inter: int) -> int:
     return 2 * sec(inter, hidden) + sec(hidden, inter)
 
 
-def dequant_int4_section(buf: bytes, off: int, out_dim: int, in_dim: int):
-    """One section -> (torch f32 [out_dim, in_dim], new offset). Mirrors the Rust
-    `dequant_int4` / `tools/glm5_ref/load_export.py`."""
-    ng = in_dim // INT4_GROUP
-    packed_len = out_dim * in_dim // 2
-    scale_len = out_dim * ng * 2
-    packed = np.frombuffer(buf[off:off + packed_len], dtype=np.uint8)
-    scales = np.frombuffer(buf[off + packed_len:off + packed_len + scale_len], dtype="<u2")
-    lo = (packed & 0x0F).astype(np.int32) - 8
-    hi = ((packed >> 4) & 0x0F).astype(np.int32) - 8
-    nib = np.empty(out_dim * in_dim, dtype=np.int32)
-    nib[0::2] = lo
-    nib[1::2] = hi
-    s = (scales.astype(np.uint32) << 16).view(np.float32).reshape(out_dim, ng)
-    w = nib.reshape(out_dim, ng, INT4_GROUP).astype(np.float32) * s[:, :, None]
-    return torch.from_numpy(w.reshape(out_dim, in_dim).copy()), off + packed_len + scale_len
-
-
 def dequant_expert_bin(path, hidden: int, inter: int):
-    """expert bin -> (gate [inter, hidden], up [inter, hidden], down [hidden, inter]) f32."""
+    """expert bin -> (gate [inter, hidden], up [inter, hidden], down [hidden, inter]) f32
+    (glm5_ref's `_dequant_expert_bin` without the size check)."""
     buf = Path(path).read_bytes()
     if len(buf) != int4_bin_bytes(hidden, inter):
         raise ValueError(f"{path}: {len(buf)} bytes, expected {int4_bin_bytes(hidden, inter)}")
@@ -533,7 +529,7 @@ __all__ = [
     "interleave", "deinterleave", "hf_state_to_checkpoint", "checkpoint_state_to_hf",
     "hf_config_from_manifest", "build_tiny_model", "prompt_ids", "select_prompt", "argmax_margins",
     "argmax_margins_batched", "int4_roundtrip_state", "int4_roundtrip_model", "greedy_reference",
-    "UNEMBED_STD", "MIN_ARGMAX_MARGIN", "N_PROMPT_CANDIDATES",
+    "UNEMBED_STD", "REL_PROJ_STD", "MIN_ARGMAX_MARGIN", "N_PROMPT_CANDIDATES",
     "int4_bin_bytes", "dequant_int4_section", "dequant_expert_bin", "read_manifest",
     "load_export_state", "load_export_as_hf",
 ]

@@ -43,8 +43,9 @@ from inkling_ref import real_layer_parity  # noqa: E402
 
 REPO = Path(_TOOLS_DIR).parent
 EXPORT = REPO / "crates" / "cascadia-engine-sparse-moe" / "tests" / "fixtures" / "inkling_export"
-# Tight bars for the tiny model vs HF float32 (measured 2026-09-10: rms(diff)/rms <= 0.063 %,
-# worst element <= 0.26 % of its row's RMS / <= 0.1 % of the row's max, on every layer, both paths).
+# Tight bars for the tiny model vs HF float32 (measured 2026-09-10 with the load-bearing relative-position
+# bias, REL_PROJ_STD 0.5: rms(diff)/rms <= 0.066 %, worst element <= 0.27 % of its row's RMS / <= 0.1 % of
+# the row's max, on every layer, both paths).
 TIGHT_RMS = 1e-3     # 0.1 % of the row RMS, energy-wise
 TIGHT_ELEM = 5e-3    # 0.5 % of the row RMS for the single worst element (bf16 write-back on each linear)
 # HF in bfloat16 vs HF in float32 differs by 17 % of the row RMS at the tiny model's global layer 3

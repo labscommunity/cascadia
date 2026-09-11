@@ -20,24 +20,30 @@ What this script does
   3. runs the dump's token ids through transformers' own `InklingForCausalLM` (eager attention,
      no cache) with forward hooks on `embed_norm` and every decoder layer (`output_hidden_states`
      replaces the last entry with the normed state; hooks do not);
-  4. compares each dumped tensor with its HF counterpart: max |diff|, max |diff| as a fraction of
-     the HF row RMS (the PASS/FAIL metric, `--tol`), rms(diff)/rms(row) and the minimum per-row
-     cosine similarity — for the decode-path AND the prefill-path tensors, plus the logits (with
-     per-position argmax agreement) when the head is present. With reference.json next to the
-     export and the dump starting with its prompt (K == num_layers), the first-token / greedy
-     argmaxes are checked on both sides too.
+  4. compares each dumped tensor with its HF counterpart — for the decode-path AND the
+     prefill-path tensors, plus the logits (with per-position argmax agreement) when the head is
+     present. The VERDICT per tensor is `rms(diff)/rms(HF) <= --rms-tol` AND `max|diff| /
+     max|row| <= --scale-tol` (every element within that fraction of its row's largest value),
+     plus `--ulp-tol` bf16 ULPs of the HF value when given, plus argmax agreement at every
+     position for the logits. max |diff| as a fraction of the HF row RMS is REPORTED ONLY:
+     `--tol` labels it in the summary line and sets `frac_max_within_tol` in the report, it never
+     changes the verdict (the tier-2 tests pin that number themselves). The minimum per-row cosine
+     similarity is reported too. With reference.json next to the export and the dump starting
+     with its prompt (K == num_layers), the first-token / greedy argmaxes are checked on both
+     sides too.
 
 Tolerance
   The Rust shell rounds to bf16 after every linear (bf16 weights, f32 accumulate); HF in float32
-  does not. Each rounded element carries up to ~0.4 % relative error, so the default `--tol 0.02`
-  (2 % of the HF row RMS for the single worst element) is the band the tier-2 tests use. Measured
-  on the tiny export (K=4, 19 tokens, float32): worst element 0.09-0.26 % of its row RMS
-  (0.1 % of the row max), rms(diff)/rms 0.02-0.06 %, cosine 1.000000, argmax 19/19, decode ==
-  prefill bit for bit. With `--dtype bfloat16` HF ALSO rounds its residual stream (and the
-  log-scaled position bias) to bf16 while the Rust residual stays f32: HF-bf16 differs from
-  HF-f32 by 17 % of the row RMS at the tiny model's global layer, and Rust-vs-HF-bf16 lands on
-  the same number — so bf16 is a memory fallback for an argmax-level check only (`--tol 0.25`);
-  the per-layer numbers mean float32.
+  does not. Each rounded element carries up to ~0.4 % relative error, and where a residual and a
+  branch cancel, the element's absolute error tracks the branch's magnitude, not its own — hence
+  the row-scale criteria (defaults 1 % rms energy, 1 % of the row max) rather than a per-element
+  relative band. Measured on the tiny export (K=4, 19 tokens, float32): worst element 0.10-0.27 %
+  of its row RMS (0.1 % of the row max), rms(diff)/rms 0.025-0.066 %, cosine 1.000000, argmax
+  19/19, decode == prefill bit for bit. With `--dtype bfloat16` HF ALSO rounds its residual
+  stream (and the log-scaled position bias) to bf16 while the Rust residual stays f32: HF-bf16
+  differs from HF-f32 by 17 % of the row RMS at the tiny model's global layer, and
+  Rust-vs-HF-bf16 lands on the same number — so bf16 is a memory fallback for an argmax-level
+  check only (`--rms-tol 0.25 --scale-tol 0.25`); the per-layer numbers mean float32.
 
 Memory on the real box (Inkling 975B: hidden 6144, 66 layers, 256 experts of width 3072)
   Dequantised to float32 one MoE layer is 256 x 3 x 3072 x 6144 x 4 B = 58 GB (plus ~0.5 GB of
@@ -388,7 +394,9 @@ def main(argv=None) -> int:
     ap.add_argument("--layers", type=int, required=True, help="compare the first K layers")
     ap.add_argument("--dump", required=True, help="safetensors written by the inkling_layer_dump example")
     ap.add_argument("--dtype", choices=sorted(DTYPES), default="float32")
-    ap.add_argument("--tol", type=float, default=0.02, help="max |diff| / HF row RMS (default 0.02)")
+    ap.add_argument("--tol", type=float, default=0.02,
+                    help="max |diff| / HF row RMS: reported (summary line, `frac_max_within_tol`) but never "
+                         "part of the verdict (default 0.02)")
     ap.add_argument("--ulp-tol", type=float, default=None, help="optional extra PASS criterion: every element within this many bf16 ULPs of HF")
     ap.add_argument("--rms-tol", type=float, default=0.01, help="PASS: rms(diff)/rms per tensor (default 0.01)")
     ap.add_argument("--scale-tol", type=float, default=0.01, help="PASS: max|diff| / max|row| per tensor (default 0.01)")
