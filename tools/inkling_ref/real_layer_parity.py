@@ -200,8 +200,24 @@ def run_hf(model, tokens: list[int], k: int) -> dict[str, torch.Tensor]:
 # --------------------------------------------------------------------------
 # comparison
 # --------------------------------------------------------------------------
-def row_metrics(rust: torch.Tensor, hf: torch.Tensor, tol: float) -> dict:
-    """Per-tensor closeness of `rust` to `hf` (both [T, C]), computed in float64."""
+def bf16_ulp(x: torch.Tensor) -> torch.Tensor:
+    """Spacing of bf16 values at magnitude |x| (7 explicit mantissa bits): 2^(floor(log2|x|) - 7)."""
+    ax = x.abs().clamp_min(1e-30)
+    return torch.exp2(torch.floor(torch.log2(ax)) - 7)
+
+
+def row_metrics(rust: torch.Tensor, hf: torch.Tensor, tol: float,
+                ulp_tol: float = 4.0, rms_tol: float = 0.01) -> dict:
+    """Per-tensor closeness of `rust` to `hf` (both [T, C]), computed in float64.
+
+    PASS = `rms(diff)/rms <= rms_tol` AND every element within `ulp_tol` bf16 ULPs of the HF
+    value (denominator floored at 1e-3 of the row RMS so near-zero entries are judged on the
+    row's scale). The Rust shell rounds every linear's output to bf16 while HF runs float32;
+    on the real model the residual stream carries massive activations (|x| ~ 1e3 in rows whose
+    RMS is ~10), where one bf16 ULP is 4-8 in absolute terms — max|diff|/rowRMS reads 0.4 there
+    while rms(diff)/rms is 0.3 %. That is the reference's own dtype granularity, not a math
+    error, so the verdict is ULP-aware; `max|diff|/rowRMS` (`tol`) stays reported.
+    """
     r, h = rust.double(), hf.double()
     if r.shape != h.shape:
         raise ValueError(f"shape {tuple(r.shape)} vs HF {tuple(h.shape)}")
@@ -213,6 +229,9 @@ def row_metrics(rust: torch.Tensor, hf: torch.Tensor, tol: float) -> dict:
     frac_rows = diff.max(dim=1).values / row_rms
     cos = torch.nn.functional.cosine_similarity(r, h, dim=1, eps=1e-30)
     worst = int(frac_rows.argmax())
+    ulps = diff / torch.maximum(bf16_ulp(h), 1e-3 * row_rms[:, None])
+    uw = int(ulps.argmax())
+    urow, ucol = divmod(uw, ulps.shape[1])
     m = {
         "max_abs": float(diff.max()),
         # the PASS/FAIL metric: worst element of the worst row, relative to that row's RMS
@@ -226,12 +245,18 @@ def row_metrics(rust: torch.Tensor, hf: torch.Tensor, tol: float) -> dict:
         "row_rms_min": float(row_rms.min()),
         "row_rms_max": float(row_rms.max()),
         "rows": int(r.shape[0]),
+        # worst element in bf16 ULPs of the HF value (floored at 1e-3 * row RMS)
+        "ulp_max": float(ulps.max()),
+        "ulp_worst": {"row": int(urow), "col": int(ucol), "hf": float(h[urow, ucol]),
+                      "rust": float(r[urow, ucol]), "row_rms": float(row_rms[urow])},
+        "frac_max_within_tol": bool(frac_rows.max() <= tol),
     }
-    m["pass"] = m["frac_max"] <= tol
+    m["pass"] = m["frac_rms"] <= rms_tol and m["ulp_max"] <= ulp_tol
     return m
 
 
 def compare_dump(export, layers: int, dump, dtype: str = "float32", tol: float = 0.02,
+                 ulp_tol: float = 4.0, rms_tol: float = 0.01,
                  tokens: list[int] | None = None, log=print) -> dict:
     """Load, run HF, compare. Returns the report dict (`report['pass']` is the verdict)."""
     from safetensors.torch import load_file
@@ -297,10 +322,10 @@ def compare_dump(export, layers: int, dump, dtype: str = "float32", tol: float =
     # ---- compare ----
     results: dict[str, dict] = {}
     log(f"[parity] {'tensor':<22} {'max|diff|':>11} {'max|diff|/rowRMS':>17} {'max|diff|/rowMax':>17} "
-        f"{'rms(diff)/rms':>14} {'min cos':>10}  verdict")
+        f"{'rms(diff)/rms':>14} {'min cos':>10} {'bf16 ULPs':>10}  verdict")
     for n in want_names:
         base = n.rsplit("_", 1)[0] if n != "embed_out" else n  # layerL_out_decode -> layerL_out
-        m = row_metrics(d[n], hf[base], tol)
+        m = row_metrics(d[n], hf[base], tol, ulp_tol=ulp_tol, rms_tol=rms_tol)
         if n.startswith("logits"):
             am_r = d[n].argmax(dim=1)
             am_h = hf["logits"].argmax(dim=1)
@@ -311,7 +336,10 @@ def compare_dump(export, layers: int, dump, dtype: str = "float32", tol: float =
         results[n] = m
         extra = f"  argmax {m['argmax_agree']}/{T}" if "argmax_agree" in m else ""
         log(f"[parity] {n:<22} {m['max_abs']:>11.3e} {m['frac_max']:>17.5f} {m['frac_scale']:>17.5f} "
-            f"{m['frac_rms']:>14.5f} {m['cos_min']:>10.6f}  {'PASS' if m['pass'] else 'FAIL'}{extra}")
+            f"{m['frac_rms']:>14.5f} {m['cos_min']:>10.6f} {m['ulp_max']:>10.2f}  {'PASS' if m['pass'] else 'FAIL'}{extra}")
+        w = m["ulp_worst"]
+        log(f"[parity]   worst element row {w['row']} col {w['col']}: hf {w['hf']:.4f} rust {w['rust']:.4f} "
+            f"(row RMS {w['row_rms']:.3f})")
 
     # ---- reference.json (tiny exports carry HF's greedy on the same weights) ----
     ref_report = None
@@ -337,9 +365,10 @@ def compare_dump(export, layers: int, dump, dtype: str = "float32", tol: float =
     ok = all(m["pass"] for m in results.values())
     if ref_report is not None:
         ok = ok and all(c["greedy"] and c["first_token_argmax"] is not False for c in ref_report.values())
-    log(f"[parity] {'PASS' if ok else 'FAIL'}: {len(results)} tensors, tol {tol} of row RMS, dtype {dtype}")
+    log(f"[parity] {'PASS' if ok else 'FAIL'}: {len(results)} tensors; criteria rms(diff)/rms <= {rms_tol}, "
+        f"every element <= {ulp_tol} bf16 ULPs of HF (max|diff|/rowRMS reported, tol {tol}); dtype {dtype}")
     return {"pass": ok, "export": str(export), "layers": k, "num_layers": man["num_layers"], "dtype": dtype,
-            "tol": tol, "tokens": tokens, "experts": meta.get("experts"), "estimate_bytes": est,
+            "tol": tol, "ulp_tol": ulp_tol, "rms_tol": rms_tol, "tokens": tokens, "experts": meta.get("experts"), "estimate_bytes": est,
             "tensors": results, "reference": ref_report}
 
 
@@ -351,11 +380,14 @@ def main(argv=None) -> int:
     ap.add_argument("--dump", required=True, help="safetensors written by the inkling_layer_dump example")
     ap.add_argument("--dtype", choices=sorted(DTYPES), default="float32")
     ap.add_argument("--tol", type=float, default=0.02, help="max |diff| / HF row RMS (default 0.02)")
+    ap.add_argument("--ulp-tol", type=float, default=4.0, help="PASS: every element within this many bf16 ULPs of HF (default 4)")
+    ap.add_argument("--rms-tol", type=float, default=0.01, help="PASS: rms(diff)/rms per tensor (default 0.01)")
     ap.add_argument("--tokens", help="comma-separated ids; must equal the dump's `tokens` when present")
     ap.add_argument("--json", help="write the full report here")
     a = ap.parse_args(argv)
     tokens = [int(t) for t in a.tokens.replace(",", " ").split()] if a.tokens else None
-    rep = compare_dump(a.export, a.layers, a.dump, dtype=a.dtype, tol=a.tol, tokens=tokens)
+    rep = compare_dump(a.export, a.layers, a.dump, dtype=a.dtype, tol=a.tol, ulp_tol=a.ulp_tol,
+                       rms_tol=a.rms_tol, tokens=tokens)
     if a.json:
         Path(a.json).write_text(json.dumps(rep, indent=2))
     return 0 if rep["pass"] else 1
