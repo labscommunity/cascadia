@@ -788,9 +788,23 @@ fn render_prompt_legacy(messages: &[ChatMessage]) -> String {
 /// across every request — the ~17 KB Gemma 3/4 macro template is parsed once,
 /// not on each `/v1/chat/completions` call. Returns Err on parse failure so the
 /// caller can fall back to the legacy formatter.
-/// serde_json formatter matching Python's default `json.dumps` separators
-/// (`", "` and `": "`). serde_json's compact formatter omits both spaces.
-struct PyDumpsCompact;
+/// serde_json formatter with Python `json.dumps` separators: the default
+/// `(", ", ": ")`, or whatever the template passed as `separators=` (Inkling's
+/// template asks for the compact `(",", ":")`). serde_json's compact formatter
+/// omits both spaces, which is why the default is not simply the builtin.
+struct PyDumpsCompact {
+    item: Vec<u8>,
+    key: Vec<u8>,
+}
+
+impl Default for PyDumpsCompact {
+    fn default() -> Self {
+        Self {
+            item: b", ".to_vec(),
+            key: b": ".to_vec(),
+        }
+    }
+}
 
 impl serde_json::ser::Formatter for PyDumpsCompact {
     fn begin_array_value<W: ?Sized + std::io::Write>(
@@ -801,7 +815,7 @@ impl serde_json::ser::Formatter for PyDumpsCompact {
         if first {
             Ok(())
         } else {
-            w.write_all(b", ")
+            w.write_all(&self.item)
         }
     }
 
@@ -813,12 +827,32 @@ impl serde_json::ser::Formatter for PyDumpsCompact {
         if first {
             Ok(())
         } else {
-            w.write_all(b", ")
+            w.write_all(&self.item)
         }
     }
 
     fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
-        w.write_all(b": ")
+        w.write_all(&self.key)
+    }
+}
+
+/// `json.dumps(sort_keys=True)`: rebuild every object with its keys in sorted
+/// order (recursively), leaving arrays and scalars untouched.
+fn sort_json_keys(v: serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(m) => {
+            let mut entries: Vec<(String, serde_json::Value)> = m.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut out = serde_json::Map::new();
+            for (k, val) in entries {
+                out.insert(k, sort_json_keys(val));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(a) => {
+            serde_json::Value::Array(a.into_iter().map(sort_json_keys).collect())
+        }
+        other => other,
     }
 }
 
@@ -874,25 +908,42 @@ fn py_tojson(
         },
     };
     let ensure_ascii = args.get::<Option<bool>>("ensure_ascii")?.unwrap_or(false);
-    // transformers' shim also accepts sort_keys and separators. Consume them so
-    // an unknown-kwarg error can't reroute the render into the legacy
-    // formatter, but refuse non-default values instead of ignoring them — a
-    // silently wrong prompt is the failure mode this whole filter exists to
-    // remove.
-    if args.get::<Option<bool>>("sort_keys")?.unwrap_or(false) {
-        return Err(Error::new(
-            ErrorKind::InvalidOperation,
-            "tojson: sort_keys=True is not supported",
-        ));
-    }
-    if args.get::<Option<Value>>("separators")?.is_some() {
-        return Err(Error::new(
-            ErrorKind::InvalidOperation,
-            "tojson: separators= is not supported",
-        ));
-    }
+    // transformers' shim also accepts sort_keys and separators (Inkling's
+    // template renders tool specs and tool calls with
+    // `tojson(sort_keys=true, separators=(",", ":"))`). Both are honoured with
+    // json.dumps semantics; anything else unknown still fails the render
+    // rather than silently producing a prompt the model never saw.
+    let sort_keys = args.get::<Option<bool>>("sort_keys")?.unwrap_or(false);
+    let separators = match args.get::<Option<Value>>("separators")? {
+        None => None,
+        Some(v) => {
+            let parts: Vec<String> = v
+                .try_iter()
+                .ok()
+                .map(|it| it.map(|x| x.to_string()).collect())
+                .unwrap_or_default();
+            if parts.len() != 2 {
+                return Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "tojson: separators= must be a (item, key) pair",
+                ));
+            }
+            Some((parts[0].clone(), parts[1].clone()))
+        }
+    };
     args.assert_all_used()?;
 
+    // Route through serde_json::Value when keys must be sorted (minijinja maps
+    // serialize in insertion order).
+    let sorted: Option<serde_json::Value> = if sort_keys {
+        Some(sort_json_keys(serde_json::to_value(&value).map_err(
+            |err| {
+                Error::new(ErrorKind::InvalidOperation, "cannot serialize to JSON").with_source(err)
+            },
+        )?))
+    } else {
+        None
+    };
     let mut out = Vec::<u8>::new();
     let res = match indent {
         // Python switches to `(',', ': ')` under indent, which is exactly what
@@ -901,11 +952,24 @@ fn py_tojson(
             let pad = " ".repeat(n);
             let fmt = serde_json::ser::PrettyFormatter::with_indent(pad.as_bytes());
             let mut ser = serde_json::Serializer::with_formatter(&mut out, fmt);
-            serde::Serialize::serialize(&value, &mut ser)
+            match &sorted {
+                Some(sv) => serde::Serialize::serialize(sv, &mut ser),
+                None => serde::Serialize::serialize(&value, &mut ser),
+            }
         }
         None => {
-            let mut ser = serde_json::Serializer::with_formatter(&mut out, PyDumpsCompact);
-            serde::Serialize::serialize(&value, &mut ser)
+            let fmt = match &separators {
+                Some((item, key)) => PyDumpsCompact {
+                    item: item.as_bytes().to_vec(),
+                    key: key.as_bytes().to_vec(),
+                },
+                None => PyDumpsCompact::default(),
+            };
+            let mut ser = serde_json::Serializer::with_formatter(&mut out, fmt);
+            match &sorted {
+                Some(sv) => serde::Serialize::serialize(sv, &mut ser),
+                None => serde::Serialize::serialize(&value, &mut ser),
+            }
         }
     };
     res.map_err(|err| {
@@ -4248,20 +4312,35 @@ mod tests {
     }
 
     #[test]
-    fn tojson_refuses_unsupported_kwargs_rather_than_ignoring_them() {
-        // Consumed so the render doesn't die on an unknown kwarg, but honoured
-        // or refused — never silently dropped.
-        let err = tojson_of(
-            serde_json::json!({"b": 1, "a": 2}),
+    fn tojson_honours_sort_keys_and_separators_kwargs() {
+        // json.dumps semantics: sort_keys orders every object's keys
+        // (recursively), separators=(item, key) replaces the default
+        // (", ", ": "). Inkling's template uses both for tool specs.
+        let out = tojson_of(
+            serde_json::json!({"b": {"d": 1, "c": [1, {"z": 0, "y": 0}]}, "a": 2}),
             &[("sort_keys", true.into())],
         )
-        .expect_err("sort_keys=True must not be silently ignored");
-        assert!(err.to_string().contains("sort_keys"), "{err}");
-
+        .expect("sort_keys=True renders");
+        assert_eq!(
+            out,
+            "{\"a\": 2, \"b\": {\"c\": [1, {\"y\": 0, \"z\": 0}], \"d\": 1}}"
+        );
         assert!(
             tojson_of(serde_json::json!({}), &[("sort_keys", false.into())]).is_ok(),
             "sort_keys=False is the default and must be accepted"
         );
+        let out = tojson_of(
+            serde_json::json!({"a": [1, 2], "b": "x"}),
+            &[("separators", minijinja::value::Value::from(vec![",", ":"]))],
+        )
+        .expect("separators renders");
+        assert_eq!(out, "{\"a\":[1,2],\"b\":\"x\"}");
+        let err = tojson_of(
+            serde_json::json!({}),
+            &[("separators", minijinja::value::Value::from(vec![","]))],
+        )
+        .expect_err("a separators tuple must have two entries");
+        assert!(err.to_string().contains("separators"), "{err}");
     }
 
     #[test]
@@ -4555,6 +4634,28 @@ mod tests {
         let out =
             render_or_fallback(Some(&env), &msgs, "", "", true, Some("high"), None, None).unwrap();
         assert_eq!(out, "effort=xhigh");
+    }
+
+    /// Inkling's template renders tool specs with
+    /// `tojson(sort_keys=true, separators=(",", ":"))`; the filter must honour
+    /// both (json.dumps semantics) instead of failing the render.
+    #[test]
+    fn tojson_honours_sort_keys_and_separators() {
+        const T: &str = "{%- set spec = {\"type\": \"function\", \"name\": tools[0].function.name, \"description\": \"d\", \"parameters\": {\"b\": 1, \"a\": [2, 3]}} -%}\
+{{ [spec] | tojson(sort_keys=true, separators=(\",\", \":\")) }}|{{ {\"b\": 1, \"a\": 2} | tojson(sort_keys=true) }}";
+        let env = build_chat_env(T).unwrap();
+        let tools = vec![Tool {
+            r#type: "function".into(),
+            function: serde_json::json!({"name": "get_weather"}),
+        }];
+        let msgs = [msg("user", "hi")];
+        let out =
+            render_or_fallback(Some(&env), &msgs, "", "", true, None, None, Some(&tools)).unwrap();
+        assert_eq!(
+            out,
+            "[{\"description\":\"d\",\"name\":\"get_weather\",\"parameters\":{\"a\":[2,3],\"b\":1},\"type\":\"function\"}]\
+|{\"a\": 2, \"b\": 1}"
+        );
     }
 
     #[test]
