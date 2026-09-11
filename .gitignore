@@ -45,6 +45,10 @@ shards_cached/
 !crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export_tiny_indexer/**/*.safetensors
 !crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export_tiny_indexer_dense/**/*.safetensors
 !crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_fp8_export/**/*.safetensors
+# Exception: same reason, inkling golden fixtures (tools/inkling_ref/gen_fixtures.py +
+# tools/export_inkling.py --tiny) — the Rust inkling tests read these directly.
+!crates/cascadia-engine-sparse-moe/tests/fixtures/inkling/fixtures.safetensors
+!crates/cascadia-engine-sparse-moe/tests/fixtures/inkling_export/**/*.safetensors
 
 # Runtime artifacts the code under test writes INTO fixture dirs while the
 # above golden tests run (routing-usage histogram, exporter resume markers) —
