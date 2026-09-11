@@ -267,10 +267,17 @@ cascadia worker --engine sparse-moe --model /data/inkling-int4 --ep-worker-index
 cascadia run /data/inkling-int4 --engine sparse-moe --ep-workers hostA:9200,hostB:9201,hostC:9202 --api :8000
 ```
 
-When it pays and when it does not — one network round per MoE layer, the
-driver's own attention reads as the serial floor — is worked through in the
-scaling note; measured numbers for this topology are recorded there as they
-land.
+Measured on the miner, all four processes on the one box over loopback TCP
+(3 workers, mmap experts paging from the same SATA SSD; page cache warm from
+the earlier runs): the same four prompts answer identically to the
+single-process runs (`Paris`, `42`, the Pacific sentence); cold TTFT 42 s
+(single-process runs: 107–176 s), 16-token answer 121 s vs 174–180 s, i.e.
+0.13 tok/s vs 0.09. That is the parallel-expert-read effect of the scaling
+note's RAM-starved regime showing up even on one box (three processes read
+their expert bins concurrently); the network round per MoE layer costs
+~0.15–0.2 ms on loopback. When it pays and when it does not across real
+boxes — one LAN round per MoE layer, the driver's own attention reads as the
+serial floor — is worked through in the scaling note.
 
 Topology, bandwidth ceilings and what expert-level routing across boxes would
 buy: [`../perf/INKLING_SCALING.md`](../perf/INKLING_SCALING.md).

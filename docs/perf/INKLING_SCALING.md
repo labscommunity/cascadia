@@ -95,6 +95,13 @@ issue, round trips are.
 | expert parallel + tensor-parallel attention | 128 all-reduces + 128 dispatch/gather | 0.04 + 0.03 + 0.06 ≈ 0.13, ~0.25 with p99 tails | ~4–8 |
 | same over the DERP relay | 256 rounds × 22 ms | ~5.6 | 0.2 |
 
+Built (`--ep-workers` / `--ep-worker-index`, see `inkling.md`) and measured on the
+miner with driver + 3 workers on the one box over loopback TCP, real export, SSD-paged:
+answers identical to single-process, cold 25-token TTFT 42 s (vs 107–176 s), 16-token
+answer 121 s vs 174–180 s (0.13 vs 0.09 tok/s) — the parallel-expert-read effect of
+the paged regime, with a ~0.15–0.2 ms loopback round per MoE layer. Page-cache state
+differed between the runs, so treat the ratio as indicative until a cold-cache A/B.
+
 Read across: in the **RAM-resident** regime the best expert-parallel design is
 ~1.5–2× the pipeline, not an order of magnitude, and only on a switched LAN with
 sub-millisecond tails; over a relay it is 20× *slower* than the pipeline. The
