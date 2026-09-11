@@ -424,6 +424,7 @@ dependencies = [
  "half",
  "lru",
  "memmap2",
+ "num_cpus",
  "rayon",
  "serde",
  "serde_json",

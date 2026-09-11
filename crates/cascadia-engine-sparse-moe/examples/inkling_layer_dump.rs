@@ -214,6 +214,7 @@ fn ms(d: Duration) -> f64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    cascadia_engine_sparse_moe::init_thread_pool();
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {

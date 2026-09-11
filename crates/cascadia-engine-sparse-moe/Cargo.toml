@@ -36,6 +36,7 @@ half = "2"
 lru = "0.18"
 memmap2 = "0.9"
 rayon = "1"
+num_cpus = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

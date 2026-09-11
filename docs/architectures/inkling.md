@@ -243,7 +243,11 @@ is the RAM-resident mode: every expert bin (and the dense MLPs) is `mlock`'d
 as it is opened, so the export is wired in memory and the GEMVs never fault —
 for a box whose RAM holds the export (512 GB int4), on macOS in particular,
 which re-faults cached file pages on every touch. Best-effort: the first
-refused lock is reported and the rest stay page-cache backed.
+refused lock is reported and the rest stay page-cache backed. The engine
+sizes rayon's pool to the **physical** cores unless `RAYON_NUM_THREADS` is
+set: the row-parallel GEMVs gain nothing from a core's second hyperthread
+and lose 3× to it on macOS (Mac Pro 28c/56t, pinned: 33 → 10.4 ms per MoE
+layer); Linux is indifferent (miner 24c/48t: 14.2 → 13.4).
 
 ## Sizing and the hardware honesty note
 

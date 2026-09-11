@@ -534,6 +534,7 @@ impl Builder for SparseMoEBuilder {
     }
 
     async fn load(&mut self, shard: ShardSpec) -> EngineResult<LoadStream> {
+        crate::init_thread_pool();
         let mut plugin = PluginConfig::new();
         if let Some(d) = &self.config.cache_dir {
             plugin = plugin.with("CACHE_DIR", d.clone());
