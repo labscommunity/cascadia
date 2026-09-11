@@ -1,8 +1,9 @@
 # Inkling (Thinking Machines Lab) on the sparse-MoE engine
 
-Status: **engine + exporter + tests landed on `feat/inkling`; real-model
-export and hardware validation in progress** (this page is updated as the
-numbers land).
+Status: **engine + exporter + tests on `feat/inkling` (PR #154); the 975B
+checkpoint is exported (512 GB int4) and validated layer-for-layer against
+transformers on real weights; end-to-end serving measured on the miner** (see
+Validation).
 
 Inkling is Thinking Machines Lab's open-weights (Apache-2.0) mixture-of-experts
 family, released 2026-07-15. Cascadia runs the text model of both sizes through
@@ -130,9 +131,50 @@ cannot run HF end to end (`K = 3`, float32 ≈ 67 GB: layers 0–1 dense + the
 first MoE layer). Tiny export, float32: worst element ≤ 0.26 % of its row RMS,
 rms(diff)/rms ≤ 0.06 %, argmax 19/19, decode == prefill bit for bit.
 
-Real model (miner, Xeon Gold 6252 48T / 172 GB / SATA SSD scratch): _pending —
-export streaming in progress; per-layer parity against checkpoint slices and
-factual prompts end to end follow._
+**Real model — 975B export on the miner** (Xeon Gold 6252, 48 threads,
+172 GB RAM, artifact on a SATA SSD; `hf download` 1.905 TB in 16-shard
+batches at ~350 MB/s streamed through `export_inkling.py --skip-missing-shards
+--delete-consumed-shards`, ~1.2 s per expert with 8 workers, whole export ≈ 2 h,
+512 GB on disk):
+
+`parity_run.sh 3` — prompt `The capital of France is` (5 tokens), Rust
+`inkling_layer_dump` of layers 0–2 (two dense, one MoE; mmap experts; decode and
+batched-prefill paths bit-identical) vs transformers on the same
+int4-dequantised weights:
+
+| layer | vs HF float32: rms(diff)/rms | max\|diff\| / max\|row\| | min cos | vs HF **bfloat16** (the model's native dtype): rms(diff)/rms |
+|---|---|---|---|---|
+| embed + embed_norm | 0.0000 | 0.0000 | 1.000000 | 0.0019 |
+| 0 (dense, sliding) | 0.0031 | 0.0049 | 1.000000 | 0.0016 |
+| 1 (dense, sliding) | 0.0016 | 0.0024 | 1.000000 | 0.0034 |
+| 2 (MoE, sliding) | 0.0013 | 0.0012 | 1.000000 | **0.0311** (cos 0.99982) |
+
+Verdict PASS against float32 (criteria: rms ≤ 1 %, max|diff| ≤ 1 % of the
+row's max). The absolute worst diffs (4.1 / 2.5 / 9.6) sit on the residual
+stream's massive-activation dims (row max ≈ 830 where row RMS ≈ 11) at one
+bf16 ULP — the shell's bf16 write-back. The last column is the yardstick: the
+model's own bfloat16 execution deviates from float32 by 3.1 % rms on the MoE
+layer, ~25× more than the Rust shell does.
+
+**End to end** (`smoke.sh`: `cascadia run out --engine sparse-moe --api :8010`,
+mmap experts, `reasoning_effort: "none"` so the template emits `Thinking effort
+level: 0`, greedy; the server loads in 91 s — 36 GB of bf16 shells and the
+edge tables read from the SSD, experts mmap'd):
+
+| prompt (tokens) | answer | tokens | wall |
+|---|---|---|---|
+| "What is the capital of France? Answer in one word." (25) — TTFT probe, cold page cache | — | 1 | 176 s |
+| same, warm | `Paris` | 4 | 33 s |
+| "What is 17 + 25? Answer with just the number." (27) | `42` | 4 | 83 s |
+| "Which ocean is the largest on Earth? One sentence." (24) | `The Pacific Ocean is the largest on Earth, covering about 63 million square` | 16 | 180 s |
+
+A first run with thinking left on (the API's GLM effort mapping had escalated
+`"none"` to `"high"` — fixed in the same PR) produced coherent reasoning
+openings ("The user is asking for the capital of France and wants") at 12
+tokens per 256–299 s. Decode is 8–25 s/token depending on how many of a
+token's ~48 experts × 64 layers are already in the page cache: the routed
+experts (490 GB) page from a SATA SSD into 172 GB of RAM, so this box is a
+correctness platform, not a throughput one (next section).
 
 ## Serving
 
@@ -158,11 +200,13 @@ sliding layers' rings are fixed at 512 + 32), `CASCADIA_INKLING_EXPERTS=eager|mm
 Per generated token the engine touches ~41B active parameters: ~21.7B routed
 expert weights (int4, ~11 GB of reads), ~7.2B shared-expert weights, ~8.7B
 attention weights and the dense/embed/unembed tables (bf16, ~36 GB resident).
-RAM-resident at 100 GB/s that is roughly 0.3–0.5 s/token; with the 490 GB of
-routed experts paged from disk the routed reads dominate and the SATA SSD on
-the validation box caps decode at well under 0.1 tok/s. A "record" run needs
-the int4 artifact (~525 GB) resident: a ≥640 GB-RAM box, or an N-rank pipeline
-whose ranks together hold it.
+RAM-resident at 100 GB/s that is roughly 0.3–0.5 s/token. With the 490 GB of
+routed experts paged from the miner's SATA SSD into 172 GB of RAM, measured
+decode is 8–25 s/token (0.05–0.12 tok/s) and a cold 25-token prefill takes
+~3 minutes — the SSD, not the shell, is the clock. A "record" run needs the
+int4 artifact (512 GB) resident: a ≥640 GB-RAM box, or an N-rank pipeline
+whose ranks together hold it (e.g. 4 × 160 GB), plus the prefix cache and
+expert-residency follow-ups below.
 
 ## Open follow-ups
 
