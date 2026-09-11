@@ -8,12 +8,14 @@ Modes:
   --model DIR --out OUT           convert a local thinkingmachines/Inkling{,-Small} checkpoint
       [--layers a-b]              only layers a..b inclusive (embed/head still exported unless --shards-only)
       [--shards-only]             only the int4 expert/dense bins: skip embed, head, shells, manifest
-      [--skip-missing-shards]     streaming pass: export everything the PRESENT shards allow, skip the
-                                  rest, exit 0 with an `INKLING_EXPORT ...` summary line; re-run as
+      [--skip-missing-shards]     streaming pass: convert every tensor whose shard file is PRESENT, skip
+                                  the rest, exit 0 with an `INKLING_EXPORT ...` summary line; re-run as
                                   more `model-000NN-of-00109.safetensors` files arrive
-      [--delete-consumed-shards]  delete a source shard once EVERY tensor it holds is exported + fsynced
-                                  (tracked per shard through model.safetensors.index.json)
-      [--workers N]               expert-quantization threads (default min(8, cpus))
+      [--delete-consumed-shards]  delete a source shard once EVERY tensor it holds has been converted
+                                  (staged or final) and fsynced — tracked per shard through
+                                  model.safetensors.index.json, so ONE pass over a shard consumes it no
+                                  matter which other shards have arrived
+      [--workers N]               conversion threads (default min(8, cpus))
   --layers-done-check --out OUT [--model DIR]
                                   assert embed, head and every layer are complete; print the manifest;
                                   exit 1 (listing what is missing) otherwise
@@ -31,9 +33,15 @@ On-disk layout (PORT_SPEC §1-§2; read by crates/cascadia-engine-sparse-moe/src
   <out>/experts/layer_NN/dense.bin             dense-layer MLP (w13_dn / w2_md)
   <out>/source_config.json                     copy of the source config.json (for --layers-done-check)
 
-Every output is written to `<name>.tmp`, fsynced, then renamed, so a kill mid-tensor never leaves a
-truncated file that looks done. Re-runs skip finished work by file presence + size (and per-layer
-`.layer_NN.done` markers) in seconds. Per-tensor timing is printed for every unit written.
+Stage-then-assemble: a real checkpoint scatters one layer's tensors over the whole shard range (w13 and
+w2 of a layer usually sit in different shards), so every TENSOR is converted the moment its shard is
+readable and staged under <out>/.staging/ — `layer_NN/expert_EEE.gateup.part` (packed gate+up sections
+from one w13 row), `expert_EEE.down.part` (from one w2 row), same for `expert_sharedS` / `dense`, and
+one-tensor safetensors `layer_NN/shell.<suffix>.st`, `embed/<key>.st`, `head/<key>.st`. A unit's final
+file is assembled (concatenated / merged) once all its parts exist, then the parts are deleted. Every
+write goes to `<name>.tmp`, is fsynced, then renamed, so a kill mid-tensor never leaves a truncated
+file that looks done. Re-runs reuse finals and parts by presence + size (and `.layer_NN.done` markers)
+in seconds. Per-tensor timing is printed for every part staged.
 """
 from __future__ import annotations
 
@@ -51,6 +59,7 @@ from pathlib import Path
 _INT4_GROUP = 32
 LAYER_PREFIX = "model.llm.layers."
 DROP_PREFIXES = ("model.mtp.", "model.audio.", "model.visual.")
+STAGING = ".staging"
 # <out>/embed.safetensors, <out>/head.safetensors: key -> (checkpoint name, stored dtype)
 EMBED_TENSORS = {
     "embed.weight": ("model.llm.embed.weight", "bf16"),
@@ -109,20 +118,27 @@ def pack_int4(w):
     return packed.numpy().tobytes(), bf.numpy().tobytes()
 
 
-def expert_bin_chunks(gate, up, down):
-    """SwiGLU FFN bin = gate, up, down sections (packed nibbles then bf16 scales each).
-    Matches MmapExpert::open's `2*section(inter,dim) + section(dim,inter)`."""
+def pack_sections(*ws):
+    """int4 sections (packed nibbles then bf16 scales, per matrix), concatenated in order."""
     chunks = []
-    for w in (gate, up, down):
+    for w in ws:
         p, s = pack_int4(w)
         chunks += [p, s]
     return chunks
 
 
+def expert_bin_chunks(gate, up, down):
+    """SwiGLU FFN bin = gate, up, down sections. Matches MmapExpert::open's
+    `2*section(inter,dim) + section(dim,inter)`."""
+    return pack_sections(gate, up, down)
+
+
+def _section_bytes(o: int, i: int) -> int:
+    return o * i // 2 + o * (i // _INT4_GROUP) * 2
+
+
 def int4_bin_bytes(hidden: int, inter: int) -> int:
-    def sec(o, i):
-        return o * i // 2 + o * (i // _INT4_GROUP) * 2
-    return 2 * sec(inter, hidden) + sec(hidden, inter)
+    return 2 * _section_bytes(inter, hidden) + _section_bytes(hidden, inter)
 
 
 # --------------------------------------------------------------------------
@@ -348,12 +364,36 @@ def shell_spec(man: dict, li: int):
     return spec
 
 
-class Unit:
-    """One output file: embed | head | shell(layer) | expert(layer, e) | shared(layer, s) | dense(layer)."""
-    __slots__ = ("kind", "layer", "idx", "needs", "output", "size")
+class Part:
+    """One staged intermediate under <out>/.staging, derived from exactly ONE checkpoint tensor
+    (`source`; `row` = expert index into a stacked [E, ...] tensor, None = whole tensor):
+      kind "st"     one-tensor safetensors of a converted shell / embed / head tensor (key, role, shape)
+      kind "gateup" packed int4 gate + up sections from one w13 row (rows 0::2 / 1::2)
+      kind "down"   packed int4 down section from one w2 row
+    `size` is the exact byte size for int4 parts (None for safetensors), `est` the pre-flight estimate."""
+    __slots__ = ("kind", "path", "size", "est", "source", "row", "key", "role", "shape", "parent_shape", "unit")
 
-    def __init__(self, kind, layer, idx, needs, output, size=None):
-        self.kind, self.layer, self.idx, self.needs, self.output, self.size = kind, layer, idx, needs, output, size
+    def __init__(self, kind, path, source, *, size=None, est=0, row=None, key=None, role=None,
+                 shape=None, parent_shape=None):
+        self.kind, self.path, self.source = kind, path, source
+        self.size, self.est, self.row, self.key, self.role = size, est, row, key, role
+        self.shape, self.parent_shape, self.unit = shape, parent_shape, None
+
+    @property
+    def label(self) -> str:
+        tag = self.key if self.kind == "st" else self.kind
+        return f"{self.unit.label} {tag}"
+
+
+class Unit:
+    """One final output file: embed | head | shell(layer) | expert(layer, e) | shared(layer, s) |
+    dense(layer), assembled from its `parts`."""
+    __slots__ = ("kind", "layer", "idx", "parts", "output", "size")
+
+    def __init__(self, kind, layer, idx, parts, output, size=None):
+        self.kind, self.layer, self.idx, self.parts, self.output, self.size = kind, layer, idx, parts, output, size
+        for p in parts:
+            p.unit = self
 
     @property
     def label(self) -> str:
@@ -368,55 +408,107 @@ class Unit:
         return f"layer {self.layer:02d}][{tag}"
 
 
+def _st_est(shape, role) -> int:
+    n = 1
+    for d in shape:
+        n *= d
+    return n * (2 if role == "bf16" else 4) + 256
+
+
 def build_plan(man: dict, out: Path):
-    """Every unit of a complete export (independent of --layers/--shards-only, which only choose
-    what to RUN; shard consumption is judged against the full plan)."""
-    H, I, Id = man["hidden_size"], man["moe_intermediate"], man["dense_intermediate"]
+    """Every unit + part of a complete export (independent of --layers/--shards-only, which only
+    choose what to RUN; shard consumption is judged against the full plan).
+    Returns (units, per_layer units, parts_by_tensor)."""
+    H, I, Id, V = man["hidden_size"], man["moe_intermediate"], man["dense_intermediate"], man["vocab_size"]
+    stg = out / STAGING
+    by_tensor = defaultdict(list)
+
+    def st(dirname, key, source, role, shape, stem=None):
+        # `key` is the tensor key inside BOTH the staged one-tensor file and the assembled file;
+        # `stem` only names the staged file (shell parts get a `shell.` prefix on disk).
+        p = Part("st", stg / dirname / f"{stem or key}.st", source, est=_st_est(shape, role),
+                 key=key, role=role, shape=shape)
+        by_tensor[source].append(p)
+        return p
+
+    def gateup(dirname, stem, source, inter, row=None, parent_shape=None):
+        p = Part("gateup", stg / dirname / f"{stem}.gateup.part", source, size=2 * _section_bytes(inter, H),
+                 est=2 * _section_bytes(inter, H), row=row, shape=(2 * inter, H), parent_shape=parent_shape)
+        by_tensor[source].append(p)
+        return p
+
+    def down(dirname, stem, source, inter, row=None, parent_shape=None):
+        p = Part("down", stg / dirname / f"{stem}.down.part", source, size=_section_bytes(H, inter),
+                 est=_section_bytes(H, inter), row=row, shape=(H, inter), parent_shape=parent_shape)
+        by_tensor[source].append(p)
+        return p
+
     units = [
-        Unit("embed", None, None, [n for n, _ in EMBED_TENSORS.values()], out / "embed.safetensors"),
-        Unit("head", None, None, [n for n, _ in HEAD_TENSORS.values()], out / "head.safetensors"),
+        Unit("embed", None, None,
+             [st("embed", k, n, r, (V, H) if r == "bf16" else (H,)) for k, (n, r) in EMBED_TENSORS.items()],
+             out / "embed.safetensors"),
+        Unit("head", None, None,
+             [st("head", k, n, r, (V, H) if r == "bf16" else (H,)) for k, (n, r) in HEAD_TENSORS.items()],
+             out / "head.safetensors"),
     ]
     per_layer = defaultdict(list)
     for li in range(man["num_layers"]):
         p = f"{LAYER_PREFIX}{li}."
-        edir = out / "experts" / f"layer_{li:02d}"
-        u = Unit("shell", li, None, [p + suf for suf, _, _ in shell_spec(man, li)],
-                 out / "shells" / f"layer_{li:02d}.safetensors")
-        per_layer[li].append(u)
+        ld = f"layer_{li:02d}"
+        edir = out / "experts" / ld
+        per_layer[li].append(Unit("shell", li, None,
+                                  [st(ld, suf, p + suf, role, shape, stem=f"shell.{suf}")
+                                   for suf, role, shape in shell_spec(man, li)],
+                                  out / "shells" / f"{ld}.safetensors"))
         if li in man["dense_layers"]:
-            per_layer[li].append(Unit("dense", li, None, [p + "mlp.w13_dn.weight", p + "mlp.w2_md.weight"],
+            per_layer[li].append(Unit("dense", li, None,
+                                      [gateup(ld, "dense", p + "mlp.w13_dn.weight", Id),
+                                       down(ld, "dense", p + "mlp.w2_md.weight", Id)],
                                       edir / "dense.bin", int4_bin_bytes(H, Id)))
         else:
-            for e in range(man["num_experts"]):
+            E, S = man["num_experts"], man["n_shared_experts"]
+            w13, w2 = p + "mlp.experts.w13_weight", p + "mlp.experts.w2_weight"
+            for e in range(E):
                 per_layer[li].append(Unit("expert", li, e,
-                                          [p + "mlp.experts.w13_weight", p + "mlp.experts.w2_weight"],
+                                          [gateup(ld, f"expert_{e:03d}", w13, I, row=e, parent_shape=(E, 2 * I, H)),
+                                           down(ld, f"expert_{e:03d}", w2, I, row=e, parent_shape=(E, H, I))],
                                           edir / f"expert_{e:03d}.bin", int4_bin_bytes(H, I)))
-            for s in range(man["n_shared_experts"]):
+            sw13, sw2 = p + "mlp.shared_experts.shared_w13_weight", p + "mlp.shared_experts.shared_w2_weight"
+            for s in range(S):
                 per_layer[li].append(Unit("shared", li, s,
-                                          [p + "mlp.shared_experts.shared_w13_weight",
-                                           p + "mlp.shared_experts.shared_w2_weight"],
+                                          [gateup(ld, f"expert_shared{s}", sw13, I, row=s, parent_shape=(S, 2 * I, H)),
+                                           down(ld, f"expert_shared{s}", sw2, I, row=s, parent_shape=(S, H, I))],
                                           edir / f"expert_shared{s}.bin", int4_bin_bytes(H, I)))
         units += per_layer[li]
-    return units, per_layer
+    return units, per_layer, by_tensor
 
 
 def layer_marker(out: Path, li: int) -> Path:
     return out / f".layer_{li:02d}.done"
 
 
-def unit_output_done(u: Unit) -> bool:
+def _file_done(path: Path, size) -> bool:
     try:
-        st = u.output.stat()
+        st = path.stat()
     except FileNotFoundError:
         return False
-    return u.size is None or st.st_size == u.size
+    return size is None or st.st_size == size
+
+
+def unit_output_done(u: Unit) -> bool:
+    return _file_done(u.output, u.size)
+
+
+def staged_part_count(out: Path) -> int:
+    stg = out / STAGING
+    return sum(1 for p in stg.rglob("*") if p.is_file() and not p.name.endswith(".tmp")) if stg.exists() else 0
 
 
 def completeness(man: dict, out: Path):
-    """(complete, missing descriptions, layers_done, embed_done, head_done) from the files on disk.
+    """(complete, missing descriptions, layers_done, embed_done, head_done) from the FINAL files on disk.
     Verifies every output's presence + size; `.layer_NN.done` markers are deliberately NOT trusted
     here (they are the exporter's fast path; this is the audit)."""
-    units, per_layer = build_plan(man, out)
+    units, per_layer, _ = build_plan(man, out)
     missing, layers_done = [], 0
     embed_done = unit_output_done(units[0])
     head_done = unit_output_done(units[1])
@@ -478,7 +570,9 @@ class DictSource:
 class ShardSource:
     """Streamed reads over a local HF checkpoint via `model.safetensors.index.json`. Never loads a
     shard: `get` reads one tensor, `get_row` one expert's slice (`safe_open(...).get_slice(name)[e]`,
-    a [2I, H] read out of a 9.7 GB w13). One safe_open handle per (thread, shard)."""
+    a [2I, H] read out of a 9.7 GB w13). One safe_open handle per (thread, shard). A shard is
+    "present" when the exact file the index names exists in the model dir (hf's `.incomplete`
+    downloads live under .cache and never match)."""
 
     def __init__(self, model_dir: Path):
         from safetensors import safe_open
@@ -554,36 +648,28 @@ class ShardSource:
 # Disk pre-flight
 # --------------------------------------------------------------------------
 def estimate_export_bytes(man: dict) -> int:
-    H, K, d_rel, V = man["hidden_size"], man["conv_kernel_size"], man["d_rel"], man["vocab_size"]
-    E, S, I, Id = man["num_experts"], man["n_shared_experts"], man["moe_intermediate"], man["dense_intermediate"]
-    total = 2 * 2 * V * H + 4 * 2 * H
-    for li in range(man["num_layers"]):
-        heads, kv, hd, extent = layer_dims(man, li)
-        total += 2 * (heads * hd * H + 2 * kv * hd * H + heads * d_rel * H + H * heads * hd)
-        total += 4 * (2 * H + 2 * hd + 2 * kv * hd * K + d_rel * extent + 2 * H * K)
-        if li in man["dense_layers"]:
-            total += int4_bin_bytes(H, Id) + 4
-        else:
-            total += (E + S) * int4_bin_bytes(H, I) + 4 * ((E + S) * H + E + 1)
-    return total
+    """Whole-export size (informational)."""
+    units, _, _ = build_plan(man, Path("."))
+    return sum(p.est for u in units for p in u.parts)
 
 
-def check_space(out: Path, man: dict, first_pass: bool) -> None:
-    """Refuse to START an export the disk cannot hold (INKLING_SKIP_SPACE_CHECK=1 overrides). On a
-    resumed / streaming pass the free space is a moving target (shards arrive and get deleted), so
-    only the numbers are printed."""
+def check_space(out: Path, pass_bytes: int, total_bytes: int, enforce: bool) -> None:
+    """Refuse to start a pass the disk cannot hold (INKLING_SKIP_SPACE_CHECK=1 overrides). The
+    estimate is what THIS pass can write (parts whose shards are present and that are not staged /
+    final yet), never the whole export. Not enforced on streaming passes (--skip-missing-shards):
+    there the free space is a moving target as consumed shards get deleted during the pass."""
     out.mkdir(parents=True, exist_ok=True)
-    est = estimate_export_bytes(man)
     free = shutil.disk_usage(out).free
-    log(f"[check_space] estimated export ~{est / 1e9:.1f} GB, free ~{free / 1e9:.1f} GB"
-        + ("" if first_pass else " (resumed pass: not enforced)"))
-    if first_pass and free < est * 1.05 and os.environ.get("INKLING_SKIP_SPACE_CHECK") != "1":
-        raise SystemExit(f"[export_inkling] insufficient disk: need ~{est / 1e9:.1f} GB (+5% margin), "
-                         f"have ~{free / 1e9:.1f} GB. Set INKLING_SKIP_SPACE_CHECK=1 to override.")
+    log(f"[check_space] this pass writes ~{pass_bytes / 1e9:.1f} GB (whole export ~{total_bytes / 1e9:.1f} GB), "
+        f"free ~{free / 1e9:.1f} GB" + ("" if enforce else " (streaming pass: not enforced)"))
+    if enforce and free < pass_bytes * 1.05 and os.environ.get("INKLING_SKIP_SPACE_CHECK") != "1":
+        raise SystemExit(f"[export_inkling] insufficient disk: this pass needs ~{pass_bytes / 1e9:.1f} GB "
+                         f"(+5% margin), have ~{free / 1e9:.1f} GB. Set INKLING_SKIP_SPACE_CHECK=1 to override.")
 
 
 # --------------------------------------------------------------------------
-# The exporter
+# The exporter: stage every tensor's converted form as soon as it is readable, assemble units from
+# their parts, consume shards per tensor.
 # --------------------------------------------------------------------------
 def _shape_check(name, got, want):
     if tuple(got) != tuple(want):
@@ -598,141 +684,162 @@ class Exporter:
         self.layers = layers
         self.shards_only, self.skip_missing, self.delete_consumed = shards_only, skip_missing, delete_consumed
         self.workers = max(1, workers)
-        self.units, self.per_layer = build_plan(man, self.out)
-        self._done: dict[int, bool] = {}
+        self.units, self.per_layer, self.by_tensor = build_plan(man, self.out)
+        self._udone: dict[int, bool] = {}
+        self._pdone: dict[int, bool] = {}
         self._lock = threading.Lock()
         self.pending_shards: set[str] = set()
         self.deleted_shards: list[str] = []
         self.counts = defaultdict(int)
-        self.layer_stats = None
+        self.stats = None
 
-    # ---- done / runnable bookkeeping
+    # ---- done bookkeeping (final outputs + staged parts; markers as a fast path)
     def unit_done(self, u: Unit) -> bool:
         k = id(u)
-        v = self._done.get(k)
+        v = self._udone.get(k)
         if v is None:
-            if u.layer is not None and layer_marker(self.out, u.layer).exists():
-                v = True
-            else:
-                v = unit_output_done(u)
-            self._done[k] = v
+            v = (u.layer is not None and layer_marker(self.out, u.layer).exists()) or unit_output_done(u)
+            self._udone[k] = v
         return v
 
-    def mark_done(self, u: Unit) -> None:
-        with self._lock:
-            self._done[id(u)] = True
+    def part_done(self, p: Part) -> bool:
+        if self.unit_done(p.unit):
+            return True
+        k = id(p)
+        v = self._pdone.get(k)
+        if v is None:
+            v = _file_done(p.path, p.size)
+            self._pdone[k] = v
+        return v
 
-    def runnable(self, u: Unit) -> bool:
-        missing = sorted({self.src.shard_of(n) for n in u.needs if not self.src.available(n)} - {None})
-        absent = [n for n in u.needs if not self.src.has(n)]
-        if absent:
-            raise SystemExit(f"[export_inkling] {u.label}: tensors missing from the checkpoint index: {absent} "
+    def available(self, p: Part) -> bool:
+        if not self.src.has(p.source):
+            raise SystemExit(f"[export_inkling] {p.label}: tensor '{p.source}' missing from the checkpoint index "
                              "— checkpoint layout differs from PORT_SPEC §2")
-        if missing:
-            if not self.skip_missing:
-                raise SystemExit(f"[export_inkling] {u.label}: source shard(s) not on disk: {missing} "
-                                 "(use --skip-missing-shards for a streaming pass)")
-            with self._lock:
-                self.pending_shards.update(missing)
-            return False
-        return True
+        if self.src.available(p.source):
+            return True
+        shard = self.src.shard_of(p.source)
+        if not self.skip_missing:
+            raise SystemExit(f"[export_inkling] {p.label}: source shard not on disk: {shard} "
+                             "(use --skip-missing-shards for a streaming pass)")
+        with self._lock:
+            self.pending_shards.add(shard)
+        return False
 
-    # ---- unit runners
-    def _read_global(self, u: Unit):
+    def _bump(self, key, dt=0.0, nbytes=0):
+        with self._lock:
+            if self.stats is not None:
+                self.stats[key] += dt
+                self.stats["bytes"] += nbytes
+
+    # ---- stage one part
+    def stage_part(self, p: Part) -> None:
         import torch
 
-        spec = EMBED_TENSORS if u.kind == "embed" else HEAD_TENSORS
-        V, H = self.man["vocab_size"], self.man["hidden_size"]
-        tensors, nw = {}, 0
-        for key, (name, role) in spec.items():
-            t = self.src.get(name)
-            _shape_check(name, t.shape, (V, H) if role == "bf16" else (H,))
-            tensors[key] = (t.to(torch.bfloat16) if role == "bf16" else t.to(torch.float32)).contiguous()
-            nw += t.numel()
-        return tensors, nw
-
-    def _read_shell(self, u: Unit):
-        import torch
-
-        tensors, nw = {}, 0
-        for suffix, role, shape in shell_spec(self.man, u.layer):
-            name = f"{LAYER_PREFIX}{u.layer}.{suffix}"
-            t = self.src.get(name)
-            _shape_check(name, t.shape, shape)
-            if role == "bf16":
+        t0 = time.perf_counter()
+        if p.kind == "st":
+            t = self.src.get(p.source)
+            _shape_check(p.source, t.shape, p.shape)
+            if p.role == "bf16":
                 t = t.to(torch.bfloat16)
-            elif role == "f32":
+            elif p.role == "f32":
                 t = t.to(torch.float32)
             else:  # conv [C, 1, K] -> [C, K] f32
-                t = t.to(torch.float32).reshape(shape[0], shape[2])
-            tensors[suffix] = t.contiguous()
-            nw += t.numel()
-        return tensors, nw
-
-    def _read_ffn(self, u: Unit):
-        import torch
-
-        H = self.man["hidden_size"]
-        w13n, w2n = u.needs
-        if u.kind == "dense":
-            Id = self.man["dense_intermediate"]
-            w13, w2 = self.src.get(w13n), self.src.get(w2n)
-            _shape_check(w13n, w13.shape, (2 * Id, H))
-            _shape_check(w2n, w2.shape, (H, Id))
-        else:
-            I = self.man["moe_intermediate"]
-            n = self.man["num_experts"] if u.kind == "expert" else self.man["n_shared_experts"]
-            _shape_check(w13n, self.src.shape(w13n), (n, 2 * I, H))
-            _shape_check(w2n, self.src.shape(w2n), (n, H, I))
-            w13, w2 = self.src.get_row(w13n, u.idx), self.src.get_row(w2n, u.idx)
-        w13 = w13.to(torch.float32)
-        # transformers Interleave(dim=1): gate = rows 0::2, up = rows 1::2
-        return w13[0::2], w13[1::2], w2.to(torch.float32)
-
-    def run_unit(self, u: Unit) -> str:
-        if self.unit_done(u):
-            return "skipped"
-        if not self.runnable(u):
-            return "pending"
-        t0 = time.perf_counter()
-        if u.kind in ("embed", "head"):
-            tensors, nw = self._read_global(u)
+                t = t.to(torch.float32).reshape(p.shape[0], p.shape[2])
+            nw = t.numel()
             t1 = t2 = time.perf_counter()
-            nbytes = atomic_save_safetensors(tensors, u.output)
-        elif u.kind == "shell":
-            tensors, nw = self._read_shell(u)
-            t1 = t2 = time.perf_counter()
-            nbytes = atomic_save_safetensors(tensors, u.output)
+            nbytes = atomic_save_safetensors({p.key: t.contiguous()}, p.path)
         else:
-            gate, up, down = self._read_ffn(u)
-            nw = gate.numel() + up.numel() + down.numel()
+            if p.row is None:
+                w = self.src.get(p.source)
+            else:
+                _shape_check(p.source, self.src.shape(p.source), p.parent_shape)  # header read only
+                w = self.src.get_row(p.source, p.row)
+            _shape_check(p.source if p.row is None else f"{p.source}[{p.row}]", w.shape, p.shape)
+            w = w.to(torch.float32)
+            nw = w.numel()
             t1 = time.perf_counter()
-            chunks = expert_bin_chunks(gate, up, down)
+            # transformers Interleave(dim=1): gate = rows 0::2, up = rows 1::2
+            chunks = pack_sections(w[0::2], w[1::2]) if p.kind == "gateup" else pack_sections(w)
             t2 = time.perf_counter()
-            nbytes = atomic_write_bytes(u.output, chunks)
-            if nbytes != u.size:
-                raise SystemExit(f"[export_inkling] {u.output}: wrote {nbytes} bytes, expected {u.size}")
+            nbytes = atomic_write_bytes(p.path, chunks)
+            if nbytes != p.size:
+                raise SystemExit(f"[export_inkling] {p.path}: wrote {nbytes} bytes, expected {p.size}")
         t3 = time.perf_counter()
-        self.mark_done(u)
-        log(f"[{u.label}] read {t1 - t0:.3f}s quant {t2 - t1:.3f}s write {t3 - t2:.3f}s | "
+        with self._lock:
+            self._pdone[id(p)] = True
+        log(f"[{p.label}] read {t1 - t0:.3f}s quant {t2 - t1:.3f}s write {t3 - t2:.3f}s | "
             f"{nw / 1e6:.1f}M weights -> {nbytes / 1e6:.1f} MB")
         with self._lock:
-            if self.layer_stats is not None:
-                st = self.layer_stats
-                st["n"] += 1
-                st["read"] += t1 - t0
-                st["quant"] += t2 - t1
-                st["write"] += t3 - t2
-                st["bytes"] += nbytes
-        return "done"
+            if self.stats is not None:
+                self.stats["staged"] += 1
+                self.stats["read"] += t1 - t0
+                self.stats["quant"] += t2 - t1
+                self.stats["write"] += t3 - t2
+                self.stats["bytes"] += nbytes
 
-    # ---- shard consumption
+    # ---- assemble one unit from its parts, then drop the parts
+    def assemble_unit(self, u: Unit) -> None:
+        t0 = time.perf_counter()
+        if u.kind in ("embed", "head", "shell"):
+            from safetensors.torch import load_file
+
+            tensors = {}
+            for p in u.parts:
+                tensors[p.key] = load_file(str(p.path))[p.key]
+            nbytes = atomic_save_safetensors(tensors, u.output)
+        else:
+            nbytes = atomic_write_bytes(u.output, [p.path.read_bytes() for p in u.parts])
+            if nbytes != u.size:
+                raise SystemExit(f"[export_inkling] {u.output}: assembled {nbytes} bytes, expected {u.size}")
+        for p in u.parts:
+            p.path.unlink(missing_ok=True)
+        with self._lock:
+            self._udone[id(u)] = True
+            if self.stats is not None:
+                self.stats["assembled"] += 1
+                self.stats["assemble"] += time.perf_counter() - t0
+        log(f"[{u.label}] assembled {len(u.parts)} parts -> {u.output.name} ({nbytes / 1e6:.1f} MB, "
+            f"{(time.perf_counter() - t0) * 1e3:.0f} ms)")
+
+    # ---- one group of units (embed/head, or one layer): stage what is readable, assemble what is whole
+    def process(self, units, ex) -> dict:
+        stage, n_skip, n_pend = [], 0, 0
+        for u in units:
+            if self.unit_done(u):
+                n_skip += 1
+                continue
+            for p in u.parts:
+                if self.part_done(p):
+                    continue
+                if self.available(p):
+                    stage.append(p)
+                else:
+                    n_pend += 1
+        list(ex.map(self.stage_part, stage))
+        assemble = [u for u in units if not self.unit_done(u) and all(self.part_done(p) for p in u.parts)]
+        list(ex.map(self.assemble_unit, assemble))
+        self.counts["staged"] += len(stage)
+        self.counts["assembled"] += len(assemble)
+        self.counts["skipped"] += n_skip
+        self.counts["pending"] += n_pend
+        return {"staged": len(stage), "assembled": len(assemble), "skipped": n_skip, "pending": n_pend}
+
+    def pass_bytes(self, units) -> int:
+        """What this pass can write: parts of these units that are neither staged nor final and
+        whose shard is present (missing shards are recorded, not fatal, here)."""
+        total = 0
+        for u in units:
+            if self.unit_done(u):
+                continue
+            for p in u.parts:
+                if not self.part_done(p) and self.src.has(p.source) and self.src.available(p.source):
+                    total += p.est
+        return total
+
+    # ---- shard consumption: every tensor a shard holds has all its parts staged or final
     def consumed_tensors(self) -> set:
-        consumers = defaultdict(list)
-        for u in self.units:
-            for n in u.needs:
-                consumers[n].append(u)
-        return {n for n, us in consumers.items() if all(self.unit_done(u) for u in us)}
+        return {n for n, parts in self.by_tensor.items() if all(self.part_done(p) for p in parts)}
 
     def shard_consumed(self, shard: str, consumed: set) -> bool:
         return all(n.startswith(DROP_PREFIXES) or n in consumed for n in self.src.shards[shard])
@@ -748,52 +855,57 @@ class Exporter:
                 size = p.stat().st_size
                 os.remove(p)
                 self.deleted_shards.append(shard)
-                log(f"[shard] deleted {shard} ({size / 1e9:.2f} GB): every tensor it holds is exported")
+                log(f"[shard] deleted {shard} ({size / 1e9:.2f} GB): every tensor it holds is converted")
+
+    def _selected_units(self):
+        L = self.man["num_layers"]
+        lo, hi = self.layers if self.layers else (0, L - 1)
+        if not (0 <= lo <= hi < L):
+            raise SystemExit(f"[export_inkling] --layers {lo}-{hi} outside 0..{L - 1}")
+        sel = [] if self.shards_only else list(self.units[:2])
+        for li in range(lo, hi + 1):
+            sel += [u for u in self.per_layer[li] if not (self.shards_only and u.kind == "shell")]
+        return lo, hi, sel
 
     # ---- driver
     def run(self) -> dict:
         man, out = self.man, self.out
         L = man["num_layers"]
-        lo, hi = self.layers if self.layers else (0, L - 1)
-        if not (0 <= lo <= hi < L):
-            raise SystemExit(f"[export_inkling] --layers {lo}-{hi} outside 0..{L - 1}")
-        known = {n for u in self.units for n in u.needs}
+        lo, hi, selected = self._selected_units()
+        known = set(self.by_tensor)
         unknown = [n for n in self.src.names() if n not in known and not n.startswith(DROP_PREFIXES)]
         if unknown:
             log(f"[export] WARNING: {len(unknown)} checkpoint tensors are neither exported nor dropped "
                 f"(their shards are never deleted), e.g. {unknown[:5]}")
+        pass_est = self.pass_bytes(selected)
+        check_space(out, pass_est, estimate_export_bytes(man), enforce=not self.skip_missing)
 
-        def tally(status):
-            self.counts[status] += 1
-
-        if not self.shards_only:
-            for u in self.units[:2]:
-                tally(self.run_unit(u))
         with ThreadPoolExecutor(max_workers=self.workers) as ex:
+            if not self.shards_only:
+                r = self.process(self.units[:2], ex)
+                log(f"[embed/head] staged {r['staged']} assembled {r['assembled']} skipped {r['skipped']} "
+                    f"pending {r['pending']}")
             for li in range(lo, hi + 1):
-                lunits = self.per_layer[li]
+                lunits = [u for u in self.per_layer[li] if not (self.shards_only and u.kind == "shell")]
                 if layer_marker(out, li).exists():
                     log(f"[layer {li:02d}/{L}] skip (done)")
-                    for _ in lunits:
-                        tally("skipped")
+                    self.counts["skipped"] += len(lunits)
                     continue
-                self.layer_stats = {"n": 0, "read": 0.0, "quant": 0.0, "write": 0.0, "bytes": 0}
+                self.stats = defaultdict(float)
                 t0 = time.perf_counter()
-                todo = [u for u in lunits if not (self.shards_only and u.kind == "shell")]
-                statuses = list(ex.map(self.run_unit, todo))
-                for s in statuses:
-                    tally(s)
-                st = self.layer_stats
-                self.layer_stats = None
-                if all(self.unit_done(u) for u in lunits):
+                r = self.process(lunits, ex)
+                st, self.stats = self.stats, None
+                if all(self.unit_done(u) for u in self.per_layer[li]):
                     layer_marker(out, li).touch()
+                    shutil.rmtree(out / STAGING / f"layer_{li:02d}", ignore_errors=True)
                     state = "complete"
                 else:
-                    state = "partial (" + ", ".join(f"{k}={statuses.count(k)}" for k in ("done", "skipped", "pending")) + ")"
+                    state = "partial"
                 dt = time.perf_counter() - t0
-                log(f"[layer {li:02d}/{L}] {state}: {st['n']} units written in {dt:.1f}s "
-                    f"(read {st['read']:.1f}s quant {st['quant']:.1f}s write {st['write']:.1f}s; "
-                    f"{st['bytes'] / 1e9:.2f} GB, {st['bytes'] / 1e9 / max(dt, 1e-9):.2f} GB/s)")
+                log(f"[layer {li:02d}/{L}] {state}: staged {r['staged']} parts ({st['bytes'] / 1e9:.2f} GB; read "
+                    f"{st['read']:.1f}s quant {st['quant']:.1f}s write {st['write']:.1f}s), assembled "
+                    f"{r['assembled']} units ({st['assemble']:.1f}s), skipped {r['skipped']}, pending "
+                    f"{r['pending']} parts; {dt:.1f}s, {st['bytes'] / 1e9 / max(dt, 1e-9):.2f} GB/s")
                 self.sweep_shards()
         self.sweep_shards()
 
@@ -802,10 +914,14 @@ class Exporter:
         if self.src.shards:
             consumed = self.consumed_tensors()
             n_consumed = sum(self.shard_consumed(s, consumed) for s in self.src.shards)
+        if complete:
+            shutil.rmtree(out / STAGING, ignore_errors=True)
+        staged = staged_part_count(out)
         summary = {
             "complete": complete, "layers_done": layers_done, "num_layers": L, "embed_done": embed_done,
             "head_done": head_done, "shards_consumed": n_consumed, "shards_deleted": list(self.deleted_shards),
-            "pending_shards": sorted(self.pending_shards), "counts": dict(self.counts), "missing": missing,
+            "pending_shards": sorted(self.pending_shards), "staged_parts": staged, "counts": dict(self.counts),
+            "missing": missing,
         }
         if complete and not self.shards_only:
             write_manifest(man, out)
@@ -813,8 +929,8 @@ class Exporter:
             log("[export] incomplete, manifest not written: " + "; ".join(missing[:6])
                 + (" ..." if len(missing) > 6 else ""))
         log(f"INKLING_EXPORT layers_done={layers_done}/{L} shards_consumed={n_consumed} "
-            f"pending_shards=[{','.join(summary['pending_shards'])}] embed_done={int(embed_done)} "
-            f"head_done={int(head_done)} complete={int(complete)}")
+            f"pending_shards=[{','.join(summary['pending_shards'])}] staged_parts={staged} "
+            f"embed_done={int(embed_done)} head_done={int(head_done)} complete={int(complete)}")
         return summary
 
 
@@ -832,8 +948,6 @@ def export_real(model_dir: Path, out: Path, *, layers=None, shards_only=False, s
     src_cfg = out / "source_config.json"
     if not src_cfg.exists():
         shutil.copy(model_dir / "config.json", src_cfg)
-    first_pass = not (out / "embed.safetensors").exists() and not any(out.glob(".layer_*.done"))
-    check_space(out, man, first_pass)
     _set_threads(workers)
     src = ShardSource(model_dir)
     ex = Exporter(src, man, out, layers=layers, shards_only=shards_only, skip_missing=skip_missing,
@@ -887,14 +1001,16 @@ def layers_done_check(out: Path, model_dir=None) -> bool:
         raise SystemExit(f"[export_inkling] --layers-done-check: no config at {cfg} (pass --model DIR)")
     man = load_and_validate_config(cfg)
     complete, missing, layers_done, embed_done, head_done = completeness(man, out)
+    staged = staged_part_count(out)
     if complete:
         if not (out / "manifest.json").exists():
             write_manifest(man, out)
-        log(f"[layers-done-check] OK: embed, head and {layers_done}/{man['num_layers']} layers complete")
+        log(f"[layers-done-check] OK: embed, head and {layers_done}/{man['num_layers']} layers complete "
+            f"(staged_parts={staged})")
         print(json.dumps(man, indent=2))
         return True
     log(f"[layers-done-check] INCOMPLETE: layers {layers_done}/{man['num_layers']}, "
-        f"embed_done={int(embed_done)} head_done={int(head_done)}")
+        f"embed_done={int(embed_done)} head_done={int(head_done)}, staged_parts={staged}")
     for m in missing:
         log("  - " + m)
     stale = [layer_marker(out, li) for li in range(man["num_layers"])
@@ -923,7 +1039,7 @@ def main():
     ap.add_argument("--skip-missing-shards", action="store_true",
                     help="streaming pass: skip tensors whose shard file is absent, exit 0 with a summary")
     ap.add_argument("--delete-consumed-shards", action="store_true",
-                    help="delete a source shard once every tensor it holds is exported and fsynced")
+                    help="delete a source shard once every tensor it holds is converted and fsynced")
     ap.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1))
     ap.add_argument("--layers-done-check", action="store_true",
                     help="assert the export at --out is complete and print the manifest (exit 1 otherwise)")

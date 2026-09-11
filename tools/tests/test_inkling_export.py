@@ -313,7 +313,8 @@ def test_tiny_rerun_is_idempotent(tiny_export):
     ckpt = hf_state_to_checkpoint(build_tiny_model(man).state_dict())
     summary = export_inkling.Exporter(export_inkling.DictSource(ckpt), man, out, workers=2).run()
     n_units = 2 + 4 + 1 + 3 * (8 + 2)
-    assert summary["counts"] == {"skipped": n_units} and summary["complete"]
+    assert summary["counts"] == {"skipped": n_units, "staged": 0, "assembled": 0, "pending": 0}
+    assert summary["complete"] and summary["staged_parts"] == 0 and not (out / ".staging").exists()
     after = {p: p.stat().st_mtime_ns for p in out.rglob("*") if p.is_file()}
     for p, m in before.items():
         if p.name != "manifest.json":
@@ -335,8 +336,8 @@ def test_layers_done_check_detects_missing_and_truncated(tiny_export):
         man = export_inkling.load_and_validate_config(TINY_CONFIG)
         ckpt = hf_state_to_checkpoint(build_tiny_model(man).state_dict())
         summary = export_inkling.Exporter(export_inkling.DictSource(ckpt), man, out, workers=2).run()
-        assert summary["counts"]["done"] == 1 and summary["complete"]
-        assert victim.read_bytes() == data
+        assert summary["counts"]["staged"] == 2 and summary["counts"]["assembled"] == 1 and summary["complete"]
+        assert victim.read_bytes() == data and summary["staged_parts"] == 0
         assert export_inkling.layers_done_check(out) is True
     finally:
         victim.write_bytes(data)
@@ -346,20 +347,25 @@ def test_layers_done_check_detects_missing_and_truncated(tiny_export):
 # --------------------------------------------------------------------------
 # streaming passes over a synthetic sharded checkpoint (the real --model path)
 # --------------------------------------------------------------------------
-def _write_sharded_checkpoint(model_dir: Path, ckpt: dict):
-    """3 shards split by layer (shard 0: embed/head/mtp + layer 0, 1: layers 1-2, 2: layer 3),
-    bf16 tensors like the real checkpoint, plus model.safetensors.index.json + config.json."""
+def _write_sharded_checkpoint(model_dir: Path, ckpt: dict, layout: str = "by_layer"):
+    """3 shards of bf16 tensors like the real checkpoint + model.safetensors.index.json + config.json.
+    layout "by_layer": shard 0 = embed/head/mtp + layer 0, 1 = layers 1-2, 2 = layer 3.
+    layout "spread": every layer's tensors are scattered over all 3 shards (round-robin in name
+    order), so w13 and w2 of a layer and the shell tensors land in different shards — the real
+    thinkingmachines/Inkling index does this (layer 35's shell spans shards 1..108)."""
     from safetensors.torch import save_file
 
-    def shard_of(name):
+    def shard_of(name, i):
+        if layout == "spread":
+            return i % 3
         if name.startswith("model.llm.layers."):
             li = int(name.split(".")[3])
             return 0 if li == 0 else (1 if li <= 2 else 2)
         return 0
 
     groups = {0: {}, 1: {}, 2: {}}
-    for k, v in ckpt.items():
-        groups[shard_of(k)][k] = v.to(torch.bfloat16).contiguous()
+    for i, (k, v) in enumerate(sorted(ckpt.items())):
+        groups[shard_of(k, i)][k] = v.to(torch.bfloat16).contiguous()
     groups[0]["model.mtp.layers.0.attn_norm.weight"] = torch.ones(64, dtype=torch.bfloat16)  # dropped
     names = {i: f"model-{i + 1:05d}-of-00003.safetensors" for i in groups}
     wm = {}
@@ -389,7 +395,7 @@ def test_streaming_export_over_sharded_checkpoint(tmp_path, tiny_export):
         export_inkling.export_real(model_dir, out, workers=2)  # without --skip-missing-shards: loud
     s1 = export_inkling.export_real(model_dir, out, skip_missing=True, delete_consumed=True, workers=2)
     assert not s1["complete"] and s1["layers_done"] == 3 and s1["embed_done"] and s1["head_done"]
-    assert s1["pending_shards"] == [names[2]]
+    assert s1["pending_shards"] == [names[2]] and s1["staged_parts"] == 0
     assert sorted(s1["shards_deleted"]) == [names[0], names[1]] and s1["shards_consumed"] == 2
     assert not (model_dir / names[0]).exists() and not (model_dir / names[1]).exists()
     assert not (out / "manifest.json").exists()
@@ -401,17 +407,86 @@ def test_streaming_export_over_sharded_checkpoint(tmp_path, tiny_export):
     assert s2["complete"] and s2["layers_done"] == 4 and s2["pending_shards"] == []
     assert s2["shards_deleted"] == [names[2]] and s2["shards_consumed"] == 3
     assert s2["counts"]["skipped"] == 2 + (1 + 1) + 2 * (1 + 10)  # embed, head, layer 0, layers 1-2
+    assert s2["counts"]["assembled"] == 11 and s2["staged_parts"] == 0 and not (out / ".staging").exists()
     assert (out / "manifest.json").exists() and (out / "tokenizer_config.json").exists()
     assert export_inkling.layers_done_check(out, model_dir) is True
+    _assert_same_export(tiny_out, out)
 
-    # byte-identical to the --tiny export (same weights, DictSource vs ShardSource)
-    for p in tiny_out.rglob("*.bin"):
-        assert (out / p.relative_to(tiny_out)).read_bytes() == p.read_bytes(), p
+
+def _assert_same_export(a_dir: Path, b_dir: Path):
+    """Final outputs of two exports of the same weights are byte-identical (bins) / tensor-identical."""
     from safetensors.torch import load_file
-    for p in tiny_out.rglob("*.safetensors"):
-        a, b = load_file(str(p)), load_file(str(out / p.relative_to(tiny_out)))
-        assert set(a) == set(b) and all(torch.equal(a[k], b[k]) and a[k].dtype == b[k].dtype for k in a), p
-    assert json.loads((out / "manifest.json").read_text()) == json.loads((tiny_out / "manifest.json").read_text())
+
+    bins_a = sorted(p.relative_to(a_dir) for p in a_dir.rglob("*.bin"))
+    bins_b = sorted(p.relative_to(b_dir) for p in b_dir.rglob("*.bin"))
+    assert bins_a == bins_b and bins_a
+    for rel in bins_a:
+        assert (a_dir / rel).read_bytes() == (b_dir / rel).read_bytes(), rel
+    sts_a = sorted(p.relative_to(a_dir) for p in a_dir.rglob("*.safetensors") if ".staging" not in p.parts)
+    sts_b = sorted(p.relative_to(b_dir) for p in b_dir.rglob("*.safetensors") if ".staging" not in p.parts)
+    assert sts_a == sts_b and len(sts_a) == 6
+    for rel in sts_a:
+        a, b = load_file(str(a_dir / rel)), load_file(str(b_dir / rel))
+        assert list(a) == list(b), rel
+        assert all(torch.equal(a[k], b[k]) and a[k].dtype == b[k].dtype for k in a), rel
+    assert json.loads((a_dir / "manifest.json").read_text()) == json.loads((b_dir / "manifest.json").read_text())
+
+
+def test_streaming_spread_shards_consumed_one_at_a_time(tmp_path, tiny_export):
+    """The real index scatters a layer's tensors over the whole shard range: a shard must become
+    consumable after ONE pass regardless of what else has downloaded (per-tensor staging)."""
+    tiny_out, _ = tiny_export
+    man = export_inkling.load_and_validate_config(TINY_CONFIG)
+    ckpt = hf_state_to_checkpoint(build_tiny_model(man).state_dict())
+    model_dir = tmp_path / "ckpt"
+    names = _write_sharded_checkpoint(model_dir, ckpt, layout="spread")
+    wm = json.loads((model_dir / "model.safetensors.index.json").read_text())["weight_map"]
+    # the layout really spreads every layer: its w13 and w2 sit in different shards, shells span all 3
+    for li in range(1, 4):
+        p = f"model.llm.layers.{li}."
+        assert wm[p + "mlp.experts.w13_weight"] != wm[p + "mlp.experts.w2_weight"]
+        assert len({wm[k] for k in wm if k.startswith(p)}) == 3
+    out = tmp_path / "export"
+    parked = {i: tmp_path / names[i] for i in (1, 2)}
+    for i in parked:
+        (model_dir / names[i]).rename(parked[i])
+
+    # shard 0 alone: nothing can be assembled (every unit needs the other shards), but every tensor
+    # of shard 0 gets staged, so the shard is consumed and deleted in this very pass
+    s1 = export_inkling.export_real(model_dir, out, skip_missing=True, delete_consumed=True, workers=2)
+    assert s1["shards_deleted"] == [names[0]] and s1["shards_consumed"] == 1
+    assert s1["pending_shards"] == [names[1], names[2]]
+    assert s1["layers_done"] == 0 and not s1["complete"]
+    assert s1["counts"]["staged"] > 0 and s1["counts"]["assembled"] == 0
+    assert s1["staged_parts"] == s1["counts"]["staged"] > 0
+    n_shard0 = sum(1 for k, v in wm.items() if v == names[0])
+    assert s1["counts"]["staged"] >= n_shard0  # w13/w2 tensors fan out into many parts
+    assert not (out / "manifest.json").exists()
+
+    # idempotent re-run with nothing new: everything already staged is skipped, no assembly
+    s1b = export_inkling.export_real(model_dir, out, skip_missing=True, delete_consumed=True, workers=2)
+    assert s1b["counts"]["staged"] == 0 and s1b["counts"]["assembled"] == 0
+    assert s1b["staged_parts"] == s1["staged_parts"] and s1b["shards_deleted"] == []
+
+    # shard 1 arrives: consumed + deleted; still nothing whole (shard 2 holds the rest)
+    parked[1].rename(model_dir / names[1])
+    s2 = export_inkling.export_real(model_dir, out, skip_missing=True, delete_consumed=True, workers=2)
+    assert s2["shards_deleted"] == [names[1]] and s2["shards_consumed"] == 2 and s2["pending_shards"] == [names[2]]
+    assert s2["counts"]["staged"] > 0 and not s2["complete"]
+    # units whose parts all sit in shards 0+1 are assembled now (2 parts -> 1 final each)
+    assert s2["staged_parts"] == s1["staged_parts"] + s2["counts"]["staged"] - 2 * s2["counts"]["assembled"]
+    assert export_inkling.layers_done_check(out, model_dir) is False
+
+    # shard 2 arrives: remaining parts staged, every unit assembled, parts gone, manifest written
+    parked[2].rename(model_dir / names[2])
+    s3 = export_inkling.export_real(model_dir, out, skip_missing=True, delete_consumed=True, workers=2)
+    assert s3["complete"] and s3["layers_done"] == 4 and s3["pending_shards"] == []
+    assert s3["shards_deleted"] == [names[2]] and s3["shards_consumed"] == 3
+    assert s2["counts"]["assembled"] + s3["counts"]["assembled"] == 2 + 4 + 1 + 3 * 10
+    assert s3["staged_parts"] == 0 and s3["counts"]["staged"] > 0
+    assert not (out / ".staging").exists() and not list(out.rglob("*.part")) and not list(out.rglob("*.tmp"))
+    assert export_inkling.layers_done_check(out, model_dir) is True
+    _assert_same_export(tiny_out, out)
 
 
 def test_layers_range_and_shards_only(tmp_path):
@@ -424,11 +499,43 @@ def test_layers_range_and_shards_only(tmp_path):
     assert not s["complete"] and s["layers_done"] == 0 and not s["embed_done"]
     assert sorted(p.name for p in (out / "experts").iterdir()) == ["layer_01", "layer_02"]
     assert not (out / "shells").exists() or not list((out / "shells").iterdir())
-    assert s["shards_deleted"] == []  # shells of layers 1-2 still need shard 1
+    assert s["shards_deleted"] == [] and s["staged_parts"] == 0  # shells of layers 1-2 still need shard 1
     assert all((model_dir / n).exists() for n in names.values())
     s = export_inkling.export_real(model_dir, out, delete_consumed=True, workers=2)
-    assert s["complete"] and s["counts"]["skipped"] == 2 * 10
+    assert s["complete"] and s["counts"]["skipped"] == 2 * 10 and s["staged_parts"] == 0
     assert sorted(s["shards_deleted"]) == sorted(names.values())
+
+
+def test_check_space_is_per_pass_and_skipped_when_streaming(tmp_path, monkeypatch):
+    man = export_inkling.load_and_validate_config(TINY_CONFIG)
+    ckpt = hf_state_to_checkpoint(build_tiny_model(man).state_dict())
+    model_dir = tmp_path / "ckpt"
+    names = _write_sharded_checkpoint(model_dir, ckpt, layout="spread")
+    out = tmp_path / "export"
+    seen = []
+    real = export_inkling.check_space
+
+    def spy(o, pass_bytes, total_bytes, enforce):
+        seen.append((pass_bytes, total_bytes, enforce))
+        return real(o, pass_bytes, total_bytes, enforce)
+
+    monkeypatch.setattr(export_inkling, "check_space", spy)
+    (model_dir / names[2]).rename(tmp_path / names[2])
+    export_inkling.export_real(model_dir, out, skip_missing=True, workers=2)
+    pb, tb, enforce = seen[-1]
+    assert not enforce and 0 < pb < tb           # streaming: estimate only, never enforced
+    export_inkling.export_real(model_dir, out, skip_missing=True, workers=2)
+    assert seen[-1][0] == 0                        # nothing new to write on a no-op re-run
+    (tmp_path / names[2]).rename(model_dir / names[2])
+    export_inkling.export_real(model_dir, out, workers=2)
+    pb, tb, enforce = seen[-1]
+    assert enforce and 0 < pb < tb                 # non-streaming: only what this pass writes
+    # an impossible pass must refuse (and the env override must lift it)
+    monkeypatch.setattr(export_inkling.shutil, "disk_usage", lambda p: type("du", (), {"free": 1})())
+    with pytest.raises(SystemExit, match="insufficient disk"):
+        export_inkling.check_space(out, 10_000, 20_000, enforce=True)
+    monkeypatch.setenv("INKLING_SKIP_SPACE_CHECK", "1")
+    export_inkling.check_space(out, 10_000, 20_000, enforce=True)
 
 
 def test_gen_fixtures_writes_spec_tensor_set(tmp_path):
