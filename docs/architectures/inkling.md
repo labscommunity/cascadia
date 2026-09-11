@@ -195,12 +195,16 @@ edge tables read from the SSD, experts mmap'd):
 | "What is the capital of France? Answer in one word." (25) — TTFT probe, cold page cache | — | 1 | 176 s |
 | same, warm | `Paris` | 4 | 33 s |
 | "What is 17 + 25? Answer with just the number." (27) | `42` | 4 | 83 s |
-| "Which ocean is the largest on Earth? One sentence." (24) | `The Pacific Ocean is the largest on Earth, covering about 63 million square` | 16 | 180 s |
+| "Which ocean is the largest on Earth? One sentence." (24) | `The Pacific Ocean is the largest on Earth, covering about 63 million square` | 16 | 174–180 s |
+| "What is the capital of Italy? One word." (25), **thinking on** (`reasoning_effort: "low"`) | `<think>The user asks for the capital of Italy, requesting one word. The answer is Rome.</think>Rome` | 25 | 205 s |
 
-A first run with thinking left on (the API's GLM effort mapping had escalated
-`"none"` to `"high"` — fixed in the same PR) produced coherent reasoning
-openings ("The user is asking for the capital of France and wants") at 12
-tokens per 256–299 s. Decode is 8–25 s/token depending on how many of a
+The thinking-on row is the special-token framing translated by the API
+(`<|content_thinking|>…<|end_message|>` → `<think>…</think>`, then the
+`<|content_text|>` answer). A first run with thinking left on by accident
+(the API's GLM effort mapping had escalated `"none"` to `"high"` — fixed in
+the same PR) produced coherent reasoning openings at 12 tokens per 256–299 s;
+with the overlapped expert reads the warmup fell from 28 s to 13 s and a
+cold 25-token prefill from 176 s to 107–155 s depending on page-cache state. Decode is 8–25 s/token depending on how many of a
 token's ~48 experts × 64 layers are already in the page cache: the routed
 experts (490 GB) page from a SATA SSD into 172 GB of RAM, so this box is a
 correctness platform, not a throughput one (next section).
