@@ -62,6 +62,43 @@ impl ExpertSet {
     }
 }
 
+/// `CASCADIA_INKLING_PIN_EXPERTS`: `mlock` every mmap'd expert as it is
+/// opened, so the whole export is wired in RAM and each GEMV runs off the
+/// mapping without page faults — the RAM-resident ("record") mode for a box
+/// whose memory holds the export (macOS in particular re-faults file-backed
+/// pages it has already cached, which costs more than the GEMV itself).
+/// Best-effort: the first expert the OS refuses to lock (`RLIMIT_MEMLOCK`,
+/// wired-memory limit) is reported once and the rest stay page-cache backed.
+pub(crate) fn pin_experts() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| super::env_flag("CASCADIA_INKLING_PIN_EXPERTS"))
+}
+
+/// [`pin_experts`] for one just-opened expert; returns the bytes wired.
+fn maybe_pin(x: &AnyExpert, what: &str) -> usize {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static FAILED: AtomicBool = AtomicBool::new(false);
+    if !pin_experts() || FAILED.load(Ordering::Relaxed) {
+        return 0;
+    }
+    match x.as_mmap() {
+        Some(m) => match m.pin() {
+            Ok(()) => m.bin_len(),
+            Err(e) => {
+                if !FAILED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[inkling] CASCADIA_INKLING_PIN_EXPERTS: mlock of {what} failed ({e}); \
+                         leaving the remaining experts to the page cache"
+                    );
+                }
+                0
+            }
+        },
+        None => 0,
+    }
+}
+
 /// Open the expert bins of MoE layer `li` that `experts` owns, as
 /// `(expert id, expert)` in ascending id order — routed ids `0..n_routed`
 /// from `expert_EEE.bin`, shared ids `n_routed + s` from
@@ -88,6 +125,7 @@ pub fn load_moe_experts(
     let (hidden, inter) = (m.hidden_size, m.moe_intermediate);
     let edir = dir.join("experts").join(format!("layer_{li:02}"));
     let mut out = Vec::new();
+    let mut wired = 0usize;
     for e in 0..m.num_experts {
         if experts.owns(e) {
             let x = load_expert_bin(
@@ -96,6 +134,7 @@ pub fn load_moe_experts(
                 inter,
                 mode,
             )?;
+            wired += maybe_pin(&x, &format!("layer {li} expert {e}"));
             out.push((e, x));
         }
     }
@@ -108,8 +147,16 @@ pub fn load_moe_experts(
                 inter,
                 mode,
             )?;
+            wired += maybe_pin(&x, &format!("layer {li} shared expert {s}"));
             out.push((id, x));
         }
+    }
+    if wired > 0 {
+        eprintln!(
+            "[inkling] layer {li}: mlock'd {} experts ({:.1} GB)",
+            out.len(),
+            wired as f64 / 1e9
+        );
     }
     Ok(out)
 }
@@ -346,6 +393,7 @@ pub fn load_layer(
     let edir = dir.join("experts").join(format!("layer_{li:02}"));
     let mlp = if m.dense_layers.contains(&li) {
         let w = load_expert_bin(&edir.join("dense.bin"), hidden, m.dense_intermediate, mode)?;
+        maybe_pin(&w, &format!("layer {li} dense MLP"));
         let gs = g("mlp.global_scale")?;
         LayerMlp::Dense(DenseMlp::new(
             w,

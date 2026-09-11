@@ -55,10 +55,16 @@ native `modeling_inkling.py` (5.16+), which is also the test oracle:
 - `moe.rs` — `MoeLayer` (routed experts + the two shared experts as separate
   `AnyExpert`s with their gammas; batch-union prefill visits each expert once)
   and `DenseMlp` (× `global_scale`). Experts reuse the glm/dsv4 int4 group-32
-  mmap kernels (AVX-512 → AVX2 → scalar dispatch). After routing, the selected
-  bins are prefetched and read concurrently (glm's overlapped path) instead of
-  page-faulting one at a time inside their GEMVs; `CASCADIA_INKLING_SEQ_READS=1`
-  restores serial reads.
+  mmap kernels (AVX-512 → AVX2 → scalar dispatch). After routing, a token's
+  routed + shared experts run **concurrently** (each GEMV row-parallel on its
+  own; the sum stays in gate order, so the result is bit-identical to a serial
+  visit — `CASCADIA_INKLING_SERIAL_EXPERTS=1` restores that schedule), and the
+  prefill block visits its unique experts the same way. An expert's bin is
+  streamed whole into an owned buffer first (glm's overlapped read) only when
+  its pages are **not** resident (a 64-page `mincore` sample per token);
+  a resident expert is computed straight off the mapping, where the copy
+  would cost ~2× (miner, warm: 28 → 14 ms per MoE layer).
+  `CASCADIA_INKLING_SEQ_READS=1` forces the direct path everywhere.
 - `model.rs` — `Layer` (pre-norm → attention → attn conv → residual; post-norm →
   MLP → mlp conv → residual), `Model` (embed → embed RMSNorm → layers → norm →
   `/ logits_mup_width_multiplier` → unembed → slice to `unpadded_vocab_size`).
@@ -226,8 +232,18 @@ cascadia worker --rank 0 --total 2 --engine sparse-moe --model /data/inkling-int
 
 Knobs: `CASCADIA_INKLING_MAX_SEQ` (global-layer KV rows; default 4096 — the
 sliding layers' rings are fixed at 512 + 32) and `CASCADIA_INKLING_EXPERTS=eager|mmap`
-(default mmap for real-sized expert sets); in-process hosts set the same two
-through `SparseMoEBuilderConfig::{max_seq, experts_mode}`.
+(default mmap for real-sized expert sets; `eager` is the dequantised dev
+path — 4× the bytes, measured 2.5× slower per layer than a page-cache-resident
+mmap, so it is not the "resident" mode); in-process hosts set the same two
+through `SparseMoEBuilderConfig::{max_seq, experts_mode}`. Schedule knobs,
+both bit-identical either way: `CASCADIA_INKLING_SERIAL_EXPERTS=1` (visit a
+token's experts one after another) and `CASCADIA_INKLING_SEQ_READS=1` (never
+copy a paged-out expert's bin before its GEMV). `CASCADIA_INKLING_PIN_EXPERTS=1`
+is the RAM-resident mode: every expert bin (and the dense MLPs) is `mlock`'d
+as it is opened, so the export is wired in memory and the GEMVs never fault —
+for a box whose RAM holds the export (512 GB int4), on macOS in particular,
+which re-faults cached file pages on every touch. Best-effort: the first
+refused lock is reported and the rest stay page-cache backed.
 
 ## Sizing and the hardware honesty note
 
