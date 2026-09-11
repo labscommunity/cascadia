@@ -1321,53 +1321,77 @@ fn render_or_fallback(
         }
         return Ok(render_prompt_legacy(messages));
     };
-    let mut first = render_with_chat_env(
-        env,
-        messages,
-        bos_token,
-        eos_token,
-        enable_thinking,
-        reasoning_effort,
-        tools,
-    );
-    // The API maps OpenAI's effort words onto GLM's high/max vocabulary and
-    // passes one on every thinking request. Templates with a different
-    // vocabulary reject it with raise_exception — Qwen3.8's accepts only
-    // xhigh/medium/low and `default('xhigh')`s the undefined case — which
-    // turned every default chat request into a 400. When the rejection names
-    // the effort, render again once: with the caller's own word if it differs
-    // from the mapping (a template with a low/medium scale honours it
-    // directly), otherwise with the effort undefined so the template's own
-    // default applies. Only the API's own word is discarded that way. A
-    // distinct word the caller chose and the template rejected stays a
-    // rejection (the 400 below) — serving it at the template's default would
-    // silently drop a parameter the caller believed had taken effect.
+    // Which `reasoning_effort` the template sees, in order of preference:
+    //
+    // 1. `"none"` when thinking is off and the caller set no effort — templates
+    //    that switch thinking through the effort itself (Inkling: "Thinking
+    //    effort level: 0") need it; templates that reject the word fall
+    //    through, with `enable_thinking=false` doing the work as before.
+    // 2. The caller's own word. A template with its own scale (Inkling's
+    //    none/minimal/low/medium/high/max, Qwen3.8's xhigh/medium/low) honours
+    //    it as meant; the GLM mapping below would silently escalate "none" or
+    //    "low" to "high". A word the caller chose that the template rejects
+    //    stays a rejection (the 400 below) — serving it at some other level
+    //    would drop a parameter the caller believed had taken effect.
+    // 3. The API's mapped word (OpenAI vocabulary onto GLM's high/max): what
+    //    every thinking request carried before, and the value templates on
+    //    that vocabulary accept.
+    // 4. Undefined, so the template's own default applies (Qwen3.8's
+    //    `default('xhigh')`) when it rejected the API's own words.
+    //
+    // Only steps 1, 3 and 4 are the API's words to discard.
     //
     // Substring match, coupled to the templates' `raise_exception` prose:
-    // Qwen3.8 says "Unexpected reasoning effort ...", and the underscore
-    // spelling covers a template that names the parameter instead.
+    // Qwen3.8 says "Unexpected reasoning effort ...", Inkling "Unknown
+    // reasoning_effort: ...", and the underscore spelling covers a template
+    // that names the parameter instead.
     let rejects_effort = |r: &Result<String, PromptRenderError>| {
         matches!(r, Err(PromptRenderError::Rejected(m)) if {
             let m = m.to_ascii_lowercase();
             m.contains("reasoning effort") || m.contains("reasoning_effort")
         })
     };
-    if reasoning_effort.is_some() && rejects_effort(&first) {
-        let retry = raw_effort.filter(|r| Some(*r) != reasoning_effort);
-        tracing::info!(
-            mapped = ?reasoning_effort,
-            retry = ?retry,
-            "chat_template rejected the mapped reasoning_effort; rendering again"
-        );
+    let mut order: Vec<Option<&str>> = Vec::with_capacity(4);
+    if !enable_thinking && raw_effort.is_none() {
+        order.push(Some("none"));
+    }
+    if let Some(raw) = raw_effort {
+        if !order.contains(&Some(raw)) {
+            order.push(Some(raw));
+        }
+    }
+    if let Some(mapped) = reasoning_effort {
+        if !order.contains(&Some(mapped)) {
+            order.push(Some(mapped));
+        }
+    }
+    order.push(None);
+    let mut first = Err(PromptRenderError::Failed("no render attempted".into()));
+    for (i, candidate) in order.iter().enumerate() {
         first = render_with_chat_env(
             env,
             messages,
             bos_token,
             eos_token,
             enable_thinking,
-            retry,
+            *candidate,
             tools,
         );
+        if !rejects_effort(&first) {
+            break;
+        }
+        // The caller's own word was rejected: that is their 400 to see — unless
+        // it is also the API's mapped word, which is the API's to discard.
+        if raw_effort.is_some() && *candidate == raw_effort && *candidate != reasoning_effort {
+            break;
+        }
+        if i + 1 < order.len() {
+            tracing::info!(
+                rejected = ?candidate,
+                next = ?order[i + 1],
+                "chat_template rejected a reasoning_effort word; rendering again"
+            );
+        }
     }
     match first {
         Ok(s) => Ok(s),
@@ -4656,6 +4680,36 @@ mod tests {
             "[{\"description\":\"d\",\"name\":\"get_weather\",\"parameters\":{\"a\":[2,3],\"b\":1},\"type\":\"function\"}]\
 |{\"a\": 2, \"b\": 1}"
         );
+    }
+
+    /// Inkling's template turns the effort word into a numeric level and
+    /// switches thinking off at 0: the caller's own word must reach it
+    /// (the GLM mapping would send "none" as "high"), thinking-off with no
+    /// effort must render level 0, and an omitted effort keeps the mapped
+    /// default.
+    #[test]
+    fn effort_word_reaches_a_template_with_its_own_scale() {
+        const T: &str = "{%- set effort_map = {\"none\": 0.0, \"minimal\": 0.1, \"low\": 0.2, \"medium\": 0.7, \"high\": 0.9, \"max\": 0.99} -%}\
+{%- set eff = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else \"high\" -%}\
+{%- if eff not in effort_map -%}{{ raise_exception(\"Unknown reasoning_effort: \" ~ eff) }}{%- endif -%}\
+level={{ effort_map[eff] }}";
+        let env = build_chat_env(T).unwrap();
+        let msgs = [msg("user", "hi")];
+        let r = |thinking: bool, mapped: Option<&str>, raw: Option<&str>| {
+            render_or_fallback(Some(&env), &msgs, "", "", thinking, mapped, raw, None)
+        };
+        // caller said "none": honoured, not escalated to the mapped "high"
+        assert_eq!(r(false, Some("high"), Some("none")).unwrap(), "level=0.0");
+        assert_eq!(r(true, Some("high"), Some("low")).unwrap(), "level=0.2");
+        // thinking off, no effort given: level 0
+        assert_eq!(r(false, Some("high"), None).unwrap(), "level=0.0");
+        // omitted effort, thinking on: the mapped default
+        assert_eq!(r(true, Some("high"), None).unwrap(), "level=0.9");
+        // a caller word the template rejects is the caller's 400
+        assert!(matches!(
+            r(true, Some("high"), Some("bogus")),
+            Err(PromptRenderError::Rejected(_))
+        ));
     }
 
     #[test]
