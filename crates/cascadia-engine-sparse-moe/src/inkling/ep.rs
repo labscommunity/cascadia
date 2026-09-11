@@ -486,9 +486,10 @@ impl ExpertBank {
         for &id in &unique {
             table[&id].prefetch();
         }
-        // Decode (one row): the concurrent whole-bin reads of
-        // `MoeLayer::forward`; a batch computes straight off the mmap like
-        // `forward_batch` (each expert's pages are touched once per frame).
+        // Decode (one row): `MoeLayer::forward`'s reads — a paged-out expert
+        // is streamed whole, concurrently; a resident one is computed straight
+        // off the mmap. A batch computes off the mmap like `forward_batch`
+        // (each expert's pages are touched once per frame).
         let bufs: HashMap<usize, Vec<u8>> =
             if rows == 1 && !seq_reads() && unique.iter().any(|id| table[id].as_mmap().is_some()) {
                 unique
@@ -496,6 +497,7 @@ impl ExpertBank {
                     .filter_map(|&id| {
                         table[&id]
                             .as_mmap()
+                            .filter(|m| !m.mostly_resident())
                             .and_then(|m| m.read_bytes().ok())
                             .map(|buf| (id, buf))
                     })

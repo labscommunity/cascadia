@@ -48,10 +48,11 @@ use super::ffn::AnyExpert;
 use super::gate::{inkling_gate, GateOut};
 use crate::dsv4::math::linear_f32;
 
-/// `CASCADIA_INKLING_SEQ_READS`: serial expert reads (fault each mmap'd
-/// expert's pages in during its own GEMV) instead of the concurrent
-/// whole-bin reads. Read once. Shared with the expert worker
-/// ([`super::ep::ExpertBank`]), which mirrors the decode read path.
+/// `CASCADIA_INKLING_SEQ_READS`: always compute straight off an mmap'd
+/// expert (fault its pages in during its own GEMV) instead of the bulk
+/// whole-bin read a paged-out expert gets by default. Read once. Shared
+/// with the expert worker ([`super::ep::ExpertBank`]), which mirrors the
+/// decode read path.
 pub(crate) fn seq_reads() -> bool {
     use std::sync::OnceLock;
     static E: OnceLock<bool> = OnceLock::new();
@@ -273,13 +274,19 @@ impl MoeLayer {
         for e in &sel {
             e.prefetch();
         }
-        // Overlapped reads: the mmap'd experts' whole bins, concurrently, into
-        // owned buffers the GEMVs then run from (bit-identical to the mmap).
+        // Overlapped reads: an mmap'd expert that is paged out is streamed
+        // whole, concurrently with the others, into an owned buffer its GEMV
+        // then runs from (bit-identical to the mmap). One already resident
+        // is computed straight off the mapping — the copy would only cost.
         let bufs: Vec<Option<Vec<u8>>> =
             if !seq_reads() && sel.iter().any(|e| e.as_mmap().is_some()) {
                 use rayon::prelude::*;
                 sel.par_iter()
-                    .map(|e| e.as_mmap().and_then(|m| m.read_bytes().ok()))
+                    .map(|e| {
+                        e.as_mmap()
+                            .filter(|m| !m.mostly_resident())
+                            .and_then(|m| m.read_bytes().ok())
+                    })
                     .collect()
             } else {
                 vec![None; sel.len()]
