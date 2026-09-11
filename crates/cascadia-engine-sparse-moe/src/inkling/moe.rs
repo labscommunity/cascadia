@@ -58,6 +58,16 @@ pub(crate) fn seq_reads() -> bool {
     *E.get_or_init(|| env_flag("CASCADIA_INKLING_SEQ_READS"))
 }
 
+/// `CASCADIA_INKLING_SERIAL_EXPERTS`: run a token's selected experts one
+/// after another (each GEMV row-parallel on its own) instead of
+/// concurrently. Same values either way; only the schedule differs. Read
+/// once.
+pub(crate) fn par_experts() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| !env_flag("CASCADIA_INKLING_SERIAL_EXPERTS"))
+}
+
 /// Router + expert weights of one MoE layer.
 pub struct MoeWeights {
     /// `mlp.gate.weight` `[n_routed + n_shared, hidden]`, f32 (logits are not
@@ -274,27 +284,27 @@ impl MoeLayer {
             } else {
                 vec![None; sel.len()]
             };
+        // The selected experts' FFNs run concurrently (each GEMV is itself
+        // row-parallel; rayon's work stealing nests them). Every y_j is the
+        // same value the serial loop produced, and the accumulation below
+        // keeps gate order, so the result is bit-identical.
+        let ffn = |(e, buf): (&&AnyExpert, &Option<Vec<u8>>)| match (buf, e.as_mmap()) {
+            (Some(b), Some(m)) => m.swiglu_from(b, x),
+            _ => e.forward(x, self.hidden, self.inter),
+        };
+        let ys: Vec<Vec<f32>> = if par_experts() {
+            use rayon::prelude::*;
+            sel.par_iter().zip(bufs.par_iter()).map(ffn).collect()
+        } else {
+            sel.iter().zip(bufs.iter()).map(ffn).collect()
+        };
         let mut out = vec![0.0f32; self.hidden];
-        for ((e, buf), &wj) in sel.iter().zip(&bufs).zip(weights) {
-            let y = match (buf, e.as_mmap()) {
-                (Some(b), Some(m)) => m.swiglu_from(b, x),
-                _ => e.forward(x, self.hidden, self.inter),
-            };
-            for (o, &yi) in out.iter_mut().zip(&y) {
+        for (y, &wj) in ys.iter().zip(weights) {
+            for (o, &yi) in out.iter_mut().zip(y) {
                 *o += wj * yi;
             }
         }
         out
-    }
-
-    /// `out += Σ_s γ_s · S_s(x)` — the shared experts, in order.
-    fn add_shared(&self, x: &[f32], gammas: &[f32], out: &mut [f32]) {
-        for (s, &g) in self.w.shared.iter().zip(gammas) {
-            let y = s.forward(x, self.hidden, self.inter);
-            for (o, &yi) in out.iter_mut().zip(&y) {
-                *o += g * yi;
-            }
-        }
     }
 
     /// Batch-union MoE for `rows` tokens (`xs` is `[rows, hidden]`), returning
@@ -354,20 +364,56 @@ impl MoeLayer {
             s.prefetch();
         }
 
-        // 3. One visit per unique routed expert, its rows hot.
+        // 3. One visit per unique routed expert, its rows hot. The experts
+        //    run concurrently; each computes its rows back to back, so an
+        //    mmap'd expert's int4 pages are still faulted in once.
         let mut ey = vec![0.0f32; nblk * k * hidden];
-        for (e, slots) in occ.iter().enumerate() {
+        let visit = |(e, slots): (usize, &Vec<usize>)| {
+            let mut ys = Vec::with_capacity(slots.len() * hidden);
             for &s in slots {
                 let br = s / k;
                 let x = &xs[(lo + br) * hidden..(lo + br + 1) * hidden];
-                let y = self.w.experts[e].forward(x, hidden, self.inter);
-                ey[s * hidden..(s + 1) * hidden].copy_from_slice(&y);
+                ys.extend_from_slice(&self.w.experts[e].forward(x, hidden, self.inter));
+            }
+            (e, ys)
+        };
+        let visits: Vec<(usize, Vec<f32>)> = if par_experts() {
+            use rayon::prelude::*;
+            occ.par_iter()
+                .enumerate()
+                .filter(|(_, slots)| !slots.is_empty())
+                .map(visit)
+                .collect()
+        } else {
+            occ.iter()
+                .enumerate()
+                .filter(|(_, slots)| !slots.is_empty())
+                .map(visit)
+                .collect()
+        };
+        for (e, ys) in visits {
+            for (i, &s) in occ[e].iter().enumerate() {
+                ey[s * hidden..(s + 1) * hidden].copy_from_slice(&ys[i * hidden..(i + 1) * hidden]);
             }
         }
+        // The shared experts per row (S_s(x_row), in s order).
+        let shared_row = |br: usize| -> Vec<Vec<f32>> {
+            let x = &xs[(lo + br) * hidden..(lo + br + 1) * hidden];
+            self.w
+                .shared
+                .iter()
+                .map(|s| s.forward(x, hidden, self.inter))
+                .collect()
+        };
+        let shared_y: Vec<Vec<Vec<f32>>> = if par_experts() {
+            use rayon::prelude::*;
+            (0..nblk).into_par_iter().map(shared_row).collect()
+        } else {
+            (0..nblk).map(shared_row).collect()
+        };
 
         // 4. Per row: routed in gate order, then shared — forward()'s op order.
         for br in 0..nblk {
-            let x = &xs[(lo + br) * hidden..(lo + br + 1) * hidden];
             let o = &mut out[(lo + br) * hidden..(lo + br + 1) * hidden];
             for slot in 0..k {
                 let s = br * k + slot;
@@ -376,7 +422,12 @@ impl MoeLayer {
                     *oo += wj * yi;
                 }
             }
-            self.add_shared(x, &gammas[br * self.n_shared..(br + 1) * self.n_shared], o);
+            let g = &gammas[br * self.n_shared..(br + 1) * self.n_shared];
+            for (y, &gs) in shared_y[br].iter().zip(g) {
+                for (oo, &yi) in o.iter_mut().zip(y) {
+                    *oo += gs * yi;
+                }
+            }
         }
     }
 }
