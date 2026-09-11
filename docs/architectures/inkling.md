@@ -55,7 +55,10 @@ native `modeling_inkling.py` (5.16+), which is also the test oracle:
 - `moe.rs` — `MoeLayer` (routed experts + the two shared experts as separate
   `AnyExpert`s with their gammas; batch-union prefill visits each expert once)
   and `DenseMlp` (× `global_scale`). Experts reuse the glm/dsv4 int4 group-32
-  mmap kernels (AVX-512 → AVX2 → scalar dispatch).
+  mmap kernels (AVX-512 → AVX2 → scalar dispatch). After routing, the selected
+  bins are prefetched and read concurrently (glm's overlapped path) instead of
+  page-faulting one at a time inside their GEMVs; `CASCADIA_INKLING_SEQ_READS=1`
+  restores serial reads.
 - `model.rs` — `Layer` (pre-norm → attention → attn conv → residual; post-norm →
   MLP → mlp conv → residual), `Model` (embed → embed RMSNorm → layers → norm →
   `/ logits_mup_width_multiplier` → unembed → slice to `unpadded_vocab_size`).
@@ -64,8 +67,26 @@ native `modeling_inkling.py` (5.16+), which is also the test oracle:
   the generic `PipelineEngine` drives across N ranks.
 
 Every piece of sequence state (KV rings, four conv histories per layer)
-supports `reset`, `truncate` (speculative-decode rewind; `DEFAULT_REWIND = 32`
-rows of slack on the sliding rings) and `snapshot`/`restore` (prefix cache).
+supports `reset` (O(1): every position read is below `len` and was written
+since the last reset or restore), `truncate` (speculative-decode rewind;
+`DEFAULT_REWIND = 32` rows of slack on the sliding rings, bounded against a
+write high-water mark so consecutive rewinds cannot creep past it) and
+`snapshot`/`restore` (prefix cache).
+
+**Serving through the API.** Inkling frames its output with *special* tokens
+(`<|message_model|>`, `<|content_thinking|>`, `<|content_text|>`,
+`<|content_invoke_tool_json|>`, `<|end_message|>`) that engines strip when
+decoding. `cascadia-api` reads the marker ids off each chunk
+(`MarkerDialect`, ids from `tokenizer_config.json`) and re-inserts the
+textual delimiters every other served template uses — `<think>…</think>`
+around the scratchpad and a Hermes `<tool_call>{"name","arguments"}</tool_call>`
+for tool calls — in the non-streaming and streaming paths. The chat template
+turns `reasoning_effort` into a numeric thinking level (`none` = 0 switches
+thinking off, `high` = 0.9 is the default); the API probes at load that the
+template distinguishes the OpenAI words and passes the caller's own word
+through (an explicit `enable_thinking: true` beats a `none`). Its tool
+declarations render with `tojson(sort_keys=true, separators=(",", ":"))`,
+which the API's Python-compatible `tojson` honours.
 
 ## Export layout (`tools/export_inkling.py`)
 
@@ -92,12 +113,17 @@ stripped. The fused `w13` tensors interleave gate/up rows (row `2i` = gate,
 Modes: `--validate config.json` (contract check, prints the derived manifest),
 `--tiny OUT` (synthetic tiny model built with transformers' own
 `InklingForCausalLM`, exported, plus `reference.json` = HF's greedy tokens on
-the int4-dequantised weights), `--model DIR --out OUT` for a checkpoint. The
-real export streams: `--skip-missing-shards` processes whatever shards have
-downloaded, `--delete-consumed-shards` frees a shard once every tensor it holds
-is written, re-runs are idempotent (per-tensor temp-then-rename, per-layer done
-markers), `--layers-done-check` asserts completeness. That is how the 1.9 TB
-checkpoint is converted on a box with 900 GB of scratch.
+the int4-dequantised weights; refuses to wipe a directory that is not its own
+unless `--force`), `--model DIR --out OUT` for a checkpoint. The real export
+streams: `--skip-missing-shards` processes whatever shards have downloaded,
+every tensor is converted the moment its shard is readable (a layer's tensors
+span shards 1..108, so per-unit consumption would need ~1.5 TB resident), a
+unit whose shards are all present is written once directly while one with a
+pending shard is staged and assembled later, `--delete-consumed-shards` frees
+a shard once every tensor it holds is converted, re-runs are idempotent
+(temp-then-rename, done markers), `--layers-done-check` asserts completeness.
+That is how the 1.9 TB checkpoint is converted on a box with 900 GB of
+scratch.
 
 ## Validation
 
@@ -106,7 +132,10 @@ Tier 1–4 of the family test ladder (all synthetic, no downloads, `cargo test
 
 1. **Primitive goldens vs HF** (`inkling_conv/relpos/gate/attn`): element-wise
    1e-4 on the f32 paths; attention layers (sliding layer 0, global layer 3
-   with log scaling active) within bf16 write-back tolerance.
+   with log scaling active) within bf16 write-back tolerance. The fixtures'
+   relative-position bias is load-bearing (rms |bias| / rms |q·k/D| of 1.3–2.3
+   per layer): zeroing it moves the hidden states 4–9 % of row scale against a
+   2 % tolerance and the attention goldens by 6–13 %.
 2. **Model parity** (`inkling_model`): per-layer hidden states ≤ 0.1 % of row
    scale vs HF float32 on the tiny model; 8/8 greedy ids exact.
 3. **Loader round-trip** (`inkling_loader`): `load_model` on the `--tiny` export
