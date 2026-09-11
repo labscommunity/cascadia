@@ -248,7 +248,7 @@ mod int3_tests {
 /// `[inter,hidden]`, down `[hidden,inter]`. `Eager` dequantizes to f32 (fast,
 /// tiny/dev); `Mmap` keeps it packed on disk and dequantizes rows on the fly
 /// (the only mode that fits the real model).
-fn load_expert_bin(
+pub(crate) fn load_expert_bin(
     path: &Path,
     hidden: usize,
     inter: usize,
