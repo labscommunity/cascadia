@@ -321,7 +321,47 @@ pub struct SparseMoEBuilder {
     transport: StageTransport,
 }
 
+/// The `arch` string of `<dir>/manifest.json`, read as raw JSON (the Rust-shell
+/// families each carry their own manifest schema, so the family is chosen
+/// before any strict parse).
+fn peek_arch(dir: &std::path::Path) -> Option<String> {
+    let s = std::fs::read_to_string(dir.join("manifest.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    v.get("arch").and_then(|a| a.as_str()).map(str::to_owned)
+}
+
+/// `CASCADIA_<FAMILY>_MAX_SEQ` when set to a positive integer (`=0` and junk
+/// fall through to `default`), so every family reads the knob the same way.
+fn env_max_seq(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
 impl SparseMoEBuilder {
+    /// Rank 0 (the API rank) needs the tokenizer; workers drive themselves from
+    /// the hidden states on the wire. Shared by every Rust-shell family.
+    fn load_rank0_tokenizer(&mut self, rank: u32, family: &str) -> EngineResult<()> {
+        if rank != 0 {
+            return Ok(());
+        }
+        let tok_path = self.config.model_dir.join("tokenizer.json");
+        if tok_path.exists() {
+            self.tokenizer = Some(
+                Tokenizer::from_file(&tok_path)
+                    .map_err(|e| EngineError::Backend(format!("load tokenizer.json: {e}")))?,
+            );
+        } else {
+            warn!(
+                "no tokenizer.json at {} — {family} engine will only accept pre-tokenized inputs",
+                tok_path.display()
+            );
+        }
+        Ok(())
+    }
+
     pub fn new(config: SparseMoEBuilderConfig) -> Self {
         Self {
             config,
@@ -428,23 +468,17 @@ impl Builder for SparseMoEBuilder {
         // schema, so peek the arch before the strict Manifest parse. Rust
         // shell + int4 experts; token-by-token pipeline like the M2 path
         // (ids never cross the wire — hash layers live on rank 0).
-        let is_dsv4 = std::fs::read_to_string(self.config.model_dir.join("manifest.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .map(|v| v.get("arch").and_then(|a| a.as_str()) == Some("deepseek_v4"))
-            .unwrap_or(false);
-        if is_dsv4 {
+        if peek_arch(&self.config.model_dir).as_deref() == Some("deepseek_v4") {
             let total = self.config.total.max(1);
             let rank = self.config.rank.min(total - 1);
             // Context budget sizes the rope table + KV/compressed/indexer
             // caches (memory scales with it). Overridable for long-context
             // deployments via CASCADIA_DSV4_MAX_SEQ; fall back to the default on
             // a missing, unparseable, or zero value.
-            let max_seq = std::env::var("CASCADIA_DSV4_MAX_SEQ")
-                .ok()
-                .and_then(|s| s.trim().parse::<usize>().ok())
-                .filter(|&n| n > 0)
-                .unwrap_or(crate::dsv4::stage::DSV4_DEFAULT_MAX_SEQ);
+            let max_seq = env_max_seq(
+                "CASCADIA_DSV4_MAX_SEQ",
+                crate::dsv4::stage::DSV4_DEFAULT_MAX_SEQ,
+            );
             if max_seq > 131072 {
                 warn!(
                     max_seq,
@@ -460,20 +494,7 @@ impl Builder for SparseMoEBuilder {
                 shard.layer_end,
             )
             .map_err(|e| EngineError::Backend(format!("dsv4 load: {e}")))?;
-            if rank == 0 {
-                let tok_path = self.config.model_dir.join("tokenizer.json");
-                if tok_path.exists() {
-                    self.tokenizer =
-                        Some(Tokenizer::from_file(&tok_path).map_err(|e| {
-                            EngineError::Backend(format!("load tokenizer.json: {e}"))
-                        })?);
-                } else {
-                    warn!(
-                        "no tokenizer.json at {} — dsv4 engine will only accept pre-tokenized inputs",
-                        tok_path.display()
-                    );
-                }
-            }
+            self.load_rank0_tokenizer(rank, "dsv4")?;
             self.dsv4_runner = Some(runner);
             return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
                 "loaded DeepSeek-V4 stage (dsv4 Rust shell)",
@@ -484,24 +505,16 @@ impl Builder for SparseMoEBuilder {
         // + short-conv shells, int4 mmap experts, on the same staged pipeline as
         // glm5. Its manifest schema differs from the strict Manifest, so peek the
         // arch first.
-        let is_inkling = std::fs::read_to_string(self.config.model_dir.join("manifest.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .map(|v| v.get("arch").and_then(|a| a.as_str()) == Some("inkling"))
-            .unwrap_or(false);
-        if is_inkling {
+        let arch = peek_arch(&self.config.model_dir);
+        if arch.as_deref() == Some("inkling") {
             let total = self.config.total.max(1);
             let rank = self.config.rank.min(total - 1);
-            let max_seq = self
-                .config
-                .max_seq
-                .or_else(|| {
-                    std::env::var("CASCADIA_INKLING_MAX_SEQ")
-                        .ok()
-                        .and_then(|s| s.trim().parse::<usize>().ok())
-                        .filter(|&n| n > 0)
-                })
-                .unwrap_or(crate::inkling::stage::INKLING_DEFAULT_MAX_SEQ);
+            let max_seq = self.config.max_seq.unwrap_or_else(|| {
+                env_max_seq(
+                    "CASCADIA_INKLING_MAX_SEQ",
+                    crate::inkling::stage::INKLING_DEFAULT_MAX_SEQ,
+                )
+            });
             let runner = crate::inkling::stage::InklingRunner::load_staged(
                 &self.config.model_dir,
                 max_seq,
@@ -512,20 +525,7 @@ impl Builder for SparseMoEBuilder {
                 self.config.experts_mode.clone(),
             )
             .map_err(|e| EngineError::Backend(format!("inkling load: {e}")))?;
-            if rank == 0 {
-                let tok_path = self.config.model_dir.join("tokenizer.json");
-                if tok_path.exists() {
-                    self.tokenizer =
-                        Some(Tokenizer::from_file(&tok_path).map_err(|e| {
-                            EngineError::Backend(format!("load tokenizer.json: {e}"))
-                        })?);
-                } else {
-                    warn!(
-                        "no tokenizer.json at {} — inkling engine will only accept pre-tokenized inputs",
-                        tok_path.display()
-                    );
-                }
-            }
+            self.load_rank0_tokenizer(rank, "inkling")?;
             self.inkling_runner = Some(runner);
             return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
                 "loaded inkling stage (Inkling Rust shell)",
@@ -536,26 +536,15 @@ impl Builder for SparseMoEBuilder {
         // strict Manifest, so peek the arch first. Rust MLA+DSA shell + int4
         // experts; 1x-width hidden on the same dist wire (no HC copies, no
         // input_ids past rank 0).
-        let is_glm = std::fs::read_to_string(self.config.model_dir.join("manifest.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .map(|v| v.get("arch").and_then(|a| a.as_str()) == Some("glm5"))
-            .unwrap_or(false);
-        if is_glm {
+        if arch.as_deref() == Some("glm5") {
             let total = self.config.total.max(1);
             let rank = self.config.rank.min(total - 1);
-            let max_seq = self
-                .config
-                .max_seq
-                .or_else(|| {
-                    std::env::var("CASCADIA_GLM5_MAX_SEQ")
-                        .ok()
-                        .and_then(|s| s.trim().parse::<usize>().ok())
-                        // `=0` keeps meaning "fall through to the default",
-                        // not "zero context".
-                        .filter(|&n| n > 0)
-                })
-                .unwrap_or(crate::glm::stage::GLM5_DEFAULT_MAX_SEQ);
+            let max_seq = self.config.max_seq.unwrap_or_else(|| {
+                env_max_seq(
+                    "CASCADIA_GLM5_MAX_SEQ",
+                    crate::glm::stage::GLM5_DEFAULT_MAX_SEQ,
+                )
+            });
             let runner = crate::glm::stage::GlmRunner::load_staged(
                 &self.config.model_dir,
                 max_seq,
@@ -574,20 +563,7 @@ impl Builder for SparseMoEBuilder {
                 ),
             )
             .map_err(|e| EngineError::Backend(format!("glm5 load: {e}")))?;
-            if rank == 0 {
-                let tok_path = self.config.model_dir.join("tokenizer.json");
-                if tok_path.exists() {
-                    self.tokenizer =
-                        Some(Tokenizer::from_file(&tok_path).map_err(|e| {
-                            EngineError::Backend(format!("load tokenizer.json: {e}"))
-                        })?);
-                } else {
-                    warn!(
-                        "no tokenizer.json at {} — glm5 engine will only accept pre-tokenized inputs",
-                        tok_path.display()
-                    );
-                }
-            }
+            self.load_rank0_tokenizer(rank, "glm5")?;
             self.glm_runner = Some(runner);
             return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
                 "loaded glm5 stage (glm5 Rust shell)",
