@@ -13,10 +13,36 @@
 //! only difference — well inside the fixture tolerance).
 //!
 //! Dense (`dense_layers`): `down(silu(gate·x) · up·x) · mlp.global_scale`.
+//!
+//! Expert I/O (the mmap'd real model): after routing, every expert the token
+//! touches — the `top_k` routed plus both shared — is prefetched
+//! (`madvise(WILLNEED)` / `PrefetchVirtualMemory`) and then read whole,
+//! concurrently (rayon over the selection, one sequential `read` per bin), and
+//! the GEMVs run from those buffers — glm's light-R1 path
+//! ([`MmapExpert::read_bytes`](crate::dsv4::expert_mmap::MmapExpert::read_bytes)
+//! → `swiglu_from`). The bytes are the mmap's bytes and the kernel is the
+//! same, so the output is bit-identical to faulting the pages in mid-GEMV one
+//! expert at a time; only the disk sees the difference (8 experts in flight
+//! instead of one). `CASCADIA_INKLING_SEQ_READS=1` restores the serial
+//! fault-on-touch behaviour (the family's escape hatch; glm's
+//! `CASCADIA_GLM5_R1READ` is the same switch with the opposite default). The
+//! batch-union prefill prefetches every expert with rows before its expert
+//! pass and computes from the mmap (each expert's pages are touched once per
+//! block anyway).
 
+use super::env_flag;
 use super::ffn::AnyExpert;
 use super::gate::{inkling_gate, GateOut};
 use crate::dsv4::math::linear_f32;
+
+/// `CASCADIA_INKLING_SEQ_READS`: serial expert reads (fault each mmap'd
+/// expert's pages in during its own GEMV) instead of the concurrent
+/// whole-bin reads. Read once.
+fn seq_reads() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| env_flag("CASCADIA_INKLING_SEQ_READS"))
+}
 
 /// Router + expert weights of one MoE layer.
 pub struct MoeWeights {
@@ -77,20 +103,6 @@ impl MoeLayer {
         }
     }
 
-    /// The routed experts (for pinning / prefetch enumeration).
-    pub fn experts(&self) -> &[AnyExpert] {
-        &self.w.experts
-    }
-
-    /// The shared experts (always active — top pin candidates).
-    pub fn shared(&self) -> &[AnyExpert] {
-        &self.w.shared
-    }
-
-    pub fn global_scale(&self) -> f32 {
-        self.w.global_scale
-    }
-
     /// Route one token: router GEMV (f32) + [`inkling_gate`]. No expert
     /// compute — also the prediction hook for prefetch.
     pub fn route(&self, x: &[f32]) -> GateOut {
@@ -108,17 +120,44 @@ impl MoeLayer {
         )
     }
 
-    /// MoE for one token `x` (`[hidden]`, the mlp-normed hidden). Returns `[hidden]`.
+    /// MoE for one token `x` (`[hidden]`, the mlp-normed hidden). Returns
+    /// `[hidden]`. Routed experts accumulate in gate order, then the shared
+    /// experts — the order [`Self::forward_batch`] reproduces per row.
     pub fn forward(&self, x: &[f32]) -> Vec<f32> {
         let gate = self.route(x);
+        // Every expert this token touches, in accumulation order, with its weight.
+        let sel: Vec<&AnyExpert> = gate
+            .idx
+            .iter()
+            .map(|&e| &self.w.experts[e])
+            .chain(self.w.shared.iter())
+            .collect();
+        let weights = gate.w.iter().chain(gate.gammas.iter());
+        // Kick the OS read-ahead for all of them before any compute.
+        for e in &sel {
+            e.prefetch();
+        }
+        // Overlapped reads: the mmap'd experts' whole bins, concurrently, into
+        // owned buffers the GEMVs then run from (bit-identical to the mmap).
+        let bufs: Vec<Option<Vec<u8>>> =
+            if !seq_reads() && sel.iter().any(|e| e.as_mmap().is_some()) {
+                use rayon::prelude::*;
+                sel.par_iter()
+                    .map(|e| e.as_mmap().and_then(|m| m.read_bytes().ok()))
+                    .collect()
+            } else {
+                vec![None; sel.len()]
+            };
         let mut out = vec![0.0f32; self.hidden];
-        for (&e, &wj) in gate.idx.iter().zip(&gate.w) {
-            let y = self.w.experts[e].forward(x, self.hidden, self.inter);
+        for ((e, buf), &wj) in sel.iter().zip(&bufs).zip(weights) {
+            let y = match (buf, e.as_mmap()) {
+                (Some(b), Some(m)) => m.swiglu_from(b, x),
+                _ => e.forward(x, self.hidden, self.inter),
+            };
             for (o, &yi) in out.iter_mut().zip(&y) {
                 *o += wj * yi;
             }
         }
-        self.add_shared(x, &gate.gammas, &mut out);
         out
     }
 
@@ -170,7 +209,18 @@ impl MoeLayer {
             gammas[br * self.n_shared..(br + 1) * self.n_shared].copy_from_slice(&gate.gammas);
         }
 
-        // 2. One visit per unique routed expert, its rows hot.
+        // 2. Read-ahead for every expert this block touches (routed with
+        //    rows, plus the shared pair), so the expert pass overlaps its I/O.
+        for (e, slots) in occ.iter().enumerate() {
+            if !slots.is_empty() {
+                self.w.experts[e].prefetch();
+            }
+        }
+        for s in &self.w.shared {
+            s.prefetch();
+        }
+
+        // 3. One visit per unique routed expert, its rows hot.
         let mut ey = vec![0.0f32; nblk * k * hidden];
         for (e, slots) in occ.iter().enumerate() {
             for &s in slots {
@@ -181,7 +231,7 @@ impl MoeLayer {
             }
         }
 
-        // 3. Per row: routed in gate order, then shared — forward()'s op order.
+        // 4. Per row: routed in gate order, then shared — forward()'s op order.
         for br in 0..nblk {
             let x = &xs[(lo + br) * hidden..(lo + br + 1) * hidden];
             let o = &mut out[(lo + br) * hidden..(lo + br + 1) * hidden];

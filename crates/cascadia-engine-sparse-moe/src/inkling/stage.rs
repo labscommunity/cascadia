@@ -8,14 +8,15 @@
 use std::path::Path;
 
 use super::loader::{load_stage, read_manifest, InklingManifest};
-use super::model::{Layer, WideTable};
+use super::model::{Head, Layer, WideTable};
 use super::rmsnorm_f32;
 use crate::dsv4::loader::{ExpertsMode, LoadError};
 use crate::staged::StagedRunner;
 
 /// Default context budget for the global layers' KV caches (sliding layers
 /// keep a fixed `window + rewind` ring regardless). Override with
-/// `CASCADIA_INKLING_MAX_SEQ` or `--max-seq`.
+/// `CASCADIA_INKLING_MAX_SEQ` (or `SparseMoEBuilderConfig::max_seq` for
+/// in-process hosts).
 pub const INKLING_DEFAULT_MAX_SEQ: usize = 4096;
 
 /// Contiguous even split of `n` layers across `total` ranks.
@@ -46,11 +47,9 @@ pub fn layer_split(m: &InklingManifest, rank: u32, total: u32) -> Result<(usize,
 pub struct InklingRunner {
     embed: Option<(WideTable, Vec<f32>)>, // (table, embed_norm) on rank 0
     layers: Vec<Layer>,                   // this rank's slice
-    head: Option<(Vec<f32>, WideTable)>,  // (norm, unembed) on the last rank
+    head: Option<Head>,                   // norm / mup / unembed on the last rank
     hidden: usize,
-    unpadded_vocab: usize,
     eps: f32,
-    mup: f32,
     max_seq: usize,
     eos: Vec<u32>,
     pos: usize,
@@ -114,9 +113,7 @@ impl InklingRunner {
             layers: s.layers,
             head: s.head,
             hidden: m.hidden_size,
-            unpadded_vocab: m.unpadded_vocab(),
             eps: m.rms_norm_eps,
-            mup: m.logits_mup_width_multiplier,
             max_seq,
             eos: m.eos_token_ids.clone(),
             pos: 0,
@@ -125,15 +122,6 @@ impl InklingRunner {
             lo,
             hi,
         })
-    }
-
-    pub fn layers(&self) -> &[Layer] {
-        &self.layers
-    }
-
-    /// Current sequence position (tokens folded so far).
-    pub fn pos(&self) -> usize {
-        self.pos
     }
 }
 
@@ -200,15 +188,11 @@ impl StagedRunner for InklingRunner {
         x
     }
     fn head_logits(&self, hidden: &[f32]) -> Vec<f32> {
-        let (norm, unembed) = self.head.as_ref().expect("head_logits on a non-last rank");
-        let mut x = hidden.to_vec();
-        rmsnorm_f32(&mut x, norm, self.eps);
-        let inv = 1.0 / self.mup;
-        for v in &mut x {
-            *v *= inv;
-        }
-        let mut logits = vec![0.0f32; self.unpadded_vocab];
-        unembed.matvec_f32(&x, self.hidden, &mut logits);
-        logits
+        // The one head implementation (`Head::logits`) shared with `Model` —
+        // `x / mup`, not `x * (1 / mup)` (a 1-ULP drift at mup 24).
+        self.head
+            .as_ref()
+            .expect("head_logits on a non-last rank")
+            .logits(hidden)
     }
 }

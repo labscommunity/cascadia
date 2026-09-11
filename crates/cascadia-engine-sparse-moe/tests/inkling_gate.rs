@@ -162,3 +162,70 @@ fn golden_gate_matches_hf() {
     assert_close("gate_w", &got_w, &want_w, 1e-4, 1e-4);
     assert_close("gate_gamma", &out.gammas, &gamma_want, 1e-4, 1e-4);
 }
+
+/// A NaN logit (corrupted activation) at the real router width: the sort must
+/// not panic (`sort_by` rejects a non-total comparator) and the NaN expert
+/// must never be selected, however large its bias.
+#[test]
+fn nan_logit_is_unselectable_and_does_not_panic_at_n_256() {
+    let (n_routed, n_shared, top_k) = (256usize, 2usize, 6usize);
+    let logits: Vec<f32> = (0..n_routed + n_shared)
+        .map(|i| ((i * 37 % 101) as f32 / 50.0) - 1.0)
+        .collect();
+    let mut bias = vec![0.0f32; n_routed];
+    let nan_ids = [17usize, 0, 255, 128];
+    let mut poisoned = logits.clone();
+    for &i in &nan_ids {
+        poisoned[i] = f32::NAN;
+        bias[i] = 100.0; // would win selection outright if NaN compared
+    }
+    let out = inkling_gate(&poisoned, &bias, top_k, n_shared, 8.0, 1.0);
+    assert_eq!(out.idx.len(), top_k);
+    for &i in &nan_ids {
+        assert!(
+            !out.idx.contains(&i),
+            "NaN expert {i} selected: {:?}",
+            out.idx
+        );
+    }
+    let mut ids = out.idx.clone();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), top_k, "duplicate ids in {:?}", out.idx);
+    assert!(out.w.iter().all(|v| v.is_finite()), "weights {:?}", out.w);
+    assert!(out.gammas.iter().all(|v| v.is_finite()));
+
+    // Expected: the deterministic top-k over the remaining experts (choice
+    // DESC, ties -> lower id) with the same weights — the NaNs simply vanish.
+    let choice: Vec<f32> = logits[..n_routed]
+        .iter()
+        .zip(&bias)
+        .enumerate()
+        .map(|(i, (&l, &b))| {
+            if nan_ids.contains(&i) {
+                f32::NEG_INFINITY
+            } else {
+                sigmoid(l) + b
+            }
+        })
+        .collect();
+    let mut want: Vec<usize> = (0..n_routed).collect();
+    want.sort_by(|&a, &b| choice[b].total_cmp(&choice[a]).then(a.cmp(&b)));
+    want.truncate(top_k);
+    assert_eq!(out.idx, want);
+    let den: f32 = want.iter().map(|&i| sigmoid(logits[i])).sum::<f32>()
+        + sigmoid(logits[n_routed])
+        + sigmoid(logits[n_routed + 1]);
+    let want_w: Vec<f32> = want
+        .iter()
+        .map(|&i| sigmoid(logits[i]) / den * 8.0)
+        .collect();
+    assert_close("w", &out.w, &want_w, 1e-6, 1e-6);
+
+    // Every routed logit NaN: still no panic; the lowest ids are picked.
+    let all_nan: Vec<f32> = (0..n_routed + n_shared)
+        .map(|i| if i < n_routed { f32::NAN } else { 0.0 })
+        .collect();
+    let out = inkling_gate(&all_nan, &vec![0.0; n_routed], top_k, n_shared, 8.0, 1.0);
+    assert_eq!(out.idx, (0..top_k).collect::<Vec<_>>());
+}

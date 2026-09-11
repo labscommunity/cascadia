@@ -16,7 +16,10 @@
 //! (`e_score_correction_bias`) steers SELECTION only; the weights use the raw
 //! sigmoid scores. `torch.topk(sorted=False)` leaves the selection order
 //! unspecified, so we fix it: selection score descending, ties toward the
-//! lower id (the glm convention).
+//! lower id (the glm convention). A NaN selection score (a NaN logit — a
+//! corrupted activation) is never selected: it ranks as `-inf`, and the sort
+//! uses `f32::total_cmp` so the comparator stays a total order (`sort_by`
+//! panics on an inconsistent one).
 
 /// One token's routing: the `top_k` selected routed expert ids, their weights,
 /// and the `n_shared` shared-expert gammas — all in canonical order.
@@ -55,20 +58,23 @@ pub fn inkling_gate(
     );
 
     let scores: Vec<f32> = logits.iter().map(|&l| sigmoid(l)).collect();
+    // Selection score; NaN is unselectable (ranks below every finite score).
     let choice: Vec<f32> = scores[..n_routed]
         .iter()
         .zip(bias)
-        .map(|(&s, &b)| s + b)
+        .map(|(&s, &b)| {
+            let c = s + b;
+            if c.is_nan() {
+                f32::NEG_INFINITY
+            } else {
+                c
+            }
+        })
         .collect();
 
-    // Deterministic top-k: ids by choice DESC, ties -> lower id.
+    // Deterministic top-k: ids by choice DESC (total order), ties -> lower id.
     let mut order: Vec<usize> = (0..n_routed).collect();
-    order.sort_by(|&a, &b| {
-        choice[b]
-            .partial_cmp(&choice[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.cmp(&b))
-    });
+    order.sort_by(|&a, &b| choice[b].total_cmp(&choice[a]).then_with(|| a.cmp(&b)));
     order.truncate(top_k);
 
     // Shared-expert sink: selected + shared scores share one denominator.

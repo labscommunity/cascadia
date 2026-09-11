@@ -529,3 +529,126 @@ fn golden_sliding_attention_layer0_matches_hf() {
     let got = layer.forward_prefill(&x, t);
     assert_close("attn_out_sliding (layer 0)", &got, &want, 1e-2, 2e-2);
 }
+
+// ---- rewind slack is measured from the write high-water mark -------------
+
+fn slack_dims() -> AttnDims {
+    AttnDims::sliding(8, 2, 1, 4, 2, 3, 1e-6).with_rewind(4) // ring 7 rows
+}
+
+/// Two truncates whose sum exceeds the slack (each alone within it): the
+/// discarded positions have overwritten the ring rows position 14 would read.
+#[test]
+#[should_panic(expected = "rewind slack")]
+fn sliding_consecutive_truncates_cannot_creep_past_the_slack() {
+    let dims = slack_dims();
+    let mut layer = random_layer(dims.clone(), 21);
+    let h = Lcg(21).vec(20 * dims.hidden, 1.0);
+    let _ = layer.forward_prefill(&h, 20);
+    layer.truncate(17); // 3 <= 4
+    layer.truncate(14); // 6 below the high-water mark 20
+}
+
+#[test]
+fn sliding_consecutive_truncates_within_the_slack_redecode_exactly() {
+    let dims = slack_dims();
+    let hd = dims.hidden;
+    let t = 20;
+    let h = Lcg(22).vec(t * hd, 1.0);
+    let mut layer = random_layer(dims.clone(), 22);
+    let full = layer.forward_prefill(&h, t);
+    layer.truncate(19);
+    let _ = layer.forward_token(&h[19 * hd..20 * hd]); // hwm stays 20
+    layer.truncate(18);
+    layer.truncate(16); // 4 below the high-water mark: exactly the slack
+    let redo = layer.forward_prefill(&h[16 * hd..], t - 16);
+    assert_eq!(
+        redo,
+        full[16 * hd..].to_vec(),
+        "decode after two truncates must equal the uninterrupted sequence"
+    );
+}
+
+#[test]
+fn sliding_truncate_snapshot_restore_truncate_within_the_slack_is_exact() {
+    let dims = slack_dims();
+    let hd = dims.hidden;
+    let t = 20;
+    let h = Lcg(23).vec(t * hd, 1.0);
+    let mut layer = random_layer(dims.clone(), 23);
+    let full = layer.forward_prefill(&h, t);
+    layer.truncate(18);
+    let snap = layer.snapshot();
+    assert_eq!(snap.len(), 18);
+
+    // Into a fresh layer: the rest of the slack below the ORIGINAL high-water
+    // mark 20 is still usable ...
+    let mut fresh = random_layer(dims.clone(), 23);
+    fresh.restore(&snap);
+    fresh.truncate(16);
+    let redo = fresh.forward_prefill(&h[16 * hd..], t - 16);
+    assert_eq!(redo, full[16 * hd..].to_vec(), "fresh layer after restore");
+
+    // ... and back into the same layer after a reset.
+    layer.reset();
+    layer.restore(&snap);
+    layer.truncate(16);
+    let redo = layer.forward_prefill(&h[16 * hd..], t - 16);
+    assert_eq!(
+        redo,
+        full[16 * hd..].to_vec(),
+        "same layer after reset+restore"
+    );
+}
+
+#[test]
+#[should_panic(expected = "rewind slack")]
+fn sliding_truncate_snapshot_restore_truncate_beyond_the_slack_panics() {
+    let dims = slack_dims();
+    let t = 20;
+    let h = Lcg(26).vec(t * dims.hidden, 1.0);
+    let mut layer = random_layer(dims.clone(), 26);
+    let _ = layer.forward_prefill(&h, t);
+    layer.truncate(18);
+    let snap = layer.snapshot();
+    let mut fresh = random_layer(dims.clone(), 26);
+    fresh.restore(&snap);
+    fresh.truncate(15); // 5 below the original high-water mark 20 (slack 4)
+}
+
+// ---- O(1) reset ----------------------------------------------------------
+
+/// `reset` no longer zeroes the KV rows or the conv rings: attention reads only
+/// rows written since the reset, so a previous (ring-wrapping, then truncated)
+/// sequence must be invisible — bit-identical to a fresh layer, sliding and
+/// global alike.
+#[test]
+fn reset_then_decode_is_bit_identical_to_a_fresh_layer() {
+    for dims in parity_dims() {
+        let hd = dims.hidden;
+        let a = Lcg(24).vec(25 * hd, 1.0);
+        let b = Lcg(25).vec(9 * hd, 1.0);
+        let mut layer = random_layer(dims.clone(), 24);
+        let _ = layer.forward_prefill(&a, 25);
+        layer.truncate(23);
+        layer.reset();
+        assert_eq!(layer.len(), 0);
+        let got = layer.forward_prefill(&b, 9);
+        let mut fresh = random_layer(dims.clone(), 24);
+        assert_eq!(
+            got,
+            fresh.forward_prefill(&b, 9),
+            "window {:?}: reset must hide the previous sequence",
+            dims.window
+        );
+        // A rewind right after the reset behaves like a fresh layer's too.
+        layer.truncate(7);
+        fresh.truncate(7);
+        assert_eq!(
+            layer.forward_prefill(&b[7 * hd..], 2),
+            fresh.forward_prefill(&b[7 * hd..], 2),
+            "window {:?}: rewind after reset",
+            dims.window
+        );
+    }
+}

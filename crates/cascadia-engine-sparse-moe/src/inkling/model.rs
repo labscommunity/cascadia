@@ -17,7 +17,6 @@
 
 use super::attn::{AttentionLayer, AttnKv};
 use super::conv::{ConvState, ShortConv};
-use super::ffn::AnyExpert;
 use super::moe::{DenseMlp, MoeLayer};
 use super::rmsnorm_f32;
 use crate::dsv4::math::{dot, dot_bf16w};
@@ -96,37 +95,12 @@ impl Layer {
         }
     }
 
-    pub fn attn(&self) -> &AttentionLayer {
-        &self.attn
-    }
-
-    /// This layer's MoE block, if sparse (for pin / prefetch machinery).
+    /// This layer's MoE block, if sparse.
     pub fn moe(&self) -> Option<&MoeLayer> {
         match &self.mlp {
             LayerMlp::Moe(m) => Some(m),
             LayerMlp::Dense(_) => None,
         }
-    }
-
-    pub fn moe_mut(&mut self) -> Option<&mut MoeLayer> {
-        match &mut self.mlp {
-            LayerMlp::Moe(m) => Some(m),
-            LayerMlp::Dense(_) => None,
-        }
-    }
-
-    /// The dense-layer expert, if this is a dense layer (always-active weights).
-    pub fn dense_expert(&self) -> Option<&AnyExpert> {
-        match &self.mlp {
-            LayerMlp::Dense(d) => Some(&d.w),
-            LayerMlp::Moe(_) => None,
-        }
-    }
-
-    /// `mlp_norm.weight` — the norm the router input passes through (lookahead
-    /// proxies build `rmsnorm(prev_out, mlp_norm)` before predicting experts).
-    pub fn mlp_norm(&self) -> &[f32] {
-        &self.mlp_norm
     }
 
     /// Cached positions (attention and convs agree).
@@ -145,7 +119,8 @@ impl Layer {
         self.attn.cache_bytes() + self.attn_sconv.cache_bytes() + self.mlp_sconv.cache_bytes()
     }
 
-    /// Clear all sequence state (new sequence).
+    /// Clear all sequence state (new sequence). O(1) — see
+    /// [`AttentionLayer::reset`] / [`ShortConv::reset`].
     pub fn reset(&mut self) {
         self.attn.reset();
         self.attn_sconv.reset();
@@ -286,20 +261,79 @@ impl WideTable {
     }
 }
 
-/// Full Inkling text model: embed + embed_norm → layers → norm / mup → unembed.
+/// The output head: `logits = unembed · (rmsnorm(x, norm) / mup)` sliced to
+/// `unpadded_vocab` (f32 logits, no bf16 rounding — see
+/// [`WideTable::matvec_f32`]). The ONE implementation [`Model`], the staged
+/// runner and the layer-dump example share, so their logits cannot drift: the
+/// division is a true `x / mup`, not `x * (1 / mup)` — at the real
+/// `logits_mup_width_multiplier` of 24 the reciprocal form is 1 ULP off on
+/// most elements, enough to flip argmax ties.
+pub struct Head {
+    /// `norm.weight` `[hidden]`.
+    pub norm: Vec<f32>,
+    /// `unembed.weight` `[vocab, hidden]`.
+    pub unembed: WideTable,
+    pub eps: f32,
+    /// `logits_mup_width_multiplier` (> 0).
+    pub mup: f32,
+    /// Logits are sliced to this many entries (`unpadded_vocab_size`).
+    pub unpadded_vocab: usize,
+}
+
+impl Head {
+    pub fn new(
+        norm: Vec<f32>,
+        unembed: WideTable,
+        eps: f32,
+        mup: f32,
+        unpadded_vocab: usize,
+    ) -> Self {
+        let hidden = norm.len();
+        assert!(hidden > 0, "head: empty norm");
+        assert!(mup > 0.0, "head: mup must be positive");
+        assert!(
+            unpadded_vocab >= 1 && unpadded_vocab * hidden <= unembed.len(),
+            "head: unpadded_vocab {unpadded_vocab} vs unembed rows {}",
+            unembed.len() / hidden
+        );
+        Self {
+            norm,
+            unembed,
+            eps,
+            mup,
+            unpadded_vocab,
+        }
+    }
+
+    pub fn hidden(&self) -> usize {
+        self.norm.len()
+    }
+
+    /// `unembed · (rmsnorm(x, norm) / mup)[..unpadded_vocab]` for one hidden
+    /// `x` (`[hidden]`).
+    pub fn logits(&self, x: &[f32]) -> Vec<f32> {
+        let hidden = self.hidden();
+        assert_eq!(x.len(), hidden, "head logits: x len");
+        let mut y = x.to_vec();
+        rmsnorm_f32(&mut y, &self.norm, self.eps);
+        for v in y.iter_mut() {
+            *v /= self.mup;
+        }
+        let mut logits = vec![0.0f32; self.unpadded_vocab];
+        self.unembed.matvec_f32(&y, hidden, &mut logits);
+        logits
+    }
+}
+
+/// Full Inkling text model: embed + embed_norm → layers → [`Head`].
 pub struct Model {
     pub hidden: usize,
     pub vocab: usize,
-    /// Logits are sliced to this many entries (`unpadded_vocab_size`).
-    pub unpadded_vocab: usize,
     pub eps: f32,
-    /// `logits_mup_width_multiplier` — the final hidden is divided by it.
-    pub mup: f32,
     embed: WideTable,     // [vocab, hidden]
     embed_norm: Vec<f32>, // [hidden]
     layers: Vec<Layer>,
-    norm: Vec<f32>,     // [hidden]
-    unembed: WideTable, // [vocab, hidden]
+    head: Head,
 }
 
 impl Model {
@@ -324,22 +358,28 @@ impl Model {
             unpadded_vocab >= 1 && unpadded_vocab <= vocab,
             "model: unpadded_vocab {unpadded_vocab} vs vocab {vocab}"
         );
-        assert!(mup > 0.0, "model: mup must be positive");
         for (i, l) in layers.iter().enumerate() {
             assert_eq!(l.hidden, hidden, "model: layer {i} hidden");
         }
         Self {
             hidden,
             vocab,
-            unpadded_vocab,
             eps,
-            mup,
             embed,
             embed_norm,
             layers,
-            norm,
-            unembed,
+            head: Head::new(norm, unembed, eps, mup, unpadded_vocab),
         }
+    }
+
+    /// Logits are sliced to this many entries (`unpadded_vocab_size`).
+    pub fn unpadded_vocab(&self) -> usize {
+        self.head.unpadded_vocab
+    }
+
+    /// `logits_mup_width_multiplier` — the final hidden is divided by it.
+    pub fn mup(&self) -> f32 {
+        self.head.mup
     }
 
     pub fn layers(&self) -> &[Layer] {
@@ -401,18 +441,10 @@ impl Model {
         x
     }
 
-    /// `unembed · (rmsnorm(x, norm) / mup)`, sliced to `unpadded_vocab`
-    /// (f32 logits).
+    /// [`Head::logits`]: `unembed · (rmsnorm(x, norm) / mup)`, sliced to
+    /// `unpadded_vocab` (f32 logits).
     pub fn head_logits(&self, x: &[f32]) -> Vec<f32> {
-        assert_eq!(x.len(), self.hidden, "head_logits: x len");
-        let mut y = x.to_vec();
-        rmsnorm_f32(&mut y, &self.norm, self.eps);
-        for v in y.iter_mut() {
-            *v /= self.mup;
-        }
-        let mut logits = vec![0.0f32; self.unpadded_vocab];
-        self.unembed.matvec_f32(&y, self.hidden, &mut logits);
-        logits
+        self.head.logits(x)
     }
 
     /// Embed `token`, run every layer and the head; returns logits

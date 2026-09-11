@@ -249,3 +249,140 @@ fn golden_sconv_matches_hf() {
     let got = conv.prefill(&x, t);
     assert_close("sconv_out", &got, &want, 1e-4, 1e-4);
 }
+
+// ---- rewind slack is measured from the write high-water mark -------------
+
+/// The reviewer's repro: two truncates whose SUM exceeds the slack, each alone
+/// within it. Measured against the already-lowered `len` the second passed
+/// silently and the decode at 40 read ring rows positions 72..74 had
+/// overwritten; measured against the high-water mark (100) it panics.
+#[test]
+#[should_panic(expected = "exceeds the rewind slack")]
+fn consecutive_truncates_cannot_creep_past_the_slack() {
+    let (c, k, rewind, t) = (3usize, 4usize, 32usize, 100usize);
+    let mut rng = Lcg(31);
+    let w = rng.vec(c * k);
+    let u = rng.vec(t * c);
+    let mut conv = ShortConv::with_rewind(w, c, k, rewind);
+    let _ = conv.prefill(&u, t);
+    conv.truncate(70); // 30 <= 32
+    conv.truncate(40); // 60 positions below the high-water mark 100
+}
+
+#[test]
+fn consecutive_truncates_within_the_slack_redecode_exactly() {
+    let (c, k, rewind, t) = (3usize, 4usize, 32usize, 100usize);
+    let mut rng = Lcg(32);
+    let w = rng.vec(c * k);
+    let u = rng.vec(t * c);
+    let mut conv = ShortConv::with_rewind(w.clone(), c, k, rewind);
+    let full = conv.prefill(&u, t);
+    conv.truncate(90);
+    let _ = conv.prefill(&u[90 * c..95 * c], 5); // partial re-decode: hwm stays 100
+    conv.truncate(75); // 25 below 100
+    conv.truncate(68); // 32 below 100: exactly the slack
+    let redo = conv.prefill(&u[68 * c..], t - 68);
+    assert_eq!(
+        redo,
+        full[68 * c..].to_vec(),
+        "decode after two truncates must equal the uninterrupted sequence"
+    );
+    // and the uninterrupted sequence on a fresh conv is `full` (sanity).
+    let mut fresh = ShortConv::with_rewind(w, c, k, rewind);
+    assert_eq!(fresh.prefill(&u, t), full);
+}
+
+#[test]
+fn truncate_snapshot_restore_truncate_within_the_slack_is_exact() {
+    let (c, k, rewind, t) = (4usize, 4usize, 8usize, 40usize);
+    let mut rng = Lcg(33);
+    let w = rng.vec(c * k);
+    let u = rng.vec(t * c);
+    let mut conv = ShortConv::with_rewind(w.clone(), c, k, rewind);
+    let full = conv.prefill(&u, t);
+    conv.truncate(37); // 3 of the 8
+    let snap = conv.snapshot();
+    assert_eq!(snap.len(), 37);
+
+    // Into a fresh conv (prefix-cache reuse): the remaining 5 of the slack,
+    // measured from the ORIGINAL high-water mark 40, are still usable ...
+    let mut fresh = ShortConv::with_rewind(w.clone(), c, k, rewind);
+    fresh.restore(&snap);
+    fresh.truncate(32);
+    let redo = fresh.prefill(&u[32 * c..], t - 32);
+    assert_eq!(redo, full[32 * c..].to_vec(), "fresh conv after restore");
+
+    // ... and back into the same conv after a reset.
+    conv.reset();
+    conv.restore(&snap);
+    conv.truncate(32);
+    let redo = conv.prefill(&u[32 * c..], t - 32);
+    assert_eq!(
+        redo,
+        full[32 * c..].to_vec(),
+        "same conv after reset+restore"
+    );
+}
+
+#[test]
+#[should_panic(expected = "exceeds the rewind slack")]
+fn truncate_snapshot_restore_truncate_beyond_the_slack_panics() {
+    let (c, k, rewind, t) = (4usize, 4usize, 8usize, 40usize);
+    let mut rng = Lcg(34);
+    let w = rng.vec(c * k);
+    let u = rng.vec(t * c);
+    let mut conv = ShortConv::with_rewind(w.clone(), c, k, rewind);
+    let _ = conv.prefill(&u, t);
+    conv.truncate(37);
+    let snap = conv.snapshot();
+    let mut fresh = ShortConv::with_rewind(w, c, k, rewind);
+    fresh.restore(&snap);
+    fresh.truncate(31); // 9 below the original high-water mark 40 (slack 8)
+}
+
+/// Before the ring has wrapped every position is still in it, so a rewind to
+/// 0 is legal even when it is longer than the slack.
+#[test]
+fn rewind_to_zero_before_the_ring_wraps_is_allowed() {
+    let (c, k, rewind) = (2usize, 4usize, 2usize); // hist 5
+    let mut rng = Lcg(36);
+    let w = rng.vec(c * k);
+    let u = rng.vec(5 * c);
+    let mut conv = ShortConv::with_rewind(w, c, k, rewind);
+    let full = conv.prefill(&u, 5);
+    conv.truncate(0); // 5 > slack 2, but hwm 5 <= hist 5: nothing overwritten
+    assert_eq!(conv.prefill(&u, 5), full);
+}
+
+// ---- O(1) reset ----------------------------------------------------------
+
+/// `reset` no longer zeroes the ring: a decode only reads rows written since
+/// the reset, so the previous sequence (here one that wrapped the ring many
+/// times, then got truncated) must be invisible — bit-identical to a fresh conv.
+#[test]
+fn reset_then_decode_is_bit_identical_to_a_fresh_conv() {
+    let (c, k, rewind) = (5usize, 4usize, 3usize); // hist 6
+    let mut rng = Lcg(35);
+    let w = rng.vec(c * k);
+    let a = rng.vec(50 * c);
+    let b = rng.vec(20 * c);
+    let mut conv = ShortConv::with_rewind(w.clone(), c, k, rewind);
+    let _ = conv.prefill(&a, 50);
+    conv.truncate(48);
+    conv.reset();
+    assert_eq!(conv.len(), 0);
+    let got = conv.prefill(&b, 20);
+    let mut fresh = ShortConv::with_rewind(w, c, k, rewind);
+    assert_eq!(
+        got,
+        fresh.prefill(&b, 20),
+        "reset must hide the previous sequence entirely"
+    );
+    // A rewind right after the reset behaves like a fresh conv's too.
+    conv.truncate(17);
+    fresh.truncate(17);
+    assert_eq!(
+        conv.prefill(&b[17 * c..], 3),
+        fresh.prefill(&b[17 * c..], 3)
+    );
+}

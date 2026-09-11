@@ -18,6 +18,20 @@
 //! can rewind a rejected speculative draft without re-running the prefix.
 //! [`ShortConv::prefill`] is bit-identical to `t` sequential decodes (same
 //! per-position code path).
+//!
+//! # Ring validity
+//!
+//! Position `p` is written to row `p % hist` when it is consumed. `hwm` (the
+//! write high-water mark) is one past the furthest position written since the
+//! last `reset` / `restore`; every position `< hwm` has been written, so row
+//! `q % hist` holds position `q` exactly when `q` is the newest position of its
+//! row class, i.e. `q >= hwm - hist` (all of `[0, hwm)` while the ring has not
+//! wrapped). A decode at `len` reads positions `[len - (K-1), len)`, which is
+//! inside that window iff `hwm - len <= rewind` — the bound `truncate` enforces
+//! (against `hwm`, not the already-lowered `len`, so it holds across any
+//! sequence of truncates and restores). Because reads never leave the window
+//! and `reset` empties it (`hwm = 0`), the ring's contents outside the window
+//! are never observed and `reset` does not need to zero them.
 
 use super::DEFAULT_REWIND;
 
@@ -36,6 +50,9 @@ pub struct ShortConv {
     ring: Vec<f32>,
     /// Positions consumed so far (the next input is position `len`).
     len: usize,
+    /// Write high-water mark: one past the furthest position written since the
+    /// last `reset` / `restore` (`>= len`; see the module docs).
+    hwm: usize,
 }
 
 /// A saved conv history for prefix caching / restore: the raw inputs at
@@ -85,6 +102,7 @@ impl ShortConv {
             hist,
             ring: vec![0.0; hist * c],
             len: 0,
+            hwm: 0,
         }
     }
 
@@ -107,6 +125,12 @@ impl ShortConv {
         self.ring.len() * std::mem::size_of::<f32>()
     }
 
+    /// Oldest position whose input is still in the ring (see the module docs).
+    #[inline]
+    fn oldest_valid(&self) -> usize {
+        self.hwm.saturating_sub(self.hist)
+    }
+
     /// One position: `out = conv(u) + u` at position `self.len`, then record
     /// `u` and advance. The single code path both `decode` and `prefill` use —
     /// summation order per channel is tap 0 .. tap K-1, then `+ u`.
@@ -115,6 +139,11 @@ impl ShortConv {
         debug_assert_eq!(u.len(), c);
         debug_assert_eq!(out.len(), c);
         let p = self.len;
+        debug_assert!(
+            p.saturating_sub(k - 1) >= self.oldest_valid(),
+            "ShortConv ring invariant broken: position {p} needs inputs older than {}",
+            self.oldest_valid()
+        );
         out.fill(0.0);
         for j in 0..k {
             // Tap j reads position p - (K-1) + j, i.e. `back` positions ago.
@@ -138,6 +167,7 @@ impl ShortConv {
         let row = p % hist;
         self.ring[row * c..(row + 1) * c].copy_from_slice(u);
         self.len = p + 1;
+        self.hwm = self.hwm.max(p + 1);
     }
 
     /// Decode one position: `u` is `[C]`; returns `conv(u) + u` (`[C]`) and
@@ -165,36 +195,45 @@ impl ShortConv {
         out
     }
 
-    /// Forget everything (new sequence).
+    /// Forget everything (new sequence). O(1): the ring is not zeroed — with
+    /// `hwm = 0` no row is inside the valid window, and a decode only ever
+    /// reads rows written since (module docs).
     pub fn reset(&mut self) {
-        self.ring.fill(0.0);
         self.len = 0;
+        self.hwm = 0;
     }
 
     /// Roll back to `len` positions (spec-decode reject). O(1): the ring rows
     /// past `len` are stale and get overwritten as decode resumes. Panics if
-    /// the rewind exceeds the slack (`self.len - len > rewind`) — the inputs
-    /// the next position would need have been overwritten.
+    /// the rewind exceeds the slack — measured from the write high-water mark
+    /// (`hwm - len > rewind`), so consecutive truncates cannot creep past it:
+    /// the inputs the next position would need have been overwritten by the
+    /// discarded positions.
     pub fn truncate(&mut self, len: usize) {
         assert!(
             len <= self.len,
             "ShortConv::truncate({len}) beyond current len {}",
             self.len
         );
+        let stale = self.hwm - len;
         assert!(
-            self.len - len <= self.rewind,
-            "ShortConv::truncate: rewinding {} positions exceeds the rewind slack {} \
-             (raise the conv's rewind or cap the speculative draft length)",
-            self.len - len,
+            stale <= self.rewind || self.hwm <= self.hist,
+            "ShortConv::truncate({len}): {stale} positions were written past it (high-water \
+             mark {}) which exceeds the rewind slack {} — the ring no longer holds the inputs \
+             position {len} needs (raise the conv's rewind or cap the speculative draft length)",
+            self.hwm,
             self.rewind
         );
         self.len = len;
     }
 
-    /// Copy out the valid history window (positions `[max(0, len - hist), len)`).
+    /// Copy out the valid history window: positions `[hwm - hist, len)` (from
+    /// 0 while the ring has not wrapped) — every row the ring still holds
+    /// for a position below `len`, so a restore followed by an in-slack
+    /// `truncate` reads exactly what this conv would have.
     pub fn snapshot(&self) -> ConvState {
         let (c, hist) = (self.c, self.hist);
-        let first = self.len.saturating_sub(hist);
+        let first = self.oldest_valid().min(self.len);
         let mut rows = Vec::with_capacity((self.len - first) * c);
         for p in first..self.len {
             let row = p % hist;
@@ -207,9 +246,11 @@ impl ShortConv {
         }
     }
 
-    /// Restore a snapshot (call after [`Self::reset`]); replaces the length and
-    /// the history window. A snapshot from a conv with a larger rewind is
-    /// trimmed to this ring; one with a smaller rewind restores what it holds.
+    /// Restore a snapshot; replaces the length, the history window and the
+    /// high-water mark (so the rewind bound after a restore is the one the
+    /// snapshot's window actually supports). A snapshot from a conv with a
+    /// larger rewind is trimmed to this ring; one with a smaller rewind
+    /// restores what it holds.
     pub fn restore(&mut self, s: &ConvState) {
         let (c, hist) = (self.c, self.hist);
         assert_eq!(
@@ -217,12 +258,15 @@ impl ShortConv {
             (s.len - s.first) * c,
             "ShortConv::restore: snapshot channel count mismatch"
         );
-        self.len = s.len;
         let start = s.first.max(s.len.saturating_sub(hist));
         for p in start..s.len {
             let row = p % hist;
             let src = &s.rows[(p - s.first) * c..(p - s.first + 1) * c];
             self.ring[row * c..(row + 1) * c].copy_from_slice(src);
         }
+        self.len = s.len;
+        // Valid window = [start, len): `hwm - hist == start`, or everything
+        // from 0 when the restored rows fit without wrapping.
+        self.hwm = if start == 0 { s.len } else { start + hist };
     }
 }

@@ -26,6 +26,15 @@
 //! `pos % rows`), global layers `max_seq` rows (slot = `pos`). The two conv
 //! histories live inside the layer, so `reset` / `truncate` / `snapshot` /
 //! `restore` cover the whole attention state.
+//!
+//! Ring validity follows [`ShortConv`](super::conv): `hwm` is one past the
+//! furthest position written since the last `reset` / `restore`; a sliding
+//! ring holds position `j` iff `j >= hwm - rows`. Attending at `p` reads keys
+//! `[p + 1 - window, p]` (`p` itself is written first), inside that window iff
+//! `hwm - p <= rewind + 1`; `truncate` enforces the uniform `hwm - len <=
+//! rewind` bound shared with the convs. A global layer never wraps (slot =
+//! position) and reads only `[0, p]`. Reads therefore never leave the rows
+//! written since the last reset, so `reset` is O(1) with no zeroing.
 
 use super::conv::{ConvState, ShortConv};
 use super::relpos::RelPos;
@@ -145,6 +154,9 @@ pub struct AttentionLayer {
     k: Vec<f32>, // [Hkv, rows, D]
     v: Vec<f32>, // [Hkv, rows, D]
     len: usize,
+    /// Write high-water mark: one past the furthest position written since the
+    /// last `reset` / `restore` (`>= len`; module docs).
+    hwm: usize,
 }
 
 /// A saved attention state for prefix reuse: the cached k/v rows at positions
@@ -234,6 +246,7 @@ impl AttentionLayer {
             k: vec![0.0; hkv * rows * d],
             v: vec![0.0; hkv * rows * d],
             len: 0,
+            hwm: 0,
         }
     }
 
@@ -273,18 +286,21 @@ impl AttentionLayer {
         (kvh * self.rows + slot) * self.dims.head_dim
     }
 
-    /// Clear the KV cache and conv histories (new sequence).
+    /// Clear the KV cache and conv histories (new sequence). O(1): nothing is
+    /// zeroed — with `hwm = 0` no cached row is inside the valid window, and
+    /// attention only reads rows written since (module docs).
     pub fn reset(&mut self) {
-        self.k.fill(0.0);
-        self.v.fill(0.0);
         self.len = 0;
+        self.hwm = 0;
         self.k_sconv.reset();
         self.v_sconv.reset();
     }
 
     /// Roll back to `len` positions (spec-decode reject). O(1). A sliding
-    /// layer can rewind at most `rewind` positions (its ring has overwritten
-    /// older rows); the convs enforce the same bound.
+    /// layer can rewind at most `rewind` positions below the write high-water
+    /// mark — across any number of truncates, since the discarded positions
+    /// have already overwritten the ring's older rows; the convs enforce the
+    /// same bound. Panics beyond it.
     pub fn truncate(&mut self, len: usize) {
         assert!(
             len <= self.len,
@@ -292,10 +308,13 @@ impl AttentionLayer {
             self.len
         );
         if self.dims.window.is_some() {
+            let stale = self.hwm - len;
             assert!(
-                self.len - len <= self.dims.rewind,
-                "attn truncate: rewinding {} positions exceeds the sliding ring's rewind slack {}",
-                self.len - len,
+                stale <= self.dims.rewind || self.hwm <= self.rows,
+                "attn truncate({len}): {stale} positions were written past it (high-water mark \
+                 {}) which exceeds the sliding ring's rewind slack {} — the keys position {len} \
+                 needs have been overwritten",
+                self.hwm,
                 self.dims.rewind
             );
         }
@@ -304,12 +323,12 @@ impl AttentionLayer {
         self.v_sconv.truncate(len);
     }
 
-    /// Snapshot the cached k/v (the valid window on a sliding layer, all
-    /// positions on a global one) and the conv histories.
+    /// Snapshot the cached k/v (the valid ring window `[hwm - rows, len)` on a
+    /// sliding layer, all positions on a global one) and the conv histories.
     pub fn snapshot(&self) -> AttnKv {
         let (hkv, d) = (self.dims.n_kv_heads, self.dims.head_dim);
         let first = match self.dims.window {
-            Some(_) => self.len.saturating_sub(self.rows),
+            Some(_) => self.hwm.saturating_sub(self.rows).min(self.len),
             None => 0,
         };
         let n = self.len - first;
@@ -333,8 +352,9 @@ impl AttentionLayer {
         }
     }
 
-    /// Restore a snapshot (call after [`Self::reset`]); replaces the length,
-    /// the cached rows and the conv histories. Snapshot and layer must share
+    /// Restore a snapshot; replaces the length, the cached rows, the conv
+    /// histories and the high-water mark (so the rewind bound after a restore
+    /// is what the snapshot's window supports). Snapshot and layer must share
     /// dims.
     pub fn restore(&mut self, kv: &AttnKv) {
         let (hkv, d) = (self.dims.n_kv_heads, self.dims.head_dim);
@@ -349,7 +369,6 @@ impl AttentionLayer {
                 self.rows
             );
         }
-        self.len = kv.len;
         let start = kv.first.max(kv.len.saturating_sub(self.rows));
         for p in start..kv.len {
             let s = self.slot(p);
@@ -360,6 +379,14 @@ impl AttentionLayer {
                 self.v[o..o + d].copy_from_slice(&kv.v[src..src + d]);
             }
         }
+        self.len = kv.len;
+        // Valid window = [start, len): `hwm - rows == start`, or everything
+        // from 0 when the restored rows fit without wrapping.
+        self.hwm = if start == 0 {
+            kv.len
+        } else {
+            start + self.rows
+        };
         self.k_sconv.restore(&kv.k_conv);
         self.v_sconv.restore(&kv.v_conv);
     }
@@ -405,6 +432,13 @@ impl AttentionLayer {
                 p + 1,
                 self.rows
             );
+        } else {
+            debug_assert!(
+                (p + 1).saturating_sub(self.dims.window.unwrap_or(0))
+                    >= self.hwm.saturating_sub(self.rows),
+                "attn ring invariant broken at position {p} (hwm {})",
+                self.hwm
+            );
         }
 
         // Per-head RMSNorm on q and (conv'd) k, f32.
@@ -419,6 +453,7 @@ impl AttentionLayer {
             self.v[o..o + d].copy_from_slice(&v[kvh * d..(kvh + 1) * d]);
         }
         self.len = p + 1;
+        self.hwm = self.hwm.max(p + 1);
 
         // Log scaling (global layers only): scales q and the position bias.
         let tau = match (self.dims.window, self.dims.n_floor) {

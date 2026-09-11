@@ -10,21 +10,23 @@
 //!
 //! Tensor names inside the safetensors are the checkpoint's own with the
 //! `model.llm.` / `model.llm.layers.N.` prefix stripped (`attn.wq_du.weight`,
-//! `attn.k_sconv.weight`, `mlp.gate.weight`, ...). Projections are held as
-//! bf16 bits (the checkpoint dtype, lossless); norms, convs, the relative-bias
-//! bank and the router stay f32. Expert bins are the glm/dsv4 int4 group-32
-//! contract and load through the same [`load_expert_bin`] (eager f32 for
-//! tiny/dev exports, mmap for the real model).
+//! `attn.k_sconv.weight`, `mlp.gate.weight`, ...). Projections and the edge
+//! tables are held as bf16 bits (the checkpoint dtype, lossless), read
+//! straight off the file payload ([`StFile::bf16_bits`] — no f32 transient on
+//! the 2.3 GiB embed / unembed tables or the ~36 GB of shells); norms, convs,
+//! the relative-bias bank and the router stay f32. Expert bins are the
+//! glm/dsv4 int4 group-32 contract and load through the same
+//! [`load_expert_bin`] (eager f32 for tiny/dev exports, mmap for the real
+//! model).
 
 use std::path::Path;
 
-use half::bf16;
 use serde::Deserialize;
 
 use super::attn::{AttentionLayer, AttnDims, AttnWeights};
 use super::conv::ShortConv;
 use super::ffn::AnyExpert;
-use super::model::{Layer, LayerMlp, Model, WideTable};
+use super::model::{Head, Layer, LayerMlp, Model, WideTable};
 use super::moe::{DenseMlp, MoeLayer, MoeWeights};
 use super::relpos::RelPos;
 use crate::dsv4::loader::{ExpertsMode, LoadError};
@@ -32,6 +34,11 @@ use crate::dsv4::st::StFile;
 use crate::glm::loader::load_expert_bin;
 
 /// The subset of `manifest.json` the Inkling shell needs (`PORT_SPEC.md` §1).
+///
+/// `route_scale`, `log_scaling_alpha` and `logits_mup_width_multiplier` are
+/// REQUIRED: they scale the routed weights, the global layers' queries and the
+/// final hidden, and a manifest silently defaulting them runs coherent-looking
+/// garbage. `export_inkling.py` always writes them.
 #[derive(Debug, Clone, Deserialize)]
 pub struct InklingManifest {
     pub arch: String,
@@ -67,15 +74,16 @@ pub struct InklingManifest {
     pub top_k: usize,
     #[serde(default = "two")]
     pub n_shared_experts: usize,
-    #[serde(default = "one_f32")]
+    /// Multiplies routed weights and shared gammas (8.0 on the released models).
     pub route_scale: f32,
     pub rms_norm_eps: f32,
     /// `None` → no log scaling on global layers.
     #[serde(default)]
     pub log_scaling_n_floor: Option<f32>,
-    #[serde(default)]
+    /// Log-scaling slope (only used with `log_scaling_n_floor`, but required
+    /// so a manifest cannot silently zero it).
     pub log_scaling_alpha: f32,
-    #[serde(default = "one_f32")]
+    /// The final hidden is divided by this before the unembed (24.0 released).
     pub logits_mup_width_multiplier: f32,
     #[serde(default = "four")]
     pub conv_kernel_size: usize,
@@ -85,9 +93,6 @@ pub struct InklingManifest {
     pub has_mtp: bool,
 }
 
-fn one_f32() -> f32 {
-    1.0
-}
 fn two() -> usize {
     2
 }
@@ -146,12 +151,27 @@ pub fn read_manifest(dir: &Path) -> Result<InklingManifest, LoadError> {
             "unknown layer type {bad:?} (expected \"sliding\" | \"global\")"
         )));
     }
-    if m.hidden_size % 32 != 0 || m.moe_intermediate % 32 != 0 {
+    if m.moe_intermediate == 0 {
+        return Err(LoadError::Manifest("moe_intermediate must be > 0".into()));
+    }
+    if !m.dense_layers.is_empty() && m.dense_intermediate == 0 {
+        return Err(LoadError::Manifest(format!(
+            "dense_intermediate must be > 0 when dense_layers is non-empty ({:?})",
+            m.dense_layers
+        )));
+    }
+    if m.logits_mup_width_multiplier.is_nan() || m.logits_mup_width_multiplier <= 0.0 {
+        return Err(LoadError::Manifest(format!(
+            "logits_mup_width_multiplier must be > 0, got {}",
+            m.logits_mup_width_multiplier
+        )));
+    }
+    if !m.hidden_size.is_multiple_of(32) || !m.moe_intermediate.is_multiple_of(32) {
         return Err(LoadError::Manifest(
             "hidden_size and moe_intermediate must be multiples of the int4 group (32)".into(),
         ));
     }
-    if !m.dense_layers.is_empty() && m.dense_intermediate % 32 != 0 {
+    if !m.dense_layers.is_empty() && !m.dense_intermediate.is_multiple_of(32) {
         return Err(LoadError::Manifest(
             "dense_intermediate must be a multiple of the int4 group (32)".into(),
         ));
@@ -163,10 +183,6 @@ pub fn read_manifest(dir: &Path) -> Result<InklingManifest, LoadError> {
         )));
     }
     Ok(m)
-}
-
-fn to_bf16_bits(v: &[f32]) -> Vec<u16> {
-    v.iter().map(|x| bf16::from_f32(*x).to_bits()).collect()
 }
 
 /// A conv weight tensor as exported (`[C, K]` or the checkpoint's `[C, 1, K]`).
@@ -192,7 +208,8 @@ pub fn load_layer(
     let (hidden, eps, k) = (m.hidden_size, m.rms_norm_eps, m.conv_kernel_size);
     let st = StFile::open(&dir.join(format!("shells/layer_{li:02}.safetensors")))?;
     let g = |n: &str| st.f32(n).map(|t| t.1);
-    let gb = |n: &str| -> Result<Vec<u16>, LoadError> { Ok(to_bf16_bits(&g(n)?)) };
+    // bf16 projections: the file payload as-is (no widen / narrow round trip).
+    let gb = |n: &str| st.bf16_bits(n).map(|t| t.1);
 
     let (hq, hkv, d) = m.attn_shape(li);
     let mut dims = if m.is_sliding(li) {
@@ -296,25 +313,25 @@ pub fn load_layer(
 pub struct InklingStage {
     pub embed: Option<(WideTable, Vec<f32>)>,
     pub layers: Vec<Layer>,
-    pub head: Option<(Vec<f32>, WideTable)>,
+    pub head: Option<Head>,
     pub manifest: InklingManifest,
 }
 
 /// Read a `[vocab, hidden]` edge table as bf16 bits (the checkpoint dtype —
-/// lossless, half the RAM of f32).
+/// lossless, half the RAM of f32, and copied straight off the file payload).
 fn wide_table(
     st: &StFile,
     name: &str,
     vocab: usize,
     hidden: usize,
 ) -> Result<WideTable, LoadError> {
-    let (shape, v) = st.f32(name)?;
+    let (shape, v) = st.bf16_bits(name)?;
     if v.len() != vocab * hidden {
         return Err(LoadError::Manifest(format!(
             "{name}: shape {shape:?} != [{vocab}, {hidden}]"
         )));
     }
-    Ok(WideTable::Bf16(to_bf16_bits(&v)))
+    Ok(WideTable::Bf16(v))
 }
 
 /// Load the layer slice `[lo, hi)`. Reads embed only when `first`, head only
@@ -341,9 +358,19 @@ pub fn load_stage(
     };
     let head = if last {
         let h = StFile::open(&dir.join("head.safetensors"))?;
-        Some((
-            h.f32("norm.weight")?.1,
+        let norm = h.f32("norm.weight")?.1;
+        if norm.len() != hidden {
+            return Err(LoadError::Manifest(format!(
+                "norm.weight has {} entries, expected hidden_size {hidden}",
+                norm.len()
+            )));
+        }
+        Some(Head::new(
+            norm,
             wide_table(&h, "unembed.weight", vocab, hidden)?,
+            m.rms_norm_eps,
+            m.logits_mup_width_multiplier,
+            m.unpadded_vocab(),
         ))
     } else {
         None
@@ -371,7 +398,7 @@ pub fn load_model_with(dir: &Path, max_seq: usize, mode: ExpertsMode) -> Result<
     let m = read_manifest(dir)?;
     let s = load_stage(dir, max_seq, 0, m.num_layers, true, true, mode)?;
     let (embed, embed_norm) = s.embed.expect("full model has an embed");
-    let (norm, unembed) = s.head.expect("full model has a head");
+    let Head { norm, unembed, .. } = s.head.expect("full model has a head");
     Ok(Model::new(
         m.hidden_size,
         m.vocab_size,

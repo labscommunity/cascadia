@@ -14,9 +14,10 @@ use cascadia_engine_sparse_moe::dsv4::st::StFile;
 use cascadia_engine_sparse_moe::inkling::attn::{AttentionLayer, AttnDims, AttnWeights};
 use cascadia_engine_sparse_moe::inkling::conv::ShortConv;
 use cascadia_engine_sparse_moe::inkling::ffn::{deinterleave_w13, AnyExpert, ExpertW};
-use cascadia_engine_sparse_moe::inkling::model::{Layer, LayerMlp, Model, WideTable};
+use cascadia_engine_sparse_moe::inkling::model::{Head, Layer, LayerMlp, Model, WideTable};
 use cascadia_engine_sparse_moe::inkling::moe::{DenseMlp, MoeLayer, MoeWeights};
 use cascadia_engine_sparse_moe::inkling::relpos::RelPos;
+use cascadia_engine_sparse_moe::inkling::rmsnorm_f32;
 
 fn fixtures() -> Option<StFile> {
     let p = match std::env::var_os("INKLING_FIXTURES") {
@@ -191,7 +192,7 @@ fn cfg() -> Cfg {
         route_scale: 8.0,
         n_floor: 2.0,
         alpha: 0.1,
-        mup: 2.0,
+        mup: 24.0, // the real `logits_mup_width_multiplier` (not a power of two)
         eps: 1e-6,
         max_seq: 48,
         rewind: 4,
@@ -377,6 +378,88 @@ fn greedy_is_deterministic_and_within_unpadded_vocab() {
         assert_eq!(got, want);
         logits = m.forward_token(want);
     }
+}
+
+/// The head divides by `mup` (`x / 24`), it does not multiply by the
+/// reciprocal (`x * (1/24)`): the two differ by 1 ULP on a good fraction of
+/// elements at mup 24 — enough to flip an argmax tie between the single-process
+/// model and the staged runner, which share this one implementation.
+#[test]
+fn head_divides_by_mup_bit_exactly_at_the_real_mup_24() {
+    let (hidden, vocab, unpadded, eps, mup) = (48usize, 40usize, 37usize, 1e-6f32, 24.0f32);
+    let mut rng = Lcg(77);
+    let norm = rng.norm(hidden);
+    let table = bits(&rng.vec(vocab * hidden, 1.0));
+    let head = Head::new(
+        norm.clone(),
+        WideTable::Bf16(table.clone()),
+        eps,
+        mup,
+        unpadded,
+    );
+    let unembed = WideTable::Bf16(table);
+    let mut reciprocal_drifts = 0usize;
+    for _ in 0..8 {
+        let x = rng.vec(hidden, 3.0);
+        let got = head.logits(&x);
+        assert_eq!(got.len(), unpadded);
+        // Reference: explicit division, then the same f32 unembed.
+        let mut y = x.clone();
+        rmsnorm_f32(&mut y, &norm, eps);
+        for v in y.iter_mut() {
+            *v /= mup;
+        }
+        let mut want = vec![0.0f32; unpadded];
+        unembed.matvec_f32(&y, hidden, &mut want);
+        assert_eq!(
+            got, want,
+            "head logits must be the divided path bit for bit"
+        );
+        // Teeth: the reciprocal multiply is a different rounding at mup 24.
+        let inv = 1.0 / mup;
+        let mut y2 = x.clone();
+        rmsnorm_f32(&mut y2, &norm, eps);
+        for v in y2.iter_mut() {
+            *v *= inv;
+        }
+        reciprocal_drifts += y
+            .iter()
+            .zip(&y2)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+    }
+    assert!(
+        reciprocal_drifts > 0,
+        "x * (1/24) never differed from x / 24 — the test has no teeth"
+    );
+    // Model::head_logits is that same function.
+    let m = random_model(11);
+    let x = Lcg(5).vec(cfg().hidden, 2.0);
+    assert_eq!(m.mup(), 24.0);
+    assert_eq!(m.head_logits(&x).len(), m.unpadded_vocab());
+}
+
+/// `reset` is O(1) (no zeroing of the KV rings / conv histories): a previous
+/// sequence that wrapped every sliding ring, then got truncated, must be
+/// invisible to the next one — bit-identical to a fresh model.
+#[test]
+fn reset_then_decode_is_bit_identical_to_a_fresh_model() {
+    let mut m = random_model(6);
+    let long: Vec<u32> = (0..30).map(|i| (i * 7 % 20) as u32).collect();
+    m.reset();
+    let _ = m.prefill(&long);
+    let _ = m.forward_token(3);
+    m.truncate(29);
+    m.reset();
+    assert_eq!(m.len(), 0);
+    let prompt = vec![4u32, 9, 2, 17, 0, 11];
+    let a = m.prefill(&prompt);
+    let a2 = m.forward_token(1);
+    let mut fresh = random_model(6);
+    let b = fresh.prefill(&prompt);
+    let b2 = fresh.forward_token(1);
+    assert_eq!(a, b, "prefill logits after reset vs fresh");
+    assert_eq!(a2, b2, "decode logits after reset vs fresh");
 }
 
 #[test]

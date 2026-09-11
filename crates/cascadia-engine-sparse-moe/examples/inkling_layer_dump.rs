@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use cascadia_engine_sparse_moe::dsv4::loader::ExpertsMode;
 use cascadia_engine_sparse_moe::inkling::loader::{load_stage, read_manifest, InklingStage};
-use cascadia_engine_sparse_moe::inkling::model::{argmax, WideTable};
+use cascadia_engine_sparse_moe::inkling::model::argmax;
 use cascadia_engine_sparse_moe::inkling::rmsnorm_f32;
 use cascadia_engine_sparse_moe::inkling::stage::INKLING_DEFAULT_MAX_SEQ;
 
@@ -133,20 +133,6 @@ fn embed_token(stage: &InklingStage, token: u32) -> Vec<f32> {
     let mut x = table.row(token as usize, m.hidden_size);
     rmsnorm_f32(&mut x, norm, m.rms_norm_eps);
     x
-}
-
-/// `unembed · (rmsnorm(x, norm) / mup)[..unpadded_vocab]` — `InklingRunner::head_logits`.
-fn head_logits(stage: &InklingStage, norm: &[f32], unembed: &WideTable, x: &[f32]) -> Vec<f32> {
-    let m = &stage.manifest;
-    let mut y = x.to_vec();
-    rmsnorm_f32(&mut y, norm, m.rms_norm_eps);
-    let inv = 1.0 / m.logits_mup_width_multiplier;
-    for v in &mut y {
-        *v *= inv;
-    }
-    let mut logits = vec![0.0f32; m.unpadded_vocab()];
-    unembed.matvec_f32(&y, m.hidden_size, &mut logits);
-    logits
 }
 
 /// One tensor of the dump: raw little-endian bytes + safetensors header fields.
@@ -300,12 +286,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let dec_total = t_dec.elapsed();
+    // The head is `Head::logits` — the same code `Model` and the staged
+    // runner use (final norm, `/ mup`, unembed, sliced to `unpadded_vocab`).
     let mut logits_dec = Vec::new();
-    if let Some((norm, unembed)) = stage.head.as_ref() {
+    if let Some(head) = stage.head.as_ref() {
         let t0 = Instant::now();
         for r in 0..t_len {
             let x = &dec_out[k - 1][r * hidden..(r + 1) * hidden];
-            logits_dec.extend(head_logits(&stage, norm, unembed, x));
+            logits_dec.extend(head.logits(x));
         }
         println!(
             "[inkling_layer_dump] head (decode rows) {:.1} ms for {t_len} positions",
@@ -329,10 +317,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let pre_total = t_pre.elapsed();
     let mut logits_pre = Vec::new();
-    if let Some((norm, unembed)) = stage.head.as_ref() {
+    if let Some(head) = stage.head.as_ref() {
         for r in 0..t_len {
             let x = &pre_out[k - 1][r * hidden..(r + 1) * hidden];
-            logits_pre.extend(head_logits(&stage, norm, unembed, x));
+            logits_pre.extend(head.logits(x));
         }
     }
 
