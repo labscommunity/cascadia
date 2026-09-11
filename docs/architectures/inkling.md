@@ -242,6 +242,9 @@ int4 artifact (512 GB) resident: a ≥640 GB-RAM box, or an N-rank pipeline
 whose ranks together hold it (e.g. 4 × 160 GB), plus the prefix cache and
 expert-residency follow-ups below.
 
+Topology, bandwidth ceilings and what expert-level routing across boxes would
+buy: [`../perf/INKLING_SCALING.md`](../perf/INKLING_SCALING.md).
+
 ## Open follow-ups
 
 - Per-rank KV-prefix cache and the qwen35-style in-process prefix cache (TTFT).
