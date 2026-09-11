@@ -5263,17 +5263,34 @@ impl<R: StagedRunner> PipelineEngine<R> {
             self.runner
                 .generate_reason(&prompt_ids, max_new, &sampling_cfg);
         let n_tokens = generated.len() as u32;
-        let text = tok.decode(&generated, true).unwrap_or_default();
         let elapsed = started.elapsed().as_secs_f64();
         info!(
             task = %task.task_id,
             tokens = n_tokens,
             elapsed_s = elapsed,
             tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
-            "task done (dsv4 single-stage)"
+            "task done ({} single-stage)",
+            self.runner.arch_name()
         );
-        let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
-        chunk.n_tokens = Some(n_tokens);
+        // One chunk per token (id + UTF-8-safe text delta), exactly what the
+        // pipeline path streams, then an empty final marker — not one
+        // whole-turn text: the API's marker translation (Inkling's
+        // special-token framing → <think>/<tool_call> delimiters) reads the
+        // token ids off each chunk, and a single chunk carrying the whole turn
+        // has no ids to align its text with. Same text, same count.
+        let mut out = Vec::with_capacity(generated.len() + 1);
+        let mut emitted = 0usize;
+        for i in 0..generated.len() {
+            let full = tok.decode(&generated[..=i], true).unwrap_or_default();
+            let delta = utf8_safe_delta(&full, &mut emitted);
+            let mut c = Chunk::token(task.task_id.clone(), generated[i] as i64, delta);
+            c.n_tokens = Some(1);
+            c.token_ids = vec![generated[i] as i64];
+            out.push((task.task_id.clone(), c));
+        }
+        let mut chunk = Chunk::final_marker(task.task_id.clone(), String::new());
+        // The token chunks carry the count; the marker adds none.
+        chunk.n_tokens = Some(0);
         // Same omission as the pipeline path: the API reads this and reported 0.
         // `prompt_ids` is already truncated to the context budget above, so its
         // length is the count actually processed.
@@ -5283,7 +5300,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
         } else {
             finish_reason_for(n_tokens as usize, max_new)
         });
-        vec![(task.task_id.clone(), chunk)]
+        out.push((task.task_id.clone(), chunk));
+        out
     }
 
     /// Rank-0 driver: embed + my layers (with the token id for the hash
