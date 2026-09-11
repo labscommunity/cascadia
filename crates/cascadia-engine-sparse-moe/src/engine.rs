@@ -6160,7 +6160,7 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
                     .map(|e| e.get_ids().to_vec())
                     .unwrap_or_else(|_| vec![1]);
                 let _ = self.runner.generate_argmax(&ids, 1);
-                info!("warmup: generated 1 token (dsv4)");
+                info!(arch = self.runner.arch_name(), "warmup: generated 1 token");
             }
         }
     }
