@@ -112,6 +112,14 @@ pub struct AppState {
     /// OFF (to inject the empty `<think></think>`). Keeps the working
     /// thinking-on path byte-identical to the engine's native render.
     pub defer_template_on_thinking: bool,
+    /// The chat template distinguishes OpenAI's `reasoning_effort` words
+    /// (probed at load: "low" and "medium" render differently). When true the
+    /// caller's own word reaches the template; when false the GLM high/max
+    /// mapping applies. See [`EffortArgs`].
+    pub effort_words: bool,
+    /// Special-token message framing to translate back into text delimiters
+    /// (Inkling). See [`MarkerDialect`].
+    pub marker_dialect: Option<MarkerDialect>,
     /// Pipeline readiness for `/health`. Starts `true`; a completion that fails
     /// with a 5xx (e.g. the distributed pipeline dropped a peer link) flips it
     /// `false`, a success flips it back `true` — so `/health` reflects the real
@@ -134,6 +142,8 @@ pub struct Config {
     pub chat_template: ChatTemplateConfig,
     /// See [`AppState::defer_template_on_thinking`]. Set by the CLI for ov-genai.
     pub defer_template_on_thinking: bool,
+    /// See [`MarkerDialect`]; the CLI loads it with [`MarkerDialect::load`].
+    pub marker_dialect: Option<MarkerDialect>,
 }
 
 impl Default for Config {
@@ -144,7 +154,189 @@ impl Default for Config {
             max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
             chat_template: ChatTemplateConfig::default(),
             defer_template_on_thinking: false,
+            marker_dialect: None,
         }
+    }
+}
+
+/// Message framing made of SPECIAL tokens (Inkling): the model emits
+/// `<|message_model|><|content_thinking|>…<|end_message|>` for its scratchpad,
+/// `<|message_model|><|content_text|>…<|end_message|>` for the answer and
+/// `<|message_model|>NAME<|content_invoke_tool_json|>{"name":…,"args":…}<|end_message|>`
+/// for a tool call. Engines decode with special tokens stripped, so that
+/// framing vanishes from the text stream and the reasoning is glued to the
+/// answer. The API reads the marker ids off each chunk instead and re-inserts
+/// the textual delimiters every other served template uses (`<think>…</think>`,
+/// Hermes `<tool_call>{"name","arguments"}</tool_call>`), so the response side
+/// keeps a single dialect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkerDialect {
+    pub message_model: i64,
+    pub content_text: i64,
+    pub content_thinking: i64,
+    pub end_message: i64,
+    pub invoke_tool_json: i64,
+}
+
+impl MarkerDialect {
+    /// Read the marker ids from `<tok_dir>/tokenizer_config.json`
+    /// (`added_tokens_decoder`) when `template` frames its output with
+    /// `<|content_thinking|>`; `None` for every other template.
+    pub fn load(tok_dir: &std::path::Path, template: Option<&str>) -> Option<Self> {
+        if !template?.contains("<|content_thinking|>") {
+            return None;
+        }
+        let v = std::fs::read(tok_dir.join("tokenizer_config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())?;
+        let table = v.get("added_tokens_decoder")?.as_object()?;
+        let id_of = |name: &str| -> Option<i64> {
+            table.iter().find_map(|(id, tok)| {
+                (tok.get("content")?.as_str()? == name).then(|| id.parse::<i64>().ok())?
+            })
+        };
+        let d = Self {
+            message_model: id_of("<|message_model|>")?,
+            content_text: id_of("<|content_text|>")?,
+            content_thinking: id_of("<|content_thinking|>")?,
+            end_message: id_of("<|end_message|>")?,
+            invoke_tool_json: id_of("<|content_invoke_tool_json|>")?,
+        };
+        info!(
+            ?d,
+            "chat template frames output with special tokens; translating markers"
+        );
+        Some(d)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarkerMode {
+    Idle,
+    /// After `<|message_model|>`: text until the content-type marker (a tool
+    /// call's name lives here).
+    Header,
+    Thinking,
+    Text,
+    /// After `<|content_invoke_tool_json|>`: the call's JSON until `<|end_message|>`.
+    Tool,
+}
+
+/// Per-response translator for a [`MarkerDialect`]: feed every engine chunk,
+/// take the text the response should carry. Text arriving in the `Header` and
+/// `Tool` states is withheld until the marker that types it, so a streamed
+/// tool call surfaces as one `<tool_call>` block.
+pub struct MarkerFilter {
+    d: MarkerDialect,
+    mode: MarkerMode,
+    header: String,
+    tool_json: String,
+}
+
+impl MarkerFilter {
+    pub fn new(d: MarkerDialect) -> Self {
+        Self {
+            d,
+            mode: MarkerMode::Idle,
+            header: String::new(),
+            tool_json: String::new(),
+        }
+    }
+
+    fn on_marker(&mut self, id: i64, out: &mut String) -> bool {
+        let d = &self.d;
+        if id == d.message_model {
+            self.mode = MarkerMode::Header;
+            self.header.clear();
+        } else if id == d.content_thinking {
+            out.push_str("<think>");
+            self.mode = MarkerMode::Thinking;
+        } else if id == d.content_text {
+            // Header text before a text body is not a name; keep it.
+            out.push_str(&std::mem::take(&mut self.header));
+            self.mode = MarkerMode::Text;
+        } else if id == d.invoke_tool_json {
+            self.mode = MarkerMode::Tool;
+            self.tool_json.clear();
+        } else if id == d.end_message {
+            match self.mode {
+                MarkerMode::Thinking => out.push_str("</think>"),
+                MarkerMode::Tool => out.push_str(&self.tool_call_block()),
+                MarkerMode::Header => out.push_str(&std::mem::take(&mut self.header)),
+                _ => {}
+            }
+            self.mode = MarkerMode::Idle;
+        } else {
+            return false;
+        }
+        true
+    }
+
+    /// `NAME<|content_invoke_tool_json|>{"name":…,"args":…}` → the Hermes
+    /// block `parse_tool_calls` already understands.
+    fn tool_call_block(&mut self) -> String {
+        let name_hdr = std::mem::take(&mut self.header);
+        let raw = std::mem::take(&mut self.tool_json);
+        let name_hdr = name_hdr.trim();
+        let body = match serde_json::from_str::<serde_json::Value>(raw.trim()) {
+            Ok(v) => {
+                let name = v
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| name_hdr.to_owned());
+                let args = v
+                    .get("args")
+                    .or_else(|| v.get("arguments"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                serde_json::json!({ "name": name, "arguments": args }).to_string()
+            }
+            // Unparseable: pass it through inside the block; parse_tool_calls
+            // skips a malformed block rather than failing the response.
+            Err(_) => raw,
+        };
+        format!("<tool_call>{body}</tool_call>")
+    }
+
+    /// Translate one chunk. Marker ids (empty text after special-token
+    /// stripping) drive the state; other text is routed by the current state.
+    /// A chunk carrying several ids (spec-decode) routes its text by the state
+    /// after all of them.
+    pub fn feed(&mut self, chunk: &cascadia_types::Chunk) -> String {
+        let mut out = String::new();
+        let ids: Vec<i64> = if chunk.token_ids.is_empty() {
+            vec![chunk.token_id]
+        } else {
+            chunk.token_ids.clone()
+        };
+        let mut all_markers = !ids.is_empty();
+        for id in ids {
+            if !self.on_marker(id, &mut out) {
+                all_markers = false;
+            }
+        }
+        if all_markers && chunk.text.is_empty() {
+            return out;
+        }
+        match self.mode {
+            MarkerMode::Header => self.header.push_str(&chunk.text),
+            MarkerMode::Tool => self.tool_json.push_str(&chunk.text),
+            _ => out.push_str(&chunk.text),
+        }
+        out
+    }
+
+    /// Flush anything still withheld (the stream ended mid-header / mid-call).
+    pub fn finish(&mut self) -> String {
+        let mut out = std::mem::take(&mut self.header);
+        if self.mode == MarkerMode::Tool && !self.tool_json.is_empty() {
+            out.push_str(&self.tool_call_block());
+        } else if self.mode == MarkerMode::Thinking {
+            out.push_str("</think>");
+        }
+        self.mode = MarkerMode::Idle;
+        out
     }
 }
 
@@ -255,11 +447,26 @@ pub fn make_router_with_stats(
                     None
                 }
             }),
-        bos_token: Arc::from(cfg.chat_template.bos_token.unwrap_or_default()),
-        eos_token: Arc::from(cfg.chat_template.eos_token.unwrap_or_default()),
+        bos_token: Arc::from(cfg.chat_template.bos_token.clone().unwrap_or_default()),
+        eos_token: Arc::from(cfg.chat_template.eos_token.clone().unwrap_or_default()),
         defer_template_on_thinking: cfg.defer_template_on_thinking,
+        effort_words: false,
+        marker_dialect: cfg.marker_dialect.clone(),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
+    let state = AppState {
+        effort_words: state
+            .chat_env
+            .as_deref()
+            .map(|env| template_speaks_effort_words(env, &state.bos_token, &state.eos_token))
+            .unwrap_or(false),
+        ..state
+    };
+    if state.effort_words {
+        info!(
+            "chat_template distinguishes OpenAI reasoning_effort words; passing the caller's own"
+        );
+    }
     // Register the label-less metric families up-front so a scrape before
     // any traffic still lists them (#16). Idempotent.
     cascadia_metrics::init();
@@ -932,9 +1139,20 @@ fn py_tojson(
         }
     };
     args.assert_all_used()?;
+    // Python honours an explicit separators tuple under indent (items end in
+    // the item separator, keys use the key separator); serde_json's pretty
+    // formatter has fixed separators. Refuse the combination rather than
+    // silently emitting bytes the template did not ask for.
+    if indent.is_some() && separators.is_some() {
+        return Err(Error::new(
+            ErrorKind::InvalidOperation,
+            "tojson: separators= together with indent= is not supported",
+        ));
+    }
 
-    // Route through serde_json::Value when keys must be sorted (minijinja maps
-    // serialize in insertion order).
+    // Route through serde_json::Value when keys must be sorted (a serde_json
+    // Map may preserve insertion order when the `preserve_order` feature is
+    // unified into the build; sorting explicitly keeps the output stable).
     let sorted: Option<serde_json::Value> = if sort_keys {
         Some(sort_json_keys(serde_json::to_value(&value).map_err(
             |err| {
@@ -1300,14 +1518,55 @@ fn classify_render_error(err: &minijinja::Error) -> PromptRenderError {
 /// returns a confident answer to a question the model was never asked, so tools
 /// requests fail loudly instead. Tool-less requests keep the fallback, since a
 /// degraded prompt still beats a dead endpoint.
+/// What the template should see as `reasoning_effort`, and how it was chosen.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EffortArgs<'a> {
+    /// The API's word: OpenAI vocabulary mapped onto GLM's high/max levels
+    /// (`effective_reasoning_effort`).
+    pub mapped: Option<&'a str>,
+    /// The caller's own word, verbatim.
+    pub raw: Option<&'a str>,
+    /// The caller set `enable_thinking` explicitly (a toggle beats an effort
+    /// word that would switch thinking off).
+    pub explicit_thinking: bool,
+    /// The template distinguishes the OpenAI words (see
+    /// [`template_speaks_effort_words`]).
+    pub template_words: bool,
+}
+
+/// Does `env` treat OpenAI's `reasoning_effort` words as distinct levels?
+/// Probed once at load by rendering the same message with "low" and "medium":
+/// Inkling (none/minimal/low/medium/high/max → a numeric thinking level) and
+/// Qwen3.8 (xhigh/medium/low) render them differently; GLM-5 (`'high' if
+/// reasoning_effort == 'high' else 'max'`) and templates that ignore the
+/// effort render them identically, and keep the GLM mapping.
+pub fn template_speaks_effort_words(
+    env: &minijinja::Environment<'static>,
+    bos_token: &str,
+    eos_token: &str,
+) -> bool {
+    let msgs = [ChatMessage {
+        role: "user".into(),
+        content: "probe".into(),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+    let render =
+        |w: &str| render_with_chat_env(env, &msgs, bos_token, eos_token, true, Some(w), None);
+    match (render("low"), render("medium")) {
+        (Ok(a), Ok(b)) => a != b,
+        _ => false,
+    }
+}
+
 fn render_or_fallback(
     env: Option<&minijinja::Environment<'static>>,
     messages: &[ChatMessage],
     bos_token: &str,
     eos_token: &str,
     enable_thinking: bool,
-    reasoning_effort: Option<&str>,
-    raw_effort: Option<&str>,
+    effort: EffortArgs<'_>,
     tools: Option<&[Tool]>,
 ) -> Result<String, PromptRenderError> {
     let has_tools = tools.is_some_and(|t| !t.is_empty());
@@ -1321,25 +1580,26 @@ fn render_or_fallback(
         }
         return Ok(render_prompt_legacy(messages));
     };
-    // Which `reasoning_effort` the template sees, in order of preference:
+    // Which `reasoning_effort` the template sees, in order of preference.
     //
-    // 1. `"none"` when thinking is off and the caller set no effort — templates
-    //    that switch thinking through the effort itself (Inkling: "Thinking
-    //    effort level: 0") need it; templates that reject the word fall
-    //    through, with `enable_thinking=false` doing the work as before.
-    // 2. The caller's own word. A template with its own scale (Inkling's
-    //    none/minimal/low/medium/high/max, Qwen3.8's xhigh/medium/low) honours
-    //    it as meant; the GLM mapping below would silently escalate "none" or
-    //    "low" to "high". A word the caller chose that the template rejects
-    //    stays a rejection (the 400 below) — serving it at some other level
-    //    would drop a parameter the caller believed had taken effect.
-    // 3. The API's mapped word (OpenAI vocabulary onto GLM's high/max): what
-    //    every thinking request carried before, and the value templates on
-    //    that vocabulary accept.
-    // 4. Undefined, so the template's own default applies (Qwen3.8's
-    //    `default('xhigh')`) when it rejected the API's own words.
+    // Templates that distinguish OpenAI's words (`template_words`, probed at
+    // load — Inkling, Qwen3.8) get the caller's own word: the GLM mapping
+    // would silently turn "none" or "low" into "high" (measured on Inkling:
+    // a thinking-off request rendered at level 0.9). Thinking off with no
+    // effort given sends "none" (Inkling switches thinking through the
+    // effort). An explicit `enable_thinking: true` beats a "none" — the
+    // documented toggle-wins rule — by sending the mapped word instead. Then
+    // the mapped word, then undefined (the template's default) so Qwen3.8's
+    // rejection of "high" lands on its `default('xhigh')`.
     //
-    // Only steps 1, 3 and 4 are the API's words to discard.
+    // Every other template (GLM-5's high/max vocabulary, or one that ignores
+    // the effort) sees the mapped word first, as before; on a rejection, the
+    // caller's own word if it differs, else undefined.
+    //
+    // A word the caller chose that the template rejects stays a rejection
+    // (the 400 below) — unless it is also the API's mapped word, which is the
+    // API's to discard. Serving a rejected caller word at another level would
+    // drop a parameter the caller believed had taken effect.
     //
     // Substring match, coupled to the templates' `raise_exception` prose:
     // Qwen3.8 says "Unexpected reasoning effort ...", Inkling "Unknown
@@ -1351,21 +1611,35 @@ fn render_or_fallback(
             m.contains("reasoning effort") || m.contains("reasoning_effort")
         })
     };
+    let EffortArgs {
+        mapped,
+        raw,
+        explicit_thinking,
+        template_words,
+    } = effort;
+    fn push<'a>(order: &mut Vec<Option<&'a str>>, w: Option<&'a str>) {
+        if !order.contains(&w) {
+            order.push(w);
+        }
+    }
     let mut order: Vec<Option<&str>> = Vec::with_capacity(4);
-    if !enable_thinking && raw_effort.is_none() {
-        order.push(Some("none"));
-    }
-    if let Some(raw) = raw_effort {
-        if !order.contains(&Some(raw)) {
-            order.push(Some(raw));
+    if template_words {
+        match raw {
+            Some("none") if enable_thinking && explicit_thinking => push(&mut order, mapped),
+            Some(r) => push(&mut order, Some(r)),
+            None if !enable_thinking => push(&mut order, Some("none")),
+            None => push(&mut order, mapped),
+        }
+        push(&mut order, mapped);
+    } else {
+        push(&mut order, mapped);
+        if let Some(r) = raw {
+            push(&mut order, Some(r));
         }
     }
-    if let Some(mapped) = reasoning_effort {
-        if !order.contains(&Some(mapped)) {
-            order.push(Some(mapped));
-        }
-    }
-    order.push(None);
+    push(&mut order, None);
+    // The caller's own word, when it is not also the API's.
+    let callers = raw.filter(|r| Some(*r) != mapped);
     let mut first = Err(PromptRenderError::Failed("no render attempted".into()));
     for (i, candidate) in order.iter().enumerate() {
         first = render_with_chat_env(
@@ -1380,9 +1654,8 @@ fn render_or_fallback(
         if !rejects_effort(&first) {
             break;
         }
-        // The caller's own word was rejected: that is their 400 to see — unless
-        // it is also the API's mapped word, which is the API's to discard.
-        if raw_effort.is_some() && *candidate == raw_effort && *candidate != reasoning_effort {
+        // The caller's own word was rejected: that is their 400 to see.
+        if callers.is_some() && *candidate == callers {
             break;
         }
         if i + 1 < order.len() {
@@ -1413,8 +1686,7 @@ fn render_prompt(
     state: &AppState,
     messages: &[ChatMessage],
     enable_thinking: bool,
-    reasoning_effort: Option<&str>,
-    raw_effort: Option<&str>,
+    effort: EffortArgs<'_>,
     tools: Option<&[Tool]>,
 ) -> Result<String, PromptRenderError> {
     // ov-genai applies the model's own template, so the engine gets raw text.
@@ -1437,8 +1709,10 @@ fn render_prompt(
         &state.bos_token,
         &state.eos_token,
         enable_thinking,
-        reasoning_effort,
-        raw_effort,
+        EffortArgs {
+            template_words: state.effort_words,
+            ..effort
+        },
         tools,
     )
 }
@@ -1862,8 +2136,10 @@ impl ChatPromptRenderer {
             &self.bos_token,
             &self.eos_token,
             enable_thinking,
-            reasoning_effort,
-            None,
+            EffortArgs {
+                mapped: reasoning_effort,
+                ..Default::default()
+            },
             tools,
         )
     }
@@ -1905,8 +2181,12 @@ async fn chat_completions(
         &state,
         &req.messages,
         enable_thinking,
-        Some(req.effective_reasoning_effort()),
-        req.reasoning_effort.as_deref(),
+        EffortArgs {
+            mapped: Some(req.effective_reasoning_effort()),
+            raw: req.reasoning_effort.as_deref(),
+            explicit_thinking: req.enable_thinking.is_some(),
+            template_words: state.effort_words,
+        },
         req.tools.as_deref(),
     ) {
         Ok(p) => p,
@@ -2040,6 +2320,7 @@ async fn chat_completions(
         Ok(s) => s,
         Err(err) => return engine_error_response(err),
     };
+    let mut marker = state.marker_dialect.clone().map(MarkerFilter::new);
     let mut buf = String::new();
     let mut completion_tokens: u32 = 0;
     let mut prompt_tokens: u32 = 0;
@@ -2067,7 +2348,15 @@ async fn chat_completions(
         // on `!is_final` dropped them (tokens_total stuck at 0 for
         // ov-genai). chunk_token_count contributes 0 for the empty final
         // markers other engines emit, so there's no phantom over-count.
-        buf.push_str(&chunk.text);
+        match marker.as_mut() {
+            Some(f) => {
+                buf.push_str(&f.feed(&chunk));
+                if chunk.is_final {
+                    buf.push_str(&f.finish());
+                }
+            }
+            None => buf.push_str(&chunk.text),
+        }
         completion_tokens += chunk_token_count(&chunk);
         if let Some(lp) = &chunk.logprobs {
             logprobs_content.push(lp.clone());
@@ -2243,6 +2532,7 @@ async fn completions(
         Ok(s) => s,
         Err(err) => return engine_error_response(err),
     };
+    let mut marker = state.marker_dialect.clone().map(MarkerFilter::new);
     let mut buf = String::new();
     let mut completion_tokens: u32 = 0;
     let mut prompt_tokens: u32 = 0;
@@ -2257,7 +2547,15 @@ async fn completions(
             )
                 .into_response();
         }
-        buf.push_str(&chunk.text);
+        match marker.as_mut() {
+            Some(f) => {
+                buf.push_str(&f.feed(&chunk));
+                if chunk.is_final {
+                    buf.push_str(&f.finish());
+                }
+            }
+            None => buf.push_str(&chunk.text),
+        }
         completion_tokens += chunk_token_count(&chunk);
         if let Some(lp) = &chunk.logprobs {
             logprobs_content.push(lp.clone());
@@ -2476,12 +2774,21 @@ async fn stream_completion(
         let mut buf = String::new();
         let mut err: Option<String> = None;
         let mut stream = chunk_stream;
+        let mut marker = state.marker_dialect.clone().map(MarkerFilter::new);
         while let Some(chunk) = stream.next().await {
             if let Some(reason) = &chunk.error {
                 err = Some(reason.clone());
                 break;
             }
-            buf.push_str(&chunk.text);
+            match marker.as_mut() {
+                Some(f) => {
+                    buf.push_str(&f.feed(&chunk));
+                    if chunk.is_final {
+                        buf.push_str(&f.finish());
+                    }
+                }
+                None => buf.push_str(&chunk.text),
+            }
         }
         let frames: Vec<Bytes> = if let Some(reason) = err {
             warn!(task = %task_id, reason = %reason, "engine failed tool task mid-stream; SSE error");
@@ -2564,6 +2871,9 @@ async fn stream_completion(
     // Hyper writes immediately (combined with TCP_NODELAY set on the
     // accepted connection in cascadia-cli's serve loop, this lands the
     // per-token chunk on the wire as a separate ~220 B packet).
+    let marker: Arc<std::sync::Mutex<Option<MarkerFilter>>> = Arc::new(std::sync::Mutex::new(
+        state.marker_dialect.clone().map(MarkerFilter::new),
+    ));
     let body_stream = permit_carrier
         .then(move |chunk| {
             let model = model.clone();
@@ -2571,6 +2881,7 @@ async fn stream_completion(
             let stats = stats.clone();
             let usage_completion = usage_completion.clone();
             let usage_prompt = usage_prompt.clone();
+            let marker = marker.clone();
             async move {
                 // Count model tokens as they stream so the dashboard's
                 // tokens_total advances live (not just at request end).
@@ -2606,6 +2917,22 @@ async fn stream_completion(
                 // tokens per chunk; downstream tok/s would be wrong if
                 // it counted chunks. Standard clients ignore unknown
                 // fields; our orchestrator reads it.
+                // Special-token framing (Inkling) → textual delimiters, same
+                // translation as the non-streaming path; withheld text (a
+                // tool call's name/JSON) surfaces on the closing marker.
+                let text = {
+                    let mut guard = marker.lock().unwrap();
+                    match guard.as_mut() {
+                        Some(f) => {
+                            let mut t = f.feed(&chunk);
+                            if chunk.is_final {
+                                t.push_str(&f.finish());
+                            }
+                            t
+                        }
+                        None => chunk.text.clone(),
+                    }
+                };
                 let payload = serde_json::json!({
                     "id": task_id,
                     "object": "chat.completion.chunk",
@@ -2616,7 +2943,7 @@ async fn stream_completion(
                         "index": 0,
                         "delta": {
                             "role": "assistant",
-                            "content": chunk.text,
+                            "content": text,
                         },
                         "finish_reason": if chunk.is_final {
                             Some(chunk.finish_reason.map(|f| f.as_openai_str()).unwrap_or("stop"))
@@ -4454,14 +4781,38 @@ mod tests {
         // Renders fine without tools; explodes inside the tools branch.
         let env = build_chat_env("{% if tools %}{{ nope.missing.deeper }}{% endif %}ok").unwrap();
 
-        let err = render_or_fallback(Some(&env), &msgs, "", "", true, None, None, Some(&tools))
-            .expect_err("a tools request must not fall back");
+        let err = render_or_fallback(
+            Some(&env),
+            &msgs,
+            "",
+            "",
+            true,
+            EffortArgs {
+                mapped: None,
+                raw: None,
+                ..Default::default()
+            },
+            Some(&tools),
+        )
+        .expect_err("a tools request must not fall back");
         assert!(matches!(err, PromptRenderError::Failed(_)), "{err:?}");
 
         // Same broken template, no tools: fallback is still allowed, because a
         // degraded prompt beats a dead endpoint.
-        let out = render_or_fallback(Some(&env), &msgs, "", "", true, None, None, None)
-            .expect("tool-less requests keep the fallback");
+        let out = render_or_fallback(
+            Some(&env),
+            &msgs,
+            "",
+            "",
+            true,
+            EffortArgs {
+                mapped: None,
+                raw: None,
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("tool-less requests keep the fallback");
         assert_eq!(out, "ok");
     }
 
@@ -4543,8 +4894,11 @@ mod tests {
             "",
             "",
             true,
-            Some("high"),
-            Some("low"),
+            EffortArgs {
+                mapped: Some("high"),
+                raw: Some("low"),
+                ..Default::default()
+            },
             None,
         )
         .unwrap();
@@ -4557,8 +4911,11 @@ mod tests {
             "",
             "",
             true,
-            Some("high"),
-            Some("high"),
+            EffortArgs {
+                mapped: Some("high"),
+                raw: Some("high"),
+                ..Default::default()
+            },
             None,
         )
         .unwrap();
@@ -4572,8 +4929,11 @@ mod tests {
             "",
             "",
             true,
-            Some("high"),
-            Some("hgih"),
+            EffortArgs {
+                mapped: Some("high"),
+                raw: Some("hgih"),
+                ..Default::default()
+            },
             None,
         )
         .expect_err("the caller's own rejected word must surface");
@@ -4590,8 +4950,11 @@ mod tests {
                 "",
                 "",
                 true,
-                Some("high"),
-                Some("low"),
+                EffortArgs {
+                    mapped: Some("high"),
+                    raw: Some("low"),
+                    ..Default::default()
+                },
                 None
             ),
             Err(PromptRenderError::Rejected(_))
@@ -4655,8 +5018,20 @@ mod tests {
 {%- endif -%}effort={{ reasoning_effort | default('xhigh') }}";
         let env = build_chat_env(T).unwrap();
         let msgs = [msg("user", "hi")];
-        let out =
-            render_or_fallback(Some(&env), &msgs, "", "", true, Some("high"), None, None).unwrap();
+        let out = render_or_fallback(
+            Some(&env),
+            &msgs,
+            "",
+            "",
+            true,
+            EffortArgs {
+                mapped: Some("high"),
+                raw: None,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
         assert_eq!(out, "effort=xhigh");
     }
 
@@ -4673,8 +5048,20 @@ mod tests {
             function: serde_json::json!({"name": "get_weather"}),
         }];
         let msgs = [msg("user", "hi")];
-        let out =
-            render_or_fallback(Some(&env), &msgs, "", "", true, None, None, Some(&tools)).unwrap();
+        let out = render_or_fallback(
+            Some(&env),
+            &msgs,
+            "",
+            "",
+            true,
+            EffortArgs {
+                mapped: None,
+                raw: None,
+                ..Default::default()
+            },
+            Some(&tools),
+        )
+        .unwrap();
         assert_eq!(
             out,
             "[{\"description\":\"d\",\"name\":\"get_weather\",\"parameters\":{\"a\":[2,3],\"b\":1},\"type\":\"function\"}]\
@@ -4695,21 +5082,146 @@ mod tests {
 level={{ effort_map[eff] }}";
         let env = build_chat_env(T).unwrap();
         let msgs = [msg("user", "hi")];
-        let r = |thinking: bool, mapped: Option<&str>, raw: Option<&str>| {
-            render_or_fallback(Some(&env), &msgs, "", "", thinking, mapped, raw, None)
+        assert!(
+            template_speaks_effort_words(&env, "", ""),
+            "the probe must classify an Inkling-shaped template as word-speaking"
+        );
+        let r = |thinking: bool, explicit: bool, mapped: Option<&str>, raw: Option<&str>| {
+            let effort = EffortArgs {
+                mapped,
+                raw,
+                explicit_thinking: explicit,
+                template_words: true,
+            };
+            render_or_fallback(Some(&env), &msgs, "", "", thinking, effort, None)
         };
-        // caller said "none": honoured, not escalated to the mapped "high"
-        assert_eq!(r(false, Some("high"), Some("none")).unwrap(), "level=0.0");
-        assert_eq!(r(true, Some("high"), Some("low")).unwrap(), "level=0.2");
+        // caller said "none" (thinking off by that alone): honoured, not
+        // escalated to the mapped "high"
+        assert_eq!(
+            r(false, false, Some("high"), Some("none")).unwrap(),
+            "level=0.0"
+        );
+        assert_eq!(
+            r(true, false, Some("high"), Some("low")).unwrap(),
+            "level=0.2"
+        );
         // thinking off, no effort given: level 0
-        assert_eq!(r(false, Some("high"), None).unwrap(), "level=0.0");
+        assert_eq!(r(false, true, Some("high"), None).unwrap(), "level=0.0");
         // omitted effort, thinking on: the mapped default
-        assert_eq!(r(true, Some("high"), None).unwrap(), "level=0.9");
+        assert_eq!(r(true, false, Some("high"), None).unwrap(), "level=0.9");
+        // explicit enable_thinking:true beats "none": the toggle wins
+        assert_eq!(
+            r(true, true, Some("high"), Some("none")).unwrap(),
+            "level=0.9"
+        );
         // a caller word the template rejects is the caller's 400
         assert!(matches!(
-            r(true, Some("high"), Some("bogus")),
+            r(true, false, Some("high"), Some("bogus")),
             Err(PromptRenderError::Rejected(_))
         ));
+    }
+
+    /// GLM-5's template never rejects: anything but the literal "high" is
+    /// Max. The probe must classify it as NOT word-speaking so the mapping
+    /// keeps "low"/"none"/"medium" at High (the regression the review caught).
+    #[test]
+    fn glm_style_template_keeps_the_mapping() {
+        const T: &str = "effort={{ 'high' if reasoning_effort is defined and reasoning_effort == 'high' else 'max' }}";
+        let env = build_chat_env(T).unwrap();
+        assert!(!template_speaks_effort_words(&env, "", ""));
+        let msgs = [msg("user", "hi")];
+        for raw in [
+            Some("low"),
+            Some("medium"),
+            Some("none"),
+            Some("bogus"),
+            None,
+        ] {
+            let effort = EffortArgs {
+                mapped: Some("high"),
+                raw,
+                explicit_thinking: false,
+                template_words: false,
+            };
+            assert_eq!(
+                render_or_fallback(Some(&env), &msgs, "", "", true, effort, None).unwrap(),
+                "effort=high",
+                "raw {raw:?} must stay at the mapped level on a GLM-style template"
+            );
+        }
+        let effort = EffortArgs {
+            mapped: Some("max"),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_or_fallback(Some(&env), &msgs, "", "", true, effort, None).unwrap(),
+            "effort=max"
+        );
+    }
+
+    /// Inkling's special-token framing → the textual delimiters the rest of
+    /// the API understands: `<think>…</think>` and a Hermes tool-call block.
+    #[test]
+    fn marker_filter_translates_thinking_text_and_tool_calls() {
+        use cascadia_types::Chunk;
+        let d = MarkerDialect {
+            message_model: 200001,
+            content_text: 200004,
+            content_thinking: 200008,
+            end_message: 200010,
+            invoke_tool_json: 200049,
+        };
+        let tok = |id: i64, text: &str| {
+            let mut c = Chunk::token(String::from("t"), id, text.to_string());
+            c.token_ids = vec![id];
+            c
+        };
+        // <|message_model|><|content_thinking|>plan<|end_message|><|message_model|><|content_text|>Paris<|end_message|>
+        let mut f = MarkerFilter::new(d.clone());
+        let mut out = String::new();
+        for c in [
+            tok(200001, ""),
+            tok(200008, ""),
+            tok(7, "plan"),
+            tok(200010, ""),
+            tok(200001, ""),
+            tok(200004, ""),
+            tok(9, "Paris"),
+            tok(200010, ""),
+        ] {
+            out.push_str(&f.feed(&c));
+        }
+        out.push_str(&f.finish());
+        assert_eq!(out, "<think>plan</think>Paris");
+        // tool call: NAME<|content_invoke_tool_json|>{"name":…,"args":…}<|end_message|>
+        let mut f = MarkerFilter::new(d.clone());
+        let mut out = String::new();
+        for c in [
+            tok(200001, ""),
+            tok(11, "get_"),
+            tok(12, "weather"),
+            tok(200049, ""),
+            tok(13, "{\"name\":\"get_weather\","),
+            tok(14, "\"args\":{\"city\":\"Paris\"}}"),
+            tok(200010, ""),
+        ] {
+            let piece = f.feed(&c);
+            // withheld until the closing marker: no partial name/JSON leaks
+            if c.token_id != 200010 {
+                assert_eq!(piece, "", "leaked {piece:?}");
+            }
+            out.push_str(&piece);
+        }
+        assert_eq!(
+            out,
+            "<tool_call>{\"arguments\":{\"city\":\"Paris\"},\"name\":\"get_weather\"}</tool_call>"
+        );
+        let calls = parse_tool_calls(&out).expect("Hermes block parses");
+        assert_eq!(calls[0].function.name, "get_weather");
+        // thinking-off answer with no framing markers passes straight through
+        let mut f = MarkerFilter::new(d);
+        assert_eq!(f.feed(&tok(9, "42")), "42");
+        assert_eq!(f.finish(), "");
     }
 
     #[test]
@@ -4843,12 +5355,37 @@ level={{ effort_map[eff] }}";
             r#type: "function".into(),
             function: serde_json::json!({"name": "get_weather"}),
         }];
-        let err = render_or_fallback(None, &msgs, "", "", true, None, None, Some(&tools))
-            .expect_err("no template + tools must not be answered");
+        let err = render_or_fallback(
+            None,
+            &msgs,
+            "",
+            "",
+            true,
+            EffortArgs {
+                mapped: None,
+                raw: None,
+                ..Default::default()
+            },
+            Some(&tools),
+        )
+        .expect_err("no template + tools must not be answered");
         assert!(matches!(err, PromptRenderError::Rejected(_)), "{err:?}");
 
         assert!(
-            render_or_fallback(None, &msgs, "", "", true, None, None, None).is_ok(),
+            render_or_fallback(
+                None,
+                &msgs,
+                "",
+                "",
+                true,
+                EffortArgs {
+                    mapped: None,
+                    raw: None,
+                    ..Default::default()
+                },
+                None
+            )
+            .is_ok(),
             "tool-less requests still render without a template"
         );
     }
@@ -4867,7 +5404,19 @@ level={{ effort_map[eff] }}";
             tool_calls: None,
             tool_call_id: None,
         }];
-        match render_or_fallback(Some(&env), &msgs, "", "", true, None, None, None) {
+        match render_or_fallback(
+            Some(&env),
+            &msgs,
+            "",
+            "",
+            true,
+            EffortArgs {
+                mapped: None,
+                raw: None,
+                ..Default::default()
+            },
+            None,
+        ) {
             Err(PromptRenderError::Rejected(m)) => {
                 assert!(m.contains("system role not supported"), "{m}")
             }

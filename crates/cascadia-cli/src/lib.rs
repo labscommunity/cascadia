@@ -2049,6 +2049,12 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             );
         }
         let mut cfg = cascadia_api::Config::default();
+        // Special-token message framing (Inkling): translated back into the
+        // textual delimiters the API's response side understands.
+        cfg.marker_dialect = cascadia_api::MarkerDialect::load(
+            std::path::Path::new(&args.model),
+            chat_template.template.as_deref(),
+        );
         cfg.chat_template = chat_template;
         // Long-context serving: the 64 KiB body / 32 KiB prompt defaults hold
         // ~8 K tokens, a fraction of what the Qwen3.5-family and Llama-3.1
