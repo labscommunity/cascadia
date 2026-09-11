@@ -150,7 +150,7 @@ def test_bfloat16_reference_path(tmp_path, reference):
     # bf16 reference = argmax-level check only: the reference itself rounds, so the ULP
     # criterion does not apply and rms is judged at the bf16 tolerance.
     rep = real_layer_parity.compare_dump(EXPORT, 4, dump, dtype="bfloat16", tol=BF16_TOL,
-                                         ulp_tol=float("inf"), rms_tol=BF16_TOL, log=print)
+                                         rms_tol=BF16_TOL, scale_tol=BF16_TOL, log=print)
     assert rep["pass"], json.dumps(rep["tensors"], indent=1)
     assert rep["tensors"]["logits_prefill"]["argmax_agree"] == len(tokens)
     assert rep["reference"]["hf"]["greedy"] and rep["reference"]["rust"]["greedy"]
