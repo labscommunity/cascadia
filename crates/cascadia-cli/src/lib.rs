@@ -207,9 +207,11 @@ pub enum EngineKind {
     /// (per-layer-type asymmetric attention, KV-sharing, per-layer
     /// embeddings, baked softcap) produced by `tools/export_gemma4.py`.
     Gemma4,
-    /// Kimi K2.6-style sparse-MoE engine. Routes only the top-k experts
-    /// per token (not all 384) and runs the expert matmuls through the
-    /// hand-rolled AVX-512 int4 GEMM kernel. Single-stage, CPU-targeted.
+    /// CPU sparse-MoE engine: routes only the top-k experts per token. The
+    /// family is read from the export's `manifest.json`: Kimi K2.6 (AVX-512
+    /// int4 GEMM + Rust MLA shells), MiniMax-M2 (OV-IR shells), and the
+    /// Rust-shell + int4-mmap-expert families GLM-5, DeepSeek-V4 and Inkling
+    /// (N-rank pipeline).
     SparseMoe,
     /// Qwen3.5-family staged engine (`qwen35`; `qwen36-moe` kept as an
     /// alias). Runs the IR-surgery shard chain
@@ -965,7 +967,7 @@ fn cmd_engines() -> Result<()> {
     println!("  ov-runtime     multi-stage stateful KV cache; pre-exported per-stage v3+ shards");
     println!("  ov-dist-spec   multi-stage spec decode (mask-based KV rewind); v5 shards");
     println!("  gemma4         Gemma 4 multi-stage (per-layer-type attn, KV-sharing, PLI); gemma4_cached_v1 shards");
-    println!("  sparse-moe     Kimi K2.6 (AVX-512 int4 GEMM + Rust MLA shells) or MiniMax-M2 (OV-IR shells); single-stage top-k expert dispatch");
+    println!("  sparse-moe     sparse mixture-of-experts on CPU: Kimi K2.6 (AVX-512 int4 GEMM), MiniMax-M2 (OV-IR shells), GLM-5 / DeepSeek-V4 / Inkling (Rust shells + int4 mmap experts, N-rank pipeline)");
     println!("  qwen35         Qwen3.5-family staged chain (GatedDeltaNet; 3.5/3.6 MoE or 3.8 dense); qwen3_5* IR-surgery shards (alias: qwen36-moe)");
     Ok(())
 }
@@ -1263,7 +1265,8 @@ fn export_hint(model: &str, engine: EngineKind) -> String {
         // sparse-moe consumes a manifest.json expert tree, not a shard tree.
         EngineKind::SparseMoe => {
             "  sparse-moe needs a manifest.json + per-expert tree — see\n  \
-             docs/architectures/moe.md (e.g. tools/export_minimax_m2.py)."
+             docs/architectures/moe.md (tools/export_minimax_m2.py, export_glm5.py, \
+             export_deepseek_v4.py, export_inkling.py)."
                 .to_string()
         }
         EngineKind::OvDistSpec => format!(

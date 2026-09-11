@@ -313,6 +313,8 @@ pub struct SparseMoEBuilder {
     dsv4_runner: Option<crate::dsv4::stage::Dsv4Runner>,
     /// Set when the manifest's arch is "glm5" (Rust glm5 shell + int4 experts).
     glm_runner: Option<crate::glm::stage::GlmRunner>,
+    /// Set when the manifest's arch is "inkling" (Rust Inkling shell + int4 experts).
+    inkling_runner: Option<crate::inkling::stage::InklingRunner>,
     tokenizer: Option<Tokenizer>,
     listen_host: String,
     listen_port: Option<u16>,
@@ -327,6 +329,7 @@ impl SparseMoEBuilder {
             ov_runner: None,
             dsv4_runner: None,
             glm_runner: None,
+            inkling_runner: None,
             tokenizer: None,
             listen_host: "0.0.0.0".into(),
             listen_port: None,
@@ -474,6 +477,58 @@ impl Builder for SparseMoEBuilder {
             self.dsv4_runner = Some(runner);
             return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
                 "loaded DeepSeek-V4 stage (dsv4 Rust shell)",
+            )])));
+        }
+
+        // Inkling shell backend (Thinking Machines' MoE): Rust GQA + relative-bias
+        // + short-conv shells, int4 mmap experts, on the same staged pipeline as
+        // glm5. Its manifest schema differs from the strict Manifest, so peek the
+        // arch first.
+        let is_inkling = std::fs::read_to_string(self.config.model_dir.join("manifest.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .map(|v| v.get("arch").and_then(|a| a.as_str()) == Some("inkling"))
+            .unwrap_or(false);
+        if is_inkling {
+            let total = self.config.total.max(1);
+            let rank = self.config.rank.min(total - 1);
+            let max_seq = self
+                .config
+                .max_seq
+                .or_else(|| {
+                    std::env::var("CASCADIA_INKLING_MAX_SEQ")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                        .filter(|&n| n > 0)
+                })
+                .unwrap_or(crate::inkling::stage::INKLING_DEFAULT_MAX_SEQ);
+            let runner = crate::inkling::stage::InklingRunner::load_staged(
+                &self.config.model_dir,
+                max_seq,
+                rank,
+                total,
+                shard.layer_start,
+                shard.layer_end,
+                self.config.experts_mode.clone(),
+            )
+            .map_err(|e| EngineError::Backend(format!("inkling load: {e}")))?;
+            if rank == 0 {
+                let tok_path = self.config.model_dir.join("tokenizer.json");
+                if tok_path.exists() {
+                    self.tokenizer =
+                        Some(Tokenizer::from_file(&tok_path).map_err(|e| {
+                            EngineError::Backend(format!("load tokenizer.json: {e}"))
+                        })?);
+                } else {
+                    warn!(
+                        "no tokenizer.json at {} — inkling engine will only accept pre-tokenized inputs",
+                        tok_path.display()
+                    );
+                }
+            }
+            self.inkling_runner = Some(runner);
+            return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
+                "loaded inkling stage (Inkling Rust shell)",
             )])));
         }
 
@@ -730,6 +785,28 @@ impl Builder for SparseMoEBuilder {
                 total,
                 // dsv4 has no config-threaded prefix cache; `None` keeps its
                 // existing env-only behaviour byte-for-byte.
+                None,
+            )));
+        }
+        if let Some(runner) = self.inkling_runner {
+            let total = self.config.total.max(1);
+            let rank = self.config.rank.min(total - 1);
+            if rank == 0 && self.tokenizer.is_none() {
+                return Err(EngineError::Backend(
+                    "tokenizer.json missing (required for the inkling API rank)".into(),
+                ));
+            }
+            let runtime_handle = tokio::runtime::Handle::try_current()
+                .map_err(|_| EngineError::Backend("Builder::build outside tokio context".into()))?;
+            info!(rank, total, "built inkling engine");
+            return Ok(Box::new(PipelineEngine::new(
+                runner,
+                self.tokenizer,
+                self.transport,
+                runtime_handle,
+                rank,
+                total,
+                // No per-rank KV-prefix cache on this family yet (follow-up).
                 None,
             )));
         }
