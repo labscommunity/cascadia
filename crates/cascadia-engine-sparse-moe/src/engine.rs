@@ -90,6 +90,15 @@ pub struct SparseMoEBuilderConfig {
     /// compile at all).
     pub ov_properties: Vec<(String, String)>,
     pub max_cached_experts: u32,
+    /// Expert-parallel driver: the expert workers (`host:port`) this rank
+    /// dispatches MoE work to (Inkling family). Non-empty ⇒ this rank runs
+    /// every layer's attention/router locally and holds NO expert weights;
+    /// `total` must be 1. See `docs/perf/INKLING_SCALING.md`.
+    pub ep_workers: Vec<(String, u16)>,
+    /// Expert-parallel worker: `(index, count)` — this process serves the
+    /// experts homed on shard `index` of `count` for every MoE layer and
+    /// nothing else (no attention, no sequence state, no API).
+    pub ep_worker: Option<(u32, u32)>,
     /// Pipeline stage index (0-based).
     pub rank: u32,
     /// Number of pipeline stages.
@@ -191,6 +200,8 @@ impl SparseMoEBuilderConfig {
             // `CASCADIA_MAX_EXPERTS_CACHED` overrides this if set.
             // See PowerInfer SmallThinker `MAX_N_CACHED` (MIT).
             max_cached_experts: 0,
+            ep_workers: Vec::new(),
+            ep_worker: None,
             rank: 0,
             total: 1,
             top_k_override: None,
@@ -315,6 +326,12 @@ pub struct SparseMoEBuilder {
     glm_runner: Option<crate::glm::stage::GlmRunner>,
     /// Set when the manifest's arch is "inkling" (Rust Inkling shell + int4 experts).
     inkling_runner: Option<crate::inkling::stage::InklingRunner>,
+    /// Expert-parallel driver: one connection per expert worker (`ep_workers`).
+    ep_clients: Vec<Arc<TokioMutex<ActivationClient>>>,
+    /// Expert-parallel worker: the driver's connection (`ep_worker`).
+    ep_server: Option<Arc<TokioMutex<ActivationServer>>>,
+    /// Expert-parallel worker: its expert shard, loaded in `load`.
+    ep_bank: Option<crate::inkling::ep::ExpertBank>,
     tokenizer: Option<Tokenizer>,
     listen_host: String,
     listen_port: Option<u16>,
@@ -328,6 +345,19 @@ fn peek_arch(dir: &std::path::Path) -> Option<String> {
     let s = std::fs::read_to_string(dir.join("manifest.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&s).ok()?;
     v.get("arch").and_then(|a| a.as_str()).map(str::to_owned)
+}
+
+/// Outbound connect timeout for chain/star formation: a peer only starts
+/// listening after it has loaded its multi-GB slice, so this must out-wait
+/// the slowest cold load. Default 300 s; `CASCADIA_CONNECT_TIMEOUT_SECS`
+/// overrides.
+fn connect_timeout() -> std::time::Duration {
+    let secs = std::env::var("CASCADIA_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(300);
+    std::time::Duration::from_secs(secs)
 }
 
 /// `CASCADIA_<FAMILY>_MAX_SEQ` when set to a positive integer (`=0` and junk
@@ -370,6 +400,9 @@ impl SparseMoEBuilder {
             dsv4_runner: None,
             glm_runner: None,
             inkling_runner: None,
+            ep_clients: Vec::new(),
+            ep_server: None,
+            ep_bank: None,
             tokenizer: None,
             listen_host: "0.0.0.0".into(),
             listen_port: None,
@@ -386,6 +419,51 @@ impl Builder for SparseMoEBuilder {
     }
 
     async fn connect(&mut self, peers: PeerLayout) -> EngineResult<()> {
+        // Expert-parallel worker: bind the listener the driver dials and wait
+        // for it. Like a pipeline's upstream accept, this blocks until the
+        // driver connects — start workers first, then the driver.
+        if let Some((index, count)) = self.config.ep_worker {
+            if self.config.total > 1 || !self.config.ep_workers.is_empty() {
+                return Err(EngineError::InvalidConfig(
+                    "an expert worker cannot also be a pipeline stage or a driver".into(),
+                ));
+            }
+            let port = self.listen_port.ok_or_else(|| {
+                EngineError::InvalidConfig(
+                    "expert worker requires configure_listen() (--listen) before connect()".into(),
+                )
+            })?;
+            let mut server = ActivationServer::new(self.listen_host.clone(), port);
+            server.start().await.map_err(|e| {
+                EngineError::Backend(format!("listen {}:{}: {}", self.listen_host, port, e))
+            })?;
+            info!(host = %self.listen_host, port, index, count, "expert worker bound; waiting for the driver");
+            server
+                .accept()
+                .await
+                .map_err(|e| EngineError::Backend(format!("accept driver: {e}")))?;
+            info!(index, count, "expert worker: driver connected");
+            self.ep_server = Some(Arc::new(TokioMutex::new(server)));
+            return Ok(());
+        }
+        // Expert-parallel driver: dial every worker (they must already be
+        // listening), then continue as a single-stage engine.
+        if !self.config.ep_workers.is_empty() {
+            if self.config.total > 1 {
+                return Err(EngineError::InvalidConfig(
+                    "--ep-workers runs the driver as a single stage (--total 1)".into(),
+                ));
+            }
+            let timeout = connect_timeout();
+            for (i, (host, port)) in self.config.ep_workers.iter().enumerate() {
+                let mut client = ActivationClient::new(host.clone(), *port);
+                client.connect_with_timeout(timeout).await.map_err(|e| {
+                    EngineError::Backend(format!("connect expert worker {i} at {host}:{port}: {e}"))
+                })?;
+                info!(worker = i, host = %host, port, "expert worker connected");
+                self.ep_clients.push(Arc::new(TokioMutex::new(client)));
+            }
+        }
         let single = self.config.total <= 1;
         let has_upstream = peers.upstream.is_some();
         let has_downstream = peers.downstream.is_some();
@@ -507,6 +585,31 @@ impl Builder for SparseMoEBuilder {
         // arch first.
         let arch = peek_arch(&self.config.model_dir);
         if arch.as_deref() == Some("inkling") {
+            // Expert-parallel worker: only this shard's experts, for every MoE
+            // layer. No runner, no tokenizer, no sequence state.
+            if let Some((index, count)) = self.config.ep_worker {
+                let mode = match self
+                    .config
+                    .experts_mode
+                    .clone()
+                    .or_else(|| std::env::var("CASCADIA_INKLING_EXPERTS").ok())
+                    .as_deref()
+                {
+                    Some("eager") => crate::dsv4::loader::ExpertsMode::Eager,
+                    _ => crate::dsv4::loader::ExpertsMode::Mmap,
+                };
+                let bank = crate::inkling::ep::load_expert_bank(
+                    &self.config.model_dir,
+                    index,
+                    count,
+                    mode,
+                )
+                .map_err(|e| EngineError::Backend(format!("inkling expert bank load: {e}")))?;
+                self.ep_bank = Some(bank);
+                return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
+                    format!("loaded inkling expert shard {index}/{count}"),
+                )])));
+            }
             let total = self.config.total.max(1);
             let rank = self.config.rank.min(total - 1);
             let max_seq = self.config.max_seq.unwrap_or_else(|| {
@@ -515,6 +618,27 @@ impl Builder for SparseMoEBuilder {
                     crate::inkling::stage::INKLING_DEFAULT_MAX_SEQ,
                 )
             });
+            // Expert-parallel driver: every layer local, experts remote.
+            let remote = if self.ep_clients.is_empty() {
+                None
+            } else {
+                let m = crate::inkling::loader::read_manifest(&self.config.model_dir)
+                    .map_err(|e| EngineError::Backend(format!("inkling manifest: {e}")))?;
+                let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+                    EngineError::Backend("Builder::load outside tokio context".into())
+                })?;
+                info!(
+                    workers = self.ep_clients.len(),
+                    "inkling expert-parallel driver: experts dispatched to workers"
+                );
+                Some(Arc::new(crate::inkling::ep::EpClient::new(
+                    self.ep_clients.clone(),
+                    handle,
+                    m.hidden_size,
+                    m.num_experts,
+                    m.n_shared_experts,
+                )))
+            };
             let runner = crate::inkling::stage::InklingRunner::load_staged(
                 &self.config.model_dir,
                 max_seq,
@@ -523,6 +647,7 @@ impl Builder for SparseMoEBuilder {
                 shard.layer_start,
                 shard.layer_end,
                 self.config.experts_mode.clone(),
+                remote,
             )
             .map_err(|e| EngineError::Backend(format!("inkling load: {e}")))?;
             self.load_rank0_tokenizer(rank, "inkling")?;
@@ -741,6 +866,19 @@ impl Builder for SparseMoEBuilder {
     }
 
     fn build(self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
+        if let Some(bank) = self.ep_bank {
+            let server = self.ep_server.ok_or_else(|| {
+                EngineError::Backend("expert worker built without a driver connection".into())
+            })?;
+            let runtime_handle = tokio::runtime::Handle::try_current()
+                .map_err(|_| EngineError::Backend("Builder::build outside tokio context".into()))?;
+            info!("built inkling expert worker");
+            return Ok(Box::new(crate::inkling::ep::ExpertWorkerEngine::new(
+                bank,
+                server,
+                runtime_handle,
+            )));
+        }
         if let Some(runner) = self.dsv4_runner {
             let total = self.config.total.max(1);
             let rank = self.config.rank.min(total - 1);
@@ -3294,6 +3432,9 @@ impl SparseMoEEngine {
             }
             // H.1a: CAPTURE carrying the head's turn tenant; the stash entry is tagged so `export`
             // confines it to that tenant. Relay preserves the v2 form downstream.
+            FrameKind::ExpertDispatch | FrameKind::ExpertResult => Err(format!(
+                "pipeline stage received expert-parallel frame {kind:?} (that is an expert worker's frame)"
+            )),
             #[cfg(feature = "kv_coord")]
             FrameKind::CaptureV2 => {
                 let (epoch, tokens, tenant) = self
@@ -5259,9 +5400,28 @@ impl<R: StagedRunner> PipelineEngine<R> {
                  the response answers only the first {max_seq} tokens"
             );
         }
-        let (generated, hit_context_cap) =
+        // A failure inside the forward (an expert-parallel worker that errored
+        // or dropped, an assertion in a shell) unwinds through the runner, which
+        // has no error channel: catch it here, reset the sequence state the
+        // half-finished turn left behind, and fail THIS task instead of the
+        // process. The panic message carries the worker/layer diagnostics.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.runner
-                .generate_reason(&prompt_ids, max_new, &sampling_cfg);
+                .generate_reason(&prompt_ids, max_new, &sampling_cfg)
+        }));
+        let (generated, hit_context_cap) = match outcome {
+            Ok(r) => r,
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "forward panicked".to_string());
+                warn!(task = %task.task_id, error = %msg, "single-stage forward failed; task aborted");
+                self.runner.reset();
+                return vec![(task.task_id.clone(), Chunk::error(task.task_id, msg))];
+            }
+        };
         let n_tokens = generated.len() as u32;
         let elapsed = started.elapsed().as_secs_f64();
         info!(

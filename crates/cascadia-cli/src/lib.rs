@@ -271,6 +271,24 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub api: Option<String>,
 
+    /// Expert-parallel driver (`sparse-moe`, Inkling): comma-separated
+    /// `host:port` of the expert workers to dispatch MoE work to. This rank
+    /// then runs every layer's attention locally and holds no expert weights;
+    /// start the workers first. Implies `--total 1`.
+    #[arg(long, value_delimiter = ',')]
+    pub ep_workers: Vec<String>,
+
+    /// Expert-parallel worker: serve expert shard N (0-based) of
+    /// `--ep-worker-count` for every MoE layer on `--listen`, and nothing
+    /// else — no API, no attention. Experts homed on this shard are those with
+    /// `expert_id % count == N`.
+    #[arg(long)]
+    pub ep_worker_index: Option<u32>,
+
+    /// Expert-parallel worker: number of expert shards (= workers).
+    #[arg(long)]
+    pub ep_worker_count: Option<u32>,
+
     /// OpenVINO device target. Forwarded verbatim to ov::Core::compile_model.
     ///
     /// Valid forms:
@@ -652,6 +670,13 @@ pub struct RunArgs {
     #[arg(long)]
     pub prefix_cache_gb: Option<f64>,
 
+    /// Expert-parallel driver (`sparse-moe`, Inkling): comma-separated
+    /// `host:port` of running expert workers (`cascadia worker
+    /// --ep-worker-index N --ep-worker-count W --listen :port`). See
+    /// `cascadia worker --help`.
+    #[arg(long, value_delimiter = ',')]
+    pub ep_workers: Vec<String>,
+
     /// Largest chat-completions request body in MiB (rendered prompt capped
     /// alike). See `cascadia worker --help`.
     #[arg(long, default_value_t = 1.0)]
@@ -681,6 +706,7 @@ impl WorkerArgs {
         api: String,
         prefix_cache_gb: Option<f64>,
         api_max_body_mb: f64,
+        ep_workers: Vec<String>,
     ) -> Self {
         WorkerArgs {
             rank: 0,
@@ -696,6 +722,9 @@ impl WorkerArgs {
             engine,
             prefix_cache_gb,
             api_max_body_mb,
+            ep_workers,
+            ep_worker_index: None,
+            ep_worker_count: None,
             ov_cache_dir: None,
             ov_kv_precision: None,
             ov_dyn_quant_group: None,
@@ -942,6 +971,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         args.api,
         args.prefix_cache_gb,
         args.api_max_body_mb,
+        args.ep_workers,
     );
     cmd_worker(worker).await
 }
@@ -1476,6 +1506,16 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
             cfg.ffn_axpy_prebuild = args.ffn_axpy_prebuild;
             cfg.ffn_sparsity_thresholds_file = args.ffn_sparsity_thresholds_file.clone();
             cfg.ffn_sparsity_capture_dir = args.ffn_sparsity_capture_dir.clone();
+            // Expert-parallel roles (Inkling).
+            cfg.ep_workers = args
+                .ep_workers
+                .iter()
+                .map(|w| parse_addr(w, "127.0.0.1"))
+                .collect::<Result<Vec<_>>>()?;
+            cfg.ep_worker = match (args.ep_worker_index, args.ep_worker_count) {
+                (Some(i), Some(n)) => Some((i, n)),
+                _ => None,
+            };
             // Issue #38: capture surfaces silu(gate) via the AXPY
             // scratch — if the user asked to capture but didn't ask
             // for AXPY, warn (the capture will silently be empty
@@ -1766,7 +1806,40 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     // engine). Cheap, pure, and the same answer either side of the load.
     let prefix_cache_bytes = resolve_prefix_cache_bytes(args.prefix_cache_gb)?;
     let max_body = resolve_api_max_body_bytes(args.api_max_body_mb)?;
-    let is_first = args.rank == 0;
+    // Expert-parallel roles (Inkling): a worker relays expert work like a
+    // non-first pipeline stage (listens, no API); a driver is a single stage
+    // that also dials its workers.
+    let ep_worker = match (args.ep_worker_index, args.ep_worker_count) {
+        (Some(i), Some(n)) if n == 0 || i >= n => {
+            return Err(anyhow!(
+                "--ep-worker-index {i} out of range for --ep-worker-count {n}"
+            ))
+        }
+        (Some(i), Some(n)) => Some((i, n)),
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(anyhow!(
+                "--ep-worker-index and --ep-worker-count go together"
+            ))
+        }
+        (None, None) => None,
+    };
+    if ep_worker.is_some() && !args.ep_workers.is_empty() {
+        return Err(anyhow!(
+            "a process is either an expert worker or a driver, not both"
+        ));
+    }
+    if (ep_worker.is_some() || !args.ep_workers.is_empty()) && args.total != 1 {
+        return Err(anyhow!(
+            "expert-parallel roles run with --total 1 (the driver is the whole pipeline)"
+        ));
+    }
+    if (ep_worker.is_some() || !args.ep_workers.is_empty()) && args.engine != EngineKind::SparseMoe
+    {
+        return Err(anyhow!(
+            "expert-parallel roles are sparse-moe (Inkling) only"
+        ));
+    }
+    let is_first = args.rank == 0 && ep_worker.is_none();
     let is_last = args.rank == args.total - 1;
 
     // Only rank 0 reaches the API bind; every other rank returns from the
@@ -1789,6 +1862,8 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     let upstream = if is_first {
         None
     } else {
+        // An expert worker listens for its driver exactly like a pipeline
+        // stage listens for its upstream.
         Some(PeerEndpoint::new(listen_host.clone(), listen_port))
     };
     let downstream = if is_last {
@@ -2581,6 +2656,7 @@ mod python_tests {
             ":8000".into(),
             None,
             1.0,
+            Vec::new(),
         );
         a.engine = engine;
         a
@@ -2993,6 +3069,7 @@ mod ov_property_tests {
             "127.0.0.1:8080".into(),
             None,
             1.0,
+            Vec::new(),
         )
     }
 
@@ -3436,6 +3513,7 @@ mod tests {
             args.api,
             args.prefix_cache_gb,
             args.api_max_body_mb,
+            Vec::new(),
         );
         assert_eq!(worker.prefix_cache_gb, Some(0.0));
         assert_eq!(worker.api_max_body_mb, 2.0);
