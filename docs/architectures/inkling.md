@@ -254,13 +254,32 @@ layer); Linux is indifferent (miner 24c/48t: 14.2 → 13.4).
 Per generated token the engine touches ~41B active parameters: ~21.7B routed
 expert weights (int4, ~11 GB of reads), ~7.2B shared-expert weights, ~8.7B
 attention weights and the dense/embed/unembed tables (bf16, ~36 GB resident).
-RAM-resident at 100 GB/s that is roughly 0.3–0.5 s/token. With the 490 GB of
-routed experts paged from the miner's SATA SSD into 172 GB of RAM, measured
-decode is 8–25 s/token (0.05–0.12 tok/s) and a cold 25-token prefill takes
-~3 minutes — the SSD, not the shell, is the clock. A "record" run needs the
-int4 artifact (512 GB) resident: a ≥640 GB-RAM box, or an N-rank pipeline
-whose ranks together hold it (e.g. 4 × 160 GB), plus the prefix cache and
-expert-residency follow-ups below.
+With the 490 GB of routed experts paged from the miner's SATA SSD into 172 GB
+of RAM, measured decode is 8–25 s/token (0.05–0.12 tok/s) and a cold 25-token
+prefill takes ~3 minutes — the SSD, not the shell, is the clock there.
+
+**RAM-resident, measured (2019 Mac Pro, Xeon W-3275M 28c/56t, 1.5 TB, macOS
+12.7, the whole export `mlock`'d, 28 threads; same binary and prompts as the
+miner runs, answers byte-identical):**
+
+| | port as first merged (mmap, 56 threads) | + concurrent experts, pin, physical cores |
+|---|---|---|
+| load (wire 490 GB) | 70 s + 328 s first touch | 812 s (≈0.6 GB/s) |
+| TTFT, 25-token prompt | 39.6 s | **12.5 s** |
+| 64-token answer, wall | 227 s | **53.9 s** |
+| decode | 3.0 s/token, 0.33 tok/s | **0.66 s/token, 1.5 tok/s** |
+| prefill | 1.6 s/token | 0.5 s/token (per token, like decode: no row batching yet) |
+
+The first resident run showed the shell, not memory, was the clock (3 s/token
+against a ~0.4 s bandwidth floor): the experts ran serially, the per-token
+bin copy cost 2×, macOS re-faulted cached pages, and 56 hyperthreads tripled
+the GEMV time. The four schedule changes (all bit-identical, byte-compared
+on an 8-layer dump) are what the second column measures; the remaining gap
+to the bandwidth floor is the bf16 attention GEMVs, per-row dequant and the
+unbatched prefill — the follow-ups below. A "record" run therefore wants the
+int4 artifact (512 GB) resident — a ≥640 GB-RAM box with the pin, or an
+N-rank pipeline whose ranks together hold it (e.g. 4 × 160 GB) — plus those
+follow-ups.
 
 ### Expert-parallel dispatch (star topology)
 
@@ -298,6 +317,13 @@ their expert bins concurrently); the network round per MoE layer costs
 ~0.15–0.2 ms on loopback. When it pays and when it does not across real
 boxes — one LAN round per MoE layer, the driver's own attention reads as the
 serial floor — is worked through in the scaling note.
+
+Resident (Mac Pro, export pinned, driver on 28 threads + 3 workers on 9
+each, loopback): same byte-identical answers; TTFT 13.6 s vs 12.5 s single
+process, 64-token answer 59.9 s vs 53.9 s, decode 0.74 vs 0.66 s/token — the
+star's whole cost on one box is ~1.2 ms per MoE layer (frame round + the
+thread split), which is what a cabled LAN has to stay under to break even
+per §4 of the scaling note.
 
 Topology, bandwidth ceilings and what expert-level routing across boxes would
 buy: [`../perf/INKLING_SCALING.md`](../perf/INKLING_SCALING.md).
