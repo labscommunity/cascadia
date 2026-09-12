@@ -36,6 +36,14 @@ This directory holds per-family deep-dives for non-trivial cases.
   (Qwopus) export recipe.
 - [`minimax-m2.md`](./minimax-m2.md) — MiniMax-M2 on the sparse-MoE
   engine: export pipeline, quantization configs, measured throughput.
+- [`glm5.md`](./glm5.md) — GLM-5 on the sparse-MoE engine's pure-Rust
+  shell path (MLA + DSA indexer, int4 mmap experts, N-rank pipeline).
+- [`deepseek-v4.md`](./deepseek-v4.md) — DeepSeek-V4 on the same path
+  (MQA-on-latent, sliding window + compressor, hash routing).
+- [`inkling.md`](./inkling.md) — Inkling / Inkling-Small (Thinking
+  Machines, 975B/276B MoE) on the same path: no-RoPE relative-position
+  bias, short convolutions, sliding/global GQA, shared-expert-aware
+  sigmoid router; streaming exporter for the 1.9 TB checkpoint.
 
 ## How to add a new family
 

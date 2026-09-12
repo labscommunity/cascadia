@@ -129,6 +129,36 @@ impl StFile {
         Ok((ti.shape.clone(), out))
     }
 
+    /// The tensor as bf16 bits (accepts BF16, F32, F16). A BF16 tensor is a
+    /// straight copy of its little-endian payload — no widen-to-f32 pass and
+    /// no f32 transient, which matters for multi-GiB bf16 tables (the Inkling
+    /// embed / unembed and every attention projection). F32 / F16 are
+    /// narrowed with round-to-nearest-even, exactly `bf16::from_f32(f32(x))`,
+    /// so the result equals [`Self::f32`] narrowed element by element for
+    /// every dtype.
+    pub fn bf16_bits(&self, name: &str) -> Result<(Vec<usize>, Vec<u16>), StError> {
+        let (ti, b) = self.bytes(name)?;
+        let out: Vec<u16> = match ti.dtype.as_str() {
+            "BF16" => {
+                let mut out = vec![0u16; b.len() / 2];
+                for (o, c) in out.iter_mut().zip(b.chunks_exact(2)) {
+                    *o = u16::from_le_bytes([c[0], c[1]]);
+                }
+                out
+            }
+            "F32" => b
+                .chunks_exact(4)
+                .map(|c| bf16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]])).to_bits())
+                .collect(),
+            "F16" => b
+                .chunks_exact(2)
+                .map(|c| bf16::from_f32(half::f16::from_le_bytes([c[0], c[1]]).to_f32()).to_bits())
+                .collect(),
+            other => return Err(StError::Dtype(other.into(), name.into())),
+        };
+        Ok((ti.shape.clone(), out))
+    }
+
     /// Decode to i32 (accepts I32, I64 with lossy narrow).
     pub fn i32(&self, name: &str) -> Result<(Vec<usize>, Vec<i32>), StError> {
         let (ti, b) = self.bytes(name)?;

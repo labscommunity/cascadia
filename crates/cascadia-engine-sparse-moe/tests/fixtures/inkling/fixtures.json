@@ -1,0 +1,988 @@
+{
+  "transformers_version": "5.16.1",
+  "torch_version": "2.14.0",
+  "seed": 7,
+  "weight_init": "N(0, 0.05) bf16-rounded; norms/global_scale 1 + N(0, 0.05); unembed N(0, 0.5); attn.rel_logits_proj.proj N(0, 0.5)",
+  "tiny_config": {
+    "model_type": "inkling_mm_model",
+    "architectures": [
+      "InklingForConditionalGeneration"
+    ],
+    "text_config": {
+      "model_type": "inkling_text",
+      "hidden_size": 64,
+      "num_hidden_layers": 4,
+      "vocab_size": 128,
+      "unpadded_vocab_size": 120,
+      "num_attention_heads": 4,
+      "num_key_value_heads": 2,
+      "head_dim": 16,
+      "swa_num_attention_heads": 4,
+      "swa_num_key_value_heads": 2,
+      "swa_head_dim": 16,
+      "d_rel": 4,
+      "rel_extent": 8,
+      "sliding_window_size": 4,
+      "local_layer_ids": [
+        0,
+        1,
+        2
+      ],
+      "dense_mlp_idx": 1,
+      "dense_intermediate_size": 64,
+      "intermediate_size": 32,
+      "moe_intermediate_size": 32,
+      "n_routed_experts": 8,
+      "num_experts_per_tok": 2,
+      "n_shared_experts": 2,
+      "route_scale": 8.0,
+      "rms_norm_eps": 1e-06,
+      "log_scaling_n_floor": 4,
+      "log_scaling_alpha": 0.1,
+      "logits_mup_width_multiplier": 2.0,
+      "sconv_kernel_size": 4,
+      "hidden_act": "silu",
+      "eos_token_id": 127,
+      "gate_activation": "sigmoid",
+      "norm_after_topk": true,
+      "use_global_scale": true,
+      "use_gate_bias": true,
+      "use_sconv": true,
+      "use_embed_norm": true,
+      "shared_expert_sink": true,
+      "q_bias": false,
+      "o_bias": false,
+      "final_logit_softcapping": null
+    }
+  },
+  "manifest": {
+    "arch": "inkling",
+    "num_layers": 4,
+    "hidden_size": 64,
+    "vocab_size": 128,
+    "unpadded_vocab_size": 120,
+    "num_attention_heads": 4,
+    "num_kv_heads": 2,
+    "head_dim": 16,
+    "swa_num_attention_heads": 4,
+    "swa_num_kv_heads": 2,
+    "swa_head_dim": 16,
+    "d_rel": 4,
+    "rel_extent": 8,
+    "sliding_window": 4,
+    "layer_types": [
+      "sliding",
+      "sliding",
+      "sliding",
+      "global"
+    ],
+    "dense_layers": [
+      0
+    ],
+    "dense_intermediate": 64,
+    "moe_intermediate": 32,
+    "num_experts": 8,
+    "top_k": 2,
+    "n_shared_experts": 2,
+    "route_scale": 8.0,
+    "rms_norm_eps": 1e-06,
+    "log_scaling_n_floor": 4,
+    "log_scaling_alpha": 0.1,
+    "logits_mup_width_multiplier": 2.0,
+    "conv_kernel_size": 4,
+    "eos_token_ids": [
+      127
+    ],
+    "hidden_act": "silu",
+    "experts_format": "int4_bin",
+    "shell_backend": "rust_inkling",
+    "has_mtp": false
+  },
+  "prompt_ids": [
+    5,
+    33,
+    81,
+    53,
+    92,
+    85,
+    83,
+    43,
+    74,
+    10,
+    86,
+    84
+  ],
+  "prompt_seed": 439,
+  "greedy_ids": [
+    28,
+    48,
+    106,
+    84,
+    28,
+    48,
+    106,
+    84
+  ],
+  "first_logits_argmax": [
+    45,
+    93,
+    119,
+    89,
+    67,
+    54,
+    10,
+    56,
+    102,
+    102,
+    4,
+    28
+  ],
+  "argmax_top2_logit_margins": {
+    "prompt": [
+      0.3717498779296875,
+      0.8234448432922363,
+      0.9502310752868652,
+      0.36803531646728516,
+      1.6090941429138184,
+      0.7727482318878174,
+      0.6631956100463867,
+      0.791968822479248,
+      0.751251220703125,
+      2.6114063262939453,
+      1.8083786964416504,
+      1.854769229888916
+    ],
+    "greedy": [
+      1.854769229888916,
+      1.4371938705444336,
+      0.4838862419128418,
+      0.4171147346496582,
+      1.6031441688537598,
+      1.051018238067627,
+      0.24388504028320312,
+      0.3796238899230957
+    ]
+  },
+  "argmax_margin_floor": {
+    "required": 0.15,
+    "f32_and_int4_roundtrip": 0.24388551712036133
+  },
+  "relpos_bias_to_score_rms": {
+    "required_ratio": 0.5,
+    "per_layer": {
+      "0": {
+        "score_rms": 0.24730925261974335,
+        "bias_rms": 0.35352760553359985,
+        "ratio": 1.4294960733926734,
+        "pairs": 168
+      },
+      "1": {
+        "score_rms": 0.24890606105327606,
+        "bias_rms": 0.31894639134407043,
+        "ratio": 1.281392626577313,
+        "pairs": 168
+      },
+      "2": {
+        "score_rms": 0.2531188130378723,
+        "bias_rms": 0.5915018916130066,
+        "ratio": 2.3368547146454284,
+        "pairs": 168
+      },
+      "3": {
+        "score_rms": 0.26649484038352966,
+        "bias_rms": 0.4816263020038605,
+        "ratio": 1.8072631399194126,
+        "pairs": 312
+      }
+    },
+    "note": "rms over the allowed (q,k) pairs of the prompt prefill; score = q.k/head_dim, bias = r.proj[:, dist], both tau-scaled"
+  },
+  "gate": {
+    "layer": 1,
+    "idx_order": "selection score (sigmoid(logit)+bias) descending, ties -> lower id",
+    "logits": "[num_experts + n_shared]: routed first, shared last"
+  },
+  "conventions": {
+    "sliding_window": "allowed iff q_idx - kv_idx < sliding_window (window keys incl. current)",
+    "sconv": "out[p,c] = sum_j w[c,j]*u[p-3+j,c], u[<0]=0, returns out+u; w[:,3] hits the current token",
+    "attn_out": "o_proj output (before attn_sconv), positions 0..5, layer 3 log-scaled (tau at p>=4)",
+    "layer_out": "decoder-layer output (after mlp_sconv + residual), i.e. the next layer's input",
+    "final_logits": "rmsnorm(x, norm)/mup @ unembed^T, sliced to unpadded_vocab_size",
+    "weights": "checkpoint names; w13 rows interleaved (2i = gate_i, 2i+1 = up_i); convs [C,1,K]",
+    "dtypes": "all floats f32 (bf16-exact weights); prompt_ids/greedy_ids/gate_idx i64"
+  },
+  "spec_vs_hf_max_rel_err": {
+    "layer0_out": 8.17043594749972e-08,
+    "layer1_out": 8.181511077643276e-08,
+    "layer2_out": 1.2106419299698527e-07,
+    "layer3_out": 1.2113212995830147e-07,
+    "final_logits": 2.2335956914832548e-07,
+    "sconv_out": 0.0,
+    "relpos_bias": 0.0,
+    "gate_w": 5.90117978746783e-08,
+    "gate_gamma": 0.0,
+    "attn_out": 8.675324003832064e-08,
+    "attn_out_sliding": 9.765699387163301e-08,
+    "moe_out": 2.563030560141102e-07
+  },
+  "tensors": {
+    "prompt_ids": [
+      [
+        12
+      ],
+      "int64"
+    ],
+    "greedy_ids": [
+      [
+        8
+      ],
+      "int64"
+    ],
+    "layer0_out": [
+      [
+        12,
+        64
+      ],
+      "float32"
+    ],
+    "layer1_out": [
+      [
+        12,
+        64
+      ],
+      "float32"
+    ],
+    "layer2_out": [
+      [
+        12,
+        64
+      ],
+      "float32"
+    ],
+    "layer3_out": [
+      [
+        12,
+        64
+      ],
+      "float32"
+    ],
+    "final_logits": [
+      [
+        12,
+        120
+      ],
+      "float32"
+    ],
+    "sconv_in": [
+      [
+        8,
+        6
+      ],
+      "float32"
+    ],
+    "sconv_w": [
+      [
+        8,
+        4
+      ],
+      "float32"
+    ],
+    "sconv_out": [
+      [
+        8,
+        6
+      ],
+      "float32"
+    ],
+    "relpos_r": [
+      [
+        4,
+        4
+      ],
+      "float32"
+    ],
+    "relpos_proj": [
+      [
+        4,
+        8
+      ],
+      "float32"
+    ],
+    "relpos_bias": [
+      [
+        4,
+        10
+      ],
+      "float32"
+    ],
+    "gate_x": [
+      [
+        1,
+        64
+      ],
+      "float32"
+    ],
+    "gate_logits": [
+      [
+        10
+      ],
+      "float32"
+    ],
+    "gate_bias": [
+      [
+        8
+      ],
+      "float32"
+    ],
+    "gate_global_scale": [
+      [
+        1
+      ],
+      "float32"
+    ],
+    "gate_idx": [
+      [
+        2
+      ],
+      "int64"
+    ],
+    "gate_w": [
+      [
+        2
+      ],
+      "float32"
+    ],
+    "gate_gamma": [
+      [
+        2
+      ],
+      "float32"
+    ],
+    "attn_out": [
+      [
+        6,
+        64
+      ],
+      "float32"
+    ],
+    "attn_out_sliding": [
+      [
+        6,
+        64
+      ],
+      "float32"
+    ],
+    "attn_x": [
+      [
+        6,
+        64
+      ],
+      "float32"
+    ],
+    "moe_x": [
+      [
+        1,
+        64
+      ],
+      "float32"
+    ],
+    "moe_out": [
+      [
+        1,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.embed.weight": [
+      [
+        128,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.0.attn.wq_du.weight": [
+      [
+        64,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.0.attn.wk_dv.weight": [
+      [
+        32,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.0.attn.wv_dv.weight": [
+      [
+        32,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.0.attn.wr_du.weight": [
+      [
+        16,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.0.attn.wo_ud.weight": [
+      [
+        64,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.0.attn.k_sconv.weight": [
+      [
+        32,
+        1,
+        4
+      ],
+      "float32"
+    ],
+    "model.llm.layers.0.attn.v_sconv.weight": [
+      [
+        32,
+        1,
+        4
+      ],
+      "float32"
+    ],
+    "model.llm.layers.0.attn.q_norm.weight": [
+      [
+        16
+      ],
+      "float32"
+    ],
+    "model.llm.layers.0.attn.k_norm.weight": [
+      [
+        16
+      ],
+      "float32"
+    ],
+    "model.llm.layers.0.attn.rel_logits_proj.proj": [
+      [
+        4,
+        4
+      ],
+      "float32"
+    ],
+    "model.llm.layers.0.mlp.global_scale": [
+      [
+        1
+      ],
+      "float32"
+    ],
+    "model.llm.layers.0.mlp.w2_md.weight": [
+      [
+        64,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.0.attn_norm.weight": [
+      [
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.0.mlp_norm.weight": [
+      [
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.0.attn_sconv.weight": [
+      [
+        64,
+        1,
+        4
+      ],
+      "float32"
+    ],
+    "model.llm.layers.0.mlp_sconv.weight": [
+      [
+        64,
+        1,
+        4
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.attn.wq_du.weight": [
+      [
+        64,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.attn.wk_dv.weight": [
+      [
+        32,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.attn.wv_dv.weight": [
+      [
+        32,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.attn.wr_du.weight": [
+      [
+        16,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.attn.wo_ud.weight": [
+      [
+        64,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.attn.k_sconv.weight": [
+      [
+        32,
+        1,
+        4
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.attn.v_sconv.weight": [
+      [
+        32,
+        1,
+        4
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.attn.q_norm.weight": [
+      [
+        16
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.attn.k_norm.weight": [
+      [
+        16
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.attn.rel_logits_proj.proj": [
+      [
+        4,
+        4
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.mlp.gate.weight": [
+      [
+        10,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.mlp.gate.global_scale": [
+      [
+        1
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.mlp.gate.bias": [
+      [
+        8
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.mlp.experts.w13_weight": [
+      [
+        8,
+        64,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.mlp.experts.w2_weight": [
+      [
+        8,
+        64,
+        32
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.mlp.shared_experts.shared_w2_weight": [
+      [
+        2,
+        64,
+        32
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.attn_norm.weight": [
+      [
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.mlp_norm.weight": [
+      [
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.attn_sconv.weight": [
+      [
+        64,
+        1,
+        4
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.mlp_sconv.weight": [
+      [
+        64,
+        1,
+        4
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.attn.wq_du.weight": [
+      [
+        64,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.attn.wk_dv.weight": [
+      [
+        32,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.attn.wv_dv.weight": [
+      [
+        32,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.attn.wr_du.weight": [
+      [
+        16,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.attn.wo_ud.weight": [
+      [
+        64,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.attn.k_sconv.weight": [
+      [
+        32,
+        1,
+        4
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.attn.v_sconv.weight": [
+      [
+        32,
+        1,
+        4
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.attn.q_norm.weight": [
+      [
+        16
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.attn.k_norm.weight": [
+      [
+        16
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.attn.rel_logits_proj.proj": [
+      [
+        4,
+        4
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.mlp.gate.weight": [
+      [
+        10,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.mlp.gate.global_scale": [
+      [
+        1
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.mlp.gate.bias": [
+      [
+        8
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.mlp.experts.w13_weight": [
+      [
+        8,
+        64,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.mlp.experts.w2_weight": [
+      [
+        8,
+        64,
+        32
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.mlp.shared_experts.shared_w2_weight": [
+      [
+        2,
+        64,
+        32
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.attn_norm.weight": [
+      [
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.mlp_norm.weight": [
+      [
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.attn_sconv.weight": [
+      [
+        64,
+        1,
+        4
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.mlp_sconv.weight": [
+      [
+        64,
+        1,
+        4
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.attn.wq_du.weight": [
+      [
+        64,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.attn.wk_dv.weight": [
+      [
+        32,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.attn.wv_dv.weight": [
+      [
+        32,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.attn.wr_du.weight": [
+      [
+        16,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.attn.wo_ud.weight": [
+      [
+        64,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.attn.k_sconv.weight": [
+      [
+        32,
+        1,
+        4
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.attn.v_sconv.weight": [
+      [
+        32,
+        1,
+        4
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.attn.q_norm.weight": [
+      [
+        16
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.attn.k_norm.weight": [
+      [
+        16
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.attn.rel_logits_proj.proj": [
+      [
+        4,
+        8
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.mlp.gate.weight": [
+      [
+        10,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.mlp.gate.global_scale": [
+      [
+        1
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.mlp.gate.bias": [
+      [
+        8
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.mlp.experts.w13_weight": [
+      [
+        8,
+        64,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.mlp.experts.w2_weight": [
+      [
+        8,
+        64,
+        32
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.mlp.shared_experts.shared_w2_weight": [
+      [
+        2,
+        64,
+        32
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.attn_norm.weight": [
+      [
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.mlp_norm.weight": [
+      [
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.attn_sconv.weight": [
+      [
+        64,
+        1,
+        4
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.mlp_sconv.weight": [
+      [
+        64,
+        1,
+        4
+      ],
+      "float32"
+    ],
+    "model.llm.norm.weight": [
+      [
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.embed_norm.weight": [
+      [
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.unembed.weight": [
+      [
+        128,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.0.mlp.w13_dn.weight": [
+      [
+        128,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.1.mlp.shared_experts.shared_w13_weight": [
+      [
+        2,
+        64,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.2.mlp.shared_experts.shared_w13_weight": [
+      [
+        2,
+        64,
+        64
+      ],
+      "float32"
+    ],
+    "model.llm.layers.3.mlp.shared_experts.shared_w13_weight": [
+      [
+        2,
+        64,
+        64
+      ],
+      "float32"
+    ]
+  }
+}

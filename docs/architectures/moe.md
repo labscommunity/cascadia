@@ -31,6 +31,7 @@ Each MoE family routes differently:
 | **GraniteMoE** | varies | varies | none | dropless routing | |
 | **HunYuan-Large / A13B** | many | small | yes | shared + specialised | |
 | **Gemma 4 26B-A4B** | (unknown; see config) | — | — | — | wrapper around `Gemma4ForConditionalGeneration` with `enable_moe_block: True` |
+| **Inkling / Inkling-Small** (Thinking Machines) | 256 routed + 2 shared | 6 | 2 (own gammas) | sigmoid + bias; normalised over selected **and** shared | no RoPE (learned relative-position bias), short convs, 5:1 sliding/global — see [inkling.md](inkling.md) |
 
 Each variant needs its own export branch — there is no "one MoE forward"
 that fits them all. The choices that differ:
@@ -67,10 +68,14 @@ MiniMax-M2 ([minimax-m2.md](minimax-m2.md) documents the
 pipeline). The Kimi K2.6 artefacts come from an external export
 pipeline that is not part of this repo.
 
-If/when Cascadia grows support for more MoE families (Mixtral and the
-Gemma 4 26B-A4B are the obvious candidates), each would land as its
-own `export_<family>.py` beside the generic exporter — the MiniMax-M2
-and Gemma 4 exporters set the pattern.
+Three more families run through the engine's **pure-Rust shell + int4
+mmap expert** path (no OpenVINO on the critical path, N-rank pipeline
+via `StagedRunner`), each with its own exporter and page:
+GLM-5 ([glm5.md](glm5.md), `tools/export_glm5.py`), DeepSeek-V4
+([deepseek-v4.md](deepseek-v4.md), `tools/export_deepseek_v4.py`) and
+Inkling ([inkling.md](inkling.md), `tools/export_inkling.py`). New
+families land the same way: a per-family `export_<family>.py`, a
+`src/<family>/` shell, and goldens against the HF implementation.
 
 ## Until then
 

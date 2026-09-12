@@ -215,6 +215,17 @@ impl MmapExpert {
         &self.path
     }
 
+    /// Whether this expert's bin is (almost) entirely resident in RAM right
+    /// now: at least 90% of 64 pages sampled across it are in core. A resident
+    /// expert is cheaper to compute straight off the mapping than to copy
+    /// first; a paged-out one streams faster as one bulk sequential read
+    /// ([`Self::read_bytes`]). `false` when the OS query is unavailable, so
+    /// the caller keeps the streaming path.
+    pub fn mostly_resident(&self) -> bool {
+        let (resident, probed) = self.resident_pages_sampled(64);
+        probed > 0 && resident * 10 >= probed * 9
+    }
+
     /// Estimate how many of this expert's mapped pages are resident in RAM right
     /// now, by probing `samples` pages spread evenly across the bin. Returns
     /// `(resident, probed)`; `(0, 0)` if the OS query is unavailable or fails.

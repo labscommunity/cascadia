@@ -90,6 +90,15 @@ pub struct SparseMoEBuilderConfig {
     /// compile at all).
     pub ov_properties: Vec<(String, String)>,
     pub max_cached_experts: u32,
+    /// Expert-parallel driver: the expert workers (`host:port`) this rank
+    /// dispatches MoE work to (Inkling family). Non-empty ⇒ this rank runs
+    /// every layer's attention/router locally and holds NO expert weights;
+    /// `total` must be 1. See `docs/perf/INKLING_SCALING.md`.
+    pub ep_workers: Vec<(String, u16)>,
+    /// Expert-parallel worker: `(index, count)` — this process serves the
+    /// experts homed on shard `index` of `count` for every MoE layer and
+    /// nothing else (no attention, no sequence state, no API).
+    pub ep_worker: Option<(u32, u32)>,
     /// Pipeline stage index (0-based).
     pub rank: u32,
     /// Number of pipeline stages.
@@ -191,6 +200,8 @@ impl SparseMoEBuilderConfig {
             // `CASCADIA_MAX_EXPERTS_CACHED` overrides this if set.
             // See PowerInfer SmallThinker `MAX_N_CACHED` (MIT).
             max_cached_experts: 0,
+            ep_workers: Vec::new(),
+            ep_worker: None,
             rank: 0,
             total: 1,
             top_k_override: None,
@@ -313,13 +324,74 @@ pub struct SparseMoEBuilder {
     dsv4_runner: Option<crate::dsv4::stage::Dsv4Runner>,
     /// Set when the manifest's arch is "glm5" (Rust glm5 shell + int4 experts).
     glm_runner: Option<crate::glm::stage::GlmRunner>,
+    /// Set when the manifest's arch is "inkling" (Rust Inkling shell + int4 experts).
+    inkling_runner: Option<crate::inkling::stage::InklingRunner>,
+    /// Expert-parallel driver: one connection per expert worker (`ep_workers`).
+    ep_clients: Vec<Arc<TokioMutex<ActivationClient>>>,
+    /// Expert-parallel worker: the driver's connection (`ep_worker`).
+    ep_server: Option<Arc<TokioMutex<ActivationServer>>>,
+    /// Expert-parallel worker: its expert shard, loaded in `load`.
+    ep_bank: Option<crate::inkling::ep::ExpertBank>,
     tokenizer: Option<Tokenizer>,
     listen_host: String,
     listen_port: Option<u16>,
     transport: StageTransport,
 }
 
+/// The `arch` string of `<dir>/manifest.json`, read as raw JSON (the Rust-shell
+/// families each carry their own manifest schema, so the family is chosen
+/// before any strict parse).
+fn peek_arch(dir: &std::path::Path) -> Option<String> {
+    let s = std::fs::read_to_string(dir.join("manifest.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    v.get("arch").and_then(|a| a.as_str()).map(str::to_owned)
+}
+
+/// Outbound connect timeout for chain/star formation: a peer only starts
+/// listening after it has loaded its multi-GB slice, so this must out-wait
+/// the slowest cold load. Default 300 s; `CASCADIA_CONNECT_TIMEOUT_SECS`
+/// overrides.
+fn connect_timeout() -> std::time::Duration {
+    let secs = std::env::var("CASCADIA_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(300);
+    std::time::Duration::from_secs(secs)
+}
+
+/// `CASCADIA_<FAMILY>_MAX_SEQ` when set to a positive integer (`=0` and junk
+/// fall through to `default`), so every family reads the knob the same way.
+fn env_max_seq(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
 impl SparseMoEBuilder {
+    /// Rank 0 (the API rank) needs the tokenizer; workers drive themselves from
+    /// the hidden states on the wire. Shared by every Rust-shell family.
+    fn load_rank0_tokenizer(&mut self, rank: u32, family: &str) -> EngineResult<()> {
+        if rank != 0 {
+            return Ok(());
+        }
+        let tok_path = self.config.model_dir.join("tokenizer.json");
+        if tok_path.exists() {
+            self.tokenizer = Some(
+                Tokenizer::from_file(&tok_path)
+                    .map_err(|e| EngineError::Backend(format!("load tokenizer.json: {e}")))?,
+            );
+        } else {
+            warn!(
+                "no tokenizer.json at {} — {family} engine will only accept pre-tokenized inputs",
+                tok_path.display()
+            );
+        }
+        Ok(())
+    }
+
     pub fn new(config: SparseMoEBuilderConfig) -> Self {
         Self {
             config,
@@ -327,6 +399,10 @@ impl SparseMoEBuilder {
             ov_runner: None,
             dsv4_runner: None,
             glm_runner: None,
+            inkling_runner: None,
+            ep_clients: Vec::new(),
+            ep_server: None,
+            ep_bank: None,
             tokenizer: None,
             listen_host: "0.0.0.0".into(),
             listen_port: None,
@@ -343,6 +419,51 @@ impl Builder for SparseMoEBuilder {
     }
 
     async fn connect(&mut self, peers: PeerLayout) -> EngineResult<()> {
+        // Expert-parallel worker: bind the listener the driver dials and wait
+        // for it. Like a pipeline's upstream accept, this blocks until the
+        // driver connects — start workers first, then the driver.
+        if let Some((index, count)) = self.config.ep_worker {
+            if self.config.total > 1 || !self.config.ep_workers.is_empty() {
+                return Err(EngineError::InvalidConfig(
+                    "an expert worker cannot also be a pipeline stage or a driver".into(),
+                ));
+            }
+            let port = self.listen_port.ok_or_else(|| {
+                EngineError::InvalidConfig(
+                    "expert worker requires configure_listen() (--listen) before connect()".into(),
+                )
+            })?;
+            let mut server = ActivationServer::new(self.listen_host.clone(), port);
+            server.start().await.map_err(|e| {
+                EngineError::Backend(format!("listen {}:{}: {}", self.listen_host, port, e))
+            })?;
+            info!(host = %self.listen_host, port, index, count, "expert worker bound; waiting for the driver");
+            server
+                .accept()
+                .await
+                .map_err(|e| EngineError::Backend(format!("accept driver: {e}")))?;
+            info!(index, count, "expert worker: driver connected");
+            self.ep_server = Some(Arc::new(TokioMutex::new(server)));
+            return Ok(());
+        }
+        // Expert-parallel driver: dial every worker (they must already be
+        // listening), then continue as a single-stage engine.
+        if !self.config.ep_workers.is_empty() {
+            if self.config.total > 1 {
+                return Err(EngineError::InvalidConfig(
+                    "--ep-workers runs the driver as a single stage (--total 1)".into(),
+                ));
+            }
+            let timeout = connect_timeout();
+            for (i, (host, port)) in self.config.ep_workers.iter().enumerate() {
+                let mut client = ActivationClient::new(host.clone(), *port);
+                client.connect_with_timeout(timeout).await.map_err(|e| {
+                    EngineError::Backend(format!("connect expert worker {i} at {host}:{port}: {e}"))
+                })?;
+                info!(worker = i, host = %host, port, "expert worker connected");
+                self.ep_clients.push(Arc::new(TokioMutex::new(client)));
+            }
+        }
         let single = self.config.total <= 1;
         let has_upstream = peers.upstream.is_some();
         let has_downstream = peers.downstream.is_some();
@@ -413,6 +534,7 @@ impl Builder for SparseMoEBuilder {
     }
 
     async fn load(&mut self, shard: ShardSpec) -> EngineResult<LoadStream> {
+        crate::init_thread_pool();
         let mut plugin = PluginConfig::new();
         if let Some(d) = &self.config.cache_dir {
             plugin = plugin.with("CACHE_DIR", d.clone());
@@ -425,23 +547,17 @@ impl Builder for SparseMoEBuilder {
         // schema, so peek the arch before the strict Manifest parse. Rust
         // shell + int4 experts; token-by-token pipeline like the M2 path
         // (ids never cross the wire — hash layers live on rank 0).
-        let is_dsv4 = std::fs::read_to_string(self.config.model_dir.join("manifest.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .map(|v| v.get("arch").and_then(|a| a.as_str()) == Some("deepseek_v4"))
-            .unwrap_or(false);
-        if is_dsv4 {
+        if peek_arch(&self.config.model_dir).as_deref() == Some("deepseek_v4") {
             let total = self.config.total.max(1);
             let rank = self.config.rank.min(total - 1);
             // Context budget sizes the rope table + KV/compressed/indexer
             // caches (memory scales with it). Overridable for long-context
             // deployments via CASCADIA_DSV4_MAX_SEQ; fall back to the default on
             // a missing, unparseable, or zero value.
-            let max_seq = std::env::var("CASCADIA_DSV4_MAX_SEQ")
-                .ok()
-                .and_then(|s| s.trim().parse::<usize>().ok())
-                .filter(|&n| n > 0)
-                .unwrap_or(crate::dsv4::stage::DSV4_DEFAULT_MAX_SEQ);
+            let max_seq = env_max_seq(
+                "CASCADIA_DSV4_MAX_SEQ",
+                crate::dsv4::stage::DSV4_DEFAULT_MAX_SEQ,
+            );
             if max_seq > 131072 {
                 warn!(
                     max_seq,
@@ -457,23 +573,88 @@ impl Builder for SparseMoEBuilder {
                 shard.layer_end,
             )
             .map_err(|e| EngineError::Backend(format!("dsv4 load: {e}")))?;
-            if rank == 0 {
-                let tok_path = self.config.model_dir.join("tokenizer.json");
-                if tok_path.exists() {
-                    self.tokenizer =
-                        Some(Tokenizer::from_file(&tok_path).map_err(|e| {
-                            EngineError::Backend(format!("load tokenizer.json: {e}"))
-                        })?);
-                } else {
-                    warn!(
-                        "no tokenizer.json at {} — dsv4 engine will only accept pre-tokenized inputs",
-                        tok_path.display()
-                    );
-                }
-            }
+            self.load_rank0_tokenizer(rank, "dsv4")?;
             self.dsv4_runner = Some(runner);
             return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
                 "loaded DeepSeek-V4 stage (dsv4 Rust shell)",
+            )])));
+        }
+
+        // Inkling shell backend (Thinking Machines' MoE): Rust GQA + relative-bias
+        // + short-conv shells, int4 mmap experts, on the same staged pipeline as
+        // glm5. Its manifest schema differs from the strict Manifest, so peek the
+        // arch first.
+        let arch = peek_arch(&self.config.model_dir);
+        if arch.as_deref() == Some("inkling") {
+            // Expert-parallel worker: only this shard's experts, for every MoE
+            // layer. No runner, no tokenizer, no sequence state.
+            if let Some((index, count)) = self.config.ep_worker {
+                let mode = match self
+                    .config
+                    .experts_mode
+                    .clone()
+                    .or_else(|| std::env::var("CASCADIA_INKLING_EXPERTS").ok())
+                    .as_deref()
+                {
+                    Some("eager") => crate::dsv4::loader::ExpertsMode::Eager,
+                    _ => crate::dsv4::loader::ExpertsMode::Mmap,
+                };
+                let bank = crate::inkling::ep::load_expert_bank(
+                    &self.config.model_dir,
+                    index,
+                    count,
+                    mode,
+                )
+                .map_err(|e| EngineError::Backend(format!("inkling expert bank load: {e}")))?;
+                self.ep_bank = Some(bank);
+                return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
+                    format!("loaded inkling expert shard {index}/{count}"),
+                )])));
+            }
+            let total = self.config.total.max(1);
+            let rank = self.config.rank.min(total - 1);
+            let max_seq = self.config.max_seq.unwrap_or_else(|| {
+                env_max_seq(
+                    "CASCADIA_INKLING_MAX_SEQ",
+                    crate::inkling::stage::INKLING_DEFAULT_MAX_SEQ,
+                )
+            });
+            // Expert-parallel driver: every layer local, experts remote.
+            let remote = if self.ep_clients.is_empty() {
+                None
+            } else {
+                let m = crate::inkling::loader::read_manifest(&self.config.model_dir)
+                    .map_err(|e| EngineError::Backend(format!("inkling manifest: {e}")))?;
+                let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+                    EngineError::Backend("Builder::load outside tokio context".into())
+                })?;
+                info!(
+                    workers = self.ep_clients.len(),
+                    "inkling expert-parallel driver: experts dispatched to workers"
+                );
+                Some(Arc::new(crate::inkling::ep::EpClient::new(
+                    self.ep_clients.clone(),
+                    handle,
+                    m.hidden_size,
+                    m.num_experts,
+                    m.n_shared_experts,
+                )))
+            };
+            let runner = crate::inkling::stage::InklingRunner::load_staged(
+                &self.config.model_dir,
+                max_seq,
+                rank,
+                total,
+                shard.layer_start,
+                shard.layer_end,
+                self.config.experts_mode.clone(),
+                remote,
+            )
+            .map_err(|e| EngineError::Backend(format!("inkling load: {e}")))?;
+            self.load_rank0_tokenizer(rank, "inkling")?;
+            self.inkling_runner = Some(runner);
+            return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
+                "loaded inkling stage (Inkling Rust shell)",
             )])));
         }
 
@@ -481,26 +662,15 @@ impl Builder for SparseMoEBuilder {
         // strict Manifest, so peek the arch first. Rust MLA+DSA shell + int4
         // experts; 1x-width hidden on the same dist wire (no HC copies, no
         // input_ids past rank 0).
-        let is_glm = std::fs::read_to_string(self.config.model_dir.join("manifest.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .map(|v| v.get("arch").and_then(|a| a.as_str()) == Some("glm5"))
-            .unwrap_or(false);
-        if is_glm {
+        if arch.as_deref() == Some("glm5") {
             let total = self.config.total.max(1);
             let rank = self.config.rank.min(total - 1);
-            let max_seq = self
-                .config
-                .max_seq
-                .or_else(|| {
-                    std::env::var("CASCADIA_GLM5_MAX_SEQ")
-                        .ok()
-                        .and_then(|s| s.trim().parse::<usize>().ok())
-                        // `=0` keeps meaning "fall through to the default",
-                        // not "zero context".
-                        .filter(|&n| n > 0)
-                })
-                .unwrap_or(crate::glm::stage::GLM5_DEFAULT_MAX_SEQ);
+            let max_seq = self.config.max_seq.unwrap_or_else(|| {
+                env_max_seq(
+                    "CASCADIA_GLM5_MAX_SEQ",
+                    crate::glm::stage::GLM5_DEFAULT_MAX_SEQ,
+                )
+            });
             let runner = crate::glm::stage::GlmRunner::load_staged(
                 &self.config.model_dir,
                 max_seq,
@@ -519,20 +689,7 @@ impl Builder for SparseMoEBuilder {
                 ),
             )
             .map_err(|e| EngineError::Backend(format!("glm5 load: {e}")))?;
-            if rank == 0 {
-                let tok_path = self.config.model_dir.join("tokenizer.json");
-                if tok_path.exists() {
-                    self.tokenizer =
-                        Some(Tokenizer::from_file(&tok_path).map_err(|e| {
-                            EngineError::Backend(format!("load tokenizer.json: {e}"))
-                        })?);
-                } else {
-                    warn!(
-                        "no tokenizer.json at {} — glm5 engine will only accept pre-tokenized inputs",
-                        tok_path.display()
-                    );
-                }
-            }
+            self.load_rank0_tokenizer(rank, "glm5")?;
             self.glm_runner = Some(runner);
             return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
                 "loaded glm5 stage (glm5 Rust shell)",
@@ -710,6 +867,19 @@ impl Builder for SparseMoEBuilder {
     }
 
     fn build(self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
+        if let Some(bank) = self.ep_bank {
+            let server = self.ep_server.ok_or_else(|| {
+                EngineError::Backend("expert worker built without a driver connection".into())
+            })?;
+            let runtime_handle = tokio::runtime::Handle::try_current()
+                .map_err(|_| EngineError::Backend("Builder::build outside tokio context".into()))?;
+            info!("built inkling expert worker");
+            return Ok(Box::new(crate::inkling::ep::ExpertWorkerEngine::new(
+                bank,
+                server,
+                runtime_handle,
+            )));
+        }
         if let Some(runner) = self.dsv4_runner {
             let total = self.config.total.max(1);
             let rank = self.config.rank.min(total - 1);
@@ -730,6 +900,28 @@ impl Builder for SparseMoEBuilder {
                 total,
                 // dsv4 has no config-threaded prefix cache; `None` keeps its
                 // existing env-only behaviour byte-for-byte.
+                None,
+            )));
+        }
+        if let Some(runner) = self.inkling_runner {
+            let total = self.config.total.max(1);
+            let rank = self.config.rank.min(total - 1);
+            if rank == 0 && self.tokenizer.is_none() {
+                return Err(EngineError::Backend(
+                    "tokenizer.json missing (required for the inkling API rank)".into(),
+                ));
+            }
+            let runtime_handle = tokio::runtime::Handle::try_current()
+                .map_err(|_| EngineError::Backend("Builder::build outside tokio context".into()))?;
+            info!(rank, total, "built inkling engine");
+            return Ok(Box::new(PipelineEngine::new(
+                runner,
+                self.tokenizer,
+                self.transport,
+                runtime_handle,
+                rank,
+                total,
+                // No per-rank KV-prefix cache on this family yet (follow-up).
                 None,
             )));
         }
@@ -3241,6 +3433,9 @@ impl SparseMoEEngine {
             }
             // H.1a: CAPTURE carrying the head's turn tenant; the stash entry is tagged so `export`
             // confines it to that tenant. Relay preserves the v2 form downstream.
+            FrameKind::ExpertDispatch | FrameKind::ExpertResult => Err(format!(
+                "pipeline stage received expert-parallel frame {kind:?} (that is an expert worker's frame)"
+            )),
             #[cfg(feature = "kv_coord")]
             FrameKind::CaptureV2 => {
                 let (epoch, tokens, tenant) = self
@@ -5206,21 +5401,57 @@ impl<R: StagedRunner> PipelineEngine<R> {
                  the response answers only the first {max_seq} tokens"
             );
         }
-        let (generated, hit_context_cap) =
+        // A failure inside the forward (an expert-parallel worker that errored
+        // or dropped, an assertion in a shell) unwinds through the runner, which
+        // has no error channel: catch it here, reset the sequence state the
+        // half-finished turn left behind, and fail THIS task instead of the
+        // process. The panic message carries the worker/layer diagnostics.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.runner
-                .generate_reason(&prompt_ids, max_new, &sampling_cfg);
+                .generate_reason(&prompt_ids, max_new, &sampling_cfg)
+        }));
+        let (generated, hit_context_cap) = match outcome {
+            Ok(r) => r,
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "forward panicked".to_string());
+                warn!(task = %task.task_id, error = %msg, "single-stage forward failed; task aborted");
+                self.runner.reset();
+                return vec![(task.task_id.clone(), Chunk::error(task.task_id, msg))];
+            }
+        };
         let n_tokens = generated.len() as u32;
-        let text = tok.decode(&generated, true).unwrap_or_default();
         let elapsed = started.elapsed().as_secs_f64();
         info!(
             task = %task.task_id,
             tokens = n_tokens,
             elapsed_s = elapsed,
             tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
-            "task done (dsv4 single-stage)"
+            "task done ({} single-stage)",
+            self.runner.arch_name()
         );
-        let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
-        chunk.n_tokens = Some(n_tokens);
+        // One chunk per token (id + UTF-8-safe text delta), exactly what the
+        // pipeline path streams, then an empty final marker — not one
+        // whole-turn text: the API's marker translation (Inkling's
+        // special-token framing → <think>/<tool_call> delimiters) reads the
+        // token ids off each chunk, and a single chunk carrying the whole turn
+        // has no ids to align its text with. Same text, same count.
+        let mut out = Vec::with_capacity(generated.len() + 1);
+        let mut emitted = 0usize;
+        for i in 0..generated.len() {
+            let full = tok.decode(&generated[..=i], true).unwrap_or_default();
+            let delta = utf8_safe_delta(&full, &mut emitted);
+            let mut c = Chunk::token(task.task_id.clone(), generated[i] as i64, delta);
+            c.n_tokens = Some(1);
+            c.token_ids = vec![generated[i] as i64];
+            out.push((task.task_id.clone(), c));
+        }
+        let mut chunk = Chunk::final_marker(task.task_id.clone(), String::new());
+        // The token chunks carry the count; the marker adds none.
+        chunk.n_tokens = Some(0);
         // Same omission as the pipeline path: the API reads this and reported 0.
         // `prompt_ids` is already truncated to the context budget above, so its
         // length is the count actually processed.
@@ -5230,7 +5461,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
         } else {
             finish_reason_for(n_tokens as usize, max_new)
         });
-        vec![(task.task_id.clone(), chunk)]
+        out.push((task.task_id.clone(), chunk));
+        out
     }
 
     /// Rank-0 driver: embed + my layers (with the token id for the hash
@@ -6083,7 +6315,7 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
                     .map(|e| e.get_ids().to_vec())
                     .unwrap_or_else(|_| vec![1]);
                 let _ = self.runner.generate_argmax(&ids, 1);
-                info!("warmup: generated 1 token (dsv4)");
+                info!(arch = self.runner.arch_name(), "warmup: generated 1 token");
             }
         }
     }

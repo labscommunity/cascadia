@@ -40,6 +40,7 @@ pub mod dist;
 pub mod dsv4;
 pub mod engine;
 pub mod glm;
+pub mod inkling;
 #[cfg(feature = "kv_coord")]
 pub mod kv_coordination;
 pub mod kv_prefix_cache;
@@ -57,6 +58,33 @@ pub mod tensors;
 
 #[doc(hidden)]
 pub use engine::{prepare_resume, ResumeSeed};
+
+/// Size rayon's global pool to the physical cores when `RAYON_NUM_THREADS`
+/// is unset. The row-parallel int4 GEMV kernels gain nothing from a core's
+/// second hyperthread and lose a lot to it on macOS (Mac Pro, 28c/56t:
+/// 33 → 10 ms per Inkling MoE layer); Linux is indifferent (miner,
+/// 24c/48t: 14.2 → 13.4 ms). Called at engine load and by the bench
+/// examples; a no-op once a pool exists (a host that built its own keeps
+/// it) and whenever the operator set `RAYON_NUM_THREADS`.
+pub fn init_thread_pool() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("RAYON_NUM_THREADS").is_some() {
+            return;
+        }
+        let phys = num_cpus::get_physical();
+        if phys == 0 {
+            return;
+        }
+        if rayon::ThreadPoolBuilder::new()
+            .num_threads(phys)
+            .build_global()
+            .is_ok()
+        {
+            tracing::info!(threads = phys, "rayon pool sized to the physical cores");
+        }
+    });
+}
 pub use engine::{SparseMoEBuilder, SparseMoEBuilderConfig, SparseMoEEngine};
 pub use kv_prefix_cache::{KvPrefixCache, KvSnapshot, LayerKvSlice, ModelFingerprint};
 pub use manifest::Manifest;
