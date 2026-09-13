@@ -1,0 +1,45 @@
+version: 1
+name: 002_expert_schedule
+hypothesis: Direct resident mmap execution and expert concurrency beat Windows whole-bin
+  copying.
+question: q1
+moonshot: false
+runner:
+  backend: ssh
+  host: cascadia-tate-07-ts
+  user: devcloud
+  timeout_seconds: 300
+  command: powershell -NoProfile -File C:/Users/devcloud/inkling-autolab/run-bench.ps1
+    -Threads {threads} -Mask {mask} -Serial {serial} -Reads {reads} -Samples {samples}
+    -Tokens {tokens} -Kind {kind} -Variant {variant} -ExpectedHash {expected_hash}
+defaults:
+  expected_hash: 4e89f0793afa1015
+  mask: 65535
+  serial: 0
+  reads: 0
+  samples: 5
+  tokens: 32
+  kind: layer
+  variant: baseline
+  threads: 16
+grid:
+  serial:
+  - 0
+  - 1
+  reads:
+  - 0
+  - 1
+metrics:
+  primary: layer_tokens_per_s
+  direction: maximize
+  collect:
+  - name: layer_tokens_per_s
+    pattern: (?m)^layer_tokens_per_s=([\d.]+)
+  - name: layer_ms
+    pattern: (?m)^layer_ms=([\d.]+)
+  - name: output_hash
+    pattern: (?m)^output_hash=([0-9a-f]+)
+    type: str
+stopping:
+  window: 100000
+  max_failures: 2

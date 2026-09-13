@@ -1,0 +1,22 @@
+questions:
+  - id: q1
+    question: Which thread count and expert schedule minimizes resident layer latency?
+    status: active
+    priority: 1
+  - id: q2
+    question: Does hybrid-core affinity improve the selected schedule?
+    status: pending
+    priority: 2
+  - id: q3
+    question: Can activation reuse across bf16 rows improve the production shell without numerical changes?
+    status: pending
+    priority: 3
+  - id: q4
+    question: Do concurrent attention projections reduce latency further?
+    status: pending
+    priority: 4
+  - id: q5
+    question: What is full-checkpoint end-to-end throughput on tate-07?
+    status: blocked
+    reason: No Inkling export; 4 GB disk free versus the 512 GB artifact.
+    priority: 5

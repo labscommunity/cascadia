@@ -1,0 +1,4 @@
+results.db*
+.autolab/
+*.log
+.campaign.lock

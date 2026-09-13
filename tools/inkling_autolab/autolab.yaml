@@ -1,0 +1,7 @@
+name: inkling-panther-lake
+research_directive: Optimize the production Inkling engine on tate-07 with correctness-gated measurements.
+strategy:
+  moonshot_ratio: 0.5
+  enforce: soft
+measurement_scope: synthetic resident 975B-sized layer; full checkpoint unavailable
+host: cascadia-tate-07-ts

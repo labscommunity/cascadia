@@ -1,0 +1,22 @@
+{
+  "inspected_at": "2026-09-12",
+  "host": "tate-07",
+  "hostname": "pdx88-pa0794",
+  "ssh_alias": "cascadia-tate-07-ts",
+  "cpu": "Intel Core Ultra X7 358H",
+  "cores": 16,
+  "threads": 16,
+  "os": "Windows 11 Pro",
+  "ram_kib": 66427728,
+  "free_disk_bytes_before_setup": 4071964672,
+  "avx2": true,
+  "fma": true,
+  "avx512f": false,
+  "baseline_engine_commit": "9aaebff02a2f68a48913ff67061d90c13121ae35",
+  "baseline_binary_sha256": "2a4292fa49def264b9efcb379d408abebf4a30935512ce0d760bbd6db423779d",
+  "baseline_output_hash": "4e89f0793afa1015",
+  "compiler": "rustc 1.95.0 x86_64-pc-windows-msvc",
+  "autolab_commit": "3993e2c4d4d05175a9b84f6632f062ce1994deda",
+  "full_checkpoint_present": false,
+  "full_model_tokens_per_second": null
+}
