@@ -52,3 +52,30 @@ Before measurement: Windows working-set residency may keep using whole-bin
 copies despite a warm standby cache. Direct mmap reads should avoid copies in
 this resident workload; concurrent versus serial experts may change contention.
 Sweep both switches at 16 threads, requiring the reference hash.
+
+## 2 results — direct mmap wins
+
+16 threads, concurrent experts: default adaptive reads 46.602 ms, direct mmap
+18.016 ms (2.59x). Serial experts: 49.108 ms adaptive, 20.082 ms direct.
+All four runs preserve every output bit. The likely explanation is Windows
+standby-cache versus process-working-set residency: explicit reads can leave
+the mapping unvisited, so a working-set query keeps choosing a copy. This is
+a hypothesis about the cause, not a traced conclusion. Keep the production
+default for paged workloads until a real checkpoint can verify that regime.
+For this resident configuration, set CASCADIA_INKLING_SEQ_READS=1.
+
+## 3 — direct-read thread and affinity hypothesis
+
+Before measurement: once copy traffic disappears the best thread count may
+change. Repeat a smaller thread sweep, then compare explicit CPU bit masks.
+Do not infer P/E/LPE identities solely from bit positions.
+
+## Paused at user request — restart checkpoint
+
+Stopped the controller with SIGINT during campaign 003, before the 8-thread
+experiment could be recorded. Completed results: 16 threads 18.141694 ms;
+12 threads 19.094159 ms, both hash `4e89f0793afa1015`. The raw partial export
+is retained. Resume the same campaign/SQLite database; the first unrecorded
+configuration is 8 threads, then 4, 6, 10. No kernel candidate was deployed.
+The bf16 row-tiling candidate is local and untested: preserve as a patch and
+do not promote it until x86 tests plus fixed-hash benchmarks pass.

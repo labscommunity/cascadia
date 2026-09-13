@@ -1,0 +1,58 @@
+[
+  {
+    "run_id": "003_direct_threads_threads=16_a8331365",
+    "timestamp": "2026-09-13T04:31:06.442700+00:00",
+    "campaign_name": "003_direct_threads",
+    "experiment_name": "003_direct_threads_threads=16",
+    "status": "completed",
+    "wall_time_s": 6.205121250008233,
+    "raw_output": "process_priority=High affinity=65535 bf16_rows=1\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=18.503512 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=18.141694 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=18.019784 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=18.068556 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=18.210053 hash=4e89f0793afa1015\nlayer_ms=18.141694\nlayer_tokens_per_s=55.121645\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[18.019784375,18.06855625,18.14169375,18.210053125,18.5035125]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 55.121645,
+      "layer_ms": 18.141694,
+      "output_hash": "4e89f0793afa1015"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "mask": 65535,
+      "serial": 0,
+      "reads": 1,
+      "samples": 5,
+      "tokens": 32,
+      "kind": "layer",
+      "variant": "baseline",
+      "threads": 16,
+      "name": "003_direct_threads_threads=16",
+      "campaign_name": "003_direct_threads"
+    }
+  },
+  {
+    "run_id": "003_direct_threads_threads=12_191bd6f5",
+    "timestamp": "2026-09-13T04:31:12.544804+00:00",
+    "campaign_name": "003_direct_threads",
+    "experiment_name": "003_direct_threads_threads=12",
+    "status": "completed",
+    "wall_time_s": 6.097581707988866,
+    "raw_output": "process_priority=High affinity=65535 bf16_rows=1\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=12 tokens=32 warmup=16\nsample=0 ms_per_layer_token=19.603022 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=19.166144 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=19.094159 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=19.068425 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=18.975253 hash=4e89f0793afa1015\nlayer_ms=19.094159\nlayer_tokens_per_s=52.372036\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[18.975253125000002,19.068425,19.094159375,19.16614375,19.603021875]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 52.372036,
+      "layer_ms": 19.094159,
+      "output_hash": "4e89f0793afa1015"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "mask": 65535,
+      "serial": 0,
+      "reads": 1,
+      "samples": 5,
+      "tokens": 32,
+      "kind": "layer",
+      "variant": "baseline",
+      "threads": 12,
+      "name": "003_direct_threads_threads=12",
+      "campaign_name": "003_direct_threads"
+    }
+  }
+]
