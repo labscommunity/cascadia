@@ -421,6 +421,29 @@ pub fn linear_bf16_w(x: &[f32], w: &[u16], out_dim: usize, in_dim: usize, y: &mu
     assert_eq!(x.len(), in_dim);
     assert_eq!(w.len(), out_dim * in_dim);
     assert_eq!(y.len(), out_dim);
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        use std::sync::OnceLock;
+        static ROWS: OnceLock<usize> = OnceLock::new();
+        let rows = *ROWS.get_or_init(|| {
+            std::env::var("CASCADIA_BF16_GEMV_ROWS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|r| matches!(r, 1 | 2 | 4))
+                .unwrap_or(1)
+        });
+        match rows {
+            2 => {
+                linear_bf16_w_tiled::<2>(x, w, in_dim, y);
+                return;
+            }
+            4 => {
+                linear_bf16_w_tiled::<4>(x, w, in_dim, y);
+                return;
+            }
+            _ => {}
+        }
+    }
     y.par_iter_mut().enumerate().for_each(|(o, yy)| {
         let row = &w[o * in_dim..(o + 1) * in_dim];
         *yy = to_bf16(dot_bf16w(row, x));
@@ -438,4 +461,118 @@ pub fn linear_f32(x: &[f32], w: &[f32], out_dim: usize, in_dim: usize, y: &mut [
         let row = &w[o * in_dim..(o + 1) * in_dim];
         *yy = dot(row, x);
     });
+}
+
+/// Share activation loads across independent output rows. Each row retains
+/// dot_bf16w_avx2's two accumulator chains and horizontal reduction exactly.
+#[cfg(target_arch = "x86_64")]
+fn linear_bf16_w_tiled<const ROWS: usize>(x: &[f32], w: &[u16], in_dim: usize, y: &mut [f32]) {
+    use rayon::prelude::*;
+    y.par_chunks_mut(ROWS).enumerate().for_each(|(tile, out)| {
+        let start = tile * ROWS * in_dim;
+        if out.len() == ROWS {
+            // SAFETY: caller checks AVX2/FMA. The validated matrix and activation
+            // dimensions cover all ROWS rows; the kernel bounds every vector load.
+            unsafe { bf16_rows_avx2::<ROWS>(&w[start..start + ROWS * in_dim], x, out) };
+        } else {
+            for (r, value) in out.iter_mut().enumerate() {
+                *value = to_bf16(dot_bf16w(
+                    &w[start + r * in_dim..start + (r + 1) * in_dim],
+                    x,
+                ));
+            }
+        }
+    });
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn bf16_rows_avx2<const ROWS: usize>(w: &[u16], x: &[f32], y: &mut [f32]) {
+    use core::arch::x86_64::*;
+    let n = x.len();
+    let widen = |p: *const u16| -> __m256 {
+        _mm256_castsi256_ps(_mm256_slli_epi32(
+            _mm256_cvtepu16_epi32(_mm_loadu_si128(p.cast())),
+            16,
+        ))
+    };
+    let mut a = [_mm256_setzero_ps(); ROWS];
+    let mut b = [_mm256_setzero_ps(); ROWS];
+    let mut i = 0;
+    while i + 16 <= n {
+        let x0 = _mm256_loadu_ps(x.as_ptr().add(i));
+        let x1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
+        for r in 0..ROWS {
+            let row = w.as_ptr().add(r * n + i);
+            a[r] = _mm256_fmadd_ps(widen(row), x0, a[r]);
+            b[r] = _mm256_fmadd_ps(widen(row.add(8)), x1, b[r]);
+        }
+        i += 16;
+    }
+    if i + 8 <= n {
+        let xv = _mm256_loadu_ps(x.as_ptr().add(i));
+        for (r, acc) in a.iter_mut().enumerate() {
+            *acc = _mm256_fmadd_ps(widen(w.as_ptr().add(r * n + i)), xv, *acc);
+        }
+        i += 8;
+    }
+    for r in 0..ROWS {
+        let acc = _mm256_add_ps(a[r], b[r]);
+        let s = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+        let shuf = _mm_movehdup_ps(s);
+        let sums = _mm_add_ps(s, shuf);
+        let shuf2 = _mm_movehl_ps(shuf, sums);
+        let mut total = _mm_cvtss_f32(_mm_add_ss(sums, shuf2));
+        for k in i..n {
+            total += f32::from_bits((w[r * n + k] as u32) << 16) * x[k];
+        }
+        y[r] = to_bf16(total);
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod bf16_tiled_tests {
+    use super::*;
+
+    #[test]
+    fn tiled_rows_preserve_production_dot_bits_including_tails() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        let mut seed = 20260912u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 40) as f32 / 16777216.0 - 0.5) * 0.3
+        };
+        for n in [0, 1, 7, 8, 15, 16, 17, 31, 32, 33, 127, 256, 3072, 6144] {
+            for rows in [1, 2, 3, 4, 5, 17] {
+                // Offset the slices to cover unaligned loads, including odd rows.
+                let storage: Vec<u16> = (0..rows * n + 1)
+                    .map(|_| bf16::from_f32(next()).to_bits())
+                    .collect();
+                let w = &storage[1..];
+                let input: Vec<f32> = (0..n + 1).map(|_| next()).collect();
+                let x = &input[1..];
+                let want: Vec<f32> = (0..rows)
+                    .map(|r| to_bf16(dot_bf16w(&w[r * n..(r + 1) * n], x)))
+                    .collect();
+                let mut got2 = vec![f32::NAN; rows];
+                let mut got4 = vec![f32::NAN; rows];
+                linear_bf16_w_tiled::<2>(x, w, n, &mut got2);
+                linear_bf16_w_tiled::<4>(x, w, n, &mut got4);
+                for r in 0..rows {
+                    assert_eq!(
+                        got2[r].to_bits(),
+                        want[r].to_bits(),
+                        "2-row n={n} rows={rows} r={r}"
+                    );
+                    assert_eq!(
+                        got4[r].to_bits(),
+                        want[r].to_bits(),
+                        "4-row n={n} rows={rows} r={r}"
+                    );
+                }
+            }
+        }
+    }
 }

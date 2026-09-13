@@ -230,10 +230,12 @@ impl MmapExpert {
     /// now, by probing `samples` pages spread evenly across the bin. Returns
     /// `(resident, probed)`; `(0, 0)` if the OS query is unavailable or fails.
     ///
-    /// This is the decode profiler's TRUE expert-cache hit signal: mmap page
-    /// faults are not counted by the process read counter on Windows (paging I/O
-    /// is charged elsewhere), so residency is probed directly — `QueryWorkingSetEx`
-    /// on Windows, `mincore` on unix. Best-effort and read-only.
+    /// `QueryWorkingSetEx` on Windows probes this mapping's process working set,
+    /// not the complete system file cache. A buffered `read_bytes` can leave the
+    /// mapping invalid even while its backing pages are cached in RAM; a later
+    /// mmap access can then soft-fault without disk I/O. Treat this as a lower
+    /// bound on cached bytes, not a true file-cache miss count. Unix uses mincore.
+    /// Best-effort and read-only; it never faults pages in to bias the sample.
     pub fn resident_pages_sampled(&self, samples: usize) -> (usize, usize) {
         const PAGE: usize = 4096;
         let len = self.mmap.len();
@@ -361,6 +363,34 @@ impl MmapExpert {
         // are unpacked straight into the FMA against x (no f32 scratch row, no
         // scalar unpack), rayon across rows. Same value as dequant-then-dot,
         // modulo f32 summation order (see `dequant_row_dot`).
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+            && !(is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512bw")
+                && is_x86_feature_detected!("avx512vl"))
+        {
+            use std::sync::OnceLock;
+            static ROWS: OnceLock<usize> = OnceLock::new();
+            let rows = *ROWS.get_or_init(|| {
+                std::env::var("CASCADIA_INT4_GEMV_ROWS")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|r| matches!(r, 1 | 2 | 4))
+                    .unwrap_or(1)
+            });
+            match rows {
+                2 => {
+                    gemv_tiled_avx2::<2>(packed, scales, x, y);
+                    return;
+                }
+                4 => {
+                    gemv_tiled_avx2::<4>(packed, scales, x, y);
+                    return;
+                }
+                _ => {}
+            }
+        }
         y.par_iter_mut().enumerate().for_each(|(o, yy)| {
             let prow = &packed[o * row_bytes..(o + 1) * row_bytes];
             let srow = &scales[o * ng * 2..(o + 1) * ng * 2];
@@ -681,5 +711,151 @@ mod tests {
         let got = dequant_row_dot(&packed, &scales, &x, in_dim) as f64;
         let rel = (got - refv).abs() / refv.abs().max(1e-6);
         assert!(rel < 1e-4, "fused={got} ref={refv} rel={rel}");
+    }
+}
+
+/// Tile output rows while keeping each row's original AVX2 FMA chain. The
+/// caller has checked AVX2/FMA and excluded the different AVX-512 reduction.
+#[cfg(target_arch = "x86_64")]
+fn gemv_tiled_avx2<const ROWS: usize>(packed: &[u8], scales: &[u8], x: &[f32], y: &mut [f32]) {
+    use rayon::prelude::*;
+    let n = x.len();
+    let rb = n / 2;
+    let sb = n / G * 2;
+    y.par_chunks_mut(ROWS).enumerate().for_each(|(tile, out)| {
+        let first = tile * ROWS;
+        if out.len() == ROWS {
+            // SAFETY: dispatch checked CPU features. All rows have n/2 packed
+            // bytes and n/32 bf16 scales; n is group-aligned in the bin format.
+            unsafe {
+                dequant_rows_avx2::<ROWS>(
+                    &packed[first * rb..(first + ROWS) * rb],
+                    &scales[first * sb..(first + ROWS) * sb],
+                    x,
+                    out,
+                )
+            };
+        } else {
+            for (r, value) in out.iter_mut().enumerate() {
+                let row = first + r;
+                // SAFETY: same feature and row bounds as the complete tiles.
+                *value = to_bf16(unsafe {
+                    dequant_row_dot_avx2(
+                        &packed[row * rb..(row + 1) * rb],
+                        &scales[row * sb..(row + 1) * sb],
+                        x,
+                        n,
+                    )
+                });
+            }
+        }
+    });
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dequant_rows_avx2<const ROWS: usize>(
+    packed: &[u8],
+    scales: &[u8],
+    x: &[f32],
+    y: &mut [f32],
+) {
+    use core::arch::x86_64::*;
+    let n = x.len();
+    let ng = n / G;
+    let mask = _mm_set1_epi8(15);
+    let bias = _mm_set1_epi8(8);
+    let mut acc = [_mm256_setzero_ps(); ROWS];
+    for g in 0..ng {
+        let xp = x.as_ptr().add(g * G);
+        let x0 = _mm256_loadu_ps(xp);
+        let x1 = _mm256_loadu_ps(xp.add(8));
+        let x2 = _mm256_loadu_ps(xp.add(16));
+        let x3 = _mm256_loadu_ps(xp.add(24));
+        for (r, a) in acc.iter_mut().enumerate() {
+            let si = (r * ng + g) * 2;
+            let scale = half::bf16::from_le_bytes([scales[si], scales[si + 1]]).to_f32();
+            let sv = _mm256_set1_ps(scale);
+            let pk = _mm_loadu_si128(packed.as_ptr().add(r * n / 2 + g * G / 2).cast());
+            let low = _mm_sub_epi8(_mm_and_si128(pk, mask), bias);
+            let high = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16::<4>(pk), mask), bias);
+            let il = _mm_unpacklo_epi8(low, high);
+            let ih = _mm_unpackhi_epi8(low, high);
+            let c0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(il));
+            let c1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(il)));
+            let c2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(ih));
+            let c3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(ih)));
+            *a = _mm256_fmadd_ps(_mm256_mul_ps(c0, sv), x0, *a);
+            *a = _mm256_fmadd_ps(_mm256_mul_ps(c1, sv), x1, *a);
+            *a = _mm256_fmadd_ps(_mm256_mul_ps(c2, sv), x2, *a);
+            *a = _mm256_fmadd_ps(_mm256_mul_ps(c3, sv), x3, *a);
+        }
+    }
+    for (a, value) in acc.into_iter().zip(y) {
+        let s = _mm_add_ps(_mm256_castps256_ps128(a), _mm256_extractf128_ps::<1>(a));
+        let shuf = _mm_movehdup_ps(s);
+        let sums = _mm_add_ps(s, shuf);
+        let shuf2 = _mm_movehl_ps(shuf, sums);
+        *value = to_bf16(_mm_cvtss_f32(_mm_add_ss(sums, shuf2)));
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tiled_int4_tests {
+    use super::*;
+
+    #[test]
+    fn tiled_rows_preserve_avx2_bits_across_scales_and_odd_row_counts() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        let mut seed = 4431u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (seed >> 32) as u32
+        };
+        for n in [32, 64, 96, 256, 3072, 6144] {
+            for rows in [1, 2, 3, 4, 5, 17] {
+                let data: Vec<u8> = (0..n * rows / 2 + 1).map(|_| next() as u8).collect();
+                let packed = &data[1..];
+                let mut scales = vec![0u8];
+                for _ in 0..rows * n / G {
+                    let scale = half::bf16::from_f32((next() % 127) as f32 / 4096.0);
+                    scales.extend(scale.to_le_bytes());
+                }
+                let scales = &scales[1..];
+                let x: Vec<f32> = (0..n)
+                    .map(|_| (next() >> 8) as f32 / 16777216.0 - 0.5)
+                    .collect();
+                let want: Vec<f32> = (0..rows)
+                    .map(|r| {
+                        to_bf16(unsafe {
+                            dequant_row_dot_avx2(
+                                &packed[r * n / 2..(r + 1) * n / 2],
+                                &scales[r * n / G * 2..(r + 1) * n / G * 2],
+                                &x,
+                                n,
+                            )
+                        })
+                    })
+                    .collect();
+                let mut a = vec![f32::NAN; rows];
+                let mut b = vec![f32::NAN; rows];
+                gemv_tiled_avx2::<2>(packed, scales, &x, &mut a);
+                gemv_tiled_avx2::<4>(packed, scales, &x, &mut b);
+                for r in 0..rows {
+                    assert_eq!(
+                        a[r].to_bits(),
+                        want[r].to_bits(),
+                        "2-row n={n} rows={rows} r={r}"
+                    );
+                    assert_eq!(
+                        b[r].to_bits(),
+                        want[r].to_bits(),
+                        "4-row n={n} rows={rows} r={r}"
+                    );
+                }
+            }
+        }
     }
 }
