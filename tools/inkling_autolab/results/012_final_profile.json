@@ -1,0 +1,434 @@
+[
+  {
+    "run_id": "012_final_profile_a_repeat=1_slot=0_5c158e4e",
+    "timestamp": "2026-09-13T05:18:34.970080+00:00",
+    "campaign_name": "012_final_profile",
+    "experiment_name": "012_final_profile_a_repeat=1_slot=0",
+    "status": "completed",
+    "wall_time_s": 7.784922040998936,
+    "raw_output": "arm=direct variant=final reads=1 bf16_rows=1 int4_rows=1\r\nbinary_sha256=FFFD189ECEBD32110B72B918DC448BA280C631C20388EE800AF3A76C0C6AEBD9\r\nprocess_priority=High affinity=65535 bf16_rows=1 int4_rows=1 parallel_projections=0\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=18.975750 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=18.555391 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=18.249906 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=18.374131 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=18.439241 hash=4e89f0793afa1015\nsample=5 ms_per_layer_token=18.261741 hash=4e89f0793afa1015\nsample=6 ms_per_layer_token=18.310681 hash=4e89f0793afa1015\nlayer_ms=18.374131\nlayer_tokens_per_s=54.424342\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[18.24990625,18.261740625,18.31068125,18.374131249999998,18.439240625,18.555390625,18.975749999999998]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 54.424342,
+      "layer_ms": 18.374131,
+      "output_hash": "4e89f0793afa1015",
+      "actual_arm": "direct"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "samples": 7,
+      "a_repeat": 1,
+      "slot": 0,
+      "name": "012_final_profile_a_repeat=1_slot=0",
+      "campaign_name": "012_final_profile"
+    }
+  },
+  {
+    "run_id": "012_final_profile_a_repeat=1_slot=1_e2682018",
+    "timestamp": "2026-09-13T05:18:42.584261+00:00",
+    "campaign_name": "012_final_profile",
+    "experiment_name": "012_final_profile_a_repeat=1_slot=1",
+    "status": "completed",
+    "wall_time_s": 7.609631457948126,
+    "raw_output": "arm=tiled variant=final reads=1 bf16_rows=2 int4_rows=4\r\nbinary_sha256=FFFD189ECEBD32110B72B918DC448BA280C631C20388EE800AF3A76C0C6AEBD9\r\nprocess_priority=High affinity=65535 bf16_rows=2 int4_rows=4 parallel_projections=0\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=17.319372 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=17.746006 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=17.354816 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=17.154587 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=17.246241 hash=4e89f0793afa1015\nsample=5 ms_per_layer_token=17.167769 hash=4e89f0793afa1015\nsample=6 ms_per_layer_token=17.120484 hash=4e89f0793afa1015\nlayer_ms=17.246241\nlayer_tokens_per_s=57.983651\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[17.120484375,17.154587499999998,17.16776875,17.246240625,17.319371874999998,17.354815625,17.74600625]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 57.983651,
+      "layer_ms": 17.246241,
+      "output_hash": "4e89f0793afa1015",
+      "actual_arm": "tiled"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "samples": 7,
+      "a_repeat": 1,
+      "slot": 1,
+      "name": "012_final_profile_a_repeat=1_slot=1",
+      "campaign_name": "012_final_profile"
+    }
+  },
+  {
+    "run_id": "012_final_profile_a_repeat=1_slot=2_91aafc39",
+    "timestamp": "2026-09-13T05:19:00.096405+00:00",
+    "campaign_name": "012_final_profile",
+    "experiment_name": "012_final_profile_a_repeat=1_slot=2",
+    "status": "completed",
+    "wall_time_s": 17.50788641604595,
+    "raw_output": "arm=adaptive variant=final reads=0 bf16_rows=1 int4_rows=1\r\nbinary_sha256=FFFD189ECEBD32110B72B918DC448BA280C631C20388EE800AF3A76C0C6AEBD9\r\nprocess_priority=High affinity=65535 bf16_rows=1 int4_rows=1 parallel_projections=0\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=47.617000 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=47.664822 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=47.640066 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=47.353084 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=47.913562 hash=4e89f0793afa1015\nsample=5 ms_per_layer_token=48.106566 hash=4e89f0793afa1015\nsample=6 ms_per_layer_token=47.837094 hash=4e89f0793afa1015\nlayer_ms=47.664822\nlayer_tokens_per_s=20.979833\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[47.353084375,47.617,47.640065625,47.664821875,47.83709375,47.9135625,48.106565625]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 20.979833,
+      "layer_ms": 47.664822,
+      "output_hash": "4e89f0793afa1015",
+      "actual_arm": "adaptive"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "samples": 7,
+      "a_repeat": 1,
+      "slot": 2,
+      "name": "012_final_profile_a_repeat=1_slot=2",
+      "campaign_name": "012_final_profile"
+    }
+  },
+  {
+    "run_id": "012_final_profile_a_repeat=2_slot=0_0c713bf6",
+    "timestamp": "2026-09-13T05:19:07.529902+00:00",
+    "campaign_name": "012_final_profile",
+    "experiment_name": "012_final_profile_a_repeat=2_slot=0",
+    "status": "completed",
+    "wall_time_s": 7.429113166057505,
+    "raw_output": "arm=tiled variant=final reads=1 bf16_rows=2 int4_rows=4\r\nbinary_sha256=FFFD189ECEBD32110B72B918DC448BA280C631C20388EE800AF3A76C0C6AEBD9\r\nprocess_priority=High affinity=65535 bf16_rows=2 int4_rows=4 parallel_projections=0\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=17.555338 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=17.464962 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=17.472994 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=17.409887 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=17.492466 hash=4e89f0793afa1015\nsample=5 ms_per_layer_token=17.839153 hash=4e89f0793afa1015\nsample=6 ms_per_layer_token=17.748322 hash=4e89f0793afa1015\nlayer_ms=17.492466\nlayer_tokens_per_s=57.167470\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[17.4098875,17.4649625,17.47299375,17.492465624999998,17.5553375,17.748321875000002,17.839153125]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 57.16747,
+      "layer_ms": 17.492466,
+      "output_hash": "4e89f0793afa1015",
+      "actual_arm": "tiled"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "samples": 7,
+      "a_repeat": 2,
+      "slot": 0,
+      "name": "012_final_profile_a_repeat=2_slot=0",
+      "campaign_name": "012_final_profile"
+    }
+  },
+  {
+    "run_id": "012_final_profile_a_repeat=2_slot=1_b6167d76",
+    "timestamp": "2026-09-13T05:19:24.853153+00:00",
+    "campaign_name": "012_final_profile",
+    "experiment_name": "012_final_profile_a_repeat=2_slot=1",
+    "status": "completed",
+    "wall_time_s": 17.318983915960416,
+    "raw_output": "arm=adaptive variant=final reads=0 bf16_rows=1 int4_rows=1\r\nbinary_sha256=FFFD189ECEBD32110B72B918DC448BA280C631C20388EE800AF3A76C0C6AEBD9\r\nprocess_priority=High affinity=65535 bf16_rows=1 int4_rows=1 parallel_projections=0\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=47.214550 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=47.088497 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=47.101328 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=47.105422 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=47.073753 hash=4e89f0793afa1015\nsample=5 ms_per_layer_token=47.115016 hash=4e89f0793afa1015\nsample=6 ms_per_layer_token=46.942934 hash=4e89f0793afa1015\nlayer_ms=47.101328\nlayer_tokens_per_s=21.230824\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[46.94293437499999,47.073753124999996,47.088496875,47.101328125,47.105421875,47.115015625,47.21455]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 21.230824,
+      "layer_ms": 47.101328,
+      "output_hash": "4e89f0793afa1015",
+      "actual_arm": "adaptive"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "samples": 7,
+      "a_repeat": 2,
+      "slot": 1,
+      "name": "012_final_profile_a_repeat=2_slot=1",
+      "campaign_name": "012_final_profile"
+    }
+  },
+  {
+    "run_id": "012_final_profile_a_repeat=2_slot=2_cc572bf4",
+    "timestamp": "2026-09-13T05:19:32.589141+00:00",
+    "campaign_name": "012_final_profile",
+    "experiment_name": "012_final_profile_a_repeat=2_slot=2",
+    "status": "completed",
+    "wall_time_s": 7.731604874948971,
+    "raw_output": "arm=direct variant=final reads=1 bf16_rows=1 int4_rows=1\r\nbinary_sha256=FFFD189ECEBD32110B72B918DC448BA280C631C20388EE800AF3A76C0C6AEBD9\r\nprocess_priority=High affinity=65535 bf16_rows=1 int4_rows=1 parallel_projections=0\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=18.548706 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=18.356997 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=18.358509 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=18.372419 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=18.417763 hash=4e89f0793afa1015\nsample=5 ms_per_layer_token=18.391756 hash=4e89f0793afa1015\nsample=6 ms_per_layer_token=19.010837 hash=4e89f0793afa1015\nlayer_ms=18.391756\nlayer_tokens_per_s=54.372186\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[18.356996875,18.358509374999997,18.37241875,18.39175625,18.417762500000002,18.548706250000002,19.010837499999997]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 54.372186,
+      "layer_ms": 18.391756,
+      "output_hash": "4e89f0793afa1015",
+      "actual_arm": "direct"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "samples": 7,
+      "a_repeat": 2,
+      "slot": 2,
+      "name": "012_final_profile_a_repeat=2_slot=2",
+      "campaign_name": "012_final_profile"
+    }
+  },
+  {
+    "run_id": "012_final_profile_a_repeat=3_slot=0_d9d97074",
+    "timestamp": "2026-09-13T05:19:49.889008+00:00",
+    "campaign_name": "012_final_profile",
+    "experiment_name": "012_final_profile_a_repeat=3_slot=0",
+    "status": "completed",
+    "wall_time_s": 17.29567975003738,
+    "raw_output": "arm=adaptive variant=final reads=0 bf16_rows=1 int4_rows=1\r\nbinary_sha256=FFFD189ECEBD32110B72B918DC448BA280C631C20388EE800AF3A76C0C6AEBD9\r\nprocess_priority=High affinity=65535 bf16_rows=1 int4_rows=1 parallel_projections=0\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=47.535681 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=47.110081 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=47.064991 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=46.722519 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=47.113972 hash=4e89f0793afa1015\nsample=5 ms_per_layer_token=47.168391 hash=4e89f0793afa1015\nsample=6 ms_per_layer_token=47.063872 hash=4e89f0793afa1015\nlayer_ms=47.110081\nlayer_tokens_per_s=21.226879\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[46.72251875,47.063871875,47.064990625,47.11008125000001,47.113971875,47.168390625,47.53568125]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 21.226879,
+      "layer_ms": 47.110081,
+      "output_hash": "4e89f0793afa1015",
+      "actual_arm": "adaptive"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "samples": 7,
+      "a_repeat": 3,
+      "slot": 0,
+      "name": "012_final_profile_a_repeat=3_slot=0",
+      "campaign_name": "012_final_profile"
+    }
+  },
+  {
+    "run_id": "012_final_profile_a_repeat=3_slot=1_5264be2e",
+    "timestamp": "2026-09-13T05:19:57.701458+00:00",
+    "campaign_name": "012_final_profile",
+    "experiment_name": "012_final_profile_a_repeat=3_slot=1",
+    "status": "completed",
+    "wall_time_s": 7.808356499997899,
+    "raw_output": "arm=direct variant=final reads=1 bf16_rows=1 int4_rows=1\r\nbinary_sha256=FFFD189ECEBD32110B72B918DC448BA280C631C20388EE800AF3A76C0C6AEBD9\r\nprocess_priority=High affinity=65535 bf16_rows=1 int4_rows=1 parallel_projections=0\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=18.639597 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=18.433619 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=18.404172 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=18.715156 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=18.806297 hash=4e89f0793afa1015\nsample=5 ms_per_layer_token=18.714031 hash=4e89f0793afa1015\nsample=6 ms_per_layer_token=19.020406 hash=4e89f0793afa1015\nlayer_ms=18.714031\nlayer_tokens_per_s=53.435841\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[18.404171875,18.433618749999997,18.639596875000002,18.714031249999998,18.71515625,18.806296875,19.02040625]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 53.435841,
+      "layer_ms": 18.714031,
+      "output_hash": "4e89f0793afa1015",
+      "actual_arm": "direct"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "samples": 7,
+      "a_repeat": 3,
+      "slot": 1,
+      "name": "012_final_profile_a_repeat=3_slot=1",
+      "campaign_name": "012_final_profile"
+    }
+  },
+  {
+    "run_id": "012_final_profile_a_repeat=3_slot=2_e555ab04",
+    "timestamp": "2026-09-13T05:20:05.101171+00:00",
+    "campaign_name": "012_final_profile",
+    "experiment_name": "012_final_profile_a_repeat=3_slot=2",
+    "status": "completed",
+    "wall_time_s": 7.3957163750892505,
+    "raw_output": "arm=tiled variant=final reads=1 bf16_rows=2 int4_rows=4\r\nbinary_sha256=FFFD189ECEBD32110B72B918DC448BA280C631C20388EE800AF3A76C0C6AEBD9\r\nprocess_priority=High affinity=65535 bf16_rows=2 int4_rows=4 parallel_projections=0\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=17.632316 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=17.454122 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=17.400472 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=17.431394 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=17.408041 hash=4e89f0793afa1015\nsample=5 ms_per_layer_token=17.384256 hash=4e89f0793afa1015\nsample=6 ms_per_layer_token=17.354975 hash=4e89f0793afa1015\nlayer_ms=17.408041\nlayer_tokens_per_s=57.444719\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[17.354975000000003,17.38425625,17.400471875,17.408040624999998,17.431393749999998,17.454121875,17.632315625]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 57.444719,
+      "layer_ms": 17.408041,
+      "output_hash": "4e89f0793afa1015",
+      "actual_arm": "tiled"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "samples": 7,
+      "a_repeat": 3,
+      "slot": 2,
+      "name": "012_final_profile_a_repeat=3_slot=2",
+      "campaign_name": "012_final_profile"
+    }
+  },
+  {
+    "run_id": "012_final_profile_a_repeat=4_slot=0_317b1342",
+    "timestamp": "2026-09-13T05:20:12.720320+00:00",
+    "campaign_name": "012_final_profile",
+    "experiment_name": "012_final_profile_a_repeat=4_slot=0",
+    "status": "completed",
+    "wall_time_s": 7.6160634169355035,
+    "raw_output": "arm=direct variant=final reads=1 bf16_rows=1 int4_rows=1\r\nbinary_sha256=FFFD189ECEBD32110B72B918DC448BA280C631C20388EE800AF3A76C0C6AEBD9\r\nprocess_priority=High affinity=65535 bf16_rows=1 int4_rows=1 parallel_projections=0\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=18.342519 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=18.160300 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=18.049000 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=18.063931 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=18.030116 hash=4e89f0793afa1015\nsample=5 ms_per_layer_token=18.092144 hash=4e89f0793afa1015\nsample=6 ms_per_layer_token=18.037206 hash=4e89f0793afa1015\nlayer_ms=18.063931\nlayer_tokens_per_s=55.358935\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[18.030115625,18.03720625,18.049,18.063931250000003,18.09214375,18.1603,18.34251875]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 55.358935,
+      "layer_ms": 18.063931,
+      "output_hash": "4e89f0793afa1015",
+      "actual_arm": "direct"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "samples": 7,
+      "a_repeat": 4,
+      "slot": 0,
+      "name": "012_final_profile_a_repeat=4_slot=0",
+      "campaign_name": "012_final_profile"
+    }
+  },
+  {
+    "run_id": "012_final_profile_a_repeat=4_slot=1_04a70af5",
+    "timestamp": "2026-09-13T05:20:20.135496+00:00",
+    "campaign_name": "012_final_profile",
+    "experiment_name": "012_final_profile_a_repeat=4_slot=1",
+    "status": "completed",
+    "wall_time_s": 7.410876041976735,
+    "raw_output": "arm=tiled variant=final reads=1 bf16_rows=2 int4_rows=4\r\nbinary_sha256=FFFD189ECEBD32110B72B918DC448BA280C631C20388EE800AF3A76C0C6AEBD9\r\nprocess_priority=High affinity=65535 bf16_rows=2 int4_rows=4 parallel_projections=0\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=17.847925 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=17.438253 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=17.419275 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=17.437347 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=17.457591 hash=4e89f0793afa1015\nsample=5 ms_per_layer_token=17.403434 hash=4e89f0793afa1015\nsample=6 ms_per_layer_token=17.409428 hash=4e89f0793afa1015\nlayer_ms=17.437347\nlayer_tokens_per_s=57.348174\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[17.403434375,17.409428125,17.419275000000003,17.437346875,17.438253125,17.457590625,17.847925]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 57.348174,
+      "layer_ms": 17.437347,
+      "output_hash": "4e89f0793afa1015",
+      "actual_arm": "tiled"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "samples": 7,
+      "a_repeat": 4,
+      "slot": 1,
+      "name": "012_final_profile_a_repeat=4_slot=1",
+      "campaign_name": "012_final_profile"
+    }
+  },
+  {
+    "run_id": "012_final_profile_a_repeat=4_slot=2_a4dd7c2b",
+    "timestamp": "2026-09-13T05:20:37.435390+00:00",
+    "campaign_name": "012_final_profile",
+    "experiment_name": "012_final_profile_a_repeat=4_slot=2",
+    "status": "completed",
+    "wall_time_s": 17.295510916039348,
+    "raw_output": "arm=adaptive variant=final reads=0 bf16_rows=1 int4_rows=1\r\nbinary_sha256=FFFD189ECEBD32110B72B918DC448BA280C631C20388EE800AF3A76C0C6AEBD9\r\nprocess_priority=High affinity=65535 bf16_rows=1 int4_rows=1 parallel_projections=0\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=47.133425 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=46.981450 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=46.869191 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=46.906016 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=47.044659 hash=4e89f0793afa1015\nsample=5 ms_per_layer_token=47.155697 hash=4e89f0793afa1015\nsample=6 ms_per_layer_token=47.361284 hash=4e89f0793afa1015\nlayer_ms=47.044659\nlayer_tokens_per_s=21.256398\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[46.869190625,46.906015625,46.98145,47.044659375,47.133425,47.155696875,47.361284375]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 21.256398,
+      "layer_ms": 47.044659,
+      "output_hash": "4e89f0793afa1015",
+      "actual_arm": "adaptive"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "samples": 7,
+      "a_repeat": 4,
+      "slot": 2,
+      "name": "012_final_profile_a_repeat=4_slot=2",
+      "campaign_name": "012_final_profile"
+    }
+  },
+  {
+    "run_id": "012_final_profile_a_repeat=5_slot=0_33b67111",
+    "timestamp": "2026-09-13T05:20:44.828920+00:00",
+    "campaign_name": "012_final_profile",
+    "experiment_name": "012_final_profile_a_repeat=5_slot=0",
+    "status": "completed",
+    "wall_time_s": 7.389457832905464,
+    "raw_output": "arm=tiled variant=final reads=1 bf16_rows=2 int4_rows=4\r\nbinary_sha256=FFFD189ECEBD32110B72B918DC448BA280C631C20388EE800AF3A76C0C6AEBD9\r\nprocess_priority=High affinity=65535 bf16_rows=2 int4_rows=4 parallel_projections=0\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=17.802328 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=17.482913 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=17.508544 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=17.503250 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=17.440578 hash=4e89f0793afa1015\nsample=5 ms_per_layer_token=17.479537 hash=4e89f0793afa1015\nsample=6 ms_per_layer_token=17.458534 hash=4e89f0793afa1015\nlayer_ms=17.482913\nlayer_tokens_per_s=57.198708\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[17.440578125000002,17.458534375,17.4795375,17.4829125,17.50325,17.50854375,17.802328125]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 57.198708,
+      "layer_ms": 17.482913,
+      "output_hash": "4e89f0793afa1015",
+      "actual_arm": "tiled"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "samples": 7,
+      "a_repeat": 5,
+      "slot": 0,
+      "name": "012_final_profile_a_repeat=5_slot=0",
+      "campaign_name": "012_final_profile"
+    }
+  },
+  {
+    "run_id": "012_final_profile_a_repeat=5_slot=1_19a26414",
+    "timestamp": "2026-09-13T05:21:02.128005+00:00",
+    "campaign_name": "012_final_profile",
+    "experiment_name": "012_final_profile_a_repeat=5_slot=1",
+    "status": "completed",
+    "wall_time_s": 17.294880499946885,
+    "raw_output": "arm=adaptive variant=final reads=0 bf16_rows=1 int4_rows=1\r\nbinary_sha256=FFFD189ECEBD32110B72B918DC448BA280C631C20388EE800AF3A76C0C6AEBD9\r\nprocess_priority=High affinity=65535 bf16_rows=1 int4_rows=1 parallel_projections=0\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=46.943287 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=47.055022 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=46.923534 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=47.238322 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=47.794366 hash=4e89f0793afa1015\nsample=5 ms_per_layer_token=46.963338 hash=4e89f0793afa1015\nsample=6 ms_per_layer_token=47.012872 hash=4e89f0793afa1015\nlayer_ms=47.012872\nlayer_tokens_per_s=21.270770\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[46.923534375,46.9432875,46.9633375,47.012871875,47.055021875,47.238321875000004,47.794365625000005]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 21.27077,
+      "layer_ms": 47.012872,
+      "output_hash": "4e89f0793afa1015",
+      "actual_arm": "adaptive"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "samples": 7,
+      "a_repeat": 5,
+      "slot": 1,
+      "name": "012_final_profile_a_repeat=5_slot=1",
+      "campaign_name": "012_final_profile"
+    }
+  },
+  {
+    "run_id": "012_final_profile_a_repeat=5_slot=2_90857539",
+    "timestamp": "2026-09-13T05:21:09.736859+00:00",
+    "campaign_name": "012_final_profile",
+    "experiment_name": "012_final_profile_a_repeat=5_slot=2",
+    "status": "completed",
+    "wall_time_s": 7.604489083052613,
+    "raw_output": "arm=direct variant=final reads=1 bf16_rows=1 int4_rows=1\r\nbinary_sha256=FFFD189ECEBD32110B72B918DC448BA280C631C20388EE800AF3A76C0C6AEBD9\r\nprocess_priority=High affinity=65535 bf16_rows=1 int4_rows=1 parallel_projections=0\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=18.307062 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=18.109572 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=18.073719 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=18.105541 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=18.052038 hash=4e89f0793afa1015\nsample=5 ms_per_layer_token=18.084881 hash=4e89f0793afa1015\nsample=6 ms_per_layer_token=18.064656 hash=4e89f0793afa1015\nlayer_ms=18.084881\nlayer_tokens_per_s=55.294806\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[18.0520375,18.064656250000002,18.073718749999998,18.08488125,18.105540625,18.109571875,18.307062499999997]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 55.294806,
+      "layer_ms": 18.084881,
+      "output_hash": "4e89f0793afa1015",
+      "actual_arm": "direct"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "samples": 7,
+      "a_repeat": 5,
+      "slot": 2,
+      "name": "012_final_profile_a_repeat=5_slot=2",
+      "campaign_name": "012_final_profile"
+    }
+  },
+  {
+    "run_id": "012_final_profile_a_repeat=6_slot=0_a38bb7f6",
+    "timestamp": "2026-09-13T05:21:27.103374+00:00",
+    "campaign_name": "012_final_profile",
+    "experiment_name": "012_final_profile_a_repeat=6_slot=0",
+    "status": "completed",
+    "wall_time_s": 17.36224124999717,
+    "raw_output": "arm=adaptive variant=final reads=0 bf16_rows=1 int4_rows=1\r\nbinary_sha256=FFFD189ECEBD32110B72B918DC448BA280C631C20388EE800AF3A76C0C6AEBD9\r\nprocess_priority=High affinity=65535 bf16_rows=1 int4_rows=1 parallel_projections=0\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=47.482788 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=47.423169 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=47.127569 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=47.073372 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=47.239562 hash=4e89f0793afa1015\nsample=5 ms_per_layer_token=47.308722 hash=4e89f0793afa1015\nsample=6 ms_per_layer_token=47.283091 hash=4e89f0793afa1015\nlayer_ms=47.283091\nlayer_tokens_per_s=21.149210\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[47.073371875,47.12756875,47.2395625,47.28309062499999,47.308721875,47.42316875,47.4827875]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 21.14921,
+      "layer_ms": 47.283091,
+      "output_hash": "4e89f0793afa1015",
+      "actual_arm": "adaptive"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "samples": 7,
+      "a_repeat": 6,
+      "slot": 0,
+      "name": "012_final_profile_a_repeat=6_slot=0",
+      "campaign_name": "012_final_profile"
+    }
+  },
+  {
+    "run_id": "012_final_profile_a_repeat=6_slot=1_94877986",
+    "timestamp": "2026-09-13T05:21:34.713545+00:00",
+    "campaign_name": "012_final_profile",
+    "experiment_name": "012_final_profile_a_repeat=6_slot=1",
+    "status": "completed",
+    "wall_time_s": 7.605862542055547,
+    "raw_output": "arm=direct variant=final reads=1 bf16_rows=1 int4_rows=1\r\nbinary_sha256=FFFD189ECEBD32110B72B918DC448BA280C631C20388EE800AF3A76C0C6AEBD9\r\nprocess_priority=High affinity=65535 bf16_rows=1 int4_rows=1 parallel_projections=0\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=18.297659 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=18.062719 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=18.236991 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=18.209434 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=18.023191 hash=4e89f0793afa1015\nsample=5 ms_per_layer_token=18.059309 hash=4e89f0793afa1015\nsample=6 ms_per_layer_token=17.963063 hash=4e89f0793afa1015\nlayer_ms=18.062719\nlayer_tokens_per_s=55.362651\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[17.963062500000003,18.023190625,18.059309374999998,18.062718750000002,18.209434375,18.236990625,18.297659375000002]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 55.362651,
+      "layer_ms": 18.062719,
+      "output_hash": "4e89f0793afa1015",
+      "actual_arm": "direct"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "samples": 7,
+      "a_repeat": 6,
+      "slot": 1,
+      "name": "012_final_profile_a_repeat=6_slot=1",
+      "campaign_name": "012_final_profile"
+    }
+  },
+  {
+    "run_id": "012_final_profile_a_repeat=6_slot=2_5e422f9a",
+    "timestamp": "2026-09-13T05:21:42.131598+00:00",
+    "campaign_name": "012_final_profile",
+    "experiment_name": "012_final_profile_a_repeat=6_slot=2",
+    "status": "completed",
+    "wall_time_s": 7.413634542026557,
+    "raw_output": "arm=tiled variant=final reads=1 bf16_rows=2 int4_rows=4\r\nbinary_sha256=FFFD189ECEBD32110B72B918DC448BA280C631C20388EE800AF3A76C0C6AEBD9\r\nprocess_priority=High affinity=65535 bf16_rows=2 int4_rows=4 parallel_projections=0\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=17.765391 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=17.473741 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=17.419828 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=17.458075 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=17.483550 hash=4e89f0793afa1015\nsample=5 ms_per_layer_token=17.515928 hash=4e89f0793afa1015\nsample=6 ms_per_layer_token=17.405891 hash=4e89f0793afa1015\nlayer_ms=17.473741\nlayer_tokens_per_s=57.228731\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[17.405890625,17.419828125000002,17.458075,17.473740625,17.48355,17.515928125,17.765390625]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 57.228731,
+      "layer_ms": 17.473741,
+      "output_hash": "4e89f0793afa1015",
+      "actual_arm": "tiled"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "samples": 7,
+      "a_repeat": 6,
+      "slot": 2,
+      "name": "012_final_profile_a_repeat=6_slot=2",
+      "campaign_name": "012_final_profile"
+    }
+  }
+]

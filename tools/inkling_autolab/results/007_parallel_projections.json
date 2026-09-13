@@ -1,0 +1,126 @@
+[
+  {
+    "run_id": "007_parallel_projections_int4_rows=1_parallel_projections=0_29a4266c",
+    "timestamp": "2026-09-13T04:57:38.661435+00:00",
+    "campaign_name": "007_parallel_projections",
+    "experiment_name": "007_parallel_projections_int4_rows=1_parallel_projections=0",
+    "status": "completed",
+    "wall_time_s": 5.849622791050933,
+    "raw_output": "process_priority=High affinity=65535 bf16_rows=2 int4_rows=1 parallel_projections=0\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=18.747772 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=18.056294 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=17.870591 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=17.811578 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=17.860212 hash=4e89f0793afa1015\nlayer_ms=17.870591\nlayer_tokens_per_s=55.957860\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[17.811578125,17.8602125,17.870590625,18.056293750000002,18.747771874999998]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 55.95786,
+      "layer_ms": 17.870591,
+      "output_hash": "4e89f0793afa1015"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "mask": 65535,
+      "serial": 0,
+      "reads": 1,
+      "samples": 5,
+      "tokens": 32,
+      "kind": "layer",
+      "variant": "projections",
+      "threads": 16,
+      "bf16_rows": 2,
+      "int4_rows": 1,
+      "parallel_projections": 0,
+      "name": "007_parallel_projections_int4_rows=1_parallel_projections=0",
+      "campaign_name": "007_parallel_projections"
+    }
+  },
+  {
+    "run_id": "007_parallel_projections_int4_rows=1_parallel_projections=1_a2d21491",
+    "timestamp": "2026-09-13T04:57:44.470491+00:00",
+    "campaign_name": "007_parallel_projections",
+    "experiment_name": "007_parallel_projections_int4_rows=1_parallel_projections=1",
+    "status": "completed",
+    "wall_time_s": 5.804937292006798,
+    "raw_output": "process_priority=High affinity=65535 bf16_rows=2 int4_rows=1 parallel_projections=1\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=18.034006 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=18.419034 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=18.360078 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=18.017312 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=18.129222 hash=4e89f0793afa1015\nlayer_ms=18.129222\nlayer_tokens_per_s=55.159565\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[18.0173125,18.03400625,18.129221875,18.360078124999998,18.419034375]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 55.159565,
+      "layer_ms": 18.129222,
+      "output_hash": "4e89f0793afa1015"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "mask": 65535,
+      "serial": 0,
+      "reads": 1,
+      "samples": 5,
+      "tokens": 32,
+      "kind": "layer",
+      "variant": "projections",
+      "threads": 16,
+      "bf16_rows": 2,
+      "int4_rows": 1,
+      "parallel_projections": 1,
+      "name": "007_parallel_projections_int4_rows=1_parallel_projections=1",
+      "campaign_name": "007_parallel_projections"
+    }
+  },
+  {
+    "run_id": "007_parallel_projections_int4_rows=4_parallel_projections=0_8fc0fd8a",
+    "timestamp": "2026-09-13T04:57:50.044999+00:00",
+    "campaign_name": "007_parallel_projections",
+    "experiment_name": "007_parallel_projections_int4_rows=4_parallel_projections=0",
+    "status": "completed",
+    "wall_time_s": 5.570591707946733,
+    "raw_output": "process_priority=High affinity=65535 bf16_rows=2 int4_rows=4 parallel_projections=0\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=17.389250 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=17.062819 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=17.075087 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=17.170097 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=17.116384 hash=4e89f0793afa1015\nlayer_ms=17.116384\nlayer_tokens_per_s=58.423554\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[17.06281875,17.0750875,17.116384375000003,17.170096875,17.389249999999997]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 58.423554,
+      "layer_ms": 17.116384,
+      "output_hash": "4e89f0793afa1015"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "mask": 65535,
+      "serial": 0,
+      "reads": 1,
+      "samples": 5,
+      "tokens": 32,
+      "kind": "layer",
+      "variant": "projections",
+      "threads": 16,
+      "bf16_rows": 2,
+      "int4_rows": 4,
+      "parallel_projections": 0,
+      "name": "007_parallel_projections_int4_rows=4_parallel_projections=0",
+      "campaign_name": "007_parallel_projections"
+    }
+  },
+  {
+    "run_id": "007_parallel_projections_int4_rows=4_parallel_projections=1_4496b3dd",
+    "timestamp": "2026-09-13T04:57:55.678090+00:00",
+    "campaign_name": "007_parallel_projections",
+    "experiment_name": "007_parallel_projections_int4_rows=4_parallel_projections=1",
+    "status": "completed",
+    "wall_time_s": 5.6291368750389665,
+    "raw_output": "process_priority=High affinity=65535 bf16_rows=2 int4_rows=4 parallel_projections=1\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=17.536912 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=17.271200 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=17.279453 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=17.518194 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=17.668931 hash=4e89f0793afa1015\nlayer_ms=17.518194\nlayer_tokens_per_s=57.083511\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[17.2712,17.279453125,17.518193750000002,17.5369125,17.66893125]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 57.083511,
+      "layer_ms": 17.518194,
+      "output_hash": "4e89f0793afa1015"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "mask": 65535,
+      "serial": 0,
+      "reads": 1,
+      "samples": 5,
+      "tokens": 32,
+      "kind": "layer",
+      "variant": "projections",
+      "threads": 16,
+      "bf16_rows": 2,
+      "int4_rows": 4,
+      "parallel_projections": 1,
+      "name": "007_parallel_projections_int4_rows=4_parallel_projections=1",
+      "campaign_name": "007_parallel_projections"
+    }
+  }
+]

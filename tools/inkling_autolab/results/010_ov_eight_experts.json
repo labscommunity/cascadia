@@ -1,0 +1,122 @@
+[
+  {
+    "run_id": "010_ov_eight_experts_device=CPU_schedule=fused_c52e76e9",
+    "timestamp": "2026-09-13T05:08:26.476737+00:00",
+    "campaign_name": "010_ov_eight_experts",
+    "experiment_name": "010_ov_eight_experts_device=CPU_schedule=fused",
+    "status": "completed",
+    "wall_time_s": 8.127431415952742,
+    "raw_output": "openvino_version=2026.3.1-22476-759c5a6ab8c-releases/2026/3\r\ndevice_name=Intel(R) Core(TM) Ultra X7 358H\r\ncompile_seconds=0.4888850999996066\r\nscope=synthetic_eight_resident_experts_numerical_oracle\r\nvalidation_passed=1\r\noracle_errors_json=[{\"expert\": 0, \"input\": 0, \"relative_rms\": 0.00036208669665373363, \"max_error_over_rms\": 0.009956798111793345, \"finite\": true}, {\"expert\": 1, \"input\": 0, \"relative_rms\": 9.93909062411038e-07, \"max_error_over_rms\": 7.790624171632264e-05, \"finite\": true}, {\"expert\": 2, \"input\": 0, \"relative_rms\": 0.0, \"max_error_over_rms\": 0.0, \"finite\": true}, {\"expert\": 3, \"input\": 0, \"relative_rms\": 0.0005563441867902753, \"max_error_over_rms\": 0.009657273608931875, \"finite\": true}, {\"expert\": 4, \"input\": 0, \"relative_rms\": 0.0001589098864880887, \"max_error_over_rms\": 0.00947034204107807, \"finite\": true}, {\"expert\": 5, \"input\": 0, \"relative_rms\": 6.114012492559717e-05, \"max_error_over_rms\": 0.004792369202684612, \"finite\": true}, {\"expert\": 6, \"input\": 0, \"relative_rms\": 3.9608435181303405e-06, \"max_error_over_rms\": 0.0003074680314971842, \"finite\": true}, {\"expert\": 7, \"input\": 0, \"relative_rms\": 0.0002372197004984199, \"max_error_over_rms\": 0.010030459036099178, \"finite\": true}, {\"expert\": 0, \"input\": 1, \"relative_rms\": 0.0, \"max_error_over_rms\": 0.0, \"finite\": true}, {\"expert\": 1, \"input\": 1, \"relative_rms\": 1.9869984369203102e-06, \"max_error_over_rms\": 0.00015574823328520025, \"finite\": true}, {\"expert\": 2, \"input\": 1, \"relative_rms\": 1.0390745811218018e-05, \"max_error_over_rms\": 0.0006127301236532239, \"finite\": true}, {\"expert\": 3, \"input\": 1, \"relative_rms\": 0.00017509655808747558, \"max_error_over_rms\": 0.010383264814359331, \"finite\": true}, {\"expert\": 4, \"input\": 1, \"relative_rms\": 0.00023581621936448807, \"max_error_over_rms\": 0.00998216553947228, \"finite\": true}, {\"expert\": 5, \"input\": 1, \"relative_rms\": 0.0, \"max_error_over_rms\": 0.0, \"finite\": true}, {\"expert\": 6, \"input\": 1, \"relative_rms\": 0.0, \"max_error_over_rms\": 0.0, \"finite\": true}, {\"expert\": 7, \"input\": 1, \"relative_rms\": 6.339783667476447e-05, \"max_error_over_rms\": 0.004817625969151541, \"finite\": true}]\r\nexperts_ms=10.051912497146986\r\ntiming_samples_json=[10.070243748486973, 9.997809378546663, 10.056406244984828, 10.095543751958758, 10.022003116318956, 10.051912497146986, 10.002684372011572]\r\n",
+    "error": null,
+    "metrics": {
+      "experts_ms": 10.051912497146986,
+      "validation_passed": 1
+    },
+    "config": {
+      "device": "CPU",
+      "schedule": "fused",
+      "name": "010_ov_eight_experts_device=CPU_schedule=fused",
+      "campaign_name": "010_ov_eight_experts"
+    }
+  },
+  {
+    "run_id": "010_ov_eight_experts_device=CPU_schedule=serial_832c764d",
+    "timestamp": "2026-09-13T05:08:35.121205+00:00",
+    "campaign_name": "010_ov_eight_experts",
+    "experiment_name": "010_ov_eight_experts_device=CPU_schedule=serial",
+    "status": "completed",
+    "wall_time_s": 8.640068999957293,
+    "raw_output": "openvino_version=2026.3.1-22476-759c5a6ab8c-releases/2026/3\r\ndevice_name=Intel(R) Core(TM) Ultra X7 358H\r\ncompile_seconds=0.4727301001548767\r\nscope=synthetic_eight_resident_experts_numerical_oracle\r\nvalidation_passed=1\r\noracle_errors_json=[{\"expert\": 0, \"input\": 0, \"relative_rms\": 0.00036208669665373363, \"max_error_over_rms\": 0.009956798111793345, \"finite\": true}, {\"expert\": 1, \"input\": 0, \"relative_rms\": 9.93909062411038e-07, \"max_error_over_rms\": 7.790624171632264e-05, \"finite\": true}, {\"expert\": 2, \"input\": 0, \"relative_rms\": 0.0, \"max_error_over_rms\": 0.0, \"finite\": true}, {\"expert\": 3, \"input\": 0, \"relative_rms\": 0.0005563441867902753, \"max_error_over_rms\": 0.009657273608931875, \"finite\": true}, {\"expert\": 4, \"input\": 0, \"relative_rms\": 0.0001589098864880887, \"max_error_over_rms\": 0.00947034204107807, \"finite\": true}, {\"expert\": 5, \"input\": 0, \"relative_rms\": 6.114012492559717e-05, \"max_error_over_rms\": 0.004792369202684612, \"finite\": true}, {\"expert\": 6, \"input\": 0, \"relative_rms\": 3.9608435181303405e-06, \"max_error_over_rms\": 0.0003074680314971842, \"finite\": true}, {\"expert\": 7, \"input\": 0, \"relative_rms\": 0.0002372197004984199, \"max_error_over_rms\": 0.010030459036099178, \"finite\": true}, {\"expert\": 0, \"input\": 1, \"relative_rms\": 0.0, \"max_error_over_rms\": 0.0, \"finite\": true}, {\"expert\": 1, \"input\": 1, \"relative_rms\": 1.9869984369203102e-06, \"max_error_over_rms\": 0.00015574823328520025, \"finite\": true}, {\"expert\": 2, \"input\": 1, \"relative_rms\": 1.0390745811218018e-05, \"max_error_over_rms\": 0.0006127301236532239, \"finite\": true}, {\"expert\": 3, \"input\": 1, \"relative_rms\": 0.00017509655808747558, \"max_error_over_rms\": 0.010383264814359331, \"finite\": true}, {\"expert\": 4, \"input\": 1, \"relative_rms\": 0.00023581621936448807, \"max_error_over_rms\": 0.00998216553947228, \"finite\": true}, {\"expert\": 5, \"input\": 1, \"relative_rms\": 0.0, \"max_error_over_rms\": 0.0, \"finite\": true}, {\"expert\": 6, \"input\": 1, \"relative_rms\": 0.0, \"max_error_over_rms\": 0.0, \"finite\": true}, {\"expert\": 7, \"input\": 1, \"relative_rms\": 6.339783667476447e-05, \"max_error_over_rms\": 0.004817625969151541, \"finite\": true}]\r\nexperts_ms=12.332137499470264\r\ntiming_samples_json=[12.190518755232915, 12.294315616600215, 12.767646869178861, 12.513275010860525, 12.332137499470264, 12.339459382928908, 12.312668754020706]\r\n",
+    "error": null,
+    "metrics": {
+      "experts_ms": 12.332137499470264,
+      "validation_passed": 1
+    },
+    "config": {
+      "device": "CPU",
+      "schedule": "serial",
+      "name": "010_ov_eight_experts_device=CPU_schedule=serial",
+      "campaign_name": "010_ov_eight_experts"
+    }
+  },
+  {
+    "run_id": "010_ov_eight_experts_device=CPU_schedule=async_afc9634b",
+    "timestamp": "2026-09-13T05:08:43.175732+00:00",
+    "campaign_name": "010_ov_eight_experts",
+    "experiment_name": "010_ov_eight_experts_device=CPU_schedule=async",
+    "status": "completed",
+    "wall_time_s": 8.050570041988976,
+    "raw_output": "openvino_version=2026.3.1-22476-759c5a6ab8c-releases/2026/3\r\ndevice_name=Intel(R) Core(TM) Ultra X7 358H\r\ncompile_seconds=0.49653099942952394\r\nscope=synthetic_eight_resident_experts_numerical_oracle\r\nvalidation_passed=1\r\noracle_errors_json=[{\"expert\": 0, \"input\": 0, \"relative_rms\": 0.00036208669665373363, \"max_error_over_rms\": 0.009956798111793345, \"finite\": true}, {\"expert\": 1, \"input\": 0, \"relative_rms\": 9.93909062411038e-07, \"max_error_over_rms\": 7.790624171632264e-05, \"finite\": true}, {\"expert\": 2, \"input\": 0, \"relative_rms\": 0.0, \"max_error_over_rms\": 0.0, \"finite\": true}, {\"expert\": 3, \"input\": 0, \"relative_rms\": 0.0005563441867902753, \"max_error_over_rms\": 0.009657273608931875, \"finite\": true}, {\"expert\": 4, \"input\": 0, \"relative_rms\": 0.0001589098864880887, \"max_error_over_rms\": 0.00947034204107807, \"finite\": true}, {\"expert\": 5, \"input\": 0, \"relative_rms\": 6.114012492559717e-05, \"max_error_over_rms\": 0.004792369202684612, \"finite\": true}, {\"expert\": 6, \"input\": 0, \"relative_rms\": 3.9608435181303405e-06, \"max_error_over_rms\": 0.0003074680314971842, \"finite\": true}, {\"expert\": 7, \"input\": 0, \"relative_rms\": 0.0002372197004984199, \"max_error_over_rms\": 0.010030459036099178, \"finite\": true}, {\"expert\": 0, \"input\": 1, \"relative_rms\": 0.0, \"max_error_over_rms\": 0.0, \"finite\": true}, {\"expert\": 1, \"input\": 1, \"relative_rms\": 1.9869984369203102e-06, \"max_error_over_rms\": 0.00015574823328520025, \"finite\": true}, {\"expert\": 2, \"input\": 1, \"relative_rms\": 1.0390745811218018e-05, \"max_error_over_rms\": 0.0006127301236532239, \"finite\": true}, {\"expert\": 3, \"input\": 1, \"relative_rms\": 0.00017509655808747558, \"max_error_over_rms\": 0.010383264814359331, \"finite\": true}, {\"expert\": 4, \"input\": 1, \"relative_rms\": 0.00023581621936448807, \"max_error_over_rms\": 0.00998216553947228, \"finite\": true}, {\"expert\": 5, \"input\": 1, \"relative_rms\": 0.0, \"max_error_over_rms\": 0.0, \"finite\": true}, {\"expert\": 6, \"input\": 1, \"relative_rms\": 0.0, \"max_error_over_rms\": 0.0, \"finite\": true}, {\"expert\": 7, \"input\": 1, \"relative_rms\": 6.339783667476447e-05, \"max_error_over_rms\": 0.004817625969151541, \"finite\": true}]\r\nexperts_ms=9.540590617689304\r\ntiming_samples_json=[9.59239061921835, 9.439493747777306, 9.59088749368675, 9.57814062712714, 9.539256250718608, 9.490306241787039, 9.540590617689304]\r\n",
+    "error": null,
+    "metrics": {
+      "experts_ms": 9.540590617689304,
+      "validation_passed": 1
+    },
+    "config": {
+      "device": "CPU",
+      "schedule": "async",
+      "name": "010_ov_eight_experts_device=CPU_schedule=async",
+      "campaign_name": "010_ov_eight_experts"
+    }
+  },
+  {
+    "run_id": "010_ov_eight_experts_device=GPU_schedule=fused_45ff3af9",
+    "timestamp": "2026-09-13T05:08:50.731745+00:00",
+    "campaign_name": "010_ov_eight_experts",
+    "experiment_name": "010_ov_eight_experts_device=GPU_schedule=fused",
+    "status": "completed",
+    "wall_time_s": 7.551845416077413,
+    "raw_output": "openvino_version=2026.3.1-22476-759c5a6ab8c-releases/2026/3\r\ndevice_name=Intel(R) Arc(TM) B390 GPU (iGPU)\r\ncompile_seconds=1.0648950999602675\r\nscope=synthetic_eight_resident_experts_numerical_oracle\r\nvalidation_passed=1\r\noracle_errors_json=[{\"expert\": 0, \"input\": 0, \"relative_rms\": 0.002814142736137158, \"max_error_over_rms\": 0.010905440802986546, \"finite\": true}, {\"expert\": 1, \"input\": 0, \"relative_rms\": 0.002963182288894032, \"max_error_over_rms\": 0.011961346994765866, \"finite\": true}, {\"expert\": 2, \"input\": 0, \"relative_rms\": 0.0030095210952241678, \"max_error_over_rms\": 0.013107861151740048, \"finite\": true}, {\"expert\": 3, \"input\": 0, \"relative_rms\": 0.003235927274020287, \"max_error_over_rms\": 0.013589087794013667, \"finite\": true}, {\"expert\": 4, \"input\": 0, \"relative_rms\": 0.0031512104219638694, \"max_error_over_rms\": 0.013983840931932445, \"finite\": true}, {\"expert\": 5, \"input\": 0, \"relative_rms\": 0.0033417827944260156, \"max_error_over_rms\": 0.014021131453288992, \"finite\": true}, {\"expert\": 6, \"input\": 0, \"relative_rms\": 0.00294346559563418, \"max_error_over_rms\": 0.013497065902177662, \"finite\": true}, {\"expert\": 7, \"input\": 0, \"relative_rms\": 0.0030119009246474073, \"max_error_over_rms\": 0.014986610227916858, \"finite\": true}, {\"expert\": 0, \"input\": 1, \"relative_rms\": 0.0027783090718130673, \"max_error_over_rms\": 0.012613131482338646, \"finite\": true}, {\"expert\": 1, \"input\": 1, \"relative_rms\": 0.0029355890865717478, \"max_error_over_rms\": 0.014765054193744237, \"finite\": true}, {\"expert\": 2, \"input\": 1, \"relative_rms\": 0.0030869324144385305, \"max_error_over_rms\": 0.012859852980950449, \"finite\": true}, {\"expert\": 3, \"input\": 1, \"relative_rms\": 0.0029297451678086043, \"max_error_over_rms\": 0.012795295202753595, \"finite\": true}, {\"expert\": 4, \"input\": 1, \"relative_rms\": 0.003079404680785881, \"max_error_over_rms\": 0.015042095031984323, \"finite\": true}, {\"expert\": 5, \"input\": 1, \"relative_rms\": 0.003268416717011872, \"max_error_over_rms\": 0.014393763909886984, \"finite\": true}, {\"expert\": 6, \"input\": 1, \"relative_rms\": 0.003055884299567217, \"max_error_over_rms\": 0.012901251350325058, \"finite\": true}, {\"expert\": 7, \"input\": 1, \"relative_rms\": 0.003091045535889584, \"max_error_over_rms\": 0.013373440350523758, \"finite\": true}]\r\nexperts_ms=3.7773843650938943\r\ntiming_samples_json=[3.763937493204139, 3.7872593820793554, 3.7773843650938943, 3.754096876946278, 3.7764125008834526, 3.812746872426942, 3.802399995038286]\r\n",
+    "error": null,
+    "metrics": {
+      "experts_ms": 3.7773843650938943,
+      "validation_passed": 1
+    },
+    "config": {
+      "device": "GPU",
+      "schedule": "fused",
+      "name": "010_ov_eight_experts_device=GPU_schedule=fused",
+      "campaign_name": "010_ov_eight_experts"
+    }
+  },
+  {
+    "run_id": "010_ov_eight_experts_device=GPU_schedule=serial_ac9bb023",
+    "timestamp": "2026-09-13T05:08:57.982770+00:00",
+    "campaign_name": "010_ov_eight_experts",
+    "experiment_name": "010_ov_eight_experts_device=GPU_schedule=serial",
+    "status": "completed",
+    "wall_time_s": 7.247396250022575,
+    "raw_output": "openvino_version=2026.3.1-22476-759c5a6ab8c-releases/2026/3\r\ndevice_name=Intel(R) Arc(TM) B390 GPU (iGPU)\r\ncompile_seconds=0.7013898985460401\r\nscope=synthetic_eight_resident_experts_numerical_oracle\r\nvalidation_passed=1\r\noracle_errors_json=[{\"expert\": 0, \"input\": 0, \"relative_rms\": 0.002814142736137158, \"max_error_over_rms\": 0.010905440802986546, \"finite\": true}, {\"expert\": 1, \"input\": 0, \"relative_rms\": 0.002963182288894032, \"max_error_over_rms\": 0.011961346994765866, \"finite\": true}, {\"expert\": 2, \"input\": 0, \"relative_rms\": 0.0030095210952241678, \"max_error_over_rms\": 0.013107861151740048, \"finite\": true}, {\"expert\": 3, \"input\": 0, \"relative_rms\": 0.003235927274020287, \"max_error_over_rms\": 0.013589087794013667, \"finite\": true}, {\"expert\": 4, \"input\": 0, \"relative_rms\": 0.0031512104219638694, \"max_error_over_rms\": 0.013983840931932445, \"finite\": true}, {\"expert\": 5, \"input\": 0, \"relative_rms\": 0.0033417827944260156, \"max_error_over_rms\": 0.014021131453288992, \"finite\": true}, {\"expert\": 6, \"input\": 0, \"relative_rms\": 0.00294346559563418, \"max_error_over_rms\": 0.013497065902177662, \"finite\": true}, {\"expert\": 7, \"input\": 0, \"relative_rms\": 0.0030119009246474073, \"max_error_over_rms\": 0.014986610227916858, \"finite\": true}, {\"expert\": 0, \"input\": 1, \"relative_rms\": 0.0027783090718130673, \"max_error_over_rms\": 0.012613131482338646, \"finite\": true}, {\"expert\": 1, \"input\": 1, \"relative_rms\": 0.0029355890865717478, \"max_error_over_rms\": 0.014765054193744237, \"finite\": true}, {\"expert\": 2, \"input\": 1, \"relative_rms\": 0.0030869324144385305, \"max_error_over_rms\": 0.012859852980950449, \"finite\": true}, {\"expert\": 3, \"input\": 1, \"relative_rms\": 0.0029297451678086043, \"max_error_over_rms\": 0.012795295202753595, \"finite\": true}, {\"expert\": 4, \"input\": 1, \"relative_rms\": 0.003079404680785881, \"max_error_over_rms\": 0.015042095031984323, \"finite\": true}, {\"expert\": 5, \"input\": 1, \"relative_rms\": 0.003268416717011872, \"max_error_over_rms\": 0.014393763909886984, \"finite\": true}, {\"expert\": 6, \"input\": 1, \"relative_rms\": 0.003055884299567217, \"max_error_over_rms\": 0.012901251350325058, \"finite\": true}, {\"expert\": 7, \"input\": 1, \"relative_rms\": 0.003091045535889584, \"max_error_over_rms\": 0.013373440350523758, \"finite\": true}]\r\nexperts_ms=4.239043744746596\r\ntiming_samples_json=[4.311962489737198, 4.369662507087924, 4.23322813003324, 4.227593744872138, 4.250699988915585, 4.239043744746596, 4.234018750139512]\r\n",
+    "error": null,
+    "metrics": {
+      "experts_ms": 4.239043744746596,
+      "validation_passed": 1
+    },
+    "config": {
+      "device": "GPU",
+      "schedule": "serial",
+      "name": "010_ov_eight_experts_device=GPU_schedule=serial",
+      "campaign_name": "010_ov_eight_experts"
+    }
+  },
+  {
+    "run_id": "010_ov_eight_experts_device=GPU_schedule=async_86626d65",
+    "timestamp": "2026-09-13T05:09:05.031476+00:00",
+    "campaign_name": "010_ov_eight_experts",
+    "experiment_name": "010_ov_eight_experts_device=GPU_schedule=async",
+    "status": "completed",
+    "wall_time_s": 7.04580329102464,
+    "raw_output": "openvino_version=2026.3.1-22476-759c5a6ab8c-releases/2026/3\r\ndevice_name=Intel(R) Arc(TM) B390 GPU (iGPU)\r\ncompile_seconds=0.6930650002323091\r\nscope=synthetic_eight_resident_experts_numerical_oracle\r\nvalidation_passed=1\r\noracle_errors_json=[{\"expert\": 0, \"input\": 0, \"relative_rms\": 0.002814142736137158, \"max_error_over_rms\": 0.010905440802986546, \"finite\": true}, {\"expert\": 1, \"input\": 0, \"relative_rms\": 0.002963182288894032, \"max_error_over_rms\": 0.011961346994765866, \"finite\": true}, {\"expert\": 2, \"input\": 0, \"relative_rms\": 0.0030095210952241678, \"max_error_over_rms\": 0.013107861151740048, \"finite\": true}, {\"expert\": 3, \"input\": 0, \"relative_rms\": 0.003235927274020287, \"max_error_over_rms\": 0.013589087794013667, \"finite\": true}, {\"expert\": 4, \"input\": 0, \"relative_rms\": 0.0031512104219638694, \"max_error_over_rms\": 0.013983840931932445, \"finite\": true}, {\"expert\": 5, \"input\": 0, \"relative_rms\": 0.0033417827944260156, \"max_error_over_rms\": 0.014021131453288992, \"finite\": true}, {\"expert\": 6, \"input\": 0, \"relative_rms\": 0.00294346559563418, \"max_error_over_rms\": 0.013497065902177662, \"finite\": true}, {\"expert\": 7, \"input\": 0, \"relative_rms\": 0.0030119009246474073, \"max_error_over_rms\": 0.014986610227916858, \"finite\": true}, {\"expert\": 0, \"input\": 1, \"relative_rms\": 0.0027783090718130673, \"max_error_over_rms\": 0.012613131482338646, \"finite\": true}, {\"expert\": 1, \"input\": 1, \"relative_rms\": 0.0029355890865717478, \"max_error_over_rms\": 0.014765054193744237, \"finite\": true}, {\"expert\": 2, \"input\": 1, \"relative_rms\": 0.0030869324144385305, \"max_error_over_rms\": 0.012859852980950449, \"finite\": true}, {\"expert\": 3, \"input\": 1, \"relative_rms\": 0.0029297451678086043, \"max_error_over_rms\": 0.012795295202753595, \"finite\": true}, {\"expert\": 4, \"input\": 1, \"relative_rms\": 0.003079404680785881, \"max_error_over_rms\": 0.015042095031984323, \"finite\": true}, {\"expert\": 5, \"input\": 1, \"relative_rms\": 0.003268416717011872, \"max_error_over_rms\": 0.014393763909886984, \"finite\": true}, {\"expert\": 6, \"input\": 1, \"relative_rms\": 0.003055884299567217, \"max_error_over_rms\": 0.012901251350325058, \"finite\": true}, {\"expert\": 7, \"input\": 1, \"relative_rms\": 0.003091045535889584, \"max_error_over_rms\": 0.013373440350523758, \"finite\": true}]\r\nexperts_ms=3.2683531171642244\r\ntiming_samples_json=[3.238740624510683, 3.2973343768389896, 3.2489500008523464, 3.2201218855334446, 3.2858718768693507, 3.2683531171642244, 3.296925002359785]\r\n",
+    "error": null,
+    "metrics": {
+      "experts_ms": 3.2683531171642244,
+      "validation_passed": 1
+    },
+    "config": {
+      "device": "GPU",
+      "schedule": "async",
+      "name": "010_ov_eight_experts_device=GPU_schedule=async",
+      "campaign_name": "010_ov_eight_experts"
+    }
+  }
+]

@@ -1,0 +1,47 @@
+version: 1
+name: 006_int4_tiles
+hypothesis: Interleaving independent int4 rows hides FMA dependency latency without
+  changing numerical results.
+question: q3
+moonshot: true
+runner:
+  backend: ssh
+  host: cascadia-tate-07-ts
+  user: devcloud
+  timeout_seconds: 300
+  command: powershell -NoProfile -File C:/Users/devcloud/inkling-autolab/run-bench.ps1
+    -Threads {threads} -Mask {mask} -Serial {serial} -Reads {reads} -Samples {samples}
+    -Tokens {tokens} -Kind {kind} -Variant {variant} -ExpectedHash {expected_hash}
+    -Bf16Rows {bf16_rows} -Int4Rows {int4_rows}
+defaults:
+  expected_hash: 4e89f0793afa1015
+  mask: 65535
+  serial: 0
+  reads: 1
+  samples: 5
+  tokens: 32
+  kind: layer
+  variant: int4-rows
+  threads: 16
+grid:
+  int4_rows:
+  - 1
+  - 2
+  - 4
+  bf16_rows:
+  - 1
+  - 2
+metrics:
+  primary: layer_tokens_per_s
+  direction: maximize
+  collect:
+  - name: layer_tokens_per_s
+    pattern: (?m)^layer_tokens_per_s=([\d.]+)
+  - name: layer_ms
+    pattern: (?m)^layer_ms=([\d.]+)
+  - name: output_hash
+    pattern: (?m)^output_hash=([0-9a-f]+)
+    type: str
+stopping:
+  window: 100000
+  max_failures: 2

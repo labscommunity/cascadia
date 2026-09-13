@@ -1,0 +1,45 @@
+version: 1
+name: 012_final_profile
+hypothesis: The retained paths retain their gain when all arms use the final binary
+  and identical compiler.
+question: q3
+moonshot: false
+runner:
+  backend: ssh
+  host: cascadia-tate-07-ts
+  user: devcloud
+  timeout_seconds: 300
+  command: powershell -NoProfile -File C:/Users/devcloud/inkling-autolab/compare.ps1
+    -Slot {slot} -Repeat {a_repeat} -Samples {samples} -UseFinal
+defaults:
+  expected_hash: 4e89f0793afa1015
+  samples: 7
+grid:
+  a_repeat:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  slot:
+  - 0
+  - 1
+  - 2
+metrics:
+  primary: layer_tokens_per_s
+  direction: maximize
+  collect:
+  - name: layer_tokens_per_s
+    pattern: (?m)^layer_tokens_per_s=([\d.]+)
+  - name: layer_ms
+    pattern: (?m)^layer_ms=([\d.]+)
+  - name: output_hash
+    pattern: (?m)^output_hash=([0-9a-f]+)
+    type: str
+  - name: actual_arm
+    pattern: (?m)^arm=([a-z0-9]+)
+    type: str
+stopping:
+  window: 100000
+  max_failures: 2

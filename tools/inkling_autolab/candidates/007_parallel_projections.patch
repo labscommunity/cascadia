@@ -1,0 +1,35 @@
+diff --git a/crates/cascadia-engine-sparse-moe/src/inkling/attn.rs b/crates/cascadia-engine-sparse-moe/src/inkling/attn.rs
+index 8ccde363..afcf4daf 100644
+--- a/crates/cascadia-engine-sparse-moe/src/inkling/attn.rs
++++ b/crates/cascadia-engine-sparse-moe/src/inkling/attn.rs
+@@ -401,6 +401,30 @@ impl AttentionLayer {
+             self.dims.head_dim,
+             self.dims.d_rel,
+         );
++        use std::sync::OnceLock;
++        static PARALLEL: OnceLock<bool> = OnceLock::new();
++        if *PARALLEL.get_or_init(|| super::env_flag("CASCADIA_INKLING_PAR_PROJECTIONS")) {
++            let project = |w: &[u16], rows: usize| {
++                let mut out = vec![0.0; rows];
++                linear_bf16_w(h, w, rows, hd, &mut out);
++                out
++            };
++            let (q, (kr, (vr, r))) = rayon::join(
++                || project(&self.w.wq, hq * d),
++                || {
++                    rayon::join(
++                        || project(&self.w.wk, hkv * d),
++                        || {
++                            rayon::join(
++                                || project(&self.w.wv, hkv * d),
++                                || project(&self.w.wr, hq * dr),
++                            )
++                        },
++                    )
++                },
++            );
++            return (q, kr, vr, r);
++        }
+         let mut q = vec![0.0f32; hq * d];
+         linear_bf16_w(h, &self.w.wq, hq * d, hd, &mut q);
+         let mut kr = vec![0.0f32; hkv * d];

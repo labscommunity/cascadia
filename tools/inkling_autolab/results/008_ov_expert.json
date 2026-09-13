@@ -1,0 +1,44 @@
+[
+  {
+    "run_id": "008_ov_expert_device=CPU_9d679352",
+    "timestamp": "2026-09-13T04:59:50.071944+00:00",
+    "campaign_name": "008_ov_expert",
+    "experiment_name": "008_ov_expert_device=CPU",
+    "status": "completed",
+    "wall_time_s": 3.3144532499136403,
+    "raw_output": "openvino_version=2026.3.1-22476-759c5a6ab8c-releases/2026/3\r\ndevice_name=Intel(R) Core(TM) Ultra X7 358H\r\ncompile_seconds=0.1159785003401339\r\nscope=synthetic_single_expert_numerical_oracle\r\nexpert_ms=1.265257815248333\r\nrelative_rms=0.00036208669665373363\r\nmax_error_over_rms=0.009956798111793345\r\nvalidation_passed=1\r\ntiming_samples_json=[1.254098431672901, 1.2566796867758967, 1.2291328093851916, 1.2969093731953762, 1.3083078156341799, 1.265257815248333, 1.2951031239936128]\r\n",
+    "error": null,
+    "metrics": {
+      "expert_ms": 1.265257815248333,
+      "relative_rms": 0.00036208669665373363,
+      "max_error_over_rms": 0.009956798111793345,
+      "validation_passed": 1
+    },
+    "config": {
+      "device": "CPU",
+      "name": "008_ov_expert_device=CPU",
+      "campaign_name": "008_ov_expert"
+    }
+  },
+  {
+    "run_id": "008_ov_expert_device=GPU_4a791467",
+    "timestamp": "2026-09-13T04:59:53.785285+00:00",
+    "campaign_name": "008_ov_expert",
+    "experiment_name": "008_ov_expert_device=GPU",
+    "status": "completed",
+    "wall_time_s": 3.7092510419897735,
+    "raw_output": "openvino_version=2026.3.1-22476-759c5a6ab8c-releases/2026/3\r\ndevice_name=Intel(R) Arc(TM) B390 GPU (iGPU)\r\ncompile_seconds=1.4682901999913156\r\nscope=synthetic_single_expert_numerical_oracle\r\nexpert_ms=0.48343125672545284\r\nrelative_rms=0.002814142736137158\r\nmax_error_over_rms=0.010905440802986546\r\nvalidation_passed=1\r\ntiming_samples_json=[0.48465155850863084, 0.48290780978277326, 0.48343125672545284, 0.484248434077017, 0.4825687501579523, 0.4853312493651174, 0.48329999845009297]\r\n",
+    "error": null,
+    "metrics": {
+      "expert_ms": 0.48343125672545284,
+      "relative_rms": 0.002814142736137158,
+      "max_error_over_rms": 0.010905440802986546,
+      "validation_passed": 1
+    },
+    "config": {
+      "device": "GPU",
+      "name": "008_ov_expert_device=GPU",
+      "campaign_name": "008_ov_expert"
+    }
+  }
+]

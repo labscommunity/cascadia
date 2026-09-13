@@ -1,0 +1,89 @@
+[
+  {
+    "run_id": "005_bf16_tiles_bf16_rows=1_4a4fc92d",
+    "timestamp": "2026-09-13T04:45:08.285472+00:00",
+    "campaign_name": "005_bf16_tiles",
+    "experiment_name": "005_bf16_tiles_bf16_rows=1",
+    "status": "completed",
+    "wall_time_s": 6.0814479580149055,
+    "raw_output": "process_priority=High affinity=65535 bf16_rows=1\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=18.167656 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=17.952675 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=17.924756 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=17.929834 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=17.965084 hash=4e89f0793afa1015\nlayer_ms=17.952675\nlayer_tokens_per_s=55.702005\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[17.92475625,17.929834375,17.952675000000003,17.965084375,18.16765625]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 55.702005,
+      "layer_ms": 17.952675,
+      "output_hash": "4e89f0793afa1015"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "mask": 65535,
+      "serial": 0,
+      "reads": 1,
+      "samples": 5,
+      "tokens": 32,
+      "kind": "layer",
+      "variant": "bf16-rows",
+      "threads": 16,
+      "bf16_rows": 1,
+      "name": "005_bf16_tiles_bf16_rows=1",
+      "campaign_name": "005_bf16_tiles"
+    }
+  },
+  {
+    "run_id": "005_bf16_tiles_bf16_rows=2_28cfb1a3",
+    "timestamp": "2026-09-13T04:45:14.032051+00:00",
+    "campaign_name": "005_bf16_tiles",
+    "experiment_name": "005_bf16_tiles_bf16_rows=2",
+    "status": "completed",
+    "wall_time_s": 5.741920416941866,
+    "raw_output": "process_priority=High affinity=65535 bf16_rows=2\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=18.054834 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=17.869750 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=17.801063 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=17.821938 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=17.822606 hash=4e89f0793afa1015\nlayer_ms=17.822606\nlayer_tokens_per_s=56.108517\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[17.8010625,17.8219375,17.82260625,17.86975,18.054834375]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 56.108517,
+      "layer_ms": 17.822606,
+      "output_hash": "4e89f0793afa1015"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "mask": 65535,
+      "serial": 0,
+      "reads": 1,
+      "samples": 5,
+      "tokens": 32,
+      "kind": "layer",
+      "variant": "bf16-rows",
+      "threads": 16,
+      "bf16_rows": 2,
+      "name": "005_bf16_tiles_bf16_rows=2",
+      "campaign_name": "005_bf16_tiles"
+    }
+  },
+  {
+    "run_id": "005_bf16_tiles_bf16_rows=4_7a803545",
+    "timestamp": "2026-09-13T04:45:19.860110+00:00",
+    "campaign_name": "005_bf16_tiles",
+    "experiment_name": "005_bf16_tiles_bf16_rows=4",
+    "status": "completed",
+    "wall_time_s": 5.824590583099052,
+    "raw_output": "process_priority=High affinity=65535 bf16_rows=4\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=18.804256 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=18.393272 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=18.083356 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=18.057044 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=17.959013 hash=4e89f0793afa1015\nlayer_ms=18.083356\nlayer_tokens_per_s=55.299469\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[17.9590125,18.057043750000002,18.08335625,18.393271875,18.80425625]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 55.299469,
+      "layer_ms": 18.083356,
+      "output_hash": "4e89f0793afa1015"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "mask": 65535,
+      "serial": 0,
+      "reads": 1,
+      "samples": 5,
+      "tokens": 32,
+      "kind": "layer",
+      "variant": "bf16-rows",
+      "threads": 16,
+      "bf16_rows": 4,
+      "name": "005_bf16_tiles_bf16_rows=4",
+      "campaign_name": "005_bf16_tiles"
+    }
+  }
+]

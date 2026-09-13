@@ -15,8 +15,16 @@
   "baseline_engine_commit": "9aaebff02a2f68a48913ff67061d90c13121ae35",
   "baseline_binary_sha256": "2a4292fa49def264b9efcb379d408abebf4a30935512ce0d760bbd6db423779d",
   "baseline_output_hash": "4e89f0793afa1015",
-  "compiler": "rustc 1.95.0 x86_64-pc-windows-msvc",
+  "compiler": "rustc 1.98.1 (48a229cea 2026-09-01) x86_64-pc-windows-msvc; queried explicitly 2026-09-13",
   "autolab_commit": "3993e2c4d4d05175a9b84f6632f062ce1994deda",
   "full_checkpoint_present": false,
-  "full_model_tokens_per_second": null
+  "full_model_tokens_per_second": null,
+  "disk_model": "SAMSUNG MZVLC1T0HFLU-00BT7",
+  "physical_disk_count": 1,
+  "disk_capacity_bytes": 1024209543168,
+  "free_disk_bytes_after_setup": 3595194368,
+  "ethernet_bits_per_second": 1000000000,
+  "mapped_network_drives": 0,
+  "compiler_metadata_correction": "Earlier 1.95 metadata did not query the explicit MSVC toolchain; superseded by rustc +stable-x86_64-pc-windows-msvc -vV. Final profile confirmation uses one binary for all arms.",
+  "free_disk_bytes_final": 3415846912
 }

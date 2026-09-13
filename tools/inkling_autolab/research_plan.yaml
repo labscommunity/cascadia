@@ -1,22 +1,43 @@
 questions:
-  - id: q1
-    question: Which thread count and expert schedule minimizes resident layer latency?
-    status: active
-    priority: 1
-  - id: q2
-    question: Does hybrid-core affinity improve the selected schedule?
-    status: pending
-    priority: 2
-  - id: q3
-    question: Can activation reuse across bf16 rows improve the production shell without numerical changes?
-    status: pending
-    priority: 3
-  - id: q4
-    question: Do concurrent attention projections reduce latency further?
-    status: pending
-    priority: 4
-  - id: q5
-    question: What is full-checkpoint end-to-end throughput on tate-07?
-    status: blocked
-    reason: No Inkling export; 4 GB disk free versus the 512 GB artifact.
-    priority: 5
+- id: q1
+  question: Which thread count and expert schedule minimizes resident layer latency?
+  status: answered
+  priority: 1
+  answer: 16 threads, concurrent experts, direct mmap wins the resident case; retest
+    reads under real paging.
+- id: q2
+  question: Does hybrid-core affinity improve the selected schedule?
+  status: answered
+  priority: 2
+  answer: All 16 CPUs beat the tested affinity subsets.
+- id: q3
+  question: Can activation reuse across bf16 rows improve the production shell without
+    numerical changes?
+  status: answered
+  priority: 3
+  answer: 'Final same-binary comparison: bf16=2 plus int4=4 yields 4.43% speedup over
+    direct baseline, wins all six groups.'
+- id: q4
+  question: Do concurrent attention projections reduce latency further?
+  status: answered
+  priority: 4
+  answer: Concurrent projections regress performance; production change removed.
+- id: q5
+  question: What is full-checkpoint end-to-end throughput on tate-07?
+  status: blocked
+  reason: No full 975B checkpoint; only ~3.5 GB disk free versus 512 GB export. Full
+    decode harness prepared; 25 tok/s not measured.
+  priority: 5
+- id: q6
+  question: Can the Intel iGPU accelerate the selected expert set?
+  status: answered
+  answer: 'Eight distinct resident experts: OpenVINO GPU async 3.268 ms, oracle passed.
+    Full backend/cache churn/paging unvalidated.'
+  priority: 6
+- id: q7
+  question: Why does adaptive residency repeatedly copy warm files on Windows?
+  status: answered
+  priority: 7
+  answer: Working-set sample stays 0/64 after buffered reads/prefetch, becomes 64/64
+    after mapped page walk. Direct-read resident profile avoids repeated copies; cold
+    paging policy remains unvalidated.

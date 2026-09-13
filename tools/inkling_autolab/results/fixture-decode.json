@@ -1,0 +1,65 @@
+{
+  "correctness_verified": true,
+  "export": "crates/cascadia-engine-sparse-moe/tests/fixtures/inkling_export",
+  "manifest": {
+    "experts": 8,
+    "hidden": 64,
+    "layers": 4
+  },
+  "output_hash": "1f7cd0eb14a22662",
+  "samples": [
+    {
+      "case": "tiny_hf_greedy",
+      "decode_seconds": 0.0048074,
+      "decode_steps": 7,
+      "generated_ids": [
+        28,
+        48,
+        106,
+        84,
+        28,
+        48,
+        106,
+        84
+      ],
+      "prefill_seconds": 0.0100181,
+      "repetition": 0
+    },
+    {
+      "case": "tiny_hf_greedy",
+      "decode_seconds": 0.0046472,
+      "decode_steps": 7,
+      "generated_ids": [
+        28,
+        48,
+        106,
+        84,
+        28,
+        48,
+        106,
+        84
+      ],
+      "prefill_seconds": 0.0089066,
+      "repetition": 1
+    },
+    {
+      "case": "tiny_hf_greedy",
+      "decode_seconds": 0.0049862,
+      "decode_steps": 7,
+      "generated_ids": [
+        28,
+        48,
+        106,
+        84,
+        28,
+        48,
+        106,
+        84
+      ],
+      "prefill_seconds": 0.009085,
+      "repetition": 2
+    }
+  ],
+  "scope": "fixture_model_decode",
+  "slowest_case_decode_tokens_per_s": 1403.8746941558702
+}

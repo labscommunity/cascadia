@@ -1,0 +1,114 @@
+[
+  {
+    "run_id": "004_affinity_mask=65535_4e80f79d",
+    "timestamp": "2026-09-13T04:38:54.649026+00:00",
+    "campaign_name": "004_affinity",
+    "experiment_name": "004_affinity_mask=65535",
+    "status": "completed",
+    "wall_time_s": 5.922257957980037,
+    "raw_output": "process_priority=High affinity=65535 bf16_rows=1\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=16 tokens=32 warmup=16\nsample=0 ms_per_layer_token=18.676481 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=18.888828 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=18.657800 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=18.136475 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=18.174441 hash=4e89f0793afa1015\nlayer_ms=18.657800\nlayer_tokens_per_s=53.596887\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[18.136475,18.174440625,18.657799999999998,18.676481250000002,18.888828125]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 53.596887,
+      "layer_ms": 18.6578,
+      "output_hash": "4e89f0793afa1015"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "mask": 65535,
+      "serial": 0,
+      "reads": 1,
+      "samples": 5,
+      "tokens": 32,
+      "kind": "layer",
+      "variant": "baseline",
+      "threads": 0,
+      "name": "004_affinity_mask=65535",
+      "campaign_name": "004_affinity"
+    }
+  },
+  {
+    "run_id": "004_affinity_mask=4095_106b7208",
+    "timestamp": "2026-09-13T04:39:00.648309+00:00",
+    "campaign_name": "004_affinity",
+    "experiment_name": "004_affinity_mask=4095",
+    "status": "completed",
+    "wall_time_s": 5.995311625069007,
+    "raw_output": "process_priority=High affinity=4095 bf16_rows=1\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=12 tokens=32 warmup=16\nsample=0 ms_per_layer_token=19.506138 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=19.004863 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=19.001203 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=19.045378 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=19.124884 hash=4e89f0793afa1015\nlayer_ms=19.045378\nlayer_tokens_per_s=52.506177\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[19.001203125,19.0048625,19.045378125000003,19.124884375,19.5061375]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 52.506177,
+      "layer_ms": 19.045378,
+      "output_hash": "4e89f0793afa1015"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "mask": 4095,
+      "serial": 0,
+      "reads": 1,
+      "samples": 5,
+      "tokens": 32,
+      "kind": "layer",
+      "variant": "baseline",
+      "threads": 0,
+      "name": "004_affinity_mask=4095",
+      "campaign_name": "004_affinity"
+    }
+  },
+  {
+    "run_id": "004_affinity_mask=65520_1367c04e",
+    "timestamp": "2026-09-13T04:39:07.427505+00:00",
+    "campaign_name": "004_affinity",
+    "experiment_name": "004_affinity_mask=65520",
+    "status": "completed",
+    "wall_time_s": 6.7756170419743285,
+    "raw_output": "process_priority=High affinity=65520 bf16_rows=1\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=12 tokens=32 warmup=16\nsample=0 ms_per_layer_token=21.889250 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=21.913581 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=21.556284 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=21.593962 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=22.084497 hash=4e89f0793afa1015\nlayer_ms=21.889250\nlayer_tokens_per_s=45.684526\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[21.556284374999997,21.5939625,21.88925,21.91358125,22.084496875000003]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 45.684526,
+      "layer_ms": 21.88925,
+      "output_hash": "4e89f0793afa1015"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "mask": 65520,
+      "serial": 0,
+      "reads": 1,
+      "samples": 5,
+      "tokens": 32,
+      "kind": "layer",
+      "variant": "baseline",
+      "threads": 0,
+      "name": "004_affinity_mask=65520",
+      "campaign_name": "004_affinity"
+    }
+  },
+  {
+    "run_id": "004_affinity_mask=15_b2e3f9ba",
+    "timestamp": "2026-09-13T04:40:15.539154+00:00",
+    "campaign_name": "004_affinity",
+    "experiment_name": "004_affinity_mask=15",
+    "status": "completed",
+    "wall_time_s": 7.7987090409733355,
+    "raw_output": "process_priority=High affinity=15 bf16_rows=1\r\ncpu_avx2=true cpu_fma=true cpu_avx512f=false\nscope=synthetic_resident_layer hidden=6144 inter=3072 selected_experts=8 kind=layer threads=4 tokens=32 warmup=16\nsample=0 ms_per_layer_token=27.105297 hash=4e89f0793afa1015\nsample=1 ms_per_layer_token=26.666850 hash=4e89f0793afa1015\nsample=2 ms_per_layer_token=26.599659 hash=4e89f0793afa1015\nsample=3 ms_per_layer_token=26.842578 hash=4e89f0793afa1015\nsample=4 ms_per_layer_token=26.491609 hash=4e89f0793afa1015\nlayer_ms=26.666850\nlayer_tokens_per_s=37.499742\noutput_hash=4e89f0793afa1015\ntiming_samples_json=[26.491609375,26.599659375,26.66685,26.842578125,27.105296875]\n",
+    "error": null,
+    "metrics": {
+      "layer_tokens_per_s": 37.499742,
+      "layer_ms": 26.66685,
+      "output_hash": "4e89f0793afa1015"
+    },
+    "config": {
+      "expected_hash": "4e89f0793afa1015",
+      "mask": 15,
+      "serial": 0,
+      "reads": 1,
+      "samples": 5,
+      "tokens": 32,
+      "kind": "layer",
+      "variant": "baseline",
+      "threads": 0,
+      "name": "004_affinity_mask=15",
+      "campaign_name": "004_affinity"
+    }
+  }
+]

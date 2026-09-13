@@ -1,0 +1,31 @@
+{
+  "test_summaries": [
+    "ok. 133 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+    "ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s",
+    "ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s",
+    "ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+    "ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+    "ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s",
+    "ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s",
+    "ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+    "ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s"
+  ],
+  "total_passed": 222,
+  "binary_sha256": [
+    "FFFD189ECEBD32110B72B918DC448BA280C631C20388EE800AF3A76C0C6AEBD9",
+    "F0BF021AF04EDD76F6FEC5B77D8571225BA38F8F2315CBAAC2BED189C04FC77A"
+  ],
+  "compiler": "rustc 1.98.1 (48a229cea 2026-09-01), MSVC, LLVM 22.1.8",
+  "bf16_rows": 2,
+  "int4_rows": 4,
+  "full_checkpoint_validation": false,
+  "fixture_decode_hash": "1f7cd0eb14a22662",
+  "fixture_greedy_matches_hf": true,
+  "fixture_repetitions": 3,
+  "clippy": "completed successfully; warnings remain in existing library code and 3 chunks_exact style suggestions in inkling_bench"
+}

@@ -1,0 +1,35 @@
+version: 1
+name: 010_ov_eight_experts
+hypothesis: The iGPU gain survives eight distinct active expert weights and dispatch
+  costs.
+question: q6
+moonshot: true
+measurement_scope: synthetic_eight_resident_experts_numerical_oracle
+validation_metric: validation_passed
+runner:
+  backend: ssh
+  host: cascadia-tate-07-ts
+  user: devcloud
+  timeout_seconds: 600
+  command: C:/Users/devcloud/venvs/qwen38/Scripts/python.exe -u C:/Users/devcloud/inkling-autolab/ov-moe-probe.py
+    --device {device} --schedule {schedule}
+grid:
+  device:
+  - CPU
+  - GPU
+  schedule:
+  - fused
+  - serial
+  - async
+metrics:
+  primary: experts_ms
+  direction: minimize
+  collect:
+  - name: experts_ms
+    pattern: (?m)^experts_ms=([\d.eE+-]+)
+  - name: validation_passed
+    pattern: (?m)^validation_passed=(\d+)
+    type: int
+stopping:
+  window: 100000
+  max_failures: 2

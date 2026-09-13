@@ -1,0 +1,22 @@
+{
+  "test_summaries": [
+    "ok. 1 passed; 0 failed; 0 ignored; 0 measured; 132 filtered out; finished in 0.00s",
+    "ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s",
+    "ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s",
+    "ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+    "ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s"
+  ],
+  "total_passed": 75,
+  "binary_sha256": [
+    "96794B8EF0F81B18002FD42146F9546156E1BC787B5EF4B606141E6BD896B294"
+  ],
+  "compiler": "stable-x86_64-pc-windows-msvc (earlier 1.95 version label was unverified; see environment.json correction)",
+  "bf16_rows": 4,
+  "int4_rows": 4,
+  "parallel_projections": 1,
+  "full_checkpoint_validation": false
+}

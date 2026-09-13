@@ -1,0 +1,53 @@
+version: 1
+name: full_model_decode_TEMPLATE
+hypothesis: The verified PTL profile improves complete large-model decode.
+measurement_scope: full_large_model_decode
+validation_metric: correctness_verified
+question: q5
+moonshot: false
+runner:
+  backend: ssh
+  host: cascadia-tate-07-ts
+  user: devcloud
+  timeout_seconds: 14400
+  command: powershell -NoProfile -File C:/Users/devcloud/inkling-autolab/run-full.ps1
+    -Model "{model}" -Cases "{cases}" -Reads {reads} -Bf16Rows {bf16_rows} -Int4Rows
+    {int4_rows} -Tokens 64 -Samples 3
+defaults:
+  model: C:/Users/devcloud/inkling-autolab/model
+  cases: C:/Users/devcloud/inkling-autolab/large-cases.json
+  expected_hash: REPLACE_WITH_REAL_BASELINE_HASH
+grid:
+  reads:
+  - 0
+  - 1
+  bf16_rows:
+  - 1
+  - 2
+  int4_rows:
+  - 1
+  - 4
+metrics:
+  primary: decode_tokens_per_s
+  direction: maximize
+  collect:
+  - name: decode_tokens_per_s
+    pattern: (?m)^decode_tokens_per_s=([\d.eE+-]+)
+  - name: output_hash
+    pattern: (?m)^output_hash=([0-9a-f]+)
+    type: str
+  - name: full_model
+    pattern: (?m)^full_model=(\d+)
+    type: int
+  - name: correctness_verified
+    pattern: (?m)^correctness_verified=(\d+)
+    type: int
+  - name: decode_steps_min
+    pattern: (?m)^decode_steps_min=(\d+)
+    type: int
+  - name: repetitions
+    pattern: (?m)^repetitions=(\d+)
+    type: int
+stopping:
+  window: 100000
+  max_failures: 2

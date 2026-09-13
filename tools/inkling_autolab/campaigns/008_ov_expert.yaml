@@ -1,0 +1,35 @@
+version: 1
+name: 008_ov_expert
+hypothesis: Moving the expert computation to the Intel iGPU can outperform the Rust
+  CPU component while respecting the original weight grid.
+question: q6
+moonshot: true
+measurement_scope: synthetic_single_expert_numerical_oracle
+validation_metric: validation_passed
+runner:
+  backend: ssh
+  host: cascadia-tate-07-ts
+  user: devcloud
+  timeout_seconds: 600
+  command: C:/Users/devcloud/venvs/qwen38/Scripts/python.exe -u C:/Users/devcloud/inkling-autolab/ov-expert-probe.py
+    --device {device}
+grid:
+  device:
+  - CPU
+  - GPU
+metrics:
+  primary: expert_ms
+  direction: minimize
+  collect:
+  - name: expert_ms
+    pattern: (?m)^expert_ms=([\d.eE+-]+)
+  - name: relative_rms
+    pattern: (?m)^relative_rms=([\d.eE+-]+)
+  - name: max_error_over_rms
+    pattern: (?m)^max_error_over_rms=([\d.eE+-]+)
+  - name: validation_passed
+    pattern: (?m)^validation_passed=(\d+)
+    type: int
+stopping:
+  window: 100000
+  max_failures: 2

@@ -1,0 +1,43 @@
+{
+  "scope": "warm_file_cache_working_set_probe",
+  "bin_bytes": 31850496,
+  "page_walk_checksum": 991814,
+  "phases": [
+    {
+      "phase": "new_mapping",
+      "valid": 0,
+      "sampled": 64,
+      "elapsed_ms": null
+    },
+    {
+      "phase": "buffered_read_0",
+      "valid": 0,
+      "sampled": 64,
+      "elapsed_ms": 8.789300452917814
+    },
+    {
+      "phase": "buffered_read_1",
+      "valid": 0,
+      "sampled": 64,
+      "elapsed_ms": 8.182699792087078
+    },
+    {
+      "phase": "buffered_read_2",
+      "valid": 0,
+      "sampled": 64,
+      "elapsed_ms": 8.043699897825718
+    },
+    {
+      "phase": "prefetch_returned_1",
+      "valid": 0,
+      "sampled": 64,
+      "elapsed_ms": null
+    },
+    {
+      "phase": "after_mapping_page_walk",
+      "valid": 64,
+      "sampled": 64,
+      "elapsed_ms": 6.9911000318825245
+    }
+  ]
+}

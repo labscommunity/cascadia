@@ -1,0 +1,18 @@
+{
+  "updated_at": "2026-09-13",
+  "target_decode_tokens_per_s": 25,
+  "target_reached": false,
+  "full_model_decode_tokens_per_s": null,
+  "status": "blocked_on_checkpoint_and_storage",
+  "checkpoint_available": false,
+  "required_export_bytes_approx": 512000000000,
+  "free_disk_bytes": 3415846912,
+  "physical_ram_kib": 66427728,
+  "full_model_benchmark_built": true,
+  "full_model_benchmark_fixture_verified": true,
+  "next_action": "Provision the complete unchanged large Inkling export on tate-07 with adequate storage; then establish baseline cases/hash and run full-model campaign. Storage alone does not establish target feasibility.",
+  "deployment_launcher_check": {
+    "exit_code": 1,
+    "error": "Full Inkling checkpoint unavailable at C:/Users/devcloud/inkling-autolab/model; cannot measure full-model throughput."
+  }
+}
