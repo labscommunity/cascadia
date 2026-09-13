@@ -1,6 +1,7 @@
 # Restart handoff — Inkling / Panther Lake Autolab
 
-Updated 2026-09-13. The user is offline and authorized autonomous testing on
+Updated 2026-09-13. Completed campaign execution; no task benchmark/controller
+is left running. All results and the full-model deployment blocker are saved. The user is offline and authorized autonomous testing on
 **tate-07, 100.82.253.76**, plus commit/push as t8, without coauthor trailers.
 Latest target: **25 full-model decode tokens/s for large Inkling on this one PTL
 box**. It has NOT been reached. Do not equate layer/component rates with it.
@@ -25,7 +26,8 @@ groups, all output hashes exact. Combined 2.699x resident-layer gain; tiles alon
 009 measured 2.753x / 1.070x; use the conservative final same-binary numbers.
 Smaller pools/affinity subsets and parallel projections lost. Retained two opt-in
 AVX2 row kernels; original defaults remain 1/1. Removed parallel-projection
-production code; saved the rejected patch/evidence. Kernel commit: 18c3edf9.
+production code; saved the rejected patch/evidence. Kernel commit: 18c3edf9; campaigns/full-decode harness: 83d07a27. Both pushed
+as t8 without coauthors.
 
 OpenVINO eight-expert probe: GPU async 3.268 ms vs CPU async 9.541 ms.
 Independent f64-dot oracle passed for all eight distinct experts at two inputs.

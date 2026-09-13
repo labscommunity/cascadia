@@ -27,5 +27,11 @@
   "fixture_decode_hash": "1f7cd0eb14a22662",
   "fixture_greedy_matches_hf": true,
   "fixture_repetitions": 3,
-  "clippy": "completed successfully; warnings remain in existing library code and 3 chunks_exact style suggestions in inkling_bench"
+  "clippy": "completed successfully; warnings remain in existing library code and 3 chunks_exact style suggestions in inkling_bench",
+  "wrong_architecture_without_fixture_override": {
+    "exit_code": 101,
+    "error": "expected the complete large Inkling architecture",
+    "full_model_metric_emitted": false
+  },
+  "owned_remote_processes_before_final_guard": 0
 }
