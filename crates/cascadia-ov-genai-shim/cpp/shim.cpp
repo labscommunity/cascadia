@@ -746,6 +746,27 @@ int32_t cascadia_tokenizer_count_tokens(
 
 // ===================== ov-runtime (Core/CompiledModel/InferRequest) =====================
 
+// Replace every Constant of a model read from an IR with a fresh in-memory
+// copy: the IR reader's constants are file-backed (mmap) and carry the
+// weightless-cache attribute, and OpenVINO 2026.3.1's GPU plugin cannot
+// build its fused MoE op from such constants ("Node which is about to be
+// added in between two other nodes should not have any existing
+// dependencies ... postponed_decompression") unless its offload path is on.
+// A copied constant has neither the mapping nor the attribute, and compiles
+// like a graph built in memory. Costs one extra copy of the weights while
+// compiling. Requested with the pseudo-property CASCADIA_MATERIALIZE_CONSTANTS=1,
+// which never reaches the plugin.
+static void materialize_constants(const std::shared_ptr<ov::Model>& model) {
+    for (const auto& op : model->get_ops()) {
+        auto c = std::dynamic_pointer_cast<ov::op::v0::Constant>(op);
+        if (!c) continue;
+        auto nc = std::make_shared<ov::op::v0::Constant>(
+            c->get_element_type(), c->get_shape(), c->get_data_ptr());
+        nc->set_friendly_name(c->get_friendly_name());
+        ov::replace_node(c, nc);
+    }
+}
+
 int32_t cascadia_runtime_compile(
     const char* model_xml_path, const char* device,
     const char* const* properties_kv, size_t properties_count,
@@ -756,8 +777,23 @@ int32_t cascadia_runtime_compile(
     try {
         auto handle = std::make_unique<cascadia_runtime_t>();
         auto props = collect_properties(properties_kv, properties_count);
-        auto compiled = handle->core.compile_model(
-            std::string(model_xml_path), std::string(device), props);
+        bool materialize = false;
+        {
+            auto it = props.find("CASCADIA_MATERIALIZE_CONSTANTS");
+            if (it != props.end()) {
+                materialize = it->second.as<std::string>() == "1";
+                props.erase(it);
+            }
+        }
+        ov::CompiledModel compiled;
+        if (materialize) {
+            auto model = handle->core.read_model(std::string(model_xml_path));
+            materialize_constants(model);
+            compiled = handle->core.compile_model(model, std::string(device), props);
+        } else {
+            compiled = handle->core.compile_model(
+                std::string(model_xml_path), std::string(device), props);
+        }
         handle->compiled = std::make_shared<ov::CompiledModel>(std::move(compiled));
         handle->request = std::make_shared<ov::InferRequest>(
             handle->compiled->create_infer_request());

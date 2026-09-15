@@ -95,6 +95,44 @@ So the resident single-stream number for today's export on a 1.5 TB
 Cascade Lake box is **1.5 tok/s**, 4.5× the first resident run and ~2.6× off
 the bandwidth floor of §1 — the shell items in §5 are the rest.
 
+### 2b. Panther Lake CPU vs Arc B390 iGPU (tate-07, real layers)
+
+Same dump on a 64 GB Panther Lake laptop (Core Ultra X7 358H, AVX2 only,
+Arc B390 iGPU) with the experts as OpenVINO int4 IRs on the iGPU
+(`CASCADIA_INKLING_OV_EXPERTS=1`, `docs/architectures/inkling.md`):
+
+| layer | CPU kernel, 16 threads | iGPU experts (f32, exact) | iGPU experts (f16) |
+|---|---|---|---|
+| dense (0, 1) | 8.3 ms/token | 6.3 ms/token | 6.5 ms/token |
+| MoE (2) decode | 23.7 ms/token | **7.6 ms/token** | 7.1 ms/token |
+| MoE (2) prefill, 23 tokens | 210 ms | 152 ms | 129 ms |
+
+With the fused MoE kernel (OpenVINO 2026.3) and the attention projections
+on the iGPU as well, the same layer measures 5.1 ms/token decode with int8
+projections (4.5 with int4) and 89 ms per 23-token prefill, the dense
+layers 4.2 ms (3.6) — 5.9–6.6× the CPU kernel, about 0.3 s per token for
+the whole model on resident ranks. The box itself still
+pages the 975B export from NVMe (the 16 GB/token of expert reads are its
+clock), so these are per-rank numbers of a resident pipeline (§3), not a
+single-box tokens/s:
+
+| 12 resident ranks, single stream | s/token | tok/s |
+|---|---|---|
+| CPU kernel (30 ms per MoE layer) | ~2.0 | ~0.5 |
+| fused MoE on iGPU, attention on CPU (6.9 ms) | 0.45 | 2.2 |
+| everything on iGPU, int8 attention (5.1 ms) | 0.33 | ~3.0 |
+| everything on iGPU, int4 attention (4.5 ms) | 0.30 | ~3.3 |
+| bandwidth floor, all int4 at ~105 GB/s | 0.21 | ~4.7 |
+
+Aggregate with concurrent streams: the fused kernel already batches rows
+(2.4 ms per row at 23 rows against 4.5 ms for one), so a rank that decodes
+several streams per step approaches the bandwidth floor per token; the
+engine's per-request scheduler is the remaining piece for that. The device budget is the rank limit on
+Windows: the iGPU gets half the RAM as shared memory (33.5 GiB here), so a
+64 GB box holds three fused MoE layers (8.3 GB each) at these numbers, four
+at the cap and five or six paging — 22 ranks for the model, or larger-RAM
+or Linux ranks for more layers each.
+
 ## 3. Why a pipeline does not multiply per-box bandwidth
 
 Layer sharding (what `--engine sparse-moe` does across ranks) gives box *i* a

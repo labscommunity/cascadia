@@ -146,6 +146,16 @@ pub struct MoeLayer {
     remote: Option<(u32, Arc<EpClient>)>,
     route_observer: Option<RouteObserver>,
     expert_cache: super::expert_cache::ExpertCache,
+    /// Optional OpenVINO expert backend (`(layer index, backend)`), attached
+    /// by the loader when `CASCADIA_INKLING_OV_EXPERTS` is set: every
+    /// selected expert then runs its compiled IR (iGPU / NPU / CPU), falling
+    /// back per call to the Rust kernel. See [`super::ov_expert`].
+    ov: Option<(u32, Arc<super::ov_expert::OvExperts>)>,
+    /// Optional fused-MoE backend (`(layer index, backend)`): the whole layer
+    /// as one compiled OpenVINO model, routing from [`Self::route`]. Takes
+    /// precedence over `ov` for the routed + shared experts. See
+    /// [`super::ov_moe`].
+    ov_moe: Option<(u32, Arc<super::ov_moe::OvMoe>)>,
 }
 
 impl MoeLayer {
@@ -265,6 +275,8 @@ impl MoeLayer {
             remote: None,
             route_observer: None,
             expert_cache: super::expert_cache::ExpertCache::new(n_routed, cache_bytes),
+            ov: None,
+            ov_moe: None,
         }
     }
 
@@ -312,6 +324,117 @@ impl MoeLayer {
     }
 
     /// The attached expert-parallel client and this layer's absolute index.
+    /// Route this layer's experts through an OpenVINO backend (see
+    /// [`super::ov_expert`]); `layer` is the global layer index the IRs are
+    /// filed under.
+    pub fn attach_ov(&mut self, layer: u32, ov: Arc<super::ov_expert::OvExperts>) {
+        self.ov = Some((layer, ov));
+    }
+
+    pub fn ov(&self) -> Option<(u32, &Arc<super::ov_expert::OvExperts>)> {
+        self.ov.as_ref().map(|(l, o)| (*l, o))
+    }
+
+    /// Route this layer through a fused-MoE backend (see [`super::ov_moe`]);
+    /// `layer` is the global layer index its IR is filed under.
+    pub fn attach_ov_moe(&mut self, layer: u32, ov: Arc<super::ov_moe::OvMoe>) {
+        self.ov_moe = Some((layer, ov));
+    }
+
+    pub fn ov_moe(&self) -> Option<(u32, &Arc<super::ov_moe::OvMoe>)> {
+        self.ov_moe.as_ref().map(|(l, o)| (*l, o))
+    }
+
+    /// Compile this layer's fused IR ahead of time; `None` without a backend.
+    pub fn warm_ov_moe(&self) -> Option<bool> {
+        let (lid, ov) = self.ov_moe.as_ref()?;
+        Some(ov.warm(*lid))
+    }
+
+    /// `rows` rows through the fused backend: route each row here, dispatch
+    /// the ids + weights (shared experts as `n_routed + s` with their gammas)
+    /// in one call. `None` when the backend declines (the caller falls back).
+    fn forward_ov_moe(&self, xs: &[f32], rows: usize) -> Option<Vec<f32>> {
+        let (lid, ov) = self.ov_moe.as_ref()?;
+        let k = self.top_k + self.w.shared.len();
+        if ov.k_total() != k {
+            return None;
+        }
+        let mut ids = Vec::with_capacity(rows * k);
+        let mut wts = Vec::with_capacity(rows * k);
+        for r in 0..rows {
+            let gate = self.route(&xs[r * self.hidden..(r + 1) * self.hidden]);
+            ids.extend(gate.idx.iter().map(|&e| e as i32));
+            ids.extend((0..self.w.shared.len()).map(|s| (self.n_routed + s) as i32));
+            wts.extend_from_slice(&gate.w);
+            wts.extend_from_slice(&gate.gammas);
+        }
+        ov.forward(*lid, xs, rows, &ids, &wts)
+    }
+
+    /// Compile every expert of this layer on the attached OV backend (a
+    /// benchmark's warm-up); returns `(compiled, failed keys)`, or `None`
+    /// when no backend is attached.
+    pub fn warm_ov(&self) -> Option<(usize, Vec<(u32, u32)>)> {
+        if self.ov_moe.is_some() {
+            return None; // the fused backend serves this layer; its per-expert IRs are only a fallback
+        }
+        let (lid, ov) = self.ov.as_ref()?;
+        let n = self.w.experts.len() + self.w.shared.len();
+        let keys: Vec<(u32, u32)> = (0..n as u32).map(|e| (*lid, e)).collect();
+        let bad = ov.warm(&keys, self.n_routed as u32);
+        Some((n - bad.len(), bad))
+    }
+
+    /// One expert (`id` in the Rust id space: routed `0..n_routed`, shared
+    /// `n_routed + s`) on `x`: the OV backend when attached and it answers,
+    /// else the Rust kernel straight off the expert's storage.
+    fn expert_ov_or_rust(&self, id: usize, x: &[f32]) -> Vec<f32> {
+        if let Some((lid, ov)) = &self.ov {
+            if let Some(y) = ov.expert(*lid, id as u32, self.n_routed as u32, x) {
+                return y;
+            }
+        }
+        let e = if id < self.n_routed {
+            &self.w.experts[id]
+        } else {
+            &self.w.shared[id - self.n_routed]
+        };
+        e.forward(x, self.hidden, self.inter)
+    }
+
+    /// Decode through the OV backend: the token's routed + shared experts as
+    /// compiled IRs (concurrently under rayon when `par_experts`), summed in
+    /// gate order like [`Self::forward`]. Bypasses the mmap read machinery —
+    /// the device holds the weights.
+    fn forward_ov(&self, x: &[f32]) -> Vec<f32> {
+        let gate = self.route(x);
+        let ids: Vec<usize> = gate
+            .idx
+            .iter()
+            .copied()
+            .chain((0..self.w.shared.len()).map(|s| self.n_routed + s))
+            .collect();
+        let ys: Vec<Vec<f32>> = if par_experts() {
+            use rayon::prelude::*;
+            ids.par_iter()
+                .map(|&id| self.expert_ov_or_rust(id, x))
+                .collect()
+        } else {
+            ids.iter()
+                .map(|&id| self.expert_ov_or_rust(id, x))
+                .collect()
+        };
+        let weights = gate.w.iter().chain(gate.gammas.iter());
+        let mut out = vec![0.0f32; self.hidden];
+        for (y, &wj) in ys.iter().zip(weights) {
+            for (o, &yi) in out.iter_mut().zip(y) {
+                *o += wj * yi;
+            }
+        }
+        out
+    }
+
     pub fn remote(&self) -> Option<(u32, &Arc<EpClient>)> {
         self.remote.as_ref().map(|(l, c)| (*l, c))
     }
@@ -401,6 +524,14 @@ impl MoeLayer {
             "inkling MoE layer has no local experts and no expert-parallel client attached \
              (a driver built with ExpertSet::None must attach_remote before running)"
         );
+        if self.ov_moe.is_some() {
+            if let Some(y) = self.forward_ov_moe(x, 1) {
+                return y;
+            }
+        }
+        if self.ov.is_some() {
+            return self.forward_ov(x);
+        }
         let gate = self.route(x);
         // Every expert this token touches, in accumulation order, with its weight.
         let sel: Vec<&AnyExpert> = gate
@@ -538,6 +669,23 @@ impl MoeLayer {
         assert_eq!(xs.len(), rows * self.hidden, "moe forward_batch: xs len");
         if self.remote.is_some() {
             return self.forward_remote(xs, rows);
+        }
+        if self.ov_moe.is_some() {
+            if let Some(y) = self.forward_ov_moe(xs, rows) {
+                return y;
+            }
+        }
+        if self.ov.is_some() {
+            // Per-expert IRs take one row at a time; rows run concurrently.
+            // Same per-row result as `forward_ov`, so decode and prefill agree.
+            let row = |br: usize| self.forward_ov(&xs[br * self.hidden..(br + 1) * self.hidden]);
+            let ys: Vec<Vec<f32>> = if par_experts() {
+                use rayon::prelude::*;
+                (0..rows).into_par_iter().map(row).collect()
+            } else {
+                (0..rows).map(row).collect()
+            };
+            return ys.concat();
         }
         assert!(
             self.has_local_experts(),
@@ -707,6 +855,8 @@ pub struct DenseMlp {
     /// `dense_intermediate`.
     pub inter: usize,
     pub global_scale: f32,
+    /// Optional OpenVINO backend for this MLP (`(layer index, backend)`).
+    ov: Option<(u32, Arc<super::ov_expert::OvExperts>)>,
 }
 
 impl DenseMlp {
@@ -715,12 +865,33 @@ impl DenseMlp {
             w,
             inter,
             global_scale,
+            ov: None,
         }
+    }
+
+    pub fn attach_ov(&mut self, layer: u32, ov: Arc<super::ov_expert::OvExperts>) {
+        self.ov = Some((layer, ov));
+    }
+
+    pub fn ov(&self) -> Option<(u32, &Arc<super::ov_expert::OvExperts>)> {
+        self.ov.as_ref().map(|(l, o)| (*l, o))
+    }
+
+    /// Compile this MLP on the attached OV backend; `(compiled, failed)`.
+    pub fn warm_ov(&self) -> Option<(usize, Vec<(u32, u32)>)> {
+        let (lid, ov) = self.ov.as_ref()?;
+        let bad = ov.warm(&[(*lid, super::ov_expert::DENSE)], 0);
+        Some((1 - bad.len(), bad))
     }
 
     /// `down(silu(gate·x) · up·x) · global_scale` for one token (`[hidden]`).
     pub fn forward(&self, x: &[f32], hidden: usize) -> Vec<f32> {
-        let mut y = self.w.forward(x, hidden, self.inter);
+        let mut y = match &self.ov {
+            Some((lid, ov)) => ov
+                .dense(*lid, x)
+                .unwrap_or_else(|| self.w.forward(x, hidden, self.inter)),
+            None => self.w.forward(x, hidden, self.inter),
+        };
         for v in y.iter_mut() {
             *v *= self.global_scale;
         }

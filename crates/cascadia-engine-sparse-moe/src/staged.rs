@@ -9,6 +9,27 @@
 
 use crate::sampling::{init_rng, sample, SamplingConfig};
 
+/// Wall-clock split of one generation: the prompt forward plus the first
+/// sample, then the decode steps (each a full forward + head + sample) after
+/// it. `decode_steps` is the number of timed steps, i.e. tokens minus one.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GenTiming {
+    pub prefill_s: f64,
+    pub decode_s: f64,
+    pub decode_steps: usize,
+}
+
+impl GenTiming {
+    /// Decode tokens per second over the timed steps (0 without any).
+    pub fn decode_tok_s(&self) -> f64 {
+        if self.decode_s > 0.0 && self.decode_steps > 0 {
+            self.decode_steps as f64 / self.decode_s
+        } else {
+            0.0
+        }
+    }
+}
+
 pub trait StagedRunner: Send + 'static {
     /// Short backend name for log lines (`"dsv4"`, `"glm5"`).
     fn arch_name(&self) -> &'static str;
@@ -99,9 +120,24 @@ pub trait StagedRunner: Send + 'static {
         max_new: usize,
         cfg: &SamplingConfig,
     ) -> (Vec<u32>, bool) {
+        let (out, cap, _) = self.generate_reason_timed(prompt, max_new, cfg);
+        (out, cap)
+    }
+
+    /// [`Self::generate_reason`] plus wall-clock timing split into the prefill
+    /// (prompt forward + first sample) and the decode steps after it, so a
+    /// serving log can report decode tok/s the way the benchmarks do instead
+    /// of folding a 25 s prefill into a 16-token request.
+    fn generate_reason_timed(
+        &mut self,
+        prompt: &[u32],
+        max_new: usize,
+        cfg: &SamplingConfig,
+    ) -> (Vec<u32>, bool, GenTiming) {
+        let started = std::time::Instant::now();
         self.reset();
         if prompt.is_empty() {
-            return (Vec::new(), false);
+            return (Vec::new(), false, GenTiming::default());
         }
         let max_seq = self.max_seq();
         let mut rng = init_rng(cfg.seed);
@@ -130,6 +166,9 @@ pub trait StagedRunner: Send + 'static {
             ll
         };
         let mut next = sample(&last_logits, &history, cfg, &mut rng);
+        let prefill_s = started.elapsed().as_secs_f64();
+        let decode_started = std::time::Instant::now();
+        let mut decode_steps = 0usize;
         let mut out = Vec::with_capacity(max_new);
         let mut pos = prompt.len().min(max_seq);
         let mut hit_context_cap = false;
@@ -154,8 +193,14 @@ pub trait StagedRunner: Send + 'static {
             let logits = self.head_logits(&h);
             next = sample(&logits, &history, cfg, &mut rng);
             pos += 1;
+            decode_steps += 1;
         }
-        (out, hit_context_cap)
+        let timing = GenTiming {
+            prefill_s,
+            decode_s: decode_started.elapsed().as_secs_f64(),
+            decode_steps,
+        };
+        (out, hit_context_cap, timing)
     }
 
     /// Single-stage greedy convenience (warmup / tests).

@@ -173,6 +173,81 @@ impl Layer {
         }
     }
 
+    /// Route this layer's MLP (MoE experts or the dense FFN) through an
+    /// OpenVINO backend; `layer` is the global layer index.
+    pub fn attach_ov(&mut self, layer: u32, ov: Arc<super::ov_expert::OvExperts>) {
+        match &mut self.mlp {
+            LayerMlp::Moe(m) => m.attach_ov(layer, ov),
+            LayerMlp::Dense(d) => d.attach_ov(layer, ov),
+        }
+    }
+
+    /// Route this layer's MoE through a fused-MoE backend (dense layers keep
+    /// their path); `layer` is the global layer index.
+    pub fn attach_ov_moe(&mut self, layer: u32, ov: Arc<super::ov_moe::OvMoe>) {
+        if let LayerMlp::Moe(m) = &mut self.mlp {
+            m.attach_ov_moe(layer, ov);
+        }
+    }
+
+    /// Route this layer's attention projections through an OpenVINO backend.
+    pub fn attach_ov_attn(&mut self, layer: u32, ov: Arc<super::ov_attn::OvAttn>) {
+        self.attn.attach_ov(layer, ov);
+    }
+
+    pub fn ov_attn(&self) -> Option<&Arc<super::ov_attn::OvAttn>> {
+        self.attn.ov().map(|(_, o)| o)
+    }
+
+    pub fn warm_ov_attn(&self) -> Option<bool> {
+        self.attn.warm_ov()
+    }
+
+    /// Free this layer's Rust projection tables once its OpenVINO attention
+    /// backend compiled (`None` without a backend, `Some(0)` if it failed to
+    /// warm and the Rust tables must stay).
+    pub fn release_rust_attention_weights(&mut self) -> Option<usize> {
+        let ok = self.attn.warm_ov()?;
+        Some(if ok {
+            self.attn.release_rust_projections()
+        } else {
+            0
+        })
+    }
+
+    /// The attached fused-MoE backend, if any.
+    pub fn ov_moe(&self) -> Option<&Arc<super::ov_moe::OvMoe>> {
+        match &self.mlp {
+            LayerMlp::Moe(m) => m.ov_moe().map(|(_, o)| o),
+            LayerMlp::Dense(_) => None,
+        }
+    }
+
+    /// Compile this layer's fused IR ahead of time; `None` without a backend.
+    pub fn warm_ov_moe(&self) -> Option<bool> {
+        match &self.mlp {
+            LayerMlp::Moe(m) => m.warm_ov_moe(),
+            LayerMlp::Dense(_) => None,
+        }
+    }
+
+    /// The attached OV backend, if any.
+    pub fn ov(&self) -> Option<&Arc<super::ov_expert::OvExperts>> {
+        match &self.mlp {
+            LayerMlp::Moe(m) => m.ov().map(|(_, o)| o),
+            LayerMlp::Dense(d) => d.ov().map(|(_, o)| o),
+        }
+    }
+
+    /// Compile this layer's experts / MLP on the attached OV backend;
+    /// `(compiled, failed keys)`, or `None` without a backend.
+    pub fn warm_ov(&self) -> Option<(usize, Vec<(u32, u32)>)> {
+        match &self.mlp {
+            LayerMlp::Moe(m) => m.warm_ov(),
+            LayerMlp::Dense(d) => d.warm_ov(),
+        }
+    }
+
     /// Cached positions (attention and convs agree).
     pub fn len(&self) -> usize {
         debug_assert_eq!(self.attn.len(), self.attn_sconv.len());
@@ -391,6 +466,8 @@ impl WideTable {
 /// `logits_mup_width_multiplier` of 24 the reciprocal form is 1 ULP off on
 /// most elements, enough to flip argmax ties.
 pub struct Head {
+    /// Optional OpenVINO backend for the unembed GEMV; see [`super::ov_head`].
+    ov: Option<Arc<super::ov_head::OvHead>>,
     /// `norm.weight` `[hidden]`.
     pub norm: Vec<f32>,
     /// `unembed.weight` `[vocab, hidden]`.
@@ -419,6 +496,7 @@ impl Head {
             unembed.len() / hidden
         );
         Self {
+            ov: None,
             norm,
             unembed,
             eps,
@@ -431,6 +509,21 @@ impl Head {
         self.norm.len()
     }
 
+    /// Route the unembed GEMV through an OpenVINO backend (see
+    /// [`super::ov_head`]).
+    pub fn attach_ov(&mut self, ov: Arc<super::ov_head::OvHead>) {
+        self.ov = Some(ov);
+    }
+
+    pub fn ov(&self) -> Option<&Arc<super::ov_head::OvHead>> {
+        self.ov.as_ref()
+    }
+
+    /// Compile the head's IR ahead of time; `None` without a backend.
+    pub fn warm_ov(&self) -> Option<bool> {
+        Some(self.ov.as_ref()?.warm())
+    }
+
     /// `unembed · (rmsnorm(x, norm) / mup)[..unpadded_vocab]` for one hidden
     /// `x` (`[hidden]`).
     pub fn logits(&self, x: &[f32]) -> Vec<f32> {
@@ -440,6 +533,11 @@ impl Head {
         rmsnorm_f32(&mut y, &self.norm, self.eps);
         for v in y.iter_mut() {
             *v /= self.mup;
+        }
+        if let Some(ov) = &self.ov {
+            if let Some(l) = ov.logits(&y) {
+                return l;
+            }
         }
         let mut logits = vec![0.0f32; self.unpadded_vocab];
         self.unembed.matvec_f32(&y, hidden, &mut logits);
@@ -619,6 +717,74 @@ impl Model {
 
     /// Embed `token`, run every layer and the head; returns logits
     /// `[unpadded_vocab]` at this position and advances the caches.
+    /// Route every layer's experts / dense MLP through an OpenVINO backend
+    /// (layer index = position; the model holds all layers).
+    pub fn attach_ov(&mut self, ov: Arc<super::ov_expert::OvExperts>) {
+        for (i, l) in self.layers.iter_mut().enumerate() {
+            l.attach_ov(i as u32, Arc::clone(&ov));
+        }
+    }
+
+    /// Route the head's unembed GEMV through an OpenVINO backend (last rank
+    /// only; a stage without a head ignores it).
+    pub fn attach_ov_head(&mut self, ov: Arc<super::ov_head::OvHead>) {
+        self.head.attach_ov(ov);
+    }
+
+    pub fn ov_head(&self) -> Option<&Arc<super::ov_head::OvHead>> {
+        self.head.ov()
+    }
+
+    /// Compile every attached OpenVINO backend (attention, fused MoE,
+    /// per-expert, head) ahead of the first forward so their compile and
+    /// first-shape costs land outside any timed region. Returns
+    /// `(backends warmed, backends that failed)`.
+    pub fn warm_ov_backends(&self) -> (usize, usize) {
+        let (mut ok, mut bad) = (0usize, 0usize);
+        let mut tally = |r: Option<bool>| match r {
+            Some(true) => ok += 1,
+            Some(false) => bad += 1,
+            None => {}
+        };
+        for l in &self.layers {
+            tally(l.warm_ov_attn());
+            tally(l.warm_ov_moe());
+            tally(l.warm_ov().map(|(_, failed)| failed.is_empty()));
+        }
+        tally(self.head.warm_ov());
+        (ok, bad)
+    }
+
+    /// Free the Rust attention projections of every layer whose OpenVINO
+    /// attention backend compiles (see `Layer::release_rust_attention_weights`);
+    /// one entry per layer.
+    pub fn release_rust_attention_weights(&mut self) -> Vec<Option<usize>> {
+        self.layers
+            .iter_mut()
+            .map(|l| l.release_rust_attention_weights())
+            .collect()
+    }
+
+    /// Route every MoE layer through a fused-MoE backend (layer index =
+    /// position) — layers whose IR the backend lacks keep their path.
+    pub fn attach_ov_moe(&mut self, ov: Arc<super::ov_moe::OvMoe>) {
+        for (i, l) in self.layers.iter_mut().enumerate() {
+            if ov.has_layer(i as u32) {
+                l.attach_ov_moe(i as u32, Arc::clone(&ov));
+            }
+        }
+    }
+
+    /// Route every layer's attention projections that have IRs through an
+    /// OpenVINO backend (layer index = position).
+    pub fn attach_ov_attn(&mut self, ov: Arc<super::ov_attn::OvAttn>) {
+        for (i, l) in self.layers.iter_mut().enumerate() {
+            if ov.has_layer(i as u32) {
+                l.attach_ov_attn(i as u32, Arc::clone(&ov));
+            }
+        }
+    }
+
     pub fn forward_token(&mut self, token: u32) -> Vec<f32> {
         let mut x = self.embed_token(token);
         let early = self.early_prediction_reads_enabled();

@@ -68,22 +68,25 @@ pub fn rmsnorm_f32(x: &mut [f32], w: &[f32], eps: f32) {
 pub mod attn;
 pub mod conv;
 pub mod ep;
+mod expert_cache;
 pub mod ffn;
 pub mod gate;
 pub mod loader;
 pub mod model;
 pub mod moe;
-mod expert_cache;
+pub mod ov_attn;
+pub mod ov_expert;
+pub mod ov_head;
+pub mod ov_moe;
 pub use expert_cache::ExpertCacheStats;
 mod read_buffers;
+pub use read_buffers::prefill_read_statistics;
 pub use read_buffers::read_buffer_idle_limit_bytes;
 pub use read_buffers::uncached_read_statistics;
-pub use read_buffers::prefill_read_statistics;
 mod predicted_read;
 pub use predicted_read::{
     prediction_read_statistics, prediction_read_worker_count, second_prediction_rank_ceiling,
-    second_prediction_read_statistics, third_prediction_read_statistics,
-    PredictionReadStats,
+    second_prediction_read_statistics, third_prediction_read_statistics, PredictionReadStats,
 };
 pub mod relpos;
 pub mod stage;

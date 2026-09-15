@@ -936,3 +936,147 @@ fn previous_layer_prediction_cannot_use_predecessor_or_target_sequence_state() {
     assert_eq!(first.len(), 3);
     assert_eq!(second.len(), 4);
 }
+
+/// The OpenVINO expert backend's wiring on a build without OpenVINO (or with
+/// an unusable `experts_ov/`): every expert call falls back to the Rust
+/// kernel per key, the model's output is bit-identical to a plain model, the
+/// failed keys are recorded once, and `from_env` stays `None` without the
+/// opt-in. (The device path itself is validated on hardware — see
+/// docs/architectures/inkling.md.)
+#[test]
+fn ov_backend_falls_back_bit_identically_without_openvino() {
+    use cascadia_engine_sparse_moe::inkling::ov_expert::OvExperts;
+    use std::sync::Arc;
+
+    let c = cfg();
+    let tmp = std::env::temp_dir().join(format!("inkling_ov_test_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let mut plain = random_model(7);
+    let mut with_ov = random_model(7);
+    let ov = Arc::new(OvExperts::from_dir(
+        tmp.clone(),
+        "CPU".into(),
+        c.hidden,
+        8,
+        64,
+        None,
+        &[("INFERENCE_PRECISION_HINT".into(), "f32".into())],
+    ));
+    with_ov.attach_ov(Arc::clone(&ov));
+    assert_eq!(ov.stats().fallbacks, 0);
+
+    for &t in &[3u32, 11, 5] {
+        let a = plain.forward_token(t);
+        let b = with_ov.forward_token(t);
+        assert_eq!(
+            bits(&a),
+            bits(&b),
+            "token {t}: OV-attached model must equal the plain model when every expert falls back"
+        );
+    }
+    let st = ov.stats();
+    assert!(st.fallbacks > 0, "no expert call went through the backend");
+    assert_eq!(
+        st.hits + st.misses,
+        0,
+        "nothing can run on a stub / empty experts_ov"
+    );
+    let failed = ov.failed_keys();
+    assert!(!failed.is_empty(), "unusable IRs must be recorded per key");
+    // Layer 0/1 are dense (one key each), MoE layers record the touched experts.
+    assert!(failed.values().all(|v| !v.is_empty()));
+
+    assert!(
+        OvExperts::from_env(&tmp, c.hidden).is_none(),
+        "the backend is opt-in: CASCADIA_INKLING_OV_EXPERTS unset -> None"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn releasing_rust_attention_weights_keeps_them_when_the_backend_cannot_warm() {
+    // Without OpenVINO the attention IR cannot compile, so the release must
+    // refuse (Some(0)) and the Rust projections stay bit-identical.
+    use cascadia_engine_sparse_moe::inkling::ov_attn::OvAttn;
+    use std::sync::Arc;
+
+    let tmp = std::env::temp_dir().join(format!("inkling_ov_attn_drop_{}", std::process::id()));
+    let dir = tmp.join("attn_ov");
+    for sub in ["qkvr", "o"] {
+        let d = dir.join("layer_00").join(sub);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("openvino_model.xml"), b"<net/>").unwrap();
+    }
+    let mut plain = random_model(7);
+    let mut with_ov = random_model(7);
+    let ov = Arc::new(OvAttn::new(dir, "GPU".into()));
+    assert!(ov.has_layer(0));
+    with_ov.attach_ov_attn(Arc::clone(&ov));
+    let released = with_ov.release_rust_attention_weights();
+    assert_eq!(
+        released[0],
+        Some(0),
+        "no OpenVINO: layer 0 must keep its Rust tables"
+    );
+    assert!(
+        released[1..].iter().all(|r| r.is_none()),
+        "layers without an IR have no backend"
+    );
+    for &t in &[3u32, 11, 5] {
+        let a = plain.forward_token(t);
+        let b = with_ov.forward_token(t);
+        assert_eq!(
+            bits(&a),
+            bits(&b),
+            "token {t}: kept Rust projections must stay bit-identical"
+        );
+    }
+    assert!(ov.stats().fallbacks > 0, "the backend was never asked");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// The fused-MoE backend's wiring on a build without OpenVINO: the layer
+/// declines every call, the model falls back to its other paths bit-identically,
+/// the unusable layers are recorded, and `from_env` stays `None` without the
+/// opt-in.
+#[test]
+fn ov_moe_backend_falls_back_bit_identically_without_openvino() {
+    use cascadia_engine_sparse_moe::inkling::ov_moe::OvMoe;
+    use std::sync::Arc;
+
+    let c = cfg();
+    let tmp = std::env::temp_dir().join(format!("inkling_ov_moe_test_{}", std::process::id()));
+    // One "IR" per MoE layer so has_layer() is true and the (stub) compile is attempted.
+    for l in 0..8u32 {
+        let d = tmp.join(format!("layer_{l:02}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("openvino_model.xml"), b"<net/>").unwrap();
+    }
+    let mut plain = random_model(11);
+    let mut with_ov = random_model(11);
+    let ov = Arc::new(OvMoe::new(
+        tmp.clone(),
+        "GPU".into(),
+        c.hidden,
+        c.top_k + 2,
+        c.n_routed + 2,
+        None,
+        None,
+    ));
+    with_ov.attach_ov_moe(Arc::clone(&ov));
+    for &t in &[3u32, 11, 5] {
+        assert_eq!(
+            bits(&plain.forward_token(t)),
+            bits(&with_ov.forward_token(t)),
+            "token {t}"
+        );
+    }
+    let st = ov.stats();
+    assert!(
+        st.fallbacks > 0 && st.calls == 0,
+        "stub: every fused call must fall back, got {st:?}"
+    );
+    assert!(!ov.failed_layers().is_empty());
+    assert!(OvMoe::from_env(&tmp, c.hidden, c.top_k + 2, c.n_routed + 2).is_none());
+    let _ = std::fs::remove_dir_all(&tmp);
+}

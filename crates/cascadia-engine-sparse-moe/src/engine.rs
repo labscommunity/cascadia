@@ -5408,9 +5408,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // process. The panic message carries the worker/layer diagnostics.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.runner
-                .generate_reason(&prompt_ids, max_new, &sampling_cfg)
+                .generate_reason_timed(&prompt_ids, max_new, &sampling_cfg)
         }));
-        let (generated, hit_context_cap) = match outcome {
+        let (generated, hit_context_cap, timing) = match outcome {
             Ok(r) => r,
             Err(payload) => {
                 let msg = payload
@@ -5430,6 +5430,10 @@ impl<R: StagedRunner> PipelineEngine<R> {
             tokens = n_tokens,
             elapsed_s = elapsed,
             tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
+            prefill_s = timing.prefill_s,
+            decode_s = timing.decode_s,
+            decode_steps = timing.decode_steps,
+            decode_tok_s = timing.decode_tok_s(),
             "task done ({} single-stage)",
             self.runner.arch_name()
         );

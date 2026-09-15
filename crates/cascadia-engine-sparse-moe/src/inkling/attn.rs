@@ -143,6 +143,9 @@ pub struct AttnWeights {
 }
 
 pub struct AttentionLayer {
+    /// Optional OpenVINO backend for the five projections (`(layer, backend)`);
+    /// see [`super::ov_attn`].
+    ov: Option<(u32, std::sync::Arc<super::ov_attn::OvAttn>)>,
     pub dims: AttnDims,
     scale: f32,
     w: AttnWeights,
@@ -236,6 +239,7 @@ impl AttentionLayer {
             }
         };
         Self {
+            ov: None,
             scale: 1.0 / d as f32,
             dims,
             w,
@@ -393,6 +397,110 @@ impl AttentionLayer {
 
     /// The four projections of one input-normed hidden `h` (`[H]`), each
     /// bf16-rounded: `(q, k_raw, v_raw, r)`.
+    /// Route the five projections through an OpenVINO backend (see
+    /// [`super::ov_attn`]); `layer` is the global layer index its IRs are
+    /// filed under.
+    pub fn attach_ov(&mut self, layer: u32, ov: std::sync::Arc<super::ov_attn::OvAttn>) {
+        self.ov = Some((layer, ov));
+    }
+
+    pub fn ov(&self) -> Option<(u32, &std::sync::Arc<super::ov_attn::OvAttn>)> {
+        self.ov.as_ref().map(|(l, o)| (*l, o))
+    }
+
+    /// Compile this layer's projection IRs and take their first-call cost.
+    pub fn warm_ov(&self) -> Option<bool> {
+        let (lid, ov) = self.ov.as_ref()?;
+        Some(ov.warm(
+            *lid,
+            self.dims.hidden,
+            self.dims.n_heads * self.dims.head_dim,
+        ))
+    }
+
+    /// `q`, `k`, `v`, `r` for `t` rows (`hs` = `[t, H]`): one backend call
+    /// when attached (and it answers), else `t` Rust projections.
+    /// Free the five bf16 projection tables once an OpenVINO backend serves
+    /// them (`CASCADIA_INKLING_OV_ATTN_DROP_RUST=1`): 264 MB per layer that
+    /// would otherwise sit next to the device copy in unified memory. Returns
+    /// the bytes released. After this a refused backend call is fatal (there
+    /// is nothing left to fall back to), which the projection paths report.
+    pub fn release_rust_projections(&mut self) -> usize {
+        assert!(
+            self.ov.is_some(),
+            "release_rust_projections without an OpenVINO attention backend"
+        );
+        let w = &mut self.w;
+        let bytes = 2 * (w.wq.len() + w.wk.len() + w.wv.len() + w.wr.len() + w.wo.len());
+        for t in [&mut w.wq, &mut w.wk, &mut w.wv, &mut w.wr, &mut w.wo] {
+            *t = Vec::new();
+        }
+        bytes
+    }
+
+    fn rust_projections_released(&self) -> bool {
+        self.w.wq.is_empty() && self.dims.hidden > 0
+    }
+
+    fn project_rows(&self, hs: &[f32], t: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        if let Some((lid, ov)) = &self.ov {
+            if let Some([q, k, v, r]) = ov.qkvr(*lid, hs, t) {
+                return (q, k, v, r);
+            }
+            assert!(
+                !self.rust_projections_released(),
+                "inkling layer {lid}: the OpenVINO attention backend refused a call after \
+                 the Rust projections were released (CASCADIA_INKLING_OV_ATTN_DROP_RUST=1)"
+            );
+        }
+        let (hd, hq, hkv, d, dr) = (
+            self.dims.hidden,
+            self.dims.n_heads,
+            self.dims.n_kv_heads,
+            self.dims.head_dim,
+            self.dims.d_rel,
+        );
+        let (qd, kd, rd) = (hq * d, hkv * d, hq * dr);
+        let mut q_all = vec![0.0f32; t * qd];
+        let mut kr_all = vec![0.0f32; t * kd];
+        let mut vr_all = vec![0.0f32; t * kd];
+        let mut r_all = vec![0.0f32; t * rd];
+        for (row, h) in hs.chunks_exact(hd).enumerate() {
+            let (q, kr, vr, r) = self.project(h);
+            q_all[row * qd..(row + 1) * qd].copy_from_slice(&q);
+            kr_all[row * kd..(row + 1) * kd].copy_from_slice(&kr);
+            vr_all[row * kd..(row + 1) * kd].copy_from_slice(&vr);
+            r_all[row * rd..(row + 1) * rd].copy_from_slice(&r);
+        }
+        (q_all, kr_all, vr_all, r_all)
+    }
+
+    /// The output projection for `t` context rows (`ctx` = `[t, Hq·D]`).
+    fn project_out_rows(&self, ctx: &[f32], t: usize) -> Vec<f32> {
+        if let Some((lid, ov)) = &self.ov {
+            if let Some(y) = ov.o(*lid, ctx, t) {
+                return y;
+            }
+            assert!(
+                !self.rust_projections_released(),
+                "inkling layer {lid}: the OpenVINO attention backend refused a call after \
+                 the Rust projections were released (CASCADIA_INKLING_OV_ATTN_DROP_RUST=1)"
+            );
+        }
+        let (hd, hq, d) = (self.dims.hidden, self.dims.n_heads, self.dims.head_dim);
+        let mut out = vec![0.0f32; t * hd];
+        for (row, c) in ctx.chunks_exact(hq * d).enumerate() {
+            linear_bf16_w(
+                c,
+                &self.w.wo,
+                hd,
+                hq * d,
+                &mut out[row * hd..(row + 1) * hd],
+            );
+        }
+        out
+    }
+
     fn project(&self, h: &[f32]) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
         let (hd, hq, hkv, d, dr) = (
             self.dims.hidden,
@@ -505,9 +613,9 @@ impl AttentionLayer {
             }
         }
 
-        let mut out = vec![0.0f32; hd];
-        linear_bf16_w(&ctx, &self.w.wo, hd, hq * d, &mut out);
-        out
+        // The output projection is applied by the caller (batched for prefill).
+        let _ = hd;
+        ctx
     }
 
     /// Attend one input-normed hidden `h` (`[H]`) at position `self.len`,
@@ -515,10 +623,11 @@ impl AttentionLayer {
     /// `attn_sconv` — the layer applies that conv and the residual.
     pub fn forward_token(&mut self, h: &[f32]) -> Vec<f32> {
         assert_eq!(h.len(), self.dims.hidden, "attn forward_token: h len");
-        let (q, kr, vr, r) = self.project(h);
+        let (q, kr, vr, r) = self.project_rows(h, 1);
         let kc = self.k_sconv.decode(&kr);
         let v = self.v_sconv.decode(&vr);
-        self.attend(q, kc, &v, &r)
+        let ctx = self.attend(q, kc, &v, &r);
+        self.project_out_rows(&ctx, 1)
     }
 
     /// Prefill `t` input-normed rows (`hs` = `[t, H]`) starting at position
@@ -539,29 +648,20 @@ impl AttentionLayer {
             "attn forward_prefill: hs len != t * hidden"
         );
         let (qd, kd, rd) = (hq * d, hkv * d, hq * dr);
-        let mut q_all = vec![0.0f32; t * qd];
-        let mut kr_all = vec![0.0f32; t * kd];
-        let mut vr_all = vec![0.0f32; t * kd];
-        let mut r_all = vec![0.0f32; t * rd];
-        for (row, h) in hs.chunks_exact(hd).enumerate() {
-            let (q, kr, vr, r) = self.project(h);
-            q_all[row * qd..(row + 1) * qd].copy_from_slice(&q);
-            kr_all[row * kd..(row + 1) * kd].copy_from_slice(&kr);
-            vr_all[row * kd..(row + 1) * kd].copy_from_slice(&vr);
-            r_all[row * rd..(row + 1) * rd].copy_from_slice(&r);
-        }
+        let (q_all, kr_all, vr_all, r_all) = self.project_rows(hs, t);
         let kc_all = self.k_sconv.prefill(&kr_all, t);
         let v_all = self.v_sconv.prefill(&vr_all, t);
-        let mut out = vec![0.0f32; t * hd];
+        let mut ctx_all = vec![0.0f32; t * qd];
         for row in 0..t {
-            let o = self.attend(
+            let c = self.attend(
                 q_all[row * qd..(row + 1) * qd].to_vec(),
                 kc_all[row * kd..(row + 1) * kd].to_vec(),
                 &v_all[row * kd..(row + 1) * kd],
                 &r_all[row * rd..(row + 1) * rd],
             );
-            out[row * hd..(row + 1) * hd].copy_from_slice(&o);
+            ctx_all[row * qd..(row + 1) * qd].copy_from_slice(&c);
         }
-        out
+        let _ = hd;
+        self.project_out_rows(&ctx_all, t)
     }
 }

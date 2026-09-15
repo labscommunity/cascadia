@@ -542,7 +542,7 @@ pub fn load_stage(
     } else {
         None
     };
-    let head = if last {
+    let mut head = if last {
         let h = StFile::open(&dir.join("head.safetensors"))?;
         let norm = h.f32("norm.weight")?.1;
         if norm.len() != hidden {
@@ -564,6 +564,77 @@ pub fn load_stage(
     let mut layers = Vec::with_capacity(hi.saturating_sub(lo));
     for li in lo..hi {
         layers.push(load_layer(dir, &m, li, max_seq, mode, experts)?);
+    }
+    // Optional OpenVINO expert backend (`CASCADIA_INKLING_OV_EXPERTS=1` +
+    // `<model>/experts_ov`): one backend, Arc-shared by every layer of this
+    // slice so all share one cache of compiled IRs.
+    if let Some(ov) = super::ov_expert::OvExperts::from_env(dir, hidden) {
+        let ov = std::sync::Arc::new(ov);
+        for (i, l) in layers.iter_mut().enumerate() {
+            let lid = (lo + i) as u32;
+            if ov.has_layer(lid) {
+                l.attach_ov(lid, std::sync::Arc::clone(&ov));
+            }
+        }
+    }
+    // Optional fused-MoE backend (`CASCADIA_INKLING_OV_MOE=1` + `<model>/moe_ov`):
+    // one compiled model per MoE layer that has an IR; takes precedence over
+    // the per-expert backend for those layers.
+    if let Some(ov) = super::ov_moe::OvMoe::from_env(
+        dir,
+        hidden,
+        m.top_k + m.n_shared_experts,
+        m.num_experts + m.n_shared_experts,
+    ) {
+        let ov = std::sync::Arc::new(ov);
+        for (i, l) in layers.iter_mut().enumerate() {
+            let lid = (lo + i) as u32;
+            if ov.has_layer(lid) && ov_moe_layer_selected(lid) {
+                l.attach_ov_moe(lid, std::sync::Arc::clone(&ov));
+            }
+        }
+    }
+    // Optional OpenVINO attention-projection backend (`CASCADIA_INKLING_OV_ATTN=1`
+    // + `<model>/attn_ov`), layers that have IRs.
+    if let Some(ov) = super::ov_attn::OvAttn::from_env(dir) {
+        let ov = std::sync::Arc::new(ov);
+        let drop_rust = super::env_flag("CASCADIA_INKLING_OV_ATTN_DROP_RUST");
+        let (mut released, mut kept) = (0usize, 0usize);
+        for (i, l) in layers.iter_mut().enumerate() {
+            let lid = (lo + i) as u32;
+            if ov.has_layer(lid) {
+                l.attach_ov_attn(lid, std::sync::Arc::clone(&ov));
+                if drop_rust {
+                    // Compile now and free the 264 MB bf16 copy; a layer whose IR
+                    // fails to compile keeps its tables (and the Rust path).
+                    match l.release_rust_attention_weights() {
+                        Some(0) => kept += 1,
+                        Some(b) => released += b,
+                        None => {}
+                    }
+                }
+            }
+        }
+        if drop_rust {
+            tracing::info!(
+                target: "cascadia::inkling",
+                event = "ov_attn_drop_rust",
+                released_mib = released / (1024 * 1024),
+                layers_kept = kept,
+            );
+            eprintln!(
+                "[inkling] released {} MiB of Rust attention projections served by OpenVINO ({kept} layers kept theirs)",
+                released / (1024 * 1024)
+            );
+        }
+    }
+    // Optional OpenVINO head backend (`CASCADIA_INKLING_OV_HEAD=1` +
+    // `<model>/head_ov`), last rank only.
+    if let Some(h) = head.as_mut() {
+        let unpadded = m.unpadded_vocab_size.unwrap_or(m.vocab_size);
+        if let Some(ov) = super::ov_head::OvHead::from_env(dir, unpadded) {
+            h.attach_ov(std::sync::Arc::new(ov));
+        }
     }
     Ok(InklingStage {
         embed,
@@ -606,4 +677,18 @@ pub fn load_model_with(dir: &Path, max_seq: usize, mode: ExpertsMode) -> Result<
         norm,
         unembed,
     ))
+}
+
+/// `CASCADIA_INKLING_OV_MOE_LAYERS` (comma list, e.g. `2,3,4`) restricts the
+/// fused-MoE backend to those layers even where more IRs exist — the
+/// Windows iGPU budget (half of RAM) holds three Inkling layers per 64 GB.
+/// Unset or empty selects every layer that has an IR.
+fn ov_moe_layer_selected(lid: u32) -> bool {
+    static SEL: std::sync::OnceLock<Option<Vec<u32>>> = std::sync::OnceLock::new();
+    let sel = SEL.get_or_init(|| {
+        let v = std::env::var("CASCADIA_INKLING_OV_MOE_LAYERS").ok()?;
+        let ids: Vec<u32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+        (!ids.is_empty()).then_some(ids)
+    });
+    sel.as_ref().is_none_or(|ids| ids.contains(&lid))
 }

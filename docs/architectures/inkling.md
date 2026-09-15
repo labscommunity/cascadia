@@ -334,6 +334,201 @@ int4 artifact (512 GB) resident — a ≥640 GB-RAM box with the pin, or an
 N-rank pipeline whose ranks together hold it (e.g. 4 × 160 GB) — plus those
 follow-ups.
 
+### OpenVINO expert backend (iGPU / NPU / CPU)
+
+A box whose CPU has no wide SIMD — Panther Lake is AVX2-only, so the int4
+kernels take their scalar/AVX2 paths — can run the experts on its Xe3 iGPU
+through OpenVINO instead: `CASCADIA_INKLING_OV_EXPERTS=1` with a
+`<model>/experts_ov/` tree makes every routed / shared expert and the two
+dense MLPs a compiled OV model (`inkling/ov_expert.rs`, the glm5 backend's
+design with Inkling's naming: `layer_NN/expert_EEE`, `expert_sharedS`,
+`dense`). The IRs come from `tools/inkling_expert_ov.py`, which packs the
+bins' own nibbles and bf16 group scales into `u4`/`bf16` constants — no
+re-quantisation, the IR sits on the exact grid the Rust kernel reads — and
+`--validate` compares one expert on CPU or GPU against a numpy reference of
+that grid. What differs from the Rust kernel is its inner bf16 rounding of
+gate/up (OpenVINO's `Convert` to bf16 truncates, so the graph cannot
+reproduce it) plus f32 accumulation order: measured on the Arc B390,
+relative rms 1.5e-6 per expert at f32 with 99.9% of bf16 outputs
+identical; `CASCADIA_INKLING_OV_PRECISION=f16` is the iGPU's native, inexact
+fast mode (7e-4). `CASCADIA_INKLING_OV_DEVICE` (default `GPU`),
+`_OV_CACHE` / `_OV_CACHE_MB` bound the LRU of compiled models by count and
+estimated device bytes (a resident benchmark of a few layers needs
+~13 GiB per MoE layer), `_OV_CACHE_DIR` persists the compiled blobs, and
+`_OV_DQ_GROUP` (default 0) keeps the plugins' int8 activation quantisation
+off. A missing or uncompilable IR falls back to the Rust kernel per expert
+(warned once); GPU resource exhaustion disables the backend for the
+process. `inkling_layer_dump --warm-ov` compiles every loaded layer's
+experts before timing and the read-out counts device hits, compiles and
+fallbacks, so a run that silently fell back cannot pass as a device
+measurement. Whole-model runs on a paged host are out of scope for this
+design (an IR per expert means a compile per first touch and one
+compiled model per resident expert), which is the glm5 backend's finding
+too; it exists to measure the iGPU's per-layer decode and prefill against
+the CPU kernel on real layers.
+
+Measured on tate-07 (Core Ultra X7 358H, 4P+8E+4LPE, 64 GB LPDDR5X, Arc
+B390 iGPU, Windows 11, OpenVINO GenAI 2026.2.1 runtime), real layers of the
+975B export, 23-token prompt, page cache warm, `inkling_layer_dump`, one run
+each; the same binary with and without `CASCADIA_INKLING_OV_EXPERTS=1`:
+
+| layer | CPU kernel (AVX2, 16 threads) | iGPU experts, f32 (exact) | iGPU experts, f16 |
+|---|---|---|---|
+| dense (0, 1), decode | 8.3 ms/token | 6.3 ms/token | 6.5 ms/token |
+| MoE (2), decode | 23.7 ms/token | **7.6 ms/token (3.1×)** | 7.1 ms/token (3.3×) |
+| MoE (2), prefill of 23 tokens | 210 ms | 152 ms | 129 ms |
+| expert call on the device | — | 4.4 ms mean, 8 in flight | 3.5 ms mean |
+| residual stream vs CPU after 3 layers | — | rel rms 5.0e-4, routing identical | 5.9e-4 |
+
+The attention shell stays on the CPU (~3 ms/layer of bf16 GEMV), so the
+MoE layer's remaining 4–5 ms is the eight concurrent expert calls; the
+int4 weights stream at ~55–60 GB/s aggregate on the iGPU against the
+CPU kernel's ~13 GB/s equivalent. f16 buys 7%: the calls are weight-stream
+and call-overhead bound, not compute bound. Whole model, resident:
+64 × 7.6 + 2 × 6.3 ≈ 0.5 s/token on this class of box versus 1.5 s/token on
+its CPU kernel — a 3× that a 64 GB box cannot cash on its own (the
+975B export pages from NVMe there; the experts' 16 GB/token of reads are the
+clock), but which every rank of a resident pipeline would see. Warming the
+260 IRs of three layers takes ~30 s from the blob cache (~13 GiB device).
+
+Resident-set limit of this design on a 64 GB box: a second MoE layer on the
+device (518 compiled models, ~26 GiB of driver allocations on top of the
+bins' page cache) pushes the box into memory pressure — the 4-layer run
+kept layer 3 at 7.7 ms/token (f32) / 6.8 (f16) but the first-allocated
+layer 2 fell to 16.8 / 21.7 ms/token, and the CPU pass of that sequence ran
+at 31–32 ms/token instead of 23.7 (one run each, the box hot from the
+previous sequence). Numerics and routing stayed as above (rel rms 5.5e-4
+after four layers). One MoE layer per 64 GB is the clean comparison; a
+resident pipeline rank holds one or two layers anyway.
+
+### OpenVINO fused-MoE backend (one compiled model per layer)
+
+OpenVINO 2026.3's GPU plugin fuses a whole MoE layer into its
+`moe_3gemm_fused_compressed` kernel (all experts one expert-major compressed
+constant, a token's k experts in one launch, rows grouped per expert for
+prefill, optional on-disk expert streaming). `tools/inkling_moe_layer_ov.py`
+writes that layer graph for Inkling — the "tiled 3-GEMM block" the plugin's
+`ConvertTiledMoeBlockToGatherMatmuls` pass matches, with the bins' own
+nibbles as `u4` constants (zero point 8, bf16 scales as f16) and the routing
+as inputs (`topk_indices`, `routing_weights`) fed by the Rust gate, so
+Inkling's routing stays exact and the two shared experts ride as the last
+two ids with their gammas — into `<model>/moe_ov/layer_NN/` (~8.2 GB, ~30 s
+per layer). `inkling/ov_moe.rs` runs them: `CASCADIA_INKLING_OV_MOE=1`
+(`_OV_MOE_DEVICE`, `_OV_MOE_CACHE_DIR`, `_OV_MOE_OFFLOAD` = the plugin's
+`OFFLOAD_RATIO`), one call per layer per token or per prefill batch,
+precedence over the per-expert backend for layers that have an IR, per-layer
+fallback otherwise.
+
+Findings on the Arc B390 (driver 32.0.101.8860, OpenVINO 2026.3.1 and the
+2026.5 nightly), all reproduced on Intel's own optimum-intel Qwen3-MoE
+export before any Inkling graph was involved:
+
+- the plugin's batched-GEMV decode kernel crashes the process (access
+  violation in `openvino_intel_gpu_plugin.dll`); the backend sets
+  `OV_GPU_MOE_BATCHED_GEMV_THRESHOLD=0` so decode takes the grouped-GEMM
+  path, and a single-row call still crashes there, so decode is padded to
+  two rows (the second a copy with zero weights) — 2.9–3.0 ms per MoE layer
+  at Inkling's shape (8 experts, 256 MB, ~85 GB/s) versus 4.4 ms for the
+  per-expert backend's eight concurrent calls;
+- prefill: 23 rows in 30 ms per layer (unique experts read once, ~60 GB/s),
+  128 rows in 34 ms — versus 152 ms for the per-expert backend's per-row
+  calls;
+- numerics: the kernel is f16-only; the real layer-2 IR matches the numpy
+  grid reference at relative rms 6.4e-4 (the per-expert f32 path: 1.5e-6);
+- on-disk offload (`OFFLOAD_RATIO` + `WEIGHTS_PATH`) needs the asymmetric
+  layout (the symmetric `i4` export's zero-point placeholder has no bin
+  offset) and streams non-resident experts at ~1 GB/s even from a warm page
+  cache — an order of magnitude under the NVMe and the Rust mmap path, so it
+  cannot serve a paged whole model on this box;
+- the matcher wants the single-input `Swish` (the Python helper's default
+  adds a beta constant and silently prevents fusion);
+- a saved IR's file-backed constants cannot be built into the fused op at
+  all (the plugin's reorder insertion fails) unless the offload path is on;
+  the shim therefore materialises the IR's constants in memory before
+  compiling (`CASCADIA_MATERIALIZE_CONSTANTS=1`, the backend's default),
+  which is the form that measures 3.4 ms per padded decode row — the
+  offload path (`CASCADIA_INKLING_OV_MOE_OFFLOAD=N`) works too but starts
+  its slot cache empty (every first touch streams at ~1 GB/s, so the
+  backend sweeps all experts at warm-up), needs the IR padded with dummy
+  experts so its 1% floor still holds every real expert (`--pad-experts`),
+  and costs 5.5 ms per decode row and 55 ms per 23-row prefill;
+- each new row count pays a first-call cost (~55 ms, and ~1 s at the
+  32-row kernel boundary), so a serving loop should bucket prefill rows;
+- the plugin reads its knobs through the C runtime's environment, which a
+  Rust `set_var` does not update on Windows; the backend uses `_putenv_s`
+  there.
+
+Measured on tate-07 with the fused backend in the engine (same dump, real
+layer 2, 23-token prompt, one run each, all with zero fallbacks):
+
+| path | MoE layer decode | prefill, 23 tokens | fused call mean | residual vs CPU |
+|---|---|---|---|---|
+| CPU kernel | 30.1 ms/token | 207 ms | — | exact |
+| per-expert iGPU, f32 | 7.4 ms/token | 153 ms | 4.5 ms × 8 in flight | rel rms 5.0e-4 |
+| fused iGPU, materialised | 6.8 ms/token | 148 ms | 6.7 ms (≈4.5 decode, 55 prefill) | rel rms 1.9e-3 |
+| fused iGPU, offload 1% | 6.7 ms/token | 148 ms | 6.7 ms | rel rms 1.9e-3 |
+
+The ~3 ms of each layer that remain are the bf16 attention GEMVs on the
+CPU (already at ~80 GB/s), which is why the next step is the int4
+attention-projection backend below rather than a device copy of bf16.
+
+### OpenVINO attention-projection backend (int4 projections on the iGPU)
+
+`tools/inkling_attn_ov.py` re-quantises a layer's five attention GEMVs
+(`q`, `k`, `v`, `r`, `o`; ~264 MB bf16) to int4 on the experts' grid
+(~66 MB) and writes two IRs per layer (`attn_ov/layer_NN/{qkvr,o}`);
+`inkling/ov_attn.rs` runs them (`CASCADIA_INKLING_OV_ATTN=1`,
+`_OV_ATTN_DEVICE`, `_OV_ATTN_DIR` for a variant such as `attn_ov_int8`)
+with outputs rounded to bf16 like the Rust kernel. The head norms, position
+bias, softmax, KV cache and convolutions stay in Rust; prefill projects all
+rows in one call and applies the output projection once per batch. Device
+probe on the B390: int4 qkvr 0.60 ms + o 0.32 ms per layer against ~3 ms on
+the CPU, while a f16 copy of the same weights takes 2.45 ms — the byte count
+is the lever, not the device.
+
+With everything on the iGPU (dense MLPs and the fused MoE as above, plus
+these projections), the same dump on tate-07:
+
+| path | dense layer | MoE layer decode | MoE prefill, 23 tokens | residual vs CPU after 3 layers |
+|---|---|---|---|---|
+| CPU kernel | 9.7 ms/token | 30.1 ms/token | 207 ms | exact |
+| fused MoE on iGPU, attention on CPU | 6.2 ms/token | 6.9 ms/token | 148 ms | rel rms 1.9e-3 |
+| + int4 attention on iGPU (`--weights int4`) | 3.6 ms/token | 4.5 ms/token | 88 ms | rel rms 1.5e-2 |
+| **+ int8 attention on iGPU (`--weights int8`, default)** | **4.2 ms/token** | **5.1 ms/token** | **89 ms** | rel rms 6.5e-3 |
+
+That is 5.9× (int8) to 6.6× (int4) the CPU kernel per MoE layer, ~0.33 s
+per token for the whole model on resident ranks (~3 tok/s single stream on
+a 12-rank pipeline). The attention weights' round-to-nearest quantisation
+is what sets the residual: int4 (group 32) carries ~10% weight-relative
+error and moves the residual stream to 1.5e-2, int8 (per row) ~1.2% and
+6.5e-3; the plugin's own error on either set of weights is 2e-4. int8 is
+the default; int4 is the speed option for a demo that tolerates it. With
+int4 the device's f16 GEMV and GEMM paths also stopped being bit-identical,
+so decode and prefill differed by 3e-4 relative at layer 2 (the dump's
+`dec-vs-pre` column); with int8 they agree to the bit again.
+
+### OpenVINO head backend, and releasing the Rust copies
+
+`tools/inkling_attn_ov.py --head --weights int8` writes the unembed table
+(`[201024, 6144]`, 2.46 GB of bf16 that every token reads on the last
+rank, ~31 ms on this CPU) as one compressed-FC IR under `head_ov/`;
+`CASCADIA_INKLING_OV_HEAD=1` (`_OV_HEAD_DEVICE`, default `GPU`) runs it
+through `inkling/ov_head.rs`. The RMSNorm, the mup divide and the slice to
+`unpadded_vocab_size` stay in Rust. On tate-07 the int8 head validates at
+2.1e-4 relative to the quantised grid with the same argmax, and a 1-row
+call takes 11.3 ms on the B390.
+
+`CASCADIA_INKLING_OV_ATTN_DROP_RUST=1` compiles each layer's attention IR
+at load and frees the five bf16 projection tables (264 MB per layer,
+16.4 GB for the model) that would otherwise sit next to the int8 device
+copy in unified memory. A layer whose IR fails to compile keeps its
+tables; after a release a refused backend call is fatal and says so. On a
+64 GB box that RAM is what the expert cache lives on
+(`CASCADIA_INKLING_EXPERT_CACHE_MIB`, now allowed up to 1024 per layer),
+which is the point. `CASCADIA_INKLING_OV_MOE_LAYERS=2,3,4` restricts the
+fused-MoE backend to a subset of the layers that have IRs (the Windows
+rank budget below).
+
 ### Expert-parallel dispatch (star topology)
 
 Beside the layer pipeline, the family can run as a **driver + expert
@@ -381,7 +576,49 @@ per §4 of the scaling note.
 Topology, bandwidth ceilings and what expert-level routing across boxes would
 buy: [`../perf/INKLING_SCALING.md`](../perf/INKLING_SCALING.md).
 
+### Serving with the iGPU backends (end to end)
+
+`cascadia run <model> --engine sparse-moe --api :8011` on tate-07 with the
+three backends enabled and IRs for layers 0–7 (the remaining 58 layers on
+the CPU, paged from NVMe): the same three prompts as the miner and Mac Pro
+runs answer byte-identically — `Paris`, `42`, the Pacific sentence — with
+int8 attention projections and the fused MoE on the iGPU. Wall times there
+are the paged CPU layers' (5–22 minutes per prompt), so this is the
+correctness gate for the device paths inside the real serving loop, not a
+speed measurement. In fact that run was *paging*: six fused MoE layers are
+50 GB of unified memory on top of the ~40 GB the whole-model process needs,
+which is what those wall times were. On a single 64 GB box the fused
+layers must stay off and the iGPU carries the attention projections and
+the head only; `docs/perf/INKLING_SINGLE_BOX_BENCH.md` has the whole-model
+single-stream measurements (CPU control, ours on the iGPU, OpenVINO's own
+MoE offload) under the autolab's campaign-129 protocol.
+
+**Rank budget.** The limit on a 64 GB Windows box is not RAM but the
+iGPU's shared-memory budget, which Windows sets to half the RAM: OpenVINO
+reports `GPU_DEVICE_TOTAL_MEM_SIZE` = 33.5 GiB on tate-07. A fused MoE
+layer is 8.3 GB of device allocations, so three layers (25 GB) run at the
+per-layer numbers above, four (33.2 GB) sit at the cap and decode falls to
+50–145 ms per MoE layer, and five or six page every call (250–430 ms).
+So a 64 GB Windows rank carries **three** fused MoE layers on the iGPU
+(the two dense layers are small) — 22 such ranks for the 975B model — a
+96 GB box five and a 128 GB box seven. Confirmed with the 5-layer dump
+(2 dense + 3 fused MoE, int8 attention): 4.5–4.6 ms per dense and
+5.4–5.6 ms per MoE layer decode, 52–91 ms prefill, residual 5.9e-3 after
+five layers — the single-layer numbers hold across a full rank. Linux ranks are not under the 50%
+policy (Level Zero shared allocations can use most of the RAM) and are
+the way to get five or six layers per 64 GB; that is unmeasured here.
+
 ## Open follow-ups
+
+- **Multi-stream decode (aggregate throughput).** The pipeline engine serves
+  one request at a time; the fused MoE kernel already batches rows (2.4 ms
+  per row at 23 rows against 4.5 ms for one), so several streams per step
+  would raise a rank's tokens per second toward the bandwidth floor. Needs
+  per-stream KV and conv slots in `AttentionLayer` (the state is already
+  separable — `LayerState` snapshot/restore exists), a `forward_tokens` over
+  `(slot, token)` rows in `Model`/`InklingStage`, and a scheduler in the
+  engine that steps every active task together (the `StagedRunner` trait
+  is per stream today).
 
 - Per-rank KV-prefix cache and the qwen35-style in-process prefix cache (TTFT).
 - MTP draft head (exported? no — dropped) / n-gram speculative decode: the

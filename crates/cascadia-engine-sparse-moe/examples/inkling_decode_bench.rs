@@ -1,6 +1,8 @@
 //! Complete autoregressive Inkling decode, separate from the synthetic layer probe.
 //!
-//! --export DIR --cases cases.json [--tokens 64] [--samples 3] [--out result.json]
+//! --export DIR --cases cases.json [--tokens 64] [--samples 3] [--out result.json] [--warm-ov]
+//! [--tolerate-divergence] records the first token that parts from greedy_ids
+//! instead of aborting (device numerics); such a run is not correctness-verified.
 //! [--route-trace routes.json] captures routed expert IDs without changing logits.
 //! [--layer-profile profile.json] records attention/MLP branch timings per layer.
 //! cases.json: [{"name":"case", "prompt_ids":[...], "greedy_ids":[...]}].
@@ -39,6 +41,10 @@ struct Sample {
     decode_ended_unix: f64,
     decode_steps: usize,
     generated_ids: Vec<u32>,
+    /// Index of the first token that differs from the case's `greedy_ids`
+    /// (`--tolerate-divergence` only; `None` = exact match or no reference).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_divergence: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -87,7 +93,14 @@ fn hash_logits(hash: &mut u64, logits: &[f32]) {
     }
 }
 
-fn generate(model: &mut Model, case: &Case, tokens: usize, eos: &[u32], hash: &mut u64) -> Sample {
+fn generate(
+    model: &mut Model,
+    case: &Case,
+    tokens: usize,
+    eos: &[u32],
+    hash: &mut u64,
+    tolerate_divergence: bool,
+) -> Sample {
     model.reset();
     let prefill_started_unix = unix_seconds();
     let start = Instant::now();
@@ -107,10 +120,33 @@ fn generate(model: &mut Model, case: &Case, tokens: usize, eos: &[u32], hash: &m
     }
     let decode_seconds = start.elapsed().as_secs_f64();
     let decode_ended_unix = unix_seconds();
+    let mut first_divergence = None;
     if let Some(expected) = &case.greedy_ids {
-        assert_eq!(&generated_ids, expected, "greedy mismatch: {}", case.name);
+        if tolerate_divergence {
+            // Device numerics (int8/f16 projections) are not expected to hold
+            // the bf16 reference's greedy path for 64 tokens; record where it
+            // parts instead of aborting the campaign, and say so in the output.
+            first_divergence = generated_ids
+                .iter()
+                .zip(expected.iter())
+                .position(|(a, b)| a != b)
+                .or_else(|| {
+                    (generated_ids.len() != expected.len())
+                        .then_some(generated_ids.len().min(expected.len()))
+                });
+            if let Some(i) = first_divergence {
+                println!(
+                    "greedy_divergence case={} first_divergent_token={i} matched_prefix={i}/{}",
+                    case.name,
+                    expected.len()
+                );
+            }
+        } else {
+            assert_eq!(&generated_ids, expected, "greedy mismatch: {}", case.name);
+        }
     }
     Sample {
+        first_divergence,
         case: case.name.clone(),
         repetition: 0,
         prefill_seconds,
@@ -144,8 +180,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tokens = 64usize;
     let mut repetitions = 3usize;
     let mut allow_fixture = false;
+    let mut warm_ov = false;
+    let mut tolerate_divergence = false;
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
+        if flag == "--warm-ov" {
+            warm_ov = true;
+            continue;
+        }
+        if flag == "--tolerate-divergence" {
+            tolerate_divergence = true;
+            continue;
+        }
         if flag == "--allow-fixture" {
             allow_fixture = true;
             continue;
@@ -225,7 +271,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "expected the complete large Inkling architecture"
     );
     let full_model = large && !allow_fixture;
-    let correctness_verified = cases.iter().all(|c| c.greedy_ids.is_some());
+    // Exact greedy parity is asserted per sample unless `--tolerate-divergence`,
+    // in which case the run is NOT correctness-verified (divergences are
+    // recorded per sample instead).
+    let correctness_verified = cases.iter().all(|c| c.greedy_ids.is_some()) && !tolerate_divergence;
     for c in &cases {
         assert!(!c.prompt_ids.is_empty(), "empty prompt: {}", c.name);
         assert!(c
@@ -242,6 +291,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("sequence length overflow")?;
     let load = Instant::now();
     let mut model = load_model_with(&export, max_seq, ExpertsMode::Mmap)?;
+    if warm_ov {
+        // Compile the attached OpenVINO backends before any timed region.
+        let t0 = Instant::now();
+        let (ok, bad) = model.warm_ov_backends();
+        println!(
+            "warm_ov_backends={ok} warm_ov_failed={bad} warm_ov_seconds={:.1}",
+            t0.elapsed().as_secs_f64()
+        );
+    }
     assert_eq!(model.layers().len(), manifest.num_layers);
     println!("load_seconds={}", load.elapsed().as_secs_f64());
     let embedding_mapped = model.embedding_is_mapped();
@@ -309,7 +367,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for rep in 0..repetitions {
         let mut hash = 0xcbf29ce484222325;
         for case in &cases {
-            let mut sample = generate(&mut model, case, tokens, &manifest.eos_token_ids, &mut hash);
+            let mut sample = generate(
+                &mut model,
+                case,
+                tokens,
+                &manifest.eos_token_ids,
+                &mut hash,
+                tolerate_divergence,
+            );
             sample.repetition = rep;
             assert!(
                 sample.decode_steps > 0,
