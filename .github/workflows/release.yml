@@ -27,7 +27,7 @@
 #          self-hosted AI-PCs being online.
 #
 # ┌─ OpenVINO GenAI SDK archives ──────────────────────────────────────────────┐
-# │ Both URLs in `env:` below were probed 2026-07-06 and return HTTP 206 (they  │
+# │ Both URLs in `env:` below were probed 2026-09-19 and return HTTP 206 (they  │
 # │ exist). When bumping the version, re-confirm against the storage index:     │
 # │   https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/│
 # │ Keep the Linux archive's OS matched to the runner (ubuntu22 ↔ ubuntu-22.04) │
@@ -69,8 +69,8 @@ env:
   # To bump: edit BOTH full URLs here plus OV_LINUX_URL in ci.yml (the Linux
   # release pre-flight must stay in lockstep), and re-confirm them against
   # the storage index in the header banner above.
-  OV_LINUX_URL: "https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/2026.2/linux/openvino_genai_ubuntu22_2026.2.0.0_x86_64.tar.gz"
-  OV_WINDOWS_URL: "https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/2026.2/windows/openvino_genai_windows_2026.2.0.0_x86_64.zip"
+  OV_LINUX_URL: "https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/beta/2026.5.0.0beta1/linux/openvino_genai_ubuntu22_2026.5.0.0beta1_x86_64.tar.gz"
+  OV_WINDOWS_URL: "https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/beta/2026.5.0.0beta1/windows/openvino_genai_windows_2026.5.0.0beta1_x86_64.zip"
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 

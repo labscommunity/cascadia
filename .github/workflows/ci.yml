@@ -20,7 +20,7 @@ permissions:
 env:
   # Must match release.yml's OV_LINUX_URL — linux-openvino-check below
   # pre-flights that build, and a version skew would quietly un-mirror it.
-  OV_LINUX_URL: https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/2026.2/linux/openvino_genai_ubuntu22_2026.2.0.0_x86_64.tar.gz
+  OV_LINUX_URL: https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/beta/2026.5.0.0beta1/linux/openvino_genai_ubuntu22_2026.5.0.0beta1_x86_64.tar.gz
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
