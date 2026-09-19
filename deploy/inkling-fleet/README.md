@@ -20,17 +20,40 @@ serves the OpenAI-compatible API (and the dashboard) from rank 0.
    ```
    sudo /media/$USER/<ssd>/inkling-deploy/install.sh <rank>
    ```
-   **Windows 11** (PowerShell as administrator):
-   ```
-   Set-ExecutionPolicy -Scope Process Bypass -Force
-   E:\inkling-deploy\install.ps1 -Rank <rank>
-   ```
+   **Windows 11**: the SSD is ext4, which Windows cannot read (it offers to
+   format the drive: say no). Install the Windows boxes over the LAN instead,
+   see "Windows boxes" below.
 3. Unplug the SSD. The rank starts by itself, now and at every boot, and
    restarts if it stops. `status.sh` / `status.ps1` in the install folder show
    one screen of health.
 
 Order does not matter: a rank keeps retrying its downstream neighbour until
 it is up. Rank 0 answers on `http://<IP_0>:8000` once every rank is up.
+
+## Windows boxes (over the LAN)
+
+1. Plug the SSD into any Ubuntu box on the switch (one that is already
+   installed is fine) and run
+   ```
+   python3 /media/$USER/<ssd>/inkling-deploy/serve.py
+   ```
+   It serves the kit and the model read-only on port 8080 and prints two
+   lines. (If that box has a firewall on: `sudo ufw allow 8080/tcp`.)
+2. On each Windows box, open PowerShell as administrator and type those two
+   lines with the box's rank:
+   ```
+   Set-ExecutionPolicy -Scope Process Bypass -Force
+   curl.exe -s -o $env:TEMP\bootstrap.ps1 http://<that box>:8080/inkling-deploy/bootstrap.ps1; & $env:TEMP\bootstrap.ps1 -Rank <rank> -Server http://<that box>:8080
+   ```
+   It pulls the Windows half of the kit (about 1 GB) into `C:\inkling-kit`, then
+   runs the normal installer, which pulls that rank's slice of the model (about
+   44 GB, a few minutes on 2.5 GbE) and sets the rank up exactly as on Ubuntu.
+   Both Windows boxes can pull at the same time. Running it again resumes.
+3. Ctrl-C `serve.py` when both are done and carry on with the SSD.
+
+The Windows box must reach the Ubuntu box before its static address exists:
+either both are on DHCP at that moment, or give the Windows port its
+`fleet.env` address by hand first.
 
 ## Addresses
 
@@ -72,8 +95,10 @@ requests the pipeline serves; raise it on every box together.
 - `no /dev/dri render node`: the kernel does not expose the Panther Lake
   iGPU; the rank runs on the CPU. Ubuntu 24.04 needs its HWE kernel (6.14+).
 - Re-running the installer is safe; it skips what is already done. It
-  restarts that box's rank, and every rank exits when a neighbour goes away
-  and comes back under its supervisor, so the whole pipeline restarts once
-  (about five seconds plus load time). Requests made in that window get an
-  error from rank 0; wait until `status` on the changed box shows one
-  worker that has been up for a minute before benchmarking.
+  restarts that box's rank; the ranks behind rank 0 then restart once under
+  their supervisors (about five seconds plus load time) and rank 0 reconnects
+  by itself, so the next request just works. Same after a box reboots.
+- Binaries built before 2026-09-19 (`bin/BUILD.txt` names a commit other than
+  `ea7a54ed` or later) lack that reconnect: if requests keep failing after a
+  box restarted, restart rank 0 once (`sudo systemctl restart cascadia-inkling`,
+  or on Windows end the `cascadia-ov` process; the task relaunches it).

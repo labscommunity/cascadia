@@ -28,5 +28,8 @@ wheels/     openvino==2026.3.1 for cp310..cp314 manylinux_2_28 + cp312 win_amd64
 tools/      inkling_attn_ov.py inkling_moe_layer_ov.py inkling_expert_ov.py glm5_expert_ov.py
 ```
 
+The SSD is ext4, which Windows cannot read: the two Windows boxes install over the LAN
+(`serve.py` on an Ubuntu box that holds the SSD, `bootstrap.ps1` on the Windows box; see README).
+
 The copy on the miner's external SSD (`/mnt/external_ssd/inkling-deploy`)
 is the one assembled and tested on 2026-09-18.

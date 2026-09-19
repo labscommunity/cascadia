@@ -96,28 +96,56 @@ if (-not $CpuOnly) {
 }
 
 # ---------- 3. model slice ----------
-$m = Get-Content "$ModelSource\manifest.json" | ConvertFrom-Json
+# -ModelSource is a folder (an SSD this box can read) or, for the LAN path, http://<box with the SSD>:8080/inkling/out
+# served by serve.py; names and sizes then come from its /filelist.txt instead of directory listings.
+$Http = $ModelSource -match '^https?://'
+$sizes = @{}
+if ($Http) {
+  $ModelSource = $ModelSource.TrimEnd('/')
+  $srvRoot = $ModelSource -replace '/inkling/out$', ''
+  foreach ($line in (& curl.exe --fail -s "$srvRoot/filelist.txt")) { $p = $line -split "`t", 2; if ($p.Count -eq 2 -and $p[1].StartsWith('inkling/out/')) { $sizes[$p[1].Substring(12).Replace('/', '\')] = [int64]$p[0] } }
+  if ($sizes.Count -eq 0) { throw "no file list at $srvRoot/filelist.txt (is serve.py running on the box with the SSD?)" }
+  $m = ((& curl.exe --fail -s "$ModelSource/manifest.json") -join "`n") | ConvertFrom-Json
+} else {
+  $m = Get-Content "$ModelSource\manifest.json" | ConvertFrom-Json
+}
+function SliceDir($rel) {
+  if ($Http) { $sizes.Keys | Where-Object { $_.StartsWith("$rel\") } | Sort-Object }
+  elseif (Test-Path "$ModelSource\$rel") { Get-ChildItem "$ModelSource\$rel" -Recurse -File | ForEach-Object { $_.FullName.Substring($ModelSource.Length + 1) } }
+}
+function SliceHas($rel) { if ($Http) { $sizes.ContainsKey($rel) } else { Test-Path "$ModelSource\$rel" } }
+function SliceSize($rel) { if ($Http) { $sizes[$rel] } else { (Get-Item "$ModelSource\$rel").Length } }
+function SliceDone($rel) { $dst = "$Prefix\model\$rel"; (Test-Path $dst) -and ((Get-Item $dst).Length -eq (SliceSize $rel)) }
 $n = [int]$m.num_layers; $base = [math]::Floor($n / $Total); $rem = $n % $Total
 $Lo = [int]($Rank * $base + [math]::Min($Rank, $rem)); $Hi = [int]($Lo + $base + $(if ($Rank -lt $rem) { 1 } else { 0 }))
 $files = @('manifest.json', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'chat_template.jinja', 'source_config.json')
 for ($li = $Lo; $li -lt $Hi; $li++) {
   $tag = '{0:d2}' -f [int]$li
   $files += "shells\layer_$tag.safetensors"
-  $files += Get-ChildItem "$ModelSource\experts\layer_$tag" -File | ForEach-Object { "experts\layer_$tag\$($_.Name)" }
-  if (Test-Path "$ModelSource\attn_ov\layer_$tag") { $files += Get-ChildItem "$ModelSource\attn_ov\layer_$tag" -Recurse -File | ForEach-Object { $_.FullName.Substring($ModelSource.Length + 1) } }
+  $files += SliceDir "experts\layer_$tag"
+  $files += SliceDir "attn_ov\layer_$tag"
 }
 if ($Rank -eq 0) { $files += 'embed.safetensors' }
-if ($Rank -eq $Total - 1) { $files += 'head.safetensors'; if (Test-Path "$ModelSource\head_ov") { $files += Get-ChildItem "$ModelSource\head_ov" -File | ForEach-Object { "head_ov\$($_.Name)" } } }
-$files = $files | Where-Object { Test-Path "$ModelSource\$_" }
-$bytes = ($files | ForEach-Object { (Get-Item "$ModelSource\$_").Length } | Measure-Object -Sum).Sum
-Log ("slice: layers [{0},{1}) {2} files {3:n1} GiB -> {4}\model" -f $Lo, $Hi, $files.Count, ($bytes / 1GB), $Prefix)
-$t0 = Get-Date; $done = 0
-foreach ($f in $files) {
-  $src = "$ModelSource\$f"; $dst = "$Prefix\model\$f"
-  New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
-  if (-not ((Test-Path $dst) -and ((Get-Item $dst).Length -eq (Get-Item $src).Length))) { Copy-Item $src $dst -Force }
-  $done += (Get-Item $src).Length
+if ($Rank -eq $Total - 1) { $files += 'head.safetensors'; $files += SliceDir 'head_ov' }
+$files = @($files | Where-Object { $_ -and (SliceHas $_) })
+$bytes = ($files | ForEach-Object { SliceSize $_ } | Measure-Object -Sum).Sum
+$todo = @($files | Where-Object { -not (SliceDone $_) })
+Log ("slice: layers [{0},{1}) {2} files {3:n1} GiB ({4} to fetch) -> {5}\model" -f $Lo, $Hi, $files.Count, ($bytes / 1GB), $todo.Count, $Prefix)
+$t0 = Get-Date
+if ($Http -and $todo.Count -gt 0) {
+  $cfg = "$Prefix\logs\slice.curl"
+  $todo | ForEach-Object { 'url = "{0}/{1}"' -f $ModelSource, [uri]::EscapeUriString($_.Replace('\', '/')); 'output = "{0}"' -f ("$Prefix\model\$_").Replace('\', '/') } | Set-Content -Encoding ASCII $cfg
+  & curl.exe --fail --silent --show-error --retry 3 --parallel --parallel-max 8 --create-dirs -K $cfg
+  if ($LASTEXITCODE -ne 0) { throw "slice download failed (curl exit $LASTEXITCODE); run this again to resume" }
+} else {
+  foreach ($f in $todo) {
+    $dst = "$Prefix\model\$f"
+    New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
+    Copy-Item "$ModelSource\$f" $dst -Force
+  }
 }
+$short = @($files | Where-Object { -not (SliceDone $_) })
+if ($short.Count -gt 0) { throw "slice incomplete: $($short.Count) files missing or short, e.g. $($short[0]); run this again to resume" }
 Log ("slice done in {0:n0} s" -f ((Get-Date) - $t0).TotalSeconds)
 @{ rank = $Rank; total = $Total; layer_start = $Lo; layer_end = $Hi; num_layers = $n } | ConvertTo-Json | Set-Content "$Prefix\model\rank.json"
 
@@ -183,11 +211,18 @@ $myIp = $fleet["IP_$Rank"]
 if (-not $NoNet -and $myIp) {
   $nic = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.Name -notmatch 'Tailscale|Wi-Fi|Bluetooth|vEthernet' } | Sort-Object -Property LinkSpeed -Descending | Select-Object -First 1
   if ($nic) {
-    if (-not (Get-NetIPAddress -InterfaceIndex $nic.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -eq $myIp })) {
-      New-NetIPAddress -InterfaceIndex $nic.ifIndex -IPAddress $myIp -PrefixLength 24 -ErrorAction SilentlyContinue | Out-Null
+    $hasIp = { Get-NetIPAddress -InterfaceIndex $nic.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -eq $myIp } }
+    $dhcp = (Get-NetIPInterface -InterfaceIndex $nic.ifIndex -AddressFamily IPv4).Dhcp
+    if (-not (& $hasIp)) {
+      # Next to DHCP a manual address needs the interface's coexistence switch. New-NetIPAddress refuses there
+      # ("Inconsistent parameters PolicyStore PersistentStore and Dhcp Enabled") and leaves an address that the
+      # next reboot drops; netsh stores it persistently and leaves DHCP as it is.
+      if ($dhcp -eq 'Enabled') { netsh interface ipv4 set interface $nic.ifIndex dhcpstaticipcoexistence=enabled | Out-Null }
+      netsh interface ipv4 add address $nic.ifIndex $myIp 255.255.255.0 store=persistent | Out-Null
     }
-    Log "static address $myIp/24 added on $($nic.Name) (existing addresses kept)"
-  }
+    if (& $hasIp) { Log "static address $myIp/24 on $($nic.Name) (persistent; DHCP on that port stays $dhcp)" }
+    else { Log "WARNING: could not add $myIp/24 to $($nic.Name); set it by hand or the neighbouring ranks cannot reach this box" }
+  } else { Log "WARNING: no wired port that is up; plug the box into the switch and run this again (or set $myIp/24 by hand)" }
 }
 
 # ---------- 8. scheduled task (starts at boot, restarts on failure) ----------
