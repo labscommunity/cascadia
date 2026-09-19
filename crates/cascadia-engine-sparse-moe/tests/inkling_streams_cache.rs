@@ -1,12 +1,18 @@
 //! Multi-stream decode through the batched MoE path with the explicit expert
-//! cache on: the second pass over the same streams must hit the cache, and
-//! every token/logit must stay bit-identical to the eager (in-RAM) reference.
+//! cache on: the second pass over the same streams must hit the cache without
+//! changing a bit, and both passes must produce the eager (in-RAM) reference's
+//! tokens, with logits equal up to kernel summation order (2.8e-4 of the
+//! largest logit on an AVX-512 host, exactly zero on AVX2 and NEON).
 //! Own process: the cache is configured through process-wide env.
 
 use std::path::PathBuf;
 
 use cascadia_engine_sparse_moe::inkling::stage::InklingRunner;
 use cascadia_engine_sparse_moe::staged::StagedRunner;
+
+/// Largest accepted logit difference against the eager reference, as a
+/// fraction of the step's largest logit (see the comparison below).
+const LOGIT_TOLERANCE: f32 = 5e-3;
 
 fn argmax(v: &[f32]) -> u32 {
     let mut b = 0;
@@ -57,7 +63,7 @@ fn run_batched(
 }
 
 #[test]
-fn batched_decode_with_expert_cache_is_bit_identical_and_hits_on_the_second_pass() {
+fn batched_decode_with_expert_cache_matches_the_reference_and_hits_on_the_second_pass() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/inkling_export");
     if !dir.join("reference.json").exists() {
         return;
@@ -105,21 +111,40 @@ fn batched_decode_with_expert_cache_is_bit_identical_and_hits_on_the_second_pass
     assert!(cached.configure_streams(2));
     let pass1 = run_batched(&mut cached, &prompts, n);
     let pass2 = run_batched(&mut cached, &prompts, n);
-    for (name, got) in [("pass 1", &pass1), ("pass 2", &pass2)] {
-        for (i, ((gt, gl), (wt, wl))) in got.iter().zip(&want).enumerate() {
+    // The cache must not change a single bit: pass 1 computes every expert
+    // from a fresh read, pass 2 from retained buffers.
+    for (i, ((t1, l1), (t2, l2))) in pass1.iter().zip(&pass2).enumerate() {
+        assert_eq!(
+            t1, t2,
+            "stream {i}: tokens differ between the miss pass and the hit pass"
+        );
+        for (step, (a, b)) in l1.iter().zip(l2).enumerate() {
             assert_eq!(
-                gt, wt,
-                "{name} stream {i}: tokens differ from the eager reference"
+                a.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                b.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                "stream {i} step {step}: logits differ between the miss pass and the hit pass"
             );
-            for (step, (a, b)) in gl.iter().zip(wl).enumerate() {
-                assert_eq!(
-                    a.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                    b.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                    "{name} stream {i} step {step}: logits differ"
-                );
-            }
         }
     }
+    // Against the eager reference: the same tokens, and logits equal up to
+    // kernel summation order. The streamed path computes a prefill row by row
+    // while the eager path takes the multi-row kernel; where that kernel is a
+    // different algorithm (AVX-512 hosts) the low bits differ, elsewhere the
+    // two are bit-identical.
+    let mut worst = 0f32;
+    for (i, ((gt, gl), (wt, wl))) in pass1.iter().zip(&want).enumerate() {
+        assert_eq!(gt, wt, "stream {i}: tokens differ from the eager reference");
+        for (step, (a, b)) in gl.iter().zip(wl).enumerate() {
+            let scale = b.iter().fold(1f32, |m, x| m.max(x.abs()));
+            let d = a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs())) / scale;
+            assert!(
+                d <= LOGIT_TOLERANCE,
+                "stream {i} step {step}: logits differ from the eager reference by {d:e} of the largest logit"
+            );
+            worst = worst.max(d);
+        }
+    }
+    eprintln!("largest logit difference vs the eager reference: {worst:e} of the largest logit");
     let stats = cached.expert_cache_stats_total();
     eprintln!("expert cache after two passes: {stats:?}");
     assert!(stats.hits > 0, "the second pass must hit the cache");
