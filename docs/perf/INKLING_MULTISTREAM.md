@@ -74,8 +74,9 @@ one group vs four: same tokens, 1.5–2× less wall time.
 |---|---|
 | `inkling_streams.rs` | streams decoded in a batch are bit-identical (logits and greedy ids) to each stream alone, including a stream admitted mid-flight and a slot reused after close; the single-sequence path is unchanged and still reproduces the HF reference ids |
 | `inkling_streams_wire.rs` | 3-rank loopback pipeline, 5 tasks over 3 slots (admission, finish, reuse): every task's tokens equal the single-stage engine's |
-| `inkling_streams_overlap.rs` | groups in flight overlap the ranks (above) |
+| `inkling_streams_overlap.rs` | slow runner (10 ms + 5 ms/row per micro-batch), 4-rank loopback: with one group in flight exactly one rank decodes at a time, with four groups all four are observed decoding at once (wall time 1.6-1.9x shorter, reported, not asserted) |
 | `inkling_streams_wire.rs::last_rank_exits_after_upstream_reset` | a last rank whose upstream dies hard (TCP reset) exits its step loop for the supervisor instead of spinning on `NotConnected` (fails without the fix) |
+| `inkling_streams_wire.rs::rank0_redials_after_downstream_restart` | a TCP forwarder cuts the rank 0 link the way a dying neighbour does: neighbours restart while rank 0 idles → no request fails, same tokens; neighbours down → fast error; back → served again (fails with the probe disabled, and with the re-dial disabled; passes on macOS and Linux) |
 | local API run (`cascadia run`, fixture, `CASCADIA_STREAMS=4`) | four concurrent `/v1/completions` return exactly what the one-task path returns |
 | the crate's 439 tests | no regression |
 
@@ -211,21 +212,41 @@ CASCADIA_INKLING_OV_ATTN_DROP_RUST=1 CASCADIA_INKLING_OV_HEAD=1` (last rank).
 Start the last rank first, rank 0 last (or in any order under a supervisor:
 ranks retry their downstream until it accepts).
 
-**Restarts.** A rank exits when a neighbour goes away, by design (the
+**Restarts.** A worker rank exits when a neighbour goes away, by design (its
 listener accepts exactly once, so a fresh process is the only clean
-reconnect), so every rank must run under a supervisor that relaunches it:
-the installers use systemd `Restart=always` and a scheduled-task loop.
-Restarting or re-installing one box therefore restarts the whole pipeline
-once; it settles in about five seconds plus load time, and requests made
-in that window get an error from rank 0. Two bugs found on the four-box
-bed while re-installing rank 0 are fixed on this branch: rank 0 kept
-serving errors on a dead downstream instead of exiting (`b7336add`), and
-the last rank spun forever on `worker recv_kind failed: not connected`
-after its upstream reset, so the restarted middle rank could never
-reconnect (`44f6b909`; it now latches the dropped link and exits like the
-other ranks). The Windows installer also had to stop the previous task's
-`run.ps1` loop before its worker, or the loop relaunched an orphan that held
-port 8000 (`9a33b412`).
+reconnect), so every rank runs under a supervisor that relaunches it: the
+installers use systemd `Restart=always` and a scheduled-task loop. Rank 0 is
+the exception: it is a client of rank 1, so it keeps its process and its API
+and dials again in place. Before admitting a request on an idle link it
+probes the socket (the downstream never sends unsolicited bytes, so EOF, an
+error or data means dead or out of sync), and a latched wire failure aborts
+the open streams and re-dials with a 2 s budget at most every 3 s.
+
+What that looks like from outside, measured on the four-box bed:
+
+- a box restarts or is re-installed: the ranks behind rank 0 restart once
+  (about five seconds plus load time); the next request is served on a fresh
+  connection and does not fail (rank 0's log: `downstream link found dead
+  while idle; re-dialing`, reconnected 22 ms later);
+- a request made while a rank is still down waits on rank 1, which is itself
+  waiting for its neighbour: it completes if the box comes back within rank
+  1's 300 s connect budget and fails otherwise; requests after that fail
+  fast until the box is back, then are served again with no manual step;
+- an idle pipeline stays up. It did not before: the last rank waited for its
+  next frame in a receive the transport bounds at 900 s, so every 15 minutes
+  of silence the pipeline rebuilt itself. The last rank now waits with the
+  same peek the middle ranks use, and the installers also set
+  `CASCADIA_FRAME_IDLE_CEILING_SECS=0` (which is what protects binaries
+  built before that change).
+
+Bugs found on the bed along the way, all fixed on this branch: rank 0 kept
+serving a dead socket's error until restarted by hand (first made to exit,
+`b7336add`, then replaced by the in-place re-dial, `ea7a54ed`); the last rank
+spun forever on `worker recv_kind failed: not connected` after its upstream
+reset, so the restarted middle rank could never reconnect (`44f6b909`); the
+Windows installer unregistered the previous task without ending its
+`run.ps1` loop, which relaunched an orphan that held port 8000 (`9a33b412`);
+the 15-minute idle teardown (`5bf7f9b1`, `ea7a54ed`).
 
 The `cascadia-array` control plane
 does exactly this for a ring of Windows boxes (bundled DHCP + mDNS, USB
