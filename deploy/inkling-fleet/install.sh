@@ -52,6 +52,29 @@ if ! done_step runtime; then
   tar -xzf "$ARCH" -C "$PREFIX/ov"; mark runtime
 fi
 OVDIR=$(ls -d "$PREFIX"/ov/openvino_genai_* | head -1)
+# OpenCL ICD loader: OpenVINO GenAI's library links libOpenCL.so.1, so without it the
+# binary does not start (CPU-only ranks included) and Intel's OpenCL package will not
+# configure. Ubuntu only has it where something else pulled it in (ffmpeg, another ICD).
+if ! ldconfig -p | grep -q 'libOpenCL\.so\.1'; then
+  log "OpenCL ICD loader (ocl-icd-libopencl1)"
+  if ls "$HERE"/gpu-debs/ocl-icd-libopencl1_*.deb > /dev/null 2>&1; then
+    dpkg -i "$HERE"/gpu-debs/ocl-icd-libopencl1_*.deb >> "$PREFIX/logs/gpu-debs.log" 2>&1 || log "ocl-icd-libopencl1 did not install (see logs/gpu-debs.log)"
+  else
+    log "gpu-debs/ocl-icd-libopencl1_*.deb is not on this SSD"
+  fi
+fi
+# Self-test before anything slow: the binary must start against the side-by-side
+# runtime on this OS, or the service would only crash-loop later.
+if ! ( set +u; . "$OVDIR/setupvars.sh" > /dev/null 2>&1; "$PREFIX/cascadia" --version > "$PREFIX/logs/selftest.out" 2>&1 ); then
+  log "ERROR: $PREFIX/cascadia does not start on this system:"; head -5 "$PREFIX/logs/selftest.out" | sed 's/^/    /'
+  if grep -q 'libOpenCL' "$PREFIX/logs/selftest.out"; then
+    log "libOpenCL.so.1 is missing: copy ocl-icd-libopencl1_*.deb into gpu-debs/ on the SSD (or, with internet, apt install ocl-icd-libopencl1) and run this again."
+  elif grep -q 'GLIBC' "$PREFIX/logs/selftest.out"; then
+    log "the Linux binary on this SSD is built on Ubuntu 24.04 (glibc 2.39) and needs 24.04 or newer; this box runs Ubuntu $VERSION_ID."
+  fi
+  exit 1
+fi
+log "binary self-test: $(head -1 "$PREFIX/logs/selftest.out")"
 
 # ---------- 2. Intel GPU packages (offline .debs) ----------
 GPU_OK=0

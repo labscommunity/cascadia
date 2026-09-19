@@ -18,6 +18,9 @@ runtime/python-3.12.10-embed-amd64.zip      (python.org; the Windows boxes' priv
 gpu-debs/   intel/compute-runtime 26.35.39758.10 (intel-opencl-icd, libze-intel-gpu1, intel-ocloc,
             libigdgmm12), intel/intel-graphics-compiler 2.41.5 (intel-igc-core-2, intel-igc-opencl-2),
             oneapi-src/level-zero 1.33.1 (libze1 u22.04 + u24.04)   — GitHub release assets
+            ocl-icd-libopencl1 (Ubuntu archive, `apt-get download ocl-icd-libopencl1` on 24.04): the OpenCL
+            ICD loader. OpenVINO GenAI's library links libOpenCL.so.1, so the binary does not start without
+            it, and a default Ubuntu install does not always have it
 wheels/     openvino==2026.3.1 for cp310..cp314 manylinux_2_28 + cp312 win_amd64; numpy for the same
             (pip download --only-binary=:all: --platform manylinux_2_28_x86_64 --python-version X)
 tools/      inkling_attn_ov.py inkling_moe_layer_ov.py inkling_expert_ov.py glm5_expert_ov.py
