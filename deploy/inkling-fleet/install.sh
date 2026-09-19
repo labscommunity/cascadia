@@ -37,7 +37,9 @@ UB="${VERSION_ID%%.*}"
 RAM_GB=$(( $(grep MemTotal /proc/meminfo | awk '{print $2}') / 1048576 ))
 PY=$(command -v python3 || true)
 PYV=$($PY -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo none)
-NIC=$(ip -o link show | awk -F': ' '$2 !~ /lo|docker|veth|tailscale|wl/ {print $2; exit}')
+# the wired port: one with link if there is one (boxes with two ports), else the first
+NICS=$(ip -o link show | awk -F': ' '{n=$2; sub(/@.*/,"",n)} n !~ /^(lo|docker|veth|br-|virbr|tailscale|wl|ww|tun|wg)/ {print n, ($0 ~ /LOWER_UP/ ? "up" : "down")}')
+NIC=$(echo "$NICS" | awk '$2=="up"{print $1; exit}'); [ -n "$NIC" ] || NIC=$(echo "$NICS" | awk 'NR==1{print $1}')
 log "rank $RANK of $TOTAL on Ubuntu $VERSION_ID, ${RAM_GB} GB RAM, python $PYV, nic ${NIC:-?}, prefix $PREFIX"
 
 # ---------- 0. stop a rank that is already running here (re-install) ----------
@@ -201,17 +203,27 @@ log "rank.env written: layers [$LO,$HI), iGPU=$GPU_OK, fused=[${FUSED:-none}], n
 
 # ---------- 7. static IP on the wired NIC ----------
 if [ "$NO_NET" = 0 ] && [ -n "$MYIP" ] && [ -n "$NIC" ]; then
+  # With a DHCP lease on the port right now, keep DHCP and add the fleet address. Without one (an offline
+  # switch, no DHCP server) "DHCP + static" is not safe: NetworkManager fails the whole connection when
+  # DHCP times out and takes the static address down with it, so the port becomes static only.
+  if ip -4 -o addr show dev "$NIC" | grep -q dynamic; then DHCP4=true; else DHCP4=false; fi
   cat > /etc/netplan/60-cascadia-inkling.yaml <<YAML
 network:
   version: 2
   ethernets:
     $NIC:
-      dhcp4: true
+      dhcp4: $DHCP4
       addresses: [$MYIP/24]
 YAML
   chmod 600 /etc/netplan/60-cascadia-inkling.yaml
   netplan apply 2>>"$PREFIX/logs/netplan.log" || log "netplan apply failed (see logs/netplan.log)"
-  log "static address $MYIP/24 added on $NIC (DHCP kept)"
+  sleep 2
+  if ip -4 -o addr show dev "$NIC" | grep -q " $MYIP/"; then
+    if [ "$DHCP4" = true ]; then log "static address $MYIP/24 on $NIC (DHCP kept: the port holds a lease)"
+    else log "static address $MYIP/24 on $NIC (static only: no DHCP lease on this port; to undo, remove /etc/netplan/60-cascadia-inkling.yaml and run netplan apply)"; fi
+  else
+    log "WARNING: $MYIP/24 is not on $NIC after netplan apply (see logs/netplan.log); set it by hand or the neighbouring ranks cannot reach this box"
+  fi
 fi
 
 # ---------- 8. systemd service ----------
