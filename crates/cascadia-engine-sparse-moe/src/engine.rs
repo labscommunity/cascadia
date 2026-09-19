@@ -1448,6 +1448,11 @@ const MAX_PENDING_TASKS: usize = 8;
 /// hot-spinning while a misbehaving peer keeps trying. Matches the cadence
 /// dist_spec uses for the same situation.
 const WORKER_BACKOFF: Duration = Duration::from_millis(200);
+/// Rank 0's downstream re-dial: one bounded connect attempt per interval
+/// while the link is down, so a neighbour that is still loading does not
+/// stall every step for the whole connect budget.
+const REDIAL_BUDGET: Duration = Duration::from_secs(2);
+const REDIAL_INTERVAL: Duration = Duration::from_secs(3);
 
 /// In-flight multi-stage generation on rank 0 (one at a time; queued tasks
 /// wait in `pending`). This is the streamed replacement for the deleted
@@ -5308,6 +5313,9 @@ pub struct PipelineEngine<R: StagedRunner> {
     /// Set once a frame has arrived from the previous rank: after that, a
     /// `NotConnected` upstream is a dropped link, not a rank that has yet to dial in.
     upstream_seen: bool,
+    /// Rank 0 only: earliest time for the next downstream re-dial while the
+    /// link is down (see `redial_downstream`).
+    redial_next: Option<Instant>,
     disconnect_reported: bool,
     last_rank_history: Vec<i64>,
     last_rank_rng: u64,
@@ -5453,6 +5461,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             total,
             peer_disconnected: false,
             upstream_seen: false,
+            redial_next: None,
             disconnect_reported: false,
             last_rank_history: Vec::new(),
             last_rank_rng: 0,
@@ -5852,12 +5861,69 @@ impl<R: StagedRunner> PipelineEngine<R> {
         Ok(())
     }
 
+    /// Rank 0 only, and only while no stream is open: the downstream rank never
+    /// sends unsolicited bytes, so an idle link that reads EOF, an error, or
+    /// data is dead (the neighbour restarted) or out of sync (a reply that
+    /// outlived its aborted stream). Found before admitting, the request that
+    /// would have hit the dead socket is served on a fresh one instead of
+    /// failing; on Linux a send to a peer that closed even succeeds, and the
+    /// failure would only surface on the reply.
+    fn downstream_idle_dead(&self) -> bool {
+        let Some(down) = self.transport.downstream.clone() else {
+            return false;
+        };
+        self.block_on(async {
+            let c = down.lock().await;
+            // Timing out means nothing to read: idle and alive.
+            tokio::time::timeout(Duration::from_millis(1), c.wait_readable())
+                .await
+                .is_ok()
+        })
+    }
+
+    /// Rank 0 only. The downstream link dropped: a neighbour restarted, or the
+    /// connect raced a rank that was exiting. Workers rebuild by exiting for
+    /// their supervisor because their listener accepts exactly once; the
+    /// driver is a client, so it dials again in place and the API stays up
+    /// (requests made while the link is down fail fast with `not connected`).
+    /// Streams still open belonged to the old connection and are aborted with
+    /// an error chunk. Returns true once the link is back.
+    fn redial_downstream(&mut self, out: &mut Vec<(TaskId, Chunk)>) -> bool {
+        let Some(down) = self.transport.downstream.clone() else {
+            return false;
+        };
+        let now = Instant::now();
+        if self.redial_next.is_some_and(|t| now < t) {
+            return false;
+        }
+        self.redial_next = Some(now + REDIAL_INTERVAL);
+        if !self.streams.is_empty() || self.stream_inflight.iter().any(|q| !q.is_empty()) {
+            self.fail_streams_into(out, "downstream link lost; stream aborted".into());
+        }
+        let res = self.block_on(async {
+            let mut c = down.lock().await;
+            c.close().await;
+            c.connect_with_timeout(REDIAL_BUDGET).await
+        });
+        match res {
+            Ok(()) => {
+                info!(rank = self.rank, "downstream link re-dialed; resuming");
+                self.peer_disconnected = false;
+                self.disconnect_reported = false;
+                self.redial_next = None;
+                true
+            }
+            Err(e) => {
+                warn!(rank = self.rank, error = %e, "downstream re-dial failed; retrying");
+                false
+            }
+        }
+    }
+
     /// Abort every stream (wire or forward failure): error chunks, slots
     /// freed, in-flight bookkeeping cleared. A wire failure also latches
-    /// `peer_disconnected`: the downstream link does not reconnect, so rank 0
-    /// surfaces a connection-fatal error on its next step and the supervisor
-    /// (systemd, the scheduled task loop) restarts it to re-dial — the same
-    /// rebuild rule the worker ranks follow.
+    /// `peer_disconnected`; rank 0 then re-dials the downstream rank in place
+    /// on a later step (see [`Self::redial_downstream`]).
     fn fail_streams_into(&mut self, out: &mut Vec<(TaskId, Chunk)>, msg: String) {
         if !msg.starts_with("forward panicked") && !msg.contains("stream reply") {
             self.peer_disconnected = true;
@@ -6747,28 +6813,38 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // Multi-stream mid rank: frames from upstream and replies from
         // downstream are independent events — serve whichever is ready, so a
         // frame for the next group is not stuck behind this group's reply.
-        if self.stream_cap > 0 && !self.is_last() {
-            if let Some(down) = downstream.clone() {
+        // The last rank has nothing to relay but waits for its frame the same
+        // way (a peek, without the transport's frame-start idle ceiling): a
+        // pipeline that idles between requests for longer than that ceiling
+        // (900 s by default) must not lose its links and rebuild itself.
+        if self.stream_cap > 0 {
+            let relay = downstream.clone().filter(|_| !self.is_last());
+            {
                 enum Ready {
                     Up,
                     Down,
                 }
-                let ready = self.block_on(async {
-                    tokio::select! {
-                        r = async { upstream.lock().await.wait_readable().await } => r.map(|_| Ready::Up),
-                        r = async { down.lock().await.wait_readable().await } => r.map(|_| Ready::Down),
-                    }
-                });
+                let ready = match relay.as_ref() {
+                    Some(down) => self.block_on(async {
+                        tokio::select! {
+                            r = async { upstream.lock().await.wait_readable().await } => r.map(|_| Ready::Up),
+                            r = async { down.lock().await.wait_readable().await } => r.map(|_| Ready::Down),
+                        }
+                    }),
+                    None => self
+                        .block_on(async { upstream.lock().await.wait_readable().await })
+                        .map(|_| Ready::Up),
+                };
                 match ready {
                     Ok(Ready::Up) => {}
                     Ok(Ready::Down) => {
+                        let down = relay.as_ref().expect("Ready::Down only with a downstream");
                         let res = self.block_on(async {
-                            match recv_kind_client(&down).await {
+                            match recv_kind_client(down).await {
                                 Ok(Some(FrameKind::StreamTokens)) => {
-                                    let (bid, toks) =
-                                        recv_stream_tokens_body_client(&down)
-                                            .await
-                                            .map_err(|e| format!("recv_stream_tokens: {e}"))?;
+                                    let (bid, toks) = recv_stream_tokens_body_client(down)
+                                        .await
+                                        .map_err(|e| format!("recv_stream_tokens: {e}"))?;
                                     send_stream_tokens_upstream(&upstream, bid, &toks)
                                         .await
                                         .map_err(|e| format!("relay stream tokens: {e}"))
@@ -7428,7 +7504,29 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
         // chunk on the driver), so rank 0 never surfaces an Err here.
         if self.rank == 0 {
             if self.stream_cap > 0 {
-                let produced = self.step_streams();
+                let mut produced = Vec::new();
+                let idle =
+                    self.streams.is_empty() && self.stream_inflight.iter().all(|q| q.is_empty());
+                if !self.peer_disconnected
+                    && idle
+                    && !self.pending.is_empty()
+                    && self.downstream_idle_dead()
+                {
+                    warn!(
+                        rank = self.rank,
+                        "downstream link found dead while idle; re-dialing"
+                    );
+                    self.peer_disconnected = true;
+                    self.redial_next = None;
+                }
+                if self.peer_disconnected {
+                    // The driver re-dials in place (its neighbour's listener
+                    // accepts a fresh connection once the neighbour is back);
+                    // the one-shot Err below is for drivers that are stepped
+                    // by a relay loop.
+                    self.redial_downstream(&mut produced);
+                }
+                produced.extend(self.step_streams());
                 if produced.is_empty()
                     && worker_should_report_disconnect(
                         self.peer_disconnected,
@@ -7657,9 +7755,16 @@ mod tests {
     #[test]
     fn worker_recv_failure_fatal_only_after_link_was_live() {
         use cascadia_transport::TransportError;
-        let reset = || TransportError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
-        assert!(!worker_recv_failure_is_fatal(&TransportError::NotConnected, false));
-        assert!(worker_recv_failure_is_fatal(&TransportError::NotConnected, true));
+        let reset =
+            || TransportError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert!(!worker_recv_failure_is_fatal(
+            &TransportError::NotConnected,
+            false
+        ));
+        assert!(worker_recv_failure_is_fatal(
+            &TransportError::NotConnected,
+            true
+        ));
         assert!(!worker_recv_failure_is_fatal(
             &TransportError::FrameStartTimeout(std::time::Duration::from_secs(1)),
             true

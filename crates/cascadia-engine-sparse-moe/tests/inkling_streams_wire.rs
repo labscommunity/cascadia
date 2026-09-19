@@ -226,7 +226,9 @@ async fn last_rank_exits_after_upstream_reset() {
     let server = Arc::new(Mutex::new(server));
     let sc = server.clone();
     let accept = tokio::spawn(async move { sc.lock().await.accept().await.unwrap() });
-    let upstream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let upstream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
     accept.await.unwrap();
 
     let r2 = InklingRunner::load_staged(&dir, 64, 2, 3, 3, 4, Some("eager".into()), None).unwrap();
@@ -254,13 +256,271 @@ async fn last_rank_exits_after_upstream_reset() {
         }
     });
     // Let the worker settle into its blocking receive, then kill the peer
-    // hard: linger 0 turns the close into a reset.
+    // hard: linger 0 turns the close into a reset. (tokio deprecates the
+    // setter because a non-zero linger blocks the thread on drop; zero does
+    // not.)
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    upstream.set_linger(Some(std::time::Duration::ZERO)).unwrap();
+    #[allow(deprecated)]
+    upstream
+        .set_linger(Some(std::time::Duration::ZERO))
+        .unwrap();
     drop(upstream);
     worker.join().unwrap();
     assert!(
         exited.load(Ordering::Relaxed),
         "last rank kept stepping after its upstream reset; the supervisor can never rebuild it"
     );
+}
+
+/// Like `collect`, but a task may end in an error chunk (returned as Err) and
+/// a step may report a dead link once (ignored: the driver keeps stepping).
+fn collect_lenient(engine: &mut dyn Engine, ids: &[String]) -> Vec<Result<Vec<i64>, String>> {
+    let mut res: Vec<Result<Vec<i64>, String>> = ids.iter().map(|_| Ok(Vec::new())).collect();
+    let mut done = vec![false; ids.len()];
+    let mut steps = 0;
+    while done.iter().any(|d| !d) {
+        steps += 1;
+        assert!(steps < 500, "engine did not finish the tasks");
+        let Ok(chunks) = engine.step() else { continue };
+        for (id, c) in chunks {
+            let i = ids.iter().position(|x| x == &id).expect("known task");
+            if let Some(err) = c.error.clone() {
+                res[i] = Err(err.to_string());
+                done[i] = true;
+            } else if c.is_final {
+                done[i] = true;
+            } else if let Ok(t) = &mut res[i] {
+                t.push(c.token_id);
+            }
+        }
+    }
+    res
+}
+
+/// Submit the first `n` prompts under fresh task ids and collect them.
+fn run_round(e0: &mut dyn Engine, tag: &str, n: usize) -> Vec<Result<Vec<i64>, String>> {
+    let ids: Vec<String> = (0..n).map(|i| format!("{tag}-{i}")).collect();
+    for (i, id) in ids.iter().enumerate() {
+        let mut t = GenerationTask::new(id.clone(), PROMPTS[i]);
+        t.max_tokens = MAX_TOKENS[i];
+        t.temperature = 0.0;
+        e0.submit(t).unwrap();
+    }
+    collect_lenient(e0, &ids)
+}
+
+/// Ranks 1 and 2 of the loopback pipeline plus a TCP forwarder standing in
+/// for the wire between rank 0 and rank 1. Cutting the forwarder kills the
+/// link the way a dying neighbour does: rank 0's own socket stays open and
+/// reads EOF (closing rank 0's client from the test would not exercise that).
+struct Tail {
+    ports: (u16, u16, u16),
+    fwd: tokio::task::JoinHandle<()>,
+    c12: Arc<Mutex<ActivationClient>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Tail {
+    /// `ports` = (forwarder, rank 1, rank 2); zeros pick free ports.
+    async fn start(
+        dir: &std::path::Path,
+        handle: &tokio::runtime::Handle,
+        ports: (u16, u16, u16),
+    ) -> Tail {
+        let mut s12 = ActivationServer::new("127.0.0.1", ports.2);
+        s12.start().await.unwrap();
+        let p2 = s12.port();
+        let s12 = Arc::new(Mutex::new(s12));
+        let sc = s12.clone();
+        let accept = tokio::spawn(async move { sc.lock().await.accept().await.unwrap() });
+        let mut c12 = ActivationClient::new("127.0.0.1", p2);
+        c12.connect_with_timeout(std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        accept.await.unwrap();
+        let c12 = Arc::new(Mutex::new(c12));
+
+        // Rank 1 accepts whenever rank 0 dials in through the forwarder.
+        let mut s01 = ActivationServer::new("127.0.0.1", ports.1);
+        s01.start().await.unwrap();
+        let p1 = s01.port();
+        let s01 = Arc::new(Mutex::new(s01));
+        let sc = s01.clone();
+        tokio::spawn(async move { sc.lock().await.accept().await.unwrap() });
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", ports.0))
+            .await
+            .unwrap();
+        let pf = listener.local_addr().unwrap().port();
+        let fwd = tokio::spawn(async move {
+            let (mut a, _) = listener.accept().await.unwrap();
+            let mut b = tokio::net::TcpStream::connect(("127.0.0.1", p1))
+                .await
+                .unwrap();
+            a.set_nodelay(true).ok();
+            b.set_nodelay(true).ok();
+            let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
+        });
+
+        let load = |rank, lo, hi| {
+            InklingRunner::load_staged(dir, 64, rank, 3, lo, hi, Some("eager".into()), None)
+                .unwrap()
+        };
+        let mut e1 = PipelineEngine::new(
+            load(1, 2, 3),
+            None,
+            StageTransport {
+                upstream: Some(s01),
+                downstream: Some(c12.clone()),
+            },
+            handle.clone(),
+            1,
+            3,
+            None,
+        );
+        let mut e2 = PipelineEngine::new(
+            load(2, 3, 4),
+            None,
+            StageTransport {
+                upstream: Some(s12),
+                downstream: None,
+            },
+            handle.clone(),
+            2,
+            3,
+            None,
+        );
+        assert_eq!(e1.enable_streams(3), 3);
+        assert_eq!(e2.enable_streams(3), 3);
+        let workers = [Box::new(e1) as Box<dyn Engine>, Box::new(e2)]
+            .into_iter()
+            .map(|mut e| {
+                std::thread::spawn(move || {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    while std::time::Instant::now() < deadline {
+                        if e.step().is_err() {
+                            return;
+                        }
+                    }
+                    panic!("worker rank never exited");
+                })
+            })
+            .collect();
+        Tail {
+            ports: (pf, p1, p2),
+            fwd,
+            c12,
+            workers,
+        }
+    }
+
+    /// The neighbours die: the wire to rank 0 is cut, rank 1 exits on its
+    /// upstream EOF, rank 2 on rank 1's. Returns the ports for a restart.
+    async fn kill(self) -> (u16, u16, u16) {
+        self.fwd.abort();
+        let mut workers = self.workers.into_iter();
+        let w1 = workers.next().unwrap();
+        tokio::task::spawn_blocking(move || w1.join().unwrap())
+            .await
+            .unwrap();
+        self.c12.lock().await.close().await;
+        let w2 = workers.next().unwrap();
+        tokio::task::spawn_blocking(move || w2.join().unwrap())
+            .await
+            .unwrap();
+        self.ports
+    }
+}
+
+/// Rank 0 keeps its process (and its API) across a restart of the ranks
+/// behind it. Before the fix it kept the dead socket and answered every
+/// request with its error until someone restarted rank 0 by hand (seen on the
+/// four-box bed after a re-install, and after an idle-ceiling teardown).
+///
+/// 1. neighbours restart while rank 0 idles: the next requests are served on
+///    a fresh connection and none fails (the idle link is probed before
+///    admitting);
+/// 2. neighbours down: a request fails fast with an error instead of hanging;
+/// 3. neighbours back: requests are served again, same tokens throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rank0_redials_after_downstream_restart() {
+    let Some(dir) = fixture() else { return };
+    let handle = tokio::runtime::Handle::current();
+    let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
+    let n = PROMPTS.len();
+
+    let tail = Tail::start(&dir, &handle, (0, 0, 0)).await;
+    let mut c01 = ActivationClient::new("127.0.0.1", tail.ports.0);
+    c01.connect_with_timeout(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    let r0 = InklingRunner::load_staged(&dir, 64, 0, 3, 0, 2, Some("eager".into()), None).unwrap();
+    let mut e0 = PipelineEngine::new(
+        r0,
+        Some(tok),
+        StageTransport {
+            upstream: None,
+            downstream: Some(Arc::new(Mutex::new(c01))),
+        },
+        handle.clone(),
+        0,
+        3,
+        None,
+    );
+    assert_eq!(e0.enable_streams(3), 3);
+
+    // Rank 0 steps on a blocking thread; it travels in and out of each round.
+    async fn round(
+        e0: PipelineEngine<InklingRunner>,
+        tag: &'static str,
+        n: usize,
+    ) -> (PipelineEngine<InklingRunner>, Vec<Result<Vec<i64>, String>>) {
+        tokio::task::spawn_blocking(move || {
+            let mut e0 = e0;
+            let got = run_round(&mut e0, tag, n);
+            (e0, got)
+        })
+        .await
+        .unwrap()
+    }
+
+    let (e0, healthy) = round(e0, "healthy", n).await;
+    let expected: Vec<Vec<i64>> = healthy
+        .into_iter()
+        .map(|r| r.expect("healthy round"))
+        .collect();
+    assert!(expected.iter().all(|t| !t.is_empty()));
+
+    // 1. The neighbours restart while rank 0 idles.
+    let ports = tail.kill().await;
+    let tail = Tail::start(&dir, &handle, ports).await;
+    let (e0, got) = round(e0, "restarted", n).await;
+    for (i, (g, e)) in got.iter().zip(&expected).enumerate() {
+        assert_eq!(g.as_ref(), Ok(e), "task {i} after the neighbours restarted");
+    }
+
+    // 2. The neighbours are down.
+    let ports = tail.kill().await;
+    let started = std::time::Instant::now();
+    let (e0, got) = round(e0, "down", 1).await;
+    assert!(
+        got[0].is_err(),
+        "a request with the pipeline down must fail, got {:?}",
+        got[0]
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "and fail fast"
+    );
+
+    // 3. They come back; rank 0 re-dials once its retry interval has passed.
+    let tail = Tail::start(&dir, &handle, ports).await;
+    tokio::time::sleep(std::time::Duration::from_millis(3200)).await;
+    let (e0, got) = round(e0, "back", n).await;
+    for (i, (g, e)) in got.iter().zip(&expected).enumerate() {
+        assert_eq!(g.as_ref(), Ok(e), "task {i} after the pipeline came back");
+    }
+
+    drop(e0);
+    tail.kill().await;
 }
