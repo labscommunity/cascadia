@@ -15,6 +15,8 @@ runtime/openvino_genai_ubuntu22_2026.3.1.0_x86_64.tar.gz
 runtime/openvino_genai_windows_2026.3.1.0_x86_64.zip
     from https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/2026.3.1/{linux,windows}/
 runtime/python-3.12.10-embed-amd64.zip      (python.org; the Windows boxes' private Python)
+runtime/vc_redist.x64.exe                   (https://aka.ms/vs/17/release/vc_redist.x64.exe; the executables and every
+                                            OpenVINO DLL import the Visual C++ runtime, which the archive does not bundle)
 gpu-debs/   intel/compute-runtime 26.35.39758.10 (intel-opencl-icd, libze-intel-gpu1, intel-ocloc,
             libigdgmm12), intel/intel-graphics-compiler 2.41.5 (intel-igc-core-2, intel-igc-opencl-2),
             oneapi-src/level-zero 1.33.1 (libze1 u22.04 + u24.04)   — GitHub release assets

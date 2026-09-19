@@ -66,6 +66,28 @@ if (-not (Done 'runtime')) {
 }
 $OvDir = (Get-ChildItem "$Prefix\ov" -Directory | Select-Object -First 1).FullName
 
+# Visual C++ runtime: both executables and every OpenVINO DLL import vcruntime140 / vcruntime140_1 /
+# msvcp140, the OpenVINO archive bundles none of them, and a fresh Windows 11 does not always have them.
+$vcMissing = @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') | Where-Object { -not (Test-Path "$env:WINDIR\System32\$_") }
+if ($vcMissing) {
+  $vc = "$Here\runtime\vc_redist.x64.exe"
+  if (Test-Path $vc) {
+    Log "Visual C++ runtime (missing: $($vcMissing -join ', '))"
+    $r = Start-Process -FilePath $vc -ArgumentList '/install', '/quiet', '/norestart' -Wait -PassThru
+    if (@(0, 1638, 3010) -notcontains $r.ExitCode) { Log "vc_redist.x64.exe exited with $($r.ExitCode)" }
+  } else { Log "runtime\vc_redist.x64.exe is not on this SSD" }
+}
+# Self-test before anything slow: both executables must start on this box (the OpenVINO one against the
+# side-by-side runtime), or the scheduled task would only restart a worker that can never load.
+$selfTest = "call `"$Prefix\cascadia.exe`" --version && call `"$OvDir\setupvars.bat`" > nul 2>&1 && `"$Prefix\cascadia-ov.exe`" --version"
+$ver = cmd /c $selfTest 2>&1
+if ($LASTEXITCODE -ne 0) {
+  Log "ERROR: the cascadia executables do not start on this box (exit $LASTEXITCODE): $($ver -join ' ')"
+  Log "exit -1073741515 means a DLL is missing: install the Visual C++ 2015-2022 x64 redistributable (runtime\vc_redist.x64.exe on the SSD) and run this again."
+  exit 1
+}
+Log "binary self-test: $($ver -join ' / ')"
+
 # ---------- 2. iGPU present? ----------
 $GpuOk = $false
 if (-not $CpuOnly) {
