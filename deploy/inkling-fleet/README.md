@@ -15,8 +15,9 @@ serves the OpenAI-compatible API (and the dashboard) from rank 0.
 
 1. Plug the SSD in. Decide the box's rank (0–11). Ranks 0 and 11 hold the
    embedding and the output head; the two Windows boxes can be any rank (the
-   installer gives them 3 fused layers on the iGPU instead of 5).
-2. **Ubuntu:**
+   installer gives them 3 fused layers on the iGPU instead of 4).
+2. **Ubuntu** (24.04 or newer; the installer checks that the binary starts
+   before it does anything slow):
    ```
    sudo /media/$USER/<ssd>/inkling-deploy/install.sh <rank>
    ```
@@ -45,20 +46,30 @@ it is up. Rank 0 answers on `http://<IP_0>:8000` once every rank is up.
    Set-ExecutionPolicy -Scope Process Bypass -Force
    curl.exe -s -o $env:TEMP\bootstrap.ps1 http://<that box>:8080/inkling-deploy/bootstrap.ps1; & $env:TEMP\bootstrap.ps1 -Rank <rank> -Server http://<that box>:8080
    ```
-   It pulls the Windows half of the kit (about 1 GB) into `C:\inkling-kit`, then
+   It pulls the Windows half of the kit (about 400 MB) into `C:\inkling-kit`, then
    runs the normal installer, which pulls that rank's slice of the model (about
    44 GB, a few minutes on 2.5 GbE) and sets the rank up exactly as on Ubuntu.
    Both Windows boxes can pull at the same time. Running it again resumes.
 3. Ctrl-C `serve.py` when both are done and carry on with the SSD.
 
-The Windows box must reach the Ubuntu box before its static address exists:
-either both are on DHCP at that moment, or give the Windows port its
-`fleet.env` address by hand first.
+The Windows box has to reach the Ubuntu box before its own installer has
+given it a fleet address. If the switch has no DHCP server, give the wired
+port its `fleet.env` address first (PowerShell as administrator; the port is
+usually called `Ethernet`, see `Get-NetAdapter`):
+```
+netsh interface ipv4 set interface "Ethernet" dhcpstaticipcoexistence=enabled
+netsh interface ipv4 add address "Ethernet" 192.168.50.<10 + rank> 255.255.255.0
+```
+The installer later finds the address already there and keeps it.
 
 ## Addresses
 
-`fleet.env` assigns `192.168.50.10 + rank` to each box's wired port (added
-alongside DHCP, not replacing it). Change the addresses there before
+`fleet.env` assigns `192.168.50.10 + rank` to each box's wired port (the one
+with link). Where that port holds a DHCP lease the address is added next to
+DHCP; on a switch with no DHCP server an Ubuntu box's port becomes static
+only, because a "DHCP + static" profile does not stay up there (to undo:
+remove `/etc/netplan/60-cascadia-inkling.yaml`, then `sudo netplan apply`).
+Windows keeps DHCP on either way. Change the addresses there before
 installing if the venue's network is different, or install with `--no-net` /
 `-NoNet` and set addresses yourself; the `NEXT` line in each box's `rank.env`
 must point at the next rank.
