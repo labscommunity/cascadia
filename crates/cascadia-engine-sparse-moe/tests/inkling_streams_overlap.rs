@@ -6,7 +6,7 @@
 //! smaller frames at once, and smaller frames are cheaper per row.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,11 @@ struct SlowRunner {
     cost: (Duration, Duration),
     /// (decode calls, rows, slept) — printed per rank at the end.
     stats: Arc<std::sync::Mutex<(u64, u64, Duration)>>,
+    /// Ranks inside a decode micro-batch right now, and the most seen at
+    /// once, shared by the pipeline's ranks: overlap observed directly, not
+    /// inferred from wall time.
+    busy: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
 }
 
 impl StagedRunner for SlowRunner {
@@ -86,7 +91,10 @@ impl StagedRunner for SlowRunner {
     }
     fn decode_streams(&mut self, hidden: Vec<f32>, slots: &[usize]) -> Vec<f32> {
         let t0 = Instant::now();
+        let now = self.busy.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
         std::thread::sleep(self.cost.0 + self.cost.1 * slots.len() as u32);
+        self.busy.fetch_sub(1, Ordering::SeqCst);
         let mut g = self.stats.lock().unwrap();
         g.0 += 1;
         g.1 += slots.len() as u64;
@@ -113,14 +121,15 @@ async fn link() -> (Arc<Mutex<ActivationServer>>, Arc<Mutex<ActivationClient>>) 
 }
 
 /// Run `n_streams` tasks of `tokens` tokens through a 4-rank pipeline with
-/// `groups` frames in flight; returns the wall time of the decode phase.
+/// `groups` frames in flight; returns the wall time of the decode phase, the
+/// tokens, and the most ranks that were decoding at the same moment.
 async fn run(
     dir: &PathBuf,
     groups: usize,
     n_streams: usize,
     tokens: u32,
     cost: (Duration, Duration),
-) -> (Duration, Vec<Vec<i64>>) {
+) -> (Duration, Vec<Vec<i64>>, usize) {
     let handle = tokio::runtime::Handle::current();
     let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).unwrap();
     // 4 ranks: layers [0,1) [1,2) [2,3) [3,4)
@@ -130,11 +139,15 @@ async fn run(
     let stats: Vec<Arc<std::sync::Mutex<(u64, u64, Duration)>>> = (0..4)
         .map(|_| Arc::new(std::sync::Mutex::new((0, 0, Duration::ZERO))))
         .collect();
+    let busy = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
     let mk = |rank: u32, lo: u32, hi: u32| SlowRunner {
         inner: InklingRunner::load_staged(dir, 64, rank, 4, lo, hi, Some("eager".into()), None)
             .unwrap(),
         cost,
         stats: stats[rank as usize].clone(),
+        busy: busy.clone(),
+        peak: peak.clone(),
     };
     std::env::set_var("CASCADIA_STREAMS_INFLIGHT", groups.to_string());
     let mut e0 = PipelineEngine::new(
@@ -256,10 +269,14 @@ async fn run(
             g.2.as_secs_f64() * 1e3 / g.0.max(1) as f64
         );
     }
-    (wall, toks)
+    (wall, toks, peak.load(Ordering::SeqCst))
 }
 
+/// Diagnostic sweep, run on demand (`--ignored`). Not part of the suite: `run`
+/// selects the in-flight depth through a process-wide env var, so a sweep
+/// running next to the asserted test below could hand it the wrong depth.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
 async fn probe_timings() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/inkling_export");
     if !dir.join("tokenizer.json").exists() {
@@ -272,7 +289,7 @@ async fn probe_timings() {
         (1, 6, 0, 0),
         (4, 6, 0, 0),
     ] {
-        let (w, _) = run(
+        let (w, _, peak) = run(
             &dir,
             g,
             streams,
@@ -284,7 +301,7 @@ async fn probe_timings() {
         )
         .await;
         eprintln!(
-            "probe groups={g} streams={streams} cost={base_ms}+{row_ms}/row ms: decode wall {w:?}"
+            "probe groups={g} streams={streams} cost={base_ms}+{row_ms}/row ms: decode wall {w:?}, peak busy ranks {peak}"
         );
     }
 }
@@ -299,15 +316,20 @@ async fn groups_in_flight_overlap_the_ranks() {
     let (tokens, streams) = (12u32, 6usize);
     let cost = (Duration::from_millis(10), Duration::from_millis(5));
     // 1 group: one 6-row frame per step, 40 ms per rank, 4 ranks in series.
-    let (w1, t1) = run(&dir, 1, streams, tokens, cost).await;
+    let (w1, t1, peak1) = run(&dir, 1, streams, tokens, cost).await;
     // 4 groups (one per rank): 1-2 row frames, ~15-20 ms per rank, all ranks busy.
-    let (w4, t4) = run(&dir, 4, streams, tokens, cost).await;
+    let (w4, t4, peak4) = run(&dir, 4, streams, tokens, cost).await;
     assert_eq!(t1, t4, "tokens must not depend on the in-flight depth");
-    eprintln!("decode wall: 1 group {w1:?}, 4 groups {w4:?}");
-    // Serial: ~160 ms per 6 tokens. Overlapped: ~20 ms per 1-2 tokens once
-    // full, i.e. about 2x; require 1.5x to leave room for timer slop.
+    // Wall time is reported, not asserted: about 1.6-1.9x on an idle machine,
+    // but sleep precision and a loaded CI runner move it. The overlap itself
+    // is observed directly.
+    eprintln!(
+        "decode wall: 1 group {w1:?}, 4 groups {w4:?} ({:.2}x); peak busy ranks {peak1} vs {peak4}",
+        w1.as_secs_f64() / w4.as_secs_f64()
+    );
+    assert_eq!(peak1, 1, "one group in flight: the ranks must take turns");
     assert!(
-        w1.as_secs_f64() > 1.5 * w4.as_secs_f64(),
-        "no overlap: 1 group {w1:?} vs 4 groups {w4:?}"
+        peak4 >= 2,
+        "no overlap: with 4 groups in flight at most {peak4} rank decoded at a time"
     );
 }
