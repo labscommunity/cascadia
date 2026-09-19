@@ -139,6 +139,8 @@ v="IP_$RANK"; MYIP="${!v}"
   echo "OVDIR=$OVDIR"
   echo "RAYON_NUM_THREADS=$(nproc)"
   echo "CASCADIA_INKLING_MAX_SEQ=${MAX_SEQ:-1024}"; echo "CASCADIA_STREAMS=${STREAMS:-16}"; echo "CASCADIA_API_MAX_CONCURRENT=$(( ${STREAMS:-16} * 4 ))"
+  # no frame-start idle ceiling between requests (default 900 s would drop an idle rank's link; TCP keepalive still catches a dead peer)
+  echo "CASCADIA_FRAME_IDLE_CEILING_SECS=0"
   # the tuned CPU read profile with the expert cache holding the whole slice
   cat <<'ENV'
 CASCADIA_INKLING_SERIAL_EXPERTS=0
