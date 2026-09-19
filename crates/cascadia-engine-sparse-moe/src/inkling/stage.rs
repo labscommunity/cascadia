@@ -55,6 +55,9 @@ pub struct InklingRunner {
     max_seq: usize,
     eos: Vec<u32>,
     pos: usize,
+    /// Multi-stream slots: `Some(pos)` while a sequence owns the slot, `None`
+    /// when free. Empty on the single-sequence path.
+    streams: Vec<Option<usize>>,
     pub rank: u32,
     pub total: u32,
     pub lo: usize,
@@ -159,11 +162,25 @@ impl InklingRunner {
             max_seq,
             eos: m.eos_token_ids.clone(),
             pos: 0,
+            streams: Vec::new(),
             rank,
             total,
             lo,
             hi,
         })
+    }
+}
+
+impl InklingRunner {
+    /// Expert-cache counters summed over this rank's MoE layers.
+    pub fn expert_cache_stats_total(&self) -> super::ExpertCacheStats {
+        let mut total = super::ExpertCacheStats::default();
+        for l in &self.layers {
+            if let Some(m) = l.moe() {
+                total.add(m.expert_cache_stats());
+            }
+        }
+        total
     }
 }
 
@@ -236,5 +253,107 @@ impl StagedRunner for InklingRunner {
             .as_ref()
             .expect("head_logits on a non-last rank")
             .logits(hidden)
+    }
+    fn head_logits_rows(&self, hidden: &[f32], rows: usize) -> Vec<f32> {
+        self.head
+            .as_ref()
+            .expect("head_logits_rows on a non-last rank")
+            .logits_rows(hidden, rows)
+    }
+
+    // ---- multi-stream decode ---------------------------------------------
+    fn stream_capacity(&self) -> usize {
+        self.streams.len()
+    }
+    fn configure_streams(&mut self, n: usize) -> bool {
+        if n == 0 {
+            return false;
+        }
+        for l in &mut self.layers {
+            l.ensure_slots(n);
+        }
+        if self.streams.len() < n {
+            self.streams.resize(n, None);
+        }
+        let per_slot: usize = self.layers.iter().map(Layer::slot_bytes).sum();
+        tracing::info!(
+            rank = self.rank,
+            streams = n,
+            slot_mib = per_slot >> 20,
+            pool_mib = (per_slot * n) >> 20,
+            "inkling stream slots allocated"
+        );
+        true
+    }
+    fn open_stream(&mut self) -> Option<usize> {
+        let slot = self.streams.iter().position(Option::is_none)?;
+        for l in &mut self.layers {
+            l.select_slot(slot);
+            l.reset();
+        }
+        self.streams[slot] = Some(0);
+        Some(slot)
+    }
+    fn open_stream_at(&mut self, slot: usize) -> bool {
+        if slot >= self.streams.len() {
+            return false;
+        }
+        for l in &mut self.layers {
+            l.select_slot(slot);
+            l.reset();
+        }
+        self.streams[slot] = Some(0);
+        true
+    }
+    fn close_stream(&mut self, slot: usize) {
+        if let Some(s) = self.streams.get_mut(slot) {
+            *s = None;
+        }
+    }
+    fn stream_pos(&self, slot: usize) -> usize {
+        self.streams.get(slot).copied().flatten().unwrap_or(0)
+    }
+    fn prefill_stream(&mut self, slot: usize, hidden: Vec<f32>, rows: usize) -> Vec<f32> {
+        let pos = self.streams[slot].expect("prefill_stream on a free slot");
+        assert_eq!(
+            hidden.len(),
+            rows * self.hidden,
+            "inkling prefill_stream: bad hidden length"
+        );
+        let mut x = hidden;
+        for l in &mut self.layers {
+            l.select_slot(slot);
+            x = l.forward_prefill(&x, rows);
+        }
+        self.streams[slot] = Some(pos + rows);
+        x
+    }
+    fn decode_streams(&mut self, hidden: Vec<f32>, slots: &[usize]) -> Vec<f32> {
+        let rows = slots.len();
+        assert_eq!(
+            hidden.len(),
+            rows * self.hidden,
+            "inkling decode_streams: bad hidden length"
+        );
+        for (i, &s) in slots.iter().enumerate() {
+            assert!(
+                self.streams[s].is_some(),
+                "decode_streams: slot {s} is free"
+            );
+            assert!(
+                !slots[..i].contains(&s),
+                "decode_streams: slot {s} listed twice in one step"
+            );
+        }
+        let mut x = hidden;
+        for l in &mut self.layers {
+            x = l.forward_rows(&x, rows, slots);
+        }
+        for &s in slots {
+            if let Some(p) = self.streams[s].as_mut() {
+                *p += 1;
+            }
+        }
+        x
     }
 }

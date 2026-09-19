@@ -171,6 +171,22 @@ pub enum FrameKind {
     /// Version 1 weighted fused-shard request; result uses ExpertResult with k=1.
     FusedExpertDispatch = 0x53_4D_45_52,
     ExpertResult = 0x53_4D_45_51, // "SME\x51" — worker → driver: status + outputs | message
+    // Multi-stream pipeline decode (continuous batching across ranks; see
+    // `PipelineEngine::step_streams`). Appended codes — never reorder existing
+    // ones. Every rank keeps one KV slot per stream; rank 0 picks the slot ids.
+    /// down: `batch_id u32 | slot u32 | rows u32 | 40 B SamplingConfig | tensor [1, rows, H]` —
+    /// open `slot` on every rank and prefill its prompt rows; the last rank
+    /// samples the final row with a fresh per-slot sampler and replies
+    /// `StreamTokens{batch_id, [(slot, token)]}`.
+    StreamOpen = 0x53_4D_45_60, // "SME\x60"
+    /// down: `batch_id u32 | rows u32 | (slot u32, pos u32) × rows | tensor [1, rows, H]` — one
+    /// decode token per listed stream; the last rank samples each row with that
+    /// slot's sampler and replies `StreamTokens`.
+    StreamDecode = 0x53_4D_45_61, // "SME\x61"
+    /// down, one-way: `slot u32` — release the slot on every rank.
+    StreamClose = 0x53_4D_45_62, // "SME\x62"
+    /// up: `batch_id u32 | rows u32 | (slot u32, token i64) × rows`.
+    StreamTokens = 0x53_4D_45_63, // "SME\x63"
 }
 
 impl FrameKind {
@@ -198,6 +214,10 @@ impl FrameKind {
             x if x == FrameKind::ExpertDispatch as u32 => Some(FrameKind::ExpertDispatch),
             x if x == FrameKind::FusedExpertDispatch as u32 => Some(FrameKind::FusedExpertDispatch),
             x if x == FrameKind::ExpertResult as u32 => Some(FrameKind::ExpertResult),
+            x if x == FrameKind::StreamOpen as u32 => Some(FrameKind::StreamOpen),
+            x if x == FrameKind::StreamDecode as u32 => Some(FrameKind::StreamDecode),
+            x if x == FrameKind::StreamClose as u32 => Some(FrameKind::StreamClose),
+            x if x == FrameKind::StreamTokens as u32 => Some(FrameKind::StreamTokens),
             _ => None,
         }
     }
@@ -1349,6 +1369,242 @@ pub async fn recv_token_batch_body_client(
         ]));
     }
     Ok(tokens)
+}
+
+// ───────────────────────── multi-stream pipeline frames ─────────────────────────
+
+/// Rows one stream frame may carry (streams per decode step, or prompt rows
+/// of one prefill).
+pub const MAX_STREAM_ROWS: u32 = MAX_BATCH_COUNT;
+
+fn be_u32(b: &[u8]) -> u32 {
+    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+}
+
+/// down: open `slot` with `rows` prompt positions (`hidden` = `[rows, h]`).
+pub async fn send_stream_open(
+    cli: &Mutex<ActivationClient>,
+    batch_id: u32,
+    slot: u32,
+    sampling: &SamplingConfig,
+    hidden_f32: &[f32],
+    rows: u32,
+    h: u32,
+) -> TransportResult<()> {
+    let mut header = [0u8; 16 + SAMPLING_WIRE_BYTES];
+    header[0..4].copy_from_slice(&(FrameKind::StreamOpen as u32).to_be_bytes());
+    header[4..8].copy_from_slice(&batch_id.to_be_bytes());
+    header[8..12].copy_from_slice(&slot.to_be_bytes());
+    header[12..16].copy_from_slice(&rows.to_be_bytes());
+    let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+    encode_sampling(sampling, &mut sbytes);
+    header[16..].copy_from_slice(&sbytes);
+    let tensor = hidden_to_tensor(hidden_f32, [1, rows, h]);
+    let mut guard = cli.lock().await;
+    guard.send_raw(&header).await?;
+    guard.send(&tensor).await?;
+    Ok(())
+}
+
+/// Body of a `StreamOpen` (kind consumed): `(batch_id, slot, rows, sampling, hidden)`.
+pub async fn recv_stream_open_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u32, u32, u32, SamplingConfig, Vec<f32>)> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(12 + SAMPLING_WIRE_BYTES).await?;
+    if raw.len() != 12 + SAMPLING_WIRE_BYTES {
+        return Err(TransportError::SocketClosed);
+    }
+    let (batch_id, slot, rows) = (be_u32(&raw[0..4]), be_u32(&raw[4..8]), be_u32(&raw[8..12]));
+    if rows == 0 || rows > MAX_STREAM_ROWS {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream open: rows {rows} out of range 1..={MAX_STREAM_ROWS}"
+        ))));
+    }
+    let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+    sbytes.copy_from_slice(&raw[12..]);
+    let sampling = decode_sampling(&sbytes);
+    let (tensor, _) = guard.recv().await?;
+    drop(guard);
+    if tensor.shape[1] != rows {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream open: tensor shape[1]={} != rows {rows}",
+            tensor.shape[1]
+        ))));
+    }
+    let (h, _) = tensor_to_hidden(&tensor)?;
+    Ok((batch_id, slot, rows, sampling, h))
+}
+
+/// down: one decode token for each `(slot, pos)` (`hidden` = `[rows.len(), h]`).
+pub async fn send_stream_decode(
+    cli: &Mutex<ActivationClient>,
+    batch_id: u32,
+    rows: &[(u32, u32)],
+    hidden_f32: &[f32],
+    h: u32,
+) -> TransportResult<()> {
+    let n = rows.len() as u32;
+    if n == 0 || n > MAX_STREAM_ROWS {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream decode: rows {n} out of range 1..={MAX_STREAM_ROWS}"
+        ))));
+    }
+    let mut header = Vec::with_capacity(12 + rows.len() * 8);
+    header.extend_from_slice(&(FrameKind::StreamDecode as u32).to_be_bytes());
+    header.extend_from_slice(&batch_id.to_be_bytes());
+    header.extend_from_slice(&n.to_be_bytes());
+    for &(slot, pos) in rows {
+        header.extend_from_slice(&slot.to_be_bytes());
+        header.extend_from_slice(&pos.to_be_bytes());
+    }
+    let tensor = hidden_to_tensor(hidden_f32, [1, n, h]);
+    let mut guard = cli.lock().await;
+    guard.send_raw(&header).await?;
+    guard.send(&tensor).await?;
+    Ok(())
+}
+
+/// Body of a `StreamDecode` (kind consumed): `(batch_id, [(slot, pos)], hidden)`.
+pub async fn recv_stream_decode_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u32, Vec<(u32, u32)>, Vec<f32>)> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(8).await?;
+    if raw.len() != 8 {
+        return Err(TransportError::SocketClosed);
+    }
+    let (batch_id, n) = (be_u32(&raw[0..4]), be_u32(&raw[4..8]));
+    if n == 0 || n > MAX_STREAM_ROWS {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream decode: rows {n} out of range 1..={MAX_STREAM_ROWS}"
+        ))));
+    }
+    let raw = guard.recv_raw(n as usize * 8).await?;
+    if raw.len() != n as usize * 8 {
+        return Err(TransportError::SocketClosed);
+    }
+    let rows: Vec<(u32, u32)> = raw
+        .chunks_exact(8)
+        .map(|c| (be_u32(&c[0..4]), be_u32(&c[4..8])))
+        .collect();
+    let (tensor, _) = guard.recv().await?;
+    drop(guard);
+    if tensor.shape[1] != n {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream decode: tensor shape[1]={} != rows {n}",
+            tensor.shape[1]
+        ))));
+    }
+    let (h, _) = tensor_to_hidden(&tensor)?;
+    Ok((batch_id, rows, h))
+}
+
+/// down, one-way: release `slot` on every downstream rank.
+pub async fn send_stream_close(cli: &Mutex<ActivationClient>, slot: u32) -> TransportResult<()> {
+    let mut bytes = [0u8; 8];
+    bytes[0..4].copy_from_slice(&(FrameKind::StreamClose as u32).to_be_bytes());
+    bytes[4..8].copy_from_slice(&slot.to_be_bytes());
+    let mut guard = cli.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Body of a `StreamClose` (kind consumed): the slot.
+pub async fn recv_stream_close_body_server(srv: &Mutex<ActivationServer>) -> TransportResult<u32> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(4).await?;
+    drop(guard);
+    if raw.len() != 4 {
+        return Err(TransportError::SocketClosed);
+    }
+    Ok(be_u32(&raw))
+}
+
+/// up: the sampled token of each `(slot, token)` for `batch_id`.
+pub async fn send_stream_tokens_upstream(
+    srv: &Mutex<ActivationServer>,
+    batch_id: u32,
+    tokens: &[(u32, i64)],
+) -> TransportResult<()> {
+    let n = tokens.len() as u32;
+    if n == 0 || n > MAX_STREAM_ROWS {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream tokens: rows {n} out of range 1..={MAX_STREAM_ROWS}"
+        ))));
+    }
+    let mut bytes = Vec::with_capacity(12 + tokens.len() * 12);
+    bytes.extend_from_slice(&(FrameKind::StreamTokens as u32).to_be_bytes());
+    bytes.extend_from_slice(&batch_id.to_be_bytes());
+    bytes.extend_from_slice(&n.to_be_bytes());
+    for &(slot, tok) in tokens {
+        bytes.extend_from_slice(&slot.to_be_bytes());
+        bytes.extend_from_slice(&tok.to_be_bytes());
+    }
+    let mut guard = srv.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Body of a `StreamTokens` (kind consumed): `(batch_id, [(slot, token)])`.
+pub async fn recv_stream_tokens_body_client(
+    cli: &Mutex<ActivationClient>,
+) -> TransportResult<(u32, Vec<(u32, i64)>)> {
+    let mut guard = cli.lock().await;
+    let raw = guard.recv_raw(8).await?;
+    if raw.len() != 8 {
+        return Err(TransportError::SocketClosed);
+    }
+    let (batch_id, n) = (be_u32(&raw[0..4]), be_u32(&raw[4..8]));
+    if n == 0 || n > MAX_STREAM_ROWS {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream tokens: rows {n} out of range 1..={MAX_STREAM_ROWS}"
+        ))));
+    }
+    let raw = guard.recv_raw(n as usize * 12).await?;
+    drop(guard);
+    if raw.len() != n as usize * 12 {
+        return Err(TransportError::SocketClosed);
+    }
+    let toks = raw
+        .chunks_exact(12)
+        .map(|c| {
+            (
+                be_u32(&c[0..4]),
+                i64::from_be_bytes([c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11]]),
+            )
+        })
+        .collect();
+    Ok((batch_id, toks))
+}
+
+/// Await the `StreamTokens` reply owed to a stream frame just sent `down`,
+/// bounded by `deadline` (same drop-on-timeout rule as [`recv_token_reply`]).
+pub async fn recv_stream_tokens_reply(
+    down: &Mutex<ActivationClient>,
+    deadline: std::time::Duration,
+) -> Result<(u32, Vec<(u32, i64)>), String> {
+    match tokio::time::timeout(deadline, async {
+        match recv_kind_client(down).await {
+            Ok(Some(FrameKind::StreamTokens)) => recv_stream_tokens_body_client(down)
+                .await
+                .map_err(|e| format!("recv_stream_tokens: {e}")),
+            Ok(Some(other)) => Err(format!("expected StreamTokens reply, got {other:?}")),
+            Ok(None) => Err("downstream closed before StreamTokens".into()),
+            Err(e) => Err(format!("recv_kind: {e}")),
+        }
+    })
+    .await
+    {
+        Ok(res) => res,
+        Err(_) => {
+            down.lock().await.close().await;
+            Err(format!(
+                "stream reply timeout after {deadline:?}: downstream silent (dead peer?); \
+                 connection dropped"
+            ))
+        }
+    }
 }
 
 /// Forward a Reset frame downstream — used by mid ranks after consuming

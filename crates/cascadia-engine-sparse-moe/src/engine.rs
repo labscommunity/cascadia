@@ -9,6 +9,7 @@
 //!   Rank 0 owns the API, layer 0, and the prefill+decode driver loop.
 //!   Last rank owns the head and sampler. Middle ranks just relay.
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,10 +31,14 @@ use tracing::{info, warn};
 
 use crate::dist::{
     forward_reset, recv_forward_batch_body_server, recv_forward_body_server, recv_key_body_server,
-    recv_kind_client, recv_kind_server, recv_token_batch_body_client, recv_token_body_client,
+    recv_kind_client, recv_kind_server, recv_stream_close_body_server,
+    recv_stream_decode_body_server, recv_stream_open_body_server, recv_stream_tokens_body_client,
+    recv_stream_tokens_reply, recv_token_batch_body_client, recv_token_body_client,
     send_cache_prefix, send_forward, send_forward_batch, send_forward_batch_prefill,
     send_forward_batch_prefill_nosample, send_forward_nosample, send_forward_prefill, send_reset,
-    send_restore_prefix, send_token_batch_upstream, send_token_upstream, FrameKind, StageTransport,
+    send_restore_prefix, send_stream_close, send_stream_decode, send_stream_open,
+    send_stream_tokens_upstream, send_token_batch_upstream, send_token_upstream, FrameKind,
+    StageTransport,
 };
 #[cfg(feature = "kv_coord")]
 use crate::dist::{
@@ -941,7 +946,7 @@ impl Builder for SparseMoEBuilder {
             let runtime_handle = tokio::runtime::Handle::try_current()
                 .map_err(|_| EngineError::Backend("Builder::build outside tokio context".into()))?;
             info!(rank, total, "built inkling engine");
-            return Ok(Box::new(PipelineEngine::new(
+            let mut engine = PipelineEngine::new(
                 runner,
                 self.tokenizer,
                 self.transport,
@@ -950,7 +955,19 @@ impl Builder for SparseMoEBuilder {
                 total,
                 // No per-rank KV-prefix cache on this family yet (follow-up).
                 None,
-            )));
+            );
+            // `CASCADIA_STREAMS=N`: decode up to N requests together (single
+            // stage). Off by default; the pipeline wire is a follow-up.
+            let streams = std::env::var("CASCADIA_STREAMS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            if streams > 0 {
+                // Every rank of a pipeline must configure the same slot count:
+                // rank 0 picks slot ids, workers open the same ids.
+                engine.enable_streams(streams);
+            }
+            return Ok(Box::new(engine));
         }
         if let Some(runner) = self.glm_runner {
             let total = self.config.total.max(1);
@@ -1168,6 +1185,15 @@ impl Builder for SparseMoEBuilder {
 /// cap is `length`; stopping short of it (EOS / stop sequence) is `stop`. The
 /// runner returns the generated ids excluding EOS, so `n >= max_new` means the
 /// cap was the limiter. An EOS landing exactly at the cap reports `length`.
+/// The message carried by a caught forward panic.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "forward panicked".to_string())
+}
+
 fn finish_reason_for(n_tokens: usize, max_new: usize) -> FinishReason {
     if n_tokens >= max_new {
         FinishReason::Length
@@ -1309,6 +1335,24 @@ fn even_moe_split(total_moe: u32, rank: u32, total: u32) -> (u32, u32) {
 /// first step after the link drops. After that the one-shot is spent so a
 /// re-poll (the relay loop has already exited on the first one) doesn't flood.
 /// Pure, for testing.
+/// Whether a failed upstream receive on a pipeline worker means the link is
+/// gone for good. The server reports `NotConnected` both before the previous
+/// rank has dialed in (keep waiting) and after a once-live socket was dropped
+/// (fatal: the listener accepts exactly once, so nothing reconnects — exit so
+/// the supervisor rebuilds the rank). A frame-start timeout consumed nothing
+/// and is retried; every other error comes off a live socket the transport
+/// has already dropped, or leaves it unusable.
+pub(crate) fn worker_recv_failure_is_fatal(
+    err: &cascadia_transport::TransportError,
+    upstream_seen: bool,
+) -> bool {
+    match err {
+        cascadia_transport::TransportError::NotConnected => upstream_seen,
+        cascadia_transport::TransportError::FrameStartTimeout(_) => false,
+        _ => true,
+    }
+}
+
 fn worker_should_report_disconnect(peer_disconnected: bool, already_reported: bool) -> bool {
     peer_disconnected && !already_reported
 }
@@ -1404,6 +1448,11 @@ const MAX_PENDING_TASKS: usize = 8;
 /// hot-spinning while a misbehaving peer keeps trying. Matches the cadence
 /// dist_spec uses for the same situation.
 const WORKER_BACKOFF: Duration = Duration::from_millis(200);
+/// Rank 0's downstream re-dial: one bounded connect attempt per interval
+/// while the link is down, so a neighbour that is still loading does not
+/// stall every step for the whole connect budget.
+const REDIAL_BUDGET: Duration = Duration::from_secs(2);
+const REDIAL_INTERVAL: Duration = Duration::from_secs(3);
 
 /// In-flight multi-stage generation on rank 0 (one at a time; queued tasks
 /// wait in `pending`). This is the streamed replacement for the deleted
@@ -3463,6 +3512,12 @@ impl SparseMoEEngine {
             FrameKind::ExpertDispatch | FrameKind::FusedExpertDispatch | FrameKind::ExpertResult => Err(format!(
                 "pipeline stage received expert-parallel frame {kind:?} (that is an expert worker's frame)"
             )),
+            FrameKind::StreamOpen
+            | FrameKind::StreamDecode
+            | FrameKind::StreamClose
+            | FrameKind::StreamTokens => Err(format!(
+                "sparse-moe stage received multi-stream frame {kind:?} (only the staged pipeline engine serves streams)"
+            )),
             #[cfg(feature = "kv_coord")]
             FrameKind::CaptureV2 => {
                 let (epoch, tokens, tenant) = self
@@ -5255,6 +5310,12 @@ pub struct PipelineEngine<R: StagedRunner> {
     rank: u32,
     total: u32,
     peer_disconnected: bool,
+    /// Set once a frame has arrived from the previous rank: after that, a
+    /// `NotConnected` upstream is a dropped link, not a rank that has yet to dial in.
+    upstream_seen: bool,
+    /// Rank 0 only: earliest time for the next downstream re-dial while the
+    /// link is down (see `redial_downstream`).
+    redial_next: Option<Instant>,
     disconnect_reported: bool,
     last_rank_history: Vec<i64>,
     last_rank_rng: u64,
@@ -5271,6 +5332,84 @@ pub struct PipelineEngine<R: StagedRunner> {
     /// Rank 0 serves ONE task at a time (as the monolithic driver did): a new
     /// task is popped from `pending` only when this is `None`.
     active: Option<PipeActive>,
+    /// Multi-stream decode (single stage only for now): up to `stream_cap`
+    /// tasks decode together, one token each per `step`, the runner batching
+    /// their MoE rows. Empty / 0 = the one-task path above.
+    streams: Vec<StreamActive>,
+    stream_cap: usize,
+    /// Last rank of a multi-stream pipeline: one sampler per open slot.
+    stream_samplers: HashMap<usize, StreamSampler>,
+    /// Rank 0: id of the last stream frame sent (replies must echo it).
+    stream_batch_seq: u32,
+    /// Rank 0 of a pipeline: streams are split into this many groups, each
+    /// with its own micro-batch frame in flight, so every rank works on a
+    /// different group's frame at once. Groups are serviced round-robin, one
+    /// per `step`, which keeps the single reply FIFO in order. 1 = one frame
+    /// in flight (no overlap). Pays off because a rank's cost per frame is a
+    /// fixed part plus a per-row part: G smaller frames in flight finish
+    /// sooner than one big one through R ranks in series.
+    stream_groups: usize,
+    /// Rank 0: frames sent and not yet answered, per group, in send order.
+    stream_inflight: Vec<VecDeque<StreamInFlight>>,
+    /// Rank 0: rotation counter (`% stream_groups` = the group this step serves).
+    stream_step: u64,
+    /// New streams admitted (prefilled) per `step`, so a burst of prompts
+    /// cannot stall the streams already decoding for many prefills at once.
+    stream_admit_per_step: usize,
+    /// Aggregate-throughput window: tokens emitted and wall time since the
+    /// last multi-stream log line.
+    stream_log: (u64, Duration, u64),
+}
+
+/// One task inside the multi-stream single-stage scheduler: its slot in the
+/// runner, its own sampling state, and the token sampled but not yet emitted
+/// (`next`), mirroring `PipeActive` per stream.
+/// Per-slot sampling state on the last rank (the driver keeps the tokens).
+struct StreamSampler {
+    cfg: crate::sampling::SamplingConfig,
+    history: Vec<i64>,
+    rng: u64,
+}
+
+/// A stream frame rank 0 has sent and is owed a `StreamTokens` reply for.
+struct StreamInFlight {
+    batch_id: u32,
+    /// Slots in row order (one for a `StreamOpen`).
+    slots: Vec<usize>,
+    open: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StreamState {
+    /// `StreamOpen` sent, first token not back yet (pipeline only).
+    Prefilling,
+    /// `next` holds a token to emit and forward.
+    Ready,
+    /// A decode frame carrying this stream is in flight (pipeline only).
+    InFlight,
+}
+
+struct StreamActive {
+    id: TaskId,
+    slot: usize,
+    /// Pipeline: the micro-batch group this stream rides in.
+    group: usize,
+    state: StreamState,
+    /// Cancelled while a frame was in flight: retire silently once it lands.
+    cancelled: bool,
+    cfg: crate::sampling::SamplingConfig,
+    history: Vec<i64>,
+    rng: u64,
+    max_new: usize,
+    started: Instant,
+    prefill_s: f64,
+    decode_started: Instant,
+    prompt_len: usize,
+    next: i64,
+    /// Absolute position the next forward of this stream occupies.
+    pos: usize,
+    generated: Vec<u32>,
+    emitted: usize,
 }
 
 /// Rank-0 per-token streaming state: everything the decode loop threaded as
@@ -5303,7 +5442,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
     /// `CASCADIA_GLM5_PREFIX_CACHE`, preserving the env-only behaviour. This
     /// index must stay in lockstep with every rank's `SliceKvCache`, so the
     /// value threaded here is the same one handed to `StageOpts`.
-    fn new(
+    pub fn new(
         runner: R,
         tokenizer: Option<Tokenizer>,
         transport: StageTransport,
@@ -5321,6 +5460,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
             rank,
             total,
             peer_disconnected: false,
+            upstream_seen: false,
+            redial_next: None,
             disconnect_reported: false,
             last_rank_history: Vec::new(),
             last_rank_rng: 0,
@@ -5335,7 +5476,704 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 })
                 .unwrap_or(0),
             active: None,
+            streams: Vec::new(),
+            stream_cap: 0,
+            stream_samplers: HashMap::new(),
+            stream_batch_seq: 0,
+            stream_groups: 1,
+            stream_inflight: Vec::new(),
+            stream_step: 0,
+            stream_admit_per_step: 1,
+            stream_log: (0, Duration::ZERO, 0),
         }
+    }
+
+    /// Enable multi-stream decode with up to `n` concurrent tasks (single
+    /// stage only). Returns the capacity actually configured (0 if the runner
+    /// cannot batch streams).
+    pub fn enable_streams(&mut self, n: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        if !self.runner.configure_streams(n) {
+            return 0;
+        }
+        self.stream_cap = self.runner.stream_capacity().min(n);
+        self.stream_admit_per_step = std::env::var("CASCADIA_STREAMS_ADMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &usize| v >= 1)
+            .unwrap_or(1);
+        // Frames in flight = ranks (rank 0 computes too), unless overridden;
+        // never more groups than slots.
+        let default_groups = (self.total.max(1) as usize).max(1);
+        self.stream_groups = std::env::var("CASCADIA_STREAMS_INFLIGHT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v: &usize| v >= 1)
+            .unwrap_or(default_groups)
+            .min(self.stream_cap)
+            .max(1);
+        self.stream_inflight = (0..self.stream_groups).map(|_| VecDeque::new()).collect();
+        info!(
+            streams = self.stream_cap,
+            admit_per_step = self.stream_admit_per_step,
+            groups_in_flight = self.stream_groups,
+            rank = self.rank,
+            total = self.total,
+            "multi-stream decode enabled ({})",
+            self.runner.arch_name()
+        );
+        self.stream_cap
+    }
+
+    /// Rank 0 of a multi-stream pipeline: one group's turn. Receive the
+    /// group's outstanding replies (the oldest frames on the wire — groups
+    /// are serviced round-robin, so the single reply FIFO stays in order),
+    /// admit new streams into this group (their `StreamOpen` goes out now),
+    /// emit the group's ready tokens, retire finished streams, and send one
+    /// decode micro-batch for the survivors. With G groups and G frames in
+    /// flight, each downstream rank is busy on a different group's rows.
+    fn step_streams_pipeline(&mut self) -> Vec<(TaskId, Chunk)> {
+        // One `step` = one round over every group, so each active stream
+        // emits exactly one token per step (the runner's no-progress guard
+        // closes a task that sees three chunk-less steps). Between rounds
+        // every group's frame is in flight at once, which is the overlap.
+        let mut out: Vec<(TaskId, Chunk)> = Vec::new();
+        let groups = self.stream_groups.max(1);
+        for g in 0..groups {
+            self.stream_step += 1;
+            let done = self.step_stream_group(g, &mut out);
+            if !done {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Serve group `g` (see [`Self::step_streams_pipeline`]); `false` once
+    /// the streams were aborted.
+    fn step_stream_group(&mut self, g: usize, out: &mut Vec<(TaskId, Chunk)>) -> bool {
+        let step_started = Instant::now();
+        let groups = self.stream_groups.max(1);
+        let Some(down) = self.transport.downstream.clone() else {
+            self.fail_streams_into(out, "rank 0 missing downstream".into());
+            return false;
+        };
+        // ---- 1. replies for this group's frames ----
+        while let Some(f) = self.stream_inflight[g].pop_front() {
+            let deadline = if f.open {
+                Self::reply_deadline_prefill()
+            } else {
+                Self::reply_deadline() * groups as u32
+            };
+            let (bid, toks) = match self.block_on(recv_stream_tokens_reply(&down, deadline)) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.fail_streams_into(out, e);
+                    return false;
+                }
+            };
+            if bid != f.batch_id || toks.len() != f.slots.len() {
+                let msg = format!(
+                    "stream reply mismatch: batch {bid} vs {}, {} rows vs {}",
+                    f.batch_id,
+                    toks.len(),
+                    f.slots.len()
+                );
+                self.fail_streams_into(out, msg);
+                return false;
+            }
+            for (&slot, &(wslot, token)) in f.slots.iter().zip(&toks) {
+                if wslot as usize != slot {
+                    let msg = format!("stream reply row names slot {wslot}, expected {slot}");
+                    self.fail_streams_into(out, msg);
+                    return false;
+                }
+                if let Some(st) = self.streams.iter_mut().find(|s| s.slot == slot) {
+                    st.next = token;
+                    if !f.open {
+                        st.pos += 1;
+                    }
+                    st.state = StreamState::Ready;
+                }
+            }
+        }
+        // ---- 2. admissions into this group ----
+        let mut admitted = 0usize;
+        while admitted < self.stream_admit_per_step
+            && self.streams.len() < self.stream_cap
+            && !self.pending.is_empty()
+        {
+            let task = self.pending.pop_front().expect("non-empty");
+            admitted += 1;
+            if let Err((id, chunk)) = self.admit_stream_pipeline(task, g, &down) {
+                out.push((id, chunk));
+            }
+        }
+        // ---- 3. emission for this group's ready streams ----
+        let tok = self
+            .tokenizer
+            .as_ref()
+            .expect("multi-stream step needs a tokenizer");
+        let max_seq = self.runner.max_seq();
+        let eos: Vec<u32> = self.runner.eos_token_ids().to_vec();
+        let arch = self.runner.arch_name();
+        let mut finished: Vec<usize> = Vec::new();
+        for (i, st) in self.streams.iter_mut().enumerate() {
+            if st.group != g || st.state != StreamState::Ready {
+                continue;
+            }
+            if st.cancelled {
+                finished.push(i);
+                continue;
+            }
+            let t = st.next as u32;
+            st.generated.push(t);
+            let full = tok.decode(&st.generated, true).unwrap_or_default();
+            let delta = utf8_safe_delta(&full, &mut st.emitted);
+            let mut c = Chunk::token(st.id.clone(), st.next, delta);
+            c.n_tokens = Some(1);
+            c.token_ids = vec![st.next];
+            out.push((st.id.clone(), c));
+            let n = st.generated.len();
+            let natural_stop = n >= st.max_new || eos.contains(&t);
+            let cap_stop = !natural_stop && st.pos >= max_seq;
+            if natural_stop || cap_stop {
+                let mut chunk = Chunk::final_marker(st.id.clone(), String::new());
+                chunk.n_tokens = Some(0);
+                chunk.prompt_tokens = Some(st.prompt_len as u32);
+                chunk.finish_reason = Some(if cap_stop {
+                    FinishReason::Length
+                } else {
+                    finish_reason_for(n, st.max_new)
+                });
+                out.push((st.id.clone(), chunk));
+                let decode_s = st.decode_started.elapsed().as_secs_f64();
+                let steps = n.saturating_sub(1);
+                info!(
+                    task = %st.id,
+                    tokens = n,
+                    elapsed_s = st.started.elapsed().as_secs_f64(),
+                    prefill_s = st.prefill_s,
+                    decode_s,
+                    decode_steps = steps,
+                    decode_tok_s = if decode_s > 0.0 { steps as f64 / decode_s } else { 0.0 },
+                    "task done ({arch} multi-stream pipeline)"
+                );
+                finished.push(i);
+            }
+        }
+        for &i in finished.iter().rev() {
+            let st = self.streams.swap_remove(i);
+            self.runner.close_stream(st.slot);
+            if let Err(e) = self.block_on(send_stream_close(&down, st.slot as u32)) {
+                warn!(slot = st.slot, "stream close not relayed: {e}");
+            }
+        }
+        // ---- 4. one decode micro-batch for this group's survivors ----
+        let rows_idx: Vec<usize> = self
+            .streams
+            .iter()
+            .enumerate()
+            .filter(|(_, st)| st.group == g && st.state == StreamState::Ready)
+            .map(|(i, _)| i)
+            .collect();
+        if rows_idx.is_empty() {
+            return true;
+        }
+        let hs = self.runner.hidden_size();
+        let slots: Vec<usize> = rows_idx.iter().map(|&i| self.streams[i].slot).collect();
+        let wire_rows: Vec<(u32, u32)> = rows_idx
+            .iter()
+            .map(|&i| (self.streams[i].slot as u32, self.streams[i].pos as u32))
+            .collect();
+        let mut hidden = Vec::with_capacity(slots.len() * hs);
+        for &i in &rows_idx {
+            let st = &self.streams[i];
+            debug_assert_eq!(st.pos, self.runner.stream_pos(st.slot));
+            hidden.extend(self.runner.embed_token(st.next as u32));
+        }
+        let runner = &mut self.runner;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runner.decode_streams(hidden, &slots)
+        }));
+        let h = match outcome {
+            Ok(h) => h,
+            Err(payload) => {
+                self.fail_streams_into(out, panic_message(payload));
+                return false;
+            }
+        };
+        self.stream_batch_seq = self.stream_batch_seq.wrapping_add(1);
+        let batch_id = self.stream_batch_seq;
+        if let Err(e) = self.block_on(send_stream_decode(
+            &down, batch_id, &wire_rows, &h, hs as u32,
+        )) {
+            self.fail_streams_into(out, format!("send_stream_decode: {e}"));
+            return false;
+        }
+        for &i in &rows_idx {
+            self.streams[i].state = StreamState::InFlight;
+        }
+        self.stream_inflight[g].push_back(StreamInFlight {
+            batch_id,
+            slots,
+            open: false,
+        });
+        // ---- aggregate log ----
+        let rows = rows_idx.len();
+        let (ref mut toks, ref mut wall, ref mut steps) = self.stream_log;
+        *toks += rows as u64;
+        *wall += step_started.elapsed();
+        *steps += 1;
+        if *steps >= 16 * groups as u64 {
+            let secs = wall.as_secs_f64();
+            info!(
+                streams = self.streams.len(),
+                groups,
+                steps = *steps,
+                step_ms = secs * 1e3 / *steps as f64,
+                aggregate_tok_s = if secs > 0.0 { *toks as f64 / secs } else { 0.0 },
+                "{arch} multi-stream pipeline decode"
+            );
+            self.stream_log = (0, Duration::ZERO, 0);
+        }
+        true
+    }
+
+    /// Pipeline admission: tokenize, take a slot, run my layers over the
+    /// prompt and send `StreamOpen` for group `g` without waiting; the first
+    /// token arrives with the group's next turn.
+    #[allow(clippy::result_large_err)]
+    fn admit_stream_pipeline(
+        &mut self,
+        task: GenerationTask,
+        g: usize,
+        down: &Arc<TokioMutex<ActivationClient>>,
+    ) -> Result<(), (TaskId, Chunk)> {
+        let started = Instant::now();
+        let Some(tok) = self.tokenizer.as_ref() else {
+            let e = Chunk::error(task.task_id.clone(), "engine has no tokenizer".to_string());
+            return Err((task.task_id, e));
+        };
+        let mut prompt_ids: Vec<u32> = match tok.encode(task.prompt.as_str(), true) {
+            Ok(enc) => enc.get_ids().to_vec(),
+            Err(e) => {
+                let c = Chunk::error(
+                    task.task_id.clone(),
+                    format!("tokenizer encode failed: {e}"),
+                );
+                return Err((task.task_id, c));
+            }
+        };
+        if prompt_ids.is_empty() {
+            let c = Chunk::final_marker(task.task_id.clone(), "");
+            return Err((task.task_id, c));
+        }
+        let max_seq = self.runner.max_seq();
+        if prompt_ids.len() > max_seq {
+            warn!(
+                task = %task.task_id,
+                prompt_tokens = prompt_ids.len(),
+                context_budget = max_seq,
+                "prompt exceeds context budget; dropping the tail (newest tokens)"
+            );
+            prompt_ids.truncate(max_seq);
+        }
+        let Some(slot) = self.runner.open_stream() else {
+            let c = Chunk::error(task.task_id.clone(), "no free stream slot".to_string());
+            return Err((task.task_id, c));
+        };
+        let hs = self.runner.hidden_size();
+        let rows = prompt_ids.len();
+        let mut hidden = Vec::with_capacity(rows * hs);
+        for &t in &prompt_ids {
+            hidden.extend(self.runner.embed_token(t));
+        }
+        let cfg = sampling_from_task(&task);
+        let runner = &mut self.runner;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runner.prefill_stream(slot, hidden, rows)
+        }));
+        let h = match outcome {
+            Ok(h) => h,
+            Err(payload) => {
+                let msg = panic_message(payload);
+                warn!(task = %task.task_id, error = %msg, "stream prefill failed; task aborted");
+                self.runner.close_stream(slot);
+                return Err((task.task_id.clone(), Chunk::error(task.task_id, msg)));
+            }
+        };
+        self.stream_batch_seq = self.stream_batch_seq.wrapping_add(1);
+        let batch_id = self.stream_batch_seq;
+        if let Err(e) = self.block_on(send_stream_open(
+            down,
+            batch_id,
+            slot as u32,
+            &cfg,
+            &h,
+            rows as u32,
+            hs as u32,
+        )) {
+            warn!(task = %task.task_id, "send_stream_open failed: {e}");
+            self.peer_disconnected = true;
+            self.runner.close_stream(slot);
+            return Err((
+                task.task_id.clone(),
+                Chunk::error(task.task_id, format!("send_stream_open: {e}")),
+            ));
+        }
+        self.stream_inflight[g].push_back(StreamInFlight {
+            batch_id,
+            slots: vec![slot],
+            open: true,
+        });
+        let prefill_s = started.elapsed().as_secs_f64();
+        info!(
+            task = %task.task_id,
+            slot,
+            group = g,
+            prompt_tokens = rows,
+            rank0_prefill_s = prefill_s,
+            streams = self.streams.len() + 1,
+            "stream admitted (pipeline)"
+        );
+        self.streams.push(StreamActive {
+            id: task.task_id,
+            slot,
+            group: g,
+            state: StreamState::Prefilling,
+            cancelled: false,
+            cfg,
+            history: Vec::new(),
+            rng: 0,
+            max_new: task.max_tokens.max(1) as usize,
+            started,
+            prefill_s,
+            decode_started: Instant::now(),
+            prompt_len: rows,
+            next: -1,
+            pos: rows,
+            generated: Vec::new(),
+            emitted: 0,
+        });
+        Ok(())
+    }
+
+    /// Rank 0 only, and only while no stream is open: the downstream rank never
+    /// sends unsolicited bytes, so an idle link that reads EOF, an error, or
+    /// data is dead (the neighbour restarted) or out of sync (a reply that
+    /// outlived its aborted stream). Found before admitting, the request that
+    /// would have hit the dead socket is served on a fresh one instead of
+    /// failing; on Linux a send to a peer that closed even succeeds, and the
+    /// failure would only surface on the reply.
+    fn downstream_idle_dead(&self) -> bool {
+        let Some(down) = self.transport.downstream.clone() else {
+            return false;
+        };
+        self.block_on(async {
+            let c = down.lock().await;
+            // Timing out means nothing to read: idle and alive.
+            tokio::time::timeout(Duration::from_millis(1), c.wait_readable())
+                .await
+                .is_ok()
+        })
+    }
+
+    /// Rank 0 only. The downstream link dropped: a neighbour restarted, or the
+    /// connect raced a rank that was exiting. Workers rebuild by exiting for
+    /// their supervisor because their listener accepts exactly once; the
+    /// driver is a client, so it dials again in place and the API stays up
+    /// (requests made while the link is down fail fast with `not connected`).
+    /// Streams still open belonged to the old connection and are aborted with
+    /// an error chunk. Returns true once the link is back.
+    fn redial_downstream(&mut self, out: &mut Vec<(TaskId, Chunk)>) -> bool {
+        let Some(down) = self.transport.downstream.clone() else {
+            return false;
+        };
+        let now = Instant::now();
+        if self.redial_next.is_some_and(|t| now < t) {
+            return false;
+        }
+        self.redial_next = Some(now + REDIAL_INTERVAL);
+        if !self.streams.is_empty() || self.stream_inflight.iter().any(|q| !q.is_empty()) {
+            self.fail_streams_into(out, "downstream link lost; stream aborted".into());
+        }
+        let res = self.block_on(async {
+            let mut c = down.lock().await;
+            c.close().await;
+            c.connect_with_timeout(REDIAL_BUDGET).await
+        });
+        match res {
+            Ok(()) => {
+                info!(rank = self.rank, "downstream link re-dialed; resuming");
+                self.peer_disconnected = false;
+                self.disconnect_reported = false;
+                self.redial_next = None;
+                true
+            }
+            Err(e) => {
+                warn!(rank = self.rank, error = %e, "downstream re-dial failed; retrying");
+                false
+            }
+        }
+    }
+
+    /// Abort every stream (wire or forward failure): error chunks, slots
+    /// freed, in-flight bookkeeping cleared. A wire failure also latches
+    /// `peer_disconnected`; rank 0 then re-dials the downstream rank in place
+    /// on a later step (see [`Self::redial_downstream`]).
+    fn fail_streams_into(&mut self, out: &mut Vec<(TaskId, Chunk)>, msg: String) {
+        if !msg.starts_with("forward panicked") && !msg.contains("stream reply") {
+            self.peer_disconnected = true;
+        }
+        warn!(error = %msg, streams = self.streams.len(), "multi-stream pipeline failed; aborting all streams");
+        for q in &mut self.stream_inflight {
+            q.clear();
+        }
+        for st in self.streams.drain(..) {
+            self.runner.close_stream(st.slot);
+            if !st.cancelled {
+                out.push((st.id.clone(), Chunk::error(st.id, msg.clone())));
+            }
+        }
+    }
+
+    /// Multi-stream single stage: admit up to `stream_admit_per_step` pending
+    /// tasks (prefill each, sample its first token), emit every active
+    /// stream's pending token, retire finished streams, then decode one token
+    /// for all survivors as one batch and sample their next tokens. Each
+    /// `step` therefore yields exactly one `Chunk::token` per active stream —
+    /// the runner fans them out by task id.
+    fn step_streams(&mut self) -> Vec<(TaskId, Chunk)> {
+        if self.total > 1 {
+            return self.step_streams_pipeline();
+        }
+        let mut out: Vec<(TaskId, Chunk)> = Vec::new();
+        let step_started = Instant::now();
+        // ---- admission (prefill-first) ----
+        let mut admitted = 0usize;
+        while admitted < self.stream_admit_per_step
+            && self.streams.len() < self.stream_cap
+            && !self.pending.is_empty()
+        {
+            let task = self.pending.pop_front().expect("non-empty");
+            admitted += 1;
+            match self.admit_stream(task) {
+                Ok(()) => {}
+                Err((id, chunk)) => out.push((id, chunk)),
+            }
+        }
+        if self.streams.is_empty() {
+            return out;
+        }
+        // ---- emission: each stream's pending token, stop checks ----
+        let tok = self
+            .tokenizer
+            .as_ref()
+            .expect("multi-stream step needs a tokenizer");
+        let max_seq = self.runner.max_seq();
+        let eos: Vec<u32> = self.runner.eos_token_ids().to_vec();
+        let arch = self.runner.arch_name();
+        let mut finished: Vec<usize> = Vec::new();
+        for (i, st) in self.streams.iter_mut().enumerate() {
+            let t = st.next as u32;
+            st.generated.push(t);
+            st.history.push(st.next);
+            let full = tok.decode(&st.generated, true).unwrap_or_default();
+            let delta = utf8_safe_delta(&full, &mut st.emitted);
+            let mut c = Chunk::token(st.id.clone(), st.next, delta);
+            c.n_tokens = Some(1);
+            c.token_ids = vec![st.next];
+            out.push((st.id.clone(), c));
+            let n = st.generated.len();
+            let natural_stop = n >= st.max_new || eos.contains(&t);
+            // The cache cannot hold position `max_seq`: stop before forwarding
+            // there (the token sampled at the last in-range position is still
+            // emitted) and report `length`, as the one-task path does.
+            let cap_stop = !natural_stop && st.pos >= max_seq;
+            if natural_stop || cap_stop {
+                let mut chunk = Chunk::final_marker(st.id.clone(), String::new());
+                chunk.n_tokens = Some(0);
+                chunk.prompt_tokens = Some(st.prompt_len as u32);
+                chunk.finish_reason = Some(if cap_stop {
+                    FinishReason::Length
+                } else {
+                    finish_reason_for(n, st.max_new)
+                });
+                out.push((st.id.clone(), chunk));
+                let decode_s = st.decode_started.elapsed().as_secs_f64();
+                let steps = n.saturating_sub(1);
+                info!(
+                    task = %st.id,
+                    tokens = n,
+                    elapsed_s = st.started.elapsed().as_secs_f64(),
+                    prefill_s = st.prefill_s,
+                    decode_s,
+                    decode_steps = steps,
+                    decode_tok_s = if decode_s > 0.0 { steps as f64 / decode_s } else { 0.0 },
+                    "task done ({arch} multi-stream)"
+                );
+                finished.push(i);
+            }
+        }
+        for &i in finished.iter().rev() {
+            let st = self.streams.swap_remove(i);
+            self.runner.close_stream(st.slot);
+            if let Some(down) = self.transport.downstream.clone() {
+                if let Err(e) = self.block_on(send_stream_close(&down, st.slot as u32)) {
+                    warn!(slot = st.slot, "stream close not relayed: {e}");
+                }
+            }
+        }
+        if self.streams.is_empty() {
+            return out;
+        }
+        // ---- decode: one batched forward over every surviving stream ----
+        let hs = self.runner.hidden_size();
+        let slots: Vec<usize> = self.streams.iter().map(|s| s.slot).collect();
+        let mut hidden = Vec::with_capacity(slots.len() * hs);
+        for st in &self.streams {
+            debug_assert_eq!(st.pos, self.runner.stream_pos(st.slot));
+            hidden.extend(self.runner.embed_token(st.next as u32));
+        }
+        let rows = slots.len();
+        let fail_batch = |this: &mut Self, out: &mut Vec<(TaskId, Chunk)>, msg: String| {
+            warn!(error = %msg, streams = rows, "multi-stream forward failed; aborting the batch");
+            for st in this.streams.drain(..) {
+                this.runner.close_stream(st.slot);
+                out.push((st.id.clone(), Chunk::error(st.id, msg.clone())));
+            }
+        };
+        let runner = &mut self.runner;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let h = runner.decode_streams(hidden, &slots);
+            runner.head_logits_rows(&h, rows)
+        }));
+        let logits = match outcome {
+            Ok(l) => l,
+            Err(payload) => {
+                fail_batch(self, &mut out, panic_message(payload));
+                return out;
+            }
+        };
+        let vocab = logits.len() / rows;
+        for (i, st) in self.streams.iter_mut().enumerate() {
+            let l = &logits[i * vocab..(i + 1) * vocab];
+            st.next = crate::sampling::sample(l, &st.history, &st.cfg, &mut st.rng);
+            st.pos += 1;
+        }
+        // ---- aggregate log every ~16 steps ----
+        let (ref mut toks, ref mut wall, ref mut steps) = self.stream_log;
+        *toks += rows as u64;
+        *wall += step_started.elapsed();
+        *steps += 1;
+        if *steps >= 16 {
+            let secs = wall.as_secs_f64();
+            info!(
+                streams = rows,
+                steps = *steps,
+                step_ms = secs * 1e3 / *steps as f64,
+                aggregate_tok_s = if secs > 0.0 { *toks as f64 / secs } else { 0.0 },
+                "{arch} multi-stream decode"
+            );
+            self.stream_log = (0, Duration::ZERO, 0);
+        }
+        out
+    }
+
+    /// Tokenize, prefill and seed one task as a stream. On failure the task's
+    /// terminal chunk is returned instead.
+    #[allow(clippy::result_large_err)]
+    fn admit_stream(&mut self, task: GenerationTask) -> Result<(), (TaskId, Chunk)> {
+        let started = Instant::now();
+        let Some(tok) = self.tokenizer.as_ref() else {
+            let e = Chunk::error(task.task_id.clone(), "engine has no tokenizer".to_string());
+            return Err((task.task_id, e));
+        };
+        let mut prompt_ids: Vec<u32> = match tok.encode(task.prompt.as_str(), true) {
+            Ok(enc) => enc.get_ids().to_vec(),
+            Err(e) => {
+                let c = Chunk::error(
+                    task.task_id.clone(),
+                    format!("tokenizer encode failed: {e}"),
+                );
+                return Err((task.task_id, c));
+            }
+        };
+        if prompt_ids.is_empty() {
+            let c = Chunk::final_marker(task.task_id.clone(), "");
+            return Err((task.task_id, c));
+        }
+        let max_seq = self.runner.max_seq();
+        if prompt_ids.len() > max_seq {
+            warn!(
+                task = %task.task_id,
+                prompt_tokens = prompt_ids.len(),
+                context_budget = max_seq,
+                "prompt exceeds context budget; dropping the tail (newest tokens)"
+            );
+            prompt_ids.truncate(max_seq);
+        }
+        let Some(slot) = self.runner.open_stream() else {
+            // Capacity is checked by the caller; a runner refusing anyway is a bug.
+            let c = Chunk::error(task.task_id.clone(), "no free stream slot".to_string());
+            return Err((task.task_id, c));
+        };
+        let hs = self.runner.hidden_size();
+        let rows = prompt_ids.len();
+        let mut hidden = Vec::with_capacity(rows * hs);
+        for &t in &prompt_ids {
+            hidden.extend(self.runner.embed_token(t));
+        }
+        let cfg = sampling_from_task(&task);
+        let mut rng = crate::sampling::init_rng(cfg.seed);
+        let history: Vec<i64> = Vec::new();
+        let runner = &mut self.runner;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let h = runner.prefill_stream(slot, hidden, rows);
+            runner.head_logits(&h[(rows - 1) * hs..rows * hs])
+        }));
+        let logits = match outcome {
+            Ok(l) => l,
+            Err(payload) => {
+                let msg = panic_message(payload);
+                warn!(task = %task.task_id, error = %msg, "stream prefill failed; task aborted");
+                self.runner.close_stream(slot);
+                return Err((task.task_id.clone(), Chunk::error(task.task_id, msg)));
+            }
+        };
+        let next = crate::sampling::sample(&logits, &history, &cfg, &mut rng);
+        let prefill_s = started.elapsed().as_secs_f64();
+        info!(
+            task = %task.task_id,
+            slot,
+            prompt_tokens = rows,
+            prefill_s,
+            streams = self.streams.len() + 1,
+            "stream admitted"
+        );
+        self.streams.push(StreamActive {
+            id: task.task_id,
+            slot,
+            group: 0,
+            state: StreamState::Ready,
+            cancelled: false,
+            cfg,
+            history,
+            rng,
+            max_new: task.max_tokens.max(1) as usize,
+            started,
+            prefill_s,
+            decode_started: Instant::now(),
+            prompt_len: rows,
+            next,
+            pos: rows,
+            generated: Vec::new(),
+            emitted: 0,
+        });
+        Ok(())
     }
 
     /// Longest cached prompt prefix that is a STRICT prefix of `prompt` (length
@@ -5972,9 +6810,85 @@ impl<R: StagedRunner> PipelineEngine<R> {
             return Vec::new();
         };
         let downstream = self.transport.downstream.clone();
+        // Multi-stream mid rank: frames from upstream and replies from
+        // downstream are independent events — serve whichever is ready, so a
+        // frame for the next group is not stuck behind this group's reply.
+        // The last rank has nothing to relay but waits for its frame the same
+        // way (a peek, without the transport's frame-start idle ceiling): a
+        // pipeline that idles between requests for longer than that ceiling
+        // (900 s by default) must not lose its links and rebuild itself.
+        if self.stream_cap > 0 {
+            let relay = downstream.clone().filter(|_| !self.is_last());
+            {
+                enum Ready {
+                    Up,
+                    Down,
+                }
+                let ready = match relay.as_ref() {
+                    Some(down) => self.block_on(async {
+                        tokio::select! {
+                            r = async { upstream.lock().await.wait_readable().await } => r.map(|_| Ready::Up),
+                            r = async { down.lock().await.wait_readable().await } => r.map(|_| Ready::Down),
+                        }
+                    }),
+                    None => self
+                        .block_on(async { upstream.lock().await.wait_readable().await })
+                        .map(|_| Ready::Up),
+                };
+                match ready {
+                    Ok(Ready::Up) => {}
+                    Ok(Ready::Down) => {
+                        let down = relay.as_ref().expect("Ready::Down only with a downstream");
+                        let res = self.block_on(async {
+                            match recv_kind_client(down).await {
+                                Ok(Some(FrameKind::StreamTokens)) => {
+                                    let (bid, toks) = recv_stream_tokens_body_client(down)
+                                        .await
+                                        .map_err(|e| format!("recv_stream_tokens: {e}"))?;
+                                    send_stream_tokens_upstream(&upstream, bid, &toks)
+                                        .await
+                                        .map_err(|e| format!("relay stream tokens: {e}"))
+                                }
+                                Ok(Some(other)) => Err(format!(
+                                    "expected StreamTokens from downstream, got {other:?}"
+                                )),
+                                Ok(None) => Err("downstream closed".into()),
+                                Err(e) => Err(format!("recv_kind (downstream): {e}")),
+                            }
+                        });
+                        if let Err(e) = res {
+                            warn!("worker reply relay failed: {e}");
+                            self.peer_disconnected = true;
+                        }
+                        return Vec::new();
+                    }
+                    // Upstream not accepted yet (the previous rank has not dialed
+                    // in): fall through to the blocking receive, which retries
+                    // with a backoff exactly as the one-task path does.
+                    Err(cascadia_transport::TransportError::NotConnected) => {}
+                    Err(e) => {
+                        warn!("worker socket closed while idle: {e}");
+                        self.peer_disconnected = true;
+                        return Vec::new();
+                    }
+                }
+            }
+        }
         let kind = match self.block_on(recv_kind_server(&upstream)) {
-            Ok(Some(k)) => k,
+            Ok(Some(k)) => {
+                self.upstream_seen = true;
+                k
+            }
             Ok(None) => {
+                self.peer_disconnected = true;
+                return Vec::new();
+            }
+            Err(e) if worker_recv_failure_is_fatal(&e, self.upstream_seen) => {
+                // The listener accepted exactly once, so nothing reconnects:
+                // latch, and the next step() exits the relay loop for the
+                // supervisor to rebuild this rank (the last rank has no
+                // downstream select to notice the drop any other way).
+                warn!("worker upstream link lost: {e}; exiting for supervisor rebuild");
                 self.peer_disconnected = true;
                 return Vec::new();
             }
@@ -6064,6 +6978,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     Err(format!("recv cache_prefix key: {e}"))
                 }
             },
+            FrameKind::StreamOpen => self.handle_stream_open(&upstream, downstream.as_ref()),
+            FrameKind::StreamDecode => self.handle_stream_decode(&upstream, downstream.as_ref()),
+            FrameKind::StreamClose => self.handle_stream_close(&upstream, downstream.as_ref()),
             other => Err(format!(
                 "worker received unsupported frame {other:?} (dsv4 has no spec-decode batching)"
             )),
@@ -6073,6 +6990,162 @@ impl<R: StagedRunner> PipelineEngine<R> {
             std::thread::sleep(WORKER_BACKOFF);
         }
         Vec::new()
+    }
+
+    // ---- multi-stream pipeline: worker side ------------------------------
+
+    /// A stream frame that names a slot this rank cannot hold is a protocol
+    /// violation (rank 0 and the workers must share `CASCADIA_STREAMS`).
+    fn stream_slot_ok(&mut self, slot: u32) -> Result<usize, String> {
+        let cap = self.runner.stream_capacity();
+        if (slot as usize) < cap {
+            return Ok(slot as usize);
+        }
+        self.peer_disconnected = true;
+        Err(format!(
+            "stream slot {slot} beyond this rank's capacity {cap} (set CASCADIA_STREAMS on every rank)"
+        ))
+    }
+
+    /// `StreamOpen`: open the slot, prefill its prompt rows through my layers;
+    /// the last rank samples the final row with a fresh per-slot sampler and
+    /// replies, a mid relays the rows down and the reply up.
+    fn handle_stream_open(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+    ) -> Result<(), String> {
+        let (batch_id, slot, rows, sampling_cfg, hidden_f32) = self
+            .block_on(recv_stream_open_body_server(upstream))
+            .map_err(|e| format!("recv_stream_open: {e}"))?;
+        let s = self.stream_slot_ok(slot)?;
+        let hs = self.runner.hidden_size();
+        if hidden_f32.len() != rows as usize * hs || rows as usize > self.runner.max_seq() {
+            self.peer_disconnected = true;
+            return Err(format!(
+                "stream open: {} floats for {rows} rows of width {hs}",
+                hidden_f32.len()
+            ));
+        }
+        if !self.runner.open_stream_at(s) {
+            self.peer_disconnected = true;
+            return Err(format!("stream open: slot {s} refused by the runner"));
+        }
+        let hidden = self.runner.prefill_stream(s, hidden_f32, rows as usize);
+        if self.is_last() {
+            let logits = self
+                .runner
+                .head_logits(&hidden[(rows as usize - 1) * hs..rows as usize * hs]);
+            let rng = crate::sampling::init_rng(sampling_cfg.seed);
+            let mut sampler = StreamSampler {
+                cfg: sampling_cfg,
+                history: Vec::new(),
+                rng,
+            };
+            let token =
+                crate::sampling::sample(&logits, &sampler.history, &sampler.cfg, &mut sampler.rng);
+            sampler.history.push(token);
+            self.stream_samplers.insert(s, sampler);
+            self.block_on(send_stream_tokens_upstream(
+                upstream,
+                batch_id,
+                &[(slot, token)],
+            ))
+            .map_err(|e| format!("send_stream_tokens: {e}"))
+        } else {
+            let down = downstream.ok_or("mid rank missing downstream")?;
+            // Send on; the reply comes back through the readiness loop in
+            // `step_worker` and is relayed upstream there.
+            self.block_on(send_stream_open(
+                down,
+                batch_id,
+                slot,
+                &sampling_cfg,
+                &hidden,
+                rows,
+                hs as u32,
+            ))
+            .map_err(|e| format!("send_stream_open: {e}"))
+        }
+    }
+
+    /// `StreamDecode`: one token per listed stream through my layers as one
+    /// batch; the last rank samples each row with its slot's sampler.
+    fn handle_stream_decode(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+    ) -> Result<(), String> {
+        let (batch_id, rows, hidden_f32) = self
+            .block_on(recv_stream_decode_body_server(upstream))
+            .map_err(|e| format!("recv_stream_decode: {e}"))?;
+        let hs = self.runner.hidden_size();
+        if hidden_f32.len() != rows.len() * hs {
+            self.peer_disconnected = true;
+            return Err(format!(
+                "stream decode: {} floats for {} rows of width {hs}",
+                hidden_f32.len(),
+                rows.len()
+            ));
+        }
+        let mut slots = Vec::with_capacity(rows.len());
+        for &(slot, pos) in &rows {
+            let s = self.stream_slot_ok(slot)?;
+            let have = self.runner.stream_pos(s);
+            if have != pos as usize || pos as usize >= self.runner.max_seq() {
+                self.peer_disconnected = true;
+                return Err(format!(
+                    "stream decode: slot {s} at position {have}, frame says {pos} (budget {})",
+                    self.runner.max_seq()
+                ));
+            }
+            slots.push(s);
+        }
+        let hidden = self.runner.decode_streams(hidden_f32, &slots);
+        if self.is_last() {
+            let logits = self.runner.head_logits_rows(&hidden, slots.len());
+            let vocab = logits.len() / slots.len();
+            let mut toks = Vec::with_capacity(slots.len());
+            for (i, &s) in slots.iter().enumerate() {
+                let sampler = self.stream_samplers.get_mut(&s).ok_or_else(|| {
+                    format!("stream decode: slot {s} has no sampler (no StreamOpen seen)")
+                })?;
+                let l = &logits[i * vocab..(i + 1) * vocab];
+                let token =
+                    crate::sampling::sample(l, &sampler.history, &sampler.cfg, &mut sampler.rng);
+                sampler.history.push(token);
+                toks.push((s as u32, token));
+            }
+            self.block_on(send_stream_tokens_upstream(upstream, batch_id, &toks))
+                .map_err(|e| format!("send_stream_tokens: {e}"))
+        } else {
+            let down = downstream.ok_or("mid rank missing downstream")?;
+            self.block_on(send_stream_decode(
+                down, batch_id, &rows, &hidden, hs as u32,
+            ))
+            .map_err(|e| format!("send_stream_decode: {e}"))
+        }
+    }
+
+    /// `StreamClose` (one-way): free the slot here and downstream.
+    fn handle_stream_close(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+    ) -> Result<(), String> {
+        let slot = self
+            .block_on(recv_stream_close_body_server(upstream))
+            .map_err(|e| format!("recv_stream_close: {e}"))?;
+        if (slot as usize) < self.runner.stream_capacity() {
+            self.runner.close_stream(slot as usize);
+            self.stream_samplers.remove(&(slot as usize));
+        }
+        match downstream {
+            Some(down) => self
+                .block_on(send_stream_close(down, slot))
+                .map_err(|e| format!("relay stream close: {e}")),
+            None => Ok(()),
+        }
     }
 
     /// `sample = false` (ForwardNoSample, prefill-intermediate): still run
@@ -6407,15 +7480,67 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
         if self.active.as_ref().is_some_and(|a| &a.id == task_id) {
             self.active = None;
         }
+        if let Some(i) = self.streams.iter().position(|s| &s.id == task_id) {
+            if self.total > 1 {
+                // A pipeline stream may have a frame in flight whose reply names
+                // its slot: keep the bookkeeping until that lands, then retire
+                // it silently at its group's next turn.
+                self.streams[i].cancelled = true;
+            } else {
+                let st = self.streams.swap_remove(i);
+                self.runner.close_stream(st.slot);
+            }
+        }
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
         if self.total <= 1 {
+            if self.stream_cap > 0 {
+                return Ok(self.step_streams());
+            }
             return Ok(self.step_single_stage());
         }
         // step_first handles its own errors terminally (final-marker/error
         // chunk on the driver), so rank 0 never surfaces an Err here.
         if self.rank == 0 {
+            if self.stream_cap > 0 {
+                let mut produced = Vec::new();
+                let idle =
+                    self.streams.is_empty() && self.stream_inflight.iter().all(|q| q.is_empty());
+                if !self.peer_disconnected
+                    && idle
+                    && !self.pending.is_empty()
+                    && self.downstream_idle_dead()
+                {
+                    warn!(
+                        rank = self.rank,
+                        "downstream link found dead while idle; re-dialing"
+                    );
+                    self.peer_disconnected = true;
+                    self.redial_next = None;
+                }
+                if self.peer_disconnected {
+                    // The driver re-dials in place (its neighbour's listener
+                    // accepts a fresh connection once the neighbour is back);
+                    // the one-shot Err below is for drivers that are stepped
+                    // by a relay loop.
+                    self.redial_downstream(&mut produced);
+                }
+                produced.extend(self.step_streams());
+                if produced.is_empty()
+                    && worker_should_report_disconnect(
+                        self.peer_disconnected,
+                        self.disconnect_reported,
+                    )
+                {
+                    // The error chunks went out on the step that failed; now
+                    // hand the relay loop the connection-fatal error so the
+                    // stage is rebuilt (re-dials the downstream rank).
+                    self.disconnect_reported = true;
+                    return Err(EngineError::NotConnected);
+                }
+                return Ok(produced);
+            }
             return Ok(self.step_first());
         }
         // Worker rank. step_worker returns empty once an upstream disconnect (or
@@ -6618,6 +7743,34 @@ mod tests {
         // The Err step() returns on that one report is connection-fatal, so
         // run_relay_loop exits ConnectionFatal.
         assert!(EngineError::NotConnected.is_connection_fatal());
+    }
+
+    /// The last rank has no downstream to select on, so a dropped upstream
+    /// surfaces only through recv_kind_server. NotConnected after the link
+    /// was live must be fatal (the listener never re-accepts, so the worker
+    /// would otherwise spin at the backoff rate forever — seen on a 4-box
+    /// pipeline when a middle rank restarted); the same error before the
+    /// previous rank dialed in is just "keep waiting", and a hard reset is
+    /// fatal either way.
+    #[test]
+    fn worker_recv_failure_fatal_only_after_link_was_live() {
+        use cascadia_transport::TransportError;
+        let reset =
+            || TransportError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert!(!worker_recv_failure_is_fatal(
+            &TransportError::NotConnected,
+            false
+        ));
+        assert!(worker_recv_failure_is_fatal(
+            &TransportError::NotConnected,
+            true
+        ));
+        assert!(!worker_recv_failure_is_fatal(
+            &TransportError::FrameStartTimeout(std::time::Duration::from_secs(1)),
+            true
+        ));
+        assert!(worker_recv_failure_is_fatal(&reset(), false));
+        assert!(worker_recv_failure_is_fatal(&reset(), true));
     }
 
     // -------- batched-prefill reply deadline (regression for the unbounded

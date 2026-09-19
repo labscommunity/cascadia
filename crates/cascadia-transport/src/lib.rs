@@ -912,6 +912,27 @@ impl ActivationServer {
         self.listener = None;
         self.accepted_addr = None;
     }
+
+    /// Wait until at least one byte of the next frame is readable, without
+    /// consuming it (`Err(SocketClosed)` on EOF). Cancel-safe — a relay can
+    /// `select!` this against another socket's readiness and then read the
+    /// frame under the normal calls.
+    pub async fn wait_readable(&self) -> TransportResult<()> {
+        let sock = self.client.as_ref().ok_or(TransportError::NotConnected)?;
+        wait_readable(sock).await
+    }
+}
+
+async fn wait_readable(sock: &TcpStream) -> TransportResult<()> {
+    let mut b = [0u8; 1];
+    loop {
+        match sock.peek(&mut b).await {
+            Ok(0) => return Err(TransportError::SocketClosed),
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 /// TCP client that sends activations to downstream.
@@ -1092,6 +1113,12 @@ impl ActivationClient {
             .with_label_values(&["raw"])
             .inc_by(n as u64);
         Ok(buf)
+    }
+
+    /// See [`ActivationServer::wait_readable`].
+    pub async fn wait_readable(&self) -> TransportResult<()> {
+        let sock = self.sock.as_ref().ok_or(TransportError::NotConnected)?;
+        wait_readable(sock).await
     }
 
     pub async fn close(&mut self) {

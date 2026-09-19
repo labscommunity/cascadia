@@ -127,15 +127,27 @@ impl OvHead {
     /// Logits for one normed, mup-divided hidden state (`x` = `[hidden]`),
     /// sliced to `unpadded_vocab`; `None` to take the Rust head.
     pub fn logits(&self, x: &[f32]) -> Option<Vec<f32>> {
+        self.logits_rows(x, 1)
+    }
+
+    /// [`Self::logits`] for `rows` normed, mup-divided hidden states
+    /// (`xs` = `[rows, hidden]`) in one device call; returns
+    /// `[rows, unpadded_vocab]` or `None` to take the Rust head.
+    pub fn logits_rows(&self, xs: &[f32], rows: usize) -> Option<Vec<f32>> {
         if !self.warm() {
             self.fallbacks.fetch_add(1, Ordering::Relaxed);
             return None;
         }
+        assert!(
+            rows >= 1 && xs.len().is_multiple_of(rows),
+            "OV head: xs/rows shape"
+        );
+        let hidden = xs.len() / rows;
         let t0 = Instant::now();
         let mut g = self.rt.lock().expect("OV head lock");
         let rt = g.as_mut()?;
         let step = rt
-            .set_input("x", DType::F32, &[1, 1, x.len()], f32_bytes(x))
+            .set_input("x", DType::F32, &[1, rows, hidden], f32_bytes(xs))
             .map_err(|e| format!("set_input: {e}"))
             .and_then(|_| rt.infer().map_err(|e| format!("infer: {e}")));
         if let Err(why) = step {
@@ -155,19 +167,23 @@ impl OvHead {
         };
         drop(g);
         let n = bytes.len() / 4;
-        if n < self.unpadded_vocab {
+        if n < rows * self.unpadded_vocab || n % rows != 0 {
             self.mark_failed(&format!(
-                "output {n} logits < unpadded_vocab {}",
+                "output {n} logits for {rows} rows < unpadded_vocab {}",
                 self.unpadded_vocab
             ));
             self.fallbacks.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        let out: Vec<f32> = bytes
-            .chunks_exact(4)
-            .take(self.unpadded_vocab)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let padded = n / rows;
+        let mut out: Vec<f32> = Vec::with_capacity(rows * self.unpadded_vocab);
+        for r in 0..rows {
+            out.extend(
+                bytes[r * padded * 4..(r * padded + self.unpadded_vocab) * 4]
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+            );
+        }
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.call_ns
             .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);

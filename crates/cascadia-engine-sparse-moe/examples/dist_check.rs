@@ -128,6 +128,12 @@ async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
             | FrameKind::ExpertResult => {
                 println!("[server] expert-parallel frames not handled in dist_check — ignoring");
             }
+            FrameKind::StreamOpen
+            | FrameKind::StreamDecode
+            | FrameKind::StreamClose
+            | FrameKind::StreamTokens => {
+                println!("[server] multi-stream frames not handled in dist_check — ignoring");
+            }
         }
     }
     println!("[server] frames processed: {frame_count} (got_reset={got_reset})");
