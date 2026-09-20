@@ -116,3 +116,27 @@ other three IRs on the boxes (008; run.sh now carries the generator). Memory is 
 a fused layer costs 8.3 GB of device memory, a resident CPU layer 7.8 GB, so six fused layers are
 ~55 GB either way; the obstacle is the 8.4 GB host copy the shim makes while compiling each layer,
 which at the sixth layer leaves about 3 GB free. 008 therefore starts on one rank.
+
+## 2026-09-20, iterations 007-008: the iGPU takes every expert layer
+
+007 (overrides only): each rank's three IR layers fused at f16: 45.7 tok/s steady at 264 streams,
+unseen-prompt single stream 2.6-3.0 tok/s, answers 12/12; one gate prompt departs from the CPU
+reference at character 81 with an equivalent phrase (half precision on the device is not
+bit-identical, so an answer-level check joined the gates). Rank 1 showed the second overflow site
+the f16 study had predicted: layer 8's shared expert passes 65504 inside the expert, 2.8 % of its
+fused calls fell back, and the fallbacks filled the CPU cache until the box swapped.
+
+008a/b: why only three layers per box? The kernel lets a driver own half of RAM (ttm pages_limit),
+and the installer generated three IRs to match. But a fused layer (8.3 GB on the device) replaces a
+resident CPU layer (7.8 GB): six fused layers need about the memory the box was already using.
+run.sh now carries the IR generator (one layer at a time, moved into place when complete), raises
+pages_limit for the boot when the overrides ask, and regenerates a layer with attenuated up scales
+(layer 8: x 2^-4, multiplied back on the host; exact on the fixture). One rank first (rank 6:
+169 ms/frame at 14 rows against 230-260 for its neighbours, memory healthy), then all:
+**55.6 tok/s steady at 176 streams, 3.0-3.4 tok/s on unseen prompts, 12.3 tok/s on a memorised
+one**, CPU expert cache 0 MiB on every rank, the 25 W boxes as fast as the 60 W ones. The platform
+power limit stopped mattering the moment the experts left the CPU.
+
+What limits now: rank 0 (its two dense layers still on the CPU: 60 ms of a 230 ms frame, 96.8 %
+busy), swap-ins of driver-owned pages at swappiness 60, and a client-side descriptor limit that made
+every phase above ~250 streams meaningless (the Mac's tunnel agent has 256 descriptors).
