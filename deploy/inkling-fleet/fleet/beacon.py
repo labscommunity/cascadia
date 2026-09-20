@@ -24,10 +24,20 @@ load figures and the worker's latest "stage profile" log line (see
 CASCADIA_STAGE_PROFILE_SECS), so one machine sees where the whole pipeline's
 time goes without a login on the other boxes. Discovery never depends on it.
 
+Rank 0 has two more jobs, because it is the only box anyone outside the LAN can
+reach (its API port) and the box every updater pulls from:
+  * it keeps what all the boxes broadcast in one small JSON file
+    (--telemetry-file), which the worker's API port serves as
+    GET /api/fleet/telemetry;
+  * every 30 s it makes sure the fleet's file server is listening
+    (--file-server-dir/-user/-port) and starts it when it is not.
+Neither can take discovery down: whatever fails there is swallowed.
+
 Same LAN segment only (broadcast does not cross routers), and nothing here is
 authenticated: anyone on the LAN can claim a rank. Fine for a demo network.
 """
 import argparse
+import collections
 import json
 import os
 import re
@@ -39,6 +49,8 @@ import time
 
 MAGIC = "cascadia-inkling-beacon-1"
 TELE_MAGIC = "cascadia-inkling-tele-1"  # load figures: a packet of its own, so it can never break discovery
+TELE_BYTES = TELE_MAGIC.encode()
+TELE_FILE_MAX = 400 * 1000  # bytes: rank 0's aggregate is fetched through a thin tunnel, often
 VIRTUAL = ("lo", "docker", "veth", "br-", "virbr", "tailscale", "wl", "ww", "tun", "wg")
 BEGIN = "# >>> cascadia-inkling fleet (written by beacon.py; do not edit between the markers) >>>"
 END = "# <<< cascadia-inkling fleet <<<"
@@ -348,13 +360,203 @@ def parse(data, fleet):
             if isinstance(m.get("w"), dict):
                 parse.worker[int(m["rank"])] = m["w"]
             return int(m["rank"]), int(m.get("total", 0)), host, str(m.get("id", host))
-    except (ValueError, KeyError, TypeError, UnicodeDecodeError):
-        pass
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError, AttributeError, RecursionError):
+        pass  # AttributeError: valid JSON that is not an object ("[]"); RecursionError: "[[[[..." - anyone can send those
     return None
 
 
 parse.files = {}  # rank -> version of the fleet files its updater has applied (0 = not enrolled)
 parse.worker = {}  # rank -> {"state", "restarts", "phase"} as that box reports it
+
+
+def tele_packet(data, fleet):
+    """The decoded telemetry packet of this fleet, or None for anything else (a discovery packet, noise)."""
+    if TELE_BYTES not in data:
+        return None
+    try:
+        # NaN / Infinity are not JSON: one of them would make rank 0's whole aggregate unreadable to a strict parser.
+        m = json.loads(data.decode(), parse_constant=lambda _: None)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None
+    if isinstance(m, dict) and m.get("magic") == TELE_MAGIC and m.get("fleet") == fleet:
+        return m
+    return None
+
+
+class FleetTelemetry:
+    """Rank 0 only: what every box's telemetry packet said lately, as one JSON file the API port serves.
+
+    The boxes' clocks disagree (by up to a day), so everything also carries "rt": when RANK 0 received it.
+    Per rank: the latest figures, the last static dict, a short ring of samples, and the last distinct stage
+    profiles (a box repeats its latest profile every second until the worker logs a newer one).
+    """
+
+    SYS_RING, PROFS, MAX_RANKS = 12, 30, 64
+
+    def __init__(self, path, fleet):
+        self.path, self.fleet = path, fleet
+        self.ranks = {}
+
+    def add(self, m, src, rt):
+        rank = m.get("rank")
+        if not isinstance(rank, int) or isinstance(rank, bool) or not 0 <= rank < 4096:
+            return
+        e = self.ranks.get(rank)
+        if e is None:
+            if len(self.ranks) >= self.MAX_RANKS:  # nothing on the LAN is authenticated: never grow without bound
+                return
+            e = self.ranks[rank] = {"static": {}, "sys_ring": collections.deque(maxlen=self.SYS_RING),
+                                    "profs": collections.deque(maxlen=self.PROFS)}
+        s = dict(m["sys"]) if isinstance(m.get("sys"), dict) else {}
+        static = s.pop("static", None)  # sent every 15 s only: kept apart so the samples stay small
+        if isinstance(static, dict):
+            e["static"] = static
+        rt = round(rt, 2)
+        t = m.get("t")
+        e.update(host=str(m.get("host", "?"))[:64], ip=src, rt=rt, t=t if isinstance(t, (int, float)) else None, sys=s)
+        e["sys_ring"].append({"rt": rt, "sys": s})
+        prof = m.get("prof")
+        if isinstance(prof, dict) and prof:
+            at = prof.get("at")
+            if at is None:
+                known = any({k: v for k, v in p.items() if k != "rt"} == prof for p in e["profs"])
+            else:
+                known = any(p.get("at") == at for p in e["profs"])
+            if not known:
+                e["profs"].append(dict(prof, rt=rt))
+
+    def document(self, now, extra, ring, profs):
+        ranks = {}
+        for r in sorted(self.ranks):
+            e = self.ranks[r]
+            o = {k: e.get(k) for k in ("host", "ip", "rt", "t", "sys", "static")}
+            o["sys_ring"] = list(e["sys_ring"])[-ring:] if ring else []
+            o["profs"] = list(e["profs"])[-profs:] if profs else []
+            ranks[str(r)] = o
+        doc = {"t": round(now, 2), "fleet": self.fleet, "ranks": ranks}
+        doc.update(extra)
+        return doc
+
+    def write(self, now, extra):
+        """Atomically (tmp + rename). A reader never sees half a file; the file never exceeds TELE_FILE_MAX."""
+        for ring, profs in ((self.SYS_RING, self.PROFS), (6, 15), (3, 8), (1, 3), (1, 1), (0, 0)):
+            data = json.dumps(self.document(now, extra, ring, profs), separators=(",", ":"))
+            if len(data) <= TELE_FILE_MAX:
+                break
+        else:
+            return  # cannot happen with 64 ranks of 2 KB packets; if it does, the last good file stays
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(data)
+        os.chmod(tmp, 0o644)  # the worker that serves it need not be root
+        os.replace(tmp, self.path)
+
+
+def fleet_extra(a, payload, table, fs):
+    """The discovery side of rank 0's aggregate: what each box says its worker is doing, and who was heard when."""
+    clip = lambda v, n: re.sub(r"[^\x20-\x7e]", "?", str(v))[:n]
+    workers = dict(parse.worker)
+    if isinstance(payload.get("w"), dict):
+        workers[a.rank] = payload["w"]  # this box's own, even while it has no address to broadcast from
+    worker = {}
+    for r in sorted(k for k in workers if isinstance(k, int) and 0 <= k < 4096)[:FleetTelemetry.MAX_RANKS]:
+        w = workers[r] if isinstance(workers[r], dict) else {}
+        n = w.get("restarts")
+        worker[str(r)] = {"state": clip(w.get("state", "?"), 32), "restarts": n if isinstance(n, int) else 0,
+                          "phase": clip(w.get("phase", ""), 200)}
+    disc = {}
+    for r in sorted(k for k in table if isinstance(k, int) and 0 <= k < 4096)[:FleetTelemetry.MAX_RANKS]:
+        e = table[r]
+        disc[str(r)] = {"ip": e.get("ip"), "host": clip(e.get("host", "?"), 64), "seen": round(e.get("seen", 0), 2),
+                        "files": parse.files.get(r, 0)}
+    extra = {"worker": worker, "disc": disc}
+    if fs is not None:
+        extra["file_server"] = fs.status()
+    return extra
+
+
+class FileServer:
+    """Rank 0 only: keeps the fleet's file server running (what every box's updater pulls from).
+
+    Nothing else restarts it, and without it no box can be updated any more - including this script. It is
+    `python3 -m http.server`, as the unprivileged owner of the folder, never as root.
+    """
+
+    def __init__(self, directory, user, port):
+        self.dir, self.user, self.port = directory, user, port
+        self.proc = None
+        self.starts, self.last_start, self.listening, self.note = 0, 0.0, None, ""
+
+    def status(self):
+        return {"port": self.port, "listening": self.listening, "starts": self.starts,
+                "last_start": round(self.last_start, 2), "pid": self.proc.pid if self.proc else None, "note": self.note}
+
+    def is_listening(self):
+        try:
+            socket.create_connection(("127.0.0.1", self.port), timeout=1.0).close()
+            return True
+        except OSError:
+            return False
+
+    def say(self, note):
+        if note != self.note:  # once per reason, not every 30 s
+            self.note = note
+            log("file server: " + note)
+
+    def check(self):
+        """Never raises."""
+        try:
+            self._check()
+        except Exception as err:  # noqa: BLE001 - discovery goes on whatever happens here
+            try:
+                self.say("not supervised this round: %s: %s" % (type(err).__name__, err))
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _check(self):
+        if self.proc is not None and self.proc.poll() is not None:
+            self.proc = None  # it ended (and is reaped now)
+        self.listening = self.is_listening()
+        if self.listening:
+            return  # ours or anybody's: never a second one
+        if self.proc is not None:
+            if time.time() - self.last_start < 20:
+                return  # ours is still starting
+            self.proc.kill()  # ours runs but does not listen: replace it
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.SubprocessError:
+                pass
+            self.proc = None
+        if not os.path.isdir(self.dir):
+            return self.say("%s does not exist: nothing to serve" % self.dir)
+        import pwd
+        try:
+            pw = pwd.getpwnam(self.user)
+        except KeyError:
+            return self.say("no user %s on this box: not started" % self.user)
+        cmd = [sys.executable or "python3", "-m", "http.server", str(self.port), "--directory", self.dir, "--bind", "0.0.0.0"]
+        kw = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=self.dir,
+                  start_new_session=True, env=dict(os.environ, HOME=pw.pw_dir, USER=self.user, LOGNAME=self.user))
+        if os.geteuid() == pw.pw_uid:
+            drops = [{}]
+        else:  # user= alone would leave it in root's groups; the second form is for a sandbox that forbids setgroups
+            drops = [{"user": pw.pw_uid, "group": pw.pw_gid, "extra_groups": [pw.pw_gid]}, {"user": pw.pw_uid}]
+        err = None
+        for drop in drops:
+            try:
+                self.proc = subprocess.Popen(cmd, **dict(kw, **drop))
+                break
+            except (OSError, ValueError, TypeError, subprocess.SubprocessError) as e:
+                err = e
+        else:
+            return self.say("cannot start as %s: %s: %s" % (self.user, type(err).__name__, err))
+        self.starts += 1
+        self.last_start = time.time()
+        self.note = ""
+        log("file server: nothing was listening on port %d, started http.server as %s (pid %d) in %s"
+            % (self.port, self.user, self.proc.pid, self.dir))
 
 
 def write_hosts(path, fleet, table):
@@ -514,8 +716,14 @@ def run_service(a):
         pass
     pending = {}  # rank -> (new address, first heard) until it has been stable for a moment
     watched = {a.rank - 1, a.rank, a.rank + 1}
-    last_send = last_state = last_warn = last_worker = last_tele = 0.0
+    last_send = last_state = last_warn = last_worker = last_tele = last_agg = 0.0
     tele = Telemetry()
+    # Rank 0 only: the fleet's telemetry in one file for the API port, and the file server kept alive.
+    agg = FleetTelemetry(a.telemetry_file, a.fleet) if a.rank == 0 and a.telemetry_file else None
+    fs = FileServer(a.file_server_dir, a.file_server_user, a.file_server_port) if a.rank == 0 and a.file_server_dir else None
+    # First look right away: a restart of this service takes a file server it started down with it (systemd stops
+    # the whole control group), and until it is back no box can fetch an update. Then every 30 s.
+    next_fs = time.time() + 1.0
     dirty = bool(table)
     log("beacon for rank %d of %d, fleet %s, UDP %d" % (a.rank, a.total, a.fleet, a.port))
     while True:
@@ -531,11 +739,32 @@ def run_service(a):
         if a.telemetry and now - last_tele >= 1.0:
             last_tele = now
             announce_telemetry(a.port, payload, tele)
+        if fs is not None and now >= next_fs:
+            next_fs = now + 30.0
+            try:
+                fs.check()
+            except Exception:  # noqa: BLE001 - check() swallows everything itself; this is the second lock
+                pass
+        if agg is not None and now - last_agg >= 1.0:
+            last_agg = now
+            try:
+                agg.write(now, fleet_extra(a, payload, table, fs))
+            except Exception:  # noqa: BLE001 - a full /run, a bad value: the next second may work, discovery goes on
+                pass
         r, _, _ = select.select([sock], [], [], 0.5)
         if r:
             try:
                 data, (src, _) = sock.recvfrom(2048)
             except OSError:
+                continue
+            tm = None
+            try:  # telemetry is a packet of its own and handled apart: nothing in it can break discovery
+                tm = tele_packet(data, a.fleet)
+                if tm is not None and agg is not None:
+                    agg.add(tm, src, time.time())
+            except Exception:  # noqa: BLE001
+                pass
+            if tm is not None:
                 continue
             m = parse(data, a.fleet)
             if not m:
@@ -606,6 +835,12 @@ def main():
     ap.add_argument("--top", action="store_true", help="live load of every box until Ctrl-C")
     ap.add_argument("--record", default="", help="append every box's load figures to this file as JSON lines for --wait seconds")
     ap.add_argument("--no-telemetry", dest="telemetry", action="store_false", help="service: announce the rank only")
+    ap.add_argument("--telemetry-file", default="/run/cascadia-inkling/telemetry.json",
+                    help="rank 0: every box's latest telemetry as one JSON file, rewritten once a second ('' = none)")
+    ap.add_argument("--file-server-dir", default="/home/devcloud/inkling-files",
+                    help="rank 0: folder the fleet's file server serves; it is started when nothing listens ('' = leave it alone)")
+    ap.add_argument("--file-server-user", default="devcloud", help="rank 0: the file server runs as this user, never as root")
+    ap.add_argument("--file-server-port", type=int, default=8088)
     a = ap.parse_args()
     if a.top or a.record:
         return run_watch(a)
