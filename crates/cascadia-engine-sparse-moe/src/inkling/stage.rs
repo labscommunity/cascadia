@@ -6,6 +6,7 @@
 //! [`crate::engine::PipelineEngine`] drives it exactly like glm5 / dsv4.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::ep::EpClient;
@@ -62,6 +63,18 @@ pub struct InklingRunner {
     pub total: u32,
     pub lo: usize,
     pub hi: usize,
+    /// Per-layer branch clocks for the stage profile; `None` until
+    /// [`StagedRunner::enable_profile`].
+    profile: Option<Arc<ProfileClocks>>,
+}
+
+/// Decode / prefill time per branch, summed over this rank's layers.
+#[derive(Default)]
+struct ProfileClocks {
+    decode_attn_ns: AtomicU64,
+    decode_mlp_ns: AtomicU64,
+    prefill_attn_ns: AtomicU64,
+    prefill_mlp_ns: AtomicU64,
 }
 
 impl InklingRunner {
@@ -167,6 +180,7 @@ impl InklingRunner {
             total,
             lo,
             hi,
+            profile: None,
         })
     }
 }
@@ -262,6 +276,49 @@ impl StagedRunner for InklingRunner {
     }
 
     // ---- multi-stream decode ---------------------------------------------
+    fn enable_profile(&mut self) {
+        if self.profile.is_some() {
+            return;
+        }
+        let clocks = Arc::new(ProfileClocks::default());
+        for l in &mut self.layers {
+            let c = Arc::clone(&clocks);
+            l.set_timing_observer(Some(Arc::new(move |t: super::model::LayerTiming| {
+                let (attn, mlp) = if t.prefill {
+                    (&c.prefill_attn_ns, &c.prefill_mlp_ns)
+                } else {
+                    (&c.decode_attn_ns, &c.decode_mlp_ns)
+                };
+                attn.fetch_add(t.attention.as_nanos() as u64, Ordering::Relaxed);
+                mlp.fetch_add(t.mlp.as_nanos() as u64, Ordering::Relaxed);
+            })));
+        }
+        self.profile = Some(clocks);
+    }
+    fn profile(&self) -> Option<crate::staged::RunnerProfile> {
+        let c = self.profile.as_ref()?;
+        let cache = self.expert_cache_stats_total();
+        let attn = self
+            .layers
+            .iter()
+            .find_map(|l| l.ov_attn())
+            .map(|o| o.stats());
+        let head = self.head.as_ref().and_then(|h| h.ov()).map(|o| o.stats());
+        Some(crate::staged::RunnerProfile {
+            decode_attn_ns: c.decode_attn_ns.load(Ordering::Relaxed),
+            decode_mlp_ns: c.decode_mlp_ns.load(Ordering::Relaxed),
+            prefill_attn_ns: c.prefill_attn_ns.load(Ordering::Relaxed),
+            prefill_mlp_ns: c.prefill_mlp_ns.load(Ordering::Relaxed),
+            cache_hits: cache.hits,
+            cache_misses: cache.misses,
+            cache_retained_mib: (cache.retained_bytes >> 20) as u64,
+            cache_capacity_mib: (cache.capacity_bytes >> 20) as u64,
+            ov_attn_calls: attn.map_or(0, |a| a.calls),
+            ov_attn_ns: attn.map_or(0, |a| a.call_ns),
+            ov_head_calls: head.map_or(0, |h| h.calls),
+            ov_head_ns: head.map_or(0, |h| h.call_ns),
+        })
+    }
     fn stream_capacity(&self) -> usize {
         self.streams.len()
     }

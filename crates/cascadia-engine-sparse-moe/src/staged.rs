@@ -30,6 +30,30 @@ impl GenTiming {
     }
 }
 
+/// What a runner measured about its own layers, for the stage profile the
+/// pipeline engine logs (`CASCADIA_STAGE_PROFILE_SECS`). Cumulative since
+/// [`StagedRunner::enable_profile`], except the `_mib` gauges.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunnerProfile {
+    /// Decode steps: attention branch / MLP branch, summed over my layers.
+    pub decode_attn_ns: u64,
+    pub decode_mlp_ns: u64,
+    /// Prefill blocks: the same split.
+    pub prefill_attn_ns: u64,
+    pub prefill_mlp_ns: u64,
+    /// Expert cache: lookups served from RAM / read from the model files.
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_retained_mib: u64,
+    pub cache_capacity_mib: u64,
+    /// Offloaded attention projections and output head (OpenVINO), inside the
+    /// attention / head time above.
+    pub ov_attn_calls: u64,
+    pub ov_attn_ns: u64,
+    pub ov_head_calls: u64,
+    pub ov_head_ns: u64,
+}
+
 pub trait StagedRunner: Send + 'static {
     /// Short backend name for log lines (`"dsv4"`, `"glm5"`).
     fn arch_name(&self) -> &'static str;
@@ -156,6 +180,16 @@ pub trait StagedRunner: Send + 'static {
     /// advances every listed slot by one. A slot appears at most once.
     fn decode_streams(&mut self, _hidden: Vec<f32>, _slots: &[usize]) -> Vec<f32> {
         unimplemented!("this runner does not batch streams")
+    }
+
+    /// Start collecting the runner-side counters [`Self::profile`] reports.
+    /// Off until called (the per-layer clocks cost two `Instant::now` each).
+    fn enable_profile(&mut self) {}
+
+    /// Runner-side counters for the engine's periodic stage profile; `None`
+    /// when the runner keeps none. All fields but the gauges are cumulative.
+    fn profile(&self) -> Option<RunnerProfile> {
+        None
     }
 
     /// Distributed KV-prefix cache hooks (pipeline prefix reuse). Default:

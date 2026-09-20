@@ -5371,6 +5371,8 @@ pub struct PipelineEngine<R: StagedRunner> {
     /// Aggregate-throughput window: tokens emitted and wall time since the
     /// last multi-stream log line.
     stream_log: (u64, Duration, u64),
+    /// Per-window time account of this rank (`CASCADIA_STAGE_PROFILE_SECS`).
+    stage_profile: Option<StageProfile>,
 }
 
 /// One task inside the multi-stream single-stage scheduler: its slot in the
@@ -5389,6 +5391,158 @@ struct StreamInFlight {
     /// Slots in row order (one for a `StreamOpen`).
     slots: Vec<usize>,
     open: bool,
+    sent_at: Instant,
+}
+
+/// Where a multi-stream pipeline rank's wall time goes, logged once per
+/// window while frames flow (`CASCADIA_STAGE_PROFILE_SECS=<n>`; unset or 0 =
+/// off). A pipeline runs at the pace of its slowest stage, and from outside
+/// every rank looks equally "busy serving": this is how to tell the rank that
+/// computes all the time from the ranks that wait for it, and compute from
+/// I/O (expert cache misses) from the wire.
+///
+/// `wait` is time blocked with nothing to do: a worker on its sockets, rank 0
+/// on the reply of the group whose turn it is. `round trip` (rank 0) is frame
+/// sent to reply read, i.e. the ring's latency under load, which exceeds the
+/// ranks' summed compute by whatever the frame spent queued behind other
+/// groups' frames and the reply spent behind a busy mid rank.
+struct StageProfile {
+    every: Duration,
+    since: Instant,
+    wait: Duration,
+    recv: Duration,
+    compute: Duration,
+    max_compute: Duration,
+    prefill: Duration,
+    head: Duration,
+    send: Duration,
+    relay: Duration,
+    emit: Duration,
+    round_trip: Duration,
+    max_round_trip: Duration,
+    frames: u64,
+    rows: u64,
+    opens: u64,
+    open_rows: u64,
+    relays: u64,
+    replies: u64,
+    runner: crate::staged::RunnerProfile,
+}
+
+impl StageProfile {
+    fn from_env() -> Option<Self> {
+        let secs = std::env::var("CASCADIA_STAGE_PROFILE_SECS")
+            .ok()?
+            .parse::<u64>()
+            .ok()
+            .filter(|&s| s > 0)?;
+        Some(Self::new(Duration::from_secs(secs)))
+    }
+
+    fn new(every: Duration) -> Self {
+        Self {
+            every,
+            since: Instant::now(),
+            wait: Duration::ZERO,
+            recv: Duration::ZERO,
+            compute: Duration::ZERO,
+            max_compute: Duration::ZERO,
+            prefill: Duration::ZERO,
+            head: Duration::ZERO,
+            send: Duration::ZERO,
+            relay: Duration::ZERO,
+            emit: Duration::ZERO,
+            round_trip: Duration::ZERO,
+            max_round_trip: Duration::ZERO,
+            frames: 0,
+            rows: 0,
+            opens: 0,
+            open_rows: 0,
+            relays: 0,
+            replies: 0,
+            runner: crate::staged::RunnerProfile::default(),
+        }
+    }
+
+    /// A wait longer than a window is the pipeline idling between requests,
+    /// not a stage waiting for work: start the window over after it.
+    fn waited(&mut self, d: Duration) {
+        if d >= self.every && self.frames + self.opens + self.relays == 0 {
+            self.restart();
+        } else {
+            self.wait += d;
+        }
+    }
+
+    fn decoded(&mut self, rows: usize, compute: Duration) {
+        self.frames += 1;
+        self.rows += rows as u64;
+        self.compute += compute;
+        self.max_compute = self.max_compute.max(compute);
+    }
+
+    fn replied(&mut self, round_trip: Duration) {
+        self.replies += 1;
+        self.round_trip += round_trip;
+        self.max_round_trip = self.max_round_trip.max(round_trip);
+    }
+
+    fn restart(&mut self) {
+        let runner = self.runner;
+        *self = Self::new(self.every);
+        self.runner = runner;
+    }
+
+    fn flush(&mut self, rank: u32, total: u32, now: Option<crate::staged::RunnerProfile>) {
+        let window = self.since.elapsed();
+        if window < self.every {
+            return;
+        }
+        let now = now.unwrap_or_default();
+        let was = self.runner;
+        self.runner = now;
+        if self.frames + self.opens + self.relays == 0 {
+            self.restart();
+            return;
+        }
+        let ms = |d: Duration| (d.as_secs_f64() * 1e3).round() as u64;
+        let ns_ms = |a: u64, b: u64| a.saturating_sub(b) / 1_000_000;
+        info!(
+            rank,
+            total,
+            window_ms = ms(window),
+            frames = self.frames,
+            rows = self.rows,
+            opens = self.opens,
+            open_rows = self.open_rows,
+            wait_ms = ms(self.wait),
+            recv_ms = ms(self.recv),
+            compute_ms = ms(self.compute),
+            max_compute_ms = ms(self.max_compute),
+            prefill_ms = ms(self.prefill),
+            head_ms = ms(self.head),
+            send_ms = ms(self.send),
+            relay_ms = ms(self.relay),
+            relays = self.relays,
+            emit_ms = ms(self.emit),
+            replies = self.replies,
+            round_trip_ms = ms(self.round_trip),
+            max_round_trip_ms = ms(self.max_round_trip),
+            attn_ms = ns_ms(now.decode_attn_ns, was.decode_attn_ns),
+            mlp_ms = ns_ms(now.decode_mlp_ns, was.decode_mlp_ns),
+            prefill_attn_ms = ns_ms(now.prefill_attn_ns, was.prefill_attn_ns),
+            prefill_mlp_ms = ns_ms(now.prefill_mlp_ns, was.prefill_mlp_ns),
+            ov_attn_ms = ns_ms(now.ov_attn_ns, was.ov_attn_ns),
+            ov_attn_calls = now.ov_attn_calls.saturating_sub(was.ov_attn_calls),
+            ov_head_ms = ns_ms(now.ov_head_ns, was.ov_head_ns),
+            cache_hits = now.cache_hits.saturating_sub(was.cache_hits),
+            cache_misses = now.cache_misses.saturating_sub(was.cache_misses),
+            cache_mib = now.cache_retained_mib,
+            cache_cap_mib = now.cache_capacity_mib,
+            "stage profile"
+        );
+        self.restart();
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -5501,6 +5655,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             stream_step: 0,
             stream_admit_per_step: 1,
             stream_log: (0, Duration::ZERO, 0),
+            stage_profile: None,
         }
     }
 
@@ -5531,6 +5686,10 @@ impl<R: StagedRunner> PipelineEngine<R> {
             .min(self.stream_cap)
             .max(1);
         self.stream_inflight = (0..self.stream_groups).map(|_| VecDeque::new()).collect();
+        self.stage_profile = StageProfile::from_env();
+        if self.stage_profile.is_some() {
+            self.runner.enable_profile();
+        }
         info!(
             streams = self.stream_cap,
             admit_per_step = self.stream_admit_per_step,
@@ -5657,6 +5816,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             } else {
                 Self::reply_deadline() * groups as u32
             };
+            let wait_started = Instant::now();
             let (bid, toks) = match self.block_on(recv_stream_tokens_reply(&down, deadline)) {
                 Ok(r) => r,
                 Err(e) => {
@@ -5664,6 +5824,10 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     return false;
                 }
             };
+            if let Some(p) = self.stage_profile.as_mut() {
+                p.wait += wait_started.elapsed();
+                p.replied(f.sent_at.elapsed());
+            }
             if bid != f.batch_id || toks.len() != f.slots.len() {
                 let msg = format!(
                     "stream reply mismatch: batch {bid} vs {}, {} rows vs {}",
@@ -5697,11 +5861,22 @@ impl<R: StagedRunner> PipelineEngine<R> {
         {
             let task = self.pending.pop_front().expect("non-empty");
             admitted += 1;
-            if let Err((id, chunk)) = self.admit_stream_pipeline(task, g, &down) {
-                out.push((id, chunk));
+            let admit_started = Instant::now();
+            let prompt_rows = match self.admit_stream_pipeline(task, g, &down) {
+                Ok(rows) => rows,
+                Err((id, chunk)) => {
+                    out.push((id, chunk));
+                    0
+                }
+            };
+            if let Some(p) = self.stage_profile.as_mut() {
+                p.opens += 1;
+                p.open_rows += prompt_rows as u64;
+                p.prefill += admit_started.elapsed();
             }
         }
         // ---- 3. emission for this group's ready streams ----
+        let emit_started = Instant::now();
         let tok = self
             .tokenizer
             .as_ref()
@@ -5769,9 +5944,14 @@ impl<R: StagedRunner> PipelineEngine<R> {
             .filter(|(_, st)| st.group == g && st.state == StreamState::Ready)
             .map(|(i, _)| i)
             .collect();
+        if let Some(p) = self.stage_profile.as_mut() {
+            p.emit += emit_started.elapsed();
+        }
         if rows_idx.is_empty() {
+            self.flush_stage_profile();
             return true;
         }
+        let compute_started = Instant::now();
         let hs = self.runner.hidden_size();
         let slots: Vec<usize> = rows_idx.iter().map(|&i| self.streams[i].slot).collect();
         let wire_rows: Vec<(u32, u32)> = rows_idx
@@ -5797,11 +5977,16 @@ impl<R: StagedRunner> PipelineEngine<R> {
         };
         self.stream_batch_seq = self.stream_batch_seq.wrapping_add(1);
         let batch_id = self.stream_batch_seq;
+        let send_started = Instant::now();
         if let Err(e) = self.block_on(send_stream_decode(
             &down, batch_id, &wire_rows, &h, hs as u32,
         )) {
             self.fail_streams_into(out, format!("send_stream_decode: {e}"));
             return false;
+        }
+        if let Some(p) = self.stage_profile.as_mut() {
+            p.decoded(rows_idx.len(), send_started - compute_started);
+            p.send += send_started.elapsed();
         }
         for &i in &rows_idx {
             self.streams[i].state = StreamState::InFlight;
@@ -5810,6 +5995,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             batch_id,
             slots,
             open: false,
+            sent_at: Instant::now(),
         });
         // ---- aggregate log ----
         let rows = rows_idx.len();
@@ -5829,7 +6015,16 @@ impl<R: StagedRunner> PipelineEngine<R> {
             );
             self.stream_log = (0, Duration::ZERO, 0);
         }
+        self.flush_stage_profile();
         true
+    }
+
+    fn flush_stage_profile(&mut self) {
+        if let Some(p) = self.stage_profile.as_mut() {
+            if p.since.elapsed() >= p.every {
+                p.flush(self.rank, self.total, self.runner.profile());
+            }
+        }
     }
 
     /// Pipeline admission: tokenize, take a slot, run my layers over the
@@ -5841,7 +6036,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         task: GenerationTask,
         g: usize,
         down: &Arc<TokioMutex<ActivationClient>>,
-    ) -> Result<(), (TaskId, Chunk)> {
+    ) -> Result<usize, (TaskId, Chunk)> {
         let started = Instant::now();
         let Some(tok) = self.tokenizer.as_ref() else {
             let e = Chunk::error(task.task_id.clone(), "engine has no tokenizer".to_string());
@@ -5918,6 +6113,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             batch_id,
             slots: vec![slot],
             open: true,
+            sent_at: Instant::now(),
         });
         let prefill_s = started.elapsed().as_secs_f64();
         info!(
@@ -5948,7 +6144,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             generated: Vec::new(),
             emitted: 0,
         });
-        Ok(())
+        Ok(rows)
     }
 
     /// Rank 0 only, and only while no stream is open: the downstream rank never
@@ -6914,6 +7110,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     Up,
                     Down,
                 }
+                let wait_started = Instant::now();
                 let ready = match relay.as_ref() {
                     Some(down) => self.block_on(async {
                         tokio::select! {
@@ -6925,9 +7122,13 @@ impl<R: StagedRunner> PipelineEngine<R> {
                         .block_on(async { upstream.lock().await.wait_readable().await })
                         .map(|_| Ready::Up),
                 };
+                if let Some(p) = self.stage_profile.as_mut() {
+                    p.waited(wait_started.elapsed());
+                }
                 match ready {
                     Ok(Ready::Up) => {}
                     Ok(Ready::Down) => {
+                        let relay_started = Instant::now();
                         let down = relay.as_ref().expect("Ready::Down only with a downstream");
                         let res = self.block_on(async {
                             match recv_kind_client(down).await {
@@ -6950,6 +7151,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
                             warn!("worker reply relay failed: {e}");
                             self.peer_disconnected = true;
                         }
+                        if let Some(p) = self.stage_profile.as_mut() {
+                            p.relays += 1;
+                            p.relay += relay_started.elapsed();
+                        }
+                        self.flush_stage_profile();
                         return Vec::new();
                     }
                     // Upstream not accepted yet (the previous rank has not dialed
@@ -7079,6 +7285,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             warn!("worker frame failed: {e}");
             std::thread::sleep(WORKER_BACKOFF);
         }
+        self.flush_stage_profile();
         Vec::new()
     }
 
@@ -7105,9 +7312,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
         upstream: &Arc<TokioMutex<ActivationServer>>,
         downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
     ) -> Result<(), String> {
+        let recv_started = Instant::now();
         let (batch_id, slot, rows, sampling_cfg, hidden_f32) = self
             .block_on(recv_stream_open_body_server(upstream))
             .map_err(|e| format!("recv_stream_open: {e}"))?;
+        let received = Instant::now();
         let s = self.stream_slot_ok(slot)?;
         let hs = self.runner.hidden_size();
         if hidden_f32.len() != rows as usize * hs || rows as usize > self.runner.max_seq() {
@@ -7122,6 +7331,13 @@ impl<R: StagedRunner> PipelineEngine<R> {
             return Err(format!("stream open: slot {s} refused by the runner"));
         }
         let hidden = self.runner.prefill_stream(s, hidden_f32, rows as usize);
+        let computed = Instant::now();
+        if let Some(p) = self.stage_profile.as_mut() {
+            p.opens += 1;
+            p.open_rows += rows as u64;
+            p.recv += received - recv_started;
+            p.prefill += computed - received;
+        }
         if self.is_last() {
             let logits = self
                 .runner
@@ -7136,26 +7352,38 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 crate::sampling::sample(&logits, &sampler.history, &sampler.cfg, &mut sampler.rng);
             sampler.history.push(token);
             self.stream_samplers.insert(s, sampler);
-            self.block_on(send_stream_tokens_upstream(
-                upstream,
-                batch_id,
-                &[(slot, token)],
-            ))
-            .map_err(|e| format!("send_stream_tokens: {e}"))
+            let send_started = Instant::now();
+            let sent = self
+                .block_on(send_stream_tokens_upstream(
+                    upstream,
+                    batch_id,
+                    &[(slot, token)],
+                ))
+                .map_err(|e| format!("send_stream_tokens: {e}"));
+            if let Some(p) = self.stage_profile.as_mut() {
+                p.head += send_started - computed;
+                p.send += send_started.elapsed();
+            }
+            sent
         } else {
             let down = downstream.ok_or("mid rank missing downstream")?;
             // Send on; the reply comes back through the readiness loop in
             // `step_worker` and is relayed upstream there.
-            self.block_on(send_stream_open(
-                down,
-                batch_id,
-                slot,
-                &sampling_cfg,
-                &hidden,
-                rows,
-                hs as u32,
-            ))
-            .map_err(|e| format!("send_stream_open: {e}"))
+            let sent = self
+                .block_on(send_stream_open(
+                    down,
+                    batch_id,
+                    slot,
+                    &sampling_cfg,
+                    &hidden,
+                    rows,
+                    hs as u32,
+                ))
+                .map_err(|e| format!("send_stream_open: {e}"));
+            if let Some(p) = self.stage_profile.as_mut() {
+                p.send += computed.elapsed();
+            }
+            sent
         }
     }
 
@@ -7166,9 +7394,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
         upstream: &Arc<TokioMutex<ActivationServer>>,
         downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
     ) -> Result<(), String> {
+        let recv_started = Instant::now();
         let (batch_id, rows, hidden_f32) = self
             .block_on(recv_stream_decode_body_server(upstream))
             .map_err(|e| format!("recv_stream_decode: {e}"))?;
+        let received = Instant::now();
         let hs = self.runner.hidden_size();
         if hidden_f32.len() != rows.len() * hs {
             self.peer_disconnected = true;
@@ -7192,6 +7422,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
             slots.push(s);
         }
         let hidden = self.runner.decode_streams(hidden_f32, &slots);
+        let computed = Instant::now();
+        if let Some(p) = self.stage_profile.as_mut() {
+            p.recv += received - recv_started;
+            p.decoded(slots.len(), computed - received);
+        }
         if self.is_last() {
             let logits = self.runner.head_logits_rows(&hidden, slots.len());
             let vocab = logits.len() / slots.len();
@@ -7206,14 +7441,26 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 sampler.history.push(token);
                 toks.push((s as u32, token));
             }
-            self.block_on(send_stream_tokens_upstream(upstream, batch_id, &toks))
-                .map_err(|e| format!("send_stream_tokens: {e}"))
+            let send_started = Instant::now();
+            let sent = self
+                .block_on(send_stream_tokens_upstream(upstream, batch_id, &toks))
+                .map_err(|e| format!("send_stream_tokens: {e}"));
+            if let Some(p) = self.stage_profile.as_mut() {
+                p.head += send_started - computed;
+                p.send += send_started.elapsed();
+            }
+            sent
         } else {
             let down = downstream.ok_or("mid rank missing downstream")?;
-            self.block_on(send_stream_decode(
-                down, batch_id, &rows, &hidden, hs as u32,
-            ))
-            .map_err(|e| format!("send_stream_decode: {e}"))
+            let sent = self
+                .block_on(send_stream_decode(
+                    down, batch_id, &rows, &hidden, hs as u32,
+                ))
+                .map_err(|e| format!("send_stream_decode: {e}"));
+            if let Some(p) = self.stage_profile.as_mut() {
+                p.send += computed.elapsed();
+            }
+            sent
         }
     }
 
@@ -7836,6 +8083,36 @@ mod tests {
     /// relay loop — exactly once — so run_relay_loop exits and systemd
     /// rebuilds the stage instead of backing off Ok(empty) forever. The Err
     /// step() emits (EngineError::NotConnected) must be recognized as fatal.
+    #[test]
+    fn stage_profile_counts_work_and_drops_idle_gaps() {
+        let mut p = StageProfile::new(Duration::from_millis(50));
+        // Idle between requests: a wait longer than the window, nothing done yet.
+        p.waited(Duration::from_secs(300));
+        assert_eq!(p.wait, Duration::ZERO, "an idle gap is not stage wait time");
+        p.waited(Duration::from_millis(7));
+        p.decoded(3, Duration::from_millis(20));
+        p.decoded(1, Duration::from_millis(30));
+        p.replied(Duration::from_millis(400));
+        assert_eq!((p.frames, p.rows, p.replies), (2, 4, 1));
+        assert_eq!(p.compute, Duration::from_millis(50));
+        assert_eq!(p.max_compute, Duration::from_millis(30));
+        assert_eq!(p.wait, Duration::from_millis(7));
+        // A long wait in a window that already has work is real waiting.
+        p.waited(Duration::from_millis(60));
+        assert_eq!(p.wait, Duration::from_millis(67));
+        // Not due yet: nothing is reset.
+        p.flush(1, 3, None);
+        assert_eq!(p.frames, 2);
+        std::thread::sleep(Duration::from_millis(60));
+        let runner = crate::staged::RunnerProfile {
+            decode_mlp_ns: 5_000_000,
+            ..Default::default()
+        };
+        p.flush(1, 3, Some(runner));
+        assert_eq!((p.frames, p.rows, p.wait), (0, 0, Duration::ZERO));
+        assert_eq!(p.runner, runner, "the next window reports deltas from here");
+    }
+
     #[test]
     fn worker_disconnect_reports_fatal_once() {
         // Connected: nothing to report.
