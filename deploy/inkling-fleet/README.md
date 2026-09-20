@@ -17,10 +17,9 @@ install and keep it the same for every box.
 ## Per box (about 10 minutes, mostly copying)
 
 1. Plug the SSD in. Decide the box's rank (0–10): rank 0 is the box clients
-   talk to, and rank r sends to rank r+1, so give each box a different rank.
-   If the boxes already have their addresses and `fleet.env` lists them (see
-   "Addresses"), use `auto` instead of a number and the installer takes the
-   rank from the box's address.
+   talk to, and rank r sends to rank r+1, so give each box a different rank
+   (a sticker on the box helps). Addresses do not matter: the boxes find each
+   other, see "Addresses".
 2. **Ubuntu** (24.04 or newer; the installer checks that the binary starts
    before it does anything slow):
    ```
@@ -69,24 +68,32 @@ The installer later finds the address already there and keeps it.
 
 ## Addresses
 
-**The boxes already have fixed addresses:** put them in `fleet.env` as
-`IP_0` … `IP_10`, in rank order, before the first install (`apply-update.sh`
-takes them as arguments). The installer then leaves the network alone, and
-`install.sh auto` takes the rank from the address. If `fleet.env` does not
-match, the installer stops at once and says so rather than rewrite a port
-that someone configured: on Ubuntu Desktop an address set in Settings lives in
-its own NetworkManager profile, only one profile runs per port, and the
-installer's could take its place.
+Nothing to configure. Every box runs a small beacon next to its rank: once a
+second it announces "rank N is here" on the wired LAN, and it keeps the names
+`inkling-rank-0` … `inkling-rank-10` current in a marked block of
+`/etc/hosts`. Ranks dial each other by those names, so the boxes can keep
+whatever addresses they have (DHCP included), the installer never touches the
+network, and an address that changes is followed within a few seconds (the
+ranks on either side of it restart once). All boxes must be on one LAN segment,
+i.e. one switch: broadcast does not cross routers.
 
-**The boxes have no fixed addresses yet:** `fleet.env` assigns
-`192.168.50.10 + rank` to each box's wired port (the one with link). Where that port holds a DHCP lease the address is added next to
-DHCP; on a switch with no DHCP server an Ubuntu box's port becomes static
-only, because a "DHCP + static" profile does not stay up there (to undo:
-remove `/etc/netplan/60-cascadia-inkling.yaml`, then `sudo netplan apply`).
-Windows keeps DHCP on either way. Change the addresses there before
-installing if the venue's network is different, or install with `--no-net` /
-`-NoNet` and set addresses yourself; the `NEXT` line in each box's `rank.env`
-must point at the next rank.
+Who is where, from any box (or any laptop on that switch with Python 3):
+
+```
+python3 /opt/cascadia-inkling/beacon.py --show        # or <ssd>/inkling-deploy/fleet/beacon.py --show
+```
+
+It lists every rank with its current address and host name, prints rank 0's
+API address, and says so loudly if two boxes were installed with the same rank
+(re-run the installer with the right number on one of them). On a fleet box the
+API is also simply `http://inkling-rank-0:8000`.
+
+Fixed addresses instead: set `DISCOVER=0` in `fleet.env` and list the boxes'
+addresses as `IP_0` … `IP_10` in rank order (`apply-update.sh` takes them as
+arguments). A box that already holds its address is left alone and
+`install.sh auto` takes the rank from it; a box without any fixed address gets
+its `IP_<rank>` added to the wired port that has link; a port that has some
+*other* fixed address makes the installer stop rather than rewrite it.
 
 ## What runs where
 
@@ -102,10 +109,11 @@ must point at the next rank.
 
 ## Showing throughput
 
-From any box on the network (Python 3):
+From any box of the fleet (from another machine, use rank 0's address as
+`beacon.py --show` prints it):
 
 ```
-python3 inkling-deploy/bench.py http://192.168.50.10:8000 --streams 16 --tokens 64
+python3 inkling-deploy/bench.py http://inkling-rank-0:8000 --streams 16 --tokens 64
 ```
 
 prints per-stream tokens/s, time to first token and the aggregate
@@ -122,6 +130,10 @@ requests the pipeline serves; raise it on every box together.
 - A rank that is far slower than the others is swapping (`status.sh` says
   so): lower `FUSED_LAYERS_LINUX` in `fleet.env` by one and run the installer
   on that box again.
+- A rank that keeps logging `still waiting for downstream peer`: the next rank
+  is not installed or not running yet, or is not on the same switch
+  (`beacon.py --show` on both boxes tells which). If a firewall is on
+  (`sudo ufw status`), the installer opens the fleet's ports itself.
 - Re-running the installer is safe; it skips what is already done. It
   restarts that box's rank; the ranks behind rank 0 then restart once under
   their supervisors (about five seconds plus load time) and rank 0 reconnects

@@ -10,3 +10,7 @@ if [ "$RANK" = 0 ]; then
   echo "api: $(curl -s -m 3 http://127.0.0.1:8000/v1/models | head -c 120)"
 fi
 free -g | awk 'NR==2 {r="ram: used " $3 " GB, available " $7 " GB"} NR==3 {print r ", swap used " $3 " GB" ($3 > 1 ? "  <-- swapping: this rank will be very slow; lower FUSED_LAYERS_LINUX in fleet.env and re-run the installer" : "")}'
+if [ -f "$PREFIX/beacon.py" ]; then
+  echo "fleet (as heard on the LAN; beacon: $(systemctl is-active cascadia-inkling-beacon.service 2>/dev/null)):"
+  python3 "$PREFIX/beacon.py" --show --wait 2 --fleet "${FLEET:-inkling}" --port "${BEACON_PORT:-9099}" || true
+fi

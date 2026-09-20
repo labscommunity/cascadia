@@ -1,13 +1,14 @@
 #!/bin/bash
 # Apply this update to the Inkling deployment SSD. Run on a Linux box with the SSD mounted (it is ext4):
-#     ./apply-update.sh /media/$USER/<ssd> [number of boxes, default 11] [address of rank 0] [of rank 1] ...
-# Give the addresses when the boxes already have theirs (one per box, in rank order: rank 0 is the box clients
-# talk to, rank r sends to rank r+1). Without them fleet.env keeps the addresses it has.
-# <ssd> is the folder that holds inkling-deploy/ and inkling/. Adds and replaces files under inkling-deploy/,
-# and sets the fleet size in fleet.env (your address edits are kept; the old file is saved next to it).
-# The model export and everything else on the SSD are left alone.
+#     sudo ./apply-update.sh /media/$USER/<ssd> [number of boxes, default 11]
+# <ssd> is the folder that holds inkling-deploy/ and inkling/. Adds and replaces files under inkling-deploy/ and
+# rewrites fleet.env for that many boxes with address discovery on (the old file is saved next to it). The model
+# export and everything else on the SSD are left alone.
+#
+# Fixed addresses instead of discovery: add them, one per box in rank order (rank r sends to rank r+1):
+#     sudo ./apply-update.sh /media/$USER/<ssd> 11 10.0.0.21 10.0.0.22 ... (11 addresses)
 set -euo pipefail
-SSD="${1:?usage: $0 /path/to/ssd [number of boxes] [addresses in rank order]}"; TOTAL="${2:-11}"; shift; [ $# -gt 0 ] && shift; IPS=("$@")
+SSD="${1:?usage: $0 /path/to/ssd [number of boxes] [fixed addresses in rank order]}"; TOTAL="${2:-11}"; shift; [ $# -gt 0 ] && shift; IPS=("$@")
 HERE="$(cd "$(dirname "$0")" && pwd)"; D="$SSD/inkling-deploy"
 [ -f "$D/install.sh" ] || { echo "no inkling-deploy/install.sh under $SSD - is this the SSD's top folder?"; exit 1; }
 [ -f "$SSD/inkling/out/manifest.json" ] || { echo "no inkling/out/manifest.json under $SSD - is this the SSD's top folder?"; exit 1; }
@@ -23,39 +24,41 @@ fi
 
 # 1. files
 cd "$HERE/inkling-deploy"
-find . -type f | sort | while read -r f; do mkdir -p "$D/$(dirname "$f")"; cp -p "$f" "$D/$f"; done
-chmod +x "$D/install.sh" "$D/serve.py" "$D/bin/linux/cascadia" "$D/fleet/"*.sh
+find . -type f ! -name fleet.env.template | sort | while read -r f; do mkdir -p "$D/$(dirname "$f")"; cp -p "$f" "$D/$f"; done
+chmod +x "$D/install.sh" "$D/serve.py" "$D/bin/linux/cascadia" "$D/fleet/"*.sh "$D/fleet/beacon.py"
 
-# 2. fleet size (addresses already in the file are kept)
+# 2. fleet.env: the current template, with this fleet's size and the settings the old file carried
 F="$D/fleet.env"; cp -p "$F" "$F.before-update"
-sed -i -E "s/^TOTAL=.*/TOTAL=$TOTAL/; s/^FUSED_LAYERS_LINUX=.*/FUSED_LAYERS_LINUX=3/" "$F"
-grep -q '^TOTAL=' "$F" || echo "TOTAL=$TOTAL" >> "$F"
-for n in $(seq "$TOTAL" 64); do sed -i "/^IP_${n}=/d" "$F"; done
-# the old note above FUSED_LAYERS_LINUX suggested raising it; replace it with what is now known
-python3 - "$F" <<'PY'
-import sys,re
-p=sys.argv[1]; s=open(p).read()
-note=("# Fused MoE layers the iGPU takes per box, at most (each is 8.3 GB of unified\n"
-      "# memory; the rest of the rank's layers stay on the CPU at 7.7 GB each). The\n"
-      "# iGPU can use half of RAM, so 3 on a 64 GB box, and the Ubuntu installer caps\n"
-      "# this by the box's RAM anyway. If status.sh shows a box swapping, lower this\n"
-      "# and re-run the installer there.\n")
-s2=re.sub(r"(?:^#[^\n]*\n)+(?=FUSED_LAYERS_LINUX=)", note, s, count=1, flags=re.M) if re.search(r"^# Fused MoE layers", s, flags=re.M) else s
-open(p,'w').write(s2)
+python3 - "$F" "$HERE/inkling-deploy/fleet.env.template" "$TOTAL" "${IPS[@]}" <<'PY'
+import re, sys
+path, template, total, ips = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4:]
+old = dict(re.findall(r"^([A-Za-z_0-9]+)=(.*)$", open(path).read(), flags=re.M))
+text = open(template).read()
+keep = ["RELAY_PORT", "STREAMS", "MAX_SEQ", "FLEET", "BEACON_PORT", "FUSED_LAYERS_WINDOWS"]
+values = {k: old[k].strip() for k in keep if k in old}
+values["TOTAL"] = str(total)
+values["DISCOVER"] = "0" if ips else "1"
+for k, v in values.items():
+    text = re.sub(r"^%s=.*$" % k, "%s=%s" % (k, v), text, flags=re.M)
+addr = [ips[n] if ips else old.get("IP_%d" % n, "192.168.50.%d" % (10 + n)).strip() for n in range(total)]
+block = "".join("IP_%d=%s\n" % (n, a) for n, a in enumerate(addr))
+text = re.sub(r"(?:^IP_\d+=.*\n)+", block, text, count=1, flags=re.M)
+open(path, "w").write(text)
 PY
-for n in $(seq 0 $((TOTAL-1))); do grep -q "^IP_${n}=" "$F" || sed -i "/^RELAY_PORT=/a IP_${n}=192.168.50.$((10+n))" "$F"; done
-for n in $(seq 0 $((TOTAL-1))); do grep -q "^IP_${n}=" "$F" || echo "IP_${n}=192.168.50.$((10+n))" >> "$F"; done
-if [ ${#IPS[@]} -gt 0 ]; then for n in $(seq 0 $((TOTAL-1))); do sed -i "s/^IP_${n}=.*/IP_${n}=${IPS[$n]}/" "$F"; done; fi
 sync
 
 # 3. verify
 bad=0
-while read -r f; do cmp -s "$f" "$D/$f" || { echo "MISMATCH: $f"; bad=1; }; done < <(find . -type f | sort)
+while read -r f; do cmp -s "$f" "$D/$f" || { echo "MISMATCH: $f"; bad=1; }; done < <(find . -type f ! -name fleet.env.template | sort)
 [ $bad = 0 ] || { echo "the copy did not verify - run this again"; exit 1; }
-"$D/bin/linux/cascadia" --version > /dev/null 2>&1 && echo "binary runs on this machine: $("$D/bin/linux/cascadia" --version)" || echo "(the binary was not test-run here: it needs the OpenVINO runtime that each box's installer sets up; the installer tests it)"
-echo "update applied and verified: $(find . -type f | wc -l | tr -d ' ') files"
+echo "update applied and verified: $(find . -type f ! -name fleet.env.template | wc -l | tr -d ' ') files"
 LO_L=$((LAYERS / TOTAL)); HI_L=$(( (LAYERS + TOTAL - 1) / TOTAL ))
 echo "fleet: $TOTAL boxes, $( [ $LO_L = $HI_L ] && echo $LO_L || echo "$LO_L or $HI_L" ) of $LAYERS layers each; ranks 0..$((TOTAL-1))"
-grep -E '^(TOTAL|IP_|FUSED_LAYERS_LINUX)' "$F" | tr '\n' ' '; echo
-if [ ${#IPS[@]} -gt 0 ]; then echo "install each box with:  sudo <ssd>/inkling-deploy/install.sh auto     (takes the rank from the box's address; the network is left alone)"
-else echo "install each box with:  sudo <ssd>/inkling-deploy/install.sh <rank>"; echo "(boxes that already have fixed addresses: run this script again with the addresses, see the top of this file)"; fi
+if [ ${#IPS[@]} -gt 0 ]; then
+  echo "addresses: fixed ($(grep -E '^IP_' "$F" | tr '\n' ' '))"
+  echo "install each box with:  sudo <ssd>/inkling-deploy/install.sh auto     (takes the rank from the box's address)"
+else
+  echo "addresses: discovered on the LAN (the boxes may use DHCP and their addresses may change; all on one switch)"
+  echo "install each box with:  sudo <ssd>/inkling-deploy/install.sh <rank>   (a different number 0..$((TOTAL-1)) on every box; rank 0 is the one clients talk to)"
+  echo "who is where, any time: python3 <ssd>/inkling-deploy/fleet/beacon.py --show"
+fi
