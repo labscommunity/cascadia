@@ -5383,6 +5383,18 @@ pub struct PipelineEngine<R: StagedRunner> {
     /// Speculation counters since start: frames guessed, guesses confirmed,
     /// guesses refuted (each costs a rewind).
     spec_stats: (u64, u64, u64),
+    /// Direct reply link (`CASCADIA_STREAMS_RETURN_PORT`): the last rank
+    /// listens, rank 0 dials `CASCADIA_STREAMS_RETURN_HOST`, and token replies
+    /// skip the ranks in between. A mid rank forwards a reply only between
+    /// two of its own frames, so a relayed reply waits at every busy rank on
+    /// its way up: with 11 frames in flight that stretched rank 0's group turn
+    /// to about twice a stage time.
+    return_cli: Option<Arc<TokioMutex<ActivationClient>>>,
+    return_srv: Option<Arc<TokioMutex<ActivationServer>>>,
+    /// Rank 0: the return link is connected to the chain as it is now.
+    return_ready: bool,
+    /// Last rank: rank 0's connection has been accepted.
+    return_accepted: bool,
 }
 
 /// One task inside the multi-stream single-stage scheduler: its slot in the
@@ -5755,6 +5767,10 @@ impl<R: StagedRunner> PipelineEngine<R> {
             stage_profile: None,
             stream_spec_depth: None,
             spec_stats: (0, 0, 0),
+            return_cli: None,
+            return_srv: None,
+            return_ready: false,
+            return_accepted: false,
         }
     }
 
@@ -5796,6 +5812,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 .unwrap_or(self.total.max(2) as usize - 1)
                 .min(crate::inkling::DEFAULT_REWIND - 1)
         });
+        self.setup_return_link();
         self.stage_profile = StageProfile::from_env();
         if self.stage_profile.is_some() {
             self.runner.enable_profile();
@@ -5932,9 +5949,18 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 Self::reply_deadline() * groups as u32
             };
             let wait_started = Instant::now();
-            let (bid, toks) = match self.block_on(recv_stream_tokens_reply(&down, deadline)) {
+            let replies = match self.reply_link(&down) {
+                Ok(l) => l,
+                Err(e) => {
+                    self.fail_streams_into(out, e);
+                    return false;
+                }
+            };
+            let (bid, toks) = match self.block_on(recv_stream_tokens_reply(&replies, deadline)) {
                 Ok(r) => r,
                 Err(e) => {
+                    self.return_ready = false;
+                    self.peer_disconnected = true;
                     self.fail_streams_into(out, e);
                     return false;
                 }
@@ -6363,6 +6389,124 @@ impl<R: StagedRunner> PipelineEngine<R> {
         Ok(rows)
     }
 
+    /// Configure the direct reply link from the environment (see `return_cli`).
+    /// The last rank binds its listener here; rank 0 only records where to
+    /// dial and connects before it next admits a stream.
+    fn setup_return_link(&mut self) {
+        let Some(port) = std::env::var("CASCADIA_STREAMS_RETURN_PORT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u16>().ok())
+            .filter(|&p| p > 0)
+        else {
+            return;
+        };
+        if self.total <= 2 {
+            return; // rank 1 already answers rank 0 directly
+        }
+        if self.rank == 0 {
+            match std::env::var("CASCADIA_STREAMS_RETURN_HOST") {
+                Ok(host) if !host.trim().is_empty() => {
+                    info!(host = %host.trim(), port, "token replies come back on a direct link");
+                    self.return_cli = Some(Arc::new(TokioMutex::new(ActivationClient::new(
+                        host.trim().to_string(),
+                        port,
+                    ))));
+                }
+                _ => warn!(
+                    "CASCADIA_STREAMS_RETURN_PORT set without CASCADIA_STREAMS_RETURN_HOST on \
+                     rank 0; replies stay on the relay path"
+                ),
+            }
+        } else if self.is_last() {
+            let mut srv = ActivationServer::new("0.0.0.0", port);
+            match self.block_on(srv.start()) {
+                Ok(()) => {
+                    info!(port, "token replies go to rank 0 on a direct link");
+                    self.return_srv = Some(Arc::new(TokioMutex::new(srv)));
+                }
+                Err(e) => {
+                    // Rank 0 will wait for this port: a rank that cannot open
+                    // it must not pretend to serve.
+                    warn!(
+                        port,
+                        "return link listener failed: {e}; exiting for supervisor"
+                    );
+                    self.peer_disconnected = true;
+                }
+            }
+        }
+    }
+
+    /// Rank 0: the link replies are read from, connecting the direct one first
+    /// if it is configured and not connected to the present chain.
+    fn reply_link(
+        &mut self,
+        down: &Arc<TokioMutex<ActivationClient>>,
+    ) -> Result<Arc<TokioMutex<ActivationClient>>, String> {
+        let Some(ret) = self.return_cli.clone() else {
+            return Ok(down.clone());
+        };
+        if !self.return_ready {
+            let res = self.block_on(async {
+                let mut c = ret.lock().await;
+                c.close().await;
+                c.connect_with_timeout(Duration::from_secs(30)).await
+            });
+            if let Err(e) = res {
+                self.peer_disconnected = true;
+                return Err(format!("return link to the last rank: {e}"));
+            }
+            self.return_ready = true;
+        }
+        Ok(ret)
+    }
+
+    /// Last rank: send a reply on the direct link when configured (accepting
+    /// rank 0's connection first), else up the relay path.
+    fn send_tokens_reply(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        batch_id: u32,
+        toks: &[(u32, i64)],
+    ) -> Result<(), String> {
+        let Some(ret) = self.return_srv.clone() else {
+            return self
+                .block_on(send_stream_tokens_upstream(upstream, batch_id, toks))
+                .map_err(|e| format!("send_stream_tokens: {e}"));
+        };
+        if !self.return_accepted {
+            let accepted = self.block_on(async {
+                tokio::time::timeout(Duration::from_secs(60), async {
+                    ret.lock().await.accept().await
+                })
+                .await
+            });
+            match accepted {
+                Ok(Ok(())) => self.return_accepted = true,
+                Ok(Err(e)) => {
+                    self.peer_disconnected = true;
+                    return Err(format!("return link accept: {e}"));
+                }
+                Err(_) => {
+                    self.peer_disconnected = true;
+                    return Err("return link: rank 0 did not dial in within 60 s".into());
+                }
+            }
+        }
+        let sent = self
+            .block_on(send_stream_tokens_upstream(&ret, batch_id, toks))
+            .map_err(|e| format!("send_stream_tokens (return link): {e}"));
+        if sent.is_err() {
+            self.peer_disconnected = true; // rebuild the chain: rank 0 re-dials the new last rank
+        }
+        sent
+    }
+
+    /// Rank 0: token replies are arriving on the direct return link.
+    pub fn return_link_active(&self) -> bool {
+        self.return_cli.is_some() && self.return_ready
+    }
+
     /// `(guesses sent, confirmed, refuted)` by the speculation path since start.
     pub fn speculation_stats(&self) -> (u64, u64, u64) {
         self.spec_stats
@@ -6417,9 +6561,18 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     Self::reply_deadline() * groups
                 };
                 let wait_started = Instant::now();
-                let (bid, toks) = match self.block_on(recv_stream_tokens_reply(&down, deadline)) {
-                    Ok(r) => r,
+                let replies = match self.reply_link(&down) {
+                    Ok(l) => l,
                     Err(e) => return self.fail_streams_into(out, e),
+                };
+                let (bid, toks) = match self.block_on(recv_stream_tokens_reply(&replies, deadline))
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.return_ready = false;
+                        self.peer_disconnected = true;
+                        return self.fail_streams_into(out, e);
+                    }
                 };
                 if let Some(p) = self.stage_profile.as_mut() {
                     p.wait += wait_started.elapsed();
@@ -6442,9 +6595,17 @@ impl<R: StagedRunner> PipelineEngine<R> {
         while let Some(front) = self.streams[0].spec.front().map(|r| r.batch_id) {
             let wait_started = Instant::now();
             let deadline = Self::reply_deadline() * groups;
-            let (bid, toks) = match self.block_on(recv_stream_tokens_reply(&down, deadline)) {
-                Ok(r) => r,
+            let replies = match self.reply_link(&down) {
+                Ok(l) => l,
                 Err(e) => return self.fail_streams_into(out, e),
+            };
+            let (bid, toks) = match self.block_on(recv_stream_tokens_reply(&replies, deadline)) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.return_ready = false;
+                    self.peer_disconnected = true;
+                    return self.fail_streams_into(out, e);
+                }
             };
             if bid != front || toks.len() != 1 || toks[0].0 as usize != slot {
                 let msg = format!("stream reply mismatch: batch {bid} vs {front} (speculation)");
@@ -6615,7 +6776,14 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let groups = self.stream_groups.max(1) as u32;
         while self.streams[0].spec.pop_front().is_some() {
             let deadline = Self::reply_deadline() * groups;
-            if let Err(e) = self.block_on(recv_stream_tokens_reply(down, deadline)) {
+            let replies = match self.reply_link(down) {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!("speculation: {e}");
+                    break;
+                }
+            };
+            if let Err(e) = self.block_on(recv_stream_tokens_reply(&replies, deadline)) {
                 warn!("speculation: reply to a dropped frame not read: {e}");
                 self.peer_disconnected = true;
                 break;
@@ -6822,6 +6990,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         match res {
             Ok(()) => {
                 info!(rank = self.rank, "downstream link re-dialed; resuming");
+                self.return_ready = false; // the last rank behind it is a new process
                 self.peer_disconnected = false;
                 self.disconnect_reported = false;
                 self.redial_next = None;
@@ -8055,13 +8224,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             sampler.history.push(token);
             self.stream_samplers.insert(s, sampler);
             let send_started = Instant::now();
-            let sent = self
-                .block_on(send_stream_tokens_upstream(
-                    upstream,
-                    batch_id,
-                    &[(slot, token)],
-                ))
-                .map_err(|e| format!("send_stream_tokens: {e}"));
+            let sent = self.send_tokens_reply(upstream, batch_id, &[(slot, token)]);
             if let Some(p) = self.stage_profile.as_mut() {
                 p.head += send_started - computed;
                 p.send += send_started.elapsed();
@@ -8158,9 +8321,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 toks.push((s as u32, token));
             }
             let send_started = Instant::now();
-            let sent = self
-                .block_on(send_stream_tokens_upstream(upstream, batch_id, &toks))
-                .map_err(|e| format!("send_stream_tokens: {e}"));
+            let sent = self.send_tokens_reply(upstream, batch_id, &toks);
             if let Some(p) = self.stage_profile.as_mut() {
                 p.head += send_started - computed;
                 p.send += send_started.elapsed();
@@ -8596,6 +8757,9 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
                 self.link_busy
                     .fetch_max(1, std::sync::atomic::Ordering::SeqCst);
                 let epoch = self.link_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                if epoch != self.seen_link_epoch {
+                    self.return_ready = false; // the keeper re-dialed: a new chain behind it
+                }
                 if self.peer_disconnected && epoch != self.seen_link_epoch {
                     // The link keeper re-dialed after this failure was latched.
                     self.peer_disconnected = false;
