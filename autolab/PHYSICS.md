@@ -158,3 +158,43 @@ same size as expert parallelism and without re-sharding anything. Where the gap 
    nobody expects to be right would be free to read at once.
 
 None of this was visible while the doc claimed the bus was saturated at 62 GB/s.
+
+## Where the weights live decides how many memory buses serve one token (2026-09-20, the user's question)
+
+"Eleven boxes with everything in RAM only slightly outperform one box for a single stream: why?" Because of how the
+weights are PARTITIONED, not how they are encoded. The fleet's RAM is 78 % full (535 GB of 690 GB), so every layout
+is a partition (each weight stored once); the partitions differ in how many boxes can work on one token's layer.
+
+One token reads 27.1 GB, in 66 strictly sequential layers; inside a layer the eight experts are independent of each
+other. One box alone reads most of that from RAM and the cold experts from NVMe: ~1.1 tok/s. The fleet, cut BY LAYER
+(six layers per box), reads all of it from RAM but still through one memory system at a time: 466 ms = 2.1 tok/s
+before speculation. **Pipeline parallelism multiplies throughput (65 tok/s, ~30x one box); for one stream it is
+one PTL box that never misses RAM.** Speculation is how the idle ten boxes were put to work on a lone stream so far.
+
+The three ways to cut the same bytes (lone row, measured kernel rates, this LAN: 1 GbE, 0.25 ms round trip, a hidden
+state is 12.3 kB at f16):
+
+| cut | boxes reading one token's layer | network per layer | expert part of a layer | trip | multi-stream wire cap | output |
+|---|---|---|---|---|---|---|
+| by layer (today) | 1 | none (1 hop per 6 layers) | 3.6 ms | 466 ms | none (65 tok/s compute-bound) | exact |
+| by expert: each box holds 1/11 of every layer's 256 experts (+ the two shared ones everywhere, 4.2 GB) | ~5.5 of 11 (two of the six routed experts share a box in 81 % of layers) | 74 kB out, 74 kB back | ~1.9 ms | ~360 ms (-23 %) | ~150 tok/s | exact |
+| by slice: every expert's 3072 inner neurons cut in 11 (slices of 288/192, multiples of the 32-weight groups); every box holds a slice of all 16,512 experts and returns ONE summed vector per layer | 11 of 11, perfectly balanced, independent of routing | 12 kB to ten boxes (123 kB unicast, 12 kB if multicast), 123 kB back | 1.5-2.0 ms | ~350 ms (-25 %) | ~53 tok/s | not bit-identical (the sum order changes) |
+
+On THIS LAN both cuts land at about -25 %, because 1.2 of the ~1.9 ms is the 1 GbE port pushing six to ten copies
+of a 12 kB vector out and as many back. What the same cuts would give as the other terms move:
+
+| | trip | prose (a = 0.42) | structured (a = 0.78) |
+|---|---|---|---|
+| today | 466 ms | 3.4 tok/s | 8 |
+| + weights cut inside the layer, this 1 GbE | ~350 | 4.4 | 10 |
+| + GPU paths at the rate the head already shows (call fusion, rank 0's dense kernel) | ~290 | 5.2 | 12 |
+| + a faster fabric (2.5 GbE dongles, or Thunderbolt between boxes: 0.1 ms, 20 Gb/s) | ~230 | 6.4 | 14 |
+| + int4 attention (attention on the driving box is then the floor: 66 x 0.7 ms) | ~180 | 8 | 17 |
+
+The floor of the whole idea: 27.1 GB / (11 x 100 GB/s) = 25 ms if all buses always worked, plus one network exchange
+per sequential layer (66 x >= 0.4 ms): ~50-60 ms, 16-20 tok/s before speculation. Nothing on 1 GbE gets near it.
+
+Encoding (fewer bytes per token) is the other axis, and it is independent of the cut: experts at ~3 bits instead of
+4.6 (-25 to -35 % of 16.8 GB; needs a new export of 522 GB, calibration data, and an iGPU kernel that does not
+exist in OpenVINO), attention at int4 (-4.3 GB). Both change the numerics. Entropy-coding int4 (3.5 bits of entropy)
+cannot be decoded at 100 GB/s. Skipping low-weight experts or inactive neurons is lossy.
