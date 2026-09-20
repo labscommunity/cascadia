@@ -443,6 +443,14 @@ def cmd_run(a):
 
 
 def main():
+    try:  # macOS gives a process 256 descriptors: phases of more than ~250 streams lost the rest to "connection reset"
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = 8192 if hard == resource.RLIM_INFINITY else min(8192, hard)
+        if soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+    except (ImportError, ValueError, OSError):
+        pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("status"); s.add_argument("--log", action="store_true"); s.set_defaults(fn=cmd_status)
