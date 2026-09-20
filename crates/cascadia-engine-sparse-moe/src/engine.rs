@@ -5387,6 +5387,8 @@ pub struct PipelineEngine<R: StagedRunner> {
     /// Speculation counters since start: frames guessed, guesses confirmed,
     /// guesses refuted (each costs a rewind).
     spec_stats: (u64, u64, u64),
+    /// What finished requests taught the drafter (speculation only).
+    shared_ngrams: Arc<std::sync::Mutex<crate::ngram_draft::SharedNgrams>>,
     /// Direct reply link (`CASCADIA_STREAMS_RETURN_PORT`): the last rank
     /// listens, rank 0 dials `CASCADIA_STREAMS_RETURN_HOST`, and token replies
     /// skip the ranks in between. A mid rank forwards a reply only between
@@ -5788,6 +5790,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
             stage_profile: None,
             stream_spec_depth: None,
             spec_stats: (0, 0, 0),
+            shared_ngrams: Arc::new(std::sync::Mutex::new(
+                crate::ngram_draft::SharedNgrams::default(),
+            )),
             batched_admissions: 0,
             return_cli: None,
             return_srv: None,
@@ -6138,6 +6143,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         }
         for &i in finished.iter().rev() {
             let st = self.streams.swap_remove(i);
+            self.learn_from(&st);
             self.runner.close_stream(st.slot);
             if let Err(e) = self.block_on(send_stream_close(&down, st.slot as u32)) {
                 warn!(slot = st.slot, "stream close not relayed: {e}");
@@ -6372,7 +6378,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
             let group = (0..counts.len()).min_by_key(|&i| counts[i]).unwrap_or(0);
             counts[group] += 1;
             let draft = self.stream_spec_depth.map(|_| {
-                let mut d = crate::ngram_draft::Draft::new().with_draft_k(1);
+                let mut d = crate::ngram_draft::Draft::new()
+                    .with_draft_k(1)
+                    .with_shared(self.shared_ngrams.clone());
                 let ids: Vec<i64> = ids.iter().map(|&t| t as i64).collect();
                 d.warm_with_prompt(&ids);
                 d
@@ -6479,7 +6487,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // A prompt longer than one window goes down as `StreamFeed` windows:
         // the first here, the rest one per group turn (`feed_stream_window`).
         let draft = self.stream_spec_depth.map(|_| {
-            let mut d = crate::ngram_draft::Draft::new().with_draft_k(1);
+            let mut d = crate::ngram_draft::Draft::new()
+                .with_draft_k(1)
+                .with_shared(self.shared_ngrams.clone());
             let ids: Vec<i64> = prompt_ids.iter().map(|&t| t as i64).collect();
             d.warm_with_prompt(&ids);
             d
@@ -6997,11 +7007,24 @@ impl<R: StagedRunner> PipelineEngine<R> {
             }
         }
         let st = self.streams.swap_remove(0);
+        self.learn_from(&st);
         self.runner.close_stream(st.slot);
         if let Err(e) = self.block_on(send_stream_close(down, st.slot as u32)) {
             warn!(slot = st.slot, "stream close not relayed: {e}");
         }
         self.note_link_busy();
+    }
+
+    /// A finished stream's prompt and output go into the shared drafter table
+    /// (its history may carry a speculated tail past them: not learned).
+    fn learn_from(&self, st: &StreamActive) {
+        let Some(d) = st.draft.as_ref() else {
+            return;
+        };
+        let n = (st.prompt_len + st.generated.len()).min(d.history().len());
+        if let Ok(mut shared) = self.shared_ngrams.lock() {
+            shared.learn(&d.history()[..n]);
+        }
     }
 
     /// One decode frame of the speculating stream: `input` at `pos` through my

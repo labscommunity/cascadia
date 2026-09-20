@@ -88,7 +88,7 @@ pub fn init_thread_pool() {
 pub use engine::{SparseMoEBuilder, SparseMoEBuilderConfig, SparseMoEEngine};
 pub use kv_prefix_cache::{KvPrefixCache, KvSnapshot, LayerKvSlice, ModelFingerprint};
 pub use manifest::Manifest;
-pub use ngram_draft::{Draft, DEFAULT_DRAFT_K, MAX_NGRAM, MIN_NGRAM};
+pub use ngram_draft::{Draft, SharedNgrams, DEFAULT_DRAFT_K, MAX_NGRAM, MIN_NGRAM};
 pub use ov_moe::{GenStats, OvMoeError, OvMoeRunner};
 pub use runner::{Runner, RunnerError, RunnerOptions};
 pub use sampling::SamplingConfig;

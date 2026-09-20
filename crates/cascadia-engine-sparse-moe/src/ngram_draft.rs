@@ -51,6 +51,103 @@ pub const MAX_NGRAM: usize = 4;
 /// override per task via [`Draft::with_draft_k`].
 pub const DEFAULT_DRAFT_K: usize = 8;
 
+/// What every request so far has taught about "which token follows these":
+/// a backoff table over 3-, 2- and 1-token contexts with counts, shared by all
+/// streams of a process ([`Draft::with_shared`]). A request's own prompt and
+/// output are the best guide when they repeat; this answers the rest of the
+/// time, which is most of the time for a reasoning model whose stock phrases
+/// ("The user is asking for ...") recur across requests but not within one.
+///
+/// A pipeline that speculates on a lone stream pays about half a stage time
+/// for a wrong guess and saves ten stage times with a right one, so a guess is
+/// worth sending when it is right more than about one time in twenty
+/// ([`SharedNgrams::MIN_CONFIDENCE`] asks for one in eight to leave a margin).
+#[derive(Debug, Default)]
+pub struct SharedNgrams {
+    /// Context (1..=3 tokens, FNV-hashed with its length) -> followers seen.
+    table: HashMap<u64, Followers>,
+}
+
+/// The most frequent followers of one context (a handful is enough: only the
+/// top one is ever proposed) and how often the context was seen at all.
+#[derive(Debug, Default, Clone)]
+struct Followers {
+    seen: u32,
+    top: Vec<(i64, u32)>,
+}
+
+impl SharedNgrams {
+    /// Longest shared context. Longer contexts live in the per-request table.
+    pub const MAX_CONTEXT: usize = 3;
+    /// Followers remembered per context.
+    const KEEP: usize = 4;
+    /// Contexts remembered; past this the table stops learning new ones (the
+    /// common ones are in by then) rather than grow without bound.
+    const MAX_CONTEXTS: usize = 2_000_000;
+    /// A shared guess is proposed only if its follower was seen in at least
+    /// this share of the context's occurrences...
+    pub const MIN_CONFIDENCE: f32 = 0.125;
+    /// ...and the context at least this often.
+    const MIN_SEEN: u32 = 2;
+
+    fn key(ctx: &[i64]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ ctx.len() as u64;
+        for &t in ctx {
+            for b in t.to_le_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h
+    }
+
+    /// Learn from a finished sequence (prompt followed by output).
+    pub fn learn(&mut self, tokens: &[i64]) {
+        for i in 1..tokens.len() {
+            let next = tokens[i];
+            for k in 1..=Self::MAX_CONTEXT.min(i) {
+                let key = Self::key(&tokens[i - k..i]);
+                if !self.table.contains_key(&key) && self.table.len() >= Self::MAX_CONTEXTS {
+                    continue;
+                }
+                let f = self.table.entry(key).or_default();
+                f.seen = f.seen.saturating_add(1);
+                if let Some(i) = f.top.iter().position(|(t, _)| *t == next) {
+                    f.top[i].1 = f.top[i].1.saturating_add(1);
+                } else if f.top.len() < Self::KEEP {
+                    f.top.push((next, 1));
+                } else if let Some(min) = f.top.iter_mut().min_by_key(|(_, n)| *n) {
+                    // The rarest remembered follower gives way, and the newcomer
+                    // starts from one: counts never overstate, so the confidence
+                    // bar cannot be passed by churn.
+                    *min = (next, 1);
+                }
+            }
+        }
+    }
+
+    /// The likeliest follower of the longest known suffix of `buf`, if it
+    /// clears the confidence bar.
+    pub fn guess(&self, buf: &[i64]) -> Option<i64> {
+        for k in (1..=Self::MAX_CONTEXT.min(buf.len())).rev() {
+            let Some(f) = self.table.get(&Self::key(&buf[buf.len() - k..])) else {
+                continue;
+            };
+            let Some(&(t, n)) = f.top.iter().max_by_key(|(_, n)| *n) else {
+                continue;
+            };
+            if f.seen >= Self::MIN_SEEN && n as f32 >= Self::MIN_CONFIDENCE * f.seen as f32 {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    pub fn contexts(&self) -> usize {
+        self.table.len()
+    }
+}
+
 /// N-gram lookup draft model. Stateless w.r.t. the target — owns its
 /// own token history and lookup table.
 ///
@@ -67,6 +164,9 @@ pub struct Draft {
     table: HashMap<Vec<i64>, i64>,
     /// Max tokens to draft per round.
     draft_k: usize,
+    /// What other requests taught ([`SharedNgrams`]); asked when this
+    /// request's own history has no match.
+    shared: Option<std::sync::Arc<std::sync::Mutex<SharedNgrams>>>,
 }
 
 impl Draft {
@@ -76,7 +176,20 @@ impl Draft {
             history: Vec::new(),
             table: HashMap::new(),
             draft_k: DEFAULT_DRAFT_K,
+            shared: None,
         }
+    }
+
+    /// Fall back to a table shared across requests when this one's own
+    /// history has no match for the current suffix.
+    pub fn with_shared(mut self, shared: std::sync::Arc<std::sync::Mutex<SharedNgrams>>) -> Self {
+        self.shared = Some(shared);
+        self
+    }
+
+    /// The tokens seen so far (prompt, output, and any speculated tail).
+    pub fn history(&self) -> &[i64] {
+        &self.history
     }
 
     /// Override draft K. Clamped to `1..=64`; values outside that range
@@ -184,7 +297,8 @@ impl Draft {
                 return Some(t);
             }
         }
-        None
+        let shared = self.shared.as_ref()?;
+        shared.lock().ok()?.guess(buf)
     }
 }
 
@@ -197,6 +311,38 @@ impl Default for Draft {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_table_answers_what_the_request_cannot() {
+        use std::sync::{Arc, Mutex};
+        let shared = Arc::new(Mutex::new(SharedNgrams::default()));
+        // Two earlier requests went "7 8 9 10"; a third went "7 8 50".
+        for seq in [[1, 7, 8, 9, 10], [2, 7, 8, 9, 10], [3, 7, 8, 50, 60]] {
+            shared.lock().unwrap().learn(&seq);
+        }
+        let mut d = Draft::new().with_draft_k(1).with_shared(shared.clone());
+        d.warm_with_prompt(&[40, 41, 7, 8]);
+        // Nothing in this request follows "7 8"; the shared table says 9 (2 of 3).
+        assert_eq!(d.propose(), vec![9]);
+        // The request's own history wins over the shared table.
+        d.warm_with_prompt(&[50, 99, 7, 8]);
+        assert_eq!(d.propose(), vec![50]);
+        // A context seen once is not evidence, and a rare follower is not a guess.
+        let mut fresh = Draft::new().with_draft_k(1).with_shared(shared.clone());
+        fresh.warm_with_prompt(&[3]);
+        assert!(fresh.propose().is_empty(), "\"3\" was seen once: no guess");
+        let mut noisy = SharedNgrams::default();
+        let mut seq = Vec::new();
+        for t in 0..40 {
+            seq.extend([5, 100 + t]); // forty different followers of 5
+        }
+        noisy.learn(&seq);
+        assert_eq!(
+            noisy.guess(&[5]),
+            None,
+            "1 in 40 is below the confidence bar"
+        );
+    }
 
     #[test]
     fn empty_draft_proposes_nothing() {
