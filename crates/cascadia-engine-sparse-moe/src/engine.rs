@@ -5372,6 +5372,8 @@ pub struct PipelineEngine<R: StagedRunner> {
     stream_inflight: Vec<VecDeque<StreamInFlight>>,
     /// Rank 0: rotation counter (`% stream_groups` = the group this step serves).
     stream_step: u64,
+    /// Rank 0: the group whose turn comes next (a step may end mid-round).
+    stream_cursor: usize,
     /// New streams admitted (prefilled) per `step`, so a burst of prompts
     /// cannot stall the streams already decoding for many prefills at once.
     stream_admit_per_step: usize,
@@ -5795,6 +5797,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             stream_groups: 1,
             stream_inflight: Vec::new(),
             stream_step: 0,
+            stream_cursor: 0,
             stream_admit_per_step: 1,
             stream_log: (0, Duration::ZERO, 0),
             stage_profile: None,
@@ -5963,21 +5966,28 @@ impl<R: StagedRunner> PipelineEngine<R> {
     /// decode micro-batch for the survivors. With G groups and G frames in
     /// flight, each downstream rank is busy on a different group's rows.
     fn step_streams_pipeline(&mut self) -> Vec<(TaskId, Chunk)> {
-        // One `step` = one round over every group, so each active stream
-        // emits exactly one token per step (the runner's no-progress guard
-        // closes a task that sees three chunk-less steps). Between rounds
-        // every group's frame is in flight at once, which is the overlap.
+        // Groups are served in turn, one frame each in flight, so every rank
+        // works on a different group's rows at once.
         let mut out: Vec<(TaskId, Chunk)> = Vec::new();
         if self.spec_applies() {
             self.step_stream_spec(&mut out);
             self.flush_stage_profile();
             return out;
         }
+        // A step ends with the first group turn that produced something (at
+        // most one round when none does: the runner closes a task after three
+        // steps without a chunk for anybody). It used to be a whole round, and
+        // the runner holds the engine lock for a step: with 48 requests
+        // arriving together their submits waited for that lock and reached
+        // `pending` a few per round, seconds apart, so admission crawled
+        // (first token after 80-90 s on average) however cheap prefill became.
         let groups = self.stream_groups.max(1);
-        for g in 0..groups {
+        for _ in 0..groups {
+            let g = self.stream_cursor % groups;
+            self.stream_cursor = (g + 1) % groups;
             self.stream_step += 1;
             let done = self.step_stream_group(g, &mut out);
-            if !done {
+            if !done || !out.is_empty() {
                 break;
             }
         }

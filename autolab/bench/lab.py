@@ -288,15 +288,34 @@ class Telemetry(threading.Thread):
                 self.stop_ev.wait(max(0.2, self.every - (time.time() - t)))
 
 
+THINGS = ["a bicycle gear", "a refrigerator", "a suspension bridge", "a sailboat tacking upwind", "a pendulum clock", "a zipper",
+          "a solar panel", "a vaccine", "a compost heap", "a barometer", "a microwave oven", "a lighthouse lens", "yeast in bread",
+          "a heat pump", "a tuning fork", "a canal lock", "a parachute", "a thermos flask", "a ballpoint pen", "a wind turbine",
+          "a pressure cooker", "noise-cancelling headphones", "a gyroscope", "a camera shutter", "a water tower", "a fuse",
+          "an escalator", "a sundial", "a violin bow", "a smoke detector", "a siphon", "a telescope mirror", "a lock and key",
+          "a steam whistle", "a magnifying glass", "a hot-air balloon", "a loom", "a sewing machine", "a rain gauge", "a kite"]
+ASKS = ["Explain in three sentences how {} works.", "What are two common misconceptions about {}? Be brief.",
+        "Describe {} to someone who has never seen one, in two sentences.", "Give one surprising fact about {} and explain it."]
+
+
+def fresh_prompt(tag, i):
+    """A prompt this fleet has (almost certainly) not seen: what the cross-request drafter is worth has to be measured on
+    text it could not have memorised. Deterministic per (experiment tag, stream), different across experiments."""
+    h = int(hashlib.sha256(("%s/%d" % (tag, i)).encode()).hexdigest(), 16)
+    return ASKS[h % len(ASKS)].format(THINGS[(h >> 8) % len(THINGS)])
+
+
 ECHO = "Repeat the following paragraph exactly, word for word, two times, and write nothing else:\n\n" + FILLER
 
 
 def run_phase(name, streams, tokens, prompt_words, cap):
     t0 = time.time()
     # "echo..." phases ask for a copy of the prompt: the output repeats the input, the best case for n-gram drafts
-    prompt = ECHO if name.startswith("echo") else None
+    # "fresh..." phases use prompts derived from the phase's tag (RUN_TAG + phase name), unseen by earlier experiments
+    prompts = [ECHO if name.startswith("echo") else fresh_prompt(RUN_TAG[0] + "/" + name, i) if name.startswith("fresh") else None
+               for i in range(streams)]
     with concurrent.futures.ThreadPoolExecutor(max_workers=streams) as ex:
-        futs = [ex.submit(chat, i, tokens, prompt_words, cap, prompt) for i in range(streams)]
+        futs = [ex.submit(chat, i, tokens, prompt_words, cap, prompts[i]) for i in range(streams)]
         out = [f.result() for f in futs]
     wall = time.time() - t0
     ok = [x for x in out if "error" not in x]
@@ -312,7 +331,11 @@ def run_phase(name, streams, tokens, prompt_words, cap):
     return res
 
 
+RUN_TAG = [""]
+
+
 def cmd_bench(a):
+    RUN_TAG[0] = a.exp
     d = os.path.join(LAB, "experiments", a.exp); os.makedirs(d, exist_ok=True)
     tel = Telemetry(os.path.join(d, "telemetry.jsonl")); tel.start()
     results = []
