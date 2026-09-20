@@ -16,3 +16,35 @@ Reasoning for the next step: the two targets need different things. Aggregate: f
 pipeline (M1, M4), then make rows share expert reads (M2) with the iGPU doing the GEMM (M3).
 Single stream: the sequential bandwidth ceiling is 2.4 tok/s; only several positions in flight
 (S1) can pass it. First release batches M1, T1, the telemetry door and the profile fix.
+
+## 2026-09-20, iteration 001: fill the pipeline, stop the long-prompt outage
+
+Release channel: the connectivity session's signed channel (`release.py publish` -> rank 0
+poller -> fleet updater) is now this loop's only door; Tailscale on rank 0 is off. Lock taken,
+baseline binaries and overrides kept in `~/inkling-release/baseline/`.
+
+Built while the fleet measured: (a) emptiest-group admission, (b) StreamFeed windows for long
+prompts, (c) stage profile reports a request's last window at once, (d) fused MoE made safe at
+f16 (power-of-two weight rescale, non-finite fallback, compile at load), (e) pipelined
+speculation for a lone stream with StreamRewind, (f) direct reply link last rank -> rank 0.
+(a)-(d) are in binary 71973619 (exp 001); (e), (f) follow in exp 002.
+
+Research notes behind (e) and (f):
+
+- Single stream is served by one memory bus at a time (PHYSICS.md): the only way past ~2.4 tok/s
+  with layers sharded by box is to have several positions of the stream in flight. A wrong
+  guess costs at most one stage time (the corrected frame queues behind one dropped frame at
+  rank 1, then follows it down the pipe in lockstep), a right guess saves a whole round trip:
+  time per token = a*T + (1-a)*(D*T + ~T/2). The draft decides everything: a = 0.3 gives 1.4x,
+  0.5 gives 1.85x, 0.9 gives 5.5x.
+- With balanced groups 11 and 16 streams both settle near 9-10 tok/s of steady decode although
+  the stage times allow ~16 at 11 streams: the group turn on rank 0 takes ~110-150 ms where a
+  stage takes 53-90. Replies are relayed up through nine ranks that each forward only between
+  two of their own frames; with every rank busy a reply waits at most of them. A direct
+  connection from the last rank removes all nine waits.
+- The fused-MoE study (research/fused_moe_f16.md) found the systematic overflow site: routing
+  weights sum to 8 x global_scale (about 100 per weight at layer 40), so the weighted sum leaves
+  f16. Dividing a row's weights by a power of two and multiplying the output back is exact.
+  It also raised a doubt to settle on the fleet: the f32 hint may never have compiled the fused
+  kernel, in which case "fused f32 = 1.66 tok/s" was the CPU path plus overhead. The stage
+  profile now carries ov_moe_calls / ov_moe_fallbacks / ov_moe_nonfinite to tell.

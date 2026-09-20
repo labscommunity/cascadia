@@ -304,6 +304,9 @@ def cmd_run(a):
         if rc != 0:
             log("publish/settle failed (rc %d)" % rc); return rc
     d = os.path.join(LAB, "experiments", a.exp); os.makedirs(d, exist_ok=True)
+    if a.warm_streams:
+        # A restart empties every rank's resident expert copy: touch many experts before anything is timed.
+        run_phase("warmup", a.warm_streams, 24, 0, a.cap)
     for w in range(a.warm):
         r = chat(3 + w, 24, timeout=600)
         log("warm %d: %s tok/s, ttft %s, %s" % (w, r.get("tok_s"), r.get("ttft_s"), r.get("error") or repr(r.get("text", "")[:50])))
@@ -331,6 +334,7 @@ def main():
         if name == "run":
             s.add_argument("--phases", nargs="+", required=True); s.add_argument("--prompt-words", type=int, default=0)
             s.add_argument("--warm", type=int, default=2); s.add_argument("--force", action="store_true")
+            s.add_argument("--warm-streams", type=int, default=16)
         s.set_defaults(fn=fn)
     s = sub.add_parser("reference"); s.set_defaults(fn=cmd_reference)
     s = sub.add_parser("gate"); s.set_defaults(fn=cmd_gate)
