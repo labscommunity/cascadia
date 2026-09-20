@@ -661,6 +661,28 @@ pub fn load_stage(
             }
         }
     }
+    // Optional device backend for the dense layers' MLP (`CASCADIA_INKLING_OV_DENSE=1`
+    // + `<model>/dense_ov`): compiled while loading, like the fused MoE layers.
+    if let Some(ov) = super::ov_dense::OvDense::from_env(dir, hidden) {
+        let ov = std::sync::Arc::new(ov);
+        for (i, l) in layers.iter_mut().enumerate() {
+            let lid = (lo + i) as u32;
+            if l.is_dense() && ov.has_layer(lid) {
+                let t0 = std::time::Instant::now();
+                let ok = ov.warm(lid);
+                tracing::info!(
+                    target: "cascadia::inkling",
+                    event = "ov_dense_warm",
+                    layer = lid,
+                    ok,
+                    secs = t0.elapsed().as_secs_f64(),
+                );
+                if ok {
+                    l.attach_ov_dense(lid, std::sync::Arc::clone(&ov));
+                }
+            }
+        }
+    }
     // Optional OpenVINO attention-projection backend (`CASCADIA_INKLING_OV_ATTN=1`
     // + `<model>/attn_ov`), layers that have IRs.
     if let Some(ov) = super::ov_attn::OvAttn::from_env(dir) {

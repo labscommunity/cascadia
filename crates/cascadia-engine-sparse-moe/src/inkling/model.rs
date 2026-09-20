@@ -190,6 +190,17 @@ impl Layer {
         }
     }
 
+    /// Run a dense layer's MLP on the all-rows device backend; no-op on a MoE layer.
+    pub fn attach_ov_dense(&mut self, layer: u32, ov: Arc<super::ov_dense::OvDense>) {
+        if let LayerMlp::Dense(d) = &mut self.mlp {
+            d.attach_ov_dense(layer, ov);
+        }
+    }
+
+    pub fn is_dense(&self) -> bool {
+        matches!(self.mlp, LayerMlp::Dense(_))
+    }
+
     /// Route this layer's attention projections through an OpenVINO backend.
     pub fn attach_ov_attn(&mut self, layer: u32, ov: Arc<super::ov_attn::OvAttn>) {
         self.attn.attach_ov(layer, ov);

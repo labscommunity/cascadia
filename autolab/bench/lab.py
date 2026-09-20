@@ -279,6 +279,27 @@ def cmd_quality(a):
     return 0 if good >= len(QUALITY) - 1 else 1
 
 
+SEED_ASKS = ["Explain how {} works, step by step.", "What are the main advantages and disadvantages of {}?",
+             "Write a short paragraph about the history of {}.", "Give three practical tips related to {}.",
+             "Compare {} with something similar and say which is better for a beginner.", "Summarise what a child should know about {}.",
+             "What commonly goes wrong with {}, and how do you fix it?", "Write a four-line poem about {}."]
+
+
+def cmd_seed(a):
+    """Traffic whose only purpose is to teach the cross-request drafter how this model phrases things: many different
+    prompts, decoded side by side. None of them is used in a timed phase ("fresh" prompts come from other templates)."""
+    topics = THINGS + ["a sourdough starter", "the water cycle", "a chess opening", "compound interest", "a volcano", "a coral reef",
+                       "the stock market", "a violin", "machine learning", "a marathon", "vaccination", "recycling", "a telescope",
+                       "the Roman Empire", "a jet engine", "photosynthesis", "an electric car", "a symphony orchestra", "DNA", "a glacier"]
+    prompts = [q.format(t) for t in topics for q in SEED_ASKS][: a.prompts]
+    t0 = time.time(); done = tokens = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=a.streams) as ex:
+        for r in ex.map(lambda p: chat(0, a.tokens, timeout=a.cap, prompt=p), prompts):
+            done += "error" not in r; tokens += r.get("tokens", 0)
+    log("SEED: %d of %d prompts, %d tokens in %.0f s (%.1f tok/s)" % (done, len(prompts), tokens, time.time() - t0, tokens / (time.time() - t0)))
+    return 0
+
+
 def cmd_gate(a):
     ok, res = gate()
     for x in res:
@@ -439,6 +460,8 @@ def main():
         s.set_defaults(fn=fn)
     s = sub.add_parser("quality"); s.add_argument("exp"); s.add_argument("--tokens", type=int, default=320)
     s.add_argument("--cap", type=int, default=900); s.set_defaults(fn=cmd_quality)
+    s = sub.add_parser("seed"); s.add_argument("--prompts", type=int, default=240); s.add_argument("--streams", type=int, default=96)
+    s.add_argument("--tokens", type=int, default=128); s.add_argument("--cap", type=int, default=900); s.set_defaults(fn=cmd_seed)
     s = sub.add_parser("reference"); s.set_defaults(fn=cmd_reference)
     s = sub.add_parser("gate"); s.set_defaults(fn=cmd_gate)
     s = sub.add_parser("bench"); s.add_argument("exp"); s.add_argument("--phases", nargs="+", required=True)

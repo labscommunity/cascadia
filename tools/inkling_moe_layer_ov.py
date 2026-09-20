@@ -178,6 +178,26 @@ def layer_model(src, lid, man, layout="u4zp", pad_experts=4, up_shift=0):
     return build_layer(gate_w, up_w, down_w, hidden, inter, n_total, k + n_sh)
 
 
+def dense_model(src, lid, man, layout="u4zp"):
+    """The dense MLP of one of the first layers as three compressed MatMuls with a dynamic row count:
+    x [1, rows, H] -> down(silu(gate x) * up x) -> y [1, rows, H] (the runtime applies mlp.global_scale)."""
+    hidden, inter = man["hidden_size"], man["dense_intermediate"]
+    (gp, gs), (up_, us), (dp, ds) = read_bin_sections(os.path.join(src, "experts", f"layer_{lid:02d}", "dense.bin"), hidden, inter)
+    sq = ops.constant(np.array([0], np.int64))
+    gate_w = ops.squeeze(stacked_weight([gp], [gs], inter, hidden, layout), sq)     # [I, H]
+    up_w = ops.squeeze(stacked_weight([up_], [us], inter, hidden, layout), sq)
+    down_w = ops.squeeze(stacked_weight([dp], [ds], hidden, inter, layout), sq)     # [H, I]
+    x = ops.parameter(PartialShape([1, -1, hidden]), Type.f32, name="x")
+    x.get_output_tensor(0).set_names({"x"})
+    g = ops.matmul(x, gate_w, False, True)
+    u = ops.matmul(x, up_w, False, True)
+    sw = NodeFactory("opset4").create("Swish", [g.output(0)], {})
+    y = ops.matmul(ops.multiply(sw, u), down_w, False, True)
+    m = Model([y], [x], "inkling_dense_mlp")
+    m.outputs[0].tensor.set_names({"y"})
+    return m
+
+
 def validate(src, lid, man, device="GPU", layout="u4zp", pad_experts=4):
     """Compile the layer and compare one 2-row call against a numpy reference on the bins' grid."""
     from glm5_expert_ov import _load  # noqa: E402  (dequantised gate/up/down of one bin)
@@ -239,6 +259,8 @@ def main():
                     help="multiply every up-projection scale by 2^-N; the layer then returns y * 2^-N and the runtime multiplies "
                          "it back (it reads cascadia_moe.json next to the IR). For layers whose expert output itself passes "
                          "f16's 65504 on the device (Inkling layer 8's shared expert reaches -94909); 4 is the tested value")
+    ap.add_argument("--dense", action="store_true",
+                    help="write the DENSE layers among --layers instead (their MLP as <out>/dense_ov/layer_NN/), skip the MoE ones")
     args = ap.parse_args()
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     man = json.load(open(os.path.join(args.src, "manifest.json")))
@@ -246,6 +268,20 @@ def main():
     dense = set(man["dense_layers"])
     out = args.out or args.src
     for lid in [int(v) for v in args.layers.split(",")]:
+        if args.dense:
+            if lid not in dense:
+                print(f"layer {lid}: not a dense layer, skipped")
+                continue
+            dst = os.path.join(out, "dense_ov", f"layer_{lid:02d}")
+            xml = os.path.join(dst, "openvino_model.xml")
+            if args.skip_existing and os.path.exists(xml):
+                print(f"layer {lid}: exists, skipped")
+                continue
+            t0 = time.time()
+            os.makedirs(dst, exist_ok=True)
+            ov.save_model(dense_model(args.src, lid, man, args.layout), xml, compress_to_fp16=False)
+            print(f"layer {lid}: dense MLP written {xml} in {time.time()-t0:.0f}s")
+            continue
         if lid in dense:
             print(f"layer {lid}: dense, skipped (the dense MLP keeps the per-expert IR)")
             continue

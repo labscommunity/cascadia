@@ -1059,6 +1059,8 @@ pub struct DenseMlp {
     pub global_scale: f32,
     /// Optional OpenVINO backend for this MLP (`(layer index, backend)`).
     ov: Option<(u32, Arc<super::ov_expert::OvExperts>)>,
+    /// Optional all-rows-in-one-call device backend ([`super::ov_dense`]).
+    ov_dense: Option<(u32, Arc<super::ov_dense::OvDense>)>,
 }
 
 impl DenseMlp {
@@ -1068,7 +1070,17 @@ impl DenseMlp {
             inter,
             global_scale,
             ov: None,
+            ov_dense: None,
         }
+    }
+
+    /// Run this MLP's rows on the device backend (see [`super::ov_dense`]).
+    pub fn attach_ov_dense(&mut self, layer: u32, ov: Arc<super::ov_dense::OvDense>) {
+        self.ov_dense = Some((layer, ov));
+    }
+
+    pub fn ov_dense(&self) -> Option<(u32, &Arc<super::ov_dense::OvDense>)> {
+        self.ov_dense.as_ref().map(|(l, o)| (*l, o))
     }
 
     pub fn attach_ov(&mut self, layer: u32, ov: Arc<super::ov_expert::OvExperts>) {
@@ -1092,6 +1104,14 @@ impl DenseMlp {
     /// dense layers cost more per row than its four MoE layers and made it the
     /// slowest stage of the fleet.
     pub fn forward_rows(&self, xs: &[f32], rows: usize, hidden: usize) -> Vec<f32> {
+        if let Some((lid, ov)) = self.ov_dense.as_ref() {
+            if let Some(mut y) = ov.forward(*lid, xs, rows) {
+                for v in y.iter_mut() {
+                    *v *= self.global_scale;
+                }
+                return y;
+            }
+        }
         if rows < 2 || self.ov.is_some() || !row_gemm() {
             let mut out = Vec::with_capacity(rows * hidden);
             for row in xs.chunks_exact(hidden) {
@@ -1109,6 +1129,9 @@ impl DenseMlp {
 
     /// `down(silu(gate·x) · up·x) · global_scale` for one token (`[hidden]`).
     pub fn forward(&self, x: &[f32], hidden: usize) -> Vec<f32> {
+        if self.ov_dense.is_some() {
+            return self.forward_rows(x, 1, hidden);
+        }
         let mut y = match &self.ov {
             Some((lid, ov)) => ov
                 .dense(*lid, x)
