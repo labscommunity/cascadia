@@ -23,9 +23,17 @@ PROMPTS = ["Explain in three sentences why the sky is blue.", "What is the capit
 urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
 
 
-def one(base, i, tokens, out):
+FILLER = ("The harbour town woke slowly that morning: gulls over the quay, a baker carrying trays, two "
+          "fishermen arguing about the tide, and a child counting the boats as they left one by one. ")
+
+
+def one(base, i, tokens, out, prompt_words=0):
+    prompt = PROMPTS[i % len(PROMPTS)]
+    if prompt_words:  # a long prompt, to time prefill: filler text, then the question
+        words = (FILLER * (prompt_words // len(FILLER.split()) + 1)).split()[:prompt_words]
+        prompt = "Read this, then answer the question after it.\n\n" + " ".join(words) + "\n\n" + prompt
     body = json.dumps({"model": "inkling", "stream": True, "max_tokens": tokens, "temperature": 0,
-                       "messages": [{"role": "user", "content": PROMPTS[i % len(PROMPTS)]}]}).encode()
+                       "messages": [{"role": "user", "content": prompt}]}).encode()
     req = urllib.request.Request(f"{base}/v1/chat/completions", data=body, headers={"Content-Type": "application/json"})
     t0 = time.time(); first = last = None; n = 0; text = []
     try:
@@ -73,11 +81,12 @@ def main():
     ap.add_argument("--tokens", type=int, default=64)
     ap.add_argument("--rounds", type=int, default=1)
     ap.add_argument("--warmup", type=int, default=1, help="untimed rounds first (fills the expert caches)")
+    ap.add_argument("--prompt-words", type=int, default=0, help="pad every prompt with this many words of text (times prefill)")
     a = ap.parse_args()
     base = a.base.rstrip("/")
     for r in range(a.warmup + a.rounds):
         out = [None] * a.streams
-        ths = [threading.Thread(target=one, args=(base, i, a.tokens, out)) for i in range(a.streams)]
+        ths = [threading.Thread(target=one, args=(base, i, a.tokens, out, a.prompt_words)) for i in range(a.streams)]
         t0 = time.time(); [t.start() for t in ths]; [t.join() for t in ths]; wall = time.time() - t0
         ok = [x for x in out if x and "error" not in x]
         tot = sum(x["tokens"] for x in ok)
