@@ -32,13 +32,13 @@ use tracing::{info, warn};
 use crate::dist::{
     forward_reset, recv_forward_batch_body_server, recv_forward_body_server, recv_key_body_server,
     recv_kind_client, recv_kind_server, recv_stream_close_body_server,
-    recv_stream_decode_body_server, recv_stream_open_body_server, recv_stream_tokens_body_client,
-    recv_stream_tokens_reply, recv_token_batch_body_client, recv_token_body_client,
-    send_cache_prefix, send_forward, send_forward_batch, send_forward_batch_prefill,
-    send_forward_batch_prefill_nosample, send_forward_nosample, send_forward_prefill, send_reset,
-    send_restore_prefix, send_stream_close, send_stream_decode, send_stream_open,
-    send_stream_tokens_upstream, send_token_batch_upstream, send_token_upstream, FrameKind,
-    StageTransport,
+    recv_stream_decode_body_server, recv_stream_feed_body_server, recv_stream_open_body_server,
+    recv_stream_tokens_body_client, recv_stream_tokens_reply, recv_token_batch_body_client,
+    recv_token_body_client, send_cache_prefix, send_forward, send_forward_batch,
+    send_forward_batch_prefill, send_forward_batch_prefill_nosample, send_forward_nosample,
+    send_forward_prefill, send_reset, send_restore_prefix, send_stream_close, send_stream_decode,
+    send_stream_feed, send_stream_open, send_stream_tokens_upstream, send_token_batch_upstream,
+    send_token_upstream, FrameKind, StageTransport, STREAM_FEED_FINAL, STREAM_FEED_OPEN,
 };
 #[cfg(feature = "kv_coord")]
 use crate::dist::{
@@ -3518,7 +3518,8 @@ impl SparseMoEEngine {
             FrameKind::StreamOpen
             | FrameKind::StreamDecode
             | FrameKind::StreamClose
-            | FrameKind::StreamTokens => Err(format!(
+            | FrameKind::StreamTokens
+            | FrameKind::StreamFeed => Err(format!(
                 "sparse-moe stage received multi-stream frame {kind:?} (only the staged pipeline engine serves streams)"
             )),
             #[cfg(feature = "kv_coord")]
@@ -5385,6 +5386,34 @@ struct StreamSampler {
     rng: u64,
 }
 
+/// Header of one prompt window on a worker: a whole `StreamOpen`
+/// (`flags: None`) or a `StreamFeed` window with its flags.
+struct StreamWindow {
+    batch_id: u32,
+    slot: u32,
+    rows: u32,
+    flags: Option<u32>,
+    sampling_cfg: crate::sampling::SamplingConfig,
+}
+
+/// Prompt rows per prefill frame of the multi-stream pipeline
+/// (`CASCADIA_STREAMS_PREFILL_WINDOW`, default 128, at most
+/// [`crate::dist::MAX_STREAM_ROWS`]). A longer prompt travels as several
+/// windows back to back, so the ranks work on it at the same time, and other
+/// streams' decode frames pass between its windows.
+fn stream_prefill_window_rows() -> usize {
+    use std::sync::OnceLock;
+    static W: OnceLock<usize> = OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("CASCADIA_STREAMS_PREFILL_WINDOW")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v >= 1)
+            .unwrap_or(128)
+            .min(crate::dist::MAX_STREAM_ROWS as usize)
+    })
+}
+
 /// A stream frame rank 0 has sent and is owed a `StreamTokens` reply for.
 struct StreamInFlight {
     batch_id: u32,
@@ -5465,13 +5494,29 @@ impl StageProfile {
     }
 
     /// A wait longer than a window is the pipeline idling between requests,
-    /// not a stage waiting for work: start the window over after it.
-    fn waited(&mut self, d: Duration) {
-        if d >= self.every && self.frames + self.opens + self.relays == 0 {
-            self.restart();
-        } else {
+    /// not a stage waiting for work: report what the window held before the
+    /// gap (the tail of the last request would otherwise be logged minutes
+    /// later with the idle time in it) and start over after it.
+    fn waited(
+        &mut self,
+        d: Duration,
+        rank: u32,
+        total: u32,
+        runner: impl FnOnce() -> Option<crate::staged::RunnerProfile>,
+    ) {
+        if d < self.every {
             self.wait += d;
+            return;
         }
+        if self.active() {
+            self.since += d;
+            self.log(rank, total, runner());
+        }
+        self.restart();
+    }
+
+    fn active(&self) -> bool {
+        self.frames + self.opens + self.relays > 0
     }
 
     fn decoded(&mut self, rows: usize, compute: Duration) {
@@ -5494,17 +5539,22 @@ impl StageProfile {
     }
 
     fn flush(&mut self, rank: u32, total: u32, now: Option<crate::staged::RunnerProfile>) {
-        let window = self.since.elapsed();
-        if window < self.every {
+        if self.since.elapsed() < self.every {
             return;
         }
-        let now = now.unwrap_or_default();
+        if self.active() {
+            self.log(rank, total, now);
+        } else if let Some(now) = now {
+            self.runner = now;
+        }
+        self.restart();
+    }
+
+    fn log(&mut self, rank: u32, total: u32, now: Option<crate::staged::RunnerProfile>) {
+        let window = self.since.elapsed();
+        let now = now.unwrap_or(self.runner);
         let was = self.runner;
         self.runner = now;
-        if self.frames + self.opens + self.relays == 0 {
-            self.restart();
-            return;
-        }
         let ms = |d: Duration| (d.as_secs_f64() * 1e3).round() as u64;
         let ns_ms = |a: u64, b: u64| a.saturating_sub(b) / 1_000_000;
         info!(
@@ -5541,12 +5591,14 @@ impl StageProfile {
             cache_cap_mib = now.cache_capacity_mib,
             "stage profile"
         );
-        self.restart();
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StreamState {
+    /// A long prompt whose windows are still being sent (`feed` holds the
+    /// rest); nothing is owed for it yet (pipeline only).
+    Feeding,
     /// `StreamOpen` sent, first token not back yet (pipeline only).
     Prefilling,
     /// `next` holds a token to emit and forward.
@@ -5576,6 +5628,8 @@ struct StreamActive {
     pos: usize,
     generated: Vec<u32>,
     emitted: usize,
+    /// Pipeline, long prompts: the prompt tokens not sent yet (`Feeding`).
+    feed: VecDeque<u32>,
 }
 
 /// Rank-0 per-token streaming state: everything the decode loop threaded as
@@ -5855,6 +5909,29 @@ impl<R: StagedRunner> PipelineEngine<R> {
         }
         // ---- 2. admissions into this group ----
         let mut admitted = 0usize;
+        // A long prompt goes down one window per group turn, whichever group's
+        // turn it is: the decode frames of the other streams keep flowing
+        // between its windows instead of waiting for the whole prompt.
+        if let Some(i) = self
+            .streams
+            .iter()
+            .position(|st| st.state == StreamState::Feeding)
+        {
+            admitted += 1;
+            let feed_started = Instant::now();
+            let rows = match self.feed_stream_window(i, g, &down) {
+                Ok(rows) => rows,
+                Err((id, chunk)) => {
+                    out.push((id, chunk));
+                    0
+                }
+            };
+            if let Some(p) = self.stage_profile.as_mut() {
+                p.opens += 1;
+                p.open_rows += rows as u64;
+                p.prefill += feed_started.elapsed();
+            }
+        }
         while admitted < self.stream_admit_per_step
             && self.streams.len() < self.stream_cap
             && !self.pending.is_empty()
@@ -5949,6 +6026,16 @@ impl<R: StagedRunner> PipelineEngine<R> {
             p.emit += emit_started.elapsed();
         }
         if rows_idx.is_empty() {
+            if self.streams.is_empty() && self.pending.is_empty() {
+                // The last stream just finished: report the window now, not
+                // when the next request arrives.
+                if let Some(p) = self.stage_profile.as_mut() {
+                    if p.active() {
+                        p.log(self.rank, self.total, self.runner.profile());
+                        p.restart();
+                    }
+                }
+            }
             self.flush_stage_profile();
             return true;
         }
@@ -6091,6 +6178,15 @@ impl<R: StagedRunner> PipelineEngine<R> {
             return Err((task.task_id, c));
         };
         let hs = self.runner.hidden_size();
+        let prompt_len = prompt_ids.len();
+        // A prompt longer than one window goes down as `StreamFeed` windows:
+        // the first here, the rest one per group turn (`feed_stream_window`).
+        let window = stream_prefill_window_rows();
+        let windowed = prompt_len > window;
+        let mut feed: VecDeque<u32> = VecDeque::new();
+        if windowed {
+            feed.extend(prompt_ids.drain(window..));
+        }
         let rows = prompt_ids.len();
         let mut hidden = Vec::with_capacity(rows * hs);
         for &t in &prompt_ids {
@@ -6112,15 +6208,29 @@ impl<R: StagedRunner> PipelineEngine<R> {
         };
         self.stream_batch_seq = self.stream_batch_seq.wrapping_add(1);
         let batch_id = self.stream_batch_seq;
-        if let Err(e) = self.block_on(send_stream_open(
-            down,
-            batch_id,
-            slot as u32,
-            &cfg,
-            &h,
-            rows as u32,
-            hs as u32,
-        )) {
+        let sent = if windowed {
+            self.block_on(send_stream_feed(
+                down,
+                batch_id,
+                slot as u32,
+                STREAM_FEED_OPEN,
+                &cfg,
+                &h,
+                rows as u32,
+                hs as u32,
+            ))
+        } else {
+            self.block_on(send_stream_open(
+                down,
+                batch_id,
+                slot as u32,
+                &cfg,
+                &h,
+                rows as u32,
+                hs as u32,
+            ))
+        };
+        if let Err(e) = sent {
             warn!(task = %task.task_id, "send_stream_open failed: {e}");
             self.peer_disconnected = true;
             self.runner.close_stream(slot);
@@ -6129,18 +6239,21 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 Chunk::error(task.task_id, format!("send_stream_open: {e}")),
             ));
         }
-        self.stream_inflight[g].push_back(StreamInFlight {
-            batch_id,
-            slots: vec![slot],
-            open: true,
-            sent_at: Instant::now(),
-        });
+        if !windowed {
+            self.stream_inflight[g].push_back(StreamInFlight {
+                batch_id,
+                slots: vec![slot],
+                open: true,
+                sent_at: Instant::now(),
+            });
+        }
         let prefill_s = started.elapsed().as_secs_f64();
         info!(
             task = %task.task_id,
             slot,
             group = g,
-            prompt_tokens = rows,
+            prompt_tokens = prompt_len,
+            first_window = rows,
             rank0_prefill_s = prefill_s,
             streams = self.streams.len() + 1,
             "stream admitted (pipeline)"
@@ -6149,7 +6262,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
             id: task.task_id,
             slot,
             group: g,
-            state: StreamState::Prefilling,
+            state: if windowed {
+                StreamState::Feeding
+            } else {
+                StreamState::Prefilling
+            },
             cancelled: false,
             cfg,
             history: Vec::new(),
@@ -6158,12 +6275,100 @@ impl<R: StagedRunner> PipelineEngine<R> {
             started,
             prefill_s,
             decode_started: Instant::now(),
-            prompt_len: rows,
+            prompt_len,
             next: -1,
-            pos: rows,
+            pos: prompt_len,
             generated: Vec::new(),
             emitted: 0,
+            feed,
         });
+        Ok(rows)
+    }
+
+    /// Send the next window of `streams[i]`'s prompt (state `Feeding`) during
+    /// group `turn`'s turn. Only the last window is answered: its in-flight
+    /// record goes on `turn`'s queue, because replies come back in the order
+    /// the frames were sent and are read at the turn that sent them (the
+    /// reply names the slot, so the stream's own group does not matter).
+    /// A stream cancelled while feeding is closed here: nothing is owed for it.
+    #[allow(clippy::result_large_err)]
+    fn feed_stream_window(
+        &mut self,
+        i: usize,
+        turn: usize,
+        down: &Arc<TokioMutex<ActivationClient>>,
+    ) -> Result<usize, (TaskId, Chunk)> {
+        let started = Instant::now();
+        let slot = self.streams[i].slot;
+        if self.streams[i].cancelled {
+            let st = self.streams.swap_remove(i);
+            self.runner.close_stream(st.slot);
+            if let Err(e) = self.block_on(send_stream_close(down, st.slot as u32)) {
+                warn!(slot = st.slot, "stream close not relayed: {e}");
+            }
+            return Ok(0);
+        }
+        let window = stream_prefill_window_rows();
+        let rows = self.streams[i].feed.len().min(window);
+        let ids: Vec<u32> = self.streams[i].feed.drain(..rows).collect();
+        let last = self.streams[i].feed.is_empty();
+        let hs = self.runner.hidden_size();
+        let mut hidden = Vec::with_capacity(rows * hs);
+        for &t in &ids {
+            hidden.extend(self.runner.embed_token(t));
+        }
+        let runner = &mut self.runner;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runner.prefill_stream(slot, hidden, rows)
+        }));
+        let id = self.streams[i].id.clone();
+        let fail = |this: &mut Self, msg: String| {
+            let st = this.streams.swap_remove(i);
+            this.runner.close_stream(st.slot);
+            (st.id.clone(), Chunk::error(st.id, msg))
+        };
+        let h = match outcome {
+            Ok(h) => h,
+            Err(payload) => {
+                let msg = panic_message(payload);
+                warn!(task = %id, error = %msg, "stream prefill window failed; task aborted");
+                // The ranks behind hold the windows sent so far: free the slot there too.
+                if let Err(e) = self.block_on(send_stream_close(down, slot as u32)) {
+                    warn!(slot, "stream close not relayed: {e}");
+                }
+                return Err(fail(self, msg));
+            }
+        };
+        self.stream_batch_seq = self.stream_batch_seq.wrapping_add(1);
+        let batch_id = self.stream_batch_seq;
+        let cfg = self.streams[i].cfg.clone();
+        let flags = if last { STREAM_FEED_FINAL } else { 0 };
+        if let Err(e) = self.block_on(send_stream_feed(
+            down,
+            batch_id,
+            slot as u32,
+            flags,
+            &cfg,
+            &h,
+            rows as u32,
+            hs as u32,
+        )) {
+            warn!(task = %id, "send_stream_feed failed: {e}");
+            self.peer_disconnected = true;
+            return Err(fail(self, format!("send_stream_feed: {e}")));
+        }
+        let st = &mut self.streams[i];
+        st.prefill_s += started.elapsed().as_secs_f64();
+        if last {
+            st.state = StreamState::Prefilling;
+            st.decode_started = Instant::now();
+            self.stream_inflight[turn].push_back(StreamInFlight {
+                batch_id,
+                slots: vec![slot],
+                open: true,
+                sent_at: Instant::now(),
+            });
+        }
         Ok(rows)
     }
 
@@ -6478,6 +6683,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             pos: rows,
             generated: Vec::new(),
             emitted: 0,
+            feed: VecDeque::new(),
         });
         Ok(())
     }
@@ -7143,7 +7349,10 @@ impl<R: StagedRunner> PipelineEngine<R> {
                         .map(|_| Ready::Up),
                 };
                 if let Some(p) = self.stage_profile.as_mut() {
-                    p.waited(wait_started.elapsed());
+                    let runner = &self.runner;
+                    p.waited(wait_started.elapsed(), self.rank, self.total, || {
+                        runner.profile()
+                    });
                 }
                 match ready {
                     Ok(Ready::Up) => {}
@@ -7295,6 +7504,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 }
             },
             FrameKind::StreamOpen => self.handle_stream_open(&upstream, downstream.as_ref()),
+            FrameKind::StreamFeed => self.handle_stream_feed(&upstream, downstream.as_ref()),
             FrameKind::StreamDecode => self.handle_stream_decode(&upstream, downstream.as_ref()),
             FrameKind::StreamClose => self.handle_stream_close(&upstream, downstream.as_ref()),
             other => Err(format!(
@@ -7336,19 +7546,81 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let (batch_id, slot, rows, sampling_cfg, hidden_f32) = self
             .block_on(recv_stream_open_body_server(upstream))
             .map_err(|e| format!("recv_stream_open: {e}"))?;
+        let window = StreamWindow {
+            batch_id,
+            slot,
+            rows,
+            flags: None,
+            sampling_cfg,
+        };
+        self.stream_prefill_window(upstream, downstream, window, hidden_f32, recv_started)
+    }
+
+    /// `StreamFeed`: one window of a long prompt (see [`FrameKind::StreamFeed`]).
+    fn handle_stream_feed(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+    ) -> Result<(), String> {
+        let recv_started = Instant::now();
+        let (batch_id, slot, rows, flags, sampling_cfg, hidden_f32) = self
+            .block_on(recv_stream_feed_body_server(upstream))
+            .map_err(|e| format!("recv_stream_feed: {e}"))?;
+        let window = StreamWindow {
+            batch_id,
+            slot,
+            rows,
+            flags: Some(flags),
+            sampling_cfg,
+        };
+        self.stream_prefill_window(upstream, downstream, window, hidden_f32, recv_started)
+    }
+
+    /// Prompt rows of one slot through my layers. A `StreamOpen` is the whole
+    /// prompt (open, prefill, sample); a `StreamFeed` window opens only when
+    /// flagged, appends at the slot's position, and is sampled and answered
+    /// only when it is the last one. Relayed downstream as the frame it came as.
+    fn stream_prefill_window(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+        w: StreamWindow,
+        hidden_f32: Vec<f32>,
+        recv_started: Instant,
+    ) -> Result<(), String> {
         let received = Instant::now();
+        let StreamWindow {
+            batch_id,
+            slot,
+            rows,
+            flags,
+            sampling_cfg,
+        } = w;
+        let (open, last_window) = match flags {
+            None => (true, true),
+            Some(f) => (f & STREAM_FEED_OPEN != 0, f & STREAM_FEED_FINAL != 0),
+        };
         let s = self.stream_slot_ok(slot)?;
         let hs = self.runner.hidden_size();
-        if hidden_f32.len() != rows as usize * hs || rows as usize > self.runner.max_seq() {
+        let have = if open { 0 } else { self.runner.stream_pos(s) };
+        if hidden_f32.len() != rows as usize * hs || have + rows as usize > self.runner.max_seq() {
             self.peer_disconnected = true;
             return Err(format!(
-                "stream open: {} floats for {rows} rows of width {hs}",
-                hidden_f32.len()
+                "stream prefill: {} floats for {rows} rows of width {hs} at position {have} (budget {})",
+                hidden_f32.len(),
+                self.runner.max_seq()
             ));
         }
-        if !self.runner.open_stream_at(s) {
+        if open {
+            if !self.runner.open_stream_at(s) {
+                self.peer_disconnected = true;
+                return Err(format!("stream open: slot {s} refused by the runner"));
+            }
+        } else if have == 0 {
+            // A later window of a prompt whose first window never opened the
+            // slot here: this rank's KV would start mid-prompt.
             self.peer_disconnected = true;
-            return Err(format!("stream open: slot {s} refused by the runner"));
+            return Err(format!("stream feed: slot {s} is not open on this rank"));
         }
         let hidden = self.runner.prefill_stream(s, hidden_f32, rows as usize);
         let computed = Instant::now();
@@ -7359,6 +7631,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
             p.prefill += computed - received;
         }
         if self.is_last() {
+            if !last_window {
+                return Ok(());
+            }
             let logits = self
                 .runner
                 .head_logits(&hidden[(rows as usize - 1) * hs..rows as usize * hs]);
@@ -7389,17 +7664,31 @@ impl<R: StagedRunner> PipelineEngine<R> {
             let down = downstream.ok_or("mid rank missing downstream")?;
             // Send on; the reply comes back through the readiness loop in
             // `step_worker` and is relayed upstream there.
-            let sent = self
-                .block_on(send_stream_open(
-                    down,
-                    batch_id,
-                    slot,
-                    &sampling_cfg,
-                    &hidden,
-                    rows,
-                    hs as u32,
-                ))
-                .map_err(|e| format!("send_stream_open: {e}"));
+            let sent = match flags {
+                None => self
+                    .block_on(send_stream_open(
+                        down,
+                        batch_id,
+                        slot,
+                        &sampling_cfg,
+                        &hidden,
+                        rows,
+                        hs as u32,
+                    ))
+                    .map_err(|e| format!("send_stream_open: {e}")),
+                Some(f) => self
+                    .block_on(send_stream_feed(
+                        down,
+                        batch_id,
+                        slot,
+                        f,
+                        &sampling_cfg,
+                        &hidden,
+                        rows,
+                        hs as u32,
+                    ))
+                    .map_err(|e| format!("send_stream_feed: {e}")),
+            };
             if let Some(p) = self.stage_profile.as_mut() {
                 p.send += computed.elapsed();
             }
@@ -8107,9 +8396,9 @@ mod tests {
     fn stage_profile_counts_work_and_drops_idle_gaps() {
         let mut p = StageProfile::new(Duration::from_millis(50));
         // Idle between requests: a wait longer than the window, nothing done yet.
-        p.waited(Duration::from_secs(300));
+        p.waited(Duration::from_secs(300), 1, 3, || None);
         assert_eq!(p.wait, Duration::ZERO, "an idle gap is not stage wait time");
-        p.waited(Duration::from_millis(7));
+        p.waited(Duration::from_millis(7), 1, 3, || None);
         p.decoded(3, Duration::from_millis(20));
         p.decoded(1, Duration::from_millis(30));
         p.replied(Duration::from_millis(400));
@@ -8117,9 +8406,9 @@ mod tests {
         assert_eq!(p.compute, Duration::from_millis(50));
         assert_eq!(p.max_compute, Duration::from_millis(30));
         assert_eq!(p.wait, Duration::from_millis(7));
-        // A long wait in a window that already has work is real waiting.
-        p.waited(Duration::from_millis(60));
-        assert_eq!(p.wait, Duration::from_millis(67));
+        // A short wait in a window that already has work is real waiting.
+        p.waited(Duration::from_millis(40), 1, 3, || None);
+        assert_eq!(p.wait, Duration::from_millis(47));
         // Not due yet: nothing is reset.
         p.flush(1, 3, None);
         assert_eq!(p.frames, 2);
@@ -8131,6 +8420,11 @@ mod tests {
         p.flush(1, 3, Some(runner));
         assert_eq!((p.frames, p.rows, p.wait), (0, 0, Duration::ZERO));
         assert_eq!(p.runner, runner, "the next window reports deltas from here");
+        // The request ends and the pipeline idles: the work done so far is
+        // reported before the gap, and the gap is not counted as waiting.
+        p.decoded(2, Duration::from_millis(9));
+        p.waited(Duration::from_secs(120), 1, 3, || Some(runner));
+        assert_eq!((p.frames, p.wait), (0, Duration::ZERO));
     }
 
     #[test]
