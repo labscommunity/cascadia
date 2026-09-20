@@ -611,6 +611,9 @@ pub fn load_stage(
         None
     };
     let mut layers = Vec::with_capacity(hi.saturating_sub(lo));
+    // Handles for the load-time split bench (`CASCADIA_INKLING_SPLIT_BENCH`).
+    let mut bench_moe: Option<std::sync::Arc<super::ov_moe::OvMoe>> = None;
+    let mut bench_attn: Option<std::sync::Arc<super::ov_attn::OvAttn>> = None;
     for li in lo..hi {
         layers.push(load_layer(dir, &m, li, max_seq, mode, experts)?);
     }
@@ -636,6 +639,7 @@ pub fn load_stage(
         m.num_experts + m.n_shared_experts,
     ) {
         let ov = std::sync::Arc::new(ov);
+        bench_moe = Some(std::sync::Arc::clone(&ov));
         // Compile the fused layers while the rank loads, not inside the first
         // request: on an 11-rank pipeline the lazy compiles ran one rank after
         // another (first request: 242 s to the first token), here every rank
@@ -687,6 +691,7 @@ pub fn load_stage(
     // + `<model>/attn_ov`), layers that have IRs.
     if let Some(ov) = super::ov_attn::OvAttn::from_env(dir) {
         let ov = std::sync::Arc::new(ov);
+        bench_attn = Some(std::sync::Arc::clone(&ov));
         let drop_rust = super::env_flag("CASCADIA_INKLING_OV_ATTN_DROP_RUST");
         let (mut released, mut kept) = (0usize, 0usize);
         for (i, l) in layers.iter_mut().enumerate() {
@@ -725,12 +730,130 @@ pub fn load_stage(
             h.attach_ov(std::sync::Arc::new(ov));
         }
     }
+    if super::env_flag("CASCADIA_INKLING_SPLIT_BENCH") {
+        if let (Some(moe), Some(attn)) = (bench_moe.as_ref(), bench_attn.as_ref()) {
+            let lids: Vec<u32> = (lo..lo + layers.len())
+                .map(|l| l as u32)
+                .filter(|&l| moe.has_layer(l) && attn.has_layer(l) && ov_moe_layer_selected(l))
+                .collect();
+            split_bench(
+                moe,
+                attn,
+                &lids,
+                m.hidden_size,
+                m.num_experts,
+                m.n_shared_experts,
+                m.top_k,
+            );
+        }
+    }
     Ok(InklingStage {
         embed,
         layers,
         head,
         manifest: m,
     })
+}
+
+/// `CASCADIA_INKLING_SPLIT_BENCH=1`, once at load: can a second frame use the
+/// iGPU while the first one's calls are in their host-side parts? The device
+/// calls of synthetic one- and two-row frames (q/k/v/r, o, fused experts per
+/// layer, random expert ids) run (a) on one thread, layer after layer, as the
+/// stage does today, and (b) as a two- and three-thread pipeline over disjoint
+/// layer groups. Microseconds per frame go out on a "stage profile" line (the
+/// beacon relays it). Nothing here touches a stream's state.
+#[allow(clippy::too_many_arguments)]
+fn split_bench(
+    moe: &std::sync::Arc<super::ov_moe::OvMoe>,
+    attn: &std::sync::Arc<super::ov_attn::OvAttn>,
+    lids: &[u32],
+    hidden: usize,
+    n_routed: usize,
+    n_shared: usize,
+    top_k: usize,
+) {
+    use std::time::Instant;
+    if lids.len() < 2 {
+        return;
+    }
+    let k = top_k + n_shared;
+    let frames = 48usize;
+    let layer_call = |lid: u32, rows: usize, seed: usize| {
+        let x: Vec<f32> = (0..rows * hidden)
+            .map(|i| (((i + seed) % 97) as f32 - 48.0) * 1e-3)
+            .collect();
+        if let Some([q, _k, _v, _r]) = attn.qkvr(lid, &x, rows) {
+            let _ = attn.o(lid, &q, rows);
+        }
+        let mut ids = Vec::with_capacity(rows * k);
+        for r in 0..rows {
+            for j in 0..top_k {
+                ids.push(((seed * 31 + r * 17 + j * 43 + lid as usize * 7) % n_routed) as i32);
+            }
+            for s in 0..n_shared {
+                ids.push((n_routed + s) as i32);
+            }
+        }
+        let w = vec![1.0f32 / k as f32; rows * k];
+        let _ = moe.forward(lid, &x, rows, &ids, &w);
+    };
+    let run = |rows: usize, groups: usize| -> u128 {
+        // `groups` threads, each owning a contiguous group of layers; frame f
+        // enters group g+1 when group g is done with it.
+        let per = lids.len().div_ceil(groups);
+        let chunks: Vec<Vec<u32>> = lids.chunks(per).map(|c| c.to_vec()).collect();
+        let t0 = Instant::now();
+        std::thread::scope(|sc| {
+            let mut rx_prev: Option<std::sync::mpsc::Receiver<usize>> = None;
+            for chunk in chunks {
+                let (tx, rx) = std::sync::mpsc::sync_channel::<usize>(1);
+                let rx_in = rx_prev.take();
+                let lc = &layer_call;
+                sc.spawn(move || {
+                    let work = |f: usize| {
+                        for &lid in &chunk {
+                            lc(lid, rows, f);
+                        }
+                    };
+                    match rx_in {
+                        None => {
+                            for f in 0..frames {
+                                work(f);
+                                let _ = tx.send(f);
+                            }
+                        }
+                        Some(rx_in) => {
+                            while let Ok(f) = rx_in.recv() {
+                                work(f);
+                                let _ = tx.send(f);
+                            }
+                        }
+                    }
+                });
+                rx_prev = Some(rx);
+            }
+            if let Some(rx) = rx_prev {
+                while rx.recv().is_ok() {}
+            }
+        });
+        t0.elapsed().as_micros() / frames as u128
+    };
+    for rows in [1usize, 2] {
+        let _ = run(rows, 1); // shapes warm
+        let seq = run(rows, 1);
+        let p2 = run(rows, 2);
+        let p3 = run(rows, 3);
+        let line = format!(
+            "SB{}R{rows} probe stage profile rows={rows} layers={} seq_us={seq} pipe2_us={p2} pipe3_us={p3}",
+            lids[0],
+            lids.len()
+        );
+        for _ in 0..3 {
+            println!("{line}");
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+        tracing::info!(target: "cascadia::inkling", event = "split_bench", rows, seq_us = seq as u64, pipe2_us = p2 as u64, pipe3_us = p3 as u64);
+    }
 }
 
 /// Load a full single-stage model with eager (dequantized f32) experts — the

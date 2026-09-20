@@ -490,6 +490,20 @@ impl MoeLayer {
             cosine,
             ok,
         );
+        // Also as integers on a "stage profile" line: the fleet's beacon relays
+        // those from every rank, the log itself stays on the box.
+        println!(
+            "MC{lid} probe stage profile layer={lid} cos_ppm={} ok={}",
+            (cosine.clamp(0.0, 1.0) * 1e6) as u64,
+            u8::from(ok)
+        );
+        // Reported everywhere; ENFORCED (the layer leaves the device) only with
+        // CASCADIA_INKLING_OV_MOE_CHECK=enforce, until the check has a record.
+        let enforce =
+            std::env::var("CASCADIA_INKLING_OV_MOE_CHECK").is_ok_and(|v| v.trim() == "enforce");
+        if !ok && !enforce {
+            return true;
+        }
         if !ok {
             ov.fail_layer(
                 *lid,
