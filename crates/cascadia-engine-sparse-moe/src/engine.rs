@@ -5519,6 +5519,11 @@ struct StageProfile {
     spec_sent: u64,
     spec_hits: u64,
     spec_misses: u64,
+    /// Of those, guesses that came from the drafter model; and verified
+    /// tokens that had no guess in flight behind them at all.
+    spec_lm_hits: u64,
+    spec_lm_misses: u64,
+    spec_none: u64,
     runner: crate::staged::RunnerProfile,
 }
 
@@ -5556,6 +5561,9 @@ impl StageProfile {
             spec_sent: 0,
             spec_hits: 0,
             spec_misses: 0,
+            spec_lm_hits: 0,
+            spec_lm_misses: 0,
+            spec_none: 0,
             runner: crate::staged::RunnerProfile::default(),
         }
     }
@@ -5648,6 +5656,9 @@ impl StageProfile {
             spec_sent = self.spec_sent,
             spec_hits = self.spec_hits,
             spec_misses = self.spec_misses,
+            spec_lm_hits = self.spec_lm_hits,
+            spec_lm_misses = self.spec_lm_misses,
+            spec_none = self.spec_none,
             attn_ms = ns_ms(now.decode_attn_ns, was.decode_attn_ns),
             mlp_ms = ns_ms(now.decode_mlp_ns, was.decode_mlp_ns),
             prefill_attn_ms = ns_ms(now.prefill_attn_ns, was.prefill_attn_ns),
@@ -5723,6 +5734,8 @@ struct SpecSent {
     input: i64,
     /// The input was a draft (in the drafter's history, not in `generated`).
     guess: bool,
+    /// The draft came from the drafter model (not from the n-gram tables).
+    from_model: bool,
     valid: bool,
     sent_at: Instant,
 }
@@ -6980,11 +6993,13 @@ impl<R: StagedRunner> PipelineEngine<R> {
             st.pos = rec.pos + 1;
             st.next = t;
             st.next_emitted = false;
+            let from_model = st.spec.front().is_some_and(|n| n.from_model);
             match st.spec.front().map(|n| n.input == t) {
                 Some(true) => {
                     self.spec_stats.1 += 1;
                     if let Some(p) = self.stage_profile.as_mut() {
                         p.spec_hits += 1;
+                        p.spec_lm_hits += u64::from(from_model);
                     }
                 }
                 Some(false) => {
@@ -7002,6 +7017,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     self.spec_stats.2 += 1;
                     if let Some(p) = self.stage_profile.as_mut() {
                         p.spec_misses += 1;
+                        p.spec_lm_misses += u64::from(from_model);
                     }
                     if !self.runner.truncate_stream(slot, len) {
                         return self.fail_streams_into(out, "speculation: rewind refused".into());
@@ -7012,7 +7028,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
                         return self.fail_streams_into(out, format!("send_stream_rewind: {e}"));
                     }
                 }
-                None => {}
+                None => {
+                    if let Some(p) = self.stage_profile.as_mut() {
+                        p.spec_none += 1;
+                    }
+                }
             }
             break;
         }
@@ -7059,8 +7079,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
         loop {
             let st = &self.streams[0];
             let valid = st.spec.iter().filter(|r| r.valid).count();
-            let (pos, input, guess) = match st.spec.iter().rev().find(|r| r.valid) {
-                None => (st.pos, st.next, false),
+            let (pos, input, guess, from_model) = match st.spec.iter().rev().find(|r| r.valid) {
+                None => (st.pos, st.next, false, false),
                 Some(last) => {
                     // Guesses beyond what the request may still produce are wasted.
                     let ahead = st.generated.len() + valid;
@@ -7081,10 +7101,14 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     else {
                         break;
                     };
-                    (pos, d, true)
+                    let from_model = self.streams[0]
+                        .draft
+                        .as_ref()
+                        .is_some_and(|d| d.last_from_model());
+                    (pos, d, true, from_model)
                 }
             };
-            if let Err(e) = self.spec_send(&down, pos, input, guess) {
+            if let Err(e) = self.spec_send(&down, pos, input, guess, from_model) {
                 return self.fail_streams_into(out, e);
             }
         }
@@ -7217,6 +7241,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         pos: usize,
         input: i64,
         guess: bool,
+        from_model: bool,
     ) -> Result<(), String> {
         let compute_started = Instant::now();
         let slot = self.streams[0].slot;
@@ -7262,6 +7287,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             pos,
             input,
             guess,
+            from_model,
             valid: true,
             sent_at: Instant::now(),
         });

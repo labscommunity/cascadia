@@ -80,7 +80,11 @@ fn main() {
     let mut ask = Duration::ZERO;
     let started = Instant::now();
     for d in corpus.iter().take(docs) {
-        let prompt = enc(d["prompt"].as_str().unwrap_or(""));
+        // The prompt as the fleet's API renders it (Inkling's chat template).
+        let prompt = enc(&format!(
+            "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>{}<|end_message|><|message_model|>",
+            d["prompt"].as_str().unwrap_or("")
+        ));
         let text = enc(d["text"].as_str().unwrap_or(""));
         let mut draft = Draft::new().with_draft_k(1).with_shared(shared.clone());
         if let Some(cfg) = lm.clone() {

@@ -143,6 +143,20 @@ impl SharedNgrams {
         None
     }
 
+    /// A follower the table is SURE of: the longest context (three tokens),
+    /// seen at least twice, followed by the same token nine times in ten.
+    /// That is text the fleet has written before (a repeated prompt, a stock
+    /// phrase): there the table beats any drafter model.
+    pub fn sure_guess(&self, buf: &[i64]) -> Option<i64> {
+        let k = Self::MAX_CONTEXT;
+        if buf.len() < k {
+            return None;
+        }
+        let f = self.table.get(&Self::key(&buf[buf.len() - k..]))?;
+        let &(t, n) = f.top.iter().max_by_key(|(_, n)| *n)?;
+        (f.seen >= Self::MIN_SEEN && n as f32 >= 0.9 * f.seen as f32).then_some(t)
+    }
+
     pub fn contexts(&self) -> usize {
         self.table.len()
     }
@@ -243,6 +257,8 @@ pub struct Draft {
     lm: Option<crate::lm_draft::LmLink>,
     /// Guesses by source: `(model, tables)`.
     sources: (u64, u64),
+    /// The last guess handed out came from the drafter model.
+    last_from_model: bool,
 }
 
 impl Draft {
@@ -257,7 +273,13 @@ impl Draft {
             lm_cfg: None,
             lm: None,
             sources: (0, 0),
+            last_from_model: false,
         }
+    }
+
+    /// Whether the last [`Self::propose_one`] answer came from the drafter model.
+    pub fn last_from_model(&self) -> bool {
+        self.last_from_model
     }
 
     /// Ask a drafter model first ([`crate::lm_draft`]); the tables answer when
@@ -274,16 +296,27 @@ impl Draft {
     /// The next token's guess for the speculation path: the drafter model's if
     /// one is configured and has an answer within `wait`, else the tables'.
     pub fn propose_one(&mut self, wait: std::time::Duration) -> Option<i64> {
+        self.last_from_model = false;
         if self.lm.is_none() {
             if let Some((cfg, tok)) = self.lm_cfg.take() {
                 let prompt = &self.history[..self.prompt_len.min(self.history.len())];
                 self.lm = Some(crate::lm_draft::LmLink::new(cfg, tok, prompt));
             }
         }
+        if self.lm.is_some() {
+            // Text seen before (this request's own last four tokens, or a
+            // context the shared table is sure of) outranks the model: on a
+            // repeated prompt the tables are right nine times in ten.
+            if let Some(t) = self.sure_next() {
+                self.sources.1 += 1;
+                return Some(t);
+            }
+        }
         if let Some(lm) = self.lm.as_mut() {
             let from = self.prompt_len.min(self.history.len());
             if let Some(t) = lm.next(&self.history[from..], wait) {
                 self.sources.0 += 1;
+                self.last_from_model = true;
                 return Some(t);
             }
             // A guess from the tables would send the text somewhere the model
@@ -430,6 +463,17 @@ impl Draft {
             }
         }
         out
+    }
+
+    /// A guess the tables are sure of (see [`SharedNgrams::sure_guess`]).
+    fn sure_next(&self) -> Option<i64> {
+        let h = &self.history;
+        if h.len() >= MAX_NGRAM {
+            if let Some(&t) = self.table.get(&h[h.len() - MAX_NGRAM..]) {
+                return Some(t);
+            }
+        }
+        self.shared.as_ref()?.lock().ok()?.sure_guess(h)
     }
 
     /// Look up the next token after the trailing k-gram of `buf`.

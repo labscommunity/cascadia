@@ -140,7 +140,8 @@ impl LmLink {
     /// sees its text (special tokens dropped) as one user turn.
     pub fn new(cfg: LmConfig, tok: Arc<Tokenizer>, prompt_ids: &[i64]) -> Self {
         let ids: Vec<u32> = prompt_ids.iter().map(|&t| t as u32).collect();
-        let user = tok.decode(&ids, true).unwrap_or_default();
+        let user = last_user_turn(&tok.decode(&ids, false).unwrap_or_default())
+            .unwrap_or_else(|| tok.decode(&ids, true).unwrap_or_default());
         let head = cfg.template.render(user.trim());
         let shared = Arc::new((Mutex::new(Shared::default()), Condvar::new()));
         let worker = shared.clone();
@@ -250,12 +251,13 @@ impl LmLink {
             cont
         } else {
             match cont.rfind(|c: char| c.is_whitespace()) {
-                // Nothing but a first word yet: take it as it stands. Right
-                // after a wrong guess the pipeline is empty and one drafter
-                // token of delay is a frame not sent; most pieces are whole
-                // words, and a guess cut short is only a wrong guess.
-                Some(0) | None => cont,
+                // Nothing but a first word yet. Taking it as it stands saves
+                // one drafter token of delay after a wrong guess, but a word
+                // cut short is a wrong guess AND sends the text away from
+                // what the drafter is writing (it has to start over).
+                Some(0) | None if gamble_first_word() => cont,
                 Some(i) => &cont[..i],
+                None => "",
             }
         };
         if stable.is_empty() {
@@ -281,6 +283,27 @@ impl Drop for LmLink {
         }
         cv.notify_all();
     }
+}
+
+/// `CASCADIA_STREAMS_SPEC_LM_GAMBLE=1`: use the drafter's first word before
+/// the next one proves it complete.
+fn gamble_first_word() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CASCADIA_STREAMS_SPEC_LM_GAMBLE").is_ok_and(|v| v.trim() == "1")
+    })
+}
+
+/// The last user message of a prompt rendered with message markers
+/// (`<|message_user|>...<|end_message|>`, Inkling's chat template, which also
+/// puts a "Thinking effort level" system line first). `None` when the prompt
+/// has no such markers.
+fn last_user_turn(rendered: &str) -> Option<String> {
+    let start = rendered.rfind("<|message_user|>")? + "<|message_user|>".len();
+    let rest = &rendered[start..];
+    let body = rest.split("<|end_message|>").next().unwrap_or(rest);
+    let body = body.strip_prefix("<|content_text|>").unwrap_or(body);
+    (!body.trim().is_empty()).then(|| body.to_string())
 }
 
 fn worker_loop(shared: &Arc<(Mutex<Shared>, Condvar)>, addr: &str, n_predict: usize) {

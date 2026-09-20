@@ -43,7 +43,7 @@ for ph in phases:
                          head=tot["head_ms"] / fr, relays=tot["relays"], relay_ms=tot["relay_ms"], opens=tot["opens"], open_rows=tot["open_rows"],
                          prefill_ms=tot["prefill_ms"], rtt=tot["round_trip_ms"] / (tot["replies"] or 1), maxrtt=max([p.get("max_round_trip_ms", 0) for p in profs] or [0]),
                          replies=tot["replies"], emit=tot["emit_ms"], miss=100.0 * tot["cache_misses"] / look if look else 0.0,
-                         spec=(tot["spec_sent"], tot["spec_hits"], tot["spec_misses"]), cache=(profs[-1].get("cache_mib", 0) if profs else 0),
+                         spec=(tot["spec_sent"], tot["spec_hits"], tot["spec_misses"], "model right/wrong", tot.get("spec_lm_hits", 0), tot.get("spec_lm_misses", 0), "no guess", tot.get("spec_none", 0)), cache=(profs[-1].get("cache_mib", 0) if profs else 0),
                          cpu=g("cpu"), cores=g("p_cores"), w=g("pkg_w"), mhz=g("mhz"), temp=g("temp"), gpu=g("gpu"), rd=g("rd_mb_s"), swi=g("swapin_s"),
                          rx=g("rx_mb_s"), tx=g("tx_mb_s"), avail=min([x.get("mem_avail", 0) for x in sysr] or [0]), anon=max([x.get("p_rssanon", 0) for x in sysr] or [0])))
     print("rank win frames rows/f  util% wait% | ms/frame ms/row maxms |  attn   mlp ovattn ovmoe(fb/nf) | recv send head | relays(ms) | miss% cacheMiB |  cpu% cores  pkgW  MHz temp gpu% rdMB/s swi/s rxMB/s | availMiB anonMiB")
