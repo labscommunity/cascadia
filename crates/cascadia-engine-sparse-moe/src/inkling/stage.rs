@@ -304,6 +304,11 @@ impl StagedRunner for InklingRunner {
             .find_map(|l| l.ov_attn())
             .map(|o| o.stats());
         let head = self.head.as_ref().and_then(|h| h.ov()).map(|o| o.stats());
+        let moe = self
+            .layers
+            .iter()
+            .find_map(|l| l.ov_moe())
+            .map(|o| o.stats());
         Some(crate::staged::RunnerProfile {
             decode_attn_ns: c.decode_attn_ns.load(Ordering::Relaxed),
             decode_mlp_ns: c.decode_mlp_ns.load(Ordering::Relaxed),
@@ -317,6 +322,10 @@ impl StagedRunner for InklingRunner {
             ov_attn_ns: attn.map_or(0, |a| a.call_ns),
             ov_head_calls: head.map_or(0, |h| h.calls),
             ov_head_ns: head.map_or(0, |h| h.call_ns),
+            ov_moe_calls: moe.map_or(0, |m| m.calls),
+            ov_moe_ns: moe.map_or(0, |m| m.call_ns),
+            ov_moe_fallbacks: moe.map_or(0, |m| m.fallbacks),
+            ov_moe_nonfinite: moe.map_or(0, |m| m.nonfinite),
         })
     }
     fn stream_capacity(&self) -> usize {

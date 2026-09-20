@@ -52,6 +52,12 @@ pub struct RunnerProfile {
     pub ov_attn_ns: u64,
     pub ov_head_calls: u64,
     pub ov_head_ns: u64,
+    /// Fused MoE layers on the device: calls, time, calls handed back to the
+    /// CPU path, and of those the ones that overflowed half precision.
+    pub ov_moe_calls: u64,
+    pub ov_moe_ns: u64,
+    pub ov_moe_fallbacks: u64,
+    pub ov_moe_nonfinite: u64,
 }
 
 pub trait StagedRunner: Send + 'static {

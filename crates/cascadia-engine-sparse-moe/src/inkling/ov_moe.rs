@@ -100,6 +100,35 @@ pub struct OvMoeStats {
     pub compiles: u64,
     pub compile_ns: u64,
     pub fallbacks: u64,
+    /// Calls whose output held a NaN or infinity (half-precision overflow on
+    /// the device) and were handed to the other expert path; part of `fallbacks`.
+    pub nonfinite: u64,
+}
+
+/// `CASCADIA_INKLING_OV_MOE_WEIGHT_RESCALE` (default on): divide each row's
+/// routing weights by a power of two before the device call and multiply the
+/// row's output back on the host. Inkling's routing weights sum to
+/// `8 * mlp.gate.global_scale`, which grows with depth (about 100 per weight at
+/// layer 40): at the plugin's f16 the weighted sum of expert outputs passes
+/// 65504 and the layer returns infinities, then NaN logits (the fleet printed
+/// `!!!!`). A power of two changes no mantissa bit, so the result equals the
+/// unscaled one wherever that one was finite.
+fn weight_rescale() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("CASCADIA_INKLING_OV_MOE_WEIGHT_RESCALE")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// Smallest power of two >= `v` (1 for anything at or below 1, or not finite).
+fn pow2_ceil(v: f32) -> f32 {
+    if !v.is_finite() || v <= 1.0 {
+        return 1.0;
+    }
+    2.0f32.powi(v.log2().ceil() as i32)
 }
 
 pub struct OvMoe {
@@ -125,6 +154,7 @@ pub struct OvMoe {
     compiles: AtomicU64,
     compile_ns: AtomicU64,
     fallbacks: AtomicU64,
+    nonfinite: AtomicU64,
 }
 
 impl OvMoe {
@@ -251,6 +281,7 @@ impl OvMoe {
             compiles: AtomicU64::new(0),
             compile_ns: AtomicU64::new(0),
             fallbacks: AtomicU64::new(0),
+            nonfinite: AtomicU64::new(0),
         }
     }
 
@@ -282,6 +313,7 @@ impl OvMoe {
             compiles: self.compiles.load(Ordering::Relaxed),
             compile_ns: self.compile_ns.load(Ordering::Relaxed),
             fallbacks: self.fallbacks.load(Ordering::Relaxed),
+            nonfinite: self.nonfinite.load(Ordering::Relaxed),
         }
     }
 
@@ -402,6 +434,28 @@ impl OvMoe {
             return None;
         };
         let t0 = Instant::now();
+        // Keep the device's weighted sum inside half precision: per row, the
+        // routing weights go down by a power of two and the output comes back
+        // up by it on the host (see `weight_rescale`).
+        let row_scale: Vec<f32> = if weight_rescale() {
+            weights
+                .chunks_exact(self.k_total)
+                .map(|w| pow2_ceil(w.iter().map(|v| v.abs()).sum()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let scaled_w: Vec<f32>;
+        let weights = if row_scale.iter().any(|&f| f != 1.0) {
+            scaled_w = weights
+                .chunks_exact(self.k_total)
+                .zip(&row_scale)
+                .flat_map(|(w, &f)| w.iter().map(move |v| v / f))
+                .collect();
+            &scaled_w[..]
+        } else {
+            weights
+        };
         // Pad to the shape bucket: copies of the last row with zero weights
         // (the kernel still touches their experts, which are the same ones).
         let prow = bucket_rows(rows);
@@ -502,15 +556,29 @@ impl OvMoe {
             self.fallbacks.fetch_add(1, Ordering::Relaxed);
             return None;
         }
+        let mut out = out;
+        out.truncate(rows * self.hidden);
+        // An expert's own output can still pass 65504 on the device (seen on a
+        // shared expert of layer 8: -94909): that call goes to the other
+        // expert path instead of poisoning the residual stream with NaN.
+        if out.iter().any(|v| !v.is_finite()) {
+            self.nonfinite.fetch_add(1, Ordering::Relaxed);
+            self.fallbacks.fetch_add(1, Ordering::Relaxed);
+            self.note_call_failure(lid, "non-finite output (half-precision overflow)");
+            return None;
+        }
+        for (row, &f) in out.chunks_exact_mut(self.hidden).zip(&row_scale) {
+            if f != 1.0 {
+                for v in row {
+                    *v *= f;
+                }
+            }
+        }
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.rows.fetch_add(rows as u64, Ordering::Relaxed);
         self.call_ns
             .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        Some(if prow != rows {
-            out[..rows * self.hidden].to_vec()
-        } else {
-            out
-        })
+        Some(out)
     }
 
     fn note_call_failure(&self, lid: u32, why: &str) {
@@ -573,5 +641,27 @@ impl std::fmt::Debug for OvMoe {
             .field("hidden", &self.hidden)
             .field("k_total", &self.k_total)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod rescale_tests {
+    #[test]
+    fn weight_rescale_factor_is_an_exact_power_of_two() {
+        use super::pow2_ceil;
+        assert_eq!(pow2_ceil(0.0), 1.0);
+        assert_eq!(pow2_ceil(0.7), 1.0);
+        assert_eq!(pow2_ceil(1.0), 1.0);
+        assert_eq!(pow2_ceil(1.5), 2.0);
+        assert_eq!(pow2_ceil(800.0), 1024.0);
+        assert_eq!(pow2_ceil(1024.0), 1024.0);
+        assert_eq!(pow2_ceil(f32::NAN), 1.0);
+        assert_eq!(pow2_ceil(f32::INFINITY), 1.0);
+        // Dividing a weight by the factor and multiplying the product back is
+        // exact: only the exponent moves.
+        for &(w, y) in &[(97.3f32, 1873.25f32), (105.0, -0.0371), (3.1e-3, 4.2e2)] {
+            let f = pow2_ceil(800.0);
+            assert_eq!((w / f) * y * f, w * y);
+        }
     }
 }

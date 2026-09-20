@@ -636,10 +636,28 @@ pub fn load_stage(
         m.num_experts + m.n_shared_experts,
     ) {
         let ov = std::sync::Arc::new(ov);
+        // Compile the fused layers while the rank loads, not inside the first
+        // request: on an 11-rank pipeline the lazy compiles ran one rank after
+        // another (first request: 242 s to the first token), here every rank
+        // compiles at once. `CASCADIA_INKLING_OV_MOE_WARM=0` keeps them lazy.
+        let warm = std::env::var("CASCADIA_INKLING_OV_MOE_WARM")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true);
         for (i, l) in layers.iter_mut().enumerate() {
             let lid = (lo + i) as u32;
             if experts != ExpertSet::None && ov.has_layer(lid) && ov_moe_layer_selected(lid) {
                 l.attach_ov_moe(lid, std::sync::Arc::clone(&ov));
+                if warm {
+                    let t0 = std::time::Instant::now();
+                    let ok = l.warm_ov_moe();
+                    tracing::info!(
+                        target: "cascadia::inkling",
+                        event = "ov_moe_warm",
+                        layer = lid,
+                        ok = ok.unwrap_or(false),
+                        secs = t0.elapsed().as_secs_f64(),
+                    );
+                }
             }
         }
     }
