@@ -1015,6 +1015,17 @@ impl ActivationClient {
         self.connect_with_timeout(DEFAULT_CONNECT_TIMEOUT).await
     }
 
+    /// One connection attempt, without the operator messages of
+    /// [`Self::connect_with_timeout`]: for callers that poll (the driver's
+    /// idle link keeper). The name is resolved again on every call. Bound it
+    /// with a timeout: an unreachable host can hold a connect for a long time.
+    pub async fn try_connect(&mut self) -> TransportResult<()> {
+        let sock = TcpStream::connect((self.host.as_str(), self.port)).await?;
+        tune_pipeline_socket(&sock);
+        self.sock = Some(sock);
+        Ok(())
+    }
+
     pub async fn send(&mut self, tensor: &Tensor) -> TransportResult<TransferStats> {
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
         send_tensor(sock, tensor).await

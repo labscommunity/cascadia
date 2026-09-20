@@ -315,6 +315,8 @@ fn run_round(e0: &mut dyn Engine, tag: &str, n: usize) -> Vec<Result<Vec<i64>, S
 /// reads EOF (closing rank 0's client from the test would not exercise that).
 struct Tail {
     ports: (u16, u16, u16),
+    /// Completes when rank 1 has accepted rank 0's dial.
+    accepted: Option<tokio::task::JoinHandle<()>>,
     fwd: tokio::task::JoinHandle<()>,
     c12: Arc<Mutex<ActivationClient>>,
     workers: Vec<std::thread::JoinHandle<()>>,
@@ -346,7 +348,7 @@ impl Tail {
         let p1 = s01.port();
         let s01 = Arc::new(Mutex::new(s01));
         let sc = s01.clone();
-        tokio::spawn(async move { sc.lock().await.accept().await.unwrap() });
+        let accepted = tokio::spawn(async move { sc.lock().await.accept().await.unwrap() });
 
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", ports.0))
             .await
@@ -408,6 +410,7 @@ impl Tail {
             .collect();
         Tail {
             ports: (pf, p1, p2),
+            accepted: Some(accepted),
             fwd,
             c12,
             workers,
@@ -491,9 +494,23 @@ async fn rank0_redials_after_downstream_restart() {
         .collect();
     assert!(expected.iter().all(|t| !t.is_empty()));
 
-    // 1. The neighbours restart while rank 0 idles.
+    // 1. The neighbours restart while rank 0 idles, and no request arrives.
+    // Rank 0 must notice the dead link and dial the new rank 1 by itself:
+    // until it does, rank 1 waits for that dial, unloaded, and on a real fleet
+    // every rank that restarts after it waits on the one before (seen with 11
+    // boxes: ranks 1-5 all "waiting for the previous rank to dial in" behind a
+    // rank 0 that was "serving").
     let ports = tail.kill().await;
-    let tail = Tail::start(&dir, &handle, ports).await;
+    let mut tail = Tail::start(&dir, &handle, ports).await;
+    let dialed = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tail.accepted.take().unwrap(),
+    )
+    .await;
+    assert!(
+        dialed.is_ok(),
+        "rank 0 did not re-dial the restarted rank 1 while idle (no request was made)"
+    );
     let (e0, got) = round(e0, "restarted", n).await;
     for (i, (g, e)) in got.iter().zip(&expected).enumerate() {
         assert_eq!(g.as_ref(), Ok(e), "task {i} after the neighbours restarted");

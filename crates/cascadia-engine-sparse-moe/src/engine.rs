@@ -1453,6 +1453,9 @@ const WORKER_BACKOFF: Duration = Duration::from_millis(200);
 /// stall every step for the whole connect budget.
 const REDIAL_BUDGET: Duration = Duration::from_secs(2);
 const REDIAL_INTERVAL: Duration = Duration::from_secs(3);
+/// How often rank 0's link keeper looks at the downstream link while no
+/// request is in progress.
+const IDLE_LINK_CHECK: Duration = Duration::from_secs(2);
 
 /// In-flight multi-stage generation on rank 0 (one at a time; queued tasks
 /// wait in `pending`). This is the streamed replacement for the deleted
@@ -5316,6 +5319,15 @@ pub struct PipelineEngine<R: StagedRunner> {
     /// Rank 0 only: earliest time for the next downstream re-dial while the
     /// link is down (see `redial_downstream`).
     redial_next: Option<Instant>,
+    /// Rank 0 only: tasks this engine is handling (queued, streaming, frames in
+    /// flight). The link keeper touches the downstream socket only at zero.
+    link_busy: Arc<std::sync::atomic::AtomicUsize>,
+    /// Bumped by the link keeper each time it re-dialed; lets `step` see that
+    /// a failure it latched has already been repaired.
+    link_epoch: Arc<std::sync::atomic::AtomicU64>,
+    seen_link_epoch: u64,
+    /// Dropping this (with the engine) ends the link keeper task.
+    link_keeper: Option<Arc<()>>,
     disconnect_reported: bool,
     last_rank_history: Vec<i64>,
     last_rank_rng: u64,
@@ -5462,6 +5474,10 @@ impl<R: StagedRunner> PipelineEngine<R> {
             peer_disconnected: false,
             upstream_seen: false,
             redial_next: None,
+            link_busy: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            link_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            seen_link_epoch: 0,
+            link_keeper: None,
             disconnect_reported: false,
             last_rank_history: Vec::new(),
             last_rank_rng: 0,
@@ -5524,7 +5540,81 @@ impl<R: StagedRunner> PipelineEngine<R> {
             "multi-stream decode enabled ({})",
             self.runner.arch_name()
         );
+        self.spawn_link_keeper();
         self.stream_cap
+    }
+
+    /// Rank 0 of a multi-stream pipeline: keep the downstream link alive while
+    /// idle. `step` only runs while a request is being served, so without this
+    /// a link that died between requests (the ranks behind restarted) stays
+    /// dead until the next request, and until then rank 1 waits for a dial
+    /// that never comes, unloaded, and every rank that restarts after it waits
+    /// on the one before: seen on an 11-box fleet as ranks 1-5 all "waiting
+    /// for the previous rank to dial in" behind a rank 0 that reported
+    /// "serving". The keeper only touches the socket while no task is queued,
+    /// streaming or in flight (the downstream never sends unsolicited bytes,
+    /// so EOF, an error or data on an idle link means dead or out of sync),
+    /// holds the client's lock while it probes and re-dials, and resolves the
+    /// peer's name again on every attempt.
+    fn spawn_link_keeper(&mut self) {
+        if self.rank != 0 || self.total <= 1 || self.link_keeper.is_some() {
+            return;
+        }
+        let Some(down) = self.transport.downstream.clone() else {
+            return;
+        };
+        let token = Arc::new(());
+        let alive = Arc::downgrade(&token);
+        self.link_keeper = Some(token);
+        let busy = self.link_busy.clone();
+        let epoch = self.link_epoch.clone();
+        self.runtime_handle.spawn(async move {
+            use std::sync::atomic::Ordering::SeqCst;
+            let mut tick = tokio::time::interval(IDLE_LINK_CHECK);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut down_since: Option<Instant> = None;
+            loop {
+                tick.tick().await;
+                if alive.upgrade().is_none() {
+                    return;
+                }
+                if busy.load(SeqCst) != 0 {
+                    continue;
+                }
+                let mut client = down.lock().await;
+                // A request may have arrived while this waited for the lock.
+                if busy.load(SeqCst) != 0 {
+                    continue;
+                }
+                let dead = tokio::time::timeout(Duration::from_millis(1), client.wait_readable())
+                    .await
+                    .is_ok();
+                if !dead {
+                    continue;
+                }
+                if down_since.is_none() {
+                    warn!("downstream link is dead while idle; re-dialing until the next rank is back");
+                    down_since = Some(Instant::now());
+                }
+                client.close().await;
+                if let Ok(Ok(())) = tokio::time::timeout(REDIAL_BUDGET, client.try_connect()).await {
+                    epoch.fetch_add(1, SeqCst);
+                    info!(
+                        down_s = down_since.map(|t| t.elapsed().as_secs()).unwrap_or(0),
+                        "downstream link re-dialed while idle"
+                    );
+                    down_since = None;
+                }
+            }
+        });
+    }
+
+    /// Tell the link keeper whether a task is being handled (see `link_busy`).
+    fn note_link_busy(&self) {
+        let n = self.pending.len()
+            + self.streams.len()
+            + self.stream_inflight.iter().map(|q| q.len()).sum::<usize>();
+        self.link_busy.store(n, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Rank 0 of a multi-stream pipeline: one group's turn. Receive the
@@ -7465,6 +7555,7 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
             });
         }
         self.pending.push_back(task);
+        self.note_link_busy();
         Ok(())
     }
 
@@ -7491,6 +7582,7 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
                 self.runner.close_stream(st.slot);
             }
         }
+        self.note_link_busy();
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
@@ -7505,6 +7597,17 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
         if self.rank == 0 {
             if self.stream_cap > 0 {
                 let mut produced = Vec::new();
+                // Work is present for the whole step, whatever the last count said.
+                self.link_busy
+                    .fetch_max(1, std::sync::atomic::Ordering::SeqCst);
+                let epoch = self.link_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                if self.peer_disconnected && epoch != self.seen_link_epoch {
+                    // The link keeper re-dialed after this failure was latched.
+                    self.peer_disconnected = false;
+                    self.disconnect_reported = false;
+                    self.redial_next = None;
+                }
+                self.seen_link_epoch = epoch;
                 let idle =
                     self.streams.is_empty() && self.stream_inflight.iter().all(|q| q.is_empty());
                 if !self.peer_disconnected
@@ -7527,6 +7630,7 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
                     self.redial_downstream(&mut produced);
                 }
                 produced.extend(self.step_streams());
+                self.note_link_busy();
                 if produced.is_empty()
                     && worker_should_report_disconnect(
                         self.peer_disconnected,
