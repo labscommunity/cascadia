@@ -10,7 +10,7 @@ if [ -f "$PREFIX/fleet-overrides.env" ]; then set -a; source "$PREFIX/fleet-over
 # a time into a scratch folder, moved into place only when complete: a box that loses power mid-way never finds
 # half an IR. Whatever fails here, the worker still starts (a layer without an IR simply stays on the CPU path).
 gen_fused_irs() {
-  local want="${CASCADIA_FUSE_LAYERS:-}" py l nn dst tmp free_gb
+  local want="${CASCADIA_FUSE_LAYERS:-}" py l nn dst tmp free_gb shift have pair
   [ -n "$want" ] || return 0
   py=$(command -v python3) || return 0
   [ -d "$PREFIX/pylib" ] || { echo "fused IRs: no $PREFIX/pylib on this box"; return 0; }
@@ -19,16 +19,21 @@ gen_fused_irs() {
   for l in ${want//,/ }; do
     case "$l" in ''|*[!0-9]*) continue ;; esac
     nn=$(printf %02d "$l"); dst="$PREFIX/model/moe_ov/layer_$nn"
-    [ -s "$dst/openvino_model.xml" ] && [ -s "$dst/openvino_model.bin" ] && continue
+    # CASCADIA_FUSE_UP_SHIFT="8:4 40:4": those layers are (re)generated with their up-projection scales x 2^-N (an expert
+    # whose own output passes f16's range on the device); a layer counts as present only with the asked exponent.
+    shift=0; for pair in ${CASCADIA_FUSE_UP_SHIFT:-}; do [ "${pair%%:*}" = "$l" ] && shift="${pair##*:}"; done
+    case "$shift" in ''|*[!0-9]*) shift=0 ;; esac
+    have=$(sed -n 's/.*"up_scale_exponent"[^0-9]*\([0-9][0-9]*\).*/\1/p' "$dst/cascadia_moe.json" 2>/dev/null | head -1)
+    [ -s "$dst/openvino_model.xml" ] && [ -s "$dst/openvino_model.bin" ] && [ "${have:-0}" = "$shift" ] && continue
     # a layer that failed once is not retried at every start (each try can take minutes): CASCADIA_FUSE_RETRY=1 asks again
     [ -e "$PREFIX/logs/fused-ir.failed-$nn" ] && [ "${CASCADIA_FUSE_RETRY:-0}" != 1 ] && continue
     free_gb=$(df -Pk "$PREFIX/model" | awk 'NR==2 {print int($4/1048576)}')
     [ "${free_gb:-0}" -ge 20 ] || { echo "fused IRs: only ${free_gb} GB free, layer $l not generated"; return 0; }
-    [ -s "$PREFIX/tools/inkling_moe_layer_ov.py" ] || write_generator "$PREFIX/tools/inkling_moe_layer_ov.py"
+    write_generator "$PREFIX/tools/inkling_moe_layer_ov.py"
     rm -rf "$tmp"; mkdir -p "$tmp"
     echo "fused IRs: generating layer $l (about a minute, 8.4 GB)"
     if PYTHONPATH="$PREFIX/pylib" timeout 900 "$py" "$PREFIX/tools/inkling_moe_layer_ov.py" --src "$PREFIX/model" --out "$tmp" \
-         --layers "$l" --layout u4zp --pad-experts 4 >> "$PREFIX/logs/fused-ir.log" 2>&1 \
+         --layers "$l" --layout u4zp --pad-experts 4 --up-scale-exponent "$shift" >> "$PREFIX/logs/fused-ir.log" 2>&1 \
        && [ -s "$tmp/moe_ov/layer_$nn/openvino_model.bin" ]; then
       mkdir -p "$PREFIX/model/moe_ov"; rm -rf "$dst"; mv "$tmp/moe_ov/layer_$nn" "$dst" && echo "fused IRs: layer $l ready"
       rm -f "$PREFIX/logs/fused-ir.failed-$nn"
@@ -129,7 +134,7 @@ def raw_const(t, dims, raw):
     return ov.op.Constant(ten, shared_memory=False)
 
 
-def stacked_weight(packed_list, scale_list, out, inn, layout="u4zp"):
+def stacked_weight(packed_list, scale_list, out, inn, layout="u4zp", scale_shift=0):
     """Expert-major compressed constant + f16 scales -> the plugin's decompression chain -> [E, out, in] f32.
 
     `u4zp` (default): the bins' nibbles verbatim as `u4` with an explicit zero point of 8 —
@@ -142,6 +147,13 @@ def stacked_weight(packed_list, scale_list, out, inn, layout="u4zp"):
     ng = inn // GROUP
     raw = np.concatenate([p.reshape(-1) for p in packed_list])
     sc = np.stack([_bf16_to_f16(s) for s in scale_list]).reshape(e, out, ng, 1)
+    if scale_shift:
+        # A power of two moves only the exponent: exact unless the scale drops below f16's smallest normal (6.1e-5),
+        # where it keeps fewer mantissa bits. Reported so the caller can judge (see --up-scale-exponent).
+        f32 = sc.astype(np.float32) * np.float32(2.0 ** -scale_shift)
+        sub = int(np.count_nonzero((np.abs(f32) < 6.1e-5) & (f32 != 0)))
+        print(f"  scales x 2^-{scale_shift}: {sub} of {f32.size} ({100.0 * sub / f32.size:.2f} %) become f16 subnormals")
+        sc = f32.astype(np.float16)
     if layout == "i4":
         w = raw_const(Type.i4, [e, out, ng, GROUP], (raw ^ np.uint8(0x88)).tobytes())
         w = ops.convert(w, Type.f16)
@@ -187,7 +199,7 @@ def build_layer(gate_w, up_w, down_w, hidden, inter, n_total, k):
     return m
 
 
-def layer_model(src, lid, man, layout="u4zp", pad_experts=4):
+def layer_model(src, lid, man, layout="u4zp", pad_experts=4, up_shift=0):
     hidden, inter = man["hidden_size"], man["moe_intermediate"]
     n_exp, n_sh, k = man["num_experts"], man["n_shared_experts"], man["top_k"]
     edir = os.path.join(src, "experts", f"layer_{lid:02d}")
@@ -209,7 +221,7 @@ def layer_model(src, lid, man, layout="u4zp", pad_experts=4):
     n_total = n_exp + n_sh + pad_experts
     assert (n_total * 99) // 100 >= n_exp + n_sh, "pad_experts too small for the 1% offload floor"
     gate_w = stacked_weight([g[0] for g in gates], [g[1] for g in gates], inter, hidden, layout)
-    up_w = stacked_weight([u[0] for u in ups], [u[1] for u in ups], inter, hidden, layout)
+    up_w = stacked_weight([u[0] for u in ups], [u[1] for u in ups], inter, hidden, layout, up_shift)
     down_w = stacked_weight([d[0] for d in downs], [d[1] for d in downs], hidden, inter, layout)
     return build_layer(gate_w, up_w, down_w, hidden, inter, n_total, k + n_sh)
 
@@ -271,6 +283,10 @@ def main():
     ap.add_argument("--skip-existing", action="store_true")
     ap.add_argument("--layout", choices=["u4zp", "i4"], default="u4zp")
     ap.add_argument("--pad-experts", type=int, default=4, help="dummy experts appended so the 1%% offload floor keeps every real expert resident")
+    ap.add_argument("--up-scale-exponent", type=int, default=0,
+                    help="multiply every up-projection scale by 2^-N; the layer then returns y * 2^-N and the runtime multiplies "
+                         "it back (it reads cascadia_moe.json next to the IR). For layers whose expert output itself passes "
+                         "f16's 65504 on the device (Inkling layer 8's shared expert reaches -94909); 4 is the tested value")
     args = ap.parse_args()
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     man = json.load(open(os.path.join(args.src, "manifest.json")))
@@ -290,9 +306,11 @@ def main():
             print(f"layer {lid}: exists, skipped")
             continue
         t0 = time.time()
-        m = layer_model(args.src, lid, man, args.layout, args.pad_experts)
+        m = layer_model(args.src, lid, man, args.layout, args.pad_experts, args.up_scale_exponent)
         os.makedirs(dst, exist_ok=True)
         ov.save_model(m, xml, compress_to_fp16=False)
+        with open(os.path.join(dst, "cascadia_moe.json"), "w") as f:
+            json.dump({"up_scale_exponent": args.up_scale_exponent}, f)
         print(f"layer {lid}: written {xml} in {time.time()-t0:.0f}s")
 
 

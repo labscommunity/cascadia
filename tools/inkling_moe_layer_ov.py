@@ -86,7 +86,7 @@ def raw_const(t, dims, raw):
     return ov.op.Constant(ten, shared_memory=False)
 
 
-def stacked_weight(packed_list, scale_list, out, inn, layout="u4zp"):
+def stacked_weight(packed_list, scale_list, out, inn, layout="u4zp", scale_shift=0):
     """Expert-major compressed constant + f16 scales -> the plugin's decompression chain -> [E, out, in] f32.
 
     `u4zp` (default): the bins' nibbles verbatim as `u4` with an explicit zero point of 8 —
@@ -99,6 +99,13 @@ def stacked_weight(packed_list, scale_list, out, inn, layout="u4zp"):
     ng = inn // GROUP
     raw = np.concatenate([p.reshape(-1) for p in packed_list])
     sc = np.stack([_bf16_to_f16(s) for s in scale_list]).reshape(e, out, ng, 1)
+    if scale_shift:
+        # A power of two moves only the exponent: exact unless the scale drops below f16's smallest normal (6.1e-5),
+        # where it keeps fewer mantissa bits. Reported so the caller can judge (see --up-scale-exponent).
+        f32 = sc.astype(np.float32) * np.float32(2.0 ** -scale_shift)
+        sub = int(np.count_nonzero((np.abs(f32) < 6.1e-5) & (f32 != 0)))
+        print(f"  scales x 2^-{scale_shift}: {sub} of {f32.size} ({100.0 * sub / f32.size:.2f} %) become f16 subnormals")
+        sc = f32.astype(np.float16)
     if layout == "i4":
         w = raw_const(Type.i4, [e, out, ng, GROUP], (raw ^ np.uint8(0x88)).tobytes())
         w = ops.convert(w, Type.f16)
@@ -144,7 +151,7 @@ def build_layer(gate_w, up_w, down_w, hidden, inter, n_total, k):
     return m
 
 
-def layer_model(src, lid, man, layout="u4zp", pad_experts=4):
+def layer_model(src, lid, man, layout="u4zp", pad_experts=4, up_shift=0):
     hidden, inter = man["hidden_size"], man["moe_intermediate"]
     n_exp, n_sh, k = man["num_experts"], man["n_shared_experts"], man["top_k"]
     edir = os.path.join(src, "experts", f"layer_{lid:02d}")
@@ -166,7 +173,7 @@ def layer_model(src, lid, man, layout="u4zp", pad_experts=4):
     n_total = n_exp + n_sh + pad_experts
     assert (n_total * 99) // 100 >= n_exp + n_sh, "pad_experts too small for the 1% offload floor"
     gate_w = stacked_weight([g[0] for g in gates], [g[1] for g in gates], inter, hidden, layout)
-    up_w = stacked_weight([u[0] for u in ups], [u[1] for u in ups], inter, hidden, layout)
+    up_w = stacked_weight([u[0] for u in ups], [u[1] for u in ups], inter, hidden, layout, up_shift)
     down_w = stacked_weight([d[0] for d in downs], [d[1] for d in downs], hidden, inter, layout)
     return build_layer(gate_w, up_w, down_w, hidden, inter, n_total, k + n_sh)
 
@@ -228,6 +235,10 @@ def main():
     ap.add_argument("--skip-existing", action="store_true")
     ap.add_argument("--layout", choices=["u4zp", "i4"], default="u4zp")
     ap.add_argument("--pad-experts", type=int, default=4, help="dummy experts appended so the 1%% offload floor keeps every real expert resident")
+    ap.add_argument("--up-scale-exponent", type=int, default=0,
+                    help="multiply every up-projection scale by 2^-N; the layer then returns y * 2^-N and the runtime multiplies "
+                         "it back (it reads cascadia_moe.json next to the IR). For layers whose expert output itself passes "
+                         "f16's 65504 on the device (Inkling layer 8's shared expert reaches -94909); 4 is the tested value")
     args = ap.parse_args()
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     man = json.load(open(os.path.join(args.src, "manifest.json")))
@@ -247,9 +258,11 @@ def main():
             print(f"layer {lid}: exists, skipped")
             continue
         t0 = time.time()
-        m = layer_model(args.src, lid, man, args.layout, args.pad_experts)
+        m = layer_model(args.src, lid, man, args.layout, args.pad_experts, args.up_scale_exponent)
         os.makedirs(dst, exist_ok=True)
         ov.save_model(m, xml, compress_to_fp16=False)
+        with open(os.path.join(dst, "cascadia_moe.json"), "w") as f:
+            json.dump({"up_scale_exponent": args.up_scale_exponent}, f)
         print(f"layer {lid}: written {xml} in {time.time()-t0:.0f}s")
 
 

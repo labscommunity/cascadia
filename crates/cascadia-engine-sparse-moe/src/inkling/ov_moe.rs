@@ -155,6 +155,12 @@ pub struct OvMoe {
     compile_ns: AtomicU64,
     fallbacks: AtomicU64,
     nonfinite: AtomicU64,
+    /// Per layer: what the device's output must be multiplied by. A layer
+    /// generated with `--up-scale-exponent N` (its `cascadia_moe.json` says so)
+    /// returns `y * 2^-N`, which keeps an expert whose own output passes f16's
+    /// range finite on the device (Inkling layer 8's shared expert reaches
+    /// -94909); 1.0 for every other layer.
+    out_scale: Mutex<HashMap<u32, f32>>,
 }
 
 impl OvMoe {
@@ -282,6 +288,7 @@ impl OvMoe {
             compile_ns: AtomicU64::new(0),
             fallbacks: AtomicU64::new(0),
             nonfinite: AtomicU64::new(0),
+            out_scale: Mutex::new(HashMap::new()),
         }
     }
 
@@ -315,6 +322,34 @@ impl OvMoe {
             fallbacks: self.fallbacks.load(Ordering::Relaxed),
             nonfinite: self.nonfinite.load(Ordering::Relaxed),
         }
+    }
+
+    /// `2^N` for a layer generated with `--up-scale-exponent N`, else 1.
+    fn layer_out_scale(&self, lid: u32) -> f32 {
+        if let Some(&f) = self.out_scale.lock().unwrap().get(&lid) {
+            return f;
+        }
+        let side = self
+            .dir
+            .join(format!("layer_{lid:02}"))
+            .join("cascadia_moe.json");
+        let n = std::fs::read_to_string(&side)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| v.get("up_scale_exponent").and_then(|e| e.as_u64()))
+            .filter(|&n| n <= 16)
+            .unwrap_or(0);
+        let f = 2.0f32.powi(n as i32);
+        if n > 0 {
+            tracing::info!(
+                target: "cascadia::inkling",
+                event = "ov_moe_up_scale",
+                layer = lid,
+                exponent = n,
+            );
+        }
+        self.out_scale.lock().unwrap().insert(lid, f);
+        f
     }
 
     fn xml(&self, lid: u32) -> PathBuf {
@@ -567,10 +602,20 @@ impl OvMoe {
             self.note_call_failure(lid, "non-finite output (half-precision overflow)");
             return None;
         }
-        for (row, &f) in out.chunks_exact_mut(self.hidden).zip(&row_scale) {
-            if f != 1.0 {
-                for v in row {
-                    *v *= f;
+        let layer_scale = self.layer_out_scale(lid);
+        if row_scale.is_empty() {
+            if layer_scale != 1.0 {
+                for v in out.iter_mut() {
+                    *v *= layer_scale;
+                }
+            }
+        } else {
+            for (row, &f) in out.chunks_exact_mut(self.hidden).zip(&row_scale) {
+                let f = f * layer_scale;
+                if f != 1.0 {
+                    for v in row {
+                        *v *= f;
+                    }
                 }
             }
         }
