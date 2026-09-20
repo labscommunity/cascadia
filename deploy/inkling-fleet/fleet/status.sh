@@ -14,3 +14,11 @@ if [ -f "$PREFIX/beacon.py" ]; then
   echo "fleet (as heard on the LAN; beacon: $(systemctl is-active cascadia-inkling-beacon.service 2>/dev/null)):"
   python3 "$PREFIX/beacon.py" --show --wait 2 --fleet "${FLEET:-inkling}" --port "${BEACON_PORT:-9099}" || true
 fi
+python3 - <<'PY' 2>/dev/null || true
+import json, time
+try:
+    u = json.load(open("/run/cascadia-inkling/update.json"))
+    print("fleet files: version %s, %s" % (time.strftime("%m-%d %H:%M:%S", time.localtime(u["version"])) if u["version"] else "none yet", "in sync with rank 0" if u["ok"] else "last check failed: " + u["error"]))
+except OSError:
+    print("fleet files: this box is not enrolled in the updater")
+PY

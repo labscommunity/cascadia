@@ -83,7 +83,11 @@ def announce(port, payload):
                 mac = open("/sys/class/net/%s/address" % name).read().strip()
             except OSError:
                 mac = payload["host"]
-            s.sendto(json.dumps(dict(payload, ip=ip, id=mac)).encode(), (brd, port))
+            try:
+                files = int(json.load(open("/run/cascadia-inkling/update.json")).get("version", 0))
+            except (OSError, ValueError):
+                files = 0
+            s.sendto(json.dumps(dict(payload, ip=ip, id=mac, files=files)).encode(), (brd, port))
             s.close()
             sent.append(ip)
         except OSError:
@@ -96,10 +100,14 @@ def parse(data, fleet):
         m = json.loads(data.decode())
         if m.get("magic") == MAGIC and m.get("fleet") == fleet:
             host = str(m.get("host", "?"))
+            parse.files[int(m["rank"])] = int(m.get("files", 0) or 0)
             return int(m["rank"]), int(m.get("total", 0)), host, str(m.get("id", host))
     except (ValueError, KeyError, TypeError, UnicodeDecodeError):
         pass
     return None
+
+
+parse.files = {}  # rank -> version of the fleet files its updater has applied (0 = not enrolled)
 
 
 def write_hosts(path, fleet, table):
@@ -148,7 +156,9 @@ def show(table, dups, total, fleet, me=None):
             note += "  (silent for %d s)" % age
         if r in dups:
             note += "  <-- CLAIMED BY SEVERAL BOXES: %s" % ", ".join(sorted(dups[r]))
-        print("  rank %2d  %-15s  %s%s" % (r, e["ip"], e["host"], note))
+        v = parse.files.get(r, 0)
+        files = "files %s" % time.strftime("%m-%d %H:%M:%S", time.localtime(v)) if v else "files: not enrolled"
+        print("  rank %2d  %-15s  %-16s %s%s" % (r, e["ip"], e["host"], files, note))
     if 0 in table:
         print("  API: http://%s:8000   (on a fleet box also http://%s-rank-0:8000)" % (table[0]["ip"], fleet))
 

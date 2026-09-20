@@ -3,6 +3,8 @@
 set -u
 PREFIX="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 set -a; source "$PREFIX/rank.env"; set +a
+# fleet-wide settings pushed from rank 0 by the updater win over this box's own (same on every box by construction)
+if [ -f "$PREFIX/fleet-overrides.env" ]; then set -a; source "$PREFIX/fleet-overrides.env"; set +a; fi
 # side-by-side OpenVINO runtime for this process only
 if [ -n "${OVDIR:-}" ] && [ -f "$OVDIR/setupvars.sh" ]; then set +u; source "$OVDIR/setupvars.sh" > /dev/null; set -u; fi
 args=(worker --rank "$RANK" --total "$TOTAL" --engine sparse-moe --device CPU --model "$PREFIX/model"
