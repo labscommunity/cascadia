@@ -220,6 +220,31 @@ def gate():
     return ok, res
 
 
+def gate_multi(n=8):
+    """The same check with the reference prompts decoding side by side with others: multi-row kernels (expert GEMM,
+    batched dense MLP, batched admission) only run when a frame carries several rows, which a lone request never does."""
+    ref = json.load(open(os.path.join(HERE, "reference.json")))
+    order = [GATE_PROMPTS[i % len(GATE_PROMPTS)] if i % 2 == 0 else 6 + i for i in range(n)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
+        outs = list(ex.map(lambda i: chat(i, GATE_TOKENS, timeout=900), order))
+    res = []
+    for i, r in zip(order, outs):
+        got = r.get("text", "")
+        bad = ("error" in r) or not got.strip() or "!!!!" in got or len(set(got)) < 6
+        item = dict(i=i, broken=bad, text=got[:80], error=r.get("error"))
+        if str(i) in ref:
+            want = ref[str(i)]; common = 0
+            for x, y in zip(got, want):
+                if x != y:
+                    break
+                common += 1
+            item.update(match_chars=common, of=len(want))
+        res.append(item)
+    judged = [x for x in res if "of" in x]
+    ok = all(not x["broken"] for x in res) and all(x["match_chars"] >= min(40, x["of"]) for x in judged)
+    return ok, res
+
+
 def cmd_gate(a):
     ok, res = gate()
     for x in res:
@@ -322,6 +347,14 @@ def cmd_run(a):
     log("GATE", "PASS" if ok else "FAIL")
     if not ok and not a.force:
         return 3
+    ok2, res2 = gate_multi()
+    json.dump(dict(ok=ok, prompts=res, multi_ok=ok2, multi=res2), open(os.path.join(d, "gate.json"), "w"), indent=1)
+    for x in res2:
+        log("gate (8 side by side) prompt %d: %s%s  %r" % (x["i"], "%d/%d chars match" % (x["match_chars"], x["of"]) if "of" in x else "no reference",
+            "  BROKEN" if x["broken"] else "", x["text"][:50]))
+    log("GATE MULTI", "PASS" if ok2 else "FAIL")
+    if not ok2 and not a.force:
+        return 4
     return cmd_bench(a)
 
 

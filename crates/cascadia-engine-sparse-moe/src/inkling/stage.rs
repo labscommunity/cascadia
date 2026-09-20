@@ -154,6 +154,26 @@ impl InklingRunner {
                 }
             }
         }
+        // `CASCADIA_INKLING_PREWARM=1`: fill the resident expert copy while
+        // loading (see `MoeLayer::prewarm_expert_cache`).
+        if remote.is_none() && super::env_flag("CASCADIA_INKLING_PREWARM") {
+            let t0 = std::time::Instant::now();
+            let (mut experts, mut bytes) = (0usize, 0usize);
+            for l in &s.layers {
+                if let Some(moe) = l.moe() {
+                    let (n, b) = moe.prewarm_expert_cache();
+                    experts += n;
+                    bytes += b;
+                }
+            }
+            tracing::info!(
+                rank,
+                experts,
+                gib = bytes as f64 / (1u64 << 30) as f64,
+                secs = t0.elapsed().as_secs_f64(),
+                "inkling experts pre-warmed"
+            );
+        }
         let cache_bytes: usize = s.layers.iter().map(Layer::cache_bytes).sum();
         tracing::info!(
             rank,
