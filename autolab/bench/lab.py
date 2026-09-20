@@ -387,12 +387,13 @@ def run_phase(name, streams, tokens, prompt_words, cap):
     # "fresh..." phases use prompts derived from the phase's tag (RUN_TAG + phase name), unseen by earlier experiments
     prompts = [ECHO if name.startswith("echo") else fresh_prompt(RUN_TAG[0] + "/" + name, i) if name.startswith("fresh")
                else family_prompt(name, RUN_TAG[0] + "/" + name, i) if name.startswith("fam")
-               else family_prompt("fam%d" % (i % 12), RUN_TAG[0] + "/" + name, i) if name.startswith("mix") else None
+               else family_prompt("fam%d" % (i % 12), RUN_TAG[0] + "/" + name, i) if name.startswith(("mix", "stag")) else None
                for i in range(streams)]
     def start(i):
         # Hundreds of connections opened in the same millisecond get reset somewhere along the tunnel
         # (13 of 264 in exp 006); 15 ms apart they all arrive within a few seconds and none is lost.
-        time.sleep(0.015 * i)
+        # `stag...` phases: requests arrive LAB_STAGGER seconds apart (default 1 s), the way people do; the others as a burst
+        time.sleep((float(os.environ.get("LAB_STAGGER", "1")) if name.startswith("stag") else 0.015) * i)
         return chat(i, tokens, prompt_words, cap, prompts[i])
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=streams) as ex:
