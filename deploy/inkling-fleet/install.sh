@@ -246,7 +246,8 @@ ENV
   if [ "$GPU_OK" = 1 ]; then
     echo "CASCADIA_INKLING_OV_ATTN=1"; echo "CASCADIA_INKLING_OV_ATTN_DEVICE=GPU"; echo "CASCADIA_INKLING_OV_ATTN_DIR=attn_ov"; echo "CASCADIA_INKLING_OV_ATTN_DROP_RUST=1"
     echo "CASCADIA_INKLING_OV_HEAD=1"; echo "CASCADIA_INKLING_OV_HEAD_DEVICE=GPU"; echo "OV_GPU_MOE_BATCHED_GEMV_THRESHOLD=0"
-    if [ -n "$FUSED" ]; then echo "CASCADIA_INKLING_OV_MOE=1"; echo "CASCADIA_INKLING_OV_MOE_DEVICE=GPU"; echo "CASCADIA_INKLING_OV_MOE_LAYERS=$FUSED"; fi
+    # f32: at the plugin's f16 the fused layers of the deeper ranks overflow and every logit is NaN (output "!!!!")
+    if [ -n "$FUSED" ]; then echo "CASCADIA_INKLING_OV_MOE=1"; echo "CASCADIA_INKLING_OV_MOE_DEVICE=GPU"; echo "CASCADIA_INKLING_OV_MOE_LAYERS=$FUSED"; echo "CASCADIA_INKLING_OV_MOE_PRECISION=f32"; fi
   fi
 } > "$PREFIX/rank.env"
 install -m 0755 "$HERE/fleet/run.sh" "$PREFIX/run.sh"

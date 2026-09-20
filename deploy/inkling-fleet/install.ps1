@@ -195,7 +195,7 @@ $env_lines = @(
 if ($GpuOk) {
   $env_lines += @("CASCADIA_INKLING_OV_ATTN=1", "CASCADIA_INKLING_OV_ATTN_DEVICE=GPU", "CASCADIA_INKLING_OV_ATTN_DIR=attn_ov", "CASCADIA_INKLING_OV_ATTN_DROP_RUST=1",
                   "CASCADIA_INKLING_OV_HEAD=1", "CASCADIA_INKLING_OV_HEAD_DEVICE=GPU", "OV_GPU_MOE_BATCHED_GEMV_THRESHOLD=0")
-  if ($Fused -ne '') { $env_lines += @("CASCADIA_INKLING_OV_MOE=1", "CASCADIA_INKLING_OV_MOE_DEVICE=GPU", "CASCADIA_INKLING_OV_MOE_LAYERS=$Fused") }
+  if ($Fused -ne '') { $env_lines += @("CASCADIA_INKLING_OV_MOE=1", "CASCADIA_INKLING_OV_MOE_DEVICE=GPU", "CASCADIA_INKLING_OV_MOE_LAYERS=$Fused", "CASCADIA_INKLING_OV_MOE_PRECISION=f32") }
 }
 $env_lines | Set-Content "$Prefix\rank.env"
 Copy-Item "$Here\fleet\run.ps1" "$Prefix\run.ps1" -Force
