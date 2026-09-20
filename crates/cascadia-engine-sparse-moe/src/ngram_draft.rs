@@ -146,6 +146,70 @@ impl SharedNgrams {
     pub fn contexts(&self) -> usize {
         self.table.len()
     }
+
+    const MAGIC: &'static [u8; 8] = b"CSNGRAM1";
+
+    /// Write the table to `path` (tmp + rename), so what requests taught
+    /// survives a restart of the worker.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let tmp = path.with_extension("tmp");
+        {
+            let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+            w.write_all(Self::MAGIC)?;
+            w.write_all(&(self.table.len() as u64).to_le_bytes())?;
+            for (key, f) in &self.table {
+                w.write_all(&key.to_le_bytes())?;
+                w.write_all(&f.seen.to_le_bytes())?;
+                w.write_all(&[f.top.len() as u8])?;
+                for (t, n) in &f.top {
+                    w.write_all(&t.to_le_bytes())?;
+                    w.write_all(&n.to_le_bytes())?;
+                }
+            }
+            w.flush()?;
+        }
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Read a table written by [`Self::save`]. A missing, foreign or damaged
+    /// file yields an error and the caller starts empty.
+    pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::io::Read;
+        let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+        let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
+        let mut head = [0u8; 16];
+        r.read_exact(&mut head)?;
+        if &head[..8] != Self::MAGIC {
+            return Err(bad("not a shared n-gram table"));
+        }
+        let n = u64::from_le_bytes(head[8..].try_into().expect("8 bytes")) as usize;
+        if n > Self::MAX_CONTEXTS {
+            return Err(bad("table larger than this build accepts"));
+        }
+        let mut table = HashMap::with_capacity(n);
+        for _ in 0..n {
+            let mut rec = [0u8; 13];
+            r.read_exact(&mut rec)?;
+            let key = u64::from_le_bytes(rec[..8].try_into().expect("8 bytes"));
+            let seen = u32::from_le_bytes(rec[8..12].try_into().expect("4 bytes"));
+            let k = rec[12] as usize;
+            if k > Self::KEEP {
+                return Err(bad("damaged entry"));
+            }
+            let mut top = Vec::with_capacity(k);
+            for _ in 0..k {
+                let mut e = [0u8; 12];
+                r.read_exact(&mut e)?;
+                top.push((
+                    i64::from_le_bytes(e[..8].try_into().expect("8 bytes")),
+                    u32::from_le_bytes(e[8..].try_into().expect("4 bytes")),
+                ));
+            }
+            table.insert(key, Followers { seen, top });
+        }
+        Ok(Self { table })
+    }
 }
 
 /// N-gram lookup draft model. Stateless w.r.t. the target — owns its
@@ -342,6 +406,24 @@ mod tests {
             None,
             "1 in 40 is below the confidence bar"
         );
+    }
+
+    #[test]
+    fn shared_table_survives_a_restart() {
+        let mut t = SharedNgrams::default();
+        t.learn(&[1, 7, 8, 9, 10, 7, 8, 9, 11, 7, 8, 9]);
+        let dir = std::env::temp_dir().join(format!("cs-ngram-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("table.bin");
+        t.save(&path).unwrap();
+        let back = SharedNgrams::load(&path).unwrap();
+        assert_eq!(back.contexts(), t.contexts());
+        for ctx in [&[7i64, 8][..], &[8, 9], &[9], &[7, 8, 9]] {
+            assert_eq!(back.guess(ctx), t.guess(ctx), "context {ctx:?}");
+        }
+        std::fs::write(&path, b"garbage").unwrap();
+        assert!(SharedNgrams::load(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -5389,6 +5389,8 @@ pub struct PipelineEngine<R: StagedRunner> {
     spec_stats: (u64, u64, u64),
     /// What finished requests taught the drafter (speculation only).
     shared_ngrams: Arc<std::sync::Mutex<crate::ngram_draft::SharedNgrams>>,
+    /// Finished requests learned from since start (the table is saved every 16th).
+    spec_learned: std::cell::Cell<u64>,
     /// Direct reply link (`CASCADIA_STREAMS_RETURN_PORT`): the last rank
     /// listens, rank 0 dials `CASCADIA_STREAMS_RETURN_HOST`, and token replies
     /// skip the ranks in between. A mid rank forwards a reply only between
@@ -5441,6 +5443,14 @@ fn stream_prefill_window_rows() -> usize {
             .unwrap_or(128)
             .min(crate::dist::MAX_STREAM_ROWS as usize)
     })
+}
+
+/// Where the cross-request drafter table is kept between restarts
+/// (`CASCADIA_STREAMS_SPEC_TABLE`; unset = memory only).
+fn spec_table_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("CASCADIA_STREAMS_SPEC_TABLE")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
 }
 
 /// Most prompts one prefill frame carries (`CASCADIA_STREAMS_ADMIT_BATCH`,
@@ -5793,6 +5803,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             shared_ngrams: Arc::new(std::sync::Mutex::new(
                 crate::ngram_draft::SharedNgrams::default(),
             )),
+            spec_learned: std::cell::Cell::new(0),
             batched_admissions: 0,
             return_cli: None,
             return_srv: None,
@@ -5840,6 +5851,20 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 .min(crate::inkling::DEFAULT_REWIND - 1)
         });
         self.setup_return_link();
+        if self.stream_spec_depth.is_some() {
+            if let Some(path) = spec_table_path() {
+                match crate::ngram_draft::SharedNgrams::load(&path) {
+                    Ok(t) => {
+                        info!(contexts = t.contexts(), path = %path.display(), "drafter table loaded");
+                        if let Ok(mut shared) = self.shared_ngrams.lock() {
+                            *shared = t;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => warn!(path = %path.display(), "drafter table not loaded: {e}"),
+                }
+            }
+        }
         self.stage_profile = StageProfile::from_env();
         if self.stage_profile.is_some() {
             self.runner.enable_profile();
@@ -7024,6 +7049,15 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let n = (st.prompt_len + st.generated.len()).min(d.history().len());
         if let Ok(mut shared) = self.shared_ngrams.lock() {
             shared.learn(&d.history()[..n]);
+            self.spec_learned.set(self.spec_learned.get() + 1);
+            // Every 16th finished request: a few MB, off the token path.
+            if self.spec_learned.get() % 16 == 0 {
+                if let Some(path) = spec_table_path() {
+                    if let Err(e) = shared.save(&path) {
+                        warn!(path = %path.display(), "drafter table not saved: {e}");
+                    }
+                }
+            }
         }
     }
 
