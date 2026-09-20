@@ -1,0 +1,97 @@
+{
+ "ok": false,
+ "prompts": [
+  {
+   "i": 0,
+   "match_chars": 0,
+   "of": 147,
+   "exact": false,
+   "broken": true,
+   "tok_s": null,
+   "ttft_s": null,
+   "text": "",
+   "error": "server error: {'message': 'send_stream_open: not connected; call connect()/accept() first', 'type': 'engine_error'}"
+  },
+  {
+   "i": 1,
+   "match_chars": 0,
+   "of": 150,
+   "exact": false,
+   "broken": true,
+   "tok_s": null,
+   "ttft_s": null,
+   "text": "",
+   "error": "server error: {'message': 'send_stream_open: not connected; call connect()/accept() first', 'type': 'engine_error'}"
+  },
+  {
+   "i": 5,
+   "match_chars": 0,
+   "of": 112,
+   "exact": false,
+   "broken": true,
+   "tok_s": null,
+   "ttft_s": null,
+   "text": "",
+   "error": "server error: {'message': 'send_stream_open: not connected; call connect()/accept() first', 'type': 'engine_error'}"
+  }
+ ],
+ "multi_ok": false,
+ "multi": [
+  {
+   "i": 0,
+   "broken": true,
+   "text": "<think>The user wants an explanation of why the sky is blue in exactly three sen",
+   "error": "server error: {'message': 'downstream closed before StreamTokens', 'type': 'engine_error'}",
+   "match_chars": 89,
+   "of": 147
+  },
+  {
+   "i": 7,
+   "broken": true,
+   "text": "",
+   "error": "server error: {'message': 'send_stream_open_batch: not connected; call connect()/accept() first', 'type': 'engine_error'}"
+  },
+  {
+   "i": 5,
+   "broken": true,
+   "text": "",
+   "error": "server error: {'message': 'send_stream_open_batch: not connected; call connect()/accept() first', 'type': 'engine_error'}",
+   "match_chars": 0,
+   "of": 112
+  },
+  {
+   "i": 9,
+   "broken": true,
+   "text": "<think>The user wants a summary of photosynthesis in two sentences. I need to be",
+   "error": "server error: {'message': 'downstream closed before StreamTokens', 'type': 'engine_error'}"
+  },
+  {
+   "i": 1,
+   "broken": true,
+   "text": "",
+   "error": "server error: {'message': 'send_stream_open_batch: not connected; call connect()/accept() first', 'type': 'engine_error'}",
+   "match_chars": 0,
+   "of": 150
+  },
+  {
+   "i": 11,
+   "broken": true,
+   "text": "<think>The user wants a description of rain in one sentence. I should make it",
+   "error": "server error: {'message': 'downstream closed before StreamTokens', 'type': 'engine_error'}"
+  },
+  {
+   "i": 0,
+   "broken": true,
+   "text": "",
+   "error": "server error: {'message': 'send_stream_open_batch: not connected; call connect()/accept() first', 'type': 'engine_error'}",
+   "match_chars": 0,
+   "of": 147
+  },
+  {
+   "i": 13,
+   "broken": true,
+   "text": "",
+   "error": "server error: {'message': 'send_stream_open_batch: not connected; call connect()/accept() first', 'type': 'engine_error'}"
+  }
+ ]
+}

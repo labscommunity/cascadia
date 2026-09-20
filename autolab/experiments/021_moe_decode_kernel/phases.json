@@ -1,0 +1,54 @@
+[
+ {
+  "phase": "mix11a",
+  "streams": 11,
+  "tokens_req": 96,
+  "prompt_words": 0,
+  "start": 1789939028.01748,
+  "end": 1789939035.048726,
+  "wall_s": 7.0,
+  "completed": 0,
+  "tokens": 0,
+  "aggregate_tok_s": 0.0,
+  "sum_stream_tok_s": 0,
+  "ttft_mean_s": 0.0,
+  "ttft_max_s": 0,
+  "errors": [
+   "server error: {'message': 'send_stream_open: io error: Connection reset by peer (os error 104)', 'type': 'engine_error'}",
+   "server error: {'message': 'send_stream_open_batch: not connected; call connect()/accept() first', 'type': 'engine_error'}",
+   "server error: {'message': 'send_stream_open_batch: not connected; call connect()/accept() first', 'type': 'engine_error'}",
+   "server error: {'message': 'send_stream_open_batch: not connected; call connect()/accept() first', 'type': 'engine_error'}",
+   "server error: {'message': 'send_stream_open_batch: not connected; call connect()/accept() first', 'type': 'engine_error'}"
+  ],
+  "sample": "",
+  "stream_tok_s_min": 0,
+  "stream_tok_s_median": 0,
+  "ttft_median_s": 0
+ },
+ {
+  "phase": "mix15a",
+  "streams": 15,
+  "tokens_req": 128,
+  "prompt_words": 0,
+  "start": 1789939047.056442,
+  "end": 1789939185.182231,
+  "wall_s": 138.1,
+  "completed": 0,
+  "tokens": 7,
+  "aggregate_tok_s": 0.051,
+  "sum_stream_tok_s": 0,
+  "ttft_mean_s": 0.0,
+  "ttft_max_s": 0,
+  "errors": [
+   "server error: {'message': 'downstream closed before StreamTokens', 'type': 'engine_error'}",
+   "server error: {'message': 'downstream closed before StreamTokens', 'type': 'engine_error'}",
+   "server error: {'message': 'downstream closed before StreamTokens', 'type': 'engine_error'}",
+   "server error: {'message': 'downstream closed before StreamTokens', 'type': 'engine_error'}",
+   "server error: {'message': 'downstream closed before StreamTokens', 'type': 'engine_error'}"
+  ],
+  "sample": "",
+  "stream_tok_s_min": 0,
+  "stream_tok_s_median": 0,
+  "ttft_median_s": 0
+ }
+]

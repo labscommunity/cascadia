@@ -425,7 +425,78 @@ impl MoeLayer {
             ov.mark_k_mismatch(*lid, k);
             return Some(false);
         }
-        Some(ov.warm(*lid))
+        if !ov.warm(*lid) {
+            return Some(false);
+        }
+        Some(self.check_ov_moe_high_ids())
+    }
+
+    /// The device path against the Rust kernels on the HIGHEST expert ids of
+    /// this layer (the last routed experts and the shared ones). The GPU
+    /// plugin's decode kernels index an expert's weights with a 32-bit product
+    /// that overflows from id 228 at this model's sizes: low ids compute
+    /// correctly and high ones read out of bounds, so a warm-up on ids 0..k
+    /// proves nothing. A layer that fails is taken off the device (loudly)
+    /// rather than left to write garbage into the residual stream.
+    fn check_ov_moe_high_ids(&self) -> bool {
+        let Some((lid, ov)) = self.ov_moe.as_ref() else {
+            return true;
+        };
+        if self.ov.is_some() || !self.has_local_experts() || self.n_routed < self.top_k {
+            return true; // nothing on the host to compare with
+        }
+        let k = self.top_k + self.w.shared.len();
+        let x: Vec<f32> = (0..self.hidden)
+            .map(|i| ((i as f32 * 0.37).sin() + (i as f32 * 0.011).cos()) * 0.05)
+            .collect();
+        let mut ids: Vec<usize> = (self.n_routed - self.top_k..self.n_routed).collect();
+        ids.extend((0..self.w.shared.len()).map(|s| self.n_routed + s));
+        let w = vec![1.0f32 / k as f32; k];
+        let ids32: Vec<i32> = ids.iter().map(|&e| e as i32).collect();
+        let Some(dev) = ov.forward(*lid, &x, 1, &ids32, &w) else {
+            return false;
+        };
+        let mut host = vec![0.0f32; self.hidden];
+        for (&e, &we) in ids.iter().zip(&w) {
+            for (h, y) in host.iter_mut().zip(self.expert_ov_or_rust(e, &x)) {
+                *h += we * y;
+            }
+        }
+        let dot: f64 = dev
+            .iter()
+            .zip(&host)
+            .map(|(a, b)| *a as f64 * *b as f64)
+            .sum();
+        let nd: f64 = dev
+            .iter()
+            .map(|a| *a as f64 * *a as f64)
+            .sum::<f64>()
+            .sqrt();
+        let nh: f64 = host
+            .iter()
+            .map(|a| *a as f64 * *a as f64)
+            .sum::<f64>()
+            .sqrt();
+        let cosine = if nd > 0.0 && nh > 0.0 {
+            dot / (nd * nh)
+        } else {
+            0.0
+        };
+        let ok = cosine.is_finite() && cosine > 0.995;
+        tracing::info!(
+            target: "cascadia::inkling",
+            event = "ov_moe_high_id_check",
+            layer = *lid,
+            cosine,
+            ok,
+        );
+        if !ok {
+            ov.fail_layer(
+                *lid,
+                &format!("device output for expert ids {ids:?} disagrees with the host kernels (cosine {cosine:.4})"),
+            );
+        }
+        ok
     }
 
     /// `rows` rows through the fused backend: route each row here, dispatch

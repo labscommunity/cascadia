@@ -96,11 +96,44 @@ pub(crate) fn device_ns(rt: &Runtime) -> u64 {
 }
 
 pub(crate) fn bucket_rows(rows: usize) -> usize {
-    match rows {
-        0..=2 => 2,
-        3..=32 => rows.div_ceil(8) * 8,
-        _ => rows.div_ceil(32) * 32,
+    if rows > 32 {
+        return rows.div_ceil(32) * 32;
     }
+    small_buckets()
+        .iter()
+        .copied()
+        .find(|&b| b >= rows)
+        .unwrap_or(32)
+}
+
+/// The row counts (<= 32) device calls are padded to. Default `2,8,16,24,32`:
+/// a one-row call used to crash the plugin's decode kernel (its 32-bit expert
+/// offset, see autolab 022), so decode was padded to two rows. With a fixed
+/// plugin `CASCADIA_INKLING_OV_BUCKETS=1,2,4,8,16,24,32` lets a frame of one
+/// row read one row's experts, and a frame of three pad to four, not eight.
+fn small_buckets() -> &'static [usize] {
+    use std::sync::OnceLock;
+    static B: OnceLock<Vec<usize>> = OnceLock::new();
+    B.get_or_init(|| {
+        let mut v: Vec<usize> = std::env::var("CASCADIA_INKLING_OV_BUCKETS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|t| t.trim().parse().ok())
+                    .filter(|&b| (1..=32).contains(&b))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if v.is_empty() {
+            v = vec![2, 8, 16, 24, 32];
+        }
+        v.sort_unstable();
+        v.dedup();
+        if v.last() != Some(&32) {
+            v.push(32);
+        }
+        v
+    })
 }
 
 fn f32_bytes(v: &[f32]) -> &[u8] {
@@ -468,12 +501,18 @@ impl OvMoe {
         // The first call at a row count pays the plugin's kernel setup for
         // that shape (~140 ms for the padded decode shape on the B390); take
         // the decode bucket and the smallest prefill bucket here.
-        let ids: Vec<i32> = (0..k as i32).collect();
-        ok &= self.forward(lid, &x, 1, &ids, &w).is_some();
-        let x8 = vec![0.0f32; 8 * self.hidden];
-        let ids8: Vec<i32> = ids.iter().copied().cycle().take(8 * k).collect();
-        let w8 = vec![0.0f32; 8 * k];
-        ok &= self.forward(lid, &x8, 8, &ids8, &w8).is_some();
+        // On the HIGHEST ids: the plugin's decode kernels overflow a 32-bit
+        // expert offset from id 228 on (autolab 022); a plugin that does must
+        // fail here, while the rank loads, not inside the first request.
+        let ids: Vec<i32> = (self.n_experts.saturating_sub(k)..self.n_experts)
+            .map(|e| e as i32)
+            .collect();
+        for &b in small_buckets().iter().filter(|&&b| b <= 8) {
+            let xb = vec![0.0f32; b * self.hidden];
+            let idsb: Vec<i32> = ids.iter().copied().cycle().take(b * k).collect();
+            let wb = vec![0.0f32; b * k];
+            ok &= self.forward(lid, &xb, b, &idsb, &wb).is_some();
+        }
         // Warm-up calls are not benchmark calls.
         self.calls.store(before.0, Ordering::Relaxed);
         self.rows.store(before.1, Ordering::Relaxed);
@@ -697,6 +736,12 @@ impl OvMoe {
     /// layer routes `layer_k` (`top_k + n_shared`): the IR can never serve this
     /// layer, so latch it unusable — it then shows in [`Self::failed_layers`],
     /// so `--warm-ov` reports it FAILED — and report it once, like any bad IR.
+    /// Take `lid` off the device for good, with the reason (a load-time check
+    /// failed): its rows go to the host kernels from now on.
+    pub fn fail_layer(&self, lid: u32, why: &str) {
+        self.mark_failed(lid, why);
+    }
+
     pub fn mark_k_mismatch(&self, lid: u32, layer_k: usize) {
         self.mark_failed(
             lid,

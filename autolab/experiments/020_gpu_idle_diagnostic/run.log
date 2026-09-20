@@ -1,0 +1,37 @@
+15:46:45 publish: release 1789937205 signed and published: cascadia (20455336 B, bd874f62fdae), fleet-overrides.env (7051 B, 3bdfe76fd1fe) | the entry point polls every ~30 s; `release.py wait` follows the rollout
+15:46:45 settle: files PENDING, 11/11 serving, 1 version(s), restarts 0 6 5 4 4 3 2 1 1 0 0, steady 0/3
+15:47:21 settle: files ok, 11/11 serving, 2 version(s), restarts 0 6 5 4 4 3 2 1 1 0 0, steady 0/3
+15:47:51 settle: files ok, 0/11 serving, 1 version(s), restarts 0 0 0 0 0 0 0 0 0 0 0, steady 0/3
+15:48:27 settle: files ok, 1/11 serving, 1 version(s), restarts 0 0 0 0 0 0 0 0 0 0 0, steady 0/3
+15:48:57 settle: files ok, 1/11 serving, 1 version(s), restarts 0 1 0 1 1 0 1 1 0 1 1, steady 0/3
+15:49:33 settle: files ok, 2/11 serving, 1 version(s), restarts 0 1 0 1 1 0 1 1 0 1 1, steady 0/3
+15:50:04 settle: files ok, 2/11 serving, 1 version(s), restarts 0 2 1 1 2 1 1 2 1 1 1, steady 0/3
+15:50:39 settle: files ok, 2/11 serving, 1 version(s), restarts 0 2 1 1 2 1 1 2 1 1 1, steady 0/3
+15:51:15 settle: files ok, 4/11 serving, 1 version(s), restarts 0 3 2 2 2 2 2 2 1 1 1, steady 0/3
+15:51:45 settle: files ok, 4/11 serving, 1 version(s), restarts 0 3 2 2 2 2 2 2 1 1 1, steady 0/3
+15:52:21 settle: files ok, 6/11 serving, 1 version(s), restarts 0 4 3 3 3 2 2 2 1 1 1, steady 0/3
+15:52:51 settle: files ok, 6/11 serving, 1 version(s), restarts 0 4 3 3 3 2 2 2 1 1 1, steady 0/3
+15:53:27 settle: files ok, 11/11 serving, 1 version(s), restarts 0 4 3 3 3 2 2 2 1 1 1, steady 1/3
+15:53:58 settle: files ok, 11/11 serving, 1 version(s), restarts 0 4 3 3 3 2 2 2 1 1 1, steady 2/3
+15:54:33 settle: files ok, 11/11 serving, 1 version(s), restarts 0 4 3 3 3 2 2 2 1 1 1, steady 3/3
+15:55:32 PHASE warmup: 16/16 done, 384 tok in 59 s = 6.49 tok/s aggregate (sum of streams 21.77), ttft mean 40.1 max 45.9
+15:55:41 warm 0: 6.299 tok/s, ttft 4.85, '<think>The user wants three prime numbers and reas'
+15:55:48 warm 1: 6.662 tok/s, ttft 3.78, '<think>The user wants a description of a cat in tw'
+15:56:13 gate prompt 0: 147/147 chars match  7.251 tok/s ttft 4.86  '<think>The user wants an explanation of why the sky is blue '
+15:56:13 gate prompt 1: 150/150 chars match  11.35 tok/s ttft 4.85  '<think>The user is asking for the capital of France and want'
+15:56:13 gate prompt 5: 81/112 chars match  10.775 tok/s ttft 4.79  '<think>The user is asking "What is 6 times 7? Explain briefl'
+15:56:13 GATE PASS
+15:56:37 gate (8 side by side) prompt 0: 147/147 chars match  '<think>The user wants an explanation of why the sk'
+15:56:37 gate (8 side by side) prompt 7: no reference  '<think>The user wants one tip for sleeping better,'
+15:56:37 gate (8 side by side) prompt 5: 81/112 chars match  '<think>The user is asking "What is 6 times 7? Expl'
+15:56:37 gate (8 side by side) prompt 9: no reference  '<think>The user wants a summary of photosynthesis '
+15:56:37 gate (8 side by side) prompt 1: 150/150 chars match  '<think>The user is asking for the capital of Franc'
+15:56:37 gate (8 side by side) prompt 11: no reference  '<think>The user wants a description of rain in one'
+15:56:37 gate (8 side by side) prompt 0: 147/147 chars match  '<think>The user wants an explanation of why the sk'
+15:56:37 gate (8 side by side) prompt 13: no reference  '<think>The user wants an explanation of gravity su'
+15:56:37 GATE MULTI PASS
+15:57:57 PHASE mix11a: 11/11 done, 1056 tok in 79 s = 13.30 tok/s aggregate (sum of streams 19.23), ttft mean 22.3 max 34.2
+15:59:50 PHASE mix15a: 15/15 done, 1920 tok in 101 s = 18.97 tok/s aggregate (sum of streams 23.11), ttft mean 17.8 max 22.4
+16:01:49 PHASE mix15b: 15/15 done, 1920 tok in 108 s = 17.86 tok/s aggregate (sum of streams 23.30), ttft mean 24.3 max 31.6
+16:02:01 telemetry endpoint available: True
+finished
