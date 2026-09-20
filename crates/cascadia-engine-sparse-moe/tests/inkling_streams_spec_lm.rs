@@ -54,10 +54,19 @@ fn collect(engine: &mut dyn Engine, ids: &[String]) -> Vec<Vec<i64>> {
     let mut toks: Vec<Vec<i64>> = vec![Vec::new(); ids.len()];
     let mut done = vec![false; ids.len()];
     let mut steps = 0;
+    let mut empty = 0;
     while done.iter().any(|d| !d) {
         steps += 1;
         assert!(steps < 200_000, "engine did not finish the tasks");
         let chunks = engine.step().expect("step");
+        // The serving loop (cascadia-runner) reads three empty steps in a row
+        // as a wedged engine and fails the request: a waiting round must not
+        // surface as an empty step.
+        empty = if chunks.is_empty() { empty + 1 } else { 0 };
+        assert!(
+            empty < 3,
+            "three empty steps in a row: the runner would fail the request"
+        );
         for (id, c) in chunks {
             let i = ids.iter().position(|x| x == &id).expect("known task");
             assert!(c.error.is_none(), "task {id} errored: {:?}", c.error);
@@ -131,6 +140,9 @@ fn fake_drafter(known: Vec<(String, String)>) -> String {
                 })
                 .unwrap_or_default();
             let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n");
+            // A real drafter needs tens of milliseconds to start over after a
+            // wrong guess: rank 0 must find the pipeline with room and no guess.
+            std::thread::sleep(std::time::Duration::from_millis(40));
             let words: Vec<&str> = cont.split_inclusive(' ').take(12).collect();
             let n = words.len().max(1);
             for i in 0..n {
@@ -251,6 +263,9 @@ async fn a_drafter_model_never_changes_the_tokens() {
             let (stop, died) = (stop.clone(), died.clone());
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
+                    // Real ranks take tens of milliseconds per frame: replies
+                    // must be slow enough here for rank 0 to find none waiting.
+                    std::thread::sleep(std::time::Duration::from_millis(8));
                     if e.step().is_err() {
                         died.store(true, Ordering::Relaxed);
                         break;

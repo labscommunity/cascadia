@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """analyze.py EXP [--mode all|decode|admit]: per phase and rank, where the pipeline's time went.
 
-Reads experiments/EXP/phases.json (phase windows on this Mac's clock) and telemetry.jsonl (what lab.py
+Reads experiments/EXP/phases.json (phase windows on this Mac's clock) and ~/inkling-release/autolab-telemetry/EXP/telemetry.jsonl (raw, never in the repo: what lab.py
 polled from /api/fleet/telemetry: "lt" = local poll time, "profs" = stage profiles with rank 0's receive time
 "rt"). Rank 0's clock and this Mac's differ, so profile times are placed by the poll that first saw them.
 """
@@ -11,7 +11,8 @@ LAB = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 exp = sys.argv[1]; mode = sys.argv[3] if len(sys.argv) > 3 and sys.argv[2] == "--mode" else "all"
 d = os.path.join(LAB, "experiments", exp)
 phases = json.load(open(os.path.join(d, "phases.json")))
-recs = [json.loads(l) for l in open(os.path.join(d, "telemetry.jsonl")) if l.strip()]
+raw = os.path.join(os.path.expanduser("~/inkling-release/autolab-telemetry"), os.path.basename(d.rstrip("/")), "telemetry.jsonl")
+recs = [json.loads(l) for l in open(raw) if l.strip()]
 mean = lambda xs: sum(xs) / len(xs) if xs else 0.0
 BUSY = ("recv_ms", "compute_ms", "prefill_ms", "head_ms", "send_ms", "relay_ms", "emit_ms")
 summary = {}

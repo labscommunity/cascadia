@@ -6865,6 +6865,23 @@ impl<R: StagedRunner> PipelineEngine<R> {
     /// One step of the speculation path: at most one verified token out, then
     /// the pipeline topped up with guesses. See [`Self::spec_applies`].
     fn step_stream_spec(&mut self, out: &mut Vec<(TaskId, Chunk)>) {
+        // With a drafter model a round may end without a token (no reply yet:
+        // it went to top the pipeline up instead of blocking). A step that
+        // hands nothing back reads as a stalled engine to the caller, so the
+        // rounds repeat here until one produces something or the lone-stream
+        // path no longer applies. Without a drafter model every round blocks
+        // for its reply and this loop runs once.
+        loop {
+            let before = out.len();
+            self.spec_round(out);
+            if out.len() > before || self.peer_disconnected || !self.spec_applies() {
+                return;
+            }
+        }
+    }
+
+    /// One round of [`Self::step_stream_spec`].
+    fn spec_round(&mut self, out: &mut Vec<(TaskId, Chunk)>) {
         let Some(down) = self.transport.downstream.clone() else {
             self.fail_streams_into(out, "rank 0 missing downstream".into());
             return;
@@ -6923,7 +6940,12 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 let st = &self.streams[0];
                 let valid = st.spec.iter().filter(|r| r.valid).count();
                 let room = valid <= depth && st.generated.len() + valid < st.max_new;
-                if room && !self.reply_within(&down, Duration::from_millis(6)) {
+                // Past the reply deadline the blocking read below reports the loss.
+                let overdue = st
+                    .spec
+                    .front()
+                    .is_some_and(|r| r.sent_at.elapsed() > Self::reply_deadline() * groups);
+                if room && !overdue && !self.reply_within(&down, Duration::from_millis(6)) {
                     break;
                 }
             }

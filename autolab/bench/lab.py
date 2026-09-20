@@ -353,6 +353,14 @@ ASKS = ["Explain in three sentences how {} works.", "What are two common misconc
         "Describe {} to someone who has never seen one, in two sentences.", "Give one surprising fact about {} and explain it."]
 
 
+def raw_telemetry_path(exp):
+    """Raw telemetry names the lab's hosts and this repository is public: it lives OUTSIDE the work tree (a forced
+    `git add` of an experiment folder once published seven of these files). Records keep analysis.json only."""
+    d = os.path.join(os.path.expanduser("~/inkling-release/autolab-telemetry"), exp)
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "telemetry.jsonl")
+
+
 def fresh_prompt(tag, i):
     """A prompt this fleet has (almost certainly) not seen: what the cross-request drafter is worth has to be measured on
     text it could not have memorised. Deterministic per (experiment tag, stream), different across experiments."""
@@ -398,7 +406,7 @@ RUN_TAG = [""]
 def cmd_bench(a):
     RUN_TAG[0] = a.exp
     d = os.path.join(LAB, "experiments", a.exp); os.makedirs(d, exist_ok=True)
-    tel = Telemetry(os.path.join(d, "telemetry.jsonl")); tel.start()
+    tel = Telemetry(raw_telemetry_path(a.exp)); tel.start()
     results = []
     try:
         for spec in a.phases:
