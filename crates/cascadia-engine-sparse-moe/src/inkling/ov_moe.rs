@@ -95,6 +95,20 @@ pub(crate) fn device_ns(rt: &Runtime) -> u64 {
         * 1000
 }
 
+/// `CASCADIA_INKLING_OV_MOE_DECODE_DIR`: folder (next to `moe_ov/`) of layers
+/// that run through the plugin's decode kernels.
+fn decode_dir_name() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static D: OnceLock<Option<String>> = OnceLock::new();
+    D.get_or_init(|| {
+        std::env::var("CASCADIA_INKLING_OV_MOE_DECODE_DIR")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty() && !v.contains('/') && !v.contains(".."))
+    })
+    .as_deref()
+}
+
 pub(crate) fn bucket_rows(rows: usize) -> usize {
     if rows > 32 {
         return rows.div_ceil(32) * 32;
@@ -397,10 +411,7 @@ impl OvMoe {
         if let Some(&f) = self.out_scale.lock().unwrap().get(&lid) {
             return f;
         }
-        let side = self
-            .dir
-            .join(format!("layer_{lid:02}"))
-            .join("cascadia_moe.json");
+        let side = self.layer_dir(lid).join("cascadia_moe.json");
         let n = std::fs::read_to_string(&side)
             .ok()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
@@ -421,9 +432,32 @@ impl OvMoe {
     }
 
     fn xml(&self, lid: u32) -> PathBuf {
-        self.dir
-            .join(format!("layer_{lid:02}"))
-            .join("openvino_model.xml")
+        self.layer_dir(lid).join("openvino_model.xml")
+    }
+
+    /// The folder of `lid`'s IR. `CASCADIA_INKLING_OV_MOE_DECODE_DIR=moe_ov_g64`
+    /// names a sibling of `moe_ov/` holding the same layers re-quantised to a
+    /// wider int4 group (run.sh writes them when `CASCADIA_FUSE_GROUP` asks):
+    /// the GPU plugin's MoE decode kernels (batched GEMV: three kernels and no
+    /// host synchronisation per call) refuse group 32 on Xe2 and newer. A
+    /// layer found there is compiled with the decode threshold ON, every other
+    /// layer keeps the prefill path, so one rank can run both side by side.
+    fn layer_dir(&self, lid: u32) -> PathBuf {
+        if let Some(alt) = decode_dir_name() {
+            if let Some(parent) = self.dir.parent() {
+                let d = parent.join(alt).join(format!("layer_{lid:02}"));
+                if d.join("openvino_model.xml").is_file() {
+                    return d;
+                }
+            }
+        }
+        self.dir.join(format!("layer_{lid:02}"))
+    }
+
+    /// Whether `lid` runs from the decode-kernel folder (see [`Self::layer_dir`]).
+    pub fn uses_decode_kernels(&self, lid: u32) -> bool {
+        decode_dir_name().is_some()
+            && self.layer_dir(lid) != self.dir.join(format!("layer_{lid:02}"))
     }
 
     /// Whether an IR exists for layer `lid`.
@@ -452,6 +486,18 @@ impl OvMoe {
             // The offload path streams experts from the IR's weights file.
             let bin = xml.with_extension("bin");
             plugin = plugin.with("WEIGHTS_PATH", bin.to_string_lossy().to_string());
+        }
+        // The plugin reads this knob from the process environment when it
+        // builds a model: set per layer, under the layer-table lock.
+        let threshold = if self.uses_decode_kernels(lid) {
+            "32"
+        } else {
+            "0"
+        };
+        if std::env::var("OV_GPU_MOE_BATCHED_GEMV_THRESHOLD").as_deref() != Ok(threshold)
+            && decode_dir_name().is_some()
+        {
+            set_process_env("OV_GPU_MOE_BATCHED_GEMV_THRESHOLD", threshold);
         }
         let t0 = Instant::now();
         match Runtime::compile(p, &self.device, &plugin) {

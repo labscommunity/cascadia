@@ -10,15 +10,21 @@ if [ -f "$PREFIX/fleet-overrides.env" ]; then set -a; source "$PREFIX/fleet-over
 # a time into a scratch folder, moved into place only when complete: a box that loses power mid-way never finds
 # half an IR. Whatever fails here, the worker still starts (a layer without an IR simply stays on the CPU path).
 gen_fused_irs() {
-  local want="${CASCADIA_FUSE_LAYERS:-}" py l nn dst tmp free_gb shift have pair
+  # $1 = layers, $2 = int4 group of the weights written (32 = the bins verbatim, into moe_ov/). A second call with
+  # CASCADIA_FUSE_DECODE_LAYERS and group 64|128 writes those layers ALSO re-quantised to the wider group, into their
+  # own folder (moe_ov_g64): the GPU plugin's MoE decode kernels refuse group 32 on Xe2 and newer. The engine picks
+  # that folder per layer with CASCADIA_INKLING_OV_MOE_DECODE_DIR=moe_ov_g64; the group-32 layers stay where they are.
+  local want="${1:-}" py l nn dst tmp free_gb shift have pair grp sub mark
   [ -n "$want" ] || return 0
+  grp="${2:-32}"; case "$grp" in 64|128) sub="moe_ov_g$grp" ;; *) grp=32; sub="moe_ov" ;; esac
   py=$(command -v python3) || return 0
   [ -d "$PREFIX/pylib" ] || { echo "fused IRs: no $PREFIX/pylib on this box"; return 0; }
   mkdir -p "$PREFIX/tools" "$PREFIX/logs"
   tmp="$PREFIX/model/.fuse-tmp"
   for l in ${want//,/ }; do
     case "$l" in ''|*[!0-9]*) continue ;; esac
-    nn=$(printf %02d "$l"); dst="$PREFIX/model/moe_ov/layer_$nn"
+    nn=$(printf %02d "$l"); dst="$PREFIX/model/$sub/layer_$nn"; mark="$PREFIX/logs/fused-ir.failed-$nn"
+    [ "$sub" = "moe_ov" ] || mark="$PREFIX/logs/fused-ir.failed-$sub-$nn"
     # CASCADIA_FUSE_UP_SHIFT="8:4 40:4": those layers are (re)generated with their up-projection scales x 2^-N (an expert
     # whose own output passes f16's range on the device); a layer counts as present only with the asked exponent.
     shift=0; for pair in ${CASCADIA_FUSE_UP_SHIFT:-}; do [ "${pair%%:*}" = "$l" ] && shift="${pair##*:}"; done
@@ -26,20 +32,21 @@ gen_fused_irs() {
     have=$(sed -n 's/.*"up_scale_exponent"[^0-9]*\([0-9][0-9]*\).*/\1/p' "$dst/cascadia_moe.json" 2>/dev/null | head -1)
     [ -s "$dst/openvino_model.xml" ] && [ -s "$dst/openvino_model.bin" ] && [ "${have:-0}" = "$shift" ] && continue
     # a layer that failed once is not retried at every start (each try can take minutes): CASCADIA_FUSE_RETRY=1 asks again
-    [ -e "$PREFIX/logs/fused-ir.failed-$nn" ] && [ "${CASCADIA_FUSE_RETRY:-0}" != 1 ] && continue
+    [ -e "$mark" ] && [ "${CASCADIA_FUSE_RETRY:-0}" != 1 ] && continue
     free_gb=$(df -Pk "$PREFIX/model" | awk 'NR==2 {print int($4/1048576)}')
     [ "${free_gb:-0}" -ge 20 ] || { echo "fused IRs: only ${free_gb} GB free, layer $l not generated"; return 0; }
     write_generator "$PREFIX/tools/inkling_moe_layer_ov.py"
     rm -rf "$tmp"; mkdir -p "$tmp"
     echo "fused IRs: generating layer $l (about a minute, 8.4 GB)"
     if PYTHONPATH="$PREFIX/pylib" timeout 900 "$py" "$PREFIX/tools/inkling_moe_layer_ov.py" --src "$PREFIX/model" --out "$tmp" \
-         --layers "$l" --layout u4zp --pad-experts 4 --up-scale-exponent "$shift" >> "$PREFIX/logs/fused-ir.log" 2>&1 \
-       && [ -s "$tmp/moe_ov/layer_$nn/openvino_model.bin" ]; then
-      mkdir -p "$PREFIX/model/moe_ov"; rm -rf "$dst"; mv "$tmp/moe_ov/layer_$nn" "$dst" && echo "fused IRs: layer $l ready"
-      rm -f "$PREFIX/logs/fused-ir.failed-$nn"
+         --layers "$l" --layout u4zp --pad-experts 4 --up-scale-exponent "$shift" --group "$grp" --moe-dir "$sub" \
+         >> "$PREFIX/logs/fused-ir.log" 2>&1 \
+       && [ -s "$tmp/$sub/layer_$nn/openvino_model.bin" ]; then
+      mkdir -p "$PREFIX/model/$sub"; rm -rf "$dst"; mv "$tmp/$sub/layer_$nn" "$dst" && echo "fused IRs: layer $l ready ($sub)"
+      rm -f "$mark"
     else
       echo "fused IRs: layer $l failed (see $PREFIX/logs/fused-ir.log); it stays on the CPU path"
-      : > "$PREFIX/logs/fused-ir.failed-$nn"
+      : > "$mark"
     fi
     rm -rf "$tmp"
   done
@@ -144,6 +151,8 @@ def stacked_weight(packed_list, scale_list, out, inn, layout="u4zp", scale_shift
     optimum-intel's `--sym` export uses; the plugin cannot offload it (2026.3.1 asks the
     zero-point placeholder for a bin offset)."""
     e = len(packed_list)
+    if OUT_GROUP[0] != GROUP:
+        return regrouped_weight(packed_list, scale_list, out, inn, OUT_GROUP[0], scale_shift)
     ng = inn // GROUP
     raw = np.concatenate([p.reshape(-1) for p in packed_list])
     sc = np.stack([_bf16_to_f16(s) for s in scale_list]).reshape(e, out, ng, 1)
@@ -162,6 +171,56 @@ def stacked_weight(packed_list, scale_list, out, inn, layout="u4zp", scale_shift
         zp = raw_const(Type.u4, [e, out, ng, 1], np.full((e * out * ng + 1) // 2, 0x88, np.uint8).tobytes())
         w = ops.subtract(ops.convert(w, Type.f16), ops.convert(zp, Type.f16))
     w = ops.multiply(w, ops.constant(sc))
+    w = ops.reshape(w, ops.constant(np.array([e, out, inn], np.int64)), False)
+    return ops.convert(w, Type.f32)
+
+
+# Group size of the weights WRITTEN (the bins are always GROUP = 32). 32 = the bins' nibbles and scales verbatim.
+# 64 / 128 (`--group`): the GPU plugin's MoE DECODE kernels (batched GEMV, the path built for a few rows) refuse
+# group 32 on Xe2 and newer (they need group >= 2 x sub-group size = 64; the refusal is swallowed at compile time and
+# surfaces as "Unable to cast reference from base to derived type" at infer). Regrouping re-quantises: each wider
+# group gets its own scale and zero point (asymmetric u4), fitted to the dequantised 32-group weights.
+OUT_GROUP = [GROUP]
+
+
+def _bf16_bits_to_f32(u16):
+    """bfloat16 bit patterns -> float32, exactly (same exponent width: shift into the top 16 bits)."""
+    return (u16.astype(np.uint32) << 16).view(np.float32)
+
+
+def regrouped_weight(packed_list, scale_list, out, inn, group, scale_shift=0):
+    """As `stacked_weight` (u4 + zero point + f16 scale -> [E, out, in] f32), with `group`-wide groups."""
+    assert group % GROUP == 0 and inn % group == 0, (group, inn)
+    e, ng = len(packed_list), inn // group
+    q_all = np.empty((e, out, ng, group), np.uint8)
+    s_all = np.empty((e, out, ng, 1), np.float16)
+    z_all = np.empty((e, out, ng, 1), np.uint8)
+    err_num = err_den = 0.0
+    for i, (p, sc) in enumerate(zip(packed_list, scale_list)):
+        v = np.empty((out, inn), np.float32)
+        v[:, 0::2] = (p & 0x0F).astype(np.float32) - 8.0
+        v[:, 1::2] = (p >> 4).astype(np.float32) - 8.0
+        w = (v.reshape(out, inn // GROUP, GROUP) * _bf16_bits_to_f32(sc).reshape(out, inn // GROUP, 1)).reshape(out, ng, group)
+        mn = np.minimum(w.min(axis=2, keepdims=True), 0.0)
+        mx = np.maximum(w.max(axis=2, keepdims=True), 0.0)
+        s = ((mx - mn) / 15.0).astype(np.float16).astype(np.float32)
+        s[s == 0] = 1.0
+        z = np.clip(np.rint(-mn / s), 0, 15)
+        q = np.clip(np.rint(w / s) + z, 0, 15)
+        err_num += float((((q - z) * s - w) ** 2).sum()); err_den += float((w ** 2).sum())
+        q_all[i] = q.astype(np.uint8); z_all[i] = z.astype(np.uint8)
+        s_all[i] = (s * np.float32(2.0 ** -scale_shift)).astype(np.float16)
+    print(f"  regrouped {e} x [{out}, {inn}] to group {group}: weight error {100.0 * (err_num / max(err_den, 1e-30)) ** 0.5:.2f} % rms of the group-32 weights")
+    flat = q_all.reshape(-1)
+    raw = (flat[0::2] | (flat[1::2] << 4)).astype(np.uint8)
+    zf = z_all.reshape(-1)
+    if zf.size % 2:
+        zf = np.append(zf, np.uint8(8))
+    zraw = (zf[0::2] | (zf[1::2] << 4)).astype(np.uint8)
+    wq = raw_const(Type.u4, [e, out, ng, group], raw.tobytes())
+    zp = raw_const(Type.u4, [e, out, ng, 1], zraw.tobytes())
+    w = ops.subtract(ops.convert(wq, Type.f16), ops.convert(zp, Type.f16))
+    w = ops.multiply(w, ops.constant(s_all))
     w = ops.reshape(w, ops.constant(np.array([e, out, inn], np.int64)), False)
     return ops.convert(w, Type.f32)
 
@@ -246,6 +305,48 @@ def dense_model(src, lid, man, layout="u4zp"):
     return m
 
 
+def dense_as_moe_model(src, lid, man, layout="u4zp", pad_experts=4):
+    """The dense MLP as an all-experts-active MoE layer: its inner neurons cut into slices as wide as a routed expert
+    (24,576 / 3,072 = 8 on Inkling), each slice an "expert" of the fused block, every row selecting all of them with
+    weight 1. `down(silu(gate x) * up x)` is a sum over inner neurons, so the slices' outputs add up to the same
+    vector; gate/up are cut by rows and down by columns on the bins' own 32-weight groups, so no weight is requantised.
+    Why: on the Arc B390 three compressed MatMuls 24,576 wide read their 4-bit weights at ~26 GB/s, the fused
+    3-GEMM op at 80-130 GB/s, and rank 0's two dense layers made it the slowest stage of the pipeline."""
+    hidden, inter, ei = man["hidden_size"], man["dense_intermediate"], man["moe_intermediate"]
+    assert inter % ei == 0 and ei % GROUP == 0 and hidden % GROUP == 0, (inter, ei)
+    n = inter // ei
+    (gp, gs), (up_, us), (dp, ds) = read_bin_sections(os.path.join(src, "experts", f"layer_{lid:02d}", "dense.bin"), hidden, inter)
+    gates = [(gp[e * ei:(e + 1) * ei], gs[e * ei:(e + 1) * ei]) for e in range(n)]
+    ups = [(up_[e * ei:(e + 1) * ei], us[e * ei:(e + 1) * ei]) for e in range(n)]
+    downs = [(np.ascontiguousarray(dp[:, e * ei // 2:(e + 1) * ei // 2]),
+              np.ascontiguousarray(ds[:, e * ei // GROUP:(e + 1) * ei // GROUP])) for e in range(n)]
+    for _ in range(pad_experts):
+        gates.append((np.full_like(gates[0][0], 0x88), np.zeros_like(gates[0][1])))
+        ups.append((np.full_like(ups[0][0], 0x88), np.zeros_like(ups[0][1])))
+        downs.append((np.full_like(downs[0][0], 0x88), np.zeros_like(downs[0][1])))
+    gate_w = stacked_weight([g[0] for g in gates], [g[1] for g in gates], ei, hidden, layout)
+    up_w = stacked_weight([u[0] for u in ups], [u[1] for u in ups], ei, hidden, layout)
+    down_w = stacked_weight([d[0] for d in downs], [d[1] for d in downs], hidden, ei, layout)
+    return build_layer(gate_w, up_w, down_w, hidden, ei, n + pad_experts, n)
+
+
+def validate_dense_as_moe(src, lid, man, device="CPU", layout="u4zp", pad_experts=4):
+    """The all-slices-active MoE form against the three-MatMul form of the same dense layer, on `device`."""
+    core = ov.Core()
+    a = core.compile_model(dense_model(src, lid, man, layout), device)
+    b = core.compile_model(dense_as_moe_model(src, lid, man, layout, pad_experts), device)
+    n = man["dense_intermediate"] // man["moe_intermediate"]
+    rng = np.random.default_rng(7)
+    x = (rng.standard_normal((1, 3, man["hidden_size"])) * 0.05).astype(np.float32)
+    ids = np.tile(np.arange(n, dtype=np.int32), (3, 1))
+    w = np.ones((3, n), np.float32)
+    ya = a({"x": x})[a.outputs[0]]
+    yb = b({"x": x, "topk_indices": ids, "routing_weights": w})[b.outputs[0]]
+    rel = float(np.sqrt(((ya - yb) ** 2).mean()) / (np.sqrt((ya ** 2).mean()) + 1e-30))
+    print(f"layer {lid}: dense-as-MoE vs three MatMuls on {device}: rel RMS {rel:.3e}, max |y| {float(np.abs(ya).max()):.4g}")
+    return rel
+
+
 def validate(src, lid, man, device="GPU", layout="u4zp", pad_experts=4):
     """Compile the layer and compare one 2-row call against a numpy reference on the bins' grid."""
     from glm5_expert_ov import _load  # noqa: E402  (dequantised gate/up/down of one bin)
@@ -309,13 +410,40 @@ def main():
                          "f16's 65504 on the device (Inkling layer 8's shared expert reaches -94909); 4 is the tested value")
     ap.add_argument("--dense", action="store_true",
                     help="write the DENSE layers among --layers instead (their MLP as <out>/dense_ov/layer_NN/), skip the MoE ones")
+    ap.add_argument("--group", type=int, default=GROUP, choices=[32, 64, 128],
+                    help="group size of the weights written (the bins are group 32). 64 or 128 re-quantise (asymmetric u4 per "
+                         "group) so that the GPU plugin's MoE decode kernels accept the layer on Xe2+ (they refuse group 32)")
+    ap.add_argument("--moe-dir", default="moe_ov", help="folder name under --out for the MoE layers (default moe_ov)")
+    ap.add_argument("--dense-as-moe", action="store_true",
+                    help="write the DENSE layers among --layers as all-slices-active fused-MoE IRs (<out>/dense_moe_ov/layer_NN/): "
+                         "the same sum through the fused 3-GEMM op, which reads 4-bit weights about three times faster on the iGPU")
     args = ap.parse_args()
+    OUT_GROUP[0] = args.group
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     man = json.load(open(os.path.join(args.src, "manifest.json")))
     assert man.get("arch") == "inkling", man.get("arch")
     dense = set(man["dense_layers"])
     out = args.out or args.src
     for lid in [int(v) for v in args.layers.split(",")]:
+        if args.dense_as_moe:
+            if lid not in dense:
+                print(f"layer {lid}: not a dense layer, skipped")
+                continue
+            if args.validate:
+                validate_dense_as_moe(args.src, lid, man, args.validate_device, args.layout, args.pad_experts)
+                continue
+            dst = os.path.join(out, "dense_moe_ov", f"layer_{lid:02d}")
+            xml = os.path.join(dst, "openvino_model.xml")
+            if args.skip_existing and os.path.exists(xml):
+                print(f"layer {lid}: exists, skipped")
+                continue
+            t0 = time.time()
+            os.makedirs(dst, exist_ok=True)
+            ov.save_model(dense_as_moe_model(args.src, lid, man, args.layout, args.pad_experts), xml, compress_to_fp16=False)
+            with open(os.path.join(dst, "cascadia_moe.json"), "w") as f:
+                json.dump({"up_scale_exponent": 0, "dense_slices": man["dense_intermediate"] // man["moe_intermediate"]}, f)
+            print(f"layer {lid}: dense MLP as MoE written {xml} in {time.time()-t0:.0f}s")
+            continue
         if args.dense:
             if lid not in dense:
                 print(f"layer {lid}: not a dense layer, skipped")
@@ -336,7 +464,7 @@ def main():
         if args.validate:
             validate(args.src, lid, man, args.validate_device, args.layout, args.pad_experts)
             continue
-        dst = os.path.join(out, "moe_ov", f"layer_{lid:02d}")
+        dst = os.path.join(out, args.moe_dir, f"layer_{lid:02d}")
         xml = os.path.join(dst, "openvino_model.xml")
         if args.skip_existing and os.path.exists(xml):
             print(f"layer {lid}: exists, skipped")
@@ -346,7 +474,7 @@ def main():
         os.makedirs(dst, exist_ok=True)
         ov.save_model(m, xml, compress_to_fp16=False)
         with open(os.path.join(dst, "cascadia_moe.json"), "w") as f:
-            json.dump({"up_scale_exponent": args.up_scale_exponent}, f)
+            json.dump({"up_scale_exponent": args.up_scale_exponent, "group": args.group}, f)
         print(f"layer {lid}: written {xml} in {time.time()-t0:.0f}s")
 
 
@@ -359,7 +487,8 @@ PYGEN_EOF
 if [ -n "${CASCADIA_GPU_PAGES_GIB:-}" ] && [ -w /sys/module/ttm/parameters/pages_limit ]; then
   case "$CASCADIA_GPU_PAGES_GIB" in ''|*[!0-9]*) ;; *) echo $((CASCADIA_GPU_PAGES_GIB * 262144)) > /sys/module/ttm/parameters/pages_limit 2>/dev/null || true ;; esac
 fi
-gen_fused_irs || true
+gen_fused_irs "${CASCADIA_FUSE_LAYERS:-}" 32 || true
+gen_fused_irs "${CASCADIA_FUSE_DECODE_LAYERS:-}" "${CASCADIA_FUSE_GROUP:-64}" || true
 # The dense layers' MLP (rank 0) as one device call for all rows of a frame (CASCADIA_FUSE_DENSE="0,1"): same
 # generator, same rules (scratch folder, moved into place when complete, a failure is marked and tolerated).
 gen_dense_irs() {
