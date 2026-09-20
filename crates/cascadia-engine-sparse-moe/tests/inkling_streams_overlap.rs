@@ -27,6 +27,8 @@ struct SlowRunner {
     cost: (Duration, Duration),
     /// (decode calls, rows, slept) — printed per rank at the end.
     stats: Arc<std::sync::Mutex<(u64, u64, Duration)>>,
+    /// The most rows any one decode micro-batch carried.
+    max_rows: Arc<AtomicUsize>,
     /// Ranks inside a decode micro-batch right now, and the most seen at
     /// once, shared by the pipeline's ranks: overlap observed directly, not
     /// inferred from wall time.
@@ -93,6 +95,7 @@ impl StagedRunner for SlowRunner {
         let t0 = Instant::now();
         let now = self.busy.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(now, Ordering::SeqCst);
+        self.max_rows.fetch_max(slots.len(), Ordering::SeqCst);
         std::thread::sleep(self.cost.0 + self.cost.1 * slots.len() as u32);
         self.busy.fetch_sub(1, Ordering::SeqCst);
         let mut g = self.stats.lock().unwrap();
@@ -122,14 +125,18 @@ async fn link() -> (Arc<Mutex<ActivationServer>>, Arc<Mutex<ActivationClient>>) 
 
 /// Run `n_streams` tasks of `tokens` tokens through a 4-rank pipeline with
 /// `groups` frames in flight; returns the wall time of the decode phase, the
-/// tokens, and the most ranks that were decoding at the same moment.
+/// tokens, the most ranks that were decoding at the same moment and the most
+/// rows one decode micro-batch carried. `trickle`: the requests arrive one
+/// per round instead of all before the first (what a server sees: a submit
+/// waits for the engine lock, which a round holds).
 async fn run(
     dir: &PathBuf,
     groups: usize,
     n_streams: usize,
     tokens: u32,
     cost: (Duration, Duration),
-) -> (Duration, Vec<Vec<i64>>, usize) {
+    trickle: bool,
+) -> (Duration, Vec<Vec<i64>>, usize, usize) {
     let handle = tokio::runtime::Handle::current();
     let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).unwrap();
     // 4 ranks: layers [0,1) [1,2) [2,3) [3,4)
@@ -141,6 +148,7 @@ async fn run(
         .collect();
     let busy = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
+    let max_rows = Arc::new(AtomicUsize::new(0));
     let mk = |rank: u32, lo: u32, hi: u32| SlowRunner {
         inner: InklingRunner::load_staged(dir, 64, rank, 4, lo, hi, Some("eager".into()), None)
             .unwrap(),
@@ -148,6 +156,7 @@ async fn run(
         stats: stats[rank as usize].clone(),
         busy: busy.clone(),
         peak: peak.clone(),
+        max_rows: max_rows.clone(),
     };
     std::env::set_var("CASCADIA_STREAMS_INFLIGHT", groups.to_string());
     let mut e0 = PipelineEngine::new(
@@ -219,14 +228,21 @@ async fn run(
     let ids: Vec<String> = (0..n_streams).map(|i| format!("s{i}")).collect();
     let ids2 = ids.clone();
     let (wall, toks) = tokio::task::spawn_blocking(move || {
-        for (i, id) in ids2.iter().enumerate() {
+        let task = |i: usize| {
             let mut t = GenerationTask::new(
-                id.clone(),
+                ids2[i].clone(),
                 format!("a{} a{} a{} a{}", 5 + i, 33, 81 + i, 53),
             );
             t.max_tokens = tokens;
             t.temperature = 0.0;
-            e0.submit(t).unwrap();
+            t
+        };
+        let mut submitted = 0;
+        if !trickle {
+            for i in 0..n_streams {
+                e0.submit(task(i)).unwrap();
+            }
+            submitted = n_streams;
         }
         // admit everything first (prefills are round trips), then time decode
         let mut toks: Vec<Vec<i64>> = vec![Vec::new(); n_streams];
@@ -236,6 +252,10 @@ async fn run(
         while done.iter().any(|d| !d) {
             steps += 1;
             assert!(steps < 2000, "did not finish");
+            if submitted < n_streams {
+                e0.submit(task(submitted)).unwrap();
+                submitted += 1;
+            }
             let chunks = e0.step().expect("step");
             for (id, c) in chunks {
                 let i = ids2.iter().position(|x| x == &id).unwrap();
@@ -269,7 +289,12 @@ async fn run(
             g.2.as_secs_f64() * 1e3 / g.0.max(1) as f64
         );
     }
-    (wall, toks, peak.load(Ordering::SeqCst))
+    (
+        wall,
+        toks,
+        peak.load(Ordering::SeqCst),
+        max_rows.load(Ordering::SeqCst),
+    )
 }
 
 /// Diagnostic sweep, run on demand (`--ignored`). Not part of the suite: `run`
@@ -289,7 +314,7 @@ async fn probe_timings() {
         (1, 6, 0, 0),
         (4, 6, 0, 0),
     ] {
-        let (w, _, peak) = run(
+        let (w, _, peak, _) = run(
             &dir,
             g,
             streams,
@@ -298,6 +323,7 @@ async fn probe_timings() {
                 Duration::from_millis(base_ms),
                 Duration::from_millis(row_ms),
             ),
+            false,
         )
         .await;
         eprintln!(
@@ -316,9 +342,9 @@ async fn groups_in_flight_overlap_the_ranks() {
     let (tokens, streams) = (12u32, 6usize);
     let cost = (Duration::from_millis(10), Duration::from_millis(5));
     // 1 group: one 6-row frame per step, 40 ms per rank, 4 ranks in series.
-    let (w1, t1, peak1) = run(&dir, 1, streams, tokens, cost).await;
+    let (w1, t1, peak1, _) = run(&dir, 1, streams, tokens, cost, false).await;
     // 4 groups (one per rank): 1-2 row frames, ~15-20 ms per rank, all ranks busy.
-    let (w4, t4, peak4) = run(&dir, 4, streams, tokens, cost).await;
+    let (w4, t4, peak4, _) = run(&dir, 4, streams, tokens, cost, false).await;
     assert_eq!(t1, t4, "tokens must not depend on the in-flight depth");
     // Wall time is reported, not asserted: about 1.6-1.9x on an idle machine,
     // but sleep precision and a loaded CI runner move it. The overlap itself
@@ -332,4 +358,16 @@ async fn groups_in_flight_overlap_the_ranks() {
         peak4 >= 2,
         "no overlap: with 4 groups in flight at most {peak4} rank decoded at a time"
     );
+    // Requests that arrive one per round (a server's submits wait for the
+    // engine lock a round holds) must still spread over the groups. Every
+    // round starts at group 0, so admitting into "the group whose turn it is"
+    // put all four streams into group 0: one 4-row frame in flight, three
+    // ranks idle. (Here in the same test because `run` picks the depth
+    // through a process-wide env var.)
+    let (_, tt, _, max_rows) = run(&dir, 4, 4, tokens, cost, true).await;
+    assert_eq!(
+        max_rows, 1,
+        "4 streams over 4 groups must be one row per frame, saw a {max_rows}-row frame"
+    );
+    assert_eq!(tt[..], t4[..4], "tokens must not depend on the grouping");
 }

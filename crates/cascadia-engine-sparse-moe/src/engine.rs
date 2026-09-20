@@ -5858,6 +5858,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         while admitted < self.stream_admit_per_step
             && self.streams.len() < self.stream_cap
             && !self.pending.is_empty()
+            && self.group_is_emptiest(g)
         {
             let task = self.pending.pop_front().expect("non-empty");
             admitted += 1;
@@ -6017,6 +6018,25 @@ impl<R: StagedRunner> PipelineEngine<R> {
         }
         self.flush_stage_profile();
         true
+    }
+
+    /// Whether a new stream may join group `g` now: only the emptiest group
+    /// admits. Every round starts at group 0, and requests reach `pending` a
+    /// few at a time (a submit needs the engine lock, which a round holds for
+    /// seconds), so "whichever group's turn it is" filled the first groups
+    /// and starved the rest: 48 streams on an 11-rank fleet sat in 7 groups of
+    /// 15, 10, 8, 6, 4, 4 and 2 rows. Four frames fewer than ranks in flight,
+    /// and the 15-row frame held every rank five times longer than the 2-row
+    /// one behind it. A pending request waits at most one round for the
+    /// emptiest group's turn.
+    fn group_is_emptiest(&self, g: usize) -> bool {
+        let mut rows = vec![0usize; self.stream_groups.max(1)];
+        for st in &self.streams {
+            if let Some(n) = rows.get_mut(st.group) {
+                *n += 1;
+            }
+        }
+        rows.get(g).copied() == rows.iter().copied().min()
     }
 
     fn flush_stage_profile(&mut self) {
