@@ -6004,7 +6004,28 @@ impl<R: StagedRunner> PipelineEngine<R> {
             return false;
         };
         // ---- 1. replies for this group's frames ----
-        while let Some(f) = self.stream_inflight[g].pop_front() {
+        // Only the frames in flight when the turn starts: an admission made
+        // while waiting (below) queues its frame here too, and its reply is
+        // due at this group's NEXT turn, after every frame sent before it.
+        let owed = self.stream_inflight[g].len();
+        for _ in 0..owed {
+            // Replies come back in the order the frames went out, so nothing
+            // can be read before this one. While it is not here and requests
+            // are waiting, prefill them instead of standing still: a prefill
+            // frame of eight prompts takes about 30 s to cross 11 ranks, and
+            // rank 0 used to spend that time blocked right here with the rest
+            // of a burst still unadmitted (first token after 73 s on average).
+            while !self.pending.is_empty()
+                && self.streams.len() < self.stream_cap
+                && !self.reply_waiting(&down)
+            {
+                if !self.admit_pending(g, &down, out) {
+                    break;
+                }
+            }
+            let Some(f) = self.stream_inflight[g].pop_front() else {
+                break;
+            };
             let deadline = if f.open {
                 Self::reply_deadline_prefill()
             } else {
@@ -6081,38 +6102,14 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 p.prefill += feed_started.elapsed();
             }
         }
-        if admitted == 0 && self.pending.len() >= 2 && self.group_is_emptiest(g) {
-            let admit_started = Instant::now();
-            let (n, rows) = self.admit_streams_batch(g, &down, out);
-            if n > 0 {
-                admitted += n;
-                if let Some(p) = self.stage_profile.as_mut() {
-                    p.opens += n as u64;
-                    p.open_rows += rows as u64;
-                    p.prefill += admit_started.elapsed();
-                }
-            }
-        }
         while admitted < self.stream_admit_per_step
             && self.streams.len() < self.stream_cap
             && !self.pending.is_empty()
-            && self.group_is_emptiest(g)
         {
-            let task = self.pending.pop_front().expect("non-empty");
-            admitted += 1;
-            let admit_started = Instant::now();
-            let prompt_rows = match self.admit_stream_pipeline(task, g, &down) {
-                Ok(rows) => rows,
-                Err((id, chunk)) => {
-                    out.push((id, chunk));
-                    0
-                }
-            };
-            if let Some(p) = self.stage_profile.as_mut() {
-                p.opens += 1;
-                p.open_rows += prompt_rows as u64;
-                p.prefill += admit_started.elapsed();
+            if !self.admit_pending(g, &down, out) {
+                break;
             }
+            admitted += 1;
         }
         // ---- 3. emission for this group's ready streams ----
         let emit_started = Instant::now();
@@ -6274,6 +6271,72 @@ impl<R: StagedRunner> PipelineEngine<R> {
             self.stream_log = (0, Duration::ZERO, 0);
         }
         self.flush_stage_profile();
+        true
+    }
+
+    /// Whether the next reply can be read without waiting.
+    fn reply_waiting(&mut self, down: &Arc<TokioMutex<ActivationClient>>) -> bool {
+        let Ok(replies) = self.reply_link(down) else {
+            return true; // let the blocking read report the failure
+        };
+        self.block_on(async {
+            let c = replies.lock().await;
+            tokio::time::timeout(Duration::from_millis(1), c.wait_readable())
+                .await
+                .is_ok()
+        })
+    }
+
+    /// Admit from the queue during group `turn`'s turn: several prompts as one
+    /// prefill frame when two or more wait, else one. The frame's reply is
+    /// owed at `turn`'s next turn. `false` when nothing could be admitted.
+    ///
+    /// New streams join the EMPTIEST group, not the group whose turn it is:
+    /// requests used to reach the queue a few at a time and every round
+    /// started at group 0, so the first groups filled and the rest starved
+    /// (48 streams on the 11-rank fleet sat in 7 groups of 15, 10, 8, 6, 4, 4
+    /// and 2 rows: four frames fewer in flight than ranks, and a 15-row frame
+    /// holding every rank five times longer than the 2-row one behind it).
+    fn admit_pending(
+        &mut self,
+        turn: usize,
+        down: &Arc<TokioMutex<ActivationClient>>,
+        out: &mut Vec<(TaskId, Chunk)>,
+    ) -> bool {
+        let admit_started = Instant::now();
+        if self.pending.len() >= 2 {
+            let (n, rows) = self.admit_streams_batch(turn, down, out);
+            if n > 0 {
+                if let Some(p) = self.stage_profile.as_mut() {
+                    p.opens += n as u64;
+                    p.open_rows += rows as u64;
+                    p.prefill += admit_started.elapsed();
+                }
+                return true;
+            }
+        }
+        let Some(task) = self.pending.pop_front() else {
+            return false;
+        };
+        let mut counts = vec![0usize; self.stream_groups.max(1)];
+        for st in &self.streams {
+            if let Some(n) = counts.get_mut(st.group) {
+                *n += 1;
+            }
+        }
+        let group = (0..counts.len()).min_by_key(|&i| counts[i]).unwrap_or(0);
+        let prompt_rows = match self.admit_stream_pipeline(task, group, turn, down) {
+            Ok(rows) => rows,
+            Err((id, chunk)) => {
+                out.push((id, chunk));
+                0
+            }
+        };
+        if let Some(p) = self.stage_profile.as_mut() {
+            p.opens += 1;
+            p.open_rows += prompt_rows as u64;
+            p.prefill += admit_started.elapsed();
+        }
         true
     }
 
@@ -6447,25 +6510,6 @@ impl<R: StagedRunner> PipelineEngine<R> {
         (n, rows)
     }
 
-    /// Whether a new stream may join group `g` now: only the emptiest group
-    /// admits. Every round starts at group 0, and requests reach `pending` a
-    /// few at a time (a submit needs the engine lock, which a round holds for
-    /// seconds), so "whichever group's turn it is" filled the first groups
-    /// and starved the rest: 48 streams on an 11-rank fleet sat in 7 groups of
-    /// 15, 10, 8, 6, 4, 4 and 2 rows. Four frames fewer than ranks in flight,
-    /// and the 15-row frame held every rank five times longer than the 2-row
-    /// one behind it. A pending request waits at most one round for the
-    /// emptiest group's turn.
-    fn group_is_emptiest(&self, g: usize) -> bool {
-        let mut rows = vec![0usize; self.stream_groups.max(1)];
-        for st in &self.streams {
-            if let Some(n) = rows.get_mut(st.group) {
-                *n += 1;
-            }
-        }
-        rows.get(g).copied() == rows.iter().copied().min()
-    }
-
     fn flush_stage_profile(&mut self) {
         if let Some(p) = self.stage_profile.as_mut() {
             if p.since.elapsed() >= p.every {
@@ -6482,6 +6526,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         &mut self,
         task: GenerationTask,
         g: usize,
+        reply_queue: usize,
         down: &Arc<TokioMutex<ActivationClient>>,
     ) -> Result<usize, (TaskId, Chunk)> {
         let started = Instant::now();
@@ -6588,7 +6633,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             ));
         }
         if !windowed {
-            self.stream_inflight[g].push_back(StreamInFlight {
+            self.stream_inflight[reply_queue].push_back(StreamInFlight {
                 batch_id,
                 slots: vec![slot],
                 open: true,
