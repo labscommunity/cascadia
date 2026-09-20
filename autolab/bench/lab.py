@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""Autolab harness for the 11-box Inkling fleet. Runs on the operator's Mac; standard library only.
+
+The fleet has no shell. Everything goes through two doors:
+  in:   ~/inkling-release/bin/release.py publish ...   (signed release channel -> rank 0 -> all boxes)
+  out:  http://localhost:18000  = rank 0 :8000 (OpenAI API, /api/stats, /api/fleet/telemetry)
+        release.py status --json  (signed: fleet table, rank 0 worker log tail)
+
+    lab.py status                                  one-line fleet state
+    lab.py publish  --note WHY [cascadia=PATH] [fleet-overrides.env=PATH] [beacon.py=PATH run.sh=PATH --allow-infra]
+    lab.py settle   [--expect name=sha ...]        wait until 11 workers serve one files version, restarts steady
+    lab.py reference                               record greedy reference texts from the fleet as it is NOW
+    lab.py gate                                    greedy outputs vs the reference (exit 1 = output broken)
+    lab.py bench EXP --phases single:1:48 s16:16:48 [--prompt-words N]   timed phases + telemetry -> experiments/EXP/
+    lab.py run EXP --note WHY [files...] --phases ...   publish + settle + warm + gate + bench
+
+Hard rule: no phase waits longer than --cap seconds (default 900).
+"""
+import argparse, concurrent.futures, hashlib, json, os, re, subprocess, sys, threading, time, urllib.error, urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LAB = os.path.dirname(HERE)
+API = os.environ.get("INKLING_API", "http://localhost:18000")
+RELEASE = [sys.executable if sys.version_info >= (3, 9) else "/usr/bin/python3", os.path.expanduser("~/inkling-release/bin/release.py")]
+RELEASE[0] = "/usr/bin/python3"
+LOCK = os.path.expanduser("~/inkling-release/publisher.lock/owner")
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+PROMPTS = ["Explain in three sentences why the sky is blue.", "What is the capital of France? Answer in one word.",
+           "Write two sentences about the Pacific Ocean.", "List three prime numbers and say why they are prime.",
+           "Describe a cat in two sentences.", "What is 6 times 7? Explain briefly.", "Name two planets and one fact about each.",
+           "Give one tip for sleeping better, in two sentences.", "Why is the ocean salty? Two sentences.",
+           "Summarise photosynthesis in two sentences.", "What does a compiler do? Two sentences.", "Describe rain in one sentence.",
+           "What is a haiku? Give one.", "Explain gravity to a child in two sentences.", "Name a famous painting and its painter.",
+           "What is the boiling point of water? Explain."]
+FILLER = ("The harbour town woke slowly that morning: gulls over the quay, a baker carrying trays, two "
+          "fishermen arguing about the tide, and a child counting the boats as they left one by one. ")
+GATE_PROMPTS = [0, 1, 5]
+GATE_TOKENS = 32
+
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+def get_json(path, timeout=15):
+    with OPENER.open(API + path, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def release(*args, timeout=120):
+    p = subprocess.run(RELEASE + list(args), capture_output=True, text=True, timeout=timeout)
+    return p.returncode, p.stdout, p.stderr
+
+
+def status():
+    rc, out, err = release("status", "--json")
+    if rc != 0 or not out.strip():
+        raise RuntimeError("release.py status failed: %s" % (err or out)[:300])
+    return json.loads(out)
+
+
+def fleet_rows(st):
+    rows = {}
+    for line in (st.get("beacon") or "").splitlines():
+        m = re.match(r"\s+rank\s+(\d+)\s+(\S+)\s+(\S+)\s+files (\S+ \S+)\s+\| worker (\w+), (\d+) restarts: (.*)", line)
+        if m:
+            rows[int(m.group(1))] = dict(ip=m.group(2), host=m.group(3), files=m.group(4), state=m.group(5),
+                                         restarts=int(m.group(6)), phase=m.group(7).strip())
+    return rows
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for c in iter(lambda: f.read(1 << 20), b""):
+            h.update(c)
+    return h.hexdigest()
+
+
+def cmd_status(a):
+    st = status()
+    rows = fleet_rows(st)
+    age = time.time() - st.get("time", 0)
+    print("report %.0f s old; release %s; files version %s; %d/11 ranks active; restarts %s" % (
+        age, st.get("poller", {}).get("applied"), st.get("fleet", {}).get("version"),
+        sum(1 for r in rows.values() if r["state"] == "active"), " ".join(str(rows[k]["restarts"]) for k in sorted(rows))))
+    bad = {k: v["phase"] for k, v in rows.items() if v["phase"] != "serving"}
+    if bad:
+        print("not serving:", bad)
+    if a.log:
+        for l in st.get("worker_log", []):
+            print("   ", re.sub(r"\x1b\[[0-9;]*m", "", l)[:260])
+    return 0
+
+
+def settle(expect, cap=900, steady=3):
+    """Wait until the fleet runs the expected file hashes, 11 workers serve, and restart counts stop moving."""
+    t0 = time.time(); last = None; same = 0; seen_time = 0
+    while time.time() - t0 < cap:
+        try:
+            st = status()
+        except Exception as e:  # noqa: BLE001
+            log("status:", str(e)[:120]); time.sleep(10); continue
+        if st.get("time", 0) == seen_time:
+            time.sleep(5); continue
+        seen_time = st.get("time", 0)
+        files = st.get("fleet", {}).get("files", {})
+        rows = fleet_rows(st)
+        ok_files = all(files.get(n) == h for n, h in expect.items())
+        versions = {r["files"] for r in rows.values()}
+        active = sum(1 for r in rows.values() if r["state"] == "active" and r["phase"].startswith("serving"))
+        restarts = tuple(rows[k]["restarts"] for k in sorted(rows))
+        same = same + 1 if (restarts == last and ok_files and active == 11 and len(versions) == 1) else 0
+        last = restarts
+        log("settle: files %s, %d/11 serving, %d version(s), restarts %s, steady %d/%d" % (
+            "ok" if ok_files else "PENDING", active, len(versions), " ".join(map(str, restarts)), same, steady))
+        if same >= steady:
+            return True
+        time.sleep(10)
+    return False
+
+
+def cmd_settle(a):
+    expect = dict(x.split("=", 1) for x in a.expect)
+    return 0 if settle(expect, a.cap) else 1
+
+
+def cmd_publish(a):
+    owner = open(LOCK).read() if os.path.exists(LOCK) else ""
+    if "tahoma-6d" not in owner:
+        sys.exit("publisher lock is not ours (%s): not publishing" % LOCK)
+    args, expect = ["publish"], {}
+    for spec in a.files:
+        name, path = spec.split("=", 1)
+        expect[name] = sha256(path)
+        args.append("%s=%s" % (name, os.path.abspath(path)))
+    if a.allow_infra:
+        args.append("--allow-infra")
+    args += ["--note", a.note]
+    rc, out, err = release(*args, timeout=300)
+    log("publish:", (out + err).strip().replace("\n", " | ")[:400])
+    if rc != 0:
+        return 2
+    json.dump(expect, open(os.path.join(LAB, ".autolab", "expect.json"), "w"))
+    return 0 if settle(expect, a.cap) else 1
+
+
+def chat(i, tokens, prompt_words=0, timeout=900, prompt=None):
+    prompt = prompt or PROMPTS[i % len(PROMPTS)]
+    if prompt_words:
+        words = (FILLER * (prompt_words // len(FILLER.split()) + 1)).split()[:prompt_words]
+        prompt = "Read this, then answer the question after it.\n\n" + " ".join(words) + "\n\n" + prompt
+    body = json.dumps({"model": "inkling", "stream": True, "max_tokens": tokens, "temperature": 0,
+                       "messages": [{"role": "user", "content": prompt}]}).encode()
+    req = urllib.request.Request(API + "/v1/chat/completions", data=body, headers={"Content-Type": "application/json"})
+    t0 = time.time(); first = last = None; n = 0; text = []; deadline = t0 + timeout
+    try:
+        r = None
+        for attempt in range(40):
+            try:
+                r = OPENER.open(req, timeout=timeout); break
+            except urllib.error.HTTPError as e:
+                if e.code != 503 or attempt == 39:
+                    raise
+                time.sleep(0.5 + 0.25 * attempt)
+        with r:
+            for line in r:
+                if time.time() > deadline:
+                    raise TimeoutError("phase cap")
+                line = line.strip()
+                if not line.startswith(b"data:"):
+                    continue
+                data = line[5:].strip()
+                if data == b"[DONE]":
+                    break
+                try:
+                    v = json.loads(data)
+                except ValueError:
+                    continue
+                if "error" in v and not v.get("choices"):
+                    raise RuntimeError("server error: %s" % str(v["error"])[:160])
+                ch = v.get("choices", [{}])[0]; d = ch.get("delta") or {}
+                if ch.get("finish_reason") is None and d != {}:
+                    now = time.time(); first = first or now; last = now; n += 1
+                    text.append(d.get("content") or d.get("reasoning_content") or d.get("reasoning") or "")
+        return dict(i=i, wall_s=round(time.time() - t0, 2), ttft_s=round((first or t0) - t0, 2), tokens=n,
+                    tok_s=round((n - 1) / (last - first), 3) if n > 1 and last > first else None, text="".join(text))
+    except Exception as e:  # noqa: BLE001
+        return dict(i=i, wall_s=round(time.time() - t0, 2), error=str(e)[:200], tokens=n, text="".join(text))
+
+
+def cmd_reference(a):
+    ref = {}
+    for i in GATE_PROMPTS:
+        r = chat(i, GATE_TOKENS)
+        if "error" in r:
+            sys.exit("reference request failed: %s" % r["error"])
+        ref[str(i)] = r["text"]; log("ref %d: %r" % (i, r["text"][:90]))
+    json.dump(ref, open(os.path.join(HERE, "reference.json"), "w"), indent=1)
+    return 0
+
+
+def gate():
+    """Greedy outputs vs the recorded reference. Returns (ok, details). Garbage has fine tok/s, so this runs before every timing."""
+    ref = json.load(open(os.path.join(HERE, "reference.json")))
+    res = []
+    for i in GATE_PROMPTS:
+        r = chat(i, GATE_TOKENS, timeout=600)
+        got, want = r.get("text", ""), ref[str(i)]
+        common = 0
+        for x, y in zip(got, want):
+            if x != y:
+                break
+            common += 1
+        bad = ("error" in r) or not got.strip() or "!!!!" in got or len(set(got)) < 6
+        res.append(dict(i=i, match_chars=common, of=len(want), exact=got == want, broken=bad, tok_s=r.get("tok_s"),
+                        ttft_s=r.get("ttft_s"), text=got[:120], error=r.get("error")))
+    ok = all(not x["broken"] for x in res) and sum(1 for x in res if x["match_chars"] >= min(40, x["of"])) >= 2
+    return ok, res
+
+
+def cmd_gate(a):
+    ok, res = gate()
+    for x in res:
+        log("gate prompt %d: %d/%d chars match%s  %s tok/s ttft %s  %r" % (x["i"], x["match_chars"], x["of"],
+            " (exact)" if x["exact"] else "", x["tok_s"], x["ttft_s"], x["text"][:70]))
+    log("GATE", "PASS" if ok else "FAIL")
+    return 0 if ok else 1
+
+
+class Telemetry(threading.Thread):
+    """Polls /api/fleet/telemetry (when the fleet serves it) and /api/stats into a JSONL file."""
+
+    def __init__(self, path, every=2.0):
+        super().__init__(daemon=True); self.path, self.every, self.stop_ev = path, every, threading.Event()
+        self.seen = {}; self.available = None
+
+    def run(self):
+        with open(self.path, "a") as f:
+            while not self.stop_ev.is_set():
+                t = time.time()
+                try:
+                    tel = get_json("/api/fleet/telemetry", timeout=10)
+                    self.available = "ranks" in tel
+                    for rank, e in (tel.get("ranks") or {}).items():
+                        rec = {"lt": t, "rank": int(rank), "rt": e.get("rt"), "sys": e.get("sys"), "host": e.get("host")}
+                        new = [p for p in e.get("profs", []) if p.get("at") not in self.seen.setdefault(rank, set())]
+                        for p in new:
+                            self.seen[rank].add(p.get("at"))
+                        if new:
+                            rec["profs"] = new
+                        if e.get("static"):
+                            rec["static"] = e["static"]
+                        f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+                except Exception as e:  # noqa: BLE001
+                    self.available = False if self.available is None else self.available
+                try:
+                    f.write(json.dumps({"lt": t, "stats": get_json("/api/stats", timeout=10)}) + "\n")
+                except Exception:  # noqa: BLE001
+                    pass
+                f.flush()
+                self.stop_ev.wait(max(0.2, self.every - (time.time() - t)))
+
+
+def run_phase(name, streams, tokens, prompt_words, cap):
+    t0 = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=streams) as ex:
+        futs = [ex.submit(chat, i, tokens, prompt_words, cap) for i in range(streams)]
+        out = [f.result() for f in futs]
+    wall = time.time() - t0
+    ok = [x for x in out if "error" not in x]
+    tot = sum(x["tokens"] for x in out)
+    res = dict(phase=name, streams=streams, tokens_req=tokens, prompt_words=prompt_words, start=t0, end=t0 + wall, wall_s=round(wall, 1),
+               completed=len(ok), tokens=tot, aggregate_tok_s=round(tot / wall, 3),
+               sum_stream_tok_s=round(sum(x["tok_s"] or 0 for x in ok), 3),
+               ttft_mean_s=round(sum(x["ttft_s"] for x in ok) / max(1, len(ok)), 2), ttft_max_s=max([x["ttft_s"] for x in ok] or [0]),
+               errors=[x["error"] for x in out if "error" in x][:5], sample=(ok[0]["text"][:100] if ok else ""))
+    log("PHASE %s: %d/%d done, %d tok in %.0f s = %.2f tok/s aggregate (sum of streams %.2f), ttft mean %.1f max %.1f%s" % (
+        name, len(ok), streams, tot, wall, res["aggregate_tok_s"], res["sum_stream_tok_s"], res["ttft_mean_s"], res["ttft_max_s"],
+        "  ERRORS: %s" % res["errors"][:2] if res["errors"] else ""))
+    return res
+
+
+def cmd_bench(a):
+    d = os.path.join(LAB, "experiments", a.exp); os.makedirs(d, exist_ok=True)
+    tel = Telemetry(os.path.join(d, "telemetry.jsonl")); tel.start()
+    results = []
+    try:
+        for spec in a.phases:
+            f = spec.split(":"); name, streams, tokens = f[0], int(f[1]), int(f[2]); pw = int(f[3]) if len(f) > 3 else a.prompt_words
+            results.append(run_phase(name, streams, tokens, pw, a.cap))
+            json.dump(results, open(os.path.join(d, "phases.json"), "w"), indent=1)
+            time.sleep(12)  # the ranks report a request's last profile window when they go idle
+    finally:
+        tel.stop_ev.set(); tel.join(5)
+    log("telemetry endpoint available: %s" % tel.available)
+    return 0
+
+
+def cmd_run(a):
+    if a.files:
+        rc = cmd_publish(a)
+        if rc != 0:
+            log("publish/settle failed (rc %d)" % rc); return rc
+    d = os.path.join(LAB, "experiments", a.exp); os.makedirs(d, exist_ok=True)
+    for w in range(a.warm):
+        r = chat(3 + w, 24, timeout=600)
+        log("warm %d: %s tok/s, ttft %s, %s" % (w, r.get("tok_s"), r.get("ttft_s"), r.get("error") or repr(r.get("text", "")[:50])))
+    ok, res = gate()
+    json.dump(dict(ok=ok, prompts=res), open(os.path.join(d, "gate.json"), "w"), indent=1)
+    for x in res:
+        log("gate prompt %d: %d/%d chars match  %s tok/s ttft %s  %r" % (x["i"], x["match_chars"], x["of"], x["tok_s"], x["ttft_s"], x["text"][:60]))
+    log("GATE", "PASS" if ok else "FAIL")
+    if not ok and not a.force:
+        return 3
+    return cmd_bench(a)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("status"); s.add_argument("--log", action="store_true"); s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("settle"); s.add_argument("--expect", nargs="*", default=[]); s.add_argument("--cap", type=int, default=900); s.set_defaults(fn=cmd_settle)
+    for name, fn in (("publish", cmd_publish), ("run", cmd_run)):
+        s = sub.add_parser(name)
+        if name == "run":
+            s.add_argument("exp")
+        s.add_argument("files", nargs="*"); s.add_argument("--note", required=True); s.add_argument("--allow-infra", action="store_true")
+        s.add_argument("--cap", type=int, default=900)
+        if name == "run":
+            s.add_argument("--phases", nargs="+", required=True); s.add_argument("--prompt-words", type=int, default=0)
+            s.add_argument("--warm", type=int, default=2); s.add_argument("--force", action="store_true")
+        s.set_defaults(fn=fn)
+    s = sub.add_parser("reference"); s.set_defaults(fn=cmd_reference)
+    s = sub.add_parser("gate"); s.set_defaults(fn=cmd_gate)
+    s = sub.add_parser("bench"); s.add_argument("exp"); s.add_argument("--phases", nargs="+", required=True)
+    s.add_argument("--prompt-words", type=int, default=0); s.add_argument("--cap", type=int, default=900); s.set_defaults(fn=cmd_bench)
+    a = ap.parse_args()
+    return a.fn(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
