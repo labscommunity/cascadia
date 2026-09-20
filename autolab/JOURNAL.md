@@ -78,3 +78,41 @@ cache at 60-90 % and misses up to 1.4 %).
 Measurement hygiene learned: compare steady decode (sum of per-stream rates) across experiments,
 not aggregate (it includes the admission ramp, a third of a 64-token phase at 48 streams); warm
 with many streams after every restart, or pre-warm.
+
+## 2026-09-20, iterations 004-006: rows share reads, admission stops blocking, the power limit is measured
+
+004 (multi-row int4 kernel, batched dense MLP, batched admission, pre-warm): rank 0 left the
+bottleneck (181.7 -> 129.6 ms/frame), the 25 W ranks took it over at 95-99 % busy. Steady decode
+20.7 tok/s at 48 streams, 24.5 at 96; short-prompt TTFT 9.6 -> 5.8 s; prefill per prompt row 2.5x
+cheaper. The frame-time model `17 ms + attention(R) + 6 U(R) t_expert` fits R = 1, 4, 6.4, 14
+and 19 within 10 %: decode is one memory read per distinct expert.
+
+005/006 (short engine steps, admission while waiting): two different reasons admissions crawled.
+First the engine lock: a step was a whole round, submits waited for it and arrived a few per round.
+Then the reply wait: rank 0 blocked on a prefill frame's reply (up to 30 s through 11 ranks) with
+most of a burst still unadmitted. 48-request burst TTFT 80 -> 73 -> 44 s, aggregate 12.6 -> 18.7.
+264 streams: 34.9 tok/s steady. Platform watts confirm the limiter: ranks 0-7 sit at psys 24-25 W
+(PL1 = 25 W) with clocks at 1.8-2.0 GHz; ranks 8-10 draw 42-48 W.
+
+A number worth keeping: once the drafter table was on disk the gate prompts (seen many times) ran
+at 8.5, 6.5 and 5.3 tok/s single-stream with exact output. It says nothing about unseen prompts
+(1.9-2.0 tok/s), but it is the measured top of pipelined speculation on this fleet and it matches
+the time model at a ~ 0.9.
+
+## 2026-09-20, iteration 003: what the 25 W boxes do best
+
+Seven identical boxes, one run, one variable each. Fewer threads lose (12: +14 %, 8: +43 % stage
+time), also with the low-power E cores fenced off: all 16 cores earn their watts. Holding the CPUs
+out of deep C-states is worth 8 % of a stage for a lone stream and nothing under load. The iGPU is
+the find: three of six MoE layers fused at f16 (exact since the power-of-two weight rescale; zero
+fallbacks in 1300 frames) cut the stage time by 24 % at 4 rows and 19 % at 14, at 5 W LESS package
+power. A fused layer takes 23.7 ms at 15 rows where a CPU layer on the same box takes ~46: under a
+power limit the GPU moves experts for fewer joules than 16 throttled cores. Why only three layers:
+the kernel gives driver-owned system memory half of RAM by default, and the installer generated
+three IRs per box to match.
+
+Reasoning for 007/008: fuse everywhere (007), then lift the half-of-RAM limit and generate the
+other three IRs on the boxes (008; run.sh now carries the generator). Memory is not the obstacle:
+a fused layer costs 8.3 GB of device memory, a resident CPU layer 7.8 GB, so six fused layers are
+~55 GB either way; the obstacle is the 8.4 GB host copy the shim makes while compiling each layer,
+which at the sixth layer leaves about 3 GB free. 008 therefore starts on one rank.
