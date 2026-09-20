@@ -263,10 +263,15 @@ class Telemetry(threading.Thread):
                 self.stop_ev.wait(max(0.2, self.every - (time.time() - t)))
 
 
+ECHO = "Repeat the following paragraph exactly, word for word, two times, and write nothing else:\n\n" + FILLER
+
+
 def run_phase(name, streams, tokens, prompt_words, cap):
     t0 = time.time()
+    # "echo..." phases ask for a copy of the prompt: the output repeats the input, the best case for n-gram drafts
+    prompt = ECHO if name.startswith("echo") else None
     with concurrent.futures.ThreadPoolExecutor(max_workers=streams) as ex:
-        futs = [ex.submit(chat, i, tokens, prompt_words, cap) for i in range(streams)]
+        futs = [ex.submit(chat, i, tokens, prompt_words, cap, prompt) for i in range(streams)]
         out = [f.result() for f in futs]
     wall = time.time() - t0
     ok = [x for x in out if "error" not in x]
