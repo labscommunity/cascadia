@@ -37,8 +37,8 @@ gen_fused_irs() {
     [ "${free_gb:-0}" -ge 20 ] || { echo "fused IRs: only ${free_gb} GB free, layer $l not generated"; return 0; }
     write_generator "$PREFIX/tools/inkling_moe_layer_ov.py"
     rm -rf "$tmp"; mkdir -p "$tmp"
-    echo "fused IRs: generating layer $l (about a minute, 8.4 GB)"
-    if PYTHONPATH="$PREFIX/pylib" timeout 900 "$py" "$PREFIX/tools/inkling_moe_layer_ov.py" --src "$PREFIX/model" --out "$tmp" \
+    echo "fused IRs: generating layer $l (about a minute, 8.4 GB; re-quantising to a wider group takes about six)"
+    if PYTHONPATH="$PREFIX/pylib" timeout "$([ "$grp" = 32 ] && echo 900 || echo 2400)" "$py" "$PREFIX/tools/inkling_moe_layer_ov.py" --src "$PREFIX/model" --out "$tmp" \
          --layers "$l" --layout u4zp --pad-experts 4 --up-scale-exponent "$shift" --group "$grp" --moe-dir "$sub" \
          >> "$PREFIX/logs/fused-ir.log" 2>&1 \
        && [ -s "$tmp/$sub/layer_$nn/openvino_model.bin" ]; then
