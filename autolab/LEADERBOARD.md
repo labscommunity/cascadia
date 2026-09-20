@@ -15,3 +15,4 @@
 | 009 | 09-20 | + dense layers 0-1 on the iGPU, swappiness 1 (binary fa0b6b79) | **3.1-3.6 unseen**; 12.1 / 9.3 / 6.7 memorised | 5.0-5.7 | **57.9@176 (34.8 agg)**, 54.9@352 (35.4 agg) | the device path is row-linear (~10 ms/row/rank): more streams only cost memory |
 | 010 | 09-20 | drafter seeded with 30k tokens of varied traffic | 3.27 mean on four unseen prompts (unchanged) | 5.0 | - | closed: word n-grams saturate near a third right |
 | 011 | 09-20 | + a frame's rows attend concurrently (binary b7e149a4) | 3.3 unseen; 12.0 / 9.4 / 7.4 memorised | 4.9-5.0 | **64.2@176 (37.0 agg), 60.9@264 (38.4 agg)** | aggregate target met in steady decode |
+| 011b | 09-20 | same config, 176 streams x 128 tokens | - | - | **70.2 steady, 57.9 over the whole phase incl. admission**; server counter median 70.5, max 80.4 | independent confirmation from /api/stats |
