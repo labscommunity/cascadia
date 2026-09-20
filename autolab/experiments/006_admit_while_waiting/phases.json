@@ -1,0 +1,59 @@
+[
+ {
+  "phase": "s48",
+  "streams": 48,
+  "tokens_req": 64,
+  "prompt_words": 0,
+  "start": 1789895831.7634869,
+  "end": 1789895991.7434309,
+  "wall_s": 160.0,
+  "completed": 48,
+  "tokens": 2997,
+  "aggregate_tok_s": 18.734,
+  "sum_stream_tok_s": 26.435,
+  "ttft_mean_s": 43.56,
+  "ttft_max_s": 55.02,
+  "errors": [],
+  "sample": "<think>The user wants an explanation of why the sky is blue in exactly three sentences. I need to be"
+ },
+ {
+  "phase": "s264",
+  "streams": 264,
+  "tokens_req": 32,
+  "prompt_words": 0,
+  "start": 1789896003.755114,
+  "end": 1789896393.306418,
+  "wall_s": 389.6,
+  "completed": 251,
+  "tokens": 8032,
+  "aggregate_tok_s": 20.619,
+  "sum_stream_tok_s": 34.914,
+  "ttft_mean_s": 141.39,
+  "ttft_max_s": 232.09,
+  "errors": [
+   "<urlopen error [Errno 32] Broken pipe>",
+   "[Errno 54] Connection reset by peer",
+   "[Errno 54] Connection reset by peer",
+   "[Errno 54] Connection reset by peer",
+   "[Errno 54] Connection reset by peer"
+  ],
+  "sample": "<think>The user wants an explanation of why the sky is blue in exactly three sentences. I need to be"
+ },
+ {
+  "phase": "fresh1",
+  "streams": 1,
+  "tokens_req": 64,
+  "prompt_words": 0,
+  "start": 1789896405.310037,
+  "end": 1789896443.191374,
+  "wall_s": 37.9,
+  "completed": 1,
+  "tokens": 64,
+  "aggregate_tok_s": 1.689,
+  "sum_stream_tok_s": 1.994,
+  "ttft_mean_s": 6.28,
+  "ttft_max_s": 6.28,
+  "errors": [],
+  "sample": "<think>The user wants one surprising fact about a hot-air balloon and an explanation. I need to pick"
+ }
+]
