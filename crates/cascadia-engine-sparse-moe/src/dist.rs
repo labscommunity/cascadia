@@ -187,6 +187,14 @@ pub enum FrameKind {
     StreamClose = 0x53_4D_45_62, // "SME\x62"
     /// up: `batch_id u32 | rows u32 | (slot u32, token i64) × rows`.
     StreamTokens = 0x53_4D_45_63, // "SME\x63"
+    /// down: `batch_id u32 | slot u32 | rows u32 | flags u32 | SamplingConfig | tensor [1, rows, H]`
+    /// — one window of a prompt longer than a `StreamOpen` may carry
+    /// ([`MAX_STREAM_ROWS`]). [`STREAM_FEED_OPEN`] on the first window opens
+    /// the slot, the rows append at the slot's position, and only the window
+    /// with [`STREAM_FEED_FINAL`] is sampled and answered with `StreamTokens`.
+    /// Windows travel the pipeline back to back, so rank 1 works on the first
+    /// while rank 0 computes the second.
+    StreamFeed = 0x53_4D_45_64, // "SME\x64"
 }
 
 impl FrameKind {
@@ -218,6 +226,7 @@ impl FrameKind {
             x if x == FrameKind::StreamDecode as u32 => Some(FrameKind::StreamDecode),
             x if x == FrameKind::StreamClose as u32 => Some(FrameKind::StreamClose),
             x if x == FrameKind::StreamTokens as u32 => Some(FrameKind::StreamTokens),
+            x if x == FrameKind::StreamFeed as u32 => Some(FrameKind::StreamFeed),
             _ => None,
         }
     }
@@ -1434,6 +1443,75 @@ pub async fn recv_stream_open_body_server(
     }
     let (h, _) = tensor_to_hidden(&tensor)?;
     Ok((batch_id, slot, rows, sampling, h))
+}
+
+/// `StreamFeed` flag: this is the prompt's first window, open the slot.
+pub const STREAM_FEED_OPEN: u32 = 1;
+/// `StreamFeed` flag: this is the prompt's last window, sample its final row
+/// and reply `StreamTokens`.
+pub const STREAM_FEED_FINAL: u32 = 2;
+
+/// down: `rows` more prompt positions of `slot` (see [`FrameKind::StreamFeed`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn send_stream_feed(
+    cli: &Mutex<ActivationClient>,
+    batch_id: u32,
+    slot: u32,
+    flags: u32,
+    sampling: &SamplingConfig,
+    hidden_f32: &[f32],
+    rows: u32,
+    h: u32,
+) -> TransportResult<()> {
+    let mut header = [0u8; 20 + SAMPLING_WIRE_BYTES];
+    header[0..4].copy_from_slice(&(FrameKind::StreamFeed as u32).to_be_bytes());
+    header[4..8].copy_from_slice(&batch_id.to_be_bytes());
+    header[8..12].copy_from_slice(&slot.to_be_bytes());
+    header[12..16].copy_from_slice(&rows.to_be_bytes());
+    header[16..20].copy_from_slice(&flags.to_be_bytes());
+    let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+    encode_sampling(sampling, &mut sbytes);
+    header[20..].copy_from_slice(&sbytes);
+    let tensor = hidden_to_tensor(hidden_f32, [1, rows, h]);
+    let mut guard = cli.lock().await;
+    guard.send_raw(&header).await?;
+    guard.send(&tensor).await?;
+    Ok(())
+}
+
+/// Body of a `StreamFeed` (kind consumed): `(batch_id, slot, rows, flags, sampling, hidden)`.
+pub async fn recv_stream_feed_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u32, u32, u32, u32, SamplingConfig, Vec<f32>)> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(16 + SAMPLING_WIRE_BYTES).await?;
+    if raw.len() != 16 + SAMPLING_WIRE_BYTES {
+        return Err(TransportError::SocketClosed);
+    }
+    let (batch_id, slot, rows, flags) = (
+        be_u32(&raw[0..4]),
+        be_u32(&raw[4..8]),
+        be_u32(&raw[8..12]),
+        be_u32(&raw[12..16]),
+    );
+    if rows == 0 || rows > MAX_STREAM_ROWS {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream feed: rows {rows} out of range 1..={MAX_STREAM_ROWS}"
+        ))));
+    }
+    let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+    sbytes.copy_from_slice(&raw[16..]);
+    let sampling = decode_sampling(&sbytes);
+    let (tensor, _) = guard.recv().await?;
+    drop(guard);
+    if tensor.shape[1] != rows {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream feed: tensor shape[1]={} != rows {rows}",
+            tensor.shape[1]
+        ))));
+    }
+    let (h, _) = tensor_to_hidden(&tensor)?;
+    Ok((batch_id, slot, rows, flags, sampling, h))
 }
 
 /// down: one decode token for each `(slot, pos)` (`hidden` = `[rows.len(), h]`).
