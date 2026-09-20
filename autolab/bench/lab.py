@@ -386,7 +386,8 @@ def run_phase(name, streams, tokens, prompt_words, cap):
     # "echo..." phases ask for a copy of the prompt: the output repeats the input, the best case for n-gram drafts
     # "fresh..." phases use prompts derived from the phase's tag (RUN_TAG + phase name), unseen by earlier experiments
     prompts = [ECHO if name.startswith("echo") else fresh_prompt(RUN_TAG[0] + "/" + name, i) if name.startswith("fresh")
-               else family_prompt(name, RUN_TAG[0] + "/" + name, i) if name.startswith("fam") else None
+               else family_prompt(name, RUN_TAG[0] + "/" + name, i) if name.startswith("fam")
+               else family_prompt("fam%d" % (i % 12), RUN_TAG[0] + "/" + name, i) if name.startswith("mix") else None
                for i in range(streams)]
     def start(i):
         # Hundreds of connections opened in the same millisecond get reset somewhere along the tunnel
@@ -400,11 +401,14 @@ def run_phase(name, streams, tokens, prompt_words, cap):
     wall = time.time() - t0
     ok = [x for x in out if "error" not in x]
     tot = sum(x["tokens"] for x in out)
+    rates = sorted(x["tok_s"] or 0 for x in ok); ttfts = sorted(x["ttft_s"] for x in ok)
     res = dict(phase=name, streams=streams, tokens_req=tokens, prompt_words=prompt_words, start=t0, end=t0 + wall, wall_s=round(wall, 1),
                completed=len(ok), tokens=tot, aggregate_tok_s=round(tot / wall, 3),
                sum_stream_tok_s=round(sum(x["tok_s"] or 0 for x in ok), 3),
                ttft_mean_s=round(sum(x["ttft_s"] for x in ok) / max(1, len(ok)), 2), ttft_max_s=max([x["ttft_s"] for x in ok] or [0]),
-               errors=[x["error"] for x in out if "error" in x][:5], sample=(ok[0]["text"][:100] if ok else ""))
+               errors=[x["error"] for x in out if "error" in x][:5], sample=(ok[0]["text"][:100] if ok else ""),
+               stream_tok_s_min=(rates[0] if rates else 0), stream_tok_s_median=(rates[len(rates) // 2] if rates else 0),
+               ttft_median_s=(ttfts[len(ttfts) // 2] if ttfts else 0))
     log("PHASE %s: %d/%d done, %d tok in %.0f s = %.2f tok/s aggregate (sum of streams %.2f), ttft mean %.1f max %.1f%s" % (
         name, len(ok), streams, tot, wall, res["aggregate_tok_s"], res["sum_stream_tok_s"], res["ttft_mean_s"], res["ttft_max_s"],
         "  ERRORS: %s" % res["errors"][:2] if res["errors"] else ""))

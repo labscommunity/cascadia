@@ -198,3 +198,42 @@ Encoding (fewer bytes per token) is the other axis, and it is independent of the
 4.6 (-25 to -35 % of 16.8 GB; needs a new export of 522 GB, calibration data, and an iGPU kernel that does not
 exist in OpenVINO), attention at int4 (-4.3 GB). Both change the numerics. Entropy-coding int4 (3.5 bits of entropy)
 cannot be decoded at 100 GB/s. Skipping low-weight experts or inactive neurons is lossy.
+
+## The 15-stream regime (goal re-set by the user on 2026-09-20: interactive speed for up to 15 streams, ideally 60 tok/s aggregate)
+
+Measured baseline (019, config of 015c, 15 mixed-task streams x 128 tokens, all arriving at once): **22.5-23.4 tok/s
+steady = 1.4-1.6 tok/s per stream, first token after 31 s (median)**. 11 streams: 20.8; 22: 32.1; 33: 37.7.
+
+Eleven stages want eleven frames in flight, so 15 streams means 1.36 rows per frame, and one round (every stream
+one token) is the sum of eleven frame times at the pace of the slowest stage. Frame time of a middle rank (25 W):
+
+| rows per frame | 1.00 | 1.36 | 1.92 | 2.90 | 14.4 |
+|---|---|---|---|---|---|
+| ms per frame | 35.1 | 40.8 | 50.6 | 70.8 | 154 |
+| GPU attention projections | 9.7 | 9.6 | 10.2 | 12.4 | 14.4 |
+| GPU fused experts | 21.2 | 25.0 | 31.2 | 44.3 | 120 |
+| CPU (attention core, routers, glue) | 4.2 | 5.9 | 9.3 | 14.1 | ~20 |
+
+`T(r) = 16 + 19 r ms` for r <= 3 (not the `28 + 9 r` of large batches): a second row reads its own eight experts
+per layer (1.57 GB per stage, 12 ms: the marginal row moves at ~129 GB/s, the bus at work), while the FIRST row pays
+~13 ms that are not bytes: 12 attention calls at ~0.3 ms and 6 fused-MoE calls at ~1.5 ms of fixed cost each.
+
+What follows from that, in the order it matters at 15 streams:
+
+1. **Two stages set the pace.** Rank 0 takes 48.3 ms per 1.36-row frame (its two dense layers run at 26 GB/s: 18 ms)
+   and rank 10 takes 36.5 + 11.7 ms (the output head); everyone else 37-41 ms and waits 25-33 % of the time.
+   Balanced, the same kernels give +18 %.
+2. **The GPU is idle for a third of every frame** (CPU glue + per-call host work, during which no kernel runs) if
+   the fixed cost per call is host time, which OpenVINO's dynamic-shape flow suggests (shape inference, kernel
+   selection, argument setting per primitive per call). Two frames in flight INSIDE a box (its six layers cut in two
+   halves with disjoint state, one thread each, sharing the iGPU) would fill those gaps: up to ~1.6x at one or two
+   rows per frame. To be confirmed by measuring GPU time against wall time per call before building it.
+3. **The byte ceiling.** Per round a stage reads 11 x 0.78 GB of attention + 15 x 1.57 GB of experts = 32 GB. At
+   the 108-129 GB/s this memory has shown: 250-300 ms per round = **50-60 tok/s is the ceiling of this layout with
+   today's encodings**; int4 attention would lift it by ~15 %. 60 tok/s is at the edge of physics, 40-50 is the
+   engineering target.
+4. **Speculation does not help here.** A guess row costs a full set of expert reads (19 ms of a 41 ms frame); it pays
+   only above ~0.6-0.75 acceptance, which only text the tables have memorised reaches. It stays a lone-stream tool.
+5. **First token.** A prompt travels as ONE frame through eleven stages in series (5 s for 45 tokens alone, 31 s when
+   fifteen arrive together and are admitted in fat frames that also stall everyone's decoding). Windows of <= 32 rows
+   sent back to back pipeline one prompt across the stages, and stay on the GPU plugin's small-batch MoE path.

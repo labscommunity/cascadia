@@ -1,5 +1,9 @@
 # autolab/inkling-fleet-perf
 
+> **Goal re-set by the user on 2026-09-20 (afternoon):** interactive speed for up to 15 concurrent streams, and the
+> highest aggregate throughput at that concurrency: ideally 60 tok/s (4 tok/s per stream). The earlier targets
+> (> 10 tok/s single stream, > 60 tok/s at any concurrency) are history; see PHYSICS.md "The 15-stream regime".
+
 Autonomous performance research on the live 11-box Inkling fleet (975B MoE, 66 layers,
 pipeline-parallel, 6 layers per Intel Panther Lake box: Core Ultra X7 358H, Arc B390 iGPU,
 61 GiB LPDDR5x-8533, USB 1 GbE). Long-lived research branch; verified wins are cherry-picked
