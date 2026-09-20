@@ -1,0 +1,10 @@
+12:08:39 publish: release 1789924119 signed and published: cascadia (20362968 B, b7e149a47c8a), fleet-overrides.env (6618 B, 34fff77683c9) | the entry point polls every ~30 s; `release.py wait` follows the rollout
+12:08:39 settle: files PENDING, 11/11 serving, 1 version(s), restarts 0 4 3 3 3 3 2 2 1 1 1, steady 0/3
+12:09:09 settle: files ok, 10/11 serving, 2 version(s), restarts 0 4 3 3 3 3 2 2 1 0 1, steady 0/3
+12:09:44 settle: files ok, 0/11 serving, 1 version(s), restarts 0 0 0 0 0 0 0 0 0 0 0, steady 0/3
+12:10:20 settle: files ok, 0/11 serving, 1 version(s), restarts 0 0 0 0 0 0 0 0 0 1 1, steady 0/3
+12:10:50 settle: files ok, 1/11 serving, 1 version(s), restarts 0 1 1 1 1 0 1 0 0 1 1, steady 0/3
+12:11:26 settle: files ok, 2/11 serving, 1 version(s), restarts 0 1 1 1 1 0 1 0 0 1 1, steady 0/3
+12:12:01 settle: files ok, 3/11 serving, 1 version(s), restarts 0 1 2 1 2 1 1 1 0 1 1, steady 0/3
+12:12:32 settle: files ok, 2/11 serving, 1 version(s), restarts 0 2 2 1 2 1 1 1 0 1 1, steady 0/3
+12:13:07 settle: files ok, 2/11 serving, 1 version(s), restarts 0 2 2 2 2 2 2 1 1 1 1, steady 0/3

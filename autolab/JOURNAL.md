@@ -162,3 +162,28 @@ Where the two targets stand, and why:
   bus limit + 13 ms of int8 attention projections, also bus-bound), eleven stages in series are
   440 ms, and only right guesses shorten that: `T (a + (1 - a) D)`. a = 0.3 today. 10 tok/s needs
   a ~ 0.85: a trained draft head on the last rank's hidden states (EAGLE-style), not an n-gram table.
+
+## 2026-09-20, iterations 012-015: the single-stream equation, term by term
+
+The user: "keep going until we hit 10 tok/s single stream. think from first principles and outside the box."
+So each term of `a*T + (1-a)*L` got measured instead of assumed.
+
+012 (anatomy): L = 408 ms of bus-bound work + hops + 45 ms that rank 0 wasted computing guess frames before
+reading the reply that mattered; a = 0.30. With a fixed near 0.3 the fleet already ran within 10 % of what the
+topology allows: the target needs both a and L to move.
+013 (offline, the fleet's own text): how right can a drafter be? n-gram tables 30-38 %, Qwen3-0.6B 54 %, 4B 61 %,
+an oracle over two drafters 66 %, and by task 0.39 (story) to 0.78 (arithmetic). Nothing reaches the 0.85 that
+10 tok/s needs at this L.
+014 (the user pointed at their poll-mode NIC driver project): the 3.3 ms LAN round trip was `cdc_ncm` holding small
+frames for up to 1.2 ms per direction. `tx_timer_usecs = 0`: 0.2-0.3 ms. Latency no longer rules expert parallelism
+out; the 1 GbE wire and a 43 GB re-shard per box remain its price.
+015: a 0.6B drafter model beside rank 0 (text in, the target's tokens out, any vocabulary), a rank 0 that reads
+replies between guess frames, tables where they are sure. First release broke every lone request for a few minutes
+(a waiting round surfaced as an empty engine step; rolled back, fixed, and the test now fails the old code).
+Result: prose 3.0 -> 3.1-3.7, structured tasks 5.9-10.9, memorised 10-12, 176 streams 65.5. Exact.
+
+Also fixed: seven raw telemetry files (they name lab hosts) had been force-added with experiment folders and pushed.
+The branch was rewritten without them and the harness now writes raw telemetry outside the work tree.
+
+Next, in order of return per effort: distil the drafter on this model's outputs (a +0.1 on prose), expert
+parallelism for the lone row as a serving MODE (L -27 %), int4 attention (L -13 %, changes numerics).

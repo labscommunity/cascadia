@@ -368,6 +368,16 @@ def fresh_prompt(tag, i):
     return ASKS[h % len(ASKS)].format(THINGS[(h >> 8) % len(THINGS)])
 
 
+def family_prompt(name, tag, i):
+    """`famK...` phases: an unseen prompt of collect.py's family K (0 explain, 1 code, 2 arithmetic, 3 story, 4 tips,
+    5 table, 6 rewrite, 7 facts, 8 poem, 9 how-to, 10 translate, 11 true/false): how predictable the model's text is
+    to a drafter depends on the kind of task far more than on anything else (013: 0.39 to 0.78 for the same drafter)."""
+    import collect
+    k = int(re.match(r"fam(\d+)", name).group(1)) % len(collect.FAMILIES)
+    h = int(hashlib.sha256(("%s/%d" % (tag, i)).encode()).hexdigest(), 16)
+    return collect.FAMILIES[k](h >> 4)
+
+
 ECHO = "Repeat the following paragraph exactly, word for word, two times, and write nothing else:\n\n" + FILLER
 
 
@@ -375,7 +385,8 @@ def run_phase(name, streams, tokens, prompt_words, cap):
     t0 = time.time()
     # "echo..." phases ask for a copy of the prompt: the output repeats the input, the best case for n-gram drafts
     # "fresh..." phases use prompts derived from the phase's tag (RUN_TAG + phase name), unseen by earlier experiments
-    prompts = [ECHO if name.startswith("echo") else fresh_prompt(RUN_TAG[0] + "/" + name, i) if name.startswith("fresh") else None
+    prompts = [ECHO if name.startswith("echo") else fresh_prompt(RUN_TAG[0] + "/" + name, i) if name.startswith("fresh")
+               else family_prompt(name, RUN_TAG[0] + "/" + name, i) if name.startswith("fam") else None
                for i in range(streams)]
     def start(i):
         # Hundreds of connections opened in the same millisecond get reset somewhere along the tunnel

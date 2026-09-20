@@ -46,3 +46,24 @@ Tier S = structural, could move a target by 2x or more. Tier A = 1.2-2x. Tier B 
 | X4 | A | `up`-scale attenuation (2^-4) in the shim's constant copy for the sporadic overflow inside an expert (layer 8: -94909) | removes the remaining fallbacks | after X3's fallback count |
 | X5 | B | cross-request n-gram table on rank 0 (stock reasoning phrases repeat across requests) | acceptance +0.1-0.2 | todo |
 | X6 | A | rebalance groups as streams finish; more frames in flight than ranks | util +10-20 % | exp 004 (env) |
+
+## Added 2026-09-20 afternoon (after 012-015): single stream, what is left and what each is worth
+
+Measured: prose 3.1-3.7 tok/s (a = 0.42, L = 410 ms), structured tasks 6-11, memorised 10-12.
+
+1. **Drafter distilled on the fleet's own outputs.** Qwen3-0.6B is right 0.41 on explanations and 0.78 on arithmetic;
+   the gap is style, which fine-tuning on a few million of this model's tokens closes in part (literature: +10 to
+   +45 % relative). The fleet writes ~200k tokens an hour at 176 streams; the miner's 4060 Ti can tune 0.6B in an
+   hour or two. Expected: a 0.42 -> 0.5-0.55 on prose = 3.5 -> 4.3 tok/s. Exact.
+2. **Expert parallelism for the lone row, as a mode** (`PHYSICS.md`). Every box holds 1/11 of every layer's experts
+   (CPU-resident, 47.8 GB) and serves any stage; a stage fans a layer's six routed experts out and computes the two
+   shared ones itself. L 410 -> ~290 ms. Needs: expert servers that accept several drivers, the staged loader with
+   remote experts (the engine has both halves, the CLI forbids the combination), a re-shard of 43 GB per box over
+   the LAN driven from the overrides, junk guesses kept off the expert servers. Costs the multi-stream mode while on.
+3. **int4 attention projections generated on the boxes** (-5 ms per stage, L -55 ms). Changes numerics: needs a
+   wider quality gate than twelve questions.
+4. **Hot-expert replicas** (keeps both modes): the 4-7 GB each box has left hold the most-used experts of OTHER
+   ranks' layers; a lone row offloads those while its own iGPU reads the rest. Worth ~-50 ms if usage is as skewed
+   as in other MoEs (unmeasured here: count expert ids per layer first).
+5. **Not exact, so only ever opt-in:** keep a guess the model itself finds likely (its probability within a factor of
+   the top token's). With a model drafter that is a ~0.7 on prose: ~6 tok/s today, ~10 with 2 and 3.
