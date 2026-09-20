@@ -160,6 +160,12 @@ impl InklingRunner {
             let t0 = std::time::Instant::now();
             let (mut experts, mut bytes) = (0usize, 0usize);
             for l in &s.layers {
+                // A layer served by the fused device backend keeps its experts
+                // in device memory; a second, resident CPU copy of it is only
+                // read on a fallback and would not fit next to it.
+                if l.ov_moe().is_some() {
+                    continue;
+                }
                 if let Some(moe) = l.moe() {
                     let (n, b) = moe.prewarm_expert_cache();
                     experts += n;

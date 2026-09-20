@@ -187,6 +187,10 @@ class Telemetry:
                 c["p_majflt"], c["p_cpu"] = int(f[9]), int(f[11]) + int(f[12])
         c["rapl"] = _num("/sys/class/powercap/intel-rapl:0/energy_uj", -1)
         c["rapl_max"] = _num("/sys/class/powercap/intel-rapl:0/max_energy_range_uj", 0)
+        # The platform domain ("psys": SoC + memory + the rest of the board) is the one the 25 W boxes are held by.
+        c["psys"] = _num("/sys/class/powercap/intel-rapl:1/energy_uj", -1)
+        c["psys_max"] = _num("/sys/class/powercap/intel-rapl:1/max_energy_range_uj", 0)
+        c["plimit"] = _num("/sys/devices/system/cpu/cpu0/thermal_throttle/package_power_limit_count", 0)
         idle = [_num(g, -1) for g in sorted(glob.glob("/sys/class/drm/card*/device/tile*/gt0/gtidle/idle_residency_ms"))]
         c["gpu_idle_ms"] = idle[0] if idle else -1
         c["throttle"] = _num("/sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count", 0)
@@ -212,6 +216,19 @@ class Telemetry:
         if freqs:
             g["mhz"] = sum(freqs) // len(freqs) // 1000
             g["mhz_max"] = max(freqs) // 1000
+        for kind, name in (("cpu_core", "mhz_p"), ("cpu_atom", "mhz_e")):  # hybrid parts: P cores and E cores apart
+            cpus = []
+            for part in _read("/sys/devices/%s/cpus" % kind).strip().split(","):
+                if "-" in part:
+                    a, b = part.split("-", 1)
+                    if a.isdigit() and b.isdigit():
+                        cpus += list(range(int(a), int(b) + 1))
+                elif part.isdigit():
+                    cpus.append(int(part))
+            f = [_num("/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq" % c) for c in cpus[:32]]
+            f = [x for x in f if x]
+            if f:
+                g[name] = sum(f) // len(f) // 1000
         temps = [_num(p) for p in glob.glob("/sys/class/thermal/thermal_zone*/temp")]
         if temps:
             g["temp"] = max(temps) // 1000
@@ -265,6 +282,12 @@ class Telemetry:
             if e < 0:
                 e += now["rapl_max"]
             out["pkg_w"] = round(e / 1e6 / dt, 1)
+        if now.get("psys", -1) >= 0 and prev.get("psys", -1) >= 0:
+            e = now["psys"] - prev["psys"]
+            if e < 0:
+                e += now.get("psys_max", 0)
+            out["psys_w"] = round(e / 1e6 / dt, 1)
+        out["plimit"] = d("plimit")
         if now["gpu_idle_ms"] >= 0 and prev.get("gpu_idle_ms", -1) >= 0:
             out["gpu"] = round(min(max(1 - d("gpu_idle_ms") / 1e3 / dt, 0), 1), 3)
         out["throttle"] = d("throttle")
