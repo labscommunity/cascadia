@@ -6,6 +6,12 @@
 //! * `GET /api/stats` — coarse runtime counters (in-flight requests,
 //!   tokens generated). Read from the shared [`cascadia_types::ApiStats`]
 //!   the OpenAI server bumps on the chat hot path.
+//! * `GET /api/fleet/telemetry` — a JSON file another process on this box
+//!   keeps current (the Inkling fleet's `beacon.py` on rank 0: every box's
+//!   load figures and stage profiles), passed through as-is. The API port
+//!   is the only way into some fleets, so their telemetry leaves through it.
+//!   File named by `CASCADIA_FLEET_TELEMETRY_FILE`; a missing file is a 200
+//!   with an `error` field, not a failure — most deployments have none.
 //! * `embed-spa` feature — when on, serves the built Vite SPA from
 //!   `crates/cascadia-dashboard/web/dist` at `/`, including a fallback to
 //!   `index.html` for client-side routes. When off, `/` serves a small
@@ -20,10 +26,13 @@
 //! the dashboard separable also leaves room for shipping or hiding it
 //! independently of the OpenAI API.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::http::header;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use cascadia_topology::{NodeInfo, Topology};
@@ -63,13 +72,30 @@ pub struct DashboardState {
 /// Build the dashboard router. Combine with `cascadia-api`'s router in the
 /// host process; see `crates/cascadia-cli` for the canonical composition.
 pub fn make_router(state: DashboardState) -> Router {
+    make_router_with_telemetry_file(state, telemetry_path())
+}
+
+/// [`make_router`] with the fleet telemetry file named by the caller instead
+/// of the environment. The environment is read once, in `make_router`, not
+/// per request: it cannot change under a running server, and the route tests
+/// (which run in parallel in one process) can each use a file of their own.
+fn make_router_with_telemetry_file(state: DashboardState, telemetry_file: PathBuf) -> Router {
     // Merge SPA routes (when `embed-spa` is on) before `.with_state` so
     // both sub-routers carry the same `Router<DashboardState>` state type
     // when axum unifies them. After `.with_state(state)` the requirement
     // is fulfilled and we return a plain `Router<()>`.
     let r = Router::new()
         .route("/api/topology", get(get_topology))
-        .route("/api/stats", get(get_stats));
+        .route("/api/stats", get(get_stats))
+        // An explicit route, so it is matched before the SPA fallback (which
+        // 404s every unknown `/api/*`) in an `embed-spa` build as well.
+        .route(
+            "/api/fleet/telemetry",
+            get(move || {
+                let path = telemetry_file.clone();
+                async move { fleet_telemetry_response(&path).await }
+            }),
+        );
 
     #[cfg(feature = "embed-spa")]
     let r = r.merge(spa::router());
@@ -142,6 +168,77 @@ async fn get_stats(State(state): State<DashboardState>) -> Json<StatsResponse> {
     })
 }
 
+/// Env var naming the fleet telemetry file served at `/api/fleet/telemetry`.
+pub const FLEET_TELEMETRY_FILE_ENV: &str = "CASCADIA_FLEET_TELEMETRY_FILE";
+
+/// Where the Inkling fleet's `beacon.py` writes it on rank 0.
+pub const DEFAULT_FLEET_TELEMETRY_FILE: &str = "/run/cascadia-inkling/telemetry.json";
+
+/// The writer keeps the file under ~400 KB; anything beyond this is not that
+/// file, and is not read into memory on the serving path.
+const FLEET_TELEMETRY_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The fleet telemetry file this process serves: `CASCADIA_FLEET_TELEMETRY_FILE`,
+/// else the beacon's default.
+pub fn telemetry_path() -> PathBuf {
+    telemetry_path_from(std::env::var_os(FLEET_TELEMETRY_FILE_ENV))
+}
+
+/// [`telemetry_path`] on an explicit value (unset or empty = the default).
+fn telemetry_path_from(value: Option<std::ffi::OsString>) -> PathBuf {
+    match value {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => PathBuf::from(DEFAULT_FLEET_TELEMETRY_FILE),
+    }
+}
+
+/// The file's bytes, provided it is a regular-sized JSON document.
+async fn read_fleet_telemetry(path: &Path) -> Result<Vec<u8>, &'static str> {
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|_| "no telemetry file")?;
+    let mut bytes = Vec::new();
+    // One byte past the cap tells "too large" apart from "exactly the cap"
+    // without trusting the file's metadata (it is replaced once a second).
+    file.take(FLEET_TELEMETRY_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| "no telemetry file")?;
+    if bytes.len() as u64 > FLEET_TELEMETRY_MAX_BYTES {
+        return Err("telemetry file too large");
+    }
+    // Served under `application/json`, so it has to be JSON: a path that
+    // names some other file must not hand that file's contents out.
+    serde_json::from_slice::<serde::de::IgnoredAny>(&bytes)
+        .map_err(|_| "telemetry file is not JSON")?;
+    Ok(bytes)
+}
+
+/// `GET /api/fleet/telemetry`: the file as-is, or `{"error", "path"}` — both
+/// 200, so a poller tells "this box has no fleet telemetry" from "this build
+/// has no such route" (404) without parsing an error page.
+async fn fleet_telemetry_response(path: &Path) -> Response {
+    let body = match read_fleet_telemetry(path).await {
+        Ok(bytes) => bytes,
+        Err(error) => serde_json::json!({
+            "error": error,
+            "path": path.to_string_lossy(),
+        })
+        .to_string()
+        .into_bytes(),
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            // Rewritten once a second: a cached copy is a wrong answer.
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +303,156 @@ mod tests {
         assert_eq!(v["requests_total"], 7);
         assert_eq!(v["tokens_total"], 2048);
         assert_eq!(v["max_concurrent"], 16);
+    }
+
+    // `/api/fleet/telemetry`. The file comes from the router's constructor,
+    // never from the environment: env vars are process-global and these
+    // tests run in parallel. NOT feature-gated — the route has to answer
+    // in the `embed-spa` build too, where the SPA fallback 404s every
+    // `/api/*` path it is handed.
+
+    /// A file of this test's own in the temp dir, removed on drop.
+    struct TempFile(PathBuf);
+
+    impl TempFile {
+        fn new(name: &str, contents: &[u8]) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "cascadia-dashboard-test-{}-{name}",
+                std::process::id()
+            ));
+            std::fs::write(&path, contents).unwrap();
+            TempFile(path)
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    async fn get_telemetry(file: &Path) -> (StatusCode, String, String, Vec<u8>) {
+        let app = make_router_with_telemetry_file(state_with_two_nodes(), file.to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/fleet/telemetry")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let header = |name| {
+            response
+                .headers()
+                .get(name)
+                .map(|v: &axum::http::HeaderValue| v.to_str().unwrap().to_string())
+                .unwrap_or_default()
+        };
+        let (ct, cc) = (header(header::CONTENT_TYPE), header(header::CACHE_CONTROL));
+        let body = to_bytes(response.into_body(), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        (status, ct, cc, body.to_vec())
+    }
+
+    #[test]
+    fn telemetry_path_is_the_env_value_else_the_beacon_default() {
+        assert_eq!(
+            telemetry_path_from(None),
+            PathBuf::from("/run/cascadia-inkling/telemetry.json")
+        );
+        assert_eq!(
+            telemetry_path_from(Some("".into())),
+            PathBuf::from(DEFAULT_FLEET_TELEMETRY_FILE)
+        );
+        assert_eq!(
+            telemetry_path_from(Some("/tmp/x/t.json".into())),
+            PathBuf::from("/tmp/x/t.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn fleet_telemetry_serves_the_file_as_is() {
+        // Byte-for-byte: the odd spacing must survive (no re-serialization).
+        let contents =
+            br#"{"t": 12.5,"fleet":"inkling",  "ranks":{"3":{"rt":1.0,"sys":{"cpu":0.5}}}}"#;
+        let file = TempFile::new("as-is.json", contents);
+        let (status, ct, cc, body) = get_telemetry(&file.0).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ct, "application/json");
+        assert_eq!(cc, "no-store");
+        assert_eq!(body, contents);
+    }
+
+    #[tokio::test]
+    async fn fleet_telemetry_without_a_file_is_a_200_that_says_so() {
+        let missing = std::env::temp_dir().join(format!(
+            "cascadia-dashboard-test-{}-there-is-no-such-file.json",
+            std::process::id()
+        ));
+        let (status, ct, _, body) = get_telemetry(&missing).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ct, "application/json");
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"], "no telemetry file");
+        assert_eq!(v["path"], missing.to_string_lossy().as_ref());
+    }
+
+    #[tokio::test]
+    async fn fleet_telemetry_never_hands_out_a_file_that_is_not_json() {
+        let file = TempFile::new("not-json.txt", b"root:x:0:0:secret\n");
+        let (status, ct, _, body) = get_telemetry(&file.0).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ct, "application/json");
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"], "telemetry file is not JSON");
+        assert!(!String::from_utf8_lossy(&body).contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn fleet_telemetry_is_capped_at_4_mib() {
+        // Valid JSON on both sides of the cap, so only the size decides.
+        let json_string = |len: usize| {
+            let mut s = vec![b'a'; len];
+            s[0] = b'"';
+            s[len - 1] = b'"';
+            s
+        };
+        let at_cap = TempFile::new("at-cap.json", &json_string(4 * 1024 * 1024));
+        let (_, _, _, body) = get_telemetry(&at_cap.0).await;
+        assert_eq!(body.len(), 4 * 1024 * 1024);
+
+        let over = TempFile::new("over-cap.json", &json_string(4 * 1024 * 1024 + 1));
+        let (status, _, _, body) = get_telemetry(&over.0).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"], "telemetry file too large");
+    }
+
+    #[tokio::test]
+    async fn public_router_has_the_fleet_telemetry_route() {
+        // `make_router` is what the host process mounts next to the OpenAI
+        // routes. Whatever file the environment of this test run names (on a
+        // build box: none), the route answers 200 + JSON — never the 404 an
+        // unrouted `/api/*` path gets.
+        let app = make_router(state_with_two_nodes());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/fleet/telemetry")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let body = to_bytes(response.into_body(), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice::<Value>(&body).unwrap();
     }
 
     // Regression tests for the "downloaded main, saw `API + dashboard
