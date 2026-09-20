@@ -60,8 +60,13 @@ def sha256_of(path):
     return h.hexdigest()
 
 
+# Fleet traffic never goes through a web proxy: a box with http_proxy set would hand "inkling-rank-0" to the
+# proxy, which cannot resolve it (HTTP 504).
+DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def fetch(url, timeout=10):
-    with urllib.request.urlopen(url, timeout=timeout) as r:
+    with DIRECT.open(url, timeout=timeout) as r:
         return r.read()
 
 

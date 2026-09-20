@@ -134,6 +134,9 @@ requests the pipeline serves; raise it on every box together.
   is not installed or not running yet, or is not on the same switch
   (`beacon.py --show` on both boxes tells which). If a firewall is on
   (`sudo ufw status`), the installer opens the fleet's ports itself.
+- Boxes with a web proxy configured (`http_proxy` in `/etc/environment`, usual on corporate images): fleet
+  names like `inkling-rank-0` must not go through it (the proxy answers HTTP 504). The kit's own scripts
+  bypass proxies; in your own commands use `curl --noproxy '*' ...`.
 - Re-running the installer is safe; it skips what is already done. It
   restarts that box's rank; the ranks behind rank 0 then restart once under
   their supervisors (about five seconds plus load time) and rank 0 reconnects

@@ -348,9 +348,9 @@ fi
 # Fleet updater: if rank 0 is already serving the fleet's files, enroll now, so later changes (scripts, binary,
 # settings) reach this box by themselves. Not fatal: it can be done any time later.
 if [ "$DISCOVER" = 1 ]; then
-  ENROLL="python3 -c \"import urllib.request as u;print(u.urlopen('http://$FLEET-rank-0:8088/enroll-updater.sh').read().decode())\" | sudo bash"
+  ENROLL="curl --noproxy '*' -fsS http://$FLEET-rank-0:8088/enroll-updater.sh | sudo bash"
   for i in 1 2 3 4 5; do getent hosts "$FLEET-rank-0" > /dev/null 2>&1 && break; sleep 2; done
-  if $PY -c "import sys, urllib.request; sys.stdout.buffer.write(urllib.request.urlopen('http://$FLEET-rank-0:8088/enroll-updater.sh', timeout=5).read())" > "$PREFIX/enroll-updater.sh" 2>/dev/null; then
+  if $PY -c "import sys, urllib.request as u; sys.stdout.buffer.write(u.build_opener(u.ProxyHandler({})).open('http://$FLEET-rank-0:8088/enroll-updater.sh', timeout=5).read())" > "$PREFIX/enroll-updater.sh" 2>/dev/null; then
     PREFIX="$PREFIX" bash "$PREFIX/enroll-updater.sh" 2>&1 | tail -3 || log "updater enrollment did not complete; later: $ENROLL"
   else
     rm -f "$PREFIX/enroll-updater.sh"; log "rank 0 is not serving fleet files right now; to get updates by themselves later, run: $ENROLL"

@@ -18,6 +18,11 @@ PROMPTS = ["Explain in three sentences why the sky is blue.", "What is the capit
            "What is the boiling point of water? Explain."]
 
 
+# The pipeline is on the LAN: never through a web proxy (boxes with http_proxy set would send the fleet's
+# names to it and get HTTP 504).
+urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
+
+
 def one(base, i, tokens, out):
     body = json.dumps({"model": "inkling", "stream": True, "max_tokens": tokens, "temperature": 0,
                        "messages": [{"role": "user", "content": PROMPTS[i % len(PROMPTS)]}]}).encode()

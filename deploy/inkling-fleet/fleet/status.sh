@@ -7,7 +7,7 @@ systemctl --no-pager --lines=0 status cascadia-inkling.service 2>/dev/null | sed
 echo "last log lines:"
 journalctl -u cascadia-inkling --no-pager -n 6 -o cat 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-160
 if [ "$RANK" = 0 ]; then
-  echo "api: $(curl -s -m 3 http://127.0.0.1:8000/v1/models | head -c 120)"
+  echo "api: $(curl --noproxy '*' -s -m 3 http://127.0.0.1:8000/v1/models | head -c 120)"
 fi
 free -g | awk 'NR==2 {r="ram: used " $3 " GB, available " $7 " GB"} NR==3 {print r ", swap used " $3 " GB" ($3 > 1 ? "  <-- swapping: this rank will be very slow; lower FUSED_LAYERS_LINUX in fleet.env and re-run the installer" : "")}'
 if [ -f "$PREFIX/beacon.py" ]; then
