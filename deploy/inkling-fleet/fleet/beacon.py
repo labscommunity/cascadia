@@ -23,6 +23,7 @@ authenticated: anyone on the LAN can claim a rank. Fine for a demo network.
 import argparse
 import json
 import os
+import re
 import select
 import socket
 import subprocess
@@ -61,6 +62,43 @@ def local_addrs():
     return wired or [a for a in other if not a[0].startswith(("lo", "docker", "veth", "br-", "virbr"))]
 
 
+def worker_status(unit="cascadia-inkling.service"):
+    """What this box's rank is doing, in a few words, for `--show` on any other machine."""
+    st = {"state": "?", "restarts": 0, "phase": ""}
+    try:
+        out = subprocess.run(["systemctl", "show", unit, "-p", "ActiveState", "-p", "NRestarts"],
+                             capture_output=True, text=True, timeout=5).stdout
+        kv = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+        st["state"] = kv.get("ActiveState", "?")
+        st["restarts"] = int(kv.get("NRestarts", "0") or 0)
+        log_ = subprocess.run(["journalctl", "-u", unit, "-n", "60", "-o", "cat", "--no-pager"],
+                              capture_output=True, text=True, timeout=5).stdout
+        lines = [re.sub(r"\x1b\[[0-9;]*m", "", l).strip() for l in log_.splitlines()]
+        lines = [l for l in lines if l and "GPU_MOE_BATCHED" not in l]
+        last_start = max([i for i, l in enumerate(lines) if "worker starting" in l] or [0])
+        run = lines[last_start:]
+        text = " ".join(run)
+        if any(k in text for k in ("entering relay loop", "API serving", "API + dashboard serving")):
+            phase = "serving"
+        elif "upstream peer accepted" in text:
+            phase = "loading the model"
+        elif "downstream connected" in text:
+            phase = "waiting for the previous rank to dial in"
+        elif "waiting for downstream peer" in text:
+            phase = "waiting for the next rank"
+        else:
+            phase = ""
+        errs = [l for l in run if re.search(r"ERROR|Error:|panicked|exiting for supervisor", l)]
+        if errs:
+            phase = (phase + "; " if phase else "") + "last error: " + re.sub(r"^\S+Z\s+\w+\s+\S+:\s*", "", errs[-1])[:110]
+        elif not phase and run:
+            phase = re.sub(r"^\S+Z\s+\w+\s+\S+:\s*", "", run[-1])[:110]
+        st["phase"] = phase
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return st
+
+
 def listener(port):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -87,7 +125,7 @@ def announce(port, payload):
                 files = int(json.load(open("/run/cascadia-inkling/update.json")).get("version", 0))
             except (OSError, ValueError):
                 files = 0
-            s.sendto(json.dumps(dict(payload, ip=ip, id=mac, files=files)).encode(), (brd, port))
+            s.sendto(json.dumps(dict(payload, ip=ip, id=mac, files=files))[:1300].encode(), (brd, port))
             s.close()
             sent.append(ip)
         except OSError:
@@ -101,6 +139,8 @@ def parse(data, fleet):
         if m.get("magic") == MAGIC and m.get("fleet") == fleet:
             host = str(m.get("host", "?"))
             parse.files[int(m["rank"])] = int(m.get("files", 0) or 0)
+            if isinstance(m.get("w"), dict):
+                parse.worker[int(m["rank"])] = m["w"]
             return int(m["rank"]), int(m.get("total", 0)), host, str(m.get("id", host))
     except (ValueError, KeyError, TypeError, UnicodeDecodeError):
         pass
@@ -108,6 +148,7 @@ def parse(data, fleet):
 
 
 parse.files = {}  # rank -> version of the fleet files its updater has applied (0 = not enrolled)
+parse.worker = {}  # rank -> {"state", "restarts", "phase"} as that box reports it
 
 
 def write_hosts(path, fleet, table):
@@ -158,6 +199,10 @@ def show(table, dups, total, fleet, me=None):
             note += "  <-- CLAIMED BY SEVERAL BOXES: %s" % ", ".join(sorted(dups[r]))
         v = parse.files.get(r, 0)
         files = "files %s" % time.strftime("%m-%d %H:%M:%S", time.localtime(v)) if v else "files: not enrolled"
+        w = parse.worker.get(r)
+        if w:
+            clean = lambda t: re.sub(r"[^\x20-\x7e]", "?", str(t))[:140]
+            note = "  | worker %s, %s restarts: %s%s" % (clean(w.get("state")), clean(w.get("restarts")), clean(w.get("phase")), note)
         print("  rank %2d  %-15s  %-16s %s%s" % (r, e["ip"], e["host"], files, note))
     if 0 in table:
         print("  API: http://%s:8000   (on a fleet box also http://%s-rank-0:8000)" % (table[0]["ip"], fleet))
@@ -200,11 +245,14 @@ def run_service(a):
         pass
     pending = {}  # rank -> (new address, first heard) until it has been stable for a moment
     watched = {a.rank - 1, a.rank, a.rank + 1}
-    last_send = last_state = last_warn = 0.0
+    last_send = last_state = last_warn = last_worker = 0.0
     dirty = bool(table)
     log("beacon for rank %d of %d, fleet %s, UDP %d" % (a.rank, a.total, a.fleet, a.port))
     while True:
         now = time.time()
+        if now - last_worker >= 5.0:
+            last_worker = now
+            payload["w"] = worker_status()
         if now - last_send >= 1.0:
             last_send = now
             if not announce(a.port, payload) and now - last_warn > 30:
