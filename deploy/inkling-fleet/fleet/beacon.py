@@ -71,14 +71,14 @@ def worker_status(unit="cascadia-inkling.service"):
         kv = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
         st["state"] = kv.get("ActiveState", "?")
         st["restarts"] = int(kv.get("NRestarts", "0") or 0)
-        log_ = subprocess.run(["journalctl", "-u", unit, "-n", "60", "-o", "cat", "--no-pager"],
+        log_ = subprocess.run(["journalctl", "-u", unit, "-n", "400", "-o", "cat", "--no-pager"],
                               capture_output=True, text=True, timeout=5).stdout
         lines = [re.sub(r"\x1b\[[0-9;]*m", "", l).strip() for l in log_.splitlines()]
         lines = [l for l in lines if l and "GPU_MOE_BATCHED" not in l]
         last_start = max([i for i, l in enumerate(lines) if "worker starting" in l] or [0])
         run = lines[last_start:]
         text = " ".join(run)
-        if any(k in text for k in ("entering relay loop", "API serving", "API + dashboard serving")):
+        if any(k in text for k in ("entering relay loop", "API serving", "API + dashboard serving", "stream admitted", "task done")):
             phase = "serving"
         elif "upstream peer accepted" in text:
             phase = "loading the model"
