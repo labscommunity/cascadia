@@ -314,8 +314,14 @@ def run_phase(name, streams, tokens, prompt_words, cap):
     # "fresh..." phases use prompts derived from the phase's tag (RUN_TAG + phase name), unseen by earlier experiments
     prompts = [ECHO if name.startswith("echo") else fresh_prompt(RUN_TAG[0] + "/" + name, i) if name.startswith("fresh") else None
                for i in range(streams)]
+    def start(i):
+        # Hundreds of connections opened in the same millisecond get reset somewhere along the tunnel
+        # (13 of 264 in exp 006); 15 ms apart they all arrive within a few seconds and none is lost.
+        time.sleep(0.015 * i)
+        return chat(i, tokens, prompt_words, cap, prompts[i])
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=streams) as ex:
-        futs = [ex.submit(chat, i, tokens, prompt_words, cap, prompts[i]) for i in range(streams)]
+        futs = [ex.submit(start, i) for i in range(streams)]
         out = [f.result() for f in futs]
     wall = time.time() - t0
     ok = [x for x in out if "error" not in x]
