@@ -5393,6 +5393,11 @@ pub struct PipelineEngine<R: StagedRunner> {
     shared_ngrams: Arc<std::sync::Mutex<crate::ngram_draft::SharedNgrams>>,
     /// Finished requests learned from since start (the table is saved every 16th).
     spec_learned: std::cell::Cell<u64>,
+    /// A drafter model for the speculation path (`CASCADIA_STREAMS_SPEC_LM`,
+    /// see [`crate::lm_draft`]) with the target's tokenizer to cut its text.
+    spec_lm: Option<(crate::lm_draft::LmConfig, Arc<Tokenizer>)>,
+    /// Guesses by source since start: `(drafter model, n-gram tables)`.
+    spec_sources: (u64, u64),
     /// Direct reply link (`CASCADIA_STREAMS_RETURN_PORT`): the last rank
     /// listens, rank 0 dials `CASCADIA_STREAMS_RETURN_HOST`, and token replies
     /// skip the ranks in between. A mid rank forwards a reply only between
@@ -5807,6 +5812,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 crate::ngram_draft::SharedNgrams::default(),
             )),
             spec_learned: std::cell::Cell::new(0),
+            spec_lm: None,
+            spec_sources: (0, 0),
             batched_admissions: 0,
             return_cli: None,
             return_srv: None,
@@ -5866,6 +5873,14 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => warn!(path = %path.display(), "drafter table not loaded: {e}"),
                 }
+            }
+            if let (Some(cfg), Some(tok)) = (
+                crate::lm_draft::LmConfig::from_env(),
+                self.tokenizer.as_ref(),
+            ) {
+                info!(addr = %cfg.addr, template = ?cfg.template, n_predict = cfg.n_predict,
+                      "speculation asks a drafter model first");
+                self.spec_lm = Some((cfg, Arc::new(tok.clone())));
             }
         }
         self.stage_profile = StageProfile::from_env();
@@ -6276,14 +6291,17 @@ impl<R: StagedRunner> PipelineEngine<R> {
 
     /// Whether the next reply can be read without waiting.
     fn reply_waiting(&mut self, down: &Arc<TokioMutex<ActivationClient>>) -> bool {
+        self.reply_within(down, Duration::from_millis(1))
+    }
+
+    /// Whether a token reply becomes readable within `wait`.
+    fn reply_within(&mut self, down: &Arc<TokioMutex<ActivationClient>>, wait: Duration) -> bool {
         let Ok(replies) = self.reply_link(down) else {
             return true; // let the blocking read report the failure
         };
         self.block_on(async {
             let c = replies.lock().await;
-            tokio::time::timeout(Duration::from_millis(1), c.wait_readable())
-                .await
-                .is_ok()
+            tokio::time::timeout(wait, c.wait_readable()).await.is_ok()
         })
     }
 
@@ -6479,6 +6497,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 let mut d = crate::ngram_draft::Draft::new()
                     .with_draft_k(1)
                     .with_shared(self.shared_ngrams.clone());
+                if let Some((cfg, tok)) = self.spec_lm.clone() {
+                    d = d.with_lm(cfg, tok);
+                }
                 let ids: Vec<i64> = ids.iter().map(|&t| t as i64).collect();
                 d.warm_with_prompt(&ids);
                 d
@@ -6570,6 +6591,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
             let mut d = crate::ngram_draft::Draft::new()
                 .with_draft_k(1)
                 .with_shared(self.shared_ngrams.clone());
+            if let Some((cfg, tok)) = self.spec_lm.clone() {
+                d = d.with_lm(cfg, tok);
+            }
             let ids: Vec<i64> = prompt_ids.iter().map(|&t| t as i64).collect();
             d.warm_with_prompt(&ids);
             d
@@ -6890,6 +6914,19 @@ impl<R: StagedRunner> PipelineEngine<R> {
         }
         // ---- 1. the next verified token, if frames of ours are in flight ----
         while let Some(front) = self.streams[0].spec.front().map(|r| r.batch_id) {
+            // A drafter model may not have had its guess ready when the frames
+            // went out (it starts over after every wrong guess). Blocking here
+            // until the next reply would leave the pipeline empty for a whole
+            // trip: look for the reply briefly, and top the pipeline up (3.)
+            // when there is none yet.
+            if self.spec_lm.is_some() && !self.streams[0].cancelled && self.pending.is_empty() {
+                let st = &self.streams[0];
+                let valid = st.spec.iter().filter(|r| r.valid).count();
+                let room = valid <= depth && st.generated.len() + valid < st.max_new;
+                if room && !self.reply_within(&down, Duration::from_millis(6)) {
+                    break;
+                }
+            }
             let wait_started = Instant::now();
             let deadline = Self::reply_deadline() * groups;
             let replies = match self.reply_link(&down) {
@@ -6967,6 +7004,13 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 .find(|r| r.valid)
                 .is_some_and(|r| r.guess && r.input == self.streams[0].next);
             let finished = self.spec_emit(out, in_draft);
+            if !finished && !in_draft {
+                // The text just changed under the drafter model: let it write
+                // while this rank computes the frame of the true token.
+                if let Some(d) = self.streams[0].draft.as_mut() {
+                    d.poke();
+                }
+            }
             if let Some(p) = self.stage_profile.as_mut() {
                 p.emit += emit_started.elapsed();
             }
@@ -6983,6 +7027,13 @@ impl<R: StagedRunner> PipelineEngine<R> {
             return;
         }
         let max_seq = self.runner.max_seq();
+        // A drafter model writes while this rank computes; when it has nothing
+        // yet, a few milliseconds of patience are cheaper than an empty frame.
+        let patience = if self.spec_lm.is_some() {
+            Duration::from_millis(4)
+        } else {
+            Duration::ZERO
+        };
         loop {
             let st = &self.streams[0];
             let valid = st.spec.iter().filter(|r| r.valid).count();
@@ -6994,11 +7045,21 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     if valid > depth || ahead >= st.max_new || last.pos + 1 >= max_seq {
                         break;
                     }
-                    let Some(d) = st.draft.as_ref().and_then(|d| d.propose().first().copied())
+                    let pos = last.pos + 1;
+                    // A reply that is already here outranks another guess: it
+                    // may refute the frames this one would follow, and a frame
+                    // holds this rank for a whole stage time.
+                    if self.reply_waiting(&down) {
+                        break;
+                    }
+                    let Some(d) = self.streams[0]
+                        .draft
+                        .as_mut()
+                        .and_then(|d| d.propose_one(patience))
                     else {
                         break;
                     };
-                    (last.pos + 1, d, true)
+                    (pos, d, true)
                 }
             };
             if let Err(e) = self.spec_send(&down, pos, input, guess) {
@@ -7088,6 +7149,16 @@ impl<R: StagedRunner> PipelineEngine<R> {
         }
         let st = self.streams.swap_remove(0);
         self.learn_from(&st);
+        if let Some(d) = st.draft.as_ref() {
+            let (lm, tables) = d.sources();
+            self.spec_sources.0 += lm;
+            self.spec_sources.1 += tables;
+            if d.has_lm() {
+                info!(task = %st.id, guesses_model = lm, guesses_tables = tables,
+                      model_total = self.spec_sources.0, tables_total = self.spec_sources.1,
+                      "speculation guesses by source");
+            }
+        }
         self.runner.close_stream(st.slot);
         if let Err(e) = self.block_on(send_stream_close(down, st.slot as u32)) {
             warn!(slot = st.slot, "stream close not relayed: {e}");

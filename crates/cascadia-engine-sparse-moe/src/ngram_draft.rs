@@ -231,6 +231,18 @@ pub struct Draft {
     /// What other requests taught ([`SharedNgrams`]); asked when this
     /// request's own history has no match.
     shared: Option<std::sync::Arc<std::sync::Mutex<SharedNgrams>>>,
+    /// Where the output begins in `history` (after [`Self::warm_with_prompt`]).
+    prompt_len: usize,
+    /// A small language model asked before the tables ([`crate::lm_draft`]):
+    /// its settings until the first guess is wanted, then the live link. Only
+    /// a stream that really speculates ever opens one.
+    lm_cfg: Option<(
+        crate::lm_draft::LmConfig,
+        std::sync::Arc<tokenizers::Tokenizer>,
+    )>,
+    lm: Option<crate::lm_draft::LmLink>,
+    /// Guesses by source: `(model, tables)`.
+    sources: (u64, u64),
 }
 
 impl Draft {
@@ -241,7 +253,76 @@ impl Draft {
             table: HashMap::new(),
             draft_k: DEFAULT_DRAFT_K,
             shared: None,
+            prompt_len: 0,
+            lm_cfg: None,
+            lm: None,
+            sources: (0, 0),
         }
+    }
+
+    /// Ask a drafter model first ([`crate::lm_draft`]); the tables answer when
+    /// it has nothing ready. `tok` is the TARGET's tokenizer.
+    pub fn with_lm(
+        mut self,
+        cfg: crate::lm_draft::LmConfig,
+        tok: std::sync::Arc<tokenizers::Tokenizer>,
+    ) -> Self {
+        self.lm_cfg = Some((cfg, tok));
+        self
+    }
+
+    /// The next token's guess for the speculation path: the drafter model's if
+    /// one is configured and has an answer within `wait`, else the tables'.
+    pub fn propose_one(&mut self, wait: std::time::Duration) -> Option<i64> {
+        if self.lm.is_none() {
+            if let Some((cfg, tok)) = self.lm_cfg.take() {
+                let prompt = &self.history[..self.prompt_len.min(self.history.len())];
+                self.lm = Some(crate::lm_draft::LmLink::new(cfg, tok, prompt));
+            }
+        }
+        if let Some(lm) = self.lm.as_mut() {
+            let from = self.prompt_len.min(self.history.len());
+            if let Some(t) = lm.next(&self.history[from..], wait) {
+                self.sources.0 += 1;
+                return Some(t);
+            }
+            // A guess from the tables would send the text somewhere the model
+            // is not writing towards, and the model is right more often: an
+            // empty frame is the better price. The tables answer only when
+            // there is no model to ask.
+            if !lm.unreachable() {
+                return None;
+            }
+        }
+        let t = self.lookup_next(&self.history)?;
+        self.sources.1 += 1;
+        Some(t)
+    }
+
+    /// Tell the drafter model where the text stands NOW, so that it writes
+    /// while the caller computes (a frame holds rank 0 for a stage time; the
+    /// guess for the frame after it is wanted right then). No-op without one.
+    pub fn poke(&mut self) {
+        if self.lm.is_none() {
+            if let Some((cfg, tok)) = self.lm_cfg.take() {
+                let prompt = &self.history[..self.prompt_len.min(self.history.len())];
+                self.lm = Some(crate::lm_draft::LmLink::new(cfg, tok, prompt));
+            }
+        }
+        if let Some(lm) = self.lm.as_mut() {
+            let from = self.prompt_len.min(self.history.len());
+            let _ = lm.next(&self.history[from..], std::time::Duration::ZERO);
+        }
+    }
+
+    /// `(guesses from the drafter model, guesses from the tables)`.
+    pub fn sources(&self) -> (u64, u64) {
+        self.sources
+    }
+
+    /// Whether a drafter model is configured for this request.
+    pub fn has_lm(&self) -> bool {
+        self.lm.is_some() || self.lm_cfg.is_some()
     }
 
     /// Fall back to a table shared across requests when this one's own
@@ -271,6 +352,8 @@ impl Draft {
     pub fn reset(&mut self) {
         self.history.clear();
         self.table.clear();
+        self.prompt_len = 0;
+        self.lm = None;
     }
 
     /// Bulk-load history (prompt prefill). Walks every k-gram in
@@ -281,6 +364,7 @@ impl Draft {
         for &t in tokens {
             self.append(t);
         }
+        self.prompt_len = self.history.len();
     }
 
     /// Append one verified token. Updates the k-gram table with the

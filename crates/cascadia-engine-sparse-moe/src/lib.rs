@@ -44,6 +44,7 @@ pub mod inkling;
 #[cfg(feature = "kv_coord")]
 pub mod kv_coordination;
 pub mod kv_prefix_cache;
+pub mod lm_draft;
 pub mod manifest;
 pub mod ngram_draft;
 pub mod ov_kv_cache;
