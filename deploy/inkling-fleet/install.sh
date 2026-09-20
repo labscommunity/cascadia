@@ -16,7 +16,9 @@
 # service. Nothing system-wide is replaced: OpenVINO lives under the prefix,
 # the GPU packages are the vendor .debs (they do add /dev/dri access), and the
 # service runs as its own unit.
-set -euo pipefail
+set -Eeuo pipefail
+# Never stop without saying where: any command that fails unexpectedly names itself.
+trap 'rc=$?; echo "[install] ERROR: stopped at line $LINENO (exit $rc) while running: $BASH_COMMAND" >&2; echo "[install] nothing was removed; fix the cause and run the same command again (finished steps are skipped)" >&2' ERR
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RANK="${1:?usage: install.sh <rank>|auto [--cpu-only] [--no-net] [--add-address] [--prefix DIR] [--model-source DIR]}"; shift
 PREFIX=/opt/cascadia-inkling; CPU_ONLY=0; NO_NET=0; ADD_ADDRESS=0; MODEL_SRC="$HERE/../inkling/out"
@@ -89,7 +91,8 @@ if ! done_step runtime; then
   log "OpenVINO runtime -> $PREFIX/ov"; rm -rf "$PREFIX/ov"; mkdir -p "$PREFIX/ov"
   tar -xzf "$ARCH" -C "$PREFIX/ov"; mark runtime
 fi
-OVDIR=$(ls -d "$PREFIX"/ov/openvino_genai_* | head -1)
+OVDIR=$(ls -d "$PREFIX"/ov/openvino_genai_* 2>/dev/null | head -1 || true)
+[ -n "$OVDIR" ] || { log "ERROR: the OpenVINO runtime did not unpack under $PREFIX/ov (is $ARCH on the SSD and readable?)"; exit 1; }
 # OpenCL ICD loader: OpenVINO GenAI's library links libOpenCL.so.1, so without it the
 # binary does not start (CPU-only ranks included) and Intel's OpenCL package will not
 # configure. Ubuntu only has it where something else pulled it in (ffmpeg, another ICD).
@@ -119,10 +122,13 @@ GPU_OK=0
 if [ "$CPU_ONLY" = 0 ]; then
   if ! done_step gpudebs; then
     log "Intel GPU compute packages"
-    ZE=$(ls "$HERE"/gpu-debs/libze1_*u${UB}.04_*.deb 2>/dev/null | head -1)
-    [ -n "$ZE" ] || ZE=$(ls "$HERE"/gpu-debs/libze1_*u24.04_*.deb | head -1)   # 26.04: the 24.04 build installs fine
+    # Level Zero loader built for this Ubuntu release, else the 24.04 build (it installs fine on newer releases).
+    # "|| true": with set -e and pipefail a glob that matches nothing would otherwise end the install on the spot.
+    ZE=$(ls "$HERE"/gpu-debs/libze1_*u${UB}.04_*.deb 2>/dev/null | head -1 || true)
+    [ -n "$ZE" ] || ZE=$(ls "$HERE"/gpu-debs/libze1_*u24.04_*.deb 2>/dev/null | head -1 || true)
+    [ -n "$ZE" ] || log "no libze1 package on the SSD for Ubuntu $VERSION_ID"
     dpkg -i "$HERE"/gpu-debs/libigdgmm12_*.deb "$HERE"/gpu-debs/intel-igc-core-2_*.deb "$HERE"/gpu-debs/intel-igc-opencl-2_*.deb \
-            "$ZE" "$HERE"/gpu-debs/libze-intel-gpu1_*.deb "$HERE"/gpu-debs/intel-opencl-icd_*.deb \
+            ${ZE:+"$ZE"} "$HERE"/gpu-debs/libze-intel-gpu1_*.deb "$HERE"/gpu-debs/intel-opencl-icd_*.deb \
             "$HERE"/gpu-debs/intel-ocloc_*.deb >> "$PREFIX/logs/gpu-debs.log" 2>&1 || log "some GPU packages did not install (see logs/gpu-debs.log)"
     getent group render > /dev/null && usermod -aG render,video root || true
     mark gpudebs
