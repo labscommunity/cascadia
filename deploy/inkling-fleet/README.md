@@ -1,4 +1,4 @@
-# Inkling on 12 boxes — from this SSD
+# Inkling on 11 boxes — from this SSD
 
 Everything the installation needs is on this drive:
 
@@ -7,23 +7,22 @@ inkling-deploy/          this folder: installers, binaries, runtimes, tools, fle
 inkling/out/             the Inkling int4 export (549 GB) + int8 attention/head IRs
 ```
 
-Twelve Intel Panther Lake boxes (10 × Ubuntu, 2 × Windows 11), one wired
-switch, no internet. Each box becomes one rank of a 12-rank pipeline that
-serves the OpenAI-compatible API (and the dashboard) from rank 0.
+Eleven Intel Panther Lake boxes running Ubuntu, one wired switch, no
+internet. Each box becomes one rank of an 11-rank pipeline (6 of the model's
+66 layers per box) that serves the OpenAI-compatible API (and the dashboard)
+from rank 0. The number of boxes is `TOTAL` in `fleet.env`; the installers
+split the layers evenly over whatever it says, so set it before the first
+install and keep it the same for every box.
 
 ## Per box (about 10 minutes, mostly copying)
 
-1. Plug the SSD in. Decide the box's rank (0–11). Ranks 0 and 11 hold the
-   embedding and the output head; the two Windows boxes can be any rank (the
-   installer gives them 3 fused layers on the iGPU instead of 4).
+1. Plug the SSD in. Decide the box's rank (0–10): rank 0 is the box clients
+   talk to, and rank r sends to rank r+1, so give each box a different rank.
 2. **Ubuntu** (24.04 or newer; the installer checks that the binary starts
    before it does anything slow):
    ```
    sudo /media/$USER/<ssd>/inkling-deploy/install.sh <rank>
    ```
-   **Windows 11**: the SSD is ext4, which Windows cannot read (it offers to
-   format the drive: say no). Install the Windows boxes over the LAN instead,
-   see "Windows boxes" below.
 3. Unplug the SSD. The rank starts by itself, now and at every boot, and
    restarts if it stops. `status.sh` / `status.ps1` in the install folder show
    one screen of health.
@@ -31,7 +30,10 @@ serves the OpenAI-compatible API (and the dashboard) from rank 0.
 Order does not matter: a rank keeps retrying its downstream neighbour until
 it is up. Rank 0 answers on `http://<IP_0>:8000` once every rank is up.
 
-## Windows boxes (over the LAN)
+## If a Windows 11 box joins the fleet (over the LAN)
+
+The SSD is ext4, which Windows cannot read (it offers to format the drive:
+say no), so a Windows box installs over the LAN:
 
 1. Plug the SSD into any Ubuntu box on the switch (one that is already
    installed is fine) and run
@@ -78,9 +80,9 @@ must point at the next rank.
 
 - Experts stay on the CPU with the tuned read profile (the whole slice is
   resident in the expert cache after the first request), except the layers
-  the iGPU takes as fused MoE (4 per Ubuntu box, 3 per Windows box, generated
-  on the box at install time in about a minute each; `fleet.env` sets the
-  counts).
+  the iGPU takes as fused MoE (3 of a 64 GB box's 6, generated on the box at
+  install time in about a minute each; `fleet.env` sets the count and the
+  installer caps it at what half of the box's RAM can hold).
 - Attention projections and the output head run on the iGPU from the int8
   IRs on the SSD.
 - Without a usable iGPU (no `/dev/dri` render node, no Intel GPU, or
@@ -105,6 +107,9 @@ requests the pipeline serves; raise it on every box together.
   different `CASCADIA_STREAMS` than rank 0.
 - `no /dev/dri render node`: the kernel does not expose the Panther Lake
   iGPU; the rank runs on the CPU. Ubuntu 24.04 needs its HWE kernel (6.14+).
+- A rank that is far slower than the others is swapping (`status.sh` says
+  so): lower `FUSED_LAYERS_LINUX` in `fleet.env` by one and run the installer
+  on that box again.
 - Re-running the installer is safe; it skips what is already done. It
   restarts that box's rank; the ranks behind rank 0 then restart once under
   their supervisors (about five seconds plus load time) and rank 0 reconnects

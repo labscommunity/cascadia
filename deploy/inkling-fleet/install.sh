@@ -144,7 +144,11 @@ FUSED=""
 if [ "$GPU_OK" = 1 ]; then
   # device (=unified) memory per fused layer is 8.3 GB; leave RAM for the CPU
   # layers (7.7 GB each) and ~14 GB for the OS, the slots and compile transients.
-  MAX_FUSED="${FUSED_LAYERS_LINUX:-4}"
+  MAX_FUSED="${FUSED_LAYERS_LINUX:-3}"
+  # The iGPU can take at most half of RAM (the kernel's default limit for the xe driver, the same
+  # share Windows gives it), so cap the request by this box's RAM: 3 layers on 64 GB, 1 on 32 GB.
+  RAM_CAP=$(( RAM_GB * 10 / 2 / 83 ))
+  if [ "$MAX_FUSED" -gt "$RAM_CAP" ]; then log "fused layers capped at $RAM_CAP for ${RAM_GB} GB RAM (fleet.env asks for $MAX_FUSED)"; MAX_FUSED=$RAM_CAP; fi
   cands=""; for l in $(seq "$LO" $((HI-1))); do [ "$l" -ge 2 ] && cands="$cands $l"; done
   n=0; for l in $cands; do [ $n -lt "$MAX_FUSED" ] && FUSED="${FUSED:+$FUSED,}$l" && n=$((n+1)); done
   if [ -n "$FUSED" ] && done_step pylib && ! done_step "fused:$FUSED"; then

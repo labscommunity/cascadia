@@ -28,6 +28,10 @@ wheels/     openvino==2026.3.1 for cp310..cp314 manylinux_2_28 + cp312 win_amd64
 tools/      inkling_attn_ov.py inkling_moe_layer_ov.py inkling_expert_ov.py glm5_expert_ov.py
 ```
 
+To refresh an SSD that is already in the field, pack `apply-update.sh` next to an `inkling-deploy/` folder
+holding only the changed files and run it on any Linux machine with the SSD mounted: it copies and verifies
+them and sets the fleet size in `fleet.env` without touching edited addresses or the model.
+
 The SSD is ext4, which Windows cannot read: the two Windows boxes install over the LAN
 (`serve.py` on an Ubuntu box that holds the SSD, `bootstrap.ps1` on the Windows box; see README).
 
