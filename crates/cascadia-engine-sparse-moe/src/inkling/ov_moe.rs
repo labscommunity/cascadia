@@ -73,6 +73,28 @@ fn set_process_env(name: &str, value: &str) {
 /// boundary on the B390), so calls use a few fixed shapes — 2 (decode), then
 /// multiples of 8 up to 32, then multiples of 32 — and the padding rows are
 /// ignored on the way out.
+/// `CASCADIA_INKLING_OV_PERF=1`: compile the device graphs with per-primitive
+/// profiling and account, per call, the time inside `infer()` and the time the
+/// DEVICE spent executing. Wall minus device time is when the GPU sat idle
+/// (host-side shape inference, argument setting, submission, copies): the
+/// number that says whether a second frame could use the device meanwhile.
+/// A diagnostic: profiling itself costs a little, so set it on one rank.
+pub(crate) fn ov_perf() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("CASCADIA_INKLING_OV_PERF").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Device execution time of the last `infer()` (sum over primitives), ns.
+pub(crate) fn device_ns(rt: &Runtime) -> u64 {
+    rt.profiling()
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split('\t').nth(3)?.parse::<u64>().ok())
+        .sum::<u64>()
+        * 1000
+}
+
 pub(crate) fn bucket_rows(rows: usize) -> usize {
     match rows {
         0..=2 => 2,
@@ -97,6 +119,10 @@ pub struct OvMoeStats {
     pub calls: u64,
     pub rows: u64,
     pub call_ns: u64,
+    /// With `CASCADIA_INKLING_OV_PERF=1`: time inside `infer()` and time the
+    /// device executed, of `call_ns`.
+    pub infer_ns: u64,
+    pub device_ns: u64,
     pub compiles: u64,
     pub compile_ns: u64,
     pub fallbacks: u64,
@@ -151,6 +177,8 @@ pub struct OvMoe {
     calls: AtomicU64,
     rows: AtomicU64,
     call_ns: AtomicU64,
+    infer_ns: AtomicU64,
+    device_ns: AtomicU64,
     compiles: AtomicU64,
     compile_ns: AtomicU64,
     fallbacks: AtomicU64,
@@ -250,6 +278,9 @@ impl OvMoe {
         let precision =
             std::env::var("CASCADIA_INKLING_OV_MOE_PRECISION").unwrap_or_else(|_| "f32".into());
         let mut plugin = PluginConfig::new().with("INFERENCE_PRECISION_HINT", precision);
+        if ov_perf() {
+            plugin = plugin.with("PERF_COUNT", "YES");
+        }
         match &offload {
             Some(r) => {
                 plugin = plugin.with("OFFLOAD_RATIO", r.clone());
@@ -284,6 +315,8 @@ impl OvMoe {
             calls: AtomicU64::new(0),
             rows: AtomicU64::new(0),
             call_ns: AtomicU64::new(0),
+            infer_ns: AtomicU64::new(0),
+            device_ns: AtomicU64::new(0),
             compiles: AtomicU64::new(0),
             compile_ns: AtomicU64::new(0),
             fallbacks: AtomicU64::new(0),
@@ -317,6 +350,8 @@ impl OvMoe {
             calls: self.calls.load(Ordering::Relaxed),
             rows: self.rows.load(Ordering::Relaxed),
             call_ns: self.call_ns.load(Ordering::Relaxed),
+            infer_ns: self.infer_ns.load(Ordering::Relaxed),
+            device_ns: self.device_ns.load(Ordering::Relaxed),
             compiles: self.compiles.load(Ordering::Relaxed),
             compile_ns: self.compile_ns.load(Ordering::Relaxed),
             fallbacks: self.fallbacks.load(Ordering::Relaxed),
@@ -536,7 +571,16 @@ impl OvMoe {
                     )
                     .map_err(|e| format!("set_input routing_weights: {e}"))
                 })
-                .and_then(|_| rt.infer().map_err(|e| format!("infer: {e}")));
+                .and_then(|_| {
+                    let t_infer = Instant::now();
+                    let r = rt.infer().map_err(|e| format!("infer: {e}"));
+                    if ov_perf() {
+                        self.infer_ns
+                            .fetch_add(t_infer.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        self.device_ns.fetch_add(device_ns(&rt), Ordering::Relaxed);
+                    }
+                    r
+                });
             if let Err(why) = step {
                 // Not latched (a device-side error can be transient), but said
                 // once per layer so a benchmark cannot silently fall back.

@@ -58,6 +58,12 @@ pub struct RunnerProfile {
     pub ov_moe_ns: u64,
     pub ov_moe_fallbacks: u64,
     pub ov_moe_nonfinite: u64,
+    /// `CASCADIA_INKLING_OV_PERF=1` only: of the offloaded time, the part
+    /// inside `infer()` and the part the device spent executing.
+    pub ov_attn_infer_ns: u64,
+    pub ov_attn_device_ns: u64,
+    pub ov_moe_infer_ns: u64,
+    pub ov_moe_device_ns: u64,
 }
 
 pub trait StagedRunner: Send + 'static {

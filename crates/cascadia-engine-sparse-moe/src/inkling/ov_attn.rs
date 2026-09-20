@@ -45,6 +45,9 @@ pub struct OvAttnStats {
     pub calls: u64,
     pub rows: u64,
     pub call_ns: u64,
+    /// With `CASCADIA_INKLING_OV_PERF=1` (see `ov_moe::ov_perf`).
+    pub infer_ns: u64,
+    pub device_ns: u64,
     pub compiles: u64,
     pub fallbacks: u64,
 }
@@ -65,6 +68,8 @@ pub struct OvAttn {
     calls: AtomicU64,
     rows: AtomicU64,
     call_ns: AtomicU64,
+    infer_ns: AtomicU64,
+    device_ns: AtomicU64,
     compiles: AtomicU64,
     fallbacks: AtomicU64,
 }
@@ -103,13 +108,21 @@ impl OvAttn {
         Self {
             dir,
             device,
-            plugin: PluginConfig::new().with("INFERENCE_PRECISION_HINT", "f16"),
+            plugin: if super::ov_moe::ov_perf() {
+                PluginConfig::new()
+                    .with("INFERENCE_PRECISION_HINT", "f16")
+                    .with("PERF_COUNT", "YES")
+            } else {
+                PluginConfig::new().with("INFERENCE_PRECISION_HINT", "f16")
+            },
             layers: Mutex::new(HashMap::new()),
             failed: Mutex::new(HashSet::new()),
             noted: Mutex::new(HashSet::new()),
             calls: AtomicU64::new(0),
             rows: AtomicU64::new(0),
             call_ns: AtomicU64::new(0),
+            infer_ns: AtomicU64::new(0),
+            device_ns: AtomicU64::new(0),
             compiles: AtomicU64::new(0),
             fallbacks: AtomicU64::new(0),
         }
@@ -124,6 +137,8 @@ impl OvAttn {
             calls: self.calls.load(Ordering::Relaxed),
             rows: self.rows.load(Ordering::Relaxed),
             call_ns: self.call_ns.load(Ordering::Relaxed),
+            infer_ns: self.infer_ns.load(Ordering::Relaxed),
+            device_ns: self.device_ns.load(Ordering::Relaxed),
             compiles: self.compiles.load(Ordering::Relaxed),
             fallbacks: self.fallbacks.load(Ordering::Relaxed),
         }
@@ -216,7 +231,17 @@ impl OvAttn {
             let step = r
                 .set_input("x", DType::F32, &[1, prow, hidden], f32_bytes(xs))
                 .map_err(|e| format!("qkvr set_input: {e}"))
-                .and_then(|_| r.infer().map_err(|e| format!("qkvr infer: {e}")));
+                .and_then(|_| {
+                    let t_infer = Instant::now();
+                    let res = r.infer().map_err(|e| format!("qkvr infer: {e}"));
+                    if super::ov_moe::ov_perf() {
+                        self.infer_ns
+                            .fetch_add(t_infer.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        self.device_ns
+                            .fetch_add(super::ov_moe::device_ns(&r), Ordering::Relaxed);
+                    }
+                    res
+                });
             if let Err(why) = step {
                 self.note(lid, &why);
                 self.fallbacks.fetch_add(1, Ordering::Relaxed);
@@ -290,7 +315,17 @@ impl OvAttn {
             let step = r
                 .set_input("ctx", DType::F32, &[1, prow, dim], f32_bytes(ctx))
                 .map_err(|e| format!("o set_input: {e}"))
-                .and_then(|_| r.infer().map_err(|e| format!("o infer: {e}")));
+                .and_then(|_| {
+                    let t_infer = Instant::now();
+                    let res = r.infer().map_err(|e| format!("o infer: {e}"));
+                    if super::ov_moe::ov_perf() {
+                        self.infer_ns
+                            .fetch_add(t_infer.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        self.device_ns
+                            .fetch_add(super::ov_moe::device_ns(&r), Ordering::Relaxed);
+                    }
+                    res
+                });
             if let Err(why) = step {
                 self.note(lid, &why);
                 self.fallbacks.fetch_add(1, Ordering::Relaxed);

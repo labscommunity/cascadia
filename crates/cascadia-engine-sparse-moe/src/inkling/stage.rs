@@ -352,6 +352,10 @@ impl StagedRunner for InklingRunner {
             ov_moe_ns: moe.map_or(0, |m| m.call_ns),
             ov_moe_fallbacks: moe.map_or(0, |m| m.fallbacks),
             ov_moe_nonfinite: moe.map_or(0, |m| m.nonfinite),
+            ov_attn_infer_ns: attn.map_or(0, |a| a.infer_ns),
+            ov_attn_device_ns: attn.map_or(0, |a| a.device_ns),
+            ov_moe_infer_ns: moe.map_or(0, |m| m.infer_ns),
+            ov_moe_device_ns: moe.map_or(0, |m| m.device_ns),
         })
     }
     fn stream_capacity(&self) -> usize {
