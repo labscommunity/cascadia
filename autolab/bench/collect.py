@@ -55,8 +55,16 @@ def main():
     ap.add_argument("out"); ap.add_argument("--prompts", type=int, default=192); ap.add_argument("--streams", type=int, default=48)
     ap.add_argument("--tokens", type=int, default=160); ap.add_argument("--seed", default="corpus-a")
     ap.add_argument("--cap", type=int, default=900)
+    ap.add_argument("--dolly", help="databricks-dolly-15k.jsonl: real instructions instead of the twelve families")
+    ap.add_argument("--skip", type=int, default=0, help="prompts of the shuffled instruction file to skip (resume)")
     a = ap.parse_args()
-    prompts = [prompt_for(a.seed, i) for i in range(a.prompts)]
+    if a.dolly:
+        rows = [json.loads(l) for l in open(a.dolly)]
+        rows = [r for r in rows if len(r["instruction"]) + len(r.get("context", "")) < 700]
+        rows.sort(key=lambda r: hashlib.sha256((a.seed + r["instruction"]).encode()).hexdigest())  # deterministic shuffle
+        prompts = [(r["instruction"] + ("\n\n" + r["context"] if r.get("context") else "")) for r in rows][a.skip:a.skip + a.prompts]
+    else:
+        prompts = [prompt_for(a.seed, i) for i in range(a.prompts)]
     done = 0; t0 = time.time()
     with open(a.out, "a") as f:
         for lo in range(0, len(prompts), a.streams):
