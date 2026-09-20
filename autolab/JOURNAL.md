@@ -48,3 +48,33 @@ Research notes behind (e) and (f):
   It also raised a doubt to settle on the fleet: the f32 hint may never have compiled the fused
   kernel, in which case "fused f32 = 1.66 tok/s" was the CPU path plus overhead. The stage
   profile now carries ov_moe_calls / ov_moe_fallbacks / ov_moe_nonfinite to tell.
+
+## 2026-09-20, iterations 002a/002b: the reply path and the first speculation on real hardware
+
+002a (direct reply link): 11 streams 8.9 -> 12.9 tok/s steady, 48 streams 14.7 -> 18.4. First
+per-rank view through /api/fleet/telemetry: at 48 streams rank 0 is 96 % busy, ranks 1-7 84-90 %,
+the three 60 W boxes 62-71 %. Fleet mean 82 % (exp 000: 30 %). The scheduling losses are gone;
+what is left is time per row on the slowest stage, which is rank 0 (46.7 ms/row at 3.9 rows per
+frame) because its two dense layers run row by row, then the 25 W boxes (40-43), then the 60 W
+boxes (30).
+
+002b (speculation): output character-identical; +5-30 % on free-form reasoning, 2.79 tok/s on a
+copy task where 47 of 96 tokens were right guesses. The time model
+`T (a + (1 - a) D)` predicted 2.8 for that acceptance. So the mechanism delivers exactly what the
+draft's acceptance allows, and everything about the single-stream target is now a question about
+drafts: a = 0.5 -> 2.9 tok/s, 0.7 -> 4.6, 0.9 -> 8.6 at T = 58 ms (the 25 W limit lives in T:
+at the 60 W boxes' 41 ms the same acceptances give 4.1 / 6.5 / 12).
+
+Reasoning for 004: with the pipeline full, per-row cost is the only lever. Rows must stop
+re-reading what they share: the shared experts (2 of every row's 8), the dense layers (all of
+rank 0's rows), and routed experts once frames carry enough rows to collide (8.7 rows/frame at
+96 streams: 70 routed pairs on ~50 distinct experts). The multi-row int4 kernel is bit-identical
+per row, so the gate stays character-exact; it now also runs 8 requests side by side, because a
+lone request never enters a multi-row kernel. Batched admission attacks the burst TTFT (91 s mean
+at 48): ten 24-token prompts touch ~250 experts together, not 10 x 135. Pre-warm makes every
+experiment start from the same state (002a's single-stream number was taken with the expert
+cache at 60-90 % and misses up to 1.4 %).
+
+Measurement hygiene learned: compare steady decode (sum of per-stream rates) across experiments,
+not aggregate (it includes the admission ramp, a third of a 64-token phase at 48 streams); warm
+with many streams after every restart, or pre-warm.
