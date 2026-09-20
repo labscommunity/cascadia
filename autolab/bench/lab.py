@@ -245,6 +245,40 @@ def gate_multi(n=8):
     return ok, res
 
 
+QUALITY = [("What is the capital of France? Answer in one word.", ["paris"]),
+           ("What is 6 times 7? Answer with the number only.", ["42"]),
+           ("What is 17 multiplied by 23? Answer with the number only.", ["391"]),
+           ("List the first five prime numbers, separated by commas.", ["2", "3", "5", "7", "11"]),
+           ("Which planet is known as the Red Planet? One word.", ["mars"]),
+           ("What is the chemical symbol for gold? Answer with the symbol only.", ["au"]),
+           ("Who wrote the play Romeo and Juliet? Give the name only.", ["shakespeare"]),
+           ("What is the largest ocean on Earth? One word.", ["pacific"]),
+           ("How many days are there in a leap year? Number only.", ["366"]),
+           ("What is the square root of 144? Number only.", ["12"]),
+           ("Translate 'good morning' into Spanish. Two words only.", ["buenos"]),
+           ("What gas do plants absorb from the air for photosynthesis? Give its chemical formula.", ["co2", "co₂"])]
+
+
+def cmd_quality(a):
+    """Answers, not prefixes: 12 questions with known answers decoded side by side to the end of the answer.
+    A change that keeps the first tokens but damages the model (half-precision paths) shows here."""
+    d = os.path.join(LAB, "experiments", a.exp); os.makedirs(d, exist_ok=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(QUALITY)) as ex:
+        outs = list(ex.map(lambda q: chat(0, a.tokens, timeout=a.cap, prompt=q[0]), QUALITY))
+    res, good = [], 0
+    for (q, want), r in zip(QUALITY, outs):
+        text = r.get("text", ""); answer = text.split("</think>")[-1] if "</think>" in text else ""
+        hit = bool(answer) and (all(w in answer.lower() for w in want) if len(want) > 2 else any(w in answer.lower() for w in want))
+        words = text.split(); rep = len(words) > 30 and len(set(words)) < len(words) * 0.2
+        good += hit
+        res.append(dict(q=q, want=want, ok=hit, finished="</think>" in text, degenerate=rep, tokens=r.get("tokens"), answer=answer.strip()[:160],
+                        error=r.get("error")))
+        log("%s  %-62s -> %r%s" % ("ok " if hit else "BAD", q[:62], answer.strip()[:60], "  (no answer within the token budget)" if "</think>" not in text else ""))
+    json.dump(dict(correct=good, of=len(QUALITY), items=res), open(os.path.join(d, "quality.json"), "w"), indent=1)
+    log("QUALITY %d/%d correct" % (good, len(QUALITY)))
+    return 0 if good >= len(QUALITY) - 1 else 1
+
+
 def cmd_gate(a):
     ok, res = gate()
     for x in res:
@@ -403,6 +437,8 @@ def main():
             s.add_argument("--warm", type=int, default=2); s.add_argument("--force", action="store_true")
             s.add_argument("--warm-streams", type=int, default=16)
         s.set_defaults(fn=fn)
+    s = sub.add_parser("quality"); s.add_argument("exp"); s.add_argument("--tokens", type=int, default=320)
+    s.add_argument("--cap", type=int, default=900); s.set_defaults(fn=cmd_quality)
     s = sub.add_parser("reference"); s.set_defaults(fn=cmd_reference)
     s = sub.add_parser("gate"); s.set_defaults(fn=cmd_gate)
     s = sub.add_parser("bench"); s.add_argument("exp"); s.add_argument("--phases", nargs="+", required=True)
