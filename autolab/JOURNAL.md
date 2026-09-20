@@ -140,3 +140,25 @@ power limit stopped mattering the moment the experts left the CPU.
 What limits now: rank 0 (its two dense layers still on the CPU: 60 ms of a 230 ms frame, 96.8 %
 busy), swap-ins of driver-owned pages at swappiness 60, and a client-side descriptor limit that made
 every phase above ~250 streams meaningless (the Mac's tunnel agent has 256 descriptors).
+
+## 2026-09-20, iterations 009-011: the last stage imbalances
+
+009: rank 0's dense layers onto the iGPU (229 -> 187 ms per frame): 57.9 tok/s steady at 176
+streams. More streams stopped helping (352: 54.9): on the device a row costs about 10 ms per rank
+whatever the batch, so extra streams only add KV memory, and at 352 streams five ranks swap.
+010: 30k tokens of varied traffic into the cross-request drafter: unseen prompts stay at ~3.3
+tok/s (a ~ 0.3). Word n-grams saturate; past that a draft has to understand the text.
+011: with the experts on the iGPU the CPUs idle, and the per-row part of attention (convs, head
+norms, softmax over the row's own cache) still ran row after row: 20-30 ms of a 190 ms frame.
+Rows are independent sequences, so they now run concurrently, bit-identical per row:
+**64.2 tok/s steady at 176 streams.**
+
+Where the two targets stand, and why:
+- aggregate > 60 tok/s: met in steady decode (64.2 at 176 streams, 60.9 at 264); from 9.7 this
+  morning. Aggregate over a whole short phase is lower (37-38) because a third of a 32-token phase
+  is admitting 176 prompts.
+- single stream > 10 tok/s: met only on prompts the drafter has seen (12 tok/s, exact output);
+  3.3 tok/s on unseen prompts, from 1.6. A stage is ~40 ms now (24 ms of expert reads at the memory
+  bus limit + 13 ms of int8 attention projections, also bus-bound), eleven stages in series are
+  440 ms, and only right guesses shorten that: `T (a + (1 - a) D)`. a = 0.3 today. 10 tok/s needs
+  a ~ 0.85: a trained draft head on the last rank's hidden states (EAGLE-style), not an n-gram table.
