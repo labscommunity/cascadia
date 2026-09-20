@@ -18,6 +18,9 @@ install and keep it the same for every box.
 
 1. Plug the SSD in. Decide the box's rank (0–10): rank 0 is the box clients
    talk to, and rank r sends to rank r+1, so give each box a different rank.
+   If the boxes already have their addresses and `fleet.env` lists them (see
+   "Addresses"), use `auto` instead of a number and the installer takes the
+   rank from the box's address.
 2. **Ubuntu** (24.04 or newer; the installer checks that the binary starts
    before it does anything slow):
    ```
@@ -66,8 +69,17 @@ The installer later finds the address already there and keeps it.
 
 ## Addresses
 
-`fleet.env` assigns `192.168.50.10 + rank` to each box's wired port (the one
-with link). Where that port holds a DHCP lease the address is added next to
+**The boxes already have fixed addresses:** put them in `fleet.env` as
+`IP_0` … `IP_10`, in rank order, before the first install (`apply-update.sh`
+takes them as arguments). The installer then leaves the network alone, and
+`install.sh auto` takes the rank from the address. If `fleet.env` does not
+match, the installer stops at once and says so rather than rewrite a port
+that someone configured: on Ubuntu Desktop an address set in Settings lives in
+its own NetworkManager profile, only one profile runs per port, and the
+installer's could take its place.
+
+**The boxes have no fixed addresses yet:** `fleet.env` assigns
+`192.168.50.10 + rank` to each box's wired port (the one with link). Where that port holds a DHCP lease the address is added next to
 DHCP; on a switch with no DHCP server an Ubuntu box's port becomes static
 only, because a "DHCP + static" profile does not stay up there (to undo:
 remove `/etc/netplan/60-cascadia-inkling.yaml`, then `sudo netplan apply`).

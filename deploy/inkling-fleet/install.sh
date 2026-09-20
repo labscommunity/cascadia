@@ -1,9 +1,11 @@
 #!/bin/bash
 # Inkling rank installer for Ubuntu boxes — everything comes from this SSD.
 #
-#   sudo ./install.sh <rank>               # rank 0..TOTAL-1 (TOTAL from fleet.env, default 12)
+#   sudo ./install.sh <rank>               # rank 0..TOTAL-1 (TOTAL from fleet.env)
+#   sudo ./install.sh auto                 # the rank whose fleet.env address (IP_<rank>) this box already has
 #   sudo ./install.sh <rank> --cpu-only    # skip the iGPU (no driver / no fused IRs)
-#   sudo ./install.sh <rank> --no-net      # do not set the static IP from fleet.env
+#   sudo ./install.sh <rank> --no-net      # never touch the network configuration
+#   sudo ./install.sh <rank> --add-address # add the fleet.env address even though the port already has a fixed one
 #   sudo ./install.sh <rank> --prefix DIR  # install elsewhere than /opt/cascadia-inkling
 #
 # What it does, in order, all idempotent: copies the binary + OpenVINO runtime,
@@ -16,14 +18,20 @@
 # service runs as its own unit.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RANK="${1:?usage: install.sh <rank> [--cpu-only] [--no-net] [--prefix DIR] [--model-source DIR]}"; shift
-PREFIX=/opt/cascadia-inkling; CPU_ONLY=0; NO_NET=0; MODEL_SRC="$HERE/../inkling/out"
+RANK="${1:?usage: install.sh <rank>|auto [--cpu-only] [--no-net] [--add-address] [--prefix DIR] [--model-source DIR]}"; shift
+PREFIX=/opt/cascadia-inkling; CPU_ONLY=0; NO_NET=0; ADD_ADDRESS=0; MODEL_SRC="$HERE/../inkling/out"
 while [ $# -gt 0 ]; do case "$1" in
-  --cpu-only) CPU_ONLY=1;; --no-net) NO_NET=1;; --prefix) PREFIX="$2"; shift;; --model-source) MODEL_SRC="$2"; shift;;
+  --cpu-only) CPU_ONLY=1;; --no-net) NO_NET=1;; --add-address) ADD_ADDRESS=1;; --prefix) PREFIX="$2"; shift;; --model-source) MODEL_SRC="$2"; shift;;
   *) echo "unknown option $1"; exit 2;; esac; shift; done
 # shellcheck source=fleet.env
 source "$HERE/fleet.env"
 TOTAL="${TOTAL:-12}"
+if [ "$RANK" = auto ]; then
+  RANK=""
+  for r in $(seq 0 $((TOTAL-1))); do v="IP_$r"; a="${!v:-}"; if [ -n "$a" ] && ip -4 -o addr show | grep -q " $a/"; then RANK=$r; break; fi; done
+  [ -n "$RANK" ] || { echo "auto: none of this box's addresses ($(ip -4 -o addr show scope global | awk '{print $4}' | tr '\n' ' ')) is listed in $HERE/fleet.env as IP_0..IP_$((TOTAL-1))"; exit 2; }
+  echo "auto: this box holds IP_$RANK, so it is rank $RANK"
+fi
 [ "$RANK" -ge 0 ] && [ "$RANK" -lt "$TOTAL" ] || { echo "rank must be 0..$((TOTAL-1))"; exit 2; }
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 2; }
 log() { echo "[install $(date +%T)] $*"; }
@@ -41,6 +49,27 @@ PYV=$($PY -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || ech
 NICS=$(ip -o link show | awk -F': ' '{n=$2; sub(/@.*/,"",n)} n !~ /^(lo|docker|veth|br-|virbr|tailscale|wl|ww|tun|wg)/ {print n, ($0 ~ /LOWER_UP/ ? "up" : "down")}')
 NIC=$(echo "$NICS" | awk '$2=="up"{print $1; exit}'); [ -n "$NIC" ] || NIC=$(echo "$NICS" | awk 'NR==1{print $1}')
 log "rank $RANK of $TOTAL on Ubuntu $VERSION_ID, ${RAM_GB} GB RAM, python $PYV, nic ${NIC:-?}, prefix $PREFIX"
+
+# Addresses. The neighbouring ranks dial this box at fleet.env's IP_$RANK. If the box already holds that address
+# the network is left alone. If its wired port has some other fixed address, stop now rather than rewrite it:
+# netplan would add ours next to an address configured in netplan, but an address set in Settings/nmcli lives in
+# its own NetworkManager profile, only one profile runs per port, and ours could take its place.
+v="IP_$RANK"; MYIP="${!v:-}"
+HAVE_MYIP=0; if [ -n "$MYIP" ] && ip -4 -o addr show | grep -q " $MYIP/"; then HAVE_MYIP=1; fi
+if [ "$NO_NET" = 0 ] && [ "$ADD_ADDRESS" = 0 ] && [ "$HAVE_MYIP" = 0 ] && [ -n "$MYIP" ] && [ -n "$NIC" ]; then
+  FIXED_NOW=$(ip -4 -o addr show dev "$NIC" scope global | grep -v dynamic | awk '{print $4}' | tr '\n' ' ' || true)
+  if [ -n "$FIXED_NOW" ]; then
+    echo
+    echo "This box's wired port ($NIC) already has a fixed address: $FIXED_NOW"
+    echo "but fleet.env says rank $RANK is $MYIP, and that is the address the neighbouring rank will dial."
+    echo "  * The boxes already have their addresses: put them in $HERE/fleet.env (IP_0..IP_$((TOTAL-1)), in rank"
+    echo "    order) and run this again. The installer then leaves the network alone, and 'install.sh auto' takes"
+    echo "    the rank from the address."
+    echo "  * To add $MYIP to $NIC anyway: run this again with --add-address. On Ubuntu Desktop that can replace an"
+    echo "    address that was set in Settings, because NetworkManager runs one profile per port."
+    exit 2
+  fi
+fi
 
 # ---------- 0. stop a rank that is already running here (re-install) ----------
 systemctl stop cascadia-inkling.service 2>/dev/null || true
@@ -159,9 +188,11 @@ if [ "$GPU_OK" = 1 ]; then
 fi
 
 # ---------- 6. rank environment ----------
-IP_NEXT=""; MYIP=""
-if [ "$RANK" -lt $((TOTAL-1)) ]; then v="IP_$((RANK+1))"; IP_NEXT="${!v}"; fi
-v="IP_$RANK"; MYIP="${!v}"
+IP_NEXT=""
+if [ "$RANK" -lt $((TOTAL-1)) ]; then
+  v="IP_$((RANK+1))"; IP_NEXT="${!v:-}"
+  [ -n "$IP_NEXT" ] || { log "ERROR: fleet.env has no IP_$((RANK+1)): rank $RANK would not know where to send"; exit 1; }
+fi
 {
   echo "# generated by install.sh for rank $RANK of $TOTAL — layers [$LO,$HI)"
   echo "RANK=$RANK"; echo "TOTAL=$TOTAL"; echo "LAYER_START=$LO"; echo "LAYER_END=$HI"; echo "NEXT=${IP_NEXT:+$IP_NEXT:$((RELAY_PORT+RANK+1))}"
@@ -206,7 +237,11 @@ install -m 0755 "$HERE/fleet/status.sh" "$PREFIX/status.sh"
 log "rank.env written: layers [$LO,$HI), iGPU=$GPU_OK, fused=[${FUSED:-none}], next=${IP_NEXT:-none}"
 
 # ---------- 7. static IP on the wired NIC ----------
-if [ "$NO_NET" = 0 ] && [ -n "$MYIP" ] && [ -n "$NIC" ]; then
+if [ "$HAVE_MYIP" = 1 ]; then
+  log "this box already has $MYIP: network configuration left alone"
+elif [ "$NO_NET" = 1 ]; then
+  if [ -n "$MYIP" ] && [ "$RANK" -gt 0 ]; then log "WARNING: --no-net and $MYIP (rank $RANK in fleet.env) is not on this box: rank $((RANK-1)) cannot reach it until it is"; fi
+elif [ -n "$MYIP" ] && [ -n "$NIC" ]; then
   # With a DHCP lease on the port right now, keep DHCP and add the fleet address. Without one (an offline
   # switch, no DHCP server) "DHCP + static" is not safe: NetworkManager fails the whole connection when
   # DHCP times out and takes the static address down with it, so the port becomes static only.
@@ -254,4 +289,8 @@ systemctl enable cascadia-inkling.service > /dev/null 2>&1
 systemctl restart cascadia-inkling.service
 sleep 3
 systemctl --no-pager --lines=0 status cascadia-inkling.service 2>/dev/null | head -3 || true
+if [ -n "$IP_NEXT" ] && command -v ping > /dev/null 2>&1; then
+  if ping -c1 -W1 "$IP_NEXT" > /dev/null 2>&1; then log "next rank's box ($IP_NEXT) answers"
+  else log "note: next rank's box ($IP_NEXT) does not answer ping (fine if it is not plugged in or set up yet)"; fi
+fi
 log "installed. Follow with: $PREFIX/status.sh   (logs: journalctl -u cascadia-inkling -f)"

@@ -1,11 +1,13 @@
 #!/bin/bash
 # Apply this update to the Inkling deployment SSD. Run on a Linux box with the SSD mounted (it is ext4):
-#     ./apply-update.sh /media/$USER/<ssd> [number of boxes, default 11]
+#     ./apply-update.sh /media/$USER/<ssd> [number of boxes, default 11] [address of rank 0] [of rank 1] ...
+# Give the addresses when the boxes already have theirs (one per box, in rank order: rank 0 is the box clients
+# talk to, rank r sends to rank r+1). Without them fleet.env keeps the addresses it has.
 # <ssd> is the folder that holds inkling-deploy/ and inkling/. Adds and replaces files under inkling-deploy/,
 # and sets the fleet size in fleet.env (your address edits are kept; the old file is saved next to it).
 # The model export and everything else on the SSD are left alone.
 set -euo pipefail
-SSD="${1:?usage: $0 /path/to/ssd [number of boxes]}"; TOTAL="${2:-11}"
+SSD="${1:?usage: $0 /path/to/ssd [number of boxes] [addresses in rank order]}"; TOTAL="${2:-11}"; shift; [ $# -gt 0 ] && shift; IPS=("$@")
 HERE="$(cd "$(dirname "$0")" && pwd)"; D="$SSD/inkling-deploy"
 [ -f "$D/install.sh" ] || { echo "no inkling-deploy/install.sh under $SSD - is this the SSD's top folder?"; exit 1; }
 [ -f "$SSD/inkling/out/manifest.json" ] || { echo "no inkling/out/manifest.json under $SSD - is this the SSD's top folder?"; exit 1; }
@@ -13,6 +15,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"; D="$SSD/inkling-deploy"
 case "$TOTAL" in ''|*[!0-9]*) echo "number of boxes must be a number"; exit 1;; esac
 LAYERS=$(python3 -c "import json;print(json.load(open('$SSD/inkling/out/manifest.json'))['num_layers'])")
 [ "$TOTAL" -ge 1 ] && [ "$TOTAL" -le "$LAYERS" ] || { echo "number of boxes must be 1..$LAYERS"; exit 1; }
+if [ ${#IPS[@]} -gt 0 ]; then
+  [ ${#IPS[@]} -eq "$TOTAL" ] || { echo "got ${#IPS[@]} addresses for $TOTAL boxes: give exactly one per box, in rank order"; exit 1; }
+  for a in "${IPS[@]}"; do [[ "$a" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "not an IPv4 address: $a"; exit 1; }; done
+  [ "$(printf '%s\n' "${IPS[@]}" | sort -u | wc -l)" -eq "$TOTAL" ] || { echo "the same address appears twice"; exit 1; }
+fi
 
 # 1. files
 cd "$HERE/inkling-deploy"
@@ -36,7 +43,9 @@ note=("# Fused MoE layers the iGPU takes per box, at most (each is 8.3 GB of uni
 s2=re.sub(r"(?:^#[^\n]*\n)+(?=FUSED_LAYERS_LINUX=)", note, s, count=1, flags=re.M) if re.search(r"^# Fused MoE layers", s, flags=re.M) else s
 open(p,'w').write(s2)
 PY
+for n in $(seq 0 $((TOTAL-1))); do grep -q "^IP_${n}=" "$F" || sed -i "/^RELAY_PORT=/a IP_${n}=192.168.50.$((10+n))" "$F"; done
 for n in $(seq 0 $((TOTAL-1))); do grep -q "^IP_${n}=" "$F" || echo "IP_${n}=192.168.50.$((10+n))" >> "$F"; done
+if [ ${#IPS[@]} -gt 0 ]; then for n in $(seq 0 $((TOTAL-1))); do sed -i "s/^IP_${n}=.*/IP_${n}=${IPS[$n]}/" "$F"; done; fi
 sync
 
 # 3. verify
@@ -48,4 +57,5 @@ echo "update applied and verified: $(find . -type f | wc -l | tr -d ' ') files"
 LO_L=$((LAYERS / TOTAL)); HI_L=$(( (LAYERS + TOTAL - 1) / TOTAL ))
 echo "fleet: $TOTAL boxes, $( [ $LO_L = $HI_L ] && echo $LO_L || echo "$LO_L or $HI_L" ) of $LAYERS layers each; ranks 0..$((TOTAL-1))"
 grep -E '^(TOTAL|IP_|FUSED_LAYERS_LINUX)' "$F" | tr '\n' ' '; echo
-echo "install each box with:  sudo $D/install.sh <rank>"
+if [ ${#IPS[@]} -gt 0 ]; then echo "install each box with:  sudo <ssd>/inkling-deploy/install.sh auto     (takes the rank from the box's address; the network is left alone)"
+else echo "install each box with:  sudo <ssd>/inkling-deploy/install.sh <rank>"; echo "(boxes that already have fixed addresses: run this script again with the addresses, see the top of this file)"; fi
