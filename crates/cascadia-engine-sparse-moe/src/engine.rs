@@ -47,6 +47,7 @@ use crate::dist::{
     send_capture_ack_upstream, send_restore, send_restore_ack_upstream, send_restore_carry,
     CAPTURE_ACK_TIMEOUT,
 };
+use crate::dist::{recv_stream_rewind_body_server, send_stream_rewind};
 use crate::kv_prefix_cache::KvPrefixCache;
 use crate::manifest::Manifest;
 use crate::ov_moe::OvMoeRunner;
@@ -3519,7 +3520,8 @@ impl SparseMoEEngine {
             | FrameKind::StreamDecode
             | FrameKind::StreamClose
             | FrameKind::StreamTokens
-            | FrameKind::StreamFeed => Err(format!(
+            | FrameKind::StreamFeed
+            | FrameKind::StreamRewind => Err(format!(
                 "sparse-moe stage received multi-stream frame {kind:?} (only the staged pipeline engine serves streams)"
             )),
             #[cfg(feature = "kv_coord")]
@@ -5374,6 +5376,13 @@ pub struct PipelineEngine<R: StagedRunner> {
     stream_log: (u64, Duration, u64),
     /// Per-window time account of this rank (`CASCADIA_STAGE_PROFILE_SECS`).
     stage_profile: Option<StageProfile>,
+    /// Rank 0: speculated frames allowed in flight behind a lone stream's real
+    /// one (`CASCADIA_STREAMS_SPEC=1`, depth `CASCADIA_STREAMS_SPEC_DEPTH`,
+    /// default ranks - 1). `None` = off.
+    stream_spec_depth: Option<usize>,
+    /// Speculation counters since start: frames guessed, guesses confirmed,
+    /// guesses refuted (each costs a rewind).
+    spec_stats: (u64, u64, u64),
 }
 
 /// One task inside the multi-stream single-stage scheduler: its slot in the
@@ -5455,6 +5464,9 @@ struct StageProfile {
     open_rows: u64,
     relays: u64,
     replies: u64,
+    spec_sent: u64,
+    spec_hits: u64,
+    spec_misses: u64,
     runner: crate::staged::RunnerProfile,
 }
 
@@ -5489,6 +5501,9 @@ impl StageProfile {
             open_rows: 0,
             relays: 0,
             replies: 0,
+            spec_sent: 0,
+            spec_hits: 0,
+            spec_misses: 0,
             runner: crate::staged::RunnerProfile::default(),
         }
     }
@@ -5578,6 +5593,9 @@ impl StageProfile {
             replies = self.replies,
             round_trip_ms = ms(self.round_trip),
             max_round_trip_ms = ms(self.max_round_trip),
+            spec_sent = self.spec_sent,
+            spec_hits = self.spec_hits,
+            spec_misses = self.spec_misses,
             attn_ms = ns_ms(now.decode_attn_ns, was.decode_attn_ns),
             mlp_ms = ns_ms(now.decode_mlp_ns, was.decode_mlp_ns),
             prefill_attn_ms = ns_ms(now.prefill_attn_ns, was.prefill_attn_ns),
@@ -5634,6 +5652,27 @@ struct StreamActive {
     emitted: usize,
     /// Pipeline, long prompts: the prompt tokens not sent yet (`Feeding`).
     feed: VecDeque<u32>,
+    /// Pipelined speculation: this stream's frames in flight, in position
+    /// order (see `PipelineEngine::step_stream_spec`).
+    spec: VecDeque<SpecSent>,
+    /// N-gram drafter over prompt + generated + speculated tokens.
+    draft: Option<crate::ngram_draft::Draft>,
+    /// `next` has been emitted already (speculation hands the stream back
+    /// with its last token emitted but not forwarded).
+    next_emitted: bool,
+}
+
+/// One decode frame of a speculating stream: `input` rode at position `pos`.
+/// `valid` turns false when an earlier guess proved wrong; its reply is then
+/// read and dropped.
+struct SpecSent {
+    batch_id: u32,
+    pos: usize,
+    input: i64,
+    /// The input was a draft (in the drafter's history, not in `generated`).
+    guess: bool,
+    valid: bool,
+    sent_at: Instant,
 }
 
 /// Rank-0 per-token streaming state: everything the decode loop threaded as
@@ -5714,6 +5753,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
             stream_admit_per_step: 1,
             stream_log: (0, Duration::ZERO, 0),
             stage_profile: None,
+            stream_spec_depth: None,
+            spec_stats: (0, 0, 0),
         }
     }
 
@@ -5744,6 +5785,17 @@ impl<R: StagedRunner> PipelineEngine<R> {
             .min(self.stream_cap)
             .max(1);
         self.stream_inflight = (0..self.stream_groups).map(|_| VecDeque::new()).collect();
+        self.stream_spec_depth = (self.rank == 0
+            && self.total > 1
+            && std::env::var("CASCADIA_STREAMS_SPEC").is_ok_and(|v| v.trim() == "1"))
+        .then(|| {
+            std::env::var("CASCADIA_STREAMS_SPEC_DEPTH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&v| v >= 1)
+                .unwrap_or(self.total.max(2) as usize - 1)
+                .min(crate::inkling::DEFAULT_REWIND - 1)
+        });
         self.stage_profile = StageProfile::from_env();
         if self.stage_profile.is_some() {
             self.runner.enable_profile();
@@ -5847,6 +5899,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // closes a task that sees three chunk-less steps). Between rounds
         // every group's frame is in flight at once, which is the overlap.
         let mut out: Vec<(TaskId, Chunk)> = Vec::new();
+        if self.spec_applies() {
+            self.step_stream_spec(&mut out);
+            self.flush_stage_profile();
+            return out;
+        }
         let groups = self.stream_groups.max(1);
         for g in 0..groups {
             self.stream_step += 1;
@@ -5975,8 +6032,16 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 finished.push(i);
                 continue;
             }
+            if st.next_emitted {
+                // Speculation emitted this token; it only needs forwarding.
+                st.next_emitted = false;
+                continue;
+            }
             let t = st.next as u32;
             st.generated.push(t);
+            if let Some(d) = st.draft.as_mut() {
+                d.append(st.next);
+            }
             let full = tok.decode(&st.generated, true).unwrap_or_default();
             let delta = utf8_safe_delta(&full, &mut st.emitted);
             let mut c = Chunk::token(st.id.clone(), st.next, delta);
@@ -6185,6 +6250,12 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let prompt_len = prompt_ids.len();
         // A prompt longer than one window goes down as `StreamFeed` windows:
         // the first here, the rest one per group turn (`feed_stream_window`).
+        let draft = self.stream_spec_depth.map(|_| {
+            let mut d = crate::ngram_draft::Draft::new().with_draft_k(1);
+            let ids: Vec<i64> = prompt_ids.iter().map(|&t| t as i64).collect();
+            d.warm_with_prompt(&ids);
+            d
+        });
         let window = stream_prefill_window_rows();
         let windowed = prompt_len > window;
         let mut feed: VecDeque<u32> = VecDeque::new();
@@ -6285,8 +6356,336 @@ impl<R: StagedRunner> PipelineEngine<R> {
             generated: Vec::new(),
             emitted: 0,
             feed,
+            spec: VecDeque::new(),
+            draft,
+            next_emitted: false,
         });
         Ok(rows)
+    }
+
+    /// `(guesses sent, confirmed, refuted)` by the speculation path since start.
+    pub fn speculation_stats(&self) -> (u64, u64, u64) {
+        self.spec_stats
+    }
+
+    /// Whether this step belongs to the lone-stream speculation path
+    /// (`CASCADIA_STREAMS_SPEC=1`). A pipeline serving one stream keeps one
+    /// rank busy and ten waiting: the stream's next token cannot start before
+    /// its last one comes back. With a guess for that next token, its frame
+    /// enters right behind the real one, and the guess after it behind that,
+    /// so up to `total` positions of the one stream are in flight on as many
+    /// ranks. The reply to position p names the true token at p + 1: if the
+    /// frame in flight for p + 1 carried exactly that token, its reply is one
+    /// stage time away instead of a whole round trip; if not, that frame and
+    /// its successors are dropped, every rank rolls the slot back
+    /// (`StreamRewind`, which travels behind them) and the true token goes
+    /// out, as it would have without the guess. Tokens are those of plain
+    /// greedy or sampled decoding: a guess never chooses a token, it only
+    /// decides whether work started early is kept.
+    fn spec_applies(&self) -> bool {
+        if self.stream_spec_depth.is_none() || self.streams.len() != 1 {
+            return false;
+        }
+        let st = &self.streams[0];
+        if st.draft.is_none() || st.state == StreamState::Feeding {
+            return false;
+        }
+        if !st.spec.is_empty() {
+            return true; // our frames are in flight: their replies are read here
+        }
+        let queued: usize = self.stream_inflight.iter().map(VecDeque::len).sum();
+        self.pending.is_empty() && !st.cancelled && queued <= 1
+    }
+
+    /// One step of the speculation path: at most one verified token out, then
+    /// the pipeline topped up with guesses. See [`Self::spec_applies`].
+    fn step_stream_spec(&mut self, out: &mut Vec<(TaskId, Chunk)>) {
+        let Some(down) = self.transport.downstream.clone() else {
+            self.fail_streams_into(out, "rank 0 missing downstream".into());
+            return;
+        };
+        let depth = self.stream_spec_depth.unwrap_or(1);
+        let groups = self.stream_groups.max(1) as u32;
+        let slot = self.streams[0].slot;
+        // ---- 0. a frame the group path left in flight: its reply is ours ----
+        if self.streams[0].spec.is_empty() {
+            let g = (0..self.stream_inflight.len()).find(|&g| !self.stream_inflight[g].is_empty());
+            if let Some(f) = g.and_then(|g| self.stream_inflight[g].pop_front()) {
+                let deadline = if f.open {
+                    Self::reply_deadline_prefill()
+                } else {
+                    Self::reply_deadline() * groups
+                };
+                let wait_started = Instant::now();
+                let (bid, toks) = match self.block_on(recv_stream_tokens_reply(&down, deadline)) {
+                    Ok(r) => r,
+                    Err(e) => return self.fail_streams_into(out, e),
+                };
+                if let Some(p) = self.stage_profile.as_mut() {
+                    p.wait += wait_started.elapsed();
+                    p.replied(f.sent_at.elapsed());
+                }
+                if bid != f.batch_id || toks.len() != 1 || toks[0].0 as usize != slot {
+                    let msg = format!("stream reply mismatch: batch {bid} vs {}", f.batch_id);
+                    return self.fail_streams_into(out, msg);
+                }
+                let st = &mut self.streams[0];
+                st.next = toks[0].1;
+                if !f.open {
+                    st.pos += 1;
+                }
+                st.state = StreamState::Ready;
+                st.next_emitted = false;
+            }
+        }
+        // ---- 1. the next verified token, if frames of ours are in flight ----
+        while let Some(front) = self.streams[0].spec.front().map(|r| r.batch_id) {
+            let wait_started = Instant::now();
+            let deadline = Self::reply_deadline() * groups;
+            let (bid, toks) = match self.block_on(recv_stream_tokens_reply(&down, deadline)) {
+                Ok(r) => r,
+                Err(e) => return self.fail_streams_into(out, e),
+            };
+            if bid != front || toks.len() != 1 || toks[0].0 as usize != slot {
+                let msg = format!("stream reply mismatch: batch {bid} vs {front} (speculation)");
+                return self.fail_streams_into(out, msg);
+            }
+            let rec = self.streams[0].spec.pop_front().expect("front exists");
+            if let Some(p) = self.stage_profile.as_mut() {
+                p.wait += wait_started.elapsed();
+                p.replied(rec.sent_at.elapsed());
+            }
+            if !rec.valid {
+                continue; // a dropped guess: its reply means nothing
+            }
+            let t = toks[0].1;
+            let st = &mut self.streams[0];
+            st.pos = rec.pos + 1;
+            st.next = t;
+            st.next_emitted = false;
+            match st.spec.front().map(|n| n.input == t) {
+                Some(true) => {
+                    self.spec_stats.1 += 1;
+                    if let Some(p) = self.stage_profile.as_mut() {
+                        p.spec_hits += 1;
+                    }
+                }
+                Some(false) => {
+                    // Wrong guess: drop it and everything sent after it, and
+                    // roll the slot back to the last true position everywhere.
+                    let mut dropped = 0usize;
+                    for r in st.spec.iter_mut().filter(|r| r.valid) {
+                        r.valid = false;
+                        dropped += usize::from(r.guess);
+                    }
+                    if let Some(d) = st.draft.as_mut() {
+                        d.rewind(dropped);
+                    }
+                    let len = st.pos;
+                    self.spec_stats.2 += 1;
+                    if let Some(p) = self.stage_profile.as_mut() {
+                        p.spec_misses += 1;
+                    }
+                    if !self.runner.truncate_stream(slot, len) {
+                        return self.fail_streams_into(out, "speculation: rewind refused".into());
+                    }
+                    if let Err(e) =
+                        self.block_on(send_stream_rewind(&down, slot as u32, len as u32))
+                    {
+                        return self.fail_streams_into(out, format!("send_stream_rewind: {e}"));
+                    }
+                }
+                None => {}
+            }
+            break;
+        }
+        // ---- 2. emit it ----
+        if !self.streams[0].next_emitted {
+            let emit_started = Instant::now();
+            // A right guess in flight already put this token in the drafter.
+            let in_draft = self.streams[0]
+                .spec
+                .iter()
+                .find(|r| r.valid)
+                .is_some_and(|r| r.guess && r.input == self.streams[0].next);
+            let finished = self.spec_emit(out, in_draft);
+            if let Some(p) = self.stage_profile.as_mut() {
+                p.emit += emit_started.elapsed();
+            }
+            if finished {
+                return self.spec_finish(&down);
+            }
+        }
+        // ---- 3. keep the pipeline full ----
+        let drain_only = !self.pending.is_empty() || self.streams[0].cancelled;
+        if drain_only {
+            if self.streams[0].spec.is_empty() {
+                self.streams[0].state = StreamState::Ready; // the group path forwards `next`
+            }
+            return;
+        }
+        let max_seq = self.runner.max_seq();
+        loop {
+            let st = &self.streams[0];
+            let valid = st.spec.iter().filter(|r| r.valid).count();
+            let (pos, input, guess) = match st.spec.iter().rev().find(|r| r.valid) {
+                None => (st.pos, st.next, false),
+                Some(last) => {
+                    // Guesses beyond what the request may still produce are wasted.
+                    let ahead = st.generated.len() + valid;
+                    if valid > depth || ahead >= st.max_new || last.pos + 1 >= max_seq {
+                        break;
+                    }
+                    let Some(d) = st.draft.as_ref().and_then(|d| d.propose().first().copied())
+                    else {
+                        break;
+                    };
+                    (last.pos + 1, d, true)
+                }
+            };
+            if let Err(e) = self.spec_send(&down, pos, input, guess) {
+                return self.fail_streams_into(out, e);
+            }
+        }
+        self.note_link_busy();
+    }
+
+    /// Emit `streams[0].next` (speculation path); `true` when the stream is done.
+    fn spec_emit(&mut self, out: &mut Vec<(TaskId, Chunk)>, in_draft: bool) -> bool {
+        let tok = self
+            .tokenizer
+            .as_ref()
+            .expect("multi-stream step needs a tokenizer");
+        let max_seq = self.runner.max_seq();
+        let eos: Vec<u32> = self.runner.eos_token_ids().to_vec();
+        let arch = self.runner.arch_name();
+        let stats = self.spec_stats;
+        let st = &mut self.streams[0];
+        let t = st.next as u32;
+        st.generated.push(t);
+        if !in_draft {
+            if let Some(d) = st.draft.as_mut() {
+                d.append(st.next);
+            }
+        }
+        st.next_emitted = true;
+        let full = tok.decode(&st.generated, true).unwrap_or_default();
+        let delta = utf8_safe_delta(&full, &mut st.emitted);
+        let mut c = Chunk::token(st.id.clone(), st.next, delta);
+        c.n_tokens = Some(1);
+        c.token_ids = vec![st.next];
+        out.push((st.id.clone(), c));
+        let n = st.generated.len();
+        let natural_stop = n >= st.max_new || eos.contains(&t);
+        let cap_stop = !natural_stop && st.pos >= max_seq;
+        if !(natural_stop || cap_stop) {
+            return false;
+        }
+        let mut chunk = Chunk::final_marker(st.id.clone(), String::new());
+        chunk.n_tokens = Some(0);
+        chunk.prompt_tokens = Some(st.prompt_len as u32);
+        chunk.finish_reason = Some(if cap_stop {
+            FinishReason::Length
+        } else {
+            finish_reason_for(n, st.max_new)
+        });
+        out.push((st.id.clone(), chunk));
+        let decode_s = st.decode_started.elapsed().as_secs_f64();
+        let steps = n.saturating_sub(1);
+        info!(
+            task = %st.id,
+            tokens = n,
+            elapsed_s = st.started.elapsed().as_secs_f64(),
+            prefill_s = st.prefill_s,
+            decode_s,
+            decode_steps = steps,
+            decode_tok_s = if decode_s > 0.0 { steps as f64 / decode_s } else { 0.0 },
+            guesses_total = stats.0,
+            guesses_right_total = stats.1,
+            guesses_wrong_total = stats.2,
+            "task done ({arch} multi-stream pipeline, speculating)"
+        );
+        true
+    }
+
+    /// The speculating stream is done: read and drop the replies still owed to
+    /// its frames (the slot must not be reused before they are gone), then
+    /// close it everywhere.
+    fn spec_finish(&mut self, down: &Arc<TokioMutex<ActivationClient>>) {
+        let groups = self.stream_groups.max(1) as u32;
+        while self.streams[0].spec.pop_front().is_some() {
+            let deadline = Self::reply_deadline() * groups;
+            if let Err(e) = self.block_on(recv_stream_tokens_reply(down, deadline)) {
+                warn!("speculation: reply to a dropped frame not read: {e}");
+                self.peer_disconnected = true;
+                break;
+            }
+        }
+        let st = self.streams.swap_remove(0);
+        self.runner.close_stream(st.slot);
+        if let Err(e) = self.block_on(send_stream_close(down, st.slot as u32)) {
+            warn!(slot = st.slot, "stream close not relayed: {e}");
+        }
+        self.note_link_busy();
+    }
+
+    /// One decode frame of the speculating stream: `input` at `pos` through my
+    /// layers and down the pipeline.
+    fn spec_send(
+        &mut self,
+        down: &Arc<TokioMutex<ActivationClient>>,
+        pos: usize,
+        input: i64,
+        guess: bool,
+    ) -> Result<(), String> {
+        let compute_started = Instant::now();
+        let slot = self.streams[0].slot;
+        let hs = self.runner.hidden_size();
+        if self.runner.stream_pos(slot) != pos {
+            return Err(format!(
+                "speculation: slot {slot} at position {}, frame wants {pos}",
+                self.runner.stream_pos(slot)
+            ));
+        }
+        let hidden = self.runner.embed_token(input as u32);
+        let runner = &mut self.runner;
+        let h = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runner.decode_streams(hidden, &[slot])
+        }))
+        .map_err(panic_message)?;
+        self.stream_batch_seq = self.stream_batch_seq.wrapping_add(1);
+        let batch_id = self.stream_batch_seq;
+        let send_started = Instant::now();
+        self.block_on(send_stream_decode(
+            down,
+            batch_id,
+            &[(slot as u32, pos as u32)],
+            &h,
+            hs as u32,
+        ))
+        .map_err(|e| format!("send_stream_decode: {e}"))?;
+        if let Some(p) = self.stage_profile.as_mut() {
+            p.decoded(1, send_started - compute_started);
+            p.send += send_started.elapsed();
+            p.spec_sent += u64::from(guess);
+        }
+        let st = &mut self.streams[0];
+        if guess {
+            self.spec_stats.0 += 1;
+            if let Some(d) = st.draft.as_mut() {
+                d.append(input);
+            }
+        }
+        st.state = StreamState::InFlight;
+        st.spec.push_back(SpecSent {
+            batch_id,
+            pos,
+            input,
+            guess,
+            valid: true,
+            sent_at: Instant::now(),
+        });
+        Ok(())
     }
 
     /// Send the next window of `streams[i]`'s prompt (state `Feeding`) during
@@ -6688,6 +7087,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
             generated: Vec::new(),
             emitted: 0,
             feed: VecDeque::new(),
+            spec: VecDeque::new(),
+            draft: None,
+            next_emitted: false,
         });
         Ok(())
     }
@@ -7509,6 +7911,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             },
             FrameKind::StreamOpen => self.handle_stream_open(&upstream, downstream.as_ref()),
             FrameKind::StreamFeed => self.handle_stream_feed(&upstream, downstream.as_ref()),
+            FrameKind::StreamRewind => self.handle_stream_rewind(&upstream, downstream.as_ref()),
             FrameKind::StreamDecode => self.handle_stream_decode(&upstream, downstream.as_ref()),
             FrameKind::StreamClose => self.handle_stream_close(&upstream, downstream.as_ref()),
             other => Err(format!(
@@ -7774,6 +8177,38 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 p.send += computed.elapsed();
             }
             sent
+        }
+    }
+
+    /// `StreamRewind` (one-way): a speculated token was wrong. Roll the slot
+    /// back to `len` positions here (the last rank also forgets the tokens it
+    /// sampled past that point) and downstream.
+    fn handle_stream_rewind(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+    ) -> Result<(), String> {
+        let (slot, len) = self
+            .block_on(recv_stream_rewind_body_server(upstream))
+            .map_err(|e| format!("recv_stream_rewind: {e}"))?;
+        let s = self.stream_slot_ok(slot)?;
+        let have = self.runner.stream_pos(s);
+        if len as usize > have || !self.runner.truncate_stream(s, len as usize) {
+            self.peer_disconnected = true;
+            return Err(format!(
+                "stream rewind: slot {s} at position {have} cannot go back to {len}"
+            ));
+        }
+        if let Some(sampler) = self.stream_samplers.get_mut(&s) {
+            let drop = have - len as usize;
+            let keep = sampler.history.len().saturating_sub(drop);
+            sampler.history.truncate(keep);
+        }
+        match downstream {
+            Some(down) => self
+                .block_on(send_stream_rewind(down, slot, len))
+                .map_err(|e| format!("relay stream rewind: {e}")),
+            None => Ok(()),
         }
     }
 

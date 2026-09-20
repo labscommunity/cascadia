@@ -195,6 +195,11 @@ pub enum FrameKind {
     /// Windows travel the pipeline back to back, so rank 1 works on the first
     /// while rank 0 computes the second.
     StreamFeed = 0x53_4D_45_64, // "SME\x64"
+    /// down, one-way: `slot u32 | len u32` — roll `slot` back to `len`
+    /// positions on every rank (a speculated token turned out wrong; the
+    /// frames that carried it and its successors are ahead of this one on the
+    /// wire, so every rank has processed them by the time it reads this).
+    StreamRewind = 0x53_4D_45_65, // "SME\x65"
 }
 
 impl FrameKind {
@@ -227,6 +232,7 @@ impl FrameKind {
             x if x == FrameKind::StreamClose as u32 => Some(FrameKind::StreamClose),
             x if x == FrameKind::StreamTokens as u32 => Some(FrameKind::StreamTokens),
             x if x == FrameKind::StreamFeed as u32 => Some(FrameKind::StreamFeed),
+            x if x == FrameKind::StreamRewind as u32 => Some(FrameKind::StreamRewind),
             _ => None,
         }
     }
@@ -1586,6 +1592,34 @@ pub async fn send_stream_close(cli: &Mutex<ActivationClient>, slot: u32) -> Tran
     let mut guard = cli.lock().await;
     guard.send_raw(&bytes).await?;
     Ok(())
+}
+
+/// down, one-way: roll `slot` back to `len` positions on every downstream rank.
+pub async fn send_stream_rewind(
+    cli: &Mutex<ActivationClient>,
+    slot: u32,
+    len: u32,
+) -> TransportResult<()> {
+    let mut bytes = [0u8; 12];
+    bytes[0..4].copy_from_slice(&(FrameKind::StreamRewind as u32).to_be_bytes());
+    bytes[4..8].copy_from_slice(&slot.to_be_bytes());
+    bytes[8..12].copy_from_slice(&len.to_be_bytes());
+    let mut guard = cli.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Body of a `StreamRewind` (kind consumed): `(slot, len)`.
+pub async fn recv_stream_rewind_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u32, u32)> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(8).await?;
+    drop(guard);
+    if raw.len() != 8 {
+        return Err(TransportError::SocketClosed);
+    }
+    Ok((be_u32(&raw[0..4]), be_u32(&raw[4..8])))
 }
 
 /// Body of a `StreamClose` (kind consumed): the slot.

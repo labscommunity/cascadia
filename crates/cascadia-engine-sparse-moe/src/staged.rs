@@ -198,6 +198,12 @@ pub trait StagedRunner: Send + 'static {
         None
     }
 
+    /// Roll `slot` back to `len` positions (a speculated token was wrong).
+    /// `false` when the runner cannot (the caller must not speculate then).
+    fn truncate_stream(&mut self, _slot: usize, _len: usize) -> bool {
+        false
+    }
+
     /// Distributed KV-prefix cache hooks (pipeline prefix reuse). Default:
     /// unsupported — only the glm5 runner implements them, so dsv4 / OV runners
     /// are unaffected. `restore_prefix` restores this rank's cached KV slice for

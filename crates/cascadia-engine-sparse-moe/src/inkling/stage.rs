@@ -379,6 +379,20 @@ impl StagedRunner for InklingRunner {
     fn stream_pos(&self, slot: usize) -> usize {
         self.streams.get(slot).copied().flatten().unwrap_or(0)
     }
+    fn truncate_stream(&mut self, slot: usize, len: usize) -> bool {
+        let Some(Some(pos)) = self.streams.get(slot).copied() else {
+            return false;
+        };
+        if len > pos {
+            return false;
+        }
+        for l in &mut self.layers {
+            l.select_slot(slot);
+            l.truncate(len);
+        }
+        self.streams[slot] = Some(len);
+        true
+    }
     fn prefill_stream(&mut self, slot: usize, hidden: Vec<f32>, rows: usize) -> Vec<f32> {
         let pos = self.streams[slot].expect("prefill_stream on a free slot");
         assert_eq!(
