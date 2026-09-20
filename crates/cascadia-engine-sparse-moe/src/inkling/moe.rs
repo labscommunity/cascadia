@@ -482,7 +482,11 @@ impl MoeLayer {
         } else {
             0.0
         };
-        let ok = cosine.is_finite() && cosine > 0.995;
+        // A layer taken from the regrouped folder carries re-quantised weights:
+        // measured 0.992 against the group-32 kernels (12 % of the block's
+        // output); an out-of-bounds read gives noise, far below either bar.
+        let bar = if ov.uses_decode_kernels(*lid) { 0.98 } else { 0.995 };
+        let ok = cosine.is_finite() && cosine > bar;
         tracing::info!(
             target: "cascadia::inkling",
             event = "ov_moe_high_id_check",

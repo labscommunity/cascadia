@@ -747,12 +747,85 @@ pub fn load_stage(
             );
         }
     }
+    if super::env_flag("CASCADIA_INKLING_LAYER_BENCH") {
+        if let Some(moe) = bench_moe.as_ref() {
+            let lids: Vec<u32> = (lo..lo + layers.len())
+                .map(|l| l as u32)
+                .filter(|&l| moe.has_layer(l) && ov_moe_layer_selected(l))
+                .collect();
+            layer_bench(
+                moe,
+                &lids,
+                m.hidden_size,
+                m.num_experts,
+                m.n_shared_experts,
+                m.top_k,
+            );
+        }
+    }
     Ok(InklingStage {
         embed,
         layers,
         head,
         manifest: m,
     })
+}
+
+/// `CASCADIA_INKLING_LAYER_BENCH=1`, once at load: what one fused-experts call
+/// costs per LAYER at one, two and three rows (median of 33 calls, expert ids
+/// spread over the whole range). A rank that runs some layers through the
+/// plugin's decode kernels (`CASCADIA_INKLING_OV_MOE_DECODE_DIR`) and the rest
+/// through its prefill path shows both side by side, on the same box, with
+/// nothing else running. Microseconds go out on a "stage profile" line.
+fn layer_bench(
+    moe: &std::sync::Arc<super::ov_moe::OvMoe>,
+    lids: &[u32],
+    hidden: usize,
+    n_routed: usize,
+    n_shared: usize,
+    top_k: usize,
+) {
+    use std::time::Instant;
+    let k = top_k + n_shared;
+    for &lid in lids {
+        let mut med = [0u128; 3];
+        for (slot, rows) in [1usize, 2, 3].into_iter().enumerate() {
+            let mut us = Vec::with_capacity(33);
+            for call in 0..36usize {
+                let x: Vec<f32> = (0..rows * hidden)
+                    .map(|i| (((i + call) % 97) as f32 - 48.0) * 1e-3)
+                    .collect();
+                let mut ids = Vec::with_capacity(rows * k);
+                for r in 0..rows {
+                    for j in 0..top_k {
+                        ids.push(((call * 31 + r * 17 + j * 43 + lid as usize * 7) % n_routed) as i32);
+                    }
+                    for s in 0..n_shared {
+                        ids.push((n_routed + s) as i32);
+                    }
+                }
+                let w = vec![1.0f32 / k as f32; rows * k];
+                let t0 = Instant::now();
+                let ok = moe.forward(lid, &x, rows, &ids, &w).is_some();
+                if call >= 3 && ok {
+                    us.push(t0.elapsed().as_micros());
+                }
+            }
+            us.sort_unstable();
+            med[slot] = us.get(us.len() / 2).copied().unwrap_or(0);
+        }
+        let line = format!(
+            "LB{lid} probe stage profile layer={lid} decode={} r1_us={} r2_us={} r3_us={}",
+            u8::from(moe.uses_decode_kernels(lid)),
+            med[0],
+            med[1],
+            med[2]
+        );
+        for _ in 0..3 {
+            println!("{line}");
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    }
 }
 
 /// `CASCADIA_INKLING_SPLIT_BENCH=1`, once at load: can a second frame use the
