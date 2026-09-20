@@ -401,13 +401,7 @@ impl Layer {
         rmsnorm_f32(&mut h2, &self.mlp_norm, self.eps);
         let m = match &self.mlp {
             LayerMlp::Moe(m) => m.forward_batch(&h2, rows),
-            LayerMlp::Dense(d) => {
-                let mut m = vec![0.0f32; rows * hd];
-                for (r, row) in h2.chunks_exact(hd).enumerate() {
-                    m[r * hd..(r + 1) * hd].copy_from_slice(&d.forward(row, hd));
-                }
-                m
-            }
+            LayerMlp::Dense(d) => d.forward_rows(&h2, rows, hd),
         };
         let m = self.mlp_sconv.prefill(&m, rows);
         for (xi, &mi) in x1.iter_mut().zip(&m) {
@@ -447,13 +441,7 @@ impl Layer {
         rmsnorm_f32(&mut h2, &self.mlp_norm, self.eps);
         let m = match &self.mlp {
             LayerMlp::Moe(m) => m.forward_batch(&h2, rows),
-            LayerMlp::Dense(d) => {
-                let mut m = vec![0.0f32; rows * hd];
-                for (r, row) in h2.chunks_exact(hd).enumerate() {
-                    m[r * hd..(r + 1) * hd].copy_from_slice(&d.forward(row, hd));
-                }
-                m
-            }
+            LayerMlp::Dense(d) => d.forward_rows(&h2, rows, hd),
         };
         let mut at = 0usize;
         for &(slot, r) in segs {
@@ -502,13 +490,7 @@ impl Layer {
         rmsnorm_f32(&mut h2, &self.mlp_norm, self.eps);
         let m = match &self.mlp {
             LayerMlp::Moe(m) => m.forward_batch(&h2, rows),
-            LayerMlp::Dense(d) => {
-                let mut m = vec![0.0f32; rows * hd];
-                for (r, row) in h2.chunks_exact(hd).enumerate() {
-                    m[r * hd..(r + 1) * hd].copy_from_slice(&d.forward(row, hd));
-                }
-                m
-            }
+            LayerMlp::Dense(d) => d.forward_rows(&h2, rows, hd),
         };
         for (r, &slot) in slots.iter().enumerate() {
             self.mlp_sconv.select(slot);

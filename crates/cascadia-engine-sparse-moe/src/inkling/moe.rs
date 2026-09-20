@@ -115,6 +115,28 @@ pub(crate) fn par_experts() -> bool {
     *E.get_or_init(|| !env_flag("CASCADIA_INKLING_SERIAL_EXPERTS"))
 }
 
+/// `CASCADIA_INKLING_ROW_GEMM` (default ON; `0`/`false`/`no`/`off` restores
+/// the per-row kernels): in a batch-union block, an int4 expert with two or
+/// more rows — and both shared experts, which every row uses — runs ONE
+/// multi-input pass ([`MmapExpert::swiglu_rows_from`](crate::dsv4::expert_mmap::MmapExpert::swiglu_rows_from))
+/// instead of a GEMV per row, so its packed bytes cross the memory bus once
+/// per block. Same bits per row either way; only the schedule differs. Read
+/// once.
+fn row_gemm() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| match std::env::var("CASCADIA_INKLING_ROW_GEMM") {
+        Ok(v) => {
+            let v = v.trim();
+            !(v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("no")
+                || v.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => true,
+    })
+}
+
 /// Router + expert weights of one MoE layer.
 pub struct MoeWeights {
     /// `mlp.gate.weight` `[n_routed + n_shared, hidden]`, f32 (logits are not
@@ -164,6 +186,48 @@ pub struct MoeLayer {
 }
 
 impl MoeLayer {
+    /// Read every routed expert into the resident cache now (as far as its
+    /// capacity goes) instead of on first use. A pipeline rank's cache is sized
+    /// to hold its whole slice, but it used to fill only as requests touched
+    /// experts: after every restart the first request took 34 s to its first
+    /// token and decode ran at half speed for minutes. Returns
+    /// `(experts loaded, bytes)`.
+    pub fn prewarm_expert_cache(&self) -> (usize, usize) {
+        use rayon::prelude::*;
+        if self.expert_cache.stats().capacity_bytes == 0 {
+            return (0, 0);
+        }
+        let ids: Vec<usize> = (0..self.w.experts.len()).collect();
+        let mut loaded = (0usize, 0usize);
+        // Cohorts bound how many 32 MB buffers are in flight at once.
+        for cohort in ids.chunks(16) {
+            let done: Vec<usize> = cohort
+                .par_iter()
+                .map(|&e| {
+                    let Some(m) = self.w.experts[e].as_mmap() else {
+                        return 0;
+                    };
+                    let mut lease = super::read_buffers::ReadBuffers::acquire(1);
+                    if lease.buffers[0]
+                        .read_prefill(m.bin_path(), m.bin_len())
+                        .is_err()
+                    {
+                        return 0;
+                    }
+                    let size = lease.buffers[0].as_slice().len();
+                    if self.expert_cache.preload(e, &mut lease.buffers[0]) {
+                        size
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            loaded.0 += done.iter().filter(|&&b| b > 0).count();
+            loaded.1 += done.iter().sum::<usize>();
+        }
+        loaded
+    }
+
     pub fn expert_cache_stats(&self) -> super::ExpertCacheStats {
         self.expert_cache.stats()
     }
@@ -751,8 +815,23 @@ impl MoeLayer {
         out: &mut [f32],
         streamed: bool,
     ) {
+        self.forward_block_impl(xs, lo, hi, out, streamed, row_gemm());
+    }
+
+    /// `gemm`: run an int4 expert's rows (and the shared experts' block) as one
+    /// multi-input pass — see [`row_gemm`]. Bit-identical to `gemm = false`.
+    fn forward_block_impl(
+        &self,
+        xs: &[f32],
+        lo: usize,
+        hi: usize,
+        out: &mut [f32],
+        streamed: bool,
+        gemm: bool,
+    ) {
         let (hidden, k) = (self.hidden, self.top_k);
         let nblk = hi - lo;
+        let row = |br: usize| &xs[(lo + br) * hidden..(lo + br + 1) * hidden];
 
         // 1. Route every row; remember each (row, slot)'s expert + weight and the
         //    per-expert occurrence list.
@@ -815,6 +894,10 @@ impl MoeLayer {
         let visit = |(e, slots): (usize, &Vec<usize>)| {
             let mapped = self.w.experts[e].as_mmap();
             if let (Some(m), Some(hit)) = (mapped, hit_map.get(&e)) {
+                if gemm && slots.len() >= 2 {
+                    let rows: Vec<&[f32]> = slots.iter().map(|&s| row(s / k)).collect();
+                    return (e, m.swiglu_rows_from(hit.as_slice(), &rows));
+                }
                 let mut ys = Vec::with_capacity(slots.len() * hidden);
                 for &s in slots {
                     let br = s / k;
@@ -841,19 +924,27 @@ impl MoeLayer {
                 }
                 _ => false,
             };
-            let mut ys = Vec::with_capacity(slots.len() * hidden);
-            for &s in slots {
-                let br = s / k;
-                let x = &xs[(lo + br) * hidden..(lo + br + 1) * hidden];
-                let y = if ready {
-                    mapped
-                        .unwrap()
-                        .swiglu_from(lease.as_ref().unwrap().buffers[0].as_slice(), x)
-                } else {
-                    self.w.experts[e].forward(x, hidden, self.inter)
-                };
-                ys.extend_from_slice(&y);
-            }
+            let ys = if ready && gemm && slots.len() >= 2 {
+                let rows: Vec<&[f32]> = slots.iter().map(|&s| row(s / k)).collect();
+                mapped
+                    .unwrap()
+                    .swiglu_rows_from(lease.as_ref().unwrap().buffers[0].as_slice(), &rows)
+            } else {
+                let mut ys = Vec::with_capacity(slots.len() * hidden);
+                for &s in slots {
+                    let br = s / k;
+                    let x = &xs[(lo + br) * hidden..(lo + br + 1) * hidden];
+                    let y = if ready {
+                        mapped
+                            .unwrap()
+                            .swiglu_from(lease.as_ref().unwrap().buffers[0].as_slice(), x)
+                    } else {
+                        self.w.experts[e].forward(x, hidden, self.inter)
+                    };
+                    ys.extend_from_slice(&y);
+                }
+                ys
+            };
             if ready && cache_on {
                 // Admit the freshly read bytes (a miss) after its rows computed;
                 // the lease gets any evicted allocation back and drops it.
@@ -901,7 +992,23 @@ impl MoeLayer {
                 ey[s * hidden..(s + 1) * hidden].copy_from_slice(&ys[i * hidden..(i + 1) * hidden]);
             }
         }
-        // The shared experts per row (S_s(x_row), in s order).
+        // The shared experts (S_s(x_row), in s order). Every row uses both, so
+        // with `gemm` each runs ONCE over the whole block (`shared_blk[s]` is
+        // `[nblk, hidden]`); otherwise per row (`shared_y[br][s]`).
+        let shared_blk: Vec<Vec<f32>> = if gemm && nblk >= 2 {
+            let rows: Vec<&[f32]> = (0..nblk).map(row).collect();
+            let one = |s: &AnyExpert| {
+                super::ffn::forward_rows(s, &rows, hidden, self.inter, par_experts())
+            };
+            if par_experts() {
+                use rayon::prelude::*;
+                self.w.shared.par_iter().map(one).collect()
+            } else {
+                self.w.shared.iter().map(one).collect()
+            }
+        } else {
+            Vec::new()
+        };
         let shared_row = |br: usize| -> Vec<Vec<f32>> {
             let x = &xs[(lo + br) * hidden..(lo + br + 1) * hidden];
             self.w
@@ -910,7 +1017,9 @@ impl MoeLayer {
                 .map(|s| s.forward(x, hidden, self.inter))
                 .collect()
         };
-        let shared_y: Vec<Vec<Vec<f32>>> = if par_experts() {
+        let shared_y: Vec<Vec<Vec<f32>>> = if !shared_blk.is_empty() || self.w.shared.is_empty() {
+            Vec::new()
+        } else if par_experts() {
             use rayon::prelude::*;
             (0..nblk).into_par_iter().map(shared_row).collect()
         } else {
@@ -928,7 +1037,11 @@ impl MoeLayer {
                 }
             }
             let g = &gammas[br * self.n_shared..(br + 1) * self.n_shared];
-            for (y, &gs) in shared_y[br].iter().zip(g) {
+            for (si, &gs) in g.iter().enumerate().take(self.w.shared.len()) {
+                let y: &[f32] = match shared_blk.get(si) {
+                    Some(blk) => &blk[br * hidden..(br + 1) * hidden],
+                    None => &shared_y[br][si],
+                };
                 for (oo, &yi) in o.iter_mut().zip(y) {
                     *oo += gs * yi;
                 }
@@ -971,6 +1084,27 @@ impl DenseMlp {
         let (lid, ov) = self.ov.as_ref()?;
         let bad = ov.warm(&[(*lid, super::ov_expert::DENSE)], 0);
         Some((1 - bad.len(), bad))
+    }
+
+    /// [`Self::forward`] for `rows` rows (`xs` = `[rows, hidden]`), bit-identical
+    /// per row. The int4 weights (226 MB a layer) cross the memory bus once for
+    /// the block instead of once per row: on the pipeline's rank 0 the two
+    /// dense layers cost more per row than its four MoE layers and made it the
+    /// slowest stage of the fleet.
+    pub fn forward_rows(&self, xs: &[f32], rows: usize, hidden: usize) -> Vec<f32> {
+        if rows < 2 || self.ov.is_some() || !row_gemm() {
+            let mut out = Vec::with_capacity(rows * hidden);
+            for row in xs.chunks_exact(hidden) {
+                out.extend(self.forward(row, hidden));
+            }
+            return out;
+        }
+        let views: Vec<&[f32]> = xs.chunks_exact(hidden).collect();
+        let mut y = super::ffn::forward_rows(&self.w, &views, hidden, self.inter, true);
+        for v in y.iter_mut() {
+            *v *= self.global_scale;
+        }
+        y
     }
 
     /// `down(silu(gate·x) · up·x) · global_scale` for one token (`[hidden]`).
@@ -1036,5 +1170,57 @@ mod prefill_read_tests {
             actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
             expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
         );
+    }
+
+    /// `CASCADIA_INKLING_ROW_GEMM` on vs off, on the real int4 fixture bins: 8
+    /// routed experts top-3 + both shared experts (one mapped, one an owned
+    /// copy — `CASCADIA_INKLING_OWN_SHARED`), 29 rows so every expert carries
+    /// several. The block through the multi-input kernel must equal the
+    /// per-row kernels bit for bit, mapped and streamed, and so must a row
+    /// computed alone (a stream decoded alone vs in a batch).
+    #[test]
+    fn row_gemm_block_is_bit_identical_to_the_per_row_kernels() {
+        use crate::dsv4::expert_mmap::MmapExpert;
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/inkling_export/experts/layer_01");
+        let open = |name: String| MmapExpert::open(&directory.join(name), 64, 32).unwrap();
+        let (hidden, n_routed, n_shared, rows) = (64usize, 8usize, 2usize, 29usize);
+        let mut seed = 0x9E37_79B9u64;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 40) as f32) / (1u64 << 24) as f32 - 0.5
+        };
+        let weights = MoeWeights {
+            router_w: (0..(n_routed + n_shared) * hidden)
+                .map(|_| next())
+                .collect(),
+            router_bias: vec![0.0; n_routed],
+            global_scale: 8.0,
+            experts: (0..n_routed)
+                .map(|e| AnyExpert::Mmap(open(format!("expert_{e:03}.bin"))))
+                .collect(),
+            shared: vec![
+                AnyExpert::Mmap(open("expert_shared0.bin".into())),
+                AnyExpert::Mmap(open("expert_shared1.bin".into()))
+                    .into_owned_int4()
+                    .unwrap(),
+            ],
+        };
+        let layer = MoeLayer::new(hidden, 32, 3, 1.0, weights);
+        let xs: Vec<f32> = (0..rows * hidden).map(|_| 4.0 * next()).collect();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let mut per_row = vec![0.0; xs.len()];
+        layer.forward_block_impl(&xs, 0, rows, &mut per_row, false, false);
+        assert!(per_row.iter().any(|&v| v != 0.0));
+        for streamed in [false, true] {
+            let mut gemm = vec![0.0; xs.len()];
+            layer.forward_block_impl(&xs, 0, rows, &mut gemm, streamed, true);
+            assert_eq!(bits(&gemm), bits(&per_row), "block, streamed={streamed}");
+            let mut alone = vec![0.0; xs.len()];
+            for r in 0..rows {
+                layer.forward_block_impl(&xs, r, r + 1, &mut alone, streamed, true);
+            }
+            assert_eq!(bits(&alone), bits(&per_row), "alone, streamed={streamed}");
+        }
     }
 }
