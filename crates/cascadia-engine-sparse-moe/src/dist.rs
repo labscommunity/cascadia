@@ -200,6 +200,11 @@ pub enum FrameKind {
     /// frames that carried it and its successors are ahead of this one on the
     /// wire, so every rank has processed them by the time it reads this).
     StreamRewind = 0x53_4D_45_65, // "SME\x65"
+    /// down: `batch_id u32 | n u32 | (slot u32, rows u32, SamplingConfig) × n | tensor [1, Σrows, H]`
+    /// — open `n` slots and prefill their prompts in one pass (rows end to
+    /// end), so the prompts share expert reads; the last rank samples each
+    /// prompt's final row and replies one `StreamTokens` with `n` entries.
+    StreamOpenBatch = 0x53_4D_45_66, // "SME\x66"
 }
 
 impl FrameKind {
@@ -233,6 +238,7 @@ impl FrameKind {
             x if x == FrameKind::StreamTokens as u32 => Some(FrameKind::StreamTokens),
             x if x == FrameKind::StreamFeed as u32 => Some(FrameKind::StreamFeed),
             x if x == FrameKind::StreamRewind as u32 => Some(FrameKind::StreamRewind),
+            x if x == FrameKind::StreamOpenBatch as u32 => Some(FrameKind::StreamOpenBatch),
             _ => None,
         }
     }
@@ -1449,6 +1455,90 @@ pub async fn recv_stream_open_body_server(
     }
     let (h, _) = tensor_to_hidden(&tensor)?;
     Ok((batch_id, slot, rows, sampling, h))
+}
+
+/// Prompts one `StreamOpenBatch` may carry.
+pub const MAX_OPEN_BATCH: u32 = 64;
+
+/// down: open and prefill several slots at once (see [`FrameKind::StreamOpenBatch`]).
+/// `segs[i] = (slot, rows, sampling)`; `hidden` holds the prompts' rows end to end.
+pub async fn send_stream_open_batch(
+    cli: &Mutex<ActivationClient>,
+    batch_id: u32,
+    segs: &[(u32, u32, SamplingConfig)],
+    hidden_f32: &[f32],
+    h: u32,
+) -> TransportResult<()> {
+    let total: u32 = segs.iter().map(|s| s.1).sum();
+    let n = segs.len() as u32;
+    if n == 0 || n > MAX_OPEN_BATCH || total == 0 || total > MAX_STREAM_ROWS {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream open batch: {n} prompts, {total} rows out of range"
+        ))));
+    }
+    let mut header = Vec::with_capacity(12 + segs.len() * (8 + SAMPLING_WIRE_BYTES));
+    header.extend_from_slice(&(FrameKind::StreamOpenBatch as u32).to_be_bytes());
+    header.extend_from_slice(&batch_id.to_be_bytes());
+    header.extend_from_slice(&n.to_be_bytes());
+    for (slot, rows, sampling) in segs {
+        header.extend_from_slice(&slot.to_be_bytes());
+        header.extend_from_slice(&rows.to_be_bytes());
+        let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+        encode_sampling(sampling, &mut sbytes);
+        header.extend_from_slice(&sbytes);
+    }
+    let tensor = hidden_to_tensor(hidden_f32, [1, total, h]);
+    let mut guard = cli.lock().await;
+    guard.send_raw(&header).await?;
+    guard.send(&tensor).await?;
+    Ok(())
+}
+
+/// Body of a `StreamOpenBatch` (kind consumed): `(batch_id, [(slot, rows, sampling)], hidden)`.
+#[allow(clippy::type_complexity)]
+pub async fn recv_stream_open_batch_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u32, Vec<(u32, u32, SamplingConfig)>, Vec<f32>)> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(8).await?;
+    if raw.len() != 8 {
+        return Err(TransportError::SocketClosed);
+    }
+    let (batch_id, n) = (be_u32(&raw[0..4]), be_u32(&raw[4..8]));
+    if n == 0 || n > MAX_OPEN_BATCH {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream open batch: {n} prompts out of range 1..={MAX_OPEN_BATCH}"
+        ))));
+    }
+    let per = 8 + SAMPLING_WIRE_BYTES;
+    let raw = guard.recv_raw(n as usize * per).await?;
+    if raw.len() != n as usize * per {
+        return Err(TransportError::SocketClosed);
+    }
+    let mut segs = Vec::with_capacity(n as usize);
+    let mut total = 0u32;
+    for c in raw.chunks_exact(per) {
+        let (slot, rows) = (be_u32(&c[0..4]), be_u32(&c[4..8]));
+        let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+        sbytes.copy_from_slice(&c[8..]);
+        total = total.saturating_add(rows);
+        if rows == 0 || total > MAX_STREAM_ROWS {
+            return Err(TransportError::Io(std::io::Error::other(format!(
+                "stream open batch: prompt of {rows} rows, {total} so far, limit {MAX_STREAM_ROWS}"
+            ))));
+        }
+        segs.push((slot, rows, decode_sampling(&sbytes)));
+    }
+    let (tensor, _) = guard.recv().await?;
+    drop(guard);
+    if tensor.shape[1] != total {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream open batch: tensor shape[1]={} != {total} rows",
+            tensor.shape[1]
+        ))));
+    }
+    let (h, _) = tensor_to_hidden(&tensor)?;
+    Ok((batch_id, segs, h))
 }
 
 /// `StreamFeed` flag: this is the prompt's first window, open the slot.

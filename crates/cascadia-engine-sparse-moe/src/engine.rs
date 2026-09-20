@@ -47,7 +47,10 @@ use crate::dist::{
     send_capture_ack_upstream, send_restore, send_restore_ack_upstream, send_restore_carry,
     CAPTURE_ACK_TIMEOUT,
 };
-use crate::dist::{recv_stream_rewind_body_server, send_stream_rewind};
+use crate::dist::{
+    recv_stream_open_batch_body_server, recv_stream_rewind_body_server, send_stream_open_batch,
+    send_stream_rewind,
+};
 use crate::kv_prefix_cache::KvPrefixCache;
 use crate::manifest::Manifest;
 use crate::ov_moe::OvMoeRunner;
@@ -3521,7 +3524,8 @@ impl SparseMoEEngine {
             | FrameKind::StreamClose
             | FrameKind::StreamTokens
             | FrameKind::StreamFeed
-            | FrameKind::StreamRewind => Err(format!(
+            | FrameKind::StreamRewind
+            | FrameKind::StreamOpenBatch => Err(format!(
                 "sparse-moe stage received multi-stream frame {kind:?} (only the staged pipeline engine serves streams)"
             )),
             #[cfg(feature = "kv_coord")]
@@ -5391,6 +5395,8 @@ pub struct PipelineEngine<R: StagedRunner> {
     /// to about twice a stage time.
     return_cli: Option<Arc<TokioMutex<ActivationClient>>>,
     return_srv: Option<Arc<TokioMutex<ActivationServer>>>,
+    /// Rank 0: prompts admitted through multi-prompt prefill frames since start.
+    batched_admissions: u64,
     /// Rank 0: the return link is connected to the chain as it is now.
     return_ready: bool,
     /// Last rank: rank 0's connection has been accepted.
@@ -5432,6 +5438,21 @@ fn stream_prefill_window_rows() -> usize {
             .filter(|&v| v >= 1)
             .unwrap_or(128)
             .min(crate::dist::MAX_STREAM_ROWS as usize)
+    })
+}
+
+/// Most prompts one prefill frame carries (`CASCADIA_STREAMS_ADMIT_BATCH`,
+/// default 8, 1 = one frame per prompt).
+fn stream_admit_batch() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CASCADIA_STREAMS_ADMIT_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v >= 1)
+            .unwrap_or(8)
+            .min(crate::dist::MAX_OPEN_BATCH as usize)
     })
 }
 
@@ -5767,6 +5788,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             stage_profile: None,
             stream_spec_depth: None,
             spec_stats: (0, 0, 0),
+            batched_admissions: 0,
             return_cli: None,
             return_srv: None,
             return_ready: false,
@@ -6019,6 +6041,18 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 p.prefill += feed_started.elapsed();
             }
         }
+        if admitted == 0 && self.pending.len() >= 2 && self.group_is_emptiest(g) {
+            let admit_started = Instant::now();
+            let (n, rows) = self.admit_streams_batch(g, &down, out);
+            if n > 0 {
+                admitted += n;
+                if let Some(p) = self.stage_profile.as_mut() {
+                    p.opens += n as u64;
+                    p.open_rows += rows as u64;
+                    p.prefill += admit_started.elapsed();
+                }
+            }
+        }
         while admitted < self.stream_admit_per_step
             && self.streams.len() < self.stream_cap
             && !self.pending.is_empty()
@@ -6200,6 +6234,174 @@ impl<R: StagedRunner> PipelineEngine<R> {
         }
         self.flush_stage_profile();
         true
+    }
+
+    /// Admit several waiting requests as ONE prefill frame
+    /// (`CASCADIA_STREAMS_ADMIT_BATCH` prompts at most, default 8; 1 = off):
+    /// their rows share every rank's expert reads, where one frame per request
+    /// made a burst of 48 short prompts cost 48 frames of about a second on
+    /// every rank (time to first token 87 s on average). Only prompts that fit
+    /// one window take this path; each new stream joins the emptiest group.
+    /// Returns (streams admitted, prompt rows). The frame's reply is owed at
+    /// the turn of `g`, the group whose turn sends it.
+    fn admit_streams_batch(
+        &mut self,
+        g: usize,
+        down: &Arc<TokioMutex<ActivationClient>>,
+        out: &mut Vec<(TaskId, Chunk)>,
+    ) -> (usize, usize) {
+        let limit = stream_admit_batch();
+        if limit < 2 {
+            return (0, 0);
+        }
+        let Some(tok) = self.tokenizer.as_ref() else {
+            return (0, 0);
+        };
+        let window = stream_prefill_window_rows();
+        let max_rows = crate::dist::MAX_STREAM_ROWS as usize;
+        let started = Instant::now();
+        // Take tasks from the front while they fit; stop at the first that does
+        // not (a long prompt keeps its place and goes through the windowed path).
+        let mut picked: Vec<(GenerationTask, Vec<u32>)> = Vec::new();
+        let mut total = 0usize;
+        while picked.len() < limit && self.streams.len() + picked.len() < self.stream_cap {
+            let Some(task) = self.pending.front() else {
+                break;
+            };
+            let ids: Vec<u32> = match tok.encode(task.prompt.as_str(), true) {
+                Ok(enc) => enc.get_ids().to_vec(),
+                Err(_) => break, // the single path reports it
+            };
+            if ids.is_empty() || ids.len() > window || total + ids.len() > max_rows {
+                break;
+            }
+            total += ids.len();
+            let task = self.pending.pop_front().expect("front exists");
+            picked.push((task, ids));
+        }
+        if picked.len() < 2 {
+            // Not a batch: hand the task back for the single path.
+            for (task, _) in picked.into_iter().rev() {
+                self.pending.push_front(task);
+            }
+            return (0, 0);
+        }
+        let hs = self.runner.hidden_size();
+        let mut segs: Vec<(usize, usize)> = Vec::with_capacity(picked.len());
+        let mut hidden = Vec::with_capacity(total * hs);
+        for (_, ids) in &picked {
+            let Some(slot) = self.runner.open_stream() else {
+                break;
+            };
+            segs.push((slot, ids.len()));
+            for &t in ids {
+                hidden.extend(self.runner.embed_token(t));
+            }
+        }
+        // Tasks that found no slot wait for the next turn.
+        while picked.len() > segs.len() {
+            let (task, _) = picked.pop().expect("longer than segs");
+            self.pending.push_front(task);
+        }
+        let rows: usize = segs.iter().map(|&(_, r)| r).sum();
+        hidden.truncate(rows * hs);
+        let abort = |this: &mut Self, out: &mut Vec<(TaskId, Chunk)>, msg: String| {
+            for &(slot, _) in &segs {
+                this.runner.close_stream(slot);
+            }
+            for (task, _) in &picked {
+                out.push((
+                    task.task_id.clone(),
+                    Chunk::error(task.task_id.clone(), msg.clone()),
+                ));
+            }
+        };
+        let runner = &mut self.runner;
+        let segs_ref = &segs;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runner.prefill_streams(segs_ref, hidden)
+        }));
+        let h = match outcome {
+            Ok(h) => h,
+            Err(payload) => {
+                let msg = panic_message(payload);
+                warn!(error = %msg, "batched stream prefill failed; tasks aborted");
+                abort(self, out, msg);
+                return (0, 0);
+            }
+        };
+        let cfgs: Vec<crate::sampling::SamplingConfig> =
+            picked.iter().map(|(t, _)| sampling_from_task(t)).collect();
+        let wire: Vec<(u32, u32, crate::sampling::SamplingConfig)> = segs
+            .iter()
+            .zip(&cfgs)
+            .map(|(&(slot, r), c)| (slot as u32, r as u32, c.clone()))
+            .collect();
+        self.stream_batch_seq = self.stream_batch_seq.wrapping_add(1);
+        let batch_id = self.stream_batch_seq;
+        if let Err(e) = self.block_on(send_stream_open_batch(down, batch_id, &wire, &h, hs as u32))
+        {
+            warn!("send_stream_open_batch failed: {e}");
+            self.peer_disconnected = true;
+            abort(self, out, format!("send_stream_open_batch: {e}"));
+            return (0, 0);
+        }
+        let prefill_s = started.elapsed().as_secs_f64();
+        let mut counts = vec![0usize; self.stream_groups.max(1)];
+        for st in &self.streams {
+            if let Some(n) = counts.get_mut(st.group) {
+                *n += 1;
+            }
+        }
+        self.stream_inflight[g].push_back(StreamInFlight {
+            batch_id,
+            slots: segs.iter().map(|&(s, _)| s).collect(),
+            open: true,
+            sent_at: Instant::now(),
+        });
+        info!(
+            prompts = segs.len(),
+            rows,
+            rank0_prefill_s = prefill_s,
+            streams = self.streams.len() + segs.len(),
+            "streams admitted as one prefill frame (pipeline)"
+        );
+        let n = segs.len();
+        self.batched_admissions += n as u64;
+        for (((task, ids), &(slot, r)), cfg) in picked.into_iter().zip(&segs).zip(cfgs) {
+            let group = (0..counts.len()).min_by_key(|&i| counts[i]).unwrap_or(0);
+            counts[group] += 1;
+            let draft = self.stream_spec_depth.map(|_| {
+                let mut d = crate::ngram_draft::Draft::new().with_draft_k(1);
+                let ids: Vec<i64> = ids.iter().map(|&t| t as i64).collect();
+                d.warm_with_prompt(&ids);
+                d
+            });
+            self.streams.push(StreamActive {
+                id: task.task_id,
+                slot,
+                group,
+                state: StreamState::Prefilling,
+                cancelled: false,
+                cfg,
+                history: Vec::new(),
+                rng: 0,
+                max_new: task.max_tokens.max(1) as usize,
+                started,
+                prefill_s,
+                decode_started: Instant::now(),
+                prompt_len: r,
+                next: -1,
+                pos: r,
+                generated: Vec::new(),
+                emitted: 0,
+                feed: VecDeque::new(),
+                spec: VecDeque::new(),
+                draft,
+                next_emitted: false,
+            });
+        }
+        (n, rows)
     }
 
     /// Whether a new stream may join group `g` now: only the emptiest group
@@ -6500,6 +6702,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
             self.peer_disconnected = true; // rebuild the chain: rank 0 re-dials the new last rank
         }
         sent
+    }
+
+    /// Rank 0: prompts admitted through multi-prompt prefill frames since start.
+    pub fn batched_admissions(&self) -> u64 {
+        self.batched_admissions
     }
 
     /// Rank 0: token replies are arriving on the direct return link.
@@ -8081,6 +8288,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
             FrameKind::StreamOpen => self.handle_stream_open(&upstream, downstream.as_ref()),
             FrameKind::StreamFeed => self.handle_stream_feed(&upstream, downstream.as_ref()),
             FrameKind::StreamRewind => self.handle_stream_rewind(&upstream, downstream.as_ref()),
+            FrameKind::StreamOpenBatch => {
+                self.handle_stream_open_batch(&upstream, downstream.as_ref())
+            }
             FrameKind::StreamDecode => self.handle_stream_decode(&upstream, downstream.as_ref()),
             FrameKind::StreamClose => self.handle_stream_close(&upstream, downstream.as_ref()),
             other => Err(format!(
@@ -8334,6 +8544,88 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     down, batch_id, &rows, &hidden, hs as u32,
                 ))
                 .map_err(|e| format!("send_stream_decode: {e}"));
+            if let Some(p) = self.stage_profile.as_mut() {
+                p.send += computed.elapsed();
+            }
+            sent
+        }
+    }
+
+    /// `StreamOpenBatch`: several prompts opened and prefilled in one pass
+    /// (they share expert reads); the last rank samples each prompt's final
+    /// row and answers with one `StreamTokens`.
+    fn handle_stream_open_batch(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+    ) -> Result<(), String> {
+        let recv_started = Instant::now();
+        let (batch_id, wire_segs, hidden_f32) = self
+            .block_on(recv_stream_open_batch_body_server(upstream))
+            .map_err(|e| format!("recv_stream_open_batch: {e}"))?;
+        let received = Instant::now();
+        let hs = self.runner.hidden_size();
+        let total: usize = wire_segs.iter().map(|s| s.1 as usize).sum();
+        if hidden_f32.len() != total * hs {
+            self.peer_disconnected = true;
+            return Err(format!(
+                "stream open batch: {} floats for {total} rows of width {hs}",
+                hidden_f32.len()
+            ));
+        }
+        let mut segs = Vec::with_capacity(wire_segs.len());
+        for (slot, rows, _) in &wire_segs {
+            let s = self.stream_slot_ok(*slot)?;
+            if *rows as usize > self.runner.max_seq() || !self.runner.open_stream_at(s) {
+                self.peer_disconnected = true;
+                return Err(format!("stream open batch: slot {s} refused by the runner"));
+            }
+            segs.push((s, *rows as usize));
+        }
+        let hidden = self.runner.prefill_streams(&segs, hidden_f32);
+        let computed = Instant::now();
+        if let Some(p) = self.stage_profile.as_mut() {
+            p.opens += segs.len() as u64;
+            p.open_rows += total as u64;
+            p.recv += received - recv_started;
+            p.prefill += computed - received;
+        }
+        if self.is_last() {
+            let mut toks = Vec::with_capacity(segs.len());
+            let mut at = 0usize;
+            for (&(s, rows), (slot, _, cfg)) in segs.iter().zip(&wire_segs) {
+                at += rows;
+                let logits = self.runner.head_logits(&hidden[(at - 1) * hs..at * hs]);
+                let rng = crate::sampling::init_rng(cfg.seed);
+                let mut sampler = StreamSampler {
+                    cfg: cfg.clone(),
+                    history: Vec::new(),
+                    rng,
+                };
+                let token = crate::sampling::sample(
+                    &logits,
+                    &sampler.history,
+                    &sampler.cfg,
+                    &mut sampler.rng,
+                );
+                sampler.history.push(token);
+                self.stream_samplers.insert(s, sampler);
+                toks.push((*slot, token));
+            }
+            let send_started = Instant::now();
+            let sent = self.send_tokens_reply(upstream, batch_id, &toks);
+            if let Some(p) = self.stage_profile.as_mut() {
+                p.head += send_started - computed;
+                p.send += send_started.elapsed();
+            }
+            sent
+        } else {
+            let down = downstream.ok_or("mid rank missing downstream")?;
+            let sent = self
+                .block_on(send_stream_open_batch(
+                    down, batch_id, &wire_segs, &hidden, hs as u32,
+                ))
+                .map_err(|e| format!("send_stream_open_batch: {e}"));
             if let Some(p) = self.stage_profile.as_mut() {
                 p.send += computed.elapsed();
             }

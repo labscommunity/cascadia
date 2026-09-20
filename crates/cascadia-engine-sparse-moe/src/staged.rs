@@ -181,6 +181,20 @@ pub trait StagedRunner: Send + 'static {
         unimplemented!("this runner does not batch streams")
     }
 
+    /// Prefill several slots' prompts in one pass (`segs[i] = (slot, rows)`,
+    /// rows end to end in `hidden`), sharing whatever the runner can share
+    /// between them. Default: one [`Self::prefill_stream`] per slot.
+    fn prefill_streams(&mut self, segs: &[(usize, usize)], hidden: Vec<f32>) -> Vec<f32> {
+        let h = self.hidden_size();
+        let mut out = Vec::with_capacity(hidden.len());
+        let mut at = 0usize;
+        for &(slot, rows) in segs {
+            out.extend(self.prefill_stream(slot, hidden[at * h..(at + rows) * h].to_vec(), rows));
+            at += rows;
+        }
+        out
+    }
+
     /// Decode one token on each of `slots` (`hidden` = `[slots.len(), hidden]`,
     /// row `i` at `stream_pos(slots[i])`); returns `[slots.len(), hidden]` and
     /// advances every listed slot by one. A slot appears at most once.

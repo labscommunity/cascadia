@@ -419,6 +419,55 @@ impl Layer {
 }
 
 impl Layer {
+    /// Prefill several sequences at once: `segs[i] = (slot, rows)`, their rows
+    /// laid end to end in `xs`. Attention and the convs run per sequence on its
+    /// own slot (each appending at that slot's position); the MoE runs ALL rows
+    /// as one batch-union, so an expert several prompts touch is read once.
+    /// A 24-token prompt touches about 135 of a layer's 256 experts and ten of
+    /// them about 250, not 1350: a burst of requests costs the expert reads of
+    /// roughly two. Per row the ops are [`Self::forward_prefill`]'s.
+    pub fn forward_prefill_slots(&mut self, xs: &[f32], segs: &[(usize, usize)]) -> Vec<f32> {
+        let start = self.timing_observer.as_ref().map(|_| Instant::now());
+        let hd = self.hidden;
+        let rows: usize = segs.iter().map(|&(_, r)| r).sum();
+        assert_eq!(xs.len(), rows * hd, "layer forward_prefill_slots: xs len");
+        let mut h = xs.to_vec();
+        rmsnorm_f32(&mut h, &self.attn_norm, self.eps);
+        let mut a: Vec<f32> = Vec::with_capacity(rows * hd);
+        let mut at = 0usize;
+        for &(slot, r) in segs {
+            self.select_slot(slot);
+            let seg = self.attn.forward_prefill(&h[at * hd..(at + r) * hd], r);
+            a.extend(self.attn_sconv.prefill(&seg, r));
+            at += r;
+        }
+        let mut x1: Vec<f32> = xs.iter().zip(&a).map(|(&xi, &ai)| xi + ai).collect();
+        let mlp_start = start.map(|_| Instant::now());
+        let mut h2 = x1.clone();
+        rmsnorm_f32(&mut h2, &self.mlp_norm, self.eps);
+        let m = match &self.mlp {
+            LayerMlp::Moe(m) => m.forward_batch(&h2, rows),
+            LayerMlp::Dense(d) => {
+                let mut m = vec![0.0f32; rows * hd];
+                for (r, row) in h2.chunks_exact(hd).enumerate() {
+                    m[r * hd..(r + 1) * hd].copy_from_slice(&d.forward(row, hd));
+                }
+                m
+            }
+        };
+        let mut at = 0usize;
+        for &(slot, r) in segs {
+            self.mlp_sconv.select(slot);
+            let ms = self.mlp_sconv.prefill(&m[at * hd..(at + r) * hd], r);
+            for (xi, &mi) in x1[at * hd..(at + r) * hd].iter_mut().zip(&ms) {
+                *xi += mi;
+            }
+            at += r;
+        }
+        self.observe_timing(start, mlp_start, rows, true);
+        x1
+    }
+
     /// Multi-stream decode step: `rows` residual-stream rows (`xs` =
     /// `[rows, hidden]`), row `i` the next token of sequence `slots[i]`.
     /// Attention, the convs and the residuals run per row on that row's slot;

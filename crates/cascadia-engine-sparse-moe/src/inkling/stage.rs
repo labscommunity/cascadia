@@ -408,6 +408,34 @@ impl StagedRunner for InklingRunner {
         self.streams[slot] = Some(pos + rows);
         x
     }
+    fn prefill_streams(&mut self, segs: &[(usize, usize)], hidden: Vec<f32>) -> Vec<f32> {
+        let rows: usize = segs.iter().map(|&(_, r)| r).sum();
+        assert_eq!(
+            hidden.len(),
+            rows * self.hidden,
+            "inkling prefill_streams: bad hidden length"
+        );
+        for (i, &(s, _)) in segs.iter().enumerate() {
+            assert!(
+                self.streams[s].is_some(),
+                "prefill_streams: slot {s} is free"
+            );
+            assert!(
+                !segs[..i].iter().any(|&(o, _)| o == s),
+                "prefill_streams: slot {s} listed twice"
+            );
+        }
+        let mut x = hidden;
+        for l in &mut self.layers {
+            x = l.forward_prefill_slots(&x, segs);
+        }
+        for &(s, r) in segs {
+            if let Some(p) = self.streams[s].as_mut() {
+                *p += r;
+            }
+        }
+        x
+    }
     fn decode_streams(&mut self, hidden: Vec<f32>, slots: &[usize]) -> Vec<f32> {
         let rows = slots.len();
         assert_eq!(
