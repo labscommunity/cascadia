@@ -234,6 +234,15 @@ size of `~/inkling-release/builds/cascadia-<short>` against
 - [ ] Prove the new SPA is inside the binary before staging it: on the miner, `strings ~/inkling-build/target/release/cascadia | grep -c 'waiting for a slot'` prints at least 1 and `strings … | grep -o 'index-[A-Za-z0-9_-]*\.js' | sort -u` prints the new bundle name (`index-Ba7ZRF0b.js` for the 2026-09-21 ship) and **not** `index-DUJ_Gm7o.js`. A miss means the stale-tarball trap bit you.
 - [ ] Stage the binary on the operator machine: `scp miner:inkling-build/target/release/cascadia ~/inkling-release/builds/cascadia-<published-commit>-streams` and record its `sha256`.
 
+> **Done for this ship on 2026-09-21.** Built on the miner from `639f0c02`
+> (the published commit, `fix: preserve expert telemetry and record validated
+> fleet captures`) plus the staged SPA tarball, in 1m44s. Binary: 20 709 672
+> bytes, sha256 `9084392040688eaa6aa9ff6cf6d222f84e24e119e528d91920d12ddd106563c2`,
+> embed proof passed (`waiting for a slot` ×1; bundle `index-Ba7ZRF0b.js`, no
+> `index-DUJ_Gm7o.js`). Staged as `~/inkling-release/builds/cascadia-639f0c02-streams`
+> on the Mac mini. C2 is the only step left; it was blocked by the autolab
+> publisher lock and the lab being down.
+
 ### C2. Publish and verify
 
 `~/inkling-release/bin/release.py` on the Mac mini is sign-and-stage only. It
