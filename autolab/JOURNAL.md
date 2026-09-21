@@ -187,3 +187,28 @@ The branch was rewritten without them and the harness now writes raw telemetry o
 
 Next, in order of return per effort: distil the drafter on this model's outputs (a +0.1 on prose), expert
 parallelism for the lone row as a serving MODE (L -27 %), int4 attention (L -13 %, changes numerics).
+
+## 2026-09-20 evening, iterations 019-029: the goal is now 15 streams
+
+The user re-set the goal: interactive speed for up to 15 streams, ideally 60 tok/s aggregate at 15. Baseline 22.5-23.4
+(019). What the numbers say (PHYSICS.md, "The 15-stream regime"; MOONSHOTS.md, F1-F6): eleven frames of 1.36 rows
+turn around a ring at eleven times its slowest stage; a row costs 19 ms of a stage, the frame itself 16; the byte
+ceiling of this layout is 50-65 tok/s with nothing else in a frame. 60 is not there with exact int4 experts;
+30-35 exact, ~40 with lossy options.
+
+* 024 prompts as 8-row windows (config): first token alone 5 -> 2 s, fifteen at once 31 -> 7 s; 24.2-24.6 tok/s.
+* 020/023: GPU calls from two threads overlap 1.04-1.10x: the per-call fixed cost is on the device; splitting a
+  box's layers between two frames is dead.
+* 021/022/025/026: the plugin's MoE decode kernels. They never crashed: `infer()` throws because group 32 is
+  refused on Xe2+ (swallowed assert), the engine fell back to host experts, the host cache filled the box, the OOM
+  killer did the rest (cache now capped at 1 GiB fleet-wide). With group 64 they work and read at the bus limit,
+  but share no expert between rows: worth +8 % at 15 streams, and group 64 is not exact. 029 goes after the exact
+  route: six compiled `32`s in the plugin become `16`s (the pre-Xe2 configuration of the same code).
+* 027: rank 0's dense layers through the fused-experts op: 51.9 -> 43.7 ms a frame, exact (cosine 0.999999 against
+  the MatMul form); the ring gained 0.5 % because rank 10's head (11.6 ms per CALL) paces it just as much.
+* 028: the last rank shares one head call between decode frames that are already waiting. **Operator error on its
+  first rollout:** the gate and a 15-stream phase were started before the settle check had finished (a build
+  task's "exited with code 0" was misread as the publish task's), requests reached a half-built chain, which then
+  wedged (streams admitted, no replies, ranks 1-2 "waiting for the previous rank") until the next release. Rolled
+  back to 027 within ten minutes, gates pass, re-run pending. Rule: no traffic before "steady 3/3" is on screen.
+  Also worth a fix of its own: requests that arrive while the chain is assembling should be refused, not wedge it.
