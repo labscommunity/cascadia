@@ -49,10 +49,11 @@ def main():
         used = set()
         for record in files:
             data = bytearray((batch / record['file']).read_bytes())
-            if data[:8] != b'INKCAP01':
+            if data[:8] not in (b'INKCAP01', b'INKCAP02'):
                 raise ValueError('bad capture magic')
+            dtype, itemsize = (torch.float16, 2) if data[:8] == b'INKCAP01' else (torch.float32, 4)
             hidden, rank, slot, prompt_rows, sequence = struct.unpack_from('<IIIIQ', data, 8)
-            row_bytes = 8 + 2 * hidden
+            row_bytes = 8 + itemsize * hidden
             if (len(data) - 32) % row_bytes:
                 raise ValueError('incomplete captured record')
             n = (len(data) - 32) // row_bytes
@@ -71,13 +72,15 @@ def main():
             agreement, response = candidates[0]
             i = response['i']; used.add(i)
             ids = torch.tensor(prompts[i] + generated.tolist(), dtype=torch.int64)
-            residuals = torch.stack([torch.frombuffer(data, dtype=torch.float16, count=hidden,
+            residuals = torch.stack([torch.frombuffer(data, dtype=dtype, count=hidden,
                                       offset=32 + p * row_bytes + 8).clone() for p in range(n)])
             if not torch.isfinite(residuals).all():
                 raise ValueError('nonfinite captured residual')
             e = embed[ids].float()
             e = e * torch.rsqrt(e.square().mean(-1, keepdim=True) + eps) * norm
-            save_file({'tokens': ids, 'embed_out': e.half(), 'final_out': residuals, 'argmax': samples},
+            if not torch.isfinite(e).all():
+                raise ValueError('nonfinite normalized embedding')
+            save_file({'tokens': ids, 'embed_out': e, 'final_out': residuals, 'argmax': samples},
                       str(out / ('p%04d.safetensors' % i)),
                       metadata={'i': str(i), 'family': str(response['family']), 'prompt_len': str(prompt_rows),
                                 'source': 'fleet', 'capture': record['file']})

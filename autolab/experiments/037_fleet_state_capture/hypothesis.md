@@ -14,3 +14,13 @@ per frame. Failures stop capture without stopping inference. The unit tests
 cover budget exhaustion and rewinds; the pipeline test covers prompt windows,
 slot reuse, and capture/output-token agreement through the direct reply link.
 Both normal output gates must pass before collecting the 36-prompt corpus.
+
+## First deployment: format correction
+
+Both output gates passed and fifteen-stream throughput was 24.28 / 24.42,
+but a downloaded file contained 1,031 overflowing f16 values in 163 x 6,144
+residuals. The pre-final-norm residual range exceeds 65,504; the normalized
+head inputs do not. No corpus was collected from this format. INKCAP02
+preserves the original f32 residuals, still bounded by 2048 MiB. A new unit
+test round-trips large values bit for bit. MTP reply-link work must either
+carry f32 residuals or normalize before an f16 conversion.

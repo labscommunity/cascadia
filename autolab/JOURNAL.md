@@ -277,3 +277,10 @@ and completed-file downloads through a restricted route on the existing
 entry relay. Capture, readiness, direct-return, head-sharing and speculation
 tests passed. The original 36-prompt corpus and checkpoint are available for
 re-scoring the shipped MTP head on fleet states.
+
+037's first deployed capture format was insufficient: raw residuals before
+the final RMSNorm exceed f16's range. Gates passed (24.28 / 24.42 tok/s at
+15 streams), but downloaded-state validation found infinities in the dump.
+Stopped before collecting the study corpus. INKCAP02 stores original f32
+residuals; regression test includes values outside f16 range. Any future
+12 kB MTP reply must carry normalized states, not raw final residuals.

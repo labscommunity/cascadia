@@ -1,8 +1,10 @@
 //! Bounded, opt-in residual capture. One completed file per stream instance.
 //!
-//! INKCAP01 header (32 bytes, little endian): magic[8], hidden u32,
+//! INKCAP02 header (32 bytes, little endian): magic[8], hidden u32,
 //! pipeline rank u32, slot u32, prompt rows u32, sequence u64.
-//! Each position: sampled next-token i64 (-1 when unsampled), hidden f16[H].
+//! Each position: sampled next-token i64 (-1 when unsampled), hidden f32[H].
+//! Final residuals can exceed f16's range before the final RMSNorm. Preserve
+//! their original f32 values; INKCAP01's f16 conversion could overflow.
 //! Rewinds truncate records; slot reuse creates a new file. Only .bin files
 //! are complete; an I/O or budget failure leaves .part evidence unfinalized.
 use std::collections::HashMap;
@@ -70,7 +72,7 @@ impl StateCapture {
             dir: dir.to_owned(),
             rank,
             hidden,
-            record_bytes: 8 + 2 * hidden as u64,
+            record_bytes: 8 + 4 * hidden as u64,
             budget,
             written,
             sequence: 0,
@@ -111,7 +113,7 @@ impl StateCapture {
                 .write(true)
                 .create_new(true)
                 .open(&path)?;
-            file.write_all(b"INKCAP01")?;
+            file.write_all(b"INKCAP02")?;
             for n in [self.hidden as u32, self.rank, slot as u32, 0] {
                 file.write_all(&n.to_le_bytes())?;
             }
@@ -146,7 +148,7 @@ impl StateCapture {
             for row in hidden.chunks_exact(self.hidden) {
                 bytes.extend_from_slice(&(-1i64).to_le_bytes());
                 for &x in row {
-                    bytes.extend_from_slice(&half::f16::from_f32(x).to_le_bytes());
+                    bytes.extend_from_slice(&x.to_le_bytes());
                 }
             }
             s.file.write_all(&bytes)
@@ -198,7 +200,7 @@ impl StateCapture {
                 let mut line = serde_json::to_vec(&serde_json::json!({
                     "file": finished.file_name().unwrap().to_string_lossy(),
                     "size": size, "rank": self.rank, "slot": slot,
-                    "prompt_rows": s.prompt_rows, "hidden": self.hidden,
+                    "prompt_rows": s.prompt_rows, "hidden": self.hidden, "format": "INKCAP02",
                 }))?;
                 line.push(b'\n');
                 self.reserve(line.len() as u64)?;
@@ -238,14 +240,11 @@ mod tests {
             .find(|p| p.extension().is_some_and(|e| e == "bin"))
             .unwrap();
         let bytes = std::fs::read(path).unwrap();
-        assert_eq!(bytes.len(), 32 + 3 * 12);
-        assert_eq!(&bytes[..8], b"INKCAP01");
+        assert_eq!(bytes.len(), 32 + 3 * 16);
+        assert_eq!(&bytes[..8], b"INKCAP02");
         assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 2);
-        assert_eq!(i64::from_le_bytes(bytes[56..64].try_into().unwrap()), 12);
-        assert_eq!(
-            half::f16::from_le_bytes(bytes[64..66].try_into().unwrap()).to_f32(),
-            7.
-        );
+        assert_eq!(i64::from_le_bytes(bytes[64..72].try_into().unwrap()), 12);
+        assert_eq!(f32::from_le_bytes(bytes[72..76].try_into().unwrap()), 7.);
         c.open(1);
         c.rows(1, 0, &[0., 0.]);
         c.close(1);
@@ -255,7 +254,7 @@ mod tests {
     #[test]
     fn budget_failure_never_finalizes_partial_capture_and_survives_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let mut c = StateCapture::new(dir.path(), 1, 2, 44).unwrap();
+        let mut c = StateCapture::new(dir.path(), 1, 2, 48).unwrap();
         c.open(0);
         c.rows(0, 0, &[1., 2.]);
         c.rows(0, 1, &[3., 4.]);
@@ -267,9 +266,33 @@ mod tests {
             .collect();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].extension().unwrap(), "part");
-        let mut again = StateCapture::new(dir.path(), 1, 2, 44).unwrap();
+        let mut again = StateCapture::new(dir.path(), 1, 2, 48).unwrap();
         again.open(1);
         assert!(again.failed);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn large_pre_norm_residuals_are_preserved_bit_for_bit() {
+        let dir = tempfile::tempdir().unwrap();
+        let values = [100_000.125f32, -900_000.5, f32::MAX, -f32::MIN_POSITIVE];
+        let mut c = StateCapture::new(dir.path(), 10, values.len(), 4096).unwrap();
+        c.open(0);
+        c.rows(0, 0, &values);
+        c.token(0, 0, 7);
+        c.close(0);
+        let row: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(dir.path().join("index.jsonl"))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        let bytes = std::fs::read(dir.path().join(row["file"].as_str().unwrap())).unwrap();
+        for (b, expected) in bytes[40..].chunks_exact(4).zip(values) {
+            assert_eq!(
+                f32::from_le_bytes(b.try_into().unwrap()).to_bits(),
+                expected.to_bits()
+            );
+        }
     }
 }

@@ -239,11 +239,11 @@ async fn captured_final_states_name_the_tokens_returned_by_the_pipeline() {
     for record in records {
         let bytes =
             std::fs::read(capture_dir.path().join(record["file"].as_str().unwrap())).unwrap();
-        assert_eq!(&bytes[..8], b"INKCAP01");
+        assert_eq!(&bytes[..8], b"INKCAP02");
         let width = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
         let prompt = u32::from_le_bytes(bytes[20..24].try_into().unwrap()) as usize;
         assert!(prompt > 3, "test must span prompt windows");
-        let rows: Vec<_> = bytes[32..].chunks_exact(8 + 2 * width).collect();
+        let rows: Vec<_> = bytes[32..].chunks_exact(8 + 4 * width).collect();
         assert!(rows.len() >= prompt);
         for row in &rows[..prompt - 1] {
             assert_eq!(i64::from_le_bytes(row[..8].try_into().unwrap()), -1);
@@ -253,8 +253,8 @@ async fn captured_final_states_name_the_tokens_returned_by_the_pipeline() {
             .map(|r| i64::from_le_bytes(r[..8].try_into().unwrap()))
             .collect();
         assert!(rows.iter().all(|r| r[8..]
-            .chunks_exact(2)
-            .all(|h| half::f16::from_le_bytes(h.try_into().unwrap()).is_finite())));
+            .chunks_exact(4)
+            .all(|h| f32::from_le_bytes(h.try_into().unwrap()).is_finite())));
         captured.push(tokens);
     }
     let mut expected_captures = got.clone();
