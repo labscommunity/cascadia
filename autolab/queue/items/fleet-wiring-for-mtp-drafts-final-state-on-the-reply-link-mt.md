@@ -6,7 +6,7 @@ outcome:
 priority: 5
 target: 15 streams, interactive speed at 3-8 streams
 exact: yes
-needs: multi-day build: export the MTP blocks (int4 MLP, int8 attention), run them on the box that plays rank 0 with their own KV + conv state, final state on the reply link, guess rows for MANY streams in the scheduler, 65k-row draft unembed; start with module 0 only
+needs: multi-day build: export the MTP blocks (int4 MLP, int8 attention), run them on the box that plays rank 0 with their own KV + conv state, final state on the reply link, guess rows for MANY streams in the scheduler, 65k-row draft unembed; start with module 0 only; its first step IS the fleet state capture item (final state written on the last rank / carried on the reply link)
 proposed_by: teammate (spec.md E5) + autolab
 owner: 
 experiment: 

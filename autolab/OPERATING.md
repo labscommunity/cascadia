@@ -189,7 +189,8 @@ been swapped when this was written.
 | operator's Mac, outside the repository | `~/inkling-release/`: `bin/release.py`, `builds/`, `autolab-overrides/` (the REAL overrides, with the proxy's name), `autolab-state/role_swap`, `autolab-telemetry/`, `autolab-notes/`, `manual/`, `publisher.lock/`, `baseline/` |
 | build host (`ssh miner`) | `~/inkling-build` (release builds; do not delete its `target`), `/dev/shm` (scratch, RAM), the read-only export and checkpoint incl. the shipped MTP head |
 | offline studies | `autolab/research/mtp_offline/` (scripts + result tables of the MTP-head and logit-lens study, 033), `crates/cascadia-engine-sparse-moe/examples/inkling_spec_dump.rs` (hidden-state dump) |
-| offline model runs | the Mac Pro (`ssh pro`): the whole export resident on the CPU path, ~0.7 s per token; `~/inkling-spec-offline/` holds the hidden-state dump of the MTP study |
+| where the model runs for studies | **The fleet.** Text, acceptance rates, expert usage and hidden states are measured on the fleet's own numerics (f16 fused experts, int8 attention): its text departs from any other path's after 7-70 tokens, and the heads and drafters will see ITS states. Hidden states come from the fleet state capture (queue item); scoring and training run on the build host. |
+| the Mac Pro (`ssh pro`, whole int4 export resident on the CPU path, ~0.7 s per token) | Only for what the fleet cannot do: (1) a bit-exact CPU REFERENCE of the whole model in one process, for parity work and for looking at ANY tensor of any layer (the fleet only exposes what crosses a rank boundary unless every rank is instrumented and redeployed); (2) work that must go on while the fleet is down or must not be restarted. `~/inkling-spec-offline/` there holds 033's dump. Do not plan new measurements on it otherwise. |
 
 ## 7. Before every publish
 

@@ -94,7 +94,7 @@ on eleven buses of 136 GB/s.
 | their id | what | here | order |
 |---|---|---|---|
 | E4 | the shipped MTP head as-is, scored on this model's own text | = F6's first question. Structure read from the file today: 8 modules, each `embed_norm`, `hidden_norm`, `input_proj [6144, 12288]` and one DENSE Inkling block (attention + MLP 24,576 wide): DeepSeek-V3 style chained depths, 1.3 GB bf16 each (~0.39 GB at int4 MLP + int8 attention = ~3.5 ms per draft on one bus, plus the unembed) | **done (033)**: a1 0.726, a2-a8 0.69-0.85 given the chain so far with context upkeep, 15.4 ms per draft (7.9 with a 65k-row unembed prefix) |
-| E1 | residual dump on the Mac Pro over the 013 corpus | reduced to what E4 and E2 need: final state at every position + the ten rank-boundary residuals at generated positions (not all 66 layers) | **done**: 36 prompts on the Mac Pro, 77 min; tool `examples/inkling_spec_dump.rs` |
+| E1 | residual dump over the 013 corpus (ran on the Mac Pro's CPU path; **from now on: the fleet state capture**, queue) | reduced to what E4 and E2 need: final state at every position + the ten rank-boundary residuals at generated positions (not all 66 layers) | **done**: 36 prompts on the Mac Pro, 77 min; tool `examples/inkling_spec_dump.rs` |
 | E2 | logit lens per rank boundary (the "guess later from a deeper rank" idea) | measured on the same dump; their own prediction is that it fails its bar | **done, closed**: raw lens 0.000 through rank 4 (0.49 at rank 9), tuned lens 0.34-0.39, all below their bars |
 | E3 | a new EAGLE-style head trained on the final state | only if E4 fails its bar (a1 >= 0.7 at <= 25 ms per draft): the shipped head is already trained on the real distribution | not needed for now: the shipped head passes its bar; revisit only if fleet-captured states show it lower |
 | E5 | fleet wiring: the reply carries the final state (12 kB f16), a head drafts on rank 0 | after E4/E3 pass. For F6 it also needs guess rows for MANY streams in the scheduler (today speculation is a lone-stream mode) and F1 first (the head's cost lands on rank 0, the stage everyone waits for) | later |
@@ -102,9 +102,14 @@ on eleven buses of 136 GB/s.
 
 ### Status after 033 and the role swap (2026-09-20 night): what is left, in order
 
+Measurements run on the fleet from here on (the owner's instruction): hidden states through the fleet state capture,
+expert usage through counters on the ranks, text through the API. The Mac Pro stays a CPU reference for parity work
+and any-tensor inspection, nothing else (`OPERATING.md`, section 6).
+
 1. **Reliability first.** The entry box's power (brick / outlet / unit): owner's hands. Requests arriving while the
    chain assembles should be refused, not wedge it (small binary change, queue).
-2. **MTP drafts on the fleet** (F6 / the teammate's E5): export the eight dense MTP blocks (int4 MLP, int8 attention),
+2. **MTP drafts on the fleet** (F6 / the teammate's E5): first the fleet state capture (it is E5a's frame extension
+   and it re-scores the head on the fleet's own states), then export the eight dense MTP blocks (int4 MLP, int8 attention),
    run them on the box that plays rank 0 with their own KV and conv state, carry the final state on the reply link
    (12 kB a row), guess rows for MANY streams in the scheduler (today speculation is a lone-stream mode), a 65k-row
    draft unembed. Start with module 0 only (a1 0.73, 8 ms a draft), measure, then depth.

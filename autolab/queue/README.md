@@ -9,7 +9,7 @@ time: see `../README.md`).
 
     python3 autolab/bench/equeue.py add --title "what changes, in one line" --by "who proposes it" \
         --target "15 streams | single stream | first token | reliability | offline study" \
-        --exact yes|no|n/a --needs "binary change | overrides only | offline, Mac Pro | ..." \
+        --exact yes|no|n/a --needs "binary change | overrides only | offline, build host | ..." \
         --priority 50 --body idea.md          # or --body - to read the body from stdin
     python3 autolab/bench/equeue.py render     # refresh QUEUE.md, commit both
 
@@ -18,7 +18,7 @@ branches that both add items never conflict. Do not number items: `experiments/N
 runs, by the operator, and recorded in the item's `experiment:` field.
 
 The body is free Markdown with these headings; the more of them are filled in, the sooner the item can run:
-**Hypothesis** (why it should help, with the arithmetic), **Method** (what changes: code, env, which ranks),
+**Hypothesis** (why it should help, with the arithmetic; measurements run on the FLEET unless the item says what the fleet cannot do, see `../OPERATING.md` section 6), **Method** (what changes: code, env, which ranks),
 **Prediction** (a number), **Kill** (what result ends it), **Result** (filled in by the operator).
 
 ## Fields

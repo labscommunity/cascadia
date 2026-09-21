@@ -52,3 +52,7 @@ their own KV/conv state, carry the final state on the reply link, and guess rows
 
 Caveats: 36 prompts (3 per family, 477 positions each); CPU int4 path, not the fleet's f16-fused path; the tok/s
 figures are a renewal model at today's L = 466 ms and T = 45 ms with the head's own cost on rank 0 not yet charged.
+
+Follow-ups do not go back to the Mac Pro: the fleet writes its own final and rank-boundary states (queue: fleet state
+capture) and the head is re-scored on those with the same scripts. The Mac Pro remains the CPU reference for parity
+work and any-tensor inspection.

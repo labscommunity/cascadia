@@ -6,7 +6,7 @@ outcome: measurement
 priority: 5
 target: 15 streams, interactive speed at 3-8 streams, single stream
 exact: yes
-needs: offline: Mac Pro dump + miner scoring (background agent running); fleet part blocked on a1 >= 0.7
+needs: DONE offline (033): hidden-state dump on the Mac Pro's CPU path + scoring on the build host. Follow-ups use the fleet state capture instead (queue)
 proposed_by: teammate (spec.md E4/E1) + autolab
 owner: background research agent
 experiment: 033_mtp_offline_study

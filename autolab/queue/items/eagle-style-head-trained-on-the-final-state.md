@@ -6,7 +6,7 @@ outcome:
 priority: 60
 target: single stream, 15 streams
 exact: yes
-needs: only if the shipped MTP head fails its bar; miner GPU; more fleet text (capture route)
+needs: only if the shipped MTP head disappoints on the fleet's own states; training states come from the fleet state capture (no Mac Pro); training on the build host's GPU (8 GB) or CPU
 proposed_by: teammate (spec.md E3)
 owner: 
 experiment: 

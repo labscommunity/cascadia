@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare the Mac Pro CPU-path greedy text with the fleet's corpus text: first-divergence token index.
+"""Compare a CPU-reference-path greedy text (033: dumped on the Mac Pro) with the fleet's corpus text: first-divergence token index.
 
     corpus_compare.py gen.jsonl corpus.jsonl tokenizer.json
 """
