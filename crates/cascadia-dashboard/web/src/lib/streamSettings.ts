@@ -29,9 +29,9 @@ export const DEFAULT_SETTINGS: StreamSettings = {
   cooldownMinS: 1,
   cooldownMaxS: 2,
   temperature: 0,
-  showTileHeader: true,
-  showTileFooter: true,
-  fontSizePx: 12.5,
+  showTileHeader: false,
+  showTileFooter: false,
+  fontSizePx: 10,
   streamResponses: true,
 };
 
