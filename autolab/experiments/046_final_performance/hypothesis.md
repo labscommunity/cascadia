@@ -99,3 +99,13 @@ Continue reverse sweeps and family tests with a persisted limit of 176
 streams. The planned 256-stream repeat and conditional 352 extension remain
 unmeasured; report this failed stress attempt without inferring a universal
 hard engine limit. No release or model configuration changed.
+
+## Exploratory refinement: 88 streams
+
+The initial decode-only profiles show the limiting role at 18.12 ms/row
+with 5.82 rows/frame (64 streams), 21.40 with 8.73 (96), 19.76 with 11.63
+(128), and 17.38 / 17.35 with exactly 16 (the two 176 runs). Test 88 streams,
+eight rows per each of eleven groups, twice before selecting family-test
+concurrency. This may expose a useful batch-size boundary between 64 and
+96; it is a hypothesis, not a confirmed kernel explanation. These extra
+points occur after the original ascending sweep and are labeled exploratory.

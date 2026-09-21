@@ -14,9 +14,11 @@ Two initial 128-stream attempts were excluded: one received an admission 503, an
 
 The 256-stream attempt disconnected during admission. Outstanding requests were cancelled, the unchanged fleet returned to idle, and the correctness gate passed again. The remaining survey was capped at **176 streams**. The planned 256-stream repeats and conditional 352-stream extension were therefore not completed. This is an observed failure, not proof of a hard engine concurrency limit; the measured optimum is bounded by the tested range.
 
-Best observed sustained aggregate: **57.94 tok/s at 176 streams**.
+An **88-stream refinement** was added after the first sweep and the 176-stream repeat: it places eight rows in each of eleven pipeline groups. The observed slowdown above eight rows per group motivated this extra point. Both 88-stream runs occur after the original ascending pass; they are exploratory measurements, with the same token and health checks.
+
+Best observed sustained aggregate: **57.72 tok/s at 176 streams**.
 Smallest tested setting within 95% of that peak: **176 streams**.
-Best observed throughput including startup/drain: **45.37 tok/s at 176 streams**.
+Best observed throughput including startup/drain: **45.24 tok/s at 176 streams**.
 
 These are different objectives from maximizing each user’s speed. Use the latency and per-stream columns to choose an operating point.
 
@@ -38,8 +40,8 @@ These are different objectives from maximizing each user’s speed. Use the late
 | 48 | 1 | 46.01 | 0.96 | 38.24 | 18.72 / 31.24 |
 | 64 | 1 | 53.74 | 0.84 | 42.30 | 25.21 / 47.49 |
 | 96 | 1 | 46.43 | 0.48 | 39.09 | 38.75 / 73.97 |
-| 128 | 1 | 50.36 | 0.39 | 41.79 | 56.42 / 108.73 |
-| 176 | 1 | 57.94 | 0.33 | 45.37 | 77.46 / 164.87 |
+| 128 | 2 | 50.10 | 0.39 | 41.61 | 55.11 / 108.73 |
+| 176 | 2 | 57.72 | 0.33 | 45.24 | 76.83 / 165.34 |
 
 | Minimum sustained tok/s/stream | Highest tested concurrency meeting it |
 |---:|---:|

@@ -22,7 +22,7 @@ import lab
 
 FAMILIES = ['explanation', 'code', 'arithmetic', 'story', 'tips', 'table',
             'rewrite', 'facts', 'poem', 'instructions', 'translation', 'true_false']
-LEVELS = [1, 2, 4, 6, 8, 11, 15, 22, 32, 48, 64, 96, 128, 176, 256]
+LEVELS = [1, 2, 4, 6, 8, 11, 15, 22, 32, 48, 64, 88, 96, 128, 176, 256]
 EXPECTED_RELEASE = 1790016660
 EXPECTED_BINARY = '9084392040688eaa6aa9ff6cf6d222f84e24e119e528d91920d12ddd106563c2'
 EXPECTED_RESTARTS = [2, 5, 5, 4, 3, 3, 3, 2, 0, 1, 1]

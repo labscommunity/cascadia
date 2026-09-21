@@ -109,6 +109,12 @@ def main():
                    'The planned 256-stream repeats and conditional 352-stream extension were '
                    'therefore not completed. This is an observed failure, not proof of a hard '
                    'engine concurrency limit; the measured optimum is bounded by the tested range.','']
+    if (root/'refinement.json').exists():
+        report+=['An **88-stream refinement** was added after the first sweep and the 176-stream '
+                 'repeat: it places eight rows in each of eleven pipeline groups. The observed '
+                 'slowdown above eight rows per group motivated this extra point. Both 88-stream '
+                 'runs occur after the original ascending pass; they are exploratory '
+                 'measurements, with the same token and health checks.','']
     if grouped:
         ns=list(grouped)
         steady=[avg(grouped[n],'steady_aggregate_tok_s') for n in ns]
@@ -139,7 +145,7 @@ def main():
         axes[1].yaxis.set_minor_locator(NullLocator())
         for ax in axes:
             ax.set_xscale('log',base=2);ax.set_xlabel('Concurrent streams')
-            ticks=[n for n in ns if n in [1,2,4,8,15,32,64,128,176,256,352]]
+            ticks=[n for n in ns if n in [1,2,4,8,15,32,64,88,128,176,256,352]]
             ax.set_xticks(ticks);ax.xaxis.set_major_formatter(ScalarFormatter())
             ax.tick_params(axis='x',rotation=35)
         fig.suptitle('Inkling on 11 Panther Lake boxes | '+status,fontsize=13)

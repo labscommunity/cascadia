@@ -1,0 +1,10 @@
+{
+  "added_epoch": 1790029518.082921,
+  "streams": 88,
+  "runs": 2,
+  "rationale": "Eight rows in each of eleven pipeline groups; test observed batch-size dependence between 64 and 96",
+  "timing": "After original ascending pass and 176-stream reverse repeat; before family concurrency selection",
+  "status": "Running after clean boundary pause; mixed_b_c128 completed and API idle confirmed",
+  "boundary_phase": "mixed_b_c128",
+  "pause_type": "intentional client SIGINT after results persisted and all requests completed; no fleet restart"
+}
