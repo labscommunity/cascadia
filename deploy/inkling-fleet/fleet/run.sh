@@ -3,6 +3,47 @@
 set -u
 PREFIX="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 set -a; source "$PREFIX/rank.env"; set +a
+# ---- Role swap: two boxes exchange their PIPELINE roles (rank, layers, API); everything that belongs to the BOX stays
+# where it is: the beacon's rank and the host names it keeps (<fleet>-rank-N), the updater's source, and on the entry
+# box the operator tunnel, the release poller and the file server (their keys were made on that box). Why: the entry
+# box lost power three times under rank 0's load (API, scheduler, draft model, the highest package power of the 25 W
+# boxes); a box without that platform limit takes the role, the entry box keeps a middle rank and relays :8000.
+# ROLE_SWAP="A B" (box ranks) or empty; empty in the repository: autolab/bench/build_role_swap.py writes the run.sh
+# of a swap release. A box of the pair changes role ONLY if it holds the other role's data,
+# verified (role-swap/ready-<role>, written by the sync block of the overrides); every other box only learns where
+# its next rank lives now. BOX_RANK is this box's installed rank, RANK the role it plays.
+ROLE_SWAP=""
+BOX_RANK="$RANK"
+role_swap() {
+  local a b per base r nr nb port
+  set -- $ROLE_SWAP; a="${1:-}"; b="${2:-}"
+  case "$a$b" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$a" != "$b" ] && [ "$a" -lt "$TOTAL" ] && [ "$b" -lt "$TOTAL" ] || return 0
+  # the last rank also holds the output head: not part of this mechanism
+  [ "$a" -lt "$((TOTAL-1))" ] && [ "$b" -lt "$((TOTAL-1))" ] || return 0
+  per=$((LAYER_END - LAYER_START)); [ "$per" -gt 0 ] || return 0
+  r="$BOX_RANK"
+  if [ "$BOX_RANK" = "$a" ] || [ "$BOX_RANK" = "$b" ]; then
+    [ "$BOX_RANK" = "$a" ] && r="$b" || r="$a"
+    if [ ! -e "$PREFIX/role-swap/ready-$r" ]; then
+      echo "role swap: no verified data for role $r on this box (box rank $BOX_RANK): keeping the installed role"
+      r="$BOX_RANK"
+    fi
+  fi
+  if [ "$r" != "$BOX_RANK" ]; then
+    RANK="$r"; LAYER_START=$((r * per)); LAYER_END=$((r * per + per))
+    echo "role swap: box rank $BOX_RANK plays pipeline rank $RANK, layers [$LAYER_START,$LAYER_END)"
+  fi
+  # where the next pipeline rank lives (rank.env: NEXT=<fleet>-rank-<n>:<port>, empty on the last rank)
+  if [ -n "${NEXT:-}" ]; then
+    nr=$((RANK + 1)); nb="$nr"
+    [ "$nr" = "$a" ] && nb="$b"; [ "$nr" = "$b" ] && nb="$a"
+    port="${NEXT##*:}"; base=$((port - BOX_RANK - 1))
+    case "$NEXT" in "$FLEET-rank-"*) NEXT="$FLEET-rank-$nb:$((base + nr))" ;; esac
+  fi
+}
+role_swap
+export BOX_RANK ROLE_SWAP
 # fleet-wide settings pushed from rank 0 by the updater win over this box's own (same on every box by construction)
 if [ -f "$PREFIX/fleet-overrides.env" ]; then set -a; source "$PREFIX/fleet-overrides.env"; set +a; fi
 # Fused MoE IRs for layers that have none yet (CASCADIA_FUSE_LAYERS="36,37,..." from the overrides). The installer
