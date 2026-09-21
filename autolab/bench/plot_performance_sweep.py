@@ -91,6 +91,14 @@ def main():
                    'the reverse sweep and family tests use the same capture-disabled state. '
                    'No worker restarted and no model configuration changed. Repeat differences '
                    'therefore include phrase learning, time/order effects and this instrumentation change.','']
+    stress_path=root/'stress-attempts.json'
+    if stress_path.exists():
+        report += ['Two initial 128-stream attempts were excluded: one received an admission '
+                   '503, and the next received an engine no-progress error before generating '
+                   'tokens. The workers did not restart. A subsequent correctness gate passed; '
+                   'the verified-idle retry then completed all 128 requests without capacity '
+                   'retries. These interruptions are retained in [stress attempts](stress-attempts.json). '
+                   'Completed-run throughput is not an error-rate or reliability estimate.','']
     if grouped:
         ns=list(grouped)
         steady=[avg(grouped[n],'steady_aggregate_tok_s') for n in ns]
@@ -192,6 +200,11 @@ def main():
              'The exact prompts, generated text, per-event token timing and raw fleet telemetry '
              'are retained privately under the operator’s autolab-telemetry directory. '
              'No host names, addresses or raw telemetry are included here.']
+    if (root/'role-diagnostics.csv').exists():
+        report+=['','[Role diagnostics](role-diagnostics.csv) contain numeric compute, memory and '
+                 'fallback observations. Profile windows must fit entirely inside the shared '
+                 'decode interval and contain no admissions. These sampled counters exclude '
+                 'startup and drain; their correlations do not establish causes.']
     (root/'report.md').write_text('\n'.join(report)+'\n')
     print(f'Wrote report, CSV and charts for {len(phases)} completed phases to {root}')
 

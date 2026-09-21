@@ -1,0 +1,24 @@
+{
+  "attempts": [
+    {
+      "phase": "mixed_a_c128",
+      "observed_epoch": 1790027288,
+      "outcome": "excluded: HTTP 503; client now handles only explicit queue/permit capacity with bounded backoff"
+    },
+    {
+      "phase": "mixed_a_c128",
+      "observed_epoch": 1790027628,
+      "outcome": "excluded: no-progress SSE error before tokens after previous cohort cancellation"
+    }
+  ],
+  "recovery": "No worker restarted. Single-stream correctness gate passed at 16:55:40 CDT. One further monitored 128-stream attempt allowed after verified idle cleanup; on repeat backend failure stop escalation and finish remaining lower-load/family data.",
+  "verified_idle_retry": {
+    "outcome": "success",
+    "phase": "mixed_a_c128",
+    "streams": 128,
+    "requests": 128,
+    "tokens": 16384,
+    "capacity_retries": 0,
+    "worker_restarts": 0
+  }
+}
