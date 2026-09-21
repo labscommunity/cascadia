@@ -284,3 +284,10 @@ the final RMSNorm exceed f16's range. Gates passed (24.28 / 24.42 tok/s at
 Stopped before collecting the study corpus. INKCAP02 stores original f32
 residuals; regression test includes values outside f16 range. Any future
 12 kB MTP reply must carry normalized states, not raw final residuals.
+
+During MTP runtime review, found an existing dense-device fallback cycle:
+`forward_rows` called `forward` for one row after a failed GPU attempt,
+and `forward` immediately retried `forward_rows`. The fallback now enters
+the host/per-expert path directly. Three dense/kernel tests, nineteen
+model/parity tests (including HF goldens), and the speculative pipeline
+test passed. This fix is for the next binary; it is not in bf6540ea.

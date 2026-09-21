@@ -1236,7 +1236,11 @@ impl DenseMlp {
         let want = reference(self);
         let (cosine, rel) = match got.as_ref() {
             Some(g) if g.len() == want.len() => {
-                let dot: f64 = g.iter().zip(&want).map(|(a, b)| *a as f64 * *b as f64).sum();
+                let dot: f64 = g
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| *a as f64 * *b as f64)
+                    .sum();
                 let ng: f64 = g.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
                 let nw: f64 = want.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
                 let diff: f64 = g
@@ -1323,7 +1327,7 @@ impl DenseMlp {
         if rows < 2 || self.ov.is_some() || !row_gemm() {
             let mut out = Vec::with_capacity(rows * hidden);
             for row in xs.chunks_exact(hidden) {
-                out.extend(self.forward(row, hidden));
+                out.extend(self.forward_fallback(row, hidden));
             }
             return out;
         }
@@ -1337,9 +1341,12 @@ impl DenseMlp {
 
     /// `down(silu(gate·x) · up·x) · global_scale` for one token (`[hidden]`).
     pub fn forward(&self, x: &[f32], hidden: usize) -> Vec<f32> {
-        if self.ov_dense.is_some() || self.ov_dense_moe.is_some() {
-            return self.forward_rows(x, 1, hidden);
-        }
+        self.forward_rows(x, 1, hidden)
+    }
+
+    /// Device batch paths have already been attempted. Do not re-enter
+    /// `forward_rows`: a failed one-row device call would recurse forever.
+    fn forward_fallback(&self, x: &[f32], hidden: usize) -> Vec<f32> {
         let mut y = match &self.ov {
             Some((lid, ov)) => ov
                 .dense(*lid, x)
@@ -1356,6 +1363,32 @@ impl DenseMlp {
 #[cfg(test)]
 mod prefill_read_tests {
     use super::*;
+
+    #[test]
+    fn failed_dense_device_call_falls_back_once_for_one_row() {
+        let weights = || AnyExpert::EagerF32 {
+            wg: vec![1., 0., 0., 1.],
+            wu: vec![0.5, 0., 0., 0.5],
+            wd: vec![1., 0., 0., 1.],
+        };
+        let reference = DenseMlp::new(weights(), 2, 0.25);
+        let mut candidate = DenseMlp::new(weights(), 2, 0.25);
+        let missing = tempfile::tempdir().unwrap();
+        let device = Arc::new(super::super::ov_moe::OvMoe::new(
+            missing.path().to_owned(),
+            "CPU".into(),
+            2,
+            1,
+            1,
+            None,
+            None,
+        ));
+        candidate.attach_ov_dense_moe(0, device, 1);
+        let input = [0.5, -0.25];
+        let expected = reference.forward(&input, 2);
+        assert_eq!(candidate.forward(&input, 2), expected);
+        assert_eq!(candidate.forward_rows(&input, 1, 2), expected);
+    }
 
     #[test]
     fn streamed_prefill_preserves_real_int4_bits_across_multiple_cohorts() {
