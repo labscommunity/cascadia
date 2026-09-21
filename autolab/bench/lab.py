@@ -253,7 +253,8 @@ def cmd_reference(a):
 
 def gate():
     """Greedy outputs vs the recorded reference. Returns (ok, details). Garbage has fine tok/s, so this runs before every timing."""
-    ref = json.load(open(os.path.join(HERE, "reference.json")))
+    with open(os.path.join(HERE, "reference.json")) as f:
+        ref = json.load(f)
     res = []
     for i in GATE_PROMPTS:
         r = chat(i, GATE_TOKENS, timeout=600)
@@ -266,6 +267,8 @@ def gate():
         bad = ("error" in r) or not got.strip() or "!!!!" in got or len(set(got)) < 6
         res.append(dict(i=i, match_chars=common, of=len(want), exact=got == want, broken=bad, tok_s=r.get("tok_s"),
                         ttft_s=r.get("ttft_s"), text=got[:120], error=r.get("error")))
+        if "error" in r:
+            break  # Do not send the next gate request into an unreachable fleet.
     ok = all(not x["broken"] for x in res) and sum(1 for x in res if x["match_chars"] >= min(40, x["of"])) >= 2
     return ok, res
 
@@ -481,7 +484,11 @@ def cmd_bench(a):
         for spec in a.phases:
             f = spec.split(":"); name, streams, tokens = f[0], int(f[1]), int(f[2]); pw = int(f[3]) if len(f) > 3 else a.prompt_words
             results.append(run_phase(name, streams, tokens, pw, a.cap))
-            json.dump(results, open(os.path.join(d, "phases.json"), "w"), indent=1)
+            with open(os.path.join(d, "phases.json"), "w") as output:
+                json.dump(results, output, indent=1)
+            if results[-1]["errors"] or results[-1]["completed"] != streams:
+                log("STOP: phase failed or incomplete; no further benchmark traffic")
+                return 5
             time.sleep(12)  # the ranks report a request's last profile window when they go idle
     finally:
         tel.stop_ev.set(); tel.join(5)
@@ -497,10 +504,15 @@ def cmd_run(a):
     d = os.path.join(LAB, "experiments", a.exp); os.makedirs(d, exist_ok=True)
     if a.warm_streams:
         # A restart empties every rank's resident expert copy: touch many experts before anything is timed.
-        run_phase("warmup", a.warm_streams, 24, 0, a.cap)
+        warm = run_phase("warmup", a.warm_streams, 24, 0, a.cap)
+        if warm["errors"] or warm["completed"] != a.warm_streams:
+            log("STOP: warmup failed or incomplete; no gate or benchmark traffic")
+            return 5
     for w in range(a.warm):
         r = chat(3 + w, 24, timeout=600)
         log("warm %d: %s tok/s, ttft %s, %s" % (w, r.get("tok_s"), r.get("ttft_s"), r.get("error") or repr(r.get("text", "")[:50])))
+        if "error" in r:
+            return 5
     ok, res = gate()
     json.dump(dict(ok=ok, prompts=res), open(os.path.join(d, "gate.json"), "w"), indent=1)
     for x in res:

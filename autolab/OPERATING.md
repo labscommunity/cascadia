@@ -176,6 +176,10 @@ been swapped when this was written.
   `release.py status` says `STALE` with a growing age. Everything stops: the pipeline needs all eleven boxes, and the
   door is on that box. Only a person on site can power-cycle it. Stop all traffic and tell the owner; do not retry
   in a loop.
+  A future-dated report can have a negative apparent age while already stale (seen again during 040).
+  Check whether its signed timestamp advances across observations; a negative age is not proof of freshness.
+  The harness now stops after an incomplete/failed phase or warmup and after a serial gate transport error;
+  it still waits for active requests to hit their timeout unless the operator stops the process.
 * **After it is back**: the workers re-assemble by themselves. Check `release.py status`: if the age is absurd
   (weeks) or negative, the box's clock was reset. `publish.py` stamps the fleet's manifest with that clock and every
   updater refuses a manifest older than the last one it applied, so **no release rolls out until the clock is right**.

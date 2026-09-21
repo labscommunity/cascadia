@@ -356,3 +356,9 @@ No fleet measurement is claimed and no release has been published after
 the outage. Shared-bank EP sessions passed all twenty EP tests, including
 concurrent drivers, peer error/disconnect isolation and bank reuse; the
 multi-driver fleet topology and reshard remain unimplemented.
+
+Harness follow-up from the outage: benchmark phases previously returned success
+and continued after failed requests. They now save the failed/incomplete phase,
+return nonzero and send no later phases. Warmup failures stop before gates;
+a serial gate transport error stops its remaining prompts. Three regression
+tests passed. Active requests still need timeout or operator termination.
