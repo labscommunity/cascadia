@@ -375,3 +375,29 @@ needed for that scoped trial. A single signed-status check after the update
 still returned the exact frozen outage report (epoch 1789974050), so no
 traffic or release was attempted. The owner will report back after checking
 the entry box on site. Keep fleet traffic and publishing stopped until then.
+
+## 2026-09-21: Streams dashboard deployment prepared; entry clock blocks publishing
+
+The owner requested deployment of the other agent's dashboard update. The
+current checkout is `7ac7bfb5`, with the Streams UI incorporated into the
+branch. The prepared `cascadia-639f0c02-streams` binary retains the currently
+deployed engine and embeds the new dashboard; it is 20,709,672 bytes with
+SHA-256 `9084392040688eaa6aa9ff6cf6d222f84e24e119e528d91920d12ddd106563c2`.
+Verified the ELF architecture, embedded `index-Ba7ZRF0b.js`, rollback binary,
+publisher ownership, and absence of another benchmark/publisher process.
+`npm ci --no-audit --no-fund && npm run build` passed, including TypeScript
+checking. All 23 rebuilt dashboard files match the staged dashboard archive
+byte for byte. The signed-channel deployment dry run passed; the intended
+release changes only `cascadia`, retaining the current overrides and int8
+attention.
+
+Signed status now advances, so the entry box's reporting path has returned.
+However, it reports July 27 while the operator's date is September 21.
+Its fleet manifest is still version 1789973512 from before the outage.
+Publishing with this clock would produce a version older than the one the
+updaters already accepted. No release or inference traffic was sent. Asked
+the owner to set the installed rank-0 entry box's current UTC system time
+at its console, as OPERATING section 5 describes. Once corrected, publish
+the verified binary, wait for all eleven workers to settle, run correctness
+gates, and verify `/streams` serves the new bundle. The prior binary
+`cascadia-639f0c02` remains the rollback for this dashboard-only release.
