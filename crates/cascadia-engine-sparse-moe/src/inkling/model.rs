@@ -197,6 +197,25 @@ impl Layer {
         }
     }
 
+    /// Run a dense layer's MLP through the fused-experts op (see
+    /// [`super::moe::DenseMlp::attach_ov_dense_moe`]), checked against the
+    /// path it replaces; `false` = it disagreed and was detached.
+    pub fn attach_ov_dense_moe(
+        &mut self,
+        layer: u32,
+        ov: Arc<super::ov_moe::OvMoe>,
+        slices: usize,
+        hidden: usize,
+    ) -> bool {
+        match &mut self.mlp {
+            LayerMlp::Dense(d) => {
+                d.attach_ov_dense_moe(layer, ov, slices);
+                d.check_dense_moe(hidden)
+            }
+            _ => true,
+        }
+    }
+
     pub fn is_dense(&self) -> bool {
         matches!(self.mlp, LayerMlp::Dense(_))
     }

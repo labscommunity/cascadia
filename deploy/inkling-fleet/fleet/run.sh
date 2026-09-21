@@ -491,8 +491,11 @@ gen_fused_irs "${CASCADIA_FUSE_LAYERS:-}" 32 || true
 gen_fused_irs "${CASCADIA_FUSE_DECODE_LAYERS:-}" "${CASCADIA_FUSE_GROUP:-64}" || true
 # The dense layers' MLP (rank 0) as one device call for all rows of a frame (CASCADIA_FUSE_DENSE="0,1"): same
 # generator, same rules (scratch folder, moved into place when complete, a failure is marked and tolerated).
+# CASCADIA_FUSE_DENSE_MOE="0,1" writes the same MLP once more as an all-slices-active fused-experts layer
+# (dense_moe_ov/): the form in which this GPU reads 4-bit weights three to four times faster (autolab 027).
 gen_dense_irs() {
-  local want="${CASCADIA_FUSE_DENSE:-}" py l nn dst tmp
+  # $1 = layers, $2 = generator flag, $3 = folder under model/
+  local want="${1:-}" flag="$2" sub="$3" py l nn dst tmp mark
   [ -n "$want" ] || return 0
   py=$(command -v python3) || return 0
   [ -d "$PREFIX/pylib" ] || return 0
@@ -501,22 +504,24 @@ gen_dense_irs() {
   for l in ${want//,/ }; do
     case "$l" in ''|*[!0-9]*) continue ;; esac
     [ "$l" -ge "${LAYER_START:-0}" ] && [ "$l" -lt "${LAYER_END:-0}" ] || continue
-    nn=$(printf %02d "$l"); dst="$PREFIX/model/dense_ov/layer_$nn"
+    nn=$(printf %02d "$l"); dst="$PREFIX/model/$sub/layer_$nn"; mark="$PREFIX/logs/dense-ir.failed-$nn"
+    [ "$sub" = "dense_ov" ] || mark="$PREFIX/logs/dense-ir.failed-$sub-$nn"
     [ -s "$dst/openvino_model.xml" ] && [ -s "$dst/openvino_model.bin" ] && continue
-    [ -e "$PREFIX/logs/dense-ir.failed-$nn" ] && [ "${CASCADIA_FUSE_RETRY:-0}" != 1 ] && continue
+    [ -e "$mark" ] && [ "${CASCADIA_FUSE_RETRY:-0}" != 1 ] && continue
     write_generator "$PREFIX/tools/inkling_moe_layer_ov.py"
     rm -rf "$tmp"; mkdir -p "$tmp"
-    echo "dense IRs: generating layer $l"
+    echo "dense IRs: generating layer $l ($sub)"
     if PYTHONPATH="$PREFIX/pylib" timeout 600 "$py" "$PREFIX/tools/inkling_moe_layer_ov.py" --src "$PREFIX/model" --out "$tmp" \
-         --layers "$l" --dense >> "$PREFIX/logs/fused-ir.log" 2>&1 && [ -s "$tmp/dense_ov/layer_$nn/openvino_model.bin" ]; then
-      mkdir -p "$PREFIX/model/dense_ov"; rm -rf "$dst"; mv "$tmp/dense_ov/layer_$nn" "$dst" && echo "dense IRs: layer $l ready"
+         --layers "$l" "$flag" >> "$PREFIX/logs/fused-ir.log" 2>&1 && [ -s "$tmp/$sub/layer_$nn/openvino_model.bin" ]; then
+      mkdir -p "$PREFIX/model/$sub"; rm -rf "$dst"; mv "$tmp/$sub/layer_$nn" "$dst" && echo "dense IRs: layer $l ready ($sub)"
     else
-      echo "dense IRs: layer $l failed (see $PREFIX/logs/fused-ir.log); it stays on the CPU"; : > "$PREFIX/logs/dense-ir.failed-$nn"
+      echo "dense IRs: layer $l failed (see $PREFIX/logs/fused-ir.log); it keeps its previous path"; : > "$mark"
     fi
     rm -rf "$tmp"
   done
 }
-gen_dense_irs || true
+gen_dense_irs "${CASCADIA_FUSE_DENSE:-}" --dense dense_ov || true
+gen_dense_irs "${CASCADIA_FUSE_DENSE_MOE:-}" --dense-as-moe dense_moe_ov || true
 # side-by-side OpenVINO runtime for this process only
 if [ -n "${OVDIR:-}" ] && [ -f "$OVDIR/setupvars.sh" ]; then set +u; source "$OVDIR/setupvars.sh" > /dev/null; set -u; fi
 args=(worker --rank "$RANK" --total "$TOTAL" --engine sparse-moe --device CPU --model "$PREFIX/model"

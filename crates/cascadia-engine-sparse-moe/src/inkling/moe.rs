@@ -1150,6 +1150,9 @@ pub struct DenseMlp {
     ov: Option<(u32, Arc<super::ov_expert::OvExperts>)>,
     /// Optional all-rows-in-one-call device backend ([`super::ov_dense`]).
     ov_dense: Option<(u32, Arc<super::ov_dense::OvDense>)>,
+    /// The same MLP as an all-slices-active fused-experts layer
+    /// (`(layer, backend, slices)`, see [`Self::attach_ov_dense_moe`]).
+    ov_dense_moe: Option<(u32, Arc<super::ov_moe::OvMoe>, usize)>,
 }
 
 impl DenseMlp {
@@ -1160,7 +1163,117 @@ impl DenseMlp {
             global_scale,
             ov: None,
             ov_dense: None,
+            ov_dense_moe: None,
         }
+    }
+
+    /// Run this MLP through the GPU plugin's fused-experts op: the inner
+    /// neurons cut into `slices` "experts" as wide as a routed one, every row
+    /// selecting all of them with weight 1 (`tools/inkling_moe_layer_ov.py
+    /// --dense-as-moe`, `<model>/dense_moe_ov`). `down(silu(gate x) * up x)`
+    /// is a sum over inner neurons, so the slices add up to the same vector and
+    /// no weight is requantised. Why: three compressed MatMuls 24,576 wide read
+    /// their 4-bit weights at ~26 GB/s on the Arc B390 (9.6 ms a layer per
+    /// frame), the fused op reads the same bytes at > 80 GB/s, and the two
+    /// dense layers made rank 0 the slowest stage of the pipeline.
+    pub fn attach_ov_dense_moe(
+        &mut self,
+        layer: u32,
+        ov: Arc<super::ov_moe::OvMoe>,
+        slices: usize,
+    ) {
+        self.ov_dense_moe = Some((layer, ov, slices));
+    }
+
+    /// `rows` rows through the fused-experts form; `None` = not attached or
+    /// the device call failed (the next backend runs). Without `global_scale`.
+    pub fn dense_moe_rows(&self, xs: &[f32], rows: usize) -> Option<Vec<f32>> {
+        let (lid, ov, slices) = self.ov_dense_moe.as_ref()?;
+        let ids: Vec<i32> = (0..rows).flat_map(|_| 0..*slices as i32).collect();
+        let w = vec![1.0f32; rows * slices];
+        ov.forward(*lid, xs, rows, &ids, &w)
+    }
+
+    /// The three-MatMul device form, for the load-time comparison.
+    pub fn dense_ov_rows(&self, xs: &[f32], rows: usize) -> Option<Vec<f32>> {
+        let (lid, ov) = self.ov_dense.as_ref()?;
+        ov.forward(*lid, xs, rows)
+    }
+
+    /// Once at load: the fused-experts form against the form it replaces (the
+    /// three-MatMul device call, else the host kernel) on two synthetic rows,
+    /// and what a call of each costs (median of 17, microseconds). Goes out on
+    /// a "stage profile" line; a form that disagrees (cosine <= 0.9999) is
+    /// detached and the previous path keeps running.
+    pub fn check_dense_moe(&mut self, hidden: usize) -> bool {
+        let Some((lid, _, _)) = self.ov_dense_moe.as_ref() else {
+            return true;
+        };
+        let lid = *lid;
+        let rows = 2usize;
+        let x: Vec<f32> = (0..rows * hidden)
+            .map(|i| ((i as f32 * 0.37).sin() + (i as f32 * 0.011).cos()) * 0.05)
+            .collect();
+        let reference = |me: &Self| -> Vec<f32> {
+            me.dense_ov_rows(&x, rows).unwrap_or_else(|| {
+                x.chunks_exact(hidden)
+                    .flat_map(|r| me.w.forward(r, hidden, me.inter))
+                    .collect()
+            })
+        };
+        let median = |f: &dyn Fn() -> bool| -> u128 {
+            let mut us: Vec<u128> = (0..20)
+                .filter_map(|i| {
+                    let t0 = std::time::Instant::now();
+                    let ok = f();
+                    (i >= 3 && ok).then(|| t0.elapsed().as_micros())
+                })
+                .collect();
+            us.sort_unstable();
+            us.get(us.len() / 2).copied().unwrap_or(0)
+        };
+        let got = self.dense_moe_rows(&x, rows);
+        let want = reference(self);
+        let (cosine, rel) = match got.as_ref() {
+            Some(g) if g.len() == want.len() => {
+                let dot: f64 = g.iter().zip(&want).map(|(a, b)| *a as f64 * *b as f64).sum();
+                let ng: f64 = g.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+                let nw: f64 = want.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+                let diff: f64 = g
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                if ng > 0.0 && nw > 0.0 {
+                    (dot / (ng * nw), diff / nw)
+                } else {
+                    (0.0, 1.0)
+                }
+            }
+            _ => (0.0, 1.0),
+        };
+        let x1 = &x[..hidden];
+        let moe1 = median(&|| self.dense_moe_rows(x1, 1).is_some());
+        let moe2 = median(&|| self.dense_moe_rows(&x, 2).is_some());
+        let ref1 = median(&|| self.dense_ov_rows(x1, 1).is_some());
+        let ref2 = median(&|| self.dense_ov_rows(&x, 2).is_some());
+        let ok = cosine.is_finite() && cosine > 0.9999;
+        tracing::info!(target: "cascadia::inkling", event = "dense_moe_check", layer = lid, cosine, rel, moe1_us = moe1 as u64, ref1_us = ref1 as u64, ok);
+        let line = format!(
+            "DM{lid} probe stage profile layer={lid} cos_ppm={} rel_ppm={} moe1_us={moe1} moe2_us={moe2} ref1_us={ref1} ref2_us={ref2} ok={}",
+            (cosine.clamp(0.0, 1.0) * 1e6) as u64,
+            (rel.clamp(0.0, 1.0) * 1e6) as u64,
+            u8::from(ok)
+        );
+        for _ in 0..3 {
+            println!("{line}");
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        if !ok {
+            self.ov_dense_moe = None;
+        }
+        ok
     }
 
     /// Run this MLP's rows on the device backend (see [`super::ov_dense`]).
@@ -1193,6 +1306,12 @@ impl DenseMlp {
     /// dense layers cost more per row than its four MoE layers and made it the
     /// slowest stage of the fleet.
     pub fn forward_rows(&self, xs: &[f32], rows: usize, hidden: usize) -> Vec<f32> {
+        if let Some(mut y) = self.dense_moe_rows(xs, rows) {
+            for v in y.iter_mut() {
+                *v *= self.global_scale;
+            }
+            return y;
+        }
         if let Some((lid, ov)) = self.ov_dense.as_ref() {
             if let Some(mut y) = ov.forward(*lid, xs, rows) {
                 for v in y.iter_mut() {
@@ -1218,7 +1337,7 @@ impl DenseMlp {
 
     /// `down(silu(gate·x) · up·x) · global_scale` for one token (`[hidden]`).
     pub fn forward(&self, x: &[f32], hidden: usize) -> Vec<f32> {
-        if self.ov_dense.is_some() {
+        if self.ov_dense.is_some() || self.ov_dense_moe.is_some() {
             return self.forward_rows(x, 1, hidden);
         }
         let mut y = match &self.ov {

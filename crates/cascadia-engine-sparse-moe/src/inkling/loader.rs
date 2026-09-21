@@ -687,6 +687,39 @@ pub fn load_stage(
             }
         }
     }
+    // The dense layers through the GPU plugin's fused-experts op
+    // (`CASCADIA_INKLING_OV_DENSE_MOE=1` + `<model>/dense_moe_ov`): the form
+    // that reads 4-bit weights fastest on this device. Attached after the
+    // three-MatMul form so the load-time check compares the two.
+    if super::env_flag("CASCADIA_INKLING_OV_DENSE_MOE") {
+        let ddir = dir.join("dense_moe_ov");
+        let slices = if m.moe_intermediate > 0 && m.dense_intermediate.is_multiple_of(m.moe_intermediate) {
+            m.dense_intermediate / m.moe_intermediate
+        } else {
+            0
+        };
+        if ddir.is_dir() && slices > 0 {
+            let device = std::env::var("CASCADIA_INKLING_OV_MOE_DEVICE").unwrap_or_else(|_| "GPU".into());
+            let ov = std::sync::Arc::new(super::ov_moe::OvMoe::new(
+                ddir, device, hidden, slices, slices, None, None,
+            ));
+            for (i, l) in layers.iter_mut().enumerate() {
+                let lid = (lo + i) as u32;
+                if l.is_dense() && ov.has_layer(lid) {
+                    let t0 = std::time::Instant::now();
+                    let ok = ov.warm(lid)
+                        && l.attach_ov_dense_moe(lid, std::sync::Arc::clone(&ov), slices, hidden);
+                    tracing::info!(
+                        target: "cascadia::inkling",
+                        event = "ov_dense_moe_warm",
+                        layer = lid,
+                        ok,
+                        secs = t0.elapsed().as_secs_f64(),
+                    );
+                }
+            }
+        }
+    }
     // Optional OpenVINO attention-projection backend (`CASCADIA_INKLING_OV_ATTN=1`
     // + `<model>/attn_ov`), layers that have IRs.
     if let Some(ov) = super::ov_attn::OvAttn::from_env(dir) {
