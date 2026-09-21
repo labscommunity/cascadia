@@ -346,3 +346,13 @@ disjoint splits, a learnable synthetic feature transition and zero-adapter
 parity/backpropagation. A synthetic CUDA forward/backward through the real
 frozen quantized MTP block also passed at 1.8 GiB peak allocated memory.
 No held-out sequence was used for gradients; no training has started.
+
+Offline preparation while the fleet door is down: 044 now has a default-off
+CPU/GPU overlap probe using independent attention KV/conv scratch and actual
+normalization/router kernels. Its non-perturbation test, nineteen model/HF
+parity tests, speculative-token exactness test and EP timeout test passed.
+Its role-5 once-only wrapper passed Docker rank/no-retry/start-cutoff checks.
+No fleet measurement is claimed and no release has been published after
+the outage. Shared-bank EP sessions passed all twenty EP tests, including
+concurrent drivers, peer error/disconnect isolation and bank reuse; the
+multi-driver fleet topology and reshard remain unimplemented.

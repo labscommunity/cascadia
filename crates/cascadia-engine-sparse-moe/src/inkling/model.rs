@@ -534,6 +534,30 @@ impl Layer {
     }
 }
 
+impl Layer {
+    /// Synthetic, CPU-only attention/normalization/router work for a diagnostic
+    /// overlap bound. Independent scratch means no real sequence is advanced.
+    pub(super) fn cpu_overlap_work(&self, rows: usize, context: usize) -> impl FnMut() + Send + '_ {
+        let mut attention = self.attn.cpu_probe(rows, context);
+        let input: Vec<f32> = (0..rows * self.hidden)
+            .map(|i| ((i % 29) as f32 - 14.0) * 0.01)
+            .collect();
+        move || {
+            let mut h = input.clone();
+            rmsnorm_f32(&mut h, &self.attn_norm, self.eps);
+            std::hint::black_box(attention.step());
+            // GPU projections/residual outputs are deliberately absent: this
+            // is independent host work, not an end-to-end alternate forward.
+            rmsnorm_f32(&mut h, &self.mlp_norm, self.eps);
+            if let Some(moe) = self.moe() {
+                for row in h.chunks_exact(self.hidden) {
+                    std::hint::black_box(moe.route_unobserved(row));
+                }
+            }
+        }
+    }
+}
+
 /// A `vocab × hidden` edge table (embedding or unembed) held as exact f32 or
 /// bf16 bits (the checkpoint dtype — lossless for bf16 weights and half the
 /// RAM), or a read-only mapped BF16 table for sparse embedding lookups.

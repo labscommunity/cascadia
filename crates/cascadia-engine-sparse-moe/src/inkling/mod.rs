@@ -67,6 +67,7 @@ pub fn rmsnorm_f32(x: &mut [f32], w: &[f32], eps: f32) {
 
 pub mod attn;
 pub mod conv;
+mod cpu_overlap;
 pub mod ep;
 pub mod ep_fused;
 pub mod ep_placement;

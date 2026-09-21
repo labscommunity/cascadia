@@ -6,12 +6,12 @@ outcome:
 priority: 70
 target: single stream
 exact: yes
-needs: large: multi-driver expert servers, 43 GB re-shard per box; 018 showed this LAN carries it for ONE stream only
+needs: shared-bank multi-session foundation passes 20 tests; bounded listeners, staged drivers, compact shard preparation and fleet cost/parity still pending
 proposed_by: autolab session 2026-09-20
-owner: 
-experiment: 
+owner: autolab-continuation-20260921
+experiment: 045_expert_parallel_serving
 created: 2026-09-20
-updated: 2026-09-20
+updated: 2026-09-21
 ---
 
 ## Hypothesis

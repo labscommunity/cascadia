@@ -741,6 +741,103 @@ impl AttentionLayer {
     }
 }
 
+/// Private scratch for an opt-in overlap measurement. Borrows only weights;
+/// no serving KV/conv state or projections are touched.
+pub(super) struct CpuProbe<'a> {
+    ctx: AttnCtx<'a>,
+    slots: Vec<CpuProbeSlot>,
+    context: usize,
+    q: Vec<f32>,
+    kr: Vec<f32>,
+    vr: Vec<f32>,
+    r: Vec<f32>,
+}
+
+struct CpuProbeSlot {
+    k: Vec<f32>,
+    v: Vec<f32>,
+    kc: ShortConv,
+    vc: ShortConv,
+}
+
+impl AttentionLayer {
+    pub(super) fn cpu_probe(&self, rows: usize, context: usize) -> CpuProbe<'_> {
+        assert!((1..=2).contains(&rows));
+        let context = context.min(self.rows.saturating_sub(1));
+        let cache_rows = context + 1;
+        let kd = self.dims.n_kv_heads * self.dims.head_dim;
+        let values = |n: usize| {
+            (0..n)
+                .map(|i| ((i % 31) as f32 - 15.0) * 0.01)
+                .collect::<Vec<_>>()
+        };
+        let kr = values(kd);
+        let vr = values(kd);
+        let slots = (0..rows)
+            .map(|_| {
+                let mut kc = ShortConv::new(self.k_sconv.w().to_vec(), kd, self.k_sconv.k());
+                let mut vc = ShortConv::new(self.v_sconv.w().to_vec(), kd, self.v_sconv.k());
+                for _ in 0..3 {
+                    kc.decode(&kr);
+                    vc.decode(&vr);
+                }
+                CpuProbeSlot {
+                    k: values(kd * cache_rows),
+                    v: values(kd * cache_rows),
+                    kc,
+                    vc,
+                }
+            })
+            .collect();
+        CpuProbe {
+            ctx: AttnCtx {
+                dims: &self.dims,
+                scale: self.scale,
+                rows: cache_rows,
+                relpos: &self.relpos,
+                q_norm: &self.w.q_norm,
+                k_norm: &self.w.k_norm,
+            },
+            slots,
+            context,
+            q: values(self.dims.n_heads * self.dims.head_dim),
+            r: values(self.dims.n_heads * self.dims.d_rel),
+            kr,
+            vr,
+        }
+    }
+}
+
+impl CpuProbe<'_> {
+    pub(super) fn step(&mut self) -> Vec<f32> {
+        use rayon::prelude::*;
+        let run = |slot: &mut CpuProbeSlot| {
+            slot.kc.truncate(3);
+            slot.vc.truncate(3);
+            let kc = slot.kc.decode(&self.kr);
+            let v = slot.vc.decode(&self.vr);
+            let (mut len, mut hwm) = (self.context, self.context);
+            attend_state(
+                &self.ctx,
+                &mut slot.k,
+                &mut slot.v,
+                &mut len,
+                &mut hwm,
+                self.q.clone(),
+                kc,
+                &v,
+                &self.r,
+            )
+        };
+        let outputs: Vec<Vec<f32>> = if self.slots.len() > 1 && row_parallel_attention() {
+            self.slots.par_iter_mut().map(run).collect()
+        } else {
+            self.slots.iter_mut().map(run).collect()
+        };
+        outputs.into_iter().flatten().collect()
+    }
+}
+
 /// What [`attend_state`] reads of a layer besides one sequence's state.
 struct AttnCtx<'a> {
     dims: &'a AttnDims,

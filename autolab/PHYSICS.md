@@ -258,8 +258,7 @@ and 4.8 for two (026, 029: no gain, and they share no expert between rows); two 
 | round = the larger | 571 | 527 | 507 | **532** | 557 | 630 |
 | tok/s (15 / round) | 26.3 | 28.5 | 29.6 | **28.2** | 26.9 | 23.8 |
 
-Measured at F = 11: rounds of 544-556 ms, 27 tok/s raw, 24-25 as the sum of the streams' own rates. F = 10 might be
-worth 5 % (`CASCADIA_STREAMS_INFLIGHT=10`, untested); nothing else in the grouping is. This is why making rank 0
+Measured at F = 11: rounds of 544-556 ms, 27 tok/s raw, 24-25 as the sum of the streams' own rates. F = 10 was tested in 034: no gain at 15 streams and -4.6% at 176; keep eleven. This is why making rank 0
 faster (027: -8 ms) returned 0.5 %, and why sharing head calls, which makes a reply wait for another frame's layers,
 lost 2.5 % (028): the ring is a closed loop, and a late reply is a late next frame.
 
@@ -281,3 +280,18 @@ experts on these boxes.
 39-42 ms. The entry box, doing a middle rank's work since the role swap (032), needs 44 ms and 20.0 W where its seven
 identical siblings need 39-41 ms and 17-19 W: a unit or power-supply problem, the same box that lost all power three
 times in one day.
+
+### Later fleet qualification (034–041)
+
+034 falsified the ten-frame gain predicted above: 15-stream throughput was
+flat and 176-stream throughput fell 4.6%. 039 measured the shipped MTP head
+on actual fleet states: 0.668 first-draft agreement, or 0.644 on the planned
+int4/int8/65k deployment grids, below the 0.70 qualification bar. Runtime
+projections based on 033 CPU states remain hypotheses, not serving results.
+
+041 measured int4 attention projections at 0.77–0.81 ms per layer versus
+1.30–1.35 ms for int8 (one/two rows, role 5). Unlike the earlier dense/head
+FC shapes, these int4 kernels are faster. Extrapolation suggests 3.0–3.5 ms
+saved per six-layer frame; no fleet gain has been measured. Projection RMS
+difference is 9.6–9.7%, so a numerical quality decision is required before
+serving these weights. The current attention remains int8.

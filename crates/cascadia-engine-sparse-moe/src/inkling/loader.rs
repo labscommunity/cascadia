@@ -796,6 +796,15 @@ pub fn load_stage(
             );
         }
     }
+    if super::env_flag("CASCADIA_INKLING_CPU_OVERLAP_BENCH") {
+        if let Some(moe) = bench_moe.as_ref() {
+            if let Err(error) = super::cpu_overlap::run(
+                &layers, lo, moe, m.hidden_size, m.num_experts, m.n_shared_experts, m.top_k,
+            ) {
+                eprintln!("[inkling] CPU-overlap diagnostic stopped: {error}");
+            }
+        }
+    }
     if super::env_flag("CASCADIA_INKLING_EXPERT_COUNTS") {
         let mut reporter = super::expert_counts::Reporter::default();
         for (i, layer) in layers.iter_mut().enumerate() {
