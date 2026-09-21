@@ -90,6 +90,9 @@ export function Streams() {
               stream={s}
               running={snapshot.aggregate.running}
               emptyText={emptyText}
+              showHeader={snapshot.settings.showTileHeader}
+              showFooter={snapshot.settings.showTileFooter}
+              fontSizePx={snapshot.settings.fontSizePx}
               runner={runner}
             />
           ))}

@@ -14,7 +14,7 @@
 // in-flight request and wake the pending sleep; no flags to keep in sync.
 
 import { PROMPTS } from "@/lib/prompts";
-import { chatStream, HttpError } from "@/lib/sse";
+import { chatComplete, chatStream, type ChatStreamArgs, HttpError } from "@/lib/sse";
 import { clampSettings, DEFAULT_SETTINGS, type StreamSettings } from "@/lib/streamSettings";
 
 export type StreamStatus =
@@ -481,35 +481,49 @@ export class StreamRunner {
     const startedAt = performance.now();
     slot.startedAt = startedAt;
     let completed = false;
+    const args: ChatStreamArgs = {
+      model: this.model,
+      messages: [{ role: "user", content: s.prompt ?? "" }],
+      max_tokens: this.settings.maxTokens,
+      temperature: this.settings.temperature,
+    };
     try {
-      const stream = chatStream(
-        {
-          model: this.model,
-          messages: [{ role: "user", content: s.prompt ?? "" }],
-          max_tokens: this.settings.maxTokens,
-          temperature: this.settings.temperature,
-        },
-        controller.signal,
-      );
-      for await (const chunk of stream) {
-        if (!this.alive(slot, gen)) return { kind: "aborted" };
-        // Mid-stream engine failure: {object:"error"} with no `choices`.
-        if (chunk.object === "error") return { kind: "error", message: chunk.error.message };
-        const now = performance.now();
-        if (s.ttftMs === null) {
-          s.ttftMs = now - startedAt;
-          s.status = "streaming";
+      if (this.settings.streamResponses) {
+        const stream = chatStream(args, controller.signal);
+        for await (const chunk of stream) {
+          if (!this.alive(slot, gen)) return { kind: "aborted" };
+          // Mid-stream engine failure: {object:"error"} with no `choices`.
+          if (chunk.object === "error") return { kind: "error", message: chunk.error.message };
+          const now = performance.now();
+          if (s.ttftMs === null) {
+            s.ttftMs = now - startedAt;
+            s.status = "streaming";
+          }
+          const n = chunk.n_tokens ?? 1;
+          s.tokens += n;
+          s.reply += chunk.choices[0]?.delta.content ?? "";
+          s.elapsedMs = now - startedAt;
+          s.tokPerSec = decodeRate(s.tokens, s.elapsedMs, s.ttftMs);
+          this.ring.push({ t: now, n });
+          this.totalTokens += n;
+          this.mark(slot);
         }
-        const n = chunk.n_tokens ?? 1;
-        s.tokens += n;
-        s.reply += chunk.choices[0]?.delta.content ?? "";
+        s.elapsedMs = performance.now() - startedAt;
+      } else {
+        // Full reply in one request: there is no first-token event, so TTFT
+        // stays null and the rate is the whole reply over the whole wait. The
+        // tile sits in prefill (prompt + caret) until the reply lands.
+        const { text, tokens } = await chatComplete(args, controller.signal);
+        if (!this.alive(slot, gen)) return { kind: "aborted" };
+        const now = performance.now();
+        s.reply = text;
+        s.tokens = tokens;
         s.elapsedMs = now - startedAt;
-        s.tokPerSec = decodeRate(s.tokens, s.elapsedMs, s.ttftMs);
-        this.ring.push({ t: now, n });
-        this.totalTokens += n;
+        s.tokPerSec = s.elapsedMs > 50 ? tokens / (s.elapsedMs / 1000) : null;
+        this.ring.push({ t: now, n: tokens });
+        this.totalTokens += tokens;
         this.mark(slot);
       }
-      s.elapsedMs = performance.now() - startedAt;
       completed = true;
       return { kind: "done" };
     } catch (err) {

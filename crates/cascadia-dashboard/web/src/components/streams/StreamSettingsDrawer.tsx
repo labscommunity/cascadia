@@ -35,7 +35,7 @@ export function StreamSettingsDrawer({ open, settings, serverMax, onChange, onCl
     <aside
       role="dialog"
       aria-label="Stream settings"
-      className="absolute inset-y-0 right-0 z-20 flex w-80 flex-col gap-5 border-l border-night-rule bg-night-2 p-5 shadow-elev"
+      className="absolute inset-y-0 right-0 z-20 flex w-80 flex-col gap-5 overflow-y-auto border-l border-night-rule bg-night-2 p-5 shadow-elev"
     >
       <div className="flex items-center justify-between">
         <span className="label-mono text-night-dim">Settings</span>
@@ -88,6 +88,31 @@ export function StreamSettingsDrawer({ open, settings, serverMax, onChange, onCl
         step={0.1}
         onChange={(v) => set({ temperature: v })}
       />
+      <Field
+        label="Terminal font size (px)"
+        value={settings.fontSizePx}
+        min={LIMITS.fontSizePx.min}
+        max={LIMITS.fontSizePx.max}
+        step={0.5}
+        onChange={(v) => set({ fontSizePx: v })}
+      />
+
+      <Checkbox
+        label="Show tile header"
+        checked={settings.showTileHeader}
+        onChange={(v) => set({ showTileHeader: v })}
+      />
+      <Checkbox
+        label="Show tile footer"
+        checked={settings.showTileFooter}
+        onChange={(v) => set({ showTileFooter: v })}
+      />
+      <Checkbox
+        label="Stream tokens as they arrive"
+        checked={settings.streamResponses}
+        onChange={(v) => set({ streamResponses: v })}
+        hint="Off = fetch the whole reply in one request; the tile shows it once the model finishes."
+      />
 
       <p className={`font-mono text-[11px] leading-relaxed ${aboveCap ? "text-amber-400" : "text-night-low"}`}>
         {serverMax != null
@@ -137,6 +162,35 @@ function Field({
         }}
         className="rounded-sm border border-night-rule bg-night px-2 py-1 font-mono text-[13px] text-night-ink focus:border-persian focus:outline-none"
       />
+    </label>
+  );
+}
+
+function Checkbox({
+  label,
+  checked,
+  onChange,
+  hint,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  hint?: string;
+}) {
+  return (
+    <label className="flex cursor-pointer flex-col gap-1">
+      <span className="flex items-center gap-2">
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={(e) => onChange(e.target.checked)}
+          className="h-4 w-4 rounded-sm border border-night-rule bg-night accent-mint-bright"
+        />
+        <span className="label-mono text-night-dim">{label}</span>
+      </span>
+      {hint ? (
+        <span className="pl-6 font-mono text-[11px] leading-relaxed text-night-low">{hint}</span>
+      ) : null}
     </label>
   );
 }

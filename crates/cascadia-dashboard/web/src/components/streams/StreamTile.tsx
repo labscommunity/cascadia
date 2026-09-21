@@ -7,6 +7,12 @@ type Props = {
   running: boolean;
   /** Body text for a tile that has never held a prompt. */
   emptyText: string;
+  /** Show the top bar (index, status, tok/s, hover Pause/Skip). */
+  showHeader: boolean;
+  /** Show the bottom metrics bar (tokens, TTFT, elapsed). */
+  showFooter: boolean;
+  /** Body text size in px (prompt/reply/scrollback). */
+  fontSizePx: number;
   runner: StreamRunner;
 };
 
@@ -35,7 +41,15 @@ const WORD: Record<StreamStatus, string> = {
  * only for streams that changed since the last frame, so a token on stream
  * 3 re-renders tile 3 alone. `runner` and `emptyText` are stable props.
  */
-export const StreamTile = memo(function StreamTile({ stream, running, emptyText, runner }: Props) {
+export const StreamTile = memo(function StreamTile({
+  stream,
+  running,
+  emptyText,
+  showHeader,
+  showFooter,
+  fontSizePx,
+  runner,
+}: Props) {
   const bodyRef = useRef<HTMLDivElement | null>(null);
 
   // Keep the newest text in view. scrollTop rather than scrollIntoView so
@@ -51,28 +65,34 @@ export const StreamTile = memo(function StreamTile({ stream, running, emptyText,
 
   return (
     <div className="group flex min-h-0 flex-col overflow-hidden rounded-md border border-night-rule bg-night-2 font-mono text-[12.5px] leading-snug">
-      <header className="flex h-7 shrink-0 items-center gap-2 bg-night-3 px-3">
-        <span className="tabular-nums text-night-low">#{String(stream.id + 1).padStart(2, "0")}</span>
-        <span className={`h-1.5 w-1.5 rounded-full ${DOT[stream.status]}`} aria-hidden />
-        <span className={`label-mono ${WORD[stream.status]}`}>{statusWord}</span>
-        <span className="ml-auto flex items-center gap-2">
-          <span className="flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
-            {paused ? (
-              <TileButton onClick={() => runner.resumeStream(stream.id)}>Resume</TileButton>
-            ) : (
-              <TileButton onClick={() => runner.pauseStream(stream.id)}>Pause</TileButton>
-            )}
-            <TileButton onClick={() => runner.skipStream(stream.id)} disabled={!running || paused}>
-              Skip
-            </TileButton>
+      {showHeader ? (
+        <header className="flex h-7 shrink-0 items-center gap-2 bg-night-3 px-3">
+          <span className="tabular-nums text-night-low">#{String(stream.id + 1).padStart(2, "0")}</span>
+          <span className={`h-1.5 w-1.5 rounded-full ${DOT[stream.status]}`} aria-hidden />
+          <span className={`label-mono ${WORD[stream.status]}`}>{statusWord}</span>
+          <span className="ml-auto flex items-center gap-2">
+            <span className="flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+              {paused ? (
+                <TileButton onClick={() => runner.resumeStream(stream.id)}>Resume</TileButton>
+              ) : (
+                <TileButton onClick={() => runner.pauseStream(stream.id)}>Pause</TileButton>
+              )}
+              <TileButton onClick={() => runner.skipStream(stream.id)} disabled={!running || paused}>
+                Skip
+              </TileButton>
+            </span>
+            <span className="tabular-nums text-night-dim">
+              {stream.tokPerSec != null ? `${stream.tokPerSec.toFixed(1)} tok/s` : "—"}
+            </span>
           </span>
-          <span className="tabular-nums text-night-dim">
-            {stream.tokPerSec != null ? `${stream.tokPerSec.toFixed(1)} tok/s` : "—"}
-          </span>
-        </span>
-      </header>
+        </header>
+      ) : null}
 
-      <div ref={bodyRef} className="min-h-0 flex-1 space-y-2 overflow-y-auto px-3 py-2">
+      <div
+        ref={bodyRef}
+        className="min-h-0 flex-1 space-y-2 overflow-y-auto px-3 py-2"
+        style={{ fontSize: `${fontSizePx}px` }}
+      >
         {stream.history.map((ex, i) => (
           <div key={i} className="whitespace-pre-wrap text-night-low">
             <div>&gt; {ex.prompt}</div>
@@ -96,11 +116,13 @@ export const StreamTile = memo(function StreamTile({ stream, running, emptyText,
         )}
       </div>
 
-      <footer className="label-mono flex h-6 shrink-0 items-center gap-3 border-t border-night-rule px-3 tabular-nums">
-        <span>{stream.tokens} tok</span>
-        <span>TTFT {stream.ttftMs != null ? `${stream.ttftMs.toFixed(0)} ms` : "—"}</span>
-        <span className="ml-auto">{(stream.elapsedMs / 1000).toFixed(1)} s</span>
-      </footer>
+      {showFooter ? (
+        <footer className="label-mono flex h-6 shrink-0 items-center gap-3 border-t border-night-rule px-3 tabular-nums">
+          <span>{stream.tokens} tok</span>
+          <span>TTFT {stream.ttftMs != null ? `${stream.ttftMs.toFixed(0)} ms` : "—"}</span>
+          <span className="ml-auto">{(stream.elapsedMs / 1000).toFixed(1)} s</span>
+        </footer>
+      ) : null}
     </div>
   );
 });

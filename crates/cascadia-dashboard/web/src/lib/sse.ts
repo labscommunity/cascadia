@@ -109,3 +109,43 @@ export async function* chatStream(
     reader.releaseLock();
   }
 }
+
+/** Non-streaming completion shape (OpenAI-compat, `stream:false`). */
+type ChatCompletionResponse = {
+  choices: { message: { content?: string }; finish_reason: "stop" | null }[];
+  usage?: { completion_tokens?: number };
+};
+
+/**
+ * Fetch a whole reply in one request (`stream:false`): the server generates
+ * the full completion, then returns it as a single JSON body. Used by the
+ * streams showcase when "stream tokens" is off. Throws `HttpError` on a
+ * non-2xx response, exactly like `chatStream`, so a caller treats a 503 the
+ * same way. Token count comes from `usage.completion_tokens`, with a word
+ * count as a fallback when the server omits usage.
+ */
+export async function chatComplete(
+  args: ChatStreamArgs,
+  signal?: AbortSignal,
+): Promise<{ text: string; tokens: number }> {
+  const r = await fetch("/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: args.model,
+      messages: args.messages,
+      max_tokens: args.max_tokens ?? 256,
+      temperature: args.temperature ?? 0,
+      stream: false,
+    }),
+    signal,
+  });
+  if (!r.ok) {
+    const text = await r.text().catch(() => "");
+    throw new HttpError(r.status, `HTTP ${r.status}: ${text || r.statusText}`);
+  }
+  const data = (await r.json()) as ChatCompletionResponse;
+  const text = data.choices[0]?.message.content ?? "";
+  const tokens = data.usage?.completion_tokens ?? text.split(/\s+/).filter(Boolean).length;
+  return { text, tokens };
+}

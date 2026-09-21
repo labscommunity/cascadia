@@ -13,6 +13,14 @@ export type StreamSettings = {
   cooldownMaxS: number;
   /** Sampling temperature; 0 matches Chat and the fleet bench. */
   temperature: number;
+  /** Show each tile's top bar (index, status, tok/s, hover Pause/Skip). */
+  showTileHeader: boolean;
+  /** Show each tile's bottom metrics bar (tokens, TTFT, elapsed). */
+  showTileFooter: boolean;
+  /** Body text size in px for the prompt/reply/scrollback. */
+  fontSizePx: number;
+  /** Stream tokens over SSE (true) or fetch the full reply at once (false). */
+  streamResponses: boolean;
 };
 
 export const DEFAULT_SETTINGS: StreamSettings = {
@@ -21,6 +29,10 @@ export const DEFAULT_SETTINGS: StreamSettings = {
   cooldownMinS: 1,
   cooldownMaxS: 2,
   temperature: 0,
+  showTileHeader: true,
+  showTileFooter: true,
+  fontSizePx: 12.5,
+  streamResponses: true,
 };
 
 export const LIMITS = {
@@ -28,6 +40,7 @@ export const LIMITS = {
   maxTokens: { min: 16, max: 1024 },
   cooldownS: { min: 0, max: 30 },
   temperature: { min: 0, max: 1.5 },
+  fontSizePx: { min: 9, max: 20 },
 } as const;
 
 const STORAGE_KEY = "cascadia.streams.settings.v1";
@@ -35,6 +48,10 @@ const STORAGE_KEY = "cascadia.streams.settings.v1";
 function clampNumber(value: unknown, min: number, max: number, fallback: number): number {
   const n = typeof value === "number" && Number.isFinite(value) ? value : fallback;
   return Math.min(max, Math.max(min, n));
+}
+
+function clampBool(value: unknown, fallback: boolean): boolean {
+  return typeof value === "boolean" ? value : fallback;
 }
 
 export function clampSettings(s: Partial<StreamSettings> | null | undefined): StreamSettings {
@@ -63,7 +80,26 @@ export function clampSettings(s: Partial<StreamSettings> | null | undefined): St
     LIMITS.temperature.max,
     d.temperature,
   );
-  return { streamCount, maxTokens, cooldownMinS, cooldownMaxS, temperature };
+  const fontSizePx = clampNumber(
+    src.fontSizePx,
+    LIMITS.fontSizePx.min,
+    LIMITS.fontSizePx.max,
+    d.fontSizePx,
+  );
+  const showTileHeader = clampBool(src.showTileHeader, d.showTileHeader);
+  const showTileFooter = clampBool(src.showTileFooter, d.showTileFooter);
+  const streamResponses = clampBool(src.streamResponses, d.streamResponses);
+  return {
+    streamCount,
+    maxTokens,
+    cooldownMinS,
+    cooldownMaxS,
+    temperature,
+    showTileHeader,
+    showTileFooter,
+    fontSizePx,
+    streamResponses,
+  };
 }
 
 /** Stored settings, or defaults when nothing is stored or it fails to parse. */
