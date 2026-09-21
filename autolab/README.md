@@ -53,3 +53,9 @@ not research.
 
 Never connect to relay ports 9100-9110. Prompts over 256 tokens crash the chain on binaries
 before experiment 001.
+
+## The experiment queue
+
+`QUEUE.md` lists every experiment, finished, running and proposed, with its status; it is generated from one file
+per item in `queue/items/`. Anyone (another agent, a teammate) adds an item with `bench/queue.py add ...` or by
+writing a file; the operator of the fleet runs them in priority order. Rules and fields: `queue/README.md`.
