@@ -39,6 +39,29 @@ fi
 ''' % dict(a=pair[0], b=pair[1], src=src.rstrip("\n"))
 
 
+def block_clock(proxy):
+    return '''
+# autolab 032 (the entry box): a power loss resets this box's clock to its firmware date (three times on 2026-09-20,
+# back to July). publish.py stamps the fleet's manifest with this clock and every updater refuses a manifest older
+# than the one it applied: with the clock in the past NO release can roll out until someone sets it by hand. If the
+# clock is provably wrong (earlier than a release this box already applied) take the time from an HTTPS Date header
+# through the lab proxy. Forward only, this box only, and only in that case.
+if [ "${BOX_RANK:-$RANK}" = "0" ]; then
+  _last=$(sed -n 's/.*"version"[^0-9]*\\([0-9][0-9]*\\).*/\\1/p' "$PREFIX/update-state.json" 2>/dev/null | head -1)
+  _was=$(date +%%s)
+  if [ -n "$_last" ] && [ "$_was" -lt "$_last" ]; then
+    _hdr=$(curl -sI --max-time 20 -x "%(proxy)s" https://www.google.com 2>/dev/null | sed -n 's/^[Dd]ate: *//p' | tr -d '\\r' | head -1)
+    _now=$(date -u -d "$_hdr" +%%s 2>/dev/null || echo 0)
+    if [ "$_now" -gt "$_last" ]; then
+      date -u -s "@$_now" > /dev/null 2>&1 && { hwclock -w > /dev/null 2>&1; echo "CLK probe stage profile ph=1 clock_set=1 was_behind_s=$((_now - _was))"; }
+    else
+      echo "CLK probe stage profile ph=8 clock_set=0 was=$_was last=$_last got=$_now"
+    fi
+  fi
+fi
+''' % dict(proxy=proxy)
+
+
 def block_relay(src):
     return '''
 # autolab 032b (the entry box, when it no longer plays pipeline rank 0): the operator tunnel, the Tailscale address
@@ -61,6 +84,10 @@ def main():
     pair = (sys.argv[4] if len(sys.argv) > 4 and sys.argv[3] == "--pair" else "0 8").split()
     assert len(pair) == 2 and all(p.isdigit() for p in pair), pair
     s = open(base).read().rstrip("\n") + "\n"
+    import re
+    m = re.search(r"PX=(http://[^ ;\n]+)", s)   # the lab proxy, as the base file names it (redacted in repository copies)
+    assert m, "no PX= in the base overrides"
+    s += block_clock(m.group(1))
     sync = block_sync(pair, open(os.path.join(FLEET, "role_sync.py")).read())
     relay = block_relay(open(os.path.join(FLEET, "api_relay.py")).read())
     run = open(os.path.join(FLEET, "run.sh")).read()
