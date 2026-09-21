@@ -203,12 +203,13 @@ content hashes and are reproducible for identical sources and lockfile, so:
 - [ ] Back up the old tarball: `cp ~/inkling-build/dash-dist.tar.gz ~/inkling-build/dash-dist.tar.gz.before-streams`.
 - [ ] Copy the new one from Task 7 into place as `~/inkling-build/dash-dist.tar.gz`.
 - [ ] Run the build machine's usual script (it does `tar -xzf … -C repo/crates/cascadia-dashboard/web` then `cargo build --release -p cascadia --features openvino,dashboard-embed`). No branch change is needed: this feature has no Rust changes, so the checkout can stay where it is, including on `autolab/inkling-fleet-perf` with its `/api/fleet/telemetry` route.
-- [ ] Prove the new SPA is inside the binary before publishing: `strings target/release/cascadia | grep -c 'waiting for a slot'` prints at least 1 (a string only the streams tile contains). If it prints 0 the stale-tarball trap bit you; check which tarball was untarred.
+- [ ] Prove the new SPA is inside the binary before publishing: `strings target/release/cascadia | grep -c 'waiting for a slot'` prints at least 1 (a string only the streams tile contains), and `strings target/release/cascadia | grep -c 'index-Ba7ZRF0b'` prints at least 1 for the 2026-09-21 ship (the embedded index.html names the bundle). A 0 on either means the stale-tarball trap bit you; check which tarball was untarred.
+- [ ] Before building, make sure the tarball itself is not stale on *this* side: its asset names must match `ls crates/cascadia-dashboard/web/dist/assets` from a build of the commit you mean to ship. (On 2026-09-21 the first tarball was cut at 08:46, before the 09:11 defaults commit, and had to be regenerated.)
 
 ### C2. Publish and verify
 
 - [ ] Publish through the fleet's signed channel the usual way (the operator wrapper, or `publish.py` on rank 0 with the new `cascadia` in the served folder). Every box's updater installs it and restarts its worker; wait 5–8 minutes for the pipeline to re-form.
-- [ ] Through the tunnel: `curl -s http://localhost:18000/streams | grep -o 'assets/index-[A-Za-z0-9_-]*\.js'` shows the new hash from C0.
+- [ ] Through the tunnel: `curl -s http://localhost:18000/streams | grep -o 'assets/index-[A-Za-z0-9_-]*\.js'` shows the *new* build's name, not the old `index-DUJ_Gm7o.js`. For the 2026-09-21 ship (built from `2b21634a`) that is `index-Ba7ZRF0b.js`; for any later ship, read it from `tar -tzf ~/dash-dist.tar.gz`.
 - [ ] `http://localhost:18000/streams` renders the dark wall; run B1 quickly (Play, 16 streams, two minutes).
 - [ ] `http://localhost:18000/` and `/chat` still look and work as before.
 - [ ] `curl -s http://localhost:18000/api/fleet/telemetry | head -c 200` still answers (the Rust side of the build was not regressed by the branch the machine built from).
