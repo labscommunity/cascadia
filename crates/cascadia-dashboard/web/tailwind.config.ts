@@ -6,6 +6,11 @@ import type { Config } from "tailwindcss";
 // them only for places where utilities aren't enough (e.g. pseudo-elements,
 // keyframes with rgb(... / alpha) syntax).
 export default {
+  // The streams showcase (/streams) is the one dark route. `dark:` utilities
+  // key on this attribute, which Layout sets on its root for that route only.
+  // v3 selector strategy = descendants only; the root styles itself in
+  // globals.css.
+  darkMode: ["selector", '[data-theme="dark"]'],
   content: ["./index.html", "./src/**/*.{ts,tsx}"],
   theme: {
     extend: {
@@ -32,6 +37,17 @@ export default {
         "state-warm": "#B54708",
         "state-cold": "#8A94A3",
         "state-error": "#B42318",
+        // Night palette for the streams showcase (route-scoped dark theme).
+        // Brand accents (mint, mint-bright, celadon, persian) are reused on
+        // top of these; the light state-* colours lack contrast on them, so
+        // dark status text uses Tailwind's amber-400 / red-400 instead.
+        night: "#0B0F14",
+        "night-2": "#111821",
+        "night-3": "#182230",
+        "night-rule": "#1F2A37",
+        "night-ink": "#E6EBF0",
+        "night-dim": "#9AA7B4",
+        "night-low": "#5C6875",
       },
       fontFamily: {
         // LT Cushion (the brand display face) is a paid font; Fraunces is the

@@ -30,6 +30,30 @@ impl GenTiming {
     }
 }
 
+/// What a runner measured about its own layers, for the stage profile the
+/// pipeline engine logs (`CASCADIA_STAGE_PROFILE_SECS`). Cumulative since
+/// [`StagedRunner::enable_profile`], except the `_mib` gauges.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunnerProfile {
+    /// Decode steps: attention branch / MLP branch, summed over my layers.
+    pub decode_attn_ns: u64,
+    pub decode_mlp_ns: u64,
+    /// Prefill blocks: the same split.
+    pub prefill_attn_ns: u64,
+    pub prefill_mlp_ns: u64,
+    /// Expert cache: lookups served from RAM / read from the model files.
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_retained_mib: u64,
+    pub cache_capacity_mib: u64,
+    /// Offloaded attention projections and output head (OpenVINO), inside the
+    /// attention / head time above.
+    pub ov_attn_calls: u64,
+    pub ov_attn_ns: u64,
+    pub ov_head_calls: u64,
+    pub ov_head_ns: u64,
+}
+
 pub trait StagedRunner: Send + 'static {
     /// Short backend name for log lines (`"dsv4"`, `"glm5"`).
     fn arch_name(&self) -> &'static str;
@@ -88,6 +112,85 @@ pub trait StagedRunner: Send + 'static {
 
     /// Last-rank only: logits from the final hidden.
     fn head_logits(&self, hidden: &[f32]) -> Vec<f32>;
+
+    /// Last-rank only: logits for `rows` final hiddens (`[rows, hidden]` ->
+    /// `[rows, vocab]`). Default loops [`Self::head_logits`]; a backend with a
+    /// batched head (one table read per step) overrides.
+    fn head_logits_rows(&self, hidden: &[f32], rows: usize) -> Vec<f32> {
+        let hs = self.hidden_size();
+        assert_eq!(
+            hidden.len(),
+            rows * hs,
+            "head_logits_rows: bad hidden length"
+        );
+        let mut out = Vec::new();
+        for r in 0..rows {
+            out.extend(self.head_logits(&hidden[r * hs..(r + 1) * hs]));
+        }
+        out
+    }
+
+    // ---- multi-stream decode (continuous batching) ----------------------
+    //
+    // A runner that keeps one KV/sequence state per *stream slot* can decode
+    // several sequences per step: each step takes one token per active
+    // stream, runs attention per stream and the MoE as one batch. All
+    // default to "unsupported" (`stream_capacity() == 0`), which keeps every
+    // other backend on the one-sequence path.
+
+    /// Stream slots this runner holds (0 = single-sequence only).
+    fn stream_capacity(&self) -> usize {
+        0
+    }
+
+    /// Allocate `n` stream slots (KV + conv state each). Returns `false` if
+    /// the runner cannot batch streams.
+    fn configure_streams(&mut self, _n: usize) -> bool {
+        false
+    }
+
+    /// Take a free slot for a new sequence (state cleared); `None` when all
+    /// slots are busy.
+    fn open_stream(&mut self) -> Option<usize> {
+        None
+    }
+
+    /// Open a specific slot (a worker rank following rank 0's choice); the
+    /// slot's state is cleared even if it was busy. `false` if out of range.
+    fn open_stream_at(&mut self, _slot: usize) -> bool {
+        false
+    }
+
+    /// Release a slot.
+    fn close_stream(&mut self, _slot: usize) {}
+
+    /// Positions consumed on `slot` (its next token's absolute position).
+    fn stream_pos(&self, _slot: usize) -> usize {
+        0
+    }
+
+    /// Prefill `rows` prompt positions of `slot` (`hidden` = `[rows, hidden]`,
+    /// positions `stream_pos(slot)..+rows`); returns `[rows, hidden]`.
+    fn prefill_stream(&mut self, _slot: usize, _hidden: Vec<f32>, _rows: usize) -> Vec<f32> {
+        unimplemented!("this runner does not batch streams")
+    }
+
+    /// Decode one token on each of `slots` (`hidden` = `[slots.len(), hidden]`,
+    /// row `i` at `stream_pos(slots[i])`); returns `[slots.len(), hidden]` and
+    /// advances every listed slot by one. A slot appears at most once.
+    fn decode_streams(&mut self, _hidden: Vec<f32>, _slots: &[usize]) -> Vec<f32> {
+        unimplemented!("this runner does not batch streams")
+    }
+
+    /// Start collecting the runner-side counters [`Self::profile`] reports.
+    /// Off until called (the per-layer clocks cost two `Instant::now` each).
+    fn enable_profile(&mut self) {}
+
+    /// Runner-side counters for the engine's periodic stage profile; `None`
+    /// when the runner keeps none. All fields but the gauges are cumulative.
+    fn profile(&self) -> Option<RunnerProfile> {
+        None
+    }
 
     /// Distributed KV-prefix cache hooks (pipeline prefix reuse). Default:
     /// unsupported — only the glm5 runner implements them, so dsv4 / OV runners

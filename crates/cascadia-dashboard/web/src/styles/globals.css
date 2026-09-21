@@ -11,6 +11,9 @@
  * was the brief.
  *
  * Note we deliberately do NOT match exo's dark "command center" theme.
+ * The one exception is the streams showcase at /streams, which scopes a
+ * dark theme to its own route via `[data-theme="dark"]` below; every other
+ * screen stays light.
  */
 
 @layer base {
@@ -25,6 +28,16 @@
     --rule: 217 220 212;
 
     color-scheme: light;
+  }
+
+  /* Streams showcase root. Tailwind's `dark:` variant matches descendants of
+   * this attribute (see tailwind.config.ts), so the element carrying it
+   * styles itself here. `color-scheme: dark` flips form controls and
+   * scrollbars for the subtree despite the page-level <meta> saying light. */
+  [data-theme="dark"] {
+    color-scheme: dark;
+    background-color: theme(colors.night);
+    color: theme(colors.night-ink);
   }
 
   html,
@@ -74,6 +87,17 @@
     border-radius: 50%;
     background: rgb(var(--persian) / 0.45);
     animation: pulse 2s ease-out infinite;
+  }
+
+  /* Terminal caret for a tile that is waiting on or receiving tokens. */
+  .cursor-blink {
+    animation: cursor-blink 1s steps(2, start) infinite;
+  }
+
+  @keyframes cursor-blink {
+    to {
+      visibility: hidden;
+    }
   }
 
   @keyframes pulse {

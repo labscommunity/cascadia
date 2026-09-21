@@ -264,6 +264,32 @@ impl Layer {
         self.attn.cache_bytes() + self.attn_sconv.cache_bytes() + self.mlp_sconv.cache_bytes()
     }
 
+    /// Size this layer's multi-stream slot pool (attention KV + the four conv
+    /// histories per sequence). See [`Self::select_slot`].
+    pub fn ensure_slots(&mut self, n: usize) {
+        self.attn.ensure_slots(n);
+        self.attn_sconv.ensure_slots(n);
+        self.mlp_sconv.ensure_slots(n);
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.attn.slot_count()
+    }
+
+    /// Bytes one additional sequence slot costs on this layer.
+    pub fn slot_bytes(&self) -> usize {
+        self.cache_bytes()
+    }
+
+    /// Make sequence `slot` the live one for every stateful part of this
+    /// layer (O(1) swaps); `reset` / `truncate` / `forward_token` /
+    /// `forward_prefill` then act on that sequence.
+    pub fn select_slot(&mut self, slot: usize) {
+        self.attn.select(slot);
+        self.attn_sconv.select(slot);
+        self.mlp_sconv.select(slot);
+    }
+
     /// Clear all sequence state (new sequence). O(1) — see
     /// [`AttentionLayer::reset`] / [`ShortConv::reset`].
     pub fn reset(&mut self) {
@@ -388,6 +414,61 @@ impl Layer {
             *xi += mi;
         }
         self.observe_timing(start, mlp_start, rows, true);
+        x1
+    }
+}
+
+impl Layer {
+    /// Multi-stream decode step: `rows` residual-stream rows (`xs` =
+    /// `[rows, hidden]`), row `i` the next token of sequence `slots[i]`.
+    /// Attention, the convs and the residuals run per row on that row's slot;
+    /// the MoE runs all rows as one batch-union (each expert loaded once for
+    /// every stream that chose it — the aggregate-throughput lever). Per row
+    /// the op sequence is [`Self::forward_token`]'s, so a stream decoded in a
+    /// batch equals the same stream decoded alone (bit-identical on the CPU
+    /// kernels). Returns `[rows, hidden]`.
+    pub fn forward_rows(&mut self, xs: &[f32], rows: usize, slots: &[usize]) -> Vec<f32> {
+        let start = self.timing_observer.as_ref().map(|_| Instant::now());
+        let hd = self.hidden;
+        assert_eq!(xs.len(), rows * hd, "layer forward_rows: xs len");
+        assert_eq!(slots.len(), rows, "layer forward_rows: one slot per row");
+        // attention branch: batched projections, per-slot attention + conv
+        let mut h = xs.to_vec();
+        rmsnorm_f32(&mut h, &self.attn_norm, self.eps);
+        let a = self.attn.forward_rows(&h, rows, slots);
+        let mut x1: Vec<f32> = Vec::with_capacity(rows * hd);
+        for (r, &slot) in slots.iter().enumerate() {
+            self.attn_sconv.select(slot);
+            let ar = self.attn_sconv.decode(&a[r * hd..(r + 1) * hd]);
+            x1.extend(
+                xs[r * hd..(r + 1) * hd]
+                    .iter()
+                    .zip(&ar)
+                    .map(|(&xi, &ai)| xi + ai),
+            );
+        }
+        let mlp_start = start.map(|_| Instant::now());
+        // mlp branch: one batch across streams
+        let mut h2 = x1.clone();
+        rmsnorm_f32(&mut h2, &self.mlp_norm, self.eps);
+        let m = match &self.mlp {
+            LayerMlp::Moe(m) => m.forward_batch(&h2, rows),
+            LayerMlp::Dense(d) => {
+                let mut m = vec![0.0f32; rows * hd];
+                for (r, row) in h2.chunks_exact(hd).enumerate() {
+                    m[r * hd..(r + 1) * hd].copy_from_slice(&d.forward(row, hd));
+                }
+                m
+            }
+        };
+        for (r, &slot) in slots.iter().enumerate() {
+            self.mlp_sconv.select(slot);
+            let mr = self.mlp_sconv.decode(&m[r * hd..(r + 1) * hd]);
+            for (xi, &mi) in x1[r * hd..(r + 1) * hd].iter_mut().zip(&mr) {
+                *xi += mi;
+            }
+        }
+        self.observe_timing(start, mlp_start, rows, false);
         x1
     }
 }
@@ -523,6 +604,34 @@ impl Head {
     /// Compile the head's IR ahead of time; `None` without a backend.
     pub fn warm_ov(&self) -> Option<bool> {
         Some(self.ov.as_ref()?.warm())
+    }
+
+    /// [`Self::logits`] for `rows` hidden states (`xs` = `[rows, hidden]`),
+    /// returning `[rows, unpadded_vocab]`. The OpenVINO head takes all rows in
+    /// one call (the 1.2 GB table read once per step); the Rust head loops.
+    pub fn logits_rows(&self, xs: &[f32], rows: usize) -> Vec<f32> {
+        let hidden = self.hidden();
+        assert_eq!(xs.len(), rows * hidden, "head logits_rows: xs len");
+        if rows == 1 {
+            return self.logits(xs);
+        }
+        if let Some(ov) = &self.ov {
+            let mut ys = xs.to_vec();
+            for y in ys.chunks_exact_mut(hidden) {
+                rmsnorm_f32(y, &self.norm, self.eps);
+                for v in y.iter_mut() {
+                    *v /= self.mup;
+                }
+            }
+            if let Some(l) = ov.logits_rows(&ys, rows) {
+                return l;
+            }
+        }
+        let mut out = Vec::with_capacity(rows * self.unpadded_vocab);
+        for x in xs.chunks_exact(hidden) {
+            out.extend(self.logits(x));
+        }
+        out
     }
 
     /// `unembed · (rmsnorm(x, norm) / mup)[..unpadded_vocab]` for one hidden

@@ -2160,6 +2160,16 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // the thinking-OFF path (engine sets apply_chat_template=false then);
         // thinking-ON stays on ov-genai's native template, untouched.
         cfg.defer_template_on_thinking = matches!(args.engine, EngineKind::OvGenai);
+        // `CASCADIA_API_MAX_CONCURRENT`: in-flight request cap (backpressure is
+        // 503 beyond it). A multi-stream engine serves `CASCADIA_STREAMS` at
+        // once, so a demo firing that many at a time needs the cap above it.
+        if let Some(n) = std::env::var("CASCADIA_API_MAX_CONCURRENT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+        {
+            cfg.max_concurrent_requests = n;
+        }
         let max_concurrent = cfg.max_concurrent_requests as u64;
         // Shared live counters: the API bumps them on the chat hot path,
         // the dashboard's /api/stats reads them — same Arc, so the cluster

@@ -781,12 +781,48 @@ impl MoeLayer {
             s.prefetch();
         }
 
+        // 2b. The explicit expert cache (the streamed/owned-buffer path only):
+        //     one lookup for the block's unique experts — a hit computes its
+        //     rows straight from the retained bytes, a miss is read once and
+        //     admitted after compute. This is what lets multi-stream decode
+        //     (which batches rows exactly like prefill) run from the cache
+        //     instead of re-reading every expert per step.
+        let cache_on = streamed && self.expert_cache.stats().capacity_bytes > 0;
+        let unique: Vec<usize> = occ
+            .iter()
+            .enumerate()
+            .filter(|(_, slots)| !slots.is_empty())
+            .map(|(e, _)| e)
+            .collect();
+        let hit_map: std::collections::HashMap<usize, Arc<super::read_buffers::ReadBuffer>> =
+            if cache_on {
+                match self.expert_cache.lookup(&unique) {
+                    Some(hits) => unique
+                        .iter()
+                        .zip(hits)
+                        .filter_map(|(&e, h)| h.map(|b| (e, b)))
+                        .collect(),
+                    None => Default::default(),
+                }
+            } else {
+                Default::default()
+            };
+
         // 3. One visit per unique routed expert, its rows hot. The experts
         //    run concurrently; each computes its rows back to back, so an
         //    mmap'd expert's int4 pages are still faulted in once.
         let mut ey = vec![0.0f32; nblk * k * hidden];
         let visit = |(e, slots): (usize, &Vec<usize>)| {
             let mapped = self.w.experts[e].as_mmap();
+            if let (Some(m), Some(hit)) = (mapped, hit_map.get(&e)) {
+                let mut ys = Vec::with_capacity(slots.len() * hidden);
+                for &s in slots {
+                    let br = s / k;
+                    let x = &xs[(lo + br) * hidden..(lo + br + 1) * hidden];
+                    ys.extend_from_slice(&m.swiglu_from(hit.as_slice(), x));
+                }
+                return (e, ys);
+            }
             let mut lease = (streamed && mapped.is_some())
                 .then(|| super::read_buffers::ReadBuffers::acquire(1));
             let ready = match (mapped, lease.as_mut()) {
@@ -817,6 +853,12 @@ impl MoeLayer {
                     self.w.experts[e].forward(x, hidden, self.inter)
                 };
                 ys.extend_from_slice(&y);
+            }
+            if ready && cache_on {
+                // Admit the freshly read bytes (a miss) after its rows computed;
+                // the lease gets any evicted allocation back and drops it.
+                self.expert_cache
+                    .retain(e, &mut lease.as_mut().unwrap().buffers[0]);
             }
             (e, ys)
         };

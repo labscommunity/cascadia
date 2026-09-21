@@ -37,6 +37,11 @@ use super::DEFAULT_REWIND;
 
 /// One depthwise causal conv with its decode history.
 pub struct ShortConv {
+    /// Parked sequence states for multi-stream decode (see [`Self::select`]);
+    /// empty on the single-sequence path.
+    slots: Vec<ConvSlot>,
+    /// Which parked slot the live `ring/len/hwm` currently belong to.
+    live: usize,
     /// Kernel `[C, K]` (row-major: channel `c`'s taps are `w[c*K .. c*K+K]`).
     w: Vec<f32>,
     /// Channels.
@@ -52,6 +57,15 @@ pub struct ShortConv {
     len: usize,
     /// Write high-water mark: one past the furthest position written since the
     /// last `reset` / `restore` (`>= len`; see the module docs).
+    hwm: usize,
+}
+
+/// One parked sequence's conv history (multi-stream decode): the ring plus
+/// its cursor and high-water mark. Swapped whole with the live state by
+/// [`ShortConv::select`].
+struct ConvSlot {
+    ring: Vec<f32>,
+    len: usize,
     hwm: usize,
 }
 
@@ -95,6 +109,8 @@ impl ShortConv {
         assert_eq!(w.len(), c * k, "ShortConv: weight len != c * k");
         let hist = ((k - 1) + rewind).max(1);
         Self {
+            slots: Vec::new(),
+            live: 0,
             w,
             c,
             k,
@@ -104,6 +120,51 @@ impl ShortConv {
             len: 0,
             hwm: 0,
         }
+    }
+
+    /// Size the multi-stream slot pool to `n` sequences (each with its own
+    /// history ring). Slot 0 is the state that was live at the call; the rest
+    /// start empty. Idempotent for the same `n`; growing keeps existing
+    /// slots. See [`Self::select`].
+    pub fn ensure_slots(&mut self, n: usize) {
+        while self.slots.len() < n {
+            let empty = ConvSlot {
+                ring: vec![0.0; self.hist * self.c],
+                len: 0,
+                hwm: 0,
+            };
+            // The live slot's entry holds a placeholder: its real state is in
+            // the live fields until another slot is selected.
+            self.slots.push(empty);
+        }
+    }
+
+    /// Slots in the pool (0 on the single-sequence path).
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Make sequence `slot`'s history the live one, parking the current
+    /// sequence's. O(1): the rings are swapped by pointer. Every `decode` /
+    /// `prefill` / `reset` / `truncate` after this acts on that sequence.
+    pub fn select(&mut self, slot: usize) {
+        assert!(
+            slot < self.slots.len(),
+            "ShortConv::select({slot}): pool holds {} slots",
+            self.slots.len()
+        );
+        if slot == self.live {
+            return;
+        }
+        let cur = self.live;
+        // park the live state into its entry, then take the new slot's out
+        std::mem::swap(&mut self.ring, &mut self.slots[cur].ring);
+        std::mem::swap(&mut self.len, &mut self.slots[cur].len);
+        std::mem::swap(&mut self.hwm, &mut self.slots[cur].hwm);
+        std::mem::swap(&mut self.ring, &mut self.slots[slot].ring);
+        std::mem::swap(&mut self.len, &mut self.slots[slot].len);
+        std::mem::swap(&mut self.hwm, &mut self.slots[slot].hwm);
+        self.live = slot;
     }
 
     /// The kernel weights `[C, K]` row-major (read-only).
