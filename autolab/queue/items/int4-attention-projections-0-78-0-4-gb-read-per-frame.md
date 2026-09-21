@@ -1,17 +1,17 @@
 ---
 id: int4-attention-projections-0-78-0-4-gb-read-per-frame
 title: int4 attention projections (0.78 -> 0.4 GB read per frame)
-status: proposed
+status: ready
 outcome: 
 priority: 25
 target: 15 streams, single stream
 exact: no
-needs: USER DECISION (changes numerics); IR regeneration on the boxes; a wider quality gate than twelve questions
+needs: bounded one-rank kernel measurement prepared; any later numerical serving rollout still needs owner decision
 proposed_by: autolab session 2026-09-20
-owner: 
-experiment: 
+owner: autolab-continuation-20260921
+experiment: 041_attention_int4
 created: 2026-09-20
-updated: 2026-09-20
+updated: 2026-09-21
 ---
 
 ## Hypothesis
