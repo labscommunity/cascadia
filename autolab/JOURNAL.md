@@ -376,7 +376,7 @@ still returned the exact frozen outage report (epoch 1789974050), so no
 traffic or release was attempted. The owner will report back after checking
 the entry box on site. Keep fleet traffic and publishing stopped until then.
 
-## 2026-09-21: Streams dashboard deployment prepared; entry clock blocks publishing
+## 2026-09-21: Streams dashboard deployed after entry clock correction
 
 The owner requested deployment of the other agent's dashboard update. The
 current checkout is `7ac7bfb5`, with the Streams UI incorporated into the
@@ -401,3 +401,28 @@ at its console, as OPERATING section 5 describes. Once corrected, publish
 the verified binary, wait for all eleven workers to settle, run correctness
 gates, and verify `/streams` serves the new bundle. The prior binary
 `cascadia-639f0c02` remains the rollback for this dashboard-only release.
+
+The owner corrected the entry clock at its console. Verified a fresh signed
+report later than the prior fleet manifest and zero requests in flight, then
+published release **1790016660** at 13:51 CDT. All eleven boxes received the
+new binary. Several workers reported `peer link dead; rebuild needed` while
+neighbors restarted; these were the existing supervisor-driven stage rebuilds.
+All eleven were serving by 13:58:56, and the fleet reached **steady 3/3 at
+14:00:07**. No generation was sent before settlement. Restart counts remained
+unchanged through verification: `2 5 5 4 3 3 3 2 0 1 1` by installed rank.
+
+The single-stream and eight-stream correctness gates both passed, including
+the same known third-prompt departure at character 81. `/`, `/chat`, `/streams`,
+the JavaScript and CSS bundles, and the dark logo all returned HTTP 200 and
+matched the rebuilt assets byte for byte. The fleet is available for the
+owner's Streams dashboard testing. This release changes no model numerics,
+overrides, role assignments, or infrastructure; no int4 serving canary ran.
+The longer visual/interactive Streams acceptance checklist remains for testing.
+
+Local monitor fix: an idle head can report its successful full-chain readiness
+probe after the initial API startup message ages out of the beacon's journal
+window. `lab.py` now recognizes that exact eleven-stage ready phase in addition
+to `serving`, while requiring an active worker, matching versions and unchanged
+restart counts. Three readiness/stability tests and the three failed-run tests
+passed. Restarted only the local settle monitor to pick up this fix; the fleet
+received one release.

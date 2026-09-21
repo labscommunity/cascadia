@@ -31,6 +31,15 @@ They live in files on the operator's Mac that this document names.
 
 ## 2. Known-good releases and the current experiment
 
+Latest serving release: **1790016660** (2026-09-21), binary
+`~/inkling-release/builds/cascadia-639f0c02-streams`, with the existing
+`040_counts_041_attn.env` overrides and 032b run.sh. This adds the Streams
+dashboard to the already deployed engine. The owner corrected the entry
+clock; all eleven workers settled and both correctness gates passed. The
+fleet is available for dashboard testing; the temporary int4 serving canary
+has not run. For this dashboard release, `cascadia-639f0c02` is the binary
+rollback, with the same overrides and run.sh. See the latest JOURNAL entry.
+
 As of 038 (2026-09-21), the kept binary is `~/inkling-release/builds/cascadia-bf6540ea`,
 overrides `~/inkling-release/autolab-overrides/038_phrase_transfer.env`, with the same 032b run.sh below.
 035 adds the full-chain readiness gate; 034's ten frames were negative, so keep eleven.
