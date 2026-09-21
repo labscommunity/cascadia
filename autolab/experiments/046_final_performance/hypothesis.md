@@ -74,3 +74,16 @@ state in the exported data: the ascending low-concurrency phases had writes
 enabled; all later phases, including the reverse sweep and family tests,
 have writes disabled. This is an instrumentation change to disclose when
 interpreting repeats. No release or model-numerical change was made.
+
+## Execution note: admission backpressure at 128 streams
+
+The first 128-stream burst received an HTTP 503 and was stopped and excluded.
+Source inspection found the engine's pending queue is capped at 64, below
+the API's 512 in-flight permits. The client now retries only explicitly
+identified queue-full or permit-capacity responses, with bounded backoff
+and the original request deadline. Engine-unavailable 503s and other errors
+still stop the suite. Record rejected attempts and retain all queueing time
+in TTFT and end-to-end throughput. Server request counters include
+engine-queue rejections but exclude API-permit rejections; the accounting
+check distinguishes them. The 96-stream result remains valid, including
+its slowdown; compare against the reverse pass and telemetry.

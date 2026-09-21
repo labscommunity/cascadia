@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from pathlib import Path
 import statistics
 import time
@@ -150,14 +151,42 @@ class Sweep:
             raise RuntimeError(self.failure)
         started = time.time()
         row = dict(family=FAMILIES[family], family_index=family, prompt_index=index,
-                   prompt=prompt_for(family, index), started=started, events=[], text='', usage=None)
+                   prompt=prompt_for(family, index), started=started, events=[], text='', usage=None,
+                   capacity_retries=0, engine_queue_rejections=0, permit_rejections=0,
+                   capacity_retry_sleep_s=0)
         body = dict(model='model', messages=[dict(role='user', content=row['prompt'])],
                     temperature=0, max_tokens=tokens, stream=True, stream_options=dict(include_usage=True))
         seen_done = False
         try:
-            async with self.session.post(lab.API+'/v1/chat/completions', json=body,
-                                         timeout=aiohttp.ClientTimeout(total=self.cap)) as response:
-                response.raise_for_status()
+            while True:
+                if self.failure:
+                    raise RuntimeError(self.failure)
+                remaining=self.cap-(time.time()-started)
+                if remaining<=0:
+                    raise TimeoutError('Request deadline including capacity queueing exceeded')
+                response=await self.session.post(lab.API+'/v1/chat/completions',json=body,
+                                                 timeout=aiohttp.ClientTimeout(total=remaining))
+                if response.status<400:
+                    break
+                detail=await response.text()
+                response.release()
+                try: reason=json.loads(detail).get('error','')
+                except (ValueError,AttributeError): reason=''
+                queue_full=isinstance(reason,str) and re.fullmatch(r'queue full \(\d+ pending, cap \d+\)',reason)
+                permit_full=reason=='engine at capacity; retry after current requests complete'
+                if response.status!=503 or not (queue_full or permit_full):
+                    raise RuntimeError(f'HTTP {response.status}: {detail[:400]}')
+                row['capacity_retries']+=1
+                row['engine_queue_rejections' if queue_full else 'permit_rejections']+=1
+                row['last_capacity_response']=reason
+                if not getattr(self,'capacity_noted',False):
+                    self.capacity_noted=True
+                    lab.log('Capacity backoff:',reason)
+                delay=min(5,0.5+0.25*row['capacity_retries'])*(0.9+(index%5)*0.05)
+                row['capacity_retry_sleep_s']+=delay
+                await asyncio.sleep(delay)
+            async with response:
+                row['headers_s']=time.time()-started
                 async for line in response.content:
                     if not line.startswith(b'data:'):
                         continue
@@ -215,6 +244,7 @@ class Sweep:
             raw_path.rename(self.raw / (name + f'.previous-{time.time_ns()}.jsonl'))
         started = time.time(); rows = []; cohorts = []
         self.phase_active = True
+        self.capacity_noted = False
         try:
             for low in range(0, count, n):
                 cohort_start = time.time()
@@ -240,7 +270,8 @@ class Sweep:
             total = sum(r['tokens'] for r in rows)
             if after['tokens_total'] - before['tokens_total'] != total:
                 raise RuntimeError('Server token counter disagrees: competing traffic or lost token accounting')
-            if after['requests_total'] - before['requests_total'] != count:
+            queue_rejections=sum(r['engine_queue_rejections'] for r in rows)
+            if after['requests_total'] - before['requests_total'] != count+queue_rejections:
                 raise RuntimeError('Server request counter disagrees: competing traffic')
             overlap = sum(c['overlap_s'] for c in cohorts)
             overlap_tokens = sum(c['overlap_tokens'] for c in cohorts)
@@ -259,13 +290,16 @@ class Sweep:
                           prompt_tokens_median=quantile([r['prompt_tokens'] for r in rows],.5),
                           completion_tokens_median=quantile([r['tokens'] for r in rows],.5),
                           early_finish=sum(r['tokens']<tokens for r in rows),
+                          capacity_retries=sum(r['capacity_retries'] for r in rows),
+                          engine_queue_rejections=queue_rejections,
                           chunks=sum(r['chunks'] for r in rows), cohorts=cohorts,
                           request_metrics=[{k:v for k,v in r.items() if k not in ['text','prompt','events','usage']}
                                            for r in rows])
             self.results.append(result); atomic_json(self.result_path,self.results)
             lab.log(f"DONE {name}: steady {result['steady_aggregate_tok_s']:.2f} total / "
                     f"{result['steady_per_stream_tok_s']:.2f} per stream; end-to-end {result['aggregate_tok_s']:.2f}; "
-                    f"TTFT p50/p95 {result['ttft_median_s']:.2f}/{result['ttft_p95_s']:.2f}s")
+                    f"TTFT p50/p95 {result['ttft_median_s']:.2f}/{result['ttft_p95_s']:.2f}s; "
+                    f"capacity retries {result['capacity_retries']}")
             await asyncio.sleep(5)
             return result
         except BaseException as e:

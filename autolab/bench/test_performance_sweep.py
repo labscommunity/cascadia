@@ -46,25 +46,33 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         t=time.time()
         def row(index):
             return dict(events=[[t+index*.01,1],[t+1+index*.01,2]],tokens=3,
-                        ttft_s=.1,wall_s=1.1,prompt_tokens=12,chunks=2,text='abc')
+                        ttft_s=.1,wall_s=1.1,prompt_tokens=12,chunks=2,text='abc',
+                        capacity_retries=0,engine_queue_rejections=0)
         with tempfile.TemporaryDirectory() as d, patch.object(perf.lab,'LAB',d), \
              patch.object(perf.Path,'home',return_value=Path(d)), \
              patch.object(perf,'check_fleet',return_value=1), \
              patch.object(perf.asyncio,'sleep',new=AsyncMock()):
             sweep=perf.Sweep('fixture')
             sweep.stats=AsyncMock(side_effect=[dict(requests_in_flight=0,tokens_total=0,requests_total=0),
-                                               dict(requests_in_flight=0,tokens_total=6,requests_total=2)])
-            sweep.request=AsyncMock(side_effect=[row(0),row(1)])
+                                               dict(requests_in_flight=0,tokens_total=6,requests_total=3)])
+            first=row(0);first.update(capacity_retries=1,engine_queue_rejections=1)
+            sweep.request=AsyncMock(side_effect=[first,row(1)])
             result=await sweep.phase('check',2,3,family=0)
             self.assertEqual(result['tokens'],6)
+            self.assertEqual(result['engine_queue_rejections'],1)
             self.assertGreater(result['wall_s'],0)
             self.assertEqual(json.loads(sweep.result_path.read_text())[0]['phase'],'check')
 
-    async def fetch(self, usage=5, done=True):
+    async def fetch(self, usage=5, done=True, reject=None):
         import json
+        attempts=0
         async def handler(request):
+            nonlocal attempts
+            attempts+=1
             body=await request.json()
             self.assertTrue(body['stream_options']['include_usage'])
+            if reject and attempts==1:
+                return web.json_response(dict(error=reject),status=503)
             records=[dict(n_tokens=3,choices=[dict(delta=dict(content='abc'),finish_reason=None)]),
                      dict(n_tokens=2,choices=[dict(delta=dict(content='de'),finish_reason=None)]),
                      dict(n_tokens=1,choices=[dict(delta=dict(content=''),finish_reason='length')]),
@@ -97,6 +105,17 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_incomplete_stream_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError,'Incomplete stream'):
             await self.fetch(done=False)
+
+    async def test_capacity_retry_keeps_queue_wait_in_latency_and_counts_rejection(self):
+        row=await self.fetch(reject='queue full (64 pending, cap 64)')
+        self.assertEqual(row['capacity_retries'],1)
+        self.assertEqual(row['engine_queue_rejections'],1)
+        self.assertGreaterEqual(row['ttft_s'],.6)
+        self.assertEqual(row['tokens'],5)
+
+    async def test_unavailable_engine_is_not_retried_as_capacity(self):
+        with self.assertRaisesRegex(RuntimeError,'HTTP 503'):
+            await self.fetch(reject='not connected')
 
 
 if __name__=='__main__':unittest.main()

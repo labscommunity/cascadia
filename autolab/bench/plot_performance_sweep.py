@@ -40,6 +40,8 @@ def main():
     incident_path=root/'capture-budget-event.json'
     capture_event=json.loads(incident_path.read_text()) if incident_path.exists() else None
     for phase in phases:
+        phase.setdefault('capacity_retries',0)
+        phase.setdefault('engine_queue_rejections',0)
         prompts=[prompt_for(r['family_index'],r['prompt_index']) for r in phase['request_metrics']]
         phase['unique_prompts']=len(set(prompts))
         phase['capture_writes']=('disabled_after_budget' if capture_event and
@@ -48,7 +50,8 @@ def main():
             'steady_aggregate_tok_s','steady_per_stream_tok_s','aggregate_tok_s','overlap_s',
             'stream_tok_s_median','stream_tok_s_p10','stream_tok_s_p90','stream_tok_s_max',
             'ttft_median_s','ttft_p95_s','ttft_max_s','prompt_tokens_median',
-            'completion_tokens_median','early_finish','unique_prompts','capture_writes']
+            'completion_tokens_median','early_finish','unique_prompts','capture_writes',
+            'capacity_retries','engine_queue_rejections']
     with (root/'phase-results.csv').open('w',newline='') as f:
         writer=csv.DictWriter(f,fieldnames=fields,lineterminator='\n');writer.writeheader()
         writer.writerows({k:r.get(k) for k in fields} for r in phases)
@@ -77,6 +80,10 @@ def main():
             'high-concurrency family cohorts can repeat identical prompts. `unique_prompts` in '
             'the phase CSV records diversity; family maxima describe these pools, not a guarantee '
             'for arbitrary novel prompts.','']
+    report += ['At high concurrency, the engine’s 64-entry pending queue can reject a burst '
+               'before the API’s 512-request limit is reached. Only explicit capacity rejections '
+               'are retried with bounded backoff; retry counts are recorded and all queueing '
+               'time remains included in TTFT and end-to-end throughput. Other errors stop the run.','']
     if capture_event:
         report += ['The bounded diagnostic capture reached its storage budget during the first '
                    '22-stream attempt. That incomplete attempt was excluded and repeated. Capture '
