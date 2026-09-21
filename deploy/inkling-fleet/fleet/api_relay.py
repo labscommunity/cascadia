@@ -11,7 +11,7 @@ One request is answered here: `GET /api/fleet/telemetry`. That file is written b
 rank 0 (this one), so the API process on the other box does not have it. To make the check apply to every request,
 the relay asks for one request per connection (`Connection: close` towards the upstream). Standard library only.
 """
-import argparse, asyncio, os, sys, time
+import argparse, asyncio, os, re, sys, time
 
 HEAD_LIMIT = 65536
 
@@ -71,6 +71,19 @@ async def handle(reader, writer, a):
             await writer.drain()
             return
         host, port = a.upstream.rsplit(":", 1)
+        capture = path.startswith(b"/api/fleet/capture/")
+        if capture:
+            match = re.fullmatch(rb"/api/fleet/capture/(10|[0-9])/(index\.jsonl|r[0-9]+-s[0-9]+-[0-9]+-[0-9]+-[0-9]+\.bin)", path)
+            if first[0] != b"GET" or not match or not getattr(a, "capture_fleet", ""):
+                writer.write(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+                return
+            host = "%s-rank-%s" % (a.capture_fleet, match[1].decode())
+            port = a.capture_port
+            # Build a fresh GET: capture access has no request body and no
+            # caller-controlled upstream, headers, traversal or query string.
+            head = b"GET /" + match[2] + b" HTTP/1.1\r\nHost: capture\r\n\r\n"
+            cut = head.index(b"\r\n\r\n")
         try:
             up_reader, up_writer = await asyncio.wait_for(asyncio.open_connection(host, int(port)), timeout=10)
         except (OSError, asyncio.TimeoutError) as e:
@@ -81,7 +94,10 @@ async def handle(reader, writer, a):
             return
         up_writer.write(one_request_per_connection(head[:cut]) + head[cut + 4:])
         await up_writer.drain()
-        await asyncio.gather(pipe(reader, up_writer), pipe(up_reader, writer))
+        if capture:
+            await pipe(up_reader, writer)
+        else:
+            await asyncio.gather(pipe(reader, up_writer), pipe(up_reader, writer))
     except (asyncio.TimeoutError, ConnectionError, OSError):
         pass
     finally:
@@ -104,6 +120,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--listen", type=int, default=8000)
     ap.add_argument("--upstream", required=True, help="host:port of the box that plays pipeline rank 0")
+    ap.add_argument("--capture-fleet", default="", help="enable read-only state capture downloads for this fleet")
+    ap.add_argument("--capture-port", type=int, default=9204)
     ap.add_argument("--telemetry", default=os.environ.get("CASCADIA_FLEET_TELEMETRY_FILE", "/run/cascadia-inkling/telemetry.json"))
     a = ap.parse_args()
     try:
