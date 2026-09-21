@@ -164,8 +164,8 @@ Terminal look: `bg-night-2 border border-night-rule rounded-md`, mono font,
   state-warm, `prefill` celadon (pulsing), `streaming` mint-bright,
   `cooldown` night-dim, `paused` night-low, `error` state-error.
 - **Body** (`flex-1 min-h-0 overflow-y-auto px-3 py-2`): scrollback of the
-  last **3** finished exchanges rendered dimmed (`text-night-low`), then the
-  current exchange: `> {prompt}` in `text-night-dim`, then the streamed reply
+  last **3** earlier exchanges (finished, or cut short by Skip or Stop)
+  rendered dimmed (`text-night-low`), then the current exchange: `> {prompt}` in `text-night-dim`, then the streamed reply
   in `text-night-ink whitespace-pre-wrap`, then a blinking block cursor
   (`▌`, 1 s step animation) while `prefill`/`streaming`. Auto-scrolls to the
   bottom on every update using `scrollTop = scrollHeight` (same technique as
@@ -248,7 +248,7 @@ export type StreamState = {
   attempt: number;            // 503 retries for the current prompt
   error: string | null;
   pauseRequested: boolean;    // Pause pressed mid-reply; idles after it
-  history: Exchange[];        // last 3 finished exchanges, oldest first
+  history: Exchange[];        // last 3 earlier exchanges, oldest first
 };
 
 export type Aggregate = {
@@ -310,16 +310,21 @@ class StreamRunner {
   4. On the first chunk: status `streaming`, record TTFT. Per chunk: append
      `delta.content`, `tokens += n_tokens ?? 1`, push `(now, n)` to the
      shared token ring, recompute `elapsedMs` and `tokPerSec`.
-  5. On `[DONE]`: push the exchange onto `history` (cap 3),
-     `completedReplies++`, status `cooldown`, wait a uniform random
-     duration in `[cooldownMinS, cooldownMaxS]` seconds, go to 1.
+  5. On `[DONE]`: `completedReplies++`. If Pause was requested, park
+     (status `paused`). Otherwise status `cooldown`, wait a uniform random
+     duration in `[cooldownMinS, cooldownMaxS]` seconds, go to 1. The
+     finished exchange moves into `history` (cap 3) when the *next* prompt
+     begins, so it stays bright through its cooldown and dims only when
+     replaced; an exchange cut short by Skip or Stop is archived the same
+     way if it produced any text.
 - **backoff(attempt)** = `min(5000, 500 + 250 × attempt) × U(0.8, 1.2)` ms.
   Unlimited attempts while running.
 - **stop():** `running = false`; abort every controller, clear every timer,
   set every non-paused stream to `idle` (keep `prompt`, `reply`, `history`,
   metrics on screen), `pauseRequested = false` everywhere.
 - **pauseStream(id):** if `streaming`/`prefill` → `pauseRequested = true`
-  (finishes the reply, then `paused`). If `queued`/`cooldown` → cancel the
+  (finishes the reply, then `paused`; if that attempt instead ends in a 503
+  or network error, the stream parks at once rather than retrying). If `queued`/`cooldown` → cancel the
   pending timer/retry, status `paused` now. If `idle` (runner stopped) →
   status `paused` so it stays out on the next Play.
 - **resumeStream(id):** status `idle`; if running, launch its loop.
