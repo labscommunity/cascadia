@@ -18,6 +18,8 @@ An **88-stream refinement** was added after the first sweep and the 176-stream r
 
 The owner paused and later resumed collection. Completed phases were retained and the interrupted 88-stream repeat was restarted. The serving release and worker restart counts were unchanged. Other generation occurred during the pause, so subsequent results also reflect any phrase-history learning from that traffic. It is excluded from all measured phase counters. See [pause history](pause-history.json).
 
+An additional resumed 88-stream attempt was excluded after other generation raised the API count to 94 active requests. Completed phases are unaffected. The watchdog now stops immediately when active requests exceed the phase concurrency, in addition to the final token and request counter checks.
+
 Best observed sustained aggregate: **58.86 tok/s at 88 streams**.
 Smallest tested setting within 95% of that peak: **88 streams**.
 Best observed throughput including startup/drain: **46.03 tok/s at 88 streams**.

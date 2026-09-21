@@ -40,6 +40,15 @@ class HealthTests(unittest.TestCase):
 
 
 class ClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_watch_stops_when_other_requests_exceed_phase_concurrency(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(perf.lab,'LAB',d), \
+             patch.object(perf.Path,'home',return_value=Path(d)):
+            sweep=perf.Sweep('competing')
+            sweep.phase_active=True;sweep.phase_concurrency=2
+            sweep.stats=AsyncMock(return_value=dict(requests_in_flight=3))
+            await sweep.watch()
+            self.assertIn('Competing generation: 3 active requests',sweep.failure)
+
     async def test_recorded_concurrency_cap_survives_resume_and_limits_family_tests(self):
         import json
         with tempfile.TemporaryDirectory() as d, patch.object(perf.lab,'LAB',d), \

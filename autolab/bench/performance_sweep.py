@@ -113,6 +113,7 @@ class Sweep:
         self.pending = set()
         self.failure = None
         self.phase_active = False
+        self.phase_concurrency = None
         self.session = None
 
     async def stats(self):
@@ -128,6 +129,9 @@ class Sweep:
                 while True:
                     stats = await self.stats()
                     f.write(json.dumps(dict(time=time.time(), **stats)) + '\n'); f.flush()
+                    if self.phase_active and stats['requests_in_flight']>self.phase_concurrency:
+                        raise RuntimeError(f"Competing generation: {stats['requests_in_flight']} active requests "
+                                           f"exceeds this phase's {self.phase_concurrency} streams")
                     now = time.monotonic()
                     if now - last_health >= 25:
                         report = await asyncio.to_thread(check_fleet)
@@ -244,6 +248,7 @@ class Sweep:
             raw_path.rename(self.raw / (name + f'.previous-{time.time_ns()}.jsonl'))
         started = time.time(); rows = []; cohorts = []
         self.phase_active = True
+        self.phase_concurrency = n
         self.capacity_noted = False
         try:
             for low in range(0, count, n):
@@ -308,6 +313,7 @@ class Sweep:
             raise
         finally:
             self.phase_active = False
+            self.phase_concurrency = None
 
     async def run(self, suite, max_streams=None):
         timeout = aiohttp.ClientTimeout(total=10)
@@ -374,7 +380,7 @@ def main():
     args=ap.parse_args()
     pause_path=Path(lab.LAB)/'experiments'/args.exp/'paused.json'
     if pause_path.exists():
-        raise SystemExit('Owner paused testing. Wait for an explicit resume instruction before clearing paused.json.')
+        raise SystemExit('Survey paused: '+json.loads(pause_path.read_text()).get('reason','see paused.json'))
     owner=Path(lab.LOCK).read_text()
     if 'autolab-continuation-20260921' not in owner:
         raise SystemExit('Publisher ownership changed')

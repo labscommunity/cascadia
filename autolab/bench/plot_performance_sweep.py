@@ -72,7 +72,7 @@ def main():
     limit=json.loads(limit_path.read_text())['max_streams'] if limit_path.exists() else None
     status=('Completed survey' if complete else 'IN PROGRESS — completed phases only')
     paused=(root/'paused.json').exists()
-    if paused:status='PAUSED by owner — completed phases only'
+    if paused:status='PAUSED — completed phases only'
     if limit:status+=f' (capped at {limit} streams)'
     report=['# Inkling fleet performance survey','',status,'',
             'Eleven Panther Lake boxes; release `1790016660`; int4 experts and int8 attention. '
@@ -124,6 +124,11 @@ def main():
                  'pause, so subsequent results also reflect any phrase-history learning from '
                  'that traffic. It is excluded from all measured phase counters. See '
                  '[pause history](pause-history.json).','']
+    if (root/'competing-traffic-event.json').exists():
+        report+=['An additional resumed 88-stream attempt was excluded after other generation '
+                 'raised the API count to 94 active requests. Completed phases are unaffected. '
+                 'The watchdog now stops immediately when active requests exceed the phase '
+                 'concurrency, in addition to the final token and request counter checks.','']
     if grouped:
         ns=list(grouped)
         steady=[avg(grouped[n],'steady_aggregate_tok_s') for n in ns]

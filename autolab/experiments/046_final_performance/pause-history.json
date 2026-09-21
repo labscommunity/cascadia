@@ -15,5 +15,16 @@
       "tokens_total_delta": 32280,
       "note": "Outside survey phases; learned phrase history may have changed. Not included in measurements."
     }
+  },
+  {
+    "time": 1790033350.603082,
+    "reason": "Competing generation detected after resume:94active requests during88-stream phase. Awaiting confirmation other traffic is stopped.",
+    "resume_requires": "Exclusive measurement window; owner has already authorized resumption",
+    "interrupted_phase": "mixed_b_c088",
+    "completed_phases": 18,
+    "expected_active_max": 88,
+    "observed_active": 94,
+    "resumed_at": 1790033451.455988,
+    "resume_authorization": "Owner confirmed: Other traffic stopped; continue"
   }
 ]
