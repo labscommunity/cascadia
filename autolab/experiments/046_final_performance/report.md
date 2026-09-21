@@ -20,9 +20,9 @@ The owner paused and later resumed collection. Completed phases were retained an
 
 An additional resumed 88-stream attempt was excluded after other generation raised the API count to 94 active requests. Completed phases are unaffected. The watchdog now stops immediately when active requests exceed the phase concurrency, in addition to the final token and request counter checks.
 
-Best observed sustained aggregate: **58.86 tok/s at 88 streams**.
+Best observed sustained aggregate: **60.29 tok/s at 88 streams**.
 Smallest tested setting within 95% of that peak: **88 streams**.
-Best observed throughput including startup/drain: **46.03 tok/s at 88 streams**.
+Best observed throughput including startup/drain: **46.87 tok/s at 88 streams**.
 
 These are different objectives from maximizing each user’s speed. Use the latency and per-stream columns to choose an operating point.
 
@@ -42,8 +42,8 @@ These are different objectives from maximizing each user’s speed. Use the late
 | 22 | 1 | 34.50 | 1.57 | 29.89 | 9.54 / 13.51 |
 | 32 | 1 | 38.48 | 1.20 | 32.68 | 12.39 / 20.81 |
 | 48 | 1 | 46.01 | 0.96 | 38.24 | 18.72 / 31.24 |
-| 64 | 1 | 53.74 | 0.84 | 42.30 | 25.21 / 47.49 |
-| 88 | 1 | 58.86 | 0.67 | 46.03 | 36.23 / 64.18 |
+| 64 | 2 | 53.60 | 0.84 | 42.41 | 25.10 / 46.41 |
+| 88 | 2 | 60.29 | 0.69 | 46.87 | 34.61 / 64.75 |
 | 96 | 2 | 46.85 | 0.49 | 39.79 | 38.94 / 71.31 |
 | 128 | 2 | 50.10 | 0.39 | 41.61 | 55.11 / 108.73 |
 | 176 | 2 | 57.72 | 0.33 | 45.24 | 76.83 / 165.34 |

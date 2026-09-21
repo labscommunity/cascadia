@@ -148,6 +148,10 @@ def main():
         axes[0].fill_between(ns,lo,hi,color='#176b78',alpha=.15,label='Repeat range')
         axes[0].plot(ns,end,'s--',color='#bc6b26',label='Including startup and drain')
         axes[0].axhline(max(steady)*.95,color='#777',ls=':',lw=1,label='95% of observed peak')
+        if 88 in ns and 96 in ns and steady[ns.index(96)]<steady[ns.index(88)]*.9:
+            axes[0].annotate('96-stream dip',xy=(96,steady[ns.index(96)]),
+                             xytext=(14,-38),textcoords='offset points',fontsize=8,
+                             arrowprops=dict(arrowstyle='-',color='#777'),color='#555')
         axes[0].set(ylabel='Aggregate output tokens / second',title='Fleet throughput')
         axes[0].set_ylim(bottom=0)
         axes[0].legend(fontsize=8)

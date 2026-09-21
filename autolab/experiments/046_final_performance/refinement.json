@@ -4,7 +4,7 @@
   "runs": 2,
   "rationale": "Eight rows in each of eleven pipeline groups; test observed batch-size dependence between 64 and 96",
   "timing": "After original ascending pass and 176-stream reverse repeat; before family concurrency selection",
-  "status": "First88run completed at58.86tok/s; owner paused during second88run, which is excluded and must be repeated on explicit resume.",
+  "status": "Both88-stream measurements completed:58.860866 and61.711884tok/s; pairedmean60.286375. Owner pause and competing-traffic interruptions excluded.",
   "boundary_phase": "mixed_b_c128",
   "pause_type": "intentional client SIGINT after results persisted and all requests completed; no fleet restart"
 }
