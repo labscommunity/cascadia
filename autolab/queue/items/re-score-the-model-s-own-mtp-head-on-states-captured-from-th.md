@@ -1,17 +1,17 @@
 ---
 id: re-score-the-model-s-own-mtp-head-on-states-captured-from-th
 title: re-score the model's own MTP head on states captured from the fleet (f16 fused experts, int8 attention), same 36 prompts as 033
-status: blocked
+status: running
 outcome: 
 priority: 7
 target: single stream, 15 streams
 exact: n/a
-needs: the fleet state capture item; scoring with autolab/research/mtp_offline/mtp_score.py on the build host's CPU (~30 s a sequence); no Mac Pro
+needs: collecting 36 original rendered prompts from the settled and gated fleet, then score on miner
 proposed_by: autolab session 2026-09-20 (user: use the fleet, not the Mac Pro)
-owner: 
-experiment: 
+owner: autolab-continuation-20260921
+experiment: 039_mtp_fleet_rescore
 created: 2026-09-20
-updated: 2026-09-20
+updated: 2026-09-21
 ---
 
 ## Hypothesis

@@ -797,11 +797,13 @@ pub fn load_stage(
         }
     }
     if super::env_flag("CASCADIA_INKLING_EXPERT_COUNTS") {
+        let mut reporter = super::expert_counts::Reporter::default();
         for (i, layer) in layers.iter_mut().enumerate() {
             if let Some(moe) = layer.moe_mut() {
-                moe.set_route_observer(Some(super::expert_counts::observer(lo + i, m.num_experts)));
+                moe.set_route_observer(Some(reporter.observer(lo + i, m.num_experts)));
             }
         }
+        reporter.start();
     }
     Ok(InklingStage {
         embed,

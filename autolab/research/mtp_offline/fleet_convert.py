@@ -31,6 +31,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--captures', required=True); ap.add_argument('--prompts', required=True)
     ap.add_argument('--weights', required=True); ap.add_argument('--out', required=True)
+    ap.add_argument('--api-mode', choices=['completion', 'chat'], default='completion',
+                    help='raw completions skip structural tokens; chat translates markers')
     a = ap.parse_args()
     torch.set_num_threads(8)
     torch.set_grad_enabled(False)
@@ -61,8 +63,11 @@ def main():
             generated = samples[prompt_rows - 1:]
             if not prompt_rows or (generated < 0).any():
                 raise ValueError('missing prompt boundary or sampled tokens')
-            decoded = api_text(tok.decode(generated.tolist(), skip_special_tokens=False))
-            candidates = [(common_prefix(decoded, api_text(r['response']['text'])), r) for r in responses
+            decoded = tok.decode(generated.tolist(), skip_special_tokens=a.api_mode == 'completion')
+            if a.api_mode == 'chat':
+                decoded = api_text(decoded)
+            response_text = lambda r: (api_text(r['response']['text']) if a.api_mode == 'chat' else r['response']['text'])
+            candidates = [(common_prefix(decoded, response_text(r)), r) for r in responses
                           if r['i'] not in used and len(prompts[r['i']]) == prompt_rows]
             candidates.sort(key=lambda pair: pair[0], reverse=True)
             if not candidates or candidates[0][0] < min(120, len(decoded)):
@@ -70,6 +75,8 @@ def main():
             if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
                 raise ValueError('ambiguous capture/API match')
             agreement, response = candidates[0]
+            if decoded != response_text(response):
+                raise ValueError('capture/API text differs after %d characters for request %d' % (agreement, response['i']))
             i = response['i']; used.add(i)
             ids = torch.tensor(prompts[i] + generated.tolist(), dtype=torch.int64)
             residuals = torch.stack([torch.frombuffer(data, dtype=dtype, count=hidden,

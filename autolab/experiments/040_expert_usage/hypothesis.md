@@ -3,8 +3,12 @@
 Count routed selections in every MoE layer with
 CASCADIA_INKLING_EXPERT_COUNTS=1 (default off). Counts include prompt and
 decode routing work, including speculative or fallback evaluations. Shared
-experts are excluded. Every 1024 routing rows, emit cumulative top-16/32/64
-shares, maximum share and distinct count using a changing per-layer tag.
+experts are excluded. A diagnostic thread per stage rotates one cumulative
+layer summary every seven seconds: top-16/32/64 shares, maximum share and
+distinct count, with a tag that changes with the row count. The beacon polls
+only the latest profile line every five seconds; simultaneous layer reports
+would silently lose five of six. Repeated rounds tolerate ordinary profiles
+replacing an occasional diagnostic line. No logging on the inference path.
 
 Run the twelve prompt families at fifteen streams for at least ten minutes.
 Uniform routing gives top-64 share 25%; the hot-replica proposal requires

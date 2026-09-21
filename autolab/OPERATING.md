@@ -31,11 +31,13 @@ They live in files on the operator's Mac that this document names.
 
 ## 2. Known-good releases and the current experiment
 
-As of 035 (2026-09-21), the kept binary is `~/inkling-release/builds/cascadia-5b090e55`,
-overrides `~/inkling-release/autolab-overrides/035_chain_readiness.env`, with the same 032b run.sh below.
-It adds `CASCADIA_STREAMS_READY_GATE=1` on role 0; both gates passed and 15 streams measured 24.21/24.63 tok/s.
-034's ten frames were negative: keep eleven. 037 is enabling final-state capture as a temporary measurement;
-check `~/inkling-release/autolab-state/continuation.json` and the signed release status for the active files.
+As of 038 (2026-09-21), the kept binary is `~/inkling-release/builds/cascadia-bf6540ea`,
+overrides `~/inkling-release/autolab-overrides/038_phrase_transfer.env`, with the same 032b run.sh below.
+035 adds the full-chain readiness gate; 034's ten frames were negative, so keep eleven.
+037's capture uses original f32 residuals (INKCAP02); raw states exceed f16 range.
+Capture writes are off after the validated 36-prompt collection. 038 merged the old
+entry box's phrase table into the new head, preserving both histories and a backup.
+Check `~/inkling-release/autolab-state/continuation.json` and signed status for active experiments.
 The table below remains the earlier rollback, with readiness and capture disabled.
 
 | | file on the operator's Mac |
@@ -45,7 +47,7 @@ The table below remains the earlier rollback, with readiness and capture disable
 | overrides | `~/inkling-release/autolab-overrides/032b_role_swap.env` |
 | status.sh | `deploy/inkling-fleet/fleet/status.sh` |
 
-* **Stay on the swap (normal):** the three files above. This is the base for every new experiment.
+* **Stay on the swap (normal):** keep the 032b run.sh and copy the latest published true overrides for each experiment; the table above is an earlier rollback.
 * **Undo the swap:** `deploy/inkling-fleet/fleet/run.sh` (its `ROLE_SWAP` is empty) + `030_clean_exact.env`, with
   `--allow-role-change --allow-no-relay --allow-infra`. Every box returns to its installed role; its own data was
   never touched. This puts the API back on the box that loses power: only do it on the owner's word.

@@ -57,8 +57,9 @@ def main():
                            o_us=round(statistics.median(os)), relative_rms_ppm=round(1e6*np.sqrt(diff2/max(ref2,1e-30))))
                 records.append(rec)
                 line = 'AQ%dB%dR%d probe stage profile ' % (layer,bits,rows) + ' '.join('%s=%s' % kv for kv in rec.items())
-                # Repeat for the journal follower, with the same de-duplicated tag.
-                for _ in range(3):
+                # The beacon samples the latest journal profile every five
+                # seconds. Keep each result current for longer than one poll.
+                for _ in range(7):
                     print(line, flush=True); time.sleep(1)
             del q, o, weights, wo, compiled_q, compiled_o, rq, ro, yq, yo
             gc.collect()

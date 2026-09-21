@@ -291,3 +291,29 @@ and `forward` immediately retried `forward_rows`. The fallback now enters
 the host/per-expert path directly. Three dense/kernel tests, nineteen
 model/parity tests (including HF goldens), and the speculative pipeline
 test passed. This fix is for the next binary; it is not in bf6540ea.
+
+037b settled and passed both gates. F32 capture measured 24.43 / 24.48 tok/s
+at fifteen streams, with all requests complete. The 36 original rendered
+033 prompts yielded 5,760 actual sampled tokens. All files were finite and
+all decoded outputs matched the complete completion API responses. Raw
+completion decoding skips structural tokens; the converter now uses that
+same rule. Capture tooling kept; writes disabled in 038 after collection.
+039's original and quantized MTP scorers are running on the build host.
+
+038 is rolling out the bounded, verified phrase-table merge. Its baseline
+on the original 031 prompts was 4.12 explain, 4.26 story, 5.22 code,
+9.87 arithmetic, 5.87 rewriting and 4.91 true/false tokens/s. Capturing new
+states is turned off in the same release; do not attribute small timing
+differences to table seeding alone. Successful merge counts and exact gates
+are the primary result.
+
+038 kept: signed release 1789971870 settled, both gates passed, merged
+contexts 24,453 -> 194,299. Repeated 031 prompts improved substantially
+(4.12 -> 7.73 explain, 4.26 -> 7.22 story); repetition also learns those
+phrases, so this is not an unseen-prompt or isolated transfer speed claim.
+
+Before 040, corrected diagnostic delivery: the beacon samples just the
+latest profile every five seconds. Simultaneous expert-layer summaries
+would lose five of six. A stage reporter now rotates one layer every seven
+seconds, out of the inference path; tests cover every layer and lifetime.
+041 holds each kernel result for seven seconds for the same reason.

@@ -1,8 +1,8 @@
 ---
 id: fleet-state-capture-final-and-rank-boundary-residuals-writte
 title: fleet state capture: final and rank-boundary residuals written on the boxes, fetched through the entry box's relay (replaces the Mac Pro dump)
-status: running
-outcome: 
+status: done
+outcome: kept
 priority: 5
 target: offline studies on the fleet's own numerics; first step of the MTP wiring
 exact: yes

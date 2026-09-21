@@ -1,17 +1,17 @@
 ---
 id: carry-the-memorised-phrase-table-spec-ngrams-bin-from-the-en
 title: carry the memorised-phrase table (spec-ngrams.bin) from the entry box to the box that plays rank 0
-status: ready
-outcome: 
+status: done
+outcome: kept
 priority: 6
 target: single stream
 exact: yes
-needs: overrides only: the entry box copies the file into model/.role-swap/ (served by role_sync.py), the other box fetches it once before its worker starts
+needs: verified transfer complete; 24453 -> 194299 contexts; both gates pass
 proposed_by: autolab session 2026-09-20
-owner: 
-experiment: 
+owner: autolab-continuation-20260921
+experiment: 038_phrase_transfer
 created: 2026-09-20
-updated: 2026-09-20
+updated: 2026-09-21
 ---
 
 ## Hypothesis

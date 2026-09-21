@@ -42,8 +42,9 @@ def raw_completion(prompt, tokens):
             if 'error' in item:
                 raise RuntimeError(str(item['error']))
             choice = item.get('choices', [{}])[0]
+            count += item.get('n_tokens', 0 if choice.get('finish_reason') else 1)
             if choice.get('text'):
-                text.append(choice['text']); count += 1
+                text.append(choice['text'])
     return dict(text=''.join(text), tokens=count)
 
 
@@ -63,44 +64,52 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     corpus = [json.loads(line) for line in Path(a.corpus).read_text().splitlines()][:a.prompts]
     rendered = {r['i']: r['text'] for r in (json.loads(l) for l in Path(a.rendered).read_text().splitlines())} if a.rendered else {}
-    for lo in range(0, len(corpus), a.streams):
-        batch_dir = out / ('batch-%03d' % lo)
-        if (batch_dir / 'complete.json').exists():
-            lab.log('capture batch already complete:', lo)
-            continue
-        batch_dir.mkdir(exist_ok=True)
-        before = {r['file'] for r in index(a.box)}
-        batch = corpus[lo:lo + a.streams]
+    telemetry = lab.Telemetry(str(out / 'telemetry.jsonl'))
+    telemetry.start()
+    started = time.monotonic()
+    try:
+        for lo in range(0, len(corpus), a.streams):
+            batch_dir = out / ('batch-%03d' % lo)
+            if (batch_dir / 'complete.json').exists():
+                lab.log('capture batch already complete:', lo)
+                continue
+            batch_dir.mkdir(exist_ok=True)
+            before = {r['file'] for r in index(a.box)}
+            batch = corpus[lo:lo + a.streams]
 
-        def one(item):
-            result = raw_completion(rendered[item['i']], a.tokens) if rendered else lab.chat(item['i'], a.tokens, timeout=900, prompt=item['prompt'])
-            return dict(i=item['i'], family=item['i'] % 12, prompt=item['prompt'], response=result)
+            def one(item):
+                result = raw_completion(rendered[item['i']], a.tokens) if rendered else lab.chat(item['i'], a.tokens, timeout=900, prompt=item['prompt'])
+                return dict(i=item['i'], family=item['i'] % 12, prompt=item['prompt'], response=result)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as ex:
-            responses = list(ex.map(one, batch))
-        (batch_dir / 'responses.json').write_text(json.dumps(responses, indent=1))
-        if any('error' in r['response'] for r in responses):
-            raise RuntimeError('API request failed; responses saved, stopping collection')
-        deadline = time.monotonic() + 60
-        while True:
-            new = [r for r in index(a.box) if r['file'] not in before]
-            if len(new) >= len(batch):
-                break
-            if time.monotonic() >= deadline:
-                raise RuntimeError('missing completed captures; check budget and capture-server state')
-            time.sleep(2)
-        for record in new:
-            name = record['file']
-            if Path(name).name != name:
-                raise ValueError('invalid capture filename')
-            with lab.OPENER.open(lab.API + '/api/fleet/capture/%d/%s' % (a.box, name), timeout=120) as r:
-                data = r.read(64 * 1024 * 1024)
-            if len(data) != record['size']:
-                raise ValueError('capture size mismatch')
-            (batch_dir / name).write_bytes(data)
-        (batch_dir / 'complete.json').write_text(json.dumps(new, indent=1))
-        lab.log('captured batch %d: %d requests, %d files, %.1f MiB' % (
-            lo, len(batch), len(new), sum(r['size'] for r in new) / 2**20))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as ex:
+                responses = list(ex.map(one, batch))
+            (batch_dir / 'responses.json').write_text(json.dumps(responses, indent=1))
+            if any('error' in r['response'] for r in responses):
+                raise RuntimeError('API request failed; responses saved, stopping collection')
+            deadline = time.monotonic() + 60
+            while True:
+                new = [r for r in index(a.box) if r['file'] not in before]
+                if len(new) >= len(batch):
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('missing completed captures; check budget and capture-server state')
+                time.sleep(2)
+            for record in new:
+                name = record['file']
+                if Path(name).name != name:
+                    raise ValueError('invalid capture filename')
+                with lab.OPENER.open(lab.API + '/api/fleet/capture/%d/%s' % (a.box, name), timeout=120) as r:
+                    data = r.read(64 * 1024 * 1024)
+                if len(data) != record['size']:
+                    raise ValueError('capture size mismatch')
+                (batch_dir / name).write_bytes(data)
+            (batch_dir / 'complete.json').write_text(json.dumps(new, indent=1))
+            lab.log('captured batch %d: %d requests, %d files, %.1f MiB' % (
+                lo, len(batch), len(new), sum(r['size'] for r in new) / 2**20))
+    finally:
+        telemetry.stop_ev.set()
+        telemetry.join(timeout=25)
+        lab.log('capture collection elapsed %.1f seconds' % (time.monotonic() - started))
 
 
 if __name__ == '__main__':
