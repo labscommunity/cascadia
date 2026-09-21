@@ -72,6 +72,15 @@ def fleet_rows(st):
     return rows
 
 
+def worker_is_serving(row):
+    # An idle head can age its original API startup line out of the beacon's
+    # journal window. The full-chain readiness probe then supplies its phase.
+    phase = row.get("phase", "")
+    return row.get("state") == "active" and (
+        phase.startswith("serving") or phase == "pipeline chain ready; accepting requests total=11"
+    )
+
+
 def sha256(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -87,7 +96,7 @@ def cmd_status(a):
     print("report %.0f s old; release %s; files version %s; %d/11 ranks active; restarts %s" % (
         age, st.get("poller", {}).get("applied"), st.get("fleet", {}).get("version"),
         sum(1 for r in rows.values() if r["state"] == "active"), " ".join(str(rows[k]["restarts"]) for k in sorted(rows))))
-    bad = {k: v["phase"] for k, v in rows.items() if v["phase"] != "serving"}
+    bad = {k: v["phase"] for k, v in rows.items() if not worker_is_serving(v)}
     if bad:
         print("not serving:", bad)
     if a.log:
@@ -111,7 +120,7 @@ def settle(expect, cap=900, steady=3):
         rows = fleet_rows(st)
         ok_files = all(files.get(n) == h for n, h in expect.items())
         versions = {r["files"] for r in rows.values()}
-        active = sum(1 for r in rows.values() if r["state"] == "active" and r["phase"].startswith("serving"))
+        active = sum(1 for r in rows.values() if worker_is_serving(r))
         restarts = tuple(rows[k]["restarts"] for k in sorted(rows))
         same = same + 1 if (restarts == last and ok_files and active == 11 and len(versions) == 1) else 0
         last = restarts
