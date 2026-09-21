@@ -1,5 +1,8 @@
 # autolab/inkling-fleet-perf
 
+> **Taking over, or about to publish anything to the fleet? Read [`OPERATING.md`](OPERATING.md) first.** The fleet has
+> no shell; the release channel is the only door, and the document lists the releases that would close it.
+
 > **Goal re-set by the user on 2026-09-20 (afternoon):** interactive speed for up to 15 concurrent streams, and the
 > highest aggregate throughput at that concurrency: ideally 60 tok/s (4 tok/s per stream). The earlier targets
 > (> 10 tok/s single stream, > 60 tok/s at any concurrency) are history; see PHYSICS.md "The 15-stream regime".

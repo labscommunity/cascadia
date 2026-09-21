@@ -126,15 +126,57 @@ def cmd_settle(a):
     return 0 if settle(expect, a.cap) else 1
 
 
+OPERATOR = os.environ.get("AUTOLAB_OPERATOR", "tahoma-6d")   # the tag the publisher lock's owner file must contain
+STATE_DIR = os.path.expanduser("~/inkling-release/autolab-state")
+ROLE_STATE = os.path.join(STATE_DIR, "role_swap")             # the ROLE_SWAP pair the fleet runs with ("" = none)
+
+
+def role_swap_of(path):
+    m = re.search(r'^ROLE_SWAP="([^"]*)"$', open(path).read(), re.M)
+    return m.group(1).strip() if m else None
+
+
+def publish_guards(a, files):
+    """Refuse the releases that are known to break this fleet (autolab/OPERATING.md has the stories)."""
+    live = open(ROLE_STATE).read().strip() if os.path.exists(ROLE_STATE) else ""
+    for name, path in files.items():
+        if name in ("run.sh", "fleet-overrides.env", "status.sh"):
+            rc = subprocess.run(["bash", "-n", path], capture_output=True, text=True)
+            if rc.returncode != 0:
+                sys.exit("REFUSED: %s does not parse (bash -n): %s" % (path, rc.stderr.strip()[:300]))
+        if name == "fleet-overrides.env":
+            text = open(path).read()
+            if "LAB-PROXY:PORT" in text:
+                sys.exit("REFUSED: %s is a REDACTED repository copy (LAB-PROXY:PORT): the draft model fetch and the entry box's "
+                         "clock self-heal would break. Publish the file kept in ~/inkling-release/autolab-overrides/." % path)
+            if live and "api_relay.py" not in text and not a.allow_no_relay:
+                sys.exit("REFUSED: a role swap (%s) is live and %s has no API relay block: the entry box's :8000 (the operator "
+                         "tunnel, localhost:18000) would go dark. Start from the last published overrides, or pass "
+                         "--allow-no-relay if that is really intended." % (live, path))
+        if name == "run.sh":
+            want = role_swap_of(path)
+            if want is None:
+                sys.exit("REFUSED: %s has no ROLE_SWAP line" % path)
+            if want != live and not a.allow_role_change:
+                sys.exit("REFUSED: %s says ROLE_SWAP=\"%s\" but the fleet runs with \"%s\". The repository's run.sh keeps it EMPTY "
+                         "on purpose: publishing it moves rank 0 back to the entry box. Build the release file with "
+                         "autolab/bench/build_role_swap.py, or pass --allow-role-change if the change is intended." % (path, want, live))
+
+
 def cmd_publish(a):
     owner = open(LOCK).read() if os.path.exists(LOCK) else ""
-    if "tahoma-6d" not in owner:
-        sys.exit("publisher lock is not ours (%s): not publishing" % LOCK)
-    args, expect = ["publish"], {}
+    if OPERATOR not in owner:
+        sys.exit("publisher lock is not ours (%s says %r, AUTOLAB_OPERATOR=%s): not publishing" % (LOCK, owner.strip()[:80], OPERATOR))
+    args, expect, files = ["publish"], {}, {}
     for spec in a.files:
         name, path = spec.split("=", 1)
+        files[name] = path
         expect[name] = sha256(path)
         args.append("%s=%s" % (name, os.path.abspath(path)))
+    publish_guards(a, files)
+    if a.dry_run:
+        log("dry run: guards passed, would publish", ", ".join("%s=%s" % kv for kv in files.items()))
+        return 0
     if a.allow_infra:
         args.append("--allow-infra")
     args += ["--note", a.note]
@@ -142,8 +184,14 @@ def cmd_publish(a):
     log("publish:", (out + err).strip().replace("\n", " | ")[:400])
     if rc != 0:
         return 2
+    if "run.sh" in files:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        open(ROLE_STATE, "w").write((role_swap_of(files["run.sh"]) or "") + "\n")
     json.dump(expect, open(os.path.join(LAB, ".autolab", "expect.json"), "w"))
-    return 0 if settle(expect, a.cap) else 1
+    ok = settle(expect, a.cap)
+    log("SETTLED: the fleet is steady, traffic is fine" if ok else
+        "NOT SETTLED within %d s: send NO traffic; run `lab.py settle` until it says steady 3/3" % a.cap)
+    return 0 if ok else 1
 
 
 def chat(i, tokens, prompt_words=0, timeout=900, prompt=None):
@@ -484,6 +532,9 @@ def main():
         if name == "run":
             s.add_argument("exp")
         s.add_argument("files", nargs="*"); s.add_argument("--note", required=True); s.add_argument("--allow-infra", action="store_true")
+        s.add_argument("--allow-role-change", action="store_true", help="run.sh's ROLE_SWAP differs from what the fleet runs: intended")
+        s.add_argument("--allow-no-relay", action="store_true", help="overrides without the API relay block while a role swap is live")
+        s.add_argument("--dry-run", action="store_true", help="run the guards, publish nothing")
         s.add_argument("--cap", type=int, default=900)
         if name == "run":
             s.add_argument("--phases", nargs="+", required=True); s.add_argument("--prompt-words", type=int, default=0)
