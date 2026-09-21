@@ -1,0 +1,39 @@
+{
+  "recorded_at": 1790034462.063974,
+  "client_python": "3.14.4 (main, Apr  7 2026, 13:13:20) [Clang 21.0.0 (clang-2100.0.123.102)]",
+  "client_os": "Darwin",
+  "client_architecture": "arm64",
+  "packages": {
+    "aiohttp": "3.14.3",
+    "matplotlib": "3.11.2",
+    "numpy": "2.5.3"
+  },
+  "collector_sha256": {
+    "autolab/bench/performance_sweep.py": "e57b0f7d71dd0ee0c20843473521ddfcd0ba4deb200fae22c354f712283efd61",
+    "autolab/bench/collect.py": "bed0f0009d3428de1df9f8063ad22ee0738bf1f70baafb7d744a6a8955eeb0de"
+  },
+  "release": 1790016660,
+  "binary_sha256": "9084392040688eaa6aa9ff6cf6d222f84e24e119e528d91920d12ddd106563c2",
+  "fleet_boxes": 11,
+  "pipeline_layers": 66,
+  "layers_per_rank": 6,
+  "pipeline_groups": 11,
+  "role_swap": [
+    0,
+    8
+  ],
+  "expert_weights": "int4",
+  "attention": "int8",
+  "api_model": "model",
+  "temperature": 0,
+  "max_completion_tokens": 128,
+  "request_stagger_seconds": 0.015,
+  "api_max_concurrent": 512,
+  "engine_pending_queue_cap": 64,
+  "study_concurrency_cap": 176,
+  "prompt_key": "046-performance-final/{family}/{index}",
+  "notes": [
+    "Metadata records the resumed collector; earlier admission/backoff/health-guard revisions and interruptions are documented separately.",
+    "No deployment or model-numerical change occurred during this survey."
+  ]
+}

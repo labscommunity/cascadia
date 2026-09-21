@@ -79,7 +79,11 @@ def main():
             'All survey requests use temperature 0 and a 128-token output budget. '
             'Counts include reasoning and answer tokens.','',
             'Sustained decode is measured only while all requests in each cohort are decoding. '
-            'End-to-end throughput includes admission, prefill and drain. Prompts are repeated '
+            'Average per-stream speed divides that total by concurrency; it is not a lower '
+            'bound for every individual request. '
+            'End-to-end throughput includes admission, prefill and drain. The mixed workload '
+            'cycles through twelve families; rounding to complete cohorts makes family '
+            'proportions vary slightly with concurrency. The same deterministic prompts recur '
             'across sweep passes; learned phrase history remains enabled. Repeat ranges are '
             'observed variability, not confidence intervals. The fixed prompt pools are finite: '
             'high-concurrency family cohorts can repeat identical prompts. `unique_prompts` in '
@@ -157,7 +161,7 @@ def main():
         axes[0].legend(fontsize=8)
         axes[1].plot(ns,per,'o-',color='#176b78',label='Sustained total / streams')
         axes[1].fill_between(ns,np.array(lo)/ns,np.array(hi)/ns,color='#176b78',alpha=.15)
-        axes[1].set(ylabel='Output tokens / second / stream',title='Per-stream speed as concurrency increases',yscale='log')
+        axes[1].set(ylabel='Average output tokens / second / stream',title='Per-stream speed as concurrency increases',yscale='log')
         axes[1].yaxis.set_major_locator(LogLocator(base=10,subs=(1,2,5)))
         axes[1].yaxis.set_major_formatter(FuncFormatter(lambda x,_:f'{x:g}'))
         axes[1].yaxis.set_minor_locator(NullLocator())
@@ -192,7 +196,7 @@ def main():
                    '|---:|---:|---:|---:|---:|---:|']
         for i,n in enumerate(ns):
             report.append(f'| {n} | {len(grouped[n])} | {steady[i]:.2f} | {per[i]:.2f} | {end[i]:.2f} | {p50[i]:.2f} / {p95[i]:.2f} |')
-        report+=['','| Minimum sustained tok/s/stream | Highest tested concurrency meeting it |',
+        report+=['','| Target average sustained tok/s/stream | Highest tested concurrency meeting it |',
                     '|---:|---:|']
         for target in [1,2,3,5,10]:
             acceptable=[n for n,v in zip(ns,per) if v>=target]
@@ -239,6 +243,9 @@ def main():
                  'fallback observations. Profile windows must fit entirely inside the shared '
                  'decode interval and contain no admissions. These sampled counters exclude '
                  'startup and drain; their correlations do not establish causes.']
+    if (root/'collection-environment.json').exists():
+        report+=['','[Collection environment](collection-environment.json) records the release '
+                 'and collector hashes, client package versions and measurement settings.']
     (root/'report.md').write_text('\n'.join(report)+'\n')
     print(f'Wrote report, CSV and charts for {len(phases)} completed phases to {root}')
 
