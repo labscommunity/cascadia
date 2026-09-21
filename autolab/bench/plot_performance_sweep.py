@@ -71,6 +71,8 @@ def main():
     limit_path=root/'concurrency-limit.json'
     limit=json.loads(limit_path.read_text())['max_streams'] if limit_path.exists() else None
     status=('Completed survey' if complete else 'IN PROGRESS — completed phases only')
+    paused=(root/'paused.json').exists()
+    if paused:status='PAUSED by owner — completed phases only'
     if limit:status+=f' (capped at {limit} streams)'
     report=['# Inkling fleet performance survey','',status,'',
             'Eleven Panther Lake boxes; release `1790016660`; int4 experts and int8 attention. '
@@ -127,7 +129,7 @@ def main():
         best_end=ns[int(np.argmax(end))]
         summary=dict(complete=complete,peak_steady_streams=best,peak_steady_tok_s=max(steady),
                      smallest_streams_within_95pct_peak=knee,peak_end_to_end_streams=best_end,
-                     peak_end_to_end_tok_s=max(end),max_streams_limit=limit)
+                     peak_end_to_end_tok_s=max(end),max_streams_limit=limit,paused=paused)
         (root/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
         fig,axes=plt.subplots(1,2,figsize=(12,4.6),layout='constrained')
         axes[0].plot(ns,steady,'o-',color='#176b78',label='Sustained decode')

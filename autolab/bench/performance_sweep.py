@@ -372,6 +372,9 @@ def main():
     ap.add_argument('--max-streams',type=int,choices=LEVELS,
                     help='Persist a concurrency cap for this experiment, including future resumptions')
     args=ap.parse_args()
+    pause_path=Path(lab.LAB)/'experiments'/args.exp/'paused.json'
+    if pause_path.exists():
+        raise SystemExit('Owner paused testing. Wait for an explicit resume instruction before clearing paused.json.')
     owner=Path(lab.LOCK).read_text()
     if 'autolab-continuation-20260921' not in owner:
         raise SystemExit('Publisher ownership changed')

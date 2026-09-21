@@ -1,0 +1,9 @@
+{
+  "time": 1790030457.9731488,
+  "reason": "Owner explicitly requested: please pause the tests until i say resume",
+  "resume_requires": "Explicit owner instruction; do not resume automatically",
+  "interrupted_phase": "mixed_b_c088",
+  "completed_phases": 18,
+  "requests_in_flight_after_stop": 0,
+  "next_step_when_authorized": "Check unchanged fleet health and idle, run correctness gate after cancellation cleanup, archive this pause record, then resume suite all with saved concurrency limit176. Repeat interrupted mixed_b_c088; completed phases are retained."
+}

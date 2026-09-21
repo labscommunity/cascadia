@@ -1,6 +1,6 @@
 # Inkling fleet performance survey
 
-IN PROGRESS — completed phases only (capped at 176 streams)
+PAUSED by owner — completed phases only (capped at 176 streams)
 
 Eleven Panther Lake boxes; release `1790016660`; int4 experts and int8 attention. All survey requests use temperature 0 and a 128-token output budget. Counts include reasoning and answer tokens.
 
@@ -16,9 +16,9 @@ The 256-stream attempt disconnected during admission. Outstanding requests were 
 
 An **88-stream refinement** was added after the first sweep and the 176-stream repeat: it places eight rows in each of eleven pipeline groups. The observed slowdown above eight rows per group motivated this extra point. Both 88-stream runs occur after the original ascending pass; they are exploratory measurements, with the same token and health checks.
 
-Best observed sustained aggregate: **57.72 tok/s at 176 streams**.
-Smallest tested setting within 95% of that peak: **176 streams**.
-Best observed throughput including startup/drain: **45.24 tok/s at 176 streams**.
+Best observed sustained aggregate: **58.86 tok/s at 88 streams**.
+Smallest tested setting within 95% of that peak: **88 streams**.
+Best observed throughput including startup/drain: **46.03 tok/s at 88 streams**.
 
 These are different objectives from maximizing each user’s speed. Use the latency and per-stream columns to choose an operating point.
 
@@ -39,7 +39,8 @@ These are different objectives from maximizing each user’s speed. Use the late
 | 32 | 1 | 38.48 | 1.20 | 32.68 | 12.39 / 20.81 |
 | 48 | 1 | 46.01 | 0.96 | 38.24 | 18.72 / 31.24 |
 | 64 | 1 | 53.74 | 0.84 | 42.30 | 25.21 / 47.49 |
-| 96 | 1 | 46.43 | 0.48 | 39.09 | 38.75 / 73.97 |
+| 88 | 1 | 58.86 | 0.67 | 46.03 | 36.23 / 64.18 |
+| 96 | 2 | 46.85 | 0.49 | 39.79 | 38.94 / 71.31 |
 | 128 | 2 | 50.10 | 0.39 | 41.61 | 55.11 / 108.73 |
 | 176 | 2 | 57.72 | 0.33 | 45.24 | 76.83 / 165.34 |
 

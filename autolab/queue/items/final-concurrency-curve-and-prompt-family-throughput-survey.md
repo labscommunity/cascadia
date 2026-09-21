@@ -1,12 +1,12 @@
 ---
 id: final-concurrency-curve-and-prompt-family-throughput-survey
 title: Final concurrency curve and prompt-family throughput survey
-status: running
+status: blocked
 outcome: 
 priority: 1
 target: single stream, multi stream, prompt families
 exact: yes
-needs: Measurement only on release 1790016660; no competing generation
+needs: Owner explicitly paused all tests; wait for owner to say resume. 18 completed phases retained, API idle.
 proposed_by: owner request 2026-09-21
 owner: autolab-continuation-20260921
 experiment: 046_final_performance
