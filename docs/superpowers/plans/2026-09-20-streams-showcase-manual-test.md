@@ -117,12 +117,26 @@ cd ../../.. && cargo build -p cascadia-dashboard --features embed-spa && cargo t
 
 ---
 
-## Part B — fleet, Inkling
+## Part B — fleet, Inkling (no release needed)
 
-Deploy the branch to rank 0 the usual way (`deploy/inkling-fleet/apply-update.sh`;
-the SPA must be built and the binary built with `--features dashboard-embed`).
-Open the rank-0 dashboard from the presentation machine. Keep
-`deploy/inkling-fleet/bench.py` handy for cross-checking numbers.
+Nothing in Part B requires shipping a binary. The Vite dev server proxies
+`/api`, `/v1` (including SSE) and `/health` to whatever `VITE_API_PROXY`
+names, so point it at rank 0's API through the operator tunnel and the whole
+screen runs against the live fleet from your laptop. Ship (Part C) only after
+Part B passes. Keep `deploy/inkling-fleet/bench.py` handy for cross-checks.
+
+### B0. Run against the live fleet through the tunnel
+
+```bash
+# the operator tunnel exposes rank 0's :8000 as localhost:18000
+curl -s http://localhost:18000/api/stats          # expect JSON with max_concurrent
+cd crates/cascadia-dashboard/web
+VITE_API_PROXY=http://localhost:18000 npm run dev
+```
+
+- [ ] `http://localhost:5173/streams` shows the fleet's model in the picker (`inkling` or whatever `/v1/models` returns) and `Server 0 / <cap>` with the fleet's real cap (the default is 16 unless `fleet-overrides.env` on rank 0 sets `CASCADIA_API_MAX_CONCURRENT`).
+- [ ] Note the cap. `fleet.env` has `STREAMS=16` per rank; the UI default of 16 streams matches. Anything above the cap will queue, which is fine and is part of the demo.
+- [ ] Keep the fleet-side Cluster page (`http://localhost:18000/`) open in a second window during B1–B3 to watch `In flight` and `Tokens` move while the streams run.
 
 ### B1. Pacing and legibility
 
@@ -151,3 +165,42 @@ Open the rank-0 dashboard from the presentation machine. Keep
 ### B4. Cross-tab moment (for the demo script)
 
 - [ ] With streams running, switching to Cluster kills them (by design — spec decision). Document in the demo script that the multi-stream wall and the Cluster counters are shown one after the other, not side by side, or open Cluster in a second window.
+
+---
+
+## Part C — ship to the fleet (binary release)
+
+Rank 0 serves the SPA from inside the `cascadia` binary; there is no
+standalone frontend process and no runtime static-file override. A frontend
+change rides a binary release, which restarts all 11 workers and takes 5–8
+minutes to settle. Do this only after Parts A and B pass, and only when nobody
+is mid-experiment on the fleet.
+
+### C0. Pre-flight: make sure the new tarball drops nothing
+
+The build machine's script untars `~/inkling-build/dash-dist.tar.gz` over
+`crates/cascadia-dashboard/web` before building, so the *tarball* is the SPA
+that ships, whatever branch the checkout is on. Vite's asset names are
+content hashes and are reproducible for identical sources and lockfile, so:
+
+- [ ] On the build machine: `tar -tzf ~/inkling-build/dash-dist.tar.gz | grep assets/` and note the `index-<hash>.js` / `index-<hash>.css` names.
+- [ ] On your laptop, on a clean checkout of `feat/inkling-multistream`: `cd crates/cascadia-dashboard/web && npm ci && npm run build && ls dist/assets`. Same names → the deployed SPA has no unpushed changes and it is safe to replace the tarball. Different names → someone built the deployed tarball from a web tree that is not on origin. The operator's notes name a `tahoma-dashboard` worktree on a `feat/dashboard` branch; `tahoma` is the Cascadia workspace on the team's Mac mini, not the miner, so look there. Diff its `web/` against this branch and merge before shipping.
+- [ ] Confirm the tarball layout you are about to ship matches the old one's top-level entry (`dist/`): `tar -tzf ~/dash-dist.tar.gz | head -3`.
+- [ ] Confirm nobody holds the publisher lock (`~/inkling-release/publisher.lock` on the build machine) or is mid-experiment on the fleet.
+
+### C1. Build
+
+- [ ] Back up the old tarball: `cp ~/inkling-build/dash-dist.tar.gz ~/inkling-build/dash-dist.tar.gz.before-streams`.
+- [ ] Copy the new one from Task 7 into place as `~/inkling-build/dash-dist.tar.gz`.
+- [ ] Run the build machine's usual script (it does `tar -xzf … -C repo/crates/cascadia-dashboard/web` then `cargo build --release -p cascadia --features openvino,dashboard-embed`). No branch change is needed: this feature has no Rust changes, so the checkout can stay where it is, including on `autolab/inkling-fleet-perf` with its `/api/fleet/telemetry` route.
+- [ ] Prove the new SPA is inside the binary before publishing: `strings target/release/cascadia | grep -c 'waiting for a slot'` prints at least 1 (a string only the streams tile contains). If it prints 0 the stale-tarball trap bit you; check which tarball was untarred.
+
+### C2. Publish and verify
+
+- [ ] Publish through the fleet's signed channel the usual way (the operator wrapper, or `publish.py` on rank 0 with the new `cascadia` in the served folder). Every box's updater installs it and restarts its worker; wait 5–8 minutes for the pipeline to re-form.
+- [ ] Through the tunnel: `curl -s http://localhost:18000/streams | grep -o 'assets/index-[A-Za-z0-9_-]*\.js'` shows the new hash from C0.
+- [ ] `http://localhost:18000/streams` renders the dark wall; run B1 quickly (Play, 16 streams, two minutes).
+- [ ] `http://localhost:18000/` and `/chat` still look and work as before.
+- [ ] `curl -s http://localhost:18000/api/fleet/telemetry | head -c 200` still answers (the Rust side of the build was not regressed by the branch the machine built from).
+- [ ] `curl -s http://localhost:18000/api/stats` shows the pipeline serving again (`requests_in_flight` moves when you Play).
+- [ ] Rollback if needed: restore `dash-dist.tar.gz.before-streams`, rebuild, republish.

@@ -2118,6 +2118,19 @@ npm run build
 ```
 Expected: typecheck silent; build ends `✓ built in …` with `dist/index.html` and hashed assets. Serve it once to make sure the production bundle (not just dev) works: `npm run preview` then open the printed URL + `/streams` — note the preview server has no API proxy, so the picker shows an error and Play stays disabled, but the dark shell, 16 idle tiles and the settings drawer must all render. Ctrl-C the preview.
 
+Then package the built SPA the way the fleet's build machine expects it. Its
+build script untars this file over `crates/cascadia-dashboard/web`, so the
+tarball's top-level entry must be `dist/` (inferred from that command; the
+checklist's Part C compares against the tarball already on the build machine
+before it is replaced):
+```bash
+cd crates/cascadia-dashboard/web
+tar -czf "$HOME/dash-dist.tar.gz" dist
+tar -tzf "$HOME/dash-dist.tar.gz" | head -3    # dist/  dist/index.html  dist/assets/…
+```
+Do not commit the tarball or `dist/`; `dist/` is gitignored and the tarball
+lives outside the repo. Tell the user where it is.
+
 - [ ] **Step 3: Embed check**
 
 From the repo root:
@@ -2140,4 +2153,4 @@ git commit -m "docs: mention the streams showcase in the dashboard section"
 git status --porcelain     # empty
 git log --oneline feat/inkling-multistream..HEAD
 ```
-Expected: the spec/plan docs commit(s) plus seven feature commits (Tasks 1–7), nothing unstaged. Do not push. Hand over to the manual test checklist at `docs/superpowers/plans/2026-09-20-streams-showcase-manual-test.md`.
+Expected: the spec/plan docs commit(s) plus seven feature commits (Tasks 1–7), nothing unstaged. Do not push. Hand over to the manual test checklist at `docs/superpowers/plans/2026-09-20-streams-showcase-manual-test.md`: Part A runs locally, Part B runs against the live fleet through the operator tunnel with no release, Part C ships the `~/dash-dist.tar.gz` from Step 2 above.

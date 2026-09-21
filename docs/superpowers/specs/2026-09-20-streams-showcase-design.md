@@ -444,9 +444,13 @@ checklist covering:
   stream-count changes, settings persistence, fullscreen, unmount-stops,
   and that Cluster/Chat are visually unchanged. Note the mock engine echoes
   the prompt's words instantly, so pacing is not observable locally.
-- **Fleet, Inkling:** pacing, aggregate tok/s plausibility against
-  `bench.py`, 20-tile legibility on a 1080p screen, an hour-long soak with
-  no growth in tile count or memory.
+- **Fleet, Inkling, no release needed:** run the SPA locally with the Vite
+  dev server pointed at rank 0's API through the operator tunnel
+  (`VITE_API_PROXY=http://localhost:18000 npm run dev`); the proxy already
+  covers `/api`, `/v1` and SSE. Checks: pacing, aggregate tok/s plausibility
+  against `bench.py`, 20-tile legibility on a 1080p screen, an hour-long
+  soak with no growth in tile count or memory. Shipping the binary (§13) is
+  the last step, after these pass.
 
 `npm run typecheck` and `npm run build` must pass; `cargo build --release
 -p cascadia --features dashboard-embed` must embed the result.
@@ -460,3 +464,36 @@ checklist covering:
   a user choice in the drawer, not a default.
 - The server's `n_tokens` per chunk is honoured for token counts, as Chat
   does today.
+
+## 13. Deployment to the fleet
+
+Facts established from the repo and the fleet operator's notes (2026-09-20):
+
+- Rank 0 serves the dashboard from the `cascadia` binary; the SPA is baked in
+  by `rust-embed` under the `dashboard-embed` feature. There is **no runtime
+  override** pointing the crate at a directory of static files: release
+  builds embed `web/dist` at compile time, debug builds read it from disk per
+  request (`spa.rs`). Iterating against the live fleet without a release is
+  still possible, through the Vite dev server and the operator tunnel (§11).
+- The fleet's build machine stages the SPA from a tarball: its build script
+  runs `tar -xzf ~/inkling-build/dash-dist.tar.gz -C repo/crates/cascadia-dashboard/web`
+  and then `cargo build --release -p cascadia --features openvino,dashboard-embed`.
+  **A stale tarball silently wins over a fresh repo tree.** Shipping this
+  feature therefore means regenerating that tarball from this branch's
+  `web/dist` (top-level entry `dist/`), not just checking the branch out.
+- The binary reaches the boxes through the fleet's signed channel
+  (`deploy/inkling-fleet/fleet/publish.py` writes `manifest.json` next to the
+  files rank 0 serves on :8088; every box's `updater.py` installs what changed
+  and restarts `cascadia-inkling.service`). A frontend-only change therefore
+  restarts all 11 workers and takes 5–8 minutes to settle; whoever holds the
+  publisher lock on the build machine must not be mid-experiment.
+- This feature changes no Rust, so the build machine's checkout can stay on
+  whatever branch it is on (including `autolab/inkling-fleet-perf`, which adds
+  the `/api/fleet/telemetry` route the fleet uses). Only the tarball changes.
+- **Pre-flight to confirm before shipping:** no pushed branch carries SPA
+  changes this branch lacks (checked 2026-09-20: `autolab/inkling-fleet-perf`
+  touches only `src/lib.rs`). If the tarball currently deployed was built from
+  an *unpushed* web tree, replacing it would drop those changes. Vite output
+  is content-hashed and deterministic for the same sources and lockfile, so
+  compare the asset names in the deployed tarball with a build of
+  `feat/inkling-multistream`'s `web/` before proceeding (checklist Part C).
