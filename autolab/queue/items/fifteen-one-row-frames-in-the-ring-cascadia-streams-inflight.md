@@ -1,12 +1,12 @@
 ---
 id: fifteen-one-row-frames-in-the-ring-cascadia-streams-inflight
 title: fifteen one-row frames in the ring (CASCADIA_STREAMS_INFLIGHT=15) with the decode kernels on every layer
-status: ready
+status: dropped
 outcome: 
 priority: 2
 target: 15 streams
 exact: yes
-needs: 029 passing; overrides only (patch + decode layers on all ranks, rank 0 INFLIGHT=15)
+needs: dropped: its gain rested on the decode kernels being faster for one-row frames (029: they are not); fifteen one-row frames alone put 15 head calls a round on rank 10 (648 ms)
 proposed_by: autolab session 2026-09-20
 owner: 
 experiment: 

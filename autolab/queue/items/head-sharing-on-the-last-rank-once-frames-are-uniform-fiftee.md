@@ -1,12 +1,12 @@
 ---
 id: head-sharing-on-the-last-rank-once-frames-are-uniform-fiftee
 title: head sharing on the last rank once frames are uniform (fifteen frames on eleven stages always queue somewhere)
-status: ready
+status: dropped
 outcome: 
 priority: 3
 target: 15 streams
 exact: yes
-needs: after the uniform-frames item; overrides only (CASCADIA_STREAMS_HEAD_BATCH=2..3)
+needs: dropped with the uniform-frames item (028: -2.5 % with mixed frames)
 proposed_by: autolab session 2026-09-20
 owner: 
 experiment: 

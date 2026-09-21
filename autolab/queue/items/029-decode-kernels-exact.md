@@ -1,8 +1,8 @@
 ---
 id: 029-decode-kernels-exact
-title: the decode kernels on the exact group-32 layers, by turning six 32s into 16s in the plugin
-status: running
-outcome: 
+title: decode kernels on the exact group-32 weights via a six-byte plugin patch: correct (checks 0.999994), no faster at one row (3.0-3.2 ms on both paths); removed
+status: done
+outcome: negative
 priority: 1
 target: 15 streams, single stream
 exact: yes

@@ -7,13 +7,13 @@ journal; rolled back, re-run). `CASCADIA_STREAMS_HEAD_BATCH=2`, 026's canary rem
 |---|---|---|
 | steady tok/s (two phases) | 24.89 / 24.69 | **24.08 / 24.16** |
 | rank 0's round trip | 544 ms | **569 ms** |
-| rank 10: layers + head per frame, waiting | 35.9 + 11.6 ms, 11.5 % | ~36 + ~7, **23 %** |
+| rank 10: layers + head per frame, waiting | 35.9 + 11.6 ms, 11.5 % | not reliable: rank 10's clock jumped a day ahead and `analyze.py` double-counts its records from here on (see 029) |
 | head calls / frames served (rank 10, HB line) | 1 / 1 | 1024 / 1555 (52 % of frames shared a call) |
 | ranks 1-9 waiting | 23-33 % | 25-36 % |
 | one fresh stream, gates | 4.9 tok/s, pass | 3.5-3.8 (another prompt), pass |
 
-The mechanism works (test `inkling_streams_head_batching`, HB counter) and rank 10 stopped being busy, yet every
-rank waits MORE. No stage is saturated (the sum of all ranks' work per frame is 422 ms; the round takes 569), so the
+The mechanism works (test `inkling_streams_head_batch`, HB counter), rank 10's head time per frame fell, yet every
+other rank waits MORE. No stage is saturated (the sum of all ranks' work per frame is 422 ms; the round takes 569), so the
 ring is not paced by a slow stage's average at all:
 
 **the convoy.** Fifteen streams in eleven frames = four frames of two rows and seven of one. A two-row frame takes

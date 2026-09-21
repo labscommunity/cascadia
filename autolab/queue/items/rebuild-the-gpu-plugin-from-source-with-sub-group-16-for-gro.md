@@ -1,12 +1,12 @@
 ---
 id: rebuild-the-gpu-plugin-from-source-with-sub-group-16-for-gro
 title: rebuild the GPU plugin from source with sub-group 16 for group-32 MoE weights
-status: blocked
+status: dropped
 outcome: 
 priority: 60
 target: 15 streams, single stream
 exact: yes
-needs: fallback only if 029's six-byte patch fails its checks; miner RAM disk build + a way to ship a 40 MB library
+needs: dropped: 029 reached the same kernels with a binary patch and they are no faster at one row
 proposed_by: autolab session 2026-09-20
 owner: 
 experiment: 

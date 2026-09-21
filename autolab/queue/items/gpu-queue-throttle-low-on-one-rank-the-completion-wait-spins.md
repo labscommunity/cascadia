@@ -1,8 +1,8 @@
 ---
 id: gpu-queue-throttle-low-on-one-rank-the-completion-wait-spins
-title: GPU queue throttle LOW on one rank: the completion wait spins a core that the 25 W budget could give the iGPU
-status: running
-outcome: 
+title: GPU queue throttle LOW (rank 6 A/B): 0.5 cores and -1.5 W, but +2.3 ms a frame; removed
+status: done
+outcome: negative
 priority: 1
 target: 15 streams
 exact: yes
