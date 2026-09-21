@@ -5,9 +5,10 @@
 //! the attended context — are the bf16 bytes the CPU streams at ~80 GB/s
 //! (~264 MB per layer). `tools/inkling_attn_ov.py` writes them as two
 //! per-layer IRs, `<model>/attn_ov/layer_NN/{qkvr,o}/openvino_model.xml`,
-//! by default re-quantised to int4 on the experts' grid (~66 MB per layer:
-//! the byte saving is the speed-up, a f16 copy on the device would not be),
-//! and this backend runs them; the head norms, position bias, softmax, KV
+//! by default re-quantised to int8 (~132 MB per layer), optionally int4
+//! on the experts' grid (~66 MB per layer). Int4 changes the projection
+//! weights and needs its own quality and device-cost checks. This backend
+//! runs the exported IRs; the head norms, position bias, softmax, KV
 //! cache and convolutions stay in [`super::attn`].
 //!
 //! Outputs are rounded to bf16 like the Rust `linear_bf16_w`, so what differs
