@@ -6,9 +6,11 @@ Eleven Panther Lake boxes; release `1790016660`; int4 experts and int8 attention
 
 Sustained decode is measured only while all requests in each cohort are decoding. End-to-end throughput includes admission, prefill and drain. Prompts are repeated across sweep passes; learned phrase history remains enabled. Repeat ranges are observed variability, not confidence intervals. The fixed prompt pools are finite: high-concurrency family cohorts can repeat identical prompts. `unique_prompts` in the phase CSV records diversity; family maxima describe these pools, not a guarantee for arbitrary novel prompts.
 
-Best observed sustained aggregate: **13.94 tok/s at 6 streams**.
-Smallest tested setting within 95% of that peak: **6 streams**.
-Best observed throughput including startup/drain: **12.83 tok/s at 6 streams**.
+The bounded diagnostic capture reached its storage budget during the first 22-stream attempt. That incomplete attempt was excluded and repeated. Capture writes were enabled for the ascending 1–15-stream points and disabled thereafter; the reverse sweep and family tests use the same capture-disabled state. No worker restarted and no model configuration changed. Repeat differences therefore include phrase learning, time/order effects and this instrumentation change.
+
+Best observed sustained aggregate: **53.74 tok/s at 64 streams**.
+Smallest tested setting within 95% of that peak: **64 streams**.
+Best observed throughput including startup/drain: **42.30 tok/s at 64 streams**.
 
 These are different objectives from maximizing each user’s speed. Use the latency and per-stream columns to choose an operating point.
 
@@ -22,11 +24,18 @@ These are different objectives from maximizing each user’s speed. Use the late
 | 2 | 1 | 4.55 | 2.28 | 4.40 | 2.06 / 2.94 |
 | 4 | 1 | 9.18 | 2.30 | 8.69 | 3.31 / 3.74 |
 | 6 | 1 | 13.94 | 2.32 | 12.83 | 3.44 / 5.51 |
+| 8 | 1 | 18.62 | 2.33 | 16.86 | 4.55 / 6.28 |
+| 11 | 1 | 23.58 | 2.14 | 21.15 | 5.47 / 7.64 |
+| 15 | 1 | 24.63 | 1.64 | 22.23 | 6.00 / 9.52 |
+| 22 | 1 | 34.50 | 1.57 | 29.89 | 9.54 / 13.51 |
+| 32 | 1 | 38.48 | 1.20 | 32.68 | 12.39 / 20.81 |
+| 48 | 1 | 46.01 | 0.96 | 38.24 | 18.72 / 31.24 |
+| 64 | 1 | 53.74 | 0.84 | 42.30 | 25.21 / 47.49 |
 
 | Minimum sustained tok/s/stream | Highest tested concurrency meeting it |
 |---:|---:|
-| 1 | 6 |
-| 2 | 6 |
+| 1 | 32 |
+| 2 | 11 |
 | 3 | 1 |
 | 5 | 1 |
 | 10 | None |

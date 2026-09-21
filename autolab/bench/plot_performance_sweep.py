@@ -17,7 +17,12 @@ from performance_sweep import FAMILIES, quantile, prompt_for
 
 def save(fig, root, name):
     for ext in ['png','svg','pdf']:
-        fig.savefig(root/f'{name}.{ext}',dpi=180,bbox_inches='tight')
+        path=root/f'{name}.{ext}'
+        metadata=({'Date':None} if ext=='svg' else
+                  {'CreationDate':None,'ModDate':None} if ext=='pdf' else {})
+        fig.savefig(path,dpi=180,bbox_inches='tight',metadata=metadata)
+        if ext=='svg':
+            path.write_text('\n'.join(line.rstrip() for line in path.read_text().splitlines())+'\n')
     plt.close(fig)
 
 
@@ -45,7 +50,7 @@ def main():
             'ttft_median_s','ttft_p95_s','ttft_max_s','prompt_tokens_median',
             'completion_tokens_median','early_finish','unique_prompts','capture_writes']
     with (root/'phase-results.csv').open('w',newline='') as f:
-        writer=csv.DictWriter(f,fieldnames=fields);writer.writeheader()
+        writer=csv.DictWriter(f,fieldnames=fields,lineterminator='\n');writer.writeheader()
         writer.writerows({k:r.get(k) for k in fields} for r in phases)
     requests=[]
     for phase in phases:
@@ -53,11 +58,12 @@ def main():
             requests.append(dict(phase=phase['phase'],concurrency=phase['streams'],**r))
     with (root/'request-results.csv').open('w',newline='') as f:
         fields=sorted({k for r in requests for k in r})
-        writer=csv.DictWriter(f,fieldnames=fields);writer.writeheader();writer.writerows(requests)
+        writer=csv.DictWriter(f,fieldnames=fields,lineterminator='\n');writer.writeheader();writer.writerows(requests)
     mixed=[r for r in phases if r['family']=='mixed']
     grouped={n:[r for r in mixed if r['streams']==n] for n in sorted({r['streams'] for r in mixed})}
     plt.rcParams.update({'font.family':'DejaVu Sans','font.size':10,'axes.spines.top':False,
-                         'axes.spines.right':False,'axes.grid':True,'grid.alpha':.2})
+                         'axes.spines.right':False,'axes.grid':True,'grid.alpha':.2,
+                         'svg.hashsalt':'046_final_performance'})
     complete=(root/'complete.json').exists()
     status='Completed survey' if complete else 'IN PROGRESS — completed phases only'
     report=['# Inkling fleet performance survey','',status,'',
