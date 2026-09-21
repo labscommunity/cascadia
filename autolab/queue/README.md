@@ -7,11 +7,11 @@ time: see `../README.md`).
 
 ## Add an item
 
-    python3 autolab/bench/queue.py add --title "what changes, in one line" --by "who proposes it" \
+    python3 autolab/bench/equeue.py add --title "what changes, in one line" --by "who proposes it" \
         --target "15 streams | single stream | first token | reliability | offline study" \
         --exact yes|no|n/a --needs "binary change | overrides only | offline, Mac Pro | ..." \
         --priority 50 --body idea.md          # or --body - to read the body from stdin
-    python3 autolab/bench/queue.py render     # refresh QUEUE.md, commit both
+    python3 autolab/bench/equeue.py render     # refresh QUEUE.md, commit both
 
 or write the file by hand (copy any item): the name is the id, a slug of the title. One file per item means two
 branches that both add items never conflict. Do not number items: `experiments/NNN_*` numbers are given when an item
@@ -35,11 +35,11 @@ The body is free Markdown with these headings; the more of them are filled in, t
 
 ## Operating it
 
-    queue.py list --status running,ready     what is going on and what is next
-    queue.py next                            the item to run now
-    queue.py set <id> status=running owner="autolab session" experiment=030_uniform_frames
-    queue.py set <id> status=done outcome=kept
-    queue.py render
+    equeue.py list --status running,ready     what is going on and what is next
+    equeue.py next                            the item to run now
+    equeue.py set <id> status=running owner="autolab session" experiment=030_uniform_frames
+    equeue.py set <id> status=done outcome=kept
+    equeue.py render
 
 Rules that come from this fleet's history (see `../JOURNAL.md`): one change per release where the effect has to be
 attributed; canaries on one rank, self-reverting; no traffic before the settle check says `steady 3/3`; raw

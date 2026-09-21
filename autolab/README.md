@@ -57,5 +57,5 @@ before experiment 001.
 ## The experiment queue
 
 `QUEUE.md` lists every experiment, finished, running and proposed, with its status; it is generated from one file
-per item in `queue/items/`. Anyone (another agent, a teammate) adds an item with `bench/queue.py add ...` or by
+per item in `queue/items/`. Anyone (another agent, a teammate) adds an item with `bench/equeue.py add ...` or by
 writing a file; the operator of the fleet runs them in priority order. Rules and fields: `queue/README.md`.
