@@ -37,7 +37,7 @@ export function ModelPicker({ value, onChange }: Props) {
   }, []);
 
   if (error) {
-    return <span className="label-mono text-state-error">/v1/models {error}</span>;
+    return <span className="label-mono text-state-error dark:text-red-400">/v1/models {error}</span>;
   }
   if (!models) {
     return <span className="label-mono">loading…</span>;
@@ -56,7 +56,7 @@ export function ModelPicker({ value, onChange }: Props) {
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="font-mono text-[13px] text-ink bg-paper border border-rule rounded-sm px-2 py-1 focus:outline-none focus:border-persian hover:border-pine transition-colors"
+        className="font-mono text-[13px] text-ink bg-paper border border-rule rounded-sm px-2 py-1 focus:outline-none focus:border-persian hover:border-pine transition-colors dark:bg-night-2 dark:border-night-rule dark:text-night-ink dark:hover:border-mint"
       >
         {models.map((m) => (
           <option key={m.id} value={m.id}>
