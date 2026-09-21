@@ -205,6 +205,11 @@ pub enum FrameKind {
     /// end), so the prompts share expert reads; the last rank samples each
     /// prompt's final row and replies one `StreamTokens` with `n` entries.
     StreamOpenBatch = 0x53_4D_45_66, // "SME\x66"
+    /// Idle-chain handshake, with no model work or sequence state. The last
+    /// rank answers on the ordinary upstream path with ChainReadyAck.
+    ChainReady = 0x53_4D_45_67,
+    /// up: last rank u32 | total ranks u32. Relayed through every stage.
+    ChainReadyAck = 0x53_4D_45_68,
 }
 
 impl FrameKind {
@@ -239,9 +244,30 @@ impl FrameKind {
             x if x == FrameKind::StreamFeed as u32 => Some(FrameKind::StreamFeed),
             x if x == FrameKind::StreamRewind as u32 => Some(FrameKind::StreamRewind),
             x if x == FrameKind::StreamOpenBatch as u32 => Some(FrameKind::StreamOpenBatch),
+            x if x == FrameKind::ChainReady as u32 => Some(FrameKind::ChainReady),
+            x if x == FrameKind::ChainReadyAck as u32 => Some(FrameKind::ChainReadyAck),
             _ => None,
         }
     }
+}
+
+/// A successful probe proves every worker has reached its receive loop, not
+/// merely that its TCP listener has opened. No generation request is needed.
+pub async fn probe_chain(client: &mut ActivationClient, total: u32) -> TransportResult<()> {
+    client
+        .send_raw(&(FrameKind::ChainReady as u32).to_be_bytes())
+        .await?;
+    let ack = client.recv_raw(12).await?;
+    let expected: Vec<u8> = [FrameKind::ChainReadyAck as u32, total - 1, total]
+        .into_iter()
+        .flat_map(u32::to_be_bytes)
+        .collect();
+    if ack != expected {
+        return Err(TransportError::Io(std::io::Error::other(
+            "invalid chain readiness acknowledgement",
+        )));
+    }
+    Ok(())
 }
 
 /// Read one frame-kind code from the wire. Returns `None` on a clean

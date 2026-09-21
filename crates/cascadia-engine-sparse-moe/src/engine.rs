@@ -5335,6 +5335,9 @@ pub struct PipelineEngine<R: StagedRunner> {
     seen_link_epoch: u64,
     /// Dropping this (with the engine) ends the link keeper task.
     link_keeper: Option<Arc<()>>,
+    /// Opt-in admission barrier, opened by a handshake through ALL ranks.
+    /// The idle link keeper progresses it even while requests are refused.
+    chain_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
     disconnect_reported: bool,
     last_rank_history: Vec<i64>,
     last_rank_rng: u64,
@@ -5826,6 +5829,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             link_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             seen_link_epoch: 0,
             link_keeper: None,
+            chain_ready: None,
             disconnect_reported: false,
             last_rank_history: Vec::new(),
             last_rank_rng: 0,
@@ -5952,6 +5956,12 @@ impl<R: StagedRunner> PipelineEngine<R> {
             "multi-stream decode enabled ({})",
             self.runner.arch_name()
         );
+        if self.rank == 0
+            && self.total > 1
+            && std::env::var("CASCADIA_STREAMS_READY_GATE").as_deref() == Ok("1")
+        {
+            self.chain_ready = Some(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        }
         self.spawn_link_keeper();
         self.stream_cap
     }
@@ -5980,6 +5990,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
         self.link_keeper = Some(token);
         let busy = self.link_busy.clone();
         let epoch = self.link_epoch.clone();
+        let ready = self.chain_ready.clone();
+        let total = self.total;
         self.runtime_handle.spawn(async move {
             use std::sync::atomic::Ordering::SeqCst;
             let mut tick = tokio::time::interval(IDLE_LINK_CHECK);
@@ -6001,21 +6013,42 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 let dead = tokio::time::timeout(Duration::from_millis(1), client.wait_readable())
                     .await
                     .is_ok();
-                if !dead {
+                if !dead && ready.as_ref().is_none_or(|r| r.load(SeqCst)) {
                     continue;
                 }
-                if down_since.is_none() {
+                if let Some(ready) = ready.as_ref() {
+                    ready.store(false, SeqCst);
+                }
+                if dead && down_since.is_none() {
                     warn!("downstream link is dead while idle; re-dialing until the next rank is back");
                     down_since = Some(Instant::now());
                 }
-                client.close().await;
-                if let Ok(Ok(())) = tokio::time::timeout(REDIAL_BUDGET, client.try_connect()).await {
+                if dead {
+                    client.close().await;
+                    if !matches!(tokio::time::timeout(REDIAL_BUDGET, client.try_connect()).await, Ok(Ok(()))) {
+                        continue;
+                    }
                     epoch.fetch_add(1, SeqCst);
                     info!(
                         down_s = down_since.map(|t| t.elapsed().as_secs()).unwrap_or(0),
                         "downstream link re-dialed while idle"
                     );
                     down_since = None;
+                }
+                if let Some(ready) = ready.as_ref() {
+                    // Loading eleven stages can take minutes. Keep one probe
+                    // outstanding while submit returns 503; repeatedly tearing
+                    // down the socket here would restart the loading chain.
+                    let probe = tokio::time::timeout(Duration::from_secs(900),
+                        crate::dist::probe_chain(&mut client, total)).await;
+                    if matches!(probe, Ok(Ok(()))) {
+                        ready.store(true, SeqCst);
+                        info!(total, "pipeline chain ready; accepting requests");
+                    } else {
+                        // A cancelled/failed read has unknown framing state.
+                        client.close().await;
+                        warn!("pipeline readiness probe failed; requests remain refused");
+                    }
                 }
             }
         });
@@ -8569,6 +8602,26 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     Err(format!("recv cache_prefix key: {e}"))
                 }
             },
+            FrameKind::ChainReady => {
+                let total = self.total;
+                let last = self.is_last();
+                let result = self.block_on(async {
+                    if let Some(down) = downstream.as_ref() {
+                        crate::dist::probe_chain(&mut *down.lock().await, total).await?;
+                    } else if !last {
+                        return Err(cascadia_transport::TransportError::NotConnected);
+                    }
+                    let ack: Vec<u8> = [FrameKind::ChainReadyAck as u32, total - 1, total]
+                        .into_iter()
+                        .flat_map(u32::to_be_bytes)
+                        .collect();
+                    upstream.lock().await.send_raw(&ack).await
+                });
+                if result.is_err() {
+                    self.peer_disconnected = true;
+                }
+                result.map_err(|e| format!("chain readiness: {e}"))
+            }
             FrameKind::StreamOpen => self.handle_stream_open(&upstream, downstream.as_ref()),
             FrameKind::StreamFeed => self.handle_stream_feed(&upstream, downstream.as_ref()),
             FrameKind::StreamRewind => self.handle_stream_rewind(&upstream, downstream.as_ref()),
@@ -9348,6 +9401,13 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
                 "only rank 0 accepts tasks; worker ranks drive themselves from upstream frames"
                     .into(),
             ));
+        }
+        if self
+            .chain_ready
+            .as_ref()
+            .is_some_and(|r| !r.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return Err(EngineError::NotConnected);
         }
         if self.pending.len() >= OV_MAX_PENDING {
             return Err(EngineError::QueueFull {
