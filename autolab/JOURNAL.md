@@ -367,3 +367,11 @@ Owner update, 2026-09-21: no entry-box hardware change yet. The brick/outlet
 have not been swapped and the unit has not been replaced. This does not
 confirm the cause of the 040 outage or establish recovery. Fleet traffic
 remains stopped pending the on-site power/access check.
+
+Owner follow-up, 2026-09-21: the second API/dashboard tunnel is not installed.
+The owner explicitly authorized the prepared temporary role-5 int4 quality
+canary, with restoration to int8 afterwards; no additional approval is
+needed for that scoped trial. A single signed-status check after the update
+still returned the exact frozen outage report (epoch 1789974050), so no
+traffic or release was attempted. The owner will report back after checking
+the entry box on site. Keep fleet traffic and publishing stopped until then.
