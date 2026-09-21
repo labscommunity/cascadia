@@ -18,6 +18,8 @@ Hard rule: no phase waits longer than --cap seconds (default 900).
 """
 import argparse, concurrent.futures, hashlib, json, os, re, subprocess, sys, threading, time, urllib.error, urllib.request
 
+from telemetry_analysis import profile_key
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 LAB = os.path.dirname(HERE)
 API = os.environ.get("INKLING_API", "http://localhost:18000")
@@ -373,11 +375,14 @@ class Telemetry(threading.Thread):
                     self.available = "ranks" in tel
                     for rank, e in (tel.get("ranks") or {}).items():
                         rec = {"lt": t, "rank": int(rank), "rt": e.get("rt"), "sys": e.get("sys"), "host": e.get("host")}
-                        new = [p for p in e.get("profs", []) if p.get("at") not in self.seen.setdefault(rank, set())]
+                        new = [p for p in e.get("profs", []) if profile_key(p) not in self.seen.setdefault(rank, set())]
                         for p in new:
-                            self.seen[rank].add(p.get("at"))
+                            self.seen[rank].add(profile_key(p))
                         if new:
                             rec["profs"] = new
+                        windows = [p for p in e.get("profs", []) if p.get("window_ms", 0) > 0 and isinstance(p.get("rank"), int)]
+                        if windows:
+                            rec["role"] = windows[-1]["rank"]
                         if e.get("static"):
                             rec["static"] = e["static"]
                         f.write(json.dumps(rec, separators=(",", ":")) + "\n")

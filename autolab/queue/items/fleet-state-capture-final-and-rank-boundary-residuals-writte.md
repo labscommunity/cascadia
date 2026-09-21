@@ -1,17 +1,17 @@
 ---
 id: fleet-state-capture-final-and-rank-boundary-residuals-writte
 title: fleet state capture: final and rank-boundary residuals written on the boxes, fetched through the entry box's relay (replaces the Mac Pro dump)
-status: ready
+status: running
 outcome: 
 priority: 5
 target: offline studies on the fleet's own numerics; first step of the MTP wiring
 exact: yes
 needs: binary (env-gated, default off) + overrides (relay route); no offline machine
 proposed_by: autolab session 2026-09-20 (user: use the fleet, not the Mac Pro)
-owner: 
-experiment: 
+owner: autolab-continuation-20260921
+experiment: 037_fleet_state_capture
 created: 2026-09-20
-updated: 2026-09-20
+updated: 2026-09-21
 ---
 
 ## Why

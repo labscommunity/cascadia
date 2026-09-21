@@ -3,16 +3,20 @@
 
 Reads experiments/EXP/phases.json (phase windows on this Mac's clock) and ~/inkling-release/autolab-telemetry/EXP/telemetry.jsonl (raw, never in the repo: what lab.py
 polled from /api/fleet/telemetry: "lt" = local poll time, "profs" = stage profiles with rank 0's receive time
-"rt"). Rank 0's clock and this Mac's differ, so profile times are placed by the poll that first saw them.
+"rt"). Rank 0's clock and this Mac's differ, so profile receive times are translated through the enclosing poll, not the worker timestamp.
+Rows are pipeline roles; each row also retains its installed box number.
 """
 import sys, json, os, collections
+from telemetry_analysis import normalize_records
 
 LAB = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 exp = sys.argv[1]; mode = sys.argv[3] if len(sys.argv) > 3 and sys.argv[2] == "--mode" else "all"
 d = os.path.join(LAB, "experiments", exp)
 phases = json.load(open(os.path.join(d, "phases.json")))
 raw = os.path.join(os.path.expanduser("~/inkling-release/autolab-telemetry"), os.path.basename(d.rstrip("/")), "telemetry.jsonl")
-recs = [json.loads(l) for l in open(raw) if l.strip()]
+recs = normalize_records([json.loads(l) for l in open(raw) if l.strip()])
+boxes = {r["rank"]: r["box"] for r in recs if "box" in r}
+print("Pipeline role -> installed box: " + ", ".join("%d -> %d" % x for x in sorted(boxes.items())))
 mean = lambda xs: sum(xs) / len(xs) if xs else 0.0
 BUSY = ("recv_ms", "compute_ms", "prefill_ms", "head_ms", "send_ms", "relay_ms", "emit_ms")
 summary = {}
@@ -24,19 +28,20 @@ for ph in phases:
     rows = []
     for rank in range(11):
         rr = [r for r in recs if r.get("rank") == rank and s - 1 <= r["lt"] <= e + 14]
-        profs = [p for r in rr for p in r.get("profs", []) if r["lt"] - p.get("window_ms", 0) / 1e3 >= s - 3]
+        profs = [p for r in rr for p in r.get("profs", [])
+                 if s - 1 <= p["lt"] <= e + 14 and p["lt"] - p.get("window_ms", 0) / 1e3 >= s - 3]
         if mode == "decode": profs = [p for p in profs if p.get("opens", 0) == 0]
         if mode == "admit": profs = [p for p in profs if p.get("opens", 0) > 0]
         sysr = [r["sys"] for r in rr if r.get("sys") and s + 2 <= r["lt"] <= e]
         tot = collections.Counter()
         for p in profs:
             for k, v in p.items():
-                if isinstance(v, (int, float)) and k not in ("rank", "total", "rt", "cache_mib", "cache_cap_mib", "max_compute_ms", "max_round_trip_ms"):
+                if isinstance(v, (int, float)) and k not in ("rank", "total", "rt", "lt", "cache_mib", "cache_cap_mib", "max_compute_ms", "max_round_trip_ms"):
                     tot[k] += v
         W = tot["window_ms"] or 1; fr = tot["frames"] or 1; rw = tot["rows"] or 1
         busy = sum(tot[k] for k in BUSY); look = tot["cache_hits"] + tot["cache_misses"]
         g = lambda k: mean([x[k] for x in sysr if k in x and x[k] is not None])
-        rows.append(dict(rank=rank, n=len(profs), frames=tot["frames"], rpf=tot["rows"] / fr, util=busy / W, wait=tot["wait_ms"] / W,
+        rows.append(dict(rank=rank, box=boxes.get(rank, rank), n=len(profs), frames=tot["frames"], rpf=tot["rows"] / fr, util=busy / W, wait=tot["wait_ms"] / W,
                          cpf=tot["compute_ms"] / fr, cpr=tot["compute_ms"] / rw, maxc=max([p.get("max_compute_ms", 0) for p in profs] or [0]),
                          attn=tot["attn_ms"] / fr, mlp=tot["mlp_ms"] / fr, ovattn=tot["ov_attn_ms"] / fr, ovmoe=tot["ov_moe_ms"] / fr,
                          moefb=tot["ov_moe_fallbacks"], moenf=tot["ov_moe_nonfinite"], recv=tot["recv_ms"] / fr, send=tot["send_ms"] / fr,
@@ -46,7 +51,7 @@ for ph in phases:
                          spec=(tot["spec_sent"], tot["spec_hits"], tot["spec_misses"], "model right/wrong", tot.get("spec_lm_hits", 0), tot.get("spec_lm_misses", 0), "no guess", tot.get("spec_none", 0)), cache=(profs[-1].get("cache_mib", 0) if profs else 0),
                          cpu=g("cpu"), cores=g("p_cores"), w=g("pkg_w"), mhz=g("mhz"), temp=g("temp"), gpu=g("gpu"), rd=g("rd_mb_s"), swi=g("swapin_s"),
                          rx=g("rx_mb_s"), tx=g("tx_mb_s"), avail=min([x.get("mem_avail", 0) for x in sysr] or [0]), anon=max([x.get("p_rssanon", 0) for x in sysr] or [0])))
-    print("rank win frames rows/f  util% wait% | ms/frame ms/row maxms |  attn   mlp ovattn ovmoe(fb/nf) | recv send head | relays(ms) | miss% cacheMiB |  cpu% cores  pkgW  MHz temp gpu% rdMB/s swi/s rxMB/s | availMiB anonMiB")
+    print("role win frames rows/f  util% wait% | ms/frame ms/row maxms |  attn   mlp ovattn ovmoe(fb/nf) | recv send head | relays(ms) | miss% cacheMiB |  cpu% cores  pkgW  MHz temp gpu% rdMB/s swi/s rxMB/s | availMiB anonMiB")
     for r in rows:
         print("%4d %3d %6d %6.2f  %5.1f %5.1f | %8.1f %6.1f %5d | %5.1f %5.1f %6.1f %5.1f(%d/%d) | %4.1f %4.1f %4.1f | %5d(%4d) | %5.1f %8d | %5.1f %5.2f %5.1f %4.0f %4.0f %4.0f %6.1f %5.0f %6.2f | %8d %7d" % (
             r["rank"], r["n"], r["frames"], r["rpf"], 100 * r["util"], 100 * r["wait"], r["cpf"], r["cpr"], r["maxc"], r["attn"], r["mlp"], r["ovattn"],
