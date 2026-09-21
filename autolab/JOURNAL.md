@@ -244,3 +244,34 @@ ceiling of this layout is 50-65 tok/s with nothing else in a frame. 60 is not th
   One stream ~5-6 tok/s if wired; the logit-lens / delayed-guess idea is closed (0.00 raw through rank 4).
 * **For whoever continues:** `OPERATING.md` (how to deploy without closing the only door; `lab.py publish` now refuses
   the releases that would), `QUEUE.md` (every experiment and its status; anyone may add items), the README's status.
+
+
+## 2026-09-21: continuation, 034-037
+
+The owner explicitly handed publishing over from tahoma-6d to
+`autolab-continuation-20260921`. The initial fleet was settled, all eleven
+workers served the recorded role swap, and the published binary/run/overrides
+hashes matched the documented files.
+
+034: ten frames in flight was negative. Paired fifteen-stream phases were
+24.580/24.679 with eleven frames, 24.596/24.444 with ten; 176 streams fell
+67.974 -> 64.846. Both output gates passed and every request completed. The
+simple round-time approximation overstated the benefit of fewer frames.
+Eleven frames are restored in 035.
+
+035 adds an opt-in idle handshake through every worker before rank 0 admits
+requests. A delayed-final-worker integration test proves TCP connectivity
+alone does not open admission, and that the gate recovers without requests.
+Nine pipeline/reconnect/speculation tests passed. The release is rolling out.
+
+036 is kept (harness only): pipeline-role and installed-box identities are
+separate; old profile windows are placed by their receive age and duplicate
+windows excluded. The role-0 summary now reads installed box 8. The harness
+also accepts `--prompt-tag` to compare identical prompts in separate records.
+
+037 is built and tested, not yet enabled: bounded f16 residual capture in the
+runner, sampled token IDs from the actual last-rank sampler, rewind handling,
+and completed-file downloads through a restricted route on the existing
+entry relay. Capture, readiness, direct-return, head-sharing and speculation
+tests passed. The original 36-prompt corpus and checkpoint are available for
+re-scoring the shipped MTP head on fleet states.

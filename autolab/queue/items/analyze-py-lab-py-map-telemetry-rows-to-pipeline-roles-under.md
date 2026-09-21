@@ -23,3 +23,8 @@ updated: 2026-09-21
 ## Kill
 
 ## Result
+
+036: kept. Roles come from worker profiles while physical box identity stays
+explicit; duplicate windows and probe tags are excluded, and receive times
+place windows on the operator clock. Synthetic skew/backlog tests passed,
+and 032 was re-analyzed with role 0 correctly mapped to installed box 8.

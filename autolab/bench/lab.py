@@ -473,7 +473,7 @@ RUN_TAG = [""]
 
 
 def cmd_bench(a):
-    RUN_TAG[0] = a.exp
+    RUN_TAG[0] = getattr(a, "prompt_tag", None) or a.exp
     d = os.path.join(LAB, "experiments", a.exp); os.makedirs(d, exist_ok=True)
     tel = Telemetry(raw_telemetry_path(a.exp)); tel.start()
     results = []
@@ -543,6 +543,7 @@ def main():
         s.add_argument("--cap", type=int, default=900)
         if name == "run":
             s.add_argument("--phases", nargs="+", required=True); s.add_argument("--prompt-words", type=int, default=0)
+            s.add_argument("--prompt-tag", help="reuse another experiment's deterministic prompts for a paired comparison")
             s.add_argument("--warm", type=int, default=2); s.add_argument("--force", action="store_true")
             s.add_argument("--warm-streams", type=int, default=16)
         s.set_defaults(fn=fn)
@@ -553,6 +554,7 @@ def main():
     s = sub.add_parser("reference"); s.set_defaults(fn=cmd_reference)
     s = sub.add_parser("gate"); s.set_defaults(fn=cmd_gate)
     s = sub.add_parser("bench"); s.add_argument("exp"); s.add_argument("--phases", nargs="+", required=True)
+    s.add_argument("--prompt-tag", help="reuse another experiment's deterministic prompts for a paired comparison")
     s.add_argument("--prompt-words", type=int, default=0); s.add_argument("--cap", type=int, default=900); s.set_defaults(fn=cmd_bench)
     a = ap.parse_args()
     return a.fn(a)
