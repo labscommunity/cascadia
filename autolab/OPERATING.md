@@ -20,7 +20,8 @@ They live in files on the operator's Mac that this document names.
   model, layers 0-5); the entry box plays pipeline rank 8 and relays its port 8000 to it. Host names, the updater's
   source, telemetry and `status.sh`'s table all go by **installed** rank; only the worker's role changed.
   `BOX_RANK` = installed rank, `RANK` = role played. Telemetry row `0` is the entry box (pipeline rank 8), row `8` is
-  pipeline rank 0. `analyze.py`'s "rank 0" summary lines therefore read the wrong box until someone teaches it.
+  pipeline rank 0. Experiment 036 corrected `analyze.py`: role summaries use the inner profile rank and
+  record the installed box separately; repeated/backlogged profile windows are de-duplicated.
 * **Two doors, both on the operator's Mac:**
   * in: `autolab/bench/lab.py publish ...` -> `~/inkling-release/bin/release.py` -> poller on the entry box -> every
     box's updater. Only six file names exist: `cascadia`, `fleet-overrides.env`, `run.sh`, `status.sh`, `beacon.py`,
@@ -28,7 +29,14 @@ They live in files on the operator's Mac that this document names.
   * out: `http://localhost:18000` (OpenAI API, dashboard, `/api/stats`, `/api/fleet/telemetry`, `/api/topology`) and
     `release.py status [--json]` (signed fleet table + the last 30 log lines of the **entry box's** worker).
 
-## 2. What the fleet runs now, and the two known-good releases
+## 2. Known-good releases and the current experiment
+
+As of 035 (2026-09-21), the kept binary is `~/inkling-release/builds/cascadia-5b090e55`,
+overrides `~/inkling-release/autolab-overrides/035_chain_readiness.env`, with the same 032b run.sh below.
+It adds `CASCADIA_STREAMS_READY_GATE=1` on role 0; both gates passed and 15 streams measured 24.21/24.63 tok/s.
+034's ten frames were negative: keep eleven. 037 is enabling final-state capture as a temporary measurement;
+check `~/inkling-release/autolab-state/continuation.json` and the signed release status for the active files.
+The table below remains the earlier rollback, with readiness and capture disabled.
 
 | | file on the operator's Mac |
 |---|---|
@@ -152,8 +160,8 @@ restore it in the release that ends the canary (022, 026, 029 are templates).
   box serves a small file for a few minutes on a spare port, the entry box curls it and pages it into its own journal
   ten lines at a time with a prefix; `autolab/bench/collect_pages.py PREFIX OUT` collects the pages. Key that block on
   `BOX_RANK`, not `RANK`.
-* Rank 10's clock is a day ahead; `analyze.py` then counts its frames twice (its per-frame columns are halved).
-  Clocks across the fleet disagree; trust "rt" (receive time) and your own Mac's clock.
+* Rank 10's clock is a day ahead. Clocks across the fleet disagree; trust "rt" (receive time) and your own Mac's
+  clock. The 036 analyzer now translates profile windows by receive age and excludes duplicate records.
 
 ## 5. The entry box: what happens when it dies, and what to do
 

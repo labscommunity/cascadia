@@ -262,14 +262,16 @@ Eleven frames are restored in 035.
 035 adds an opt-in idle handshake through every worker before rank 0 admits
 requests. A delayed-final-worker integration test proves TCP connectivity
 alone does not open admission, and that the gate recovers without requests.
-Nine pipeline/reconnect/speculation tests passed. The release is rolling out.
+Nine pipeline/reconnect/speculation tests passed. The release settled and
+both fleet gates passed. Paired fifteen-stream phases: 24.212 / 24.631 tok/s,
+all requests complete, first token 6.61 / 6.10 s. Kept for reliability.
 
 036 is kept (harness only): pipeline-role and installed-box identities are
 separate; old profile windows are placed by their receive age and duplicate
 windows excluded. The role-0 summary now reads installed box 8. The harness
 also accepts `--prompt-tag` to compare identical prompts in separate records.
 
-037 is built and tested, not yet enabled: bounded f16 residual capture in the
+037 is built and tested, now rolling out: bounded f16 residual capture in the
 runner, sampled token IDs from the actual last-rank sampler, rewind handling,
 and completed-file downloads through a restricted route on the existing
 entry relay. Capture, readiness, direct-return, head-sharing and speculation

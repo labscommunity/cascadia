@@ -1,8 +1,8 @@
 ---
 id: refuse-requests-while-the-chain-of-ranks-is-still-assembling
 title: refuse requests while the chain of ranks is still assembling (they wedged it for ten minutes in 028's first rollout)
-status: running
-outcome: 
+status: done
+outcome: kept
 priority: 3
 target: reliability
 exact: yes
