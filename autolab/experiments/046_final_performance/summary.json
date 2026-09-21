@@ -1,8 +1,9 @@
 {
   "complete": false,
-  "peak_steady_streams": 64,
-  "peak_steady_tok_s": 53.74387113882796,
-  "smallest_streams_within_95pct_peak": 64,
-  "peak_end_to_end_streams": 64,
-  "peak_end_to_end_tok_s": 42.29596633062803
+  "peak_steady_streams": 176,
+  "peak_steady_tok_s": 57.9380863763043,
+  "smallest_streams_within_95pct_peak": 176,
+  "peak_end_to_end_streams": 176,
+  "peak_end_to_end_tok_s": 45.36784953674478,
+  "max_streams_limit": 176
 }

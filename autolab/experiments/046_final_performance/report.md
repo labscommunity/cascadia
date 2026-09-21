@@ -1,6 +1,6 @@
 # Inkling fleet performance survey
 
-IN PROGRESS — completed phases only
+IN PROGRESS — completed phases only (capped at 176 streams)
 
 Eleven Panther Lake boxes; release `1790016660`; int4 experts and int8 attention. All survey requests use temperature 0 and a 128-token output budget. Counts include reasoning and answer tokens.
 
@@ -12,9 +12,11 @@ The bounded diagnostic capture reached its storage budget during the first 22-st
 
 Two initial 128-stream attempts were excluded: one received an admission 503, and the next received an engine no-progress error before generating tokens. The workers did not restart. A subsequent correctness gate passed; the verified-idle retry then completed all 128 requests without capacity retries. These interruptions are retained in [stress attempts](stress-attempts.json). Completed-run throughput is not an error-rate or reliability estimate.
 
-Best observed sustained aggregate: **53.74 tok/s at 64 streams**.
-Smallest tested setting within 95% of that peak: **64 streams**.
-Best observed throughput including startup/drain: **42.30 tok/s at 64 streams**.
+The 256-stream attempt disconnected during admission. Outstanding requests were cancelled, the unchanged fleet returned to idle, and the correctness gate passed again. The remaining survey was capped at **176 streams**. The planned 256-stream repeats and conditional 352-stream extension were therefore not completed. This is an observed failure, not proof of a hard engine concurrency limit; the measured optimum is bounded by the tested range.
+
+Best observed sustained aggregate: **57.94 tok/s at 176 streams**.
+Smallest tested setting within 95% of that peak: **176 streams**.
+Best observed throughput including startup/drain: **45.37 tok/s at 176 streams**.
 
 These are different objectives from maximizing each user’s speed. Use the latency and per-stream columns to choose an operating point.
 
@@ -37,6 +39,7 @@ These are different objectives from maximizing each user’s speed. Use the late
 | 64 | 1 | 53.74 | 0.84 | 42.30 | 25.21 / 47.49 |
 | 96 | 1 | 46.43 | 0.48 | 39.09 | 38.75 / 73.97 |
 | 128 | 1 | 50.36 | 0.39 | 41.79 | 56.42 / 108.73 |
+| 176 | 1 | 57.94 | 0.33 | 45.37 | 77.46 / 164.87 |
 
 | Minimum sustained tok/s/stream | Highest tested concurrency meeting it |
 |---:|---:|

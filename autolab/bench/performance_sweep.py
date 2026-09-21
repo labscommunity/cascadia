@@ -309,7 +309,7 @@ class Sweep:
         finally:
             self.phase_active = False
 
-    async def run(self, suite):
+    async def run(self, suite, max_streams=None):
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=600),
                                          timeout=timeout, trust_env=False) as self.session:
@@ -322,22 +322,32 @@ class Sweep:
                     await self.phase('pilot_single',1,32,family=0)
                     await self.phase('pilot_four',4,32)
                     return
-                levels = LEVELS.copy()
+                limit_path=self.dest/'concurrency-limit.json'
+                if limit_path.exists():
+                    saved_limit=json.loads(limit_path.read_text())['max_streams']
+                    if max_streams is not None and max_streams!=saved_limit:
+                        raise RuntimeError('Requested stream limit differs from recorded experiment limit')
+                    max_streams=saved_limit
+                elif max_streams is not None:
+                    atomic_json(limit_path,dict(max_streams=max_streams,time=time.time(),
+                                note='Operator-imposed survey limit; see stress-attempts.json for evidence'))
+                levels = [n for n in LEVELS if max_streams is None or n<=max_streams]
                 for n in levels:
                     await self.phase(f'mixed_a_c{n:03}',n)
-                high = next(r for r in self.results if r['phase']=='mixed_a_c256')
-                lower = max(r['steady_aggregate_tok_s'] for r in self.results
-                            if r['phase'].startswith('mixed_a') and r['streams']<256)
-                if high['steady_aggregate_tok_s'] > lower*1.05:
-                    levels.append(352)
-                    await self.phase('mixed_a_c352',352)
+                if max_streams is None:
+                    high = next(r for r in self.results if r['phase']=='mixed_a_c256')
+                    lower = max(r['steady_aggregate_tok_s'] for r in self.results
+                                if r['phase'].startswith('mixed_a') and r['streams']<256)
+                    if high['steady_aggregate_tok_s'] > lower*1.05:
+                        levels.append(352)
+                        await self.phase('mixed_a_c352',352)
                 for n in reversed(levels):
                     await self.phase(f'mixed_b_c{n:03}',n)
                 if suite == 'mixed': return
                 means = {n:statistics.mean(r['steady_aggregate_tok_s'] for r in self.results
                          if r['phase'] in [f'mixed_a_c{n:03}',f'mixed_b_c{n:03}']) for n in levels}
                 best = max(means,key=means.get)
-                family_levels = sorted({1,15,64,best})
+                family_levels = sorted(n for n in {1,15,64,best} if max_streams is None or n<=max_streams)
                 atomic_json(self.dest/'family-plan.json',dict(mixed_peak_streams=best,levels=family_levels))
                 for family in range(12):
                     for n in family_levels:
@@ -346,7 +356,8 @@ class Sweep:
                     await self.phase(f'family_{family:02}_b_c001',1,family=family,samples=3)
                     await self.phase(f'family_{family:02}_b_c{best:03}',best,family=family)
                 atomic_json(self.dest/'complete.json',dict(time=time.time(),release=EXPECTED_RELEASE,
-                            mixed_levels=levels,family_levels=family_levels,phases=len(self.results)))
+                            mixed_levels=levels,family_levels=family_levels,phases=len(self.results),
+                            max_streams_limit=max_streams))
             finally:
                 watcher.cancel()
                 await asyncio.gather(watcher,return_exceptions=True)
@@ -358,6 +369,8 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--exp',default='046_final_performance')
     ap.add_argument('--suite',choices=['pilot','mixed','all'],default='all')
+    ap.add_argument('--max-streams',type=int,choices=LEVELS,
+                    help='Persist a concurrency cap for this experiment, including future resumptions')
     args=ap.parse_args()
     owner=Path(lab.LOCK).read_text()
     if 'autolab-continuation-20260921' not in owner:
@@ -365,7 +378,7 @@ def main():
     import resource
     soft,hard=resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE,(min(8192,hard),hard))
-    asyncio.run(Sweep(args.exp).run(args.suite))
+    asyncio.run(Sweep(args.exp).run(args.suite,args.max_streams))
 
 
 if __name__=='__main__': main()

@@ -87,3 +87,15 @@ in TTFT and end-to-end throughput. Server request counters include
 engine-queue rejections but exclude API-permit rejections; the accounting
 check distinguishes them. The 96-stream result remains valid, including
 its slowdown; compare against the reverse pass and telemetry.
+
+## Execution note: transport disconnect at 256 streams, 17:11 CDT
+
+The verified-idle 128-stream retry and the 176-stream run completed without
+capacity retries. The 256-stream attempt disconnected during admission;
+outstanding requests were cancelled and the phase was excluded. All eleven
+workers stayed active with unchanged restart counts, the API returned to
+idle, and the single-stream correctness gate passed at 17:12:39 CDT.
+Continue reverse sweeps and family tests with a persisted limit of 176
+streams. The planned 256-stream repeat and conditional 352 extension remain
+unmeasured; report this failed stress attempt without inferring a universal
+hard engine limit. No release or model configuration changed.

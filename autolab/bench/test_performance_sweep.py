@@ -40,6 +40,31 @@ class HealthTests(unittest.TestCase):
 
 
 class ClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recorded_concurrency_cap_survives_resume_and_limits_family_tests(self):
+        import json
+        with tempfile.TemporaryDirectory() as d, patch.object(perf.lab,'LAB',d), \
+             patch.object(perf.Path,'home',return_value=Path(d)), \
+             patch.object(perf,'check_fleet',return_value=1), \
+             patch.object(perf.lab,'Telemetry'):
+            for limit in [8,None]:
+                sweep=perf.Sweep('capped')
+                sweep.watch=AsyncMock()
+                observed=[]
+                async def phase(name,n,**kwargs):
+                    observed.append(n)
+                    result=dict(phase=name,streams=n,steady_aggregate_tok_s=n)
+                    sweep.results.append(result)
+                    return result
+                sweep.phase=phase
+                await sweep.run('all',limit)
+                self.assertEqual(max(observed),8)
+                complete=json.loads((sweep.dest/'complete.json').read_text())
+                self.assertEqual(complete['mixed_levels'],[1,2,4,6,8])
+                self.assertEqual(complete['family_levels'],[1,8])
+                self.assertEqual(complete['max_streams_limit'],8)
+            with self.assertRaisesRegex(RuntimeError,'differs from recorded'):
+                await sweep.run('all',256)
+
     async def test_completed_phase_validates_counters_and_persists_summary(self):
         import json
         import time

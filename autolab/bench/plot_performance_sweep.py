@@ -68,7 +68,10 @@ def main():
                          'axes.spines.right':False,'axes.grid':True,'grid.alpha':.2,
                          'svg.hashsalt':'046_final_performance'})
     complete=(root/'complete.json').exists()
-    status='Completed survey' if complete else 'IN PROGRESS — completed phases only'
+    limit_path=root/'concurrency-limit.json'
+    limit=json.loads(limit_path.read_text())['max_streams'] if limit_path.exists() else None
+    status=('Completed survey' if complete else 'IN PROGRESS — completed phases only')
+    if limit:status+=f' (capped at {limit} streams)'
     report=['# Inkling fleet performance survey','',status,'',
             'Eleven Panther Lake boxes; release `1790016660`; int4 experts and int8 attention. '
             'All survey requests use temperature 0 and a 128-token output budget. '
@@ -99,6 +102,13 @@ def main():
                    'the verified-idle retry then completed all 128 requests without capacity '
                    'retries. These interruptions are retained in [stress attempts](stress-attempts.json). '
                    'Completed-run throughput is not an error-rate or reliability estimate.','']
+    if limit:
+        report += [f'The 256-stream attempt disconnected during admission. Outstanding requests '
+                   f'were cancelled, the unchanged fleet returned to idle, and the correctness '
+                   f'gate passed again. The remaining survey was capped at **{limit} streams**. '
+                   'The planned 256-stream repeats and conditional 352-stream extension were '
+                   'therefore not completed. This is an observed failure, not proof of a hard '
+                   'engine concurrency limit; the measured optimum is bounded by the tested range.','']
     if grouped:
         ns=list(grouped)
         steady=[avg(grouped[n],'steady_aggregate_tok_s') for n in ns]
@@ -111,7 +121,7 @@ def main():
         best_end=ns[int(np.argmax(end))]
         summary=dict(complete=complete,peak_steady_streams=best,peak_steady_tok_s=max(steady),
                      smallest_streams_within_95pct_peak=knee,peak_end_to_end_streams=best_end,
-                     peak_end_to_end_tok_s=max(end))
+                     peak_end_to_end_tok_s=max(end),max_streams_limit=limit)
         (root/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
         fig,axes=plt.subplots(1,2,figsize=(12,4.6),layout='constrained')
         axes[0].plot(ns,steady,'o-',color='#176b78',label='Sustained decode')
