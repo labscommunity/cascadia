@@ -1,12 +1,12 @@
 ---
 id: re-score-the-model-s-own-mtp-head-on-states-captured-from-th
 title: re-score the model's own MTP head on states captured from the fleet (f16 fused experts, int8 attention), same 36 prompts as 033
-status: running
-outcome: 
+status: done
+outcome: negative
 priority: 7
 target: single stream, 15 streams
 exact: n/a
-needs: collecting 36 original rendered prompts from the settled and gated fleet, then score on miner
+needs: 039 complete: 0.6681 original, 0.6436 deployment grids; below 0.70 bar, redirect to conditional fleet-head training
 proposed_by: autolab session 2026-09-20 (user: use the fleet, not the Mac Pro)
 owner: autolab-continuation-20260921
 experiment: 039_mtp_fleet_rescore

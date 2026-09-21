@@ -1,7 +1,7 @@
 ---
 id: expert-usage-skew-per-layer-are-the-top-64-experts-60-of-sel
 title: expert-usage skew per layer (are the top 64 experts > 60 % of selections?) to price hot-expert replicas
-status: ready
+status: running
 outcome: 
 priority: 30
 target: single stream

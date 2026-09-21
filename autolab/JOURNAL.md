@@ -317,3 +317,10 @@ latest profile every five seconds. Simultaneous expert-layer summaries
 would lose five of six. A stage reporter now rotates one layer every seven
 seconds, out of the inference path; tests cover every layer and lifetime.
 041 holds each kernel result for seven seconds for the same reason.
+
+039 complete: on all 36 fleet sequences (5,724 targets), module 0 scores
+0.6681 with original full-vocabulary weights and 0.6436 with deployment
+weight grids. The original 65k prefix alone is 0.6454: the cutoff explains
+most export loss. The predeclared 0.70 bar fails. Redirect runtime qualification
+to the conditional 042 fleet-state training study; 117 exact-rendered-disjoint
+prompts are selected, and all original 36 stay held out. No MTP assets enabled.

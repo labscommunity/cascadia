@@ -1,7 +1,7 @@
 ---
 id: int4-attention-projections-0-78-0-4-gb-read-per-frame
 title: int4 attention projections (0.78 -> 0.4 GB read per frame)
-status: ready
+status: running
 outcome: 
 priority: 25
 target: 15 streams, single stream
