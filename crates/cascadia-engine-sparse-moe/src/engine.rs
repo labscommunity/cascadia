@@ -5358,6 +5358,17 @@ pub struct PipelineEngine<R: StagedRunner> {
     stream_cap: usize,
     /// Last rank of a multi-stream pipeline: one sampler per open slot.
     stream_samplers: HashMap<usize, StreamSampler>,
+    /// Last rank: decode frames whose layers are done and whose output-head
+    /// call is owed (`CASCADIA_STREAMS_HEAD_BATCH` > 1). The head reads its
+    /// whole table once per CALL whatever the row count (1.24 GB of int8:
+    /// 11.6 ms of a 47.5 ms frame at 15 streams, which made the last rank the
+    /// stage everyone waits for), so when the next frame is already waiting
+    /// its layers run first and ONE call serves both frames' rows.
+    pending_heads: Vec<PendingHead>,
+    head_batch: usize,
+    head_batch_min_streams: usize,
+    /// (head calls, frames they served) since start.
+    head_batch_stats: (u64, u64),
     /// Rank 0: id of the last stream frame sent (replies must echo it).
     stream_batch_seq: u32,
     /// Rank 0 of a pipeline: streams are split into this many groups, each
@@ -5412,6 +5423,23 @@ pub struct PipelineEngine<R: StagedRunner> {
     return_ready: bool,
     /// Last rank: rank 0's connection has been accepted.
     return_accepted: bool,
+}
+
+/// Decode frames (process-wide) whose output head ran in a call shared with
+/// another frame (`CASCADIA_STREAMS_HEAD_BATCH`); tests and the log read it.
+static HEAD_SHARED_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`HEAD_SHARED_FRAMES`].
+pub fn head_shared_frames() -> u64 {
+    HEAD_SHARED_FRAMES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A decode frame on the last rank whose layers are done and whose
+/// output-head call is owed (see `SparseMoEEngine::pending_heads`).
+struct PendingHead {
+    batch_id: u32,
+    slots: Vec<usize>,
+    hidden: Vec<f32>,
 }
 
 /// One task inside the multi-stream single-stage scheduler: its slot in the
@@ -5831,6 +5859,17 @@ impl<R: StagedRunner> PipelineEngine<R> {
             spec_learned: std::cell::Cell::new(0),
             spec_lm: None,
             spec_sources: (0, 0),
+            pending_heads: Vec::new(),
+            head_batch: std::env::var("CASCADIA_STREAMS_HEAD_BATCH")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(1)
+                .clamp(1, 8),
+            head_batch_min_streams: std::env::var("CASCADIA_STREAMS_HEAD_BATCH_MIN_STREAMS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(4),
+            head_batch_stats: (0, 0),
             batched_admissions: 0,
             return_cli: None,
             return_srv: None,
@@ -8440,6 +8479,16 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 return Vec::new();
             }
         };
+        // Heads owed from earlier decode frames go out before anything that is
+        // not another decode frame (a close or a rewind must find its stream's
+        // sampler in the state the frames before it left).
+        if !matches!(kind, FrameKind::StreamDecode) {
+            if let Err(e) = self.flush_pending_heads(&upstream) {
+                warn!("worker head flush failed: {e}");
+                self.peer_disconnected = true;
+                return Vec::new();
+            }
+        }
         let res = match kind {
             FrameKind::Reset => {
                 self.runner.reset();
@@ -8752,26 +8801,27 @@ impl<R: StagedRunner> PipelineEngine<R> {
             p.decoded(slots.len(), computed - received);
         }
         if self.is_last() {
-            let logits = self.runner.head_logits_rows(&hidden, slots.len());
-            let vocab = logits.len() / slots.len();
-            let mut toks = Vec::with_capacity(slots.len());
-            for (i, &s) in slots.iter().enumerate() {
-                let sampler = self.stream_samplers.get_mut(&s).ok_or_else(|| {
-                    format!("stream decode: slot {s} has no sampler (no StreamOpen seen)")
-                })?;
-                let l = &logits[i * vocab..(i + 1) * vocab];
-                let token =
-                    crate::sampling::sample(l, &sampler.history, &sampler.cfg, &mut sampler.rng);
-                sampler.history.push(token);
-                toks.push((s as u32, token));
+            self.pending_heads.push(PendingHead {
+                batch_id,
+                slots,
+                hidden,
+            });
+            // Wait for the next frame's layers only when it is already here
+            // and the rank serves enough streams for throughput to be the
+            // point: a lone stream's reply must not wait for a guess frame.
+            let defer = self.head_batch > 1
+                && self.pending_heads.len() < self.head_batch
+                && self.stream_samplers.len() >= self.head_batch_min_streams
+                && self.block_on(async {
+                    let u = upstream.lock().await;
+                    tokio::time::timeout(Duration::from_micros(200), u.wait_readable())
+                        .await
+                        .is_ok_and(|r| r.is_ok())
+                });
+            if defer {
+                return Ok(());
             }
-            let send_started = Instant::now();
-            let sent = self.send_tokens_reply(upstream, batch_id, &toks);
-            if let Some(p) = self.stage_profile.as_mut() {
-                p.head += send_started - computed;
-                p.send += send_started.elapsed();
-            }
-            sent
+            self.flush_pending_heads(upstream)
         } else {
             let down = downstream.ok_or("mid rank missing downstream")?;
             let sent = self
@@ -8784,6 +8834,74 @@ impl<R: StagedRunner> PipelineEngine<R> {
             }
             sent
         }
+    }
+
+    /// Last rank: one output-head call for every decode frame whose head is
+    /// owed, then each frame's tokens sampled and sent as its own reply, in
+    /// arrival order (a stream's rows reach its sampler in position order).
+    fn flush_pending_heads(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+    ) -> Result<(), String> {
+        if self.pending_heads.is_empty() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let pending = std::mem::take(&mut self.pending_heads);
+        let total: usize = pending.iter().map(|p| p.slots.len()).sum();
+        let logits = if pending.len() == 1 {
+            self.runner.head_logits_rows(&pending[0].hidden, total)
+        } else {
+            let mut all = Vec::with_capacity(pending.iter().map(|p| p.hidden.len()).sum());
+            for p in &pending {
+                all.extend_from_slice(&p.hidden);
+            }
+            self.runner.head_logits_rows(&all, total)
+        };
+        let vocab = logits.len() / total.max(1);
+        self.head_batch_stats.0 += 1;
+        self.head_batch_stats.1 += pending.len() as u64;
+        if pending.len() > 1 {
+            HEAD_SHARED_FRAMES
+                .fetch_add(pending.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        if self.head_batch > 1 && self.head_batch_stats.0.is_multiple_of(512) {
+            // integers on a "stage profile" line: the fleet's beacon relays those
+            println!(
+                "HB probe stage profile calls={} frames={}",
+                self.head_batch_stats.0, self.head_batch_stats.1
+            );
+        }
+        let mut row = 0usize;
+        let mut replies = Vec::with_capacity(pending.len());
+        for p in &pending {
+            let mut toks = Vec::with_capacity(p.slots.len());
+            for &s in &p.slots {
+                let sampler = self.stream_samplers.get_mut(&s).ok_or_else(|| {
+                    format!("stream decode: slot {s} has no sampler (no StreamOpen seen)")
+                })?;
+                let l = &logits[row * vocab..(row + 1) * vocab];
+                let token =
+                    crate::sampling::sample(l, &sampler.history, &sampler.cfg, &mut sampler.rng);
+                sampler.history.push(token);
+                toks.push((s as u32, token));
+                row += 1;
+            }
+            replies.push((p.batch_id, toks));
+        }
+        let send_started = Instant::now();
+        let mut sent = Ok(());
+        for (batch_id, toks) in &replies {
+            sent = self.send_tokens_reply(upstream, *batch_id, toks);
+            if sent.is_err() {
+                break;
+            }
+        }
+        if let Some(p) = self.stage_profile.as_mut() {
+            p.head += send_started - started;
+            p.send += send_started.elapsed();
+        }
+        sent
     }
 
     /// `StreamOpenBatch`: several prompts opened and prefilled in one pass
