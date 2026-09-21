@@ -3525,7 +3525,9 @@ impl SparseMoEEngine {
             | FrameKind::StreamTokens
             | FrameKind::StreamFeed
             | FrameKind::StreamRewind
-            | FrameKind::StreamOpenBatch => Err(format!(
+            | FrameKind::StreamOpenBatch
+            | FrameKind::ChainReady
+            | FrameKind::ChainReadyAck => Err(format!(
                 "sparse-moe stage received multi-stream frame {kind:?} (only the staged pipeline engine serves streams)"
             )),
             #[cfg(feature = "kv_coord")]
