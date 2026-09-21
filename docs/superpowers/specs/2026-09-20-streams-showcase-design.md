@@ -490,10 +490,12 @@ Facts established from the repo and the fleet operator's notes (2026-09-20):
 - This feature changes no Rust, so the build machine's checkout can stay on
   whatever branch it is on (including `autolab/inkling-fleet-perf`, which adds
   the `/api/fleet/telemetry` route the fleet uses). Only the tarball changes.
-- **Pre-flight to confirm before shipping:** no pushed branch carries SPA
-  changes this branch lacks (checked 2026-09-20: `autolab/inkling-fleet-perf`
-  touches only `src/lib.rs`). If the tarball currently deployed was built from
-  an *unpushed* web tree, replacing it would drop those changes. Vite output
-  is content-hashed and deterministic for the same sources and lockfile, so
-  compare the asset names in the deployed tarball with a build of
-  `feat/inkling-multistream`'s `web/` before proceeding (checklist Part C).
+- **Pre-flight (done 2026-09-20, repeat for later SPA releases):** no pushed
+  branch carries SPA changes this branch lacks (`autolab/inkling-fleet-perf`
+  touches only `src/lib.rs`; every other remote branch's `web/` equals
+  `feat/inkling-multistream`'s). The deployed tarball's content-hashed asset
+  names match a clean build of that tree, so it was not built from an
+  unpushed source, and the `tahoma-dashboard` worktree on the Mac mini is a
+  stale `feat/dashboard` checkout one commit behind `main` with nothing
+  unpushed. Replacing the tarball with this branch's build drops nothing.
+  The comparison procedure lives in checklist Part C0.

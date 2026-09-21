@@ -178,6 +178,16 @@ is mid-experiment on the fleet.
 
 ### C0. Pre-flight: make sure the new tarball drops nothing
 
+> **Done for this ship on 2026-09-20.** The tarball on the build machine
+> (`~/inkling-build/dash-dist.tar.gz`, dated Sep 19 21:44, top-level entry
+> `dist/`) lists `index-DUJ_Gm7o.js` and `index-DCDzzC-l.css`, which is
+> exactly what a clean build of `feat/inkling-multistream`'s `web/` produces
+> (Node 22, current lockfile). Every remote branch shares that web tree. The
+> `tahoma-dashboard` worktree on the Mac mini is on the stale `feat/dashboard`
+> branch (upstream deleted), one commit behind `main`, with nothing
+> uncommitted or unpushed under `web/`. Skip to C1 unless the tarball's date
+> or names have changed since. The steps stay here for the next SPA release.
+
 The build machine's script untars `~/inkling-build/dash-dist.tar.gz` over
 `crates/cascadia-dashboard/web` before building, so the *tarball* is the SPA
 that ships, whatever branch the checkout is on. Vite's asset names are

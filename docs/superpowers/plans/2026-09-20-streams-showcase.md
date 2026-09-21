@@ -2120,9 +2120,8 @@ Expected: typecheck silent; build ends `✓ built in …` with `dist/index.html`
 
 Then package the built SPA the way the fleet's build machine expects it. Its
 build script untars this file over `crates/cascadia-dashboard/web`, so the
-tarball's top-level entry must be `dist/` (inferred from that command; the
-checklist's Part C compares against the tarball already on the build machine
-before it is replaced):
+tarball's top-level entry must be `dist/` (confirmed 2026-09-20 against the
+tarball on the build machine, which lists `dist/index.html`, `dist/assets/…`):
 ```bash
 cd crates/cascadia-dashboard/web
 tar -czf "$HOME/dash-dist.tar.gz" dist
