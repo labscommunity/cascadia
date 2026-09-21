@@ -796,6 +796,13 @@ pub fn load_stage(
             );
         }
     }
+    if super::env_flag("CASCADIA_INKLING_EXPERT_COUNTS") {
+        for (i, layer) in layers.iter_mut().enumerate() {
+            if let Some(moe) = layer.moe_mut() {
+                moe.set_route_observer(Some(super::expert_counts::observer(lo + i, m.num_experts)));
+            }
+        }
+    }
     Ok(InklingStage {
         embed,
         layers,
