@@ -32,14 +32,18 @@ def main():
     data=json.loads((root/'measurements.json').read_text())
     phases=[r for r in data if not r['phase'].startswith('pilot')]
     if not phases:raise SystemExit('No completed survey phases yet')
+    incident_path=root/'capture-budget-event.json'
+    capture_event=json.loads(incident_path.read_text()) if incident_path.exists() else None
     for phase in phases:
         prompts=[prompt_for(r['family_index'],r['prompt_index']) for r in phase['request_metrics']]
         phase['unique_prompts']=len(set(prompts))
+        phase['capture_writes']=('disabled_after_budget' if capture_event and
+                                 phase['start']>capture_event['observed_epoch'] else 'enabled')
     fields=['phase','family','streams','requests','tokens_req','tokens','chunks','wall_s',
             'steady_aggregate_tok_s','steady_per_stream_tok_s','aggregate_tok_s','overlap_s',
             'stream_tok_s_median','stream_tok_s_p10','stream_tok_s_p90','stream_tok_s_max',
             'ttft_median_s','ttft_p95_s','ttft_max_s','prompt_tokens_median',
-            'completion_tokens_median','early_finish','unique_prompts']
+            'completion_tokens_median','early_finish','unique_prompts','capture_writes']
     with (root/'phase-results.csv').open('w',newline='') as f:
         writer=csv.DictWriter(f,fieldnames=fields);writer.writeheader()
         writer.writerows({k:r.get(k) for k in fields} for r in phases)
@@ -67,6 +71,13 @@ def main():
             'high-concurrency family cohorts can repeat identical prompts. `unique_prompts` in '
             'the phase CSV records diversity; family maxima describe these pools, not a guarantee '
             'for arbitrary novel prompts.','']
+    if capture_event:
+        report += ['The bounded diagnostic capture reached its storage budget during the first '
+                   '22-stream attempt. That incomplete attempt was excluded and repeated. Capture '
+                   'writes were enabled for the ascending 1–15-stream points and disabled thereafter; '
+                   'the reverse sweep and family tests use the same capture-disabled state. '
+                   'No worker restarted and no model configuration changed. Repeat differences '
+                   'therefore include phrase learning, time/order effects and this instrumentation change.','']
     if grouped:
         ns=list(grouped)
         steady=[avg(grouped[n],'steady_aggregate_tok_s') for n in ns]

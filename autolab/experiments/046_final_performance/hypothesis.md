@@ -61,3 +61,16 @@ counters. Preserve completed phases and any interruption for resumption.
 The readiness anchor is the successful 14:00 CDT settlement and gates;
 empty beacon phase text is permitted only with those exact unchanged active
 workers, because profiling ages startup text out of the journal window.
+
+## Execution note: diagnostic capture budget, 16:30 CDT
+
+The first 22-stream attempt was stopped by the watchdog when bounded state
+capture exhausted its configured byte budget. All workers remained active
+with identical restart counts. Source inspection confirms this disables
+capture writes and leaves inference running. Retain only the completed
+1–15-stream phases; repeat the interrupted 22-stream phase after recognizing
+that exact diagnostic warning and rechecking correctness. Record capture
+state in the exported data: the ascending low-concurrency phases had writes
+enabled; all later phases, including the reverse sweep and family tests,
+have writes disabled. This is an instrumentation change to disclose when
+interpreting repeats. No release or model-numerical change was made.

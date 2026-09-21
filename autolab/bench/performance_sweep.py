@@ -25,6 +25,8 @@ LEVELS = [1, 2, 4, 6, 8, 11, 15, 22, 32, 48, 64, 96, 128, 176, 256]
 EXPECTED_RELEASE = 1790016660
 EXPECTED_BINARY = '9084392040688eaa6aa9ff6cf6d222f84e24e119e528d91920d12ddd106563c2'
 EXPECTED_RESTARTS = [2, 5, 5, 4, 3, 3, 3, 2, 0, 1, 1]
+CAPTURE_BUDGET_PHASE = ('state capture stopped, incomplete .part files retained: '
+                        'state capture byte budget exhausted')
 
 
 def atomic_json(path, value):
@@ -70,8 +72,11 @@ def check_fleet():
     # Profiling can fill the beacon journal window and leave an empty phase.
     # Accept that only with the exact release/restart anchor that passed
     # steady 3/3 and both correctness gates on 2026-09-21 at 14:00 CDT.
+    # This exact bounded-diagnostic warning sets capture.failed and makes
+    # later capture calls no-ops. It neither exits nor changes inference.
     bad = [r['phase'] for r in rows.values()
-           if r['phase'] and not lab.worker_is_serving(r)]
+           if r['phase'] and r['phase'] != CAPTURE_BUDGET_PHASE
+           and (not lab.worker_is_serving(r) or 'last error:' in r['phase'])]
     if bad:
         raise RuntimeError('Fleet phase changed: ' + repr(bad))
     return st['time']
@@ -264,7 +269,8 @@ class Sweep:
             await asyncio.sleep(5)
             return result
         except BaseException as e:
-            atomic_json(self.raw/'interruption.json',dict(phase=name,time=time.time(),error=f'{type(e).__name__}: {e}'))
+            atomic_json(self.raw/'interruption.json',dict(phase=name,time=time.time(),error=f'{type(e).__name__}: {e}',
+                                                         health_error=self.failure))
             raise
         finally:
             self.phase_active = False

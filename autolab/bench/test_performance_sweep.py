@@ -21,6 +21,24 @@ class MetricTests(unittest.TestCase):
         self.assertAlmostEqual(rows[0]['decode_tok_s'],4/3)
 
 
+class HealthTests(unittest.TestCase):
+    def test_exact_capture_budget_warning_is_benign_but_other_errors_stop(self):
+        import time
+        status=dict(time=time.time(),poller=dict(applied=perf.EXPECTED_RELEASE),
+                    fleet=dict(files={'cascadia':perf.EXPECTED_BINARY}))
+        rows={k:dict(state='active',phase='',restarts=n,files='same')
+              for k,n in enumerate(perf.EXPECTED_RESTARTS)}
+        with patch.object(perf.lab,'status',return_value=status), \
+             patch.object(perf.lab,'fleet_rows',return_value=rows):
+            rows[10]['phase']=perf.CAPTURE_BUDGET_PHASE
+            perf.check_fleet()
+            for phase in ['serving; last error: GPU failure',
+                          'state capture stopped, incomplete .part files retained: disk error']:
+                rows[10]['phase']=phase
+                with self.assertRaisesRegex(RuntimeError,'Fleet phase changed'):
+                    perf.check_fleet()
+
+
 class ClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_completed_phase_validates_counters_and_persists_summary(self):
         import json
