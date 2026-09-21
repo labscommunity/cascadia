@@ -25,3 +25,25 @@ log (signed status, last 30 lines) had the truth. Progress probes need a changin
 Open: whether the entry box still loses power as a middle rank (about 2-4 W less package power, but six expert
 layers instead of four to reload). Its power brick/outlet has not been swapped yet. No load test was run after the
 swap beyond the gates. Revert: publish the repository's `run.sh` and `030_clean_exact.env`.
+
+## Load test after the swap (22:52-23:06 CDT, on the user's request)
+
+| | before the swap | after |
+|---|---|---|
+| 15 streams x 128 tokens, steady tok/s | 24.8 | 23.6 / 24.6 (rank 10's head still paces the ring) |
+| rank 0's stage per frame | 44.2 ms (entry box) | **39.5 ms** (the box without the platform limit) |
+| one stream, SAME prompts: explain / story / code / arithmetic | 4.07 / 3.40 / 4.83 / 8.81 | 4.04 / 3.25 / 5.12 / 9.29 |
+| one stream, same prompts: rewrite / true-false | 7.08 / 9.38 | 5.64 / 4.34 (their phrases lived in the memorised table, which stayed on the old box and is re-learned) |
+
+The entry box survived all of it (restart counters unchanged, 11/11 serving): ~12 minutes of load including two
+15-stream phases, the kind that stopped it at 20:57.
+
+**The entry box is measurably unlike its seven identical siblings, doing the same work now:** 44.1 ms a frame against
+38.8-41.3 (fused experts 27.5 ms against 23.9-25.1, iGPU 90 % busy against 75-83 %), 20.0 W of package power
+against 17.3-19.4 W, 1.15 busy cores against ~0.96 (part of that is the door: relay, poller, tunnel, file server,
+beacon aggregation). So the swap bought it less power margin than predicted (20.0 W, not 17-19), and the difference
+is in the unit or its power supply, not in the role. It is now the slowest middle rank but still faster than rank 10
+with its head (47.2 ms), so it costs the ring nothing.
+
+`status.sh` (published 23:02, restarts nothing) now says which pipeline role a box plays; the fleet table keeps
+listing boxes by INSTALLED rank, which is what the updater, the names and the tunnel depend on.
