@@ -31,11 +31,12 @@ They live in files on the operator's Mac that this document names.
 
 ## 2. Known-good releases and the current experiment
 
-**Testing is paused by the owner (2026-09-21, 17:40 CDT). Do not run fleet
-tests until the owner explicitly says to resume.** Experiment 046 retained
-18 completed phases and stopped during the second 88-stream run; the API
-was verified idle. `experiments/046_final_performance/paused.json` is a
-resume guard, and the private continuation file records the recovery steps.
+**The owner resumed testing on 2026-09-21 at 18:25 CDT.** Experiment 046
+retained 18 completed phases from before the pause and resumes with the
+second 88-stream run. The serving release, binary and worker restart counts
+are unchanged, and the API was verified idle. The pause and resumption are
+recorded in `experiments/046_final_performance/pause-history.json`; the
+private continuation file records the active process and next steps.
 
 Latest serving release: **1790016660** (2026-09-21), binary
 `~/inkling-release/builds/cascadia-639f0c02-streams`, with the existing

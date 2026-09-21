@@ -1,6 +1,6 @@
 # Inkling fleet performance survey
 
-PAUSED by owner — completed phases only (capped at 176 streams)
+IN PROGRESS — completed phases only (capped at 176 streams)
 
 Eleven Panther Lake boxes; release `1790016660`; int4 experts and int8 attention. All survey requests use temperature 0 and a 128-token output budget. Counts include reasoning and answer tokens.
 
@@ -15,6 +15,8 @@ Two initial 128-stream attempts were excluded: one received an admission 503, an
 The 256-stream attempt disconnected during admission. Outstanding requests were cancelled, the unchanged fleet returned to idle, and the correctness gate passed again. The remaining survey was capped at **176 streams**. The planned 256-stream repeats and conditional 352-stream extension were therefore not completed. This is an observed failure, not proof of a hard engine concurrency limit; the measured optimum is bounded by the tested range.
 
 An **88-stream refinement** was added after the first sweep and the 176-stream repeat: it places eight rows in each of eleven pipeline groups. The observed slowdown above eight rows per group motivated this extra point. Both 88-stream runs occur after the original ascending pass; they are exploratory measurements, with the same token and health checks.
+
+The owner paused and later resumed collection. Completed phases were retained and the interrupted 88-stream repeat was restarted. The serving release and worker restart counts were unchanged. Other generation occurred during the pause, so subsequent results also reflect any phrase-history learning from that traffic. It is excluded from all measured phase counters. See [pause history](pause-history.json).
 
 Best observed sustained aggregate: **58.86 tok/s at 88 streams**.
 Smallest tested setting within 95% of that peak: **88 streams**.

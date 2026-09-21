@@ -117,6 +117,13 @@ def main():
                  'slowdown above eight rows per group motivated this extra point. Both 88-stream '
                  'runs occur after the original ascending pass; they are exploratory '
                  'measurements, with the same token and health checks.','']
+    if (root/'pause-history.json').exists():
+        report+=['The owner paused and later resumed collection. Completed phases were retained '
+                 'and the interrupted 88-stream repeat was restarted. The serving release and '
+                 'worker restart counts were unchanged. Other generation occurred during the '
+                 'pause, so subsequent results also reflect any phrase-history learning from '
+                 'that traffic. It is excluded from all measured phase counters. See '
+                 '[pause history](pause-history.json).','']
     if grouped:
         ns=list(grouped)
         steady=[avg(grouped[n],'steady_aggregate_tok_s') for n in ns]
