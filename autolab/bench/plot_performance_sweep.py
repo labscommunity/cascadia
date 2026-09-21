@@ -9,10 +9,10 @@ import statistics
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.ticker import ScalarFormatter
+from matplotlib.ticker import ScalarFormatter, LogLocator, FuncFormatter, NullLocator
 import numpy as np
 
-from performance_sweep import FAMILIES, quantile
+from performance_sweep import FAMILIES, quantile, prompt_for
 
 
 def save(fig, root, name):
@@ -32,11 +32,14 @@ def main():
     data=json.loads((root/'measurements.json').read_text())
     phases=[r for r in data if not r['phase'].startswith('pilot')]
     if not phases:raise SystemExit('No completed survey phases yet')
+    for phase in phases:
+        prompts=[prompt_for(r['family_index'],r['prompt_index']) for r in phase['request_metrics']]
+        phase['unique_prompts']=len(set(prompts))
     fields=['phase','family','streams','requests','tokens_req','tokens','chunks','wall_s',
             'steady_aggregate_tok_s','steady_per_stream_tok_s','aggregate_tok_s','overlap_s',
             'stream_tok_s_median','stream_tok_s_p10','stream_tok_s_p90','stream_tok_s_max',
             'ttft_median_s','ttft_p95_s','ttft_max_s','prompt_tokens_median',
-            'completion_tokens_median','early_finish']
+            'completion_tokens_median','early_finish','unique_prompts']
     with (root/'phase-results.csv').open('w',newline='') as f:
         writer=csv.DictWriter(f,fieldnames=fields);writer.writeheader()
         writer.writerows({k:r.get(k) for k in fields} for r in phases)
@@ -60,7 +63,10 @@ def main():
             'Sustained decode is measured only while all requests in each cohort are decoding. '
             'End-to-end throughput includes admission, prefill and drain. Prompts are repeated '
             'across sweep passes; learned phrase history remains enabled. Repeat ranges are '
-            'observed variability, not confidence intervals.','']
+            'observed variability, not confidence intervals. The fixed prompt pools are finite: '
+            'high-concurrency family cohorts can repeat identical prompts. `unique_prompts` in '
+            'the phase CSV records diversity; family maxima describe these pools, not a guarantee '
+            'for arbitrary novel prompts.','']
     if grouped:
         ns=list(grouped)
         steady=[avg(grouped[n],'steady_aggregate_tok_s') for n in ns]
@@ -81,10 +87,14 @@ def main():
         axes[0].plot(ns,end,'s--',color='#bc6b26',label='Including startup and drain')
         axes[0].axhline(max(steady)*.95,color='#777',ls=':',lw=1,label='95% of observed peak')
         axes[0].set(ylabel='Aggregate output tokens / second',title='Fleet throughput')
+        axes[0].set_ylim(bottom=0)
         axes[0].legend(fontsize=8)
         axes[1].plot(ns,per,'o-',color='#176b78',label='Sustained total / streams')
         axes[1].fill_between(ns,np.array(lo)/ns,np.array(hi)/ns,color='#176b78',alpha=.15)
         axes[1].set(ylabel='Output tokens / second / stream',title='Per-stream speed as concurrency increases',yscale='log')
+        axes[1].yaxis.set_major_locator(LogLocator(base=10,subs=(1,2,5)))
+        axes[1].yaxis.set_major_formatter(FuncFormatter(lambda x,_:f'{x:g}'))
+        axes[1].yaxis.set_minor_locator(NullLocator())
         for ax in axes:
             ax.set_xscale('log',base=2);ax.set_xlabel('Concurrent streams')
             ticks=[n for n in ns if n in [1,2,4,8,15,32,64,128,176,256,352]]
@@ -100,6 +110,9 @@ def main():
         ax.plot(ns,p50,'o-',label='Median');ax.plot(ns,p95,'s-',label='p95')
         ax.set(xscale='log',yscale='log',xlabel='Concurrent streams',ylabel='Seconds to first token',
                title='First-token latency | burst arrival, 15 ms between requests')
+        ax.yaxis.set_major_locator(LogLocator(base=10,subs=(1,2,5)))
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda x,_:f'{x:g}'))
+        ax.yaxis.set_minor_locator(NullLocator())
         ax.set_xticks(ns);ax.xaxis.set_major_formatter(ScalarFormatter());ax.tick_params(axis='x',rotation=45)
         ax.legend();save(fig,root,'concurrency-latency')
         report += [f'Best observed sustained aggregate: **{max(steady):.2f} tok/s at {best} streams**.',
