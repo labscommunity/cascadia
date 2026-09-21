@@ -173,6 +173,9 @@ pub trait StagedRunner: Send + 'static {
         false
     }
 
+    /// Optional research capture: the token sampled from this position.
+    fn capture_token(&mut self, _slot: usize, _pos: usize, _token: i64) {}
+
     /// Release a slot.
     fn close_stream(&mut self, _slot: usize) {}
 

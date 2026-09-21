@@ -111,3 +111,5 @@ mod tests {
         assert_eq!(&x[2..], &[0.0, 0.0]);
     }
 }
+
+mod capture;

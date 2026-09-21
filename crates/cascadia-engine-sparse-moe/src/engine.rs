@@ -5444,6 +5444,7 @@ pub fn head_shared_frames() -> u64 {
 struct PendingHead {
     batch_id: u32,
     slots: Vec<usize>,
+    positions: Vec<usize>,
     hidden: Vec<f32>,
 }
 
@@ -8772,6 +8773,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 crate::sampling::sample(&logits, &sampler.history, &sampler.cfg, &mut sampler.rng);
             sampler.history.push(token);
             self.stream_samplers.insert(s, sampler);
+            self.runner
+                .capture_token(s, have + rows as usize - 1, token);
             let send_started = Instant::now();
             let sent = self.send_tokens_reply(upstream, batch_id, &[(slot, token)]);
             if let Some(p) = self.stage_profile.as_mut() {
@@ -8859,6 +8862,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             self.pending_heads.push(PendingHead {
                 batch_id,
                 slots,
+                positions: rows.iter().map(|&(_, pos)| pos as usize).collect(),
                 hidden,
             });
             // Wait for the next frame's layers only when it is already here
@@ -8931,7 +8935,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let mut replies = Vec::with_capacity(pending.len());
         for p in &pending {
             let mut toks = Vec::with_capacity(p.slots.len());
-            for &s in &p.slots {
+            for (i, &s) in p.slots.iter().enumerate() {
                 let sampler = self.stream_samplers.get_mut(&s).ok_or_else(|| {
                     format!("stream decode: slot {s} has no sampler (no StreamOpen seen)")
                 })?;
@@ -8939,6 +8943,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 let token =
                     crate::sampling::sample(l, &sampler.history, &sampler.cfg, &mut sampler.rng);
                 sampler.history.push(token);
+                self.runner.capture_token(s, p.positions[i], token);
                 toks.push((s as u32, token));
                 row += 1;
             }
@@ -9018,6 +9023,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 );
                 sampler.history.push(token);
                 self.stream_samplers.insert(s, sampler);
+                self.runner.capture_token(s, rows - 1, token);
                 toks.push((*slot, token));
             }
             let send_started = Instant::now();
