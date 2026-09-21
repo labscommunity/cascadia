@@ -1,12 +1,12 @@
 ---
 id: int4-attention-projections-0-78-0-4-gb-read-per-frame
 title: int4 attention projections (0.78 -> 0.4 GB read per frame)
-status: running
-outcome: 
+status: done
+outcome: measurement
 priority: 25
 target: 15 streams, single stream
 exact: no
-needs: bounded one-rank kernel measurement prepared; any later numerical serving rollout still needs owner decision
+needs: 041 complete: kernels 39-43% faster, output RMS difference 9.6-9.7%; numerical serving canary requires owner decision
 proposed_by: autolab session 2026-09-20
 owner: autolab-continuation-20260921
 experiment: 041_attention_int4

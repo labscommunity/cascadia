@@ -1,12 +1,12 @@
 ---
 id: expert-usage-skew-per-layer-are-the-top-64-experts-60-of-sel
 title: expert-usage skew per layer (are the top 64 experts > 60 % of selections?) to price hot-expert replicas
-status: running
+status: blocked
 outcome: 
 priority: 30
 target: single stream
 exact: n/a
-needs: binary (env-gated counters on every rank, default off) + overrides; measured on the fleet under real traffic, no offline machine
+needs: entry/API door unreachable during first 15-stream phase; stopped traffic; both gates passed but no sustained sample yet
 proposed_by: teammate (spec.md appendix)
 owner: autolab-continuation-20260921
 experiment: 040_expert_usage

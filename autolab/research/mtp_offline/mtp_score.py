@@ -110,7 +110,7 @@ class Depth:
         rep = N_HEADS // self.kv_heads
         kk = kk.repeat_interleave(rep, dim=0); vv = vv.repeat_interleave(rep, dim=0)
         scores = q @ kk.transpose(1, 2) / HEAD_DIM                     # q/k are RMS-normed per head: 1/d scaling
-        pos = torch.arange(T)
+        pos = torch.arange(T, device=x.device)
         dist = pos[:, None] - pos[None, :]                             # [q, k]
         if "no_relbias" not in flags:
             rel = (r @ self.rel_proj).transpose(0, 1)                  # [heads, T, extent]

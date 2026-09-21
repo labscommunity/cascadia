@@ -32,3 +32,23 @@ with rank-0 slack. Kill a bounded candidate below that bar, on train/test
 leakage, non-finite state/loss, or excessive deployment cost. Never claim
 training-set accuracy or an offline renewal model as measured fleet speed.
 Keep candidate code and assets off the serving path until qualified.
+
+## Fixed recipes before collecting training data
+
+Candidate A: residual two-layer SiLU feature predictor, width 512, inputs
+[current post-final-norm state, next verified-token embedding], output next
+post-final-norm state. Frozen int8-grid 65k head. Loss MSE + 0.1 cross-entropy,
+AdamW 3e-4, batch 128, twenty epochs, seed 42.
+
+Candidate B: rank-32 adapter on the existing MTP input projection, all module
+weights frozen on the int4/int8 grids, twelve epochs, AdamW 2e-4, one full
+sequence per step, true-token temporal context, token cross-entropy. Both
+use gradient clipping at 1.0 and bf16-autocast CUDA arithmetic. Candidate B's
+linear matrices are stored as bf16 during this study; report its zero-adapter
+baseline on the same arithmetic to expose that difference from 039 f32.
+
+Within each of twelve families, seed-42 shuffle and reserve about 20% of
+training sequences for validation. Select greatest validation agreement,
+including the initial untrained/zero-adapter checkpoint; score held-out
+sequences only after selection. No recipe search on the held-out results.
+These bounded trials cannot rule out larger datasets or different heads.

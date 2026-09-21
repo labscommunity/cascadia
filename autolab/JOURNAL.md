@@ -324,3 +324,25 @@ weight grids. The original 65k prefix alone is 0.6454: the cutoff explains
 most export loss. The predeclared 0.70 bar fails. Redirect runtime qualification
 to the conditional 042 fleet-state training study; 117 exact-rendered-disjoint
 prompts are selected, and all original 36 stay held out. No MTP assets enabled.
+
+During the first 040 fifteen-stream phase after both gates passed, the API
+became unreachable (HTTP 000), while the operator tunnel stayed alive. The
+signed report stopped advancing at epoch 1789974050; its clock was ahead of
+the Mac, so its apparent negative age did not mean freshness. Stopped the
+benchmark process and all fleet traffic, as OPERATING requires. No retry loop
+or further publish. The 117-prompt training collection has NOT started.
+Await an on-site entry-box check; this resembles the earlier hard stops,
+but power loss is not confirmed from the stale report alone. 041's complete
+kernel measurements were saved before the outage.
+
+041 completed successfully: int4 QKVR+O took 0.765–0.808 ms vs int8
+1.298–1.348 ms on role 5, 39–43% faster. The 9.6–9.7% projection RMS difference
+requires a numerical quality decision before serving. 043 candidate/rollback
+both passed dry-run guards, with Docker checks for role selection, success,
+idempotence, partial-install fallback and start cutoff; not published.
+
+042 training preparation passed four tests covering exact label alignment,
+disjoint splits, a learnable synthetic feature transition and zero-adapter
+parity/backpropagation. A synthetic CUDA forward/backward through the real
+frozen quantized MTP block also passed at 1.8 GiB peak allocated memory.
+No held-out sequence was used for gradients; no training has started.
