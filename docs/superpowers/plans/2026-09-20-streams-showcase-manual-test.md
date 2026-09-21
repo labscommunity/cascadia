@@ -202,7 +202,7 @@ content hashes and are reproducible for identical sources and lockfile, so:
 
 - [ ] On the build machine: `tar -tzf ~/inkling-build/dash-dist.tar.gz | grep assets/` and note the `index-<hash>.js` / `index-<hash>.css` names.
 - [ ] On your laptop, on a clean checkout of `feat/inkling-multistream`: `cd crates/cascadia-dashboard/web && npm ci && npm run build && ls dist/assets`. Same names → the deployed SPA has no unpushed changes and it is safe to replace the tarball. Different names → someone built the deployed tarball from a web tree that is not on origin. The operator's notes name a `tahoma-dashboard` worktree on a `feat/dashboard` branch; `tahoma` is the Cascadia workspace on the team's Mac mini, not the miner, so look there. Diff its `web/` against this branch and merge before shipping.
-- [ ] Confirm the tarball layout you are about to ship matches the old one's top-level entry (`dist/`): `tar -tzf ~/dash-dist.tar.gz | head -3`.
+- [ ] Confirm the tarball layout you are about to ship matches the old one's top-level entry (`dist/`): `tar -tzf ~/dash-dist.tar.gz | head -3`, and that it carries no macOS AppleDouble entries: `tar -tzf ~/dash-dist.tar.gz | grep -c '/\._'` prints 0 (build it with `COPYFILE_DISABLE=1 tar --no-xattrs …`; the first 2026-09-21 tarball had a `dist/._index.html` and was regenerated).
 - [ ] Confirm nobody holds the publisher lock (`~/inkling-release/publisher.lock` on the build machine) or is mid-experiment on the fleet.
 
 ### C1. Build

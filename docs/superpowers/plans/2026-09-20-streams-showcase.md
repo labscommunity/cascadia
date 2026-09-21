@@ -2124,8 +2124,12 @@ tarball's top-level entry must be `dist/` (confirmed 2026-09-20 against the
 tarball on the build machine, which lists `dist/index.html`, `dist/assets/…`):
 ```bash
 cd crates/cascadia-dashboard/web
-tar -czf "$HOME/dash-dist.tar.gz" dist
-tar -tzf "$HOME/dash-dist.tar.gz" | head -3    # dist/  dist/index.html  dist/assets/…
+# COPYFILE_DISABLE / --no-xattrs: macOS tar otherwise adds AppleDouble
+# `._index.html` entries and xattr headers, which rust-embed would serve as
+# assets on the fleet.
+COPYFILE_DISABLE=1 tar --no-xattrs -czf "$HOME/dash-dist.tar.gz" dist
+tar -tzf "$HOME/dash-dist.tar.gz" | grep -c '/\._'   # must print 0
+tar -tzf "$HOME/dash-dist.tar.gz" | head -3          # dist/  dist/index.html  dist/assets/…
 ```
 Do not commit the tarball or `dist/`; `dist/` is gitignored and the tarball
 lives outside the repo. Tell the user where it is.
