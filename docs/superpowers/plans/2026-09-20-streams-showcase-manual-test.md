@@ -46,11 +46,14 @@ one per token with no delay, so tiles cycle fast; that is expected.
 ### A2. Initial state
 
 - [ ] 16 tiles in a 4 × 4 grid filling the viewport under the toolbar.
-- [ ] Each tile: `#01` … `#16`, grey dot, `idle`, body `press Play`, footer `0 tok · TTFT — · 0.0 s`.
+- [ ] With default settings each tile is body only (no header, no footer) at a 10 px mono font, showing `press Play`.
+- [ ] Open the drawer and turn on **Show tile header** and **Show tile footer** (keep them on for A3–A6, they are where the status words and the hover controls live). Each tile now reads `#01` … `#16`, grey dot, `idle`, footer `0 tok · TTFT — · 0.0 s`.
 - [ ] Toolbar: model name in the picker, Play button enabled (mint), cells `Active 0 · Queued 0 · Agg tok/s — · Tokens 0 · Replies 0 · Server 0 / 4`.
 - [ ] Stop the mock server, reload `/streams`: picker shows the `/v1/models` error, Play is disabled with a `waiting for a model` tooltip, tiles say `waiting for a model`, `Server —`. Restart the server, reload: back to normal.
 
 ### A3. Play, run, Stop
+
+Header and footer on (see A2). Stream tokens as they arrive: on (the default).
 
 - [ ] Play → tiles start one at a time, roughly 300 ms apart (watch the first second).
 - [ ] With cap 4: some tiles show amber `queued` with `waiting for a slot… (attempt N)`, N climbing; `Server` reads up to `4 / 4`; `Queued` in the toolbar matches the count of amber tiles.
@@ -87,7 +90,7 @@ one per token with no delay, so tiles cycle fast; that is expected.
 
 ### A7. Settings drawer
 
-- [ ] Gear → 320 px panel on the right with Streams 16, Max tokens 160, Cooldown min 1, Cooldown max 2, Temperature 0, the server-cap line in amber (`Server admits 4 … Streams above the cap will queue.`), and Reset to defaults.
+- [ ] Gear → 320 px panel on the right with Streams 16, Max tokens 160, Cooldown min 1, Cooldown max 2, Temperature 0, Terminal font size 10, Show tile header off, Show tile footer off, Stream tokens as they arrive on (with its hint line), the server-cap line in amber (`Server admits 4 … Streams above the cap will queue.`), and Reset to defaults. The panel scrolls if the window is short.
 - [ ] Esc closes it; gear toggles it; × closes it.
 - [ ] Streams → 20 while running: four tiles appended and started; grid re-flows to 5 × 4; the others never blink.
 - [ ] Streams → 6 while running: tiles #07+ disappear; `Server` in-flight drops.
@@ -95,9 +98,12 @@ one per token with no delay, so tiles cycle fast; that is expected.
 - [ ] Clamping: 0 → 1; 99 → 64 (grid becomes scrollable once tiles would be under 160 px); Cooldown min 5 → max snaps to 5; Temperature 3 → 1.5; Max tokens 5 → 16.
 - [ ] Max tokens → 16 while running: each tile's *next* echo is cut at 16 words; the reply in flight finishes at its old length.
 - [ ] Cooldown min/max → 5/5: every tile now pauses ~5 s between prompts.
-- [ ] Persistence: set Streams 9, reload → 9 tiles; DevTools → Local Storage → `cascadia.streams.settings.v1` holds the JSON. Reset to defaults → 16 tiles and default JSON.
+- [ ] Terminal font size → 16: body text grows on every tile at once, including scrollback; → 9: smallest; type 25 → snaps to 20; type 4 → snaps to 9.
+- [ ] Show tile header off → headers vanish on every tile immediately and hovering shows no Pause/Skip; on → they are back. Same for Show tile footer.
+- [ ] Stream tokens as they arrive **off**, while running: each tile's *next* prompt sits in `prefill` with the caret and then the whole reply appears at once; its footer shows `TTFT —` and a tok/s equal to reply tokens over the wait; `Agg tok/s`, `Tokens` and `Replies` keep climbing; with cap 4 you still see `queued` tiles. Back **on**: the next prompt streams word by word again and TTFT returns.
+- [ ] Persistence: set Streams 9, font 14, header on, reload the page: 9 tiles, 14 px, headers shown. DevTools → Application → Local Storage: key `cascadia.streams.settings.v1` holds the JSON with all nine fields. Click Reset to defaults: 16 tiles, 10 px, header and footer off, stored JSON back to defaults.
 - [ ] Bad storage: in the console run
-  `localStorage.setItem("cascadia.streams.settings.v1", '{"streamCount":500,"cooldownMaxS":-3}')` then reload → 64 tiles, Cooldown max shows 1, no console error. Then `localStorage.setItem("cascadia.streams.settings.v1", "not json")`, reload → defaults, no console error. Reset to defaults afterwards.
+  `localStorage.setItem("cascadia.streams.settings.v1", '{"streamCount":500,"cooldownMaxS":-3,"fontSizePx":99,"showTileHeader":"yes"}')` then reload → 64 tiles, Cooldown max shows 1, font 20, header off (a non-boolean falls back to the default), no console error. Then `localStorage.setItem("cascadia.streams.settings.v1", "not json")`, reload → defaults, no console error. Reset to defaults afterwards.
 
 ### A8. Server failure and recovery
 
@@ -141,7 +147,8 @@ VITE_API_PROXY=http://localhost:18000 npm run dev
 ### B1. Pacing and legibility
 
 - [ ] Default 16 streams, Play: tiles fill in over ~5 s; TTFT per tile is seconds, not milliseconds; replies stream visibly word by word.
-- [ ] At 1080p, 16 and 20 tiles are readable from two metres: prompt line, reply text and the footer numbers.
+- [ ] At 1080p, 16 and 20 tiles are readable from two metres. The default 10 px body font is tuned for density on a close screen; for a distant audience raise Terminal font size in the drawer (14–16 px) and decide whether the header/footer bars earn their space.
+- [ ] Stream tokens as they arrive **off** on the fleet: tiles fill in as whole replies; compare the feel against streaming and note which the demo should default to.
 - [ ] 32 tiles: still fills the screen; text small but legible up close. 64: the grid scrolls; document that this is the expected behaviour.
 - [ ] Fullscreen on the presentation display: no nav, no browser chrome, near-black edge to edge.
 

@@ -32,6 +32,7 @@ from the nav gaining a third entry and a dark variant.
 | Runner architecture | Plain TypeScript class outside React, consumed via `useSyncExternalStore`, snapshots coalesced to one per animation frame. |
 | Branch | `7i7o/streams-showcase`, branched from `feat/inkling-multistream`. |
 | Docs | This spec and the plan live in `docs/superpowers/` and are committed on the branch. |
+| Post-plan additions (2026-09-21) | Per-tile header and footer toggles (both **off** by default), a terminal font-size setting (**10 px** default), and a non-streaming mode that fetches each whole reply in one request. See §6.3, §6.4, §7.4, §8. |
 
 ## 3. Non-goals
 
@@ -157,10 +158,12 @@ Left to right:
 ### 6.3 Tile (`StreamTile`)
 
 Terminal look: `bg-night-2 border border-night-rule rounded-md`, mono font,
-`text-[12.5px] leading-snug`, `overflow-hidden flex flex-col`.
+`leading-snug`, `overflow-hidden flex flex-col`. Body text size comes from
+the `fontSizePx` setting (default 10 px, range 9–20).
 
-- **Header** (`bg-night-3`, 28 px): `#07` index, status dot + status word,
-  live `tok/s` on the right. Status colours: `idle` night-low, `queued`
+- **Header** (`bg-night-3`, 28 px; rendered only while `showTileHeader` is
+  on, **off by default** so the wall is pure text): `#07` index, status dot
+  + status word, live `tok/s` on the right. Status colours: `idle` night-low, `queued`
   state-warm, `prefill` celadon (pulsing), `streaming` mint-bright,
   `cooldown` night-dim, `paused` night-low, `error` state-error.
 - **Body** (`flex-1 min-h-0 overflow-y-auto px-3 py-2`): scrollback of the
@@ -172,10 +175,13 @@ Terminal look: `bg-night-2 border border-night-rule rounded-md`, mono font,
   `ChatSurface`).
   - `queued`: reply area shows `waiting for a slot… (attempt N)`.
   - `error`: reply area shows the error text in `state-error`.
-- **Footer** (24 px, `border-t border-night-rule`, `label-mono` scale):
-  `tokens · TTFT ms · tok/s · elapsed s`.
+- **Footer** (24 px, `border-t border-night-rule`, `label-mono` scale;
+  rendered only while `showTileFooter` is on, **off by default**):
+  `tokens · TTFT ms · elapsed s`.
 - **Hover controls** (top-right of the header, `opacity-0 group-hover:opacity-100`):
-  `Pause` / `Resume` and `Skip`. Disabled while the runner is stopped.
+  `Pause` / `Resume` and `Skip`. Skip is disabled while the runner is
+  stopped. They live in the header, so they are reachable only while the
+  header is shown.
 - Tiles are `React.memo`'d and receive an immutable per-stream state object,
   so a token on stream 3 re-renders only tile 3.
 
@@ -192,7 +198,14 @@ by `clampSettings`):
 | Cooldown min (s) | 0 – 30 | 1 | next cooldown |
 | Cooldown max (s) | min – 30 | 2 | next cooldown |
 | Temperature | 0 – 1.5 (step 0.1) | 0 | next prompt per stream |
+| Terminal font size (px) | 9 – 20 (step 0.5) | 10 | live |
+| Show tile header | on / off | off | live |
+| Show tile footer | on / off | off | live |
+| Stream tokens as they arrive | on / off | on | next prompt per stream |
 
+The last four arrived after the plan (2026-09-21). "Stream tokens" off makes
+each stream fetch its whole reply in one request (§7.4). The drawer body
+scrolls when the controls exceed the viewport.
 Below the fields: a read-only line `Server admits N concurrent requests
 (CASCADIA_API_MAX_CONCURRENT)` from `/api/stats`, turning `state-warm` when
 `Streams > N` with the note `streams above the cap will queue`.
@@ -213,8 +226,11 @@ A `Reset to defaults` link restores the table above.
 ### 7.1 Files
 
 - `src/lib/streamRunner.ts` — the class, pure TS, no React import.
-- `src/lib/streamSettings.ts` — `StreamSettings`, `DEFAULT_SETTINGS`,
-  `clampSettings`, `loadSettings`, `saveSettings` (key
+- `src/lib/streamSettings.ts` — `StreamSettings` (count, max tokens,
+  cooldown range, temperature, `showTileHeader`, `showTileFooter`,
+  `fontSizePx`, `streamResponses`), `DEFAULT_SETTINGS`, `LIMITS`,
+  `clampSettings` (numbers clamped, booleans fall back to the default when
+  not a boolean), `loadSettings`, `saveSettings` (key
   `cascadia.streams.settings.v1`; a parse failure returns defaults).
 - `src/lib/prompts.ts` — `PROMPTS: readonly string[]`.
 - `src/lib/gridLayout.ts` — `chooseColumns`.
@@ -310,6 +326,13 @@ class StreamRunner {
   4. On the first chunk: status `streaming`, record TTFT. Per chunk: append
      `delta.content`, `tokens += n_tokens ?? 1`, push `(now, n)` to the
      shared token ring, recompute `elapsedMs` and `tokPerSec`.
+     **When `streamResponses` is off** the request goes through
+     `chatComplete` (`stream:false`) instead: the tile stays in `prefill`
+     (prompt plus caret) until the whole reply lands, TTFT stays `null`,
+     `tokens` comes from `usage.completion_tokens` (word count as fallback),
+     `tokPerSec` is the whole reply over the whole wait, and the reply is
+     pushed to the token ring as one event. Errors map the same way
+     (`HttpError` 503 → capacity).
   5. On `[DONE]`: `completedReplies++`. If Pause was requested, park
      (status `paused`). Otherwise status `cooldown`, wait a uniform random
      duration in `[cooldownMinS, cooldownMaxS]` seconds, go to 1. The
@@ -378,7 +401,12 @@ export class HttpError extends Error {
 
 and `chatStream` throws `new HttpError(r.status, message)` instead of a
 plain `Error`, where `message` is the same `HTTP <status>: <text>` string
-it builds today. `ChatSurface` only reads
+it builds today.
+
+Post-plan (2026-09-21) the file also gained
+`chatComplete(args, signal): Promise<{ text: string; tokens: number }>`, a
+`stream:false` call to the same endpoint used by the non-streaming mode
+(§7.4). It throws `HttpError` on non-2xx exactly like `chatStream`. `ChatSurface` only reads
 `.message`, so its behaviour is unchanged. Nothing else in the file moves.
 
 ## 9. Prompt pool

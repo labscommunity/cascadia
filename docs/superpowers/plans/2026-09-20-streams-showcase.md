@@ -2153,3 +2153,30 @@ git status --porcelain     # empty
 git log --oneline feat/inkling-multistream..HEAD
 ```
 Expected: the spec/plan docs commit(s) plus seven feature commits (Tasks 1–7), nothing unstaged. Do not push. Hand over to the manual test checklist at `docs/superpowers/plans/2026-09-20-streams-showcase-manual-test.md`: Part A runs locally, Part B runs against the live fleet through the operator tunnel with no release, Part C ships the `~/dash-dist.tar.gz` from Step 2 above.
+
+---
+
+## Post-plan additions (implemented 2026-09-21, after Task 7)
+
+Two commits landed on top of the plan at the user's request; the spec was
+updated to match (§2, §6.3, §6.4, §7.1, §7.4, §8).
+
+- `45f20a75 feat(dashboard): streams tile display toggles, font size, and full-response mode`
+  - `src/lib/streamSettings.ts`: `showTileHeader`, `showTileFooter`,
+    `fontSizePx` (9–20), `streamResponses`; `clampBool` for the booleans.
+  - `src/lib/sse.ts`: `chatComplete()` (`stream:false`), same `HttpError`
+    contract as `chatStream`.
+  - `src/lib/streamRunner.ts`: `request()` branches on
+    `settings.streamResponses`; the non-streaming branch keeps the tile in
+    `prefill`, leaves TTFT null and rates the whole reply over the wait.
+  - `src/components/streams/StreamTile.tsx`: `showHeader`, `showFooter`,
+    `fontSizePx` props; header and footer render conditionally.
+  - `src/components/streams/StreamSettingsDrawer.tsx`: font-size field and
+    three checkboxes (with a hint on the streaming one); drawer scrolls.
+  - `src/pages/Streams.tsx`: passes the three tile props from settings.
+- `2b21634a feat(dashboard): default streams tiles to hidden header/footer and 10px font`
+  - `DEFAULT_SETTINGS`: `showTileHeader: false`, `showTileFooter: false`,
+    `fontSizePx: 10`.
+
+The shipped bundle for this state is `index-Ba7ZRF0b.js` (see the manual
+test checklist, Part C).
