@@ -362,3 +362,8 @@ and continued after failed requests. They now save the failed/incomplete phase,
 return nonzero and send no later phases. Warmup failures stop before gates;
 a serial gate transport error stops its remaining prompts. Three regression
 tests passed. Active requests still need timeout or operator termination.
+
+Owner update, 2026-09-21: no entry-box hardware change yet. The brick/outlet
+have not been swapped and the unit has not been replaced. This does not
+confirm the cause of the 040 outage or establish recovery. Fleet traffic
+remains stopped pending the on-site power/access check.
