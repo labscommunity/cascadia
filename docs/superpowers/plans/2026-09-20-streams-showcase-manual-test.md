@@ -205,20 +205,53 @@ content hashes and are reproducible for identical sources and lockfile, so:
 - [ ] Confirm the tarball layout you are about to ship matches the old one's top-level entry (`dist/`): `tar -tzf ~/dash-dist.tar.gz | head -3`, and that it carries no macOS AppleDouble entries: `tar -tzf ~/dash-dist.tar.gz | grep -c '/\._'` prints 0 (build it with `COPYFILE_DISABLE=1 tar --no-xattrs …`; the first 2026-09-21 tarball had a `dist/._index.html` and was regenerated).
 - [ ] Confirm nobody holds the publisher lock (`~/inkling-release/publisher.lock` on the build machine) or is mid-experiment on the fleet.
 
-### C1. Build
+### C1. Build (how the fleet's build actually works)
 
-- [ ] Back up the old tarball: `cp ~/inkling-build/dash-dist.tar.gz ~/inkling-build/dash-dist.tar.gz.before-streams`.
-- [ ] Copy the new one from Task 7 into place as `~/inkling-build/dash-dist.tar.gz`.
-- [ ] Run the build machine's usual script (it does `tar -xzf … -C repo/crates/cascadia-dashboard/web` then `cargo build --release -p cascadia --features openvino,dashboard-embed`). No branch change is needed: this feature has no Rust changes, so the checkout can stay where it is, including on `autolab/inkling-fleet-perf` with its `/api/fleet/telemetry` route.
-- [ ] Prove the new SPA is inside the binary before publishing: `strings target/release/cascadia | grep -c 'waiting for a slot'` prints at least 1 (a string only the streams tile contains), and `strings target/release/cascadia | grep -c 'index-Ba7ZRF0b'` prints at least 1 for the 2026-09-21 ship (the embedded index.html names the bundle). A 0 on either means the stale-tarball trap bit you; check which tarball was untarred.
-- [ ] Before building, make sure the tarball itself is not stale on *this* side: its asset names must match `ls crates/cascadia-dashboard/web/dist/assets` from a build of the commit you mean to ship. (On 2026-09-21 the first tarball was cut at 08:46, before the 09:11 defaults commit, and had to be regenerated.)
+The build host is the miner (ssh alias `miner`). The operator's script is
+`autolab/bench/miner_build.sh` in the autolab worktree on the Mac mini
+(`~/Workspaces/tahoma-inkling-autolab`). It ships a **`git archive HEAD`** of
+that checkout as `~/inkling-build/ms-src.tar.gz`, then on the miner: wipes and
+re-creates `~/inkling-build/repo` from it, untars `~/inkling-build/dash-dist.tar.gz`
+over `repo/crates/cascadia-dashboard/web`, and runs
+`cargo build --release -p cascadia --features openvino,dashboard-embed` with
+`CARGO_TARGET_DIR=~/inkling-build/target` and the OpenVINO 2026.3.1 env. The
+miner's root disk is full (~3 GB free); never add build trees there.
+
+A frontend-only release must therefore archive **the commit whose binary is
+currently published**, not the autolab HEAD, or unpublished engine changes
+ride along. Find it with `release.py status` (release version) and match the
+size of `~/inkling-release/builds/cascadia-<short>` against
+`~/inkling-release/published/release.json`.
+
+- [ ] Back up the old tarball: `cp -p ~/inkling-build/dash-dist.tar.gz ~/inkling-build/dash-dist.tar.gz.before-streams` (done 2026-09-21).
+- [ ] Stage the new one as `~/inkling-build/dash-dist.tar.gz` and verify `sha256sum` matches your local copy (done 2026-09-21: `602c95b9d6eda705…`, no AppleDouble entries).
+- [ ] On the Mac mini, in the autolab worktree, archive the published commit and ship it under a name of its own so the autolab pipeline's `ms-src.tar.gz` is left alone:
+  ```bash
+  git archive --format=tar.gz -o /tmp/ms-src-streams.tar.gz <published-commit>
+  scp /tmp/ms-src-streams.tar.gz miner:inkling-build/ms-src-streams.tar.gz
+  ```
+- [ ] Run a copy of `autolab/bench/miner_build.sh` with `ms-src.tar.gz` replaced by `ms-src-streams.tar.gz` (nothing else changed): `ssh miner 'bash -s' < miner_build_streams.sh`. Incremental builds take a few minutes; a source switch can take longer.
+- [ ] Prove the new SPA is inside the binary before staging it: on the miner, `strings ~/inkling-build/target/release/cascadia | grep -c 'waiting for a slot'` prints at least 1 and `strings … | grep -o 'index-[A-Za-z0-9_-]*\.js' | sort -u` prints the new bundle name (`index-Ba7ZRF0b.js` for the 2026-09-21 ship) and **not** `index-DUJ_Gm7o.js`. A miss means the stale-tarball trap bit you.
+- [ ] Stage the binary on the operator machine: `scp miner:inkling-build/target/release/cascadia ~/inkling-release/builds/cascadia-<published-commit>-streams` and record its `sha256`.
 
 ### C2. Publish and verify
 
-- [ ] Publish through the fleet's signed channel the usual way (the operator wrapper, or `publish.py` on rank 0 with the new `cascadia` in the served folder). Every box's updater installs it and restarts its worker; wait 5–8 minutes for the pipeline to re-form.
-- [ ] Through the tunnel: `curl -s http://localhost:18000/streams | grep -o 'assets/index-[A-Za-z0-9_-]*\.js'` shows the *new* build's name, not the old `index-DUJ_Gm7o.js`. For the 2026-09-21 ship (built from `2b21634a`) that is `index-Ba7ZRF0b.js`; for any later ship, read it from `tar -tzf ~/dash-dist.tar.gz`.
+`~/inkling-release/bin/release.py` on the Mac mini is sign-and-stage only. It
+signs the release with the operator's Ed25519 key; rank 0 polls
+`release.py serve` through the operator tunnel, verifies, drops the files in
+`~/inkling-files` and runs the fleet's `publish.py`, and every box's updater
+follows. So a publish made while rank 0 is down is applied when rank 0 comes
+back and the poller is up. The publisher lock is the **directory**
+`~/inkling-release/publisher.lock/` with an `owner` file; while it exists and
+names a live session, do not publish. On 2026-09-21 it was held by
+`autolab-continuation-20260921`.
+
+- [ ] Lock clear (`ls ~/inkling-release/publisher.lock` fails) or its owner has agreed.
+- [ ] Publish: `python3 ~/inkling-release/bin/release.py publish cascadia=~/inkling-release/builds/cascadia-<published-commit>-streams --note "streams showcase SPA on <published-commit>"`.
+- [ ] `python3 ~/inkling-release/bin/release.py wait --timeout 900` until all 11 ranks run it; `release.py status` shows 11 of 11 on the new version. A frontend-only change still restarts every worker; expect 5–8 minutes.
+- [ ] Through the tunnel: `curl -s http://localhost:18000/streams | grep -o 'assets/index-[A-Za-z0-9_-]*\.js'` shows the new bundle name (`index-Ba7ZRF0b.js` for the 2026-09-21 ship).
 - [ ] `http://localhost:18000/streams` renders the dark wall; run B1 quickly (Play, 16 streams, two minutes).
 - [ ] `http://localhost:18000/` and `/chat` still look and work as before.
-- [ ] `curl -s http://localhost:18000/api/fleet/telemetry | head -c 200` still answers (the Rust side of the build was not regressed by the branch the machine built from).
+- [ ] `curl -s http://localhost:18000/api/fleet/telemetry | head -c 200` still answers (the published commit's Rust side is intact).
 - [ ] `curl -s http://localhost:18000/api/stats` shows the pipeline serving again (`requests_in_flight` moves when you Play).
-- [ ] Rollback if needed: restore `dash-dist.tar.gz.before-streams`, rebuild, republish.
+- [ ] Rollback if needed: `python3 ~/inkling-release/bin/release.py republish <previous version>` (the previous release stays on disk), or restore `dash-dist.tar.gz.before-streams`, rebuild and publish again.

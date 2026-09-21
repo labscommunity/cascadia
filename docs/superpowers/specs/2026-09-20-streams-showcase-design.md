@@ -503,18 +503,27 @@ Facts established from the repo and the fleet operator's notes (2026-09-20):
   builds embed `web/dist` at compile time, debug builds read it from disk per
   request (`spa.rs`). Iterating against the live fleet without a release is
   still possible, through the Vite dev server and the operator tunnel (§11).
-- The fleet's build machine stages the SPA from a tarball: its build script
-  runs `tar -xzf ~/inkling-build/dash-dist.tar.gz -C repo/crates/cascadia-dashboard/web`
-  and then `cargo build --release -p cascadia --features openvino,dashboard-embed`.
-  **A stale tarball silently wins over a fresh repo tree.** Shipping this
-  feature therefore means regenerating that tarball from this branch's
-  `web/dist` (top-level entry `dist/`), not just checking the branch out.
-- The binary reaches the boxes through the fleet's signed channel
-  (`deploy/inkling-fleet/fleet/publish.py` writes `manifest.json` next to the
-  files rank 0 serves on :8088; every box's `updater.py` installs what changed
-  and restarts `cascadia-inkling.service`). A frontend-only change therefore
-  restarts all 11 workers and takes 5–8 minutes to settle; whoever holds the
-  publisher lock on the build machine must not be mid-experiment.
+- The build host is the miner; the operator's script is
+  `autolab/bench/miner_build.sh` in the autolab worktree on the Mac mini. It
+  ships a `git archive HEAD` of that checkout as `~/inkling-build/ms-src.tar.gz`,
+  and on the miner re-creates `~/inkling-build/repo` from it, untars
+  `~/inkling-build/dash-dist.tar.gz` over `repo/crates/cascadia-dashboard/web`,
+  and runs `cargo build --release -p cascadia --features openvino,dashboard-embed`.
+  **A stale tarball silently wins over a fresh source tree**, and the source
+  is whatever commit the operator's checkout is on. Shipping this feature
+  therefore means regenerating `dash-dist.tar.gz` from this branch's
+  `web/dist` (top-level entry `dist/`, no macOS AppleDouble entries) and
+  archiving the *currently published* commit, so no unpublished engine work
+  rides along.
+- The binary reaches the boxes through the fleet's signed channel:
+  `~/inkling-release/bin/release.py publish cascadia=<binary>` on the Mac mini
+  signs and stages it; rank 0 polls the operator machine through the tunnel,
+  verifies, and runs the fleet's `publish.py` (`deploy/inkling-fleet/fleet/`),
+  after which every box's `updater.py` installs it and restarts
+  `cascadia-inkling.service`. A frontend-only change therefore restarts all
+  11 workers and takes 5–8 minutes to settle. The publisher lock is the
+  directory `~/inkling-release/publisher.lock/` (with an `owner` file); never
+  publish while another session holds it.
 - This feature changes no Rust, so the build machine's checkout can stay on
   whatever branch it is on (including `autolab/inkling-fleet-perf`, which adds
   the `/api/fleet/telemetry` route the fleet uses). Only the tarball changes.
