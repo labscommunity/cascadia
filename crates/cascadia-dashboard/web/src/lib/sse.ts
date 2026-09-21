@@ -34,6 +34,22 @@ export type ChatErrorChunk = {
 
 export type ChatStreamChunk = ChatCompletionChunk | ChatErrorChunk;
 
+/**
+ * Non-2xx response from `/v1/chat/completions`. Carries the status so a
+ * caller can treat 503 (server at its `max_concurrent` cap; retry with
+ * backoff) differently from a 4xx it must not retry. The message is the
+ * same `HTTP <status>: <body>` text callers already display.
+ */
+export class HttpError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "HttpError";
+  }
+}
+
 export type ChatStreamArgs = {
   model: string;
   messages: ChatMessage[];
@@ -59,7 +75,7 @@ export async function* chatStream(
   });
   if (!r.ok) {
     const text = await r.text().catch(() => "");
-    throw new Error(`HTTP ${r.status}: ${text || r.statusText}`);
+    throw new HttpError(r.status, `HTTP ${r.status}: ${text || r.statusText}`);
   }
   if (!r.body) throw new Error("response had no body");
 
