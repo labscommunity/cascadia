@@ -188,6 +188,7 @@ been swapped when this was written.
 | engine | `crates/cascadia-engine-sparse-moe/src/`: `engine.rs` (scheduler, streams, speculation), `inkling/` (loader, fused-MoE / attention / dense / head device backends), `lm_draft.rs`, `ngram_draft.rs` |
 | operator's Mac, outside the repository | `~/inkling-release/`: `bin/release.py`, `builds/`, `autolab-overrides/` (the REAL overrides, with the proxy's name), `autolab-state/role_swap`, `autolab-telemetry/`, `autolab-notes/`, `manual/`, `publisher.lock/`, `baseline/` |
 | build host (`ssh miner`) | `~/inkling-build` (release builds; do not delete its `target`), `/dev/shm` (scratch, RAM), the read-only export and checkpoint incl. the shipped MTP head |
+| offline studies | `autolab/research/mtp_offline/` (scripts + result tables of the MTP-head and logit-lens study, 033), `crates/cascadia-engine-sparse-moe/examples/inkling_spec_dump.rs` (hidden-state dump) |
 | offline model runs | the Mac Pro (`ssh pro`): the whole export resident on the CPU path, ~0.7 s per token; `~/inkling-spec-offline/` holds the hidden-state dump of the MTP study |
 
 ## 7. Before every publish

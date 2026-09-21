@@ -1,15 +1,15 @@
 ---
 id: speculation-for-every-stream-with-the-model-s-own-mtp-head-m
-title: speculation for every stream with the model's own MTP head (mtp.safetensors, 8 dense draft blocks): offline acceptance first
-status: running
-outcome: 
+title: offline: the model's own MTP head (8 dense draft modules) names the next token 0.726 of the time (0.63-0.69 prose, 0.87 arithmetic); deeper modules need their context kept current; ~5-6 tok/s for one stream if wired
+status: done
+outcome: measurement
 priority: 5
 target: 15 streams, interactive speed at 3-8 streams, single stream
 exact: yes
 needs: offline: Mac Pro dump + miner scoring (background agent running); fleet part blocked on a1 >= 0.7
 proposed_by: teammate (spec.md E4/E1) + autolab
-owner: background research agent (offline part)
-experiment: 
+owner: background research agent
+experiment: 033_mtp_offline_study
 created: 2026-09-20
 updated: 2026-09-20
 ---

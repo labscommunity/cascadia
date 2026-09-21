@@ -237,3 +237,47 @@ What follows from that, in the order it matters at 15 streams:
 5. **First token.** A prompt travels as ONE frame through eleven stages in series (5 s for 45 tokens alone, 31 s when
    fifteen arrive together and are admitted in fat frames that also stall everyone's decoding). Windows of <= 32 rows
    sent back to back pipeline one prompt across the stages, and stay on the GPU plugin's small-batch MoE path.
+
+### The 15-stream regime, as measured (026-033; supersedes the estimates in items 1, 2 and 4 above)
+
+**The constants held.** A frame of r rows costs a 25 W stage `16 + 19 r` ms. The 16: 0.78 GB of int8 attention read
+once per frame (8-9 ms at ~90 GB/s) plus about 1.2 ms of fixed cost in each of six fused-expert calls. The 19: one
+row's 1.57 GB of experts (12 ms, at the bus limit) plus ~5 ms of CPU work and glue. Nothing on the device-call side
+moved them: the plugin's decode kernels cost `1.4 + 1.7 r` ms per call against the prefill path's 3.0 ms for one row
+and 4.8 for two (026, 029: no gain, and they share no expert between rows); two threads of device calls overlap
+1.04-1.10x (023); letting the completion wait sleep costs 2.3 ms a frame (029).
+
+**What turns the ring.** F frames circulate over eleven stages. A round (every stream one token) takes the larger of
+* the busiest stage's work per round: the last rank, `F x (13.5 + 11.7 head) + 17 x 15 rows` = **25 F + 255 ms**, and
+* one frame's trip through all stages: `11 x (16 + 19 x 15/F)` + hops = **179 + 3135/F ms**.
+
+| frames F | 8 | 9 | 10 | **11** | 12 | 15 |
+|---|---|---|---|---|---|---|
+| last rank's work per round | 457 | 482 | 507 | **532** | 557 | 630 |
+| one frame's trip | 571 | 527 | 492 | **464** | 440 | 388 |
+| round = the larger | 571 | 527 | 507 | **532** | 557 | 630 |
+| tok/s (15 / round) | 26.3 | 28.5 | 29.6 | **28.2** | 26.9 | 23.8 |
+
+Measured at F = 11: rounds of 544-556 ms, 27 tok/s raw, 24-25 as the sum of the streams' own rates. F = 10 might be
+worth 5 % (`CASCADIA_STREAMS_INFLIGHT=10`, untested); nothing else in the grouping is. This is why making rank 0
+faster (027: -8 ms) returned 0.5 %, and why sharing head calls, which makes a reply wait for another frame's layers,
+lost 2.5 % (028): the ring is a closed loop, and a late reply is a late next frame.
+
+**Ideal of this layout at 15 streams: about 32 tok/s** (every stage at the middle ranks' `11 x T(1.36)` = 461 ms, no
+head penalty). The fleet is at 77 % of that. What could still move it, exactly:
+
+| lever | worth at 15 streams | note |
+|---|---|---|
+| frames in flight 11 -> 10 | up to +5 % | one environment variable on rank 0; untested |
+| the last rank's head cheaper per call | up to +8 % (then rank 0 paces) | int8 at 107 GB/s is already the bus; int4 through this GPU's generic path is slower per byte; no exact idea left |
+| guess rows from the model's own MTP head (a1 = 0.73 measured, 033) | **about +7 %**: two rows per stream = 1.73 tokens for 1.62x the stage time | the same head is worth ~2x per stream at 3-8 streams, where the ring has idle room, and 3.4-4.1 -> ~5-6 tok/s for one stream |
+| not exact: int4 attention (if a fast int4 path exists), top-4 instead of top-6 experts | +10 %, +20 % | owner's decision; changes the model's output |
+
+60 tok/s at 15 streams would need 15 rows x 1.57 GB x 11 stages + attention + head = ~34 GB per round per stage in
+250 ms = 136 GB/s sustained with nothing else in a frame: the bus's rated peak. It is not there with exact int4
+experts on these boxes.
+
+**The boxes are not equal, and one is odd.** Ranks 8-10 (no 25 W platform limit) run a stage in 35-36 ms against
+39-42 ms. The entry box, doing a middle rank's work since the role swap (032), needs 44 ms and 20.0 W where its seven
+identical siblings need 39-41 ms and 17-19 W: a unit or power-supply problem, the same box that lost all power three
+times in one day.

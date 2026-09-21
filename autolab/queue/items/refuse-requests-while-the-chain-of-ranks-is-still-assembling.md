@@ -3,7 +3,7 @@ id: refuse-requests-while-the-chain-of-ranks-is-still-assembling
 title: refuse requests while the chain of ranks is still assembling (they wedged it for ten minutes in 028's first rollout)
 status: ready
 outcome: 
-priority: 15
+priority: 3
 target: reliability
 exact: yes
 needs: binary change on rank 0 (503 until every link is up)

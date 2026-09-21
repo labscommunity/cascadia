@@ -212,3 +212,35 @@ ceiling of this layout is 50-65 tok/s with nothing else in a frame. 60 is not th
   wedged (streams admitted, no replies, ranks 1-2 "waiting for the previous rank") until the next release. Rolled
   back to 027 within ten minutes, gates pass, re-run pending. Rule: no traffic before "steady 3/3" is on screen.
   Also worth a fix of its own: requests that arrive while the chain is assembling should be refused, not wedge it.
+
+## 2026-09-20 late evening, iterations 029-033: two negatives, a dying entry box, a role swap
+
+* **029, both negative.** The decode kernels run on the exact group-32 weights once six compiled `32`s in the GPU plugin
+  become `16`s (the pre-Xe2 configuration of the same code; found by disassembling the byte-identical library on the
+  build host; every layer of the canary rank passed the load check at 0.999994). A one-row call then takes 3.0-3.2 ms,
+  the same as the prefill path: 026's "2.1 ms" was extrapolated from a call whose second row repeated the first row's
+  experts. Fitted on distinct rows the decode path is `1.4 ms + 1.7 ms per row`. The ~1-1.4 ms every MoE call costs
+  before its bytes is common to both paths. Queue throttle LOW halves the busy core and saves 1.5 W, and costs 2.3 ms
+  a frame in wake-ups. Both removed (030).
+* **What paces 15 streams, corrected.** 028's verdict called it a convoy behind the two-row frames. The better reading:
+  a ring of F frames turns at the LARGER of (a) the busiest stage's work per round and (b) one frame's trip through
+  eleven stages. The last rank does 11 x (36.6 + 11.7) = 531 ms per round (measured round 544-556). Fewer frames
+  lengthen the trip (`179 + 3135/F` ms), more frames add fixed cost and head calls (`25 F + 255` ms): F = 11 is
+  within 5 % of the optimum. So neither regrouping nor head sharing (which delays a reply by one frame's layers and
+  lost 2.5 %) helps; only a cheaper frame or cheaper rows do.
+* **The entry box lost all power three times** (13:39, ~20:38 one minute after a reload at idle, ~20:57 one minute
+  into a 15-stream phase), its clock back to the firmware date each time. Two lessons that cost time: its reset clock
+  blocks every release (the fleet manifest is stamped with it and updaters refuse older manifests; now self-healed in
+  the overrides), and a fleet that is "11/11 serving" is not settled until `steady 3/3` (traffic into a half-built
+  chain wedged it for ten minutes).
+* **032 role swap**, on the user's request: the box installed as rank 8 plays rank 0; the entry box keeps the door,
+  plays rank 8 and relays :8000. Built as two releases (verified LAN copy of each other's role data, then a `run.sh`
+  whose `ROLE_SWAP` names the pair), tested in two containers named like the boxes before it touched the fleet,
+  reversible in one release. Gates exact; 15 streams unchanged (23.6 / 24.6); rank 0's stage 44.2 -> 39.5 ms. The
+  entry box, now doing exactly what seven identical boxes do, is 8-10 % slower and draws more: the fault is in the
+  unit or its supply, not in the role.
+* **033 (offline, the teammate's plan):** the checkpoint's own MTP head is right 0.726 of the time on this model's
+  text (0.63-0.69 on prose); its deeper modules need their own attention and conv state kept current (0.11 without).
+  One stream ~5-6 tok/s if wired; the logit-lens / delayed-guess idea is closed (0.00 raw through rank 4).
+* **For whoever continues:** `OPERATING.md` (how to deploy without closing the only door; `lab.py publish` now refuses
+  the releases that would), `QUEUE.md` (every experiment and its status; anyone may add items), the README's status.

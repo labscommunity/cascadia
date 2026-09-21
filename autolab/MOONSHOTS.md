@@ -77,12 +77,12 @@ rows' fourteen), attention projections on the GPU 10.3 (int8, 0.78 GB per frame 
 
 | id | tier | idea | expected at 15 streams | exact? | status |
 |---|---|---|---|---|---|
-| F1 | A | rank 0's dense layers through the fused-experts op (eight slices, all selected) | rank 0 51.9 -> ~39 ms; pace set by rank 10 (46.7): **+11 %** | yes (7e-7) | **027, built** |
-| F2 | A | rank 10's output head as an int4 proxy + top-k on the device, the k candidates rescored against the bf16 rows on the host (greedy rows only; sampled rows keep the full head) | 11.6 -> ~6 ms; pace 46.7 -> ~42: **+11 %** | as exact as today's int8 head or better | next |
-| F3 | A | the plugin's MoE DECODE kernels for one-row frames (7 of 11 frames at 15 streams): they read at the bus limit (133-136 GB/s against 85-92 on the prefill path) | -0.9 ms per layer per one-row frame = **-3.4 ms per average frame (+8 %)**, single stream L -59 ms | group 64: NO (12 % of a block's output); group 32 needs a rebuilt plugin (sub-group 16) | 026: works on one layer |
+| F1 | A | rank 0's dense layers through the fused-experts op (eight slices, all selected) | rank 0 51.9 -> ~39 ms; pace set by rank 10 (46.7): **+11 %** | yes (7e-7) | **done (027): rank 0 51.9 -> 43.7 ms, fleet +0.5 %** (the last rank paces the ring) |
+| F2 | A | rank 10's output head as an int4 proxy + top-k on the device, the k candidates rescored against the bf16 rows on the host (greedy rows only; sampled rows keep the full head) | 11.6 -> ~6 ms; pace 46.7 -> ~42: **+11 %** | as exact as today's int8 head or better | **dropped**: this GPU reads int4 through the generic FC path 3x slower per byte than int8 (8.1 ms for 255 MB), so an int4 head would be slower; sharing head calls instead lost 2.5 % (028) |
+| F3 | A | the plugin's MoE DECODE kernels for one-row frames (7 of 11 frames at 15 streams): they read at the bus limit (133-136 GB/s against 85-92 on the prefill path) | -0.9 ms per layer per one-row frame = **-3.4 ms per average frame (+8 %)**, single stream L -59 ms | group 64: NO (12 % of a block's output); group 32 needs a rebuilt plugin (sub-group 16) | **closed (026, 029)**: works with group 64 (not exact) and on exact group 32 with a six-byte plugin patch, but a one-row call costs 3.0-3.2 ms on either path (`1.4 + 1.7 r` ms): no gain |
 | F4 | B | int4 attention projections (0.78 -> 0.4 GB per frame) | -4 ms per frame (+10 %) | no (wider quality gate first) | todo |
 | F5 | B | one frame's CPU work (attention core, routers) while the GPU runs the previous call | <= -3 ms | yes | todo |
-| F6 | S | **speculation for every stream, not only a lone one**, with a drafter that is right >= 0.8 of the time: the model's own shipped MTP head (eight dense draft blocks, 10.5 GB bf16, `mtp.safetensors`, dropped by the exporter; found on the miner). A guess row costs a full set of expert reads (19 ms of a stage), so it pays only at high acceptance: **+12-15 % at 15 streams, ~2x per stream at 3-8 streams, 3.4 -> 5-6 tok/s alone** | yes (verified like today's guesses) | offline acceptance study running (teammate's E4, with E1's dump) |
+| F6 | S | **speculation for every stream, not only a lone one**, with a drafter that is right >= 0.8 of the time: the model's own shipped MTP head (eight dense draft blocks, 10.5 GB bf16, `mtp.safetensors`, dropped by the exporter; found on the miner). A guess row costs a full set of expert reads (19 ms of a stage), so it pays only at high acceptance: **with the measured a1 = 0.73: about +7 % at 15 streams, ~2x per stream at 3-8 streams, 3.4-4.1 -> 5-6 tok/s alone** | yes (verified like today's guesses) | **offline study done (033): a1 = 0.726 (0.63-0.69 prose, 0.87 arithmetic)**, deeper modules need their own context kept current; passes the plan's bar; fleet wiring is the next big build |
 
 The byte ceiling stands: 15 rows x 6 layers x 8 experts x 31.85 MB + 11 frames x 0.78 GB of attention = 31.5 GB per
 round per stage = 232 ms at the bus limit = 65 tok/s with nothing else in a frame; rank 10 adds 11 head reads
@@ -93,9 +93,22 @@ on eleven buses of 136 GB/s.
 
 | their id | what | here | order |
 |---|---|---|---|
-| E4 | the shipped MTP head as-is, scored on this model's own text | = F6's first question. Structure read from the file today: 8 modules, each `embed_norm`, `hidden_norm`, `input_proj [6144, 12288]` and one DENSE Inkling block (attention + MLP 24,576 wide): DeepSeek-V3 style chained depths, 1.3 GB bf16 each (~0.39 GB at int4 MLP + int8 attention = ~3.5 ms per draft on one bus, plus the unembed) | **first** (offline, running) |
-| E1 | residual dump on the Mac Pro over the 013 corpus | reduced to what E4 and E2 need: final state at every position + the ten rank-boundary residuals at generated positions (not all 66 layers) | with E4 |
-| E2 | logit lens per rank boundary (the "guess later from a deeper rank" idea) | measured on the same dump; their own prediction is that it fails its bar | after E4 |
-| E3 | a new EAGLE-style head trained on the final state | only if E4 fails its bar (a1 >= 0.7 at <= 25 ms per draft): the shipped head is already trained on the real distribution | conditional |
+| E4 | the shipped MTP head as-is, scored on this model's own text | = F6's first question. Structure read from the file today: 8 modules, each `embed_norm`, `hidden_norm`, `input_proj [6144, 12288]` and one DENSE Inkling block (attention + MLP 24,576 wide): DeepSeek-V3 style chained depths, 1.3 GB bf16 each (~0.39 GB at int4 MLP + int8 attention = ~3.5 ms per draft on one bus, plus the unembed) | **done (033)**: a1 0.726, a2-a8 0.69-0.85 given the chain so far with context upkeep, 15.4 ms per draft (7.9 with a 65k-row unembed prefix) |
+| E1 | residual dump on the Mac Pro over the 013 corpus | reduced to what E4 and E2 need: final state at every position + the ten rank-boundary residuals at generated positions (not all 66 layers) | **done**: 36 prompts on the Mac Pro, 77 min; tool `examples/inkling_spec_dump.rs` |
+| E2 | logit lens per rank boundary (the "guess later from a deeper rank" idea) | measured on the same dump; their own prediction is that it fails its bar | **done, closed**: raw lens 0.000 through rank 4 (0.49 at rank 9), tuned lens 0.34-0.39, all below their bars |
+| E3 | a new EAGLE-style head trained on the final state | only if E4 fails its bar (a1 >= 0.7 at <= 25 ms per draft): the shipped head is already trained on the real distribution | not needed for now: the shipped head passes its bar; revisit only if fleet-captured states show it lower |
 | E5 | fleet wiring: the reply carries the final state (12 kB f16), a head drafts on rank 0 | after E4/E3 pass. For F6 it also needs guess rows for MANY streams in the scheduler (today speculation is a lone-stream mode) and F1 first (the head's cost lands on rank 0, the stage everyone waits for) | later |
 | appendix | expert-usage skew | rides on E1 if the dump records routed ids | optional |
+
+### Status after 033 and the role swap (2026-09-20 night): what is left, in order
+
+1. **Reliability first.** The entry box's power (brick / outlet / unit): owner's hands. Requests arriving while the
+   chain assembles should be refused, not wedge it (small binary change, queue).
+2. **MTP drafts on the fleet** (F6 / the teammate's E5): export the eight dense MTP blocks (int4 MLP, int8 attention),
+   run them on the box that plays rank 0 with their own KV and conv state, carry the final state on the reply link
+   (12 kB a row), guess rows for MANY streams in the scheduler (today speculation is a lone-stream mode), a 65k-row
+   draft unembed. Start with module 0 only (a1 0.73, 8 ms a draft), measure, then depth.
+3. **Small and exact:** carry the memorised-phrase table over to the new rank 0 (true/false 9.4 -> 4.3 since the swap);
+   one frame's CPU work overlapped with the previous device call (3.5 ms of 41).
+4. **Owner's decision (not exact):** int4 attention, if an int4 path faster than this GPU's 26-31 GB/s exists; fewer
+   experts per token. 60 tok/s at 15 streams needs one of these AND speculation; exact int4 experts top out near 32.
