@@ -67,3 +67,35 @@ Measured: prose 3.1-3.7 tok/s (a = 0.42, L = 410 ms), structured tasks 6-11, mem
    as in other MoEs (unmeasured here: count expert ids per layer first).
 5. **Not exact, so only ever opt-in:** keep a guess the model itself finds likely (its probability within a factor of
    the top token's). With a model drafter that is a ~0.7 on prose: ~6 tok/s today, ~10 with 2 and 3.
+
+## Added 2026-09-20 evening: the 15-stream roster (goal: interactive speed for up to 15 streams, ideally 60 tok/s)
+
+Where a 15-stream round goes (026, per frame of 1.36 rows): rank 0 **51.9 ms, 96 % busy**; ranks 1-7 39-42 ms and
+23-28 % idle; ranks 8-9 35.5 ms and 35 % idle; rank 10 35.1 + 11.6 ms of output head, 85 % busy. 24.6 tok/s steady.
+Inside a middle rank's 41 ms: fused experts 24.7 (six calls; 2.98 ms for one row's eight experts, 4.83 ms for two
+rows' fourteen), attention projections on the GPU 10.3 (int8, 0.78 GB per frame whatever the row count), CPU 3.5.
+
+| id | tier | idea | expected at 15 streams | exact? | status |
+|---|---|---|---|---|---|
+| F1 | A | rank 0's dense layers through the fused-experts op (eight slices, all selected) | rank 0 51.9 -> ~39 ms; pace set by rank 10 (46.7): **+11 %** | yes (7e-7) | **027, built** |
+| F2 | A | rank 10's output head as an int4 proxy + top-k on the device, the k candidates rescored against the bf16 rows on the host (greedy rows only; sampled rows keep the full head) | 11.6 -> ~6 ms; pace 46.7 -> ~42: **+11 %** | as exact as today's int8 head or better | next |
+| F3 | A | the plugin's MoE DECODE kernels for one-row frames (7 of 11 frames at 15 streams): they read at the bus limit (133-136 GB/s against 85-92 on the prefill path) | -0.9 ms per layer per one-row frame = **-3.4 ms per average frame (+8 %)**, single stream L -59 ms | group 64: NO (12 % of a block's output); group 32 needs a rebuilt plugin (sub-group 16) | 026: works on one layer |
+| F4 | B | int4 attention projections (0.78 -> 0.4 GB per frame) | -4 ms per frame (+10 %) | no (wider quality gate first) | todo |
+| F5 | B | one frame's CPU work (attention core, routers) while the GPU runs the previous call | <= -3 ms | yes | todo |
+| F6 | S | **speculation for every stream, not only a lone one**, with a drafter that is right >= 0.8 of the time: the model's own shipped MTP head (eight dense draft blocks, 10.5 GB bf16, `mtp.safetensors`, dropped by the exporter; found on the miner). A guess row costs a full set of expert reads (19 ms of a stage), so it pays only at high acceptance: **+12-15 % at 15 streams, ~2x per stream at 3-8 streams, 3.4 -> 5-6 tok/s alone** | yes (verified like today's guesses) | offline acceptance study running (teammate's E4, with E1's dump) |
+
+The byte ceiling stands: 15 rows x 6 layers x 8 experts x 31.85 MB + 11 frames x 0.78 GB of attention = 31.5 GB per
+round per stage = 232 ms at the bus limit = 65 tok/s with nothing else in a frame; rank 10 adds 11 head reads
+(13.6 GB) per round. F1-F5 together land at 35-40 tok/s; 60 at 15 streams is not reachable with exact int4 experts
+on eleven buses of 136 GB/s.
+
+### The teammate's hidden-state drafter plan (`spec.md`, E1-E5), slotted
+
+| their id | what | here | order |
+|---|---|---|---|
+| E4 | the shipped MTP head as-is, scored on this model's own text | = F6's first question. Structure read from the file today: 8 modules, each `embed_norm`, `hidden_norm`, `input_proj [6144, 12288]` and one DENSE Inkling block (attention + MLP 24,576 wide): DeepSeek-V3 style chained depths, 1.3 GB bf16 each (~0.39 GB at int4 MLP + int8 attention = ~3.5 ms per draft on one bus, plus the unembed) | **first** (offline, running) |
+| E1 | residual dump on the Mac Pro over the 013 corpus | reduced to what E4 and E2 need: final state at every position + the ten rank-boundary residuals at generated positions (not all 66 layers) | with E4 |
+| E2 | logit lens per rank boundary (the "guess later from a deeper rank" idea) | measured on the same dump; their own prediction is that it fails its bar | after E4 |
+| E3 | a new EAGLE-style head trained on the final state | only if E4 fails its bar (a1 >= 0.7 at <= 25 ms per draft): the shipped head is already trained on the real distribution | conditional |
+| E5 | fleet wiring: the reply carries the final state (12 kB f16), a head drafts on rank 0 | after E4/E3 pass. For F6 it also needs guess rows for MANY streams in the scheduler (today speculation is a lone-stream mode) and F1 first (the head's cost lands on rank 0, the stage everyone waits for) | later |
+| appendix | expert-usage skew | rides on E1 if the dump records routed ids | optional |
