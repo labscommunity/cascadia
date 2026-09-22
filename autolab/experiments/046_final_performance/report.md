@@ -1,6 +1,6 @@
 # Inkling fleet performance survey
 
-IN PROGRESS — completed phases only (capped at 176 streams)
+PAUSED — completed phases only (capped at 176 streams)
 
 Eleven Panther Lake boxes; release `1790016660`; int4 experts and int8 attention. All survey requests use temperature 0 and a 128-token output budget. Counts include reasoning and answer tokens.
 
@@ -63,7 +63,7 @@ All **12/12 generated outputs were text-identical** between those passes; see [p
 
 | Family | Single-stream median | Fastest single request | Best aggregate decode | Streams at best |
 |---|---:|---:|---:|---:|
-| explanation | 11.27 | 15.04 | 24.82 | 15 |
+| explanation | 11.27 | 15.04 | 55.47 | 64 |
 
 Family maxima cover only the tested settings shown in `phase-results.csv`. A fastest individual request is sensitive to prompt choice and phrase learning; the median and repeated phase means are better deployment expectations.
 

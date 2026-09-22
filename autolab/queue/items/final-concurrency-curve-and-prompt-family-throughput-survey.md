@@ -1,12 +1,12 @@
 ---
 id: final-concurrency-curve-and-prompt-family-throughput-survey
 title: Final concurrency curve and prompt-family throughput survey
-status: running
+status: blocked
 outcome: 
 priority: 1
 target: single stream, multi stream, prompt families
 exact: yes
-needs: Owner resumed 2026-09-21 18:25 CDT; measurement only on unchanged release1790016660; no competing generation
+needs: Owner reported crash and said hold on at19:12CDT; no fleet probes or tests until owner directs. 33 completed phases retained.
 proposed_by: owner request 2026-09-21
 owner: autolab-continuation-20260921
 experiment: 046_final_performance

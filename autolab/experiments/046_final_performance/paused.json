@@ -1,0 +1,12 @@
+{
+  "time": 1790035970.530577,
+  "reason": "Owner reported: it just crashed. hold on",
+  "resume_requires": "Wait for owner to say resume; do not send fleet requests or run tests meanwhile",
+  "interrupted_phase": "family_00_a_c088",
+  "completed_phases": 33,
+  "last_completed_phase": "family_00_a_c064",
+  "traffic_status": "Watchdog had already stopped the local client on API timeout; no fleet probe after owner hold",
+  "watchdog_health_error": "TimeoutError",
+  "interruption_epoch": 1790035926.84108,
+  "client_exit_code": 1
+}

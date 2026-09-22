@@ -6,5 +6,5 @@
   "peak_end_to_end_streams": 88,
   "peak_end_to_end_tok_s": 46.874876421073495,
   "max_streams_limit": 176,
-  "paused": false
+  "paused": true
 }
