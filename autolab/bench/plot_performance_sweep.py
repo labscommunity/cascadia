@@ -201,6 +201,22 @@ def main():
         for target in [1,2,3,5,10]:
             acceptable=[n for n,v in zip(ns,per) if v>=target]
             report.append(f'| {target} | {max(acceptable) if acceptable else "None"} |')
+        singles={r['phase']:r for r in grouped.get(1,[])}
+        if all(name in singles for name in ['mixed_a_c001','mixed_b_c001']):
+            first=singles['mixed_a_c001']['steady_aggregate_tok_s']
+            repeat=singles['mixed_b_c001']['steady_aggregate_tok_s']
+            report+=['',f'**Single-stream pass difference:** {first:.2f} tok/s on the first study '
+                     f'pass and {repeat:.2f} on the repeat of the same deterministic prompts. '
+                     'The table and curve show their mean and observed range. Phrase learning '
+                     'remained enabled, other generation occurred during the owner pause, and '
+                     'capture writes were disabled between passes. No engine or model change '
+                     'occurred. The repeat is not an unseen-prompt baseline or evidence of a '
+                     'new kernel speedup.']
+            if (root/'single-stream-comparison.json').exists():
+                comparison=json.loads((root/'single-stream-comparison.json').read_text())
+                report += [f"All **{comparison['identical_outputs']}/{comparison['requests']} generated "
+                           'outputs were text-identical** between those passes; see '
+                           '[per-family comparison and output hashes](single-stream-comparison.json).']
     families=[r for r in phases if r['family']!='mixed']
     if families:
         names=[f for f in FAMILIES if any(r['family']==f and r['streams']==1 for r in families)]

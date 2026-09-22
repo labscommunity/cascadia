@@ -32,8 +32,8 @@ These are different objectives from maximizing each user’s speed. Use the late
 
 | Streams | Runs | Decode tok/s | Decode tok/s/stream | Including startup tok/s | TTFT median / p95 (s) |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 1 | 5.68 | 5.68 | 5.19 | 2.18 / 2.65 |
-| 2 | 1 | 4.55 | 2.28 | 4.40 | 2.06 / 2.94 |
+| 1 | 2 | 7.96 | 7.96 | 6.98 | 2.18 / 2.41 |
+| 2 | 2 | 4.53 | 2.27 | 4.37 | 2.06 / 3.03 |
 | 4 | 2 | 9.16 | 2.29 | 8.64 | 3.31 / 4.03 |
 | 6 | 2 | 13.89 | 2.31 | 12.80 | 4.20 / 5.49 |
 | 8 | 2 | 18.60 | 2.32 | 16.86 | 4.55 / 6.23 |
@@ -55,6 +55,17 @@ These are different objectives from maximizing each user’s speed. Use the late
 | 3 | 1 |
 | 5 | 1 |
 | 10 | None |
+
+**Single-stream pass difference:** 5.68 tok/s on the first study pass and 10.24 on the repeat of the same deterministic prompts. The table and curve show their mean and observed range. Phrase learning remained enabled, other generation occurred during the owner pause, and capture writes were disabled between passes. No engine or model change occurred. The repeat is not an unseen-prompt baseline or evidence of a new kernel speedup.
+All **12/12 generated outputs were text-identical** between those passes; see [per-family comparison and output hashes](single-stream-comparison.json).
+
+![Prompt families](prompt-families.png)
+
+| Family | Single-stream median | Fastest single request | Best aggregate decode | Streams at best |
+|---|---:|---:|---:|---:|
+| explanation | 11.27 | 15.04 | 24.82 | 15 |
+
+Family maxima cover only the tested settings shown in `phase-results.csv`. A fastest individual request is sensitive to prompt choice and phrase learning; the median and repeated phase means are better deployment expectations.
 
 Data: [phase CSV](phase-results.csv), [per-request CSV](request-results.csv), [full sanitized phase measurements](measurements.json). Each chart is also available as SVG and PDF.
 
