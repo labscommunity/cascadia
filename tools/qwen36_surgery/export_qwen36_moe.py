@@ -161,9 +161,20 @@ def layer_state_vids(layer_types: list, global_idx: int) -> list:
     return [f"past.conv.{n}cache", f"past.ssm.{n}cache"]
 
 
-def stage_ranges(num_layers: int, total: int) -> list:
+def stage_ranges(num_layers: int, total: int, split: str | None = None) -> list:
     if total < 1 or total > num_layers:
         raise ValueError(f"--total must be in 1..{num_layers}, got {total}")
+    if split:
+        bounds = [int(x.strip()) for x in split.split(",") if x.strip()]
+        if len(bounds) != total - 1:
+            raise ValueError(f"--layer-split needs {total - 1} boundaries, got {len(bounds)}")
+        ranges = []
+        start = 0
+        for b in bounds:
+            ranges.append((start, b - 1))
+            start = b
+        ranges.append((start, num_layers - 1))
+        return ranges
     per = num_layers // total
     ranges = []
     start = 0
@@ -375,7 +386,7 @@ def build_feeds(model, hidden_size: int, hidden=None, embeds=None):
     return feeds
 
 
-def run_export(model_dir, output_dir, num_stages=2, validate=False):
+def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=None):
     """Cut the official int4 OV IR in `model_dir` into `num_stages` stage
     dirs under `output_dir` + manifest + aux files. Entry point for
     `cascadia shard` dispatch (export_shards.py) and for main() below."""
@@ -389,7 +400,7 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False):
             f"not on safetensors"
         )
     spec = read_model_spec(model_dir)
-    ranges = stage_ranges(spec.num_layers, num_stages)
+    ranges = stage_ranges(spec.num_layers, num_stages, layer_split)
     check_stage_ranges(spec, ranges)
     print(
         f"model: {spec.model_type} hidden={spec.hidden} layers={spec.num_layers} "
@@ -576,10 +587,13 @@ def main():
     ap.add_argument("--model", required=True, help="official int4-ov model dir")
     ap.add_argument("--out", required=True, help="output dir for stage dirs")
     ap.add_argument("--total", type=int, default=2)
+    ap.add_argument("--layer-split", default=None,
+                    help="explicit layer boundaries, comma-separated "
+                    "(e.g. 48 for a 2-stage 48/16 split)")
     ap.add_argument("--validate", action="store_true",
                     help="chain stages vs full model on one synthetic token")
     args = ap.parse_args()
-    run_export(args.model, args.out, args.total, args.validate)
+    run_export(args.model, args.out, args.total, args.validate, args.layer_split)
 
 
 if __name__ == "__main__":

@@ -358,6 +358,8 @@ pub struct Qwen36Builder {
     /// either way, so that observation is consistent with both readings and proves nothing.
     pub kv_cache_precision: Option<String>,
     pub dyn_quant_group: Option<String>,
+    /// Extra OV plugin properties (CLI perf flags, e.g. INFERENCE_NUM_THREADS).
+    pub ov_properties: Vec<(String, String)>,
     /// OV compiled-blob cache. Without it this 35B MoE recompiles from scratch on EVERY spawn (and any
     /// plugin-property change forces a full uncached rebuild that can exceed the rig's serve window).
     /// runtime/gemma4/dist_spec all set this; qwen36 did not.
@@ -381,6 +383,10 @@ impl Qwen36Builder {
     }
     pub fn with_dyn_quant_group(mut self, group: impl Into<String>) -> Self {
         self.dyn_quant_group = Some(group.into());
+        self
+    }
+    pub fn with_ov_properties(mut self, props: Vec<(String, String)>) -> Self {
+        self.ov_properties = props;
         self
     }
     /// Prefix-cache byte budget (0 = off). Default [`crate::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES`].
@@ -409,6 +415,7 @@ impl Qwen36Builder {
             hidden: LEGACY_HIDDEN,
             kv_cache_precision: None,
             dyn_quant_group: None,
+            ov_properties: Vec::new(),
             cache_dir: None,
             prefix_cache_bytes: crate::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES,
             im_start_id: None,
@@ -533,6 +540,9 @@ impl Builder for Qwen36Builder {
         }
         if let Some(g) = &self.dyn_quant_group {
             plugin = plugin.with("DYNAMIC_QUANTIZATION_GROUP_SIZE", g);
+        }
+        for (k, v) in &self.ov_properties {
+            plugin = plugin.with(k, v);
         }
 
         // Embeddings + tokenizer + eos live with the decode driver only.

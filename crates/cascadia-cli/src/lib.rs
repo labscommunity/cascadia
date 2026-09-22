@@ -1576,6 +1576,7 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
             if let Some(group) = &args.ov_dyn_quant_group {
                 b = b.with_dyn_quant_group(group);
             }
+            b = b.with_ov_properties(ov_perf_properties(args));
             info!(
                 prefix_cache_gib = prefix_cache_bytes >> 30,
                 "qwen35 prefix-cache budget"
