@@ -51,6 +51,181 @@ pub const MAX_NGRAM: usize = 4;
 /// override per task via [`Draft::with_draft_k`].
 pub const DEFAULT_DRAFT_K: usize = 8;
 
+/// What every request so far has taught about "which token follows these":
+/// a backoff table over 3-, 2- and 1-token contexts with counts, shared by all
+/// streams of a process ([`Draft::with_shared`]). A request's own prompt and
+/// output are the best guide when they repeat; this answers the rest of the
+/// time, which is most of the time for a reasoning model whose stock phrases
+/// ("The user is asking for ...") recur across requests but not within one.
+///
+/// A pipeline that speculates on a lone stream pays about half a stage time
+/// for a wrong guess and saves ten stage times with a right one, so a guess is
+/// worth sending when it is right more than about one time in twenty
+/// ([`SharedNgrams::MIN_CONFIDENCE`] asks for one in eight to leave a margin).
+#[derive(Debug, Default)]
+pub struct SharedNgrams {
+    /// Context (1..=3 tokens, FNV-hashed with its length) -> followers seen.
+    table: HashMap<u64, Followers>,
+}
+
+/// The most frequent followers of one context (a handful is enough: only the
+/// top one is ever proposed) and how often the context was seen at all.
+#[derive(Debug, Default, Clone)]
+struct Followers {
+    seen: u32,
+    top: Vec<(i64, u32)>,
+}
+
+impl SharedNgrams {
+    /// Longest shared context. Longer contexts live in the per-request table.
+    pub const MAX_CONTEXT: usize = 3;
+    /// Followers remembered per context.
+    const KEEP: usize = 4;
+    /// Contexts remembered; past this the table stops learning new ones (the
+    /// common ones are in by then) rather than grow without bound.
+    const MAX_CONTEXTS: usize = 2_000_000;
+    /// A shared guess is proposed only if its follower was seen in at least
+    /// this share of the context's occurrences...
+    pub const MIN_CONFIDENCE: f32 = 0.125;
+    /// ...and the context at least this often.
+    const MIN_SEEN: u32 = 2;
+
+    fn key(ctx: &[i64]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ ctx.len() as u64;
+        for &t in ctx {
+            for b in t.to_le_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h
+    }
+
+    /// Learn from a finished sequence (prompt followed by output).
+    pub fn learn(&mut self, tokens: &[i64]) {
+        for i in 1..tokens.len() {
+            let next = tokens[i];
+            for k in 1..=Self::MAX_CONTEXT.min(i) {
+                let key = Self::key(&tokens[i - k..i]);
+                if !self.table.contains_key(&key) && self.table.len() >= Self::MAX_CONTEXTS {
+                    continue;
+                }
+                let f = self.table.entry(key).or_default();
+                f.seen = f.seen.saturating_add(1);
+                if let Some(i) = f.top.iter().position(|(t, _)| *t == next) {
+                    f.top[i].1 = f.top[i].1.saturating_add(1);
+                } else if f.top.len() < Self::KEEP {
+                    f.top.push((next, 1));
+                } else if let Some(min) = f.top.iter_mut().min_by_key(|(_, n)| *n) {
+                    // The rarest remembered follower gives way, and the newcomer
+                    // starts from one: counts never overstate, so the confidence
+                    // bar cannot be passed by churn.
+                    *min = (next, 1);
+                }
+            }
+        }
+    }
+
+    /// The likeliest follower of the longest known suffix of `buf`, if it
+    /// clears the confidence bar.
+    pub fn guess(&self, buf: &[i64]) -> Option<i64> {
+        for k in (1..=Self::MAX_CONTEXT.min(buf.len())).rev() {
+            let Some(f) = self.table.get(&Self::key(&buf[buf.len() - k..])) else {
+                continue;
+            };
+            let Some(&(t, n)) = f.top.iter().max_by_key(|(_, n)| *n) else {
+                continue;
+            };
+            if f.seen >= Self::MIN_SEEN && n as f32 >= Self::MIN_CONFIDENCE * f.seen as f32 {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    /// A follower the table is SURE of: the longest context (three tokens),
+    /// seen at least twice, followed by the same token nine times in ten.
+    /// That is text the fleet has written before (a repeated prompt, a stock
+    /// phrase): there the table beats any drafter model.
+    pub fn sure_guess(&self, buf: &[i64]) -> Option<i64> {
+        let k = Self::MAX_CONTEXT;
+        if buf.len() < k {
+            return None;
+        }
+        let f = self.table.get(&Self::key(&buf[buf.len() - k..]))?;
+        let &(t, n) = f.top.iter().max_by_key(|(_, n)| *n)?;
+        (f.seen >= Self::MIN_SEEN && n as f32 >= 0.9 * f.seen as f32).then_some(t)
+    }
+
+    pub fn contexts(&self) -> usize {
+        self.table.len()
+    }
+
+    const MAGIC: &'static [u8; 8] = b"CSNGRAM1";
+
+    /// Write the table to `path` (tmp + rename), so what requests taught
+    /// survives a restart of the worker.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let tmp = path.with_extension("tmp");
+        {
+            let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+            w.write_all(Self::MAGIC)?;
+            w.write_all(&(self.table.len() as u64).to_le_bytes())?;
+            for (key, f) in &self.table {
+                w.write_all(&key.to_le_bytes())?;
+                w.write_all(&f.seen.to_le_bytes())?;
+                w.write_all(&[f.top.len() as u8])?;
+                for (t, n) in &f.top {
+                    w.write_all(&t.to_le_bytes())?;
+                    w.write_all(&n.to_le_bytes())?;
+                }
+            }
+            w.flush()?;
+        }
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Read a table written by [`Self::save`]. A missing, foreign or damaged
+    /// file yields an error and the caller starts empty.
+    pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::io::Read;
+        let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+        let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
+        let mut head = [0u8; 16];
+        r.read_exact(&mut head)?;
+        if &head[..8] != Self::MAGIC {
+            return Err(bad("not a shared n-gram table"));
+        }
+        let n = u64::from_le_bytes(head[8..].try_into().expect("8 bytes")) as usize;
+        if n > Self::MAX_CONTEXTS {
+            return Err(bad("table larger than this build accepts"));
+        }
+        let mut table = HashMap::with_capacity(n);
+        for _ in 0..n {
+            let mut rec = [0u8; 13];
+            r.read_exact(&mut rec)?;
+            let key = u64::from_le_bytes(rec[..8].try_into().expect("8 bytes"));
+            let seen = u32::from_le_bytes(rec[8..12].try_into().expect("4 bytes"));
+            let k = rec[12] as usize;
+            if k > Self::KEEP {
+                return Err(bad("damaged entry"));
+            }
+            let mut top = Vec::with_capacity(k);
+            for _ in 0..k {
+                let mut e = [0u8; 12];
+                r.read_exact(&mut e)?;
+                top.push((
+                    i64::from_le_bytes(e[..8].try_into().expect("8 bytes")),
+                    u32::from_le_bytes(e[8..].try_into().expect("4 bytes")),
+                ));
+            }
+            table.insert(key, Followers { seen, top });
+        }
+        Ok(Self { table })
+    }
+}
+
 /// N-gram lookup draft model. Stateless w.r.t. the target — owns its
 /// own token history and lookup table.
 ///
@@ -67,6 +242,23 @@ pub struct Draft {
     table: HashMap<Vec<i64>, i64>,
     /// Max tokens to draft per round.
     draft_k: usize,
+    /// What other requests taught ([`SharedNgrams`]); asked when this
+    /// request's own history has no match.
+    shared: Option<std::sync::Arc<std::sync::Mutex<SharedNgrams>>>,
+    /// Where the output begins in `history` (after [`Self::warm_with_prompt`]).
+    prompt_len: usize,
+    /// A small language model asked before the tables ([`crate::lm_draft`]):
+    /// its settings until the first guess is wanted, then the live link. Only
+    /// a stream that really speculates ever opens one.
+    lm_cfg: Option<(
+        crate::lm_draft::LmConfig,
+        std::sync::Arc<tokenizers::Tokenizer>,
+    )>,
+    lm: Option<crate::lm_draft::LmLink>,
+    /// Guesses by source: `(model, tables)`.
+    sources: (u64, u64),
+    /// The last guess handed out came from the drafter model.
+    last_from_model: bool,
 }
 
 impl Draft {
@@ -76,7 +268,106 @@ impl Draft {
             history: Vec::new(),
             table: HashMap::new(),
             draft_k: DEFAULT_DRAFT_K,
+            shared: None,
+            prompt_len: 0,
+            lm_cfg: None,
+            lm: None,
+            sources: (0, 0),
+            last_from_model: false,
         }
+    }
+
+    /// Whether the last [`Self::propose_one`] answer came from the drafter model.
+    pub fn last_from_model(&self) -> bool {
+        self.last_from_model
+    }
+
+    /// Ask a drafter model first ([`crate::lm_draft`]); the tables answer when
+    /// it has nothing ready. `tok` is the TARGET's tokenizer.
+    pub fn with_lm(
+        mut self,
+        cfg: crate::lm_draft::LmConfig,
+        tok: std::sync::Arc<tokenizers::Tokenizer>,
+    ) -> Self {
+        self.lm_cfg = Some((cfg, tok));
+        self
+    }
+
+    /// The next token's guess for the speculation path: the drafter model's if
+    /// one is configured and has an answer within `wait`, else the tables'.
+    pub fn propose_one(&mut self, wait: std::time::Duration) -> Option<i64> {
+        self.last_from_model = false;
+        if self.lm.is_none() {
+            if let Some((cfg, tok)) = self.lm_cfg.take() {
+                let prompt = &self.history[..self.prompt_len.min(self.history.len())];
+                self.lm = Some(crate::lm_draft::LmLink::new(cfg, tok, prompt));
+            }
+        }
+        if self.lm.is_some() {
+            // Text seen before (this request's own last four tokens, or a
+            // context the shared table is sure of) outranks the model: on a
+            // repeated prompt the tables are right nine times in ten.
+            if let Some(t) = self.sure_next() {
+                self.sources.1 += 1;
+                return Some(t);
+            }
+        }
+        if let Some(lm) = self.lm.as_mut() {
+            let from = self.prompt_len.min(self.history.len());
+            if let Some(t) = lm.next(&self.history[from..], wait) {
+                self.sources.0 += 1;
+                self.last_from_model = true;
+                return Some(t);
+            }
+            // A guess from the tables would send the text somewhere the model
+            // is not writing towards, and the model is right more often: an
+            // empty frame is the better price. The tables answer only when
+            // there is no model to ask.
+            if !lm.unreachable() {
+                return None;
+            }
+        }
+        let t = self.lookup_next(&self.history)?;
+        self.sources.1 += 1;
+        Some(t)
+    }
+
+    /// Tell the drafter model where the text stands NOW, so that it writes
+    /// while the caller computes (a frame holds rank 0 for a stage time; the
+    /// guess for the frame after it is wanted right then). No-op without one.
+    pub fn poke(&mut self) {
+        if self.lm.is_none() {
+            if let Some((cfg, tok)) = self.lm_cfg.take() {
+                let prompt = &self.history[..self.prompt_len.min(self.history.len())];
+                self.lm = Some(crate::lm_draft::LmLink::new(cfg, tok, prompt));
+            }
+        }
+        if let Some(lm) = self.lm.as_mut() {
+            let from = self.prompt_len.min(self.history.len());
+            let _ = lm.next(&self.history[from..], std::time::Duration::ZERO);
+        }
+    }
+
+    /// `(guesses from the drafter model, guesses from the tables)`.
+    pub fn sources(&self) -> (u64, u64) {
+        self.sources
+    }
+
+    /// Whether a drafter model is configured for this request.
+    pub fn has_lm(&self) -> bool {
+        self.lm.is_some() || self.lm_cfg.is_some()
+    }
+
+    /// Fall back to a table shared across requests when this one's own
+    /// history has no match for the current suffix.
+    pub fn with_shared(mut self, shared: std::sync::Arc<std::sync::Mutex<SharedNgrams>>) -> Self {
+        self.shared = Some(shared);
+        self
+    }
+
+    /// The tokens seen so far (prompt, output, and any speculated tail).
+    pub fn history(&self) -> &[i64] {
+        &self.history
     }
 
     /// Override draft K. Clamped to `1..=64`; values outside that range
@@ -94,6 +385,8 @@ impl Draft {
     pub fn reset(&mut self) {
         self.history.clear();
         self.table.clear();
+        self.prompt_len = 0;
+        self.lm = None;
     }
 
     /// Bulk-load history (prompt prefill). Walks every k-gram in
@@ -104,6 +397,7 @@ impl Draft {
         for &t in tokens {
             self.append(t);
         }
+        self.prompt_len = self.history.len();
     }
 
     /// Append one verified token. Updates the k-gram table with the
@@ -171,6 +465,17 @@ impl Draft {
         out
     }
 
+    /// A guess the tables are sure of (see [`SharedNgrams::sure_guess`]).
+    fn sure_next(&self) -> Option<i64> {
+        let h = &self.history;
+        if h.len() >= MAX_NGRAM {
+            if let Some(&t) = self.table.get(&h[h.len() - MAX_NGRAM..]) {
+                return Some(t);
+            }
+        }
+        self.shared.as_ref()?.lock().ok()?.sure_guess(h)
+    }
+
     /// Look up the next token after the trailing k-gram of `buf`.
     /// Tries the longest k-gram first, then progressively shorter.
     /// Returns the first match found.
@@ -184,7 +489,8 @@ impl Draft {
                 return Some(t);
             }
         }
-        None
+        let shared = self.shared.as_ref()?;
+        shared.lock().ok()?.guess(buf)
     }
 }
 
@@ -197,6 +503,56 @@ impl Default for Draft {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_table_answers_what_the_request_cannot() {
+        use std::sync::{Arc, Mutex};
+        let shared = Arc::new(Mutex::new(SharedNgrams::default()));
+        // Two earlier requests went "7 8 9 10"; a third went "7 8 50".
+        for seq in [[1, 7, 8, 9, 10], [2, 7, 8, 9, 10], [3, 7, 8, 50, 60]] {
+            shared.lock().unwrap().learn(&seq);
+        }
+        let mut d = Draft::new().with_draft_k(1).with_shared(shared.clone());
+        d.warm_with_prompt(&[40, 41, 7, 8]);
+        // Nothing in this request follows "7 8"; the shared table says 9 (2 of 3).
+        assert_eq!(d.propose(), vec![9]);
+        // The request's own history wins over the shared table.
+        d.warm_with_prompt(&[50, 99, 7, 8]);
+        assert_eq!(d.propose(), vec![50]);
+        // A context seen once is not evidence, and a rare follower is not a guess.
+        let mut fresh = Draft::new().with_draft_k(1).with_shared(shared.clone());
+        fresh.warm_with_prompt(&[3]);
+        assert!(fresh.propose().is_empty(), "\"3\" was seen once: no guess");
+        let mut noisy = SharedNgrams::default();
+        let mut seq = Vec::new();
+        for t in 0..40 {
+            seq.extend([5, 100 + t]); // forty different followers of 5
+        }
+        noisy.learn(&seq);
+        assert_eq!(
+            noisy.guess(&[5]),
+            None,
+            "1 in 40 is below the confidence bar"
+        );
+    }
+
+    #[test]
+    fn shared_table_survives_a_restart() {
+        let mut t = SharedNgrams::default();
+        t.learn(&[1, 7, 8, 9, 10, 7, 8, 9, 11, 7, 8, 9]);
+        let dir = std::env::temp_dir().join(format!("cs-ngram-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("table.bin");
+        t.save(&path).unwrap();
+        let back = SharedNgrams::load(&path).unwrap();
+        assert_eq!(back.contexts(), t.contexts());
+        for ctx in [&[7i64, 8][..], &[8, 9], &[9], &[7, 8, 9]] {
+            assert_eq!(back.guess(ctx), t.guess(ctx), "context {ctx:?}");
+        }
+        std::fs::write(&path, b"garbage").unwrap();
+        assert!(SharedNgrams::load(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn empty_draft_proposes_nothing() {

@@ -1,0 +1,66 @@
+[
+  {
+    "layer": 30,
+    "bits": 4,
+    "rows": 1,
+    "q_us": 500,
+    "o_us": 292,
+    "relative_rms_ppm": 96917
+  },
+  {
+    "layer": 30,
+    "bits": 4,
+    "rows": 2,
+    "q_us": 488,
+    "o_us": 293,
+    "relative_rms_ppm": 97347
+  },
+  {
+    "layer": 30,
+    "bits": 8,
+    "rows": 1,
+    "q_us": 780,
+    "o_us": 518,
+    "relative_rms_ppm": 0
+  },
+  {
+    "layer": 30,
+    "bits": 8,
+    "rows": 2,
+    "q_us": 780,
+    "o_us": 563,
+    "relative_rms_ppm": 0
+  },
+  {
+    "layer": 31,
+    "bits": 4,
+    "rows": 1,
+    "q_us": 509,
+    "o_us": 299,
+    "relative_rms_ppm": 96138
+  },
+  {
+    "layer": 31,
+    "bits": 4,
+    "rows": 2,
+    "q_us": 477,
+    "o_us": 288,
+    "relative_rms_ppm": 96474
+  },
+  {
+    "layer": 31,
+    "bits": 8,
+    "rows": 1,
+    "q_us": 778,
+    "o_us": 560,
+    "relative_rms_ppm": 0
+  },
+  {
+    "layer": 31,
+    "bits": 8,
+    "rows": 2,
+    "q_us": 781,
+    "o_us": 567,
+    "relative_rms_ppm": 0
+  }
+]

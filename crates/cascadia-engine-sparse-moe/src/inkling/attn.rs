@@ -630,48 +630,296 @@ impl AttentionLayer {
     /// the conv'd `kc`, append k/v to the cache at position `self.len`, attend
     /// (with log scaling on global layers), and project out. `q`/`kc` are
     /// taken by value because they are normalised in place.
-    fn attend(&mut self, mut q: Vec<f32>, mut kc: Vec<f32>, v: &[f32], r: &[f32]) -> Vec<f32> {
-        let (hd, hq, hkv, d, dr) = (
-            self.dims.hidden,
+    fn attend(&mut self, q: Vec<f32>, kc: Vec<f32>, v: &[f32], r: &[f32]) -> Vec<f32> {
+        let ctx = AttnCtx {
+            dims: &self.dims,
+            scale: self.scale,
+            rows: self.rows,
+            relpos: &self.relpos,
+            q_norm: &self.w.q_norm,
+            k_norm: &self.w.k_norm,
+        };
+        attend_state(
+            &ctx,
+            &mut self.k,
+            &mut self.v,
+            &mut self.len,
+            &mut self.hwm,
+            q,
+            kc,
+            v,
+            r,
+        )
+    }
+}
+
+/// `CASCADIA_INKLING_PAR_ATTN` (default on): a frame's rows attend
+/// concurrently. Each row belongs to a different sequence with its own KV
+/// cache and conv histories, so the rows are independent; they used to run one
+/// after another, which was invisible while the experts kept every core busy
+/// and became a fifth of a frame once the experts moved to the iGPU.
+fn row_parallel_attention() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("CASCADIA_INKLING_PAR_ATTN")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
+    })
+}
+
+impl AttentionLayer {
+    /// The per-row part of [`Self::forward_rows`] with the rows concurrent:
+    /// k/v convs, then attention, each on its own sequence's state. Bit for
+    /// bit what the sequential loop computes per row. Returns `[t, Hq·D]`.
+    fn attend_rows_parallel(
+        &mut self,
+        q_all: &[f32],
+        kr_all: &[f32],
+        vr_all: &[f32],
+        r_all: &[f32],
+        slots: &[usize],
+    ) -> Vec<f32> {
+        use rayon::prelude::*;
+        let (hq, hkv, d, dr) = (
             self.dims.n_heads,
             self.dims.n_kv_heads,
             self.dims.head_dim,
             self.dims.d_rel,
         );
-        let p = self.len;
-        if self.dims.window.is_none() {
+        let (qd, kd, rd) = (hq * d, hkv * d, hq * dr);
+        let kc_all = self.k_sconv.decode_slots(kr_all, slots);
+        let v_all = self.v_sconv.decode_slots(vr_all, slots);
+        // Every sequence's KV state into its slot entry (the live one sits in
+        // the layer's own fields), back again afterwards.
+        let live = self.live;
+        std::mem::swap(&mut self.k, &mut self.slots[live].k);
+        std::mem::swap(&mut self.v, &mut self.slots[live].v);
+        std::mem::swap(&mut self.len, &mut self.slots[live].len);
+        std::mem::swap(&mut self.hwm, &mut self.slots[live].hwm);
+        let mut ctx_all = vec![0.0f32; slots.len() * qd];
+        {
+            let cx = AttnCtx {
+                dims: &self.dims,
+                scale: self.scale,
+                rows: self.rows,
+                relpos: &self.relpos,
+                q_norm: &self.w.q_norm,
+                k_norm: &self.w.k_norm,
+            };
+            let mut picked: Vec<Option<&mut AttnSlot>> = slots.iter().map(|_| None).collect();
+            for (i, st) in self.slots.iter_mut().enumerate() {
+                if let Some(row) = slots.iter().position(|&s| s == i) {
+                    picked[row] = Some(st);
+                }
+            }
+            picked
+                .into_par_iter()
+                .zip(ctx_all.par_chunks_mut(qd))
+                .enumerate()
+                .for_each(|(row, (st, out))| {
+                    let st = st.expect("attention: slot out of range or listed twice");
+                    let c = attend_state(
+                        &cx,
+                        &mut st.k,
+                        &mut st.v,
+                        &mut st.len,
+                        &mut st.hwm,
+                        q_all[row * qd..(row + 1) * qd].to_vec(),
+                        kc_all[row * kd..(row + 1) * kd].to_vec(),
+                        &v_all[row * kd..(row + 1) * kd],
+                        &r_all[row * rd..(row + 1) * rd],
+                    );
+                    out.copy_from_slice(&c);
+                });
+        }
+        std::mem::swap(&mut self.k, &mut self.slots[live].k);
+        std::mem::swap(&mut self.v, &mut self.slots[live].v);
+        std::mem::swap(&mut self.len, &mut self.slots[live].len);
+        std::mem::swap(&mut self.hwm, &mut self.slots[live].hwm);
+        ctx_all
+    }
+}
+
+/// Private scratch for an opt-in overlap measurement. Borrows only weights;
+/// no serving KV/conv state or projections are touched.
+pub(super) struct CpuProbe<'a> {
+    ctx: AttnCtx<'a>,
+    slots: Vec<CpuProbeSlot>,
+    context: usize,
+    q: Vec<f32>,
+    kr: Vec<f32>,
+    vr: Vec<f32>,
+    r: Vec<f32>,
+}
+
+struct CpuProbeSlot {
+    k: Vec<f32>,
+    v: Vec<f32>,
+    kc: ShortConv,
+    vc: ShortConv,
+}
+
+impl AttentionLayer {
+    pub(super) fn cpu_probe(&self, rows: usize, context: usize) -> CpuProbe<'_> {
+        assert!((1..=2).contains(&rows));
+        let context = context.min(self.rows.saturating_sub(1));
+        let cache_rows = context + 1;
+        let kd = self.dims.n_kv_heads * self.dims.head_dim;
+        let values = |n: usize| {
+            (0..n)
+                .map(|i| ((i % 31) as f32 - 15.0) * 0.01)
+                .collect::<Vec<_>>()
+        };
+        let kr = values(kd);
+        let vr = values(kd);
+        let slots = (0..rows)
+            .map(|_| {
+                let mut kc = ShortConv::new(self.k_sconv.w().to_vec(), kd, self.k_sconv.k());
+                let mut vc = ShortConv::new(self.v_sconv.w().to_vec(), kd, self.v_sconv.k());
+                for _ in 0..3 {
+                    kc.decode(&kr);
+                    vc.decode(&vr);
+                }
+                CpuProbeSlot {
+                    k: values(kd * cache_rows),
+                    v: values(kd * cache_rows),
+                    kc,
+                    vc,
+                }
+            })
+            .collect();
+        CpuProbe {
+            ctx: AttnCtx {
+                dims: &self.dims,
+                scale: self.scale,
+                rows: cache_rows,
+                relpos: &self.relpos,
+                q_norm: &self.w.q_norm,
+                k_norm: &self.w.k_norm,
+            },
+            slots,
+            context,
+            q: values(self.dims.n_heads * self.dims.head_dim),
+            r: values(self.dims.n_heads * self.dims.d_rel),
+            kr,
+            vr,
+        }
+    }
+}
+
+impl CpuProbe<'_> {
+    pub(super) fn step(&mut self) -> Vec<f32> {
+        use rayon::prelude::*;
+        let run = |slot: &mut CpuProbeSlot| {
+            slot.kc.truncate(3);
+            slot.vc.truncate(3);
+            let kc = slot.kc.decode(&self.kr);
+            let v = slot.vc.decode(&self.vr);
+            let (mut len, mut hwm) = (self.context, self.context);
+            attend_state(
+                &self.ctx,
+                &mut slot.k,
+                &mut slot.v,
+                &mut len,
+                &mut hwm,
+                self.q.clone(),
+                kc,
+                &v,
+                &self.r,
+            )
+        };
+        let outputs: Vec<Vec<f32>> = if self.slots.len() > 1 && row_parallel_attention() {
+            self.slots.par_iter_mut().map(run).collect()
+        } else {
+            self.slots.iter_mut().map(run).collect()
+        };
+        outputs.into_iter().flatten().collect()
+    }
+}
+
+/// What [`attend_state`] reads of a layer besides one sequence's state.
+struct AttnCtx<'a> {
+    dims: &'a AttnDims,
+    scale: f32,
+    rows: usize,
+    relpos: &'a RelPos,
+    q_norm: &'a [f32],
+    k_norm: &'a [f32],
+}
+
+impl AttnCtx<'_> {
+    #[inline]
+    fn slot(&self, pos: usize) -> usize {
+        match self.dims.window {
+            Some(_) => pos % self.rows,
+            None => pos,
+        }
+    }
+
+    #[inline]
+    fn kv_off(&self, kvh: usize, slot: usize) -> usize {
+        (kvh * self.rows + slot) * self.dims.head_dim
+    }
+}
+
+/// The per-position attention core on ONE sequence's state (`k`/`v` caches,
+/// `len`, `hwm`), whichever sequence that is: the layer's live one
+/// ([`AttentionLayer::attend`]) or a parked slot (row-parallel decode).
+#[allow(clippy::too_many_arguments)]
+fn attend_state(
+    cx: &AttnCtx<'_>,
+    k_cache: &mut [f32],
+    v_cache: &mut [f32],
+    len: &mut usize,
+    hwm: &mut usize,
+    mut q: Vec<f32>,
+    mut kc: Vec<f32>,
+    v: &[f32],
+    r: &[f32],
+) -> Vec<f32> {
+    {
+        let (hd, hq, hkv, d, dr) = (
+            cx.dims.hidden,
+            cx.dims.n_heads,
+            cx.dims.n_kv_heads,
+            cx.dims.head_dim,
+            cx.dims.d_rel,
+        );
+        let p = *len;
+        if cx.dims.window.is_none() {
             assert!(
-                p < self.rows,
+                p < cx.rows,
                 "Inkling context length {} exceeds max_seq {}; raise the global layers' max_seq",
                 p + 1,
-                self.rows
+                cx.rows
             );
         } else {
             debug_assert!(
-                (p + 1).saturating_sub(self.dims.window.unwrap_or(0))
-                    >= self.hwm.saturating_sub(self.rows),
+                (p + 1).saturating_sub(cx.dims.window.unwrap_or(0))
+                    >= (*hwm).saturating_sub(cx.rows),
                 "attn ring invariant broken at position {p} (hwm {})",
-                self.hwm
+                (*hwm)
             );
         }
 
         // Per-head RMSNorm on q and (conv'd) k, f32.
-        rmsnorm_f32(&mut q, &self.w.q_norm, self.dims.eps);
-        rmsnorm_f32(&mut kc, &self.w.k_norm, self.dims.eps);
+        rmsnorm_f32(&mut q, &cx.q_norm, cx.dims.eps);
+        rmsnorm_f32(&mut kc, &cx.k_norm, cx.dims.eps);
 
         // Cache this position's k / v per kv head.
-        let slot = self.slot(p);
+        let slot = cx.slot(p);
         for kvh in 0..hkv {
-            let o = self.kv_off(kvh, slot);
-            self.k[o..o + d].copy_from_slice(&kc[kvh * d..(kvh + 1) * d]);
-            self.v[o..o + d].copy_from_slice(&v[kvh * d..(kvh + 1) * d]);
+            let o = cx.kv_off(kvh, slot);
+            k_cache[o..o + d].copy_from_slice(&kc[kvh * d..(kvh + 1) * d]);
+            v_cache[o..o + d].copy_from_slice(&v[kvh * d..(kvh + 1) * d]);
         }
-        self.len = p + 1;
-        self.hwm = self.hwm.max(p + 1);
+        *len = p + 1;
+        *hwm = (*hwm).max(p + 1);
 
         // Log scaling (global layers only): scales q and the position bias.
-        let tau = match (self.dims.window, self.dims.n_floor) {
-            (None, Some(nf)) => 1.0 + self.dims.alpha * ((p + 1) as f32 / nf).max(1.0).ln(),
+        let tau = match (cx.dims.window, cx.dims.n_floor) {
+            (None, Some(nf)) => 1.0 + cx.dims.alpha * ((p + 1) as f32 / nf).max(1.0).ln(),
             _ => 1.0,
         };
         if tau != 1.0 {
@@ -681,26 +929,26 @@ impl AttentionLayer {
         }
 
         // Visible keys: global 0..=p; sliding p-window < j <= p.
-        let j0 = match self.dims.window {
+        let j0 = match cx.dims.window {
             Some(win) => (p + 1).saturating_sub(win),
             None => 0,
         };
         let n_keys = p + 1 - j0;
         let group = hq / hkv;
-        let extent = self.relpos.extent();
+        let extent = cx.relpos.extent();
 
         let mut ctx = vec![0.0f32; hq * d];
         let mut score = vec![0.0f32; n_keys];
         for h in 0..hq {
             let kvh = h / group;
             let qh = &q[h * d..(h + 1) * d];
-            let prof = self.relpos.profile(&r[h * dr..(h + 1) * dr]);
+            let prof = cx.relpos.profile(&r[h * dr..(h + 1) * dr]);
             let mut smax = f32::NEG_INFINITY;
             for (i, j) in (j0..=p).enumerate() {
-                let o = self.kv_off(kvh, self.slot(j));
+                let o = cx.kv_off(kvh, cx.slot(j));
                 let dist = p - j;
                 let bias = if dist < extent { prof[dist] * tau } else { 0.0 };
-                let s = dot(qh, &self.k[o..o + d]) * self.scale + bias;
+                let s = dot(qh, &k_cache[o..o + d]) * cx.scale + bias;
                 score[i] = s;
                 smax = smax.max(s);
             }
@@ -712,8 +960,8 @@ impl AttentionLayer {
             let ctx_h = &mut ctx[h * d..(h + 1) * d];
             for (i, j) in (j0..=p).enumerate() {
                 let pj = score[i] / denom;
-                let o = self.kv_off(kvh, self.slot(j));
-                for (c, &x) in ctx_h.iter_mut().zip(&self.v[o..o + d]) {
+                let o = cx.kv_off(kvh, cx.slot(j));
+                for (c, &x) in ctx_h.iter_mut().zip(&v_cache[o..o + d]) {
                     *c += pj * x;
                 }
             }
@@ -723,7 +971,9 @@ impl AttentionLayer {
         let _ = hd;
         ctx
     }
+}
 
+impl AttentionLayer {
     /// Attend one input-normed hidden `h` (`[H]`) at position `self.len`,
     /// appending to the cache. Returns the `Wo` output (`[H]`) BEFORE
     /// `attn_sconv` — the layer applies that conv and the residual.
@@ -791,6 +1041,10 @@ impl AttentionLayer {
         assert_eq!(hs.len(), t * hd, "attn forward_rows: hs len != t * hidden");
         let (qd, kd, rd) = (hq * d, hkv * d, hq * dr);
         let (q_all, kr_all, vr_all, r_all) = self.project_rows(hs, t);
+        if t >= 2 && row_parallel_attention() {
+            let ctx_all = self.attend_rows_parallel(&q_all, &kr_all, &vr_all, &r_all, slots);
+            return self.project_out_rows(&ctx_all, t);
+        }
         let mut ctx_all = vec![0.0f32; t * qd];
         for (row, &slot) in slots.iter().enumerate() {
             self.select(slot);

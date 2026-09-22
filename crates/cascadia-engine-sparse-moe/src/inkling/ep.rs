@@ -1045,7 +1045,7 @@ mod gpu_requirement_tests {
 /// exits for a supervisor rebuild (the driver's connection is accepted at
 /// `connect()` only).
 pub struct ExpertWorkerEngine {
-    bank: ExpertBank,
+    bank: Arc<ExpertBank>,
     server: Arc<TokioMutex<ActivationServer>>,
     handle: tokio::runtime::Handle,
     peer_disconnected: bool,
@@ -1056,6 +1056,19 @@ pub struct ExpertWorkerEngine {
 impl ExpertWorkerEngine {
     pub fn new(
         bank: ExpertBank,
+        server: Arc<TokioMutex<ActivationServer>>,
+        handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self::new_shared(Arc::new(bank), server, handle)
+    }
+
+    /// Serve an independent driver connection using an already loaded bank.
+    /// Each connection owns its framing/disconnect state; weights and backend
+    /// caches are shared. This does not enable a listener or change the CLI's
+    /// single-driver topology. A serving-mode controller must bound accepted
+    /// sessions and own their lifetime before using this constructor.
+    pub fn new_shared(
+        bank: Arc<ExpertBank>,
         server: Arc<TokioMutex<ActivationServer>>,
         handle: tokio::runtime::Handle,
     ) -> Self {

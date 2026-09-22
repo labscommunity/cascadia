@@ -1,0 +1,97 @@
+{
+ "ok": true,
+ "prompts": [
+  {
+   "i": 0,
+   "match_chars": 147,
+   "of": 147,
+   "exact": true,
+   "broken": false,
+   "tok_s": 12.143,
+   "ttft_s": 4.96,
+   "text": "<think>The user wants an explanation of why the sky is blue in exactly three sentences. I need to be accurate but concis",
+   "error": null
+  },
+  {
+   "i": 1,
+   "match_chars": 150,
+   "of": 150,
+   "exact": true,
+   "broken": false,
+   "tok_s": 9.293,
+   "ttft_s": 5.69,
+   "text": "<think>The user is asking for the capital of France and wants the answer in one word. The capital of France is Paris. I ",
+   "error": null
+  },
+  {
+   "i": 5,
+   "match_chars": 81,
+   "of": 112,
+   "exact": false,
+   "broken": false,
+   "tok_s": 6.694,
+   "ttft_s": 4.87,
+   "text": "<think>The user is asking \"What is 6 times 7? Explain briefly.\" This is a simple multiplication question. 6 \u00d7 7 = 42",
+   "error": null
+  }
+ ],
+ "multi_ok": true,
+ "multi": [
+  {
+   "i": 0,
+   "broken": false,
+   "text": "<think>The user wants an explanation of why the sky is blue in exactly three sen",
+   "error": null,
+   "match_chars": 147,
+   "of": 147
+  },
+  {
+   "i": 7,
+   "broken": false,
+   "text": "<think>The user wants one tip for sleeping better, in exactly two sentences. I n",
+   "error": null
+  },
+  {
+   "i": 5,
+   "broken": false,
+   "text": "<think>The user is asking \"What is 6 times 7? Explain briefly.\" This is a simple",
+   "error": null,
+   "match_chars": 81,
+   "of": 112
+  },
+  {
+   "i": 9,
+   "broken": false,
+   "text": "<think>The user wants a summary of photosynthesis in two sentences. I need to be",
+   "error": null
+  },
+  {
+   "i": 1,
+   "broken": false,
+   "text": "<think>The user is asking for the capital of France and wants the answer in one ",
+   "error": null,
+   "match_chars": 150,
+   "of": 150
+  },
+  {
+   "i": 11,
+   "broken": false,
+   "text": "<think>The user wants a description of rain in one sentence. I should make it ev",
+   "error": null
+  },
+  {
+   "i": 0,
+   "broken": false,
+   "text": "<think>The user wants an explanation of why the sky is blue in exactly three sen",
+   "error": null,
+   "match_chars": 147,
+   "of": 147
+  },
+  {
+   "i": 13,
+   "broken": false,
+   "text": "<think>The user wants an explanation of gravity suitable for a child, in exactly",
+   "error": null
+  }
+ ]
+}

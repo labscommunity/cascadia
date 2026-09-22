@@ -1,0 +1,5 @@
+11:04:05 PHASE fresh1a: 1/1 done, 96 tok in 69 s = 1.38 tok/s aggregate (sum of streams 2.79), ttft mean 35.3 max 35.3
+11:04:54 PHASE fresh1b: 1/1 done, 96 tok in 37 s = 2.60 tok/s aggregate (sum of streams 2.99), ttft mean 5.1 max 5.1
+11:05:42 PHASE fresh1c: 1/1 done, 96 tok in 36 s = 2.65 tok/s aggregate (sum of streams 3.05), ttft mean 5.0 max 5.0
+11:05:54 telemetry endpoint available: True
+done

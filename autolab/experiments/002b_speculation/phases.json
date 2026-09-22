@@ -1,0 +1,53 @@
+[
+ {
+  "phase": "single",
+  "streams": 1,
+  "tokens_req": 64,
+  "prompt_words": 0,
+  "start": 1789892361.5509582,
+  "end": 1789892410.4701738,
+  "wall_s": 48.9,
+  "completed": 1,
+  "tokens": 64,
+  "aggregate_tok_s": 1.308,
+  "sum_stream_tok_s": 1.604,
+  "ttft_mean_s": 9.63,
+  "ttft_max_s": 9.63,
+  "errors": [],
+  "sample": "<think>The user wants an explanation of why the sky is blue in exactly three sentences. I need to be"
+ },
+ {
+  "phase": "echo",
+  "streams": 1,
+  "tokens_req": 96,
+  "prompt_words": 0,
+  "start": 1789892422.4755929,
+  "end": 1789892486.8981252,
+  "wall_s": 64.4,
+  "completed": 1,
+  "tokens": 96,
+  "aggregate_tok_s": 1.49,
+  "sum_stream_tok_s": 2.793,
+  "ttft_mean_s": 30.41,
+  "ttft_max_s": 30.41,
+  "errors": [],
+  "sample": "<think>The user wants me to repeat a specific paragraph exactly, word for word, two times, and write"
+ },
+ {
+  "phase": "single2",
+  "streams": 1,
+  "tokens_req": 64,
+  "prompt_words": 0,
+  "start": 1789892498.907351,
+  "end": 1789892544.0349078,
+  "wall_s": 45.1,
+  "completed": 1,
+  "tokens": 64,
+  "aggregate_tok_s": 1.418,
+  "sum_stream_tok_s": 1.772,
+  "ttft_mean_s": 9.58,
+  "ttft_max_s": 9.58,
+  "errors": [],
+  "sample": "<think>The user wants an explanation of why the sky is blue in exactly three sentences. I need to be"
+ }
+]

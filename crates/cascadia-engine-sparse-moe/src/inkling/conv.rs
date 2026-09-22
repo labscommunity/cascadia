@@ -95,6 +95,53 @@ impl ConvState {
     }
 }
 
+/// One position of a short convolution on ONE sequence's history (`ring`, `len`,
+/// `hwm`): the layer's live one or a parked slot.
+fn step_state(
+    w: &[f32],
+    (c, k, hist): (usize, usize, usize),
+    ring: &mut [f32],
+    len: &mut usize,
+    hwm: &mut usize,
+    u: &[f32],
+    out: &mut [f32],
+) {
+    {
+        debug_assert_eq!(u.len(), c);
+        debug_assert_eq!(out.len(), c);
+        let p = *len;
+        debug_assert!(
+            p.saturating_sub(k - 1) >= (*hwm).saturating_sub(hist),
+            "ShortConv ring invariant broken: position {p} needs inputs older than {}",
+            (*hwm).saturating_sub(hist)
+        );
+        out.fill(0.0);
+        for j in 0..k {
+            // Tap j reads position p - (K-1) + j, i.e. `back` positions ago.
+            let back = k - 1 - j;
+            if back > p {
+                continue; // zero padding before position 0
+            }
+            let src: &[f32] = if back == 0 {
+                u
+            } else {
+                let row = (p - back) % hist;
+                &ring[row * c..(row + 1) * c]
+            };
+            for ((o, &s), wrow) in out.iter_mut().zip(src).zip(w.chunks_exact(k)) {
+                *o += wrow[j] * s;
+            }
+        }
+        for (o, &ui) in out.iter_mut().zip(u) {
+            *o += ui;
+        }
+        let row = p % hist;
+        ring[row * c..(row + 1) * c].copy_from_slice(u);
+        *len = p + 1;
+        *hwm = (*hwm).max(p + 1);
+    }
+}
+
 impl ShortConv {
     /// `w` is `[c, k]` row-major; history sized for [`DEFAULT_REWIND`].
     pub fn new(w: Vec<f32>, c: usize, k: usize) -> Self {
@@ -211,39 +258,57 @@ impl ShortConv {
     /// `u` and advance. The single code path both `decode` and `prefill` use —
     /// summation order per channel is tap 0 .. tap K-1, then `+ u`.
     fn step(&mut self, u: &[f32], out: &mut [f32]) {
-        let (c, k, hist) = (self.c, self.k, self.hist);
-        debug_assert_eq!(u.len(), c);
-        debug_assert_eq!(out.len(), c);
-        let p = self.len;
-        debug_assert!(
-            p.saturating_sub(k - 1) >= self.oldest_valid(),
-            "ShortConv ring invariant broken: position {p} needs inputs older than {}",
-            self.oldest_valid()
+        step_state(
+            &self.w,
+            (self.c, self.k, self.hist),
+            &mut self.ring,
+            &mut self.len,
+            &mut self.hwm,
+            u,
+            out,
         );
-        out.fill(0.0);
-        for j in 0..k {
-            // Tap j reads position p - (K-1) + j, i.e. `back` positions ago.
-            let back = k - 1 - j;
-            if back > p {
-                continue; // zero padding before position 0
+    }
+
+    /// Decode one position on each of `slots` (distinct sequences; row `i` of
+    /// `u` belongs to `slots[i]`), the rows concurrently: each sequence has its
+    /// own ring, so per row this is [`Self::decode`] on that sequence, bit for
+    /// bit. Returns `[slots.len(), C]`.
+    pub(crate) fn decode_slots(&mut self, u: &[f32], slots: &[usize]) -> Vec<f32> {
+        use rayon::prelude::*;
+        let c = self.c;
+        assert_eq!(
+            u.len(),
+            slots.len() * c,
+            "ShortConv::decode_slots: input len"
+        );
+        // Every sequence's state into its slot entry (the live one is held in
+        // the layer's own fields), back again afterwards.
+        let live = self.live;
+        std::mem::swap(&mut self.ring, &mut self.slots[live].ring);
+        std::mem::swap(&mut self.len, &mut self.slots[live].len);
+        std::mem::swap(&mut self.hwm, &mut self.slots[live].hwm);
+        let mut out = vec![0.0f32; slots.len() * c];
+        {
+            let (w, dims) = (&self.w, (self.c, self.k, self.hist));
+            let mut picked: Vec<Option<&mut ConvSlot>> = slots.iter().map(|_| None).collect();
+            for (i, st) in self.slots.iter_mut().enumerate() {
+                if let Some(row) = slots.iter().position(|&s| s == i) {
+                    picked[row] = Some(st);
+                }
             }
-            let src: &[f32] = if back == 0 {
-                u
-            } else {
-                let row = (p - back) % hist;
-                &self.ring[row * c..(row + 1) * c]
-            };
-            for ((o, &s), wrow) in out.iter_mut().zip(src).zip(self.w.chunks_exact(k)) {
-                *o += wrow[j] * s;
-            }
+            picked
+                .into_par_iter()
+                .zip(out.par_chunks_mut(c))
+                .zip(u.par_chunks(c))
+                .for_each(|((st, o), ui)| {
+                    let st = st.expect("decode_slots: slot out of range or listed twice");
+                    step_state(w, dims, &mut st.ring, &mut st.len, &mut st.hwm, ui, o);
+                });
         }
-        for (o, &ui) in out.iter_mut().zip(u) {
-            *o += ui;
-        }
-        let row = p % hist;
-        self.ring[row * c..(row + 1) * c].copy_from_slice(u);
-        self.len = p + 1;
-        self.hwm = self.hwm.max(p + 1);
+        std::mem::swap(&mut self.ring, &mut self.slots[live].ring);
+        std::mem::swap(&mut self.len, &mut self.slots[live].len);
+        std::mem::swap(&mut self.hwm, &mut self.slots[live].hwm);
+        out
     }
 
     /// Decode one position: `u` is `[C]`; returns `conv(u) + u` (`[C]`) and

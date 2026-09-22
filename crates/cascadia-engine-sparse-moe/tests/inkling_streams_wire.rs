@@ -189,6 +189,14 @@ async fn three_rank_multistream_matches_single_stage() {
             e0.submit(t).unwrap();
         }
         let got = collect(&mut e0, &ids2);
+        // Five requests at once with three slots: the first three must have
+        // gone down as one prefill frame (they share expert reads), and the
+        // tokens below must not notice.
+        assert!(
+            e0.batched_admissions() >= 3,
+            "a burst was admitted one frame per prompt ({} batched)",
+            e0.batched_admissions()
+        );
         drop(e0);
         got
     })

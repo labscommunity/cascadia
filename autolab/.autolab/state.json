@@ -1,0 +1,6 @@
+{
+ "iteration": 0,
+ "next_experiment": "001_balanced_windowed_telemetry",
+ "fleet_baseline": {"cascadia": "7dc3b4b5", "overrides": "3dbce6c6", "beacon": "cf71fa3d"},
+ "targets": {"single_tok_s": 10, "aggregate_tok_s": 60}
+}

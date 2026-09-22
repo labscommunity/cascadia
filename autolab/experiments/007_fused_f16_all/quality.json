@@ -1,0 +1,155 @@
+{
+ "correct": 12,
+ "of": 12,
+ "items": [
+  {
+   "q": "What is the capital of France? Answer in one word.",
+   "want": [
+    "paris"
+   ],
+   "ok": true,
+   "finished": true,
+   "degenerate": false,
+   "tokens": 39,
+   "answer": "Paris",
+   "error": null
+  },
+  {
+   "q": "What is 6 times 7? Answer with the number only.",
+   "want": [
+    "42"
+   ],
+   "ok": true,
+   "finished": true,
+   "degenerate": false,
+   "tokens": 42,
+   "answer": "42",
+   "error": null
+  },
+  {
+   "q": "What is 17 multiplied by 23? Answer with the number only.",
+   "want": [
+    "391"
+   ],
+   "ok": true,
+   "finished": true,
+   "degenerate": false,
+   "tokens": 55,
+   "answer": "391",
+   "error": null
+  },
+  {
+   "q": "List the first five prime numbers, separated by commas.",
+   "want": [
+    "2",
+    "3",
+    "5",
+    "7",
+    "11"
+   ],
+   "ok": true,
+   "finished": true,
+   "degenerate": false,
+   "tokens": 136,
+   "answer": "The first five prime numbers are:\n\n2,3,5,7,11",
+   "error": null
+  },
+  {
+   "q": "Which planet is known as the Red Planet? One word.",
+   "want": [
+    "mars"
+   ],
+   "ok": true,
+   "finished": true,
+   "degenerate": false,
+   "tokens": 33,
+   "answer": "Mars",
+   "error": null
+  },
+  {
+   "q": "What is the chemical symbol for gold? Answer with the symbol only.",
+   "want": [
+    "au"
+   ],
+   "ok": true,
+   "finished": true,
+   "degenerate": false,
+   "tokens": 35,
+   "answer": "Au",
+   "error": null
+  },
+  {
+   "q": "Who wrote the play Romeo and Juliet? Give the name only.",
+   "want": [
+    "shakespeare"
+   ],
+   "ok": true,
+   "finished": true,
+   "degenerate": false,
+   "tokens": 58,
+   "answer": "William Shakespeare",
+   "error": null
+  },
+  {
+   "q": "What is the largest ocean on Earth? One word.",
+   "want": [
+    "pacific"
+   ],
+   "ok": true,
+   "finished": true,
+   "degenerate": false,
+   "tokens": 40,
+   "answer": "Pacific",
+   "error": null
+  },
+  {
+   "q": "How many days are there in a leap year? Number only.",
+   "want": [
+    "366"
+   ],
+   "ok": true,
+   "finished": true,
+   "degenerate": false,
+   "tokens": 53,
+   "answer": "366",
+   "error": null
+  },
+  {
+   "q": "What is the square root of 144? Number only.",
+   "want": [
+    "12"
+   ],
+   "ok": true,
+   "finished": true,
+   "degenerate": false,
+   "tokens": 53,
+   "answer": "12",
+   "error": null
+  },
+  {
+   "q": "Translate 'good morning' into Spanish. Two words only.",
+   "want": [
+    "buenos"
+   ],
+   "ok": true,
+   "finished": true,
+   "degenerate": false,
+   "tokens": 70,
+   "answer": "Buenos d\u00edas",
+   "error": null
+  },
+  {
+   "q": "What gas do plants absorb from the air for photosynthesis? Give its chemical formula.",
+   "want": [
+    "co2",
+    "co\u2082"
+   ],
+   "ok": true,
+   "finished": true,
+   "degenerate": false,
+   "tokens": 118,
+   "answer": "Plants absorb **carbon dioxide** from the air for photosynthesis.\n\nChemical formula: **CO\u2082** (or CO2)",
+   "error": null
+  }
+ ]
+}

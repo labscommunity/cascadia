@@ -1,0 +1,11 @@
+{
+  "sequences": 36,
+  "prompt_ids": "original 033 rendered prompts and token IDs",
+  "generated_tokens": 5760,
+  "format": "INKCAP02 f32",
+  "all_residuals_finite": true,
+  "all_api_text_exact": true,
+  "prompt_rows_min": 24,
+  "prompt_rows_max": 48,
+  "raw_capture_bytes": 170663280
+}

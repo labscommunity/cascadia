@@ -229,6 +229,29 @@ impl ExpertCache {
     /// evicted allocation returns to the caller's scratch lease for reuse.
     /// Never evict an entry with an outstanding lease: retained plus leased
     /// expert allocations therefore stay within this layer's capacity.
+    /// Put `expert`'s bytes in the cache before it was ever routed to (a rank
+    /// filling its resident copy at startup). Takes free capacity only: never
+    /// evicts, never counts as a hit, miss or admission. `false` when it did
+    /// not fit or was already there.
+    pub fn preload(&self, expert: usize, bytes: &mut ReadBuffer) -> bool {
+        let size = bytes.allocated_bytes();
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if bytes.as_slice().is_empty()
+            || expert >= state.frequency.len()
+            || size > state.stats.capacity_bytes - state.stats.retained_bytes
+            || state.entries.iter().any(|e| e.expert == expert)
+        {
+            return false;
+        }
+        let incoming = std::mem::take(bytes);
+        state.stats.retained_bytes += size;
+        state.entries.push(Entry {
+            expert,
+            bytes: Arc::new(incoming),
+        });
+        true
+    }
+
     pub fn retain(&self, expert: usize, bytes: &mut ReadBuffer) {
         let size = bytes.allocated_bytes();
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -305,6 +328,29 @@ mod tests {
         cache.retain(0, &mut ReadBuffer::default());
         cache.retain(0, &mut bytes(17, 64));
         assert_eq!(cache.stats().retained_bytes, 0);
+    }
+
+    #[test]
+    fn preload_fills_free_capacity_and_is_served_as_hits() {
+        let cache = ExpertCache::new(4, 64); // room for two 32-byte experts
+        assert!(
+            cache.preload(1, &mut bytes(11, 32)),
+            "never routed to, still loaded"
+        );
+        assert!(cache.preload(3, &mut bytes(33, 32)));
+        assert!(
+            !cache.preload(0, &mut bytes(7, 32)),
+            "full: preload never evicts"
+        );
+        assert!(!cache.preload(1, &mut bytes(11, 32)), "already there");
+        assert!(!cache.preload(9, &mut bytes(9, 32)), "out of range");
+        let st = cache.stats();
+        assert_eq!((st.retained_bytes, st.admissions, st.evictions), (64, 0, 0));
+        let hits = cache.lookup(&[1, 0, 3]).expect("cache on");
+        assert_eq!(hits[0].as_ref().map(|b| b.as_slice()[0]), Some(11));
+        assert!(hits[1].is_none());
+        assert_eq!(hits[2].as_ref().map(|b| b.as_slice()[0]), Some(33));
+        assert_eq!((cache.stats().hits, cache.stats().misses), (2, 1));
     }
 
     #[test]

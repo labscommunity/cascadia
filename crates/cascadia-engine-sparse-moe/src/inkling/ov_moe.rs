@@ -73,12 +73,126 @@ fn set_process_env(name: &str, value: &str) {
 /// boundary on the B390), so calls use a few fixed shapes — 2 (decode), then
 /// multiples of 8 up to 32, then multiples of 32 — and the padding rows are
 /// ignored on the way out.
+/// `CASCADIA_INKLING_OV_PERF=1`: compile the device graphs with per-primitive
+/// profiling and account, per call, the time inside `infer()` and the time the
+/// DEVICE spent executing. Wall minus device time is when the GPU sat idle
+/// (host-side shape inference, argument setting, submission, copies): the
+/// number that says whether a second frame could use the device meanwhile.
+/// A diagnostic: profiling itself costs a little, so set it on one rank.
+pub(crate) fn ov_perf() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("CASCADIA_INKLING_OV_PERF").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Device execution time of the last `infer()` (sum over primitives), ns.
+pub(crate) fn device_ns(rt: &Runtime) -> u64 {
+    rt.profiling()
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split('\t').nth(3)?.parse::<u64>().ok())
+        .sum::<u64>()
+        * 1000
+}
+
+/// `CASCADIA_INKLING_OV_MOE_DECODE_DIR`: folder (next to `moe_ov/`) of layers
+/// that run through the plugin's decode kernels.
+fn decode_dir_name() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static D: OnceLock<Option<String>> = OnceLock::new();
+    D.get_or_init(|| {
+        std::env::var("CASCADIA_INKLING_OV_MOE_DECODE_DIR")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty() && !v.contains('/') && !v.contains(".."))
+    })
+    .as_deref()
+}
+
+/// `CASCADIA_INKLING_OV_MOE_DECODE_LAYERS` (`all` or a comma list): layers
+/// that take the plugin's decode kernels from their ordinary group-32 IR.
+/// That needs a plugin whose MoE kernels run with sub-group 16 on this GPU
+/// (Xe2 and newer default to 32, which refuses group 32: autolab 026, 029).
+fn decode_layer_listed(lid: u32) -> bool {
+    let (all, list) = decode_layer_list();
+    *all || list.contains(&lid)
+}
+
+/// Whether any layer is listed (the per-layer plugin knob must then be set
+/// for every layer this process compiles, listed or not).
+fn decode_layers_configured() -> bool {
+    let (all, list) = decode_layer_list();
+    *all || !list.is_empty()
+}
+
+fn decode_layer_list() -> &'static (bool, Vec<u32>) {
+    use std::sync::OnceLock;
+    static L: OnceLock<(bool, Vec<u32>)> = OnceLock::new();
+    L.get_or_init(|| {
+        let v = std::env::var("CASCADIA_INKLING_OV_MOE_DECODE_LAYERS").unwrap_or_default();
+        let v = v.trim();
+        (
+            v.eq_ignore_ascii_case("all"),
+            v.split(',').filter_map(|t| t.trim().parse().ok()).collect(),
+        )
+    })
+}
+
+/// `CASCADIA_INKLING_OV_MOE_DECODE_ROWS` (default 1): calls of at most this
+/// many rows take the decode kernels on a decode layer, unpadded. They read
+/// at the bus limit but share no expert between rows: measured equal to the
+/// prefill path at two rows and slower beyond (026), so one row by default.
+fn decode_rows() -> usize {
+    use std::sync::OnceLock;
+    static R: OnceLock<usize> = OnceLock::new();
+    *R.get_or_init(|| {
+        std::env::var("CASCADIA_INKLING_OV_MOE_DECODE_ROWS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 32)
+    })
+}
+
 pub(crate) fn bucket_rows(rows: usize) -> usize {
-    match rows {
-        0..=2 => 2,
-        3..=32 => rows.div_ceil(8) * 8,
-        _ => rows.div_ceil(32) * 32,
+    if rows > 32 {
+        return rows.div_ceil(32) * 32;
     }
+    small_buckets()
+        .iter()
+        .copied()
+        .find(|&b| b >= rows)
+        .unwrap_or(32)
+}
+
+/// The row counts (<= 32) device calls are padded to. Default `2,8,16,24,32`:
+/// a one-row call used to crash the plugin's decode kernel (its 32-bit expert
+/// offset, see autolab 022), so decode was padded to two rows. With a fixed
+/// plugin `CASCADIA_INKLING_OV_BUCKETS=1,2,4,8,16,24,32` lets a frame of one
+/// row read one row's experts, and a frame of three pad to four, not eight.
+fn small_buckets() -> &'static [usize] {
+    use std::sync::OnceLock;
+    static B: OnceLock<Vec<usize>> = OnceLock::new();
+    B.get_or_init(|| {
+        let mut v: Vec<usize> = std::env::var("CASCADIA_INKLING_OV_BUCKETS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|t| t.trim().parse().ok())
+                    .filter(|&b| (1..=32).contains(&b))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if v.is_empty() {
+            v = vec![2, 8, 16, 24, 32];
+        }
+        v.sort_unstable();
+        v.dedup();
+        if v.last() != Some(&32) {
+            v.push(32);
+        }
+        v
+    })
 }
 
 fn f32_bytes(v: &[f32]) -> &[u8] {
@@ -97,9 +211,42 @@ pub struct OvMoeStats {
     pub calls: u64,
     pub rows: u64,
     pub call_ns: u64,
+    /// With `CASCADIA_INKLING_OV_PERF=1`: time inside `infer()` and time the
+    /// device executed, of `call_ns`.
+    pub infer_ns: u64,
+    pub device_ns: u64,
     pub compiles: u64,
     pub compile_ns: u64,
     pub fallbacks: u64,
+    /// Calls whose output held a NaN or infinity (half-precision overflow on
+    /// the device) and were handed to the other expert path; part of `fallbacks`.
+    pub nonfinite: u64,
+}
+
+/// `CASCADIA_INKLING_OV_MOE_WEIGHT_RESCALE` (default on): divide each row's
+/// routing weights by a power of two before the device call and multiply the
+/// row's output back on the host. Inkling's routing weights sum to
+/// `8 * mlp.gate.global_scale`, which grows with depth (about 100 per weight at
+/// layer 40): at the plugin's f16 the weighted sum of expert outputs passes
+/// 65504 and the layer returns infinities, then NaN logits (the fleet printed
+/// `!!!!`). A power of two changes no mantissa bit, so the result equals the
+/// unscaled one wherever that one was finite.
+fn weight_rescale() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("CASCADIA_INKLING_OV_MOE_WEIGHT_RESCALE")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// Smallest power of two >= `v` (1 for anything at or below 1, or not finite).
+fn pow2_ceil(v: f32) -> f32 {
+    if !v.is_finite() || v <= 1.0 {
+        return 1.0;
+    }
+    2.0f32.powi(v.log2().ceil() as i32)
 }
 
 pub struct OvMoe {
@@ -122,9 +269,18 @@ pub struct OvMoe {
     calls: AtomicU64,
     rows: AtomicU64,
     call_ns: AtomicU64,
+    infer_ns: AtomicU64,
+    device_ns: AtomicU64,
     compiles: AtomicU64,
     compile_ns: AtomicU64,
     fallbacks: AtomicU64,
+    nonfinite: AtomicU64,
+    /// Per layer: what the device's output must be multiplied by. A layer
+    /// generated with `--up-scale-exponent N` (its `cascadia_moe.json` says so)
+    /// returns `y * 2^-N`, which keeps an expert whose own output passes f16's
+    /// range finite on the device (Inkling layer 8's shared expert reaches
+    /// -94909); 1.0 for every other layer.
+    out_scale: Mutex<HashMap<u32, f32>>,
 }
 
 impl OvMoe {
@@ -214,6 +370,9 @@ impl OvMoe {
         let precision =
             std::env::var("CASCADIA_INKLING_OV_MOE_PRECISION").unwrap_or_else(|_| "f32".into());
         let mut plugin = PluginConfig::new().with("INFERENCE_PRECISION_HINT", precision);
+        if ov_perf() {
+            plugin = plugin.with("PERF_COUNT", "YES");
+        }
         match &offload {
             Some(r) => {
                 plugin = plugin.with("OFFLOAD_RATIO", r.clone());
@@ -248,9 +407,13 @@ impl OvMoe {
             calls: AtomicU64::new(0),
             rows: AtomicU64::new(0),
             call_ns: AtomicU64::new(0),
+            infer_ns: AtomicU64::new(0),
+            device_ns: AtomicU64::new(0),
             compiles: AtomicU64::new(0),
             compile_ns: AtomicU64::new(0),
             fallbacks: AtomicU64::new(0),
+            nonfinite: AtomicU64::new(0),
+            out_scale: Mutex::new(HashMap::new()),
         }
     }
 
@@ -279,16 +442,83 @@ impl OvMoe {
             calls: self.calls.load(Ordering::Relaxed),
             rows: self.rows.load(Ordering::Relaxed),
             call_ns: self.call_ns.load(Ordering::Relaxed),
+            infer_ns: self.infer_ns.load(Ordering::Relaxed),
+            device_ns: self.device_ns.load(Ordering::Relaxed),
             compiles: self.compiles.load(Ordering::Relaxed),
             compile_ns: self.compile_ns.load(Ordering::Relaxed),
             fallbacks: self.fallbacks.load(Ordering::Relaxed),
+            nonfinite: self.nonfinite.load(Ordering::Relaxed),
         }
     }
 
+    /// `2^N` for a layer generated with `--up-scale-exponent N`, else 1.
+    fn layer_out_scale(&self, lid: u32) -> f32 {
+        if let Some(&f) = self.out_scale.lock().unwrap().get(&lid) {
+            return f;
+        }
+        let side = self.layer_dir(lid).join("cascadia_moe.json");
+        let n = std::fs::read_to_string(&side)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| v.get("up_scale_exponent").and_then(|e| e.as_u64()))
+            .filter(|&n| n <= 16)
+            .unwrap_or(0);
+        let f = 2.0f32.powi(n as i32);
+        if n > 0 {
+            tracing::info!(
+                target: "cascadia::inkling",
+                event = "ov_moe_up_scale",
+                layer = lid,
+                exponent = n,
+            );
+        }
+        self.out_scale.lock().unwrap().insert(lid, f);
+        f
+    }
+
     fn xml(&self, lid: u32) -> PathBuf {
-        self.dir
-            .join(format!("layer_{lid:02}"))
-            .join("openvino_model.xml")
+        self.layer_dir(lid).join("openvino_model.xml")
+    }
+
+    /// The folder of `lid`'s IR. `CASCADIA_INKLING_OV_MOE_DECODE_DIR=moe_ov_g64`
+    /// names a sibling of `moe_ov/` holding the same layers re-quantised to a
+    /// wider int4 group (run.sh writes them when `CASCADIA_FUSE_GROUP` asks):
+    /// the GPU plugin's MoE decode kernels (batched GEMV: three kernels and no
+    /// host synchronisation per call) refuse group 32 on Xe2 and newer. A
+    /// layer found there is compiled with the decode threshold ON, every other
+    /// layer keeps the prefill path, so one rank can run both side by side.
+    fn layer_dir(&self, lid: u32) -> PathBuf {
+        if let Some(alt) = decode_dir_name() {
+            if let Some(parent) = self.dir.parent() {
+                let d = parent.join(alt).join(format!("layer_{lid:02}"));
+                if d.join("openvino_model.xml").is_file() {
+                    return d;
+                }
+            }
+        }
+        self.dir.join(format!("layer_{lid:02}"))
+    }
+
+    /// Whether `lid` runs from the re-quantised folder (see [`Self::layer_dir`]).
+    pub fn is_regrouped(&self, lid: u32) -> bool {
+        decode_dir_name().is_some()
+            && self.layer_dir(lid) != self.dir.join(format!("layer_{lid:02}"))
+    }
+
+    /// Whether `lid`'s small calls take the plugin's decode kernels: a layer
+    /// from the re-quantised folder, or one listed in
+    /// `CASCADIA_INKLING_OV_MOE_DECODE_LAYERS`.
+    pub fn uses_decode_kernels(&self, lid: u32) -> bool {
+        self.is_regrouped(lid) || decode_layer_listed(lid)
+    }
+
+    /// Rows a call of `rows` rows is padded to on layer `lid`.
+    fn padded_rows(&self, lid: u32, rows: usize) -> usize {
+        if rows <= decode_rows() && self.uses_decode_kernels(lid) {
+            rows
+        } else {
+            bucket_rows(rows)
+        }
     }
 
     /// Whether an IR exists for layer `lid`.
@@ -317,6 +547,21 @@ impl OvMoe {
             // The offload path streams experts from the IR's weights file.
             let bin = xml.with_extension("bin");
             plugin = plugin.with("WEIGHTS_PATH", bin.to_string_lossy().to_string());
+        }
+        // The plugin reads this knob from the process environment when it
+        // builds a model: set per layer, under the layer-table lock.
+        // (The plugin turns 0 into 1: a one-row call takes the decode kernels
+        // on every layer, which is why other layers pad one row to two.)
+        let decode = self.uses_decode_kernels(lid);
+        let threshold = if decode {
+            decode_rows().to_string()
+        } else {
+            "0".to_string()
+        };
+        if std::env::var("OV_GPU_MOE_BATCHED_GEMV_THRESHOLD").as_deref() != Ok(threshold.as_str())
+            && (decode || decode_dir_name().is_some() || decode_layers_configured())
+        {
+            set_process_env("OV_GPU_MOE_BATCHED_GEMV_THRESHOLD", &threshold);
         }
         let t0 = Instant::now();
         match Runtime::compile(p, &self.device, &plugin) {
@@ -366,12 +611,24 @@ impl OvMoe {
         // The first call at a row count pays the plugin's kernel setup for
         // that shape (~140 ms for the padded decode shape on the B390); take
         // the decode bucket and the smallest prefill bucket here.
-        let ids: Vec<i32> = (0..k as i32).collect();
-        ok &= self.forward(lid, &x, 1, &ids, &w).is_some();
-        let x8 = vec![0.0f32; 8 * self.hidden];
-        let ids8: Vec<i32> = ids.iter().copied().cycle().take(8 * k).collect();
-        let w8 = vec![0.0f32; 8 * k];
-        ok &= self.forward(lid, &x8, 8, &ids8, &w8).is_some();
+        // On the HIGHEST ids: the plugin's decode kernels overflow a 32-bit
+        // expert offset from id 228 on (autolab 022); a plugin that does must
+        // fail here, while the rank loads, not inside the first request.
+        let ids: Vec<i32> = (self.n_experts.saturating_sub(k)..self.n_experts)
+            .map(|e| e as i32)
+            .collect();
+        let mut shapes: Vec<usize> = small_buckets().iter().copied().filter(|&b| b <= 8).collect();
+        if self.uses_decode_kernels(lid) {
+            shapes.extend(1..=decode_rows());
+            shapes.sort_unstable();
+            shapes.dedup();
+        }
+        for b in shapes {
+            let xb = vec![0.0f32; b * self.hidden];
+            let idsb: Vec<i32> = ids.iter().copied().cycle().take(b * k).collect();
+            let wb = vec![0.0f32; b * k];
+            ok &= self.forward(lid, &xb, b, &idsb, &wb).is_some();
+        }
         // Warm-up calls are not benchmark calls.
         self.calls.store(before.0, Ordering::Relaxed);
         self.rows.store(before.1, Ordering::Relaxed);
@@ -402,9 +659,31 @@ impl OvMoe {
             return None;
         };
         let t0 = Instant::now();
+        // Keep the device's weighted sum inside half precision: per row, the
+        // routing weights go down by a power of two and the output comes back
+        // up by it on the host (see `weight_rescale`).
+        let row_scale: Vec<f32> = if weight_rescale() {
+            weights
+                .chunks_exact(self.k_total)
+                .map(|w| pow2_ceil(w.iter().map(|v| v.abs()).sum()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let scaled_w: Vec<f32>;
+        let weights = if row_scale.iter().any(|&f| f != 1.0) {
+            scaled_w = weights
+                .chunks_exact(self.k_total)
+                .zip(&row_scale)
+                .flat_map(|(w, &f)| w.iter().map(move |v| v / f))
+                .collect();
+            &scaled_w[..]
+        } else {
+            weights
+        };
         // Pad to the shape bucket: copies of the last row with zero weights
         // (the kernel still touches their experts, which are the same ones).
-        let prow = bucket_rows(rows);
+        let prow = self.padded_rows(lid, rows);
         let (xs_p, ids_p, w_p);
         let (xs, ids, weights) = if prow != rows {
             let h = self.hidden;
@@ -447,7 +726,16 @@ impl OvMoe {
                     )
                     .map_err(|e| format!("set_input routing_weights: {e}"))
                 })
-                .and_then(|_| rt.infer().map_err(|e| format!("infer: {e}")));
+                .and_then(|_| {
+                    let t_infer = Instant::now();
+                    let r = rt.infer().map_err(|e| format!("infer: {e}"));
+                    if ov_perf() {
+                        self.infer_ns
+                            .fetch_add(t_infer.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        self.device_ns.fetch_add(device_ns(&rt), Ordering::Relaxed);
+                    }
+                    r
+                });
             if let Err(why) = step {
                 // Not latched (a device-side error can be transient), but said
                 // once per layer so a benchmark cannot silently fall back.
@@ -502,15 +790,39 @@ impl OvMoe {
             self.fallbacks.fetch_add(1, Ordering::Relaxed);
             return None;
         }
+        let mut out = out;
+        out.truncate(rows * self.hidden);
+        // An expert's own output can still pass 65504 on the device (seen on a
+        // shared expert of layer 8: -94909): that call goes to the other
+        // expert path instead of poisoning the residual stream with NaN.
+        if out.iter().any(|v| !v.is_finite()) {
+            self.nonfinite.fetch_add(1, Ordering::Relaxed);
+            self.fallbacks.fetch_add(1, Ordering::Relaxed);
+            self.note_call_failure(lid, "non-finite output (half-precision overflow)");
+            return None;
+        }
+        let layer_scale = self.layer_out_scale(lid);
+        if row_scale.is_empty() {
+            if layer_scale != 1.0 {
+                for v in out.iter_mut() {
+                    *v *= layer_scale;
+                }
+            }
+        } else {
+            for (row, &f) in out.chunks_exact_mut(self.hidden).zip(&row_scale) {
+                let f = f * layer_scale;
+                if f != 1.0 {
+                    for v in row {
+                        *v *= f;
+                    }
+                }
+            }
+        }
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.rows.fetch_add(rows as u64, Ordering::Relaxed);
         self.call_ns
             .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        Some(if prow != rows {
-            out[..rows * self.hidden].to_vec()
-        } else {
-            out
-        })
+        Some(out)
     }
 
     fn note_call_failure(&self, lid: u32, why: &str) {
@@ -540,6 +852,12 @@ impl OvMoe {
     /// layer routes `layer_k` (`top_k + n_shared`): the IR can never serve this
     /// layer, so latch it unusable — it then shows in [`Self::failed_layers`],
     /// so `--warm-ov` reports it FAILED — and report it once, like any bad IR.
+    /// Take `lid` off the device for good, with the reason (a load-time check
+    /// failed): its rows go to the host kernels from now on.
+    pub fn fail_layer(&self, lid: u32, why: &str) {
+        self.mark_failed(lid, why);
+    }
+
     pub fn mark_k_mismatch(&self, lid: u32, layer_k: usize) {
         self.mark_failed(
             lid,
@@ -573,5 +891,27 @@ impl std::fmt::Debug for OvMoe {
             .field("hidden", &self.hidden)
             .field("k_total", &self.k_total)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod rescale_tests {
+    #[test]
+    fn weight_rescale_factor_is_an_exact_power_of_two() {
+        use super::pow2_ceil;
+        assert_eq!(pow2_ceil(0.0), 1.0);
+        assert_eq!(pow2_ceil(0.7), 1.0);
+        assert_eq!(pow2_ceil(1.0), 1.0);
+        assert_eq!(pow2_ceil(1.5), 2.0);
+        assert_eq!(pow2_ceil(800.0), 1024.0);
+        assert_eq!(pow2_ceil(1024.0), 1024.0);
+        assert_eq!(pow2_ceil(f32::NAN), 1.0);
+        assert_eq!(pow2_ceil(f32::INFINITY), 1.0);
+        // Dividing a weight by the factor and multiplying the product back is
+        // exact: only the exponent moves.
+        for &(w, y) in &[(97.3f32, 1873.25f32), (105.0, -0.0371), (3.1e-3, 4.2e2)] {
+            let f = pow2_ceil(800.0);
+            assert_eq!((w / f) * y * f, w * y);
+        }
     }
 }

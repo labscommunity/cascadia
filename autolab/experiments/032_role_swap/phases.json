@@ -1,0 +1,42 @@
+[
+ {
+  "phase": "mix15a",
+  "streams": 15,
+  "tokens_req": 128,
+  "prompt_words": 0,
+  "start": 1789962990.12715,
+  "end": 1789963079.7285068,
+  "wall_s": 89.6,
+  "completed": 15,
+  "tokens": 1920,
+  "aggregate_tok_s": 21.428,
+  "sum_stream_tok_s": 23.638,
+  "ttft_mean_s": 7.75,
+  "ttft_max_s": 11.35,
+  "errors": [],
+  "sample": "<think>The user wants an explanation of coral reefs suitable for a curious ten-year-old, in one shor",
+  "stream_tok_s_min": 1.525,
+  "stream_tok_s_median": 1.566,
+  "ttft_median_s": 7.22
+ },
+ {
+  "phase": "mix15b",
+  "streams": 15,
+  "tokens_req": 128,
+  "prompt_words": 0,
+  "start": 1789963091.7344892,
+  "end": 1789963177.509274,
+  "wall_s": 85.8,
+  "completed": 15,
+  "tokens": 1920,
+  "aggregate_tok_s": 22.384,
+  "sum_stream_tok_s": 24.634,
+  "ttft_mean_s": 7.14,
+  "ttft_max_s": 10.73,
+  "errors": [],
+  "sample": "<think>The user wants an explanation of electric cars for a curious ten-year-old, in one short parag",
+  "stream_tok_s_min": 1.587,
+  "stream_tok_s_median": 1.628,
+  "ttft_median_s": 6.39
+ }
+]
