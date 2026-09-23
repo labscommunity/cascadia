@@ -42,6 +42,9 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
+#include <sys/vfs.h>
+#include <linux/magic.h>
 #include <unistd.h>
 
 #define PAGE 4096UL
@@ -112,6 +115,8 @@ static void do_init(void) {
     const char *v;
     if ((v = getenv("ELASTIC_MIN_MB")) && atol(v) > 0)
         g_threshold = (size_t)atol(v) << 20;
+    if ((v = getenv("ELASTIC_MIN_KB")) && atol(v) > 0)   /* sub-MB research knob */
+        g_threshold = (size_t)atol(v) << 10;
     if ((v = getenv("ELASTIC_DIR")) && *v) g_dir = v;
     else if ((v = getenv("TMPDIR")) && *v) g_dir = v;
     g_pool_cap = 8UL << 30;
@@ -119,6 +124,18 @@ static void do_init(void) {
         g_pool_cap = (size_t)atol(v) << 20;
     g_log = (v = getenv("ELASTIC_LOG")) && *v == '1';
     g_mmap_on = !((v = getenv("ELASTIC_MMAP")) && *v == '0');
+    /* Fail-loud guard: on tmpfs/ramfs the written pages can never reach a
+     * disk, so the posture silently gives no survival benefit under a
+     * memory cap (measured: dies at the same caps as stock while RssAnon
+     * still collapses). A user who asked for --elastic deserves the warn. */
+    struct statfs st;
+    if (statfs(g_dir, &st) == 0
+        && (st.f_type == TMPFS_MAGIC || st.f_type == RAMFS_MAGIC))
+        fprintf(stderr,
+                "cascadia: elastic WARNING: backing dir %s is on tmpfs/ramfs —"
+                " pages cannot be written back, so --elastic gives NO OOM"
+                " protection. Point ELASTIC_DIR at a disk-backed dir"
+                " (ext4/xfs).\n", g_dir);
 }
 static inline void ensure_init(void) { pthread_once(&init_once, do_init); }
 
@@ -161,13 +178,18 @@ static int pool_put(void *base, size_t total, int fd) {
     pthread_mutex_unlock(&g_pool_mu);
     return 0;
 }
+/* Pooled mappings hold no fd: the unlinked O_TMPFILE inode stays alive
+ * through the MAP_SHARED mapping alone, so a pool slot never leaks an fd
+ * and sub-MB thresholds (thousands of live mappings) can't hit EMFILE.
+ * big_alloc2 must therefore open a fresh tmpfile per allocation — the fd
+ * is closed immediately after mmap in every path. */
 
 static void *big_alloc2(size_t size, int want_zero) {
     size_t total = PAGE + ((size + PAGE - 1) & ~(PAGE - 1));
     void *base = pool_take(total);
     if (base) {                          /* reuse WITHOUT zeroing (D-015) */
         hdr_t *h = (hdr_t *)base;
-        h->magic = MAGIC;                /* total + fd survive in the header */
+        h->magic = MAGIC;                /* total survives in the header */
         h->user_size = size;
         if (want_zero) memset((char *)base + PAGE, 0, size);
         atomic_fetch_add(&n_big, 1);
@@ -179,8 +201,9 @@ static void *big_alloc2(size_t size, int want_zero) {
     if (ftruncate(fd, (off_t)total) != 0) { close(fd); return NULL; }
     base = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (base == MAP_FAILED) { close(fd); atomic_fetch_add(&n_fallback, 1); return NULL; }
+    close(fd);                           /* mapping holds the inode; no fd kept */
     hdr_t *h = (hdr_t *)base;
-    h->magic = MAGIC; h->user_size = size; h->total = total; h->fd = fd;
+    h->magic = MAGIC; h->user_size = size; h->total = total; h->fd = -1;
     atomic_fetch_add(&n_big, 1);
     atomic_fetch_add(&n_big_bytes, size);
     return (char *)base + PAGE;
@@ -200,13 +223,13 @@ static hdr_t *big_hdr(void *p) {
 static void *big_alloc(size_t size) { return big_alloc2(size, 0); }
 
 static void big_free(hdr_t *h) {
-    int fd = h->fd;
+    int fd = h->fd;                      /* -1 in the fd-free pool design */
     size_t total = h->total;
     h->magic = 0;                    /* total+fd stay for pooled reuse */
     atomic_fetch_add(&n_free_big, 1);
     if (pool_put(h, total, fd)) return;
     munmap(h, total);
-    close(fd);
+    if (fd >= 0) close(fd);
 }
 
 /* ---- interposed API ---- */
@@ -304,16 +327,19 @@ void *valloc(size_t size) { return memalign(PAGE, size); }
  * tracking. Fresh sparse file pages read as zeros — MAP_ANONYMOUS's
  * zero-on-first-touch semantics are preserved.
  * Interposed only when: addr==NULL, writable, non-exec, anonymous+private,
- * no MAP_FIXED/MAP_STACK/HUGETLB, and len >= threshold. ELASTIC_MMAP=0 off. */
+ * no MAP_FIXED/MAP_STACK/HUGETLB, and len >= threshold (the fd argument is
+ * ignored by the kernel for anonymous mappings, so any value passes).
+ * ELASTIC_MMAP=0 disables the leg. */
 #include <sys/syscall.h>
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
+    ensure_init();
     if (g_in_init || !real_mmap)
         return (void *)syscall(SYS_mmap, addr, len, prot, flags, fd, off);
     if (g_mmap_on && addr == NULL && len >= g_threshold
         && (prot & PROT_WRITE) && !(prot & PROT_EXEC)
         && (flags & MAP_ANONYMOUS) && !(flags & MAP_SHARED)
         && !(flags & (MAP_FIXED | MAP_FIXED_NOREPLACE | MAP_STACK
-                      | MAP_HUGETLB | MAP_SYNC)) && fd == -1) {
+                      | MAP_HUGETLB | MAP_SYNC))) {
         int tf = open(g_dir, O_TMPFILE | O_RDWR | O_EXCL, 0600);
         if (tf >= 0) {
             if (ftruncate(tf, (off_t)len) == 0) {
