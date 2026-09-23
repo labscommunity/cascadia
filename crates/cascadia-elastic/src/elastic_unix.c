@@ -61,13 +61,17 @@ static void *(*real_realloc)(void *, size_t);
 static void *(*real_aligned_alloc)(size_t, size_t);
 static int   (*real_posix_memalign)(void **, size_t, size_t);
 static void *(*real_memalign)(size_t, size_t);
+static void *(*real_mmap)(void *, size_t, int, int, int, off_t);
+static volatile int g_in_init;
 
 static size_t g_threshold = 1UL << 20;
 static const char *g_dir = "/tmp";
 static int g_log = 0;
+static int g_mmap_on = 1;              /* ELASTIC_MMAP=0 disables the mmap leg */
 
 static _Atomic uint64_t n_big, n_big_bytes, n_free_big, n_fallback;
 static _Atomic uint64_t n_pool_hit, n_pool_put;
+static _Atomic uint64_t n_mmap, n_mmap_bytes, n_mmap_fb;
 
 /* ---- retention pool: freed mappings kept mapped for zero-cost reuse.
  * Fixed-size table; first-fit with a <=2x waste bound. All entries stay
@@ -95,6 +99,7 @@ static void *boot_alloc(size_t sz) {
 
 static pthread_once_t init_once = PTHREAD_ONCE_INIT;
 static void do_init(void) {
+    g_in_init = 1;
     real_malloc         = dlsym(RTLD_NEXT, "malloc");
     real_free           = dlsym(RTLD_NEXT, "free");
     real_calloc         = dlsym(RTLD_NEXT, "calloc");
@@ -102,6 +107,8 @@ static void do_init(void) {
     real_aligned_alloc  = dlsym(RTLD_NEXT, "aligned_alloc");
     real_posix_memalign = dlsym(RTLD_NEXT, "posix_memalign");
     real_memalign       = dlsym(RTLD_NEXT, "memalign");
+    real_mmap           = dlsym(RTLD_NEXT, "mmap");
+    g_in_init = 0;
     const char *v;
     if ((v = getenv("ELASTIC_MIN_MB")) && atol(v) > 0)
         g_threshold = (size_t)atol(v) << 20;
@@ -111,6 +118,7 @@ static void do_init(void) {
     if ((v = getenv("ELASTIC_POOL_MB")) && atol(v) >= 0)
         g_pool_cap = (size_t)atol(v) << 20;
     g_log = (v = getenv("ELASTIC_LOG")) && *v == '1';
+    g_mmap_on = !((v = getenv("ELASTIC_MMAP")) && *v == '0');
 }
 static inline void ensure_init(void) { pthread_once(&init_once, do_init); }
 
@@ -287,15 +295,58 @@ void *memalign(size_t align, size_t size) {
 
 void *valloc(size_t size) { return memalign(PAGE, size); }
 
+/* ---- mmap leg: large MAP_ANONYMOUS|MAP_PRIVATE scratch bypasses malloc
+ * entirely (oneDNN compiled-graph scratch does this), so the malloc hook
+ * never sees it and it stays anonymous — the measured C1 floor leak. Serve
+ * those mappings from the same O_TMPFILE pool: map the tmpfile MAP_SHARED
+ * and close the fd immediately (the mapping holds the reference; the
+ * unlinked inode dies with the mapping), so munmap/mremap/madvise need no
+ * tracking. Fresh sparse file pages read as zeros — MAP_ANONYMOUS's
+ * zero-on-first-touch semantics are preserved.
+ * Interposed only when: addr==NULL, writable, non-exec, anonymous+private,
+ * no MAP_FIXED/MAP_STACK/HUGETLB, and len >= threshold. ELASTIC_MMAP=0 off. */
+#include <sys/syscall.h>
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
+    if (g_in_init || !real_mmap)
+        return (void *)syscall(SYS_mmap, addr, len, prot, flags, fd, off);
+    if (g_mmap_on && addr == NULL && len >= g_threshold
+        && (prot & PROT_WRITE) && !(prot & PROT_EXEC)
+        && (flags & MAP_ANONYMOUS) && !(flags & MAP_SHARED)
+        && !(flags & (MAP_FIXED | MAP_FIXED_NOREPLACE | MAP_STACK
+                      | MAP_HUGETLB | MAP_SYNC)) && fd == -1) {
+        int tf = open(g_dir, O_TMPFILE | O_RDWR | O_EXCL, 0600);
+        if (tf >= 0) {
+            if (ftruncate(tf, (off_t)len) == 0) {
+                void *p = real_mmap(NULL, len, PROT_READ | PROT_WRITE,
+                                    MAP_SHARED, tf, 0);
+                close(tf);              /* mapping holds the reference */
+                if (p != MAP_FAILED) {
+                    atomic_fetch_add(&n_mmap, 1);
+                    atomic_fetch_add(&n_mmap_bytes, len);
+                    return p;
+                }
+            } else {
+                close(tf);
+            }
+        }
+        atomic_fetch_add(&n_mmap_fb, 1);
+    }
+    return real_mmap(addr, len, prot, flags, fd, off);
+}
+
 __attribute__((destructor)) static void report(void) {
     if (!g_log) return;
     fprintf(stderr,
-            "[elastic] big_allocs=%llu (%.1f MB total) big_frees=%llu pool_hits=%llu pool_puts=%llu fallbacks=%llu threshold=%zuMB dir=%s\n",
+            "[elastic] big_allocs=%llu (%.1f MB total) big_frees=%llu pool_hits=%llu pool_puts=%llu fallbacks=%llu threshold=%zuMB dir=%s\n"
+            "[elastic] mmap_leg=%llu (%.1f MB) mmap_fallbacks=%llu\n",
             (unsigned long long)n_big,
             (double)n_big_bytes / 1048576.0,
             (unsigned long long)n_free_big,
             (unsigned long long)n_pool_hit,
             (unsigned long long)n_pool_put,
             (unsigned long long)n_fallback,
-            g_threshold >> 20, g_dir);
+            g_threshold >> 20, g_dir,
+            (unsigned long long)n_mmap,
+            (double)n_mmap_bytes / 1048576.0,
+            (unsigned long long)n_mmap_fb);
 }
