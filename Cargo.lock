@@ -271,6 +271,7 @@ dependencies = [
  "cascadia-api",
  "cascadia-dashboard",
  "cascadia-discovery",
+ "cascadia-elastic",
  "cascadia-engine",
  "cascadia-engine-mock",
  "cascadia-engine-openvino",
@@ -339,6 +340,14 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "cascadia-elastic"
+version = "0.1.7"
+dependencies = [
+ "cc",
+ "libc",
 ]
 
 [[package]]
