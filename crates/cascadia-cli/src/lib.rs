@@ -2170,6 +2170,24 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         {
             cfg.max_concurrent_requests = n;
         }
+        // `CASCADIA_API_MAX_PROMPT_BYTES` / `CASCADIA_API_MAX_BODY_BYTES`: the
+        // prompt and body caps (defaults 32 KiB / 64 KiB, sized for chat; a
+        // long-context deployment raises them together with the engine's
+        // context budget, see `CASCADIA_INKLING_MAX_SEQ`).
+        if let Some(n) = std::env::var("CASCADIA_API_MAX_PROMPT_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+        {
+            cfg.max_prompt_bytes = n;
+        }
+        if let Some(n) = std::env::var("CASCADIA_API_MAX_BODY_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+        {
+            cfg.max_body_bytes = n.max(cfg.max_prompt_bytes + 4096);
+        }
         let max_concurrent = cfg.max_concurrent_requests as u64;
         // Shared live counters: the API bumps them on the chat hot path,
         // the dashboard's /api/stats reads them — same Arc, so the cluster

@@ -314,6 +314,32 @@ impl Layer {
     /// Make sequence `slot` the live one for every stateful part of this
     /// layer (O(1) swaps); `reset` / `truncate` / `forward_token` /
     /// `forward_prefill` then act on that sequence.
+    /// Context probe: the live slot's attention cache filled to `n`
+    /// positions (bytes written), see `AttentionLayer::fill_synthetic`.
+    pub(crate) fn probe_fill(&mut self, n: usize) -> usize {
+        self.attn.fill_synthetic(n)
+    }
+
+    /// Context probe: the live slot back at `n` positions (convs reset, the
+    /// attention rows kept).
+    pub(crate) fn probe_rewind(&mut self, n: usize) {
+        self.attn.probe_set_len(n);
+        self.attn_sconv.reset();
+        self.mlp_sconv.reset();
+    }
+
+    /// Context probe: the live slot's cache pages given back, convs reset.
+    pub(crate) fn probe_release(&mut self) {
+        self.attn.release_cache();
+        self.attn_sconv.reset();
+        self.mlp_sconv.reset();
+    }
+
+    /// Bytes a sequence of `n` positions writes into this layer's cache.
+    pub(crate) fn probe_cache_bytes(&self, n: usize) -> usize {
+        self.attn.cache_bytes_for(n)
+    }
+
     pub fn select_slot(&mut self, slot: usize) {
         self.attn.select(slot);
         self.attn_sconv.select(slot);

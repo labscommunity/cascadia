@@ -490,6 +490,66 @@ impl AttentionLayer {
     /// Route the five projections through an OpenVINO backend (see
     /// [`super::ov_attn`]); `layer` is the global layer index its IRs are
     /// filed under.
+    /// Context probe (`CASCADIA_INKLING_CONTEXT_BENCH`): make the LIVE slot
+    /// look like a sequence of `n` positions. Every cache row a decode at
+    /// position `n` would read is written with small pseudo-random values
+    /// (so the pages are really resident and the softmax is not degenerate);
+    /// `len` and `hwm` become `n`. Bytes written = what a real sequence of
+    /// `n` positions costs this layer. Not for inference: the contents mean
+    /// nothing. Returns the bytes written.
+    pub(crate) fn fill_synthetic(&mut self, n: usize) -> usize {
+        let d = self.dims.head_dim;
+        let hkv = self.dims.n_kv_heads;
+        let rows = self.rows;
+        let filled = n.min(rows);
+        let first = n - filled; // sliding: only the last `rows` positions exist
+        let mut x: u32 = 0x9E37_79B9 ^ n as u32;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        let mut written = 0usize;
+        for h in 0..hkv {
+            for p in first..n {
+                let slot = p % rows;
+                let off = (h * rows + slot) * d;
+                for i in 0..d {
+                    self.k[off + i] = next() * 0.5;
+                    self.v[off + i] = next() * 0.5;
+                }
+                written += 2 * d * 4;
+            }
+        }
+        self.len = n;
+        self.hwm = n;
+        written
+    }
+
+    /// Context probe: the live slot back at `n` positions without rewriting
+    /// its rows (a decode advanced it by one; the rows are still there).
+    pub(crate) fn probe_set_len(&mut self, n: usize) {
+        self.len = n;
+        self.hwm = n;
+    }
+
+    /// Give the live slot's cache pages back to the system (after a probe
+    /// touched them): the buffers are replaced by fresh zeroed ones, which
+    /// the allocator maps lazily, and the old ones are freed. State: reset.
+    pub(crate) fn release_cache(&mut self) {
+        let n = self.k.len();
+        self.k = vec![0.0; n];
+        self.v = vec![0.0; n];
+        self.len = 0;
+        self.hwm = 0;
+    }
+
+    /// Bytes a sequence of `n` positions writes into this layer's cache.
+    pub(crate) fn cache_bytes_for(&self, n: usize) -> usize {
+        2 * self.dims.n_kv_heads * n.min(self.rows) * self.dims.head_dim * 4
+    }
+
     pub fn attach_ov(&mut self, layer: u32, ov: std::sync::Arc<super::ov_attn::OvAttn>) {
         self.ov = Some((layer, ov));
     }
