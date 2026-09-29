@@ -123,6 +123,15 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     results, t_start = [], time.time()
     rates = []   # measured prefill tok/s
+    out_path = os.path.join(out_dir, "context_scan.json")
+
+    def save(note=""):
+        # after EVERY size: if a box dies mid-scan, what was measured before it is on disk already
+        json.dump(dict(exp=a.exp, sizes=sizes, budget_s=a.budget_s, new_tokens=a.new_tokens, results=results,
+                       wall_s=round(time.time() - t_start), note=note), open(out_path + ".tmp", "w"), indent=1)
+        os.replace(out_path + ".tmp", out_path)
+
+    save("started")
     for size in sizes:
         left = a.budget_s - (time.time() - t_start)
         rate = min(rates) if rates else 40.0
@@ -130,9 +139,13 @@ def main():
         if predicted > left:
             log("size %d: predicted %.0f s at %.0f tok/s of prefill, %.0f s left: skipped" % (size, predicted, rate, left))
             results.append(dict(size=size, skipped=True, predicted_s=round(predicted), left_s=round(left)))
+            save()
             continue
         prompt, code = build_prompt(pool, size, seed=size)
         log("size %d: %d chars, sending (%d parallel), predicted %.0f s" % (size, len(prompt), a.streams, predicted))
+        results.append(dict(size=size, in_flight=True, started_at=time.strftime("%H:%M:%S")))
+        save("size %d in flight" % size)
+        results.pop()
         if a.streams > 1:
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(a.streams) as ex:
@@ -145,20 +158,22 @@ def main():
         prefill_rate = round(pt / r["ttft_s"], 1) if pt and r.get("ttft_s") else None
         if prefill_rate:
             rates.append(prefill_rate)
+        if r.get("error") and not r.get("ttft_s"):
+            log("size %d: no first token after %s s (%s)" % (size, r.get("wall_s"), r["error"]))
         row = dict(size=size, prompt_tokens=pt, ttft_s=r.get("ttft_s"), prefill_tok_s=prefill_rate,
                    decode_tok_s=r.get("decode_tok_s"), tokens=r.get("tokens"), wall_s=r.get("wall_s"),
                    needle_found=found, error=r.get("error"), streams=a.streams,
                    answer=(r.get("text") or "")[-120:],
                    others=[dict(ttft_s=x.get("ttft_s"), decode_tok_s=x.get("decode_tok_s"), error=x.get("error")) for x in rs[1:]])
         results.append(row)
+        save()
         log("size %d: prompt %s tok, first token %s s (%s tok/s prefill), decode %s tok/s, needle %s%s" % (
             size, pt, r.get("ttft_s"), prefill_rate, r.get("decode_tok_s"), "FOUND" if found else "missing",
             (", error: " + r["error"]) if r.get("error") else ""))
         if r.get("error"):
             log("stopping the scan after an error")
             break
-    json.dump(dict(exp=a.exp, sizes=sizes, budget_s=a.budget_s, new_tokens=a.new_tokens, results=results,
-                   wall_s=round(time.time() - t_start)), open(os.path.join(out_dir, "context_scan.json"), "w"), indent=1)
+    save("finished")
     print("\n| context (tokens) | first token (s) | prefill tok/s | decode tok/s | needle | note |")
     print("|---|---|---|---|---|---|")
     for r in results:

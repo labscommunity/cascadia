@@ -51,5 +51,11 @@ wrong, which would be a finding on its own).
 **Kill / safety.** No traffic before `steady 3/3`; a gate failure on the test release = immediate revert; the scan
 stops at the first request error; every request is capped; the script always ends with the revert.
 
+**If a box dies mid-test** (the entry box has lost power four times): every number is on disk the moment it is
+measured. The probe lines are saved every 20 s while the fleet settles (they reach the Mac through the entry box, so
+they would be lost with it); the scan writes its results file after every size and marks the size in flight; every
+exit, planned or not, prints the numbers gathered so far. The revert release is published regardless and the boxes
+apply it by themselves once the entry box is back.
+
 **What it does NOT test.** Many streams at long context (memory adds up per stream), prompts beyond ~32k for real,
 KV in f16 (a possible follow-up if 512k is wanted), quality beyond the needle.
