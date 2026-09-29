@@ -6196,8 +6196,18 @@ impl<R: StagedRunner> PipelineEngine<R> {
         {
             admitted += 1;
             let feed_started = Instant::now();
+            let feed_id = self.streams[i].id.clone();
             let rows = match self.feed_stream_window(i, g, &down) {
-                Ok(rows) => rows,
+                Ok(rows) => {
+                    // A window went down: real work, no token yet. The
+                    // runner closes a task after three steps that return
+                    // nothing, which a prompt of more than ~22 windows
+                    // used to trip; the API sends nothing for this chunk.
+                    if rows > 0 {
+                        out.push((feed_id.clone(), Chunk::progress(feed_id)));
+                    }
+                    rows
+                }
                 Err((id, chunk)) => {
                     out.push((id, chunk));
                     0

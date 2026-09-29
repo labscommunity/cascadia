@@ -2930,6 +2930,12 @@ async fn stream_completion(
             let usage_prompt = usage_prompt.clone();
             let marker = marker.clone();
             async move {
+                // A progress marker (a long prompt still going down the
+                // pipeline, one window per engine step): nothing to send,
+                // nothing to count; the connection stays open.
+                if chunk.is_progress() {
+                    return Ok::<Bytes, std::convert::Infallible>(Bytes::new());
+                }
                 // Count model tokens as they stream so the dashboard's
                 // tokens_total advances live (not just at request end).
                 // Counts the final chunk too (ov-genai emits its whole

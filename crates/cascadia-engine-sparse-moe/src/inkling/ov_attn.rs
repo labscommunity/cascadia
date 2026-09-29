@@ -198,10 +198,17 @@ impl OvAttn {
             self.rows.load(Ordering::Relaxed),
             self.call_ns.load(Ordering::Relaxed),
         );
-        let ok = self.qkvr(lid, &vec![0.0f32; hidden], 1).is_some()
+        let mut ok = self.qkvr(lid, &vec![0.0f32; hidden], 1).is_some()
             && self.o(lid, &vec![0.0f32; ctx_dim], 1).is_some()
             && self.qkvr(lid, &vec![0.0f32; 8 * hidden], 8).is_some()
             && self.o(lid, &vec![0.0f32; 8 * ctx_dim], 8).is_some();
+        // the prompt window's row count as well (see `ov_moe::warm_rows`)
+        if let Some(w) = super::ov_moe::warm_rows() {
+            let w = super::ov_moe::bucket_rows(w);
+            ok = ok
+                && self.qkvr(lid, &vec![0.0f32; w * hidden], w).is_some()
+                && self.o(lid, &vec![0.0f32; w * ctx_dim], w).is_some();
+        }
         self.calls.store(before.0, Ordering::Relaxed);
         self.rows.store(before.1, Ordering::Relaxed);
         self.call_ns.store(before.2, Ordering::Relaxed);

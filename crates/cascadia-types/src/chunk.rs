@@ -182,6 +182,31 @@ impl Chunk {
         self.n_tokens
             .unwrap_or(if self.text.is_empty() { 0 } else { 1 })
     }
+
+    /// A progress marker: no text, no token (`n_tokens` = 0), not final. An
+    /// engine emits one from a step that did real work for the task but has
+    /// nothing to say yet (a long prompt going down a pipeline one window at
+    /// a time), so the runner's no-progress watchdog sees the work and the
+    /// API sends nothing for it. Consumers: [`Self::is_progress`].
+    pub fn progress(task_id: TaskId) -> Self {
+        Self {
+            task_id,
+            token_id: 0,
+            text: String::new(),
+            token_ids: Vec::new(),
+            is_final: false,
+            logprobs: None,
+            n_tokens: Some(0),
+            prompt_tokens: None,
+            error: None,
+            finish_reason: None,
+        }
+    }
+
+    /// See [`Self::progress`].
+    pub fn is_progress(&self) -> bool {
+        !self.is_final && self.error.is_none() && self.text.is_empty() && self.n_tokens == Some(0)
+    }
 }
 
 #[cfg(test)]

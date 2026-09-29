@@ -154,6 +154,15 @@ fn decode_rows() -> usize {
     })
 }
 
+/// `CASCADIA_INKLING_OV_WARM_ROWS`: a row count whose device shapes are
+/// compiled at load (the prompt window), so no request pays for it.
+pub(crate) fn warm_rows() -> Option<usize> {
+    std::env::var("CASCADIA_INKLING_OV_WARM_ROWS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0 && n <= 256)
+}
+
 pub(crate) fn bucket_rows(rows: usize) -> usize {
     if rows > 32 {
         return rows.div_ceil(32) * 32;
@@ -620,9 +629,16 @@ impl OvMoe {
         let mut shapes: Vec<usize> = small_buckets().iter().copied().filter(|&b| b <= 8).collect();
         if self.uses_decode_kernels(lid) {
             shapes.extend(1..=decode_rows());
-            shapes.sort_unstable();
-            shapes.dedup();
         }
+        // The prompt windows' shape too (`CASCADIA_INKLING_OV_WARM_ROWS`, e.g.
+        // the value of CASCADIA_STREAMS_PREFILL_WINDOW): the first call at a
+        // new row count compiles that shape's kernels, which a long prompt's
+        // first window would otherwise pay on every layer of every rank.
+        if let Some(w) = warm_rows() {
+            shapes.push(bucket_rows(w));
+        }
+        shapes.sort_unstable();
+        shapes.dedup();
         for b in shapes {
             let xb = vec![0.0f32; b * self.hidden];
             let idsb: Vec<i32> = ids.iter().copied().cycle().take(b * k).collect();
