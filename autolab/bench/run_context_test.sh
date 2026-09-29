@@ -5,7 +5,7 @@
 #
 # 1. publishes the test binary + overrides and waits until the fleet is steady (about 10 min: every rank runs the
 #    context probe while loading);  2. reads the probe lines;  3. output gates;  4. the real-prompt scan inside a
-# 12-minute budget;  5. publishes the revert set (what the fleet ran before) and waits for it;  6. gates again.
+# 13-minute budget;  5. publishes the revert set (what the fleet ran before) and waits for it;  6. gates again.
 # Stops at the first thing that is not right (a gate failure, a fleet that does not settle) and, whatever happened
 # after step 1, always ends with the revert. Wall clock: about 25 min to the end of the scan, ~35 with the revert.
 set -u
@@ -43,8 +43,8 @@ log "3/6 gates"
 if ! $LAB gate 2>&1 | tee -a "$OUT/run.log" | tail -1 | grep -q "GATE PASS"; then
   log "gate failed on the test release: reverting"; revert; exit 3
 fi
-log "4/6 scan (12-minute budget; sizes that would not fit in it are skipped)"
-/usr/bin/python3 autolab/bench/context_scan.py "$EXP" --sizes 1024,4096,12288,32768 --budget-s 720 --new-tokens 32 2>&1 | tee -a "$OUT/run.log" | tail -12
+log "4/6 scan (13-minute budget; sizes that would not fit in it are skipped)"
+/usr/bin/python3 autolab/bench/context_scan.py "$EXP" --sizes 1024,8192,32768,65536,102400 --budget-s 780 --new-tokens 32 2>&1 | tee -a "$OUT/run.log" | tail -12
 log "scan done at $(( ($(date +%s) - T0) / 60 )) min from the start"
 log "5/6 revert"; revert
 log "6/6 done at $(( ($(date +%s) - T0) / 60 )) min. Results: $OUT/context_scan.json, $OUT/probe_cx.json, $OUT/run.log"

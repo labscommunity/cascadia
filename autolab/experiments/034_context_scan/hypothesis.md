@@ -24,24 +24,28 @@ warning; a generation that reaches position 1,024 stops. Every benchmark so far 
 caps from the environment; overrides = the live configuration + max_seq 1M, 16 slots, the probe list):
 1. **The probe, every rank, at load** (`CASCADIA_INKLING_CONTEXT_BENCH`): fill slot 0's caches to N positions with
    synthetic rows (every byte a real sequence writes, so the pages are resident), decode one row at N a few times,
-   report memory and time, free the pages. Sizes 4k, 16k, 64k, 128k, 256k, 512k, 1M. A size that does not fit in
+   report memory and time, free the pages. Sizes 4k, 16k, 64k, 100k, 128k, 256k, 512k, 1M. A size that does not fit in
    the box's free memory plus a 3 GiB margin is reported `fits=0` and not tried: the probe cannot take a worker
    down (tests: `tests/inkling_context_bench.rs`, the runner decodes the same tokens afterwards).
    Read with `probe_read.py CX`: per rank and size, `fits`, `need_mb`, `avail_mb`, `decode_ms`, `attn_ms`.
 2. **Real prompts, one stream** (`bench/context_scan.py`): natural text (the fleet's own responses, then Dolly) of
-   1k, 4k, 12k and 32k tokens with a needle sentence near the start and a question at the end that asks for it;
-   32 new tokens each. Measured: exact prompt tokens (`usage`), first token = prefill, decode tok/s at that context,
-   and whether the answer contains the needle (attention over the whole context works or not). A 12-minute budget:
+   1k, 8k, 32k, 64k and 100k tokens with a needle sentence near the start and a question at the end that asks for
+   it; 32 new tokens each. Prompts travel as 64-row windows during the test (8 in production, chosen in 024 for a
+   burst of 15 streams): a lone long prompt is limited by the fixed cost per window, so 2-3x the prefill rate. Measured: exact prompt tokens (`usage`), first token = prefill, decode tok/s at that context,
+   and whether the answer contains the needle (attention over the whole context works or not). A 13-minute budget:
    a size whose predicted prefill would pass it is skipped and recorded.
 
-**Time.** Publish + settle ~10 min (the probe adds 2-3 min to every rank's load), gates 1 min, scan <= 12 min:
+**Time.** Publish + settle ~10 min (the probe adds 2-3 min to every rank's load), gates 1 min, scan <= 13 min:
 **about 25 minutes**; then the revert release (~8 min) restores `cascadia-639f0c02-streams` + the 040/041 overrides.
 
 **Predictions.** Probe: 4k-128k fit on every rank; 256k on all; 512k on the ranks with >= 7.5 GB free (the box
 that plays rank 0 and a few others), not on the rest; **1M on none** (needs 8.6 + 3 GB). decode_ms roughly
-35-45 ms up to 16k, +1 ms per 1k positions beyond (CPU attention), so ~300 ms at 256k. Scan: prefill 45-55 tok/s at
-1k-4k falling to ~35 at 32k; first token 20 s / 90 s / 5.5 min / (32k skipped or ~13 min); decode 3.5 -> ~3.0 tok/s
-at 32k; needle found at every size (if not, the global layers' attention beyond 1,024 of relative-bias extent is
+35-45 ms up to 16k, +1 ms per 1k positions beyond (CPU attention), so ~300 ms at 256k. Scan (64-row windows): prefill 120-160
+tok/s at 1k-8k, falling with the square of the context on the CPU attention (each window's rows attend over
+everything before them on the global layer: ~17 TFLOP for a 32k prompt, ~67 at 64k, ~160 at 100k, on CPUs that do
+maybe 100 GFLOPS): first token ~10 s / ~1 min / 4-6 min / 12-20 min / (100k: 30-45 min, skipped by the budget);
+so 1k, 8k and 32k for real, 64k if the measured rate allows, 100k by the probe only; decode 3.5 -> ~3.0 tok/s at
+32k and ~1.5-2 at 100k (probe); needle found at every size (if not, the global layers' attention beyond 1,024 of relative-bias extent is
 wrong, which would be a finding on its own).
 
 **Kill / safety.** No traffic before `steady 3/3`; a gate failure on the test release = immediate revert; the scan
