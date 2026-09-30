@@ -426,3 +426,17 @@ to `serving`, while requiring an active worker, matching versions and unchanged
 restart counts. Three readiness/stability tests and the three failed-run tests
 passed. Restarted only the local settle monitor to pick up this fix; the fleet
 received one release.
+
+## 2026-09-29/30, iterations 034 and 047: context
+
+The owner asked whether the 1M-token context is possible here and how speed falls with context. Found first: the
+fleet had been serving 1,024 tokens (`MAX_SEQ=1024` from the install) and the API capped prompts at 32 KiB. 034
+(one-shot, 26 min): a probe on every box filled a slot's caches to N positions and decoded there: 45 ms per token
+per box at 4k, 221 at 64k, 1.5 s at 512k, 3 s at 1M on the one box with room; 1M needs 8.2 GB per box and ten boxes
+have 9.4-9.9 GB free. It also found two engine limits: a prompt of more than ~22 windows was closed by the runner's
+"no progress" watchdog (at the production 8-row window: 176 tokens; nobody had sent a longer prompt since 024),
+and the first call at a new window shape compiled kernels on every layer of every rank (34 s at 1k). Both fixed
+(progress chunks the API does not send; shapes compiled at load). 047 (12 h, reverted): 1k-64k with repeats, the
+needle found 20/20, prefill quadratic (1.5e-6 s x N², 1 h 50 min at 64k) and decode linear in the context, and
+every box doing it with ONE core (11 GFLOPS effective). 128k did not finish in six hours. The lever is a parallel
+attention kernel, not hardware: the probe and the stress test both point at the same single-threaded loop.

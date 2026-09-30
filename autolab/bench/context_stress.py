@@ -114,7 +114,7 @@ def main():
     ap.add_argument("--repeats", default="3,2,1", help="repeats for sizes <= 16k, <= 64k, above")
     ap.add_argument("--streams", default="1,4", help="concurrencies, each a full ascending pass")
     ap.add_argument("--new-tokens", type=int, default=96)
-    ap.add_argument("--cap", type=int, default=7200, help="cap per request (s)")
+    ap.add_argument("--cap", type=int, default=21600, help="cap per request (s): a 256k prompt can take hours")
     a = ap.parse_args()
     sizes = sorted({int(s) for s in a.sizes.split(",") if s.strip()})
     reps = [int(x) for x in a.repeats.split(",")]
@@ -152,11 +152,23 @@ def main():
         return min(rs) if rs else 40.0
 
     save()
+    budget_file = os.path.join(out_dir, "budget_s")   # the operator can change the budget while the run is on
+
+    def budget():
+        try:
+            v = int(open(budget_file).read().strip())
+            if v != a.budget_s:
+                log("budget changed to %d s (from %s)" % (v, budget_file))
+                a.budget_s = v
+        except (OSError, ValueError):
+            pass
+        return a.budget_s
+
     for streams in streams_list:
         for size in sizes:
             n_rep = reps[0] if size <= 16384 else reps[1] if size <= 65536 else reps[2]
             for rep in range(n_rep):
-                left = a.budget_s - (time.time() - t_start)
+                left = budget() - (time.time() - t_start)
                 rate = rate_for(size)
                 # prefill grows with the square of the context on the CPU attention: assume the rate at a larger
                 # size is at best the rate measured, and with `streams` prompts at once the pipeline is shared

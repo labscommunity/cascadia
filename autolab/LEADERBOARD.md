@@ -32,3 +32,5 @@
 | 035 | 09-21 | rank 0 refuses admission until a stateless probe returns through the whole chain; eleven frames, role swap retained | gates exact | - | 15 streams 24.21 / 24.63; first token 6.61 / 6.10 s | kept for reliability; delayed-worker integration test proves recovery without generation traffic |
 
 038: kept verified phrase-history merge (24,453 -> 194,299 contexts), both gates exact. Repeated single-stream prompts improved; no unseen-prompt or 15-stream claim. See `experiments/038_phrase_transfer/verdict.md`.
+| 034 | 09-29 | measurement: context probe on every box (4k-1M) + real prompts; one-shot, reverted | 1k: 3.5 | 34 s at 1k (cold 64-row shapes) | - | 1M does not fit (8.2 GB/box); a token costs 2.9 ms per 1k of context per box; prompts > ~22 windows were closed by the runner's watchdog (fixed) |
+| 047 | 09-29/30 | measurement: context stress 1k-64k, 12 h, reverted (binary 6430d70e-ctx2: progress chunks, warm shapes) | 4.7 (1k), 3.3 (8k), 1.5 (32k), 0.8 (64k) | 22 s (1k), 2.9 min (8k), 27 min (32k), 1 h 50 (64k) | - | prefill quadratic (1.5e-6 s x N^2), one CPU core per box does the attention; needle 20/20; 128k not in 6 h |

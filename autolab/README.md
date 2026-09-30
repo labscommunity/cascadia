@@ -42,6 +42,12 @@ production. Earlier targets and where they ended:
 * **Best remaining exact lever:** the model's own MTP head as the drafter (033, offline: right 0.73 of the time,
   0.63-0.69 on prose): one stream ~5-6 tok/s, ~2x per stream at 3-8 streams, about +7 % at 15. A multi-day build
   (queue). Lossy options (int4 attention, fewer experts) need the owner's decision.
+* **Context (2026-09-29/30, experiments 034 and 047):** the fleet had served a 1,024-token context (`MAX_SEQ=1024`
+  at install). Measured with the budget raised: prefill is quadratic in the context (1.5e-6 s x N²: 22 s at 1k,
+  27 min at 32k, 1 h 50 min at 64k, 128k not in 6 h), decode falls linearly (4.7 tok/s at 1k, 1.5 at 32k, 0.8 at 64k),
+  the needle is found at every size through 64k, and 1M does not fit in memory (8.2 GB per box of f32 KV). Both
+  costs are one CPU core per box doing the attention (11 GFLOPS effective; 16 cores idle): the next lever is a
+  parallel attention kernel (queue), worth up to ~12x at long context. `experiments/047_context_stress/verdict.md`.
 * **Queue:** `QUEUE.md`. Anyone may add items (`queue/README.md`); one operator runs them.
 
 ## The loop

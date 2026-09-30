@@ -1,0 +1,157 @@
+17:20:15 1/6 publish: cascadia-6430d70e-ctx2 + 047_context_stress.env
+17:30:56 settle: files ok, 11/11 serving, 1 version(s), restarts 2 6 6 5 4 3 3 2 0 1 1, steady 3/3
+17:30:56 SETTLED: the fleet is steady, traffic is fine
+17:32:38 settle: files ok, 11/11 serving, 1 version(s), restarts 2 6 6 5 4 3 3 2 0 1 1, steady 3/3
+17:32:38 2/6 (no probe in this release: 034 holds the per-box context probe)
+17:32:38 3/6 gates
+17:33:20 gate prompt 0: 147/147 chars match (exact)  6.228 tok/s ttft 21.54  '<think>The user wants an explanation of why the sky is blue in exactly'
+17:33:20 gate prompt 1: 150/150 chars match (exact)  11.914 tok/s ttft 5.1  '<think>The user is asking for the capital of France and wants the answ'
+17:33:20 gate prompt 5: 81/112 chars match  11.774 tok/s ttft 4.9  '<think>The user is asking "What is 6 times 7? Explain briefly." This i'
+17:33:20 GATE PASS
+17:33:20 4/6 stress (budget 14400 s; results after every request)
+17:33:20 budget changed to 43200 s (from /Users/tatef/Workspaces/tahoma-inkling-autolab/autolab/experiments/047_context_stress/budget_s)
+17:33:20 streams 1 size 1024 rep 0: 4505 chars, predicted 100 s
+17:34:03 streams 1 size 1024 rep 0: prompt 1041 tok, first token 22.98 s (45.3 tok/s prefill), decode 4.773 tok/s, needle FOUND
+17:34:03 streams 1 size 1024 rep 1: 4505 chars, predicted 97 s
+17:34:47 streams 1 size 1024 rep 1: prompt 1042 tok, first token 22.29 s (46.7 tok/s prefill), decode 4.181 tok/s, needle FOUND
+17:34:47 streams 1 size 1024 rep 2: 4505 chars, predicted 97 s
+17:35:26 streams 1 size 1024 rep 2: prompt 1041 tok, first token 22.11 s (47.1 tok/s prefill), decode 5.225 tok/s, needle FOUND
+17:35:26 streams 1 size 2048 rep 0: 9011 chars, predicted 119 s
+17:36:20 streams 1 size 2048 rep 0: prompt 2011 tok, first token 37.47 s (53.7 tok/s prefill), decode 5.287 tok/s, needle FOUND
+17:36:20 streams 1 size 2048 rep 1: 9011 chars, predicted 112 s
+17:37:11 streams 1 size 2048 rep 1: prompt 2011 tok, first token 37.49 s (53.6 tok/s prefill), decode 6.615 tok/s, needle FOUND
+17:37:11 streams 1 size 2048 rep 2: 9011 chars, predicted 112 s
+17:38:03 streams 1 size 2048 rep 2: prompt 2012 tok, first token 37.43 s (53.8 tok/s prefill), decode 5.557 tok/s, needle FOUND
+17:38:03 streams 1 size 4096 rep 0: 18022 chars, predicted 164 s
+17:39:44 streams 1 size 4096 rep 0: prompt 3991 tok, first token 75.27 s (53.0 tok/s prefill), decode 3.704 tok/s, needle FOUND
+17:39:44 streams 1 size 4096 rep 1: 18022 chars, predicted 151 s
+17:41:21 streams 1 size 4096 rep 1: prompt 3991 tok, first token 75.58 s (52.8 tok/s prefill), decode 4.417 tok/s, needle FOUND
+17:41:21 streams 1 size 4096 rep 2: 18022 chars, predicted 152 s
+17:43:03 streams 1 size 4096 rep 2: prompt 3992 tok, first token 75.58 s (52.8 tok/s prefill), decode 3.599 tok/s, needle FOUND
+17:43:03 streams 1 size 8192 rep 0: 36044 chars, predicted 255 s
+17:46:27 streams 1 size 8192 rep 0: prompt 7889 tok, first token 172.39 s (45.8 tok/s prefill), decode 2.969 tok/s, needle FOUND
+17:46:27 streams 1 size 8192 rep 1: 36044 chars, predicted 253 s
+17:49:49 streams 1 size 8192 rep 1: prompt 7889 tok, first token 172.72 s (45.7 tok/s prefill), decode 3.26 tok/s, needle FOUND
+17:49:49 streams 1 size 8192 rep 2: 36044 chars, predicted 253 s
+17:53:07 streams 1 size 8192 rep 2: prompt 7889 tok, first token 172.51 s (45.7 tok/s prefill), decode 3.732 tok/s, needle FOUND
+17:53:07 streams 1 size 16384 rep 0: 72089 chars, predicted 436 s
+18:01:25 streams 1 size 16384 rep 0: prompt 15896 tok, first token 470.81 s (33.8 tok/s prefill), decode 3.4 tok/s, needle FOUND
+18:01:25 streams 1 size 16384 rep 1: 72089 chars, predicted 559 s
+18:09:55 streams 1 size 16384 rep 1: prompt 15899 tok, first token 470.96 s (33.8 tok/s prefill), decode 2.45 tok/s, needle FOUND
+18:09:55 streams 1 size 16384 rep 2: 72089 chars, predicted 559 s
+18:18:27 streams 1 size 16384 rep 2: prompt 15896 tok, first token 471.1 s (33.7 tok/s prefill), decode 2.289 tok/s, needle FOUND
+18:18:28 streams 1 size 32768 rep 0: 144179 chars, predicted 1046 s
+18:46:52 streams 1 size 32768 rep 0: prompt 31614 tok, first token 1635.01 s (19.3 tok/s prefill), decode 1.347 tok/s, needle FOUND
+18:46:52 streams 1 size 32768 rep 1: 144179 chars, predicted 1772 s
+19:15:00 streams 1 size 32768 rep 1: prompt 31614 tok, first token 1634.98 s (19.3 tok/s prefill), decode 1.683 tok/s, needle FOUND
+19:15:00 streams 1 size 65536 rep 0: 288358 chars, predicted 3470 s
+21:07:23 streams 1 size 65536 rep 0: prompt 64292 tok, first token 6585.57 s (9.8 tok/s prefill), decode 0.603 tok/s, needle FOUND
+21:07:23 streams 1 size 65536 rep 1: 288358 chars, predicted 6761 s
+22:58:16 streams 1 size 65536 rep 1: prompt 64292 tok, first token 6583.36 s (9.8 tok/s prefill), decode 1.043 tok/s, needle FOUND
+22:58:16 streams 1 size 131072 rep 0: 576716 chars, predicted 13449 s
+04:58:16 streams 1 size 131072 rep 0: prompt None tok, first token None s (None tok/s prefill), decode None tok/s, needle missing, error: timeout: timed out
+04:58:17 stopping after an error
+
+| streams | context (tokens) | first token (s) | prefill tok/s | decode tok/s (per stream) | aggregate | needle | note |
+|---|---|---|---|---|---|---|---|
+| 1 | 1041 | 22.98 | 45.3 | 4.773 | 4.773 | yes |  |
+| 1 | 1042 | 22.29 | 46.7 | 4.181 | 4.181 | yes |  |
+| 1 | 1041 | 22.11 | 47.1 | 5.225 | 5.225 | yes |  |
+| 1 | 2011 | 37.47 | 53.7 | 5.287 | 5.287 | yes |  |
+| 1 | 2011 | 37.49 | 53.6 | 6.615 | 6.615 | yes |  |
+| 1 | 2012 | 37.43 | 53.8 | 5.557 | 5.557 | yes |  |
+| 1 | 3991 | 75.27 | 53.0 | 3.704 | 3.704 | yes |  |
+| 1 | 3991 | 75.58 | 52.8 | 4.417 | 4.417 | yes |  |
+| 1 | 3992 | 75.58 | 52.8 | 3.599 | 3.599 | yes |  |
+| 1 | 7889 | 172.39 | 45.8 | 2.969 | 2.969 | yes |  |
+| 1 | 7889 | 172.72 | 45.7 | 3.26 | 3.26 | yes |  |
+| 1 | 7889 | 172.51 | 45.7 | 3.732 | 3.732 | yes |  |
+| 1 | 15896 | 470.81 | 33.8 | 3.4 | 3.4 | yes |  |
+| 1 | 15899 | 470.96 | 33.8 | 2.45 | 2.45 | yes |  |
+| 1 | 15896 | 471.1 | 33.7 | 2.289 | 2.289 | yes |  |
+| 1 | 31614 | 1635.01 | 19.3 | 1.347 | 1.347 | yes |  |
+| 1 | 31614 | 1634.98 | 19.3 | 1.683 | 1.683 | yes |  |
+| 1 | 64292 | 6585.57 | 9.8 | 0.603 | 0.603 | yes |  |
+| 1 | 64292 | 6583.36 | 9.8 | 1.043 | 1.043 | yes |  |
+| 1 | 131072 | None | None | None | None | NO | timeout: timed out |
+04:58:17 stress done at 698 min from the start
+04:58:17 5/6 revert
+04:58:17 REVERT: publishing what the fleet ran before (cascadia-639f0c02-streams + 040_counts_041_attn.env)
+05:04:33 settle: files ok, 11/11 serving, 1 version(s), restarts 1 2 1 1 1 1 1 1 0 1 1, steady 3/3
+05:04:33 SETTLED: the fleet is steady, traffic is fine
+05:06:10 settle: files ok, 11/11 serving, 1 version(s), restarts 1 2 1 1 1 1 1 1 0 1 1, steady 3/3
+05:06:33 GATE PASS
+05:06:33 6/6 done at 706 min.
+================ numbers so far (05:06:33) ================
+PROBE (per box, per context size; installed rank 0 = the box that plays rank 8, installed 8 = the box that plays rank 0):
+  rank  ctx        fits  need_mb  avail_mb  decode_ms  attn_ms  mlp_ms
+     0  262144     1        2090      9642        769      740      29
+     0  524288     1        4138      9634       1492     1464      29
+     0  1048576    0        8234      9512                            
+     1  262144     1        2090      9461        758      734      24
+     1  524288     1        4138      9557       1496     1472      24
+     1  1048576    0        8234      9665                            
+     2  131072     1        1066      9373        404      380      24
+     2  262144     1        2090      9417        759      735      24
+     2  524288     1        4138      9450       1508     1485      24
+     2  1048576    0        8234      9574                            
+     3  131072     1        1066      9891        400      375      25
+     3  262144     1        2090      9863        751      727      25
+     3  524288     1        4138      9751       1497     1472      25
+     3  1048576    0        8234      9742                            
+     4  102400     1         842      9286        316      292      25
+     4  131072     1        1066      9396        400      377      24
+     4  262144     1        2090      9472        780      923      24
+     4  524288     1        4138      9645       1512     1488      24
+     4  1048576    0        8234      9880                            
+     5  131072     1        1066      9509        411      388      23
+     5  262144     1        2090      9509        776      753      23
+     5  524288     1        4138      9590       1491     1472      24
+     5  1048576    0        8234      9695                            
+     6  131072     1        1066      9443        386      364      24
+     6  262144     1        2090      9443        756      732      24
+     6  524288     1        4138      9545       1484     1460      24
+     6  1048576    0        8234      9633                            
+     7  102400     1         842     10027        330      311      24
+     7  131072     1        1066      9661        414      392      24
+     7  262144     1        2090      9958        767      744      24
+     7  524288     1        4138      9627       1499     1476      24
+     7  1048576    0        8234      9754                            
+     8  102400     1         842     22364        327      301      26
+     8  131072     1        1066     22715        407      381      26
+     8  262144     1        2090     22415        782      756      27
+     8  524288     1        4138     22493       1510     1483      27
+     8  1048576    1        8234     22636       2990     2964      27
+     9  102400     1         842      9026        312      290      22
+     9  131072     1        1066      9078        387      365      22
+     9  262144     1        2090      9106        751      727      23
+     9  524288     1        4138      9164       1491     1591      24
+     9  1048576    0        8234      9449                            
+    10  102400     1         842      9610        325      303      22
+    10  131072     1        1066      9631        411      389      22
+    10  262144     1        2090      9496        778      756      23
+    10  524288     1        4138      9568       1493     1470      22
+    10  1048576    0        8234      9643                            
+STRESS (last: streams 1 size 131072 rep 0, stopped: error at streams 1 size 131072: timeout: timed out):
+  | streams | context (tokens) | first token (s) | prefill tok/s | decode tok/s | aggregate | needle | note |
+  | 1 | 1041 | 22.98 | 45.3 | 4.773 | 4.773 | yes |  |
+  | 1 | 1042 | 22.29 | 46.7 | 4.181 | 4.181 | yes |  |
+  | 1 | 1041 | 22.11 | 47.1 | 5.225 | 5.225 | yes |  |
+  | 1 | 2011 | 37.47 | 53.7 | 5.287 | 5.287 | yes |  |
+  | 1 | 2011 | 37.49 | 53.6 | 6.615 | 6.615 | yes |  |
+  | 1 | 2012 | 37.43 | 53.8 | 5.557 | 5.557 | yes |  |
+  | 1 | 3991 | 75.27 | 53.0 | 3.704 | 3.704 | yes |  |
+  | 1 | 3991 | 75.58 | 52.8 | 4.417 | 4.417 | yes |  |
+  | 1 | 3992 | 75.58 | 52.8 | 3.599 | 3.599 | yes |  |
+  | 1 | 7889 | 172.39 | 45.8 | 2.969 | 2.969 | yes |  |
+  | 1 | 7889 | 172.72 | 45.7 | 3.26 | 3.26 | yes |  |
+  | 1 | 7889 | 172.51 | 45.7 | 3.732 | 3.732 | yes |  |
+  | 1 | 15896 | 470.81 | 33.8 | 3.4 | 3.4 | yes |  |
+  | 1 | 15899 | 470.96 | 33.8 | 2.45 | 2.45 | yes |  |
+  | 1 | 15896 | 471.1 | 33.7 | 2.289 | 2.289 | yes |  |
+  | 1 | 31614 | 1635.01 | 19.3 | 1.347 | 1.347 | yes |  |
+  | 1 | 31614 | 1634.98 | 19.3 | 1.683 | 1.683 | yes |  |
+  | 1 | 64292 | 6585.57 | 9.8 | 0.603 | 0.603 | yes |  |
+  | 1 | 64292 | 6583.36 | 9.8 | 1.043 | 1.043 | yes |  |
+  | 1 | 131072 | None | None | None | None | NO | timeout: timed out |
+files: autolab/experiments/047_context_stress/context_stress.json  autolab/experiments/047_context_stress/context_stress.csv  autolab/experiments/047_context_stress/run.log
