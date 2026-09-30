@@ -6,13 +6,15 @@
 # - openvino >= 2026.4 — matches the SDK floor in INSTALL.md, so exported IRs
 #   are never newer than the runtime that serves them (2026.2 was the first
 #   release with the fused GatedDeltaNet op + qwen3_5_moe support).
-# - optimum-intel: qwen3_5_moe export path requires a 2026.2-era release.
+# - optimum-intel >= 2.2 — the release built against OpenVINO 2026.4; adds the
+#   MTP-head export for Qwen3.5/3.6/3.8. Earlier releases cap transformers
+#   below 5.2 (1.27: <4.58, 2.0: <5.1), so they could never satisfy the pin above.
 #
 # TODO(#77): exact == pins recorded after the first verified Qwen3.6 export
 # on the 2026.2 toolchain (Part B Path 1 task).
 transformers>=5.2,<5.5
 openvino>=2026.4
-optimum-intel>=1.27
+optimum-intel>=2.2
 nncf>=2.18
 torch>=2.6
 # Imported directly by export_shards.py and by the `cascadia shard` dependency
