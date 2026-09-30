@@ -1297,3 +1297,89 @@ async fn malformed_half_reply_is_rejected_and_drained_before_next_frame() {
         );
     }
 }
+
+/// Future pipeline drivers need independent sockets into one resident expert
+/// bank. Exercise simultaneous callers, a peer-local error/close and a new
+/// session without reloading weights. No CLI serving mode is enabled here.
+#[test]
+fn shared_bank_driver_sessions_are_independent_and_reusable() {
+    let dir = export_dir();
+    assert!(dir.join("manifest.json").is_file(), "tiny fixture required");
+    let manifest = read_manifest(&dir).unwrap();
+    let bank = Arc::new(load_expert_bank(&dir, 0, 1, ExpertsMode::Mmap).unwrap());
+    let layer = (0..bank.num_layers())
+        .find(|&l| bank.is_moe_layer(l))
+        .unwrap() as u32;
+    let rt = runtime();
+    let session = |bank: Arc<ExpertBank>| {
+        let (server, client) = rt.block_on(loopback());
+        let mut engine = ExpertWorkerEngine::new_shared(bank, server, rt.handle().clone());
+        let worker = std::thread::spawn(move || {
+            loop {
+                match engine.step() {
+                    Ok(_) => {}
+                    Err(e) if e.is_connection_fatal() => break engine.frames_served(),
+                    Err(e) => panic!("shared worker session: {e}"),
+                }
+            }
+        });
+        let ep = EpClient::new(
+            vec![client.clone()],
+            rt.handle().clone(),
+            manifest.hidden_size,
+            manifest.num_experts,
+            manifest.n_shared_experts,
+        );
+        (ep, client, worker)
+    };
+    let (first, c1, w1) = session(bank.clone());
+    let (second, c2, w2) = session(bank.clone());
+    let input: Vec<f32> = (0..manifest.hidden_size)
+        .map(|i| (i as f32 - 3.0) * 0.01)
+        .collect();
+    let body = cascadia_engine_sparse_moe::dist::ExpertDispatchBody {
+        layer,
+        rows: 1,
+        k: 1,
+        hidden: input.clone(),
+        hidden_shape: [1, manifest.hidden_size as u32, 1],
+        ids: vec![0],
+        ids_shape: [1, 1, 1],
+    };
+    let expected = bank.serve(&body).unwrap();
+    std::thread::scope(|scope| {
+        let a = scope.spawn(|| first.dispatch(layer, &input, &[vec![(0, 1.0)]]).unwrap());
+        let b = scope.spawn(|| second.dispatch(layer, &input, &[vec![(0, 1.0)]]).unwrap());
+        assert_eq!(a.join().unwrap(), expected);
+        assert_eq!(b.join().unwrap(), expected);
+    });
+    // A complete bad request gets an error without corrupting either socket.
+    assert!(
+        first
+            .dispatch(manifest.num_layers as u32 + 1, &input, &[vec![(0, 1.0)]])
+            .is_err()
+    );
+    assert_eq!(
+        second.dispatch(layer, &input, &[vec![(0, 1.0)]]).unwrap(),
+        expected
+    );
+    close_all(&rt, &[c1]);
+    assert_eq!(w1.join().unwrap(), 1);
+    assert_eq!(
+        second.dispatch(layer, &input, &[vec![(0, 1.0)]]).unwrap(),
+        expected
+    );
+    let (third, c3, w3) = session(bank.clone());
+    assert_eq!(
+        third.dispatch(layer, &input, &[vec![(0, 1.0)]]).unwrap(),
+        expected
+    );
+    close_all(&rt, &[c2, c3]);
+    assert_eq!(w2.join().unwrap(), 3);
+    assert_eq!(w3.join().unwrap(), 1);
+    assert_eq!(
+        Arc::strong_count(&bank),
+        1,
+        "sessions release the shared bank"
+    );
+}

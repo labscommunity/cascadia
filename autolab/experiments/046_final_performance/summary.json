@@ -1,0 +1,10 @@
+{
+  "complete": false,
+  "peak_steady_streams": 88,
+  "peak_steady_tok_s": 60.286375128761485,
+  "smallest_streams_within_95pct_peak": 88,
+  "peak_end_to_end_streams": 88,
+  "peak_end_to_end_tok_s": 46.874876421073495,
+  "max_streams_limit": 176,
+  "paused": true
+}

@@ -1,0 +1,3 @@
+experiments/*/telemetry.jsonl
+.autolab/expect.json
+bench/__pycache__/

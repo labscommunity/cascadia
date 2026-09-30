@@ -1,0 +1,41 @@
+16:03:23 publish: release 1789938203 signed and published: cascadia (20455336 B, bd874f62fdae), fleet-overrides.env (7033 B, f867ce922b1d) | the entry point polls every ~30 s; `release.py wait` follows the rollout
+16:03:23 settle: files PENDING, 11/11 serving, 1 version(s), restarts 0 4 3 3 3 2 2 2 1 1 1, steady 0/3
+16:03:33 settle: files PENDING, 11/11 serving, 1 version(s), restarts 0 4 3 3 3 2 2 2 1 1 1, steady 0/3
+16:04:04 settle: files ok, 10/11 serving, 2 version(s), restarts 0 4 3 3 3 2 2 2 1 1 1, steady 0/3
+16:04:34 settle: files ok, 0/11 serving, 1 version(s), restarts 0 0 0 0 0 0 0 0 0 0 0, steady 0/3
+16:05:10 settle: files ok, 1/11 serving, 1 version(s), restarts 0 0 0 0 0 0 0 0 0 0 0, steady 0/3
+16:05:41 settle: files ok, 1/11 serving, 1 version(s), restarts 0 1 1 0 0 1 0 1 1 0 1, steady 0/3
+16:06:16 settle: files ok, 1/11 serving, 1 version(s), restarts 0 1 1 0 0 1 0 1 1 0 1, steady 0/3
+16:06:47 settle: files ok, 1/11 serving, 1 version(s), restarts 0 1 2 1 0 1 1 1 2 1 1, steady 0/3
+16:07:22 settle: files ok, 1/11 serving, 1 version(s), restarts 0 2 2 1 0 1 1 1 2 1 1, steady 0/3
+16:07:58 settle: files ok, 3/11 serving, 1 version(s), restarts 0 2 2 2 1 1 1 2 2 1 1, steady 0/3
+16:08:28 settle: files ok, 3/11 serving, 1 version(s), restarts 0 3 3 2 1 1 1 2 2 1 1, steady 0/3
+16:09:04 settle: files ok, 4/11 serving, 1 version(s), restarts 0 3 3 2 2 2 1 2 2 1 1, steady 0/3
+16:09:35 settle: files ok, 4/11 serving, 1 version(s), restarts 0 4 4 3 2 2 1 2 2 1 1, steady 0/3
+16:10:10 settle: files ok, 4/11 serving, 1 version(s), restarts 0 4 4 3 2 3 2 2 2 1 1, steady 0/3
+16:10:41 settle: files ok, 4/11 serving, 1 version(s), restarts 0 4 5 4 3 3 2 2 2 1 1, steady 0/3
+16:11:16 settle: files ok, 6/11 serving, 1 version(s), restarts 0 5 5 4 3 3 2 2 2 1 1, steady 0/3
+16:11:52 settle: files ok, 10/11 serving, 1 version(s), restarts 0 5 5 4 3 3 2 2 2 1 1, steady 0/3
+16:12:22 settle: files ok, 11/11 serving, 1 version(s), restarts 0 5 5 4 3 3 2 2 2 1 1, steady 1/3
+16:12:58 settle: files ok, 11/11 serving, 1 version(s), restarts 0 5 5 4 3 3 2 2 2 1 1, steady 2/3
+16:13:29 settle: files ok, 11/11 serving, 1 version(s), restarts 0 5 5 4 3 3 2 2 2 1 1, steady 3/3
+16:14:51 PHASE warmup: 0/16 done, 12 tok in 82 s = 0.15 tok/s aggregate (sum of streams 0.00), ttft mean 0.0 max 0.0  ERRORS: ["server error: {'message': 'downstream closed before StreamTokens', 'type': 'engine_error'}", "server error: {'message': 'downstream closed before StreamTokens', 'type': 'engine_error'}"]
+16:14:53 warm 0: None tok/s, ttft None, server error: {'message': 'send_stream_open: not connected; call connect()/accept() first', 'type': 'engine_error'}
+16:14:54 warm 1: None tok/s, ttft None, server error: {'message': 'send_stream_open: not connected; call connect()/accept() first', 'type': 'engine_error'}
+16:14:57 gate prompt 0: 0/147 chars match  None tok/s ttft None  ''
+16:14:57 gate prompt 1: 0/150 chars match  None tok/s ttft None  ''
+16:14:57 gate prompt 5: 0/112 chars match  None tok/s ttft None  ''
+16:14:57 GATE FAIL
+16:17:08 gate (8 side by side) prompt 0: 89/147 chars match  BROKEN  '<think>The user wants an explanation of why the sk'
+16:17:08 gate (8 side by side) prompt 7: no reference  BROKEN  ''
+16:17:08 gate (8 side by side) prompt 5: 0/112 chars match  BROKEN  ''
+16:17:08 gate (8 side by side) prompt 9: no reference  BROKEN  '<think>The user wants a summary of photosynthesis '
+16:17:08 gate (8 side by side) prompt 1: 0/150 chars match  BROKEN  ''
+16:17:08 gate (8 side by side) prompt 11: no reference  BROKEN  '<think>The user wants a description of rain in one'
+16:17:08 gate (8 side by side) prompt 0: 0/147 chars match  BROKEN  ''
+16:17:08 gate (8 side by side) prompt 13: no reference  BROKEN  ''
+16:17:08 GATE MULTI FAIL
+16:17:15 PHASE mix11a: 0/11 done, 0 tok in 7 s = 0.00 tok/s aggregate (sum of streams 0.00), ttft mean 0.0 max 0.0  ERRORS: ["server error: {'message': 'send_stream_open: io error: Connection reset by peer (os error 104)', 'type': 'engine_error'}", "server error: {'message': 'send_stream_open_batch: not connected; call connect()/accept() first', 'type': 'engine_error'}"]
+16:19:45 PHASE mix15a: 0/15 done, 7 tok in 138 s = 0.05 tok/s aggregate (sum of streams 0.00), ttft mean 0.0 max 0.0  ERRORS: ["server error: {'message': 'downstream closed before StreamTokens', 'type': 'engine_error'}", "server error: {'message': 'downstream closed before StreamTokens', 'type': 'engine_error'}"]
+16:19:57 telemetry endpoint available: True
+finished

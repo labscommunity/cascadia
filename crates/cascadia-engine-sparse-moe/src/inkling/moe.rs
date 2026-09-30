@@ -115,6 +115,28 @@ pub(crate) fn par_experts() -> bool {
     *E.get_or_init(|| !env_flag("CASCADIA_INKLING_SERIAL_EXPERTS"))
 }
 
+/// `CASCADIA_INKLING_ROW_GEMM` (default ON; `0`/`false`/`no`/`off` restores
+/// the per-row kernels): in a batch-union block, an int4 expert with two or
+/// more rows — and both shared experts, which every row uses — runs ONE
+/// multi-input pass ([`MmapExpert::swiglu_rows_from`](crate::dsv4::expert_mmap::MmapExpert::swiglu_rows_from))
+/// instead of a GEMV per row, so its packed bytes cross the memory bus once
+/// per block. Same bits per row either way; only the schedule differs. Read
+/// once.
+fn row_gemm() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| match std::env::var("CASCADIA_INKLING_ROW_GEMM") {
+        Ok(v) => {
+            let v = v.trim();
+            !(v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("no")
+                || v.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => true,
+    })
+}
+
 /// Router + expert weights of one MoE layer.
 pub struct MoeWeights {
     /// `mlp.gate.weight` `[n_routed + n_shared, hidden]`, f32 (logits are not
@@ -164,6 +186,48 @@ pub struct MoeLayer {
 }
 
 impl MoeLayer {
+    /// Read every routed expert into the resident cache now (as far as its
+    /// capacity goes) instead of on first use. A pipeline rank's cache is sized
+    /// to hold its whole slice, but it used to fill only as requests touched
+    /// experts: after every restart the first request took 34 s to its first
+    /// token and decode ran at half speed for minutes. Returns
+    /// `(experts loaded, bytes)`.
+    pub fn prewarm_expert_cache(&self) -> (usize, usize) {
+        use rayon::prelude::*;
+        if self.expert_cache.stats().capacity_bytes == 0 {
+            return (0, 0);
+        }
+        let ids: Vec<usize> = (0..self.w.experts.len()).collect();
+        let mut loaded = (0usize, 0usize);
+        // Cohorts bound how many 32 MB buffers are in flight at once.
+        for cohort in ids.chunks(16) {
+            let done: Vec<usize> = cohort
+                .par_iter()
+                .map(|&e| {
+                    let Some(m) = self.w.experts[e].as_mmap() else {
+                        return 0;
+                    };
+                    let mut lease = super::read_buffers::ReadBuffers::acquire(1);
+                    if lease.buffers[0]
+                        .read_prefill(m.bin_path(), m.bin_len())
+                        .is_err()
+                    {
+                        return 0;
+                    }
+                    let size = lease.buffers[0].as_slice().len();
+                    if self.expert_cache.preload(e, &mut lease.buffers[0]) {
+                        size
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            loaded.0 += done.iter().filter(|&&b| b > 0).count();
+            loaded.1 += done.iter().sum::<usize>();
+        }
+        loaded
+    }
+
     pub fn expert_cache_stats(&self) -> super::ExpertCacheStats {
         self.expert_cache.stats()
     }
@@ -361,7 +425,96 @@ impl MoeLayer {
             ov.mark_k_mismatch(*lid, k);
             return Some(false);
         }
-        Some(ov.warm(*lid))
+        if !ov.warm(*lid) {
+            return Some(false);
+        }
+        Some(self.check_ov_moe_high_ids())
+    }
+
+    /// The device path against the Rust kernels on the HIGHEST expert ids of
+    /// this layer (the last routed experts and the shared ones). The GPU
+    /// plugin's decode kernels index an expert's weights with a 32-bit product
+    /// that overflows from id 228 at this model's sizes: low ids compute
+    /// correctly and high ones read out of bounds, so a warm-up on ids 0..k
+    /// proves nothing. A layer that fails is taken off the device (loudly)
+    /// rather than left to write garbage into the residual stream.
+    fn check_ov_moe_high_ids(&self) -> bool {
+        let Some((lid, ov)) = self.ov_moe.as_ref() else {
+            return true;
+        };
+        if self.ov.is_some() || !self.has_local_experts() || self.n_routed < self.top_k {
+            return true; // nothing on the host to compare with
+        }
+        let k = self.top_k + self.w.shared.len();
+        let x: Vec<f32> = (0..self.hidden)
+            .map(|i| ((i as f32 * 0.37).sin() + (i as f32 * 0.011).cos()) * 0.05)
+            .collect();
+        let mut ids: Vec<usize> = (self.n_routed - self.top_k..self.n_routed).collect();
+        ids.extend((0..self.w.shared.len()).map(|s| self.n_routed + s));
+        let w = vec![1.0f32 / k as f32; k];
+        let ids32: Vec<i32> = ids.iter().map(|&e| e as i32).collect();
+        let Some(dev) = ov.forward(*lid, &x, 1, &ids32, &w) else {
+            return false;
+        };
+        let mut host = vec![0.0f32; self.hidden];
+        for (&e, &we) in ids.iter().zip(&w) {
+            for (h, y) in host.iter_mut().zip(self.expert_ov_or_rust(e, &x)) {
+                *h += we * y;
+            }
+        }
+        let dot: f64 = dev
+            .iter()
+            .zip(&host)
+            .map(|(a, b)| *a as f64 * *b as f64)
+            .sum();
+        let nd: f64 = dev
+            .iter()
+            .map(|a| *a as f64 * *a as f64)
+            .sum::<f64>()
+            .sqrt();
+        let nh: f64 = host
+            .iter()
+            .map(|a| *a as f64 * *a as f64)
+            .sum::<f64>()
+            .sqrt();
+        let cosine = if nd > 0.0 && nh > 0.0 {
+            dot / (nd * nh)
+        } else {
+            0.0
+        };
+        // A layer taken from the regrouped folder carries re-quantised weights:
+        // measured 0.992 against the group-32 kernels (12 % of the block's
+        // output); an out-of-bounds read gives noise, far below either bar.
+        let bar = if ov.is_regrouped(*lid) { 0.98 } else { 0.995 };
+        let ok = cosine.is_finite() && cosine > bar;
+        tracing::info!(
+            target: "cascadia::inkling",
+            event = "ov_moe_high_id_check",
+            layer = *lid,
+            cosine,
+            ok,
+        );
+        // Also as integers on a "stage profile" line: the fleet's beacon relays
+        // those from every rank, the log itself stays on the box.
+        println!(
+            "MC{lid} probe stage profile layer={lid} cos_ppm={} ok={}",
+            (cosine.clamp(0.0, 1.0) * 1e6) as u64,
+            u8::from(ok)
+        );
+        // Reported everywhere; ENFORCED (the layer leaves the device) only with
+        // CASCADIA_INKLING_OV_MOE_CHECK=enforce, until the check has a record.
+        let enforce =
+            std::env::var("CASCADIA_INKLING_OV_MOE_CHECK").is_ok_and(|v| v.trim() == "enforce");
+        if !ok && !enforce {
+            return true;
+        }
+        if !ok {
+            ov.fail_layer(
+                *lid,
+                &format!("device output for expert ids {ids:?} disagrees with the host kernels (cosine {cosine:.4})"),
+            );
+        }
+        ok
     }
 
     /// `rows` rows through the fused backend: route each row here, dispatch
@@ -751,8 +904,23 @@ impl MoeLayer {
         out: &mut [f32],
         streamed: bool,
     ) {
+        self.forward_block_impl(xs, lo, hi, out, streamed, row_gemm());
+    }
+
+    /// `gemm`: run an int4 expert's rows (and the shared experts' block) as one
+    /// multi-input pass — see [`row_gemm`]. Bit-identical to `gemm = false`.
+    fn forward_block_impl(
+        &self,
+        xs: &[f32],
+        lo: usize,
+        hi: usize,
+        out: &mut [f32],
+        streamed: bool,
+        gemm: bool,
+    ) {
         let (hidden, k) = (self.hidden, self.top_k);
         let nblk = hi - lo;
+        let row = |br: usize| &xs[(lo + br) * hidden..(lo + br + 1) * hidden];
 
         // 1. Route every row; remember each (row, slot)'s expert + weight and the
         //    per-expert occurrence list.
@@ -815,6 +983,10 @@ impl MoeLayer {
         let visit = |(e, slots): (usize, &Vec<usize>)| {
             let mapped = self.w.experts[e].as_mmap();
             if let (Some(m), Some(hit)) = (mapped, hit_map.get(&e)) {
+                if gemm && slots.len() >= 2 {
+                    let rows: Vec<&[f32]> = slots.iter().map(|&s| row(s / k)).collect();
+                    return (e, m.swiglu_rows_from(hit.as_slice(), &rows));
+                }
                 let mut ys = Vec::with_capacity(slots.len() * hidden);
                 for &s in slots {
                     let br = s / k;
@@ -841,19 +1013,27 @@ impl MoeLayer {
                 }
                 _ => false,
             };
-            let mut ys = Vec::with_capacity(slots.len() * hidden);
-            for &s in slots {
-                let br = s / k;
-                let x = &xs[(lo + br) * hidden..(lo + br + 1) * hidden];
-                let y = if ready {
-                    mapped
-                        .unwrap()
-                        .swiglu_from(lease.as_ref().unwrap().buffers[0].as_slice(), x)
-                } else {
-                    self.w.experts[e].forward(x, hidden, self.inter)
-                };
-                ys.extend_from_slice(&y);
-            }
+            let ys = if ready && gemm && slots.len() >= 2 {
+                let rows: Vec<&[f32]> = slots.iter().map(|&s| row(s / k)).collect();
+                mapped
+                    .unwrap()
+                    .swiglu_rows_from(lease.as_ref().unwrap().buffers[0].as_slice(), &rows)
+            } else {
+                let mut ys = Vec::with_capacity(slots.len() * hidden);
+                for &s in slots {
+                    let br = s / k;
+                    let x = &xs[(lo + br) * hidden..(lo + br + 1) * hidden];
+                    let y = if ready {
+                        mapped
+                            .unwrap()
+                            .swiglu_from(lease.as_ref().unwrap().buffers[0].as_slice(), x)
+                    } else {
+                        self.w.experts[e].forward(x, hidden, self.inter)
+                    };
+                    ys.extend_from_slice(&y);
+                }
+                ys
+            };
             if ready && cache_on {
                 // Admit the freshly read bytes (a miss) after its rows computed;
                 // the lease gets any evicted allocation back and drops it.
@@ -901,7 +1081,23 @@ impl MoeLayer {
                 ey[s * hidden..(s + 1) * hidden].copy_from_slice(&ys[i * hidden..(i + 1) * hidden]);
             }
         }
-        // The shared experts per row (S_s(x_row), in s order).
+        // The shared experts (S_s(x_row), in s order). Every row uses both, so
+        // with `gemm` each runs ONCE over the whole block (`shared_blk[s]` is
+        // `[nblk, hidden]`); otherwise per row (`shared_y[br][s]`).
+        let shared_blk: Vec<Vec<f32>> = if gemm && nblk >= 2 {
+            let rows: Vec<&[f32]> = (0..nblk).map(row).collect();
+            let one = |s: &AnyExpert| {
+                super::ffn::forward_rows(s, &rows, hidden, self.inter, par_experts())
+            };
+            if par_experts() {
+                use rayon::prelude::*;
+                self.w.shared.par_iter().map(one).collect()
+            } else {
+                self.w.shared.iter().map(one).collect()
+            }
+        } else {
+            Vec::new()
+        };
         let shared_row = |br: usize| -> Vec<Vec<f32>> {
             let x = &xs[(lo + br) * hidden..(lo + br + 1) * hidden];
             self.w
@@ -910,7 +1106,9 @@ impl MoeLayer {
                 .map(|s| s.forward(x, hidden, self.inter))
                 .collect()
         };
-        let shared_y: Vec<Vec<Vec<f32>>> = if par_experts() {
+        let shared_y: Vec<Vec<Vec<f32>>> = if !shared_blk.is_empty() || self.w.shared.is_empty() {
+            Vec::new()
+        } else if par_experts() {
             use rayon::prelude::*;
             (0..nblk).into_par_iter().map(shared_row).collect()
         } else {
@@ -928,7 +1126,11 @@ impl MoeLayer {
                 }
             }
             let g = &gammas[br * self.n_shared..(br + 1) * self.n_shared];
-            for (y, &gs) in shared_y[br].iter().zip(g) {
+            for (si, &gs) in g.iter().enumerate().take(self.w.shared.len()) {
+                let y: &[f32] = match shared_blk.get(si) {
+                    Some(blk) => &blk[br * hidden..(br + 1) * hidden],
+                    None => &shared_y[br][si],
+                };
                 for (oo, &yi) in o.iter_mut().zip(y) {
                     *oo += gs * yi;
                 }
@@ -946,6 +1148,11 @@ pub struct DenseMlp {
     pub global_scale: f32,
     /// Optional OpenVINO backend for this MLP (`(layer index, backend)`).
     ov: Option<(u32, Arc<super::ov_expert::OvExperts>)>,
+    /// Optional all-rows-in-one-call device backend ([`super::ov_dense`]).
+    ov_dense: Option<(u32, Arc<super::ov_dense::OvDense>)>,
+    /// The same MLP as an all-slices-active fused-experts layer
+    /// (`(layer, backend, slices)`, see [`Self::attach_ov_dense_moe`]).
+    ov_dense_moe: Option<(u32, Arc<super::ov_moe::OvMoe>, usize)>,
 }
 
 impl DenseMlp {
@@ -955,7 +1162,131 @@ impl DenseMlp {
             inter,
             global_scale,
             ov: None,
+            ov_dense: None,
+            ov_dense_moe: None,
         }
+    }
+
+    /// Run this MLP through the GPU plugin's fused-experts op: the inner
+    /// neurons cut into `slices` "experts" as wide as a routed one, every row
+    /// selecting all of them with weight 1 (`tools/inkling_moe_layer_ov.py
+    /// --dense-as-moe`, `<model>/dense_moe_ov`). `down(silu(gate x) * up x)`
+    /// is a sum over inner neurons, so the slices add up to the same vector and
+    /// no weight is requantised. Why: three compressed MatMuls 24,576 wide read
+    /// their 4-bit weights at ~26 GB/s on the Arc B390 (9.6 ms a layer per
+    /// frame), the fused op reads the same bytes at > 80 GB/s, and the two
+    /// dense layers made rank 0 the slowest stage of the pipeline.
+    pub fn attach_ov_dense_moe(
+        &mut self,
+        layer: u32,
+        ov: Arc<super::ov_moe::OvMoe>,
+        slices: usize,
+    ) {
+        self.ov_dense_moe = Some((layer, ov, slices));
+    }
+
+    /// `rows` rows through the fused-experts form; `None` = not attached or
+    /// the device call failed (the next backend runs). Without `global_scale`.
+    pub fn dense_moe_rows(&self, xs: &[f32], rows: usize) -> Option<Vec<f32>> {
+        let (lid, ov, slices) = self.ov_dense_moe.as_ref()?;
+        let ids: Vec<i32> = (0..rows).flat_map(|_| 0..*slices as i32).collect();
+        let w = vec![1.0f32; rows * slices];
+        ov.forward(*lid, xs, rows, &ids, &w)
+    }
+
+    /// The three-MatMul device form, for the load-time comparison.
+    pub fn dense_ov_rows(&self, xs: &[f32], rows: usize) -> Option<Vec<f32>> {
+        let (lid, ov) = self.ov_dense.as_ref()?;
+        ov.forward(*lid, xs, rows)
+    }
+
+    /// Once at load: the fused-experts form against the form it replaces (the
+    /// three-MatMul device call, else the host kernel) on two synthetic rows,
+    /// and what a call of each costs (median of 17, microseconds). Goes out on
+    /// a "stage profile" line; a form that disagrees (cosine <= 0.9999) is
+    /// detached and the previous path keeps running.
+    pub fn check_dense_moe(&mut self, hidden: usize) -> bool {
+        let Some((lid, _, _)) = self.ov_dense_moe.as_ref() else {
+            return true;
+        };
+        let lid = *lid;
+        let rows = 2usize;
+        let x: Vec<f32> = (0..rows * hidden)
+            .map(|i| ((i as f32 * 0.37).sin() + (i as f32 * 0.011).cos()) * 0.05)
+            .collect();
+        let reference = |me: &Self| -> Vec<f32> {
+            me.dense_ov_rows(&x, rows).unwrap_or_else(|| {
+                x.chunks_exact(hidden)
+                    .flat_map(|r| me.w.forward(r, hidden, me.inter))
+                    .collect()
+            })
+        };
+        let median = |f: &dyn Fn() -> bool| -> u128 {
+            let mut us: Vec<u128> = (0..20)
+                .filter_map(|i| {
+                    let t0 = std::time::Instant::now();
+                    let ok = f();
+                    (i >= 3 && ok).then(|| t0.elapsed().as_micros())
+                })
+                .collect();
+            us.sort_unstable();
+            us.get(us.len() / 2).copied().unwrap_or(0)
+        };
+        let got = self.dense_moe_rows(&x, rows);
+        let want = reference(self);
+        let (cosine, rel) = match got.as_ref() {
+            Some(g) if g.len() == want.len() => {
+                let dot: f64 = g
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| *a as f64 * *b as f64)
+                    .sum();
+                let ng: f64 = g.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+                let nw: f64 = want.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+                let diff: f64 = g
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                if ng > 0.0 && nw > 0.0 {
+                    (dot / (ng * nw), diff / nw)
+                } else {
+                    (0.0, 1.0)
+                }
+            }
+            _ => (0.0, 1.0),
+        };
+        let x1 = &x[..hidden];
+        let moe1 = median(&|| self.dense_moe_rows(x1, 1).is_some());
+        let moe2 = median(&|| self.dense_moe_rows(&x, 2).is_some());
+        let ref1 = median(&|| self.dense_ov_rows(x1, 1).is_some());
+        let ref2 = median(&|| self.dense_ov_rows(&x, 2).is_some());
+        let ok = cosine.is_finite() && cosine > 0.9999;
+        tracing::info!(target: "cascadia::inkling", event = "dense_moe_check", layer = lid, cosine, rel, moe1_us = moe1 as u64, ref1_us = ref1 as u64, ok);
+        let line = format!(
+            "DM{lid} probe stage profile layer={lid} cos_ppm={} rel_ppm={} moe1_us={moe1} moe2_us={moe2} ref1_us={ref1} ref2_us={ref2} ok={}",
+            (cosine.clamp(0.0, 1.0) * 1e6) as u64,
+            (rel.clamp(0.0, 1.0) * 1e6) as u64,
+            u8::from(ok)
+        );
+        for _ in 0..3 {
+            println!("{line}");
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        if !ok {
+            self.ov_dense_moe = None;
+        }
+        ok
+    }
+
+    /// Run this MLP's rows on the device backend (see [`super::ov_dense`]).
+    pub fn attach_ov_dense(&mut self, layer: u32, ov: Arc<super::ov_dense::OvDense>) {
+        self.ov_dense = Some((layer, ov));
+    }
+
+    pub fn ov_dense(&self) -> Option<(u32, &Arc<super::ov_dense::OvDense>)> {
+        self.ov_dense.as_ref().map(|(l, o)| (*l, o))
     }
 
     pub fn attach_ov(&mut self, layer: u32, ov: Arc<super::ov_expert::OvExperts>) {
@@ -973,8 +1304,49 @@ impl DenseMlp {
         Some((1 - bad.len(), bad))
     }
 
+    /// [`Self::forward`] for `rows` rows (`xs` = `[rows, hidden]`), bit-identical
+    /// per row. The int4 weights (226 MB a layer) cross the memory bus once for
+    /// the block instead of once per row: on the pipeline's rank 0 the two
+    /// dense layers cost more per row than its four MoE layers and made it the
+    /// slowest stage of the fleet.
+    pub fn forward_rows(&self, xs: &[f32], rows: usize, hidden: usize) -> Vec<f32> {
+        if let Some(mut y) = self.dense_moe_rows(xs, rows) {
+            for v in y.iter_mut() {
+                *v *= self.global_scale;
+            }
+            return y;
+        }
+        if let Some((lid, ov)) = self.ov_dense.as_ref() {
+            if let Some(mut y) = ov.forward(*lid, xs, rows) {
+                for v in y.iter_mut() {
+                    *v *= self.global_scale;
+                }
+                return y;
+            }
+        }
+        if rows < 2 || self.ov.is_some() || !row_gemm() {
+            let mut out = Vec::with_capacity(rows * hidden);
+            for row in xs.chunks_exact(hidden) {
+                out.extend(self.forward_fallback(row, hidden));
+            }
+            return out;
+        }
+        let views: Vec<&[f32]> = xs.chunks_exact(hidden).collect();
+        let mut y = super::ffn::forward_rows(&self.w, &views, hidden, self.inter, true);
+        for v in y.iter_mut() {
+            *v *= self.global_scale;
+        }
+        y
+    }
+
     /// `down(silu(gate·x) · up·x) · global_scale` for one token (`[hidden]`).
     pub fn forward(&self, x: &[f32], hidden: usize) -> Vec<f32> {
+        self.forward_rows(x, 1, hidden)
+    }
+
+    /// Device batch paths have already been attempted. Do not re-enter
+    /// `forward_rows`: a failed one-row device call would recurse forever.
+    fn forward_fallback(&self, x: &[f32], hidden: usize) -> Vec<f32> {
         let mut y = match &self.ov {
             Some((lid, ov)) => ov
                 .dense(*lid, x)
@@ -991,6 +1363,32 @@ impl DenseMlp {
 #[cfg(test)]
 mod prefill_read_tests {
     use super::*;
+
+    #[test]
+    fn failed_dense_device_call_falls_back_once_for_one_row() {
+        let weights = || AnyExpert::EagerF32 {
+            wg: vec![1., 0., 0., 1.],
+            wu: vec![0.5, 0., 0., 0.5],
+            wd: vec![1., 0., 0., 1.],
+        };
+        let reference = DenseMlp::new(weights(), 2, 0.25);
+        let mut candidate = DenseMlp::new(weights(), 2, 0.25);
+        let missing = tempfile::tempdir().unwrap();
+        let device = Arc::new(super::super::ov_moe::OvMoe::new(
+            missing.path().to_owned(),
+            "CPU".into(),
+            2,
+            1,
+            1,
+            None,
+            None,
+        ));
+        candidate.attach_ov_dense_moe(0, device, 1);
+        let input = [0.5, -0.25];
+        let expected = reference.forward(&input, 2);
+        assert_eq!(candidate.forward(&input, 2), expected);
+        assert_eq!(candidate.forward_rows(&input, 1, 2), expected);
+    }
 
     #[test]
     fn streamed_prefill_preserves_real_int4_bits_across_multiple_cohorts() {
@@ -1036,5 +1434,57 @@ mod prefill_read_tests {
             actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
             expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
         );
+    }
+
+    /// `CASCADIA_INKLING_ROW_GEMM` on vs off, on the real int4 fixture bins: 8
+    /// routed experts top-3 + both shared experts (one mapped, one an owned
+    /// copy — `CASCADIA_INKLING_OWN_SHARED`), 29 rows so every expert carries
+    /// several. The block through the multi-input kernel must equal the
+    /// per-row kernels bit for bit, mapped and streamed, and so must a row
+    /// computed alone (a stream decoded alone vs in a batch).
+    #[test]
+    fn row_gemm_block_is_bit_identical_to_the_per_row_kernels() {
+        use crate::dsv4::expert_mmap::MmapExpert;
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/inkling_export/experts/layer_01");
+        let open = |name: String| MmapExpert::open(&directory.join(name), 64, 32).unwrap();
+        let (hidden, n_routed, n_shared, rows) = (64usize, 8usize, 2usize, 29usize);
+        let mut seed = 0x9E37_79B9u64;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 40) as f32) / (1u64 << 24) as f32 - 0.5
+        };
+        let weights = MoeWeights {
+            router_w: (0..(n_routed + n_shared) * hidden)
+                .map(|_| next())
+                .collect(),
+            router_bias: vec![0.0; n_routed],
+            global_scale: 8.0,
+            experts: (0..n_routed)
+                .map(|e| AnyExpert::Mmap(open(format!("expert_{e:03}.bin"))))
+                .collect(),
+            shared: vec![
+                AnyExpert::Mmap(open("expert_shared0.bin".into())),
+                AnyExpert::Mmap(open("expert_shared1.bin".into()))
+                    .into_owned_int4()
+                    .unwrap(),
+            ],
+        };
+        let layer = MoeLayer::new(hidden, 32, 3, 1.0, weights);
+        let xs: Vec<f32> = (0..rows * hidden).map(|_| 4.0 * next()).collect();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let mut per_row = vec![0.0; xs.len()];
+        layer.forward_block_impl(&xs, 0, rows, &mut per_row, false, false);
+        assert!(per_row.iter().any(|&v| v != 0.0));
+        for streamed in [false, true] {
+            let mut gemm = vec![0.0; xs.len()];
+            layer.forward_block_impl(&xs, 0, rows, &mut gemm, streamed, true);
+            assert_eq!(bits(&gemm), bits(&per_row), "block, streamed={streamed}");
+            let mut alone = vec![0.0; xs.len()];
+            for r in 0..rows {
+                layer.forward_block_impl(&xs, r, r + 1, &mut alone, streamed, true);
+            }
+            assert_eq!(bits(&alone), bits(&per_row), "alone, streamed={streamed}");
+        }
     }
 }

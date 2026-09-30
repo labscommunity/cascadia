@@ -1,0 +1,64 @@
+### Production simulation D (module 0 current at every token; modules 1..7 run ONLY at the anchor after each miss)
+
+36 sequences, 2165 chains (anchors), mean accepted run 1.65
+
+| draft k | n (chain right so far) | a_k given drafts 1..k-1 right | P(drafts 1..k right) |
+|---|---|---|---|
+| 1 | 2165 | 0.659 | 0.659 |
+| 2 | 1419 | 0.612 | 0.404 |
+| 3 | 863 | 0.596 | 0.240 |
+| 4 | 510 | 0.596 | 0.143 |
+| 5 | 302 | 0.656 | 0.094 |
+| 6 | 198 | 0.631 | 0.059 |
+| 7 | 124 | 0.685 | 0.041 |
+| 8 | 84 | 0.702 | 0.028 |
+
+E[accepted drafts per chain] = 1.67 -> (L + E*T)/(1+E) = 203 ms per token = 4.9 tok/s
+
+| family | seqs | chains | a1 at anchors | E[accepted] | implied tok/s |
+|---|---|---|---|---|---|
+| explain | 3 | 192 | 0.609 | 1.50 | 4.7 |
+| code | 3 | 164 | 0.732 | 1.93 | 5.3 |
+| arithmetic | 3 | 137 | 0.796 | 2.53 | 6.1 |
+| story | 3 | 213 | 0.610 | 1.25 | 4.3 |
+| lists | 3 | 183 | 0.678 | 1.63 | 4.9 |
+| tables | 3 | 214 | 0.556 | 1.25 | 4.3 |
+| rewriting | 3 | 157 | 0.726 | 2.06 | 5.5 |
+| facts | 3 | 211 | 0.588 | 1.27 | 4.3 |
+| poem | 3 | 215 | 0.577 | 1.24 | 4.3 |
+| how-to | 3 | 179 | 0.659 | 1.68 | 5.0 |
+| translation | 3 | 144 | 0.792 | 2.35 | 5.9 |
+| true/false | 3 | 156 | 0.724 | 2.10 | 5.5 |
+
+### E2 raw logit lens (36 sequences, 5760 generated positions)
+
+| stages waited k (state leaving rank k-1 = layer) | top-1 | top-5 | bar to beat today (spec section 1) |
+|---|---|---|---|
+| 1 (rank 0, layer 5) | 0.000 | 0.000 | 0.42 |
+| 2 (rank 1, layer 11) | 0.000 | 0.000 | 0.47 |
+| 3 (rank 2, layer 17) | 0.000 | 0.000 | 0.54 |
+| 4 (rank 3, layer 23) | 0.000 | 0.000 | 0.62 |
+| 5 (rank 4, layer 29) | 0.000 | 0.022 | 0.73 |
+| 6 (rank 5, layer 35) | 0.027 | 0.078 | 0.90 |
+| 7 (rank 6, layer 41) | 0.072 | 0.159 | impossible |
+| 8 (rank 7, layer 47) | 0.157 | 0.301 | impossible |
+| 9 (rank 8, layer 53) | 0.262 | 0.424 | impossible |
+| 10 (rank 9, layer 59) | 0.488 | 0.678 | impossible |
+| 11 (rank 10, layer 65) | 1.000 | 1.000 | (final layer: self-check) |
+
+top-1 by family:
+
+| family | L5 | L11 | L17 | L23 | L29 | L35 | L41 | L47 | L53 | L59 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| explain | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.02 | 0.07 | 0.17 | 0.28 | 0.53 |
+| code | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.03 | 0.09 | 0.21 | 0.33 | 0.54 |
+| arithmetic | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.04 | 0.08 | 0.17 | 0.28 | 0.45 |
+| story | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.03 | 0.06 | 0.14 | 0.22 | 0.45 |
+| lists | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.04 | 0.11 | 0.19 | 0.31 | 0.52 |
+| tables | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.02 | 0.05 | 0.12 | 0.17 | 0.44 |
+| rewriting | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.02 | 0.06 | 0.17 | 0.29 | 0.54 |
+| facts | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.01 | 0.09 | 0.14 | 0.24 | 0.47 |
+| poem | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.02 | 0.05 | 0.11 | 0.21 | 0.39 |
+| how-to | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.03 | 0.07 | 0.17 | 0.28 | 0.47 |
+| translation | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.01 | 0.06 | 0.16 | 0.26 | 0.54 |
+| true/false | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.04 | 0.07 | 0.14 | 0.28 | 0.51 |

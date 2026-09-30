@@ -1,0 +1,44 @@
+{
+ "exp": "034_context_scan",
+ "sizes": [
+  1024,
+  8192,
+  32768,
+  65536,
+  102400
+ ],
+ "budget_s": 780,
+ "new_tokens": 32,
+ "results": [
+  {
+   "size": 1024,
+   "prompt_tokens": 1040,
+   "ttft_s": 34.43,
+   "prefill_tok_s": 30.2,
+   "decode_tok_s": 3.472,
+   "tokens": 32,
+   "wall_s": 43.36,
+   "needle_found": false,
+   "error": null,
+   "streams": 1,
+   "answer": "n the note near the beginning of the collection. Looking back at the documents:\n\nIn the black hole explanation document,",
+   "others": []
+  },
+  {
+   "size": 8192,
+   "prompt_tokens": null,
+   "ttft_s": null,
+   "prefill_tok_s": null,
+   "decode_tok_s": null,
+   "tokens": 0,
+   "wall_s": 25.14,
+   "needle_found": false,
+   "error": "{'message': 'engine made no progress for 3 consecutive steps', 'type': 'engine_error'}",
+   "streams": 1,
+   "answer": "",
+   "others": []
+  }
+ ],
+ "wall_s": 69,
+ "note": "finished"
+}

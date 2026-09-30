@@ -1,0 +1,38 @@
+{
+ "ok": false,
+ "prompts": [
+  {
+   "i": 0,
+   "match_chars": 0,
+   "of": 147,
+   "exact": false,
+   "broken": true,
+   "tok_s": null,
+   "ttft_s": null,
+   "text": "",
+   "error": "server error: {'message': 'send_stream_open: not connected; call connect()/accept() first', 'type': 'engine_error'}"
+  },
+  {
+   "i": 1,
+   "match_chars": 0,
+   "of": 150,
+   "exact": false,
+   "broken": true,
+   "tok_s": null,
+   "ttft_s": null,
+   "text": "",
+   "error": "server error: {'message': 'send_stream_open: not connected; call connect()/accept() first', 'type': 'engine_error'}"
+  },
+  {
+   "i": 5,
+   "match_chars": 0,
+   "of": 112,
+   "exact": false,
+   "broken": true,
+   "tok_s": null,
+   "ttft_s": null,
+   "text": "",
+   "error": "server error: {'message': 'send_stream_open: not connected; call connect()/accept() first', 'type': 'engine_error'}"
+  }
+ ]
+}

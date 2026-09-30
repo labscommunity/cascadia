@@ -187,6 +187,29 @@ pub enum FrameKind {
     StreamClose = 0x53_4D_45_62, // "SME\x62"
     /// up: `batch_id u32 | rows u32 | (slot u32, token i64) × rows`.
     StreamTokens = 0x53_4D_45_63, // "SME\x63"
+    /// down: `batch_id u32 | slot u32 | rows u32 | flags u32 | SamplingConfig | tensor [1, rows, H]`
+    /// — one window of a prompt longer than a `StreamOpen` may carry
+    /// ([`MAX_STREAM_ROWS`]). [`STREAM_FEED_OPEN`] on the first window opens
+    /// the slot, the rows append at the slot's position, and only the window
+    /// with [`STREAM_FEED_FINAL`] is sampled and answered with `StreamTokens`.
+    /// Windows travel the pipeline back to back, so rank 1 works on the first
+    /// while rank 0 computes the second.
+    StreamFeed = 0x53_4D_45_64, // "SME\x64"
+    /// down, one-way: `slot u32 | len u32` — roll `slot` back to `len`
+    /// positions on every rank (a speculated token turned out wrong; the
+    /// frames that carried it and its successors are ahead of this one on the
+    /// wire, so every rank has processed them by the time it reads this).
+    StreamRewind = 0x53_4D_45_65, // "SME\x65"
+    /// down: `batch_id u32 | n u32 | (slot u32, rows u32, SamplingConfig) × n | tensor [1, Σrows, H]`
+    /// — open `n` slots and prefill their prompts in one pass (rows end to
+    /// end), so the prompts share expert reads; the last rank samples each
+    /// prompt's final row and replies one `StreamTokens` with `n` entries.
+    StreamOpenBatch = 0x53_4D_45_66, // "SME\x66"
+    /// Idle-chain handshake, with no model work or sequence state. The last
+    /// rank answers on the ordinary upstream path with ChainReadyAck.
+    ChainReady = 0x53_4D_45_67,
+    /// up: last rank u32 | total ranks u32. Relayed through every stage.
+    ChainReadyAck = 0x53_4D_45_68,
 }
 
 impl FrameKind {
@@ -218,9 +241,33 @@ impl FrameKind {
             x if x == FrameKind::StreamDecode as u32 => Some(FrameKind::StreamDecode),
             x if x == FrameKind::StreamClose as u32 => Some(FrameKind::StreamClose),
             x if x == FrameKind::StreamTokens as u32 => Some(FrameKind::StreamTokens),
+            x if x == FrameKind::StreamFeed as u32 => Some(FrameKind::StreamFeed),
+            x if x == FrameKind::StreamRewind as u32 => Some(FrameKind::StreamRewind),
+            x if x == FrameKind::StreamOpenBatch as u32 => Some(FrameKind::StreamOpenBatch),
+            x if x == FrameKind::ChainReady as u32 => Some(FrameKind::ChainReady),
+            x if x == FrameKind::ChainReadyAck as u32 => Some(FrameKind::ChainReadyAck),
             _ => None,
         }
     }
+}
+
+/// A successful probe proves every worker has reached its receive loop, not
+/// merely that its TCP listener has opened. No generation request is needed.
+pub async fn probe_chain(client: &mut ActivationClient, total: u32) -> TransportResult<()> {
+    client
+        .send_raw(&(FrameKind::ChainReady as u32).to_be_bytes())
+        .await?;
+    let ack = client.recv_raw(12).await?;
+    let expected: Vec<u8> = [FrameKind::ChainReadyAck as u32, total - 1, total]
+        .into_iter()
+        .flat_map(u32::to_be_bytes)
+        .collect();
+    if ack != expected {
+        return Err(TransportError::Io(std::io::Error::other(
+            "invalid chain readiness acknowledgement",
+        )));
+    }
+    Ok(())
 }
 
 /// Read one frame-kind code from the wire. Returns `None` on a clean
@@ -1436,6 +1483,159 @@ pub async fn recv_stream_open_body_server(
     Ok((batch_id, slot, rows, sampling, h))
 }
 
+/// Prompts one `StreamOpenBatch` may carry.
+pub const MAX_OPEN_BATCH: u32 = 64;
+
+/// down: open and prefill several slots at once (see [`FrameKind::StreamOpenBatch`]).
+/// `segs[i] = (slot, rows, sampling)`; `hidden` holds the prompts' rows end to end.
+pub async fn send_stream_open_batch(
+    cli: &Mutex<ActivationClient>,
+    batch_id: u32,
+    segs: &[(u32, u32, SamplingConfig)],
+    hidden_f32: &[f32],
+    h: u32,
+) -> TransportResult<()> {
+    let total: u32 = segs.iter().map(|s| s.1).sum();
+    let n = segs.len() as u32;
+    if n == 0 || n > MAX_OPEN_BATCH || total == 0 || total > MAX_STREAM_ROWS {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream open batch: {n} prompts, {total} rows out of range"
+        ))));
+    }
+    let mut header = Vec::with_capacity(12 + segs.len() * (8 + SAMPLING_WIRE_BYTES));
+    header.extend_from_slice(&(FrameKind::StreamOpenBatch as u32).to_be_bytes());
+    header.extend_from_slice(&batch_id.to_be_bytes());
+    header.extend_from_slice(&n.to_be_bytes());
+    for (slot, rows, sampling) in segs {
+        header.extend_from_slice(&slot.to_be_bytes());
+        header.extend_from_slice(&rows.to_be_bytes());
+        let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+        encode_sampling(sampling, &mut sbytes);
+        header.extend_from_slice(&sbytes);
+    }
+    let tensor = hidden_to_tensor(hidden_f32, [1, total, h]);
+    let mut guard = cli.lock().await;
+    guard.send_raw(&header).await?;
+    guard.send(&tensor).await?;
+    Ok(())
+}
+
+/// Body of a `StreamOpenBatch` (kind consumed): `(batch_id, [(slot, rows, sampling)], hidden)`.
+#[allow(clippy::type_complexity)]
+pub async fn recv_stream_open_batch_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u32, Vec<(u32, u32, SamplingConfig)>, Vec<f32>)> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(8).await?;
+    if raw.len() != 8 {
+        return Err(TransportError::SocketClosed);
+    }
+    let (batch_id, n) = (be_u32(&raw[0..4]), be_u32(&raw[4..8]));
+    if n == 0 || n > MAX_OPEN_BATCH {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream open batch: {n} prompts out of range 1..={MAX_OPEN_BATCH}"
+        ))));
+    }
+    let per = 8 + SAMPLING_WIRE_BYTES;
+    let raw = guard.recv_raw(n as usize * per).await?;
+    if raw.len() != n as usize * per {
+        return Err(TransportError::SocketClosed);
+    }
+    let mut segs = Vec::with_capacity(n as usize);
+    let mut total = 0u32;
+    for c in raw.chunks_exact(per) {
+        let (slot, rows) = (be_u32(&c[0..4]), be_u32(&c[4..8]));
+        let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+        sbytes.copy_from_slice(&c[8..]);
+        total = total.saturating_add(rows);
+        if rows == 0 || total > MAX_STREAM_ROWS {
+            return Err(TransportError::Io(std::io::Error::other(format!(
+                "stream open batch: prompt of {rows} rows, {total} so far, limit {MAX_STREAM_ROWS}"
+            ))));
+        }
+        segs.push((slot, rows, decode_sampling(&sbytes)));
+    }
+    let (tensor, _) = guard.recv().await?;
+    drop(guard);
+    if tensor.shape[1] != total {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream open batch: tensor shape[1]={} != {total} rows",
+            tensor.shape[1]
+        ))));
+    }
+    let (h, _) = tensor_to_hidden(&tensor)?;
+    Ok((batch_id, segs, h))
+}
+
+/// `StreamFeed` flag: this is the prompt's first window, open the slot.
+pub const STREAM_FEED_OPEN: u32 = 1;
+/// `StreamFeed` flag: this is the prompt's last window, sample its final row
+/// and reply `StreamTokens`.
+pub const STREAM_FEED_FINAL: u32 = 2;
+
+/// down: `rows` more prompt positions of `slot` (see [`FrameKind::StreamFeed`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn send_stream_feed(
+    cli: &Mutex<ActivationClient>,
+    batch_id: u32,
+    slot: u32,
+    flags: u32,
+    sampling: &SamplingConfig,
+    hidden_f32: &[f32],
+    rows: u32,
+    h: u32,
+) -> TransportResult<()> {
+    let mut header = [0u8; 20 + SAMPLING_WIRE_BYTES];
+    header[0..4].copy_from_slice(&(FrameKind::StreamFeed as u32).to_be_bytes());
+    header[4..8].copy_from_slice(&batch_id.to_be_bytes());
+    header[8..12].copy_from_slice(&slot.to_be_bytes());
+    header[12..16].copy_from_slice(&rows.to_be_bytes());
+    header[16..20].copy_from_slice(&flags.to_be_bytes());
+    let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+    encode_sampling(sampling, &mut sbytes);
+    header[20..].copy_from_slice(&sbytes);
+    let tensor = hidden_to_tensor(hidden_f32, [1, rows, h]);
+    let mut guard = cli.lock().await;
+    guard.send_raw(&header).await?;
+    guard.send(&tensor).await?;
+    Ok(())
+}
+
+/// Body of a `StreamFeed` (kind consumed): `(batch_id, slot, rows, flags, sampling, hidden)`.
+pub async fn recv_stream_feed_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u32, u32, u32, u32, SamplingConfig, Vec<f32>)> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(16 + SAMPLING_WIRE_BYTES).await?;
+    if raw.len() != 16 + SAMPLING_WIRE_BYTES {
+        return Err(TransportError::SocketClosed);
+    }
+    let (batch_id, slot, rows, flags) = (
+        be_u32(&raw[0..4]),
+        be_u32(&raw[4..8]),
+        be_u32(&raw[8..12]),
+        be_u32(&raw[12..16]),
+    );
+    if rows == 0 || rows > MAX_STREAM_ROWS {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream feed: rows {rows} out of range 1..={MAX_STREAM_ROWS}"
+        ))));
+    }
+    let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+    sbytes.copy_from_slice(&raw[16..]);
+    let sampling = decode_sampling(&sbytes);
+    let (tensor, _) = guard.recv().await?;
+    drop(guard);
+    if tensor.shape[1] != rows {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "stream feed: tensor shape[1]={} != rows {rows}",
+            tensor.shape[1]
+        ))));
+    }
+    let (h, _) = tensor_to_hidden(&tensor)?;
+    Ok((batch_id, slot, rows, flags, sampling, h))
+}
+
 /// down: one decode token for each `(slot, pos)` (`hidden` = `[rows.len(), h]`).
 pub async fn send_stream_decode(
     cli: &Mutex<ActivationClient>,
@@ -1508,6 +1708,34 @@ pub async fn send_stream_close(cli: &Mutex<ActivationClient>, slot: u32) -> Tran
     let mut guard = cli.lock().await;
     guard.send_raw(&bytes).await?;
     Ok(())
+}
+
+/// down, one-way: roll `slot` back to `len` positions on every downstream rank.
+pub async fn send_stream_rewind(
+    cli: &Mutex<ActivationClient>,
+    slot: u32,
+    len: u32,
+) -> TransportResult<()> {
+    let mut bytes = [0u8; 12];
+    bytes[0..4].copy_from_slice(&(FrameKind::StreamRewind as u32).to_be_bytes());
+    bytes[4..8].copy_from_slice(&slot.to_be_bytes());
+    bytes[8..12].copy_from_slice(&len.to_be_bytes());
+    let mut guard = cli.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Body of a `StreamRewind` (kind consumed): `(slot, len)`.
+pub async fn recv_stream_rewind_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u32, u32)> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(8).await?;
+    drop(guard);
+    if raw.len() != 8 {
+        return Err(TransportError::SocketClosed);
+    }
+    Ok((be_u32(&raw[0..4]), be_u32(&raw[4..8])))
 }
 
 /// Body of a `StreamClose` (kind consumed): the slot.

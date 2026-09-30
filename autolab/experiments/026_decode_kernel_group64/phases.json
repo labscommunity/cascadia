@@ -1,0 +1,42 @@
+[
+ {
+  "phase": "mix15a",
+  "streams": 15,
+  "tokens_req": 128,
+  "prompt_words": 0,
+  "start": 1789948452.691895,
+  "end": 1789948538.442254,
+  "wall_s": 85.8,
+  "completed": 15,
+  "tokens": 1920,
+  "aggregate_tok_s": 22.391,
+  "sum_stream_tok_s": 24.578,
+  "ttft_mean_s": 6.67,
+  "ttft_max_s": 10.59,
+  "errors": [],
+  "sample": "<think>The user wants an explanation of glaciers suitable for a curious ten-year-old, in one short p",
+  "stream_tok_s_min": 1.585,
+  "stream_tok_s_median": 1.628,
+  "ttft_median_s": 5.88
+ },
+ {
+  "phase": "mix15b",
+  "streams": 15,
+  "tokens_req": 128,
+  "prompt_words": 0,
+  "start": 1789948550.446521,
+  "end": 1789948636.280722,
+  "wall_s": 85.8,
+  "completed": 15,
+  "tokens": 1920,
+  "aggregate_tok_s": 22.369,
+  "sum_stream_tok_s": 24.693,
+  "ttft_mean_s": 6.92,
+  "ttft_max_s": 11.19,
+  "errors": [],
+  "sample": "<think>The user wants an explanation of volcanoes for a curious ten-year-old, in one short paragraph",
+  "stream_tok_s_min": 1.58,
+  "stream_tok_s_median": 1.642,
+  "ttft_median_s": 6.69
+ }
+]

@@ -1,0 +1,8 @@
+12:55:31 PHASE fam1_code: 1/1 done, 128 tok in 40 s = 3.17 tok/s aggregate (sum of streams 3.67), ttft mean 5.7 max 5.7
+12:56:04 PHASE fam2_arith: 1/1 done, 128 tok in 22 s = 5.94 tok/s aggregate (sum of streams 8.19), ttft mean 6.0 max 6.0
+12:56:44 PHASE fam6_rewrite: 1/1 done, 128 tok in 28 s = 4.65 tok/s aggregate (sum of streams 5.85), ttft mean 5.8 max 5.8
+12:57:20 PHASE fam10_translate: 1/1 done, 128 tok in 25 s = 5.18 tok/s aggregate (sum of streams 6.60), ttft mean 5.5 max 5.5
+12:58:15 PHASE fam3_story: 1/1 done, 128 tok in 43 s = 2.99 tok/s aggregate (sum of streams 3.38), ttft mean 5.2 max 5.2
+12:58:44 PHASE fam11_truefalse: 1/1 done, 128 tok in 17 s = 7.56 tok/s aggregate (sum of streams 10.95), ttft mean 5.3 max 5.3
+12:58:56 telemetry endpoint available: True
+finished

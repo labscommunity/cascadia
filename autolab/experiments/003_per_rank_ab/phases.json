@@ -1,0 +1,53 @@
+[
+ {
+  "phase": "fresh1",
+  "streams": 1,
+  "tokens_req": 64,
+  "prompt_words": 0,
+  "start": 1789896850.1558971,
+  "end": 1789896892.416693,
+  "wall_s": 42.3,
+  "completed": 1,
+  "tokens": 64,
+  "aggregate_tok_s": 1.514,
+  "sum_stream_tok_s": 1.761,
+  "ttft_mean_s": 6.48,
+  "ttft_max_s": 6.48,
+  "errors": [],
+  "sample": "<think>The user wants one surprising fact about a water tower and an explanation. I need to pick som"
+ },
+ {
+  "phase": "s48",
+  "streams": 48,
+  "tokens_req": 64,
+  "prompt_words": 0,
+  "start": 1789896904.432918,
+  "end": 1789897101.7949,
+  "wall_s": 197.4,
+  "completed": 48,
+  "tokens": 2997,
+  "aggregate_tok_s": 15.185,
+  "sum_stream_tok_s": 21.257,
+  "ttft_mean_s": 52.76,
+  "ttft_max_s": 66.66,
+  "errors": [],
+  "sample": "<think>The user wants an explanation of why the sky is blue in exactly three sentences. I need to be"
+ },
+ {
+  "phase": "s176",
+  "streams": 176,
+  "tokens_req": 32,
+  "prompt_words": 0,
+  "start": 1789897113.798541,
+  "end": 1789897417.531039,
+  "wall_s": 303.7,
+  "completed": 176,
+  "tokens": 5632,
+  "aggregate_tok_s": 18.543,
+  "sum_stream_tok_s": 27.959,
+  "ttft_mean_s": 93.88,
+  "ttft_max_s": 148.88,
+  "errors": [],
+  "sample": "<think>The user wants an explanation of why the sky is blue in exactly three sentences. I need to be"
+ }
+]

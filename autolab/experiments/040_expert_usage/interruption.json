@@ -1,0 +1,10 @@
+{
+  "status": "interrupted; not a completed expert-usage measurement",
+  "serial_gate_pass": true,
+  "concurrent_gate_pass": true,
+  "completed_timed_phases": 0,
+  "partial_layers": 41,
+  "reason": "API HTTP 000; signed report stopped advancing; Mac tunnel process alive; power failure not confirmed",
+  "action": "benchmark terminated; all fleet traffic stopped; no publish after loss",
+  "training_collection_started": false
+}

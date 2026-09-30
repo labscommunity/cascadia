@@ -1,0 +1,7 @@
+15:24:48 PHASE mix15a: 15/15 done, 1920 tok in 122 s = 15.68 tok/s aggregate (sum of streams 22.54), ttft mean 36.7 max 45.1
+15:26:53 PHASE mix15b: 15/15 done, 1920 tok in 113 s = 17.00 tok/s aggregate (sum of streams 23.38), ttft mean 30.0 max 36.8
+15:28:16 PHASE mix11: 11/11 done, 1056 tok in 71 s = 14.82 tok/s aggregate (sum of streams 20.75), ttft mean 19.1 max 25.7
+15:29:58 PHASE mix22: 22/22 done, 2112 tok in 90 s = 23.54 tok/s aggregate (sum of streams 32.09), ttft mean 23.0 max 30.4
+15:32:03 PHASE mix33: 33/33 done, 3168 tok in 113 s = 28.13 tok/s aggregate (sum of streams 37.66), ttft mean 27.9 max 34.5
+15:32:15 telemetry endpoint available: True
+finished

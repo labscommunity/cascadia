@@ -1,0 +1,53 @@
+[
+ {
+  "phase": "s176",
+  "streams": 176,
+  "tokens_req": 32,
+  "prompt_words": 0,
+  "start": 1789903892.5492601,
+  "end": 1789904044.666286,
+  "wall_s": 152.1,
+  "completed": 176,
+  "tokens": 5632,
+  "aggregate_tok_s": 37.024,
+  "sum_stream_tok_s": 64.175,
+  "ttft_mean_s": 59.52,
+  "ttft_max_s": 84.9,
+  "errors": [],
+  "sample": "<think>The user wants an explanation of why the sky is blue in exactly three sentences. I need to be"
+ },
+ {
+  "phase": "s264",
+  "streams": 264,
+  "tokens_req": 32,
+  "prompt_words": 0,
+  "start": 1789904056.6722188,
+  "end": 1789904276.4470358,
+  "wall_s": 219.8,
+  "completed": 264,
+  "tokens": 8448,
+  "aggregate_tok_s": 38.439,
+  "sum_stream_tok_s": 60.864,
+  "ttft_mean_s": 73.45,
+  "ttft_max_s": 117.34,
+  "errors": [],
+  "sample": "<think>The user wants an explanation of why the sky is blue in exactly three sentences. I need to be"
+ },
+ {
+  "phase": "fresh1",
+  "streams": 1,
+  "tokens_req": 64,
+  "prompt_words": 0,
+  "start": 1789904288.460117,
+  "end": 1789904314.79295,
+  "wall_s": 26.3,
+  "completed": 1,
+  "tokens": 64,
+  "aggregate_tok_s": 2.43,
+  "sum_stream_tok_s": 3.011,
+  "ttft_mean_s": 5.41,
+  "ttft_max_s": 5.41,
+  "errors": [],
+  "sample": "<think>The user asks for two common misconceptions about a thermos flask (vacuum flask). Need to be "
+ }
+]

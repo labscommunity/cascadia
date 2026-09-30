@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -1445,6 +1446,28 @@ int32_t cascadia_runtime_set_input(
     try {
         ov::Shape ov_shape(shape, shape + rank);
         ov::element::Type elem = dtype_from_code(dtype);
+        // CASCADIA_OV_REUSE_INPUTS=1: write into the request's OWN input tensor
+        // instead of binding a fresh host tensor on every call. On the GPU
+        // plugin the request's tensor is USM host memory the device reads in
+        // place; a user tensor is copied into a device allocation, and binding
+        // a new one each call redoes the plugin's per-input bookkeeping. Small
+        // per call, but a pipeline stage makes 18 calls per frame.
+        static const bool reuse_inputs = [] {
+            const char* v = std::getenv("CASCADIA_OV_REUSE_INPUTS");
+            return v && v[0] == '1';
+        }();
+        if (reuse_inputs) {
+            ov::Tensor own = handle->request->get_tensor(std::string(tensor_name));
+            if (own.get_element_type() == elem) {
+                if (own.get_shape() != ov_shape) own.set_shape(ov_shape);
+                if (data_size != own.get_byte_size()) {
+                    set_last_error("data_size does not match tensor.get_byte_size()");
+                    return 1;
+                }
+                std::memcpy(own.data(), data, data_size);
+                return 0;
+            }
+        }
         // Allocate a Tensor and copy the bytes in. Using void-cast allocate
         // is the safe path (no aliasing of caller buffer beyond the call).
         ov::Tensor tensor(elem, ov_shape);

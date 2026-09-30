@@ -1,0 +1,19 @@
+[
+ {
+  "phase": "long176",
+  "streams": 176,
+  "tokens_req": 128,
+  "prompt_words": 0,
+  "start": 1789904341.3002508,
+  "end": 1789904713.170721,
+  "wall_s": 371.9,
+  "completed": 176,
+  "tokens": 21549,
+  "aggregate_tok_s": 57.948,
+  "sum_stream_tok_s": 70.235,
+  "ttft_mean_s": 50.52,
+  "ttft_max_s": 73.34,
+  "errors": [],
+  "sample": "<think>The user wants an explanation of why the sky is blue in exactly three sentences. I need to be"
+ }
+]

@@ -1,0 +1,26 @@
+11:58:30 publish: release 1789923510 signed and published: cascadia (20440992 B, 1d171a3700f3), fleet-overrides.env (6618 B, 34fff77683c9) | the entry point polls every ~30 s; `release.py wait` follows the rollout
+11:58:30 settle: files PENDING, 11/11 serving, 1 version(s), restarts 0 1 1 1 1 1 1 1 1 1 1, steady 0/3
+11:58:40 settle: files PENDING, 11/11 serving, 1 version(s), restarts 0 1 1 1 1 1 1 1 1 1 1, steady 0/3
+11:59:10 settle: files ok, 11/11 serving, 1 version(s), restarts 0 1 1 1 1 1 1 1 1 1 1, steady 1/3
+11:59:41 settle: files ok, 0/11 serving, 1 version(s), restarts 0 0 0 0 0 0 0 0 0 0 0, steady 0/3
+12:00:16 settle: files ok, 0/11 serving, 1 version(s), restarts 0 0 0 0 0 0 0 0 0 0 0, steady 0/3
+12:00:46 settle: files ok, 1/11 serving, 1 version(s), restarts 0 1 0 1 1 1 0 1 0 1 1, steady 0/3
+12:01:22 settle: files ok, 1/11 serving, 1 version(s), restarts 0 1 0 1 1 1 0 1 0 1 1, steady 0/3
+12:01:57 settle: files ok, 2/11 serving, 1 version(s), restarts 0 2 1 1 2 2 1 1 1 1 1, steady 0/3
+12:02:28 settle: files ok, 2/11 serving, 1 version(s), restarts 0 2 1 1 2 2 1 1 1 1 1, steady 0/3
+12:03:03 settle: files ok, 3/11 serving, 1 version(s), restarts 0 2 2 2 2 2 2 2 1 1 1, steady 0/3
+12:03:38 settle: files ok, 3/11 serving, 1 version(s), restarts 0 3 2 2 2 3 2 2 1 1 1, steady 0/3
+12:04:09 settle: files ok, 5/11 serving, 1 version(s), restarts 0 3 2 2 3 3 2 2 1 1 1, steady 0/3
+12:04:44 settle: files ok, 6/11 serving, 1 version(s), restarts 0 4 3 3 3 3 2 2 1 1 1, steady 0/3
+12:05:15 settle: files ok, 8/11 serving, 1 version(s), restarts 0 4 3 3 3 3 2 2 1 1 1, steady 0/3
+12:05:50 settle: files ok, 11/11 serving, 1 version(s), restarts 0 4 3 3 3 3 2 2 1 1 1, steady 1/3
+12:06:25 settle: files ok, 11/11 serving, 1 version(s), restarts 0 4 3 3 3 3 2 2 1 1 1, steady 2/3
+12:06:56 settle: files ok, 11/11 serving, 1 version(s), restarts 0 4 3 3 3 3 2 2 1 1 1, steady 3/3
+12:08:02 PHASE warmup: 16/16 done, 384 tok in 66 s = 5.79 tok/s aggregate (sum of streams 20.66), ttft mean 44.6 max 52.8
+12:08:07 warm 0: None tok/s, ttft None, server error: {'message': 'engine made no progress for 3 consecutive steps', 'type': 'engine_error'}
+12:08:10 warm 1: None tok/s, ttft None, server error: {'message': 'engine made no progress for 3 consecutive steps', 'type': 'engine_error'}
+12:08:24 gate prompt 0: 7/147 chars match  None tok/s ttft None  '<think>'
+12:08:24 gate prompt 1: 7/150 chars match  None tok/s ttft None  '<think>'
+12:08:24 gate prompt 5: 7/112 chars match  None tok/s ttft None  '<think>'
+12:08:24 GATE FAIL
+finished

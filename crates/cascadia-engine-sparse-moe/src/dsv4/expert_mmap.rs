@@ -688,6 +688,742 @@ unsafe fn dequant_row_dot_avx2(
     _mm_cvtss_f32(sums2)
 }
 
+// ───────────────────── multi-input (row-batched) int4 GEMM ─────────────────────
+//
+// `gemv_on` streams a whole section (9.4 MB of nibbles + 1.2 MB of scales at
+// the real dims) through the memory bus for ONE activation. When a block of
+// rows shares an expert (multi-stream decode, prefill) that is `n` full passes
+// over the same bytes. The kernels below decode each weight group ONCE and
+// feed it to all `n` activations, so the expert's bytes cross the bus once per
+// call.
+//
+// Bit-identity contract: for every (weight row, input) pair the arithmetic is
+// the single-input kernel's, operation for operation — accumulator starts at
+// +0, groups ascend, the same `c·scale` product feeds the same FMA chain
+// (AVX2: 4 × 8-lane, AVX-512: 2 × 16-lane, scalar: lo then hi nibble), the
+// same horizontal reduction, the same `to_bf16`. Only the loop nest around the
+// pair changes (inputs inside weight groups inside a tile of weight rows), and
+// no operation mixes two pairs, so the f32 bits are the single-input bits.
+// `tests::row_gemm` pins that on the RAW dot (before the bf16 rounding, which
+// would mask most reorderings) for each ISA.
+
+/// Which fused dequant-dot kernel runs. The three differ in lane structure and
+/// so in f32 bits; a multi-input kernel has to mirror the active one.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Int4Isa {
+    Scalar,
+    Avx2,
+    Avx512,
+}
+
+impl Int4Isa {
+    /// The kernel [`dequant_row_dot`] — and so `gemv_on` — dispatches to on
+    /// this CPU. (`CASCADIA_INT4_GEMV_ROWS` tiling is the AVX2 kernel's bits:
+    /// `tiled_rows_preserve_avx2_bits_across_scales_and_odd_row_counts`.)
+    pub fn active() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512bw")
+                && is_x86_feature_detected!("avx512vl")
+            {
+                return Self::Avx512;
+            }
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                return Self::Avx2;
+            }
+        }
+        Self::Scalar
+    }
+
+    /// Whether this CPU can run the kernel (forcing an unsupported one would
+    /// be an illegal instruction).
+    pub fn supported(self) -> bool {
+        match self {
+            Self::Scalar => true,
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx2 => is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx512 => {
+                is_x86_feature_detected!("avx512f")
+                    && is_x86_feature_detected!("avx512bw")
+                    && is_x86_feature_detected!("avx512vl")
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            _ => false,
+        }
+    }
+}
+
+/// Weight rows per GEMM tile (`CASCADIA_INT4_GEMM_ROWS` = 1|2|4|8, default 8).
+/// A tile's rows share one sweep over the inputs, so the inputs come out of L2
+/// once per tile instead of once per weight row, and `rows × n` independent FMA
+/// chains keep the FMA ports busy where one chain is latency-bound. A schedule
+/// knob only: every setting produces the same bits.
+fn gemm_tile_rows() -> usize {
+    use std::sync::OnceLock;
+    static ROWS: OnceLock<usize> = OnceLock::new();
+    *ROWS.get_or_init(|| {
+        std::env::var("CASCADIA_INT4_GEMM_ROWS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|r| matches!(r, 1 | 2 | 4 | 8))
+            .unwrap_or(GEMM_TILE_ROWS)
+    })
+}
+
+const GEMM_TILE_ROWS: usize = 8;
+
+/// Ceiling on one tile's accumulator scratch (see `gemm_section`).
+const GEMM_ACC_BYTES: usize = 16 * 1024;
+
+/// How far ahead of the group being decoded the packed-row prefetch reaches.
+#[cfg(target_arch = "x86_64")]
+const GEMM_PREFETCH: usize = 512;
+
+/// Pull every tile row's nibble stream (one cache line = 4 groups) and scale
+/// stream (one line = 32 groups) ahead of group `g` by hand: a tile interleaves
+/// `2 × rows` slow streams, which the hardware prefetcher loses track of —
+/// measured, a tile of 8 only beats a tile of 2 with this. Hints only (no
+/// fault, no effect on values); `wrapping_add` because the last ones point past
+/// the tile.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn gemm_prefetch(packed: &[u8], scales: &[u8], rows: usize, (rb, sb): (usize, usize), g: usize) {
+    use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+    if !g.is_multiple_of(4) {
+        return;
+    }
+    for r in 0..rows {
+        let nibbles = packed
+            .as_ptr()
+            .wrapping_add(r * rb + g * (G / 2) + GEMM_PREFETCH);
+        // SAFETY: prefetch never dereferences; any address is allowed.
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(nibbles as *const i8) };
+        if g.is_multiple_of(32) {
+            let scale = scales.as_ptr().wrapping_add(r * sb + g * 2 + 64);
+            // SAFETY: as above.
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(scale as *const i8) };
+        }
+    }
+}
+
+/// Most inputs one GEMM pass carries; a larger block (prefill's 128-row blocks)
+/// is split into balanced passes. Bounds the scratch (`n × in_dim` f32 of
+/// group-major inputs — 1.5 MB at 64 × 6144 — plus the `[out][n]` outputs) and
+/// keeps the input block near the per-core L2. Measured on a 1 MB-L2 Xeon: 64
+/// per pass 0.22 ms/row, 32 → 0.24, 16 → 0.26 — by then the weight stream is
+/// amortized 64× anyway. A multi-stream decode frame (≤ 64 rows) is one pass.
+pub const GEMM_MAX_INPUTS: usize = 64;
+
+/// One AVX2 accumulator (8 lanes), 32-byte aligned so a store never straddles
+/// a cache line.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+#[repr(C, align(32))]
+struct Acc8([f32; 8]);
+
+/// One AVX-512 accumulator (16 lanes), cache-line aligned.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Acc16([f32; 16]);
+
+/// `n` inputs of `in_dim` re-laid GROUP-major: `out[(g·n + j)·G + c] =
+/// xs[j][g·G + c]`. For one weight group the kernel then walks the `n` inputs'
+/// 32 columns back to back (one sequential stream instead of `n` strided
+/// ones). Pure copies, so the values the FMAs see are the callers' bits.
+fn group_major(xs: &[&[f32]], in_dim: usize) -> Vec<f32> {
+    let n = xs.len();
+    let mut out = vec![0.0f32; n * in_dim];
+    for (j, x) in xs.iter().enumerate() {
+        assert_eq!(x.len(), in_dim, "int4 gemm: input {j} length");
+        for (g, grp) in x.chunks_exact(G).enumerate() {
+            out[(g * n + j) * G..(g * n + j + 1) * G].copy_from_slice(grp);
+        }
+    }
+    out
+}
+
+/// [`group_major`] from a `[in_dim][n]` matrix (`cols[c·n + j]`, the layout a
+/// GEMM writes) — the gate/up product feeding the down projection.
+fn group_major_from_cols(cols: &[f32], n: usize, in_dim: usize) -> Vec<f32> {
+    debug_assert_eq!(cols.len(), n * in_dim);
+    let mut out = vec![0.0f32; n * in_dim];
+    for g in 0..in_dim / G {
+        for c in 0..G {
+            let src = &cols[(g * G + c) * n..(g * G + c + 1) * n];
+            for (j, &v) in src.iter().enumerate() {
+                out[(g * n + j) * G + c] = v;
+            }
+        }
+    }
+    out
+}
+
+/// `Y = W·X` for `n` inputs over one packed section. `xg` is the group-major
+/// input block ([`group_major`]); `yt` is `[out_dim][n]` (`yt[o·n + j]` = row
+/// `o` · input `j`). Rayon over tiles of weight rows — each task carries ALL
+/// `n` inputs through its rows, so the split never touches a (row, input)
+/// pair's arithmetic. `round` applies the GEMV's `to_bf16` (off only in the
+/// raw-dot tests).
+#[allow(clippy::too_many_arguments)]
+fn gemm_section(
+    packed: &[u8],
+    scales: &[u8],
+    in_dim: usize,
+    xg: &[f32],
+    n: usize,
+    yt: &mut [f32],
+    isa: Int4Isa,
+    tile: usize,
+    round: bool,
+) {
+    assert!(
+        n > 0 && tile > 0 && in_dim.is_multiple_of(G),
+        "int4 gemm: shape"
+    );
+    assert!(isa.supported(), "int4 gemm: {isa:?} not supported here");
+    let out_dim = yt.len() / n;
+    let (rb, sb) = (in_dim / 2, in_dim / G * 2);
+    assert_eq!(yt.len(), out_dim * n, "int4 gemm: output length");
+    assert_eq!(xg.len(), n * in_dim, "int4 gemm: input length");
+    assert!(
+        packed.len() >= out_dim * rb && scales.len() >= out_dim * sb,
+        "int4 gemm: section length"
+    );
+    // Keep a tile's accumulators (`tile · n` of them) well inside L1 next to
+    // the group's input window: at 64 inputs a tile of 8 AVX-512 accumulators
+    // is 32 KB — a whole L1D — and measured 1.5× slower per row than at 32.
+    let lane_bytes = match isa {
+        Int4Isa::Avx512 => 64,
+        Int4Isa::Avx2 => 32,
+        Int4Isa::Scalar => 4,
+    };
+    let mut tile = tile;
+    while tile > 2 && tile * n * lane_bytes > GEMM_ACC_BYTES {
+        tile /= 2;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if isa == Int4Isa::Avx512 {
+        return gemm_drive(
+            packed,
+            scales,
+            (rb, sb),
+            n,
+            yt,
+            tile,
+            round,
+            Acc16([0.0; 16]),
+            // SAFETY: `isa.supported()` checked avx512{f,bw,vl}; slice bounds
+            // are asserted inside the kernel.
+            |p, s, rows, acc, y| unsafe { gemm_tile_avx512(p, s, rows, xg, n, in_dim, acc, y) },
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    if isa == Int4Isa::Avx2 {
+        return gemm_drive(
+            packed,
+            scales,
+            (rb, sb),
+            n,
+            yt,
+            tile,
+            round,
+            Acc8([0.0; 8]),
+            // SAFETY: `isa.supported()` checked avx2+fma; bounds asserted inside.
+            |p, s, rows, acc, y| unsafe { gemm_tile_avx2(p, s, rows, xg, n, in_dim, acc, y) },
+        );
+    }
+    gemm_drive(
+        packed,
+        scales,
+        (rb, sb),
+        n,
+        yt,
+        tile,
+        round,
+        0.0f32,
+        |p, s, rows, acc, y| gemm_tile_scalar(p, s, rows, xg, n, in_dim, acc, y),
+    );
+}
+
+/// The rayon split shared by the three kernels: tiles of `tile` weight rows
+/// (the last may be short), a per-task accumulator scratch (`tile · n` of `A`).
+#[allow(clippy::too_many_arguments)]
+fn gemm_drive<A, K>(
+    packed: &[u8],
+    scales: &[u8],
+    (rb, sb): (usize, usize),
+    n: usize,
+    yt: &mut [f32],
+    tile: usize,
+    round: bool,
+    zero: A,
+    kernel: K,
+) where
+    A: Copy + Send + Sync,
+    K: Fn(&[u8], &[u8], usize, &mut [A], &mut [f32]) + Sync,
+{
+    use rayon::prelude::*;
+    yt.par_chunks_mut(n * tile).enumerate().for_each_init(
+        || vec![zero; n * tile],
+        |acc, (t, out)| {
+            let first = t * tile;
+            let rows = out.len() / n;
+            kernel(
+                &packed[first * rb..(first + rows) * rb],
+                &scales[first * sb..(first + rows) * sb],
+                rows,
+                acc,
+                out,
+            );
+            if round {
+                for v in out.iter_mut() {
+                    *v = to_bf16(*v);
+                }
+            }
+        },
+    );
+}
+
+/// Scalar tile: `dequant_row_dot_scalar`'s chain per (row, input) — `acc +=
+/// (nibble·s)·x[c]`, columns (lo nibble then hi) and groups ascending. The
+/// group's 32 `nibble·s` weights are built once for all inputs, and the inputs
+/// run four at a time so four independent add chains overlap (one chain is
+/// latency-bound); neither touches a pair's operation order.
+#[allow(clippy::too_many_arguments)]
+fn gemm_tile_scalar(
+    packed: &[u8],
+    scales: &[u8],
+    rows: usize,
+    xg: &[f32],
+    n: usize,
+    in_dim: usize,
+    acc: &mut [f32],
+    y: &mut [f32],
+) {
+    let ng = in_dim / G;
+    let (rb, sb) = (in_dim / 2, ng * 2);
+    let acc = &mut acc[..rows * n];
+    acc.fill(0.0);
+    for g in 0..ng {
+        let xgrp = &xg[g * n * G..(g + 1) * n * G];
+        for r in 0..rows {
+            let si = r * sb + g * 2;
+            let s = bf16::from_le_bytes([scales[si], scales[si + 1]]).to_f32();
+            let bytes = &packed[r * rb + g * (G / 2)..r * rb + (g + 1) * (G / 2)];
+            let mut w = [0.0f32; G];
+            for (i, &byte) in bytes.iter().enumerate() {
+                w[2 * i] = ((byte & 0x0F) as i32 - 8) as f32 * s;
+                w[2 * i + 1] = (((byte >> 4) & 0x0F) as i32 - 8) as f32 * s;
+            }
+            let mut quads = acc[r * n..(r + 1) * n].chunks_exact_mut(4);
+            let mut xquads = xgrp.chunks_exact(4 * G);
+            for (a, x) in (&mut quads).zip(&mut xquads) {
+                let (mut a0, mut a1, mut a2, mut a3) = (a[0], a[1], a[2], a[3]);
+                for (c, &wc) in w.iter().enumerate() {
+                    a0 += wc * x[c];
+                    a1 += wc * x[G + c];
+                    a2 += wc * x[2 * G + c];
+                    a3 += wc * x[3 * G + c];
+                }
+                (a[0], a[1], a[2], a[3]) = (a0, a1, a2, a3);
+            }
+            let rest = quads.into_remainder();
+            for (a, x) in rest.iter_mut().zip(xquads.remainder().chunks_exact(G)) {
+                let mut v = *a;
+                for (&wc, &xc) in w.iter().zip(x) {
+                    v += wc * xc;
+                }
+                *a = v;
+            }
+        }
+    }
+    y[..rows * n].copy_from_slice(acc);
+}
+
+/// One weight group's four 8-lane `c·scale` vectors (columns 0..7, 8..15,
+/// 16..23, 24..31) — exactly the products `dequant_row_dot_avx2` feeds its FMAs.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn group_weights_avx2(packed16: *const u8, scale: f32) -> [core::arch::x86_64::__m256; 4] {
+    use core::arch::x86_64::*;
+    let lo_mask = _mm_set1_epi8(0x0F);
+    let bias = _mm_set1_epi8(8);
+    let sv = _mm256_set1_ps(scale);
+    let pk = _mm_loadu_si128(packed16 as *const __m128i);
+    let low_s = _mm_sub_epi8(_mm_and_si128(pk, lo_mask), bias);
+    let high_s = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16::<4>(pk), lo_mask), bias);
+    // low/high nibble of byte i = cols 2i, 2i+1 -> interleave to column order.
+    let il = _mm_unpacklo_epi8(low_s, high_s); // cols 0..15
+    let ih = _mm_unpackhi_epi8(low_s, high_s); // cols 16..31
+    [
+        _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(il)), sv),
+        _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(il))),
+            sv,
+        ),
+        _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(ih)), sv),
+        _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(ih))),
+            sv,
+        ),
+    ]
+}
+
+/// AVX2 tile: `dequant_row_dot_avx2`'s chain per (row, input) — the group's
+/// four `c·scale` vectors are built once and FMA'd against each input's 32
+/// columns into that pair's own 8-lane accumulator, then the same horizontal
+/// sum. Weight rows go through the input loop two at a time so both share each
+/// input's four loads (the loop is load-port-bound otherwise); the two rows'
+/// chains never mix. Writes the RAW dots (`y[r·n + j]`); the driver rounds.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn gemm_tile_avx2(
+    packed: &[u8],
+    scales: &[u8],
+    rows: usize,
+    xg: &[f32],
+    n: usize,
+    in_dim: usize,
+    acc: &mut [Acc8],
+    y: &mut [f32],
+) {
+    use core::arch::x86_64::*;
+    let ng = in_dim / G;
+    let (rb, sb) = (in_dim / 2, ng * 2);
+    assert!(packed.len() >= rows * rb && scales.len() >= rows * sb);
+    assert!(xg.len() >= n * in_dim && acc.len() >= rows * n && y.len() >= rows * n);
+    let scale = |r: usize, g: usize| {
+        let si = r * sb + g * 2;
+        half::bf16::from_le_bytes([scales[si], scales[si + 1]]).to_f32()
+    };
+    let pp = packed.as_ptr();
+    let ap = acc.as_mut_ptr() as *mut f32;
+    for a in 0..rows * n {
+        _mm256_store_ps(ap.add(a * 8), _mm256_setzero_ps());
+    }
+    for g in 0..ng {
+        let xgp = xg.as_ptr().add(g * n * G);
+        let mut r = 0;
+        gemm_prefetch(packed, scales, rows, (rb, sb), g);
+        while r + 2 <= rows {
+            let [u0, u1, u2, u3] = group_weights_avx2(pp.add(r * rb + g * (G / 2)), scale(r, g));
+            let [v0, v1, v2, v3] =
+                group_weights_avx2(pp.add((r + 1) * rb + g * (G / 2)), scale(r + 1, g));
+            let (ar, br) = (ap.add(r * n * 8), ap.add((r + 1) * n * 8));
+            for j in 0..n {
+                let xp = xgp.add(j * G);
+                let (x0, x1) = (_mm256_loadu_ps(xp), _mm256_loadu_ps(xp.add(8)));
+                let (x2, x3) = (_mm256_loadu_ps(xp.add(16)), _mm256_loadu_ps(xp.add(24)));
+                let mut a = _mm256_load_ps(ar.add(j * 8));
+                a = _mm256_fmadd_ps(u0, x0, a);
+                a = _mm256_fmadd_ps(u1, x1, a);
+                a = _mm256_fmadd_ps(u2, x2, a);
+                a = _mm256_fmadd_ps(u3, x3, a);
+                _mm256_store_ps(ar.add(j * 8), a);
+                let mut b = _mm256_load_ps(br.add(j * 8));
+                b = _mm256_fmadd_ps(v0, x0, b);
+                b = _mm256_fmadd_ps(v1, x1, b);
+                b = _mm256_fmadd_ps(v2, x2, b);
+                b = _mm256_fmadd_ps(v3, x3, b);
+                _mm256_store_ps(br.add(j * 8), b);
+            }
+            r += 2;
+        }
+        if r < rows {
+            let [w0, w1, w2, w3] = group_weights_avx2(pp.add(r * rb + g * (G / 2)), scale(r, g));
+            let ar = ap.add(r * n * 8);
+            for j in 0..n {
+                let xp = xgp.add(j * G);
+                let mut a = _mm256_load_ps(ar.add(j * 8));
+                a = _mm256_fmadd_ps(w0, _mm256_loadu_ps(xp), a);
+                a = _mm256_fmadd_ps(w1, _mm256_loadu_ps(xp.add(8)), a);
+                a = _mm256_fmadd_ps(w2, _mm256_loadu_ps(xp.add(16)), a);
+                a = _mm256_fmadd_ps(w3, _mm256_loadu_ps(xp.add(24)), a);
+                _mm256_store_ps(ar.add(j * 8), a);
+            }
+        }
+    }
+    for (i, value) in y[..rows * n].iter_mut().enumerate() {
+        // horizontal sum of the 8 lanes — `dequant_row_dot_avx2`'s order
+        let a = _mm256_load_ps(ap.add(i * 8));
+        let s128 = _mm_add_ps(_mm256_castps256_ps128(a), _mm256_extractf128_ps::<1>(a));
+        let shuf = _mm_movehdup_ps(s128);
+        let sums = _mm_add_ps(s128, shuf);
+        let shuf2 = _mm_movehl_ps(shuf, sums);
+        *value = _mm_cvtss_f32(_mm_add_ss(sums, shuf2));
+    }
+}
+
+/// One weight group's two 16-lane `c·scale` vectors (columns 0..15, 16..31) —
+/// the products `dequant_row_dot_avx512` feeds its FMAs.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+#[inline]
+unsafe fn group_weights_avx512(packed16: *const u8, scale: f32) -> [core::arch::x86_64::__m512; 2] {
+    use core::arch::x86_64::*;
+    let lo_mask = _mm_set1_epi8(0x0F);
+    let bias = _mm_set1_epi8(8);
+    let sv = _mm512_set1_ps(scale);
+    let pk = _mm_loadu_si128(packed16 as *const __m128i);
+    let low_s = _mm_sub_epi8(_mm_and_si128(pk, lo_mask), bias);
+    let high_s = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16::<4>(pk), lo_mask), bias);
+    let il = _mm_unpacklo_epi8(low_s, high_s); // cols 0..15
+    let ih = _mm_unpackhi_epi8(low_s, high_s); // cols 16..31
+    [
+        _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(il)), sv),
+        _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(ih)), sv),
+    ]
+}
+
+/// AVX-512 tile: `dequant_row_dot_avx512`'s chain per (row, input) — two
+/// 16-lane `c·scale` vectors per group, FMA'd in column order into that pair's
+/// own accumulator, then the same `_mm512_reduce_add_ps`. Weight rows pair up
+/// through the input loop like the AVX2 tile.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn gemm_tile_avx512(
+    packed: &[u8],
+    scales: &[u8],
+    rows: usize,
+    xg: &[f32],
+    n: usize,
+    in_dim: usize,
+    acc: &mut [Acc16],
+    y: &mut [f32],
+) {
+    use core::arch::x86_64::*;
+    let ng = in_dim / G;
+    let (rb, sb) = (in_dim / 2, ng * 2);
+    assert!(packed.len() >= rows * rb && scales.len() >= rows * sb);
+    assert!(xg.len() >= n * in_dim && acc.len() >= rows * n && y.len() >= rows * n);
+    let scale = |r: usize, g: usize| {
+        let si = r * sb + g * 2;
+        half::bf16::from_le_bytes([scales[si], scales[si + 1]]).to_f32()
+    };
+    let pp = packed.as_ptr();
+    let ap = acc.as_mut_ptr() as *mut f32;
+    for a in 0..rows * n {
+        _mm512_store_ps(ap.add(a * 16), _mm512_setzero_ps());
+    }
+    for g in 0..ng {
+        let xgp = xg.as_ptr().add(g * n * G);
+        let mut r = 0;
+        gemm_prefetch(packed, scales, rows, (rb, sb), g);
+        while r + 2 <= rows {
+            let [u0, u1] = group_weights_avx512(pp.add(r * rb + g * (G / 2)), scale(r, g));
+            let [v0, v1] =
+                group_weights_avx512(pp.add((r + 1) * rb + g * (G / 2)), scale(r + 1, g));
+            let (ar, br) = (ap.add(r * n * 16), ap.add((r + 1) * n * 16));
+            for j in 0..n {
+                let xp = xgp.add(j * G);
+                let (x0, x1) = (_mm512_loadu_ps(xp), _mm512_loadu_ps(xp.add(16)));
+                let mut a = _mm512_load_ps(ar.add(j * 16));
+                a = _mm512_fmadd_ps(u0, x0, a);
+                a = _mm512_fmadd_ps(u1, x1, a);
+                _mm512_store_ps(ar.add(j * 16), a);
+                let mut b = _mm512_load_ps(br.add(j * 16));
+                b = _mm512_fmadd_ps(v0, x0, b);
+                b = _mm512_fmadd_ps(v1, x1, b);
+                _mm512_store_ps(br.add(j * 16), b);
+            }
+            r += 2;
+        }
+        if r < rows {
+            let [w0, w1] = group_weights_avx512(pp.add(r * rb + g * (G / 2)), scale(r, g));
+            let ar = ap.add(r * n * 16);
+            for j in 0..n {
+                let xp = xgp.add(j * G);
+                let mut a = _mm512_load_ps(ar.add(j * 16));
+                a = _mm512_fmadd_ps(w0, _mm512_loadu_ps(xp), a);
+                a = _mm512_fmadd_ps(w1, _mm512_loadu_ps(xp.add(16)), a);
+                _mm512_store_ps(ar.add(j * 16), a);
+            }
+        }
+    }
+    for (i, value) in y[..rows * n].iter_mut().enumerate() {
+        *value = _mm512_reduce_add_ps(_mm512_load_ps(ap.add(i * 16)));
+    }
+}
+
+/// One output row's raw dot on an explicit kernel ([`dequant_row_dot`] with the
+/// dispatch lifted out) — the per-row reference the forced paths use.
+#[inline]
+fn dequant_row_dot_with(
+    isa: Int4Isa,
+    packed_row: &[u8],
+    scales_row: &[u8],
+    x: &[f32],
+    in_dim: usize,
+) -> f32 {
+    // SAFETY (both): callers assert `isa.supported()`; loads stay within
+    // packed_row (in_dim/2 B), scales_row (in_dim/G·2 B) and x (in_dim).
+    #[cfg(target_arch = "x86_64")]
+    if isa == Int4Isa::Avx512 {
+        return unsafe { dequant_row_dot_avx512(packed_row, scales_row, x, in_dim) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if isa == Int4Isa::Avx2 {
+        return unsafe { dequant_row_dot_avx2(packed_row, scales_row, x, in_dim) };
+    }
+    let _ = isa;
+    dequant_row_dot_scalar(packed_row, scales_row, x, in_dim)
+}
+
+impl MmapExpert {
+    /// [`Self::swiglu_from`] for `xs.len()` inputs at once, returned flat
+    /// `[n, dim]` (input-major). Each weight group is unpacked once and
+    /// applied to every input, so the expert's bytes cross the memory bus once
+    /// per call instead of once per input. Row `j` of the result is
+    /// BIT-IDENTICAL to `self.swiglu_from(data, xs[j])` on the same machine
+    /// (see the contract above); one input IS that call.
+    pub fn swiglu_rows_from(&self, data: &[u8], xs: &[&[f32]]) -> Vec<f32> {
+        match xs {
+            [] => Vec::new(),
+            [x] => self.swiglu_from(data, x),
+            _ => self.swiglu_rows_with(data, xs, Int4Isa::active(), gemm_tile_rows()),
+        }
+    }
+
+    /// [`Self::swiglu_rows_from`] over the mapping itself — per row the bits of
+    /// `glm::ffn::swiglu_mmap` (the `AnyExpert::Mmap` forward).
+    pub fn swiglu_rows(&self, xs: &[&[f32]]) -> Vec<f32> {
+        self.swiglu_rows_from(&self.mmap, xs)
+    }
+
+    /// The multi-input SwiGLU on an explicit kernel and tile (tests / benches:
+    /// the AVX2 path on an AVX-512 box). Panics if `isa` is unsupported here.
+    #[doc(hidden)]
+    pub fn swiglu_rows_from_forced(
+        &self,
+        data: &[u8],
+        xs: &[&[f32]],
+        isa: Int4Isa,
+        tile_rows: usize,
+    ) -> Vec<f32> {
+        assert!(isa.supported(), "int4 gemm: {isa:?} not supported here");
+        self.swiglu_rows_with(data, xs, isa, tile_rows.max(1))
+    }
+
+    /// [`Self::swiglu_from`] on an explicit kernel: `gemv_rows` = 2|4 selects
+    /// the tiled AVX2 GEMV (`CASCADIA_INT4_GEMV_ROWS`), anything else the
+    /// per-row rayon path. The single-input baseline for tests / benches; with
+    /// `Int4Isa::active()` it is `swiglu_from`'s own arithmetic.
+    #[doc(hidden)]
+    pub fn swiglu_from_forced(
+        &self,
+        data: &[u8],
+        x: &[f32],
+        isa: Int4Isa,
+        gemv_rows: usize,
+    ) -> Vec<f32> {
+        assert!(isa.supported(), "int4 gemv: {isa:?} not supported here");
+        let (inter, dim) = (self.inter, self.dim);
+        let sec = section_bytes(inter, dim);
+        let mut h = vec![0.0f32; inter];
+        gemv_forced(data, 0, inter, dim, x, &mut h, isa, gemv_rows);
+        let mut u = vec![0.0f32; inter];
+        gemv_forced(data, sec, inter, dim, x, &mut u, isa, gemv_rows);
+        for (hi, &ui) in h.iter_mut().zip(&u) {
+            *hi = (*hi / (1.0 + (-*hi).exp())) * ui;
+        }
+        let mut out = vec![0.0f32; dim];
+        gemv_forced(data, 2 * sec, dim, inter, &h, &mut out, isa, gemv_rows);
+        out
+    }
+
+    fn swiglu_rows_with(&self, data: &[u8], xs: &[&[f32]], isa: Int4Isa, tile: usize) -> Vec<f32> {
+        use rayon::prelude::*;
+        let (inter, dim) = (self.inter, self.dim);
+        let sec = section_bytes(inter, dim);
+        let section = |off: usize, out_dim: usize, in_dim: usize| {
+            let ng = in_dim / G;
+            (
+                &data[off..off + out_dim * in_dim / 2],
+                &data[off + out_dim * in_dim / 2..off + out_dim * in_dim / 2 + out_dim * ng * 2],
+            )
+        };
+        let (gate_p, gate_s) = section(0, inter, dim);
+        let (up_p, up_s) = section(sec, inter, dim);
+        let (down_p, down_s) = section(2 * sec, dim, inter);
+        let n = xs.len();
+        let mut out = vec![0.0f32; n * dim];
+        if n == 0 {
+            return out;
+        }
+        // Balanced passes of at most GEMM_MAX_INPUTS inputs.
+        let pass = n.div_ceil(n.div_ceil(GEMM_MAX_INPUTS));
+        for (chunk, dst) in xs.chunks(pass).zip(out.chunks_mut(pass * dim)) {
+            let m = chunk.len();
+            let xg = group_major(chunk, dim);
+            let mut h = vec![0.0f32; inter * m]; // [inter][m]
+            gemm_section(gate_p, gate_s, dim, &xg, m, &mut h, isa, tile, true);
+            let mut u = vec![0.0f32; inter * m];
+            gemm_section(up_p, up_s, dim, &xg, m, &mut u, isa, tile, true);
+            // silu(gate)·up — `swiglu_from`'s expression, elementwise (so any
+            // split is value-neutral); serial it would cost n × 3072 `exp`s.
+            h.par_chunks_mut(4096)
+                .zip(u.par_chunks(4096))
+                .for_each(|(hc, uc)| {
+                    for (hi, &ui) in hc.iter_mut().zip(uc) {
+                        *hi = (*hi / (1.0 + (-*hi).exp())) * ui;
+                    }
+                });
+            let hg = group_major_from_cols(&h, m, inter);
+            let mut yt = vec![0.0f32; dim * m]; // [dim][m]
+            gemm_section(down_p, down_s, inter, &hg, m, &mut yt, isa, tile, true);
+            for (j, row) in dst.chunks_mut(dim).enumerate() {
+                for (o, v) in row.iter_mut().enumerate() {
+                    *v = yt[o * m + j];
+                }
+            }
+        }
+        out
+    }
+}
+
+/// `gemv_on` with the kernel and tiling passed in instead of detected / read
+/// from the environment. `gemv_on` itself is left untouched (it is the
+/// production single-input path); `tests::row_gemm` pins the two together.
+#[allow(clippy::too_many_arguments)]
+fn gemv_forced(
+    data: &[u8],
+    sec_off: usize,
+    out_dim: usize,
+    in_dim: usize,
+    x: &[f32],
+    y: &mut [f32],
+    isa: Int4Isa,
+    gemv_rows: usize,
+) {
+    use rayon::prelude::*;
+    let ng = in_dim / G;
+    let packed = &data[sec_off..sec_off + out_dim * in_dim / 2];
+    let scales =
+        &data[sec_off + out_dim * in_dim / 2..sec_off + out_dim * in_dim / 2 + out_dim * ng * 2];
+    let row_bytes = in_dim / 2;
+    #[cfg(target_arch = "x86_64")]
+    if isa == Int4Isa::Avx2 {
+        match gemv_rows {
+            2 => return gemv_tiled_avx2::<2>(packed, scales, x, y),
+            4 => return gemv_tiled_avx2::<4>(packed, scales, x, y),
+            _ => {}
+        }
+    }
+    let _ = gemv_rows;
+    y.par_iter_mut().enumerate().for_each(|(o, yy)| {
+        let prow = &packed[o * row_bytes..(o + 1) * row_bytes];
+        let srow = &scales[o * ng * 2..(o + 1) * ng * 2];
+        *yy = to_bf16(dequant_row_dot_with(isa, prow, srow, x, in_dim));
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::{dequant_row_dot, G};
@@ -940,6 +1676,317 @@ mod tiled_int4_tests {
                     );
                 }
             }
+        }
+    }
+}
+
+/// The multi-input kernels against the single-input ones, on the RAW f32 dot.
+/// (The GEMV's bf16 rounding keeps 8 significant bits, so it hides almost every
+/// summation-order slip — `bf16_rounding_would_hide_an_order_slip` counts it —
+/// and an output-level comparison alone would have no teeth.) Each kernel is
+/// called directly, so the AVX2 path is exercised on an AVX-512 box too.
+#[cfg(test)]
+mod row_gemm_tests {
+    use super::*;
+
+    fn isas() -> Vec<Int4Isa> {
+        [Int4Isa::Scalar, Int4Isa::Avx2, Int4Isa::Avx512]
+            .into_iter()
+            .filter(|i| i.supported())
+            .collect()
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (self.0 >> 32) as u32
+        }
+    }
+
+    /// A random `[out_dim, in_dim]` section (every nibble value, scales of the
+    /// real model's order incl. zero and negative) + `n` inputs.
+    fn section(
+        rng: &mut Rng,
+        out_dim: usize,
+        in_dim: usize,
+        n: usize,
+    ) -> (Vec<u8>, Vec<u8>, Vec<Vec<f32>>) {
+        let packed: Vec<u8> = (0..out_dim * in_dim / 2)
+            .map(|_| rng.next() as u8)
+            .collect();
+        let mut scales = Vec::with_capacity(out_dim * in_dim / G * 2);
+        for _ in 0..out_dim * in_dim / G {
+            let s = (rng.next() % 255) as f32 / 8192.0 - 127.0 / 8192.0;
+            scales.extend(half::bf16::from_f32(s).to_le_bytes());
+        }
+        let xs = (0..n)
+            .map(|_| {
+                (0..in_dim)
+                    .map(|_| (rng.next() >> 8) as f32 / 16777216.0 - 0.5)
+                    .collect()
+            })
+            .collect();
+        (packed, scales, xs)
+    }
+
+    /// Per-(row, input) raw dots from the SINGLE-input kernel, `[out_dim][n]`.
+    fn per_row(
+        isa: Int4Isa,
+        packed: &[u8],
+        scales: &[u8],
+        xs: &[Vec<f32>],
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Vec<f32> {
+        use rayon::prelude::*;
+        let (rb, sb, n) = (in_dim / 2, in_dim / G * 2, xs.len());
+        let mut want = vec![0.0f32; out_dim * n];
+        want.par_chunks_mut(n).enumerate().for_each(|(o, w)| {
+            for (j, x) in xs.iter().enumerate() {
+                w[j] = dequant_row_dot_with(
+                    isa,
+                    &packed[o * rb..(o + 1) * rb],
+                    &scales[o * sb..(o + 1) * sb],
+                    x,
+                    in_dim,
+                );
+            }
+        });
+        want
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm(
+        isa: Int4Isa,
+        tile: usize,
+        round: bool,
+        packed: &[u8],
+        scales: &[u8],
+        xs: &[Vec<f32>],
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Vec<f32> {
+        let refs: Vec<&[f32]> = xs.iter().map(Vec::as_slice).collect();
+        let xg = group_major(&refs, in_dim);
+        let mut yt = vec![f32::NAN; out_dim * xs.len()];
+        gemm_section(
+            packed,
+            scales,
+            in_dim,
+            &xg,
+            xs.len(),
+            &mut yt,
+            isa,
+            tile,
+            round,
+        );
+        yt
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|f| f.to_bits()).collect()
+    }
+
+    #[test]
+    fn gemm_raw_dots_are_the_single_input_kernels_bits() {
+        let mut rng = Rng(0x1A2B_3C4D);
+        for isa in isas() {
+            for (out_dim, in_dim) in [(1, 32), (3, 64), (5, 96), (17, 256), (9, 3072), (6, 6144)] {
+                for n in [1, 2, 3, 5, 8, 17] {
+                    let (packed, scales, xs) = section(&mut rng, out_dim, in_dim, n);
+                    let want = per_row(isa, &packed, &scales, &xs, out_dim, in_dim);
+                    for tile in [1, 2, 4, 8] {
+                        let got = gemm(isa, tile, false, &packed, &scales, &xs, out_dim, in_dim);
+                        assert_eq!(
+                            bits(&got),
+                            bits(&want),
+                            "{isa:?} raw {out_dim}x{in_dim} n={n} tile={tile}"
+                        );
+                        let got = gemm(isa, tile, true, &packed, &scales, &xs, out_dim, in_dim);
+                        let rounded: Vec<f32> = want.iter().map(|&v| to_bf16(v)).collect();
+                        assert_eq!(
+                            bits(&got),
+                            bits(&rounded),
+                            "{isa:?} bf16 {out_dim}x{in_dim} n={n} tile={tile}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The real sections (gate/up `[3072, 6144]`, down `[6144, 3072]`), every
+    /// weight row, the default tile.
+    #[test]
+    fn gemm_raw_dots_match_at_the_real_dims() {
+        let mut rng = Rng(0x5EED_0042);
+        for isa in isas() {
+            for (out_dim, in_dim) in [(3072, 6144), (6144, 3072)] {
+                let (packed, scales, xs) = section(&mut rng, out_dim, in_dim, 17);
+                let want = per_row(isa, &packed, &scales, &xs, out_dim, in_dim);
+                for n in [2, 3, 5, 8, 17] {
+                    let got = gemm(
+                        isa,
+                        GEMM_TILE_ROWS,
+                        false,
+                        &packed,
+                        &scales,
+                        &xs[..n],
+                        out_dim,
+                        in_dim,
+                    );
+                    for o in 0..out_dim {
+                        assert_eq!(
+                            bits(&got[o * n..(o + 1) * n]),
+                            bits(&want[o * 17..o * 17 + n]),
+                            "{isa:?} {out_dim}x{in_dim} n={n} row {o}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `dequant_row_dot_scalar` with the groups walked LAST-to-first: the same
+    /// products, one summation-order slip.
+    fn reversed_groups_dot(packed_row: &[u8], scales_row: &[u8], x: &[f32], in_dim: usize) -> f32 {
+        let mut acc = 0.0f32;
+        for g in (0..in_dim / G).rev() {
+            let s = bf16::from_le_bytes([scales_row[g * 2], scales_row[g * 2 + 1]]).to_f32();
+            for i in 0..G / 2 {
+                let byte = packed_row[g * (G / 2) + i];
+                let lo = (byte & 0x0F) as i32 - 8;
+                let hi = ((byte >> 4) & 0x0F) as i32 - 8;
+                acc += (lo as f32 * s) * x[g * G + 2 * i];
+                acc += (hi as f32 * s) * x[g * G + 2 * i + 1];
+            }
+        }
+        acc
+    }
+
+    /// Teeth: the raw comparison above must FAIL for a kernel that sums in a
+    /// different order — reversed groups against the scalar kernel, and the
+    /// three lane structures against each other.
+    #[test]
+    fn a_different_summation_order_changes_the_raw_bits() {
+        let mut rng = Rng(0x7EE7);
+        let (out_dim, in_dim, n) = (64, 6144, 4);
+        let (packed, scales, xs) = section(&mut rng, out_dim, in_dim, n);
+        let (rb, sb) = (in_dim / 2, in_dim / G * 2);
+        let scalar = gemm(
+            Int4Isa::Scalar,
+            4,
+            false,
+            &packed,
+            &scales,
+            &xs,
+            out_dim,
+            in_dim,
+        );
+        let mut reversed = vec![0.0f32; out_dim * n];
+        for o in 0..out_dim {
+            for (j, x) in xs.iter().enumerate() {
+                reversed[o * n + j] = reversed_groups_dot(
+                    &packed[o * rb..(o + 1) * rb],
+                    &scales[o * sb..(o + 1) * sb],
+                    x,
+                    in_dim,
+                );
+            }
+        }
+        let differing = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .filter(|(p, q)| p.to_bits() != q.to_bits())
+                .count()
+        };
+        let total = out_dim * n;
+        let slipped = differing(&scalar, &reversed);
+        assert!(
+            slipped * 2 > total,
+            "reversed group order changed only {slipped}/{total} raw dots"
+        );
+        let all = isas();
+        for (a, &ia) in all.iter().enumerate() {
+            for &ib in &all[a + 1..] {
+                let ya = gemm(ia, 4, false, &packed, &scales, &xs, out_dim, in_dim);
+                let yb = gemm(ib, 4, false, &packed, &scales, &xs, out_dim, in_dim);
+                let d = differing(&ya, &yb);
+                assert!(
+                    d * 2 > total,
+                    "{ia:?} vs {ib:?}: only {d}/{total} raw dots differ"
+                );
+            }
+        }
+    }
+
+    /// Why the comparisons above are on the raw dot: after the GEMV's bf16
+    /// rounding the same order slip survives in (almost) no output.
+    #[test]
+    fn bf16_rounding_would_hide_an_order_slip() {
+        let mut rng = Rng(0xB16);
+        let (out_dim, in_dim, n) = (64, 6144, 4);
+        let (packed, scales, xs) = section(&mut rng, out_dim, in_dim, n);
+        let (rb, sb) = (in_dim / 2, in_dim / G * 2);
+        let rounded = gemm(
+            Int4Isa::Scalar,
+            4,
+            true,
+            &packed,
+            &scales,
+            &xs,
+            out_dim,
+            in_dim,
+        );
+        let mut hidden = 0;
+        for o in 0..out_dim {
+            for (j, x) in xs.iter().enumerate() {
+                let slip = to_bf16(reversed_groups_dot(
+                    &packed[o * rb..(o + 1) * rb],
+                    &scales[o * sb..(o + 1) * sb],
+                    x,
+                    in_dim,
+                ));
+                hidden += (slip.to_bits() == rounded[o * n + j].to_bits()) as usize;
+            }
+        }
+        assert!(
+            hidden * 10 >= out_dim * n * 9,
+            "expected bf16 rounding to mask most order slips, masked {hidden}/{}",
+            out_dim * n
+        );
+    }
+
+    /// `gemv_forced` on the active kernel is `gemv_on` (the production
+    /// single-input path the forced baseline stands in for).
+    #[test]
+    fn forced_gemv_on_the_active_kernel_is_gemv_on() {
+        let mut rng = Rng(0xF0CE);
+        let (out_dim, in_dim) = (37, 256);
+        let (packed, scales, xs) = section(&mut rng, out_dim, in_dim, 1);
+        let mut data = packed.clone();
+        data.extend_from_slice(&scales);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.bin");
+        // Any file of a valid length: gemv_on reads `data`, not the mapping.
+        std::fs::write(&path, vec![0u8; 3 * section_bytes(32, 32)]).unwrap();
+        let m = MmapExpert::open(&path, 32, 32).unwrap();
+        let mut want = vec![0.0f32; out_dim];
+        m.gemv_on(&data, 0, out_dim, in_dim, &xs[0], &mut want);
+        for rows in [1, 2, 4] {
+            let mut got = vec![0.0f32; out_dim];
+            gemv_forced(
+                &data,
+                0,
+                out_dim,
+                in_dim,
+                &xs[0],
+                &mut got,
+                Int4Isa::active(),
+                rows,
+            );
+            assert_eq!(bits(&got), bits(&want), "gemv_rows={rows}");
         }
     }
 }

@@ -1,0 +1,116 @@
+sequences: 36, first-draft positions: 5724, head self-check (python norm+unembed == dumped argmax): 1.0000
+per family sequences: {'explain': 3, 'code': 3, 'arithmetic': 3, 'story': 3, 'lists': 3, 'tables': 3, 'rewriting': 3, 'facts': 3, 'poem': 3, 'how-to': 3, 'translation': 3, 'true/false': 3}
+
+### Protocol A: true-token context (draft context re-extended on verified tokens)
+
+| draft k | n | a_k (unconditional) | a_k given drafts 1..k-1 right (n) | P(drafts 1..k all right) |
+|---|---|---|---|---|
+| 1 | 5724 | 0.726 | 0.726 (5724) | 0.726 |
+| 2 | 5688 | 0.642 | 0.691 (4135) | 0.503 |
+| 3 | 5652 | 0.630 | 0.730 (2844) | 0.367 |
+| 4 | 5616 | 0.602 | 0.725 (2064) | 0.267 |
+| 5 | 5580 | 0.601 | 0.768 (1487) | 0.205 |
+| 6 | 5544 | 0.593 | 0.793 (1133) | 0.162 |
+| 7 | 5508 | 0.597 | 0.832 (892) | 0.135 |
+| 8 | 5472 | 0.586 | 0.845 (740) | 0.114 |
+
+expected accepted drafts per chain of 8: E = 2.48; renewal model (L + E*T)/(1 + E) with L = 466 ms, T = 45 ms: 166 ms per token = 6.0 tok/s (a constant a would need to be 0.71 for the same E)
+
+### Protocol B: own top-1 tokens as context (cheap chain, never corrected)
+
+| draft k | n | a_k (unconditional) | a_k given drafts 1..k-1 right (n) | P(drafts 1..k all right) |
+|---|---|---|---|---|
+| 1 | 5724 | 0.726 | 0.726 (5724) | 0.726 |
+| 2 | 5688 | 0.534 | 0.688 (4135) | 0.500 |
+| 3 | 5652 | 0.412 | 0.706 (2829) | 0.353 |
+| 4 | 5616 | 0.314 | 0.703 (1984) | 0.248 |
+| 5 | 5580 | 0.247 | 0.735 (1382) | 0.182 |
+| 6 | 5544 | 0.203 | 0.759 (1008) | 0.138 |
+| 7 | 5508 | 0.169 | 0.775 (759) | 0.107 |
+| 8 | 5472 | 0.141 | 0.788 (586) | 0.084 |
+
+expected accepted drafts per chain of 8: E = 2.34; renewal model (L + E*T)/(1 + E) with L = 466 ms, T = 45 ms: 171 ms per token = 5.8 tok/s (a constant a would need to be 0.70 for the same E)
+
+### Protocol C: own tokens, depths >= 2 with NO context (floor: deeper modules' state not maintained)
+
+| draft k | n | a_k (unconditional) | a_k given drafts 1..k-1 right (n) | P(drafts 1..k all right) |
+|---|---|---|---|---|
+| 1 | 5724 | 0.726 | 0.726 (5724) | 0.726 |
+| 2 | 5688 | 0.110 | 0.139 (4135) | 0.101 |
+| 3 | 5652 | 0.026 | 0.109 (570) | 0.011 |
+| 4 | 5616 | 0.010 | 0.048 (62) | 0.001 |
+| 5 | 5580 | 0.009 | 0.000 (3) | 0.000 |
+| 6 | 5544 | 0.006 | nan (0) | 0.000 |
+| 7 | 5508 | 0.004 | nan (0) | 0.000 |
+| 8 | 5472 | 0.002 | nan (0) | 0.000 |
+
+expected accepted drafts per chain of 8: E = 0.84; renewal model (L + E*T)/(1 + E) with L = 466 ms, T = 45 ms: 274 ms per token = 3.6 tok/s (a constant a would need to be 0.46 for the same E)
+
+### By family (protocol A; a_k unconditional, in brackets: given the chain right so far)
+
+| family | seqs | n | a1 | a2 | a3 | a4 | P(1..2) | P(1..3) | P(1..4) | E[accepted of 8] | implied tok/s |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| explain | 3 | 477 | 0.690 | 0.60 (0.63) | 0.58 (0.62) | 0.54 (0.64) | 0.43 | 0.27 | 0.18 | 1.79 | 5.1 |
+| code | 3 | 477 | 0.746 | 0.69 (0.75) | 0.68 (0.78) | 0.65 (0.72) | 0.56 | 0.43 | 0.31 | 2.75 | 6.4 |
+| arithmetic | 3 | 477 | 0.868 | 0.83 (0.86) | 0.84 (0.90) | 0.82 (0.89) | 0.75 | 0.67 | 0.60 | 4.69 | 8.4 |
+| story | 3 | 477 | 0.627 | 0.53 (0.54) | 0.53 (0.51) | 0.50 (0.55) | 0.34 | 0.17 | 0.10 | 1.38 | 4.5 |
+| lists | 3 | 477 | 0.706 | 0.60 (0.65) | 0.54 (0.69) | 0.53 (0.64) | 0.46 | 0.32 | 0.21 | 2.04 | 5.5 |
+| tables | 3 | 477 | 0.646 | 0.54 (0.59) | 0.52 (0.63) | 0.49 (0.62) | 0.38 | 0.24 | 0.15 | 1.70 | 5.0 |
+| rewriting | 3 | 477 | 0.788 | 0.70 (0.74) | 0.70 (0.77) | 0.66 (0.73) | 0.59 | 0.45 | 0.33 | 2.98 | 6.6 |
+| facts | 3 | 477 | 0.656 | 0.55 (0.58) | 0.55 (0.60) | 0.49 (0.56) | 0.38 | 0.23 | 0.13 | 1.60 | 4.8 |
+| poem | 3 | 477 | 0.656 | 0.56 (0.60) | 0.56 (0.70) | 0.55 (0.69) | 0.40 | 0.28 | 0.19 | 1.89 | 5.2 |
+| how-to | 3 | 477 | 0.730 | 0.66 (0.70) | 0.64 (0.71) | 0.63 (0.68) | 0.51 | 0.37 | 0.25 | 2.41 | 5.9 |
+| translation | 3 | 477 | 0.811 | 0.74 (0.79) | 0.73 (0.81) | 0.71 (0.77) | 0.64 | 0.51 | 0.40 | 3.28 | 7.0 |
+| true/false | 3 | 477 | 0.788 | 0.71 (0.76) | 0.69 (0.78) | 0.65 (0.80) | 0.59 | 0.46 | 0.37 | 3.23 | 6.9 |
+| **all** | 36 | 5724 | 0.726 | 0.64 (0.69) | 0.63 (0.73) | 0.60 (0.73) | 0.50 | 0.37 | 0.27 | 2.48 | 6.0 |
+
+### By family, protocol B (own tokens as context)
+
+| family | seqs | n | a1 | a2 | a3 | a4 | P(1..2) | P(1..3) | P(1..4) | E[accepted of 8] | implied tok/s |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| explain | 3 | 477 | 0.690 | 0.46 (0.63) | 0.33 (0.60) | 0.23 (0.64) | 0.43 | 0.26 | 0.17 | 1.81 | 5.1 |
+| code | 3 | 477 | 0.746 | 0.59 (0.76) | 0.47 (0.76) | 0.36 (0.71) | 0.57 | 0.43 | 0.30 | 2.69 | 6.3 |
+| arithmetic | 3 | 477 | 0.868 | 0.75 (0.85) | 0.70 (0.87) | 0.62 (0.85) | 0.74 | 0.64 | 0.55 | 4.07 | 7.8 |
+| story | 3 | 477 | 0.627 | 0.40 (0.54) | 0.27 (0.51) | 0.18 (0.50) | 0.34 | 0.17 | 0.09 | 1.36 | 4.5 |
+| lists | 3 | 477 | 0.706 | 0.49 (0.64) | 0.35 (0.66) | 0.25 (0.64) | 0.46 | 0.30 | 0.19 | 2.03 | 5.4 |
+| tables | 3 | 477 | 0.646 | 0.41 (0.58) | 0.30 (0.62) | 0.19 (0.60) | 0.38 | 0.23 | 0.14 | 1.69 | 5.0 |
+| rewriting | 3 | 477 | 0.788 | 0.63 (0.75) | 0.49 (0.75) | 0.38 (0.72) | 0.59 | 0.44 | 0.32 | 2.85 | 6.5 |
+| facts | 3 | 477 | 0.656 | 0.42 (0.58) | 0.29 (0.58) | 0.21 (0.61) | 0.38 | 0.22 | 0.13 | 1.57 | 4.8 |
+| poem | 3 | 477 | 0.656 | 0.44 (0.59) | 0.33 (0.64) | 0.23 (0.64) | 0.39 | 0.25 | 0.16 | 1.70 | 5.0 |
+| how-to | 3 | 477 | 0.730 | 0.54 (0.70) | 0.40 (0.68) | 0.29 (0.62) | 0.51 | 0.35 | 0.22 | 2.27 | 5.8 |
+| translation | 3 | 477 | 0.811 | 0.64 (0.77) | 0.52 (0.76) | 0.42 (0.73) | 0.62 | 0.47 | 0.35 | 2.83 | 6.5 |
+| true/false | 3 | 477 | 0.788 | 0.61 (0.75) | 0.49 (0.77) | 0.41 (0.80) | 0.59 | 0.46 | 0.37 | 3.20 | 6.9 |
+| **all** | 36 | 5724 | 0.726 | 0.53 (0.69) | 0.41 (0.71) | 0.31 (0.70) | 0.50 | 0.35 | 0.25 | 2.34 | 5.8 |
+
+### Teeth checks (first draft, a1; all positions)
+
+| variant | a1 |
+|---|---|
+| reference (hidden first, both norms, post-final-norm input, no output norm, de-interleaved w13) | 0.726 |
+| swap | 0.001 |
+| no_enorm | 0.610 |
+| raw_embed | 0.576 |
+| prenorm_in | 0.024 |
+| out_norm | 0.725 |
+| no_deint | 0.447 |
+| no_sconv | 0.611 |
+| no_relbias | 0.641 |
+| noctx | 0.371 |
+| shift0 | 0.047 |
+
+prose only (explain + story): reference 0.658; swap 0.001; no_enorm 0.564; raw_embed 0.485; prenorm_in 0.025; out_norm 0.658; no_deint 0.426; no_sconv 0.563; no_relbias 0.558; noctx 0.321; shift0 0.040
+
+### Vocabulary prefix (first draft)
+
+| | all target tokens (n=5724) | accepted first drafts (n=4156) |
+|---|---|---|
+| id < 32768 | 0.8667 | 0.8879 |
+| id < 65536 | 0.9357 | 0.9502 |
+| id < 131072 | 0.9773 | 0.9817 |
+
+| draft unembed restricted to ids < n | a1 |
+|---|---|
+| 32768 | 0.656 |
+| 65536 | 0.696 |
+| 131072 | 0.714 |
+| full (200058) | 0.726 |

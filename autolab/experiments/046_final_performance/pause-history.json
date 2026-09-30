@@ -1,0 +1,30 @@
+[
+  {
+    "time": 1790030457.9731488,
+    "reason": "Owner explicitly requested: please pause the tests until i say resume",
+    "resume_requires": "Explicit owner instruction; do not resume automatically",
+    "interrupted_phase": "mixed_b_c088",
+    "completed_phases": 18,
+    "requests_in_flight_after_stop": 0,
+    "next_step_when_authorized": "Check unchanged fleet health and idle, run correctness gate after cancellation cleanup, archive this pause record, then resume suite all with saved concurrency limit176. Repeat interrupted mixed_b_c088; completed phases are retained.",
+    "resumed_at": 1790033137.692941,
+    "resume_authorization": "Owner: please resume and give me an eta for all the numbers being collected",
+    "resume_health": "Unchanged serving release/hash/restarts; fresh signed status; API idle",
+    "generation_during_pause": {
+      "requests_total_delta": 294,
+      "tokens_total_delta": 32280,
+      "note": "Outside survey phases; learned phrase history may have changed. Not included in measurements."
+    }
+  },
+  {
+    "time": 1790033350.603082,
+    "reason": "Competing generation detected after resume:94active requests during88-stream phase. Awaiting confirmation other traffic is stopped.",
+    "resume_requires": "Exclusive measurement window; owner has already authorized resumption",
+    "interrupted_phase": "mixed_b_c088",
+    "completed_phases": 18,
+    "expected_active_max": 88,
+    "observed_active": 94,
+    "resumed_at": 1790033451.455988,
+    "resume_authorization": "Owner confirmed: Other traffic stopped; continue"
+  }
+]

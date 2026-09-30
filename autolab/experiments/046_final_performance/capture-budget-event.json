@@ -1,0 +1,9 @@
+{
+  "observed_epoch": 1790026215,
+  "phase_interrupted": "mixed_a_c022",
+  "reason": "Existing bounded f32 state capture reached its byte budget and disabled further capture writes.",
+  "workers_restarted": false,
+  "release_changed": false,
+  "partial_phase_excluded": true,
+  "resume": "Recognize only the exact capture-budget diagnostic as benign, verify correctness, repeat 22-stream phase."
+}

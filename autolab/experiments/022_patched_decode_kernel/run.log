@@ -1,0 +1,26 @@
+16:32:23 publish: release 1789939943 signed and published: cascadia (20455336 B, bd874f62fdae), fleet-overrides.env (9892 B, 47b242306a7b) | the entry point polls every ~30 s; `release.py wait` follows the rollout
+16:32:23 settle: files PENDING, 11/11 serving, 1 version(s), restarts 0 3 3 3 2 2 1 1 1 0 0, steady 0/3
+16:32:33 settle: files PENDING, 11/11 serving, 1 version(s), restarts 0 3 3 3 2 2 1 1 1 0 0, steady 0/3
+16:32:58 settle: files ok, 11/11 serving, 1 version(s), restarts 0 3 3 3 2 2 1 1 1 0 0, steady 1/3
+16:33:34 settle: files ok, 0/11 serving, 1 version(s), restarts 0 0 0 0 0 0 0 0 0 0 0, steady 0/3
+16:34:05 settle: files ok, 0/11 serving, 1 version(s), restarts 0 0 0 0 0 0 0 0 0 0 0, steady 0/3
+16:34:40 settle: files ok, 1/11 serving, 1 version(s), restarts 0 1 1 0 1 1 1 0 0 1 0, steady 0/3
+16:35:16 settle: files ok, 1/11 serving, 1 version(s), restarts 0 1 1 0 1 1 1 0 0 1 0, steady 0/3
+16:35:46 settle: files ok, 2/11 serving, 1 version(s), restarts 0 2 2 1 1 2 2 1 0 1 0, steady 0/3
+16:36:22 settle: files ok, 2/11 serving, 1 version(s), restarts 0 2 2 1 1 2 2 1 0 1 0, steady 0/3
+16:36:53 settle: files ok, 2/11 serving, 1 version(s), restarts 0 2 2 2 2 2 3 2 1 1 0, steady 0/3
+16:37:28 settle: files ok, 3/11 serving, 1 version(s), restarts 0 3 3 2 2 2 3 2 1 1 0, steady 0/3
+16:37:59 settle: files ok, 5/11 serving, 1 version(s), restarts 0 3 3 2 3 3 3 2 1 1 0, steady 0/3
+16:38:34 settle: files ok, 5/11 serving, 1 version(s), restarts 0 4 4 3 3 3 3 2 1 1 0, steady 0/3
+16:39:10 settle: files ok, 8/11 serving, 1 version(s), restarts 0 4 4 3 3 3 3 2 1 1 0, steady 0/3
+16:39:40 settle: files ok, 11/11 serving, 1 version(s), restarts 0 4 4 3 3 3 3 2 1 1 0, steady 1/3
+16:40:16 settle: files ok, 11/11 serving, 1 version(s), restarts 0 4 4 3 3 3 3 2 1 1 0, steady 2/3
+16:40:47 settle: files ok, 11/11 serving, 1 version(s), restarts 0 4 4 3 3 3 3 2 1 1 0, steady 3/3
+16:42:16 PHASE warmup: 0/16 done, 2 tok in 89 s = 0.02 tok/s aggregate (sum of streams 0.00), ttft mean 0.0 max 0.0  ERRORS: ["server error: {'message': 'downstream closed before StreamTokens', 'type': 'engine_error'}", "server error: {'message': 'downstream closed before StreamTokens', 'type': 'engine_error'}"]
+16:42:50 warm 0: None tok/s, ttft None, server error: {'message': 'send_stream_open: io error: Connection reset by peer (os error 104)', 'type': 'engine_error'}
+16:42:53 warm 1: None tok/s, ttft None, server error: {'message': 'send_stream_open: not connected; call connect()/accept() first', 'type': 'engine_error'}
+16:42:56 gate prompt 0: 0/147 chars match  None tok/s ttft None  ''
+16:42:56 gate prompt 1: 0/150 chars match  None tok/s ttft None  ''
+16:42:56 gate prompt 5: 0/112 chars match  None tok/s ttft None  ''
+16:42:56 GATE FAIL
+finished

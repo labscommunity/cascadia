@@ -1,0 +1,38 @@
+{
+ "ok": true,
+ "prompts": [
+  {
+   "i": 0,
+   "match_chars": 147,
+   "of": 147,
+   "exact": true,
+   "broken": false,
+   "tok_s": 1.659,
+   "ttft_s": 9.66,
+   "text": "<think>The user wants an explanation of why the sky is blue in exactly three sentences. I need to be accurate but concis",
+   "error": null
+  },
+  {
+   "i": 1,
+   "match_chars": 150,
+   "of": 150,
+   "exact": true,
+   "broken": false,
+   "tok_s": 1.676,
+   "ttft_s": 10.35,
+   "text": "<think>The user is asking for the capital of France and wants the answer in one word. The capital of France is Paris. I ",
+   "error": null
+  },
+  {
+   "i": 5,
+   "match_chars": 112,
+   "of": 112,
+   "exact": true,
+   "broken": false,
+   "tok_s": 1.6,
+   "ttft_s": 9.98,
+   "text": "<think>The user is asking \"What is 6 times 7? Explain briefly.\" This is a simple arithmetic question: 6 \u00d7 7 = 42",
+   "error": null
+  }
+ ]
+}

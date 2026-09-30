@@ -1,0 +1,42 @@
+[
+ {
+  "phase": "mix15a",
+  "streams": 15,
+  "tokens_req": 128,
+  "prompt_words": 0,
+  "start": 1789969083.3018491,
+  "end": 1789969170.0581372,
+  "wall_s": 86.8,
+  "completed": 15,
+  "tokens": 1920,
+  "aggregate_tok_s": 22.131,
+  "sum_stream_tok_s": 24.212,
+  "ttft_mean_s": 6.61,
+  "ttft_max_s": 10.5,
+  "errors": [],
+  "sample": "<think>The user wants an explanation of the Silk Road suitable for a curious ten-year-old, in one sh",
+  "stream_tok_s_min": 1.555,
+  "stream_tok_s_median": 1.613,
+  "ttft_median_s": 6.62
+ },
+ {
+  "phase": "mix15b",
+  "streams": 15,
+  "tokens_req": 128,
+  "prompt_words": 0,
+  "start": 1789969182.0695732,
+  "end": 1789969266.858044,
+  "wall_s": 84.8,
+  "completed": 15,
+  "tokens": 1920,
+  "aggregate_tok_s": 22.645,
+  "sum_stream_tok_s": 24.631,
+  "ttft_mean_s": 6.1,
+  "ttft_max_s": 9.55,
+  "errors": [],
+  "sample": "<think>The user wants an explanation of coffee suitable for a curious ten-year-old, in one short par",
+  "stream_tok_s_min": 1.587,
+  "stream_tok_s_median": 1.645,
+  "ttft_median_s": 6.27
+ }
+]
