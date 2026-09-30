@@ -13,7 +13,7 @@ build:
     cargo build --release -p cascadia
 
 # Build with real OpenVINO. Requires INTEL_OPENVINO_DIR to point at an
-# OpenVINO GenAI 2026.1+ SDK (see INSTALL.md). Usage:
+# OpenVINO GenAI 2026.4+ SDK (see INSTALL.md). Usage:
 #   just build-ov                       # uses $INTEL_OPENVINO_DIR
 #   just build-ov /opt/intel/openvino   # overrides it
 build-ov dir=env_var_or_default("INTEL_OPENVINO_DIR", ""):

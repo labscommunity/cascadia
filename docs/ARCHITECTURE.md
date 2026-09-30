@@ -52,7 +52,7 @@ Dashboard HTTP routes (`/api/topology`, `/api/stats`) and an embedded Vite SPA (
 
 ## `cascadia-ov-genai-shim`
 
-C++ FFI shim wrapping `openvino-genai`. `extern "C"` only; every entry point catches `...` so a C++ exception cannot unwind into Rust UB. Stub mode (no link) is the default for dev / CI; `--features openvino` links against the real OV GenAI 2026.2+ SDK.
+C++ FFI shim wrapping `openvino-genai`. `extern "C"` only; every entry point catches `...` so a C++ exception cannot unwind into Rust UB. Stub mode (no link) is the default for dev / CI; `--features openvino` links against the real OV GenAI 2026.4+ SDK.
 
 ## `cascadia-types`
 
