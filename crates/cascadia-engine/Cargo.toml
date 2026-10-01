@@ -11,6 +11,7 @@ description = "Engine + Builder traits — the plugin interface every inference 
 [dependencies]
 cascadia-types = { workspace = true }
 cascadia-kv-wire = { path = "../cascadia-kv-wire", optional = true }
+cascadia-transport = { workspace = true, optional = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
@@ -20,3 +21,9 @@ tracing = { workspace = true, optional = true }
 # Issue-34 Option C: the KV coordination surface (KvCoordination trait + Engine accessor). Off by
 # default so the wire crate never enters a default consumer's tree.
 kv_coord = ["dep:cascadia-kv-wire", "dep:tracing"]
+# Issue #76: injected activation byte streams + live re-attach. Off by default so
+# tokio/socket2/prometheus (via cascadia-transport) stay out of a default consumer's tree.
+injected_streams = ["dep:cascadia-transport"]
+
+[dev-dependencies]
+tokio = { workspace = true }

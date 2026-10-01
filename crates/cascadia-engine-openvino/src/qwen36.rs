@@ -508,6 +508,43 @@ impl Builder for Qwen36Builder {
         Ok(())
     }
 
+    /// Issue #76: wire up with already-connected streams instead of
+    /// dialing/listening. Role from `rank`/`total`, exactly as `connect` reads
+    /// it from `peers` (`total <= 1` is standalone: no peers, both sides absent).
+    /// Pipeline-only, so the stage `LinkShape` has `ep_driver=false`,
+    /// `ep_workers=0` and any EP link is rejected by the exact-match
+    /// `check_connect_streams`. No HELLO is sent here — the handshake runs lazily
+    /// at the first admission (`step_pipe_first` gates on `handshake_done`).
+    /// Pipeline mode bridges sync engine code to the async transport through the
+    /// stored runtime handle, so capture it here for `total > 1` as `connect` does
+    /// (re-attach's async swap needs it). `configure_listen` is ignored on this
+    /// path.
+    async fn connect_streams(&mut self, links: cascadia_engine::StreamLinks) -> EngineResult<()> {
+        cascadia_engine::check_connect_streams(
+            cascadia_engine::LinkShape::pipeline(self.rank > 0, self.rank + 1 < self.total),
+            &links,
+        )?;
+        let cascadia_engine::StreamLinks {
+            upstream,
+            downstream,
+            ..
+        } = links;
+        if self.total > 1 {
+            self.runtime_handle = Some(tokio::runtime::Handle::current());
+        }
+        if let Some(up) = upstream {
+            self.upstream = Some(Arc::new(tokio::sync::Mutex::new(
+                ActivationServer::from_stream(up),
+            )));
+        }
+        if let Some(down) = downstream {
+            self.downstream = Some(Arc::new(tokio::sync::Mutex::new(
+                ActivationClient::from_stream(down),
+            )));
+        }
+        Ok(())
+    }
+
     async fn load(&mut self, shard: ShardSpec) -> EngineResult<LoadStream> {
         let pipeline = self.total > 1;
         if !pipeline && !(shard.is_first_stage && shard.is_last_stage) {
@@ -3674,5 +3711,71 @@ mod tests {
             Err(EngineError::QueueFull { queued, cap })
                 if queued == MAX_PENDING_TASKS && cap == MAX_PENDING_TASKS
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_wires_injected_handles_for_a_middle_stage() {
+        // rank 1 of 3 ⇒ middle stage: both sides required.
+        let mut b = Qwen36Builder::new("/x", "CPU").with_rank(1, 3);
+        let (_up_far, up_near) = tokio::io::duplex(1 << 16);
+        let (_down_far, down_near) = tokio::io::duplex(1 << 16);
+        b.connect_streams(cascadia_engine::StreamLinks::pipeline(
+            Some(Box::new(up_near)),
+            Some(Box::new(down_near)),
+        ))
+        .await
+        .unwrap();
+        assert!(b.upstream.is_some() && b.downstream.is_some());
+        assert!(
+            b.runtime_handle.is_some(),
+            "pipeline mode captures the runtime handle, like connect()"
+        );
+        assert!(b.upstream.as_ref().unwrap().lock().await.is_injected());
+        assert!(b.downstream.as_ref().unwrap().lock().await.is_injected());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_rejects_shape_mismatch() {
+        // head (rank 0 of 2): downstream only; an upstream stream is a role error.
+        let mut b = Qwen36Builder::new("/x", "CPU").with_rank(0, 2);
+        let (_f, n) = tokio::io::duplex(64);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks::pipeline(
+                Some(Box::new(n)),
+                None
+            ))
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+        // standalone (total 1): any stream is a role error.
+        let mut b1 = Qwen36Builder::new("/x", "CPU").with_rank(0, 1);
+        let (_f2, n2) = tokio::io::duplex(64);
+        assert!(matches!(
+            b1.connect_streams(cascadia_engine::StreamLinks::pipeline(
+                None,
+                Some(Box::new(n2))
+            ))
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_rejects_ep_links() {
+        // Pipeline-only engine: an EP link alongside the correct pipeline shape is
+        // a role error (exact-match against a pipeline LinkShape).
+        let mut b = Qwen36Builder::new("/x", "CPU").with_rank(0, 2); // head: downstream only
+        let (_fd, down) = tokio::io::duplex(64);
+        let (_fe, ep) = tokio::io::duplex(64);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks {
+                downstream: Some(Box::new(down)),
+                ep_driver: Some(Box::new(ep)),
+                ..Default::default()
+            })
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+        assert!(b.upstream.is_none() && b.downstream.is_none());
     }
 }

@@ -378,9 +378,11 @@ version = "0.2.7"
 dependencies = [
  "async-trait",
  "cascadia-kv-wire",
+ "cascadia-transport",
  "cascadia-types",
  "futures",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
 ]
 
