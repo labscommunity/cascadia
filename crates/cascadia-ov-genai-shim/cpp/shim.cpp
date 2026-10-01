@@ -30,6 +30,10 @@
 #include <openvino/genai/visual_language/pipeline.hpp>
 #include <openvino/genai/continuous_batching_pipeline.hpp>
 #include <openvino/genai/chat_history.hpp>
+#include <filesystem>
+#ifdef __linux__
+#include <dlfcn.h>
+#endif
 
 namespace {
 
@@ -71,6 +75,47 @@ void set_last_error(const std::exception& e) {
 // exceed a few dozen keys in practice; this caps allocation at ~4 KB
 // even if the caller passes a poisoned count.
 static constexpr size_t MAX_PROPERTY_PAIRS = 256;
+
+#ifdef __linux__
+// Locate libopenvino_tokenizers.so next to the loaded libopenvino
+// (the SDK layout on Linux puts both in runtime/lib/intel64).
+std::string find_openvino_tokenizers() {
+    if (const char* e = std::getenv("OV_TOKENIZER_PREBUILD_EXTENSION_PATH")) {
+        std::string p(e);
+        if (!p.empty()) return p;
+    }
+    void* h = dlopen("libopenvino.so.2650", RTLD_NOLOAD | RTLD_NOW);
+    if (!h) h = dlopen("libopenvino.so.2631", RTLD_NOLOAD | RTLD_NOW);
+    if (!h) h = dlopen("libopenvino.so", RTLD_NOLOAD | RTLD_NOW);
+    if (h) {
+        Dl_info info{};
+        void* sym = dlsym(h, "ov_get_openvino_version");
+        if (sym && dladdr(sym, &info) && info.dli_fname) {
+            auto cand = std::filesystem::path(info.dli_fname).parent_path()
+                        / "libopenvino_tokenizers.so";
+            if (std::filesystem::is_regular_file(cand)) return cand.string();
+        }
+    }
+    return "libopenvino_tokenizers.so";
+}
+#endif
+
+// Register the tokenizers extension on the Core for the runtime-compile
+// path (cascadia_runtime_compile*). Previously the shim passed a genai-only
+// "extensions" property in the compile_model props; OpenVINO 2026.5
+// forwards unknown property keys to the plugin config parser and rejects
+// it with "Option not found: extensions". register_extension() on the Core
+// is the supported way to load a shared-library extension. GenAI pipelines
+// (LLMPipeline, ContinuousBatchingPipeline) still consume the "extensions"
+// property themselves and are unaffected.
+void register_tokenizers_core_extension(ov::Core& core) {
+#ifdef __linux__
+    auto path = find_openvino_tokenizers();
+    std::fprintf(stderr, "cascadia-ov-genai-shim: register tokenizers extension %s\n",
+                 path.c_str());
+    core.add_extension(path);
+#endif
+}
 
 ov::AnyMap collect_properties(const char* const* kv, size_t count) {
     ov::AnyMap props;
@@ -785,6 +830,7 @@ int32_t cascadia_runtime_compile(
                 props.erase(it);
             }
         }
+        register_tokenizers_core_extension(handle->core);
         ov::CompiledModel compiled;
         if (materialize) {
             auto model = handle->core.read_model(std::string(model_xml_path));
@@ -843,6 +889,7 @@ int32_t cascadia_runtime_import_blob(
         auto handle = std::make_unique<cascadia_runtime_t>();
         auto props = collect_properties(properties_kv, properties_count);
 
+        register_tokenizers_core_extension(handle->core);
         std::ifstream f(blob_path, std::ios::binary | std::ios::ate);
         if (!f) {
             set_last_error((std::string("cannot open blob: ") + blob_path).c_str());
@@ -913,6 +960,7 @@ int32_t cascadia_runtime_compile_gemv_offload(
     try {
         auto handle = std::make_unique<cascadia_runtime_t>();
         auto props = collect_properties(properties_kv, properties_count);
+        register_tokenizers_core_extension(handle->core);
         // read_model keeps the .bin mmapped; the offload pass moves the
         // sym-INT4 weight constants into CascadiaInt4Gemv op members so the
         // plugin compile below never repacks them into a resident copy.
