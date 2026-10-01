@@ -559,6 +559,96 @@ impl Builder for SparseMoEBuilder {
         Ok(())
     }
 
+    /// Issue #76: wire this stage up with already-connected byte streams instead
+    /// of dialing/listening. Mirrors `connect`'s three roles — an expert worker
+    /// accepts the driver's one link; an expert-parallel driver takes one link
+    /// per worker and runs as a single stage; a plain pipeline stage takes its
+    /// upstream/downstream per rank/total. `configure_listen` is ignored on this
+    /// path — the streams arrive connected. Streams must satisfy the contract on
+    /// `cascadia_transport::InjectedStream`.
+    async fn connect_streams(&mut self, links: cascadia_engine::StreamLinks) -> EngineResult<()> {
+        // ---- Expert worker: one injected link from the driver, no pipeline. ----
+        if let Some((index, count)) = self.config.ep_worker {
+            // Same guard `connect` enforces (:429-433): a worker is never also a
+            // pipeline stage or a driver.
+            if self.config.total > 1 || !self.config.ep_workers.is_empty() {
+                return Err(EngineError::InvalidConfig(
+                    "an expert worker cannot also be a pipeline stage or a driver".into(),
+                ));
+            }
+            cascadia_engine::check_connect_streams(
+                cascadia_engine::LinkShape {
+                    ep_driver: true,
+                    ..Default::default()
+                },
+                &links,
+            )?;
+            let driver = links
+                .ep_driver
+                .expect("check_connect_streams guarantees an ep_driver link");
+            info!(index, count, "expert worker: driver stream injected");
+            self.ep_server = Some(Arc::new(TokioMutex::new(ActivationServer::from_stream(
+                driver,
+            ))));
+            return Ok(());
+        }
+        // ---- Expert-parallel driver: one injected link per worker, in order. ----
+        if !self.config.ep_workers.is_empty() {
+            // Same guard `connect` enforces (:455-459): the driver runs as a
+            // single stage (`--total 1`); for total == 1 there are no pipeline
+            // links, so the stage shape carries only `ep_workers`.
+            if self.config.total > 1 {
+                return Err(EngineError::InvalidConfig(
+                    "--ep-workers runs the driver as a single stage (--total 1)".into(),
+                ));
+            }
+            cascadia_engine::check_connect_streams(
+                cascadia_engine::LinkShape {
+                    ep_workers: self.config.ep_workers.len(),
+                    ..Default::default()
+                },
+                &links,
+            )?;
+            for (i, stream) in links.ep_workers.into_iter().enumerate() {
+                let stream =
+                    stream.expect("check_connect_streams guarantees every ep_workers entry Some");
+                info!(worker = i, "expert worker stream injected");
+                self.ep_clients
+                    .push(Arc::new(TokioMutex::new(ActivationClient::from_stream(
+                        stream,
+                    ))));
+            }
+            return Ok(());
+        }
+        // ---- Plain pipeline stage. ----
+        // Role from rank/total exactly as the CLI derives its PeerLayout
+        // (cascadia-cli/src/lib.rs): a single stage has no peers; otherwise
+        // upstream iff not rank 0, downstream iff not the last rank.
+        let total = self.config.total;
+        let (stage_upstream, stage_downstream) = if total <= 1 {
+            (false, false)
+        } else {
+            let rank = self.config.rank.min(total - 1);
+            (rank != 0, rank != total - 1)
+        };
+        cascadia_engine::check_connect_streams(
+            cascadia_engine::LinkShape::pipeline(stage_upstream, stage_downstream),
+            &links,
+        )?;
+        // Pre-connected: no bind, no dial, no accept. Store each handle where
+        // `connect` stores its TCP one, so `build()` sees an identical state.
+        if let Some(up) = links.upstream {
+            self.transport.upstream =
+                Some(Arc::new(TokioMutex::new(ActivationServer::from_stream(up))));
+        }
+        if let Some(down) = links.downstream {
+            self.transport.downstream = Some(Arc::new(TokioMutex::new(
+                ActivationClient::from_stream(down),
+            )));
+        }
+        Ok(())
+    }
+
     async fn load(&mut self, shard: ShardSpec) -> EngineResult<LoadStream> {
         crate::init_thread_pool();
         let mut plugin = PluginConfig::new();
@@ -1164,13 +1254,17 @@ impl Builder for SparseMoEBuilder {
                 runner.fingerprint(),
             ),
         ));
+        // An injected upstream (#76) arrives connected: `NotConnected` on it is a
+        // dropped link, never a previous rank that has yet to dial in.
+        let upstream_injected = self.transport.injected_sides().0;
         Ok(Box::new(SparseMoEEngine {
             runner,
             tokenizer: self.tokenizer,
             pending: VecDeque::new(),
             peer_disconnected: false,
-            upstream_seen: false,
+            upstream_seen: upstream_injected,
             frame_kind: None,
+            upstream_injected,
             transport: self.transport,
             runtime_handle,
             rank,
@@ -1533,6 +1627,24 @@ fn relink_worker_step(
     }
 }
 
+/// A worker rank's `step()` result over an injected upstream (#76), once its
+/// frame (if any) is served. Nothing re-links an injected link in place (the
+/// embedder owns it), so while the upstream link is latched dead every step
+/// returns the same connection-fatal `Err`, at once and without serving or
+/// sleeping, and the relay loop (`run_relay_loop`, a worker's only driver)
+/// exits on it. TCP/UDS workers never come here: they re-link in place
+/// (`relink_worker`). Pure, for testing.
+fn worker_step(
+    peer_disconnected: bool,
+    produced: Vec<(TaskId, Chunk)>,
+) -> EngineResult<Vec<(TaskId, Chunk)>> {
+    if peer_disconnected {
+        Err(EngineError::NotConnected)
+    } else {
+        Ok(produced)
+    }
+}
+
 /// Rank 0, before a task's RESET: re-dial a downstream that was dropped, or
 /// that reads EOF or data while idle (the next rank re-linked or restarted;
 /// it never sends unsolicited bytes). `Ok(true)` when it dialed.
@@ -1540,6 +1652,15 @@ async fn relink_idle_downstream(
     down: &TokioMutex<ActivationClient>,
 ) -> cascadia_transport::TransportResult<bool> {
     let mut cli = down.lock().await;
+    // An injected link (#76) cannot be peeked and is never dialed: the embedder
+    // watches it and re-attaches a fresh one, so only a dropped one fails here.
+    if cli.is_injected() {
+        return if cli.is_connected() {
+            Ok(false)
+        } else {
+            Err(cascadia_transport::TransportError::NotConnected)
+        };
+    }
     // Timing out means nothing to read: idle and alive.
     let dead = !cli.is_connected()
         || tokio::time::timeout(Duration::from_millis(1), cli.wait_readable())
@@ -1706,6 +1827,9 @@ pub struct SparseMoEEngine {
     upstream_seen: bool,
     /// The frame `handle_one_frame` is serving, for `step_worker`'s failure rule.
     frame_kind: Option<FrameKind>,
+    /// Issue #76: the upstream is an injected stream (fixed at connect), so a
+    /// latched link is reported instead of re-linked in place.
+    upstream_injected: bool,
     /// Last-rank only: tokens this rank has sampled since the last
     /// `Reset`. Used as the `history` argument to `sampling::sample` so
     /// the repetition penalty has the recent local emit-stream to
@@ -1902,11 +2026,21 @@ impl Engine for SparseMoEEngine {
         if self.rank == 0 {
             return Ok(self.step_first());
         }
-        // Worker rank: a latched disconnect re-links in place (see
+        // Worker rank over TCP/UDS: a latched disconnect re-links in place (see
         // `relink_worker`), so it is never surfaced as a connection-fatal
         // Err: that would end run_relay_loop, and nothing rebuilds an
         // embedded stage.
-        Ok(self.step_worker())
+        if !self.upstream_injected {
+            return Ok(self.step_worker());
+        }
+        // Over an injected upstream (#76) nothing re-links in place:
+        // `worker_step` reports a latched link as connection-fatal.
+        let produced = if self.peer_disconnected {
+            Vec::new()
+        } else {
+            self.step_worker()
+        };
+        worker_step(self.peer_disconnected, produced)
     }
 
     #[cfg(feature = "kv_coord")]
@@ -4068,7 +4202,11 @@ pub struct OvMoeEngine {
     peer_disconnected: bool,
     /// Set once a frame has arrived from the previous rank: after that, a
     /// `NotConnected` upstream is a dropped link, not a rank that has yet to dial in.
+    /// Starts set for an injected upstream (#76), which arrives connected.
     upstream_seen: bool,
+    /// Issue #76: the upstream is an injected stream (fixed at connect), so a
+    /// latched link is reported instead of re-linked in place.
+    upstream_injected: bool,
     /// Last-rank only: tokens this rank has sampled since the last `Reset`,
     /// used as the repetition-penalty `history`. Like the K2.6 path, prompt
     /// tokens are not mirrored here (they flow only as hidden states), so
@@ -4133,6 +4271,8 @@ impl OvMoeEngine {
                 runner.fingerprint(),
             ),
         ));
+        // See `SparseMoEBuilder::build`.
+        let upstream_injected = transport.injected_sides().0;
         Self {
             runner,
             tokenizer,
@@ -4142,7 +4282,8 @@ impl OvMoeEngine {
             rank,
             total,
             peer_disconnected: false,
-            upstream_seen: false,
+            upstream_seen: upstream_injected,
+            upstream_injected,
             last_rank_history: Vec::new(),
             last_rank_rng: 0,
             last_rank_rng_seeded: false,
@@ -5314,8 +5455,19 @@ impl Engine for OvMoeEngine {
         if self.rank == 0 {
             return Ok(self.step_first());
         }
-        // A latched disconnect re-links in place, as SparseMoEEngine::step's does.
-        Ok(self.step_worker())
+        // Worker rank over TCP/UDS: a latched disconnect re-links in place, as
+        // SparseMoEEngine::step's does.
+        if !self.upstream_injected {
+            return Ok(self.step_worker());
+        }
+        // Over an injected upstream (#76) nothing re-links in place:
+        // `worker_step` reports a latched link as connection-fatal.
+        let produced = if self.peer_disconnected {
+            Vec::new()
+        } else {
+            self.step_worker()
+        };
+        worker_step(self.peer_disconnected, produced)
     }
 
     #[cfg(feature = "kv_coord")]
@@ -5565,7 +5717,11 @@ pub struct PipelineEngine<R: StagedRunner> {
     peer_disconnected: bool,
     /// Set once a frame has arrived from the previous rank: after that, a
     /// `NotConnected` upstream is a dropped link, not a rank that has yet to dial in.
+    /// Starts set for an injected upstream (#76), which arrives connected.
     upstream_seen: bool,
+    /// Issue #76: the upstream is an injected stream (fixed at connect), so a
+    /// latched link is reported instead of re-linked in place.
+    upstream_injected: bool,
     /// Rank 0 only: earliest time for the next downstream re-dial while the
     /// link is down (see `redial_downstream`).
     redial_next: Option<Instant>,
@@ -5939,6 +6095,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
         total: u32,
         prefix_cap: Option<usize>,
     ) -> Self {
+        // An injected upstream (#76) arrives connected: `NotConnected` on it
+        // is a dropped link, never a previous rank that has yet to dial in.
+        let upstream_injected = transport.injected_sides().0;
         Self {
             runner,
             tokenizer,
@@ -5948,7 +6107,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
             rank,
             total,
             peer_disconnected: false,
-            upstream_seen: false,
+            upstream_seen: upstream_injected,
+            upstream_injected,
             redial_next: None,
             link_busy: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             link_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -6694,7 +6854,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             return false;
         };
         self.block_on(async {
-            let c = down.lock().await;
+            let mut c = down.lock().await;
             // Timing out means nothing to read: idle and alive.
             tokio::time::timeout(Duration::from_millis(1), c.wait_readable())
                 .await
@@ -8619,10 +8779,21 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
             }
             return Ok(self.step_first());
         }
-        // Worker rank: a latched disconnect (a dropped upstream, or a protocol
-        // violation escalated to one in handle_forward) re-links in place (see
-        // `relink_worker`), so it is never surfaced as a connection-fatal Err.
-        Ok(self.step_worker())
+        // Worker rank over TCP/UDS: a latched disconnect (a dropped upstream, or
+        // a protocol violation escalated to one in handle_forward) re-links in
+        // place (see `relink_worker`), so it is never surfaced as a
+        // connection-fatal Err.
+        if !self.upstream_injected {
+            return Ok(self.step_worker());
+        }
+        // Over an injected upstream (#76) nothing re-links in place:
+        // `worker_step` reports a latched link as connection-fatal.
+        let produced = if self.peer_disconnected {
+            Vec::new()
+        } else {
+            self.step_worker()
+        };
+        worker_step(self.peer_disconnected, produced)
     }
 }
 
@@ -8746,6 +8917,36 @@ mod tests {
         }
         fn head_logits(&self, _hidden: &[f32]) -> Vec<f32> {
             vec![0.0]
+        }
+    }
+
+    /// A worker on an injected upstream (#76) never re-links in place: once the
+    /// embedder's end is gone, every step reports the dead link as
+    /// connection-fatal, promptly, so the relay loop exits instead of retrying
+    /// an accept that an injected server always refuses.
+    #[test]
+    fn an_injected_worker_reports_its_dead_upstream_on_every_step() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (near, far) = tokio::io::duplex(64);
+        let transport = StageTransport {
+            upstream: Some(Arc::new(TokioMutex::new(ActivationServer::from_stream(
+                Box::new(near),
+            )))),
+            downstream: None,
+        };
+        let mut eng =
+            PipelineEngine::new(StubRunner, None, transport, rt.handle().clone(), 1, 2, None);
+        assert!(eng.upstream_injected && eng.upstream_seen);
+        drop(far);
+        for i in 0..3 {
+            let t0 = Instant::now();
+            let r = eng.step();
+            assert!(
+                matches!(&r, Err(e) if e.is_connection_fatal()),
+                "step {i}: got {:?}",
+                r.map(|v| v.len())
+            );
+            assert!(t0.elapsed() < WORKER_BACKOFF, "step {i} must not back off");
         }
     }
 
@@ -9178,6 +9379,28 @@ mod tests {
         assert!(down.lock().await.is_connected());
     }
 
+    /// An injected downstream (#76) is neither probed nor dialed before a task: a
+    /// live one is kept as is, a dropped one fails the task for a re-attach.
+    #[tokio::test]
+    async fn rank0_never_redials_an_injected_downstream() {
+        let (near, far) = tokio::io::duplex(1 << 16);
+        let down = TokioMutex::new(ActivationClient::from_stream(Box::new(near)));
+        assert!(!relink_idle_downstream(&down).await.unwrap());
+        assert!(down.lock().await.is_connected(), "the live stream is kept");
+        let mut worker = ActivationServer::from_stream(Box::new(far));
+        send_reset(&down).await.unwrap();
+        let kb = worker.recv_raw(4).await.unwrap();
+        assert_eq!(
+            u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]),
+            FrameKind::Reset as u32
+        );
+        down.lock().await.close().await;
+        assert!(matches!(
+            relink_idle_downstream(&down).await,
+            Err(cascadia_transport::TransportError::NotConnected)
+        ));
+    }
+
     // -------- batched-prefill reply deadline (regression for the unbounded
     // recv_kind_client/recv_token_body_client pair — see `prefill_reply_budget`
     // and its two call sites in `handle_forward_batch_prefill` /
@@ -9346,5 +9569,229 @@ mod tests {
             dial_stage_from_loopback("0.0.0.0", "127.0.0.1").await,
             (true, false)
         );
+    }
+
+    // ---- injected streams: connect_streams (#76) ----
+    //
+    // connect_streams never touches the filesystem (unlike load/connect's TCP
+    // dance), so a dummy model dir is fine and no manifest is written — and the
+    // EP paths need neither load() nor build() (both require real weights/IR), so
+    // these drive connect_streams alone and read the builder's private fields.
+
+    fn injected_builder(rank: u32, total: u32) -> SparseMoEBuilder {
+        SparseMoEBuilder::new(
+            SparseMoEBuilderConfig::new("/nonexistent", "CPU").with_rank(rank, total),
+        )
+    }
+
+    fn duplex_byte_stream() -> cascadia_engine::ByteStream {
+        Box::new(tokio::io::duplex(64).0)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_wires_a_middle_stage_both_sides() {
+        let mut b = injected_builder(1, 3); // middle: upstream + downstream
+        b.connect_streams(cascadia_engine::StreamLinks::pipeline(
+            Some(duplex_byte_stream()),
+            Some(duplex_byte_stream()),
+        ))
+        .await
+        .expect("a middle stage accepts both streams");
+        assert!(b.transport.upstream.is_some());
+        assert!(b.transport.downstream.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_wires_head_downstream_only() {
+        let mut b = injected_builder(0, 2); // head (rank 0): downstream only
+        b.connect_streams(cascadia_engine::StreamLinks::pipeline(
+            None,
+            Some(duplex_byte_stream()),
+        ))
+        .await
+        .expect("a head accepts a downstream stream");
+        assert!(b.transport.upstream.is_none());
+        assert!(b.transport.downstream.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_wires_tail_upstream_only() {
+        let mut b = injected_builder(1, 2); // tail (rank total-1): upstream only
+        b.connect_streams(cascadia_engine::StreamLinks::pipeline(
+            Some(duplex_byte_stream()),
+            None,
+        ))
+        .await
+        .expect("a tail accepts an upstream stream");
+        assert!(b.transport.upstream.is_some());
+        assert!(b.transport.downstream.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_standalone_takes_no_streams() {
+        let mut b = injected_builder(0, 1); // single stage
+        b.connect_streams(cascadia_engine::StreamLinks::default())
+            .await
+            .expect("a standalone stage wires nothing");
+        assert!(b.transport.upstream.is_none());
+        assert!(b.transport.downstream.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_rejects_pipeline_shape_mismatch() {
+        // Head given an upstream it does not have.
+        let mut b = injected_builder(0, 2);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks::pipeline(
+                Some(duplex_byte_stream()),
+                Some(duplex_byte_stream()),
+            ))
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+        // Middle missing its downstream.
+        let mut b = injected_builder(1, 3);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks::pipeline(
+                Some(duplex_byte_stream()),
+                None,
+            ))
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+        // Standalone handed a stream.
+        let mut b = injected_builder(0, 1);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks::pipeline(
+                None,
+                Some(duplex_byte_stream()),
+            ))
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_wires_an_expert_worker_driver_link() {
+        // An EP worker (ep_worker set, total == 1) accepts exactly one driver
+        // link via `ep_driver` and stores an injected ActivationServer.
+        let mut cfg = SparseMoEBuilderConfig::new("/nonexistent", "CPU");
+        cfg.ep_worker = Some((0, 1));
+        let mut b = SparseMoEBuilder::new(cfg);
+        b.connect_streams(cascadia_engine::StreamLinks {
+            ep_driver: Some(duplex_byte_stream()),
+            ..Default::default()
+        })
+        .await
+        .expect("an expert worker accepts a driver link");
+        assert!(
+            b.ep_server.is_some(),
+            "the driver link is stored as ep_server"
+        );
+        assert!(b.transport.upstream.is_none() && b.transport.downstream.is_none());
+        assert!(b.ep_clients.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_wires_expert_driver_worker_links_in_order() {
+        // An EP driver (ep_workers non-empty, total == 1) takes one link per
+        // worker, in order, as injected ActivationClients.
+        let mut cfg = SparseMoEBuilderConfig::new("/nonexistent", "CPU");
+        cfg.ep_workers = vec![("a".into(), 1), ("b".into(), 2)];
+        let mut b = SparseMoEBuilder::new(cfg);
+        b.connect_streams(cascadia_engine::StreamLinks {
+            ep_workers: vec![Some(duplex_byte_stream()), Some(duplex_byte_stream())],
+            ..Default::default()
+        })
+        .await
+        .expect("an expert driver accepts one link per worker");
+        assert_eq!(
+            b.ep_clients.len(),
+            2,
+            "one injected client per worker, in order"
+        );
+        assert!(b.ep_server.is_none());
+        assert!(b.transport.upstream.is_none() && b.transport.downstream.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_rejects_ep_shape_mismatches() {
+        // Driver with 2 workers handed the wrong count.
+        let mut cfg = SparseMoEBuilderConfig::new("/nonexistent", "CPU");
+        cfg.ep_workers = vec![("a".into(), 1), ("b".into(), 2)];
+        let mut b = SparseMoEBuilder::new(cfg);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks {
+                ep_workers: vec![Some(duplex_byte_stream())],
+                ..Default::default()
+            })
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+        assert!(b.ep_clients.is_empty(), "a rejected connect wires nothing");
+
+        // Driver with a None entry in ep_workers (every entry must be Some).
+        let mut cfg = SparseMoEBuilderConfig::new("/nonexistent", "CPU");
+        cfg.ep_workers = vec![("a".into(), 1), ("b".into(), 2)];
+        let mut b = SparseMoEBuilder::new(cfg);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks {
+                ep_workers: vec![Some(duplex_byte_stream()), None],
+                ..Default::default()
+            })
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+
+        // An EP link on a plain pipeline stage.
+        let mut b = injected_builder(0, 2); // head: downstream only
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks {
+                downstream: Some(duplex_byte_stream()),
+                ep_driver: Some(duplex_byte_stream()),
+                ..Default::default()
+            })
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+
+        // A pipeline link on an EP worker.
+        let mut cfg = SparseMoEBuilderConfig::new("/nonexistent", "CPU");
+        cfg.ep_worker = Some((0, 1));
+        let mut b = SparseMoEBuilder::new(cfg);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks {
+                upstream: Some(duplex_byte_stream()),
+                ep_driver: Some(duplex_byte_stream()),
+                ..Default::default()
+            })
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+        assert!(b.ep_server.is_none(), "a rejected connect wires nothing");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_keeps_ep_invalidconfig_guards() {
+        // An expert worker cannot also be a pipeline stage (total > 1): the
+        // guard fires before any shape check, so the links are irrelevant.
+        let mut cfg = SparseMoEBuilderConfig::new("/nonexistent", "CPU").with_rank(0, 2);
+        cfg.ep_worker = Some((0, 1));
+        let mut b = SparseMoEBuilder::new(cfg);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks::default())
+                .await,
+            Err(EngineError::InvalidConfig(_))
+        ));
+
+        // An expert-parallel driver runs as a single stage (total == 1).
+        let mut cfg = SparseMoEBuilderConfig::new("/nonexistent", "CPU").with_rank(0, 2);
+        cfg.ep_workers = vec![("127.0.0.1".into(), 9000)];
+        let mut b = SparseMoEBuilder::new(cfg);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks::default())
+                .await,
+            Err(EngineError::InvalidConfig(_))
+        ));
     }
 }

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use cascadia_engine::{Builder, Engine, EngineError, EngineFailure};
+use cascadia_engine::{Builder, Engine, EngineError, EngineFailure, StreamLinks};
 use cascadia_types::{Chunk, FinishReason, GenerationTask, PeerLayout, ShardSpec, TaskId};
 use futures::Stream;
 use parking_lot::Mutex;
@@ -364,6 +364,10 @@ pub struct Runner {
     /// The engine's [`Engine::failure`] handle, grabbed once at `start()` so the server
     /// can watch it without the engine lock. A handle nothing sets until then.
     failure: Mutex<EngineFailure>,
+    /// Set only by [`Runner::start_with_streams`] (issue #76). In stream mode
+    /// a dead link is recoverable via [`Runner::reattach`]; in TCP mode it is
+    /// terminal, exactly as before.
+    stream_mode: AtomicBool,
 }
 
 impl Runner {
@@ -374,6 +378,7 @@ impl Runner {
             model: Mutex::new(None),
             closing: Arc::new(AtomicBool::new(false)),
             failure: Mutex::new(EngineFailure::default()),
+            stream_mode: AtomicBool::new(false),
         }
     }
 
@@ -411,7 +416,31 @@ impl Runner {
             "runner connect"
         );
         builder.connect(peers).await?;
+        self.load_build_warmup(builder, shard).await
+    }
 
+    /// Issue #76: like [`Runner::start_with_listen`], but the caller supplies
+    /// already-connected streams (see the contract on
+    /// `cascadia_transport::InjectedStream`). Puts the runner in stream
+    /// mode, which enables [`Runner::reattach`].
+    pub async fn start_with_streams(
+        &self,
+        links: StreamLinks,
+        shard: ShardSpec,
+    ) -> Result<(), EngineError> {
+        let mut builder = self.builder.lock().take().ok_or(EngineError::NotLoaded)?;
+        info!(links = ?links.shape(), "runner connect (injected streams)");
+        builder.connect_streams(links).await?;
+        self.load_build_warmup(builder, shard).await?;
+        self.stream_mode.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn load_build_warmup(
+        &self,
+        mut builder: Box<dyn Builder>,
+        shard: ShardSpec,
+    ) -> Result<(), EngineError> {
         info!("runner load");
         let model = shard.model_id.clone();
         let device = shard.device.clone();
@@ -1485,6 +1514,7 @@ mod tests {
             model: Mutex::new(None),
             closing: Arc::new(AtomicBool::new(false)),
             failure: Mutex::new(EngineFailure::default()),
+            stream_mode: AtomicBool::new(false),
         });
 
         // Drive the relay loop on a worker thread, let it run for a window
@@ -1537,6 +1567,7 @@ mod tests {
             model: Mutex::new(None),
             closing: Arc::new(AtomicBool::new(false)),
             failure: Mutex::new(EngineFailure::default()),
+            stream_mode: AtomicBool::new(false),
         });
 
         // No external stop: the loop must terminate on its own. A timed join
@@ -1586,6 +1617,7 @@ mod tests {
                 model: Mutex::new(None),
                 closing: Arc::new(AtomicBool::new(false)),
                 failure: Mutex::new(EngineFailure::default()),
+                stream_mode: AtomicBool::new(false),
             });
             let driver = runner.clone();
             let handle = std::thread::spawn(move || driver.run_relay_loop());
@@ -2876,6 +2908,7 @@ mod tests {
             model: Mutex::new(Some(Arc::from(model))),
             closing: Arc::new(AtomicBool::new(false)),
             failure: Mutex::new(EngineFailure::default()),
+            stream_mode: AtomicBool::new(false),
         }
     }
 
@@ -3760,5 +3793,65 @@ mod tests {
             .await
             .expect("the lock holder never finished after teardown")
             .unwrap();
+    }
+
+    /// Builder that records which connect path the runner used.
+    struct PathBuilder(Arc<parking_lot::Mutex<Vec<&'static str>>>);
+
+    #[async_trait::async_trait]
+    impl Builder for PathBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            self.0.lock().push("tcp");
+            Ok(())
+        }
+        async fn connect_streams(
+            &mut self,
+            links: cascadia_engine::StreamLinks,
+        ) -> Result<(), EngineError> {
+            assert!(links.upstream.is_some() && links.downstream.is_none());
+            self.0.lock().push("streams");
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            Ok(Box::new(FailingEngine))
+        }
+    }
+
+    fn test_shard() -> ShardSpec {
+        ShardSpec::single_stage("m", "CPU")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_with_streams_uses_connect_streams_and_sets_stream_mode() {
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let runner = Runner::new(Box::new(PathBuilder(log.clone())));
+        let (a, _b) = tokio::io::duplex(64);
+        runner
+            .start_with_streams(
+                cascadia_engine::StreamLinks::pipeline(Some(Box::new(a)), None),
+                test_shard(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(*log.lock(), vec!["streams"]);
+        assert!(runner.stream_mode.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_with_listen_leaves_stream_mode_off() {
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let runner = Runner::new(Box::new(PathBuilder(log.clone())));
+        runner
+            .start_with_listen(PeerLayout::single_stage(), test_shard(), None)
+            .await
+            .unwrap();
+        assert_eq!(*log.lock(), vec!["tcp"]);
+        assert!(!runner.stream_mode.load(Ordering::SeqCst));
     }
 }

@@ -10,7 +10,7 @@ description = "Per-stage Runner — owns Builder/Engine, drives the generate loo
 
 [dependencies]
 cascadia-types = { workspace = true }
-cascadia-engine = { workspace = true }
+cascadia-engine = { workspace = true, features = ["injected_streams"] }
 cascadia-metrics = { workspace = true }
 tokio = { workspace = true }
 parking_lot = { workspace = true }

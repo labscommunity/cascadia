@@ -1711,6 +1711,23 @@ impl StageTransport {
     }
 }
 
+impl StageTransport {
+    /// Issue #76: whether the upstream / downstream link is an injected stream.
+    /// For engine setup only, before anything else shares the links: a link
+    /// whose lock is held counts as not injected.
+    pub(crate) fn injected_sides(&self) -> (bool, bool) {
+        let up = self
+            .upstream
+            .as_ref()
+            .is_some_and(|s| s.try_lock().is_ok_and(|g| g.is_injected()));
+        let down = self
+            .downstream
+            .as_ref()
+            .is_some_and(|c| c.try_lock().is_ok_and(|g| g.is_injected()));
+        (up, down)
+    }
+}
+
 // ───────────────────── Inkling expert-parallel dispatch (`crate::inkling::ep`) ─────────────────────
 //
 // Star topology: the driver (rank 0 of a `total = 1` pipeline) routes every MoE layer locally and
