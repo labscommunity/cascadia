@@ -23,6 +23,82 @@ pub mod kv_handoff;
 #[cfg(feature = "kv_coord")]
 pub use kv_handoff::{KvHandoffMailbox, KvHandoffSlot};
 
+#[cfg(feature = "injected_streams")]
+pub use cascadia_transport::ByteStream;
+
+/// Issue #76: the activation links handed to [`Builder::connect_streams`] and
+/// `Engine::reattach_streams`. Pipeline stages use `upstream`/`downstream`;
+/// an inkling expert-parallel (EP) worker uses `ep_driver`; an EP driver uses
+/// `ep_workers`, one entry per expert worker in `--ep-workers` order. On
+/// re-attach a `None` keeps that link, and an empty `ep_workers` keeps all.
+#[cfg(feature = "injected_streams")]
+#[derive(Default)]
+pub struct StreamLinks {
+    pub upstream: Option<ByteStream>,
+    pub downstream: Option<ByteStream>,
+    pub ep_driver: Option<ByteStream>,
+    pub ep_workers: Vec<Option<ByteStream>>,
+}
+
+#[cfg(feature = "injected_streams")]
+impl StreamLinks {
+    /// Pipeline links only.
+    pub fn pipeline(upstream: Option<ByteStream>, downstream: Option<ByteStream>) -> Self {
+        Self {
+            upstream,
+            downstream,
+            ..Self::default()
+        }
+    }
+
+    /// Which links this value carries; `ep_workers` counts the `Some` entries.
+    pub fn shape(&self) -> LinkShape {
+        LinkShape {
+            upstream: self.upstream.is_some(),
+            downstream: self.downstream.is_some(),
+            ep_driver: self.ep_driver.is_some(),
+            ep_workers: self.ep_workers.iter().filter(|s| s.is_some()).count(),
+        }
+    }
+}
+
+/// Issue #76: which links a stage has (for validation) or a [`StreamLinks`]
+/// carries. Pipeline stages and EP roles never mix (the EP driver runs as a
+/// single stage).
+#[cfg(feature = "injected_streams")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinkShape {
+    pub upstream: bool,
+    pub downstream: bool,
+    pub ep_driver: bool,
+    pub ep_workers: usize,
+}
+
+#[cfg(feature = "injected_streams")]
+impl LinkShape {
+    pub fn pipeline(upstream: bool, downstream: bool) -> Self {
+        Self {
+            upstream,
+            downstream,
+            ..Self::default()
+        }
+    }
+}
+
+/// Issue #76: validate a `connect_streams` call. Every link the stage has must
+/// be supplied (every `ep_workers` entry `Some`, count equal) and nothing else.
+#[cfg(feature = "injected_streams")]
+pub fn check_connect_streams(stage: LinkShape, links: &StreamLinks) -> EngineResult<()> {
+    let got = links.shape();
+    if got != stage || links.ep_workers.len() != stage.ep_workers {
+        return Err(EngineError::PeerRejected(format!(
+            "connect_streams links {got:?} (ep_workers entries: {}) do not match this stage {stage:?}",
+            links.ep_workers.len()
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error("invalid configuration: {0}")]
@@ -397,6 +473,17 @@ pub trait Builder: Send {
     /// Single-stage engines must reject any non-empty layout.
     async fn connect(&mut self, peers: PeerLayout) -> EngineResult<()>;
 
+    /// Issue #76: wire up with already-connected streams instead of
+    /// dialing/listening. Links must match this stage exactly (see
+    /// [`check_connect_streams`]). `configure_listen` is ignored on this path.
+    /// Streams must satisfy the contract on `cascadia_transport::InjectedStream`.
+    #[cfg(feature = "injected_streams")]
+    async fn connect_streams(&mut self, _links: StreamLinks) -> EngineResult<()> {
+        Err(EngineError::PeerRejected(
+            "this engine does not accept injected streams".into(),
+        ))
+    }
+
     /// Load model weights. Streams progress events.
     async fn load(&mut self, shard: ShardSpec) -> EngineResult<LoadStream>;
 
@@ -410,6 +497,121 @@ pub trait Builder: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "injected_streams")]
+    fn duplex_end() -> ByteStream {
+        Box::new(tokio::io::duplex(64).0)
+    }
+
+    #[cfg(feature = "injected_streams")]
+    #[test]
+    fn stream_links_shape_reports_present_links() {
+        let links = StreamLinks {
+            upstream: Some(duplex_end()),
+            downstream: None,
+            ep_driver: None,
+            ep_workers: vec![Some(duplex_end()), None, Some(duplex_end())],
+        };
+        assert_eq!(
+            links.shape(),
+            LinkShape {
+                upstream: true,
+                downstream: false,
+                ep_driver: false,
+                ep_workers: 2
+            }
+        );
+        assert_eq!(StreamLinks::default().shape(), LinkShape::default());
+        assert_eq!(
+            StreamLinks::pipeline(None, Some(duplex_end())).shape(),
+            LinkShape::pipeline(false, true)
+        );
+    }
+
+    #[cfg(feature = "injected_streams")]
+    #[test]
+    fn check_connect_streams_requires_an_exact_match() {
+        let middle = LinkShape::pipeline(true, true);
+        assert!(check_connect_streams(
+            middle,
+            &StreamLinks::pipeline(Some(duplex_end()), Some(duplex_end()))
+        )
+        .is_ok());
+        assert!(matches!(
+            check_connect_streams(middle, &StreamLinks::pipeline(Some(duplex_end()), None)),
+            Err(EngineError::PeerRejected(_))
+        ));
+        // Standalone stage: nothing supplied.
+        assert!(check_connect_streams(LinkShape::default(), &StreamLinks::default()).is_ok());
+        assert!(check_connect_streams(
+            LinkShape::default(),
+            &StreamLinks::pipeline(None, Some(duplex_end()))
+        )
+        .is_err());
+        // A pipeline stage refuses EP links.
+        let ep_on_pipeline = StreamLinks {
+            ep_driver: Some(duplex_end()),
+            ..StreamLinks::pipeline(Some(duplex_end()), Some(duplex_end()))
+        };
+        assert!(check_connect_streams(middle, &ep_on_pipeline).is_err());
+        // EP worker: exactly the driver link.
+        let worker = LinkShape {
+            ep_driver: true,
+            ..LinkShape::default()
+        };
+        assert!(check_connect_streams(
+            worker,
+            &StreamLinks {
+                ep_driver: Some(duplex_end()),
+                ..Default::default()
+            }
+        )
+        .is_ok());
+        assert!(check_connect_streams(worker, &StreamLinks::default()).is_err());
+        // EP driver with 2 workers: both entries, both Some.
+        let driver = LinkShape {
+            ep_workers: 2,
+            ..LinkShape::default()
+        };
+        let two = StreamLinks {
+            ep_workers: vec![Some(duplex_end()), Some(duplex_end())],
+            ..Default::default()
+        };
+        assert!(check_connect_streams(driver, &two).is_ok());
+        let short = StreamLinks {
+            ep_workers: vec![Some(duplex_end())],
+            ..Default::default()
+        };
+        assert!(check_connect_streams(driver, &short).is_err());
+        let hole = StreamLinks {
+            ep_workers: vec![Some(duplex_end()), None],
+            ..Default::default()
+        };
+        assert!(check_connect_streams(driver, &hole).is_err());
+    }
+
+    #[cfg(feature = "injected_streams")]
+    #[tokio::test]
+    async fn builder_connect_streams_defaults_to_rejection() {
+        struct NoStreams;
+        #[async_trait]
+        impl Builder for NoStreams {
+            async fn connect(&mut self, _peers: PeerLayout) -> EngineResult<()> {
+                Ok(())
+            }
+            async fn load(&mut self, _shard: ShardSpec) -> EngineResult<LoadStream> {
+                Ok(Box::pin(futures::stream::empty()))
+            }
+            fn build(self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
+                Err(EngineError::NotLoaded)
+            }
+        }
+        let mut b = NoStreams;
+        assert!(matches!(
+            b.connect_streams(StreamLinks::default()).await,
+            Err(EngineError::PeerRejected(_))
+        ));
+    }
 
     /// The two "frame-start" errors are NOT the same error, and conflating them is easy: both
     /// start with the same words and both mention a timeout. Only one is fatal.

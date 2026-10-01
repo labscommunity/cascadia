@@ -4688,6 +4688,18 @@ impl OvRuntimeBuilder {
     }
 }
 
+#[cfg(test)]
+impl OvRuntimeBuilder {
+    /// Test seam (#76): the stream slots are private, so a builder-level test
+    /// cannot otherwise assert that `connect_streams` stored an injected handle.
+    fn upstream_handle(&self) -> Option<Arc<tokio::sync::Mutex<ActivationServer>>> {
+        self.upstream.clone()
+    }
+    fn downstream_handle(&self) -> Option<Arc<tokio::sync::Mutex<ActivationClient>>> {
+        self.downstream.clone()
+    }
+}
+
 #[async_trait]
 impl Builder for OvRuntimeBuilder {
     fn configure_listen(&mut self, host: &str, port: u16) {
@@ -4724,6 +4736,41 @@ impl Builder for OvRuntimeBuilder {
                 .accept()
                 .await
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Issue #76: wire this stage up with already-connected streams instead of
+    /// binding a listener and dialing. The caller supplies a stream for each
+    /// side this stage has a peer on; shape is validated against the stage role
+    /// derived from `rank`/`total` (rank 0 has no upstream, the last rank has no
+    /// downstream - same mapping `connect`'s `PeerLayout` encodes). ov-runtime is
+    /// pipeline-only, so the stage `LinkShape` has `ep_driver=false`,
+    /// `ep_workers=0`; `check_connect_streams` is an exact match, so any EP link
+    /// in `links` is rejected with `PeerRejected`. Injected handles are stored in
+    /// the same `Arc<Mutex<..>>` slots `connect` uses, so every downstream path is
+    /// identical from here on. `configure_listen` is ignored on this path (no
+    /// listener is bound). No liveness check is done; a dead stream fails at first
+    /// use (contract on `cascadia_transport::InjectedStream`).
+    async fn connect_streams(&mut self, links: cascadia_engine::StreamLinks) -> EngineResult<()> {
+        let stage_upstream = self.rank > 0;
+        let stage_downstream = self.rank + 1 < self.total;
+        cascadia_engine::check_connect_streams(
+            cascadia_engine::LinkShape::pipeline(stage_upstream, stage_downstream),
+            &links,
+        )?;
+        let cascadia_engine::StreamLinks {
+            upstream,
+            downstream,
+            ..
+        } = links;
+        if let Some(stream) = upstream {
+            let server = ActivationServer::from_stream(stream);
+            self.upstream = Some(Arc::new(tokio::sync::Mutex::new(server)));
+        }
+        if let Some(stream) = downstream {
+            let client = ActivationClient::from_stream(stream);
+            self.downstream = Some(Arc::new(tokio::sync::Mutex::new(client)));
         }
         Ok(())
     }
@@ -6845,5 +6892,106 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tok, 8);
+    }
+
+    // ---- injected streams: connect_streams (#76) ----
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_head_stores_injected_downstream() {
+        // rank 0 of 2 is the head: downstream only, no upstream.
+        let mut b = OvRuntimeBuilder::new("/non/existent", 0, 2, "CPU");
+        let (down, _peer) = tokio::io::duplex(64);
+        b.connect_streams(cascadia_engine::StreamLinks::pipeline(
+            None,
+            Some(Box::new(down)),
+        ))
+        .await
+        .expect("head accepts a downstream-only shape");
+        assert!(b.upstream_handle().is_none(), "head has no upstream");
+        let h = b.downstream_handle().expect("downstream stored");
+        assert!(
+            h.lock().await.is_injected(),
+            "stored handle must be injected"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_middle_stores_both_injected() {
+        // rank 1 of 3 is a middle stage: both sides required.
+        let mut b = OvRuntimeBuilder::new("/non/existent", 1, 3, "CPU");
+        let (up, _pu) = tokio::io::duplex(64);
+        let (down, _pd) = tokio::io::duplex(64);
+        b.connect_streams(cascadia_engine::StreamLinks::pipeline(
+            Some(Box::new(up)),
+            Some(Box::new(down)),
+        ))
+        .await
+        .expect("middle accepts both sides");
+        assert!(b.upstream_handle().unwrap().lock().await.is_injected());
+        assert!(b.downstream_handle().unwrap().lock().await.is_injected());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_standalone_accepts_none_none() {
+        // rank 0 of 1 is standalone: neither side.
+        let mut b = OvRuntimeBuilder::new("/non/existent", 0, 1, "CPU");
+        b.connect_streams(cascadia_engine::StreamLinks::default())
+            .await
+            .expect("standalone accepts an empty StreamLinks");
+        assert!(b.upstream_handle().is_none() && b.downstream_handle().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_rejects_shape_mismatch_and_stores_nothing() {
+        // Head (rank 0 of 2) has no upstream: an upstream stream is a shape error,
+        // and the check runs before anything is stored.
+        let mut b = OvRuntimeBuilder::new("/non/existent", 0, 2, "CPU");
+        let (up, _pu) = tokio::io::duplex(64);
+        let (down, _pd) = tokio::io::duplex(64);
+        let err = b
+            .connect_streams(cascadia_engine::StreamLinks::pipeline(
+                Some(Box::new(up)),
+                Some(Box::new(down)),
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::PeerRejected(_)), "got {err:?}");
+        assert!(
+            b.upstream_handle().is_none() && b.downstream_handle().is_none(),
+            "a rejected shape stores nothing"
+        );
+
+        // Tail (rank 1 of 2) has no downstream: a downstream stream is a shape error.
+        let mut b = OvRuntimeBuilder::new("/non/existent", 1, 2, "CPU");
+        let (down, _pd) = tokio::io::duplex(64);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks::pipeline(
+                None,
+                Some(Box::new(down))
+            ))
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_rejects_ep_links() {
+        // ov-runtime is pipeline-only. An EP link alongside the correct pipeline
+        // shape is still a role error: exact-match `check_connect_streams` against
+        // a pipeline `LinkShape` (ep_driver=false, ep_workers=0) rejects it, and
+        // nothing is stored.
+        let mut b = OvRuntimeBuilder::new("/non/existent", 0, 2, "CPU"); // head: downstream only
+        let (down, _pd) = tokio::io::duplex(64);
+        let (ep, _pe) = tokio::io::duplex(64);
+        let err = b
+            .connect_streams(cascadia_engine::StreamLinks {
+                downstream: Some(Box::new(down)),
+                ep_driver: Some(Box::new(ep)),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::PeerRejected(_)), "got {err:?}");
+        assert!(b.upstream_handle().is_none() && b.downstream_handle().is_none());
     }
 }

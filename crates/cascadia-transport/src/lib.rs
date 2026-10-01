@@ -50,15 +50,58 @@ fn tune_pipeline_socket(sock: &TcpStream) {
     let _ = socket2::SockRef::from(sock).set_tcp_keepalive(&ka);
 }
 
-/// A connected pipeline byte stream: TCP (cross-host) or a Unix domain
-/// socket (in-host, #17). Both carry the identical length-prefixed wire
-/// format; every frame helper in this crate is generic over
-/// `AsyncRead`/`AsyncWrite`, so the two arms share one code path.
-#[derive(Debug)]
+/// Issue #76: a byte stream supplied by an embedder instead of a socket this
+/// crate dialed or accepted (encrypted p2p stream, in-process pipe, ...).
+/// Implemented automatically for every `AsyncRead + AsyncWrite + Send + Unpin`
+/// type.
+///
+/// # Contract for injected streams
+///
+/// A stream handed to [`ActivationServer::from_stream`],
+/// [`ActivationClient::from_stream`] or `attach` must:
+///
+/// 1. arrive connected and ready (no readiness wait or retry is done);
+/// 2. be cancel-safe for reads: dropping a pending `read` must not lose
+///    bytes - anything read from the underlying transport stays in the
+///    stream object, not in the dropped future (true for tokio
+///    `TcpStream`/`UnixStream`, `BufReader`, `duplex`, tokio-rustls and
+///    `tokio_util::compat` adapters; recombined `tokio::io::split` halves are
+///    fine because a handle is never read and written concurrently);
+/// 3. surface death promptly on every operation - `read`, `write`, `flush`
+///    and `shutdown` return EOF or an error when the outer transport dies.
+///    Before re-attaching, the embedder must close or drop its own end of
+///    every stream being replaced;
+/// 4. be byte-transparent and in order;
+/// 5. be fresh: never a stream that already carried frames for this engine;
+/// 6. avoid Nagle-style coalescing (token frames are small).
+pub trait InjectedStream: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> InjectedStream for T {}
+
+/// A boxed [`InjectedStream`], as passed to `from_stream` / `attach`.
+pub type ByteStream = Box<dyn InjectedStream>;
+
+/// A connected pipeline byte stream: TCP (cross-host), a Unix domain
+/// socket (in-host, #17), or an embedder-supplied stream (#76). All carry
+/// the identical length-prefixed wire format; every frame helper in this
+/// crate is generic over `AsyncRead`/`AsyncWrite`, so the arms share one
+/// code path.
 pub enum ActivationStream {
     Tcp(TcpStream),
     #[cfg(unix)]
     Unix(UnixStream),
+    /// Issue #76: see [`InjectedStream`] for the contract.
+    Injected(ByteStream),
+}
+
+impl std::fmt::Debug for ActivationStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ActivationStream::Tcp(s) => f.debug_tuple("Tcp").field(s).finish(),
+            #[cfg(unix)]
+            ActivationStream::Unix(s) => f.debug_tuple("Unix").field(s).finish(),
+            ActivationStream::Injected(_) => f.write_str("Injected(..)"),
+        }
+    }
 }
 
 impl ActivationStream {
@@ -78,6 +121,8 @@ impl ActivationStream {
                 let _ = sock.set_send_buffer_size(1024 * 1024);
                 let _ = sock.set_recv_buffer_size(1024 * 1024);
             }
+            // An injected stream is the embedder's to tune.
+            ActivationStream::Injected(_) => {}
         }
     }
 
@@ -87,6 +132,7 @@ impl ActivationStream {
             ActivationStream::Tcp(s) => s.shutdown().await,
             #[cfg(unix)]
             ActivationStream::Unix(s) => s.shutdown().await,
+            ActivationStream::Injected(s) => s.shutdown().await,
         }
     }
 }
@@ -101,6 +147,7 @@ impl AsyncRead for ActivationStream {
             ActivationStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
             #[cfg(unix)]
             ActivationStream::Unix(s) => Pin::new(s).poll_read(cx, buf),
+            ActivationStream::Injected(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -115,6 +162,7 @@ impl AsyncWrite for ActivationStream {
             ActivationStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(unix)]
             ActivationStream::Unix(s) => Pin::new(s).poll_write(cx, buf),
+            ActivationStream::Injected(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -123,6 +171,7 @@ impl AsyncWrite for ActivationStream {
             ActivationStream::Tcp(s) => Pin::new(s).poll_flush(cx),
             #[cfg(unix)]
             ActivationStream::Unix(s) => Pin::new(s).poll_flush(cx),
+            ActivationStream::Injected(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -131,6 +180,7 @@ impl AsyncWrite for ActivationStream {
             ActivationStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
             #[cfg(unix)]
             ActivationStream::Unix(s) => Pin::new(s).poll_shutdown(cx),
+            ActivationStream::Injected(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 
@@ -143,6 +193,7 @@ impl AsyncWrite for ActivationStream {
             ActivationStream::Tcp(s) => Pin::new(s).poll_write_vectored(cx, bufs),
             #[cfg(unix)]
             ActivationStream::Unix(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+            ActivationStream::Injected(s) => Pin::new(s).poll_write_vectored(cx, bufs),
         }
     }
 
@@ -151,6 +202,7 @@ impl AsyncWrite for ActivationStream {
             ActivationStream::Tcp(s) => s.is_write_vectored(),
             #[cfg(unix)]
             ActivationStream::Unix(s) => s.is_write_vectored(),
+            ActivationStream::Injected(s) => s.is_write_vectored(),
         }
     }
 }
@@ -342,6 +394,14 @@ pub enum TransportError {
     /// keeping the socket safe here — see `recv_error_is_connection_fatal`.
     #[error("frame-start wait timed out after {0:?} with no bytes (retryable)")]
     FrameStartTimeout(Duration),
+
+    /// An injected stream failed with an I/O error kind outside the set the
+    /// transport recognises as a dead link (an opaque p2p stream may report
+    /// peer death as `Other` or a custom kind). Always connection-fatal. The
+    /// message deliberately contains "connection aborted" so engines that
+    /// flatten transport errors to strings classify it as fatal too.
+    #[error("connection aborted (injected stream): {0}")]
+    StreamFailed(io::Error),
 }
 
 pub type TransportResult<T> = Result<T, TransportError>;
@@ -787,6 +847,31 @@ fn clamp_frame_idle_ceiling(
     configured.map(|c| c.max(recv_timeout))
 }
 
+/// The I/O error kinds that mean the link is dead. Shared by the recv-fatal
+/// classifier and [`normalize_injected`].
+fn io_kind_is_fatal(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// On an injected handle, turn an I/O error of an unrecognised kind into
+/// [`TransportError::StreamFailed`] so it is connection-fatal. Socket handles
+/// (`injected == false`) and fatal-kind errors pass through unchanged.
+fn normalize_injected(injected: bool, err: TransportError) -> TransportError {
+    match err {
+        TransportError::Io(e) if injected && !io_kind_is_fatal(e.kind()) => {
+            TransportError::StreamFailed(e)
+        }
+        other => other,
+    }
+}
+
 /// Whether a recv error leaves the socket unusable for subsequent reads, so
 /// the owner must drop it. Cases, all leaving the link dead or frame
 /// alignment lost:
@@ -829,14 +914,8 @@ fn recv_error_is_connection_fatal(err: &TransportError) -> bool {
         // The peer is connected but silent past the idle ceiling: a frame it
         // sends later must never land in a different request.
         TransportError::FrameIdleCeiling(_) => true,
-        TransportError::Io(e) => matches!(
-            e.kind(),
-            io::ErrorKind::TimedOut
-                | io::ErrorKind::ConnectionReset
-                | io::ErrorKind::BrokenPipe
-                | io::ErrorKind::ConnectionAborted
-                | io::ErrorKind::UnexpectedEof
-        ),
+        TransportError::StreamFailed(_) => true,
+        TransportError::Io(e) => io_kind_is_fatal(e.kind()),
         // NOT fatal, deliberately: zero bytes were consumed (cancel-safe
         // `read`), so the socket stays frame-aligned and the caller retries on
         // it. The late frame this admits is handled a layer up by the engine's
@@ -938,12 +1017,13 @@ async fn recv_exact_frame_start<R: AsyncRead + Unpin>(
 /// [`TransportError::FrameStartTimeout`] — `tokio::io::AsyncReadExt::read` is
 /// cancel-safe, so the dropped read consumed nothing and the socket stays frame-
 /// aligned for the caller to retry on the next step. It takes the concrete
-/// [`ActivationStream`] rather than any `AsyncRead` on purpose: both of its
-/// flavors delegate straight to tokio's unbuffered `TcpStream`/`UnixStream`
-/// `poll_read`, which are cancel-safe. **Do not generify this over `AsyncRead`
-/// without re-verifying cancel safety**: a buffering reader that consumed bytes
-/// into its own buffer before being dropped would desync the stream silently,
-/// and the failure mode is corrupted tokens, not an error.
+/// [`ActivationStream`] rather than any `AsyncRead` on purpose: the `Tcp` and
+/// `Unix` flavors delegate straight to tokio's unbuffered `poll_read`, which
+/// is cancel-safe, and the `Injected` flavor is cancel-safe by contract item 2
+/// of [`InjectedStream`]. **Do not generify this over `AsyncRead` without
+/// re-verifying cancel safety**: a buffering reader that consumed bytes into
+/// its own buffer before being dropped would desync the stream silently, and
+/// the failure mode is corrupted tokens, not an error.
 ///
 /// Once `n > 0` the frame has STARTED, so a timeout on the remainder is a
 /// mid-frame stall: alignment is lost and the resulting `Io(TimedOut)` is
@@ -1029,6 +1109,9 @@ pub struct ActivationServer {
     /// [`close`](Self::close) and on `Drop` so a crash-restart can re-bind.
     #[cfg(unix)]
     owned_unix_path: Option<OwnedUnixSocket>,
+    /// Built by `from_stream` (#76): no listener; `start`/`accept` refuse;
+    /// unknown-kind I/O errors are normalized to `StreamFailed`.
+    injected: bool,
 }
 
 /// A bound unix socket path plus the (dev, ino) of the file our bind
@@ -1200,10 +1283,55 @@ impl ActivationServer {
             actual_port,
             #[cfg(unix)]
             owned_unix_path: None,
+            injected: false,
+        }
+    }
+
+    /// Issue #76: a server over an already-connected stream. There is no
+    /// listener; `start` and `accept` return [`TransportError::NotStarted`].
+    pub fn from_stream(stream: ByteStream) -> Self {
+        Self {
+            // Placeholder: only `start`/`accept` read the address, and both
+            // refuse on an injected server.
+            addr: TransportAddr::Tcp {
+                host: String::new(),
+                port: 0,
+            },
+            listener: None,
+            client: Some(ActivationStream::Injected(stream)),
+            accepted_peer: Some("injected".into()),
+            actual_port: 0,
+            #[cfg(unix)]
+            owned_unix_path: None,
+            injected: true,
+        }
+    }
+
+    /// Issue #76: replace the current stream (dropping any old one) with a
+    /// fresh injected one.
+    pub fn attach(&mut self, stream: ByteStream) {
+        self.client = Some(ActivationStream::Injected(stream));
+        self.accepted_peer = Some("injected".into());
+    }
+
+    /// Issue #76: true for a server built by [`from_stream`](Self::from_stream).
+    pub fn is_injected(&self) -> bool {
+        self.injected
+    }
+
+    /// Issue #76: injected servers drop the stream when a send fails with
+    /// [`TransportError::StreamFailed`]; socket send behavior is unchanged.
+    fn drop_connection_if_send_failed(&mut self, err: Option<&TransportError>) {
+        if matches!(err, Some(TransportError::StreamFailed(_))) {
+            self.client = None;
+            self.accepted_peer = None;
         }
     }
 
     pub async fn start(&mut self) -> TransportResult<()> {
+        if self.injected {
+            return Err(TransportError::NotStarted);
+        }
         self.addr.check()?;
         match &self.addr {
             TransportAddr::Tcp { host, port } => {
@@ -1268,6 +1396,9 @@ impl ActivationServer {
     }
 
     pub async fn accept(&mut self) -> TransportResult<()> {
+        if self.injected {
+            return Err(TransportError::NotStarted);
+        }
         let listener = self.listener.as_ref().ok_or(TransportError::NotStarted)?;
         let (stream, peer) = match listener {
             ActivationListener::Tcp(l) => {
@@ -1289,8 +1420,11 @@ impl ActivationServer {
     }
 
     pub async fn recv(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        let injected = self.injected;
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        let res = recv_tensor(sock).await;
+        let res = recv_tensor(sock)
+            .await
+            .map_err(|e| normalize_injected(injected, e));
         self.drop_connection_if_recv_fatal(res.as_ref().err());
         res
     }
@@ -1314,8 +1448,11 @@ impl ActivationServer {
     /// and later calls fail fast with `NotConnected`; recover with a
     /// fresh connection).
     pub async fn recv_reply(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        let injected = self.injected;
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        let res = recv_tensor_reply(sock).await;
+        let res = recv_tensor_reply(sock)
+            .await
+            .map_err(|e| normalize_injected(injected, e));
         if res.is_err() {
             self.poison().await;
         }
@@ -1327,8 +1464,11 @@ impl ActivationServer {
     /// is dropped and later calls fail fast with `NotConnected`;
     /// recover with a fresh connection).
     pub async fn recv_reply_prefill(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        let injected = self.injected;
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        let res = recv_tensor_reply_prefill(sock).await;
+        let res = recv_tensor_reply_prefill(sock)
+            .await
+            .map_err(|e| normalize_injected(injected, e));
         if res.is_err() {
             self.poison().await;
         }
@@ -1349,17 +1489,30 @@ impl ActivationServer {
     }
 
     pub async fn send(&mut self, tensor: &Tensor) -> TransportResult<TransferStats> {
+        let injected = self.injected;
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        send_tensor(sock, tensor).await
+        let res = send_tensor(sock, tensor)
+            .await
+            .map_err(|e| normalize_injected(injected, e));
+        self.drop_connection_if_send_failed(res.as_ref().err());
+        res
     }
 
     /// Send raw bytes over the established connection. Used by the
     /// dist-spec engines to prefix tensor frames with control bytes
     /// (kind + logical_pos_start).
     pub async fn send_raw(&mut self, bytes: &[u8]) -> TransportResult<()> {
+        let injected = self.injected;
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        sock.write_all(bytes).await?;
-        sock.flush().await?;
+        let res = async {
+            sock.write_all(bytes).await?;
+            sock.flush().await?;
+            Ok::<(), TransportError>(())
+        }
+        .await
+        .map_err(|e| normalize_injected(injected, e));
+        self.drop_connection_if_send_failed(res.as_ref().err());
+        res?;
         cascadia_metrics::TRANSPORT_SENT_BYTES_TOTAL
             .with_label_values(&["raw"])
             .inc_by(bytes.len() as u64);
@@ -1373,9 +1526,12 @@ impl ActivationServer {
         if n > MAX_RAW_BYTES {
             return Err(TransportError::RawSizeTooLarge(n));
         }
+        let injected = self.injected;
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
         let mut buf = vec![0u8; n];
-        let res = recv_exact_frame_start(sock, &mut buf).await;
+        let res = recv_exact_frame_start(sock, &mut buf)
+            .await
+            .map_err(|e| normalize_injected(injected, e));
         self.drop_connection_if_recv_fatal(res.as_ref().err());
         res?;
         cascadia_metrics::TRANSPORT_RECV_BYTES_TOTAL
@@ -1421,6 +1577,9 @@ impl Drop for ActivationServer {
 pub struct ActivationClient {
     target: TransportAddr,
     sock: Option<ActivationStream>,
+    /// Built by `from_stream` (#76): `connect*` refuse; unknown-kind I/O
+    /// errors are normalized to `StreamFailed`.
+    injected: bool,
 }
 
 impl ActivationClient {
@@ -1431,16 +1590,57 @@ impl ActivationClient {
         Self {
             target: TransportAddr::from_host_port(&host.into(), port),
             sock: None,
+            injected: false,
         }
     }
 
     pub fn for_addr(target: TransportAddr) -> Self {
-        Self { target, sock: None }
+        Self {
+            target,
+            sock: None,
+            injected: false,
+        }
+    }
+
+    /// Issue #76: a client over an already-connected stream. `connect*`
+    /// return [`TransportError::NotStarted`].
+    pub fn from_stream(stream: ByteStream) -> Self {
+        Self {
+            // Placeholder: only `dial`/`connect*` read the target, and
+            // `connect_with_timeout` refuses on an injected client.
+            target: TransportAddr::Tcp {
+                host: String::new(),
+                port: 0,
+            },
+            sock: Some(ActivationStream::Injected(stream)),
+            injected: true,
+        }
+    }
+
+    /// Issue #76: replace the current stream (dropping any old one) with a
+    /// fresh injected one.
+    pub fn attach(&mut self, stream: ByteStream) {
+        self.sock = Some(ActivationStream::Injected(stream));
+    }
+
+    /// Issue #76: true for a client built by [`from_stream`](Self::from_stream).
+    pub fn is_injected(&self) -> bool {
+        self.injected
+    }
+
+    /// See [`ActivationServer::drop_connection_if_send_failed`].
+    fn drop_connection_if_send_failed(&mut self, err: Option<&TransportError>) {
+        if matches!(err, Some(TransportError::StreamFailed(_))) {
+            self.sock = None;
+        }
     }
 
     /// One connect attempt for the configured target flavor.
-    async fn dial(&self) -> io::Result<ActivationStream> {
-        match &self.target {
+    /// Takes the target, not `&self`: a `&ActivationClient` held across an
+    /// await would make the future `!Send` (a boxed injected stream is `Send`
+    /// but not `Sync`).
+    async fn dial(target: &TransportAddr) -> io::Result<ActivationStream> {
+        match target {
             TransportAddr::Tcp { host, port } => Ok(ActivationStream::Tcp(
                 TcpStream::connect((host.as_str(), *port)).await?,
             )),
@@ -1461,6 +1661,9 @@ impl ActivationClient {
     /// permission denied, a non-directory path component) is deterministic
     /// and fails fast instead of burning the whole timeout.
     pub async fn connect_with_timeout(&mut self, timeout: Duration) -> TransportResult<()> {
+        if self.injected {
+            return Err(TransportError::NotStarted);
+        }
         self.target.check()?;
         // A unix target on a non-unix platform can never succeed — fail
         // fast instead of burning the whole connect timeout retrying.
@@ -1487,7 +1690,7 @@ impl ActivationClient {
         let mut last_err: Option<io::Error> = None;
         let mut next_progress = start + Duration::from_secs(5);
         while Instant::now() < deadline {
-            match self.dial().await {
+            match Self::dial(&self.target).await {
                 Ok(sock) => {
                     sock.tune();
                     info!(target = %self.target, "ActivationClient connected");
@@ -1544,13 +1747,21 @@ impl ActivationClient {
     }
 
     pub async fn send(&mut self, tensor: &Tensor) -> TransportResult<TransferStats> {
+        let injected = self.injected;
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        send_tensor(sock, tensor).await
+        let res = send_tensor(sock, tensor)
+            .await
+            .map_err(|e| normalize_injected(injected, e));
+        self.drop_connection_if_send_failed(res.as_ref().err());
+        res
     }
 
     pub async fn recv(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        let injected = self.injected;
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        let res = recv_tensor(sock).await;
+        let res = recv_tensor(sock)
+            .await
+            .map_err(|e| normalize_injected(injected, e));
         self.drop_connection_if_recv_fatal(res.as_ref().err());
         res
     }
@@ -1568,8 +1779,11 @@ impl ActivationClient {
         &mut self,
         frame_start_deadline: Duration,
     ) -> TransportResult<(Tensor, TransferStats)> {
+        let injected = self.injected;
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        let res = recv_tensor_token(sock, frame_start_deadline).await;
+        let res = recv_tensor_token(sock, frame_start_deadline)
+            .await
+            .map_err(|e| normalize_injected(injected, e));
         self.drop_connection_if_recv_fatal(res.as_ref().err());
         res
     }
@@ -1589,8 +1803,11 @@ impl ActivationClient {
     /// and later calls fail fast with `NotConnected`; recover with a
     /// fresh connection).
     pub async fn recv_reply(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        let injected = self.injected;
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        let res = recv_tensor_reply(sock).await;
+        let res = recv_tensor_reply(sock)
+            .await
+            .map_err(|e| normalize_injected(injected, e));
         if res.is_err() {
             self.poison().await;
         }
@@ -1602,8 +1819,11 @@ impl ActivationClient {
     /// is dropped and later calls fail fast with `NotConnected`;
     /// recover with a fresh connection).
     pub async fn recv_reply_prefill(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        let injected = self.injected;
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        let res = recv_tensor_reply_prefill(sock).await;
+        let res = recv_tensor_reply_prefill(sock)
+            .await
+            .map_err(|e| normalize_injected(injected, e));
         if res.is_err() {
             self.poison().await;
         }
@@ -1619,9 +1839,17 @@ impl ActivationClient {
     }
 
     pub async fn send_raw(&mut self, bytes: &[u8]) -> TransportResult<()> {
+        let injected = self.injected;
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        sock.write_all(bytes).await?;
-        sock.flush().await?;
+        let res = async {
+            sock.write_all(bytes).await?;
+            sock.flush().await?;
+            Ok::<(), TransportError>(())
+        }
+        .await
+        .map_err(|e| normalize_injected(injected, e));
+        self.drop_connection_if_send_failed(res.as_ref().err());
+        res?;
         cascadia_metrics::TRANSPORT_SENT_BYTES_TOTAL
             .with_label_values(&["raw"])
             .inc_by(bytes.len() as u64);
@@ -1632,9 +1860,12 @@ impl ActivationClient {
         if n > MAX_RAW_BYTES {
             return Err(TransportError::RawSizeTooLarge(n));
         }
+        let injected = self.injected;
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
         let mut buf = vec![0u8; n];
-        let res = recv_exact_frame_start(sock, &mut buf).await;
+        let res = recv_exact_frame_start(sock, &mut buf)
+            .await
+            .map_err(|e| normalize_injected(injected, e));
         self.drop_connection_if_recv_fatal(res.as_ref().err());
         res?;
         cascadia_metrics::TRANSPORT_RECV_BYTES_TOTAL
@@ -3002,5 +3233,257 @@ mod tests {
             "idle gap under the ceiling must not time out: {:?}",
             got.err()
         );
+    }
+
+    // ---- injected streams (#76) ----
+
+    fn sample_tensor() -> Tensor {
+        Tensor::from_2d(DType::F32, 1, 2, vec![0, 0, 128, 63, 0, 0, 0, 64])
+    }
+
+    /// A stream whose every read/write fails with a non-standard error kind,
+    /// as an opaque p2p transport might report peer death.
+    struct OtherErrStream;
+
+    impl tokio::io::AsyncRead for OtherErrStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Err(io::Error::other("peer gone")))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for OtherErrStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Err(io::Error::other("peer gone")))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn injected_stream_round_trips_tensor_raw_and_reply() {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let mut client = ActivationClient::from_stream(Box::new(a));
+        let mut server = ActivationServer::from_stream(Box::new(b));
+        assert!(client.is_injected() && server.is_injected());
+
+        client.send(&sample_tensor()).await.unwrap();
+        let (got, _) = server.recv().await.unwrap();
+        assert_eq!(got.data, sample_tensor().data);
+
+        server.send_raw(&[7, 8, 9, 10]).await.unwrap();
+        assert_eq!(client.recv_raw(4).await.unwrap(), vec![7, 8, 9, 10]);
+
+        server.send(&sample_tensor()).await.unwrap();
+        let (reply, _) = client.recv_reply().await.unwrap();
+        assert_eq!(reply.data, sample_tensor().data);
+    }
+
+    #[tokio::test]
+    async fn injected_recv_token_timeout_keeps_stream_aligned() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (a, mut b) = tokio::io::duplex(1 << 20);
+        let mut client = ActivationClient::from_stream(Box::new(a));
+        // Nothing sent: bounded frame-start wait elapses with zero bytes read.
+        let first = client.recv_token(Duration::from_millis(100)).await;
+        assert!(
+            matches!(first, Err(TransportError::FrameStartTimeout(_))),
+            "expected FrameStartTimeout, got {first:?}"
+        );
+        // Stream kept and still frame-aligned: a full frame now arrives intact.
+        send_tensor(&mut b, &sample_tensor()).await.unwrap();
+        let (got, _) = client.recv_token(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(got.data, sample_tensor().data);
+    }
+
+    #[tokio::test]
+    async fn injected_peer_drop_is_connection_fatal_like_tcp() {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let mut server = ActivationServer::from_stream(Box::new(b));
+        drop(a);
+        let err = server.recv().await.unwrap_err();
+        assert!(matches!(err, TransportError::SocketClosed), "got {err:?}");
+        let err = server.send(&sample_tensor()).await.unwrap_err();
+        assert!(recv_error_is_connection_fatal(&err) || matches!(err, TransportError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn injected_unknown_io_error_becomes_stream_failed_on_every_method() {
+        // recv
+        let mut s = ActivationServer::from_stream(Box::new(OtherErrStream));
+        let e = s.recv().await.unwrap_err();
+        assert!(matches!(e, TransportError::StreamFailed(_)), "recv: {e:?}");
+        assert!(
+            matches!(s.recv().await, Err(TransportError::NotConnected)),
+            "recv must drop the stream"
+        );
+        // recv_raw
+        let mut s = ActivationServer::from_stream(Box::new(OtherErrStream));
+        assert!(matches!(
+            s.recv_raw(4).await,
+            Err(TransportError::StreamFailed(_))
+        ));
+        assert!(matches!(
+            s.recv_raw(4).await,
+            Err(TransportError::NotConnected)
+        ));
+        // recv_reply (poisons)
+        let mut s = ActivationServer::from_stream(Box::new(OtherErrStream));
+        assert!(matches!(
+            s.recv_reply().await,
+            Err(TransportError::StreamFailed(_))
+        ));
+        assert!(matches!(
+            s.recv_reply().await,
+            Err(TransportError::NotConnected)
+        ));
+        // recv_reply_prefill (poisons)
+        let mut s = ActivationServer::from_stream(Box::new(OtherErrStream));
+        assert!(matches!(
+            s.recv_reply_prefill().await,
+            Err(TransportError::StreamFailed(_))
+        ));
+        // send / send_raw drop the stream
+        let mut s = ActivationServer::from_stream(Box::new(OtherErrStream));
+        assert!(matches!(
+            s.send(&sample_tensor()).await,
+            Err(TransportError::StreamFailed(_))
+        ));
+        assert!(matches!(
+            s.send(&sample_tensor()).await,
+            Err(TransportError::NotConnected)
+        ));
+        let mut s = ActivationServer::from_stream(Box::new(OtherErrStream));
+        assert!(matches!(
+            s.send_raw(&[1]).await,
+            Err(TransportError::StreamFailed(_))
+        ));
+        assert!(matches!(
+            s.send_raw(&[1]).await,
+            Err(TransportError::NotConnected)
+        ));
+
+        // Same set on the client, plus recv_token.
+        let mut c = ActivationClient::from_stream(Box::new(OtherErrStream));
+        assert!(matches!(
+            c.recv().await,
+            Err(TransportError::StreamFailed(_))
+        ));
+        assert!(matches!(c.recv().await, Err(TransportError::NotConnected)));
+        let mut c = ActivationClient::from_stream(Box::new(OtherErrStream));
+        assert!(matches!(
+            c.recv_raw(4).await,
+            Err(TransportError::StreamFailed(_))
+        ));
+        let mut c = ActivationClient::from_stream(Box::new(OtherErrStream));
+        assert!(matches!(
+            c.recv_token(Duration::from_secs(1)).await,
+            Err(TransportError::StreamFailed(_))
+        ));
+        assert!(matches!(
+            c.recv_token(Duration::from_secs(1)).await,
+            Err(TransportError::NotConnected)
+        ));
+        let mut c = ActivationClient::from_stream(Box::new(OtherErrStream));
+        assert!(matches!(
+            c.recv_reply().await,
+            Err(TransportError::StreamFailed(_))
+        ));
+        let mut c = ActivationClient::from_stream(Box::new(OtherErrStream));
+        assert!(matches!(
+            c.recv_reply_prefill().await,
+            Err(TransportError::StreamFailed(_))
+        ));
+        let mut c = ActivationClient::from_stream(Box::new(OtherErrStream));
+        assert!(matches!(
+            c.send(&sample_tensor()).await,
+            Err(TransportError::StreamFailed(_))
+        ));
+        assert!(matches!(
+            c.send(&sample_tensor()).await,
+            Err(TransportError::NotConnected)
+        ));
+        let mut c = ActivationClient::from_stream(Box::new(OtherErrStream));
+        assert!(matches!(
+            c.send_raw(&[1]).await,
+            Err(TransportError::StreamFailed(_))
+        ));
+    }
+
+    #[test]
+    fn stream_failed_is_fatal_under_both_classifiers() {
+        let e = TransportError::StreamFailed(io::Error::other("peer gone"));
+        assert!(recv_error_is_connection_fatal(&e));
+        // Engines flatten transport errors to strings; the engine-side
+        // classifier matches the "connection aborted" substring.
+        assert!(e
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("connection aborted"));
+    }
+
+    #[tokio::test]
+    async fn tcp_unknown_io_error_is_not_normalized() {
+        // normalize_injected must leave non-injected handles' errors alone.
+        let e = normalize_injected(false, TransportError::Io(io::Error::other("x")));
+        assert!(matches!(e, TransportError::Io(_)));
+        let e = normalize_injected(true, TransportError::Io(io::Error::other("x")));
+        assert!(matches!(e, TransportError::StreamFailed(_)));
+        // Fatal kinds stay Io even when injected.
+        let e = normalize_injected(
+            true,
+            TransportError::Io(io::Error::from(io::ErrorKind::ConnectionReset)),
+        );
+        assert!(matches!(e, TransportError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn attach_replaces_a_dead_stream() {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let mut server = ActivationServer::from_stream(Box::new(b));
+        drop(a);
+        assert!(server.recv().await.is_err());
+        let (a2, b2) = tokio::io::duplex(1 << 20);
+        server.attach(Box::new(b2));
+        let mut peer = ActivationClient::from_stream(Box::new(a2));
+        peer.send(&sample_tensor()).await.unwrap();
+        let (got, _) = server.recv().await.unwrap();
+        assert_eq!(got.data, sample_tensor().data);
+    }
+
+    #[tokio::test]
+    async fn injected_handle_refuses_tcp_lifecycle_calls() {
+        let (a, b) = tokio::io::duplex(64);
+        let mut server = ActivationServer::from_stream(Box::new(b));
+        assert!(matches!(
+            server.start().await,
+            Err(TransportError::NotStarted)
+        ));
+        assert!(matches!(
+            server.accept().await,
+            Err(TransportError::NotStarted)
+        ));
+        let mut client = ActivationClient::from_stream(Box::new(a));
+        assert!(matches!(
+            client.connect_with_timeout(Duration::from_millis(10)).await,
+            Err(TransportError::NotStarted)
+        ));
     }
 }

@@ -536,6 +536,96 @@ impl Builder for SparseMoEBuilder {
         Ok(())
     }
 
+    /// Issue #76: wire this stage up with already-connected byte streams instead
+    /// of dialing/listening. Mirrors `connect`'s three roles — an expert worker
+    /// accepts the driver's one link; an expert-parallel driver takes one link
+    /// per worker and runs as a single stage; a plain pipeline stage takes its
+    /// upstream/downstream per rank/total. `configure_listen` is ignored on this
+    /// path — the streams arrive connected. Streams must satisfy the contract on
+    /// `cascadia_transport::InjectedStream`.
+    async fn connect_streams(&mut self, links: cascadia_engine::StreamLinks) -> EngineResult<()> {
+        // ---- Expert worker: one injected link from the driver, no pipeline. ----
+        if let Some((index, count)) = self.config.ep_worker {
+            // Same guard `connect` enforces (:429-433): a worker is never also a
+            // pipeline stage or a driver.
+            if self.config.total > 1 || !self.config.ep_workers.is_empty() {
+                return Err(EngineError::InvalidConfig(
+                    "an expert worker cannot also be a pipeline stage or a driver".into(),
+                ));
+            }
+            cascadia_engine::check_connect_streams(
+                cascadia_engine::LinkShape {
+                    ep_driver: true,
+                    ..Default::default()
+                },
+                &links,
+            )?;
+            let driver = links
+                .ep_driver
+                .expect("check_connect_streams guarantees an ep_driver link");
+            info!(index, count, "expert worker: driver stream injected");
+            self.ep_server = Some(Arc::new(TokioMutex::new(ActivationServer::from_stream(
+                driver,
+            ))));
+            return Ok(());
+        }
+        // ---- Expert-parallel driver: one injected link per worker, in order. ----
+        if !self.config.ep_workers.is_empty() {
+            // Same guard `connect` enforces (:455-459): the driver runs as a
+            // single stage (`--total 1`); for total == 1 there are no pipeline
+            // links, so the stage shape carries only `ep_workers`.
+            if self.config.total > 1 {
+                return Err(EngineError::InvalidConfig(
+                    "--ep-workers runs the driver as a single stage (--total 1)".into(),
+                ));
+            }
+            cascadia_engine::check_connect_streams(
+                cascadia_engine::LinkShape {
+                    ep_workers: self.config.ep_workers.len(),
+                    ..Default::default()
+                },
+                &links,
+            )?;
+            for (i, stream) in links.ep_workers.into_iter().enumerate() {
+                let stream =
+                    stream.expect("check_connect_streams guarantees every ep_workers entry Some");
+                info!(worker = i, "expert worker stream injected");
+                self.ep_clients
+                    .push(Arc::new(TokioMutex::new(ActivationClient::from_stream(
+                        stream,
+                    ))));
+            }
+            return Ok(());
+        }
+        // ---- Plain pipeline stage. ----
+        // Role from rank/total exactly as the CLI derives its PeerLayout
+        // (cascadia-cli/src/lib.rs): a single stage has no peers; otherwise
+        // upstream iff not rank 0, downstream iff not the last rank.
+        let total = self.config.total;
+        let (stage_upstream, stage_downstream) = if total <= 1 {
+            (false, false)
+        } else {
+            let rank = self.config.rank.min(total - 1);
+            (rank != 0, rank != total - 1)
+        };
+        cascadia_engine::check_connect_streams(
+            cascadia_engine::LinkShape::pipeline(stage_upstream, stage_downstream),
+            &links,
+        )?;
+        // Pre-connected: no bind, no dial, no accept. Store each handle where
+        // `connect` stores its TCP one, so `build()` sees an identical state.
+        if let Some(up) = links.upstream {
+            self.transport.upstream =
+                Some(Arc::new(TokioMutex::new(ActivationServer::from_stream(up))));
+        }
+        if let Some(down) = links.downstream {
+            self.transport.downstream = Some(Arc::new(TokioMutex::new(
+                ActivationClient::from_stream(down),
+            )));
+        }
+        Ok(())
+    }
+
     async fn load(&mut self, shard: ShardSpec) -> EngineResult<LoadStream> {
         crate::init_thread_pool();
         let mut plugin = PluginConfig::new();
@@ -6731,5 +6821,229 @@ mod tests {
             prefill_reply_budget(recv_timeout, Some(ceiling)),
             std::time::Duration::from_secs(600)
         );
+    }
+
+    // ---- injected streams: connect_streams (#76) ----
+    //
+    // connect_streams never touches the filesystem (unlike load/connect's TCP
+    // dance), so a dummy model dir is fine and no manifest is written — and the
+    // EP paths need neither load() nor build() (both require real weights/IR), so
+    // these drive connect_streams alone and read the builder's private fields.
+
+    fn injected_builder(rank: u32, total: u32) -> SparseMoEBuilder {
+        SparseMoEBuilder::new(
+            SparseMoEBuilderConfig::new("/nonexistent", "CPU").with_rank(rank, total),
+        )
+    }
+
+    fn duplex_byte_stream() -> cascadia_engine::ByteStream {
+        Box::new(tokio::io::duplex(64).0)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_wires_a_middle_stage_both_sides() {
+        let mut b = injected_builder(1, 3); // middle: upstream + downstream
+        b.connect_streams(cascadia_engine::StreamLinks::pipeline(
+            Some(duplex_byte_stream()),
+            Some(duplex_byte_stream()),
+        ))
+        .await
+        .expect("a middle stage accepts both streams");
+        assert!(b.transport.upstream.is_some());
+        assert!(b.transport.downstream.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_wires_head_downstream_only() {
+        let mut b = injected_builder(0, 2); // head (rank 0): downstream only
+        b.connect_streams(cascadia_engine::StreamLinks::pipeline(
+            None,
+            Some(duplex_byte_stream()),
+        ))
+        .await
+        .expect("a head accepts a downstream stream");
+        assert!(b.transport.upstream.is_none());
+        assert!(b.transport.downstream.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_wires_tail_upstream_only() {
+        let mut b = injected_builder(1, 2); // tail (rank total-1): upstream only
+        b.connect_streams(cascadia_engine::StreamLinks::pipeline(
+            Some(duplex_byte_stream()),
+            None,
+        ))
+        .await
+        .expect("a tail accepts an upstream stream");
+        assert!(b.transport.upstream.is_some());
+        assert!(b.transport.downstream.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_standalone_takes_no_streams() {
+        let mut b = injected_builder(0, 1); // single stage
+        b.connect_streams(cascadia_engine::StreamLinks::default())
+            .await
+            .expect("a standalone stage wires nothing");
+        assert!(b.transport.upstream.is_none());
+        assert!(b.transport.downstream.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_rejects_pipeline_shape_mismatch() {
+        // Head given an upstream it does not have.
+        let mut b = injected_builder(0, 2);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks::pipeline(
+                Some(duplex_byte_stream()),
+                Some(duplex_byte_stream()),
+            ))
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+        // Middle missing its downstream.
+        let mut b = injected_builder(1, 3);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks::pipeline(
+                Some(duplex_byte_stream()),
+                None,
+            ))
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+        // Standalone handed a stream.
+        let mut b = injected_builder(0, 1);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks::pipeline(
+                None,
+                Some(duplex_byte_stream()),
+            ))
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_wires_an_expert_worker_driver_link() {
+        // An EP worker (ep_worker set, total == 1) accepts exactly one driver
+        // link via `ep_driver` and stores an injected ActivationServer.
+        let mut cfg = SparseMoEBuilderConfig::new("/nonexistent", "CPU");
+        cfg.ep_worker = Some((0, 1));
+        let mut b = SparseMoEBuilder::new(cfg);
+        b.connect_streams(cascadia_engine::StreamLinks {
+            ep_driver: Some(duplex_byte_stream()),
+            ..Default::default()
+        })
+        .await
+        .expect("an expert worker accepts a driver link");
+        assert!(
+            b.ep_server.is_some(),
+            "the driver link is stored as ep_server"
+        );
+        assert!(b.transport.upstream.is_none() && b.transport.downstream.is_none());
+        assert!(b.ep_clients.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_wires_expert_driver_worker_links_in_order() {
+        // An EP driver (ep_workers non-empty, total == 1) takes one link per
+        // worker, in order, as injected ActivationClients.
+        let mut cfg = SparseMoEBuilderConfig::new("/nonexistent", "CPU");
+        cfg.ep_workers = vec![("a".into(), 1), ("b".into(), 2)];
+        let mut b = SparseMoEBuilder::new(cfg);
+        b.connect_streams(cascadia_engine::StreamLinks {
+            ep_workers: vec![Some(duplex_byte_stream()), Some(duplex_byte_stream())],
+            ..Default::default()
+        })
+        .await
+        .expect("an expert driver accepts one link per worker");
+        assert_eq!(
+            b.ep_clients.len(),
+            2,
+            "one injected client per worker, in order"
+        );
+        assert!(b.ep_server.is_none());
+        assert!(b.transport.upstream.is_none() && b.transport.downstream.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_rejects_ep_shape_mismatches() {
+        // Driver with 2 workers handed the wrong count.
+        let mut cfg = SparseMoEBuilderConfig::new("/nonexistent", "CPU");
+        cfg.ep_workers = vec![("a".into(), 1), ("b".into(), 2)];
+        let mut b = SparseMoEBuilder::new(cfg);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks {
+                ep_workers: vec![Some(duplex_byte_stream())],
+                ..Default::default()
+            })
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+        assert!(b.ep_clients.is_empty(), "a rejected connect wires nothing");
+
+        // Driver with a None entry in ep_workers (every entry must be Some).
+        let mut cfg = SparseMoEBuilderConfig::new("/nonexistent", "CPU");
+        cfg.ep_workers = vec![("a".into(), 1), ("b".into(), 2)];
+        let mut b = SparseMoEBuilder::new(cfg);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks {
+                ep_workers: vec![Some(duplex_byte_stream()), None],
+                ..Default::default()
+            })
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+
+        // An EP link on a plain pipeline stage.
+        let mut b = injected_builder(0, 2); // head: downstream only
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks {
+                downstream: Some(duplex_byte_stream()),
+                ep_driver: Some(duplex_byte_stream()),
+                ..Default::default()
+            })
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+
+        // A pipeline link on an EP worker.
+        let mut cfg = SparseMoEBuilderConfig::new("/nonexistent", "CPU");
+        cfg.ep_worker = Some((0, 1));
+        let mut b = SparseMoEBuilder::new(cfg);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks {
+                upstream: Some(duplex_byte_stream()),
+                ep_driver: Some(duplex_byte_stream()),
+                ..Default::default()
+            })
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+        assert!(b.ep_server.is_none(), "a rejected connect wires nothing");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_keeps_ep_invalidconfig_guards() {
+        // An expert worker cannot also be a pipeline stage (total > 1): the
+        // guard fires before any shape check, so the links are irrelevant.
+        let mut cfg = SparseMoEBuilderConfig::new("/nonexistent", "CPU").with_rank(0, 2);
+        cfg.ep_worker = Some((0, 1));
+        let mut b = SparseMoEBuilder::new(cfg);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks::default())
+                .await,
+            Err(EngineError::InvalidConfig(_))
+        ));
+
+        // An expert-parallel driver runs as a single stage (total == 1).
+        let mut cfg = SparseMoEBuilderConfig::new("/nonexistent", "CPU").with_rank(0, 2);
+        cfg.ep_workers = vec![("127.0.0.1".into(), 9000)];
+        let mut b = SparseMoEBuilder::new(cfg);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks::default())
+                .await,
+            Err(EngineError::InvalidConfig(_))
+        ));
     }
 }
