@@ -1002,6 +1002,59 @@ fn int4_expert_forward(bytes: &[u8], apn: &[f32], hidden: usize, inter: usize) -
     out_bf16.iter().map(|b| b.to_f32()).collect()
 }
 
+/// A weightless runner for engine-level tests that never run a forward pass
+/// (re-attach, step latching). Nothing here touches model weights.
+#[cfg(test)]
+impl OvMoeRunner {
+    /// A middle-stage runner with no compiled graphs whose `kv_layers`
+    /// per-layer caches each already hold `past_seq_len` positions, so a test
+    /// can observe `reset` through `kv_past_seq_len`.
+    pub(crate) fn weightless_for_test(kv_layers: usize, past_seq_len: usize) -> Self {
+        let manifest: Manifest = serde_json::from_str(
+            r#"{"arch":"test","num_layers":2,"dense_layers":[],"num_experts":1,
+                "top_k":1,"hidden_size":8,"num_kv_heads":1,"qk_head_dim":2,
+                "v_head_dim":2,"vocab_size":4,"eos_token_ids":[],
+                "experts_format":"int4_bin","shell_backend":"ov_ir"}"#,
+        )
+        .expect("test manifest");
+        let kv = (0..kv_layers)
+            .map(|_| LayerKv {
+                k: Vec::new(),
+                v: Vec::new(),
+                seq: past_seq_len,
+            })
+            .collect();
+        Self {
+            manifest,
+            model_dir: PathBuf::new(),
+            device: "CPU".into(),
+            plugin: PluginConfig::default(),
+            embed: None,
+            head: None,
+            shells: Vec::new(),
+            routers: None,
+            core_ports: CorePorts {
+                apn: 0,
+                residual: 0,
+                shared: 0,
+                present_k: 0,
+                present_v: 0,
+            },
+            router_ports: RouterPorts { ids: 0, weights: 0 },
+            layer_ids: (0..kv_layers as u32).collect(),
+            experts: ExpertCache::Int4Bin(LruCache::unbounded()),
+            kv,
+            is_first: false,
+            is_last: false,
+            hidden: 8,
+            kv_heads: 1,
+            head_dim: 2,
+            top_k: 1,
+            expert_intermediate: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

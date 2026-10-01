@@ -272,6 +272,17 @@ pub static TRANSPORT_RECV_BYTES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|
     .expect("register cascadia_transport_recv_bytes_total")
 });
 
+/// Issue #76: links replaced by a live re-attach, per side
+/// (upstream | downstream | ep_driver | ep_worker).
+pub static LINK_REATTACH_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "cascadia_link_reattach_total",
+        "Activation links replaced on a live engine by re-attach.",
+        &["side"]
+    )
+    .expect("register cascadia_link_reattach_total")
+});
+
 /// Full tensor-frame send duration (serialize + kernel send + flush). When
 /// `CASCADIA_SEND_BURST_BYTES` is set the timed window also contains the
 /// deliberate inter-burst sleeps, which are pacing, not link latency.
@@ -328,6 +339,7 @@ pub fn init() {
     LazyLock::force(&ENGINE_WARMUP_DURATION_SECONDS);
     LazyLock::force(&TRANSPORT_SENT_BYTES_TOTAL);
     LazyLock::force(&TRANSPORT_RECV_BYTES_TOTAL);
+    LazyLock::force(&LINK_REATTACH_TOTAL);
 }
 
 /// Gather the default registry into Prometheus text exposition format.
