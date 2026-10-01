@@ -2034,6 +2034,24 @@ impl Builder for OvDistSpecBuilder {
         Ok(())
     }
 
+    /// Issue #76: wire the driver (rank 0) with an already-connected downstream byte stream
+    /// instead of dialing TCP. Role is identical to `connect`: no upstream, exactly one
+    /// downstream. Pipeline-only, so the stage `LinkShape` has `ep_driver=false`, `ep_workers=0`
+    /// and any EP link is rejected by the exact-match `check_connect_streams`. Stored in
+    /// `self.downstream`, exactly where `connect` puts its dialed client.
+    async fn connect_streams(&mut self, links: cascadia_engine::StreamLinks) -> EngineResult<()> {
+        // Driver has no upstream and requires a downstream (see `connect`, :2020-2027).
+        cascadia_engine::check_connect_streams(
+            cascadia_engine::LinkShape::pipeline(false, true),
+            &links,
+        )?;
+        let cascadia_engine::StreamLinks { downstream, .. } = links;
+        let downstream = downstream.expect("check_connect_streams guarantees Some downstream");
+        let client = ActivationClient::from_stream(downstream);
+        self.downstream = Some(Arc::new(tokio::sync::Mutex::new(client)));
+        Ok(())
+    }
+
     async fn load(&mut self, _shard: ShardSpec) -> EngineResult<LoadStream> {
         let mut events = Vec::new();
         let pipeline_cfg = read_pipeline_config(&self.pipeline_dir)?;
@@ -2773,6 +2791,36 @@ impl Builder for OvDistSpecWorkerBuilder {
         Ok(())
     }
 
+    /// Issue #76: wire a worker (ranks 1..N-1) with already-connected byte streams. A worker
+    /// always has an upstream; it has a downstream unless it is the last stage — the same rule
+    /// `build` uses for `is_last` (`:2835`). Pipeline-only, so the stage `LinkShape` has
+    /// `ep_driver=false`, `ep_workers=0` and any EP link is rejected by the exact-match
+    /// `check_connect_streams`. `configure_listen` is ignored on this path (no listener is opened).
+    /// Stored in `self.upstream`/`self.downstream`, exactly where `connect` puts its accepted
+    /// server and dialed client.
+    async fn connect_streams(&mut self, links: cascadia_engine::StreamLinks) -> EngineResult<()> {
+        let stage_downstream = self.rank + 1 < self.total;
+        cascadia_engine::check_connect_streams(
+            cascadia_engine::LinkShape::pipeline(true, stage_downstream),
+            &links,
+        )?;
+        let cascadia_engine::StreamLinks {
+            upstream,
+            downstream,
+            ..
+        } = links;
+        let upstream = upstream.expect("check_connect_streams guarantees Some upstream");
+        self.upstream = Some(Arc::new(tokio::sync::Mutex::new(
+            ActivationServer::from_stream(upstream),
+        )));
+        if let Some(downstream) = downstream {
+            self.downstream = Some(Arc::new(tokio::sync::Mutex::new(
+                ActivationClient::from_stream(downstream),
+            )));
+        }
+        Ok(())
+    }
+
     async fn load(&mut self, _shard: ShardSpec) -> EngineResult<LoadStream> {
         let mut events = Vec::new();
         let stage_dir = {
@@ -3471,5 +3519,150 @@ mod tests {
         let (kind, rx) = h.await.unwrap();
         assert_eq!(kind, FrameKind::LogitsResponse);
         assert_eq!(rx, logits);
+    }
+
+    // ---- injected streams: builder connect_streams (#76) ----
+
+    /// Head/driver (rank 0): no upstream, exactly one downstream. `connect_streams` must wire the
+    /// injected downstream into `self.downstream` and reject any other shape.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn head_builder_connect_streams_wires_injected_downstream() {
+        let mut builder = OvDistSpecBuilder::new("/nonexistent", "", "CPU", 4);
+        let (near, far) = tokio::io::duplex(1 << 16);
+        builder
+            .connect_streams(cascadia_engine::StreamLinks::pipeline(
+                None,
+                Some(Box::new(near)),
+            ))
+            .await
+            .expect("head accepts a downstream-only shape");
+
+        let client = builder.downstream.as_ref().expect("downstream wired");
+        assert!(client.lock().await.is_injected());
+
+        // The wired client actually carries a frame to the far end.
+        let mut server = ActivationServer::from_stream(Box::new(far));
+        client
+            .lock()
+            .await
+            .send_raw(&(FrameKind::Reset as u32).to_be_bytes())
+            .await
+            .unwrap();
+        let kb = server.recv_raw(4).await.unwrap();
+        assert_eq!(
+            u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]),
+            FrameKind::Reset as u32
+        );
+
+        // Wrong shape: supplying an upstream, or omitting the downstream, is rejected.
+        let mut b_up = OvDistSpecBuilder::new("/nonexistent", "", "CPU", 4);
+        let (u, _u_far) = tokio::io::duplex(64);
+        assert!(matches!(
+            b_up.connect_streams(cascadia_engine::StreamLinks::pipeline(
+                Some(Box::new(u)),
+                None
+            ))
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+        let mut b_none = OvDistSpecBuilder::new("/nonexistent", "", "CPU", 4);
+        assert!(matches!(
+            b_none
+                .connect_streams(cascadia_engine::StreamLinks::default())
+                .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+    }
+
+    /// Worker: always has an upstream; has a downstream unless it is the last stage. Shape is
+    /// derived from rank/total exactly as `build` derives `is_last`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn worker_builder_connect_streams_wires_upstream_and_downstream() {
+        // Middle worker (rank 1 of 3): upstream + downstream.
+        let mut mid = OvDistSpecWorkerBuilder::new("/nonexistent", 1, 3, "CPU");
+        let (u_near, _u_far) = tokio::io::duplex(1 << 16);
+        let (d_near, _d_far) = tokio::io::duplex(1 << 16);
+        mid.connect_streams(cascadia_engine::StreamLinks::pipeline(
+            Some(Box::new(u_near)),
+            Some(Box::new(d_near)),
+        ))
+        .await
+        .expect("middle worker accepts both sides");
+        assert!(mid.upstream.as_ref().unwrap().lock().await.is_injected());
+        assert!(mid.downstream.as_ref().unwrap().lock().await.is_injected());
+
+        // Last worker (rank 2 of 3): upstream only; a downstream stream is a shape error.
+        let mut last = OvDistSpecWorkerBuilder::new("/nonexistent", 2, 3, "CPU");
+        let (u2, _u2_far) = tokio::io::duplex(64);
+        last.connect_streams(cascadia_engine::StreamLinks::pipeline(
+            Some(Box::new(u2)),
+            None,
+        ))
+        .await
+        .expect("last worker accepts an upstream-only shape");
+        assert!(last.upstream.as_ref().unwrap().lock().await.is_injected());
+        assert!(last.downstream.is_none());
+
+        let mut bad_down = OvDistSpecWorkerBuilder::new("/nonexistent", 2, 3, "CPU");
+        let (u3, _u3_far) = tokio::io::duplex(64);
+        let (d3, _d3_far) = tokio::io::duplex(64);
+        assert!(matches!(
+            bad_down
+                .connect_streams(cascadia_engine::StreamLinks::pipeline(
+                    Some(Box::new(u3)),
+                    Some(Box::new(d3)),
+                ))
+                .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+
+        // The upstream is mandatory on every worker.
+        let mut no_up = OvDistSpecWorkerBuilder::new("/nonexistent", 1, 3, "CPU");
+        let (d4, _d4_far) = tokio::io::duplex(64);
+        assert!(matches!(
+            no_up
+                .connect_streams(cascadia_engine::StreamLinks::pipeline(
+                    None,
+                    Some(Box::new(d4))
+                ))
+                .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+    }
+
+    /// dist_spec is pipeline-only: an EP link alongside the correct pipeline shape is still a role
+    /// error (exact-match `check_connect_streams` against a pipeline `LinkShape`), for both roles.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_rejects_ep_links() {
+        // Head: a valid downstream + an EP driver.
+        let mut head = OvDistSpecBuilder::new("/nonexistent", "", "CPU", 4);
+        let (d, _d_far) = tokio::io::duplex(64);
+        let (ep, _ep_far) = tokio::io::duplex(64);
+        assert!(matches!(
+            head.connect_streams(cascadia_engine::StreamLinks {
+                downstream: Some(Box::new(d)),
+                ep_driver: Some(Box::new(ep)),
+                ..Default::default()
+            })
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+        assert!(head.downstream.is_none(), "a rejected shape stores nothing");
+
+        // Worker: a valid upstream + an EP worker link.
+        let mut worker = OvDistSpecWorkerBuilder::new("/nonexistent", 1, 3, "CPU");
+        let (u, _u_far) = tokio::io::duplex(64);
+        let (ep2, _ep2_far) = tokio::io::duplex(64);
+        assert!(matches!(
+            worker
+                .connect_streams(cascadia_engine::StreamLinks {
+                    upstream: Some(Box::new(u)),
+                    ep_workers: vec![Some(Box::new(ep2))],
+                    ..Default::default()
+                })
+                .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+        assert!(worker.upstream.is_none());
     }
 }

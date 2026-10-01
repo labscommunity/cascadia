@@ -2074,6 +2074,37 @@ impl Builder for Gemma4Builder {
         Ok(())
     }
 
+    /// Issue #76: wire up with already-connected streams instead of
+    /// dialing/listening. Role is read from `rank`/`total` exactly as `connect`
+    /// reads presence from `peers`: upstream iff not rank 0, downstream iff not
+    /// the last rank. Pipeline-only, so the stage `LinkShape` has
+    /// `ep_driver=false`, `ep_workers=0` and any EP link is rejected by the
+    /// exact-match `check_connect_streams`. gemma4 does no connect-time handshake
+    /// (relays re-sync at wire position 0), so wrapping and storing the handles is
+    /// all that is needed. `configure_listen` is ignored on this path.
+    async fn connect_streams(&mut self, links: cascadia_engine::StreamLinks) -> EngineResult<()> {
+        cascadia_engine::check_connect_streams(
+            cascadia_engine::LinkShape::pipeline(self.rank > 0, self.rank + 1 < self.total),
+            &links,
+        )?;
+        let cascadia_engine::StreamLinks {
+            upstream,
+            downstream,
+            ..
+        } = links;
+        if let Some(up) = upstream {
+            self.upstream = Some(Arc::new(tokio::sync::Mutex::new(
+                ActivationServer::from_stream(up),
+            )));
+        }
+        if let Some(down) = downstream {
+            self.downstream = Some(Arc::new(tokio::sync::Mutex::new(
+                ActivationClient::from_stream(down),
+            )));
+        }
+        Ok(())
+    }
+
     async fn load(&mut self, _shard: ShardSpec) -> EngineResult<LoadStream> {
         let mut events = Vec::new();
         events.push(LoadProgress::message(format!(
@@ -2601,5 +2632,71 @@ mod tests {
         let c = final_chunk("t1".to_string(), 106, String::new(), 93, true);
         assert_eq!(c.n_tokens, Some(1));
         assert_eq!(c.token_count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_wires_injected_handles_for_a_middle_stage() {
+        // rank 1 of 3 ⇒ middle stage: both sides required.
+        let mut b = Gemma4Builder::new("/x", 1, 3, "CPU");
+        let (_up_far, up_near) = tokio::io::duplex(1 << 16);
+        let (_down_far, down_near) = tokio::io::duplex(1 << 16);
+        b.connect_streams(cascadia_engine::StreamLinks::pipeline(
+            Some(Box::new(up_near)),
+            Some(Box::new(down_near)),
+        ))
+        .await
+        .unwrap();
+        assert!(b.upstream.is_some() && b.downstream.is_some());
+        assert!(
+            b.upstream.as_ref().unwrap().lock().await.is_injected(),
+            "upstream server was built via from_stream"
+        );
+        assert!(
+            b.downstream.as_ref().unwrap().lock().await.is_injected(),
+            "downstream client was built via from_stream"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_rejects_shape_mismatch() {
+        // first stage (rank 0 of 2): downstream only. An upstream stream, or a
+        // missing downstream, is a role error (engine untouched).
+        let mut b = Gemma4Builder::new("/x", 0, 2, "CPU");
+        let (_f, n) = tokio::io::duplex(64);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks::pipeline(
+                Some(Box::new(n)),
+                None
+            ))
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+        let mut b2 = Gemma4Builder::new("/x", 0, 2, "CPU");
+        assert!(matches!(
+            b2.connect_streams(cascadia_engine::StreamLinks::default())
+                .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_streams_rejects_ep_links() {
+        // Pipeline-only engine: an EP link alongside the correct pipeline shape is
+        // a role error (exact-match against a pipeline LinkShape).
+        let mut b = Gemma4Builder::new("/x", 1, 3, "CPU"); // middle: both sides
+        let (_fu, up) = tokio::io::duplex(64);
+        let (_fd, down) = tokio::io::duplex(64);
+        let (_fe, ep) = tokio::io::duplex(64);
+        assert!(matches!(
+            b.connect_streams(cascadia_engine::StreamLinks {
+                upstream: Some(Box::new(up)),
+                downstream: Some(Box::new(down)),
+                ep_driver: Some(Box::new(ep)),
+                ..Default::default()
+            })
+            .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+        assert!(b.upstream.is_none() && b.downstream.is_none());
     }
 }
