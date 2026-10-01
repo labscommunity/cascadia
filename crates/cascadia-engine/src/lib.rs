@@ -10,6 +10,19 @@
 //! request through to completion in a single call (matching the Python
 //! semantics today). The async surface lives in [`Builder`] for I/O during
 //! load and connect.
+//!
+//! # Cargo features
+//!
+//! * `kv_coord` — the KV coordination surface (issue 34). Off by default.
+//! * `injected_streams` — issue #76: `Builder::connect_streams`,
+//!   `Engine::reattach_streams`, `StreamLinks`, `LinkShape` and the
+//!   validators `check_connect_streams` / `check_reattach_streams`. Off by
+//!   default so a default consumer's tree stays free of tokio/socket2/
+//!   prometheus (it pulls in `cascadia-transport`). Enable it on every crate
+//!   that implements or calls these items: engine crates that accept injected
+//!   streams, and the embedder (`cascadia-runner` already enables it). The
+//!   stream type `ByteStream` is re-exported here; its contract lives on
+//!   `cascadia_transport::InjectedStream`.
 
 use std::pin::Pin;
 
@@ -27,12 +40,17 @@ pub use kv_handoff::{KvHandoffMailbox, KvHandoffSlot};
 pub use cascadia_transport::ByteStream;
 
 /// Issue #76: the activation links handed to [`Builder::connect_streams`] and
-/// `Engine::reattach_streams`. Pipeline stages use `upstream`/`downstream`;
+/// [`Engine::reattach_streams`]. Pipeline stages use `upstream`/`downstream`;
 /// an inkling expert-parallel (EP) worker uses `ep_driver`; an EP driver uses
 /// `ep_workers`, one entry per expert worker in `--ep-workers` order. On
 /// re-attach a `None` keeps that link, and an empty `ep_workers` keeps all.
+///
+/// `#[non_exhaustive]`: build one with [`StreamLinks::pipeline`],
+/// [`StreamLinks::ep_driver`], [`StreamLinks::ep_workers`] or `default()`;
+/// the fields stay public for reading, taking and assigning.
 #[cfg(feature = "injected_streams")]
 #[derive(Default)]
+#[non_exhaustive]
 pub struct StreamLinks {
     pub upstream: Option<ByteStream>,
     pub downstream: Option<ByteStream>,
@@ -51,6 +69,28 @@ impl StreamLinks {
         }
     }
 
+    /// An EP worker's single link to its driver.
+    pub fn ep_driver(stream: ByteStream) -> Self {
+        Self {
+            ep_driver: Some(stream),
+            ..Self::default()
+        }
+    }
+
+    /// An EP driver's links to its expert workers, one entry per worker in
+    /// `--ep-workers` order.
+    ///
+    /// For `connect_streams` every entry must be `Some` and the length must
+    /// equal the worker count. For `reattach_streams` an empty vector keeps
+    /// every worker's link, and a `None` entry keeps that worker's link (the
+    /// length must then equal the worker count).
+    pub fn ep_workers(streams: Vec<Option<ByteStream>>) -> Self {
+        Self {
+            ep_workers: streams,
+            ..Self::default()
+        }
+    }
+
     /// Which links this value carries; `ep_workers` counts the `Some` entries.
     pub fn shape(&self) -> LinkShape {
         LinkShape {
@@ -65,8 +105,15 @@ impl StreamLinks {
 /// Issue #76: which links a stage has (for validation) or a [`StreamLinks`]
 /// carries. Pipeline stages and EP roles never mix (the EP driver runs as a
 /// single stage).
+///
+/// Public for out-of-tree `Engine`/`Builder` implementers, who describe their
+/// stage with it and call [`check_connect_streams`] /
+/// [`check_reattach_streams`]. `#[non_exhaustive]`: build one with
+/// [`LinkShape::pipeline`], [`LinkShape::ep_driver`],
+/// [`LinkShape::ep_workers`] or `default()`.
 #[cfg(feature = "injected_streams")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LinkShape {
     pub upstream: bool,
     pub downstream: bool,
@@ -76,6 +123,8 @@ pub struct LinkShape {
 
 #[cfg(feature = "injected_streams")]
 impl LinkShape {
+    /// A pipeline stage: head `(false, true)`, relay `(true, true)`, tail
+    /// `(true, false)`, standalone `(false, false)`.
     pub fn pipeline(upstream: bool, downstream: bool) -> Self {
         Self {
             upstream,
@@ -83,10 +132,28 @@ impl LinkShape {
             ..Self::default()
         }
     }
+
+    /// An EP worker: only the link to its driver.
+    pub fn ep_driver() -> Self {
+        Self {
+            ep_driver: true,
+            ..Self::default()
+        }
+    }
+
+    /// An EP driver with `n` expert workers.
+    pub fn ep_workers(n: usize) -> Self {
+        Self {
+            ep_workers: n,
+            ..Self::default()
+        }
+    }
 }
 
 /// Issue #76: validate a `connect_streams` call. Every link the stage has must
 /// be supplied (every `ep_workers` entry `Some`, count equal) and nothing else.
+///
+/// Public for out-of-tree `Engine`/`Builder` implementers.
 #[cfg(feature = "injected_streams")]
 pub fn check_connect_streams(stage: LinkShape, links: &StreamLinks) -> EngineResult<()> {
     let got = links.shape();
@@ -99,6 +166,70 @@ pub fn check_connect_streams(stage: LinkShape, links: &StreamLinks) -> EngineRes
     Ok(())
 }
 
+/// Issue #76: the [`EngineError::PeerRejected`] for a re-attach that keeps a
+/// link which can no longer carry frames: closed by this stage, dropped by the
+/// transport after a dead-link error, or closed by its peer (the transport's
+/// `is_connected()` is false). Keeping it would park the stage again on its
+/// first frame, so every in-tree engine checks each kept link before
+/// swapping anything and refuses with this error, naming the side.
+#[cfg(feature = "injected_streams")]
+pub fn kept_link_dead(side: &str) -> EngineError {
+    EngineError::PeerRejected(format!(
+        "reattach: the kept {side} link is dead (closed by this stage, dropped after a link \
+         error, or closed by its peer); replace it too"
+    ))
+}
+
+/// Issue #76: validate a `reattach_streams` call. At least one link must be
+/// replaced, only links the stage has, and `ep_workers` must be empty (keep
+/// all) or exactly as long as the stage's worker count (`None` = keep that
+/// worker's link).
+///
+/// **Relay rule:** a stage that has an upstream link must replace it on every
+/// re-attach. An idle relay's `step()` holds the engine lock while blocked on
+/// its upstream frame-start read, and only closing THAT stream frees it; a
+/// re-attach that keeps the upstream would wait behind that read. So any
+/// re-attach cascades to the head, which also refreshes head-side session
+/// state (prefix index, handshake, RESET). Heads (no upstream), EP workers
+/// and EP drivers are unaffected.
+///
+/// Every failure is [`EngineError::PeerRejected`] (nothing swapped). Public
+/// for out-of-tree `Engine`/`Builder` implementers; an engine may layer
+/// stricter rules on top.
+#[cfg(feature = "injected_streams")]
+pub fn check_reattach_streams(stage: LinkShape, links: &StreamLinks) -> EngineResult<()> {
+    let got = links.shape();
+    if got == LinkShape::default() {
+        return Err(EngineError::PeerRejected(
+            "reattach_streams needs at least one replacement stream".into(),
+        ));
+    }
+    let lacks = (got.upstream && !stage.upstream)
+        || (got.downstream && !stage.downstream)
+        || (got.ep_driver && !stage.ep_driver);
+    if lacks {
+        return Err(EngineError::PeerRejected(format!(
+            "reattach_streams links {got:?} include a link this stage {stage:?} does not have"
+        )));
+    }
+    if !links.ep_workers.is_empty() && links.ep_workers.len() != stage.ep_workers {
+        return Err(EngineError::PeerRejected(format!(
+            "reattach_streams got {} ep_workers entries; this stage has {} expert workers",
+            links.ep_workers.len(),
+            stage.ep_workers
+        )));
+    }
+    if stage.upstream && !got.upstream {
+        return Err(EngineError::PeerRejected(
+            "reattach_streams must replace this stage's upstream link: an idle relay blocks \
+             on its upstream read while holding the engine lock, and only closing that stream \
+             frees it (re-attach the upstream link too, cascading to the head)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error("invalid configuration: {0}")]
@@ -107,7 +238,15 @@ pub enum EngineError {
     #[error("not yet loaded; call load() before build()")]
     NotLoaded,
 
-    #[error("not yet connected; call connect() before build()")]
+    /// No usable peer link: the builder was never connected (call `connect()`
+    /// or `connect_streams()` before `build()`), the link died, or (issue
+    /// #76) the runner is fenced or dropped the request on a re-attach.
+    ///
+    /// Connection-fatal structurally (see [`EngineError::is_connection_fatal`]).
+    /// The Display text deliberately avoids the classifier's "not connected"
+    /// substring, so flattening this into a `Backend` string never changes how
+    /// that string classifies.
+    #[error("peer link unavailable: not yet connected, dead, or replaced")]
     NotConnected,
 
     #[error("peer layout rejected: {0}")]
@@ -456,6 +595,26 @@ pub trait Engine: Send {
         None
     }
 
+    /// Issue #76: replace one or more links after a link failure and return
+    /// the engine to a clean between-requests state. A `None` link (or `None`
+    /// / absent `ep_workers` entry) keeps that link's current stream. Called
+    /// with the runner's engine lock held, so no `step()` is in flight.
+    ///
+    /// Contract: return [`EngineError::PeerRejected`] ONLY for validation
+    /// failures detected before any stream is swapped (engine untouched). Any
+    /// failure after a swap must be a different variant; the runner fences
+    /// the engine on those. Validate with [`check_reattach_streams`], which
+    /// enforces the relay rule: a stage with an upstream link must replace it
+    /// on every re-attach (an idle relay's `step()` is blocked on that link's
+    /// read, so only closing it lets this call take the engine lock), and any
+    /// re-attach therefore cascades to the head.
+    #[cfg(feature = "injected_streams")]
+    fn reattach_streams(&mut self, _links: StreamLinks) -> EngineResult<()> {
+        Err(EngineError::PeerRejected(
+            "this engine does not support re-attach".into(),
+        ))
+    }
+
     /// Tear down the engine. Idempotent.
     fn close(&mut self) {}
 }
@@ -506,12 +665,8 @@ mod tests {
     #[cfg(feature = "injected_streams")]
     #[test]
     fn stream_links_shape_reports_present_links() {
-        let links = StreamLinks {
-            upstream: Some(duplex_end()),
-            downstream: None,
-            ep_driver: None,
-            ep_workers: vec![Some(duplex_end()), None, Some(duplex_end())],
-        };
+        let mut links = StreamLinks::ep_workers(vec![Some(duplex_end()), None, Some(duplex_end())]);
+        links.upstream = Some(duplex_end());
         assert_eq!(
             links.shape(),
             LinkShape {
@@ -526,6 +681,11 @@ mod tests {
             StreamLinks::pipeline(None, Some(duplex_end())).shape(),
             LinkShape::pipeline(false, true)
         );
+        assert_eq!(
+            StreamLinks::ep_driver(duplex_end()).shape(),
+            LinkShape::ep_driver()
+        );
+        assert_eq!(LinkShape::ep_workers(3).ep_workers, 3);
     }
 
     #[cfg(feature = "injected_streams")]
@@ -549,45 +709,106 @@ mod tests {
         )
         .is_err());
         // A pipeline stage refuses EP links.
-        let ep_on_pipeline = StreamLinks {
-            ep_driver: Some(duplex_end()),
-            ..StreamLinks::pipeline(Some(duplex_end()), Some(duplex_end()))
-        };
+        let mut ep_on_pipeline = StreamLinks::pipeline(Some(duplex_end()), Some(duplex_end()));
+        ep_on_pipeline.ep_driver = Some(duplex_end());
         assert!(check_connect_streams(middle, &ep_on_pipeline).is_err());
         // EP worker: exactly the driver link.
-        let worker = LinkShape {
-            ep_driver: true,
-            ..LinkShape::default()
-        };
-        assert!(check_connect_streams(
-            worker,
-            &StreamLinks {
-                ep_driver: Some(duplex_end()),
-                ..Default::default()
-            }
-        )
-        .is_ok());
+        let worker = LinkShape::ep_driver();
+        assert!(check_connect_streams(worker, &StreamLinks::ep_driver(duplex_end())).is_ok());
         assert!(check_connect_streams(worker, &StreamLinks::default()).is_err());
         // EP driver with 2 workers: both entries, both Some.
-        let driver = LinkShape {
-            ep_workers: 2,
-            ..LinkShape::default()
-        };
-        let two = StreamLinks {
-            ep_workers: vec![Some(duplex_end()), Some(duplex_end())],
-            ..Default::default()
-        };
+        let driver = LinkShape::ep_workers(2);
+        let two = StreamLinks::ep_workers(vec![Some(duplex_end()), Some(duplex_end())]);
         assert!(check_connect_streams(driver, &two).is_ok());
-        let short = StreamLinks {
-            ep_workers: vec![Some(duplex_end())],
-            ..Default::default()
-        };
+        let short = StreamLinks::ep_workers(vec![Some(duplex_end())]);
         assert!(check_connect_streams(driver, &short).is_err());
-        let hole = StreamLinks {
-            ep_workers: vec![Some(duplex_end()), None],
-            ..Default::default()
-        };
+        let hole = StreamLinks::ep_workers(vec![Some(duplex_end()), None]);
         assert!(check_connect_streams(driver, &hole).is_err());
+    }
+
+    #[cfg(feature = "injected_streams")]
+    #[test]
+    fn check_reattach_streams_rules() {
+        let middle = LinkShape::pipeline(true, true);
+        // relay: replace upstream (keep downstream) / replace both
+        assert!(
+            check_reattach_streams(middle, &StreamLinks::pipeline(Some(duplex_end()), None))
+                .is_ok()
+        );
+        assert!(check_reattach_streams(
+            middle,
+            &StreamLinks::pipeline(Some(duplex_end()), Some(duplex_end()))
+        )
+        .is_ok());
+        // replacing nothing
+        assert!(matches!(
+            check_reattach_streams(middle, &StreamLinks::default()),
+            Err(EngineError::PeerRejected(_))
+        ));
+        // head (downstream only): may keep its (absent) upstream; an upstream
+        // stream is a role error
+        let head = LinkShape::pipeline(false, true);
+        assert!(
+            check_reattach_streams(head, &StreamLinks::pipeline(None, Some(duplex_end()))).is_ok()
+        );
+        assert!(
+            check_reattach_streams(head, &StreamLinks::pipeline(Some(duplex_end()), None)).is_err()
+        );
+        // tail (upstream only)
+        let tail = LinkShape::pipeline(true, false);
+        assert!(
+            check_reattach_streams(tail, &StreamLinks::pipeline(Some(duplex_end()), None)).is_ok()
+        );
+        // EP link on a pipeline stage
+        assert!(check_reattach_streams(middle, &StreamLinks::ep_driver(duplex_end())).is_err());
+        // EP worker: only the driver link
+        let worker = LinkShape::ep_driver();
+        assert!(check_reattach_streams(worker, &StreamLinks::ep_driver(duplex_end())).is_ok());
+        assert!(
+            check_reattach_streams(worker, &StreamLinks::pipeline(Some(duplex_end()), None))
+                .is_err()
+        );
+        // EP driver with 3 workers: replace worker 1 only; wrong length; all None
+        let driver = LinkShape::ep_workers(3);
+        let one = StreamLinks::ep_workers(vec![None, Some(duplex_end()), None]);
+        assert!(check_reattach_streams(driver, &one).is_ok());
+        let wrong_len = StreamLinks::ep_workers(vec![Some(duplex_end())]);
+        assert!(check_reattach_streams(driver, &wrong_len).is_err());
+        let none = StreamLinks::ep_workers(vec![None, None, None]);
+        assert!(check_reattach_streams(driver, &none).is_err());
+    }
+
+    #[cfg(feature = "injected_streams")]
+    #[test]
+    fn check_reattach_streams_rejects_a_relay_keeping_its_upstream() {
+        // Relay rule: a stage with an upstream link must replace it on every
+        // re-attach, so a downstream-only re-attach on a relay is refused.
+        let middle = LinkShape::pipeline(true, true);
+        match check_reattach_streams(middle, &StreamLinks::pipeline(None, Some(duplex_end()))) {
+            Err(EngineError::PeerRejected(msg)) => {
+                assert!(msg.contains("upstream"), "message explains the rule: {msg}");
+            }
+            other => panic!("expected PeerRejected, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "injected_streams")]
+    #[test]
+    fn engine_reattach_streams_defaults_to_rejection() {
+        struct E;
+        impl Engine for E {
+            fn warmup(&mut self) {}
+            fn submit(&mut self, _t: GenerationTask) -> EngineResult<()> {
+                Ok(())
+            }
+            fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+                Ok(vec![])
+            }
+        }
+        assert!(matches!(
+            E.reattach_streams(StreamLinks::default()),
+            Err(EngineError::PeerRejected(_))
+        ));
     }
 
     #[cfg(feature = "injected_streams")]

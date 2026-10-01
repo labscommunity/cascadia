@@ -23,3 +23,4 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 cascadia-engine-mock = { workspace = true }
 cascadia-transport = { workspace = true }
+tracing-subscriber = { workspace = true }

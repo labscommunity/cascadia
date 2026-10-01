@@ -236,6 +236,61 @@ pub(crate) fn map_ov_err(err: OvError) -> EngineError {
     }
 }
 
+/// The two ways to clear an OV stateful request's KV between independent turns.
+/// A trait only so the choice made by [`clear_ov_state`] can be observed with a
+/// fake in tests; the production implementation is [`OvRuntime`] itself.
+pub(crate) trait OvStateClear {
+    /// The cheap reset: `VariableState::reset()` on every state.
+    fn reset_state(&mut self) -> Result<(), OvError>;
+    /// Drop the InferRequest and build a fresh one off the compiled model.
+    fn recreate_request(&mut self) -> Result<(), OvError>;
+}
+
+impl OvStateClear for OvRuntime {
+    fn reset_state(&mut self) -> Result<(), OvError> {
+        OvRuntime::reset_state(self)
+    }
+    fn recreate_request(&mut self) -> Result<(), OvError> {
+        OvRuntime::recreate_request(self)
+    }
+}
+
+/// Clear a stateful request before a cold turn. After a `set_state_blob` has
+/// been applied (`state_restored`), the cheap `reset_state` does not scrub
+/// the restored state (see the shim's `recreate_request` doc, and
+/// `scrub_after_set_state`), so a cold turn would run on warm-restore residue;
+/// rebuild the request instead. The flag is cleared only once a rebuild
+/// succeeds, so a failed one is retried on the next clear rather than silently
+/// downgraded to the reset that cannot scrub it. A turn that never restored
+/// keeps the cheap reset, so default (non-`kv_coord`) builds are unchanged.
+pub(crate) fn clear_ov_state(
+    rt: &mut impl OvStateClear,
+    state_restored: &mut bool,
+) -> EngineResult<()> {
+    if *state_restored {
+        rt.recreate_request().map_err(map_ov_err)?;
+        *state_restored = false;
+        Ok(())
+    } else {
+        rt.reset_state().map_err(map_ov_err)
+    }
+}
+
+/// Undo a restore right now (a failed `set_state_blob`, a rejected warm verdict):
+/// rebuild the request, because `reset_state` cannot scrub restore residue.
+/// Rebuilds at most once per restore: a successful rebuild clears
+/// `state_restored`, so the next cold clear is the cheap reset again; a failed
+/// one leaves it set so that clear retries the rebuild. Only `kv_coord`
+/// builds restore state, so only they (and the unit tests) call it.
+#[cfg(any(feature = "kv_coord", test))]
+pub(crate) fn scrub_restore_now(
+    rt: &mut impl OvStateClear,
+    state_restored: &mut bool,
+) -> EngineResult<()> {
+    *state_restored = true;
+    clear_ov_state(rt, state_restored)
+}
+
 /// Decode a float output port's raw bytes to f32, by its reported dtype.
 /// Shared by every output-reading path (run_first / run_relay / static).
 fn bytes_to_f32(dtype: ShimDType, bytes: &[u8]) -> EngineResult<Vec<f32>> {
@@ -600,8 +655,8 @@ impl WireDeadLatch {
     ///   [`EngineError::BatchAborted`], which is structurally non-fatal. The
     ///   phrase is written here rather than inherited from `cause`, because the
     ///   stored text need not match the classifier at all (a latch armed by the
-    ///   structural [`EngineError::NotConnected`] displays as "not YET
-    ///   connected", which no substring rule catches).
+    ///   structural [`EngineError::NotConnected`] displays as "peer link
+    ///   unavailable", which no substring rule catches).
     /// * It quotes the original cause, so the operator and the SSE client both
     ///   learn what actually killed the link, not just that it is gone.
     fn fail_fast_error(&self) -> Option<EngineError> {
@@ -612,6 +667,101 @@ impl WireDeadLatch {
             ))
         })
     }
+
+    /// Issue #76: disarm the latch on re-attach. The dead packed downstream has
+    /// been replaced with a fresh stream, so the recorded cause no longer
+    /// applies and requests must be served again. The only caller is
+    /// `reset_for_reattach`; a latch is otherwise one-way for the process life.
+    fn clear(&mut self) {
+        self.cause = None;
+    }
+}
+
+/// Issue #76: a re-attach that keeps this stage's downstream must find it
+/// live (`is_connected`: held, not dropped by the transport, not closed by
+/// its peer as far as this stage has read). A dead one would park the stage
+/// again on its first frame, so keeping it is refused with
+/// [`cascadia_engine::kept_link_dead`] before anything is swapped. Upstreams
+/// are always replaced (relay rule), so only the downstream can be kept.
+/// Shared by ov-runtime, gemma4 and qwen36.
+pub(crate) async fn check_kept_downstream_live(
+    downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
+    kept: bool,
+) -> EngineResult<()> {
+    match downstream {
+        Some(d) if kept && !d.lock().await.is_connected() => {
+            Err(cascadia_engine::kept_link_dead("downstream"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Issue #76: validate a `reattach_streams` request for an ov-runtime stage
+/// BEFORE any stream is swapped. Pure (no engine state) so the rule is
+/// unit-testable without model weights.
+///
+/// `stateful` is `OvRuntimeEngine::is_stateful`. `stage` is this stage's
+/// `LinkShape` (ov-runtime is pipeline-only, so
+/// `LinkShape::pipeline(has_upstream, has_downstream)`). `links` is the
+/// re-attach request; a `None` field means "keep the current stream".
+///
+/// `check_reattach_streams` covers the base rules (at least one link
+/// replaced, only sides the stage has, no EP links) and the relay rule (a
+/// stage with an upstream must replace it), so every re-attach already
+/// cascades UP to the head. What is left here is the downward direction for a
+/// stateful stage, which must also replace its downstream.
+fn validate_reattach(
+    stateful: bool,
+    stage: cascadia_engine::LinkShape,
+    links: &cascadia_engine::StreamLinks,
+) -> EngineResult<()> {
+    cascadia_engine::check_reattach_streams(stage, links)?;
+    // A stateful relay resets its OV KV only when a multi-token frame arrives,
+    // and the stateful wire carries no position (see `relay_middle_body`). In a
+    // chain A->B->C where only the A<->B hop died, B keeping its live
+    // downstream would leave C on the previous session's KV, and a 1-token
+    // first request would skip C's reset: silent wrong output. Replacing B->C
+    // makes C's upstream die (the embedder closes it first), so C is
+    // re-attached and reset in turn, cascading to the tail.
+    if stateful && stage.downstream && links.downstream.is_none() {
+        return Err(EngineError::PeerRejected(
+            "ov-runtime stateful stage with a downstream must replace it on re-attach \
+             (downstream: None is rejected so the reset cascades down the chain)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The stateful (non-static, non-packed) wire carries no position and no
+/// request boundary: a relay resets its OV KV only when a multi-token hidden
+/// frame arrives (`relay_middle_body`/`relay_last_body`). A cold 1-token prompt
+/// is sent as a `[1, 1, H]` frame, byte-for-byte a decode step, so every relay
+/// would run it on the previous request's KV and return a wrong token. The
+/// head therefore refuses it (`Some(message)`) instead of sending it, at
+/// `submit` (`OvRuntimeEngine::refuse_one_token_cold_prompt`, a client error)
+/// with a step-time backstop in `step_first`.
+///
+/// Only a COLD 1-token prompt can reach this: a warm resume needs a cached
+/// strict, non-empty prefix (`OvKvCache::take_warm`), so a 1-token prompt is
+/// always cold. A warm turn whose SUFFIX is 1 token is safe and allowed: every
+/// relay was RESTOREd to the prefix first (the head admits warm only on an
+/// all-ranks verdict) and runs the suffix at the restored position.
+///
+/// `stateful` is `static_kv.is_none()` (packed heads never reach this path);
+/// `is_last_stage` is true for a standalone (total == 1) stage, which has no
+/// relays to mislead. Static chains carry the position on the wire and reset
+/// at position 0, so they are not affected.
+fn one_token_stateful_chain_refusal(
+    prompt_tokens: usize,
+    stateful: bool,
+    is_last_stage: bool,
+) -> Option<String> {
+    (prompt_tokens == 1 && stateful && !is_last_stage).then(|| {
+        "1-token prompts are not supported on a stateful multi-stage chain: relays cannot \
+         tell a new request from a decode step; use a static/packed layout or a longer prompt"
+            .to_string()
+    })
 }
 
 /// The relay failed to answer its upstream. When the step it was answering
@@ -831,6 +981,7 @@ const TOKEN_RECV_DEADLINE_CEILING: std::time::Duration = std::time::Duration::fr
 // to cold reprefill (the caller aborts + reprefills on Err), never hang the serve at the client
 // deadline. Warm-resume is an optimization, not a correctness gate — generous enough for a valid
 // tail restore, well under any client timeout.
+#[cfg(feature = "kv_coord")]
 const RESTORE_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Overall budget for one token wait.
@@ -1523,6 +1674,12 @@ pub struct OvRuntimeEngine {
     /// in both modes, so this only labels the mode in the warm-resume logs the cert greps.
     #[cfg(feature = "kv_coord")]
     plane_restore: bool,
+    /// A `set_state_blob` has been applied to `runtime` and not yet scrubbed by a
+    /// rebuild. Makes the next cold clear (`clear_ov_state`) rebuild the request
+    /// instead of the cheap reset that cannot clear restored state. Set by every
+    /// warm-restore site (head admission, the RESTORE arm, the plane apply);
+    /// only ever true in `kv_coord` builds.
+    state_restored: bool,
 }
 
 impl OvRuntimeEngine {
@@ -2088,6 +2245,52 @@ impl OvRuntimeEngine {
         Ok(())
     }
 
+    /// [`one_token_stateful_chain_refusal`] at `submit`, as a client error
+    /// ([`EngineError::InvalidConfig`]: the API answers 400 and does not mark
+    /// the node unhealthy, where an error chunk from `step` is a 5xx that
+    /// does). Counts the prompt exactly as `step_first` does (tokens plus
+    /// resume ids) and skips the cases `step_first` answers before its own
+    /// check (no tokenizer, an invalid resume id, a budget the resume prefix
+    /// already exhausts), so it refuses precisely what `step_first` would.
+    ///
+    /// The extra tokenization (under the engine lock) happens only on a
+    /// stateful multi-stage head: every other stage returns before encoding,
+    /// and so does a task whose resume ids alone are already 2+ tokens.
+    fn refuse_one_token_cold_prompt(&self, task: &GenerationTask) -> EngineResult<()> {
+        if self.packed.is_some()
+            || self.static_kv.is_some()
+            || !self.spec.is_first_stage
+            || self.spec.is_last_stage
+        {
+            return Ok(());
+        }
+        let Some(tok) = self.tokenizer.as_ref() else {
+            return Ok(());
+        };
+        let resume = task.resume_ids();
+        if let Some(r) = resume {
+            if cascadia_types::validate_resume_ids(r, Some(crate::resume_vocab_bound(tok))).is_err()
+                || r.len() >= task.max_tokens.max(1) as usize
+                || r.len() > 1
+            {
+                return Ok(());
+            }
+        }
+        let prompt_tokens = tok
+            .encode(task.prompt.clone(), false)
+            .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?
+            .get_ids()
+            .len()
+            + resume.map_or(0, <[i32]>::len);
+        match one_token_stateful_chain_refusal(prompt_tokens, true, false) {
+            Some(msg) => {
+                warn!(task = %task.task_id, "refusing a 1-token prompt on a stateful multi-stage chain");
+                Err(EngineError::InvalidConfig(msg))
+            }
+            None => Ok(()),
+        }
+    }
+
     fn step_first(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
         if self.packed.is_some() {
             return self.step_first_packed();
@@ -2132,6 +2335,18 @@ impl OvRuntimeEngine {
                 }
             }
             cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
+            if let Some(msg) = one_token_stateful_chain_refusal(
+                prompt_ids.len(),
+                self.static_kv.is_none(),
+                self.spec.is_last_stage,
+            ) {
+                // Backstop only: `submit` already refuses these (`refuse_one_token_cold_prompt`).
+                // Refused before anything is restored, reset or sent: relay state is untouched and
+                // the task never becomes active, so the next request is served normally.
+                warn!(task = %task.task_id, "refusing a 1-token prompt on a stateful multi-stage chain");
+                let id = task.task_id.clone();
+                return Ok(vec![(id.clone(), Chunk::error(id, msg))]);
+            }
             // Issue-34 warm-resume: if a pulled/cached KV blob covers a strict prefix of this
             // prompt, restore it and prefill only the suffix. Gated + best-effort — off-rig
             // set_state_blob returns Stub, so this stays cold. Only the stateful (non-static) path.
@@ -2145,6 +2360,8 @@ impl OvRuntimeEngine {
                 {
                     match self.runtime.set_state_blob(&blob) {
                         Ok(()) => {
+                            // Applied: the next cold admission must rebuild, not reset.
+                            self.state_restored = true;
                             // Multi-stage: RESTORE the whole downstream chain too (all-or-nothing).
                             // Any rank short ⇒ ABORT everyone + cold (never a partial/corrupt warm).
                             // Dropping the frame skipped the SAME-CHAIN restore too (where no plane pull
@@ -2208,7 +2425,7 @@ impl OvRuntimeEngine {
                 }
             }
             if warm_prefix == 0 && self.static_kv.is_none() {
-                self.runtime.reset_state().map_err(map_ov_err)?;
+                clear_ov_state(&mut self.runtime, &mut self.state_restored)?;
             }
             self.position = warm_prefix as i64;
             info!(
@@ -3360,6 +3577,75 @@ impl OvRuntimeEngine {
         }
     }
 
+    /// True when this stage keeps its KV in OV internal state (neither the
+    /// static host-side ring nor the packed multi-slot variant). Only such a
+    /// stage depends on `reset_state`, and only its relays reset on the
+    /// multi-token-frame heuristic in `relay_middle_body`/`relay_last_body`.
+    fn is_stateful(&self) -> bool {
+        self.static_kv.is_none() && self.packed.is_none()
+    }
+
+    /// Issue #76: return the engine to a clean between-requests state after a
+    /// re-attach. UNCONDITIONAL — unlike `cancel`, it does not gate on
+    /// `self.active`, because relay ranks never set `active` (assigned only at
+    /// the head's admission), yet they are exactly the ranks that must reset
+    /// their KV so the next request starts at position 0.
+    /// Any failure here is `Backend` (never `PeerRejected`): it happens after
+    /// the swap, so the runner fences the engine on it.
+    fn reset_for_reattach(&mut self) -> EngineResult<()> {
+        // Clear OV internal KV. Only the stateful path depends on it, so only
+        // there is a failure fatal (Backend). Static/packed stages never gate on
+        // OV state, so call it best-effort there, like `cancel` does.
+        if self.is_stateful() {
+            // The dead session may have applied a `set_state_blob` (a RESTORE
+            // that landed before the link died, or a warm turn), whose residue
+            // the cheap reset cannot clear: `clear_ov_state` rebuilds then.
+            clear_ov_state(&mut self.runtime, &mut self.state_restored)?;
+        } else {
+            let _ = self.runtime.reset_state();
+        }
+        // Host-side static ring (static path); no-op allocation otherwise.
+        if let Some(sk) = self.static_kv.as_mut() {
+            sk.reset();
+        }
+        self.position = 0;
+        // Packed path: retire every occupied slot so its KV region returns to
+        // the free pool. Iterate by index; `retire` clears the slot's KV.
+        if let Some(packed) = self.packed.as_mut() {
+            for slot in 0..packed.slots.len() {
+                if packed.slots[slot].is_some() {
+                    packed.retire(slot);
+                }
+            }
+        }
+        self.active = None;
+        self.consecutive_token_timeouts = 0;
+        // Fresh stream => no orphan token can echo a stale inbound seq. Match a
+        // freshly built engine's between-requests state (`build()` sets None);
+        // it is set again on the next upstream recv before it is ever echoed.
+        // `awaiting_token_seq` is NOT reset: it is monotonic for the engine's
+        // lifetime so a re-formed generation cannot collide with an orphan of
+        // the old one.
+        self.inbound_seq = None;
+        // Re-admit requests on the (now replaced) packed downstream wire.
+        self.wire_dead.clear();
+        // --park-prefill contract: a re-attach is a "task over, going idle"
+        // transition, exactly like `cancel`. Free the prefill model's resident
+        // weight copy now so it is not stranded until the next prefill. No-op
+        // when parking is off.
+        self.park_prefill_model();
+        // KV-coordination warm-resume state (Issue-34 Option C). A parked slice
+        // or a pending warm flag from the dead session must not apply later.
+        #[cfg(feature = "kv_coord")]
+        {
+            self.kv_warm_pending = false;
+            if self.kv_handoff.discard_any() {
+                info!(target: "cascadia::kv", event = "kv_handoff_discarded_on_reattach");
+            }
+        }
+        Ok(())
+    }
+
     /// Run one chunked-prefill inference for `real` (<= C) tokens starting at
     /// absolute `position`, absorbing their K/V into the shared ring. Returns
     /// the primary output `[1, C, X]` bytes when `want_output`, else empty —
@@ -3585,7 +3871,7 @@ impl OvRuntimeEngine {
                 // its position). The flag is consumed every prefill so it never leaks across turns.
                 let warm = self.kv_consume_warm_pending();
                 if shape[1] > 1 && !warm {
-                    self.runtime.reset_state().map_err(map_ov_err)?;
+                    clear_ov_state(&mut self.runtime, &mut self.state_restored)?;
                     self.position = 0;
                 }
                 let r = self.run_relay(&hidden, shape, self.position)?;
@@ -3682,7 +3968,7 @@ impl OvRuntimeEngine {
             None => {
                 let warm = self.kv_consume_warm_pending();
                 if shape[1] > 1 && !warm {
-                    self.runtime.reset_state().map_err(map_ov_err)?;
+                    clear_ov_state(&mut self.runtime, &mut self.state_restored)?;
                     self.position = 0;
                 }
                 let (o, s) = self.run_relay(&hidden, shape, self.position)?;
@@ -3834,6 +4120,7 @@ impl Engine for OvRuntimeEngine {
                 }
             }
         }
+        self.refuse_one_token_cold_prompt(&task)?;
         self.pending.push(task);
         Ok(())
     }
@@ -3915,6 +4202,64 @@ impl Engine for OvRuntimeEngine {
         }
     }
 
+    /// Issue #76: replace one or both pipeline streams in place and reset to a
+    /// clean between-requests state, without reloading weights. A `None` field in
+    /// `links` keeps that side. Called with the runner's engine lock held, so no
+    /// `step()` is in flight. Order: validate (`validate_reattach`) -> swap each
+    /// `Some` side inside its existing `Arc<Mutex<..>>` -> unconditional reset.
+    fn reattach_streams(&mut self, links: cascadia_engine::StreamLinks) -> EngineResult<()> {
+        // Validate BEFORE touching anything: a PeerRejected here means the
+        // engine is untouched, which the runner relies on not to fence.
+        validate_reattach(
+            self.is_stateful(),
+            cascadia_engine::LinkShape::pipeline(
+                self.upstream.is_some(),
+                self.downstream.is_some(),
+            ),
+            &links,
+        )?;
+        self.block_on(check_kept_downstream_live(
+            self.downstream.clone(),
+            links.downstream.is_none(),
+        ))?;
+        let cascadia_engine::StreamLinks {
+            upstream,
+            downstream,
+            ..
+        } = links;
+        // `validate_reattach` only accepts sides this stage has, so the handle
+        // lookups cannot miss. They are still resolved before any swap, so if
+        // that ever broke the error is PeerRejected (engine untouched) rather
+        // than Backend, which fences; an Err past the swaps is post-swap =>
+        // Backend. `block_on` (never `blocking_lock()`) because this may run
+        // on a runtime worker thread.
+        let missing = |side: &str| {
+            EngineError::PeerRejected(format!(
+                "reattach: validated {side} has no handle on this stage"
+            ))
+        };
+        let up = match upstream {
+            Some(s) => Some((self.upstream.clone().ok_or_else(|| missing("upstream"))?, s)),
+            None => None,
+        };
+        let down = match downstream {
+            Some(s) => Some((
+                self.downstream
+                    .clone()
+                    .ok_or_else(|| missing("downstream"))?,
+                s,
+            )),
+            None => None,
+        };
+        if let Some((handle, s)) = up {
+            self.block_on(cascadia_transport::attach_server(&handle, s));
+        }
+        if let Some((handle, s)) = down {
+            self.block_on(cascadia_transport::attach_client(&handle, s));
+        }
+        self.reset_for_reattach()
+    }
+
     #[cfg(feature = "kv_coord")]
     fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
         Some(self)
@@ -3954,7 +4299,7 @@ impl OvRuntimeEngine {
     /// scrub leaves donor state live, and every later turn on this request serves garbage.
     #[cfg(feature = "kv_coord")]
     fn scrub_after_set_state(&mut self, context: &str) {
-        if let Err(e) = self.runtime.recreate_request() {
+        if let Err(e) = scrub_restore_now(&mut self.runtime, &mut self.state_restored) {
             error!(error = %e, context,
                 "ov-runtime: recreate_request scrub failed; KV state may be dirty");
         }
@@ -4035,6 +4380,7 @@ impl OvRuntimeEngine {
         let set_state_ms = t_set_state.elapsed().as_millis() as u64;
         match set_state {
             Ok(()) => {
+                self.state_restored = true;
                 self.position = crate::kv_coordination::kv_seq_from_blob(blob).unwrap_or(0) as i64;
                 // Probe A+B (PLANE apply site). `position` settled the depth question (head 97 == tail
                 // 97, mismatch refuted). What remains is whether the BYTES differ from the chain path's
@@ -4466,6 +4812,7 @@ impl OvRuntimeEngine {
                     let pos_before = self.position;
                     match self.runtime.set_state_blob(blob) {
                         Ok(()) => {
+                            self.state_restored = true;
                             self.position =
                                 crate::kv_coordination::kv_seq_from_blob(blob).unwrap_or(0) as i64;
                             self.kv_warm_pending = true;
@@ -4493,6 +4840,7 @@ impl OvRuntimeEngine {
                     match self.kv.take_capture(epoch) {
                         Some((tokens, blob)) => match self.runtime.set_state_blob(&blob) {
                             Ok(()) => {
+                                self.state_restored = true;
                                 // Real KV depth, not the token count (off-by-one, see kv_seq_from_blob).
                                 self.position = crate::kv_coordination::kv_seq_from_blob(&blob)
                                     .map(|s| s.min(tokens.len()))
@@ -4685,18 +5033,6 @@ impl OvRuntimeBuilder {
             p = p.with(key, val);
         }
         p
-    }
-}
-
-#[cfg(test)]
-impl OvRuntimeBuilder {
-    /// Test seam (#76): the stream slots are private, so a builder-level test
-    /// cannot otherwise assert that `connect_streams` stored an injected handle.
-    fn upstream_handle(&self) -> Option<Arc<tokio::sync::Mutex<ActivationServer>>> {
-        self.upstream.clone()
-    }
-    fn downstream_handle(&self) -> Option<Arc<tokio::sync::Mutex<ActivationClient>>> {
-        self.downstream.clone()
     }
 }
 
@@ -5461,6 +5797,7 @@ impl Builder for OvRuntimeBuilder {
             plane_restore: std::env::var("CASCADIA_KV_PLANE_RESTORE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            state_restored: false,
         }))
     }
 }
@@ -5836,8 +6173,8 @@ mod tests {
         assert!(msg.contains("restart"), "{msg}");
 
         // Fatality must not depend on the stored cause's wording. `NotConnected`
-        // is fatal STRUCTURALLY and displays as "not YET connected", which no
-        // substring rule matches — a fail-fast error that merely echoed the
+        // is fatal STRUCTURALLY and displays as "peer link unavailable", which
+        // no substring rule matches — a fail-fast error that merely echoed the
         // cause would silently become non-fatal here.
         let mut latch = WireDeadLatch::default();
         assert!(EngineError::NotConnected.is_connection_fatal());
@@ -6907,8 +7244,8 @@ mod tests {
         ))
         .await
         .expect("head accepts a downstream-only shape");
-        assert!(b.upstream_handle().is_none(), "head has no upstream");
-        let h = b.downstream_handle().expect("downstream stored");
+        assert!(b.upstream.clone().is_none(), "head has no upstream");
+        let h = b.downstream.clone().expect("downstream stored");
         assert!(
             h.lock().await.is_injected(),
             "stored handle must be injected"
@@ -6927,8 +7264,8 @@ mod tests {
         ))
         .await
         .expect("middle accepts both sides");
-        assert!(b.upstream_handle().unwrap().lock().await.is_injected());
-        assert!(b.downstream_handle().unwrap().lock().await.is_injected());
+        assert!(b.upstream.clone().unwrap().lock().await.is_injected());
+        assert!(b.downstream.clone().unwrap().lock().await.is_injected());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6938,7 +7275,7 @@ mod tests {
         b.connect_streams(cascadia_engine::StreamLinks::default())
             .await
             .expect("standalone accepts an empty StreamLinks");
-        assert!(b.upstream_handle().is_none() && b.downstream_handle().is_none());
+        assert!(b.upstream.clone().is_none() && b.downstream.clone().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6957,7 +7294,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, EngineError::PeerRejected(_)), "got {err:?}");
         assert!(
-            b.upstream_handle().is_none() && b.downstream_handle().is_none(),
+            b.upstream.clone().is_none() && b.downstream.clone().is_none(),
             "a rejected shape stores nothing"
         );
 
@@ -6984,14 +7321,636 @@ mod tests {
         let (down, _pd) = tokio::io::duplex(64);
         let (ep, _pe) = tokio::io::duplex(64);
         let err = b
-            .connect_streams(cascadia_engine::StreamLinks {
-                downstream: Some(Box::new(down)),
-                ep_driver: Some(Box::new(ep)),
-                ..Default::default()
+            .connect_streams({
+                let mut l = cascadia_engine::StreamLinks::pipeline(None, Some(Box::new(down)));
+                l.ep_driver = Some(Box::new(ep));
+                l
             })
             .await
             .unwrap_err();
         assert!(matches!(err, EngineError::PeerRejected(_)), "got {err:?}");
-        assert!(b.upstream_handle().is_none() && b.downstream_handle().is_none());
+        assert!(b.upstream.clone().is_none() && b.downstream.clone().is_none());
+    }
+
+    // ---- injected streams: reattach (#76) ----
+
+    /// A throwaway injected `ByteStream` for the pure `validate_reattach` tests. They
+    /// only read `StreamLinks` shape (`is_some`/`is_none`), never drive I/O, so a
+    /// duplex half whose far end is dropped is enough. `tokio::io::duplex` only
+    /// allocates a buffer — no runtime needed — so these stay plain `#[test]`.
+    fn dummy_stream() -> cascadia_engine::ByteStream {
+        let (a, _b) = tokio::io::duplex(64);
+        Box::new(a)
+    }
+
+    #[test]
+    fn wire_dead_latch_clear_resets_cause() {
+        let mut latch = WireDeadLatch::default();
+        assert!(latch.cause().is_none());
+        // `NotConnected` is connection-fatal, so it arms the latch.
+        assert!(
+            latch.observe(&EngineError::NotConnected),
+            "fatal cause must latch"
+        );
+        assert!(latch.cause().is_some());
+        // Re-attach disarms it.
+        latch.clear();
+        assert!(latch.cause().is_none(), "clear() must drop the cause");
+        // A fresh wire can die again and re-arm.
+        assert!(latch.observe(&EngineError::NotConnected));
+        assert!(latch.cause().is_some());
+    }
+
+    #[test]
+    fn validate_reattach_stateful_stage_must_replace_a_live_downstream() {
+        // Middle stateful stage (has upstream + downstream). Keeping the
+        // downstream is rejected so the reset cascades to the next stage;
+        // replacing it is fine.
+        let stage = cascadia_engine::LinkShape::pipeline(true, true);
+        assert!(matches!(
+            validate_reattach(
+                true,
+                stage,
+                &cascadia_engine::StreamLinks::pipeline(Some(dummy_stream()), None)
+            ),
+            Err(EngineError::PeerRejected(_))
+        ));
+        // replace downstream only: rejected by the generic relay rule (a stage
+        // with an upstream must replace it), so a stateful middle stage must
+        // replace both links
+        assert!(matches!(
+            validate_reattach(
+                true,
+                stage,
+                &cascadia_engine::StreamLinks::pipeline(None, Some(dummy_stream()))
+            ),
+            Err(EngineError::PeerRejected(_))
+        ));
+        // replace both
+        assert!(validate_reattach(
+            true,
+            stage,
+            &cascadia_engine::StreamLinks::pipeline(Some(dummy_stream()), Some(dummy_stream()))
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_reattach_static_stage_may_keep_its_downstream() {
+        // Static stage (static_kv Some -> stateful=false): keeping the downstream
+        // is allowed; it re-synchronises at wire position 0. Args are
+        // (stateful, stage: LinkShape, links: &StreamLinks); a `None` link = keep.
+        let stage = cascadia_engine::LinkShape::pipeline(true, true);
+        // replace up, KEEP down
+        assert!(validate_reattach(
+            false,
+            stage,
+            &cascadia_engine::StreamLinks::pipeline(Some(dummy_stream()), None)
+        )
+        .is_ok());
+        // KEEP up, replace down: rejected by the generic relay rule, stateful
+        // or not
+        assert!(matches!(
+            validate_reattach(
+                false,
+                stage,
+                &cascadia_engine::StreamLinks::pipeline(None, Some(dummy_stream()))
+            ),
+            Err(EngineError::PeerRejected(_))
+        ));
+        // a static head (no upstream) replaces its downstream
+        assert!(validate_reattach(
+            false,
+            cascadia_engine::LinkShape::pipeline(false, true),
+            &cascadia_engine::StreamLinks::pipeline(None, Some(dummy_stream()))
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_reattach_rejects_role_and_empty_shapes() {
+        // A head (no upstream) rejects an upstream stream (role error).
+        assert!(matches!(
+            validate_reattach(
+                true,
+                cascadia_engine::LinkShape::pipeline(false, true),
+                &cascadia_engine::StreamLinks::pipeline(Some(dummy_stream()), None)
+            ),
+            Err(EngineError::PeerRejected(_))
+        ));
+        // Nothing to replace is rejected.
+        assert!(matches!(
+            validate_reattach(
+                false,
+                cascadia_engine::LinkShape::pipeline(true, true),
+                &cascadia_engine::StreamLinks::default()
+            ),
+            Err(EngineError::PeerRejected(_))
+        ));
+        // A head (static) replacing its only side (downstream) is fine.
+        assert!(validate_reattach(
+            false,
+            cascadia_engine::LinkShape::pipeline(false, true),
+            &cascadia_engine::StreamLinks::pipeline(None, Some(dummy_stream()))
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_reattach_rejects_ep_links_on_a_pipeline_stage() {
+        // ov-runtime is pipeline-only; an EP link is a role error even alongside a
+        // valid downstream replacement. `check_reattach_streams` (called inside
+        // validate_reattach) rejects it because the stage LinkShape carries
+        // ep_driver=false, ep_workers=0.
+        let stage = cascadia_engine::LinkShape::pipeline(false, true); // head
+        let links = {
+            let mut l = cascadia_engine::StreamLinks::pipeline(None, Some(dummy_stream()));
+            l.ep_driver = Some(dummy_stream());
+            l
+        };
+        assert!(matches!(
+            validate_reattach(true, stage, &links),
+            Err(EngineError::PeerRejected(_))
+        ));
+    }
+
+    // ---- injected streams: reattach_streams on a live engine (#76) ----
+
+    /// Build an `OvRuntimeEngine` without weights. `OvRuntime` is a zero-field
+    /// struct in a stub (non-`openvino`) build, so `OvRuntime {}` constructs
+    /// with no IR or device; every OV call on it returns `Err(Stub)`. Enough to
+    /// drive the stream swap and the host-side half of `reset_for_reattach`.
+    /// Each side the stage has gets an injected handle over a duplex half whose
+    /// far end is dropped, i.e. a dead link waiting to be re-attached.
+    #[cfg(not(feature = "openvino"))]
+    fn stub_engine(is_first: bool, is_last: bool, static_ring: bool) -> OvRuntimeEngine {
+        let mut spec = ShardSpec::single_stage("m", "CPU");
+        spec.is_first_stage = is_first;
+        spec.is_last_stage = is_last;
+        let upstream = (!is_first).then(|| {
+            let (near, _far) = tokio::io::duplex(64);
+            Arc::new(tokio::sync::Mutex::new(ActivationServer::from_stream(
+                Box::new(near),
+            )))
+        });
+        let downstream = (!is_last).then(|| {
+            let (near, _far) = tokio::io::duplex(64);
+            Arc::new(tokio::sync::Mutex::new(ActivationClient::from_stream(
+                Box::new(near),
+            )))
+        });
+        let rotary = Rotary::from_config(&crate::rotary::ModelTextConfig {
+            head_dim: Some(4),
+            ..Default::default()
+        })
+        .expect("head_dim 4 is a valid rotary config");
+        OvRuntimeEngine {
+            spec,
+            runtime: OvRuntime {},
+            rotary,
+            hidden_size: 4,
+            tokenizer: None,
+            eos_token_ids: Vec::new(),
+            upstream,
+            downstream,
+            runtime_handle: tokio::runtime::Handle::current(),
+            position: 0,
+            input_names: Vec::new(),
+            canonical_inputs: std::collections::HashMap::new(),
+            pending: Vec::new(),
+            active: None,
+            packed: None,
+            static_kv: static_ring.then(|| test_ring(8, 1, 2, 1)),
+            prefill: None,
+            park_prefill: false,
+            prefill_reload: None,
+            step_warn: StepWarnLimiter::default(),
+            wire_dead: WireDeadLatch::default(),
+            awaiting_token_seq: 0,
+            inbound_seq: None,
+            consecutive_token_timeouts: 0,
+            #[cfg(feature = "kv_coord")]
+            kv: crate::kv_coordination::OvKvCache::default(),
+            #[cfg(feature = "kv_coord")]
+            kv_share: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::kv_coordination::OvKvCache::default(),
+            )),
+            #[cfg(feature = "kv_coord")]
+            kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
+            #[cfg(feature = "kv_coord")]
+            kv_warm_pending: false,
+            #[cfg(feature = "kv_coord")]
+            plane_restore: false,
+            state_restored: false,
+        }
+    }
+
+    /// Send one frame through `client` and read it back on `server`: proves the
+    /// two are the ends of one live stream.
+    #[cfg(not(feature = "openvino"))]
+    async fn frame_crosses(
+        client: &Arc<tokio::sync::Mutex<ActivationClient>>,
+        server: &mut ActivationServer,
+    ) -> bool {
+        let t = encode_wire_lead(7, None);
+        if client.lock().await.send(&t).await.is_err() {
+            return false;
+        }
+        matches!(server.recv().await, Ok((got, _)) if got.data == t.data)
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    #[test]
+    fn is_stateful_is_neither_static_nor_packed() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _g = rt.enter();
+        assert!(stub_engine(false, true, false).is_stateful());
+        assert!(!stub_engine(false, true, true).is_stateful());
+    }
+
+    /// A relay never sets `active` (only the head's admission does), so the
+    /// re-attach reset must not gate on it: a static middle stage with
+    /// `active == None` still gets its ring, position, seq echo, timeout
+    /// streak and dead-wire latch cleared, and both swaps land inside the
+    /// SAME `Arc`s the engine's clones hold.
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_resets_an_idle_static_relay_and_swaps_in_place() {
+        let mut e = stub_engine(false, false, true);
+        assert!(e.active.is_none(), "a relay never has an active task");
+        let up_clone = e.upstream.clone().unwrap();
+        let down_clone = e.downstream.clone().unwrap();
+        // Dirty every piece of between-requests state the dead session left.
+        e.position = 7;
+        e.static_kv.as_mut().unwrap().valid = 5;
+        e.inbound_seq = Some(9);
+        e.consecutive_token_timeouts = 2;
+        e.awaiting_token_seq = 41;
+        assert!(e.wire_dead.observe(&EngineError::NotConnected));
+
+        let (up_near, up_far) = tokio::io::duplex(1 << 16);
+        let (down_near, down_far) = tokio::io::duplex(1 << 16);
+        e.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            Some(Box::new(up_near)),
+            Some(Box::new(down_near)),
+        ))
+        .expect("a static relay replacing both links re-attaches");
+
+        assert_eq!(e.position, 0);
+        assert_eq!(e.static_kv.as_ref().unwrap().valid, 0, "ring reset");
+        assert!(e.inbound_seq.is_none(), "no seq to echo on a fresh stream");
+        assert_eq!(e.consecutive_token_timeouts, 0);
+        assert_eq!(e.awaiting_token_seq, 41, "the outbound seq stays monotonic");
+        assert!(e.wire_dead.cause().is_none(), "dead-wire latch disarmed");
+        assert!(e.active.is_none());
+
+        // The engine's own clones now talk over the fresh streams.
+        let mut down_peer = ActivationServer::from_stream(Box::new(down_far));
+        assert!(frame_crosses(&down_clone, &mut down_peer).await);
+        let up_peer = Arc::new(tokio::sync::Mutex::new(ActivationClient::from_stream(
+            Box::new(up_far),
+        )));
+        let t = encode_wire_lead(3, None);
+        up_peer.lock().await.send(&t).await.unwrap();
+        let (got, _) = up_clone.lock().await.recv().await.unwrap();
+        assert_eq!(got.data, t.data);
+    }
+
+    /// A stateful stage's reset is fatal on failure (it is the only thing that
+    /// clears OV KV). The stub runtime fails every OV call, which exercises the
+    /// post-swap path: the result is `Backend`, never `PeerRejected`, because
+    /// the streams were already swapped and the runner must fence.
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_reset_failure_on_a_stateful_stage_is_post_swap_backend() {
+        let mut e = stub_engine(false, true, false); // stateful tail
+        let up_clone = e.upstream.clone().unwrap();
+        e.position = 7;
+        let (up_near, up_far) = tokio::io::duplex(1 << 16);
+        let err = e
+            .reattach_streams(cascadia_engine::StreamLinks::pipeline(
+                Some(Box::new(up_near)),
+                None,
+            ))
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Backend(_)), "got {err:?}");
+        // Swapped before the reset ran.
+        let peer = ActivationClient::from_stream(Box::new(up_far));
+        let peer = Arc::new(tokio::sync::Mutex::new(peer));
+        let t = encode_wire_lead(3, None);
+        peer.lock().await.send(&t).await.unwrap();
+        assert_eq!(up_clone.lock().await.recv().await.unwrap().0.data, t.data);
+    }
+
+    /// A rejected re-attach touches nothing: a stateful middle stage that keeps
+    /// its downstream is refused, and the old (dead) streams are still the ones
+    /// in place.
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejected_reattach_leaves_the_engine_untouched() {
+        let mut e = stub_engine(false, false, false); // stateful middle
+        let down_clone = e.downstream.clone().unwrap();
+        e.position = 7;
+        let (up_near, _up_far) = tokio::io::duplex(1 << 16);
+        assert!(matches!(
+            e.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+                Some(Box::new(up_near)),
+                None,
+            )),
+            Err(EngineError::PeerRejected(_))
+        ));
+        assert_eq!(e.position, 7, "no reset on a rejected re-attach");
+        // The downstream is still the dead original (its far end was dropped).
+        assert!(down_clone
+            .lock()
+            .await
+            .send(&encode_wire_lead(1, None))
+            .await
+            .is_err());
+    }
+
+    /// Issue #76 R4 item 3 (late control acks): RESTORE/ABORT/CAPTURE acks
+    /// carry no epoch, so a late ack on a kept link can be read by a later
+    /// control wait. What keeps that from ever reaching the client is that the
+    /// token wait REJECTS an I8 control frame instead of skipping it: the turn's
+    /// own control ack always precedes its token in the stream, so a turn that
+    /// consumed a stale verdict fails before it emits anything. Pin it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn token_wait_rejects_a_control_ack_ahead_of_the_token() {
+        let (near, far) = tokio::io::duplex(1 << 16);
+        let client = Arc::new(tokio::sync::Mutex::new(ActivationClient::from_stream(
+            Box::new(near),
+        )));
+        let mut peer = ActivationServer::from_stream(Box::new(far));
+        // A late RESTORE_ACK (opcode 4, verdict 1), then the real token.
+        let ack = WireTensor::new(WireDType::I8, [1, 1, 2], vec![4, 1]);
+        peer.send(&ack).await.unwrap();
+        peer.send(&encode_token_with_seq(5, 3)).await.unwrap();
+        match recv_token_seq_checked(&client, 3, false).await {
+            Err(TokenWaitFailure::Other(_)) => {}
+            Err(TokenWaitFailure::TimedOut(e)) => panic!("expected a hard reject, got timeout {e}"),
+            Ok(tok) => panic!("a control ack was skipped and token {tok} accepted"),
+        }
+    }
+
+    // ---- warm-restore residue: cold clears rebuild after a restore ----
+
+    /// Records which clear `clear_ov_state` chose; `fail_recreate` makes the rebuild fail.
+    #[derive(Default)]
+    struct FakeClear {
+        resets: u32,
+        recreates: u32,
+        fail_recreate: bool,
+    }
+
+    impl OvStateClear for FakeClear {
+        fn reset_state(&mut self) -> Result<(), OvError> {
+            self.resets += 1;
+            Ok(())
+        }
+        fn recreate_request(&mut self) -> Result<(), OvError> {
+            self.recreates += 1;
+            if self.fail_recreate {
+                Err(OvError::Native("recreate failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn undoing_a_restore_rebuilds_once_then_the_next_clear_is_cheap() {
+        let mut rt = FakeClear::default();
+        let mut restored = true;
+        scrub_restore_now(&mut rt, &mut restored).unwrap();
+        assert_eq!((rt.resets, rt.recreates), (0, 1));
+        assert!(!restored, "a successful rebuild has nothing left to scrub");
+        clear_ov_state(&mut rt, &mut restored).unwrap();
+        assert_eq!(
+            (rt.resets, rt.recreates),
+            (1, 1),
+            "the next cold clear must not rebuild a second time"
+        );
+        // Flag clear on entry (abort before any flag was set): still rebuilds.
+        let mut restored = false;
+        scrub_restore_now(&mut rt, &mut restored).unwrap();
+        assert_eq!(rt.recreates, 2);
+        assert!(!restored);
+    }
+
+    #[test]
+    fn a_failed_undo_keeps_the_rebuild_for_the_next_clear() {
+        let mut rt = FakeClear {
+            fail_recreate: true,
+            ..Default::default()
+        };
+        let mut restored = false;
+        assert!(scrub_restore_now(&mut rt, &mut restored).is_err());
+        assert!(
+            restored,
+            "a failed rebuild must be retried by the next clear"
+        );
+        rt.fail_recreate = false;
+        clear_ov_state(&mut rt, &mut restored).unwrap();
+        assert_eq!((rt.resets, rt.recreates), (0, 2));
+        assert!(!restored);
+    }
+
+    #[test]
+    fn a_cold_clear_without_a_restore_keeps_the_cheap_reset() {
+        let mut rt = FakeClear::default();
+        let mut restored = false;
+        clear_ov_state(&mut rt, &mut restored).unwrap();
+        assert_eq!((rt.resets, rt.recreates), (1, 0));
+        assert!(!restored);
+    }
+
+    #[test]
+    fn a_cold_clear_after_a_restore_rebuilds_the_request_once() {
+        let mut rt = FakeClear::default();
+        let mut restored = true;
+        clear_ov_state(&mut rt, &mut restored).unwrap();
+        assert_eq!(
+            (rt.resets, rt.recreates),
+            (0, 1),
+            "reset_state cannot scrub a restore"
+        );
+        assert!(!restored, "a successful rebuild clears the residue");
+        // The NEXT cold clear has nothing restored to scrub: back to the cheap reset.
+        clear_ov_state(&mut rt, &mut restored).unwrap();
+        assert_eq!((rt.resets, rt.recreates), (1, 1));
+    }
+
+    #[test]
+    fn a_failed_rebuild_is_retried_not_downgraded() {
+        let mut rt = FakeClear {
+            fail_recreate: true,
+            ..Default::default()
+        };
+        let mut restored = true;
+        assert!(matches!(
+            clear_ov_state(&mut rt, &mut restored),
+            Err(EngineError::Backend(_))
+        ));
+        assert!(restored, "still dirty: the next clear must rebuild again");
+        assert_eq!(
+            rt.resets, 0,
+            "never falls back to the reset that cannot scrub it"
+        );
+        rt.fail_recreate = false;
+        clear_ov_state(&mut rt, &mut restored).unwrap();
+        assert_eq!((rt.resets, rt.recreates), (0, 2));
+        assert!(!restored);
+    }
+
+    /// Re-attach of a stateful stage goes through the same clear: with a restored state it
+    /// rebuilds, and a failed rebuild (the stub fails every OV call) is post-swap `Backend` that
+    /// keeps the flag, so the retry re-attach rebuilds again instead of resetting.
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_keeps_the_restore_flag_until_a_rebuild_succeeds() {
+        let mut e = stub_engine(false, true, false); // stateful tail
+        e.state_restored = true;
+        let (up, _far) = tokio::io::duplex(64);
+        assert!(matches!(
+            e.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+                Some(Box::new(up)),
+                None
+            )),
+            Err(EngineError::Backend(_))
+        ));
+        assert!(e.state_restored);
+    }
+
+    // ---- 1-token prompts on a stateful multi-stage chain ----
+
+    #[test]
+    fn one_token_refusal_applies_only_to_a_stateful_multi_stage_head() {
+        // (prompt_tokens, stateful, is_last_stage)
+        assert!(one_token_stateful_chain_refusal(1, true, false).is_some());
+        assert!(
+            one_token_stateful_chain_refusal(2, true, false).is_none(),
+            "longer prompt"
+        );
+        assert!(
+            one_token_stateful_chain_refusal(1, false, false).is_none(),
+            "static chain"
+        );
+        assert!(
+            one_token_stateful_chain_refusal(1, true, true).is_none(),
+            "standalone"
+        );
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    fn tiny_tokenizer() -> Tokenizer {
+        let json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+            "normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,
+            "decoder":null,"model":{"type":"WordLevel","vocab":{"hi":0},"unk_token":"[UNK]"}}"#;
+        Tokenizer::from_bytes(json.as_bytes()).expect("build tiny tokenizer")
+    }
+
+    /// M2: a re-attach may keep a downstream only while it is live.
+    #[tokio::test]
+    async fn keeping_a_dead_downstream_is_refused() {
+        let client = |s: tokio::io::DuplexStream| {
+            Some(Arc::new(tokio::sync::Mutex::new(
+                ActivationClient::from_stream(Box::new(s)),
+            )))
+        };
+        let (live, _live_far) = tokio::io::duplex(1 << 16);
+        let live = client(live);
+        assert!(check_kept_downstream_live(live.clone(), true).await.is_ok());
+        live.as_ref().unwrap().lock().await.close().await;
+        assert!(matches!(
+            check_kept_downstream_live(live.clone(), true).await,
+            Err(EngineError::PeerRejected(m)) if m.contains("kept downstream link is dead")
+        ));
+        // Replaced, or no downstream at all: nothing to check.
+        assert!(check_kept_downstream_live(live, false).await.is_ok());
+        assert!(check_kept_downstream_live(None, true).await.is_ok());
+    }
+
+    /// A cold 1-token prompt on a stateful chain's head is refused at `submit` as a client error
+    /// (`InvalidConfig`, which the API answers 400 without marking the node unhealthy), before
+    /// anything is queued. It counts the prompt exactly as `step_first` would: tokens plus resume
+    /// ids, and only when `step_first` would reach its refusal at all.
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cold_one_token_prompt_is_refused_at_submit() {
+        let mut e = stub_engine(true, false, false); // stateful head of a 2+ stage chain
+        e.tokenizer = Some(Arc::new(tiny_tokenizer()));
+        let refused = |r: EngineResult<()>| matches!(r, Err(EngineError::InvalidConfig(m)) if m.contains("1-token prompts are not supported"));
+        assert!(refused(e.submit(GenerationTask::new("t1", "hi"))));
+        // An empty prompt plus a 1-token resume prefix is 1 token too.
+        let mut resumed = GenerationTask::new("t2", "");
+        resumed.resume_token_ids = Some(vec![0]);
+        assert!(refused(e.submit(resumed)));
+        assert!(e.pending.is_empty(), "a refused task is never queued");
+
+        // Not refused here because `step_first` answers them before its refusal: an exhausted
+        // budget (Length with zero tokens) and an invalid resume id.
+        let mut exhausted = GenerationTask::new("t3", "");
+        exhausted.resume_token_ids = Some(vec![0]);
+        exhausted.max_tokens = 1;
+        e.submit(exhausted).unwrap();
+        let mut invalid = GenerationTask::new("t4", "");
+        invalid.resume_token_ids = Some(vec![-1]);
+        e.submit(invalid).unwrap();
+        // Longer prompts pass.
+        e.submit(GenerationTask::new("t5", "hi hi")).unwrap();
+        assert_eq!(e.pending.len(), 3);
+
+        // A standalone stage and a static chain's head are never refused.
+        for (is_last, static_ring) in [(true, false), (false, true)] {
+            let mut ok = stub_engine(true, is_last, static_ring);
+            ok.tokenizer = Some(Arc::new(tiny_tokenizer()));
+            ok.submit(GenerationTask::new("t6", "hi")).unwrap();
+        }
+    }
+
+    /// The step-time check stays as a backstop (unreachable through `submit`): a cold 1-token
+    /// prompt that reaches admission is a per-request error. Nothing is sent downstream (relays
+    /// would read it as a decode step on stale KV), no OV state is touched, the task never becomes
+    /// active, and the next request is admitted normally.
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cold_one_token_prompt_is_refused_on_a_stateful_chain_head() {
+        use tokio::io::AsyncReadExt;
+        let mut e = stub_engine(true, false, false); // stateful head of a 2+ stage chain
+        let (near, mut far) = tokio::io::duplex(1 << 16);
+        e.downstream = Some(Arc::new(tokio::sync::Mutex::new(
+            ActivationClient::from_stream(Box::new(near)),
+        )));
+        e.tokenizer = Some(Arc::new(tiny_tokenizer()));
+        // Bypasses `submit`, which refuses it first.
+        e.pending.push(GenerationTask::new("t1", "hi"));
+
+        let out = e
+            .step()
+            .expect("refused as this request's error, not an engine failure");
+        assert_eq!(out.len(), 1);
+        let msg = out[0].1.error.as_deref().expect("an error chunk");
+        assert!(
+            msg.contains("1-token prompts are not supported"),
+            "got {msg}"
+        );
+        assert!(e.active.is_none() && e.pending.is_empty());
+        let mut buf = [0u8; 1];
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), far.read(&mut buf))
+                .await
+                .is_err(),
+            "nothing may reach the relays"
+        );
+
+        // Still usable: a 2-token prompt passes the guard (the stub then fails at its first OV
+        // call, which is past it).
+        e.submit(GenerationTask::new("t2", "hi hi")).unwrap();
+        let refused_again = matches!(
+            e.step(),
+            Ok(v) if v.iter().any(|(_, c)| c.error.as_deref().is_some_and(|m| m.contains("1-token")))
+        );
+        assert!(!refused_again);
     }
 }

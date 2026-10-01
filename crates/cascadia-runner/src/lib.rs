@@ -11,18 +11,18 @@
 //! through a single mutex; chunks for other tasks emitted during *our*
 //! `step()` turns are buffered for their owners, and vice versa.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cascadia_engine::{Builder, Engine, EngineError, StreamLinks};
 use cascadia_types::{Chunk, FinishReason, GenerationTask, PeerLayout, ShardSpec, TaskId};
 use futures::Stream;
 use parking_lot::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// When `generate()` sees this many consecutive empty steps with no new
 /// chunks for *any* task, it returns rather than block forever on a
@@ -42,6 +42,10 @@ const RELAY_ERR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(
 /// cancels are moot anyway — but an unbounded vec on that path would grow
 /// for the life of the process.
 const MAX_DEFERRED_CANCELS: usize = 4096;
+
+/// How long [`Runner::close`] waits for the engine lock before it logs why
+/// it is still waiting (it then keeps waiting).
+const CLOSE_WARN_AFTER: Duration = Duration::from_secs(5);
 
 /// Why [`Runner::run_relay_loop`] returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,6 +152,18 @@ struct Buffers {
     /// `cancelled` tombstone set, so a queue that is somehow not being
     /// drained cannot grow without bound.
     deferred_cancels: Vec<TaskId>,
+    /// Issue #76: tasks admitted to the engine by [`Runner::generate`] /
+    /// [`Runner::generate_async`] whose stream has not been dropped yet,
+    /// whether still queued in the engine or already running. A re-attach
+    /// that may have swapped links cancels every one of them in the engine
+    /// and moves it to `orphaned` (see [`Runner::reattach`]). Removed by
+    /// the stream's `Drop` and by [`Runner::cancel`].
+    admitted: HashSet<TaskId>,
+    /// Issue #76: tasks a re-attach cancelled. The distribution pass drops
+    /// any chunk the engine still produces for them (a cancel ack, say), so
+    /// the stream ends with the re-attach error instead of new output.
+    /// Removed together with `admitted`.
+    orphaned: HashSet<TaskId>,
 }
 
 /// The engine, plus the state every release of it has to service: the
@@ -173,6 +189,22 @@ struct EngineSlot {
     /// failed `try_lock` rather than block a tokio worker here (#122).
     engine: Mutex<Option<Box<dyn Engine>>>,
     buffers: Mutex<Buffers>,
+    /// Issue #76: true while the last re-attach failed after swapping
+    /// streams, so the engine's state is unspecified until one succeeds.
+    /// Lives on the slot (not the runner) because [`ChunkStream`] reaches
+    /// the engine through the slot alone. Written ONLY while holding the
+    /// engine lock (in [`Runner::reattach`]), and every binding read is
+    /// made after acquiring it, so no holder can step or submit between a
+    /// failed swap and the fence going up.
+    fenced: AtomicBool,
+    /// Issue #76: which set of links the engine is on. Bumped (under the
+    /// engine lock, in [`Runner::reattach`]) whenever `reattach_streams` ran
+    /// and did not return `PeerRejected`, i.e. whenever a swap may have
+    /// happened. A [`ChunkStream`] records it at submit and fails once it
+    /// moves: the engine reset its session state with the swap, so a request
+    /// in flight across it can never finish. Same locking discipline as
+    /// `fenced`.
+    attach_epoch: AtomicU64,
 }
 
 /// An engine lock that cannot be released without paying what the release
@@ -252,7 +284,21 @@ impl EngineSlot {
         Self {
             engine: Mutex::new(engine),
             buffers: Mutex::new(Buffers::default()),
+            fenced: AtomicBool::new(false),
+            attach_epoch: AtomicU64::new(0),
         }
+    }
+
+    /// Binding only when read while holding the engine lock (see
+    /// [`EngineSlot::fenced`]).
+    fn is_fenced(&self) -> bool {
+        self.fenced.load(Ordering::SeqCst)
+    }
+
+    /// Binding only when read while holding the engine lock (see
+    /// [`EngineSlot::attach_epoch`]).
+    fn attach_epoch(&self) -> u64 {
+        self.attach_epoch.load(Ordering::SeqCst)
     }
 
     /// Take the engine lock, blocking the calling thread until it is free.
@@ -261,6 +307,22 @@ impl EngineSlot {
         EngineGuard {
             slot: self,
             guard: Some(self.engine.lock()),
+        }
+    }
+
+    /// [`lock`](Self::lock), but call `on_slow` once if the lock is still
+    /// held after `after`, then keep waiting.
+    fn lock_noting_delay(&self, after: Duration, on_slow: impl FnOnce()) -> EngineGuard<'_> {
+        let guard = match self.engine.try_lock_for(after) {
+            Some(g) => g,
+            None => {
+                on_slow();
+                self.engine.lock()
+            }
+        };
+        EngineGuard {
+            slot: self,
+            guard: Some(guard),
         }
     }
 
@@ -338,6 +400,72 @@ impl EngineSlot {
     }
 }
 
+/// Issue #76: stream-mode link bookkeeping. `generation` bumps on every
+/// re-attach that reached the engine (success, failure or rejection); the relay loop
+/// parks until it changes. `closed` is set by `close()` under this mutex so a
+/// parked relay cannot miss it. The failed-re-attach fence itself lives on
+/// [`EngineSlot::fenced`].
+#[derive(Default)]
+struct LinkState {
+    generation: u64,
+    closed: bool,
+}
+
+/// `parking_lot`, not `std::sync`: like the engine slot, it must not poison.
+/// Lock order: engine slot → `state`, never the reverse.
+#[derive(Default)]
+struct Link {
+    state: Mutex<LinkState>,
+    cv: parking_lot::Condvar,
+    /// Test-only hook around the relay loop's unlocked fence pre-check; see
+    /// [`Link::hooked_fence_read`].
+    #[cfg(test)]
+    precheck_hook: Mutex<Option<PrecheckHook>>,
+}
+
+#[cfg(test)]
+type PrecheckHook = Arc<dyn Fn(Option<bool>) + Send + Sync>;
+
+#[cfg(test)]
+impl Link {
+    /// Run the relay loop's fence pre-check `read` with the test hook around
+    /// it: called with `None` after the generation snapshot and before the
+    /// flag read, then with `Some(fenced)` after it. Lets a test pin the
+    /// interleaving "relay reads the flag while a re-attach holds it
+    /// transiently up".
+    fn hooked_fence_read(&self, read: impl FnOnce() -> bool) -> bool {
+        let hook = self.precheck_hook.lock().clone();
+        if let Some(hook) = &hook {
+            hook(None);
+        }
+        let fenced = read();
+        if let Some(hook) = &hook {
+            hook(Some(fenced));
+        }
+        fenced
+    }
+}
+
+/// Issue #76: the relay loop's "link down" warning fires once per link death,
+/// not on every wake. Keyed on the attach epoch the engine was on when the
+/// step failed: a rejected re-attach wakes the relay without changing the
+/// links, so its next fatal step is the same death and stays quiet.
+#[derive(Default)]
+struct LinkDownLog {
+    warned_at: Option<u64>,
+}
+
+impl LinkDownLog {
+    /// True the first time a dead link is seen on `epoch`.
+    fn first_for(&mut self, epoch: u64) -> bool {
+        if self.warned_at == Some(epoch) {
+            return false;
+        }
+        self.warned_at = Some(epoch);
+        true
+    }
+}
+
 pub struct Runner {
     /// Mutex so the Runner is `Sync` even with a `dyn Builder` inside;
     /// taken once during `start()` and dropped.
@@ -358,6 +486,10 @@ pub struct Runner {
     /// a dead link is recoverable via [`Runner::reattach`]; in TCP mode it is
     /// terminal, exactly as before.
     stream_mode: AtomicBool,
+    /// Issue #76: see [`Link`]. Only used in stream mode. An `Arc`, like
+    /// `slot`, so [`Runner::reattach`] can take `&self` and still hand both
+    /// to its blocking half.
+    link: Arc<Link>,
 }
 
 impl Runner {
@@ -368,7 +500,21 @@ impl Runner {
             model: Mutex::new(None),
             closing: Arc::new(AtomicBool::new(false)),
             stream_mode: AtomicBool::new(false),
+            link: Arc::new(Link::default()),
         }
+    }
+
+    /// A started runner around `engine`, without a builder.
+    #[cfg(test)]
+    fn for_test(engine: Box<dyn Engine>, stream_mode: bool) -> Arc<Self> {
+        Arc::new(Self {
+            builder: Mutex::new(None),
+            slot: Arc::new(EngineSlot::new(Some(engine))),
+            model: Mutex::new(None),
+            closing: Arc::new(AtomicBool::new(false)),
+            stream_mode: AtomicBool::new(stream_mode),
+            link: Arc::new(Link::default()),
+        })
     }
 
     /// `model` label for generation metrics; "unknown" before `start()`.
@@ -406,6 +552,24 @@ impl Runner {
     /// already-connected streams (see the contract on
     /// `cascadia_transport::InjectedStream`). Puts the runner in stream
     /// mode, which enables [`Runner::reattach`].
+    ///
+    /// In stream mode a dead link does not end [`Runner::run_relay_loop`]:
+    /// the relay parks until [`Runner::reattach`] or [`Runner::close`]. There
+    /// is no link-death event — the embedder watches its own ends of the
+    /// streams and re-attaches when one dies.
+    ///
+    /// **[`Runner::close`] is mandatory in stream mode.** A relay parked on a
+    /// dead link only returns when re-attached or closed; dropping the runner
+    /// without closing leaves its `spawn_blocking` thread parked forever, and
+    /// tokio runtime shutdown waits on it and hangs.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::NotLoaded`] if the runner was already started (the
+    /// builder is consumed by the first start); otherwise whatever the
+    /// builder's `connect_streams` / `load` / `build` returns, e.g.
+    /// [`EngineError::PeerRejected`] when `links` does not match the stage's
+    /// shape.
     pub async fn start_with_streams(
         &self,
         links: StreamLinks,
@@ -414,9 +578,11 @@ impl Runner {
         let mut builder = self.builder.lock().take().ok_or(EngineError::NotLoaded)?;
         info!(links = ?links.shape(), "runner connect (injected streams)");
         builder.connect_streams(links).await?;
-        self.load_build_warmup(builder, shard).await?;
+        // Before `load_build_warmup` places the engine in the slot: anything
+        // that can reach a live engine must already see stream mode (a relay
+        // loop started on it reads the flag once, at entry).
         self.stream_mode.store(true, Ordering::SeqCst);
-        Ok(())
+        self.load_build_warmup(builder, shard).await
     }
 
     async fn load_build_warmup(
@@ -469,7 +635,20 @@ impl Runner {
     ///
     /// Refuses (as a benign no-op `Ok(())`) any task whose id already carries
     /// a `cancelled` tombstone — see the comment in the lock region below.
+    ///
+    /// A task submitted this way has no stream, so a re-attach does not
+    /// cancel it (only [`Runner::generate`] / [`Runner::generate_async`]
+    /// tasks are tracked); cancel it yourself if it must not outlive one.
     pub fn submit(&self, task: GenerationTask) -> Result<(), EngineError> {
+        self.submit_at_epoch(task, false).map(|_| ())
+    }
+
+    /// [`Runner::submit`], also returning the attach epoch read under the
+    /// same engine lock that admitted the task (see
+    /// [`EngineSlot::attach_epoch`]); the task's [`ChunkStream`] records it.
+    /// With `track`, an admitted task is recorded in [`Buffers::admitted`]
+    /// under that lock, so a later re-attach can cancel it.
+    fn submit_at_epoch(&self, task: GenerationTask, track: bool) -> Result<u64, EngineError> {
         // NOTE: the lock below is a hard `lock()`, not a `try_lock()` — this
         // is the one engine-lock caller that must not give up, since there is
         // nowhere to park a submit. A tokio worker thread blocked here counts
@@ -483,6 +662,7 @@ impl Runner {
         // while the engine was busy, freeing their slots before this task
         // asks for one.
         let mut guard = self.slot.lock_applying_cancels();
+        let epoch = self.slot.attach_epoch();
         // ==== BEGIN cancellation-safety check — keep INSIDE the lock ====
         // NEVER hand the engine a task that is already tombstoned
         // cancelled. `generate_async` arms a cancel guard BEFORE it
@@ -506,12 +686,23 @@ impl Runner {
         // is an arm of this expression rather than an early `return`, so
         // the guard is still live and still owes — and on drop pays — the
         // drain + wake every engine-lock release owes its parked streams.
-        if self.slot.buffers.lock().cancelled.contains(&task.task_id) {
-            Ok(())
+        if self.is_fenced() {
+            // Issue #76: last re-attach failed after swapping streams; the
+            // engine's state is unspecified until a re-attach succeeds.
+            Err(EngineError::NotConnected)
+        } else if self.slot.buffers.lock().cancelled.contains(&task.task_id) {
+            Ok(epoch)
         } else {
             // ==== END; the branch below is the original submit path ====
             match guard.engine() {
-                Some(engine) => engine.submit(task),
+                Some(engine) => {
+                    let task_id = task.task_id.clone();
+                    engine.submit(task)?;
+                    if track {
+                        self.slot.buffers.lock().admitted.insert(task_id);
+                    }
+                    Ok(epoch)
+                }
                 None => Err(EngineError::NotLoaded),
             }
         }
@@ -529,6 +720,8 @@ impl Runner {
             let mut bufs = self.slot.buffers.lock();
             bufs.cancelled.insert(task_id.clone());
             bufs.chunks.remove(task_id);
+            bufs.admitted.remove(task_id);
+            bufs.orphaned.remove(task_id);
         }
         self.slot.cancel_or_defer(task_id);
     }
@@ -541,9 +734,16 @@ impl Runner {
     /// **Blocks the calling thread** for up to a full engine step: the submit
     /// runs inline via [`Runner::submit`], and only the returned stream is
     /// async. Async contexts must use [`Runner::generate_async`] instead.
+    ///
+    /// **Task ids must be unique** among live requests (here and in
+    /// [`Runner::generate_async`]). Chunks are routed by id: after a
+    /// re-attach the dropped requests' ids stay marked orphaned until their
+    /// streams are dropped, and a new task reusing such an id meanwhile gets
+    /// none of its output (its chunks are discarded). A cancelled id is
+    /// refused outright (see [`Runner::submit`]).
     pub fn generate(&self, task: GenerationTask) -> Result<ChunkStream, EngineError> {
-        self.submit(task.clone())?;
-        Ok(self.stream_for(task.task_id))
+        let epoch = self.submit_at_epoch(task.clone(), true)?;
+        Ok(self.stream_for(task.task_id, epoch))
     }
 
     /// Async [`Runner::generate`]: submits off the runtime via
@@ -585,8 +785,8 @@ impl Runner {
             armed: true,
         };
         let this = self.clone();
-        let joined = tokio::task::spawn_blocking(move || this.submit(task)).await;
-        match joined {
+        let joined = tokio::task::spawn_blocking(move || this.submit_at_epoch(task, true)).await;
+        let epoch = match joined {
             // The engine rejected the task (QueueFull, NotLoaded, …). Per the
             // `Engine::submit` contract nothing was enqueued, so there is
             // nothing to cancel — disarm rather than write a tombstone for a
@@ -601,18 +801,19 @@ impl Runner {
             // let it cancel — cancelling an id the engine never admitted is a
             // documented no-op for every `Engine` impl.
             Err(e) => return Err(EngineError::Backend(format!("submit task join: {e}"))),
-            Ok(Ok(())) => {}
-        }
+            Ok(Ok(epoch)) => epoch,
+        };
         // The task now has an owner: from here its `Drop` handles cancellation.
-        let stream = self.stream_for(task_id);
+        let stream = self.stream_for(task_id, epoch);
         guard.disarm();
         Ok(stream)
     }
 
-    fn stream_for(&self, task_id: TaskId) -> ChunkStream {
+    fn stream_for(&self, task_id: TaskId, epoch: u64) -> ChunkStream {
         ChunkStream {
             task_id,
             slot: self.slot.clone(),
+            epoch,
             consecutive_empty: 0,
             last_errored_task: None,
             consecutive_foreign_err: 0,
@@ -623,6 +824,191 @@ impl Runner {
             metrics_finalized: false,
             closing: self.closing.clone(),
         }
+    }
+
+    /// Issue #76: replace this stage's dead link(s) on the live engine. A
+    /// `None` link (or `None` / absent `ep_workers` entry) keeps that link.
+    /// Stream mode only.
+    ///
+    /// # Before calling
+    ///
+    /// * **Close your own end of every stream being replaced first**
+    ///   (contract item 3 on `cascadia_transport::InjectedStream`). The step
+    ///   that is blocked on a dead link holds the engine lock this call needs;
+    ///   only closing that stream makes the step return and frees the lock.
+    /// * **Relay rule:** a stage that has an upstream link must replace it on
+    ///   every re-attach (an idle relay's step blocks on its upstream read
+    ///   while holding the engine lock, and only closing that stream frees
+    ///   it). Any re-attach therefore cascades to the head, which refreshes
+    ///   the head's session state. `check_reattach_streams` enforces this.
+    /// * There is no link-death event: the embedder detects a dead link by
+    ///   watching its own ends.
+    /// * Issue one re-attach per outage, for all its links at once.
+    ///   Concurrent or duplicate re-attaches for the same outage are an
+    ///   embedder bug: the second one swaps out the links the first just
+    ///   installed. (Retrying after a dropped call is fine; see
+    ///   *Cancellation*.)
+    ///
+    /// # In-flight requests
+    ///
+    /// Requests on the head when its links are swapped cannot finish (the
+    /// engine resets its session state). That covers every request submitted
+    /// before the re-attach through [`Runner::generate`] /
+    /// [`Runner::generate_async`], whether it was already running or still
+    /// queued in the engine: each is cancelled in the engine, and its stream
+    /// ends, without emitting anything new, with an error chunk carrying
+    /// [`EngineError::NotConnected`] and "link re-attached; in-flight request
+    /// dropped" (chunks it buffered before the swap are delivered first).
+    /// Resubmit them. A task given to [`Runner::submit`] directly has no
+    /// stream and is not tracked.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future before its blocking half has taken the engine
+    /// lock cancels the re-attach: nothing is swapped, fenced or bumped.
+    /// Once the lock is taken, the re-attach completes even if the future is
+    /// dropped: its result is lost, but it is still counted and logged.
+    /// A caller that gave up (a `timeout` around this call, say) can simply
+    /// call `reattach` again with fresh streams, after closing its ends of
+    /// the streams it handed to the dropped call: if that call did swap, the
+    /// retry replaces those links the same way any re-attach does, and if it
+    /// did not, the retry is the only one. Either way the result is one
+    /// completed re-attach on the retry's streams.
+    ///
+    /// # Errors
+    ///
+    /// * [`EngineError::PeerRejected`]: validation failed and nothing was
+    ///   swapped; the old links are intact. Returned for a runner not in
+    ///   stream mode (TCP), for a shape the stage does not have, and for a
+    ///   relay keeping its upstream (relay rule).
+    /// * [`EngineError::NotLoaded`]: the runner was never started, or was
+    ///   closed.
+    /// * Any other error: streams may have been swapped and the engine's
+    ///   state is unspecified, so the runner is fenced — `submit` and open
+    ///   streams fail with [`EngineError::NotConnected`] and a relay parks —
+    ///   until a re-attach succeeds. Retry with fresh streams for every link
+    ///   this call replaced.
+    pub async fn reattach(&self, links: StreamLinks) -> Result<(), EngineError> {
+        if !self.stream_mode.load(Ordering::SeqCst) {
+            return Err(EngineError::PeerRejected(
+                "reattach requires a runner started with start_with_streams".into(),
+            ));
+        }
+        let replaced = links.shape();
+        // Cancel safety: set when this future is dropped. The blocking half
+        // checks it right after taking the slot lock, so a caller that gave
+        // up while it was still waiting never swaps anything.
+        let abort = Arc::new(AtomicBool::new(false));
+        let _abort_on_drop = AbortOnDrop(abort.clone());
+        let (slot, link) = (self.slot.clone(), self.link.clone());
+        // The "link re-attached" / failure logs are emitted from the blocking
+        // half (so a dropped-but-completed call still logs); carry the
+        // caller's span AND subscriber over so they keep its context (a
+        // blocking-pool thread only sees the global subscriber otherwise, so a
+        // caller with a scoped one would lose them).
+        let span = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+        tokio::task::spawn_blocking(move || {
+            let _dispatch = tracing::dispatcher::set_default(&dispatch);
+            let _span = span.enter();
+            let _blocking = BlockingContextGuard::enter();
+            let mut guard = slot.lock_applying_cancels();
+            if abort.load(Ordering::SeqCst) {
+                // Nobody is waiting for this result.
+                return Err(EngineError::NotConnected);
+            }
+            let Some(engine) = guard.engine() else {
+                return Err(EngineError::NotLoaded);
+            };
+            // Fence and bump the epoch BEFORE the call, still under the
+            // engine lock: if `reattach_streams` panics mid-swap, unwinding
+            // drops the guard with the fence up and the epoch moved, so no
+            // holder can step or submit against a half-swapped engine (the
+            // join error surfaces as Backend) and no older stream survives.
+            let was_fenced = slot.fenced.swap(true, Ordering::SeqCst);
+            let prev_epoch = slot.attach_epoch.fetch_add(1, Ordering::SeqCst);
+            let result = engine.reattach_streams(links);
+            if matches!(result, Err(EngineError::PeerRejected(_))) {
+                // Validation failure: nothing was swapped; fence and epoch
+                // go back to their previous values. Every epoch read holds
+                // the engine lock, so its transient bump was never seen. The
+                // flag was transiently up, though, and a relay's unlocked
+                // pre-check may have read it and parked: bump the generation
+                // (still under the slot lock, order slot → link) so that
+                // relay re-checks. A spurious wake is harmless.
+                slot.fenced.store(was_fenced, Ordering::SeqCst);
+                slot.attach_epoch.store(prev_epoch, Ordering::SeqCst);
+                let mut st = link.state.lock();
+                st.generation += 1;
+                link.cv.notify_all();
+                return result;
+            }
+            // Every task admitted before this call ran on the old links and
+            // the engine's old session, so none of them can finish: cancel
+            // each in the engine now, still under its lock, so no later step
+            // admits a queued one, and mark them orphaned so their streams
+            // fail with the re-attach error instead of emitting anything new.
+            let stale: Vec<TaskId> = {
+                let mut bufs = slot.buffers.lock();
+                let stale: Vec<TaskId> = bufs.admitted.drain().collect();
+                bufs.orphaned.extend(stale.iter().cloned());
+                stale
+            };
+            for tid in &stale {
+                engine.cancel(tid);
+            }
+            // Fence (or unfence) while still holding the engine lock: every
+            // other engine holder reads the flag after acquiring that lock,
+            // so none can step or submit against a half-reset engine.
+            slot.fenced.store(result.is_err(), Ordering::SeqCst);
+            // Still under the slot lock (order: slot → link).
+            let generation = {
+                let mut st = link.state.lock();
+                st.generation += 1;
+                link.cv.notify_all();
+                st.generation
+            };
+            // Metric and logs here, not after the await: once the lock was
+            // taken this re-attach completes even if the caller dropped the
+            // future, and it must still be counted and logged.
+            match &result {
+                Ok(()) => {
+                    let counts = [
+                        ("upstream", u64::from(replaced.upstream)),
+                        ("downstream", u64::from(replaced.downstream)),
+                        ("ep_driver", u64::from(replaced.ep_driver)),
+                        ("ep_worker", replaced.ep_workers as u64),
+                    ];
+                    for (side, n) in counts {
+                        if n > 0 {
+                            cascadia_metrics::LINK_REATTACH_TOTAL
+                                .with_label_values(&[side])
+                                .inc_by(n);
+                        }
+                    }
+                    info!(generation, links = ?replaced, dropped_requests = stale.len(), "link re-attached");
+                }
+                Err(e) => {
+                    warn!(error = %e, "re-attach failed after swapping streams; engine fenced until a successful re-attach");
+                }
+            }
+            result
+        })
+        .await
+        .map_err(|e| EngineError::Backend(format!("reattach join: {e}")))?
+    }
+
+    /// Park until the link generation moves past `snap` or the runner closes.
+    fn wait_for_link_change(&self, snap: u64) {
+        let mut st = self.link.state.lock();
+        while st.generation == snap && !st.closed {
+            self.link.cv.wait(&mut st);
+        }
+    }
+
+    /// See [`EngineSlot::is_fenced`].
+    fn is_fenced(&self) -> bool {
+        self.slot.is_fenced()
     }
 
     /// Step the engine forever; exits when the engine slot empties (clean
@@ -640,13 +1026,49 @@ impl Runner {
     /// `RELAY_ERR_BACKOFF` so it can't peg a core; the backoff resets on
     /// any non-empty `Ok` step. Engines MAY additionally self-throttle.
     ///
+    /// In stream mode (issue #76) a connection-fatal step does not exit: the
+    /// loop parks until [`Runner::reattach`] or [`Runner::close`].
+    ///
     /// Enters a `BlockingContextGuard` once per OS thread (since this
     /// loop runs on a single `spawn_blocking` thread) so that engines'
     /// `run_async` calls hit the naked-`block_on` path instead of
     /// `block_in_place` — ~60 ms/frame savings on Windows.
     pub fn run_relay_loop(&self) -> RelayExit {
         let _blocking = BlockingContextGuard::enter();
+        let stream_mode = self.stream_mode.load(Ordering::SeqCst);
+        let mut link_down = LinkDownLog::default();
         loop {
+            // Stream mode: snapshot the link generation BEFORE stepping, so a
+            // re-attach that lands between a fatal step and the wait below is
+            // never lost. The fenced check here only avoids a needless lock;
+            // the binding check is under the slot lock below.
+            let snap = if stream_mode {
+                let st = self.link.state.lock();
+                if st.closed {
+                    info!("relay loop exited: runner closed");
+                    return RelayExit::SlotEmpty;
+                }
+                let generation = st.generation;
+                drop(st);
+                // Generation is read before the flag. Invariant: every path
+                // that changes or transiently sets the flag bumps the
+                // generation under the link mutex before releasing the slot
+                // lock — so whatever flag value this read observes, the
+                // generation has moved past `generation` by the time the
+                // re-attach is over, and the wait returns.
+                // Tests hook this read to pin the interleaving with a re-attach.
+                #[cfg(test)]
+                let fenced = self.link.hooked_fence_read(|| self.is_fenced());
+                #[cfg(not(test))]
+                let fenced = self.is_fenced();
+                if fenced {
+                    self.wait_for_link_change(generation);
+                    continue;
+                }
+                generation
+            } else {
+                0
+            };
             // Through the guard like every other holder: a relay-stage
             // runner serves no streams today, so it has nothing to wake —
             // but a runner that both relays and generates would strand
@@ -655,6 +1077,11 @@ impl Runner {
             // drains a relay-stage runner's deferred cancels: nobody polls a
             // stream here, so without this round the queue only grows.
             let mut guard = self.slot.lock_applying_cancels();
+            if stream_mode && self.is_fenced() {
+                drop(guard);
+                self.wait_for_link_change(snap);
+                continue;
+            }
             let Some(engine) = guard.engine() else {
                 drop(guard);
                 info!("relay loop exited: engine slot empty");
@@ -663,12 +1090,24 @@ impl Runner {
             // Engine.step is sync; just drain. A non-fatal Err is logged
             // but the loop keeps driving — relay engines recover their own
             // state and a transient frame error must not take the stage
-            // down. A connection-fatal Err is unrecoverable in-process, so
-            // bail and let the supervisor rebuild us.
+            // down. A connection-fatal Err is unrecoverable in-process in
+            // TCP mode, so bail and let the supervisor rebuild us; in
+            // stream mode park until the embedder re-attaches (or closes).
             let failed = match engine.step() {
                 Ok(_) => false,
                 Err(e) if e.is_connection_fatal() => {
+                    // Read under the engine lock, like every epoch read.
+                    let epoch = self.slot.attach_epoch();
                     drop(guard);
+                    if stream_mode {
+                        if link_down.first_for(epoch) {
+                            warn!(error = %e, "relay step hit a dead peer link; waiting for re-attach");
+                        } else {
+                            debug!(error = %e, "relay step still on a dead peer link; waiting for re-attach");
+                        }
+                        self.wait_for_link_change(snap);
+                        continue;
+                    }
                     warn!(error = %e, "relay step hit a dead peer link; exiting for supervisor rebuild");
                     return RelayExit::ConnectionFatal;
                 }
@@ -691,12 +1130,34 @@ impl Runner {
         }
     }
 
+    /// Tear the engine down. Later calls fail with [`EngineError::NotLoaded`];
+    /// in-flight streams end with a "server is shutting down" error chunk.
+    ///
+    /// Mandatory in stream mode (issue #76): it is the only thing besides
+    /// [`Runner::reattach`] that wakes a relay parked on a dead link, so
+    /// skipping it leaves that `spawn_blocking` thread parked forever and
+    /// tokio runtime shutdown hangs waiting for it.
+    ///
+    /// Blocks until no step holds the engine. A step blocked on a link read
+    /// (an idle relay waiting on its upstream) holds it until that link
+    /// delivers, dies or hits the frame idle ceiling; with injected streams,
+    /// close your ends of them first so `close` returns at once. After
+    /// 5 s (`CLOSE_WARN_AFTER`) of waiting it logs one warning naming that cause,
+    /// then keeps waiting.
     pub fn close(&self) {
         // BEFORE the slot empties, so no in-flight stream can observe a gone
         // engine without also seeing that this is a shutdown. Ordering is the
         // whole point: set it after, and a stream that polls in between books
         // a client cancellation for a server restart.
         self.closing.store(true, Ordering::SeqCst);
+        // Issue #76: wake a stream-mode relay parked on a dead link. Done
+        // under the link mutex (its predicate reads `closed`), and before the
+        // slot lock, never while holding it in the reverse order.
+        {
+            let mut st = self.link.state.lock();
+            st.closed = true;
+            self.link.cv.notify_all();
+        }
         {
             // Tear down and empty the slot under ONE guard, where this used
             // to take the lock twice. Releasing in between now means waking,
@@ -706,7 +1167,21 @@ impl Runner {
             // window; the single release still wakes the streams parked on
             // contention, which must re-poll to observe the emptied slot or
             // a teardown would strand them Pending forever.
-            let mut guard = self.slot.lock();
+            //
+            // The lock can be held by a step blocked on a link read (an idle
+            // relay waits on its upstream for the next frame), which only
+            // returns when that link delivers, dies, or hits the frame idle
+            // ceiling. Say so once if it takes a while, then keep waiting.
+            let mut guard = self.slot.lock_noting_delay(CLOSE_WARN_AFTER, || {
+                warn!(
+                    waited_secs = CLOSE_WARN_AFTER.as_secs(),
+                    "close() is still waiting for the engine lock: a step is blocked on a \
+                     peer link (an idle relay waits on its upstream for the next frame). \
+                     It returns when that link delivers or dies, or at the frame idle \
+                     ceiling (CASCADIA_FRAME_IDLE_CEILING_SECS, default 900 s); with \
+                     injected streams, close your ends of them to release it now"
+                );
+            });
             if let Some(engine) = guard.engine() {
                 engine.close();
             }
@@ -756,6 +1231,17 @@ impl Drop for SubmitCancelGuard {
     }
 }
 
+/// Sets its flag on drop: [`Runner::reattach`]'s "my caller is gone" signal
+/// to its detached blocking half. Also set on normal completion, when the
+/// blocking half has already finished and no longer reads it.
+struct AbortOnDrop(Arc<AtomicBool>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 pub struct ChunkStream {
     task_id: TaskId,
     /// The engine slot, shared with the [`Runner`] that made this stream and
@@ -764,6 +1250,10 @@ pub struct ChunkStream {
     /// same [`EngineGuard`] every other holder uses and cannot re-implement
     /// the release protocol by hand.
     slot: Arc<EngineSlot>,
+    /// Issue #76: the [`EngineSlot::attach_epoch`] the task was admitted
+    /// under. A different value at a later poll means the links were swapped
+    /// (and the engine's session reset) under this request.
+    epoch: u64,
     consecutive_empty: usize,
     /// Foreign-task hot-spin guard: the last foreign task-id an engine `step()`
     /// failed, and how many times in a row it has failed *that same* id. A
@@ -942,6 +1432,14 @@ impl ChunkStream {
     }
 }
 
+/// Why [`ChunkStream::poll_next`]'s step round produced no chunks.
+enum StepFail {
+    /// The engine's `step()` (or the fence) failed.
+    Engine(EngineError),
+    /// The links were re-attached since this stream's task was admitted.
+    Orphaned,
+}
+
 impl Stream for ChunkStream {
     type Item = Chunk;
 
@@ -1025,6 +1523,18 @@ impl Stream for ChunkStream {
                     }
                 };
                 let result = match guard.engine() {
+                    // Issue #76: the links were swapped since this task was
+                    // admitted, so the engine reset the session it ran in.
+                    // Read under the engine lock; fail without stepping.
+                    Some(_) if this.slot.attach_epoch() != this.epoch => {
+                        Some(Err(StepFail::Orphaned))
+                    }
+                    // Issue #76: a failed post-swap re-attach fenced the
+                    // engine. Read under the engine lock; end this stream
+                    // through the own-task error path without stepping.
+                    Some(_) if this.slot.is_fenced() => {
+                        Some(Err(StepFail::Engine(EngineError::NotConnected)))
+                    }
                     // Slot empty: `Runner::close` took the engine, i.e. server
                     // teardown. Handled below rather than here because
                     // `fail_teardown` needs `&mut *this` and this guard still
@@ -1035,14 +1545,16 @@ impl Stream for ChunkStream {
                             let empty = produced.is_empty();
                             let mut bufs = this.slot.buffers.lock();
                             for (tid, chunk) in produced {
-                                if bufs.cancelled.contains(&tid) {
+                                // Issue #76: an orphaned task's stream ends
+                                // with the re-attach error, never new output.
+                                if bufs.cancelled.contains(&tid) || bufs.orphaned.contains(&tid) {
                                     continue;
                                 }
                                 bufs.chunks.entry(tid).or_default().push_back(chunk);
                             }
                             Ok(empty)
                         }
-                        Err(e) => Err(e),
+                        Err(e) => Err(StepFail::Engine(e)),
                     }),
                 };
                 // Releasing the guard is what drains + wakes every stream
@@ -1056,7 +1568,17 @@ impl Stream for ChunkStream {
             };
             let produced_empty = match step_result {
                 Ok(empty) => empty,
-                Err(e) => match e.task_id() {
+                Err(StepFail::Orphaned) => {
+                    warn!(
+                        task = %this.task_id,
+                        "link re-attached under an in-flight request; failing its stream"
+                    );
+                    return this.fail_stream(format!(
+                        "link re-attached; in-flight request dropped ({})",
+                        EngineError::NotConnected
+                    ));
+                }
+                Err(StepFail::Engine(e)) => match e.task_id() {
                     Some(failed) if failed != &this.task_id => {
                         // Misattribution guard: fail the named task's stream,
                         // not ours. Route the failure as a final error chunk
@@ -1077,7 +1599,10 @@ impl Stream for ChunkStream {
                         // Cancelled task = no consumer left; recreating its
                         // buffer entry would leak until close() (mirror the
                         // cancelled-check on the distribution path below).
-                        if !bufs.cancelled.contains(&failed) {
+                        // Issue #76: an orphaned task's stream ends with the
+                        // re-attach error (its own poll checks the epoch
+                        // before anything else), never a routed engine error.
+                        if !bufs.cancelled.contains(&failed) && !bufs.orphaned.contains(&failed) {
                             let buf = bufs.chunks.entry(failed.clone()).or_default();
                             // Dedup: one error chunk max. If the buffer
                             // already ends in a NORMAL final chunk the task
@@ -1198,6 +1723,8 @@ impl Drop for ChunkStream {
         self.slot.cancel_or_defer(&self.task_id);
         let mut bufs = self.slot.buffers.lock();
         bufs.chunks.remove(&self.task_id);
+        bufs.admitted.remove(&self.task_id);
+        bufs.orphaned.remove(&self.task_id);
         // Tombstone rather than remove: an engine that defers its final
         // chunk past cancel would re-buffer it for this dead stream via
         // another caller's distribution pass, leaking the map entry until
@@ -1360,13 +1887,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let engine: Box<dyn Engine> = Box::new(CountingFailingEngine(calls.clone()));
-        let runner = Arc::new(Runner {
-            builder: Mutex::new(None),
-            slot: Arc::new(EngineSlot::new(Some(engine))),
-            model: Mutex::new(None),
-            closing: Arc::new(AtomicBool::new(false)),
-            stream_mode: AtomicBool::new(false),
-        });
+        let runner = Runner::for_test(engine, false);
 
         // Drive the relay loop on a worker thread, let it run for a window
         // several backoffs wide, then empty the engine slot to stop it.
@@ -1412,13 +1933,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let engine: Box<dyn Engine> = Box::new(DeadLinkEngine(calls.clone()));
-        let runner = Arc::new(Runner {
-            builder: Mutex::new(None),
-            slot: Arc::new(EngineSlot::new(Some(engine))),
-            model: Mutex::new(None),
-            closing: Arc::new(AtomicBool::new(false)),
-            stream_mode: AtomicBool::new(false),
-        });
+        let runner = Runner::for_test(engine, false);
 
         // No external stop: the loop must terminate on its own. A timed join
         // guards against a regression that lets it spin forever.
@@ -1461,13 +1976,7 @@ mod tests {
         // treated as connection-fatal by the relay loop.
         for msg in ["connection reset by peer", "recv_exact timed out after 60s"] {
             let engine: Box<dyn Engine> = Box::new(RstStepEngine(EngineError::Backend(msg.into())));
-            let runner = Arc::new(Runner {
-                builder: Mutex::new(None),
-                slot: Arc::new(EngineSlot::new(Some(engine))),
-                model: Mutex::new(None),
-                closing: Arc::new(AtomicBool::new(false)),
-                stream_mode: AtomicBool::new(false),
-            });
+            let runner = Runner::for_test(engine, false);
             let driver = runner.clone();
             let handle = std::thread::spawn(move || driver.run_relay_loop());
             let start = std::time::Instant::now();
@@ -3378,5 +3887,928 @@ mod tests {
             .unwrap();
         assert_eq!(*log.lock(), vec!["tcp"]);
         assert!(!runner.stream_mode.load(Ordering::SeqCst));
+    }
+
+    use std::sync::atomic::AtomicBool as Flag;
+
+    /// Engine whose link is dead while `dead` is set. `reattach_streams`
+    /// revives it, or fails with Backend when `fail_reattach` is set.
+    struct LinkEngine {
+        dead: Arc<Flag>,
+        fail_reattach: Arc<Flag>,
+        panic_reattach: Arc<Flag>,
+        steps: Arc<std::sync::atomic::AtomicUsize>,
+        submits: Arc<std::sync::atomic::AtomicUsize>,
+        reattaches: Arc<std::sync::atomic::AtomicUsize>,
+        /// Signals each step (capacity 1, dropped when full), so a test can
+        /// wait for a step, or for its absence, instead of sleeping.
+        stepped: std::sync::mpsc::SyncSender<()>,
+    }
+
+    impl Engine for LinkEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _task: GenerationTask) -> Result<(), EngineError> {
+            self.submits.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            self.steps.fetch_add(1, Ordering::SeqCst);
+            let _ = self.stepped.try_send(());
+            if self.dead.load(Ordering::SeqCst) {
+                Err(EngineError::Backend("socket closed during recv".into()))
+            } else {
+                Ok(vec![])
+            }
+        }
+        fn reattach_streams(
+            &mut self,
+            links: cascadia_engine::StreamLinks,
+        ) -> Result<(), EngineError> {
+            self.reattaches.fetch_add(1, Ordering::SeqCst);
+            cascadia_engine::check_reattach_streams(
+                cascadia_engine::LinkShape::pipeline(true, true),
+                &links,
+            )?;
+            if self.panic_reattach.load(Ordering::SeqCst) {
+                panic!("reattach_streams panicked mid-swap");
+            }
+            if self.fail_reattach.load(Ordering::SeqCst) {
+                return Err(EngineError::Backend("reset failed".into()));
+            }
+            self.dead.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct LinkHarness {
+        runner: Arc<Runner>,
+        dead: Arc<Flag>,
+        fail_reattach: Arc<Flag>,
+        panic_reattach: Arc<Flag>,
+        steps: Arc<std::sync::atomic::AtomicUsize>,
+        submits: Arc<std::sync::atomic::AtomicUsize>,
+        reattaches: Arc<std::sync::atomic::AtomicUsize>,
+        stepped: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl LinkHarness {
+        /// The engine steps within `STEP_WAIT`.
+        fn expect_step(&self, what: &str) {
+            self.stepped
+                .recv_timeout(STEP_WAIT)
+                .unwrap_or_else(|_| panic!("timed out: {what}"));
+        }
+
+        /// The engine does not step within `NO_STEP_WINDOW`. Drains a step
+        /// signalled earlier first, so only steps from now on count.
+        fn expect_no_step(&self, what: &str) {
+            let _ = self.stepped.try_recv();
+            assert!(self.stepped.recv_timeout(NO_STEP_WINDOW).is_err(), "{what}");
+        }
+    }
+
+    const STEP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+    /// How long "no step" is watched for. A regression (a relay that keeps
+    /// stepping) signals within microseconds, so this only bounds the cost.
+    const NO_STEP_WINDOW: std::time::Duration = std::time::Duration::from_millis(150);
+
+    fn link_runner(stream_mode: bool) -> LinkHarness {
+        let dead = Arc::new(Flag::new(false));
+        let fail_reattach = Arc::new(Flag::new(false));
+        let panic_reattach = Arc::new(Flag::new(false));
+        let steps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let submits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reattaches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (stepped_tx, stepped) = std::sync::mpsc::sync_channel(1);
+        let engine: Box<dyn Engine> = Box::new(LinkEngine {
+            stepped: stepped_tx,
+            dead: dead.clone(),
+            fail_reattach: fail_reattach.clone(),
+            panic_reattach: panic_reattach.clone(),
+            steps: steps.clone(),
+            submits: submits.clone(),
+            reattaches: reattaches.clone(),
+        });
+        let runner = Runner::for_test(engine, stream_mode);
+        LinkHarness {
+            runner,
+            dead,
+            fail_reattach,
+            panic_reattach,
+            steps,
+            submits,
+            reattaches,
+            stepped,
+        }
+    }
+
+    fn duplex_end() -> cascadia_engine::ByteStream {
+        Box::new(tokio::io::duplex(64).0)
+    }
+
+    fn up_link() -> cascadia_engine::StreamLinks {
+        cascadia_engine::StreamLinks::pipeline(Some(duplex_end()), None)
+    }
+
+    fn wait_until(what: &str, f: impl Fn() -> bool) {
+        let start = std::time::Instant::now();
+        while !f() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "timed out: {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn task(id: &str) -> GenerationTask {
+        GenerationTask::new(id, "x")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stream_mode_relay_parks_on_dead_link_and_resumes_after_reattach() {
+        let h = link_runner(true);
+        h.dead.store(true, Ordering::SeqCst);
+        let driver = h.runner.clone();
+        let loop_handle = std::thread::spawn(move || driver.run_relay_loop());
+        h.expect_step("first fatal step");
+        h.expect_no_step("a parked relay must not keep stepping");
+        assert!(
+            !loop_handle.is_finished(),
+            "stream-mode relay must park, not exit"
+        );
+        assert_eq!(h.steps.load(Ordering::SeqCst), 1);
+
+        h.runner.reattach(up_link()).await.unwrap();
+        h.expect_step("resumed stepping");
+
+        h.runner.close();
+        assert_eq!(loop_handle.join().unwrap(), RelayExit::SlotEmpty);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn close_wakes_a_parked_relay() {
+        let h = link_runner(true);
+        h.dead.store(true, Ordering::SeqCst);
+        let driver = h.runner.clone();
+        let loop_handle = std::thread::spawn(move || driver.run_relay_loop());
+        wait_until("first fatal step", || h.steps.load(Ordering::SeqCst) >= 1);
+        h.runner.close();
+        wait_until("relay exit", || loop_handle.is_finished());
+        assert_eq!(loop_handle.join().unwrap(), RelayExit::SlotEmpty);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wait_for_link_change_returns_at_once_for_a_stale_snapshot() {
+        // What makes a re-attach landing between the relay's fatal step and
+        // its park not lost: the relay waits on the generation snapshot it
+        // took BEFORE stepping, and a wait on a stale snapshot is a no-op.
+        let h = link_runner(true);
+        h.dead.store(true, Ordering::SeqCst);
+        let snap = h.runner.link.state.lock().generation;
+        h.runner.reattach(up_link()).await.unwrap();
+        // The relay's wait with the pre-reattach snapshot must return at once.
+        let r = h.runner.clone();
+        let waiter = std::thread::spawn(move || r.wait_for_link_change(snap));
+        wait_until("wait returns", || waiter.is_finished());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_rejected_in_tcp_mode_and_for_bad_shape() {
+        let h = link_runner(false);
+        assert!(matches!(
+            h.runner.reattach(up_link()).await,
+            Err(EngineError::PeerRejected(_))
+        ));
+        // TCP-mode rejection happens before the slot lock: nothing moves.
+        assert_eq!(h.runner.link.state.lock().generation, 0);
+        assert!(!h.runner.is_fenced());
+        let h = link_runner(true);
+        let gen_before = h.runner.link.state.lock().generation;
+        assert!(matches!(
+            h.runner
+                .reattach(cascadia_engine::StreamLinks::default())
+                .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+        // A shape rejection leaves the fence where it was; the generation
+        // moves (the flag was transiently up, so parked relays re-check).
+        assert!(h.runner.link.state.lock().generation > gen_before);
+        assert!(!h.runner.is_fenced());
+        // Nothing was swapped, so in-flight requests are not orphaned.
+        assert_eq!(h.runner.slot.attach_epoch(), 0);
+    }
+
+    /// Healthy relay engine whose `reattach_streams` announces itself, blocks
+    /// until released, then rejects (as the dist_spec partial-link rule does).
+    struct GatedRejectEngine {
+        steps: Arc<std::sync::atomic::AtomicUsize>,
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Engine for GatedRejectEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _task: GenerationTask) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            self.steps.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            Ok(vec![])
+        }
+        fn reattach_streams(
+            &mut self,
+            _links: cascadia_engine::StreamLinks,
+        ) -> Result<(), EngineError> {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            Err(EngineError::PeerRejected("partial re-attach".into()))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejected_reattach_wakes_a_relay_that_saw_the_transient_fence() {
+        // The relay's unlocked pre-check reads the flag while a re-attach
+        // holds it transiently up; the re-attach is then rejected. The relay
+        // parked on that read must be woken, not stranded on a live engine.
+        let steps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let engine: Box<dyn Engine> = Box::new(GatedRejectEngine {
+            steps: steps.clone(),
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let runner = Runner::for_test(engine, true);
+
+        // Hook: once armed, the next pre-check reports in, waits until the
+        // re-attach is inside `reattach_streams` (flag up, slot lock held),
+        // then reports the flag value it read.
+        let armed = Arc::new(Flag::new(false));
+        let in_hook = Arc::new(Flag::new(false));
+        let (hit_tx, hit_rx) = std::sync::mpsc::channel::<()>();
+        let (read_tx, read_rx) = std::sync::mpsc::channel::<bool>();
+        let entered_rx = Mutex::new(entered_rx);
+        let hook: PrecheckHook = {
+            let (armed, in_hook) = (armed.clone(), in_hook.clone());
+            Arc::new(move |fenced| match fenced {
+                None => {
+                    if armed.swap(false, Ordering::SeqCst) {
+                        in_hook.store(true, Ordering::SeqCst);
+                        hit_tx.send(()).unwrap();
+                        entered_rx.lock().recv().unwrap();
+                    }
+                }
+                Some(f) => {
+                    if in_hook.swap(false, Ordering::SeqCst) {
+                        read_tx.send(f).unwrap();
+                    }
+                }
+            })
+        };
+        *runner.link.precheck_hook.lock() = Some(hook);
+
+        let driver = runner.clone();
+        let loop_handle = std::thread::spawn(move || driver.run_relay_loop());
+        wait_until("relay steps", || steps.load(Ordering::SeqCst) >= 1);
+
+        armed.store(true, Ordering::SeqCst);
+        hit_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("relay reaches the pre-check");
+        // Relay sits in the pre-check without the slot lock: the re-attach
+        // takes it, raises the flag and blocks inside `reattach_streams`.
+        let r = runner.clone();
+        let reattach = tokio::spawn(async move { r.reattach(up_link()).await });
+        let saw = read_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("relay reads the flag");
+        assert!(saw, "relay must observe the transient fence");
+        // The relay has acted on `true` (it parks); now reject the re-attach.
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            reattach.await.unwrap(),
+            Err(EngineError::PeerRejected(_))
+        ));
+        assert!(
+            !runner.is_fenced(),
+            "a rejected re-attach restores the fence"
+        );
+
+        let after = steps.load(Ordering::SeqCst);
+        wait_until(
+            "relay resumes stepping after the rejected re-attach",
+            || steps.load(Ordering::SeqCst) > after,
+        );
+
+        runner.close();
+        assert_eq!(loop_handle.join().unwrap(), RelayExit::SlotEmpty);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_after_close_is_not_loaded() {
+        let h = link_runner(true);
+        h.runner.close();
+        assert!(matches!(
+            h.runner.reattach(up_link()).await,
+            Err(EngineError::NotLoaded)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_reattach_fences_until_a_successful_one() {
+        let h = link_runner(true);
+        h.fail_reattach.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            h.runner.reattach(up_link()).await,
+            Err(EngineError::Backend(_))
+        ));
+        // Fenced: submit refused without reaching the engine.
+        let r = h.runner.clone();
+        let res = tokio::task::spawn_blocking(move || r.submit(task("t1")))
+            .await
+            .unwrap();
+        assert!(matches!(res, Err(EngineError::NotConnected)), "got {res:?}");
+        assert_eq!(h.submits.load(Ordering::SeqCst), 0);
+        // Fenced: relay loop does not step.
+        let driver = h.runner.clone();
+        let loop_handle = std::thread::spawn(move || driver.run_relay_loop());
+        h.expect_no_step("fenced relay must not step");
+        assert_eq!(h.steps.load(Ordering::SeqCst), 0);
+        // A successful reattach clears the fence and wakes the relay.
+        h.fail_reattach.store(false, Ordering::SeqCst);
+        h.runner.reattach(up_link()).await.unwrap();
+        h.expect_step("relay steps after unfence");
+        let r = h.runner.clone();
+        let res = tokio::task::spawn_blocking(move || r.submit(task("t2")))
+            .await
+            .unwrap();
+        assert!(res.is_ok());
+        h.runner.close();
+        assert_eq!(loop_handle.join().unwrap(), RelayExit::SlotEmpty);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn panicking_reattach_leaves_the_engine_fenced() {
+        // A panic inside `reattach_streams` may have swapped some streams and
+        // not others: the engine state is unspecified, so it must stay fenced.
+        let h = link_runner(true);
+        h.panic_reattach.store(true, Ordering::SeqCst);
+        let res = h.runner.reattach(up_link()).await;
+        assert!(matches!(res, Err(EngineError::Backend(_))), "got {res:?}");
+        assert!(
+            h.runner.slot.is_fenced(),
+            "a panicked re-attach must leave the fence up"
+        );
+        assert_eq!(
+            h.runner.slot.attach_epoch(),
+            1,
+            "a panicked re-attach may have swapped: older streams are orphaned"
+        );
+        let r = h.runner.clone();
+        let res = tokio::task::spawn_blocking(move || r.submit(task("t1")))
+            .await
+            .unwrap();
+        assert!(matches!(res, Err(EngineError::NotConnected)), "got {res:?}");
+        assert_eq!(h.submits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_reattach_fences_open_generate_streams() {
+        // A stream opened before a failed post-swap re-attach must not step
+        // the half-reset engine: its next poll ends it with NotConnected.
+        let h = link_runner(true);
+        let mut stream = h.runner.generate_async(task("open")).await.unwrap();
+        h.fail_reattach.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            h.runner.reattach(up_link()).await,
+            Err(EngineError::Backend(_))
+        ));
+        let steps_before = h.steps.load(Ordering::SeqCst);
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("poll must not hang")
+            .expect("fenced stream yields a final error chunk");
+        let err = chunk.error.as_deref().expect("error chunk");
+        assert!(
+            err.contains(&EngineError::NotConnected.to_string()),
+            "got {err:?}"
+        );
+        assert!(chunk.is_final);
+        assert_eq!(
+            h.steps.load(Ordering::SeqCst),
+            steps_before,
+            "a fenced stream must not step the engine"
+        );
+        assert!(stream.next().await.is_none());
+    }
+
+    #[test]
+    fn tcp_mode_relay_still_exits_connection_fatal() {
+        let h = link_runner(false);
+        h.dead.store(true, Ordering::SeqCst);
+        let driver = h.runner.clone();
+        let loop_handle = std::thread::spawn(move || driver.run_relay_loop());
+        wait_until("relay exit", || loop_handle.is_finished());
+        assert_eq!(loop_handle.join().unwrap(), RelayExit::ConnectionFatal);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_fails_in_flight_streams_with_a_clear_error() {
+        // A request in flight on the head when its links are swapped can
+        // never finish (the engine reset its session state): the stream must
+        // end at once with a NotConnected error naming the re-attach, not
+        // limp on until the "no progress" guard trips.
+        let h = link_runner(true);
+        let mut stream = h.runner.generate_async(task("inflight")).await.unwrap();
+        h.runner.reattach(up_link()).await.unwrap();
+        let steps_before = h.steps.load(Ordering::SeqCst);
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("poll must not hang")
+            .expect("orphaned stream yields a final error chunk");
+        let err = chunk.error.as_deref().expect("error chunk");
+        assert!(
+            err.contains("link re-attached; in-flight request dropped"),
+            "got {err:?}"
+        );
+        assert!(
+            err.contains(&EngineError::NotConnected.to_string()),
+            "got {err:?}"
+        );
+        assert!(chunk.is_final);
+        assert_eq!(
+            h.steps.load(Ordering::SeqCst),
+            steps_before,
+            "an orphaned stream must not step the engine"
+        );
+        assert!(stream.next().await.is_none());
+        // A request submitted after the re-attach is unaffected.
+        let mut fresh = h.runner.generate_async(task("fresh")).await.unwrap();
+        let chunk = fresh.next().await.expect("chunk");
+        assert!(
+            !chunk
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("re-attached"),
+            "got {chunk:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_dropped_before_the_slot_lock_does_not_swap() {
+        // Dropping the `reattach` future while its blocking half still waits
+        // for the slot lock must cancel it: nothing swapped, no fence moved,
+        // no generation or epoch bump.
+        let h = link_runner(true);
+        let baseline = Arc::strong_count(&h.runner.slot);
+        let gen_before = h.runner.link.state.lock().generation;
+        let guard = h.runner.slot.lock();
+        let mut fut = Box::pin(h.runner.reattach(up_link()));
+        assert!(futures::poll!(&mut fut).is_pending());
+        drop(fut);
+        drop(guard);
+        // The detached blocking half holds a clone of the slot until it has
+        // run: wait for it to finish.
+        wait_until("blocking half finished", || {
+            Arc::strong_count(&h.runner.slot) == baseline
+        });
+        assert_eq!(h.runner.slot.attach_epoch(), 0);
+        assert_eq!(
+            h.reattaches.load(Ordering::SeqCst),
+            0,
+            "a cancelled re-attach must not reach the engine"
+        );
+        assert!(!h.runner.is_fenced());
+        assert_eq!(h.runner.link.state.lock().generation, gen_before);
+    }
+
+    /// Builder whose `build()` records whether the runner was already in
+    /// stream mode, i.e. before the engine lands in the slot.
+    struct ModeProbeBuilder {
+        runner: Arc<parking_lot::Mutex<std::sync::Weak<Runner>>>,
+        seen: Arc<parking_lot::Mutex<Option<bool>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Builder for ModeProbeBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn connect_streams(
+            &mut self,
+            _links: cascadia_engine::StreamLinks,
+        ) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            let runner = self.runner.lock().upgrade().expect("runner alive");
+            *self.seen.lock() = Some(runner.stream_mode.load(Ordering::SeqCst));
+            Ok(Box::new(FailingEngine))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_with_streams_sets_stream_mode_before_the_engine_is_live() {
+        let weak = Arc::new(parking_lot::Mutex::new(std::sync::Weak::new()));
+        let seen = Arc::new(parking_lot::Mutex::new(None));
+        let runner = Arc::new(Runner::new(Box::new(ModeProbeBuilder {
+            runner: weak.clone(),
+            seen: seen.clone(),
+        })));
+        *weak.lock() = Arc::downgrade(&runner);
+        runner
+            .start_with_streams(
+                cascadia_engine::StreamLinks::pipeline(Some(duplex_end()), None),
+                test_shard(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *seen.lock(),
+            Some(true),
+            "stream mode must be on before the engine is placed in the slot"
+        );
+    }
+
+    #[test]
+    fn link_down_warns_once_per_attach_epoch() {
+        let mut log = LinkDownLog::default();
+        assert!(log.first_for(0), "first death warns");
+        assert!(!log.first_for(0), "a re-wake on the same links is quiet");
+        assert!(log.first_for(1), "a death after a swap warns again");
+        assert!(!log.first_for(1));
+    }
+
+    /// Serializes the tests that pin `cascadia_link_reattach_total` deltas
+    /// for the non-upstream sides.
+    static REATTACH_METRIC_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Accepts any non-empty set of links (no stage shape), for counting.
+    struct AnyLinkEngine;
+
+    impl Engine for AnyLinkEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _task: GenerationTask) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            Ok(vec![])
+        }
+        fn reattach_streams(
+            &mut self,
+            links: cascadia_engine::StreamLinks,
+        ) -> Result<(), EngineError> {
+            if links.shape() == cascadia_engine::LinkShape::default() {
+                return Err(EngineError::PeerRejected("nothing to replace".into()));
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_counts_each_replaced_link_per_side() {
+        // `upstream` is left out: other tests in this binary re-attach
+        // upstream links concurrently, so its delta is not ours to pin.
+        let _metric = REATTACH_METRIC_TEST.lock().await;
+        let count = |side: &str| {
+            cascadia_metrics::LINK_REATTACH_TOTAL
+                .with_label_values(&[side])
+                .get()
+        };
+        let sides = ["downstream", "ep_driver", "ep_worker"];
+        let before: Vec<u64> = sides.iter().map(|s| count(s)).collect();
+        let runner = Runner::for_test(Box::new(AnyLinkEngine), true);
+
+        // Two of three workers replaced (`None` keeps one), plus downstream.
+        let mut links = cascadia_engine::StreamLinks::ep_workers(vec![
+            Some(duplex_end()),
+            None,
+            Some(duplex_end()),
+        ]);
+        links.downstream = Some(duplex_end());
+        runner.reattach(links).await.unwrap();
+        runner
+            .reattach(cascadia_engine::StreamLinks::ep_driver(duplex_end()))
+            .await
+            .unwrap();
+        // A rejected re-attach replaced nothing and counts nothing.
+        assert!(matches!(
+            runner
+                .reattach(cascadia_engine::StreamLinks::default())
+                .await,
+            Err(EngineError::PeerRejected(_))
+        ));
+
+        let delta: Vec<u64> = sides
+            .iter()
+            .zip(&before)
+            .map(|(s, b)| count(s) - b)
+            .collect();
+        assert_eq!(delta, vec![1, 1, 2], "per-side deltas for {sides:?}");
+    }
+
+    /// One recorded event: its message and the name of the span it fired in.
+    type RecordedEvent = (String, Option<String>);
+
+    /// Records each event's message and the name of the span it fired in.
+    #[derive(Clone, Default)]
+    struct SpanRecorder(Arc<Mutex<Vec<RecordedEvent>>>);
+
+    impl<S> tracing_subscriber::Layer<S> for SpanRecorder
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    if f.name() == "message" {
+                        self.0 = format!("{v:?}");
+                    }
+                }
+            }
+            let mut msg = Message(String::new());
+            event.record(&mut msg);
+            let span = ctx.event_span(event).map(|s| s.name().to_string());
+            self.0.lock().push((msg.0, span));
+        }
+    }
+
+    #[test]
+    fn reattach_logs_stay_in_the_callers_span_and_subscriber() {
+        use tracing::Instrument;
+        use tracing_subscriber::layer::SubscriberExt;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // `upstream`: the side the per-side metric tests leave unpinned.
+        let upstream = || cascadia_engine::StreamLinks::pipeline(Some(duplex_end()), None);
+        let runner = Runner::for_test(Box::new(AnyLinkEngine), true);
+        // Register the re-attach log callsites on this thread first. Other
+        // tests in this binary hit them with no subscriber installed; a
+        // registration racing ours could otherwise cache "never interested"
+        // after the rebuild below and hide the event from the scoped
+        // subscriber.
+        rt.block_on(runner.reattach(upstream())).unwrap();
+
+        let recorder = SpanRecorder::default();
+        let subscriber = tracing_subscriber::registry().with(recorder.clone());
+        // A scoped (not global) subscriber: the blocking half of `reattach`
+        // runs on a pool thread, which only sees it if it is carried over.
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            rt.block_on(
+                runner
+                    .reattach(upstream())
+                    .instrument(tracing::info_span!("embedder_reattach")),
+            )
+            .unwrap();
+        });
+        let events = recorder.0.lock();
+        let reattached = events
+            .iter()
+            .find(|(msg, _)| msg == "link re-attached")
+            .unwrap_or_else(|| {
+                panic!("the re-attach log reached the caller's subscriber: {events:?}")
+            });
+        assert_eq!(reattached.1.as_deref(), Some("embedder_reattach"));
+    }
+
+    /// FIFO engine: `submit` queues, each `step` finishes the oldest queued
+    /// task with one final chunk. Like the real engines, `reattach_streams`
+    /// leaves the queue alone; `cancel` removes a task and is logged.
+    #[derive(Default)]
+    struct QueueEngine {
+        queue: VecDeque<TaskId>,
+        cancelled: Arc<Mutex<Vec<TaskId>>>,
+    }
+
+    impl Engine for QueueEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> Result<(), EngineError> {
+            self.queue.push_back(task.task_id);
+            Ok(())
+        }
+        fn cancel(&mut self, task_id: &TaskId) {
+            self.queue.retain(|t| t != task_id);
+            self.cancelled.lock().push(task_id.clone());
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            Ok(self
+                .queue
+                .pop_front()
+                .map(|tid| {
+                    let mut chunk = Chunk::token(tid.clone(), 1, "tok");
+                    chunk.is_final = true;
+                    (tid, chunk)
+                })
+                .into_iter()
+                .collect())
+        }
+        fn reattach_streams(
+            &mut self,
+            _links: cascadia_engine::StreamLinks,
+        ) -> Result<(), EngineError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_drops_queued_tasks_before_they_emit() {
+        // A task still queued (submitted, never stepped) when the links are
+        // swapped must be cancelled in the engine and its stream must fail
+        // with the re-attach error -- not be admitted later by a sibling's
+        // step and finish (or fail mid-output) on the new links.
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let engine = QueueEngine {
+            cancelled: cancelled.clone(),
+            ..Default::default()
+        };
+        let runner = Runner::for_test(Box::new(engine), true);
+        let mut queued = runner.generate_async(task("queued")).await.unwrap();
+        runner.reattach(up_link()).await.unwrap();
+        assert_eq!(
+            *cancelled.lock(),
+            vec![TaskId::from("queued")],
+            "the re-attach cancels the stale task in the engine"
+        );
+        // A request submitted after the re-attach steps the engine first.
+        let mut fresh = runner.generate_async(task("fresh")).await.unwrap();
+        let chunk = fresh.next().await.expect("fresh chunk");
+        assert_eq!(chunk.task_id, TaskId::from("fresh"), "got {chunk:?}");
+        assert!(chunk.error.is_none(), "got {chunk:?}");
+        // The stale stream's first chunk is the re-attach error.
+        let chunk = queued.next().await.expect("queued chunk");
+        let err = chunk
+            .error
+            .as_deref()
+            .unwrap_or_else(|| panic!("got {chunk:?}"));
+        assert!(
+            err.contains("link re-attached; in-flight request dropped"),
+            "got {err:?}"
+        );
+        assert!(queued.next().await.is_none());
+    }
+
+    /// First step fails naming the `stale` task; later steps finish `fresh`.
+    #[derive(Default)]
+    struct ForeignFailEngine {
+        steps: usize,
+    }
+
+    impl Engine for ForeignFailEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _task: GenerationTask) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            self.steps += 1;
+            if self.steps == 1 {
+                return Err(EngineError::Backend("boom".into()).for_task("stale".into()));
+            }
+            Ok(vec![("fresh".into(), Chunk::final_marker("fresh", "ok"))])
+        }
+        fn reattach_streams(
+            &mut self,
+            _links: cascadia_engine::StreamLinks,
+        ) -> Result<(), EngineError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_orphaned_stream_ends_with_the_reattach_error_not_a_routed_engine_error() {
+        // A sibling's step fails naming the orphaned task: that failure must
+        // not be routed into the orphaned stream, which ends with the
+        // re-attach error regardless.
+        let runner = Runner::for_test(Box::new(ForeignFailEngine::default()), true);
+        let mut stale = runner.generate_async(task("stale")).await.unwrap();
+        runner.reattach(up_link()).await.unwrap();
+        let mut fresh = runner.generate_async(task("fresh")).await.unwrap();
+        let chunk = fresh.next().await.expect("fresh chunk");
+        assert_eq!(chunk.text, "ok", "got {chunk:?}");
+        let chunk = stale.next().await.expect("stale chunk");
+        let err = chunk
+            .error
+            .as_deref()
+            .unwrap_or_else(|| panic!("got {chunk:?}"));
+        assert!(
+            err.contains("link re-attached; in-flight request dropped"),
+            "got {err:?}"
+        );
+        assert!(stale.next().await.is_none());
+    }
+
+    /// `reattach_streams` signals `entered`, then blocks until `release`.
+    struct GatedReattachEngine {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Engine for GatedReattachEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _task: GenerationTask) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            Ok(vec![])
+        }
+        fn reattach_streams(
+            &mut self,
+            _links: cascadia_engine::StreamLinks,
+        ) -> Result<(), EngineError> {
+            self.entered.send(()).unwrap();
+            self.release.lock().recv().unwrap();
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_dropped_after_the_slot_lock_still_counts_and_logs() {
+        // Once the blocking half holds the lock the re-attach completes even
+        // if the caller drops the future -- and must still be counted (and
+        // logged, from the same place).
+        let _metric = REATTACH_METRIC_TEST.lock().await;
+        let count = || {
+            cascadia_metrics::LINK_REATTACH_TOTAL
+                .with_label_values(&["ep_driver"])
+                .get()
+        };
+        let before = count();
+        let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+        let runner = Runner::for_test(
+            Box::new(GatedReattachEngine {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            }),
+            true,
+        );
+        let baseline = Arc::strong_count(&runner.slot);
+        let mut fut =
+            Box::pin(runner.reattach(cascadia_engine::StreamLinks::ep_driver(duplex_end())));
+        assert!(futures::poll!(&mut fut).is_pending());
+        entered
+            .recv_timeout(STEP_WAIT)
+            .expect("blocking half reached the engine");
+        drop(fut);
+        release.send(()).unwrap();
+        wait_until("blocking half finished", || {
+            Arc::strong_count(&runner.slot) == baseline
+        });
+        assert_eq!(runner.slot.attach_epoch(), 1, "the swap completed");
+        assert_eq!(
+            count() - before,
+            1,
+            "a dropped but completed re-attach is counted"
+        );
+    }
+
+    #[test]
+    fn close_lock_notes_a_long_wait_once_and_keeps_waiting() {
+        let slot = Arc::new(EngineSlot::new(None));
+        let noted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Free lock: no note.
+        drop(
+            slot.lock_noting_delay(std::time::Duration::from_millis(20), || {
+                noted.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        assert_eq!(noted.load(Ordering::SeqCst), 0);
+        // Held past the delay: noted once, then still acquired on release.
+        let held = slot.lock();
+        let acquired = Arc::new(Flag::new(false));
+        let waiter = {
+            let (slot, noted, acquired) = (slot.clone(), noted.clone(), acquired.clone());
+            std::thread::spawn(move || {
+                let _g = slot.lock_noting_delay(std::time::Duration::from_millis(20), || {
+                    noted.fetch_add(1, Ordering::SeqCst);
+                });
+                acquired.store(true, Ordering::SeqCst);
+            })
+        };
+        wait_until("long wait noted", || noted.load(Ordering::SeqCst) == 1);
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "still waiting after the note"
+        );
+        drop(held);
+        waiter.join().unwrap();
+        assert!(acquired.load(Ordering::SeqCst));
+        assert_eq!(noted.load(Ordering::SeqCst), 1, "noted exactly once");
     }
 }
