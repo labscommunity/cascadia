@@ -121,6 +121,22 @@ jobs:
         # e2e tests against the mock engine.
         run: cargo test --workspace --all-targets
 
+      - name: Injected-streams example (issue #76)
+        # `--all-targets` above only compiles examples; this one also runs:
+        # two stages over duplex streams, kill the link, re-attach, generate
+        # again. It asserts its own output and exits non-zero on a regression.
+        run: cargo run -p cascadia-runner --example injected_duplex
+
+      - name: cascadia-engine default deps stay socket-free
+        # The `injected_streams` feature pulls cascadia-transport (tokio,
+        # socket2, prometheus) into cascadia-engine. It must stay off by
+        # default so a plain Engine/Builder implementer's tree stays lean.
+        run: |
+          if cargo tree -p cascadia-engine -e normal --prefix none | grep -E '^(tokio|socket2|prometheus) '; then
+            echo "::error::cascadia-engine's default build depends on tokio/socket2/prometheus"
+            exit 1
+          fi
+
       # Everything above builds default features, and `dashboard-embed` is
       # default-off — so without these steps the whole embedded-SPA path
       # (spa.rs, rust-embed, mime_guess, and build.rs's success branch) is

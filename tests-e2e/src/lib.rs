@@ -244,6 +244,16 @@ impl MockPipeline {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        // Timed out. Report every stage's stderr now: Drop deletes the logs,
+        // so without this a flaky timeout (e.g. a stage losing its
+        // `pick_free_port` port to another process before binding it) leaves
+        // nothing to diagnose.
+        for (rank, log) in &self.stage_logs {
+            let stderr = std::fs::read_to_string(log).unwrap_or_default();
+            eprintln!(
+                "wait_for_health timed out after {timeout:?}; stage rank {rank} stderr:\n{stderr}"
+            );
+        }
         false
     }
 

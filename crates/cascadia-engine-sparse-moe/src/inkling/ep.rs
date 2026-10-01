@@ -1040,16 +1040,16 @@ mod gpu_requirement_tests {
 /// The engine an expert worker rank runs: `step()` serves one
 /// `ExpertDispatch` frame (recv → compute → reply), like
 /// `PipelineEngine::step_worker`; driven by `Runner::run_relay_loop`. Takes
-/// no tasks. A clean close by the driver latches `peer_disconnected` and
-/// `step()` surfaces a connection-fatal `Err` exactly once, so the relay loop
-/// exits for a supervisor rebuild (the driver's connection is accepted at
-/// `connect()` only).
+/// no tasks. A clean close by the driver (or a connection-fatal transport
+/// error) latches `peer_disconnected`, and from then on every `step()` returns
+/// a connection-fatal `Err` at once: the relay loop exits for a supervisor
+/// rebuild in TCP mode (the driver's connection is accepted at `connect()`
+/// only) and parks until a re-attach in stream mode.
 pub struct ExpertWorkerEngine {
     bank: ExpertBank,
     server: Arc<TokioMutex<ActivationServer>>,
     handle: tokio::runtime::Handle,
     peer_disconnected: bool,
-    disconnect_reported: bool,
     frames: u64,
 }
 
@@ -1064,7 +1064,6 @@ impl ExpertWorkerEngine {
             server,
             handle,
             peer_disconnected: false,
-            disconnect_reported: false,
             frames: 0,
         }
     }
@@ -1243,31 +1242,28 @@ impl Engine for ExpertWorkerEngine {
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        // Mirror PipelineEngine::step: while the driver's link is latched
+        // dead, every step returns a connection-fatal Err at once, without
+        // serving or sleeping under the engine lock, so a stream-mode relay
+        // woken with the link still dead (a rejected re-attach) parks again.
         if self.peer_disconnected {
-            if !self.disconnect_reported {
-                self.disconnect_reported = true;
-                return Err(EngineError::NotConnected);
-            }
-            std::thread::sleep(WORKER_BACKOFF);
-            return Ok(Vec::new());
+            return Err(EngineError::NotConnected);
         }
         if let Err(e) = self.serve_one() {
             let e = format!("expert worker {}/{}: {e}", self.bank.index, self.bank.count);
             warn!("{e}");
             let err = EngineError::Backend(e);
             if err.is_connection_fatal() {
-                // The driver's socket is gone; only a rebuild re-accepts one.
+                // The driver's link is gone; only a rebuild (TCP) or a
+                // re-attach (stream mode) brings one back.
                 self.peer_disconnected = true;
-                self.disconnect_reported = true;
                 return Err(err);
             }
             std::thread::sleep(WORKER_BACKOFF);
             return Ok(Vec::new());
         }
-        // Mirror PipelineEngine::step: a clean close surfaces as a
-        // connection-fatal Err exactly once, so the relay loop exits.
-        if self.peer_disconnected && !self.disconnect_reported {
-            self.disconnect_reported = true;
+        // A clean close surfaces as a connection-fatal Err.
+        if self.peer_disconnected {
             return Err(EngineError::NotConnected);
         }
         Ok(Vec::new())
@@ -1281,7 +1277,23 @@ impl Engine for ExpertWorkerEngine {
             server.lock().await.close().await;
         });
         self.peer_disconnected = true;
-        self.disconnect_reported = true;
+    }
+
+    /// Issue #76: replace the driver link after it died and return to a clean
+    /// state. An EP worker owns exactly one link (the driver's); there is no
+    /// sequence state to reset — the bank is read-only weights and `frames` is a
+    /// counter. Bridges sync→async through `block_on` (cascadia_runner::run_async),
+    /// exactly as `close` does above.
+    fn reattach_streams(&mut self, links: cascadia_engine::StreamLinks) -> EngineResult<()> {
+        cascadia_engine::check_reattach_streams(cascadia_engine::LinkShape::ep_driver(), &links)?;
+        // Pre-swap: even a broken validation guarantee leaves the engine
+        // untouched, so PeerRejected (the runner does not fence), not Backend.
+        let driver = links.ep_driver.ok_or_else(|| {
+            EngineError::PeerRejected("reattach: validated ep_driver link missing".into())
+        })?;
+        self.block_on(cascadia_transport::attach_server(&self.server, driver));
+        self.peer_disconnected = false;
+        Ok(())
     }
 }
 
@@ -1309,6 +1321,123 @@ mod tests {
         assert!(batch >= one);
         if let Some(c) = frame_idle_ceiling() {
             assert!(batch < c);
+        }
+    }
+
+    // ---- injected streams: ExpertWorkerEngine::reattach_streams (#76) ----
+
+    /// `ExpertBank` has no weightless constructor, but every field is trivial or
+    /// `None`-able, and this child module can build it by struct literal. An
+    /// empty bank is enough: reattach never dispatches to experts.
+    fn empty_bank() -> ExpertBank {
+        ExpertBank {
+            layers: Vec::new(),
+            moe: Vec::new(),
+            hidden: 8,
+            inter: 8,
+            n_routed: 1,
+            n_shared: 0,
+            index: 0,
+            count: 1,
+            ov: None,
+            fused: None,
+            require_gpu: false,
+            gpu_name: None,
+            cpu_calls: AtomicU64::new(0),
+            cpu_f16_reference: false,
+            wire_f16_replies: AtomicU64::new(0),
+            wire_f32_replies: AtomicU64::new(0),
+            wire_tensor_bytes: AtomicU64::new(0),
+            wire_f32_equivalent_bytes: AtomicU64::new(0),
+        }
+    }
+
+    #[test]
+    fn expert_worker_reattach_clears_latches_and_revives_server() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (near, far) = tokio::io::duplex(1 << 16);
+        let server = Arc::new(TokioMutex::new(ActivationServer::from_stream(Box::new(
+            near,
+        ))));
+        let mut eng = ExpertWorkerEngine::new(empty_bank(), server, rt.handle().clone());
+        eng.peer_disconnected = true;
+        drop(far); // the driver closed its end (contract item 3)
+
+        let (near2, far2) = tokio::io::duplex(1 << 16);
+        eng.reattach_streams(cascadia_engine::StreamLinks::ep_driver(Box::new(near2)))
+            .expect("ep worker reattach of the driver link");
+
+        assert!(!eng.peer_disconnected);
+        // Server live on the fresh stream: a driver on far2 sends a frame kind
+        // and the worker's server reads it off the newly attached stream.
+        rt.block_on(async {
+            let mut driver = ActivationClient::from_stream(Box::new(far2));
+            driver
+                .send_raw(&(FrameKind::Reset as u32).to_be_bytes())
+                .await
+                .unwrap();
+            let kb = eng.server.lock().await.recv_raw(4).await.unwrap();
+            assert_eq!(
+                u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]),
+                FrameKind::Reset as u32
+            );
+        });
+    }
+
+    #[test]
+    fn expert_worker_reattach_rejects_bad_shape() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (near, _far) = tokio::io::duplex(64);
+        let server = Arc::new(TokioMutex::new(ActivationServer::from_stream(Box::new(
+            near,
+        ))));
+        let mut eng = ExpertWorkerEngine::new(empty_bank(), server, rt.handle().clone());
+        eng.peer_disconnected = true; // sentinel
+                                      // Replacing nothing.
+        assert!(matches!(
+            eng.reattach_streams(cascadia_engine::StreamLinks::default()),
+            Err(EngineError::PeerRejected(_))
+        ));
+        // A pipeline upstream link the worker does not have.
+        assert!(matches!(
+            eng.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+                Some(Box::new(tokio::io::duplex(64).0)),
+                None
+            )),
+            Err(EngineError::PeerRejected(_))
+        ));
+        assert!(
+            eng.peer_disconnected,
+            "a rejected reattach must not touch state"
+        );
+    }
+
+    /// Every step after the driver's link died must return a connection-fatal
+    /// error, promptly: a stream-mode relay parks on it, and a later wake with
+    /// the link still dead (a rejected re-attach) must park again instead of
+    /// sleeping `WORKER_BACKOFF` under the engine lock and returning `Ok`.
+    #[test]
+    fn expert_worker_keeps_failing_fast_on_a_dead_driver_link() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (near, far) = tokio::io::duplex(64);
+        let server = Arc::new(TokioMutex::new(ActivationServer::from_stream(Box::new(
+            near,
+        ))));
+        let mut eng = ExpertWorkerEngine::new(empty_bank(), server, rt.handle().clone());
+        drop(far); // the driver closed its end
+        for i in 0..3 {
+            let t0 = std::time::Instant::now();
+            let r = eng.step();
+            let took = t0.elapsed();
+            assert!(
+                matches!(&r, Err(e) if e.is_connection_fatal()),
+                "step {i} on a dead driver link must be connection-fatal, got {:?}",
+                r.map(|v| v.len())
+            );
+            assert!(
+                took < WORKER_BACKOFF,
+                "step {i} must not back off while the link is latched dead (took {took:?})"
+            );
         }
     }
 }

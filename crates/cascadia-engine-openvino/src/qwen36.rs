@@ -2707,6 +2707,82 @@ impl Engine for Qwen36Engine {
         }
     }
 
+    fn reattach_streams(&mut self, links: cascadia_engine::StreamLinks) -> EngineResult<()> {
+        // Validate first: PeerRejected ⇒ engine untouched, runner does not fence.
+        // Pipeline-only, so the stage LinkShape has ep_driver=false, ep_workers=0
+        // and any EP link is rejected here.
+        cascadia_engine::check_reattach_streams(
+            cascadia_engine::LinkShape::pipeline(
+                self.upstream.is_some(),
+                self.downstream.is_some(),
+            ),
+            &links,
+        )?;
+        // Pipeline mode always has a runtime handle (set by connect/connect_streams
+        // for total > 1). Checked here, before any swap, so a missing one is a
+        // validation failure (PeerRejected, engine untouched), not a Backend error
+        // the runner would answer by fencing an engine nothing was done to.
+        let h = self.handle().map_err(|_| {
+            EngineError::PeerRejected(
+                "qwen36 reattach_streams: engine is not in pipeline mode (no runtime handle)"
+                    .into(),
+            )
+        })?;
+        run_async(
+            &h,
+            crate::runtime::check_kept_downstream_live(
+                self.downstream.clone(),
+                links.downstream.is_none(),
+            ),
+        )?;
+        let cascadia_engine::StreamLinks {
+            upstream,
+            downstream,
+            ..
+        } = links;
+        // Resolve every target before swapping anything, so even a broken
+        // validation guarantee is a PeerRejected with the engine untouched.
+        let missing = |side: &str| {
+            EngineError::PeerRejected(format!(
+                "qwen36 reattach_streams: validated {side} has no handle on this stage"
+            ))
+        };
+        let up = match upstream {
+            Some(s) => Some((self.upstream.clone().ok_or_else(|| missing("upstream"))?, s)),
+            None => None,
+        };
+        let down = match downstream {
+            Some(s) => Some((
+                self.downstream
+                    .clone()
+                    .ok_or_else(|| missing("downstream"))?,
+                s,
+            )),
+            None => None,
+        };
+        if let Some((server, s)) = up {
+            run_async(&h, cascadia_transport::attach_server(&server, s));
+        }
+        if let Some((client, s)) = down {
+            run_async(&h, cascadia_transport::attach_client(&client, s));
+        }
+        // Clean between-requests state. `attach` and these writes cannot fail and
+        // `reset_all` swallows its own errors into `stages_dirty`, so every
+        // reachable error is a pre-swap PeerRejected above: a qwen36 re-attach
+        // never leaves the runner fenced, short of a panic mid-swap.
+        self.active = None;
+        // Scrubs stage KV; clears primed / state_restored / stages_dirty.
+        self.reset_all();
+        // Head re-sends HELLO, re-negotiating chain_capture_v2.
+        self.handshake_done = false;
+        // Poison cleared so the config-mismatch verdict is re-evaluated.
+        self.poisoned = None;
+        // epoch / peer_epoch left untouched: RESET/RESTORE resync them at admission.
+        #[cfg(feature = "kv_coord")]
+        self.kv_handoff.discard_any(); // a parked slice from the dead session must not apply later
+        Ok(())
+    }
+
     #[cfg(feature = "kv_coord")]
     fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
         // Only ranks that hold KV (a loaded stage) participate; emb-only rank-0 with no stage can't.
@@ -3768,14 +3844,272 @@ mod tests {
         let (_fd, down) = tokio::io::duplex(64);
         let (_fe, ep) = tokio::io::duplex(64);
         assert!(matches!(
-            b.connect_streams(cascadia_engine::StreamLinks {
-                downstream: Some(Box::new(down)),
-                ep_driver: Some(Box::new(ep)),
-                ..Default::default()
+            b.connect_streams({
+                let mut l = cascadia_engine::StreamLinks::pipeline(None, Some(Box::new(down)));
+                l.ep_driver = Some(Box::new(ep));
+                l
             })
             .await,
             Err(EngineError::PeerRejected(_))
         ));
         assert!(b.upstream.is_none() && b.downstream.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_streams_swaps_downstream_and_clears_session_state() {
+        let mut e = bare_engine(2, "{}");
+        e.rank = 0; // head: downstream only
+        e.runtime_handle = Some(tokio::runtime::Handle::current());
+        let (_far, near) = tokio::io::duplex(1 << 16);
+        e.downstream = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            ActivationClient::from_stream(Box::new(near)),
+        )));
+        let down_before = e.downstream.clone().unwrap();
+
+        // Dirty session state a re-attach must clear.
+        e.handshake_done = true;
+        e.poisoned = Some("stale handshake mismatch".into());
+        e.primed = true;
+        e.active = Some(ActiveTask {
+            task_id: "t0".into(),
+            tenant: String::new(),
+            prompt_ids: vec![1, 2, 3],
+            prefill_idx: 2,
+            step: 2,
+            warm_prefix: 0,
+            snapshot_at: Vec::new(),
+            logits: Vec::new(),
+            next_token: None,
+            gen_ids: Vec::new(),
+            emitted: Vec::new(),
+            resume_seed_len: 0,
+            max_tokens: 16,
+            started: Instant::now(),
+            snapshot_secs: 0.0,
+            wire_ms: Vec::new(),
+        });
+
+        let (mut far2, near2) = tokio::io::duplex(1 << 16);
+        e.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            None,
+            Some(Box::new(near2)),
+        ))
+        .expect("fresh downstream + no loaded stages ⇒ reset_all is a no-op ⇒ Ok");
+
+        assert!(e.active.is_none(), "active task dropped");
+        assert!(!e.handshake_done, "handshake re-runs at next admission");
+        assert!(e.poisoned.is_none(), "poison cleared so HELLO re-evaluates");
+        assert!(!e.primed, "reset_all scrubbed the stage requests");
+        assert!(
+            std::sync::Arc::ptr_eq(&down_before, e.downstream.as_ref().unwrap()),
+            "the Arc is swapped in place, never replaced"
+        );
+        assert!(
+            e.downstream.as_ref().unwrap().lock().await.is_injected(),
+            "the attached stream is the injected one"
+        );
+
+        // The new stream is live: bytes sent through the engine's client arrive
+        // on the far end of the stream passed to reattach_streams. Fails if
+        // `attach` is skipped (the old stream's far end was dropped).
+        {
+            use tokio::io::AsyncReadExt;
+            e.downstream
+                .as_ref()
+                .unwrap()
+                .lock()
+                .await
+                .send_raw(b"ping")
+                .await
+                .unwrap();
+            let mut buf = [0u8; 4];
+            far2.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping");
+        }
+    }
+
+    /// M2: a relay may keep its downstream only while it is live.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_refuses_keeping_a_dead_downstream() {
+        let mut e = bare_engine(3, "{}");
+        e.rank = 1; // relay: both links
+        e.runtime_handle = Some(tokio::runtime::Handle::current());
+        let (_uf, up) = tokio::io::duplex(64);
+        e.upstream = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            ActivationServer::from_stream(Box::new(up)),
+        )));
+        let (_df, down) = tokio::io::duplex(64);
+        e.downstream = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            ActivationClient::from_stream(Box::new(down)),
+        )));
+        e.downstream.as_ref().unwrap().lock().await.close().await;
+        let (_nf, near) = tokio::io::duplex(64);
+        let res = e.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            Some(Box::new(near)),
+            None,
+        ));
+        assert!(
+            matches!(&res, Err(EngineError::PeerRejected(m)) if m.contains("kept downstream link is dead")),
+            "got {res:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_streams_rejects_bad_shape() {
+        let mut e = bare_engine(2, "{}");
+        e.rank = 0; // head: downstream only
+        e.runtime_handle = Some(tokio::runtime::Handle::current());
+        let (_f, near) = tokio::io::duplex(64);
+        e.downstream = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            ActivationClient::from_stream(Box::new(near)),
+        )));
+        // both None ⇒ nothing to replace.
+        assert!(matches!(
+            e.reattach_streams(cascadia_engine::StreamLinks::default()),
+            Err(EngineError::PeerRejected(_))
+        ));
+        // upstream stream on a head (no upstream) ⇒ role error.
+        let (_f2, n2) = tokio::io::duplex(64);
+        assert!(matches!(
+            e.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+                Some(Box::new(n2)),
+                None
+            )),
+            Err(EngineError::PeerRejected(_))
+        ));
+        // untouched by the rejection.
+        assert!(e.downstream.is_some() && !e.handshake_done);
+    }
+
+    /// A missing runtime handle is a pre-swap validation failure: `PeerRejected`
+    /// (runner does not fence), never a `Backend` error after an untouched engine.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_streams_without_a_runtime_handle_is_rejected_before_any_swap() {
+        let mut e = bare_engine(2, "{}");
+        e.rank = 0; // head: downstream only
+        e.runtime_handle = None;
+        let (_f, near) = tokio::io::duplex(64);
+        e.downstream = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            ActivationClient::from_stream(Box::new(near)),
+        )));
+        e.handshake_done = true;
+        let (_f2, near2) = tokio::io::duplex(64);
+        let res = e.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            None,
+            Some(Box::new(near2)),
+        ));
+        assert!(
+            matches!(res, Err(EngineError::PeerRejected(_))),
+            "got {res:?}"
+        );
+        assert!(
+            e.handshake_done,
+            "a rejected re-attach leaves the engine untouched"
+        );
+    }
+
+    /// With the relay rule every re-attach cascades to the head, so the head's
+    /// re-attach must make the next admission re-run the HELLO handshake.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn head_reattach_resends_hello_at_the_next_admission() {
+        use tokio::io::AsyncReadExt;
+        let mut e = bare_engine(2, "{}");
+        e.rank = 0; // head: downstream only
+        e.runtime_handle = Some(tokio::runtime::Handle::current());
+        let (_far, near) = tokio::io::duplex(1 << 16);
+        e.downstream = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            ActivationClient::from_stream(Box::new(near)),
+        )));
+        e.handshake_done = true; // the dead session had already shaken hands
+
+        let (mut far2, near2) = tokio::io::duplex(1 << 16);
+        e.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            None,
+            Some(Box::new(near2)),
+        ))
+        .unwrap();
+        assert!(!e.handshake_done);
+
+        // The peer reads the first frame header, then hangs up so the engine's
+        // reply wait fails fast (no tokenizer is needed: the handshake runs
+        // before tokenization).
+        let peer = tokio::spawn(async move {
+            let mut hb = [0u8; 12];
+            far2.read_exact(&mut hb).await.unwrap();
+            parse_header(&hb).0
+        });
+        e.pending.push(GenerationTask::new("t1", "hi"));
+        let out = e.step().unwrap();
+        assert_eq!(
+            peer.await.unwrap(),
+            FRAME_HELLO,
+            "first frame after re-attach is HELLO"
+        );
+        assert!(
+            matches!(out.as_slice(), [(_, c)] if c.error.is_some()),
+            "a failed handshake errors the admitted task: {out:?}"
+        );
+        assert!(!e.handshake_done, "no ACK ⇒ handshake still pending");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_streams_rejects_ep_links() {
+        // Pipeline-only engine: an EP link alongside a valid downstream
+        // replacement is still a role error, rejected before any swap.
+        let mut e = bare_engine(2, "{}");
+        e.rank = 0; // head: downstream only
+        e.runtime_handle = Some(tokio::runtime::Handle::current());
+        let (_f, near) = tokio::io::duplex(64);
+        e.downstream = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            ActivationClient::from_stream(Box::new(near)),
+        )));
+        let (_fd, down) = tokio::io::duplex(64);
+        let (_fe, ep) = tokio::io::duplex(64);
+        assert!(matches!(
+            e.reattach_streams({
+                let mut l = cascadia_engine::StreamLinks::pipeline(None, Some(Box::new(down)));
+                l.ep_driver = Some(Box::new(ep));
+                l
+            }),
+            Err(EngineError::PeerRejected(_))
+        ));
+        assert!(e.downstream.is_some() && !e.handshake_done);
+    }
+
+    #[cfg(feature = "kv_coord")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_streams_discards_a_parked_kv_handoff_slice() {
+        let mut e = bare_engine(2, "{}");
+        e.rank = 0;
+        e.runtime_handle = Some(tokio::runtime::Handle::current());
+        let (_far, near) = tokio::io::duplex(1 << 16);
+        e.downstream = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            ActivationClient::from_stream(Box::new(near)),
+        )));
+        // Park a slice from the (now dead) session.
+        let (manifest, payloads) = crate::kv_coordination::blob_to_wire(
+            &[1, 2, 3],
+            &[0xAB],
+            "acme",
+            e.kv_fingerprint(),
+            0xE7,
+        );
+        e.kv_handoff.put(0xE7, manifest, payloads);
+        assert!(
+            e.kv_handoff.ever_parked(),
+            "precondition: a slice is parked"
+        );
+
+        let (_f2, near2) = tokio::io::duplex(1 << 16);
+        e.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            None,
+            Some(Box::new(near2)),
+        ))
+        .unwrap();
+
+        assert!(
+            !e.kv_handoff.discard_any(),
+            "re-attach already discarded the parked slice; nothing left to take"
+        );
     }
 }

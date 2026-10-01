@@ -2968,6 +2968,86 @@ fn write_present_kv(
     }
 }
 
+/// Weightless runners for engine-level tests that never run a forward pass
+/// (re-attach, step latching). Nothing here touches model weights.
+#[cfg(test)]
+impl Runner {
+    /// A middle-stage runner with zero MoE layers, no layer 0 and no head,
+    /// loaded through the real `load` path from a throwaway manifest and an
+    /// empty safetensors index.
+    pub(crate) fn weightless_for_test() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            r#"{"arch":"test","num_layers":2,"dense_layers":[0],"num_experts":1,
+                "top_k":1,"hidden_size":8,"num_kv_heads":1,"qk_head_dim":2,
+                "v_head_dim":2,"vocab_size":4,"eos_token_ids":[],
+                "experts_format":"int4_bin"}"#,
+        )
+        .expect("write manifest");
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{}}"#,
+        )
+        .expect("write safetensors index");
+        let range = LayerRange {
+            layer_start: 1,
+            layer_end: 1,
+            is_first: false,
+            is_last: false,
+        };
+        Self::load(
+            dir.path().to_path_buf(),
+            "CPU",
+            PluginConfig::default(),
+            range,
+        )
+        .expect("weightless runner")
+    }
+
+    /// Append a weightless MoE layer whose KV already holds `past_seq_len`
+    /// positions, so a test can observe `reset_kv` through
+    /// `kv_past_seq_lens`. Never forwarded through.
+    pub(crate) fn push_dirty_kv_layer_for_test(&mut self, past_seq_len: usize) {
+        let e = Vec::new;
+        let int4_shell = Int4Shell {
+            layer: 1,
+            input_norm: e(),
+            q_a_proj_packed: e(),
+            q_a_proj_scale: e(),
+            q_a_norm: e(),
+            q_b_proj_packed: e(),
+            q_b_proj_scale: e(),
+            kv_a_proj_packed: e(),
+            kv_a_proj_scale: e(),
+            kv_a_norm: e(),
+            kv_b_proj_packed: e(),
+            kv_b_proj_scale: e(),
+            o_proj_packed: e(),
+            o_proj_scale: e(),
+            post_norm: e(),
+            router_packed: e(),
+            router_scale: e(),
+            router_bias: e(),
+            shared_gate_packed: e(),
+            shared_gate_scale: e(),
+            shared_up_packed: e(),
+            shared_up_scale: e(),
+            shared_down_packed: e(),
+            shared_down_scale: e(),
+        };
+        self.layers.push(LayerState {
+            lid: 1,
+            int4_shell,
+            past_k: Vec::new(),
+            past_v: Vec::new(),
+            past_seq_len,
+            kv_capacity: 0,
+        });
+        self.last_routing_ids.push(vec![0]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
