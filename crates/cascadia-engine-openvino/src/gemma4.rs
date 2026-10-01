@@ -232,6 +232,25 @@ fn argmax_last_row(logits: &[f32], vocab: usize) -> i32 {
     best_i as i32
 }
 
+/// A relay's scrub decision for an incoming hidden frame at absolute wire
+/// `position`. Position 0 is a new sequence: clear own KV, which REBUILDS the
+/// request after a RESTORE on this rank (`restore_blob_clean` sets
+/// `state_restored`; the cheap `reset_state` cannot scrub restore residue) and
+/// cheap-resets otherwise. Any other position continues the current sequence,
+/// so nothing is cleared: a RESTOREd warm turn never starts at 0, and its
+/// restored state must survive to be decoded on.
+fn relay_scrub_at_wire_position(
+    position: i64,
+    rt: &mut impl crate::runtime::OvStateClear,
+    state_restored: &mut bool,
+) -> EngineResult<()> {
+    if position == 0 {
+        crate::runtime::clear_ov_state(rt, state_restored)
+    } else {
+        Ok(())
+    }
+}
+
 fn map_ov_err(err: OvError) -> EngineError {
     match err {
         OvError::Stub => {
@@ -696,6 +715,36 @@ impl Gemma4Engine {
         crate::dist_spec::run_async_pub(&self.runtime_handle, f)
     }
 
+    /// Return to a clean between-requests state after `reattach_streams`: drop the
+    /// active task, reset the OV internal KV and rewind the wire position. The
+    /// field writes happen before the OV call, so they take effect even when the
+    /// reset errors — mirrors `step_first`'s error path.
+    ///
+    /// `state_restored` is deliberately KEPT: the cheap `reset_state` cannot scrub
+    /// warm-restore residue, and the flag is what makes the next new sequence
+    /// rebuild the request (`scrub_for_new_sequence`). Clearing it here would run
+    /// the next cold turn on the restore residue.
+    fn reset_session_state(&mut self) -> Result<(), OvError> {
+        self.active = None;
+        self.position = 0;
+        self.runtime.reset_state()
+    }
+
+    /// Scrub own KV before a new sequence starts at position 0 (head cold
+    /// admission, relay wire position 0). A prior restore leaves residue the
+    /// cheap `reset_state` can't scrub, so rebuild the request instead and only
+    /// then forget the restore; on a failed rebuild the flag stays set so the
+    /// next new sequence retries it (`crate::runtime::clear_ov_state`).
+    fn scrub_for_new_sequence(&mut self) -> EngineResult<()> {
+        crate::runtime::clear_ov_state(&mut self.runtime, &mut self.state_restored)
+    }
+
+    /// Relay half of [`Self::scrub_for_new_sequence`]: see
+    /// [`relay_scrub_at_wire_position`].
+    fn relay_scrub(&mut self, position: i64) -> EngineResult<()> {
+        relay_scrub_at_wire_position(position, &mut self.runtime, &mut self.state_restored)
+    }
+
     fn send_hidden_downstream(
         &mut self,
         hidden: &[f32],
@@ -1062,12 +1111,7 @@ impl Gemma4Engine {
                 // A prior restore leaves residue cheap reset_state can't scrub — rebuild the request so
                 // this cold turn (incl. a fresh session after a warm-migrated turn on the same runtime)
                 // starts truly clean, not in the donor's reasoning-channel trajectory.
-                if self.state_restored {
-                    self.runtime.recreate_request().map_err(map_ov_err)?;
-                    self.state_restored = false;
-                } else {
-                    self.runtime.reset_state().map_err(map_ov_err)?;
-                }
+                self.scrub_for_new_sequence()?;
             }
             self.position = warm_prefix as i64;
             info!(
@@ -1427,9 +1471,7 @@ impl Gemma4Engine {
         // directly as the position_ids base and reset own KV when it is 0 (a
         // new sequence). Correct for any prompt length, including 1 token.
         let (hidden, shape, position) = self.recv_hidden_from_upstream()?;
-        if position == 0 {
-            self.runtime.reset_state().map_err(map_ov_err)?;
-        }
+        self.relay_scrub(position)?;
         let (out, out_shape) = self.run_relay(&hidden, shape, position)?;
         let next = argmax_logits(&out, &out_shape)?;
         self.send_token_to_upstream(next)?;
@@ -1441,9 +1483,7 @@ impl Gemma4Engine {
         // Multi-token hidden = prefill: the token reply waits on every
         // remaining stage's whole-prompt compute — widened budget.
         let prefill_reply = shape[1] > 1;
-        if position == 0 {
-            self.runtime.reset_state().map_err(map_ov_err)?;
-        }
+        self.relay_scrub(position)?;
         let (out, out_shape) = self.run_relay(&hidden, shape, position)?;
         let s3 = to_shape3(&out_shape);
         // Forward the SAME absolute position downstream so every stage aligns.
@@ -1526,8 +1566,70 @@ impl Engine for Gemma4Engine {
             .as_ref()
             .is_some_and(|a| &a.task.task_id == task_id)
         {
+            // Dropping the handle is enough: every admission scrubs before it
+            // runs (cold: `scrub_for_new_sequence`, warm: `restore_blob_clean`)
+            // and sets `position`, and relays scrub at wire position 0. Resetting
+            // here would only duplicate that work under the engine lock.
             self.active = None;
         }
+    }
+
+    fn reattach_streams(&mut self, links: cascadia_engine::StreamLinks) -> EngineResult<()> {
+        // Validate before touching anything: PeerRejected here means the engine
+        // is untouched and the runner will not fence. gemma4 relays reset at wire
+        // position 0, so a stateful stage may keep a healthy downstream — no
+        // downstream:None rejection (that rule is ov-runtime-only). Pipeline-only,
+        // so the stage LinkShape has ep_driver=false, ep_workers=0 and any EP link
+        // is rejected here too.
+        cascadia_engine::check_reattach_streams(
+            cascadia_engine::LinkShape::pipeline(
+                self.upstream.is_some(),
+                self.downstream.is_some(),
+            ),
+            &links,
+        )?;
+        self.block_on(crate::runtime::check_kept_downstream_live(
+            self.downstream.clone(),
+            links.downstream.is_none(),
+        ))?;
+        let cascadia_engine::StreamLinks {
+            upstream,
+            downstream,
+            ..
+        } = links;
+        // Resolve every target before swapping anything: validation guarantees
+        // the handles, but if that ever broke, the error must be PeerRejected
+        // (nothing swapped, engine untouched), not Backend, which fences.
+        let missing = |side: &str| {
+            EngineError::PeerRejected(format!(
+                "gemma4 reattach_streams: validated {side} has no handle on this stage"
+            ))
+        };
+        let up = match upstream {
+            Some(s) => Some((self.upstream.clone().ok_or_else(|| missing("upstream"))?, s)),
+            None => None,
+        };
+        let down = match downstream {
+            Some(s) => Some((
+                self.downstream
+                    .clone()
+                    .ok_or_else(|| missing("downstream"))?,
+                s,
+            )),
+            None => None,
+        };
+        if let Some((server, s)) = up {
+            self.block_on(cascadia_transport::attach_server(&server, s));
+        }
+        if let Some((client, s)) = down {
+            self.block_on(cascadia_transport::attach_client(&client, s));
+        }
+        // Clean between-requests state. A failure here is post-swap, so it is
+        // Backend (never PeerRejected): the runner fences until a later re-attach.
+        self.reset_session_state().map_err(|e| {
+            EngineError::Backend(format!("gemma4 reattach reset_state failed: {e}"))
+        })?;
+        Ok(())
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
@@ -1919,12 +2021,14 @@ impl cascadia_engine::KvCoordination for Gemma4Engine {
         // Drop a STAGED slice first so a later commit cannot resurrect it.
         let _ = self.kv.take_capture(epoch);
         // Verdict rejected after this rank applied — rebuild the request to drop the restored state.
-        // gemma4 keeps no warm flag, so the rebuild alone returns it to cold; `state_restored` makes
-        // the following cold reset upgrade to a rebuild too (this model's reset_state leaves residue).
-        if let Err(e) = self.runtime.recreate_request() {
+        // gemma4 keeps no warm flag, so the rebuild alone returns it to cold. Only a FAILED rebuild
+        // leaves `state_restored` set, upgrading the next new sequence's clear to a rebuild (this
+        // model's reset_state leaves residue); a successful one is not repeated there.
+        if let Err(e) =
+            crate::runtime::scrub_restore_now(&mut self.runtime, &mut self.state_restored)
+        {
             warn!(error = %e, "gemma4: recreate_request on warm-resume abort failed");
         }
-        self.state_restored = true;
     }
 
     fn kv_bearing_ranks(&self, total_ranks: usize) -> usize {
@@ -2688,15 +2792,349 @@ mod tests {
         let (_fd, down) = tokio::io::duplex(64);
         let (_fe, ep) = tokio::io::duplex(64);
         assert!(matches!(
-            b.connect_streams(cascadia_engine::StreamLinks {
-                upstream: Some(Box::new(up)),
-                downstream: Some(Box::new(down)),
-                ep_driver: Some(Box::new(ep)),
-                ..Default::default()
+            b.connect_streams({
+                let mut l = cascadia_engine::StreamLinks::pipeline(
+                    Some(Box::new(up)),
+                    Some(Box::new(down)),
+                );
+                l.ep_driver = Some(Box::new(ep));
+                l
             })
             .await,
             Err(EngineError::PeerRejected(_))
         ));
         assert!(b.upstream.is_none() && b.downstream.is_none());
+    }
+
+    /// Build a `Gemma4Engine` without weights. `cascadia_ov_genai_shim::Runtime`
+    /// is a zero-field (zero-sized) struct in a stub, non-`openvino` build, so
+    /// `OvRuntime {}` constructs with no IR or device — enough to drive the pure
+    /// state logic of `cancel()` / `reattach_streams`. That literal does not
+    /// compile against the real shim, so this helper and every test using it are
+    /// stub-only. In the stub every OV call (`reset_state`, `recreate_request`)
+    /// returns `Err(Stub)`; the tests assert on engine state, not on that error.
+    /// Injected handles are built from throwaway duplex pairs whose far ends are
+    /// dropped unless a test keeps them to check the swapped stream is live.
+    #[cfg(not(feature = "openvino"))]
+    fn stub_gemma4(is_first: bool, is_last: bool) -> Gemma4Engine {
+        let mut spec = ShardSpec::single_stage("m", "CPU");
+        spec.is_first_stage = is_first;
+        spec.is_last_stage = is_last;
+        let upstream = if is_first {
+            None
+        } else {
+            let (_far, near) = tokio::io::duplex(1 << 16);
+            Some(Arc::new(tokio::sync::Mutex::new(
+                ActivationServer::from_stream(Box::new(near)),
+            )))
+        };
+        let downstream = if is_last {
+            None
+        } else {
+            let (_far, near) = tokio::io::duplex(1 << 16);
+            Some(Arc::new(tokio::sync::Mutex::new(
+                ActivationClient::from_stream(Box::new(near)),
+            )))
+        };
+        Gemma4Engine {
+            spec,
+            num_kv_shared_layers: 0,
+            num_stages: if is_first && is_last { 1 } else { 2 },
+            runtime: OvRuntime {},
+            tokenizer: None,
+            eos_token_ids: Vec::new(),
+            upstream,
+            downstream,
+            runtime_handle: tokio::runtime::Handle::current(),
+            position: 0,
+            state_restored: false,
+            canonical_inputs: std::collections::HashMap::new(),
+            pending: Vec::new(),
+            active: None,
+            cross_kv_out: Vec::new(),
+            external_kv_in: Vec::new(),
+            pending_external_kv: std::collections::HashMap::new(),
+            step_warn: StepWarnLimiter::default(),
+            #[cfg(feature = "kv_coord")]
+            kv: crate::kv_coordination::OvKvCache::default(),
+            #[cfg(feature = "kv_coord")]
+            kv_share: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::kv_coordination::OvKvCache::default(),
+            )),
+        }
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    fn stub_active(id: &str) -> ActiveTask {
+        ActiveTask {
+            task: GenerationTask::new(id, "hello"),
+            prompt_ids: vec![1, 2, 3],
+            generated: Vec::new(),
+            last_text: String::new(),
+            prefilled: false,
+            last_token: 0,
+            resume_seed_len: 0,
+            warm_prefix: 0,
+            started: std::time::Instant::now(),
+            t_alpha_compute: std::time::Duration::ZERO,
+            t_wire: std::time::Duration::ZERO,
+        }
+    }
+
+    /// Counts which clear a relay chose; `fail_recreate` makes the rebuild fail.
+    #[derive(Default)]
+    struct CountingClear {
+        resets: u32,
+        recreates: u32,
+        fail_recreate: bool,
+    }
+
+    impl crate::runtime::OvStateClear for CountingClear {
+        fn reset_state(&mut self) -> Result<(), OvError> {
+            self.resets += 1;
+            Ok(())
+        }
+        fn recreate_request(&mut self) -> Result<(), OvError> {
+            self.recreates += 1;
+            if self.fail_recreate {
+                Err(OvError::Native("recreate failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// The relay's wire-position-0 decision after a RESTORE: a new sequence at position 0 rebuilds
+    /// (once), a warm turn continuing at the restored position clears nothing, and without a
+    /// restore position 0 is the cheap reset.
+    #[test]
+    fn relay_rebuilds_at_wire_position_zero_only_after_a_restore() {
+        let mut rt = CountingClear::default();
+        // RESTOREd, then the warm turn's suffix arrives at the restored position: keep the state.
+        let mut restored = true;
+        relay_scrub_at_wire_position(17, &mut rt, &mut restored).unwrap();
+        assert_eq!(
+            (rt.resets, rt.recreates),
+            (0, 0),
+            "a warm turn is not wiped"
+        );
+        assert!(restored);
+        // The next new sequence starts at 0: rebuild, then forget the restore.
+        relay_scrub_at_wire_position(0, &mut rt, &mut restored).unwrap();
+        assert_eq!(
+            (rt.resets, rt.recreates),
+            (0, 1),
+            "reset_state cannot scrub a restore"
+        );
+        assert!(!restored);
+        // Another new sequence: nothing restored any more, so the cheap reset.
+        relay_scrub_at_wire_position(0, &mut rt, &mut restored).unwrap();
+        assert_eq!((rt.resets, rt.recreates), (1, 1));
+        // A failed rebuild keeps the flag, so the next position 0 retries it.
+        let mut rt = CountingClear {
+            fail_recreate: true,
+            ..Default::default()
+        };
+        let mut restored = true;
+        assert!(relay_scrub_at_wire_position(0, &mut rt, &mut restored).is_err());
+        assert!(restored);
+    }
+
+    /// Regression (review C1): a warm-restored turn leaves residue the cheap
+    /// `reset_state` cannot scrub; only the `state_restored` flag makes the next
+    /// cold admission rebuild the request. Cancelling must not forget it.
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test]
+    async fn cancel_after_a_warm_restore_keeps_the_rebuild_for_the_next_cold_admission() {
+        let mut e = stub_gemma4(true, true);
+        e.active = Some(stub_active("t0"));
+        e.state_restored = true;
+        let id = e.active.as_ref().unwrap().task.task_id.clone();
+        e.cancel(&id);
+        assert!(e.active.is_none());
+        assert!(
+            e.state_restored,
+            "next cold admission must rebuild, not cheap-reset over restore residue"
+        );
+    }
+
+    /// Regression (review C1), re-attach flavour of the test above.
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_after_a_warm_restore_keeps_the_rebuild_for_the_next_cold_admission() {
+        let mut e = stub_gemma4(true, false);
+        e.state_restored = true;
+        let (_far, near) = tokio::io::duplex(1 << 16);
+        let res = e.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            None,
+            Some(Box::new(near)),
+        ));
+        assert!(
+            !matches!(res, Err(EngineError::PeerRejected(_))),
+            "got {res:?}"
+        );
+        assert!(
+            e.state_restored,
+            "next cold admission must rebuild, not cheap-reset over restore residue"
+        );
+    }
+
+    /// `cancel()` keeps main's behaviour: it drops the task and nothing else
+    /// (every admission scrubs; see `cancel`).
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test]
+    async fn cancel_drops_only_the_matching_active_task() {
+        let mut e = stub_gemma4(true, true);
+        e.active = Some(stub_active("t0"));
+        e.position = 5;
+        let active_id = e.active.as_ref().unwrap().task.task_id.clone();
+        let other_id = GenerationTask::new("other", "x").task_id;
+
+        // Cancelling a different task must NOT disturb the active one.
+        e.cancel(&other_id);
+        assert!(e.active.is_some());
+        assert_eq!(e.position, 5);
+
+        e.cancel(&active_id);
+        assert!(e.active.is_none(), "active cleared");
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test]
+    async fn reattach_streams_rejects_bad_shape_before_touching_state() {
+        // head: downstream only.
+        let mut e = stub_gemma4(true, false);
+        assert!(matches!(
+            e.reattach_streams(cascadia_engine::StreamLinks::default()),
+            Err(EngineError::PeerRejected(_))
+        ));
+        let (_f, n) = tokio::io::duplex(64);
+        assert!(matches!(
+            e.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+                Some(Box::new(n)),
+                None
+            )),
+            Err(EngineError::PeerRejected(_))
+        ));
+        // Validation rejected before any swap: the downstream Arc is intact.
+        assert!(e.downstream.is_some());
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test]
+    async fn reattach_streams_rejects_ep_links() {
+        // Pipeline-only engine: an EP link alongside a valid downstream
+        // replacement is still a role error, rejected before any swap.
+        let mut e = stub_gemma4(true, false); // head: downstream only
+        let (_fd, down) = tokio::io::duplex(64);
+        let (_fe, ep) = tokio::io::duplex(64);
+        assert!(matches!(
+            e.reattach_streams({
+                let mut l = cascadia_engine::StreamLinks::pipeline(None, Some(Box::new(down)));
+                l.ep_driver = Some(Box::new(ep));
+                l
+            }),
+            Err(EngineError::PeerRejected(_))
+        ));
+        assert!(
+            e.downstream.is_some(),
+            "a rejected shape leaves the engine untouched"
+        );
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_streams_swaps_downstream_live_and_resets_session_state() {
+        use tokio::io::AsyncReadExt;
+        let mut e = stub_gemma4(true, false); // head: downstream only
+        let down_before = e.downstream.clone().unwrap();
+        e.active = Some(stub_active("t0"));
+        e.position = 7;
+
+        let (mut far, near) = tokio::io::duplex(1 << 16);
+        // The swap passed validation, so whatever the OV reset returns (the
+        // stub's `Err(Stub)` maps to Backend; a real runtime returns Ok), it is
+        // never PeerRejected. The swap and field resets happen first either way.
+        let res = e.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            None,
+            Some(Box::new(near)),
+        ));
+        assert!(
+            !matches!(res, Err(EngineError::PeerRejected(_))),
+            "got {res:?}"
+        );
+        assert!(e.active.is_none());
+        assert_eq!(e.position, 0);
+        assert!(Arc::ptr_eq(&down_before, e.downstream.as_ref().unwrap()));
+
+        // The new stream is live: bytes sent via the engine's client arrive on
+        // the far end of the stream passed to reattach_streams.
+        e.downstream
+            .as_ref()
+            .unwrap()
+            .lock()
+            .await
+            .send_raw(b"ping")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 4];
+        far.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+    }
+
+    /// M2: keeping a downstream that can no longer carry frames is refused
+    /// before anything is swapped; keeping a live one is fine.
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_refuses_keeping_a_dead_downstream() {
+        let mut e = stub_gemma4(false, false); // relay: both links
+        e.downstream.as_ref().unwrap().lock().await.close().await;
+        let (_far, near) = tokio::io::duplex(1 << 16);
+        let res = e.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            Some(Box::new(near)),
+            None,
+        ));
+        assert!(
+            matches!(&res, Err(EngineError::PeerRejected(m)) if m.contains("kept downstream link is dead")),
+            "got {res:?}"
+        );
+        let mut e = stub_gemma4(false, false);
+        let (_far, near) = tokio::io::duplex(1 << 16);
+        let res = e.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            Some(Box::new(near)),
+            None,
+        ));
+        assert!(
+            !matches!(res, Err(EngineError::PeerRejected(_))),
+            "a live downstream may be kept, got {res:?}"
+        );
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_streams_swaps_upstream_live() {
+        use tokio::io::AsyncWriteExt;
+        let mut e = stub_gemma4(false, true); // tail: upstream only
+        let (mut far, near) = tokio::io::duplex(1 << 16);
+        let res = e.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            Some(Box::new(near)),
+            None,
+        ));
+        // Past validation: never PeerRejected (see the downstream test above).
+        assert!(
+            !matches!(res, Err(EngineError::PeerRejected(_))),
+            "got {res:?}"
+        );
+        far.write_all(b"pong").await.unwrap();
+        let got = e
+            .upstream
+            .as_ref()
+            .unwrap()
+            .lock()
+            .await
+            .recv_raw(4)
+            .await
+            .unwrap();
+        assert_eq!(got, b"pong");
     }
 }

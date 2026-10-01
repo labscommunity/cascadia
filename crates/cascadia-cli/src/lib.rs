@@ -2428,27 +2428,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
                 );
             }
         }
-        // Bounded close so a stuck peer / transport doesn't force the
-        // operator to escalate `kill` → `kill -9`. `Runner::close()` is
-        // sync (parking_lot::Mutex) and may block_on async transport
-        // teardown internally; dispatch via spawn_blocking so the timer
-        // can actually fire, then await with a deadline. On timeout we
-        // log loudly and return — the process exit will SIGKILL any
-        // straggler threads, which is the right outcome at that point.
-        const SHUTDOWN_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-        let r = runner.clone();
-        let close_task = tokio::task::spawn_blocking(move || r.close());
-        match tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, close_task).await {
-            Ok(Ok(())) => info!("runner.close() complete"),
-            Ok(Err(join_err)) => tracing::warn!(
-                error = %join_err,
-                "runner.close() task panicked"
-            ),
-            Err(_) => tracing::warn!(
-                timeout_s = SHUTDOWN_CLOSE_TIMEOUT.as_secs(),
-                "runner.close() exceeded timeout; abandoning teardown"
-            ),
-        }
+        close_runner_bounded(&runner).await;
         return Ok(());
     }
 
@@ -2457,6 +2437,46 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
+    let result = stdin_loop(&runner, &mut lines, args.max_tokens).await;
+    // EOF or a fatal error: run the same bounded teardown as API mode, so
+    // close() is never skipped (in stream mode a parked relay only returns
+    // once close() runs).
+    close_runner_bounded(&runner).await;
+    result
+}
+
+/// Bounded close so a stuck peer / transport doesn't force the operator to
+/// escalate `kill` → `kill -9`. `Runner::close()` is sync (parking_lot::Mutex)
+/// and may block_on async transport teardown internally; dispatch via
+/// spawn_blocking so the timer can actually fire, then await with a deadline.
+/// On timeout we log loudly and return — the process exit will SIGKILL any
+/// straggler threads, which is the right outcome at that point.
+async fn close_runner_bounded(runner: &Arc<Runner>) {
+    const SHUTDOWN_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let r = runner.clone();
+    let close_task = tokio::task::spawn_blocking(move || r.close());
+    match tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, close_task).await {
+        Ok(Ok(())) => info!("runner.close() complete"),
+        Ok(Err(join_err)) => tracing::warn!(
+            error = %join_err,
+            "runner.close() task panicked"
+        ),
+        Err(_) => tracing::warn!(
+            timeout_s = SHUTDOWN_CLOSE_TIMEOUT.as_secs(),
+            "runner.close() exceeded timeout; abandoning teardown"
+        ),
+    }
+}
+
+/// Read prompts line by line and stream each completion to stdout until EOF.
+async fn stdin_loop<R>(
+    runner: &Arc<Runner>,
+    lines: &mut tokio::io::Lines<R>,
+    max_tokens: u32,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
     let mut counter = 0usize;
     while let Some(line) = lines.next_line().await? {
         let line = line.trim().to_string();
@@ -2467,7 +2487,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         let task = GenerationTask {
             task_id: format!("stdin-{counter}"),
             prompt: line,
-            max_tokens: args.max_tokens,
+            max_tokens,
             temperature: 0.0,
             logprobs: 0,
             sampling: cascadia_types::SamplingParams::default(),
@@ -2480,15 +2500,106 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // runtime, and the sync path would block a worker on the engine
         // mutex for a full step (#122). Benign while stdin is serial, but
         // it is the exact pattern the API layer had to unwind.
-        let mut stream = runner.generate_async(task).await?;
-        while let Some(chunk) = stream.next().await {
-            print!("{}", chunk.text);
-            if chunk.is_final {
-                println!();
+        let mut stream = match runner.generate_async(task).await {
+            Ok(stream) => stream,
+            // One bad input (e.g. a 1-token prompt on a stateful multi-stage
+            // head) must not end the session: report it and read the next line.
+            Err(e) if is_per_request_refusal(&e) => {
+                eprintln!("request refused: {e}");
+                continue;
             }
+            Err(e) => return Err(e.into()),
+        };
+        let stdout = std::io::stdout();
+        let stderr = std::io::stderr();
+        while let Some(chunk) = stream.next().await {
+            write_stdin_chunk(&mut stdout.lock(), &mut stderr.lock(), &chunk)?;
         }
     }
     Ok(())
+}
+
+/// A submit error that refuses only this request (the input or the moment
+/// was wrong, the engine is fine): the stdin loop reports it and continues.
+/// Matches the API's 4xx/retry-later classes; anything else ends the loop.
+fn is_per_request_refusal(e: &cascadia_engine::EngineError) -> bool {
+    use cascadia_engine::EngineError as E;
+    matches!(
+        e,
+        E::InvalidConfig(_) | E::PromptTooLong(_) | E::QueueFull { .. }
+    )
+}
+
+/// Print one stdin-mode chunk: its text to `out`, a newline after the final
+/// chunk, and a failed request's `error` to `err` (an error chunk carries no
+/// text, so without this a failure looked like an empty answer).
+fn write_stdin_chunk(
+    out: &mut impl std::io::Write,
+    err: &mut impl std::io::Write,
+    chunk: &cascadia_types::Chunk,
+) -> std::io::Result<()> {
+    write!(out, "{}", chunk.text)?;
+    if chunk.is_final {
+        writeln!(out)?;
+    }
+    out.flush()?;
+    if let Some(e) = &chunk.error {
+        writeln!(err, "request failed: {e}")?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod stdin_mode_tests {
+    use super::*;
+    use cascadia_engine::EngineError;
+
+    #[test]
+    fn client_refusals_keep_the_stdin_loop_going() {
+        assert!(is_per_request_refusal(&EngineError::InvalidConfig(
+            "1-token prompts are not supported".into()
+        )));
+        assert!(is_per_request_refusal(&EngineError::PromptTooLong(
+            "x".into()
+        )));
+        assert!(is_per_request_refusal(&EngineError::QueueFull {
+            queued: 1,
+            cap: 1
+        }));
+        assert!(!is_per_request_refusal(&EngineError::NotConnected));
+        assert!(!is_per_request_refusal(&EngineError::Backend(
+            "boom".into()
+        )));
+        assert!(!is_per_request_refusal(&EngineError::NotLoaded));
+    }
+
+    #[test]
+    fn stdin_chunks_print_text_and_report_errors() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        write_stdin_chunk(
+            &mut out,
+            &mut err,
+            &cascadia_types::Chunk::token("t", 1, "hi"),
+        )
+        .unwrap();
+        write_stdin_chunk(
+            &mut out,
+            &mut err,
+            &cascadia_types::Chunk::final_marker("t", ""),
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "hi\n");
+        assert!(err.is_empty());
+
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let failed = cascadia_types::Chunk::error("t", "link re-attached");
+        write_stdin_chunk(&mut out, &mut err, &failed).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "\n");
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "request failed: link re-attached\n"
+        );
+    }
 }
 
 /// The bundled Python exporter, included into the binary at build time.

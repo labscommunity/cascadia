@@ -52,6 +52,7 @@
 
 use std::sync::Arc;
 
+use cascadia_engine::{check_reattach_streams, EngineError, EngineResult, LinkShape, StreamLinks};
 use cascadia_transport::{
     ActivationClient, ActivationServer, DType, Tensor, TransportError, TransportResult,
     MAX_RAW_BYTES,
@@ -1359,6 +1360,53 @@ pub async fn forward_reset(downstream: &Mutex<ActivationClient>) -> TransportRes
     send_reset(downstream).await
 }
 
+/// Issue #76: the shared handle a validated re-attach swaps into. Validation
+/// (`check_reattach_streams`) guarantees it is present; an error here means
+/// that guarantee broke. Callers resolve every target before swapping
+/// anything, so even then nothing has been swapped, hence `PeerRejected`
+/// (engine untouched; the runner does not fence), never `Backend`.
+pub(crate) fn reattach_target<'a, T>(
+    link: &'a Option<Arc<Mutex<T>>>,
+    side: &str,
+) -> EngineResult<&'a Arc<Mutex<T>>> {
+    link.as_ref().ok_or_else(|| {
+        EngineError::PeerRejected(format!(
+            "reattach: validated {side} link has no handle on this stage"
+        ))
+    })
+}
+
+/// Whether a failed recv on a worker's upstream leaves that link dead for
+/// good, so the worker latches it (`peer_disconnected`) and its next `step()`
+/// returns a connection-fatal error. The errors: the transport dropped the
+/// stream (`StreamFailed`, a dead-link I/O kind, the frame idle ceiling), it
+/// is already gone (`NotConnected`), or the peer closed it (`SocketClosed`).
+/// A retryable frame-start timeout or a bad frame on a live link is not.
+///
+/// This holds on TCP/UDS too. A worker's `ActivationServer` accepts its
+/// upstream only in `Builder::connect`; once the transport drops that socket
+/// nothing accepts again (every later recv is `NotConnected`), and the head
+/// never re-dials. So a worker that kept retrying would only log every
+/// `WORKER_BACKOFF` forever; the relay must exit for a supervisor restart
+/// (TCP) or park for a re-attach (injected streams). Pure, for testing.
+pub(crate) fn recv_error_kills_link(err: &TransportError) -> bool {
+    match err {
+        TransportError::StreamFailed(_)
+        | TransportError::NotConnected
+        | TransportError::FrameIdleCeiling(_)
+        | TransportError::SocketClosed => true,
+        TransportError::Io(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+        _ => false,
+    }
+}
+
 /// Bundle of the per-rank transport state. The Builder constructs this
 /// during `connect()` and hands it to the Engine.
 #[derive(Default)]
@@ -1374,6 +1422,157 @@ impl StageTransport {
 
     pub fn is_last(&self) -> bool {
         self.downstream.is_none()
+    }
+
+    /// Issue #76: this stage's pipeline [`LinkShape`]. EP links are not carried
+    /// here — an EP driver holds those on its `PipelineEngine`, not on the
+    /// transport.
+    pub(crate) fn link_shape(&self) -> LinkShape {
+        LinkShape::pipeline(self.upstream.is_some(), self.downstream.is_some())
+    }
+
+    /// Issue #76: swap one or both pipeline streams in place after a link
+    /// failure, through `cascadia_transport::attach_server`/`attach_client`.
+    /// Validation runs FIRST via `check_reattach_streams`, so a rejection
+    /// leaves the transport untouched and the caller can return
+    /// `PeerRejected` knowing nothing was swapped. Used by the pipeline-only
+    /// engines (`SparseMoEEngine`, `OvMoeEngine`); `PipelineEngine` validates
+    /// the combined pipeline+EP shape itself and swaps with the same helpers.
+    /// Sparse-moe never detaches a task holding one of these handles across
+    /// steps, so the handle's mutex is the only ordering point.
+    pub(crate) fn reattach(
+        &self,
+        handle: &tokio::runtime::Handle,
+        links: StreamLinks,
+    ) -> EngineResult<()> {
+        check_reattach_streams(self.link_shape(), &links)?;
+        self.check_closed_links_replaced(handle, &links)?;
+        let up = match links.upstream {
+            Some(s) => Some((reattach_target(&self.upstream, "upstream")?, s)),
+            None => None,
+        };
+        let down = match links.downstream {
+            Some(s) => Some((reattach_target(&self.downstream, "downstream")?, s)),
+            None => None,
+        };
+        cascadia_runner::run_async(handle, async move {
+            if let Some((srv, s)) = up {
+                cascadia_transport::attach_server(srv, s).await;
+            }
+            if let Some((cli, s)) = down {
+                cascadia_transport::attach_client(cli, s).await;
+            }
+        });
+        Ok(())
+    }
+}
+
+impl StageTransport {
+    /// Issue #76 (stream mode): close every injected pipeline link this stage
+    /// holds. Called by `close_injected_links_on_latch` for a latch whose
+    /// upstream is still live (a protocol latch): see there. TCP/UDS links are
+    /// left alone: a TCP worker's relay exits on the latch and the process is
+    /// rebuilt. Returns how many links were closed.
+    pub(crate) fn close_injected_links(&self, handle: &tokio::runtime::Handle) -> usize {
+        let (up, down) = (self.upstream.clone(), self.downstream.clone());
+        cascadia_runner::run_async(handle, async move {
+            let mut closed = 0;
+            if let Some(srv) = up {
+                let mut g = srv.lock().await;
+                if g.is_injected() && g.holds_stream() {
+                    g.close().await;
+                    closed += 1;
+                }
+            }
+            if let Some(cli) = down {
+                let mut g = cli.lock().await;
+                if g.is_injected() && g.holds_stream() {
+                    g.close().await;
+                    closed += 1;
+                }
+            }
+            closed
+        })
+    }
+
+    /// Issue #76: whether this stage's upstream link can still carry frames
+    /// (`is_connected`: held, not dropped, peer has not closed it). A stage
+    /// with no upstream (the head) counts as live.
+    pub(crate) fn upstream_is_live(&self, handle: &tokio::runtime::Handle) -> bool {
+        match self.upstream.clone() {
+            Some(srv) => {
+                cascadia_runner::run_async(handle, async move { srv.lock().await.is_connected() })
+            }
+            None => true,
+        }
+    }
+
+    /// Issue #76: a re-attach may keep a link only while it can still carry
+    /// frames. One that was closed (`close_injected_links`), dropped by the
+    /// transport, or closed by its peer is dead for good, so keeping it would
+    /// park the stage again on its first frame: `PeerRejected` (nothing
+    /// swapped) naming the side ([`cascadia_engine::kept_link_dead`]). A
+    /// peer's close is seen once this stage has read the EOF.
+    pub(crate) fn check_closed_links_replaced(
+        &self,
+        handle: &tokio::runtime::Handle,
+        links: &StreamLinks,
+    ) -> EngineResult<()> {
+        let up = self.upstream.clone().filter(|_| links.upstream.is_none());
+        let down = self
+            .downstream
+            .clone()
+            .filter(|_| links.downstream.is_none());
+        let (up_dead, down_dead) = cascadia_runner::run_async(handle, async move {
+            let up_dead = match up {
+                Some(srv) => !srv.lock().await.is_connected(),
+                None => false,
+            };
+            let down_dead = match down {
+                Some(cli) => !cli.lock().await.is_connected(),
+                None => false,
+            };
+            (up_dead, down_dead)
+        });
+        for (dead, side) in [(up_dead, "upstream"), (down_dead, "downstream")] {
+            if dead {
+                return Err(cascadia_engine::kept_link_dead(side));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Issue #76: a worker's `step()` latched (`peer_disconnected` went from
+/// false to true). Only a PROTOCOL latch closes links: one whose upstream is
+/// still live (a failed prefill frame, a prefix-restore miss, a bad hidden
+/// width, a downstream failure mid-frame). That worker parks and serves
+/// nothing over links that look healthy, so without closing them its
+/// neighbours would notice only at the head's reply deadline; closing its
+/// injected links makes each peer, and the embedder's ends, see EOF at once.
+/// A DEAD-UPSTREAM latch (EOF, a dead-link error, the idle ceiling) closes
+/// nothing: the embedder already sees that link die, and closing the healthy
+/// downstream would cascade the outage to the tail. No-op on TCP/UDS.
+pub(crate) fn close_injected_links_on_latch(
+    was_latched: bool,
+    latched: bool,
+    transport: &StageTransport,
+    handle: &tokio::runtime::Handle,
+) {
+    if !latched || was_latched {
+        return;
+    }
+    if !transport.upstream_is_live(handle) {
+        tracing::debug!("worker latched on a dead upstream; its other links stay open");
+        return;
+    }
+    let closed = transport.close_injected_links(handle);
+    if closed > 0 {
+        tracing::warn!(
+            closed,
+            "worker latched on a protocol failure; closed its injected links so peers see EOF \
+             (re-attach all of them)"
+        );
     }
 }
 
@@ -1845,5 +2044,157 @@ mod expert_frame_tests {
         // An F32 tensor where ids are expected is a framing error, not a silent reinterpretation.
         let f = hidden_to_tensor(&[1.0, 2.0], [1, 2, 1]);
         assert!(tensor_to_ids(&f).is_err());
+    }
+}
+
+#[cfg(test)]
+mod reattach_tests {
+    use super::*;
+    use cascadia_engine::{EngineError, StreamLinks};
+
+    fn tensor() -> Tensor {
+        // [1,1,2] F32 = 1.0, 2.0 little-endian (8 bytes). MAX_RANK == 3.
+        Tensor::new(DType::F32, [1, 1, 2], vec![0, 0, 128, 63, 0, 0, 0, 64])
+    }
+
+    /// The helper swaps a fresh DOWNSTREAM (client) stream INTO the existing Arc
+    /// — the one SparseActive/OvMoeActive/PipeActive clone — and never replaces
+    /// the Arc.
+    #[test]
+    fn reattach_swaps_downstream_into_the_cloned_arc() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (near, far) = tokio::io::duplex(1 << 16);
+        let cli = Arc::new(Mutex::new(ActivationClient::from_stream(Box::new(near))));
+        let cli_clone = Arc::clone(&cli); // stand-in for an Active's downstream clone
+        let transport = StageTransport {
+            upstream: None,
+            downstream: Some(cli),
+        };
+        drop(far); // old link dead (embedder closed its end — contract item 3)
+
+        let (near2, far2) = tokio::io::duplex(1 << 16);
+        transport
+            .reattach(
+                rt.handle(),
+                StreamLinks::pipeline(None, Some(Box::new(near2))),
+            )
+            .expect("downstream-only reattach");
+
+        assert!(
+            Arc::ptr_eq(&cli_clone, transport.downstream.as_ref().unwrap()),
+            "the Arc must be swapped in place, never replaced"
+        );
+        rt.block_on(async {
+            let mut peer = ActivationServer::from_stream(Box::new(far2));
+            cli_clone.lock().await.send(&tensor()).await.unwrap();
+            let (got, _) = peer.recv().await.unwrap();
+            assert_eq!(
+                got.data,
+                tensor().data,
+                "the clone carries the fresh stream"
+            );
+        });
+    }
+
+    /// Same for a fresh UPSTREAM (server) stream.
+    #[test]
+    fn reattach_swaps_upstream_into_the_cloned_arc() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (near, far) = tokio::io::duplex(1 << 16);
+        let srv = Arc::new(Mutex::new(ActivationServer::from_stream(Box::new(near))));
+        let srv_clone = Arc::clone(&srv);
+        let transport = StageTransport {
+            upstream: Some(srv),
+            downstream: None,
+        };
+        drop(far);
+
+        let (near2, far2) = tokio::io::duplex(1 << 16);
+        transport
+            .reattach(
+                rt.handle(),
+                StreamLinks::pipeline(Some(Box::new(near2)), None),
+            )
+            .expect("upstream-only reattach");
+
+        assert!(Arc::ptr_eq(
+            &srv_clone,
+            transport.upstream.as_ref().unwrap()
+        ));
+        rt.block_on(async {
+            let mut peer = ActivationClient::from_stream(Box::new(far2));
+            peer.send(&tensor()).await.unwrap();
+            let (got, _) = srv_clone.lock().await.recv().await.unwrap();
+            assert_eq!(got.data, tensor().data);
+        });
+    }
+
+    /// Validation (replacing nothing, a side the stage lacks, or an EP link a
+    /// pipeline transport cannot carry) rejects with PeerRejected and leaves the
+    /// transport untouched — before any swap.
+    #[test]
+    fn reattach_validation_rejects_bad_shapes() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (near, _far) = tokio::io::duplex(64);
+        let transport = StageTransport {
+            upstream: None,
+            downstream: Some(Arc::new(Mutex::new(ActivationClient::from_stream(
+                Box::new(near),
+            )))),
+        };
+        // Both None → replaces nothing.
+        assert!(matches!(
+            transport.reattach(rt.handle(), StreamLinks::default()),
+            Err(EngineError::PeerRejected(_))
+        ));
+        // An upstream this stage lacks.
+        assert!(matches!(
+            transport.reattach(
+                rt.handle(),
+                StreamLinks::pipeline(Some(Box::new(tokio::io::duplex(64).0)), None),
+            ),
+            Err(EngineError::PeerRejected(_))
+        ));
+        // An EP link on a pipeline-only transport.
+        assert!(matches!(
+            transport.reattach(
+                rt.handle(),
+                StreamLinks::ep_driver(Box::new(tokio::io::duplex(64).0)),
+            ),
+            Err(EngineError::PeerRejected(_))
+        ));
+    }
+
+    /// A missing re-attach target is reported before any swap, so it must not
+    /// fence the runner: `PeerRejected`, never `Backend`.
+    #[test]
+    fn a_missing_reattach_target_is_peer_rejected() {
+        let none: Option<Arc<Mutex<ActivationClient>>> = None;
+        assert!(matches!(
+            reattach_target(&none, "downstream"),
+            Err(EngineError::PeerRejected(m)) if m.contains("downstream")
+        ));
+    }
+
+    /// Only errors after which the transport has dropped the stream count as
+    /// a dead link; a retryable frame-start timeout or a bad frame does not.
+    #[test]
+    fn recv_error_kills_link_only_for_dead_link_errors() {
+        use std::io::{Error, ErrorKind};
+        for dead in [
+            TransportError::StreamFailed(Error::other("p2p")),
+            TransportError::NotConnected,
+            TransportError::FrameIdleCeiling(std::time::Duration::from_secs(1)),
+            TransportError::Io(Error::from(ErrorKind::ConnectionReset)),
+        ] {
+            assert!(recv_error_kills_link(&dead), "{dead:?}");
+        }
+        for live in [
+            TransportError::FrameStartTimeout(std::time::Duration::from_secs(1)),
+            TransportError::RawSizeTooLarge(1),
+            TransportError::Io(Error::other("bad frame kind")),
+        ] {
+            assert!(!recv_error_kills_link(&live), "{live:?}");
+        }
     }
 }

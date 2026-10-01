@@ -32,15 +32,15 @@ use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_ov_genai_shim::{
     advance_emitted, DType as ShimDType, Error as OvError, PluginConfig, Runtime as OvRuntime,
 };
+#[cfg(feature = "kv_coord")]
+use cascadia_transport::MAX_RAW_BYTES;
 use cascadia_transport::{
-    recv_tensor, send_tensor, ActivationClient, ActivationServer, DType as WireDType,
-    Tensor as WireTensor, MAX_RANK, MAX_RAW_BYTES,
+    ActivationClient, ActivationServer, DType as WireDType, Tensor as WireTensor, MAX_RANK,
 };
 use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId};
 use futures::stream;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
-use tokio::net::TcpStream;
 #[cfg(feature = "kv_coord")]
 use tracing::error;
 use tracing::{info, warn};
@@ -165,6 +165,31 @@ fn argmax(slice: &[f32]) -> usize {
     best_i
 }
 
+/// Issue #76: validate a dist_spec WORKER `reattach_streams` request BEFORE any
+/// stream is swapped. Pure (no engine state) so the rule is unit-testable
+/// without model weights.
+///
+/// Delegates the base rules (>=1 replaced, only sides the stage has, no EP
+/// links) to `check_reattach_streams`, then adds the worker rule: the
+/// connection-fatal path in `OvDistSpecWorkerEngine::step` `close()`s BOTH the
+/// upstream and the downstream, so a partial re-attach would keep a dead hop and
+/// loop. Every link the stage has must be replaced: the upstream always, the
+/// downstream iff the stage has one.
+fn validate_worker_reattach(
+    stage: cascadia_engine::LinkShape,
+    links: &cascadia_engine::StreamLinks,
+) -> EngineResult<()> {
+    cascadia_engine::check_reattach_streams(stage, links)?;
+    if links.upstream.is_none() || (stage.downstream && links.downstream.is_none()) {
+        return Err(EngineError::PeerRejected(
+            "ov-dist-spec worker re-attach must replace every link it has: its connection-fatal \
+             path closes both the upstream and the downstream hop, so both must be re-attached"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn map_ov_err(err: OvError) -> EngineError {
     match err {
         OvError::Stub => {
@@ -266,127 +291,6 @@ fn v5_inputs(
     crate::runtime::resolve_canonical_inputs(runtime)
 }
 
-// -------- frame send / recv on the underlying TcpStream --------
-
-async fn send_forward(
-    sock: &mut TcpStream,
-    logical_pos_start: u32,
-    attn_mask_total: usize,
-    attn_mask: &[i64],
-    hidden_shape: [u32; MAX_RANK],
-    hidden_data: Vec<u8>,
-) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let mut header = [0u8; 8];
-    header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
-    header[4..8].copy_from_slice(&logical_pos_start.to_be_bytes());
-    sock.write_all(&header).await?;
-    let attn_tensor = WireTensor::new(
-        WireDType::I64,
-        [1, 1, attn_mask_total as u32],
-        i64_to_bytes(attn_mask),
-    );
-    send_tensor(sock, &attn_tensor).await.map_err(io_err)?;
-    let hidden_tensor = WireTensor::new(WireDType::F16, hidden_shape, hidden_data);
-    send_tensor(sock, &hidden_tensor).await.map_err(io_err)?;
-    Ok(())
-}
-
-async fn send_reset(sock: &mut TcpStream) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let bytes = (FrameKind::Reset as u32).to_be_bytes();
-    sock.write_all(&bytes).await?;
-    sock.flush().await?;
-    Ok(())
-}
-
-async fn send_logits(
-    sock: &mut TcpStream,
-    logits_shape: [u32; MAX_RANK],
-    logits_data: Vec<u8>,
-) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let bytes = (FrameKind::LogitsResponse as u32).to_be_bytes();
-    sock.write_all(&bytes).await?;
-    let tensor = WireTensor::new(WireDType::F16, logits_shape, logits_data);
-    send_tensor(sock, &tensor).await.map_err(io_err)?;
-    Ok(())
-}
-
-async fn recv_kind(sock: &mut TcpStream) -> std::io::Result<FrameKind> {
-    use tokio::io::AsyncReadExt;
-    let mut buf = [0u8; 4];
-    sock.read_exact(&mut buf).await?;
-    let v = u32::from_be_bytes(buf);
-    FrameKind::from_u32(v).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad kind: {v}"))
-    })
-}
-
-/// After `recv_kind` returned `Forward`, read the rest of the body.
-/// Returns `(logical_pos_start, attention_mask, hidden_states_f32, hidden_shape)`.
-async fn recv_forward_body(
-    sock: &mut TcpStream,
-) -> std::io::Result<(u32, Vec<i64>, Vec<f32>, [usize; MAX_RANK])> {
-    use tokio::io::AsyncReadExt;
-    let mut pos_buf = [0u8; 4];
-    sock.read_exact(&mut pos_buf).await?;
-    let logical_pos_start = u32::from_be_bytes(pos_buf);
-    let (attn, _) = recv_tensor(sock).await.map_err(io_err)?;
-    let attn_mask = bytes_to_i64(&attn.data);
-    let (hidden, _) = recv_tensor(sock).await.map_err(io_err)?;
-    let hs_f32 = match hidden.dtype {
-        WireDType::F32 => hidden
-            .data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-        WireDType::F16 => f16_bytes_to_f32(&hidden.data),
-        other => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("unexpected hidden dtype {other:?}"),
-            ))
-        }
-    };
-    let shape = [
-        hidden.shape[0] as usize,
-        hidden.shape[1] as usize,
-        hidden.shape[2] as usize,
-    ];
-    Ok((logical_pos_start, attn_mask, hs_f32, shape))
-}
-
-async fn recv_logits_body(sock: &mut TcpStream) -> std::io::Result<(Vec<f32>, [usize; MAX_RANK])> {
-    let (t, _) = recv_tensor(sock).await.map_err(io_err)?;
-    let f = match t.dtype {
-        WireDType::F32 => t
-            .data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-        WireDType::F16 => f16_bytes_to_f32(&t.data),
-        other => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("unexpected logits dtype {other:?}"),
-            ))
-        }
-    };
-    Ok((
-        f,
-        [
-            t.shape[0] as usize,
-            t.shape[1] as usize,
-            t.shape[2] as usize,
-        ],
-    ))
-}
-
-fn io_err(e: cascadia_transport::TransportError) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-}
-
 // -------- MaskedReq (local draft / target wrapper with mask-based rewind) --------
 
 /// Bound on every §8 CAPTURE/RESTORE ack wait — a reply to in-flight work must use a strict
@@ -409,6 +313,10 @@ pub struct MaskedReq {
     cache_len: usize,
     logical_pos: usize,
     inputs: std::collections::HashMap<String, String>,
+    /// A `set_state_blob` has been applied and not yet scrubbed by a rebuild, so the next cold
+    /// clear must rebuild the request (see `crate::runtime::clear_ov_state`). Only ever true in
+    /// `kv_coord` builds.
+    state_restored: bool,
 }
 
 #[cfg(feature = "kv_coord")]
@@ -417,6 +325,8 @@ impl MaskedReq {
         self.runtime.get_state_blob().ok()
     }
     pub(crate) fn kv_restore(&mut self, b: &[u8]) -> bool {
+        // Set even on Err: a failed set may have applied PARTIALLY.
+        self.state_restored = true;
         self.runtime.set_state_blob(b).is_ok()
     }
     /// Scrub after a `set_state_blob` this turn is abandoning — failed (the request may be
@@ -425,8 +335,12 @@ impl MaskedReq {
     /// `recreate_request` doc), so rebuild the request, then `reset` the host cursors — the
     /// cold reprefill must not run over half the donor's KV.
     pub(crate) fn kv_scrub(&mut self) {
-        if let Err(e) = self.runtime.recreate_request() {
-            error!(error = %e, "ov-dist-spec: draft recreate_request scrub failed; KV state may be dirty");
+        match self.runtime.recreate_request() {
+            Ok(()) => self.state_restored = false,
+            Err(e) => {
+                self.state_restored = true;
+                error!(error = %e, "ov-dist-spec: draft recreate_request scrub failed; KV state may be dirty");
+            }
         }
         let _ = self.reset();
     }
@@ -477,11 +391,12 @@ impl MaskedReq {
             cache_len: 0,
             logical_pos: 0,
             inputs,
+            state_restored: false,
         })
     }
 
     pub fn reset(&mut self) -> Result<(), EngineError> {
-        self.runtime.reset_state().map_err(map_ov_err)?;
+        crate::runtime::clear_ov_state(&mut self.runtime, &mut self.state_restored)?;
         for m in self.valid_mask.iter_mut() {
             *m = 1;
         }
@@ -607,21 +522,88 @@ impl MaskedReq {
 
 // -------- DistributedMaskedReq (driver-side wrapper for multi-stage target) --------
 
+/// Logits (as f32) and their wire shape from one FORWARD -> LOGITS_RESPONSE round-trip.
+type ForwardReply = Result<(Vec<f32>, [usize; 3]), cascadia_transport::TransportError>;
+
 /// Handle to a target.feed network round-trip in flight. Created by
 /// `feed_send_async`, awaited by `feed_recv_async`.
 ///
 /// **Drop semantics**: dropping a `TargetSendHandle` without calling
-/// `feed_recv_async` does NOT cancel the spawned network task — tokio's
-/// `JoinHandle::drop` only discards the result, the task itself continues
-/// to completion. The bytes are still sent and received over the wire,
-/// and the next operation on the same `DistributedMaskedReq` will queue
-/// behind the orphan via the `downstream` mutex. To actually cancel,
-/// call `JoinHandle::abort` (not currently exposed). In practice
-/// `spec_decode_greedy` always awaits the handle, so this is a
-/// theoretical concern for unusual callers.
+/// `feed_recv_async` (an early return between the two in `spec_decode_greedy`)
+/// cancels the round-trip if it has not started writing yet: the task checks
+/// `cancelled` once it holds the downstream lock and returns without touching
+/// the stream. That lock is what a re-attach holds while it swaps the stream,
+/// so an orphan can never put a stale FORWARD on a re-attached stream.
+///
+/// Not `JoinHandle::abort`: an abort lands at the next await point, which may
+/// be mid-frame, and a truncated FORWARD on a live (kept) link desyncs every
+/// later exchange. A round-trip that already started writing therefore runs to
+/// completion and keeps the link frame-aligned, as it did before.
 pub struct TargetSendHandle {
-    join:
-        tokio::task::JoinHandle<Result<(Vec<f32>, [usize; 3]), cascadia_transport::TransportError>>,
+    join: tokio::task::JoinHandle<ForwardReply>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for TargetSendHandle {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Spawn the driver's FORWARD -> LOGITS_RESPONSE round-trip on `downstream` (the network half of
+/// `DistributedMaskedReq::feed_send_async`). `attn` spans the whole `[0, total)` attention window.
+fn spawn_forward_round_trip(
+    runtime_handle: &tokio::runtime::Handle,
+    downstream: Arc<tokio::sync::Mutex<ActivationClient>>,
+    logical_pos_start: u32,
+    attn: Vec<i64>,
+    hidden_shape_wire: [u32; MAX_RANK],
+    hidden_f16: Vec<u8>,
+) -> TargetSendHandle {
+    let total = attn.len();
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task_cancelled = cancelled.clone();
+    let join = runtime_handle.spawn(async move {
+        let mut g = downstream.lock().await;
+        // Orphaned before it got the lock (see `TargetSendHandle`): nothing written, nothing owed.
+        if task_cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(cascadia_transport::TransportError::SocketClosed);
+        }
+        let mut header = [0u8; 8];
+        header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
+        header[4..8].copy_from_slice(&logical_pos_start.to_be_bytes());
+        g.send_raw(&header).await?;
+        let attn_tensor =
+            WireTensor::new(WireDType::I64, [1, 1, total as u32], i64_to_bytes(&attn));
+        g.send(&attn_tensor).await?;
+        let hidden_tensor = WireTensor::new(WireDType::F16, hidden_shape_wire, hidden_f16);
+        g.send(&hidden_tensor).await?;
+        let kind_bytes = g.recv_raw(4).await?;
+        let kind = u32::from_be_bytes([kind_bytes[0], kind_bytes[1], kind_bytes[2], kind_bytes[3]]);
+        if kind != FrameKind::LogitsResponse as u32 {
+            return Err(cascadia_transport::TransportError::SocketClosed);
+        }
+        let (t, _) = g.recv().await?;
+        let logits_f32 = match t.dtype {
+            WireDType::F32 => t
+                .data
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<_>>(),
+            WireDType::F16 => f16_bytes_to_f32(&t.data),
+            _ => return Err(cascadia_transport::TransportError::SocketClosed),
+        };
+        Ok::<_, cascadia_transport::TransportError>((
+            logits_f32,
+            [
+                t.shape[0] as usize,
+                t.shape[1] as usize,
+                t.shape[2] as usize,
+            ],
+        ))
+    });
+    TargetSendHandle { join, cancelled }
 }
 
 pub struct DistributedMaskedReq {
@@ -639,6 +621,10 @@ pub struct DistributedMaskedReq {
     pub t_alpha_infer: std::time::Duration,
     pub t_alpha_output: std::time::Duration,
     pub t_wire: std::time::Duration,
+    /// A `set_state_blob` has been applied and not yet scrubbed by a rebuild, so the next cold
+    /// clear must rebuild the request (see `crate::runtime::clear_ov_state`). Only ever true in
+    /// `kv_coord` builds.
+    state_restored: bool,
 }
 
 #[cfg(feature = "kv_coord")]
@@ -647,14 +633,20 @@ impl DistributedMaskedReq {
         self.stage0.get_state_blob().ok()
     }
     pub(crate) fn stage0_restore(&mut self, b: &[u8]) -> bool {
+        // Set even on Err: a failed set may have applied PARTIALLY.
+        self.state_restored = true;
         self.stage0.set_state_blob(b).is_ok()
     }
     /// Scrub after an abandoned `set_state_blob` (see `MaskedReq::kv_scrub`): rebuild the
     /// stage-0 request — `reset_state` cannot clear post-`set_state` residue — then `reset`,
     /// which also re-broadcasts Reset down the chain.
     pub(crate) fn kv_scrub(&mut self) {
-        if let Err(e) = self.stage0.recreate_request() {
-            error!(error = %e, "ov-dist-spec: target recreate_request scrub failed; KV state may be dirty");
+        match self.stage0.recreate_request() {
+            Ok(()) => self.state_restored = false,
+            Err(e) => {
+                self.state_restored = true;
+                error!(error = %e, "ov-dist-spec: target recreate_request scrub failed; KV state may be dirty");
+            }
         }
         let _ = self.reset();
     }
@@ -817,11 +809,12 @@ impl DistributedMaskedReq {
             t_alpha_infer: std::time::Duration::ZERO,
             t_alpha_output: std::time::Duration::ZERO,
             t_wire: std::time::Duration::ZERO,
+            state_restored: false,
         })
     }
 
     pub fn reset(&mut self) -> Result<(), EngineError> {
-        self.stage0.reset_state().map_err(map_ov_err)?;
+        crate::runtime::clear_ov_state(&mut self.stage0, &mut self.state_restored)?;
         let downstream = self.downstream.clone();
         run_async(&self.runtime_handle, async move {
             let mut g = downstream.lock().await;
@@ -917,49 +910,14 @@ impl DistributedMaskedReq {
         self.t_alpha_infer += std::time::Duration::from_micros(infer_us as u64);
         self.t_alpha_output += std::time::Duration::from_micros(output_us as u64);
 
-        let downstream = self.downstream.clone();
-        let attn_clone = attn;
-        let total_clone = total;
-        let join = self.runtime_handle.spawn(async move {
-            let mut g = downstream.lock().await;
-            let mut header = [0u8; 8];
-            header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
-            header[4..8].copy_from_slice(&logical_pos_start.to_be_bytes());
-            g.send_raw(&header).await?;
-            let attn_tensor = WireTensor::new(
-                WireDType::I64,
-                [1, 1, total_clone as u32],
-                i64_to_bytes(&attn_clone),
-            );
-            g.send(&attn_tensor).await?;
-            let hidden_tensor = WireTensor::new(WireDType::F16, hidden_shape_wire, hidden_f16);
-            g.send(&hidden_tensor).await?;
-            let kind_bytes = g.recv_raw(4).await?;
-            let kind =
-                u32::from_be_bytes([kind_bytes[0], kind_bytes[1], kind_bytes[2], kind_bytes[3]]);
-            if kind != FrameKind::LogitsResponse as u32 {
-                return Err(cascadia_transport::TransportError::SocketClosed);
-            }
-            let (t, _) = g.recv().await?;
-            let logits_f32 = match t.dtype {
-                WireDType::F32 => t
-                    .data
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect::<Vec<_>>(),
-                WireDType::F16 => f16_bytes_to_f32(&t.data),
-                _ => return Err(cascadia_transport::TransportError::SocketClosed),
-            };
-            Ok::<_, cascadia_transport::TransportError>((
-                logits_f32,
-                [
-                    t.shape[0] as usize,
-                    t.shape[1] as usize,
-                    t.shape[2] as usize,
-                ],
-            ))
-        });
-        Ok(TargetSendHandle { join })
+        Ok(spawn_forward_round_trip(
+            &self.runtime_handle,
+            self.downstream.clone(),
+            logical_pos_start,
+            attn,
+            hidden_shape_wire,
+            hidden_f16,
+        ))
     }
 
     /// Block on the network round-trip started by `feed_send_async`.
@@ -968,9 +926,9 @@ impl DistributedMaskedReq {
         handle: TargetSendHandle,
     ) -> Result<(Vec<f32>, [usize; 3]), EngineError> {
         let _ts = std::time::Instant::now();
-        let result = run_async(&self.runtime_handle, async move {
-            handle
-                .join
+        let mut handle = handle;
+        let result = run_async(&self.runtime_handle, async {
+            (&mut handle.join)
                 .await
                 .map_err(|e| cascadia_transport::TransportError::Io(std::io::Error::other(e)))?
         });
@@ -1048,9 +1006,6 @@ impl DistributedMaskedReq {
         let downstream = self.downstream.clone();
         let attn_clone = attn.clone();
         let _ts = std::time::Instant::now();
-        let mut t_send = std::time::Duration::ZERO;
-        let mut t_recv = std::time::Duration::ZERO;
-        let mut t_lock = std::time::Duration::ZERO;
         let _ts_lock = std::time::Instant::now();
         let (logits, _logits_shape, send_d, recv_d) = run_async(&self.runtime_handle, async move {
             let mut g = downstream.lock().await;
@@ -1116,10 +1071,9 @@ impl DistributedMaskedReq {
             ))
         })
         .map_err(|e| EngineError::Backend(e.to_string()))?;
-        t_lock = _ts_lock.elapsed();
+        let t_lock = _ts_lock.elapsed();
         let wire_us = _ts.elapsed().as_micros();
-        t_send = send_d;
-        t_recv = recv_d;
+        let (t_send, t_recv) = (send_d, recv_d);
         tracing::debug!(
             wire_us,
             send_us = t_send.as_micros() as u64,
@@ -1488,6 +1442,44 @@ impl Engine for OvDistSpecEngine {
         {
             self.active = None;
         }
+    }
+
+    /// Issue #76: replace the dead downstream stream on the live driver and return to a clean
+    /// between-requests state without reloading weights. The driver has no upstream, so only a
+    /// `downstream` replacement is valid; pipeline-only, so any EP link in `links` is rejected by
+    /// `check_reattach_streams`.
+    fn reattach_streams(&mut self, links: cascadia_engine::StreamLinks) -> EngineResult<()> {
+        // Validate before touching anything (PeerRejected => engine untouched; the runner does not
+        // fence on it). Head: no upstream, one downstream.
+        cascadia_engine::check_reattach_streams(
+            cascadia_engine::LinkShape::pipeline(false, true),
+            &links,
+        )?;
+        let cascadia_engine::StreamLinks { downstream, .. } = links;
+        // Unreachable after the check above; still pre-swap, so PeerRejected is truthful.
+        let downstream = downstream.ok_or_else(|| {
+            EngineError::PeerRejected("reattach: the driver needs a downstream stream".into())
+        })?;
+
+        // Swap the stream inside the Arc the engine already holds (`DistributedMaskedReq` and any
+        // orphan `feed_send_async` task share this clone). Locking waits out an orphan that is
+        // mid-round-trip; an orphan that had not started yet is cancelled by
+        // `TargetSendHandle`'s drop and never writes on the fresh stream. Use the stored runtime
+        // handle, the one every other transport call in this engine goes through: `run_async`
+        // picks `block_in_place` or a bare `block_on` from the calling thread, and
+        // `Handle::current()` would panic if an embedder drove this from a non-runtime thread.
+        let handle = self.target.runtime_handle.clone();
+        let ds = self.target.downstream.clone();
+        run_async(&handle, cascadia_transport::attach_client(&ds, downstream));
+
+        // Clean between-requests state: drop any active speculation, then reset stage-0 KV +
+        // host cursors and broadcast RESET on the freshly attached stream. Any failure here is
+        // post-swap, so reset() returns Backend (never PeerRejected) and the runner fences until a
+        // retry with fresh streams; the next cold admission (`start_task`) re-sends RESET as a
+        // backstop.
+        self.active = None;
+        self.target.reset()?;
+        Ok(())
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
@@ -2040,7 +2032,7 @@ impl Builder for OvDistSpecBuilder {
     /// and any EP link is rejected by the exact-match `check_connect_streams`. Stored in
     /// `self.downstream`, exactly where `connect` puts its dialed client.
     async fn connect_streams(&mut self, links: cascadia_engine::StreamLinks) -> EngineResult<()> {
-        // Driver has no upstream and requires a downstream (see `connect`, :2020-2027).
+        // Driver has no upstream and requires a downstream (see `connect`).
         cascadia_engine::check_connect_streams(
             cascadia_engine::LinkShape::pipeline(false, true),
             &links,
@@ -2177,6 +2169,10 @@ pub struct OvDistSpecWorkerEngine {
     kv_handoff: std::sync::Arc<crate::kv_coordination::KvHandoffMailbox>,
     #[cfg(feature = "kv_coord")]
     kv_model_id: String,
+    /// A `set_state_blob` has been applied and not yet scrubbed by a rebuild, so the next cold
+    /// clear must rebuild the request (see `crate::runtime::clear_ov_state`). Only ever true in
+    /// `kv_coord` builds.
+    state_restored: bool,
 }
 
 impl Engine for OvDistSpecWorkerEngine {
@@ -2245,6 +2241,67 @@ impl Engine for OvDistSpecWorkerEngine {
         Some(self)
     }
 
+    /// Issue #76: replace the dead streams on the live worker and reset this rank. A worker
+    /// always has an upstream; it has a downstream unless it is the last stage. The fatal path in
+    /// `step()` close()s BOTH handles, so `validate_worker_reattach` requires every link the stage
+    /// has (a partial re-attach is `PeerRejected`); attach makes them live again. Pipeline-only, so
+    /// any EP link in `links` is rejected by `check_reattach_streams`.
+    fn reattach_streams(&mut self, links: cascadia_engine::StreamLinks) -> EngineResult<()> {
+        // Validate first (PeerRejected => engine untouched). `self.downstream.is_some()` is this
+        // stage's role: a last stage has none, so a downstream replacement is rejected for it, and
+        // a stage that has one must replace it (the fatal path closed it too).
+        validate_worker_reattach(
+            cascadia_engine::LinkShape::pipeline(true, self.downstream.is_some()),
+            &links,
+        )?;
+        let cascadia_engine::StreamLinks {
+            upstream,
+            downstream,
+            ..
+        } = links;
+
+        // Swap in place inside the Arcs the engine holds. Use the stored runtime handle (see the
+        // driver's `reattach_streams`).
+        let handle = self.runtime_handle.clone();
+        // Resolved before any swap (unreachable after validation): PeerRejected, engine untouched.
+        let downstream = match downstream {
+            Some(s) => Some((
+                self.downstream.clone().ok_or_else(|| {
+                    EngineError::PeerRejected("reattach: downstream handle missing".into())
+                })?,
+                s,
+            )),
+            None => None,
+        };
+        if let Some(upstream) = upstream {
+            run_async(
+                &handle,
+                cascadia_transport::attach_server(&self.upstream, upstream),
+            );
+        }
+        if let Some((down, s)) = downstream {
+            run_async(&handle, cascadia_transport::attach_client(&down, s));
+        }
+
+        // kv_coord: drop any warm-resume slice the dead session parked in the mailbox so it cannot
+        // be applied to a later turn (epoch-blind; the mailbox lock is independent of the engine
+        // lock). First, because it cannot fail: a failing `reset_state` below must not leave the
+        // slice armed. The capture stash (self.kv) is epoch-keyed + capacity-evicted, so it is left
+        // as-is.
+        #[cfg(feature = "kv_coord")]
+        self.kv_handoff.discard_any();
+
+        // Clean between-requests state: reset this rank's KV. The worker is frame-driven and has no
+        // `active`/in-flight state to clear (reattach holds the engine lock, so no step() is live;
+        // a fresh stream carries no partial frame). close() set no flag beyond dropping the stream,
+        // which attach restored. A failure here is post-swap => Backend (never PeerRejected); the
+        // head's next-admission RESET re-syncs the chain regardless. Rebuilds instead of resetting
+        // when the dead session left a restored state (`clear_ov_state`).
+        crate::runtime::clear_ov_state(&mut self.runtime, &mut self.state_restored)?;
+
+        Ok(())
+    }
+
     #[cfg(feature = "kv_coord")]
     fn kv_holder(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvSnapshotHolder>> {
         Some(std::sync::Arc::new(crate::kv_coordination::OvKvHolder {
@@ -2282,7 +2339,15 @@ impl OvDistSpecWorkerEngine {
 
         match kind {
             FrameKind::Reset => {
-                self.runtime.reset_state().map_err(map_ov_err)?;
+                // The driver's cold-turn reset: after a RESTORE this must rebuild the request.
+                // A failed scrub (the rebuild allocates, so it can fail) is reported, but only
+                // after the Reset went downstream: the ranks below still start the driver's cold
+                // turn, and this rank's flag stays set so its next Reset retries the rebuild.
+                let scrubbed =
+                    crate::runtime::clear_ov_state(&mut self.runtime, &mut self.state_restored);
+                if let Err(e) = &scrubbed {
+                    warn!(error = %e, "ov-dist-spec worker: Reset scrub failed; forwarding the Reset anyway");
+                }
                 if let Some(d) = downstream {
                     run_async(&self.runtime_handle, async move {
                         let mut dg = d.lock().await;
@@ -2290,7 +2355,7 @@ impl OvDistSpecWorkerEngine {
                     })
                     .map_err(|e| EngineError::Backend(e.to_string()))?;
                 }
-                Ok(())
+                scrubbed
             }
             FrameKind::LogitsResponse => Err(EngineError::Backend(
                 "worker received LOGITS_RESPONSE".into(),
@@ -2430,6 +2495,7 @@ impl OvDistSpecWorkerEngine {
                 } else if !carried.is_empty() {
                     match self.runtime.set_state_blob(&carried) {
                         Ok(()) => {
+                            self.state_restored = true;
                             info!(
                                 epoch,
                                 blob_len = carried.len(),
@@ -2445,7 +2511,10 @@ impl OvDistSpecWorkerEngine {
                     }
                 } else if let Some((_, blob)) = self.kv.take_capture(epoch) {
                     match self.runtime.set_state_blob(&blob) {
-                        Ok(()) => true,
+                        Ok(()) => {
+                            self.state_restored = true;
+                            true
+                        }
                         Err(e) => {
                             warn!(error = %e, epoch, "ov-dist-spec worker: set_state(capture) failed; rank cold");
                             self.kv_worker_scrub();
@@ -2793,7 +2862,7 @@ impl Builder for OvDistSpecWorkerBuilder {
 
     /// Issue #76: wire a worker (ranks 1..N-1) with already-connected byte streams. A worker
     /// always has an upstream; it has a downstream unless it is the last stage — the same rule
-    /// `build` uses for `is_last` (`:2835`). Pipeline-only, so the stage `LinkShape` has
+    /// `build` uses for `is_last`. Pipeline-only, so the stage `LinkShape` has
     /// `ep_driver=false`, `ep_workers=0` and any EP link is rejected by the exact-match
     /// `check_connect_streams`. `configure_listen` is ignored on this path (no listener is opened).
     /// Stored in `self.upstream`/`self.downstream`, exactly where `connect` puts its accepted
@@ -2898,6 +2967,7 @@ impl Builder for OvDistSpecWorkerBuilder {
             kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
             #[cfg(feature = "kv_coord")]
             kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
+            state_restored: false,
         }))
     }
 }
@@ -3122,13 +3192,16 @@ impl OvDistSpecWorkerEngine {
         let mailbox = std::sync::Arc::clone(&self.kv_handoff);
         let fp = self.kv_fingerprint();
         let runtime = &mut self.runtime;
+        let state_restored = &mut self.state_restored;
         crate::kv_coordination::drain_handoff(&mailbox, fp, 0, expected_epoch, |blob| {
+            // Set before the attempt: a failed set_state may be PARTIAL.
+            *state_restored = true;
             match runtime.set_state_blob(blob) {
                 Ok(()) => true,
                 Err(e) => {
                     warn!(error = %e, "ov-dist-spec worker: set_state(handoff) failed; rank cold");
-                    // A failed set_state may be PARTIAL; reset_state cannot scrub it.
-                    if let Err(e2) = runtime.recreate_request() {
+                    // reset_state cannot scrub a partial set; rebuild (flag cleared on success).
+                    if let Err(e2) = crate::runtime::clear_ov_state(runtime, state_restored) {
                         error!(error = %e2, "ov-dist-spec worker: recreate_request scrub failed; KV state may be dirty");
                     }
                     false
@@ -3140,7 +3213,10 @@ impl OvDistSpecWorkerEngine {
     /// `reset_state` cannot clear post-`set_state` residue, and the head's cold fallback
     /// only sends Reset, which bottoms out in exactly that insufficient scrub.
     fn kv_worker_scrub(&mut self) {
-        if let Err(e) = self.runtime.recreate_request() {
+        // A failed rebuild keeps `state_restored` set so the next Reset retries it.
+        if let Err(e) =
+            crate::runtime::scrub_restore_now(&mut self.runtime, &mut self.state_restored)
+        {
             error!(error = %e, "ov-dist-spec worker: recreate_request scrub failed; KV state may be dirty");
         }
     }
@@ -3639,10 +3715,10 @@ mod tests {
         let (d, _d_far) = tokio::io::duplex(64);
         let (ep, _ep_far) = tokio::io::duplex(64);
         assert!(matches!(
-            head.connect_streams(cascadia_engine::StreamLinks {
-                downstream: Some(Box::new(d)),
-                ep_driver: Some(Box::new(ep)),
-                ..Default::default()
+            head.connect_streams({
+                let mut l = cascadia_engine::StreamLinks::pipeline(None, Some(Box::new(d)));
+                l.ep_driver = Some(Box::new(ep));
+                l
             })
             .await,
             Err(EngineError::PeerRejected(_))
@@ -3655,14 +3731,434 @@ mod tests {
         let (ep2, _ep2_far) = tokio::io::duplex(64);
         assert!(matches!(
             worker
-                .connect_streams(cascadia_engine::StreamLinks {
-                    upstream: Some(Box::new(u)),
-                    ep_workers: vec![Some(Box::new(ep2))],
-                    ..Default::default()
+                .connect_streams({
+                    let mut l = cascadia_engine::StreamLinks::pipeline(Some(Box::new(u)), None);
+                    l.ep_workers = vec![Some(Box::new(ep2))];
+                    l
                 })
                 .await,
             Err(EngineError::PeerRejected(_))
         ));
         assert!(worker.upstream.is_none());
+    }
+
+    // ---- injected streams: re-attach swap mechanism (#76) ----
+
+    /// Head mechanism: the downstream `Arc` is cloned into `DistributedMaskedReq` (and any orphan
+    /// `feed_send_async` task). `reattach_streams` locks that `Arc` and calls `attach`; a clone
+    /// taken earlier must then talk over the fresh stream. The engine-level path, reset included,
+    /// is `driver_reattach_swaps_then_resets_the_target`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn downstream_arc_swap_is_visible_through_the_driver_clone() {
+        let (dead_near, dead_far) = tokio::io::duplex(64);
+        let arc = Arc::new(tokio::sync::Mutex::new(ActivationClient::from_stream(
+            Box::new(dead_near),
+        )));
+        let driver_clone = arc.clone(); // the clone DistributedMaskedReq keeps
+        drop(dead_far); // embedder closes the old far end (contract item 3)
+        assert!(driver_clone
+            .lock()
+            .await
+            .send(&sample_wire_tensor())
+            .await
+            .is_err());
+
+        // Swap in place (exactly what reattach_streams does), never replacing the Arc.
+        let (fresh_near, fresh_far) = tokio::io::duplex(1 << 16);
+        arc.lock().await.attach(Box::new(fresh_near));
+
+        // The driver's clone now round-trips over the fresh stream.
+        let mut server = ActivationServer::from_stream(Box::new(fresh_far));
+        driver_clone
+            .lock()
+            .await
+            .send_raw(&(FrameKind::Reset as u32).to_be_bytes())
+            .await
+            .unwrap();
+        let kb = server.recv_raw(4).await.unwrap();
+        assert_eq!(
+            u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]),
+            FrameKind::Reset as u32
+        );
+    }
+
+    /// Worker mechanism: the fatal path `close()`s the upstream server; `attach` revives it, and
+    /// the engine's `Arc` clone sees the live stream. Mirrors `reattach_streams`' upstream swap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upstream_arc_swap_revives_a_closed_worker_server() {
+        let (dead_client, _dead_server_far) = tokio::io::duplex(64);
+        let arc = Arc::new(tokio::sync::Mutex::new(ActivationServer::from_stream(
+            Box::new(dead_client),
+        )));
+        let engine_clone = arc.clone();
+        // Fatal path: close() drops the stream (and listener); no other flag is set.
+        arc.lock().await.close().await;
+        assert!(engine_clone.lock().await.recv_raw(4).await.is_err());
+
+        // Re-attach a fresh upstream and prove the engine's clone reads from it.
+        let (fresh_client, fresh_server) = tokio::io::duplex(1 << 16);
+        arc.lock().await.attach(Box::new(fresh_server));
+        let mut peer = ActivationClient::from_stream(Box::new(fresh_client));
+        peer.send_raw(&(FrameKind::Reset as u32).to_be_bytes())
+            .await
+            .unwrap();
+        let kb = engine_clone.lock().await.recv_raw(4).await.unwrap();
+        assert_eq!(
+            u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]),
+            FrameKind::Reset as u32
+        );
+    }
+
+    /// dist_spec stages are pipeline-only, so both overrides validate with
+    /// `check_reattach_streams` against a pipeline `LinkShape` whose
+    /// `ep_driver`/`ep_workers` are empty — any EP link is rejected before the
+    /// engine is touched. This pins the exact validation call both overrides make,
+    /// for both roles, without building an engine.
+    #[test]
+    fn reattach_rejects_ep_links_for_dist_spec_shapes() {
+        fn dummy() -> cascadia_engine::ByteStream {
+            let (a, _b) = tokio::io::duplex(64);
+            Box::new(a)
+        }
+        // Head (no upstream, one downstream): a valid downstream + an EP driver.
+        let head = cascadia_engine::LinkShape::pipeline(false, true);
+        let head_links = {
+            let mut l = cascadia_engine::StreamLinks::pipeline(None, Some(dummy()));
+            l.ep_driver = Some(dummy());
+            l
+        };
+        assert!(matches!(
+            cascadia_engine::check_reattach_streams(head, &head_links),
+            Err(EngineError::PeerRejected(_))
+        ));
+        // Worker (upstream + downstream): a valid upstream + an EP worker link.
+        let worker = cascadia_engine::LinkShape::pipeline(true, true);
+        let worker_links = {
+            let mut l = cascadia_engine::StreamLinks::pipeline(Some(dummy()), None);
+            l.ep_workers = vec![Some(dummy())];
+            l
+        };
+        assert!(matches!(
+            cascadia_engine::check_reattach_streams(worker, &worker_links),
+            Err(EngineError::PeerRejected(_))
+        ));
+    }
+
+    /// A dist_spec worker's connection-fatal path `close()`s BOTH hops, so a
+    /// re-attach must replace every link the stage has: keeping a (dead)
+    /// downstream or upstream is rejected before any swap.
+    #[test]
+    fn validate_worker_reattach_requires_every_link_the_stage_has() {
+        fn dummy() -> cascadia_engine::ByteStream {
+            let (a, _b) = tokio::io::duplex(64);
+            Box::new(a)
+        }
+        use cascadia_engine::{LinkShape, StreamLinks};
+        // Middle worker (upstream + downstream).
+        let mid = LinkShape::pipeline(true, true);
+        assert!(matches!(
+            validate_worker_reattach(mid, &StreamLinks::pipeline(Some(dummy()), None)),
+            Err(EngineError::PeerRejected(_))
+        ));
+        assert!(matches!(
+            validate_worker_reattach(mid, &StreamLinks::pipeline(None, Some(dummy()))),
+            Err(EngineError::PeerRejected(_))
+        ));
+        assert!(validate_worker_reattach(
+            mid,
+            &StreamLinks::pipeline(Some(dummy()), Some(dummy()))
+        )
+        .is_ok());
+        // Last worker (upstream only): replacing the upstream is the whole set.
+        let last = LinkShape::pipeline(true, false);
+        assert!(
+            validate_worker_reattach(last, &StreamLinks::pipeline(Some(dummy()), None)).is_ok()
+        );
+        // Base rules still apply: nothing to replace / a link the stage lacks.
+        assert!(matches!(
+            validate_worker_reattach(mid, &StreamLinks::default()),
+            Err(EngineError::PeerRejected(_))
+        ));
+        assert!(matches!(
+            validate_worker_reattach(last, &StreamLinks::pipeline(Some(dummy()), Some(dummy()))),
+            Err(EngineError::PeerRejected(_))
+        ));
+    }
+
+    /// A `TargetSendHandle` dropped before its task reached the downstream lock (the step that
+    /// spawned it returned early) must never write. A re-attach holds that lock while it swaps the
+    /// stream; an orphan that got the lock only afterwards would put a stale FORWARD at the head of
+    /// the FRESH stream and desync the new session's very first exchange.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_target_send_handle_never_writes_on_a_reattached_stream() {
+        use tokio::io::AsyncReadExt;
+        let (dead_near, _dead_far) = tokio::io::duplex(1 << 16);
+        let arc = Arc::new(tokio::sync::Mutex::new(ActivationClient::from_stream(
+            Box::new(dead_near),
+        )));
+        // The re-attach is in progress: it holds the downstream lock for the swap.
+        let mut swap = arc.lock().await;
+        let orphan = spawn_forward_round_trip(
+            &tokio::runtime::Handle::current(),
+            arc.clone(),
+            0,
+            vec![1],
+            [1, 1, 4],
+            vec![0u8; 8],
+        );
+        // Let the task start and queue on the lock, then orphan it.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(orphan);
+        let (fresh_near, mut fresh_far) = tokio::io::duplex(1 << 16);
+        swap.attach(Box::new(fresh_near));
+        drop(swap);
+
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            fresh_far.read(&mut buf),
+        )
+        .await;
+        assert!(
+            read.is_err(),
+            "the orphaned round-trip wrote {read:?} onto the re-attached stream"
+        );
+    }
+
+    /// Build an `OvDistSpecEngine` (driver) without weights. `OvRuntime` is a zero-field struct in a
+    /// stub (non-`openvino`) build, so `OvRuntime {}` constructs with no IR or device; every OV call
+    /// on it returns `Err(Stub)`. Enough to drive the swap and the reset dispatch.
+    #[cfg(not(feature = "openvino"))]
+    fn stub_driver(downstream: Arc<tokio::sync::Mutex<ActivationClient>>) -> OvDistSpecEngine {
+        let json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+            "normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,
+            "decoder":null,"model":{"type":"WordLevel","vocab":{"hi":0},"unk_token":"[UNK]"}}"#;
+        OvDistSpecEngine {
+            target: DistributedMaskedReq {
+                stage0: OvRuntime {},
+                stage0_inputs: std::collections::HashMap::new(),
+                downstream,
+                runtime_handle: tokio::runtime::Handle::current(),
+                valid_mask: vec![1; 8],
+                cache_len: 0,
+                logical_pos: 0,
+                t_alpha_setup: Duration::ZERO,
+                t_alpha_infer: Duration::ZERO,
+                t_alpha_output: Duration::ZERO,
+                t_wire: Duration::ZERO,
+                state_restored: false,
+            },
+            draft: MaskedReq {
+                runtime: OvRuntime {},
+                has_beam: false,
+                valid_mask: vec![1; 8],
+                cache_len: 0,
+                logical_pos: 0,
+                inputs: std::collections::HashMap::new(),
+                state_restored: false,
+            },
+            tokenizer: Arc::new(Tokenizer::from_bytes(json.as_bytes()).unwrap()),
+            eos_token_ids: Vec::new(),
+            k: 1,
+            pending: Vec::new(),
+            active: None,
+            #[cfg(feature = "kv_coord")]
+            kv: crate::kv_coordination::OvKvCache::default(),
+            #[cfg(feature = "kv_coord")]
+            kv_share: Arc::new(std::sync::Mutex::new(
+                crate::kv_coordination::OvKvCache::default(),
+            )),
+            #[cfg(feature = "kv_coord")]
+            kv_model_id: String::new(),
+        }
+    }
+
+    /// The driver re-attach clears the active speculation, swaps the downstream inside the Arc the
+    /// target already holds, and then runs `DistributedMaskedReq::reset`. The stub runtime fails
+    /// that reset at its first OV call, which is what this observes: the error is post-swap
+    /// `Backend` carrying the stub's message (the only OV call on this path is the reset's
+    /// `reset_state`), never `PeerRejected`.
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn driver_reattach_swaps_then_resets_the_target() {
+        let (dead, _dead_far) = tokio::io::duplex(64);
+        let ds = Arc::new(tokio::sync::Mutex::new(ActivationClient::from_stream(
+            Box::new(dead),
+        )));
+        let mut e = stub_driver(ds.clone());
+        e.active = Some(ActiveSpec {
+            task: GenerationTask::new("t0", "hi"),
+            #[cfg(feature = "kv_coord")]
+            prompt_ids: vec![0],
+            out: vec![0],
+            resume_seed_len: 0,
+            emitted: Vec::new(),
+            prev_correction: 0,
+            d_last_logit: Vec::new(),
+            stats: SpecDecodeStats::default(),
+            initialized: true,
+        });
+        let (fresh, fresh_far) = tokio::io::duplex(1 << 16);
+        let err = e
+            .reattach_streams(cascadia_engine::StreamLinks::pipeline(
+                None,
+                Some(Box::new(fresh)),
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Backend(m) if m.contains("without --features openvino")),
+            "got {err:?}"
+        );
+        assert!(e.active.is_none(), "the active speculation is dropped");
+        // The target's own clone talks over the fresh stream.
+        let mut server = ActivationServer::from_stream(Box::new(fresh_far));
+        ds.lock()
+            .await
+            .send_raw(&(FrameKind::Reset as u32).to_be_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            server.recv_raw(4).await.unwrap(),
+            (FrameKind::Reset as u32).to_be_bytes()
+        );
+    }
+
+    /// Worker re-attach: both links swap in place, then `reset_state` runs (observed through the
+    /// stub's error, see `driver_reattach_swaps_then_resets_the_target`). With kv_coord the
+    /// parked hand-off slice is discarded before the reset, so a failing reset cannot leave it armed.
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn worker_reattach_swaps_both_links_then_resets_state() {
+        let (up_dead, _uf) = tokio::io::duplex(64);
+        let (down_dead, _df) = tokio::io::duplex(64);
+        let up = Arc::new(tokio::sync::Mutex::new(ActivationServer::from_stream(
+            Box::new(up_dead),
+        )));
+        let down = Arc::new(tokio::sync::Mutex::new(ActivationClient::from_stream(
+            Box::new(down_dead),
+        )));
+        let mut w = OvDistSpecWorkerEngine {
+            is_last: false,
+            runtime: OvRuntime {},
+            inputs: std::collections::HashMap::new(),
+            upstream: up.clone(),
+            downstream: Some(down.clone()),
+            runtime_handle: tokio::runtime::Handle::current(),
+            #[cfg(feature = "kv_coord")]
+            kv: crate::kv_coordination::OvKvCache::default(),
+            #[cfg(feature = "kv_coord")]
+            kv_share: Arc::new(std::sync::Mutex::new(
+                crate::kv_coordination::OvKvCache::default(),
+            )),
+            #[cfg(feature = "kv_coord")]
+            kv_handoff: Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
+            #[cfg(feature = "kv_coord")]
+            kv_model_id: String::new(),
+            state_restored: false,
+        };
+        #[cfg(feature = "kv_coord")]
+        {
+            let (m, p) = crate::kv_coordination::blob_to_wire(&[1], &[0xAB], "t", 7, 1);
+            w.kv_handoff.put(7, m, p);
+        }
+        let (up_fresh, up_far) = tokio::io::duplex(1 << 16);
+        let (down_fresh, down_far) = tokio::io::duplex(1 << 16);
+        let err = w
+            .reattach_streams(cascadia_engine::StreamLinks::pipeline(
+                Some(Box::new(up_fresh)),
+                Some(Box::new(down_fresh)),
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Backend(m) if m.contains("without --features openvino")),
+            "got {err:?}"
+        );
+        #[cfg(feature = "kv_coord")]
+        assert!(
+            !w.kv_handoff.discard_any(),
+            "the parked slice was already discarded by the re-attach"
+        );
+        let kind = (FrameKind::Reset as u32).to_be_bytes();
+        let mut peer_up = ActivationClient::from_stream(Box::new(up_far));
+        peer_up.send_raw(&kind).await.unwrap();
+        assert_eq!(up.lock().await.recv_raw(4).await.unwrap(), kind);
+        let mut peer_down = ActivationServer::from_stream(Box::new(down_far));
+        down.lock().await.send_raw(&kind).await.unwrap();
+        assert_eq!(peer_down.recv_raw(4).await.unwrap(), kind);
+    }
+
+    /// A worker whose Reset scrub fails (the stub runtime fails every OV call, like a failing
+    /// rebuild after a RESTORE) still forwards the Reset downstream before returning the error, so
+    /// the ranks below it stay in sync with the driver's cold turn.
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn worker_reset_is_forwarded_even_when_its_scrub_fails() {
+        let (up_near, up_far) = tokio::io::duplex(1 << 16);
+        let (down_near, down_far) = tokio::io::duplex(1 << 16);
+        let mut w = OvDistSpecWorkerEngine {
+            is_last: false,
+            runtime: OvRuntime {},
+            inputs: std::collections::HashMap::new(),
+            upstream: Arc::new(tokio::sync::Mutex::new(ActivationServer::from_stream(
+                Box::new(up_near),
+            ))),
+            downstream: Some(Arc::new(tokio::sync::Mutex::new(
+                ActivationClient::from_stream(Box::new(down_near)),
+            ))),
+            runtime_handle: tokio::runtime::Handle::current(),
+            #[cfg(feature = "kv_coord")]
+            kv: crate::kv_coordination::OvKvCache::default(),
+            #[cfg(feature = "kv_coord")]
+            kv_share: Arc::new(std::sync::Mutex::new(
+                crate::kv_coordination::OvKvCache::default(),
+            )),
+            #[cfg(feature = "kv_coord")]
+            kv_handoff: Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
+            #[cfg(feature = "kv_coord")]
+            kv_model_id: String::new(),
+            state_restored: true,
+        };
+        let kind = (FrameKind::Reset as u32).to_be_bytes();
+        let mut driver = ActivationClient::from_stream(Box::new(up_far));
+        driver.send_raw(&kind).await.unwrap();
+        let (w, res) = tokio::task::spawn_blocking(move || {
+            let res = w.handle_one_frame();
+            (w, res)
+        })
+        .await
+        .unwrap();
+        assert!(res.is_err(), "the failed scrub is still reported");
+        assert!(
+            w.state_restored,
+            "the failed rebuild is retried at the next Reset"
+        );
+        let mut next = ActivationServer::from_stream(Box::new(down_far));
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), next.recv_raw(4))
+            .await
+            .expect("Reset must reach the next rank")
+            .unwrap();
+        assert_eq!(got, kind);
+    }
+
+    /// The driver's cold-turn reset and the worker's Reset handler both go through
+    /// `clear_ov_state`, so a restored state is rebuilt, not reset. With the stub runtime every OV
+    /// call fails, which leaves the flag set: the next cold reset retries the rebuild.
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restored_driver_keeps_the_flag_until_a_rebuild_succeeds() {
+        let (dead, _far) = tokio::io::duplex(64);
+        let ds = Arc::new(tokio::sync::Mutex::new(ActivationClient::from_stream(
+            Box::new(dead),
+        )));
+        let mut e = stub_driver(ds);
+        e.target.state_restored = true;
+        e.draft.state_restored = true;
+        assert!(e.target.reset().is_err());
+        assert!(e.draft.reset().is_err());
+        assert!(e.target.state_restored && e.draft.state_restored);
+    }
+
+    fn sample_wire_tensor() -> WireTensor {
+        WireTensor::new(WireDType::I64, [1, 1, 2], i64_to_bytes(&[1, 2]))
     }
 }

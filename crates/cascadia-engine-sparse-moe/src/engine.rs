@@ -28,6 +28,7 @@ use tokenizers::Tokenizer;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
+use crate::dist::{close_injected_links_on_latch, reattach_target, recv_error_kills_link};
 use crate::dist::{
     forward_reset, recv_forward_batch_body_server, recv_forward_body_server, recv_key_body_server,
     recv_kind_client, recv_kind_server, recv_token_batch_body_client, recv_token_body_client,
@@ -546,23 +547,20 @@ impl Builder for SparseMoEBuilder {
     async fn connect_streams(&mut self, links: cascadia_engine::StreamLinks) -> EngineResult<()> {
         // ---- Expert worker: one injected link from the driver, no pipeline. ----
         if let Some((index, count)) = self.config.ep_worker {
-            // Same guard `connect` enforces (:429-433): a worker is never also a
-            // pipeline stage or a driver.
+            // Same guard `connect` enforces in its expert-worker branch: a
+            // worker is never also a pipeline stage or a driver.
             if self.config.total > 1 || !self.config.ep_workers.is_empty() {
                 return Err(EngineError::InvalidConfig(
                     "an expert worker cannot also be a pipeline stage or a driver".into(),
                 ));
             }
             cascadia_engine::check_connect_streams(
-                cascadia_engine::LinkShape {
-                    ep_driver: true,
-                    ..Default::default()
-                },
+                cascadia_engine::LinkShape::ep_driver(),
                 &links,
             )?;
-            let driver = links
-                .ep_driver
-                .expect("check_connect_streams guarantees an ep_driver link");
+            let driver = links.ep_driver.ok_or_else(|| {
+                EngineError::Backend("connect_streams: validated ep_driver link missing".into())
+            })?;
             info!(index, count, "expert worker: driver stream injected");
             self.ep_server = Some(Arc::new(TokioMutex::new(ActivationServer::from_stream(
                 driver,
@@ -571,24 +569,25 @@ impl Builder for SparseMoEBuilder {
         }
         // ---- Expert-parallel driver: one injected link per worker, in order. ----
         if !self.config.ep_workers.is_empty() {
-            // Same guard `connect` enforces (:455-459): the driver runs as a
-            // single stage (`--total 1`); for total == 1 there are no pipeline
-            // links, so the stage shape carries only `ep_workers`.
+            // Same guard `connect` enforces in its expert-parallel driver
+            // branch: the driver runs as a single stage (`--total 1`); for
+            // total == 1 there are no pipeline links, so the stage shape
+            // carries only `ep_workers`.
             if self.config.total > 1 {
                 return Err(EngineError::InvalidConfig(
                     "--ep-workers runs the driver as a single stage (--total 1)".into(),
                 ));
             }
             cascadia_engine::check_connect_streams(
-                cascadia_engine::LinkShape {
-                    ep_workers: self.config.ep_workers.len(),
-                    ..Default::default()
-                },
+                cascadia_engine::LinkShape::ep_workers(self.config.ep_workers.len()),
                 &links,
             )?;
             for (i, stream) in links.ep_workers.into_iter().enumerate() {
-                let stream =
-                    stream.expect("check_connect_streams guarantees every ep_workers entry Some");
+                let stream = stream.ok_or_else(|| {
+                    EngineError::Backend(format!(
+                        "connect_streams: validated ep_workers[{i}] link missing"
+                    ))
+                })?;
                 info!(worker = i, "expert worker stream injected");
                 self.ep_clients
                     .push(Arc::new(TokioMutex::new(ActivationClient::from_stream(
@@ -1018,6 +1017,8 @@ impl Builder for SparseMoEBuilder {
                 // dsv4 has no config-threaded prefix cache; `None` keeps its
                 // existing env-only behaviour byte-for-byte.
                 None,
+                // dsv4 is never an expert-parallel driver.
+                Vec::new(),
             )));
         }
         if let Some(runner) = self.inkling_runner {
@@ -1040,6 +1041,10 @@ impl Builder for SparseMoEBuilder {
                 total,
                 // No per-rank KV-prefix cache on this family yet (follow-up).
                 None,
+                // Issue #76: the EP driver's worker links — the same Arcs
+                // `load` handed `EpClient::new` — so reattach_streams can swap
+                // a dead worker's stream in place. Empty when not an EP driver.
+                self.ep_clients.clone(),
             )));
         }
         if let Some(runner) = self.glm_runner {
@@ -1063,6 +1068,8 @@ impl Builder for SparseMoEBuilder {
                 // Same value the per-rank SliceKvCache got, so the rank-0 index
                 // and the per-rank caches stay in lockstep.
                 self.config.prefix_cache_depth.map(|d| d as usize),
+                // glm5 is never an expert-parallel driver.
+                Vec::new(),
             )));
         }
         if let Some(ov) = self.ov_runner {
@@ -1203,49 +1210,16 @@ impl Builder for SparseMoEBuilder {
                 );
             }
         }
-        // Snapshot the holder mirror before the struct literal moves `runner` / `kv_prefix_cache`
-        // (fingerprint()/capacity() are `&self`; the struct-literal field shorthands below would
-        // otherwise move them first).
-        #[cfg(feature = "kv_coord")]
-        let kv_share = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::kv_coordination::SparseHolderState::new(
-                kv_prefix_cache.capacity(),
-                runner.fingerprint(),
-            ),
-        ));
-        Ok(Box::new(SparseMoEEngine {
+        Ok(Box::new(SparseMoEEngine::new(
             runner,
-            tokenizer: self.tokenizer,
-            pending: VecDeque::new(),
-            peer_disconnected: false,
-            disconnect_reported: false,
-            transport: self.transport,
+            self.tokenizer,
+            self.transport,
             runtime_handle,
             rank,
             total,
-            last_rank_history: Vec::new(),
-            last_rank_rng: 0,
-            last_rank_rng_seeded: false,
             spec_decode_k,
             kv_prefix_cache,
-            #[cfg(feature = "kv_coord")]
-            kv_offers: crate::kv_coordination::KvOfferStash::new(
-                crate::kv_coordination::KV_MAX_OFFERS,
-                crate::kv_coordination::KV_MAX_OFFER_BYTES,
-                crate::kv_prefix_cache::KvSnapshot::approx_bytes,
-            ),
-            #[cfg(feature = "kv_coord")]
-            kv_capture: std::collections::HashMap::new(),
-            #[cfg(feature = "kv_coord")]
-            kv_downstream: std::collections::HashMap::new(),
-            #[cfg(feature = "kv_coord")]
-            kv_share,
-            #[cfg(feature = "kv_coord")]
-            kv_handoff_mailbox: std::sync::Arc::new(
-                cascadia_engine::kv_handoff::KvHandoffMailbox::new(),
-            ),
-            active: None,
-        }))
+        )))
     }
 }
 
@@ -1394,13 +1368,52 @@ fn even_moe_split(total_moe: u32, rank: u32, total: u32) -> (u32, u32) {
     (start, end)
 }
 
-/// Whether a worker-rank `step()` should surface its latched upstream
-/// disconnect as a connection-fatal `Err` this call: yes exactly once, on the
-/// first step after the link drops. After that the one-shot is spent so a
-/// re-poll (the relay loop has already exited on the first one) doesn't flood.
-/// Pure, for testing.
-fn worker_should_report_disconnect(peer_disconnected: bool, already_reported: bool) -> bool {
-    peer_disconnected && !already_reported
+/// A worker rank's `step()` result once its frame (if any) is served. While
+/// the upstream link is latched dead, every step returns the same
+/// connection-fatal `Err`, at once and without serving or sleeping. The relay
+/// loop (`run_relay_loop`, a worker's only driver) exits on it in TCP mode so
+/// the supervisor rebuilds the stage: a worker's upstream socket is accepted
+/// only at connect. In stream mode the loop parks until a re-attach; a wake
+/// with the link still dead (a rejected re-attach) gets the error again and
+/// parks again, instead of backing off under the engine lock and returning
+/// `Ok(empty)` forever. Pure, for testing.
+fn worker_step(
+    peer_disconnected: bool,
+    produced: Vec<(TaskId, Chunk)>,
+) -> EngineResult<Vec<(TaskId, Chunk)>> {
+    if peer_disconnected {
+        Err(EngineError::NotConnected)
+    } else {
+        Ok(produced)
+    }
+}
+
+/// Read the next frame kind off a worker rank's upstream (the OvMoe and
+/// pipeline workers). `None` means no frame this step: a clean close or a dead
+/// link (see `recv_error_kills_link`) latches `peer_disconnected`; any other
+/// recv error is logged and backed off so a misbehaving peer on a live link
+/// cannot hot-spin the relay.
+fn recv_worker_kind(
+    handle: &tokio::runtime::Handle,
+    upstream: &Arc<TokioMutex<ActivationServer>>,
+    peer_disconnected: &mut bool,
+) -> Option<FrameKind> {
+    match cascadia_runner::run_async(handle, recv_kind_server(upstream)) {
+        Ok(Some(kind)) => Some(kind),
+        Ok(None) => {
+            *peer_disconnected = true;
+            None
+        }
+        Err(e) => {
+            warn!("worker recv_kind failed: {e}");
+            if recv_error_kills_link(&e) {
+                *peer_disconnected = true;
+            } else {
+                std::thread::sleep(WORKER_BACKOFF);
+            }
+            None
+        }
+    }
 }
 
 /// Per-token reply budget: no widening. Mirrors `reply_deadline`'s body
@@ -1534,15 +1547,11 @@ pub struct SparseMoEEngine {
     runtime_handle: tokio::runtime::Handle,
     rank: u32,
     total: u32,
-    /// Set on a worker rank when the upstream socket closes cleanly. Keeps
-    /// step_worker from hot-spinning on `recv_kind_server` returning
-    /// `Ok(None)` over and over.
+    /// Set on a worker rank when its upstream link is dead: a clean close, a
+    /// link the transport dropped, or a protocol violation escalated to one.
+    /// While set, every `step()` returns a connection-fatal `Err` at once
+    /// (see `worker_step`). Cleared only by `reattach_streams`.
     peer_disconnected: bool,
-    /// Worker rank one-shot: true after `step()` has surfaced the latched
-    /// disconnect as a connection-fatal `Err` to the relay loop. Stops the
-    /// fatal Err from being re-emitted if `step()` is somehow polled again
-    /// before the stage is rebuilt (the relay loop exits on the first one).
-    disconnect_reported: bool,
     /// Last-rank only: tokens this rank has sampled since the last
     /// `Reset`. Used as the `history` argument to `sampling::sample` so
     /// the repetition penalty has the recent local emit-stream to
@@ -1605,6 +1614,61 @@ pub struct SparseMoEEngine {
 }
 
 impl SparseMoEEngine {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        runner: Runner,
+        tokenizer: Option<Tokenizer>,
+        transport: StageTransport,
+        runtime_handle: tokio::runtime::Handle,
+        rank: u32,
+        total: u32,
+        spec_decode_k: Option<u32>,
+        kv_prefix_cache: KvPrefixCache,
+    ) -> Self {
+        // Snapshot the holder mirror before the struct literal moves `runner` / `kv_prefix_cache`
+        // (fingerprint()/capacity() are `&self`; the struct-literal field shorthands below would
+        // otherwise move them first).
+        #[cfg(feature = "kv_coord")]
+        let kv_share = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::kv_coordination::SparseHolderState::new(
+                kv_prefix_cache.capacity(),
+                runner.fingerprint(),
+            ),
+        ));
+        SparseMoEEngine {
+            runner,
+            tokenizer,
+            pending: VecDeque::new(),
+            peer_disconnected: false,
+            transport,
+            runtime_handle,
+            rank,
+            total,
+            last_rank_history: Vec::new(),
+            last_rank_rng: 0,
+            last_rank_rng_seeded: false,
+            spec_decode_k,
+            kv_prefix_cache,
+            #[cfg(feature = "kv_coord")]
+            kv_offers: crate::kv_coordination::KvOfferStash::new(
+                crate::kv_coordination::KV_MAX_OFFERS,
+                crate::kv_coordination::KV_MAX_OFFER_BYTES,
+                crate::kv_prefix_cache::KvSnapshot::approx_bytes,
+            ),
+            #[cfg(feature = "kv_coord")]
+            kv_capture: std::collections::HashMap::new(),
+            #[cfg(feature = "kv_coord")]
+            kv_downstream: std::collections::HashMap::new(),
+            #[cfg(feature = "kv_coord")]
+            kv_share,
+            #[cfg(feature = "kv_coord")]
+            kv_handoff_mailbox: std::sync::Arc::new(
+                cascadia_engine::kv_handoff::KvHandoffMailbox::new(),
+            ),
+            active: None,
+        }
+    }
+
     /// Bridge sync `Engine::step` code to an async transport future.
     /// Delegates to `cascadia_runner::run_async`, which consults the
     /// thread-local `BlockingContextGuard` flag — set by
@@ -1739,19 +1803,20 @@ impl Engine for SparseMoEEngine {
         if self.rank == 0 {
             return Ok(self.step_first());
         }
-        // Worker rank. step_worker returns empty on a latched upstream
-        // disconnect. The worker's upstream socket can only be re-accepted by
-        // a rebuild, so once disconnected, surface a connection-fatal Err to
-        // run_relay_loop (its ONLY driver — rank-0/single-stage go through
-        // generate()) so it exits and systemd rebuilds the stage, instead of
-        // backing off Ok(empty) forever. Emit it exactly once; the loop bails
-        // on the first fatal Err.
-        let produced = self.step_worker();
-        if worker_should_report_disconnect(self.peer_disconnected, self.disconnect_reported) {
-            self.disconnect_reported = true;
-            return Err(EngineError::NotConnected);
-        }
-        Ok(produced)
+        // Worker rank: `worker_step` latches a dead upstream and reports it.
+        let was_latched = self.peer_disconnected;
+        let produced = if was_latched {
+            Vec::new()
+        } else {
+            self.step_worker()
+        };
+        close_injected_links_on_latch(
+            was_latched,
+            self.peer_disconnected,
+            &self.transport,
+            &self.runtime_handle,
+        );
+        worker_step(self.peer_disconnected, produced)
     }
 
     #[cfg(feature = "kv_coord")]
@@ -1777,6 +1842,26 @@ impl Engine for SparseMoEEngine {
     fn kv_handoff(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>> {
         Some(std::sync::Arc::clone(&self.kv_handoff_mailbox)
             as std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>)
+    }
+
+    /// Issue #76: replace one or both pipeline streams after a link failure and
+    /// return to a clean between-requests state. A `None` link keeps that side.
+    fn reattach_streams(&mut self, links: cascadia_engine::StreamLinks) -> EngineResult<()> {
+        // Validate the pipeline shape + swap each supplied side in place.
+        // Every error from here (`PeerRejected`, or `Backend` if a validated
+        // handle were missing) is raised before any swap; nothing below fails.
+        self.transport.reattach(&self.runtime_handle, links)?;
+        // Clean between-requests state — unconditionally, never via cancel().
+        self.peer_disconnected = false;
+        self.active = None;
+        self.runner.reset_kv();
+        #[cfg(feature = "kv_coord")]
+        {
+            // A slice parked by the dead session's plane commit must not be
+            // applied to the fresh one; it has no epoch to self-evict.
+            self.kv_handoff_mailbox.discard_any();
+        }
+        Ok(())
     }
 
     fn close(&mut self) {
@@ -3191,16 +3276,11 @@ impl SparseMoEEngine {
     /// we sleep briefly on disconnect / error to avoid pegging a core
     /// while the runner is being torn down by the operator.
     fn step_worker(&mut self) -> Vec<(TaskId, Chunk)> {
-        if self.peer_disconnected {
-            std::thread::sleep(WORKER_BACKOFF);
-            return Vec::new();
-        }
         let upstream = match self.transport.upstream.clone() {
             Some(u) => u,
             None => {
                 warn!("worker rank has no upstream peer");
                 self.peer_disconnected = true;
-                std::thread::sleep(WORKER_BACKOFF);
                 return Vec::new();
             }
         };
@@ -3209,8 +3289,11 @@ impl SparseMoEEngine {
             Err(e) => {
                 warn!(rank = self.rank, "worker frame failed: {e}");
                 // Don't hot-spin on a misbehaving peer. dist_spec uses
-                // the same 200 ms cool-off; same logic applies here.
-                std::thread::sleep(WORKER_BACKOFF);
+                // the same 200 ms cool-off; same logic applies here. A
+                // latched link needs none: `step` reports it at once.
+                if !self.peer_disconnected {
+                    std::thread::sleep(WORKER_BACKOFF);
+                }
                 Vec::new()
             }
         }
@@ -3379,9 +3462,15 @@ impl SparseMoEEngine {
         upstream: &Arc<TokioMutex<ActivationServer>>,
     ) -> Result<(), String> {
         let downstream = self.transport.downstream.clone();
-        let kind = self
-            .block_on(recv_kind_server(upstream))
-            .map_err(|e| format!("recv_kind: {e}"))?;
+        let kind = match self.block_on(recv_kind_server(upstream)) {
+            Ok(kind) => kind,
+            Err(e) => {
+                if recv_error_kills_link(&e) {
+                    self.peer_disconnected = true;
+                }
+                return Err(format!("recv_kind: {e}"));
+            }
+        };
         let Some(kind) = kind else {
             // Clean upstream close — the driver finished its session.
             // Latch the flag so subsequent step()s back off without
@@ -3870,8 +3959,10 @@ pub struct OvMoeEngine {
     runtime_handle: tokio::runtime::Handle,
     rank: u32,
     total: u32,
-    /// Set on a worker rank when the upstream socket closes cleanly, so
-    /// `step_worker` doesn't hot-spin on `recv_kind_server` → `Ok(None)`.
+    /// Set on a worker rank when its upstream link is dead (a clean close or
+    /// a link the transport dropped). While set, every `step()` returns a
+    /// connection-fatal `Err` at once (see `worker_step`). Cleared only by
+    /// `reattach_streams`.
     peer_disconnected: bool,
     /// Last-rank only: tokens this rank has sampled since the last `Reset`,
     /// used as the repetition-penalty `history`. Like the K2.6 path, prompt
@@ -4875,27 +4966,16 @@ impl OvMoeEngine {
 
     /// Worker rank (rank > 0): service one frame from upstream per call.
     fn step_worker(&mut self) -> Vec<(TaskId, Chunk)> {
-        if self.peer_disconnected {
-            std::thread::sleep(WORKER_BACKOFF);
-            return Vec::new();
-        }
         let Some(upstream) = self.transport.upstream.clone() else {
             warn!("worker rank has no upstream socket");
-            std::thread::sleep(WORKER_BACKOFF);
+            self.peer_disconnected = true;
             return Vec::new();
         };
         let downstream = self.transport.downstream.clone();
-        let kind = match self.block_on(recv_kind_server(&upstream)) {
-            Ok(Some(k)) => k,
-            Ok(None) => {
-                self.peer_disconnected = true;
-                return Vec::new();
-            }
-            Err(e) => {
-                warn!("worker recv_kind failed: {e}");
-                std::thread::sleep(WORKER_BACKOFF);
-                return Vec::new();
-            }
+        let Some(kind) =
+            recv_worker_kind(&self.runtime_handle, &upstream, &mut self.peer_disconnected)
+        else {
+            return Vec::new();
         };
         let res = match kind {
             FrameKind::Reset => {
@@ -4931,7 +5011,10 @@ impl OvMoeEngine {
         };
         if let Err(e) = res {
             warn!("worker frame failed: {e}");
-            std::thread::sleep(WORKER_BACKOFF);
+            // A latched link needs no cool-off: `step` reports it at once.
+            if !self.peer_disconnected {
+                std::thread::sleep(WORKER_BACKOFF);
+            }
         }
         Vec::new()
     }
@@ -5086,18 +5169,43 @@ impl Engine for OvMoeEngine {
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
-        // Behavior-preserving migration to EngineResult: step_single_stage /
-        // step_first / step_worker handle their own errors terminally (the
-        // driver emits a final-marker chunk; the worker latches), so there is
-        // nothing to surface as Err here.
+        // step_single_stage / step_first handle their own errors terminally
+        // (the driver emits a final-marker chunk), so rank 0 never surfaces an
+        // Err here.
         if self.total <= 1 {
             return Ok(self.step_single_stage());
         }
-        Ok(if self.rank == 0 {
-            self.step_first()
+        if self.rank == 0 {
+            return Ok(self.step_first());
+        }
+        // Worker rank: `worker_step` latches a dead upstream and reports it.
+        let was_latched = self.peer_disconnected;
+        let produced = if was_latched {
+            Vec::new()
         } else {
             self.step_worker()
-        })
+        };
+        close_injected_links_on_latch(
+            was_latched,
+            self.peer_disconnected,
+            &self.transport,
+            &self.runtime_handle,
+        );
+        worker_step(self.peer_disconnected, produced)
+    }
+
+    /// Issue #76: see `SparseMoEEngine::reattach_streams`. OvMoe resets KV via
+    /// `OvMoeRunner::reset` (the same call its Reset-frame handler uses).
+    fn reattach_streams(&mut self, links: cascadia_engine::StreamLinks) -> EngineResult<()> {
+        self.transport.reattach(&self.runtime_handle, links)?;
+        self.peer_disconnected = false;
+        self.active_ov = None;
+        self.runner.reset();
+        #[cfg(feature = "kv_coord")]
+        {
+            self.kv_handoff_mailbox.discard_any();
+        }
+        Ok(())
     }
 
     #[cfg(feature = "kv_coord")]
@@ -5344,8 +5452,11 @@ pub struct PipelineEngine<R: StagedRunner> {
     runtime_handle: tokio::runtime::Handle,
     rank: u32,
     total: u32,
+    /// Set on a worker rank when its upstream link is dead (a clean close, a
+    /// link the transport dropped, or a protocol violation escalated to one).
+    /// While set, every `step()` returns a connection-fatal `Err` at once (see
+    /// `worker_step`). Cleared only by `reattach_streams`.
     peer_disconnected: bool,
-    disconnect_reported: bool,
     last_rank_history: Vec<i64>,
     last_rank_rng: u64,
     last_rank_rng_seeded: bool,
@@ -5361,6 +5472,11 @@ pub struct PipelineEngine<R: StagedRunner> {
     /// Rank 0 serves ONE task at a time (as the monolithic driver did): a new
     /// task is popped from `pending` only when this is `None`.
     active: Option<PipeActive>,
+    /// Issue #76: the EP driver's per-worker connections — a clone of the same
+    /// `ep_clients` Vec handed to `EpClient::new` at build, so `reattach_streams`
+    /// can swap a dead worker's link inside the `Arc` the `EpClient` holds.
+    /// Empty on every non-EP-driver stage.
+    ep_links: Vec<Arc<TokioMutex<ActivationClient>>>,
 }
 
 /// Rank-0 per-token streaming state: everything the decode loop threaded as
@@ -5393,6 +5509,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
     /// `CASCADIA_GLM5_PREFIX_CACHE`, preserving the env-only behaviour. This
     /// index must stay in lockstep with every rank's `SliceKvCache`, so the
     /// value threaded here is the same one handed to `StageOpts`.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         runner: R,
         tokenizer: Option<Tokenizer>,
@@ -5401,6 +5518,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         rank: u32,
         total: u32,
         prefix_cap: Option<usize>,
+        ep_links: Vec<Arc<TokioMutex<ActivationClient>>>,
     ) -> Self {
         Self {
             runner,
@@ -5411,7 +5529,6 @@ impl<R: StagedRunner> PipelineEngine<R> {
             rank,
             total,
             peer_disconnected: false,
-            disconnect_reported: false,
             last_rank_history: Vec::new(),
             last_rank_rng: 0,
             last_rank_rng_seeded: false,
@@ -5425,6 +5542,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 })
                 .unwrap_or(0),
             active: None,
+            ep_links,
         }
     }
 
@@ -6052,27 +6170,16 @@ impl<R: StagedRunner> PipelineEngine<R> {
     }
 
     fn step_worker(&mut self) -> Vec<(TaskId, Chunk)> {
-        if self.peer_disconnected {
-            std::thread::sleep(WORKER_BACKOFF);
-            return Vec::new();
-        }
         let Some(upstream) = self.transport.upstream.clone() else {
             warn!("worker rank has no upstream socket");
-            std::thread::sleep(WORKER_BACKOFF);
+            self.peer_disconnected = true;
             return Vec::new();
         };
         let downstream = self.transport.downstream.clone();
-        let kind = match self.block_on(recv_kind_server(&upstream)) {
-            Ok(Some(k)) => k,
-            Ok(None) => {
-                self.peer_disconnected = true;
-                return Vec::new();
-            }
-            Err(e) => {
-                warn!("worker recv_kind failed: {e}");
-                std::thread::sleep(WORKER_BACKOFF);
-                return Vec::new();
-            }
+        let Some(kind) =
+            recv_worker_kind(&self.runtime_handle, &upstream, &mut self.peer_disconnected)
+        else {
+            return Vec::new();
         };
         let res = match kind {
             FrameKind::Reset => {
@@ -6160,7 +6267,10 @@ impl<R: StagedRunner> PipelineEngine<R> {
         };
         if let Err(e) = res {
             warn!("worker frame failed: {e}");
-            std::thread::sleep(WORKER_BACKOFF);
+            // A latched link needs no cool-off: `step` reports it at once.
+            if !self.peer_disconnected {
+                std::thread::sleep(WORKER_BACKOFF);
+            }
         }
         Vec::new()
     }
@@ -6499,6 +6609,89 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
         }
     }
 
+    /// Issue #76: replace one or more links after a link failure and return to a
+    /// clean between-requests state. A `None` pipeline link (or `None` / absent
+    /// `ep_workers` entry) keeps that link. Validates the combined pipeline +
+    /// EP-worker shape itself — an EP driver (`total == 1`) carries its worker
+    /// links here, not on `StageTransport` — then swaps each supplied side in
+    /// place via the shared helpers. EP dispatch is stateless per frame (one
+    /// ExpertDispatch in, one result out; no KV) and the driver keeps no EP
+    /// latch — a dead worker's link is closed on timeout (`EpClient::round_trip`)
+    /// and the request fails — so there is nothing to reset for EP beyond the
+    /// pipeline-engine reset below.
+    fn reattach_streams(&mut self, mut links: cascadia_engine::StreamLinks) -> EngineResult<()> {
+        // Combined shape: pipeline links this stage has + one slot per EP worker
+        // the driver holds (empty on a non-driver). Validation first, so a
+        // rejection (PeerRejected) leaves the engine untouched.
+        let mut stage = cascadia_engine::LinkShape::pipeline(
+            self.transport.upstream.is_some(),
+            self.transport.downstream.is_some(),
+        );
+        stage.ep_workers = self.ep_links.len();
+        cascadia_engine::check_reattach_streams(stage, &links)?;
+        self.transport
+            .check_closed_links_replaced(&self.runtime_handle, &links)?;
+        // A kept EP worker link must be live too (an empty `ep_workers` keeps
+        // them all).
+        let kept_ep: Vec<(usize, Arc<TokioMutex<ActivationClient>>)> = self
+            .ep_links
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| links.ep_workers.get(*i).is_none_or(|s| s.is_none()))
+            .map(|(i, l)| (i, Arc::clone(l)))
+            .collect();
+        if let Some(i) = cascadia_runner::run_async(&self.runtime_handle, async move {
+            for (i, l) in kept_ep {
+                if !l.lock().await.is_connected() {
+                    return Some(i);
+                }
+            }
+            None
+        }) {
+            return Err(cascadia_engine::kept_link_dead(&format!("ep_workers[{i}]")));
+        }
+        // Resolve every swap target before swapping anything, so even a
+        // (validation-excluded) missing handle fails with nothing swapped.
+        let up = match links.upstream.take() {
+            Some(s) => Some((reattach_target(&self.transport.upstream, "upstream")?, s)),
+            None => None,
+        };
+        let down = match links.downstream.take() {
+            Some(s) => Some((
+                reattach_target(&self.transport.downstream, "downstream")?,
+                s,
+            )),
+            None => None,
+        };
+        // `check_reattach_streams` guarantees `ep_workers` is empty (keep all)
+        // or exactly `self.ep_links.len()` long; a `None` entry keeps that
+        // worker's stream.
+        let ep = self.ep_links.iter().zip(links.ep_workers);
+        // Swap in place through the shared transport helpers.
+        cascadia_runner::run_async(&self.runtime_handle, async move {
+            if let Some((srv, s)) = up {
+                cascadia_transport::attach_server(srv, s).await;
+            }
+            if let Some((cli, s)) = down {
+                cascadia_transport::attach_client(cli, s).await;
+            }
+            for (slot, stream) in ep {
+                if let Some(stream) = stream {
+                    cascadia_transport::attach_client(slot, stream).await;
+                }
+            }
+        });
+        // Clean between-requests state — unconditionally, never via cancel().
+        self.peer_disconnected = false;
+        self.active = None;
+        // The rank-0 head holds the KV-prefix index; clearing it stops a
+        // restarted worker's next prefix hit from latching "kv-prefix cache
+        // diverged" forever. Worker ranks keep an empty index (no-op there).
+        self.prefix_index.clear();
+        self.runner.reset();
+        Ok(())
+    }
+
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
         if self.total <= 1 {
             return Ok(self.step_single_stage());
@@ -6508,18 +6701,21 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
         if self.rank == 0 {
             return Ok(self.step_first());
         }
-        // Worker rank. step_worker returns empty once an upstream disconnect (or
-        // a protocol violation escalated to one in handle_forward) latches
-        // peer_disconnected. The upstream socket can only be re-accepted by a
-        // rebuild, so surface a connection-fatal Err to run_relay_loop (its only
-        // driver) exactly once — mirroring SparseMoEEngine::step — so the stage
-        // tears down and rebuilds instead of backing off Ok(empty) forever.
-        let produced = self.step_worker();
-        if worker_should_report_disconnect(self.peer_disconnected, self.disconnect_reported) {
-            self.disconnect_reported = true;
-            return Err(EngineError::NotConnected);
-        }
-        Ok(produced)
+        // Worker rank: `worker_step` latches a dead upstream (or a protocol
+        // violation escalated to one in handle_forward) and reports it.
+        let was_latched = self.peer_disconnected;
+        let produced = if was_latched {
+            Vec::new()
+        } else {
+            self.step_worker()
+        };
+        close_injected_links_on_latch(
+            was_latched,
+            self.peer_disconnected,
+            &self.transport,
+            &self.runtime_handle,
+        );
+        worker_step(self.peer_disconnected, produced)
     }
 }
 
@@ -6651,6 +6847,7 @@ mod tests {
             0,
             2,
             None,
+            Vec::new(),
         );
         let mut task = GenerationTask::new("t", "hi").with_max_tokens(4);
         task.resume_token_ids = Some(vec![3]);
@@ -6693,21 +6890,17 @@ mod tests {
         assert_eq!((s, e), (0, u32::MAX));
     }
 
-    /// A latched worker disconnect must surface a connection-fatal Err to the
-    /// relay loop — exactly once — so run_relay_loop exits and systemd
-    /// rebuilds the stage instead of backing off Ok(empty) forever. The Err
-    /// step() emits (EngineError::NotConnected) must be recognized as fatal.
+    /// A latched worker disconnect surfaces a connection-fatal Err on every
+    /// step, not once: TCP-mode run_relay_loop exits on the first one; a
+    /// stream-mode one parks on each, including after a wake that left the
+    /// link dead.
     #[test]
-    fn worker_disconnect_reports_fatal_once() {
-        // Connected: nothing to report.
-        assert!(!worker_should_report_disconnect(false, false));
-        // First step after the link drops: report.
-        assert!(worker_should_report_disconnect(true, false));
-        // Already reported: suppressed (don't flood if re-polled).
-        assert!(!worker_should_report_disconnect(true, true));
-        // The Err step() returns on that one report is connection-fatal, so
-        // run_relay_loop exits ConnectionFatal.
-        assert!(EngineError::NotConnected.is_connection_fatal());
+    fn worker_step_reports_a_latched_disconnect_every_time() {
+        assert_eq!(worker_step(false, Vec::new()).unwrap().len(), 0);
+        for _ in 0..2 {
+            let e = worker_step(true, Vec::new()).unwrap_err();
+            assert!(e.is_connection_fatal(), "{e:?}");
+        }
     }
 
     // -------- batched-prefill reply deadline (regression for the unbounded
@@ -6930,12 +7123,9 @@ mod tests {
         let mut cfg = SparseMoEBuilderConfig::new("/nonexistent", "CPU");
         cfg.ep_worker = Some((0, 1));
         let mut b = SparseMoEBuilder::new(cfg);
-        b.connect_streams(cascadia_engine::StreamLinks {
-            ep_driver: Some(duplex_byte_stream()),
-            ..Default::default()
-        })
-        .await
-        .expect("an expert worker accepts a driver link");
+        b.connect_streams(cascadia_engine::StreamLinks::ep_driver(duplex_byte_stream()))
+            .await
+            .expect("an expert worker accepts a driver link");
         assert!(
             b.ep_server.is_some(),
             "the driver link is stored as ep_server"
@@ -6951,10 +7141,10 @@ mod tests {
         let mut cfg = SparseMoEBuilderConfig::new("/nonexistent", "CPU");
         cfg.ep_workers = vec![("a".into(), 1), ("b".into(), 2)];
         let mut b = SparseMoEBuilder::new(cfg);
-        b.connect_streams(cascadia_engine::StreamLinks {
-            ep_workers: vec![Some(duplex_byte_stream()), Some(duplex_byte_stream())],
-            ..Default::default()
-        })
+        b.connect_streams(cascadia_engine::StreamLinks::ep_workers(vec![
+            Some(duplex_byte_stream()),
+            Some(duplex_byte_stream()),
+        ]))
         .await
         .expect("an expert driver accepts one link per worker");
         assert_eq!(
@@ -6973,10 +7163,9 @@ mod tests {
         cfg.ep_workers = vec![("a".into(), 1), ("b".into(), 2)];
         let mut b = SparseMoEBuilder::new(cfg);
         assert!(matches!(
-            b.connect_streams(cascadia_engine::StreamLinks {
-                ep_workers: vec![Some(duplex_byte_stream())],
-                ..Default::default()
-            })
+            b.connect_streams(cascadia_engine::StreamLinks::ep_workers(vec![Some(
+                duplex_byte_stream()
+            )]))
             .await,
             Err(EngineError::PeerRejected(_))
         ));
@@ -6987,10 +7176,10 @@ mod tests {
         cfg.ep_workers = vec![("a".into(), 1), ("b".into(), 2)];
         let mut b = SparseMoEBuilder::new(cfg);
         assert!(matches!(
-            b.connect_streams(cascadia_engine::StreamLinks {
-                ep_workers: vec![Some(duplex_byte_stream()), None],
-                ..Default::default()
-            })
+            b.connect_streams(cascadia_engine::StreamLinks::ep_workers(vec![
+                Some(duplex_byte_stream()),
+                None
+            ]))
             .await,
             Err(EngineError::PeerRejected(_))
         ));
@@ -6998,10 +7187,11 @@ mod tests {
         // An EP link on a plain pipeline stage.
         let mut b = injected_builder(0, 2); // head: downstream only
         assert!(matches!(
-            b.connect_streams(cascadia_engine::StreamLinks {
-                downstream: Some(duplex_byte_stream()),
-                ep_driver: Some(duplex_byte_stream()),
-                ..Default::default()
+            b.connect_streams({
+                let mut l =
+                    cascadia_engine::StreamLinks::pipeline(None, Some(duplex_byte_stream()));
+                l.ep_driver = Some(duplex_byte_stream());
+                l
             })
             .await,
             Err(EngineError::PeerRejected(_))
@@ -7012,10 +7202,11 @@ mod tests {
         cfg.ep_worker = Some((0, 1));
         let mut b = SparseMoEBuilder::new(cfg);
         assert!(matches!(
-            b.connect_streams(cascadia_engine::StreamLinks {
-                upstream: Some(duplex_byte_stream()),
-                ep_driver: Some(duplex_byte_stream()),
-                ..Default::default()
+            b.connect_streams({
+                let mut l =
+                    cascadia_engine::StreamLinks::pipeline(Some(duplex_byte_stream()), None);
+                l.ep_driver = Some(duplex_byte_stream());
+                l
             })
             .await,
             Err(EngineError::PeerRejected(_))
@@ -7045,5 +7236,909 @@ mod tests {
                 .await,
             Err(EngineError::InvalidConfig(_))
         ));
+    }
+
+    // ---- injected streams: reattach_streams (#76) ----
+    //
+    // PipelineEngine takes a weight-free StubRunner; SparseMoEEngine and
+    // OvMoeEngine get weightless runners (see the dead-link section below).
+    // The shared swap logic is also covered by dist.rs's `reattach_tests`.
+    //
+    // reattach_streams is SYNC and block_on's internally via the stored runtime
+    // handle; a plain #[test] with a multi-thread `Runtime::new()` handle makes
+    // run_async take its `handle.block_on` branch (no current runtime on this
+    // thread) without deadlock. A #[tokio::test] would deadlock re-entering its
+    // own runtime — the same pattern tests/sparse_streaming.rs uses.
+
+    #[test]
+    fn pipeline_reattach_swaps_downstream_in_place_and_clears_state() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (near, far) = tokio::io::duplex(1 << 16);
+        let down = Arc::new(TokioMutex::new(ActivationClient::from_stream(Box::new(
+            near,
+        ))));
+        let down_clone = Arc::clone(&down); // what a PipeActive holds
+        let mut eng = PipelineEngine::new(
+            StubRunner,
+            None,
+            StageTransport {
+                upstream: None,
+                downstream: Some(down),
+            },
+            rt.handle().clone(),
+            0, // head: downstream only
+            2,
+            None,
+            Vec::new(), // no EP links on a plain pipeline stage
+        );
+        // Dirty, post-outage state.
+        eng.peer_disconnected = true;
+        eng.prefix_index.push((vec![1, 2, 3], 7));
+        drop(far); // old link dead (contract item 3)
+
+        let (near2, far2) = tokio::io::duplex(1 << 16);
+        eng.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            None,
+            Some(Box::new(near2)),
+        ))
+        .expect("downstream-only reattach on a head");
+
+        assert!(!eng.peer_disconnected);
+        assert!(eng.prefix_index.is_empty(), "head must clear prefix_index");
+        assert!(
+            Arc::ptr_eq(&down_clone, eng.transport.downstream.as_ref().unwrap()),
+            "the Arc must be swapped in place, never replaced"
+        );
+        rt.block_on(async {
+            let mut peer = cascadia_transport::ActivationServer::from_stream(Box::new(far2));
+            let t = cascadia_transport::Tensor::from_2d(
+                cascadia_transport::DType::F32,
+                1,
+                2,
+                vec![0, 0, 128, 63, 0, 0, 0, 64],
+            );
+            down_clone.lock().await.send(&t).await.unwrap();
+            let (got, _) = peer.recv().await.unwrap();
+            assert_eq!(got.data, t.data);
+        });
+    }
+
+    #[test]
+    fn pipeline_reattach_rejects_bad_shape_without_touching_state() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (near, _far) = tokio::io::duplex(64);
+        let mut eng = PipelineEngine::new(
+            StubRunner,
+            None,
+            StageTransport {
+                upstream: None,
+                downstream: Some(Arc::new(TokioMutex::new(ActivationClient::from_stream(
+                    Box::new(near),
+                )))),
+            },
+            rt.handle().clone(),
+            0,
+            2,
+            None,
+            Vec::new(),
+        );
+        eng.peer_disconnected = true; // sentinel: must survive a rejected call
+                                      // Replacing nothing.
+        assert!(matches!(
+            eng.reattach_streams(cascadia_engine::StreamLinks::default()),
+            Err(EngineError::PeerRejected(_))
+        ));
+        // An upstream this head lacks.
+        assert!(matches!(
+            eng.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+                Some(Box::new(tokio::io::duplex(64).0)),
+                None,
+            )),
+            Err(EngineError::PeerRejected(_))
+        ));
+        // An EP worker link a plain pipeline stage does not have.
+        assert!(matches!(
+            eng.reattach_streams(cascadia_engine::StreamLinks::ep_workers(vec![Some(
+                Box::new(tokio::io::duplex(64).0)
+            )])),
+            Err(EngineError::PeerRejected(_))
+        ));
+        assert!(
+            eng.peer_disconnected,
+            "a rejected reattach must leave engine state untouched"
+        );
+    }
+
+    /// The EP driver is a single-stage `PipelineEngine` whose `ep_links` is a
+    /// clone of the same `ep_clients` Vec `EpClient::new` was handed at build.
+    /// Re-attaching a worker link must reach the `ActivationClient` the EpClient
+    /// dispatches through.
+    #[test]
+    fn ep_driver_reattach_reaches_the_arc_epclient_holds() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (near, far) = tokio::io::duplex(1 << 16);
+        // One EP worker connection. The EpClient (held inside the inkling runner)
+        // and the driver PipelineEngine's `ep_links` are BOTH clones of this same
+        // Arc — exactly as `build()` wires them: EpClient::new(ep_clients.clone())
+        // in `load`, ep_links = ep_clients.clone() in `build`.
+        let worker0 = Arc::new(TokioMutex::new(ActivationClient::from_stream(Box::new(
+            near,
+        ))));
+        let probe = Arc::clone(&worker0); // third clone, to drive I/O after the swap
+        let ep = crate::inkling::ep::EpClient::new(
+            vec![Arc::clone(&worker0)],
+            rt.handle().clone(),
+            8, // hidden
+            1, // n_routed
+            0, // n_shared
+        );
+        assert_eq!(ep.n_workers(), 1);
+        let mut eng = PipelineEngine::new(
+            StubRunner,
+            None,
+            StageTransport {
+                upstream: None,
+                downstream: None,
+            },
+            rt.handle().clone(),
+            0, // the driver runs as a single stage
+            1,
+            None,
+            vec![worker0], // ep_links (moves the Arc; probe + ep keep clones)
+        );
+        eng.peer_disconnected = true;
+        drop(far); // the dead worker link's far end (contract item 3)
+
+        let (near2, far2) = tokio::io::duplex(1 << 16);
+        eng.reattach_streams(cascadia_engine::StreamLinks::ep_workers(vec![Some(
+            Box::new(near2),
+        )]))
+        .expect("ep-driver reattach of worker 0");
+
+        assert!(!eng.peer_disconnected);
+        assert!(
+            Arc::ptr_eq(&probe, &eng.ep_links[0]),
+            "the worker Arc must be swapped in place, never replaced"
+        );
+        // The swap reached the shared ActivationClient (the one the EpClient also
+        // holds): drive the fresh stream through `probe` and read it on far2.
+        rt.block_on(async {
+            let mut peer = cascadia_transport::ActivationServer::from_stream(Box::new(far2));
+            let t = cascadia_transport::Tensor::from_2d(
+                cascadia_transport::DType::F32,
+                1,
+                2,
+                vec![0, 0, 128, 63, 0, 0, 0, 64],
+            );
+            probe.lock().await.send(&t).await.unwrap();
+            let (got, _) = peer.recv().await.unwrap();
+            assert_eq!(got.data, t.data);
+        });
+        drop(ep); // keep the EpClient alive until here so the shared wiring is explicit
+    }
+
+    // ---- injected streams: dead-link latching + engine-level re-attach (#76) ----
+    //
+    // Weightless engines: `Runner::weightless_for_test` / `OvMoeRunner::
+    // weightless_for_test` build runners with no compiled graphs, enough for
+    // every path that never runs a forward (step latching, re-attach). Same
+    // plain-#[test] + `Runtime::new()` pattern as the reattach tests above.
+
+    /// A stream whose reads fail with an I/O kind the transport does not
+    /// recognise as a dead link (an opaque p2p stream reporting peer death as
+    /// `Other`). The injected handle normalizes that to `StreamFailed`.
+    struct FailingStream;
+
+    impl tokio::io::AsyncRead for FailingStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("p2p link lost")))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FailingStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    fn injected_server(s: cascadia_engine::ByteStream) -> Arc<TokioMutex<ActivationServer>> {
+        Arc::new(TokioMutex::new(ActivationServer::from_stream(s)))
+    }
+
+    fn injected_client(s: cascadia_engine::ByteStream) -> Arc<TokioMutex<ActivationClient>> {
+        Arc::new(TokioMutex::new(ActivationClient::from_stream(s)))
+    }
+
+    fn duplex() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        tokio::io::duplex(1 << 16)
+    }
+
+    /// The pipeline transport of rank `rank` of `total`, each link an injected
+    /// duplex end. Returns the far ends (upstream, downstream) so the test
+    /// controls when each link dies.
+    fn injected_transport(
+        rank: u32,
+        total: u32,
+    ) -> (
+        StageTransport,
+        Option<tokio::io::DuplexStream>,
+        Option<tokio::io::DuplexStream>,
+    ) {
+        let (mut t, mut far_up, mut far_down) = (StageTransport::default(), None, None);
+        if rank > 0 {
+            let (near, far) = duplex();
+            t.upstream = Some(injected_server(Box::new(near)));
+            far_up = Some(far);
+        }
+        if rank + 1 < total {
+            let (near, far) = duplex();
+            t.downstream = Some(injected_client(Box::new(near)));
+            far_down = Some(far);
+        }
+        (t, far_up, far_down)
+    }
+
+    fn sparse_engine(
+        rt: &tokio::runtime::Runtime,
+        transport: StageTransport,
+        rank: u32,
+        total: u32,
+    ) -> SparseMoEEngine {
+        SparseMoEEngine::new(
+            Runner::weightless_for_test(),
+            None,
+            transport,
+            rt.handle().clone(),
+            rank,
+            total,
+            None,
+            KvPrefixCache::new(0),
+        )
+    }
+
+    fn ov_engine(
+        rt: &tokio::runtime::Runtime,
+        transport: StageTransport,
+        rank: u32,
+        total: u32,
+    ) -> OvMoeEngine {
+        OvMoeEngine::new(
+            OvMoeRunner::weightless_for_test(2, 0),
+            None,
+            transport,
+            rt.handle().clone(),
+            rank,
+            total,
+            crate::ov_kv_cache::OvMoeKvPrefixCache::new(0),
+        )
+    }
+
+    fn pipeline_engine(
+        rt: &tokio::runtime::Runtime,
+        transport: StageTransport,
+        rank: u32,
+        total: u32,
+    ) -> PipelineEngine<StubRunner> {
+        PipelineEngine::new(
+            StubRunner,
+            None,
+            transport,
+            rt.handle().clone(),
+            rank,
+            total,
+            None,
+            Vec::new(),
+        )
+    }
+
+    /// Every step on a dead upstream link must return a connection-fatal
+    /// error, promptly. A stream-mode relay parks on that error; a later wake
+    /// with the link still dead (a rejected re-attach bumps the generation)
+    /// must park again rather than sleep `WORKER_BACKOFF` holding the engine
+    /// lock and return `Ok(empty)` forever.
+    fn assert_steps_fail_fast_and_fatal(
+        mut step: impl FnMut() -> EngineResult<Vec<(TaskId, Chunk)>>,
+    ) {
+        for i in 0..3 {
+            let t0 = Instant::now();
+            let r = step();
+            let took = t0.elapsed();
+            assert!(
+                matches!(&r, Err(e) if e.is_connection_fatal()),
+                "step {i} on a dead upstream link must be connection-fatal, got {:?}",
+                r.map(|v| v.len())
+            );
+            assert!(
+                took < WORKER_BACKOFF,
+                "step {i} must not back off while the link is latched dead (took {took:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_worker_keeps_failing_fast_after_upstream_eof() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (t, far_up, _far_down) = injected_transport(1, 2);
+        let mut eng = sparse_engine(&rt, t, 1, 2);
+        drop(far_up); // the head closed its end
+        assert_steps_fail_fast_and_fatal(|| eng.step());
+    }
+
+    #[test]
+    fn ov_moe_worker_keeps_failing_fast_after_upstream_eof() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (t, far_up, _far_down) = injected_transport(1, 2);
+        let mut eng = ov_engine(&rt, t, 1, 2);
+        drop(far_up);
+        assert_steps_fail_fast_and_fatal(|| eng.step());
+    }
+
+    #[test]
+    fn pipeline_worker_keeps_failing_fast_after_upstream_eof() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (t, far_up, _far_down) = injected_transport(1, 2);
+        let mut eng = pipeline_engine(&rt, t, 1, 2);
+        drop(far_up);
+        assert_steps_fail_fast_and_fatal(|| eng.step());
+    }
+
+    /// An injected upstream that fails without a clean EOF (the transport
+    /// normalizes the error to `StreamFailed` and drops the stream, so every
+    /// later recv is `NotConnected`) is just as dead: the worker must latch it
+    /// and park, not warn-and-retry forever.
+    #[test]
+    fn workers_latch_a_failed_injected_upstream() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let upstream = || StageTransport {
+            upstream: Some(injected_server(Box::new(FailingStream))),
+            downstream: None,
+        };
+        let mut sparse = sparse_engine(&rt, upstream(), 1, 2);
+        assert_steps_fail_fast_and_fatal(|| sparse.step());
+        let mut ov = ov_engine(&rt, upstream(), 1, 2);
+        assert_steps_fail_fast_and_fatal(|| ov.step());
+        let mut pipe = pipeline_engine(&rt, upstream(), 1, 2);
+        assert_steps_fail_fast_and_fatal(|| pipe.step());
+    }
+
+    /// Asserts `far` sees EOF promptly: the near end was closed.
+    fn assert_far_end_sees_eof(rt: &tokio::runtime::Runtime, far: &mut tokio::io::DuplexStream) {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 1];
+        let n = rt
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), far.read(&mut buf)).await
+            })
+            .expect("the latched worker must close this link, not leave it open")
+            .unwrap();
+        assert_eq!(n, 0, "EOF");
+    }
+
+    /// Asserts `far` sees NO EOF within a short window: the near end is open.
+    fn assert_far_end_stays_open(rt: &tokio::runtime::Runtime, far: &mut tokio::io::DuplexStream) {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 1];
+        let res = rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(200), far.read(&mut buf)).await
+        });
+        assert!(res.is_err(), "the link must stay open, got {res:?}");
+    }
+
+    /// Stream mode: a worker whose UPSTREAM died latches but leaves its
+    /// healthy downstream open (no cascade to the tail), so a re-attach that
+    /// replaces only the upstream is accepted.
+    #[test]
+    fn a_dead_upstream_latch_leaves_the_downstream_open() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for which in ["sparse", "ov_moe", "pipeline"] {
+            let (t, far_up, far_down) = injected_transport(1, 3);
+            let mut far_down = far_down.unwrap();
+            let mut eng: Box<dyn Engine> = match which {
+                "sparse" => Box::new(sparse_engine(&rt, t, 1, 3)),
+                "ov_moe" => Box::new(ov_engine(&rt, t, 1, 3)),
+                _ => Box::new(pipeline_engine(&rt, t, 1, 3)),
+            };
+            drop(far_up);
+            assert!(eng.step().is_err(), "{which}: latched");
+            assert_far_end_stays_open(&rt, &mut far_down);
+            let (up, _up_far) = duplex();
+            eng.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+                Some(Box::new(up)),
+                None,
+            ))
+            .unwrap_or_else(|e| panic!("{which}: keeping the healthy downstream: {e}"));
+        }
+    }
+
+    /// Stream mode: a PROTOCOL latch (here a real one: a RestorePrefix for a
+    /// key this rank does not hold, i.e. a diverged prefix cache) leaves the
+    /// links healthy, so the worker closes them: both neighbours see EOF at
+    /// once, and a re-attach that keeps the closed downstream is refused.
+    #[test]
+    fn a_protocol_latch_closes_the_workers_injected_links() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (t, far_up, far_down) = injected_transport(1, 3);
+        let (far_up, mut far_down) = (far_up.unwrap(), far_down.unwrap());
+        let mut eng = pipeline_engine(&rt, t, 1, 3);
+        let head = TokioMutex::new(ActivationClient::from_stream(Box::new(far_up)));
+        rt.block_on(crate::dist::send_restore_prefix(&head, 42))
+            .unwrap();
+        assert!(eng.step().is_err(), "a restore miss latches the worker");
+        assert!(eng.peer_disconnected);
+        assert_far_end_sees_eof(&rt, &mut far_down);
+        let up_eof = rt.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                head.lock().await.recv_raw(1),
+            )
+            .await
+        });
+        assert!(
+            matches!(
+                up_eof,
+                Ok(Err(cascadia_transport::TransportError::SocketClosed))
+            ),
+            "the upstream peer sees EOF, got {up_eof:?}"
+        );
+        // Keeping the closed downstream is refused, nothing swapped.
+        let (up, _up_far) = duplex();
+        let res = eng.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            Some(Box::new(up)),
+            None,
+        ));
+        assert!(
+            matches!(&res, Err(EngineError::PeerRejected(m)) if m.contains("kept downstream link is dead")),
+            "got {res:?}"
+        );
+        assert!(eng.peer_disconnected, "a rejected reattach touches nothing");
+        let (up, _up_far) = duplex();
+        let (down, _down_far) = duplex();
+        eng.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            Some(Box::new(up)),
+            Some(Box::new(down)),
+        ))
+        .unwrap();
+        assert!(!eng.peer_disconnected);
+    }
+
+    /// An EP driver may keep a worker's link only while it is live.
+    #[test]
+    fn keeping_a_dead_ep_worker_link_is_rejected() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (live, _live_far) = duplex();
+        let (dead, _dead_far) = duplex();
+        let dead = injected_client(Box::new(dead));
+        rt.block_on(async { dead.lock().await.close().await });
+        let mut eng = PipelineEngine::new(
+            StubRunner,
+            None,
+            StageTransport::default(),
+            rt.handle().clone(),
+            0,
+            1,
+            None,
+            vec![injected_client(Box::new(live)), dead],
+        );
+        let (fresh, _fresh_far) = duplex();
+        let res = eng.reattach_streams(cascadia_engine::StreamLinks::ep_workers(vec![
+            Some(Box::new(fresh)),
+            None,
+        ]));
+        assert!(
+            matches!(&res, Err(EngineError::PeerRejected(m)) if m.contains("ep_workers[1]")),
+            "got {res:?}"
+        );
+        let (a, _af) = duplex();
+        let (b, _bf) = duplex();
+        eng.reattach_streams(cascadia_engine::StreamLinks::ep_workers(vec![
+            Some(Box::new(a)),
+            Some(Box::new(b)),
+        ]))
+        .unwrap();
+    }
+
+    /// TCP/UDS links are never closed by the latch hook (a TCP worker exits
+    /// and is rebuilt instead).
+    #[test]
+    fn closing_on_latch_leaves_tcp_links_alone() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let t = StageTransport {
+            upstream: None,
+            downstream: Some(Arc::new(TokioMutex::new(ActivationClient::new(
+                "127.0.0.1",
+                1,
+            )))),
+        };
+        assert_eq!(t.close_injected_links(rt.handle()), 0);
+    }
+
+    /// Reads one 4-byte frame kind off `far` after `send` pushes it through
+    /// `near`, proving `near` is live on the stream whose far end is `far`.
+    fn assert_client_reaches(
+        rt: &tokio::runtime::Runtime,
+        near: &Arc<TokioMutex<ActivationClient>>,
+        far: tokio::io::DuplexStream,
+    ) {
+        rt.block_on(async {
+            near.lock()
+                .await
+                .send_raw(&(FrameKind::Reset as u32).to_be_bytes())
+                .await
+                .unwrap();
+            let mut peer = ActivationServer::from_stream(Box::new(far));
+            let kb = peer.recv_raw(4).await.unwrap();
+            assert_eq!(
+                u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]),
+                FrameKind::Reset as u32
+            );
+        });
+    }
+
+    /// Same as [`assert_client_reaches`] in the other direction.
+    fn assert_server_reaches(
+        rt: &tokio::runtime::Runtime,
+        near: &Arc<TokioMutex<ActivationServer>>,
+        far: tokio::io::DuplexStream,
+    ) {
+        rt.block_on(async {
+            let mut peer = ActivationClient::from_stream(Box::new(far));
+            peer.send_raw(&(FrameKind::Reset as u32).to_be_bytes())
+                .await
+                .unwrap();
+            let kb = near.lock().await.recv_raw(4).await.unwrap();
+            assert_eq!(
+                u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]),
+                FrameKind::Reset as u32
+            );
+        });
+    }
+
+    fn sparse_active(down: Arc<TokioMutex<ActivationClient>>) -> SparseActive {
+        SparseActive {
+            id: "t".into(),
+            downstream: down,
+            cfg: crate::sampling::SamplingConfig::default(),
+            eos: Vec::new(),
+            max_new: 4,
+            started: Instant::now(),
+            history: vec![1, 2],
+            generated: vec![2],
+            emitted: 0,
+            resume_seed_len: 0,
+            seam_check: None,
+            next: 3,
+            prompt_ids: vec![1],
+            tenant: String::new(),
+        }
+    }
+
+    fn ov_active(down: Arc<TokioMutex<ActivationClient>>) -> OvMoeActive {
+        OvMoeActive {
+            id: "t".into(),
+            downstream: down,
+            cfg: crate::sampling::SamplingConfig::default(),
+            eos: Vec::new(),
+            max_new: 4,
+            started: Instant::now(),
+            generated: vec![2],
+            emitted: 0,
+            resume_seed_len: 0,
+            seam_check: None,
+            next: 3,
+            pos: 2,
+            prompt_ids: vec![1],
+            tenant: String::new(),
+        }
+    }
+
+    /// Head: the downstream is swapped inside the Arc the in-flight request
+    /// held, and the engine returns to a clean between-requests state (no
+    /// active request, KV reset, latches cleared).
+    #[test]
+    fn sparse_head_reattach_swaps_in_place_and_resets() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (t, _, far_down) = injected_transport(0, 2);
+        let mut eng = sparse_engine(&rt, t, 0, 2);
+        let down = Arc::clone(eng.transport.downstream.as_ref().unwrap());
+        eng.active = Some(sparse_active(Arc::clone(&down)));
+        eng.runner.push_dirty_kv_layer_for_test(5);
+        eng.peer_disconnected = true;
+        drop(far_down);
+
+        let (near2, far2) = duplex();
+        eng.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            None,
+            Some(Box::new(near2)),
+        ))
+        .expect("head downstream reattach");
+
+        assert!(eng.active.is_none(), "the in-flight request is dropped");
+        assert_eq!(eng.runner.kv_past_seq_lens(), vec![0], "KV reset");
+        assert!(!eng.peer_disconnected);
+        assert!(Arc::ptr_eq(
+            &down,
+            eng.transport.downstream.as_ref().unwrap()
+        ));
+        assert_client_reaches(&rt, &down, far2);
+    }
+
+    /// Relay: keeping the upstream is rejected (the relay rule) without
+    /// touching anything; replacing both links swaps both in place and resets.
+    #[test]
+    fn sparse_relay_reattach_enforces_the_relay_rule() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (t, _far_up, _far_down) = injected_transport(1, 3);
+        let mut eng = sparse_engine(&rt, t, 1, 3);
+        let up = Arc::clone(eng.transport.upstream.as_ref().unwrap());
+        let down = Arc::clone(eng.transport.downstream.as_ref().unwrap());
+        eng.runner.push_dirty_kv_layer_for_test(5);
+        eng.peer_disconnected = true;
+
+        for links in [
+            cascadia_engine::StreamLinks::default(),
+            cascadia_engine::StreamLinks::pipeline(None, Some(Box::new(duplex().0))),
+            cascadia_engine::StreamLinks::ep_driver(Box::new(duplex().0)),
+        ] {
+            assert!(matches!(
+                eng.reattach_streams(links),
+                Err(EngineError::PeerRejected(_))
+            ));
+        }
+        assert!(eng.peer_disconnected, "a rejected reattach touches nothing");
+        assert_eq!(eng.runner.kv_past_seq_lens(), vec![5]);
+
+        let ((up2, far_up2), (down2, far_down2)) = (duplex(), duplex());
+        eng.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            Some(Box::new(up2)),
+            Some(Box::new(down2)),
+        ))
+        .expect("relay replaces both links");
+        assert!(!eng.peer_disconnected);
+        assert_eq!(eng.runner.kv_past_seq_lens(), vec![0]);
+        assert!(Arc::ptr_eq(&up, eng.transport.upstream.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(
+            &down,
+            eng.transport.downstream.as_ref().unwrap()
+        ));
+        assert_server_reaches(&rt, &up, far_up2);
+        assert_client_reaches(&rt, &down, far_down2);
+        // Back on a live link: a step blocks on the next frame instead of
+        // failing, so drive one Reset through it.
+        assert_steps_resume_after_reattach(&rt, &mut eng);
+    }
+
+    /// After a successful re-attach the latched worker serves frames again:
+    /// a Reset on the fresh upstream is consumed and relayed downstream.
+    fn assert_steps_resume_after_reattach(rt: &tokio::runtime::Runtime, eng: &mut SparseMoEEngine) {
+        let ((up3, far_up3), (down3, far_down3)) = (duplex(), duplex());
+        eng.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            Some(Box::new(up3)),
+            Some(Box::new(down3)),
+        ))
+        .expect("second reattach");
+        rt.block_on(async {
+            let mut head = ActivationClient::from_stream(Box::new(far_up3));
+            head.send_raw(&(FrameKind::Reset as u32).to_be_bytes())
+                .await
+                .unwrap();
+        });
+        assert!(eng.step().is_ok(), "a live link serves the frame");
+        rt.block_on(async {
+            let mut tail = ActivationServer::from_stream(Box::new(far_down3));
+            let kb = tail.recv_raw(4).await.unwrap();
+            assert_eq!(
+                u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]),
+                FrameKind::Reset as u32
+            );
+        });
+    }
+
+    #[test]
+    fn ov_moe_head_reattach_swaps_in_place_and_resets() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (t, _, far_down) = injected_transport(0, 2);
+        let mut eng = OvMoeEngine::new(
+            OvMoeRunner::weightless_for_test(2, 5),
+            None,
+            t,
+            rt.handle().clone(),
+            0,
+            2,
+            crate::ov_kv_cache::OvMoeKvPrefixCache::new(0),
+        );
+        let down = Arc::clone(eng.transport.downstream.as_ref().unwrap());
+        eng.active_ov = Some(ov_active(Arc::clone(&down)));
+        eng.peer_disconnected = true;
+        drop(far_down);
+
+        let (near2, far2) = duplex();
+        eng.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            None,
+            Some(Box::new(near2)),
+        ))
+        .expect("head downstream reattach");
+
+        assert!(eng.active_ov.is_none(), "the in-flight request is dropped");
+        assert_eq!(eng.runner.kv_past_seq_len(), 0, "KV reset");
+        assert!(!eng.peer_disconnected);
+        assert!(Arc::ptr_eq(
+            &down,
+            eng.transport.downstream.as_ref().unwrap()
+        ));
+        assert_client_reaches(&rt, &down, far2);
+    }
+
+    #[test]
+    fn ov_moe_relay_reattach_enforces_the_relay_rule() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (t, _far_up, _far_down) = injected_transport(1, 3);
+        let mut eng = OvMoeEngine::new(
+            OvMoeRunner::weightless_for_test(2, 5),
+            None,
+            t,
+            rt.handle().clone(),
+            1,
+            3,
+            crate::ov_kv_cache::OvMoeKvPrefixCache::new(0),
+        );
+        let up = Arc::clone(eng.transport.upstream.as_ref().unwrap());
+        let down = Arc::clone(eng.transport.downstream.as_ref().unwrap());
+        eng.peer_disconnected = true;
+
+        for links in [
+            cascadia_engine::StreamLinks::default(),
+            cascadia_engine::StreamLinks::pipeline(None, Some(Box::new(duplex().0))),
+            cascadia_engine::StreamLinks::ep_workers(vec![Some(Box::new(duplex().0))]),
+        ] {
+            assert!(matches!(
+                eng.reattach_streams(links),
+                Err(EngineError::PeerRejected(_))
+            ));
+        }
+        assert!(eng.peer_disconnected, "a rejected reattach touches nothing");
+        assert_eq!(eng.runner.kv_past_seq_len(), 5);
+
+        let ((up2, far_up2), (down2, far_down2)) = (duplex(), duplex());
+        eng.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            Some(Box::new(up2)),
+            Some(Box::new(down2)),
+        ))
+        .expect("relay replaces both links");
+        assert!(!eng.peer_disconnected);
+        assert_eq!(eng.runner.kv_past_seq_len(), 0);
+        assert!(Arc::ptr_eq(&up, eng.transport.upstream.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(
+            &down,
+            eng.transport.downstream.as_ref().unwrap()
+        ));
+        assert_server_reaches(&rt, &up, far_up2);
+        assert_client_reaches(&rt, &down, far_down2);
+    }
+
+    /// The PipelineEngine prefix-cache latch: `prefix_index` lives on the head
+    /// and is cleared only by the head's own re-attach. A middle stage cannot
+    /// re-attach its downstream alone — the relay rule forces it to replace
+    /// its upstream too, whose far end is the next stage up, and so on until
+    /// the head re-attaches and clears its index.
+    #[test]
+    fn pipeline_relay_reattach_without_its_upstream_is_rejected() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (t, _far_up, _far_down) = injected_transport(1, 3);
+        let mut eng = pipeline_engine(&rt, t, 1, 3);
+        eng.peer_disconnected = true;
+        let r = eng.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            None,
+            Some(Box::new(duplex().0)),
+        ));
+        assert!(
+            matches!(&r, Err(EngineError::PeerRejected(m)) if m.contains("upstream")),
+            "a middle stage keeping its upstream must be rejected, got {r:?}"
+        );
+        assert!(eng.peer_disconnected, "a rejected reattach touches nothing");
+        eng.reattach_streams(cascadia_engine::StreamLinks::pipeline(
+            Some(Box::new(duplex().0)),
+            Some(Box::new(duplex().0)),
+        ))
+        .expect("replacing both links is accepted");
+        assert!(!eng.peer_disconnected);
+    }
+
+    /// A TCP worker whose upstream socket the transport dropped (a frame idle
+    /// ceiling, a reset, a mid-frame stall) is stuck for good: its server
+    /// accepted that socket in `Builder::connect` and nothing accepts again,
+    /// and the head never re-dials. A started-but-unaccepted server is that
+    /// exact state (listener bound, no client), so every recv is
+    /// `NotConnected`. The worker must latch it and return connection-fatal so
+    /// the TCP relay exits for a supervisor restart, instead of logging every
+    /// `WORKER_BACKOFF` forever.
+    #[test]
+    fn tcp_workers_latch_a_dropped_upstream_socket() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let upstream = || {
+            let mut srv = ActivationServer::new("127.0.0.1", 0);
+            rt.block_on(srv.start()).expect("bind");
+            StageTransport {
+                upstream: Some(Arc::new(TokioMutex::new(srv))),
+                downstream: None,
+            }
+        };
+        let mut sparse = sparse_engine(&rt, upstream(), 1, 2);
+        assert_steps_fail_fast_and_fatal(|| sparse.step());
+        let mut ov = ov_engine(&rt, upstream(), 1, 2);
+        assert_steps_fail_fast_and_fatal(|| ov.step());
+        let mut pipe = pipeline_engine(&rt, upstream(), 1, 2);
+        assert_steps_fail_fast_and_fatal(|| pipe.step());
+    }
+
+    /// A slice the plane parked for the dead session must not survive a
+    /// re-attach: it has no epoch the fresh session will ask for, and applying
+    /// it would warm the new session with the old one's KV. Both engines that
+    /// hold a mailbox discard it (`PipelineEngine` has none).
+    #[cfg(feature = "kv_coord")]
+    #[test]
+    fn reattach_discards_a_parked_kv_slice() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let park = |mailbox: &cascadia_engine::kv_handoff::KvHandoffMailbox| {
+            let snap = crate::ov_kv_cache::OvMoeKvSnapshot {
+                past_seq_len: 0,
+                layers: Vec::new(),
+            };
+            let (m, pl) =
+                crate::ov_kv_coordination::ov_snapshot_to_wire(&[1, 2], &snap, "peer", 7, 0xE0);
+            mailbox.put(0xE0, m, pl);
+        };
+        let both = || {
+            cascadia_engine::StreamLinks::pipeline(
+                Some(Box::new(duplex().0)),
+                Some(Box::new(duplex().0)),
+            )
+        };
+
+        let (t, _far_up, _far_down) = injected_transport(1, 3);
+        let mut sparse = sparse_engine(&rt, t, 1, 3);
+        park(&sparse.kv_handoff_mailbox);
+        // A rejected re-attach touches nothing, the parked slice included.
+        assert!(sparse
+            .reattach_streams(cascadia_engine::StreamLinks::pipeline(
+                None,
+                Some(Box::new(duplex().0))
+            ))
+            .is_err());
+        assert!(sparse.kv_handoff_mailbox.discard_any(), "kept on reject");
+        park(&sparse.kv_handoff_mailbox);
+        sparse.reattach_streams(both()).expect("sparse reattach");
+        assert!(
+            !sparse.kv_handoff_mailbox.discard_any(),
+            "SparseMoE re-attach must discard the parked slice"
+        );
+
+        let (t, _far_up, _far_down) = injected_transport(1, 3);
+        let mut ov = ov_engine(&rt, t, 1, 3);
+        park(&ov.kv_handoff_mailbox);
+        ov.reattach_streams(both()).expect("ov reattach");
+        assert!(
+            !ov.kv_handoff_mailbox.discard_any(),
+            "OvMoe re-attach must discard the parked slice"
+        );
     }
 }

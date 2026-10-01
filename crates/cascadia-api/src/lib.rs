@@ -5948,6 +5948,115 @@ level={{ effort_map[eff] }}";
         );
     }
 
+    /// Engine that refuses every task at `submit()` with `InvalidConfig`, as
+    /// the stateful ov-runtime head does for a cold 1-token prompt.
+    struct RefusingEngine;
+
+    impl cascadia_engine::Engine for RefusingEngine {
+        fn warmup(&mut self) {}
+        fn submit(
+            &mut self,
+            _task: cascadia_types::GenerationTask,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            Err(cascadia_engine::EngineError::InvalidConfig(
+                "1-token prompts are not supported on a stateful multi-stage chain".into(),
+            ))
+        }
+        fn step(
+            &mut self,
+        ) -> Result<Vec<(cascadia_types::TaskId, Chunk)>, cascadia_engine::EngineError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct RefusingBuilder;
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for RefusingBuilder {
+        async fn connect(
+            &mut self,
+            _peers: PeerLayout,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, cascadia_engine::EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> Result<Box<dyn cascadia_engine::Engine>, cascadia_engine::EngineError> {
+            Ok(Box::new(RefusingEngine))
+        }
+    }
+
+    // A client-input refusal at submit() (InvalidConfig) is a 400
+    // `invalid_request` on both completion routes, streaming or not, and
+    // must NOT mark the node degraded: /health stays 200.
+    #[tokio::test]
+    async fn submit_invalid_config_is_400_and_keeps_health_ok() {
+        let runner = Runner::new(Box::new(RefusingBuilder));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("refusing-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let app = make_router(Arc::new(runner), "refusing-model");
+        for stream in [false, true] {
+            let (status, body) = post_chat(
+                app.clone(),
+                serde_json::json!({
+                    "model": "refusing-model",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "stream": stream,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "stream={stream}: {body}");
+            let payload = serde_json::json!({
+                "model": "refusing-model",
+                "prompt": "Hi",
+                "stream": stream,
+            });
+            let status = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status();
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "completions stream={stream}"
+            );
+        }
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            health.status(),
+            StatusCode::OK,
+            "a 400 must not degrade /health"
+        );
+    }
+
     /// Engine that emits a token every step and NEVER finishes. Only
     /// `Runner::close()` can end a generation from it, which is what makes
     /// the teardown test deterministic: the no-progress wedge guard trips

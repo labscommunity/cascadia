@@ -1905,6 +1905,56 @@ mod tests {
         );
     }
 
+    /// Issue #76: a re-attach `discard_any`s the mailbox, but a plane commit from the dead session
+    /// can still land AFTER that. What binds the late slice is the same gate as any other drain:
+    /// the epoch (a content hash of the warm prefix's tokens), the build/model validation, and the
+    /// depth guard. So it is only ever applied on a RESTORE for the very same token prefix, where
+    /// it IS the right KV, and never for another prompt, another model or a shallower slice.
+    #[test]
+    fn a_commit_landing_after_a_reattach_discard_applies_only_to_its_own_prefix() {
+        const DEAD: u64 = 0xF0;
+        const NEXT: u64 = 0xF1;
+        let drain = |mb: &KvHandoffMailbox, fp: u64, position: i64, epoch: u64| {
+            let mut applied = false;
+            let ok = drain_handoff(mb, fp, position, epoch, |_| {
+                applied = true;
+                true
+            });
+            assert_eq!(ok, applied);
+            applied
+        };
+        let late_commit = |mb: &KvHandoffMailbox| {
+            let s = slot_at_depth(4);
+            mb.put(DEAD, s.manifest, s.payloads);
+        };
+        let mailbox = KvHandoffMailbox::new();
+        late_commit(&mailbox);
+        assert!(
+            mailbox.discard_any(),
+            "the re-attach discards the parked slice"
+        );
+
+        // The commit lands after the discard. A RESTORE for a different prefix drops it.
+        late_commit(&mailbox);
+        assert!(!drain(&mailbox, DECISION_FP, 0, NEXT));
+        assert!(
+            !drain(&mailbox, DECISION_FP, 0, DEAD),
+            "dropped, not re-parked"
+        );
+
+        // A foreign model or drifted build is refused even with the matching epoch.
+        late_commit(&mailbox);
+        assert!(!drain(&mailbox, DECISION_FP + 1, 0, DEAD));
+
+        // A rank already past the slice's depth refuses it (no snapping backwards).
+        late_commit(&mailbox);
+        assert!(!drain(&mailbox, DECISION_FP, 5, DEAD));
+
+        // Same prefix, same model, fresh position: the slice is the KV this RESTORE asked for.
+        late_commit(&mailbox);
+        assert!(drain(&mailbox, DECISION_FP, 0, DEAD));
+    }
+
     #[test]
     fn handoff_decision_accepts_a_good_slice() {
         let s = slot_at_depth(4);
