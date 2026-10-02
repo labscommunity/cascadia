@@ -22,17 +22,22 @@ if [ ${#IPS[@]} -gt 0 ]; then
   [ "$(printf '%s\n' "${IPS[@]}" | sort -u | wc -l)" -eq "$TOTAL" ] || { echo "the same address appears twice"; exit 1; }
 fi
 
-# 1. files
+# 0. the operator's fleet.env (edited addresses, sizes) is read from the snapshot, so take it before any copy
+F="$D/fleet.env"; cp -p "$F" "$F.before-update"
+# the template the update ships: fleet.env.template, or the repo's fleet.env when the bundle was packed from the tree
+TPL="$HERE/inkling-deploy/fleet.env.template"; [ -f "$TPL" ] || TPL="$HERE/inkling-deploy/fleet.env"
+[ -f "$TPL" ] || { echo "no fleet.env.template (or fleet.env) in $HERE/inkling-deploy"; exit 1; }
+
+# 1. files — never fleet.env itself: step 2 rewrites it from the template plus the snapshot
 cd "$HERE/inkling-deploy"
-find . -type f ! -name fleet.env.template | sort | while read -r f; do mkdir -p "$D/$(dirname "$f")"; cp -p "$f" "$D/$f"; done
+find . -type f ! -name fleet.env.template ! -name fleet.env | sort | while read -r f; do mkdir -p "$D/$(dirname "$f")"; cp -p "$f" "$D/$f"; done
 chmod +x "$D/install.sh" "$D/serve.py" "$D/bin/linux/cascadia" "$D/fleet/"*.sh "$D/fleet/beacon.py"
 
 # 2. fleet.env: the current template, with this fleet's size and the settings the old file carried
-F="$D/fleet.env"; cp -p "$F" "$F.before-update"
-python3 - "$F" "$HERE/inkling-deploy/fleet.env.template" "$TOTAL" "${IPS[@]}" <<'PY'
+python3 - "$F" "$F.before-update" "$TPL" "$TOTAL" "${IPS[@]}" <<'PY'
 import re, sys
-path, template, total, ips = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4:]
-old = dict(re.findall(r"^([A-Za-z_0-9]+)=(.*)$", open(path).read(), flags=re.M))
+path, snapshot, template, total, ips = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5:]
+old = dict(re.findall(r"^([A-Za-z_0-9]+)=(.*)$", open(snapshot).read(), flags=re.M))
 text = open(template).read()
 keep = ["RELAY_PORT", "STREAMS", "MAX_SEQ", "FLEET", "BEACON_PORT", "FUSED_LAYERS_WINDOWS"]
 values = {k: old[k].strip() for k in keep if k in old}

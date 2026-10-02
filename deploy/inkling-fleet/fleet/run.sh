@@ -9,7 +9,8 @@ if [ -f "$PREFIX/fleet-overrides.env" ]; then set -a; source "$PREFIX/fleet-over
 if [ -n "${OVDIR:-}" ] && [ -f "$OVDIR/setupvars.sh" ]; then set +u; source "$OVDIR/setupvars.sh" > /dev/null; set -u; fi
 args=(worker --rank "$RANK" --total "$TOTAL" --engine sparse-moe --device CPU --model "$PREFIX/model"
       --layer-start "$LAYER_START" --layer-end "$LAYER_END")
-[ "$RANK" -gt 0 ] && args+=(--listen ":$((9100 + RANK))")
+# the port the previous rank dials: fleet.env's RELAY_PORT (written to rank.env by the installer), 9100 before that
+[ "$RANK" -gt 0 ] && args+=(--listen ":$((${RELAY_PORT:-9100} + RANK))")
 [ -n "${NEXT:-}" ] && args+=(--next "$NEXT")
 [ "$RANK" = 0 ] && args+=(--api ":8000")
 # What the dashboard shows for this box. --device stays CPU (the engine's own device: routing and the CPU-side
