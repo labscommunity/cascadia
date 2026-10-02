@@ -5860,7 +5860,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let step_started = Instant::now();
         let groups = self.stream_groups.max(1);
         let Some(down) = self.transport.downstream.clone() else {
-            self.fail_streams_into(out, "rank 0 missing downstream".into());
+            self.fail_streams_into(out, "rank 0 missing downstream".into(), true);
             return false;
         };
         // ---- 1. replies for this group's frames ----
@@ -5874,7 +5874,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             let (bid, toks) = match self.block_on(recv_stream_tokens_reply(&down, deadline)) {
                 Ok(r) => r,
                 Err(e) => {
-                    self.fail_streams_into(out, e);
+                    self.fail_streams_into(out, e, true);
                     return false;
                 }
             };
@@ -5889,13 +5889,13 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     toks.len(),
                     f.slots.len()
                 );
-                self.fail_streams_into(out, msg);
+                self.fail_streams_into(out, msg, false);
                 return false;
             }
             for (&slot, &(wslot, token)) in f.slots.iter().zip(&toks) {
                 if wslot as usize != slot {
                     let msg = format!("stream reply row names slot {wslot}, expected {slot}");
-                    self.fail_streams_into(out, msg);
+                    self.fail_streams_into(out, msg, false);
                     return false;
                 }
                 if let Some(st) = self.streams.iter_mut().find(|s| s.slot == slot) {
@@ -6059,7 +6059,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let h = match outcome {
             Ok(h) => h,
             Err(payload) => {
-                self.fail_streams_into(out, panic_message(payload));
+                self.fail_streams_into(out, panic_message(payload), false);
                 return false;
             }
         };
@@ -6069,7 +6069,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         if let Err(e) = self.block_on(send_stream_decode(
             &down, batch_id, &wire_rows, &h, hs as u32,
         )) {
-            self.fail_streams_into(out, format!("send_stream_decode: {e}"));
+            self.fail_streams_into(out, format!("send_stream_decode: {e}"), true);
             return false;
         }
         if let Some(p) = self.stage_profile.as_mut() {
@@ -6409,7 +6409,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         }
         self.redial_next = Some(now + REDIAL_INTERVAL);
         if !self.streams.is_empty() || self.stream_inflight.iter().any(|q| !q.is_empty()) {
-            self.fail_streams_into(out, "downstream link lost; stream aborted".into());
+            self.fail_streams_into(out, "downstream link lost; stream aborted".into(), true);
         }
         let res = self.block_on(async {
             let mut c = down.lock().await;
@@ -6431,12 +6431,19 @@ impl<R: StagedRunner> PipelineEngine<R> {
         }
     }
 
-    /// Abort every stream (wire or forward failure): error chunks, slots
-    /// freed, in-flight bookkeeping cleared. A wire failure also latches
-    /// `peer_disconnected`; rank 0 then re-dials the downstream rank in place
-    /// on a later step (see [`Self::redial_downstream`]).
-    fn fail_streams_into(&mut self, out: &mut Vec<(TaskId, Chunk)>, msg: String) {
-        if !msg.starts_with("forward panicked") && !msg.contains("stream reply") {
+    /// Abort every stream (wire or local failure): error chunks, slots
+    /// freed, in-flight bookkeeping cleared. `wire` says the downstream link
+    /// itself failed (send/receive error, no link, timeout); only then is
+    /// `peer_disconnected` latched so rank 0 re-dials the downstream rank in
+    /// place on a later step (see [`Self::redial_downstream`]). A local
+    /// failure — a panic inside the forward, a reply that does not match the
+    /// frame — must NOT re-dial: the worker's listener accepts once, so a
+    /// re-dial into a healthy neighbour tears the whole chain down and every
+    /// rank reloads its slice for what was one bad request. (The message text
+    /// used to decide this, and a String panic payload never starts with
+    /// "forward panicked".)
+    fn fail_streams_into(&mut self, out: &mut Vec<(TaskId, Chunk)>, msg: String, wire: bool) {
+        if wire {
             self.peer_disconnected = true;
         }
         warn!(error = %msg, streams = self.streams.len(), "multi-stream pipeline failed; aborting all streams");
