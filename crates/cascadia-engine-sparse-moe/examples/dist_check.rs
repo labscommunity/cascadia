@@ -108,6 +108,11 @@ async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
             FrameKind::ForwardBatch => {
                 println!("[server] FORWARD_BATCH not handled in dist_check — ignoring");
             }
+            FrameKind::ChainReady | FrameKind::ChainReadyAck => {
+                // Readiness handshake of the multi-stream engine (idle check
+                // through every stage); a one-stage dist_check never joins one.
+                println!("[server] chain-readiness frame not handled in dist_check — ignoring");
+            }
             FrameKind::TokenBatch => {
                 println!("[server] unexpected TOKEN_BATCH from upstream — ignoring");
             }
@@ -132,7 +137,9 @@ async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
             | FrameKind::StreamDecode
             | FrameKind::StreamClose
             | FrameKind::StreamTokens
-            | FrameKind::StreamFeed => {
+            | FrameKind::StreamFeed
+            | FrameKind::StreamRewind
+            | FrameKind::StreamOpenBatch => {
                 println!("[server] multi-stream frames not handled in dist_check — ignoring");
             }
         }

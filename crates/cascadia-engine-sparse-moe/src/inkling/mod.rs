@@ -67,6 +67,7 @@ pub fn rmsnorm_f32(x: &mut [f32], w: &[f32], eps: f32) {
 
 pub mod attn;
 pub mod conv;
+mod cpu_overlap;
 pub mod ep;
 pub mod ep_fused;
 pub mod ep_placement;
@@ -78,6 +79,7 @@ pub mod loader;
 pub mod model;
 pub mod moe;
 pub mod ov_attn;
+pub mod ov_dense;
 pub mod ov_expert;
 pub mod ov_head;
 pub mod ov_moe;
@@ -110,3 +112,6 @@ mod tests {
         assert_eq!(&x[2..], &[0.0, 0.0]);
     }
 }
+
+mod capture;
+mod expert_counts;

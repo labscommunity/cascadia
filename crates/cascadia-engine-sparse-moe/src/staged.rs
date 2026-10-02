@@ -52,6 +52,18 @@ pub struct RunnerProfile {
     pub ov_attn_ns: u64,
     pub ov_head_calls: u64,
     pub ov_head_ns: u64,
+    /// Fused MoE layers on the device: calls, time, calls handed back to the
+    /// CPU path, and of those the ones that overflowed half precision.
+    pub ov_moe_calls: u64,
+    pub ov_moe_ns: u64,
+    pub ov_moe_fallbacks: u64,
+    pub ov_moe_nonfinite: u64,
+    /// `CASCADIA_INKLING_OV_PERF=1` only: of the offloaded time, the part
+    /// inside `infer()` and the part the device spent executing.
+    pub ov_attn_infer_ns: u64,
+    pub ov_attn_device_ns: u64,
+    pub ov_moe_infer_ns: u64,
+    pub ov_moe_device_ns: u64,
 }
 
 pub trait StagedRunner: Send + 'static {
@@ -161,6 +173,9 @@ pub trait StagedRunner: Send + 'static {
         false
     }
 
+    /// Optional research capture: the token sampled from this position.
+    fn capture_token(&mut self, _slot: usize, _pos: usize, _token: i64) {}
+
     /// Release a slot.
     fn close_stream(&mut self, _slot: usize) {}
 
@@ -173,6 +188,20 @@ pub trait StagedRunner: Send + 'static {
     /// positions `stream_pos(slot)..+rows`); returns `[rows, hidden]`.
     fn prefill_stream(&mut self, _slot: usize, _hidden: Vec<f32>, _rows: usize) -> Vec<f32> {
         unimplemented!("this runner does not batch streams")
+    }
+
+    /// Prefill several slots' prompts in one pass (`segs[i] = (slot, rows)`,
+    /// rows end to end in `hidden`), sharing whatever the runner can share
+    /// between them. Default: one [`Self::prefill_stream`] per slot.
+    fn prefill_streams(&mut self, segs: &[(usize, usize)], hidden: Vec<f32>) -> Vec<f32> {
+        let h = self.hidden_size();
+        let mut out = Vec::with_capacity(hidden.len());
+        let mut at = 0usize;
+        for &(slot, rows) in segs {
+            out.extend(self.prefill_stream(slot, hidden[at * h..(at + rows) * h].to_vec(), rows));
+            at += rows;
+        }
+        out
     }
 
     /// Decode one token on each of `slots` (`hidden` = `[slots.len(), hidden]`,
@@ -190,6 +219,12 @@ pub trait StagedRunner: Send + 'static {
     /// when the runner keeps none. All fields but the gauges are cumulative.
     fn profile(&self) -> Option<RunnerProfile> {
         None
+    }
+
+    /// Roll `slot` back to `len` positions (a speculated token was wrong).
+    /// `false` when the runner cannot (the caller must not speculate then).
+    fn truncate_stream(&mut self, _slot: usize, _len: usize) -> bool {
+        false
     }
 
     /// Distributed KV-prefix cache hooks (pipeline prefix reuse). Default:

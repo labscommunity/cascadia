@@ -54,6 +54,8 @@ pub struct InklingRunner {
     hidden: usize,
     eps: f32,
     max_seq: usize,
+    /// The context probe ran (once per process).
+    context_bench_done: bool,
     eos: Vec<u32>,
     pos: usize,
     /// Multi-stream slots: `Some(pos)` while a sequence owns the slot, `None`
@@ -66,6 +68,7 @@ pub struct InklingRunner {
     /// Per-layer branch clocks for the stage profile; `None` until
     /// [`StagedRunner::enable_profile`].
     profile: Option<Arc<ProfileClocks>>,
+    capture: Option<super::capture::StateCapture>,
 }
 
 /// Decode / prefill time per branch, summed over this rank's layers.
@@ -154,6 +157,32 @@ impl InklingRunner {
                 }
             }
         }
+        // `CASCADIA_INKLING_PREWARM=1`: fill the resident expert copy while
+        // loading (see `MoeLayer::prewarm_expert_cache`).
+        if remote.is_none() && super::env_flag("CASCADIA_INKLING_PREWARM") {
+            let t0 = std::time::Instant::now();
+            let (mut experts, mut bytes) = (0usize, 0usize);
+            for l in &s.layers {
+                // A layer served by the fused device backend keeps its experts
+                // in device memory; a second, resident CPU copy of it is only
+                // read on a fallback and would not fit next to it.
+                if l.ov_moe().is_some() {
+                    continue;
+                }
+                if let Some(moe) = l.moe() {
+                    let (n, b) = moe.prewarm_expert_cache();
+                    experts += n;
+                    bytes += b;
+                }
+            }
+            tracing::info!(
+                rank,
+                experts,
+                gib = bytes as f64 / (1u64 << 30) as f64,
+                secs = t0.elapsed().as_secs_f64(),
+                "inkling experts pre-warmed"
+            );
+        }
         let cache_bytes: usize = s.layers.iter().map(Layer::cache_bytes).sum();
         tracing::info!(
             rank,
@@ -173,6 +202,7 @@ impl InklingRunner {
             hidden: m.hidden_size,
             eps: m.rms_norm_eps,
             max_seq,
+            context_bench_done: false,
             eos: m.eos_token_ids.clone(),
             pos: 0,
             streams: Vec::new(),
@@ -181,11 +211,162 @@ impl InklingRunner {
             lo,
             hi,
             profile: None,
+            capture: super::capture::StateCapture::from_env(rank, total, m.hidden_size),
         })
     }
 }
 
 impl InklingRunner {
+    /// `CASCADIA_INKLING_CONTEXT_BENCH="8192,65536,262144,1048576"` (once, at
+    /// the first `configure_streams`): what a sequence of N positions costs
+    /// THIS rank, without prefilling one. Slot 0's caches are filled with
+    /// synthetic rows up to N (every byte a real sequence would have written,
+    /// so the pages are resident), one decode row runs at position N a few
+    /// times, then the pages go back. Sizes that do not fit in the memory the
+    /// box has left (need + 3 GiB of margin) are reported and not tried, so
+    /// the probe cannot take the worker down. Integers go out on "stage
+    /// profile" lines, one tag per size: `CX<N> probe stage profile ctx=..
+    /// fits=.. need_mb=.. avail_mb=.. fill_ms=.. decode_ms=.. attn_ms=..
+    /// rest_ms=.. rss_mb=.. rss_after_mb=..`. Nothing here serves a request;
+    /// a slot may be open, this uses slot 0 before any stream exists.
+    pub(crate) fn context_bench(&mut self) {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+        let Ok(spec) = std::env::var("CASCADIA_INKLING_CONTEXT_BENCH") else {
+            return;
+        };
+        if self.context_bench_done || self.streams.is_empty() || self.streams[0].is_some() {
+            return;
+        }
+        self.context_bench_done = true;
+        self.enable_profile(); // the attention / MLP split of each decode
+        let mut sizes: Vec<usize> = spec
+            .split(',')
+            .filter_map(|t| t.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 16)
+            .collect();
+        sizes.sort_unstable();
+        sizes.dedup();
+        let max_seq = self.max_seq;
+        let rss_mb = || -> u64 {
+            std::fs::read_to_string("/proc/self/statm")
+                .ok()
+                .and_then(|s| {
+                    s.split_whitespace()
+                        .nth(1)
+                        .and_then(|v| v.parse::<u64>().ok())
+                })
+                .map_or(0, |pages| pages * 4096 / (1 << 20))
+        };
+        let avail_mb = || -> u64 {
+            std::fs::read_to_string("/proc/meminfo")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("MemAvailable:"))
+                        .and_then(|l| {
+                            l.split_whitespace()
+                                .nth(1)
+                                .and_then(|v| v.parse::<u64>().ok())
+                        })
+                })
+                .map_or(0, |kb| kb / 1024)
+        };
+        let say = |line: String| {
+            for _ in 0..3 {
+                println!("{line}");
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        };
+        for n in sizes {
+            if n > max_seq {
+                say(format!(
+                    "CX{n} probe stage profile ctx={n} fits=0 max_seq={max_seq} avail_mb={}",
+                    avail_mb()
+                ));
+                continue;
+            }
+            let need: usize = self.layers.iter().map(|l| l.probe_cache_bytes(n)).sum();
+            let need_mb = (need >> 20) as u64;
+            let avail = avail_mb();
+            if avail < need_mb + 3072 {
+                say(format!("CX{n} probe stage profile ctx={n} fits=0 need_mb={need_mb} avail_mb={avail} rss_mb={}", rss_mb()));
+                continue; // a larger size will not fit either, but say so for each
+            }
+            let hidden = self.hidden;
+            let rss0 = rss_mb();
+            let t0 = Instant::now();
+            // a context of n tokens: n - 1 cached positions, the new row at n - 1
+            let mut written = 0usize;
+            for l in &mut self.layers {
+                l.select_slot(0);
+                l.reset();
+                written += l.probe_fill(n - 1);
+            }
+            let fill_ms = t0.elapsed().as_millis() as u64;
+            self.streams[0] = Some(n - 1);
+            let x: Vec<f32> = (0..hidden)
+                .map(|i| ((i as f32 * 0.37).sin() + (i as f32 * 0.011).cos()) * 0.05)
+                .collect();
+            let clocks = |me: &Self| -> (u64, u64) {
+                me.profile.as_ref().map_or((0, 0), |c| {
+                    (
+                        c.decode_attn_ns.load(Ordering::Relaxed),
+                        c.decode_mlp_ns.load(Ordering::Relaxed),
+                    )
+                })
+            };
+            let (a0, m0) = clocks(self);
+            let mut us: Vec<u128> = Vec::new();
+            let started = Instant::now();
+            for call in 0..5 {
+                // the same position every time (a decode advances the caches by one)
+                self.streams[0] = Some(n - 1);
+                for l in &mut self.layers {
+                    l.select_slot(0);
+                    l.probe_rewind(n - 1);
+                }
+                let t = Instant::now();
+                let _ = self.decode_streams(x.clone(), &[0]);
+                if call > 0 {
+                    us.push(t.elapsed().as_micros());
+                }
+                if started.elapsed().as_secs() > 40 && call > 0 {
+                    break;
+                }
+            }
+            us.sort_unstable();
+            let decode_ms = us.get(us.len() / 2).map_or(0, |v| (v / 1000) as u64);
+            let calls = (us.len() as u64).max(1);
+            let (a1, m1) = clocks(self);
+            let attn_ms = a1.saturating_sub(a0) / 1_000_000 / (calls + 1);
+            let mlp_ms = m1.saturating_sub(m0) / 1_000_000 / (calls + 1);
+            let rss1 = rss_mb();
+            self.streams[0] = None;
+            for l in &mut self.layers {
+                l.select_slot(0);
+                l.probe_release();
+            }
+            let rss2 = rss_mb();
+            tracing::info!(
+                target: "cascadia::inkling",
+                event = "context_bench",
+                ctx = n,
+                written_mb = (written >> 20) as u64,
+                fill_ms,
+                decode_ms,
+                attn_ms,
+                mlp_ms,
+                rss_before_mb = rss0,
+                rss_during_mb = rss1,
+                rss_after_mb = rss2,
+            );
+            say(format!(
+                "CX{n} probe stage profile ctx={n} fits=1 need_mb={need_mb} avail_mb={avail} fill_ms={fill_ms} decode_ms={decode_ms} attn_ms={attn_ms} mlp_ms={mlp_ms} calls={calls} rss_mb={rss1} rss_after_mb={rss2}"
+            ));
+        }
+    }
+
     /// Expert-cache counters summed over this rank's MoE layers.
     pub fn expert_cache_stats_total(&self) -> super::ExpertCacheStats {
         let mut total = super::ExpertCacheStats::default();
@@ -304,6 +485,11 @@ impl StagedRunner for InklingRunner {
             .find_map(|l| l.ov_attn())
             .map(|o| o.stats());
         let head = self.head.as_ref().and_then(|h| h.ov()).map(|o| o.stats());
+        let moe = self
+            .layers
+            .iter()
+            .find_map(|l| l.ov_moe())
+            .map(|o| o.stats());
         Some(crate::staged::RunnerProfile {
             decode_attn_ns: c.decode_attn_ns.load(Ordering::Relaxed),
             decode_mlp_ns: c.decode_mlp_ns.load(Ordering::Relaxed),
@@ -317,6 +503,14 @@ impl StagedRunner for InklingRunner {
             ov_attn_ns: attn.map_or(0, |a| a.call_ns),
             ov_head_calls: head.map_or(0, |h| h.calls),
             ov_head_ns: head.map_or(0, |h| h.call_ns),
+            ov_moe_calls: moe.map_or(0, |m| m.calls),
+            ov_moe_ns: moe.map_or(0, |m| m.call_ns),
+            ov_moe_fallbacks: moe.map_or(0, |m| m.fallbacks),
+            ov_moe_nonfinite: moe.map_or(0, |m| m.nonfinite),
+            ov_attn_infer_ns: attn.map_or(0, |a| a.infer_ns),
+            ov_attn_device_ns: attn.map_or(0, |a| a.device_ns),
+            ov_moe_infer_ns: moe.map_or(0, |m| m.infer_ns),
+            ov_moe_device_ns: moe.map_or(0, |m| m.device_ns),
         })
     }
     fn stream_capacity(&self) -> usize {
@@ -332,6 +526,7 @@ impl StagedRunner for InklingRunner {
         if self.streams.len() < n {
             self.streams.resize(n, None);
         }
+        self.context_bench();
         let per_slot: usize = self.layers.iter().map(Layer::slot_bytes).sum();
         tracing::info!(
             rank = self.rank,
@@ -349,6 +544,9 @@ impl StagedRunner for InklingRunner {
             l.reset();
         }
         self.streams[slot] = Some(0);
+        if let Some(c) = self.capture.as_mut() {
+            c.open(slot);
+        }
         Some(slot)
     }
     fn open_stream_at(&mut self, slot: usize) -> bool {
@@ -360,15 +558,43 @@ impl StagedRunner for InklingRunner {
             l.reset();
         }
         self.streams[slot] = Some(0);
+        if let Some(c) = self.capture.as_mut() {
+            c.open(slot);
+        }
         true
     }
+    fn capture_token(&mut self, slot: usize, pos: usize, token: i64) {
+        if let Some(c) = self.capture.as_mut() {
+            c.token(slot, pos, token);
+        }
+    }
     fn close_stream(&mut self, slot: usize) {
+        if let Some(c) = self.capture.as_mut() {
+            c.close(slot);
+        }
         if let Some(s) = self.streams.get_mut(slot) {
             *s = None;
         }
     }
     fn stream_pos(&self, slot: usize) -> usize {
         self.streams.get(slot).copied().flatten().unwrap_or(0)
+    }
+    fn truncate_stream(&mut self, slot: usize, len: usize) -> bool {
+        let Some(Some(pos)) = self.streams.get(slot).copied() else {
+            return false;
+        };
+        if len > pos {
+            return false;
+        }
+        for l in &mut self.layers {
+            l.select_slot(slot);
+            l.truncate(len);
+        }
+        self.streams[slot] = Some(len);
+        if let Some(c) = self.capture.as_mut() {
+            c.truncate(slot, len);
+        }
+        true
     }
     fn prefill_stream(&mut self, slot: usize, hidden: Vec<f32>, rows: usize) -> Vec<f32> {
         let pos = self.streams[slot].expect("prefill_stream on a free slot");
@@ -382,7 +608,47 @@ impl StagedRunner for InklingRunner {
             l.select_slot(slot);
             x = l.forward_prefill(&x, rows);
         }
+        if let Some(c) = self.capture.as_mut() {
+            c.rows(slot, pos, &x);
+        }
         self.streams[slot] = Some(pos + rows);
+        x
+    }
+    fn prefill_streams(&mut self, segs: &[(usize, usize)], hidden: Vec<f32>) -> Vec<f32> {
+        let rows: usize = segs.iter().map(|&(_, r)| r).sum();
+        assert_eq!(
+            hidden.len(),
+            rows * self.hidden,
+            "inkling prefill_streams: bad hidden length"
+        );
+        for (i, &(s, _)) in segs.iter().enumerate() {
+            assert!(
+                self.streams[s].is_some(),
+                "prefill_streams: slot {s} is free"
+            );
+            assert!(
+                !segs[..i].iter().any(|&(o, _)| o == s),
+                "prefill_streams: slot {s} listed twice"
+            );
+        }
+        let mut x = hidden;
+        for l in &mut self.layers {
+            x = l.forward_prefill_slots(&x, segs);
+        }
+        let mut offset = 0;
+        for &(s, r) in segs {
+            if let Some(c) = self.capture.as_mut() {
+                c.rows(
+                    s,
+                    self.streams[s].unwrap(),
+                    &x[offset * self.hidden..(offset + r) * self.hidden],
+                );
+            }
+            offset += r;
+            if let Some(p) = self.streams[s].as_mut() {
+                *p += r;
+            }
+        }
         x
     }
     fn decode_streams(&mut self, hidden: Vec<f32>, slots: &[usize]) -> Vec<f32> {
@@ -406,7 +672,14 @@ impl StagedRunner for InklingRunner {
         for l in &mut self.layers {
             x = l.forward_rows(&x, rows, slots);
         }
-        for &s in slots {
+        for (i, &s) in slots.iter().enumerate() {
+            if let Some(c) = self.capture.as_mut() {
+                c.rows(
+                    s,
+                    self.streams[s].unwrap(),
+                    &x[i * self.hidden..(i + 1) * self.hidden],
+                );
+            }
             if let Some(p) = self.streams[s].as_mut() {
                 *p += 1;
             }

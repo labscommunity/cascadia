@@ -47,6 +47,10 @@ use crate::dist::{
     send_capture_ack_upstream, send_restore, send_restore_ack_upstream, send_restore_carry,
     CAPTURE_ACK_TIMEOUT,
 };
+use crate::dist::{
+    recv_stream_open_batch_body_server, recv_stream_rewind_body_server, send_stream_open_batch,
+    send_stream_rewind,
+};
 use crate::kv_prefix_cache::KvPrefixCache;
 use crate::manifest::Manifest;
 use crate::ov_moe::OvMoeRunner;
@@ -3519,7 +3523,11 @@ impl SparseMoEEngine {
             | FrameKind::StreamDecode
             | FrameKind::StreamClose
             | FrameKind::StreamTokens
-            | FrameKind::StreamFeed => Err(format!(
+            | FrameKind::StreamFeed
+            | FrameKind::StreamRewind
+            | FrameKind::StreamOpenBatch
+            | FrameKind::ChainReady
+            | FrameKind::ChainReadyAck => Err(format!(
                 "sparse-moe stage received multi-stream frame {kind:?} (only the staged pipeline engine serves streams)"
             )),
             #[cfg(feature = "kv_coord")]
@@ -5329,6 +5337,9 @@ pub struct PipelineEngine<R: StagedRunner> {
     seen_link_epoch: u64,
     /// Dropping this (with the engine) ends the link keeper task.
     link_keeper: Option<Arc<()>>,
+    /// Opt-in admission barrier, opened by a handshake through ALL ranks.
+    /// The idle link keeper progresses it even while requests are refused.
+    chain_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
     disconnect_reported: bool,
     last_rank_history: Vec<i64>,
     last_rank_rng: u64,
@@ -5352,6 +5363,17 @@ pub struct PipelineEngine<R: StagedRunner> {
     stream_cap: usize,
     /// Last rank of a multi-stream pipeline: one sampler per open slot.
     stream_samplers: HashMap<usize, StreamSampler>,
+    /// Last rank: decode frames whose layers are done and whose output-head
+    /// call is owed (`CASCADIA_STREAMS_HEAD_BATCH` > 1). The head reads its
+    /// whole table once per CALL whatever the row count (1.24 GB of int8:
+    /// 11.6 ms of a 47.5 ms frame at 15 streams, which made the last rank the
+    /// stage everyone waits for), so when the next frame is already waiting
+    /// its layers run first and ONE call serves both frames' rows.
+    pending_heads: Vec<PendingHead>,
+    head_batch: usize,
+    head_batch_min_streams: usize,
+    /// (head calls, frames they served) since start.
+    head_batch_stats: (u64, u64),
     /// Rank 0: id of the last stream frame sent (replies must echo it).
     stream_batch_seq: u32,
     /// Rank 0 of a pipeline: streams are split into this many groups, each
@@ -5366,6 +5388,8 @@ pub struct PipelineEngine<R: StagedRunner> {
     stream_inflight: Vec<VecDeque<StreamInFlight>>,
     /// Rank 0: rotation counter (`% stream_groups` = the group this step serves).
     stream_step: u64,
+    /// Rank 0: the group whose turn comes next (a step may end mid-round).
+    stream_cursor: usize,
     /// New streams admitted (prefilled) per `step`, so a burst of prompts
     /// cannot stall the streams already decoding for many prefills at once.
     stream_admit_per_step: usize,
@@ -5374,6 +5398,54 @@ pub struct PipelineEngine<R: StagedRunner> {
     stream_log: (u64, Duration, u64),
     /// Per-window time account of this rank (`CASCADIA_STAGE_PROFILE_SECS`).
     stage_profile: Option<StageProfile>,
+    /// Rank 0: speculated frames allowed in flight behind a lone stream's real
+    /// one (`CASCADIA_STREAMS_SPEC=1`, depth `CASCADIA_STREAMS_SPEC_DEPTH`,
+    /// default ranks - 1). `None` = off.
+    stream_spec_depth: Option<usize>,
+    /// Speculation counters since start: frames guessed, guesses confirmed,
+    /// guesses refuted (each costs a rewind).
+    spec_stats: (u64, u64, u64),
+    /// What finished requests taught the drafter (speculation only).
+    shared_ngrams: Arc<std::sync::Mutex<crate::ngram_draft::SharedNgrams>>,
+    /// Finished requests learned from since start (the table is saved every 16th).
+    spec_learned: std::cell::Cell<u64>,
+    /// A drafter model for the speculation path (`CASCADIA_STREAMS_SPEC_LM`,
+    /// see [`crate::lm_draft`]) with the target's tokenizer to cut its text.
+    spec_lm: Option<(crate::lm_draft::LmConfig, Arc<Tokenizer>)>,
+    /// Guesses by source since start: `(drafter model, n-gram tables)`.
+    spec_sources: (u64, u64),
+    /// Direct reply link (`CASCADIA_STREAMS_RETURN_PORT`): the last rank
+    /// listens, rank 0 dials `CASCADIA_STREAMS_RETURN_HOST`, and token replies
+    /// skip the ranks in between. A mid rank forwards a reply only between
+    /// two of its own frames, so a relayed reply waits at every busy rank on
+    /// its way up: with 11 frames in flight that stretched rank 0's group turn
+    /// to about twice a stage time.
+    return_cli: Option<Arc<TokioMutex<ActivationClient>>>,
+    return_srv: Option<Arc<TokioMutex<ActivationServer>>>,
+    /// Rank 0: prompts admitted through multi-prompt prefill frames since start.
+    batched_admissions: u64,
+    /// Rank 0: the return link is connected to the chain as it is now.
+    return_ready: bool,
+    /// Last rank: rank 0's connection has been accepted.
+    return_accepted: bool,
+}
+
+/// Decode frames (process-wide) whose output head ran in a call shared with
+/// another frame (`CASCADIA_STREAMS_HEAD_BATCH`); tests and the log read it.
+static HEAD_SHARED_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`HEAD_SHARED_FRAMES`].
+pub fn head_shared_frames() -> u64 {
+    HEAD_SHARED_FRAMES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A decode frame on the last rank whose layers are done and whose
+/// output-head call is owed (see `SparseMoEEngine::pending_heads`).
+struct PendingHead {
+    batch_id: u32,
+    slots: Vec<usize>,
+    positions: Vec<usize>,
+    hidden: Vec<f32>,
 }
 
 /// One task inside the multi-stream single-stage scheduler: its slot in the
@@ -5411,6 +5483,29 @@ fn stream_prefill_window_rows() -> usize {
             .filter(|&v| v >= 1)
             .unwrap_or(128)
             .min(crate::dist::MAX_STREAM_ROWS as usize)
+    })
+}
+
+/// Where the cross-request drafter table is kept between restarts
+/// (`CASCADIA_STREAMS_SPEC_TABLE`; unset = memory only).
+fn spec_table_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("CASCADIA_STREAMS_SPEC_TABLE")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// Most prompts one prefill frame carries (`CASCADIA_STREAMS_ADMIT_BATCH`,
+/// default 8, 1 = one frame per prompt).
+fn stream_admit_batch() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CASCADIA_STREAMS_ADMIT_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v >= 1)
+            .unwrap_or(8)
+            .min(crate::dist::MAX_OPEN_BATCH as usize)
     })
 }
 
@@ -5455,6 +5550,14 @@ struct StageProfile {
     open_rows: u64,
     relays: u64,
     replies: u64,
+    spec_sent: u64,
+    spec_hits: u64,
+    spec_misses: u64,
+    /// Of those, guesses that came from the drafter model; and verified
+    /// tokens that had no guess in flight behind them at all.
+    spec_lm_hits: u64,
+    spec_lm_misses: u64,
+    spec_none: u64,
     runner: crate::staged::RunnerProfile,
 }
 
@@ -5489,6 +5592,12 @@ impl StageProfile {
             open_rows: 0,
             relays: 0,
             replies: 0,
+            spec_sent: 0,
+            spec_hits: 0,
+            spec_misses: 0,
+            spec_lm_hits: 0,
+            spec_lm_misses: 0,
+            spec_none: 0,
             runner: crate::staged::RunnerProfile::default(),
         }
     }
@@ -5578,6 +5687,12 @@ impl StageProfile {
             replies = self.replies,
             round_trip_ms = ms(self.round_trip),
             max_round_trip_ms = ms(self.max_round_trip),
+            spec_sent = self.spec_sent,
+            spec_hits = self.spec_hits,
+            spec_misses = self.spec_misses,
+            spec_lm_hits = self.spec_lm_hits,
+            spec_lm_misses = self.spec_lm_misses,
+            spec_none = self.spec_none,
             attn_ms = ns_ms(now.decode_attn_ns, was.decode_attn_ns),
             mlp_ms = ns_ms(now.decode_mlp_ns, was.decode_mlp_ns),
             prefill_attn_ms = ns_ms(now.prefill_attn_ns, was.prefill_attn_ns),
@@ -5585,6 +5700,14 @@ impl StageProfile {
             ov_attn_ms = ns_ms(now.ov_attn_ns, was.ov_attn_ns),
             ov_attn_calls = now.ov_attn_calls.saturating_sub(was.ov_attn_calls),
             ov_head_ms = ns_ms(now.ov_head_ns, was.ov_head_ns),
+            ov_moe_ms = ns_ms(now.ov_moe_ns, was.ov_moe_ns),
+            ov_moe_calls = now.ov_moe_calls.saturating_sub(was.ov_moe_calls),
+            ov_moe_fallbacks = now.ov_moe_fallbacks.saturating_sub(was.ov_moe_fallbacks),
+            ov_moe_nonfinite = now.ov_moe_nonfinite.saturating_sub(was.ov_moe_nonfinite),
+            ov_attn_infer_ms = ns_ms(now.ov_attn_infer_ns, was.ov_attn_infer_ns),
+            ov_attn_device_ms = ns_ms(now.ov_attn_device_ns, was.ov_attn_device_ns),
+            ov_moe_infer_ms = ns_ms(now.ov_moe_infer_ns, was.ov_moe_infer_ns),
+            ov_moe_device_ms = ns_ms(now.ov_moe_device_ns, was.ov_moe_device_ns),
             cache_hits = now.cache_hits.saturating_sub(was.cache_hits),
             cache_misses = now.cache_misses.saturating_sub(was.cache_misses),
             cache_mib = now.cache_retained_mib,
@@ -5630,6 +5753,29 @@ struct StreamActive {
     emitted: usize,
     /// Pipeline, long prompts: the prompt tokens not sent yet (`Feeding`).
     feed: VecDeque<u32>,
+    /// Pipelined speculation: this stream's frames in flight, in position
+    /// order (see `PipelineEngine::step_stream_spec`).
+    spec: VecDeque<SpecSent>,
+    /// N-gram drafter over prompt + generated + speculated tokens.
+    draft: Option<crate::ngram_draft::Draft>,
+    /// `next` has been emitted already (speculation hands the stream back
+    /// with its last token emitted but not forwarded).
+    next_emitted: bool,
+}
+
+/// One decode frame of a speculating stream: `input` rode at position `pos`.
+/// `valid` turns false when an earlier guess proved wrong; its reply is then
+/// read and dropped.
+struct SpecSent {
+    batch_id: u32,
+    pos: usize,
+    input: i64,
+    /// The input was a draft (in the drafter's history, not in `generated`).
+    guess: bool,
+    /// The draft came from the drafter model (not from the n-gram tables).
+    from_model: bool,
+    valid: bool,
+    sent_at: Instant,
 }
 
 /// Rank-0 per-token streaming state: everything the decode loop threaded as
@@ -5686,6 +5832,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             link_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             seen_link_epoch: 0,
             link_keeper: None,
+            chain_ready: None,
             disconnect_reported: false,
             last_rank_history: Vec::new(),
             last_rank_rng: 0,
@@ -5707,9 +5854,34 @@ impl<R: StagedRunner> PipelineEngine<R> {
             stream_groups: 1,
             stream_inflight: Vec::new(),
             stream_step: 0,
+            stream_cursor: 0,
             stream_admit_per_step: 1,
             stream_log: (0, Duration::ZERO, 0),
             stage_profile: None,
+            stream_spec_depth: None,
+            spec_stats: (0, 0, 0),
+            shared_ngrams: Arc::new(std::sync::Mutex::new(
+                crate::ngram_draft::SharedNgrams::default(),
+            )),
+            spec_learned: std::cell::Cell::new(0),
+            spec_lm: None,
+            spec_sources: (0, 0),
+            pending_heads: Vec::new(),
+            head_batch: std::env::var("CASCADIA_STREAMS_HEAD_BATCH")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(1)
+                .clamp(1, 8),
+            head_batch_min_streams: std::env::var("CASCADIA_STREAMS_HEAD_BATCH_MIN_STREAMS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(4),
+            head_batch_stats: (0, 0),
+            batched_admissions: 0,
+            return_cli: None,
+            return_srv: None,
+            return_ready: false,
+            return_accepted: false,
         }
     }
 
@@ -5740,6 +5912,40 @@ impl<R: StagedRunner> PipelineEngine<R> {
             .min(self.stream_cap)
             .max(1);
         self.stream_inflight = (0..self.stream_groups).map(|_| VecDeque::new()).collect();
+        self.stream_spec_depth = (self.rank == 0
+            && self.total > 1
+            && std::env::var("CASCADIA_STREAMS_SPEC").is_ok_and(|v| v.trim() == "1"))
+        .then(|| {
+            std::env::var("CASCADIA_STREAMS_SPEC_DEPTH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&v| v >= 1)
+                .unwrap_or(self.total.max(2) as usize - 1)
+                .min(crate::inkling::DEFAULT_REWIND - 1)
+        });
+        self.setup_return_link();
+        if self.stream_spec_depth.is_some() {
+            if let Some(path) = spec_table_path() {
+                match crate::ngram_draft::SharedNgrams::load(&path) {
+                    Ok(t) => {
+                        info!(contexts = t.contexts(), path = %path.display(), "drafter table loaded");
+                        if let Ok(mut shared) = self.shared_ngrams.lock() {
+                            *shared = t;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => warn!(path = %path.display(), "drafter table not loaded: {e}"),
+                }
+            }
+            if let (Some(cfg), Some(tok)) = (
+                crate::lm_draft::LmConfig::from_env(),
+                self.tokenizer.as_ref(),
+            ) {
+                info!(addr = %cfg.addr, template = ?cfg.template, n_predict = cfg.n_predict,
+                      "speculation asks a drafter model first");
+                self.spec_lm = Some((cfg, Arc::new(tok.clone())));
+            }
+        }
         self.stage_profile = StageProfile::from_env();
         if self.stage_profile.is_some() {
             self.runner.enable_profile();
@@ -5753,6 +5959,12 @@ impl<R: StagedRunner> PipelineEngine<R> {
             "multi-stream decode enabled ({})",
             self.runner.arch_name()
         );
+        if self.rank == 0
+            && self.total > 1
+            && std::env::var("CASCADIA_STREAMS_READY_GATE").as_deref() == Ok("1")
+        {
+            self.chain_ready = Some(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        }
         self.spawn_link_keeper();
         self.stream_cap
     }
@@ -5781,6 +5993,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
         self.link_keeper = Some(token);
         let busy = self.link_busy.clone();
         let epoch = self.link_epoch.clone();
+        let ready = self.chain_ready.clone();
+        let total = self.total;
         self.runtime_handle.spawn(async move {
             use std::sync::atomic::Ordering::SeqCst;
             let mut tick = tokio::time::interval(IDLE_LINK_CHECK);
@@ -5802,21 +6016,42 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 let dead = tokio::time::timeout(Duration::from_millis(1), client.wait_readable())
                     .await
                     .is_ok();
-                if !dead {
+                if !dead && ready.as_ref().is_none_or(|r| r.load(SeqCst)) {
                     continue;
                 }
-                if down_since.is_none() {
+                if let Some(ready) = ready.as_ref() {
+                    ready.store(false, SeqCst);
+                }
+                if dead && down_since.is_none() {
                     warn!("downstream link is dead while idle; re-dialing until the next rank is back");
                     down_since = Some(Instant::now());
                 }
-                client.close().await;
-                if let Ok(Ok(())) = tokio::time::timeout(REDIAL_BUDGET, client.try_connect()).await {
+                if dead {
+                    client.close().await;
+                    if !matches!(tokio::time::timeout(REDIAL_BUDGET, client.try_connect()).await, Ok(Ok(()))) {
+                        continue;
+                    }
                     epoch.fetch_add(1, SeqCst);
                     info!(
                         down_s = down_since.map(|t| t.elapsed().as_secs()).unwrap_or(0),
                         "downstream link re-dialed while idle"
                     );
                     down_since = None;
+                }
+                if let Some(ready) = ready.as_ref() {
+                    // Loading eleven stages can take minutes. Keep one probe
+                    // outstanding while submit returns 503; repeatedly tearing
+                    // down the socket here would restart the loading chain.
+                    let probe = tokio::time::timeout(Duration::from_secs(900),
+                        crate::dist::probe_chain(&mut client, total)).await;
+                    if matches!(probe, Ok(Ok(()))) {
+                        ready.store(true, SeqCst);
+                        info!(total, "pipeline chain ready; accepting requests");
+                    } else {
+                        // A cancelled/failed read has unknown framing state.
+                        client.close().await;
+                        warn!("pipeline readiness probe failed; requests remain refused");
+                    }
                 }
             }
         });
@@ -5838,16 +6073,28 @@ impl<R: StagedRunner> PipelineEngine<R> {
     /// decode micro-batch for the survivors. With G groups and G frames in
     /// flight, each downstream rank is busy on a different group's rows.
     fn step_streams_pipeline(&mut self) -> Vec<(TaskId, Chunk)> {
-        // One `step` = one round over every group, so each active stream
-        // emits exactly one token per step (the runner's no-progress guard
-        // closes a task that sees three chunk-less steps). Between rounds
-        // every group's frame is in flight at once, which is the overlap.
+        // Groups are served in turn, one frame each in flight, so every rank
+        // works on a different group's rows at once.
         let mut out: Vec<(TaskId, Chunk)> = Vec::new();
+        if self.spec_applies() {
+            self.step_stream_spec(&mut out);
+            self.flush_stage_profile();
+            return out;
+        }
+        // A step ends with the first group turn that produced something (at
+        // most one round when none does: the runner closes a task after three
+        // steps without a chunk for anybody). It used to be a whole round, and
+        // the runner holds the engine lock for a step: with 48 requests
+        // arriving together their submits waited for that lock and reached
+        // `pending` a few per round, seconds apart, so admission crawled
+        // (first token after 80-90 s on average) however cheap prefill became.
         let groups = self.stream_groups.max(1);
-        for g in 0..groups {
+        for _ in 0..groups {
+            let g = self.stream_cursor % groups;
+            self.stream_cursor = (g + 1) % groups;
             self.stream_step += 1;
             let done = self.step_stream_group(g, &mut out);
-            if !done {
+            if !done || !out.is_empty() {
                 break;
             }
         }
@@ -5864,16 +6111,46 @@ impl<R: StagedRunner> PipelineEngine<R> {
             return false;
         };
         // ---- 1. replies for this group's frames ----
-        while let Some(f) = self.stream_inflight[g].pop_front() {
+        // Only the frames in flight when the turn starts: an admission made
+        // while waiting (below) queues its frame here too, and its reply is
+        // due at this group's NEXT turn, after every frame sent before it.
+        let owed = self.stream_inflight[g].len();
+        for _ in 0..owed {
+            // Replies come back in the order the frames went out, so nothing
+            // can be read before this one. While it is not here and requests
+            // are waiting, prefill them instead of standing still: a prefill
+            // frame of eight prompts takes about 30 s to cross 11 ranks, and
+            // rank 0 used to spend that time blocked right here with the rest
+            // of a burst still unadmitted (first token after 73 s on average).
+            while !self.pending.is_empty()
+                && self.streams.len() < self.stream_cap
+                && !self.reply_waiting(&down)
+            {
+                if !self.admit_pending(g, &down, out) {
+                    break;
+                }
+            }
+            let Some(f) = self.stream_inflight[g].pop_front() else {
+                break;
+            };
             let deadline = if f.open {
                 Self::reply_deadline_prefill()
             } else {
                 Self::reply_deadline() * groups as u32
             };
             let wait_started = Instant::now();
-            let (bid, toks) = match self.block_on(recv_stream_tokens_reply(&down, deadline)) {
+            let replies = match self.reply_link(&down) {
+                Ok(l) => l,
+                Err(e) => {
+                    self.fail_streams_into(out, e, true);
+                    return false;
+                }
+            };
+            let (bid, toks) = match self.block_on(recv_stream_tokens_reply(&replies, deadline)) {
                 Ok(r) => r,
                 Err(e) => {
+                    self.return_ready = false;
+                    self.peer_disconnected = true;
                     self.fail_streams_into(out, e, true);
                     return false;
                 }
@@ -5919,8 +6196,18 @@ impl<R: StagedRunner> PipelineEngine<R> {
         {
             admitted += 1;
             let feed_started = Instant::now();
+            let feed_id = self.streams[i].id.clone();
             let rows = match self.feed_stream_window(i, g, &down) {
-                Ok(rows) => rows,
+                Ok(rows) => {
+                    // A window went down: real work, no token yet. The
+                    // runner closes a task after three steps that return
+                    // nothing, which a prompt of more than ~22 windows
+                    // used to trip; the API sends nothing for this chunk.
+                    if rows > 0 {
+                        out.push((feed_id.clone(), Chunk::progress(feed_id)));
+                    }
+                    rows
+                }
                 Err((id, chunk)) => {
                     out.push((id, chunk));
                     0
@@ -5935,23 +6222,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
         while admitted < self.stream_admit_per_step
             && self.streams.len() < self.stream_cap
             && !self.pending.is_empty()
-            && self.group_is_emptiest(g)
         {
-            let task = self.pending.pop_front().expect("non-empty");
-            admitted += 1;
-            let admit_started = Instant::now();
-            let prompt_rows = match self.admit_stream_pipeline(task, g, &down) {
-                Ok(rows) => rows,
-                Err((id, chunk)) => {
-                    out.push((id, chunk));
-                    0
-                }
-            };
-            if let Some(p) = self.stage_profile.as_mut() {
-                p.opens += 1;
-                p.open_rows += prompt_rows as u64;
-                p.prefill += admit_started.elapsed();
+            if !self.admit_pending(g, &down, out) {
+                break;
             }
+            admitted += 1;
         }
         // ---- 3. emission for this group's ready streams ----
         let emit_started = Instant::now();
@@ -5971,8 +6246,16 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 finished.push(i);
                 continue;
             }
+            if st.next_emitted {
+                // Speculation emitted this token; it only needs forwarding.
+                st.next_emitted = false;
+                continue;
+            }
             let t = st.next as u32;
             st.generated.push(t);
+            if let Some(d) = st.draft.as_mut() {
+                d.append(st.next);
+            }
             let full = tok.decode(&st.generated, true).unwrap_or_default();
             let delta = utf8_safe_delta(&full, &mut st.emitted);
             let mut c = Chunk::token(st.id.clone(), st.next, delta);
@@ -6009,6 +6292,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         }
         for &i in finished.iter().rev() {
             let st = self.streams.swap_remove(i);
+            self.learn_from(&st);
             self.runner.close_stream(st.slot);
             if let Err(e) = self.block_on(send_stream_close(&down, st.slot as u32)) {
                 warn!(slot = st.slot, "stream close not relayed: {e}");
@@ -6107,23 +6391,246 @@ impl<R: StagedRunner> PipelineEngine<R> {
         true
     }
 
-    /// Whether a new stream may join group `g` now: only the emptiest group
-    /// admits. Every round starts at group 0, and requests reach `pending` a
-    /// few at a time (a submit needs the engine lock, which a round holds for
-    /// seconds), so "whichever group's turn it is" filled the first groups
-    /// and starved the rest: 48 streams on an 11-rank fleet sat in 7 groups of
-    /// 15, 10, 8, 6, 4, 4 and 2 rows. Four frames fewer than ranks in flight,
-    /// and the 15-row frame held every rank five times longer than the 2-row
-    /// one behind it. A pending request waits at most one round for the
-    /// emptiest group's turn.
-    fn group_is_emptiest(&self, g: usize) -> bool {
-        let mut rows = vec![0usize; self.stream_groups.max(1)];
+    /// Whether the next reply can be read without waiting.
+    fn reply_waiting(&mut self, down: &Arc<TokioMutex<ActivationClient>>) -> bool {
+        self.reply_within(down, Duration::from_millis(1))
+    }
+
+    /// Whether a token reply becomes readable within `wait`.
+    fn reply_within(&mut self, down: &Arc<TokioMutex<ActivationClient>>, wait: Duration) -> bool {
+        let Ok(replies) = self.reply_link(down) else {
+            return true; // let the blocking read report the failure
+        };
+        self.block_on(async {
+            let c = replies.lock().await;
+            tokio::time::timeout(wait, c.wait_readable()).await.is_ok()
+        })
+    }
+
+    /// Admit from the queue during group `turn`'s turn: several prompts as one
+    /// prefill frame when two or more wait, else one. The frame's reply is
+    /// owed at `turn`'s next turn. `false` when nothing could be admitted.
+    ///
+    /// New streams join the EMPTIEST group, not the group whose turn it is:
+    /// requests used to reach the queue a few at a time and every round
+    /// started at group 0, so the first groups filled and the rest starved
+    /// (48 streams on the 11-rank fleet sat in 7 groups of 15, 10, 8, 6, 4, 4
+    /// and 2 rows: four frames fewer in flight than ranks, and a 15-row frame
+    /// holding every rank five times longer than the 2-row one behind it).
+    fn admit_pending(
+        &mut self,
+        turn: usize,
+        down: &Arc<TokioMutex<ActivationClient>>,
+        out: &mut Vec<(TaskId, Chunk)>,
+    ) -> bool {
+        let admit_started = Instant::now();
+        if self.pending.len() >= 2 {
+            let (n, rows) = self.admit_streams_batch(turn, down, out);
+            if n > 0 {
+                if let Some(p) = self.stage_profile.as_mut() {
+                    p.opens += n as u64;
+                    p.open_rows += rows as u64;
+                    p.prefill += admit_started.elapsed();
+                }
+                return true;
+            }
+        }
+        let Some(task) = self.pending.pop_front() else {
+            return false;
+        };
+        let mut counts = vec![0usize; self.stream_groups.max(1)];
         for st in &self.streams {
-            if let Some(n) = rows.get_mut(st.group) {
+            if let Some(n) = counts.get_mut(st.group) {
                 *n += 1;
             }
         }
-        rows.get(g).copied() == rows.iter().copied().min()
+        let group = (0..counts.len()).min_by_key(|&i| counts[i]).unwrap_or(0);
+        let prompt_rows = match self.admit_stream_pipeline(task, group, turn, down) {
+            Ok(rows) => rows,
+            Err((id, chunk)) => {
+                out.push((id, chunk));
+                0
+            }
+        };
+        if let Some(p) = self.stage_profile.as_mut() {
+            p.opens += 1;
+            p.open_rows += prompt_rows as u64;
+            p.prefill += admit_started.elapsed();
+        }
+        true
+    }
+
+    /// Admit several waiting requests as ONE prefill frame
+    /// (`CASCADIA_STREAMS_ADMIT_BATCH` prompts at most, default 8; 1 = off):
+    /// their rows share every rank's expert reads, where one frame per request
+    /// made a burst of 48 short prompts cost 48 frames of about a second on
+    /// every rank (time to first token 87 s on average). Only prompts that fit
+    /// one window take this path; each new stream joins the emptiest group.
+    /// Returns (streams admitted, prompt rows). The frame's reply is owed at
+    /// the turn of `g`, the group whose turn sends it.
+    fn admit_streams_batch(
+        &mut self,
+        g: usize,
+        down: &Arc<TokioMutex<ActivationClient>>,
+        out: &mut Vec<(TaskId, Chunk)>,
+    ) -> (usize, usize) {
+        let limit = stream_admit_batch();
+        if limit < 2 {
+            return (0, 0);
+        }
+        let Some(tok) = self.tokenizer.as_ref() else {
+            return (0, 0);
+        };
+        let window = stream_prefill_window_rows();
+        let max_rows = crate::dist::MAX_STREAM_ROWS as usize;
+        let started = Instant::now();
+        // Take tasks from the front while they fit; stop at the first that does
+        // not (a long prompt keeps its place and goes through the windowed path).
+        let mut picked: Vec<(GenerationTask, Vec<u32>)> = Vec::new();
+        let mut total = 0usize;
+        while picked.len() < limit && self.streams.len() + picked.len() < self.stream_cap {
+            let Some(task) = self.pending.front() else {
+                break;
+            };
+            let ids: Vec<u32> = match tok.encode(task.prompt.as_str(), true) {
+                Ok(enc) => enc.get_ids().to_vec(),
+                Err(_) => break, // the single path reports it
+            };
+            if ids.is_empty() || ids.len() > window || total + ids.len() > max_rows {
+                break;
+            }
+            total += ids.len();
+            let task = self.pending.pop_front().expect("front exists");
+            picked.push((task, ids));
+        }
+        if picked.len() < 2 {
+            // Not a batch: hand the task back for the single path.
+            for (task, _) in picked.into_iter().rev() {
+                self.pending.push_front(task);
+            }
+            return (0, 0);
+        }
+        let hs = self.runner.hidden_size();
+        let mut segs: Vec<(usize, usize)> = Vec::with_capacity(picked.len());
+        let mut hidden = Vec::with_capacity(total * hs);
+        for (_, ids) in &picked {
+            let Some(slot) = self.runner.open_stream() else {
+                break;
+            };
+            segs.push((slot, ids.len()));
+            for &t in ids {
+                hidden.extend(self.runner.embed_token(t));
+            }
+        }
+        // Tasks that found no slot wait for the next turn.
+        while picked.len() > segs.len() {
+            let (task, _) = picked.pop().expect("longer than segs");
+            self.pending.push_front(task);
+        }
+        let rows: usize = segs.iter().map(|&(_, r)| r).sum();
+        hidden.truncate(rows * hs);
+        let abort = |this: &mut Self, out: &mut Vec<(TaskId, Chunk)>, msg: String| {
+            for &(slot, _) in &segs {
+                this.runner.close_stream(slot);
+            }
+            for (task, _) in &picked {
+                out.push((
+                    task.task_id.clone(),
+                    Chunk::error(task.task_id.clone(), msg.clone()),
+                ));
+            }
+        };
+        let runner = &mut self.runner;
+        let segs_ref = &segs;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runner.prefill_streams(segs_ref, hidden)
+        }));
+        let h = match outcome {
+            Ok(h) => h,
+            Err(payload) => {
+                let msg = panic_message(payload);
+                warn!(error = %msg, "batched stream prefill failed; tasks aborted");
+                abort(self, out, msg);
+                return (0, 0);
+            }
+        };
+        let cfgs: Vec<crate::sampling::SamplingConfig> =
+            picked.iter().map(|(t, _)| sampling_from_task(t)).collect();
+        let wire: Vec<(u32, u32, crate::sampling::SamplingConfig)> = segs
+            .iter()
+            .zip(&cfgs)
+            .map(|(&(slot, r), c)| (slot as u32, r as u32, c.clone()))
+            .collect();
+        self.stream_batch_seq = self.stream_batch_seq.wrapping_add(1);
+        let batch_id = self.stream_batch_seq;
+        if let Err(e) = self.block_on(send_stream_open_batch(down, batch_id, &wire, &h, hs as u32))
+        {
+            warn!("send_stream_open_batch failed: {e}");
+            self.peer_disconnected = true;
+            abort(self, out, format!("send_stream_open_batch: {e}"));
+            return (0, 0);
+        }
+        let prefill_s = started.elapsed().as_secs_f64();
+        let mut counts = vec![0usize; self.stream_groups.max(1)];
+        for st in &self.streams {
+            if let Some(n) = counts.get_mut(st.group) {
+                *n += 1;
+            }
+        }
+        self.stream_inflight[g].push_back(StreamInFlight {
+            batch_id,
+            slots: segs.iter().map(|&(s, _)| s).collect(),
+            open: true,
+            sent_at: Instant::now(),
+        });
+        info!(
+            prompts = segs.len(),
+            rows,
+            rank0_prefill_s = prefill_s,
+            streams = self.streams.len() + segs.len(),
+            "streams admitted as one prefill frame (pipeline)"
+        );
+        let n = segs.len();
+        self.batched_admissions += n as u64;
+        for (((task, ids), &(slot, r)), cfg) in picked.into_iter().zip(&segs).zip(cfgs) {
+            let group = (0..counts.len()).min_by_key(|&i| counts[i]).unwrap_or(0);
+            counts[group] += 1;
+            let draft = self.stream_spec_depth.map(|_| {
+                let mut d = crate::ngram_draft::Draft::new()
+                    .with_draft_k(1)
+                    .with_shared(self.shared_ngrams.clone());
+                if let Some((cfg, tok)) = self.spec_lm.clone() {
+                    d = d.with_lm(cfg, tok);
+                }
+                let ids: Vec<i64> = ids.iter().map(|&t| t as i64).collect();
+                d.warm_with_prompt(&ids);
+                d
+            });
+            self.streams.push(StreamActive {
+                id: task.task_id,
+                slot,
+                group,
+                state: StreamState::Prefilling,
+                cancelled: false,
+                cfg,
+                history: Vec::new(),
+                rng: 0,
+                max_new: task.max_tokens.max(1) as usize,
+                started,
+                prefill_s,
+                decode_started: Instant::now(),
+                prompt_len: r,
+                next: -1,
+                pos: r,
+                generated: Vec::new(),
+                emitted: 0,
+                feed: VecDeque::new(),
+                spec: VecDeque::new(),
+                draft,
+                next_emitted: false,
+            });
+        }
+        (n, rows)
     }
 
     fn flush_stage_profile(&mut self) {
@@ -6142,6 +6649,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         &mut self,
         task: GenerationTask,
         g: usize,
+        reply_queue: usize,
         down: &Arc<TokioMutex<ActivationClient>>,
     ) -> Result<usize, (TaskId, Chunk)> {
         let started = Instant::now();
@@ -6181,6 +6689,17 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let prompt_len = prompt_ids.len();
         // A prompt longer than one window goes down as `StreamFeed` windows:
         // the first here, the rest one per group turn (`feed_stream_window`).
+        let draft = self.stream_spec_depth.map(|_| {
+            let mut d = crate::ngram_draft::Draft::new()
+                .with_draft_k(1)
+                .with_shared(self.shared_ngrams.clone());
+            if let Some((cfg, tok)) = self.spec_lm.clone() {
+                d = d.with_lm(cfg, tok);
+            }
+            let ids: Vec<i64> = prompt_ids.iter().map(|&t| t as i64).collect();
+            d.warm_with_prompt(&ids);
+            d
+        });
         let window = stream_prefill_window_rows();
         let windowed = prompt_len > window;
         let mut feed: VecDeque<u32> = VecDeque::new();
@@ -6240,7 +6759,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             ));
         }
         if !windowed {
-            self.stream_inflight[g].push_back(StreamInFlight {
+            self.stream_inflight[reply_queue].push_back(StreamInFlight {
                 batch_id,
                 slots: vec![slot],
                 open: true,
@@ -6281,8 +6800,595 @@ impl<R: StagedRunner> PipelineEngine<R> {
             generated: Vec::new(),
             emitted: 0,
             feed,
+            spec: VecDeque::new(),
+            draft,
+            next_emitted: false,
         });
         Ok(rows)
+    }
+
+    /// Configure the direct reply link from the environment (see `return_cli`).
+    /// The last rank binds its listener here; rank 0 only records where to
+    /// dial and connects before it next admits a stream.
+    fn setup_return_link(&mut self) {
+        let Some(port) = std::env::var("CASCADIA_STREAMS_RETURN_PORT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u16>().ok())
+            .filter(|&p| p > 0)
+        else {
+            return;
+        };
+        if self.total <= 2 {
+            return; // rank 1 already answers rank 0 directly
+        }
+        if self.rank == 0 {
+            match std::env::var("CASCADIA_STREAMS_RETURN_HOST") {
+                Ok(host) if !host.trim().is_empty() => {
+                    info!(host = %host.trim(), port, "token replies come back on a direct link");
+                    self.return_cli = Some(Arc::new(TokioMutex::new(ActivationClient::new(
+                        host.trim().to_string(),
+                        port,
+                    ))));
+                }
+                _ => warn!(
+                    "CASCADIA_STREAMS_RETURN_PORT set without CASCADIA_STREAMS_RETURN_HOST on \
+                     rank 0; replies stay on the relay path"
+                ),
+            }
+        } else if self.is_last() {
+            let mut srv = ActivationServer::new("0.0.0.0", port);
+            match self.block_on(srv.start()) {
+                Ok(()) => {
+                    info!(port, "token replies go to rank 0 on a direct link");
+                    self.return_srv = Some(Arc::new(TokioMutex::new(srv)));
+                }
+                Err(e) => {
+                    // Rank 0 will wait for this port: a rank that cannot open
+                    // it must not pretend to serve.
+                    warn!(
+                        port,
+                        "return link listener failed: {e}; exiting for supervisor"
+                    );
+                    self.peer_disconnected = true;
+                }
+            }
+        }
+    }
+
+    /// Rank 0: the link replies are read from, connecting the direct one first
+    /// if it is configured and not connected to the present chain.
+    fn reply_link(
+        &mut self,
+        down: &Arc<TokioMutex<ActivationClient>>,
+    ) -> Result<Arc<TokioMutex<ActivationClient>>, String> {
+        let Some(ret) = self.return_cli.clone() else {
+            return Ok(down.clone());
+        };
+        if !self.return_ready {
+            let res = self.block_on(async {
+                let mut c = ret.lock().await;
+                c.close().await;
+                c.connect_with_timeout(Duration::from_secs(30)).await
+            });
+            if let Err(e) = res {
+                self.peer_disconnected = true;
+                return Err(format!("return link to the last rank: {e}"));
+            }
+            self.return_ready = true;
+        }
+        Ok(ret)
+    }
+
+    /// Last rank: send a reply on the direct link when configured (accepting
+    /// rank 0's connection first), else up the relay path.
+    fn send_tokens_reply(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        batch_id: u32,
+        toks: &[(u32, i64)],
+    ) -> Result<(), String> {
+        let Some(ret) = self.return_srv.clone() else {
+            return self
+                .block_on(send_stream_tokens_upstream(upstream, batch_id, toks))
+                .map_err(|e| format!("send_stream_tokens: {e}"));
+        };
+        if !self.return_accepted {
+            let accepted = self.block_on(async {
+                tokio::time::timeout(Duration::from_secs(60), async {
+                    ret.lock().await.accept().await
+                })
+                .await
+            });
+            match accepted {
+                Ok(Ok(())) => self.return_accepted = true,
+                Ok(Err(e)) => {
+                    self.peer_disconnected = true;
+                    return Err(format!("return link accept: {e}"));
+                }
+                Err(_) => {
+                    self.peer_disconnected = true;
+                    return Err("return link: rank 0 did not dial in within 60 s".into());
+                }
+            }
+        }
+        let sent = self
+            .block_on(send_stream_tokens_upstream(&ret, batch_id, toks))
+            .map_err(|e| format!("send_stream_tokens (return link): {e}"));
+        if sent.is_err() {
+            self.peer_disconnected = true; // rebuild the chain: rank 0 re-dials the new last rank
+        }
+        sent
+    }
+
+    /// Rank 0: prompts admitted through multi-prompt prefill frames since start.
+    pub fn batched_admissions(&self) -> u64 {
+        self.batched_admissions
+    }
+
+    /// Rank 0: token replies are arriving on the direct return link.
+    pub fn return_link_active(&self) -> bool {
+        self.return_cli.is_some() && self.return_ready
+    }
+
+    /// `(guesses sent, confirmed, refuted)` by the speculation path since start.
+    pub fn speculation_stats(&self) -> (u64, u64, u64) {
+        self.spec_stats
+    }
+
+    /// Whether this step belongs to the lone-stream speculation path
+    /// (`CASCADIA_STREAMS_SPEC=1`). A pipeline serving one stream keeps one
+    /// rank busy and ten waiting: the stream's next token cannot start before
+    /// its last one comes back. With a guess for that next token, its frame
+    /// enters right behind the real one, and the guess after it behind that,
+    /// so up to `total` positions of the one stream are in flight on as many
+    /// ranks. The reply to position p names the true token at p + 1: if the
+    /// frame in flight for p + 1 carried exactly that token, its reply is one
+    /// stage time away instead of a whole round trip; if not, that frame and
+    /// its successors are dropped, every rank rolls the slot back
+    /// (`StreamRewind`, which travels behind them) and the true token goes
+    /// out, as it would have without the guess. Tokens are those of plain
+    /// greedy or sampled decoding: a guess never chooses a token, it only
+    /// decides whether work started early is kept.
+    fn spec_applies(&self) -> bool {
+        if self.stream_spec_depth.is_none() || self.streams.len() != 1 {
+            return false;
+        }
+        let st = &self.streams[0];
+        if st.draft.is_none() || st.state == StreamState::Feeding {
+            return false;
+        }
+        if !st.spec.is_empty() {
+            return true; // our frames are in flight: their replies are read here
+        }
+        let queued: usize = self.stream_inflight.iter().map(VecDeque::len).sum();
+        self.pending.is_empty() && !st.cancelled && queued <= 1
+    }
+
+    /// One step of the speculation path: at most one verified token out, then
+    /// the pipeline topped up with guesses. See [`Self::spec_applies`].
+    fn step_stream_spec(&mut self, out: &mut Vec<(TaskId, Chunk)>) {
+        // With a drafter model a round may end without a token (no reply yet:
+        // it went to top the pipeline up instead of blocking). A step that
+        // hands nothing back reads as a stalled engine to the caller, so the
+        // rounds repeat here until one produces something or the lone-stream
+        // path no longer applies. Without a drafter model every round blocks
+        // for its reply and this loop runs once.
+        loop {
+            let before = out.len();
+            self.spec_round(out);
+            if out.len() > before || self.peer_disconnected || !self.spec_applies() {
+                return;
+            }
+        }
+    }
+
+    /// One round of [`Self::step_stream_spec`].
+    fn spec_round(&mut self, out: &mut Vec<(TaskId, Chunk)>) {
+        let Some(down) = self.transport.downstream.clone() else {
+            self.fail_streams_into(out, "rank 0 missing downstream".into(), true);
+            return;
+        };
+        let depth = self.stream_spec_depth.unwrap_or(1);
+        let groups = self.stream_groups.max(1) as u32;
+        let slot = self.streams[0].slot;
+        // ---- 0. a frame the group path left in flight: its reply is ours ----
+        if self.streams[0].spec.is_empty() {
+            let g = (0..self.stream_inflight.len()).find(|&g| !self.stream_inflight[g].is_empty());
+            if let Some(f) = g.and_then(|g| self.stream_inflight[g].pop_front()) {
+                let deadline = if f.open {
+                    Self::reply_deadline_prefill()
+                } else {
+                    Self::reply_deadline() * groups
+                };
+                let wait_started = Instant::now();
+                let replies = match self.reply_link(&down) {
+                    Ok(l) => l,
+                    Err(e) => return self.fail_streams_into(out, e, true),
+                };
+                let (bid, toks) = match self.block_on(recv_stream_tokens_reply(&replies, deadline))
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.return_ready = false;
+                        self.peer_disconnected = true;
+                        return self.fail_streams_into(out, e, true);
+                    }
+                };
+                if let Some(p) = self.stage_profile.as_mut() {
+                    p.wait += wait_started.elapsed();
+                    p.replied(f.sent_at.elapsed());
+                }
+                if bid != f.batch_id || toks.len() != 1 || toks[0].0 as usize != slot {
+                    let msg = format!("stream reply mismatch: batch {bid} vs {}", f.batch_id);
+                    return self.fail_streams_into(out, msg, false);
+                }
+                let st = &mut self.streams[0];
+                st.next = toks[0].1;
+                if !f.open {
+                    st.pos += 1;
+                }
+                st.state = StreamState::Ready;
+                st.next_emitted = false;
+            }
+        }
+        // ---- 1. the next verified token, if frames of ours are in flight ----
+        while let Some(front) = self.streams[0].spec.front().map(|r| r.batch_id) {
+            // A drafter model may not have had its guess ready when the frames
+            // went out (it starts over after every wrong guess). Blocking here
+            // until the next reply would leave the pipeline empty for a whole
+            // trip: look for the reply briefly, and top the pipeline up (3.)
+            // when there is none yet.
+            if self.spec_lm.is_some() && !self.streams[0].cancelled && self.pending.is_empty() {
+                let st = &self.streams[0];
+                let valid = st.spec.iter().filter(|r| r.valid).count();
+                let room = valid <= depth && st.generated.len() + valid < st.max_new;
+                // Past the reply deadline the blocking read below reports the loss.
+                let overdue = st
+                    .spec
+                    .front()
+                    .is_some_and(|r| r.sent_at.elapsed() > Self::reply_deadline() * groups);
+                if room && !overdue && !self.reply_within(&down, Duration::from_millis(6)) {
+                    break;
+                }
+            }
+            let wait_started = Instant::now();
+            let deadline = Self::reply_deadline() * groups;
+            let replies = match self.reply_link(&down) {
+                Ok(l) => l,
+                Err(e) => return self.fail_streams_into(out, e, true),
+            };
+            let (bid, toks) = match self.block_on(recv_stream_tokens_reply(&replies, deadline)) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.return_ready = false;
+                    self.peer_disconnected = true;
+                    return self.fail_streams_into(out, e, true);
+                }
+            };
+            if bid != front || toks.len() != 1 || toks[0].0 as usize != slot {
+                let msg = format!("stream reply mismatch: batch {bid} vs {front} (speculation)");
+                return self.fail_streams_into(out, msg, false);
+            }
+            let rec = self.streams[0].spec.pop_front().expect("front exists");
+            if let Some(p) = self.stage_profile.as_mut() {
+                p.wait += wait_started.elapsed();
+                p.replied(rec.sent_at.elapsed());
+            }
+            if !rec.valid {
+                continue; // a dropped guess: its reply means nothing
+            }
+            let t = toks[0].1;
+            let st = &mut self.streams[0];
+            st.pos = rec.pos + 1;
+            st.next = t;
+            st.next_emitted = false;
+            let from_model = st.spec.front().is_some_and(|n| n.from_model);
+            match st.spec.front().map(|n| n.input == t) {
+                Some(true) => {
+                    self.spec_stats.1 += 1;
+                    if let Some(p) = self.stage_profile.as_mut() {
+                        p.spec_hits += 1;
+                        p.spec_lm_hits += u64::from(from_model);
+                    }
+                }
+                Some(false) => {
+                    // Wrong guess: drop it and everything sent after it, and
+                    // roll the slot back to the last true position everywhere.
+                    let mut dropped = 0usize;
+                    for r in st.spec.iter_mut().filter(|r| r.valid) {
+                        r.valid = false;
+                        dropped += usize::from(r.guess);
+                    }
+                    if let Some(d) = st.draft.as_mut() {
+                        d.rewind(dropped);
+                    }
+                    let len = st.pos;
+                    self.spec_stats.2 += 1;
+                    if let Some(p) = self.stage_profile.as_mut() {
+                        p.spec_misses += 1;
+                        p.spec_lm_misses += u64::from(from_model);
+                    }
+                    if !self.runner.truncate_stream(slot, len) {
+                        return self.fail_streams_into(
+                            out,
+                            "speculation: rewind refused".into(),
+                            false,
+                        );
+                    }
+                    if let Err(e) =
+                        self.block_on(send_stream_rewind(&down, slot as u32, len as u32))
+                    {
+                        return self.fail_streams_into(
+                            out,
+                            format!("send_stream_rewind: {e}"),
+                            true,
+                        );
+                    }
+                }
+                None => {
+                    if let Some(p) = self.stage_profile.as_mut() {
+                        p.spec_none += 1;
+                    }
+                }
+            }
+            break;
+        }
+        // ---- 2. emit it ----
+        if !self.streams[0].next_emitted {
+            let emit_started = Instant::now();
+            // A right guess in flight already put this token in the drafter.
+            let in_draft = self.streams[0]
+                .spec
+                .iter()
+                .find(|r| r.valid)
+                .is_some_and(|r| r.guess && r.input == self.streams[0].next);
+            let finished = self.spec_emit(out, in_draft);
+            if !finished && !in_draft {
+                // The text just changed under the drafter model: let it write
+                // while this rank computes the frame of the true token.
+                if let Some(d) = self.streams[0].draft.as_mut() {
+                    d.poke();
+                }
+            }
+            if let Some(p) = self.stage_profile.as_mut() {
+                p.emit += emit_started.elapsed();
+            }
+            if finished {
+                return self.spec_finish(&down);
+            }
+        }
+        // ---- 3. keep the pipeline full ----
+        let drain_only = !self.pending.is_empty() || self.streams[0].cancelled;
+        if drain_only {
+            if self.streams[0].spec.is_empty() {
+                self.streams[0].state = StreamState::Ready; // the group path forwards `next`
+            }
+            return;
+        }
+        let max_seq = self.runner.max_seq();
+        // A drafter model writes while this rank computes; when it has nothing
+        // yet, a few milliseconds of patience are cheaper than an empty frame.
+        let patience = if self.spec_lm.is_some() {
+            Duration::from_millis(4)
+        } else {
+            Duration::ZERO
+        };
+        loop {
+            let st = &self.streams[0];
+            let valid = st.spec.iter().filter(|r| r.valid).count();
+            let (pos, input, guess, from_model) = match st.spec.iter().rev().find(|r| r.valid) {
+                None => (st.pos, st.next, false, false),
+                Some(last) => {
+                    // Guesses beyond what the request may still produce are wasted.
+                    let ahead = st.generated.len() + valid;
+                    if valid > depth || ahead >= st.max_new || last.pos + 1 >= max_seq {
+                        break;
+                    }
+                    let pos = last.pos + 1;
+                    // A reply that is already here outranks another guess: it
+                    // may refute the frames this one would follow, and a frame
+                    // holds this rank for a whole stage time.
+                    if self.reply_waiting(&down) {
+                        break;
+                    }
+                    let Some(d) = self.streams[0]
+                        .draft
+                        .as_mut()
+                        .and_then(|d| d.propose_one(patience))
+                    else {
+                        break;
+                    };
+                    let from_model = self.streams[0]
+                        .draft
+                        .as_ref()
+                        .is_some_and(|d| d.last_from_model());
+                    (pos, d, true, from_model)
+                }
+            };
+            if let Err(e) = self.spec_send(&down, pos, input, guess, from_model) {
+                return self.fail_streams_into(out, e, true);
+            }
+        }
+        self.note_link_busy();
+    }
+
+    /// Emit `streams[0].next` (speculation path); `true` when the stream is done.
+    fn spec_emit(&mut self, out: &mut Vec<(TaskId, Chunk)>, in_draft: bool) -> bool {
+        let tok = self
+            .tokenizer
+            .as_ref()
+            .expect("multi-stream step needs a tokenizer");
+        let max_seq = self.runner.max_seq();
+        let eos: Vec<u32> = self.runner.eos_token_ids().to_vec();
+        let arch = self.runner.arch_name();
+        let stats = self.spec_stats;
+        let st = &mut self.streams[0];
+        let t = st.next as u32;
+        st.generated.push(t);
+        if !in_draft {
+            if let Some(d) = st.draft.as_mut() {
+                d.append(st.next);
+            }
+        }
+        st.next_emitted = true;
+        let full = tok.decode(&st.generated, true).unwrap_or_default();
+        let delta = utf8_safe_delta(&full, &mut st.emitted);
+        let mut c = Chunk::token(st.id.clone(), st.next, delta);
+        c.n_tokens = Some(1);
+        c.token_ids = vec![st.next];
+        out.push((st.id.clone(), c));
+        let n = st.generated.len();
+        let natural_stop = n >= st.max_new || eos.contains(&t);
+        let cap_stop = !natural_stop && st.pos >= max_seq;
+        if !(natural_stop || cap_stop) {
+            return false;
+        }
+        let mut chunk = Chunk::final_marker(st.id.clone(), String::new());
+        chunk.n_tokens = Some(0);
+        chunk.prompt_tokens = Some(st.prompt_len as u32);
+        chunk.finish_reason = Some(if cap_stop {
+            FinishReason::Length
+        } else {
+            finish_reason_for(n, st.max_new)
+        });
+        out.push((st.id.clone(), chunk));
+        let decode_s = st.decode_started.elapsed().as_secs_f64();
+        let steps = n.saturating_sub(1);
+        info!(
+            task = %st.id,
+            tokens = n,
+            elapsed_s = st.started.elapsed().as_secs_f64(),
+            prefill_s = st.prefill_s,
+            decode_s,
+            decode_steps = steps,
+            decode_tok_s = if decode_s > 0.0 { steps as f64 / decode_s } else { 0.0 },
+            guesses_total = stats.0,
+            guesses_right_total = stats.1,
+            guesses_wrong_total = stats.2,
+            "task done ({arch} multi-stream pipeline, speculating)"
+        );
+        true
+    }
+
+    /// The speculating stream is done: read and drop the replies still owed to
+    /// its frames (the slot must not be reused before they are gone), then
+    /// close it everywhere.
+    fn spec_finish(&mut self, down: &Arc<TokioMutex<ActivationClient>>) {
+        let groups = self.stream_groups.max(1) as u32;
+        while self.streams[0].spec.pop_front().is_some() {
+            let deadline = Self::reply_deadline() * groups;
+            let replies = match self.reply_link(down) {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!("speculation: {e}");
+                    break;
+                }
+            };
+            if let Err(e) = self.block_on(recv_stream_tokens_reply(&replies, deadline)) {
+                warn!("speculation: reply to a dropped frame not read: {e}");
+                self.peer_disconnected = true;
+                break;
+            }
+        }
+        let st = self.streams.swap_remove(0);
+        self.learn_from(&st);
+        if let Some(d) = st.draft.as_ref() {
+            let (lm, tables) = d.sources();
+            self.spec_sources.0 += lm;
+            self.spec_sources.1 += tables;
+            if d.has_lm() {
+                info!(task = %st.id, guesses_model = lm, guesses_tables = tables,
+                      model_total = self.spec_sources.0, tables_total = self.spec_sources.1,
+                      "speculation guesses by source");
+            }
+        }
+        self.runner.close_stream(st.slot);
+        if let Err(e) = self.block_on(send_stream_close(down, st.slot as u32)) {
+            warn!(slot = st.slot, "stream close not relayed: {e}");
+        }
+        self.note_link_busy();
+    }
+
+    /// A finished stream's prompt and output go into the shared drafter table
+    /// (its history may carry a speculated tail past them: not learned).
+    fn learn_from(&self, st: &StreamActive) {
+        let Some(d) = st.draft.as_ref() else {
+            return;
+        };
+        let n = (st.prompt_len + st.generated.len()).min(d.history().len());
+        if let Ok(mut shared) = self.shared_ngrams.lock() {
+            shared.learn(&d.history()[..n]);
+            self.spec_learned.set(self.spec_learned.get() + 1);
+            // Every 16th finished request: a few MB, off the token path.
+            if self.spec_learned.get() % 16 == 0 {
+                if let Some(path) = spec_table_path() {
+                    if let Err(e) = shared.save(&path) {
+                        warn!(path = %path.display(), "drafter table not saved: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// One decode frame of the speculating stream: `input` at `pos` through my
+    /// layers and down the pipeline.
+    fn spec_send(
+        &mut self,
+        down: &Arc<TokioMutex<ActivationClient>>,
+        pos: usize,
+        input: i64,
+        guess: bool,
+        from_model: bool,
+    ) -> Result<(), String> {
+        let compute_started = Instant::now();
+        let slot = self.streams[0].slot;
+        let hs = self.runner.hidden_size();
+        if self.runner.stream_pos(slot) != pos {
+            return Err(format!(
+                "speculation: slot {slot} at position {}, frame wants {pos}",
+                self.runner.stream_pos(slot)
+            ));
+        }
+        let hidden = self.runner.embed_token(input as u32);
+        let runner = &mut self.runner;
+        let h = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runner.decode_streams(hidden, &[slot])
+        }))
+        .map_err(panic_message)?;
+        self.stream_batch_seq = self.stream_batch_seq.wrapping_add(1);
+        let batch_id = self.stream_batch_seq;
+        let send_started = Instant::now();
+        self.block_on(send_stream_decode(
+            down,
+            batch_id,
+            &[(slot as u32, pos as u32)],
+            &h,
+            hs as u32,
+        ))
+        .map_err(|e| format!("send_stream_decode: {e}"))?;
+        if let Some(p) = self.stage_profile.as_mut() {
+            p.decoded(1, send_started - compute_started);
+            p.send += send_started.elapsed();
+            p.spec_sent += u64::from(guess);
+        }
+        let st = &mut self.streams[0];
+        if guess {
+            self.spec_stats.0 += 1;
+            if let Some(d) = st.draft.as_mut() {
+                d.append(input);
+            }
+        }
+        st.state = StreamState::InFlight;
+        st.spec.push_back(SpecSent {
+            batch_id,
+            pos,
+            input,
+            guess,
+            from_model,
+            valid: true,
+            sent_at: Instant::now(),
+        });
+        Ok(())
     }
 
     /// Send the next window of `streams[i]`'s prompt (state `Feeding`) during
@@ -6419,6 +7525,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         match res {
             Ok(()) => {
                 info!(rank = self.rank, "downstream link re-dialed; resuming");
+                self.return_ready = false; // the last rank behind it is a new process
                 self.peer_disconnected = false;
                 self.disconnect_reported = false;
                 self.redial_next = None;
@@ -6437,11 +7544,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
     /// `peer_disconnected` latched so rank 0 re-dials the downstream rank in
     /// place on a later step (see [`Self::redial_downstream`]). A local
     /// failure — a panic inside the forward, a reply that does not match the
-    /// frame — must NOT re-dial: the worker's listener accepts once, so a
-    /// re-dial into a healthy neighbour tears the whole chain down and every
-    /// rank reloads its slice for what was one bad request. (The message text
-    /// used to decide this, and a String panic payload never starts with
-    /// "forward panicked".)
+    /// frame, a refused rewind — must NOT re-dial: the worker's listener
+    /// accepts once, so a re-dial into a healthy neighbour tears the whole
+    /// chain down and every rank reloads its slice for what was one bad
+    /// request. (The message text used to decide this, and a String panic
+    /// payload never starts with "forward panicked".)
     fn fail_streams_into(&mut self, out: &mut Vec<(TaskId, Chunk)>, msg: String, wire: bool) {
         if wire {
             self.peer_disconnected = true;
@@ -6691,6 +7798,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
             generated: Vec::new(),
             emitted: 0,
             feed: VecDeque::new(),
+            spec: VecDeque::new(),
+            draft: None,
+            next_emitted: false,
         });
         Ok(())
     }
@@ -7430,6 +8540,16 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 return Vec::new();
             }
         };
+        // Heads owed from earlier decode frames go out before anything that is
+        // not another decode frame (a close or a rewind must find its stream's
+        // sampler in the state the frames before it left).
+        if !matches!(kind, FrameKind::StreamDecode) {
+            if let Err(e) = self.flush_pending_heads(&upstream) {
+                warn!("worker head flush failed: {e}");
+                self.peer_disconnected = true;
+                return Vec::new();
+            }
+        }
         let res = match kind {
             FrameKind::Reset => {
                 self.runner.reset();
@@ -7510,8 +8630,32 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     Err(format!("recv cache_prefix key: {e}"))
                 }
             },
+            FrameKind::ChainReady => {
+                let total = self.total;
+                let last = self.is_last();
+                let result = self.block_on(async {
+                    if let Some(down) = downstream.as_ref() {
+                        crate::dist::probe_chain(&mut *down.lock().await, total).await?;
+                    } else if !last {
+                        return Err(cascadia_transport::TransportError::NotConnected);
+                    }
+                    let ack: Vec<u8> = [FrameKind::ChainReadyAck as u32, total - 1, total]
+                        .into_iter()
+                        .flat_map(u32::to_be_bytes)
+                        .collect();
+                    upstream.lock().await.send_raw(&ack).await
+                });
+                if result.is_err() {
+                    self.peer_disconnected = true;
+                }
+                result.map_err(|e| format!("chain readiness: {e}"))
+            }
             FrameKind::StreamOpen => self.handle_stream_open(&upstream, downstream.as_ref()),
             FrameKind::StreamFeed => self.handle_stream_feed(&upstream, downstream.as_ref()),
+            FrameKind::StreamRewind => self.handle_stream_rewind(&upstream, downstream.as_ref()),
+            FrameKind::StreamOpenBatch => {
+                self.handle_stream_open_batch(&upstream, downstream.as_ref())
+            }
             FrameKind::StreamDecode => self.handle_stream_decode(&upstream, downstream.as_ref()),
             FrameKind::StreamClose => self.handle_stream_close(&upstream, downstream.as_ref()),
             other => Err(format!(
@@ -7654,14 +8798,10 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 crate::sampling::sample(&logits, &sampler.history, &sampler.cfg, &mut sampler.rng);
             sampler.history.push(token);
             self.stream_samplers.insert(s, sampler);
+            self.runner
+                .capture_token(s, have + rows as usize - 1, token);
             let send_started = Instant::now();
-            let sent = self
-                .block_on(send_stream_tokens_upstream(
-                    upstream,
-                    batch_id,
-                    &[(slot, token)],
-                ))
-                .map_err(|e| format!("send_stream_tokens: {e}"));
+            let sent = self.send_tokens_reply(upstream, batch_id, &[(slot, token)]);
             if let Some(p) = self.stage_profile.as_mut() {
                 p.head += send_started - computed;
                 p.send += send_started.elapsed();
@@ -7744,28 +8884,28 @@ impl<R: StagedRunner> PipelineEngine<R> {
             p.decoded(slots.len(), computed - received);
         }
         if self.is_last() {
-            let logits = self.runner.head_logits_rows(&hidden, slots.len());
-            let vocab = logits.len() / slots.len();
-            let mut toks = Vec::with_capacity(slots.len());
-            for (i, &s) in slots.iter().enumerate() {
-                let sampler = self.stream_samplers.get_mut(&s).ok_or_else(|| {
-                    format!("stream decode: slot {s} has no sampler (no StreamOpen seen)")
-                })?;
-                let l = &logits[i * vocab..(i + 1) * vocab];
-                let token =
-                    crate::sampling::sample(l, &sampler.history, &sampler.cfg, &mut sampler.rng);
-                sampler.history.push(token);
-                toks.push((s as u32, token));
+            self.pending_heads.push(PendingHead {
+                batch_id,
+                slots,
+                positions: rows.iter().map(|&(_, pos)| pos as usize).collect(),
+                hidden,
+            });
+            // Wait for the next frame's layers only when it is already here
+            // and the rank serves enough streams for throughput to be the
+            // point: a lone stream's reply must not wait for a guess frame.
+            let defer = self.head_batch > 1
+                && self.pending_heads.len() < self.head_batch
+                && self.stream_samplers.len() >= self.head_batch_min_streams
+                && self.block_on(async {
+                    let u = upstream.lock().await;
+                    tokio::time::timeout(Duration::from_micros(200), u.wait_readable())
+                        .await
+                        .is_ok_and(|r| r.is_ok())
+                });
+            if defer {
+                return Ok(());
             }
-            let send_started = Instant::now();
-            let sent = self
-                .block_on(send_stream_tokens_upstream(upstream, batch_id, &toks))
-                .map_err(|e| format!("send_stream_tokens: {e}"));
-            if let Some(p) = self.stage_profile.as_mut() {
-                p.head += send_started - computed;
-                p.send += send_started.elapsed();
-            }
-            sent
+            self.flush_pending_heads(upstream)
         } else {
             let down = downstream.ok_or("mid rank missing downstream")?;
             let sent = self
@@ -7777,6 +8917,190 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 p.send += computed.elapsed();
             }
             sent
+        }
+    }
+
+    /// Last rank: one output-head call for every decode frame whose head is
+    /// owed, then each frame's tokens sampled and sent as its own reply, in
+    /// arrival order (a stream's rows reach its sampler in position order).
+    fn flush_pending_heads(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+    ) -> Result<(), String> {
+        if self.pending_heads.is_empty() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let pending = std::mem::take(&mut self.pending_heads);
+        let total: usize = pending.iter().map(|p| p.slots.len()).sum();
+        let logits = if pending.len() == 1 {
+            self.runner.head_logits_rows(&pending[0].hidden, total)
+        } else {
+            let mut all = Vec::with_capacity(pending.iter().map(|p| p.hidden.len()).sum());
+            for p in &pending {
+                all.extend_from_slice(&p.hidden);
+            }
+            self.runner.head_logits_rows(&all, total)
+        };
+        let vocab = logits.len() / total.max(1);
+        self.head_batch_stats.0 += 1;
+        self.head_batch_stats.1 += pending.len() as u64;
+        if pending.len() > 1 {
+            HEAD_SHARED_FRAMES
+                .fetch_add(pending.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        if self.head_batch > 1 && self.head_batch_stats.0.is_multiple_of(512) {
+            // integers on a "stage profile" line: the fleet's beacon relays those
+            println!(
+                "HB probe stage profile calls={} frames={}",
+                self.head_batch_stats.0, self.head_batch_stats.1
+            );
+        }
+        let mut row = 0usize;
+        let mut replies = Vec::with_capacity(pending.len());
+        for p in &pending {
+            let mut toks = Vec::with_capacity(p.slots.len());
+            for (i, &s) in p.slots.iter().enumerate() {
+                let sampler = self.stream_samplers.get_mut(&s).ok_or_else(|| {
+                    format!("stream decode: slot {s} has no sampler (no StreamOpen seen)")
+                })?;
+                let l = &logits[row * vocab..(row + 1) * vocab];
+                let token =
+                    crate::sampling::sample(l, &sampler.history, &sampler.cfg, &mut sampler.rng);
+                sampler.history.push(token);
+                self.runner.capture_token(s, p.positions[i], token);
+                toks.push((s as u32, token));
+                row += 1;
+            }
+            replies.push((p.batch_id, toks));
+        }
+        let send_started = Instant::now();
+        let mut sent = Ok(());
+        for (batch_id, toks) in &replies {
+            sent = self.send_tokens_reply(upstream, *batch_id, toks);
+            if sent.is_err() {
+                break;
+            }
+        }
+        if let Some(p) = self.stage_profile.as_mut() {
+            p.head += send_started - started;
+            p.send += send_started.elapsed();
+        }
+        sent
+    }
+
+    /// `StreamOpenBatch`: several prompts opened and prefilled in one pass
+    /// (they share expert reads); the last rank samples each prompt's final
+    /// row and answers with one `StreamTokens`.
+    fn handle_stream_open_batch(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+    ) -> Result<(), String> {
+        let recv_started = Instant::now();
+        let (batch_id, wire_segs, hidden_f32) = self
+            .block_on(recv_stream_open_batch_body_server(upstream))
+            .map_err(|e| format!("recv_stream_open_batch: {e}"))?;
+        let received = Instant::now();
+        let hs = self.runner.hidden_size();
+        let total: usize = wire_segs.iter().map(|s| s.1 as usize).sum();
+        if hidden_f32.len() != total * hs {
+            self.peer_disconnected = true;
+            return Err(format!(
+                "stream open batch: {} floats for {total} rows of width {hs}",
+                hidden_f32.len()
+            ));
+        }
+        let mut segs = Vec::with_capacity(wire_segs.len());
+        for (slot, rows, _) in &wire_segs {
+            let s = self.stream_slot_ok(*slot)?;
+            if *rows as usize > self.runner.max_seq() || !self.runner.open_stream_at(s) {
+                self.peer_disconnected = true;
+                return Err(format!("stream open batch: slot {s} refused by the runner"));
+            }
+            segs.push((s, *rows as usize));
+        }
+        let hidden = self.runner.prefill_streams(&segs, hidden_f32);
+        let computed = Instant::now();
+        if let Some(p) = self.stage_profile.as_mut() {
+            p.opens += segs.len() as u64;
+            p.open_rows += total as u64;
+            p.recv += received - recv_started;
+            p.prefill += computed - received;
+        }
+        if self.is_last() {
+            let mut toks = Vec::with_capacity(segs.len());
+            let mut at = 0usize;
+            for (&(s, rows), (slot, _, cfg)) in segs.iter().zip(&wire_segs) {
+                at += rows;
+                let logits = self.runner.head_logits(&hidden[(at - 1) * hs..at * hs]);
+                let rng = crate::sampling::init_rng(cfg.seed);
+                let mut sampler = StreamSampler {
+                    cfg: cfg.clone(),
+                    history: Vec::new(),
+                    rng,
+                };
+                let token = crate::sampling::sample(
+                    &logits,
+                    &sampler.history,
+                    &sampler.cfg,
+                    &mut sampler.rng,
+                );
+                sampler.history.push(token);
+                self.stream_samplers.insert(s, sampler);
+                self.runner.capture_token(s, rows - 1, token);
+                toks.push((*slot, token));
+            }
+            let send_started = Instant::now();
+            let sent = self.send_tokens_reply(upstream, batch_id, &toks);
+            if let Some(p) = self.stage_profile.as_mut() {
+                p.head += send_started - computed;
+                p.send += send_started.elapsed();
+            }
+            sent
+        } else {
+            let down = downstream.ok_or("mid rank missing downstream")?;
+            let sent = self
+                .block_on(send_stream_open_batch(
+                    down, batch_id, &wire_segs, &hidden, hs as u32,
+                ))
+                .map_err(|e| format!("send_stream_open_batch: {e}"));
+            if let Some(p) = self.stage_profile.as_mut() {
+                p.send += computed.elapsed();
+            }
+            sent
+        }
+    }
+
+    /// `StreamRewind` (one-way): a speculated token was wrong. Roll the slot
+    /// back to `len` positions here (the last rank also forgets the tokens it
+    /// sampled past that point) and downstream.
+    fn handle_stream_rewind(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+    ) -> Result<(), String> {
+        let (slot, len) = self
+            .block_on(recv_stream_rewind_body_server(upstream))
+            .map_err(|e| format!("recv_stream_rewind: {e}"))?;
+        let s = self.stream_slot_ok(slot)?;
+        let have = self.runner.stream_pos(s);
+        if len as usize > have || !self.runner.truncate_stream(s, len as usize) {
+            self.peer_disconnected = true;
+            return Err(format!(
+                "stream rewind: slot {s} at position {have} cannot go back to {len}"
+            ));
+        }
+        if let Some(sampler) = self.stream_samplers.get_mut(&s) {
+            let drop = have - len as usize;
+            let keep = sampler.history.len().saturating_sub(drop);
+            sampler.history.truncate(keep);
+        }
+        match downstream {
+            Some(down) => self
+                .block_on(send_stream_rewind(down, slot, len))
+                .map_err(|e| format!("relay stream rewind: {e}")),
+            None => Ok(()),
         }
     }
 
@@ -8111,6 +9435,13 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
                     .into(),
             ));
         }
+        if self
+            .chain_ready
+            .as_ref()
+            .is_some_and(|r| !r.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return Err(EngineError::NotConnected);
+        }
         if self.pending.len() >= OV_MAX_PENDING {
             return Err(EngineError::QueueFull {
                 queued: self.pending.len(),
@@ -8164,6 +9495,9 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
                 self.link_busy
                     .fetch_max(1, std::sync::atomic::Ordering::SeqCst);
                 let epoch = self.link_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                if epoch != self.seen_link_epoch {
+                    self.return_ready = false; // the keeper re-dialed: a new chain behind it
+                }
                 if self.peer_disconnected && epoch != self.seen_link_epoch {
                     // The link keeper re-dialed after this failure was latched.
                     self.peer_disconnected = false;
