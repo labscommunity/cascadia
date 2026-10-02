@@ -89,6 +89,42 @@ impl ActivationStream {
             ActivationStream::Unix(s) => s.shutdown().await,
         }
     }
+
+    /// Wait until at least one byte of the next frame is readable, without
+    /// consuming it (`Err(SocketClosed)` on EOF). Cancel-safe — a relay can
+    /// `select!` this against another socket's readiness and then read the
+    /// frame under the normal calls. TCP peeks through tokio; a Unix socket
+    /// has no async peek in tokio, so it waits for readiness and peeks under
+    /// `try_io` (socket2 `MSG_PEEK`), which also clears a spurious wake-up.
+    pub async fn wait_readable(&self) -> TransportResult<()> {
+        match self {
+            ActivationStream::Tcp(s) => {
+                let mut b = [0u8; 1];
+                loop {
+                    match s.peek(&mut b).await {
+                        Ok(0) => return Err(TransportError::SocketClosed),
+                        Ok(_) => return Ok(()),
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+            #[cfg(unix)]
+            ActivationStream::Unix(s) => loop {
+                s.readable().await?;
+                let peeked = s.try_io(tokio::io::Interest::READABLE, || {
+                    let mut b = [std::mem::MaybeUninit::<u8>::uninit(); 1];
+                    socket2::SockRef::from(s).peek(&mut b)
+                });
+                match peeked {
+                    Ok(0) => return Err(TransportError::SocketClosed),
+                    Ok(_) => return Ok(()),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            },
+        }
+    }
 }
 
 impl AsyncRead for ActivationStream {
@@ -1410,30 +1446,18 @@ impl ActivationServer {
     fn unlink_owned_unix_socket(&mut self) {}
 }
 
-impl Drop for ActivationServer {
-    fn drop(&mut self) {
-        self.unlink_owned_unix_socket();
-    }
-
-    /// Wait until at least one byte of the next frame is readable, without
-    /// consuming it (`Err(SocketClosed)` on EOF). Cancel-safe — a relay can
-    /// `select!` this against another socket's readiness and then read the
-    /// frame under the normal calls.
+impl ActivationServer {
+    /// See [`ActivationStream::wait_readable`]: readiness of the accepted
+    /// upstream link without consuming anything.
     pub async fn wait_readable(&self) -> TransportResult<()> {
         let sock = self.client.as_ref().ok_or(TransportError::NotConnected)?;
-        wait_readable(sock).await
+        sock.wait_readable().await
     }
 }
 
-async fn wait_readable(sock: &TcpStream) -> TransportResult<()> {
-    let mut b = [0u8; 1];
-    loop {
-        match sock.peek(&mut b).await {
-            Ok(0) => return Err(TransportError::SocketClosed),
-            Ok(_) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(e) => return Err(e.into()),
-        }
+impl Drop for ActivationServer {
+    fn drop(&mut self) {
+        self.unlink_owned_unix_socket();
     }
 }
 
@@ -1569,8 +1593,12 @@ impl ActivationClient {
     /// idle link keeper). The name is resolved again on every call. Bound it
     /// with a timeout: an unreachable host can hold a connect for a long time.
     pub async fn try_connect(&mut self) -> TransportResult<()> {
-        let sock = TcpStream::connect((self.host.as_str(), self.port)).await?;
-        tune_pipeline_socket(&sock);
+        #[cfg(not(unix))]
+        if let TransportAddr::Unix(path) = &self.target {
+            return Err(TransportError::UnixUnsupported(path.display().to_string()));
+        }
+        let sock = self.dial().await?;
+        sock.tune();
         self.sock = Some(sock);
         Ok(())
     }
@@ -1675,10 +1703,11 @@ impl ActivationClient {
         Ok(buf)
     }
 
-    /// See [`ActivationServer::wait_readable`].
+    /// See [`ActivationStream::wait_readable`]: readiness of the downstream
+    /// link (a reply) without consuming anything.
     pub async fn wait_readable(&self) -> TransportResult<()> {
         let sock = self.sock.as_ref().ok_or(TransportError::NotConnected)?;
-        wait_readable(sock).await
+        sock.wait_readable().await
     }
 
     pub async fn close(&mut self) {
