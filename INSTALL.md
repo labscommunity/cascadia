@@ -17,9 +17,21 @@ After any install, run **`cascadia doctor`** — it checks your toolchain and te
 Each [GitHub Release](https://github.com/labscommunity/cascadia/releases) ships self-contained bundles with the OpenVINO runtime included — no SDK install, no `INTEL_OPENVINO_DIR`:
 
 - **Windows** — `cascadia-<ver>-windows-x86_64.zip`: unzip, run `cascadia.exe doctor`. Needs only a current Intel graphics driver (the OpenCL/GPU runtime ships inside it).
-- **Linux** — `cascadia-<ver>-linux-x86_64.tar.gz`: untar, run `./cascadia doctor`. Bundled libraries load from `lib/` beside the binary. Needs glibc 2.35+ (Ubuntu 22.04 or newer) and, for GPU inference, the Intel GPU runtime stack below (the bundle has no scripts — use the `apt-get` block, or `scripts/setup-openvino.sh` from a source checkout).
+- **Linux** — `cascadia-<ver>-linux-x86_64.tar.gz`: untar, run `./cascadia doctor`. Bundled libraries load from `lib/` beside the binary. Needs glibc 2.35+ (Ubuntu 22.04 or newer), the OpenCL ICD loader even for CPU-only use (`sudo apt install ocl-icd-libopencl1` — `libopenvino_genai.so` imports `libOpenCL.so.1`, so without it the binary does not start) and, for GPU inference, the Intel GPU runtime stack below (the bundle has no scripts — use the `apt-get` block, or `scripts/setup-openvino.sh` from a source checkout).
 
 The binary is not installed on your PATH — run it as `./cascadia` from the unpacked directory, or add that directory to PATH.
+
+### Which OpenVINO version is inside, and choosing another
+
+Every bundle carries one OpenVINO GenAI release. The default is the newest **stable** release validated on our fleet — the `OV_VERSION` pin in `.github/workflows/release.yml` (currently 2026.4.1.0). `cascadia doctor` prints it under `OpenVINO GenAI`, together with the runtime build string the loader actually picked up.
+
+Because OpenVINO's C++ ABI is not stable across releases, the runtime cannot be swapped underneath a binary: a bundle built for 2026.4.1 will not load 2026.5 libraries. Picking a different OpenVINO version therefore means picking a bundle (or a source build) made for it:
+
+- **Variant bundles.** A release may ship extra bundles named `cascadia-<ver>-<os>-x86_64-ov<openvino-version>.*` (for example `…-ov2026.5.0.0beta1.zip`) next to the default ones. They are the same cascadia built against that SDK — pick one when you need a newer or pre-release OpenVINO (a model family that only loads on a beta, say). Maintainers publish them by setting the repository variable `OV_EXTRA_VERSIONS` (comma-separated versions) before a release.
+- **A one-off build.** Maintainers can run the `release` workflow by hand (Actions → release → *Run workflow*) with `ov_version` set to any version Intel has published, and `dry_run` ticked to get the bundles as workflow artifacts without touching a release.
+- **From source.** `python3 scripts/ov_sdk.py fetch <version> --dest <dir>` downloads and verifies any published SDK (stable, `…beta1`, or a `….devYYYYMMDD` nightly) and prints the directory to use as `INTEL_OPENVINO_DIR`; see "OpenVINO GenAI SDK" below.
+
+Version strings are Intel's archive versions exactly as they appear in the file names on <https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/>: `2026.4.1.0`, `2026.5.0.0beta1`, `2026.5.0.0.dev20260925`.
 
 Python is not needed for inference. It is needed only for `cascadia shard` — which works from the prebuilt binary too: the Python exporters are compiled into it and extracted at run time (see "Export-time Python" below).
 
@@ -61,11 +73,20 @@ Download the **OpenVINO GenAI 2026.2+** archive for your platform from Intel:
 - Archives: <https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/>
 - Or the Intel download center: <https://www.intel.com/content/www/us/en/developer/tools/openvino-toolkit/download.html>
 
-Pick the build matching your OS (e.g. `openvino_genai_ubuntu24_2026.2.0.0_x86_64.tar.gz`). Extract it and point `INTEL_OPENVINO_DIR` at the **extracted SDK root** — the directory that contains `runtime/`, `setupvars.sh`, etc.:
+Pick the build matching your OS (e.g. `openvino_genai_ubuntu24_2026.4.1.0_x86_64.tar.gz`). Extract it and point `INTEL_OPENVINO_DIR` at the **extracted SDK root** — the directory that contains `runtime/`, `setupvars.sh`, etc.:
 
 ```bash
-export INTEL_OPENVINO_DIR=/opt/intel/openvino_genai_2026.2.0.0
+export INTEL_OPENVINO_DIR=/opt/intel/openvino_genai_2026.4.1.0
 ```
+
+Or let the repo's resolver do it — it knows Intel's archive layout (stable, `beta/`, `nightly/`), proves the archive exists, checks the published sha256, and prints the SDK root. Any published version works, including a beta:
+
+```bash
+export INTEL_OPENVINO_DIR="$(python3 scripts/ov_sdk.py fetch 2026.4.1.0 --dest "$HOME/openvino/2026.4.1.0")"
+#                                                       2026.5.0.0beta1  for the beta, etc.
+```
+
+(`--os`/`--dist` default to this host; pass `--dist ubuntu22|ubuntu24|ubuntu26` on other Linux flavours. On Windows: `python scripts\ov_sdk.py fetch 2026.4.1.0 --dest C:\openvino\2026.4.1.0`.) The release bundles are built the same way from the `OV_VERSION` pin in `.github/workflows/release.yml`.
 
 > If you build with `--features openvino` and this isn't set (or points at the wrong place), the build now fails fast with an explanatory message instead of an opaque compile/link error.
 
@@ -105,7 +126,7 @@ On **macOS** there is no Intel GPU runtime — use stub mode for dev only.
 ### Build and verify
 
 ```bash
-INTEL_OPENVINO_DIR=/opt/intel/openvino_genai_2026.2.0.0 \
+INTEL_OPENVINO_DIR=/opt/intel/openvino_genai_2026.4.1.0 \
   cargo build --release -p cascadia --features openvino
 
 ./target/release/cascadia doctor   # should list a GPU device, not just CPU

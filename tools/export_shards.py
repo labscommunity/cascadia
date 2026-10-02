@@ -2042,11 +2042,10 @@ def main():
             f"byte-for-byte; --quantization is ignored).",
             flush=True,
         )
-        if args.layer_split is not None or args.stage is not None:
+        if args.stage is not None:
             print(
-                "ERROR: --layer-split/--stage are not supported for "
-                "qwen3_5-family models (stages split uniformly at "
-                "decoder-layer boundaries).",
+                "ERROR: --stage is not supported for qwen3_5-family models "
+                "(the IR surgery exports every stage in one pass).",
                 flush=True,
             )
             sys.exit(2)
@@ -2087,6 +2086,7 @@ def main():
             args.output_dir,
             num_stages=args.num_stages,
             validate=True,
+            layer_split=args.layer_split,
         )
         return
 

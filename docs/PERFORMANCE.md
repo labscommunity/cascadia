@@ -2,18 +2,18 @@
 
 Cascadia plumbs the OpenVINO plugin properties that materially affect LLM
 inference on Intel hardware through the `cascadia worker` CLI and into the
-OV-routed engines: `ov-genai`, `ov-runtime`, `gemma4`,
-`ov-dist-spec`, and the OV IRs in `sparse-moe`. (`qwen35` is intentionally
-excluded — it compiles with a fixed plugin config because some hints, e.g.
-`INFERENCE_PRECISION_HINT=f32` / `EXECUTION_MODE_HINT=ACCURACY`, break its
-IRs; see `qwen36.rs`.) All flags are opt-in: when unset, the engine builders
-behave exactly as before, so tuning never changes default behavior.
+OV-routed engines: `ov-genai`, `ov-runtime`, `gemma4`, `ov-dist-spec`,
+`qwen35`, and the OV IRs in `sparse-moe`. All flags are opt-in: when unset, the
+engine builders behave exactly as before, so tuning never changes default
+behavior.
 
-> **`sparse-moe`:** general hints reach its OV-compiled experts, but the same
-> `f32` / `ACCURACY` hints that break `qwen35` can also fail to compile
-> experts backed by f16-only fused kernels. OpenVINO surfaces that as a compile
-> error (not silent), so treat those two hints as experimental there and
-> benchmark before relying on them.
+> **`qwen35` / `sparse-moe`:** `INFERENCE_PRECISION_HINT=f32` and
+> `EXECUTION_MODE_HINT=ACCURACY` fail to compile on Intel Arc GPUs for IRs
+> backed by f16-only fused kernels — `qwen35`'s fused MoE gemm
+> (`MOE3GemmFusedCompressed`, see `qwen36.rs`) and some `sparse-moe` experts.
+> The hints are forwarded and OpenVINO surfaces that as a compile error (not
+> silent), so treat those two hints as experimental there and benchmark before
+> relying on them.
 
 Each general flag maps to an `ov::AnyMap` entry handed to the OV compile step —
 `ov::Core::compile_model` for the raw engines, the `ov::genai::LLMPipeline`
@@ -26,8 +26,7 @@ against their allowed values at the CLI.
 
 ### General hints
 
-Forwarded to whichever OV-routed engine you select — all except
-`qwen35` (setting them there logs a warning and has no effect). `PERFORMANCE_HINT`,
+Forwarded to whichever OV-routed engine you select. `PERFORMANCE_HINT`,
 `INFERENCE_PRECISION_HINT`, and `EXECUTION_MODE_HINT` are plugin-agnostic;
 `NUM_STREAMS`, `INFERENCE_NUM_THREADS` (CPU-oriented), and
 `ALLOW_AUTO_BATCHING` (GPU/AUTO) are only effective on the plugins that own

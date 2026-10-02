@@ -397,6 +397,16 @@ int32_t cascadia_core_get_property(
     const char* device, const char* property,
     char* out_buf, size_t out_cap, size_t* out_len);
 
+/// OpenVINO versions, four '\n'-separated fields:
+///   1. GenAI version this shim was COMPILED against (from version.hpp)
+///   2. core OpenVINO version this shim was compiled against
+///   3. GenAI runtime build string actually LOADED (ov::genai::get_version)
+///   4. core runtime build string actually loaded (ov::get_openvino_version)
+/// Lines 1-2 are compile-time constants; 3-4 come from the shared
+/// libraries the loader found, so a bundle whose lib/ was swapped shows
+/// up as a skew between them. Pass `(NULL, 0, &len)` to size-query.
+int32_t cascadia_ov_version(char* out_buf, size_t out_cap, size_t* out_len);
+
 #ifdef __cplusplus
 }
 #endif

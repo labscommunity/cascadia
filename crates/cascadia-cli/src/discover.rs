@@ -90,7 +90,7 @@ pub async fn cmd_discover(args: DiscoverArgs) -> Result<()> {
     );
     println!("{}", "-".repeat(86));
     for p in &peers {
-        let addr = format!("{}:{}", p.host, p.port);
+        let addr = relay_addr(&p.host, p.port);
         let engines = if p.engines.is_empty() {
             "-".to_string()
         } else {
@@ -102,9 +102,47 @@ pub async fn cmd_discover(args: DiscoverArgs) -> Result<()> {
         );
     }
     println!();
-    println!(
-        "Pass a peer's host:port to a worker's --next, e.g. --next {}:{}",
-        peers[0].host, peers[0].port
-    );
+    if let Some(p) = peers.iter().find(|p| has_tcp_relay(p.port)) {
+        println!(
+            "Pass a peer's host:port to a worker's --next, e.g. --next {}:{}",
+            p.host, p.port
+        );
+    }
+    if peers.iter().any(|p| !has_tcp_relay(p.port)) {
+        println!(
+            "(in-host unix) peers listen on a unix socket, not a TCP port: wire \
+             them from the same host with --next unix:/path.sock"
+        );
+    }
     Ok(())
+}
+
+/// A node advertising relay port 0 has no TCP relay endpoint: it is an
+/// in-host unix-socket stage (#17), so there is nothing to dial or probe
+/// at `host:0`.
+pub(crate) fn has_tcp_relay(port: u16) -> bool {
+    port != 0
+}
+
+/// The relay address column: `host:port`, or an in-host unix marker for a
+/// port-0 node (never the undialable `host:0`).
+fn relay_addr(host: &str, port: u16) -> String {
+    if has_tcp_relay(port) {
+        format!("{host}:{port}")
+    } else {
+        format!("{host} (in-host unix)")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_zero_renders_as_in_host_unix_not_host_zero() {
+        assert!(has_tcp_relay(9100));
+        assert!(!has_tcp_relay(0));
+        assert_eq!(relay_addr("10.0.0.2", 9100), "10.0.0.2:9100");
+        assert_eq!(relay_addr("10.0.0.2", 0), "10.0.0.2 (in-host unix)");
+    }
 }

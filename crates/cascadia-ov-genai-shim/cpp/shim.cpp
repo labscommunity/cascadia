@@ -30,6 +30,8 @@
 #include <openvino/genai/visual_language/pipeline.hpp>
 #include <openvino/genai/continuous_batching_pipeline.hpp>
 #include <openvino/genai/chat_history.hpp>
+#include <openvino/genai/version.hpp>
+#include <openvino/core/version.hpp>
 
 namespace {
 
@@ -1624,6 +1626,32 @@ int32_t cascadia_core_get_property(
         return copy_name_to_buf(oss.str(), out_buf, out_cap, out_len);
     } catch (const std::exception& e) { set_last_error(e); return 1; }
     catch (...) { set_last_error("unknown exception in get_property"); return 1; }
+}
+
+#define CASCADIA_STR2(x) #x
+#define CASCADIA_STR(x) CASCADIA_STR2(x)
+
+int32_t cascadia_ov_version(char* out_buf, size_t out_cap, size_t* out_len) {
+    try {
+        std::string joined;
+        joined += CASCADIA_STR(OPENVINO_GENAI_VERSION_MAJOR) "."
+                  CASCADIA_STR(OPENVINO_GENAI_VERSION_MINOR) "."
+                  CASCADIA_STR(OPENVINO_GENAI_VERSION_PATCH);
+        joined.push_back('\n');
+        joined += CASCADIA_STR(OPENVINO_VERSION_MAJOR) "."
+                  CASCADIA_STR(OPENVINO_VERSION_MINOR) "."
+                  CASCADIA_STR(OPENVINO_VERSION_PATCH);
+        joined.push_back('\n');
+        // buildNumber looks like "2026.4.1.0-20466-7bb2e7f0e2b-releases/2026/4";
+        // keep it whole — the hash is what Intel asks for in bug reports.
+        const ov::Version genai = ov::genai::get_version();
+        joined += genai.buildNumber ? genai.buildNumber : "unknown";
+        joined.push_back('\n');
+        const ov::Version core = ov::get_openvino_version();
+        joined += core.buildNumber ? core.buildNumber : "unknown";
+        return copy_name_to_buf(joined, out_buf, out_cap, out_len);
+    } catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) { set_last_error("unknown exception in ov_version"); return 1; }
 }
 
 }  // extern "C"

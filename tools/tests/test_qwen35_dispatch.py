@@ -5,9 +5,10 @@ Run from the repo root with:
     python -m pytest tools/tests/test_qwen35_dispatch.py -v
 
 Both `qwen3_5_moe` (Qwen3.5/3.6) and dense `qwen3_5` (Qwen3.8) must route
-config-first to the IR-surgery exporter; the `--layer-split` guard fires
-BEFORE the surgery module is imported, so a stub dir with a config.json and
-an empty openvino_language_model.xml is enough (no openvino needed). A
+config-first to the IR-surgery exporter; the `--stage` guard fires BEFORE
+the surgery module is imported, so a stub dir with a config.json and an
+empty openvino_language_model.xml is enough (no openvino needed), and a
+stub `export_qwen36_moe` module catches what reaches `run_export`. A
 dense model that slipped past the dispatch would otherwise be silently
 mis-exported through the generic Qwen3 path ("qwen3_5" contains "qwen3").
 """
@@ -17,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import types
 
 import pytest
 
@@ -76,14 +78,30 @@ def _argv(model, out, *extra):
 def test_qwen35_family_dispatches_to_surgery(tmp_path, monkeypatch, capsys, outer, inner):
     model = _stub_ir(tmp_path / "ir", outer, inner)
     monkeypatch.setattr(
-        sys, "argv", _argv(model, tmp_path / "out", "--layer-split", "8"))
+        sys, "argv", _argv(model, tmp_path / "out", "--stage", "0"))
     with pytest.raises(SystemExit) as excinfo:
         export_shards.main()
     assert excinfo.value.code == 2
     out = capsys.readouterr().out
     assert "IR-surgery" in out, out
     assert outer in out, out
-    assert "--layer-split" in out, out
+    assert "--stage" in out, out
+
+
+@pytest.mark.parametrize("split", [None, "48"])
+def test_qwen35_dispatch_forwards_layer_split(tmp_path, monkeypatch, split):
+    model = _stub_ir(tmp_path / "ir", "qwen3_5", "qwen3_5_text")
+    calls = []
+    stub = types.ModuleType("export_qwen36_moe")
+    stub.run_export = lambda *a, **kw: calls.append((a, kw))
+    monkeypatch.setitem(sys.modules, "export_qwen36_moe", stub)
+    extra = ("--layer-split", split) if split is not None else ()
+    monkeypatch.setattr(sys, "argv", _argv(model, tmp_path / "out", *extra))
+    export_shards.main()
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args == (str(model), str(tmp_path / "out"))
+    assert kwargs == {"num_stages": 2, "validate": True, "layer_split": split}
 
 
 def test_qwen35_ir_dispatch_rejects_npu_target(tmp_path, monkeypatch):

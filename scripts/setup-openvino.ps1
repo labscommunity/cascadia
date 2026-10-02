@@ -38,8 +38,9 @@ if ($env:INTEL_OPENVINO_DIR -and (Test-Path (Join-Path $env:INTEL_OPENVINO_DIR '
     Write-Host "INTEL_OPENVINO_DIR: $env:INTEL_OPENVINO_DIR (looks valid)"
 } else {
     Write-Host "INTEL_OPENVINO_DIR: not set / not valid"
-    Write-Host "  Download the OpenVINO GenAI 2026.2+ SDK (see INSTALL.md) and set it, e.g.:"
-    Write-Host '    $env:INTEL_OPENVINO_DIR = "C:\openvino_genai_2026.2.0.0"'
+    Write-Host "  Fetch the OpenVINO GenAI SDK (2026.2+; releases bundle 2026.4.1.0) and set it, e.g.:"
+    Write-Host '    $env:INTEL_OPENVINO_DIR = python scripts\ov_sdk.py fetch 2026.4.1.0 --dest C:\openvino\2026.4.1.0'
+    Write-Host "  (any published version works, e.g. 2026.5.0.0beta1 — see INSTALL.md)"
 }
 
 Write-Host "`nNext:"

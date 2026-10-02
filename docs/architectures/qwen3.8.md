@@ -63,6 +63,10 @@ cascadia shard --model qwen3.8-27b --output-dir ./qwen38-2stage --num-stages 2
 cascadia run ./qwen38-2stage --engine qwen35 --device GPU --api :8000
 ```
 
+Stages split uniformly by default; `--layer-split` takes the first layer of
+stages 1..N-1 (half-open, same as the generic exporter), e.g.
+`--num-stages 2 --layer-split 48` for a 48/16 split. `--stage` is rejected.
+
 What changed versus the Qwen3.6-only exporter (`tools/qwen36_surgery/export_qwen36_moe.py`):
 
 - hidden size, layer count and per-layer attention type are read from the
@@ -72,7 +76,8 @@ What changed versus the Qwen3.6-only exporter (`tools/qwen36_surgery/export_qwen
 - every stage must own at least one full-attention layer (the orphan-state
   rewire needs a same-kind cache to redirect global mask/past-length reads
   onto) ⇒ **at most 16 stages** for the 64-layer 27B; the exporter refuses
-  finer splits up front.
+  finer splits — and any `--layer-split` that leaves a stage without a
+  full-attention layer — up front.
 - the manifest records `arch` (`qwen3_5`), `family`, `hidden_size`,
   `num_layers`, `layer_types`; the engine sizes its activation frames from
   `hidden_size` (5120 here; 2048 default for Qwen3.6-era manifests without it).

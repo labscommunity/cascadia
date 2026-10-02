@@ -209,6 +209,57 @@ fn check_openvino_env(r: &mut Report) {
     }
 }
 
+/// Which OpenVINO GenAI release is inside this binary — the SDK it was
+/// compiled against and the runtime libraries the loader actually picked up.
+/// Release bundles pin one version (see release.yml's `OV_VERSION`) and
+/// variants built against another carry an `-ov<version>` suffix, so this is
+/// how a bug report says which one it is. A skew between the two means the
+/// bundle's `lib/` (or PATH on Windows) is serving a different SDK than the
+/// binary was built for — flagged, since the C++ ABI is not stable across
+/// OpenVINO releases.
+fn check_ov_version(r: &mut Report) {
+    if !cfg!(feature = "openvino") {
+        return; // the stub line in check_ov_devices already says so
+    }
+    match cascadia_ov_genai_shim::ov_version() {
+        Ok(v) => {
+            let built = format!(
+                "built against GenAI {}, core {}",
+                v.built_genai, v.built_core
+            );
+            if v.genai_skew() {
+                r.line(
+                    Level::Warn,
+                    "OpenVINO GenAI",
+                    &format!("runtime {} but {built}", v.runtime_genai),
+                );
+                r.note(
+                    "The loaded libraries are a different OpenVINO release than this binary was",
+                );
+                r.note("compiled for. Use the lib/ shipped in the same bundle (Linux) or the DLLs");
+                r.note(
+                    "beside cascadia.exe (Windows); to change the OpenVINO version, pick a bundle",
+                );
+                r.note("built for it or rebuild from source against that SDK (INSTALL.md).");
+            } else {
+                r.line(
+                    Level::Ok,
+                    "OpenVINO GenAI",
+                    &format!("{} ({built})", v.runtime_genai),
+                );
+                r.note(&format!("core runtime {}", v.runtime_core));
+            }
+        }
+        Err(e) => {
+            r.line(
+                Level::Fail,
+                "OpenVINO GenAI",
+                &format!("version query failed: {e}"),
+            );
+        }
+    }
+}
+
 /// The heart of `doctor`: what devices can the OpenVINO runtime in THIS
 /// binary actually reach? Only meaningful when built with the openvino
 /// feature; the stub build reports that it can't check.
@@ -290,6 +341,7 @@ pub fn cmd_doctor(args: DoctorArgs) -> Result<()> {
 
     println!("\nOpenVINO:");
     check_openvino_env(&mut r);
+    check_ov_version(&mut r);
     check_ov_devices(&mut r);
 
     println!();

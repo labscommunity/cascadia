@@ -208,6 +208,46 @@ def test_stage_ranges_rejects_bad_total():
         sx.stage_ranges(64, 65)
 
 
+def test_stage_ranges_layer_split_is_half_open():
+    assert sx.stage_ranges(64, 2, "48") == [(0, 47), (48, 63)]
+    assert sx.stage_ranges(64, 3, " 16, 40 ") == [(0, 15), (16, 39), (40, 63)]
+    assert sx.stage_ranges(64, 4, "40,48,56") == [
+        (0, 39), (40, 47), (48, 55), (56, 63)
+    ]
+
+
+def test_stage_ranges_layer_split_rejects_wrong_count():
+    with pytest.raises(ValueError, match="needs 1 boundaries, got 2"):
+        sx.stage_ranges(64, 2, "16,48")
+    with pytest.raises(ValueError, match="needs 0 boundaries, got 1"):
+        sx.stage_ranges(64, 1, "48")
+
+
+def test_stage_ranges_empty_layer_split_is_not_uniform():
+    with pytest.raises(ValueError, match="--layer-split needs 1 boundaries, got 0"):
+        sx.stage_ranges(64, 2, "")
+
+
+@pytest.mark.parametrize(
+    "split", ["0", "64", "70", "-8", "48,40", "32,32", "4x"]
+)
+def test_stage_ranges_layer_split_rejects_invalid_boundaries(split):
+    total = len(split.split(",")) + 1
+    with pytest.raises(ValueError, match="--layer-split"):
+        sx.stage_ranges(64, total, split)
+
+
+def test_check_stage_ranges_rejects_a_layer_split_without_attention():
+    # Full attention sits at layers 3, 7, ..., 63: a stage of layer 0 alone
+    # (or of layer 61 alone) owns none.
+    spec = sx.spec_from_config(_qwen38_cfg())
+    sx.check_stage_ranges(spec, sx.stage_ranges(64, 2, "48"))
+    with pytest.raises(ValueError, match="stage0 .* owns no full_attention"):
+        sx.check_stage_ranges(spec, sx.stage_ranges(64, 2, "1"))
+    with pytest.raises(ValueError, match="stage1 .* owns no full_attention"):
+        sx.check_stage_ranges(spec, sx.stage_ranges(64, 3, "61,62"))
+
+
 def test_check_stage_ranges_requires_an_attention_layer_per_stage():
     spec = sx.spec_from_config(_qwen38_cfg())
     sx.check_stage_ranges(spec, sx.stage_ranges(64, 16))  # one attn layer each

@@ -120,19 +120,49 @@ impl Drop for CascadiaProc {
 pub struct MockPipeline {
     pub api_port: u16,
     pub stages: Vec<Child>,
+    /// `(rank, stderr log path)` parallel to `stages` (downstream-first),
+    /// so a stage that died can be reported with its own error output.
+    stage_logs: Vec<(usize, PathBuf)>,
 }
 
 impl MockPipeline {
     /// Spawn an N-stage mock pipeline on 127.0.0.1, downstream-first (each
     /// upstream needs its downstream listening before it connects).
     pub async fn spawn(stages: usize) -> Self {
+        let listen_addrs: Vec<String> = (0..stages)
+            .map(|_| format!("127.0.0.1:{}", pick_free_port()))
+            .collect();
+        Self::spawn_with_links(stages, &listen_addrs).await
+    }
+
+    /// Spawn an N-stage mock pipeline linked over Unix domain sockets
+    /// (`unix:/path.sock` --listen/--next, #17) instead of loopback TCP.
+    /// Unix-only.
+    #[cfg(unix)]
+    pub async fn spawn_uds(stages: usize) -> Self {
+        let dir = std::env::temp_dir().join("cascadia-e2e-uds");
+        let _ = std::fs::create_dir_all(&dir);
+        let pid = std::process::id();
+        let listen_addrs: Vec<String> = (0..stages)
+            .map(|rank| format!("unix:{}/p{pid}-r{rank}.sock", dir.display()))
+            .collect();
+        Self::spawn_with_links(stages, &listen_addrs).await
+    }
+
+    /// Shared spawner: `listen_addrs[rank]` is the address stage `rank`
+    /// listens on (TCP `host:port` or `unix:/path.sock`); stage N-1's
+    /// `--next` is `listen_addrs[N]`.
+    async fn spawn_with_links(stages: usize, listen_addrs: &[String]) -> Self {
         assert!(stages >= 1, "need at least one stage");
+        assert_eq!(listen_addrs.len(), stages);
         let bin = binary_path();
         assert!(bin.exists(), "cascadia binary not built ({:?})", bin);
 
         let api_port = pick_free_port();
-        let listen_ports: Vec<u16> = (0..stages).map(|_| pick_free_port()).collect();
         let mut procs = Vec::with_capacity(stages);
+        let mut stage_logs = Vec::with_capacity(stages);
+        static SPAWN_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SPAWN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         for rank in (0..stages).rev() {
             let is_first = rank == 0;
@@ -152,32 +182,53 @@ impl MockPipeline {
             ];
             if !is_first {
                 args.push("--listen".into());
-                args.push(format!("127.0.0.1:{}", listen_ports[rank]));
+                args.push(listen_addrs[rank].clone());
             }
             if !is_last {
                 args.push("--next".into());
-                args.push(format!("127.0.0.1:{}", listen_ports[rank + 1]));
+                args.push(listen_addrs[rank + 1].clone());
             }
             if is_first {
                 args.push("--api".into());
                 args.push(format!("127.0.0.1:{api_port}"));
             }
+            let log = std::env::temp_dir().join(format!(
+                "cascadia-e2e-p{}-s{seq}-r{rank}.stderr",
+                std::process::id()
+            ));
+            let stderr = std::fs::File::create(&log).expect("create stage stderr log");
             let child = Command::new(&bin)
                 .args(&args)
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .stderr(stderr)
                 .kill_on_drop(true)
                 .spawn()
                 .expect("spawn pipeline stage");
             procs.push(child);
+            stage_logs.push((rank, log));
             // No inter-stage sleep needed: stages are spawned downstream-first
             // and the activation transport retries its connect (every 500ms up
             // to DEFAULT_CONNECT_TIMEOUT = 30s), so an upstream simply waits out
-            // the gap until its downstream is bound and accepting.
+            // the gap until its downstream is bound and accepting. The same
+            // retry contract covers a not-yet-bound unix socket path.
         }
         Self {
             api_port,
             stages: procs,
+            stage_logs,
+        }
+    }
+
+    /// Panic if any stage process has exited, reporting its rank, exit
+    /// status and stderr. `/health` only probes rank 0's API, so a relay
+    /// rank that failed to parse its `--listen` address or died on startup
+    /// is otherwise invisible to the test.
+    pub fn assert_all_stages_alive(&mut self) {
+        for (child, (rank, log)) in self.stages.iter_mut().zip(&self.stage_logs) {
+            if let Some(status) = child.try_wait().expect("try_wait stage") {
+                let stderr = std::fs::read_to_string(log).unwrap_or_default();
+                panic!("stage rank {rank} exited early ({status}); stderr:\n{stderr}");
+            }
         }
     }
 
@@ -205,6 +256,9 @@ impl Drop for MockPipeline {
     fn drop(&mut self) {
         for c in &mut self.stages {
             let _ = c.start_kill();
+        }
+        for (_, log) in &self.stage_logs {
+            let _ = std::fs::remove_file(log);
         }
     }
 }
@@ -363,6 +417,76 @@ mod tests {
             .as_str()
             .expect("content string");
         assert!(!content.is_empty(), "pipeline produced empty completion");
+    }
+
+    /// Ask a pipeline's API for one deterministic mock completion; returns
+    /// the assistant content.
+    async fn chat_once(pipe: &MockPipeline, prompt: &str) -> String {
+        let client = reqwest::Client::new();
+        let body = serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 4,
+            "stream": false,
+        });
+        let r = client
+            .post(pipe.url("/v1/chat/completions"))
+            .json(&body)
+            .send()
+            .await
+            .expect("post chat");
+        assert!(r.status().is_success(), "chat status: {}", r.status());
+        let v: serde_json::Value = r.json().await.unwrap();
+        v["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content string")
+            .to_string()
+    }
+
+    /// #17: a 2-stage worker chain configured with `unix:` --listen/--next
+    /// comes up healthy, every stage stays alive, and it answers the same
+    /// as the TCP chain.
+    ///
+    /// Scope honesty: the MOCK engine's connect/configure_listen are
+    /// no-ops, so no activation tensors cross the socket here and output
+    /// equality with the TCP chain is expected by construction — this test
+    /// pins the CLI surface only (unix address parsing and worker startup
+    /// on EVERY rank, not just rank 0's API). The actual frame protocol
+    /// over a real UnixStream is exercised by
+    /// `cascadia-engine-sparse-moe/tests/dist_wire.rs::
+    /// uds_sequence_reset_then_forward_then_token` (engine wire) and the
+    /// `uds_*` tests in cascadia-transport (framing/timeout semantics).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uds_pipeline_matches_tcp_pipeline_output() {
+        let mut tcp = MockPipeline::spawn(2).await;
+        let mut uds = MockPipeline::spawn_uds(2).await;
+        assert!(
+            tcp.wait_for_health(Duration::from_secs(20)).await,
+            "TCP 2-stage pipeline did not become healthy"
+        );
+        assert!(
+            uds.wait_for_health(Duration::from_secs(20)).await,
+            "UDS 2-stage pipeline did not become healthy"
+        );
+        // /health only covers rank 0. Give the relay rank (the one with
+        // `--listen unix:`) a moment to fail on a bad address, then require
+        // every stage of both chains to still be running.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tcp.assert_all_stages_alive();
+        uds.assert_all_stages_alive();
+
+        let prompt = "alpha bravo charlie delta echo foxtrot";
+        let tcp_out = chat_once(&tcp, prompt).await;
+        let uds_out = chat_once(&uds, prompt).await;
+        assert!(!uds_out.is_empty(), "UDS chain produced empty completion");
+        assert_eq!(
+            tcp_out, uds_out,
+            "UDS chain output diverged from the TCP chain (CLI-surface parity)"
+        );
+        // And nobody died while serving the request.
+        tcp.assert_all_stages_alive();
+        uds.assert_all_stages_alive();
     }
 
     /// Cross-node sharded e2e: brings up an N-stage topology across real fleet

@@ -100,15 +100,77 @@ cascadia worker --rank <N> --total <N> --model <DIR> [OPTIONS]
 | `--rank <RANK>` | *required* | 0-based stage index. |
 | `--total <TOTAL>` | *required* | Total number of stages. |
 | `--model <MODEL>` | *required* | Local model directory. Not an HF repo id. |
-| `--listen <LISTEN>` | `:9100` | Bind address for the upstream-receiving socket. |
-| `--next <NEXT>` | — | Downstream peer `host:port`. Required for every stage but the last. |
-| `--api <API>` | — | API bind address. **Rank 0 only** — other ranks enter the relay loop and never bind it. Passing it there logs a warning and is otherwise ignored. |
+| `--listen <LISTEN>` | `:9100` | Bind address for the upstream-receiving socket: `host:port`, `:port`, or a [unix socket](#unix-domain-sockets) `unix:/path.sock`. |
+| `--next <NEXT>` | — | Downstream peer: `host:port` or `unix:/path.sock`. Required for every stage but the last. |
+| `--api <API>` | — | API bind address (TCP only). **Rank 0 only** — other ranks enter the relay loop and never bind it. Passing it there logs a warning and is otherwise ignored. |
 | `--engine <ENGINE>` | `mock` | Inference engine. `mock` runs without OpenVINO. |
 | `--device <DEVICE>` | `CPU` | OpenVINO device target — see [below](#device-forms). |
 
 Rank 0 serves the API and holds the first layers; the last rank produces tokens
 and returns them up the chain. Start the *downstream* worker first — engines
 wait 60 s for a downstream peer, then give up.
+
+### Unix domain sockets
+
+When two adjacent stages run on the SAME host (iGPU stage 0 → dGPU stage 1 on
+one workstation, or single-box stage testing), link them over a Unix domain
+socket instead of loopback TCP ([#17](https://github.com/labscommunity/cascadia/issues/17)):
+
+```bash
+# stage 1 (start first)
+cascadia worker --rank 1 --total 2 --model <DIR> --listen unix:/tmp/cascadia-1.sock
+
+# stage 0
+cascadia worker --rank 0 --total 2 --model <DIR> --next unix:/tmp/cascadia-1.sock --api :8416
+```
+
+Address forms recognized for `--listen`/`--next` (and for each entry of
+`--ep-workers`, the Inkling expert-parallel driver's worker list):
+`unix:/path.sock` (explicit), an absolute path, or any `.sock`-suffixed path.
+The wire format is identical to TCP; the two stages must simply agree on the
+path.
+
+`/tmp` is used above for brevity. For real deployments put the socket in a
+private directory — `$XDG_RUNTIME_DIR` or a `0700` directory you own — so
+other local users can't plant or race a file at that path. The path must fit
+in `sun_path` (104 bytes on macOS, 108 on Linux); a longer one is rejected at
+startup with a clear error.
+
+Measured round-trip latency vs `127.0.0.1` TCP (Apple Silicon macOS, release
+build, `cargo test -p cascadia-transport --release --test uds_vs_tcp_bench --
+--ignored --nocapture`):
+
+| Frame | TCP p50 | UDS p50 | Win |
+|---|---|---|---|
+| 14 KiB (decode-step hidden state) | ~32–55 µs | ~4–5 µs | ~85–92 % |
+| 1 MiB (prefill/logits class) | ~145–180 µs | ~108–111 µs | ~24–40 % |
+
+Notes:
+
+- Unix only (Linux/macOS). On Windows a `unix:` address fails fast with a
+  clear error; use TCP there.
+- The socket file is set to mode `0600` (owner-only) before the listener
+  accepts any connection.
+- Ownership of the `--listen` path is an flock on `<path>.lock`, held for
+  the worker's lifetime and released by the kernel when it exits (however it
+  exits). While another worker holds it, a new worker refuses to start with
+  an address-in-use error and leaves the live socket alone. With the lock
+  free, a socket file left at the path (by a crash) is stale and is reclaimed
+  — unlinked and re-bound. A **non-socket** file is never deleted — the
+  worker refuses to start instead. The empty `.lock` file stays next to the
+  socket and is reused by the next worker on that path.
+- On a clean close (or when the server is dropped) the worker unlinks the
+  socket file, but only if the path still refers to the socket it bound
+  (inode check), so it never removes a successor's socket. Relay ranks
+  (every rank without `--api`) install no SIGTERM/SIGINT handler, so `kill`
+  or Ctrl-C ends them without that cleanup and the file is left behind; it
+  is reclaimed by the stale-socket path above on the next start.
+- `--api` stays TCP; unix addresses are for the inter-stage activation
+  relay only.
+- Cross-host topology probing doesn't apply: a UDS-listening stage
+  advertises no TCP relay port over mDNS (port `0`), peers don't
+  latency-probe it, and `cascadia discover` labels it as an in-host unix
+  link rather than suggesting a `--next host:port` for it.
 
 ### Layer split
 
@@ -136,8 +198,37 @@ a few each. MiniMax-M2 `sparse-moe` only.
 | `--ov-execution-mode <MODE>` | — | `ACCURACY` / `PERFORMANCE`. |
 | `--prefix-cache-gb <GB>` | min(16, RAM/4) | `qwen35` only, single-process (`--total 1`): byte budget of the chain-state prefix cache; a Qwen3.8-27B snapshot is ~130 KB per context token as serialised (1.2 GB at 8 K, 4.45 GB at 32 K). `0` disables. See [qwen3.8.md](architectures/qwen3.8.md). |
 | `--api-max-body-mb <MB>` | `1` | Largest `/v1/chat/completions` body (MiB); the rendered prompt is capped alike. Was a fixed 64 KiB / 32 KiB (~8K tokens) before. `qwen35` additionally rejects prompts at or past `max_position_embeddings` (413). |
-| `--ep-workers <host:port,...>` | — | `sparse-moe` (Inkling) expert-parallel **driver**: dispatch each MoE layer's selected experts to these running workers; this rank runs every layer's attention/router locally and holds no expert weights. Implies `--total 1`. Start the workers first. |
+| `--ep-workers <host:port,...>` | — | `sparse-moe` (Inkling) expert-parallel **driver**: dispatch each MoE layer's selected experts to these running workers (each entry may also be a [unix socket](#unix-domain-sockets) `unix:/path.sock`); this rank runs every layer's attention/router locally and holds no expert weights. Implies `--total 1`. Start the workers first. |
 | `--ep-worker-index <N>` / `--ep-worker-count <W>` | — | `sparse-moe` (Inkling) expert-parallel **worker**: serve expert shard N of W (experts with `id % W == N`, shared experts included) for every MoE layer on `--listen`; no API, no attention, no sequence state. |
+| `--ov-config <KEY=VALUE>` | — | Raw OV plugin property passthrough, repeatable. See below. |
+| `--elastic` | off | Elastic memory posture (Linux; file-backed big allocations). See below. |
+| `--elastic-min-mb <MB>` | 1 | Elastic threshold; 16 = weights-only, zero speed cost. |
+| `--elastic-pool-mb <MB>` | 8192 | Elastic retained-mapping pool cap (0 = off). |
+
+**`--ov-config KEY=VALUE`** forwards any plugin property to OpenVINO verbatim,
+alongside the typed `--ov-*` flags — the escape hatch for knobs without a
+dedicated flag (`--ov-config KV_CACHE_PRECISION=u8`,
+`--ov-config DYNAMIC_QUANTIZATION_GROUP_SIZE=0`). Repeatable; applied last, so it
+overrides a typed flag setting the same key. The value may contain `=` (split on
+the first only). Malformed entries (no `=`, empty key) are rejected at parse
+time; OV itself validates the key/value. NPU-prefixed keys are gated to an NPU
+device + `--engine ov-genai`, like the typed NPU flags. Cross-platform.
+
+**`--elastic`** serves large allocations from file-backed mappings so the
+worker's weight copies, KV state and scratch are kernel-reclaimable rather than
+committed. Measured on unmodified OpenVINO CPU workers (ramlab exp 199): Linux
+2064→506 MB committed at −1% decode (`--elastic-min-mb 16` → 1549 MB at parity);
+Windows 1329→223 MB private commit at −6% decode. Same file-backed mechanism,
+different injection vector: **Linux** re-execs the worker once with an allocator
+interposer `LD_PRELOAD`ed (serving PID unchanged via execv; logs `elastic
+posture active`); **Windows** inline-hooks the UCRT allocation family
+(`malloc`/`free`/`realloc`/`calloc`/`_msize` + `_aligned_*`) in-process with
+Microsoft Detours before the OV engine loads (logs `elastic posture active
+(in-process)`). The OV-native knobs cannot substitute — they cannot disable
+oneDNN's dirty repacked copies (D-004) — so `--elastic` still asserts
+`ENABLE_MMAP=YES` to keep the weight blob clean but relies on the interposer for
+the cut. The Windows hook is compiled in only when `cascadia-elastic` was built
+with `DETOURS_DIR` set; otherwise `--elastic` reports inactive there.
 
 **`--ov-cache-dir` is on by default and matters.** For `ov-genai`, `ov-runtime`,
 `gemma4` and `sparse-moe`, leaving it unset defaults to

@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.2.5](https://github.com/labscommunity/cascadia/compare/v0.2.4...v0.2.5) (2026-10-01)
+
+
+### Features
+
+* **qwen35:** forward --ov-* plugin properties + exporter --layer-split ([f8eac1f](https://github.com/labscommunity/cascadia/commit/f8eac1fefbb0c9554e54c804b70c41c97c840cd4))
+* **qwen35:** forward --ov-* plugin properties; exporter --layer-split ([8f5bed1](https://github.com/labscommunity/cascadia/commit/8f5bed125b5844f0fb8d2f58ba20b490c1c092f5))
+* **shard:** forward --layer-split to the qwen3_5 exporter ([a07dde7](https://github.com/labscommunity/cascadia/commit/a07dde7069cdd1481a6087493fc39dd41509324a))
+* **transport:** Unix domain socket activation links for in-host pipeline stages ([#17](https://github.com/labscommunity/cascadia/issues/17)) ([8a9f50c](https://github.com/labscommunity/cascadia/commit/8a9f50c25bec8e186a69da4c6c1ef4a349ae6ea5))
+* **transport:** Unix domain socket activation links for in-host stages ([#17](https://github.com/labscommunity/cascadia/issues/17)) ([733b3c7](https://github.com/labscommunity/cascadia/commit/733b3c78b60b340f91c9fe73561acb828bb3561d))
+
+
+### Bug Fixes
+
+* **cli:** don't probe or suggest --next for port-0 (unix) stages ([59f36ad](https://github.com/labscommunity/cascadia/commit/59f36ad0063b61084a2a2defe575fa1c37d08250))
+* **cli:** reject empty unix: address and single-source the UDS rule ([e4d9789](https://github.com/labscommunity/cascadia/commit/e4d9789307e812ab5902dcc3e533242a31a18c01))
+* **cli:** stop warning that qwen35 ignores --ov-* flags ([fef2735](https://github.com/labscommunity/cascadia/commit/fef27359d2a14d653ea24ba66964610dfc749ac9))
+* **ov-genai-shim:** register tokenizers extension on Core for runtime compile path ([462f077](https://github.com/labscommunity/cascadia/commit/462f077b9b456b4e5b5272fee019781e8fe2c5e4))
+* **qwen35-export:** validate --layer-split boundaries up front ([3f0e1be](https://github.com/labscommunity/cascadia/commit/3f0e1befa45ba42b0bdde4e0fe4d8e6e920be81a))
+* **qwen35:** extend ov_properties like other builders; test plugin config ([66145c8](https://github.com/labscommunity/cascadia/commit/66145c83ae0dfc6ca2740275df88d36c57c36593))
+* **transport:** chmod the unix socket before it starts listening ([9e5001e](https://github.com/labscommunity/cascadia/commit/9e5001e8fb5c91a2a08a147bbac7fe2e88592857))
+* **transport:** decide unix socket ownership with a path lock, not a probe ([9c03ef7](https://github.com/labscommunity/cascadia/commit/9c03ef76918031c0a5f62fc5c5ec78412b1d3867))
+* **transport:** fail fast on deterministic unix connect errors ([9a719d9](https://github.com/labscommunity/cascadia/commit/9a719d91464088009910376a62e47ca42791de1b))
+* **transport:** never unlink a live or foreign unix socket ([341448a](https://github.com/labscommunity/cascadia/commit/341448a513eeef52092b0dddf2ede18023aaf738))
+
+
+### Documentation
+
+* correct Unix domain socket lifecycle and scope claims ([82d6993](https://github.com/labscommunity/cascadia/commit/82d699360f6a6c620046fa0861228a6fb65c66a9))
+
+
+### Testing
+
+* **cli:** cover parse_addr, unix --api rejection and mixed --ep-workers ([3fa990f](https://github.com/labscommunity/cascadia/commit/3fa990fc911fc6b8740c43fb5d3eacf66c55982c))
+* **e2e:** assert every UDS chain stage stays alive ([552dd24](https://github.com/labscommunity/cascadia/commit/552dd24774da646f02dbf913891dbbfd35cf700f))
+* **transport:** run the recv-deadline and stall tests over unix sockets ([566cc85](https://github.com/labscommunity/cascadia/commit/566cc853c87e27d844e71e490d3061f4472982e8))
+
 ## [0.2.4](https://github.com/labscommunity/cascadia/compare/v0.2.3...v0.2.4) (2026-09-17)
 
 

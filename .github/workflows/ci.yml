@@ -18,9 +18,11 @@ permissions:
   contents: read
 
 env:
-  # Must match release.yml's OV_LINUX_URL — linux-openvino-check below
-  # pre-flights that build, and a version skew would quietly un-mirror it.
-  OV_LINUX_URL: https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/2026.2/linux/openvino_genai_ubuntu22_2026.2.0.0_x86_64.tar.gz
+  # Must match release.yml's OV_VERSION — linux-openvino-check below
+  # pre-flights that build, and a version skew would quietly un-mirror it
+  # (the `pin-consistency` step in the test job fails if they drift).
+  # scripts/ov_sdk.py turns the version into the archive URL.
+  OV_VERSION: "2026.4.1.0"
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
@@ -95,6 +97,17 @@ jobs:
         # legacy shard configs. Promote to `-D warnings` once those
         # are tagged with `#[allow(dead_code)]` or actually used.
         run: cargo clippy --workspace --all-targets
+
+      - name: OpenVINO SDK pin consistency + resolver unit tests
+        # release.yml and this file each carry OV_VERSION; a drift would
+        # ship bundles against one SDK while CI pre-flights another.
+        run: |
+          rel="$(grep -E '^  OV_VERSION: ' .github/workflows/release.yml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+          if [ "$rel" != "$OV_VERSION" ]; then
+            echo "::error::OV_VERSION differs: ci.yml=$OV_VERSION release.yml=$rel"; exit 1
+          fi
+          echo "OV_VERSION $OV_VERSION (release.yml agrees)"
+          python3 -m unittest scripts/test_ov_sdk.py
 
       - name: Build cascadia binary (needed by e2e tests)
         # tests-e2e exec the cascadia binary directly; without this they
@@ -217,10 +230,9 @@ jobs:
 
       - name: Download + extract OpenVINO GenAI SDK (linux)
         run: |
-          mkdir -p "$RUNNER_TEMP/ov"
-          curl -fSL "$OV_LINUX_URL" -o "$RUNNER_TEMP/ov.tgz"
-          tar -xzf "$RUNNER_TEMP/ov.tgz" -C "$RUNNER_TEMP/ov" --strip-components=1
-          echo "INTEL_OPENVINO_DIR=$RUNNER_TEMP/ov" >> "$GITHUB_ENV"
+          # ubuntu22 archive ↔ ubuntu-22.04 runner, same as release.yml.
+          root="$(python3 scripts/ov_sdk.py fetch "$OV_VERSION" --os linux --dist ubuntu22 --dest "$RUNNER_TEMP/ov")"
+          echo "INTEL_OPENVINO_DIR=$root" >> "$GITHUB_ENV"
 
       - name: Check Linux openvino build (no upload)
         env:

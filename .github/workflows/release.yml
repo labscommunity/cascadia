@@ -26,11 +26,20 @@
 #          inference). So hosted runners suffice and releases don't depend on the
 #          self-hosted AI-PCs being online.
 #
-# ┌─ OpenVINO GenAI SDK archives ──────────────────────────────────────────────┐
-# │ Both URLs in `env:` below were probed 2026-07-06 and return HTTP 206 (they  │
-# │ exist). When bumping the version, re-confirm against the storage index:     │
-# │   https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/│
-# │ Keep the Linux archive's OS matched to the runner (ubuntu22 ↔ ubuntu-22.04) │
+# ┌─ OpenVINO GenAI SDK ───────────────────────────────────────────────────────┐
+# │ `OV_VERSION` in `env:` below is the ONE place the bundled SDK release is   │
+# │ pinned (ci.yml carries a copy that must match; CI fails if they drift).    │
+# │ scripts/ov_sdk.py derives the archive URLs from it and proves each exists  │
+# │ with a ranged GET (the storage host answers 200 + an HTML placeholder for  │
+# │ missing paths, so a plain HEAD proves nothing).                            │
+# │ Other versions, without touching this file:                                │
+# │   • workflow_dispatch input `ov_version` builds that SDK instead (e.g. a   │
+# │     beta such as 2026.5.0.0beta1); its bundles are named …-ov<version>.…   │
+# │   • repository variable OV_EXTRA_VERSIONS (comma-separated) adds those     │
+# │     variants to every automatic release, next to the default bundles.     │
+# │   • `dry_run` builds the bundles as workflow artifacts and never touches a │
+# │     release — try an SDK before pinning it, or build from a branch.        │
+# │ Keep the Linux archive's OS matched to the runner (ubuntu22 ↔ ubuntu-22.04)│
 # │ so the prebuilt SDK's glibc/ABI lines up with what we link against.         │
 # └────────────────────────────────────────────────────────────────────────────┘
 
@@ -46,12 +55,33 @@ on:
         description: "Existing tag to build (e.g. v0.2.0)."
         required: true
         type: string
+      ov_version:
+        description: "OpenVINO GenAI SDK version to bundle instead of OV_VERSION (e.g. 2026.5.0.0beta1)."
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: "Build bundles as workflow artifacts only; never touch a release."
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build (e.g. v0.2.0). Must already exist."
-        required: true
+        description: "Existing tag to build (e.g. v0.2.0). May be empty only with dry_run (builds this branch)."
+        required: false
         type: string
+        default: ""
+      ov_version:
+        description: "OpenVINO GenAI SDK version to bundle instead of the pinned stable (e.g. 2026.5.0.0beta1). Empty = OV_VERSION."
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: "Build the bundles as workflow artifacts only; never touch a release."
+        required: false
+        type: boolean
+        default: false
 
 # Never cancel a half-published release mid-upload. Key on the tag being built.
 # `inputs.tag` covers both workflow_call and workflow_dispatch; on tag pushes
@@ -65,21 +95,81 @@ permissions:
   contents: read
 
 env:
-  # OpenVINO GenAI SDK archives (the single source of truth for the version).
-  # To bump: edit BOTH full URLs here plus OV_LINUX_URL in ci.yml (the Linux
-  # release pre-flight must stay in lockstep), and re-confirm them against
-  # the storage index in the header banner above.
-  OV_LINUX_URL: "https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/2026.2/linux/openvino_genai_ubuntu22_2026.2.0.0_x86_64.tar.gz"
-  OV_WINDOWS_URL: "https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/2026.2/windows/openvino_genai_windows_2026.2.0.0_x86_64.zip"
+  # The OpenVINO GenAI SDK release bundled by default: the newest STABLE
+  # release validated on the fleet (single source of truth — see the banner
+  # above; scripts/ov_sdk.py turns it into the per-OS archive URLs). Keep
+  # ci.yml's OV_VERSION identical; its pin-consistency step enforces it.
+  OV_VERSION: "2026.4.1.0"
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
 jobs:
+  # ── Decide what to build: which OpenVINO GenAI SDK version(s), the bundle
+  #    version label, and whether this is a dry run. One tiny read-only job so
+  #    both build jobs share one answer and a bad input fails before anything
+  #    is downloaded or built.
+  plan:
+    name: plan (OpenVINO versions)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      versions: ${{ steps.plan.outputs.versions }}
+      default: ${{ steps.plan.outputs.default }}
+      dry_run: ${{ steps.plan.outputs.dry_run }}
+      ver: ${{ steps.plan.outputs.ver }}
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      REQUESTED: ${{ inputs.ov_version }}
+      EXTRA: ${{ vars.OV_EXTRA_VERSIONS }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - id: plan
+        run: |
+          # An explicit `ov_version` builds exactly that; otherwise the pinned
+          # default plus any OV_EXTRA_VERSIONS variants (deduplicated).
+          if [ -n "${REQUESTED:-}" ]; then list="$REQUESTED"; else list="$OV_VERSION,${EXTRA:-}"; fi
+          versions=()
+          IFS=',' read -ra parts <<< "$list"
+          for v in "${parts[@]}"; do
+            v="$(printf '%s' "$v" | tr -d '[:space:]')"
+            [ -z "$v" ] && continue
+            # Shape check: the value reaches shell steps below (via env) and
+            # file names, so it must be a plain archive version string.
+            if ! printf '%s' "$v" | grep -Eq '^[0-9]{4}\.[0-9]+(\.[0-9]+){0,2}[0-9A-Za-z.]*$'; then
+              echo "::error::not an OpenVINO GenAI archive version: '$v' (want e.g. 2026.4.1.0 or 2026.5.0.0beta1)"
+              exit 1
+            fi
+            case " ${versions[*]:-} " in *" $v "*) ;; *) versions+=("$v") ;; esac
+          done
+          json="$(printf '%s\n' "${versions[@]}" | jq -R . | jq -cs .)"
+          # Bundle version label: the tag without its 'v'; a dry run from a
+          # branch (no tag) is labelled by commit instead.
+          if printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            ver="${TAG#v}"
+          elif [ "${DRY_RUN:-false}" = "true" ]; then
+            ver="dev-${GITHUB_SHA:0:7}"
+          else
+            echo "::error::no vMAJOR.MINOR.PATCH tag to build (got '$TAG'); pass one, or set dry_run"
+            exit 1
+          fi
+          {
+            echo "versions=$json"
+            echo "default=$OV_VERSION"
+            echo "dry_run=${DRY_RUN:-false}"
+            echo "ver=$ver"
+          } >> "$GITHUB_OUTPUT"
+          echo "OpenVINO GenAI versions to bundle: $json (pinned default $OV_VERSION); bundle label $ver; dry_run=${DRY_RUN:-false}"
+
   # ── Validate the tag and make sure a Release exists to upload into.
   #    release-please normally created the pre-release already; a hand-pushed
   #    hotfix tag won't have one, so create it here. Idempotent either way.
+  #    Skipped on a dry run: nothing is published.
   ensure-release:
     name: validate tag + ensure release
+    needs: plan
+    if: ${{ needs.plan.outputs.dry_run != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -111,7 +201,7 @@ jobs:
   #    packages' lifecycle scripts. This job can only read the repo.
   build-spa:
     name: dashboard SPA
-    needs: ensure-release
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -140,8 +230,14 @@ jobs:
           retention-days: 1
 
   build-linux:
-    name: linux-x86_64 (openvino)
-    needs: [ensure-release, build-spa]
+    name: linux-x86_64 (openvino ${{ matrix.ov_version }})
+    needs: [plan, ensure-release, build-spa]
+    # Runs after a skipped ensure-release on a dry run, never after a failure.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build-spa.result == 'success' && (needs.plan.outputs.dry_run == 'true' || needs.ensure-release.result == 'success') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        ov_version: ${{ fromJSON(needs.plan.outputs.versions) }}
     # ubuntu-22.04 → glibc 2.35 floor, and matches the ubuntu22 OV archive.
     runs-on: ubuntu-22.04
     timeout-minutes: 60
@@ -149,6 +245,10 @@ jobs:
       contents: write
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
+      VER: ${{ needs.plan.outputs.ver }}
+      OV_VERSION_SELECTED: ${{ matrix.ov_version }}
+      OV_VERSION_DEFAULT: ${{ needs.plan.outputs.default }}
+      DRY_RUN: ${{ needs.plan.outputs.dry_run }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -171,14 +271,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y g++-12
 
-      - name: Download + extract OpenVINO GenAI SDK
+      - name: Download + extract OpenVINO GenAI SDK ${{ matrix.ov_version }}
         run: |
-          mkdir -p "$RUNNER_TEMP/ov"
-          curl -fSL "$OV_LINUX_URL" -o "$RUNNER_TEMP/ov.tgz"
-          # Archive has a single top-level SDK dir; --strip-components lands its
-          # contents (runtime/, setupvars.sh, …) directly under $RUNNER_TEMP/ov.
-          tar -xzf "$RUNNER_TEMP/ov.tgz" -C "$RUNNER_TEMP/ov" --strip-components=1
-          echo "INTEL_OPENVINO_DIR=$RUNNER_TEMP/ov" >> "$GITHUB_ENV"
+          # Resolves the archive URL from the version (proving it exists),
+          # verifies Intel's published sha256, and lands the SDK root
+          # (runtime/, setupvars.sh, …) at --dest.
+          root="$(python3 scripts/ov_sdk.py fetch "$OV_VERSION_SELECTED" --os linux --dist ubuntu22 --dest "$RUNNER_TEMP/ov")"
+          echo "INTEL_OPENVINO_DIR=$root" >> "$GITHUB_ENV"
 
       # Built by the build-spa job; web/dist is generated, not checked in.
       # If this step is ever dropped, cascadia-dashboard's build script fails
@@ -204,8 +303,10 @@ jobs:
       - name: Package bundle
         id: pkg
         run: |
-          ver="${TAG#v}"
-          name="cascadia-${ver}-linux-x86_64"
+          # Bundles built against the pinned default keep the plain name;
+          # any other SDK version is spelled out so both can sit on one release.
+          name="cascadia-${VER}-linux-x86_64"
+          if [ "$OV_VERSION_SELECTED" != "$OV_VERSION_DEFAULT" ]; then name="$name-ov$OV_VERSION_SELECTED"; fi
           dest="$RUNNER_TEMP/$name"
           mkdir -p "$dest/lib"
           cp target/release/cascadia "$dest/"
@@ -224,22 +325,61 @@ jobs:
           cp INSTALL.md README.md LICENSE THIRD_PARTY_NOTICES.md "$dest/"
           tar -czf "$RUNNER_TEMP/$name.tar.gz" -C "$RUNNER_TEMP" "$name"
           echo "asset=$RUNNER_TEMP/$name.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "dir=$dest" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke-test the bundle (bundled runtime loads, version matches)
+        env:
+          BUNDLE_DIR: ${{ steps.pkg.outputs.dir }}
+        run: |
+          # Exactly what a user does: run from the unpacked dir, no SDK env,
+          # no setupvars — rpath $ORIGIN/lib must resolve every library, and
+          # doctor must report the SDK release this bundle claims to carry.
+          # The one system library the bundle relies on is the OpenCL ICD
+          # loader (libopenvino_genai.so imports libOpenCL.so.1 — INSTALL.md);
+          # hosted runners don't have it, users' Intel boxes do.
+          sudo apt-get install -y --no-install-recommends ocl-icd-libopencl1 >/dev/null
+          out="$(cd "$BUNDLE_DIR" && ./cascadia doctor)" || true
+          printf '%s\n' "$out" | sed -n '/^OpenVINO:/,$p'
+          want="$(printf '%s' "$OV_VERSION_SELECTED" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')"
+          printf '%s\n' "$out" | grep -q "OpenVINO GenAI.*$want" \
+            || { echo "::error::doctor did not report OpenVINO GenAI $want from the bundled lib/"; exit 1; }
+          printf '%s\n' "$out" | grep -q "OpenVINO devices.*CPU" \
+            || { echo "::error::doctor did not enumerate the CPU device from the bundled runtime"; exit 1; }
 
       - name: Upload bundle to release
+        if: ${{ env.DRY_RUN != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: gh release upload "$TAG" "${{ steps.pkg.outputs.asset }}" --clobber
 
+      - name: Keep bundle as a workflow artifact (dry run)
+        if: ${{ env.DRY_RUN == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bundle-linux-x86_64-ov${{ matrix.ov_version }}
+          path: ${{ steps.pkg.outputs.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
   build-windows:
-    name: windows-x86_64 (openvino)
-    needs: [ensure-release, build-spa]
+    name: windows-x86_64 (openvino ${{ matrix.ov_version }})
+    needs: [plan, ensure-release, build-spa]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build-spa.result == 'success' && (needs.plan.outputs.dry_run == 'true' || needs.ensure-release.result == 'success') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        ov_version: ${{ fromJSON(needs.plan.outputs.versions) }}
     runs-on: windows-latest
     timeout-minutes: 60
     permissions:
       contents: write
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
+      VER: ${{ needs.plan.outputs.ver }}
+      OV_VERSION_SELECTED: ${{ matrix.ov_version }}
+      OV_VERSION_DEFAULT: ${{ needs.plan.outputs.default }}
+      DRY_RUN: ${{ needs.plan.outputs.dry_run }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -262,14 +402,12 @@ jobs:
 
       # MSVC (VS 2022 Build Tools) is preinstalled on windows-latest; cc-rs
       # locates it via vswhere, so no Developer Command Prompt is needed here.
-      - name: Download + extract OpenVINO GenAI SDK
+      - name: Download + extract OpenVINO GenAI SDK ${{ matrix.ov_version }}
         shell: pwsh
         run: |
-          $tmp = $env:RUNNER_TEMP
-          Invoke-WebRequest -Uri $env:OV_WINDOWS_URL -OutFile "$tmp/ov.zip"
-          Expand-Archive -Path "$tmp/ov.zip" -DestinationPath "$tmp/ov_raw" -Force
-          # Archive contains a single top-level SDK folder; point the env at it.
-          $root = (Get-ChildItem -Directory "$tmp/ov_raw")[0].FullName
+          # Same resolver as the linux job; it prints the SDK root last.
+          $root = (python scripts/ov_sdk.py fetch $env:OV_VERSION_SELECTED --os windows --dest "$env:RUNNER_TEMP/ov" | Select-Object -Last 1)
+          if (-not (Test-Path "$root/runtime/include")) { throw "ov_sdk did not produce an SDK root: '$root'" }
           "INTEL_OPENVINO_DIR=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Build cascadia (openvino + dashboard)
@@ -280,8 +418,8 @@ jobs:
         id: pkg
         shell: pwsh
         run: |
-          $ver  = $env:TAG -replace '^v',''
-          $name = "cascadia-$ver-windows-x86_64"
+          $name = "cascadia-$env:VER-windows-x86_64"
+          if ($env:OV_VERSION_SELECTED -ne $env:OV_VERSION_DEFAULT) { $name = "$name-ov$env:OV_VERSION_SELECTED" }
           $dest = Join-Path $env:RUNNER_TEMP $name
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
           $ov  = $env:INTEL_OPENVINO_DIR
@@ -299,19 +437,45 @@ jobs:
           $zip = Join-Path $env:RUNNER_TEMP "$name.zip"
           Compress-Archive -Path $dest -DestinationPath $zip -Force
           "asset=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "dir=$dest" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Smoke-test the bundle (bundled runtime loads, version matches)
+        shell: pwsh
+        env:
+          BUNDLE_DIR: ${{ steps.pkg.outputs.dir }}
+        run: |
+          # As a user would run it: the DLLs beside cascadia.exe, no SDK env.
+          # (stdout only — doctor prints its report there; pwsh turns native
+          # stderr into error records under ErrorActionPreference=Stop.)
+          $out = (& (Join-Path $env:BUNDLE_DIR 'cascadia.exe') doctor) -join "`n"
+          $i = $out.IndexOf('OpenVINO:'); if ($i -ge 0) { $out.Substring($i) } else { $out }
+          $want = [regex]::Match($env:OV_VERSION_SELECTED, '^\d+\.\d+\.\d+').Value
+          if ($out -notmatch "OpenVINO GenAI.*$([regex]::Escape($want))") { throw "doctor did not report OpenVINO GenAI $want from the bundled DLLs" }
+          if ($out -notmatch "OpenVINO devices.*CPU") { throw "doctor did not enumerate the CPU device from the bundled runtime" }
 
       - name: Upload bundle to release
+        if: ${{ env.DRY_RUN != 'true' }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: gh release upload $env:TAG "${{ steps.pkg.outputs.asset }}" --clobber
 
+      - name: Keep bundle as a workflow artifact (dry run)
+        if: ${{ env.DRY_RUN == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bundle-windows-x86_64-ov${{ matrix.ov_version }}
+          path: ${{ steps.pkg.outputs.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
   # ── Promote once both bundles are attached: a release only loses its
   #    pre-release badge when its binaries are verifiably present.
   promote:
     name: promote release
-    needs: [build-linux, build-windows]
+    needs: [plan, build-linux, build-windows]
+    if: ${{ !cancelled() && needs.plan.outputs.dry_run != 'true' && needs.build-linux.result == 'success' && needs.build-windows.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

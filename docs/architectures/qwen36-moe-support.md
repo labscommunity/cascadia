@@ -298,7 +298,8 @@ XML. Proven step by step:
   --num-stages N` detects `model_type qwen3_5_moe` config-first and
   dispatches to the IR-surgery exporter (embedded in the binary beside
   the other exporters); --quantization is ignored (stages inherit the
-  official int4 IR), --layer-split/--stage rejected. The qwen3_5_moe
+  official int4 IR), --layer-split forwarded to the exporter (first
+  layer of stages 1..N-1, half-open), --stage rejected. The qwen3_5_moe
   path runs on openvino+numpy alone (torch made lazy in
   export_shards.py — the target env is an inference node without
   torch). Validated E2E: dispatch → stage saves (40 states each, 7

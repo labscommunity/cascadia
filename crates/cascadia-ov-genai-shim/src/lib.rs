@@ -338,6 +338,12 @@ mod sys {
             out_len: *mut usize,
         ) -> c_int;
 
+        pub fn cascadia_ov_version(
+            out_buf: *mut c_char,
+            out_cap: usize,
+            out_len: *mut usize,
+        ) -> c_int;
+
         pub fn cascadia_core_get_property(
             device: *const c_char,
             property: *const c_char,
@@ -1655,6 +1661,62 @@ pub fn list_devices() -> Result<Vec<String>> {
                 s.split('\n').map(str::to_owned).collect()
             }
         })
+}
+
+/// The OpenVINO GenAI / core versions this binary was compiled against and
+/// the ones its loader actually picked up. `built_*` are the `M.m.p` from
+/// the SDK headers at build time; `runtime_*` are the libraries' own build
+/// strings (`2026.4.1.0-20466-7bb2e7f0e2b-releases/2026/4`). A release
+/// bundle whose `lib/` was swapped for another SDK shows up as a skew
+/// between the two; `cascadia doctor` prints both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OvVersion {
+    pub built_genai: String,
+    pub built_core: String,
+    pub runtime_genai: String,
+    pub runtime_core: String,
+}
+
+impl OvVersion {
+    /// `M.m.p` prefix of a runtime build string (`2026.4.1.0-20466-…` →
+    /// `2026.4.1`), comparable to the `built_*` fields.
+    pub fn runtime_release(build: &str) -> String {
+        let head = build.split('-').next().unwrap_or(build);
+        let mut parts: Vec<&str> = head.split('.').take(3).collect();
+        while parts.len() > 2 && parts.last() == Some(&"0") {
+            parts.pop();
+        }
+        parts.join(".")
+    }
+
+    fn built_release(built: &str) -> String {
+        Self::runtime_release(built)
+    }
+
+    /// True when the loaded GenAI runtime is not the release the binary was
+    /// compiled against (major.minor.patch, trailing zeros ignored).
+    pub fn genai_skew(&self) -> bool {
+        Self::built_release(&self.built_genai) != Self::runtime_release(&self.runtime_genai)
+    }
+}
+
+#[cfg(not(feature = "openvino"))]
+pub fn ov_version() -> Result<OvVersion> {
+    Err(Error::Stub)
+}
+
+#[cfg(feature = "openvino")]
+pub fn ov_version() -> Result<OvVersion> {
+    let s =
+        unsafe { fetch_buffered_string(|buf, cap, len| sys::cascadia_ov_version(buf, cap, len)) }?;
+    let mut it = s.split('\n').map(str::to_owned);
+    let mut next = || it.next().unwrap_or_default();
+    Ok(OvVersion {
+        built_genai: next(),
+        built_core: next(),
+        runtime_genai: next(),
+        runtime_core: next(),
+    })
 }
 
 /// Query a single OV property (e.g. `FULL_DEVICE_NAME`,

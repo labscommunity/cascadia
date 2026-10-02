@@ -1,0 +1,24 @@
+[package]
+name = "cascadia-elastic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Elastic-memory allocator shim for cascadia workers (file-backed big allocations, process-wide, captures the C++ OpenVINO heap)."
+
+# The crate produces TWO artifacts:
+#   * cdylib  -> not used directly; the interposer ships as a C shared library
+#                compiled by build.rs and embedded via include_bytes! (so there
+#                is no install step and no runtime path discovery).
+#   * lib     -> the `activate()` API cascadia-cli calls to turn the shim on.
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+cc = "1"

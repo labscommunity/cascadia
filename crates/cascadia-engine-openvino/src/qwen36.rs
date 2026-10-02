@@ -358,6 +358,10 @@ pub struct Qwen36Builder {
     /// either way, so that observation is consistent with both readings and proves nothing.
     pub kv_cache_precision: Option<String>,
     pub dyn_quant_group: Option<String>,
+    /// User OV plugin properties from the CLI `--ov-*` flags, applied after the cache/KV/dyn-quant
+    /// keys and forwarded verbatim. On Arc GPU, INFERENCE_PRECISION_HINT=f32 and
+    /// EXECUTION_MODE_HINT=ACCURACY fail at compile (f16-only fused MoE gemm; see the NOTE in `load`).
+    pub ov_properties: Vec<(String, String)>,
     /// OV compiled-blob cache. Without it this 35B MoE recompiles from scratch on EVERY spawn (and any
     /// plugin-property change forces a full uncached rebuild that can exceed the rig's serve window).
     /// runtime/gemma4/dist_spec all set this; qwen36 did not.
@@ -383,10 +387,30 @@ impl Qwen36Builder {
         self.dyn_quant_group = Some(group.into());
         self
     }
+    pub fn with_ov_properties(mut self, props: Vec<(String, String)>) -> Self {
+        self.ov_properties.extend(props);
+        self
+    }
     /// Prefix-cache byte budget (0 = off). Default [`crate::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES`].
     pub fn with_prefix_cache_bytes(mut self, bytes: usize) -> Self {
         self.prefix_cache_bytes = bytes;
         self
+    }
+    fn build_plugin_config(&self) -> PluginConfig {
+        let mut plugin = PluginConfig::new();
+        if let Some(d) = &self.cache_dir {
+            plugin = plugin.with("CACHE_DIR", d);
+        }
+        if let Some(p2) = &self.kv_cache_precision {
+            plugin = plugin.with("KV_CACHE_PRECISION", p2);
+        }
+        if let Some(g) = &self.dyn_quant_group {
+            plugin = plugin.with("DYNAMIC_QUANTIZATION_GROUP_SIZE", g);
+        }
+        for (k, v) in &self.ov_properties {
+            plugin = plugin.with(k, v);
+        }
+        plugin
     }
     pub fn new(shards_dir: impl Into<String>, device: impl Into<String>) -> Self {
         Self {
@@ -409,6 +433,7 @@ impl Qwen36Builder {
             hidden: LEGACY_HIDDEN,
             kv_cache_precision: None,
             dyn_quant_group: None,
+            ov_properties: Vec::new(),
             cache_dir: None,
             prefix_cache_bytes: crate::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES,
             im_start_id: None,
@@ -524,16 +549,7 @@ impl Builder for Qwen36Builder {
         // do not. Measured inert on this export and NOT the cause of warm!=cold — see the
         // `kv_cache_precision` field doc. Left wired so the knob behaves as declared if a future export
         // does route KV through a plugin-managed cache.
-        let mut plugin = PluginConfig::new();
-        if let Some(d) = &self.cache_dir {
-            plugin = plugin.with("CACHE_DIR", d);
-        }
-        if let Some(p2) = &self.kv_cache_precision {
-            plugin = plugin.with("KV_CACHE_PRECISION", p2);
-        }
-        if let Some(g) = &self.dyn_quant_group {
-            plugin = plugin.with("DYNAMIC_QUANTIZATION_GROUP_SIZE", g);
-        }
+        let plugin = self.build_plugin_config();
 
         // Embeddings + tokenizer + eos live with the decode driver only.
         if self.rank == 0 {
@@ -3074,6 +3090,23 @@ impl cascadia_engine::KvCoordination for Qwen36Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ov_properties_reach_plugin_config() {
+        // The --ov-* CLI flags must land in the PluginConfig handed to compile, alongside the
+        // cache/KV wiring, and repeated with_ov_properties calls must accumulate, not replace.
+        let b = Qwen36Builder::new("/x", "GPU")
+            .with_cache_dir("/tmp/ovc")
+            .with_kv_cache_precision("u8")
+            .with_ov_properties(vec![("INFERENCE_NUM_THREADS".into(), "8".into())])
+            .with_ov_properties(vec![("PERFORMANCE_HINT".into(), "LATENCY".into())]);
+        let cfg = b.build_plugin_config();
+        let has = |k: &str, v: &str| cfg.entries.iter().any(|(ek, ev)| ek == k && ev == v);
+        assert!(has("CACHE_DIR", "/tmp/ovc"));
+        assert!(has("KV_CACHE_PRECISION", "u8"));
+        assert!(has("INFERENCE_NUM_THREADS", "8"));
+        assert!(has("PERFORMANCE_HINT", "LATENCY"));
+    }
 
     #[test]
     fn header_roundtrip() {

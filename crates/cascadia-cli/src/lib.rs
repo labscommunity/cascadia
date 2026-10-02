@@ -17,6 +17,7 @@ use cascadia_engine_openvino::{
 };
 use cascadia_engine_sparse_moe::{SparseMoEBuilder, SparseMoEBuilderConfig};
 use cascadia_runner::Runner;
+use cascadia_transport::TransportAddr;
 use cascadia_types::{GenerationTask, PeerEndpoint, PeerLayout, ShardSpec};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
@@ -389,6 +390,44 @@ pub struct WorkerArgs {
     #[arg(long, value_enum, value_name = "MODE")]
     pub ov_execution_mode: Option<OvExecutionMode>,
 
+    /// OV plugin property passthrough, `KEY=VALUE`, repeatable. Forwarded
+    /// verbatim to the OpenVINO plugin alongside the typed `--ov-*` flags —
+    /// the escape hatch for memory/runtime knobs that have no dedicated flag
+    /// yet (e.g. `--ov-config ENABLE_MMAP=YES`,
+    /// `--ov-config KV_CACHE_PRECISION=u8`,
+    /// `--ov-config CACHE_MODE=OPTIMIZE_SIZE`). Applied LAST so it overrides a
+    /// typed flag setting the same key. No allowlist: OV validates and rejects
+    /// unknown/ill-typed keys itself. NPU-only keys still require an NPU device
+    /// + ov-genai (same gate as the typed NPU flags); a `KEY=VALUE` with no
+    /// `=`, or an empty key, is rejected at parse time.
+    #[arg(long = "ov-config", value_name = "KEY=VALUE", value_parser = validate_ov_config)]
+    pub ov_config: Vec<String>,
+
+    /// Elastic memory posture: serve large allocations from file-backed
+    /// mappings so the engine's weight copies, KV state and scratch become
+    /// kernel-reclaimable instead of anonymous/committed. Measured in-tree
+    /// (ramlab exp 199): 2064→506 MB committed at −1% decode on an unmodified
+    /// OpenVINO CPU worker. Linux re-execs the worker once with an allocator
+    /// interposer preloaded; Windows inline-hooks the UCRT allocation family
+    /// in-process via Detours (built only when DETOURS_DIR was set — otherwise
+    /// the flag parses but reports inactive). The OV knobs cannot substitute:
+    /// they cannot disable oneDNN's dirty repacked copies (D-004).
+    #[arg(long)]
+    pub elastic: bool,
+
+    /// Elastic threshold in MB: route allocations at least this large through
+    /// the file-backed pool. 1 = maximum RAM cut; 16 = weights-only, zero
+    /// measured speed cost (ramlab exp 198 threshold sweep). Ignored without
+    /// `--elastic`.
+    #[arg(long, value_name = "MB", default_value_t = 1)]
+    pub elastic_min_mb: u32,
+
+    /// Elastic retained-mapping pool cap in MB: freed big mappings kept for
+    /// zero-cost reuse (0 disables the pool — reverts to the −35% eager-return
+    /// tax). Ignored without `--elastic`.
+    #[arg(long, value_name = "MB", default_value_t = 8192)]
+    pub elastic_pool_mb: u32,
+
     /// NPU LLM prefill chunk size (NPUW_LLM_PREFILL_CHUNK_SIZE, OV 2025.3+).
     /// Applied only with --engine ov-genai on an NPU device; dropped with a
     /// warning otherwise (only ov-genai routes it through an ov::genai
@@ -691,6 +730,13 @@ pub struct RunArgs {
     /// Expert placement JSON (requires --ep-workers). See worker --help.
     #[arg(long)]
     pub ep_placement: Option<PathBuf>,
+
+    /// Elastic memory posture — serve large allocations from file-backed
+    /// mappings so RAM stays kernel-reclaimable (ramlab exp 198). See
+    /// `cascadia worker --help` for `--elastic-min-mb` / `--elastic-pool-mb`
+    /// tuning; `run` uses the measured defaults (1 MB threshold, pool on).
+    #[arg(long)]
+    pub elastic: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -747,6 +793,10 @@ impl WorkerArgs {
             ov_num_threads: None,
             ov_allow_auto_batching: false,
             ov_execution_mode: None,
+            ov_config: Vec::new(),
+            elastic: false,
+            elastic_min_mb: 1,
+            elastic_pool_mb: 8192,
             npu_prefill_chunk_size: None,
             npu_max_prompt_len: None,
             npu_min_response_len: None,
@@ -958,6 +1008,47 @@ impl OvExecutionMode {
     }
 }
 
+/// Turn on the elastic memory posture if the subcommand asked for it, BEFORE
+/// the async runtime starts. On Linux success this re-executes the process (the
+/// call does not return); otherwise it returns and the run continues, with the
+/// OV memory knobs still seeded via [`ov_perf_properties`]. Kept out of [`run`]
+/// so `main` can call it while the process is still single-threaded — env
+/// mutation and `execv` are only safe there.
+pub fn activate_elastic_if_requested(cli: &Cli) {
+    let (min_mb, pool_mb) = match &cli.cmd {
+        Command::Worker(a) if a.elastic => (a.elastic_min_mb, a.elastic_pool_mb),
+        Command::Run(a) if a.elastic => (1, 8192),
+        _ => return,
+    };
+    if cascadia_elastic::is_active() {
+        eprintln!("cascadia: elastic posture active (min={min_mb}MB pool={pool_mb}MB)");
+        return;
+    }
+    let opts = cascadia_elastic::ElasticOpts {
+        min_mb,
+        pool_mb,
+        dir: None,
+    };
+    match cascadia_elastic::activate(&opts) {
+        // On Linux success execv never returns; AlreadyActive is handled above.
+        Ok(cascadia_elastic::Activation::AlreadyActive) => {}
+        // Windows in-process hook installed this call.
+        Ok(cascadia_elastic::Activation::Activated) => {
+            eprintln!(
+                "cascadia: elastic posture active (in-process; min={min_mb}MB pool={pool_mb}MB)"
+            );
+        }
+        Ok(cascadia_elastic::Activation::UnsupportedPlatform(why)) => {
+            eprintln!("cascadia: --elastic interposer unavailable on this build: {why}");
+        }
+        Err(e) => {
+            eprintln!(
+                "cascadia: --elastic activation failed ({e}); continuing without the interposer"
+            );
+        }
+    }
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
     init_tracing(&cli.log_level);
     match cli.cmd {
@@ -977,7 +1068,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 
 async fn cmd_run(args: RunArgs) -> Result<()> {
     info!(model = %args.model, device = %args.device, engine = ?args.engine, "cascadia run (single machine)");
-    let worker = WorkerArgs::single_node(
+    let mut worker = WorkerArgs::single_node(
         args.model,
         args.device,
         args.engine,
@@ -987,6 +1078,10 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         args.ep_workers,
         args.ep_placement,
     );
+    // Carry the elastic posture onto the worker so the OV memory-knob seeding
+    // (ov_perf_properties) fires; the interposer itself was already activated
+    // in main before the async runtime started.
+    worker.elastic = args.elastic;
     cmd_worker(worker).await
 }
 
@@ -1016,14 +1111,26 @@ fn cmd_engines() -> Result<()> {
     Ok(())
 }
 
+/// Unix-domain-socket address form (#17): `unix:/path.sock`, an absolute
+/// path, or a `.sock`-suffixed name. Valid for --listen/--next (in-host
+/// pipeline hand-offs); NOT for --api (HTTP stays TCP). The rule itself is
+/// owned by the transport (`TransportAddr`).
+fn is_unix_addr(s: &str) -> bool {
+    TransportAddr::from_host_port(s, 0).is_unix()
+}
+
 fn parse_addr(s: &str, default_host: &str) -> Result<(String, u16)> {
-    if let Some(port) = s.strip_prefix(':') {
-        return Ok((default_host.to_string(), port.parse().context("port")?));
+    // A UDS address travels whole in the host slot with port 0 — the
+    // transport layer classifies it again (TransportAddr::from_host_port).
+    // Parsing through TransportAddr rejects an empty `unix:` path here,
+    // up front, instead of at bind/connect time.
+    match s.parse::<TransportAddr>()? {
+        TransportAddr::Unix(_) => Ok((s.to_string(), 0)),
+        TransportAddr::Tcp { host, port } if host.is_empty() => {
+            Ok((default_host.to_string(), port))
+        }
+        TransportAddr::Tcp { host, port } => Ok((host, port)),
     }
-    let (h, p) = s
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow!("address must be host:port (got {s:?})"))?;
-    Ok((h.to_string(), p.parse().context("port")?))
 }
 
 /// Pick the OV plugin's CACHE_DIR for this worker.
@@ -1146,6 +1253,14 @@ fn device_is_npu(device: &str) -> bool {
 fn ov_perf_properties(args: &WorkerArgs) -> Vec<(String, String)> {
     let mut props: Vec<(String, String)> = Vec::new();
 
+    // Elastic posture seeds memory-frugal OV props FIRST (lowest priority), so a
+    // typed --ov-* flag or an explicit --ov-config for the same key still wins.
+    // On Windows these knobs are the whole memory story (no interposer); on
+    // Linux they stack with the preloaded allocator (cascadia-elastic).
+    if args.elastic {
+        props.extend(cascadia_elastic::ov_memory_props());
+    }
+
     // General performance hints. PERFORMANCE_HINT / INFERENCE_PRECISION_HINT /
     // EXECUTION_MODE_HINT are plugin-agnostic ov::hint properties. NUM_STREAMS,
     // INFERENCE_NUM_THREADS (CPU-oriented) and ALLOW_AUTO_BATCHING (GPU/AUTO)
@@ -1179,7 +1294,8 @@ fn ov_perf_properties(args: &WorkerArgs) -> Vec<(String, String)> {
     // rejects or ignores them). So gate on BOTH the device (NPU) and the engine
     // (ov-genai). Keeping the gate here (single source of truth) means the
     // builders and the C++ shim never see an NPU key on a run that can't use it.
-    if device_is_npu(&args.device) && matches!(args.engine, EngineKind::OvGenai) {
+    let npu_ok = device_is_npu(&args.device) && matches!(args.engine, EngineKind::OvGenai);
+    if npu_ok {
         if let Some(n) = args.npu_prefill_chunk_size {
             props.push(("NPUW_LLM_PREFILL_CHUNK_SIZE".into(), n.to_string()));
         }
@@ -1191,7 +1307,58 @@ fn ov_perf_properties(args: &WorkerArgs) -> Vec<(String, String)> {
         }
     }
 
+    // Raw `--ov-config KEY=VALUE` passthrough, applied LAST. A later entry for a
+    // key already present (from a typed flag or an earlier --ov-config) wins:
+    // OV takes a map, so we dedupe keeping the last write. NPU-prefixed keys go
+    // through the same device+engine gate as the typed NPU flags — passing one
+    // on a CPU run would make OV reject the whole property set, so drop it with
+    // a warning instead (parity with warn_ignored_ov_perf_flags). Malformed
+    // entries are already rejected at parse time (see parse_ov_config).
+    for (key, value) in parse_ov_config(&args.ov_config) {
+        if key.to_ascii_uppercase().starts_with("NPU") && !npu_ok {
+            eprintln!(
+                "warning: ignoring --ov-config {key}={value}: NPU-prefixed keys \
+                 apply only to --engine ov-genai on an NPU device"
+            );
+            continue;
+        }
+        props.retain(|(k, _)| k != &key);
+        props.push((key, value));
+    }
+
     props
+}
+
+/// clap value-parser for `--ov-config`: require a `KEY=VALUE` shape with a
+/// non-empty key, so `--ov-config foo` or `--ov-config =x` fail with a clear
+/// message at parse time rather than being silently dropped later. The value
+/// may be empty (some OV keys accept an empty string) and may contain `=`.
+fn validate_ov_config(s: &str) -> Result<String, String> {
+    match s.split_once('=') {
+        Some((k, _)) if !k.trim().is_empty() => Ok(s.to_string()),
+        Some(_) => Err("empty key before '=' (expected KEY=VALUE)".into()),
+        None => Err(format!("missing '=' in {s:?} (expected KEY=VALUE)")),
+    }
+}
+
+/// Split `KEY=VALUE` passthrough entries into `(key, value)` pairs. Parse
+/// validation (non-empty key, an `=` present) happens in clap via
+/// [`validate_ov_config`]; this is the infallible post-parse split, so a bad
+/// entry here would be a validator bug, not user error. The value MAY contain
+/// further `=` (e.g. a device string), so we split on the FIRST `=` only.
+fn parse_ov_config(entries: &[String]) -> Vec<(String, String)> {
+    entries
+        .iter()
+        .filter_map(|e| {
+            let (k, v) = e.split_once('=')?;
+            let k = k.trim();
+            if k.is_empty() {
+                None
+            } else {
+                Some((k.to_string(), v.to_string()))
+            }
+        })
+        .collect()
 }
 
 /// Load a whole-model chat template for ov-genai, tolerating both layouts:
@@ -1235,16 +1402,6 @@ fn warn_ignored_ov_perf_flags(args: &WorkerArgs) {
             device = %args.device,
             "ignoring --npu-* flags: NPU LLM knobs apply only with \
              --engine ov-genai on an NPU device"
-        );
-    }
-
-    // qwen35 compiles with a fixed plugin config and receives no OV perf
-    // properties (some hints break its IRs — see qwen36.rs). If the user set
-    // general hints, warn they won't take effect on this engine.
-    if matches!(args.engine, EngineKind::Qwen36Moe) && !ov_perf_properties(args).is_empty() {
-        tracing::warn!(
-            "ignoring --ov-* performance flags: the qwen35 engine compiles \
-             with a fixed plugin config and does not apply them"
         );
     }
 
@@ -1576,6 +1733,7 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
             if let Some(group) = &args.ov_dyn_quant_group {
                 b = b.with_dyn_quant_group(group);
             }
+            b = b.with_ov_properties(ov_perf_properties(args));
             info!(
                 prefix_cache_gib = prefix_cache_bytes >> 30,
                 "qwen35 prefix-cache budget"
@@ -1805,6 +1963,18 @@ fn validate_worker_runtime_flags(args: &WorkerArgs) -> Result<()> {
     Ok(())
 }
 
+/// HTTP must stay TCP: reject a unix --api up-front, before any engine
+/// work, rather than failing the TcpListener bind minutes later.
+fn check_api_addr_is_tcp(api: Option<&str>) -> Result<()> {
+    if api.is_some_and(is_unix_addr) {
+        return Err(anyhow!(
+            "--api must be a TCP address (host:port); unix socket addresses are \
+             supported only for --listen/--next (in-host pipeline hand-offs)"
+        ));
+    }
+    Ok(())
+}
+
 async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     if args.rank >= args.total {
         return Err(anyhow!(
@@ -1877,7 +2047,10 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         "cascadia worker starting"
     );
 
+    check_api_addr_is_tcp(args.api.as_deref())?;
+
     let (listen_host, listen_port) = parse_addr(&args.listen, "0.0.0.0")?;
+    let listen_is_unix = is_unix_addr(&listen_host);
 
     let upstream = if is_first {
         None
@@ -1932,31 +2105,40 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     // dashboard demo. If the engine already bound the port, `bind`
     // fails with AddrInUse and we silently step aside (the engine's
     // listener handles probes identically at the TCP layer).
+    //
+    // A unix --listen has no TCP relay port: binding 0.0.0.0:0 here would
+    // grab a meaningless ephemeral port, so skip it (the node also
+    // advertises port 0 via mDNS — cross-host latency probes don't apply
+    // to an in-host UDS stage).
     let probe_addr = format!("0.0.0.0:{listen_port}");
-    match tokio::net::TcpListener::bind(&probe_addr).await {
-        Ok(listener) => {
-            info!(addr = %probe_addr, "probe listener bound");
-            tokio::spawn(async move {
-                loop {
-                    match listener.accept().await {
-                        Ok(_) => {
-                            // Drop the connection immediately — the
-                            // probe only needs the connect handshake.
-                        }
-                        Err(e) => {
-                            tracing::debug!(error = %e, "probe accept failed");
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    if listen_is_unix {
+        tracing::debug!("unix --listen; skipping TCP probe listener");
+    } else {
+        match tokio::net::TcpListener::bind(&probe_addr).await {
+            Ok(listener) => {
+                info!(addr = %probe_addr, "probe listener bound");
+                tokio::spawn(async move {
+                    loop {
+                        match listener.accept().await {
+                            Ok(_) => {
+                                // Drop the connection immediately — the
+                                // probe only needs the connect handshake.
+                            }
+                            Err(e) => {
+                                tracing::debug!(error = %e, "probe accept failed");
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
                         }
                     }
-                }
-            });
-        }
-        Err(e) => {
-            tracing::debug!(
-                error = %e,
-                addr = %probe_addr,
-                "probe listener could not bind; engine likely owns the port"
-            );
+                });
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    addr = %probe_addr,
+                    "probe listener could not bind; engine likely owns the port"
+                );
+            }
         }
     }
 
@@ -2052,11 +2234,13 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             tick.tick().await;
             // Snapshot just (id, host, port) — no full NodeInfo clone — and
             // probe all peers concurrently with join_all rather than an
-            // unbounded tokio::spawn per peer per tick.
+            // unbounded tokio::spawn per peer per tick. Port-0 peers are
+            // in-host unix stages (#17): no TCP endpoint, so dialing
+            // `host:0` every tick would only ever fail.
             let peers: Vec<(String, String, u16)> = topology_for_probe
                 .nodes()
                 .into_iter()
-                .filter(|n| n.node_id != self_id_for_probe)
+                .filter(|n| n.node_id != self_id_for_probe && discover::has_tcp_relay(n.port))
                 .map(|n| (n.node_id, n.host, n.port))
                 .collect();
             let results = futures::future::join_all(
@@ -3242,6 +3426,7 @@ mod ov_property_tests {
             EngineKind::Gemma4,
             EngineKind::OvDistSpec,
             EngineKind::SparseMoe,
+            EngineKind::Qwen36Moe,
         ] {
             let mut args = args_for_engine("NPU.0", engine);
             args.npu_prefill_chunk_size = Some(512);
@@ -3266,6 +3451,71 @@ mod ov_property_tests {
         args.ov_performance_mode = Some(OvPerformanceMode::Latency);
         let props = ov_perf_properties(&args);
         assert_eq!(prop(&props, "PERFORMANCE_HINT"), Some("LATENCY"));
+    }
+
+    #[test]
+    fn ov_config_passthrough_forwards_arbitrary_keys() {
+        let mut args = args_for("CPU");
+        args.ov_config = vec!["ENABLE_MMAP=YES".into(), "KV_CACHE_PRECISION=u8".into()];
+        let props = ov_perf_properties(&args);
+        assert_eq!(prop(&props, "ENABLE_MMAP"), Some("YES"));
+        assert_eq!(prop(&props, "KV_CACHE_PRECISION"), Some("u8"));
+    }
+
+    #[test]
+    fn ov_config_value_may_contain_equals() {
+        // Split on the FIRST '=' only, so compound values survive.
+        let mut args = args_for("CPU");
+        args.ov_config = vec!["DEVICE_PROPERTIES=CPU:NUM_STREAMS=4".into()];
+        let props = ov_perf_properties(&args);
+        assert_eq!(prop(&props, "DEVICE_PROPERTIES"), Some("CPU:NUM_STREAMS=4"));
+    }
+
+    #[test]
+    fn ov_config_overrides_a_typed_flag_for_the_same_key() {
+        // Passthrough is applied last and dedupes keeping the last write, so a
+        // user who sets both wins with the raw value.
+        let mut args = args_for("GPU");
+        args.ov_num_streams = Some(2); // -> NUM_STREAMS=2
+        args.ov_config = vec!["NUM_STREAMS=8".into()];
+        let props = ov_perf_properties(&args);
+        assert_eq!(prop(&props, "NUM_STREAMS"), Some("8"));
+        // and only once — the typed entry was removed, not shadowed.
+        assert_eq!(props.iter().filter(|(k, _)| k == "NUM_STREAMS").count(), 1);
+    }
+
+    #[test]
+    fn ov_config_npu_key_gated_off_on_cpu() {
+        let mut args = args_for("CPU");
+        args.ov_config = vec!["NPUW_LLM_PREFILL_CHUNK_SIZE=512".into()];
+        let props = ov_perf_properties(&args);
+        assert_eq!(prop(&props, "NPUW_LLM_PREFILL_CHUNK_SIZE"), None);
+    }
+
+    #[test]
+    fn ov_config_npu_key_passes_on_npu_genai() {
+        let mut args = args_for_engine("NPU.0", EngineKind::OvGenai);
+        args.ov_config = vec!["NPU_USE_NPUW=YES".into()];
+        let props = ov_perf_properties(&args);
+        assert_eq!(prop(&props, "NPU_USE_NPUW"), Some("YES"));
+    }
+
+    #[test]
+    fn ov_config_validator_rejects_malformed() {
+        assert!(validate_ov_config("ENABLE_MMAP=YES").is_ok());
+        assert!(validate_ov_config("EMPTY_VALUE_OK=").is_ok());
+        assert!(validate_ov_config("no_equals").is_err());
+        assert!(validate_ov_config("=no_key").is_err());
+        assert!(validate_ov_config("   =x").is_err());
+    }
+
+    #[test]
+    fn general_hints_apply_on_qwen35_engine() {
+        // The qwen35 builder forwards these via `with_ov_properties`.
+        let mut args = args_for_engine("GPU", EngineKind::Qwen36Moe);
+        args.ov_num_threads = Some(8);
+        let props = ov_perf_properties(&args);
+        assert_eq!(prop(&props, "INFERENCE_NUM_THREADS"), Some("8"));
     }
 }
 
@@ -3643,5 +3893,74 @@ mod tests {
             };
             assert_eq!(args.engine, EngineKind::Qwen36Moe, "--engine {spelling}");
         }
+    }
+
+    /// --listen/--next/--api address forms (#17). `unix:/tmp/x.sock` is the
+    /// case a plain last-colon split used to break.
+    #[test]
+    fn parse_addr_accepts_tcp_and_unix_forms() {
+        let cases = [
+            ("unix:/tmp/x.sock", "unix:/tmp/x.sock", 0),
+            ("/abs/x.sock", "/abs/x.sock", 0),
+            ("stage.sock", "stage.sock", 0),
+            (":9100", "0.0.0.0", 9100),
+            ("host:9100", "host", 9100),
+        ];
+        for (input, host, port) in cases {
+            let got = parse_addr(input, "0.0.0.0").unwrap_or_else(|e| panic!("{input}: {e}"));
+            assert_eq!(got, (host.to_string(), port), "{input}");
+        }
+    }
+
+    #[test]
+    fn parse_addr_rejects_bad_forms() {
+        for input in ["unix:", "justahost", "host:notaport"] {
+            assert!(parse_addr(input, "0.0.0.0").is_err(), "{input}");
+        }
+    }
+
+    /// A worker's HTTP API must stay TCP; this runs before engine work.
+    #[test]
+    fn worker_rejects_unix_api_addr() {
+        for api in ["unix:/x.sock", "/x.sock", "x.sock"] {
+            let err = check_api_addr_is_tcp(Some(api)).unwrap_err().to_string();
+            assert!(err.contains("--api must be a TCP address"), "{api}: {err}");
+        }
+        assert!(check_api_addr_is_tcp(Some("0.0.0.0:8000")).is_ok());
+        assert!(check_api_addr_is_tcp(None).is_ok());
+    }
+
+    /// --ep-workers may mix an in-host unix worker with a TCP one.
+    #[test]
+    fn ep_workers_parse_mixed_unix_and_tcp() {
+        let cli = Cli::try_parse_from([
+            "cascadia",
+            "worker",
+            "--rank",
+            "0",
+            "--total",
+            "1",
+            "--model",
+            "m",
+            "--ep-workers",
+            "unix:/a.sock,10.0.0.2:9100",
+        ])
+        .expect("parse worker argv");
+        let Command::Worker(args) = cli.cmd else {
+            panic!("expected worker subcommand");
+        };
+        let workers = args
+            .ep_workers
+            .iter()
+            .map(|w| parse_addr(w, "127.0.0.1"))
+            .collect::<Result<Vec<_>>>()
+            .expect("parse --ep-workers");
+        assert_eq!(
+            workers,
+            vec![
+                ("unix:/a.sock".to_string(), 0),
+                ("10.0.0.2".to_string(), 9100)
+            ]
+        );
     }
 }

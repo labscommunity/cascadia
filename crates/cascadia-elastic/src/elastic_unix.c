@@ -1,0 +1,456 @@
+/* elastic_preload.c — the ramlab elastic-allocator posture as an LD_PRELOAD
+ * shim, so it applies to UNMODIFIED OpenVINO (or any C/C++/Rust process).
+ *
+ * Mechanism (D-015, generalized process-wide): every allocation >= threshold
+ * is served from a MAP_SHARED mmap of an unlinked O_TMPFILE. Written pages are
+ * file-dirty, not anonymous — the kernel can write them back and reclaim under
+ * pressure, so they stop being OOM/commit exposure. Small allocations pass
+ * through to the real allocator untouched.
+ *
+ * This captures what #[global_allocator] cannot: OpenVINO/oneDNN are C++, and
+ * their compiled-graph weight copies, KV state and scratch all arrive through
+ * malloc/new/posix_memalign — which an LD_PRELOAD interposer owns.
+ *
+ * Big allocations carry a header PAGE (returned pointer = base + 4096, so it
+ * is always page-aligned and any alignment <= 4096 is satisfied). free()
+ * identifies our pointers by page alignment + mincore() + magic — no global
+ * table, no locks on the hot path.
+ *
+ * Freed big mappings are RETAINED in a pool and reused without munmap or
+ * zeroing (D-015 evictable retention): repeated transients cost no
+ * mmap/ftruncate/fault churn after warmup, yet retained pages stay file-backed
+ * and pager-reclaimable, so the retention is harmless under pressure. Without
+ * the pool, per-inference scratch pays an mmap round trip every step — the
+ * eager-return anti-pattern exp 097 measured (v1 of this shim: -35% decode).
+ *
+ * Env:  ELASTIC_MIN_MB   threshold in MB (default 1)
+ *       ELASTIC_DIR      backing dir for the tmpfiles (default $TMPDIR or /tmp)
+ *       ELASTIC_POOL_MB  max retained-mapping bytes (default 8192; 0 = no pool)
+ *       ELASTIC_LOG=1    print counters at exit
+ *
+ * Prototype for ramlab exp 198. Linux-only (O_TMPFILE, mincore).
+ */
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/statfs.h>
+#include <sys/vfs.h>
+#include <linux/magic.h>
+#include <unistd.h>
+#include <limits.h>
+#include <sys/sysmacros.h>
+
+#define PAGE 4096UL
+#define MAGIC 0xE1A571CA110CULL
+
+typedef struct {
+    uint64_t magic;
+    size_t   user_size;
+    size_t   total;      /* header page + rounded user size */
+    int      fd;
+} hdr_t;
+
+static void *(*real_malloc)(size_t);
+static void  (*real_free)(void *);
+static void *(*real_calloc)(size_t, size_t);
+static void *(*real_realloc)(void *, size_t);
+static void *(*real_aligned_alloc)(size_t, size_t);
+static int   (*real_posix_memalign)(void **, size_t, size_t);
+static void *(*real_memalign)(size_t, size_t);
+static void *(*real_mmap)(void *, size_t, int, int, int, off_t);
+static volatile int g_in_init;
+
+static size_t g_threshold = 1UL << 20;
+static const char *g_dir = "/tmp";
+static int g_log = 0;
+static int g_mmap_on = 1;              /* ELASTIC_MMAP=0 disables the mmap leg */
+
+static _Atomic uint64_t n_big, n_big_bytes, n_free_big, n_fallback;
+static _Atomic uint64_t n_pool_hit, n_pool_put;
+static _Atomic uint64_t n_mmap, n_mmap_bytes, n_mmap_fb;
+
+/* ---- retention pool: freed mappings kept mapped for zero-cost reuse.
+ * Fixed-size table; first-fit with a <=2x waste bound. All entries stay
+ * file-backed, so the kernel can still reclaim them under pressure. ---- */
+#define POOL_SLOTS 256
+typedef struct { void *base; size_t total; int fd; } pool_ent;
+static pool_ent g_pool[POOL_SLOTS];
+static size_t g_pool_bytes;
+static size_t g_pool_cap = 8UL << 30;   /* replaced at init */
+static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* ---- bootstrap arena: dlsym() itself allocates (calloc) before the real
+ * symbols are resolved; serve those few early allocations from a static
+ * bump arena that is never freed. ---- */
+static char boot_arena[1 << 20];
+static _Atomic size_t boot_off;
+static int in_boot(void *p) {
+    return (char *)p >= boot_arena && (char *)p < boot_arena + sizeof(boot_arena);
+}
+static void *boot_alloc(size_t sz) {
+    size_t o = atomic_fetch_add(&boot_off, (sz + 15) & ~15UL);
+    if (o + sz > sizeof(boot_arena)) abort();
+    return boot_arena + o;
+}
+
+static pthread_once_t init_once = PTHREAD_ONCE_INIT;
+static void do_init(void) {
+    g_in_init = 1;
+    real_malloc         = dlsym(RTLD_NEXT, "malloc");
+    real_free           = dlsym(RTLD_NEXT, "free");
+    real_calloc         = dlsym(RTLD_NEXT, "calloc");
+    real_realloc        = dlsym(RTLD_NEXT, "realloc");
+    real_aligned_alloc  = dlsym(RTLD_NEXT, "aligned_alloc");
+    real_posix_memalign = dlsym(RTLD_NEXT, "posix_memalign");
+    real_memalign       = dlsym(RTLD_NEXT, "memalign");
+    real_mmap           = dlsym(RTLD_NEXT, "mmap");
+    g_in_init = 0;
+    const char *v;
+    if ((v = getenv("ELASTIC_MIN_MB")) && atol(v) > 0)
+        g_threshold = (size_t)atol(v) << 20;
+    if ((v = getenv("ELASTIC_MIN_KB")) && atol(v) > 0)   /* sub-MB research knob */
+        g_threshold = (size_t)atol(v) << 10;
+    if ((v = getenv("ELASTIC_DIR")) && *v) g_dir = v;
+    else if ((v = getenv("TMPDIR")) && *v) g_dir = v;
+    g_pool_cap = 8UL << 30;
+    if ((v = getenv("ELASTIC_POOL_MB")) && atol(v) >= 0)
+        g_pool_cap = (size_t)atol(v) << 20;
+    g_log = (v = getenv("ELASTIC_LOG")) && *v == '1';
+    g_mmap_on = !((v = getenv("ELASTIC_MMAP")) && *v == '0');
+    /* Fail-loud guard: on tmpfs/ramfs the written pages can never reach a
+     * disk, so the posture silently gives no survival benefit under a
+     * memory cap (measured: dies at the same caps as stock while RssAnon
+     * still collapses). A user who asked for --elastic deserves the warn. */
+    struct statfs st;
+    if (statfs(g_dir, &st) == 0
+        && (st.f_type == TMPFS_MAGIC || st.f_type == RAMFS_MAGIC))
+        fprintf(stderr,
+                "cascadia: elastic WARNING: backing dir %s is on tmpfs/ramfs —"
+                " pages cannot be written back, so --elastic gives NO OOM"
+                " protection. Point ELASTIC_DIR at a disk-backed dir"
+                " (ext4/xfs).\n", g_dir);
+    /* Same warning, different failure mode: on a rotational device the
+     * mechanism still works, but the page-ins are seek-bound, so "slow but
+     * alive" degrades into "dead". Decode re-reads every weight on every
+     * token, so a dropped page is re-read inside the decode loop; and two
+     * co-tenant models interleave their reads, which on a 7200 rpm disk
+     * collapses to ~1-2 MB/s. The reference backing (WD SN770 NVMe) measures
+     * 3.3 GB/s direct. Warn rather than refuse: the posture is still correct,
+     * it is the device that is wrong.
+     *
+     * Allocation-free on purpose. This runs inside do_init, and the malloc
+     * hook does not check g_in_init (only mmap does), so any fopen/realpath
+     * here would malloc, re-enter the hook and deadlock on pthread_once.
+     * open/read/readlink/write allocate nothing. */
+    {
+        struct stat sb;
+        if (stat(g_dir, &sb) == 0) {
+            int rot = -1, fd = -1;
+            char p[PATH_MAX + 64];
+            char real[PATH_MAX];
+            snprintf(p, sizeof p, "/sys/dev/block/%u:%u/queue/rotational",
+                     (unsigned)major(sb.st_dev), (unsigned)minor(sb.st_dev));
+            fd = open(p, O_RDONLY);
+            if (fd < 0) {
+                /* A partition carries no queue: resolve the sysfs node and
+                 * step up one directory to the parent disk. readlink returns
+                 * the RAW target, which for these nodes is relative (../../…),
+                 * so it has to be re-anchored under the link's own directory
+                 * before it can be opened. (Using realpath here would malloc,
+                 * re-enter the hook and deadlock — hence the manual splice.) */
+                snprintf(p, sizeof p, "/sys/dev/block/%u:%u",
+                         (unsigned)major(sb.st_dev), (unsigned)minor(sb.st_dev));
+                ssize_t n = readlink(p, real, sizeof real - 1);
+                if (n > 0) {
+                    char abs[PATH_MAX + 32], *slash;
+                    real[n] = '\0';
+                    snprintf(abs, sizeof abs, "/sys/dev/block/%s", real);
+                    slash = strrchr(abs, '/');
+                    if (slash) {
+                        *slash = '\0';
+                        snprintf(p, sizeof p, "%s/queue/rotational", abs);
+                        fd = open(p, O_RDONLY);
+                    }
+                }
+            }
+            if (fd >= 0) {
+                char b[8];
+                ssize_t n = read(fd, b, sizeof b - 1);
+                close(fd);
+                if (n > 0) {
+                    b[n] = '\0';
+                    rot = (b[0] == '1');
+                }
+            }
+            if (rot == 1) {
+                char msg[PATH_MAX + 256];
+                int m = snprintf(msg, sizeof msg,
+                                 "cascadia: elastic WARNING: backing dir %s is on a"
+                                 " rotational device \u2014 page-ins are seek-bound, so"
+                                 " --elastic thrashes instead of degrading under"
+                                 " pressure. Point ELASTIC_DIR at an SSD/NVMe.\n",
+                                 g_dir);
+                if (m > 0)
+                    (void)!write(STDERR_FILENO, msg,
+                                 (size_t)((size_t)m < sizeof msg ? (size_t)m
+                                                                 : sizeof msg - 1));
+            }
+        }
+    }
+}
+static inline void ensure_init(void) { pthread_once(&init_once, do_init); }
+
+/* ---- big path ---- */
+static void *pool_take(size_t total_needed) {
+    if (!g_pool_cap) return NULL;
+    pthread_mutex_lock(&g_pool_mu);
+    int best = -1;
+    for (int i = 0; i < POOL_SLOTS; i++) {
+        if (!g_pool[i].base) continue;
+        if (g_pool[i].total >= total_needed && g_pool[i].total <= 2 * total_needed
+            && (best < 0 || g_pool[i].total < g_pool[best].total))
+            best = i;
+    }
+    void *base = NULL;
+    if (best >= 0) {
+        base = g_pool[best].base;
+        g_pool_bytes -= g_pool[best].total;
+        g_pool[best].base = NULL;
+        atomic_fetch_add(&n_pool_hit, 1);
+    }
+    pthread_mutex_unlock(&g_pool_mu);
+    return base;
+}
+
+static int pool_put(void *base, size_t total, int fd) {
+    if (!g_pool_cap) return 0;
+    pthread_mutex_lock(&g_pool_mu);
+    if (g_pool_bytes + total <= g_pool_cap) {
+        for (int i = 0; i < POOL_SLOTS; i++) {
+            if (!g_pool[i].base) {
+                g_pool[i] = (pool_ent){base, total, fd};
+                g_pool_bytes += total;
+                atomic_fetch_add(&n_pool_put, 1);
+                pthread_mutex_unlock(&g_pool_mu);
+                return 1;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_pool_mu);
+    return 0;
+}
+/* Pooled mappings hold no fd: the unlinked O_TMPFILE inode stays alive
+ * through the MAP_SHARED mapping alone, so a pool slot never leaks an fd
+ * and sub-MB thresholds (thousands of live mappings) can't hit EMFILE.
+ * big_alloc2 must therefore open a fresh tmpfile per allocation — the fd
+ * is closed immediately after mmap in every path. */
+
+static void *big_alloc2(size_t size, int want_zero) {
+    /* One extra page of tail slack. glibc always leaves a partial page
+     * after a large user region (its 16-byte chunk header forces the mmap
+     * to round up), and vectorised callers rely on that implicitly:
+     * oneDNN JIT repack kernels read up to 64 B past the logical end of a
+     * tensor. A page-multiple request would otherwise end flush against an
+     * unmapped page, and the over-read faults. Measured on a 27B export at
+     * the 1 MB threshold: SIGSEGV in a JIT vmovups 0x40(%r10) with the
+     * fault address exactly at the mapping end. */
+    size_t total = PAGE + ((size + PAGE - 1) & ~(PAGE - 1)) + PAGE;
+    void *base = pool_take(total);
+    if (base) {                          /* reuse WITHOUT zeroing (D-015) */
+        hdr_t *h = (hdr_t *)base;
+        h->magic = MAGIC;                /* total survives in the header */
+        h->user_size = size;
+        if (want_zero) memset((char *)base + PAGE, 0, size);
+        atomic_fetch_add(&n_big, 1);
+        atomic_fetch_add(&n_big_bytes, size);
+        return (char *)base + PAGE;
+    }
+    int fd = open(g_dir, O_TMPFILE | O_RDWR | O_EXCL, 0600);
+    if (fd < 0) { atomic_fetch_add(&n_fallback, 1); return NULL; }
+    if (ftruncate(fd, (off_t)total) != 0) { close(fd); return NULL; }
+    base = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (base == MAP_FAILED) { close(fd); atomic_fetch_add(&n_fallback, 1); return NULL; }
+    close(fd);                           /* mapping holds the inode; no fd kept */
+    hdr_t *h = (hdr_t *)base;
+    h->magic = MAGIC; h->user_size = size; h->total = total; h->fd = -1;
+    atomic_fetch_add(&n_big, 1);
+    atomic_fetch_add(&n_big_bytes, size);
+    return (char *)base + PAGE;
+}
+
+/* Is this pointer one of ours? Only possible if page-aligned; verify the
+ * header page is mapped (mincore) before dereferencing. */
+static hdr_t *big_hdr(void *p) {
+    if (((uintptr_t)p & (PAGE - 1)) != 0) return NULL;
+    char *hp = (char *)p - PAGE;
+    unsigned char vec;
+    if (mincore(hp, 1, &vec) != 0) return NULL;   /* unmapped -> not ours */
+    hdr_t *h = (hdr_t *)hp;
+    return h->magic == MAGIC ? h : NULL;
+}
+
+static void *big_alloc(size_t size) { return big_alloc2(size, 0); }
+
+static void big_free(hdr_t *h) {
+    int fd = h->fd;                      /* -1 in the fd-free pool design */
+    size_t total = h->total;
+    h->magic = 0;                    /* total+fd stay for pooled reuse */
+    atomic_fetch_add(&n_free_big, 1);
+    if (pool_put(h, total, fd)) return;
+    munmap(h, total);
+    if (fd >= 0) close(fd);
+}
+
+/* ---- interposed API ---- */
+void *malloc(size_t size) {
+    ensure_init();
+    if (!real_malloc) return boot_alloc(size);
+    if (size >= g_threshold) {
+        void *p = big_alloc(size);
+        if (p) return p;
+    }
+    return real_malloc(size);
+}
+
+void free(void *p) {
+    if (!p || in_boot(p)) return;
+    ensure_init();
+    hdr_t *h = big_hdr(p);
+    if (h) { big_free(h); return; }
+    if (real_free) real_free(p);
+}
+
+void *calloc(size_t n, size_t sz) {
+    ensure_init();
+    if (!real_calloc) { void *p = boot_alloc(n * sz); memset(p, 0, n * sz); return p; }
+    size_t bytes = n * sz;
+    if (sz != 0 && bytes / sz != n) { errno = ENOMEM; return NULL; }
+    if (bytes >= g_threshold) {
+        void *p = big_alloc2(bytes, 1);  /* pooled reuse must be re-zeroed */
+        if (p) return p;
+    }
+    return real_calloc(n, sz);
+}
+
+void *realloc(void *p, size_t size) {
+    ensure_init();
+    if (!p) return malloc(size);
+    if (size == 0) { free(p); return NULL; }
+    hdr_t *h = big_hdr(p);
+    if (h) {
+        if (size <= h->total - PAGE) { h->user_size = size; return p; }
+        void *np = malloc(size);
+        if (!np) return NULL;
+        memcpy(np, p, h->user_size < size ? h->user_size : size);
+        big_free(h);
+        return np;
+    }
+    if (in_boot(p)) {                      /* size unknown; copy generously */
+        void *np = malloc(size);
+        if (np) memcpy(np, p, size);
+        return np;
+    }
+    if (size >= g_threshold) {
+        /* foreign small->big promotion: we don't know the old size, so let the
+         * real allocator grow it; it stays anonymous. Counted for honesty. */
+        atomic_fetch_add(&n_fallback, 1);
+    }
+    return real_realloc(p, size);
+}
+
+void *aligned_alloc(size_t align, size_t size) {
+    ensure_init();
+    if (size >= g_threshold && align <= PAGE && (PAGE % (align ? align : 1)) == 0) {
+        void *p = big_alloc(size);
+        if (p) return p;
+    }
+    return real_aligned_alloc ? real_aligned_alloc(align, size) : NULL;
+}
+
+int posix_memalign(void **out, size_t align, size_t size) {
+    ensure_init();
+    if (size >= g_threshold && align <= PAGE) {
+        void *p = big_alloc(size);
+        if (p) { *out = p; return 0; }
+    }
+    return real_posix_memalign ? real_posix_memalign(out, align, size) : ENOMEM;
+}
+
+void *memalign(size_t align, size_t size) {
+    ensure_init();
+    if (size >= g_threshold && align <= PAGE) {
+        void *p = big_alloc(size);
+        if (p) return p;
+    }
+    return real_memalign ? real_memalign(align, size) : NULL;
+}
+
+void *valloc(size_t size) { return memalign(PAGE, size); }
+
+/* ---- mmap leg: large MAP_ANONYMOUS|MAP_PRIVATE scratch bypasses malloc
+ * entirely (oneDNN compiled-graph scratch does this), so the malloc hook
+ * never sees it and it stays anonymous — the measured C1 floor leak. Serve
+ * those mappings from the same O_TMPFILE pool: map the tmpfile MAP_SHARED
+ * and close the fd immediately (the mapping holds the reference; the
+ * unlinked inode dies with the mapping), so munmap/mremap/madvise need no
+ * tracking. Fresh sparse file pages read as zeros — MAP_ANONYMOUS's
+ * zero-on-first-touch semantics are preserved.
+ * Interposed only when: addr==NULL, writable, non-exec, anonymous+private,
+ * no MAP_FIXED/MAP_STACK/HUGETLB, and len >= threshold (the fd argument is
+ * ignored by the kernel for anonymous mappings, so any value passes).
+ * ELASTIC_MMAP=0 disables the leg. */
+#include <sys/syscall.h>
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
+    ensure_init();
+    if (g_in_init || !real_mmap)
+        return (void *)syscall(SYS_mmap, addr, len, prot, flags, fd, off);
+    if (g_mmap_on && addr == NULL && len >= g_threshold
+        && (prot & PROT_WRITE) && !(prot & PROT_EXEC)
+        && (flags & MAP_ANONYMOUS) && !(flags & MAP_SHARED)
+        && !(flags & (MAP_FIXED | MAP_FIXED_NOREPLACE | MAP_STACK
+                      | MAP_HUGETLB | MAP_SYNC))) {
+        int tf = open(g_dir, O_TMPFILE | O_RDWR | O_EXCL, 0600);
+        if (tf >= 0) {
+            if (ftruncate(tf, (off_t)len) == 0) {
+                void *p = real_mmap(NULL, len, PROT_READ | PROT_WRITE,
+                                    MAP_SHARED, tf, 0);
+                close(tf);              /* mapping holds the reference */
+                if (p != MAP_FAILED) {
+                    atomic_fetch_add(&n_mmap, 1);
+                    atomic_fetch_add(&n_mmap_bytes, len);
+                    return p;
+                }
+            } else {
+                close(tf);
+            }
+        }
+        atomic_fetch_add(&n_mmap_fb, 1);
+    }
+    return real_mmap(addr, len, prot, flags, fd, off);
+}
+
+__attribute__((destructor)) static void report(void) {
+    if (!g_log) return;
+    fprintf(stderr,
+            "[elastic] big_allocs=%llu (%.1f MB total) big_frees=%llu pool_hits=%llu pool_puts=%llu fallbacks=%llu threshold=%zuMB dir=%s\n"
+            "[elastic] mmap_leg=%llu (%.1f MB) mmap_fallbacks=%llu\n",
+            (unsigned long long)n_big,
+            (double)n_big_bytes / 1048576.0,
+            (unsigned long long)n_free_big,
+            (unsigned long long)n_pool_hit,
+            (unsigned long long)n_pool_put,
+            (unsigned long long)n_fallback,
+            g_threshold >> 20, g_dir,
+            (unsigned long long)n_mmap,
+            (double)n_mmap_bytes / 1048576.0,
+            (unsigned long long)n_mmap_fb);
+}

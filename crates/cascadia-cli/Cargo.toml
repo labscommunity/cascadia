@@ -40,6 +40,8 @@ cascadia-api = { workspace = true }
 cascadia-dashboard = { workspace = true }
 cascadia-discovery = { workspace = true }
 cascadia-topology = { workspace = true }
+cascadia-elastic = { workspace = true }
+cascadia-transport = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 hyper = { version = "1", features = ["server", "http1"] }
