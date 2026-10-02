@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use super::read_buffers::ReadBuffer;
 
-#[derive(Clone, Copy, Default, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct ExpertCacheStats {
     pub capacity_bytes: usize,
     pub retained_bytes: usize,
@@ -93,16 +93,17 @@ impl ExpertCache {
         }))
     }
 
-    /// Per-MoE-layer MiB; default zero. Invalid or >1024 MiB settings disable
-    /// it (256 MiB × 64 layers = the 16 GiB the campaign-129 profile runs;
-    /// the headroom above that is for boxes that free RAM elsewhere, e.g.
-    /// attention served from an iGPU copy). Allocations grow only on
-    /// successful decode reads, never during prefill.
+    /// Per-MoE-layer MiB; default zero. Invalid or >16384 MiB settings
+    /// disable it (256 MiB × 64 layers = the 16 GiB the campaign-129 profile
+    /// runs on a paged 64 GB box; a resident pipeline rank sets it at or
+    /// above a layer's 7.7 GiB of experts so its slice stays in RAM).
+    /// Allocations grow only on successful decode reads, never during
+    /// prefill.
     pub fn configured_bytes() -> usize {
         std::env::var("CASCADIA_INKLING_EXPERT_CACHE_MIB")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&mib| mib <= 1024)
+            .filter(|&mib| mib <= 16384)
             .unwrap_or(0)
             * 1024
             * 1024

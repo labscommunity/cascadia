@@ -558,18 +558,11 @@ the way to get five or six layers per 64 GB; that is unmeasured here.
 
 ## Open follow-ups
 
-- **Multi-stream decode (aggregate throughput).** The pipeline engine serves
-  one request at a time; the fused MoE kernel already batches rows (2.4 ms
-  per row at 23 rows against 4.5 ms for one), so several streams per step
-  would raise a rank's tokens per second toward the bandwidth floor. Needs
-  per-stream KV and conv slots in `AttentionLayer` (the state is already
-  separable — `LayerState` snapshot/restore exists), a `forward_tokens` over
-  `(slot, token)` rows in `Model`/`InklingStage`, and a scheduler in the
-  engine that steps every active task together (the `StagedRunner` trait
-  is per stream today).
-
-- Per-rank KV-prefix cache and the qwen35-style in-process prefix cache (TTFT).
-- MTP draft head (exported? no — dropped) / n-gram speculative decode: the
-  rewind slack is in place.
-- Vision / audio inputs (encoders dropped).
-- Hot/cold expert residency (`CASCADIA_GLM5_HOTCOLD` port) for paged runs.
+- **Multi-stream decode (aggregate throughput).** Done: per-stream
+  sequence slots in the layers, `Layer::forward_rows` over `(slot, token)`
+  rows, a single-stage scheduler (`CASCADIA_STREAMS=N`) and a pipeline wire
+  with G micro-batches in flight (`CASCADIA_STREAMS_INFLIGHT`) — see
+  [`../perf/INKLING_MULTISTREAM.md`](../perf/INKLING_MULTISTREAM.md).
+  Still open: real-model aggregate numbers on hardware, prefill/decode
+  mixing inside one micro-batch (a prefill currently stalls the other
+  streams for its duration), and per-stream prefix caching.

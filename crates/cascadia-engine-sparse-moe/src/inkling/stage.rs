@@ -6,6 +6,7 @@
 //! [`crate::engine::PipelineEngine`] drives it exactly like glm5 / dsv4.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::ep::EpClient;
@@ -55,10 +56,25 @@ pub struct InklingRunner {
     max_seq: usize,
     eos: Vec<u32>,
     pos: usize,
+    /// Multi-stream slots: `Some(pos)` while a sequence owns the slot, `None`
+    /// when free. Empty on the single-sequence path.
+    streams: Vec<Option<usize>>,
     pub rank: u32,
     pub total: u32,
     pub lo: usize,
     pub hi: usize,
+    /// Per-layer branch clocks for the stage profile; `None` until
+    /// [`StagedRunner::enable_profile`].
+    profile: Option<Arc<ProfileClocks>>,
+}
+
+/// Decode / prefill time per branch, summed over this rank's layers.
+#[derive(Default)]
+struct ProfileClocks {
+    decode_attn_ns: AtomicU64,
+    decode_mlp_ns: AtomicU64,
+    prefill_attn_ns: AtomicU64,
+    prefill_mlp_ns: AtomicU64,
 }
 
 impl InklingRunner {
@@ -159,11 +175,26 @@ impl InklingRunner {
             max_seq,
             eos: m.eos_token_ids.clone(),
             pos: 0,
+            streams: Vec::new(),
             rank,
             total,
             lo,
             hi,
+            profile: None,
         })
+    }
+}
+
+impl InklingRunner {
+    /// Expert-cache counters summed over this rank's MoE layers.
+    pub fn expert_cache_stats_total(&self) -> super::ExpertCacheStats {
+        let mut total = super::ExpertCacheStats::default();
+        for l in &self.layers {
+            if let Some(m) = l.moe() {
+                total.add(m.expert_cache_stats());
+            }
+        }
+        total
     }
 }
 
@@ -236,5 +267,150 @@ impl StagedRunner for InklingRunner {
             .as_ref()
             .expect("head_logits on a non-last rank")
             .logits(hidden)
+    }
+    fn head_logits_rows(&self, hidden: &[f32], rows: usize) -> Vec<f32> {
+        self.head
+            .as_ref()
+            .expect("head_logits_rows on a non-last rank")
+            .logits_rows(hidden, rows)
+    }
+
+    // ---- multi-stream decode ---------------------------------------------
+    fn enable_profile(&mut self) {
+        if self.profile.is_some() {
+            return;
+        }
+        let clocks = Arc::new(ProfileClocks::default());
+        for l in &mut self.layers {
+            let c = Arc::clone(&clocks);
+            l.set_timing_observer(Some(Arc::new(move |t: super::model::LayerTiming| {
+                let (attn, mlp) = if t.prefill {
+                    (&c.prefill_attn_ns, &c.prefill_mlp_ns)
+                } else {
+                    (&c.decode_attn_ns, &c.decode_mlp_ns)
+                };
+                attn.fetch_add(t.attention.as_nanos() as u64, Ordering::Relaxed);
+                mlp.fetch_add(t.mlp.as_nanos() as u64, Ordering::Relaxed);
+            })));
+        }
+        self.profile = Some(clocks);
+    }
+    fn profile(&self) -> Option<crate::staged::RunnerProfile> {
+        let c = self.profile.as_ref()?;
+        let cache = self.expert_cache_stats_total();
+        let attn = self
+            .layers
+            .iter()
+            .find_map(|l| l.ov_attn())
+            .map(|o| o.stats());
+        let head = self.head.as_ref().and_then(|h| h.ov()).map(|o| o.stats());
+        Some(crate::staged::RunnerProfile {
+            decode_attn_ns: c.decode_attn_ns.load(Ordering::Relaxed),
+            decode_mlp_ns: c.decode_mlp_ns.load(Ordering::Relaxed),
+            prefill_attn_ns: c.prefill_attn_ns.load(Ordering::Relaxed),
+            prefill_mlp_ns: c.prefill_mlp_ns.load(Ordering::Relaxed),
+            cache_hits: cache.hits,
+            cache_misses: cache.misses,
+            cache_retained_mib: (cache.retained_bytes >> 20) as u64,
+            cache_capacity_mib: (cache.capacity_bytes >> 20) as u64,
+            ov_attn_calls: attn.map_or(0, |a| a.calls),
+            ov_attn_ns: attn.map_or(0, |a| a.call_ns),
+            ov_head_calls: head.map_or(0, |h| h.calls),
+            ov_head_ns: head.map_or(0, |h| h.call_ns),
+        })
+    }
+    fn stream_capacity(&self) -> usize {
+        self.streams.len()
+    }
+    fn configure_streams(&mut self, n: usize) -> bool {
+        if n == 0 {
+            return false;
+        }
+        for l in &mut self.layers {
+            l.ensure_slots(n);
+        }
+        if self.streams.len() < n {
+            self.streams.resize(n, None);
+        }
+        let per_slot: usize = self.layers.iter().map(Layer::slot_bytes).sum();
+        tracing::info!(
+            rank = self.rank,
+            streams = n,
+            slot_mib = per_slot >> 20,
+            pool_mib = (per_slot * n) >> 20,
+            "inkling stream slots allocated"
+        );
+        true
+    }
+    fn open_stream(&mut self) -> Option<usize> {
+        let slot = self.streams.iter().position(Option::is_none)?;
+        for l in &mut self.layers {
+            l.select_slot(slot);
+            l.reset();
+        }
+        self.streams[slot] = Some(0);
+        Some(slot)
+    }
+    fn open_stream_at(&mut self, slot: usize) -> bool {
+        if slot >= self.streams.len() {
+            return false;
+        }
+        for l in &mut self.layers {
+            l.select_slot(slot);
+            l.reset();
+        }
+        self.streams[slot] = Some(0);
+        true
+    }
+    fn close_stream(&mut self, slot: usize) {
+        if let Some(s) = self.streams.get_mut(slot) {
+            *s = None;
+        }
+    }
+    fn stream_pos(&self, slot: usize) -> usize {
+        self.streams.get(slot).copied().flatten().unwrap_or(0)
+    }
+    fn prefill_stream(&mut self, slot: usize, hidden: Vec<f32>, rows: usize) -> Vec<f32> {
+        let pos = self.streams[slot].expect("prefill_stream on a free slot");
+        assert_eq!(
+            hidden.len(),
+            rows * self.hidden,
+            "inkling prefill_stream: bad hidden length"
+        );
+        let mut x = hidden;
+        for l in &mut self.layers {
+            l.select_slot(slot);
+            x = l.forward_prefill(&x, rows);
+        }
+        self.streams[slot] = Some(pos + rows);
+        x
+    }
+    fn decode_streams(&mut self, hidden: Vec<f32>, slots: &[usize]) -> Vec<f32> {
+        let rows = slots.len();
+        assert_eq!(
+            hidden.len(),
+            rows * self.hidden,
+            "inkling decode_streams: bad hidden length"
+        );
+        for (i, &s) in slots.iter().enumerate() {
+            assert!(
+                self.streams[s].is_some(),
+                "decode_streams: slot {s} is free"
+            );
+            assert!(
+                !slots[..i].contains(&s),
+                "decode_streams: slot {s} listed twice in one step"
+            );
+        }
+        let mut x = hidden;
+        for l in &mut self.layers {
+            x = l.forward_rows(&x, rows, slots);
+        }
+        for &s in slots {
+            if let Some(p) = self.streams[s].as_mut() {
+                *p += 1;
+            }
+        }
+        x
     }
 }
