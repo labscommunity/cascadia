@@ -194,7 +194,7 @@ pub enum FrameKind {
     /// with [`STREAM_FEED_FINAL`] is sampled and answered with `StreamTokens`.
     /// Windows travel the pipeline back to back, so rank 1 works on the first
     /// while rank 0 computes the second.
-    StreamFeed = 0x53_4D_45_64, // "SME\x64"
+    StreamFeed = 0x534D_4564, // "SME\x64"
 }
 
 impl FrameKind {
