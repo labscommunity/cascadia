@@ -452,7 +452,7 @@ impl Layer {
         let mut h2 = x1.clone();
         rmsnorm_f32(&mut h2, &self.mlp_norm, self.eps);
         let m = match &self.mlp {
-            LayerMlp::Moe(m) => m.forward_batch(&h2, rows),
+            LayerMlp::Moe(m) => m.forward_batch_decode(&h2, rows),
             LayerMlp::Dense(d) => {
                 let mut m = vec![0.0f32; rows * hd];
                 for (r, row) in h2.chunks_exact(hd).enumerate() {
