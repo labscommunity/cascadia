@@ -4,7 +4,7 @@ The sparse-MoE pipeline engine served one request at a time: rank 0 popped a
 task, prefilled it, then drove one token per step through every rank while
 every other rank sat idle waiting for that one frame. This note describes the
 multi-stream scheduler that replaces it for Inkling, what it is built on, how
-it was validated, and what it means for a 12-box installation.
+it was validated, and what it means for a multi-box pipeline.
 
 ## What changed
 
@@ -80,9 +80,8 @@ one group vs four: same tokens, 1.5–2× less wall time.
 | local API run (`cascadia run`, fixture, `CASCADIA_STREAMS=4`) | four concurrent `/v1/completions` return exactly what the one-task path returns |
 | the crate's 439 tests | no regression |
 
-Measured on hardware below (four boxes). Not yet run: the 12-box fleet
-itself and a Linux iGPU rank (no Linux Panther Lake box was reachable; the
-installer's iGPU path is the same tools and IRs that ran on Windows).
+Measured on hardware below (four boxes). Not yet run: a longer pipeline
+and a Linux iGPU rank (no Linux Panther Lake box was reachable).
 
 ## Measured on four boxes (2026-09-18)
 
@@ -138,23 +137,14 @@ regime, and about the 12–15 ms the tate-07 whole-model profile showed for
 its cache-resident layers. TTFT halves as well (the prefill also runs from
 the cache).
 
-**The installed pipeline** (`deploy/inkling-fleet`: `install.ps1 -Rank 0`
-on delta from the SSD tree — side-by-side runtime, private Python, fused IR
-generated on the box in 27 s, scheduled task — with the three NUC ranks
-under a restart loop; `bench.py` from another box): 8.5 tok/s for one
-stream, 10.8 summed at 8 streams, 19.1 summed at 16 (13.5 tok/s
-aggregate including the 11 s mean time to first token). Same numbers as
-the hand-launched pipeline, from a box installed by the one command the
-venue will use.
-
 **Rank 0 on the iGPU** (delta's Arc B390 through the side-by-side OpenVINO
 2026.3.1 runtime: int8 attention IRs on its three layers with the Rust
 copies released, the int8 head IR, the fused MoE IR for layer 2 generated
 on the box in 52 s; the NUC ranks unchanged): 8.4 tok/s single, 17.8 sum at
 16 streams, windows to 21.5, zero fallbacks. Rank 0 owns one MoE layer, so
 the pipeline's number barely moves; the point of the run is that the whole
-iGPU path — runtime install, IR generation, fused kernel, multi-stream
-frames — works on a Windows box that had nothing on it.
+iGPU path — IR generation, fused kernel, multi-stream frames — works on a
+Windows box.
 
 **What a paged three-layer rank looks like**, for contrast (the first
 attempt, three MoE layers per NUC with the tuned profile at 8 GB of cache
@@ -162,7 +152,7 @@ per layer, RAM oversubscribed): 1.25 tok/s single stream — 85 ms per MoE
 layer, exactly the 256 MB of expert bytes per token at the NVMe's 3 GB/s
 — and 5.6 tok/s sum at 16 streams. Residency is everything.
 
-## What to expect on the 12-box pipeline
+## What to expect on a 12-rank pipeline
 
 From the per-layer numbers in `INKLING_SINGLE_BOX_BENCH.md` (resident
 ranks, 5–6 layers per box):

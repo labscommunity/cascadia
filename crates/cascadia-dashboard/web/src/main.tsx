@@ -12,7 +12,6 @@ import { BrowserRouter, Route, Routes } from "react-router-dom";
 import { Layout } from "@/components/Layout";
 import { Chat } from "@/pages/Chat";
 import { Dashboard } from "@/pages/Dashboard";
-import { Streams } from "@/pages/Streams";
 
 const rootEl = document.getElementById("root");
 if (!rootEl) throw new Error("#root element missing from index.html");
@@ -24,7 +23,6 @@ createRoot(rootEl).render(
         <Route element={<Layout />}>
           <Route path="/" element={<Dashboard />} />
           <Route path="/chat" element={<Chat />} />
-          <Route path="/streams" element={<Streams />} />
         </Route>
       </Routes>
     </BrowserRouter>
