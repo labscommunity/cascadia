@@ -50,6 +50,17 @@ impl Default for SamplingParams {
     }
 }
 
+/// One chat turn forwarded verbatim to a downstream chat server that applies
+/// its own template (sycl-llama: llama-server renders the GGUF's chat
+/// template). Only `role` + `content` are carried — tool calls and multimodal
+/// parts are not plumbed through this path yet.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ChatTurn {
+    pub role: String,
+    #[serde(default)]
+    pub content: String,
+}
+
 /// One generation request, end-to-end.
 ///
 /// Engines that don't support a given option silently ignore it — the API
@@ -58,6 +69,13 @@ impl Default for SamplingParams {
 pub struct GenerationTask {
     pub task_id: TaskId,
     pub prompt: String,
+    /// Structured chat turns. When non-empty, engines that speak to a
+    /// downstream chat endpoint forward them verbatim and let the child apply
+    /// its own chat template; `prompt` stays the rendered fallback for every
+    /// other engine. Empty for prompt-only tasks (the legacy /v1/completions
+    /// path and every non-chat request).
+    #[serde(default)]
+    pub messages: Vec<ChatTurn>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     #[serde(default)]
@@ -169,6 +187,7 @@ impl GenerationTask {
         Self {
             task_id: task_id.into(),
             prompt: prompt.into(),
+            messages: Vec::new(),
             max_tokens: default_max_tokens(),
             temperature: 0.0,
             logprobs: 0,
@@ -212,6 +231,7 @@ mod tests {
         let t = GenerationTask {
             task_id: "t1".to_string(),
             prompt: "hello".to_string(),
+            messages: Vec::new(),
             max_tokens: default_max_tokens(),
             temperature: 0.0,
             logprobs: 0,

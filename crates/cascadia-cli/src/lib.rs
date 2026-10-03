@@ -2552,6 +2552,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         let task = GenerationTask {
             task_id: format!("stdin-{counter}"),
             prompt: line,
+            messages: Vec::new(),
             max_tokens: args.max_tokens,
             temperature: 0.0,
             logprobs: 0,

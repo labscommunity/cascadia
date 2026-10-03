@@ -236,12 +236,32 @@ impl LlamaCppEngine {
         let (tx, rx) = channel();
         self.rx = Some(rx);
 
-        let body = serde_json::json!({
-            "prompt": task.prompt,
-            "n_predict": task.max_tokens,
-            "temperature": task.temperature,
-            "stream": true,
-        });
+        // Structured chat turns go to the child's chat endpoint so
+        // llama-server renders the model's own (GGUF) chat template.
+        // Prompt-only tasks (the legacy /v1/completions path) keep the
+        // completions endpoint with the pre-rendered prompt.
+        let (endpoint, body) = if task.messages.is_empty() {
+            let body = serde_json::json!({
+                "prompt": task.prompt,
+                "n_predict": task.max_tokens,
+                "temperature": task.temperature,
+                "stream": true,
+            });
+            ("/v1/completions", body)
+        } else {
+            let messages: Vec<serde_json::Value> = task
+                .messages
+                .iter()
+                .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+                .collect();
+            let body = serde_json::json!({
+                "messages": messages,
+                "max_tokens": task.max_tokens,
+                "temperature": task.temperature,
+                "stream": true,
+            });
+            ("/v1/chat/completions", body)
+        };
         let body = body.to_string();
         let mut s = match TcpStream::connect(("127.0.0.1", port)) {
             Ok(s) => s,
@@ -258,7 +278,8 @@ impl LlamaCppEngine {
                 let _ = tx.send(r);
             };
             let req = format!(
-                "POST /v1/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                "POST {} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                endpoint,
                 body.len(),
                 body
             );

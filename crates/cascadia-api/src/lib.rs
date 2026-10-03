@@ -18,7 +18,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use cascadia_runner::Runner;
-use cascadia_types::GenerationTask;
+use cascadia_types::{ChatTurn, GenerationTask};
 use chrono::Utc;
 use futures::stream::{self, Stream};
 use futures::StreamExt;
@@ -2293,6 +2293,18 @@ async fn chat_completions(
     let task = GenerationTask {
         task_id: task_id.clone(),
         prompt,
+        // Structured turns for engines that forward the conversation to a
+        // downstream chat server applying its own template (sycl-llama:
+        // llama-server renders the GGUF chat template). Other engines ignore
+        // the field and keep consuming `prompt`.
+        messages: req
+            .messages
+            .iter()
+            .map(|m| ChatTurn {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
+            .collect(),
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         logprobs: req.logprobs_count(),
@@ -2525,6 +2537,8 @@ async fn completions(
         task_id: task_id.clone(),
         // Raw prompt — the legacy endpoint does NOT apply a chat template.
         prompt: prompt.clone(),
+        // Prompt-only: no structured turns on the /v1/completions path.
+        messages: Vec::new(),
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         logprobs: req.logprobs_count(),
