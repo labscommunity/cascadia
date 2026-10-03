@@ -146,7 +146,7 @@ impl Builder for LlamaCppBuilder {
         // cannot (nested runtime panics); the SSE reader is a plain thread.
         let port = self.port;
         let t0 = Instant::now();
-        let deadline = Duration::from_secs(600);
+        let deadline = Duration::from_secs(120);
         loop {
             if let Some(c) = self.child.as_mut() {
                 if let Ok(Some(st)) = c.try_wait() {
@@ -178,8 +178,8 @@ impl Builder for LlamaCppBuilder {
         Ok(Box::pin(stream::iter(evs)))
     }
 
-    fn build(self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
-        let child = self.child.ok_or(EngineError::NotLoaded)?;
+    fn build(mut self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
+        let child = self.child.take().ok_or(EngineError::NotLoaded)?;
         Ok(Box::new(LlamaCppEngine {
             base: format!("http://127.0.0.1:{}", self.port),
             child,
@@ -187,6 +187,7 @@ impl Builder for LlamaCppBuilder {
             active: None,
             rx: None,
             cancelled: Arc::new(AtomicBool::new(false)),
+            socket: None,
         }))
     }
 
@@ -195,6 +196,12 @@ impl Builder for LlamaCppBuilder {
             let _ = c.kill();
             let _ = c.wait();
         }
+    }
+}
+
+impl Drop for LlamaCppBuilder {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -208,6 +215,7 @@ pub struct LlamaCppEngine {
     active: Option<TaskId>,
     rx: Option<Receiver<EngineResult<(TaskId, Chunk)>>>,
     cancelled: Arc<AtomicBool>,
+    socket: Option<TcpStream>,
 }
 
 impl LlamaCppEngine {
@@ -235,17 +243,19 @@ impl LlamaCppEngine {
             "stream": true,
         });
         let body = body.to_string();
+        let mut s = match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = tx.send(Err(EngineError::Backend(format!("connect: {e}"))));
+                return;
+            }
+        };
+        let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
+        self.socket = s.try_clone().ok();
 
         std::thread::spawn(move || {
             let send = |r: EngineResult<(TaskId, Chunk)>| {
                 let _ = tx.send(r);
-            };
-            let mut s = match TcpStream::connect(("127.0.0.1", port)) {
-                Ok(s) => s,
-                Err(e) => {
-                    send(Err(EngineError::Backend(format!("connect: {e}"))));
-                    return;
-                }
             };
             let req = format!(
                 "POST /v1/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -350,13 +360,21 @@ fn handle_sse_line(
     let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
         return true;
     };
-    let text = v["choices"][0]["text"].as_str().unwrap_or("").to_string();
-    let stop = v["choices"][0]["finish_reason"].is_string();
-    let mut c = Chunk::token(tid.clone(), *token_id, text);
+    let text = v["choices"][0]["delta"]["content"].as_str().or(v["choices"][0]["text"].as_str()).unwrap_or("");
+    let stop_str = v["choices"][0]["finish_reason"].as_str();
+    let stop = stop_str.is_some();
+    // Let stop-only chunks through even if empty
+    if text.is_empty() && !stop {
+        return true;
+    }
+    let mut c = Chunk::token(tid.clone(), *token_id, text.to_string());
     *token_id += 1;
     if stop {
         c.is_final = true;
-        c.finish_reason = Some(cascadia_types::FinishReason::Stop);
+        c.finish_reason = match stop_str {
+            Some("length") => Some(cascadia_types::FinishReason::Length),
+            Some("stop") | _ => Some(cascadia_types::FinishReason::Stop),
+        };
     }
     send(Ok((tid.clone(), c)));
     !stop
@@ -386,10 +404,7 @@ impl Engine for LlamaCppEngine {
                 return Ok(vec![]);
             }
         }
-        // Wait for the next chunk. step() must not spin empty — the runner
-        // fails a stream after MAX_CONSECUTIVE_EMPTY_STEPS=3, far less than
-        // a first-token latency. This engine is batch=1, so blocking here
-        // until the reader produces something is the right behavior.
+        // Wait for the next chunk. step() must not spin empty
         let mut out = Vec::new();
         let mut done = false;
         if let Some(rx) = &self.rx {
@@ -399,8 +414,8 @@ impl Engine for LlamaCppEngine {
                     if chunk.is_final {
                         done = true;
                     }
-                    out.push((tid, chunk));
-                    // then drain anything else already buffered
+                    out.push((tid.clone(), chunk));
+                    // drain anything else already buffered for this task
                     while let Ok(item) = rx.try_recv() {
                         let (tid, chunk) = item?;
                         if chunk.is_final {
@@ -410,19 +425,20 @@ impl Engine for LlamaCppEngine {
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    // Reader thread ended without a final chunk — engine-level
-                    // failure for the active task.
                     let tid = self.active.take().unwrap();
                     let mut c = Chunk::token(tid.clone(), 0, "");
                     c.is_final = true;
                     c.error = Some("completion stream ended without [DONE]".into());
                     out.push((tid, c));
-                    self.rx = None;
+                    done = true;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    return Err(EngineError::Backend(
-                        "completion stream stalled >300s".into(),
-                    ));
+                    let tid = self.active.take().unwrap();
+                    let mut c = Chunk::token(tid.clone(), 0, "");
+                    c.is_final = true;
+                    c.error = Some("completion stream stalled >300s".into());
+                    out.push((tid, c));
+                    done = true;
                 }
             }
         }
@@ -448,6 +464,9 @@ impl Engine for LlamaCppEngine {
         self.pending.retain(|t| &t.task_id != task_id);
         if self.active.as_ref() == Some(task_id) {
             self.cancelled.store(true, Ordering::Relaxed);
+            if let Some(s) = self.socket.take() {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
             self.active = None;
             self.rx = None;
         }
@@ -455,7 +474,16 @@ impl Engine for LlamaCppEngine {
 
     fn close(&mut self) {
         self.cancelled.store(true, Ordering::Relaxed);
+        if let Some(s) = self.socket.take() {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+impl Drop for LlamaCppEngine {
+    fn drop(&mut self) {
+        self.close();
     }
 }
