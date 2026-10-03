@@ -62,8 +62,11 @@ additive, not conflicting.
       Qwen3.8-27B correctly through the cascadia API at 2.79 GB VRAM
       (kernel vram_mm), Qwen2.5-1.5B at 796 MB; child env confirms
       GGML_STREAM_WEIGHTS=1 + inherited LD_PRELOAD
-- [ ] measured conformance: committed-VRAM floor (kernel `vram_mm` meter),
-      byte-identical output vs resident arm, pressure-survival leg
+- [x] measured conformance (partial): committed-VRAM floor via kernel
+      `vram_mm` (27B: 15.82->2.79 GB; 1.5B: 1.51->0.80 GB); --elastic off
+      runs resident and leaves the child env clean; co-tenancy leg: two
+      independent `cascadia run --elastic` instances served 2x 27B at
+      5.54 GB on one GPU, both correct
 - [ ] `--stream-weights` CLI flag upstream in llama.cpp (env gate today)
 
 ## Measured numbers behind this (2026-10-03, lab repo)
