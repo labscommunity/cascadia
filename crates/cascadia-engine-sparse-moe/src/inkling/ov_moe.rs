@@ -95,65 +95,6 @@ pub(crate) fn device_ns(rt: &Runtime) -> u64 {
         * 1000
 }
 
-/// `CASCADIA_INKLING_OV_MOE_DECODE_DIR`: folder (next to `moe_ov/`) of layers
-/// that run through the plugin's decode kernels.
-fn decode_dir_name() -> Option<&'static str> {
-    use std::sync::OnceLock;
-    static D: OnceLock<Option<String>> = OnceLock::new();
-    D.get_or_init(|| {
-        std::env::var("CASCADIA_INKLING_OV_MOE_DECODE_DIR")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty() && !v.contains('/') && !v.contains(".."))
-    })
-    .as_deref()
-}
-
-/// `CASCADIA_INKLING_OV_MOE_DECODE_LAYERS` (`all` or a comma list): layers
-/// that take the plugin's decode kernels from their ordinary group-32 IR.
-/// That needs a plugin whose MoE kernels run with sub-group 16 on this GPU
-/// (Xe2 and newer default to 32, which refuses group 32: autolab 026, 029).
-fn decode_layer_listed(lid: u32) -> bool {
-    let (all, list) = decode_layer_list();
-    *all || list.contains(&lid)
-}
-
-/// Whether any layer is listed (the per-layer plugin knob must then be set
-/// for every layer this process compiles, listed or not).
-fn decode_layers_configured() -> bool {
-    let (all, list) = decode_layer_list();
-    *all || !list.is_empty()
-}
-
-fn decode_layer_list() -> &'static (bool, Vec<u32>) {
-    use std::sync::OnceLock;
-    static L: OnceLock<(bool, Vec<u32>)> = OnceLock::new();
-    L.get_or_init(|| {
-        let v = std::env::var("CASCADIA_INKLING_OV_MOE_DECODE_LAYERS").unwrap_or_default();
-        let v = v.trim();
-        (
-            v.eq_ignore_ascii_case("all"),
-            v.split(',').filter_map(|t| t.trim().parse().ok()).collect(),
-        )
-    })
-}
-
-/// `CASCADIA_INKLING_OV_MOE_DECODE_ROWS` (default 1): calls of at most this
-/// many rows take the decode kernels on a decode layer, unpadded. They read
-/// at the bus limit but share no expert between rows: measured equal to the
-/// prefill path at two rows and slower beyond (026), so one row by default.
-fn decode_rows() -> usize {
-    use std::sync::OnceLock;
-    static R: OnceLock<usize> = OnceLock::new();
-    *R.get_or_init(|| {
-        std::env::var("CASCADIA_INKLING_OV_MOE_DECODE_ROWS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(1)
-            .clamp(1, 32)
-    })
-}
-
 /// `CASCADIA_INKLING_OV_WARM_ROWS`: a row count whose device shapes are
 /// compiled at load (the prompt window), so no request pays for it.
 pub(crate) fn warm_rows() -> Option<usize> {
@@ -465,7 +406,10 @@ impl OvMoe {
         if let Some(&f) = self.out_scale.lock().unwrap().get(&lid) {
             return f;
         }
-        let side = self.layer_dir(lid).join("cascadia_moe.json");
+        let side = self
+            .dir
+            .join(format!("layer_{lid:02}"))
+            .join("cascadia_moe.json");
         let n = std::fs::read_to_string(&side)
             .ok()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
@@ -486,48 +430,9 @@ impl OvMoe {
     }
 
     fn xml(&self, lid: u32) -> PathBuf {
-        self.layer_dir(lid).join("openvino_model.xml")
-    }
-
-    /// The folder of `lid`'s IR. `CASCADIA_INKLING_OV_MOE_DECODE_DIR=moe_ov_g64`
-    /// names a sibling of `moe_ov/` holding the same layers re-quantised to a
-    /// wider int4 group (run.sh writes them when `CASCADIA_FUSE_GROUP` asks):
-    /// the GPU plugin's MoE decode kernels (batched GEMV: three kernels and no
-    /// host synchronisation per call) refuse group 32 on Xe2 and newer. A
-    /// layer found there is compiled with the decode threshold ON, every other
-    /// layer keeps the prefill path, so one rank can run both side by side.
-    fn layer_dir(&self, lid: u32) -> PathBuf {
-        if let Some(alt) = decode_dir_name() {
-            if let Some(parent) = self.dir.parent() {
-                let d = parent.join(alt).join(format!("layer_{lid:02}"));
-                if d.join("openvino_model.xml").is_file() {
-                    return d;
-                }
-            }
-        }
-        self.dir.join(format!("layer_{lid:02}"))
-    }
-
-    /// Whether `lid` runs from the re-quantised folder (see [`Self::layer_dir`]).
-    pub fn is_regrouped(&self, lid: u32) -> bool {
-        decode_dir_name().is_some()
-            && self.layer_dir(lid) != self.dir.join(format!("layer_{lid:02}"))
-    }
-
-    /// Whether `lid`'s small calls take the plugin's decode kernels: a layer
-    /// from the re-quantised folder, or one listed in
-    /// `CASCADIA_INKLING_OV_MOE_DECODE_LAYERS`.
-    pub fn uses_decode_kernels(&self, lid: u32) -> bool {
-        self.is_regrouped(lid) || decode_layer_listed(lid)
-    }
-
-    /// Rows a call of `rows` rows is padded to on layer `lid`.
-    fn padded_rows(&self, lid: u32, rows: usize) -> usize {
-        if rows <= decode_rows() && self.uses_decode_kernels(lid) {
-            rows
-        } else {
-            bucket_rows(rows)
-        }
+        self.dir
+            .join(format!("layer_{lid:02}"))
+            .join("openvino_model.xml")
     }
 
     /// Whether an IR exists for layer `lid`.
@@ -556,21 +461,6 @@ impl OvMoe {
             // The offload path streams experts from the IR's weights file.
             let bin = xml.with_extension("bin");
             plugin = plugin.with("WEIGHTS_PATH", bin.to_string_lossy().to_string());
-        }
-        // The plugin reads this knob from the process environment when it
-        // builds a model: set per layer, under the layer-table lock.
-        // (The plugin turns 0 into 1: a one-row call takes the decode kernels
-        // on every layer, which is why other layers pad one row to two.)
-        let decode = self.uses_decode_kernels(lid);
-        let threshold = if decode {
-            decode_rows().to_string()
-        } else {
-            "0".to_string()
-        };
-        if std::env::var("OV_GPU_MOE_BATCHED_GEMV_THRESHOLD").as_deref() != Ok(threshold.as_str())
-            && (decode || decode_dir_name().is_some() || decode_layers_configured())
-        {
-            set_process_env("OV_GPU_MOE_BATCHED_GEMV_THRESHOLD", &threshold);
         }
         let t0 = Instant::now();
         match Runtime::compile(p, &self.device, &plugin) {
@@ -631,9 +521,6 @@ impl OvMoe {
             .copied()
             .filter(|&b| b <= 8)
             .collect();
-        if self.uses_decode_kernels(lid) {
-            shapes.extend(1..=decode_rows());
-        }
         // The prompt windows' shape too (`CASCADIA_INKLING_OV_WARM_ROWS`, e.g.
         // the value of CASCADIA_STREAMS_PREFILL_WINDOW): the first call at a
         // new row count compiles that shape's kernels, which a long prompt's
@@ -703,7 +590,7 @@ impl OvMoe {
         };
         // Pad to the shape bucket: copies of the last row with zero weights
         // (the kernel still touches their experts, which are the same ones).
-        let prow = self.padded_rows(lid, rows);
+        let prow = bucket_rows(rows);
         let (xs_p, ids_p, w_p);
         let (xs, ids, weights) = if prow != rows {
             let h = self.hidden;

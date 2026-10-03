@@ -68,7 +68,6 @@ pub struct InklingRunner {
     /// Per-layer branch clocks for the stage profile; `None` until
     /// [`StagedRunner::enable_profile`].
     profile: Option<Arc<ProfileClocks>>,
-    capture: Option<super::capture::StateCapture>,
 }
 
 /// Decode / prefill time per branch, summed over this rank's layers.
@@ -211,7 +210,6 @@ impl InklingRunner {
             lo,
             hi,
             profile: None,
-            capture: super::capture::StateCapture::from_env(rank, total, m.hidden_size),
         })
     }
 }
@@ -544,9 +542,6 @@ impl StagedRunner for InklingRunner {
             l.reset();
         }
         self.streams[slot] = Some(0);
-        if let Some(c) = self.capture.as_mut() {
-            c.open(slot);
-        }
         Some(slot)
     }
     fn open_stream_at(&mut self, slot: usize) -> bool {
@@ -558,20 +553,9 @@ impl StagedRunner for InklingRunner {
             l.reset();
         }
         self.streams[slot] = Some(0);
-        if let Some(c) = self.capture.as_mut() {
-            c.open(slot);
-        }
         true
     }
-    fn capture_token(&mut self, slot: usize, pos: usize, token: i64) {
-        if let Some(c) = self.capture.as_mut() {
-            c.token(slot, pos, token);
-        }
-    }
     fn close_stream(&mut self, slot: usize) {
-        if let Some(c) = self.capture.as_mut() {
-            c.close(slot);
-        }
         if let Some(s) = self.streams.get_mut(slot) {
             *s = None;
         }
@@ -591,9 +575,6 @@ impl StagedRunner for InklingRunner {
             l.truncate(len);
         }
         self.streams[slot] = Some(len);
-        if let Some(c) = self.capture.as_mut() {
-            c.truncate(slot, len);
-        }
         true
     }
     fn prefill_stream(&mut self, slot: usize, hidden: Vec<f32>, rows: usize) -> Vec<f32> {
@@ -607,9 +588,6 @@ impl StagedRunner for InklingRunner {
         for l in &mut self.layers {
             l.select_slot(slot);
             x = l.forward_prefill(&x, rows);
-        }
-        if let Some(c) = self.capture.as_mut() {
-            c.rows(slot, pos, &x);
         }
         self.streams[slot] = Some(pos + rows);
         x
@@ -635,16 +613,7 @@ impl StagedRunner for InklingRunner {
         for l in &mut self.layers {
             x = l.forward_prefill_slots(&x, segs);
         }
-        let mut offset = 0;
         for &(s, r) in segs {
-            if let Some(c) = self.capture.as_mut() {
-                c.rows(
-                    s,
-                    self.streams[s].unwrap(),
-                    &x[offset * self.hidden..(offset + r) * self.hidden],
-                );
-            }
-            offset += r;
             if let Some(p) = self.streams[s].as_mut() {
                 *p += r;
             }
@@ -672,14 +641,7 @@ impl StagedRunner for InklingRunner {
         for l in &mut self.layers {
             x = l.forward_rows(&x, rows, slots);
         }
-        for (i, &s) in slots.iter().enumerate() {
-            if let Some(c) = self.capture.as_mut() {
-                c.rows(
-                    s,
-                    self.streams[s].unwrap(),
-                    &x[i * self.hidden..(i + 1) * self.hidden],
-                );
-            }
+        for &s in slots {
             if let Some(p) = self.streams[s].as_mut() {
                 *p += 1;
             }
