@@ -78,6 +78,7 @@ pub mod loader;
 pub mod model;
 pub mod moe;
 pub mod ov_attn;
+pub mod ov_dense;
 pub mod ov_expert;
 pub mod ov_head;
 pub mod ov_moe;

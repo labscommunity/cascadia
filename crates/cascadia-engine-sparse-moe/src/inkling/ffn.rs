@@ -12,6 +12,35 @@
 pub use crate::glm::ffn::{swiglu, swiglu_f32w, swiglu_mmap};
 pub use crate::glm::moe::{AnyExpert, ExpertW};
 
+/// One expert's FFN for every row of `xs` at once, returned flat
+/// `[rows, hidden]`. Row `j` is BIT-IDENTICAL to `e.forward(xs[j], hidden,
+/// inter)`: the int4 storages (`Mmap`, `OwnedInt4`) run the multi-input kernel
+/// ([`MmapExpert::swiglu_rows_from`](crate::dsv4::expert_mmap::MmapExpert::swiglu_rows_from)
+/// — the expert's packed bytes cross the memory bus once for the block instead
+/// of once per row), the dense storages (`Bf16`, `EagerF32`) the per-row
+/// kernel, rows concurrently when `parallel`.
+pub fn forward_rows(
+    e: &AnyExpert,
+    xs: &[&[f32]],
+    hidden: usize,
+    inter: usize,
+    parallel: bool,
+) -> Vec<f32> {
+    match e {
+        AnyExpert::Mmap(m) => m.swiglu_rows(xs),
+        AnyExpert::OwnedInt4 { layout, bytes } => layout.swiglu_rows_from(bytes, xs),
+        _ => {
+            let ys: Vec<Vec<f32>> = if parallel {
+                use rayon::prelude::*;
+                xs.par_iter().map(|x| e.forward(x, hidden, inter)).collect()
+            } else {
+                xs.iter().map(|x| e.forward(x, hidden, inter)).collect()
+            };
+            ys.concat()
+        }
+    }
+}
+
 /// Split an interleaved `w13` matrix (`[2·inter, hidden]` row-major, even rows
 /// gate, odd rows up) into `(gate, up)`, each `[inter, hidden]`. Element type
 /// generic so it serves bf16 bits (`u16`) and f32 alike.

@@ -636,10 +636,85 @@ pub fn load_stage(
         m.num_experts + m.n_shared_experts,
     ) {
         let ov = std::sync::Arc::new(ov);
+        // Compile the fused layers while the rank loads, not inside the first
+        // request: on an 11-rank pipeline the lazy compiles ran one rank after
+        // another (first request: 242 s to the first token), here every rank
+        // compiles at once. `CASCADIA_INKLING_OV_MOE_WARM=0` keeps them lazy.
+        let warm = std::env::var("CASCADIA_INKLING_OV_MOE_WARM")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true);
         for (i, l) in layers.iter_mut().enumerate() {
             let lid = (lo + i) as u32;
             if experts != ExpertSet::None && ov.has_layer(lid) && ov_moe_layer_selected(lid) {
                 l.attach_ov_moe(lid, std::sync::Arc::clone(&ov));
+                if warm {
+                    let t0 = std::time::Instant::now();
+                    let ok = l.warm_ov_moe();
+                    tracing::info!(
+                        target: "cascadia::inkling",
+                        event = "ov_moe_warm",
+                        layer = lid,
+                        ok = ok.unwrap_or(false),
+                        secs = t0.elapsed().as_secs_f64(),
+                    );
+                }
+            }
+        }
+    }
+    // Optional device backend for the dense layers' MLP (`CASCADIA_INKLING_OV_DENSE=1`
+    // + `<model>/dense_ov`): compiled while loading, like the fused MoE layers.
+    if let Some(ov) = super::ov_dense::OvDense::from_env(dir, hidden) {
+        let ov = std::sync::Arc::new(ov);
+        for (i, l) in layers.iter_mut().enumerate() {
+            let lid = (lo + i) as u32;
+            if l.is_dense() && ov.has_layer(lid) {
+                let t0 = std::time::Instant::now();
+                let ok = ov.warm(lid);
+                tracing::info!(
+                    target: "cascadia::inkling",
+                    event = "ov_dense_warm",
+                    layer = lid,
+                    ok,
+                    secs = t0.elapsed().as_secs_f64(),
+                );
+                if ok {
+                    l.attach_ov_dense(lid, std::sync::Arc::clone(&ov));
+                }
+            }
+        }
+    }
+    // The dense layers through the GPU plugin's fused-experts op
+    // (`CASCADIA_INKLING_OV_DENSE_MOE=1` + `<model>/dense_moe_ov`): the form
+    // that reads 4-bit weights fastest on this device. Attached after the
+    // three-MatMul form so the load-time check compares the two.
+    if super::env_flag("CASCADIA_INKLING_OV_DENSE_MOE") {
+        let ddir = dir.join("dense_moe_ov");
+        let slices =
+            if m.moe_intermediate > 0 && m.dense_intermediate.is_multiple_of(m.moe_intermediate) {
+                m.dense_intermediate / m.moe_intermediate
+            } else {
+                0
+            };
+        if ddir.is_dir() && slices > 0 {
+            let device =
+                std::env::var("CASCADIA_INKLING_OV_MOE_DEVICE").unwrap_or_else(|_| "GPU".into());
+            let ov = std::sync::Arc::new(super::ov_moe::OvMoe::new(
+                ddir, device, hidden, slices, slices, None, None,
+            ));
+            for (i, l) in layers.iter_mut().enumerate() {
+                let lid = (lo + i) as u32;
+                if l.is_dense() && ov.has_layer(lid) {
+                    let t0 = std::time::Instant::now();
+                    let ok = ov.warm(lid)
+                        && l.attach_ov_dense_moe(lid, std::sync::Arc::clone(&ov), slices, hidden);
+                    tracing::info!(
+                        target: "cascadia::inkling",
+                        event = "ov_dense_moe_warm",
+                        layer = lid,
+                        ok,
+                        secs = t0.elapsed().as_secs_f64(),
+                    );
+                }
             }
         }
     }
