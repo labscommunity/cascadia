@@ -1,0 +1,22 @@
+[package]
+name = "cascadia-engine-llamacpp"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "External llama.cpp SYCL engine: spawns llama-server, proxies its OpenAI API, maps cascadia's --elastic posture to GGML_STREAM_WEIGHTS on the child."
+
+[dependencies]
+cascadia-types = { workspace = true }
+cascadia-engine = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

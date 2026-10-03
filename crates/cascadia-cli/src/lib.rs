@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use cascadia_engine::Builder;
+use cascadia_engine_llamacpp::{LlamaCppBuilder, LlamaCppConfig};
 use cascadia_engine_mock::MockBuilder;
 use cascadia_engine_openvino::{
     Gemma4Builder, OvDistSpecBuilder, OvDistSpecWorkerBuilder, OvGenaiBuilder, OvRuntimeBuilder,
@@ -50,6 +51,7 @@ fn engine_name(kind: EngineKind) -> &'static str {
         EngineKind::Gemma4 => "gemma4",
         EngineKind::SparseMoe => "sparse-moe",
         EngineKind::Qwen36Moe => "qwen35",
+        EngineKind::SyclLlama => "sycl-llama",
     }
 }
 
@@ -223,6 +225,12 @@ pub enum EngineKind {
     /// docs/architectures/qwen36-moe-support.md and qwen3.8.md).
     #[value(name = "qwen35", alias = "qwen36-moe")]
     Qwen36Moe,
+    /// External llama.cpp SYCL engine: spawns a llama-server child and
+    /// proxies its OpenAI API. Single-stage, batch=1. On this engine,
+    /// `--elastic` maps to GGML_STREAM_WEIGHTS=1 on the child — device-side
+    /// weight streaming (disk-tier O1), orthogonal to the host interposer.
+    #[value(name = "sycl-llama")]
+    SyclLlama,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -253,6 +261,25 @@ pub struct WorkerArgs {
     /// worker never downloads or converts models; only `cascadia shard` does.
     #[arg(long)]
     pub model: String,
+
+    /// Path to a llama-server binary — sycl-llama engine only. A build with
+    /// the weight-streaming patch is required for `--elastic` to have any
+    /// effect on device memory; a stock binary runs with elastic off.
+    #[arg(long)]
+    pub llama_bin: Option<String>,
+
+    /// Context size for the spawned llama-server (-c). sycl-llama only.
+    #[arg(long, default_value_t = 4096)]
+    pub llama_ctx: u32,
+
+    /// GPU layers for the spawned llama-server (-ngl). sycl-llama only.
+    #[arg(long, default_value_t = 99)]
+    pub llama_ngl: u32,
+
+    /// Extra raw arguments appended to the llama-server command line,
+    /// verbatim. sycl-llama only.
+    #[arg(long, num_args = 0.., value_delimiter = ' ')]
+    pub llama_args: Vec<String>,
 
     /// Name reported by `/v1/models` and accepted as the `model` field in
     /// requests. Defaults to the basename of `--model` (so a local path like
@@ -735,8 +762,27 @@ pub struct RunArgs {
     /// mappings so RAM stays kernel-reclaimable (ramlab exp 198). See
     /// `cascadia worker --help` for `--elastic-min-mb` / `--elastic-pool-mb`
     /// tuning; `run` uses the measured defaults (1 MB threshold, pool on).
+    /// On `--engine sycl-llama` this maps to GGML_STREAM_WEIGHTS=1 on the
+    /// spawned llama-server (device-side weight streaming — O1 posture).
     #[arg(long)]
     pub elastic: bool,
+
+    /// Path to a llama-server binary — sycl-llama engine only. See
+    /// `cascadia worker --help`.
+    #[arg(long)]
+    pub llama_bin: Option<String>,
+
+    /// Context size for the spawned llama-server (-c). sycl-llama only.
+    #[arg(long, default_value_t = 4096)]
+    pub llama_ctx: u32,
+
+    /// GPU layers for the spawned llama-server (-ngl). sycl-llama only.
+    #[arg(long, default_value_t = 99)]
+    pub llama_ngl: u32,
+
+    /// Extra raw arguments for the spawned llama-server. sycl-llama only.
+    #[arg(long, num_args = 0.., value_delimiter = ' ')]
+    pub llama_args: Vec<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -828,6 +874,10 @@ impl WorkerArgs {
             ffn_axpy_prebuild: false,
             ffn_sparsity_thresholds_file: None,
             ffn_sparsity_capture_dir: None,
+            llama_bin: None,
+            llama_ctx: 4096,
+            llama_ngl: 99,
+            llama_args: Vec::new(),
         }
     }
 }
@@ -1082,6 +1132,10 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     // (ov_perf_properties) fires; the interposer itself was already activated
     // in main before the async runtime started.
     worker.elastic = args.elastic;
+    worker.llama_bin = args.llama_bin;
+    worker.llama_ctx = args.llama_ctx;
+    worker.llama_ngl = args.llama_ngl;
+    worker.llama_args = args.llama_args;
     cmd_worker(worker).await
 }
 
@@ -1107,6 +1161,7 @@ fn cmd_engines() -> Result<()> {
     println!("  ov-dist-spec   multi-stage spec decode (mask-based KV rewind); v5 shards");
     println!("  gemma4         Gemma 4 multi-stage (per-layer-type attn, KV-sharing, PLI, sliding window); gemma4_cached_v1.x shards");
     println!("  sparse-moe     sparse mixture-of-experts on CPU: Kimi K2.6 (AVX-512 int4 GEMM), MiniMax-M2 (OV-IR shells), GLM-5 / DeepSeek-V4 / Inkling (Rust shells + int4 mmap experts, N-rank pipeline)");
+    println!("  sycl-llama     external llama.cpp SYCL server (GGUF, spawned subprocess); --elastic = GGML_STREAM_WEIGHTS device-side streaming");
     println!("  qwen35         Qwen3.5-family staged chain (GatedDeltaNet; 3.5/3.6 MoE or 3.8 dense); qwen3_5* IR-surgery shards (alias: qwen36-moe)");
     Ok(())
 }
@@ -1714,6 +1769,35 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
                 cfg = cfg.with_spec_decode_k(k);
             }
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
+        }
+        EngineKind::SyclLlama => {
+            if args.total != 1 {
+                return Err(anyhow!("sycl-llama is single-stage only; use --total 1"));
+            }
+            let bin = args.llama_bin.clone().ok_or_else(|| {
+                anyhow!("--engine sycl-llama requires --llama-bin /path/to/llama-server")
+            })?;
+            if !std::path::Path::new(&bin).exists() {
+                return Err(anyhow!("no llama-server binary at {bin}"));
+            }
+            // --elastic on sycl-llama = GGML_STREAM_WEIGHTS=1 on the child:
+            // device-side O1 (weights stay on disk, streamed per layer).
+            // The host interposer still applies to the process itself.
+            if args.elastic {
+                tracing::warn!(
+                    "sycl-llama --elastic: enabling GGML_STREAM_WEIGHTS on the child \
+                     (device weight streaming; ~8 GB/s / model_GB decode, KV still reserved)"
+                );
+            }
+            Ok(Box::new(LlamaCppBuilder::new(LlamaCppConfig {
+                llama_bin: bin.into(),
+                model: args.model.clone().into(),
+                device: args.device.clone(),
+                ctx: args.llama_ctx,
+                ngl: args.llama_ngl,
+                elastic: args.elastic,
+                extra_args: args.llama_args.clone(),
+            })))
         }
         EngineKind::Qwen36Moe => {
             // These three were added to Qwen36Builder (bd75446 / fdbc11e) but never wired HERE, so the
