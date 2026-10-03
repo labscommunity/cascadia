@@ -278,7 +278,7 @@ pub struct WorkerArgs {
 
     /// Extra raw arguments appended to the llama-server command line,
     /// verbatim. sycl-llama only.
-    #[arg(long, num_args = 0.., value_delimiter = ' ')]
+    #[arg(long, allow_hyphen_values = true, num_args = 0..)]
     pub llama_args: Vec<String>,
 
     /// Name reported by `/v1/models` and accepted as the `model` field in
@@ -2382,6 +2382,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             EngineKind::Qwen36Moe => {
                 cascadia_api::load_chat_template_config_at(std::path::Path::new(&args.model))
             }
+            EngineKind::SyclLlama => cascadia_api::ChatTemplateConfig::default(),
             // sparse-moe exports (dsv4) keep the tokenizer files and
             // chat_template.jinja at the model root, not in a tokenizer/
             // subdir. Read the root first; fall back to the subdir layout so
