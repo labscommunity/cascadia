@@ -1,0 +1,644 @@
+{
+ "units": "GiB = 2^30 bytes; decode/prefill from llama-server timings",
+ "single": {
+  "1_5B_stock": {
+   "n": 3,
+   "model": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+   "elastic": false,
+   "load_s": [
+    6.519,
+    0.004
+   ],
+   "peak_vram_gib": [
+    1.463,
+    0.0
+   ],
+   "vram_after_load_gib": [
+    1.378,
+    0.0
+   ],
+   "decode_tps": [
+    224.573,
+    0.361
+   ],
+   "prefill_tps": [
+    27.697,
+    0.156
+   ],
+   "all_exit_clean": true,
+   "vram_back_to_baseline": true
+  },
+  "1_5B_elastic": {
+   "n": 3,
+   "model": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+   "elastic": true,
+   "load_s": [
+    6.516,
+    0.0
+   ],
+   "peak_vram_gib": [
+    0.79,
+    0.0
+   ],
+   "vram_after_load_gib": [
+    0.688,
+    0.0
+   ],
+   "decode_tps": [
+    8.867,
+    0.043
+   ],
+   "prefill_tps": [
+    51.967,
+    0.441
+   ],
+   "all_exit_clean": true,
+   "vram_back_to_baseline": true
+  },
+  "27B_stock": {
+   "n": 3,
+   "model": "Qwen3.8-27B-UD-Q4_K_S.gguf",
+   "elastic": false,
+   "load_s": [
+    20.524,
+    0.003
+   ],
+   "peak_vram_gib": [
+    15.907,
+    0.0
+   ],
+   "vram_after_load_gib": [
+    14.681,
+    0.0
+   ],
+   "decode_tps": [
+    19.35,
+    0.021
+   ],
+   "prefill_tps": [
+    16.52,
+    0.041
+   ],
+   "all_exit_clean": true,
+   "vram_back_to_baseline": true
+  },
+  "27B_elastic": {
+   "n": 3,
+   "model": "Qwen3.8-27B-UD-Q4_K_S.gguf",
+   "elastic": true,
+   "load_s": [
+    16.521,
+    0.001
+   ],
+   "peak_vram_gib": [
+    3.223,
+    0.0
+   ],
+   "vram_after_load_gib": [
+    2.543,
+    0.0
+   ],
+   "decode_tps": [
+    0.594,
+    0.002
+   ],
+   "prefill_tps": [
+    5.216,
+    0.013
+   ],
+   "all_exit_clean": true,
+   "vram_back_to_baseline": true
+  },
+  "35B_a3b_stock": {
+   "n": 3,
+   "model": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+   "elastic": false,
+   "load_s": [
+    28.531,
+    0.0
+   ],
+   "peak_vram_gib": [
+    21.685,
+    0.0
+   ],
+   "vram_after_load_gib": [
+    21.019,
+    0.0
+   ],
+   "decode_tps": [
+    34.212,
+    0.015
+   ],
+   "prefill_tps": [
+    26.547,
+    0.193
+   ],
+   "all_exit_clean": true,
+   "vram_back_to_baseline": true
+  },
+  "35B_a3b_elastic": {
+   "n": 3,
+   "model": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+   "elastic": true,
+   "load_s": [
+    22.525,
+    0.003
+   ],
+   "peak_vram_gib": [
+    2.697,
+    0.0
+   ],
+   "vram_after_load_gib": [
+    2.008,
+    0.0
+   ],
+   "decode_tps": [
+    0.287,
+    0.002
+   ],
+   "prefill_tps": [
+    2.937,
+    0.035
+   ],
+   "all_exit_clean": true,
+   "vram_back_to_baseline": true
+  }
+ },
+ "concurrent_v3": [
+  {
+   "fleet": "conc_3x27B",
+   "ready": "3/3",
+   "models": [
+    "27B",
+    "27B",
+    "27B"
+   ],
+   "vram_after_each_load_gib": [
+    2.543,
+    5.048,
+    7.552
+   ],
+   "per_instance_tps": [
+    0.173,
+    0.174,
+    0.173
+   ],
+   "aggregate_tps": 0.52,
+   "peak_vram_gib": 9.453,
+   "peak_gtt_gib": 0.297,
+   "all_text_nonempty": true
+  },
+  {
+   "fleet": "conc_5x27B",
+   "ready": "5/5",
+   "models": [
+    "27B",
+    "27B",
+    "27B",
+    "27B",
+    "27B"
+   ],
+   "vram_after_each_load_gib": [
+    2.543,
+    5.048,
+    7.552,
+    10.056,
+    12.56
+   ],
+   "per_instance_tps": [
+    0.09,
+    0.09,
+    0.09,
+    0.09,
+    0.09
+   ],
+   "aggregate_tps": 0.451,
+   "peak_vram_gib": 15.752,
+   "peak_gtt_gib": 0.505,
+   "all_text_nonempty": true
+  },
+  {
+   "fleet": "conc_3x35B",
+   "ready": "3/3",
+   "models": [
+    "35B_a3b",
+    "35B_a3b",
+    "35B_a3b"
+   ],
+   "vram_after_each_load_gib": [
+    2.008,
+    3.976,
+    5.945
+   ],
+   "per_instance_tps": [
+    0.089,
+    0.09,
+    0.09
+   ],
+   "aggregate_tps": 0.269,
+   "peak_vram_gib": 8.012,
+   "peak_gtt_gib": 0.256,
+   "all_text_nonempty": true
+  },
+  {
+   "fleet": "conc_mix",
+   "ready": "5/5",
+   "models": [
+    "27B",
+    "27B",
+    "1.5B",
+    "1.5B",
+    "1.5B"
+   ],
+   "vram_after_each_load_gib": [
+    2.543,
+    5.048,
+    5.696,
+    6.345,
+    6.994
+   ],
+   "per_instance_tps": [
+    0.296,
+    0.297,
+    2.049,
+    2.048,
+    2.048
+   ],
+   "aggregate_tps": 6.738,
+   "peak_vram_gib": 8.538,
+   "peak_gtt_gib": 0.384,
+   "all_text_nonempty": true
+  }
+ ],
+ "fleets_v2": {
+  "fleet_5x27B_elastic": {
+   "vram_after_each_load_gib": [
+    2.543,
+    5.048,
+    7.552,
+    10.056,
+    12.56
+   ],
+   "all_ready": true,
+   "all_query_ok": true,
+   "trace_peak_gib": 14.866
+  },
+  "fleet_mix_2x27B_3x1.5B": {
+   "vram_after_each_load_gib": [
+    2.543,
+    5.048,
+    5.696,
+    6.345,
+    6.994
+   ],
+   "all_ready": true,
+   "all_query_ok": true,
+   "trace_peak_gib": 8.113
+  },
+  "fleet_3x35B_a3b_elastic": {
+   "vram_after_each_load_gib": [
+    2.008,
+    3.976,
+    5.945
+   ],
+   "all_ready": true,
+   "all_query_ok": true,
+   "trace_peak_gib": 6.942
+  },
+  "fleet_2x35B_a3b_stock": {
+   "vram_after_each_load_gib": [
+    21.019,
+    21.431
+   ],
+   "all_ready": true,
+   "all_query_ok": true,
+   "trace_peak_gib": 21.902
+  },
+  "fleet_3x27B_stock": {
+   "vram_after_each_load_gib": [
+    14.681,
+    29.322,
+    30.249
+   ],
+   "all_ready": true,
+   "all_query_ok": true,
+   "trace_peak_gib": 31.475,
+   "note": "3rd instance spilled ~15 GiB to host GTT; concurrent load -> host OOM -> reboot (v2 RUN.md incident log)"
+  }
+ },
+ "latency": {
+  "lat_27B_stock": {
+   "cold_first_ttft_s": 1.338,
+   "warm_ttft_s": [
+    0.424,
+    0.243
+   ],
+   "warm_itl_median_s": [
+    0.0518,
+    0.0518
+   ]
+  },
+  "lat_27B_elastic": {
+   "cold_first_ttft_s": 4.234,
+   "warm_ttft_s": [
+    1.88,
+    1.8
+   ],
+   "warm_itl_median_s": [
+    1.6582,
+    1.6856
+   ]
+  },
+  "lat_35B_a3b_stock": {
+   "cold_first_ttft_s": 0.909,
+   "warm_ttft_s": [
+    0.176,
+    0.21
+   ],
+   "warm_itl_median_s": [
+    0.0125,
+    0.0125
+   ]
+  },
+  "lat_35B_a3b_elastic": {
+   "cold_first_ttft_s": 9.236,
+   "warm_ttft_s": [
+    4.343,
+    4.205
+   ],
+   "warm_itl_median_s": [
+    4.2681,
+    4.2686
+   ]
+  }
+ },
+ "lifecycle": {
+  "cycles_1_5B_stock": {
+   "cycles": 10,
+   "gen_ok": 7,
+   "not_ready": 3,
+   "leaks": 0,
+   "child_survived_exit": 0,
+   "settle_s_max": 0.01,
+   "load_s": [
+    6.078,
+    1.972
+   ],
+   "xe_resets": 7
+  },
+  "cycles_27B_elastic": {
+   "cycles": 5,
+   "gen_ok": 4,
+   "not_ready": 1,
+   "leaks": 0,
+   "child_survived_exit": 0,
+   "settle_s_max": 0.0096,
+   "load_s": [
+    11.384,
+    1.817
+   ],
+   "xe_resets": 4
+  }
+ },
+ "lifecycle_retry": {
+  "note": "after this PR: in-engine load retry, default timeouts, 1.5B stock, SYCL1",
+  "cycles": 15,
+  "gen_ok": 15,
+  "cycles_needing_retry": 1,
+  "leaks": 0,
+  "child_survived_exit": 0,
+  "xe_resets": 4,
+  "settle_s_max": 0.0431,
+  "load_s": [
+   4.52,
+   71.57,
+   6.51,
+   8.52,
+   6.52,
+   8.52,
+   6.52,
+   6.52,
+   10.54,
+   6.51,
+   8.52,
+   6.52,
+   6.51,
+   6.51,
+   4.51
+  ],
+  "vram_settled_gib": [
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391
+  ],
+  "vram_before_gib": [
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391
+  ]
+ },
+ "parity": [
+  {
+   "tag": "par_27B_stock_SYCL0",
+   "elastic": false,
+   "device": "SYCL0",
+   "decode_tps": 17.904,
+   "peak_vram_gib": 15.246,
+   "back_to_idle": true
+  },
+  {
+   "tag": "par_27B_elastic_SYCL0",
+   "elastic": true,
+   "device": "SYCL0",
+   "decode_tps": 0.581,
+   "peak_vram_gib": 3.364,
+   "back_to_idle": true
+  }
+ ],
+ "sweeps": {
+  "ctx": [
+   {
+    "tag": "ctx2048_stock",
+    "ctx": 2048,
+    "kv": "q8_0",
+    "elastic": false,
+    "peak_vram_gib": 15.81,
+    "decode_tps": 19.368
+   },
+   {
+    "tag": "ctx2048_elastic",
+    "ctx": 2048,
+    "kv": "q8_0",
+    "elastic": true,
+    "peak_vram_gib": 3.125,
+    "decode_tps": 0.597
+   },
+   {
+    "tag": "ctx4096_stock",
+    "ctx": 4096,
+    "kv": "q8_0",
+    "elastic": false,
+    "peak_vram_gib": 15.907,
+    "decode_tps": 19.373
+   },
+   {
+    "tag": "ctx4096_elastic",
+    "ctx": 4096,
+    "kv": "q8_0",
+    "elastic": true,
+    "peak_vram_gib": 3.223,
+    "decode_tps": 0.591
+   },
+   {
+    "tag": "ctx8192_stock",
+    "ctx": 8192,
+    "kv": "q8_0",
+    "elastic": false,
+    "peak_vram_gib": 16.103,
+    "decode_tps": 19.326
+   },
+   {
+    "tag": "ctx8192_elastic",
+    "ctx": 8192,
+    "kv": "q8_0",
+    "elastic": true,
+    "peak_vram_gib": 3.418,
+    "decode_tps": 0.594
+   }
+  ],
+  "kv": [
+   {
+    "tag": "kv_f16_elastic",
+    "ctx": 4096,
+    "kv": "f16",
+    "elastic": true,
+    "peak_vram_gib": 3.254,
+    "decode_tps": 0.599
+   },
+   {
+    "tag": "kv_q8_0_elastic",
+    "ctx": 4096,
+    "kv": "q8_0",
+    "elastic": true,
+    "peak_vram_gib": 3.223,
+    "decode_tps": 0.598
+   },
+   {
+    "tag": "kv_q4_0_elastic",
+    "ctx": 4096,
+    "kv": "q4_0",
+    "elastic": true,
+    "peak_vram_gib": 3.123,
+    "decode_tps": 0.596
+   }
+  ]
+ },
+ "hunter": {
+  "bench": [
+   {
+    "tag": "qwen1.5b_cpu",
+    "model": "qwen2.5-1.5b-int8-ov",
+    "device": "CPU",
+    "load_s": 1.29313325881958,
+    "warmup_s": 0.51,
+    "tok_s": 36.98,
+    "error": null
+   },
+   {
+    "tag": "qwen1.5b_igpu",
+    "model": "qwen2.5-1.5b-int8-ov",
+    "device": "GPU.0",
+    "load_s": 7.316797494888306,
+    "warmup_s": 2.3,
+    "tok_s": 39.04,
+    "error": null
+   },
+   {
+    "tag": "qwen1.5b_rtx",
+    "model": "qwen2.5-1.5b-int8-ov",
+    "device": "GPU.1",
+    "load_s": 10.129847764968872,
+    "warmup_s": 1.25,
+    "tok_s": 8.61,
+    "error": null
+   },
+   {
+    "tag": "qwen1.5b_npu",
+    "model": "qwen2.5-1.5b-int8-ov",
+    "device": "NPU",
+    "load_s": 2.1919796466827393,
+    "warmup_s": 49.03,
+    "tok_s": 0.17,
+    "error": null
+   },
+   {
+    "tag": "gemma_e2b_igpu",
+    "model": "gemma-4-e2b-int4-ov",
+    "device": "GPU.0",
+    "load_s": 14.522903442382812,
+    "warmup_s": 2.28,
+    "tok_s": 14.66,
+    "error": null
+   },
+   {
+    "tag": "gemma_e2b_npu",
+    "model": "gemma-4-e2b-int4-ov",
+    "device": "NPU",
+    "load_s": null,
+    "warmup_s": null,
+    "tok_s": null,
+    "error": "load: RuntimeError('Exception from src\\\\inference\\\\src\\\\cpp\\\\core.cpp:120:\\nException from src\\\\inference\\\\src\\\\dev\\\\plugin.cpp:54:\\nException from src\\\\inference\\\\src\\\\dev\\\\plugin.cpp:54:\\nException from src\\\\plugins\\\\intel_npu\\\\src\\\\plugin\\\\src\\\\plugin.cpp:552:\\nException from src\\\\plugins\\\\intel_npu\\\\src\\\\compiler_adapter\\\\src\\\\ze_graph_ext_wrappers.cpp:433:\\nCompilation failed. Level0 pfnCreate2 result: ZE_RESULT_ERROR_INVALID_NULL_POINTER, code 0x78000007 - pointer argument may not be nullptr . [NPU_VCL] Compiler returned msg:\\nCompilation failed\\n\\n\\n\\n\\n')"
+   }
+  ],
+  "cpu_cotenancy": {
+   "single": {
+    "n": 1,
+    "aggregate_tps": 33.36,
+    "per_instance_tps": [
+     33.36
+    ],
+    "ws_mb_each": [
+     3131
+    ]
+   },
+   "triple": {
+    "n": 3,
+    "aggregate_tps": 40.15,
+    "per_instance_tps": [
+     13.28,
+     13.47,
+     13.4
+    ],
+    "ws_mb_each": [
+     3130,
+     3127,
+     3130
+    ]
+   }
+  }
+ }
+}

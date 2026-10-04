@@ -52,21 +52,38 @@ additive, not conflicting.
 
 ## What's wired vs not
 
-- [x] `EngineKind::SyclLlama` ("sycl-llama"), CLI args `--llama-bin`,
-      `--llama-ctx`, `--llama-ngl`, `--llama-args`
-- [x] `LlamaCppBuilder`: spawn → `/health` poll → `Engine` via SSE proxy
-- [x] `cargo check` clean for the crate and `cascadia-cli`
+- [x] `EngineKind::SyclLlama` ("sycl-llama"), CLI args `--llama-bin`
+      (optional: --llama-bin > $CASCADIA_LLAMA_BIN > PATH),
+      `--llama-ctx`, `--llama-ngl`, `--llama-args` (space-split,
+      repeatable), `--llama-load-timeout`, `--llama-load-retries`
+- [x] `LlamaCppBuilder`: spawn → `/health` poll → `Engine` via SSE proxy;
+      child stderr piped + forwarded to our stderr with a 40-line ring
+      buffer for error tails; load retry with fresh port (xe reset hangs)
+- [x] `--device` mapping: GPU -> SYCL0, GPU.N -> SYCLN, CPU -> `none`
+      (-ngl 0), anything else verbatim
+- [x] `--elastic` preflight: the resolved binary + `libggml-base*` beside
+      it are probed for the `GGML_STREAM_WEIGHTS` marker; a stock build is
+      rejected up front
+- [x] sampling forwarding: top_p/top_k/seed/penalties/stop sent to the
+      child when non-default; SSE socket timeout 300 s
+- [x] `cargo check` clean for the crate and `cascadia-cli`; unit + mock
+      HTTP engine + spawn-failure tests under `cargo test`
 - [x] `cascadia run` passthrough for the llama-* args (RunArgs → worker
       fields wired in cmd_run)
+- [x] reproducible build: `scripts/build-llama-stream.sh` (clone +
+      `patches/llama.cpp/0001-sycl-stream-weights.patch` + oneAPI icx
+      SYCL build), marker verified post-build
 - [x] live e2e: `cascadia run --engine sycl-llama --elastic` served
-      Qwen3.8-27B correctly through the cascadia API at 2.79 GB VRAM
-      (kernel vram_mm), Qwen2.5-1.5B at 796 MB; child env confirms
+      Qwen3.8-27B correctly through the cascadia API at ~3.2 GB VRAM
+      (kernel vram_mm), Qwen2.5-1.5B at ~0.8 GB; child env confirms
       GGML_STREAM_WEIGHTS=1 + inherited LD_PRELOAD
 - [x] measured conformance (partial): committed-VRAM floor via kernel
-      `vram_mm` (27B: 15.82->2.79 GB; 1.5B: 1.51->0.80 GB); --elastic off
-      runs resident and leaves the child env clean; co-tenancy leg: two
-      independent `cascadia run --elastic` instances served 2x 27B at
-      5.54 GB on one GPU, both correct
+      `vram_mm` (27B: 15.91->3.22 GiB; 1.5B: 1.46->0.79 GiB; 35B-A3B:
+      21.68->2.70 GiB); --elastic off runs resident and leaves the child
+      env clean; co-tenancy: five 27B elastic instances on one card at
+      ~14.9 GiB peak, all correct
+- [x] lifecycle: in-engine retry absorbed intermittent child load hangs
+      (15/15 cycles, `lifecycle_retry` in docs/perf/sycl-elastic/data.json)
 - [ ] `--stream-weights` CLI flag upstream in llama.cpp (env gate today)
 
 ## Measured numbers behind this (2026-10-03, lab repo)

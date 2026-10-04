@@ -201,7 +201,7 @@ a few each. MiniMax-M2 `sparse-moe` only.
 | `--ep-workers <host:port,...>` | — | `sparse-moe` (Inkling) expert-parallel **driver**: dispatch each MoE layer's selected experts to these running workers (each entry may also be a [unix socket](#unix-domain-sockets) `unix:/path.sock`); this rank runs every layer's attention/router locally and holds no expert weights. Implies `--total 1`. Start the workers first. |
 | `--ep-worker-index <N>` / `--ep-worker-count <W>` | — | `sparse-moe` (Inkling) expert-parallel **worker**: serve expert shard N of W (experts with `id % W == N`, shared experts included) for every MoE layer on `--listen`; no API, no attention, no sequence state. |
 | `--ov-config <KEY=VALUE>` | — | Raw OV plugin property passthrough, repeatable. See below. |
-| `--elastic` | off | Elastic memory posture (Linux; file-backed big allocations). See below. |
+| `--elastic` | off | Elastic memory posture (Linux; file-backed big allocations). On `--engine sycl-llama` it instead enables `GGML_STREAM_WEIGHTS=1` on the spawned `llama-server` (device-side weight streaming) — see below and [engines/sycl-llama.md](engines/sycl-llama.md). |
 | `--elastic-min-mb <MB>` | 1 | Elastic threshold; 16 = weights-only, zero speed cost. |
 | `--elastic-pool-mb <MB>` | 8192 | Elastic retained-mapping pool cap (0 = off). |
 
@@ -294,6 +294,20 @@ they share a wire protocol. See [engines/ov-dist-spec.md](engines/ov-dist-spec.m
 
 Raising sparsity trades quality for speed. Validate against dense before you
 deploy.
+
+### sycl-llama
+
+`sycl-llama` engine only. Deep-dive: [engines/sycl-llama.md](engines/sycl-llama.md).
+All flags exist on both `cascadia run` and `cascadia worker`.
+
+| Flag | Default | Env var | Meaning |
+|---|---|---|---|
+| `--llama-bin <PATH>` | auto | `CASCADIA_LLAMA_BIN` | Path to `llama-server`. Resolution: flag > env > `llama-server` on `PATH`. |
+| `--llama-ctx <N>` | `4096` | — | Context size (`-c`). |
+| `--llama-ngl <N>` | `99` | — | GPU layers (`-ngl`). Forced to 0 when `--device CPU`. |
+| `--llama-args <ARGS>` | — | — | Extra raw args, one value per occurrence split on spaces, repeatable: `--llama-args "-ctk q8_0 -fa on"`. |
+| `--llama-load-timeout <SECS>` | auto | — | Per-attempt health deadline: `60 + 8 per GiB` of model file. |
+| `--llama-load-retries <N>` | `1` | — | Extra load attempts after a child exit or health timeout. |
 
 ### Other
 
