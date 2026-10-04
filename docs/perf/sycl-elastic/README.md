@@ -14,6 +14,7 @@ All numbers come from [`data.json`](./data.json) (verbatim copy of
 | ![fig6](fig6_laptop.png) | `fig6_laptop.png` — laptop reference: which device to pick (no elastic on laptop). |
 | ![fig7](fig7_reliability.png) | `fig7_reliability.png` — 15 load/unload cycles, leak-free, plus second-card parity. |
 | ![fig8](fig8_partial.png) | `fig8_partial.png` — `--elastic-vram` budget sweep: speed follows how much of the model fits. |
+| ![fig9](fig9_windows.png) | `fig9_windows.png` — the same streaming on Windows (Arc B390 iGPU): Linux vs Windows device memory + decode retention. |
 
 ## Methodology
 
@@ -39,6 +40,11 @@ All numbers come from [`data.json`](./data.json) (verbatim copy of
 - **Hunter laptop (fig6 only):** Core Ultra 9 285H (Arc 140T iGPU, RTX 5060
   Laptop, AI Boost NPU), 32 GB RAM, Windows 11, OpenVINO GenAI 2026.4 via
   `ov-genai`; 48 tokens after an 8-token warmup.
+- **Windows (fig9):** Core Ultra X7 358H (Arc B390 iGPU, 16.4 GiB device
+  pool), Windows 11, oneAPI 2026.0 (icx) + MSVC 19.44 build of the patched
+  llama.cpp via `scripts/build-llama-stream-windows.bat`; device memory =
+  per-process GPU performance counters (llama-cli), peak over load +
+  generation; `-c 4096` on both arms.
 
 ## Reproduce
 

@@ -47,6 +47,8 @@ reset — and VRAM returned to baseline on every cycle (see
 ```bash
 # 1. build a patched llama-server (clone + patch + oneAPI SYCL build)
 scripts/build-llama-stream.sh ~/llama-stream
+#    Windows: scripts\build-llama-stream-windows.bat (VS 2022 Build Tools
+#    + Intel oneAPI; verified on an Arc B390 iGPU)
 export CASCADIA_LLAMA_BIN=~/llama-stream/build/bin/llama-server
 
 # 2. the child needs the oneAPI runtime libs on LD_LIBRARY_PATH
@@ -139,7 +141,14 @@ Guidance:
 - KV cache is still reserved against the full `-c` context on device —
   streaming removes *weight* residency, not KV.
 - MoE models stream *all* experts per token (no router awareness).
-- Windows: the fd/pread streaming path is unsupported there.
+- Windows: supported. Weight slices are read with a positioned `ReadFile`
+  on the file's OS handle (no POSIX `pread`). Verified on an Arc B390 iGPU
+  (Core Ultra X7 358H, oneAPI 2026.0 + MSVC 19.44): build, streaming,
+  greedy-token parity and device-memory traces — see
+  `docs/perf/sycl-elastic/fig9_windows.png`. Pass `-c` explicitly when
+  streaming: with streamed weights the default context auto-fit sees the
+  freed memory as free and may pick the model's full train context (large
+  f32 KV). cascadia always passes `--llama-ctx`.
 - Chat turns carry `role` + `content` only (no tool calls / multimodal
   parts); `prompt` remains the fallback for non-chat engines.
 

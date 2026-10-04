@@ -1,5 +1,5 @@
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index cc3f8cd36..1fa6ec2fa 100644
+index cc3f8cd..1fa6ec2 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
 @@ -432,6 +432,30 @@ extern "C" {
@@ -34,7 +34,7 @@ index cc3f8cd36..1fa6ec2fa 100644
  }
  #endif
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index f6fb91798..2def496c6 100644
+index f6fb917..2def496 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -20,6 +20,8 @@
@@ -161,21 +161,23 @@ index f6fb91798..2def496c6 100644
 +    return n;
 +}
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index d1456a867..032c26e6a 100644
+index d1456a8..799e06a 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -30,6 +30,10 @@
+@@ -30,6 +30,12 @@
  #include <stdio.h>
  #include <stdlib.h>
  #include <regex>
 +#include <unordered_map>
-+#ifndef _WIN32
++#ifdef _WIN32
++#include <io.h>
++#else
 +#include <unistd.h>
 +#endif
  
  #include <sycl/sycl.hpp>
  #include <sycl/backend.hpp>
-@@ -621,6 +625,10 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+@@ -621,6 +627,10 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
      GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
      GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
      GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
@@ -186,7 +188,7 @@ index d1456a867..032c26e6a 100644
      ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
      ggml_sycl_set_device(ctx->device);
      auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
-@@ -946,6 +954,10 @@ static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_typ
+@@ -946,6 +956,10 @@ static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_typ
  }
  
  static size_t ggml_backend_sycl_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
@@ -197,7 +199,7 @@ index d1456a867..032c26e6a 100644
      size_t size = ggml_nbytes(tensor);
      int64_t ne0 = tensor->ne[0];
  
-@@ -5446,6 +5458,10 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
+@@ -5446,6 +5460,10 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
      GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
      GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
      GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
@@ -208,7 +210,7 @@ index d1456a867..032c26e6a 100644
      ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
-@@ -5603,8 +5619,203 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
+@@ -5603,8 +5621,223 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
      return skip;
  }
  
@@ -342,11 +344,35 @@ index d1456a867..032c26e6a 100644
 +    if (e.src.host_ptr != nullptr) {
 +        memcpy(sw.staging.data(), e.src.host_ptr, e.nbytes);
 +    } else {
-+#ifndef _WIN32
 +        size_t got = 0;
 +        while (got < e.nbytes) {
-+            ssize_t r = pread(e.src.fd, sw.staging.data() + got, e.nbytes - got,
-+                              (off_t) (e.src.file_off + got));
++#ifdef _WIN32
++            // UCRT has no pread; do a positioned ReadFile on the fd's OS
++            // handle (does not disturb the CRT file position)
++            HANDLE h = (HANDLE) _get_osfhandle(e.src.fd);
++            if (h == INVALID_HANDLE_VALUE) {
++                GGML_LOG_ERROR("%s: invalid handle for streamed tensor\n", __func__);
++                std::exit(1);
++            }
++            size_t chunk = e.nbytes - got;
++            if (chunk > (size_t) 0x7FFFFFFF) {
++                chunk = (size_t) 0x7FFFFFFF;
++            }
++            OVERLAPPED ov;
++            memset(&ov, 0, sizeof(ov));
++            const uint64_t off = e.src.file_off + got;
++            ov.Offset     = (DWORD) (off & 0xFFFFFFFFu);
++            ov.OffsetHigh = (DWORD) (off >> 32);
++            DWORD rd = 0;
++            if (!ReadFile(h, (char *) sw.staging.data() + got, (DWORD) chunk, &rd, &ov)) {
++                GGML_LOG_ERROR("%s: ReadFile failed for streamed tensor\n", __func__);
++                std::exit(1);
++            }
++            const int r = (int) rd;
++#else
++            const ssize_t r = pread(e.src.fd, sw.staging.data() + got, e.nbytes - got,
++                                    (off_t) (e.src.file_off + got));
++#endif
 +            if (r <= 0) {
 +                GGML_LOG_ERROR("%s: pread failed for streamed tensor\n", __func__);
 +                std::exit(1);
@@ -359,10 +385,6 @@ index d1456a867..032c26e6a 100644
 +            fprintf(stderr, "[sw] %s off=%zu n=%zu fnv=%llx\n", t->name, e.src.file_off, e.nbytes,
 +                    (unsigned long long) h);
 +        }
-+#else
-+        GGML_LOG_ERROR("%s: fd-based streaming not supported on Windows\n", __func__);
-+        std::exit(1);
-+#endif
 +    }
 +    SYCL_CHECK(CHECK_TRY_ERROR(sw.q->memcpy(dst, sw.staging.data(), e.nbytes).wait()));
 +    if (e.padded > e.nbytes) {
@@ -412,7 +434,7 @@ index d1456a867..032c26e6a 100644
  
      for (int i = 0; i < cgraph->n_nodes; i++) {
          ggml_tensor * node = cgraph->nodes[i];
-@@ -5615,7 +5826,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -5615,7 +5848,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
              continue;
          }
  
@@ -425,7 +447,7 @@ index d1456a867..032c26e6a 100644
          if (nodes_to_skip != 0) {
              i += nodes_to_skip;
              continue;
-@@ -5629,7 +5844,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -5629,7 +5866,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
          }
  #endif
          // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
@@ -434,7 +456,7 @@ index d1456a867..032c26e6a 100644
              ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
              const int gdn_nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
              if (gdn_nodes_to_skip > 0) {
-@@ -5638,20 +5853,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -5638,20 +5875,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                  continue;
              }
          }
@@ -458,7 +480,7 @@ index d1456a867..032c26e6a 100644
              i += 2;
              continue;
          }
-@@ -5712,7 +5927,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
+@@ -5712,7 +5949,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
  
  #ifdef GGML_SYCL_GRAPH
      bool use_sycl_graph = false;
@@ -468,7 +490,7 @@ index d1456a867..032c26e6a 100644
      }
      if (use_sycl_graph) {
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 5c5e97fbc..a61e40162 100644
+index 5c5e97f..a61e401 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -14,6 +14,12 @@
@@ -513,7 +535,7 @@ index 5c5e97fbc..a61e40162 100644
              const auto & mapping = mappings.at(weight->idx);
              ggml_backend_buffer_t buf_mmap = nullptr;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index c81005505..4487899f8 100644
+index c810055..4487899 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -1558,6 +1558,82 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {

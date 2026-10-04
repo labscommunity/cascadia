@@ -820,8 +820,102 @@ def fig8():
     save(fig, "fig8_partial.png")
 
 
+# ---------------- fig9 ----------------
+WIN = {
+    # Windows 11, Arc B390 iGPU (Core Ultra X7 358H), oneAPI 2026.0 + MSVC 19.44,
+    # llama.cpp SYCL + stream-weights patch. Device memory = per-process GPU
+    # perf counters (llama-cli), peak over load + generation, ~4 Hz sampling.
+    # Both arms ran with -c 4096 (see data.json windows_delta notes).
+    "1_5B": {"stock_gib": 1.463, "streamed_gib": 0.778,
+             "stock_tps": 80.8, "streamed_tps": 5.7},
+    "27B":  {"stock_gib": 15.376, "streamed_gib": 2.606,
+             "stock_tps": 6.3, "streamed_tps": 0.4},
+}
+B390_POOL_GIB = 16.4
+
+
+def fig9():
+    fig = newfig()
+    header(fig, "The same streaming, verified on Windows",
+           "llama.cpp SYCL + stream-weights patch, built on Windows 11 "
+           "(oneAPI 2026.0, MSVC 19.44)\nfor an Arc B390 iGPU (16.4 GiB "
+           "device pool); device memory = per-process GPU counters "
+           "(llama-cli),\npeak over load + generation; greedy tokens "
+           "identical to stock.")
+    rows = [
+        ("Qwen2.5-1.5B\nLinux (B70)", v("1_5B_stock", "peak_vram_gib"),
+         v("1_5B_elastic", "peak_vram_gib"), v("1_5B_stock", "decode_tps"),
+         v("1_5B_elastic", "decode_tps")),
+        ("Qwen2.5-1.5B\nWindows (B390)", WIN["1_5B"]["stock_gib"],
+         WIN["1_5B"]["streamed_gib"], WIN["1_5B"]["stock_tps"],
+         WIN["1_5B"]["streamed_tps"]),
+        ("Qwen3.8-27B\nLinux (B70)", v("27B_stock", "peak_vram_gib"),
+         v("27B_elastic", "peak_vram_gib"), v("27B_stock", "decode_tps"),
+         v("27B_elastic", "decode_tps")),
+        ("Qwen3.8-27B\nWindows (B390)", WIN["27B"]["stock_gib"],
+         WIN["27B"]["streamed_gib"], WIN["27B"]["stock_tps"],
+         WIN["27B"]["streamed_tps"]),
+    ]
+
+    axa = fig.add_axes([0.185, 0.16, 0.40, 0.58])
+    style_ax(axa)
+    axa.grid(axis="x", color=GRID, alpha=0.6)
+    axa.grid(axis="y", visible=False)
+    for i, (name, sv, ev, st, et) in enumerate(rows):
+        g = i * 1.0
+        axa.barh(g + 0.19, sv, height=0.36, color=STOCK,
+                 label="stock" if i == 0 else None)
+        axa.barh(g - 0.19, ev, height=0.36, color=ELASTIC,
+                 label="streamed" if i == 0 else None)
+        if sv > 5:
+            axa.text(sv - 0.5, g + 0.19, f"{sv:.2f}", va="center", ha="right",
+                     fontsize=11, fontweight="bold", color=BG)
+        else:
+            axa.text(sv + 0.35, g + 0.19, f"{sv:.2f}", va="center", ha="left",
+                     fontsize=11, fontweight="bold", color=TEXT)
+        axa.text(ev + 0.35, g - 0.19, f"{ev:.2f}", va="center", fontsize=11,
+                 fontweight="bold", color=ELASTIC)
+        axa.text(max(sv, ev) + 4.6, g, f"-{round(100 * (1 - ev / sv))}%",
+                 va="center", fontsize=11, fontweight="bold", color=BG,
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor=ELASTIC,
+                           edgecolor="none"))
+    axa.set_yticks([0, 1, 2, 3])
+    axa.set_yticklabels([r[0] for r in rows], fontsize=11, color=TEXT)
+    axa.set_xlabel("peak device memory, GiB", fontsize=12)
+    axa.set_xlim(0, 34)
+    top = 3.75
+    for x, lab in [(B390_POOL_GIB, "Arc B390 pool, 16.4"),
+                   (B70_HEAP_GIB, "Arc Pro B70 pool, 31.9")]:
+        axa.axvline(x, color=AMBER, linestyle="--", linewidth=1.2)
+        axa.text(x - 0.4, top - 0.02, lab, fontsize=10, color=AMBER,
+                 ha="right", va="top", bbox=REF_LABEL_BOX)
+    axa.set_ylim(-0.55, top + 0.13)
+    axa.legend(loc="center right", bbox_to_anchor=(0.98, 0.35), fontsize=10,
+               frameon=True, facecolor=PANEL, edgecolor=GRID)
+
+    axb = fig.add_axes([0.655, 0.16, 0.315, 0.58])
+    style_ax(axb)
+    axb.grid(axis="x", color=GRID, alpha=0.6)
+    axb.grid(axis="y", visible=False)
+    for i, (name, sv, ev, st, et) in enumerate(rows):
+        ret = 100.0 * et / st
+        col = BLUE if "Linux" in name else ELASTIC
+        axb.barh(i, ret, height=0.5, color=col)
+        axb.text(ret + 0.35, i, f"{ret:.1f}%   {et:.1f} vs {st:.1f} t/s",
+                 va="center", fontsize=10.5, color=TEXT)
+    axb.set_yticks([0, 1, 2, 3])
+    axb.set_yticklabels(["" for _ in rows])
+    axb.set_xlim(0, 15)
+    axb.set_xlabel("decode retained under streaming, % of stock", fontsize=12)
+    axb.set_title("capacity tier, not a speed path", fontsize=11, color=MUTED)
+    footer(fig, "Arc Pro B70 32 GB (Linux) + Arc B390 iGPU (Windows) | "
+                "llama.cpp SYCL + stream-weights patch | Qwen GGUF Q4_K | "
+                "data: docs/perf/sycl-elastic/data.json")
+    save(fig, "fig9_windows.png")
+
+
 if __name__ == "__main__":
-    fig0(); fig1(); fig2(); fig3(); fig4(); fig5(); fig6(); fig7(); fig8()
+    fig0(); fig1(); fig2(); fig3(); fig4(); fig5(); fig6(); fig7(); fig8(); fig9()
     if QC_ERRORS:
         print("\n=== QC FAILURES ===")
         for name, kind, detail in QC_ERRORS:
