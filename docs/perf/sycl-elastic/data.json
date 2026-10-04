@@ -968,27 +968,32 @@
    ]
   },
   "lat_35B_a3b_stock": {
-   "cold_first_ttft_s": 0.909,
    "warm_ttft_s": [
-    0.176,
-    0.21
+    0.583,
+    0.592,
+    0.597
    ],
    "warm_itl_median_s": [
-    0.0125,
-    0.0125
+    0.013,
+    0.013,
+    0.013
    ]
   },
   "lat_35B_a3b_elastic": {
-   "cold_first_ttft_s": 9.236,
    "warm_ttft_s": [
-    4.343,
-    4.205
+    1.874,
+    1.845,
+    1.867,
+    1.846
    ],
    "warm_itl_median_s": [
-    4.2681,
-    4.2686
+    0.385,
+    0.38,
+    0.382,
+    0.384
    ]
-  }
+  },
+  "note_35B": "router-aware campaign (0002): warm per-request server timings, v0 fully streamed; pre-0002 fully-streamed ITL was ~4 s/token"
  },
  "lifecycle": {
   "cycles_1_5B_stock": {
