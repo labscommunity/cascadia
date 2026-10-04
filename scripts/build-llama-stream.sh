@@ -13,13 +13,15 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="${1:-./llama-stream}"
+case "$DEST" in /*) ;; *) DEST="$PWD/$DEST" ;; esac   # absolutize: we cd below
 LLAMA_REPO="${LLAMA_REPO:-https://github.com/ggml-org/llama.cpp}"
 LLAMA_BASE="${LLAMA_BASE:-1692f9e50bb20fd96b963af38a282daf78feea64}"
 ONEAPI_ROOT="${ONEAPI_ROOT:-/opt/intel/oneapi}"
 JOBS="${JOBS:-$(nproc)}"
+# patch, marker file (relative to DEST), marker string proving it applied
 PATCHES=(
-    "$REPO_ROOT/patches/llama.cpp/0001-sycl-stream-weights.patch"
-    "$REPO_ROOT/patches/llama.cpp/0002-sycl-router-aware-moe.patch"
+    "$REPO_ROOT/patches/llama.cpp/0001-sycl-stream-weights.patch:ggml/src/ggml-backend.cpp:GGML_STREAM_WEIGHTS"
+    "$REPO_ROOT/patches/llama.cpp/0002-sycl-router-aware-moe.patch:ggml/src/ggml-sycl/ggml-sycl.cpp:GGML_STREAM_EXPERT_CACHE_MB"
 )
 
 if [ ! -d "$DEST/.git" ]; then
@@ -27,15 +29,20 @@ if [ ! -d "$DEST/.git" ]; then
 fi
 cd "$DEST"
 git checkout "$LLAMA_BASE"
-# apply the chain in order; a patch that fails --check must already be
-# applied (idempotent reruns) - verify the marker instead of failing
-for PATCH in "${PATCHES[@]}"; do
+# apply the chain in order; a patch that fails --check may already be applied
+# (idempotent reruns) - each patch must be proven by its own marker, so a
+# missing 0002 cannot hide behind 0001's marker
+for SPEC in "${PATCHES[@]}"; do
+    PATCH="${SPEC%%:*}"
+    REST="${SPEC#*:}"
+    MARKER_FILE="${REST%%:*}"
+    MARKER="${REST#*:}"
     if git apply --check "$PATCH" 2>/dev/null; then
         git apply "$PATCH"
-    elif grep -q GGML_STREAM_WEIGHTS "$DEST/ggml/src/ggml-backend.cpp" 2>/dev/null; then
-        echo "patch $(basename "$PATCH") already applied or not applicable; continuing"
+    elif grep -q "$MARKER" "$MARKER_FILE" 2>/dev/null; then
+        echo "patch $(basename "$PATCH") already applied; continuing"
     else
-        echo "ERROR: $(basename "$PATCH") does not apply to $LLAMA_BASE" >&2
+        echo "ERROR: $(basename "$PATCH") does not apply to $LLAMA_BASE and its marker is absent" >&2
         exit 1
     fi
 done

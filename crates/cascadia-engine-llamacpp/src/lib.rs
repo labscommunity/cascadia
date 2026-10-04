@@ -684,7 +684,9 @@ impl LlamaCppEngine {
             // Body is one byte stream of SSE `data: ...` lines, possibly
             // chunk-framed. Read chunk sizes as hex when chunked.
             let mut st = SseState::default();
-            let mut leftover = String::new();
+            // byte buffer, decoded per complete line: a chunk boundary can
+            // split a UTF-8 multibyte character, so never convert per chunk
+            let mut leftover = Vec::<u8>::new();
             'body: loop {
                 if cancelled.load(Ordering::Relaxed) {
                     return;
@@ -704,13 +706,17 @@ impl LlamaCppEngine {
                     if reader.read_exact(&mut buf).is_err() {
                         break 'body;
                     }
-                    leftover.push_str(&String::from_utf8_lossy(&buf));
+                    leftover.extend_from_slice(&buf);
                     // swallow the chunk's trailing CRLF
                     let mut crlf = [0u8; 2];
                     let _ = reader.read_exact(&mut crlf);
-                    while let Some(idx) = leftover.find('\n') {
-                        line = leftover[..idx].to_string();
-                        leftover = leftover[idx + 1..].to_string();
+                    // '\n' (0x0A) never occurs inside a UTF-8 multibyte
+                    // sequence, so byte-splitting on it is boundary-safe
+                    while let Some(idx) = leftover.iter().position(|&b| b == b'\n') {
+                        line = String::from_utf8_lossy(&leftover[..idx])
+                            .trim_end()
+                            .to_string();
+                        leftover.drain(..idx + 1);
                         if !handle_sse_line(&line, &tid, &mut st, &send) {
                             return;
                         }
@@ -1364,6 +1370,40 @@ mod unix_tests {
         assert!(last.is_final);
         assert_eq!(last.finish_reason, Some(FinishReason::Stop));
         assert_eq!(last.prompt_tokens, Some(11));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn engine_decodes_multibyte_split_across_chunks() {
+        // "é" is 2 UTF-8 bytes; split it across two chunk boundaries to
+        // prove the decoder buffers bytes per line, not per chunk
+        let (port, server) = mock_server(|_, s| {
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            s.write_all(head.as_bytes()).unwrap();
+            let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"h\u{e9}llo\"}}]}\n";
+            let bytes = payload.as_bytes();
+            let split = bytes
+                .iter()
+                .position(|&b| b == 0xC3)
+                .expect("multibyte lead byte");
+            let a = &bytes[..split + 1]; // ends mid-character (0xC3)
+            let b = &bytes[split + 1..]; // starts with the trailing byte
+            let frame = |p: &[u8]| {
+                let mut f = format!("{:x}\r\n", p.len()).into_bytes();
+                f.extend_from_slice(p);
+                f.extend_from_slice(b"\r\n");
+                f
+            };
+            s.write_all(&frame(a)).unwrap();
+            s.write_all(&frame(b)).unwrap();
+            s.write_all(b"0\r\n\r\n").unwrap();
+        });
+        let mut engine = test_engine(port);
+        engine.submit(chat_task()).unwrap();
+        let chunks = drain(&mut engine);
+        let texts: Vec<&str> = chunks.iter().map(|(_, c)| c.text.as_str()).collect();
+        assert_eq!(texts, ["h\u{e9}llo", ""], "no U+FFFD may appear");
+        assert!(!texts.iter().any(|t| t.contains('\u{FFFD}')));
         server.join().unwrap();
     }
 

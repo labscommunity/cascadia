@@ -26,8 +26,8 @@ if not exist "%DEST%\.git" (
 )
 cd /d "%DEST%"
 git checkout "%LLAMA_BASE%" || exit /b 1
-git apply --check "%PATCH1%" 2>nul && git apply "%PATCH1%" || echo patch1 already applied or not applicable; continuing
-git apply --check "%PATCH2%" 2>nul && git apply "%PATCH2%" || echo patch2 already applied or not applicable; continuing
+git apply --check "%PATCH1%" 2>nul && git apply "%PATCH1%" || (findstr /m /c:"GGML_STREAM_WEIGHTS" ggml\src\ggml-backend.cpp >nul 2>&1 && echo patch1 already applied; continuing || (echo ERROR: patch1 does not apply to %LLAMA_BASE% & exit /b 1))
+git apply --check "%PATCH2%" 2>nul && git apply "%PATCH2%" || (findstr /m /c:"GGML_STREAM_EXPERT_CACHE_MB" ggml\src\ggml-sycl\ggml-sycl.cpp >nul 2>&1 && echo patch2 already applied; continuing || (echo ERROR: patch2 does not apply to %LLAMA_BASE% & exit /b 1))
 
 REM VS + oneAPI environments. VS2022INSTALLDIR lets setvars find the Build Tools.
 if "%VS2022INSTALLDIR%"=="" set "VS2022INSTALLDIR=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"

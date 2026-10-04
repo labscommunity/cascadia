@@ -378,56 +378,6 @@ Subject: [PATCH 2/2] sycl: router-aware MoE expert streaming (automatic)
              ts.push_back(ts0[i]);
              recs.push_back(recs0[i]);
          }
-@@ -5751,35 +6050,11 @@
-     if (e.src.host_ptr != nullptr) {
-         memcpy(sw.staging.data(), e.src.host_ptr, e.nbytes);
-     } else {
-+#ifndef _WIN32
-         size_t got = 0;
-         while (got < e.nbytes) {
--#ifdef _WIN32
--            // UCRT has no pread; do a positioned ReadFile on the fd's OS
--            // handle (does not disturb the CRT file position)
--            HANDLE h = (HANDLE) _get_osfhandle(e.src.fd);
--            if (h == INVALID_HANDLE_VALUE) {
--                GGML_LOG_ERROR("%s: invalid handle for streamed tensor\n", __func__);
--                std::exit(1);
--            }
--            size_t chunk = e.nbytes - got;
--            if (chunk > (size_t) 0x7FFFFFFF) {
--                chunk = (size_t) 0x7FFFFFFF;
--            }
--            OVERLAPPED ov;
--            memset(&ov, 0, sizeof(ov));
--            const uint64_t off = e.src.file_off + got;
--            ov.Offset     = (DWORD) (off & 0xFFFFFFFFu);
--            ov.OffsetHigh = (DWORD) (off >> 32);
--            DWORD rd = 0;
--            if (!ReadFile(h, (char *) sw.staging.data() + got, (DWORD) chunk, &rd, &ov)) {
--                GGML_LOG_ERROR("%s: ReadFile failed for streamed tensor\n", __func__);
--                std::exit(1);
--            }
--            const int r = (int) rd;
--#else
--            const ssize_t r = pread(e.src.fd, sw.staging.data() + got, e.nbytes - got,
--                                    (off_t) (e.src.file_off + got));
--#endif
-+            ssize_t r = pread(e.src.fd, sw.staging.data() + got, e.nbytes - got,
-+                              (off_t) (e.src.file_off + got));
-             if (r <= 0) {
-                 GGML_LOG_ERROR("%s: pread failed for streamed tensor\n", __func__);
-                 std::exit(1);
-@@ -5792,6 +6067,10 @@
-             fprintf(stderr, "[sw] %s off=%zu n=%zu fnv=%llx\n", t->name, e.src.file_off, e.nbytes,
-                     (unsigned long long) h);
-         }
-+#else
-+        GGML_LOG_ERROR("%s: fd-based streaming not supported on Windows\n", __func__);
-+        std::exit(1);
-+#endif
-     }
-     SYCL_CHECK(CHECK_TRY_ERROR(sw.q->memcpy(dst, sw.staging.data(), e.nbytes).wait()));
-     if (e.padded > e.nbytes) {
 @@ -5811,6 +6090,9 @@
          while (s->view_src != nullptr) {
              s = s->view_src;
