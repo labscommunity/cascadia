@@ -1,8 +1,8 @@
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index cc3f8cd36..1acd0cedf 100644
+index cc3f8cd36..1fa6ec2fa 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -432,6 +432,25 @@ extern "C" {
+@@ -432,6 +432,30 @@ extern "C" {
      GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
      GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
  
@@ -21,6 +21,11 @@ index cc3f8cd36..1acd0cedf 100644
 +
 +    GGML_API int  ggml_stream_weights_enabled(void);
 +    GGML_API bool ggml_stream_is_weight(const struct ggml_tensor * tensor);
++    GGML_API bool ggml_stream_is_streamable(const struct ggml_tensor * tensor);
++    // keep layers < n resident (partial streaming); GGML_STREAM_RESIDENT_LAYERS wins
++    GGML_API void ggml_stream_set_resident_layers(int n);
++    // turn streaming off entirely (model fits); re-enables fusion/graphs
++    GGML_API void ggml_stream_disable(void);
 +    GGML_API void ggml_stream_register(struct ggml_tensor * tensor, const void * host_ptr, int fd, size_t file_off);
 +    GGML_API const struct ggml_stream_src * ggml_stream_find(const struct ggml_tensor * tensor);
 +    GGML_API int  ggml_stream_snapshot(const struct ggml_tensor ** tensors, struct ggml_stream_src * recs, int max_n);
@@ -29,7 +34,7 @@ index cc3f8cd36..1acd0cedf 100644
  }
  #endif
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index f6fb91798..d129dde99 100644
+index f6fb91798..2def496c6 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -20,6 +20,8 @@
@@ -41,7 +46,7 @@ index f6fb91798..d129dde99 100644
  #include <vector>
  
  #ifdef __APPLE__
-@@ -2429,3 +2431,87 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size)
+@@ -2429,3 +2431,113 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size)
      GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
      return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
  }
@@ -82,19 +87,45 @@ index f6fb91798..d129dde99 100644
 +    return (int) l;
 +}
 +
++static int g_stream_resident = 0;
++static bool g_stream_disabled = false;
++
++void ggml_stream_set_resident_layers(int n) {
++    g_stream_resident = n;
++}
++
++void ggml_stream_disable(void) {
++    g_stream_disabled = true;
++}
++
++static int ggml_stream_n_resident(void) {
++    static int env = -2;
++    if (env == -2) {
++        const char * e = getenv("GGML_STREAM_RESIDENT_LAYERS");
++        env = e ? atoi(e) : -1;
++    }
++    return env >= 0 ? env : g_stream_resident;
++}
++
 +int ggml_stream_weights_enabled(void) {
-+    return ggml_stream_env_flag();
++    return ggml_stream_env_flag() && !g_stream_disabled;
 +}
 +
 +static std::unordered_map<const ggml_tensor *, ggml_stream_src> g_stream_map;
 +static std::mutex g_stream_mu;
 +
-+bool ggml_stream_is_weight(const ggml_tensor * tensor) {
-+    if (!ggml_stream_env_flag() || tensor == NULL) {
++// true if the tensor would stream with no resident layers kept
++bool ggml_stream_is_streamable(const ggml_tensor * tensor) {
++    if (!ggml_stream_weights_enabled() || tensor == NULL) {
 +        return false;
 +    }
 +    return ggml_stream_parse_layer(tensor->name) >= 0 &&
 +           ggml_nbytes(tensor) >= ggml_stream_min_bytes();
++}
++
++bool ggml_stream_is_weight(const ggml_tensor * tensor) {
++    return ggml_stream_is_streamable(tensor) &&
++           ggml_stream_parse_layer(tensor->name) >= ggml_stream_n_resident();
 +}
 +
 +void ggml_stream_register(ggml_tensor * tensor, const void * host_ptr, int fd, size_t file_off) {
@@ -130,7 +161,7 @@ index f6fb91798..d129dde99 100644
 +    return n;
 +}
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index d1456a867..8c014a894 100644
+index d1456a867..032c26e6a 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
 @@ -30,6 +30,10 @@
@@ -177,7 +208,7 @@ index d1456a867..8c014a894 100644
      ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
-@@ -5603,8 +5619,202 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
+@@ -5603,8 +5619,203 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
      return skip;
  }
  
@@ -284,8 +315,9 @@ index d1456a867..8c014a894 100644
 +    sw.slot_owner.assign(nw, nullptr);
 +    sw.device = device;
 +    sw.built  = true;
-+    GGML_LOG_INFO("%s: stream slots %.2f MiB (%d slots, %d streamed tensors)\n",
-+                  __func__, sw.pool_bytes / 1048576.0, nw, n);
++    // fprintf on purpose: the server hides GGML_LOG_INFO at default verbosity
++    fprintf(stderr, "%s: stream slots %.2f MiB (%d slots, %d streamed tensors)\n",
++            __func__, sw.pool_bytes / 1048576.0, nw, n);
 +    return true;
 +}
 +catch (sycl::exception const &exc) {
@@ -380,7 +412,7 @@ index d1456a867..8c014a894 100644
  
      for (int i = 0; i < cgraph->n_nodes; i++) {
          ggml_tensor * node = cgraph->nodes[i];
-@@ -5615,7 +5825,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -5615,7 +5826,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
              continue;
          }
  
@@ -393,7 +425,7 @@ index d1456a867..8c014a894 100644
          if (nodes_to_skip != 0) {
              i += nodes_to_skip;
              continue;
-@@ -5629,7 +5843,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -5629,7 +5844,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
          }
  #endif
          // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
@@ -402,7 +434,7 @@ index d1456a867..8c014a894 100644
              ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
              const int gdn_nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
              if (gdn_nodes_to_skip > 0) {
-@@ -5638,20 +5852,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -5638,20 +5853,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                  continue;
              }
          }
@@ -426,7 +458,7 @@ index d1456a867..8c014a894 100644
              i += 2;
              continue;
          }
-@@ -5712,7 +5926,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
+@@ -5712,7 +5927,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
  
  #ifdef GGML_SYCL_GRAPH
      bool use_sycl_graph = false;
@@ -480,3 +512,90 @@ index 5c5e97fbc..a61e40162 100644
          if (use_mmap) {
              const auto & mapping = mappings.at(weight->idx);
              ggml_backend_buffer_t buf_mmap = nullptr;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index c81005505..4487899f8 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1558,6 +1558,82 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+     pimpl->mappings.reserve(ml.mappings.size());
+ 
++    // stream-weights: decide how many leading layers stay resident before
++    // buffers are allocated (alloc sizes depend on it). explicit
++    // GGML_STREAM_RESIDENT_LAYERS wins over the GGML_STREAM_VRAM_MB budget
++    if (ggml_stream_weights_enabled() && !devices.empty()) {
++        // per-layer streamable bytes, evaluated with everything streamable
++        std::map<int, size_t> s_layer;
++        size_t total_weights = 0;
++        for (const auto & it : ml.weights_map) {
++            const size_t nb = ggml_nbytes(it.second.tensor);
++            total_weights += nb;
++            if (ggml_stream_is_streamable(it.second.tensor)) {
++                int l = -1;
++                if (sscanf(it.first.c_str(), "blk.%d.", &l) == 1) {
++                    s_layer[l] += nb;
++                }
++            }
++        }
++        size_t s_total = 0, s_max = 0;
++        for (const auto & it : s_layer) {
++            s_total += it.second;
++            s_max = std::max(s_max, it.second);
++        }
++        const size_t non_streamable = total_weights - s_total;
++
++        const char * res_env = getenv("GGML_STREAM_RESIDENT_LAYERS");
++        int n_res = 0;
++        size_t resident = 0;
++        if (res_env != nullptr) {
++            n_res = atoi(res_env);
++            for (const auto & it : s_layer) {
++                if (it.first < n_res) {
++                    resident += it.second;
++                }
++            }
++        } else {
++            size_t budget = 0;
++            const char * budget_env = getenv("GGML_STREAM_VRAM_MB");
++            if (budget_env != nullptr) {
++                if (strcmp(budget_env, "auto") == 0) {
++                    const char * r = getenv("GGML_STREAM_RESERVE_MB");
++                    const size_t reserve = (r && atoi(r) > 0 ? (size_t) atoi(r) : 2048) * 1024 * 1024;
++                    size_t free_mem = 0, total_mem = 0;
++                    ggml_backend_dev_memory(devices[0].dev, &free_mem, &total_mem);
++                    if (free_mem < non_streamable + 2 * s_max + reserve) {
++                        fprintf(stderr, "stream-weights: warning: %.0f MiB free, fully streamed needs ~%.0f MiB; the driver may evict other processes to host memory\n",
++                                free_mem / 1048576.0,
++                                (non_streamable + 2 * s_max + reserve) / 1048576.0);
++                    }
++                    budget = free_mem > non_streamable + 2 * s_max + reserve
++                           ? free_mem - non_streamable - 2 * s_max - reserve : 0;
++                } else {
++                    budget = (size_t) atoll(budget_env) * 1024 * 1024;
++                }
++            }
++            for (int l = 0; l < (int) s_layer.size() && s_layer.count(l); l++) {
++                if (resident + s_layer[l] > budget) {
++                    break;
++                }
++                resident += s_layer[l];
++                n_res++;
++            }
++            ggml_stream_set_resident_layers(n_res);
++        }
++        // fprintf on purpose: the server filters LLAMA_LOG_INFO at default
++        // verbosity, and callers need this split on stderr unconditionally
++        if (n_res >= (int) n_layer_all) {
++            ggml_stream_disable();
++            fprintf(stderr, "stream-weights: model fits (%.0f MiB), streaming disabled\n",
++                    s_total / 1048576.0);
++        } else {
++            fprintf(stderr, "stream-weights: resident layers %d/%d (%.0f MiB resident, %.0f MiB streamed per token)\n",
++                    n_res, (int) n_layer_all, resident / 1048576.0,
++                    (s_total - resident) / 1048576.0);
++        }
++    }
++
+     // create the backend buffers
+     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
+     ctx_buf_maps.reserve(ml.ctx_map.size());
