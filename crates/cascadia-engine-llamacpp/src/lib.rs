@@ -22,18 +22,23 @@
 //! decode scales as ~8.1 GB/s / model_GB; KV is still reserved (O2 open);
 //! fused ops and SYCL graphs are disabled while streaming; single-device.
 
+use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
-use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId};
+use cascadia_types::{
+    Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, SamplingParams, ShardSpec,
+    TaskId,
+};
 use futures::stream;
 
 /// Configuration for the llama.cpp subprocess engine.
@@ -53,6 +58,148 @@ pub struct LlamaCppConfig {
     pub elastic: bool,
     /// Extra raw args appended verbatim to the server command line.
     pub extra_args: Vec<String>,
+    /// Health deadline per load attempt. `None` = auto: 60 s + 8 s per GiB
+    /// of model file (300 s when the file metadata is unreadable).
+    pub load_timeout: Option<Duration>,
+    /// Extra load attempts after the first fails (child exit or health
+    /// timeout). xe copy-engine resets hang the load path intermittently;
+    /// the next attempt on a fresh port nearly always succeeds. Default 1.
+    pub load_retries: u32,
+}
+
+/// Byte string whose presence in llama-server or libggml-base marks a build
+/// with the weight-streaming patch (`GGML_STREAM_WEIGHTS` env gate).
+const STREAM_MARKER: &[u8] = b"GGML_STREAM_WEIGHTS";
+
+/// Resolve the llama-server binary.
+///
+/// Order: `--llama-bin` > `$CASCADIA_LLAMA_BIN` > `llama-server`
+/// (`llama-server.exe` on Windows) found on `PATH`. An explicit path that
+/// does not exist is an error, not a fall-through — a typo must not silently
+/// pick up a different build.
+pub fn resolve_llama_bin(
+    flag: Option<&str>,
+    env: Option<OsString>,
+    path_var: Option<OsString>,
+) -> Result<PathBuf, String> {
+    if let Some(p) = flag {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Ok(pb);
+        }
+        return Err(format!("--llama-bin {p}: no such file"));
+    }
+    if let Some(v) = env.filter(|v| !v.is_empty()) {
+        let pb = PathBuf::from(&v);
+        if pb.is_file() {
+            return Ok(pb);
+        }
+        return Err(format!("CASCADIA_LLAMA_BIN={}: no such file", pb.display()));
+    }
+    let name = if cfg!(windows) {
+        "llama-server.exe"
+    } else {
+        "llama-server"
+    };
+    if let Some(paths) = path_var {
+        for dir in std::env::split_paths(&paths) {
+            let cand = dir.join(name);
+            if cand.is_file() {
+                return Ok(cand);
+            }
+        }
+    }
+    Err(format!(
+        "no llama-server binary found: pass --llama-bin <path>, set \
+         CASCADIA_LLAMA_BIN, or put {name} on PATH; build one with \
+         scripts/build-llama-stream.sh"
+    ))
+}
+
+/// Map a cascadia `--device` value to llama.cpp `--device` args + the ngl
+/// actually in force. `GPU` -> `SYCL0`, `GPU.N` -> `SYCLN`, `CPU` (any case)
+/// -> `--device none` with ngl forced to 0; anything else (SYCL1, Vulkan0,
+/// `SYCL0,SYCL1`, ...) passes verbatim.
+pub fn llama_device_args(device: &str, ngl: u32) -> (Vec<String>, u32) {
+    if device.eq_ignore_ascii_case("cpu") {
+        return (vec!["--device".into(), "none".into()], 0);
+    }
+    let mapped = if device == "GPU" {
+        Some("SYCL0".to_string())
+    } else if let Some(idx) = device.strip_prefix("GPU.") {
+        idx.parse::<u32>().ok().map(|n| format!("SYCL{n}"))
+    } else {
+        None
+    };
+    (
+        vec!["--device".into(), mapped.unwrap_or_else(|| device.into())],
+        ngl,
+    )
+}
+
+/// Result of probing a llama-server build for weight-streaming support.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamWeightsSupport {
+    /// `GGML_STREAM_WEIGHTS` marker found in the binary or a libggml-base
+    /// next to it — `--elastic` will do device-side streaming.
+    Present,
+    /// No libggml-base beside the binary and the binary lacks the marker —
+    /// support could not be verified (static build? foreign layout?).
+    Unknown,
+}
+
+fn file_contains(path: &Path, needle: &[u8]) -> bool {
+    std::fs::read(path)
+        .map(|b| b.windows(needle.len()).any(|w| w == needle))
+        .unwrap_or(false)
+}
+
+/// Preflight: does this llama-server build understand GGML_STREAM_WEIGHTS?
+/// Scans the binary itself plus `libggml-base*` / `ggml-base*.dll` files in
+/// the same directory (the env gate lives in libggml-base; distro builds
+/// link it as a shared object).
+///
+/// - marker anywhere -> `Present`
+/// - a libggml-base exists but nothing contains the marker -> `Err` (a stock
+///   build: `--elastic` would silently not reduce VRAM)
+/// - no libggml-base at all and the binary lacks the marker -> `Unknown`
+///   (caller warns and continues)
+pub fn probe_stream_weights(bin: &Path) -> Result<StreamWeightsSupport, String> {
+    if file_contains(bin, STREAM_MARKER) {
+        return Ok(StreamWeightsSupport::Present);
+    }
+    let dir = bin.parent().unwrap_or_else(|| Path::new("."));
+    let mut found_base = false;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let is_base = name.starts_with("libggml-base")
+                || (name.starts_with("ggml-base") && name.ends_with(".dll"));
+            if is_base {
+                found_base = true;
+                if file_contains(&e.path(), STREAM_MARKER) {
+                    return Ok(StreamWeightsSupport::Present);
+                }
+            }
+        }
+    }
+    if found_base {
+        Err("this llama-server build has no weight-streaming support; \
+             --elastic would not reduce VRAM. Build one with \
+             scripts/build-llama-stream.sh (or drop --elastic)"
+            .to_string())
+    } else {
+        Ok(StreamWeightsSupport::Unknown)
+    }
+}
+
+/// Auto load deadline: 60 s + 8 s per GiB of model file; 300 s when the
+/// metadata is unreadable (a spawn error will surface the real cause).
+fn auto_load_timeout(model: &Path) -> Duration {
+    match std::fs::metadata(model) {
+        Ok(m) => Duration::from_secs(60 + 8 * (m.len() >> 30)),
+        Err(_) => Duration::from_secs(300),
+    }
 }
 
 /// Minimal HTTP health probe — a GET /health against 127.0.0.1:port is a
@@ -72,15 +219,21 @@ fn health_ok(port: u16) -> bool {
     }
     let mut buf = [0u8; 64];
     let n = s.read(&mut buf).unwrap_or(0);
-    String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200")
-        || String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.0 200")
+    let status = String::from_utf8_lossy(&buf[..n]);
+    status.starts_with("HTTP/1.1 200") || status.starts_with("HTTP/1.0 200")
 }
+
+/// Last lines of child stderr, kept for error messages. The forwarding
+/// thread pushes every line; the engine reads it when a load attempt fails.
+type StderrTail = Arc<Mutex<VecDeque<String>>>;
 
 /// Builder: spawns and readiness-checks the llama-server child.
 pub struct LlamaCppBuilder {
     cfg: LlamaCppConfig,
     port: u16,
     child: Option<Child>,
+    stderr_tail: StderrTail,
+    stderr_drain: Option<std::thread::JoinHandle<()>>,
 }
 
 impl LlamaCppBuilder {
@@ -89,6 +242,8 @@ impl LlamaCppBuilder {
             cfg,
             port: 0,
             child: None,
+            stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+            stderr_drain: None,
         }
     }
 
@@ -97,6 +252,106 @@ impl LlamaCppBuilder {
         let l = TcpListener::bind("127.0.0.1:0")
             .map_err(|e| EngineError::Backend(format!("port probe: {e}")))?;
         Ok(l.local_addr().unwrap().port())
+    }
+
+    /// Spawn the llama-server child on `self.port`. stderr is piped and a
+    /// drainer thread forwards every line to our stderr while keeping the
+    /// last 40 in a ring buffer for error messages — the drainer must run
+    /// for the child's whole life or a full pipe would block the child.
+    fn spawn_child(&mut self) -> Result<(), String> {
+        let (dev_args, ngl) = llama_device_args(&self.cfg.device, self.cfg.ngl);
+        let mut cmd = Command::new(&self.cfg.llama_bin);
+        cmd.arg("-m")
+            .arg(&self.cfg.model)
+            .args(&dev_args)
+            .arg("-ngl")
+            .arg(ngl.to_string())
+            .arg("-c")
+            .arg(self.cfg.ctx.to_string())
+            .arg("--host")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(self.port.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        if self.cfg.elastic {
+            // Device-side O1: weights stay on disk, streamed per layer.
+            cmd.env("GGML_STREAM_WEIGHTS", "1");
+        }
+        for a in self.cfg.extra_args.iter().filter(|a| !a.is_empty()) {
+            cmd.arg(a);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("spawn llama-server: {e}"))?;
+        self.stderr_tail.lock().unwrap().clear();
+        if let Some(err) = child.stderr.take() {
+            let tail = self.stderr_tail.clone();
+            self.stderr_drain = Some(std::thread::spawn(move || {
+                for line in BufReader::new(err).lines().map_while(Result::ok) {
+                    eprintln!("{line}");
+                    let mut t = tail.lock().unwrap();
+                    if t.len() >= 40 {
+                        t.pop_front();
+                    }
+                    t.push_back(line);
+                }
+            }));
+        }
+        self.child = Some(child);
+        Ok(())
+    }
+
+    /// Poll `/health` until the server answers, the child exits, or the
+    /// deadline hits. Raw TcpStream — this runs on a tokio worker where
+    /// reqwest::blocking cannot (nested runtime panics); the SSE reader
+    /// is a plain thread.
+    fn wait_healthy(&mut self, timeout: Duration) -> Result<(), String> {
+        let port = self.port;
+        let t0 = Instant::now();
+        loop {
+            if let Some(c) = self.child.as_mut() {
+                if let Ok(Some(st)) = c.try_wait() {
+                    return Err(format!("llama-server exited during load: {st}"));
+                }
+            }
+            if health_ok(port) {
+                return Ok(());
+            }
+            if t0.elapsed() > timeout {
+                return Err(format!("llama-server health timeout ({timeout:?})"));
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    /// Kill + reap the child, then give the stderr drainer a short grace to
+    /// reach EOF and flush the tail. A grandchild may still hold the pipe
+    /// open, in which case the drainer is detached and keeps forwarding.
+    fn kill_child(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        if let Some(t) = self.stderr_drain.take() {
+            for _ in 0..50 {
+                if t.is_finished() {
+                    let _ = t.join();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    /// The last `n` captured child stderr lines, joined.
+    fn tail_lines(&self, n: usize) -> String {
+        let t = self.stderr_tail.lock().unwrap();
+        t.iter()
+            .skip(t.len().saturating_sub(n))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -113,57 +368,49 @@ impl Builder for LlamaCppBuilder {
     }
 
     async fn load(&mut self, _shard: ShardSpec) -> EngineResult<LoadStream> {
-        self.port = Self::pick_port()?;
-        let mut cmd = Command::new(&self.cfg.llama_bin);
-        cmd.arg("-m")
-            .arg(&self.cfg.model)
-            .arg("--device")
-            .arg(&self.cfg.device)
-            .arg("-ngl")
-            .arg(self.cfg.ngl.to_string())
-            .arg("-c")
-            .arg(self.cfg.ctx.to_string())
-            .arg("--host")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg(self.port.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit());
-        if self.cfg.elastic {
-            // Device-side O1: weights stay on disk, streamed per layer.
-            cmd.env("GGML_STREAM_WEIGHTS", "1");
+        let timeout = self
+            .cfg
+            .load_timeout
+            .unwrap_or_else(|| auto_load_timeout(&self.cfg.model));
+        if self.cfg.elastic && self.cfg.device.eq_ignore_ascii_case("cpu") {
+            tracing::warn!(
+                "sycl-llama --elastic on a CPU device: GGML_STREAM_WEIGHTS \
+                 streams weights only on the device path — it does nothing \
+                 for `--device none` (the host interposer still applies)"
+            );
         }
-        for a in &self.cfg.extra_args {
-            cmd.arg(a);
-        }
-        let child = cmd
-            .spawn()
-            .map_err(|e| EngineError::Backend(format!("spawn llama-server: {e}")))?;
-        self.child = Some(child);
-
-        // Poll /health until the server is serving or the child exits.
-        // Raw TcpStream — this runs on a tokio worker where reqwest::blocking
-        // cannot (nested runtime panics); the SSE reader is a plain thread.
-        let port = self.port;
-        let t0 = Instant::now();
-        let deadline = Duration::from_secs(120);
-        loop {
-            if let Some(c) = self.child.as_mut() {
-                if let Ok(Some(st)) = c.try_wait() {
-                    return Err(EngineError::Backend(format!(
-                        "llama-server exited during load: {st}"
-                    )));
+        let attempts = 1 + self.cfg.load_retries;
+        let mut last_err = String::new();
+        for attempt in 1..=attempts {
+            if attempt > 1 {
+                tracing::warn!(
+                    attempt,
+                    "retrying llama-server load ({last_err}); intermittent load hangs \
+                     correlate with xe copy-engine resets: check \
+                     `dmesg | grep -i 'engine reset'`"
+                );
+                std::thread::sleep(Duration::from_secs(3));
+            }
+            self.port = Self::pick_port()?;
+            match self.spawn_child().and_then(|()| self.wait_healthy(timeout)) {
+                Ok(()) => break,
+                Err(e) => {
+                    self.kill_child();
+                    let tail = self.tail_lines(20);
+                    last_err = if tail.is_empty() {
+                        e
+                    } else {
+                        format!("{e}; child stderr (last lines): {tail}")
+                    };
                 }
             }
-            if health_ok(port) {
-                break;
+            if attempt == attempts {
+                return Err(EngineError::Backend(format!(
+                    "llama-server failed to load after {attempts} attempt(s): {last_err}"
+                )));
             }
-            if t0.elapsed() > deadline {
-                return Err(EngineError::Backend("llama-server health timeout".into()));
-            }
-            std::thread::sleep(Duration::from_secs(2));
         }
-        tracing::info!(port, "llama-server ready");
+        tracing::info!(port = self.port, "llama-server ready");
 
         let evs = vec![
             LoadProgress::message("llama-server spawned"),
@@ -180,6 +427,9 @@ impl Builder for LlamaCppBuilder {
 
     fn build(mut self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
         let child = self.child.take().ok_or(EngineError::NotLoaded)?;
+        // Detach the stderr drainer: it must keep draining until the child's
+        // stderr hits EOF (child exit), so Drop must not join it here.
+        let _ = self.stderr_drain.take();
         Ok(Box::new(LlamaCppEngine {
             base: format!("http://127.0.0.1:{}", self.port),
             child,
@@ -192,10 +442,7 @@ impl Builder for LlamaCppBuilder {
     }
 
     fn close(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
+        self.kill_child();
     }
 }
 
@@ -240,7 +487,7 @@ impl LlamaCppEngine {
         // llama-server renders the model's own (GGUF) chat template.
         // Prompt-only tasks (the legacy /v1/completions path) keep the
         // completions endpoint with the pre-rendered prompt.
-        let (endpoint, body) = if task.messages.is_empty() {
+        let (endpoint, mut body) = if task.messages.is_empty() {
             let body = serde_json::json!({
                 "prompt": task.prompt,
                 "n_predict": task.max_tokens,
@@ -266,6 +513,7 @@ impl LlamaCppEngine {
             });
             ("/v1/chat/completions", body)
         };
+        apply_sampling(&mut body, &task.sampling);
         let body = body.to_string();
         let mut s = match TcpStream::connect(("127.0.0.1", port)) {
             Ok(s) => s,
@@ -274,7 +522,7 @@ impl LlamaCppEngine {
                 return;
             }
         };
-        let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
+        let _ = s.set_read_timeout(Some(Duration::from_secs(300)));
         self.socket = s.try_clone().ok();
 
         std::thread::spawn(move || {
@@ -364,6 +612,35 @@ impl LlamaCppEngine {
     }
 }
 
+/// Forward the non-default sampling knobs into a request body. Omitted
+/// fields let llama-server apply its own defaults (identical for these
+/// keys, but keeps the wire clean for fields the child may treat
+/// differently when present).
+fn apply_sampling(body: &mut serde_json::Value, sp: &SamplingParams) {
+    let d = SamplingParams::default();
+    let Some(o) = body.as_object_mut() else {
+        return;
+    };
+    if sp.top_p != d.top_p {
+        o.insert("top_p".into(), sp.top_p.into());
+    }
+    if sp.top_k != d.top_k {
+        o.insert("top_k".into(), sp.top_k.into());
+    }
+    if sp.frequency_penalty != d.frequency_penalty {
+        o.insert("frequency_penalty".into(), sp.frequency_penalty.into());
+    }
+    if sp.presence_penalty != d.presence_penalty {
+        o.insert("presence_penalty".into(), sp.presence_penalty.into());
+    }
+    if let Some(seed) = sp.seed {
+        o.insert("seed".into(), seed.into());
+    }
+    if !sp.stop.is_empty() {
+        o.insert("stop".into(), sp.stop.clone().into());
+    }
+}
+
 /// Parse one SSE `data: ...` line into a Chunk; returns false when the
 /// stream is terminal (`[DONE]` or a stop chunk was emitted).
 fn handle_sse_line(
@@ -385,7 +662,10 @@ fn handle_sse_line(
     let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
         return true;
     };
-    let text = v["choices"][0]["delta"]["content"].as_str().or(v["choices"][0]["text"].as_str()).unwrap_or("");
+    let text = v["choices"][0]["delta"]["content"]
+        .as_str()
+        .or(v["choices"][0]["text"].as_str())
+        .unwrap_or("");
     let stop_str = v["choices"][0]["finish_reason"].as_str();
     let stop = stop_str.is_some();
     // Let stop-only chunks through even if empty
@@ -396,10 +676,10 @@ fn handle_sse_line(
     *token_id += 1;
     if stop {
         c.is_final = true;
-        c.finish_reason = match stop_str {
-            Some("length") => Some(cascadia_types::FinishReason::Length),
-            Some("stop") | _ => Some(cascadia_types::FinishReason::Stop),
-        };
+        c.finish_reason = Some(match stop_str {
+            Some("length") => FinishReason::Length,
+            _ => FinishReason::Stop,
+        });
     }
     send(Ok((tid.clone(), c)));
     !stop
@@ -435,14 +715,21 @@ impl Engine for LlamaCppEngine {
         if let Some(rx) = &self.rx {
             match rx.recv_timeout(Duration::from_secs(300)) {
                 Ok(item) => {
-                    let (tid, chunk) = item?;
+                    // A reader-thread failure becomes a final error chunk on
+                    // the active task (the API maps it to a 5xx) rather than
+                    // an orphaned step() error.
+                    let err_chunk = |e: EngineError, active: &Option<TaskId>| {
+                        let tid = active.clone().unwrap_or_default();
+                        (tid.clone(), Chunk::error(tid, e.to_string()))
+                    };
+                    let (tid, chunk) = item.unwrap_or_else(|e| err_chunk(e, &self.active));
                     if chunk.is_final {
                         done = true;
                     }
                     out.push((tid.clone(), chunk));
                     // drain anything else already buffered for this task
                     while let Ok(item) = rx.try_recv() {
-                        let (tid, chunk) = item?;
+                        let (tid, chunk) = item.unwrap_or_else(|e| err_chunk(e, &self.active));
                         if chunk.is_final {
                             done = true;
                         }
@@ -510,5 +797,441 @@ impl Engine for LlamaCppEngine {
 impl Drop for LlamaCppEngine {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn collect(
+        line: &str,
+        tid: &TaskId,
+        token_id: &mut i64,
+    ) -> (bool, Vec<EngineResult<(TaskId, Chunk)>>) {
+        let out = std::cell::RefCell::new(Vec::new());
+        let send = |r: EngineResult<(TaskId, Chunk)>| out.borrow_mut().push(r);
+        let go = handle_sse_line(line, tid, token_id, &send);
+        (go, out.into_inner())
+    }
+
+    #[test]
+    fn sse_chat_delta_emits_token() {
+        let (go, out) = collect(
+            r#"data: {"choices":[{"delta":{"content":"Hello"}}]}"#,
+            &"t1".to_string(),
+            &mut 0,
+        );
+        assert!(go);
+        let c = out[0].as_ref().unwrap().1.clone();
+        assert_eq!(c.text, "Hello");
+        assert!(!c.is_final);
+    }
+
+    #[test]
+    fn sse_completion_text_emits_token() {
+        let (go, out) = collect(
+            r#"data: {"choices":[{"text":" world"}]}"#,
+            &"t1".to_string(),
+            &mut 0,
+        );
+        assert!(go);
+        assert_eq!(out[0].as_ref().unwrap().1.text, " world");
+    }
+
+    #[test]
+    fn sse_done_is_final_and_terminal() {
+        let (go, out) = collect("data: [DONE]", &"t1".to_string(), &mut 3);
+        assert!(!go);
+        let c = out[0].as_ref().unwrap().1.clone();
+        assert!(c.is_final);
+        assert_eq!(c.token_id, 3);
+    }
+
+    #[test]
+    fn sse_finish_reason_maps_length_vs_stop() {
+        let (go, out) = collect(
+            r#"data: {"choices":[{"delta":{"content":"x"},"finish_reason":"length"}]}"#,
+            &"t1".to_string(),
+            &mut 0,
+        );
+        assert!(!go);
+        assert_eq!(
+            out[0].as_ref().unwrap().1.finish_reason,
+            Some(FinishReason::Length)
+        );
+        let (go, out) = collect(
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            &"t1".to_string(),
+            &mut 0,
+        );
+        assert!(!go);
+        let c = out[0].as_ref().unwrap().1.clone();
+        assert!(c.is_final);
+        assert_eq!(c.finish_reason, Some(FinishReason::Stop));
+    }
+
+    #[test]
+    fn sse_non_data_and_malformed_lines_are_skipped() {
+        assert!(handle_sse_line(
+            ": comment",
+            &"t".into(),
+            &mut 0,
+            &|_| panic!()
+        ));
+        assert!(handle_sse_line("", &"t".into(), &mut 0, &|_| panic!()));
+        assert!(handle_sse_line(
+            "data: {not json",
+            &"t".into(),
+            &mut 0,
+            &|_| panic!()
+        ));
+        // an event line is not data either
+        assert!(handle_sse_line(
+            "event: x",
+            &"t".into(),
+            &mut 0,
+            &|_| panic!()
+        ));
+    }
+
+    #[test]
+    fn apply_sampling_omits_defaults_and_sends_non_defaults() {
+        let mut body = serde_json::json!({"prompt": "p"});
+        apply_sampling(&mut body, &SamplingParams::default());
+        assert_eq!(body, serde_json::json!({"prompt": "p"}));
+
+        let sp = SamplingParams {
+            top_p: 0.9,
+            top_k: 40,
+            seed: Some(7),
+            frequency_penalty: 0.5,
+            presence_penalty: -0.5,
+            stop: vec!["###".into()],
+        };
+        apply_sampling(&mut body, &sp);
+        assert_eq!(body["top_p"].as_f64().unwrap(), 0.9f32 as f64);
+        assert_eq!(body["top_k"], 40);
+        assert_eq!(body["seed"], 7);
+        assert_eq!(body["frequency_penalty"].as_f64().unwrap(), 0.5f32 as f64);
+        assert_eq!(body["presence_penalty"].as_f64().unwrap(), -0.5f32 as f64);
+        assert_eq!(body["stop"], serde_json::json!(["###"]));
+    }
+
+    #[test]
+    fn resolve_llama_bin_prefers_flag_then_env_then_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let flag_bin = dir.path().join("flag-bin");
+        let env_bin = dir.path().join("env-bin");
+        let path_bin = dir.path().join("llama-server");
+        for p in [&flag_bin, &env_bin, &path_bin] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        let env = Some(OsString::from(&env_bin));
+        let path = Some(std::env::join_paths([dir.path()]).unwrap());
+        // flag wins over env and PATH
+        assert_eq!(
+            resolve_llama_bin(Some(flag_bin.to_str().unwrap()), env.clone(), path.clone()).unwrap(),
+            flag_bin
+        );
+        // env wins over PATH
+        assert_eq!(
+            resolve_llama_bin(None, env.clone(), path.clone()).unwrap(),
+            env_bin
+        );
+        // PATH lookup
+        assert_eq!(resolve_llama_bin(None, None, path).unwrap(), path_bin);
+        // nothing anywhere -> error naming all three sources
+        let err = resolve_llama_bin(None, None, Some(OsString::from("/nonexistent"))).unwrap_err();
+        assert!(
+            err.contains("--llama-bin") && err.contains("CASCADIA_LLAMA_BIN"),
+            "{err}"
+        );
+        assert!(err.contains("build-llama-stream.sh"), "{err}");
+        // an explicit path that does not exist errors instead of falling through
+        assert!(resolve_llama_bin(Some("/nonexistent/bin"), env, None)
+            .is_err_and(|e| e.contains("--llama-bin")));
+    }
+
+    #[test]
+    fn llama_device_args_maps_cascadia_devices() {
+        let (a, ngl) = llama_device_args("GPU", 99);
+        assert_eq!(a, ["--device", "SYCL0"]);
+        assert_eq!(ngl, 99);
+        let (a, ngl) = llama_device_args("GPU.1", 99);
+        assert_eq!(a, ["--device", "SYCL1"]);
+        assert_eq!(ngl, 99);
+        for cpu in ["CPU", "cpu", "Cpu"] {
+            let (a, ngl) = llama_device_args(cpu, 99);
+            assert_eq!(a, ["--device", "none"], "{cpu}");
+            assert_eq!(ngl, 0, "{cpu}");
+        }
+        for verbatim in ["SYCL1", "Vulkan0", "SYCL0,SYCL1", "GPU.x"] {
+            let (a, ngl) = llama_device_args(verbatim, 12);
+            assert_eq!(a, ["--device", verbatim], "{verbatim}");
+            assert_eq!(ngl, 12, "{verbatim}");
+        }
+    }
+
+    #[test]
+    fn probe_stream_weights_detects_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("llama-server");
+        // marker inside the binary itself
+        std::fs::write(&bin, b"bin GGML_STREAM_WEIGHTS").unwrap();
+        assert_eq!(
+            probe_stream_weights(&bin).unwrap(),
+            StreamWeightsSupport::Present
+        );
+
+        // marker only in libggml-base next to the binary
+        std::fs::write(&bin, b"bin").unwrap();
+        std::fs::write(
+            dir.path().join("libggml-base.so"),
+            b"lib GGML_STREAM_WEIGHTS",
+        )
+        .unwrap();
+        assert_eq!(
+            probe_stream_weights(&bin).unwrap(),
+            StreamWeightsSupport::Present
+        );
+
+        // libggml-base present, marker nowhere -> hard error
+        std::fs::write(dir.path().join("libggml-base.so"), b"lib").unwrap();
+        let err = probe_stream_weights(&bin).unwrap_err();
+        assert!(err.contains("no weight-streaming support"), "{err}");
+
+        // no libggml-base, no marker -> Unknown (warn and continue)
+        std::fs::remove_file(dir.path().join("libggml-base.so")).unwrap();
+        assert_eq!(
+            probe_stream_weights(&bin).unwrap(),
+            StreamWeightsSupport::Unknown
+        );
+    }
+
+    #[test]
+    fn auto_load_timeout_scales_with_model_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("m.gguf");
+        let f = std::fs::File::create(&model).unwrap();
+        f.set_len(2 << 30).unwrap(); // 2 GiB sparse
+        assert_eq!(auto_load_timeout(&model), Duration::from_secs(60 + 16));
+        // unreadable metadata -> fixed 300 s
+        assert_eq!(
+            auto_load_timeout(Path::new("/nonexistent/m.gguf")),
+            Duration::from_secs(300)
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+    use cascadia_types::ChatTurn;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// In-process mock of llama-server: accepts one connection, reads the
+    /// request, hands it to `respond`, which writes the reply to the socket.
+    fn mock_server(
+        respond: impl FnOnce(&[u8], &mut TcpStream) + Send + 'static,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let t = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
+            let mut reader = BufReader::new(s.try_clone().unwrap());
+            let mut req = Vec::new();
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+                req.extend_from_slice(line.as_bytes());
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            let _ = reader.read_exact(&mut body);
+            req.extend_from_slice(&body);
+            respond(&req, &mut s);
+        });
+        (port, t)
+    }
+
+    fn chunked(payload: &str) -> String {
+        format!("{:x}\r\n{}\r\n", payload.len(), payload)
+    }
+
+    fn test_engine(port: u16) -> LlamaCppEngine {
+        LlamaCppEngine {
+            base: format!("http://127.0.0.1:{port}"),
+            child: Command::new("sleep").arg("60").spawn().unwrap(),
+            pending: Vec::new(),
+            active: None,
+            rx: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            socket: None,
+        }
+    }
+
+    fn chat_task() -> GenerationTask {
+        let mut t = GenerationTask::new("task-1", "ignored");
+        t.messages = vec![ChatTurn {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        t
+    }
+
+    /// Run step() until a final chunk arrives; returns everything collected.
+    fn drain(engine: &mut LlamaCppEngine) -> Vec<(TaskId, Chunk)> {
+        let mut out = Vec::new();
+        for _ in 0..64 {
+            let batch = engine.step().unwrap();
+            let fin = batch.iter().any(|(_, c)| c.is_final);
+            out.extend(batch);
+            if fin {
+                return out;
+            }
+        }
+        panic!("no final chunk");
+    }
+
+    #[test]
+    fn engine_streams_chat_chunks_over_chunked_sse() {
+        let (port, server) = mock_server(|req, s| {
+            let req = String::from_utf8_lossy(req);
+            assert!(req.starts_with("POST /v1/chat/completions"), "{req}");
+            assert!(req.contains("\"role\":\"user\""), "{req}");
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            s.write_all(head.as_bytes()).unwrap();
+            for p in [
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+                "data: [DONE]\n",
+            ] {
+                s.write_all(chunked(p).as_bytes()).unwrap();
+            }
+            s.write_all(b"0\r\n\r\n").unwrap();
+        });
+        let mut engine = test_engine(port);
+        engine.submit(chat_task()).unwrap();
+        let chunks = drain(&mut engine);
+        let texts: Vec<&str> = chunks.iter().map(|(_, c)| c.text.as_str()).collect();
+        assert_eq!(texts, ["Hello", " world", ""]);
+        let last = &chunks.last().unwrap().1;
+        assert!(last.is_final);
+        assert_eq!(last.finish_reason, Some(FinishReason::Stop));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn engine_emits_error_chunk_on_server_500() {
+        let (port, server) = mock_server(|_, s| {
+            s.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\noops")
+                .unwrap();
+        });
+        let mut engine = test_engine(port);
+        engine.submit(chat_task()).unwrap();
+        let chunks = drain(&mut engine);
+        let last = &chunks.last().unwrap().1;
+        assert!(last.is_final);
+        assert!(
+            last.error.as_deref().unwrap_or("").contains("500"),
+            "{last:?}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn engine_cancel_mid_stream() {
+        let (port, server) = mock_server(|_, s| {
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .unwrap();
+            s.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n")
+                .unwrap();
+            // hold the stream open; the cancelled read returns at EOF/shutdown
+            let mut buf = [0u8; 64];
+            let _ = s.read(&mut buf);
+        });
+        let mut engine = test_engine(port);
+        let task = chat_task();
+        let tid = task.task_id.clone();
+        engine.submit(task).unwrap();
+        let first = engine.step().unwrap();
+        assert_eq!(first[0].1.text, "Hello");
+        engine.cancel(&tid);
+        assert!(engine.step().unwrap().is_empty());
+        drop(engine);
+        server.join().unwrap();
+    }
+
+    fn dummy_shard() -> ShardSpec {
+        ShardSpec {
+            model_id: "m".into(),
+            layer_start: 0,
+            layer_end: 0,
+            total_layers: 0,
+            device: "GPU".into(),
+            is_first_stage: true,
+            is_last_stage: true,
+            tp_size: 1,
+            tp_rank: 0,
+        }
+    }
+
+    fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&p, perm).unwrap();
+        p
+    }
+
+    fn cfg_for(bin: PathBuf, retries: u32) -> LlamaCppConfig {
+        LlamaCppConfig {
+            llama_bin: bin,
+            model: PathBuf::from("/nonexistent.gguf"),
+            device: "GPU".into(),
+            ctx: 128,
+            ngl: 0,
+            elastic: false,
+            extra_args: vec![],
+            load_timeout: Some(Duration::from_secs(1)),
+            load_retries: retries,
+        }
+    }
+
+    #[tokio::test]
+    async fn load_retries_then_fails_with_child_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_script(
+            dir.path(),
+            "llama-server",
+            "#!/bin/sh\necho 'boom-marker-xyz' >&2\nexit 1\n",
+        );
+        let mut b = LlamaCppBuilder::new(cfg_for(bin, 1));
+        let err = b.load(dummy_shard()).await.err().unwrap().to_string();
+        assert!(err.contains("after 2 attempt(s)"), "{err}");
+        assert!(err.contains("boom-marker-xyz"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn load_health_timeout_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_script(dir.path(), "llama-server", "#!/bin/sh\nsleep 30\n");
+        let mut b = LlamaCppBuilder::new(cfg_for(bin, 0));
+        let t0 = Instant::now();
+        let err = b.load(dummy_shard()).await.err().unwrap().to_string();
+        assert!(t0.elapsed() < Duration::from_secs(20));
+        assert!(err.contains("health timeout"), "{err}");
     }
 }

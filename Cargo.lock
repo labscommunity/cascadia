@@ -394,6 +394,7 @@ dependencies = [
  "cascadia-types",
  "futures",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
