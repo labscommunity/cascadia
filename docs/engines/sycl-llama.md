@@ -128,9 +128,12 @@ Guidance:
   first-come-first-served: in a 3x 27B test the third instance found no
   room, went fully streamed, and the driver evicted ~11 GiB of the other
   instances' weights to host memory.
-- **MoE** → partial budgets help little today: every expert streams per
-  token, so decode stays at ~1 t/s until the model is fully resident
-  (router-aware streaming is future work).
+- **MoE** → router-aware expert streaming is on when `--elastic` is: only
+  the experts the router selects are read per token (detected
+  automatically, any MoE). Measured on Qwen3.6-35B-A3B: fully streamed
+  decode 0.25 -> 2.60 t/s at 1.89 GiB peak; a partial budget adds resident
+  layers on top. Set `CASCADIA_EXPERT_CACHE_MB=<MiB>` to pin a hot-expert
+  cache on the device (default 0 keeps the resident-layer budget exact).
 
 ## Limitations
 
@@ -140,7 +143,9 @@ Guidance:
   requirement of streaming).
 - KV cache is still reserved against the full `-c` context on device —
   streaming removes *weight* residency, not KV.
-- MoE models stream *all* experts per token (no router awareness).
+- MoE expert residency is opt-in (`CASCADIA_EXPERT_CACHE_MB`); by default
+  selected experts are re-read per token (correct, ~10x faster than
+  streaming every expert, still slower than resident).
 - Windows: supported. Weight slices are read with a positioned `ReadFile`
   on the file's OS handle (no POSIX `pread`). Verified on an Arc B390 iGPU
   (Core Ultra X7 358H, oneAPI 2026.0 + MSVC 19.44): build, streaming,
@@ -148,7 +153,9 @@ Guidance:
   `docs/perf/sycl-elastic/fig9_windows.png`. Pass `-c` explicitly when
   streaming: with streamed weights the default context auto-fit sees the
   freed memory as free and may pick the model's full train context (large
-  f32 KV). cascadia always passes `--llama-ctx`.
+  f32 KV). cascadia always passes `--llama-ctx`. The router-aware MoE path
+  uses the same positioned-read primitive and has not yet been exercised on
+  Windows.
 - Chat turns carry `role` + `content` only (no tool calls / multimodal
   parts); `prompt` remains the fallback for non-chat engines.
 

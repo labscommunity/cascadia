@@ -17,15 +17,28 @@ LLAMA_REPO="${LLAMA_REPO:-https://github.com/ggml-org/llama.cpp}"
 LLAMA_BASE="${LLAMA_BASE:-1692f9e50bb20fd96b963af38a282daf78feea64}"
 ONEAPI_ROOT="${ONEAPI_ROOT:-/opt/intel/oneapi}"
 JOBS="${JOBS:-$(nproc)}"
-PATCH="$REPO_ROOT/patches/llama.cpp/0001-sycl-stream-weights.patch"
+PATCHES=(
+    "$REPO_ROOT/patches/llama.cpp/0001-sycl-stream-weights.patch"
+    "$REPO_ROOT/patches/llama.cpp/0002-sycl-router-aware-moe.patch"
+)
 
 if [ ! -d "$DEST/.git" ]; then
     git clone "$LLAMA_REPO" "$DEST"
 fi
 cd "$DEST"
 git checkout "$LLAMA_BASE"
-git apply --check "$PATCH" 2>/dev/null && git apply "$PATCH" || \
-    echo "patch already applied or not applicable; continuing"
+# apply the chain in order; a patch that fails --check must already be
+# applied (idempotent reruns) - verify the marker instead of failing
+for PATCH in "${PATCHES[@]}"; do
+    if git apply --check "$PATCH" 2>/dev/null; then
+        git apply "$PATCH"
+    elif grep -q GGML_STREAM_WEIGHTS "$DEST/ggml/src/ggml-backend.cpp" 2>/dev/null; then
+        echo "patch $(basename "$PATCH") already applied or not applicable; continuing"
+    else
+        echo "ERROR: $(basename "$PATCH") does not apply to $LLAMA_BASE" >&2
+        exit 1
+    fi
+done
 
 # icx/icpx + SYCL headers come from the oneAPI environment. setvars.sh is
 # not nounset-clean, so relax -u while sourcing it.

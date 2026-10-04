@@ -17,7 +17,9 @@
 use std::process::{Command, Stdio};
 
 use anyhow::Result;
-use cascadia_engine_llamacpp::{probe_stream_weights, resolve_llama_bin, StreamWeightsSupport};
+use cascadia_engine_llamacpp::{
+    probe_expert_streaming, probe_stream_weights, resolve_llama_bin, StreamWeightsSupport,
+};
 use clap::Parser;
 
 /// Run environment + hardware checks and print a readable report.
@@ -158,6 +160,19 @@ fn check_sycl_llama(r: &mut Report) {
             "could not verify (no libggml-base next to the binary)",
         ),
         Err(e) => r.line(Level::Warn, "weight streaming", &e),
+    }
+    if probe_expert_streaming(&bin) {
+        r.line(
+            Level::Ok,
+            "MoE expert streaming",
+            "router-aware (--elastic streams selected experts only)",
+        );
+    } else {
+        r.line(
+            Level::Info,
+            "MoE expert streaming",
+            "not present: MoE models stream every expert per token",
+        );
     }
 
     match run_capturing(&bin, "--list-devices", 10) {

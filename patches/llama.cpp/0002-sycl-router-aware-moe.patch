@@ -1,0 +1,476 @@
+From: SergiioB <sergiobarrientose@outlook.com>
+Subject: [PATCH 2/2] sycl: router-aware MoE expert streaming (automatic)
+
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -30,10 +30,12 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <regex>
+ #include <unordered_map>
++#include <mutex>
++#include <unordered_set>
+ #ifdef _WIN32
+ #include <io.h>
+ #else
+ #include <unistd.h>
+ #endif
+ 
+@@ -4408,7 +4407,26 @@
+     }
+ }
+ 
++// ---- router-aware MoE expert streaming (automatic detection) ----
++// A "routed expert tensor" is any streamed weight consumed by
++// GGML_OP_MUL_MAT_ID with an expert-stack axis (ne[2] > 1). Detection is
++// purely structural (executed graph + tensor shape), so every MoE the
++// runtime can run is covered with no model/architecture list. The set is
++// populated by the pre-scan in ggml_backend_sycl_graph_compute_impl()
++// before any stream slot pool is built. The arenas and counters live with
++// the stream pool below; these early declarations are shared with
++// should_reorder_tensor() and ggml_sycl_mul_mat_id().
++static std::unordered_set<const ggml_tensor *> g_expert_tensors;
++static std::mutex                         g_expert_mu;
++// while set, suppress the in-place weight reorder optimization: expert
++// slices live in shared slot arenas whose raw file layout must be preserved
++static bool                               g_expert_slice_guard = false;
++
++
+ static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_tensor * dst) {
++    if (g_expert_slice_guard) {
++        return false;
++    }
+     return g_ggml_sycl_enable_optimize && //allow optimize, controlled by $GGML_SYCL_ENABLE_OPT
+            ctx.opt_feature.reorder &&      //allow this device due to good perf, skip the devices with bad perf.
+            dst->op == GGML_OP_MUL_MAT &&   //limit to some supported cases of Q4_0, to do for more cases.
+@@ -4780,6 +4798,266 @@
+     }
+ }
+ 
++// ---- router-aware MoE expert streaming: selective per-expert uploads ----
++// Automatically detected routed weights (g_expert_tensors) never upload their
++// full expert stack. Every MUL_MAT_ID reads only the experts the router
++// selected for the current tokens, from a per-tensor slot arena:
++//   [ n_cache LRU slots | n_scratch round-robin slots ]
++// each slot holding exactly one expert slice at the tensor's own nb[2]
++// stride, so the existing per-slice matmul and fused MoE GEMV kernels
++// address them unchanged. The fused path feeds the kernel a private
++// slot-id table; the sequential paths resolve a live slice pointer. The
++// graph's router-id tensor and all other id consumers are untouched.
++
++struct sycl_expert_arena {
++    bool                 built    = false;
++    char *               base     = nullptr;
++    int                  n_cache  = 0;    // LRU-resident expert slices
++    int                  n_scratch = 0;   // window >= router top-k (distinct ids per call)
++    int                  scr_cur  = 0;
++    size_t               stride   = 0;    // == tensor nb[2], one expert slice
++    std::vector<int32_t> slot_id;         // expert id per cache slot, -1 = free
++    std::vector<uint64_t> slot_lru;
++    uint64_t             epoch    = 0;
++};
++
++static std::unordered_map<const ggml_tensor *, sycl_expert_arena> g_earenas;
++static std::vector<char> g_expert_staging;
++static size_t g_expert_bytes_up = 0;
++static size_t g_expert_uploads  = 0;
++static size_t g_expert_hits     = 0;
++static size_t g_expert_ops      = 0;
++static bool   g_expert_cfg_reported = false;
++
++// persistent expert residency budget. Default 0 keeps the --elastic-vram
++// resident-layer semantics exact (selective loading only, no extra pinned
++// VRAM); GGML_STREAM_EXPERT_CACHE_MB=<MiB> opts into a hot-expert cache.
++static size_t sycl_expert_cache_bytes(void) {
++    static size_t v = SIZE_MAX;
++    if (v == SIZE_MAX) {
++        const char * e = getenv("GGML_STREAM_EXPERT_CACHE_MB");
++        long long mb = e ? atoll(e) : 0;
++        v = mb > 0 ? (size_t) mb * 1024 * 1024 : 0;
++    }
++    return v;
++}
++
++// positioned read of one expert slice into host staging (pread / ReadFile)
++static bool sycl_expert_read_slice(int fd, size_t off, size_t n, char * dst) {
++    size_t got = 0;
++    while (got < n) {
++#ifdef _WIN32
++        HANDLE h = (HANDLE) _get_osfhandle(fd);
++        if (h == INVALID_HANDLE_VALUE) {
++            return false;
++        }
++        size_t chunk = n - got;
++        if (chunk > (size_t) 0x7FFFFFFF) {
++            chunk = (size_t) 0x7FFFFFFF;
++        }
++        OVERLAPPED ov;
++        memset(&ov, 0, sizeof(ov));
++        const uint64_t o = off + got;
++        ov.Offset     = (DWORD) (o & 0xFFFFFFFFu);
++        ov.OffsetHigh = (DWORD) (o >> 32);
++        DWORD rd = 0;
++        if (!ReadFile(h, dst + got, (DWORD) chunk, &rd, &ov) || rd == 0) {
++            return false;
++        }
++        got += (size_t) rd;
++#else
++        const ssize_t r = pread(fd, dst + got, n - got, (off_t) (off + got));
++        if (r <= 0) {
++            return false;
++        }
++        got += (size_t) r;
++#endif
++    }
++    return true;
++}
++
++static sycl_expert_arena * sycl_expert_arena_build(const ggml_tensor * t, queue_ptr q, int n_ids) {
++    sycl_expert_arena & a = g_earenas[t];
++    if (a.built) {
++        return &a;
++    }
++    const ggml_stream_src * rec = ggml_stream_find(t);
++    GGML_ASSERT(rec != nullptr && "expert tensor without a registered stream source");
++
++    a.stride    = t->nb[2];
++    a.n_scratch = n_ids > 1 ? n_ids : 1;
++    const size_t budget = sycl_expert_cache_bytes();
++    if (budget > 0 && !g_expert_tensors.empty()) {
++        a.n_cache = (int) (budget / g_expert_tensors.size() / a.stride);
++    }
++
++    char * base = (char *) ggml_sycl_malloc_device((size_t) (a.n_cache + a.n_scratch) * a.stride, *q);
++    if (base == nullptr && a.n_cache > 0) {
++        GGML_LOG_ERROR("%s: expert arena alloc failed (%d+%d slots x %.2f MiB), retrying scratch-only\n",
++                       __func__, a.n_cache, a.n_scratch, a.stride / 1048576.0);
++        a.n_cache = 0;
++        base = (char *) ggml_sycl_malloc_device((size_t) a.n_scratch * a.stride, *q);
++    }
++    if (base == nullptr) {
++        GGML_LOG_ERROR("%s: expert scratch arena alloc failed (%d x %.2f MiB)\n",
++                       __func__, a.n_scratch, a.stride / 1048576.0);
++        std::exit(1);
++    }
++    a.base     = base;
++    a.slot_id.assign(a.n_cache, -1);
++    a.slot_lru.assign(a.n_cache, 0);
++    a.built    = true;
++
++    if (!g_expert_cfg_reported) {
++        g_expert_cfg_reported = true;
++        fprintf(stderr, "stream-weights: moe experts: %zu routed tensors auto-detected, "
++                "stride %.2f MiB, cache %lld MiB (%d slots avg), scratch %d\n",
++                g_expert_tensors.size(), a.stride / 1048576.0,
++                (long long) (sycl_expert_cache_bytes() / 1048576), a.n_cache, a.n_scratch);
++    }
++    return &a;
++}
++
++// resolve expert `id` to an arena slot, uploading the slice on a miss.
++// `pinned` (optional) protects slots already placed for the current fused
++// call from LRU eviction; scratch slots are assigned round-robin and are
++// never reused within one call (n_scratch >= distinct ids per call).
++static int sycl_expert_ensure_slot(sycl_expert_arena & a, const ggml_stream_src * rec,
++                                   const ggml_tensor * t, int32_t id, queue_ptr q,
++                                   std::vector<uint8_t> * pinned) {
++    for (int s = 0; s < a.n_cache; s++) {
++        if (a.slot_id[s] == id) {
++            a.slot_lru[s] = ++a.epoch;
++            g_expert_hits++;
++            return s;
++        }
++    }
++    g_expert_uploads++;
++
++    int victim = -1;
++    for (int s = 0; s < a.n_cache; s++) {
++        if (a.slot_id[s] < 0) { victim = s; break; }
++    }
++    if (victim < 0) {
++        uint64_t best = UINT64_MAX;
++        for (int s = 0; s < a.n_cache; s++) {
++            if (pinned && (*pinned)[s]) { continue; }
++            if (a.slot_lru[s] < best) { best = a.slot_lru[s]; victim = s; }
++        }
++    }
++    if (victim >= 0) {
++        a.slot_id[victim]  = id;
++        a.slot_lru[victim] = ++a.epoch;
++        // pin the freshly placed slice: with n_cache < n_ids a later miss in
++        // the same call must not evict it while the slot-id table points to it
++        if (pinned) {
++            (*pinned)[victim] = 1;
++        }
++    } else {
++        victim = a.n_cache + (a.scr_cur++ % a.n_scratch);
++    }
++
++    char * dstp = a.base + (size_t) victim * a.stride;
++    if (g_expert_staging.size() < a.stride) {
++        g_expert_staging.resize(a.stride);
++    }
++    if (!sycl_expert_read_slice(rec->fd, rec->file_off + (size_t) id * a.stride, a.stride, g_expert_staging.data())) {
++        GGML_LOG_ERROR("%s: expert slice read failed (tensor %s, id %d)\n", __func__, t->name, id);
++        std::exit(1);
++    }
++    SYCL_CHECK(CHECK_TRY_ERROR(q->memcpy(dstp, g_expert_staging.data(), a.stride).wait()));
++    g_expert_bytes_up += a.stride;
++    return victim;
++}
++
++static bool sycl_mm_id_is_expert(const ggml_tensor * src0) {
++    const ggml_tensor * root = src0;
++    while (root->view_src != nullptr) {
++        root = root->view_src;
++    }
++    return g_expert_tensors.find(root) != g_expert_tensors.end();
++}
++
++// single-token fused MoE GEMV over the arena: raw file layout (no reorder),
++// private slot-id table, tensor's own expert stride. Returns false when the
++// shape/type is not GEMV-eligible so the generic sequential paths run.
++static bool ggml_sycl_mul_mat_id_expert_fused(ggml_backend_sycl_context & ctx, ggml_tensor * dst, int64_t n_ids) {
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++    const ggml_tensor * ids  = dst->src[2];
++    GGML_TENSOR_BINARY_OP_LOCALS
++
++    if (ne12 != 1 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
++        ne10 != ne00 || ne10 % QK8_1 != 0 || !ggml_is_contiguous(src1) ||
++        ids->ne[1] != 1 || (ne11 != 1 && ne11 != n_ids)) {
++        return false;
++    }
++
++    const queue_ptr stream = ctx.stream();
++    const ggml_stream_src * rec = ggml_stream_find(src0);
++
++    // current router selection
++    std::vector<char> ids_host(ggml_nbytes(ids));
++    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(ids_host.data(), (const char *) ids->data, ggml_nbytes(ids))));
++    SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
++
++    sycl_expert_arena & a = *sycl_expert_arena_build(src0, stream, (int) n_ids);
++
++    // place every selected expert exactly once; pin cache hits against LRU
++    std::vector<uint8_t> pinned(a.n_cache, 0);
++    for (int64_t id = 0; id < n_ids; id++) {
++        const int32_t eid = *(const int32_t *) (ids_host.data() + id * ids->nb[0]);
++        for (int s = 0; s < a.n_cache; s++) {
++            if (a.slot_id[s] == eid) { pinned[s] = 1; break; }
++        }
++    }
++    std::vector<int32_t> slot_of(n_ids, 0);
++    for (int64_t id = 0; id < n_ids; id++) {
++        const int32_t eid = *(const int32_t *) (ids_host.data() + id * ids->nb[0]);
++        slot_of[id] = sycl_expert_ensure_slot(a, rec, src0, eid, stream, &pinned);
++    }
++
++    ggml_sycl_pool_alloc<char> ids_slot_alloc(ctx.pool(), (size_t) n_ids * sizeof(int32_t));
++    SYCL_CHECK(CHECK_TRY_ERROR(
++        stream->memcpy(ids_slot_alloc.get(), slot_of.data(), (size_t) n_ids * sizeof(int32_t)).wait()));
++
++    const int src1_padded_cols = GGML_PAD((int) ne10, MATRIX_ROW_PADDING);
++    const int nrows            = (int) src0->ne[1];
++    ggml_sycl_pool_alloc<char> src1_q8_alloc(ctx.pool(),
++        (size_t) ne11 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
++    char * src1_ddq = src1_q8_alloc.get();
++    // raw layout: no opt_for_reorder_id on arena slices
++    quantize_row_q8_1_sycl<quantize_q8_1>(
++        (const float *) src1->data, src1_ddq, (int) ne10, (int) ne11, src1_padded_cols, stream);
++    const size_t bytes_per_qrow  = (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
++    const size_t src1_row_stride = (ne11 == 1) ? 0 : bytes_per_qrow;
++
++    return ggml_sycl_mul_mat_vec_q_id(src0->type, a.base, src1_ddq,
++            (const int32_t *) ids_slot_alloc.get(), (float *) dst->data,
++            (int) ne10, nrows, (int) n_ids,
++            /*expert_weight_stride=*/ a.stride,
++            /*dst_row_stride=*/ dst->nb[1], src1_row_stride, stream);
++}
++
++// live slice pointer for the sequential expert loops: arena slot for routed
++// streamed tensors (upload on miss), stock addressing otherwise. n_ids is the
++// router top-k of the current op (sizes the scratch window on first build).
++static char * sycl_mm_id_slice(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, int64_t i02, int64_t n_ids) {
++    char * plain = (char *) src0->data + (size_t) i02 * src0->nb[2];
++    const ggml_tensor * root = src0;
++    while (root->view_src != nullptr) {
++        root = root->view_src;
++    }
++    if (g_expert_tensors.find(root) == g_expert_tensors.end()) {
++        return plain;
++    }
++    const ggml_stream_src * rec = ggml_stream_find(root);
++    GGML_ASSERT(rec != nullptr && "expert tensor without a registered stream source");
++    sycl_expert_arena & a = *sycl_expert_arena_build(root, ctx.stream(), (int) n_ids);
++    const int slot = sycl_expert_ensure_slot(a, rec, root, (int32_t) i02, ctx.stream(), nullptr);
++    return a.base + (size_t) slot * a.stride;
++}
++
+ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+                                  ggml_tensor *dst) try {
+     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
+@@ -4795,11 +5073,28 @@
+     const int64_t n_as = ne02;
+     const int64_t n_ids = ids->ne[0];
+ 
+-    if (ne12 == 1) {
++    const bool mm_expert = sycl_mm_id_is_expert(src0);
++    if (mm_expert) {
++        g_expert_ops++;
++        if ((g_expert_ops % 256) == 0) {
++            const size_t lookups = g_expert_hits + g_expert_uploads;
++            fprintf(stderr, "stream-weights: moe experts: ops %zu, hits %zu, misses %zu "
++                    "(hit %.1f%%), uploaded %.1f MiB\n",
++                    g_expert_ops, g_expert_hits, g_expert_uploads,
++                    lookups ? 100.0 * (double) g_expert_hits / (double) lookups : 0.0,
++                    g_expert_bytes_up / 1048576.0);
++        }
++        if (ggml_sycl_mul_mat_id_expert_fused(ctx, dst, n_ids)) {
++            return;
++        }
++        // GEMV-ineligible shape: the sequential loops below resolve arena
++        // slices through sycl_mm_id_slice()
++    } else if (ne12 == 1) {
+         if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
+             return;
+         }
+     }
++    g_expert_slice_guard = mm_expert;
+ 
+     std::vector<char> ids_host(ggml_nbytes(ids));
+     const char * ids_dev = (const char *) ids->data;
+@@ -4845,7 +5140,7 @@
+                 const int64_t i1 = id;
+                 const int64_t i2 = i12;
+ 
+-            src0_row.data = src0_original + i02*nb02;
++            src0_row.data = sycl_mm_id_slice(ctx, src0, i02, n_ids);
+             src1_row.data = src1_original + i11*nb11 + i12*nb12;
+             dst_row.data = dst_original + i1*nb1 + i2*nb2;
+ 
+@@ -4907,7 +5202,7 @@
+ 
+             const int64_t expert_row_offset = expert_row_offsets[i02];
+ 
+-            src0_row.data = src0_original + i02*nb02;
++            src0_row.data = sycl_mm_id_slice(ctx, src0, i02, n_ids);
+ 
+             GGML_ASSERT(nb11 == sizeof(float)*ne10);
+             GGML_ASSERT(nb1 == sizeof(float)*ne0);
+@@ -4947,6 +5242,7 @@
+             });
+         }
+     }
++    g_expert_slice_guard = false;
+ }
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+@@ -5673,7 +5969,10 @@
+     std::vector<const ggml_tensor *> ts;
+     std::vector<ggml_stream_src>     recs;
+     for (int i = 0; i < n0; i++) {
+-        if (ts0[i]->buffer == buf) {
++        if (ts0[i]->buffer == buf && g_expert_tensors.find(ts0[i]) == g_expert_tensors.end()) {
++            // routed expert tensors are excluded: they stream selectively
++            // through their per-tensor slot arenas (see mul_mat_id), not the
++            // whole-tensor slot pool
+             ts.push_back(ts0[i]);
+             recs.push_back(recs0[i]);
+         }
+@@ -5751,35 +6050,11 @@
+     if (e.src.host_ptr != nullptr) {
+         memcpy(sw.staging.data(), e.src.host_ptr, e.nbytes);
+     } else {
++#ifndef _WIN32
+         size_t got = 0;
+         while (got < e.nbytes) {
+-#ifdef _WIN32
+-            // UCRT has no pread; do a positioned ReadFile on the fd's OS
+-            // handle (does not disturb the CRT file position)
+-            HANDLE h = (HANDLE) _get_osfhandle(e.src.fd);
+-            if (h == INVALID_HANDLE_VALUE) {
+-                GGML_LOG_ERROR("%s: invalid handle for streamed tensor\n", __func__);
+-                std::exit(1);
+-            }
+-            size_t chunk = e.nbytes - got;
+-            if (chunk > (size_t) 0x7FFFFFFF) {
+-                chunk = (size_t) 0x7FFFFFFF;
+-            }
+-            OVERLAPPED ov;
+-            memset(&ov, 0, sizeof(ov));
+-            const uint64_t off = e.src.file_off + got;
+-            ov.Offset     = (DWORD) (off & 0xFFFFFFFFu);
+-            ov.OffsetHigh = (DWORD) (off >> 32);
+-            DWORD rd = 0;
+-            if (!ReadFile(h, (char *) sw.staging.data() + got, (DWORD) chunk, &rd, &ov)) {
+-                GGML_LOG_ERROR("%s: ReadFile failed for streamed tensor\n", __func__);
+-                std::exit(1);
+-            }
+-            const int r = (int) rd;
+-#else
+-            const ssize_t r = pread(e.src.fd, sw.staging.data() + got, e.nbytes - got,
+-                                    (off_t) (e.src.file_off + got));
+-#endif
++            ssize_t r = pread(e.src.fd, sw.staging.data() + got, e.nbytes - got,
++                              (off_t) (e.src.file_off + got));
+             if (r <= 0) {
+                 GGML_LOG_ERROR("%s: pread failed for streamed tensor\n", __func__);
+                 std::exit(1);
+@@ -5792,6 +6067,10 @@
+             fprintf(stderr, "[sw] %s off=%zu n=%zu fnv=%llx\n", t->name, e.src.file_off, e.nbytes,
+                     (unsigned long long) h);
+         }
++#else
++        GGML_LOG_ERROR("%s: fd-based streaming not supported on Windows\n", __func__);
++        std::exit(1);
++#endif
+     }
+     SYCL_CHECK(CHECK_TRY_ERROR(sw.q->memcpy(dst, sw.staging.data(), e.nbytes).wait()));
+     if (e.padded > e.nbytes) {
+@@ -5811,6 +6090,9 @@
+         while (s->view_src != nullptr) {
+             s = s->view_src;
+         }
++        if (g_expert_tensors.find(s) != g_expert_tensors.end()) {
++            continue; // routed expert weight: selective upload in mul_mat_id
++        }
+         const ggml_stream_src * rec = ggml_stream_find(s);
+         if (rec == nullptr || s->buffer == nullptr || !ggml_backend_buffer_is_sycl(s->buffer)) {
+             continue;
+@@ -5839,6 +6121,35 @@
+     ggml_sycl_set_main_device(sycl_ctx->device);
+     const bool stream_weights = ggml_stream_weights_enabled();
+ 
++    if (stream_weights) {
++        // automatic routed-expert detection: mark streamed weights consumed
++        // by GGML_OP_MUL_MAT_ID with an expert-stack axis (ne[2] > 1) before
++        // any slot pool is built, so they stream selectively instead of
++        // whole-tensor. Structural only - works for any MoE the runtime runs.
++        bool added = false;
++        {
++            std::lock_guard<std::mutex> lock(g_expert_mu);
++            for (int i = 0; i < cgraph->n_nodes; i++) {
++                const ggml_tensor * node = cgraph->nodes[i];
++                if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] == nullptr) {
++                    continue;
++                }
++                const ggml_tensor * s = node->src[0];
++                while (s->view_src != nullptr) {
++                    s = s->view_src;
++                }
++                if (s->ne[2] > 1 && s->ne[3] == 1 && ggml_stream_find(s) != nullptr) {
++                    added = g_expert_tensors.insert(s).second || added;
++                }
++            }
++        }
++        if (added && !g_expert_cfg_reported) {
++            // detection line; the full config line prints at first arena build
++            fprintf(stderr, "stream-weights: moe experts: router-aware expert streaming active (%zu routed tensors)\n",
++                    g_expert_tensors.size());
++        }
++    }
++
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_tensor * node = cgraph->nodes[i];
+         if (ggml_sycl_is_view_or_noop(node)) {

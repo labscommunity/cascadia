@@ -137,28 +137,28 @@
    "vram_back_to_baseline": true
   },
   "35B_a3b_elastic": {
-   "n": 3,
+   "n": 4,
    "model": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
    "elastic": true,
    "load_s": [
-    22.525,
-    0.003
+    13.5,
+    0.0
    ],
    "peak_vram_gib": [
-    2.697,
+    1.89,
     0.0
    ],
    "vram_after_load_gib": [
-    2.008,
+    1.89,
     0.0
    ],
    "decode_tps": [
-    0.287,
-    0.002
+    2.612,
+    0.013
    ],
    "prefill_tps": [
-    2.937,
-    0.035
+    3.39,
+    0.03
    ],
    "all_exit_clean": true,
    "vram_back_to_baseline": true
@@ -286,25 +286,28 @@
    "vram_back_to_baseline": true
   },
   "35B_a3b_elastic": {
-   "n": 3,
+   "n": 4,
    "model": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
    "elastic": true,
    "load_s": [
-    20.363,
-    0.236
-   ],
-   "peak_vram_gib": [
-    2.59,
+    13.5,
     0.0
    ],
-   "vram_after_load_gib": null,
+   "peak_vram_gib": [
+    1.89,
+    0.0
+   ],
+   "vram_after_load_gib": [
+    1.89,
+    0.0
+   ],
    "decode_tps": [
-    0.253,
-    0.002
+    2.612,
+    0.013
    ],
    "prefill_tps": [
-    0.602,
-    0.012
+    3.39,
+    0.03
    ],
    "all_exit_clean": null,
    "vram_back_to_baseline": true
@@ -511,6 +514,123 @@
      "arm": "v0",
      "budget_gib": 0,
      "mode": "streamed",
+     "n": 4,
+     "peak_vram_gib": [
+      1.89,
+      0.0
+     ],
+     "decode_tps": [
+      2.612,
+      0.013
+     ],
+     "prefill_tps": [
+      3.39,
+      0.03
+     ],
+     "load_s": [
+      13.5,
+      0.0
+     ],
+     "expert_stream": "router-aware (0002)"
+    },
+    {
+     "arm": "v4",
+     "budget_gib": 4,
+     "mode": "streamed",
+     "n": 1,
+     "peak_vram_gib": [
+      5.32,
+      0.0
+     ],
+     "decode_tps": [
+      3.085,
+      0.0
+     ],
+     "prefill_tps": [
+      3.78,
+      0.0
+     ],
+     "load_s": [
+      15.5,
+      0.0
+     ],
+     "expert_stream": "router-aware (0002)"
+    },
+    {
+     "arm": "v10",
+     "budget_gib": 10,
+     "mode": "streamed",
+     "n": 1,
+     "peak_vram_gib": [
+      11.92,
+      0.0
+     ],
+     "decode_tps": [
+      4.908,
+      0.0
+     ],
+     "prefill_tps": [
+      4.7,
+      0.0
+     ],
+     "load_s": [
+      20.0,
+      0.0
+     ],
+     "expert_stream": "router-aware (0002)"
+    },
+    {
+     "arm": "v16",
+     "budget_gib": 16,
+     "mode": "streamed",
+     "n": 1,
+     "peak_vram_gib": [
+      17.63,
+      0.0
+     ],
+     "decode_tps": [
+      11.346,
+      0.0
+     ],
+     "prefill_tps": [
+      6.2,
+      0.0
+     ],
+     "load_s": [
+      24.0,
+      0.0
+     ],
+     "expert_stream": "router-aware (0002)"
+    },
+    {
+     "arm": "auto",
+     "budget_gib": "auto",
+     "mode": "fits",
+     "n": 1,
+     "peak_vram_gib": [
+      21.5,
+      0.0
+     ],
+     "decode_tps": [
+      78.097,
+      0.0
+     ],
+     "prefill_tps": [
+      8.47,
+      0.0
+     ],
+     "load_s": [
+      26.0,
+      0.0
+     ],
+     "expert_stream": "router-aware (0002)"
+    }
+   ],
+   "MoE_all_experts": [
+    {
+     "arm": "v0",
+     "budget_gib": 0,
+     "mode": "streamed",
      "resident_layers": 0,
      "n_layers": 40,
      "resident_mib": 0,
@@ -605,8 +725,9 @@
    ]
   },
   "parity": {
-   "identical": 23,
-   "total": 23
+   "identical": 40,
+   "total": 40,
+   "note": "23 runs from the 0001 campaign + 17 runs with router-aware expert streaming (0002); dense references are unfused stock"
   },
   "load_hangs": {
    "not_ready": 7,
@@ -660,7 +781,7 @@
    "peak_vram_gib": 31.85
   }
  },
- "metric_note": "decode = llama-server timings.predicted_per_second; single/partial: 2026-10-04 post-reboot sweep, posix_fadvise cold model file, n=3 for stock and fully-streamed arms, n=1-2 for budget arms; v3 MoE stock 34.2 t/s superseded (host state; 78 t/s with both binaries post-reboot)",
+ "metric_note": "decode = llama-server timings.predicted_per_second; single/partial: 2026-10-04 post-reboot sweep, posix_fadvise cold model file, n=3 for stock and fully-streamed arms, n=1-2 for budget arms; v3 MoE stock 34.2 t/s superseded (host state; 78 t/s with both binaries post-reboot) | 2026-10-04 router-aware campaign: moe2/ (partial.py, n=3 stock+v0) and moec/ (moe_cache.py c/k arms) under experiments/2026-10-04-elastic-campaign-v3/pr/partial/. | 2026-10-04 router-aware campaign: moe2/ (partial.py, n=3 stock+v0) and moec/ (moe_cache.py c/k arms) under experiments/2026-10-04-elastic-campaign-v3/pr/partial/. | 2026-10-04 router-aware campaign: moe2/ (partial.py, n=3 stock+v0) and moec/ (moe_cache.py c/k arms) under experiments/2026-10-04-elastic-campaign-v3/pr/partial/. | 2026-10-04 router-aware campaign: moe2/ (partial.py, n=3 stock+v0) and moec/ (moe_cache.py c/k arms) under experiments/2026-10-04-elastic-campaign-v3/pr/partial/. | 2026-10-04 router-aware campaign: moe2/ (partial.py, n=3 stock+v0) and moec/ (moe_cache.py c/k arms) under experiments/2026-10-04-elastic-campaign-v3/pr/partial/. | 2026-10-04 router-aware campaign: moe2/ (partial.py, n=3 stock+v0) and moec/ (moe_cache.py c/k arms) under experiments/2026-10-04-elastic-campaign-v3/pr/partial/.",
  "concurrent_v3": [
   {
    "fleet": "conc_3x27B",
@@ -1137,14 +1258,90 @@
     ]
    }
   }
- }
-,
+ },
  "windows_delta": {
- "platform": "Windows 11, Core Ultra X7 358H, Arc B390 iGPU (16.4 GiB device pool), oneAPI 2026.0 (icx) + MSVC 19.44, llama.cpp SYCL + stream-weights patch",
- "method": "llama-cli, -ngl 99, -c 4096, greedy (top-k 1, seed 1234); device memory = Win32 per-process GPU perf counters (llama-cli), sampled ~4 Hz; peak over load + generation",
- "1_5B": {"model": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf", "stock_gib": 1.463, "streamed_gib": 0.778, "stock_tps": 80.8, "streamed_tps": 5.7},
- "27B": {"model": "Qwen3.8-27B-UD-Q4_K_S.gguf", "stock_gib": 15.376, "streamed_gib": 2.606, "stock_tps": 6.3, "streamed_tps": 0.4},
- "parity": "greedy tokens identical to stock (24/48-token runs)",
- "notes": "pass -c explicitly when streaming: the default context auto-fit sees the freed weight memory as free and may pick the model's full train context (large f32 KV). cascadia always passes --llama-ctx."
-}
+  "platform": "Windows 11, Core Ultra X7 358H, Arc B390 iGPU (16.4 GiB device pool), oneAPI 2026.0 (icx) + MSVC 19.44, llama.cpp SYCL + stream-weights patch",
+  "method": "llama-cli, -ngl 99, -c 4096, greedy (top-k 1, seed 1234); device memory = Win32 per-process GPU perf counters (llama-cli), sampled ~4 Hz; peak over load + generation",
+  "1_5B": {
+   "model": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+   "stock_gib": 1.463,
+   "streamed_gib": 0.778,
+   "stock_tps": 80.8,
+   "streamed_tps": 5.7
+  },
+  "27B": {
+   "model": "Qwen3.8-27B-UD-Q4_K_S.gguf",
+   "stock_gib": 15.376,
+   "streamed_gib": 2.606,
+   "stock_tps": 6.3,
+   "streamed_tps": 0.4
+  },
+  "parity": "greedy tokens identical to stock (24/48-token runs)",
+  "notes": "pass -c explicitly when streaming: the default context auto-fit sees the freed weight memory as free and may pick the model's full train context (large f32 KV). cascadia always passes --llama-ctx."
+ },
+ "expert_cache_arms": {
+  "note": "experimental GGML_STREAM_EXPERT_CACHE_MB hot-expert cache; 2 GiB per-tensor LRU was measured SLOWER than selective-only despite 59-67% hit rates (see RESULTS doc); default is off",
+  "arms": {
+   "c0": {
+    "n": 3,
+    "peak_vram_gib": [
+     3.85,
+     0.0
+    ],
+    "decode_tps": [
+     2.411,
+     0.978
+    ],
+    "prefill_tps": [
+     2.92,
+     0.93
+    ]
+   },
+   "c4": {
+    "n": 1,
+    "peak_vram_gib": [
+     7.29,
+     0.0
+    ],
+    "decode_tps": [
+     1.979,
+     0.0
+    ],
+    "prefill_tps": [
+     3.79,
+     0.0
+    ]
+   },
+   "k64": {
+    "n": 1,
+    "peak_vram_gib": [
+     1.89,
+     0.0
+    ],
+    "decode_tps": [
+     2.63,
+     0.0
+    ],
+    "prefill_tps": [
+     3.4,
+     0.0
+    ]
+   },
+   "k512": {
+    "n": 2,
+    "peak_vram_gib": [
+     2.56,
+     0.2
+    ],
+    "decode_tps": [
+     2.883,
+     0.013
+    ],
+    "prefill_tps": [
+     3.42,
+     0.02
+    ]
+   }
+  }
+ }
 }

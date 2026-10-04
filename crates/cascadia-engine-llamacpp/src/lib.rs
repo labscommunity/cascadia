@@ -112,6 +112,10 @@ pub struct LlamaCppConfig {
 /// with the weight-streaming patch (`GGML_STREAM_WEIGHTS` env gate).
 const STREAM_MARKER: &[u8] = b"GGML_STREAM_WEIGHTS";
 
+/// Marker for router-aware MoE expert streaming (0002 patch): MoE models
+/// stream only the experts the router selects instead of every expert.
+const EXPERT_MARKER: &[u8] = b"GGML_STREAM_EXPERT_CACHE_MB";
+
 /// Resolve the llama-server binary.
 ///
 /// Order: `--llama-bin` > `$CASCADIA_LLAMA_BIN` > `llama-server`
@@ -234,6 +238,25 @@ pub fn probe_stream_weights(bin: &Path) -> Result<StreamWeightsSupport, String> 
     }
 }
 
+/// Preflight: does this build also have router-aware MoE expert streaming
+/// (the 0002 patch)? Purely informational — a 0001-only build still streams
+/// correctly, it just reads every expert per token on MoE models.
+pub fn probe_expert_streaming(bin: &Path) -> bool {
+    if file_contains(bin, EXPERT_MARKER) {
+        return true;
+    }
+    let dir = bin.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                (name.starts_with("libggml-sycl") || name.starts_with("libggml-base"))
+                    && file_contains(&e.path(), EXPERT_MARKER)
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Auto load deadline: 60 s + 8 s per GiB of model file; 300 s when the
 /// metadata is unreadable (a spawn error will surface the real cause).
 fn auto_load_timeout(model: &Path) -> Duration {
@@ -326,6 +349,16 @@ impl LlamaCppBuilder {
             // Device-side O1: weights stay on disk, streamed per layer.
             cmd.env("GGML_STREAM_WEIGHTS", "1");
             cmd.env("GGML_STREAM_VRAM_MB", self.cfg.elastic_vram.to_string());
+        }
+        // Router-aware MoE streaming lives entirely in the child (0002
+        // patch): selective expert loading is automatic when streaming; a
+        // hot-expert cache is opt-in via env so --elastic-vram's
+        // resident-layer semantics stay exact.
+        if let Some(mb) = std::env::var("CASCADIA_EXPERT_CACHE_MB")
+            .ok()
+            .filter(|v| !v.is_empty())
+        {
+            cmd.env("GGML_STREAM_EXPERT_CACHE_MB", mb);
         }
         for a in self.cfg.extra_args.iter().filter(|a| !a.is_empty()) {
             cmd.arg(a);

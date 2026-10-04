@@ -751,8 +751,9 @@ def fig8():
     fig = newfig()
     header(fig, "--elastic-vram: speed follows how much of the model fits",
            "Keep the first N layers on the GPU, stream the rest from the "
-           "GGUF each token.\nauto picks N from free VRAM; if the whole "
-           "model fits, streaming turns off.")
+           "GGUF each token.\nMoE models stream only the experts the router "
+           "selects (automatic, any MoE).\nauto picks N from free VRAM; if "
+           "the whole model fits, streaming turns off.")
     box = dict(boxstyle="round,pad=0.25", facecolor=PANEL,
                edgecolor=GRID, linewidth=0.8)
     lead = dict(arrowstyle="-", color=MUTED, linewidth=0.8,
@@ -761,8 +762,8 @@ def fig8():
     lab_pos = {
         "27B": {"v0": (2.4, 0.16), "v2": (9.5, 0.16), "v4": (3.0, 3.0),
                 "v8": (7.5, 18.0), "v10": (11.5, 50.0), "v12": (19.0, 5.0)},
-        "MoE": {"v0": (3.0, 0.14), "v4": (5.0, 2.2), "v10": (10.5, 2.6),
-                "v16": (16.5, 8.0)},
+        "MoE": {"v0": (3.6, 6.0), "v4": (5.5, 1.1), "v10": (11.0, 1.6),
+                "v16": (17.5, 4.5)},
     }
     clus_pos = {"27B": (18.5, 150.0), "MoE": (16.0, 148.0)}
     for ax, key, name, kstock in [
@@ -775,6 +776,16 @@ def fig8():
         pts = sorted(arms, key=lambda a: a["peak_vram_gib"][0])
         streamed = [a for a in pts if a["mode"] == "streamed"]
         fits = [a for a in pts if a["mode"] != "streamed"]
+        if key == "MoE" and "MoE_all_experts" in DATA["partial"]["models"]:
+            # pre-router-aware curve: every expert streamed per token
+            olds = sorted(DATA["partial"]["models"]["MoE_all_experts"],
+                          key=lambda a: a["peak_vram_gib"][0])
+            olds = [a for a in olds if a["mode"] == "streamed"]
+            ax.plot([a["peak_vram_gib"][0] for a in olds],
+                    [a["decode_tps"][0] for a in olds],
+                    "--s", color=MUTED, markersize=5, linewidth=1.2,
+                    label="every expert streamed (before)")
+            ax.legend(loc="upper left", fontsize=9, frameon=False)
         xs = [a["peak_vram_gib"][0] for a in streamed]
         ys = [a["decode_tps"][0] for a in streamed]
         ax.plot(xs, ys, "-o", color=ELASTIC, markersize=7, linewidth=1.6)
@@ -810,8 +821,7 @@ def fig8():
         ax.set_title(name, fontsize=13, color=TEXT)
         if key == "MoE":
             ax.text(22.6, 0.13,
-                    "MoE streams every expert today\n(router-aware "
-                    "streaming is future work)",
+                    "router-aware: only the 8 selected\nexperts of 256 stream per token",
                     fontsize=9.5, color=MUTED, ha="right", va="bottom")
     par = DATA["partial"]["parity"]
     footer(fig, "Intel Arc Pro B70 32 GB | sycl-llama --elastic-vram sweep | "

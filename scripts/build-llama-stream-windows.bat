@@ -18,14 +18,16 @@ set "DEST=%~1"
 if "%DEST%"=="" set "DEST=%CD%\llama-stream"
 if "%LLAMA_REPO%"=="" set "LLAMA_REPO=https://github.com/ggml-org/llama.cpp"
 if "%LLAMA_BASE%"=="" set "LLAMA_BASE=1692f9e50bb20fd96b963af38a282daf78feea64"
-set "PATCH=%REPO_ROOT%\patches\llama.cpp\0001-sycl-stream-weights.patch"
+set "PATCH1=%REPO_ROOT%\patches\llama.cpp\0001-sycl-stream-weights.patch"
+set "PATCH2=%REPO_ROOT%\patches\llama.cpp\0002-sycl-router-aware-moe.patch"
 
 if not exist "%DEST%\.git" (
   git clone "%LLAMA_REPO%" "%DEST%" || exit /b 1
 )
 cd /d "%DEST%"
 git checkout "%LLAMA_BASE%" || exit /b 1
-git apply --check "%PATCH%" 2>nul && git apply "%PATCH%" || echo patch already applied or not applicable; continuing
+git apply --check "%PATCH1%" 2>nul && git apply "%PATCH1%" || echo patch1 already applied or not applicable; continuing
+git apply --check "%PATCH2%" 2>nul && git apply "%PATCH2%" || echo patch2 already applied or not applicable; continuing
 
 REM VS + oneAPI environments. VS2022INSTALLDIR lets setvars find the Build Tools.
 if "%VS2022INSTALLDIR%"=="" set "VS2022INSTALLDIR=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"

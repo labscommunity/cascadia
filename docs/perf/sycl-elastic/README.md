@@ -26,13 +26,18 @@ All numbers come from [`data.json`](./data.json) (verbatim copy of
   Qwen3.6-35B-A3B UD Q4_K_XL (GGUF).
 - **Settings:** `--llama-ctx 4096`, KV cache `q8_0`, `-fa on`, temperature 0,
   thinking off.
-- **Two data generations:** `single` / `partial` / `cotenant_auto` come from
+- **Data generations:** `single` / `partial` / `cotenant_auto` come from
   the 2026-10-04 post-reboot sweep (cold model file via
   `posix_fadvise(DONTNEED)` before each arm — `drop_caches` is avoided: on
   this xe host it leaks kernel memory; n=3 for stock and fully-streamed
   arms, n=1-2 for budget arms). Fleets, latency, lifecycle and sweeps come
   from campaign v3. The v3 MoE stock number (34.2 t/s) is superseded —
   post-reboot it measures 78 t/s with both binaries (host state).
+- **Router-aware MoE (0002 patch):** the MoE rows of `partial` / `single` /
+  `single_v3_campaign` and the `MoE` curve in fig8 come from the same-day
+  sweep of the patched build (n=3 for stock and v0); the pre-0002
+  every-expert-streamed curve is kept as `MoE_all_experts` (dashed in fig8).
+  `expert_cache_arms` records the opt-in hot-expert cache experiment.
 - **Runs:** means over repetitions; decode/prefill are server-side
   `timings.predicted_per_second` / `prompt_per_second` (not end-to-end).
 - **VRAM:** kernel `vram_mm` under debugfs, sampled ~3 Hz during
@@ -69,11 +74,13 @@ sudo cat /sys/kernel/debug/dri/<pci>/tile0/vram_mm   # "usage:" line
 #    experiments/2026-10-04-elastic-campaign-v3/pr/partial/, not committed)
 cd experiments/2026-10-04-elastic-campaign-v3/pr/partial
 python3 partial.py sweep 27B stock unfused v0 v2 v4 v8 v10 v12 auto v40
-python3 partial.py sweep MoE stock unfused v0 v4 v10 v16 auto
+python3 partial.py sweep MoE stock v0 v4 v10 v16 auto   # 0002: router-aware experts
+python3 moe_cache.py moec MoE c0 c4 k64 k512            # opt-in expert-cache arms
 python3 partial.py sweep 1.5B stock unfused v0 auto
 python3 cotenant.py sweep/cotenant-auto-2.json 2
 
-# 5. figures
+# 5. fold the runs into data.json, then draw
+python3 docs/perf/sycl-elastic/update_data_moe.py
 experiments/2026-10-04-elastic-campaign-v3/venv/bin/python \
   docs/perf/sycl-elastic/make_figs.py
 ```
