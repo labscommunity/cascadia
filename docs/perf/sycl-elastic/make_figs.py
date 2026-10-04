@@ -120,7 +120,12 @@ def qc_figure(fig, name):
         if not s:
             continue
         try:
-            bb = t.get_window_extent(renderer=r)
+            # for annotations, the window extent includes the leader arrow;
+            # the visible label box is its FancyBboxPatch
+            if t.get_bbox_patch() is not None:
+                bb = t.get_bbox_patch().get_window_extent(renderer=r)
+            else:
+                bb = t.get_window_extent(renderer=r)
         except Exception:
             continue
         if bb.width <= 1 or bb.height <= 1:
@@ -188,6 +193,39 @@ def qc_figure(fig, name):
                 QC_ERRORS.append((name, "text overlaps bar",
                                   f"{s[:40]!r} ({frac:.2f})"))
                 break
+    # data markers must not sit under a text label
+    marker_rects = []
+    dpi = fig.dpi
+    for ax in fig.axes:
+        for ln in ax.lines:
+            if not ln.get_marker() or ln.get_marker() == "None":
+                continue
+            ms = ln.get_markersize()
+            if ms <= 0:
+                continue
+            r = ms * dpi / 72.0 / 2.0 + 3
+            try:
+                xy = np.asarray(ln.get_xydata(), dtype=float)
+                disp = ax.transData.transform(xy)
+            except Exception:
+                continue
+            for px, py in disp:
+                marker_rects.append(
+                    matplotlib.transforms.Bbox.from_extents(
+                        px - r, py - r, px + r, py + r))
+    for s, bb, _ in items:
+        for mb in marker_rects:
+            if not bb.overlaps(mb):
+                continue
+            inter = bb.intersection(bb, mb)
+            if inter is None:
+                continue
+            frac = (max(inter.width, 0) * max(inter.height, 0)
+                    / (mb.width * mb.height))
+            if frac > 0.2:
+                QC_ERRORS.append((name, "text covers marker",
+                                  f"{s[:40]!r} ({frac:.2f})"))
+                break
     # dashed reference lines must not cross an unboxed text label
     for ax in fig.axes:
         for ln in ax.lines:
@@ -244,31 +282,36 @@ MODELS = [
 # ---------------- fig0 ----------------
 def fig0():
     fig = newfig(4.9)
-    fig.text(0.045, 0.955, "Run big models on a fraction of the VRAM",
+    fig.text(0.045, 0.955, "Run big models on whatever VRAM you have",
              fontsize=20, fontweight="bold", color=TEXT, va="top")
     fig.text(0.045, 0.88,
-             "cascadia --engine sycl-llama --elastic: llama.cpp streams "
-             "weights from the page cache instead of keeping them resident",
+             "cascadia --engine sycl-llama --elastic keeps what fits on the "
+             "GPU and streams the rest from the GGUF",
              fontsize=12, color=MUTED, va="top")
 
     conc = {f["fleet"]: f for f in DATA["concurrent_v3"]}
     n5 = conc["conc_5x27B"]
     p27s, p27e = v("27B_stock", "peak_vram_gib"), v("27B_elastic", "peak_vram_gib")
-    p35s, p35e = v("35B_a3b_stock", "peak_vram_gib"), v("35B_a3b_elastic", "peak_vram_gib")
-    l27s, l27e = v("27B_stock", "load_s"), v("27B_elastic", "load_s")
-    l35s, l35e = v("35B_a3b_stock", "load_s"), v("35B_a3b_elastic", "load_s")
-    load_drop = round(100 * (1 - (l27e + l35e) / (l27s + l35s)))
+    p27 = {a["arm"]: a for a in DATA["partial"]["models"]["27B"]}
+    v12 = p27["v12"]
+    streamed_12 = v12["n_layers"] - v12["resident_layers"]
+    cot2 = DATA["cotenant_auto"]["cotenant-auto-2"]
+    par = DATA["partial"]["parity"]
 
     cards = [
-        (f"{p27e:.1f} GiB", "27B model",
-         f"was {p27s:.1f} GiB stock\n(-{round(100 * (1 - p27e / p27s))}%)"),
-        (f"{p35e:.1f} GiB", "35B MoE (A3B)",
-         f"was {p35s:.1f} GiB\n(-{round(100 * (1 - p35e / p35s))}%)"),
+        (f"{p27e:.1f} GiB", "27B fully streamed",
+         f"was {p27s:.1f} GiB resident\n"
+         f"(-{round(100 * (1 - p27e / p27s))}%)"),
+        (f"{v12['decode_tps'][0]:.1f} t/s",
+         f"27B in {v12['peak_vram_gib'][0]:.1f} GiB",
+         f"{streamed_12} of {v12['n_layers']} layers streamed;\n"
+         f"resident {v('27B_stock', 'decode_tps'):.1f} t/s"),
         ("5 x 27B", "on one 32 GB card",
          f"all 5 generating at once,\n{n5['peak_vram_gib']:.1f} GiB peak\n"
          "stock: 3 copies overflow"),
-        (f"-{load_drop}%", "faster startup",
-         f"27B {l27s:.1f} -> {l27e:.1f} s\n35B {l35s:.1f} -> {l35e:.1f} s"),
+        ("2 x 27B", "auto-placed on one card",
+         f"{cot2['aggregate_concurrent_tps']:.1f} t/s together,\n"
+         f"{cot2['peak_vram_gib']:.1f} GiB peak"),
     ]
     ax = fig.add_axes([0, 0, 1, 1])
     ax.set_xlim(0, 1)
@@ -286,14 +329,20 @@ def fig0():
                 ha="center", va="center")
         ax.text(x + w / 2, y0 + h * 0.20, sub, fontsize=9.5, color=MUTED,
                 ha="center", va="center")
-    d27 = v("27B_elastic", "decode_tps")
-    d27s = v("27B_stock", "decode_tps")
-    fig.text(0.045, 0.30, PARITY_NOTE, fontsize=12, color=ELASTIC,
-             fontweight="bold", va="top")
+    v8 = p27["v8"]
+    v0 = p27["v0"]
+    fig.text(0.045, 0.30,
+             f"{par['identical']}/{par['total']} runs token-identical to "
+             "stock (fusion off when streaming)",
+             fontsize=12, color=ELASTIC, fontweight="bold", va="top")
     fig.text(0.045, 0.23,
-             f"Trade-off: --elastic streams weights per token - 27B decodes "
-             f"at {d27:.2f} t/s vs {d27s:.1f} t/s resident. A capacity mode, "
-             "not a speed mode.",
+             f"Speed follows the streamed share: 27B "
+             f"{v('27B_stock', 'decode_tps'):.1f} t/s resident -> "
+             f"{v12['decode_tps'][0]:.1f} "
+             f"({v12['streamed_mib'] / 1024:.1f} GiB/token streamed) -> "
+             f"{v8['decode_tps'][0]:.1f} "
+             f"({v8['streamed_mib'] / 1024:.1f} GiB) -> "
+             f"{v0['decode_tps'][0]:.2f} t/s fully streamed.",
              fontsize=12, color=MUTED, va="top")
     footer(fig)
     save(fig, "fig0_hero.png")
@@ -316,7 +365,7 @@ def fig1():
         ax.barh(g + 0.19, v(ks, "peak_vram_gib"), height=0.36, color=STOCK,
                 label="stock" if i == 0 else None)
         ax.barh(g - 0.19, v(ke, "peak_vram_gib"), height=0.36, color=ELASTIC,
-                label="--elastic" if i == 0 else None)
+                label="fully streamed (--elastic-vram 0)" if i == 0 else None)
         sv, ev = v(ks, "peak_vram_gib"), v(ke, "peak_vram_gib")
         ax.text(sv + 0.25, g + 0.19, f"{sv:.2f} GiB", va="center", fontsize=11,
                 fontweight="bold", color=TEXT)
@@ -340,7 +389,7 @@ def fig1():
         ax.text(xx, top - 0.02, lab, fontsize=10, color=AMBER, ha=ha,
                 va="top", bbox=REF_LABEL_BOX)
     ax.set_ylim(-0.55, top)
-    ax.legend(loc="center right", bbox_to_anchor=(0.88, 0.55), fontsize=11,
+    ax.legend(loc="center right", bbox_to_anchor=(0.97, 0.42), fontsize=10,
               frameon=True, facecolor=PANEL, edgecolor=GRID)
     footer(fig)
     save(fig, "fig1_vram.png")
@@ -362,7 +411,7 @@ def fig2():
 
     xs = list(range(1, len(el) + 1))
     ax.fill_between(xs, el, color=ELASTIC, alpha=0.15)
-    ax.plot(xs, el, color=ELASTIC, marker="o", linewidth=2, label="--elastic")
+    ax.plot(xs, el, color=ELASTIC, marker="o", linewidth=2, label="fully streamed (--elastic-vram 0)")
     for x, yy in zip(xs, el):
         off = (0, -17) if x == xs[-1] else (0, 9)
         ax.annotate(f"{yy:.1f}", (x, yy), textcoords="offset points",
@@ -411,7 +460,7 @@ def fig3():
         ax.bar(i - 0.19, v(ks, "load_s"), width=0.36, color=STOCK,
                label="stock" if i == 0 else None)
         ax.bar(i + 0.19, v(ke, "load_s"), width=0.36, color=ELASTIC,
-               label="--elastic" if i == 0 else None)
+               label="fully streamed (--elastic-vram 0)" if i == 0 else None)
         ax.text(i - 0.19, v(ks, "load_s") + 0.5, f"{v(ks, 'load_s'):.1f} s",
                 ha="center", fontsize=11, fontweight="bold", color=TEXT)
         ax.text(i + 0.19, v(ke, "load_s") + 0.5, f"{v(ke, 'load_s'):.1f} s",
@@ -428,10 +477,10 @@ def fig3():
 # ---------------- fig4 ----------------
 def fig4():
     fig = newfig()
-    header(fig, "The cost: --elastic is a capacity mode, not a speed mode",
-           "Every token re-reads the weights from the page cache at "
-           "~8 GB/s.\nUse stock when the model fits; use --elastic when it "
-           "doesn't, or to park several models on one card.")
+    header(fig, "The cost of streaming everything (--elastic-vram 0)",
+           "Every token re-reads all layer weights at ~7 GB/s. With "
+           "--elastic-vram auto, only what does not fit is\nstreamed "
+           "(see fig8).")
     axl = fig.add_axes([0.07, 0.16, 0.40, 0.55])
     style_ax(axl)
     for i, (name, ks, ke) in enumerate(MODELS):
@@ -439,7 +488,7 @@ def fig4():
         axl.bar(i - 0.19, sv, width=0.36, color=STOCK,
                 label="stock" if i == 0 else None)
         axl.bar(i + 0.19, ev, width=0.36, color=ELASTIC,
-                label="--elastic" if i == 0 else None)
+                label="fully streamed (--elastic-vram 0)" if i == 0 else None)
         axl.text(i - 0.19, sv * 1.15, f"{sv:.1f}", ha="center", fontsize=11,
                  fontweight="bold", color=TEXT)
         axl.text(i + 0.19, ev * 1.15, f"{ev:.2f}" if ev < 1 else f"{ev:.1f}",
@@ -475,7 +524,7 @@ def fig4():
         axr.bar(i - 0.19, sv, width=0.36, color=STOCK,
                 label="stock" if i == 0 else None)
         axr.bar(i + 0.19, ev, width=0.36, color=ELASTIC,
-                label="--elastic" if i == 0 else None)
+                label="fully streamed (--elastic-vram 0)" if i == 0 else None)
         axr.text(i - 0.19, sv * 1.15, sf(sv), ha="center", fontsize=10,
                  fontweight="bold", color=TEXT)
         axr.text(i + 0.19, ev * 1.15, sf(ev), ha="center", fontsize=10,
@@ -488,6 +537,7 @@ def fig4():
     axr.set_yticks([0.01, 0.1, 1, 10])
     axr.set_yticklabels(["0.01", "0.1", "1", "10"])
     axr.legend(loc="upper right", fontsize=11, frameon=False)
+    axr.set_title("latency: campaign v3", fontsize=10, color=MUTED, pad=8)
     footer(fig)
     save(fig, "fig4_tradeoff.png")
 
@@ -696,8 +746,82 @@ def fig7():
     save(fig, "fig7_reliability.png")
 
 
+# ---------------- fig8 ----------------
+def fig8():
+    fig = newfig()
+    header(fig, "--elastic-vram: speed follows how much of the model fits",
+           "Keep the first N layers on the GPU, stream the rest from the "
+           "GGUF each token.\nauto picks N from free VRAM; if the whole "
+           "model fits, streaming turns off.")
+    box = dict(boxstyle="round,pad=0.25", facecolor=PANEL,
+               edgecolor=GRID, linewidth=0.8)
+    lead = dict(arrowstyle="-", color=MUTED, linewidth=0.8,
+                shrinkA=4, shrinkB=6)
+    # per-arm label anchor (x, y data coords) for the leadered label
+    lab_pos = {
+        "27B": {"v0": (2.4, 0.16), "v2": (9.5, 0.16), "v4": (3.0, 3.0),
+                "v8": (7.5, 18.0), "v10": (11.5, 50.0), "v12": (19.0, 5.0)},
+        "MoE": {"v0": (3.0, 0.14), "v4": (5.0, 2.2), "v10": (10.5, 2.6),
+                "v16": (16.5, 8.0)},
+    }
+    clus_pos = {"27B": (18.5, 150.0), "MoE": (16.0, 148.0)}
+    for ax, key, name, kstock in [
+            (fig.add_axes([0.075, 0.15, 0.40, 0.60]), "27B",
+             "Qwen3.8-27B", "27B_stock"),
+            (fig.add_axes([0.565, 0.15, 0.40, 0.60]), "MoE",
+             "Qwen3.6-35B-A3B MoE", "35B_a3b_stock")]:
+        style_ax(ax)
+        arms = DATA["partial"]["models"][key]
+        pts = sorted(arms, key=lambda a: a["peak_vram_gib"][0])
+        streamed = [a for a in pts if a["mode"] == "streamed"]
+        fits = [a for a in pts if a["mode"] != "streamed"]
+        xs = [a["peak_vram_gib"][0] for a in streamed]
+        ys = [a["decode_tps"][0] for a in streamed]
+        ax.plot(xs, ys, "-o", color=ELASTIC, markersize=7, linewidth=1.6)
+        sv = v(kstock, "decode_tps")
+        sp = v(kstock, "peak_vram_gib")
+        ax.plot([sp], [sv], "s", color=STOCK, markersize=9)
+        # fits arms land on the stock point: one hollow green ring over it
+        if fits:
+            ax.plot([sp], [sv], "o", color=ELASTIC, markersize=13,
+                    markerfacecolor="none", markeredgewidth=1.8)
+        for a in streamed:
+            x, y = a["peak_vram_gib"][0], a["decode_tps"][0]
+            lx, ly = lab_pos[key][a["arm"]]
+            ax.annotate(f"--elastic-vram {a['budget_gib']}\n{y:.2f} t/s",
+                        xy=(x, y), xytext=(lx, ly),
+                        ha="center", va="center", fontsize=9.5, color=TEXT,
+                        bbox=box, arrowprops=lead)
+        fit_names = " / ".join(
+            "auto" if a["arm"] == "auto" else f"v{a['budget_gib']}"
+            for a in fits)
+        cx, cy = clus_pos[key]
+        ax.annotate(f"stock = {fit_names} (fits)\n{sv:.1f} t/s",
+                    xy=(sp, sv), xytext=(cx, cy),
+                    ha="center", va="center", fontsize=9.5, color=ELASTIC,
+                    bbox=box, arrowprops=lead)
+        ax.set_yscale("log")
+        ax.set_xlim(0, 23)
+        ax.set_ylim(0.1, 400)
+        ax.set_yticks([0.2, 1, 5, 20, 100])
+        ax.set_yticklabels(["0.2", "1", "5", "20", "100"])
+        ax.set_xlabel("peak VRAM, GiB", fontsize=12)
+        ax.set_ylabel("decode, tokens/s (log)", fontsize=12)
+        ax.set_title(name, fontsize=13, color=TEXT)
+        if key == "MoE":
+            ax.text(22.6, 0.13,
+                    "MoE streams every expert today\n(router-aware "
+                    "streaming is future work)",
+                    fontsize=9.5, color=MUTED, ha="right", va="bottom")
+    par = DATA["partial"]["parity"]
+    footer(fig, "Intel Arc Pro B70 32 GB | sycl-llama --elastic-vram sweep | "
+                f"{par['identical']}/{par['total']} streamed/auto runs "
+                "token-identical to reference")
+    save(fig, "fig8_partial.png")
+
+
 if __name__ == "__main__":
-    fig0(); fig1(); fig2(); fig3(); fig4(); fig5(); fig6(); fig7()
+    fig0(); fig1(); fig2(); fig3(); fig4(); fig5(); fig6(); fig7(); fig8()
     if QC_ERRORS:
         print("\n=== QC FAILURES ===")
         for name, kind, detail in QC_ERRORS:

@@ -1,6 +1,6 @@
 {
  "units": "GiB = 2^30 bytes; decode/prefill from llama-server timings",
- "single": {
+ "single_v3_campaign": {
   "1_5B_stock": {
    "n": 3,
    "model": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
@@ -164,6 +164,503 @@
    "vram_back_to_baseline": true
   }
  },
+ "single": {
+  "1_5B_stock": {
+   "n": 3,
+   "model": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+   "elastic": false,
+   "load_s": [
+    3.007,
+    0.005
+   ],
+   "peak_vram_gib": [
+    1.37,
+    0.0
+   ],
+   "vram_after_load_gib": null,
+   "decode_tps": [
+    218.417,
+    3.783
+   ],
+   "prefill_tps": [
+    9.654,
+    0.568
+   ],
+   "all_exit_clean": null,
+   "vram_back_to_baseline": true
+  },
+  "1_5B_elastic": {
+   "n": 3,
+   "model": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+   "elastic": true,
+   "load_s": [
+    4.01,
+    0.0
+   ],
+   "peak_vram_gib": [
+    0.69,
+    0.0
+   ],
+   "vram_after_load_gib": null,
+   "decode_tps": [
+    8.518,
+    0.111
+   ],
+   "prefill_tps": [
+    8.074,
+    0.2
+   ],
+   "all_exit_clean": null,
+   "vram_back_to_baseline": true
+  },
+  "27B_stock": {
+   "n": 3,
+   "model": "Qwen3.8-27B-UD-Q4_K_S.gguf",
+   "elastic": false,
+   "load_s": [
+    18.36,
+    0.474
+   ],
+   "peak_vram_gib": [
+    15.87,
+    0.0
+   ],
+   "vram_after_load_gib": null,
+   "decode_tps": [
+    19.289,
+    0.043
+   ],
+   "prefill_tps": [
+    6.982,
+    0.083
+   ],
+   "all_exit_clean": null,
+   "vram_back_to_baseline": true
+  },
+  "27B_elastic": {
+   "n": 3,
+   "model": "Qwen3.8-27B-UD-Q4_K_S.gguf",
+   "elastic": true,
+   "load_s": [
+    14.853,
+    0.471
+   ],
+   "peak_vram_gib": [
+    2.78,
+    0.0
+   ],
+   "vram_after_load_gib": null,
+   "decode_tps": [
+    0.545,
+    0.01
+   ],
+   "prefill_tps": [
+    1.169,
+    0.029
+   ],
+   "all_exit_clean": null,
+   "vram_back_to_baseline": true
+  },
+  "35B_a3b_stock": {
+   "n": 3,
+   "model": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+   "elastic": false,
+   "load_s": [
+    27.54,
+    1.414
+   ],
+   "peak_vram_gib": [
+    21.5,
+    0.0
+   ],
+   "vram_after_load_gib": null,
+   "decode_tps": [
+    78.337,
+    0.132
+   ],
+   "prefill_tps": [
+    8.356,
+    0.169
+   ],
+   "all_exit_clean": null,
+   "vram_back_to_baseline": true
+  },
+  "35B_a3b_elastic": {
+   "n": 3,
+   "model": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+   "elastic": true,
+   "load_s": [
+    20.363,
+    0.236
+   ],
+   "peak_vram_gib": [
+    2.59,
+    0.0
+   ],
+   "vram_after_load_gib": null,
+   "decode_tps": [
+    0.253,
+    0.002
+   ],
+   "prefill_tps": [
+    0.602,
+    0.012
+   ],
+   "all_exit_clean": null,
+   "vram_back_to_baseline": true
+  }
+ },
+ "partial": {
+  "models": {
+   "1.5B": [
+    {
+     "arm": "v0",
+     "budget_gib": 0,
+     "mode": "streamed",
+     "resident_layers": 0,
+     "n_layers": 28,
+     "resident_mib": 0,
+     "streamed_mib": 743,
+     "peak_vram_gib": [
+      0.69,
+      0.0
+     ],
+     "decode_tps": [
+      8.518,
+      0.111
+     ],
+     "n": 3,
+     "tokens_identical": true
+    },
+    {
+     "arm": "auto",
+     "budget_gib": "auto",
+     "mode": "resident (fits)",
+     "resident_layers": null,
+     "n_layers": null,
+     "resident_mib": null,
+     "streamed_mib": 0,
+     "peak_vram_gib": [
+      1.37,
+      0.0
+     ],
+     "decode_tps": [
+      217.642,
+      0.0
+     ],
+     "n": 1,
+     "tokens_identical": true
+    }
+   ],
+   "27B": [
+    {
+     "arm": "v0",
+     "budget_gib": 0,
+     "mode": "streamed",
+     "resident_layers": 0,
+     "n_layers": 65,
+     "resident_mib": 0,
+     "streamed_mib": 13087,
+     "peak_vram_gib": [
+      2.78,
+      0.0
+     ],
+     "decode_tps": [
+      0.545,
+      0.01
+     ],
+     "n": 3,
+     "tokens_identical": true
+    },
+    {
+     "arm": "v2",
+     "budget_gib": 2,
+     "mode": "streamed",
+     "resident_layers": 10,
+     "n_layers": 65,
+     "resident_mib": 1920,
+     "streamed_mib": 11167,
+     "peak_vram_gib": [
+      4.63,
+      0.0
+     ],
+     "decode_tps": [
+      0.622,
+      0.0
+     ],
+     "n": 1,
+     "tokens_identical": true
+    },
+    {
+     "arm": "v4",
+     "budget_gib": 4,
+     "mode": "streamed",
+     "resident_layers": 22,
+     "n_layers": 65,
+     "resident_mib": 4035,
+     "streamed_mib": 9051,
+     "peak_vram_gib": [
+      6.66,
+      0.0
+     ],
+     "decode_tps": [
+      0.757,
+      0.0
+     ],
+     "n": 1,
+     "tokens_identical": true
+    },
+    {
+     "arm": "v8",
+     "budget_gib": 8,
+     "mode": "streamed",
+     "resident_layers": 42,
+     "n_layers": 65,
+     "resident_mib": 8012,
+     "streamed_mib": 5074,
+     "peak_vram_gib": [
+      10.52,
+      0.0
+     ],
+     "decode_tps": [
+      1.356,
+      0.023
+     ],
+     "n": 2,
+     "tokens_identical": true
+    },
+    {
+     "arm": "v10",
+     "budget_gib": 10,
+     "mode": "streamed",
+     "resident_layers": 53,
+     "n_layers": 65,
+     "resident_mib": 10212,
+     "streamed_mib": 2874,
+     "peak_vram_gib": [
+      12.66,
+      0.0
+     ],
+     "decode_tps": [
+      2.309,
+      0.0
+     ],
+     "n": 1,
+     "tokens_identical": true
+    },
+    {
+     "arm": "v12",
+     "budget_gib": 12,
+     "mode": "streamed",
+     "resident_layers": 62,
+     "n_layers": 65,
+     "resident_mib": 12265,
+     "streamed_mib": 821,
+     "peak_vram_gib": [
+      14.695,
+      0.035
+     ],
+     "decode_tps": [
+      8.352,
+      0.0
+     ],
+     "n": 2,
+     "tokens_identical": true
+    },
+    {
+     "arm": "v40",
+     "budget_gib": 40,
+     "mode": "resident (fits)",
+     "resident_layers": null,
+     "n_layers": null,
+     "resident_mib": null,
+     "streamed_mib": 0,
+     "peak_vram_gib": [
+      15.87,
+      0.0
+     ],
+     "decode_tps": [
+      19.284,
+      0.0
+     ],
+     "n": 1,
+     "tokens_identical": true
+    },
+    {
+     "arm": "auto",
+     "budget_gib": "auto",
+     "mode": "resident (fits)",
+     "resident_layers": null,
+     "n_layers": null,
+     "resident_mib": null,
+     "streamed_mib": 0,
+     "peak_vram_gib": [
+      15.87,
+      0.0
+     ],
+     "decode_tps": [
+      19.27,
+      0.0
+     ],
+     "n": 1,
+     "tokens_identical": true
+    }
+   ],
+   "MoE": [
+    {
+     "arm": "v0",
+     "budget_gib": 0,
+     "mode": "streamed",
+     "resident_layers": 0,
+     "n_layers": 40,
+     "resident_mib": 0,
+     "streamed_mib": 20279,
+     "peak_vram_gib": [
+      2.59,
+      0.0
+     ],
+     "decode_tps": [
+      0.253,
+      0.002
+     ],
+     "n": 3,
+     "tokens_identical": true
+    },
+    {
+     "arm": "v4",
+     "budget_gib": 4,
+     "mode": "streamed",
+     "resident_layers": 7,
+     "n_layers": 40,
+     "resident_mib": 3617,
+     "streamed_mib": 16662,
+     "peak_vram_gib": [
+      6.06,
+      0.0
+     ],
+     "decode_tps": [
+      0.305,
+      0.0
+     ],
+     "n": 1,
+     "tokens_identical": true
+    },
+    {
+     "arm": "v10",
+     "budget_gib": 10,
+     "mode": "streamed",
+     "resident_layers": 20,
+     "n_layers": 40,
+     "resident_mib": 10137,
+     "streamed_mib": 10141,
+     "peak_vram_gib": [
+      12.42,
+      0.0
+     ],
+     "decode_tps": [
+      0.467,
+      0.0
+     ],
+     "n": 1,
+     "tokens_identical": true
+    },
+    {
+     "arm": "v16",
+     "budget_gib": 16,
+     "mode": "streamed",
+     "resident_layers": 32,
+     "n_layers": 40,
+     "resident_mib": 16161,
+     "streamed_mib": 4118,
+     "peak_vram_gib": [
+      18.31,
+      0.0
+     ],
+     "decode_tps": [
+      1.116,
+      0.0
+     ],
+     "n": 1,
+     "tokens_identical": true
+    },
+    {
+     "arm": "auto",
+     "budget_gib": "auto",
+     "mode": "resident (fits)",
+     "resident_layers": null,
+     "n_layers": null,
+     "resident_mib": null,
+     "streamed_mib": 0,
+     "peak_vram_gib": [
+      21.5,
+      0.0
+     ],
+     "decode_tps": [
+      77.459,
+      0.0
+     ],
+     "n": 1,
+     "tokens_identical": true
+    }
+   ]
+  },
+  "parity": {
+   "identical": 23,
+   "total": 23
+  },
+  "load_hangs": {
+   "not_ready": 7,
+   "starts": 42,
+   "note": "7 load hangs (not ready within 240 s), all recovered by retry; one 27B v40 record overwritten, count kept from sweep-27B.out console; coincides with xe 'Engine memory CAT error class=bcs' resets; stock arms affected too"
+  }
+ },
+ "cotenant_auto": {
+  "cotenant-auto-2": {
+   "n": 2,
+   "instances": [
+    {
+     "stream_line": "stream-weights: model fits (13087 MiB), streaming disabled",
+     "vram_after_load_gib": 14.64,
+     "decode_tps_alone": 19.281,
+     "decode_tps_concurrent": 4.472
+    },
+    {
+     "stream_line": "stream-weights: resident layers 64/65 (12752 MiB resident, 335 MiB streamed per token)",
+     "vram_after_load_gib": 29.3,
+     "decode_tps_alone": 19.015,
+     "decode_tps_concurrent": 4.437
+    }
+   ],
+   "aggregate_concurrent_tps": 8.909,
+   "peak_vram_gib": 30.53
+  },
+  "cotenant-auto-3": {
+   "n": 3,
+   "instances": [
+    {
+     "stream_line": "stream-weights: model fits (13087 MiB), streaming disabled",
+     "vram_after_load_gib": 14.64,
+     "decode_tps_alone": 19.335,
+     "decode_tps_concurrent": 3.317
+    },
+    {
+     "stream_line": "stream-weights: resident layers 64/65 (12752 MiB resident, 335 MiB streamed per token)",
+     "vram_after_load_gib": 29.3,
+     "decode_tps_alone": 19.046,
+     "decode_tps_concurrent": 3.178
+    },
+    {
+     "stream_line": "stream-weights: resident layers 0/65 (0 MiB resident, 13087 MiB streamed per token)",
+     "vram_after_load_gib": 18.12,
+     "decode_tps_alone": 0.526,
+     "decode_tps_concurrent": 0.494
+    }
+   ],
+   "aggregate_concurrent_tps": 6.99,
+   "peak_vram_gib": 31.85
+  }
+ },
+ "metric_note": "decode = llama-server timings.predicted_per_second; single/partial: 2026-10-04 post-reboot sweep, posix_fadvise cold model file, n=3 for stock and fully-streamed arms, n=1-2 for budget arms; v3 MoE stock 34.2 t/s superseded (host state; 78 t/s with both binaries post-reboot)",
  "concurrent_v3": [
   {
    "fleet": "conc_3x27B",
