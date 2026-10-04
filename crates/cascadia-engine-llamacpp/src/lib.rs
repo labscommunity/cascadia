@@ -41,6 +41,44 @@ use cascadia_types::{
 };
 use futures::stream;
 
+/// VRAM budget for `--elastic` partial weight streaming, mapped to the
+/// child's `GGML_STREAM_VRAM_MB` env: `auto` = keep whatever fits resident,
+/// a GiB number = that much resident weight budget, `0` = stream every
+/// layer (the original all-or-nothing mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElasticVram {
+    Auto,
+    MiB(u64),
+}
+
+impl std::str::FromStr for ElasticVram {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        if raw.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        let gib: f64 = raw.parse().map_err(|_| {
+            format!("invalid --elastic-vram '{raw}' (expected 'auto' or a GiB number)")
+        })?;
+        if !gib.is_finite() || gib < 0.0 {
+            return Err(format!(
+                "invalid --elastic-vram '{raw}' (expected 'auto' or a GiB number)"
+            ));
+        }
+        Ok(Self::MiB((gib * 1024.0).round() as u64))
+    }
+}
+
+impl std::fmt::Display for ElasticVram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::MiB(v) => write!(f, "{v}"),
+        }
+    }
+}
+
 /// Configuration for the llama.cpp subprocess engine.
 pub struct LlamaCppConfig {
     /// Path to a llama-server binary (a build with the stream-weights patch
@@ -56,6 +94,9 @@ pub struct LlamaCppConfig {
     pub ngl: u32,
     /// Elastic posture: GGML_STREAM_WEIGHTS=1 on the child.
     pub elastic: bool,
+    /// Resident-weight budget for elastic mode (GGML_STREAM_VRAM_MB).
+    /// Only meaningful with `elastic`.
+    pub elastic_vram: ElasticVram,
     /// Extra raw args appended verbatim to the server command line.
     pub extra_args: Vec<String>,
     /// Health deadline per load attempt. `None` = auto: 60 s + 8 s per GiB
@@ -227,12 +268,18 @@ fn health_ok(port: u16) -> bool {
 /// thread pushes every line; the engine reads it when a load attempt fails.
 type StderrTail = Arc<Mutex<VecDeque<String>>>;
 
+/// `stream-weights:` lines the patched child prints during load. Kept
+/// separately from the stderr tail: the tail is only 40 lines, so an early
+/// split line would scroll out before ready on chatty models.
+type StreamLines = Arc<Mutex<Vec<String>>>;
+
 /// Builder: spawns and readiness-checks the llama-server child.
 pub struct LlamaCppBuilder {
     cfg: LlamaCppConfig,
     port: u16,
     child: Option<Child>,
     stderr_tail: StderrTail,
+    stream_lines: StreamLines,
     stderr_drain: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -243,6 +290,7 @@ impl LlamaCppBuilder {
             port: 0,
             child: None,
             stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+            stream_lines: Arc::new(Mutex::new(Vec::new())),
             stderr_drain: None,
         }
     }
@@ -277,6 +325,7 @@ impl LlamaCppBuilder {
         if self.cfg.elastic {
             // Device-side O1: weights stay on disk, streamed per layer.
             cmd.env("GGML_STREAM_WEIGHTS", "1");
+            cmd.env("GGML_STREAM_VRAM_MB", self.cfg.elastic_vram.to_string());
         }
         for a in self.cfg.extra_args.iter().filter(|a| !a.is_empty()) {
             cmd.arg(a);
@@ -285,11 +334,25 @@ impl LlamaCppBuilder {
             .spawn()
             .map_err(|e| format!("spawn llama-server: {e}"))?;
         self.stderr_tail.lock().unwrap().clear();
+        self.stream_lines.lock().unwrap().clear();
         if let Some(err) = child.stderr.take() {
             let tail = self.stderr_tail.clone();
+            let slines = self.stream_lines.clone();
             self.stderr_drain = Some(std::thread::spawn(move || {
                 for line in BufReader::new(err).lines().map_while(Result::ok) {
                     eprintln!("{line}");
+                    if line.starts_with("stream-weights: warning:") {
+                        tracing::warn!("llama-server: {line}");
+                    } else if line.starts_with("stream-weights:") {
+                        tracing::info!("llama-server: {line}");
+                    }
+                    if line.starts_with("stream-weights:") {
+                        let mut s = slines.lock().unwrap();
+                        if s.len() >= 8 {
+                            s.remove(0);
+                        }
+                        s.push(line.clone());
+                    }
                     let mut t = tail.lock().unwrap();
                     if t.len() >= 40 {
                         t.pop_front();
@@ -355,6 +418,14 @@ impl LlamaCppBuilder {
     }
 }
 
+/// `stream-weights:` lines captured by the stderr drainer (split + warnings).
+fn stream_lines(buf: &[String]) -> Vec<String> {
+    buf.iter()
+        .filter(|l| l.starts_with("stream-weights:"))
+        .cloned()
+        .collect()
+}
+
 #[async_trait]
 impl Builder for LlamaCppBuilder {
     async fn connect(&mut self, peers: PeerLayout) -> EngineResult<()> {
@@ -412,16 +483,26 @@ impl Builder for LlamaCppBuilder {
         }
         tracing::info!(port = self.port, "llama-server ready");
 
-        let evs = vec![
+        let mut evs = vec![
             LoadProgress::message("llama-server spawned"),
             LoadProgress::message(if self.cfg.elastic {
-                "elastic posture: GGML_STREAM_WEIGHTS=1 (device O1 — weights not resident)"
+                format!(
+                    "elastic posture: GGML_STREAM_WEIGHTS=1, \
+                     GGML_STREAM_VRAM_MB={} (device weight streaming)",
+                    self.cfg.elastic_vram
+                )
             } else {
-                "stock posture: weights resident"
+                "stock posture: weights resident".to_string()
             }),
+        ];
+        // Surface the child's own streaming split lines (warning + split).
+        for line in stream_lines(&self.stream_lines.lock().unwrap()) {
+            evs.push(LoadProgress::message(line));
+        }
+        evs.extend([
             LoadProgress::message("health OK — engine ready"),
             LoadProgress::ready(),
-        ];
+        ]);
         Ok(Box::pin(stream::iter(evs)))
     }
 
@@ -493,6 +574,7 @@ impl LlamaCppEngine {
                 "n_predict": task.max_tokens,
                 "temperature": task.temperature,
                 "stream": true,
+                "stream_options": {"include_usage": true},
             });
             ("/v1/completions", body)
         } else {
@@ -506,6 +588,7 @@ impl LlamaCppEngine {
                 "max_tokens": task.max_tokens,
                 "temperature": task.temperature,
                 "stream": true,
+                "stream_options": {"include_usage": true},
                 // Relay the API-resolved thinking toggle to the child's own
                 // template (Qwen-style templates read enable_thinking;
                 // others ignore the unused kwarg).
@@ -567,9 +650,9 @@ impl LlamaCppEngine {
             }
             // Body is one byte stream of SSE `data: ...` lines, possibly
             // chunk-framed. Read chunk sizes as hex when chunked.
-            let mut token_id: i64 = 0;
+            let mut st = SseState::default();
             let mut leftover = String::new();
-            loop {
+            'body: loop {
                 if cancelled.load(Ordering::Relaxed) {
                     return;
                 }
@@ -578,15 +661,15 @@ impl LlamaCppEngine {
                     // read until CRLF-terminated hex size line
                     let mut sz = String::new();
                     if reader.read_line(&mut sz).unwrap_or(0) == 0 {
-                        return;
+                        break 'body;
                     }
                     let n = usize::from_str_radix(sz.trim(), 16).unwrap_or(0);
                     if n == 0 {
-                        return; // terminal chunk
+                        break 'body; // terminal chunk
                     }
                     let mut buf = vec![0u8; n];
                     if reader.read_exact(&mut buf).is_err() {
-                        return;
+                        break 'body;
                     }
                     leftover.push_str(&String::from_utf8_lossy(&buf));
                     // swallow the chunk's trailing CRLF
@@ -595,18 +678,27 @@ impl LlamaCppEngine {
                     while let Some(idx) = leftover.find('\n') {
                         line = leftover[..idx].to_string();
                         leftover = leftover[idx + 1..].to_string();
-                        if !handle_sse_line(&line, &tid, &mut token_id, &send) {
+                        if !handle_sse_line(&line, &tid, &mut st, &send) {
                             return;
                         }
                     }
                     continue;
                 }
                 if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break 'body;
+                }
+                if !handle_sse_line(&line, &tid, &mut st, &send) {
                     return;
                 }
-                if !handle_sse_line(&line, &tid, &mut token_id, &send) {
-                    return;
-                }
+            }
+            // Clean EOF without a [DONE] line: deliver a pending final so
+            // finish_reason/usage still reach the caller.
+            if !st.sent_final && st.finish_reason.is_some() {
+                let mut c = Chunk::token(tid.clone(), st.token_id, "");
+                c.is_final = true;
+                c.finish_reason = st.finish_reason;
+                c.prompt_tokens = st.prompt_tokens;
+                send(Ok((tid.clone(), c)));
             }
         });
     }
@@ -641,12 +733,23 @@ fn apply_sampling(body: &mut serde_json::Value, sp: &SamplingParams) {
     }
 }
 
-/// Parse one SSE `data: ...` line into a Chunk; returns false when the
-/// stream is terminal (`[DONE]` or a stop chunk was emitted).
+/// Per-stream SSE parsing state. The finish chunk is delayed until
+/// `[DONE]` so the trailing `usage` object (stream_options) and the
+/// finish_reason both land on the final Chunk the API reads.
+#[derive(Default)]
+struct SseState {
+    token_id: i64,
+    finish_reason: Option<FinishReason>,
+    prompt_tokens: Option<u32>,
+    sent_final: bool,
+}
+
+/// Parse one SSE `data: ...` line; returns false when the stream is
+/// terminal (`[DONE]` was handled and the final chunk emitted).
 fn handle_sse_line(
     line: &str,
     tid: &TaskId,
-    token_id: &mut i64,
+    st: &mut SseState,
     send: &dyn Fn(EngineResult<(TaskId, Chunk)>),
 ) -> bool {
     let line = line.trim_end_matches('\r');
@@ -654,35 +757,45 @@ fn handle_sse_line(
         return true;
     };
     if data.trim() == "[DONE]" {
-        let mut c = Chunk::token(tid.clone(), *token_id, "");
+        let mut c = Chunk::token(tid.clone(), st.token_id, "");
         c.is_final = true;
+        c.finish_reason = st.finish_reason;
+        c.prompt_tokens = st.prompt_tokens;
+        st.sent_final = true;
         send(Ok((tid.clone(), c)));
         return false;
     }
     let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
         return true;
     };
+    // stream_options usage tail (empty choices) or a timings block on a
+    // content chunk — either can carry the prompt token count.
+    if let Some(n) = v["usage"]["prompt_tokens"].as_u64() {
+        st.prompt_tokens = Some(n as u32);
+    } else if let Some(n) = v["timings"]["prompt_n"].as_u64() {
+        st.prompt_tokens = Some(n as u32);
+    }
     let text = v["choices"][0]["delta"]["content"]
         .as_str()
         .or(v["choices"][0]["text"].as_str())
         .unwrap_or("");
     let stop_str = v["choices"][0]["finish_reason"].as_str();
-    let stop = stop_str.is_some();
-    // Let stop-only chunks through even if empty
-    if text.is_empty() && !stop {
-        return true;
-    }
-    let mut c = Chunk::token(tid.clone(), *token_id, text.to_string());
-    *token_id += 1;
-    if stop {
-        c.is_final = true;
-        c.finish_reason = Some(match stop_str {
-            Some("length") => FinishReason::Length,
-            _ => FinishReason::Stop,
+    if let Some(r) = stop_str {
+        st.finish_reason = Some(if r == "length" {
+            FinishReason::Length
+        } else {
+            FinishReason::Stop
         });
     }
+    // Empty chunks carry no content; a stop-only chunk only updates the
+    // recorded finish_reason (emitted on the [DONE] final).
+    if text.is_empty() {
+        return true;
+    }
+    let c = Chunk::token(tid.clone(), st.token_id, text.to_string());
+    st.token_id += 1;
     send(Ok((tid.clone(), c)));
-    !stop
+    true
 }
 
 impl Engine for LlamaCppEngine {
@@ -807,11 +920,11 @@ mod tests {
     fn collect(
         line: &str,
         tid: &TaskId,
-        token_id: &mut i64,
+        st: &mut SseState,
     ) -> (bool, Vec<EngineResult<(TaskId, Chunk)>>) {
         let out = std::cell::RefCell::new(Vec::new());
         let send = |r: EngineResult<(TaskId, Chunk)>| out.borrow_mut().push(r);
-        let go = handle_sse_line(line, tid, token_id, &send);
+        let go = handle_sse_line(line, tid, st, &send);
         (go, out.into_inner())
     }
 
@@ -820,7 +933,7 @@ mod tests {
         let (go, out) = collect(
             r#"data: {"choices":[{"delta":{"content":"Hello"}}]}"#,
             &"t1".to_string(),
-            &mut 0,
+            &mut SseState::default(),
         );
         assert!(go);
         let c = out[0].as_ref().unwrap().1.clone();
@@ -833,7 +946,7 @@ mod tests {
         let (go, out) = collect(
             r#"data: {"choices":[{"text":" world"}]}"#,
             &"t1".to_string(),
-            &mut 0,
+            &mut SseState::default(),
         );
         assert!(go);
         assert_eq!(out[0].as_ref().unwrap().1.text, " world");
@@ -841,7 +954,11 @@ mod tests {
 
     #[test]
     fn sse_done_is_final_and_terminal() {
-        let (go, out) = collect("data: [DONE]", &"t1".to_string(), &mut 3);
+        let mut st = SseState {
+            token_id: 3,
+            ..Default::default()
+        };
+        let (go, out) = collect("data: [DONE]", &"t1".to_string(), &mut st);
         assert!(!go);
         let c = out[0].as_ref().unwrap().1.clone();
         assert!(c.is_final);
@@ -850,49 +967,132 @@ mod tests {
 
     #[test]
     fn sse_finish_reason_maps_length_vs_stop() {
-        let (go, out) = collect(
+        // finish_reason is deferred onto the [DONE] final chunk
+        let tid = "t1".to_string();
+        let mut st = SseState::default();
+        let (go, _out) = collect(
             r#"data: {"choices":[{"delta":{"content":"x"},"finish_reason":"length"}]}"#,
-            &"t1".to_string(),
-            &mut 0,
+            &tid,
+            &mut st,
         );
-        assert!(!go);
-        assert_eq!(
-            out[0].as_ref().unwrap().1.finish_reason,
-            Some(FinishReason::Length)
-        );
-        let (go, out) = collect(
-            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
-            &"t1".to_string(),
-            &mut 0,
-        );
+        assert!(go);
+        let (go, out) = collect("data: [DONE]", &tid, &mut st);
         assert!(!go);
         let c = out[0].as_ref().unwrap().1.clone();
         assert!(c.is_final);
+        assert_eq!(c.finish_reason, Some(FinishReason::Length));
+
+        let mut st = SseState::default();
+        let (go, _out) = collect(
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            &tid,
+            &mut st,
+        );
+        assert!(go);
+        let (go, out) = collect("data: [DONE]", &tid, &mut st);
+        assert!(!go);
+        assert_eq!(
+            out[0].as_ref().unwrap().1.finish_reason,
+            Some(FinishReason::Stop)
+        );
+    }
+
+    #[test]
+    fn sse_usage_lands_on_final_chunk() {
+        let tid = "t1".to_string();
+        let mut st = SseState::default();
+        let (go, out) = collect(
+            r#"data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
+            &tid,
+            &mut st,
+        );
+        assert!(go);
+        assert_eq!(out.len(), 1);
+        let (go, out) = collect(
+            r#"data: {"choices":[],"usage":{"prompt_tokens":42,"completion_tokens":1}}"#,
+            &tid,
+            &mut st,
+        );
+        assert!(go);
+        assert!(out.is_empty());
+        let (go, out) = collect("data: [DONE]", &tid, &mut st);
+        assert!(!go);
+        let c = out[0].as_ref().unwrap().1.clone();
+        assert!(c.is_final);
+        assert_eq!(c.prompt_tokens, Some(42));
         assert_eq!(c.finish_reason, Some(FinishReason::Stop));
     }
 
     #[test]
+    fn sse_timings_prompt_n_fallback() {
+        let tid = "t1".to_string();
+        let mut st = SseState::default();
+        let (_go, _out) = collect(
+            r#"data: {"choices":[{"text":"x","finish_reason":"stop"}],"timings":{"prompt_n":7}}"#,
+            &tid,
+            &mut st,
+        );
+        let (_go, out) = collect("data: [DONE]", &tid, &mut st);
+        assert_eq!(out[0].as_ref().unwrap().1.prompt_tokens, Some(7));
+    }
+
+    #[test]
     fn sse_non_data_and_malformed_lines_are_skipped() {
-        assert!(handle_sse_line(
-            ": comment",
-            &"t".into(),
-            &mut 0,
-            &|_| panic!()
-        ));
-        assert!(handle_sse_line("", &"t".into(), &mut 0, &|_| panic!()));
+        let mut st = SseState::default();
+        assert!(handle_sse_line(": comment", &"t".into(), &mut st, &|_| {
+            panic!()
+        }));
+        assert!(handle_sse_line("", &"t".into(), &mut st, &|_| panic!()));
         assert!(handle_sse_line(
             "data: {not json",
             &"t".into(),
-            &mut 0,
+            &mut st,
             &|_| panic!()
         ));
         // an event line is not data either
-        assert!(handle_sse_line(
-            "event: x",
-            &"t".into(),
-            &mut 0,
-            &|_| panic!()
-        ));
+        assert!(handle_sse_line("event: x", &"t".into(), &mut st, &|_| {
+            panic!()
+        }));
+    }
+
+    #[test]
+    fn elastic_vram_parse() {
+        use std::str::FromStr;
+        assert_eq!(ElasticVram::from_str("auto").unwrap(), ElasticVram::Auto);
+        assert_eq!(ElasticVram::from_str("AUTO").unwrap(), ElasticVram::Auto);
+        assert_eq!(ElasticVram::from_str("0").unwrap(), ElasticVram::MiB(0));
+        assert_eq!(
+            ElasticVram::from_str("12").unwrap(),
+            ElasticVram::MiB(12288)
+        );
+        assert_eq!(
+            ElasticVram::from_str("7.5").unwrap(),
+            ElasticVram::MiB(7680)
+        );
+        assert!(ElasticVram::from_str("garbage").is_err());
+        assert!(ElasticVram::from_str("-1").is_err());
+        assert!(ElasticVram::from_str("").is_err());
+    }
+
+    #[test]
+    fn stream_lines_collects_warning_and_split() {
+        let buf: Vec<String> = [
+            "stream-weights: warning: 100 MiB free".to_string(),
+            "stream-weights: resident layers 0/28 (0 MiB resident, 743 MiB streamed per token)"
+                .to_string(),
+            "not a stream line".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            stream_lines(&buf),
+            vec![
+                "stream-weights: warning: 100 MiB free".to_string(),
+                "stream-weights: resident layers 0/28 (0 MiB resident, 743 MiB streamed per token)"
+                    .to_string(),
+            ]
+        );
+        assert!(stream_lines(&[]).is_empty());
     }
 
     #[test]
@@ -1115,6 +1315,7 @@ mod unix_tests {
                 "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n",
                 "data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n",
                 "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":2}}\n",
                 "data: [DONE]\n",
             ] {
                 s.write_all(chunked(p).as_bytes()).unwrap();
@@ -1129,6 +1330,7 @@ mod unix_tests {
         let last = &chunks.last().unwrap().1;
         assert!(last.is_final);
         assert_eq!(last.finish_reason, Some(FinishReason::Stop));
+        assert_eq!(last.prompt_tokens, Some(11));
         server.join().unwrap();
     }
 
@@ -1204,6 +1406,7 @@ mod unix_tests {
             ctx: 128,
             ngl: 0,
             elastic: false,
+            elastic_vram: ElasticVram::Auto,
             extra_args: vec![],
             load_timeout: Some(Duration::from_secs(1)),
             load_retries: retries,

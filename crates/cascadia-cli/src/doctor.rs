@@ -14,9 +14,10 @@
 //! `--features openvino`, the `INTEL_OPENVINO_DIR` env, and enumerates
 //! the OV devices the runtime can actually reach.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::Result;
+use cascadia_engine_llamacpp::{probe_stream_weights, resolve_llama_bin, StreamWeightsSupport};
 use clap::Parser;
 
 /// Run environment + hardware checks and print a readable report.
@@ -88,6 +89,86 @@ fn first_line_of(cmd: &str, arg: &str) -> Option<String> {
         String::from_utf8_lossy(&out.stderr)
     };
     text.lines().next().map(|l| l.trim().to_string())
+}
+
+/// Run `<bin> <arg>` capturing stdout+stderr, with a hard timeout so a
+/// hung binary can't wedge the report. Returns the trimmed output (stderr
+/// included so loader errors like a missing shared library show up).
+fn run_capturing(bin: &std::path::Path, arg: &str, secs: u64) -> Result<String, String> {
+    let mut child = Command::new(bin)
+        .arg(arg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn failed: {e}"))?;
+    for _ in 0..secs * 10 {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let out = child.wait_with_output().map_err(|e| e.to_string())?;
+                let text = String::from_utf8_lossy(if !out.stdout.is_empty() {
+                    &out.stdout
+                } else {
+                    &out.stderr
+                });
+                return Ok(text.trim().to_string());
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let _ = child.kill();
+    Err(format!("timed out after {secs} s"))
+}
+
+/// sycl-llama: is there a usable llama-server, does it have the
+/// weight-streaming patch, and which SYCL devices does it see.
+fn check_sycl_llama(r: &mut Report) {
+    let bin = match resolve_llama_bin(
+        None,
+        std::env::var_os("CASCADIA_LLAMA_BIN"),
+        std::env::var_os("PATH"),
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            // Optional engine: a missing binary is a note, not a failure.
+            r.line(Level::Info, "llama-server", "not found");
+            r.note(&format!("{e} (needed only for `--engine sycl-llama`)"));
+            return;
+        }
+    };
+    r.line(Level::Ok, "llama-server", &format!("{}", bin.display()));
+
+    match run_capturing(&bin, "--version", 10) {
+        Ok(v) if v.contains("shared libraries") || v.contains("error while loading") => {
+            r.line(Level::Warn, "llama-server --version", &v);
+            r.note("oneAPI runtime missing: `source /opt/intel/oneapi/setvars.sh` before launching cascadia");
+        }
+        Ok(v) => r.line(Level::Ok, "llama-server --version", &v),
+        Err(e) => r.line(Level::Warn, "llama-server --version", &e),
+    }
+
+    match probe_stream_weights(&bin) {
+        Ok(StreamWeightsSupport::Present) => {
+            r.line(Level::Ok, "weight streaming", "supported (--elastic works)")
+        }
+        Ok(StreamWeightsSupport::Unknown) => r.line(
+            Level::Info,
+            "weight streaming",
+            "could not verify (no libggml-base next to the binary)",
+        ),
+        Err(e) => r.line(Level::Warn, "weight streaming", &e),
+    }
+
+    match run_capturing(&bin, "--list-devices", 10) {
+        Ok(devs) if !devs.is_empty() => {
+            r.line(Level::Ok, "llama-server devices", "");
+            for l in devs.lines().take(10) {
+                r.note(l);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn check_rust(r: &mut Report) {
@@ -343,6 +424,9 @@ pub fn cmd_doctor(args: DoctorArgs) -> Result<()> {
     check_openvino_env(&mut r);
     check_ov_version(&mut r);
     check_ov_devices(&mut r);
+
+    println!("\nsycl-llama:");
+    check_sycl_llama(&mut r);
 
     println!();
     match r.worst {
