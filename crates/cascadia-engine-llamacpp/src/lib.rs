@@ -259,6 +259,10 @@ impl LlamaCppEngine {
                 "max_tokens": task.max_tokens,
                 "temperature": task.temperature,
                 "stream": true,
+                // Relay the API-resolved thinking toggle to the child's own
+                // template (Qwen-style templates read enable_thinking;
+                // others ignore the unused kwarg).
+                "chat_template_kwargs": {"enable_thinking": task.enable_thinking},
             });
             ("/v1/chat/completions", body)
         };
