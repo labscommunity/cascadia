@@ -3,8 +3,8 @@
 //! Mirrors `cascadia/worker/runner.py`. Lifecycle:
 //!
 //! 1. [`Runner::start`] — connect transport, load weights, build engine, warm up.
-//! 2a. (first stage)  [`Runner::generate`] — submit task and stream chunks.
-//! 2b. (other stages) [`Runner::run_relay_loop`] — drive engine forever.
+//!    2a. (first stage)  [`Runner::generate`] — submit task and stream chunks.
+//!    2b. (other stages) [`Runner::run_relay_loop`] — drive engine forever.
 //! 3. [`Runner::close`].
 //!
 //! `generate()` is safe to call concurrently. Each call shares the engine

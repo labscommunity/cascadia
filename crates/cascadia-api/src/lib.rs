@@ -1310,6 +1310,7 @@ fn chat_template_smoke_failures(
     let multi_turn = [m("user", "hi"), m("assistant", "hello"), m("user", "more")];
     let round_trip = [m("user", "weather in Paris?"), call, tool_reply];
 
+    #[allow(clippy::type_complexity)]
     let cases: [(&'static str, &[ChatMessage], Option<&[Tool]>, bool); 7] = [
         ("plain", &plain, None, true),
         ("system", &with_system, None, true),

@@ -154,8 +154,8 @@ fn arm_death_guard(cmd: &mut Command) {
 /// is created once and never exits: it is what makes PR_SET_PDEATHSIG mean
 /// "when cascadia dies" instead of "when the calling thread dies".
 #[cfg(target_os = "linux")]
-fn spawn_on_parent_thread(mut cmd: Command) -> std::io::Result<Child> {
-    use std::io::{Error, ErrorKind};
+fn spawn_on_parent_thread(cmd: Command) -> std::io::Result<Child> {
+    use std::io::Error;
     use std::sync::mpsc::{channel, Sender};
     use std::sync::OnceLock;
     type Job = (Command, Sender<std::io::Result<Child>>);
@@ -167,11 +167,9 @@ fn spawn_on_parent_thread(mut cmd: Command) -> std::io::Result<Child> {
             .spawn(move || {
                 while let Ok((mut cmd, reply)) = rx.recv() {
                     let r = cmd.spawn();
-                    if let Err(std::sync::mpsc::SendError(r)) = reply.send(r) {
-                        // caller went away; don't leak the child
-                        if let Ok(mut c) = r {
-                            let _ = c.kill();
-                        }
+                    // caller went away; don't leak the child
+                    if let Err(std::sync::mpsc::SendError(Ok(mut c))) = reply.send(r) {
+                        let _ = c.kill();
                     }
                 }
             })
@@ -180,10 +178,10 @@ fn spawn_on_parent_thread(mut cmd: Command) -> std::io::Result<Child> {
     });
     let (reply_tx, reply_rx) = channel();
     tx.send((cmd, reply_tx))
-        .map_err(|_| Error::new(ErrorKind::Other, "child spawner thread gone"))?;
+        .map_err(|_| Error::other("child spawner thread gone"))?;
     reply_rx
         .recv()
-        .map_err(|_| Error::new(ErrorKind::Other, "child spawner thread gone"))?
+        .map_err(|_| Error::other("child spawner thread gone"))?
 }
 
 #[cfg(not(target_os = "linux"))]
