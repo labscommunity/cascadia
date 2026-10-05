@@ -288,6 +288,14 @@ pub struct WorkerArgs {
     #[arg(long, allow_hyphen_values = true, value_delimiter = ' ')]
     pub llama_args: Vec<String>,
 
+    /// Experimental (sycl-llama): regex of layer tensors to keep in pinned
+    /// host memory that the GPU reads in place, e.g. `blk\.(6[2-4])\..*`.
+    /// Needs a llama-server built with patch 0003. Discrete cards: the
+    /// overflow is read over the link each token instead of streamed; UMA
+    /// iGPUs: slower than device placement, frees no device memory.
+    #[arg(long, value_name = "REGEX")]
+    pub llama_host_layers: Option<String>,
+
     /// Per-attempt health deadline for the spawned llama-server, in
     /// seconds. Default: auto = 60 + 8 per GiB of model file (300 when the
     /// file is unreadable). sycl-llama only.
@@ -827,6 +835,11 @@ pub struct RunArgs {
     #[arg(long, allow_hyphen_values = true, value_delimiter = ' ')]
     pub llama_args: Vec<String>,
 
+    /// Experimental (sycl-llama): regex of layer tensors kept in pinned host
+    /// memory the GPU reads in place (needs patch 0003; see --llama-args).
+    #[arg(long, value_name = "REGEX")]
+    pub llama_host_layers: Option<String>,
+
     /// Per-attempt llama-server health deadline (seconds). Default: auto =
     /// 60 + 8 per GiB of model file. sycl-llama only.
     #[arg(long, value_name = "SECS")]
@@ -931,6 +944,7 @@ impl WorkerArgs {
             llama_ctx: 4096,
             llama_ngl: 99,
             llama_args: Vec::new(),
+            llama_host_layers: None,
             llama_load_timeout: None,
             llama_load_retries: 1,
             elastic_vram: ElasticVram::Auto,
@@ -1198,6 +1212,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     worker.llama_ctx = args.llama_ctx;
     worker.llama_ngl = args.llama_ngl;
     worker.llama_args = args.llama_args;
+    worker.llama_host_layers = args.llama_host_layers;
     worker.llama_load_timeout = args.llama_load_timeout;
     worker.llama_load_retries = args.llama_load_retries;
     worker.elastic_vram = args.elastic_vram;
@@ -1880,7 +1895,7 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
                 ngl: args.llama_ngl,
                 elastic: args.elastic,
                 elastic_vram: args.elastic_vram,
-                host_layers: None,
+                host_layers: args.llama_host_layers.clone(),
                 extra_args,
                 load_timeout: args.llama_load_timeout.map(std::time::Duration::from_secs),
                 load_retries: args.llama_load_retries,
