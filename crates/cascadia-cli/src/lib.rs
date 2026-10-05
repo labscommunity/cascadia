@@ -1122,9 +1122,15 @@ impl OvExecutionMode {
 /// so `main` can call it while the process is still single-threaded — env
 /// mutation and `execv` are only safe there.
 pub fn activate_elastic_if_requested(cli: &Cli) {
+    // sycl-llama's --elastic is the child's own device-side streaming
+    // (GGML_STREAM_WEIGHTS); the host interposer would only intercept the
+    // tiny cascadia parent's allocations and must not be inherited by
+    // llama-server (its staging buffer needs plain anonymous pages).
     let (min_mb, pool_mb) = match &cli.cmd {
-        Command::Worker(a) if a.elastic => (a.elastic_min_mb, a.elastic_pool_mb),
-        Command::Run(a) if a.elastic => (1, 8192),
+        Command::Worker(a) if a.elastic && a.engine != EngineKind::SyclLlama => {
+            (a.elastic_min_mb, a.elastic_pool_mb)
+        }
+        Command::Run(a) if a.elastic && a.engine != EngineKind::SyclLlama => (1, 8192),
         _ => return,
     };
     if cascadia_elastic::is_active() {

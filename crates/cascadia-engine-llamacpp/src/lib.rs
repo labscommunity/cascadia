@@ -207,8 +207,7 @@ impl Drop for ChildJob {
 /// side of the posture, its staging buffer must stay plain anonymous memory
 /// (Level Zero cannot memcpy from file-mapped pages), and the interposer
 /// would build a second retention pool in the child.
-const HOST_ELASTIC_ENV: [&str; 6] = [
-    "LD_PRELOAD",
+const HOST_ELASTIC_ENV: [&str; 5] = [
     "CASCADIA_ELASTIC_ACTIVE",
     "ELASTIC_DIR",
     "ELASTIC_MIN_MB",
@@ -224,6 +223,28 @@ const HOST_ELASTIC_ENV: [&str; 6] = [
 fn scrub_child_env(cmd: &mut Command, elastic: bool) {
     for k in HOST_ELASTIC_ENV {
         cmd.env_remove(k);
+    }
+    // LD_PRELOAD: strip only cascadia's interposer entries (the private
+    // libcascadia_elastic.<pid>.so activate() prepends); a user's own
+    // preloads still reach the child, and the var drops only when nothing
+    // remains.
+    if let Some(v) = std::env::var_os("LD_PRELOAD") {
+        let kept: Vec<String> = v
+            .to_string_lossy()
+            .split(':')
+            .filter(|e| {
+                !e.is_empty()
+                    && !Path::new(e)
+                        .file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with("libcascadia_elastic."))
+            })
+            .map(str::to_string)
+            .collect();
+        if kept.is_empty() {
+            cmd.env_remove("LD_PRELOAD");
+        } else {
+            cmd.env("LD_PRELOAD", kept.join(":"));
+        }
     }
     if !elastic {
         cmd.env_remove("GGML_STREAM_WEIGHTS");
@@ -1978,11 +1999,34 @@ mod unix_tests {
         scrub_child_env(&mut on, true);
         on.env("GGML_STREAM_WEIGHTS", "1");
         let r = removed(&on);
-        assert!(r.iter().any(|x| x == "LD_PRELOAD"), "{r:?}");
         assert!(
             !r.iter().any(|x| x == "GGML_STREAM_RESIDENT_LAYERS"),
             "{r:?}"
         );
+        // LD_PRELOAD keeps user entries and drops only cascadia's
+        // interposer; the var goes away entirely when the interposer was
+        // the only entry.
+        std::env::set_var(
+            "LD_PRELOAD",
+            "/tmp/libcascadia_elastic.42.so:/opt/user/libmine.so",
+        );
+        let mut filtered = Command::new("true");
+        scrub_child_env(&mut filtered, true);
+        let v = filtered
+            .get_envs()
+            .find(|(k, _)| *k == "LD_PRELOAD")
+            .and_then(|(_, v)| v)
+            .unwrap();
+        assert_eq!(v.to_string_lossy(), "/opt/user/libmine.so");
+        std::env::set_var("LD_PRELOAD", "/tmp/libcascadia_elastic.42.so");
+        let mut only = Command::new("true");
+        scrub_child_env(&mut only, true);
+        assert!(
+            only.get_envs()
+                .any(|(k, v)| k == "LD_PRELOAD" && v.is_none()),
+            "interposer-only LD_PRELOAD must be removed entirely"
+        );
+        std::env::remove_var("LD_PRELOAD");
         let set: Vec<(String, String)> = on
             .get_envs()
             .filter_map(|(k, v)| {
