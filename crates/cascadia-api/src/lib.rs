@@ -2324,9 +2324,9 @@ async fn chat_completions(
         .iter()
         .map(|m| {
             m.content.len()
-                + m.tool_calls.as_ref().map_or(0, |cs| {
-                    serde_json::to_string(cs).map_or(0, |s| s.len())
-                })
+                + m.tool_calls
+                    .as_ref()
+                    .map_or(0, |cs| serde_json::to_string(cs).map_or(0, |s| s.len()))
                 + m.tool_call_id.as_ref().map_or(0, String::len)
                 + m.name.as_ref().map_or(0, String::len)
         })

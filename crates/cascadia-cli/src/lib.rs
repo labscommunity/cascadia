@@ -12,8 +12,7 @@ use anyhow::{anyhow, Context, Result};
 use cascadia_engine::Builder;
 use cascadia_engine_llamacpp::{
     probe_stream_weights, resolve_llama_bin, validate_extra_args, ElasticVram, LlamaCppBuilder,
-    LlamaCppConfig,
-    StreamWeightsSupport,
+    LlamaCppConfig, StreamWeightsSupport,
 };
 use cascadia_engine_mock::MockBuilder;
 use cascadia_engine_openvino::{

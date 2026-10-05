@@ -126,8 +126,14 @@ fn run_capturing(bin: &std::path::Path, arg: &str, secs: u64) -> Result<String, 
         match child.try_wait() {
             Ok(Some(_)) => {
                 let _ = child.wait();
-                let out = stdout.take().and_then(|t| t.join().ok()).unwrap_or_default();
-                let err = stderr.take().and_then(|t| t.join().ok()).unwrap_or_default();
+                let out = stdout
+                    .take()
+                    .and_then(|t| t.join().ok())
+                    .unwrap_or_default();
+                let err = stderr
+                    .take()
+                    .and_then(|t| t.join().ok())
+                    .unwrap_or_default();
                 let text = String::from_utf8_lossy(if !out.is_empty() { &out } else { &err });
                 return Ok(text.trim().to_string());
             }
@@ -503,7 +509,8 @@ mod tests {
     /// the capture: both pipes drain from the start on their own threads.
     #[test]
     fn run_capturing_drains_output_larger_than_the_pipe() {
-        let (_dir, f) = script("#!/bin/sh\nhead -c 200000 /dev/zero | tr '\\0' 'x'\necho err >&2\n");
+        let (_dir, f) =
+            script("#!/bin/sh\nhead -c 200000 /dev/zero | tr '\\0' 'x'\necho err >&2\n");
         let out = run_capturing(&f, "", 10).expect("large output captured");
         assert_eq!(out.len(), 200000);
         assert!(out.chars().all(|c| c == 'x'));

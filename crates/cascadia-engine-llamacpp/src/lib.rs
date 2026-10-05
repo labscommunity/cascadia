@@ -504,12 +504,21 @@ type StreamLines = Arc<Mutex<Vec<String>>>;
 /// Each entry maps the reserved flag to the cascadia-side way to say it.
 const RESERVED_LLAMA_ARGS: &[(&str, &str)] = &[
     ("-m", "the model comes from the positional MODEL argument"),
-    ("--model", "the model comes from the positional MODEL argument"),
+    (
+        "--model",
+        "the model comes from the positional MODEL argument",
+    ),
     ("-mu", "the model comes from the positional MODEL argument"),
-    ("--model-url", "the model comes from the positional MODEL argument"),
+    (
+        "--model-url",
+        "the model comes from the positional MODEL argument",
+    ),
     ("-hf", "the model comes from the positional MODEL argument"),
     ("-hfr", "the model comes from the positional MODEL argument"),
-    ("--hf-repo", "the model comes from the positional MODEL argument"),
+    (
+        "--hf-repo",
+        "the model comes from the positional MODEL argument",
+    ),
     ("--host", "the engine binds 127.0.0.1 itself"),
     ("--port", "the engine picks a free loopback port itself"),
     ("--device", "use cascadia --device instead"),
@@ -527,9 +536,7 @@ pub fn validate_extra_args(extra_args: &[String]) -> Result<(), String> {
     for arg in extra_args {
         for (reserved, hint) in RESERVED_LLAMA_ARGS {
             if arg == reserved || arg.starts_with(&format!("{reserved}=")) {
-                return Err(format!(
-                    "--llama-args '{arg}' shadows '{reserved}': {hint}"
-                ));
+                return Err(format!("--llama-args '{arg}' shadows '{reserved}': {hint}"));
             }
         }
     }
@@ -615,8 +622,8 @@ impl LlamaCppBuilder {
             cmd.arg(a);
         }
         #[cfg(target_os = "linux")]
-        let mut child = spawn_on_parent_thread(cmd)
-            .map_err(|e| format!("spawn llama-server: {e}"))?;
+        let mut child =
+            spawn_on_parent_thread(cmd).map_err(|e| format!("spawn llama-server: {e}"))?;
         #[cfg(not(target_os = "linux"))]
         let mut child = cmd
             .spawn()
@@ -1029,7 +1036,10 @@ impl LlamaCppEngine {
             // Clean EOF without a [DONE] line: deliver a pending final so
             // finish_reason/usage still reach the caller.
             for block in st.tool_call_blocks() {
-                send(Ok((tid.clone(), Chunk::token(tid.clone(), st.token_id, block))));
+                send(Ok((
+                    tid.clone(),
+                    Chunk::token(tid.clone(), st.token_id, block),
+                )));
             }
             if !st.sent_final && st.finish_reason.is_some() {
                 let mut c = Chunk::token(tid.clone(), st.token_id, "");
@@ -1128,7 +1138,10 @@ fn handle_sse_line(
         // Emit any assembled tool calls as text just before the final
         // chunk so the API's tool-call machinery sees them in-order.
         for block in st.tool_call_blocks() {
-            send(Ok((tid.clone(), Chunk::token(tid.clone(), st.token_id, block))));
+            send(Ok((
+                tid.clone(),
+                Chunk::token(tid.clone(), st.token_id, block),
+            )));
         }
         let mut c = Chunk::token(tid.clone(), st.token_id, "");
         c.is_final = true;
@@ -1686,8 +1699,11 @@ mod tests {
 
         // Windows-style names: ggml-sycl.dll / ggml-base.dll
         std::fs::remove_file(dir.path().join("libggml-sycl.so.0.19.0")).unwrap();
-        std::fs::write(dir.path().join("ggml-sycl.dll"), b"lib GGML_STREAM_EXPERT_CACHE_MB")
-            .unwrap();
+        std::fs::write(
+            dir.path().join("ggml-sycl.dll"),
+            b"lib GGML_STREAM_EXPERT_CACHE_MB",
+        )
+        .unwrap();
         assert!(probe_expert_streaming(&bin));
         std::fs::remove_file(dir.path().join("ggml-sycl.dll")).unwrap();
         assert!(!probe_expert_streaming(&bin));
@@ -2009,10 +2025,7 @@ mod unix_tests {
             !state.is_empty() && !state.contains('Z'),
             "child {pid} did not survive the caller thread: {state}"
         );
-        let _ = Command::new("kill")
-            .arg("-9")
-            .arg(pid.to_string())
-            .output();
+        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
     }
 
     /// The host interposer's environment (#132) never reaches the child,
