@@ -29,20 +29,25 @@ if [ ! -d "$DEST/.git" ]; then
 fi
 cd "$DEST"
 git checkout "$LLAMA_BASE"
-# apply the chain in order; a patch that fails --check may already be applied
-# (idempotent reruns) - each patch must be proven by its own marker, so a
-# missing 0002 cannot hide behind 0001's marker
+# apply the chain in order (idempotent reruns): skip a patch only when its
+# own marker already proves it applied - a missing 0002 cannot hide behind
+# 0001's marker - otherwise verify it applies, apply it, and abort on any
+# failure rather than building a silently unpatched tree
 for SPEC in "${PATCHES[@]}"; do
     PATCH="${SPEC%%:*}"
     REST="${SPEC#*:}"
     MARKER_FILE="${REST%%:*}"
     MARKER="${REST#*:}"
-    if git apply --check "$PATCH" 2>/dev/null; then
-        git apply "$PATCH"
-    elif grep -q "$MARKER" "$MARKER_FILE" 2>/dev/null; then
+    if grep -q "$MARKER" "$MARKER_FILE" 2>/dev/null; then
         echo "patch $(basename "$PATCH") already applied; continuing"
-    else
+        continue
+    fi
+    if ! git apply --check "$PATCH"; then
         echo "ERROR: $(basename "$PATCH") does not apply to $LLAMA_BASE and its marker is absent" >&2
+        exit 1
+    fi
+    if ! git apply "$PATCH"; then
+        echo "ERROR: $(basename "$PATCH") failed to apply to $LLAMA_BASE" >&2
         exit 1
     fi
 done
@@ -62,10 +67,14 @@ cmake -B build \
 cmake --build build --target llama-server -j "$JOBS"
 
 BIN="$DEST/build/bin/llama-server"
-if ! grep -l GGML_STREAM_WEIGHTS "$DEST"/build/bin/libggml-base* >/dev/null 2>&1; then
-    echo "ERROR: GGML_STREAM_WEIGHTS marker not found in libggml-base — patch missing?" >&2
+if ! grep -l GGML_STREAM_WEIGHTS "$BIN" "$DEST"/build/bin/libggml-base* >/dev/null 2>&1; then
+    echo "ERROR: GGML_STREAM_WEIGHTS marker not found in the build output — patch 0001 missing?" >&2
+    exit 1
+fi
+if ! grep -l GGML_STREAM_EXPERT_CACHE_MB "$BIN" "$DEST"/build/bin/libggml-sycl* >/dev/null 2>&1; then
+    echo "ERROR: GGML_STREAM_EXPERT_CACHE_MB marker not found in the build output — patch 0002 missing?" >&2
     exit 1
 fi
 echo
-echo "built: $BIN (weight-streaming marker verified in libggml-base)"
+echo "built: $BIN (markers verified: GGML_STREAM_WEIGHTS, GGML_STREAM_EXPERT_CACHE_MB)"
 echo "export CASCADIA_LLAMA_BIN=\"$BIN\""
