@@ -150,6 +150,24 @@ from the defaults.
 the GPU, the rest stream from the GGUF every token. `auto` picks N from the
 device's free memory; `0` streams everything.
 
+**Integrated GPUs (UMA — Arc 140V/140T, B390, laptop iGPUs):** keep `auto`.
+There is no separate VRAM to budget: the driver accounts every
+GPU-visible allocation, pinned host memory included, in one pool, and
+streaming moves the model within the same DRAM at about 2 GB/s — on a
+B390 a 7B Q4 drops from 10.4 to 0.52 tok/s fully streamed, and the
+half-resident point costs 9× to free 27 % of the pool. Treat streaming
+on an iGPU as a parking mode for a model that must stay loadable but is
+not serving. Measurements and the reason (no system USM on these parts):
+[`perf/sycl-elastic/placement-b390.md`](../perf/sycl-elastic/placement-b390.md).
+
+**Discrete cards, experimental alternative to streaming the overflow:**
+`--llama-host-layers '<regex>'` keeps the matching layer tensors in
+pinned host memory that the GPU reads in place every token (patch 0003,
+applied by the build scripts). The overflow then costs link bandwidth
+with stable pointers — fused ops and graphs stay on — instead of a
+file → staging → copy per tensor. Not yet measured on a discrete card;
+the commands are in the same note.
+
 Measured sweep (32 GB Arc Pro B70, `-c 4096`, KV q8_0, `-fa on`):
 
 | `--elastic-vram` | resident layers | streamed per token | peak VRAM | decode |
