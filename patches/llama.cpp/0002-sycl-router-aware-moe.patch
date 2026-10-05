@@ -1,10 +1,8 @@
-From: SergiioB <sergiobarrientose@outlook.com>
-Subject: [PATCH 2/2] sycl: router-aware MoE expert streaming (automatic)
-
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 799e06a94..d673cb162 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -30,10 +30,12 @@
- #include <stdio.h>
+@@ -31,6 +31,8 @@
  #include <stdlib.h>
  #include <regex>
  #include <unordered_map>
@@ -13,10 +11,7 @@ Subject: [PATCH 2/2] sycl: router-aware MoE expert streaming (automatic)
  #ifdef _WIN32
  #include <io.h>
  #else
- #include <unistd.h>
- #endif
- 
-@@ -4408,7 +4407,26 @@
+@@ -4408,7 +4410,26 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
      }
  }
  
@@ -43,7 +38,7 @@ Subject: [PATCH 2/2] sycl: router-aware MoE expert streaming (automatic)
      return g_ggml_sycl_enable_optimize && //allow optimize, controlled by $GGML_SYCL_ENABLE_OPT
             ctx.opt_feature.reorder &&      //allow this device due to good perf, skip the devices with bad perf.
             dst->op == GGML_OP_MUL_MAT &&   //limit to some supported cases of Q4_0, to do for more cases.
-@@ -4780,6 +4798,266 @@
+@@ -4780,6 +4801,266 @@ static void mmid_counting_sort_rows(
      }
  }
  
@@ -310,7 +305,7 @@ Subject: [PATCH 2/2] sycl: router-aware MoE expert streaming (automatic)
  static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                   ggml_tensor *dst) try {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
-@@ -4795,11 +5073,28 @@
+@@ -4795,11 +5076,28 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
      const int64_t n_as = ne02;
      const int64_t n_ids = ids->ne[0];
  
@@ -340,7 +335,7 @@ Subject: [PATCH 2/2] sycl: router-aware MoE expert streaming (automatic)
  
      std::vector<char> ids_host(ggml_nbytes(ids));
      const char * ids_dev = (const char *) ids->data;
-@@ -4845,7 +5140,7 @@
+@@ -4845,7 +5143,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                  const int64_t i1 = id;
                  const int64_t i2 = i12;
  
@@ -349,7 +344,7 @@ Subject: [PATCH 2/2] sycl: router-aware MoE expert streaming (automatic)
              src1_row.data = src1_original + i11*nb11 + i12*nb12;
              dst_row.data = dst_original + i1*nb1 + i2*nb2;
  
-@@ -4907,7 +5202,7 @@
+@@ -4907,7 +5205,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
  
              const int64_t expert_row_offset = expert_row_offsets[i02];
  
@@ -358,7 +353,7 @@ Subject: [PATCH 2/2] sycl: router-aware MoE expert streaming (automatic)
  
              GGML_ASSERT(nb11 == sizeof(float)*ne10);
              GGML_ASSERT(nb1 == sizeof(float)*ne0);
-@@ -4947,6 +5242,7 @@
+@@ -4947,6 +5245,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
              });
          }
      }
@@ -366,7 +361,7 @@ Subject: [PATCH 2/2] sycl: router-aware MoE expert streaming (automatic)
  }
  catch (sycl::exception const &exc) {
    std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-@@ -5673,7 +5969,10 @@
+@@ -5673,7 +5972,10 @@ static bool ggml_sycl_stream_build(sycl_stream_pool & sw, ggml_backend_buffer_t
      std::vector<const ggml_tensor *> ts;
      std::vector<ggml_stream_src>     recs;
      for (int i = 0; i < n0; i++) {
@@ -378,7 +373,7 @@ Subject: [PATCH 2/2] sycl: router-aware MoE expert streaming (automatic)
              ts.push_back(ts0[i]);
              recs.push_back(recs0[i]);
          }
-@@ -5811,6 +6090,9 @@
+@@ -5811,6 +6113,9 @@ static void ggml_sycl_stream_node(ggml_backend_sycl_context * sycl_ctx, const gg
          while (s->view_src != nullptr) {
              s = s->view_src;
          }
@@ -388,7 +383,7 @@ Subject: [PATCH 2/2] sycl: router-aware MoE expert streaming (automatic)
          const ggml_stream_src * rec = ggml_stream_find(s);
          if (rec == nullptr || s->buffer == nullptr || !ggml_backend_buffer_is_sycl(s->buffer)) {
              continue;
-@@ -5839,6 +6121,35 @@
+@@ -5839,6 +6144,35 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
      ggml_sycl_set_main_device(sycl_ctx->device);
      const bool stream_weights = ggml_stream_weights_enabled();
  

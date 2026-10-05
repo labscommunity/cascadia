@@ -1,8 +1,8 @@
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index cc3f8cd..1fa6ec2 100644
+index cc3f8cd36..67cd5d3f4 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -432,6 +432,30 @@ extern "C" {
+@@ -432,6 +432,39 @@ extern "C" {
      GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
      GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
  
@@ -26,6 +26,15 @@ index cc3f8cd..1fa6ec2 100644
 +    GGML_API void ggml_stream_set_resident_layers(int n);
 +    // turn streaming off entirely (model fits); re-enables fusion/graphs
 +    GGML_API void ggml_stream_disable(void);
++    // the loader plans which tensors stream (by name, before buffers are
++    // allocated); only planned tensors get a zero-size allocation. A tensor
++    // the loader never saw (a LoRA adapter, a control vector) is allocated
++    // and uploaded normally even if its name looks like a layer weight.
++    GGML_API void ggml_stream_plan(const char * name);
++    GGML_API void ggml_stream_plan_reset(void);
++    // one dup()'d descriptor per source file, shared by every streamed tensor
++    // read from it (pread carries its own offset); throws on failure
++    GGML_API int  ggml_stream_dup_fd(int file_fd);
 +    GGML_API void ggml_stream_register(struct ggml_tensor * tensor, const void * host_ptr, int fd, size_t file_off);
 +    GGML_API const struct ggml_stream_src * ggml_stream_find(const struct ggml_tensor * tensor);
 +    GGML_API int  ggml_stream_snapshot(const struct ggml_tensor ** tensors, struct ggml_stream_src * recs, int max_n);
@@ -34,19 +43,28 @@ index cc3f8cd..1fa6ec2 100644
  }
  #endif
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index f6fb917..2def496 100644
+index f6fb91798..068f87c4b 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -20,6 +20,8 @@
+@@ -20,6 +20,17 @@
  #include <stdlib.h>
  #include <string.h>
  #include <algorithm>
 +#include <mutex>
 +#include <unordered_map>
++#include <unordered_set>
++#ifdef _WIN32
++#include <io.h>
++#else
++#include <unistd.h>
++#endif
++#include <stdexcept>
++#include <cstring>
++#include <cerrno>
  #include <vector>
  
  #ifdef __APPLE__
-@@ -2429,3 +2431,113 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size)
+@@ -2429,3 +2440,154 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size)
      GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
      return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
  }
@@ -113,6 +131,46 @@ index f6fb917..2def496 100644
 +
 +static std::unordered_map<const ggml_tensor *, ggml_stream_src> g_stream_map;
 +static std::mutex g_stream_mu;
++static std::unordered_set<std::string> g_stream_planned;
++static std::unordered_map<int, int> g_stream_fds;
++
++void ggml_stream_plan(const char * name) {
++    if (name == NULL) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(g_stream_mu);
++    g_stream_planned.insert(name);
++}
++
++void ggml_stream_plan_reset(void) {
++    std::lock_guard<std::mutex> lock(g_stream_mu);
++    g_stream_planned.clear();
++    g_stream_fds.clear();
++}
++
++static bool ggml_stream_is_planned(const ggml_tensor * tensor) {
++    std::lock_guard<std::mutex> lock(g_stream_mu);
++    return g_stream_planned.count(tensor->name) != 0;
++}
++
++int ggml_stream_dup_fd(int file_fd) {
++    std::lock_guard<std::mutex> lock(g_stream_mu);
++    auto it = g_stream_fds.find(file_fd);
++    if (it != g_stream_fds.end()) {
++        return it->second;
++    }
++#ifdef _WIN32
++    const int fd = _dup(file_fd);
++#else
++    const int fd = dup(file_fd);
++#endif
++    if (fd < 0) {
++        throw std::runtime_error(std::string("stream-weights: dup() of the model file failed: ") + strerror(errno) +
++                                 " (streaming keeps one descriptor per model file; raise the open-file limit)");
++    }
++    g_stream_fds[file_fd] = fd;
++    return fd;
++}
 +
 +// true if the tensor would stream with no resident layers kept
 +bool ggml_stream_is_streamable(const ggml_tensor * tensor) {
@@ -125,7 +183,8 @@ index f6fb917..2def496 100644
 +
 +bool ggml_stream_is_weight(const ggml_tensor * tensor) {
 +    return ggml_stream_is_streamable(tensor) &&
-+           ggml_stream_parse_layer(tensor->name) >= ggml_stream_n_resident();
++           ggml_stream_parse_layer(tensor->name) >= ggml_stream_n_resident() &&
++           ggml_stream_is_planned(tensor);
 +}
 +
 +void ggml_stream_register(ggml_tensor * tensor, const void * host_ptr, int fd, size_t file_off) {
@@ -161,7 +220,7 @@ index f6fb917..2def496 100644
 +    return n;
 +}
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index d1456a8..799e06a 100644
+index d1456a867..799e06a94 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
 @@ -30,6 +30,12 @@
@@ -490,7 +549,7 @@ index d1456a8..799e06a 100644
      }
      if (use_sycl_graph) {
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 5c5e97f..a61e401 100644
+index 5c5e97fbc..69ae87c03 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -14,6 +14,12 @@
@@ -506,7 +565,7 @@ index 5c5e97f..a61e401 100644
  static const size_t kiB = 1024;
  static const size_t MiB = 1024*kiB;
  static const size_t GiB = 1024*MiB;
-@@ -1540,6 +1546,27 @@ bool llama_model_loader::load_all_data(
+@@ -1540,6 +1546,25 @@ bool llama_model_loader::load_all_data(
  
          size_t n_size = ggml_nbytes(cur);
  
@@ -518,27 +577,25 @@ index 5c5e97f..a61e401 100644
 +                                       strstr(cur_buft_name, "Host") == nullptr;
 +        if (ggml_stream_is_weight(cur) && cur_is_plain_sycl) {
 +            // the loader's files/mappings are stack-owned and die at return,
-+            // so keep an independent fd reference for the decode-time reads
-+#ifdef _WIN32
-+            const int fd = _dup(files.at(weight->idx)->file_id());
-+#else
-+            const int fd = dup(files.at(weight->idx)->file_id());
-+#endif
-+            if (fd >= 0) {
-+                ggml_stream_register(cur, nullptr, fd, weight->offs);
-+                size_done += n_size;
-+                continue;
-+            }
++            // so keep an independent descriptor for the decode-time reads:
++            // one per model file, shared by its tensors (pread carries the
++            // offset). A failed dup() throws: this tensor's buffer space is
++            // zero (get_alloc_size), so uploading it here would overwrite
++            // the next tensor's bytes.
++            const int fd = ggml_stream_dup_fd(files.at(weight->idx)->file_id());
++            ggml_stream_register(cur, nullptr, fd, weight->offs);
++            size_done += n_size;
++            continue;
 +        }
 +
          if (use_mmap) {
              const auto & mapping = mappings.at(weight->idx);
              ggml_backend_buffer_t buf_mmap = nullptr;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index c810055..4487899 100644
+index c81005505..38d052367 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -1558,6 +1558,82 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1558,6 +1558,84 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
      ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
      pimpl->mappings.reserve(ml.mappings.size());
  
@@ -549,10 +606,12 @@ index c810055..4487899 100644
 +        // per-layer streamable bytes, evaluated with everything streamable
 +        std::map<int, size_t> s_layer;
 +        size_t total_weights = 0;
++        ggml_stream_plan_reset();
 +        for (const auto & it : ml.weights_map) {
 +            const size_t nb = ggml_nbytes(it.second.tensor);
 +            total_weights += nb;
 +            if (ggml_stream_is_streamable(it.second.tensor)) {
++                ggml_stream_plan(it.first.c_str());
 +                int l = -1;
 +                if (sscanf(it.first.c_str(), "blk.%d.", &l) == 1) {
 +                    s_layer[l] += nb;
