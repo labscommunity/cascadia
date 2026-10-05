@@ -220,7 +220,7 @@ index f6fb91798..068f87c4b 100644
 +    return n;
 +}
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index d1456a867..c059c6dcf 100644
+index d1456a867..a0754be6e 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
 @@ -30,6 +30,12 @@
@@ -581,6 +581,20 @@ index d1456a867..c059c6dcf 100644
          use_sycl_graph = check_graph_compatibility(cgraph);
      }
      if (use_sycl_graph) {
+@@ -5849,6 +6107,13 @@ static enum ggml_backend_dev_type ggml_backend_sycl_device_get_type(ggml_backend
+     if (info.l0_device_type_valid && !info.l0_discrete_gpu) {
+         return GGML_BACKEND_DEVICE_TYPE_IGPU;
+     }
++    // no Level Zero device properties on this build/driver: an integrated
++    // GPU still reports host_unified_memory = true
++    if (!info.l0_device_type_valid &&
++        dpct::dev_mgr::instance().get_device(ctx->device)
++            .get_info<sycl::info::device::host_unified_memory>()) {
++        return GGML_BACKEND_DEVICE_TYPE_IGPU;
++    }
+     return GGML_BACKEND_DEVICE_TYPE_GPU;
+ }
+ 
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
 index 5c5e97fbc..69ae87c03 100644
 --- a/src/llama-model-loader.cpp

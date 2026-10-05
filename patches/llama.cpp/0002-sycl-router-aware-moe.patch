@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index c059c6dcf..2ca16ff97 100644
+index a0754be6e..d73a1ef9a 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
 @@ -31,6 +31,8 @@
