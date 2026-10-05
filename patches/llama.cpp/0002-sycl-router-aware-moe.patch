@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 799e06a94..d673cb162 100644
+index 799e06a94..5029b918b 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
 @@ -31,6 +31,8 @@
@@ -11,7 +11,24 @@ index 799e06a94..d673cb162 100644
  #ifdef _WIN32
  #include <io.h>
  #else
-@@ -4408,7 +4410,26 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
+@@ -551,11 +553,16 @@ static bool ggml_backend_buffer_is_sycl(ggml_backend_buffer_t buffer) {
+     return buffer->buft->iface.get_name == ggml_backend_sycl_buffer_type_get_name;
+ }
+ 
++// defined with the stream pool below; frees stream-weights device memory
++// bound to this buffer (slot pool, expert arenas) before the queue dies
++static void ggml_sycl_stream_buffer_teardown(ggml_backend_buffer_t buffer, queue_ptr q);
++
+ static void
+ ggml_backend_sycl_buffer_free_buffer(ggml_backend_buffer_t buffer) try {
+     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
+     ggml_sycl_set_device(ctx->device);
+ 
++    ggml_sycl_stream_buffer_teardown(buffer, ctx->stream);
+     delete ctx;
+ }
+ catch (sycl::exception const &exc) {
+@@ -4408,7 +4415,33 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
      }
  }
  
@@ -30,6 +47,13 @@ index 799e06a94..d673cb162 100644
 +// slices live in shared slot arenas whose raw file layout must be preserved
 +static bool                               g_expert_slice_guard = false;
 +
++// clears g_expert_slice_guard on every exit path, including an unwind
++// into the function-level sycl::exception catch
++struct sycl_expert_slice_guard {
++    explicit sycl_expert_slice_guard(bool v) { g_expert_slice_guard = v; }
++    ~sycl_expert_slice_guard() { g_expert_slice_guard = false; }
++};
++
 +
  static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_tensor * dst) {
 +    if (g_expert_slice_guard) {
@@ -38,7 +62,7 @@ index 799e06a94..d673cb162 100644
      return g_ggml_sycl_enable_optimize && //allow optimize, controlled by $GGML_SYCL_ENABLE_OPT
             ctx.opt_feature.reorder &&      //allow this device due to good perf, skip the devices with bad perf.
             dst->op == GGML_OP_MUL_MAT &&   //limit to some supported cases of Q4_0, to do for more cases.
-@@ -4780,6 +4801,266 @@ static void mmid_counting_sort_rows(
+@@ -4780,6 +4813,293 @@ static void mmid_counting_sort_rows(
      }
  }
  
@@ -56,6 +80,7 @@ index 799e06a94..d673cb162 100644
 +struct sycl_expert_arena {
 +    bool                 built    = false;
 +    char *               base     = nullptr;
++    ggml_backend_buffer_t buf     = nullptr; // owning weight buffer, for teardown
 +    int                  n_cache  = 0;    // LRU-resident expert slices
 +    int                  n_scratch = 0;   // window >= router top-k (distinct ids per call)
 +    int                  scr_cur  = 0;
@@ -120,6 +145,31 @@ index 799e06a94..d673cb162 100644
 +    return true;
 +}
 +
++// routed-expert count for the cache divisor: frozen at first arena build
++// from the registered stream sources (registration is done by then), not
++// from g_expert_tensors, which still grows while new graph shapes are
++// scanned. SIZE_MAX = not yet frozen; buffer teardown resets it so a
++// reloaded model re-divides on its own registration
++static size_t g_expert_n_routed = SIZE_MAX;
++static size_t sycl_expert_n_routed(void) {
++    if (g_expert_n_routed == SIZE_MAX) {
++        const int n0 = ggml_stream_snapshot(nullptr, nullptr, 0);
++        size_t n = 0;
++        if (n0 > 0) {
++            std::vector<const ggml_tensor *> ts(n0);
++            std::vector<ggml_stream_src>     recs(n0);
++            ggml_stream_snapshot(ts.data(), recs.data(), n0);
++            for (int i = 0; i < n0; i++) {
++                if (ts[i]->ne[2] > 1 && ts[i]->ne[3] == 1) {
++                    n++;
++                }
++            }
++        }
++        g_expert_n_routed = n;
++    }
++    return g_expert_n_routed;
++}
++
 +static sycl_expert_arena * sycl_expert_arena_build(const ggml_tensor * t, queue_ptr q, int n_ids) {
 +    sycl_expert_arena & a = g_earenas[t];
 +    if (a.built) {
@@ -129,10 +179,11 @@ index 799e06a94..d673cb162 100644
 +    GGML_ASSERT(rec != nullptr && "expert tensor without a registered stream source");
 +
 +    a.stride    = t->nb[2];
++    a.buf       = t->buffer;
 +    a.n_scratch = n_ids > 1 ? n_ids : 1;
 +    const size_t budget = sycl_expert_cache_bytes();
-+    if (budget > 0 && !g_expert_tensors.empty()) {
-+        a.n_cache = (int) (budget / g_expert_tensors.size() / a.stride);
++    if (budget > 0 && sycl_expert_n_routed() > 0) {
++        a.n_cache = (int) (budget / sycl_expert_n_routed() / a.stride);
 +    }
 +
 +    char * base = (char *) ggml_sycl_malloc_device((size_t) (a.n_cache + a.n_scratch) * a.stride, *q);
@@ -305,7 +356,7 @@ index 799e06a94..d673cb162 100644
  static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                   ggml_tensor *dst) try {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
-@@ -4795,11 +5076,28 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+@@ -4795,11 +5115,28 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
      const int64_t n_as = ne02;
      const int64_t n_ids = ids->ne[0];
  
@@ -331,11 +382,11 @@ index 799e06a94..d673cb162 100644
              return;
          }
      }
-+    g_expert_slice_guard = mm_expert;
++    sycl_expert_slice_guard slice_guard(mm_expert);
  
      std::vector<char> ids_host(ggml_nbytes(ids));
      const char * ids_dev = (const char *) ids->data;
-@@ -4845,7 +5143,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+@@ -4845,7 +5182,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                  const int64_t i1 = id;
                  const int64_t i2 = i12;
  
@@ -344,7 +395,7 @@ index 799e06a94..d673cb162 100644
              src1_row.data = src1_original + i11*nb11 + i12*nb12;
              dst_row.data = dst_original + i1*nb1 + i2*nb2;
  
-@@ -4907,7 +5205,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+@@ -4907,7 +5244,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
  
              const int64_t expert_row_offset = expert_row_offsets[i02];
  
@@ -353,15 +404,7 @@ index 799e06a94..d673cb162 100644
  
              GGML_ASSERT(nb11 == sizeof(float)*ne10);
              GGML_ASSERT(nb1 == sizeof(float)*ne0);
-@@ -4947,6 +5245,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
-             });
-         }
-     }
-+    g_expert_slice_guard = false;
- }
- catch (sycl::exception const &exc) {
-   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-@@ -5673,7 +5972,10 @@ static bool ggml_sycl_stream_build(sycl_stream_pool & sw, ggml_backend_buffer_t
+@@ -5673,7 +6010,10 @@ static bool ggml_sycl_stream_build(sycl_stream_pool & sw, ggml_backend_buffer_t
      std::vector<const ggml_tensor *> ts;
      std::vector<ggml_stream_src>     recs;
      for (int i = 0; i < n0; i++) {
@@ -373,7 +416,7 @@ index 799e06a94..d673cb162 100644
              ts.push_back(ts0[i]);
              recs.push_back(recs0[i]);
          }
-@@ -5811,6 +6113,9 @@ static void ggml_sycl_stream_node(ggml_backend_sycl_context * sycl_ctx, const gg
+@@ -5811,6 +6151,9 @@ static void ggml_sycl_stream_node(ggml_backend_sycl_context * sycl_ctx, const gg
          while (s->view_src != nullptr) {
              s = s->view_src;
          }
@@ -383,7 +426,45 @@ index 799e06a94..d673cb162 100644
          const ggml_stream_src * rec = ggml_stream_find(s);
          if (rec == nullptr || s->buffer == nullptr || !ggml_backend_buffer_is_sycl(s->buffer)) {
              continue;
-@@ -5839,6 +6144,35 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -5835,10 +6178,73 @@ static void ggml_sycl_stream_node(ggml_backend_sycl_context * sycl_ctx, const gg
+     }
+ }
+ 
++static void ggml_sycl_stream_buffer_teardown(ggml_backend_buffer_t buffer, queue_ptr q) {
++    auto sw = g_swpools.find(buffer);
++    if (sw != g_swpools.end()) {
++        if (sw->second.pool != nullptr) {
++            ggml_sycl_free_device(sw->second.pool, *q);
++        }
++        g_swpools.erase(sw);
++    }
++    // routed-expert arenas on this buffer die with it; compare the buffer
++    // recorded at build time - the tensors themselves may already be freed
++    std::vector<const ggml_tensor *> dead;
++    for (auto it = g_earenas.begin(); it != g_earenas.end();) {
++        if (it->second.buf == buffer) {
++            if (it->second.base != nullptr) {
++                ggml_sycl_free_device(it->second.base, *q);
++            }
++            dead.push_back(it->first);
++            it = g_earenas.erase(it);
++        } else {
++            ++it;
++        }
++    }
++    {
++        std::lock_guard<std::mutex> lock(g_expert_mu);
++        for (const ggml_tensor * t : dead) {
++            g_expert_tensors.erase(t);
++        }
++    }
++    if (g_earenas.empty()) {
++        g_expert_cfg_reported = false;
++        g_expert_n_routed     = SIZE_MAX;
++    }
++}
++
+ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
      ggml_sycl_set_main_device(sycl_ctx->device);
      const bool stream_weights = ggml_stream_weights_enabled();
  
