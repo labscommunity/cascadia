@@ -14,6 +14,7 @@
 //! `--features openvino`, the `INTEL_OPENVINO_DIR` env, and enumerates
 //! the OV devices the runtime can actually reach.
 
+use std::io::Read;
 use std::process::{Command, Stdio};
 
 use anyhow::Result;
@@ -104,22 +105,39 @@ fn run_capturing(bin: &std::path::Path, arg: &str, secs: u64) -> Result<String, 
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn failed: {e}"))?;
+    // Drain both pipes from the start on their own threads: a child that
+    // fills the ~64 KiB pipe buffer would otherwise block mid-write and
+    // never exit, deadlocking the wait loop below.
+    let mut stdout = child.stdout.take().map(|mut p| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = p.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let mut stderr = child.stderr.take().map(|mut p| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = p.read_to_end(&mut buf);
+            buf
+        })
+    });
     for _ in 0..secs * 10 {
         match child.try_wait() {
             Ok(Some(_)) => {
-                let out = child.wait_with_output().map_err(|e| e.to_string())?;
-                let text = String::from_utf8_lossy(if !out.stdout.is_empty() {
-                    &out.stdout
-                } else {
-                    &out.stderr
-                });
+                let _ = child.wait();
+                let out = stdout.take().and_then(|t| t.join().ok()).unwrap_or_default();
+                let err = stderr.take().and_then(|t| t.join().ok()).unwrap_or_default();
+                let text = String::from_utf8_lossy(if !out.is_empty() { &out } else { &err });
                 return Ok(text.trim().to_string());
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
             Err(e) => return Err(e.to_string()),
         }
     }
+    // kill() alone leaves a zombie; wait() reaps it.
     let _ = child.kill();
+    let _ = child.wait();
     Err(format!("timed out after {secs} s"))
 }
 
@@ -460,4 +478,58 @@ pub fn cmd_doctor(args: DoctorArgs) -> Result<()> {
         anyhow::bail!("doctor: --strict and one or more checks were not OK");
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    fn script(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.sh");
+        // fs::write closes the handle — exec() of a still-open-for-write
+        // file fails with ETXTBSY
+        std::fs::write(&p, body).unwrap();
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&p, perm).unwrap();
+        (dir, p)
+    }
+
+    /// A child that writes past the ~64 KiB pipe buffer must not deadlock
+    /// the capture: both pipes drain from the start on their own threads.
+    #[test]
+    fn run_capturing_drains_output_larger_than_the_pipe() {
+        let (_dir, f) = script("#!/bin/sh\nhead -c 200000 /dev/zero | tr '\\0' 'x'\necho err >&2\n");
+        let out = run_capturing(&f, "", 10).expect("large output captured");
+        assert_eq!(out.len(), 200000);
+        assert!(out.chars().all(|c| c == 'x'));
+    }
+
+    /// A child sleeping past the deadline is killed AND reaped — kill()
+    /// alone would leave it as a zombie child of this process.
+    #[test]
+    fn run_capturing_kills_and_reaps_on_timeout() {
+        let (_dir, f) = script("#!/bin/sh\nsleep 60\n");
+        let t0 = Instant::now();
+        let err = run_capturing(&f, "", 1).unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(t0.elapsed() < Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(300));
+        // An unreaped (or still-running) child is still listed among this
+        // process's children; a reaped one is gone entirely.
+        let children = Command::new("pgrep")
+            .arg("-P")
+            .arg(std::process::id().to_string())
+            .output()
+            .expect("pgrep");
+        assert!(
+            children.stdout.is_empty(),
+            "timed-out child was left behind: {}",
+            String::from_utf8_lossy(&children.stdout)
+        );
+    }
 }
