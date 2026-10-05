@@ -58,11 +58,20 @@ What streaming buys depends on whether the GPU has its own memory.
   `10.4 -> 0.52 tok/s`, while freeing ~82% of the accounted pool. The
   pinned-host variant (streamed weights mapped in-place) ran `6.3 tok/s`
   but frees nothing on UMA, and that device has no system-USM path.
+  Reproduced on a second UMA part, the Arc 140T iGPU (Arrow Lake-H,
+  Qwen2.5-7B-Instruct Q4_K_M, `-ctk/-ctv q8_0`, `-fa on`, `--parallel 1`):
+  resident `14.97 tok/s` -> half-resident (14/28 layers) `0.66` -> fully
+  streamed `0.35 tok/s`, while peak shared-memory usage dropped
+  `4628 MiB -> ~1045 MiB`.
   Recommendation: for serving use `auto` — a model that fits takes the
   stock resident path — and treat streaming as a *parking* mode (model
   kept loadable under a small footprint while other work owns the DRAM).
   The build prints `stream-weights: warning: integrated GPU (shared
-  memory): ...` whenever streaming actually activates on an iGPU.
+  memory): ...` whenever streaming actually activates on an iGPU. The
+  device is classified with the Level Zero `ZE_DEVICE_PROPERTY_FLAG_INTEGRATED`
+  property when the driver reports it, and falls back to the SYCL
+  `host_unified_memory` property on stacks where the L0 device-type probe
+  is unavailable (OpenCL-adapter Windows builds).
   The stacked PR [#172](https://github.com/labscommunity/cascadia/pull/172)
   explores `SYCL_Host` buffer placement as an alternative on UMA.
 
@@ -190,9 +199,12 @@ Guidance:
   selected experts are re-read per token (correct, ~10x faster than
   streaming every expert, still slower than resident).
 - Windows: supported. Weight slices are read with a positioned `ReadFile`
-  on the file's OS handle (no POSIX `pread`). Verified on an Arc B390 iGPU
-  (Core Ultra X7 358H, oneAPI 2026.0 + MSVC 19.44): build, streaming,
-  greedy-token parity and device-memory traces — see
+  on the file's OS handle (no POSIX `pread`). Verified on two UMA iGPUs:
+  an Arc B390 (Panther Lake, oneAPI 2026.0 + MSVC 19.44) and an Arc 140T
+  (Arrow Lake-H, same dep-pack binaries). Covered there: build,
+  streaming + partial streaming, greedy-token parity, the iGPU warning,
+  the Job Object child cleanup (`taskkill /F` and normal exit both reap
+  `llama-server.exe`), and OpenAI tool calls end to end — see
   `docs/perf/sycl-elastic/fig9_windows.png`. Pass `-c` explicitly when
   streaming: with streamed weights the default context auto-fit sees the
   freed memory as free and may pick the model's full train context (large
