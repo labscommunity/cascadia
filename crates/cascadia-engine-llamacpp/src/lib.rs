@@ -257,6 +257,26 @@ const HOST_ELASTIC_ENV: [&str; 5] = [
     "ELASTIC_SO_PATH",
 ];
 
+/// Remove cascadia's interposer entries (`libcascadia_elastic.<pid>.so`,
+/// written to TMPDIR by `cascadia_elastic::activate`) from an LD_PRELOAD
+/// value; `None` when nothing else remains.
+fn filter_ld_preload(v: &str) -> Option<String> {
+    let kept: Vec<&str> = v
+        .split(':')
+        .filter(|e| {
+            !e.is_empty()
+                && !Path::new(e)
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("libcascadia_elastic."))
+        })
+        .collect();
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join(":"))
+    }
+}
+
 /// Scrub the child's environment: the host interposer's variables never
 /// cross, and ambient `GGML_STREAM_WEIGHTS` / `GGML_STREAM_VRAM_MB` cannot
 /// stream without `--elastic` (the engine sets both itself when it is on).
@@ -271,21 +291,13 @@ fn scrub_child_env(cmd: &mut Command, elastic: bool) {
     // preloads still reach the child, and the var drops only when nothing
     // remains.
     if let Some(v) = std::env::var_os("LD_PRELOAD") {
-        let kept: Vec<String> = v
-            .to_string_lossy()
-            .split(':')
-            .filter(|e| {
-                !e.is_empty()
-                    && !Path::new(e)
-                        .file_name()
-                        .is_some_and(|n| n.to_string_lossy().starts_with("libcascadia_elastic."))
-            })
-            .map(str::to_string)
-            .collect();
-        if kept.is_empty() {
-            cmd.env_remove("LD_PRELOAD");
-        } else {
-            cmd.env("LD_PRELOAD", kept.join(":"));
+        match filter_ld_preload(&v.to_string_lossy()) {
+            Some(kept) => {
+                cmd.env("LD_PRELOAD", kept);
+            }
+            None => {
+                cmd.env_remove("LD_PRELOAD");
+            }
         }
     }
     if !elastic {
@@ -1102,8 +1114,10 @@ struct ToolCallParts {
 impl SseState {
     /// The accumulated calls re-encoded as `<tool_call>` text — the Hermes
     /// form the API's parse_tool_calls already understands — in call order.
-    fn tool_call_blocks(&self) -> Vec<String> {
-        self.tool_calls
+    /// Drains the map: the stream-end paths ([DONE] and clean EOF) can both
+    /// run, and a call must never be emitted twice.
+    fn tool_call_blocks(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.tool_calls)
             .values()
             .filter(|p| !p.name.is_empty())
             .map(|p| {
@@ -1399,6 +1413,28 @@ mod tests {
             text,
             r#"<tool_call>{"arguments":"not-json","name":"f"}</tool_call>"#
         );
+    }
+
+    /// [DONE] emits the assembled calls and drains them; the clean-EOF path
+    /// that runs next must not emit them a second time.
+    #[test]
+    fn sse_tool_calls_emit_once_across_done_and_eof() {
+        let tid = "t1".to_string();
+        let mut st = SseState::default();
+        collect(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"f","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+            &tid,
+            &mut st,
+        );
+        let (_go, out) = collect("data: [DONE]", &tid, &mut st);
+        assert_eq!(
+            out.iter()
+                .filter(|r| r.as_ref().unwrap().1.text.contains("<tool_call>"))
+                .count(),
+            1
+        );
+        // the EOF path emits whatever remains — nothing left now
+        assert!(st.tool_call_blocks().is_empty());
     }
 
     #[test]
@@ -1731,6 +1767,8 @@ mod tests {
             Duration::from_secs(300)
         );
     }
+
+    #[test]
     fn extra_args_rejects_reserved_flags() {
         for arg in [
             "-m",
@@ -2062,30 +2100,23 @@ mod unix_tests {
         );
         // LD_PRELOAD keeps user entries and drops only cascadia's
         // interposer; the var goes away entirely when the interposer was
-        // the only entry.
-        std::env::set_var(
-            "LD_PRELOAD",
-            "/tmp/libcascadia_elastic.42.so:/opt/user/libmine.so",
+        // the only entry. (Pure fn — no process-env mutation in tests.)
+        assert_eq!(
+            filter_ld_preload("/tmp/libcascadia_elastic.42.so:/opt/user/libmine.so")
+                .as_deref(),
+            Some("/opt/user/libmine.so")
         );
-        let mut filtered = Command::new("true");
-        scrub_child_env(&mut filtered, true);
-        let v = filtered
-            .get_envs()
-            .find(|(k, _)| *k == "LD_PRELOAD")
-            .and_then(|(_, v)| v)
-            .unwrap();
-        assert_eq!(v.to_string_lossy(), "/opt/user/libmine.so");
-        std::env::set_var("LD_PRELOAD", "/tmp/libcascadia_elastic.42.so");
-        let mut only = Command::new("true");
-        scrub_child_env(&mut only, true);
-        assert!(
-            only.get_envs()
-                .any(|(k, v)| k == "LD_PRELOAD" && v.is_none()),
-            "interposer-only LD_PRELOAD must be removed entirely"
+        assert_eq!(filter_ld_preload("/tmp/libcascadia_elastic.42.so"), None);
+        assert_eq!(filter_ld_preload(""), None);
+        assert_eq!(
+            filter_ld_preload("/opt/a.so:/opt/b.so").as_deref(),
+            Some("/opt/a.so:/opt/b.so")
         );
-        std::env::remove_var("LD_PRELOAD");
         let set: Vec<(String, String)> = on
             .get_envs()
+            // filtered LD_PRELOAD may or may not be set depending on the
+            // ambient value; exclude it from the owned-env assertion
+            .filter(|(k, _)| *k != "LD_PRELOAD")
             .filter_map(|(k, v)| {
                 v.map(|v| {
                     (
