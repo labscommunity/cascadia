@@ -1619,7 +1619,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let flag_bin = dir.path().join("flag-bin");
         let env_bin = dir.path().join("env-bin");
-        let path_bin = dir.path().join("llama-server");
+        let path_bin = dir.path().join(if cfg!(windows) {
+            "llama-server.exe"
+        } else {
+            "llama-server"
+        });
         for p in [&flag_bin, &env_bin, &path_bin] {
             std::fs::write(p, b"x").unwrap();
         }
