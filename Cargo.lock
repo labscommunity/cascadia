@@ -393,10 +393,12 @@ dependencies = [
  "cascadia-engine",
  "cascadia-types",
  "futures",
+ "libc",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -115,6 +115,88 @@ const STEP_POLL: Duration = Duration::from_millis(50);
 /// since the request started) fails the task.
 const STALL_LIMIT: Duration = Duration::from_secs(300);
 
+/// Tie the child's life to cascadia's: a cascadia that is SIGKILLed or
+/// crashes must not leave a `llama-server` holding the model's VRAM and the
+/// port (every later `--elastic-vram auto` load would then see less free
+/// memory and silently keep fewer layers resident).
+///
+/// Linux: `PR_SET_PDEATHSIG` delivers SIGKILL when the thread that spawned
+/// the child exits — the runner steps engines from the runtime's long-lived
+/// worker threads, so that is cascadia's exit in practice. Windows: a Job
+/// Object with KILL_ON_JOB_CLOSE, closed by the OS with the last handle.
+#[cfg(target_os = "linux")]
+fn arm_death_guard(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: prctl is async-signal-safe and the closure touches no heap.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The parent may already have died between fork and prctl.
+            if libc::getppid() == 1 {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn arm_death_guard(_cmd: &mut Command) {}
+
+/// Windows half of the death guard: the job the child is assigned to after
+/// spawn. Keeping the handle in the engine ties the child's life to ours.
+#[cfg(windows)]
+struct ChildJob(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl ChildJob {
+    fn new_kill_on_close() -> Option<Self> {
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        // SAFETY: plain Win32 calls with a zeroed, correctly sized struct.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if ok == 0 {
+                windows_sys::Win32::Foundation::CloseHandle(job);
+                return None;
+            }
+            Some(ChildJob(job))
+        }
+    }
+
+    fn assign(&self, child: &Child) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+        // SAFETY: both handles are live for the call.
+        unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle() as _) != 0 }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ChildJob {
+    fn drop(&mut self) {
+        // SAFETY: the handle was returned by CreateJobObjectW.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
 /// Byte string whose presence in llama-server or libggml-base marks a build
 /// with the weight-streaming patch (`GGML_STREAM_WEIGHTS` env gate).
 const STREAM_MARKER: &[u8] = b"GGML_STREAM_WEIGHTS";
@@ -308,6 +390,10 @@ pub struct LlamaCppBuilder {
     cfg: LlamaCppConfig,
     port: u16,
     child: Option<Child>,
+    /// Windows: the kill-on-close job the child is assigned to at spawn;
+    /// handed to the engine with the child.
+    #[cfg(windows)]
+    child_job: Option<ChildJob>,
     stderr_tail: StderrTail,
     stream_lines: StreamLines,
     stderr_drain: Option<std::thread::JoinHandle<()>>,
@@ -319,6 +405,8 @@ impl LlamaCppBuilder {
             cfg,
             port: 0,
             child: None,
+            #[cfg(windows)]
+            child_job: None,
             stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
             stream_lines: Arc::new(Mutex::new(Vec::new())),
             stderr_drain: None,
@@ -352,6 +440,7 @@ impl LlamaCppBuilder {
             .arg(self.port.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        arm_death_guard(&mut cmd);
         if self.cfg.elastic {
             // Device-side O1: weights stay on disk, streamed per layer.
             cmd.env("GGML_STREAM_WEIGHTS", "1");
@@ -373,6 +462,15 @@ impl LlamaCppBuilder {
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("spawn llama-server: {e}"))?;
+        #[cfg(windows)]
+        {
+            match ChildJob::new_kill_on_close() {
+                Some(job) if job.assign(&child) => self.child_job = Some(job),
+                _ => tracing::warn!(
+                    "sycl-llama: could not tie llama-server to a job object; a killed cascadia may orphan it"
+                ),
+            }
+        }
         self.stderr_tail.lock().unwrap().clear();
         self.stream_lines.lock().unwrap().clear();
         if let Some(err) = child.stderr.take() {
@@ -558,6 +656,8 @@ impl Builder for LlamaCppBuilder {
             active: None,
             rx: None,
             last_chunk_at: Instant::now(),
+            #[cfg(windows)]
+            child_job: self.child_job.take(),
             cancelled: Arc::new(AtomicBool::new(false)),
             socket: None,
         }))
@@ -589,6 +689,9 @@ pub struct LlamaCppEngine {
     last_chunk_at: Instant,
     cancelled: Arc<AtomicBool>,
     socket: Option<TcpStream>,
+    /// Windows: the kill-on-close job the child lives in (see `ChildJob`).
+    #[cfg(windows)]
+    child_job: Option<ChildJob>,
 }
 
 impl LlamaCppEngine {
@@ -1342,6 +1445,8 @@ mod unix_tests {
             active: None,
             rx: None,
             last_chunk_at: Instant::now(),
+            #[cfg(windows)]
+            child_job: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             socket: None,
         }
@@ -1507,6 +1612,44 @@ mod unix_tests {
         assert!(engine.active.is_none());
         drop(engine);
         server.join().unwrap();
+    }
+
+    /// Linux: the child dies with the thread that spawned it (PDEATHSIG);
+    /// a cascadia killed with SIGKILL cannot leave llama-server behind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn death_guard_kills_child_when_spawning_thread_exits() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("30");
+            arm_death_guard(&mut cmd);
+            let child = cmd.spawn().unwrap();
+            tx.send(child.id()).unwrap();
+            // the thread ends here: the guard fires on the child
+        });
+        let pid = rx.recv().unwrap();
+        t.join().unwrap();
+        let alive = |pid: u32| std::path::Path::new(&format!("/proc/{pid}/status")).exists();
+        let mut gone = false;
+        for _ in 0..50 {
+            if !alive(pid) {
+                gone = true;
+                break;
+            }
+            // a zombie counts as dead once the state line says so
+            if let Ok(st) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+                if st
+                    .lines()
+                    .any(|l| l.starts_with("State:") && l.contains('Z'))
+                {
+                    gone = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(gone, "child {pid} outlived the spawning thread");
     }
 
     #[test]

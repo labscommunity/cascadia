@@ -18,6 +18,16 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 
+# Death guard for the spawned llama-server (see `arm_death_guard`).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+] }
+
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
