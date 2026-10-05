@@ -426,6 +426,44 @@ type StderrTail = Arc<Mutex<VecDeque<String>>>;
 /// split line would scroll out before ready on chatty models.
 type StreamLines = Arc<Mutex<Vec<String>>>;
 
+/// llama-server arguments the engine owns: llama-server's parser is
+/// last-wins, so a `--llama-args` token could silently rebind the host or
+/// port the health checks never reach, or point at another model/device.
+/// Each entry maps the reserved flag to the cascadia-side way to say it.
+const RESERVED_LLAMA_ARGS: &[(&str, &str)] = &[
+    ("-m", "the model comes from the positional MODEL argument"),
+    ("--model", "the model comes from the positional MODEL argument"),
+    ("-mu", "the model comes from the positional MODEL argument"),
+    ("--model-url", "the model comes from the positional MODEL argument"),
+    ("-hf", "the model comes from the positional MODEL argument"),
+    ("-hfr", "the model comes from the positional MODEL argument"),
+    ("--hf-repo", "the model comes from the positional MODEL argument"),
+    ("--host", "the engine binds 127.0.0.1 itself"),
+    ("--port", "the engine picks a free loopback port itself"),
+    ("--device", "use cascadia --device instead"),
+    ("-dev", "use cascadia --device instead"),
+    ("-ngl", "use --llama-ngl instead"),
+    ("--gpu-layers", "use --llama-ngl instead"),
+    ("--n-gpu-layers", "use --llama-ngl instead"),
+    ("-c", "use --llama-ctx instead"),
+    ("--ctx-size", "use --llama-ctx instead"),
+];
+
+/// Reject `extra_args` tokens that shadow engine-owned flags — a token equal
+/// to a reserved flag or of the `<flag>=<value>` form.
+pub fn validate_extra_args(extra_args: &[String]) -> Result<(), String> {
+    for arg in extra_args {
+        for (reserved, hint) in RESERVED_LLAMA_ARGS {
+            if arg == reserved || arg.starts_with(&format!("{reserved}=")) {
+                return Err(format!(
+                    "--llama-args '{arg}' shadows '{reserved}': {hint}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Builder: spawns and readiness-checks the llama-server child.
 pub struct LlamaCppBuilder {
     cfg: LlamaCppConfig,
@@ -1434,6 +1472,44 @@ mod tests {
             auto_load_timeout(Path::new("/nonexistent/m.gguf")),
             Duration::from_secs(300)
         );
+    }
+    fn extra_args_rejects_reserved_flags() {
+        for arg in [
+            "-m",
+            "--model",
+            "--model-url",
+            "-mu",
+            "-hf",
+            "--host",
+            "--port",
+            "--device",
+            "-dev",
+            "-ngl",
+            "--gpu-layers",
+            "-c",
+            "--ctx-size",
+        ] {
+            let err = validate_extra_args(&[arg.to_string()]).unwrap_err();
+            assert!(err.contains(arg), "{err}");
+        }
+        // the <flag>=<value> form shadows just the same
+        let err = validate_extra_args(&["--port=1".to_string()]).unwrap_err();
+        assert!(err.contains("--port"), "{err}");
+        let err = validate_extra_args(&["-c=8192".to_string()]).unwrap_err();
+        assert!(err.contains("--llama-ctx"), "{err}");
+    }
+
+    #[test]
+    fn extra_args_allows_non_reserved() {
+        assert!(validate_extra_args(&[
+            "-ctk".into(),
+            "q8_0".into(),
+            "-fa".into(),
+            "on".into(),
+            "--no-jinja".into(),
+        ])
+        .is_ok());
+        assert!(validate_extra_args(&[]).is_ok());
     }
 }
 

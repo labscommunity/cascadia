@@ -11,7 +11,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use cascadia_engine::Builder;
 use cascadia_engine_llamacpp::{
-    probe_stream_weights, resolve_llama_bin, ElasticVram, LlamaCppBuilder, LlamaCppConfig,
+    probe_stream_weights, resolve_llama_bin, validate_extra_args, ElasticVram, LlamaCppBuilder,
+    LlamaCppConfig,
     StreamWeightsSupport,
 };
 use cascadia_engine_mock::MockBuilder;
@@ -1859,6 +1860,13 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
                      (device weight streaming; ~8 GB/s / model_GB decode, KV still reserved)"
                 );
             }
+            let extra_args: Vec<String> = args
+                .llama_args
+                .iter()
+                .filter(|a| !a.is_empty())
+                .cloned()
+                .collect();
+            validate_extra_args(&extra_args).map_err(|e| anyhow!("{e}"))?;
             Ok(Box::new(LlamaCppBuilder::new(LlamaCppConfig {
                 llama_bin: bin,
                 model: args.model.clone().into(),
@@ -1867,12 +1875,7 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
                 ngl: args.llama_ngl,
                 elastic: args.elastic,
                 elastic_vram: args.elastic_vram,
-                extra_args: args
-                    .llama_args
-                    .iter()
-                    .filter(|a| !a.is_empty())
-                    .cloned()
-                    .collect(),
+                extra_args,
                 load_timeout: args.llama_load_timeout.map(std::time::Duration::from_secs),
                 load_retries: args.llama_load_retries,
             })))
