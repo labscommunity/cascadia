@@ -120,26 +120,70 @@ const STALL_LIMIT: Duration = Duration::from_secs(300);
 /// port (every later `--elastic-vram auto` load would then see less free
 /// memory and silently keep fewer layers resident).
 ///
-/// Linux: `PR_SET_PDEATHSIG` delivers SIGKILL when the thread that spawned
-/// the child exits — the runner steps engines from the runtime's long-lived
-/// worker threads, so that is cascadia's exit in practice. Windows: a Job
-/// Object with KILL_ON_JOB_CLOSE, closed by the OS with the last handle.
+/// Linux: `PR_SET_PDEATHSIG` delivers SIGKILL when the *thread* that
+/// spawned the child exits — not the process. Engine load/retry can run on
+/// tokio blocking-pool threads that retire after seconds of idle, so a
+/// naive pre_exec spawn would kill a healthy child whenever that caller
+/// thread goes away. All Linux spawns therefore go through one
+/// process-wide thread that never exits (`spawn_on_parent_thread`), making
+/// the child's life track cascadia's own. Windows: a Job Object with
+/// KILL_ON_JOB_CLOSE, closed by the OS with the last handle.
 #[cfg(target_os = "linux")]
 fn arm_death_guard(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
     // SAFETY: prctl is async-signal-safe and the closure touches no heap.
+    // parent_pid is the process pid (same on every thread); the child
+    // re-checks it post-fork because a subreaper (systemd --user) can
+    // reparent us between fork and prctl — test `!=`, not `== 1`.
+    let parent_pid = std::process::id() as i32;
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             // The parent may already have died between fork and prctl.
-            if libc::getppid() == 1 {
+            if libc::getppid() != parent_pid {
                 libc::_exit(1);
             }
             Ok(())
         });
     }
+}
+
+/// Spawn `cmd` on the process-wide spawner thread (see above). The thread
+/// is created once and never exits: it is what makes PR_SET_PDEATHSIG mean
+/// "when cascadia dies" instead of "when the calling thread dies".
+#[cfg(target_os = "linux")]
+fn spawn_on_parent_thread(mut cmd: Command) -> std::io::Result<Child> {
+    use std::io::{Error, ErrorKind};
+    use std::sync::mpsc::{channel, Sender};
+    use std::sync::OnceLock;
+    type Job = (Command, Sender<std::io::Result<Child>>);
+    static TX: OnceLock<Sender<Job>> = OnceLock::new();
+    let tx = TX.get_or_init(|| {
+        let (tx, rx) = channel::<Job>();
+        std::thread::Builder::new()
+            .name("llamacpp-child-spawner".into())
+            .spawn(move || {
+                while let Ok((mut cmd, reply)) = rx.recv() {
+                    let r = cmd.spawn();
+                    if let Err(std::sync::mpsc::SendError(r)) = reply.send(r) {
+                        // caller went away; don't leak the child
+                        if let Ok(mut c) = r {
+                            let _ = c.kill();
+                        }
+                    }
+                }
+            })
+            .expect("spawn llamacpp child spawner thread");
+        tx
+    });
+    let (reply_tx, reply_rx) = channel();
+    tx.send((cmd, reply_tx))
+        .map_err(|_| Error::new(ErrorKind::Other, "child spawner thread gone"))?;
+    reply_rx
+        .recv()
+        .map_err(|_| Error::new(ErrorKind::Other, "child spawner thread gone"))?
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -570,6 +614,10 @@ impl LlamaCppBuilder {
         for a in self.cfg.extra_args.iter().filter(|a| !a.is_empty()) {
             cmd.arg(a);
         }
+        #[cfg(target_os = "linux")]
+        let mut child = spawn_on_parent_thread(cmd)
+            .map_err(|e| format!("spawn llama-server: {e}"))?;
+        #[cfg(not(target_os = "linux"))]
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("spawn llama-server: {e}"))?;
@@ -1931,42 +1979,40 @@ mod unix_tests {
         server.join().unwrap();
     }
 
-    /// Linux: the child dies with the thread that spawned it (PDEATHSIG);
-    /// a cascadia killed with SIGKILL cannot leave llama-server behind.
+    /// Linux: PDEATHSIG fires on the spawning *thread's* exit — the reason
+    /// children go through the never-exiting spawner thread. A child
+    /// spawned via it from a caller thread that then exits must stay
+    /// alive; only the process dying may take the child down.
     #[cfg(target_os = "linux")]
     #[test]
-    fn death_guard_kills_child_when_spawning_thread_exits() {
+    fn spawner_thread_child_survives_short_lived_callers() {
         let (tx, rx) = std::sync::mpsc::channel();
         let t = std::thread::spawn(move || {
             let mut cmd = Command::new("sleep");
             cmd.arg("30");
             arm_death_guard(&mut cmd);
-            let child = cmd.spawn().unwrap();
+            let child = spawn_on_parent_thread(cmd).unwrap();
             tx.send(child.id()).unwrap();
-            // the thread ends here: the guard fires on the child
+            // the calling thread exits here: a naive PDEATHSIG spawn
+            // would already have killed the child
         });
         let pid = rx.recv().unwrap();
         t.join().unwrap();
-        let alive = |pid: u32| std::path::Path::new(&format!("/proc/{pid}/status")).exists();
-        let mut gone = false;
-        for _ in 0..50 {
-            if !alive(pid) {
-                gone = true;
-                break;
-            }
-            // a zombie counts as dead once the state line says so
-            if let Ok(st) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
-                if st
-                    .lines()
-                    .any(|l| l.starts_with("State:") && l.contains('Z'))
-                {
-                    gone = true;
-                    break;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(gone, "child {pid} outlived the spawning thread");
+        std::thread::sleep(Duration::from_millis(300));
+        let state = std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .unwrap_or_default()
+            .lines()
+            .find(|l| l.starts_with("State:"))
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            !state.is_empty() && !state.contains('Z'),
+            "child {pid} did not survive the caller thread: {state}"
+        );
+        let _ = Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .output();
     }
 
     /// The host interposer's environment (#132) never reaches the child,
