@@ -2515,6 +2515,10 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // the thinking-OFF path (engine sets apply_chat_template=false then);
         // thinking-ON stays on ov-genai's native template, untouched.
         cfg.defer_template_on_thinking = matches!(args.engine, EngineKind::OvGenai);
+        // sycl-llama's child renders the GGUF template itself (the engine
+        // forwards the structured turns + tools); the API-side render is
+        // only a placeholder so tool requests are not refused here
+        cfg.engine_applies_template = matches!(args.engine, EngineKind::SyclLlama);
         let max_concurrent = cfg.max_concurrent_requests as u64;
         // Shared live counters: the API bumps them on the chat hot path,
         // the dashboard's /api/stats reads them — same Arc, so the cluster

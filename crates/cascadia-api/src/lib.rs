@@ -112,6 +112,12 @@ pub struct AppState {
     /// OFF (to inject the empty `<think></think>`). Keeps the working
     /// thinking-on path byte-identical to the engine's native render.
     pub defer_template_on_thinking: bool,
+    /// The engine applies the model's chat template itself (sycl-llama: the
+    /// llama-server child renders the GGUF template on the structured turns
+    /// the task carries). Render here is a placeholder so the empty-prompt
+    /// guard stays honest; tools flow through GenerationTask, so the
+    /// no-template refusal does not apply.
+    pub engine_applies_template: bool,
     /// The chat template distinguishes OpenAI's `reasoning_effort` words
     /// (probed at load: "low" and "medium" render differently). When true the
     /// caller's own word reaches the template; when false the GLM high/max
@@ -142,6 +148,8 @@ pub struct Config {
     pub chat_template: ChatTemplateConfig,
     /// See [`AppState::defer_template_on_thinking`]. Set by the CLI for ov-genai.
     pub defer_template_on_thinking: bool,
+    /// See [`AppState::engine_applies_template`]. Set by the CLI for sycl-llama.
+    pub engine_applies_template: bool,
     /// See [`MarkerDialect`]; the CLI loads it with [`MarkerDialect::load`].
     pub marker_dialect: Option<MarkerDialect>,
 }
@@ -154,6 +162,7 @@ impl Default for Config {
             max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
             chat_template: ChatTemplateConfig::default(),
             defer_template_on_thinking: false,
+            engine_applies_template: false,
             marker_dialect: None,
         }
     }
@@ -485,6 +494,7 @@ pub fn make_router_with_stats(
         bos_token: Arc::from(cfg.chat_template.bos_token.clone().unwrap_or_default()),
         eos_token: Arc::from(cfg.chat_template.eos_token.clone().unwrap_or_default()),
         defer_template_on_thinking: cfg.defer_template_on_thinking,
+        engine_applies_template: cfg.engine_applies_template,
         effort_words: false,
         marker_dialect: cfg.marker_dialect.clone(),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -1742,6 +1752,11 @@ fn render_prompt(
     // `reasoning_effort` (the caller's parameter above) is also dropped on
     // this branch, intentionally: ov-genai applies its own template with the
     // effort undefined, so there is nowhere for the mapped value to go.
+    if state.engine_applies_template {
+        // the child renders the GGUF chat template on the forwarded turns;
+        // the prompt is a fallback and must simply be non-empty
+        return Ok(render_prompt_legacy(messages));
+    }
     if state.defer_template_on_thinking && enable_thinking {
         if tools.is_some_and(|t| !t.is_empty()) {
             return Err(PromptRenderError::Failed(
