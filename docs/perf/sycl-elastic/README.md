@@ -16,6 +16,9 @@ All numbers come from [`data.json`](./data.json) (verbatim copy of
 | ![fig8](fig8_partial.png) | `fig8_partial.png` — `--elastic-vram` budget sweep: speed follows how much of the model fits. |
 | ![fig9](fig9_windows.png) | `fig9_windows.png` — the same streaming on Windows (Arc B390 iGPU): Linux vs Windows device memory + decode retention. |
 
+Placement study on a UMA iGPU (Arc B390, Linux), stock vs streaming vs
+pinned host memory computed in place: [`placement-b390.md`](placement-b390.md).
+
 ## Methodology
 
 - **Hardware (B70 box):** 2x Intel Arc Pro B70 32 GB, kernel 7.0.0-28 (`xe`
