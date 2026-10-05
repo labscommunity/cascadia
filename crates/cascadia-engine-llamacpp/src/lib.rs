@@ -197,6 +197,42 @@ impl Drop for ChildJob {
     }
 }
 
+/// Environment the host-side `--elastic` posture sets on cascadia itself
+/// (#132) and must not reach the child: `llama-server` has its own device
+/// side of the posture, its staging buffer must stay plain anonymous memory
+/// (Level Zero cannot memcpy from file-mapped pages), and the interposer
+/// would build a second retention pool in the child.
+const HOST_ELASTIC_ENV: [&str; 6] = [
+    "LD_PRELOAD",
+    "CASCADIA_ELASTIC_ACTIVE",
+    "ELASTIC_DIR",
+    "ELASTIC_MIN_MB",
+    "ELASTIC_POOL_MB",
+    "ELASTIC_SO_PATH",
+];
+
+/// Scrub the child's environment: the host interposer's variables never
+/// cross, and ambient `GGML_STREAM_WEIGHTS` / `GGML_STREAM_VRAM_MB` cannot
+/// stream without `--elastic` (the engine sets both itself when it is on).
+/// `GGML_STREAM_RESIDENT_LAYERS` is a documented child knob that overrides
+/// the budget, so it passes through — with a warning when it will.
+fn scrub_child_env(cmd: &mut Command, elastic: bool) {
+    for k in HOST_ELASTIC_ENV {
+        cmd.env_remove(k);
+    }
+    if !elastic {
+        cmd.env_remove("GGML_STREAM_WEIGHTS");
+        cmd.env_remove("GGML_STREAM_VRAM_MB");
+        cmd.env_remove("GGML_STREAM_RESIDENT_LAYERS");
+    } else if let Ok(n) = std::env::var("GGML_STREAM_RESIDENT_LAYERS") {
+        if !n.trim().is_empty() {
+            tracing::warn!(
+                "sycl-llama: GGML_STREAM_RESIDENT_LAYERS={n} in the environment overrides --elastic-vram on the child"
+            );
+        }
+    }
+}
+
 /// Byte string whose presence in llama-server or libggml-base marks a build
 /// with the weight-streaming patch (`GGML_STREAM_WEIGHTS` env gate).
 const STREAM_MARKER: &[u8] = b"GGML_STREAM_WEIGHTS";
@@ -440,6 +476,7 @@ impl LlamaCppBuilder {
             .arg(self.port.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        scrub_child_env(&mut cmd, self.cfg.elastic);
         arm_death_guard(&mut cmd);
         if self.cfg.elastic {
             // Device-side O1: weights stay on disk, streamed per layer.
@@ -1650,6 +1687,55 @@ mod unix_tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(gone, "child {pid} outlived the spawning thread");
+    }
+
+    /// The host interposer's environment (#132) never reaches the child,
+    /// and ambient GGML_STREAM_* cannot stream without `--elastic`.
+    #[test]
+    fn scrub_child_env_drops_host_elastic_and_ambient_stream_vars() {
+        fn removed(cmd: &Command) -> Vec<String> {
+            cmd.get_envs()
+                .filter(|(_, v)| v.is_none())
+                .map(|(k, _)| k.to_string_lossy().into_owned())
+                .collect()
+        }
+        let mut off = Command::new("true");
+        scrub_child_env(&mut off, false);
+        let r = removed(&off);
+        for k in HOST_ELASTIC_ENV {
+            assert!(r.iter().any(|x| x == k), "{k} not removed: {r:?}");
+        }
+        for k in [
+            "GGML_STREAM_WEIGHTS",
+            "GGML_STREAM_VRAM_MB",
+            "GGML_STREAM_RESIDENT_LAYERS",
+        ] {
+            assert!(r.iter().any(|x| x == k), "{k} not removed: {r:?}");
+        }
+        // With --elastic the engine sets the two it owns after the scrub;
+        // the documented child knob GGML_STREAM_RESIDENT_LAYERS passes
+        // through (warned about when set).
+        let mut on = Command::new("true");
+        scrub_child_env(&mut on, true);
+        on.env("GGML_STREAM_WEIGHTS", "1");
+        let r = removed(&on);
+        assert!(r.iter().any(|x| x == "LD_PRELOAD"), "{r:?}");
+        assert!(
+            !r.iter().any(|x| x == "GGML_STREAM_RESIDENT_LAYERS"),
+            "{r:?}"
+        );
+        let set: Vec<(String, String)> = on
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(set, [("GGML_STREAM_WEIGHTS".to_string(), "1".to_string())]);
     }
 
     #[test]
