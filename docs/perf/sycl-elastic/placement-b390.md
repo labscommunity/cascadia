@@ -73,7 +73,7 @@ half 1.24 — speed-neutral.
   $B -m $M -p 0 -n 64 -r 3 -ngl 99                                   # resident
   $B -m $M -p 0 -n 64 -r 3 -ngl 99 --load-mode read -ot 'blk\.6[2-4]\..*=SYCL_Host'  # 3 layers on the host
   $B -m $M -p 0 -n 64 -r 3 -ngl 99 --load-mode read -ot 'blk\..*=SYCL_Host'         # everything on the host
-  GGML_STREAM_WEIGHTS=1 GGML_STREAM_VRAM_MB=12 $B -m $M -p 0 -n 64 -r 3 -ngl 99      # streaming, same split
+  GGML_STREAM_WEIGHTS=1 GGML_STREAM_VRAM_MB=12288 $B -m $M -p 0 -n 64 -r 3 -ngl 99   # streaming, same split (12 GiB budget = 62/65)
   ```
 
   and, separately, the driver-managed oversubscription the PR's
