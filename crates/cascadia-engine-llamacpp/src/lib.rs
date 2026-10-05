@@ -2102,8 +2102,7 @@ mod unix_tests {
         // interposer; the var goes away entirely when the interposer was
         // the only entry. (Pure fn — no process-env mutation in tests.)
         assert_eq!(
-            filter_ld_preload("/tmp/libcascadia_elastic.42.so:/opt/user/libmine.so")
-                .as_deref(),
+            filter_ld_preload("/tmp/libcascadia_elastic.42.so:/opt/user/libmine.so").as_deref(),
             Some("/opt/user/libmine.so")
         );
         assert_eq!(filter_ld_preload("/tmp/libcascadia_elastic.42.so"), None);
