@@ -329,36 +329,44 @@ fn file_contains(path: &Path, needle: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+/// Shared-library names that may carry the streaming markers beside the
+/// binary, on any OS: Linux/macOS `libggml-{base,sycl}.*`, Windows
+/// `ggml-{base,sycl}*.dll`.
+fn is_ggml_stream_lib(name: &str) -> bool {
+    name.starts_with("libggml-base")
+        || name.starts_with("libggml-sycl")
+        || ((name.starts_with("ggml-base") || name.starts_with("ggml-sycl"))
+            && name.ends_with(".dll"))
+}
+
 /// Preflight: does this llama-server build understand GGML_STREAM_WEIGHTS?
-/// Scans the binary itself plus `libggml-base*` / `ggml-base*.dll` files in
-/// the same directory (the env gate lives in libggml-base; distro builds
+/// Scans the binary itself plus `libggml-{base,sycl}*` / `ggml-*.dll` files
+/// in the same directory (the env gate lives in libggml-base; distro builds
 /// link it as a shared object).
 ///
 /// - marker anywhere -> `Present`
-/// - a libggml-base exists but nothing contains the marker -> `Err` (a stock
+/// - a ggml lib exists but nothing contains the marker -> `Err` (a stock
 ///   build: `--elastic` would silently not reduce VRAM)
-/// - no libggml-base at all and the binary lacks the marker -> `Unknown`
+/// - no ggml lib at all and the binary lacks the marker -> `Unknown`
 ///   (caller warns and continues)
 pub fn probe_stream_weights(bin: &Path) -> Result<StreamWeightsSupport, String> {
     if file_contains(bin, STREAM_MARKER) {
         return Ok(StreamWeightsSupport::Present);
     }
     let dir = bin.parent().unwrap_or_else(|| Path::new("."));
-    let mut found_base = false;
+    let mut found_lib = false;
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            let is_base = name.starts_with("libggml-base")
-                || (name.starts_with("ggml-base") && name.ends_with(".dll"));
-            if is_base {
-                found_base = true;
+            if is_ggml_stream_lib(&name) {
+                found_lib = true;
                 if file_contains(&e.path(), STREAM_MARKER) {
                     return Ok(StreamWeightsSupport::Present);
                 }
             }
         }
     }
-    if found_base {
+    if found_lib {
         Err("this llama-server build has no weight-streaming support; \
              --elastic would not reduce VRAM. Build one with \
              scripts/build-llama-stream.sh (or drop --elastic)"
@@ -379,8 +387,7 @@ pub fn probe_expert_streaming(bin: &Path) -> bool {
     std::fs::read_dir(dir)
         .map(|rd| {
             rd.flatten().any(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                (name.starts_with("libggml-sycl") || name.starts_with("libggml-base"))
+                is_ggml_stream_lib(&e.file_name().to_string_lossy())
                     && file_contains(&e.path(), EXPERT_MARKER)
             })
         })
@@ -1576,6 +1583,52 @@ mod tests {
 
         // no libggml-base, no marker -> Unknown (warn and continue)
         std::fs::remove_file(dir.path().join("libggml-base.so")).unwrap();
+        assert_eq!(
+            probe_stream_weights(&bin).unwrap(),
+            StreamWeightsSupport::Unknown
+        );
+    }
+
+    #[test]
+    fn probes_match_sycl_and_base_lib_names_on_both_oses() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("llama-server");
+        std::fs::write(&bin, b"bin").unwrap();
+
+        // the 0002 marker lives in libggml-sycl (the SYCL backend lib)
+        std::fs::write(
+            dir.path().join("libggml-sycl.so.0.19.0"),
+            b"lib GGML_STREAM_EXPERT_CACHE_MB",
+        )
+        .unwrap();
+        assert!(probe_expert_streaming(&bin));
+        // and a 0001-only sycl lib answers "no 0002"
+        std::fs::write(
+            dir.path().join("libggml-sycl.so.0.19.0"),
+            b"lib GGML_STREAM_WEIGHTS",
+        )
+        .unwrap();
+        assert!(!probe_expert_streaming(&bin));
+        // but the 0001 probe still reads it as a stream lib
+        assert_eq!(
+            probe_stream_weights(&bin).unwrap(),
+            StreamWeightsSupport::Present
+        );
+
+        // Windows-style names: ggml-sycl.dll / ggml-base.dll
+        std::fs::remove_file(dir.path().join("libggml-sycl.so.0.19.0")).unwrap();
+        std::fs::write(dir.path().join("ggml-sycl.dll"), b"lib GGML_STREAM_EXPERT_CACHE_MB")
+            .unwrap();
+        assert!(probe_expert_streaming(&bin));
+        std::fs::remove_file(dir.path().join("ggml-sycl.dll")).unwrap();
+        assert!(!probe_expert_streaming(&bin));
+
+        // a ggml lib without the marker counts as "found" -> hard error
+        std::fs::write(dir.path().join("libggml-sycl.so"), b"lib").unwrap();
+        assert!(probe_stream_weights(&bin).is_err());
+        std::fs::remove_file(dir.path().join("libggml-sycl.so")).unwrap();
+        // unrelated libs are not scanned
+        std::fs::write(dir.path().join("libggml-cpu.so"), b"lib").unwrap();
         assert_eq!(
             probe_stream_weights(&bin).unwrap(),
             StreamWeightsSupport::Unknown
