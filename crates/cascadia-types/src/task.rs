@@ -52,13 +52,23 @@ impl Default for SamplingParams {
 
 /// One chat turn forwarded verbatim to a downstream chat server that applies
 /// its own template (sycl-llama: llama-server renders the GGUF's chat
-/// template). Only `role` + `content` are carried — tool calls and multimodal
-/// parts are not plumbed through this path yet.
+/// template). Multimodal parts are not plumbed through this path; tool calls
+/// are, in the OpenAI wire form.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ChatTurn {
     pub role: String,
     #[serde(default)]
     pub content: String,
+    /// Assistant tool calls (OpenAI wire form: `[{"id","type","function":
+    /// {"name","arguments"}}]`, `arguments` as a string).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
+    /// `tool`-role turns carry the id of the call they answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Optional participant name (multi-agent / tool messages).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// One generation request, end-to-end.
@@ -76,6 +86,10 @@ pub struct GenerationTask {
     /// path and every non-chat request).
     #[serde(default)]
     pub messages: Vec<ChatTurn>,
+    /// Tool definitions offered to the model (OpenAI wire form:
+    /// `[{"type":"function","function":{...}}]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<serde_json::Value>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     #[serde(default)]
@@ -188,6 +202,7 @@ impl GenerationTask {
             task_id: task_id.into(),
             prompt: prompt.into(),
             messages: Vec::new(),
+            tools: None,
             max_tokens: default_max_tokens(),
             temperature: 0.0,
             logprobs: 0,
@@ -232,6 +247,7 @@ mod tests {
             task_id: "t1".to_string(),
             prompt: "hello".to_string(),
             messages: Vec::new(),
+            tools: None,
             max_tokens: default_max_tokens(),
             temperature: 0.0,
             logprobs: 0,

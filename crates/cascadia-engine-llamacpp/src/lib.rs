@@ -517,6 +517,9 @@ impl LlamaCppBuilder {
             .arg("127.0.0.1")
             .arg("--port")
             .arg(self.port.to_string())
+            // tool calls only render through the jinja chat template; a
+            // --no-jinja in --llama-args still wins (last flag applies)
+            .arg("--jinja")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         scrub_child_env(&mut cmd, self.cfg.elastic);
@@ -812,9 +815,25 @@ impl LlamaCppEngine {
             let messages: Vec<serde_json::Value> = task
                 .messages
                 .iter()
-                .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+                .map(|m| {
+                    let mut v = serde_json::json!({"role": m.role, "content": m.content});
+                    // an assistant tool_call turn carries null content, not ""
+                    if m.content.is_empty() && m.tool_calls.is_some() {
+                        v["content"] = serde_json::Value::Null;
+                    }
+                    if let Some(calls) = &m.tool_calls {
+                        v["tool_calls"] = calls.clone();
+                    }
+                    if let Some(id) = &m.tool_call_id {
+                        v["tool_call_id"] = serde_json::json!(id);
+                    }
+                    if let Some(n) = &m.name {
+                        v["name"] = serde_json::json!(n);
+                    }
+                    v
+                })
                 .collect();
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "messages": messages,
                 "max_tokens": task.max_tokens,
                 "temperature": task.temperature,
@@ -825,6 +844,9 @@ impl LlamaCppEngine {
                 // others ignore the unused kwarg).
                 "chat_template_kwargs": {"enable_thinking": task.enable_thinking},
             });
+            if let Some(tools) = &task.tools {
+                body["tools"] = tools.clone();
+            }
             ("/v1/chat/completions", body)
         };
         apply_sampling(&mut body, &task.sampling);
@@ -930,6 +952,9 @@ impl LlamaCppEngine {
             }
             // Clean EOF without a [DONE] line: deliver a pending final so
             // finish_reason/usage still reach the caller.
+            for block in st.tool_call_blocks() {
+                send(Ok((tid.clone(), Chunk::token(tid.clone(), st.token_id, block))));
+            }
             if !st.sent_final && st.finish_reason.is_some() {
                 let mut c = Chunk::token(tid.clone(), st.token_id, "");
                 c.is_final = true;
@@ -979,6 +1004,36 @@ struct SseState {
     finish_reason: Option<FinishReason>,
     prompt_tokens: Option<u32>,
     sent_final: bool,
+    /// OpenAI `delta.tool_calls` fragments accumulated by call index.
+    tool_calls: std::collections::BTreeMap<u64, ToolCallParts>,
+}
+
+/// One streaming tool call assembled from `delta.tool_calls` fragments.
+#[derive(Default)]
+struct ToolCallParts {
+    name: String,
+    arguments: String,
+}
+
+impl SseState {
+    /// The accumulated calls re-encoded as `<tool_call>` text — the Hermes
+    /// form the API's parse_tool_calls already understands — in call order.
+    fn tool_call_blocks(&self) -> Vec<String> {
+        self.tool_calls
+            .values()
+            .filter(|p| !p.name.is_empty())
+            .map(|p| {
+                // arguments as the parsed JSON object when it is one, else
+                // the raw string — parse_tool_calls accepts both
+                let args: serde_json::Value = serde_json::from_str(&p.arguments)
+                    .unwrap_or_else(|_| serde_json::Value::String(p.arguments.clone()));
+                format!(
+                    "<tool_call>{}</tool_call>",
+                    serde_json::json!({"name": p.name, "arguments": args})
+                )
+            })
+            .collect()
+    }
 }
 
 /// Parse one SSE `data: ...` line; returns false when the stream is
@@ -994,6 +1049,11 @@ fn handle_sse_line(
         return true;
     };
     if data.trim() == "[DONE]" {
+        // Emit any assembled tool calls as text just before the final
+        // chunk so the API's tool-call machinery sees them in-order.
+        for block in st.tool_call_blocks() {
+            send(Ok((tid.clone(), Chunk::token(tid.clone(), st.token_id, block))));
+        }
         let mut c = Chunk::token(tid.clone(), st.token_id, "");
         c.is_final = true;
         c.finish_reason = st.finish_reason;
@@ -1016,6 +1076,23 @@ fn handle_sse_line(
         .as_str()
         .or(v["choices"][0]["text"].as_str())
         .unwrap_or("");
+    // Structured tool calls arrive as OpenAI delta.tool_calls fragments
+    // (index + id + function.name + function.arguments pieces, usually
+    // without delta.content); accumulate them for the stream-end emit.
+    if let Some(calls) = v["choices"][0]["delta"]["tool_calls"].as_array() {
+        for call in calls {
+            let idx = call["index"].as_u64().unwrap_or(0);
+            let parts = st.tool_calls.entry(idx).or_default();
+            if let Some(f) = call.get("function") {
+                if let Some(n) = f["name"].as_str() {
+                    parts.name.push_str(n);
+                }
+                if let Some(a) = f["arguments"].as_str() {
+                    parts.arguments.push_str(a);
+                }
+            }
+        }
+    }
     let stop_str = v["choices"][0]["finish_reason"].as_str();
     if let Some(r) = stop_str {
         st.finish_reason = Some(if r == "length" {
@@ -1190,6 +1267,51 @@ mod tests {
         let c = out[0].as_ref().unwrap().1.clone();
         assert_eq!(c.text, "Hello");
         assert!(!c.is_final);
+    }
+
+    #[test]
+    fn sse_tool_call_fragments_emit_hermes_block_before_final() {
+        let tid = "t1".to_string();
+        let mut st = SseState::default();
+        // fragmented delta.tool_calls, the way llama-server streams them
+        collect(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}"#,
+            &tid,
+            &mut st,
+        );
+        collect(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"ci"}}]}}]}"#,
+            &tid,
+            &mut st,
+        );
+        collect(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ty\": \"Paris\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            &tid,
+            &mut st,
+        );
+        let (_go, out) = collect("data: [DONE]", &tid, &mut st);
+        let chunks: Vec<Chunk> = out.into_iter().map(|r| r.unwrap().1).collect();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(
+            chunks[0].text,
+            r#"<tool_call>{"arguments":{"city":"Paris"},"name":"get_weather"}</tool_call>"#
+        );
+        assert!(!chunks[0].is_final);
+        assert!(chunks[1].is_final);
+        // unparseable arguments still surface as a string
+        let tid2 = "t2".to_string();
+        let mut st2 = SseState::default();
+        collect(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"f","arguments":"not-json"}}]}}]}"#,
+            &tid2,
+            &mut st2,
+        );
+        let (_go, out) = collect("data: [DONE]", &tid2, &mut st2);
+        let text = &out[0].as_ref().unwrap().1.text;
+        assert_eq!(
+            text,
+            r#"<tool_call>{"arguments":"not-json","name":"f"}</tool_call>"#
+        );
     }
 
     #[test]
@@ -1577,6 +1699,7 @@ mod unix_tests {
         t.messages = vec![ChatTurn {
             role: "user".into(),
             content: "hi".into(),
+            ..Default::default()
         }];
         t
     }

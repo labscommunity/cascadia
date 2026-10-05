@@ -2211,6 +2211,32 @@ pub fn render_chat_prompt(
     ChatPromptRenderer::new(cfg).render(messages)
 }
 
+/// The engine-side structured turns from a chat request: tool fields travel
+/// as the OpenAI wire JSON a downstream chat server (llama-server's jinja)
+/// expects verbatim.
+fn chat_turns(req: &ChatCompletionRequest) -> Vec<ChatTurn> {
+    req.messages
+        .iter()
+        .map(|m| ChatTurn {
+            role: m.role.clone(),
+            content: m.content.clone(),
+            tool_calls: m
+                .tool_calls
+                .as_ref()
+                .and_then(|cs| serde_json::to_value(cs).ok()),
+            tool_call_id: m.tool_call_id.clone(),
+            name: m.name.clone(),
+        })
+        .collect()
+}
+
+/// The request's tool definitions as wire JSON for the engine.
+fn chat_tools(req: &ChatCompletionRequest) -> Option<serde_json::Value> {
+    req.tools
+        .as_ref()
+        .and_then(|ts| serde_json::to_value(ts).ok())
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
@@ -2290,6 +2316,35 @@ async fn chat_completions(
         )
             .into_response();
     }
+    // Same bound on the structured turns: tool-call results ride as
+    // messages and never count toward prompt.len(), so a request could
+    // pass the prompt check while shipping a megabyte of tool output.
+    let messages_bytes: usize = req
+        .messages
+        .iter()
+        .map(|m| {
+            m.content.len()
+                + m.tool_calls.as_ref().map_or(0, |cs| {
+                    serde_json::to_string(cs).map_or(0, |s| s.len())
+                })
+                + m.tool_call_id.as_ref().map_or(0, String::len)
+                + m.name.as_ref().map_or(0, String::len)
+        })
+        .sum();
+    if messages_bytes > state.max_prompt_bytes {
+        count_rejected("prompt_too_large");
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": format!(
+                    "messages are {messages_bytes} bytes (content + tool fields); \
+                     max allowed is {} (max_prompt_bytes)",
+                    state.max_prompt_bytes,
+                )
+            })),
+        )
+            .into_response();
+    }
     let task = GenerationTask {
         task_id: task_id.clone(),
         prompt,
@@ -2297,14 +2352,8 @@ async fn chat_completions(
         // downstream chat server applying its own template (sycl-llama:
         // llama-server renders the GGUF chat template). Other engines ignore
         // the field and keep consuming `prompt`.
-        messages: req
-            .messages
-            .iter()
-            .map(|m| ChatTurn {
-                role: m.role.clone(),
-                content: m.content.clone(),
-            })
-            .collect(),
+        messages: chat_turns(&req),
+        tools: chat_tools(&req),
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         logprobs: req.logprobs_count(),
@@ -2539,6 +2588,7 @@ async fn completions(
         prompt: prompt.clone(),
         // Prompt-only: no structured turns on the /v1/completions path.
         messages: Vec::new(),
+        tools: None,
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         logprobs: req.logprobs_count(),
@@ -4929,6 +4979,82 @@ mod tests {
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
         serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn chat_turns_forward_tool_fields_as_wire_json() {
+        let req = chat_request(serde_json::json!({
+            "tools": [{"type":"function","function":{"name":"get_weather",
+                "parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],
+            "messages": [
+                {"role":"assistant","content":null,
+                 "tool_calls":[{"id":"call_1","type":"function",
+                    "function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},
+                {"role":"tool","tool_call_id":"call_1","name":"get_weather",
+                 "content":"{\"temp_c\":18}"},
+                {"role":"user","content":"thanks"}
+            ]
+        }));
+        let turns = chat_turns(&req);
+        assert_eq!(turns.len(), 3);
+        let calls = turns[0].tool_calls.as_ref().expect("tool_calls forwarded");
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(
+            calls[0]["function"]["arguments"], "{\"city\":\"Paris\"}",
+            "arguments stay the OpenAI string form"
+        );
+        assert_eq!(turns[1].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(turns[1].name.as_deref(), Some("get_weather"));
+        let tools = chat_tools(&req).expect("tools forwarded");
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "get_weather");
+    }
+
+    #[tokio::test]
+    async fn oversized_tool_turns_get_413() {
+        // max_prompt_bytes small enough that the rendered prompt passes but
+        // the tool-result turn does not — content + tool fields must count.
+        let mut runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            max_prompt_bytes: 128,
+            // roles-only template: the rendered prompt stays tiny while the
+            // tool-result turn is huge, so the messages check is what fires
+            chat_template: ChatTemplateConfig {
+                template: Some(
+                    "{% if tools %}{{ tools | tojson }}{% endif %}\
+                     {% for m in messages %}{{ m.role }}\n{% endfor %}"
+                        .into(),
+                ),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let big = "x".repeat(4096);
+        let payload = serde_json::json!({
+            "model": "mock-model",
+            "tools": [{"type":"function","function":{"name":"f"}}],
+            "messages": [
+                {"role":"user","content":"hi"},
+                {"role":"tool","tool_call_id":"c1","content": big},
+            ],
+        });
+        let (status, body) = post_chat(app, payload).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("messages"),
+            "error must name the messages payload: {body}"
+        );
     }
 
     /// Qwen3.8's template accepts only xhigh/medium/low and raises for anything
