@@ -150,6 +150,11 @@ fn arm_death_guard(_cmd: &mut Command) {}
 #[cfg(windows)]
 struct ChildJob(windows_sys::Win32::Foundation::HANDLE);
 
+// SAFETY: a job object handle is a kernel object reference, valid from any
+// thread; the engine moves it between runtime threads but never shares it.
+#[cfg(windows)]
+unsafe impl Send for ChildJob {}
+
 #[cfg(windows)]
 impl ChildJob {
     fn new_kill_on_close() -> Option<Self> {
@@ -726,8 +731,10 @@ pub struct LlamaCppEngine {
     last_chunk_at: Instant,
     cancelled: Arc<AtomicBool>,
     socket: Option<TcpStream>,
-    /// Windows: the kill-on-close job the child lives in (see `ChildJob`).
+    /// Windows: the kill-on-close job the child lives in (see `ChildJob`);
+    /// held only so its Drop closes the job with the engine.
     #[cfg(windows)]
+    #[allow(dead_code)]
     child_job: Option<ChildJob>,
 }
 
