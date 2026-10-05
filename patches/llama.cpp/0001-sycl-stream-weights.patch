@@ -592,10 +592,10 @@ index 5c5e97fbc..69ae87c03 100644
              const auto & mapping = mappings.at(weight->idx);
              ggml_backend_buffer_t buf_mmap = nullptr;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index c81005505..38d052367 100644
+index c81005505..92cb43ec4 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -1558,6 +1558,84 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1558,6 +1558,90 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
      ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
      pimpl->mappings.reserve(ml.mappings.size());
  
@@ -674,6 +674,12 @@ index c81005505..38d052367 100644
 +            fprintf(stderr, "stream-weights: resident layers %d/%d (%.0f MiB resident, %.0f MiB streamed per token)\n",
 +                    n_res, (int) n_layer_all, resident / 1048576.0,
 +                    (s_total - resident) / 1048576.0);
++            // on a UMA part the stream re-reads weights inside the same
++            // DRAM the GPU computes from: it buys isolation, not bandwidth
++            if (ggml_backend_dev_type(devices[0].dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
++                fprintf(stderr, "stream-weights: warning: integrated GPU (shared memory): streaming re-reads %.0f MiB per token from host memory; use for parked models, not serving\n",
++                        (s_total - resident) / 1048576.0);
++            }
 +        }
 +    }
 +
