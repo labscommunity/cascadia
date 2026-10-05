@@ -108,6 +108,13 @@ pub struct LlamaCppConfig {
     pub load_retries: u32,
 }
 
+/// How long one `step()` waits for the child before handing the runtime
+/// thread back with a progress marker.
+const STEP_POLL: Duration = Duration::from_millis(50);
+/// No chunk from the child for this long (wall clock since the last one, or
+/// since the request started) fails the task.
+const STALL_LIMIT: Duration = Duration::from_secs(300);
+
 /// Byte string whose presence in llama-server or libggml-base marks a build
 /// with the weight-streaming patch (`GGML_STREAM_WEIGHTS` env gate).
 const STREAM_MARKER: &[u8] = b"GGML_STREAM_WEIGHTS";
@@ -550,6 +557,7 @@ impl Builder for LlamaCppBuilder {
             pending: Vec::new(),
             active: None,
             rx: None,
+            last_chunk_at: Instant::now(),
             cancelled: Arc::new(AtomicBool::new(false)),
             socket: None,
         }))
@@ -575,6 +583,10 @@ pub struct LlamaCppEngine {
     pending: Vec<GenerationTask>,
     active: Option<TaskId>,
     rx: Option<Receiver<EngineResult<(TaskId, Chunk)>>>,
+    /// When the active task last produced a real chunk (or started): the
+    /// 300 s stall limit is measured against this, not against one blocking
+    /// receive, so `step()` can poll briefly and let the runtime thread go.
+    last_chunk_at: Instant,
     cancelled: Arc<AtomicBool>,
     socket: Option<TcpStream>,
 }
@@ -596,6 +608,7 @@ impl LlamaCppEngine {
         cancelled.store(false, Ordering::Relaxed);
         let (tx, rx) = channel();
         self.rx = Some(rx);
+        self.last_chunk_at = Instant::now();
 
         // Structured chat turns go to the child's chat endpoint so
         // llama-server renders the model's own (GGUF) chat template.
@@ -861,12 +874,19 @@ impl Engine for LlamaCppEngine {
                 return Ok(vec![]);
             }
         }
-        // Wait for the next chunk. step() must not spin empty
+        // Wait briefly for the next chunk. `step()` runs on a runtime thread
+        // (the runner's ChunkStream polls it there), so it must not block for
+        // the child's whole prefill or inter-token gap: poll for STEP_POLL and
+        // hand back a progress marker when nothing arrived — the runner's
+        // no-progress watchdog counts it as work and the API sends nothing
+        // for it — while the real stall limit is a wall clock since the last
+        // chunk.
         let mut out = Vec::new();
         let mut done = false;
         if let Some(rx) = &self.rx {
-            match rx.recv_timeout(Duration::from_secs(300)) {
+            match rx.recv_timeout(STEP_POLL) {
                 Ok(item) => {
+                    self.last_chunk_at = Instant::now();
                     // A reader-thread failure becomes a final error chunk on
                     // the active task (the API maps it to a 5xx) rather than
                     // an orphaned step() error.
@@ -897,12 +917,19 @@ impl Engine for LlamaCppEngine {
                     done = true;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    let tid = self.active.take().unwrap();
-                    let mut c = Chunk::token(tid.clone(), 0, "");
-                    c.is_final = true;
-                    c.error = Some("completion stream stalled >300s".into());
-                    out.push((tid, c));
-                    done = true;
+                    if self.last_chunk_at.elapsed() >= STALL_LIMIT {
+                        let tid = self.active.take().unwrap();
+                        let mut c = Chunk::token(tid.clone(), 0, "");
+                        c.is_final = true;
+                        c.error = Some(format!(
+                            "completion stream stalled >{}s",
+                            STALL_LIMIT.as_secs()
+                        ));
+                        out.push((tid, c));
+                        done = true;
+                    } else if let Some(tid) = self.active.clone() {
+                        out.push((tid.clone(), Chunk::progress(tid)));
+                    }
                 }
             }
         }
@@ -1314,6 +1341,7 @@ mod unix_tests {
             pending: Vec::new(),
             active: None,
             rx: None,
+            last_chunk_at: Instant::now(),
             cancelled: Arc::new(AtomicBool::new(false)),
             socket: None,
         }
@@ -1422,6 +1450,62 @@ mod unix_tests {
             last.error.as_deref().unwrap_or("").contains("500"),
             "{last:?}"
         );
+        server.join().unwrap();
+    }
+
+    /// A quiet child (prefill, a long inter-token gap) must not hold the
+    /// runtime thread: `step()` returns within a poll interval with a
+    /// progress marker (no text, `n_tokens` 0, not final) so the runner's
+    /// watchdog sees work, and the stall limit is measured since the last
+    /// real chunk, not per call.
+    #[test]
+    fn engine_step_yields_progress_while_child_is_quiet() {
+        let (port, server) = mock_server(|_, s| {
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .unwrap();
+            s.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n")
+                .unwrap();
+            // then nothing: hold the stream open until the client goes away
+            let mut buf = [0u8; 64];
+            let _ = s.read(&mut buf);
+        });
+        let mut engine = test_engine(port);
+        let task = chat_task();
+        let tid = task.task_id.clone();
+        engine.submit(task).unwrap();
+        // The first real chunk arrives within a few polls.
+        let mut got_text = false;
+        for _ in 0..100 {
+            let out = engine.step().unwrap();
+            if out.iter().any(|(_, c)| c.text == "Hi") {
+                got_text = true;
+                break;
+            }
+            assert!(out.iter().all(|(_, c)| c.is_progress()), "{out:?}");
+        }
+        assert!(got_text);
+        // Quiet child: every step returns promptly with one progress marker.
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            let out = engine.step().unwrap();
+            assert!(t0.elapsed() < Duration::from_secs(2), "step blocked");
+            assert_eq!(out.len(), 1, "{out:?}");
+            assert_eq!(out[0].0, tid);
+            assert!(out[0].1.is_progress(), "{:?}", out[0].1);
+        }
+        assert!(engine.active.is_some());
+        // Past the stall limit since the last real chunk: a final error.
+        engine.last_chunk_at = Instant::now() - STALL_LIMIT;
+        let out = engine.step().unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1.is_final);
+        assert!(
+            out[0].1.error.as_deref().unwrap().contains("stalled"),
+            "{:?}",
+            out[0].1
+        );
+        assert!(engine.active.is_none());
+        drop(engine);
         server.join().unwrap();
     }
 

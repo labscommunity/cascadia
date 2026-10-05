@@ -2723,6 +2723,12 @@ async fn stream_text_completion(
             let usage_prompt = usage_prompt.clone();
             let echo_pending = echo_pending.clone();
             async move {
+                // A progress marker (a long prompt still going down the
+                // pipeline, one window per engine step): nothing to send,
+                // nothing to count; the connection stays open.
+                if chunk.is_progress() {
+                    return Ok::<Bytes, std::convert::Infallible>(Bytes::new());
+                }
                 if chunk.error.is_none() {
                     let n = chunk_token_count(&chunk);
                     stats.tokens_total.fetch_add(n as u64, Ordering::Relaxed);
@@ -2949,6 +2955,9 @@ async fn stream_completion(
                 // Counts the final chunk too (ov-genai emits its whole
                 // output there); chunk_token_count yields 0 for empty
                 // markers, so no phantom token.
+                if chunk.is_progress() {
+                    return Ok::<Bytes, std::convert::Infallible>(Bytes::new());
+                }
                 if chunk.error.is_none() {
                     let n = chunk_token_count(&chunk);
                     stats.tokens_total.fetch_add(n as u64, Ordering::Relaxed);
