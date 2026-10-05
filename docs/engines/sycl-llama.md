@@ -42,6 +42,30 @@ configuration — one cycle needed the in-engine retry, during a real xe engine
 reset — and VRAM returned to baseline on every cycle (see
 `docs/perf/sycl-elastic/data.json` → `lifecycle_retry`).
 
+## Serving vs parking
+
+What streaming buys depends on whether the GPU has its own memory.
+
+- **Discrete cards** (Arc Pro B70, A770, dGPU class): a partial budget is a
+  real VRAM dial. Streamed layers re-read over PCIe each token; resident
+  layers decode at stock speed, so `--elastic-vram` trades decode rate for
+  how much of the card is left for other work — the serving knob when the
+  model doesn't fit or shares the card.
+- **UMA / integrated GPUs** (Arc B390, Lunar Lake iGPU): the "device pool"
+  and host memory are the same DRAM, so streaming re-reads weights inside
+  the memory the GPU already computes from — it buys accounting isolation,
+  not bandwidth. Measured by t8 on a B390 iGPU (7B, fully streamed):
+  `10.4 -> 0.52 tok/s`, while freeing ~82% of the accounted pool. The
+  pinned-host variant (streamed weights mapped in-place) ran `6.3 tok/s`
+  but frees nothing on UMA, and that device has no system-USM path.
+  Recommendation: for serving use `auto` — a model that fits takes the
+  stock resident path — and treat streaming as a *parking* mode (model
+  kept loadable under a small footprint while other work owns the DRAM).
+  The build prints `stream-weights: warning: integrated GPU (shared
+  memory): ...` whenever streaming actually activates on an iGPU.
+  The stacked PR [#172](https://github.com/labscommunity/cascadia/pull/172)
+  explores `SYCL_Host` buffer placement as an alternative on UMA.
+
 ## Quickstart
 
 ```bash
@@ -73,20 +97,39 @@ one-GPU box.
 | Flag / env | Default | Meaning |
 |---|---|---|
 | `--engine sycl-llama` | — | Select this engine. |
-| `--elastic` | off | `GGML_STREAM_WEIGHTS=1` on the child. Before spawn, the resolved binary (and `libggml-base*` next to it) is probed for the `GGML_STREAM_WEIGHTS` marker — a stock build fails fast with an error instead of silently running resident. The host-side `--elastic` interposer still applies to the process as usual. With the default `--elastic-vram auto`, a model that fits runs at stock speed (streaming turns itself off). |
+| `--elastic` | off | `GGML_STREAM_WEIGHTS=1` on the child. Before spawn, the resolved binary (and `libggml-base*` next to it) is probed for the `GGML_STREAM_WEIGHTS` marker — a stock build fails fast with an error instead of silently running resident. The host `--elastic` interposer is NOT activated for this engine and is scrubbed from the child's environment (see below). With the default `--elastic-vram auto`, a model that fits runs at stock speed (streaming turns itself off). |
 | `--elastic-vram` | `auto` | Resident-weight VRAM budget in GiB for `--elastic`, passed as `GGML_STREAM_VRAM_MB`. `auto` = free device memory − non-streamed weights − 2× largest layer − `GGML_STREAM_RESERVE_MB`; `0` = stream every layer (maximum packing). If the whole model fits, streaming is disabled entirely (stock path, fusion back on). |
 | `--device` | `GPU` (run) / `CPU` (worker) | Device mapping: `GPU` → `SYCL0`, `GPU.N` → `SYCLN`, `CPU` → `--device none` + `-ngl 0`; anything else (`SYCL1`, `Vulkan0`, `SYCL0,SYCL1`) is passed verbatim. |
 | `--llama-bin` | auto | `llama-server` path. Resolution: flag > `CASCADIA_LLAMA_BIN` > `llama-server` (`llama-server.exe`) on `PATH`. |
 | `CASCADIA_LLAMA_BIN` | — | Env fallback for `--llama-bin`. |
 | `--llama-ctx` | `4096` | Context size (`-c`). |
 | `--llama-ngl` | `99` | GPU layers (`-ngl`); forced to 0 on `--device CPU`. |
-| `--llama-args` | — | Raw args appended verbatim; one value per occurrence, split on spaces, repeatable: `--llama-args "-ctk q8_0 -fa on"`. |
+| `--llama-args` | — | Raw args appended verbatim; one value per occurrence, split on spaces, repeatable: `--llama-args "-ctk q8_0 -fa on"`. Reserved flags the engine owns are rejected at startup — `-m`/`--model`/`-mu`/`--model-url`/`-hf`/`-hfr`/`--hf-repo` (use the positional MODEL), `--host`/`--port` (engine picks loopback), `--device`/`-dev` (use `--device`), `-ngl`/`--gpu-layers`/`--n-gpu-layers` (use `--llama-ngl`), `-c`/`--ctx-size` (use `--llama-ctx`). llama-server's parser is last-wins, so without the check a stray `--port` or `-m` would silently shadow the engine's own. |
 | `--llama-load-timeout` | auto | Per-attempt `/health` deadline in seconds. Auto = 60 + 8 per GiB of model file. |
 | `--llama-load-retries` | `1` | Extra spawn attempts when the child exits or never becomes healthy; each retry uses a fresh port after a 3 s pause. |
 | `GGML_STREAM_MIN_KB` | `256` | (child env, patched build) minimum layer-tensor size that is streamed rather than uploaded. |
 | `GGML_STREAM_VRAM_MB` | set by `--elastic-vram` | (child env) resident-weight budget in MiB, or `auto`. |
 | `GGML_STREAM_RESERVE_MB` | `2048` | (child env) headroom `auto` leaves for KV + compute buffers. |
-| `GGML_STREAM_RESIDENT_LAYERS` | — | (child env) keep the first N layers resident directly; overrides the budget. |
+| `GGML_STREAM_RESIDENT_LAYERS` | — | (child env) keep the first N layers resident directly; overrides the budget. Passed through to the child with a warning when set. |
+| `CASCADIA_EXPERT_CACHE_MB` | `0` | (cascadia env) forwarded as `GGML_STREAM_EXPERT_CACHE_MB`: hot-expert device cache for router-aware MoE streaming (0002). |
+
+Without `--elastic`, ambient `GGML_STREAM_WEIGHTS`, `GGML_STREAM_VRAM_MB`
+and `GGML_STREAM_RESIDENT_LAYERS` are dropped from the child's
+environment, so `GGML_STREAM_WEIGHTS=1 cascadia run` still runs resident.
+With `--elastic` the engine sets `GGML_STREAM_WEIGHTS=1` and
+`GGML_STREAM_VRAM_MB` itself, and a set `GGML_STREAM_RESIDENT_LAYERS`
+passes through with a warning since it overrides the budget. The host
+allocator interposer never reaches the child either:
+`CASCADIA_ELASTIC_ACTIVE` and `ELASTIC_*` are removed, and `LD_PRELOAD`
+is filtered down to non-`libcascadia_elastic.*` entries (a user's own
+preloads survive; the var drops only when nothing remains).
+
+If cascadia dies — including by `SIGKILL` — the child dies with it: on
+Linux the spawn installs `PR_SET_PDEATHSIG` and the child is spawned from
+a dedicated long-lived thread, so a retired blocking-pool thread can't
+free the child early; on Windows every child is assigned to a
+`KILL_ON_JOB_CLOSE` Job Object. An orphaned llama-server can't hold
+VRAM or its loopback port.
 
 Sampling knobs (`top_p`, `top_k`, `seed`, `frequency_penalty`,
 `presence_penalty`, `stop`) are forwarded to the child only when they differ
@@ -156,8 +199,15 @@ Guidance:
   f32 KV). cascadia always passes `--llama-ctx`. The router-aware MoE path
   uses the same positioned-read primitive and has not yet been exercised on
   Windows.
-- Chat turns carry `role` + `content` only (no tool calls / multimodal
-  parts); `prompt` remains the fallback for non-chat engines.
+- Chat turns carry `role` + `content` + tool-call fields (`tool_calls`,
+  `tool_call_id`, `name`) and request-level `tools` in the OpenAI wire
+  form; the child runs with `--jinja` so tool calls render through the
+  model's template (a `--no-jinja` in `--llama-args` overrides). The
+  child's streamed `delta.tool_calls` fragments are re-assembled and
+  emitted as `<tool_call>` text before the final chunk, so streaming and
+  non-streaming clients get the same structured `tool_calls` the API
+  produces for other engines. Multimodal parts are not plumbed;
+  `prompt` remains the fallback for non-chat engines.
 
 ## Doctor
 
