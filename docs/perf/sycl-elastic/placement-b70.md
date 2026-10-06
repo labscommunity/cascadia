@@ -77,36 +77,64 @@ resident set (N = layers kept on device).
 | 65 (refs) | stack resident 17.22, auto 17.17 | upstream stock ~17.5 | 17.3 GiB |
 | 62 | 8.25 | **6.36** | 16.1 / 16.8 GiB |
 | 55 | 2.80 | **3.29** | 15.4 / 15.0 GiB |
-| 34 | 1.10 | **1.46** | 10.0 / 10.4 GiB |
+| 34 / 33 (see note) | 1.10 | **1.46** | 10.0 / 10.4 GiB |
 | 0 | **0.54** | 0.45 | 4.0 / 3.7 GiB |
 
 Engine-path check: `cascadia run ... --llama-host-layers 'blk\.6[2-4]\..*'`
 emits `--no-mmap -ot ...=SYCL_Host`, decodes at **6.25 t/s** (bench: 6.36),
 output byte-identical to the resident arm.
 
-The deficit law (link ~50 GB/s) predicts ~14 t/s at N=62 and ~3 t/s at
-N=0 for host placement; the card does not reach that - host-in-place
-measured 6.36 / 0.45. The effective per-token host-read rate is closer to
-~25-30 GB/s at N=62 and falls further at higher streamed fractions.
-Winner is non-monotonic: streaming wins the extremes (N=62: +30%,
-N=0: +20%), host-in-place wins the middle (N=55: +18%, N=34: +33%).
+Note on N=34/33: the streaming budget that came closest gave 34/65
+resident; the recipe's host regex `blk\.(3[3-9]|[4-6][0-9])` keeps 33.
+The host arm therefore reads one extra layer (~201 MiB) per token; the
+rate column below accounts for it.
+
+**The link on this host is PCIe 4.0 x8, not the ~50 GB/s the deficit law
+assumed.** Each B70's upstream switch port (`0000:09:00.0`,
+`0000:0d:00.0`) trains at 16 GT/s x8 (capable of 32 GT/s x16; the AM4
+platform splits its Gen4 lanes x8/x8). Theoretical ceiling is ~15.75
+GB/s per card (the GPU endpoints' own `2.5 GT/s x1` is the card-internal
+virtual link and is not the bottleneck). Effective host-read rate per arm,
+from `bytes_off_device / (1/tps - 1/17.22)`:
+
+| N | off-device GB/token | stream GB/s | host-in-place GB/s |
+|---|---|---|---|
+| 62 | 0.86 | **13.6** | 8.7 |
+| 55 | 2.57 | 8.6 | **10.5** |
+| 34 / 33 | 6.98 / 7.19 | 8.2 | **11.5** |
+| 0 | 13.72 | **7.7** | 6.3 |
+
+At N=62 streaming runs at ~86% of the x8 Gen4 ceiling, and the deficit
+law with a practical 13 GB/s predicts 8.05 t/s vs 8.25 measured. Toward
+full streaming both mechanisms fall to ~6-8 GB/s (the law at 13 GB/s
+gives 0.90 t/s at N=0 vs 0.54/0.45 measured), so another cost besides
+the link dominates there: per-tensor synchronous copies for streaming,
+in-place reads for host placement. The ~14 t/s (N=62) and ~3 t/s (N=0)
+host predictions assumed a ~50 GB/s x16 Gen5 link that this host does not
+have, so they are not reachable here. Winner is non-monotonic: streaming
+wins the extremes (N=62: +30%, N=0: +20%), host-in-place wins the middle
+(N=55: +18%, N=34/33: +33%).
 
 ## Section C - three 27B instances on one card, all generating
 
 Direct `llama-server` (campaign method), `GGML_STREAM_*` via env, 64-token
 completions fired concurrently, per-instance `predicted_per_second`.
 
-| arm | per-instance t/s | combined t/s | peak vram |
+| arm | per-instance t/s | combined t/s | peak vram_mm usage |
 |---|---|---|---|
-| `auto` x3 (splits: fits / 63/65 / 0/65) | 3.49, 5.40, 0.50 | **9.4** | 34.2 GiB* |
-| `--elastic-vram 12,12,0` (62/65, 62/65, 0/65) | 1.88, 1.87, 0.48 | **4.2** | 34.2 GiB* |
-| no `--elastic` (driver oversubscription) | 3.21, 4.22, 4.15 | **11.6** | 34.0 GiB* |
-| 2 resident + 1 all-host (`-ot 'blk\..*'=SYCL_Host`) | 1.18, 1.18, 0.40 | **2.8** | 34.2 GiB* |
-| 3 x one-third on host | 0.54, 0.54, 0.54 | **1.6** | 34.0 GiB* |
+| `auto` x3 (splits: fits / 63/65 / 0/65) | 3.49, 5.40, 0.50 | **9.4** | 31.89 GiB* |
+| `--elastic-vram 12,12,0` (62/65, 62/65, 0/65) | 1.88, 1.87, 0.48 | **4.2** | 31.89 GiB* |
+| no `--elastic` (driver oversubscription) | 3.21, 4.22, 4.15 | **11.6** | 31.70 GiB* |
+| 2 resident + 1 all-host (`-ot 'blk\..*'=SYCL_Host`) | 1.18, 1.18, 0.40 | **2.8** | 31.84 GiB* |
+| 3 x one-third on host | 0.54, 0.54, 0.54 | **1.6** | 31.71 GiB* |
 
-*the xe driver allowed allocation past 32 GiB physical by evicting to host
-- that is the oversubscription the recipe asks about, and it is visible in
-`vram_mm` ("usage" exceeding `total`). Host RAM never went below ~30 GiB
+*vram_mm's `size` on this card is 34,242,297,856 bytes = 31.89 GiB. Every
+C arm peaked at, not above, the card's capacity: usage never exceeds
+`size`. Three 27B instances (~3 x 15 GiB resident in the no-`--elastic`
+arm) cannot all be in VRAM at once, so the driver must be keeping part
+of them in host memory. That is inferred from the capacity, not read off
+the counter. In the `auto` arm, instance 3 also printed `warning: 1913 MiB
+free, fully streamed needs ~4267 MiB` and loaded fully streamed. Host RAM never went below ~30 GiB
 available; no instance failed to load; no xe resets observed.
 
 ## Tate's three questions, answered from this data
@@ -114,8 +142,11 @@ available; no instance failed to load; no xe resets observed.
 1. **Does in-place host memory beat streaming at the same residency?**
    Only in the middle. At N=55/34 host placement wins by ~20-30%; at the
    extremes streaming wins (N=62: 8.25 vs 6.36; N=0: 0.54 vs 0.45). The
-   link on this B70 reaches roughly half the 50 GB/s the deficit law
-   assumes, so host placement never approaches the predicted numbers.
+   link on this host is PCIe 4.0 x8 (~15.75 GB/s), not the ~50 GB/s
+   the predictions assumed. Streaming reaches ~13.6 GB/s at N=62 (near
+   the ceiling) and host-in-place peaks at ~11.5 GB/s mid-range; both fall
+   to ~6-8 GB/s at N=0. On a Gen5 x16 host the ranking could change.
+   Retest there before generalising.
    Recommendation: for a discrete card, keep weight *streaming* as the
    `--elastic` mechanism; `SYCL_Host` placement is a better fit for UMA
    (same DRAM either way) or possibly for mid-range resident splits if a
