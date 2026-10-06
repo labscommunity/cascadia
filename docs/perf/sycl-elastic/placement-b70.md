@@ -72,13 +72,13 @@ q8_0 -ctv q8_0 -dev SYCL0`; tg64 t/s, median of 3 outer runs. Streaming
 budgets tuned so the resident-layer count matches the `-ot` regex's
 resident set (N = layers kept on device).
 
-| N resident | stream t/s | host-in-place t/s | vram peak (stream / host) |
+| N resident | stream t/s | host-in-place t/s | vram_mm peak, median of 3 (stream / host) |
 |---|---|---|---|
-| 65 (refs) | stack resident 17.22, auto 17.17 | upstream stock ~17.5 | 17.3 GiB |
-| 62 | 8.25 | **6.36** | 16.1 / 16.8 GiB |
-| 55 | 2.80 | **3.29** | 15.4 / 15.0 GiB |
-| 34 / 33 (see note) | 1.10 | **1.46** | 10.0 / 10.4 GiB |
-| 0 | **0.54** | 0.45 | 4.0 / 3.7 GiB |
+| 65 (refs) | stack resident 17.22, auto 17.17 | upstream stock ~17.5 | 16.15 GiB |
+| 62 | **8.25** | 6.36 | 15.01 / 15.60 GiB |
+| 55 | 2.80 | **3.29** | 14.39 / 14.01 GiB |
+| 34 / 33 (see note) | 1.10 | **1.46** | 9.28 / 9.73 GiB |
+| 0 | **0.54** | 0.45 | 3.05 / 3.43 GiB |
 
 Engine-path check: `cascadia run ... --llama-host-layers 'blk\.6[2-4]\..*'`
 emits `--no-mmap -ot ...=SYCL_Host`, decodes at **6.25 t/s** (bench: 6.36),
