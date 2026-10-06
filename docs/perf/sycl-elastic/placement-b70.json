@@ -102,6 +102,29 @@
   ],
   "cascadia_host_layers_tps": 6.25
  },
+ "D": {
+  "_note": "async stream pool (bb6dcb55) vs the section-A/B sync build, same host, llama-server on SYCL0, ctx 4096, -ctk q8_0 -fa on, temp 0, n_predict 32, model on tmpfs (warm reads), median of 6 (2 rounds x 3 prompts). n0 = GGML_STREAM_RESIDENT_LAYERS=0, n62 = 62/65.",
+  "sync_server": "placement-b70/llama-stack build (sections A/B binary)",
+  "async_server": "llama-stream-v3 build of the bb6dcb55 patch pair",
+  "arms": ["27B n0", "27B n62", "MoE n0", "2x 27B n0 (window)"],
+  "sync_tps": [0.448, 7.531, 5.537, 0.90],
+  "async_tps": [0.595, 17.211, 7.555, 1.28],
+  "sync_range": [[0.447, 0.448], [7.427, 7.657], [5.486, 5.562], null],
+  "async_range": [[0.593, 0.597], [17.023, 17.285], [7.424, 7.689], null],
+  "window": {
+   "_note": "common-window aggregate: 4 concurrent 96-token requests across 2 servers, total tokens / elapsed wall seconds. Replaces per-instance t/s sums which overstate steady-state.",
+   "sync": {"seconds": 424.5, "tokens": 384, "agg_tps": 0.90, "per_instance": [0.234, 0.236, 0.231, 0.231]},
+   "async": {"seconds": 300.0, "tokens": 384, "agg_tps": 1.28, "per_instance": [0.327, 0.331, 0.330, 0.327]}
+  },
+  "delivered": {
+   "n0_gib": 2865.38, "n0_uploads": 92048, "n0_h2d_gbps": 7.9,
+   "n62_gib": 0.48, "n62_uploads": 13,
+   "moe_gib": 127.90, "moe_uploads": 43392,
+   "moe_expert_gib": 99.6, "moe_routed_tensors": 72, "moe_cache_hit_pct": 0.0
+  },
+  "parity": "streamed output byte-identical sync vs async (24 tokens, temp 0)",
+  "multidevice": "tensor-split 1.5B over SYCL0+SYCL1: per-device pools (84/70 tensors), decode 9.2 t/s, pools drained 13.39/11.27 GiB per card"
+ },
  "C": {
   "card_capacity_gib": 31.89,
   "arms": [

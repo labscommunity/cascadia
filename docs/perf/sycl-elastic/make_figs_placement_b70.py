@@ -193,8 +193,45 @@ def fig13():
     save(fig, "fig13_regression_b70.png")
 
 
+def fig14():
+    D = DATA["D"]
+    fig = newfig(h=6.4)
+    header(fig, "Async stream pool vs synchronous uploader (B70)",
+           "Same arms as sections A-C, rerun on the async pool build "
+           "(copy queue + pinned staging ring + slot pinning). Decode t/s,\n"
+           "median of 6; the 2x arm is common-window aggregate "
+           "(tokens / elapsed). Log scale.")
+    ax = fig.add_axes([0.085, 0.13, 0.87, 0.58])
+    style_ax(ax)
+    ax.set_yscale("log")
+    x = np.arange(len(D["arms"]))
+    w = 0.38
+    b1 = ax.bar(x - w / 2, D["sync_tps"], w, color=MUTED,
+                label="sync uploader (pread + memcpy().wait())")
+    b2 = ax.bar(x + w / 2, D["async_tps"], w, color=ELASTIC,
+                label="async pool (copy queue + slot pinning)")
+    ax.bar_label(b1, fmt="%.2f", fontsize=10.5, color=TEXT, padding=3)
+    ax.bar_label(b2, fmt="%.2f", fontsize=10.5, color=TEXT, padding=3)
+    for xi, (s, a) in enumerate(zip(D["sync_tps"], D["async_tps"])):
+        ax.annotate(f"+{(a/s-1)*100:.0f}%", (xi + w / 2, a),
+                    textcoords="offset points", xytext=(0, 16),
+                    ha="center", fontsize=11, fontweight="bold", color=AMBER)
+    ax.set_xticks(x)
+    ax.set_xticklabels(["27B\n0/65", "27B\n62/65", "MoE\n0/24",
+                        "2x 27B 0/65\n(window agg)"], fontsize=11)
+    ax.set_ylabel("decode t/s (log)", fontsize=12)
+    ax.set_ylim(0.15, 60)
+    ax.set_yticks([0.1, 1, 10])
+    ax.legend(loc="upper right", bbox_to_anchor=(1.0, 0.98), fontsize=10,
+              frameon=True, facecolor="#161b22", edgecolor=GRID)
+    footer(fig, "Arc Pro B70 (SYCL0, PCIe 4.0 x8) | async pool bb6dcb55 | "
+                "27B Q4_K_S, MoE 14.3B-A2.7B Q3_K_M, ctx 4096 | "
+                "data: placement-b70.json D")
+    save(fig, "fig14_async_b70.png")
+
+
 if __name__ == "__main__":
-    fig10(); fig11(); fig12(); fig13()
+    fig10(); fig11(); fig12(); fig13(); fig14()
     if QC_ERRORS:
         print("\n=== QC FAILURES ===")
         for name, kind, detail in QC_ERRORS:
