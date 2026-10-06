@@ -80,10 +80,10 @@ def fig10():
 def fig11():
     fig = newfig(h=6.0)
     header(fig, "How far the PCIe link actually gets",
-           "Effective host-to-device read rate implied by each decode rate "
-           "(streamed bytes per token x t/s). Host-in-place reads direct;\n"
-           "streaming stages through a bounce buffer. Dashed line = PCIe 4.0 "
-           "x8 theoretical peak; neither mechanism gets near it.")
+           "Off-device bytes per token / (token time - resident token time). "
+           "Streaming nears the PCIe 4.0 x8 peak only at N=62;\n"
+           "toward full offload both fall to 6-8 GB/s, so per-transfer "
+           "overhead, not the link, sets the speed there.")
     ax = fig.add_axes([0.085, 0.13, 0.87, 0.60])
     style_ax(ax)
     x = np.arange(len(NS))
