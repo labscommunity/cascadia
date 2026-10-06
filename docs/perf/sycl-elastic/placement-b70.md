@@ -6,6 +6,11 @@ oneAPI 2026.0) against `feat/sycl-llama-elastic-stack` (`82aa11d`) with
 (`scripts/build-llama-stream.sh`, markers verified). Raw data:
 `experiments/2026-10-05-placement-b70/` (not committed).
 
+Updated 2026-10-06 with section D: the same arms re-run against the async
+stream pool (`bb6dcb55` on `feat/sycl-llama-elastic`) - every streaming arm
+is faster, and section D has the numbers and the common-window aggregate
+method that section C's summed column lacks.
+
 ## Findings
 
 Measured on one Arc Pro B70 (SYCL0) on a host whose GPU links run at **PCIe 4.0 x8 (~15.75 GB/s)**. All numbers are medians of 3.
@@ -15,15 +20,16 @@ Measured on one Arc Pro B70 (SYCL0) on a host whose GPU links run at **PCIe 4.0 
    - 27B decode speeds: `--elastic-vram 12` 8.33 t/s (62/65 layers on device), `--elastic-vram 0` 0.55 t/s, and `auto` 17.49 t/s ("model fits, streaming disabled", same speed as resident).
    - Streamed output is byte-identical to unpatched upstream llama.cpp.
    - The streamed child holds 1 model fd and no `LD_PRELOAD`, and it dies with cascadia.
-2. **Streaming saturates the link when little is streamed.** At N=62 it moves ~13.6 GB/s, about 86% of the x8 Gen4 ceiling. The deficit law at 13 GB/s predicts 8.05 t/s; we measured 8.25.
+2. **Streaming saturates the link when little is streamed.** At N=62 it moves ~13.6 GB/s model-implied (see section B: incremental bandwidth, an upper bound), about 86% of the x8 Gen4 ceiling. The deficit law at 13 GB/s predicts 8.05 t/s; we measured 8.25.
 3. **Streaming wins at the parking end.** At N=0 it decodes at 0.54 t/s vs 0.45 for host-in-place, and it has the smallest footprint: a 3.05 GiB peak vs 16.15 GiB resident (−81%).
 4. **Pinned host memory read in place (patch 0003) wins mid-range.** It is +18% at N=55 and +33% at N=34/33, with fused ops and graphs still on. The cascadia path (`--llama-host-layers`) works: 6.25 t/s, output identical to resident.
-5. **Co-tenancy is stable.** In every section-C arm, three 27B instances loaded and generated together with no load failures and no xe resets. `auto` reached 9.4 t/s combined.
+5. **Co-tenancy is stable.** In every section-C arm, three 27B instances loaded and generated together with no load failures and no xe resets. `auto` reached 9.4 t/s summed per-instance (see the sum caveat in section C).
+6. **UPDATE (section D): the async stream pool lifted every streaming arm.** 0/65 +33% (0.448→0.595 t/s), 62/65 +129% (7.53→17.21, resident speed via slot pinning), MoE +36%, and two co-tenant streamed instances +42% aggregate (0.90→1.28 t/s, common-window method).
 
 ### What doesn't (deficiencies)
-1. **Full streaming uses only about half the link.** At N=0 streaming reaches ~7.7 GB/s and host-in-place ~6.3 GB/s, well under the ceiling. Something other than the link dominates there: the synchronous per-tensor copy chain (file → staging → device) for streaming, and the in-place reads for host placement. Async prefetch is the obvious next fix.
+1. **Full streaming uses only about half the link** *(superseded by section D)*. At N=0 the sync build reached ~6.3-7.7 GB/s; the async build moved ~8.3 GB/s (+33%) and is now read-bound on single-threaded `pread`, not on DMA serialization. Host-in-place still ~6.3 GB/s.
 2. **Host-in-place loses with only a few layers off-device.** At N=62 it is −23% vs streaming (6.36 vs 8.25), reading at only ~8.7 GB/s. It is not a drop-in replacement across the range.
-3. **Driver oversubscription beats every elastic arm for 3 instances.** Plain loading with no `--elastic` reached 11.6 t/s combined. That compares with 9.4 for `auto`, 4.2 for explicit budgets (12/12/0), and 2.8 / 1.6 for the two host-placement arms. The trade-off is no residency guarantee: the driver decides what gets moved to host memory.
+3. **Driver oversubscription beats every elastic arm for 3 instances.** Plain loading with no `--elastic` reached 11.6 t/s summed per-instance. That compares with 9.4 for `auto`, 4.2 for explicit budgets (12/12/0), and 2.8 / 1.6 for the two host-placement arms. The trade-off is no residency guarantee: the driver decides what gets moved to host memory.
 4. **Budgets don't compose under contention.** Each of the two 62/65 instances in the 12/12/0 arm fell from 8.33 t/s alone to 1.88 t/s (−77%), because all three instances share one link.
 5. **`auto` splits first-come, first-served.** Instance 2 got 63/65 layers (5.40 t/s); instance 3 got 0/65 (0.50 t/s) and warned it lacked headroom (1913 MiB free vs ~4267 MiB needed). Nothing rebalances after load.
 6. **Tate's host-placement predictions (~14 t/s at N=62, ~3 t/s at N=0) can't be reached here.** They assume a ~50 GB/s Gen5 x16 link. A Gen5 x16 host is untested and could change the ranking.
@@ -39,9 +45,10 @@ Measured on one Arc Pro B70 (SYCL0) on a host whose GPU links run at **PCIe 4.0 
 ### Recommendation
 - Keep streaming + `auto` as `--elastic` on discrete cards.
 - Next work, in order:
-  1. Async prefetch, for the N=0 gap.
-  2. A fairer `auto` split, and promote/demote after load.
-  3. Retest host placement on a Gen5 x16 host.
+  1. ~~Async prefetch, for the N=0 gap~~ - done, see section D (+33% at N=0; the residual gap is serial `pread`, not DMA).
+  2. Parallel/file-reader offload (io_uring or reader threads) for the remaining N=0 gap.
+  3. A fairer `auto` split, and promote/demote after load.
+  4. Retest host placement on a Gen5 x16 host.
 - Document driver oversubscription as the throughput-first alternative when residency guarantees don't matter.
 
 ## Deviation from the recipe
@@ -134,10 +141,18 @@ assumed.** Each B70's upstream switch port (`0000:09:00.0`,
 `0000:0d:00.0`) trains at 16 GT/s x8 (capable of 32 GT/s x16; the AM4
 platform splits its Gen4 lanes x8/x8). Theoretical ceiling is ~15.75
 GB/s per card (the GPU endpoints' own `2.5 GT/s x1` is the card-internal
-virtual link and is not the bottleneck). Effective host-read rate per arm,
-from `bytes_off_device / (1/tps - 1/17.22)`:
+virtual link and is not the bottleneck). The rates below are
+**model-implied incremental bandwidth**, not hardware counters:
+`bytes_off_device / (1/tps - 1/17.22)` attributes the whole decode-time
+delta over the resident arm to streaming reads. That overstates link
+traffic whenever streaming also slows resident-side compute (fusion and
+graphs are off in the streamed arms), so treat the values as an upper
+bound; section D has engine-side byte accounting for comparison. There
+is also no PCIe counter path on this stack: the xe PMU exposes only GT
+engine events, and Level Zero Sysman reports `haveBandwidthCounters=1`
+but `zesDevicePciGetStats` returns unsupported (0x78000003) here.
 
-| N | off-device GB/token | stream GB/s | host-in-place GB/s |
+| N | off-device GB/token | stream GB/s* | host-in-place GB/s* |
 |---|---|---|---|
 | 62 | 0.86 | **13.6** | 8.7 |
 | 55 | 2.57 | 8.6 | **10.5** |
@@ -163,7 +178,7 @@ wins the extremes (N=62: +30%, N=0: +20%), host-in-place wins the middle
 Direct `llama-server` (campaign method), `GGML_STREAM_*` via env, 64-token
 completions fired concurrently, per-instance `predicted_per_second`.
 
-| arm | per-instance t/s | combined t/s | peak vram_mm usage |
+| arm | per-instance t/s | sum of per-instance t/s* | peak vram_mm usage |
 |---|---|---|---|
 | `auto` x3 (splits: fits / 63/65 / 0/65) | 3.49, 5.40, 0.50 | **9.4** | 31.89 GiB* |
 | `--elastic-vram 12,12,0` (62/65, 62/65, 0/65) | 1.88, 1.87, 0.48 | **4.2** | 31.89 GiB* |
@@ -179,6 +194,10 @@ of them in host memory. That is inferred from the capacity, not read off
 the counter. In the `auto` arm, instance 3 also printed `warning: 1913 MiB
 free, fully streamed needs ~4267 MiB` and loaded fully streamed. Host RAM never went below ~30 GiB
 available; no instance failed to load; no xe resets observed.
+
+\*the "sum" column adds the three per-instance rates; it overstates
+steady-state aggregate throughput when instances finish at different
+times. Section D measures aggregate properly with a common window.
 
 ![section C co-tenancy](fig12_cotenancy_b70.png)
 
@@ -197,7 +216,7 @@ available; no instance failed to load; no xe resets observed.
    (same DRAM either way) or possibly for mid-range resident splits if a
    cheaper implementation of host-read wins over staging+memcpy.
 2. **Does driver oversubscription beat either for 3 instances?** Yes:
-   plain no-`--elastic` instances reached 11.6 combined t/s vs 9.4 for
+   plain no-`--elastic` instances reached 11.6 summed per-instance t/s vs 9.4 for
    auto-streaming and 4.2 for explicit budgets. The driver's eviction is
    gentler than per-token re-read. Note the caveat: oversubscription gives
    no residency guarantees - the third instance's pages migrate on
@@ -208,3 +227,78 @@ available; no instance failed to load; no xe resets observed.
    though raw throughput favours oversubscription), it is fastest exactly
    where parking lives (N=0), and it avoids the mid-range where host
    placement happens to win but a smaller resident budget still serves.
+
+## Section D - async stream pool (update of 2026-10-06, `bb6dcb55`)
+
+Sections A-C ran the synchronous uploader: one staging buffer per pool,
+`pread` then `queue.memcpy().wait()` per tensor, on the graph thread. The
+follow-up patch pair replaces it with a dedicated copy queue per device,
+a pinned staging ring, slot parity so an upload never overwrites a slot
+a kernel is still reading, slot-owner tracking so a tensor only
+re-uploads when another tensor has claimed its slot, and a prefetch
+budget. Same footprint contract; the speed changed everywhere.
+
+Method: same host, `llama-server` on SYCL0 (`0b:00.0`), ctx 4096,
+`-ctk q8_0 -fa on`, temp 0, `n_predict 32`, median of 6 (2 rounds x 3
+prompts), decode = `timings.predicted_per_second`. The model sat on
+tmpfs so file reads run at RAM speed - the same warm regime sections
+A-C ran under. n_predict differs from A-C (32 vs 64); decode rate is
+steady-state so the comparison is on t/s.
+
+| arm | sync build t/s | async build t/s | delta |
+|---|---|---|---|
+| 27B, 0/65 resident | 0.448 (0.447-0.448) | **0.595 (0.593-0.597)** | **+33%** |
+| 27B, 62/65 resident | 7.53 (7.43-7.66) | **17.21 (17.02-17.29)** | **+129%** |
+| MoE 14.3B-A2.7B, 0/24 | 5.54 (5.49-5.56) | **7.56 (7.42-7.69)** | **+36%** |
+
+Engine byte accounting at drain: n0 delivered 2865 GiB over 92048
+uploads (sustained ~7.9 GB/s H2D), n62 delivered 0.48 GiB over **13
+uploads total**.
+
+Two mechanisms behind the deltas:
+
+- **Slot pinning.** `ensure` re-uploads a tensor only when a different
+  tensor claimed its slot. At N=62 the 13 streamed tensors each keep
+  their slot, so after the first token they are resident in the pool:
+  17.2 t/s is within 2% of the all-resident arm (17.58), at the same
+  bounded footprint the budget already paid for (the pool is allocated
+  at load regardless). The "821 MiB streamed per token" line is now a
+  cold-start cost, not the steady state - honest reading: `--elastic-vram`
+  is a residency budget, and streamed layers that fit the slot pool run
+  at resident speed.
+- **DMA/compute overlap.** At N=0 (400 tensors > slots, real streaming)
+  the sync chain (`pread` + `memcpy().wait()` per tensor, ~6.3 GB/s
+  effective) becomes read-bound with the copy queue overlapping DMA
+  behind compute: ~8.3 GB/s effective, +33%. The residual limit is
+  single-threaded file reads, not the link; parallel readers or
+  io_uring is the next lever, not more queues.
+
+Co-tenancy, measured the right way this time: two `llama-server`
+processes, both 0/65, four concurrent 96-token requests, aggregate =
+total tokens / common wall window:
+
+| build | per-request t/s | window | tokens | aggregate t/s |
+|---|---|---|---|---|
+| sync | 0.231-0.236 | 424.5 s | 384 | **0.90** |
+| async | 0.327-0.331 | 300.0 s | 384 | **1.28** |
+
+**+42% aggregate** - more than the single-instance +33%, because one
+instance's reads pipeline behind the other's compute.
+
+Multi-device: a 1.5B tensor-split (`-sm layer -ts 1,1 -dev SYCL0,SYCL1`)
+built one pool per device (84/70 tensors), each with its own copy
+queue, decoded at 9.2 t/s with coherent output, and drained
+13.39/11.27 GiB on the respective cards. Functional routing verified;
+a same-speed cross-card benchmark is still blocked by the SYCL1 vLLM
+cotenant.
+
+Output parity: 24 greedy tokens on the same prompt are byte-identical
+between the sync and async builds; sections A-C already established
+parity vs upstream.
+
+MoE detail: the async build's expert path is also parallel (per-slice
+uploads through the copy queue behind a lock) - ops 16128, 0% cache
+hits at `EXPERT_CACHE_MB=0`, 99.6 GiB of expert slices delivered. A
+nonzero expert cache is the follow-up that should turn misses into hits.
+
+![section D async pool](fig14_async_b70.png)
