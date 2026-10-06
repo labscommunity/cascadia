@@ -65,6 +65,8 @@ numerically clean; the single diff is confined to the fused fast path
 (a tie-break, not corruption; identical behaviour was seen in #171's own
 campaign data).
 
+![section A regression](fig13_regression_b70.png)
+
 ## Section B - pinned-host in-place (patch 0003) vs streaming (27B)
 
 `llama-bench` from the stack build: `-p 0 -n 64 -r 3 -ngl 99 -fa 1 -ctk
@@ -115,6 +117,9 @@ have, so they are not reachable here. Winner is non-monotonic: streaming
 wins the extremes (N=62: +30%, N=0: +20%), host-in-place wins the middle
 (N=55: +18%, N=34/33: +33%).
 
+![section B placement](fig10_placement_b70.png)
+![section B link](fig11_link_b70.png)
+
 ## Section C - three 27B instances on one card, all generating
 
 Direct `llama-server` (campaign method), `GGML_STREAM_*` via env, 64-token
@@ -136,6 +141,8 @@ of them in host memory. That is inferred from the capacity, not read off
 the counter. In the `auto` arm, instance 3 also printed `warning: 1913 MiB
 free, fully streamed needs ~4267 MiB` and loaded fully streamed. Host RAM never went below ~30 GiB
 available; no instance failed to load; no xe resets observed.
+
+![section C co-tenancy](fig12_cotenancy_b70.png)
 
 ## Tate's three questions, answered from this data
 
