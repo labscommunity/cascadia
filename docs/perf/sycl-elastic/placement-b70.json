@@ -1,0 +1,149 @@
+{
+ "_source": "experiments/2026-10-05-placement-b70/ (B-results.txt, C-*.json/.mem, A-*.json); medians of 3; card SYCL0 0000:0b:00.0; 27B = Qwen3.8-27B-UD-Q4_K_S, MoE = Qwen3.6-35B-A3B-UD-Q4_K_XL",
+ "link": {
+  "pcie": "4.0 x8",
+  "theoretical_gbps": 15.75
+ },
+ "A": {
+  "arms": [
+   "resident",
+   "--elastic-vram 12 (62/65)",
+   "--elastic-vram 0 (0/65)",
+   "--elastic auto (fits)"
+  ],
+  "tps": [
+   17.58,
+   8.33,
+   0.55,
+   17.49
+  ],
+  "moe": {
+   "arms": [
+    "resident",
+    "--elastic-vram 0",
+    "--elastic-vram 10"
+   ],
+   "tps": [
+    74.22,
+    2.5,
+    4.72
+   ]
+  }
+ },
+ "B": {
+  "resident_tps": 17.22,
+  "auto_tps": 17.17,
+  "resident_peak_gib": 16.15,
+  "N_stream": [
+   62,
+   55,
+   34,
+   0
+  ],
+  "N_host": [
+   62,
+   55,
+   33,
+   0
+  ],
+  "stream_tps": [
+   8.25,
+   2.8,
+   1.1,
+   0.54
+  ],
+  "host_tps": [
+   6.36,
+   3.29,
+   1.46,
+   0.45
+  ],
+  "stream_peak_gib": [
+   15.01,
+   14.39,
+   9.28,
+   3.05
+  ],
+  "host_peak_gib": [
+   15.6,
+   14.01,
+   9.73,
+   3.43
+  ],
+  "offdev_gb_stream": [
+   0.86,
+   2.57,
+   6.98,
+   13.72
+  ],
+  "offdev_gb_host": [
+   0.86,
+   2.57,
+   7.19,
+   13.72
+  ],
+  "stream_gbps": [
+   13.6,
+   8.6,
+   8.2,
+   7.7
+  ],
+  "host_gbps": [
+   8.7,
+   10.5,
+   11.5,
+   6.3
+  ],
+  "law_13gbps_tps": [
+   8.05,
+   3.91,
+   1.68,
+   0.9
+  ],
+  "cascadia_host_layers_tps": 6.25
+ },
+ "C": {
+  "card_capacity_gib": 31.89,
+  "arms": [
+   "auto x3",
+   "budgets 12/12/0",
+   "no --elastic (driver oversub)",
+   "2 resident + 1 all-host",
+   "3 x one-third host"
+  ],
+  "per_instance_tps": [
+   [
+    3.49,
+    5.4,
+    0.5
+   ],
+   [
+    1.88,
+    1.87,
+    0.48
+   ],
+   [
+    3.21,
+    4.22,
+    4.15
+   ],
+   [
+    1.18,
+    1.18,
+    0.4
+   ],
+   [
+    0.54,
+    0.54,
+    0.54
+   ]
+  ],
+  "peak_gib": [
+   31.89,
+   31.89,
+   31.7,
+   31.84,
+   31.71
+  ]
+ }
+}
