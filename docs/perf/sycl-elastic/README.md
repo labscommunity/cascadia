@@ -15,9 +15,15 @@ All numbers come from [`data.json`](./data.json) (verbatim copy of
 | ![fig7](fig7_reliability.png) | `fig7_reliability.png` — 15 load/unload cycles, leak-free, plus second-card parity. |
 | ![fig8](fig8_partial.png) | `fig8_partial.png` — `--elastic-vram` budget sweep: speed follows how much of the model fits. |
 | ![fig9](fig9_windows.png) | `fig9_windows.png` — the same streaming on Windows (Arc B390 iGPU): Linux vs Windows device memory + decode retention. |
+| ![fig10](fig10_placement_b70.png) | `fig10_placement_b70.png` — discrete B70: streaming vs pinned host memory at matched resident layers (log scale). |
+| ![fig11](fig11_link_b70.png) | `fig11_link_b70.png` — effective PCIe 4.0 x8 read rate per arm; neither mechanism nears the ceiling. |
+| ![fig12](fig12_cotenancy_b70.png) | `fig12_cotenancy_b70.png` — three 27B instances on one card: auto / budgets / driver oversubscription / host placement. |
+| ![fig13](fig13_regression_b70.png) | `fig13_regression_b70.png` — section-A regression check on the stack build (27B + MoE). |
 
 Placement study on a UMA iGPU (Arc B390, Linux), stock vs streaming vs
 pinned host memory computed in place: [`placement-b390.md`](placement-b390.md).
+The discrete-card counterpart on the Arc Pro B70 (streaming vs pinned host
+memory vs driver oversubscription): [`placement-b70.md`](placement-b70.md).
 
 ## Methodology
 
