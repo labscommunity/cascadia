@@ -259,10 +259,12 @@ const HOST_ELASTIC_ENV: [&str; 5] = [
 
 /// Remove cascadia's interposer entries (`libcascadia_elastic.<pid>.so`,
 /// written to TMPDIR by `cascadia_elastic::activate`) from an LD_PRELOAD
-/// value; `None` when nothing else remains.
+/// value; `None` when nothing else remains. glibc accepts both colons and
+/// spaces as separators, so split on both — a space-joined list parsed as
+/// one entry would match the filter and drop the user's own preloads too.
 fn filter_ld_preload(v: &str) -> Option<String> {
     let kept: Vec<&str> = v
-        .split(':')
+        .split([':', ' '])
         .filter(|e| {
             !e.is_empty()
                 && !Path::new(e)
@@ -1299,6 +1301,12 @@ impl Engine for LlamaCppEngine {
         if done {
             self.active = None;
             self.rx = None;
+            // Shut the request socket down so the SSE reader thread wakes
+            // from read_line() now instead of lingering until the child's
+            // own read timeout fires (300s) after a stall-side abort.
+            if let Some(s) = self.socket.take() {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
         }
         // Child died mid-stream?
         if self.active.is_some() {
@@ -2111,6 +2119,16 @@ mod unix_tests {
         );
         assert_eq!(filter_ld_preload("/tmp/libcascadia_elastic.42.so"), None);
         assert_eq!(filter_ld_preload(""), None);
+        // space-separated entries (glibc accepts both separators): the
+        // interposer is dropped without taking the user's preload with it
+        assert_eq!(
+            filter_ld_preload("/opt/user.so /tmp/libcascadia_elastic.42.so").as_deref(),
+            Some("/opt/user.so")
+        );
+        assert_eq!(
+            filter_ld_preload("/opt/a.so /opt/b.so:/tmp/libcascadia_elastic.9.so").as_deref(),
+            Some("/opt/a.so:/opt/b.so")
+        );
         assert_eq!(
             filter_ld_preload("/opt/a.so:/opt/b.so").as_deref(),
             Some("/opt/a.so:/opt/b.so")

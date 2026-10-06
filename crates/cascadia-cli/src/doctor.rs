@@ -98,6 +98,9 @@ fn first_line_of(cmd: &str, arg: &str) -> Option<String> {
 /// hung binary can't wedge the report. Returns the trimmed output (stderr
 /// included so loader errors like a missing shared library show up).
 fn run_capturing(bin: &std::path::Path, arg: &str, secs: u64) -> Result<String, String> {
+    use std::sync::mpsc::channel;
+    use std::time::{Duration, Instant};
+
     let mut child = Command::new(bin)
         .arg(arg)
         .stdin(Stdio::null())
@@ -107,37 +110,59 @@ fn run_capturing(bin: &std::path::Path, arg: &str, secs: u64) -> Result<String, 
         .map_err(|e| format!("spawn failed: {e}"))?;
     // Drain both pipes from the start on their own threads: a child that
     // fills the ~64 KiB pipe buffer would otherwise block mid-write and
-    // never exit, deadlocking the wait loop below.
-    let mut stdout = child.stdout.take().map(|mut p| {
+    // never exit, deadlocking the wait loop below. Chunks go over a
+    // channel rather than a join-on-exit: a probed binary that leaves a
+    // daemon behind keeps the pipe's write end open forever, so joining
+    // the readers would hang the report even though the child is gone.
+    let (tx, rx) = channel::<(bool, Vec<u8>)>();
+    let pipes: [(bool, Option<Box<dyn Read + Send>>); 2] = [
+        (true, child.stdout.take().map(|p| Box::new(p) as _)),
+        (false, child.stderr.take().map(|p| Box::new(p) as _)),
+    ];
+    for (is_out, pipe) in pipes {
+        let Some(mut p) = pipe else { continue };
+        let tx = tx.clone();
         std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = p.read_to_end(&mut buf);
-            buf
-        })
-    });
-    let mut stderr = child.stderr.take().map(|mut p| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = p.read_to_end(&mut buf);
-            buf
-        })
-    });
+            let mut buf = [0u8; 8192];
+            loop {
+                match p.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send((is_out, buf[..n].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+    drop(tx);
     for _ in 0..secs * 10 {
         match child.try_wait() {
             Ok(Some(_)) => {
                 let _ = child.wait();
-                let out = stdout
-                    .take()
-                    .and_then(|t| t.join().ok())
-                    .unwrap_or_default();
-                let err = stderr
-                    .take()
-                    .and_then(|t| t.join().ok())
-                    .unwrap_or_default();
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                // Readers EOF once every writer is gone; a daemon that
+                // inherited the pipe may never let that happen, so bound
+                // the drain and keep whatever arrived.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while let Some(rem) = deadline.checked_duration_since(Instant::now()) {
+                    match rx.recv_timeout(rem) {
+                        Ok((is_out, chunk)) => {
+                            if is_out {
+                                out.extend_from_slice(&chunk);
+                            } else {
+                                err.extend_from_slice(&chunk);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
                 let text = String::from_utf8_lossy(if !out.is_empty() { &out } else { &err });
                 return Ok(text.trim().to_string());
             }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
             Err(e) => return Err(e.to_string()),
         }
     }
@@ -489,7 +514,6 @@ pub fn cmd_doctor(args: DoctorArgs) -> Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 
@@ -514,6 +538,19 @@ mod tests {
         let out = run_capturing(&f, "", 10).expect("large output captured");
         assert_eq!(out.len(), 200000);
         assert!(out.chars().all(|c| c == 'x'));
+    }
+
+    /// A probed binary that leaves a daemon behind keeps the pipe's write
+    /// end open; the capture must return when the foreground child exits
+    /// instead of hanging on the reader threads' join.
+    #[test]
+    fn run_capturing_returns_when_grandchild_holds_the_pipe() {
+        // the background sleep inherits stdout; the foreground exits at once
+        let (_dir, f) = script("#!/bin/sh\nsleep 60 &\necho done\n");
+        let t0 = Instant::now();
+        let out = run_capturing(&f, "", 10).expect("capture returned");
+        assert_eq!(out, "done");
+        assert!(t0.elapsed() < Duration::from_secs(15));
     }
 
     /// A child sleeping past the deadline is killed AND reaped — kill()

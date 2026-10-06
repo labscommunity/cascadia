@@ -43,7 +43,7 @@ index cc3f8cd36..67cd5d3f4 100644
  }
  #endif
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index f6fb91798..068f87c4b 100644
+index f6fb91798..c440f0ad2 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -20,6 +20,17 @@
@@ -64,7 +64,7 @@ index f6fb91798..068f87c4b 100644
  #include <vector>
  
  #ifdef __APPLE__
-@@ -2429,3 +2440,154 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size)
+@@ -2429,3 +2440,166 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size)
      GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
      return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
  }
@@ -145,6 +145,17 @@ index f6fb91798..068f87c4b 100644
 +void ggml_stream_plan_reset(void) {
 +    std::lock_guard<std::mutex> lock(g_stream_mu);
 +    g_stream_planned.clear();
++    // drop the previous model's registrations and close its stream
++    // descriptors: reloads used to leak one dup()d fd per model file and
++    // keep stale tensor keys a recycled address could collide with
++    g_stream_map.clear();
++    for (auto & kv : g_stream_fds) {
++#ifdef _WIN32
++        _close(kv.second);
++#else
++        close(kv.second);
++#endif
++    }
 +    g_stream_fds.clear();
 +}
 +
@@ -203,6 +214,7 @@ index f6fb91798..068f87c4b 100644
 +}
 +
 +const ggml_stream_src * ggml_stream_find(const ggml_tensor * tensor) {
++    std::lock_guard<std::mutex> lock(g_stream_mu);
 +    auto it = g_stream_map.find(tensor);
 +    return it == g_stream_map.end() ? nullptr : &it->second;
 +}
@@ -220,14 +232,16 @@ index f6fb91798..068f87c4b 100644
 +    return n;
 +}
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index d1456a867..a0754be6e 100644
+index d1456a867..4bdf6a342 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -30,6 +30,12 @@
+@@ -30,6 +30,14 @@
  #include <stdio.h>
  #include <stdlib.h>
  #include <regex>
 +#include <unordered_map>
++#include <mutex>
++#include <unordered_set>
 +#ifdef _WIN32
 +#include <io.h>
 +#else
@@ -236,12 +250,12 @@ index d1456a867..a0754be6e 100644
  
  #include <sycl/sycl.hpp>
  #include <sycl/backend.hpp>
-@@ -545,11 +551,16 @@ static bool ggml_backend_buffer_is_sycl(ggml_backend_buffer_t buffer) {
+@@ -545,11 +553,16 @@ static bool ggml_backend_buffer_is_sycl(ggml_backend_buffer_t buffer) {
      return buffer->buft->iface.get_name == ggml_backend_sycl_buffer_type_get_name;
  }
  
 +// defined with the stream pool below; frees stream-weights device memory
-+// bound to this buffer before the queue dies
++// bound to this buffer (slot pool, expert arenas) before the queue dies
 +static void ggml_sycl_stream_buffer_teardown(ggml_backend_buffer_t buffer, queue_ptr q);
 +
  static void
@@ -253,7 +267,7 @@ index d1456a867..a0754be6e 100644
      delete ctx;
  }
  catch (sycl::exception const &exc) {
-@@ -621,6 +632,10 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+@@ -621,6 +634,10 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
      GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
      GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
      GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
@@ -264,7 +278,7 @@ index d1456a867..a0754be6e 100644
      ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
      ggml_sycl_set_device(ctx->device);
      auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
-@@ -946,6 +961,10 @@ static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_typ
+@@ -946,6 +963,10 @@ static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_typ
  }
  
  static size_t ggml_backend_sycl_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
@@ -275,7 +289,89 @@ index d1456a867..a0754be6e 100644
      size_t size = ggml_nbytes(tensor);
      int64_t ne0 = tensor->ne[0];
  
-@@ -5446,6 +5465,10 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
+@@ -4766,6 +4787,81 @@ static void mmid_counting_sort_rows(
+     }
+ }
+ 
++// ---- shared stream upload machinery (weight slots + expert arenas) ----
++// dedicated H2D queue per device so copies overlap compute on the in-order
++// main stream; process-lifetime, shared by every pool and expert arena on
++// the device
++static sycl::queue * sycl_stream_copy_queue(int device) {
++    static std::mutex mu;
++    static std::unordered_map<int, sycl::queue *> qs;
++    std::lock_guard<std::mutex> lock(mu);
++    auto it = qs.find(device);
++    if (it != qs.end()) {
++        return it->second;
++    }
++    sycl::queue * q = new sycl::queue(
++        dpct::dev_mgr::instance().get_device(device).create_queue());
++    qs[device] = q;
++    return q;
++}
++
++static int sycl_stream_staging_nbufs(void) {
++    static int v = -1;
++    if (v < 0) {
++        const char * e = getenv("GGML_STREAM_STAGING_BUFS");
++        v = e && atoi(e) > 0 ? atoi(e) : 8;
++        if (v > 64) {
++            v = 64;
++        }
++    }
++    return v;
++}
++
++struct sycl_stream_staging_buf {
++    char *      ptr  = nullptr;
++    size_t      cap  = 0;
++    sycl::event ev;   // last copy command reading this buffer
++    bool        live = false;
++};
++
++// a free staging buffer for n bytes: free means the copy reading it has
++// completed; when the whole ring is in flight the next slot is waited on.
++// caller records the new copy event on the returned slot
++static int sycl_stream_staging_pick(std::vector<sycl_stream_staging_buf> & staging,
++                                    int & next, sycl::queue * cq, size_t n) {
++    const int K = (int) staging.size();
++    int chosen = -1;
++    for (int k = 0; k < K; k++) {
++        const int i = (next + k) % K;
++        auto & b = staging[i];
++        if (!b.live ||
++            b.ev.get_info<sycl::info::event::command_execution_status>() ==
++                sycl::info::event_command_status::complete) {
++            chosen = i;
++            break;
++        }
++    }
++    if (chosen < 0) {
++        chosen = next;
++        staging[chosen].ev.wait();
++    }
++    auto & b = staging[chosen];
++    if (b.cap < n) {
++        if (b.ptr != nullptr) {
++            sycl::free(b.ptr, cq->get_context());
++        }
++        b.ptr = (char *) sycl::malloc_host(n, *cq);
++        if (b.ptr == nullptr) {
++            GGML_LOG_ERROR("%s: failed to allocate %zu bytes pinned staging\n", __func__, n);
++            std::exit(1);
++        }
++        b.cap = n;
++    }
++    b.live = false;
++    next = (chosen + 1) % K;
++    return chosen;
++}
++
+ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+                                  ggml_tensor *dst) try {
+     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
+@@ -5446,6 +5542,10 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
      GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
      GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
      GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
@@ -286,7 +382,7 @@ index d1456a867..a0754be6e 100644
      ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
-@@ -5603,8 +5626,239 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
+@@ -5603,8 +5703,443 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
      return skip;
  }
  
@@ -294,8 +390,19 @@ index d1456a867..a0754be6e 100644
 +// Layer weights registered by the loader are not uploaded at model load.
 +// They share a fixed slot pool and are re-uploaded just-in-time before the
 +// node that consumes them, tracked per-slot so any visit order is correct.
-+// The in-order queue serializes uploads vs ops. Fused-op paths are disabled
-+// while streaming because their covered nodes are opaque to this scan.
++// Fused-op paths are disabled while streaming because their covered nodes
++// are opaque to this scan.
++//
++// Async pipeline: uploads run on a dedicated in-order copy queue per
++// device out of a ring of pinned host staging buffers (GGML_STREAM_STAGING_BUFS,
++// default 8), so the host never blocks on the DMA itself. The consuming
++// node's kernels are gated by a compute-stream barrier on the slot's copy
++// event - the transfer overlaps surrounding compute. Slots come in
++// GGML_STREAM_SLOT_PARITY copies per weight index (default 2): while a
++// layer computes, the next layer's weights prefetch into the other parity
++// (GGML_STREAM_PREFETCH uploads enqueued per node, default 4). Every copy
++// depends on a compute-stream marker - the position behind all enqueued
++// work - so a prefetch can never overwrite a slot a live kernel reads.
 +
 +struct sycl_stream_pool {
 +    bool built   = false;
@@ -308,18 +415,56 @@ index d1456a867..a0754be6e 100644
 +        size_t          padded;
 +        size_t          slot_off;
 +        int             widx;
++        int             slot;
 +    };
 +
 +    void *                                         pool = nullptr;
 +    size_t                                         pool_bytes = 0;
++    int                                            parity = 1;
 +    std::vector<size_t>                            slot_off;
 +    std::vector<const ggml_tensor *>               slot_owner;
++    std::vector<sycl::event>                       slot_ev;
++    std::vector<uint64_t>                          slot_gen;
++    std::vector<uint64_t>                          slot_acked;
 +    std::unordered_map<const ggml_tensor *, entry> map;
-+    std::vector<char>                              staging;
++    std::mutex                                     mu;
++    std::vector<sycl_stream_staging_buf>           staging;
++    int                                            staging_next = 0;
++    // marker = compute-stream position behind all enqueued work; copies
++    // depend on it. Stamped per layer per graph - by the first node of a
++    // layer every reader of the target parity is already enqueued.
++    sycl::event                                    marker;
++    uint64_t                                       marker_stamp = UINT64_MAX;
 +    size_t                                         bytes_uploaded = 0;
 +    size_t                                         uploads = 0;
 +};
 +static std::unordered_map<ggml_backend_buffer_t, sycl_stream_pool> g_swpools;
++static std::mutex g_swpools_mu;
++static std::atomic<uint64_t> g_stream_graph_seq{0};
++
++static int sycl_stream_slot_parity(void) {
++    static int v = -1;
++    if (v < 0) {
++        const char * e = getenv("GGML_STREAM_SLOT_PARITY");
++        v = e && atoi(e) > 0 ? atoi(e) : 2;
++        if (v > 8) {
++            v = 8;
++        }
++    }
++    return v;
++}
++
++static int sycl_stream_prefetch_max(void) {
++    static int v = -1;
++    if (v < 0) {
++        const char * e = getenv("GGML_STREAM_PREFETCH");
++        v = e ? atoi(e) : 4;
++        if (v < 0) {
++            v = 0;
++        }
++    }
++    return v;
++}
 +
 +static size_t sycl_stream_padded_size(const ggml_tensor * t) {
 +    size_t size = ggml_nbytes(t);
@@ -363,14 +508,19 @@ index d1456a867..a0754be6e 100644
 +        e.widx     = recs[i].widx;
 +        e.nbytes   = ggml_nbytes(ts[i]);
 +        e.padded   = sycl_stream_padded_size(ts[i]);
++        e.slot     = e.widx * sycl_stream_slot_parity() + recs[i].layer % sycl_stream_slot_parity();
 +        wmax[e.widx] = std::max(wmax[e.widx], e.padded);
 +    }
 +
-+    sw.slot_off.assign(nw, 0);
++    const int parity = sycl_stream_slot_parity();
++    sw.parity = parity;
++    sw.slot_off.assign(nw * parity, 0);
 +    size_t off = 0;
 +    for (int w = 0; w < nw; w++) {
-+        sw.slot_off[w] = off;
-+        off += GGML_PAD(wmax[w], SYCL_BUFFER_ALIGNMENT);
++        for (int p = 0; p < parity; p++) {
++            sw.slot_off[w * parity + p] = off;
++            off += GGML_PAD(wmax[w], SYCL_BUFFER_ALIGNMENT);
++        }
 +    }
 +    sw.pool_bytes = off;
 +
@@ -382,7 +532,7 @@ index d1456a867..a0754be6e 100644
 +
 +    for (int i = 0; i < n; i++) {
 +        auto & e = sw.map[ts[i]];
-+        e.slot_off = sw.slot_off[recs[i].widx];
++        e.slot_off = sw.slot_off[e.slot];
 +        ggml_tensor * t = const_cast<ggml_tensor *>(ts[i]);
 +        t->data = (char *) sw.pool + e.slot_off;
 +        if (t->extra) {
@@ -390,12 +540,16 @@ index d1456a867..a0754be6e 100644
 +        }
 +    }
 +
-+    sw.slot_owner.assign(nw, nullptr);
++    sw.slot_owner.assign(nw * parity, nullptr);
++    sw.slot_ev.assign(nw * parity, sycl::event());
++    sw.slot_gen.assign(nw * parity, 0);
++    sw.slot_acked.assign(nw * parity, 0);
++    sw.staging.assign(sycl_stream_staging_nbufs(), sycl_stream_staging_buf{});
 +    sw.device = device;
 +    sw.built  = true;
 +    // fprintf on purpose: the server hides GGML_LOG_INFO at default verbosity
-+    fprintf(stderr, "%s: stream slots %.2f MiB (%d slots, %d streamed tensors)\n",
-+            __func__, sw.pool_bytes / 1048576.0, nw, n);
++    fprintf(stderr, "%s: stream slots %.2f MiB (%d slots, %d streamed tensors, parity %d)\n",
++            __func__, sw.pool_bytes / 1048576.0, nw * parity, n, parity);
 +    return true;
 +}
 +catch (sycl::exception const &exc) {
@@ -404,7 +558,20 @@ index d1456a867..a0754be6e 100644
 +    return false;
 +}
 +
-+static void ggml_sycl_stream_upload_one(sycl_stream_pool & sw, const ggml_tensor * t) {
++// the stream position behind everything enqueued so far; copies depend on
++// it so a re-upload never overtakes a kernel still reading the slot. The
++// stamp refreshes it once per layer per graph: all readers of the target
++// parity were enqueued before the layer's first node is scanned.
++static const sycl::event & sycl_stream_marker(sycl_stream_pool & sw, queue_ptr q, uint64_t stamp) {
++    if (sw.marker_stamp != stamp) {
++        sw.marker = q->ext_oneapi_submit_barrier();
++        sw.marker_stamp = stamp;
++    }
++    return sw.marker;
++}
++
++static void ggml_sycl_stream_upload_one(sycl_stream_pool & sw, const ggml_tensor * t,
++                                        const std::vector<sycl::event> & deps) {
 +    auto it = sw.map.find(t);
 +    if (it == sw.map.end()) {
 +        return;
@@ -412,13 +579,14 @@ index d1456a867..a0754be6e 100644
 +    auto & e = it->second;
 +    char * dst = (char *) sw.pool + e.slot_off;
 +
++    sycl::queue * cq = sycl_stream_copy_queue(sw.device);
++    const int   bi = sycl_stream_staging_pick(sw.staging, sw.staging_next, cq, e.nbytes);
++    char *      buf = sw.staging[bi].ptr;
++
 +    // L0 cannot USM-memcpy from file-mapped pages - stage through a plain
 +    // host buffer first (same workaround as ggml_backend_sycl_buffer_set_tensor)
-+    if (sw.staging.size() < e.nbytes) {
-+        sw.staging.resize(e.nbytes);
-+    }
 +    if (e.src.host_ptr != nullptr) {
-+        memcpy(sw.staging.data(), e.src.host_ptr, e.nbytes);
++        memcpy(buf, e.src.host_ptr, e.nbytes);
 +    } else {
 +        size_t got = 0;
 +        while (got < e.nbytes) {
@@ -440,13 +608,13 @@ index d1456a867..a0754be6e 100644
 +            ov.Offset     = (DWORD) (off & 0xFFFFFFFFu);
 +            ov.OffsetHigh = (DWORD) (off >> 32);
 +            DWORD rd = 0;
-+            if (!ReadFile(h, (char *) sw.staging.data() + got, (DWORD) chunk, &rd, &ov)) {
++            if (!ReadFile(h, buf + got, (DWORD) chunk, &rd, &ov)) {
 +                GGML_LOG_ERROR("%s: ReadFile failed for streamed tensor\n", __func__);
 +                std::exit(1);
 +            }
 +            const int r = (int) rd;
 +#else
-+            const ssize_t r = pread(e.src.fd, sw.staging.data() + got, e.nbytes - got,
++            const ssize_t r = pread(e.src.fd, buf + got, e.nbytes - got,
 +                                    (off_t) (e.src.file_off + got));
 +#endif
 +            if (r <= 0) {
@@ -457,15 +625,21 @@ index d1456a867..a0754be6e 100644
 +        }
 +        if (getenv("GGML_STREAM_DEBUG")) {
 +            uint64_t h = 1469598103934665603ull;
-+            for (size_t b = 0; b < e.nbytes; b += 4096) { h = (h ^ (uint8_t) sw.staging[b]) * 1099511628211ull; }
++            for (size_t b = 0; b < e.nbytes; b += 4096) { h = (h ^ (uint8_t) buf[b]) * 1099511628211ull; }
 +            fprintf(stderr, "[sw] %s off=%zu n=%zu fnv=%llx\n", t->name, e.src.file_off, e.nbytes,
 +                    (unsigned long long) h);
 +        }
 +    }
-+    SYCL_CHECK(CHECK_TRY_ERROR(sw.q->memcpy(dst, sw.staging.data(), e.nbytes).wait()));
++    sycl::event ev = deps.empty()
++                   ? cq->memcpy(dst, buf, e.nbytes)
++                   : cq->memcpy(dst, buf, e.nbytes, deps);
++    sw.staging[bi].ev = ev;
++    sw.staging[bi].live = true;
 +    if (e.padded > e.nbytes) {
-+        SYCL_CHECK(CHECK_TRY_ERROR(sw.q->memset(dst + e.nbytes, 0, e.padded - e.nbytes).wait()));
++        ev = cq->memset(dst + e.nbytes, 0, e.padded - e.nbytes, {ev});
 +    }
++    sw.slot_ev[e.slot] = ev;
++    sw.slot_gen[e.slot]++;
 +    // raw file bytes were uploaded - the in-place reorder optimization must run again
 +    if (t->extra) {
 +        ((ggml_tensor_extra_gpu *) t->extra)->optimized_feature.reorder = false;
@@ -474,7 +648,52 @@ index d1456a867..a0754be6e 100644
 +    sw.uploads++;
 +}
 +
-+static void ggml_sycl_stream_node(ggml_backend_sycl_context * sycl_ctx, const ggml_tensor * n) {
++// pool lookup + lazy build shared by the needed-scan and the prefetch
++static sycl_stream_pool * ggml_sycl_stream_pool_for(ggml_backend_buffer_t buf) {
++    std::lock_guard<std::mutex> lock(g_swpools_mu);
++    return &g_swpools[buf];
++}
++
++static bool ggml_sycl_stream_pool_ready(sycl_stream_pool & sw, ggml_backend_buffer_t buf) {
++    if (sw.built) {
++        return true;
++    }
++    auto * bctx = (ggml_backend_sycl_buffer_context *) buf->context;
++    sw.q = bctx->stream;
++    return ggml_sycl_stream_build(sw, buf, bctx->device, sw.q);
++}
++
++// upload s into its slot when not resident; deps (optional) receives the
++// slot's last write event for the consumer barrier. returns true when an
++// upload was enqueued
++static bool ggml_sycl_stream_ensure(sycl_stream_pool & sw, const ggml_tensor * s,
++                                    queue_ptr q, uint64_t stamp, std::vector<sycl::event> * deps) {
++    auto it = sw.map.find(s);
++    if (it == sw.map.end()) {
++        return false;
++    }
++    auto & e = it->second;
++    if (sw.slot_owner[e.slot] != s) {
++        ggml_sycl_stream_upload_one(sw, s, { sycl_stream_marker(sw, q, stamp) });
++        sw.slot_owner[e.slot] = s;
++        if (deps != nullptr) {
++            deps->push_back(sw.slot_ev[e.slot]);
++            sw.slot_acked[e.slot] = sw.slot_gen[e.slot];
++        }
++        return true;
++    }
++    if (deps != nullptr && sw.slot_gen[e.slot] != sw.slot_acked[e.slot]) {
++        deps->push_back(sw.slot_ev[e.slot]);
++        sw.slot_acked[e.slot] = sw.slot_gen[e.slot];
++    }
++    return false;
++}
++
++// streamed weight tensors node n consumes (view-chased roots on sycl
++// buffers); nsrc receives the count
++static void ggml_sycl_stream_sources(const ggml_tensor * n,
++                                     const ggml_tensor ** srcs, int * nsrc) {
++    *nsrc = 0;
 +    for (int j = 0; j < GGML_MAX_SRC && n->src[j] != nullptr; j++) {
 +        const ggml_tensor * s = n->src[j];
 +        while (s->view_src != nullptr) {
@@ -484,24 +703,78 @@ index d1456a867..a0754be6e 100644
 +        if (rec == nullptr || s->buffer == nullptr || !ggml_backend_buffer_is_sycl(s->buffer)) {
 +            continue;
 +        }
-+        sycl_stream_pool & sw = g_swpools[s->buffer];
-+        if (!sw.built) {
-+            auto * bctx = (ggml_backend_sycl_buffer_context *) s->buffer->context;
-+            sw.q = bctx->stream;
-+            if (!ggml_sycl_stream_build(sw, s->buffer, bctx->device, sw.q)) {
-+                continue;
-+            }
++        srcs[(*nsrc)++] = s;
++    }
++}
++
++static void ggml_sycl_stream_node(ggml_backend_sycl_context * sycl_ctx, const ggml_tensor * n,
++                                  uint64_t graph_seq, int * cur_layer) {
++    const ggml_tensor * srcs[GGML_MAX_SRC];
++    int nsrc = 0;
++    ggml_sycl_stream_sources(n, srcs, &nsrc);
++    if (nsrc == 0) {
++        return;
++    }
++    std::vector<sycl::event> deps;
++    deps.reserve(nsrc);
++    for (int k = 0; k < nsrc; k++) {
++        const ggml_tensor * s = srcs[k];
++        const ggml_stream_src * rec = ggml_stream_find(s);
++        if (cur_layer != nullptr && rec->layer > *cur_layer) {
++            *cur_layer = rec->layer;
 +        }
-+        GGML_UNUSED(sycl_ctx);
-+        auto it = sw.map.find(s);
-+        if (it == sw.map.end()) {
++        sycl_stream_pool * swp = ggml_sycl_stream_pool_for(s->buffer);
++        std::unique_lock<std::mutex> lock(swp->mu);
++        if (!ggml_sycl_stream_pool_ready(*swp, s->buffer)) {
 +            continue;
 +        }
-+        if (sw.slot_owner[it->second.widx] != s) {
-+            ggml_sycl_stream_upload_one(sw, s);
-+            sw.slot_owner[it->second.widx] = s;
++        const uint64_t stamp = (graph_seq << 32) | (uint64_t) (rec->layer + 1);
++        ggml_sycl_stream_ensure(*swp, s, sycl_ctx->stream(), stamp, &deps);
++    }
++    if (!deps.empty()) {
++        sycl_ctx->stream()->ext_oneapi_submit_barrier(deps);
++    }
++}
++
++// enqueue uploads for the next streamed layer while the current layer's
++// kernels run; scans from node `from`, enqueues at most `budget` uploads,
++// returns the node index to resume from on the next call
++static int ggml_sycl_stream_prefetch(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph,
++                                     int from, int cur_layer, uint64_t graph_seq, int budget) {
++    int j      = from;
++    int target = cur_layer + 1;
++    for (; j < cgraph->n_nodes && budget > 0; j++) {
++        const ggml_tensor * srcs[GGML_MAX_SRC];
++        int nsrc = 0;
++        ggml_sycl_stream_sources(cgraph->nodes[j], srcs, &nsrc);
++        bool stop = false;
++        for (int k = 0; k < nsrc; k++) {
++            const ggml_stream_src * rec = ggml_stream_find(srcs[k]);
++            if (target <= 0) {
++                target = rec->layer;   // first streamed layer in the graph
++            }
++            if (rec->layer > target) {
++                stop = true;   // deeper layers share a parity slot already in flight
++                break;
++            }
++            if (rec->layer != target) {
++                continue;
++            }
++            sycl_stream_pool * swp = ggml_sycl_stream_pool_for(srcs[k]->buffer);
++            std::unique_lock<std::mutex> lock(swp->mu);
++            if (!ggml_sycl_stream_pool_ready(*swp, srcs[k]->buffer)) {
++                continue;
++            }
++            const uint64_t stamp = (graph_seq << 32) | (uint64_t) (target + 1);
++            if (ggml_sycl_stream_ensure(*swp, srcs[k], sycl_ctx->stream(), stamp, nullptr)) {
++                budget--;
++            }
++        }
++        if (stop) {
++            break;
 +        }
 +    }
++    return j;
 +}
 +
 +static void ggml_sycl_stream_buffer_teardown(ggml_backend_buffer_t buffer, queue_ptr q) {
@@ -511,35 +784,68 @@ index d1456a867..a0754be6e 100644
 +    // drain in-flight kernels/memcpys before freeing the device memory
 +    // their reads/writes may still target
 +    q->wait();
-+    auto sw = g_swpools.find(buffer);
-+    if (sw != g_swpools.end()) {
-+        if (sw->second.pool != nullptr) {
-+            ggml_sycl_free_device(sw->second.pool, *q);
++    sycl_stream_pool * swp = nullptr;
++    {
++        std::lock_guard<std::mutex> lock(g_swpools_mu);
++        auto it = g_swpools.find(buffer);
++        if (it != g_swpools.end()) {
++            swp = &it->second;
 +        }
-+        g_swpools.erase(sw);
++    }
++    if (swp != nullptr) {
++        std::lock_guard<std::mutex> lock(swp->mu);
++        // copies still in flight read the staging ring and write the pool
++        sycl::queue * cq = swp->device >= 0 ? sycl_stream_copy_queue(swp->device) : nullptr;
++        if (cq != nullptr) {
++            cq->wait();
++        }
++        if (swp->pool != nullptr) {
++            ggml_sycl_free_device(swp->pool, *q);
++            swp->pool = nullptr;
++        }
++        if (cq != nullptr) {
++            for (auto & b : swp->staging) {
++                if (b.ptr != nullptr) {
++                    sycl::free(b.ptr, cq->get_context());
++                    b.ptr = nullptr;
++                }
++            }
++        }
++        std::lock_guard<std::mutex> mlock(g_swpools_mu);
++        g_swpools.erase(buffer);
 +    }
 +}
++
 +
  static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
      ggml_sycl_set_main_device(sycl_ctx->device);
 +    const bool stream_weights = ggml_stream_weights_enabled();
++    const uint64_t graph_seq = stream_weights ? ++g_stream_graph_seq : 0;
++    int cur_layer = -1;
++    int prefetch_j = 0;
  
      for (int i = 0; i < cgraph->n_nodes; i++) {
          ggml_tensor * node = cgraph->nodes[i];
-@@ -5615,7 +5869,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -5615,7 +6150,17 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
              continue;
          }
  
 -        const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
 +        if (stream_weights) {
-+            ggml_sycl_stream_node(sycl_ctx, node);
++            ggml_sycl_stream_node(sycl_ctx, node, graph_seq, &cur_layer);
++            const int pf_budget = sycl_stream_prefetch_max();
++            if (pf_budget > 0) {
++                prefetch_j = ggml_sycl_stream_prefetch(sycl_ctx, cgraph,
++                                                       std::max(prefetch_j, i + 1),
++                                                       cur_layer, graph_seq, pf_budget);
++            }
 +        }
 +
 +        const int nodes_to_skip = stream_weights ? 0 : ggml_sycl_fuse(*sycl_ctx, cgraph, i);
          if (nodes_to_skip != 0) {
              i += nodes_to_skip;
              continue;
-@@ -5629,7 +5887,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -5629,7 +6174,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
          }
  #endif
          // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
@@ -548,7 +854,7 @@ index d1456a867..a0754be6e 100644
              ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
              const int gdn_nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
              if (gdn_nodes_to_skip > 0) {
-@@ -5638,20 +5896,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -5638,20 +6183,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                  continue;
              }
          }
@@ -572,7 +878,7 @@ index d1456a867..a0754be6e 100644
              i += 2;
              continue;
          }
-@@ -5712,7 +5970,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
+@@ -5712,7 +6257,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
  
  #ifdef GGML_SYCL_GRAPH
      bool use_sycl_graph = false;
@@ -581,7 +887,7 @@ index d1456a867..a0754be6e 100644
          use_sycl_graph = check_graph_compatibility(cgraph);
      }
      if (use_sycl_graph) {
-@@ -5849,6 +6107,13 @@ static enum ggml_backend_dev_type ggml_backend_sycl_device_get_type(ggml_backend
+@@ -5849,6 +6394,13 @@ static enum ggml_backend_dev_type ggml_backend_sycl_device_get_type(ggml_backend
      if (info.l0_device_type_valid && !info.l0_discrete_gpu) {
          return GGML_BACKEND_DEVICE_TYPE_IGPU;
      }

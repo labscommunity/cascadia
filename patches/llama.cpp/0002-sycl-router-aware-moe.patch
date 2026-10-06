@@ -1,26 +1,8 @@
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index a0754be6e..d73a1ef9a 100644
+index 4bdf6a342..880d68737 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -31,6 +31,8 @@
- #include <stdlib.h>
- #include <regex>
- #include <unordered_map>
-+#include <mutex>
-+#include <unordered_set>
- #ifdef _WIN32
- #include <io.h>
- #else
-@@ -552,7 +554,7 @@ static bool ggml_backend_buffer_is_sycl(ggml_backend_buffer_t buffer) {
- }
- 
- // defined with the stream pool below; frees stream-weights device memory
--// bound to this buffer before the queue dies
-+// bound to this buffer (slot pool, expert arenas) before the queue dies
- static void ggml_sycl_stream_buffer_teardown(ggml_backend_buffer_t buffer, queue_ptr q);
- 
- static void
-@@ -4413,7 +4415,33 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
+@@ -4415,7 +4415,34 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
      }
  }
  
@@ -37,7 +19,8 @@ index a0754be6e..d73a1ef9a 100644
 +static std::mutex                         g_expert_mu;
 +// while set, suppress the in-place weight reorder optimization: expert
 +// slices live in shared slot arenas whose raw file layout must be preserved
-+static bool                               g_expert_slice_guard = false;
++// (per-thread: concurrent graphs must not leak the guard across each other)
++static thread_local bool                  g_expert_slice_guard = false;
 +
 +// clears g_expert_slice_guard on every exit path, including an unwind
 +// into the function-level sycl::exception catch
@@ -54,8 +37,8 @@ index a0754be6e..d73a1ef9a 100644
      return g_ggml_sycl_enable_optimize && //allow optimize, controlled by $GGML_SYCL_ENABLE_OPT
             ctx.opt_feature.reorder &&      //allow this device due to good perf, skip the devices with bad perf.
             dst->op == GGML_OP_MUL_MAT &&   //limit to some supported cases of Q4_0, to do for more cases.
-@@ -4785,6 +4813,293 @@ static void mmid_counting_sort_rows(
-     }
+@@ -4862,6 +4889,327 @@ static int sycl_stream_staging_pick(std::vector<sycl_stream_staging_buf> & stagi
+     return chosen;
  }
  
 +// ---- router-aware MoE expert streaming: selective per-expert uploads ----
@@ -68,11 +51,15 @@ index a0754be6e..d73a1ef9a 100644
 +// address them unchanged. The fused path feeds the kernel a private
 +// slot-id table; the sequential paths resolve a live slice pointer. The
 +// graph's router-id tensor and all other id consumers are untouched.
++// Arena state (slots, LRU, epoch, staging ring) mutates only under
++// g_expert_mu; uploads go to the device copy queue and the consuming
++// kernel is gated by the arena's pending events.
 +
 +struct sycl_expert_arena {
 +    bool                 built    = false;
 +    char *               base     = nullptr;
 +    ggml_backend_buffer_t buf     = nullptr; // owning weight buffer, for teardown
++    int                  device   = -1;
 +    int                  n_cache  = 0;    // LRU-resident expert slices
 +    int                  n_scratch = 0;   // window >= router top-k (distinct ids per call)
 +    int                  scr_cur  = 0;
@@ -80,10 +67,12 @@ index a0754be6e..d73a1ef9a 100644
 +    std::vector<int32_t> slot_id;         // expert id per cache slot, -1 = free
 +    std::vector<uint64_t> slot_lru;
 +    uint64_t             epoch    = 0;
++    std::vector<sycl_stream_staging_buf> staging;
++    int                  staging_next = 0;
++    std::vector<sycl::event> pending;     // copies the consumer must await
 +};
 +
 +static std::unordered_map<const ggml_tensor *, sycl_expert_arena> g_earenas;
-+static std::vector<char> g_expert_staging;
 +static size_t g_expert_bytes_up = 0;
 +static size_t g_expert_uploads  = 0;
 +static size_t g_expert_hits     = 0;
@@ -162,6 +151,7 @@ index a0754be6e..d73a1ef9a 100644
 +    return g_expert_n_routed;
 +}
 +
++// caller holds g_expert_mu
 +static sycl_expert_arena * sycl_expert_arena_build(const ggml_tensor * t, queue_ptr q, int n_ids) {
 +    sycl_expert_arena & a = g_earenas[t];
 +    if (a.built) {
@@ -172,6 +162,8 @@ index a0754be6e..d73a1ef9a 100644
 +
 +    a.stride    = t->nb[2];
 +    a.buf       = t->buffer;
++    a.device    = ((ggml_backend_sycl_buffer_context *) t->buffer->context)->device;
++    a.staging.assign(sycl_stream_staging_nbufs(), sycl_stream_staging_buf{});
 +    a.n_scratch = n_ids > 1 ? n_ids : 1;
 +    const size_t budget = sycl_expert_cache_bytes();
 +    if (budget > 0 && sycl_expert_n_routed() > 0) {
@@ -209,8 +201,12 @@ index a0754be6e..d73a1ef9a 100644
 +// `pinned` (optional) protects slots already placed for the current fused
 +// call from LRU eviction; scratch slots are assigned round-robin and are
 +// never reused within one call (n_scratch >= distinct ids per call).
++// The copy is enqueued on the device copy queue behind `marker` and its
++// event pushed to a.pending - the caller barriers the compute stream on it
++// before the consuming kernel. caller holds g_expert_mu
 +static int sycl_expert_ensure_slot(sycl_expert_arena & a, const ggml_stream_src * rec,
-+                                   const ggml_tensor * t, int32_t id, queue_ptr q,
++                                   const ggml_tensor * t, int32_t id,
++                                   const sycl::event & marker,
 +                                   std::vector<uint8_t> * pinned) {
 +    for (int s = 0; s < a.n_cache; s++) {
 +        if (a.slot_id[s] == id) {
@@ -245,14 +241,17 @@ index a0754be6e..d73a1ef9a 100644
 +    }
 +
 +    char * dstp = a.base + (size_t) victim * a.stride;
-+    if (g_expert_staging.size() < a.stride) {
-+        g_expert_staging.resize(a.stride);
-+    }
-+    if (!sycl_expert_read_slice(rec->fd, rec->file_off + (size_t) id * a.stride, a.stride, g_expert_staging.data())) {
++    sycl::queue * cq = sycl_stream_copy_queue(a.device);
++    const int   bi = sycl_stream_staging_pick(a.staging, a.staging_next, cq, a.stride);
++    char *      buf = a.staging[bi].ptr;
++    if (!sycl_expert_read_slice(rec->fd, rec->file_off + (size_t) id * a.stride, a.stride, buf)) {
 +        GGML_LOG_ERROR("%s: expert slice read failed (tensor %s, id %d)\n", __func__, t->name, id);
 +        std::exit(1);
 +    }
-+    SYCL_CHECK(CHECK_TRY_ERROR(q->memcpy(dstp, g_expert_staging.data(), a.stride).wait()));
++    sycl::event ev = cq->memcpy(dstp, buf, a.stride, {marker});
++    a.staging[bi].ev = ev;
++    a.staging[bi].live = true;
++    a.pending.push_back(ev);
 +    g_expert_bytes_up += a.stride;
 +    return victim;
 +}
@@ -262,12 +261,14 @@ index a0754be6e..d73a1ef9a 100644
 +    while (root->view_src != nullptr) {
 +        root = root->view_src;
 +    }
++    std::lock_guard<std::mutex> lock(g_expert_mu);
 +    return g_expert_tensors.find(root) != g_expert_tensors.end();
 +}
 +
 +// single-token fused MoE GEMV over the arena: raw file layout (no reorder),
 +// private slot-id table, tensor's own expert stride. Returns false when the
 +// shape/type is not GEMV-eligible so the generic sequential paths run.
++// caller holds g_expert_mu through the kernel launch
 +static bool ggml_sycl_mul_mat_id_expert_fused(ggml_backend_sycl_context & ctx, ggml_tensor * dst, int64_t n_ids) {
 +    const ggml_tensor * src0 = dst->src[0];
 +    const ggml_tensor * src1 = dst->src[1];
@@ -290,6 +291,10 @@ index a0754be6e..d73a1ef9a 100644
 +
 +    sycl_expert_arena & a = *sycl_expert_arena_build(src0, stream, (int) n_ids);
 +
++    // uploads go out behind a marker covering everything enqueued so far:
++    // a miss can never overwrite a slice a live kernel still reads
++    const sycl::event marker = stream->ext_oneapi_submit_barrier();
++
 +    // place every selected expert exactly once; pin cache hits against LRU
 +    std::vector<uint8_t> pinned(a.n_cache, 0);
 +    for (int64_t id = 0; id < n_ids; id++) {
@@ -301,7 +306,11 @@ index a0754be6e..d73a1ef9a 100644
 +    std::vector<int32_t> slot_of(n_ids, 0);
 +    for (int64_t id = 0; id < n_ids; id++) {
 +        const int32_t eid = *(const int32_t *) (ids_host.data() + id * ids->nb[0]);
-+        slot_of[id] = sycl_expert_ensure_slot(a, rec, src0, eid, stream, &pinned);
++        slot_of[id] = sycl_expert_ensure_slot(a, rec, src0, eid, marker, &pinned);
++    }
++    if (!a.pending.empty()) {
++        stream->ext_oneapi_submit_barrier(a.pending);
++        a.pending.clear();
 +    }
 +
 +    ggml_sycl_pool_alloc<char> ids_slot_alloc(ctx.pool(), (size_t) n_ids * sizeof(int32_t));
@@ -329,32 +338,44 @@ index a0754be6e..d73a1ef9a 100644
 +// live slice pointer for the sequential expert loops: arena slot for routed
 +// streamed tensors (upload on miss), stock addressing otherwise. n_ids is the
 +// router top-k of the current op (sizes the scratch window on first build).
-+static char * sycl_mm_id_slice(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, int64_t i02, int64_t n_ids) {
++// for mm_expert tensors the caller holds g_expert_mu through the consuming
++// kernel's launch
++static char * sycl_mm_id_slice(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, int64_t i02, int64_t n_ids,
++                               bool mm_expert) {
 +    char * plain = (char *) src0->data + (size_t) i02 * src0->nb[2];
 +    const ggml_tensor * root = src0;
 +    while (root->view_src != nullptr) {
 +        root = root->view_src;
 +    }
-+    if (g_expert_tensors.find(root) == g_expert_tensors.end()) {
++    if (!mm_expert) {
 +        return plain;
 +    }
 +    const ggml_stream_src * rec = ggml_stream_find(root);
 +    GGML_ASSERT(rec != nullptr && "expert tensor without a registered stream source");
 +    sycl_expert_arena & a = *sycl_expert_arena_build(root, ctx.stream(), (int) n_ids);
-+    const int slot = sycl_expert_ensure_slot(a, rec, root, (int32_t) i02, ctx.stream(), nullptr);
++    const sycl::event marker = ctx.stream()->ext_oneapi_submit_barrier();
++    const int slot = sycl_expert_ensure_slot(a, rec, root, (int32_t) i02, marker, nullptr);
++    if (!a.pending.empty()) {
++        ctx.stream()->ext_oneapi_submit_barrier(a.pending);
++        a.pending.clear();
++    }
 +    return a.base + (size_t) slot * a.stride;
 +}
 +
  static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                   ggml_tensor *dst) try {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
-@@ -4800,11 +5115,28 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+@@ -4877,11 +5225,32 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
      const int64_t n_as = ne02;
      const int64_t n_ids = ids->ne[0];
  
 -    if (ne12 == 1) {
 +    const bool mm_expert = sycl_mm_id_is_expert(src0);
++    // serializes arena slot/LRU state and ensures no re-upload lands between
++    // a slice lookup and the kernel launch consuming it
++    std::unique_lock<std::mutex> expert_lock(g_expert_mu, std::defer_lock);
 +    if (mm_expert) {
++        expert_lock.lock();
 +        g_expert_ops++;
 +        if ((g_expert_ops % 256) == 0) {
 +            const size_t lookups = g_expert_hits + g_expert_uploads;
@@ -378,79 +399,97 @@ index a0754be6e..d73a1ef9a 100644
  
      std::vector<char> ids_host(ggml_nbytes(ids));
      const char * ids_dev = (const char *) ids->data;
-@@ -4850,7 +5182,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+@@ -4896,7 +5265,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+     ggml_tensor src1_row = *src1;
+     ggml_tensor dst_row = *dst;
+ 
+-    char *src0_original = (char *)src0->data;
+     char *src1_original = (char *)src1->data;
+     char *dst_original = (char *)dst->data;
+ 
+@@ -4927,7 +5295,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                  const int64_t i1 = id;
                  const int64_t i2 = i12;
  
 -            src0_row.data = src0_original + i02*nb02;
-+            src0_row.data = sycl_mm_id_slice(ctx, src0, i02, n_ids);
++            src0_row.data = sycl_mm_id_slice(ctx, src0, i02, n_ids, mm_expert);
              src1_row.data = src1_original + i11*nb11 + i12*nb12;
              dst_row.data = dst_original + i1*nb1 + i2*nb2;
  
-@@ -4912,7 +5244,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+@@ -4989,7 +5357,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
  
              const int64_t expert_row_offset = expert_row_offsets[i02];
  
 -            src0_row.data = src0_original + i02*nb02;
-+            src0_row.data = sycl_mm_id_slice(ctx, src0, i02, n_ids);
++            src0_row.data = sycl_mm_id_slice(ctx, src0, i02, n_ids, mm_expert);
  
              GGML_ASSERT(nb11 == sizeof(float)*ne10);
              GGML_ASSERT(nb1 == sizeof(float)*ne0);
-@@ -5678,7 +6010,10 @@ static bool ggml_sycl_stream_build(sycl_stream_pool & sw, ggml_backend_buffer_t
+@@ -5804,7 +6172,10 @@ static bool ggml_sycl_stream_build(sycl_stream_pool & sw, ggml_backend_buffer_t
      std::vector<const ggml_tensor *> ts;
      std::vector<ggml_stream_src>     recs;
      for (int i = 0; i < n0; i++) {
 -        if (ts0[i]->buffer == buf) {
-+        if (ts0[i]->buffer == buf && g_expert_tensors.find(ts0[i]) == g_expert_tensors.end()) {
++        if (ts0[i]->buffer == buf && !sycl_mm_id_is_expert(ts0[i])) {
 +            // routed expert tensors are excluded: they stream selectively
 +            // through their per-tensor slot arenas (see mul_mat_id), not the
 +            // whole-tensor slot pool
              ts.push_back(ts0[i]);
              recs.push_back(recs0[i]);
          }
-@@ -5816,6 +6151,9 @@ static void ggml_sycl_stream_node(ggml_backend_sycl_context * sycl_ctx, const gg
+@@ -6016,6 +6387,9 @@ static void ggml_sycl_stream_sources(const ggml_tensor * n,
          while (s->view_src != nullptr) {
              s = s->view_src;
          }
-+        if (g_expert_tensors.find(s) != g_expert_tensors.end()) {
++        if (sycl_mm_id_is_expert(s)) {
 +            continue; // routed expert weight: selective upload in mul_mat_id
 +        }
          const ggml_stream_src * rec = ggml_stream_find(s);
          if (rec == nullptr || s->buffer == nullptr || !ggml_backend_buffer_is_sycl(s->buffer)) {
              continue;
-@@ -5854,12 +6192,65 @@ static void ggml_sycl_stream_buffer_teardown(ggml_backend_buffer_t buffer, queue
-         }
-         g_swpools.erase(sw);
+@@ -6131,9 +6505,38 @@ static void ggml_sycl_stream_buffer_teardown(ggml_backend_buffer_t buffer, queue
+         std::lock_guard<std::mutex> mlock(g_swpools_mu);
+         g_swpools.erase(buffer);
      }
 +    // routed-expert arenas on this buffer die with it; compare the buffer
 +    // recorded at build time - the tensors themselves may already be freed
-+    std::vector<const ggml_tensor *> dead;
-+    for (auto it = g_earenas.begin(); it != g_earenas.end();) {
-+        if (it->second.buf == buffer) {
-+            if (it->second.base != nullptr) {
-+                ggml_sycl_free_device(it->second.base, *q);
-+            }
-+            dead.push_back(it->first);
-+            it = g_earenas.erase(it);
-+        } else {
-+            ++it;
-+        }
-+    }
 +    {
-+        std::lock_guard<std::mutex> lock(g_expert_mu);
-+        for (const ggml_tensor * t : dead) {
-+            g_expert_tensors.erase(t);
++        std::lock_guard<std::mutex> elock(g_expert_mu);
++        for (auto it = g_earenas.begin(); it != g_earenas.end();) {
++            if (it->second.buf == buffer) {
++                sycl_expert_arena & a = it->second;
++                if (a.device >= 0) {
++                    sycl::queue * cq = sycl_stream_copy_queue(a.device);
++                    cq->wait(); // copies in flight may target the arena
++                    for (auto & b : a.staging) {
++                        if (b.ptr != nullptr) {
++                            sycl::free(b.ptr, cq->get_context());
++                        }
++                    }
++                }
++                if (a.base != nullptr) {
++                    ggml_sycl_free_device(a.base, *q);
++                }
++                g_expert_tensors.erase(it->first);
++                it = g_earenas.erase(it);
++            } else {
++                ++it;
++            }
 +        }
-+    }
-+    if (g_earenas.empty()) {
-+        g_expert_cfg_reported = false;
-+        g_expert_n_routed     = SIZE_MAX;
++        if (g_earenas.empty()) {
++            g_expert_cfg_reported = false;
++            g_expert_n_routed     = SIZE_MAX;
++        }
 +    }
  }
  
+-
  static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
      ggml_sycl_set_main_device(sycl_ctx->device);
      const bool stream_weights = ggml_stream_weights_enabled();
+@@ -6141,6 +6544,35 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+     int cur_layer = -1;
+     int prefetch_j = 0;
  
 +    if (stream_weights) {
 +        // automatic routed-expert detection: mark streamed weights consumed
