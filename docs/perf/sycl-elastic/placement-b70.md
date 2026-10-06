@@ -6,6 +6,44 @@ oneAPI 2026.0) against `feat/sycl-llama-elastic-stack` (`82aa11d`) with
 (`scripts/build-llama-stream.sh`, markers verified). Raw data:
 `experiments/2026-10-05-placement-b70/` (not committed).
 
+## Findings
+
+Measured on one Arc Pro B70 (SYCL0) on a host whose GPU links run at **PCIe 4.0 x8 (~15.75 GB/s)**. All numbers are medians of 3.
+
+### What works (wins)
+1. **The fixed patches hold up on a discrete card.**
+   - 27B decode speeds: `--elastic-vram 12` 8.33 t/s (62/65 layers on device), `--elastic-vram 0` 0.55 t/s, and `auto` 17.49 t/s ("model fits, streaming disabled", same speed as resident).
+   - Streamed output is byte-identical to unpatched upstream llama.cpp.
+   - The streamed child holds 1 model fd and no `LD_PRELOAD`, and it dies with cascadia.
+2. **Streaming saturates the link when little is streamed.** At N=62 it moves ~13.6 GB/s, about 86% of the x8 Gen4 ceiling. The deficit law at 13 GB/s predicts 8.05 t/s; we measured 8.25.
+3. **Streaming wins at the parking end.** At N=0 it decodes at 0.54 t/s vs 0.45 for host-in-place, and it has the smallest footprint: a 3.05 GiB peak vs 16.15 GiB resident (−81%).
+4. **Pinned host memory read in place (patch 0003) wins mid-range.** It is +18% at N=55 and +33% at N=34/33, with fused ops and graphs still on. The cascadia path (`--llama-host-layers`) works: 6.25 t/s, output identical to resident.
+5. **Co-tenancy is stable.** In every section-C arm, three 27B instances loaded and generated together with no load failures and no xe resets. `auto` reached 9.4 t/s combined.
+
+### What doesn't (deficiencies)
+1. **Full streaming uses only about half the link.** At N=0 streaming reaches ~7.7 GB/s and host-in-place ~6.3 GB/s, well under the ceiling. Something other than the link dominates there: the synchronous per-tensor copy chain (file → staging → device) for streaming, and the in-place reads for host placement. Async prefetch is the obvious next fix.
+2. **Host-in-place loses with only a few layers off-device.** At N=62 it is −23% vs streaming (6.36 vs 8.25), reading at only ~8.7 GB/s. It is not a drop-in replacement across the range.
+3. **Driver oversubscription beats every elastic arm for 3 instances.** Plain loading with no `--elastic` reached 11.6 t/s combined. That compares with 9.4 for `auto`, 4.2 for explicit budgets (12/12/0), and 2.8 / 1.6 for the two host-placement arms. The trade-off is no residency guarantee: the driver decides what gets moved to host memory.
+4. **Budgets don't compose under contention.** Each of the two 62/65 instances in the 12/12/0 arm fell from 8.33 t/s alone to 1.88 t/s (−77%), because all three instances share one link.
+5. **`auto` splits first-come, first-served.** Instance 2 got 63/65 layers (5.40 t/s); instance 3 got 0/65 (0.50 t/s) and warned it lacked headroom (1913 MiB free vs ~4267 MiB needed). Nothing rebalances after load.
+6. **Tate's host-placement predictions (~14 t/s at N=62, ~3 t/s at N=0) can't be reached here.** They assume a ~50 GB/s Gen5 x16 link. A Gen5 x16 host is untested and could change the ranking.
+
+![fig10](fig10_placement_b70.png)
+![fig12](fig12_cotenancy_b70.png)
+
+### Caveats
+- The study ran on SYCL0 instead of SYCL1, whose absolute t/s is ~9% lower than the 0f card; all comparisons are within one card.
+- The stack's fused resident path flips one greedy near-tie (one prompt, char 109). It is not a streaming bug: with fusion off, resident output equals upstream and streamed output.
+- vram_mm can't show host spill. Oversubscription is inferred from capacity: three 27B models don't fit in 31.89 GiB.
+
+### Recommendation
+- Keep streaming + `auto` as `--elastic` on discrete cards.
+- Next work, in order:
+  1. Async prefetch, for the N=0 gap.
+  2. A fairer `auto` split, and promote/demote after load.
+  3. Retest host placement on a Gen5 x16 host.
+- Document driver oversubscription as the throughput-first alternative when residency guarantees don't matter.
+
 ## Deviation from the recipe
 
 The recipe's card (SYCL1 / PCI 0000:0f:00.0) was occupied by an unrelated
