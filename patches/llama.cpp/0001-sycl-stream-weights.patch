@@ -382,7 +382,7 @@ index d1456a867..4bdf6a342 100644
      ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
-@@ -5603,8 +5703,443 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
+@@ -5603,8 +5703,447 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
      return skip;
  }
  
@@ -810,6 +810,10 @@ index d1456a867..4bdf6a342 100644
 +                    b.ptr = nullptr;
 +                }
 +            }
++        }
++        if (swp->uploads > 0) {
++            fprintf(stderr, "stream-weights: pool drained: %zu uploads, %.2f GiB delivered\n",
++                    swp->uploads, swp->bytes_uploaded / 1073741824.0);
 +        }
 +        std::lock_guard<std::mutex> mlock(g_swpools_mu);
 +        g_swpools.erase(buffer);
