@@ -244,5 +244,66 @@
    31.84,
    31.71
   ]
+ },
+ "E": {
+  "_note": "reader pool + share cap update (cascadia#171 v2, commit abbd246f6-equivalent patches). 27B = Qwen3.8-27B-UD-Q4_K_S, MoE = Qwen3.6-35B-A3B-UD-Q4_K_XL, ctx 4096, -ctk q8_0 -fa on, SYCL0, single n_predict=32 greedy decode after warmup. Streamed = GGML_STREAM_VRAM_MB=0 unless noted.",
+  "reader_pool_27b": {
+   "threads": [
+    0,
+    1,
+    2,
+    4,
+    8
+   ],
+   "tps": [
+    0.734,
+    0.753,
+    0.8,
+    0.781,
+    0.785
+   ],
+   "note": "fully streamed (0/65 resident, 13087 MiB/token). rt0 = inline serial pread (pre-pool path). rt2 best; H2D copy bandwidth is the residual limit, not reads"
+  },
+  "reader_pool_moe": {
+   "arms": [
+    "rt0 ec0",
+    "rt4 ec0",
+    "rt4 ec1024"
+   ],
+   "tps": [
+    3.85,
+    3.287,
+    3.946
+   ],
+   "note": "fully streamed 35B-A3B. Small expert slices (0.56 MiB stride) lose ~15% on the pool alone; adding the 1 GiB hot-expert cache recovers and beats rt0 (3.95 vs 3.85)"
+  },
+  "share_cap": {
+   "n": [
+    1,
+    3,
+    4294967295
+   ],
+   "budget_mib": [
+    26567,
+    8919,
+    0
+   ],
+   "uncapped_mib": 26567,
+   "formula": "min(free-overhead, floor((total-overhead)/N)); free-overhead 26567, total-overhead 26756 at load time",
+   "explicit_overrides": "GGML_STREAM_VRAM_MB=8192 with SHARE=3 warned and kept 8192; GGML_STREAM_RESIDENT_LAYERS=30 with SHARE=3 warned and kept 30; SHARE=4294967295 capped auto to 0 (full streaming)"
+  },
+  "dispatch_relief": {
+   "pread64_sync_run": {
+    "calls": 17240,
+    "secs": 57.37,
+    "window_s": 59.0,
+    "note": "serial pread ~100% of decode wall on rt0 (2026-10-07 strace)"
+   },
+   "io_window": {
+    "logical_read_gbps": 9.7,
+    "link_effective_gbps": 13.6,
+    "cold_eq_warm": true
+   }
+  }
  }
 }

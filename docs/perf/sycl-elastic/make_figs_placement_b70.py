@@ -230,8 +230,69 @@ def fig14():
     save(fig, "fig14_async_b70.png")
 
 
+def fig15():
+    E = DATA["E"]["reader_pool_27b"]
+    fig = newfig(h=6.0)
+    header(fig, "Reader-pool size on the fully streamed 27B (B70)",
+           "GGML_STREAM_READ_THREADS sweep, VRAM budget 0 (all 65 layers "
+           "streamed, 13 GiB/token). Decode t/s; rt0 is the pre-pool\n"
+           "serial-pread path. The pool lifts throughput ~7-9%; above 2 "
+           "readers the copy queue's H2D bandwidth is the limit, not reads.")
+    ax = fig.add_axes([0.09, 0.14, 0.86, 0.56])
+    style_ax(ax)
+    x = np.arange(len(E["threads"]))
+    cols = [MUTED] + [ELASTIC] * (len(E["threads"]) - 1)
+    bb = ax.bar(x, E["tps"], 0.55, color=cols)
+    ax.bar_label(bb, fmt="%.3f", fontsize=10.5, color=TEXT, padding=3)
+    ax.axhline(E["tps"][0], color=AMBER, linestyle="--", linewidth=1.2)
+    ax.text(0.02, 0.93, "dashed: serial pread baseline (rt0)",
+            fontsize=10, color=AMBER, ha="left", va="top",
+            transform=ax.transAxes, bbox=REF_LABEL_BOX)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"rt{n}" for n in E["threads"]], fontsize=11)
+    ax.set_xlabel("GGML_STREAM_READ_THREADS", fontsize=12)
+    ax.set_ylabel("decode t/s", fontsize=12)
+    ax.set_ylim(0, max(E["tps"]) * 1.25)
+    footer(fig, "Arc Pro B70 (SYCL0, PCIe 4.0 x8) | reader pool cascadia#171 | "
+                "27B Q4_K_S fully streamed, ctx 4096 | data: placement-b70.json E")
+    save(fig, "fig15_readerpool_b70.png")
+
+
+def fig16():
+    E = DATA["E"]["share_cap"]
+    fig = newfig(h=6.0)
+    header(fig, "--elastic-share N: deterministic co-tenant caps (B70)",
+           "Automatic budget = min(free - overhead, (total - overhead) / N). "
+           "Bars: the budget each --elastic-vram auto instance received when\n"
+           "N co-tenants were declared. Line: what the same free memory gave "
+           "with no share cap (first-come-first-served).")
+    ax = fig.add_axes([0.09, 0.14, 0.86, 0.56])
+    style_ax(ax)
+    x = np.arange(len(E["n"]))
+    bb = ax.bar(x, E["budget_mib"], 0.5, color=ELASTIC)
+    ax.bar_label(bb, fmt="%.0f MiB", fontsize=10.5, color=TEXT, padding=3)
+    ax.axhline(E["uncapped_mib"], color=AMBER, linestyle="--", linewidth=1.2)
+    ax.text(0.02, 0.985, "dashed: uncapped budget at this free memory",
+            fontsize=10, color=AMBER, ha="left", va="top",
+            transform=ax.transAxes, bbox=REF_LABEL_BOX)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"N={n}" if n < 100 else "N=u32::MAX" for n in E["n"]],
+                       fontsize=11)
+    ax.set_ylabel("resident-weight budget, MiB", fontsize=12)
+    ax.set_ylim(0, E["uncapped_mib"] * 1.15)
+    footer(fig, "Arc Pro B70 32 GB | --elastic-vram auto --elastic-share N | "
+                "data: placement-b70.json E")
+    save(fig, "fig16_sharecap_b70.png")
+
+
 if __name__ == "__main__":
-    fig10(); fig11(); fig12(); fig13(); fig14()
+    fig10(); fig11(); fig12(); fig13(); fig14(); fig15(); fig16()
+    if QC_ERRORS:
+        print("\n=== QC FAILURES ===")
+        for name, kind, detail in QC_ERRORS:
+            print(f"{name} | {kind} | {detail}")
+        sys.exit(1)
+    print("QC: all figures clean")
     if QC_ERRORS:
         print("\n=== QC FAILURES ===")
         for name, kind, detail in QC_ERRORS:
