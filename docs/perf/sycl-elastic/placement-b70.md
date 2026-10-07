@@ -6,14 +6,16 @@ oneAPI 2026.0) against `feat/sycl-llama-elastic-stack` (`82aa11d`) with
 (`scripts/build-llama-stream.sh`, markers verified). Raw data:
 `experiments/2026-10-05-placement-b70/` (not committed).
 
-Updated 2026-10-06 with section D: the same arms re-run against the async
+Updated 2026-10-06 with section D: the dense arms re-run against the async
 stream pool (`bb6dcb55` on `feat/sycl-llama-elastic`) - every streaming arm
 is faster, and section D has the numbers and the common-window aggregate
-method that section C's summed column lacks.
+method that section C's summed column lacks. Note the MoE arm differs:
+sections A-C measured Qwen3.6-35B-A3B (40 layers), section D measured
+Qwen1.5-MoE-14.3B-A2.7B Q3_K_M (24 layers) - the two are not comparable.
 
 ## Findings
 
-Measured on one Arc Pro B70 (SYCL0) on a host whose GPU links run at **PCIe 4.0 x8 (~15.75 GB/s)**. All numbers are medians of 3.
+Measured on one Arc Pro B70 (SYCL0) on a host whose GPU links run at **PCIe 4.0 x8 (~15.75 GB/s)**. Sections A-C report medians of 3 outer runs (9 timed requests per arm); section D reports medians of 6.
 
 ### What works (wins)
 1. **The fixed patches hold up on a discrete card.**
@@ -22,14 +24,14 @@ Measured on one Arc Pro B70 (SYCL0) on a host whose GPU links run at **PCIe 4.0 
    - The streamed child holds 1 model fd and no `LD_PRELOAD`, and it dies with cascadia.
 2. **Streaming saturates the link when little is streamed.** At N=62 it moves ~13.6 GB/s model-implied (see section B: incremental bandwidth, an upper bound), about 86% of the x8 Gen4 ceiling. The deficit law at 13 GB/s predicts 8.05 t/s; we measured 8.25.
 3. **Streaming wins at the parking end.** At N=0 it decodes at 0.54 t/s vs 0.45 for host-in-place, and it has the smallest footprint: a 3.05 GiB peak vs 16.15 GiB resident (−81%).
-4. **Pinned host memory read in place (patch 0003) wins mid-range.** It is +18% at N=55 and +33% at N=34/33, with fused ops and graphs still on. The cascadia path (`--llama-host-layers`) works: 6.25 t/s, output identical to resident.
+4. **Pinned host memory read in place (patch 0003) wins mid-range** *(measured on the sync build; async streaming may shift the crossover)*. It is +18% at N=55 and +33% at N=34/33, with fused ops and graphs still on. The cascadia path (`--llama-host-layers`) works: 6.25 t/s, output identical to resident.
 5. **Co-tenancy is stable.** In every section-C arm, three 27B instances loaded and generated together with no load failures and no xe resets. `auto` reached 9.4 t/s summed per-instance (see the sum caveat in section C).
 6. **UPDATE (section D): the async stream pool lifted every streaming arm.** 0/65 +33% (0.448→0.595 t/s), 62/65 +129% (7.53→17.21, resident speed via slot pinning), MoE +36%, and two co-tenant streamed instances +42% aggregate (0.90→1.28 t/s, common-window method).
 
 ### What doesn't (deficiencies)
-1. **Full streaming uses only about half the link** *(superseded by section D)*. At N=0 the sync build reached ~6.3-7.7 GB/s; the async build moved ~8.3 GB/s (+33%) and is now read-bound on single-threaded `pread`, not on DMA serialization. Host-in-place still ~6.3 GB/s.
+1. **Full streaming uses only about half the link** *(superseded by section D)*. At N=0 the sync build reached ~6.3-7.7 GB/s; the async build moved ~8.3 GB/s (+33%) and is likely read-bound on single-threaded `pread` (hypothesis, not traced). Host-in-place still ~6.3 GB/s.
 2. **Host-in-place loses with only a few layers off-device.** At N=62 it is −23% vs streaming (6.36 vs 8.25), reading at only ~8.7 GB/s. It is not a drop-in replacement across the range.
-3. **Driver oversubscription beats every elastic arm for 3 instances.** Plain loading with no `--elastic` reached 11.6 t/s summed per-instance. That compares with 9.4 for `auto`, 4.2 for explicit budgets (12/12/0), and 2.8 / 1.6 for the two host-placement arms. The trade-off is no residency guarantee: the driver decides what gets moved to host memory.
+3. **Driver oversubscription beats every elastic arm for 3 instances** *(sync-build sums; not re-run under async or the common-window method)*. Plain loading with no `--elastic` reached 11.6 t/s summed per-instance. That compares with 9.4 for `auto`, 4.2 for explicit budgets (12/12/0), and 2.8 / 1.6 for the two host-placement arms. The trade-off is no residency guarantee: the driver decides what gets moved to host memory.
 4. **Budgets don't compose under contention.** Each of the two 62/65 instances in the 12/12/0 arm fell from 8.33 t/s alone to 1.88 t/s (−77%), because all three instances share one link.
 5. **`auto` splits first-come, first-served.** Instance 2 got 63/65 layers (5.40 t/s); instance 3 got 0/65 (0.50 t/s) and warned it lacked headroom (1913 MiB free vs ~4267 MiB needed). Nothing rebalances after load.
 6. **Tate's host-placement predictions (~14 t/s at N=62, ~3 t/s at N=0) can't be reached here.** They assume a ~50 GB/s Gen5 x16 link. A Gen5 x16 host is untested and could change the ranking.
@@ -240,10 +242,19 @@ budget. Same footprint contract; the speed changed everywhere.
 
 Method: same host, `llama-server` on SYCL0 (`0b:00.0`), ctx 4096,
 `-ctk q8_0 -fa on`, temp 0, `n_predict 32`, median of 6 (2 rounds x 3
-prompts), decode = `timings.predicted_per_second`. The model sat on
-tmpfs so file reads run at RAM speed - the same warm regime sections
-A-C ran under. n_predict differs from A-C (32 vs 64); decode rate is
-steady-state so the comparison is on t/s.
+prompts), 1 discarded warmup request per server start, decode =
+`timings.predicted_per_second`. The model sat on tmpfs so file reads
+run at RAM speed - the same warm regime sections A-C ran under.
+n_predict differs from A-C (32 vs 64); decode rate is steady-state so
+the comparison is on t/s.
+
+Baseline note: the sync column is the same `llama-stack` binary that
+produced sections A-C, re-measured here - yet it read 0.448 t/s at N=0
+vs the 0.55 t/s section A recorded. Both are real medians on the same
+binary; the likely difference is cache/regime (A ran disk-backed warm,
+D ran tmpfs) plus different prompt mixes. Within-D comparisons use only
+D's own baseline, so the +33/+129/+36% deltas are unaffected; do not
+splice absolute t/s across sections.
 
 | arm | sync build t/s | async build t/s | delta |
 |---|---|---|---|
@@ -269,9 +280,10 @@ Two mechanisms behind the deltas:
 - **DMA/compute overlap.** At N=0 (400 tensors > slots, real streaming)
   the sync chain (`pread` + `memcpy().wait()` per tensor, ~6.3 GB/s
   effective) becomes read-bound with the copy queue overlapping DMA
-  behind compute: ~8.3 GB/s effective, +33%. The residual limit is
-  single-threaded file reads, not the link; parallel readers or
-  io_uring is the next lever, not more queues.
+  behind compute: ~8.3 GB/s effective, +33%. The *hypothesis* for the
+  residual gap to the 15.75 GB/s link ceiling is single-threaded file
+  reads - no read/copy timing trace was captured, so treat that as the
+  likely lever (parallel readers or io_uring), not an established fact.
 
 Co-tenancy, measured the right way this time: two `llama-server`
 processes, both 0/65, four concurrent 96-token requests, aggregate =
@@ -282,8 +294,11 @@ total tokens / common wall window:
 | sync | 0.231-0.236 | 424.5 s | 384 | **0.90** |
 | async | 0.327-0.331 | 300.0 s | 384 | **1.28** |
 
-**+42% aggregate** - more than the single-instance +33%, because one
-instance's reads pipeline behind the other's compute.
+**+42% aggregate** - more than the single-instance +33%. The likely cause
+is one instance's reads pipelining behind the other's compute, but this is
+inference from the delta, not a measured overlap trace. One 4-request
+window pair is also thin evidence for steady-state co-tenancy - treat the
+aggregate as directional.
 
 Multi-device: a 1.5B tensor-split (`-sm layer -ts 1,1 -dev SYCL0,SYCL1`)
 built one pool per device (84/70 tensors), each with its own copy
