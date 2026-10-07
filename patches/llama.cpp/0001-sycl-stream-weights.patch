@@ -1201,10 +1201,38 @@ index 5c5e97fbc..69ae87c03 100644
              const auto & mapping = mappings.at(weight->idx);
              ggml_backend_buffer_t buf_mmap = nullptr;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index c81005505..92cb43ec4 100644
+index c81005505..05719242a 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -1558,6 +1558,90 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1264,6 +1264,27 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
+     vocab.load(ml, kv);
+ }
+ 
++// strict decimal parse of GGML_STREAM_VRAM_SHARE: the expected co-tenant
++// count in [1, UINT32_MAX]. returns 1 when unset; rejects empty, signed,
++// trailing-text, zero, and overflowing values
++static uint64_t ggml_stream_vram_share() {
++    const char * e = getenv("GGML_STREAM_VRAM_SHARE");
++    if (e == nullptr) {
++        return 1;
++    }
++    bool ok = e[0] != '\0';
++    for (const char * p = e; *p != '\0'; p++) {
++        ok = ok && (*p >= '0' && *p <= '9');
++    }
++    const uint64_t v = ok ? strtoull(e, nullptr, 10) : 0;
++    if (!ok || v < 1 || v > UINT32_MAX) {
++        throw std::runtime_error(
++            std::string("stream-weights: GGML_STREAM_VRAM_SHARE='") + e +
++            "' is not a valid co-tenant count (expected a decimal integer in [1, 4294967295])");
++    }
++    return v;
++}
++
+ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     const auto & split_mode   = params.split_mode;
+     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+@@ -1558,6 +1579,116 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
      ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
      pimpl->mappings.reserve(ml.mappings.size());
  
@@ -1238,6 +1266,9 @@ index c81005505..92cb43ec4 100644
 +        int n_res = 0;
 +        size_t resident = 0;
 +        if (res_env != nullptr) {
++            if (getenv("GGML_STREAM_VRAM_SHARE") != nullptr) {
++                fprintf(stderr, "stream-weights: warning: GGML_STREAM_VRAM_SHARE ignored; GGML_STREAM_RESIDENT_LAYERS sets the resident layer count\n");
++            }
 +            n_res = atoi(res_env);
 +            for (const auto & it : s_layer) {
 +                if (it.first < n_res) {
@@ -1253,14 +1284,37 @@ index c81005505..92cb43ec4 100644
 +                    const size_t reserve = (r && atoi(r) > 0 ? (size_t) atoi(r) : 2048) * 1024 * 1024;
 +                    size_t free_mem = 0, total_mem = 0;
 +                    ggml_backend_dev_memory(devices[0].dev, &free_mem, &total_mem);
-+                    if (free_mem < non_streamable + 2 * s_max + reserve) {
++                    // GGML_STREAM_VRAM_SHARE=N caps the automatic resident
++                    // budget at 1/N of the card so N co-tenant instances get
++                    // an equal share instead of first-come-takes-all. it is a
++                    // load-time cap on resident weights only: it cannot move
++                    // KV, slot pools, or already-running instances
++                    const uint64_t share = ggml_stream_vram_share();
++                    const size_t overhead = non_streamable + 2 * s_max + reserve;
++                    const size_t free_over = free_mem > overhead ? free_mem - overhead : 0;
++                    if (free_mem < overhead) {
 +                        fprintf(stderr, "stream-weights: warning: %.0f MiB free, fully streamed needs ~%.0f MiB; the driver may evict other processes to host memory\n",
-+                                free_mem / 1048576.0,
-+                                (non_streamable + 2 * s_max + reserve) / 1048576.0);
++                                free_mem / 1048576.0, overhead / 1048576.0);
 +                    }
-+                    budget = free_mem > non_streamable + 2 * s_max + reserve
-+                           ? free_mem - non_streamable - 2 * s_max - reserve : 0;
++                    if (total_mem == 0) {
++                        if (share != 1) {
++                            throw std::runtime_error(
++                                "stream-weights: GGML_STREAM_VRAM_SHARE needs the device total memory, but the backend reported 0; set an explicit GGML_STREAM_VRAM_MB budget instead");
++                        }
++                        budget = free_over;
++                    } else {
++                        const size_t total_over = total_mem > overhead ? total_mem - overhead : 0;
++                        budget = std::min(free_over, total_over / share);
++                        if (share != 1) {
++                            fprintf(stderr, "stream-weights: vram share 1/%llu: resident budget %.0f MiB (free-overhead %.0f MiB, total-overhead %.0f MiB)\n",
++                                    (unsigned long long) share, budget / 1048576.0,
++                                    free_over / 1048576.0, total_over / 1048576.0);
++                        }
++                    }
 +                } else {
++                    if (getenv("GGML_STREAM_VRAM_SHARE") != nullptr) {
++                        fprintf(stderr, "stream-weights: warning: GGML_STREAM_VRAM_SHARE ignored; GGML_STREAM_VRAM_MB sets an explicit budget\n");
++                    }
 +                    budget = (size_t) atoll(budget_env) * 1024 * 1024;
 +                }
 +            }
