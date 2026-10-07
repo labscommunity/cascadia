@@ -113,7 +113,8 @@ The OpenAI request is translated into the internal (SystemOne) form before the m
 
 - `predicate` becomes a yes/no question with no criteria.
 - `choice` becomes a choice with criteria `{value: description}` in request order. A number value
-  is keyed by its JSON text (`2` → `"2"`); a missing description is `null`.
+  is keyed by Python's `str()` of the number (`2` → `"2"`, `1e5` → `"100000.0"`); a missing
+  description is `null`.
 - **Score levels are rendered as one text per level**, `"label: description"`, or just `"label"`
   when the description is missing or empty, before the codec sees them. This approximates the single-text
   levels the models were trained on; nothing in the reference implementations says which form
