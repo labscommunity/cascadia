@@ -126,6 +126,12 @@ fn read_f32(path: &Path, expect: usize) -> Result<Vec<f32>, String> {
         .collect())
 }
 
+/// The joint head is small, and was validated at f32 (tools/tests/test_clef_head.py). OpenVINO's
+/// CPU default inference precision on ARM is f16, so pin f32 rather than inherit it.
+fn joint_head_plugin() -> PluginConfig {
+    PluginConfig::new().with("INFERENCE_PRECISION_HINT", "f32")
+}
+
 impl HeadAssets {
     pub fn load(model_dir: &Path, hidden: usize) -> Result<HeadAssets, String> {
         let dir = model_dir.join("decision");
@@ -155,7 +161,7 @@ impl HeadAssets {
                 let runtime = Runtime::compile(
                     xml.to_str().ok_or("non-utf8 path")?,
                     "CPU",
-                    &PluginConfig::default(),
+                    &joint_head_plugin(),
                 )
                 .map_err(|e| format!("joint head compile: {e}"))?;
                 Ok(HeadAssets::Joint {
@@ -415,6 +421,15 @@ pub fn decode_result(b: &[u8]) -> Result<Result<Vec<f32>, String>, String> {
 mod tests {
     use super::*;
     use cascadia_types::{HiddenNeed, ReadoutHead};
+
+    #[test]
+    fn joint_head_compiles_at_f32() {
+        // OpenVINO's ARM CPU default inference precision is f16; the head was validated at f32.
+        assert!(joint_head_plugin()
+            .entries
+            .iter()
+            .any(|(k, v)| k == "INFERENCE_PRECISION_HINT" && v == "f32"));
+    }
 
     #[test]
     fn collector_keeps_requested_rows_across_chunks() {
