@@ -503,6 +503,7 @@ fn final_chunk(
         completion_tokens: None,
         error: None,
         token_ids: Vec::new(),
+        decision_logits: None,
         finish_reason: Some(if is_eos {
             FinishReason::Stop
         } else {
