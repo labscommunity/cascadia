@@ -13,6 +13,11 @@ pub const MAX_JOINT_QUESTIONS: usize = 256;
 /// Prompt-length bound for a decision pass when the engine does not know the model window
 /// (pipeline ranks other than 0 never read `max_position_embeddings`).
 pub const MAX_DECISION_PROMPT: usize = 131_072;
+/// Prompt-length bound for a joint (Clef) readout, Clef's training `max_length`. The joint head
+/// reads EVERY final-hidden row, so the head-owning process holds `T * hidden * 4` bytes for the
+/// pass (e.g. 131072 * 5120 * 4 = 2.7 GB at the window bound); capping T here bounds that at
+/// ~335 MB for a 5120-wide model, before any allocation or prefill, for HTTP and peer readouts alike.
+pub const MAX_JOINT_PROMPT: usize = 16_384;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DecisionReadout {
@@ -112,6 +117,11 @@ impl DecisionReadout {
                 }
             }
             ReadoutHead::Joint { questions } => {
+                if n > MAX_JOINT_PROMPT {
+                    return Err(format!(
+                        "joint readout of {n} tokens exceeds {MAX_JOINT_PROMPT}"
+                    ));
+                }
                 if questions.is_empty() || questions.len() > MAX_JOINT_QUESTIONS {
                     return Err(format!(
                         "joint readout has {} questions; allowed 1..={MAX_JOINT_QUESTIONS}",
@@ -235,6 +245,39 @@ mod tests {
         };
         assert_eq!(h.output_len(), 3);
         assert_eq!(h.hidden_need(), HiddenNeed::All);
+    }
+
+    #[test]
+    fn validate_caps_joint_readouts_at_max_joint_prompt() {
+        let joint = |n: u32| DecisionReadout {
+            prompt_ids: (0..n).collect(),
+            head: ReadoutHead::Joint {
+                questions: vec![JointQuestion {
+                    qtype: 0,
+                    span: [0, 1],
+                    options: vec![JointOption { span: [1, 2] }],
+                }],
+            },
+            cache_prefix: None,
+        };
+        let vocab = MAX_JOINT_PROMPT + 10;
+        assert!(joint(MAX_JOINT_PROMPT as u32)
+            .validate(vocab, MAX_DECISION_PROMPT)
+            .is_ok());
+        let err = joint(MAX_JOINT_PROMPT as u32 + 1)
+            .validate(vocab, MAX_DECISION_PROMPT)
+            .unwrap_err();
+        assert_eq!(err, "joint readout of 16385 tokens exceeds 16384");
+        // Non-joint heads keep the window bound only.
+        let long_ptr = DecisionReadout {
+            prompt_ids: (0..MAX_JOINT_PROMPT as u32 + 1).collect(),
+            head: ReadoutHead::Pointer {
+                decide_pos: 3,
+                option_pos: vec![1],
+            },
+            cache_prefix: None,
+        };
+        assert!(long_ptr.validate(vocab, MAX_DECISION_PROMPT).is_ok());
     }
 
     fn readout(prompt_len: u32, head: ReadoutHead) -> DecisionReadout {
