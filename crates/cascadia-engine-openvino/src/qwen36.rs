@@ -272,6 +272,10 @@ struct Manifest {
     /// in pre-slice shard trees (default false).
     #[serde(default)]
     last_logits_only: bool,
+    /// Last stage exposes output 1 = final-norm hidden [1, n, hidden] for decision heads
+    /// (exporter `--final-hidden`). Absent in generation-only trees (default false).
+    #[serde(default)]
+    final_hidden_output: bool,
     stages: Vec<StageInfo>,
 }
 
@@ -372,6 +376,12 @@ pub struct Qwen36Builder {
     im_start_id: Option<u32>,
     /// `max_position_embeddings` from the tree's config.json (`None` = unknown, no guard).
     max_ctx: Option<usize>,
+    /// Manifest `final_hidden_output` (set by `load`).
+    final_hidden_output: bool,
+    /// Decision head assets (`<model>/decision/`), loaded only on the head-owning process.
+    decision_assets: Option<crate::decision::HeadAssets>,
+    /// Vocabulary bound from config.json (every rank; tolerant, see `read_vocab`).
+    vocab: Option<usize>,
 }
 
 impl Qwen36Builder {
@@ -438,6 +448,9 @@ impl Qwen36Builder {
             prefix_cache_bytes: crate::prefix_cache::DEFAULT_PREFIX_CACHE_BYTES,
             im_start_id: None,
             max_ctx: None,
+            final_hidden_output: false,
+            decision_assets: None,
+            vocab: None,
         }
     }
 
@@ -579,6 +592,21 @@ impl Builder for Qwen36Builder {
             self.eos = read_eos(&dir);
         }
 
+        // Every rank: pipeline ranks other than 0 have no tokenizer, yet validate readouts too.
+        self.vocab = read_vocab(&dir);
+        let owns_head = self.total <= 1 || self.rank + 1 == self.total;
+        self.decision_assets = if owns_head && dir.join("decision").join("head.json").exists() {
+            progress.push(LoadProgress::message(
+                "loading decision head assets".to_string(),
+            ));
+            Some(
+                crate::decision::HeadAssets::load(&dir, manifest.hidden())
+                    .map_err(EngineError::Backend)?,
+            )
+        } else {
+            None
+        };
+
         let mut stages = Vec::new();
         for s in &manifest.stages {
             if pipeline && s.stage != self.rank as usize {
@@ -597,6 +625,7 @@ impl Builder for Qwen36Builder {
 
         self.manifest_json = Some(manifest_raw);
         self.last_logits_only = manifest.last_logits_only;
+        self.final_hidden_output = manifest.final_hidden_output;
         self.hidden = manifest.hidden();
         self.stages = Some(stages);
         progress.push(LoadProgress::ready());
@@ -666,6 +695,11 @@ impl Builder for Qwen36Builder {
             max_ctx: self.max_ctx,
             refresh_costs: Default::default(),
             last_restore_bytes: 0,
+            final_hidden_output: self.final_hidden_output,
+            decision_assets: self.decision_assets,
+            vocab: self.vocab,
+            want_final_hidden: false,
+            last_final_hidden: None,
         }))
     }
 }
@@ -715,6 +749,40 @@ fn read_max_ctx(dir: &Path) -> Option<usize> {
     max
 }
 
+/// `text_config.vocab_size` (or top-level `vocab_size`) from the tree's config.json; `None` with a
+/// warning when absent. Only decision admission needs it.
+fn read_vocab(dir: &Path) -> Option<usize> {
+    let raw = match std::fs::read_to_string(dir.join("config.json")) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "qwen35: no config.json; decision passes will be refused");
+            return None;
+        }
+    };
+    let cfg: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let v = cfg["text_config"]["vocab_size"]
+        .as_u64()
+        .or_else(|| cfg["vocab_size"].as_u64());
+    if v.is_none() {
+        warn!("qwen35: config.json states no vocab_size; decision passes will be refused");
+    }
+    v.map(|v| v as usize)
+}
+
+/// Decision passes prefill the codec's exact ids: no tokenization, no think block.
+fn decision_admission(task: &GenerationTask) -> Option<Vec<u32>> {
+    task.decision.as_ref().map(|d| d.prompt_ids.clone())
+}
+
+/// A decision pass snapshots only where its request's passes share a prefix (Kev: the state);
+/// chat-style `<|im_start|>` boundaries would only evict chat entries.
+fn decision_snapshot_boundaries(d: &cascadia_types::DecisionReadout, cache_on: bool) -> Vec<usize> {
+    match d.cache_prefix {
+        Some(c) if cache_on => vec![c as usize],
+        _ => Vec::new(),
+    }
+}
+
 /// The empty think block the official chat template injects for `enable_thinking=false`.
 const THINK_BLOCK: &str = "\n<think>\n\n</think>\n\n";
 
@@ -727,6 +795,9 @@ const THINK_BLOCK: &str = "\n<think>\n\n</think>\n\n";
 /// counting the bare prompt let a `max_ctx - 1` prompt through and then prefilled past
 /// `max_position_embeddings`.
 fn admitted_prompt_ids(tok: &Tokenizer, task: &GenerationTask) -> Result<Vec<u32>, String> {
+    if let Some(ids) = decision_admission(task) {
+        return Ok(ids);
+    }
     let mut ids = tok
         .encode(task.prompt.as_str(), true)
         .map_err(|e| e.to_string())?
@@ -829,6 +900,18 @@ pub struct Qwen36Engine {
     /// Bytes of the parts restored by the latest prefix-cache hit: the size estimate for the
     /// state a refresh snapshot of this conversation would copy.
     last_restore_bytes: usize,
+    /// Manifest `final_hidden_output`: the last stage's output 1 is the final-norm hidden.
+    final_hidden_output: bool,
+    /// Decision head assets; `Some` only on the head-owning process of a tree with `decision/`.
+    decision_assets: Option<crate::decision::HeadAssets>,
+    /// Vocabulary bound decision readouts are validated against (`read_vocab`).
+    vocab: Option<usize>,
+    /// The active pass needs final hidden rows: `chain_pass_inner` copies output 1 only while
+    /// set, so chat traffic on a decision tree never pays the [1, n, hidden] copy. Assigned on
+    /// every admission.
+    want_final_hidden: bool,
+    /// Final hidden of the latest `chain_pass` (when `want_final_hidden`), taken by `run_span`.
+    last_final_hidden: Option<Vec<f32>>,
 }
 
 /// In-flight task state. `step()` advances one token per call so the
@@ -876,6 +959,10 @@ struct ActiveTask {
     /// Pipeline rank 0: per-frame FORWARD→TOKEN round-trip times for
     /// decode frames (n=1), for the pipeline gate-4 wire histogram.
     wire_ms: Vec<f64>,
+    /// Decision readout: `Some` ⇒ prefill only, then the head runs instead of decode.
+    decision: Option<cascadia_types::DecisionReadout>,
+    /// Hidden rows the decision head reads, gathered per prefill span (head-owning process).
+    collector: Option<crate::decision::Collector>,
 }
 
 fn le_bytes_i64(vals: &[i64]) -> Vec<u8> {
@@ -1001,6 +1088,10 @@ impl Qwen36Engine {
         let zeros_embeds = vec![0f32; n * width];
         let first_global = self.rank == 0;
         let mut hidden: Vec<f32> = embeds.to_vec();
+        let n_stages = self.stages.len();
+        let owns_head = self.total <= 1 || self.rank + 1 == self.total;
+        let want_fh = self.want_final_hidden && self.final_hidden_output && owns_head;
+        let mut final_hidden = None;
         for (j, st) in self.stages.iter_mut().enumerate() {
             let names = st.input_names().map_err(map_ov)?;
             for name in &names {
@@ -1042,8 +1133,13 @@ impl Qwen36Engine {
                     "stage{j} output dtype {dtype:?}, expected f32"
                 )));
             }
+            if want_fh && j + 1 == n_stages {
+                let (_, _, fh) = st.output(1).map_err(map_ov)?;
+                final_hidden = Some(f32_from_le(&fh));
+            }
             hidden = f32_from_le(&bytes);
         }
+        self.last_final_hidden = final_hidden;
         Ok(hidden)
     }
 
@@ -1053,6 +1149,12 @@ impl Qwen36Engine {
         let n = toks.len();
         let e = self.embed_seq(toks)?;
         let out = self.chain_pass(&e, t0, t0 + n)?;
+        if let Some(fh) = self.last_final_hidden.take() {
+            if let Some(c) = self.active.as_mut().and_then(|t| t.collector.as_mut()) {
+                c.absorb(t0, n, &fh)
+                    .map_err(|e| EngineError::Backend(format!("decision_invalid: {e}")))?;
+            }
+        }
         if self.last_logits_only {
             // Exporter already sliced the last stage to the final
             // position; the output IS the last row.
@@ -1175,6 +1277,65 @@ impl Qwen36Engine {
         )]
     }
 
+    /// End a decision pass: run the head on the collected state, emit ONE final chunk, reset.
+    fn finish_decision(&mut self) -> Vec<(TaskId, Chunk)> {
+        self.want_final_hidden = false;
+        self.last_final_hidden = None;
+        let Some(t) = self.active.as_ref() else {
+            return Vec::new();
+        };
+        let d = t.decision.as_ref().expect("decision task");
+        let empty = crate::decision::Collector::new(cascadia_types::HiddenNeed::None, self.hidden);
+        let col = t.collector.as_ref().unwrap_or(&empty);
+        let result = match self.decision_assets.as_mut() {
+            Some(a) => crate::decision::run_head(&d.head, a, &d.prompt_ids, &t.logits, col),
+            None => Err("decision_unsupported: no head assets".into()),
+        };
+        match result {
+            Ok(logits) => {
+                let n = t.prompt_ids.len() as u32;
+                let id = t.task_id.clone();
+                self.active = None;
+                self.reset_all();
+                vec![(
+                    id.clone(),
+                    Chunk::final_marker(id, "")
+                        .with_prompt_tokens(n)
+                        .with_finish_reason(FinishReason::Stop)
+                        .with_decision_logits(logits),
+                )]
+            }
+            Err(e) => self.finalize_error(format!("decision head failed: {e}")),
+        }
+    }
+
+    /// Everything a decision pass needs before it touches a stage: a well-formed readout
+    /// (ids < vocab, spans/positions inside the prompt: the readout may come from a peer)
+    /// and, on the head-owning process, the assets and hidden output its head reads.
+    fn admit_decision_check(&self, d: &cascadia_types::DecisionReadout) -> Result<(), String> {
+        let vocab = self
+            .vocab
+            .ok_or("decision_unsupported: tree config.json states no vocab_size")?;
+        d.validate(
+            vocab,
+            self.max_ctx.unwrap_or(cascadia_types::MAX_DECISION_PROMPT),
+        )
+        .map_err(|e| format!("decision_invalid: {e}"))?;
+        let owns_head = self.total <= 1 || self.rank + 1 == self.total;
+        if owns_head {
+            if self.decision_assets.is_none() {
+                return Err("decision_unsupported: model has no decision/ head assets".into());
+            }
+            if d.head.hidden_need() != cascadia_types::HiddenNeed::None && !self.final_hidden_output
+            {
+                return Err(
+                    "decision_unsupported: tree was exported without --final-hidden".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Terminate the active task as FAILED rather than completed: clear
     /// engine state (as `finalize` does) but emit an error chunk so the
     /// API returns a 5xx instead of a 200 with whatever partial text was
@@ -1182,6 +1343,8 @@ impl Qwen36Engine {
     /// fell through to `finalize` and read as a clean (empty/partial)
     /// success.
     fn finalize_error(&mut self, reason: String) -> Vec<(TaskId, Chunk)> {
+        self.want_final_hidden = false;
+        self.last_final_hidden = None;
         let Some(t) = self.active.take() else {
             return Vec::new();
         };
@@ -1666,6 +1829,8 @@ impl Qwen36Engine {
                 started: Instant::now(),
                 snapshot_secs: 0.0,
                 wire_ms: Vec::new(),
+                decision: task.decision.clone(),
+                collector: None,
             });
         }
         let t = self.active.as_ref().unwrap();
@@ -2231,6 +2396,17 @@ impl Qwen36Engine {
                     return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
                 }
             };
+            if let Some(d) = &task.decision {
+                if let Err(reason) = self.admit_decision_check(d) {
+                    let id = task.task_id.clone();
+                    return vec![(id.clone(), Chunk::error(id, reason))];
+                }
+            }
+            // Every admission (chat too) sets it, so a stale flag can never outlive its task.
+            self.want_final_hidden = task
+                .decision
+                .as_ref()
+                .is_some_and(|d| d.head.hidden_need() != cascadia_types::HiddenNeed::None);
             // Option B forced-prefix resume: append the already-emitted assistant
             // tokens after the rendered prompt (concat, not replace) so the cold
             // prefill below carries them as context. No-op when not resuming.
@@ -2295,7 +2471,18 @@ impl Qwen36Engine {
             };
             // Issue-34 warm-resume: restore a cached strict-prefix blob and prefill only the suffix;
             // else cold reset. Gated + best-effort (stub ⇒ no blob ⇒ cold). 0 on the default path.
-            let warm_prefix: usize = {
+            let warm_prefix: usize = if let Some(d) = &task.decision {
+                // Restore no further than the first row/logit the head reads (Joint: 0 = cold).
+                // `longest_prefix` matches only STRICT prefixes of the slice it is given, so the
+                // probe is one token longer than the limit: a hit of length <= warm_limit.
+                let lim = d.warm_limit();
+                let probe = if lim == 0 {
+                    &prompt_ids[..0]
+                } else {
+                    &prompt_ids[..(lim + 1).min(prompt_ids.len())]
+                };
+                self.local_warm_or_cold(probe)
+            } else {
                 #[cfg(feature = "kv_coord")]
                 {
                     let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
@@ -2359,11 +2546,17 @@ impl Qwen36Engine {
             // already refused is dropped by `plan_snapshots` before the copy, not by `insert`
             // after it (`PrefixCache::worth_copying`).
             let state_bytes = self.last_restore_bytes;
-            let boundaries = self
-                .im_start_id
-                .filter(|_| self.prefix_cache.enabled() && !self.stages_dirty)
-                .map(|im| crate::prefix_cache::chat_boundaries(&prompt_ids, im))
-                .unwrap_or_default();
+            let boundaries = match &task.decision {
+                Some(d) => decision_snapshot_boundaries(
+                    d,
+                    self.prefix_cache.enabled() && !self.stages_dirty,
+                ),
+                None => self
+                    .im_start_id
+                    .filter(|_| self.prefix_cache.enabled() && !self.stages_dirty)
+                    .map(|im| crate::prefix_cache::chat_boundaries(&prompt_ids, im))
+                    .unwrap_or_default(),
+            };
             let snapshot_at = crate::prefix_cache::plan_snapshots(
                 &prompt_ids,
                 &boundaries,
@@ -2398,6 +2591,11 @@ impl Qwen36Engine {
                 started: Instant::now(),
                 snapshot_secs: 0.0,
                 wire_ms: Vec::new(),
+                collector: task
+                    .decision
+                    .as_ref()
+                    .map(|d| crate::decision::Collector::new(d.head.hidden_need(), self.hidden)),
+                decision: task.decision.clone(),
             });
         }
         let t = self.active.as_ref().unwrap();
@@ -2506,6 +2704,9 @@ impl Qwen36Engine {
             }
             Vec::new()
         } else {
+            if t.decision.is_some() {
+                return self.finish_decision();
+            }
             if t.gen_ids.len() >= t.max_tokens {
                 return self.finalize(FinishReason::Length);
             }
@@ -2663,6 +2864,8 @@ impl Engine for Qwen36Engine {
         if self.active.as_ref().is_some_and(|t| &t.task_id == task_id) {
             info!(task = %task_id, "qwen36: cancelled; dropping active task");
             self.active = None;
+            self.want_final_hidden = false;
+            self.last_final_hidden = None;
             // A prefix-cache hit restores over the live requests without its own reset, so the
             // only certified restore sequence is reset → prime → set_state: reset here rather
             // than leaving the cancelled task's state in place.
@@ -3229,6 +3432,11 @@ mod tests {
             max_ctx: None,
             refresh_costs: Default::default(),
             last_restore_bytes: 0,
+            final_hidden_output: false,
+            decision_assets: None,
+            vocab: None,
+            want_final_hidden: false,
+            last_final_hidden: None,
         }
     }
 
@@ -3472,6 +3680,8 @@ mod tests {
             started: Instant::now(),
             snapshot_secs: 0.0,
             wire_ms: Vec::new(),
+            decision: None,
+            collector: None,
         });
 
         let out = e.finalize_error("pipeline decode failed: wire closed".into());
@@ -3504,6 +3714,8 @@ mod tests {
             started: Instant::now(),
             snapshot_secs: 0.0,
             wire_ms: Vec::new(),
+            decision: None,
+            collector: None,
         }
     }
 
@@ -3587,6 +3799,8 @@ mod tests {
             started: Instant::now(),
             snapshot_secs: 0.0,
             wire_ms: Vec::new(),
+            decision: None,
+            collector: None,
         });
 
         let id: TaskId = "t0".into();
@@ -3674,5 +3888,72 @@ mod tests {
             Err(EngineError::QueueFull { queued, cap })
                 if queued == MAX_PENDING_TASKS && cap == MAX_PENDING_TASKS
         ));
+    }
+
+    fn decision_task(
+        head: cascadia_types::ReadoutHead,
+        cache_prefix: Option<u32>,
+    ) -> GenerationTask {
+        GenerationTask {
+            task_id: "d".into(),
+            prompt: "ignored".into(),
+            max_tokens: 1,
+            temperature: 0.0,
+            logprobs: 0,
+            sampling: Default::default(),
+            enable_thinking: false,
+            trust_remote_code: false,
+            tenant: String::new(),
+            resume_token_ids: None,
+            decision: Some(cascadia_types::DecisionReadout {
+                prompt_ids: vec![7, 8, 9, 10],
+                head,
+                cache_prefix,
+            }),
+        }
+    }
+
+    #[test]
+    fn decision_admission_uses_exact_ids_and_no_think_block() {
+        let mut t = decision_task(
+            cascadia_types::ReadoutHead::Verbalizer { token_ids: vec![1] },
+            None,
+        );
+        assert_eq!(decision_admission(&t), Some(vec![7, 8, 9, 10]));
+        t.decision = None;
+        assert_eq!(decision_admission(&t), None);
+    }
+
+    #[test]
+    fn decision_snapshots_only_at_the_shared_prefix() {
+        let t = decision_task(
+            cascadia_types::ReadoutHead::Pointer {
+                decide_pos: 3,
+                option_pos: vec![2],
+            },
+            Some(2),
+        );
+        let d = t.decision.as_ref().unwrap();
+        assert_eq!(decision_snapshot_boundaries(d, true), vec![2]);
+        assert!(
+            decision_snapshot_boundaries(d, false).is_empty(),
+            "prefix cache disabled"
+        );
+        let j = decision_task(
+            cascadia_types::ReadoutHead::Verbalizer { token_ids: vec![1] },
+            None,
+        );
+        assert!(decision_snapshot_boundaries(j.decision.as_ref().unwrap(), true).is_empty());
+    }
+
+    #[test]
+    fn manifest_reads_final_hidden_output() {
+        let m = Manifest::parse(
+            r#"{"arch":"qwen3_5","hidden_size":4096,"final_hidden_output":true,"stages":[]}"#,
+        )
+        .unwrap();
+        assert!(m.final_hidden_output);
+        let m = Manifest::parse(r#"{"arch":"qwen3_5","hidden_size":4096,"stages":[]}"#).unwrap();
+        assert!(!m.final_hidden_output);
     }
 }
