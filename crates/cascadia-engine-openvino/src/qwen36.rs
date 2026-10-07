@@ -1422,6 +1422,17 @@ impl Qwen36Engine {
         )]
     }
 
+    /// Drop every piece of per-task decision state (pipeline last rank and single box alike). Called
+    /// wherever a new task starts on a downstream rank (RESET, RESTORE) and after DECIDE_RUN, so a
+    /// decision that rank 0 aborted after DECIDE was acked cannot leave a later chat turn paying the
+    /// `[1, n, hidden]` final-hidden copy or the collector's absorb.
+    fn clear_decision_state(&mut self) {
+        self.want_final_hidden = false;
+        self.last_final_hidden = None;
+        self.pending_decision = None;
+        self.last_logits = Vec::new();
+    }
+
     /// This process runs the last stage, where the final hidden states and the decision head live.
     fn owns_head(&self) -> bool {
         owns_head(self.rank, self.total)
@@ -2462,12 +2473,8 @@ impl Qwen36Engine {
                 // rank 0 (reset protocol).
                 self.reset_all();
                 self.peer_epoch = epoch;
-                // A new task: no decision state may survive from the previous one (a chat task
-                // after an aborted decision must not copy final hidden or keep logits rows).
-                self.want_final_hidden = false;
-                self.last_final_hidden = None;
-                self.pending_decision = None;
-                self.last_logits = Vec::new();
+                // A new task: no decision state may survive from the previous one.
+                self.clear_decision_state();
                 if !is_last {
                     self.forward_reset_downstream(epoch)?;
                 }
@@ -2521,6 +2528,9 @@ impl Qwen36Engine {
                 // ack with the all-or-nothing verdict (local && downstream restored). A miss anywhere
                 // ⇒ verdict 0 ⇒ the head re-RESETs the chain cold (never a partial/corrupt restore).
                 self.peer_epoch = task_epoch;
+                // RESTORE starts a new (warm) task exactly like RESET: drop any decision state an
+                // aborted decision left, or every chat FORWARD after it pays the final-hidden copy.
+                self.clear_decision_state();
                 // Carried blob wins: on a CROSS-chain move this rank has no capture under the source
                 // chain's epoch, so the local stash is empty and only the head's inline copy exists.
                 // Drain FIRST — same reason as ov-runtime's RESTORE arm: in plane mode the head
@@ -2627,9 +2637,7 @@ impl Qwen36Engine {
                 if let Err(why) = &out {
                     warn!(epoch, error = %why, "qwen36: pipeline decision head refused/failed");
                 }
-                self.want_final_hidden = false;
-                self.last_final_hidden = None;
-                self.last_logits = Vec::new();
+                self.clear_decision_state();
                 self.reset_all();
                 self.reply_upstream(FRAME_DECISION, epoch, crate::decision::encode_result(&out))
             }
@@ -4500,6 +4508,40 @@ mod tests {
         assert!(owns_head(0, 0));
         assert!(!owns_head(0, 2));
         assert!(owns_head(1, 2));
+    }
+
+    #[test]
+    fn clear_decision_state_drops_every_decision_field() {
+        use cascadia_types::{DecisionReadout, HiddenNeed, ReadoutHead};
+        let mut e = bare_engine(2, "{}");
+        let r = DecisionReadout {
+            prompt_ids: vec![1, 2],
+            head: ReadoutHead::Verbalizer { token_ids: vec![1] },
+            cache_prefix: None,
+        };
+        e.want_final_hidden = true;
+        e.last_final_hidden = Some(vec![0.5; 8]);
+        e.pending_decision = Some((
+            3,
+            Ok((r, crate::decision::Collector::new(HiddenNeed::None, 4))),
+        ));
+        e.last_logits = vec![1.0; 8];
+        e.clear_decision_state();
+        assert!(!e.want_final_hidden);
+        assert!(e.last_final_hidden.is_none());
+        assert!(e.pending_decision.is_none());
+        assert!(e.last_logits.is_empty());
+    }
+
+    #[test]
+    fn collector_debug_prints_shape_not_rows() {
+        use cascadia_types::HiddenNeed;
+        let mut c = crate::decision::Collector::new(HiddenNeed::All, 2);
+        c.absorb(0, 2, &[0.123_456, 0.654_321, 0.111_111, 0.999_999])
+            .unwrap();
+        let s = format!("{c:?}");
+        assert!(s.contains("hidden: 2"), "{s}");
+        assert!(!s.contains("0.123"), "row data leaked: {s}");
     }
 
     #[test]
