@@ -768,6 +768,8 @@ impl Builder for Qwen36Builder {
             vocab: self.vocab,
             want_final_hidden: false,
             last_final_hidden: None,
+            pending_decision: None,
+            last_logits: Vec::new(),
         }))
     }
 }
@@ -873,6 +875,32 @@ fn decision_prompt_cap(max_ctx: Option<usize>) -> usize {
 /// appended after them, unvalidated. Shared by single-box and pipeline rank-0 admission.
 fn decision_resume_conflict(task: &GenerationTask) -> bool {
     task.decision.is_some() && task.resume_ids().is_some()
+}
+
+/// Last rank: the readout a FRAME_DECIDE announced, under its epoch, with the collector that
+/// gathers the hidden rows its head reads over the prefill FORWARDs. `Err` = the readout was
+/// refused; it is still acked (lockstep) and the error is reported at FRAME_DECIDE_RUN.
+type PendingDecision = Option<(
+    u32,
+    Result<(cascadia_types::DecisionReadout, crate::decision::Collector), String>,
+)>;
+
+/// The last rank's DECIDE_RUN lookup: always takes the entry (a stale one must not leak into
+/// the next task), and turns a missing, stale or invalid readout into the error rank 0 reports.
+fn take_pending(
+    pending: &mut Option<(
+        u32,
+        Result<(cascadia_types::DecisionReadout, crate::decision::Collector), String>,
+    )>,
+    epoch: u32,
+) -> Result<(cascadia_types::DecisionReadout, crate::decision::Collector), String> {
+    match pending.take() {
+        Some((e, r)) if e == epoch => r,
+        Some((e, _)) => Err(format!(
+            "decision pending for epoch {e}, run asked for {epoch}"
+        )),
+        None => Err("no decision pending for this epoch".into()),
+    }
 }
 
 /// The prefix-cache probe for a decision pass: restore no further than the first row/logit the
@@ -1018,6 +1046,11 @@ pub struct Qwen36Engine {
     want_final_hidden: bool,
     /// Final hidden of the latest `chain_pass` (when `want_final_hidden`), taken by `run_span`.
     last_final_hidden: Option<Vec<f32>>,
+    /// Pipeline last rank: the readout FRAME_DECIDE announced (see [`PendingDecision`]).
+    pending_decision: PendingDecision,
+    /// Pipeline last rank: the latest FORWARD's last-position logits row, kept only while a
+    /// decision is pending (a Verbalizer head reads it at FRAME_DECIDE_RUN).
+    last_logits: Vec<f32>,
 }
 
 /// In-flight task state. `step()` advances one token per call so the
@@ -1110,6 +1143,13 @@ where
 enum InFrame {
     Hello(Vec<u8>),
     Reset(u32),
+    /// FRAME_DECIDE: the task's readout, still length-prefixed (`decision::encode_readout`).
+    Decide {
+        epoch: u32,
+        body: Vec<u8>,
+    },
+    /// FRAME_DECIDE_RUN: prefill is done, run the head (last rank) or relay (middle).
+    DecideRun(u32),
     Forward {
         epoch: u32,
         pos: u32,
@@ -1651,6 +1691,118 @@ impl Qwen36Engine {
         .map_err(|e| EngineError::Backend(format!("qwen36 pipeline RESET not acked: {e}")))
     }
 
+    /// Rank 0 / middle: FRAME_DECIDE (header + length-prefixed readout body) → FRAME_DECIDE_ACK
+    /// for `epoch`. Lockstep like RESET: the ack means every rank below has the readout.
+    fn forward_decide_downstream(&mut self, epoch: u32, body: &[u8]) -> EngineResult<()> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
+        let h = self.handle()?;
+        let body = body.to_vec();
+        run_async(
+            &h,
+            reply_bounded(async move {
+                let mut g = downstream.lock().await;
+                g.send_raw(&frame_header(FRAME_DECIDE, epoch, 0)).await?;
+                g.send_raw(&body).await?;
+                let hb = g.recv_raw(12).await?;
+                let (kind, e, _) = parse_header(&hb);
+                if kind != FRAME_DECIDE_ACK || e != epoch {
+                    return Err(TransportError::SocketClosed);
+                }
+                Ok(())
+            }),
+        )
+        .map_err(|e| EngineError::Backend(format!("qwen36 pipeline DECIDE not acked: {e}")))
+    }
+
+    /// Rank 0: announce the active task's readout to the chain for the current epoch.
+    fn decide_exchange(&mut self, d: &cascadia_types::DecisionReadout) -> EngineResult<()> {
+        let epoch = self.epoch;
+        self.forward_decide_downstream(epoch, &crate::decision::encode_readout(d))
+    }
+
+    /// Rank 0 / middle: FRAME_DECIDE_RUN → FRAME_DECISION for `epoch`; returns the result body
+    /// still length-prefixed (a middle relays it verbatim, rank 0 decodes it).
+    fn forward_decide_run_downstream(&mut self, epoch: u32) -> EngineResult<Vec<u8>> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
+        let h = self.handle()?;
+        run_async(
+            &h,
+            reply_bounded(async move {
+                let mut g = downstream.lock().await;
+                g.send_raw(&frame_header(FRAME_DECIDE_RUN, epoch, 0))
+                    .await?;
+                let hb = g.recv_raw(12).await?;
+                let (kind, e, _) = parse_header(&hb);
+                if kind != FRAME_DECISION || e != epoch {
+                    return Err(TransportError::SocketClosed);
+                }
+                recv_decision_body(&mut *g, "decision body").await
+            }),
+        )
+        .map_err(map_wire)
+    }
+
+    /// Rank 0: run the head at the chain end and collect its result. Outer `Err` = wire failure;
+    /// inner `Err` = the last rank refused the readout or its head failed.
+    fn decide_run_exchange(&mut self) -> EngineResult<Result<Vec<f32>, String>> {
+        let epoch = self.epoch;
+        let body = self.forward_decide_run_downstream(epoch)?;
+        crate::decision::decode_result(&body)
+            .map_err(|e| EngineError::Backend(format!("qwen36 pipeline DECISION body: {e}")))
+    }
+
+    /// Rank 0: end a pipeline decision pass with the chain end's result (one final chunk).
+    fn finish_pipe_decision(&mut self) -> Vec<(TaskId, Chunk)> {
+        self.want_final_hidden = false;
+        self.last_final_hidden = None;
+        match self.decide_run_exchange() {
+            Ok(Ok(logits)) => {
+                let Some(t) = self.active.take() else {
+                    return Vec::new();
+                };
+                let n = t.prompt_ids.len() as u32;
+                let id = t.task_id;
+                self.reset_all();
+                vec![(
+                    id.clone(),
+                    Chunk::final_marker(id, "")
+                        .with_prompt_tokens(n)
+                        .with_finish_reason(FinishReason::Stop)
+                        .with_decision_logits(logits),
+                )]
+            }
+            Ok(Err(why)) => self.finalize_error(why),
+            Err(e) => {
+                warn!(error = %e, "pipeline decision failed");
+                self.finalize_error(format!("pipeline decision failed: {e}"))
+            }
+        }
+    }
+
+    /// Middle/last: write one reply upstream: a header (`pos` 0), then `body` verbatim if any.
+    fn reply_upstream(&mut self, kind: u32, epoch: u32, body: Vec<u8>) -> EngineResult<()> {
+        let h = self.handle()?;
+        let upstream = self
+            .upstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no upstream peer".into()))?;
+        run_async(&h, async move {
+            let mut g = upstream.lock().await;
+            g.send_raw(&frame_header(kind, epoch, 0)).await?;
+            if !body.is_empty() {
+                g.send_raw(&body).await?;
+            }
+            Ok::<(), TransportError>(())
+        })
+        .map_err(map_wire)
+    }
+
     /// Issue-34 §8: send `CAPTURE(kv_epoch, tokens)` to the downstream peer and await its ACK. Used
     /// by the head (rank 0, after a turn) and chained by each middle rank. Frame-header epoch is the
     /// current task epoch (stale-frame machinery); the KV content epoch rides the body.
@@ -1777,23 +1929,40 @@ impl Qwen36Engine {
             // Admission (spec §3.2): bump the epoch (frames carry it), tokenize, then either
             // warm-resume (chain-wide RESTORE of the pulled KV) or cold-reset to position 0.
             self.epoch = self.epoch.wrapping_add(1);
+            // Rank 0 never owns the head, so its decision state stays clear on every admission.
+            self.want_final_hidden = false;
+            self.last_final_hidden = None;
+            // Decision task: validate the readout (rank 0 holds no head, so this is the
+            // well-formedness check) and require every rank to speak the decision frames,
+            // before any frame of this task goes out.
+            if let Some(d) = &task.decision {
+                let refused = self.admit_decision_check(d).err().or_else(|| {
+                    (!chain_decision(self.chain_caps)).then(|| {
+                        "decision_unsupported: a pipeline rank predates the decision frames"
+                            .to_string()
+                    })
+                });
+                if let Some(reason) = refused {
+                    let id = task.task_id.clone();
+                    return vec![(id.clone(), Chunk::error(id, reason))];
+                }
+            }
+            if decision_resume_conflict(&task) {
+                let id = task.task_id.clone();
+                let reason = "decision_invalid: resume_token_ids not allowed on a decision task";
+                return vec![(id.clone(), Chunk::error(id, reason))];
+            }
             let tokenizer = self.tokenizer.as_ref().expect("rank 0 has tokenizer");
-            let mut prompt_ids: Vec<u32> = match tokenizer.encode(task.prompt.as_str(), true) {
-                Ok(e) => e.get_ids().to_vec(),
+            // Same encode + think-block append as before, shared with single-box admission; a
+            // decision task prefills exactly the codec's ids instead.
+            let mut prompt_ids: Vec<u32> = match admitted_prompt_ids(tokenizer, &task) {
+                Ok(ids) => ids,
                 Err(e) => {
                     warn!(task = %task.task_id, error = %e, "tokenize failed");
                     let reason = format!("tokenize failed: {e}");
                     return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
                 }
             };
-            if !task.enable_thinking && !task.prompt.trim_end().ends_with("</think>") {
-                // Legacy-rendered prompts only: a chat template injects
-                // the empty think block itself (API passes
-                // enable_thinking into the render).
-                if let Ok(e) = tokenizer.encode("\n<think>\n\n</think>\n\n", false) {
-                    prompt_ids.extend(e.get_ids());
-                }
-            }
             // Option B forced-prefix resume: append the already-emitted assistant
             // tokens after the rendered prompt (concat, not replace) so the cold
             // prefill below carries them as context. No-op when not resuming.
@@ -1864,7 +2033,12 @@ impl Qwen36Engine {
             }
             // Issue-34 warm-resume: a cached strict-prefix blob ⇒ RESTORE this rank + the whole
             // downstream chain (all-or-nothing); any rank short ⇒ cold. 0 ⇒ full prefill (default).
-            let warm_prefix: usize = {
+            // A decision pass never warm-resumes in pipeline mode: the ranks keep no local prefix
+            // cache, so it re-prefills (only the single box reuses state across questions).
+            let warm_prefix: usize = if task.decision.is_some() {
+                cold_admit!();
+                0
+            } else {
                 #[cfg(feature = "kv_coord")]
                 {
                     let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
@@ -1920,6 +2094,17 @@ impl Qwen36Engine {
                     0
                 }
             };
+            // Announce the readout after the RESET, before the prefill FORWARDs.
+            if let Some(d) = &task.decision {
+                if let Err(e) = self.decide_exchange(d) {
+                    warn!(task = %task.task_id, error = %e, "qwen36: DECIDE exchange failed");
+                    self.reset_all();
+                    return vec![(
+                        task.task_id.clone(),
+                        Chunk::error(task.task_id, e.to_string()),
+                    )];
+                }
+            }
             self.active = Some(ActiveTask {
                 task_id: task.task_id,
                 tenant: task.tenant,
@@ -2026,8 +2211,15 @@ impl Qwen36Engine {
                     .collect();
                 info!(task = %task_id, pos, first_token = ?first, ?fps, "qwen36_postprefill_state");
             }
+            // Decision pass: collect the chain end's head result instead of decoding.
+            if self.active.as_ref().is_some_and(|t| t.decision.is_some()) {
+                return self.finish_pipe_decision();
+            }
             Vec::new()
         } else {
+            if t.decision.is_some() {
+                return self.finish_pipe_decision();
+            }
             if t.gen_ids.len() >= t.max_tokens {
                 return self.finalize(FinishReason::Length);
             }
@@ -2126,6 +2318,11 @@ impl Qwen36Engine {
                     Ok(InFrame::Hello(g.recv_raw(n).await?))
                 }
                 FRAME_RESET => Ok(InFrame::Reset(epoch)),
+                FRAME_DECIDE => Ok(InFrame::Decide {
+                    epoch,
+                    body: recv_decision_body(&mut *g, "decide body").await?,
+                }),
+                FRAME_DECIDE_RUN => Ok(InFrame::DecideRun(epoch)),
                 #[cfg(feature = "kv_coord")]
                 FRAME_CAPTURE => {
                     let lb = g.recv_raw(4).await?;
@@ -2265,6 +2462,12 @@ impl Qwen36Engine {
                 // rank 0 (reset protocol).
                 self.reset_all();
                 self.peer_epoch = epoch;
+                // A new task: no decision state may survive from the previous one (a chat task
+                // after an aborted decision must not copy final hidden or keep logits rows).
+                self.want_final_hidden = false;
+                self.last_final_hidden = None;
+                self.pending_decision = None;
+                self.last_logits = Vec::new();
                 if !is_last {
                     self.forward_reset_downstream(epoch)?;
                 }
@@ -2369,6 +2572,67 @@ impl Qwen36Engine {
                 })
                 .map_err(map_wire)
             }
+            InFrame::Decide { epoch, body } => {
+                if self.poisoned.is_some() {
+                    return Err(EngineError::Backend(
+                        "qwen36 pipeline poisoned by handshake mismatch".into(),
+                    ));
+                }
+                if epoch != self.peer_epoch {
+                    // Stale epoch: drop like FORWARD; the driver's recv times out loud.
+                    warn!(
+                        epoch,
+                        current = self.peer_epoch,
+                        "qwen36: dropping stale DECIDE frame"
+                    );
+                    return Ok(());
+                }
+                if is_last {
+                    // Refused readouts are still acked (lockstep); the error surfaces at RUN.
+                    let r = crate::decision::decode_readout(&body)
+                        .and_then(|d| self.admit_decision_check(&d).map(|_| d));
+                    self.want_final_hidden = r.as_ref().is_ok_and(head_reads_hidden);
+                    self.last_final_hidden = None;
+                    self.last_logits = Vec::new();
+                    let hidden = self.hidden;
+                    self.pending_decision = Some((
+                        epoch,
+                        r.map(|d| {
+                            let col = crate::decision::Collector::new(d.head.hidden_need(), hidden);
+                            (d, col)
+                        }),
+                    ));
+                } else {
+                    self.forward_decide_downstream(epoch, &body)?;
+                }
+                self.reply_upstream(FRAME_DECIDE_ACK, epoch, Vec::new())
+            }
+            InFrame::DecideRun(epoch) => {
+                if !is_last {
+                    // Relay: the chain end's DECISION comes back through us verbatim.
+                    let body = self.forward_decide_run_downstream(epoch)?;
+                    return self.reply_upstream(FRAME_DECISION, epoch, body);
+                }
+                let out: Result<Vec<f32>, String> = take_pending(&mut self.pending_decision, epoch)
+                    .and_then(|(d, col)| match self.decision_assets.as_mut() {
+                        Some(assets) => crate::decision::run_head(
+                            &d.head,
+                            assets,
+                            &d.prompt_ids,
+                            &self.last_logits,
+                            &col,
+                        ),
+                        None => Err("decision_unsupported: no head assets".into()),
+                    });
+                if let Err(why) = &out {
+                    warn!(epoch, error = %why, "qwen36: pipeline decision head refused/failed");
+                }
+                self.want_final_hidden = false;
+                self.last_final_hidden = None;
+                self.last_logits = Vec::new();
+                self.reset_all();
+                self.reply_upstream(FRAME_DECISION, epoch, crate::decision::encode_result(&out))
+            }
             InFrame::Forward {
                 epoch,
                 pos,
@@ -2435,6 +2699,21 @@ impl Qwen36Engine {
                         .max_by(|a, b| a.1.total_cmp(b.1))
                         .map(|(i, _)| i as i32)
                         .unwrap_or(0);
+                    // Decision pass: gather this span's hidden rows and keep the logits row
+                    // the head reads. Gated on a pending decision, so chat pays nothing.
+                    if self.pending_decision.is_some() {
+                        let fh = self.last_final_hidden.take();
+                        if let Some((e, Ok((_, col)))) = self.pending_decision.as_mut() {
+                            if let Some(fh) = fh {
+                                if let Err(why) = col.absorb(t0, n, &fh) {
+                                    let e = *e;
+                                    self.pending_decision =
+                                        Some((e, Err(format!("decision_invalid: {why}"))));
+                                }
+                            }
+                        }
+                        self.last_logits = logits;
+                    }
                     (next, 0u32)
                 } else {
                     // Middle: pass the hidden span on; the chain end's
@@ -3606,6 +3885,8 @@ mod tests {
             vocab: None,
             want_final_hidden: false,
             last_final_hidden: None,
+            pending_decision: None,
+            last_logits: Vec::new(),
         }
     }
 
@@ -4222,5 +4503,38 @@ mod tests {
         assert!(owns_head(0, 0));
         assert!(!owns_head(0, 2));
         assert!(owns_head(1, 2));
+    }
+
+    #[test]
+    fn take_pending_matches_epoch_and_surfaces_errors() {
+        use cascadia_types::{DecisionReadout, HiddenNeed, ReadoutHead};
+        let r = DecisionReadout {
+            prompt_ids: vec![1, 2],
+            head: ReadoutHead::Verbalizer { token_ids: vec![1] },
+            cache_prefix: None,
+        };
+        let mut p = Some((
+            7,
+            Ok((
+                r.clone(),
+                crate::decision::Collector::new(HiddenNeed::None, 4),
+            )),
+        ));
+        assert!(take_pending(&mut p, 8).is_err(), "stale epoch");
+        assert!(
+            p.is_none(),
+            "taken even on mismatch so it cannot leak into the next task"
+        );
+        let mut p = Some((
+            7,
+            Ok((r, crate::decision::Collector::new(HiddenNeed::None, 4))),
+        ));
+        assert!(take_pending(&mut p, 7).is_ok());
+        let mut p: Option<(
+            u32,
+            Result<(DecisionReadout, crate::decision::Collector), String>,
+        )> = Some((7, Err("decision_invalid: x".into())));
+        assert_eq!(take_pending(&mut p, 7).unwrap_err(), "decision_invalid: x");
+        assert!(take_pending(&mut None, 7).is_err(), "nothing pending");
     }
 }
