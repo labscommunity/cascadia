@@ -303,6 +303,17 @@
     "logical_read_gbps": 9.7,
     "link_effective_gbps": 13.6,
     "cold_eq_warm": true
+   },
+   "reader_run_rt4": {
+    "reader_threads": {
+     "872361": 9759,
+     "872362": 9649,
+     "872363": 9702,
+     "872364": 9756
+    },
+    "dispatch_threads_preads": 6,
+    "total_pread64": 38872,
+    "note": "strace -f -e pread64 during a 48-token streamed decode: all reads on the 4 pool threads; the dispatch thread performed none"
    }
   }
  }
