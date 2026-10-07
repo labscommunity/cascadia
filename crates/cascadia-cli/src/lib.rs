@@ -1880,6 +1880,7 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
                 ngl: args.llama_ngl,
                 elastic: args.elastic,
                 elastic_vram: args.elastic_vram,
+                host_layers: None,
                 extra_args,
                 load_timeout: args.llama_load_timeout.map(std::time::Duration::from_secs),
                 load_retries: args.llama_load_retries,
