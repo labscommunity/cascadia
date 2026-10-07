@@ -55,3 +55,63 @@ of CATS; planned for follow-up evaluation. Not yet ported.
 
 Used as a build dependency from `cascadia-engine-sparse-moe`. Source
 not copied — pulled in via Cargo.
+
+## Cloudflare Clef (Apache-2.0)
+
+**Repository:** <https://huggingface.co/Cloudflare/clef-flash> (also
+<https://huggingface.co/Cloudflare/clef>), file `joint_schema_model.py`.
+
+**Author:** Cloudflare, Inc.
+
+**Licence:** Apache-2.0 (the model cards declare `license: apache-2.0`).
+The upstream `joint_schema_model.py` carries no copyright header, and the
+repository's `LICENSE` file is the Apache-2.0 text inherited from the
+Qwen3.5 base model.
+
+**What we borrowed (code):**
+- `EvidenceRoutingLayer` and `JointSchemaHead` are copied verbatim into
+  `tools/decision/clef_head.py`. `TensorHead` in the same file is the same
+  maths over flat tensors, with `cosine_similarity` rewritten for the
+  OpenVINO export. The export helpers and loaders are our additions.
+- `encode_record` (prompt layout, option order, span positions) is ported
+  to Rust in `crates/cascadia-api/src/decisions/clef.rs`.
+- `tools/decision/codec_golden.py` imports the upstream module at test
+  time to check the Rust codec against it; it is not vendored.
+
+## Kev (Apache-2.0)
+
+**Repository:** <https://github.com/jaredpalmer/kev> (model:
+<https://huggingface.co/jaredpalmer/kev-9b>).
+
+**Author:** Jared Palmer.
+
+**Licence:** Apache-2.0 (Copyright 2026 Jared Palmer, per the repository's
+`LICENSE`).
+
+**What we borrowed (code):** the request-to-record mapping of `kev/api.py`
+(`to_record`) and the prompt encoding of `kev/model.py` (`encode`, row
+form), ported to Rust in `crates/cascadia-api/src/decisions/kev.rs`; the
+confidence formula in `crates/cascadia-api/src/decisions/schema.rs` matches
+the one `kev/api.py` mirrors from TypeSafe's system-one-adapter.
+
+**Implementation:** Rust re-implementation. No Kev source files have been
+copied into the cascadia tree.
+
+## AutoTrust JEV (Apache-2.0)
+
+**Repository:** <https://huggingface.co/autotrust/JEV-9B> (also
+<https://huggingface.co/autotrust/JEV-27B>), file `vl/serve_decide.py`.
+
+**Author:** AutoTrust.
+
+**Licence:** Apache-2.0 (the model card declares `license: apache-2.0`;
+the repository has no separate `LICENSE` file and `serve_decide.py` no
+copyright header).
+
+**What we borrowed (code):** the System 1 prompt layout of
+`serve_decide.py` (`s1_pass`, strategy `single`, and `_parts` state
+rendering), ported to Rust in `crates/cascadia-api/src/decisions/jev.rs`
+and mirrored in `tools/decision/codec_golden.py` (`jev_text`).
+
+**Implementation:** Rust and Python re-implementation. No JEV source files
+have been copied into the cascadia tree.
