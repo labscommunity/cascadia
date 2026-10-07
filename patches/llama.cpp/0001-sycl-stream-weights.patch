@@ -47,7 +47,7 @@ index cc3f8cd36..d47d397a8 100644
  }
  #endif
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index f6fb91798..f686f9707 100644
+index f6fb91798..19e5cd07f 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -20,6 +20,17 @@
@@ -68,7 +68,7 @@ index f6fb91798..f686f9707 100644
  #include <vector>
  
  #ifdef __APPLE__
-@@ -2429,3 +2440,193 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size)
+@@ -2429,3 +2440,192 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size)
      GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
      return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
  }
@@ -173,17 +173,16 @@ index f6fb91798..f686f9707 100644
 +            continue;
 +        }
 +        if (--users[it->second.fd] == 0 && it->second.fd >= 0) {
-+            for (auto fit = g_stream_fds.begin(); fit != g_stream_fds.end();) {
-+                if (fit->second == it->second.fd) {
++            // close the dup descriptor unconditionally: plan_reset may have
++            // cleared g_stream_fds since this registration, so the dedupe
++            // lookup cannot be trusted to still hold the fd
 +#ifdef _WIN32
-+                    _close(fit->second);
++            _close(it->second.fd);
 +#else
-+                    close(fit->second);
++            close(it->second.fd);
 +#endif
-+                    fit = g_stream_fds.erase(fit);
-+                } else {
-+                    ++fit;
-+                }
++            for (auto fit = g_stream_fds.begin(); fit != g_stream_fds.end();) {
++                fit = fit->second == it->second.fd ? g_stream_fds.erase(fit) : std::next(fit);
 +            }
 +        }
 +        it = g_stream_map.erase(it);
