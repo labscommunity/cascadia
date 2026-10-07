@@ -309,6 +309,7 @@ All flags exist on both `cascadia run` and `cascadia worker`.
 | `--llama-load-timeout <SECS>` | auto | — | Per-attempt health deadline: `60 + 8 per GiB` of model file. |
 | `--llama-load-retries <N>` | `1` | — | Extra load attempts after a child exit or health timeout. |
 | `--elastic-vram <auto\|GiB>` | `auto` | `GGML_STREAM_VRAM_MB` | Resident-weight budget for `--elastic`: `auto` = free VRAM − non-streamed weights − 2× largest layer − reserve; `0` = stream every layer. |
+| `--elastic-share <N>` | — | `GGML_STREAM_VRAM_SHARE` | Expected co-tenant count for `--elastic-vram auto` (sycl-llama): caps automatic resident weights at 1/N of the card so N instances load equal shares. Ignored with an explicit `--elastic-vram` or `GGML_STREAM_RESIDENT_LAYERS`. |
 | — | `0` | `CASCADIA_EXPERT_CACHE_MB` → `GGML_STREAM_EXPERT_CACHE_MB` | MiB of hot-expert residency on MoE models under `--elastic`. Default 0: only the experts the router selects are read per token (automatic, any MoE); a budget pins the hottest expert slices on device. |
 
 ### Other
