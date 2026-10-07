@@ -706,6 +706,22 @@ mod tests {
                 .validate(&LIMITS)
                 .is_err()
         );
+        // Empty or missing option lists (Clef would softmax over nothing: NaN for every question).
+        for q in [
+            serde_json::json!({"c": {"type": "choice"}}),
+            serde_json::json!({"c": {"type": "choice", "criteria": []}}),
+            serde_json::json!({"s": {"type": "score", "criteria": []}}),
+            serde_json::json!({"s": {"type": "score"}}),
+            serde_json::json!({"s": {"type": "score", "criteria": {}}}),
+        ] {
+            assert!(
+                matches!(
+                    base(q.clone()).validate(&LIMITS),
+                    Err(DecisionError::BadRequest(_))
+                ),
+                "{q}"
+            );
+        }
         let mut many = serde_json::Map::new();
         for i in 0..17 {
             many.insert(format!("o{i}"), serde_json::json!("x"));
