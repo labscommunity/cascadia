@@ -193,12 +193,10 @@ impl Sanitizer {
             .get_added_tokens_decoder()
             .values()
             .map(|t| t.content.clone())
-            .filter(|c| {
-                c.len() > 2
-                    && c.starts_with('<')
-                    && c.ends_with('>')
-                    && !(c.starts_with("<|") && c.ends_with("|>"))
-            })
+            .filter(|c| c.len() > 2 && c.starts_with('<') && c.ends_with('>'))
+            // `sanitize_user_text` already rewrites `<|name|>` with name in [A-Za-z0-9_]+; any
+            // other `<|…|>` name (`<|box-start|>`) is covered only by this list, so keep it.
+            .filter(|c| !is_plain_pipe_token(c))
             .collect();
         added.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         added.dedup();
@@ -214,6 +212,15 @@ impl Sanitizer {
         }
         s
     }
+}
+
+/// `<|name|>` with a non-empty name in [A-Za-z0-9_]: the shape `sanitize_user_text` rewrites.
+fn is_plain_pipe_token(c: &str) -> bool {
+    c.strip_prefix("<|")
+        .and_then(|r| r.strip_suffix("|>"))
+        .is_some_and(|n| {
+            !n.is_empty() && n.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
 }
 
 /// Numerically stable softmax. Inputs must be finite and non-empty (all -inf or any NaN gives NaN);
