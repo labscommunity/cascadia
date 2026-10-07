@@ -146,6 +146,12 @@ pub struct AppState {
     /// `false`, a success flips it back `true` — so `/health` reflects the real
     /// state of the chain instead of always returning 200 while requests 503.
     pub ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Decision models (`decision.json` next to the weights): serves `/v1/systemone`. `None` for a
+    /// plain chat model, which answers decision routes with 501.
+    pub decisions: Option<Arc<decisions::DecisionService>>,
+    /// `--decision-dump FILE`, opened once at startup (0600, no symlinks): one JSON line per
+    /// decision pass. Records request-derived token ids.
+    pub decision_dump: Option<Arc<std::sync::Mutex<std::fs::File>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -167,6 +173,10 @@ pub struct Config {
     pub engine_applies_template: bool,
     /// See [`MarkerDialect`]; the CLI loads it with [`MarkerDialect::load`].
     pub marker_dialect: Option<MarkerDialect>,
+    /// See [`AppState::decisions`]; the CLI loads it with [`decisions::DecisionService::load`].
+    pub decisions: Option<Arc<decisions::DecisionService>>,
+    /// See [`AppState::decision_dump`]. Startup only (the CLI's `--decision-dump`), never an env var.
+    pub decision_dump: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -179,6 +189,8 @@ impl Default for Config {
             defer_template_on_thinking: false,
             engine_applies_template: false,
             marker_dialect: None,
+            decisions: None,
+            decision_dump: None,
         }
     }
 }
@@ -484,6 +496,27 @@ pub fn make_router_with_stats(
     cfg: Config,
     stats: Arc<ApiStats>,
 ) -> Router {
+    let decision_dump = cfg.decision_dump.as_ref().map(|p| {
+        let mut o = std::fs::OpenOptions::new();
+        o.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // 0600 on create; refuse to follow a symlink planted at the path.
+            o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let f = o
+            .open(p)
+            .unwrap_or_else(|e| panic!("--decision-dump {}: {e}", p.display()));
+        // `mode` only applies on create: tighten a pre-existing file too.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .unwrap_or_else(|e| panic!("--decision-dump {}: chmod 0600: {e}", p.display()));
+        }
+        Arc::new(std::sync::Mutex::new(f))
+    });
     let state = AppState {
         runner,
         model_id: model_id.into(),
@@ -513,6 +546,8 @@ pub fn make_router_with_stats(
         effort_words: false,
         marker_dialect: cfg.marker_dialect.clone(),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        decisions: cfg.decisions.clone(),
+        decision_dump,
     };
     let state = AppState {
         effort_words: state
@@ -537,6 +572,7 @@ pub fn make_router_with_stats(
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
+        .route("/v1/systemone", post(decisions::handler::decide))
         .route("/v1/cancel/:task_id", post(cancel))
         .with_state(state)
         // Flip `ready` from each completion's final status so /health tracks the
@@ -3852,6 +3888,238 @@ mod tests {
             .await
             .unwrap();
         make_router(Arc::new(runner), "mock-model")
+    }
+
+    async fn make_decision_app() -> Router {
+        make_decision_app_full(1000, 4000, None).await
+    }
+
+    async fn make_decision_app_with(max_tokens: usize, max_total_tokens: usize) -> Router {
+        make_decision_app_full(max_tokens, max_total_tokens, None).await
+    }
+
+    async fn make_decision_app_full(
+        max_tokens: usize,
+        max_total_tokens: usize,
+        dump: Option<std::path::PathBuf>,
+    ) -> Router {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let words = [
+            "[unk]",
+            "<|fim_prefix|>",
+            "<|fim_middle|>",
+            "<|box_start|>",
+            "<|box_end|>",
+            "<|fim_suffix|>",
+        ];
+        let mut vocab: std::collections::HashMap<String, u32> = words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (w.to_string(), i as u32))
+            .collect();
+        // The mock engine fails a decision task whose prompt_ids contain 999_999.
+        vocab.insert("__engine_error__".into(), 999_999);
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(vocab.into_iter().collect())
+            .unk_token("[unk]".into())
+            .build()
+            .unwrap();
+        let mut tok = tokenizers::Tokenizer::new(model);
+        tok.with_pre_tokenizer(Some(
+            tokenizers::pre_tokenizers::whitespace::WhitespaceSplit,
+        ));
+        tok.add_special_tokens(
+            &words[1..]
+                .iter()
+                .map(|w| tokenizers::AddedToken::from(w.to_string(), true))
+                .collect::<Vec<_>>(),
+        );
+        let codec =
+            decisions::kev::KevCodec::new(tok, decisions::profile::KevProfile { temperature: 1.0 })
+                .unwrap();
+        let cfg = Config {
+            decisions: Some(Arc::new(decisions::DecisionService {
+                codec: Box::new(codec),
+                max_tokens,
+                max_total_tokens,
+                max_questions: 32,
+                prefix_reuse: true,
+            })),
+            decision_dump: dump,
+            max_body_bytes: 1 << 20,
+            ..Config::default()
+        };
+        make_router_with_config(Arc::new(runner), "mock-model", cfg)
+    }
+
+    /// Same as `post_decisions`; named for tests whose body is large (the router's body limit is
+    /// raised to 1 MiB in `make_decision_app_full`).
+    async fn post_decisions_sized(app: Router, payload: &str) -> (StatusCode, Value, String) {
+        post_decisions(app, payload).await
+    }
+
+    /// Raw JSON text: `serde_json::json!` sorts object keys, which would hide question-order bugs.
+    async fn post_decisions(app: Router, payload: &str) -> (StatusCode, Value, String) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/systemone")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(Value::Null),
+            text,
+        )
+    }
+
+    #[tokio::test]
+    async fn decisions_answer_every_question_in_order() {
+        let (status, v, body) = post_decisions(
+            make_decision_app().await,
+            r#"{
+            "model": "mock-model", "state": "a b",
+            "questions": {
+                "team": {"type": "choice", "instructions": "who", "criteria": {"billing": "x", "tech": "y"}},
+                "urgent": {"type": "noul"},
+                "sev": {"type": "score", "criteria": ["lo", "mid", "hi"]}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        // Order is checked on the RAW body: parsing into serde_json::Value sorts keys.
+        let (t, u, s) = (
+            body.find("\"team\"").unwrap(),
+            body.find("\"urgent\"").unwrap(),
+            body.find("\"sev\"").unwrap(),
+        );
+        assert!(t < u && u < s, "answers out of request order: {body}");
+        // mock logits [0, -1, ...] ⇒ first option wins
+        assert_eq!(v["answers"]["team"]["choice"], "billing");
+        assert!(v["answers"]["urgent"]["noul"].as_f64().unwrap() < 0.5);
+        assert_eq!(v["usage"]["output_tokens"], 0);
+        assert!(v["usage"]["input_tokens"].as_u64().unwrap() > 0);
+        assert_eq!(v["model"], "mock-model");
+    }
+
+    #[tokio::test]
+    async fn decisions_on_a_chat_model_is_501() {
+        let (status, _, _) = post_decisions(
+            make_app().await,
+            r#"{"model": "m", "state": "s", "questions": {"u": {"type": "noul"}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn decisions_validation_is_400() {
+        let (status, v, _) = post_decisions(
+            make_decision_app().await,
+            r#"{"model": "m", "state": "s", "questions": {}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    }
+
+    #[tokio::test]
+    async fn decisions_over_the_total_token_budget_is_413() {
+        // state prefix counted once + 32 branches of ~8 tokens > max_total_tokens = 40
+        let qs: Vec<String> = (0..32)
+            .map(|i| format!(r#""q{i}": {{"type": "noul"}}"#))
+            .collect();
+        let body = format!(
+            r#"{{"model": "m", "state": "a b", "questions": {{{}}}}}"#,
+            qs.join(",")
+        );
+        let app = make_decision_app_with(1000, 40).await;
+        let (status, v, _) = post_decisions(app, &body).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+        // 3-token prefix (<fim_prefix> a b) + 32 x 8-token branches = 259: the prefill budget, not
+        // the per-pass cap (each pass is 11 tokens), is what rejects it.
+        assert_eq!(
+            v["error"],
+            "this request needs 259 prefill tokens; the per-request limit is 40"
+        );
+    }
+
+    #[tokio::test]
+    async fn decisions_dump_writes_one_line_per_pass() {
+        let path = std::env::temp_dir().join(format!("decision-dump-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // a pre-existing world-readable file must be tightened to 0600 at startup
+        std::fs::write(&path, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let app = make_decision_app_full(1000, 4000, Some(path.clone())).await;
+        let (status, v, _) = post_decisions(
+            app,
+            r#"{"model": "m", "state": "a", "questions": {"u": {"type": "noul"}, "w": {"type": "noul"}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "pre-existing empty file plus 2 appended lines"
+        );
+        assert_eq!(lines[0]["parts"][0][0], "u");
+        assert!(lines[0]["readout"]["prompt_ids"].as_array().unwrap().len() > 2);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn decisions_oversized_state_is_rejected_before_tokenizing() {
+        let big = "a ".repeat(4000 * 8);
+        let body = format!(
+            r#"{{"model": "m", "state": "{big}", "questions": {{"u": {{"type": "noul"}}}}}}"#
+        );
+        let (status, _, _) =
+            post_decisions_sized(make_decision_app_with(1000, 4000).await, &body).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn decisions_engine_error_text_is_not_returned() {
+        // the mock fails a task whose prompt_ids contain the sentinel id 999_999 (Task 2)
+        let (status, v, body) = post_decisions(
+            make_decision_app().await,
+            r#"{"model": "m", "state": "__engine_error__", "questions": {"u": {"type": "noul"}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert_eq!(v["error"], "decision engine error");
+        assert!(!body.contains("mock"), "{body}");
     }
 
     /// A router whose model carries a (minimal) tools-capable chat template.
