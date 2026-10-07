@@ -32,7 +32,8 @@ def test_sym8_rows():
 
 
 def test_check_swap_requires_every_layer_kind():
-    full = {"proj": {0: 4, 1: 7}, "conv": {0: 1},
+    full = {"proj": {0: sorted(ws.LAYER_PROJ["linear_attention"]), 1: sorted(ws.LAYER_PROJ["full_attention"])},
+            "conv": {0: 1},
             "float": {0: ["input_layernorm.weight", "post_attention_layernorm.weight", "linear_attn.A_log",
                           "linear_attn.dt_bias", "linear_attn.norm.weight"],
                       1: ["input_layernorm.weight", "post_attention_layernorm.weight", "self_attn.q_norm.weight",
@@ -47,6 +48,18 @@ def test_check_swap_requires_every_layer_kind():
         ws.check_swap(no_final, range(0, 2), ["linear_attention", "full_attention"], last=True)
 
 
+def test_check_swap_names_a_single_missing_projection():
+    assert len(ws.LAYER_PROJ["linear_attention"]) == 8 and len(ws.LAYER_PROJ["full_attention"]) == 7
+    floats = {0: sorted(ws.LAYER_FLOATS["linear_attention"]), 1: sorted(ws.LAYER_FLOATS["full_attention"])}
+    for layer, kind in ((0, "linear_attention"), (1, "full_attention")):
+        for drop in sorted(ws.LAYER_PROJ[kind]):
+            proj = {0: sorted(ws.LAYER_PROJ["linear_attention"]), 1: sorted(ws.LAYER_PROJ["full_attention"])}
+            proj[layer] = [p for p in proj[layer] if p != drop]
+            report = {"proj": proj, "conv": {0: 1}, "float": floats}
+            with pytest.raises(ValueError, match=rf"layer {layer} .*{drop}"):
+                ws.check_swap(report, range(0, 2), ["linear_attention", "full_attention"], last=False)
+
+
 def test_lora_scale_comes_from_adapter_config(tmp_path):
     import json
     (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 32, "lora_alpha": 64, "rank_pattern": {}, "alpha_pattern": {}}))
@@ -56,6 +69,14 @@ def test_lora_scale_comes_from_adapter_config(tmp_path):
     (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16, "lora_alpha": 32, "rank_pattern": {"q_proj": 8}}))
     with pytest.raises(ValueError, match="rank_pattern"):
         ws.lora_scale_from_config(str(tmp_path / "adapter_model.safetensors"))
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16, "lora_alpha": 32, "use_dora": True}))
+    with pytest.raises(ValueError, match="use_dora"):
+        ws.lora_scale_from_config(str(tmp_path / "adapter_model.safetensors"))
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16, "lora_alpha": 32, "lora_bias": True}))
+    with pytest.raises(ValueError, match="lora_bias"):
+        ws.lora_scale_from_config(str(tmp_path / "adapter_model.safetensors"))
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16, "lora_alpha": 32, "use_dora": False, "lora_bias": False}))
+    assert ws.lora_scale_from_config(str(tmp_path / "adapter_model.safetensors")) == 2.0
 
 
 def test_float_transform_table():
@@ -65,7 +86,8 @@ def test_float_transform_table():
     assert np.allclose(ws.TRANSFORMS[ws.FLOAT_KIND_TRANSFORM["linear_attn.dt_bias"]](w), w)
 
 
-def test_graft_lora_adds_scaled_branch():
+@pytest.mark.parametrize("prefix", ["", "language_model."])
+def test_graft_lora_adds_scaled_branch(tmp_path, prefix):
     ov = pytest.importorskip("openvino")
     from openvino import opset13 as ops
     torch = pytest.importorskip("torch")
@@ -77,9 +99,10 @@ def test_graft_lora_adds_scaled_branch():
     model = ov.Model([ops.result(mm)], [x], "t")
     a = torch.ones(1, 3)
     b = torch.full((3, 1), 0.5)
-    path = os.path.join(os.environ.get("TMPDIR", "/tmp"), "lora_test.safetensors")
-    save_file({"base_model.model.model.layers.0.mlp.down_proj.lora_A.weight": a,
-               "base_model.model.model.layers.0.mlp.down_proj.lora_B.weight": b}, path)
+    path = str(tmp_path / "adapter_model.safetensors")
+    save_file({f"base_model.model.model.{prefix}layers.0.mlp.down_proj.lora_A.weight": a,
+               f"base_model.model.model.{prefix}layers.0.mlp.down_proj.lora_B.weight": b}, path)
+    assert ws.lora_targets(path) == 1
     assert ws.graft_lora(model, path, 2.0) == 1
     out = ov.Core().compile_model(model, "CPU")([np.array([[1.0, 2.0, 3.0]], np.float32)])[0]
     # base = x ; lora = 2 * (x·1)·0.5 = sum(x) = 6
@@ -97,3 +120,121 @@ def test_add_final_hidden_output_exposes_lm_head_input():
     ws.add_final_hidden_output(model)
     assert len(model.outputs) == 2
     assert "final_hidden" in model.outputs[1].get_names()
+    with pytest.raises(ValueError, match="1 output"):
+        ws.add_final_hidden_output(model)  # already has two outputs
+
+
+def test_add_final_hidden_output_without_lm_head_raises_value_error():
+    ov = pytest.importorskip("openvino")
+    from openvino import opset13 as ops
+    x = ops.parameter([1, 4], np.float32, name="x")
+    model = ov.Model([ops.result(ops.multiply(x, ops.constant(np.float32(2.0))))], [x], "t")
+    with pytest.raises(ValueError, match="lm_head"):
+        ws.add_final_hidden_output(model)
+
+
+class _FakeWeights:
+    """dict-backed stand-in for ws.Weights (HF names relative to the layer stack)."""
+
+    def __init__(self, d):
+        self.d = d
+
+    def get(self, name):
+        return self.d[name]
+
+    def rows(self, name, a, b):
+        return self.d[name][a:b]
+
+
+_PFX = "self.model.model.language_model."
+
+
+def _build_stage(ov, ops, layer_types, rng, skip=()):
+    """Tiny graph whose Constants are named like the stock IR's, plus matching fake HF weights."""
+    hid, out_f, k = 8, 6, 4
+    x = ops.parameter([1, hid], np.float32, name="x")
+    results, hf = [], {}
+
+    def compressed(name, u8_shape):
+        w = ops.constant(np.full(u8_shape, 128, np.uint8), dtype=ov.Type.u8)
+        w.set_friendly_name(name)
+        zp = ops.constant(np.full([u8_shape[0]] + [1] * (len(u8_shape) - 1), 128, np.uint8), dtype=ov.Type.u8)
+        zp.set_friendly_name(name + "/zero_point")
+        s = ops.constant(np.ones([u8_shape[0]] + [1] * (len(u8_shape) - 1), np.float16), dtype=ov.Type.f16)
+        s.set_friendly_name(name + "/scale")
+        f = lambda n: ops.convert(n, ov.Type.f32)  # noqa: E731
+        return ops.multiply(ops.subtract(f(w), f(zp)), f(s))
+
+    def float_const(consumer, hf_name):
+        c = ops.constant(np.zeros(hid, np.float32))
+        mul = ops.multiply(x, c)
+        mul.set_friendly_name(consumer)
+        results.append(ops.result(mul))
+        hf[hf_name] = rng.normal(size=hid).astype(np.float32)
+
+    for i, t in enumerate(layer_types):
+        for path in sorted(ws.LAYER_PROJ[t]):
+            if (i, path) in skip:
+                continue
+            deq = compressed(f"{_PFX}layers.{i}.{path}._openvino_orig_weight", [out_f, hid])
+            mm = ops.matmul(x, deq, False, True)
+            mm.set_friendly_name(f"__module.model.model.language_model.layers.{i}.{path}/ov_ext::linear/MatMul")
+            results.append(ops.result(mm))
+            hf[f"layers.{i}.{path}.weight"] = rng.normal(size=(out_f, hid)).astype(np.float32)
+        base = f"{_PFX}layers.{i}."
+        float_const(base + "input_layernorm/aten::mul/Multiply_1", f"layers.{i}.input_layernorm.weight")
+        float_const(base + "post_attention_layernorm/aten::mul/Multiply_1", f"layers.{i}.post_attention_layernorm.weight")
+        if t == "linear_attention":
+            results.append(ops.result(compressed(f"{base}linear_attn/aten::_convolution/Reshape", [hid, 1, k])))
+            hf[f"layers.{i}.linear_attn.conv1d.weight"] = rng.normal(size=(hid, 1, k)).astype(np.float32)
+            float_const(base + "linear_attn.norm/aten::mul/Multiply_1", f"layers.{i}.linear_attn.norm.weight")
+            float_const(base + "linear_attn/aten::add/Add_2", f"layers.{i}.linear_attn.dt_bias")
+            float_const(base + "linear_attn/aten::neg/Multiply_1", f"layers.{i}.linear_attn.A_log")
+        else:
+            float_const(base + "self_attn.q_norm/aten::mul/Multiply_1", f"layers.{i}.self_attn.q_norm.weight")
+            float_const(base + "self_attn.k_norm/aten::mul/Multiply_1", f"layers.{i}.self_attn.k_norm.weight")
+    float_const(f"{_PFX}norm/aten::mul/Multiply_1", "norm.weight")
+    return ov.Model(results, [x], "stage"), _FakeWeights(hf)
+
+
+def _const(model, name):
+    return next(op for op in model.get_ops() if op.get_type_name() == "Constant" and op.get_friendly_name() == name)
+
+
+def test_swap_stage_round_trips_through_check_swap():
+    ov = pytest.importorskip("openvino")
+    from openvino import opset13 as ops
+    types = ["linear_attention", "full_attention"]
+    model, weights = _build_stage(ov, ops, types, np.random.default_rng(1))
+    report = ws.swap_stage(model, weights)
+    assert report["proj"] == {0: sorted(ws.LAYER_PROJ["linear_attention"]), 1: sorted(ws.LAYER_PROJ["full_attention"])}
+    assert report["conv"] == {0: 1}
+    assert set(report["float"][0]) == ws.LAYER_FLOATS["linear_attention"]
+    assert set(report["float"][1]) == ws.LAYER_FLOATS["full_attention"]
+    assert report["float"]["final"] == ["norm.weight"]
+    ws.check_swap(report, range(0, 2), types, last=True)
+    # projection constants now hold the int8 re-quantization of the fake HF tensor
+    name = f"{_PFX}layers.1.self_attn.q_proj._openvino_orig_weight"
+    w = weights.get("layers.1.self_attn.q_proj.weight")
+    q, zp, s = (_const(model, name + sfx).get_data() for sfx in ("", "/zero_point", "/scale"))
+    eq, ezp, es = ws.q_asym(w, 8, axis=-1)
+    np.testing.assert_array_equal(q, eq)
+    np.testing.assert_array_equal(zp, ezp)
+    np.testing.assert_array_equal(s, es)
+    # conv keeps its 3-D shape; floats go through their transform
+    assert list(_const(model, f"{_PFX}layers.0.linear_attn/aten::_convolution/Reshape").get_output_shape(0)) == [8, 1, 4]
+    a_log = next(op for op in model.get_ops() if op.get_friendly_name() == f"{_PFX}layers.0.linear_attn/aten::neg/Multiply_1")
+    np.testing.assert_allclose(a_log.input_value(1).get_node().get_data(), np.exp(weights.get("layers.0.linear_attn.A_log")),
+                               rtol=1e-6)
+    out = ov.Core().compile_model(model, "CPU")([np.ones((1, 8), np.float32)])
+    assert all(np.isfinite(v).all() for v in out.values())
+
+
+def test_swap_stage_missing_projection_fails_check_swap():
+    ov = pytest.importorskip("openvino")
+    from openvino import opset13 as ops
+    types = ["linear_attention", "full_attention"]
+    model, weights = _build_stage(ov, ops, types, np.random.default_rng(2), skip={(0, "linear_attn.in_proj_a")})
+    report = ws.swap_stage(model, weights)
+    with pytest.raises(ValueError, match=r"layer 0 .*in_proj_a"):
+        ws.check_swap(report, range(0, 2), types, last=True)
