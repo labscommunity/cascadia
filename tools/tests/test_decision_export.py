@@ -349,7 +349,7 @@ def cli(monkeypatch, tmp_path):
     monkeypatch.setattr(ex, "run_export", fake_run_export)
     base = tmp_path / "base"
     base.mkdir()
-    (base / "config.json").write_text(json.dumps({"text_config": {"max_position_embeddings": 262144}}))
+    (base / "config.json").write_text(json.dumps({"text_config": {"max_position_embeddings": 262144, "hidden_size": 8}}))
 
     def run(*argv):
         monkeypatch.setattr(sys, "argv", ["decision_export.py", *argv])
@@ -377,13 +377,13 @@ def test_cli_kev_final_hidden_weights_lora(cli, monkeypatch):
     run, calls, base, tmp = cli
     seen = {}
     monkeypatch.setattr(de, "write_kev_profile",
-                        lambda pt, out: seen.update(pt=pt) or de._write(out, {"family": "kev"}, {"kind": "pointer"}))
+                        lambda pt, out, hidden: seen.update(pt=pt, hidden=hidden) or de._write(out, {"family": "kev"}, {"kind": "pointer"}))
     run("kev", "--base-ir", str(base), "--weights", "W", "--lora", "L.safetensors", "--lora-scale", "2",
         "--head-pt", "H.pt", "--stages", "2", "--out", str(tmp / "t"))
     (_, a, kw, assets_first), = calls
     assert a == (str(base), str(tmp / "t"), 2, False, None)
     assert kw == {"weights": "W", "lora": "L.safetensors", "lora_scale": 2.0, "final_hidden": True}
-    assert assets_first and seen == {"pt": "H.pt"}
+    assert assets_first and seen == {"pt": "H.pt", "hidden": 8}
 
 
 def test_cli_clef_weights_default_to_clef_dir(cli, monkeypatch):
@@ -402,3 +402,87 @@ def test_cli_family_inputs_required_before_export(cli, family, missing, capsys):
     with pytest.raises(SystemExit):
         run(family, "--base-ir", str(base), "--out", str(tmp / "t"))
     assert missing in capsys.readouterr().err and calls == []
+
+
+# Fix round 1: stale manifest, writer-side checks, config source for max_tokens.
+
+def _jev_adapter(tmp_path, n_bias=24, choice=(8, 24), per_kind=None):
+    adapter = tmp_path / "jev" / "adapter_vllm"
+    adapter.mkdir(parents=True)
+    (adapter / "decision_head.json").write_text(json.dumps({
+        "bias": [0.0] * n_bias, "verbalizer_ids": list(range(24)),
+        "slots": {"ranges": {"noul": [0, 2], "score": [2, 8], "choice": list(choice)},
+                  "verbalizers": [str(i) for i in range(24)]}}))
+    cal = tmp_path / "jev" / "calibration.json"
+    cal.write_text(json.dumps({"per_kind": per_kind or {"noul": 1.0, "choice": 1.0, "score": 1.0}}))
+    return adapter, cal
+
+
+def test_cli_removes_stale_manifest_before_writing_assets(cli, monkeypatch):
+    run, calls, base, tmp = cli
+    out = tmp / "t"
+    out.mkdir()
+    (out / "manifest.json").write_text("{}")  # earlier export in the same tree
+
+    def early_failure(*a, **kw):  # e.g. --weights architecture mismatch, before run_export's own removal
+        raise SystemExit("--weights W is not the IR's architecture")
+    monkeypatch.setattr(ex, "run_export", early_failure)
+    adapter, _ = _jev_adapter(tmp)
+    with pytest.raises(SystemExit, match="architecture"):
+        run("jev", "--base-ir", str(base), "--adapter-dir", str(adapter), "--out", str(out))
+    assert not (out / "manifest.json").exists()
+    assert (out / "decision.json").exists()  # new assets, but no loadable tree
+
+
+def test_cli_stale_manifest_removed_when_asset_writer_fails(cli, monkeypatch):
+    run, calls, base, tmp = cli
+    out = tmp / "t"
+    out.mkdir()
+    (out / "manifest.json").write_text("{}")
+
+    def boom(*a, **kw):
+        raise ValueError("bad head.pt")
+    monkeypatch.setattr(de, "write_kev_profile", boom)
+    with pytest.raises(ValueError):
+        run("kev", "--base-ir", str(base), "--head-pt", "H.pt", "--out", str(out))
+    assert not (out / "manifest.json").exists() and calls == []
+
+
+def test_jev_calibration_missing_kind_raises(tmp_path):
+    adapter, cal = _jev_adapter(tmp_path, per_kind={"noul": 1.0, "choice": 0.98})
+    with pytest.raises(ValueError, match="score"):
+        de.write_jev_profile(str(adapter), str(cal), str(tmp_path / "tree"))
+
+
+def test_jev_length_mismatch_raises(tmp_path):
+    adapter, cal = _jev_adapter(tmp_path, n_bias=23)
+    with pytest.raises(ValueError, match="lengths differ: 24/24/23"):
+        de.write_jev_profile(str(adapter), str(cal), str(tmp_path / "tree"))
+
+
+def test_jev_slot_range_out_of_bounds_raises(tmp_path):
+    adapter, cal = _jev_adapter(tmp_path, choice=(8, 25))
+    with pytest.raises(ValueError, match="choice"):
+        de.write_jev_profile(str(adapter), str(cal), str(tmp_path / "tree"))
+
+
+def test_kev_hidden_mismatch_raises(tmp_path):
+    torch = pytest.importorskip("torch")
+    pt = tmp_path / "head.pt"
+    torch.save({"head": {"q.weight": torch.ones(4, 8), "q.bias": torch.zeros(4),
+                         "k.weight": torch.ones(4, 8), "k.bias": torch.zeros(4)}, "temperature": 1.0}, pt)
+    with pytest.raises(ValueError, match="q.weight has hidden dim 8 but the base IR's hidden_size is 16"):
+        de.write_kev_profile(str(pt), str(tmp_path / "tree"), hidden=16)
+    de.write_kev_profile(str(pt), str(tmp_path / "ok"), hidden=8)
+
+
+def test_cli_jev_max_tokens_from_weights_config(cli, monkeypatch):
+    run, calls, base, tmp = cli
+    seen = {}
+    monkeypatch.setattr(de, "write_jev_profile",
+                        lambda ad, cal, out, max_tokens: seen.update(mt=max_tokens))
+    w = tmp / "ft"
+    w.mkdir()
+    (w / "config.json").write_text(json.dumps({"text_config": {"max_position_embeddings": 4096}}))
+    run("jev", "--base-ir", str(base), "--weights", str(w), "--adapter-dir", str(tmp / "a"), "--out", str(tmp / "t"))
+    assert seen == {"mt": 4096}  # the fine-tune's config (shipped in the tree), not the base IR's 262144
