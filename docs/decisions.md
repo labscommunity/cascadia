@@ -54,10 +54,12 @@ missing `tokenizer.json`) is logged and decisions stay off; chat keeps working.
 - `model` is accepted and ignored: one server serves one model.
 - `input` is a string, or a list of messages `{"role": "user", "content": ...}`. `content` is a
   string or a list of `{"type": "input_text", "text": ...}` parts. A message's parts are
-  concatenated, and messages are joined with `"\n"`. Only `role: "user"` is accepted.
+  concatenated, and messages are joined with `"\n"`. Only `role: "user"` is accepted (an omitted
+  `role` counts as `"user"`).
   `input_image` parts are a 400: this server is text-only.
 - `questions[].name` is required, non-empty and unique. Answers come back in request order.
-- `choices[].value` is a string or a number. Duplicate values are a 400.
+- `choices[].value` is a string or a number; any other JSON type is a 400. Duplicate values are a
+  400.
 - `choices[].description` and `levels[].description` are optional.
 
 ### Response
@@ -113,7 +115,7 @@ The OpenAI request is translated into the internal (SystemOne) form before the m
 - `choice` becomes a choice with criteria `{value: description}` in request order. A number value
   is keyed by its JSON text (`2` → `"2"`); a missing description is `null`.
 - **Score levels are rendered as one text per level**, `"label: description"`, or just `"label"`
-  when there is no description, before the codec sees them. This approximates the single-text
+  when the description is missing or empty, before the codec sees them. This approximates the single-text
   levels the models were trained on; nothing in the reference implementations says which form
   they score best on. JEV never sees level text (see [JEV score answers](#jev-score-answers-are-an-approximation)),
   so only Kev and Clef are affected.
