@@ -418,7 +418,20 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
         target count.
       * `final_hidden`: the last stage also outputs the final-norm hidden
         (output 1, `final_hidden`); recorded as manifest `final_hidden_output`.
+
+    manifest.json is written last, as the commit marker: a stale one from an
+    earlier run in `output_dir` is removed first, so a failed export (LoRA
+    graft count, embeddings swap) never leaves a loadable tree behind.
     """
+    if validate and (weights or lora):
+        # _validate compares the chain against the STOCK full model and stock
+        # embeddings: a correct --weights export would fail it, and a --lora
+        # export would pass or fail regardless of the graft.
+        raise SystemExit(
+            "--validate checks the stage chain against the stock IR, so it cannot "
+            "judge a --weights/--lora export; drop --validate (decision trees are "
+            "checked by the golden/parity gates instead)"
+        )
     import openvino as ov
 
     xml = os.path.join(model_dir, "openvino_language_model.xml")
@@ -429,6 +442,16 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
             f"not on safetensors"
         )
     spec = read_model_spec(model_dir)
+    if weights and os.path.exists(os.path.join(weights, "config.json")):
+        wspec = read_model_spec(weights)
+        mine = (spec.hidden, spec.num_layers, spec.layer_types)
+        theirs = (wspec.hidden, wspec.num_layers, wspec.layer_types)
+        if mine != theirs:
+            raise SystemExit(
+                f"--weights {weights} is not the IR's architecture: hidden/num_layers "
+                f"{wspec.hidden}/{wspec.num_layers} vs {spec.hidden}/{spec.num_layers}"
+                + ("" if wspec.layer_types == spec.layer_types else ", layer_types differ")
+            )
     ranges = stage_ranges(spec.num_layers, num_stages, layer_split)
     check_stage_ranges(spec, ranges)
     print(
@@ -437,6 +460,9 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
         f"{spec.layer_types.count(FULL)} {FULL}) vocab={spec.vocab}",
         flush=True,
     )
+    stale = os.path.join(output_dir, "manifest.json")
+    if os.path.exists(stale):
+        os.remove(stale)
     manifest = build_manifest(spec, os.path.basename(os.path.abspath(model_dir)),
                               final_hidden=final_hidden)
 
@@ -495,8 +521,6 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
         if grafted != want:
             raise SystemExit(f"grafted {grafted} LoRA branches but the adapter has {want} targets")
 
-    with open(os.path.join(output_dir, "manifest.json"), "w") as f:
-        json.dump(manifest, f, indent=2)
     # aux files the engine needs alongside the stages (single-dir UX)
     import shutil
     embeddings = ("openvino_text_embeddings_model.xml", "openvino_text_embeddings_model.bin")
@@ -517,6 +541,9 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
         swap_embeddings(os.path.join(model_dir, "openvino_text_embeddings_model.xml"),
                         Weights(weights), output_dir)
         print(f"text embeddings swapped from {weights}", flush=True)
+    # last: the manifest marks the tree complete
+    with open(os.path.join(output_dir, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=2)
     print("manifest + aux files written", flush=True)
 
     if not validate:
