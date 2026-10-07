@@ -97,6 +97,17 @@ pub struct LlamaCppConfig {
     /// Resident-weight budget for elastic mode (GGML_STREAM_VRAM_MB).
     /// Only meaningful with `elastic`.
     pub elastic_vram: ElasticVram,
+    /// Experimental placement: layer tensors whose names match this regex
+    /// live in the backend's pinned HOST buffer and the GPU computes on them
+    /// in place (`-ot '<regex>=SYCL_Host'`, with mmap off so the loader
+    /// honours the host buffer). Needs a llama-server built with
+    /// `patches/llama.cpp/0003-sycl-host-buffer-compute.patch`. On a
+    /// discrete card this reads the overflow over the link every token with
+    /// stable pointers (fused ops and graphs stay on) instead of streaming
+    /// it through a staging copy; on a UMA iGPU it is slower than device
+    /// placement and frees no device-pool memory (see
+    /// `docs/perf/sycl-elastic/placement-b390.md`).
+    pub host_layers: Option<String>,
     /// Extra raw args appended verbatim to the server command line.
     pub extra_args: Vec<String>,
     /// Health deadline per load attempt. `None` = auto: 60 s + 8 s per GiB
@@ -368,6 +379,26 @@ pub fn resolve_llama_bin(
     ))
 }
 
+/// `-ot '<regex>=SYCL_Host' --no-mmap` for [`LlamaCppConfig::host_layers`],
+/// or nothing. mmap must be off: with it on, the loader silently replaces a
+/// host-buffer placement by the CPU buffer (llama-model-loader.cpp, "avoid
+/// using a host buffer when using mmap") and the CPU backend computes the
+/// layer. The regex is used as given; `=` and `,` are the override
+/// syntax's separators, so they are rejected here rather than mis-parsed
+/// by the child.
+pub fn llama_host_layer_args(host_layers: Option<&str>) -> Vec<String> {
+    match host_layers.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(re) if re.contains('=') || re.contains(',') => {
+            eprintln!(
+                "sycl-llama: --llama-host-layers {re:?} contains '=' or ',' (the -ot separators); ignored"
+            );
+            Vec::new()
+        }
+        Some(re) => vec!["--no-mmap".into(), "-ot".into(), format!("{re}=SYCL_Host")],
+        None => Vec::new(),
+    }
+}
+
 /// Map a cascadia `--device` value to llama.cpp `--device` args + the ngl
 /// actually in force. `GPU` -> `SYCL0`, `GPU.N` -> `SYCLN`, `CPU` (any case)
 /// -> `--device none` with ngl forced to 0; anything else (SYCL1, Vulkan0,
@@ -630,6 +661,7 @@ impl LlamaCppBuilder {
         {
             cmd.env("GGML_STREAM_EXPERT_CACHE_MB", mb);
         }
+        cmd.args(llama_host_layer_args(self.cfg.host_layers.as_deref()));
         for a in self.cfg.extra_args.iter().filter(|a| !a.is_empty()) {
             cmd.arg(a);
         }
@@ -1168,6 +1200,18 @@ fn handle_sse_line(
     let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
         return true;
     };
+    // The child can emit an error object mid-stream; surface it instead of
+    // letting the stream end as an ambiguous EOF.
+    if v.get("error").is_some() {
+        let msg = v["error"]["message"]
+            .as_str()
+            .or_else(|| v["error"].as_str())
+            .unwrap_or("llama-server stream error")
+            .to_string();
+        send(Ok((tid.clone(), Chunk::error(tid.clone(), msg))));
+        st.sent_final = true;
+        return false;
+    }
     // stream_options usage tail (empty choices) or a timings block on a
     // content chunk — either can carry the prompt token count.
     if let Some(n) = v["usage"]["prompt_tokens"].as_u64() {
@@ -1182,7 +1226,9 @@ fn handle_sse_line(
     // Structured tool calls arrive as OpenAI delta.tool_calls fragments
     // (index + id + function.name + function.arguments pieces, usually
     // without delta.content); accumulate them for the stream-end emit.
+    let mut active = false;
     if let Some(calls) = v["choices"][0]["delta"]["tool_calls"].as_array() {
+        active = true;
         for call in calls {
             let idx = call["index"].as_u64().unwrap_or(0);
             let parts = st.tool_calls.entry(idx).or_default();
@@ -1196,6 +1242,14 @@ fn handle_sse_line(
             }
         }
     }
+    // reasoning_content deltas carry no visible text but prove the child is
+    // alive; the stall clock must hear them or a long reasoning-only stream
+    // gets killed at the limit while still generating
+    if v["choices"][0]["delta"]["reasoning_content"].as_str().is_some_and(|s| !s.is_empty())
+        || v["choices"][0]["delta"]["reasoning"].as_str().is_some_and(|s| !s.is_empty())
+    {
+        active = true;
+    }
     let stop_str = v["choices"][0]["finish_reason"].as_str();
     if let Some(r) = stop_str {
         st.finish_reason = Some(if r == "length" {
@@ -1205,8 +1259,12 @@ fn handle_sse_line(
         });
     }
     // Empty chunks carry no content; a stop-only chunk only updates the
-    // recorded finish_reason (emitted on the [DONE] final).
+    // recorded finish_reason (emitted on the [DONE] final). Anything that
+    // carried real upstream activity still pings the stall clock.
     if text.is_empty() {
+        if active {
+            send(Ok((tid.clone(), Chunk::progress(tid.clone()))));
+        }
         return true;
     }
     let c = Chunk::token(tid.clone(), st.token_id, text.to_string());
@@ -1659,6 +1717,19 @@ mod tests {
         // an explicit path that does not exist errors instead of falling through
         assert!(resolve_llama_bin(Some("/nonexistent/bin"), env, None)
             .is_err_and(|e| e.contains("--llama-bin")));
+    }
+
+    #[test]
+    fn host_layer_args_only_with_a_regex() {
+        assert!(llama_host_layer_args(None).is_empty());
+        assert!(llama_host_layer_args(Some("  ")).is_empty());
+        assert_eq!(
+            llama_host_layer_args(Some(r"blk\.(6[2-4])\..*")),
+            ["--no-mmap", "-ot", r"blk\.(6[2-4])\..*=SYCL_Host"]
+        );
+        // the override syntax's own separators cannot be part of the pattern
+        assert!(llama_host_layer_args(Some("a=b")).is_empty());
+        assert!(llama_host_layer_args(Some("a,b")).is_empty());
     }
 
     #[test]
@@ -2205,6 +2276,7 @@ mod unix_tests {
             ngl: 0,
             elastic: false,
             elastic_vram: ElasticVram::Auto,
+            host_layers: None,
             extra_args: vec![],
             load_timeout: Some(Duration::from_secs(1)),
             load_retries: retries,

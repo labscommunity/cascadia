@@ -399,7 +399,17 @@ impl Runner {
         let model = shard.model_id.clone();
         let device = shard.device.clone();
         let load_started = Instant::now();
-        let mut load_stream = builder.load(shard).await?;
+        // engines may implement load() with synchronous spawn/health-poll
+        // loops; on a multi-thread runtime drive it through run_async so a
+        // blocking load migrates other tasks off this worker instead of
+        // stalling them. current_thread runtimes have no block_in_place;
+        // await directly there
+        let mut load_stream = match tokio::runtime::Handle::try_current() {
+            Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                run_async(&h, builder.load(shard))?
+            }
+            _ => builder.load(shard).await?,
+        };
         // drain the load progress stream
         use futures::StreamExt;
         while let Some(progress) = load_stream.next().await {

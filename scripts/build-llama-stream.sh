@@ -29,6 +29,23 @@ if [ ! -d "$DEST/.git" ]; then
 fi
 cd "$DEST"
 git checkout "$LLAMA_BASE"
+# a tree whose markers survive from an OLDER patch revision would fool the
+# per-patch skip check below; pin the exact revision set in a manifest and
+# refuse to build on top of a stale one
+MANIFEST=".cascadia-patches.manifest"
+{
+    echo "base=$LLAMA_BASE"
+    for SPEC in "${PATCHES[@]}"; do
+        P="${SPEC%%:*}"
+        echo "$(basename "$P") sha256:$(sha256sum "$P" | cut -c1-16)"
+    done
+} > "$MANIFEST.new"
+if [ -f "$MANIFEST" ] && ! cmp -s "$MANIFEST" "$MANIFEST.new"; then
+    echo "ERROR: $DEST has a different patch/base revision applied:" >&2
+    diff "$MANIFEST" "$MANIFEST.new" >&2 || true
+    echo "reset to a clean base first: git -C $DEST checkout $LLAMA_BASE -- . && rm $DEST/$MANIFEST" >&2
+    exit 1
+fi
 # apply the chain in order (idempotent reruns): skip a patch only when its
 # own marker already proves it applied - a missing 0002 cannot hide behind
 # 0001's marker - otherwise verify it applies, apply it, and abort on any
@@ -51,6 +68,7 @@ for SPEC in "${PATCHES[@]}"; do
         exit 1
     fi
 done
+mv "$MANIFEST.new" "$MANIFEST"
 
 # icx/icpx + SYCL headers come from the oneAPI environment. setvars.sh is
 # not nounset-clean, so relax -u while sourcing it.
