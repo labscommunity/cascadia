@@ -68,9 +68,19 @@ def stubbed(tmp_path, monkeypatch):
     monkeypatch.setattr(ex, "extract_stage", lambda xml, spec, a, b, first, last: _FakeStage())
     monkeypatch.setattr(ov, "save_model", lambda *a, **kw: calls.append(("save",)))
     monkeypatch.setattr(weight_swap, "Weights", lambda d: ("W", d))
-    monkeypatch.setattr(weight_swap, "swap_stage", lambda stage, w: calls.append(("swap", w)) or {"r": 1})
-    monkeypatch.setattr(weight_swap, "check_swap",
-                        lambda report, layers, lt, last: calls.append(("check", list(layers), last)))
+    reports = []
+
+    def swap_stage(stage, w):
+        calls.append(("swap", w))
+        reports.append(object())  # per-call sentinel: check_swap must get this stage's report
+        return reports[-1]
+
+    def check_swap(report, layers, lt, last):
+        assert report is reports[-1]
+        assert lt == LAYER_TYPES
+        calls.append(("check", list(layers), last))
+    monkeypatch.setattr(weight_swap, "swap_stage", swap_stage)
+    monkeypatch.setattr(weight_swap, "check_swap", check_swap)
     monkeypatch.setattr(weight_swap, "swap_embeddings",
                         lambda xml, w, out: calls.append(("emb", os.path.basename(xml), w)))
     monkeypatch.setattr(weight_swap, "add_final_hidden_output", lambda stage: calls.append(("fh",)))
@@ -97,19 +107,61 @@ def test_weights_swaps_and_checks_every_stage_and_embeddings(stubbed, tmp_path):
     wdir = tmp_path / "ft"
     wdir.mkdir()
     (wdir / "tokenizer.json").write_text("fine-tune tokenizer")
+    ft_cfg = (model / "config.json").read_text().replace('"vocab_size": 16', '"vocab_size": 16, "ft": 1')
+    (wdir / "config.json").write_text(ft_cfg)
     ex.run_export(str(model), str(out), 2, weights=str(wdir))
+    assert [c[0] for c in calls if c[0] in ("swap", "check")] == ["swap", "check", "swap", "check"]
     checks = [c for c in calls if c[0] == "check"]
     assert checks == [("check", [0, 1, 2, 3], False), ("check", [4, 5, 6, 7], True)]
     assert ("emb", "openvino_text_embeddings_model.xml", ("W", str(wdir))) in calls
     assert not (out / "openvino_text_embeddings_model.bin").exists()  # not copied from the stock IR
     assert (out / "tokenizer.json").read_text() == "fine-tune tokenizer"
+    assert (out / "config.json").read_text() == ft_cfg
+    assert (out / "manifest.json").exists()
+
+
+def test_weights_with_other_architecture_refused_before_any_work(stubbed, tmp_path):
+    model, out, calls, _, _ = stubbed
+    wdir = tmp_path / "ft"
+    wdir.mkdir()
+    cfg = json.loads((model / "config.json").read_text())
+    cfg["text_config"]["hidden_size"] = 16
+    (wdir / "config.json").write_text(json.dumps(cfg))
+    with pytest.raises(SystemExit, match="not the IR's architecture"):
+        ex.run_export(str(model), str(out), 2, weights=str(wdir))
+    assert calls == []
+
+
+@pytest.mark.parametrize("flag", ["weights", "lora"])
+def test_validate_refused_with_weights_or_lora_before_any_work(stubbed, tmp_path, flag):
+    model, out, calls, _, mp = stubbed
+    mp.setattr(ex, "extract_stage", lambda *a: pytest.fail("extract_stage ran"))
+    with pytest.raises(SystemExit, match="--validate"):
+        ex.run_export(str(model), str(out), 2, validate=True, **{flag: str(tmp_path / "x")})
+    assert calls == [] and not out.exists()
 
 
 def test_lora_graft_total_must_match_adapter_targets(stubbed, tmp_path):
     model, out, calls, ws, mp = stubbed
     _lora(mp, ws, calls, per_stage=3, targets=7)
+    out.mkdir()
+    (out / "manifest.json").write_text("{}")  # stale manifest from an earlier run in the same dir
     with pytest.raises(SystemExit, match="grafted 6 LoRA branches but the adapter has 7 targets"):
         ex.run_export(str(model), str(out), 2, lora=str(tmp_path / "adapter_model.safetensors"))
+    assert not (out / "manifest.json").exists()
+
+
+def test_embeddings_swap_failure_leaves_no_manifest(stubbed, tmp_path):
+    model, out, calls, ws, mp = stubbed
+
+    def boom(*a):
+        raise ValueError("no embedding Constant")
+    mp.setattr(ws, "swap_embeddings", boom)
+    out.mkdir()
+    (out / "manifest.json").write_text("{}")
+    with pytest.raises(ValueError):
+        ex.run_export(str(model), str(out), 2, weights=str(tmp_path / "ft"))
+    assert not (out / "manifest.json").exists()
 
 
 def test_lora_scale_comes_from_adapter_config(stubbed, tmp_path):
