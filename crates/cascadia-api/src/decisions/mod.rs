@@ -2,6 +2,7 @@
 //! openai.rs) and POST /v1/systemone (Jev/SystemOne format, handler.rs), sharing one core.
 
 pub mod clef;
+pub mod handler;
 pub mod jev;
 pub mod kev;
 pub mod profile;
