@@ -9,6 +9,7 @@ use cascadia_ov_genai_shim::{DType, PluginConfig, Runtime};
 use cascadia_types::{DecisionReadout, HiddenNeed, ReadoutHead};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug)]
 pub struct Collector {
     need: HiddenNeed,
     hidden: usize,
