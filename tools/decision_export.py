@@ -43,10 +43,19 @@ def write_jev_profile(adapter_dir, calibration_json, out_dir, max_tokens=32768):
     if not (len(slots["verbalizers"]) == n == len(h["bias"])):
         raise ValueError(f"{adapter_dir}/decision_head.json: verbalizers/verbalizer_ids/bias lengths differ: "
                          f"{len(slots['verbalizers'])}/{n}/{len(h['bias'])}")
+    missing = [k for k in ("noul", "score", "choice") if k not in slots["ranges"]]
+    if missing:
+        raise ValueError(f"{adapter_dir}/decision_head.json: slots.ranges lacks {', '.join(missing)}")
     for kind, (lo, hi) in slots["ranges"].items():
         if not 0 <= lo <= hi <= n:
             raise ValueError(f"{adapter_dir}/decision_head.json: slot range {kind} [{lo}, {hi}) "
                              f"out of bounds for {n} verbalizers")
+    # Mirrors JevCodec::new: the prompt hard-codes false/true and 0..5, so noul is 2 wide, score 6.
+    for kind, width in (("noul", 2), ("score", 6)):
+        lo, hi = slots["ranges"][kind]
+        if hi - lo != width:
+            raise ValueError(f"{adapter_dir}/decision_head.json: slot range {kind} [{lo}, {hi}) "
+                             f"must be {width} wide")
     missing = [k for k in ("noul", "choice", "score") if k not in cal]
     if missing:
         # the reference indexes TEMPS[kind] (jev.py:58): no silent 1.0
