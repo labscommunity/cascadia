@@ -111,6 +111,16 @@ impl DecisionService {
     }
 }
 
+/// A tokenizer failure inside a codec's `encode`. The tokenizer's own text can carry vocab or path
+/// detail, so it is logged and the client gets a fixed message. Every other `BadRequest` from a
+/// codec is a real validation reason and reaches the client unchanged.
+pub(crate) fn tokenize_failed(e: impl std::fmt::Display) -> DecisionError {
+    tracing::warn!(error = %e, "decision tokenization failed");
+    DecisionError::BadRequest(TOKENIZE_FAILED.into())
+}
+
+pub(crate) const TOKENIZE_FAILED: &str = "request could not be tokenized";
+
 /// kev.model.user_tokens, shared by every codec: `<|name|>` (name = [A-Za-z0-9_]+) → `<¦name¦>`.
 /// HF tokenizers match added/special tokens inside text even with add_special_tokens=false, so
 /// without this, state or option text could forge `<|im_end|>`, `<|fim_suffix|>` etc. and steer
