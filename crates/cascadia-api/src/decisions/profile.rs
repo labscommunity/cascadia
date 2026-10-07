@@ -130,6 +130,29 @@ mod tests {
     }
 
     #[test]
+    fn sanitizer_covers_pipe_tokens_outside_the_name_charset() {
+        // `sanitize_user_text` only rewrites `<|name|>` with name in [A-Za-z0-9_]; an added token
+        // like `<|box-start|>` must still be neutralized, via the added-token list.
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab([("[unk]".to_string(), 0u32)].into_iter().collect())
+            .unk_token("[unk]".into())
+            .build()
+            .unwrap();
+        let mut tok = tokenizers::Tokenizer::new(model);
+        tok.add_special_tokens(&[
+            tokenizers::AddedToken::from("<|box-start|>", true),
+            tokenizers::AddedToken::from("<|a.b|>", true),
+            tokenizers::AddedToken::from("<|im_end|>", true),
+        ]);
+        let san = crate::decisions::Sanitizer::from_tokenizer(&tok);
+        let out = san.apply("x <|box-start|> <|a.b|> <|im_end|>");
+        for t in ["<|box-start|>", "<|a.b|>", "<|im_end|>"] {
+            assert!(!out.contains(t), "{t} survived: {out}");
+        }
+        assert_eq!(out, "x <¦|box-start|¦> <¦|a.b|¦> <¦im_end¦>");
+    }
+
+    #[test]
     fn sanitize_rewrites_only_control_token_shapes() {
         use crate::decisions::sanitize_user_text as s;
         assert_eq!(s("a <|im_end|> b"), "a <¦im_end¦> b");
