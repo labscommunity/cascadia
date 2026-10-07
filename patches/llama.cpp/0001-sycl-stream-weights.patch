@@ -47,7 +47,7 @@ index cc3f8cd36..d47d397a8 100644
  }
  #endif
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index f6fb91798..f686f9707 100644
+index f6fb91798..19e5cd07f 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -20,6 +20,17 @@
@@ -68,7 +68,7 @@ index f6fb91798..f686f9707 100644
  #include <vector>
  
  #ifdef __APPLE__
-@@ -2429,3 +2440,193 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size)
+@@ -2429,3 +2440,192 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size)
      GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
      return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
  }
@@ -173,17 +173,16 @@ index f6fb91798..f686f9707 100644
 +            continue;
 +        }
 +        if (--users[it->second.fd] == 0 && it->second.fd >= 0) {
-+            for (auto fit = g_stream_fds.begin(); fit != g_stream_fds.end();) {
-+                if (fit->second == it->second.fd) {
++            // close the dup descriptor unconditionally: plan_reset may have
++            // cleared g_stream_fds since this registration, so the dedupe
++            // lookup cannot be trusted to still hold the fd
 +#ifdef _WIN32
-+                    _close(fit->second);
++            _close(it->second.fd);
 +#else
-+                    close(fit->second);
++            close(it->second.fd);
 +#endif
-+                    fit = g_stream_fds.erase(fit);
-+                } else {
-+                    ++fit;
-+                }
++            for (auto fit = g_stream_fds.begin(); fit != g_stream_fds.end();) {
++                fit = fit->second == it->second.fd ? g_stream_fds.erase(fit) : std::next(fit);
 +            }
 +        }
 +        it = g_stream_map.erase(it);
@@ -263,15 +262,29 @@ index f6fb91798..f686f9707 100644
 +    return n;
 +}
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index d1456a867..055f5ad66 100644
+index d1456a867..a617d69cb 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -30,6 +30,14 @@
+@@ -18,8 +18,10 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstdlib>
++#include <cerrno>
+ #include <float.h>
+ #include <limits>
++#include <memory>
+ #include <optional>
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -30,6 +32,17 @@
  #include <stdio.h>
  #include <stdlib.h>
  #include <regex>
 +#include <unordered_map>
 +#include <mutex>
++#include <condition_variable>
++#include <deque>
++#include <thread>
 +#include <unordered_set>
 +#ifdef _WIN32
 +#include <io.h>
@@ -281,7 +294,7 @@ index d1456a867..055f5ad66 100644
  
  #include <sycl/sycl.hpp>
  #include <sycl/backend.hpp>
-@@ -545,11 +553,16 @@ static bool ggml_backend_buffer_is_sycl(ggml_backend_buffer_t buffer) {
+@@ -545,11 +558,16 @@ static bool ggml_backend_buffer_is_sycl(ggml_backend_buffer_t buffer) {
      return buffer->buft->iface.get_name == ggml_backend_sycl_buffer_type_get_name;
  }
  
@@ -298,7 +311,7 @@ index d1456a867..055f5ad66 100644
      delete ctx;
  }
  catch (sycl::exception const &exc) {
-@@ -621,6 +634,10 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+@@ -621,6 +639,10 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
      GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
      GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
      GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
@@ -309,7 +322,7 @@ index d1456a867..055f5ad66 100644
      ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
      ggml_sycl_set_device(ctx->device);
      auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
-@@ -946,6 +963,10 @@ static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_typ
+@@ -946,6 +968,10 @@ static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_typ
  }
  
  static size_t ggml_backend_sycl_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
@@ -320,7 +333,7 @@ index d1456a867..055f5ad66 100644
      size_t size = ggml_nbytes(tensor);
      int64_t ne0 = tensor->ne[0];
  
-@@ -4766,6 +4787,81 @@ static void mmid_counting_sort_rows(
+@@ -4766,6 +4792,299 @@ static void mmid_counting_sort_rows(
      }
  }
  
@@ -338,6 +351,9 @@ index d1456a867..055f5ad66 100644
 +    }
 +    sycl::queue * q = new sycl::queue(
 +        dpct::dev_mgr::instance().get_device(device).create_queue());
++    // the async staging pipeline serializes same-slot reuse through this
++    // queue's submission order - out-of-order execution would break it
++    GGML_ASSERT(q->is_in_order());
 +    qs[device] = q;
 +    return q;
 +}
@@ -399,10 +415,225 @@ index d1456a867..055f5ad66 100644
 +    return chosen;
 +}
 +
++// ---- async staging fills: keep file reads off the dispatch thread ----
++// Fully streamed decode was measured read-bound: one serial pread per
++// upload took ~100% of decode wall time even with every page cached.
++// Reader threads fill the pinned staging buffers instead; the in-order
++// copy queue then gates each memcpy on a host task that waits for the
++// fill, so submission order - and with it every slot-ordering argument -
++// is unchanged. GGML_STREAM_READ_THREADS=0 restores the inline read.
++
++// one outstanding fill: dst is the pinned staging buffer, host a
++// file-mapped source when the loader registered one, fd+off a positioned
++// read otherwise; for host sources the byte read starts at
++// host + (off - file_off)
++struct sycl_stream_read_job {
++    std::mutex              mu;
++    std::condition_variable cv;
++    bool         done     = false;
++    char *       dst      = nullptr;
++    const void * host     = nullptr;
++    int          fd       = -1;
++    size_t       file_off = 0;
++    size_t       off      = 0;
++    size_t       n        = 0;
++    const char * name     = nullptr;   // debug only
++};
++
++struct sycl_stream_readers {
++    std::mutex                                           mu;
++    std::condition_variable                              cv;
++    std::condition_variable                              drained;
++    std::deque<std::shared_ptr<sycl_stream_read_job>>    jobs;
++    std::vector<std::thread>                             th;
++    int                                                  outstanding = 0; // queued + filling
++    bool                                                 started     = false;
++};
++
++static int sycl_stream_read_threads(void) {
++    static int v = -1;
++    if (v < 0) {
++        const char * e = getenv("GGML_STREAM_READ_THREADS");
++        v = e ? atoi(e) : 4;
++        if (v < 0) {
++            v = 0;
++        }
++        if (v > 16) {
++            v = 16;
++        }
++    }
++    return v;
++}
++
++// process-lifetime reader pools, one per device - same lifetime contract
++// as the copy queues above; never destructed so exit-order is a non-issue
++static sycl_stream_readers * g_readers = nullptr;
++static sycl_stream_readers & sycl_stream_readers_for(int device) {
++    static std::mutex mu;
++    std::lock_guard<std::mutex> lock(mu);
++    if (g_readers == nullptr) {
++        g_readers = new sycl_stream_readers[GGML_SYCL_MAX_DEVICES];
++    }
++    return g_readers[device];
++}
++
++// positioned read of n bytes into host staging (pread / positioned
++// ReadFile) or a plain memcpy from a registered host pointer
++static bool sycl_stream_read_fill(char * dst, const void * host, int fd,
++                                  size_t file_off, size_t off, size_t n) {
++    if (host != nullptr) {
++        memcpy(dst, (const char *) host + (off - file_off), n);
++        return true;
++    }
++    size_t got = 0;
++    while (got < n) {
++#ifdef _WIN32
++        // UCRT has no pread; do a positioned ReadFile on the fd's OS
++        // handle (does not disturb the CRT file position)
++        HANDLE h = (HANDLE) _get_osfhandle(fd);
++        if (h == INVALID_HANDLE_VALUE) {
++            return false;
++        }
++        size_t chunk = n - got;
++        if (chunk > (size_t) 0x7FFFFFFF) {
++            chunk = (size_t) 0x7FFFFFFF;
++        }
++        OVERLAPPED ov;
++        memset(&ov, 0, sizeof(ov));
++        const uint64_t o = (uint64_t) (off + got);
++        ov.Offset     = (DWORD) (o & 0xFFFFFFFFu);
++        ov.OffsetHigh = (DWORD) (o >> 32);
++        DWORD rd = 0;
++        if (!ReadFile(h, dst + got, (DWORD) chunk, &rd, &ov) || rd == 0) {
++            return false;
++        }
++        got += (size_t) rd;
++#else
++        const ssize_t r = pread(fd, dst + got, n - got, (off_t) (off + got));
++        if (r < 0 && errno == EINTR) {
++            continue;
++        }
++        if (r <= 0) {
++            return false;
++        }
++        got += (size_t) r;
++#endif
++    }
++    return true;
++}
++
++static void sycl_stream_debug_fill(const char * name, size_t off, size_t n, const char * buf) {
++    if (!getenv("GGML_STREAM_DEBUG")) {
++        return;
++    }
++    uint64_t h = 1469598103934665603ull;
++    for (size_t b = 0; b < n; b += 4096) { h = (h ^ (uint8_t) buf[b]) * 1099511628211ull; }
++    fprintf(stderr, "[sw] %s off=%zu n=%zu fnv=%llx\n", name, off, n,
++            (unsigned long long) h);
++}
++
++static void sycl_stream_reader_run(sycl_stream_readers * r) {
++    for (;;) {
++        std::shared_ptr<sycl_stream_read_job> job;
++        {
++            std::unique_lock<std::mutex> lock(r->mu);
++            r->cv.wait(lock, [&] { return !r->jobs.empty(); });
++            job = std::move(r->jobs.front());
++            r->jobs.pop_front();
++        }
++        if (!sycl_stream_read_fill(job->dst, job->host, job->fd, job->file_off,
++                                   job->off, job->n)) {
++            GGML_LOG_ERROR("%s: read failed for streamed tensor\n", __func__);
++            std::exit(1);
++        }
++        sycl_stream_debug_fill(job->name, job->off, job->n, job->dst);
++        {
++            std::lock_guard<std::mutex> lock(job->mu);
++            job->done = true;
++        }
++        job->cv.notify_all();
++        {
++            std::lock_guard<std::mutex> lock(r->mu);
++            if (--r->outstanding == 0) {
++                r->drained.notify_all();
++            }
++        }
++    }
++}
++
++// push one fill onto the device's reader pool; the staging ring bounds the
++// queue implicitly since every job owns a buffer and pick() blocks when
++// the ring is full
++static void sycl_stream_read_push(int device, const std::shared_ptr<sycl_stream_read_job> & job) {
++    sycl_stream_readers & r = sycl_stream_readers_for(device);
++    {
++        std::lock_guard<std::mutex> lock(r.mu);
++        if (!r.started) {
++            r.started = true;
++            const int n = sycl_stream_read_threads();
++            r.th.reserve(n);
++            for (int i = 0; i < n; i++) {
++                r.th.emplace_back(sycl_stream_reader_run, &r);
++            }
++        }
++        r.jobs.push_back(job);
++        r.outstanding++;
++    }
++    r.cv.notify_one();
++}
++
++// wait until every queued fill has finished writing its staging buffer;
++// must run before freeing a ring or the pool the copies write into
++static void sycl_stream_read_drain(int device) {
++    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
++        return;
++    }
++    sycl_stream_readers & r = sycl_stream_readers_for(device);
++    std::unique_lock<std::mutex> lock(r.mu);
++    r.drained.wait(lock, [&] { return r.outstanding == 0; });
++}
++
++// submit dst <- staging copy gated on the fill. With reader threads the
++// fill runs off-thread and a host task inside the copy queue waits for it,
++// so the dispatch thread never blocks on file IO. Without them
++// (GGML_STREAM_READ_THREADS=0) the read stays inline.
++static sycl::event sycl_stream_copy_submit(sycl::queue * cq, char * dst,
++                                           sycl_stream_staging_buf & b,
++                                           const ggml_stream_src & src, size_t off, size_t n,
++                                           const std::vector<sycl::event> & deps,
++                                           int device, const char * name) {
++    if (sycl_stream_read_threads() > 0 && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
++        auto job = std::make_shared<sycl_stream_read_job>();
++        job->dst      = b.ptr;
++        job->host     = src.host_ptr;
++        job->fd       = src.fd;
++        job->file_off = src.file_off;
++        job->off      = off;
++        job->n        = n;
++        job->name     = name;
++        sycl_stream_read_push(device, job);
++        sycl::event gate = cq->submit([job](sycl::handler & h) {
++            h.host_task([job] {
++                std::unique_lock<std::mutex> lock(job->mu);
++                job->cv.wait(lock, [&] { return job->done; });
++            });
++        });
++        std::vector<sycl::event> d = deps;
++        d.push_back(gate);
++        return cq->memcpy(dst, b.ptr, n, d);
++    }
++    if (!sycl_stream_read_fill(b.ptr, src.host_ptr, src.fd, src.file_off, off, n)) {
++        GGML_LOG_ERROR("%s: read failed for streamed tensor\n", __func__);
++        std::exit(1);
++    }
++    sycl_stream_debug_fill(name, off, n, b.ptr);
++    return deps.empty() ? cq->memcpy(dst, b.ptr, n) : cq->memcpy(dst, b.ptr, n, deps);
++}
++
  static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                   ggml_tensor *dst) try {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
-@@ -5446,6 +5542,10 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
+@@ -5446,6 +5765,10 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
      GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
      GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
      GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
@@ -413,7 +644,7 @@ index d1456a867..055f5ad66 100644
      ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
-@@ -5603,8 +5703,479 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
+@@ -5603,8 +5926,437 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
      return skip;
  }
  
@@ -623,58 +854,13 @@ index d1456a867..055f5ad66 100644
 +
 +    sycl::queue * cq = sycl_stream_copy_queue(sw.device);
 +    const int   bi = sycl_stream_staging_pick(sw.staging, sw.staging_next, cq, e.nbytes);
-+    char *      buf = sw.staging[bi].ptr;
 +
 +    // L0 cannot USM-memcpy from file-mapped pages - stage through a plain
-+    // host buffer first (same workaround as ggml_backend_sycl_buffer_set_tensor)
-+    if (e.src.host_ptr != nullptr) {
-+        memcpy(buf, e.src.host_ptr, e.nbytes);
-+    } else {
-+        size_t got = 0;
-+        while (got < e.nbytes) {
-+#ifdef _WIN32
-+            // UCRT has no pread; do a positioned ReadFile on the fd's OS
-+            // handle (does not disturb the CRT file position)
-+            HANDLE h = (HANDLE) _get_osfhandle(e.src.fd);
-+            if (h == INVALID_HANDLE_VALUE) {
-+                GGML_LOG_ERROR("%s: invalid handle for streamed tensor\n", __func__);
-+                std::exit(1);
-+            }
-+            size_t chunk = e.nbytes - got;
-+            if (chunk > (size_t) 0x7FFFFFFF) {
-+                chunk = (size_t) 0x7FFFFFFF;
-+            }
-+            OVERLAPPED ov;
-+            memset(&ov, 0, sizeof(ov));
-+            const uint64_t off = e.src.file_off + got;
-+            ov.Offset     = (DWORD) (off & 0xFFFFFFFFu);
-+            ov.OffsetHigh = (DWORD) (off >> 32);
-+            DWORD rd = 0;
-+            if (!ReadFile(h, buf + got, (DWORD) chunk, &rd, &ov)) {
-+                GGML_LOG_ERROR("%s: ReadFile failed for streamed tensor\n", __func__);
-+                std::exit(1);
-+            }
-+            const int r = (int) rd;
-+#else
-+            const ssize_t r = pread(e.src.fd, buf + got, e.nbytes - got,
-+                                    (off_t) (e.src.file_off + got));
-+#endif
-+            if (r <= 0) {
-+                GGML_LOG_ERROR("%s: pread failed for streamed tensor\n", __func__);
-+                std::exit(1);
-+            }
-+            got += (size_t) r;
-+        }
-+        if (getenv("GGML_STREAM_DEBUG")) {
-+            uint64_t h = 1469598103934665603ull;
-+            for (size_t b = 0; b < e.nbytes; b += 4096) { h = (h ^ (uint8_t) buf[b]) * 1099511628211ull; }
-+            fprintf(stderr, "[sw] %s off=%zu n=%zu fnv=%llx\n", t->name, e.src.file_off, e.nbytes,
-+                    (unsigned long long) h);
-+        }
-+    }
-+    sycl::event ev = deps.empty()
-+                   ? cq->memcpy(dst, buf, e.nbytes)
-+                   : cq->memcpy(dst, buf, e.nbytes, deps);
++    // host buffer first (same workaround as ggml_backend_sycl_buffer_set_tensor);
++    // the read itself runs on a reader thread when enabled
++    sycl::event ev = sycl_stream_copy_submit(cq, dst, sw.staging[bi], e.src,
++                                             e.src.file_off, e.nbytes, deps,
++                                             sw.device, t->name);
 +    sw.staging[bi].ev = ev;
 +    sw.staging[bi].live = true;
 +    if (e.padded > e.nbytes) {
@@ -856,6 +1042,9 @@ index d1456a867..055f5ad66 100644
 +    if (!owned.empty()) {
 +        sycl_stream_pool & sw = owned.mapped();
 +        std::lock_guard<std::mutex> lock(sw.mu);
++        // reader fills may still be writing the staging ring; wait for them
++        // before draining the copies that consume those buffers
++        sycl_stream_read_drain(sw.device);
 +        // copies still in flight read the staging ring and write the pool
 +        sycl::queue * cq = sw.device >= 0 ? sycl_stream_copy_queue(sw.device) : nullptr;
 +        if (cq != nullptr) {
@@ -893,7 +1082,7 @@ index d1456a867..055f5ad66 100644
  
      for (int i = 0; i < cgraph->n_nodes; i++) {
          ggml_tensor * node = cgraph->nodes[i];
-@@ -5615,7 +6186,17 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -5615,7 +6367,17 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
              continue;
          }
  
@@ -912,7 +1101,7 @@ index d1456a867..055f5ad66 100644
          if (nodes_to_skip != 0) {
              i += nodes_to_skip;
              continue;
-@@ -5629,7 +6210,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -5629,7 +6391,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
          }
  #endif
          // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
@@ -921,7 +1110,7 @@ index d1456a867..055f5ad66 100644
              ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
              const int gdn_nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
              if (gdn_nodes_to_skip > 0) {
-@@ -5638,20 +6219,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -5638,20 +6400,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                  continue;
              }
          }
@@ -945,7 +1134,7 @@ index d1456a867..055f5ad66 100644
              i += 2;
              continue;
          }
-@@ -5712,7 +6293,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
+@@ -5712,7 +6474,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
  
  #ifdef GGML_SYCL_GRAPH
      bool use_sycl_graph = false;
@@ -954,7 +1143,7 @@ index d1456a867..055f5ad66 100644
          use_sycl_graph = check_graph_compatibility(cgraph);
      }
      if (use_sycl_graph) {
-@@ -5849,6 +6430,13 @@ static enum ggml_backend_dev_type ggml_backend_sycl_device_get_type(ggml_backend
+@@ -5849,6 +6611,13 @@ static enum ggml_backend_dev_type ggml_backend_sycl_device_get_type(ggml_backend
      if (info.l0_device_type_valid && !info.l0_discrete_gpu) {
          return GGML_BACKEND_DEVICE_TYPE_IGPU;
      }
@@ -1012,10 +1201,38 @@ index 5c5e97fbc..69ae87c03 100644
              const auto & mapping = mappings.at(weight->idx);
              ggml_backend_buffer_t buf_mmap = nullptr;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index c81005505..92cb43ec4 100644
+index c81005505..05719242a 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -1558,6 +1558,90 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1264,6 +1264,27 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
+     vocab.load(ml, kv);
+ }
+ 
++// strict decimal parse of GGML_STREAM_VRAM_SHARE: the expected co-tenant
++// count in [1, UINT32_MAX]. returns 1 when unset; rejects empty, signed,
++// trailing-text, zero, and overflowing values
++static uint64_t ggml_stream_vram_share() {
++    const char * e = getenv("GGML_STREAM_VRAM_SHARE");
++    if (e == nullptr) {
++        return 1;
++    }
++    bool ok = e[0] != '\0';
++    for (const char * p = e; *p != '\0'; p++) {
++        ok = ok && (*p >= '0' && *p <= '9');
++    }
++    const uint64_t v = ok ? strtoull(e, nullptr, 10) : 0;
++    if (!ok || v < 1 || v > UINT32_MAX) {
++        throw std::runtime_error(
++            std::string("stream-weights: GGML_STREAM_VRAM_SHARE='") + e +
++            "' is not a valid co-tenant count (expected a decimal integer in [1, 4294967295])");
++    }
++    return v;
++}
++
+ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     const auto & split_mode   = params.split_mode;
+     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+@@ -1558,6 +1579,116 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
      ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
      pimpl->mappings.reserve(ml.mappings.size());
  
@@ -1049,6 +1266,9 @@ index c81005505..92cb43ec4 100644
 +        int n_res = 0;
 +        size_t resident = 0;
 +        if (res_env != nullptr) {
++            if (getenv("GGML_STREAM_VRAM_SHARE") != nullptr) {
++                fprintf(stderr, "stream-weights: warning: GGML_STREAM_VRAM_SHARE ignored; GGML_STREAM_RESIDENT_LAYERS sets the resident layer count\n");
++            }
 +            n_res = atoi(res_env);
 +            for (const auto & it : s_layer) {
 +                if (it.first < n_res) {
@@ -1064,14 +1284,37 @@ index c81005505..92cb43ec4 100644
 +                    const size_t reserve = (r && atoi(r) > 0 ? (size_t) atoi(r) : 2048) * 1024 * 1024;
 +                    size_t free_mem = 0, total_mem = 0;
 +                    ggml_backend_dev_memory(devices[0].dev, &free_mem, &total_mem);
-+                    if (free_mem < non_streamable + 2 * s_max + reserve) {
++                    // GGML_STREAM_VRAM_SHARE=N caps the automatic resident
++                    // budget at 1/N of the card so N co-tenant instances get
++                    // an equal share instead of first-come-takes-all. it is a
++                    // load-time cap on resident weights only: it cannot move
++                    // KV, slot pools, or already-running instances
++                    const uint64_t share = ggml_stream_vram_share();
++                    const size_t overhead = non_streamable + 2 * s_max + reserve;
++                    const size_t free_over = free_mem > overhead ? free_mem - overhead : 0;
++                    if (free_mem < overhead) {
 +                        fprintf(stderr, "stream-weights: warning: %.0f MiB free, fully streamed needs ~%.0f MiB; the driver may evict other processes to host memory\n",
-+                                free_mem / 1048576.0,
-+                                (non_streamable + 2 * s_max + reserve) / 1048576.0);
++                                free_mem / 1048576.0, overhead / 1048576.0);
 +                    }
-+                    budget = free_mem > non_streamable + 2 * s_max + reserve
-+                           ? free_mem - non_streamable - 2 * s_max - reserve : 0;
++                    if (total_mem == 0) {
++                        if (share != 1) {
++                            throw std::runtime_error(
++                                "stream-weights: GGML_STREAM_VRAM_SHARE needs the device total memory, but the backend reported 0; set an explicit GGML_STREAM_VRAM_MB budget instead");
++                        }
++                        budget = free_over;
++                    } else {
++                        const size_t total_over = total_mem > overhead ? total_mem - overhead : 0;
++                        budget = std::min(free_over, total_over / share);
++                        if (share != 1) {
++                            fprintf(stderr, "stream-weights: vram share 1/%llu: resident budget %.0f MiB (free-overhead %.0f MiB, total-overhead %.0f MiB)\n",
++                                    (unsigned long long) share, budget / 1048576.0,
++                                    free_over / 1048576.0, total_over / 1048576.0);
++                        }
++                    }
 +                } else {
++                    if (getenv("GGML_STREAM_VRAM_SHARE") != nullptr) {
++                        fprintf(stderr, "stream-weights: warning: GGML_STREAM_VRAM_SHARE ignored; GGML_STREAM_VRAM_MB sets an explicit budget\n");
++                    }
 +                    budget = (size_t) atoll(budget_env) * 1024 * 1024;
 +                }
 +            }
