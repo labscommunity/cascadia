@@ -620,44 +620,44 @@
    "instances": [
     {
      "stream_line": "stream-weights: model fits (13087 MiB), streaming disabled",
-     "vram_after_load_gib": 14.64,
-     "decode_tps_alone": 19.281,
-     "decode_tps_concurrent": 4.472
+     "vram_after_load_gib": 14.67,
+     "decode_tps_alone": 17.679,
+     "decode_tps_concurrent": 4.499
     },
     {
-     "stream_line": "stream-weights: resident layers 64/65 (12752 MiB resident, 335 MiB streamed per token)",
-     "vram_after_load_gib": 29.3,
-     "decode_tps_alone": 19.015,
-     "decode_tps_concurrent": 4.437
+     "stream_line": "stream-weights: resident layers 61/65 (12027 MiB resident, 1060 MiB streamed per token)",
+     "vram_after_load_gib": 29.26,
+     "decode_tps_alone": 7.391,
+     "decode_tps_concurrent": 3.871
     }
    ],
-   "aggregate_concurrent_tps": 8.909,
-   "peak_vram_gib": 30.53
+   "aggregate_concurrent_tps": 8.37,
+   "peak_vram_gib": 29.44
   },
   "cotenant-auto-3": {
    "n": 3,
    "instances": [
     {
      "stream_line": "stream-weights: model fits (13087 MiB), streaming disabled",
-     "vram_after_load_gib": 14.64,
-     "decode_tps_alone": 19.335,
-     "decode_tps_concurrent": 3.317
+     "vram_after_load_gib": 14.67,
+     "decode_tps_alone": 17.628,
+     "decode_tps_concurrent": 6.835
     },
     {
-     "stream_line": "stream-weights: resident layers 64/65 (12752 MiB resident, 335 MiB streamed per token)",
-     "vram_after_load_gib": 29.3,
-     "decode_tps_alone": 19.046,
-     "decode_tps_concurrent": 3.178
+     "stream_line": "stream-weights: resident layers 61/65 (12027 MiB resident, 1060 MiB streamed per token)",
+     "vram_after_load_gib": 29.26,
+     "decode_tps_alone": 7.435,
+     "decode_tps_concurrent": 3.252
     },
     {
-     "stream_line": "stream-weights: resident layers 0/65 (0 MiB resident, 13087 MiB streamed per token)",
-     "vram_after_load_gib": 18.12,
-     "decode_tps_alone": 0.526,
-     "decode_tps_concurrent": 0.494
+     "stream_line": "stream-weights: warning: 1406 MiB free, fully streamed needs ~4267 MiB; the driver may evict other processes to host memory",
+     "vram_after_load_gib": 18.06,
+     "decode_tps_alone": 0.711,
+     "decode_tps_concurrent": 0.68
     }
    ],
-   "aggregate_concurrent_tps": 6.99,
-   "peak_vram_gib": 31.85
+   "aggregate_concurrent_tps": 10.767,
+   "peak_vram_gib": 30.93
   }
  },
  "metric_note": "decode = llama-server timings.predicted_per_second; single/partial: 2026-10-04 post-reboot sweep, posix_fadvise cold model file, n=3 for stock and fully-streamed arms, n=1-2 for budget arms; v3 MoE stock 34.2 t/s superseded (host state; 78 t/s with both binaries post-reboot)",
