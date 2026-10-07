@@ -4172,6 +4172,48 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn decisions_dump_refuses_a_symlink_at_the_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("decision-dump-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("victim");
+        std::fs::write(&target, "keep").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.join("dump.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let runner = Arc::new(runner);
+        let cfg = Config {
+            decision_dump: Some(link.clone()),
+            ..Config::default()
+        };
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            make_router_with_config(runner, "mock-model", cfg)
+        }));
+        let msg = match res {
+            Ok(_) => panic!("a symlinked --decision-dump path was opened"),
+            Err(e) => e.downcast_ref::<String>().cloned().unwrap_or_default(),
+        };
+        assert!(msg.starts_with("--decision-dump"), "{msg}");
+        // The symlink target is untouched: not appended to, not chmodded.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn decisions_oversized_state_is_rejected_before_tokenizing() {
         let big = "a ".repeat(4000 * 8);
