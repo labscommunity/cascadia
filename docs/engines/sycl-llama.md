@@ -108,6 +108,7 @@ one-GPU box.
 | `--engine sycl-llama` | — | Select this engine. |
 | `--elastic` | off | `GGML_STREAM_WEIGHTS=1` on the child. Before spawn, the resolved binary (and `libggml-base*` next to it) is probed for the `GGML_STREAM_WEIGHTS` marker — a stock build fails fast with an error instead of silently running resident. The host `--elastic` interposer is NOT activated for this engine and is scrubbed from the child's environment (see below). With the default `--elastic-vram auto`, a model that fits runs at stock speed (streaming turns itself off). |
 | `--elastic-vram` | `auto` | Resident-weight VRAM budget in GiB for `--elastic`, passed as `GGML_STREAM_VRAM_MB`. `auto` = free device memory − non-streamed weights − 2× largest layer − `GGML_STREAM_RESERVE_MB`; `0` = stream every layer (maximum packing). If the whole model fits, streaming is disabled entirely (stock path, fusion back on). |
+| `--elastic-share` | — | Expected co-tenant count, forwarded as `GGML_STREAM_VRAM_SHARE` when `--elastic` is on and `--elastic-vram` is `auto`. The child then caps its automatic resident-weight budget at `min(free − overhead, (total − overhead) / N)` so N instances loaded in sequence each target a 1/N share of the card. Warns when combined with an explicit `--elastic-vram` or set without `--elastic`; `GGML_STREAM_RESIDENT_LAYERS` still wins. This is a load-time weight cap only — it does not rebalance KV cache, expert caches, or running instances. |
 | `--device` | `GPU` (run) / `CPU` (worker) | Device mapping: `GPU` → `SYCL0`, `GPU.N` → `SYCLN`, `CPU` → `--device none` + `-ngl 0`; anything else (`SYCL1`, `Vulkan0`, `SYCL0,SYCL1`) is passed verbatim. |
 | `--llama-bin` | auto | `llama-server` path. Resolution: flag > `CASCADIA_LLAMA_BIN` > `llama-server` (`llama-server.exe`) on `PATH`. |
 | `CASCADIA_LLAMA_BIN` | — | Env fallback for `--llama-bin`. |
@@ -120,14 +121,20 @@ one-GPU box.
 | `GGML_STREAM_VRAM_MB` | set by `--elastic-vram` | (child env) resident-weight budget in MiB, or `auto`. |
 | `GGML_STREAM_RESERVE_MB` | `2048` | (child env) headroom `auto` leaves for KV + compute buffers. |
 | `GGML_STREAM_RESIDENT_LAYERS` | — | (child env) keep the first N layers resident directly; overrides the budget. Passed through to the child with a warning when set. |
+| `GGML_STREAM_VRAM_SHARE` | set by `--elastic-share` | (child env) co-tenant divisor for the automatic budget (strict decimal, 1..=u32::MAX; invalid values fail the load). With no flag, an ambient value passes through untouched. |
+| `GGML_STREAM_READ_THREADS` | `4` | (child env) reader-pool size for streamed fills: file reads happen on worker threads while an in-order-queue host task gates each H2D copy on the fill completing. `0` = inline reads on the dispatch thread (old behavior). |
+| `GGML_STREAM_STAGING_BUFS` | `8` | (child env) pinned staging-ring slots per device, capped at 64. |
 | `CASCADIA_EXPERT_CACHE_MB` | `0` | (cascadia env) forwarded as `GGML_STREAM_EXPERT_CACHE_MB`: hot-expert device cache for router-aware MoE streaming (0002). |
 
-Without `--elastic`, ambient `GGML_STREAM_WEIGHTS`, `GGML_STREAM_VRAM_MB`
-and `GGML_STREAM_RESIDENT_LAYERS` are dropped from the child's
-environment, so `GGML_STREAM_WEIGHTS=1 cascadia run` still runs resident.
+Without `--elastic`, ambient `GGML_STREAM_WEIGHTS`, `GGML_STREAM_VRAM_MB`,
+`GGML_STREAM_VRAM_SHARE` and `GGML_STREAM_RESIDENT_LAYERS` are dropped
+from the child's environment, so `GGML_STREAM_WEIGHTS=1 cascadia run`
+still runs resident.
 With `--elastic` the engine sets `GGML_STREAM_WEIGHTS=1` and
 `GGML_STREAM_VRAM_MB` itself, and a set `GGML_STREAM_RESIDENT_LAYERS`
-passes through with a warning since it overrides the budget. The host
+passes through with a warning since it overrides the budget.
+`GGML_STREAM_VRAM_SHARE` is set from `--elastic-share` when the budget
+is automatic, or passes through untouched when the env already carries it. The host
 allocator interposer never reaches the child either:
 `CASCADIA_ELASTIC_ACTIVE` and `ELASTIC_*` are removed, and `LD_PRELOAD`
 is filtered down to non-`libcascadia_elastic.*` entries (a user's own
