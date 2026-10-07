@@ -403,8 +403,9 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub prefix_cache_gb: Option<f64>,
 
-    /// Largest `/v1/chat/completions` request body (MiB); the rendered prompt
-    /// is capped at the same size. 1 MiB ≈ 250 K tokens of English, the
+    /// Largest request body on every API route (MiB): chat/completions,
+    /// completions, /v1/decisions and /v1/systemone; a long decision state
+    /// needs it raised. The rendered chat prompt is capped at the same size. 1 MiB ≈ 250 K tokens of English, the
     /// window of the largest served models. Only `qwen35` also bounds the
     /// prompt in TOKENS (against `max_position_embeddings`); on other engines
     /// this byte cap is the whole guard, so lower it on an exposed endpoint.
@@ -810,8 +811,9 @@ pub struct RunArgs {
     #[arg(long, value_delimiter = ',')]
     pub ep_workers: Vec<String>,
 
-    /// Largest chat-completions request body in MiB (rendered prompt capped
-    /// alike). See `cascadia worker --help`.
+    /// Largest request body on every API route in MiB, /v1/decisions and
+    /// /v1/systemone included (rendered chat prompt capped alike). See
+    /// `cascadia worker --help`.
     #[arg(long, default_value_t = 1.0)]
     pub api_max_body_mb: f64,
 
@@ -2601,8 +2603,12 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             warn!(engine = ?args.engine, "decision.json ignored: only --engine qwen35 serves /v1/decisions");
         }
         if let Some(p) = &args.decision_dump {
-            warn!(path = %p.display(), "--decision-dump records request-derived token ids to disk; use for parity checks only");
-            cfg.decision_dump = Some(p.clone());
+            if cfg.decisions.is_some() {
+                warn!(path = %p.display(), "--decision-dump records request-derived token ids to disk; use for parity checks only");
+                cfg.decision_dump = Some(p.clone());
+            } else {
+                warn!(path = %p.display(), "--decision-dump ignored: no decision model is loaded");
+            }
         }
         // Long-context serving: the 64 KiB body / 32 KiB prompt defaults hold
         // ~8 K tokens, a fraction of what the Qwen3.5-family and Llama-3.1

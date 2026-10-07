@@ -478,6 +478,11 @@ impl Question {
     }
 }
 
+/// An image part in a list `state` (serve_decide `_parts`): `{"image": ...}` or `{"type": "image_url", ...}`.
+pub fn is_image_part(v: &OrderedValue) -> bool {
+    v.get("image").is_some() || v.get("type").and_then(|t| t.as_str()) == Some("image_url")
+}
+
 impl DecisionRequest {
     pub fn validate(&self, limits: &Limits) -> Result<(), DecisionError> {
         let bad = |m: String| Err(DecisionError::BadRequest(m));
@@ -486,6 +491,13 @@ impl DecisionRequest {
                 "images and videos are not supported by this server (text-only decision models)"
                     .into(),
             );
+        }
+        // Every family is text-only: an image part in a list state is a 400 for all of them, not
+        // just JEV (Kev and Clef would otherwise render the part into the prompt as text).
+        if let OrderedValue::Array(parts) = &self.state {
+            if parts.iter().any(is_image_part) {
+                return bad("image parts in state are not supported (text-only server)".into());
+            }
         }
         if self.questions.is_empty() || self.questions.len() > limits.max_questions {
             return bad(format!(
@@ -716,6 +728,31 @@ mod tests {
         assert!(
             matches!(img.validate(&LIMITS), Err(DecisionError::BadRequest(m)) if m.contains("images"))
         );
+    }
+
+    #[test]
+    fn image_parts_in_state_are_rejected_for_every_family() {
+        for state in [
+            r#"[{"image": "data:x"}]"#,
+            r#"["hi", {"type": "image_url", "image_url": {"url": "data:x"}}]"#,
+        ] {
+            let r = req_str(&format!(
+                r#"{{"model": "m", "state": {state}, "questions": {{"u": {{"type": "noul"}}}}}}"#
+            ));
+            match r.validate(&LIMITS) {
+                Err(DecisionError::BadRequest(m)) => {
+                    assert_eq!(
+                        m,
+                        "image parts in state are not supported (text-only server)"
+                    )
+                }
+                other => panic!("{state}: {other:?}"),
+            }
+        }
+        let ok = req_str(
+            r#"{"model": "m", "state": ["hi", {"type": "text", "text": "x"}], "questions": {"u": {"type": "noul"}}}"#,
+        );
+        assert!(ok.validate(&LIMITS).is_ok());
     }
 
     #[test]
