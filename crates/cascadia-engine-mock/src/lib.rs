@@ -76,7 +76,8 @@ impl Engine for MockEngine {
         }
         // Decision tasks answer in one final chunk with deterministic logits
         // (`-(i)`, so the first option always wins). A prompt id of `999_999`
-        // is the failure sentinel for exercising the API's error path.
+        // is the failure sentinel for exercising the API's error path; `999_998`
+        // returns non-finite logits (NaN, +inf, -inf, …) as a broken head would.
         if let Some(d) = &task.decision {
             if d.prompt_ids.contains(&999_999) {
                 return Ok(vec![(
@@ -84,7 +85,15 @@ impl Engine for MockEngine {
                     Chunk::error(task.task_id, "mock engine failure"),
                 )]);
             }
-            let logits: Vec<f32> = (0..d.head.output_len()).map(|i| -(i as f32)).collect();
+            let non_finite = d.prompt_ids.contains(&999_998);
+            let logits: Vec<f32> = (0..d.head.output_len())
+                .map(|i| match (non_finite, i % 3) {
+                    (false, _) => -(i as f32),
+                    (true, 0) => f32::NAN,
+                    (true, 1) => f32::INFINITY,
+                    (true, _) => f32::NEG_INFINITY,
+                })
+                .collect();
             let chunk = Chunk::final_marker(task.task_id.clone(), "")
                 .with_prompt_tokens(d.prompt_ids.len() as u32)
                 .with_finish_reason(cascadia_types::FinishReason::Stop)
@@ -379,5 +388,37 @@ mod tests {
         e.submit(t).unwrap();
         let out = e.step().unwrap();
         assert_eq!(out[0].1.error.as_deref(), Some("mock engine failure"));
+    }
+
+    #[test]
+    fn decision_task_with_non_finite_sentinel_returns_nan_and_inf() {
+        let mut e = MockEngine::new();
+        let t = GenerationTask {
+            task_id: "d3".into(),
+            prompt: String::new(),
+            messages: Vec::new(),
+            tools: None,
+            tool_choice: None,
+            max_tokens: 8,
+            temperature: 0.0,
+            logprobs: 0,
+            sampling: Default::default(),
+            enable_thinking: false,
+            trust_remote_code: false,
+            tenant: String::new(),
+            resume_token_ids: None,
+            decision: Some(cascadia_types::DecisionReadout {
+                prompt_ids: vec![5, 999_998],
+                head: cascadia_types::ReadoutHead::Verbalizer {
+                    token_ids: vec![1, 2, 3],
+                },
+                cache_prefix: None,
+            }),
+        };
+        e.submit(t).unwrap();
+        let out = e.step().unwrap();
+        let l = out[0].1.decision_logits.clone().unwrap();
+        assert!(l[0].is_nan());
+        assert_eq!(l[1..], [f32::INFINITY, f32::NEG_INFINITY]);
     }
 }
