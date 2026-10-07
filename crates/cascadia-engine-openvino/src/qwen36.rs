@@ -37,6 +37,7 @@ use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_ov_genai_shim::{advance_emitted, DType, PluginConfig, Runtime};
 use cascadia_transport::{
     ActivationClient, ActivationServer, DType as WireDType, Tensor as WireTensor, TransportError,
+    TransportResult,
 };
 use cascadia_types::{
     Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId,
@@ -207,19 +208,70 @@ const CAPTURE_V2_CAP: u32 = 1;
 #[cfg(not(feature = "kv_coord"))]
 const CAPTURE_V2_CAP: u32 = 0;
 
-/// Read exactly `n` body bytes in ≤`MAX_RAW_BYTES` chunks, bounded by [`MAX_CARRY_BLOB_BYTES`].
+/// Decision readout: rank 0 → chain, body = decision::encode_readout. Lockstep-acked.
+const FRAME_DECIDE: u32 = 13;
+const FRAME_DECIDE_ACK: u32 = 14;
+/// After the prefill FORWARDs: run the head on the last rank.
+const FRAME_DECIDE_RUN: u32 = 15;
+/// Last rank → rank 0 (middles relay verbatim), body = decision::encode_result.
+const FRAME_DECISION: u32 = 16;
+
+/// HELLO_ACK `pos` is a capability bit set. Bit 0 keeps the pre-existing capture_v2 meaning
+/// (old ranks send exactly 0 or 1 there), bit 1 = this rank speaks the decision frames.
+const CAP_CAPTURE_V2: u32 = 1;
+const CAP_DECISION: u32 = 2;
+
+fn own_caps() -> u32 {
+    (CAPTURE_V2_CAP & CAP_CAPTURE_V2) | CAP_DECISION
+}
+
+fn combine_caps(own: u32, down: u32) -> u32 {
+    own & down
+}
+
+fn chain_decision(caps: u32) -> bool {
+    caps & CAP_DECISION != 0
+}
+
+/// The one method chunked body reads need, on both ends of a pipeline link.
+trait RawRecv {
+    fn recv_raw(
+        &mut self,
+        n: usize,
+    ) -> impl std::future::Future<Output = TransportResult<Vec<u8>>> + Send;
+}
+
+impl RawRecv for ActivationServer {
+    fn recv_raw(
+        &mut self,
+        n: usize,
+    ) -> impl std::future::Future<Output = TransportResult<Vec<u8>>> + Send {
+        ActivationServer::recv_raw(self, n)
+    }
+}
+
+impl RawRecv for ActivationClient {
+    fn recv_raw(
+        &mut self,
+        n: usize,
+    ) -> impl std::future::Future<Output = TransportResult<Vec<u8>>> + Send {
+        ActivationClient::recv_raw(self, n)
+    }
+}
+
+/// Read exactly `n` body bytes in ≤`MAX_RAW_BYTES` chunks, accepting at most `ceiling`.
 /// `recv_raw` refuses a single over-cap read BEFORE consuming a byte, so an unchunked body read
 /// (or an over-ceiling length rejected without draining) leaves the payload in the stream and
 /// desyncs every later frame. A CAPTURE body passes 64 KiB at ≈16k tokens — reachable in any
 /// long session, since `tokens = prompt ++ generated`. Over-ceiling lengths are drained
 /// (discarded) to stay framed, then rejected.
-#[cfg(feature = "kv_coord")]
-async fn recv_kv_body_chunked(
-    g: &mut ActivationServer,
+async fn recv_body_chunked<G: RawRecv>(
+    g: &mut G,
     n: usize,
+    ceiling: usize,
     what: &str,
 ) -> Result<Vec<u8>, TransportError> {
-    let accept = n <= MAX_CARRY_BLOB_BYTES;
+    let accept = n <= ceiling;
     let mut buf = Vec::new();
     let mut remaining = n;
     while remaining > 0 {
@@ -235,10 +287,24 @@ async fn recv_kv_body_chunked(
     }
     if !accept {
         return Err(TransportError::Io(std::io::Error::other(format!(
-            "{what} length {n} exceeds {MAX_CARRY_BLOB_BYTES}; drained to stay framed"
+            "{what} length {n} exceeds {ceiling}; drained to stay framed"
         ))));
     }
     Ok(buf)
+}
+
+/// Read one `[u32 BE byte length][JSON]` decision body (FRAME_DECIDE / FRAME_DECISION), bounded
+/// by [`crate::decision::MAX_DECISION_BODY_BYTES`]. Returned still length-prefixed: the decoders
+/// and the verbatim relays take it whole.
+async fn recv_decision_body<G: RawRecv>(g: &mut G, what: &str) -> Result<Vec<u8>, TransportError> {
+    let lb = g.recv_raw(4).await?;
+    if lb.len() != 4 {
+        return Err(TransportError::SocketClosed);
+    }
+    let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
+    let mut body = lb;
+    body.extend(recv_body_chunked(g, n, crate::decision::MAX_DECISION_BODY_BYTES, what).await?);
+    Ok(body)
 }
 
 fn frame_header(kind: u32, epoch: u32, pos: u32) -> [u8; 12] {
@@ -673,6 +739,7 @@ impl Builder for Qwen36Builder {
             peer_epoch: 0,
             handshake_done: false,
             chain_capture_v2: 0,
+            chain_caps: 0,
             poisoned: None,
             pending: Vec::new(),
             active: None,
@@ -883,6 +950,9 @@ pub struct Qwen36Engine {
     /// the v1 frame — the workers then capture un-namespaced, which is cold-but-correct, instead of
     /// desyncing the stream on an unknown frame kind.
     chain_capture_v2: u32,
+    /// Chain-wide HELLO_ACK capability bits (`CAP_*`), ANDed along the chain at HELLO. 0 before the
+    /// handshake; `CAP_DECISION` clear ⇒ some rank predates the decision frames.
+    chain_caps: u32,
     /// Set when the startup handshake found a config mismatch (handshake
     /// rule: refuse to serve). Admissions fail loud with this reason.
     poisoned: Option<String>,
@@ -1428,9 +1498,12 @@ impl Qwen36Engine {
                 "qwen36 pipeline handshake refused: {reason}"
             )));
         }
-        self.chain_capture_v2 = down_cap.min(CAPTURE_V2_CAP);
+        let caps = combine_caps(own_caps(), down_cap);
+        self.chain_caps = caps;
+        self.chain_capture_v2 = (caps & CAP_CAPTURE_V2).min(CAPTURE_V2_CAP);
         self.handshake_done = true;
         info!(
+            caps,
             capture_v2 = self.chain_capture_v2,
             "qwen36 pipeline handshake ok"
         );
@@ -2057,7 +2130,8 @@ impl Qwen36Engine {
                 FRAME_CAPTURE => {
                     let lb = g.recv_raw(4).await?;
                     let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
-                    let body = recv_kv_body_chunked(&mut g, n, "capture body").await?;
+                    let body =
+                        recv_body_chunked(&mut *g, n, MAX_CARRY_BLOB_BYTES, "capture body").await?;
                     let (kv_epoch, tokens) = crate::kv_coordination::parse_capture_body(&body)
                         .ok_or(TransportError::SocketClosed)?;
                     Ok(InFrame::Capture {
@@ -2070,7 +2144,9 @@ impl Qwen36Engine {
                 FRAME_CAPTURE_V2 => {
                     let lb = g.recv_raw(4).await?;
                     let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
-                    let body = recv_kv_body_chunked(&mut g, n, "capture v2 body").await?;
+                    let body =
+                        recv_body_chunked(&mut *g, n, MAX_CARRY_BLOB_BYTES, "capture v2 body")
+                            .await?;
                     let (kv_epoch, tokens, partner) =
                         crate::kv_coordination::parse_capture_body_v2(&body)
                             .ok_or(TransportError::SocketClosed)?;
@@ -2100,7 +2176,13 @@ impl Qwen36Engine {
                     let blob = if blob_len == 0 {
                         Vec::new()
                     } else {
-                        recv_kv_body_chunked(&mut g, blob_len, "restore carried blob").await?
+                        recv_body_chunked(
+                            &mut *g,
+                            blob_len,
+                            MAX_CARRY_BLOB_BYTES,
+                            "restore carried blob",
+                        )
+                        .await?
                     };
                     Ok(InFrame::Restore {
                         task_epoch: epoch,
@@ -2133,21 +2215,23 @@ impl Qwen36Engine {
                 // rank-0 payload downstream so every rank checks against
                 // the origin; reply upstream with the combined verdict.
                 let mut reason = self.validate_hello(&payload);
-                // Chain floor: this rank's own capability, lowered by everything below it. The last
-                // rank has nothing below, so it reports its own.
-                let mut cap = CAPTURE_V2_CAP;
+                // Chain capability bits: this rank's own, ANDed with everything below it. The last
+                // rank has nothing below, so it reports its own. An old downstream rank replies its
+                // capture floor (0/1), which clears CAP_DECISION and keeps bit 0's meaning.
+                let mut cap = own_caps();
                 if reason.is_none() && !is_last {
                     match self.forward_hello_downstream(&payload) {
                         Ok((r, down_cap)) => {
                             reason = r.map(|r| format!("downstream: {r}"));
-                            cap = cap.min(down_cap);
+                            cap = combine_caps(cap, down_cap);
                         }
                         Err(e) => {
                             reason = Some(format!("downstream handshake forward failed: {e}"))
                         }
                     }
                 }
-                self.chain_capture_v2 = cap;
+                self.chain_caps = cap;
+                self.chain_capture_v2 = (cap & CAP_CAPTURE_V2).min(CAPTURE_V2_CAP);
                 let h = self.handle()?;
                 let upstream = self.upstream.clone().unwrap();
                 match reason {
@@ -2157,7 +2241,7 @@ impl Qwen36Engine {
                             g.send_raw(&frame_header(FRAME_HELLO_ACK, 0, cap)).await
                         })
                         .map_err(map_wire)?;
-                        info!(capture_v2 = cap, "qwen36 pipeline handshake ok");
+                        info!(caps = cap, "qwen36 pipeline handshake ok");
                     }
                     Some(reason) => {
                         warn!(reason = %reason, "qwen36 pipeline handshake mismatch; refusing to serve");
@@ -3326,6 +3410,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn capability_bits_degrade_to_old_ranks() {
+        let own = own_caps();
+        assert!(
+            chain_decision(own),
+            "a new build advertises decision frames"
+        );
+        // an old last rank replies its capture floor (0 or 1): bit 1 is clear either way
+        assert!(!chain_decision(combine_caps(own, 0)));
+        assert!(!chain_decision(combine_caps(own, 1)));
+        // all-new chain keeps both bits it has
+        assert_eq!(combine_caps(own, own), own);
+        // capture bit keeps today's meaning
+        assert_eq!(combine_caps(own, 1) & CAP_CAPTURE_V2, own & CAP_CAPTURE_V2);
+    }
+
+    #[test]
+    fn decision_frame_codes_are_distinct() {
+        // CAPTURE/RESTORE codes (8..=12) exist only under the kv_coord feature (off by default).
+        let decision = [
+            FRAME_DECIDE,
+            FRAME_DECIDE_ACK,
+            FRAME_DECIDE_RUN,
+            FRAME_DECISION,
+        ];
+        let mut all = vec![
+            FRAME_HELLO,
+            FRAME_HELLO_ACK,
+            FRAME_HELLO_NAK,
+            FRAME_RESET,
+            FRAME_RESET_ACK,
+            FRAME_FORWARD,
+            FRAME_TOKEN,
+        ];
+        all.extend(decision);
+        #[cfg(feature = "kv_coord")]
+        all.extend([
+            FRAME_CAPTURE,
+            FRAME_CAPTURE_ACK,
+            FRAME_RESTORE,
+            FRAME_RESTORE_ACK,
+            FRAME_CAPTURE_V2,
+        ]);
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n);
+        assert!(
+            decision.iter().all(|c| !(8..=12).contains(c)),
+            "decision codes must not reuse kv_coord codes"
+        );
+    }
+
+    #[test]
     fn ov_properties_reach_plugin_config() {
         // The --ov-* CLI flags must land in the PluginConfig handed to compile, alongside the
         // cache/KV wiring, and repeated with_ov_properties calls must accumulate, not replace.
@@ -3440,6 +3577,7 @@ mod tests {
             peer_epoch: 0,
             handshake_done: false,
             chain_capture_v2: 0,
+            chain_caps: 0,
             poisoned: None,
             pending: Vec::new(),
             active: None,
