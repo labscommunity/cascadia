@@ -120,7 +120,8 @@ def _replace(op, arr, et):
 
 def swap_stage(model, weights):
     """Replace every weight constant of a cut stage with `weights` (a Weights). Returns a report
-    of what was swapped per layer, for `check_swap`."""
+    of what was swapped per layer, for `check_swap`: {"proj": {layer: sorted [paths]},
+    "conv": {layer: n}, "float": {layer_or_"final": [kinds]}}."""
     import openvino as ov
     proj, conv, floats = _classify(model)
     report = {"proj": {}, "conv": {}, "float": {}}
@@ -136,7 +137,7 @@ def swap_stage(model, weights):
             _replace(c["w"], q, ov.Type.u8)
             _replace(c["zp"], zp, ov.Type.u8)
         _replace(c["s"], s, ov.Type.f16)
-        report["proj"][layer] = report["proj"].get(layer, 0) + 1
+        report["proj"].setdefault(layer, set()).add(path)
     for layer, c in conv.items():
         shp = list(c["w"].get_output_shape(0))
         w = weights.get(f"layers.{layer}.linear_attn.conv1d.weight").reshape(shp[0], -1)
@@ -151,9 +152,19 @@ def swap_stage(model, weights):
         _replace(op, v.reshape(list(op.get_output_shape(0))), op.get_element_type())
         m = re.match(r"layers\.(\d+)\.", hf)
         report["float"].setdefault(int(m.group(1)) if m else "final", []).append(kind)
+    report["proj"] = {k: sorted(v) for k, v in report["proj"].items()}
     return report
 
 
+# Projection paths per layer type (PROJ group 2), checked against the stock Qwen3.5-9B int8 IR's
+# `_openvino_orig_weight` constants: 8 for linear-attention layers, 7 for full-attention layers.
+LAYER_PROJ = {
+    "linear_attention": {"linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_b",
+                         "linear_attn.in_proj_a", "linear_attn.out_proj",
+                         "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"},
+    "full_attention": {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+                       "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"},
+}
 LAYER_FLOATS = {
     "linear_attention": {"input_layernorm.weight", "post_attention_layernorm.weight", "linear_attn.A_log",
                          "linear_attn.dt_bias", "linear_attn.norm.weight"},
@@ -163,12 +174,13 @@ LAYER_FLOATS = {
 
 
 def check_swap(report, layers, layer_types, last):
-    """Every layer of the stage swapped its projections, its conv (linear layers) and every float
-    kind its type carries; the last stage also swapped the final norm."""
+    """Every layer of the stage swapped every projection its type carries (LAYER_PROJ), its conv
+    (linear layers) and every float kind its type carries; the last stage also swapped the final norm."""
     for i in layers:
         t = layer_types[i]
-        if not report["proj"].get(i):
-            raise ValueError(f"layer {i}: no projection swapped")
+        missing = LAYER_PROJ[t] - set(report["proj"].get(i, ()))
+        if missing:
+            raise ValueError(f"layer {i} ({t}): projections not swapped: {sorted(missing)}")
         if t == "linear_attention" and not report["conv"].get(i):
             raise ValueError(f"layer {i}: conv1d not swapped")
         missing = LAYER_FLOATS[t] - set(report["float"].get(i, []))
@@ -185,11 +197,16 @@ def lora_targets(adapter_file):
 
 
 def lora_scale_from_config(adapter_file):
-    """PEFT scale from adapter_config.json beside the adapter: alpha/r (alpha/sqrt(r) with rsLoRA)."""
+    """PEFT scale from adapter_config.json beside the adapter: alpha/r (alpha/sqrt(r) with rsLoRA).
+    Refuses PEFT variants a plain y += scale * x A^T B^T graft would get wrong."""
     cfg = json.loads((Path(adapter_file).parent / "adapter_config.json").read_text())
     for k in ("rank_pattern", "alpha_pattern"):
         if cfg.get(k):
             raise ValueError(f"adapter_config.json has a non-empty {k}; one global LoRA scale would be wrong")
+    if cfg.get("use_dora"):
+        raise ValueError("adapter_config.json has use_dora: true; the graft would drop the DoRA magnitude vectors")
+    if cfg.get("lora_bias") not in (None, False):
+        raise ValueError(f"adapter_config.json has lora_bias={cfg['lora_bias']!r}; the graft does not add LoRA biases")
     r, alpha = cfg["r"], cfg["lora_alpha"]
     return alpha / (r ** 0.5) if cfg.get("use_rslora") else alpha / r
 
@@ -198,8 +215,11 @@ def swap_embeddings(src_xml, weights, out_dir, chunk=16384):
     import openvino as ov
     model = ov.Core().read_model(src_xml)
     consts = {op.get_friendly_name(): op for op in model.get_ops() if op.get_type_name() == "Constant"}
-    wop = next(op for nm, op in consts.items() if nm.endswith("_openvino_orig_weight"))
-    sop = next(op for nm, op in consts.items() if nm.endswith("_openvino_orig_weight/scale"))
+    wop = next((op for nm, op in consts.items() if nm.endswith("_openvino_orig_weight")), None)
+    sop = next((op for nm, op in consts.items() if nm.endswith("_openvino_orig_weight/scale")), None)
+    if wop is None or sop is None:
+        raise ValueError(f"{src_xml}: no embedding Constant ending in '_openvino_orig_weight' "
+                         "(and '_openvino_orig_weight/scale')")
     rows, hid = list(wop.get_output_shape(0))
     q = np.empty((rows, hid), dtype=np.int8)
     s = np.empty((rows, 1), dtype=np.float16)
@@ -213,12 +233,15 @@ def swap_embeddings(src_xml, weights, out_dir, chunk=16384):
 
 def graft_lora(model, adapter_file, scale):
     """y += scale * (x A^T) B^T on every LoRA-targeted MatMul in `model` (fp32 constants, LoRA term
-    first in the Add: OpenVINO's ARM CPU plugin produced NaN with fp16 constants / base-first adds)."""
+    first in the Add: OpenVINO's ARM CPU plugin produced NaN with fp16 constants / base-first adds).
+    Returns the number of branches added. Adapter keys with no matching MatMul in this stage are
+    skipped silently (a stage holds only some layers), so the exporter MUST assert that the sum of
+    graft_lora over all stages == lora_targets(adapter_file)."""
     from openvino import opset13 as ops
     from safetensors.torch import load_file
     pairs = {}
     for k, v in load_file(adapter_file).items():
-        m = re.match(r"base_model\.model\.(?:model\.)?(.+)\.lora_([AB])\.weight$", k)
+        m = re.match(r"base_model\.model\.(?:model\.)?(?:language_model\.)?(.+)\.lora_([AB])\.weight$", k)
         if m:
             pairs.setdefault(m.group(1), {})[m.group(2)] = v.float().numpy()
     n = 0
@@ -245,9 +268,16 @@ def graft_lora(model, adapter_file, scale):
 def add_final_hidden_output(model):
     """Expose the lm_head MatMul's input (= final-norm hidden, all positions) as output 1 `final_hidden`."""
     from openvino import opset13 as ops
-    mm = next(op for op in model.get_ops()
-              if op.get_type_name() == "MatMul" and op.get_friendly_name().endswith("lm_head/ov_ext::linear/MatMul"))
+    mm = next((op for op in model.get_ops()
+               if op.get_type_name() == "MatMul" and op.get_friendly_name().endswith("lm_head/ov_ext::linear/MatMul")),
+              None)
+    if mm is None:
+        raise ValueError("no MatMul named '...lm_head/ov_ext::linear/MatMul' (is this the last stage?)")
+    if len(model.outputs) != 1:
+        raise ValueError(f"expected 1 output (logits) before adding final_hidden, got {len(model.outputs)}")
     res = ops.result(mm.input_value(0))
     res.output(0).set_names({"final_hidden"})
     model.add_results([res])
     model.validate_nodes_and_infer_types()
+    if len(model.outputs) != 2 or "final_hidden" not in model.outputs[1].get_names():
+        raise ValueError("final_hidden did not land at output index 1")
