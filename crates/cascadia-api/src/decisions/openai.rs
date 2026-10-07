@@ -188,7 +188,8 @@ fn choice_value(name: &str, v: &serde_json::Value) -> Result<OrderedValue, Decis
     }
 }
 
-/// The internal criteria key: the string itself, or a number's JSON text.
+/// The internal criteria key: the string itself, or Python's `str()` of a number (`2` → `"2"`,
+/// `1e5` → `"100000.0"`), as the reference implementations key a parsed number.
 fn choice_key(v: &OrderedValue) -> String {
     match v {
         OrderedValue::String(s) => s.clone(),
@@ -414,6 +415,9 @@ mod tests {
             ]
         );
         assert_eq!(meta[0].choice_values[1], OrderedValue::Number(2.into()));
+        // number keys are Python str() of the parsed number, not the request's JSON text
+        let (r2, _) = to_internal(&oa(r#"{"input": "x", "questions": [{"type": "choice", "name": "c", "instructions": "x", "choices": [{"value": 1e5}, {"value": 2.50}]}]}"#)).unwrap();
+        assert_eq!(r2.questions["c"].option_keys(), ["100000.0", "2.5"]);
         assert_eq!(meta[2].level_labels, ["Cosmetic", "Blocked"]);
     }
 
