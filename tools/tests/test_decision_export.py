@@ -215,3 +215,190 @@ def test_cli_flags_reach_run_export(monkeypatch):
     ex.main()
     assert seen["a"] == ("m", "o", 8, False, None)
     assert seen["kw"] == {"weights": "w", "lora": "l.safetensors", "lora_scale": 0.25, "final_hidden": True}
+
+
+# ---------------------------------------------------------------------------
+# decision_export.py: decision.json profile + decision/ head assets
+# ---------------------------------------------------------------------------
+
+import numpy as np  # noqa: E402
+
+import decision_export as de  # noqa: E402
+
+
+def test_jev_profile_from_adapter_files(tmp_path):
+    adapter = tmp_path / "adapter_vllm"
+    adapter.mkdir()
+    ids = list(range(100, 124))
+    (adapter / "decision_head.json").write_text(json.dumps({
+        "bias": [0.1] * 24, "verbalizer_ids": ids,
+        "slots": {"num_slots": 24, "ranges": {"noul": [0, 2], "score": [2, 8], "choice": [8, 24]},
+                  "verbalizers": ["false", "true"] + [str(i) for i in range(6)] + [chr(65 + i) for i in range(16)]}}))
+    cal = tmp_path / "calibration.json"
+    cal.write_text(json.dumps({"per_kind": {"noul": 1.0, "choice": 0.98, "score": 1.01}}))
+    out = tmp_path / "tree"
+    de.write_jev_profile(str(adapter), str(cal), str(out), max_tokens=4096)
+    d = json.loads((out / "decision.json").read_text())
+    assert d["family"] == "jev" and d["max_tokens"] == 4096
+    assert d["jev"]["verbalizer_ids"] == ids and d["jev"]["slots"]["choice"] == [8, 24]
+    assert d["jev"]["temperature"]["choice"] == 0.98
+    assert json.loads((out / "decision" / "head.json").read_text()) == {"kind": "verbalizer"}
+
+
+def test_kev_profile_writes_pointer_weights(tmp_path):
+    torch = pytest.importorskip("torch")
+    head = {"head": {"q.weight": torch.ones(256, 8), "q.bias": torch.zeros(256),
+                     "k.weight": torch.full((256, 8), 2.0), "k.bias": torch.ones(256)},
+            "temperature": 2.19}
+    pt = tmp_path / "head.pt"
+    torch.save(head, pt)
+    out = tmp_path / "tree"
+    de.write_kev_profile(str(pt), str(out), max_tokens=73728)
+    d = json.loads((out / "decision.json").read_text())
+    assert d == {"family": "kev", "max_tokens": 73728, "kev": {"temperature": 2.19}}
+    kw = np.fromfile(out / "decision" / "pointer_k_w.f32", dtype="<f4")
+    assert kw.shape == (256 * 8,) and kw[0] == 2.0
+    assert json.loads((out / "decision" / "head.json").read_text()) == {"kind": "pointer", "dp": 256}
+
+
+def test_kev_pointer_weights_are_row_major_out_by_in(tmp_path):
+    # decision.rs `affine` reads w[o * hidden + i]: torch Linear weight (out, in), row-major.
+    torch = pytest.importorskip("torch")
+    qw = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    head = {"head": {"q.weight": qw, "q.bias": torch.tensor([7.0, 8.0, 9.0]),
+                     "k.weight": qw.bfloat16(), "k.bias": torch.zeros(3)}, "temperature": 1.5}
+    pt = tmp_path / "head.pt"
+    torch.save(head, pt)
+    out = tmp_path / "tree"
+    de.write_kev_profile(str(pt), str(out))
+    d = out / "decision"
+    assert np.fromfile(d / "pointer_q_w.f32", dtype="<f4").tolist() == [0, 1, 2, 3, 4, 5]
+    assert np.fromfile(d / "pointer_q_b.f32", dtype="<f4").tolist() == [7, 8, 9]
+    assert np.fromfile(d / "pointer_k_w.f32", dtype="<f4").tolist() == [0, 1, 2, 3, 4, 5]
+    assert json.loads((d / "head.json").read_text()) == {"kind": "pointer", "dp": 3}
+
+
+class _Pickled:  # any non-allowlisted class is refused by torch.load(weights_only=True)
+    pass
+
+
+def test_kev_head_pt_is_loaded_weights_only(tmp_path):
+    torch = pytest.importorskip("torch")
+    pt = tmp_path / "head.pt"
+    torch.save({"head": {}, "temperature": 1.0, "x": _Pickled()}, pt)
+    with pytest.raises(Exception, match="(?i)weights_only|unsupported|global"):
+        de.write_kev_profile(str(pt), str(tmp_path / "tree"))
+
+
+def _clef_checkpoint(tmp_path, vocab=5, hidden=3, key="lm_head.weight", tied=False):
+    torch = pytest.importorskip("torch")
+    from safetensors.torch import save_file
+    ck = tmp_path / "clef"
+    ck.mkdir()
+    lm = torch.arange(vocab * hidden, dtype=torch.float32).reshape(vocab, hidden).bfloat16()
+    save_file({key: lm}, str(ck / "model-00001.safetensors"))
+    (ck / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {key: "model-00001.safetensors"}}))
+    (ck / "config.json").write_text(json.dumps({"tie_word_embeddings": tied, "text_config": {}}))
+    return ck, lm
+
+
+def test_clef_profile_writes_lm_head_f16_and_joint_head(tmp_path, monkeypatch):
+    from decision import clef_head
+    ck, lm = _clef_checkpoint(tmp_path)
+    seen = []
+    monkeypatch.setattr(clef_head, "export_joint_head",
+                        lambda d, xml: seen.append((d, xml)) or open(xml, "w").close())
+    out = tmp_path / "tree"
+    de.write_clef_profile(str(ck), str(out), max_tokens=16384, chunk=2)  # chunk < vocab: streamed
+    d = out / "decision"
+    assert json.loads((out / "decision.json").read_text()) == {"family": "clef", "max_tokens": 16384, "clef": {}}
+    assert json.loads((d / "head.json").read_text()) == {"kind": "joint", "vocab": 5}
+    assert seen == [(str(ck), str(d / "joint_head.xml"))]
+    got = np.fromfile(d / "lm_head.f16", dtype="<f2")
+    assert got.shape == (5 * 3,) and got.tolist() == lm.float().flatten().tolist()
+
+
+def test_clef_tied_embeddings_use_embed_tokens(tmp_path, monkeypatch):
+    from decision import clef_head
+    ck, lm = _clef_checkpoint(tmp_path, key="model.language_model.embed_tokens.weight", tied=True)
+    monkeypatch.setattr(clef_head, "export_joint_head", lambda d, xml: open(xml, "w").close())
+    out = tmp_path / "tree"
+    de.write_clef_profile(str(ck), str(out))
+    assert np.fromfile(out / "decision" / "lm_head.f16", dtype="<f2").tolist() == lm.float().flatten().tolist()
+
+
+def test_clef_missing_lm_head_refused_without_partial_head_json(tmp_path, monkeypatch):
+    from decision import clef_head
+    ck, _ = _clef_checkpoint(tmp_path, key="model.language_model.embed_tokens.weight", tied=False)
+    monkeypatch.setattr(clef_head, "export_joint_head", lambda d, xml: open(xml, "w").close())
+    out = tmp_path / "tree"
+    with pytest.raises(SystemExit, match="lm_head.weight"):
+        de.write_clef_profile(str(ck), str(out))
+    assert not (out / "decision" / "head.json").exists()
+
+
+# CLI wiring: run_export stubbed (no IR), profile writers stubbed or synthetic.
+
+@pytest.fixture
+def cli(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run_export(*a, **kw):
+        # decision assets must already be in place when the manifest (commit marker) is written
+        calls.append(("export", a, kw, os.path.exists(os.path.join(a[1], "decision.json"))))
+    monkeypatch.setattr(ex, "run_export", fake_run_export)
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "config.json").write_text(json.dumps({"text_config": {"max_position_embeddings": 262144}}))
+
+    def run(*argv):
+        monkeypatch.setattr(sys, "argv", ["decision_export.py", *argv])
+        de.main()
+    return run, calls, base, tmp_path
+
+
+def test_cli_jev_lora_from_adapter_dir_and_no_validate(cli, monkeypatch):
+    run, calls, base, tmp = cli
+    seen = {}
+    monkeypatch.setattr(de, "write_jev_profile",
+                        lambda ad, cal, out, max_tokens: seen.update(ad=ad, cal=cal, mt=max_tokens)
+                        or de._write(out, {"family": "jev"}, {"kind": "verbalizer"}))
+    ad = tmp / "jev" / "adapter_vllm"
+    run("jev", "--base-ir", str(base), "--adapter-dir", str(ad), "--out", str(tmp / "t"))
+    (_, a, kw, assets_first), = calls
+    assert a == (str(base), str(tmp / "t"), 8, False, None)
+    assert kw == {"weights": None, "lora": os.path.join(str(ad), "adapter_model.safetensors"),
+                  "lora_scale": None, "final_hidden": False}
+    assert assets_first
+    assert seen == {"ad": str(ad), "cal": str(tmp / "jev" / "calibration.json"), "mt": 32768}
+
+
+def test_cli_kev_final_hidden_weights_lora(cli, monkeypatch):
+    run, calls, base, tmp = cli
+    seen = {}
+    monkeypatch.setattr(de, "write_kev_profile",
+                        lambda pt, out: seen.update(pt=pt) or de._write(out, {"family": "kev"}, {"kind": "pointer"}))
+    run("kev", "--base-ir", str(base), "--weights", "W", "--lora", "L.safetensors", "--lora-scale", "2",
+        "--head-pt", "H.pt", "--stages", "2", "--out", str(tmp / "t"))
+    (_, a, kw, assets_first), = calls
+    assert a == (str(base), str(tmp / "t"), 2, False, None)
+    assert kw == {"weights": "W", "lora": "L.safetensors", "lora_scale": 2.0, "final_hidden": True}
+    assert assets_first and seen == {"pt": "H.pt"}
+
+
+def test_cli_clef_weights_default_to_clef_dir(cli, monkeypatch):
+    run, calls, base, tmp = cli
+    monkeypatch.setattr(de, "write_clef_profile",
+                        lambda cd, out: de._write(out, {"family": "clef"}, {"kind": "joint"}))
+    run("clef", "--base-ir", str(base), "--clef-dir", "C", "--out", str(tmp / "t"))
+    (_, a, kw, assets_first), = calls
+    assert a[3] is False and kw == {"weights": "C", "lora": None, "lora_scale": None, "final_hidden": True}
+    assert assets_first
+
+
+@pytest.mark.parametrize("family,missing", [("jev", "--adapter-dir"), ("kev", "--head-pt"), ("clef", "--clef-dir")])
+def test_cli_family_inputs_required_before_export(cli, family, missing, capsys):
+    run, calls, base, tmp = cli
+    with pytest.raises(SystemExit):
+        run(family, "--base-ir", str(base), "--out", str(tmp / "t"))
+    assert missing in capsys.readouterr().err and calls == []
