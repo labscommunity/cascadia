@@ -28,10 +28,6 @@ fn render(v: &OrderedValue) -> String {
     }
 }
 
-fn is_image_part(v: &OrderedValue) -> bool {
-    v.get("image").is_some() || v.get("type").and_then(|t| t.as_str()) == Some("image_url")
-}
-
 /// serve_decide `_parts`: string verbatim, object via json.dumps, array concatenated part by part.
 fn render_state(v: &OrderedValue) -> String {
     match v {
@@ -152,13 +148,6 @@ impl Codec for JevCodec {
     }
 
     fn encode(&self, req: &DecisionRequest) -> Result<Vec<Pass>, DecisionError> {
-        if let OrderedValue::Array(parts) = &req.state {
-            if parts.iter().any(is_image_part) {
-                return Err(DecisionError::BadRequest(
-                    "image parts in state are not supported (text-only server)".into(),
-                ));
-            }
-        }
         let mut out = Vec::with_capacity(req.questions.len());
         for (qid, q) in &req.questions {
             let text = self.prompt_text(req, qid);
@@ -329,7 +318,10 @@ mod tests {
             c.prompt_text(&r, "u")
         );
         let img: DecisionRequest = serde_json::from_str(r#"{"model": "m", "state": [{"image": "data:x"}], "questions": {"u": {"type": "noul"}}}"#).unwrap();
-        assert!(matches!(c.encode(&img), Err(DecisionError::BadRequest(_))));
+        assert!(matches!(
+            img.validate(&c.limits()),
+            Err(DecisionError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -337,7 +329,7 @@ mod tests {
         // A validation reason, not a tokenizer failure: it must not be masked as one.
         let c = JevCodec::new(tiny_tokenizer(), profile()).unwrap();
         let img: DecisionRequest = serde_json::from_str(r#"{"model": "m", "state": [{"type": "image_url", "image_url": {"url": "data:x"}}], "questions": {"u": {"type": "noul"}}}"#).unwrap();
-        match c.encode(&img) {
+        match img.validate(&c.limits()) {
             Err(DecisionError::BadRequest(m)) => {
                 assert!(m.contains("image"), "{m}");
                 assert_ne!(m, crate::decisions::TOKENIZE_FAILED);
