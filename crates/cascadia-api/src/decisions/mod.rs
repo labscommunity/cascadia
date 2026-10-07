@@ -216,6 +216,8 @@ impl Sanitizer {
     }
 }
 
+/// Numerically stable softmax. Inputs must be finite and non-empty (all -inf or any NaN gives NaN);
+/// `handler::evaluate` rejects non-finite engine logits before any codec calls this.
 pub(crate) fn softmax(z: &[f64]) -> Vec<f64> {
     let m = z.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let e: Vec<f64> = z.iter().map(|x| (x - m).exp()).collect();

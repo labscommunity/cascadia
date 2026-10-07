@@ -3462,6 +3462,8 @@ mod tests {
             .collect();
         // The mock engine fails a decision task whose prompt_ids contain 999_999.
         vocab.insert("__engine_error__".into(), 999_999);
+        // ... and returns non-finite logits (NaN, +inf, -inf) for one containing 999_998.
+        vocab.insert("__non_finite__".into(), 999_998);
         let model = tokenizers::models::wordlevel::WordLevel::builder()
             .vocab(vocab.into_iter().collect())
             .unk_token("[unk]".into())
@@ -3729,6 +3731,45 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
         assert_eq!(v["error"], "decision engine error");
         assert!(!body.contains("mock"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn decisions_non_finite_logits_are_an_engine_error_not_a_200() {
+        // the mock returns NaN/+inf/-inf logits for the sentinel id 999_998; softmax of those is
+        // NaN, which would serialise as `null` with a fabricated first-option answer
+        for q in [
+            r#"{"u": {"type": "noul"}}"#,
+            r#"{"c": {"type": "choice", "criteria": {"a": "x", "b": "y", "c": "z"}}}"#,
+        ] {
+            let (status, v, body) = post_decisions(
+                make_decision_app().await,
+                &format!(r#"{{"model": "m", "state": "__non_finite__", "questions": {q}}}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+            assert_eq!(v["error"], "decision engine error");
+            assert!(!body.contains("null"), "{body}");
+        }
+        // the OpenAI route maps the same core error into its own envelope
+        let response = make_decision_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/decisions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"input": "__non_finite__", "questions": [{"type": "predicate", "name": "u", "instructions": "x"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["message"], "decision engine error");
+        assert_eq!(v["error"]["type"], "server_error");
     }
 
     /// A router whose model carries a (minimal) tools-capable chat template.
