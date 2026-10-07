@@ -180,6 +180,11 @@ pub(crate) async fn evaluate(
                 "engine returned no (or mis-sized) decision logits",
             ));
         };
+        // NaN/±inf (an fp16 overflow, a degenerate head) would softmax to NaN, serialise as
+        // `null` and argmax to the first option: a silent wrong 200. Fail the request instead.
+        if !logits.iter().all(|x| x.is_finite()) {
+            return Err(engine_failure("non-finite decision logits"));
+        }
         for part in &pass.parts {
             probs.insert(
                 part.question_id.clone(),
