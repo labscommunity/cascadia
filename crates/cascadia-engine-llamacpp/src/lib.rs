@@ -1245,8 +1245,12 @@ fn handle_sse_line(
     // reasoning_content deltas carry no visible text but prove the child is
     // alive; the stall clock must hear them or a long reasoning-only stream
     // gets killed at the limit while still generating
-    if v["choices"][0]["delta"]["reasoning_content"].as_str().is_some_and(|s| !s.is_empty())
-        || v["choices"][0]["delta"]["reasoning"].as_str().is_some_and(|s| !s.is_empty())
+    if v["choices"][0]["delta"]["reasoning_content"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty())
+        || v["choices"][0]["delta"]["reasoning"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
     {
         active = true;
     }
