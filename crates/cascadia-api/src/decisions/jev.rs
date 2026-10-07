@@ -165,7 +165,7 @@ impl Codec for JevCodec {
             let enc = self
                 .tok
                 .encode(text.as_str(), false)
-                .map_err(|e| DecisionError::BadRequest(format!("tokenize: {e}")))?;
+                .map_err(super::tokenize_failed)?;
             let (lo, hi) = self.slots_for(q);
             let token_ids = self.p.verbalizer_ids[lo..hi].to_vec();
             let n = token_ids.len();
@@ -330,6 +330,20 @@ mod tests {
         );
         let img: DecisionRequest = serde_json::from_str(r#"{"model": "m", "state": [{"image": "data:x"}], "questions": {"u": {"type": "noul"}}}"#).unwrap();
         assert!(matches!(c.encode(&img), Err(DecisionError::BadRequest(_))));
+    }
+
+    #[test]
+    fn image_part_error_keeps_its_own_message() {
+        // A validation reason, not a tokenizer failure: it must not be masked as one.
+        let c = JevCodec::new(tiny_tokenizer(), profile()).unwrap();
+        let img: DecisionRequest = serde_json::from_str(r#"{"model": "m", "state": [{"type": "image_url", "image_url": {"url": "data:x"}}], "questions": {"u": {"type": "noul"}}}"#).unwrap();
+        match c.encode(&img) {
+            Err(DecisionError::BadRequest(m)) => {
+                assert!(m.contains("image"), "{m}");
+                assert_ne!(m, crate::decisions::TOKENIZE_FAILED);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

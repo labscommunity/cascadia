@@ -83,7 +83,7 @@ impl ClefCodec {
         Ok(self
             .tok
             .encode(text, false)
-            .map_err(|e| DecisionError::BadRequest(format!("tokenize: {e}")))?
+            .map_err(super::tokenize_failed)?
             .get_ids()
             .to_vec())
     }
