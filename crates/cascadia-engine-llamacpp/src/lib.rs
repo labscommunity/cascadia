@@ -97,6 +97,13 @@ pub struct LlamaCppConfig {
     /// Resident-weight budget for elastic mode (GGML_STREAM_VRAM_MB).
     /// Only meaningful with `elastic`.
     pub elastic_vram: ElasticVram,
+    /// Expected co-tenant count for elastic mode (GGML_STREAM_VRAM_SHARE):
+    /// caps the child's automatic resident-weight budget at a 1/N share of
+    /// the card. Only applies to `elastic_vram == Auto`; an explicit MiB
+    /// budget or GGML_STREAM_RESIDENT_LAYERS wins on the child. This is a
+    /// load-time cap, not a fairness guarantee: it does not account for
+    /// KV, slot pools, expert caches, or already-running instances.
+    pub elastic_share: Option<u32>,
     /// Experimental placement: layer tensors whose names match this regex
     /// live in the backend's pinned HOST buffer and the GPU computes on them
     /// in place (`-ot '<regex>=SYCL_Host'`, with mmap off so the loader
@@ -317,10 +324,25 @@ fn scrub_child_env(cmd: &mut Command, elastic: bool) {
         cmd.env_remove("GGML_STREAM_WEIGHTS");
         cmd.env_remove("GGML_STREAM_VRAM_MB");
         cmd.env_remove("GGML_STREAM_RESIDENT_LAYERS");
-    } else if let Ok(n) = std::env::var("GGML_STREAM_RESIDENT_LAYERS") {
-        if !n.trim().is_empty() {
+        cmd.env_remove("GGML_STREAM_VRAM_SHARE");
+        if std::env::var_os("GGML_STREAM_VRAM_SHARE").is_some() {
             tracing::warn!(
-                "sycl-llama: GGML_STREAM_RESIDENT_LAYERS={n} in the environment overrides --elastic-vram on the child"
+                "sycl-llama: GGML_STREAM_VRAM_SHARE is set but --elastic is off; dropping it from the child"
+            );
+        }
+    } else {
+        if let Ok(n) = std::env::var("GGML_STREAM_RESIDENT_LAYERS") {
+            if !n.trim().is_empty() {
+                tracing::warn!(
+                    "sycl-llama: GGML_STREAM_RESIDENT_LAYERS={n} in the environment overrides --elastic-vram on the child"
+                );
+            }
+        }
+        // an ambient GGML_STREAM_VRAM_SHARE passes through like
+        // RESIDENT_LAYERS does; --elastic-share overrides it when given
+        if std::env::var("GGML_STREAM_VRAM_SHARE").is_ok_and(|v| !v.trim().is_empty()) {
+            tracing::warn!(
+                "sycl-llama: ambient GGML_STREAM_VRAM_SHARE reaches the child; --elastic-share sets it explicitly"
             );
         }
     }
@@ -650,6 +672,20 @@ impl LlamaCppBuilder {
             // Device-side O1: weights stay on disk, streamed per layer.
             cmd.env("GGML_STREAM_WEIGHTS", "1");
             cmd.env("GGML_STREAM_VRAM_MB", self.cfg.elastic_vram.to_string());
+            // --elastic-share caps only the 'auto' budget; the child
+            // applies it to nothing else (explicit MiB wins, and an
+            // ambient share passes through untouched when no flag is set)
+            if let Some(n) = self.cfg.elastic_share {
+                if matches!(self.cfg.elastic_vram, ElasticVram::Auto) {
+                    cmd.env("GGML_STREAM_VRAM_SHARE", n.to_string());
+                } else {
+                    tracing::warn!(
+                        "sycl-llama: --elastic-share {n} ignored: it caps only the 'auto' VRAM budget"
+                    );
+                }
+            }
+        } else if self.cfg.elastic_share.is_some() {
+            tracing::warn!("sycl-llama: --elastic-share has no effect without --elastic");
         }
         // Router-aware MoE streaming lives entirely in the child (0002
         // patch): selective expert loading is automatic when streaming; a
@@ -836,8 +872,12 @@ impl Builder for LlamaCppBuilder {
             LoadProgress::message(if self.cfg.elastic {
                 format!(
                     "elastic posture: GGML_STREAM_WEIGHTS=1, \
-                     GGML_STREAM_VRAM_MB={} (device weight streaming)",
-                    self.cfg.elastic_vram
+                     GGML_STREAM_VRAM_MB={}{} (device weight streaming)",
+                    self.cfg.elastic_vram,
+                    self.cfg
+                        .elastic_share
+                        .map(|n| format!(", GGML_STREAM_VRAM_SHARE={n}"))
+                        .unwrap_or_default()
                 )
             } else {
                 "stock posture: weights resident".to_string()
@@ -2171,6 +2211,7 @@ mod unix_tests {
             "GGML_STREAM_WEIGHTS",
             "GGML_STREAM_VRAM_MB",
             "GGML_STREAM_RESIDENT_LAYERS",
+            "GGML_STREAM_VRAM_SHARE",
         ] {
             assert!(r.iter().any(|x| x == k), "{k} not removed: {r:?}");
         }
@@ -2280,6 +2321,7 @@ mod unix_tests {
             ngl: 0,
             elastic: false,
             elastic_vram: ElasticVram::Auto,
+            elastic_share: None,
             host_layers: None,
             extra_args: vec![],
             load_timeout: Some(Duration::from_secs(1)),
