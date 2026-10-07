@@ -3,6 +3,7 @@ use super::schema::{DecisionRequest, Limits, OrderedValue, Question, QuestionTyp
 use super::{softmax, Codec, DecisionError, Pass, PassPart, Sanitizer};
 use cascadia_types::{
     DecisionReadout, JointOption, JointQuestion, ReadoutHead, MAX_DECISION_OUTPUTS,
+    MAX_JOINT_PROMPT,
 };
 
 const SYSTEM_PROMPT: &str = "Read the complete state and schema. Decide every field jointly. Each answer must be exactly one of that field's allowed options.";
@@ -70,11 +71,20 @@ fn qtype_str(q: &Question) -> &'static str {
 }
 
 impl ClefCodec {
+    /// `max_tokens` is clamped to `MAX_JOINT_PROMPT`: the engine rejects longer joint readouts, so
+    /// a larger decision.json value would only turn long states into opaque 503s.
     pub fn new(tok: tokenizers::Tokenizer, max_tokens: usize) -> Result<Self, String> {
+        if max_tokens > MAX_JOINT_PROMPT {
+            tracing::warn!(
+                max_tokens,
+                cap = MAX_JOINT_PROMPT,
+                "decision.json max_tokens exceeds the joint readout cap; clamping"
+            );
+        }
         let san = Sanitizer::from_tokenizer(&tok);
         Ok(Self {
             tok,
-            max_tokens,
+            max_tokens: max_tokens.min(MAX_JOINT_PROMPT),
             san,
         })
     }
@@ -307,6 +317,22 @@ mod tests {
             text.contains("STATE:\n<") && !text.contains("STATE:\n<|"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn max_tokens_above_the_joint_cap_is_clamped() {
+        // decision.json max_tokens > MAX_JOINT_PROMPT would build passes the engine rejects
+        // (an opaque 503); the codec truncates the state to the joint cap instead.
+        use cascadia_types::{MAX_DECISION_PROMPT, MAX_JOINT_PROMPT};
+        let big = "s".repeat(MAX_JOINT_PROMPT + 5000);
+        let r: DecisionRequest = serde_json::from_str(&format!(
+            r#"{{"model": "m", "state": "{big}", "questions": {{"u": {{"type": "noul"}}}}}}"#
+        ))
+        .unwrap();
+        let c = ClefCodec::new(tok(), MAX_JOINT_PROMPT + 10_000).unwrap();
+        let p = c.encode(&r).unwrap();
+        assert_eq!(p[0].readout.prompt_ids.len(), MAX_JOINT_PROMPT);
+        p[0].readout.validate(256, MAX_DECISION_PROMPT).unwrap();
     }
 
     #[test]
