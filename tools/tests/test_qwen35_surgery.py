@@ -268,7 +268,7 @@ def test_manifest_pins_the_keys_the_engine_reads():
     m = sx.build_manifest(sx.spec_from_config(_qwen38_cfg()), "Qwen3.8-27B-int4-ov")
     assert set(m) == {
         "arch", "family", "hidden_size", "num_layers", "layer_types",
-        "source", "last_logits_only", "stages",
+        "source", "last_logits_only", "final_hidden_output", "stages",
     }
     assert m["arch"] == "qwen3_5"
     assert m["family"] == "qwen3_5"
@@ -277,6 +277,7 @@ def test_manifest_pins_the_keys_the_engine_reads():
     assert m["layer_types"] == _layer_types(64)
     assert m["source"] == "Qwen3.8-27B-int4-ov"
     assert m["last_logits_only"] is True
+    assert m["final_hidden_output"] is False
     assert m["stages"] == []
 
 
