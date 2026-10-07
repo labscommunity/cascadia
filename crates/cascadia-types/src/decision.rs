@@ -14,9 +14,17 @@ pub const MAX_JOINT_QUESTIONS: usize = 256;
 /// (pipeline ranks other than 0 never read `max_position_embeddings`).
 pub const MAX_DECISION_PROMPT: usize = 131_072;
 /// Prompt-length bound for a joint (Clef) readout, Clef's training `max_length`. The joint head
-/// reads EVERY final-hidden row, so the head-owning process holds `T * hidden * 4` bytes for the
-/// pass (e.g. 131072 * 5120 * 4 = 2.7 GB at the window bound); capping T here bounds that at
-/// ~335 MB for a 5120-wide model, before any allocation or prefill, for HTTP and peer readouts alike.
+/// reads EVERY final-hidden row, and `run_head` hands OpenVINO a dense `[R, T]` f32 span mask
+/// (R = questions + options, at most `MAX_JOINT_QUESTIONS + MAX_DECISION_OUTPUTS`). Per pass the
+/// head-owning process holds the collected rows (`T * hidden * 4` bytes), OpenVINO's copy of them,
+/// and the mask (`R * T * 4`) plus OpenVINO's copy; the mask buffer is freed before the rows are
+/// copied, so the transient peak is `rows + max(2 * mask, mask + rows)`. At this cap, 5120 wide
+/// and R = 4128 (32 questions, 4096 options) that is 335 MB + max(541, 606) MB, about 0.95 GB
+/// (versus 131072 * 5120 * 4 = 2.7 GB for the rows alone at the window bound), checked before
+/// any allocation or prefill, for HTTP and peer readouts alike. OpenVINO keeps its input copies
+/// until the next joint pass. In practice the shim's 256 MiB cap per input is hit first: it
+/// refuses (as an engine error) a 5120-wide prompt over 13107 tokens, or a mask over 2^26
+/// elements, which includes that worst case, so each copy above is at most 256 MiB.
 pub const MAX_JOINT_PROMPT: usize = 16_384;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

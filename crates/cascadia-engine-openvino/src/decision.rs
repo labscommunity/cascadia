@@ -13,7 +13,9 @@ pub struct Collector {
     need: HiddenNeed,
     hidden: usize,
     rows: BTreeMap<u32, Vec<f32>>,
-    all: Vec<f32>,
+    /// `HiddenNeed::All` (the joint head): every row as little-endian f32 bytes, the layout the
+    /// head's `hidden` input takes, so it is handed to OpenVINO without a second full copy.
+    all: Vec<u8>,
 }
 
 /// Shape only: the gathered rows can be tens of MB, and a stray `{:?}` must not log them.
@@ -28,7 +30,7 @@ impl std::fmt::Debug for Collector {
             .field("need", &need)
             .field("hidden", &self.hidden)
             .field("rows", &self.rows.len())
-            .field("all_len", &self.all.len())
+            .field("all_rows", &self.len())
             .finish()
     }
 }
@@ -64,7 +66,10 @@ impl Collector {
                         self.len()
                     ));
                 }
-                self.all.extend_from_slice(&rows[..n * self.hidden])
+                self.all.reserve(n * self.hidden * 4);
+                for x in &rows[..n * self.hidden] {
+                    self.all.extend_from_slice(&x.to_le_bytes());
+                }
             }
             HiddenNeed::Positions(want) => {
                 for &p in want {
@@ -84,12 +89,13 @@ impl Collector {
         self.rows.get(&p).map(Vec::as_slice)
     }
 
-    pub fn all(&self) -> &[f32] {
+    /// Every collected row (`HiddenNeed::All`), row-major little-endian f32 bytes.
+    pub fn all_le(&self) -> &[u8] {
         &self.all
     }
 
     pub fn len(&self) -> usize {
-        self.all.len() / self.hidden.max(1)
+        self.all.len() / (4 * self.hidden.max(1))
     }
 }
 
@@ -188,14 +194,16 @@ fn affine(w: &[f32], b: &[f32], x: &[f32], dp: usize, hidden: usize) -> Vec<f32>
         .collect()
 }
 
-/// [rows, T] matrix whose row r averages span r (half-open), as Clef's `_mean_span`.
-pub fn span_mask(spans: &[[u32; 2]], t: usize) -> Vec<f32> {
-    let mut m = vec![0f32; spans.len() * t];
+/// [rows, T] f32 matrix whose row r averages span r (half-open), as Clef's `_mean_span`, built
+/// directly as the little-endian bytes the head's `span_mask` input takes (no f32 copy first).
+pub fn span_mask_le(spans: &[[u32; 2]], t: usize) -> Vec<u8> {
+    let mut m = vec![0u8; spans.len() * t * 4];
     for (r, s) in spans.iter().enumerate() {
         let (a, b) = (s[0] as usize, s[1] as usize);
-        let w = 1.0 / (b - a) as f32;
+        let w = (1.0 / (b - a) as f32).to_le_bytes();
         for p in a..b {
-            m[r * t + p] = w;
+            let i = (r * t + p) * 4;
+            m[i..i + 4].copy_from_slice(&w);
         }
     }
     m
@@ -307,25 +315,18 @@ pub fn run_head(
             }
             let type_ids: Vec<i64> = questions.iter().map(|q| q.qtype as i64).collect();
             let n_opt = option_q.len();
-            let mask = span_mask(&spans, t);
             let set = |rt: &mut Runtime, name: &str, dt: DType, shape: &[usize], data: &[u8]| {
                 rt.set_input(name, dt, shape, data)
                     .map_err(|e| format!("joint input {name}: {e}"))
             };
-            set(
-                runtime,
-                "hidden",
-                DType::F32,
-                &[t, *hidden],
-                &le_f32(col.all()),
-            )?;
-            set(
-                runtime,
-                "span_mask",
-                DType::F32,
-                &[spans.len(), t],
-                &le_f32(&mask),
-            )?;
+            // Memory: set_input copies each input into an OpenVINO tensor. The mask is built,
+            // copied and freed before the hidden rows are copied, so the peak is the collected
+            // rows + max(2 x mask, mask + rows) rather than two copies of each at once.
+            {
+                let mask = span_mask_le(&spans, t);
+                set(runtime, "span_mask", DType::F32, &[spans.len(), t], &mask)?;
+            }
+            set(runtime, "hidden", DType::F32, &[t, *hidden], col.all_le())?;
             set(
                 runtime,
                 "lexical",
@@ -446,7 +447,11 @@ mod tests {
         let mut c = Collector::new(HiddenNeed::All, 1);
         c.absorb(0, 2, &[0.0, 1.0]).unwrap();
         c.absorb(2, 1, &[2.0]).unwrap();
-        assert_eq!(c.all(), &[0.0, 1.0, 2.0]);
+        let le: Vec<u8> = [0.0f32, 1.0, 2.0]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        assert_eq!(c.all_le(), le.as_slice());
         assert_eq!(c.len(), 3);
     }
 
@@ -506,8 +511,12 @@ mod tests {
 
     #[test]
     fn joint_span_mask_rows_average_their_span() {
-        let m = span_mask(&[[0, 2], [2, 3]], 3);
-        assert_eq!(m, vec![0.5, 0.5, 0.0, 0.0, 0.0, 1.0]);
+        let m = span_mask_le(&[[0, 2], [2, 3]], 3);
+        let want: Vec<u8> = [0.5f32, 0.5, 0.0, 0.0, 0.0, 1.0]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        assert_eq!(m, want);
     }
 
     #[test]
