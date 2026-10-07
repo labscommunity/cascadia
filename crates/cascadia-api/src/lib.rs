@@ -3479,9 +3479,13 @@ mod tests {
                 .map(|w| tokenizers::AddedToken::from(w.to_string(), true))
                 .collect::<Vec<_>>(),
         );
-        let codec =
-            decisions::kev::KevCodec::new(tok, decisions::profile::KevProfile { temperature: 1.0 })
-                .unwrap();
+        let codec = decisions::kev::KevCodec::new(
+            tok,
+            decisions::profile::KevProfile { temperature: 1.0 },
+            max_tokens,
+            max_total_tokens,
+        )
+        .unwrap();
         let cfg = Config {
             decisions: Some(Arc::new(decisions::DecisionService {
                 codec: Box::new(codec),
@@ -3663,6 +3667,44 @@ mod tests {
         assert_eq!(
             v["error"],
             "this request needs 259 prefill tokens; the per-request limit is 40"
+        );
+    }
+
+    #[tokio::test]
+    async fn kev_deeply_nested_state_is_413_before_the_indented_expansion() {
+        // 120 nested arrays around 15,000 ones: ~30 KB of compact JSON, far under the byte
+        // pre-check (400,000 x 8 = 3.2 MB), but Kev's `render` indents every leaf by up to 238 spaces,
+        // ~3.6 MB of text. The render budget must refuse it before building that string.
+        let depth = 120;
+        let leaves = vec!["1"; 15_000].join(",");
+        let state = format!("{}{leaves}{}", "[".repeat(depth), "]".repeat(depth));
+        let body = format!(
+            r#"{{"model": "m", "state": {state}, "questions": {{"u": {{"type": "noul"}}}}}}"#
+        );
+        assert!(body.len() < 1 << 20);
+        let app = make_decision_app_with(100_000, 400_000).await;
+        let (status, v, _) = post_decisions_sized(app, &body).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+        assert_eq!(
+            v["error"],
+            "the rendered request text exceeds 3200000 bytes; the limit is 8 bytes per token of the 400000-token request budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn kev_state_at_the_pass_cap_is_413() {
+        // 10 state tokens + <fim_prefix> = 11 >= max_tokens 11: rejected right after the state is
+        // tokenized, before it is cloned into any question's row.
+        let state = vec!["a"; 10].join(" ");
+        let body = format!(
+            r#"{{"model": "m", "state": "{state}", "questions": {{"u": {{"type": "noul"}}}}}}"#
+        );
+        let app = make_decision_app_with(11, 1000).await;
+        let (status, v, _) = post_decisions(app, &body).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+        assert_eq!(
+            v["error"],
+            "the state is 11 tokens; a decision pass is limited to 11"
         );
     }
 
