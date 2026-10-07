@@ -1,0 +1,253 @@
+"""Low-memory weight swap + LoRA graft for Qwen3.5-family stage IRs.
+
+Intel's stock IRs (OpenVINO/Qwen3.5-9B-int8-ov, OpenVINO/Qwen3.8-27B-int8-ov) have the exact graph of any
+fine-tune or sibling of the same architecture. For one stage (cut by export_qwen36_moe.extract_stage) every
+weight constant is replaced with the target checkpoint's tensor quantized in the stock constant's scheme:
+  u8 [out, in] + u8 zp + f16 scale  -> int8 asymmetric per output channel (bit-exact vs NNCF)
+  u4 [out, G, 128] + u4 zp + f16    -> int4 asymmetric group 128 (NNCF data-free except .5 ties)
+  float constants (norms, dt_bias, A)-> via FLOAT_KIND_TRANSFORM, calibrated against the stock pair
+Embeddings (i8 symmetric per row) are swapped in row chunks. Peak memory: one stage.
+"""
+import json
+import re
+from pathlib import Path
+
+import numpy as np
+
+
+def q_asym(w, bits, axis):
+    hi = 2 ** bits - 1
+    lo_v, hi_v = w.min(axis=axis, keepdims=True), w.max(axis=axis, keepdims=True)
+    scale = (hi_v - lo_v) / hi
+    scale = np.where(scale == 0, np.finfo(np.float32).eps, scale)
+    zp = np.clip(np.round(-lo_v / scale), 0, hi)
+    q = np.clip(np.round(w / scale) + zp, 0, hi)
+    return q.astype(np.uint8), zp.astype(np.uint8), scale.astype(np.float16)
+
+
+def q_sym8(w):
+    scale = np.abs(w).max(axis=1, keepdims=True) / 127.0
+    scale = np.where(scale == 0, np.finfo(np.float32).eps, scale)
+    return np.clip(np.round(w / scale), -128, 127).astype(np.int8), scale.astype(np.float16)
+
+
+TRANSFORMS = {"w": lambda w: w, "1+w": lambda w: 1.0 + w, "exp": np.exp}
+FLOAT_KIND_TRANSFORM = {
+    "input_layernorm.weight": "1+w",
+    "post_attention_layernorm.weight": "1+w",
+    "self_attn.q_norm.weight": "1+w",
+    "self_attn.k_norm.weight": "1+w",
+    "norm.weight": "1+w",
+    "linear_attn.A_log": "exp",
+    "linear_attn.dt_bias": "w",
+    "linear_attn.norm.weight": "w",
+}
+FLOAT_KINDS = {
+    r"layers\.(\d+)\.input_layernorm/aten::mul/Multiply_1$": "input_layernorm.weight",
+    r"layers\.(\d+)\.post_attention_layernorm/aten::mul/Multiply_1$": "post_attention_layernorm.weight",
+    r"layers\.(\d+)\.linear_attn\.norm/aten::mul/Multiply_1$": "linear_attn.norm.weight",
+    r"layers\.(\d+)\.linear_attn/aten::add/Add_2$": "linear_attn.dt_bias",
+    r"layers\.(\d+)\.linear_attn/aten::neg/Multiply_1$": "linear_attn.A_log",
+    r"layers\.(\d+)\.self_attn\.q_norm/aten::mul/Multiply_1$": "self_attn.q_norm.weight",
+    r"layers\.(\d+)\.self_attn\.k_norm/aten::mul/Multiply_1$": "self_attn.k_norm.weight",
+    r"language_model\.norm/aten::mul/Multiply_1$": "norm.weight",
+}
+PROJ = re.compile(r"language_model\.layers\.(\d+)\.([\w.]+)\._openvino_orig_weight(/zero_point|/scale)?$")
+CONV = re.compile(r"language_model\.layers\.(\d+)\.linear_attn/aten::_convolution/Reshape(/zero_point|/scale)?$")
+SLOT = {None: "w", "/zero_point": "zp", "/scale": "s"}
+
+
+class Weights:
+    """HF safetensors checkpoint, read tensor by tensor (text-model names relative to the layer stack)."""
+
+    def __init__(self, d):
+        from safetensors import safe_open  # noqa: F401  (import check)
+        self.d = Path(d)
+        self.idx = json.loads((self.d / "model.safetensors.index.json").read_text())["weight_map"]
+        self.prefix = "model.language_model." if any(k.startswith("model.language_model.") for k in self.idx) else "model."
+        self._f = {}
+
+    def _file(self, name):
+        from safetensors import safe_open
+        f = self.idx[name]
+        if f not in self._f:
+            self._f[f] = safe_open(self.d / f, "pt")
+        return self._f[f]
+
+    def get(self, name):
+        n = self.prefix + name
+        return self._file(n).get_tensor(n).float().numpy()
+
+    def rows(self, name, a, b):
+        n = self.prefix + name
+        return self._file(n).get_slice(n)[a:b].float().numpy()
+
+
+def _classify(model):
+    import openvino as ov
+    proj, conv, floats = {}, {}, []
+    for op in model.get_ops():
+        if op.get_type_name() != "Constant":
+            continue
+        nm = op.get_friendly_name()
+        m = PROJ.search(nm)
+        if m and "lm_head" not in nm:
+            proj.setdefault((int(m.group(1)), m.group(2)), {})[SLOT[m.group(3)]] = op
+            continue
+        m = CONV.search(nm)
+        if m:
+            conv.setdefault(int(m.group(1)), {})[SLOT[m.group(2)]] = op
+            continue
+        if op.get_element_type() not in (ov.Type.f32, ov.Type.f16) or int(np.prod(list(op.get_output_shape(0)) or [1])) <= 1:
+            continue
+        for ti in op.output(0).get_target_inputs():
+            cn = ti.get_node().get_friendly_name()
+            for pat, hf in FLOAT_KINDS.items():
+                mm = re.search(pat, cn)
+                if mm:
+                    floats.append((op, (f"layers.{mm.group(1)}." if mm.groups() else "") + hf))
+                    break
+    return proj, conv, floats
+
+
+def _replace(op, arr, et):
+    from openvino import opset13 as ops
+    new = ops.constant(arr, dtype=et)
+    new.set_friendly_name(op.get_friendly_name())
+    for t in list(op.output(0).get_target_inputs()):
+        t.replace_source_output(new.output(0))
+
+
+def swap_stage(model, weights):
+    """Replace every weight constant of a cut stage with `weights` (a Weights). Returns a report
+    of what was swapped per layer, for `check_swap`."""
+    import openvino as ov
+    proj, conv, floats = _classify(model)
+    report = {"proj": {}, "conv": {}, "float": {}}
+    for (layer, path), c in proj.items():
+        w = weights.get(f"layers.{layer}.{path}.weight")
+        shp = list(c["w"].get_output_shape(0))
+        if c["w"].get_element_type() == ov.Type.u4:
+            q, zp, s = q_asym(w.reshape(shp), 4, axis=-1)
+            _replace(c["w"], q, ov.Type.u4)
+            _replace(c["zp"], zp, ov.Type.u4)
+        else:
+            q, zp, s = q_asym(w, 8, axis=-1)
+            _replace(c["w"], q, ov.Type.u8)
+            _replace(c["zp"], zp, ov.Type.u8)
+        _replace(c["s"], s, ov.Type.f16)
+        report["proj"][layer] = report["proj"].get(layer, 0) + 1
+    for layer, c in conv.items():
+        shp = list(c["w"].get_output_shape(0))
+        w = weights.get(f"layers.{layer}.linear_attn.conv1d.weight").reshape(shp[0], -1)
+        q, zp, s = q_asym(w, 8, axis=-1)
+        _replace(c["w"], q.reshape(shp), ov.Type.u8)
+        _replace(c["zp"], zp.reshape(list(c["zp"].get_output_shape(0))), ov.Type.u8)
+        _replace(c["s"], s.reshape(list(c["s"].get_output_shape(0))), ov.Type.f16)
+        report["conv"][layer] = report["conv"].get(layer, 0) + 1
+    for op, hf in floats:
+        kind = re.sub(r"layers\.\d+\.", "", hf)
+        v = TRANSFORMS[FLOAT_KIND_TRANSFORM[kind]](weights.get(hf)).astype(np.float32)
+        _replace(op, v.reshape(list(op.get_output_shape(0))), op.get_element_type())
+        m = re.match(r"layers\.(\d+)\.", hf)
+        report["float"].setdefault(int(m.group(1)) if m else "final", []).append(kind)
+    return report
+
+
+LAYER_FLOATS = {
+    "linear_attention": {"input_layernorm.weight", "post_attention_layernorm.weight", "linear_attn.A_log",
+                         "linear_attn.dt_bias", "linear_attn.norm.weight"},
+    "full_attention": {"input_layernorm.weight", "post_attention_layernorm.weight", "self_attn.q_norm.weight",
+                       "self_attn.k_norm.weight"},
+}
+
+
+def check_swap(report, layers, layer_types, last):
+    """Every layer of the stage swapped its projections, its conv (linear layers) and every float
+    kind its type carries; the last stage also swapped the final norm."""
+    for i in layers:
+        t = layer_types[i]
+        if not report["proj"].get(i):
+            raise ValueError(f"layer {i}: no projection swapped")
+        if t == "linear_attention" and not report["conv"].get(i):
+            raise ValueError(f"layer {i}: conv1d not swapped")
+        missing = LAYER_FLOATS[t] - set(report["float"].get(i, []))
+        if missing:
+            raise ValueError(f"layer {i} ({t}): float constants not swapped: {sorted(missing)}")
+    if last and "norm.weight" not in report["float"].get("final", []):
+        raise ValueError("final norm not swapped")
+
+
+def lora_targets(adapter_file):
+    from safetensors import safe_open
+    with safe_open(adapter_file, "pt") as f:
+        return sum(1 for k in f.keys() if k.endswith(".lora_A.weight"))
+
+
+def lora_scale_from_config(adapter_file):
+    """PEFT scale from adapter_config.json beside the adapter: alpha/r (alpha/sqrt(r) with rsLoRA)."""
+    cfg = json.loads((Path(adapter_file).parent / "adapter_config.json").read_text())
+    for k in ("rank_pattern", "alpha_pattern"):
+        if cfg.get(k):
+            raise ValueError(f"adapter_config.json has a non-empty {k}; one global LoRA scale would be wrong")
+    r, alpha = cfg["r"], cfg["lora_alpha"]
+    return alpha / (r ** 0.5) if cfg.get("use_rslora") else alpha / r
+
+
+def swap_embeddings(src_xml, weights, out_dir, chunk=16384):
+    import openvino as ov
+    model = ov.Core().read_model(src_xml)
+    consts = {op.get_friendly_name(): op for op in model.get_ops() if op.get_type_name() == "Constant"}
+    wop = next(op for nm, op in consts.items() if nm.endswith("_openvino_orig_weight"))
+    sop = next(op for nm, op in consts.items() if nm.endswith("_openvino_orig_weight/scale"))
+    rows, hid = list(wop.get_output_shape(0))
+    q = np.empty((rows, hid), dtype=np.int8)
+    s = np.empty((rows, 1), dtype=np.float16)
+    for a in range(0, rows, chunk):
+        q[a:a + chunk], s[a:a + chunk] = q_sym8(weights.rows("embed_tokens.weight", a, min(rows, a + chunk)))
+    _replace(wop, q, ov.Type.i8)
+    _replace(sop, s, ov.Type.f16)
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    ov.save_model(model, str(Path(out_dir) / "openvino_text_embeddings_model.xml"), compress_to_fp16=False)
+
+
+def graft_lora(model, adapter_file, scale):
+    """y += scale * (x A^T) B^T on every LoRA-targeted MatMul in `model` (fp32 constants, LoRA term
+    first in the Add: OpenVINO's ARM CPU plugin produced NaN with fp16 constants / base-first adds)."""
+    from openvino import opset13 as ops
+    from safetensors.torch import load_file
+    pairs = {}
+    for k, v in load_file(adapter_file).items():
+        m = re.match(r"base_model\.model\.(?:model\.)?(.+)\.lora_([AB])\.weight$", k)
+        if m:
+            pairs.setdefault(m.group(1), {})[m.group(2)] = v.float().numpy()
+    n = 0
+    for op in list(model.get_ordered_ops()):
+        if op.get_type_name() != "MatMul":
+            continue
+        m = re.search(r"__module\.(?:model\.)*(?:language_model\.)?((?:layers\.\d+\.[\w.]+)|lm_head)/(?:aten|ov_ext)::linear/MatMul$",
+                      op.get_friendly_name())
+        if not m or m.group(1) not in pairs:
+            continue
+        a, b = pairs[m.group(1)]["A"], pairs[m.group(1)]["B"]
+        x = op.input_value(0)
+        xa = ops.matmul(x, ops.constant(np.ascontiguousarray(a.T, dtype=np.float32)), False, False)
+        xab = ops.matmul(xa, ops.constant(np.ascontiguousarray(b.T * scale, dtype=np.float32)), False, False)
+        consumers = list(op.output(0).get_target_inputs())
+        added = ops.add(xab, op.output(0))
+        for c in consumers:
+            c.replace_source_output(added.output(0))
+        n += 1
+    model.validate_nodes_and_infer_types()
+    return n
+
+
+def add_final_hidden_output(model):
+    """Expose the lm_head MatMul's input (= final-norm hidden, all positions) as output 1 `final_hidden`."""
+    from openvino import opset13 as ops
+    mm = next(op for op in model.get_ops()
+              if op.get_type_name() == "MatMul" and op.get_friendly_name().endswith("lm_head/ov_ext::linear/MatMul"))
+    res = ops.result(mm.input_value(0))
+    res.output(0).set_names({"final_hidden"})
+    model.add_results([res])
+    model.validate_nodes_and_infer_types()
