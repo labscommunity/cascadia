@@ -35,6 +35,11 @@ bytes = { workspace = true }
 # formatter, silently stripping tools from the prompt.
 minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "macros", "multi_template", "json"] }
 minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
+indexmap = { version = "2", features = ["serde"] }
+tokenizers = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true }
