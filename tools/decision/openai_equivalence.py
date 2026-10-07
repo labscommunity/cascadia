@@ -42,16 +42,52 @@ def post(url, body):
         raise SystemExit(f"ERROR {url}: HTTP {e.code} {e.read().decode(errors='replace')}")
 
 
+def choice_key(v):
+    """The server's internal key for an OpenAI choice value: the string itself, or a number's JSON text."""
+    return v if isinstance(v, str) else json.dumps(v)
+
+
 def flat_openai(a):
     if a["type"] == "predicate":
         return {"p": [1 - a["probability"], a["probability"]]}
-    return {"p": [x["probability"] for x in a["probabilities"]], "c": a["confidence"], "s": a.get("score"), "choice": a.get("choice")}
+    out = {"p": [x["probability"] for x in a["probabilities"]], "c": a["confidence"], "s": a.get("score")}
+    if a["type"] == "choice":
+        out["choice"] = choice_key(a["choice"])
+        out["names"] = [choice_key(x["value"]) for x in a["probabilities"]]
+    else:
+        out["choice"] = None
+        out["names"] = [str(x["value"]) for x in a["probabilities"]]
+    return out
 
 
 def flat_systemone(a):
     if a["type"] == "noul":
         return {"p": [1 - a["noul"], a["noul"]]}
-    return {"p": list(a["probabilities"].values()), "c": a["confidence"], "s": a.get("score"), "choice": a.get("choice")}
+    return {"p": list(a["probabilities"].values()), "c": a["confidence"], "s": a.get("score"), "choice": a.get("choice"),
+            "names": list(a["probabilities"])}
+
+
+def compare_answer(rec, oa, so):
+    """Problems between one /v1/decisions answer and the /v1/systemone answer for the same question:
+    probabilities, confidence, score and choice, plus the option NAMES (choice values, score level
+    indices) and the score labels against what the record sent, not just positions."""
+    q = rec["questions"][oa["name"]]
+    problems = []
+    if oa["type"] != KIND[q["type"]]:
+        problems.append(f"type {oa['type']} for a {q['type']} question")
+        return problems
+    got, want = flat_openai(oa), flat_systemone(so)
+    if got != want:
+        problems.append(f"openai={got} systemone={want}")
+    if q["type"] == "choice" and got["names"] != list(q["criteria"]):
+        problems.append(f"choice values {got['names']} != request {list(q['criteria'])}")
+    if q["type"] == "score":
+        labels = [x.get("label") for x in oa["probabilities"]]
+        if labels != list(q["criteria"]):
+            problems.append(f"score labels {labels} != request {list(q['criteria'])}")
+        if [x["value"] for x in oa["probabilities"]] != list(range(len(q["criteria"]))):
+            problems.append(f"score values {[x['value'] for x in oa['probabilities']]} are not 0..{len(q['criteria']) - 1}")
+    return problems
 
 
 def main():
@@ -73,11 +109,11 @@ def main():
                   f"systemone={list(so['answers'])}")
             continue
         for ans in oa["answers"]:
-            got, want = flat_openai(ans), flat_systemone(so["answers"][ans["name"]])
+            problems = compare_answer(rec, ans, so["answers"][ans["name"]])
             n += 1
-            if got != want:
+            if problems:
                 bad += 1
-                print(f"DIFF {rec['id']}.{ans['name']}: openai={got} systemone={want}")
+                print(f"DIFF {rec['id']}.{ans['name']}: " + "; ".join(problems))
     print(f"{n - bad}/{n} questions identical across /v1/decisions and /v1/systemone")
     sys.exit(1 if bad or n == 0 else 0)
 
