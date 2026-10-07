@@ -9,12 +9,28 @@ use cascadia_ov_genai_shim::{DType, PluginConfig, Runtime};
 use cascadia_types::{DecisionReadout, HiddenNeed, ReadoutHead};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug)]
 pub struct Collector {
     need: HiddenNeed,
     hidden: usize,
     rows: BTreeMap<u32, Vec<f32>>,
     all: Vec<f32>,
+}
+
+/// Shape only: the gathered rows can be tens of MB, and a stray `{:?}` must not log them.
+impl std::fmt::Debug for Collector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let need = match &self.need {
+            HiddenNeed::None => "none".to_string(),
+            HiddenNeed::All => "all".to_string(),
+            HiddenNeed::Positions(p) => format!("positions({})", p.len()),
+        };
+        f.debug_struct("Collector")
+            .field("need", &need)
+            .field("hidden", &self.hidden)
+            .field("rows", &self.rows.len())
+            .field("all_len", &self.all.len())
+            .finish()
+    }
 }
 
 impl Collector {
