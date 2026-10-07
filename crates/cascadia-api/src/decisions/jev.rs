@@ -78,6 +78,22 @@ impl JevCodec {
                     .into(),
             );
         }
+        // The prompt hard-codes `false/true` and `0..5`, and `rescale_score` divides by width - 1:
+        // noul must be 2 wide and score 6 wide. Every range must lie inside the verbalizer list.
+        let n = p.verbalizer_ids.len();
+        for (k, width) in [("noul", Some(2)), ("score", Some(6)), ("choice", None)] {
+            let [lo, hi] = p.slots[k];
+            if lo > hi || hi > n {
+                return Err(format!(
+                    "decision.json jev: slot range {k} [{lo}, {hi}) out of bounds for {n} verbalizers"
+                ));
+            }
+            if let Some(w) = width.filter(|&w| hi - lo != w) {
+                return Err(format!(
+                    "decision.json jev: slot range {k} [{lo}, {hi}) must be {w} wide"
+                ));
+            }
+        }
         let san = Sanitizer::from_tokenizer(&tok);
         Ok(Self { tok, p, san })
     }
@@ -336,6 +352,33 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn new_rejects_bad_slot_widths_and_ranges() {
+        // Each of these would panic per request (limits(): `chi - clo` underflow; probabilities:
+        // slice out of range) or mis-read the head, so the profile must fail at load.
+        let with = |k: &str, r: [usize; 2]| {
+            let mut p = profile();
+            p.slots.insert(k.to_string(), r);
+            JevCodec::new(tiny_tokenizer(), p)
+        };
+        for (k, r, why) in [
+            ("noul", [0, 3], "noul"),
+            ("score", [2, 7], "score"),
+            ("choice", [9, 8], "choice"),
+            ("choice", [8, 12], "choice"),
+            ("score", [6, 12], "score"),
+        ] {
+            match with(k, r) {
+                Err(e) => assert!(e.contains(why), "{k} {r:?}: {e}"),
+                Ok(_) => panic!("{k} {r:?} accepted"),
+            }
+        }
+        assert!(
+            with("choice", [8, 8]).is_ok(),
+            "an empty choice range is degenerate but safe"
+        );
     }
 
     #[test]
