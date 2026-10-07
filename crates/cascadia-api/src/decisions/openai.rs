@@ -1,6 +1,8 @@
 //! OpenAI Decisions API wire format (developers.openai.com/api/docs/guides/decisions) at
 //! POST /v1/decisions. A thin adapter over the shared core: the models see the same prompts as
 //! through /v1/systemone.
+use std::collections::HashSet;
+
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -10,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use super::schema::{Answer, DecisionRequest, OrderedValue, Question, QuestionType};
 use super::DecisionError;
 use crate::AppState;
+use cascadia_types::MAX_DECISION_OUTPUTS;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct OaRequest {
@@ -221,11 +224,20 @@ pub fn to_internal(r: &OaRequest) -> Result<(DecisionRequest, Vec<OaMeta>), Deci
         let (qtype, criteria) = match q {
             OaQuestion::Predicate { .. } => (QuestionType::Noul, None),
             OaQuestion::Choice { choices, .. } => {
+                // Cap before any per-choice work: this runs on the async executor, before
+                // `evaluate` applies the profile's `max_options` and before a permit is taken.
+                if choices.len() > MAX_DECISION_OUTPUTS {
+                    return Err(bad(format!(
+                        "{name}: at most {MAX_DECISION_OUTPUTS} choices are allowed, got {}",
+                        choices.len()
+                    )));
+                }
                 let mut crit: Vec<(String, OrderedValue)> = Vec::with_capacity(choices.len());
+                let mut seen: HashSet<String> = HashSet::with_capacity(choices.len());
                 for c in choices {
                     let value = choice_value(name, &c.value)?;
                     let key = choice_key(&value);
-                    if crit.iter().any(|(k, _)| *k == key) {
+                    if !seen.insert(key.clone()) {
                         return Err(bad(format!("{name}: duplicate choice value {key:?}")));
                     }
                     crit.push((
@@ -240,6 +252,12 @@ pub fn to_internal(r: &OaRequest) -> Result<(DecisionRequest, Vec<OaMeta>), Deci
                 (QuestionType::Choice, Some(OrderedValue::Object(crit)))
             }
             OaQuestion::Score { levels, .. } => {
+                if levels.len() > MAX_DECISION_OUTPUTS {
+                    return Err(bad(format!(
+                        "{name}: at most {MAX_DECISION_OUTPUTS} levels are allowed, got {}",
+                        levels.len()
+                    )));
+                }
                 let texts = levels
                     .iter()
                     .map(|l| {
@@ -420,6 +438,47 @@ mod tests {
         assert!(bad(
             r#"{"input": "x", "questions": [{"type": "choice", "name": "c", "instructions": "x", "choices": [{"value": true}, {"value": "a"}]}]}"#
         ));
+    }
+
+    #[test]
+    fn oversized_choice_and_level_lists_are_rejected_before_the_duplicate_check() {
+        use cascadia_types::MAX_DECISION_OUTPUTS;
+        // Every value is the same: were the duplicate scan to run first, the error would name a
+        // duplicate. The count cap must fire before any per-choice work.
+        let choices = vec![r#"{"value": "a"}"#; MAX_DECISION_OUTPUTS + 1].join(",");
+        let r = oa(&format!(
+            r#"{{"input": "x", "questions": [{{"type": "choice", "name": "c", "instructions": "x", "choices": [{choices}]}}]}}"#
+        ));
+        match to_internal(&r) {
+            Err(DecisionError::BadRequest(m)) => assert_eq!(
+                m,
+                format!("c: at most {MAX_DECISION_OUTPUTS} choices are allowed, got 4097")
+            ),
+            other => panic!("{other:?}"),
+        }
+        let levels = vec![r#"{"label": "l"}"#; MAX_DECISION_OUTPUTS + 1].join(",");
+        let r = oa(&format!(
+            r#"{{"input": "x", "questions": [{{"type": "score", "name": "s", "instructions": "x", "levels": [{levels}]}}]}}"#
+        ));
+        match to_internal(&r) {
+            Err(DecisionError::BadRequest(m)) => assert_eq!(
+                m,
+                format!("s: at most {MAX_DECISION_OUTPUTS} levels are allowed, got 4097")
+            ),
+            other => panic!("{other:?}"),
+        }
+        // At the cap, distinct values still convert (the profile's own max_options applies later).
+        let choices = (0..MAX_DECISION_OUTPUTS)
+            .map(|i| format!(r#"{{"value": {i}}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let r = oa(&format!(
+            r#"{{"input": "x", "questions": [{{"type": "choice", "name": "c", "instructions": "x", "choices": [{choices}]}}]}}"#
+        ));
+        assert_eq!(
+            to_internal(&r).unwrap().1[0].choice_values.len(),
+            MAX_DECISION_OUTPUTS
+        );
     }
 
     #[test]
