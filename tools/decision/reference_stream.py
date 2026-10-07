@@ -300,6 +300,10 @@ def main():
     a = ap.parse_args()
     if a.family == "clef" and not a.clef_dir:
         ap.error("clef needs --clef-dir")
+    if a.family == "kev" and not a.lora:
+        # Kev's head was trained on Base + LoRA hidden states: a reference without the adapter is
+        # the stock backbone, and parity against a tree exported the same way would still pass.
+        ap.error("kev needs --lora (Kev's adapter_model.safetensors) with --weights (its Base checkpoint)")
     scale = resolve_lora_scale(a.lora, a.lora_scale)
     ref = build_ref(a.family, a.weights, a.dump, records(), a.tree, a.lora, scale, a.clef_dir, threads=a.threads)
     Path(a.out).write_text(json.dumps(ref))
