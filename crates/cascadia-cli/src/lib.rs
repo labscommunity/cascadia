@@ -357,6 +357,11 @@ pub struct WorkerArgs {
     #[arg(long, default_value_t = 1.0)]
     pub api_max_body_mb: f64,
 
+    /// Append every /v1/decisions pass (codec token ids + head layout) as JSONL to FILE, mode 0600.
+    /// For parity checks only: the file holds request-derived data.
+    #[arg(long)]
+    pub decision_dump: Option<PathBuf>,
+
     /// OV performance hint (PERFORMANCE_HINT). LATENCY suits single-user
     /// decode; THROUGHPUT enables NUM_STREAMS auto-tuning. See OpenVINO
     /// high-level-performance-hints docs (2026).
@@ -727,6 +732,11 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 1.0)]
     pub api_max_body_mb: f64,
 
+    /// Append every /v1/decisions pass (codec token ids + head layout) as JSONL to FILE, mode 0600.
+    /// For parity checks only: the file holds request-derived data.
+    #[arg(long)]
+    pub decision_dump: Option<PathBuf>,
+
     /// Expert placement JSON (requires --ep-workers). See worker --help.
     #[arg(long)]
     pub ep_placement: Option<PathBuf>,
@@ -765,6 +775,7 @@ impl WorkerArgs {
         api_max_body_mb: f64,
         ep_workers: Vec<String>,
         ep_placement: Option<PathBuf>,
+        decision_dump: Option<PathBuf>,
     ) -> Self {
         WorkerArgs {
             rank: 0,
@@ -780,6 +791,7 @@ impl WorkerArgs {
             engine,
             prefix_cache_gb,
             api_max_body_mb,
+            decision_dump,
             ep_workers,
             ep_worker_index: None,
             ep_worker_count: None,
@@ -1077,6 +1089,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         args.api_max_body_mb,
         args.ep_workers,
         args.ep_placement,
+        args.decision_dump,
     );
     // Carry the elastic posture onto the worker so the OV memory-knob seeding
     // (ov_perf_properties) fires; the interposer itself was already activated
@@ -2335,6 +2348,35 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             chat_template.template.as_deref(),
         );
         cfg.chat_template = chat_template;
+        // Decision models: a `decision.json` beside the shard tree turns on /v1/decisions and /v1/systemone.
+        // Only qwen35 implements decision passes; other engines would run them as empty chats.
+        if matches!(args.engine, EngineKind::Qwen36Moe) {
+            match cascadia_api::decisions::DecisionService::load(std::path::Path::new(&args.model))
+            {
+                Ok(Some(svc)) => {
+                    info!(model = %args.model, "decision.json found; serving /v1/decisions (OpenAI format) and /v1/systemone");
+                    // The shared-prefix budget discount needs real reuse: a single box with the
+                    // prefix cache on. Pipeline ranks re-prefill Kev's state per question.
+                    let mut svc = std::sync::Arc::try_unwrap(svc)
+                        .unwrap_or_else(|_| unreachable!("fresh Arc"));
+                    svc.prefix_reuse = args.total <= 1 && prefix_cache_bytes > 0;
+                    cfg.decisions = Some(std::sync::Arc::new(svc));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(model = %args.model, error = %e, "decision.json present but unusable; /v1/decisions disabled")
+                }
+            }
+        } else if std::path::Path::new(&args.model)
+            .join("decision.json")
+            .exists()
+        {
+            warn!(engine = ?args.engine, "decision.json ignored: only --engine qwen35 serves /v1/decisions");
+        }
+        if let Some(p) = &args.decision_dump {
+            warn!(path = %p.display(), "--decision-dump records request-derived token ids to disk; use for parity checks only");
+            cfg.decision_dump = Some(p.clone());
+        }
         // Long-context serving: the 64 KiB body / 32 KiB prompt defaults hold
         // ~8 K tokens, a fraction of what the Qwen3.5-family and Llama-3.1
         // windows admit. Both caps follow one operator-facing knob.
@@ -2907,6 +2949,7 @@ mod python_tests {
             1.0,
             Vec::new(),
             None,
+            None,
         );
         a.engine = engine;
         a
@@ -3351,6 +3394,7 @@ mod ov_property_tests {
             None,
             1.0,
             Vec::new(),
+            None,
             None,
         )
     }
@@ -3873,11 +3917,48 @@ mod tests {
             args.api_max_body_mb,
             Vec::new(),
             args.ep_placement,
+            None,
         );
         assert_eq!(worker.prefix_cache_gb, Some(0.0));
         assert_eq!(worker.api_max_body_mb, 2.0);
         assert_eq!(worker.rank, 0);
         assert_eq!(worker.total, 1);
+    }
+
+    #[test]
+    fn run_forwards_decision_dump() {
+        let cli = Cli::try_parse_from([
+            "cascadia",
+            "run",
+            "some-model-dir",
+            "--engine",
+            "qwen35",
+            "--decision-dump",
+            "/tmp/d.jsonl",
+        ])
+        .expect("parse run argv");
+        let Command::Run(args) = cli.cmd else {
+            panic!("expected run subcommand")
+        };
+        assert_eq!(
+            args.decision_dump.as_deref(),
+            Some(std::path::Path::new("/tmp/d.jsonl"))
+        );
+        let worker = WorkerArgs::single_node(
+            args.model,
+            args.device,
+            args.engine,
+            args.api,
+            args.prefix_cache_gb,
+            args.api_max_body_mb,
+            Vec::new(),
+            args.ep_placement,
+            args.decision_dump,
+        );
+        assert_eq!(
+            worker.decision_dump.as_deref(),
+            Some(std::path::Path::new("/tmp/d.jsonl"))
+        );
     }
 
     #[test]
@@ -3906,6 +3987,7 @@ mod tests {
             args.api_max_body_mb,
             args.ep_workers,
             args.ep_placement,
+            None,
         );
         assert_eq!(worker.ep_placement, Some(PathBuf::from("placement.json")));
         assert_eq!(worker.ep_workers, ["127.0.0.1:9201", "127.0.0.1:9202"]);
