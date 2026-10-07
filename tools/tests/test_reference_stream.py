@@ -24,6 +24,12 @@ def tiny(tmp_path):
                             linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=8, linear_value_head_dim=8)
     torch.manual_seed(0)
     model = M.Qwen3_5ForCausalLM(cfg).float().eval()
+    # random norm weights: HF initialises the (1+w) RMSNorms to zero (identity), which would let a
+    # missing or misnamed norm load pass unnoticed
+    with torch.no_grad():
+        for n, prm in model.named_parameters():
+            if "norm" in n:
+                prm.copy_(torch.randn_like(prm) * 0.3)
     # clone: tied embeddings share storage with lm_head and safetensors refuses shared tensors
     sd = {k: v.clone().contiguous() for k, v in model.state_dict().items()}
     save_file(sd, str(tmp_path / "model.safetensors"))
@@ -237,3 +243,67 @@ def test_clef_family_probs_reorders_noul_and_choice(tmp_path, monkeypatch):
     s = sm([0.5, 1.5, -0.5])                                           # alpha, mid, zeta
     assert out["b"] == pytest.approx([s[2], s[0], s[1]])              # request order: zeta, alpha, mid
     assert out["c"] == pytest.approx(sm([0.1, 0.2, 0.3]))
+
+
+def test_tiny_model_norms_are_not_identity(tmp_path):
+    model = tiny(tmp_path)
+    assert float(model.model.norm.weight.detach().abs().max()) > 0.05
+    assert float(model.model.layers[0].input_layernorm.weight.detach().abs().max()) > 0.05
+
+
+def test_lm_head_lora_row_wise_equals_full_merge(tmp_path):
+    model = tiny(tmp_path)
+    t = write_lora(tmp_path / "adapter.safetensors", model, ["lm_head"])
+    scale, vids, h = 2.0, [5, 0, 63, 5], torch.randn(32)
+    full = scale * (t["base_model.model.lm_head.lora_B.weight"] @ t["base_model.model.lm_head.lora_A.weight"])
+    got = rs.Lora(str(tmp_path / "adapter.safetensors"), scale).lm_head_logits(vids, h)
+    assert torch.allclose(got, full[vids] @ h, atol=1e-5), float((got - full[vids] @ h).abs().max())
+    assert rs.Lora(None, None).lm_head_logits(vids, h) is None
+
+
+def test_lm_head_adapter_fails_outside_jev(tmp_path):
+    model = tiny(tmp_path)
+    write_lora(tmp_path / "adapter.safetensors", model, ["layers.0.mlp.down_proj", "lm_head"])
+    passes = [{"readout": {"prompt_ids": [1, 2, 3]}}]
+    with pytest.raises(SystemExit, match="matched no decoder weight"):
+        rs.stream_hidden(str(tmp_path), passes, lora=str(tmp_path / "adapter.safetensors"), lora_scale=1.0, threads=1)
+    rs.stream_hidden(str(tmp_path), passes, lora=str(tmp_path / "adapter.safetensors"), lora_scale=1.0, threads=1,
+                     allow_lm_head_lora=True)
+    tree, _ = kev_tree(tmp_path, hidden=32)
+    dump, _ = kev_dump(tmp_path)
+    with pytest.raises(SystemExit, match="matched no decoder weight"):
+        rs.build_ref("kev", str(tmp_path), str(dump), RECS, str(tree),
+                     lora=str(tmp_path / "adapter.safetensors"), lora_scale=1.0, threads=1)
+
+
+def drop_lm_head(tmp_path, tied):
+    idx = json.loads((tmp_path / "model.safetensors.index.json").read_text())
+    del idx["weight_map"]["lm_head.weight"]
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(idx))
+    cfg = json.loads((tmp_path / "config.json").read_text())
+    cfg["tie_word_embeddings"] = tied
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+
+
+def test_lm_rows_falls_back_to_embeddings_only_when_tied(tmp_path):
+    model = tiny(tmp_path)
+    drop_lm_head(tmp_path, tied=False)
+    with pytest.raises(SystemExit, match="tie_word_embeddings"):
+        rs.lm_rows(str(tmp_path), [1])
+    cfg = json.loads((tmp_path / "config.json").read_text())
+    cfg["tie_word_embeddings"] = True
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+    assert torch.equal(rs.lm_rows(str(tmp_path), [4, 2]), model.model.embed_tokens.weight.detach()[[4, 2]])
+
+
+def test_explicit_lora_scale_still_runs_adapter_refusals(tmp_path):
+    ad = tmp_path / "adapter_model.safetensors"
+    ad.write_bytes(b"")
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16, "lora_alpha": 32}))
+    assert rs.resolve_lora_scale(str(ad)) == 2.0
+    assert rs.resolve_lora_scale(str(ad), 0.5) == 0.5
+    assert rs.resolve_lora_scale(None, None) is None
+    for bad in ({"use_dora": True}, {"rank_pattern": {"x": 4}}, {"alpha_pattern": {"x": 4}}, {"lora_bias": True}):
+        (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16, "lora_alpha": 32, **bad}))
+        with pytest.raises(ValueError):
+            rs.resolve_lora_scale(str(ad), 0.5)
