@@ -66,14 +66,31 @@ class Lora:
         self.scale = scale
         self.used = set()
 
-    def delta(self, module):
+    def _a_key(self, module):
         for pre in ("", "model.", "model.language_model."):
             a = f"base_model.model.{pre}{module}.lora_A.weight"
             if a in self.keys:
                 self.used.add(a)
-                b = self.f.get_tensor(a.replace("lora_A", "lora_B")).float()
-                return self.scale * (b @ self.f.get_tensor(a).float())
+                return a
         return None
+
+    def delta(self, module):
+        """The full merged delta, for decoder weights (one layer's worth at a time)."""
+        a = self._a_key(module)
+        if a is None:
+            return None
+        b = self.f.get_tensor(a.replace("lora_A", "lora_B")).float()
+        return self.scale * (b @ self.f.get_tensor(a).float())
+
+    def lm_head_logits(self, vids, h):
+        """scale * B[vids] @ (A @ h): the lm_head adapter's logit delta for `vids` only. The full
+        [vocab, hidden] delta (~4 GB fp32 for a 248k vocab) is never materialised. None without one."""
+        a = self._a_key("lm_head")
+        if a is None:
+            return None
+        s = self.f.get_slice(a.replace("lora_A", "lora_B"))
+        b = torch.stack([s[int(i):int(i) + 1][0] for i in vids]).float()
+        return self.scale * (b @ (self.f.get_tensor(a).float() @ h))
 
 
 def text_config(weights_dir):
@@ -85,8 +102,10 @@ def text_config(weights_dir):
 
 
 @torch.inference_mode()
-def stream_hidden(weights_dir, passes, lora=None, lora_scale=None, threads=4):
-    """Final-norm hidden [T, H] (fp32) of every pass's prompt_ids, one decoder layer resident at a time."""
+def stream_hidden(weights_dir, passes, lora=None, lora_scale=None, threads=4, allow_lm_head_lora=False):
+    """Final-norm hidden [T, H] (fp32) of every pass's prompt_ids, one decoder layer resident at a time.
+    Every adapter module must merge into a decoder weight; an lm_head adapter is tolerated only with
+    allow_lm_head_lora (JEV, whose verbalizer head applies it in family_probs)."""
     from transformers.models.qwen3_5 import modeling_qwen3_5 as M
     torch.set_num_threads(threads)
     ck, cfg = Ckpt(weights_dir), text_config(weights_dir)
@@ -116,9 +135,9 @@ def stream_hidden(weights_dir, passes, lora=None, lora_scale=None, threads=4):
         del layer, sd
         gc.collect()
         print(f"layer {i} ({cfg.layer_types[i]}, {merged} LoRA merged)", flush=True)
-    # every decoder adapter must have been merged (lm_head is the JEV head's, applied in family_probs)
+    # every adapter must have been merged; lm_head only for JEV (applied in family_probs)
     unused = sorted(k for k in lo.keys if k.endswith(".lora_A.weight") and k not in lo.used
-                    and not k.endswith(".lm_head.lora_A.weight"))
+                    and not (allow_lm_head_lora and k.endswith(".lm_head.lora_A.weight")))
     if unused:
         raise SystemExit(f"ERROR {lora}: {len(unused)} adapter module(s) matched no decoder weight, e.g. {unused[:3]}")
     norm = M.Qwen3_5RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
@@ -126,11 +145,25 @@ def stream_hidden(weights_dir, passes, lora=None, lora_scale=None, threads=4):
     return [norm(a[0]) for a in acts]
 
 
+def lm_head_name(ck, weights_dir):
+    """lm_head.weight, or the input embeddings only when config.json ties them
+    (the same rule as decision_export._lm_head_name)."""
+    if "lm_head.weight" in ck.idx:
+        return "lm_head.weight"
+    cfg_path = Path(weights_dir) / "config.json"
+    cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+    tied = cfg.get("tie_word_embeddings", (cfg.get("text_config") or {}).get("tie_word_embeddings", False))
+    emb = f"{ck.prefix}embed_tokens.weight"
+    if tied and emb in ck.idx:
+        return emb
+    raise SystemExit(f"ERROR {weights_dir}: no lm_head.weight in model.safetensors.index.json "
+                     f"(and tie_word_embeddings is not set)")
+
+
 def lm_rows(weights_dir, ids):
     """lm_head rows (fp32) for `ids`; the input embeddings when the checkpoint ties them."""
     ck = Ckpt(weights_dir)
-    name = "lm_head.weight" if "lm_head.weight" in ck.idx else f"{ck.prefix}embed_tokens.weight"
-    return ck.rows(name, ids)
+    return ck.rows(lm_head_name(ck, weights_dir), ids)
 
 
 def softmax(z):
@@ -173,9 +206,9 @@ def family_probs(family, rec, passes, hidden, tree, weights_dir, lora, lora_scal
             vids = head["token_ids"]
             last = h[-1]
             logits = lm_rows(weights_dir, vids) @ last
-            d = lo_ad.delta("lm_head")
+            d = lo_ad.lm_head_logits(vids, last)
             if d is not None:
-                logits = logits + d[vids] @ last
+                logits = logits + d
             z = [(float(l) + j["bias"][lo_slot + i]) / j["temperature"][kind] for i, l in enumerate(logits)]
             pr = softmax(z)
             out[qid] = rescale_score(pr, len(q["criteria"])) if kind == "score" else pr
@@ -225,7 +258,7 @@ def build_ref(family, weights_dir, dump, recs, tree, lora=None, lora_scale=None,
     count fails: parity_check scores every reference entry, so partial output must never be written."""
     aligned = list(align(dump, recs))
     flat = [p for _, ps in aligned for p in ps]
-    hidden = stream_hidden(weights_dir, flat, lora, lora_scale, threads=threads)
+    hidden = stream_hidden(weights_dir, flat, lora, lora_scale, threads=threads, allow_lm_head_lora=family == "jev")
     ref, k = {}, 0
     for rec, ps in aligned:
         probs = family_probs(family, rec, ps, hidden[k:k + len(ps)], tree, weights_dir, lora, lora_scale, clef_dir)
@@ -243,6 +276,16 @@ def build_ref(family, weights_dir, dump, recs, tree, lora=None, lora_scale=None,
     return ref
 
 
+def resolve_lora_scale(lora, override=None):
+    """adapter_config.json's scale, or `override`. lora_scale_from_config always runs, so its refusals
+    (DoRA, rank/alpha patterns, lora_bias) hold even when only the scale value is overridden."""
+    if not lora:
+        return override
+    from weight_swap import lora_scale_from_config
+    scale = lora_scale_from_config(lora)
+    return scale if override is None else override
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("family", choices=["jev", "kev", "clef"])
@@ -257,10 +300,7 @@ def main():
     a = ap.parse_args()
     if a.family == "clef" and not a.clef_dir:
         ap.error("clef needs --clef-dir")
-    scale = a.lora_scale
-    if a.lora and scale is None:
-        from weight_swap import lora_scale_from_config
-        scale = lora_scale_from_config(a.lora)
+    scale = resolve_lora_scale(a.lora, a.lora_scale)
     ref = build_ref(a.family, a.weights, a.dump, records(), a.tree, a.lora, scale, a.clef_dir, threads=a.threads)
     Path(a.out).write_text(json.dumps(ref))
     print(f"wrote {len(ref)} reference distributions to {a.out}")
