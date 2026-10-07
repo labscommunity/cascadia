@@ -486,6 +486,16 @@ pub struct WorkerArgs {
     #[arg(long, value_name = "auto|GiB", default_value_t = ElasticVram::Auto)]
     pub elastic_vram: ElasticVram,
 
+    /// Expected co-tenant count for `--elastic` on sycl-llama: caps the
+    /// child's automatic resident-weight budget at a 1/N share of the card
+    /// (GGML_STREAM_VRAM_SHARE), so N co-loaded instances get an equal
+    /// share instead of first-come-takes-all. Only applies to
+    /// `--elastic-vram auto`; explicit budgets and
+    /// GGML_STREAM_RESIDENT_LAYERS win. sycl-llama only; ignored without
+    /// `--elastic`.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub elastic_share: Option<u32>,
+
     /// NPU LLM prefill chunk size (NPUW_LLM_PREFILL_CHUNK_SIZE, OV 2025.3+).
     /// Applied only with --engine ov-genai on an NPU device; dropped with a
     /// warning otherwise (only ov-genai routes it through an ov::genai
@@ -807,6 +817,16 @@ pub struct RunArgs {
     #[arg(long, value_name = "auto|GiB", default_value_t = ElasticVram::Auto)]
     pub elastic_vram: ElasticVram,
 
+    /// Expected co-tenant count for `--elastic` on sycl-llama: caps the
+    /// child's automatic resident-weight budget at a 1/N share of the card
+    /// (GGML_STREAM_VRAM_SHARE), so N co-loaded instances get an equal
+    /// share instead of first-come-takes-all. Only applies to
+    /// `--elastic-vram auto`; explicit budgets and
+    /// GGML_STREAM_RESIDENT_LAYERS win. sycl-llama only; ignored without
+    /// `--elastic`.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub elastic_share: Option<u32>,
+
     /// Path to a llama-server binary — sycl-llama engine only. Optional:
     /// resolved as --llama-bin > $CASCADIA_LLAMA_BIN > `llama-server` on
     /// PATH. See `cascadia worker --help`.
@@ -934,6 +954,7 @@ impl WorkerArgs {
             llama_load_timeout: None,
             llama_load_retries: 1,
             elastic_vram: ElasticVram::Auto,
+            elastic_share: None,
         }
     }
 }
@@ -1201,6 +1222,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     worker.llama_load_timeout = args.llama_load_timeout;
     worker.llama_load_retries = args.llama_load_retries;
     worker.elastic_vram = args.elastic_vram;
+    worker.elastic_share = args.elastic_share;
     cmd_worker(worker).await
 }
 
@@ -1880,6 +1902,7 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
                 ngl: args.llama_ngl,
                 elastic: args.elastic,
                 elastic_vram: args.elastic_vram,
+                elastic_share: args.elastic_share,
                 host_layers: None,
                 extra_args,
                 load_timeout: args.llama_load_timeout.map(std::time::Duration::from_secs),
@@ -4279,5 +4302,48 @@ mod sycl_llama_flag_tests {
             "lots",
         ]);
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn elastic_share_parses_and_rejects_zero() {
+        let r = run_args(&[
+            "cascadia",
+            "run",
+            "m.gguf",
+            "--engine",
+            "sycl-llama",
+            "--elastic",
+            "--elastic-share",
+            "3",
+        ]);
+        assert_eq!(r.elastic_share, Some(3));
+        let w = worker_args(&[
+            "cascadia",
+            "worker",
+            "--rank",
+            "0",
+            "--total",
+            "1",
+            "--model",
+            "m.gguf",
+            "--engine",
+            "sycl-llama",
+            "--elastic-share",
+            "4294967295",
+        ]);
+        assert_eq!(w.elastic_share, Some(u32::MAX));
+        // unset is None so an ambient GGML_STREAM_VRAM_SHARE survives
+        assert_eq!(run_args(&["cascadia", "run", "m.gguf"]).elastic_share, None);
+        // 0, negative, and non-numeric rejected at parse time
+        for bad_n in ["0", "-1", "lots"] {
+            assert!(
+                Cli::try_parse_from([
+                    "cascadia", "run", "m.gguf", "--engine", "sycl-llama",
+                    "--elastic-share", bad_n,
+                ])
+                .is_err(),
+                "{bad_n} must not parse"
+            );
+        }
     }
 }
