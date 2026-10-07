@@ -5,6 +5,7 @@ pub mod clef;
 pub mod handler;
 pub mod jev;
 pub mod kev;
+pub mod openai;
 pub mod profile;
 pub mod schema;
 

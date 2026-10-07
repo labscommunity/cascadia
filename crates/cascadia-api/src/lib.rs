@@ -572,6 +572,7 @@ pub fn make_router_with_stats(
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
+        .route("/v1/decisions", post(decisions::openai::decide))
         .route("/v1/systemone", post(decisions::handler::decide))
         .route("/v1/cancel/:task_id", post(cancel))
         .with_state(state)
@@ -3986,6 +3987,77 @@ mod tests {
             serde_json::from_slice(&body).unwrap_or(Value::Null),
             text,
         )
+    }
+
+    /// POST to the OpenAI-format route `/v1/decisions` (raw JSON text, like `post_decisions`).
+    async fn post_openai(app: Router, payload: &str) -> (StatusCode, Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/decisions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn openai_decisions_route_answers_in_openai_shape() {
+        let (status, v) = post_openai(
+            make_decision_app().await,
+            r#"{"model": "gpt-6-luna", "input": "I was charged twice for my order.",
+            "questions": [{"type": "choice", "name": "department", "instructions": "Which department?",
+              "choices": [{"value": "billing", "description": "Payments."}, {"value": "technical", "description": "Bugs."}]},
+              {"type": "predicate", "name": "urgent", "instructions": "Urgent?"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["answers"][0]["type"], "choice");
+        assert_eq!(v["answers"][0]["name"], "department");
+        assert_eq!(v["answers"][0]["choice"], "billing");
+        assert_eq!(v["answers"][0]["probabilities"][1]["value"], "technical");
+        assert_eq!(v["answers"][1]["type"], "predicate");
+        assert!(
+            v["answers"][1]["probability"].as_f64().unwrap() < 0.5,
+            "mock: first option (false) wins"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_errors_use_openai_error_shape() {
+        let (status, v) = post_openai(
+            make_decision_app().await,
+            r#"{"input": "x", "questions": []}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert!(v["error"]["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn openai_and_systemone_routes_agree() {
+        let oa = r#"{"input": "a b", "questions": [{"type": "choice", "name": "team", "instructions": "who", "choices": [{"value": "billing", "description": "x"}, {"value": "tech", "description": "y"}]},
+                    {"type": "score", "name": "sev", "instructions": "how", "levels": [{"label": "lo"}, {"label": "mid"}, {"label": "hi"}]}]}"#;
+        let so = r#"{"model": "m", "state": "a b", "questions": {"team": {"type": "choice", "instructions": "who", "criteria": {"billing": "x", "tech": "y"}},
+                    "sev": {"type": "score", "instructions": "how", "criteria": ["lo", "mid", "hi"]}}}"#;
+        let (_, a) = post_openai(make_decision_app().await, oa).await;
+        let (_, b, _) = post_decisions(make_decision_app().await, so).await;
+        assert_eq!(
+            a["answers"][0]["probabilities"][0]["probability"],
+            b["answers"]["team"]["probabilities"]["billing"]
+        );
+        assert_eq!(a["answers"][1]["score"], b["answers"]["sev"]["score"]);
+        assert_eq!(
+            a["answers"][1]["confidence"],
+            b["answers"]["sev"]["confidence"]
+        );
     }
 
     #[tokio::test]
