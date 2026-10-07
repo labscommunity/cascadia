@@ -1471,23 +1471,23 @@ impl Qwen36Engine {
     }
 
     /// Everything a decision pass needs before it touches a stage: a well-formed readout
-    /// (ids < vocab, spans/positions inside the prompt: the readout may come from a peer)
-    /// and, on the head-owning process, the assets and hidden output its head reads.
+    /// (ids < vocab, spans/positions inside the prompt: the readout may come from a peer),
+    /// the hidden output its head reads (manifest-wide, so checked on every rank), and, on the
+    /// head-owning process, the head assets.
     fn admit_decision_check(&self, d: &cascadia_types::DecisionReadout) -> Result<(), String> {
         let vocab = self
             .vocab
             .ok_or("decision_unsupported: tree config.json states no vocab_size")?;
         d.validate(vocab, decision_prompt_cap(self.max_ctx))
             .map_err(|e| format!("decision_invalid: {e}"))?;
-        if self.owns_head() {
-            if self.decision_assets.is_none() {
-                return Err("decision_unsupported: model has no decision/ head assets".into());
-            }
-            if head_reads_hidden(d) && !self.final_hidden_output {
-                return Err(
-                    "decision_unsupported: tree was exported without --final-hidden".into(),
-                );
-            }
+        if self.owns_head() && self.decision_assets.is_none() {
+            return Err("decision_unsupported: model has no decision/ head assets".into());
+        }
+        // Every rank evaluates this (HELLO guarantees one manifest across the chain), so rank 0
+        // refuses before any frame goes out instead of the last rank refusing after a full chain
+        // prefill. The last rank's own check stays as defence in depth.
+        if head_reads_hidden(d) && !self.final_hidden_output {
+            return Err("decision_unsupported: tree was exported without --final-hidden".into());
         }
         Ok(())
     }
@@ -4503,6 +4503,46 @@ mod tests {
             "window never widens"
         );
         assert_eq!(decision_prompt_cap(Some(40_960)), 40_960, "window tightens");
+    }
+
+    #[test]
+    fn rank0_refuses_a_hidden_readout_on_a_tree_without_final_hidden_before_prefill() {
+        use cascadia_types::{DecisionReadout, ReadoutHead};
+        // Rank 0 of 2 does not own the head, but HELLO guarantees every rank has this manifest:
+        // a Pointer/Joint readout on a tree exported without --final-hidden must be refused here,
+        // not after a full chain prefill at the last rank.
+        let mut e = bare_engine(2, "{}");
+        e.rank = 0;
+        e.vocab = Some(16);
+        let pointer = DecisionReadout {
+            prompt_ids: vec![1, 2, 3],
+            head: ReadoutHead::Pointer {
+                decide_pos: 2,
+                option_pos: vec![0, 1],
+            },
+            cache_prefix: None,
+        };
+        let err = e.admit_decision_check(&pointer).unwrap_err();
+        assert!(
+            err.starts_with("decision_unsupported") && err.contains("--final-hidden"),
+            "{err}"
+        );
+        // A verbalizer readout reads only logits; rank 0 holds no head assets and needs none.
+        let verbalizer = DecisionReadout {
+            prompt_ids: vec![1, 2, 3],
+            head: ReadoutHead::Verbalizer { token_ids: vec![1] },
+            cache_prefix: None,
+        };
+        assert!(e.admit_decision_check(&verbalizer).is_ok());
+        e.final_hidden_output = true;
+        assert!(e.admit_decision_check(&pointer).is_ok());
+        // The last rank keeps its own check (defence in depth), plus the assets check.
+        e.rank = 1;
+        e.final_hidden_output = false;
+        assert!(e
+            .admit_decision_check(&pointer)
+            .unwrap_err()
+            .contains("decision_unsupported"));
     }
 
     #[test]
