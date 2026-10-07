@@ -1,0 +1,270 @@
+"""fp32 reference for a decision tree, one decoder layer resident at a time (LoRA merged per layer).
+
+Replays the server's --decision-dump, so it measures quantization only (codec correctness is
+codec_golden.py's job). Peak memory ~ one fp32 layer + the passes' activations.
+
+  python tools/decision/reference_stream.py jev  --weights JEV_BF16 --lora JEV/adapter_vllm/adapter_model.safetensors --tree TREE --dump d.jsonl --out ref.json
+  python tools/decision/reference_stream.py kev  --weights QWEN35_9B_BASE --lora KEV/adapter_model.safetensors --tree TREE --dump d.jsonl --out ref.json
+  python tools/decision/reference_stream.py clef --weights CLEF_DIR --clef-dir CLEF_DIR --tree TREE --dump d.jsonl --out ref.json
+
+REF.json maps "<record id>.<question id>" to probabilities in API option order (noul [false, true];
+choice in request order; score by level index): exactly one entry per question of the 50 records,
+which is what parity_check.py --ref requires.
+"""
+import argparse
+import gc
+import json
+import math
+import sys
+from functools import lru_cache
+from pathlib import Path
+
+import numpy as np
+import torch
+from safetensors import safe_open
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "qwen36_surgery"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from codec_golden import align, rescale_score  # noqa: E402
+from records import records  # noqa: E402
+
+
+class Ckpt:
+    """An HF safetensors checkpoint read tensor by tensor (row by row for embeddings/lm_head)."""
+
+    def __init__(self, d):
+        self.d = Path(d)
+        self.idx = json.loads((self.d / "model.safetensors.index.json").read_text())["weight_map"]
+        self.prefix = "model.language_model." if any(k.startswith("model.language_model.") for k in self.idx) else "model."
+        self._f = {}
+
+    def _file(self, name):
+        f = self.idx[name]
+        if f not in self._f:
+            self._f[f] = safe_open(self.d / f, "pt")
+        return self._f[f]
+
+    def tensor(self, name):
+        return self._file(name).get_tensor(name).float()
+
+    def rows(self, name, ids):
+        s = self._file(name).get_slice(name)
+        return torch.stack([s[int(i):int(i) + 1][0] for i in ids]).float()
+
+
+class Lora:
+    """PEFT adapter: delta(module) = scale * B @ A in fp32, or None when the module has no adapter.
+    `module` is the path below the decoder ("layers.3.mlp.down_proj") or "lm_head"; the adapter may
+    name it with or without the "model." / "model.language_model." prefix."""
+
+    def __init__(self, path, scale):
+        self.f = safe_open(path, "pt") if path else None
+        self.keys = set(self.f.keys()) if self.f else set()
+        if self.f is not None and scale is None:
+            raise ValueError("a LoRA adapter needs a scale (--lora-scale or adapter_config.json)")
+        self.scale = scale
+        self.used = set()
+
+    def delta(self, module):
+        for pre in ("", "model.", "model.language_model."):
+            a = f"base_model.model.{pre}{module}.lora_A.weight"
+            if a in self.keys:
+                self.used.add(a)
+                b = self.f.get_tensor(a.replace("lora_A", "lora_B")).float()
+                return self.scale * (b @ self.f.get_tensor(a).float())
+        return None
+
+
+def text_config(weights_dir):
+    from transformers import AutoConfig
+    cfg = AutoConfig.from_pretrained(weights_dir)
+    cfg = getattr(cfg, "text_config", cfg)
+    cfg._attn_implementation = "sdpa"
+    return cfg
+
+
+@torch.inference_mode()
+def stream_hidden(weights_dir, passes, lora=None, lora_scale=None, threads=4):
+    """Final-norm hidden [T, H] (fp32) of every pass's prompt_ids, one decoder layer resident at a time."""
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as M
+    torch.set_num_threads(threads)
+    ck, cfg = Ckpt(weights_dir), text_config(weights_dir)
+    lo = Lora(lora, lora_scale)
+    ids = [p["readout"]["prompt_ids"] for p in passes]
+    acts = [ck.rows(f"{ck.prefix}embed_tokens.weight", x).unsqueeze(0) for x in ids]
+    # Qwen3.5 text positions: [4, B, T] = text row + 3 identical mrope rows (Qwen3_5TextModel.forward)
+    pos = [torch.arange(a.shape[1]).view(1, 1, -1).expand(4, 1, -1) for a in acts]
+    rot = M.Qwen3_5TextRotaryEmbedding(cfg)
+    pe = [rot(a, p[1:]) for a, p in zip(acts, pos)]
+    for i in range(cfg.num_hidden_layers):
+        layer = M.Qwen3_5DecoderLayer(cfg, i).float()
+        sd, merged = {}, 0
+        for name in layer.state_dict():
+            w = ck.tensor(f"{ck.prefix}layers.{i}.{name}")
+            if name.endswith(".weight"):
+                d = lo.delta(f"layers.{i}.{name[:-len('.weight')]}")
+                if d is not None:
+                    w = w + d
+                    merged += 1
+            sd[name] = w
+        layer.load_state_dict(sd, strict=True)
+        layer.eval()
+        for j in range(len(acts)):
+            # attention_mask=None: sdpa runs causal; the linear-attention layers need no mask at batch 1
+            acts[j] = layer(acts[j], position_embeddings=pe[j], attention_mask=None, position_ids=pos[j][0])
+        del layer, sd
+        gc.collect()
+        print(f"layer {i} ({cfg.layer_types[i]}, {merged} LoRA merged)", flush=True)
+    # every decoder adapter must have been merged (lm_head is the JEV head's, applied in family_probs)
+    unused = sorted(k for k in lo.keys if k.endswith(".lora_A.weight") and k not in lo.used
+                    and not k.endswith(".lm_head.lora_A.weight"))
+    if unused:
+        raise SystemExit(f"ERROR {lora}: {len(unused)} adapter module(s) matched no decoder weight, e.g. {unused[:3]}")
+    norm = M.Qwen3_5RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+    norm.load_state_dict({"weight": ck.tensor(f"{ck.prefix}norm.weight")})
+    return [norm(a[0]) for a in acts]
+
+
+def lm_rows(weights_dir, ids):
+    """lm_head rows (fp32) for `ids`; the input embeddings when the checkpoint ties them."""
+    ck = Ckpt(weights_dir)
+    name = "lm_head.weight" if "lm_head.weight" in ck.idx else f"{ck.prefix}embed_tokens.weight"
+    return ck.rows(name, ids)
+
+
+def softmax(z):
+    z = np.asarray(z, dtype=np.float64)
+    e = np.exp(z - z.max())
+    return (e / e.sum()).tolist()
+
+
+@lru_cache(maxsize=2)
+def clef_tensor_head(clef_dir):
+    """Task 14's joint head over flat tensors, loaded once per clef dir."""
+    from decision.clef_head import TensorHead, load_joint_head
+    return TensorHead(load_joint_head(clef_dir)).eval()
+
+
+def n_options(q):
+    """How many probabilities the API reports for a question (option_keys)."""
+    return 2 if q["type"] == "noul" else len(q["criteria"])
+
+
+def single_part(rec, p):
+    if len(p["parts"]) != 1:
+        raise SystemExit(f"MISMATCH {rec['id']}: a pass with {len(p['parts'])} parts; this family answers one question per pass")
+    return p["parts"][0][0]
+
+
+def family_probs(family, rec, passes, hidden, tree, weights_dir, lora, lora_scale, clef_dir):
+    """{question id: probabilities in API option order} for one record's passes."""
+    prof = json.loads((Path(tree) / "decision.json").read_text())
+    out = {}
+    lo_ad = Lora(lora, lora_scale) if family == "jev" else None
+    for p, h in zip(passes, hidden, strict=True):
+        head = p["readout"]["head"]
+        if family == "jev":
+            j = prof["jev"]
+            qid = single_part(rec, p)
+            q = rec["questions"][qid]
+            kind = q["type"]
+            lo_slot = j["slots"][kind][0]
+            vids = head["token_ids"]
+            last = h[-1]
+            logits = lm_rows(weights_dir, vids) @ last
+            d = lo_ad.delta("lm_head")
+            if d is not None:
+                logits = logits + d[vids] @ last
+            z = [(float(l) + j["bias"][lo_slot + i]) / j["temperature"][kind] for i, l in enumerate(logits)]
+            pr = softmax(z)
+            out[qid] = rescale_score(pr, len(q["criteria"])) if kind == "score" else pr
+        elif family == "kev":
+            qid = single_part(rec, p)
+            dd = Path(tree) / "decision"
+            dp = json.loads((dd / "head.json").read_text())["dp"]
+            H = h.shape[1]
+
+            def ld(n, shape):
+                return torch.from_numpy(np.fromfile(dd / f"{n}.f32", dtype="<f4").reshape(shape))
+            qv = ld("pointer_q_w", (dp, H)) @ h[head["decide_pos"]] + ld("pointer_q_b", (dp,))
+            kv = h[head["option_pos"]] @ ld("pointer_k_w", (dp, H)).T + ld("pointer_k_b", (dp,))
+            z = (kv @ qv) / math.sqrt(dp) / prof["kev"]["temperature"]
+            out[qid] = softmax(z.tolist())
+        elif family == "clef":
+            th = clef_tensor_head(clef_dir)
+            T = h.shape[0]
+            spans = [q["span"] for q in head["questions"]] + [o["span"] for q in head["questions"] for o in q["options"]]
+            mask = torch.zeros(len(spans), T)
+            for r, (a, b) in enumerate(spans):
+                mask[r, a:b] = 1.0 / (b - a)
+            ids = p["readout"]["prompt_ids"]
+            lexical = torch.stack([lm_rows(weights_dir, ids[o["span"][0]:o["span"][1]]).mean(0)
+                                   for q in head["questions"] for o in q["options"]])
+            option_q = torch.tensor([qi for qi, q in enumerate(head["questions"]) for _ in q["options"]])
+            types = torch.tensor([q["qtype"] for q in head["questions"]])
+            with torch.no_grad():
+                logits = th(h, mask, lexical, option_q, types).tolist()
+            for (qid, a, b) in p["parts"]:
+                pr = softmax(logits[a:b])
+                q = rec["questions"][qid]
+                if q["type"] == "noul":  # head order [true, false] -> [false, true]
+                    pr = [pr[1], pr[0]]
+                elif q["type"] == "choice":  # head order = sorted keys -> request order
+                    order = sorted(q["criteria"])
+                    pr = [pr[order.index(k)] for k in q["criteria"]]
+                out[qid] = pr
+        else:
+            raise ValueError(f"unknown family {family!r}")
+    return out
+
+
+def build_ref(family, weights_dir, dump, recs, tree, lora=None, lora_scale=None, clef_dir=None, threads=4):
+    """{"<record>.<qid>": probs} over EVERY question of `recs`, in record/question order.
+    A dump out of step with `recs`, a question left unanswered, a duplicate or a wrong option
+    count fails: parity_check scores every reference entry, so partial output must never be written."""
+    aligned = list(align(dump, recs))
+    flat = [p for _, ps in aligned for p in ps]
+    hidden = stream_hidden(weights_dir, flat, lora, lora_scale, threads=threads)
+    ref, k = {}, 0
+    for rec, ps in aligned:
+        probs = family_probs(family, rec, ps, hidden[k:k + len(ps)], tree, weights_dir, lora, lora_scale, clef_dir)
+        k += len(ps)
+        if set(probs) != set(rec["questions"]):
+            raise SystemExit(f"MISMATCH {rec['id']}: reference answered {sorted(probs)}, record asks {sorted(rec['questions'])}")
+        for qid, q in rec["questions"].items():
+            pr = probs[qid]
+            if len(pr) != n_options(q):
+                raise SystemExit(f"MISMATCH {rec['id']}.{qid}: {len(pr)} probabilities for {n_options(q)} options")
+            ref[f"{rec['id']}.{qid}"] = pr
+    expected = sum(len(r["questions"]) for r in recs)
+    if len(ref) != expected:
+        raise SystemExit(f"MISMATCH {len(ref)} reference entries for {expected} questions")
+    return ref
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("family", choices=["jev", "kev", "clef"])
+    ap.add_argument("--weights", required=True, help="HF safetensors checkpoint (bf16/fp32)")
+    ap.add_argument("--dump", required=True, help="the server's --decision-dump from one parity_check run")
+    ap.add_argument("--tree", required=True, help="exported tree: decision.json (+ decision/ pointer weights for kev)")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--lora", default=None)
+    ap.add_argument("--lora-scale", type=float, default=None, help="override adapter_config.json")
+    ap.add_argument("--clef-dir", default=None, help="clef: dir with joint_head.safetensors + joint_head_config.json")
+    ap.add_argument("--threads", type=int, default=4)
+    a = ap.parse_args()
+    if a.family == "clef" and not a.clef_dir:
+        ap.error("clef needs --clef-dir")
+    scale = a.lora_scale
+    if a.lora and scale is None:
+        from weight_swap import lora_scale_from_config
+        scale = lora_scale_from_config(a.lora)
+    ref = build_ref(a.family, a.weights, a.dump, records(), a.tree, a.lora, scale, a.clef_dir, threads=a.threads)
+    Path(a.out).write_text(json.dumps(ref))
+    print(f"wrote {len(ref)} reference distributions to {a.out}")
+
+
+if __name__ == "__main__":
+    main()
