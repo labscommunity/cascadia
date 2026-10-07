@@ -6,6 +6,8 @@
 //! behaviour).
 
 pub mod chunk;
+pub mod decision;
+pub use decision::*;
 pub mod error;
 pub mod load;
 pub mod peer;

@@ -144,6 +144,13 @@ pub struct GenerationTask {
     /// also covers tasks constructed in-process).
     #[serde(default, deserialize_with = "de_resume_ids")]
     pub resume_token_ids: Option<Vec<i32>>,
+    /// Decision readout (docs/decisions.md). `Some` ⇒ the engine prefills
+    /// `decision.prompt_ids` verbatim and emits ONE final chunk carrying
+    /// `Chunk::decision_logits`; `prompt`, sampling and `max_tokens` are ignored.
+    /// Engines without decision support fail the task with a
+    /// `decision_unsupported:`-prefixed error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<crate::DecisionReadout>,
 }
 
 /// See `resume_token_ids`: `Some([])` on the wire normalizes to `None`.
@@ -220,6 +227,7 @@ impl GenerationTask {
             trust_remote_code: false,
             tenant: String::new(), // LOCAL_NS — see the field doc
             resume_token_ids: None,
+            decision: None,
         }
     }
 
@@ -266,6 +274,7 @@ mod tests {
             trust_remote_code: false,
             tenant: String::new(),
             resume_token_ids: None,
+            decision: None,
         };
         let json = serde_json::to_string(&t).unwrap();
         let back: GenerationTask = serde_json::from_str(&json).unwrap();

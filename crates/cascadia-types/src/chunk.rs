@@ -99,6 +99,10 @@ pub struct Chunk {
     /// not resume sources. `#[serde(default)]` keeps the wire additive.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub token_ids: Vec<i64>,
+    /// Raw per-option logits of a decision readout, on the FINAL chunk only
+    /// (length = `ReadoutHead::output_len`). `None` on every generation chunk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_logits: Option<Vec<f32>>,
 }
 
 impl Chunk {
@@ -115,6 +119,7 @@ impl Chunk {
             error: None,
             finish_reason: None,
             token_ids: Vec::new(),
+            decision_logits: None,
         }
     }
 
@@ -136,6 +141,7 @@ impl Chunk {
             completion_tokens: None,
             error: None,
             finish_reason: None,
+            decision_logits: None,
         }
     }
 
@@ -157,6 +163,7 @@ impl Chunk {
             error: None,
             finish_reason: None,
             token_ids: Vec::new(),
+            decision_logits: None,
         }
     }
 
@@ -176,6 +183,7 @@ impl Chunk {
             error: Some(reason.into()),
             finish_reason: None,
             token_ids: Vec::new(),
+            decision_logits: None,
         }
     }
 
@@ -210,6 +218,12 @@ impl Chunk {
     /// the "one token per chunk" fallback. See `Chunk::n_tokens` docs.
     pub fn with_n_tokens(mut self, n: u32) -> Self {
         self.n_tokens = Some(n);
+        self
+    }
+
+    /// Attach a decision readout's raw per-option logits (FINAL chunk only).
+    pub fn with_decision_logits(mut self, logits: Vec<f32>) -> Self {
+        self.decision_logits = Some(logits);
         self
     }
 
@@ -270,6 +284,7 @@ mod tests {
             error: None,
             finish_reason: None,
             token_ids: Vec::new(),
+            decision_logits: None,
         };
         let json = serde_json::to_string(&c).unwrap();
         let back: Chunk = serde_json::from_str(&json).unwrap();

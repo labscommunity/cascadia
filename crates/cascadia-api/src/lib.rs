@@ -2585,6 +2585,7 @@ async fn chat_completions(
         // model's context PAST the rendered prompt. Only the scheduler's
         // rescue path sets it, engine-side of this API.
         resume_token_ids: None,
+        decision: None,
     };
 
     // Acquire a request slot before touching the engine. Contended streams
@@ -2812,6 +2813,7 @@ async fn completions(
         tenant: String::new(),
         // Never client-settable; see the chat endpoint's note.
         resume_token_ids: None,
+        decision: None,
     };
 
     let permit = match state.permits.clone().try_acquire_owned() {
