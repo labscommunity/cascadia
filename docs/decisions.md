@@ -209,9 +209,9 @@ Both routes share these statuses.
 |---|---|
 | 200 | Every question answered. |
 | 400 | Validation: no questions or more than `max_questions`; an empty question name, or (OpenAI format) a duplicate question name or choice value; a choice with no options or more than the model allows; a score with fewer than 2 levels; images; a request the tokenizer cannot encode; Clef's option cap (see [Limits](#limits)). |
-| 413 | Too long: the state is more than `max_total_tokens × 8` bytes (checked before tokenizing); one pass is longer than `max_tokens`; the request's prefill work is more than `max_total_tokens`; or the engine reports the prompt too long. |
+| 413 | Too long: the state is more than `max_total_tokens × 8` bytes (checked before tokenizing); one pass is longer than `max_tokens` (JEV and Kev; Clef truncates the state instead); the request's prefill work is more than `max_total_tokens`; or the engine reports the prompt too long. |
 | 501 | The model serves no decisions: no `decision.json`, an engine other than `qwen35`, or the engine reports the model has no decision head. |
-| 503 | The engine is at capacity (retry after current requests finish), or any other engine error. |
+| 503 | The server is at capacity (`engine at capacity; retry after current requests complete`), or any other engine error. Decisions share the API's concurrency permits with chat requests. |
 
 Error messages are deliberately terse:
 
@@ -221,7 +221,8 @@ Error messages are deliberately terse:
   or Clef's `N options across all questions; the limit is 4096`) are returned as-is: they name a
   problem the caller can fix.
 - **Engine errors** return a fixed message per category (`decision engine error`, `engine at
-  capacity or unavailable`, `decision prompt too long`). The engine's text (paths, OpenVINO
+  capacity or unavailable`, `decision prompt too long`). A request that finds every concurrency
+  permit taken gets `engine at capacity; retry after current requests complete`. The engine's text (paths, OpenVINO
   messages) is logged at `warn` and never returned.
 
 ## Limits
@@ -231,11 +232,14 @@ Error messages are deliberately terse:
 | Questions per request | `max_questions` in `decision.json` | 32 |
 | Tokens in one pass | `max_tokens` in `decision.json` | required field |
 | Prefill tokens per request | `max_total_tokens` in `decision.json` | 4 × `max_tokens` |
-| Options per choice | per model family | JEV: 16 (its trained choice slots); Kev and Clef: 256 |
+| Options per choice | per model family | JEV: 16 for the shipped JEV profiles (the profile's choice slot count); Kev and Clef: 256 |
 | Options per request (Clef) | engine readout cap | 4096 across all questions, because Clef answers them in one pass |
 | Levels per score | per model family | 2 to 256 |
 | Request body | `--api-max-body-mb` | 1 MiB |
 
+- **Clef truncates the state to fit `max_tokens`** (as Cloudflare's `encode_record` does), so a
+  long state never makes a Clef pass too long; JEV and Kev return 413 when a pass exceeds
+  `max_tokens`. The request-level `max_total_tokens` byte pre-check still applies to every family.
 - **JEV and Kev run one prefill pass per question**, so `max_questions` bounds the engine work of
   one request. Clef runs one pass for the whole request.
 - **Prefill work** is the sum of all passes' prompt lengths. Kev repeats the state at the start of
@@ -245,11 +249,12 @@ Error messages are deliberately terse:
   about 64K plus five short branches. In pipeline mode (`--total` > 1) or with
   `--prefix-cache-gb 0`, every pass counts in full, because the engine re-prefills the state per
   question.
-- **Raise `--api-max-body-mb` for long states.** The default 1 MiB body cap holds roughly 250K
+- **Raise `--api-max-body-mb` for long states.** The default 1 MiB body cap (it applies to every API route) holds roughly 250K
   tokens of English, but JSON escaping and a long Kev state with many questions can exceed it.
   The flag applies to every route, chat included.
-- **One request at a time per engine slot.** A request that arrives while the engine is busy gets
-  503 at once rather than queueing.
+- **Shared concurrency permits.** Decision requests take the same concurrency permits as chat
+  requests. A request that finds none free gets 503 (`engine at capacity; retry after current
+  requests complete`) at once rather than queueing.
 
 ## Confidence
 
@@ -289,8 +294,9 @@ Each model family has a codec that reproduces its reference implementation's pro
 key order, separators, and Python `str()` / `json.dumps` formatting.
 
 - **Numbers.** Floats in request JSON are parsed exactly and rendered like Python's `repr`
-  (`1e-05`, `1.0`, `0.1`), as the reference servers would print them. Integers larger than
-  u64 are the one known gap: they are rendered as floats, where Python would keep every digit.
+  (`1e-05`, `1.0`, `0.1`), as the reference servers would print them. Integers outside the
+  i64/u64 range are the one known gap: they are rendered as floats, where Python would keep every
+  digit.
 - **Caller text is sanitized.** Hugging Face tokenizers match special tokens inside plain text, so
   a state or option text containing `<|im_end|>` could otherwise forge the prompt's structure and
   steer the decision. The server rewrites every `<|name|>` sequence, and every other angle-bracket
@@ -319,6 +325,8 @@ encoders.
 - The file is opened once at startup in append mode with permissions 0600. An existing file is
   tightened to 0600, and a symlink at the path is refused. A failure to open it stops startup.
 - It is a startup flag only; there is no environment variable for it.
+- It takes effect only when a decision model is loaded. Otherwise the server logs that
+  `--decision-dump` is ignored and opens no file.
 
 ## Limitations
 
@@ -327,7 +335,8 @@ encoders.
   capacity get 503.
 - **int8 weights only.** Decision trees are built from Intel's int8 OpenVINO exports. int4 measured
   87.8–96.3% top-1 agreement with full precision, against 98.8–100% for int8, and is not supported.
-- **JEV choice questions take at most 16 options**, the choice slots it was trained with.
+- **JEV choice questions take at most 16 options** for the shipped JEV profiles (the profile's
+  choice slot count).
 - **`--engine qwen35` only.** Other engines cannot run decision passes.
 
 ## Models
