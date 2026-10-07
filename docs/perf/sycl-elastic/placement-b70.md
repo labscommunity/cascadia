@@ -13,6 +13,13 @@ method that section C's summed column lacks. Note the MoE arm differs:
 sections A-C measured Qwen3.6-35B-A3B (40 layers), section D measured
 Qwen1.5-MoE-14.3B-A2.7B Q3_K_M (24 layers) - the two are not comparable.
 
+Updated 2026-10-08 with section E: file reads moved off the dispatch
+thread onto a bounded reader pool (+7-9% fully streamed; the strace's
+serial-`pread` bottleneck is confirmed but H2D copy bandwidth is the new
+limit), and `--elastic-share N` gives co-tenants a deterministic resident
+cap. Section E has the sweep, the MoE small-slice regression, and the
+three-tenant run.
+
 ## Findings
 
 Measured on one Arc Pro B70 (SYCL0) on a host whose GPU links run at **PCIe 4.0 x8 (~15.75 GB/s)**. Sections A-C report medians of 3 outer runs (9 timed requests per arm); section D reports medians of 6.
@@ -27,6 +34,7 @@ Measured on one Arc Pro B70 (SYCL0) on a host whose GPU links run at **PCIe 4.0 
 4. **Pinned host memory read in place (patch 0003) wins mid-range** *(measured on the sync build; async streaming may shift the crossover)*. It is +18% at N=55 and +33% at N=34/33, with fused ops and graphs still on. The cascadia path (`--llama-host-layers`) works: 6.25 t/s, output identical to resident.
 5. **Co-tenancy is stable.** In every section-C arm, three 27B instances loaded and generated together with no load failures and no xe resets. `auto` reached 9.4 t/s summed per-instance (see the sum caveat in section C).
 6. **UPDATE (section D): the async stream pool lifted every streaming arm.** 0/65 +33% (0.448→0.595 t/s), 62/65 +129% (7.53→17.21, resident speed via slot pinning), MoE +36%, and two co-tenant streamed instances +42% aggregate (0.90→1.28 t/s, common-window method).
+7. **UPDATE (section E): the reader pool buys a further +7-9% fully streamed** (0.734→0.800 t/s at rt2) and `--elastic-share N` makes `auto` co-tenant-safe: three 27B cascadia instances each declared N=3, all loaded and served, burst aggregate 0.99 t/s, clean teardown.
 
 ### What doesn't (deficiencies)
 1. **Full streaming uses only about half the link** *(superseded by section D)*. At N=0 the sync build reached ~6.3-7.7 GB/s; the async build moved ~8.3 GB/s (+33%) and is likely read-bound on single-threaded `pread` (hypothesis, not traced). Host-in-place still ~6.3 GB/s.
@@ -48,8 +56,8 @@ Measured on one Arc Pro B70 (SYCL0) on a host whose GPU links run at **PCIe 4.0 
 - Keep streaming + `auto` as `--elastic` on discrete cards.
 - Next work, in order:
   1. ~~Async prefetch, for the N=0 gap~~ - done, see section D (+33% at N=0; the residual gap is serial `pread`, not DMA).
-  2. Parallel/file-reader offload (io_uring or reader threads) for the remaining N=0 gap.
-  3. A fairer `auto` split, and promote/demote after load.
+  2. ~~Parallel/file-reader offload~~ - done, see section E (+7-9%; the H2D copy path, not reads, is the residual limit).
+  3. ~~A fairer `auto` split~~ - `--elastic-share N` covers the load-time cap (section E); promote/demote after load and wider/fused H2D copies remain.
   4. Retest host placement on a Gen5 x16 host.
 - Document driver oversubscription as the throughput-first alternative when residency guarantees don't matter.
 
@@ -317,3 +325,95 @@ hits at `EXPERT_CACHE_MB=0`, 99.6 GiB of expert slices delivered. A
 nonzero expert cache is the follow-up that should turn misses into hits.
 
 ![section D async pool](fig14_async_b70.png)
+
+## Section E - reader pool and co-tenant shares (update of 2026-10-08, cascadia#171 v2)
+
+Section D left the file read on the graph thread: the copy queue overlaps
+H2D with compute, but each `pread` still blocks the dispatch thread
+between submissions. A follow-up strace put `pread64` at 57.4 s of a
+59 s decode window (~100% of wall, all page-cache hits). The v2 patches
+move reads onto a bounded per-device thread pool
+(`GGML_STREAM_READ_THREADS`, default 4): a reader fills a pinned staging
+slot, a SYCL host task on the in-order copy queue waits for the fill,
+then the H2D memcpy is submitted. `READ_THREADS=0` restores the inline
+serial path. MoE expert slices go through the same pool.
+
+Method: same host, raw `llama-server` on SYCL0, ctx 4096,
+`-ctk q8_0 -fa on`, temp 0, `n_predict 32`, model on NVMe (page-cached
+after first read). Numbers are single runs, not medians - treat the rt
+sweep deltas as ~±0.02 t/s.
+
+### Reader-pool sweep, 27B fully streamed (13.1 GiB/token)
+
+| GGML_STREAM_READ_THREADS | decode t/s | vs rt0 |
+|---|---|---|
+| 0 (serial pread) | 0.734 | - |
+| 1 | 0.753 | +3% |
+| 2 | **0.800** | **+9%** |
+| 4 | 0.781 | +6% |
+| 8 | 0.785 | +7% |
+
+![reader pool sweep](fig15_readerpool_b70.png)
+
+Honest reading: +7-9%, not the ~30-40% the strace arithmetic suggested.
+Reads were already page-cache hits at ~9.7 GB/s logical; moving them off
+the dispatch thread helps, but the copy queue's own H2D rate - not
+dispatch blocking - is now the residual limit. More readers do not help
+past 2: a single stream of queued memcpys saturates the x8 link whatever
+thread count fills it. The pool is still worth keeping (it removes the
+dispatch stall and shrinks worst-case latency), but the next lever on
+this path is the copy itself - wider staging chunks or fused multi-tensor
+copies - not more reader threads.
+
+MoE caveat (35B-A3B fully streamed, single runs):
+
+| arm | decode t/s |
+|---|---|
+| rt0, cache 0 | 3.85 |
+| rt4, cache 0 | 3.29 (-15%) |
+| rt4, cache 1024 MiB | 3.95 (+3% vs rt0) |
+
+Expert slices are small (0.56 MiB stride): the per-copy host-task gate
+adds overhead the serial path did not pay, so the pool alone costs ~15%
+on this model. The hot-expert cache more than recovers it - routed misses
+drop enough that rt4+cache beats the serial baseline. On dense models
+(tensor-sized fills) the pool is a straight win; on MoE, pair it with
+`CASCADIA_EXPERT_CACHE_MB`.
+
+### Co-tenant shares (`--elastic-share` / `GGML_STREAM_VRAM_SHARE`)
+
+`--elastic-vram auto` used to size itself from *free* memory at load, so
+the first instance of N grabbed the whole card. `--elastic-share N` caps
+the automatic budget at `min(free - overhead, (total - overhead) / N)`;
+cascadia forwards it as `GGML_STREAM_VRAM_SHARE` only when elastic is on
+and the budget is `auto`. Parsing is strict (rejects `abc`, `0`, signs,
+trailing text, overflow) and precedence is explicit: `VRAM_MB` >
+`RESIDENT_LAYERS` > share. Verified on card:
+
+| arm | result |
+|---|---|
+| `auto` + `SHARE=3` | budget 8919 MiB = floor(26756/3); 46/65 layers resident |
+| `VRAM_MB=8192` + `SHARE=3` | warning printed, explicit budget kept |
+| `RESIDENT_LAYERS=30` + `SHARE=3` | warning printed, layer override kept |
+| `auto` + `SHARE=4294967295` | budget 0 MiB, fully streamed |
+
+![share cap](fig16_sharecap_b70.png)
+
+Three cascadia instances of `--engine sycl-llama --elastic
+--elastic-vram auto --elastic-share 3`, one 27B each, sequential loads:
+
+| tenant | env share | VRAM after its load | solo decode | concurrent burst |
+|---|---|---|---|---|
+| 1 | 3 | 14.1 GiB | 1.10 t/s | 0.36 t/s |
+| 2 | 3 | 26.4 GiB | 1.11 t/s | 0.36 t/s |
+| 3 | 3 | 32.4 GiB | 0.48 t/s | 0.27 t/s |
+
+All three served correct output; aggregate burst 0.99 t/s, zero GPU
+resets, and SIGKILLing cascadia reaped the children (VRAM returned to
+1.7 GiB idle). The cap made tenant 1 and 2 equal - the residual
+asymmetry is the `free` term: tenant 3 loaded when the card was already
+~26 GiB full, so `min(free-overhead, cap)` gave it less than the nominal
+1/3. That is the honest limit of a load-time cap: it bounds how much a
+new instance may take, it cannot hand memory back to late arrivals. Fair
+rebalancing still needs a runtime mechanism (promote/demote or driver
+vmem), listed in the roadmap.
