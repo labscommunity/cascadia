@@ -466,6 +466,30 @@ def test_jev_slot_range_out_of_bounds_raises(tmp_path):
         de.write_jev_profile(str(adapter), str(cal), str(tmp_path / "tree"))
 
 
+@pytest.mark.parametrize("kind,rng,match", [
+    ("noul", (0, 3), "noul .* must be 2 wide"),
+    ("score", (2, 7), "score .* must be 6 wide"),
+    ("choice", (9, 8), "choice"),
+])
+def test_jev_slot_widths_mirror_the_server(tmp_path, kind, rng, match):
+    # JevCodec::new refuses these at load; the exporter must not write a profile the server rejects
+    adapter, cal = _jev_adapter(tmp_path)
+    h = json.loads((adapter / "decision_head.json").read_text())
+    h["slots"]["ranges"][kind] = list(rng)
+    (adapter / "decision_head.json").write_text(json.dumps(h))
+    with pytest.raises(ValueError, match=match):
+        de.write_jev_profile(str(adapter), str(cal), str(tmp_path / "tree"))
+
+
+def test_jev_missing_slot_range_raises(tmp_path):
+    adapter, cal = _jev_adapter(tmp_path)
+    h = json.loads((adapter / "decision_head.json").read_text())
+    del h["slots"]["ranges"]["score"]
+    (adapter / "decision_head.json").write_text(json.dumps(h))
+    with pytest.raises(ValueError, match="score"):
+        de.write_jev_profile(str(adapter), str(cal), str(tmp_path / "tree"))
+
+
 def test_kev_hidden_mismatch_raises(tmp_path):
     torch = pytest.importorskip("torch")
     pt = tmp_path / "head.pt"
