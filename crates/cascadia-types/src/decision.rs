@@ -153,7 +153,7 @@ impl DecisionReadout {
     /// the first position the head reads (Verbalizer: the last token's logits; Joint: every row).
     pub fn warm_limit(&self) -> usize {
         match &self.head {
-            ReadoutHead::Verbalizer { .. } => self.prompt_ids.len() - 1,
+            ReadoutHead::Verbalizer { .. } => self.prompt_ids.len().saturating_sub(1),
             ReadoutHead::Pointer {
                 decide_pos,
                 option_pos,
@@ -417,6 +417,57 @@ mod tests {
             }],
         };
         assert_eq!(readout(10, j).warm_limit(), 0);
+    }
+
+    #[test]
+    fn warm_limit_does_not_underflow_on_an_empty_prompt() {
+        // Callers validate first today; warm_limit must not panic if one ever does not.
+        assert_eq!(
+            readout(0, ReadoutHead::Verbalizer { token_ids: vec![1] }).warm_limit(),
+            0
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_option_lists_for_every_head() {
+        // Empty options would softmax over nothing (NaN); a peer must not be able to send them.
+        assert!(
+            readout(10, ReadoutHead::Verbalizer { token_ids: vec![] })
+                .validate(100, 64)
+                .is_err(),
+            "verbalizer with no ids"
+        );
+        assert!(
+            readout(
+                10,
+                ReadoutHead::Pointer {
+                    decide_pos: 9,
+                    option_pos: vec![]
+                }
+            )
+            .validate(100, 64)
+            .is_err(),
+            "pointer with no options"
+        );
+        // A joint readout whose total is non-zero but one question has no options.
+        let joint = ReadoutHead::Joint {
+            questions: vec![
+                JointQuestion {
+                    qtype: 1,
+                    span: [1, 2],
+                    options: vec![JointOption { span: [2, 3] }],
+                },
+                JointQuestion {
+                    qtype: 1,
+                    span: [4, 5],
+                    options: vec![],
+                },
+            ],
+        };
+        assert_eq!(
+            readout(10, joint).validate(100, 64).unwrap_err(),
+            "joint question 1: bad qtype or no options"
+        );
     }
 
     #[test]
