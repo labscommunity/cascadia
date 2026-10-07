@@ -402,7 +402,7 @@ def build_feeds(model, hidden_size: int, hidden=None, embeds=None):
 
 
 def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=None,
-               weights=None, lora=None, lora_scale=None, final_hidden=False):
+               weights=None, lora=None, lora_scale=None, final_hidden=False, tokenizer=None):
     """Cut the official int4 OV IR in `model_dir` into `num_stages` stage
     dirs under `output_dir` + manifest + aux files. Entry point for
     `cascadia shard` dispatch (export_shards.py) and for main() below.
@@ -418,6 +418,10 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
         target count.
       * `final_hidden`: the last stage also outputs the final-norm hidden
         (output 1, `final_hidden`); recorded as manifest `final_hidden_output`.
+      * `tokenizer`: a tokenizer.json that replaces the one the tree would
+        otherwise ship (the `weights` checkpoint's, else the stock IR's), for a
+        head whose prompts were built with a different tokenizer (Kev: its own
+        tokenizer.json, not the Base checkpoint's). Copied before the manifest.
 
     manifest.json is written last, as the commit marker: a stale one from an
     earlier run in `output_dir` is removed first, so a failed export (LoRA
@@ -432,6 +436,8 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
             "judge a --weights/--lora export; drop --validate (decision trees are "
             "checked by the golden/parity gates instead)"
         )
+    if tokenizer is not None and not os.path.isfile(tokenizer):
+        raise SystemExit(f"tokenizer override {tokenizer} not found")
     import openvino as ov
 
     xml = os.path.join(model_dir, "openvino_language_model.xml")
@@ -536,6 +542,9 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
             src = os.path.join(model_dir, aux)
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(output_dir, aux))
+    if tokenizer is not None:
+        shutil.copy2(tokenizer, os.path.join(output_dir, "tokenizer.json"))
+        print(f"tokenizer.json from {tokenizer}", flush=True)
     if weights:
         from weight_swap import Weights, swap_embeddings
         swap_embeddings(os.path.join(model_dir, "openvino_text_embeddings_model.xml"),

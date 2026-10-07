@@ -376,14 +376,17 @@ def test_cli_jev_lora_from_adapter_dir_and_no_validate(cli, monkeypatch):
 def test_cli_kev_final_hidden_weights_lora(cli, monkeypatch):
     run, calls, base, tmp = cli
     seen = {}
+    monkeypatch.setattr(de, "kev_head_meta", lambda pt: {"base": None, "weights": None})
     monkeypatch.setattr(de, "write_kev_profile",
                         lambda pt, out, hidden: seen.update(pt=pt, hidden=hidden) or de._write(out, {"family": "kev"}, {"kind": "pointer"}))
+    pt = str(_kev_dir(tmp) / "H.pt")
     run("kev", "--base-ir", str(base), "--weights", "W", "--lora", "L.safetensors", "--lora-scale", "2",
-        "--head-pt", "H.pt", "--stages", "2", "--out", str(tmp / "t"))
+        "--head-pt", pt, "--stages", "2", "--out", str(tmp / "t"))
     (_, a, kw, assets_first), = calls
     assert a == (str(base), str(tmp / "t"), 2, False, None)
-    assert kw == {"weights": "W", "lora": "L.safetensors", "lora_scale": 2.0, "final_hidden": True}
-    assert assets_first and seen == {"pt": "H.pt", "hidden": 8}
+    assert kw == {"weights": "W", "lora": "L.safetensors", "lora_scale": 2.0, "final_hidden": True,
+                  "tokenizer": str(tmp / "kev" / "tokenizer.json")}
+    assert assets_first and seen == {"pt": pt, "hidden": 8}
 
 
 def test_cli_clef_weights_default_to_clef_dir(cli, monkeypatch):
@@ -442,9 +445,11 @@ def test_cli_stale_manifest_removed_when_asset_writer_fails(cli, monkeypatch):
 
     def boom(*a, **kw):
         raise ValueError("bad head.pt")
+    monkeypatch.setattr(de, "kev_head_meta", lambda pt: {"base": None, "weights": None})
     monkeypatch.setattr(de, "write_kev_profile", boom)
     with pytest.raises(ValueError):
-        run("kev", "--base-ir", str(base), "--head-pt", "H.pt", "--out", str(out))
+        run("kev", "--base-ir", str(base), "--weights", "W", "--lora", "L.safetensors",
+            "--head-pt", str(_kev_dir(tmp) / "H.pt"), "--out", str(out))
     assert not (out / "manifest.json").exists() and calls == []
 
 
@@ -510,3 +515,129 @@ def test_cli_jev_max_tokens_from_weights_config(cli, monkeypatch):
     (w / "config.json").write_text(json.dumps({"text_config": {"max_position_embeddings": 4096}}))
     run("jev", "--base-ir", str(base), "--weights", str(w), "--adapter-dir", str(tmp / "a"), "--out", str(tmp / "t"))
     assert seen == {"mt": 4096}  # the fine-tune's config (shipped in the tree), not the base IR's 262144
+
+
+# Scoped-review fixes: Kev ships Kev's own tokenizer, and a kev export needs its backbone + adapter.
+
+def test_tokenizer_override_replaces_the_weights_tokenizer_before_the_manifest(stubbed, tmp_path):
+    model, out, calls, _, monkeypatch = stubbed
+    wdir = tmp_path / "ft"
+    wdir.mkdir()
+    (wdir / "tokenizer.json").write_text("base tokenizer")
+    (wdir / "config.json").write_text((model / "config.json").read_text())
+    kev_tok = tmp_path / "kev" / "tokenizer.json"
+    kev_tok.parent.mkdir()
+    kev_tok.write_text("kev tokenizer")
+    import shutil
+    real_copy = shutil.copy2
+    seen = []
+
+    def copy2(src, dst):
+        if os.path.basename(dst) == "tokenizer.json":
+            seen.append((str(src), (out / "manifest.json").exists()))
+        return real_copy(src, dst)
+    monkeypatch.setattr(shutil, "copy2", copy2)
+    ex.run_export(str(model), str(out), 2, weights=str(wdir), tokenizer=str(kev_tok))
+    assert (out / "tokenizer.json").read_text() == "kev tokenizer"
+    assert seen[-1] == (str(kev_tok), False)  # the override lands before the manifest (commit marker)
+    assert (out / "manifest.json").exists()
+
+
+def test_missing_tokenizer_override_refused_before_any_work(stubbed, tmp_path):
+    model, out, calls, _, _ = stubbed
+    with pytest.raises(SystemExit, match="tokenizer"):
+        ex.run_export(str(model), str(out), 2, tokenizer=str(tmp_path / "nope" / "tokenizer.json"))
+    assert calls == [] and not (out / "manifest.json").exists()
+
+
+def _kev_dir(tmp, tokenizer=True):
+    d = tmp / "kev"
+    d.mkdir(exist_ok=True)
+    if tokenizer:
+        (d / "tokenizer.json").write_text("kev tokenizer")
+    return d
+
+
+def _stub_kev(monkeypatch, meta=None):
+    monkeypatch.setattr(de, "kev_head_meta", lambda pt: meta or {"base": "Qwen/Qwen3.5-9B-Base", "weights": "lora"})
+    monkeypatch.setattr(de, "write_kev_profile",
+                        lambda pt, out, hidden: de._write(out, {"family": "kev"}, {"kind": "pointer"}))
+
+
+def test_cli_kev_ships_the_tokenizer_beside_head_pt(cli, monkeypatch):
+    run, calls, base, tmp = cli
+    _stub_kev(monkeypatch)
+    kd = _kev_dir(tmp)
+    run("kev", "--base-ir", str(base), "--weights", "W", "--lora", "L.safetensors",
+        "--head-pt", str(kd / "head.pt"), "--out", str(tmp / "t"))
+    (_, a, kw, _), = calls
+    assert kw["tokenizer"] == str(kd / "tokenizer.json")
+
+
+def test_cli_tokenizer_flag_overrides(cli, monkeypatch):
+    run, calls, base, tmp = cli
+    _stub_kev(monkeypatch)
+    kd = _kev_dir(tmp, tokenizer=False)
+    other = tmp / "other.json"
+    other.write_text("t")
+    run("kev", "--base-ir", str(base), "--weights", "W", "--lora", "L.safetensors",
+        "--head-pt", str(kd / "head.pt"), "--tokenizer", str(other), "--out", str(tmp / "t"))
+    (_, a, kw, _), = calls
+    assert kw["tokenizer"] == str(other)
+
+
+def test_cli_kev_without_its_tokenizer_refused_before_any_write(cli, monkeypatch, capsys):
+    run, calls, base, tmp = cli
+    _stub_kev(monkeypatch)
+    kd = _kev_dir(tmp, tokenizer=False)
+    with pytest.raises(SystemExit):
+        run("kev", "--base-ir", str(base), "--weights", "W", "--lora", "L.safetensors",
+            "--head-pt", str(kd / "head.pt"), "--out", str(tmp / "t"))
+    assert "tokenizer.json" in capsys.readouterr().err
+    assert calls == [] and not (tmp / "t").exists()
+
+
+@pytest.mark.parametrize("drop", ["--weights", "--lora"])
+def test_cli_kev_needs_weights_and_lora(cli, monkeypatch, capsys, drop):
+    run, calls, base, tmp = cli
+    _stub_kev(monkeypatch)
+    kd = _kev_dir(tmp)
+    argv = {"--weights": "W", "--lora": "L.safetensors"}
+    del argv[drop]
+    with pytest.raises(SystemExit):
+        run("kev", "--base-ir", str(base), *[x for kv in argv.items() for x in kv],
+            "--head-pt", str(kd / "head.pt"), "--out", str(tmp / "t"))
+    err = capsys.readouterr().err
+    assert drop in err and "Qwen/Qwen3.5-9B-Base" in err
+    assert calls == [] and not (tmp / "t").exists()
+
+
+def test_cli_kev_head_pt_recording_full_weights_refused(cli, monkeypatch, capsys):
+    run, calls, base, tmp = cli
+    _stub_kev(monkeypatch, meta={"base": "B", "weights": "full"})
+    kd = _kev_dir(tmp)
+    with pytest.raises(SystemExit):
+        run("kev", "--base-ir", str(base), "--weights", "W", "--lora", "L.safetensors",
+            "--head-pt", str(kd / "head.pt"), "--out", str(tmp / "t"))
+    assert "'full'" in capsys.readouterr().err and calls == []
+
+
+def test_kev_head_meta_reads_base_and_weights_mode(tmp_path):
+    torch = pytest.importorskip("torch")
+    pt = tmp_path / "head.pt"
+    torch.save({"head": {}, "temperature": 1.0, "base": "Qwen/Qwen3.5-9B-Base", "weights": "lora"}, pt)
+    assert de.kev_head_meta(str(pt)) == {"base": "Qwen/Qwen3.5-9B-Base", "weights": "lora"}
+    torch.save({"head": {}, "temperature": 1.0}, pt)
+    assert de.kev_head_meta(str(pt)) == {"base": None, "weights": None}
+    torch.save({"head": {}, "temperature": 1.0, "x": _Pickled()}, pt)
+    with pytest.raises(Exception, match="(?i)weights_only|unsupported|global"):
+        de.kev_head_meta(str(pt))
+
+
+def test_cli_jev_and_clef_pass_no_tokenizer_by_default(cli, monkeypatch):
+    run, calls, base, tmp = cli
+    monkeypatch.setattr(de, "write_clef_profile",
+                        lambda cd, out: de._write(out, {"family": "clef"}, {"kind": "joint"}))
+    run("clef", "--base-ir", str(base), "--clef-dir", "C", "--out", str(tmp / "t"))
+    (_, a, kw, _), = calls
+    assert "tokenizer" not in kw
