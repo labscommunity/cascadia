@@ -307,3 +307,25 @@ def test_explicit_lora_scale_still_runs_adapter_refusals(tmp_path):
         (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16, "lora_alpha": 32, **bad}))
         with pytest.raises(ValueError):
             rs.resolve_lora_scale(str(ad), 0.5)
+
+
+def test_kev_reference_needs_lora(tmp_path, monkeypatch, capsys):
+    # Without --lora the kev reference is the stock backbone under Kev's head, and parity against a
+    # tree exported the same way would pass: refuse before any work.
+    ran = []
+    monkeypatch.setattr(rs, "build_ref", lambda *a, **kw: ran.append(a) or {})
+    monkeypatch.setattr(sys, "argv", ["reference_stream.py", "kev", "--weights", str(tmp_path), "--dump", "d",
+                                      "--tree", "t", "--out", str(tmp_path / "ref.json")])
+    with pytest.raises(SystemExit):
+        rs.main()
+    assert "--lora" in capsys.readouterr().err and ran == []
+    assert not (tmp_path / "ref.json").exists()
+
+
+def test_kev_reference_needs_weights(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(rs, "build_ref", lambda *a, **kw: {})
+    monkeypatch.setattr(sys, "argv", ["reference_stream.py", "kev", "--lora", "L", "--dump", "d",
+                                      "--tree", "t", "--out", str(tmp_path / "ref.json")])
+    with pytest.raises(SystemExit):
+        rs.main()
+    assert "--weights" in capsys.readouterr().err
