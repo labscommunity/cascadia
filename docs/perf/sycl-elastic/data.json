@@ -6,24 +6,24 @@
    "model": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
    "elastic": false,
    "load_s": [
-    6.519,
-    0.004
+    5.177,
+    0.952
    ],
    "peak_vram_gib": [
-    1.463,
-    0.0
+    3.353,
+    0.003
    ],
    "vram_after_load_gib": [
-    1.378,
-    0.0
+    3.268,
+    0.001
    ],
    "decode_tps": [
-    224.573,
-    0.361
+    206.073,
+    3.767
    ],
    "prefill_tps": [
-    27.697,
-    0.156
+    27.824,
+    0.837
    ],
    "all_exit_clean": true,
    "vram_back_to_baseline": true
@@ -33,24 +33,24 @@
    "model": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
    "elastic": true,
    "load_s": [
-    6.516,
+    4.504,
     0.0
    ],
    "peak_vram_gib": [
-    0.79,
-    0.0
+    3.352,
+    0.005
    ],
    "vram_after_load_gib": [
-    0.688,
-    0.0
+    3.269,
+    0.005
    ],
    "decode_tps": [
-    8.867,
-    0.043
+    206.151,
+    2.371
    ],
    "prefill_tps": [
-    51.967,
-    0.441
+    29.021,
+    0.564
    ],
    "all_exit_clean": true,
    "vram_back_to_baseline": true
@@ -60,24 +60,24 @@
    "model": "Qwen3.8-27B-UD-Q4_K_S.gguf",
    "elastic": false,
    "load_s": [
-    20.524,
-    0.003
+    18.013,
+    0.0
    ],
    "peak_vram_gib": [
-    15.907,
-    0.0
+    17.796,
+    0.001
    ],
    "vram_after_load_gib": [
-    14.681,
-    0.0
+    16.57,
+    0.001
    ],
    "decode_tps": [
-    19.35,
-    0.021
+    17.846,
+    0.016
    ],
    "prefill_tps": [
-    16.52,
-    0.041
+    16.515,
+    0.358
    ],
    "all_exit_clean": true,
    "vram_back_to_baseline": true
@@ -87,24 +87,24 @@
    "model": "Qwen3.8-27B-UD-Q4_K_S.gguf",
    "elastic": true,
    "load_s": [
-    16.521,
-    0.001
+    18.515,
+    0.003
    ],
    "peak_vram_gib": [
-    3.223,
-    0.0
-   ],
-   "vram_after_load_gib": [
-    2.543,
-    0.0
-   ],
-   "decode_tps": [
-    0.594,
+    17.793,
     0.002
    ],
+   "vram_after_load_gib": [
+    16.566,
+    0.002
+   ],
+   "decode_tps": [
+    17.825,
+    0.02
+   ],
    "prefill_tps": [
-    5.216,
-    0.013
+    16.772,
+    0.081
    ],
    "all_exit_clean": true,
    "vram_back_to_baseline": true
@@ -114,51 +114,51 @@
    "model": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
    "elastic": false,
    "load_s": [
-    28.531,
-    0.0
+    26.686,
+    0.944
    ],
    "peak_vram_gib": [
-    21.685,
-    0.0
+    23.57,
+    0.002
    ],
    "vram_after_load_gib": [
-    21.019,
-    0.0
+    22.906,
+    0.002
    ],
    "decode_tps": [
-    34.212,
-    0.015
+    30.287,
+    0.675
    ],
    "prefill_tps": [
-    26.547,
-    0.193
+    24.892,
+    4.951
    ],
    "all_exit_clean": true,
    "vram_back_to_baseline": true
   },
   "35B_a3b_elastic": {
-   "n": 4,
+   "n": 3,
    "model": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
    "elastic": true,
    "load_s": [
-    13.5,
+    26.519,
     0.0
    ],
    "peak_vram_gib": [
-    1.89,
-    0.0
+    23.573,
+    0.002
    ],
    "vram_after_load_gib": [
-    1.89,
-    0.0
+    22.91,
+    0.002
    ],
    "decode_tps": [
-    2.612,
-    0.013
+    30.707,
+    0.05
    ],
    "prefill_tps": [
-    3.39,
-    0.03
+    27.512,
+    0.54
    ],
    "all_exit_clean": true,
    "vram_back_to_baseline": true
@@ -170,24 +170,24 @@
    "model": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
    "elastic": false,
    "load_s": [
-    3.007,
+    3.003,
     0.005
    ],
    "peak_vram_gib": [
-    1.37,
-    0.0
+    1.437,
+    0.081
    ],
    "vram_after_load_gib": null,
    "decode_tps": [
-    218.417,
-    3.783
+    204.599,
+    2.856
    ],
    "prefill_tps": [
-    9.654,
-    0.568
+    9.868,
+    0.12
    ],
    "all_exit_clean": null,
-   "vram_back_to_baseline": true
+   "vram_back_to_baseline": false
   },
   "1_5B_elastic": {
    "n": 3,
@@ -198,116 +198,113 @@
     0.0
    ],
    "peak_vram_gib": [
-    0.69,
-    0.0
+    1.487,
+    0.617
    ],
    "vram_after_load_gib": null,
    "decode_tps": [
-    8.518,
-    0.111
+    14.768,
+    0.266
    ],
    "prefill_tps": [
-    8.074,
-    0.2
+    8.56,
+    0.058
    ],
    "all_exit_clean": null,
-   "vram_back_to_baseline": true
+   "vram_back_to_baseline": false
   },
   "27B_stock": {
    "n": 3,
    "model": "Qwen3.8-27B-UD-Q4_K_S.gguf",
    "elastic": false,
    "load_s": [
-    18.36,
-    0.474
+    29.06,
+    15.212
    ],
    "peak_vram_gib": [
-    15.87,
-    0.0
+    15.997,
+    0.172
    ],
    "vram_after_load_gib": null,
    "decode_tps": [
-    19.289,
-    0.043
+    16.337,
+    1.585
    ],
    "prefill_tps": [
-    6.982,
-    0.083
+    4.44,
+    3.019
    ],
    "all_exit_clean": null,
-   "vram_back_to_baseline": true
+   "vram_back_to_baseline": false
   },
   "27B_elastic": {
    "n": 3,
    "model": "Qwen3.8-27B-UD-Q4_K_S.gguf",
    "elastic": true,
    "load_s": [
-    14.853,
-    0.471
+    14.213,
+    0.252
    ],
    "peak_vram_gib": [
-    2.78,
-    0.0
+    3.38,
+    0.354
    ],
    "vram_after_load_gib": null,
    "decode_tps": [
-    0.545,
-    0.01
+    0.645,
+    0.012
    ],
    "prefill_tps": [
-    1.169,
-    0.029
+    1.334,
+    0.014
    ],
    "all_exit_clean": null,
-   "vram_back_to_baseline": true
+   "vram_back_to_baseline": false
   },
   "35B_a3b_stock": {
    "n": 3,
    "model": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
    "elastic": false,
    "load_s": [
-    27.54,
-    1.414
+    25.533,
+    0.005
    ],
    "peak_vram_gib": [
-    21.5,
+    21.52,
     0.0
    ],
    "vram_after_load_gib": null,
    "decode_tps": [
-    78.337,
-    0.132
+    72.297,
+    0.216
    ],
    "prefill_tps": [
-    8.356,
-    0.169
+    8.773,
+    0.09
    ],
    "all_exit_clean": null,
    "vram_back_to_baseline": true
   },
   "35B_a3b_elastic": {
-   "n": 4,
+   "n": 3,
    "model": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
    "elastic": true,
    "load_s": [
-    13.5,
+    13.52,
     0.0
    ],
    "peak_vram_gib": [
-    1.89,
+    1.96,
     0.0
    ],
-   "vram_after_load_gib": [
-    1.89,
-    0.0
-   ],
+   "vram_after_load_gib": null,
    "decode_tps": [
-    2.612,
-    0.013
+    3.441,
+    0.034
    ],
    "prefill_tps": [
-    3.39,
-    0.03
+    4.141,
+    0.022
    ],
    "all_exit_clean": null,
    "vram_back_to_baseline": true
@@ -325,12 +322,12 @@
      "resident_mib": 0,
      "streamed_mib": 743,
      "peak_vram_gib": [
-      0.69,
-      0.0
+      1.487,
+      0.617
      ],
      "decode_tps": [
-      8.518,
-      0.111
+      14.768,
+      0.266
      ],
      "n": 3,
      "tokens_identical": true
@@ -344,11 +341,11 @@
      "resident_mib": null,
      "streamed_mib": 0,
      "peak_vram_gib": [
-      1.37,
+      1.38,
       0.0
      ],
      "decode_tps": [
-      217.642,
+      206.771,
       0.0
      ],
      "n": 1,
@@ -365,12 +362,12 @@
      "resident_mib": 0,
      "streamed_mib": 13087,
      "peak_vram_gib": [
-      2.78,
-      0.0
+      3.38,
+      0.354
      ],
      "decode_tps": [
-      0.545,
-      0.01
+      0.645,
+      0.012
      ],
      "n": 3,
      "tokens_identical": true
@@ -384,11 +381,11 @@
      "resident_mib": 1920,
      "streamed_mib": 11167,
      "peak_vram_gib": [
-      4.63,
+      4.94,
       0.0
      ],
      "decode_tps": [
-      0.622,
+      0.399,
       0.0
      ],
      "n": 1,
@@ -403,11 +400,11 @@
      "resident_mib": 4035,
      "streamed_mib": 9051,
      "peak_vram_gib": [
-      6.66,
+      7.0,
       0.0
      ],
      "decode_tps": [
-      0.757,
+      0.486,
       0.0
      ],
      "n": 1,
@@ -422,12 +419,12 @@
      "resident_mib": 8012,
      "streamed_mib": 5074,
      "peak_vram_gib": [
-      10.52,
-      0.0
+      11.565,
+      0.715
      ],
      "decode_tps": [
-      1.356,
-      0.023
+      0.923,
+      0.061
      ],
      "n": 2,
      "tokens_identical": true
@@ -441,11 +438,11 @@
      "resident_mib": 10212,
      "streamed_mib": 2874,
      "peak_vram_gib": [
-      12.66,
+      13.0,
       0.0
      ],
      "decode_tps": [
-      2.309,
+      1.757,
       0.0
      ],
      "n": 1,
@@ -460,12 +457,12 @@
      "resident_mib": 12265,
      "streamed_mib": 821,
      "peak_vram_gib": [
-      14.695,
-      0.035
+      16.03,
+      0.0
      ],
      "decode_tps": [
-      8.352,
-      0.0
+      17.319,
+      0.025
      ],
      "n": 2,
      "tokens_identical": true
@@ -479,11 +476,11 @@
      "resident_mib": null,
      "streamed_mib": 0,
      "peak_vram_gib": [
-      15.87,
+      15.89,
       0.0
      ],
      "decode_tps": [
-      19.284,
+      17.597,
       0.0
      ],
      "n": 1,
@@ -498,11 +495,11 @@
      "resident_mib": null,
      "streamed_mib": 0,
      "peak_vram_gib": [
-      15.87,
+      15.89,
       0.0
      ],
      "decode_tps": [
-      19.27,
+      17.512,
       0.0
      ],
      "n": 1,
@@ -514,134 +511,17 @@
      "arm": "v0",
      "budget_gib": 0,
      "mode": "streamed",
-     "n": 4,
-     "peak_vram_gib": [
-      1.89,
-      0.0
-     ],
-     "decode_tps": [
-      2.612,
-      0.013
-     ],
-     "prefill_tps": [
-      3.39,
-      0.03
-     ],
-     "load_s": [
-      13.5,
-      0.0
-     ],
-     "expert_stream": "router-aware (0002)"
-    },
-    {
-     "arm": "v4",
-     "budget_gib": 4,
-     "mode": "streamed",
-     "n": 1,
-     "peak_vram_gib": [
-      5.32,
-      0.0
-     ],
-     "decode_tps": [
-      3.085,
-      0.0
-     ],
-     "prefill_tps": [
-      3.78,
-      0.0
-     ],
-     "load_s": [
-      15.5,
-      0.0
-     ],
-     "expert_stream": "router-aware (0002)"
-    },
-    {
-     "arm": "v10",
-     "budget_gib": 10,
-     "mode": "streamed",
-     "n": 1,
-     "peak_vram_gib": [
-      11.92,
-      0.0
-     ],
-     "decode_tps": [
-      4.908,
-      0.0
-     ],
-     "prefill_tps": [
-      4.7,
-      0.0
-     ],
-     "load_s": [
-      20.0,
-      0.0
-     ],
-     "expert_stream": "router-aware (0002)"
-    },
-    {
-     "arm": "v16",
-     "budget_gib": 16,
-     "mode": "streamed",
-     "n": 1,
-     "peak_vram_gib": [
-      17.63,
-      0.0
-     ],
-     "decode_tps": [
-      11.346,
-      0.0
-     ],
-     "prefill_tps": [
-      6.2,
-      0.0
-     ],
-     "load_s": [
-      24.0,
-      0.0
-     ],
-     "expert_stream": "router-aware (0002)"
-    },
-    {
-     "arm": "auto",
-     "budget_gib": "auto",
-     "mode": "fits",
-     "n": 1,
-     "peak_vram_gib": [
-      21.5,
-      0.0
-     ],
-     "decode_tps": [
-      78.097,
-      0.0
-     ],
-     "prefill_tps": [
-      8.47,
-      0.0
-     ],
-     "load_s": [
-      26.0,
-      0.0
-     ],
-     "expert_stream": "router-aware (0002)"
-    }
-   ],
-   "MoE_all_experts": [
-    {
-     "arm": "v0",
-     "budget_gib": 0,
-     "mode": "streamed",
      "resident_layers": 0,
      "n_layers": 40,
      "resident_mib": 0,
      "streamed_mib": 20279,
      "peak_vram_gib": [
-      2.59,
+      1.96,
       0.0
      ],
      "decode_tps": [
-      0.253,
-      0.002
+      3.441,
+      0.034
      ],
      "n": 3,
      "tokens_identical": true
@@ -655,11 +535,11 @@
      "resident_mib": 3617,
      "streamed_mib": 16662,
      "peak_vram_gib": [
-      6.06,
+      5.81,
       0.0
      ],
      "decode_tps": [
-      0.305,
+      2.945,
       0.0
      ],
      "n": 1,
@@ -674,11 +554,11 @@
      "resident_mib": 10137,
      "streamed_mib": 10141,
      "peak_vram_gib": [
-      12.42,
+      11.99,
       0.0
      ],
      "decode_tps": [
-      0.467,
+      4.706,
       0.0
      ],
      "n": 1,
@@ -693,11 +573,11 @@
      "resident_mib": 16161,
      "streamed_mib": 4118,
      "peak_vram_gib": [
-      18.31,
+      17.71,
       0.0
      ],
      "decode_tps": [
-      1.116,
+      10.673,
       0.0
      ],
      "n": 1,
@@ -712,11 +592,11 @@
      "resident_mib": null,
      "streamed_mib": 0,
      "peak_vram_gib": [
-      21.5,
+      21.52,
       0.0
      ],
      "decode_tps": [
-      77.459,
+      72.933,
       0.0
      ],
      "n": 1,
@@ -725,9 +605,8 @@
    ]
   },
   "parity": {
-   "identical": 40,
-   "total": 40,
-   "note": "23 runs from the 0001 campaign + 17 runs with router-aware expert streaming (0002); dense references are unfused stock"
+   "identical": 23,
+   "total": 23
   },
   "load_hangs": {
    "not_ready": 7,
@@ -781,7 +660,7 @@
    "peak_vram_gib": 31.85
   }
  },
- "metric_note": "decode = llama-server timings.predicted_per_second; single/partial: 2026-10-04 post-reboot sweep, posix_fadvise cold model file, n=3 for stock and fully-streamed arms, n=1-2 for budget arms; v3 MoE stock 34.2 t/s superseded (host state; 78 t/s with both binaries post-reboot) | 2026-10-04 router-aware campaign: moe2/ (partial.py, n=3 stock+v0) and moec/ (moe_cache.py c/k arms) under experiments/2026-10-04-elastic-campaign-v3/pr/partial/. | 2026-10-04 router-aware campaign: moe2/ (partial.py, n=3 stock+v0) and moec/ (moe_cache.py c/k arms) under experiments/2026-10-04-elastic-campaign-v3/pr/partial/. | 2026-10-04 router-aware campaign: moe2/ (partial.py, n=3 stock+v0) and moec/ (moe_cache.py c/k arms) under experiments/2026-10-04-elastic-campaign-v3/pr/partial/. | 2026-10-04 router-aware campaign: moe2/ (partial.py, n=3 stock+v0) and moec/ (moe_cache.py c/k arms) under experiments/2026-10-04-elastic-campaign-v3/pr/partial/. | 2026-10-04 router-aware campaign: moe2/ (partial.py, n=3 stock+v0) and moec/ (moe_cache.py c/k arms) under experiments/2026-10-04-elastic-campaign-v3/pr/partial/. | 2026-10-04 router-aware campaign: moe2/ (partial.py, n=3 stock+v0) and moec/ (moe_cache.py c/k arms) under experiments/2026-10-04-elastic-campaign-v3/pr/partial/.",
+ "metric_note": "decode = llama-server timings.predicted_per_second; single/partial: 2026-10-04 post-reboot sweep, posix_fadvise cold model file, n=3 for stock and fully-streamed arms, n=1-2 for budget arms; v3 MoE stock 34.2 t/s superseded (host state; 78 t/s with both binaries post-reboot)",
  "concurrent_v3": [
   {
    "fleet": "conc_3x27B",
@@ -792,18 +671,18 @@
     "27B"
    ],
    "vram_after_each_load_gib": [
-    2.543,
-    5.048,
-    7.552
+    15.698,
+    30.269,
+    19.054
    ],
    "per_instance_tps": [
-    0.173,
-    0.174,
-    0.173
+    0.531,
+    0.997,
+    0.281
    ],
-   "aggregate_tps": 0.52,
-   "peak_vram_gib": 9.453,
-   "peak_gtt_gib": 0.297,
+   "aggregate_tps": 1.808,
+   "peak_vram_gib": 31.89,
+   "peak_gtt_gib": 33.527,
    "all_text_nonempty": true
   },
   {
@@ -817,22 +696,22 @@
     "27B"
    ],
    "vram_after_each_load_gib": [
-    2.543,
-    5.048,
-    7.552,
-    10.056,
-    12.56
+    16.575,
+    30.217,
+    17.908,
+    30.098,
+    19.915
    ],
    "per_instance_tps": [
-    0.09,
-    0.09,
-    0.09,
-    0.09,
-    0.09
+    1.431,
+    0.066,
+    0.082,
+    0.067,
+    0.081
    ],
-   "aggregate_tps": 0.451,
-   "peak_vram_gib": 15.752,
-   "peak_gtt_gib": 0.505,
+   "aggregate_tps": 1.727,
+   "peak_vram_gib": 31.891,
+   "peak_gtt_gib": 45.17,
    "all_text_nonempty": true
   },
   {
@@ -844,18 +723,18 @@
     "35B_a3b"
    ],
    "vram_after_each_load_gib": [
-    2.008,
-    3.976,
-    5.945
+    21.497,
+    28.694,
+    30.556
    ],
    "per_instance_tps": [
-    0.089,
-    0.09,
-    0.09
+    7.798,
+    1.857,
+    1.868
    ],
-   "aggregate_tps": 0.269,
-   "peak_vram_gib": 8.012,
-   "peak_gtt_gib": 0.256,
+   "aggregate_tps": 11.523,
+   "peak_vram_gib": 31.525,
+   "peak_gtt_gib": 4.923,
    "all_text_nonempty": true
   },
   {
@@ -869,22 +748,22 @@
     "1.5B"
    ],
    "vram_after_each_load_gib": [
-    2.543,
-    5.048,
-    5.696,
-    6.345,
-    6.994
+    15.159,
+    30.065,
+    30.772,
+    31.478,
+    18.371
    ],
    "per_instance_tps": [
-    0.296,
-    0.297,
-    2.049,
-    2.048,
-    2.048
+    3.827,
+    2.405,
+    1.995,
+    1.997,
+    1.979
    ],
-   "aggregate_tps": 6.738,
-   "peak_vram_gib": 8.538,
-   "peak_gtt_gib": 0.384,
+   "aggregate_tps": 12.204,
+   "peak_vram_gib": 31.889,
+   "peak_gtt_gib": 19.049,
    "all_text_nonempty": true
   }
  ],
@@ -946,81 +825,76 @@
  },
  "latency": {
   "lat_27B_stock": {
-   "cold_first_ttft_s": 1.338,
+   "cold_first_ttft_s": 1.343,
    "warm_ttft_s": [
-    0.424,
-    0.243
+    0.43,
+    0.253
    ],
    "warm_itl_median_s": [
-    0.0518,
-    0.0518
+    0.0565,
+    0.0563
    ]
   },
   "lat_27B_elastic": {
-   "cold_first_ttft_s": 4.234,
+   "cold_first_ttft_s": 1.325,
    "warm_ttft_s": [
-    1.88,
-    1.8
+    0.428,
+    0.252
    ],
    "warm_itl_median_s": [
-    1.6582,
-    1.6856
+    0.0562,
+    0.0564
    ]
   },
   "lat_35B_a3b_stock": {
+   "cold_first_ttft_s": 0.797,
    "warm_ttft_s": [
-    0.583,
-    0.592,
-    0.597
+    0.175,
+    0.099
    ],
    "warm_itl_median_s": [
-    0.013,
-    0.013,
-    0.013
+    0.0137,
+    0.0137
    ]
   },
   "lat_35B_a3b_elastic": {
+   "cold_first_ttft_s": 0.773,
    "warm_ttft_s": [
-    1.874,
-    1.845,
-    1.867,
-    1.846
+    0.174,
+    0.101
    ],
    "warm_itl_median_s": [
-    0.385,
-    0.38,
-    0.382,
-    0.384
+    0.0137,
+    0.0137
    ]
-  },
-  "note_35B": "router-aware campaign (0002): warm per-request server timings, v0 fully streamed; pre-0002 fully-streamed ITL was ~4 s/token"
+  }
  },
  "lifecycle": {
   "cycles_1_5B_stock": {
    "cycles": 10,
-   "gen_ok": 7,
-   "not_ready": 3,
-   "leaks": 0,
+   "gen_ok": 10,
+   "not_ready": 0,
+   "leaks": 1,
    "child_survived_exit": 0,
-   "settle_s_max": 0.01,
+   "settle_s_max": null,
    "load_s": [
-    6.078,
-    1.972
+    23.366,
+    28.921
    ],
-   "xe_resets": 7
+   "xe_resets": 145
   },
   "cycles_27B_elastic": {
    "cycles": 5,
-   "gen_ok": 4,
-   "not_ready": 1,
+   "gen_ok": 5,
+   "not_ready": 0,
    "leaks": 0,
    "child_survived_exit": 0,
-   "settle_s_max": 0.0096,
+   "settle_s_max": null,
    "load_s": [
-    11.384,
-    1.817
+    84.552,
+    85.782
    ],
-   "xe_resets": 4
+   "xe_resets": 3
   }
  },
  "lifecycle_retry": {
@@ -1089,16 +963,16 @@
    "tag": "par_27B_stock_SYCL0",
    "elastic": false,
    "device": "SYCL0",
-   "decode_tps": 17.904,
-   "peak_vram_gib": 15.246,
+   "decode_tps": 17.839,
+   "peak_vram_gib": 15.83,
    "back_to_idle": true
   },
   {
    "tag": "par_27B_elastic_SYCL0",
    "elastic": true,
    "device": "SYCL0",
-   "decode_tps": 0.581,
-   "peak_vram_gib": 3.364,
+   "decode_tps": 17.828,
+   "peak_vram_gib": 16.635,
    "back_to_idle": true
   }
  ],
@@ -1109,48 +983,48 @@
     "ctx": 2048,
     "kv": "q8_0",
     "elastic": false,
-    "peak_vram_gib": 15.81,
-    "decode_tps": 19.368
+    "peak_vram_gib": 16.284,
+    "decode_tps": 17.822
    },
    {
     "tag": "ctx2048_elastic",
     "ctx": 2048,
     "kv": "q8_0",
     "elastic": true,
-    "peak_vram_gib": 3.125,
-    "decode_tps": 0.597
+    "peak_vram_gib": 16.097,
+    "decode_tps": 17.834
    },
    {
     "tag": "ctx4096_stock",
     "ctx": 4096,
     "kv": "q8_0",
     "elastic": false,
-    "peak_vram_gib": 15.907,
-    "decode_tps": 19.373
+    "peak_vram_gib": 16.381,
+    "decode_tps": 17.851
    },
    {
     "tag": "ctx4096_elastic",
     "ctx": 4096,
     "kv": "q8_0",
     "elastic": true,
-    "peak_vram_gib": 3.223,
-    "decode_tps": 0.591
+    "peak_vram_gib": 16.382,
+    "decode_tps": 17.794
    },
    {
     "tag": "ctx8192_stock",
     "ctx": 8192,
     "kv": "q8_0",
     "elastic": false,
-    "peak_vram_gib": 16.103,
-    "decode_tps": 19.326
+    "peak_vram_gib": 16.577,
+    "decode_tps": 17.86
    },
    {
     "tag": "ctx8192_elastic",
     "ctx": 8192,
     "kv": "q8_0",
     "elastic": true,
-    "peak_vram_gib": 3.418,
-    "decode_tps": 0.594
+    "peak_vram_gib": 16.577,
+    "decode_tps": 17.819
    }
   ],
   "kv": [
@@ -1159,24 +1033,24 @@
     "ctx": 4096,
     "kv": "f16",
     "elastic": true,
-    "peak_vram_gib": 3.254,
-    "decode_tps": 0.599
+    "peak_vram_gib": 16.437,
+    "decode_tps": 17.94
    },
    {
     "tag": "kv_q8_0_elastic",
     "ctx": 4096,
     "kv": "q8_0",
     "elastic": true,
-    "peak_vram_gib": 3.223,
-    "decode_tps": 0.598
+    "peak_vram_gib": 16.371,
+    "decode_tps": 17.839
    },
    {
     "tag": "kv_q4_0_elastic",
     "ctx": 4096,
     "kv": "q4_0",
     "elastic": true,
-    "peak_vram_gib": 3.123,
-    "decode_tps": 0.596
+    "peak_vram_gib": 16.34,
+    "decode_tps": 17.834
    }
   ]
  },
@@ -1260,91 +1134,6 @@
      3130,
      3127,
      3130
-    ]
-   }
-  }
- },
- "windows_delta": {
-  "platform": "Windows 11, Core Ultra X7 358H, Arc B390 iGPU (16.4 GiB device pool), oneAPI 2026.0 (icx) + MSVC 19.44, llama.cpp SYCL + stream-weights patch",
-  "method": "llama-cli, -ngl 99, -c 4096, greedy (top-k 1, seed 1234); device memory = Win32 per-process GPU perf counters (llama-cli), sampled ~4 Hz; peak over load + generation",
-  "1_5B": {
-   "model": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
-   "stock_gib": 1.463,
-   "streamed_gib": 0.778,
-   "stock_tps": 80.8,
-   "streamed_tps": 5.7
-  },
-  "27B": {
-   "model": "Qwen3.8-27B-UD-Q4_K_S.gguf",
-   "stock_gib": 15.376,
-   "streamed_gib": 2.606,
-   "stock_tps": 6.3,
-   "streamed_tps": 0.4
-  },
-  "parity": "greedy tokens identical to stock (24/48-token runs)",
-  "notes": "pass -c explicitly when streaming: the default context auto-fit sees the freed weight memory as free and may pick the model's full train context (large f32 KV). cascadia always passes --llama-ctx."
- },
- "expert_cache_arms": {
-  "note": "experimental GGML_STREAM_EXPERT_CACHE_MB hot-expert cache; 2 GiB per-tensor LRU was measured SLOWER than selective-only despite 59-67% hit rates (see RESULTS doc); default is off",
-  "arms": {
-   "c0": {
-    "n": 3,
-    "peak_vram_gib": [
-     3.85,
-     0.0
-    ],
-    "decode_tps": [
-     2.411,
-     0.978
-    ],
-    "prefill_tps": [
-     2.92,
-     0.93
-    ]
-   },
-   "c4": {
-    "n": 1,
-    "peak_vram_gib": [
-     7.29,
-     0.0
-    ],
-    "decode_tps": [
-     1.979,
-     0.0
-    ],
-    "prefill_tps": [
-     3.79,
-     0.0
-    ]
-   },
-   "k64": {
-    "n": 1,
-    "peak_vram_gib": [
-     1.89,
-     0.0
-    ],
-    "decode_tps": [
-     2.63,
-     0.0
-    ],
-    "prefill_tps": [
-     3.4,
-     0.0
-    ]
-   },
-   "k512": {
-    "n": 2,
-    "peak_vram_gib": [
-     2.56,
-     0.2
-    ],
-    "decode_tps": [
-     2.883,
-     0.013
-    ],
-    "prefill_tps": [
-     3.42,
-     0.02
     ]
    }
   }

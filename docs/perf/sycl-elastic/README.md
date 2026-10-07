@@ -26,13 +26,20 @@ All numbers come from [`data.json`](./data.json) (verbatim copy of
   Qwen3.6-35B-A3B UD Q4_K_XL (GGUF).
 - **Settings:** `--llama-ctx 4096`, KV cache `q8_0`, `-fa on`, temperature 0,
   thinking off.
-- **Data generations:** `single` / `partial` / `cotenant_auto` come from
-  the 2026-10-04 post-reboot sweep (cold model file via
+- **Data generations:** `single` / `partial` / `cotenant_auto` / `fleets` /
+  `lifecycle` / `latency` / `parity` were re-run 2026-10-07 on the async
+  stream-pool build (per-device copy queues, pinned staging ring,
+  parity slots, prefetch scan) on SYCL0. Cold model file via
   `posix_fadvise(DONTNEED)` before each arm — `drop_caches` is avoided: on
-  this xe host it leaks kernel memory; n=3 for stock and fully-streamed
-  arms, n=1-2 for budget arms). Fleets, latency, lifecycle and sweeps come
-  from campaign v3. The v3 MoE stock number (34.2 t/s) is superseded —
-  post-reboot it measures 78 t/s with both binaries (host state).
+  this xe host it leaks kernel memory; n=3-6 for repeated arms, n=1-2 for
+  budget arms. `--elastic` auto placement is resident-first, so fleet VRAM
+  curves (fig2, fig5) now show the real contention behaviour: once the
+  card fills (~31 GiB) the xe driver evicts earlier instances to host RAM
+  and the evicted instances decode at host-page-fault rates. The v3 MoE
+  stock number (34.2 t/s) is superseded — post-reboot it measures 78 t/s
+  with both binaries (host state). Lifecycle `settle_s` is reported as
+  unavailable: the desktop baseline on this host (~0.5 GiB) exceeds the
+  150 MiB settle target, so it never settles.
 - **Router-aware MoE (0002 patch):** the MoE rows of `partial` / `single` /
   `single_v3_campaign` and the `MoE` curve in fig8 come from the same-day
   sweep of the patched build (n=3 for stock and v0); the pre-0002
@@ -59,7 +66,8 @@ scripts/build-llama-stream.sh ~/llama-stream
 export CASCADIA_LLAMA_BIN=~/llama-stream/build/bin/llama-server
 source /opt/intel/oneapi/setvars.sh   # child needs the oneAPI runtime libs
 
-# 2. per arm (stock arms drop --elastic); the campaign used SYCL1
+# 2. per arm (stock arms drop --elastic); the 2026-10-07 refresh used
+#    SYCL0 (SYCL1 had a vLLM co-tenant); the original campaign used SYCL1
 cascadia run /path/to/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf \
   --engine sycl-llama --device SYCL1 --llama-ctx 4096 \
   --llama-args "-ctk q8_0 -fa on" --api 127.0.0.1:19600          # stock

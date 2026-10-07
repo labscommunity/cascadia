@@ -400,26 +400,35 @@ def fig2():
     conc = {f["fleet"]: f for f in DATA["concurrent_v3"]}
     el = conc["conc_5x27B"]["vram_after_each_load_gib"]
     st = DATA["fleets_v2"]["fleet_3x27B_stock"]["vram_after_each_load_gib"]
-    per = sum(el[i] - el[i - 1] for i in range(1, len(el))) / (len(el) - 1)
 
     fig = newfig()
     header(fig, "How many 27B models fit on one GPU",
-           f"VRAM after each load. Each additional --elastic 27B costs "
-           f"~{per:.1f} GiB; each stock 27B ~15 GiB")
+           "cascadia --elastic (auto): resident until the card fills "
+           "(~31 GiB), then the xe driver evicts earlier instances to "
+           "host RAM")
     ax = fig.add_axes([0.09, 0.14, 0.86, 0.62])
     style_ax(ax)
 
     xs = list(range(1, len(el) + 1))
     ax.fill_between(xs, el, color=ELASTIC, alpha=0.15)
-    ax.plot(xs, el, color=ELASTIC, marker="o", linewidth=2, label="fully streamed (--elastic-vram 0)")
+    ax.plot(xs, el, color=ELASTIC, marker="o", linewidth=2, label="--elastic (auto placement)")
     for x, yy in zip(xs, el):
-        off = (0, -17) if x == xs[-1] else (0, 9)
+        if x == 2:
+            off, ha = (-14, -18), "right"   # dodge stock label under the peak
+        elif x == xs[-1] or yy > 28:
+            off, ha = (0, -17), "center"
+        else:
+            off, ha = (0, 9), "center"
         ax.annotate(f"{yy:.1f}", (x, yy), textcoords="offset points",
                     xytext=off, fontsize=11, fontweight="bold",
-                    color=ELASTIC, ha="center")
-    ax.text(5.05, 14.4, f"all 5 generating at once,\npeak "
+                    color=ELASTIC, ha=ha)
+    ax.annotate("driver evicts earlier\ninstances to host RAM",
+                xy=(3, 18.3), xytext=(2.1, 7.5), fontsize=10.5,
+                color=TEXT, ha="center",
+                arrowprops=dict(arrowstyle="->", color=TEXT, lw=1.2))
+    ax.text(4.75, 12.5, f"all 5 generating at once,\npeak "
             f"{conc['conc_5x27B']['peak_vram_gib']:.1f} GiB",
-            fontsize=11, color=ELASTIC, ha="right", va="bottom")
+            fontsize=11, color=TEXT, ha="right", va="bottom")
 
     xs_s = list(range(1, len(st) + 1))
     ax.plot(xs_s, st, color=STOCK, marker="o", linewidth=2, label="stock")
@@ -435,7 +444,7 @@ def fig2():
             markeredgewidth=3)
 
     ax.axhline(B70_HEAP_GIB, color=AMBER, linestyle="--", linewidth=1.2)
-    ax.text(4.6, B70_HEAP_GIB + 0.5, "Arc Pro B70 device memory (31.9 GiB)",
+    ax.text(1.0, B70_HEAP_GIB + 0.7, "Arc Pro B70 device memory (31.9 GiB)",
             fontsize=10, color=AMBER, ha="center", bbox=REF_LABEL_BOX)
     ax.set_xlabel("27B instances loaded on one card", fontsize=12)
     ax.set_ylabel("device VRAM (GiB)", fontsize=12)
@@ -556,41 +565,39 @@ def fig5():
     cols = [BLUE, BLUE, ELASTIC, ELASTIC, ELASTIC]
     axl.bar(range(5), mix["per_instance_tps"], color=cols, width=0.6)
     for i, tp in enumerate(mix["per_instance_tps"]):
-        axl.text(i, tp + 0.05, f"{tp:.2f}", ha="center", fontsize=11,
+        axl.text(i, tp + 0.07, f"{tp:.2f}", ha="center", fontsize=11,
                  fontweight="bold", color=TEXT)
     axl.set_xticks(range(5))
     axl.set_xticklabels(names, fontsize=11, color=TEXT)
     axl.set_ylabel("decode, tokens/s", fontsize=12)
-    axl.set_ylim(0, 2.7)
-    axl.text(2, 2.45, f"aggregate {mix['aggregate_tps']:.2f} t/s",
+    axl.set_ylim(0, 4.6)
+    axl.text(2, 4.25, f"aggregate {mix['aggregate_tps']:.2f} t/s",
              ha="center", fontsize=13, fontweight="bold", color=TEXT)
 
     axr = fig.add_axes([0.60, 0.16, 0.34, 0.60])
     style_ax(axr)
     series = mix["vram_after_each_load_gib"]
-    prev = 0.0
-    for i, (n, upto) in enumerate(zip(names, series)):
-        h = upto - prev
-        axr.bar(0, h, bottom=prev, width=0.5, color=cols[i],
-                edgecolor=BG, linewidth=1)
-        if h > 1.5:
-            axr.text(0.45, prev + h / 2, f"{n}: {h:.2f} GiB", fontsize=10.5,
-                     color=TEXT, va="center")
-        prev = upto
-    axr.text(0.45, (series[1] + series[-1]) / 2,
-             f"3x 1.5B: {series[-1] - series[1]:.2f} GiB", fontsize=10.5,
-             color=TEXT, va="center")
-    axr.axhline(B70_HEAP_GIB, color=AMBER, linestyle="--", linewidth=1.2)
-    axr.text(0.4, B70_HEAP_GIB + 1.0, "B70 device memory", fontsize=10,
-             color=AMBER, ha="center", bbox=REF_LABEL_BOX)
-    axr.text(0, prev + 1.6,
-             f"{prev:.1f} GiB loaded /\n{mix['peak_vram_gib']:.1f} GiB peak",
-             ha="center", va="bottom", fontsize=12, fontweight="bold",
+    deltas = [series[0]] + [series[i] - series[i - 1]
+                            for i in range(1, len(series))]
+    for i, h in enumerate(deltas):
+        axr.bar(i, h, width=0.6, color=cols[i], edgecolor=BG, linewidth=1)
+        axr.text(i, h + 0.5 if h > 0 else h - 0.5, f"{h:+.1f}",
+                 ha="center", fontsize=10.5, fontweight="bold",
+                 color=TEXT, va="bottom" if h > 0 else "top")
+    axr.axhline(0, color=GRID, linewidth=1)
+    axr.annotate("driver evicts\n~13 GiB to host RAM", xy=(3.72, deltas[4] * 0.55),
+                 xytext=(2.3, -5.5), fontsize=10.5, color=TEXT, ha="center",
+                 arrowprops=dict(arrowstyle="->", color=TEXT, lw=1.2))
+    axr.text(3.0, 17.2,
+             f"peak {mix['peak_vram_gib']:.1f} GiB card use /\n"
+             f"{series[-1]:.1f} GiB resident after loads",
+             ha="center", va="top", fontsize=11.5, fontweight="bold",
              color=TEXT)
-    axr.set_xticks([])
-    axr.set_ylabel("device VRAM (GiB)", fontsize=12)
-    axr.set_ylim(0, 34)
-    axr.set_xlim(-0.9, 1.7)
+    axr.set_xticks(range(5))
+    axr.set_xticklabels(names, fontsize=10, color=TEXT, rotation=20)
+    axr.set_ylabel("VRAM delta per load (GiB)", fontsize=12)
+    axr.set_ylim(-16, 18)
+    axr.set_xlim(-0.6, 4.6)
     footer(fig)
     save(fig, "fig5_fleet.png")
 
