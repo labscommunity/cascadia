@@ -67,6 +67,18 @@ impl DecisionProfile {
                 format!("{:?}", p.family).to_lowercase()
             ));
         }
+        // A zero, negative or non-finite temperature turns every probability into NaN.
+        let temps = p
+            .jev
+            .iter()
+            .flat_map(|j| j.temperature.values())
+            .chain(p.kev.iter().map(|k| &k.temperature));
+        if let Some(t) = temps.copied().find(|t| !(t.is_finite() && *t > 0.0)) {
+            return Err(format!(
+                "{}: temperature must be finite and > 0, got {t}",
+                path.display()
+            ));
+        }
         Ok(p)
     }
 }
@@ -100,6 +112,18 @@ mod tests {
         );
         std::fs::write(&p, r#"{"family":"jev","max_tokens":10}"#).unwrap();
         assert!(DecisionProfile::load(&p).unwrap_err().contains("jev"));
+        std::fs::write(
+            &p,
+            r#"{"family":"kev","max_tokens":100,"kev":{"temperature":0}}"#,
+        )
+        .unwrap();
+        assert!(DecisionProfile::load(&p)
+            .unwrap_err()
+            .contains("temperature"));
+        std::fs::write(&p, r#"{"family":"jev","max_tokens":10,"jev":{"verbalizers":["false","true"],"verbalizer_ids":[1,2],"bias":[0,0],"slots":{"noul":[0,2],"score":[2,2],"choice":[2,2]},"temperature":{"noul":1,"choice":-1,"score":1}}}"#).unwrap();
+        assert!(DecisionProfile::load(&p)
+            .unwrap_err()
+            .contains("temperature"));
         let _ = std::fs::remove_dir_all(&d);
     }
 
