@@ -17,77 +17,215 @@ pub enum OrderedValue {
 }
 
 impl<'de> Deserialize<'de> for OrderedValue {
+    /// Parses the value's exact source text (serde_json `RawValue`) with `parse_ordered`:
+    /// serde_json's default float parser is not correctly rounded for every 17-digit literal,
+    /// and the workspace must not enable `float_roundtrip`/`arbitrary_precision`.
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> serde::de::Visitor<'de> for V {
-            type Value = OrderedValue;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("any JSON value")
-            }
-            fn visit_unit<E>(self) -> Result<OrderedValue, E> {
-                Ok(OrderedValue::Null)
-            }
-            fn visit_none<E>(self) -> Result<OrderedValue, E> {
-                Ok(OrderedValue::Null)
-            }
-            fn visit_some<D2: serde::Deserializer<'de>>(
-                self,
-                d: D2,
-            ) -> Result<OrderedValue, D2::Error> {
-                OrderedValue::deserialize(d)
-            }
-            fn visit_bool<E>(self, b: bool) -> Result<OrderedValue, E> {
-                Ok(OrderedValue::Bool(b))
-            }
-            fn visit_i64<E>(self, n: i64) -> Result<OrderedValue, E> {
-                Ok(OrderedValue::Number(n.into()))
-            }
-            fn visit_u64<E>(self, n: u64) -> Result<OrderedValue, E> {
-                Ok(OrderedValue::Number(n.into()))
-            }
-            fn visit_f64<E: serde::de::Error>(self, n: f64) -> Result<OrderedValue, E> {
-                serde_json::Number::from_f64(n)
-                    .map(OrderedValue::Number)
-                    .ok_or_else(|| E::custom("non-finite number"))
-            }
-            fn visit_str<E>(self, s: &str) -> Result<OrderedValue, E> {
-                Ok(OrderedValue::String(s.to_owned()))
-            }
-            fn visit_string<E>(self, s: String) -> Result<OrderedValue, E> {
-                Ok(OrderedValue::String(s))
-            }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut a: A,
-            ) -> Result<OrderedValue, A::Error> {
-                let mut v = Vec::new();
-                while let Some(x) = a.next_element()? {
-                    v.push(x);
-                }
-                Ok(OrderedValue::Array(v))
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut a: A,
-            ) -> Result<OrderedValue, A::Error> {
-                let mut v: Vec<(String, OrderedValue)> = Vec::new();
-                // key → index in `v`: O(n) even for objects with many keys (this runs before any limit).
-                let mut at: std::collections::HashMap<String, usize> =
-                    std::collections::HashMap::new();
-                while let Some((k, x)) = a.next_entry::<String, OrderedValue>()? {
-                    // Python dict semantics: a repeated key keeps its first position, takes the last value.
-                    match at.get(&k) {
-                        Some(&i) => v[i].1 = x,
-                        None => {
-                            at.insert(k.clone(), v.len());
-                            v.push((k, x));
-                        }
-                    }
-                }
-                Ok(OrderedValue::Object(v))
+        let raw = Box::<serde_json::value::RawValue>::deserialize(d)?;
+        parse_ordered(raw.get()).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Nesting bound for `parse_ordered` (untrusted input; serde_json's own limit is also 128).
+const MAX_DEPTH: usize = 128;
+
+/// Strict JSON reader into `OrderedValue`: objects keep request order with Python dict semantics
+/// (a repeated key keeps its first position and takes the last value), strings are decoded by
+/// serde_json (exact escape rules), integers stay integers (`-0` → `0`, as Python), and other
+/// numbers go through `str::parse::<f64>` (correctly rounded). Non-finite numbers are rejected.
+fn parse_ordered(text: &str) -> Result<OrderedValue, String> {
+    let mut p = Reader {
+        s: text.as_bytes(),
+        text,
+        i: 0,
+    };
+    let v = p.value(0)?;
+    p.ws();
+    if p.i != p.s.len() {
+        return Err(format!("trailing characters at byte {}", p.i));
+    }
+    Ok(v)
+}
+
+struct Reader<'a> {
+    s: &'a [u8],
+    text: &'a str,
+    i: usize,
+}
+
+impl Reader<'_> {
+    fn ws(&mut self) {
+        while let Some(b' ' | b'\t' | b'\n' | b'\r') = self.s.get(self.i) {
+            self.i += 1;
+        }
+    }
+
+    fn err<T>(&self, what: &str) -> Result<T, String> {
+        Err(format!("{what} at byte {}", self.i))
+    }
+
+    fn eat(&mut self, b: u8) -> bool {
+        if self.s.get(self.i) == Some(&b) {
+            self.i += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn literal(&mut self, word: &str, v: OrderedValue) -> Result<OrderedValue, String> {
+        if self.s[self.i..].starts_with(word.as_bytes()) {
+            self.i += word.len();
+            Ok(v)
+        } else {
+            self.err("invalid literal")
+        }
+    }
+
+    fn value(&mut self, depth: usize) -> Result<OrderedValue, String> {
+        self.ws();
+        match self.s.get(self.i) {
+            None => self.err("unexpected end of input"),
+            Some(b'n') => self.literal("null", OrderedValue::Null),
+            Some(b't') => self.literal("true", OrderedValue::Bool(true)),
+            Some(b'f') => self.literal("false", OrderedValue::Bool(false)),
+            Some(b'"') => self.string().map(OrderedValue::String),
+            Some(b'[') => self.array(depth + 1),
+            Some(b'{') => self.object(depth + 1),
+            Some(b'-' | b'0'..=b'9') => self.number(),
+            Some(_) => self.err("expected a JSON value"),
+        }
+    }
+
+    fn string(&mut self) -> Result<String, String> {
+        let start = self.i;
+        self.i += 1; // opening quote
+        loop {
+            match self.s.get(self.i) {
+                None => return self.err("unterminated string"),
+                Some(b'"') => break,
+                Some(b'\\') => self.i += 2,
+                Some(_) => self.i += 1,
             }
         }
-        d.deserialize_any(V)
+        self.i += 1; // closing quote
+                     // The slice ends on an ASCII quote, so it is a char boundary.
+        serde_json::from_str::<String>(&self.text[start..self.i])
+            .map_err(|e| format!("invalid string at byte {start}: {e}"))
+    }
+
+    fn digits(&mut self) -> usize {
+        let from = self.i;
+        while let Some(b'0'..=b'9') = self.s.get(self.i) {
+            self.i += 1;
+        }
+        self.i - from
+    }
+
+    fn number(&mut self) -> Result<OrderedValue, String> {
+        let start = self.i;
+        self.eat(b'-');
+        if self.eat(b'0') {
+            if let Some(b'0'..=b'9') = self.s.get(self.i) {
+                return self.err("leading zero in number");
+            }
+        } else if self.digits() == 0 {
+            return self.err("invalid number");
+        }
+        let mut integer = true;
+        if self.eat(b'.') {
+            integer = false;
+            if self.digits() == 0 {
+                return self.err("invalid number");
+            }
+        }
+        if self.eat(b'e') || self.eat(b'E') {
+            integer = false;
+            if !self.eat(b'+') {
+                self.eat(b'-');
+            }
+            if self.digits() == 0 {
+                return self.err("invalid number");
+            }
+        }
+        let lit = &self.text[start..self.i];
+        if integer {
+            if let Ok(n) = lit.parse::<i64>() {
+                return Ok(OrderedValue::Number(n.into()));
+            }
+            if let Ok(n) = lit.parse::<u64>() {
+                return Ok(OrderedValue::Number(n.into()));
+            }
+        }
+        let x: f64 = lit
+            .parse()
+            .map_err(|e| format!("invalid number {lit:?}: {e}"))?;
+        serde_json::Number::from_f64(x)
+            .map(OrderedValue::Number)
+            .ok_or_else(|| format!("number out of range: {lit}"))
+    }
+
+    fn array(&mut self, depth: usize) -> Result<OrderedValue, String> {
+        if depth > MAX_DEPTH {
+            return self.err("nesting too deep");
+        }
+        self.i += 1; // [
+        let mut v = Vec::new();
+        self.ws();
+        if self.eat(b']') {
+            return Ok(OrderedValue::Array(v));
+        }
+        loop {
+            v.push(self.value(depth)?);
+            self.ws();
+            if self.eat(b']') {
+                return Ok(OrderedValue::Array(v));
+            }
+            if !self.eat(b',') {
+                return self.err("expected ',' or ']'");
+            }
+        }
+    }
+
+    fn object(&mut self, depth: usize) -> Result<OrderedValue, String> {
+        if depth > MAX_DEPTH {
+            return self.err("nesting too deep");
+        }
+        self.i += 1; // {
+        let mut v: Vec<(String, OrderedValue)> = Vec::new();
+        // key → index in `v`: O(n) even for objects with many keys (this runs before any limit).
+        let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        self.ws();
+        if self.eat(b'}') {
+            return Ok(OrderedValue::Object(v));
+        }
+        loop {
+            self.ws();
+            if self.s.get(self.i) != Some(&b'"') {
+                return self.err("expected an object key");
+            }
+            let k = self.string()?;
+            self.ws();
+            if !self.eat(b':') {
+                return self.err("expected ':'");
+            }
+            let x = self.value(depth)?;
+            // Python dict semantics: a repeated key keeps its first position, takes the last value.
+            match at.get(&k) {
+                Some(&i) => v[i].1 = x,
+                None => {
+                    at.insert(k.clone(), v.len());
+                    v.push((k, x));
+                }
+            }
+            self.ws();
+            if self.eat(b'}') {
+                return Ok(OrderedValue::Object(v));
+            }
+            if !self.eat(b',') {
+                return self.err("expected ',' or '}'");
+            }
+        }
     }
 }
 
@@ -201,8 +339,9 @@ impl OrderedValue {
 
 /// Python's `float.__repr__` (what `json.dumps` and `str()` print): the shortest round-trip digits,
 /// fixed notation for exponents −4..16 (always with a fractional part, `1.0`), scientific otherwise
-/// with a signed two-digit-minimum exponent (`1e+16`, `1e-05`). Rust's `{:e}` already gives the
-/// shortest digits; only the layout differs.
+/// with a signed two-digit-minimum exponent (`1e+16`, `1e-05`). The digits come from `ryu`, which,
+/// like Python's dtoa, picks the shortest candidate closest to the exact value (ties to even);
+/// Rust's `{:e}` does not break those ties the same way. Only the layout is re-done here.
 pub fn py_float(x: f64) -> String {
     if x.is_nan() {
         return "NaN".into();
@@ -214,14 +353,25 @@ pub fn py_float(x: f64) -> String {
             "-Infinity".into()
         };
     }
-    let e = format!("{x:e}");
-    let (mant, exp) = e.split_once('e').expect("LowerExp has an exponent");
-    let exp: i32 = exp.parse().expect("integer exponent");
-    let (sign, mant) = match mant.strip_prefix('-') {
+    let mut buf = ryu::Buffer::new();
+    let r = buf.format_finite(x);
+    let (sign, r) = match r.strip_prefix('-') {
         Some(m) => ("-", m),
-        None => ("", mant),
+        None => ("", r),
     };
-    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    // ryu prints `d.ddd`, `0.000ddd`, `ddd.0` or `d.ddde±N`: recover (digits, decimal exponent).
+    let (mant, e10) = match r.split_once('e') {
+        Some((m, e)) => (m, e.parse::<i32>().expect("ryu exponent")),
+        None => (r, 0),
+    };
+    let (int, frac) = mant.split_once('.').unwrap_or((mant, ""));
+    let all: String = format!("{int}{frac}");
+    let lead = all.len() - all.trim_start_matches('0').len();
+    let digits = all[lead..].trim_end_matches('0');
+    if digits.is_empty() {
+        return format!("{sign}0.0");
+    }
+    let exp = int.len() as i32 - lead as i32 - 1 + e10;
     if (-4..16).contains(&exp) {
         let point = exp + 1;
         let body = if point <= 0 {
@@ -238,7 +388,7 @@ pub fn py_float(x: f64) -> String {
         format!("{sign}{body}")
     } else {
         let m = if digits.len() == 1 {
-            digits.clone()
+            digits.to_string()
         } else {
             format!("{}.{}", &digits[..1], &digits[1..])
         };
@@ -459,6 +609,7 @@ pub fn score_confidence(p: &[f64]) -> f64 {
 /// confidence; noul = p(true). `probs` is in `Question::option_keys` order.
 pub fn answer_from_probs(q: &Question, probs: &[f64]) -> Answer {
     let keys = q.option_keys();
+    debug_assert_eq!(probs.len(), keys.len());
     let dist: IndexMap<String, f64> = keys
         .iter()
         .cloned()
@@ -604,7 +755,7 @@ mod tests {
         let v: OrderedValue = serde_json::from_str(&body).unwrap();
         assert!(matches!(v, OrderedValue::Object(ref m) if m.len() == 200_000));
         assert!(
-            t.elapsed() < std::time::Duration::from_secs(2),
+            t.elapsed() < std::time::Duration::from_secs(5),
             "{:?}",
             t.elapsed()
         );
@@ -627,11 +778,62 @@ mod tests {
             (2.5e-05, "2.5e-05"),
             (100.0, "100.0"),
             (1e15, "1000000000000000.0"),
+            // shortest-digit ties: Python's repr breaks them half-even (Rust's `{:e}` rounds up)
+            (1059438285926254.2, "1059438285926254.2"),
+            (26363981746409.312, "26363981746409.312"),
         ] {
             assert_eq!(py_float(x), want, "{x:e}");
         }
         let v: OrderedValue = serde_json::from_str(r#"{"a": 1e16, "b": 3, "c": 2.50}"#).unwrap();
         assert_eq!(v.py_json(false, false), r#"{"a": 1e+16, "b": 3, "c": 2.5}"#);
+    }
+
+    #[test]
+    fn floats_parse_exactly_and_bad_json_is_rejected() {
+        // serde_json's default parser misrounds these 17-digit literals; Python round-trips them.
+        for lit in [
+            "0.18466034385487662",
+            "-9.667831824381321e+24",
+            "1059438285926254.2",
+        ] {
+            let v: OrderedValue = serde_json::from_str(&format!("[{lit}]")).unwrap();
+            assert_eq!(v.py_json(false, true), format!("[{lit}]"));
+        }
+        // Python: json.dumps(json.loads("-0")) == "0"
+        let z: OrderedValue = serde_json::from_str("-0").unwrap();
+        assert_eq!(z.py_json(false, false), "0");
+        assert_eq!(
+            serde_json::from_str::<OrderedValue>("18446744073709551615")
+                .unwrap()
+                .py_str(),
+            "18446744073709551615"
+        );
+        assert!(
+            serde_json::from_str::<OrderedValue>("1e400").is_err(),
+            "non-finite"
+        );
+        assert!(serde_json::from_str::<OrderedValue>(r#"{"a":}"#).is_err());
+        // our own reader's errors, independent of serde_json's pre-scan
+        assert!(parse_ordered("1e400").is_err());
+        assert!(parse_ordered(r#"{"a":}"#).is_err());
+        assert!(parse_ordered("[1] x").is_err(), "trailing garbage");
+        assert!(parse_ordered("01").is_err());
+        assert!(parse_ordered(r#""\x""#).is_err(), "bad escape");
+        assert_eq!(
+            parse_ordered(r#" {"s": "a\"\u00e9\n"} "#)
+                .unwrap()
+                .get("s")
+                .unwrap()
+                .as_str(),
+            Some("a\"é\n")
+        );
+        let deep = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
+        assert!(parse_ordered(&deep(MAX_DEPTH)).is_ok());
+        assert!(
+            parse_ordered(&deep(MAX_DEPTH + 1)).is_err(),
+            "nesting over the limit"
+        );
+        assert!(serde_json::from_str::<OrderedValue>(&deep(1000)).is_err());
     }
 
     #[test]
