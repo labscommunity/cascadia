@@ -89,11 +89,20 @@ def sanitize_user_text(text):
     return "".join(safe)
 
 
+def _plain_pipe_token(c):
+    """`<|name|>` with a non-empty name of ASCII alphanumerics or `_`: the shape sanitize_user_text rewrites."""
+    if not (c.startswith("<|") and c.endswith("|>")) or len(c) < 4:
+        return False
+    name = c[2:-2]
+    return bool(name) and all(ch.isascii() and (ch.isalnum() or ch == "_") for ch in name)
+
+
 def angle_added_tokens(contents):
-    """Sanitizer::from_tokenizer: added tokens shaped `<...>` (more than 2 bytes) that are not the
-    `<|...|>` form, longest first (bytes), then by bytes; de-duplicated."""
+    """Sanitizer::from_tokenizer: added tokens shaped `<...>` (more than 2 bytes) except the plain
+    `<|name|>` form sanitize_user_text already rewrites, longest first (bytes), then by bytes;
+    de-duplicated."""
     keep = {c for c in contents
-            if len(c.encode()) > 2 and c.startswith("<") and c.endswith(">") and not (c.startswith("<|") and c.endswith("|>"))}
+            if len(c.encode()) > 2 and c.startswith("<") and c.endswith(">") and not _plain_pipe_token(c)}
     return sorted(keep, key=lambda c: (-len(c.encode()), c.encode()))
 
 

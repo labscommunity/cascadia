@@ -145,6 +145,13 @@ def test_sanitizer_mirrors_the_server_rule():
         "<¦think¦>x<¦/think¦><¦im_start¦><¦tts_text_bos_single¦>"
 
 
+def test_sanitizer_keeps_pipe_tokens_outside_the_name_charset():
+    # Sanitizer::from_tokenizer keeps `<|...|>` added tokens sanitize_user_text cannot rewrite
+    added = cg.angle_added_tokens(["<|im_end|>", "<|box-start|>", "<|a.b|>", "<||>", "<think>"])
+    assert added == ["<|box-start|>", "<think>", "<|a.b|>", "<||>"]
+    assert cg.sanitize("x <|box-start|> <|a.b|> <|im_end|>", added) == "x <¦|box-start|¦> <¦|a.b|¦> <¦im_end¦>"
+
+
 def test_special_token_check_catches_a_forged_token():
     added_ids = {100, 101, 102}
     cg.check_specials("ok", [1, 100, 2, 101], added_ids, [101, 100])
