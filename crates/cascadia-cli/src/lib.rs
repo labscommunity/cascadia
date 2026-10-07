@@ -4338,8 +4338,13 @@ mod sycl_llama_flag_tests {
         for bad_n in ["0", "-1", "lots"] {
             assert!(
                 Cli::try_parse_from([
-                    "cascadia", "run", "m.gguf", "--engine", "sycl-llama",
-                    "--elastic-share", bad_n,
+                    "cascadia",
+                    "run",
+                    "m.gguf",
+                    "--engine",
+                    "sycl-llama",
+                    "--elastic-share",
+                    bad_n,
                 ])
                 .is_err(),
                 "{bad_n} must not parse"
