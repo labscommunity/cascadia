@@ -3,6 +3,8 @@
   jev:  python tools/decision_export.py jev  --base-ir STOCK_INT8_IR --adapter-dir JEV/adapter_vllm --out TREE [--stages N]
   kev:  python tools/decision_export.py kev  --base-ir STOCK_INT8_IR --weights QWEN35_9B_BASE --lora KEV/adapter_model.safetensors \
                                              --head-pt KEV/head.pt --out TREE
+        (--weights and --lora are required; the tree ships KEV/tokenizer.json, the one beside head.pt,
+        not the Base checkpoint's; --tokenizer FILE overrides that for any family)
   clef: python tools/decision_export.py clef --base-ir STOCK_INT8_IR --weights CLEF_DIR --clef-dir CLEF_DIR --out TREE
 
 The stage IRs come from export_qwen36_moe.run_export (one stage in memory at a time).
@@ -64,6 +66,13 @@ def write_jev_profile(adapter_dir, calibration_json, out_dir, max_tokens=32768):
         "verbalizers": slots["verbalizers"], "verbalizer_ids": h["verbalizer_ids"], "bias": h["bias"],
         "slots": slots["ranges"], "temperature": {k: cal[k] for k in ("noul", "choice", "score")}}}
     _write(out_dir, profile, {"kind": "verbalizer"})
+
+
+def kev_head_meta(head_pt):
+    """head.pt's recorded backbone: {"base": HF id or None, "weights": "lora" | ... | None}."""
+    import torch
+    meta = torch.load(head_pt, map_location="cpu", weights_only=True)
+    return {"base": meta.get("base"), "weights": meta.get("weights")}
 
 
 def write_kev_profile(head_pt, out_dir, max_tokens=73728, hidden=None):
@@ -139,11 +148,36 @@ def main():
     ap.add_argument("--calibration", default=None, help="jev: calibration.json (default: ADAPTER_DIR/../calibration.json)")
     ap.add_argument("--head-pt", default=None, help="kev: head.pt")
     ap.add_argument("--clef-dir", default=None, help="clef: dir with joint_head.* and the checkpoint")
+    ap.add_argument("--tokenizer", default=None,
+                    help="tokenizer.json the tree ships instead of the --weights/IR one (kev default: the one beside --head-pt)")
     a = ap.parse_args()
     need = {"jev": ("adapter_dir", "--adapter-dir"), "kev": ("head_pt", "--head-pt"), "clef": ("clef_dir", "--clef-dir")}
     attr, flag = need[a.family]
     if not getattr(a, attr):
         ap.error(f"{a.family} needs {flag}")
+    tokenizer = a.tokenizer
+    if a.family == "kev":
+        # Kev's pointer head was trained on its fine-tuned backbone's hidden states (Base + LoRA):
+        # without either, the tree is the stock backbone under Kev's head and serves wrong answers
+        # that a reference built the same way would not catch.
+        meta = kev_head_meta(a.head_pt)
+        missing = [f for f, v in (("--weights", a.weights), ("--lora", a.lora)) if not v]
+        if missing:
+            rec = f" ({a.head_pt} records base {meta['base']!r}, weights {meta['weights']!r})" \
+                if meta["base"] or meta["weights"] else ""
+            ap.error(f"kev needs {' and '.join(missing)}: the pointer head reads its fine-tuned "
+                     f"backbone's hidden states, not the stock IR's{rec}")
+        if meta["weights"] not in (None, "lora"):
+            ap.error(f"{a.head_pt} records weights {meta['weights']!r}; a kev export grafts a LoRA "
+                     f"(weights 'lora') onto --weights")
+        # The spike (and so the golden reference) tokenizes with Kev's own tokenizer.json, which
+        # differs from the Base checkpoint's that run_export would otherwise copy from --weights.
+        tokenizer = tokenizer or str(Path(a.head_pt).parent / "tokenizer.json")
+    if tokenizer is not None and not Path(tokenizer).is_file():
+        ap.error(f"{tokenizer} not found: a {a.family} tree must ship the tokenizer its head was "
+                 f"trained with (pass --tokenizer FILE)")
+    # Only an explicit override reaches run_export; jev/clef keep its default tokenizer choice.
+    tok_kw = {"tokenizer": tokenizer} if tokenizer is not None else {}
     from export_qwen36_moe import run_export
 
     # The decision assets below are written before run_export; drop any manifest from an
@@ -164,15 +198,15 @@ def main():
         mpe = _text_config(src).get("max_position_embeddings", 32768)
         write_jev_profile(a.adapter_dir, cal, a.out, max_tokens=min(int(mpe), 32768))
         run_export(a.base_ir, a.out, a.stages, False, a.layer_split, weights=a.weights, lora=lora,
-                   lora_scale=a.lora_scale, final_hidden=False)
+                   lora_scale=a.lora_scale, final_hidden=False, **tok_kw)
     elif a.family == "kev":
         write_kev_profile(a.head_pt, a.out, hidden=int(_text_config(a.base_ir)["hidden_size"]))
         run_export(a.base_ir, a.out, a.stages, False, a.layer_split, weights=a.weights, lora=a.lora,
-                   lora_scale=a.lora_scale, final_hidden=True)
+                   lora_scale=a.lora_scale, final_hidden=True, **tok_kw)
     else:
         write_clef_profile(a.clef_dir, a.out)
         run_export(a.base_ir, a.out, a.stages, False, a.layer_split, weights=a.weights or a.clef_dir,
-                   lora=a.lora, lora_scale=a.lora_scale, final_hidden=True)
+                   lora=a.lora, lora_scale=a.lora_scale, final_hidden=True, **tok_kw)
     print(f"decision tree written: {a.out}")
 
 
