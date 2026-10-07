@@ -87,12 +87,17 @@ impl DecisionService {
         let prof = profile::DecisionProfile::load(&path)?;
         let tok = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| format!("{}: tokenizer.json: {e}", model_dir.display()))?;
+        let max_total_tokens = prof.max_total_tokens.unwrap_or(prof.max_tokens * 4);
         let codec: Box<dyn Codec> = match prof.family {
             profile::Family::Jev => Box::new(jev::JevCodec::new(tok, prof.jev.clone().unwrap())?),
-            profile::Family::Kev => Box::new(kev::KevCodec::new(tok, prof.kev.clone().unwrap())?),
+            profile::Family::Kev => Box::new(kev::KevCodec::new(
+                tok,
+                prof.kev.clone().unwrap(),
+                prof.max_tokens,
+                max_total_tokens,
+            )?),
             profile::Family::Clef => Box::new(clef::ClefCodec::new(tok, prof.max_tokens)?),
         };
-        let max_total_tokens = prof.max_total_tokens.unwrap_or(prof.max_tokens * 4);
         let max_questions = prof.max_questions.unwrap_or(32);
         Ok(Some(Arc::new(DecisionService {
             codec,
