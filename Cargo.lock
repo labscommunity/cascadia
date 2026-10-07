@@ -274,6 +274,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "parking_lot",
+ "ryu",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
