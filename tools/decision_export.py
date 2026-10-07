@@ -39,17 +39,35 @@ def write_jev_profile(adapter_dir, calibration_json, out_dir, max_tokens=32768):
     h = json.loads((Path(adapter_dir) / "decision_head.json").read_text())
     cal = json.loads(Path(calibration_json).read_text())["per_kind"]
     slots = h["slots"]
+    n = len(h["verbalizer_ids"])
+    if not (len(slots["verbalizers"]) == n == len(h["bias"])):
+        raise ValueError(f"{adapter_dir}/decision_head.json: verbalizers/verbalizer_ids/bias lengths differ: "
+                         f"{len(slots['verbalizers'])}/{n}/{len(h['bias'])}")
+    for kind, (lo, hi) in slots["ranges"].items():
+        if not 0 <= lo <= hi <= n:
+            raise ValueError(f"{adapter_dir}/decision_head.json: slot range {kind} [{lo}, {hi}) "
+                             f"out of bounds for {n} verbalizers")
+    missing = [k for k in ("noul", "choice", "score") if k not in cal]
+    if missing:
+        # the reference indexes TEMPS[kind] (jev.py:58): no silent 1.0
+        raise ValueError(f"{calibration_json}: per_kind lacks temperature for {', '.join(missing)}")
     profile = {"family": "jev", "max_tokens": max_tokens, "jev": {
         "verbalizers": slots["verbalizers"], "verbalizer_ids": h["verbalizer_ids"], "bias": h["bias"],
-        "slots": slots["ranges"], "temperature": {k: cal.get(k, 1.0) for k in ("noul", "choice", "score")}}}
+        "slots": slots["ranges"], "temperature": {k: cal[k] for k in ("noul", "choice", "score")}}}
     _write(out_dir, profile, {"kind": "verbalizer"})
 
 
-def write_kev_profile(head_pt, out_dir, max_tokens=73728):
+def write_kev_profile(head_pt, out_dir, max_tokens=73728, hidden=None):
+    """`hidden`: the base IR's hidden size; the q/k weights' input dim must equal it."""
     import torch
     meta = torch.load(head_pt, map_location="cpu", weights_only=True)
     w = meta["head"]
     dp = w["q.weight"].shape[0]
+    if hidden is not None:
+        for key in ("q.weight", "k.weight"):
+            if w[key].shape[1] != hidden:
+                raise ValueError(f"{head_pt}: {key} has hidden dim {w[key].shape[1]} but the base IR's "
+                                 f"hidden_size is {hidden}")
     d = Path(out_dir) / "decision"
     d.mkdir(parents=True, exist_ok=True)
     for key, fname in (("q.weight", "pointer_q_w"), ("q.bias", "pointer_q_b"), ("k.weight", "pointer_k_w"), ("k.bias", "pointer_k_b")):
@@ -70,6 +88,11 @@ def _lm_head_name(W, clef_dir):
         return emb
     raise SystemExit(f"{clef_dir}: no lm_head.weight in model.safetensors.index.json "
                      f"(and tie_word_embeddings is not set) - cannot write decision/lm_head.f16")
+
+
+def _text_config(model_dir):
+    cfg = json.loads((Path(model_dir) / "config.json").read_text())
+    return cfg.get("text_config") or cfg
 
 
 def write_clef_profile(clef_dir, out_dir, max_tokens=16384, chunk=8192):
@@ -114,18 +137,27 @@ def main():
         ap.error(f"{a.family} needs {flag}")
     from export_qwen36_moe import run_export
 
+    # The decision assets below are written before run_export; drop any manifest from an
+    # earlier export first, so a failure anywhere (asset writers, or run_export's pre-flight
+    # checks that run before its own stale-manifest removal) never leaves the old manifest
+    # and stages loadable next to new decision assets. manifest.json is the commit marker.
+    stale = Path(a.out) / "manifest.json"
+    if stale.exists():
+        stale.unlink()
+
     # validate is always False: run_export refuses --validate with --weights/--lora
     # (decision trees are checked by the golden/parity gates instead).
     if a.family == "jev":
         lora = a.lora or os.path.join(a.adapter_dir, "adapter_model.safetensors")
         cal = a.calibration or os.path.join(os.path.dirname(os.path.abspath(a.adapter_dir)), "calibration.json")
-        cfg = json.loads((Path(a.base_ir) / "config.json").read_text())
-        mpe = (cfg.get("text_config") or cfg).get("max_position_embeddings", 32768)
+        # run_export ships the fine-tune's config.json in the tree when --weights is given
+        src = a.weights if a.weights and (Path(a.weights) / "config.json").exists() else a.base_ir
+        mpe = _text_config(src).get("max_position_embeddings", 32768)
         write_jev_profile(a.adapter_dir, cal, a.out, max_tokens=min(int(mpe), 32768))
         run_export(a.base_ir, a.out, a.stages, False, a.layer_split, weights=a.weights, lora=lora,
                    lora_scale=a.lora_scale, final_hidden=False)
     elif a.family == "kev":
-        write_kev_profile(a.head_pt, a.out)
+        write_kev_profile(a.head_pt, a.out, hidden=int(_text_config(a.base_ir)["hidden_size"]))
         run_export(a.base_ir, a.out, a.stages, False, a.layer_split, weights=a.weights, lora=a.lora,
                    lora_scale=a.lora_scale, final_hidden=True)
     else:
