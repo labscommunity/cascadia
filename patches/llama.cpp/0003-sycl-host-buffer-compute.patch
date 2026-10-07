@@ -17,15 +17,19 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 index d1456a867..42107883b 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -6306,6 +6306,12 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6306,6 +6306,16 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
  }
  
  static bool ggml_backend_sycl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
 +    // CASCADIA_HOST_BUFT: weights in the pinned host buffer (USM host) are
 +    // device-accessible pointers; compute on them in place instead of
 +    // handing the op to the CPU backend (UMA: same DRAM; PCIe: link-bound).
++    // pinned USM is allocated under device 0's context and the unpinned
++    // fallback (GGML_SYCL_ENABLE_HOST_PINNED_MEM=0) is ordinary pageable
++    // memory, so only device 0 with pinned memory enabled can claim it
 +    if (buft == ggml_backend_sycl_host_buffer_type()) {
-+        return true;
++        ggml_backend_sycl_device_context * dev_ctx = (ggml_backend_sycl_device_context *) dev->context;
++        return g_ggml_sycl_enable_host_pinned_mem && dev_ctx->device == 0;
 +    }
      if (buft->iface.get_name != ggml_backend_sycl_buffer_type_get_name) {
          return false;
