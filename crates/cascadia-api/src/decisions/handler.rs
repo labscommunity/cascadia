@@ -98,16 +98,9 @@ pub(crate) async fn evaluate(
             return Err(DecisionError::Engine("decision engine error".into()));
         }
     };
-    let passes = match encoded {
-        Ok(p) => p,
-        Err(DecisionError::BadRequest(m)) => {
-            tracing::warn!(error = %m, "decision encode failed");
-            return Err(DecisionError::BadRequest(
-                "request could not be tokenized".into(),
-            ));
-        }
-        Err(e) => return Err(e),
-    };
+    // Codecs mask tokenizer failures themselves (`tokenize_failed`); every other encode error is
+    // a validation reason the client should see (Clef's option cap, JEV's image parts).
+    let passes = encoded?;
     if let Some(p) = passes
         .iter()
         .find(|p| p.readout.prompt_ids.len() > svc.max_tokens)
@@ -192,10 +185,12 @@ pub(crate) async fn evaluate(
             );
         }
     }
-    let answers = req
-        .questions
-        .iter()
-        .map(|(id, q)| (id.clone(), answer_from_probs(q, &probs[id])))
-        .collect();
+    let mut answers = IndexMap::with_capacity(req.questions.len());
+    for (id, q) in &req.questions {
+        let Some(p) = probs.get(id) else {
+            return Err(engine_failure("codec produced no answer for a question"));
+        };
+        answers.insert(id.clone(), answer_from_probs(q, p));
+    }
     Ok((answers, input_tokens))
 }

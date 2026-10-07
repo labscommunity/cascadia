@@ -75,7 +75,7 @@ impl KevCodec {
         let enc = self
             .tok
             .encode(safe.as_str(), false)
-            .map_err(|e| DecisionError::BadRequest(format!("tokenize: {e}")))?;
+            .map_err(super::tokenize_failed)?;
         Ok(enc.get_ids().to_vec())
     }
 }
@@ -243,6 +243,49 @@ mod tests {
         assert_eq!(p.readout.cache_prefix, Some(2), "<fim_prefix> + state");
         let probs = c.probabilities(&r, &p.parts[0], &[2.0, 0.0]);
         assert!((probs[0] - 1.0f64.exp() / (1.0f64.exp() + 1.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tokenizer_failure_is_masked_with_a_fixed_message() {
+        // WordLevel fails on an out-of-vocab word when its unk token is not in the vocab.
+        let words = [
+            "<|fim_prefix|>",
+            "<|fim_middle|>",
+            "<|box_start|>",
+            "<|box_end|>",
+            "<|fim_suffix|>",
+        ];
+        let vocab: std::collections::HashMap<String, u32> = words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (w.to_string(), i as u32))
+            .collect();
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(vocab.into_iter().collect())
+            .unk_token("[missing-unk]".into())
+            .build()
+            .unwrap();
+        let mut t = tokenizers::Tokenizer::new(model);
+        t.with_pre_tokenizer(Some(
+            tokenizers::pre_tokenizers::whitespace::WhitespaceSplit,
+        ));
+        t.add_special_tokens(
+            &words
+                .iter()
+                .map(|w| tokenizers::AddedToken::from(w.to_string(), true))
+                .collect::<Vec<_>>(),
+        );
+        let c = KevCodec::new(t, KevProfile { temperature: 1.0 }).unwrap();
+        let r: DecisionRequest = serde_json::from_str(
+            r#"{"model": "m", "state": "out_of_vocab", "questions": {"u": {"type": "noul"}}}"#,
+        )
+        .unwrap();
+        match c.encode(&r) {
+            Err(DecisionError::BadRequest(m)) => {
+                assert_eq!(m, crate::decisions::TOKENIZE_FAILED)
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

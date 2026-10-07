@@ -3639,9 +3639,11 @@ mod tests {
         let body = format!(
             r#"{{"model": "m", "state": "{big}", "questions": {{"u": {{"type": "noul"}}}}}}"#
         );
-        let (status, _, _) =
+        let (status, v, _) =
             post_decisions_sized(make_decision_app_with(1000, 4000).await, &body).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        // The byte pre-check fired (64000 > 4000 x 8), not a token-count check after encoding.
+        assert_eq!(v["error"], "state is 64000 bytes; the limit is 32000");
     }
 
     #[tokio::test]
