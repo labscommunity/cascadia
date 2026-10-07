@@ -594,8 +594,9 @@ impl Builder for Qwen36Builder {
 
         // Every rank: pipeline ranks other than 0 have no tokenizer, yet validate readouts too.
         self.vocab = read_vocab(&dir);
-        let owns_head = self.total <= 1 || self.rank + 1 == self.total;
-        self.decision_assets = if owns_head && dir.join("decision").join("head.json").exists() {
+        self.decision_assets = if owns_head(self.rank, self.total)
+            && dir.join("decision").join("head.json").exists()
+        {
             progress.push(LoadProgress::message(
                 "loading decision head assets".to_string(),
             ));
@@ -780,6 +781,41 @@ fn decision_snapshot_boundaries(d: &cascadia_types::DecisionReadout, cache_on: b
     match d.cache_prefix {
         Some(c) if cache_on => vec![c as usize],
         _ => Vec::new(),
+    }
+}
+
+/// Rank `rank` of `total` runs the last stage (single box: always).
+fn owns_head(rank: u32, total: u32) -> bool {
+    total <= 1 || rank + 1 == total
+}
+
+/// The readout's head reads final-hidden rows (Pointer, Joint), not only the last logits.
+fn head_reads_hidden(d: &cascadia_types::DecisionReadout) -> bool {
+    d.head.hidden_need() != cascadia_types::HiddenNeed::None
+}
+
+/// Prompt bound a decision readout is validated against: the model window TIGHTENS the decision
+/// cap, never widens it (Qwen3.5's 262144 window must not lift the 131072 decision bound).
+fn decision_prompt_cap(max_ctx: Option<usize>) -> usize {
+    max_ctx.map_or(cascadia_types::MAX_DECISION_PROMPT, |m| {
+        m.min(cascadia_types::MAX_DECISION_PROMPT)
+    })
+}
+
+/// A decision pass prefills exactly the codec's validated ids; an Option-B resume prefix would be
+/// appended after them, unvalidated. Shared by single-box and pipeline rank-0 admission.
+fn decision_resume_conflict(task: &GenerationTask) -> bool {
+    task.decision.is_some() && task.resume_ids().is_some()
+}
+
+/// The prefix-cache probe for a decision pass: restore no further than the first row/logit the
+/// head reads (`warm_limit`; Joint: 0 = cold). `PrefixCache::longest_prefix` matches only STRICT
+/// prefixes of the slice it is given, so the probe is one token longer than the limit: any hit is
+/// at most `warm_limit` tokens.
+fn decision_warm_probe<'a>(d: &cascadia_types::DecisionReadout, ids: &'a [u32]) -> &'a [u32] {
+    match d.warm_limit() {
+        0 => &ids[..0],
+        lim => &ids[..(lim + 1).min(ids.len())],
     }
 }
 
@@ -1089,8 +1125,7 @@ impl Qwen36Engine {
         let first_global = self.rank == 0;
         let mut hidden: Vec<f32> = embeds.to_vec();
         let n_stages = self.stages.len();
-        let owns_head = self.total <= 1 || self.rank + 1 == self.total;
-        let want_fh = self.want_final_hidden && self.final_hidden_output && owns_head;
+        let want_fh = self.want_final_hidden && self.final_hidden_output && self.owns_head();
         let mut final_hidden = None;
         for (j, st) in self.stages.iter_mut().enumerate() {
             let names = st.input_names().map_err(map_ov)?;
@@ -1277,6 +1312,11 @@ impl Qwen36Engine {
         )]
     }
 
+    /// This process runs the last stage, where the final hidden states and the decision head live.
+    fn owns_head(&self) -> bool {
+        owns_head(self.rank, self.total)
+    }
+
     /// End a decision pass: run the head on the collected state, emit ONE final chunk, reset.
     fn finish_decision(&mut self) -> Vec<(TaskId, Chunk)> {
         self.want_final_hidden = false;
@@ -1316,18 +1356,13 @@ impl Qwen36Engine {
         let vocab = self
             .vocab
             .ok_or("decision_unsupported: tree config.json states no vocab_size")?;
-        d.validate(
-            vocab,
-            self.max_ctx.unwrap_or(cascadia_types::MAX_DECISION_PROMPT),
-        )
-        .map_err(|e| format!("decision_invalid: {e}"))?;
-        let owns_head = self.total <= 1 || self.rank + 1 == self.total;
-        if owns_head {
+        d.validate(vocab, decision_prompt_cap(self.max_ctx))
+            .map_err(|e| format!("decision_invalid: {e}"))?;
+        if self.owns_head() {
             if self.decision_assets.is_none() {
                 return Err("decision_unsupported: model has no decision/ head assets".into());
             }
-            if d.head.hidden_need() != cascadia_types::HiddenNeed::None && !self.final_hidden_output
-            {
+            if head_reads_hidden(d) && !self.final_hidden_output {
                 return Err(
                     "decision_unsupported: tree was exported without --final-hidden".into(),
                 );
@@ -2396,17 +2431,21 @@ impl Qwen36Engine {
                     return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
                 }
             };
+            // Every admission (chat too) clears it here and sets it only once the task is admitted
+            // (just before `active` is filled), so neither a stale flag nor a refused admission
+            // can make a later pass copy `final_hidden`.
+            self.want_final_hidden = false;
             if let Some(d) = &task.decision {
                 if let Err(reason) = self.admit_decision_check(d) {
                     let id = task.task_id.clone();
                     return vec![(id.clone(), Chunk::error(id, reason))];
                 }
             }
-            // Every admission (chat too) sets it, so a stale flag can never outlive its task.
-            self.want_final_hidden = task
-                .decision
-                .as_ref()
-                .is_some_and(|d| d.head.hidden_need() != cascadia_types::HiddenNeed::None);
+            if decision_resume_conflict(&task) {
+                let id = task.task_id.clone();
+                let reason = "decision_invalid: resume_token_ids not allowed on a decision task";
+                return vec![(id.clone(), Chunk::error(id, reason))];
+            }
             // Option B forced-prefix resume: append the already-emitted assistant
             // tokens after the rendered prompt (concat, not replace) so the cold
             // prefill below carries them as context. No-op when not resuming.
@@ -2472,16 +2511,7 @@ impl Qwen36Engine {
             // Issue-34 warm-resume: restore a cached strict-prefix blob and prefill only the suffix;
             // else cold reset. Gated + best-effort (stub ⇒ no blob ⇒ cold). 0 on the default path.
             let warm_prefix: usize = if let Some(d) = &task.decision {
-                // Restore no further than the first row/logit the head reads (Joint: 0 = cold).
-                // `longest_prefix` matches only STRICT prefixes of the slice it is given, so the
-                // probe is one token longer than the limit: a hit of length <= warm_limit.
-                let lim = d.warm_limit();
-                let probe = if lim == 0 {
-                    &prompt_ids[..0]
-                } else {
-                    &prompt_ids[..(lim + 1).min(prompt_ids.len())]
-                };
-                self.local_warm_or_cold(probe)
+                self.local_warm_or_cold(decision_warm_probe(d, &prompt_ids))
             } else {
                 #[cfg(feature = "kv_coord")]
                 {
@@ -2574,6 +2604,7 @@ impl Qwen36Engine {
                     "qwen35 prefix-cache snapshot plan"
                 );
             }
+            self.want_final_hidden = task.decision.as_ref().is_some_and(head_reads_hidden);
             self.active = Some(ActiveTask {
                 task_id: task.task_id,
                 tenant: task.tenant,
@@ -3958,5 +3989,100 @@ mod tests {
         assert!(m.final_hidden_output);
         let m = Manifest::parse(r#"{"arch":"qwen3_5","hidden_size":4096,"stages":[]}"#).unwrap();
         assert!(!m.final_hidden_output);
+    }
+
+    #[test]
+    fn decision_with_resume_ids_conflicts() {
+        let mut t = decision_task(
+            cascadia_types::ReadoutHead::Verbalizer { token_ids: vec![1] },
+            None,
+        );
+        assert!(!decision_resume_conflict(&t));
+        t.resume_token_ids = Some(vec![5]);
+        assert!(decision_resume_conflict(&t));
+        t.decision = None;
+        assert!(!decision_resume_conflict(&t), "chat resume is fine");
+    }
+
+    fn readout_n(n: u32, head: cascadia_types::ReadoutHead) -> cascadia_types::DecisionReadout {
+        cascadia_types::DecisionReadout {
+            prompt_ids: (100..100 + n).collect(),
+            head,
+            cache_prefix: None,
+        }
+    }
+
+    #[test]
+    fn decision_warm_probe_bounds_the_restore() {
+        use cascadia_types::{JointOption, JointQuestion, ReadoutHead};
+        let v = readout_n(10, ReadoutHead::Verbalizer { token_ids: vec![1] });
+        assert_eq!(
+            decision_warm_probe(&v, &v.prompt_ids).len(),
+            10,
+            "strict match => <= n-1 restored"
+        );
+        let p = readout_n(
+            10,
+            ReadoutHead::Pointer {
+                decide_pos: 9,
+                option_pos: vec![6, 4],
+            },
+        );
+        assert_eq!(decision_warm_probe(&p, &p.prompt_ids), &p.prompt_ids[..5]);
+        let j = readout_n(
+            10,
+            ReadoutHead::Joint {
+                questions: vec![JointQuestion {
+                    qtype: 0,
+                    span: [0, 1],
+                    options: vec![JointOption { span: [1, 2] }],
+                }],
+            },
+        );
+        assert!(decision_warm_probe(&j, &j.prompt_ids).is_empty());
+    }
+
+    #[test]
+    fn decision_warm_probe_hits_the_cache_prefix_and_never_past_it() {
+        use cascadia_types::ReadoutHead;
+        let mut d = readout_n(
+            40,
+            ReadoutHead::Pointer {
+                decide_pos: 30,
+                option_pos: vec![20, 25],
+            },
+        );
+        d.cache_prefix = Some(20);
+        let mut pc = crate::prefix_cache::PrefixCache::new(1 << 20);
+        for len in [20usize, 21, 25] {
+            assert!(pc.insert(d.prompt_ids[..len].to_vec(), vec![vec![0u8; 8]]));
+        }
+        let (_, len) = pc
+            .longest_prefix(decision_warm_probe(&d, &d.prompt_ids))
+            .expect("hit");
+        assert_eq!(
+            len, 20,
+            "restores exactly the state prefix, never a row the head reads"
+        );
+    }
+
+    #[test]
+    fn decision_prompt_cap_is_the_min_of_window_and_cap() {
+        use cascadia_types::MAX_DECISION_PROMPT;
+        assert_eq!(decision_prompt_cap(None), MAX_DECISION_PROMPT);
+        assert_eq!(
+            decision_prompt_cap(Some(262_144)),
+            MAX_DECISION_PROMPT,
+            "window never widens"
+        );
+        assert_eq!(decision_prompt_cap(Some(40_960)), 40_960, "window tightens");
+    }
+
+    #[test]
+    fn owns_head_is_single_box_or_last_rank() {
+        assert!(owns_head(0, 1));
+        assert!(owns_head(0, 0));
+        assert!(!owns_head(0, 2));
+        assert!(owns_head(1, 2));
     }
 }
