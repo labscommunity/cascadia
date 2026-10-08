@@ -117,7 +117,7 @@ impl Codec for ClefCodec {
         Limits {
             max_questions: 32,
             max_options: 256,
-            min_levels: 2,
+            min_levels: 1,
             max_levels: 256,
             image_parts: false,
         }
@@ -441,5 +441,33 @@ mod tests {
         // engine order is sorted: [a, z]; logits favour a
         let probs = c.probabilities(&r, &p[0].parts[0], &[3.0, 0.0]);
         assert!(probs[1] > probs[0], "request order is [z, a]");
+    }
+
+    #[test]
+    fn a_one_level_score_is_served_like_the_reference() {
+        // P2-FID-1: joint_schema_model refuses only empty criteria; one level answers score 0.0
+        // with probability and confidence 1, NaN-free.
+        let r: DecisionRequest = serde_json::from_str(
+            r#"{"model": "m", "state": "S", "questions": {"s": {"type": "score", "criteria": ["only"]}}}"#,
+        )
+        .unwrap();
+        let c = ClefCodec::new(tok(), 16384, None).unwrap();
+        r.validate(&c.limits()).unwrap();
+        let p = c.encode(&r).unwrap();
+        match &p[0].readout.head {
+            ReadoutHead::Joint { questions } => assert_eq!(questions[0].options.len(), 1),
+            h => panic!("{h:?}"),
+        }
+        assert_eq!(p[0].parts[0].logits, 0..1);
+        let probs = c.probabilities(&r, &p[0].parts[0], &[-7.5]);
+        assert_eq!(probs, vec![1.0]);
+        let a = serde_json::to_value(crate::decisions::schema::answer_from_probs(
+            &r.questions["s"],
+            &probs,
+        ))
+        .unwrap();
+        assert_eq!(a["score"], 0.0);
+        assert_eq!(a["confidence"], 1.0);
+        assert_eq!(a["probabilities"]["0"], 1.0);
     }
 }
