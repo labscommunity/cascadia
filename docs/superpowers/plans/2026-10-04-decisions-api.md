@@ -6240,6 +6240,7 @@ Every check aborts. `start_rank1` and `start_rank0` print why and return status 
 rsync -a ~/trees/$TREE/ RANK1_HOST:trees/$TREE/
 # host B (rank 1 listens on the LAN; start it first). $RUN is the same private dir on both hosts.
 start_rank1() {
+  command -v nc > /dev/null || { echo "start_rank1 needs nc (netcat) for its port checks"; return 1; }
   ! nc -z 127.0.0.1 7801 2> /dev/null || { echo ":7801 is already in use: stop the previous rank 1 first"; return 1; }
   cascadia worker --model ~/trees/$TREE --engine qwen35 --device CPU --rank 1 --total 2 --listen 0.0.0.0:7801 > $RUN/rank1.log 2>&1 &
   echo $! > $RUN/rank1.pid
