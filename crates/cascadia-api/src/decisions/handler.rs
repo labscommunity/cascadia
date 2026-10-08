@@ -184,11 +184,19 @@ pub(crate) async fn evaluate(
             svc.max_total_tokens
         )));
     }
-    if let Some(dump) = state.decision_dump.clone() {
+    if let Some(dump) = state.decision_dump.clone().filter(|d| !d.is_closed()) {
         // Serialize and write off the async workers (P2-SEC-5): a request's lines can reach
         // ~16 MB, and a synchronous write under the lock would stall chat streams and timers.
+        // The write carries the request's permit, so a client that leaves cannot orphan
+        // request-sized writes past the permits (P3-SEC-1). A closed dump (cap reached, write
+        // failed) costs nothing: no clone, no serialization.
         let dumped = passes.clone();
+        let held3 = held.clone();
         let wrote = tokio::task::spawn_blocking(move || {
+            let _held = held3;
+            if dump.is_closed() {
+                return Ok(());
+            }
             let mut lines = Vec::new();
             for p in &dumped {
                 let parts: Vec<_> = p
@@ -202,9 +210,7 @@ pub(crate) async fn evaluate(
                 }
                 lines.push(b'\n');
             }
-            // A poisoned lock (a panic mid-write) must not take the endpoint down: keep writing.
-            let mut f = dump.lock().unwrap_or_else(|e| e.into_inner());
-            f.append(&lines)
+            dump.append(&lines)
         })
         .await;
         match wrote {
