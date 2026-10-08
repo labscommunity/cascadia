@@ -211,6 +211,35 @@ def lora_scale_from_config(adapter_file):
     return alpha / (r ** 0.5) if cfg.get("use_rslora") else alpha / r
 
 
+def _feeds_subtract(const):
+    """True when the constant's decompression chain (Constant -> Convert -> ...) subtracts a zero point."""
+    for t in const.output(0).get_target_inputs():
+        node = t.get_node()
+        if node.get_type_name() == "Subtract":
+            return True
+        if node.get_type_name() == "Convert" and any(
+                u.get_node().get_type_name() == "Subtract" for u in node.output(0).get_target_inputs()):
+            return True
+    return False
+
+
+def check_embedding_layout(src, elem_type, has_zero_point, scale_shape, rows):
+    """swap_embeddings writes i8 symmetric rows with one f16 scale per row, so the stock constant
+    must already be laid out that way (verified on the Qwen3.5-9B IR only). A u8 asymmetric layout
+    would keep subtracting the stock zero point from the new symmetric values: every embedding
+    shifted, with no error until parity. Refuse anything else, naming what was found."""
+    problems = []
+    if elem_type != "i8":
+        problems.append(f"weight element type {elem_type} (expected i8)")
+    if has_zero_point:
+        problems.append("a zero point is subtracted (asymmetric)")
+    if list(scale_shape) != [rows, 1]:
+        problems.append(f"scale shape {list(scale_shape)} (expected [{rows}, 1])")
+    if problems:
+        raise ValueError(f"{src}: embeddings are not i8 symmetric with one scale per row: {'; '.join(problems)}. "
+                         "swap_embeddings only re-quantizes that layout; inspect this IR's embeddings first")
+
+
 def swap_embeddings(src_xml, weights, out_dir, chunk=16384):
     import openvino as ov
     model = ov.Core().read_model(src_xml)
@@ -221,6 +250,9 @@ def swap_embeddings(src_xml, weights, out_dir, chunk=16384):
         raise ValueError(f"{src_xml}: no embedding Constant ending in '_openvino_orig_weight' "
                          "(and '_openvino_orig_weight/scale')")
     rows, hid = list(wop.get_output_shape(0))
+    zp = any(nm.endswith("_openvino_orig_weight/zero_point") for nm in consts) or _feeds_subtract(wop)
+    check_embedding_layout(src_xml, wop.get_element_type().get_type_name(), zp,
+                           list(sop.get_output_shape(0)), rows)
     q = np.empty((rows, hid), dtype=np.int8)
     s = np.empty((rows, 1), dtype=np.float16)
     for a in range(0, rows, chunk):
