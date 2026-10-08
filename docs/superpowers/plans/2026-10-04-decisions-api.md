@@ -47,6 +47,14 @@ Model trees are built by an extended exporter: Intel's stock int8 IR, plus an op
 
   Rationale: in the spike, int8 moved probabilities by at most 0.08, and the only miss (JEV) was a 0.501/0.499 tie. Flips are tolerated only where the full-precision model itself was undecided. JEV has 5 such questions under a 0.02 margin, so excluding near-ties outright would let too much through.
 - **Long jobs:** exports, references and server bring-up run in the background with a Monitor that watches for completion and for failure signatures (Traceback, Error, killed, CAP, MISMATCH, FLIP, non-zero exit).
+- **Runbook environment** (Task 15 Step 6 and Tasks 18–22). Every command starts from this preamble:
+
+  ```bash
+  export SPIKE_DIR=/Users/blokchainaholic/Desktop/clabs/tahoma/experiments
+  PY=$SPIKE_DIR/clef-spike/.venv/bin/python
+  ```
+
+  `$PY` runs every tool and is the command `run_capped.py` launches. That venv (transformers 5.18, torch 2.14, openvino 2026.4.1, safetensors 0.8) is where the decision tools were developed and tested; `tools/requirements.txt`'s transformers range is unverified for `codec_golden.py`'s tokenizer-only directories. `cascadia` is this branch's release build on `PATH` (`cargo build --release -p cascadia --features openvino`), against the OpenVINO SDK of the venv's version (2026.4.1, the CI `OV_VERSION` pin). Manual `curl` calls to the decision routes must send `-H 'content-type: application/json'` (axum answers 415 otherwise); the tools set it themselves.
 - **Secrets:** never read `.env*`, keys or tokens. HF downloads use the already-configured CLI login. Subagent prompts carry the same rule.
 - **Commits:** no `Co-Authored-By` or session trailers. No push or PR without the user's approval.
 - **Tests:** Rust: `cargo test -p <crate>`. Python: `python -m pytest tools/tests/<file> -v` (OpenVINO-dependent tests `pytest.importorskip("openvino")`).
@@ -5021,21 +5029,76 @@ git commit -m "feat(tools): decision_export.py builds jev/kev/clef decision tree
 
 - [ ] **Step 6: Pipeline smoke test** (manual, needs OpenVINO and Tasks 11/11b; one machine, two processes; nothing to commit)
 
-This is the first point where a 2-stage decision tree exists, so it is where the pipeline frames (Task 11b) are exercised end to end. Build a 2-stage JEV-9B tree, then start the two ranks. Flags are as declared in `WorkerArgs`: the tree is `--model`, and the downstream peer is `--next`.
+This is the first point where a 2-stage decision tree exists, so it is where the pipeline frames (Task 11b) are exercised end to end. Build a 2-stage JEV-9B tree, then start the two ranks. Flags are as declared in `WorkerArgs`: the tree is `--model`, and the downstream peer is `--next`. Use the runbook environment from Global Constraints (`$SPIKE_DIR`, `$PY`, `cascadia` on `PATH`). Run each process in the background with a Monitor on its log, watching for `Traceback|panic|error|timed out|NAK|epoch|poisoned`.
 
 ```bash
-python tools/decision_export.py jev --base-ir ~/models/qwen35-9b-int8 --adapter-dir ~/models/jev9b/adapter_vllm --stages 2 --out ~/trees/jev9b-int8-2st
-cascadia worker --model ~/trees/jev9b-int8-2st --engine qwen35 --device CPU --rank 1 --total 2 --listen 127.0.0.1:7801 &
-cascadia worker --model ~/trees/jev9b-int8-2st --engine qwen35 --device CPU --rank 0 --total 2 --next 127.0.0.1:7801 --api 127.0.0.1:8080 &
-curl -s localhost:8080/v1/systemone -d '{"model":"jev","state":"I was charged twice","questions":{"team":{"type":"choice","instructions":"Which team?","criteria":{"billing":"charges","tech":"bugs"}}}}'
-curl -s localhost:8080/v1/decisions -d '{"model":"jev","input":"I was charged twice","questions":[{"type":"choice","name":"team","instructions":"Which team?","choices":[{"value":"billing","description":"charges"},{"value":"tech","description":"bugs"}]}]}'
+$PY tools/decision_export.py jev --base-ir ~/models/qwen35-9b-int8 --adapter-dir ~/models/jev9b/adapter_vllm --stages 2 --out ~/trees/jev9b-int8-2st
+start_ranks() {   # rank 1 first (it listens), then rank 0 (it dials rank 1 once, at startup)
+  cascadia worker --model ~/trees/jev9b-int8-2st --engine qwen35 --device CPU --rank 1 --total 2 --listen 127.0.0.1:7801 > /tmp/rank1.log 2>&1 &
+  sleep 5
+  cascadia worker --model ~/trees/jev9b-int8-2st --engine qwen35 --device CPU --rank 0 --total 2 --next 127.0.0.1:7801 --api 127.0.0.1:8080 > /tmp/rank0.log 2>&1 &
+  until curl -sf localhost:8080/health > /dev/null; do sleep 2; done
+}
+stop_ranks() { pkill -f 'cascadia worker --model' ; sleep 2; }
+start_ranks
+H='content-type: application/json'
+curl -s -H "$H" localhost:8080/v1/systemone -d '{"model":"jev","state":"I was charged twice","questions":{"team":{"type":"choice","instructions":"Which team?","criteria":{"billing":"charges","tech":"bugs"}}}}' | tee /tmp/small-base.json
+curl -s -H "$H" localhost:8080/v1/decisions -d '{"model":"jev","input":"I was charged twice","questions":[{"type":"choice","name":"team","instructions":"Which team?","choices":[{"value":"billing","description":"charges"},{"value":"tech","description":"bugs"}]}]}'
 ```
 
-Expected: 200 on both, with `"choice":"billing"` and identical probabilities. Then:
-- **Old-rank check:** restart rank 1 from a `main` build; rank 0 must answer 501 (`decision_unsupported`) within the request timeout, not hang.
-- **Large-body check:** send one request whose JEV prompt exceeds ~9k tokens (a long string state), so FRAME_DECIDE crosses 64 KiB. It must return 200.
+Expected: 200 on both, with `"choice":"billing"` and identical probabilities. (Without the `content-type` header axum answers 415.) Then, on the same two ranks:
 
-Run each process in the background with a Monitor on its log, watching for `Traceback|panic|error|timed out|NAK`.
+- **Large-body check.** A JEV state of at least 12k tokens, so FRAME_DECIDE (about 6–7 bytes of JSON per prompt id) is well past 64 KiB; JEV's `max_tokens` is 32768. It must return 200 and report `usage.input_tokens` ≥ 12000. Its answer is the baseline for the next two checks.
+
+  ```bash
+  $PY - <<'EOF'
+  import json
+  state = "The quick brown fox jumps over the lazy dog. " * 1500   # about 13.5k Qwen tokens, ~68 KB
+  q = {"team": {"type": "choice", "instructions": "Which team?", "criteria": {"billing": "charges", "tech": "bugs"}}}
+  json.dump({"model": "jev", "state": state, "questions": q}, open("/tmp/jev-large.json", "w"))
+  EOF
+  curl -s -H "$H" --data-binary @/tmp/jev-large.json localhost:8080/v1/systemone -o /tmp/large-base.json -w '%{http_code}\n'
+  $PY -c 'import json; r = json.load(open("/tmp/large-base.json")); print(r["usage"]["input_tokens"], r["answers"]["team"])'
+  ```
+
+- **Abort, then warm chat.** Drop a large decision mid-prefill, then at once send a chat request and the same decision again. Both must return 200, and the decision's answer must equal `/tmp/large-base.json` exactly (a fresh-server run).
+
+  ```bash
+  curl -s -H "$H" --max-time 1 --data-binary @/tmp/jev-large.json localhost:8080/v1/systemone; echo "abort exit=$?"   # 28 = client timed out mid-prefill
+  curl -s -H "$H" localhost:8080/v1/chat/completions -d '{"model":"jev","messages":[{"role":"user","content":"Say hi."}],"max_tokens":8}' -o /dev/null -w 'chat %{http_code}\n'
+  curl -s -H "$H" --data-binary @/tmp/jev-large.json localhost:8080/v1/systemone -o /tmp/large-after-abort.json -w 'decision %{http_code}\n'
+  $PY -c 'import json; a, b = (json.load(open(f))["answers"] for f in ("/tmp/large-base.json", "/tmp/large-after-abort.json")); assert a == b, (a, b); print("same answer")'
+  ```
+
+- **Stale-epoch DECIDE.** Abort at several points of the large request's lifetime, so some aborts land after prefill and before FRAME_DECIDE_RUN, then send two decisions back to back. Every follow-up must return 200 with the baseline answer. A `dropping stale DECIDE frame` / `dropping stale frame` warning on rank 1 is the expected drop and is fine; `timed out`, `decision engine error`, `poisoned` or a NAK in either log fails the step.
+
+  ```bash
+  for t in 0.5 1 2 3 5; do
+    curl -s -H "$H" --max-time $t --data-binary @/tmp/jev-large.json localhost:8080/v1/systemone > /dev/null
+    curl -s -H "$H" --data-binary @/tmp/jev-large.json localhost:8080/v1/systemone -o /tmp/stale-a.json -w "t=$t a %{http_code} "
+    curl -s -H "$H" localhost:8080/v1/systemone -d '{"model":"jev","state":"I was charged twice","questions":{"team":{"type":"choice","instructions":"Which team?","criteria":{"billing":"charges","tech":"bugs"}}}}' -o /tmp/stale-b.json -w "b %{http_code}\n"
+    $PY -c 'import json; L = lambda f: json.load(open(f))["answers"]; assert L("/tmp/stale-a.json") == L("/tmp/large-base.json") and L("/tmp/stale-b.json") == L("/tmp/small-base.json"); print("baseline answers")'
+  done
+  grep -nE 'stale|epoch|timed out|decision engine error|poisoned|NAK' /tmp/rank0.log /tmp/rank1.log
+  ```
+
+- **Old-rank check.** Rank 0 dials rank 1 once, at startup, and keeps its handshake, so restarting rank 1 alone only breaks the socket (a 503 or a timeout, not 501). Stop **both** ranks, start a `main`-build rank 1, then a fresh branch rank 0. The decision routes must answer 501 `decision_unsupported` and chat must still answer 200. Then restore the branch ranks.
+
+  ```bash
+  stop_ranks
+  git worktree add /tmp/cascadia-main origin/main && (cd /tmp/cascadia-main && cargo build --release -p cascadia --features openvino)
+  /tmp/cascadia-main/target/release/cascadia worker --model ~/trees/jev9b-int8-2st --engine qwen35 --device CPU --rank 1 --total 2 --listen 127.0.0.1:7801 > /tmp/rank1-main.log 2>&1 &
+  sleep 5
+  cascadia worker --model ~/trees/jev9b-int8-2st --engine qwen35 --device CPU --rank 0 --total 2 --next 127.0.0.1:7801 --api 127.0.0.1:8080 > /tmp/rank0.log 2>&1 &
+  until curl -sf localhost:8080/health > /dev/null; do sleep 2; done
+  curl -s -H "$H" localhost:8080/v1/systemone -d '{"model":"jev","state":"x","questions":{"u":{"type":"noul","instructions":"Is it?"}}}' -w ' %{http_code}\n'    # 501, "code":"decision_unsupported"
+  curl -s -H "$H" localhost:8080/v1/decisions -d '{"model":"jev","input":"x","questions":[{"type":"predicate","name":"u","instructions":"Is it?"}]}' -w ' %{http_code}\n'   # 501
+  curl -s -H "$H" localhost:8080/v1/chat/completions -d '{"model":"jev","messages":[{"role":"user","content":"Say hi."}],"max_tokens":8}' -o /dev/null -w 'chat %{http_code}\n'   # 200
+  stop_ranks
+  git worktree remove /tmp/cascadia-main
+  ```
+
+  The 501 must come back within the request timeout, not hang.
 
 ---
 
@@ -5064,10 +5127,10 @@ Neither check can stand in for the other.
   - It notes the dump file's current size, POSTs the 50 records **plus `SYNTHETIC` golden-only records** to the server, and compares only the dump lines appended after that offset. The synthetic records cover every rendering branch the 50 records miss: a list state, a nested list-of-dicts state, noul criteria overrides, a dict-valued choice description, empty and null instructions, and floats (`1e-05`, `1e16`, `2.5`).
   - `prompt_ids`, positions and spans must equal the reference encoder's exactly. For Clef the prompt ids must also equal `reference_flash.pt`'s saved `input_ids`, a tokenizer-version-independent golden for the 50 records.
   - For JEV it also checks every pass's verbalizer `token_ids` against the adapter's `decision_head.json` (`--adapter-dir`), using serve_decide's slot logic: the kind's slots, the first `n` for choice.
-  - With `--answers`, the server's top-1 on the 50 records must agree with the saved spike reference on ≥ 98%. For Kev and Clef that covers every question. For JEV it covers noul and score (score references rescaled to the record's L levels first); JEV choice is reported only, because `reference_jev.pt` was measured on sorted choices.
+  - With `--answers`, the server's top-1 on the 50 records must agree with the saved spike reference on ≥ 98%. For Kev and Clef that covers every question. For JEV it covers every question too (score references rescaled to the record's L levels first). `reference_jev.pt` was measured on sorted choices, so the answer run sends each JEV choice question with its criteria sorted (`jev_sorted`), and the prompts it dumps must equal `jev.questions()`'s ids exactly. (Fix round 1, FID-3: the plan code below still shows the earlier informational-only JEV choice line; the shipped `codec_golden.py` gates all 82.)
   - The 27B models have no saved spike reference; for them only the encoder comparison runs, and parity (Task 17) is the answer check.
 - `openai_equivalence.py --url URL`: converts each of the 50 records into an OpenAI-format request (`to_openai(rec)`), POSTs it to `/v1/decisions` and the original to `/v1/systemone`, and exits non-zero unless every question's probabilities, choice/score and confidence are identical. The records' score levels are plain strings (no descriptions), so both routes build byte-identical prompts, and any difference is an adapter bug. Everything verified through `/v1/systemone` (golden, parity) then carries over to `/v1/decisions`.
-- `backbone_diff.py A B [N] [--per-layer]`: the spike's step1 tool. Prints `SAME`/`DIFF` per sampled tensor and, with `--per-layer`, one line per decoder layer.
+- `backbone_diff.py A B [--per-layer] [--slice BYTES]`: matches tensors per layer index and suffix after stripping the repo's `model.language_model.` / `model.` prefix (vision and MTP tensors ignored), hashes both ends of every backbone tensor (all projections, norms, embeddings, final norm, lm_head), prints per-tensor / per-layer `SAME`/`DIFF`, and ends with one `VERDICT: STOCK | FINETUNED | UNKNOWN` line; UNKNOWN (no comparable decoder-layer tensors, different layer sets, or a dtype/shape mismatch) exits 2. (Fix round 1, BLD-1, replaces the sampled/gate_proj-only probe below.)
 - `def answer_probs(ans: dict) -> list[float]` and `def margin(p: list[float]) -> float` (in parity_check, tested).
 
 - [ ] **Step 1: Write the failing tests** (`tools/tests/test_decision_tools.py`)
@@ -5152,7 +5215,7 @@ Expected: `ModuleNotFoundError` (`codec_golden`, `parity_check`, `records`).
 ```python
 """Agreement of a running decisions server (SystemOne route, /v1/systemone) with a full-precision reference.
 
-  python tools/decision/parity_check.py --url http://127.0.0.1:8080                       # only drive the server (dump)
+  python tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump d.jsonl        # drive the server, write d.parity.jsonl (this run's passes only)
   python tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref ref.json        # gate: raw >= 96% and no flip with reference margin >= 0.05
 """
 import argparse
@@ -5304,7 +5367,7 @@ if __name__ == "__main__":
     main()
 ```
 
-`tools/decision/backbone_diff.py`: copy `$SPIKE_DIR/clef-spike/step1_backbone_diff.py` verbatim. Then add `--per-layer`: for every decoder layer, compare the first 8 MB of `mlp.gate_proj.weight` (`layers.{i}.` under the auto-detected prefix) and print `layer {i}: SAME|DIFF`. This is the probe that found Clef-27B's fine-tune touching only layers 40–63.
+`tools/decision/backbone_diff.py`: copy `$SPIKE_DIR/clef-spike/step1_backbone_diff.py` verbatim. Then add `--per-layer`: for every decoder layer, compare the first 8 MB of `mlp.gate_proj.weight` (`layers.{i}.` under the auto-detected prefix) and print `layer {i}: SAME|DIFF`. This is the probe that found Clef-27B's fine-tune touching only layers 40–63. (Superseded in fix round 1, BLD-1: exact-name matching made it vacuous across text-only vs VLM layouts, and gate_proj alone misses attention, norm, embedding and lm_head changes; see the interface line above.)
 
 - [ ] **Step 4: Write `codec_golden.py`**
 
@@ -5605,7 +5668,8 @@ Generalizes `$SPIKE_DIR/jev-spike/ref_stream.py` and `$SPIKE_DIR/kev-spike/kev_r
 - Test: `tools/tests/test_reference_stream.py`
 
 **Interfaces:**
-- `reference_stream.py {jev,kev,clef} --weights DIR --dump DUMP.jsonl --tree TREE --out REF.json [--lora FILE] [--lora-scale F] [--clef-dir DIR]`
+- `reference_stream.py {jev,kev,clef} --weights DIR --dump DUMP.parity.jsonl --tree TREE --out REF.json [--lora FILE] [--lora-scale F] [--clef-dir DIR]`
+  - `--dump` is the `<dump>.parity.jsonl` slice `parity_check.py --dump` writes (exactly one run of the 50 records); the server's whole dump also holds golden and other passes and fails alignment.
   - `--tree` is the exported tree. It supplies `decision.json` (JEV bias, temperatures, slots; Kev temperature) and `decision/` (Kev pointer weights).
   - Writes `{"<record>.<qid>": probs}` in `option_keys` order, the same order `parity_check` reads.
 - `def stream_hidden(weights_dir, passes, lora=None, lora_scale=None, threads=4) -> list[torch.Tensor]`: final-norm hidden `[T, H]` for every pass.
@@ -5672,9 +5736,9 @@ Expected: `ModuleNotFoundError: reference_stream` (or SKIP without transformers 
 Replays the server's --decision-dump, so it measures quantization only (codec correctness is
 codec_golden.py's job). Peak memory ~ one fp32 layer + the passes' activations.
 
-  python tools/decision/reference_stream.py jev  --weights JEV_BF16 --lora JEV/adapter_vllm/adapter_model.safetensors --tree TREE --dump d.jsonl --out ref.json
-  python tools/decision/reference_stream.py kev  --weights QWEN35_9B_BASE --lora KEV/adapter_model.safetensors --tree TREE --dump d.jsonl --out ref.json
-  python tools/decision/reference_stream.py clef --weights CLEF_DIR --clef-dir CLEF_DIR --tree TREE --dump d.jsonl --out ref.json
+  python tools/decision/reference_stream.py jev  --weights JEV_BF16 --lora JEV/adapter_vllm/adapter_model.safetensors --tree TREE --dump d.parity.jsonl --out ref.json
+  python tools/decision/reference_stream.py kev  --weights QWEN35_9B_BASE --lora KEV/adapter_model.safetensors --tree TREE --dump d.parity.jsonl --out ref.json
+  python tools/decision/reference_stream.py clef --weights CLEF_DIR --clef-dir CLEF_DIR --tree TREE --dump d.parity.jsonl --out ref.json
 """
 import argparse
 import gc
@@ -5903,15 +5967,17 @@ git commit -m "feat(tools): layer-streamed fp32 decision reference for jev/kev/c
 
 ## Model acceptance (Tasks 18–22)
 
-Each model task is manual (it needs OpenVINO and downloads), stays under 7 GB per step unless stated otherwise, and ends by appending its recipe and measured numbers to `docs/decisions.md`. Each one runs the same six checks:
+Each model task is manual (it needs OpenVINO and downloads), stays under 7 GB per step unless stated otherwise, and ends by appending its recipe and measured numbers to `docs/decisions.md`. Every command below assumes the runbook environment from Global Constraints (`$SPIKE_DIR`, `$PY`, `cascadia` on `PATH`). Each task runs the same six checks:
 1. **Export** the tree.
-2. **Serve** it with `--decision-dump`.
-3. **Golden:** `codec_golden.py` on the dump, plus `--answers` against the running server.
-4. **Reference:** `reference_stream.py` on the dump.
+2. **Serve** it with `--decision-dump`, then drive the 50 records once with `parity_check.py --dump` (no `--ref`). That writes `<dump>.parity.jsonl`: exactly this run's passes, 0600, never overwritten without `--force`.
+3. **Golden:** `codec_golden.py` (it slices its own `<dump>.golden.jsonl`), plus `--answers` against the running server.
+4. **Reference:** `reference_stream.py --dump <dump>.parity.jsonl`. The whole dump also holds golden, answer, duplicate-request and long-state passes, so the reference never reads it directly; the slice makes the step order free.
 5. **Parity:** `parity_check.py --ref` must print `PASS`: raw agreement ≥ 96% and no flip where the reference margin is ≥ 0.05.
 6. **OpenAI route equivalence:** `openai_equivalence.py --url …` must report every question identical (JEV: add `--all-states`). This carries checks 3–5 over to `/v1/decisions`.
 
-Every long step (exports, reference runs, server bring-up) runs in the background with a Monitor on its log. The Monitor watches for completion **and** for failure signatures (`Traceback`, `Error`, `killed`, `CAP`, `MISMATCH`, `FLIP`, non-zero `exit=`), so silence can't look like success. Wrap exports and references in `$SPIKE_DIR/jev-spike/run_capped.py` (`CAP_GB=7`), which watches phys_footprint and kills the step if it goes over.
+The dump is opened in append mode, so every task first removes the previous files: `rm -f /tmp/<model>.jsonl /tmp/<model>.parity.jsonl /tmp/<model>.golden.jsonl`.
+
+Every long step (exports, reference runs, server bring-up) runs in the background with a Monitor on its log. The Monitor watches for completion **and** for failure signatures (`Traceback`, `Error`, `killed`, `CAP`, `MISMATCH`, `FLIP`, `epoch`, non-zero `exit=`), so silence can't look like success. Wrap exports and references in `$SPIKE_DIR/jev-spike/run_capped.py` (`CAP_GB=7`), which watches phys_footprint and kills the step if it goes over. `run_capped.py` is **macOS-only** (it loads `/usr/lib/libproc.dylib`): on a Linux box run the step under `/usr/bin/time -v` and a cgroup memory limit instead (`systemd-run --user --scope -p MemoryMax=7G …`).
 
 ### Task 18: JEV-9B
 
@@ -5920,35 +5986,47 @@ Every long step (exports, reference runs, server bring-up) runs in the backgroun
 ```bash
 hf download OpenVINO/Qwen3.5-9B-int8-ov --local-dir ~/models/qwen35-9b-int8
 hf download autotrust/JEV-9B --include "adapter_vllm/*" --include calibration.json --include tokenizer.json --include tokenizer_config.json --local-dir ~/models/jev9b
-CAP_GB=7 python3 $SPIKE_DIR/jev-spike/run_capped.py python tools/decision_export.py jev --base-ir ~/models/qwen35-9b-int8 --adapter-dir ~/models/jev9b/adapter_vllm --out ~/trees/jev9b-int8
+CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision_export.py jev --base-ir ~/models/qwen35-9b-int8 --adapter-dir ~/models/jev9b/adapter_vllm --out ~/trees/jev9b-int8
 ```
 
 Expected: 8 stages, `grafted N LoRA branches` summing to the adapter's target count (201), and `decision tree written`.
 
-- [ ] **Step 2: Serve and dump**
+- [ ] **Step 2: Serve and drive the parity run**
 
 ```bash
-cascadia run ~/trees/jev9b-int8 --engine qwen35 --device CPU --api 127.0.0.1:8080 --decision-dump /tmp/jev9b.jsonl &
-python tools/decision/parity_check.py --url http://127.0.0.1:8080
+rm -f /tmp/jev9b.jsonl /tmp/jev9b.parity.jsonl /tmp/jev9b.golden.jsonl
+cascadia run ~/trees/jev9b-int8 --engine qwen35 --device CPU --api 127.0.0.1:8080 --decision-dump /tmp/jev9b.jsonl > /tmp/jev9b-server.log 2>&1 &
+until curl -sf http://127.0.0.1:8080/health > /dev/null; do sleep 2; done
+$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump /tmp/jev9b.jsonl
 ```
+
+Expected: `wrote 82 passes for 50 records to /tmp/jev9b.parity.jsonl`.
 
 - [ ] **Step 3: Golden check**
 
-`python tools/decision/codec_golden.py jev --url http://127.0.0.1:8080 --dump /tmp/jev9b.jsonl --tokenizer ~/models/jev9b --adapter-dir ~/models/jev9b/adapter_vllm --answers`
-Expected: every pass matches the serve_decide layout and `decision_head.json` (82 record passes + 3 synthetic), and noul plus score answers agree ≥ 98% with `reference_jev.pt`. Choice answers are listed for information only.
+```bash
+$PY tools/decision/codec_golden.py jev --url http://127.0.0.1:8080 --dump /tmp/jev9b.jsonl --tokenizer ~/models/jev9b --adapter-dir ~/models/jev9b/adapter_vllm --answers
+```
+
+Expected:
+- `jev: 86 passes match the serve_decide layout and decision_head.json` (82 record passes + 4 synthetic);
+- `jev: 82 answer-run prompts equal jev.py's (choices sorted)`: `--answers` sends each choice question with its criteria sorted, which is the order `jev.py` and `reference_jev.pt` use, and checks the server's dumped prompt ids against `jev.questions()`;
+- `jev: server answers agree with the saved reference on N/82` with N ≥ 81 (98%). All 82 are gated, the 33 choice answers included.
 
 - [ ] **Step 4: Reference and parity**
 
 The reference needs JEV's BF16 shards: `hf download autotrust/JEV-9B --include "model-*" --include "model.safetensors.index.json" --include config.json --local-dir ~/models/jev9b`.
 
 ```bash
-CAP_GB=7 python3 $SPIKE_DIR/jev-spike/run_capped.py python tools/decision/reference_stream.py jev --weights ~/models/jev9b --lora ~/models/jev9b/adapter_vllm/adapter_model.safetensors --tree ~/trees/jev9b-int8 --dump /tmp/jev9b.jsonl --out /tmp/jev9b-ref.json
-python tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref /tmp/jev9b-ref.json
+CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision/reference_stream.py jev --weights ~/models/jev9b \
+    --lora ~/models/jev9b/adapter_vllm/adapter_model.safetensors --tree ~/trees/jev9b-int8 \
+    --dump /tmp/jev9b.parity.jsonl --out /tmp/jev9b-ref.json
+$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref /tmp/jev9b-ref.json
 ```
 
-Expected: `PASS`. This is the **re-measure** that decision A requires: request-order choices and rescaled scores, replacing the spike's 98.8% (sorted choices, 6-way scores). Record the per-type lines too.
+Expected: `wrote 82 reference distributions`, then `PASS`. This is the **re-measure** that decision A requires: request-order choices and rescaled scores, replacing the spike's 98.8% (sorted choices, 6-way scores). Record the per-type lines too.
 
-- [ ] **Step 4b: OpenAI route equivalence**: `python tools/decision/openai_equivalence.py --url http://127.0.0.1:8080 --all-states`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`.
+- [ ] **Step 4b: OpenAI route equivalence**: `$PY tools/decision/openai_equivalence.py --url http://127.0.0.1:8080 --all-states`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`.
 
 - [ ] **Step 5: Docs and commit** (append the JEV-9B section to `docs/decisions.md`: the recipe above, the measured agreement, per-type counts, flips)
 
@@ -5963,22 +6041,59 @@ git commit -m "docs(decisions): JEV-9B recipe and measured parity"
 
 ```bash
 hf download Qwen/Qwen3.5-9B-Base --revision 68c46c4b3498877f3ef123c856ecfde50c39f404 --local-dir ~/models/qwen35-9b-base
-hf download jaredpalmer/kev-9b adapter_model.safetensors adapter_config.json head.pt tokenizer.json --local-dir ~/models/kev9b
-CAP_GB=7 python3 $SPIKE_DIR/jev-spike/run_capped.py python tools/decision_export.py kev --base-ir ~/models/qwen35-9b-int8 --weights ~/models/qwen35-9b-base \
+hf download jaredpalmer/kev-9b adapter_model.safetensors head.pt tokenizer.json --local-dir ~/models/kev9b
+hf download jaredpalmer/kev-9b adapter_config.json --local-dir ~/models/kev9b \
+    || cp $SPIKE_DIR/kev-spike/adapter_config.json ~/models/kev9b/adapter_config.json
+CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision_export.py kev --base-ir ~/models/qwen35-9b-int8 --weights ~/models/qwen35-9b-base \
     --lora ~/models/kev9b/adapter_model.safetensors --head-pt ~/models/kev9b/head.pt --out ~/trees/kev9b-int8
 ```
 
-If the repo has no `adapter_config.json`, the exporter stops and asks for `--lora-scale`. Pass `--lora-scale 2.0` (Kev's `lora_alpha 32 / r 16` from its training config, as used in the spike) and note it in the docs. Expected: `check_swap` passes on all 8 stages, and 248 LoRA branches grafted.
+`adapter_config.json` is downloaded on its own, because `hf download` fails outright when a named file is missing. If the repo has none, the spike's copy (`$SPIKE_DIR/kev-spike/adapter_config.json`: r=16, lora_alpha=32, no DoRA, no rank/alpha patterns, the same 12 target modules) goes beside the adapter instead; note that in the docs. Do not pass `--lora-scale` as a fallback: the exporter and `reference_stream.py` both read `adapter_config.json`, and its refusals (DoRA, patterns, `lora_bias`) must always run. Expected: `check_swap` passes on all 8 stages, and 248 LoRA branches grafted.
 
-- [ ] **Step 2: Serve and dump**: as in Task 18, with `--decision-dump /tmp/kev9b.jsonl`. Also check the state reuse works:
+- [ ] **Step 2: Serve and drive the parity run**
+
+```bash
+rm -f /tmp/kev9b.jsonl /tmp/kev9b.parity.jsonl /tmp/kev9b.golden.jsonl
+cascadia run ~/trees/kev9b-int8 --engine qwen35 --device CPU --api 127.0.0.1:8080 --decision-dump /tmp/kev9b.jsonl > /tmp/kev9b-server.log 2>&1 &
+until curl -sf http://127.0.0.1:8080/health > /dev/null; do sleep 2; done
+$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump /tmp/kev9b.jsonl
+```
+
+Expected: `wrote 82 passes for 50 records to /tmp/kev9b.parity.jsonl`. Then check the state reuse works:
 - the server log shows `qwen35 prefix-cache hit` from the second question of each multi-question record whose `<|fim_prefix|>` + state is ≥ 16 tokens (12 of the 24 multi-question records; shorter states are below `MIN_PREFIX_TOKENS` and never snapshot);
-- one synthetic long-state request (a ~8k-token state with 5 noul questions) shows one cold prefill, then hits whose `warm_prefix` equals the state length.
+- one synthetic long-state request (a ~8k-token state with 5 noul questions) shows one cold prefill, then hits whose `warm_prefix` equals the state length:
 
-- [ ] **Step 3: Golden check**: `python tools/decision/codec_golden.py kev --url http://127.0.0.1:8080 --dump /tmp/kev9b.jsonl --tokenizer ~/models/kev9b --answers`. Expected: every pass (82 + 3 synthetic) matches `kev.questions`, and answers ≥ 98% against `reference_kev.pt`.
+  ```bash
+  $PY - <<'EOF'
+  import json
+  state = "The quick brown fox jumps over the lazy dog. " * 900   # about 8k tokens
+  qs = {f"q{i}": {"type": "noul", "instructions": f"Does the text mention animal number {i}?"} for i in range(5)}
+  json.dump({"model": "kev", "state": state, "questions": qs}, open("/tmp/kev-long.json", "w"))
+  EOF
+  curl -s -H 'content-type: application/json' --data-binary @/tmp/kev-long.json http://127.0.0.1:8080/v1/systemone -w ' %{http_code}\n'
+  grep -n 'prefix-cache hit' /tmp/kev9b-server.log | tail -4
+  ```
 
-- [ ] **Step 4: Reference and parity**: `reference_stream.py kev --weights ~/models/qwen35-9b-base --lora ~/models/kev9b/adapter_model.safetensors --tree ~/trees/kev9b-int8 …`, then `parity_check.py --ref`. Expected: `PASS` (spike: 82/82).
+- [ ] **Step 3: Golden check**
 
-- [ ] **Step 4b: OpenAI route equivalence**: `python tools/decision/openai_equivalence.py --url http://127.0.0.1:8080`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`.
+```bash
+$PY tools/decision/codec_golden.py kev --url http://127.0.0.1:8080 --dump /tmp/kev9b.jsonl --tokenizer ~/models/kev9b --answers
+```
+
+Expected: `kev: 86 passes match kev.questions` (82 + 4 synthetic), and `kev: server answers agree with the saved reference on N/82` with N ≥ 81 against `reference_kev.pt`.
+
+- [ ] **Step 4: Reference and parity**
+
+```bash
+CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision/reference_stream.py kev --weights ~/models/qwen35-9b-base \
+    --lora ~/models/kev9b/adapter_model.safetensors --tree ~/trees/kev9b-int8 \
+    --dump /tmp/kev9b.parity.jsonl --out /tmp/kev9b-ref.json
+$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref /tmp/kev9b-ref.json
+```
+
+Expected: `PASS` (spike: 82/82).
+
+- [ ] **Step 4b: OpenAI route equivalence**: `$PY tools/decision/openai_equivalence.py --url http://127.0.0.1:8080`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`.
 
 - [ ] **Step 5: Docs and commit** (Kev-9B section; `git commit -m "docs(decisions): Kev-9B recipe and measured parity"`)
 
@@ -5988,18 +6103,65 @@ If the repo has no `adapter_config.json`, the exporter stops and asks for `--lor
 
 ```bash
 hf download Cloudflare/clef-flash --local-dir ~/models/clef-flash
-CAP_GB=7 python3 $SPIKE_DIR/jev-spike/run_capped.py python tools/decision_export.py clef --base-ir ~/models/qwen35-9b-int8 --weights ~/models/clef-flash --clef-dir ~/models/clef-flash --out ~/trees/clef-flash-int8
+CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision_export.py clef --base-ir ~/models/qwen35-9b-int8 --weights ~/models/clef-flash --clef-dir ~/models/clef-flash --out ~/trees/clef-flash-int8
 ```
 
-- [ ] **Step 2: Serve and dump**: `--decision-dump /tmp/clef-flash.jsonl`. Send the same request twice and confirm both return 200. This is the regression check for the prefix-cache bug: Joint passes always prefill cold.
+- [ ] **Step 2: Serve and drive the parity run**
 
-- [ ] **Step 3: Golden check**: `codec_golden.py clef --url http://127.0.0.1:8080 --dump /tmp/clef-flash.jsonl --tokenizer ~/models/clef-flash --answers`. Expected: 53 records match `encode_record` (the 50 also match the saved `input_ids`), and answers ≥ 98% against `reference_flash.pt`. That answer check is what catches noul inversion.
+```bash
+rm -f /tmp/clef-flash.jsonl /tmp/clef-flash.parity.jsonl /tmp/clef-flash.golden.jsonl
+cascadia run ~/trees/clef-flash-int8 --engine qwen35 --device CPU --api 127.0.0.1:8080 --decision-dump /tmp/clef-flash.jsonl > /tmp/clef-flash-server.log 2>&1 &
+until curl -sf http://127.0.0.1:8080/health > /dev/null; do sleep 2; done
+$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump /tmp/clef-flash.jsonl
+```
 
-- [ ] **Step 4: Reference and parity**: `reference_stream.py clef --weights ~/models/clef-flash --clef-dir ~/models/clef-flash --tree ~/trees/clef-flash-int8 …`, then `parity_check.py --ref`. Expected: `PASS` (spike: 82/82).
+Expected: `wrote 50 passes for 50 records to /tmp/clef-flash.parity.jsonl` (one joint pass per record). Then send the same request twice and confirm both return 200. This is the regression check for the prefix-cache bug: Joint passes always prefill cold.
 
-- [ ] **Step 4b: OpenAI route equivalence**: `python tools/decision/openai_equivalence.py --url http://127.0.0.1:8080`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`.
+```bash
+for i in 1 2; do curl -s -H 'content-type: application/json' http://127.0.0.1:8080/v1/systemone \
+  -d '{"model":"clef","state":"I was charged twice for my order.","questions":{"team":{"type":"choice","instructions":"Which team?","criteria":{"billing":"charges","tech":"bugs"}},"urgent":{"type":"noul","instructions":"Is it urgent?"}}}' -w ' %{http_code}\n'; done
+```
+
+- [ ] **Step 3: Golden check**
+
+```bash
+$PY tools/decision/codec_golden.py clef --url http://127.0.0.1:8080 --dump /tmp/clef-flash.jsonl --tokenizer ~/models/clef-flash --answers
+```
+
+Expected: `clef: 54 records match encode_record` (50 + 4 synthetic; the 50 also match the saved `input_ids`), and answers ≥ 98% (N ≥ 81 of 82) against `reference_flash.pt`. That answer check is what catches noul inversion.
+
+- [ ] **Step 4: Reference and parity**
+
+```bash
+CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision/reference_stream.py clef --weights ~/models/clef-flash \
+    --clef-dir ~/models/clef-flash --tree ~/trees/clef-flash-int8 \
+    --dump /tmp/clef-flash.parity.jsonl --out /tmp/clef-flash-ref.json
+$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref /tmp/clef-flash-ref.json
+```
+
+Expected: `PASS` (spike: 82/82).
+
+- [ ] **Step 4b: OpenAI route equivalence**: `$PY tools/decision/openai_equivalence.py --url http://127.0.0.1:8080`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`.
 
 - [ ] **Step 5: Docs and commit** (Clef-flash section; `git commit -m "docs(decisions): Clef-flash recipe and measured parity"`)
+
+### Two-machine runbook (Tasks 21 and 22)
+
+Host A runs rank 0 (the API, the dump and every tool); host B runs rank 1. `RANK1_HOST` is host B's LAN address. Both hosts need the **whole tree at the same `--model` path** (rank ≥ 1 reads `config.json` and, as the last rank, the `decision/` assets), the same branch build of `cascadia`, and OpenVINO 2026.4.1:
+
+```bash
+# on host A, after the export
+rsync -a ~/trees/<tree>/ RANK1_HOST:trees/<tree>/
+# host B (rank 1 listens on the LAN; start it first)
+cascadia worker --model ~/trees/<tree> --engine qwen35 --device CPU --rank 1 --total 2 --listen 0.0.0.0:7801 > /tmp/rank1.log 2>&1 &
+# host A (rank 0 dials rank 1 once, at startup; the API stays on loopback because the dump holds request text)
+rm -f /tmp/<model>.jsonl /tmp/<model>.parity.jsonl /tmp/<model>.golden.jsonl
+cascadia worker --model ~/trees/<tree> --engine qwen35 --device CPU --rank 0 --total 2 --next RANK1_HOST:7801 \
+    --api 127.0.0.1:8080 --decision-dump /tmp/<model>.jsonl > /tmp/rank0.log 2>&1 &
+until curl -sf http://127.0.0.1:8080/health > /dev/null; do sleep 2; done
+```
+
+Monitor both logs. If rank 1 restarts, restart rank 0 too (it never re-dials).
 
 ### Task 21: JEV-27B (pipeline, 2 machines)
 
@@ -6010,41 +6172,79 @@ The 27B models were never measured in the spike, so this task establishes the nu
 ```bash
 hf download OpenVINO/Qwen3.8-27B-int8-ov --local-dir ~/models/qwen38-27b-int8
 hf download autotrust/JEV-27B --include "adapter_vllm/*" --include calibration.json --include tokenizer.json --include tokenizer_config.json --local-dir ~/models/jev27b
-python tools/decision/backbone_diff.py autotrust/JEV-27B Qwen/Qwen3.8-27B 24 --per-layer
+$PY tools/decision/backbone_diff.py autotrust/JEV-27B Qwen/Qwen3.8-27B --per-layer
 ```
 
-If every layer reports SAME, the base is stock and no `--weights` is needed. If any layer differs, download the JEV-27B shards and add `--weights ~/models/jev27b`. Note that `swap_stage` never swaps `lm_head`, and JEV reads verbalizer logits from it; if `lm_head` differs too, stop and extend `swap_stage` to the lm_head constants before continuing.
+`backbone_diff.py` matches tensors per layer index and suffix (a text-only `model.layers.N.*` checkpoint lines up with a VLM `model.language_model.layers.N.*` one), hashes every backbone tensor (all projections, norms, embeddings, final norm and lm_head) and ends with one line:
+- `VERDICT: STOCK`: the backbone is stock Qwen3.8-27B. Export without `--weights`.
+- `VERDICT: FINETUNED`: export with `--weights ~/models/jev27b` (download the shards first, below). `swap_stage` never swaps `lm_head`, and JEV reads verbalizer logits from it: if the per-tensor lines show `lm_head.weight` DIFF, stop and extend `swap_stage` to the lm_head constants before continuing.
+- `VERDICT: UNKNOWN` (exit 2): nothing comparable was found. **Stop** and inspect the two repos' headers; do not export.
+
+Either way the reference (Step 4) runs on JEV-27B's **own** shards, so it is independent of this call: a wrong STOCK verdict then fails parity instead of passing a circular one.
 
 ```bash
-CAP_GB=7 python3 $SPIKE_DIR/jev-spike/run_capped.py python tools/decision_export.py jev --base-ir ~/models/qwen38-27b-int8 --adapter-dir ~/models/jev27b/adapter_vllm --stages 2 --out ~/trees/jev27b-int8
+hf download autotrust/JEV-27B --include "model-*" --include "model.safetensors.index.json" --include config.json --local-dir ~/models/jev27b
+# STOCK:
+CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision_export.py jev --base-ir ~/models/qwen38-27b-int8 --adapter-dir ~/models/jev27b/adapter_vllm --stages 2 --out ~/trees/jev27b-int8
+# FINETUNED: the same command plus --weights ~/models/jev27b
 ```
 
-- [ ] **Step 2: Serve on two machines** with the same worker commands as Task 15 Step 6 (`--model`, `--rank`, `--total`, `--listen`/`--next`), with rank 0 started with `--decision-dump /tmp/jev27b.jsonl`. Then run `parity_check.py --url …` (no ref) to produce the dump.
+- [ ] **Step 2: Serve on two machines** per the two-machine runbook above, with `<tree>` = `jev27b-int8` and `<model>` = `jev27b`. Then drive the parity run: `$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump /tmp/jev27b.jsonl` (expected: `wrote 82 passes for 50 records to /tmp/jev27b.parity.jsonl`).
 
-- [ ] **Step 3: Golden**: `codec_golden.py jev --url http://127.0.0.1:8080 --dump /tmp/jev27b.jsonl --tokenizer ~/models/jev27b --adapter-dir ~/models/jev27b/adapter_vllm` (no `--answers`: there is no saved 27B reference).
+- [ ] **Step 3: Golden**
 
-- [ ] **Step 4: Reference and parity**: `reference_stream.py jev --weights <JEV-27B or Qwen3.8-27B BF16 dir> --lora ~/models/jev27b/adapter_vllm/adapter_model.safetensors --tree ~/trees/jev27b-int8 …`. One 27B fp32 layer is ~1.7 GB, so this stays under the cap. Then `parity_check.py --ref`. Expected: `PASS`. If it fails, record the number, the per-type breakdown and the confident flips in the docs, and raise it with the user before calling the model supported.
+```bash
+$PY tools/decision/codec_golden.py jev --url http://127.0.0.1:8080 --dump /tmp/jev27b.jsonl --tokenizer ~/models/jev27b --adapter-dir ~/models/jev27b/adapter_vllm
+```
 
-- [ ] **Step 4b: OpenAI route equivalence**: `python tools/decision/openai_equivalence.py --url http://127.0.0.1:8080 --all-states`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`.
+No `--answers`: there is no saved 27B reference. Expected: `jev: 86 passes match the serve_decide layout and decision_head.json`.
 
-- [ ] **Step 5: Docs and commit** (JEV-27B section; `git commit -m "docs(decisions): JEV-27B recipe and measured parity"`)
+- [ ] **Step 4: Reference and parity.** The reference always uses JEV-27B's own BF16 shards, the same backbone the tree serves (stock, or `--weights ~/models/jev27b`); never the stock Qwen3.8-27B checkpoint. The peak is about 4 GB (one fp32 decoder layer plus its loaded state dict, ~3.4 GB, plus one LoRA delta), under the cap.
+
+```bash
+CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision/reference_stream.py jev --weights ~/models/jev27b \
+    --lora ~/models/jev27b/adapter_vllm/adapter_model.safetensors --tree ~/trees/jev27b-int8 \
+    --dump /tmp/jev27b.parity.jsonl --out /tmp/jev27b-ref.json
+$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref /tmp/jev27b-ref.json
+```
+
+Expected: `PASS`. If it fails, record the number, the per-type breakdown and the confident flips in the docs, and raise it with the user before calling the model supported.
+
+- [ ] **Step 4b: OpenAI route equivalence**: `$PY tools/decision/openai_equivalence.py --url http://127.0.0.1:8080 --all-states`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`.
+
+- [ ] **Step 5: Docs and commit** (JEV-27B section, including the backbone verdict; `git commit -m "docs(decisions): JEV-27B recipe and measured parity"`)
 
 ### Task 22: Clef 27B (pipeline, 2 machines)
 
-- [ ] **Step 1: Download and export.** This needs a machine with ~16 GB free: each of the 2 swapped stages is ~13 GB of new int8 constants. This is the one export above the 7 GB cap, and it is stated in the docs. `check_swap` runs on both stages, which is the first time the float-kind table meets the Qwen3.8-27B IR. A failure there means a node-name difference: fix `FLOAT_KINDS` and rerun. Never bypass the check.
+- [ ] **Step 1: Download and export.** This needs a machine with ~16 GB free: each of the 2 swapped stages is ~13 GB of new int8 constants. This is the one export above the 7 GB cap, and it is stated in the docs, so it is not wrapped in `run_capped.py`. `check_swap` runs on both stages, which is the first time the float-kind table meets the Qwen3.8-27B IR. A failure there means a node-name difference: fix `FLOAT_KINDS` and rerun. Never bypass the check. `swap_embeddings` also meets the 27B embeddings IR for the first time: if it stops with `embeddings are not i8 symmetric with one scale per row`, inspect that IR's embedding constants before changing anything.
 
 ```bash
 hf download Cloudflare/clef --local-dir ~/models/clef
-python tools/decision_export.py clef --base-ir ~/models/qwen38-27b-int8 --weights ~/models/clef --clef-dir ~/models/clef --stages 2 --out ~/trees/clef-int8
+$PY tools/decision_export.py clef --base-ir ~/models/qwen38-27b-int8 --weights ~/models/clef --clef-dir ~/models/clef --stages 2 --out ~/trees/clef-int8
 ```
 
-- [ ] **Step 2: Serve on two machines** with `--decision-dump /tmp/clef27b.jsonl` on rank 0, then drive the dump.
+- [ ] **Step 2: Serve on two machines** per the two-machine runbook above, with `<tree>` = `clef-int8` and `<model>` = `clef27b`. Then drive the parity run: `$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump /tmp/clef27b.jsonl` (expected: `wrote 50 passes for 50 records to /tmp/clef27b.parity.jsonl`).
 
-- [ ] **Step 3: Golden**: `codec_golden.py clef --url http://127.0.0.1:8080 --dump /tmp/clef27b.jsonl --tokenizer ~/models/clef` (no `--answers`; the 50 records' saved `input_ids` check still applies, since Clef 27B shares the tokenizer).
+- [ ] **Step 3: Golden**
 
-- [ ] **Step 4: Reference and parity**: `reference_stream.py clef --weights ~/models/clef --clef-dir ~/models/clef --tree ~/trees/clef-int8 …`, then `parity_check.py --ref`. Expected: `PASS`, with the same escalation rule as Task 21.
+```bash
+$PY tools/decision/codec_golden.py clef --url http://127.0.0.1:8080 --dump /tmp/clef27b.jsonl --tokenizer ~/models/clef
+```
 
-- [ ] **Step 4b: OpenAI route equivalence**: `python tools/decision/openai_equivalence.py --url http://127.0.0.1:8080`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`.
+No `--answers`; the 50 records' saved `input_ids` check still applies, since Clef 27B shares the tokenizer. Expected: `clef: 54 records match encode_record`.
+
+- [ ] **Step 4: Reference and parity**
+
+```bash
+CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision/reference_stream.py clef --weights ~/models/clef \
+    --clef-dir ~/models/clef --tree ~/trees/clef-int8 \
+    --dump /tmp/clef27b.parity.jsonl --out /tmp/clef27b-ref.json
+$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref /tmp/clef27b-ref.json
+```
+
+Expected: `PASS`, with the same escalation rule as Task 21.
+
+- [ ] **Step 4b: OpenAI route equivalence**: `$PY tools/decision/openai_equivalence.py --url http://127.0.0.1:8080`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`.
 
 - [ ] **Step 5: Docs and commit** (Clef-27B section, including the 16 GB export note; `git commit -m "docs(decisions): Clef 27B recipe and measured parity"`)
 
