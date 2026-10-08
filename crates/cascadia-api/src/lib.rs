@@ -3456,6 +3456,8 @@ mod tests {
         vocab.insert("__engine_error__".into(), 999_999);
         // ... and returns non-finite logits (NaN, +inf, -inf) for one containing 999_998.
         vocab.insert("__non_finite__".into(), 999_998);
+        // ... and fails a `require_warm` pass containing 999_997 as an evicted snapshot.
+        vocab.insert("__evicted__".into(), 999_997);
         let model = tokenizers::models::wordlevel::WordLevel::builder()
             .vocab(vocab.into_iter().collect())
             .unk_token("[unk]".into())
@@ -3912,6 +3914,7 @@ mod tests {
                         option_pos: vec![1, 2],
                     },
                     cache_prefix: None,
+                    require_warm: false,
                 },
                 parts: vec![decisions::PassPart {
                     question_id: qid,
@@ -4049,6 +4052,27 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
         assert_eq!(v["error"], "decision engine error");
+    }
+
+    #[tokio::test]
+    async fn kev_pass_whose_snapshot_was_evicted_is_a_503_not_a_cold_reprefill() {
+        // SEC-3: state of 21 tokens (<state> + 20), 3 noul passes of 29 (tail 8). Reuse work 45,
+        // full work 87. Under a 60-token budget passes 2 and 3 must resume warm; the mock
+        // reports their snapshot evicted, so the request is refused rather than re-prefilled.
+        let state = format!("__evicted__{}", " a".repeat(19));
+        let body = format!(
+            r#"{{"model": "m", "state": "{state}", "questions": {{"a": {{"type": "noul"}}, "b": {{"type": "noul"}}, "c": {{"type": "noul"}}}}}}"#
+        );
+        let (status, v, _) = post_decisions(make_decision_app_with(1000, 60).await, &body).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert_eq!(
+            v["error"],
+            "engine at capacity; retry after current requests complete"
+        );
+        // A budget that covers every pass cold never asks for a warm resume.
+        let (status, v, _) = post_decisions(make_decision_app_with(1000, 100).await, &body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["usage"]["input_tokens"], 87);
     }
 
     #[tokio::test]

@@ -77,8 +77,16 @@ impl Engine for MockEngine {
         // Decision tasks answer in one final chunk with deterministic logits
         // (`-(i)`, so the first option always wins). A prompt id of `999_999`
         // is the failure sentinel for exercising the API's error path; `999_998`
-        // returns non-finite logits (NaN, +inf, -inf, …) as a broken head would.
+        // returns non-finite logits (NaN, +inf, -inf, …) as a broken head would;
+        // `999_997` fails a `require_warm` pass as an evicted prefix snapshot.
         if let Some(d) = &task.decision {
+            // `999_997` in a `require_warm` pass: its prefix snapshot was evicted (SEC-3).
+            if d.require_warm && d.prompt_ids.contains(&999_997) {
+                return Ok(vec![(
+                    task.task_id.clone(),
+                    Chunk::error(task.task_id, "decision_cold: mock snapshot evicted"),
+                )]);
+            }
             if d.prompt_ids.contains(&999_999) {
                 return Ok(vec![(
                     task.task_id.clone(),
@@ -348,6 +356,7 @@ mod tests {
                 token_ids: vec![1, 2, 3],
             },
             cache_prefix: None,
+            require_warm: false,
         });
         e.submit(t).unwrap();
         let out = e.step().unwrap();
@@ -377,6 +386,7 @@ mod tests {
                 prompt_ids: vec![5, 999_999],
                 head: cascadia_types::ReadoutHead::Verbalizer { token_ids: vec![1] },
                 cache_prefix: None,
+                require_warm: false,
             }),
         };
         e.submit(t).unwrap();
@@ -404,6 +414,7 @@ mod tests {
                     token_ids: vec![1, 2, 3],
                 },
                 cache_prefix: None,
+                require_warm: false,
             }),
         };
         e.submit(t).unwrap();
