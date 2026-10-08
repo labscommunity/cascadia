@@ -90,6 +90,8 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={runtime_lib_release}");
     println!("cargo:rustc-link-search=native={runtime_lib_root}");
+    // macOS arm64 SDKs ship the dylibs under lib/arm64/Release (CPU only; no Intel GPU runtime).
+    println!("cargo:rustc-link-search=native={ov_root}/runtime/lib/arm64/Release");
     // ov::parallel_for (gemv-offload extension) inlines TBB calls; the SDK
     // ships the import libs under runtime/3rdparty/tbb/lib (Windows) and the
     // shared objects under .../tbb/lib/intel64 (Linux archives).
