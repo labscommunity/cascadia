@@ -181,6 +181,15 @@ fn input_text(input: &OaInput) -> Result<String, DecisionError> {
 fn choice_value(name: &str, v: &serde_json::Value) -> Result<OrderedValue, DecisionError> {
     match v {
         serde_json::Value::String(s) => Ok(OrderedValue::String(s.clone())),
+        // serde_json parses the integer literal `-0` as the float -0.0, and keeps no trace of the
+        // literal; Python's `json.loads("-0")` is the int 0, keyed "0" (as `/v1/systemone` keys
+        // it). So a negative zero is the integer 0, and `0` and `-0` are one value. A `-0.0`
+        // literal is folded too (Python would key it "-0.0"); `0.0` stays "0.0".
+        serde_json::Value::Number(n)
+            if n.is_f64() && n.as_f64().is_some_and(|x| x == 0.0 && x.is_sign_negative()) =>
+        {
+            Ok(OrderedValue::Number(0.into()))
+        }
         serde_json::Value::Number(n) => Ok(OrderedValue::Number(n.clone())),
         _ => Err(bad(format!(
             "{name}: choice values must be strings or numbers"
@@ -289,8 +298,8 @@ pub fn to_internal(r: &OaRequest) -> Result<(DecisionRequest, Vec<OaMeta>), Deci
         model: r.model.clone(),
         state: OrderedValue::String(input_text(&r.input)?),
         questions,
-        images: Vec::new(),
-        videos: Vec::new(),
+        images: None,
+        videos: None,
     };
     Ok((req, meta))
 }
@@ -419,6 +428,10 @@ mod tests {
         let (r2, _) = to_internal(&oa(r#"{"input": "x", "questions": [{"type": "choice", "name": "c", "instructions": "x", "choices": [{"value": 1e5}, {"value": 2.50}]}]}"#)).unwrap();
         assert_eq!(r2.questions["c"].option_keys(), ["100000.0", "2.5"]);
         assert_eq!(meta[2].level_labels, ["Cosmetic", "Blocked"]);
+        // EDGE-4: `-0` is Python's int 0 (key "0"), not "-0.0"; `0.0` keeps its float key.
+        let (r3, m3) = to_internal(&oa(r#"{"input": "x", "questions": [{"type": "choice", "name": "c", "instructions": "x", "choices": [{"value": -0}, {"value": 0.0}]}]}"#)).unwrap();
+        assert_eq!(r3.questions["c"].option_keys(), ["0", "0.0"]);
+        assert_eq!(m3[0].choice_values[0], OrderedValue::Number(0.into()));
     }
 
     #[test]
@@ -441,6 +454,9 @@ mod tests {
         ));
         assert!(bad(
             r#"{"input": "x", "questions": [{"type": "choice", "name": "c", "instructions": "x", "choices": [{"value": true}, {"value": "a"}]}]}"#
+        )); // `0` and `-0` are the same value.
+        assert!(bad(
+            r#"{"input": "x", "questions": [{"type": "choice", "name": "c", "instructions": "x", "choices": [{"value": 0}, {"value": -0}]}]}"#
         ));
     }
 

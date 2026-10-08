@@ -1,6 +1,6 @@
 //! Kev codec (jaredpalmer/kev-9b): ports kev/api.py to_record + kev/model.py encode (row form).
 use super::profile::KevProfile;
-use super::schema::{DecisionRequest, Limits, OrderedValue, QuestionType};
+use super::schema::{DecisionRequest, Limits, OrderedValue, Question, QuestionType};
 use super::{softmax, Codec, DecisionError, Pass, PassPart, Sanitizer};
 use cascadia_types::{DecisionReadout, ReadoutHead};
 use std::sync::atomic::AtomicBool;
@@ -23,7 +23,12 @@ pub struct KevCodec {
     /// The request's prefill budget (`DecisionService::max_total_tokens`); the render budget is
     /// 8 bytes per token of it, the same bound as the handler's byte pre-check.
     max_total_tokens: usize,
+    /// kev.model.admit: a state over SERVE_MAX_STATE tokens (`<state>` included) is refused.
+    max_state: usize,
 }
+
+/// kev/model.py SERVE_MAX_STATE (= MAX_TRAIN_STATE): the longest state Kev serves.
+pub const SERVE_MAX_STATE: usize = 65_536;
 
 /// Running byte budget for all of one request's rendered text (state, instructions, options).
 struct Budget {
@@ -56,7 +61,9 @@ impl Budget {
 }
 
 /// kev.api.render: str/int/float/bool via Python `str()`, lists as `- item`, objects as `key: value`.
-/// Unbounded; the codec uses [`render_bounded`].
+/// Unbounded, so test-only: a nested value's indentation can expand it ~128x (scoped-review F1).
+/// The codec uses [`render_bounded`].
+#[cfg(test)]
 pub fn render(v: &OrderedValue, indent: usize) -> String {
     let mut r = Renderer::new(usize::MAX);
     r.value(v, indent)
@@ -64,7 +71,7 @@ pub fn render(v: &OrderedValue, indent: usize) -> String {
     r.out
 }
 
-/// [`render`], but it stops as soon as the output would pass `budget` bytes, so a deeply nested
+/// kev.api.render, but it stops as soon as the output would pass `budget` bytes, so a deeply nested
 /// value (whose indentation grows with depth) never builds its full expansion. `Err` carries the
 /// budget.
 pub fn render_bounded(v: &OrderedValue, indent: usize, budget: usize) -> Result<String, usize> {
@@ -195,6 +202,7 @@ impl KevCodec {
             san,
             max_tokens,
             max_total_tokens,
+            max_state: SERVE_MAX_STATE,
         })
     }
 
@@ -211,11 +219,13 @@ impl KevCodec {
 
 impl Codec for KevCodec {
     fn limits(&self) -> Limits {
+        // kev/api.py: choice 1..=MAX_OPTIONS (255) criteria, score 1..=255 levels.
         Limits {
             max_questions: 32,
-            max_options: 256,
-            min_levels: 2,
-            max_levels: 256,
+            max_options: 255,
+            min_levels: 1,
+            max_levels: 255,
+            image_parts: false,
         }
     }
 
@@ -233,6 +243,15 @@ impl Codec for KevCodec {
         };
         let mut state = vec![s_id];
         state.extend(self.user_tokens(&b.render(&req.state)?)?);
+        // kev.model.admit (strict): ContextOverflow over SERVE_MAX_STATE; only the row may reach
+        // max_tokens (SERVE_MAX_BRANCH).
+        if state.len() > self.max_state {
+            return Err(DecisionError::TooLong(format!(
+                "the state is {} tokens, over the {}-token limit",
+                state.len(),
+                self.max_state
+            )));
+        }
         // Every row is the state plus at least <fim_middle> and <fim_suffix>: refuse before the
         // per-question clones.
         if state.len() >= self.max_tokens {
@@ -297,6 +316,16 @@ impl Codec for KevCodec {
             });
         }
         Ok(out)
+    }
+
+    /// kev/api.py `m["legend"] = dict(zip(keys, opts))`: the rendered level texts.
+    fn legend(&self, q: &Question) -> Option<Vec<OrderedValue>> {
+        let budget = self.max_total_tokens.saturating_mul(8);
+        q.score_levels()
+            .iter()
+            .map(|x| render_bounded(x, 0, budget).map(OrderedValue::String))
+            .collect::<Result<_, _>>()
+            .ok()
     }
 
     fn probabilities(&self, _req: &DecisionRequest, _part: &PassPart, logits: &[f32]) -> Vec<f64> {
@@ -510,6 +539,83 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn state_over_serve_max_state_is_413() {
+        // FID-2: kev.model.admit refuses a state over SERVE_MAX_STATE tokens, <state> included,
+        // even when the row would fit max_tokens.
+        let mut c = KevCodec::new(tok(), KevProfile { temperature: 1.0 }, 1000, 4000).unwrap();
+        assert_eq!(c.max_state, SERVE_MAX_STATE);
+        c.max_state = 3;
+        let at = |state: &str| -> DecisionRequest {
+            serde_json::from_str(&format!(
+                r#"{{"model": "m", "state": "{state}", "questions": {{"u": {{"type": "noul"}}}}}}"#
+            ))
+            .unwrap()
+        };
+        assert!(c.encode(&at("a a")).is_ok(), "<state> + 2 = 3 tokens");
+        match c.encode(&at("a a a")) {
+            Err(DecisionError::TooLong(m)) => {
+                assert_eq!(m, "the state is 4 tokens, over the 3-token limit")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn limits_match_kev_api() {
+        // FID-1: 1..=255 choice criteria and score levels (kev/api.py MAX_OPTIONS, min_length=1).
+        let c = KevCodec::new(tok(), KevProfile { temperature: 1.0 }, 1000, 4000).unwrap();
+        let l = c.limits();
+        assert_eq!((l.max_options, l.min_levels, l.max_levels), (255, 1, 255));
+        let one: DecisionRequest = serde_json::from_str(
+            r#"{"model": "m", "state": "a", "questions": {"s": {"type": "score", "criteria": ["only"]}}}"#,
+        )
+        .unwrap();
+        one.validate(&l).unwrap();
+        // One level: softmax of one logit is [1.0]; confidence 1, score 0, no NaN.
+        let p = c.probabilities(&one, &c.encode(&one).unwrap()[0].parts[0], &[0.3]);
+        assert_eq!(p, vec![1.0]);
+        let a = serde_json::to_value(crate::decisions::schema::answer_from_probs(
+            &one.questions["s"],
+            &p,
+        ))
+        .unwrap();
+        assert_eq!(a["score"], 0.0);
+        assert_eq!(a["confidence"], 1.0);
+    }
+
+    #[test]
+    fn legend_is_the_rendered_level_text() {
+        // EDGE-5(c): kev/api.py legend = dict(zip(keys, [render(x) for x in criteria])).
+        let c = KevCodec::new(tok(), KevProfile { temperature: 1.0 }, 1000, 4000).unwrap();
+        let r: DecisionRequest = serde_json::from_str(
+            r#"{"model": "m", "state": "a", "questions": {"s": {"type": "score", "criteria": [{"name": "x"}, "lo", 2, true]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.legend(&r.questions["s"]).unwrap(),
+            ["name: x", "lo", "2", "True"]
+                .map(|t| OrderedValue::String(t.into()))
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn list_state_with_image_fields_is_plain_data() {
+        // EDGE-1: kev.api.render turns a catalogue record with an `image` key into text.
+        let c = KevCodec::new(tok(), KevProfile { temperature: 1.0 }, 1000, 4000).unwrap();
+        let r: DecisionRequest = serde_json::from_str(
+            r#"{"model": "m", "state": [{"sku": 1, "image": "a"}, {"type": "image_url", "image_url": "b"}], "questions": {"u": {"type": "noul"}}}"#,
+        )
+        .unwrap();
+        r.validate(&c.limits()).unwrap();
+        assert_eq!(
+            render(&r.state, 0),
+            "- sku: 1\n  image: a\n- type: image_url\n  image_url: b"
+        );
+        assert!(c.encode(&r).is_ok());
     }
 
     #[test]
