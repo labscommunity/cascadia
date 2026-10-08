@@ -12,6 +12,9 @@ pub struct JevCodec {
     /// The per-pass token cap (`DecisionService::max_tokens`): every pass carries the whole
     /// state, so the first pass over it ends the encode instead of tokenizing every question.
     pass_cap: usize,
+    /// The request's prefill budget (`max_total_tokens`): JEV prefills every pass in full, so
+    /// the encode stops once the passes so far exceed it (P2-SEC-4).
+    total_cap: usize,
 }
 
 fn kind(q: &Question) -> &'static str {
@@ -111,12 +114,20 @@ impl JevCodec {
             p,
             san,
             pass_cap: usize::MAX,
+            total_cap: usize::MAX,
         })
     }
 
     /// Stop encoding at the first pass longer than `max_tokens` (a 413 either way).
     pub fn with_pass_cap(mut self, max_tokens: usize) -> Self {
         self.pass_cap = max_tokens;
+        self
+    }
+
+    /// Stop encoding once the passes so far exceed `max_total_tokens` (a 413 either way: no pass
+    /// shares a prefix, so the handler's budget counts every one in full).
+    pub fn with_total_cap(mut self, max_total_tokens: usize) -> Self {
+        self.total_cap = max_total_tokens;
         self
     }
 
@@ -197,6 +208,7 @@ impl Codec for JevCodec {
         cancel: &AtomicBool,
     ) -> Result<Vec<Pass>, DecisionError> {
         let mut out = Vec::with_capacity(req.questions.len());
+        let mut running = 0usize;
         // Every pass carries the whole state: render and sanitize it once, not per question.
         let state = self.san.apply(&render_state(&req.state));
         for (qid, q) in &req.questions {
@@ -208,6 +220,14 @@ impl Codec for JevCodec {
                 .map_err(super::tokenize_failed)?;
             if enc.len() > self.pass_cap {
                 return Err(super::pass_too_long(enc.len(), self.pass_cap));
+            }
+            running += enc.len();
+            if running > self.total_cap {
+                return Err(DecisionError::TooLong(format!(
+                    "this request needs at least {running} prefill tokens; the per-request limit \
+                     is {}",
+                    self.total_cap
+                )));
             }
             let (lo, hi) = self.slots_for(q);
             let token_ids = self.p.verbalizer_ids[lo..hi].to_vec();
@@ -381,6 +401,37 @@ mod tests {
         assert_eq!(roomy.encode(&req()).unwrap().len(), 3);
         let gone = std::sync::atomic::AtomicBool::new(true);
         assert!(c.encode_until(&req(), &gone).is_err());
+    }
+
+    #[test]
+    fn encode_stops_once_the_running_total_passes_the_request_budget() {
+        // P2-SEC-4: JEV prefills every pass in full, so once the passes tokenized so far exceed
+        // max_total_tokens the request is a 413 whatever follows: stop tokenizing there.
+        let full = JevCodec::new(tiny_tokenizer(), profile())
+            .unwrap()
+            .encode(&req())
+            .unwrap();
+        let len = |i: usize| full[i].readout.prompt_ids.len();
+        let total: usize = (0..3).map(len).sum();
+        let capped = JevCodec::new(tiny_tokenizer(), profile())
+            .unwrap()
+            .with_total_cap(len(0) + len(1) - 1);
+        match capped.encode(&req()) {
+            Err(DecisionError::TooLong(m)) => assert_eq!(
+                m,
+                format!(
+                    "this request needs at least {} prefill tokens; the per-request limit is {}",
+                    len(0) + len(1),
+                    len(0) + len(1) - 1
+                ),
+                "stopped after the second pass"
+            ),
+            other => panic!("{other:?}"),
+        }
+        let exact = JevCodec::new(tiny_tokenizer(), profile())
+            .unwrap()
+            .with_total_cap(total);
+        assert_eq!(exact.encode(&req()).unwrap().len(), 3);
     }
 
     #[test]

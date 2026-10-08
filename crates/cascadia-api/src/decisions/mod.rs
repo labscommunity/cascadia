@@ -151,7 +151,9 @@ impl DecisionService {
         let mut max_questions = prof.max_questions.unwrap_or(32);
         let codec: Box<dyn Codec> = match prof.family {
             profile::Family::Jev => Box::new(
-                jev::JevCodec::new(tok, prof.jev.clone().unwrap())?.with_pass_cap(max_tokens),
+                jev::JevCodec::new(tok, prof.jev.clone().unwrap())?
+                    .with_pass_cap(max_tokens)
+                    .with_total_cap(max_total_tokens),
             ),
             profile::Family::Kev => Box::new(kev::KevCodec::new(
                 tok,
