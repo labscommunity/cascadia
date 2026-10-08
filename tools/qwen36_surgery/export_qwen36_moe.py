@@ -358,8 +358,11 @@ def build_manifest(spec: ModelSpec, source: str, final_hidden: bool = False) -> 
 
     `final_hidden_output` (engine default false) says the last stage also
     outputs the final-norm hidden at index 1 (exporter `--final-hidden`).
+    It is written only when true, so a chat export's manifest stays
+    byte-identical to one from an exporter that predates the key: ranks
+    compare manifests byte for byte (HELLO) and `kv_fingerprint` hashes them.
     """
-    return {
+    m = {
         "arch": spec.model_type,
         "family": spec.family,
         "hidden_size": spec.hidden,
@@ -367,9 +370,11 @@ def build_manifest(spec: ModelSpec, source: str, final_hidden: bool = False) -> 
         "layer_types": spec.layer_types,
         "source": source,
         "last_logits_only": True,
-        "final_hidden_output": bool(final_hidden),
-        "stages": [],
     }
+    if final_hidden:
+        m["final_hidden_output"] = True
+    m["stages"] = []
+    return m
 
 
 def validate_verdict(top1: bool, overlap: int, d: float, n: float, m: int) -> bool:
