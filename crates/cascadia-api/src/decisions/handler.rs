@@ -143,10 +143,17 @@ pub(crate) async fn evaluate(
             "state is {state_bytes} bytes; the limit is {byte_limit}"
         )));
     }
+    // At most `encode_slots` tokenizations at once, whatever the request permits allow (each can
+    // hold a few hundred MB of tokenizer transients, P2-SEC-3). Waits rather than refusing: the
+    // request already holds its permit. Moved into the encode, so an orphaned encode keeps it.
+    let Ok(slot) = svc.encode_slots.clone().acquire_owned().await else {
+        return Err(DecisionError::Engine("decision engine error".into()));
+    };
     // Tokenization is CPU work proportional to the request: run it off the async executor.
     let (svc2, req2, held2, cancel2) = (svc.clone(), req.clone(), held.clone(), cancel.0.clone());
     let encoded = match tokio::task::spawn_blocking(move || {
         let _held = held2;
+        let _slot = slot;
         svc2.codec.encode_until(&req2, &cancel2)
     })
     .await

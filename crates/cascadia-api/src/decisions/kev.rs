@@ -241,8 +241,19 @@ impl Codec for KevCodec {
             total,
             tokens: self.max_total_tokens,
         };
+        // A token is at most ~8 bytes of honest rendered text: a state rendering past
+        // max_state x 8 bytes is refused before the tokenizer pays for it (P2-SEC-3).
+        let text = b.render(&req.state)?;
+        let cap = self.max_state.saturating_mul(8);
+        if text.len() > cap {
+            return Err(DecisionError::TooLong(format!(
+                "the state renders to {} bytes, over the {cap}-byte limit ({} tokens x 8)",
+                text.len(),
+                self.max_state
+            )));
+        }
         let mut state = vec![s_id];
-        state.extend(self.user_tokens(&b.render(&req.state)?)?);
+        state.extend(self.user_tokens(&text)?);
         // kev.model.admit (strict): ContextOverflow over SERVE_MAX_STATE; only the row may reach
         // max_tokens (SERVE_MAX_BRANCH).
         if state.len() > self.max_state {
@@ -561,6 +572,32 @@ mod tests {
             Err(DecisionError::TooLong(m)) => {
                 assert_eq!(m, "the state is 4 tokens, over the 3-token limit")
             }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_rendered_state_over_eight_bytes_per_allowed_token_is_413_before_tokenizing() {
+        // P2-SEC-3: the rendered state is bounded at max_state x 8 bytes before the tokenizer
+        // runs, so a guaranteed-413 state never costs a full tokenization.
+        let mut c = KevCodec::new(tok(), KevProfile { temperature: 1.0 }, 1000, 4000).unwrap();
+        c.max_state = 3;
+        let at = |state: &str| -> DecisionRequest {
+            serde_json::from_str(&format!(
+                r#"{{"model": "m", "state": "{state}", "questions": {{"u": {{"type": "noul"}}}}}}"#
+            ))
+            .unwrap()
+        };
+        // 24 bytes is the bound: under it, the token limit decides.
+        match c.encode(&at(&"a ".repeat(12))) {
+            Err(DecisionError::TooLong(m)) => assert!(m.contains("tokens"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        match c.encode(&at(&format!("{}a", "a ".repeat(12)))) {
+            Err(DecisionError::TooLong(m)) => assert_eq!(
+                m,
+                "the state renders to 25 bytes, over the 24-byte limit (3 tokens x 8)"
+            ),
             other => panic!("{other:?}"),
         }
     }
