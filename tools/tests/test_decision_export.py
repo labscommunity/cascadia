@@ -512,7 +512,8 @@ def test_cli_jev_max_tokens_from_weights_config(cli, monkeypatch):
     w = tmp / "ft"
     w.mkdir()
     (w / "config.json").write_text(json.dumps({"text_config": {"max_position_embeddings": 4096}}))
-    run("jev", "--base-ir", str(base), "--weights", str(w), "--adapter-dir", str(tmp / "a"), "--out", str(tmp / "t"))
+    run("jev", "--base-ir", str(base), "--weights", str(w), "--weights-not-merged", "--adapter-dir", str(tmp / "a"),
+        "--out", str(tmp / "t"))
     assert seen == {"mt": 4096}  # the fine-tune's config (shipped in the tree), not the base IR's 262144
 
 
@@ -659,3 +660,20 @@ def test_cli_bad_head_pt_is_a_clean_error(cli, monkeypatch, capsys, content):
     assert e.value.code == 2
     assert str(pt) in capsys.readouterr().err
     assert calls == [] and not (tmp / "t").exists()
+
+
+def test_cli_jev_weights_need_the_not_merged_statement(cli, monkeypatch, capsys):
+    """P2-BLD-1: --weights plus the grafted --lora applies the adapter twice when the shards already
+    hold it merged; the operator must state they do not (backbone_diff said FINETUNED, not MERGED)."""
+    run, calls, base, tmp = cli
+    monkeypatch.setattr(de, "write_jev_profile",
+                        lambda ad, cal, out, max_tokens: de._write(out, {"family": "jev"}, {"kind": "verbalizer"}))
+    ad = tmp / "jev" / "adapter_vllm"
+    with pytest.raises(SystemExit) as e:
+        run("jev", "--base-ir", str(base), "--adapter-dir", str(ad), "--weights", str(base), "--out", str(tmp / "t"))
+    assert e.value.code == 2 and "--weights-not-merged" in capsys.readouterr().err
+    assert calls == []
+    run("jev", "--base-ir", str(base), "--adapter-dir", str(ad), "--weights", str(base), "--weights-not-merged",
+        "--out", str(tmp / "t"))
+    (_, _, kw, _), = calls
+    assert kw["weights"] == str(base)
