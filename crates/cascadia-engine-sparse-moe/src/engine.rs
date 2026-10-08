@@ -5889,13 +5889,13 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     toks.len(),
                     f.slots.len()
                 );
-                self.fail_streams_into(out, msg, false);
+                self.fail_streams_into(out, msg, true);
                 return false;
             }
             for (&slot, &(wslot, token)) in f.slots.iter().zip(&toks) {
                 if wslot as usize != slot {
                     let msg = format!("stream reply row names slot {wslot}, expected {slot}");
-                    self.fail_streams_into(out, msg, false);
+                    self.fail_streams_into(out, msg, true);
                     return false;
                 }
                 if let Some(st) = self.streams.iter_mut().find(|s| s.slot == slot) {
@@ -6433,16 +6433,20 @@ impl<R: StagedRunner> PipelineEngine<R> {
 
     /// Abort every stream (wire or local failure): error chunks, slots
     /// freed, in-flight bookkeeping cleared. `wire` says the downstream link
-    /// itself failed (send/receive error, no link, timeout); only then is
-    /// `peer_disconnected` latched so rank 0 re-dials the downstream rank in
-    /// place on a later step (see [`Self::redial_downstream`]). A local
-    /// failure — a panic inside the forward, a reply that does not match the
-    /// frame — must NOT re-dial: the worker's listener accepts once, so a
-    /// re-dial into a healthy neighbour tears the whole chain down and every
-    /// rank reloads its slice for what was one bad request. (The message text
-    /// used to decide this, and a String panic payload never starts with
-    /// "forward panicked".)
+    /// itself failed (send/receive error, no link, timeout, or a reply that
+    /// does not match its frame, so the reply FIFO is out of sync); only then
+    /// is `peer_disconnected` latched so rank 0 re-dials the downstream rank
+    /// in place on a later step (see [`Self::redial_downstream`]). A local
+    /// failure (a panic inside the forward) must NOT re-dial: the worker's
+    /// listener accepts once, so a re-dial into a healthy neighbour tears the
+    /// whole chain down and every rank reloads its slice for what was one bad
+    /// request. A local failure first reads and drops the reply that the
+    /// downstream still owes for each in-flight frame, then sends
+    /// `StreamClose` for each aborted slot, so no stale reply stays on the
+    /// link for the idle check or the next request to find. If one of these
+    /// reads or sends fails, the failure is a wire failure.
     fn fail_streams_into(&mut self, out: &mut Vec<(TaskId, Chunk)>, msg: String, wire: bool) {
+        let wire = wire || !self.drain_stream_link();
         if wire {
             self.peer_disconnected = true;
         }
@@ -6456,6 +6460,54 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 out.push((st.id.clone(), Chunk::error(st.id, msg.clone())));
             }
         }
+    }
+
+    /// Local failure only (see [`Self::fail_streams_into`]): read and drop
+    /// the reply of each in-flight frame, oldest first, then send
+    /// `StreamClose` for each open stream. `false` if a read or a send fails,
+    /// or a reply does not match its frame.
+    fn drain_stream_link(&mut self) -> bool {
+        let Some(down) = self.transport.downstream.clone() else {
+            return false;
+        };
+        let groups = self.stream_groups.max(1) as u32;
+        let seq = self.stream_batch_seq;
+        let mut frames: Vec<StreamInFlight> = self
+            .stream_inflight
+            .iter_mut()
+            .flat_map(|q| q.drain(..))
+            .collect();
+        // Batch ids grow in send order: the oldest frame is the furthest behind `seq`.
+        frames.sort_by_key(|f| std::cmp::Reverse(seq.wrapping_sub(f.batch_id)));
+        for f in frames {
+            let deadline = if f.open {
+                Self::reply_deadline_prefill()
+            } else {
+                Self::reply_deadline() * groups
+            };
+            match self.block_on(recv_stream_tokens_reply(&down, deadline)) {
+                Ok((bid, _)) if bid == f.batch_id => {}
+                Ok((bid, _)) => {
+                    warn!(
+                        batch = bid,
+                        expected = f.batch_id,
+                        "stale stream reply mismatch"
+                    );
+                    return false;
+                }
+                Err(e) => {
+                    warn!(error = %e, "stale stream reply not read");
+                    return false;
+                }
+            }
+        }
+        for st in &self.streams {
+            if let Err(e) = self.block_on(send_stream_close(&down, st.slot as u32)) {
+                warn!(slot = st.slot, "stream close not relayed: {e}");
+                return false;
+            }
+        }
+        true
     }
 
     /// Multi-stream single stage: admit up to `stream_admit_per_step` pending
