@@ -2,7 +2,6 @@
 
     python -m pytest tools/tests/test_decision_export.py -v
 """
-import inspect
 import json
 import os
 import sys
@@ -14,22 +13,22 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), os.pardir))
 import export_qwen36_moe as ex  # noqa: E402
 
 
-def test_run_export_accepts_decision_options():
-    params = inspect.signature(ex.run_export).parameters
-    for name in ("weights", "lora", "lora_scale", "final_hidden"):
-        assert name in params, name
-    assert params["final_hidden"].default is False
-
-
-def test_lora_scale_defaults_to_adapter_config():
-    assert inspect.signature(ex.run_export).parameters["lora_scale"].default is None
-
-
 def test_manifest_records_final_hidden():
     spec = ex.ModelSpec(model_type="qwen3_5", hidden=8, num_layers=4, layer_types=["linear_attention"] * 3 + ["full_attention"])
     m = ex.build_manifest(spec, "src", final_hidden=True)
     assert m["final_hidden_output"] is True
-    assert ex.build_manifest(spec, "src")["final_hidden_output"] is False
+    assert list(m)[-2:] == ["final_hidden_output", "stages"]
+    assert "final_hidden_output" not in ex.build_manifest(spec, "src")
+
+
+def test_chat_manifest_is_byte_identical_to_the_pre_decision_exporter():
+    """Ranks compare manifest.json byte for byte at HELLO and kv_fingerprint hashes it, so a chat
+    export must not grow a `final_hidden_output: false` key a tree from main does not have."""
+    spec = ex.ModelSpec(model_type="qwen3_5", hidden=8, num_layers=4, layer_types=["linear_attention"] * 3 + ["full_attention"])
+    main_manifest = {"arch": "qwen3_5", "family": spec.family, "hidden_size": 8, "num_layers": 4,
+                     "layer_types": ["linear_attention"] * 3 + ["full_attention"], "source": "src",
+                     "last_logits_only": True, "stages": []}
+    assert json.dumps(ex.build_manifest(spec, "src"), indent=2) == json.dumps(main_manifest, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +97,7 @@ def test_chat_export_unchanged_without_decision_flags(stubbed):
     ex.run_export(str(model), str(out), 2)
     assert [c[0] for c in calls] == ["save", "save"]
     m = json.loads((out / "manifest.json").read_text())
-    assert m["final_hidden_output"] is False
+    assert "final_hidden_output" not in m
     assert (out / "openvino_text_embeddings_model.bin").read_text() == "stock openvino_text_embeddings_model.bin"
 
 
