@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use cascadia_engine::Engine;
 use cascadia_engine_sparse_moe::dist::{
-    recv_kind_client, recv_stream_tokens_body_client, send_stream_decode, send_stream_open,
-    FrameKind, StageTransport,
+    recv_kind_client, recv_stream_tokens_body_client, send_stream_decode, send_stream_feed,
+    send_stream_open, FrameKind, StageTransport, STREAM_FEED_OPEN,
 };
 use cascadia_engine_sparse_moe::engine::PipelineEngine;
 use cascadia_engine_sparse_moe::inkling::stage::InklingRunner;
@@ -357,6 +357,46 @@ async fn bad_stream_decode_frame_is_rejected_without_panic() {
         join(worker).await,
         "a decode that lists one slot two times panicked the worker"
     );
+}
+
+/// A stream frame that the last rank cannot serve, here a decode of a slot
+/// whose prompt it never sampled, must close the link at once. Before the
+/// fix the worker logged it and kept going without a reply, so rank 0 waited
+/// its whole reply deadline and then reported a dead peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_stream_frame_closes_the_link_at_once() {
+    let Some(dir) = fixture() else { return };
+    let handle = tokio::runtime::Handle::current();
+    let (c, hs, worker) = lone_last_rank(&dir, &handle).await;
+    // The first window of a long prompt opens the slot; only the final
+    // window would create its sampler.
+    let cfg = SamplingConfig::default();
+    send_stream_feed(
+        &c,
+        1,
+        0,
+        STREAM_FEED_OPEN,
+        &cfg,
+        &vec![0.1; 2 * hs],
+        2,
+        hs as u32,
+    )
+    .await
+    .unwrap();
+    send_stream_decode(&c, 2, &[(0, 2)], &vec![0.1; hs], hs as u32)
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(5), recv_kind_client(&c))
+        .await
+        .expect("the last rank neither replied nor closed the link");
+    assert!(
+        !matches!(reply, Ok(Some(_))),
+        "expected the link to close, got {reply:?}"
+    );
+    let joined = tokio::task::spawn_blocking(move || worker.join().is_ok())
+        .await
+        .unwrap();
+    assert!(joined, "the last rank panicked");
 }
 
 /// Like `collect`, but a task may end in an error chunk (returned as Err) and

@@ -7620,7 +7620,20 @@ impl<R: StagedRunner> PipelineEngine<R> {
         };
         if let Err(e) = res {
             warn!("worker frame failed: {e}");
-            std::thread::sleep(WORKER_BACKOFF);
+            if matches!(
+                kind,
+                FrameKind::StreamOpen
+                    | FrameKind::StreamFeed
+                    | FrameKind::StreamDecode
+                    | FrameKind::StreamClose
+            ) {
+                // No reply goes up for a failed stream frame: latch, so the
+                // link closes and rank 0 reads EOF now instead of waiting
+                // out its reply deadline.
+                self.peer_disconnected = true;
+            } else {
+                std::thread::sleep(WORKER_BACKOFF);
+            }
         }
         self.flush_stage_profile();
         Vec::new()
