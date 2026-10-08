@@ -300,6 +300,18 @@ impl Codec for KevCodec {
                 Some(v) => b.render(v)?,
                 None => String::new(),
             };
+            // Like the state: the row has `max_tokens - state` tokens left, so a question
+            // (instructions plus option texts) rendering past 8 bytes per token of that is refused
+            // before the tokenizer pays for it (P3-SEC residual of P2-SEC-3).
+            let left = self.max_tokens - state.len();
+            let row_cap = left.saturating_mul(8);
+            let text = instructions.len() + opts.iter().map(String::len).sum::<usize>();
+            if text > row_cap {
+                return Err(DecisionError::TooLong(format!(
+                    "a question renders to {text} bytes, over the {row_cap}-byte limit ({left} \
+                     tokens left in the pass x 8)"
+                )));
+            }
             row.extend(self.user_tokens(&instructions)?);
             let mut ends = Vec::with_capacity(opts.len());
             for o in &opts {
@@ -597,6 +609,33 @@ mod tests {
             Err(DecisionError::TooLong(m)) => assert_eq!(
                 m,
                 "the state renders to 25 bytes, over the 24-byte limit (3 tokens x 8)"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_question_text_over_eight_bytes_per_row_token_is_413_before_tokenizing() {
+        // P3-SEC residual: instructions and option texts are bounded per question like the state:
+        // the row has at most max_tokens - state tokens left, so a question rendering past 8
+        // bytes per remaining token is refused before the tokenizer pays for it.
+        let c = KevCodec::new(tok(), KevProfile { temperature: 1.0 }, 10, 4000).unwrap();
+        let at = |instructions: &str| -> DecisionRequest {
+            serde_json::from_str(&format!(
+                r#"{{"model": "m", "state": "a", "questions": {{"u": {{"type": "noul", "instructions": "{instructions}"}}}}}}"#
+            ))
+            .unwrap()
+        };
+        // The state is 2 tokens (<state> + "a"), leaving 8 tokens = 64 bytes; the noul options
+        // render as "no" and "yes" (5 bytes).
+        assert!(
+            c.encode(&at(&"b".repeat(59))).is_ok(),
+            "64 bytes: at the bound"
+        );
+        match c.encode(&at(&"b".repeat(60))) {
+            Err(DecisionError::TooLong(m)) => assert_eq!(
+                m,
+                "a question renders to 65 bytes, over the 64-byte limit (8 tokens left in the pass x 8)"
             ),
             other => panic!("{other:?}"),
         }
