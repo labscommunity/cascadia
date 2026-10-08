@@ -956,8 +956,9 @@ impl Builder for SparseMoEBuilder {
                 // No per-rank KV-prefix cache on this family yet (follow-up).
                 None,
             );
-            // `CASCADIA_STREAMS=N`: decode up to N requests together (single
-            // stage). Off by default; the pipeline wire is a follow-up.
+            // `CASCADIA_STREAMS=N`: decode up to N requests together, on a
+            // single stage or across the pipeline. Every rank must set the
+            // same N. Off by default.
             let streams = env_count(
                 "CASCADIA_STREAMS",
                 std::env::var("CASCADIA_STREAMS").ok().as_deref(),
@@ -5355,7 +5356,7 @@ pub struct PipelineEngine<R: StagedRunner> {
     /// Rank 0 serves ONE task at a time (as the monolithic driver did): a new
     /// task is popped from `pending` only when this is `None`.
     active: Option<PipeActive>,
-    /// Multi-stream decode (single stage only for now): up to `stream_cap`
+    /// Multi-stream decode (single stage or pipeline): up to `stream_cap`
     /// tasks decode together, one token each per `step`, the runner batching
     /// their MoE rows. Empty / 0 = the one-task path above.
     streams: Vec<StreamActive>,
@@ -5366,16 +5367,14 @@ pub struct PipelineEngine<R: StagedRunner> {
     stream_batch_seq: u32,
     /// Rank 0 of a pipeline: streams are split into this many groups, each
     /// with its own micro-batch frame in flight, so every rank works on a
-    /// different group's frame at once. Groups are serviced round-robin, one
-    /// per `step`, which keeps the single reply FIFO in order. 1 = one frame
-    /// in flight (no overlap). Pays off because a rank's cost per frame is a
-    /// fixed part plus a per-row part: G smaller frames in flight finish
-    /// sooner than one big one through R ranks in series.
+    /// different group's frame at once. One `step` serves every group in
+    /// turn, in a fixed order, which keeps the single reply FIFO in order.
+    /// 1 = one frame in flight (no overlap). Pays off because a rank's cost
+    /// per frame is a fixed part plus a per-row part: G smaller frames in
+    /// flight finish sooner than one big one through R ranks in series.
     stream_groups: usize,
     /// Rank 0: frames sent and not yet answered, per group, in send order.
     stream_inflight: Vec<VecDeque<StreamInFlight>>,
-    /// Rank 0: rotation counter (`% stream_groups` = the group this step serves).
-    stream_step: u64,
     /// New streams admitted (prefilled) per `step`, so a burst of prompts
     /// cannot stall the streams already decoding for many prefills at once.
     stream_admit_per_step: usize,
@@ -5737,16 +5736,15 @@ impl<R: StagedRunner> PipelineEngine<R> {
             stream_batch_seq: 0,
             stream_groups: 1,
             stream_inflight: Vec::new(),
-            stream_step: 0,
             stream_admit_per_step: 1,
             stream_log: (0, Duration::ZERO, 0),
             stage_profile: None,
         }
     }
 
-    /// Enable multi-stream decode with up to `n` concurrent tasks (single
-    /// stage only). Returns the capacity actually configured (0 if the runner
-    /// cannot batch streams).
+    /// Enable multi-stream decode with up to `n` concurrent tasks, on a single
+    /// stage or on any rank of a pipeline. Returns the capacity actually
+    /// configured (0 if the runner cannot batch streams).
     pub fn enable_streams(&mut self, n: usize) -> usize {
         if n == 0 {
             return 0;
@@ -5884,10 +5882,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
         self.link_busy.store(n, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Rank 0 of a multi-stream pipeline: one group's turn. Receive the
-    /// group's outstanding replies (the oldest frames on the wire — groups
-    /// are serviced round-robin, so the single reply FIFO stays in order),
-    /// admit new streams into this group (their `StreamOpen` goes out now),
+    /// Rank 0 of a multi-stream pipeline: one round over every group. In each
+    /// group's turn, receive the group's outstanding replies (the oldest
+    /// frames on the wire — groups are serviced round-robin, so the single
+    /// reply FIFO stays in order), admit new streams into this group (their
+    /// `StreamOpen` goes out now),
     /// emit the group's ready tokens, retire finished streams, and send one
     /// decode micro-batch for the survivors. With G groups and G frames in
     /// flight, each downstream rank is busy on a different group's rows.
@@ -5900,7 +5899,6 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let groups = self.stream_groups.max(1);
         loop {
             for g in 0..groups {
-                self.stream_step += 1;
                 let done = self.step_stream_group(g, &mut out);
                 if !done {
                     return out;

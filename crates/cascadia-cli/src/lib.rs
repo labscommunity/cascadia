@@ -2346,7 +2346,8 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         cfg.defer_template_on_thinking = matches!(args.engine, EngineKind::OvGenai);
         // `CASCADIA_API_MAX_CONCURRENT`: in-flight request cap (backpressure is
         // 503 beyond it). A multi-stream engine serves `CASCADIA_STREAMS` at
-        // once, so a demo firing that many at a time needs the cap above it.
+        // once, so a client that sends that many requests at once needs the
+        // cap above it.
         cfg.max_concurrent_requests = api_max_concurrent(
             std::env::var("CASCADIA_API_MAX_CONCURRENT").ok().as_deref(),
             cfg.max_concurrent_requests,

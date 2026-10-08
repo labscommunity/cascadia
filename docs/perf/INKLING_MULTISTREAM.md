@@ -44,10 +44,11 @@ with its slot's sampler), `StreamClose` (free the slot everywhere),
 rank 0 picks slot ids, workers open the same ids.
 
 **Groups in flight.** Rank 0 splits its streams into G groups
-(`CASCADIA_STREAMS_INFLIGHT`, default = the rank count) and serves one group
-per step: receive that group's outstanding replies — the oldest frames on
-the wire, so the single reply FIFO stays ordered — admit new streams into it,
-emit its ready tokens, retire finished streams, send one decode micro-batch.
+(`CASCADIA_STREAMS_INFLIGHT`, default = the rank count). One step serves
+every group in turn. In a group's turn, rank 0 receives that group's
+outstanding replies — the oldest frames on the wire, so the single reply
+FIFO stays ordered — admits new streams into it, emits its ready tokens,
+retires finished streams and sends one decode micro-batch.
 Mid ranks wait on readiness of both sockets (a cancel-safe `peek`) and treat
 a frame from upstream and a reply from downstream as independent events, so
 G frames are in flight and every rank is busy on a different group's rows.
