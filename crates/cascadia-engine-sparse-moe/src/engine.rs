@@ -1456,6 +1456,8 @@ const REDIAL_INTERVAL: Duration = Duration::from_secs(3);
 /// How often rank 0's link keeper looks at the downstream link while no
 /// request is in progress.
 const IDLE_LINK_CHECK: Duration = Duration::from_secs(2);
+/// At most one log line per this interval for failed idle re-dials.
+const REDIAL_FAIL_LOG_EVERY: Duration = Duration::from_secs(30);
 
 /// In-flight multi-stage generation on rank 0 (one at a time; queued tasks
 /// wait in `pending`). This is the streamed replacement for the deleted
@@ -5786,6 +5788,8 @@ impl<R: StagedRunner> PipelineEngine<R> {
             let mut tick = tokio::time::interval(IDLE_LINK_CHECK);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut down_since: Option<Instant> = None;
+            // Last time a failed re-dial was logged (rate limit).
+            let mut last_fail_log: Option<Instant> = None;
             loop {
                 tick.tick().await;
                 if alive.upgrade().is_none() {
@@ -5810,13 +5814,24 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     down_since = Some(Instant::now());
                 }
                 client.close().await;
-                if let Ok(Ok(())) = tokio::time::timeout(REDIAL_BUDGET, client.try_connect()).await {
-                    epoch.fetch_add(1, SeqCst);
-                    info!(
-                        down_s = down_since.map(|t| t.elapsed().as_secs()).unwrap_or(0),
-                        "downstream link re-dialed while idle"
-                    );
-                    down_since = None;
+                let down_s = down_since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                match tokio::time::timeout(REDIAL_BUDGET, client.try_connect()).await {
+                    Ok(Ok(())) => {
+                        epoch.fetch_add(1, SeqCst);
+                        info!(down_s, "downstream link re-dialed while idle");
+                        down_since = None;
+                        last_fail_log = None;
+                    }
+                    res => {
+                        if last_fail_log.is_none_or(|t| t.elapsed() >= REDIAL_FAIL_LOG_EVERY) {
+                            let err = match res {
+                                Ok(Err(e)) => e.to_string(),
+                                _ => format!("timed out after {REDIAL_BUDGET:?}"),
+                            };
+                            warn!(down_s, err = %err, "idle re-dial of the downstream link failed");
+                            last_fail_log = Some(Instant::now());
+                        }
+                    }
                 }
             }
         });
