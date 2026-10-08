@@ -106,10 +106,39 @@ fn batched_decode_with_expert_cache_matches_the_reference_and_hits_on_the_second
         "eager reference must match the HF greedy ids"
     );
 
+    // Prefill reads the cache but never grows it: a prefill alone on a fresh
+    // runner leaves the cache empty.
+    let mut fresh =
+        InklingRunner::load_staged(&dir, 64, 0, 1, 0, 0, Some("mmap".into()), None).unwrap();
+    assert!(fresh.configure_streams(1));
+    let slot = fresh.open_stream().unwrap();
+    let mut batch = Vec::new();
+    for &t in &p1 {
+        batch.extend(fresh.embed_token(t));
+    }
+    fresh.prefill_stream(slot, batch, p1.len());
+    fresh.close_stream(slot);
+    let after_prefill = fresh.expert_cache_stats_total();
+    eprintln!("expert cache after a prefill only: {after_prefill:?}");
+    assert!(after_prefill.capacity_bytes > 0, "the cache must be on");
+    assert!(after_prefill.misses > 0, "prefill must look up the cache");
+    assert_eq!(
+        after_prefill.retained_bytes, 0,
+        "prefill must not grow the cache"
+    );
+    assert_eq!(
+        after_prefill.admissions, 0,
+        "prefill must not admit experts"
+    );
+    drop(fresh);
+
     let mut cached =
         InklingRunner::load_staged(&dir, 64, 0, 1, 0, 0, Some("mmap".into()), None).unwrap();
     assert!(cached.configure_streams(2));
     let pass1 = run_batched(&mut cached, &prompts, n);
+    let s1 = cached.expert_cache_stats_total();
+    eprintln!("expert cache after pass 1: {s1:?}");
+    assert!(s1.retained_bytes > 0, "pass 1 misses must be admitted");
     let pass2 = run_batched(&mut cached, &prompts, n);
     // The cache must not change a single bit: pass 1 computes every expert
     // from a fresh read, pass 2 from retained buffers.
@@ -145,8 +174,11 @@ fn batched_decode_with_expert_cache_matches_the_reference_and_hits_on_the_second
         }
     }
     eprintln!("largest logit difference vs the eager reference: {worst:e} of the largest logit");
-    let stats = cached.expert_cache_stats_total();
-    eprintln!("expert cache after two passes: {stats:?}");
-    assert!(stats.hits > 0, "the second pass must hit the cache");
-    assert!(stats.retained_bytes > 0, "misses must be admitted");
+    let s2 = cached.expert_cache_stats_total();
+    eprintln!("expert cache after pass 2: {s2:?}");
+    assert!(s2.hits > s1.hits, "the second pass must hit the cache");
+    assert_eq!(
+        s2.retained_bytes, s1.retained_bytes,
+        "the second pass must not retain new bytes"
+    );
 }
