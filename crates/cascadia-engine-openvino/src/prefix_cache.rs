@@ -161,8 +161,9 @@ pub(crate) fn unframe_blobs(b: &[u8]) -> Option<Vec<Vec<u8>>> {
 /// box gets 8 GiB of it.
 pub const DEFAULT_PREFIX_CACHE_BYTES: usize = 16 << 30;
 
-/// Snapshots shorter than this are not worth a `get_state_blob` copy.
-pub const MIN_PREFIX_TOKENS: usize = 16;
+/// Snapshots shorter than this are not worth a `get_state_blob` copy (shared with the API, which
+/// never counts a reuse discount below it).
+pub use cascadia_types::MIN_PREFIX_TOKENS;
 
 struct Entry {
     tokens: Vec<u32>,
@@ -190,6 +191,9 @@ pub struct PrefixCache {
     /// The over-budget refusal has been reported once; the condition holds for
     /// every later turn, so warning again would bury the line.
     warned: bool,
+    /// Shortest and longest key length `insert` has seen, with their snapshot
+    /// bytes: the measured size model behind [`Self::estimated_bytes`].
+    size_obs: Option<((usize, usize), (usize, usize))>,
 }
 
 impl PrefixCache {
@@ -203,6 +207,7 @@ impl PrefixCache {
             misses: 0,
             refused_len: None,
             warned: false,
+            size_obs: None,
         }
     }
 
@@ -252,6 +257,30 @@ impl PrefixCache {
         self.refused_len.is_none_or(|r| len < r)
     }
 
+    /// Estimated snapshot bytes for a `len`-token key, from the snapshots
+    /// `insert` has measured: a fixed (DeltaNet) part plus KV linear in the
+    /// key, fitted through the shortest and longest key seen. With one length
+    /// measured, a key at least that long is at least that large (monotone);
+    /// `None` when nothing measured bounds it.
+    pub fn estimated_bytes(&self, len: usize) -> Option<usize> {
+        let ((l1, b1), (l2, b2)) = self.size_obs?;
+        if l2 > l1 && b2 >= b1 {
+            let per_token = (b2 - b1) as f64 / (l2 - l1) as f64;
+            Some((b1 as f64 + per_token * (len as f64 - l1 as f64)).max(0.0) as usize)
+        } else {
+            (len >= l2).then_some(b2)
+        }
+    }
+
+    /// Can the cache structurally hold a snapshot at `len` tokens: enabled,
+    /// at least [`MIN_PREFIX_TOKENS`], under the measured over-budget
+    /// threshold ([`Self::worth_copying`]) and an estimated size within the
+    /// budget ([`Self::estimated_bytes`]; unknown counts as fitting). Says
+    /// nothing about eviction: a snapshot that fits can still be evicted later.
+    pub fn can_hold(&self, len: usize) -> bool {
+        self.worth_copying(len) && self.accepts(len, self.estimated_bytes(len).unwrap_or(0))
+    }
+
     /// Cache the per-stage `parts` under `tokens`, replacing an entry with the
     /// same key and evicting least-recently-used entries until it fits. A
     /// snapshot larger than the whole budget (or a key shorter than
@@ -261,6 +290,14 @@ impl PrefixCache {
     /// not pay the same copy again.
     pub fn insert(&mut self, tokens: Vec<u32>, parts: Vec<Vec<u8>>) -> bool {
         let bytes = parts_bytes(&parts);
+        let obs = (tokens.len(), bytes);
+        self.size_obs = Some(match self.size_obs {
+            None => (obs, obs),
+            Some((lo, hi)) => (
+                if obs.0 < lo.0 { obs } else { lo },
+                if obs.0 >= hi.0 { obs } else { hi },
+            ),
+        });
         if self.enabled() && bytes > self.budget {
             self.refused_len = Some(
                 self.refused_len
@@ -446,6 +483,26 @@ pub fn plan_snapshots(
         .collect()
 }
 
+/// Which decision `boundaries` (the request's shared prefix, `cache_prefix`)
+/// this pass snapshots: every one past the restored prefix that the cache can
+/// hold ([`PrefixCache::can_hold`]) and does not already hold. Unlike
+/// [`plan_snapshots`] there is no refresh rule: a request whose later passes
+/// were admitted on the shared-prefix discount must find this exact key, even
+/// when the pass restored a shorter entry (another request's state that this
+/// one extends) and the chat rule would judge the copy not worth it.
+pub fn plan_decision_snapshots(
+    prompt: &[u32],
+    boundaries: &[usize],
+    warm_prefix: usize,
+    cache: &PrefixCache,
+) -> Vec<usize> {
+    boundaries
+        .iter()
+        .copied()
+        .filter(|&b| b > warm_prefix && cache.can_hold(b) && !cache.contains(&prompt[..b]))
+        .collect()
+}
+
 /// End of the next prefill span starting at `idx`: `chunk` tokens, clamped
 /// to the prompt length and to the first snapshot position past `idx` so a
 /// span ends exactly on it (the chain state is captured right after that
@@ -621,6 +678,62 @@ mod tests {
             plan_snapshots(&p, &[31, 1500], 0, &c, &costs, bytes),
             vec![1500]
         );
+    }
+
+    #[test]
+    fn a_decision_prefix_is_snapshotted_whatever_the_refresh_rule() {
+        // P2-CE-1: request A cached its Kev state (key 40); request B's state extends it (its
+        // cache_prefix is 60). B's first pass restores A's entry, so the chat refresh rule sees a
+        // 20-token tail against a 1.2 GB copy and skips the boundary. A decision boundary is
+        // taken anyway: B's later passes must find it.
+        let p = key(200, 0);
+        let mut c = PrefixCache::new(1 << 20);
+        assert!(c.insert(p[..40].to_vec(), blob(10)));
+        let costs = measured_costs();
+        let bytes = 1_200_000_000;
+        assert!(
+            plan_snapshots(&p, &[60], 40, &c, &costs, bytes).is_empty(),
+            "chat behaviour unchanged"
+        );
+        assert_eq!(plan_decision_snapshots(&p, &[60], 40, &c), vec![60]);
+        assert_eq!(plan_decision_snapshots(&p, &[60], 0, &c), vec![60], "cold");
+        // Not past the restored prefix, or already cached: nothing to copy.
+        assert!(plan_decision_snapshots(&p, &[60], 60, &c).is_empty());
+        assert!(c.insert(p[..60].to_vec(), blob(10)));
+        assert!(plan_decision_snapshots(&p, &[60], 40, &c).is_empty());
+        // B's later passes then restore B's own (longer) entry, not A's.
+        assert_eq!(c.longest_prefix(&p[..61]).unwrap().1, 60);
+        // A boundary the cache cannot hold is not copied at all.
+        let mut tiny = PrefixCache::new(1 << 20);
+        assert!(plan_decision_snapshots(&p, &[MIN_PREFIX_TOKENS - 1], 0, &tiny).is_empty());
+        assert!(!tiny.insert(key(40, 0), blob((1 << 20) + 1)));
+        assert!(plan_decision_snapshots(&p, &[60], 0, &tiny).is_empty());
+    }
+
+    #[test]
+    fn can_hold_is_the_structural_check_before_any_prefill() {
+        // Disabled, or a key too short to store: never.
+        assert!(!PrefixCache::new(0).can_hold(1000));
+        let mut c = PrefixCache::new(1000);
+        assert!(!c.can_hold(MIN_PREFIX_TOKENS - 1));
+        assert!(c.can_hold(MIN_PREFIX_TOKENS));
+        // Nothing measured yet: the size is unknown, so the snapshot is attempted.
+        assert_eq!(c.estimated_bytes(10_000), None);
+        assert!(c.can_hold(10_000));
+        // One snapshot measured: a longer key is at least as large (monotone).
+        assert!(c.insert(key(100, 0), blob(300)));
+        assert_eq!(c.estimated_bytes(100), Some(300));
+        assert_eq!(c.estimated_bytes(500), Some(300));
+        assert_eq!(c.estimated_bytes(50), None);
+        // Two lengths measured: fixed state + per-token KV, extrapolated.
+        assert!(c.insert(key(200, 0), blob(500)));
+        assert_eq!(c.estimated_bytes(300), Some(700));
+        assert_eq!(c.estimated_bytes(150), Some(400));
+        assert!(c.can_hold(450), "100 + 2 * 450 = 1000 fits");
+        assert!(!c.can_hold(500), "100 + 2 * 500 = 1100 cannot ever fit");
+        // A measured refusal stays authoritative.
+        assert!(!c.insert(key(300, 0), blob(1001)));
+        assert!(!c.can_hold(300) && c.can_hold(299));
     }
 
     #[test]

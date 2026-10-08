@@ -33,6 +33,10 @@ pub const MAX_JOINT_PROMPT: usize = 16_384;
 /// too-long request, instead of failing inside the shim after a full prefill. Keep in sync.
 pub const MAX_HEAD_INPUT_BYTES: usize = 256 * 1024 * 1024;
 
+/// Shortest prefix the engine's prefix cache stores: a snapshot under it is not worth the
+/// `get_state_blob` copy. Shared so the API never counts a reuse discount the cache cannot give.
+pub const MIN_PREFIX_TOKENS: usize = 16;
+
 /// The joint prompt bound at model width `hidden`: [`MAX_JOINT_PROMPT`], tightened so the head's
 /// `hidden` input (`[T, hidden]` f32) fits [`MAX_HEAD_INPUT_BYTES`]. 4096 wide (Clef-flash):
 /// 16,384 (unaffected); 5120 wide (Clef-27B): 13,107.
@@ -88,6 +92,12 @@ pub struct DecisionReadout {
     /// the prefix again past the budget the request was admitted under.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub require_warm: bool,
+    /// The first pass of a request whose later passes are `require_warm` (single box): the engine
+    /// checks, BEFORE prefilling it, that the prefix cache can hold a snapshot at `cache_prefix`
+    /// at all (`decision_uncacheable`, a 413, when it cannot), and then always takes that
+    /// snapshot, whatever the chat refresh heuristics would decide.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_snapshot: bool,
 }
 
 /// Which head reads the prefilled state. Positions/spans index `prompt_ids`.
@@ -293,6 +303,7 @@ mod tests {
             },
             cache_prefix: None,
             require_warm: false,
+            needs_snapshot: false,
         };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("\"kind\":\"verbalizer\""));
@@ -300,6 +311,22 @@ mod tests {
         assert_eq!(back, r);
         assert_eq!(r.head.output_len(), 2);
         assert_eq!(r.head.hidden_need(), HiddenNeed::None);
+        // The reuse flags stay off the wire when false (pipeline frames are unchanged) and
+        // default to false from an older peer's readout.
+        assert!(
+            !s.contains("require_warm") && !s.contains("needs_snapshot"),
+            "{s}"
+        );
+        let flagged = DecisionReadout {
+            needs_snapshot: true,
+            ..r.clone()
+        };
+        let s = serde_json::to_string(&flagged).unwrap();
+        assert!(s.contains("\"needs_snapshot\":true"), "{s}");
+        assert_eq!(
+            serde_json::from_str::<DecisionReadout>(&s).unwrap(),
+            flagged
+        );
     }
 
     #[test]
@@ -345,6 +372,7 @@ mod tests {
             },
             cache_prefix: None,
             require_warm: false,
+            needs_snapshot: false,
         };
         let vocab = MAX_JOINT_PROMPT + 10;
         assert!(joint(MAX_JOINT_PROMPT as u32)
@@ -363,6 +391,7 @@ mod tests {
             },
             cache_prefix: None,
             require_warm: false,
+            needs_snapshot: false,
         };
         assert!(long_ptr.validate(vocab, MAX_DECISION_PROMPT).is_ok());
     }
@@ -373,6 +402,7 @@ mod tests {
             head,
             cache_prefix: None,
             require_warm: false,
+            needs_snapshot: false,
         }
     }
 

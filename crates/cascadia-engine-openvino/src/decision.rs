@@ -539,6 +539,7 @@ mod tests {
             },
             cache_prefix: None,
             require_warm: false,
+            needs_snapshot: false,
         };
         assert_eq!(decode_readout(&encode_readout(&r)).unwrap(), r);
         assert_eq!(

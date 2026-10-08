@@ -229,6 +229,7 @@ impl Codec for ClefCodec {
                 head: ReadoutHead::Joint { questions: joint },
                 cache_prefix: None,
                 require_warm: false,
+                needs_snapshot: false,
             },
             parts,
         }])
