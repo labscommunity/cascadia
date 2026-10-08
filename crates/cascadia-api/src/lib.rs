@@ -151,37 +151,111 @@ pub struct AppState {
     pub decisions: Option<Arc<decisions::DecisionService>>,
     /// `--decision-dump FILE`, opened once at startup (0600, no symlinks): one JSON line per
     /// decision pass. Records request-derived token ids.
-    pub decision_dump: Option<Arc<std::sync::Mutex<DecisionDump>>>,
+    pub decision_dump: Option<Arc<DecisionDump>>,
+}
+
+/// Where the dump's bytes go: the opened file, or a test double.
+pub(crate) trait DumpSink: std::io::Write + Send {
+    /// Cut the file back to `len` bytes (drops a torn tail after a failed write).
+    fn truncate_to(&mut self, len: u64) -> std::io::Result<()>;
+}
+
+impl DumpSink for std::fs::File {
+    fn truncate_to(&mut self, len: u64) -> std::io::Result<()> {
+        self.set_len(len)
+    }
 }
 
 /// The open `--decision-dump` file and its optional size cap (`--decision-dump-max-bytes`).
-#[derive(Debug)]
+/// Closes for good (a latch) once a request would pass the cap or a write fails, so the file is
+/// always a prefix of the run's requests, whole lines only (P3-DRIFT-2, P3-SEC-2).
 pub struct DecisionDump {
-    file: std::fs::File,
-    /// File size so far (the length found at open plus every line appended since).
+    /// Set once: checked before a request's lines are cloned or serialized (P3-SEC-1).
+    closed: std::sync::atomic::AtomicBool,
+    pub(crate) file: std::sync::Mutex<DumpFile>,
+}
+
+pub(crate) struct DumpFile {
+    sink: Box<dyn DumpSink>,
+    /// File size so far (the length found at open plus every byte appended since).
     len: u64,
     max_bytes: Option<u64>,
-    warned_full: bool,
 }
 
 impl DecisionDump {
-    /// Append one request's lines whole, or none of them once the file would pass the cap.
-    pub(crate) fn append(&mut self, lines: &[u8]) -> std::io::Result<()> {
-        use std::io::Write;
-        let after = self.len.saturating_add(lines.len() as u64);
-        if self.max_bytes.is_some_and(|m| after > m) {
-            if !self.warned_full {
-                self.warned_full = true;
-                tracing::warn!(
-                    max_bytes = self.max_bytes,
-                    "--decision-dump reached --decision-dump-max-bytes; later requests are not recorded"
-                );
-            }
+    pub(crate) fn new(sink: Box<dyn DumpSink>, len: u64, max_bytes: Option<u64>) -> Self {
+        Self {
+            closed: std::sync::atomic::AtomicBool::new(false),
+            file: std::sync::Mutex::new(DumpFile {
+                sink,
+                len,
+                max_bytes,
+            }),
+        }
+    }
+
+    /// No later request is written: skip the clone and the serialization.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The file's size as counted (tests).
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> u64 {
+        self.file.lock().unwrap_or_else(|e| e.into_inner()).len
+    }
+
+    fn close(&self, why: &str) {
+        if !self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            tracing::warn!("--decision-dump {why}; later requests are not recorded");
+        }
+    }
+
+    /// Append one request's lines whole. Once they would pass the cap, nothing more is written,
+    /// this request's lines nor any later request's. A failed write drops the bytes it left
+    /// (or, if the file cannot be cut back, counts them) and closes the dump.
+    pub(crate) fn append(&self, lines: &[u8]) -> std::io::Result<()> {
+        // A poisoned lock (a panic mid-write) must not take the endpoint down: keep the state.
+        let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        if self.is_closed() {
             return Ok(());
         }
-        self.file.write_all(lines)?;
-        self.len = after;
+        let after = f.len.saturating_add(lines.len() as u64);
+        if f.max_bytes.is_some_and(|m| after > m) {
+            self.close("reached --decision-dump-max-bytes");
+            return Ok(());
+        }
+        let mut written = 0;
+        while written < lines.len() {
+            match f.sink.write(&lines[written..]) {
+                Ok(0) => {
+                    return Err(self.write_failed(
+                        &mut f,
+                        written,
+                        std::io::ErrorKind::WriteZero.into(),
+                    ))
+                }
+                Ok(n) => written += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(self.write_failed(&mut f, written, e)),
+            }
+        }
+        f.len = after;
+        if f.max_bytes.is_some_and(|m| f.len >= m) {
+            self.close("reached --decision-dump-max-bytes");
+        }
         Ok(())
+    }
+
+    fn write_failed(&self, f: &mut DumpFile, written: usize, e: std::io::Error) -> std::io::Error {
+        if written > 0 {
+            let base = f.len;
+            if f.sink.truncate_to(base).is_err() {
+                f.len = base.saturating_add(written as u64);
+            }
+        }
+        self.close("write failed");
+        e
     }
 }
 
@@ -208,7 +282,8 @@ pub struct Config {
     pub decisions: Option<Arc<decisions::DecisionService>>,
     /// See [`AppState::decision_dump`]. Startup only (the CLI's `--decision-dump`), never an env var.
     pub decision_dump: Option<std::path::PathBuf>,
-    /// Stop appending to the dump once it would pass this many bytes (`None`: unlimited).
+    /// Stop writing the dump once a request's lines would take it past this many bytes; no later
+    /// request is written either (`None`: unlimited).
     pub decision_dump_max_bytes: Option<u64>,
 }
 
@@ -570,13 +645,23 @@ pub fn make_router_with_stats(
         let file = open_decision_dump(p)
             .unwrap_or_else(|e| panic!("--decision-dump {}: {e}", p.display()));
         let len = file.metadata().map_or(0, |m| m.len());
-        Arc::new(std::sync::Mutex::new(DecisionDump {
-            file,
+        Arc::new(DecisionDump::new(
+            Box::new(file),
             len,
-            max_bytes: cfg.decision_dump_max_bytes,
-            warned_full: false,
-        }))
+            cfg.decision_dump_max_bytes,
+        ))
     });
+    make_router_inner(runner, model_id, cfg, stats, decision_dump)
+}
+
+/// [`make_router_with_stats`] with the decision dump already opened.
+fn make_router_inner(
+    runner: Arc<Runner>,
+    model_id: impl Into<String>,
+    cfg: Config,
+    stats: Arc<ApiStats>,
+    decision_dump: Option<Arc<DecisionDump>>,
+) -> Router {
     let state = AppState {
         runner,
         model_id: model_id.into(),
@@ -3959,11 +4044,8 @@ mod tests {
         make_decision_app_full(max_tokens, max_total_tokens, None).await
     }
 
-    async fn make_decision_app_full(
-        max_tokens: usize,
-        max_total_tokens: usize,
-        dump: Option<(std::path::PathBuf, Option<u64>)>,
-    ) -> Router {
+    /// The word-level Kev test tokenizer with the mock engine's sentinel words.
+    fn kev_test_tokenizer() -> tokenizers::Tokenizer {
         let words = [
             "[unk]",
             "<|fim_prefix|>",
@@ -4000,6 +4082,15 @@ mod tests {
                 .map(|w| tokenizers::AddedToken::from(w.to_string(), true))
                 .collect::<Vec<_>>(),
         );
+        tok
+    }
+
+    async fn make_decision_app_full(
+        max_tokens: usize,
+        max_total_tokens: usize,
+        dump: Option<(std::path::PathBuf, Option<u64>)>,
+    ) -> Router {
+        let tok = kev_test_tokenizer();
         let codec = decisions::kev::KevCodec::new(
             tok,
             decisions::profile::KevProfile { temperature: 1.0 },
@@ -4324,6 +4415,208 @@ mod tests {
         assert_eq!(post_decisions(app, body).await.0, StatusCode::OK);
         assert_eq!(std::fs::metadata(&tiny).unwrap().len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn decisions_dump_cap_latches_so_no_later_request_is_written() {
+        // P3-DRIFT-2 / P3-SEC-2: once one request would pass the cap, no later request is
+        // written, even one that would still fit: the file stays a prefix of the run.
+        let dir = std::env::temp_dir().join(format!("decision-dump-latch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let small = r#"{"model": "m", "state": "a", "questions": {"u": {"type": "noul"}}}"#;
+        let big = r#"{"model": "m", "state": "a", "questions": {"u": {"type": "noul"}, "w": {"type": "noul"}, "x": {"type": "noul"}}}"#;
+        let probe = dir.join("probe.jsonl");
+        let app = make_decision_app_full(1000, 4000, Some((probe.clone(), None))).await;
+        assert_eq!(post_decisions(app, small).await.0, StatusCode::OK);
+        let s = std::fs::metadata(&probe).unwrap().len();
+        // Room for two small requests: small fits, big is skipped, and the next small (which
+        // would fit) is not written either.
+        let capped = dir.join("capped.jsonl");
+        let app = make_decision_app_full(1000, 4000, Some((capped.clone(), Some(2 * s)))).await;
+        assert_eq!(post_decisions(app.clone(), small).await.0, StatusCode::OK);
+        assert_eq!(post_decisions(app.clone(), big).await.0, StatusCode::OK);
+        assert_eq!(post_decisions(app, small).await.0, StatusCode::OK);
+        assert_eq!(std::fs::metadata(&capped).unwrap().len(), s, "latched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Accepts `room` bytes, then fails like a full disk; records truncations.
+    struct FullDisk {
+        data: Arc<std::sync::Mutex<Vec<u8>>>,
+        room: usize,
+    }
+
+    impl std::io::Write for FullDisk {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut d = self.data.lock().unwrap();
+            let n = buf.len().min(self.room.saturating_sub(d.len()));
+            if n == 0 {
+                return Err(std::io::Error::other("no space left on device"));
+            }
+            d.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl DumpSink for FullDisk {
+        fn truncate_to(&mut self, len: u64) -> std::io::Result<()> {
+            self.data.lock().unwrap().truncate(len as usize);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_dump_write_drops_its_torn_line_and_closes_the_dump() {
+        // P3-SEC-2: ENOSPC mid-request must not leave a torn line (parity_check parses every
+        // line) nor a byte count short of the file. The dump stops at the first failure.
+        let data = Arc::new(std::sync::Mutex::new(b"0123".to_vec()));
+        let dump = DecisionDump::new(
+            Box::new(FullDisk {
+                data: data.clone(),
+                room: 10,
+            }),
+            4,
+            None,
+        );
+        assert!(dump.append(b"abc\n").is_ok());
+        assert_eq!(&*data.lock().unwrap(), b"0123abc\n");
+        assert!(!dump.is_closed());
+        assert!(dump.append(b"defgh\n").is_err(), "only 2 of 6 bytes fit");
+        assert_eq!(
+            &*data.lock().unwrap(),
+            b"0123abc\n",
+            "the torn tail is dropped"
+        );
+        assert!(dump.is_closed());
+        assert!(
+            dump.append(b"x\n").is_ok(),
+            "closed: nothing written, no error"
+        );
+        assert_eq!(&*data.lock().unwrap(), b"0123abc\n");
+    }
+
+    #[test]
+    fn a_dump_that_cannot_drop_its_torn_tail_counts_it() {
+        struct NoTruncate(FullDisk);
+        impl std::io::Write for NoTruncate {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl DumpSink for NoTruncate {
+            fn truncate_to(&mut self, _: u64) -> std::io::Result<()> {
+                Err(std::io::Error::other("read-only"))
+            }
+        }
+        let data = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dump = DecisionDump::new(
+            Box::new(NoTruncate(FullDisk {
+                data: data.clone(),
+                room: 3,
+            })),
+            0,
+            Some(100),
+        );
+        assert!(dump.append(b"abcdef\n").is_err());
+        assert_eq!(dump.bytes(), 3, "the bytes that reached the file");
+        assert!(dump.is_closed());
+    }
+
+    #[tokio::test]
+    async fn decisions_disconnect_keeps_the_permit_until_the_dump_write_ends() {
+        // P3-SEC-1: a client that leaves while its request waits on the dump must not free its
+        // permit while the detached write still holds a request-sized clone.
+        use std::sync::atomic::Ordering::SeqCst;
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let data = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dump = Arc::new(DecisionDump::new(
+            Box::new(FullDisk {
+                data: data.clone(),
+                room: usize::MAX,
+            }),
+            0,
+            None,
+        ));
+        let cfg = Config {
+            decisions: Some(Arc::new(decisions::DecisionService {
+                family: decisions::profile::Family::Kev,
+                codec: Box::new(
+                    decisions::kev::KevCodec::new(
+                        kev_test_tokenizer(),
+                        decisions::profile::KevProfile { temperature: 1.0 },
+                        1000,
+                        4000,
+                    )
+                    .unwrap(),
+                ),
+                max_tokens: 1000,
+                max_total_tokens: 4000,
+                max_questions: 32,
+                prefix_reuse: false,
+                encode_slots: decisions::default_encode_slots(),
+            })),
+            max_concurrent_requests: 1,
+            ..Config::default()
+        };
+        let stats = Arc::new(ApiStats::default());
+        let app = make_router_inner(
+            Arc::new(runner),
+            "mock-model",
+            cfg,
+            stats.clone(),
+            Some(dump.clone()),
+        );
+        let body = r#"{"model": "m", "state": "s", "questions": {"u": {"type": "noul"}}}"#;
+        // The disk stalls: the write waits on the dump's lock.
+        let stall = dump.file.lock().unwrap();
+        let first = tokio::spawn(app.clone().oneshot(systemone_request(body)));
+        for _ in 0..200 {
+            if Arc::strong_count(&dump) > 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        first.abort();
+        let _ = first.await;
+        // The orphaned write still holds the only permit: a new request is refused at once.
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.clone().oneshot(systemone_request(body)),
+        )
+        .await
+        .expect("refused, not queued behind the stalled dump")
+        .unwrap();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(stats.requests_in_flight.load(SeqCst), 1);
+        drop(stall);
+        for _ in 0..200 {
+            if stats.requests_in_flight.load(SeqCst) == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(stats.requests_in_flight.load(SeqCst), 0);
+        assert!(
+            !data.lock().unwrap().is_empty(),
+            "the orphan's lines were written"
+        );
+        let r = app.oneshot(systemone_request(body)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
     }
 
     #[cfg(unix)]
