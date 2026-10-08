@@ -2514,6 +2514,42 @@ mod tests {
         (server, peer)
     }
 
+    /// `wait_readable` on one stream flavor: a wait cancelled by a timeout
+    /// loses nothing, a ready byte is reported and left on the wire for the
+    /// next receive, and EOF is `SocketClosed`.
+    async fn wait_readable_contract(uds_tag: Option<&str>) {
+        let (mut server, mut peer) = server_with_raw_peer(uds_tag).await;
+        let wait = Duration::from_millis(100);
+        assert!(
+            tokio::time::timeout(wait, server.wait_readable())
+                .await
+                .is_err(),
+            "nothing was sent, so the wait must not finish"
+        );
+        peer.write_all(&[7, 8, 9]).await.unwrap();
+        peer.flush().await.unwrap();
+        server.wait_readable().await.unwrap();
+        // Readiness consumed nothing: a second wait sees the same bytes.
+        server.wait_readable().await.unwrap();
+        assert_eq!(server.recv_raw(3).await.unwrap(), vec![7, 8, 9]);
+        drop(peer);
+        assert!(matches!(
+            server.wait_readable().await,
+            Err(TransportError::SocketClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tcp_wait_readable_peeks_without_consuming() {
+        wait_readable_contract(None).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uds_wait_readable_peeks_without_consuming() {
+        wait_readable_contract(Some("peek")).await;
+    }
+
     /// Real peer death over UDS: the peer sends a header and half the body,
     /// then its socket is dropped. The server's recv must fail (not hang to
     /// the recv timeout, not yield a frame), and so must the next one.
