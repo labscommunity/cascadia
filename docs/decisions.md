@@ -229,7 +229,7 @@ Both routes share these statuses.
 |---|---|
 | 200 | Every question answered. |
 | 400 | Validation: no questions or more than `max_questions`; an empty question name, or (OpenAI format) a duplicate question name or choice value; a choice with no options or more than the model allows; a score with fewer levels than the model allows (2 for JEV, 1 for Kev and Clef) or more; images; an image part in a list `state` (JEV); a request the tokenizer cannot encode; Clef's option cap (see [Limits](#limits)). |
-| 413 | Too long: the state is more than `max_total_tokens × 8` bytes (checked before tokenizing); Kev's whole rendered text (state, instructions, options and levels) is more than `max_total_tokens × 8` bytes; Kev's rendered state is more than 524,288 bytes (65,536 × 8, checked before tokenizing); one Kev question's instructions and option texts render to more than 8 bytes per token the pass has left after the state (`max_tokens` minus the state's tokens, checked before tokenizing); Kev's state is more than 65,536 tokens (`SERVE_MAX_STATE`, `<state>` included) or reaches `max_tokens`; one pass is longer than `max_tokens` (JEV and Kev; Clef truncates the state instead); Clef's schema alone fills the joint pass, leaving no room for a non-empty state; the request's prefill work is more than `max_total_tokens` (JEV stops tokenizing at the first question that takes it over: `needs at least N`); a Kev request that needs the shared-state discount when the prefix cache can never hold that state (`this request needs N prefill tokens without prefix reuse (the shared prefix cannot fit the prefix cache); the per-request limit is M`, refused before any prefill, from the first request after startup); or the engine reports the prompt too long. |
+| 413 | Too long: the state is more than `max_total_tokens × 8` bytes (checked before tokenizing); Kev's whole rendered text (state, instructions, options and levels) is more than `max_total_tokens × 8` bytes; Kev's rendered state is more than 524,288 bytes (65,536 × 8, checked before tokenizing); one Kev question's instructions and option texts render to more than 8 bytes per token the pass has left after the state (`max_tokens` minus the state's tokens, checked before tokenizing); Kev's state is more than 65,536 tokens (`SERVE_MAX_STATE`, `<state>` included) or reaches `max_tokens`; one pass is longer than `max_tokens` (JEV and Kev; Clef truncates the state instead); Clef's schema alone fills the joint pass, leaving no room for a non-empty state; the request's prefill work is more than `max_total_tokens` (JEV stops tokenizing at the first question that takes it over: `needs at least N`); a Kev request that needs the shared-state discount when the prefix cache can never hold that state (`this request needs N prefill tokens without prefix reuse (the shared prefix cannot fit the prefix cache); the per-request limit is M`, refused before any prefill once the engine knows the snapshot's size, which its warmup measures at startup; see [Limits](#limits) for when the first such request can still spend one pass); or the engine reports the prompt too long. |
 | 501 | The model serves no decisions: no `decision.json` (or one that fails its load checks; see the startup log), an engine other than `qwen35`, the engine has no decision head (`decision/` missing on the single box or the pipeline's last rank), the tree was exported without `--final-hidden` (Kev and Clef), or a pipeline rank cannot serve decision passes (an older build, rank 0 or the last rank without `config.json` `vocab_size`, or the last rank without `decision/`; a middle rank only relays and needs neither). Rank 0 refuses the pipeline cases before any prefill. |
 | 503 | The server is at capacity (`engine at capacity; retry after current requests complete`): every concurrency permit is taken, or a Kev pass that must resume its shared state from the prefix cache found the snapshot evicted by other requests (see [Limits](#limits)); retrying can succeed. Any other engine error is `decision engine error`. Decisions share the API's concurrency permits with chat requests. |
 
@@ -290,13 +290,18 @@ Error messages are deliberately terse:
   - Before its first pass prefills anything, the engine checks that the cache can hold a snapshot
     of the state at all: the cache is on, the state is at least 16 tokens (`MIN_PREFIX_TOKENS`),
     and its snapshot is not larger than the cache. The snapshot's size is known before the first
-    request: at load the engine takes a lower bound from the tree's `config.json` attention dims
-    and measures the warmup's one-token state; snapshots taken later refine the estimate. If the
-    snapshot cannot fit, the request is a 413 that names its full need, with no prefill spent,
-    the first request after startup included. (A tree whose `config.json` lacks those dims logs a
-    warning at load; if the warmup could not measure the state either, its first such request may
-    spend one pass before the 413.) A state under 16 tokens never earns the discount, so it is
-    budgeted in full.
+    request: the warmup copies its one-token state once and reads from it the exact size at every
+    length (each attention layer's bytes per token plus the fixed recurrent state; the startup log
+    prints `fixed` and `per_token`). If the snapshot cannot fit, the request is a 413 that names
+    its full need, with no prefill spent, the first request after startup included.
+  - When the warmup could not read that size (the warmup failed, the state copy failed, or the
+    state has no readable attention layout; the startup log says so), the engine knows only a
+    lower bound: the tree's `config.json` attention dims at half a byte per element, or the
+    warmup state's total. A state whose real snapshot lies between that bound and the cache size
+    then spends one full pass (its prefill and the snapshot copy) before the 413. That happens
+    at most once per size per server start: the refused snapshot is measured, and later requests
+    of that size or longer are refused before any prefill. A state under 16 tokens never earns
+    the discount, so it is budgeted in full.
   - The first pass then always snapshots the state, even when it resumed a shorter cached state
     that this one extends (a log or transcript that grew since the last request).
   - Every later pass resumes that snapshot. If another request's passes evicted it, the request
