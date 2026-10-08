@@ -216,6 +216,15 @@ def test_jev_build_ref_bias_temperature_rescale_and_lm_head_lora(tmp_path):
         assert got == pytest.approx(want, abs=1e-6), key
 
 
+def test_rescale_score_literal_values():
+    """Literal expectations, so the JEV reference test above (which reuses rescale_score for its own
+    expected values) is not the only check of the Python rescale. Same mapping as jev.rs rescale_score."""
+    p6 = [0.1, 0.2, 0.3, 0.15, 0.15, 0.1]
+    assert rs.rescale_score(p6, 3) == pytest.approx([0.28, 0.5, 0.22], abs=1e-12)
+    assert rs.rescale_score(p6, 2) == pytest.approx([0.1 + 0.16 + 0.18 + 0.06 + 0.03, 0.04 + 0.12 + 0.09 + 0.12 + 0.1], abs=1e-12)
+    assert rs.rescale_score(p6, 6) == pytest.approx(p6, abs=1e-12)
+
+
 def test_clef_family_probs_reorders_noul_and_choice(tmp_path, monkeypatch):
     """Clef's head emits noul [true, false] and choices sorted; the reference reports option_keys order."""
     rec = RECS[0]
