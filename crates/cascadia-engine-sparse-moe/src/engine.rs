@@ -6034,8 +6034,15 @@ impl<R: StagedRunner> PipelineEngine<R> {
             }
             let t = st.next as u32;
             st.generated.push(t);
-            let full = tok.decode(&st.generated, true).unwrap_or_default();
-            let delta = utf8_safe_delta(&full, &mut st.emitted);
+            // On a decode error, send no text now: `emitted` stays, so the
+            // next good decode carries this token's text once.
+            let delta = match tok.decode(&st.generated, true) {
+                Ok(full) => utf8_safe_delta(&full, &mut st.emitted),
+                Err(e) => {
+                    warn!(task = %st.id, "token decode failed; text held back: {e}");
+                    String::new()
+                }
+            };
             let mut c = Chunk::token(st.id.clone(), st.next, delta);
             c.n_tokens = Some(1);
             c.token_ids = vec![st.next];
@@ -6612,8 +6619,15 @@ impl<R: StagedRunner> PipelineEngine<R> {
             let t = st.next as u32;
             st.generated.push(t);
             st.history.push(st.next);
-            let full = tok.decode(&st.generated, true).unwrap_or_default();
-            let delta = utf8_safe_delta(&full, &mut st.emitted);
+            // On a decode error, send no text now: `emitted` stays, so the
+            // next good decode carries this token's text once.
+            let delta = match tok.decode(&st.generated, true) {
+                Ok(full) => utf8_safe_delta(&full, &mut st.emitted),
+                Err(e) => {
+                    warn!(task = %st.id, "token decode failed; text held back: {e}");
+                    String::new()
+                }
+            };
             let mut c = Chunk::token(st.id.clone(), st.next, delta);
             c.n_tokens = Some(1);
             c.token_ids = vec![st.next];
