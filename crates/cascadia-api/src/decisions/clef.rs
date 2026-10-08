@@ -97,6 +97,11 @@ impl ClefCodec {
         })
     }
 
+    /// The effective per-pass cap: decision.json `max_tokens` clamped to the joint prompt caps.
+    pub fn max_tokens(&self) -> usize {
+        self.max_tokens
+    }
+
     fn ids(&self, text: &str) -> Result<Vec<u32>, DecisionError> {
         Ok(self
             .tok

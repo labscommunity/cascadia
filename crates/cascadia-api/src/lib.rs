@@ -452,6 +452,42 @@ pub fn load_chat_template_config_at(tok_dir: &std::path::Path) -> ChatTemplateCo
     }
 }
 
+/// Open the `--decision-dump` file for appending, mode 0600. Refuses a symlink at the path
+/// (`O_NOFOLLOW`), and, checked on the opened descriptor, anything but a regular file this user
+/// owns with one link: a FIFO (with `O_NONBLOCK` the open cannot block startup), a device, or a
+/// hardlink to another file the server account owns (SEC-4).
+fn open_decision_dump(p: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let f = o.open(p)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let m = f.metadata()?;
+        let refuse = |why: &str| Err(std::io::Error::other(why.to_string()));
+        if !m.file_type().is_file() {
+            return refuse("not a regular file");
+        }
+        if m.nlink() != 1 {
+            return refuse("the file has other hard links");
+        }
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if m.uid() != unsafe { libc::geteuid() } {
+            return refuse("the file is owned by another user");
+        }
+        // `mode` only applies on create: tighten a pre-existing file too.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| std::io::Error::other(format!("chmod 0600: {e}")))?;
+    }
+    Ok(f)
+}
+
 /// Build the router with default request-size + concurrency limits.
 /// For custom limits use [`make_router_with_config`].
 pub fn make_router(runner: Arc<Runner>, model_id: impl Into<String>) -> Router {
@@ -475,24 +511,8 @@ pub fn make_router_with_stats(
     stats: Arc<ApiStats>,
 ) -> Router {
     let decision_dump = cfg.decision_dump.as_ref().map(|p| {
-        let mut o = std::fs::OpenOptions::new();
-        o.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            // 0600 on create; refuse to follow a symlink planted at the path.
-            o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let f = o
-            .open(p)
+        let f = open_decision_dump(p)
             .unwrap_or_else(|e| panic!("--decision-dump {}: {e}", p.display()));
-        // `mode` only applies on create: tighten a pre-existing file too.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .unwrap_or_else(|e| panic!("--decision-dump {}: chmod 0600: {e}", p.display()));
-        }
         Arc::new(std::sync::Mutex::new(f))
     });
     let state = AppState {
@@ -3508,6 +3528,7 @@ mod tests {
             .unwrap();
         let cfg = Config {
             decisions: Some(Arc::new(decisions::DecisionService {
+                family: decisions::profile::Family::Kev,
                 codec,
                 max_tokens,
                 max_total_tokens,
@@ -3764,6 +3785,43 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn decisions_dump_refuses_fifos_and_hardlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("decision-dump-kinds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A FIFO: without O_NONBLOCK the open would block startup forever.
+        let fifo = dir.join("fifo.jsonl");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(open_decision_dump(&fifo).is_err());
+        // A hardlink to a file this account owns.
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.join("dump.jsonl");
+        std::fs::hard_link(&victim, &link).unwrap();
+        let e = open_decision_dump(&link).unwrap_err();
+        assert!(e.to_string().contains("hard links"), "{e}");
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "not chmodded"
+        );
+        // A fresh path is created 0600; reopening appends.
+        let ok = dir.join("ok.jsonl");
+        open_decision_dump(&ok).unwrap();
+        assert_eq!(
+            std::fs::metadata(&ok).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(open_decision_dump(&ok).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn decisions_dump_refuses_a_symlink_at_the_path() {
         use std::os::unix::fs::PermissionsExt;
@@ -3966,6 +4024,7 @@ mod tests {
         };
         let cfg = Config {
             decisions: Some(Arc::new(decisions::DecisionService {
+                family: decisions::profile::Family::Kev,
                 codec: Box::new(codec),
                 max_tokens: 1000,
                 max_total_tokens: 4000,
