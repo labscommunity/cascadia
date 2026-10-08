@@ -82,6 +82,16 @@ pub struct DecisionService {
     /// The engine can resume a shared prefix (single box, prefix cache on). Only then does the
     /// budget count Kev's state once; pipeline ranks re-prefill it per question.
     pub prefix_reuse: bool,
+    /// Concurrent decision encodes (tokenizations), separate from the request permits: each
+    /// holds up to a few hundred MB of tokenizer transients, so 16 permits must not mean 16 of
+    /// them at once (P2-SEC-3). Held by the blocking encode itself, like the request permit.
+    pub encode_slots: Arc<tokio::sync::Semaphore>,
+}
+
+/// `min(4, available parallelism)` encode slots (see [`DecisionService::encode_slots`]).
+pub fn default_encode_slots() -> Arc<tokio::sync::Semaphore> {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    Arc::new(tokio::sync::Semaphore::new(cores.clamp(1, 4)))
 }
 
 // `cascadia_api::Config` derives Debug, and `Box<dyn Codec>` cannot.
@@ -93,6 +103,7 @@ impl std::fmt::Debug for DecisionService {
             .field("max_total_tokens", &self.max_total_tokens)
             .field("max_questions", &self.max_questions)
             .field("prefix_reuse", &self.prefix_reuse)
+            .field("encode_slots", &self.encode_slots.available_permits())
             .finish_non_exhaustive()
     }
 }
@@ -177,6 +188,7 @@ impl DecisionService {
             max_total_tokens,
             max_questions,
             prefix_reuse: false,
+            encode_slots: default_encode_slots(),
         })
     }
 
