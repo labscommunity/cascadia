@@ -293,15 +293,15 @@ Error messages are deliberately terse:
     request: the warmup copies its one-token state once and reads from it the exact size at every
     length (each attention layer's bytes per token plus the fixed recurrent state; the startup log
     prints `fixed` and `per_token`). If the snapshot cannot fit, the request is a 413 that names
-    its full need, with no prefill spent, the first request after startup included.
+    its full need, with no prefill spent, the first request after startup included. A state
+    under 16 tokens never earns the discount, so it is budgeted in full.
   - When the warmup could not read that size (the warmup failed, the state copy failed, or the
     state has no readable attention layout; the startup log says so), the engine knows only a
     lower bound: the tree's `config.json` attention dims at half a byte per element, or the
     warmup state's total. A state whose real snapshot lies between that bound and the cache size
     then spends one full pass (its prefill and the snapshot copy) before the 413. That happens
     at most once per size per server start: the refused snapshot is measured, and later requests
-    of that size or longer are refused before any prefill. A state under 16 tokens never earns
-    the discount, so it is budgeted in full.
+    of that size or longer are refused before any prefill.
   - The first pass then always snapshots the state, even when it resumed a shorter cached state
     that this one extends (a log or transcript that grew since the last request).
   - Every later pass resumes that snapshot. If another request's passes evicted it, the request
