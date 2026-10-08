@@ -938,16 +938,31 @@ fn decision_warm_probe<'a>(d: &cascadia_types::DecisionReadout, ids: &'a [u32]) 
     }
 }
 
-/// A `require_warm` pass whose restore stopped short of its shared prefix: the request's snapshot
-/// was evicted (another request's pass took the cache) or never fit the cache budget. Prefilling
-/// the prefix again would exceed the budget the API admitted the request under (SEC-3), so the
-/// pass is refused before any prefill and the API answers 503 (retry).
-fn decision_cold_refusal(
+/// Prefix-cache refusals of a decision pass, checked after the restore and before any prefill
+/// (SEC-3, P2-CE-1/2, P2-SEC-1/2). `need` is the request's shared prefix (`cache_prefix`).
+/// - `decision_uncacheable` (the API's 413): the cache can never hold a snapshot at `need`
+///   (disabled, under `MIN_PREFIX_TOKENS`, or measured/estimated over the budget), on the first
+///   pass (`needs_snapshot`) of a request whose later passes must resume there, or on such a
+///   later pass. Refusing the FIRST pass spends no prefill on a request that cannot finish.
+/// - `decision_cold` (the API's 503, retry): a `require_warm` pass whose snapshot fits but is
+///   gone (evicted by other requests' passes). Prefilling the prefix again would exceed the
+///   budget the API admitted the request under.
+fn decision_cache_refusal(
     d: &cascadia_types::DecisionReadout,
     warm_prefix: usize,
+    cache: &crate::prefix_cache::PrefixCache,
 ) -> Option<String> {
     let need = d.cache_prefix? as usize;
-    (d.require_warm && warm_prefix < need).then(|| {
+    if !(d.needs_snapshot || d.require_warm) || warm_prefix >= need {
+        return None;
+    }
+    if !cache.can_hold(need) {
+        return Some(format!(
+            "decision_uncacheable: a snapshot of the shared prefix ({need} tokens) cannot fit the \
+             prefix cache"
+        ));
+    }
+    d.require_warm.then(|| {
         format!(
             "decision_cold: the shared prefix snapshot ({need} tokens) is not cached; restored \
              {warm_prefix}"
@@ -1491,9 +1506,12 @@ impl Qwen36Engine {
     /// rank (an older build, or one without config.json vocab_size or decision/ assets) cannot
     /// serve it. Refused before any frame of the task goes out.
     fn pipe_decision_refusal(&self, d: &cascadia_types::DecisionReadout) -> Option<String> {
-        if d.require_warm {
-            // Pipeline ranks never resume a decision prefix (the API sets this only with reuse).
-            return Some("decision_invalid: require_warm needs the single-box prefix cache".into());
+        if d.require_warm || d.needs_snapshot {
+            // Pipeline ranks never resume a decision prefix (the API sets these only with reuse).
+            return Some(
+                "decision_invalid: require_warm/needs_snapshot need the single-box prefix cache"
+                    .into(),
+            );
         }
         self.admit_decision_check(d).err().or_else(|| {
             (!chain_decision(self.chain_caps)).then(|| {
@@ -3009,7 +3027,7 @@ impl Qwen36Engine {
             if let Some(reason) = task
                 .decision
                 .as_ref()
-                .and_then(|d| decision_cold_refusal(d, warm_prefix))
+                .and_then(|d| decision_cache_refusal(d, warm_prefix, &self.prefix_cache))
             {
                 warn!(task = %task.task_id, %reason, "qwen35: decision pass refused");
                 let id = task.task_id.clone();
@@ -3039,14 +3057,26 @@ impl Qwen36Engine {
                     .map(|im| crate::prefix_cache::chat_boundaries(&prompt_ids, im))
                     .unwrap_or_default(),
             };
-            let snapshot_at = crate::prefix_cache::plan_snapshots(
-                &prompt_ids,
-                &boundaries,
-                warm_prefix,
-                &self.prefix_cache,
-                &self.refresh_costs,
-                state_bytes,
-            );
+            // A decision pass always snapshots its request's shared prefix when the cache can hold
+            // it: the refresh rule is for chat turns, and a request whose later passes resume
+            // there must find that exact key (P2-CE-1).
+            let snapshot_at = if task.decision.is_some() {
+                crate::prefix_cache::plan_decision_snapshots(
+                    &prompt_ids,
+                    &boundaries,
+                    warm_prefix,
+                    &self.prefix_cache,
+                )
+            } else {
+                crate::prefix_cache::plan_snapshots(
+                    &prompt_ids,
+                    &boundaries,
+                    warm_prefix,
+                    &self.prefix_cache,
+                    &self.refresh_costs,
+                    state_bytes,
+                )
+            };
             if self.prefix_cache.enabled() {
                 info!(
                     warm_prefix,
@@ -4457,6 +4487,7 @@ mod tests {
                 head,
                 cache_prefix,
                 require_warm: false,
+                needs_snapshot: false,
             }),
         }
     }
@@ -4524,6 +4555,7 @@ mod tests {
             head,
             cache_prefix: None,
             require_warm: false,
+            needs_snapshot: false,
         }
     }
 
@@ -4610,6 +4642,7 @@ mod tests {
             },
             cache_prefix: None,
             require_warm: false,
+            needs_snapshot: false,
         };
         let err = e.admit_decision_check(&pointer).unwrap_err();
         assert!(
@@ -4622,6 +4655,7 @@ mod tests {
             head: ReadoutHead::Verbalizer { token_ids: vec![1] },
             cache_prefix: None,
             require_warm: false,
+            needs_snapshot: false,
         };
         assert!(e.admit_decision_check(&verbalizer).is_ok());
         e.final_hidden_output = true;
@@ -4648,6 +4682,7 @@ mod tests {
             head: ReadoutHead::Verbalizer { token_ids: vec![1] },
             cache_prefix: None,
             require_warm: false,
+            needs_snapshot: false,
         };
         // An old last rank replies its capture floor (0 or 1).
         for old in [0, 1] {
@@ -4668,45 +4703,135 @@ mod tests {
             .starts_with("decision_invalid"));
     }
 
+    fn kev_pass(n: usize, cache_prefix: u32) -> cascadia_types::DecisionReadout {
+        cascadia_types::DecisionReadout {
+            prompt_ids: (0..n as u32).collect(),
+            head: cascadia_types::ReadoutHead::Pointer {
+                decide_pos: n as u32 - 1,
+                option_pos: vec![n as u32 - 3, n as u32 - 2],
+            },
+            cache_prefix: Some(cache_prefix),
+            require_warm: false,
+            needs_snapshot: false,
+        }
+    }
+
     #[test]
     fn a_require_warm_pass_that_missed_its_snapshot_is_refused() {
         // SEC-3: a later Kev pass admitted on the shared-prefix discount must not re-prefill the
-        // state when the snapshot is gone.
-        use cascadia_types::{DecisionReadout, ReadoutHead};
-        let mut d = DecisionReadout {
-            prompt_ids: vec![1; 10],
-            head: ReadoutHead::Pointer {
-                decide_pos: 9,
-                option_pos: vec![7, 8],
-            },
-            cache_prefix: Some(6),
-            require_warm: true,
-        };
-        let why = decision_cold_refusal(&d, 0).unwrap();
+        // state when the snapshot is gone. Evicted (the cache could hold it): the retryable 503.
+        use crate::prefix_cache::PrefixCache;
+        let cache = PrefixCache::new(1 << 20);
+        let mut d = kev_pass(30, 20);
+        d.require_warm = true;
+        let why = decision_cache_refusal(&d, 0, &cache).unwrap();
         assert!(why.starts_with("decision_cold"), "{why}");
         assert!(
-            decision_cold_refusal(&d, 5).is_some(),
+            decision_cache_refusal(&d, 19, &cache).is_some(),
             "a shorter restore re-prefills too"
         );
-        assert_eq!(decision_cold_refusal(&d, 6), None);
-        assert_eq!(decision_cold_refusal(&d, 7), None);
+        assert_eq!(decision_cache_refusal(&d, 20, &cache), None);
+        assert_eq!(decision_cache_refusal(&d, 21, &cache), None);
         d.require_warm = false;
         assert_eq!(
-            decision_cold_refusal(&d, 0),
+            decision_cache_refusal(&d, 0, &cache),
             None,
             "cold is fine when not required"
         );
-        // Pipelines never resume a decision prefix.
+        // Pipelines never resume a decision prefix, nor snapshot one.
         d.require_warm = true;
         let mut e = bare_engine(2, "{}");
         e.rank = 0;
-        e.vocab = Some(16);
+        e.vocab = Some(64);
         e.final_hidden_output = true;
         e.chain_caps = own_caps(true);
         assert!(e
             .pipe_decision_refusal(&d)
             .unwrap()
             .starts_with("decision_invalid"));
+        d.require_warm = false;
+        d.needs_snapshot = true;
+        assert!(e
+            .pipe_decision_refusal(&d)
+            .unwrap()
+            .starts_with("decision_invalid"));
+    }
+
+    #[test]
+    fn a_first_pass_whose_snapshot_can_never_fit_is_refused_before_prefill() {
+        // P2-CE-2 / P2-SEC-1/2: the first pass of a request whose later passes must resume is
+        // refused at admission (no prefill) when the cache can never hold its shared prefix, and
+        // the API answers 413, not a retryable 503.
+        use crate::prefix_cache::{PrefixCache, MIN_PREFIX_TOKENS};
+        let uncacheable = |d: &cascadia_types::DecisionReadout, warm, c: &PrefixCache| {
+            decision_cache_refusal(d, warm, c)
+                .is_some_and(|w| w.starts_with("decision_uncacheable"))
+        };
+        let mut first = kev_pass(40, 20);
+        first.needs_snapshot = true;
+        // Cache disabled.
+        assert!(uncacheable(&first, 0, &PrefixCache::new(0)));
+        // A tiny state: under the shortest key the cache stores.
+        let mut tiny = kev_pass(40, (MIN_PREFIX_TOKENS - 1) as u32);
+        tiny.needs_snapshot = true;
+        assert!(uncacheable(&tiny, 0, &PrefixCache::new(1 << 20)));
+        // Measured over the budget: a snapshot that long was already refused.
+        let mut small = PrefixCache::new(100);
+        assert!(!small.insert(vec![1; 20], vec![vec![0; 101]]));
+        assert!(uncacheable(&first, 0, &small));
+        // Estimated over the budget from two measured snapshots (fixed 0, 4 bytes per token).
+        let mut est = PrefixCache::new(70);
+        assert!(est.insert(vec![2; 16], vec![vec![0; 64]]));
+        assert!(est.insert(vec![3; 17], vec![vec![0; 68]]));
+        assert!(uncacheable(&first, 0, &est), "20 tokens ~ 80 bytes > 70");
+        // A cache that can hold it: the first pass runs (cold) and takes the snapshot.
+        let ok = PrefixCache::new(1 << 20);
+        assert_eq!(decision_cache_refusal(&first, 0, &ok), None);
+        assert_eq!(
+            crate::prefix_cache::plan_decision_snapshots(&first.prompt_ids, &[20], 0, &ok),
+            vec![20]
+        );
+        // A later pass whose snapshot turned out not to fit is a 413 too, not "retry".
+        let mut later = kev_pass(40, 20);
+        later.require_warm = true;
+        assert!(uncacheable(&later, 0, &small));
+        // Passes that do not depend on the cache are never refused.
+        assert_eq!(
+            decision_cache_refusal(&kev_pass(40, 20), 0, &PrefixCache::new(0)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_state_that_extends_a_cached_state_resumes_its_own_snapshot() {
+        // P2-CE-1 / P2-SEC-1: request A cached its state (key 30). Request B's state extends it
+        // (cache_prefix 40). B's first pass restores A's entry, plans B's own boundary (no chat
+        // refresh rule), and B's require_warm passes then resume at 40: no refusal (a 200).
+        use crate::prefix_cache::{plan_decision_snapshots, PrefixCache};
+        let mut cache = PrefixCache::new(1 << 20);
+        let b_first = {
+            let mut d = kev_pass(60, 40);
+            d.needs_snapshot = true;
+            d
+        };
+        assert!(cache.insert(b_first.prompt_ids[..30].to_vec(), vec![vec![0; 8]]));
+        let warm = cache
+            .longest_prefix(decision_warm_probe(&b_first, &b_first.prompt_ids))
+            .unwrap()
+            .1;
+        assert_eq!(warm, 30, "B's first pass restores A's shorter entry");
+        assert_eq!(decision_cache_refusal(&b_first, warm, &cache), None);
+        let plan = plan_decision_snapshots(&b_first.prompt_ids, &[40], warm, &cache);
+        assert_eq!(plan, vec![40]);
+        assert!(cache.insert(b_first.prompt_ids[..40].to_vec(), vec![vec![0; 8]]));
+        let mut b_later = kev_pass(60, 40);
+        b_later.require_warm = true;
+        let warm = cache
+            .longest_prefix(decision_warm_probe(&b_later, &b_later.prompt_ids))
+            .unwrap()
+            .1;
+        assert_eq!(warm, 40);
+        assert_eq!(decision_cache_refusal(&b_later, warm, &cache), None);
     }
 
     #[test]
@@ -4755,6 +4880,7 @@ mod tests {
             },
             cache_prefix: None,
             require_warm: false,
+            needs_snapshot: false,
         };
         let mut e = bare_engine(2, "{}");
         e.rank = 0;
@@ -4785,6 +4911,7 @@ mod tests {
             head: ReadoutHead::Verbalizer { token_ids: vec![1] },
             cache_prefix: None,
             require_warm: false,
+            needs_snapshot: false,
         };
         e.want_final_hidden = true;
         e.last_final_hidden = Some(vec![0.5; 8]);
@@ -4819,6 +4946,7 @@ mod tests {
             head: ReadoutHead::Verbalizer { token_ids: vec![1] },
             cache_prefix: None,
             require_warm: false,
+            needs_snapshot: false,
         };
         let mut p = Some((
             7,

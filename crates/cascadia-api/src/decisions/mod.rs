@@ -264,62 +264,64 @@ pub(crate) fn sanitize_user_text(text: &str) -> String {
     safe
 }
 
+/// The prefix a pass shares with the request's other passes, when the engine's prefix cache could
+/// store it: a `cache_prefix` under `MIN_PREFIX_TOKENS` is never snapshotted (P2-CE-2), so it earns
+/// no discount and is never resumed.
+fn shared_prefix(p: &Pass) -> Option<usize> {
+    p.readout
+        .cache_prefix
+        .map(|c| c as usize)
+        .filter(|&c| c >= cascadia_types::MIN_PREFIX_TOKENS)
+}
+
 /// Tokens a request prefills. With `prefix_reuse` (single box, prefix cache on) a prefix every pass
 /// shares (`cache_prefix`) is prefilled once and resumed, so it counts once; without it (pipeline,
-/// cache off) every pass is prefilled in full. This is an upper bound only when reuse is on: an
-/// evicted or over-budget snapshot re-prefills, which the per-pass `max_tokens` cap still bounds.
+/// cache off) every pass is prefilled in full. With reuse this holds because of
+/// [`mark_required_reuse`]: the engine refuses a pass that would prefill the prefix again.
 pub fn prefill_work(passes: &[Pass], prefix_reuse: bool) -> usize {
     let full: usize = passes.iter().map(|p| p.readout.prompt_ids.len()).sum();
     if !prefix_reuse {
         return full;
     }
-    let shared = passes
-        .iter()
-        .filter_map(|p| p.readout.cache_prefix)
-        .max()
-        .unwrap_or(0) as usize;
+    let shared = passes.iter().filter_map(shared_prefix).max().unwrap_or(0);
     let tails: usize = passes
         .iter()
         .map(|p| {
             p.readout
                 .prompt_ids
                 .len()
-                .saturating_sub(p.readout.cache_prefix.unwrap_or(0) as usize)
+                .saturating_sub(shared_prefix(p).unwrap_or(0))
         })
         .sum();
     (shared + tails).min(full)
 }
 
-/// Mark the passes that must resume their shared prefix from the prefix cache (SEC-3), so the
-/// tokens a request actually prefills never exceed `max_total`, whatever the cache evicts.
+/// Flag the passes of a request admitted on the shared-prefix discount (SEC-3, P2-SEC-1/2), so the
+/// tokens it actually prefills never exceed `max_total`, whatever the cache evicts.
 ///
-/// With `prefix_reuse` the budget (`prefill_work`) counts a shared prefix once, but the engine
-/// re-prefills it whenever the snapshot is gone (another request's passes evicted it, or it never
-/// fit the cache). A pass may run cold only while `spent + its full length + every later pass's
-/// tail` still fits; the rest carry `require_warm`, and the engine refuses one whose snapshot is
-/// gone (`decision_cold`, a 503 to retry) instead of prefilling past the budget. Invariant:
-/// `spent + remaining tails <= max_total`, which admission (`prefill_work <= max_total`)
-/// establishes. A request that fits without the discount marks nothing and behaves as before.
+/// A request that fits without the discount (every pass in full within `max_total`) is left
+/// alone and behaves as before. Otherwise:
+/// - the first pass with a shared prefix gets `needs_snapshot`: before prefilling it, the engine
+///   checks that its cache can hold a snapshot there at all (`decision_uncacheable`, a 413, with
+///   no prefill spent), and then always takes that snapshot;
+/// - every later such pass gets `require_warm`: the engine refuses one whose snapshot is gone
+///   (`decision_cold`, the capacity 503) instead of prefilling the prefix again, so a request
+///   that lost its snapshot fails at the first pass that misses it.
+///
+/// Worst case: the first pass in full plus every later tail, which is `prefill_work`, which
+/// admission bounded by `max_total`.
 pub fn mark_required_reuse(passes: &mut [Pass], max_total: usize, prefix_reuse: bool) {
-    if !prefix_reuse {
+    let full: usize = passes.iter().map(|p| p.readout.prompt_ids.len()).sum();
+    if !prefix_reuse || full <= max_total {
         return;
     }
-    let tail = |p: &Pass| {
-        p.readout
-            .prompt_ids
-            .len()
-            .saturating_sub(p.readout.cache_prefix.unwrap_or(0) as usize)
-    };
-    let mut later: usize = passes.iter().map(tail).sum();
-    let mut spent = 0usize;
-    for p in passes.iter_mut() {
-        let (full, t) = (p.readout.prompt_ids.len(), tail(p));
-        later -= t;
-        if p.readout.cache_prefix.is_none() || spent + full + later <= max_total {
-            spent += full;
+    let mut first = true;
+    for p in passes.iter_mut().filter(|p| shared_prefix(p).is_some()) {
+        if first {
+            p.readout.needs_snapshot = true;
+            first = false;
         } else {
             p.readout.require_warm = true;
-            spent += t;
         }
     }
 }
@@ -410,6 +412,7 @@ mod tests {
                 head: ReadoutHead::Verbalizer { token_ids: vec![1] },
                 cache_prefix,
                 require_warm: false,
+                needs_snapshot: false,
             },
             parts: Vec::new(),
         }
@@ -588,40 +591,61 @@ mod tests {
     }
 
     #[test]
-    fn only_passes_the_budget_cannot_cover_cold_must_resume() {
-        let warm = |p: &[Pass]| p.iter().map(|x| x.readout.require_warm).collect::<Vec<_>>();
+    fn a_request_on_the_discount_snapshots_first_and_resumes_every_later_pass() {
+        let flags = |p: &[Pass]| {
+            p.iter()
+                .map(|x| (x.readout.needs_snapshot, x.readout.require_warm))
+                .collect::<Vec<_>>()
+        };
+        const PLAIN: (bool, bool) = (false, false);
         // 3 Kev passes: prefix 21, tail 8 (full 29). Reuse work 45, full work 87.
         let kev = || (0..3).map(|_| pass(29, Some(21))).collect::<Vec<_>>();
         let mut p = kev();
-        mark_required_reuse(&mut p, 100, true);
+        mark_required_reuse(&mut p, 87, true);
         assert_eq!(
-            warm(&p),
-            [false; 3],
-            "fits without the discount: nothing changes"
+            flags(&p),
+            [PLAIN; 3],
+            "fits without the discount: unchanged"
         );
-        let mut p = kev();
-        mark_required_reuse(&mut p, 60, true);
-        assert_eq!(warm(&p), [false, true, true]);
-        let mut p = kev();
-        mark_required_reuse(&mut p, 66, true);
-        assert_eq!(warm(&p), [false, false, true], "29 + 29 + 8 = 66 fits");
-        let mut p = kev();
-        mark_required_reuse(&mut p, 45, true);
-        assert_eq!(warm(&p), [false, true, true]);
+        // On the discount: the first pass must be able to snapshot (checked before its prefill),
+        // and EVERY later pass resumes, so a lost snapshot fails at the first pass that misses
+        // it (P2-SEC-2) rather than after the cold passes a greedy plan would allow.
+        for budget in [45, 60, 66, 86] {
+            let mut p = kev();
+            mark_required_reuse(&mut p, budget, true);
+            assert_eq!(
+                flags(&p),
+                [(true, false), (false, true), (false, true)],
+                "{budget}"
+            );
+            // Worst case honoured: the first pass in full, the rest their tails.
+            assert!(29 + 8 + 8 <= budget);
+        }
         // Without reuse (pipeline, cache off) the budget already counted every pass in full.
         let mut p = kev();
         mark_required_reuse(&mut p, 45, false);
-        assert_eq!(warm(&p), [false; 3]);
-        // Worst case honoured: cold where planned cold, tails where warm.
-        for budget in 45..=90 {
-            let mut p = kev();
-            mark_required_reuse(&mut p, budget, true);
-            let worst: usize = p
-                .iter()
-                .map(|x| if x.readout.require_warm { 8 } else { 29 })
-                .sum();
-            assert!(worst <= budget, "{budget}: {worst}");
-        }
+        assert_eq!(flags(&p), [PLAIN; 3]);
+        // Passes without a shared prefix are never flagged; the first that has one snapshots.
+        let mut p = vec![pass(10, None), pass(29, Some(21)), pass(29, Some(21))];
+        mark_required_reuse(&mut p, 50, true);
+        assert_eq!(flags(&p), [PLAIN, (true, false), (false, true)]);
+    }
+
+    #[test]
+    fn a_prefix_too_short_to_cache_earns_no_discount() {
+        // P2-CE-2: the engine never stores a snapshot under MIN_PREFIX_TOKENS, so such a prefix
+        // is budgeted in full (a clean 413 or a clean run), never resumed.
+        let c = (cascadia_types::MIN_PREFIX_TOKENS - 1) as u32;
+        let tiny: Vec<Pass> = (0..4).map(|_| pass(c as usize + 100, Some(c))).collect();
+        assert_eq!(prefill_work(&tiny, true), prefill_work(&tiny, false));
+        let mut p = tiny.clone();
+        mark_required_reuse(&mut p, 10, true);
+        assert!(p
+            .iter()
+            .all(|x| !x.readout.needs_snapshot && !x.readout.require_warm));
+        let c = cascadia_types::MIN_PREFIX_TOKENS as u32;
+        let ok: Vec<Pass> = (0..4).map(|_| pass(c as usize + 100, Some(c))).collect();
+        assert_eq!(prefill_work(&ok, true), c as usize + 400);
     }
 
     #[test]
