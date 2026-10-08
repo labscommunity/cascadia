@@ -74,12 +74,12 @@ impl Engine for MockEngine {
                 Chunk::error(task.task_id, "mock injected engine failure"),
             )]);
         }
-        // Decision tasks answer in one final chunk with deterministic logits
-        // (`-(i)`, so the first option always wins). A prompt id of `999_999`
-        // is the failure sentinel for exercising the API's error path; `999_998`
-        // returns non-finite logits (NaN, +inf, -inf, …) as a broken head would;
-        // `999_997` fails a `require_warm` pass as an evicted prefix snapshot; `999_996` fails a
-        // `needs_snapshot` pass as a prefix the cache can never hold.
+        // Decision tasks answer in one final chunk with deterministic logits (`-(i)`, joint
+        // heads `-(i^2)/4`, so the first option always wins). A prompt id of `999_999` is the
+        // failure sentinel for exercising the API's error path; `999_998` returns non-finite
+        // logits (NaN, +inf, -inf, …) as a broken head would; `999_997` fails a `require_warm`
+        // pass as an evicted prefix snapshot; `999_996` fails a `needs_snapshot` pass as a
+        // prefix the cache can never hold.
         if let Some(d) = &task.decision {
             // `999_997` in a `require_warm` pass: its prefix snapshot was evicted (SEC-3).
             if d.require_warm && d.prompt_ids.contains(&999_997) {
@@ -102,8 +102,12 @@ impl Engine for MockEngine {
                 )]);
             }
             let non_finite = d.prompt_ids.contains(&999_998);
+            // A joint head (Clef) slices one logits vector per question: there the logits are
+            // -(i^2)/4, not evenly spaced, so a wrong slice offset changes the softmax (P2-CE-3).
+            let joint = matches!(d.head, cascadia_types::ReadoutHead::Joint { .. });
             let logits: Vec<f32> = (0..d.head.output_len())
                 .map(|i| match (non_finite, i % 3) {
+                    (false, _) if joint => -((i * i) as f32) / 4.0,
                     (false, _) => -(i as f32),
                     (true, 0) => f32::NAN,
                     (true, 1) => f32::INFINITY,
