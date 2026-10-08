@@ -338,3 +338,66 @@ def test_clef_injection_record_keeps_only_template_specials():
     with pytest.raises(SystemExit):  # unsanitized, the forged tokens get through
         cg.check_specials("clef raw", jsm.encode_record(tok, INJECT).input_ids, added_ids, template)
     cg.check_specials("clef s03", jsm.encode_record(tok, cg.clef_sanitized(INJECT, added)).input_ids, added_ids, template)
+
+
+# ---- DRIFT-1 / BLD-2: a no-ref parity run writes its own slice of the dump ------------------------
+
+def _pass_line(qid):
+    return json.dumps({"parts": [[qid, 0, 2]], "readout": {"prompt_ids": [1], "head": {"kind": "verbalizer", "token_ids": [1, 2]}}})
+
+
+def _fake_server(monkeypatch, dump, posted, extra_after=None):
+    """pc.systemone replaced by a server that appends one pass per question to `dump`."""
+    def systemone(url, rec):
+        posted.append(rec["id"])
+        with open(dump, "a") as f:
+            for qid in rec["questions"]:
+                f.write(_pass_line(qid) + "\n")
+            if rec["id"] == extra_after:
+                f.write(_pass_line("intruder") + "\n")
+        return {"answers": {}}
+    monkeypatch.setattr(pc, "systemone", systemone)
+
+
+def test_parity_run_slices_only_its_own_passes(tmp_path, monkeypatch):
+    dump = tmp_path / "jev9b.jsonl"
+    dump.write_text(_pass_line("earlier") + "\n" + _pass_line("golden") + "\n")  # earlier runs' passes
+    posted = []
+    _fake_server(monkeypatch, dump, posted)
+    pc.main(["--url", "http://x", "--dump", str(dump)])
+    out = tmp_path / "jev9b.parity.jsonl"
+    assert len(posted) == 50
+    assert len(out.read_text().splitlines()) == 82
+    assert stat.S_IMODE(out.stat().st_mode) == 0o600
+    assert [len(ps) for _, ps in cg.align(str(out), records())] == [len(r["questions"]) for r in records()]
+    # passes appended after the run (golden, duplicate request) never reach the slice
+    with open(dump, "a") as f:
+        f.write(_pass_line("later") + "\n")
+    assert len(out.read_text().splitlines()) == 82
+
+
+def test_parity_run_refuses_to_overwrite_its_slice_without_force(tmp_path, monkeypatch):
+    dump = tmp_path / "d.jsonl"
+    dump.write_text("")
+    (tmp_path / "d.parity.jsonl").write_text("old")
+    posted = []
+    _fake_server(monkeypatch, dump, posted)
+    with pytest.raises(SystemExit, match="--force"):
+        pc.main(["--url", "http://x", "--dump", str(dump)])
+    assert posted == [], "refused before posting anything"
+    pc.main(["--url", "http://x", "--dump", str(dump), "--force"])
+    assert len((tmp_path / "d.parity.jsonl").read_text().splitlines()) == 82
+
+
+def test_parity_run_fails_when_another_client_hits_the_server(tmp_path, monkeypatch):
+    dump = tmp_path / "d.jsonl"
+    dump.write_text("")
+    _fake_server(monkeypatch, dump, [], extra_after="r10")
+    with pytest.raises(SystemExit, match="MISMATCH"):
+        pc.main(["--url", "http://x", "--dump", str(dump)])
+
+
+def test_parity_run_without_ref_needs_dump(capsys):
+    with pytest.raises(SystemExit) as e:
+        pc.main(["--url", "http://x"])
+    assert e.value.code == 2 and "--dump" in capsys.readouterr().err

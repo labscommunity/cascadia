@@ -3,9 +3,9 @@
 Replays the server's --decision-dump, so it measures quantization only (codec correctness is
 codec_golden.py's job). Peak memory ~ one fp32 layer + the passes' activations.
 
-  python tools/decision/reference_stream.py jev  --weights JEV_BF16 --lora JEV/adapter_vllm/adapter_model.safetensors --tree TREE --dump d.jsonl --out ref.json
-  python tools/decision/reference_stream.py kev  --weights QWEN35_9B_BASE --lora KEV/adapter_model.safetensors --tree TREE --dump d.jsonl --out ref.json
-  python tools/decision/reference_stream.py clef --weights CLEF_DIR --clef-dir CLEF_DIR --tree TREE --dump d.jsonl --out ref.json
+  python tools/decision/reference_stream.py jev  --weights JEV_BF16 --lora JEV/adapter_vllm/adapter_model.safetensors --tree TREE --dump d.parity.jsonl --out ref.json
+  python tools/decision/reference_stream.py kev  --weights QWEN35_9B_BASE --lora KEV/adapter_model.safetensors --tree TREE --dump d.parity.jsonl --out ref.json
+  python tools/decision/reference_stream.py clef --weights CLEF_DIR --clef-dir CLEF_DIR --tree TREE --dump d.parity.jsonl --out ref.json
 
 REF.json maps "<record id>.<question id>" to probabilities in API option order (noul [false, true];
 choice in request order; score by level index): exactly one entry per question of the 50 records,
@@ -290,7 +290,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("family", choices=["jev", "kev", "clef"])
     ap.add_argument("--weights", required=True, help="HF safetensors checkpoint (bf16/fp32)")
-    ap.add_argument("--dump", required=True, help="the server's --decision-dump from one parity_check run")
+    ap.add_argument("--dump", required=True,
+                    help="the <dump>.parity.jsonl slice `parity_check.py --dump` wrote (exactly one run of the 50 records)")
     ap.add_argument("--tree", required=True, help="exported tree: decision.json (+ decision/ pointer weights for kev)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--lora", default=None)

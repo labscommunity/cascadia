@@ -1,7 +1,13 @@
 """Agreement of a running decisions server (SystemOne route, /v1/systemone) with a full-precision reference.
 
-  python tools/decision/parity_check.py --url http://127.0.0.1:8080                       # only drive the server (dump)
+  python tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump d.jsonl        # drive the server, slice its dump
   python tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref ref.json        # gate: raw >= 96% and no flip with reference margin >= 0.05
+
+Without --ref the server must run with `--decision-dump DUMP` and have no other client: this run's
+passes (the bytes the dump grew by while the 50 records were posted) are written to
+`<DUMP minus .jsonl>.parity.jsonl` (mode 0600, never overwritten without --force) and checked to
+align with the 50 records. That slice is what reference_stream.py --dump takes; the whole dump also
+holds golden, duplicate-request and earlier runs' passes.
 
 REF.json maps "<record id>.<question id>" to the reference's probabilities in API option order
 (noul [false, true]; choice in request order; score by level index), as answer_probs flattens them.
@@ -12,7 +18,9 @@ import sys
 import urllib.error
 import urllib.request
 from collections import defaultdict
+from pathlib import Path
 
+from codec_golden import align, write_private
 from records import records
 
 
@@ -84,18 +92,45 @@ def tally(ref, results):
     return per_type, agree, total, flips
 
 
-def main():
+def parity_slice(dump):
+    """Where a no-ref run writes its own passes: d.jsonl -> d.parity.jsonl."""
+    return Path(dump).with_suffix(".parity.jsonl")
+
+
+def drive_and_slice(url, dump, force=False):
+    """POST the 50 records and write exactly the dump bytes they added to parity_slice(dump),
+    then check the slice aligns with the records (one run, nothing else)."""
+    out = parity_slice(dump)
+    if out.exists() and not force:
+        raise SystemExit(f"{out} exists; pass --force to overwrite it")
+    if not Path(dump).exists():
+        raise SystemExit(f"{dump} does not exist: start the server with --decision-dump {dump}")
+    start = Path(dump).stat().st_size
+    recs = records()
+    for rec in recs:
+        systemone(url, rec)
+    write_private(out, Path(dump).read_bytes()[start:].decode(), force=force)
+    passes = sum(len(ps) for _, ps in align(str(out), recs))
+    print(f"wrote {passes} passes for {len(recs)} records to {out}")
+    return out
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", required=True)
-    ap.add_argument("--ref", default=None, help="omit to only drive the server (it writes its --decision-dump)")
+    ap.add_argument("--ref", default=None, help="omit to only drive the server and slice its --decision-dump (needs --dump)")
+    ap.add_argument("--dump", default=None, help="the server's --decision-dump file (same machine); required without --ref")
+    ap.add_argument("--force", action="store_true", help="overwrite an existing <dump>.parity.jsonl")
     ap.add_argument("--min-agree", type=float, default=0.96, help="raw top-1 agreement floor (0.96 = at most 3 flips of 82)")
     ap.add_argument("--confident", type=float, default=0.05, help="a flip where the reference margin is >= this fails the gate")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     url = a.url.rstrip("/")
-    results = [(rec, systemone(url, rec)) for rec in records()]
     if not a.ref:
-        print("requests sent (no reference given)")
+        if not a.dump:
+            ap.error("without --ref, pass --dump (the server's --decision-dump) so this run's passes are sliced out")
+        drive_and_slice(url, a.dump, a.force)
         return
+    results = [(rec, systemone(url, rec)) for rec in records()]
     with open(a.ref) as f:
         ref = json.load(f)
     per_type, agree, total, flips = tally(ref, results)
