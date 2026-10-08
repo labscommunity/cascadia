@@ -3,11 +3,15 @@ use super::profile::JevProfile;
 use super::schema::{DecisionRequest, Limits, OrderedValue, Question, QuestionType};
 use super::{softmax, Codec, DecisionError, Pass, PassPart, Sanitizer};
 use cascadia_types::{DecisionReadout, ReadoutHead};
+use std::sync::atomic::AtomicBool;
 
 pub struct JevCodec {
     tok: tokenizers::Tokenizer,
     p: JevProfile,
     san: Sanitizer,
+    /// The per-pass token cap (`DecisionService::max_tokens`): every pass carries the whole
+    /// state, so the first pass over it ends the encode instead of tokenizing every question.
+    pass_cap: usize,
 }
 
 fn kind(q: &Question) -> &'static str {
@@ -95,7 +99,18 @@ impl JevCodec {
             }
         }
         let san = Sanitizer::from_tokenizer(&tok);
-        Ok(Self { tok, p, san })
+        Ok(Self {
+            tok,
+            p,
+            san,
+            pass_cap: usize::MAX,
+        })
+    }
+
+    /// Stop encoding at the first pass longer than `max_tokens` (a 413 either way).
+    pub fn with_pass_cap(mut self, max_tokens: usize) -> Self {
+        self.pass_cap = max_tokens;
+        self
     }
 
     fn slot(&self, k: &str) -> [usize; 2] {
@@ -103,6 +118,11 @@ impl JevCodec {
     }
 
     pub fn prompt_text(&self, req: &DecisionRequest, qid: &str) -> String {
+        self.prompt_with_state(req, qid, &self.san.apply(&render_state(&req.state)))
+    }
+
+    /// [`Self::prompt_text`] with the state already rendered and sanitized.
+    fn prompt_with_state(&self, req: &DecisionRequest, qid: &str, state: &str) -> String {
         let q = &req.questions[qid];
         let lines: Vec<String> = match q.qtype {
             QuestionType::Noul => vec!["false".into(), "true".into()],
@@ -134,7 +154,7 @@ impl JevCodec {
         format!(
             "[kind] {}\n[state] {}\n[question] {}\n[options]\n{}\n[decision]:",
             kind(q),
-            self.san.apply(&render_state(&req.state)),
+            state,
             question,
             lines.join("\n")
         )
@@ -163,14 +183,24 @@ impl Codec for JevCodec {
         }
     }
 
-    fn encode(&self, req: &DecisionRequest) -> Result<Vec<Pass>, DecisionError> {
+    fn encode_until(
+        &self,
+        req: &DecisionRequest,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<Pass>, DecisionError> {
         let mut out = Vec::with_capacity(req.questions.len());
+        // Every pass carries the whole state: render and sanitize it once, not per question.
+        let state = self.san.apply(&render_state(&req.state));
         for (qid, q) in &req.questions {
-            let text = self.prompt_text(req, qid);
+            super::check_cancel(cancel)?;
+            let text = self.prompt_with_state(req, qid, &state);
             let enc = self
                 .tok
                 .encode(text.as_str(), false)
                 .map_err(super::tokenize_failed)?;
+            if enc.len() > self.pass_cap {
+                return Err(super::pass_too_long(enc.len(), self.pass_cap));
+            }
             let (lo, hi) = self.slots_for(q);
             let token_ids = self.p.verbalizer_ids[lo..hi].to_vec();
             let n = token_ids.len();
@@ -310,6 +340,37 @@ mod tests {
         }
         assert_eq!(passes[1].parts[0].question_id, "urgent");
         assert_eq!(passes[1].parts[0].logits, 0..2);
+    }
+
+    #[test]
+    fn encode_stops_at_the_first_long_pass_and_on_cancel() {
+        let c = JevCodec::new(tiny_tokenizer(), profile()).unwrap();
+        let full = c.encode(&req()).unwrap();
+        let longest = full
+            .iter()
+            .map(|p| p.readout.prompt_ids.len())
+            .max()
+            .unwrap();
+        let first = full[0].readout.prompt_ids.len();
+        let capped = JevCodec::new(tiny_tokenizer(), profile())
+            .unwrap()
+            .with_pass_cap(first - 1);
+        match capped.encode(&req()) {
+            Err(DecisionError::TooLong(m)) => assert_eq!(
+                m,
+                format!(
+                    "a decision pass is {first} tokens; the limit is {}",
+                    first - 1
+                )
+            ),
+            other => panic!("{other:?}"),
+        }
+        let roomy = JevCodec::new(tiny_tokenizer(), profile())
+            .unwrap()
+            .with_pass_cap(longest);
+        assert_eq!(roomy.encode(&req()).unwrap().len(), 3);
+        let gone = std::sync::atomic::AtomicBool::new(true);
+        assert!(c.encode_until(&req(), &gone).is_err());
     }
 
     #[test]

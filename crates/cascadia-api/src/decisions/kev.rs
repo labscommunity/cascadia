@@ -3,6 +3,7 @@ use super::profile::KevProfile;
 use super::schema::{DecisionRequest, Limits, OrderedValue, QuestionType};
 use super::{softmax, Codec, DecisionError, Pass, PassPart, Sanitizer};
 use cascadia_types::{DecisionReadout, ReadoutHead};
+use std::sync::atomic::AtomicBool;
 
 const SPECIAL: [&str; 5] = [
     "<|fim_prefix|>",
@@ -218,7 +219,11 @@ impl Codec for KevCodec {
         }
     }
 
-    fn encode(&self, req: &DecisionRequest) -> Result<Vec<Pass>, DecisionError> {
+    fn encode_until(
+        &self,
+        req: &DecisionRequest,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<Pass>, DecisionError> {
         let [s_id, q_id, o_id, c_id, d_id] = self.ids;
         let total = self.max_total_tokens.saturating_mul(8);
         let mut b = Budget {
@@ -239,6 +244,7 @@ impl Codec for KevCodec {
         }
         let mut out = Vec::new();
         for (qid, q) in &req.questions {
+            super::check_cancel(cancel)?;
             let opts: Vec<String> = match q.qtype {
                 QuestionType::Noul => {
                     let c = q.criteria.as_ref();
