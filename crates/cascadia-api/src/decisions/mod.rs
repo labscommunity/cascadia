@@ -154,27 +154,27 @@ pub(crate) const TOKENIZE_FAILED: &str = "request could not be tokenized";
 /// without this, state or option text could forge `<|im_end|>`, `<|fim_suffix|>` etc. and steer
 /// the decision. Template pieces are tokenized separately and keep their real special tokens.
 pub(crate) fn sanitize_user_text(text: &str) -> String {
+    // One linear scan (SEC-1). At each "<|", the name is the maximal [A-Za-z0-9_] run after it,
+    // rewritten only when "|>" follows the run immediately. This equals "find the first `|>` and
+    // check the text before it is a non-empty name": a name holds no '|', so the first "|>" can
+    // only sit at the run's end. Re-searching the remainder for "|>" at every "<|" was O(n^2).
     let mut safe = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("<|") {
         safe.push_str(&rest[..start]);
         let after = &rest[start + 2..];
-        match after.find("|>") {
-            Some(end)
-                if end > 0
-                    && after[..end]
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_') =>
-            {
-                safe.push_str("<¦");
-                safe.push_str(&after[..end]);
-                safe.push_str("¦>");
-                rest = &after[end + 2..];
-            }
-            _ => {
-                safe.push_str("<|");
-                rest = after;
-            }
+        let run = after
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .count();
+        if run > 0 && after[run..].starts_with("|>") {
+            safe.push_str("<¦");
+            safe.push_str(&after[..run]);
+            safe.push_str("¦>");
+            rest = &after[run + 2..];
+        } else {
+            safe.push_str("<|");
+            rest = after;
         }
     }
     safe.push_str(rest);
@@ -230,6 +230,8 @@ impl Sanitizer {
         Self { added }
     }
 
+    /// Linear in the text: `sanitize_user_text` is one scan, and each added token is one
+    /// `contains` + `replace` pass (both linear two-way searches), a fixed number per tokenizer.
     pub(crate) fn apply(&self, text: &str) -> String {
         let mut s = sanitize_user_text(text);
         for a in &self.added {
@@ -292,6 +294,133 @@ mod tests {
                 cache_prefix,
             },
             parts: Vec::new(),
+        }
+    }
+
+    /// The pre-SEC-1 implementation (quadratic on `<|<|<|…`), kept as the equivalence oracle.
+    fn sanitize_oracle(text: &str) -> String {
+        let mut safe = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = rest.find("<|") {
+            safe.push_str(&rest[..start]);
+            let after = &rest[start + 2..];
+            match after.find("|>") {
+                Some(end)
+                    if end > 0
+                        && after[..end]
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+                {
+                    safe.push_str("<¦");
+                    safe.push_str(&after[..end]);
+                    safe.push_str("¦>");
+                    rest = &after[end + 2..];
+                }
+                _ => {
+                    safe.push_str("<|");
+                    rest = after;
+                }
+            }
+        }
+        safe.push_str(rest);
+        safe
+    }
+
+    /// xorshift64*: deterministic, dependency-free.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+    }
+
+    #[test]
+    fn sanitize_is_byte_identical_to_the_oracle() {
+        // Adversarial alphabet: the delimiters, name chars, a pipe/angle on their own, a non-ASCII
+        // char, a char outside the name set and whitespace.
+        let atoms = [
+            "<|", "|>", "<", "|", ">", "a", "Z", "9", "_", "-", "é", " ", "¦", "<|a|>", "|<",
+        ];
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..200_000 {
+            let n = (rng.next() % 24) as usize;
+            let s: String = (0..n)
+                .map(|_| atoms[(rng.next() % atoms.len() as u64) as usize])
+                .collect();
+            assert_eq!(sanitize_user_text(&s), sanitize_oracle(&s), "{s:?}");
+        }
+        for s in [
+            "",
+            "<|",
+            "|>",
+            "<||>",
+            "<|a|>",
+            "<|a|><|b|>",
+            "<|<|a|>",
+            "<|a<|b|>",
+            "<|a|b|>",
+            "<|a b|>",
+            "<|é|>",
+            "x<|im_end|>y",
+            "<|a",
+            "<|a|",
+            "<|_|>|>",
+        ] {
+            assert_eq!(sanitize_user_text(s), sanitize_oracle(s), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn sanitize_is_linear_on_adversarial_input() {
+        // SEC-1: 1 MiB of "<|" (with and without a trailing "|>") took minutes when every "<|"
+        // rescanned the remainder for "|>".
+        for tail in ["", "|>", "a|>"] {
+            let s = format!("{}{tail}", "<|".repeat(512 * 1024));
+            let t = std::time::Instant::now();
+            let out = sanitize_user_text(&s);
+            assert!(
+                t.elapsed() < std::time::Duration::from_millis(500),
+                "{tail:?}: {:?}",
+                t.elapsed()
+            );
+            assert!(out.len() >= s.len());
+        }
+        let s = format!("{}x", "<|a".repeat(350_000));
+        let t = std::time::Instant::now();
+        sanitize_user_text(&s);
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn sanitizer_apply_is_linear_on_adversarial_input() {
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab([("[unk]".to_string(), 0u32)].into_iter().collect())
+            .unk_token("[unk]".into())
+            .build()
+            .unwrap();
+        let mut tok = tokenizers::Tokenizer::new(model);
+        tok.add_tokens(&[
+            tokenizers::AddedToken::from("<think>", false),
+            tokenizers::AddedToken::from("</think>", false),
+            tokenizers::AddedToken::from("<tool_call>", false),
+        ]);
+        let san = Sanitizer::from_tokenizer(&tok);
+        for unit in ["<|", "<", "<think", "<think><", "<|<think>"] {
+            let s = unit.repeat(1024 * 1024 / unit.len());
+            let t = std::time::Instant::now();
+            san.apply(&s);
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(1),
+                "{unit:?}: {:?}",
+                t.elapsed()
+            );
         }
     }
 
