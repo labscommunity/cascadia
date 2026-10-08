@@ -68,12 +68,85 @@ def test_dump_passes_align_to_records(tmp_path):
     assert aligned[0][0]["id"] == records()[0]["id"]
 
 
-def test_backbone_diff_finds_decoder_layers_under_any_prefix():
+# ---- BLD-1: backbone_diff matches across checkpoint layouts and always ends with a verdict ---------
+
+_LAYER_SUFFIXES = ["self_attn.q_proj.weight", "self_attn.o_proj.weight", "mlp.gate_proj.weight",
+                   "mlp.up_proj.weight", "mlp.down_proj.weight", "input_layernorm.weight",
+                   "post_attention_layernorm.weight"]
+
+
+def _hdr(prefix, layers=3, changed=(), dtype="BF16", extra=(), drop=()):
+    """A synthetic safetensors header: canonical name -> entry; the entry's url carries a content tag
+    so the fake sha sees a difference exactly where `changed` says."""
+    out = {}
+    names = [f"layers.{i}.{s}" for i in range(layers) for s in _LAYER_SUFFIXES] + ["embed_tokens.weight", "norm.weight"]
+    for n in names:
+        if n in drop:
+            continue
+        out[prefix + n] = (("ft:" if n in changed else "stock:") + n, dtype, (4, 4), 0, 32)
+    out["lm_head.weight"] = (("ft:" if "lm_head.weight" in changed else "stock:") + "lm_head", dtype, (8, 4), 0, 64)
+    for n in extra:
+        out[n] = ("x:" + n, dtype, (2,), 0, 4)
+    return out
+
+
+def _fake_sha(entry):
+    return entry[0]
+
+
+def _run(a, b, **kw):
     import backbone_diff as bd
-    names = [f"model.language_model.layers.{i}.mlp.gate_proj.weight" for i in (2, 0, 1)] + [
-        "model.language_model.layers.0.self_attn.q_proj.weight", "lm_head.weight",
-        "model.visual.blocks.0.mlp.gate_proj.weight"]
-    assert bd.layer_tensors(names) == [(i, f"model.language_model.layers.{i}.mlp.gate_proj.weight") for i in range(3)]
+    lines = []
+    v, code = bd.compare(a, b, sha=_fake_sha, log=lines.append, **kw)
+    assert lines[-1].startswith(f"VERDICT: {v}")
+    return v, code, lines
+
+
+def test_backbone_diff_matches_text_only_and_vlm_layouts():
+    # JEV-9B style (Qwen3_5ForCausalLM) vs a Qwen VLM repo with a vision tower and MTP head
+    a = _hdr("model.")
+    b = _hdr("model.language_model.", extra=("model.visual.blocks.0.mlp.gate_proj.weight", "mtp.layers.0.mlp.up_proj.weight"))
+    v, code, lines = _run(a, b, per_layer=True)
+    assert (v, code) == ("STOCK", 0)
+    assert "common 24" in lines[0]  # 3 layers x 7 + embed + norm + lm_head; vision and MTP ignored
+    assert [l for l in lines if l.startswith("layer ")] == [f"layer {i}: SAME (7 tensors)" for i in range(3)]
+
+
+def test_backbone_diff_sees_a_change_outside_gate_proj():
+    for changed in ("layers.1.self_attn.o_proj.weight", "layers.2.input_layernorm.weight", "embed_tokens.weight",
+                    "lm_head.weight", "norm.weight"):
+        v, code, lines = _run(_hdr("model."), _hdr("model.language_model.", changed={changed}), per_layer=True)
+        assert (v, code) == ("FINETUNED", 0), changed
+    v, _, lines = _run(_hdr("model."), _hdr("model.", changed={"layers.1.self_attn.o_proj.weight"}), per_layer=True)
+    assert "layer 1: DIFF (7 tensors, differing: self_attn.o_proj.weight)" in lines
+
+
+def test_backbone_diff_is_unknown_when_nothing_is_comparable():
+    only_lm_head = {"lm_head.weight": ("stock:lm_head", "BF16", (8, 4), 0, 64)}
+    assert _run(_hdr("model."), only_lm_head)[:2] == ("UNKNOWN", 2)
+    assert _run(_hdr("model.", layers=3), _hdr("model.", layers=4))[:2] == ("UNKNOWN", 2)
+    assert _run(_hdr("model."), _hdr("model.", dtype="F32"))[:2] == ("UNKNOWN", 2)
+    assert _run(_hdr("model."), _hdr("model.", drop={"layers.0.mlp.up_proj.weight"}))[:2] == ("UNKNOWN", 2)
+
+
+def test_backbone_diff_main_exits_nonzero_on_unknown(monkeypatch, capsys):
+    import backbone_diff as bd
+    hdrs = {"a": _hdr("model."), "b": {"lm_head.weight": ("stock:lm_head", "BF16", (8, 4), 0, 64)}}
+    monkeypatch.setattr(bd, "headers", hdrs.__getitem__)
+    with pytest.raises(SystemExit) as e:
+        bd.main(["a", "b"])
+    assert e.value.code == 2
+    assert capsys.readouterr().out.strip().splitlines()[-1].startswith("VERDICT: UNKNOWN")
+
+
+def test_backbone_diff_tensor_sha_hashes_both_ends(monkeypatch):
+    import backbone_diff as bd
+    blob = bytes(range(256)) * 64  # 16 KiB
+    monkeypatch.setattr(bd, "get", lambda url, rng: blob[rng[0]:rng[1] + 1])
+    base = bd.tensor_sha(("u", "BF16", (1,), 0, len(blob)), cap=1024)
+    tail_changed = blob[:-1] + b"\x00"
+    monkeypatch.setattr(bd, "get", lambda url, rng: tail_changed[rng[0]:rng[1] + 1])
+    assert bd.tensor_sha(("u", "BF16", (1,), 0, len(blob)), cap=1024) != base
 
 
 # ---- Fix round 1: every partial-coverage path fails loudly -------------------------------------
