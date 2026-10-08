@@ -59,7 +59,8 @@ missing `tokenizer.json`) is logged and decisions stay off; chat keeps working.
   `input_image` parts are a 400: this server is text-only.
 - `questions[].name` is required, non-empty and unique. Answers come back in request order.
 - `choices[].value` is a string or a number; any other JSON type is a 400. Duplicate values are a
-  400.
+  400. Values are compared by their internal key, Python's `str()` for a number (see
+  [Mapping notes](#mapping-notes)), so `2` and `"2"` count as the same value and are a 400 too.
 - `choices[].description` and `levels[].description` are optional.
 
 ### Response
@@ -203,6 +204,13 @@ The server does not check `api_key`; the SDK only requires that one is set.
 }
 ```
 
+- `legend` (score answers) maps each level index to its level. Kev returns each level as its
+  reference renders it: text, `key: value` lines for an object and Python `str()` for a scalar
+  (`true` → `"True"`, `2` → `"2"`). JEV and Clef echo the JSON value sent. So a score with
+  `"criteria": [{"name": "x"}, true]` gets `{"0": "name: x", "1": "True"}` from Kev and
+  `{"0": {"name": "x"}, "1": true}` from JEV and Clef. The OpenAI route is the same for every
+  family: its `label` comes from the request's `levels`.
+
 `usage.input_tokens` is the number of prompt tokens prefilled across all passes. `output_tokens`
 is always 0: decision models do not decode.
 
@@ -220,10 +228,10 @@ Both routes share these statuses.
 | Status | When |
 |---|---|
 | 200 | Every question answered. |
-| 400 | Validation: no questions or more than `max_questions`; an empty question name, or (OpenAI format) a duplicate question name or choice value; a choice with no options or more than the model allows; a score with fewer levels than the model allows (2, or 1 for Kev) or more; images; an image part in a list `state` (JEV); a request the tokenizer cannot encode; Clef's option cap (see [Limits](#limits)). |
-| 413 | Too long: the state is more than `max_total_tokens × 8` bytes (checked before tokenizing); Kev's whole rendered text (state, instructions, options and levels) is more than `max_total_tokens × 8` bytes; Kev's state is more than 65,536 tokens (`SERVE_MAX_STATE`, `<state>` included) or reaches `max_tokens`; one pass is longer than `max_tokens` (JEV and Kev; Clef truncates the state instead); Clef's schema alone fills the joint pass, leaving no room for a non-empty state; the request's prefill work is more than `max_total_tokens`; or the engine reports the prompt too long. |
-| 501 | The model serves no decisions: no `decision.json` (or one that fails its load checks; see the startup log), an engine other than `qwen35`, the engine has no decision head (`decision/` missing on the single box or the pipeline's last rank), the tree was exported without `--final-hidden` (Kev and Clef), or a pipeline rank cannot serve decision passes (an older build, or a rank without `config.json` `vocab_size` or, on the last rank, `decision/`). Rank 0 refuses the pipeline cases before any prefill. |
-| 503 | The server is at capacity (`engine at capacity; retry after current requests complete`): every concurrency permit is taken, or a Kev pass that must resume its shared state from the prefix cache found the snapshot evicted (see [Limits](#limits)). Any other engine error is `decision engine error`. Decisions share the API's concurrency permits with chat requests. |
+| 400 | Validation: no questions or more than `max_questions`; an empty question name, or (OpenAI format) a duplicate question name or choice value; a choice with no options or more than the model allows; a score with fewer levels than the model allows (2 for JEV, 1 for Kev and Clef) or more; images; an image part in a list `state` (JEV); a request the tokenizer cannot encode; Clef's option cap (see [Limits](#limits)). |
+| 413 | Too long: the state is more than `max_total_tokens × 8` bytes (checked before tokenizing); Kev's whole rendered text (state, instructions, options and levels) is more than `max_total_tokens × 8` bytes; Kev's rendered state is more than 524,288 bytes (65,536 × 8, checked before tokenizing); Kev's state is more than 65,536 tokens (`SERVE_MAX_STATE`, `<state>` included) or reaches `max_tokens`; one pass is longer than `max_tokens` (JEV and Kev; Clef truncates the state instead); Clef's schema alone fills the joint pass, leaving no room for a non-empty state; the request's prefill work is more than `max_total_tokens` (JEV stops tokenizing at the first question that takes it over: `needs at least N`); a Kev request that needs the shared-state discount when the prefix cache can never hold that state (`this request needs N prefill tokens without prefix reuse (the shared prefix cannot fit the prefix cache); the per-request limit is M`, refused before any prefill); or the engine reports the prompt too long. |
+| 501 | The model serves no decisions: no `decision.json` (or one that fails its load checks; see the startup log), an engine other than `qwen35`, the engine has no decision head (`decision/` missing on the single box or the pipeline's last rank), the tree was exported without `--final-hidden` (Kev and Clef), or a pipeline rank cannot serve decision passes (an older build, rank 0 or the last rank without `config.json` `vocab_size`, or the last rank without `decision/`; a middle rank only relays and needs neither). Rank 0 refuses the pipeline cases before any prefill. |
+| 503 | The server is at capacity (`engine at capacity; retry after current requests complete`): every concurrency permit is taken, or a Kev pass that must resume its shared state from the prefix cache found the snapshot evicted by other requests (see [Limits](#limits)); retrying can succeed. Any other engine error is `decision engine error`. Decisions share the API's concurrency permits with chat requests. |
 
 Error messages are deliberately terse:
 
@@ -247,8 +255,9 @@ Error messages are deliberately terse:
 | Options per choice | per model family | JEV: 16 for the shipped JEV profiles (the profile's choice slot count); Kev: 255 (Kev's `MAX_OPTIONS`); Clef: 256 |
 | Options per request (Clef) | engine readout cap | 4096 across all questions, because Clef answers them in one pass |
 | Tokens in the joint pass (Clef) | `MAX_JOINT_PROMPT` and the head's input limit | the smaller of `max_tokens`, 16,384 and 256 MiB ÷ (4 × width): 16,384 for Clef-flash (width 4096), about 13,107 for Clef-27B (width 5120) |
-| Levels per score | per model family | JEV and Clef: 2 to 256; Kev: 1 to 255 |
-| State tokens (Kev) | Kev's `SERVE_MAX_STATE` | 65,536, `<state>` included; only the whole pass may reach `max_tokens` |
+| Levels per score | per model family | JEV: 2 to 256; Clef: 1 to 256; Kev: 1 to 255 |
+| State tokens (Kev) | Kev's `SERVE_MAX_STATE` | 65,536, `<state>` included; only the whole pass may reach `max_tokens`. The rendered state is also capped at 8 bytes per token (524,288 bytes) before tokenizing |
+| Concurrent tokenizations | fixed | min(4, CPU cores), separate from the request permits |
 | Request body | `--api-max-body-mb` | 1 MiB |
 
 - **`decision.json` is checked at load.** `max_tokens`, `max_total_tokens` and `max_questions`
@@ -275,12 +284,19 @@ Error messages are deliberately terse:
   about 64K plus five short branches. In pipeline mode (`--total` > 1) or with
   `--prefix-cache-gb 0`, every pass counts in full, because the engine re-prefills the state per
   question.
-- **The discount is never exceeded.** A cached state can be evicted (by another request's passes,
-  or because it never fit the prefix cache) before a later question's pass. A request whose budget
-  covers every pass in full runs as usual. Otherwise the passes the budget cannot cover cold must
-  resume the cached state, and if it is gone the request gets the capacity 503 instead of
-  prefilling the state again past its budget. Retry, or raise `max_total_tokens` or
-  `--prefix-cache-gb`.
+- **The discount is never exceeded.** A request whose budget covers every pass in full runs as
+  usual. A request that needs the discount (its passes in full exceed `max_total_tokens`) relies
+  on the prefix cache:
+  - Before its first pass prefills anything, the engine checks that the cache can hold a snapshot
+    of the state at all: the cache is on, the state is at least 16 tokens (`MIN_PREFIX_TOKENS`),
+    and its snapshot is not larger than the cache (measured, or estimated from snapshots already
+    taken). If not, the request is a 413 that names its full need. A state under 16 tokens never
+    earns the discount, so it is budgeted in full.
+  - The first pass then always snapshots the state, even when it resumed a shorter cached state
+    that this one extends (a log or transcript that grew since the last request).
+  - Every later pass resumes that snapshot. If another request's passes evicted it, the request
+    stops at that pass with the capacity 503 instead of prefilling the state again past its
+    budget. Retry, or raise `max_total_tokens` or `--prefix-cache-gb`.
 - **Raise `--api-max-body-mb` for long states.** The default 1 MiB body cap (it applies to every API route) holds roughly 250K
   tokens of English, but JSON escaping and a long Kev state with many questions can exceed it.
   The flag applies to every route, chat included.
@@ -289,6 +305,11 @@ Error messages are deliberately terse:
   requests complete`) at once rather than queueing. A request holds its permit until its
   tokenization has finished, even if the client disconnects first. Decision requests count in the
   request total, the in-flight gauge and the `capacity` rejection metric like chat requests.
+- **Bounded tokenizer memory.** Tokenizing a long state takes a few hundred MB of transient memory,
+  so at most min(4, CPU cores) decision requests tokenize at once; the others wait their turn
+  (holding their permit) rather than failing. Kev also refuses a state that renders to more than
+  8 bytes per allowed token (524,288 bytes) before tokenizing it; honest text tokenizes at about
+  4 bytes per token.
 
 ## Confidence
 
@@ -362,9 +383,44 @@ encoders.
   link: a symlink, FIFO, device or hard-linked file is refused. A failure to open it stops
   startup. Keep it in a directory only you can write (not a shared `/tmp`), and bind the API to
   loopback while it is on: the file grows by every pass of every request.
+- `--decision-dump-max-bytes BYTES` stops appending once the file would pass BYTES; each
+  request's lines are written whole or not at all, and a warning is logged once. The default is
+  unlimited. Lines are written off the API's async workers, so a large dump does not stall chat.
 - It is a startup flag only; there is no environment variable for it.
 - It takes effect only when a decision model is loaded. Otherwise the server logs that
   `--decision-dump` is ignored and opens no file.
+
+## Build a decision tree
+
+A decision tree is an int8 shard tree plus `decision.json` and the head assets under `decision/`.
+`tools/decision_export.py` builds one from Intel's stock int8 OpenVINO IR and the model family's
+fine-tuned files, one family per run (`python tools/decision_export.py --help` lists every flag).
+`STOCK_INT8_IR` is a local copy of the stock IR (for example `OpenVINO/Qwen3.5-9B-int8-ov`), and
+the other upper-case names are the family's downloaded files:
+
+```bash
+# JEV: the stock IR plus JEV's verbalizer LoRA adapter.
+python tools/decision_export.py jev --base-ir STOCK_INT8_IR \
+  --adapter-dir JEV/adapter_vllm --out /models/jev-9b-int8
+
+# Kev: the Base checkpoint, Kev's LoRA and its pointer head (--weights and --lora are required).
+python tools/decision_export.py kev --base-ir STOCK_INT8_IR \
+  --weights QWEN35_9B_BASE --lora KEV/adapter_model.safetensors \
+  --head-pt KEV/head.pt --out /models/kev-9b-int8
+
+# Clef: the Clef checkpoint and its joint schema head.
+python tools/decision_export.py clef --base-ir STOCK_INT8_IR \
+  --clef-dir CLEF_DIR --out /models/clef-flash-int8
+```
+
+- `--stages N` sets the stage cut count: 8 for a single box, one per rank for a pipeline.
+- JEV takes `--weights` only for a fine-tuned backbone that does not already hold the adapter
+  merged, stated with `--weights-not-merged` (check with `tools/decision/backbone_diff.py`).
+- Kev ships the `tokenizer.json` beside `head.pt`, not the Base checkpoint's (`--tokenizer FILE`
+  overrides it for any family).
+- Kev and Clef trees are exported with the final hidden-state output their heads read; JEV's
+  verbalizer reads only the logits.
+- The manifest is written last, so a tree whose export stopped part way is not loadable.
 
 ## Limitations
 
