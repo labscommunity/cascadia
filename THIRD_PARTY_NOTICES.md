@@ -115,3 +115,28 @@ and mirrored in `tools/decision/codec_golden.py` (`jev_text`).
 
 **Implementation:** Rust and Python re-implementation. No JEV source files
 have been copied into the cascadia tree.
+
+## TypeSafe System One API and system-one-adapter (ideas, not code)
+
+**Source:** TypeSafe AI's public System One API (`POST /v1/systemone`)
+and its reference adapter `system-one-adapter` 0.2.1
+(`src/system_one_adapter/_utils/confidence_metrics.py`), as cited by
+`kev/api.py`.
+
+**Author:** TypeSafe AI.
+
+**Licence:** not stated in the material we used. Nothing was copied: we
+read the formulas and the wire format through Kev's Apache-2.0
+`kev/api.py`, which mirrors them, and through the public API shape.
+
+**What we borrowed (ideas, not code):**
+- the `/v1/systemone` request and response shape (state, typed `noul` /
+  `choice` / `score` questions, answers keyed by question id), served by
+  `crates/cascadia-api/src/decisions/handler.rs` and `schema.rs`;
+- the confidence formulas: choice `(p_max - 1/K) / (1 - 1/K)` and score
+  `max(0, 1 - E|level - mode| / D)`, in
+  `crates/cascadia-api/src/decisions/schema.rs` and documented in
+  `docs/decisions.md`.
+
+**Implementation:** Rust re-implementation. No TypeSafe source files have
+been copied into the cascadia tree.
