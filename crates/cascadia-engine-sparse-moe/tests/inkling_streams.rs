@@ -79,13 +79,13 @@ struct Stream {
 fn admit(r: &mut InklingRunner, prompt: &[u32]) -> Stream {
     let hs = r.hidden_size();
     let slot = r.open_stream().expect("free slot");
-    assert_eq!(r.stream_pos(slot), 0);
+    assert_eq!(r.stream_pos(slot), Some(0));
     let mut batch = Vec::with_capacity(prompt.len() * hs);
     for &t in prompt {
         batch.extend(r.embed_token(t));
     }
     let h = r.prefill_stream(slot, batch, prompt.len());
-    assert_eq!(r.stream_pos(slot), prompt.len());
+    assert_eq!(r.stream_pos(slot), Some(prompt.len()));
     let l = r.head_logits(&h[(prompt.len() - 1) * hs..]);
     Stream {
         slot,

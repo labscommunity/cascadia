@@ -6097,7 +6097,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let mut hidden = Vec::with_capacity(slots.len() * hs);
         for &i in &rows_idx {
             let st = &self.streams[i];
-            debug_assert_eq!(st.pos, self.runner.stream_pos(st.slot));
+            debug_assert_eq!(Some(st.pos), self.runner.stream_pos(st.slot));
             hidden.extend(self.runner.embed_token(st.next as u32));
         }
         let runner = &mut self.runner;
@@ -6653,7 +6653,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let slots: Vec<usize> = self.streams.iter().map(|s| s.slot).collect();
         let mut hidden = Vec::with_capacity(slots.len() * hs);
         for st in &self.streams {
-            debug_assert_eq!(st.pos, self.runner.stream_pos(st.slot));
+            debug_assert_eq!(Some(st.pos), self.runner.stream_pos(st.slot));
             hidden.extend(self.runner.embed_token(st.next as u32));
         }
         let rows = slots.len();
@@ -7709,7 +7709,17 @@ impl<R: StagedRunner> PipelineEngine<R> {
         };
         let s = self.stream_slot_ok(slot)?;
         let hs = self.runner.hidden_size();
-        let have = if open { 0 } else { self.runner.stream_pos(s) };
+        let have = if open {
+            Some(0)
+        } else {
+            self.runner.stream_pos(s)
+        };
+        let Some(have) = have else {
+            // A later window of a prompt whose first window never opened the
+            // slot here: this rank's KV would start mid-prompt.
+            self.peer_disconnected = true;
+            return Err(format!("stream feed: slot {s} is not open on this rank"));
+        };
         if hidden_f32.len() != rows as usize * hs || have + rows as usize > self.runner.max_seq() {
             self.peer_disconnected = true;
             return Err(format!(
@@ -7718,16 +7728,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 self.runner.max_seq()
             ));
         }
-        if open {
-            if !self.runner.open_stream_at(s) {
-                self.peer_disconnected = true;
-                return Err(format!("stream open: slot {s} refused by the runner"));
-            }
-        } else if have == 0 {
-            // A later window of a prompt whose first window never opened the
-            // slot here: this rank's KV would start mid-prompt.
+        if open && !self.runner.open_stream_at(s) {
             self.peer_disconnected = true;
-            return Err(format!("stream feed: slot {s} is not open on this rank"));
+            return Err(format!("stream open: slot {s} refused by the runner"));
         }
         let hidden = self.runner.prefill_stream(s, hidden_f32, rows as usize);
         let computed = Instant::now();
@@ -7827,11 +7830,17 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let mut slots = Vec::with_capacity(rows.len());
         for &(slot, pos) in &rows {
             let s = self.stream_slot_ok(slot)?;
+            // A free slot (`None`) or a slot listed twice would panic the
+            // runner's batched decode.
             let have = self.runner.stream_pos(s);
-            if have != pos as usize || pos as usize >= self.runner.max_seq() {
+            if have != Some(pos as usize)
+                || pos as usize >= self.runner.max_seq()
+                || slots.contains(&s)
+            {
                 self.peer_disconnected = true;
                 return Err(format!(
-                    "stream decode: slot {s} at position {have}, frame says {pos} (budget {})",
+                    "stream decode: slot {s} at position {have:?}, frame says {pos} \
+                     (budget {}, each slot listed once)",
                     self.runner.max_seq()
                 ));
             }

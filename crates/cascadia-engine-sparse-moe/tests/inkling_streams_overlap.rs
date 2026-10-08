@@ -85,7 +85,7 @@ impl StagedRunner for SlowRunner {
     fn close_stream(&mut self, slot: usize) {
         self.inner.close_stream(slot)
     }
-    fn stream_pos(&self, slot: usize) -> usize {
+    fn stream_pos(&self, slot: usize) -> Option<usize> {
         self.inner.stream_pos(slot)
     }
     fn prefill_stream(&mut self, slot: usize, hidden: Vec<f32>, rows: usize) -> Vec<f32> {

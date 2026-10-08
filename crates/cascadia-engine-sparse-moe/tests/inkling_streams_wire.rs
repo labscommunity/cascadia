@@ -8,9 +8,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use cascadia_engine::Engine;
-use cascadia_engine_sparse_moe::dist::StageTransport;
+use cascadia_engine_sparse_moe::dist::{
+    recv_kind_client, recv_stream_tokens_body_client, send_stream_decode, send_stream_open,
+    FrameKind, StageTransport,
+};
 use cascadia_engine_sparse_moe::engine::PipelineEngine;
 use cascadia_engine_sparse_moe::inkling::stage::InklingRunner;
+use cascadia_engine_sparse_moe::sampling::SamplingConfig;
+use cascadia_engine_sparse_moe::staged::StagedRunner;
 use cascadia_transport::{ActivationClient, ActivationServer};
 use cascadia_types::GenerationTask;
 use tokio::sync::Mutex;
@@ -269,6 +274,88 @@ async fn last_rank_exits_after_upstream_reset() {
     assert!(
         exited.load(Ordering::Relaxed),
         "last rank kept stepping after its upstream reset; the supervisor can never rebuild it"
+    );
+}
+
+/// A lone stream-mode last rank (rank 2 of 3) that the test feeds frames by
+/// hand. Returns the test's end of the link, the hidden width and the worker
+/// thread, which ends when `step` fails and panics if it never does.
+async fn lone_last_rank(
+    dir: &std::path::Path,
+    handle: &tokio::runtime::Handle,
+) -> (
+    Arc<Mutex<ActivationClient>>,
+    usize,
+    std::thread::JoinHandle<()>,
+) {
+    let (s, c) = link().await;
+    let r2 = InklingRunner::load_staged(dir, 64, 2, 3, 3, 4, Some("eager".into()), None).unwrap();
+    let hs = r2.hidden_size();
+    let mut e2 = PipelineEngine::new(
+        r2,
+        None,
+        StageTransport {
+            upstream: Some(s),
+            downstream: None,
+        },
+        handle.clone(),
+        2,
+        3,
+        None,
+    );
+    assert_eq!(e2.enable_streams(3), 3);
+    let worker = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            if e2.step().is_err() {
+                return;
+            }
+        }
+        panic!("the last rank kept stepping after a bad frame");
+    });
+    (c, hs, worker)
+}
+
+/// A `StreamDecode` frame that names a free slot, or one slot two times,
+/// must make the worker exit with an error. Before the fix both reached the
+/// runner's asserts and panicked the worker process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bad_stream_decode_frame_is_rejected_without_panic() {
+    let Some(dir) = fixture() else { return };
+    let handle = tokio::runtime::Handle::current();
+    let join = |w: std::thread::JoinHandle<()>| async move {
+        tokio::task::spawn_blocking(move || w.join().is_ok())
+            .await
+            .unwrap()
+    };
+
+    // A free slot at position 0.
+    let (c, hs, worker) = lone_last_rank(&dir, &handle).await;
+    send_stream_decode(&c, 1, &[(0, 0)], &vec![0.1; hs], hs as u32)
+        .await
+        .unwrap();
+    assert!(
+        join(worker).await,
+        "a decode of a free slot panicked the worker"
+    );
+
+    // An open slot listed two times.
+    let (c, hs, worker) = lone_last_rank(&dir, &handle).await;
+    let cfg = SamplingConfig::default();
+    send_stream_open(&c, 1, 0, &cfg, &vec![0.1; 2 * hs], 2, hs as u32)
+        .await
+        .unwrap();
+    assert!(matches!(
+        recv_kind_client(&c).await,
+        Ok(Some(FrameKind::StreamTokens))
+    ));
+    recv_stream_tokens_body_client(&c).await.unwrap();
+    send_stream_decode(&c, 2, &[(0, 2), (0, 2)], &vec![0.1; 2 * hs], hs as u32)
+        .await
+        .unwrap();
+    assert!(
+        join(worker).await,
+        "a decode that lists one slot two times panicked the worker"
     );
 }
 

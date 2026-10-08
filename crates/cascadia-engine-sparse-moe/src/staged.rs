@@ -164,9 +164,10 @@ pub trait StagedRunner: Send + 'static {
     /// Release a slot.
     fn close_stream(&mut self, _slot: usize) {}
 
-    /// Positions consumed on `slot` (its next token's absolute position).
-    fn stream_pos(&self, _slot: usize) -> usize {
-        0
+    /// Positions consumed on `slot` (its next token's absolute position);
+    /// `None` when the slot is free or out of range.
+    fn stream_pos(&self, _slot: usize) -> Option<usize> {
+        None
     }
 
     /// Prefill `rows` prompt positions of `slot` (`hidden` = `[rows, hidden]`,
