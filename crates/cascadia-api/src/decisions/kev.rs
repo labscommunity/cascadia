@@ -308,6 +308,7 @@ impl Codec for KevCodec {
                         option_pos: ends,
                     },
                     cache_prefix: Some(state.len() as u32),
+                    require_warm: false,
                 },
                 parts: vec![PassPart {
                     question_id: qid.clone(),

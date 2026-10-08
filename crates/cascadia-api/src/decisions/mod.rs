@@ -239,6 +239,40 @@ pub fn prefill_work(passes: &[Pass], prefix_reuse: bool) -> usize {
     (shared + tails).min(full)
 }
 
+/// Mark the passes that must resume their shared prefix from the prefix cache (SEC-3), so the
+/// tokens a request actually prefills never exceed `max_total`, whatever the cache evicts.
+///
+/// With `prefix_reuse` the budget (`prefill_work`) counts a shared prefix once, but the engine
+/// re-prefills it whenever the snapshot is gone (another request's passes evicted it, or it never
+/// fit the cache). A pass may run cold only while `spent + its full length + every later pass's
+/// tail` still fits; the rest carry `require_warm`, and the engine refuses one whose snapshot is
+/// gone (`decision_cold`, a 503 to retry) instead of prefilling past the budget. Invariant:
+/// `spent + remaining tails <= max_total`, which admission (`prefill_work <= max_total`)
+/// establishes. A request that fits without the discount marks nothing and behaves as before.
+pub fn mark_required_reuse(passes: &mut [Pass], max_total: usize, prefix_reuse: bool) {
+    if !prefix_reuse {
+        return;
+    }
+    let tail = |p: &Pass| {
+        p.readout
+            .prompt_ids
+            .len()
+            .saturating_sub(p.readout.cache_prefix.unwrap_or(0) as usize)
+    };
+    let mut later: usize = passes.iter().map(tail).sum();
+    let mut spent = 0usize;
+    for p in passes.iter_mut() {
+        let (full, t) = (p.readout.prompt_ids.len(), tail(p));
+        later -= t;
+        if p.readout.cache_prefix.is_none() || spent + full + later <= max_total {
+            spent += full;
+        } else {
+            p.readout.require_warm = true;
+            spent += t;
+        }
+    }
+}
+
 /// Caller-text neutralizer bound to one tokenizer: the `<|name|>` rule plus every other
 /// angle-bracket added token (Qwen registers `<think>`, `</think>`, `<tool_call>`, … as added tokens,
 /// and HF tokenizers match those inside plain text too). Longest tokens are rewritten first.
@@ -324,6 +358,7 @@ mod tests {
                 prompt_ids: vec![1; n],
                 head: ReadoutHead::Verbalizer { token_ids: vec![1] },
                 cache_prefix,
+                require_warm: false,
             },
             parts: Vec::new(),
         }
@@ -453,6 +488,43 @@ mod tests {
                 "{unit:?}: {:?}",
                 t.elapsed()
             );
+        }
+    }
+
+    #[test]
+    fn only_passes_the_budget_cannot_cover_cold_must_resume() {
+        let warm = |p: &[Pass]| p.iter().map(|x| x.readout.require_warm).collect::<Vec<_>>();
+        // 3 Kev passes: prefix 21, tail 8 (full 29). Reuse work 45, full work 87.
+        let kev = || (0..3).map(|_| pass(29, Some(21))).collect::<Vec<_>>();
+        let mut p = kev();
+        mark_required_reuse(&mut p, 100, true);
+        assert_eq!(
+            warm(&p),
+            [false; 3],
+            "fits without the discount: nothing changes"
+        );
+        let mut p = kev();
+        mark_required_reuse(&mut p, 60, true);
+        assert_eq!(warm(&p), [false, true, true]);
+        let mut p = kev();
+        mark_required_reuse(&mut p, 66, true);
+        assert_eq!(warm(&p), [false, false, true], "29 + 29 + 8 = 66 fits");
+        let mut p = kev();
+        mark_required_reuse(&mut p, 45, true);
+        assert_eq!(warm(&p), [false, true, true]);
+        // Without reuse (pipeline, cache off) the budget already counted every pass in full.
+        let mut p = kev();
+        mark_required_reuse(&mut p, 45, false);
+        assert_eq!(warm(&p), [false; 3]);
+        // Worst case honoured: cold where planned cold, tails where warm.
+        for budget in 45..=90 {
+            let mut p = kev();
+            mark_required_reuse(&mut p, budget, true);
+            let worst: usize = p
+                .iter()
+                .map(|x| if x.readout.require_warm { 8 } else { 29 })
+                .sum();
+            assert!(worst <= budget, "{budget}: {worst}");
         }
     }
 
