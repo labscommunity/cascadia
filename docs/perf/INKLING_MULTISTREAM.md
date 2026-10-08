@@ -23,8 +23,15 @@ stream decoded alone on the CPU kernels (`tests/inkling_streams.rs`).
 **Runner surface.** `StagedRunner` gains `configure_streams`, `open_stream`,
 `open_stream_at`, `close_stream`, `stream_pos`, `prefill_stream`,
 `decode_streams`, `head_logits_rows` (all default to "unsupported", so dsv4 /
-glm5 / OpenVINO runners are untouched). The Inkling runner implements them;
-the OpenVINO head takes all rows in one call.
+glm5 / OpenVINO runners are untouched). `stream_pos` returns `None` for a
+slot that is not open. The Inkling runner implements them; the OpenVINO
+head takes all rows in one call. `CASCADIA_STAGE_PROFILE_SECS=<n>` (unset
+or 0 = off) makes each multi-stream rank log a `stage profile` line every
+n seconds while frames flow: time spent waiting, receiving, computing,
+prefilling, in the head, sending, relaying and emitting, rank 0's frame
+round trip, frame and row counts, the runner's attention and MLP times,
+and the expert cache's hits, misses and retained MiB. Use it to find the
+slowest stage of a pipeline.
 
 **Single-stage scheduler** (`CASCADIA_STREAMS=N`). Each `step`: admit up to
 `CASCADIA_STREAMS_ADMIT` (default 1) pending tasks — tokenize, take a slot,
@@ -35,9 +42,13 @@ sample each stream's next token with its own history and rng. A forward
 panic fails the batch's tasks, not the process. Aggregate tok/s is logged
 every 16 steps.
 
-**Pipeline wire.** Four appended frame kinds: `StreamOpen` (prefill a slot on
+**Pipeline wire.** Five appended frame kinds: `StreamOpen` (prefill a slot on
 every rank; the last rank seeds a per-slot sampler and replies the first
-token), `StreamDecode` (one row per stream with `(slot, pos)`; every rank
+token), `StreamFeed` (one window of a prompt longer than
+`CASCADIA_STREAMS_PREFILL_WINDOW` rows, default 128, at most
+`MAX_STREAM_ROWS` = 256; the first window opens the slot and only the last
+one is sampled and answered; a receiver refuses a `StreamOpen` of more
+than `MAX_STREAM_ROWS` rows), `StreamDecode` (one row per stream with `(slot, pos)`; every rank
 decodes them as one batch on its own slots; the last rank samples each row
 with its slot's sampler), `StreamClose` (free the slot everywhere),
 `StreamTokens` (the reply). Every rank sets the same `CASCADIA_STREAMS`;
@@ -49,7 +60,8 @@ every group in turn. In a group's turn, rank 0 receives that group's
 outstanding replies — the oldest frames on the wire, so the single reply
 FIFO stays ordered — admits new streams into it, emits its ready tokens,
 retires finished streams and sends one decode micro-batch.
-Mid ranks wait on readiness of both sockets (a cancel-safe `peek`) and treat
+Mid ranks wait on readiness of both sockets (`wait_readable` on each
+activation stream, which is cancel-safe and consumes nothing) and treat
 a frame from upstream and a reply from downstream as independent events, so
 G frames are in flight and every rank is busy on a different group's rows.
 The last rank stays sequential.
@@ -67,7 +79,8 @@ than the serial `S / (R · cost(S))` exactly because smaller frames are cheaper
 per row. If the cost were constant per frame the two would be equal; the gain
 is real because it is not. `tests/inkling_streams_overlap.rs` charges
 `10 ms + 5 ms/row` per micro-batch on a 4-rank loopback pipeline and measures
-one group vs four: same tokens, 1.5–2× less wall time.
+one group vs four: same tokens, about 1.6–1.9× less wall time on an idle
+machine.
 
 ## Validation
 
@@ -75,11 +88,21 @@ one group vs four: same tokens, 1.5–2× less wall time.
 |---|---|
 | `inkling_streams.rs` | streams decoded in a batch are bit-identical (logits and greedy ids) to each stream alone, including a stream admitted mid-flight and a slot reused after close; the single-sequence path is unchanged and still reproduces the HF reference ids |
 | `inkling_streams_wire.rs` | 3-rank loopback pipeline, 5 tasks over 3 slots (admission, finish, reuse): every task's tokens equal the single-stage engine's |
-| `inkling_streams_overlap.rs` | slow runner (10 ms + 5 ms/row per micro-batch), 4-rank loopback: with one group in flight exactly one rank decodes at a time, with four groups all four are observed decoding at once (wall time 1.6-1.9x shorter, reported, not asserted) |
-| `inkling_streams_wire.rs::last_rank_exits_after_upstream_reset` | a last rank whose upstream dies hard (TCP reset) exits its step loop for the supervisor instead of spinning on `NotConnected` (fails without the fix) |
+| `inkling_streams_overlap.rs` | slow runner (10 ms + 5 ms/row per micro-batch), 4-rank loopback: with one group in flight exactly one rank decodes at a time; with four groups all four ranks must decode at once (asserted); four streams that arrive one per round go one row per group (wall time about 1.6–1.9× shorter, reported, not asserted) |
+| `inkling_streams_single_stage.rs` | the single-stage scheduler: greedy tasks decoded together (admitted mid-flight, slots reused) give the one-task path's tokens; a seeded sampled task gives the same tokens alone and in a batch; a stream cancelled during decode frees its slot |
+| `inkling_streams_long_prompt.rs` | prompts longer than one window (4 rows here) go as `StreamFeed` windows and give the single-stage tokens; a long prompt cancelled while its windows go down leaves no stream on rank 0; a lone prompt of more than three rounds of windows finishes through the runner |
+| `inkling_streams_cache.rs` | the batched MoE path with the expert cache on: the hit pass is bit-identical to the miss pass, the tokens equal the eager reference, the second pass hits the cache, and a prefill never grows the cache |
+| `inkling_streams_local_failure.rs` | a panic in rank 0's `decode_streams` with three groups in flight: each task of that round gets an error chunk, the owed replies are drained, and the next round gives the reference tokens on the same link with no re-dial and no worker exit |
+| `inkling_streams_idle.rs` | a stream-mode pipeline idles past the frame idle ceiling, then serves a request with the same tokens; no worker exits |
+| `inkling_streams_wire.rs::link_loss_mid_round_fails_each_stream_once` | the link to rank 1 dies with frames in flight: each task gets exactly one error chunk and nothing after it; rank 0 dials again and serves the next round |
+| `inkling_streams_wire.rs::three_rank_cancel_during_decode_frees_the_slot` | a stream cancelled with its frame in flight retires on every rank; the others and the task that takes its slot get the single-stage tokens |
+| `inkling_streams_wire.rs::rank_with_fewer_slots_fails_fast` | a rank with fewer slots than rank 0 exits with an error, and rank 0's task gets an error chunk soon, not at the reply deadline |
+| `inkling_streams_wire.rs::over_budget_stream_finishes_with_length` | a stream that asks for more tokens than the context budget ends with `FinishReason::Length`, with the same tokens on a single stage and on the pipeline |
+| `inkling_streams_wire.rs::bad_stream_decode_frame_is_rejected_without_panic`, `failed_stream_frame_closes_the_link_at_once` | a decode frame for a free slot or a repeated slot, or a frame the last rank cannot serve, makes the worker exit with an error at once instead of a panic or a silent wait |
+| `cascadia-transport` `{tcp,uds}_wait_readable_peeks_without_consuming` | `wait_readable` on TCP and Unix sockets: a wait cancelled by a timeout loses nothing, a ready byte stays on the wire, EOF gives `SocketClosed` |
+| `inkling_streams_wire.rs::last_rank_exits_after_upstream_reset_{one_task,streams}` | a last rank whose upstream dies hard (TCP reset) exits its step loop for the supervisor instead of spinning on `NotConnected`, on the one-task path and in stream mode (fails without the fix) |
 | `inkling_streams_wire.rs::rank0_redials_after_downstream_restart` | a TCP forwarder cuts the rank 0 link the way a dying neighbour does: neighbours restart while rank 0 idles → no request fails, same tokens; neighbours down → fast error; back → served again (fails with the probe disabled, and with the re-dial disabled; passes on macOS and Linux) |
 | local API run (`cascadia run`, fixture, `CASCADIA_STREAMS=4`) | four concurrent `/v1/completions` return exactly what the one-task path returns |
-| the crate's 439 tests | no regression |
 
 Measured on hardware below (four boxes). Not yet run: a longer pipeline
 and a Linux iGPU rank (no Linux Panther Lake box was reachable).
@@ -90,9 +113,9 @@ Test bed: delta (192.168.0.122, 1 GbE) as rank 0 and the NUCs alpha, beta,
 charlie (2.5 GbE) as ranks 1–3 — all Core Ultra X7 358H, 32 GB, Windows 11
 — on the home LAN, CPU path only (no OpenVINO on the boxes), the real
 export sliced per rank (pushed from the miner over ssh), a manifest
-truncated to 11 layers so the pipeline is a complete model of layers 0–10
-whose words mean nothing but whose per-layer cost, wire and batching are
-the real thing. Ranks hold `[0,3) [3,5) [6,8) [9,11)` (rank 0: the two
+truncated to 11 layers. No rank loads layers 5 and 8, so the pipeline runs
+9 real layers (2 dense + 7 MoE). Its words mean nothing, but its per-layer
+cost, wire and batching are the real thing. Ranks hold `[0,3) [3,5) [6,8) [9,11)` (rank 0: the two
 dense layers + one MoE + embed; two MoE layers per NUC; head on rank 3): a
 32 GB box cannot hold three MoE layers (23 GB) next to Windows.
 `CASCADIA_STREAMS=16`, four groups in flight, 32-token answers, load from
@@ -120,8 +143,9 @@ its unbuffered reads bypass the page cache and, until this branch, the
 batched MoE path — which every multi-stream decode step uses — never
 consulted the expert cache, so every step re-read every expert from NVMe.
 The batched path now looks up its unique experts once and admits misses
-after compute (`inkling_streams_cache.rs`: bit-identical to the eager
-reference, second pass hits). With that fix the tuned profile is the CPU
+after compute (`inkling_streams_cache.rs`: the hit pass is bit-identical to
+the miss pass, the tokens equal the eager reference, the second pass hits
+and a prefill never grows the cache). With that fix the tuned profile is the CPU
 configuration to deploy:
 
 | streams | per-stream tok/s | sum | client aggregate incl. TTFT | mean TTFT |
