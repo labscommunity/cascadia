@@ -210,6 +210,7 @@ impl Codec for JevCodec {
                     prompt_ids: enc.get_ids().to_vec(),
                     head: ReadoutHead::Verbalizer { token_ids },
                     cache_prefix: None,
+                    require_warm: false,
                 },
                 parts: vec![PassPart {
                     question_id: qid.clone(),

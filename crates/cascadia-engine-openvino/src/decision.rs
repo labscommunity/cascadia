@@ -45,10 +45,6 @@ impl Collector {
         }
     }
 
-    pub fn wants_hidden(&self) -> bool {
-        self.need != HiddenNeed::None
-    }
-
     pub fn absorb(&mut self, t0: usize, n: usize, rows: &[f32]) -> Result<(), String> {
         if rows.len() < n * self.hidden {
             return Err(format!(
@@ -139,6 +135,20 @@ fn joint_head_plugin() -> PluginConfig {
 }
 
 impl HeadAssets {
+    /// The head kind, as head.json names it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            HeadAssets::Verbalizer => "verbalizer",
+            HeadAssets::Pointer { .. } => "pointer",
+            HeadAssets::Joint { .. } => "joint",
+        }
+    }
+
+    /// The head reads final-norm hidden rows, so the tree needs `--final-hidden` stages.
+    pub fn reads_hidden(&self) -> bool {
+        !matches!(self, HeadAssets::Verbalizer)
+    }
+
     pub fn load(model_dir: &Path, hidden: usize) -> Result<HeadAssets, String> {
         let dir = model_dir.join("decision");
         let meta: serde_json::Value = serde_json::from_str(
@@ -528,6 +538,7 @@ mod tests {
                 option_pos: vec![0],
             },
             cache_prefix: None,
+            require_warm: false,
         };
         assert_eq!(decode_readout(&encode_readout(&r)).unwrap(), r);
         assert_eq!(
