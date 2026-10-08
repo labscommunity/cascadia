@@ -509,3 +509,177 @@ def test_jev_sorted_server_layout_tokenizes_to_jev_py_questions():
     got = {f"{r['id']}.{qid}": tok(cg.jev_text(cg.jev_sorted(r), qid, labels, added), add_special_tokens=False).input_ids
            for r in records() for qid in r["questions"]}
     assert got == want
+
+
+# ---- Fix round 2: backbone_diff (P2-BLD-1, P2-BLD-2, P2-BLD-4) -----------------------------------
+
+DUMMY_TOKEN = "hf_dummy_test_value_not_a_secret"
+
+
+@pytest.mark.parametrize("name", ["lm_head.weight", "embed_tokens.weight", "norm.weight"])
+def test_backbone_diff_top_level_tensor_on_one_side_is_unknown(name):
+    full = _hdr("model.")
+    trimmed = {k: v for k, v in _hdr("model.language_model.").items()
+               if k not in (name, "model.language_model." + name)}
+    for a, b in ((full, trimmed), (trimmed, full)):
+        v, code, lines = _run(a, b)
+        assert (v, code) == ("UNKNOWN", 2), name
+        assert name in lines[-1]
+
+
+_TARGETS = {f"layers.{i}.{s}" for i in range(3) for s in ("self_attn.q_proj.weight", "mlp.down_proj.weight")} \
+    | {"lm_head.weight"}
+
+
+def test_backbone_diff_merged_when_every_difference_is_an_adapter_target():
+    changed = {"layers.0.self_attn.q_proj.weight", "layers.2.mlp.down_proj.weight", "lm_head.weight"}
+    v, code, lines = _run(_hdr("model."), _hdr("model.", changed=changed), adapter=_TARGETS.__contains__)
+    assert (v, code) == ("MERGED", 3)
+    assert "--lora" in lines[-1]
+
+
+def test_backbone_diff_finetuned_when_a_difference_is_off_target():
+    changed = {"layers.0.self_attn.q_proj.weight", "layers.1.self_attn.o_proj.weight"}
+    v, code, lines = _run(_hdr("model."), _hdr("model.", changed=changed), adapter=_TARGETS.__contains__)
+    assert (v, code) == ("FINETUNED", 0)
+    assert any("outside the adapter" in l and "layers.1.self_attn.o_proj.weight" in l for l in lines)
+    # without an adapter the verdict is unchanged
+    assert _run(_hdr("model."), _hdr("model.", changed={"layers.0.self_attn.q_proj.weight"}))[:2] == ("FINETUNED", 0)
+
+
+def _save_st(path, names, value=0.0):
+    import numpy as np
+    from safetensors.numpy import save_file
+    save_file({n: np.full((4, 4), value if not callable(value) else value(n), dtype=np.float32) for n in names}, str(path))
+
+
+def test_backbone_diff_adapter_targets_from_adapter_file_and_config(tmp_path):
+    import backbone_diff as bd
+    ad = tmp_path / "adapter_vllm"
+    ad.mkdir()
+    _save_st(ad / "adapter_model.safetensors", [
+        "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight",
+        "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_B.weight",
+        "base_model.model.lm_head.lora_A.weight", "base_model.model.lm_head.lora_B.weight"])
+    on = bd.adapter_targets(str(ad))
+    assert on("layers.0.self_attn.q_proj.weight") and on("lm_head.weight")
+    assert not on("layers.1.self_attn.q_proj.weight") and not on("layers.0.self_attn.q_proj.bias")
+    assert on is not None and bd.adapter_targets(str(ad / "adapter_model.safetensors"))("lm_head.weight")
+    only_cfg = tmp_path / "cfg"
+    only_cfg.mkdir()
+    (only_cfg / "adapter_config.json").write_text(json.dumps({"target_modules": ["q_proj", "down_proj"]}))
+    on = bd.adapter_targets(str(only_cfg))
+    assert on("layers.7.self_attn.q_proj.weight") and on("layers.0.mlp.down_proj.weight")
+    assert not on("layers.0.mlp.up_proj.weight") and not on("lm_head.weight")
+    (only_cfg / "adapter_config.json").write_text(json.dumps({"target_modules": r".*\.(q_proj|lm_head)"}))
+    on = bd.adapter_targets(str(only_cfg))
+    assert on("layers.0.self_attn.q_proj.weight") and not on("layers.0.mlp.up_proj.weight")
+
+
+def _local_repo(root, prefix="model.", changed=(), index=True):
+    root.mkdir()
+    names = [f"{prefix}layers.{i}.{s}" for i in range(2) for s in _LAYER_SUFFIXES] + \
+        [f"{prefix}embed_tokens.weight", f"{prefix}norm.weight", "lm_head.weight"]
+    if index:
+        half = len(names) // 2
+        _save_st(root / "model-00001-of-00002.safetensors", names[:half], lambda n: 1.0 + (n in changed))
+        _save_st(root / "model-00002-of-00002.safetensors", names[half:], lambda n: 1.0 + (n in changed))
+        wm = {n: ("model-00001-of-00002.safetensors" if k < half else "model-00002-of-00002.safetensors")
+              for k, n in enumerate(names)}
+        (root / "model.safetensors.index.json").write_text(json.dumps({"weight_map": wm}))
+    else:
+        _save_st(root / "model.safetensors", names, lambda n: 1.0 + (n in changed))
+    return root
+
+
+def test_backbone_diff_reads_local_snapshot_dirs(tmp_path, monkeypatch, capsys):
+    import backbone_diff as bd
+    monkeypatch.setattr(bd, "get", lambda *a, **k: pytest.fail("a local dir must not touch the network"))
+    a = _local_repo(tmp_path / "a")
+    b = _local_repo(tmp_path / "b", prefix="model.language_model.", index=False)
+    with pytest.raises(SystemExit) as e:
+        bd.main([str(a), str(b), "--slice", "16"])
+    assert e.value.code == 0
+    assert capsys.readouterr().out.strip().splitlines()[-1].startswith("VERDICT: STOCK")
+    c = _local_repo(tmp_path / "c", changed={"model.layers.1.mlp.up_proj.weight"})
+    with pytest.raises(SystemExit) as e:
+        bd.main([str(a), str(c), "--slice", "16"])
+    assert e.value.code == 0
+    assert capsys.readouterr().out.strip().splitlines()[-1].startswith("VERDICT: FINETUNED")
+
+
+def test_backbone_diff_main_exits_3_on_merged(tmp_path, monkeypatch, capsys):
+    import backbone_diff as bd
+    ad = tmp_path / "cfg"
+    ad.mkdir()
+    (ad / "adapter_config.json").write_text(json.dumps({"target_modules": ["q_proj"]}))
+    a = _local_repo(tmp_path / "a")
+    b = _local_repo(tmp_path / "b", changed={"model.layers.0.self_attn.q_proj.weight"})
+    with pytest.raises(SystemExit) as e:
+        bd.main([str(a), str(b), "--adapter", str(ad)])
+    assert e.value.code == 3
+    assert capsys.readouterr().out.strip().splitlines()[-1].startswith("VERDICT: MERGED")
+
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status, self.body = status, body
+
+    def read(self):
+        return self.body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_backbone_diff_sends_hf_token_only_as_an_unredirected_header(monkeypatch):
+    import backbone_diff as bd
+    seen = []
+    monkeypatch.setattr(bd, "_open", lambda req: seen.append(req) or _Resp(206, b"abcd"))
+    monkeypatch.setenv("HF_TOKEN", DUMMY_TOKEN)
+    assert bd.get("https://huggingface.co/x/resolve/main/f", (0, 3)) == b"abcd"
+    req = seen[0]
+    assert req.unredirected_hdrs.get("Authorization") == f"Bearer {DUMMY_TOKEN}"
+    assert "Authorization" not in req.headers  # never copied onto a redirect by urllib itself
+    monkeypatch.delenv("HF_TOKEN")
+    bd.get("https://huggingface.co/x/resolve/main/f", (0, 3))
+    assert "Authorization" not in seen[1].unredirected_hdrs
+
+
+def test_backbone_diff_redirect_keeps_token_on_hf_only(monkeypatch):
+    import urllib.request
+    import backbone_diff as bd
+    req = urllib.request.Request("https://huggingface.co/x/resolve/main/f")
+    req.add_header("Range", "bytes=0-3")
+    req.add_unredirected_header("Authorization", f"Bearer {DUMMY_TOKEN}")
+    h = bd._Redirect()
+    same = h.redirect_request(req, None, 302, "Found", {}, "https://huggingface.co/y/resolve/main/f")
+    cdn = h.redirect_request(req, None, 302, "Found", {}, "https://cdn-lfs.hf.co/abc?sig=1")
+    assert same.unredirected_hdrs.get("Authorization") == f"Bearer {DUMMY_TOKEN}"
+    assert "Authorization" not in cdn.unredirected_hdrs and "Authorization" not in cdn.headers
+    assert cdn.headers.get("Range") == "bytes=0-3"
+
+
+def test_backbone_diff_ranged_read_must_be_206_with_the_exact_length(monkeypatch):
+    import backbone_diff as bd
+    for resp in (_Resp(200, b"abcd"), _Resp(206, b"abc")):
+        monkeypatch.setattr(bd, "_open", lambda req, r=resp: r)
+        with pytest.raises(SystemExit, match="206"):
+            bd.get("https://huggingface.co/x/resolve/main/f", (0, 3))
+
+
+def test_backbone_diff_http_error_never_shows_the_token(monkeypatch):
+    import io
+    import urllib.error
+    import backbone_diff as bd
+
+    def deny(req):
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, io.BytesIO(b""))
+    monkeypatch.setattr(bd, "_open", deny)
+    monkeypatch.setenv("HF_TOKEN", DUMMY_TOKEN)
+    with pytest.raises(SystemExit) as e:
+        bd.get("https://huggingface.co/x/resolve/main/f", (0, 3))
+    assert "401" in str(e.value) and DUMMY_TOKEN not in str(e.value)
