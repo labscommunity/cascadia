@@ -163,3 +163,56 @@ async fn single_stage_streams_keep_per_stream_seeded_sampling() {
         assert_eq!(a[i], greedy[j], "greedy task {j} next to a sampled stream");
     }
 }
+
+/// Submit t0-t2, cancel t1 after its second token while t0 and t2 decode,
+/// then submit t3, which can only take t1's freed slot. Returns the tokens
+/// of t0-t3 (t1's up to the cancel) and the chunks t1 got after the cancel.
+fn run_with_cancel(e: &mut dyn Engine) -> (Vec<Vec<i64>>, usize) {
+    let tasks = greedy_tasks();
+    for t in &tasks[..3] {
+        e.submit(t.clone()).unwrap();
+    }
+    let ids: Vec<String> = (0..4).map(|i| format!("t{i}")).collect();
+    let mut toks: Vec<Vec<i64>> = vec![Vec::new(); 4];
+    let mut done = [false, true, false, false];
+    let mut cancelled = false;
+    let mut after = 0;
+    let mut steps = 0;
+    while done.iter().any(|d| !d) {
+        steps += 1;
+        assert!(steps < 500, "engine did not finish the tasks");
+        for (id, c) in e.step().expect("step") {
+            let i = ids.iter().position(|x| x == &id).expect("known task");
+            assert!(c.error.is_none(), "task {id} errored: {:?}", c.error);
+            if i == 1 && cancelled {
+                after += 1;
+            } else if c.is_final {
+                done[i] = true;
+            } else {
+                toks[i].push(c.token_id);
+            }
+        }
+        if !cancelled && toks[1].len() >= 2 {
+            e.cancel(&ids[1]);
+            cancelled = true;
+            e.submit(tasks[3].clone()).unwrap();
+        }
+    }
+    (toks, after)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_stage_cancel_during_decode_frees_the_slot() {
+    let Some(dir) = fixture() else { return };
+    let expected = run(&dir, greedy_tasks(), None).await;
+    let mut e = single_stage(&dir, tokio::runtime::Handle::current());
+    assert_eq!(e.enable_streams(3), 3, "stream slots");
+    let (got, after) = tokio::task::spawn_blocking(move || run_with_cancel(&mut e))
+        .await
+        .unwrap();
+    assert_eq!(after, 0, "the cancelled task got chunks after the cancel");
+    assert_eq!(got[1], expected[1][..2], "t1 before the cancel");
+    for i in [0, 2, 3] {
+        assert_eq!(got[i], expected[i], "task {i} next to a cancelled stream");
+    }
+}

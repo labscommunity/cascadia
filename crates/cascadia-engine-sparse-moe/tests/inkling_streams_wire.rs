@@ -979,3 +979,105 @@ async fn link_loss_mid_round_fails_each_stream_once() {
     drop(e0);
     tail.kill().await;
 }
+
+/// Submit t0-t2, cancel t1 after its second token while t0 and t2 decode,
+/// then submit t3, which can only take t1's freed slot. Returns the tokens
+/// of t0-t3 (t1's up to the cancel) and the chunks t1 got after the cancel.
+fn run_with_cancel(e: &mut dyn Engine) -> (Vec<Vec<i64>>, usize) {
+    let tasks = tasks();
+    for t in &tasks[..3] {
+        e.submit(t.clone()).unwrap();
+    }
+    let ids: Vec<String> = (0..4).map(|i| format!("t{i}")).collect();
+    let mut toks: Vec<Vec<i64>> = vec![Vec::new(); 4];
+    let mut done = [false, true, false, false];
+    let mut cancelled = false;
+    let mut after = 0;
+    let mut steps = 0;
+    while done.iter().any(|d| !d) {
+        steps += 1;
+        assert!(steps < 500, "engine did not finish the tasks");
+        for (id, c) in e.step().expect("step") {
+            let i = ids.iter().position(|x| x == &id).expect("known task");
+            assert!(c.error.is_none(), "task {id} errored: {:?}", c.error);
+            if i == 1 && cancelled {
+                after += 1;
+            } else if c.is_final {
+                done[i] = true;
+            } else {
+                toks[i].push(c.token_id);
+            }
+        }
+        if !cancelled && toks[1].len() >= 2 {
+            e.cancel(&ids[1]);
+            cancelled = true;
+            e.submit(tasks[3].clone()).unwrap();
+        }
+    }
+    (toks, after)
+}
+
+/// A stream cancelled during decode, with its frame in flight, retires
+/// silently on rank 0 and on the ranks behind; the other streams and the
+/// task that takes its slot still get the single-stage tokens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_rank_cancel_during_decode_frees_the_slot() {
+    let Some(dir) = fixture() else { return };
+    let handle = tokio::runtime::Handle::current();
+    let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
+    let ids: Vec<String> = (0..PROMPTS.len()).map(|i| format!("t{i}")).collect();
+    let expected = {
+        let runner =
+            InklingRunner::load_staged(&dir, 64, 0, 1, 0, 0, Some("eager".into()), None).unwrap();
+        let mut e = PipelineEngine::new(
+            runner,
+            Some(tok.clone()),
+            StageTransport::default(),
+            handle.clone(),
+            0,
+            1,
+            None,
+        );
+        tokio::task::spawn_blocking(move || {
+            for t in tasks() {
+                e.submit(t).unwrap();
+            }
+            collect(&mut e, &ids)
+        })
+        .await
+        .unwrap()
+    };
+
+    let tail = Tail::start(&dir, &handle, (0, 0, 0)).await;
+    let mut c01 = ActivationClient::new("127.0.0.1", tail.ports.0);
+    c01.connect_with_timeout(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    let r0 = InklingRunner::load_staged(&dir, 64, 0, 3, 0, 2, Some("eager".into()), None).unwrap();
+    let mut e0 = PipelineEngine::new(
+        r0,
+        Some(tok),
+        StageTransport {
+            upstream: None,
+            downstream: Some(Arc::new(Mutex::new(c01))),
+        },
+        handle.clone(),
+        0,
+        3,
+        None,
+    );
+    assert_eq!(e0.enable_streams(3), 3);
+    let (got, after) = tokio::task::spawn_blocking(move || {
+        let r = run_with_cancel(&mut e0);
+        drop(e0);
+        r
+    })
+    .await
+    .unwrap();
+    tail.kill().await;
+    assert_eq!(after, 0, "the cancelled task got chunks after the cancel");
+    assert_eq!(got[1], expected[1][..2], "t1 before the cancel");
+    for i in [0, 2, 3] {
+        assert_eq!(got[i], expected[i], "task {i} next to a cancelled stream");
+    }
+}
