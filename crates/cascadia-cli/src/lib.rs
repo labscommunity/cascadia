@@ -364,8 +364,9 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub decision_dump: Option<PathBuf>,
 
-    /// Stop appending to --decision-dump once the file would pass BYTES (a request's lines are
-    /// written whole or not at all). Default: unlimited.
+    /// Close --decision-dump for good once a request's lines would take the file past BYTES:
+    /// neither that request nor any later one is written (whole lines only; a failed write closes
+    /// it too). Default: unlimited.
     #[arg(long, value_name = "BYTES")]
     pub decision_dump_max_bytes: Option<u64>,
 
@@ -746,8 +747,9 @@ pub struct RunArgs {
     #[arg(long)]
     pub decision_dump: Option<PathBuf>,
 
-    /// Stop appending to --decision-dump once the file would pass BYTES (a request's lines are
-    /// written whole or not at all). Default: unlimited.
+    /// Close --decision-dump for good once a request's lines would take the file past BYTES:
+    /// neither that request nor any later one is written (whole lines only; a failed write closes
+    /// it too). Default: unlimited.
     #[arg(long, value_name = "BYTES")]
     pub decision_dump_max_bytes: Option<u64>,
 
