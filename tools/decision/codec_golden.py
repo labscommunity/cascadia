@@ -22,6 +22,7 @@ Every coverage gap is a failure: a dump line out of step, a question with no ref
 record missing from reference_flash.pt, a reference with the wrong number of logits.
 """
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -46,6 +47,11 @@ def align(dump_path, recs):
     and the records are out of step (another client hit the server, or the codec split differently)."""
     with open(dump_path) as f:
         lines = [json.loads(line) for line in f if line.strip()]
+    yield from align_lines(lines, recs)
+
+
+def align_lines(lines, recs):
+    """align() over already-parsed dump lines."""
     i = 0
     for rec in recs:
         need, got = set(rec["questions"]), []
@@ -280,16 +286,27 @@ def kev_expected_specials(kev_ids, n_options):
     return [s_id, q_id, d_id] + [o_id, c_id] * n_options
 
 
+@contextlib.contextmanager
+def kev_with_golden(kev, recs, added):
+    """kev.questions over `recs` with the server's full sanitizer, restoring the module on exit.
+    kev.questions iterates kev.records(), so that is pointed at the golden set. kev's user_tokens
+    already escapes `<|name|>`; the server's sanitizer also escapes the angle added tokens
+    (<think>, <tool_call>, ...). The two steps commute, so the second is added around it."""
+    saved_records, pipe_only = kev.records, kev.user_tokens
+    kev.records = lambda: recs
+    kev.user_tokens = lambda t, text: pipe_only(t, escape_added(text, added))
+    try:
+        yield kev
+    finally:
+        kev.records, kev.user_tokens = saved_records, pipe_only
+
+
 def check_kev(dump, tok, adapter_dir, recs):
     sys.path.insert(0, str(SPIKE_DIR / "kev-spike"))
     import kev
     added_ids, added = tokenizer_added(tok)
-    kev.records = lambda: recs  # kev.questions iterates kev.records(); point it at the golden set
-    # kev's user_tokens already escapes `<|name|>`; the server's sanitizer also escapes the angle
-    # added tokens (<think>, <tool_call>, ...). The two steps commute, so add the second around it.
-    pipe_only = kev.user_tokens
-    kev.user_tokens = lambda t, text: pipe_only(t, escape_added(text, added))
-    want = {qid: (row, d, ends) for qid, kind, row, d, ends, keys in kev.questions(tok)}
+    with kev_with_golden(kev, recs, added):
+        want = {qid: (row, d, ends) for qid, kind, row, d, ends, keys in kev.questions(tok)}
     kev_ids = [tok.convert_tokens_to_ids(t) for t in kev.SPECIAL]
     n = 0
     for rec, passes in align(dump, recs):
@@ -404,9 +421,18 @@ def argmax(p):
     return max(range(len(p)), key=p.__getitem__)
 
 
+def jev_sorted(rec):
+    """The record with every choice question's criteria in sorted key order. jev.py (and the saved
+    reference_jev.pt) present choices sorted; the server keeps request order, so sending them sorted
+    makes the server's prompt the one the reference was computed on."""
+    qs = {qid: ({**q, "criteria": {k: q["criteria"][k] for k in sorted(q["criteria"])}} if q["type"] == "choice" else q)
+          for qid, q in rec["questions"].items()}
+    return {**rec, "questions": qs}
+
+
 def score_answers(family, recs, responses, ref):
-    """Top-1 agreement of server answers with a saved reference, over EVERY question: Kev and Clef
-    all of them, JEV noul and score (JEV choice is printed only, its reference used sorted choices).
+    """Top-1 agreement of server answers with a saved reference, over EVERY question of every family.
+    JEV records must arrive with sorted choice criteria (jev_sorted), the order its reference used.
     Missing answers, missing reference entries and unused reference entries all fail."""
     agree = total = 0
     used = set()
@@ -420,9 +446,8 @@ def score_answers(family, recs, responses, ref):
                 fail(f"no saved {family} reference for {key}")
             used.add(key)
             q = rec["questions"][qid]
-            if family == "jev" and q["type"] == "choice":
-                print(f"  (jev choice, informational) {key}: server={top1(ans)} reference={reference_top1(family, q, r)}")
-                continue
+            if family == "jev" and q["type"] == "choice" and list(q["criteria"]) != sorted(q["criteria"]):
+                fail(f"jev {key}: choice criteria were sent unsorted; the reference prompt lists them sorted")
             if family == "jev" and q["type"] == "score":
                 r = {"probs": rescale_score(list(map(float, r["probs"])), len(q["criteria"]))}
             want, got = reference_top1(family, q, r), top1(ans)
@@ -432,15 +457,39 @@ def score_answers(family, recs, responses, ref):
                 print(f"ANSWER {key}: server={got} reference={want}")
     if set(ref) - used:
         fail(f"{family} reference entries never answered: {sorted(set(ref) - used)[:10]}")
-    expected = sum(1 for r in recs for q in r["questions"].values() if not (family == "jev" and q["type"] == "choice"))
+    expected = sum(len(r["questions"]) for r in recs)
     if total != expected:
         fail(f"{family}: compared {total} answers, expected {expected}")
     return agree, total
 
 
-def check_answers(family, url):
+def check_jev_reference_prompts(lines, recs, ref_questions):
+    """The passes the answer run dumped vs jev.py questions(): same prompt ids and verbalizer ids for
+    every question, so the 82 answers (choices included) are scored on the reference's own prompts.
+    ref_questions = jev.questions(tok): (key, kind, prompt_ids, verbalizer_ids, bias, names)."""
+    want = {key: (list(ids), list(vids)) for key, _, ids, vids, _, _ in ref_questions}
+    n = 0
+    for rec, passes in align_lines(lines, recs):
+        for p in passes:
+            key = f"{rec['id']}.{p['parts'][0][0]}"
+            if key not in want:
+                fail(f"jev {key}: no jev.py question")
+            ids, vids = want[key]
+            if p["readout"]["prompt_ids"] != ids:
+                fail(f"jev {key}: server prompt differs from jev.py's")
+            if p["readout"]["head"]["token_ids"] != vids:
+                fail(f"jev {key}: verbalizer ids differ from jev.py's")
+            n += 1
+    if n != len(want):
+        fail(f"jev: {n} dumped passes for {len(want)} jev.py questions")
+    return n
+
+
+def check_answers(family, url, dump=None, tok=None):
     import torch
     recs = records()
+    if family == "jev":
+        recs = [jev_sorted(r) for r in recs]
     if family == "clef":
         # reference_flash.pt is per RECORD: {id, input_ids, hidden, logits=[one tensor per question]}
         ref = {k: {"probs": torch.as_tensor(lg).float().softmax(-1)} for k, lg in clef_ref_map(clef_reference(), recs).items()}
@@ -451,7 +500,15 @@ def check_answers(family, url):
             if r["qid"] in ref:
                 fail(f"{ref_file.name} has {r['qid']} twice")
             ref[r["qid"]] = r
-    agree, total = score_answers(family, recs, [systemone(url, rec) for rec in recs], ref)
+    start = Path(dump).stat().st_size if dump and Path(dump).exists() else None
+    responses = [systemone(url, rec) for rec in recs]
+    if family == "jev" and start is not None and tok is not None:
+        sys.path.insert(0, str(SPIKE_DIR / "jev-spike"))
+        import jev
+        lines = [json.loads(x) for x in Path(dump).read_bytes()[start:].decode().splitlines() if x.strip()]
+        n = check_jev_reference_prompts(lines, recs, jev.questions(tok))
+        print(f"jev: {n} answer-run prompts equal jev.py's (choices sorted)")
+    agree, total = score_answers(family, recs, responses, ref)
     print(f"{family}: server answers agree with the saved reference on {agree}/{total}")
     if agree < 0.98 * total:
         sys.exit(1)
@@ -548,7 +605,7 @@ def main():
     write_private(fresh, Path(a.dump).read_bytes()[start:].decode(), force=a.force)
     {"jev": check_jev, "kev": check_kev, "clef": check_clef}[a.family](str(fresh), tok, a.adapter_dir, recs)
     if a.answers:
-        check_answers(a.family, url)
+        check_answers(a.family, url, a.dump, tok)
 
 
 if __name__ == "__main__":
