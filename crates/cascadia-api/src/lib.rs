@@ -4251,9 +4251,11 @@ mod tests {
 
     #[tokio::test]
     async fn clef_one_joint_pass_is_sliced_per_question_on_both_routes() {
-        // CMP-2: one joint pass carries every option; the mock returns logits -(i) over all of
-        // them, so the choice gets [0, -1, -2] (sorted keys a, m, z) and the noul [-3, -4]
-        // (Clef order true, false).
+        // CMP-2 / P2-CE-3: one joint pass carries every option; the mock returns joint logits
+        // -(i^2)/4 over all of them, so the choice gets [0, -0.25, -1] (sorted keys a, m, z) and
+        // the noul [-2.25, -4] (Clef order true, false). The logits are not evenly spaced, so a
+        // wrong per-question offset (every part read from 0, or the parts swapped) changes the
+        // probabilities: the noul read at 0..2 would give 0.5622, not 0.852.
         let (status, v, body) = post_decisions(
             clef_app().await,
             r#"{"model": "m", "state": "S", "questions": {
@@ -4264,13 +4266,13 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{v}");
         let c = &v["answers"]["c"];
         assert_eq!(c["choice"], "a");
-        assert!(close(&c["probabilities"]["a"], 0.6652), "{c}");
-        assert!(close(&c["probabilities"]["m"], 0.2447), "{c}");
-        assert!(close(&c["probabilities"]["z"], 0.09), "{c}");
+        assert!(close(&c["probabilities"]["a"], 0.4658), "{c}");
+        assert!(close(&c["probabilities"]["m"], 0.3628), "{c}");
+        assert!(close(&c["probabilities"]["z"], 0.1714), "{c}");
         // reported in request order
         let (z, a) = (body.find("\"z\":").unwrap(), body.find("\"a\":").unwrap());
         assert!(z < a, "{body}");
-        assert!(close(&v["answers"]["u"]["noul"], 0.7311), "{v}");
+        assert!(close(&v["answers"]["u"]["noul"], 0.852), "{v}");
         let (status, v) = post_openai(
             clef_app().await,
             r#"{"input": "S", "questions": [
@@ -4283,9 +4285,9 @@ mod tests {
         assert_eq!(v["answers"][0]["probabilities"][0]["value"], "z");
         assert!(close(
             &v["answers"][0]["probabilities"][1]["probability"],
-            0.6652
+            0.4658
         ));
-        assert!(close(&v["answers"][1]["probability"], 0.7311), "{v}");
+        assert!(close(&v["answers"][1]["probability"], 0.852), "{v}");
     }
 
     #[tokio::test]
