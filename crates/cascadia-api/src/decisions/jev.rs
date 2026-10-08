@@ -92,6 +92,13 @@ impl JevCodec {
                     "decision.json jev: slot range {k} [{lo}, {hi}) out of bounds for {n} verbalizers"
                 ));
             }
+            // A zero-width choice range would refuse every choice question with a confusing
+            // "1..=0 options" 400 (EDGE-6).
+            if width.is_none() && hi == lo {
+                return Err(format!(
+                    "decision.json jev: slot range {k} [{lo}, {hi}) must be at least 1 wide"
+                ));
+            }
             if let Some(w) = width.filter(|&w| hi - lo != w) {
                 return Err(format!(
                     "decision.json jev: slot range {k} [{lo}, {hi}) must be {w} wide"
@@ -432,10 +439,10 @@ mod tests {
                 Ok(_) => panic!("{k} {r:?} accepted"),
             }
         }
-        assert!(
-            with("choice", [8, 8]).is_ok(),
-            "an empty choice range is degenerate but safe"
-        );
+        match with("choice", [8, 8]) {
+            Err(e) => assert!(e.contains("at least 1 wide"), "{e}"),
+            Ok(_) => panic!("a zero-width choice range refuses every choice question"),
+        }
     }
 
     #[test]

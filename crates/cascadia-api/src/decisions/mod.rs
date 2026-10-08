@@ -74,6 +74,7 @@ pub trait Codec: Send + Sync {
 }
 
 pub struct DecisionService {
+    pub family: profile::Family,
     pub codec: Box<dyn Codec>,
     pub max_tokens: usize,
     pub max_total_tokens: usize,
@@ -87,7 +88,11 @@ pub struct DecisionService {
 impl std::fmt::Debug for DecisionService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DecisionService")
+            .field("family", &self.family)
             .field("max_tokens", &self.max_tokens)
+            .field("max_total_tokens", &self.max_total_tokens)
+            .field("max_questions", &self.max_questions)
+            .field("prefix_reuse", &self.prefix_reuse)
             .finish_non_exhaustive()
     }
 }
@@ -102,31 +107,77 @@ impl DecisionService {
         let prof = profile::DecisionProfile::load(&path)?;
         let tok = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| format!("{}: tokenizer.json: {e}", model_dir.display()))?;
-        let max_total_tokens = prof.max_total_tokens.unwrap_or(prof.max_tokens * 4);
+        Self::from_profile(&prof, tok, tree_hidden(model_dir))
+            .map(|s| Some(Arc::new(s)))
+            .map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Range-check the profile and clamp it to the limits the engine enforces (EDGE-6, COR-1):
+    /// a limit the engine would refuse at admission turns a too-large request into a 503 instead
+    /// of the API's own 400/413.
+    fn from_profile(
+        prof: &profile::DecisionProfile,
+        tok: tokenizers::Tokenizer,
+        hidden: Option<usize>,
+    ) -> Result<DecisionService, String> {
+        use cascadia_types::{MAX_DECISION_PROMPT, MAX_JOINT_QUESTIONS};
+        if prof.max_tokens == 0 {
+            return Err("max_tokens must be at least 1".into());
+        }
+        if prof.max_questions == Some(0) || prof.max_total_tokens == Some(0) {
+            return Err("max_questions and max_total_tokens must be at least 1".into());
+        }
+        let mut max_tokens = prof.max_tokens;
+        if max_tokens > MAX_DECISION_PROMPT {
+            tracing::warn!(
+                max_tokens,
+                cap = MAX_DECISION_PROMPT,
+                "decision.json max_tokens exceeds the engine's decision prompt cap; clamping"
+            );
+            max_tokens = MAX_DECISION_PROMPT;
+        }
+        let max_total_tokens = prof.max_total_tokens.unwrap_or(max_tokens * 4);
+        let mut max_questions = prof.max_questions.unwrap_or(32);
         let codec: Box<dyn Codec> = match prof.family {
             profile::Family::Jev => Box::new(
-                jev::JevCodec::new(tok, prof.jev.clone().unwrap())?.with_pass_cap(prof.max_tokens),
+                jev::JevCodec::new(tok, prof.jev.clone().unwrap())?.with_pass_cap(max_tokens),
             ),
             profile::Family::Kev => Box::new(kev::KevCodec::new(
                 tok,
                 prof.kev.clone().unwrap(),
-                prof.max_tokens,
+                max_tokens,
                 max_total_tokens,
             )?),
-            profile::Family::Clef => Box::new(clef::ClefCodec::new(
-                tok,
-                prof.max_tokens,
-                tree_hidden(model_dir),
-            )?),
+            profile::Family::Clef => {
+                let c = clef::ClefCodec::new(tok, max_tokens, hidden)?;
+                // Clef truncates the state to fit its one pass, so the pass cap is the joint
+                // prompt cap, and the request budget must cover one full pass.
+                max_tokens = c.max_tokens();
+                if max_total_tokens < max_tokens {
+                    return Err(format!(
+                        "clef max_total_tokens {max_total_tokens} is below its {max_tokens}-token pass; \
+                         long states would be refused instead of truncated"
+                    ));
+                }
+                if max_questions > MAX_JOINT_QUESTIONS {
+                    tracing::warn!(
+                        max_questions,
+                        cap = MAX_JOINT_QUESTIONS,
+                        "decision.json max_questions exceeds the joint head's question cap; clamping"
+                    );
+                    max_questions = MAX_JOINT_QUESTIONS;
+                }
+                Box::new(c)
+            }
         };
-        let max_questions = prof.max_questions.unwrap_or(32);
-        Ok(Some(Arc::new(DecisionService {
+        Ok(DecisionService {
+            family: prof.family,
             codec,
-            max_tokens: prof.max_tokens,
+            max_tokens,
             max_total_tokens,
             max_questions,
             prefix_reuse: false,
-        })))
+        })
     }
 
     /// The codec's option limits with the deployment's question cap.
@@ -489,6 +540,51 @@ mod tests {
                 t.elapsed()
             );
         }
+    }
+
+    fn word_tok() -> tokenizers::Tokenizer {
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab([("[unk]".to_string(), 0u32)].into_iter().collect())
+            .unk_token("[unk]".into())
+            .build()
+            .unwrap();
+        tokenizers::Tokenizer::new(model)
+    }
+
+    fn profile(json: &str) -> profile::DecisionProfile {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn profile_limits_are_range_checked_and_clamped_at_load() {
+        use cascadia_types::{MAX_DECISION_PROMPT, MAX_JOINT_PROMPT, MAX_JOINT_QUESTIONS};
+        let load = |j: &str| DecisionService::from_profile(&profile(j), word_tok(), None);
+        // Zero limits would fail every request confusingly: refuse the profile.
+        for j in [
+            r#"{"family":"clef","max_tokens":0}"#,
+            r#"{"family":"clef","max_tokens":100,"max_questions":0}"#,
+            r#"{"family":"clef","max_tokens":100,"max_total_tokens":0}"#,
+        ] {
+            assert!(load(j).is_err(), "{j}");
+        }
+        // Clef: the joint head takes at most MAX_JOINT_QUESTIONS questions; more would be an
+        // engine 503 instead of a 400.
+        let s = load(r#"{"family":"clef","max_tokens":16384,"max_questions":1000}"#).unwrap();
+        assert_eq!(s.max_questions, MAX_JOINT_QUESTIONS);
+        assert_eq!(
+            s.max_tokens, MAX_JOINT_PROMPT,
+            "the pass cap is the clamped joint cap"
+        );
+        // ... and its budget must cover one full pass, or truncation-to-fit turns into 413s.
+        let e = load(r#"{"family":"clef","max_tokens":1000,"max_total_tokens":999}"#).unwrap_err();
+        assert!(e.contains("max_total_tokens"), "{e}");
+        // Every family: max_tokens is clamped to the engine's decision prompt cap.
+        let jev = r#"{"family":"jev","max_tokens":999999,"jev":{"verbalizers":["false","true","0","1","2","3","4","5","A"],"verbalizer_ids":[1,2,3,4,5,6,7,8,9],"bias":[0,0,0,0,0,0,0,0,0],"slots":{"noul":[0,2],"score":[2,8],"choice":[8,9]},"temperature":{"noul":1,"choice":1,"score":1}}}"#;
+        let s = load(jev).unwrap();
+        assert_eq!(s.max_tokens, MAX_DECISION_PROMPT);
+        assert_eq!(s.max_total_tokens, MAX_DECISION_PROMPT * 4);
+        assert_eq!(s.max_questions, 32);
+        assert_eq!(s.family, profile::Family::Jev);
     }
 
     #[test]
