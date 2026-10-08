@@ -238,3 +238,63 @@ def test_swap_stage_missing_projection_fails_check_swap():
     report = ws.swap_stage(model, weights)
     with pytest.raises(ValueError, match=r"layer 0 .*in_proj_a"):
         ws.check_swap(report, range(0, 2), types, last=True)
+
+
+# ---- BLD-4: swap_embeddings refuses an embeddings layout it would silently corrupt ---------------
+
+def _embeddings_xml(ov, ops, path, asym=False, scale_rows=None):
+    rows, hid = 6, 4
+    name = "self.embed_tokens.weight_openvino_orig_weight"
+    w = ops.constant(np.full((rows, hid), 128 if asym else 1, np.uint8 if asym else np.int8),
+                     dtype=ov.Type.u8 if asym else ov.Type.i8)
+    w.set_friendly_name(name)
+    deq = ops.convert(w, ov.Type.f32)
+    if asym:
+        zp = ops.constant(np.full((rows, 1), 128, np.uint8), dtype=ov.Type.u8)
+        zp.set_friendly_name(name + "/zero_point")
+        deq = ops.subtract(deq, ops.convert(zp, ov.Type.f32))
+    s = ops.constant(np.ones((scale_rows or rows, 1), np.float16), dtype=ov.Type.f16)
+    s.set_friendly_name(name + "/scale")
+    deq = ops.multiply(deq, ops.convert(s, ov.Type.f32))
+    ids = ops.parameter([1, 2], np.int64, name="input_ids")
+    out = ops.gather(deq, ids, 0)
+    ov.save_model(ov.Model([ops.result(out)], [ids], "emb"), str(path))
+    return rows, hid
+
+
+class _RowWeights:
+    def __init__(self, arr):
+        self.arr = arr
+
+    def rows(self, name, a, b):
+        assert name == "embed_tokens.weight"
+        return self.arr[a:b]
+
+
+def test_check_embedding_layout_names_each_problem():
+    ws.check_embedding_layout("e.xml", "i8", False, [6, 1], 6)
+    with pytest.raises(ValueError, match=r"element type u8.*zero point.*scale shape \[1, 1\]"):
+        ws.check_embedding_layout("e.xml", "u8", True, [1, 1], 6)
+
+
+def test_swap_embeddings_refuses_u8_asymmetric_embeddings(tmp_path):
+    ov = pytest.importorskip("openvino")
+    from openvino import opset13 as ops
+    xml = tmp_path / "emb.xml"
+    rows, hid = _embeddings_xml(ov, ops, xml, asym=True)
+    with pytest.raises(ValueError, match="not i8 symmetric"):
+        ws.swap_embeddings(str(xml), _RowWeights(np.ones((rows, hid), np.float32)), str(tmp_path / "out"))
+    assert not (tmp_path / "out").exists()
+
+
+def test_swap_embeddings_writes_i8_symmetric_rows(tmp_path):
+    ov = pytest.importorskip("openvino")
+    from openvino import opset13 as ops
+    xml = tmp_path / "emb.xml"
+    rows, hid = _embeddings_xml(ov, ops, xml)
+    w = np.random.default_rng(3).normal(size=(rows, hid)).astype(np.float32)
+    ws.swap_embeddings(str(xml), _RowWeights(w), str(tmp_path / "out"))
+    m = ov.Core().read_model(str(tmp_path / "out" / "openvino_text_embeddings_model.xml"))
+    q = _const(m, "self.embed_tokens.weight_openvino_orig_weight").get_data()
+    eq, _ = ws.q_sym8(w)
+    np.testing.assert_array_equal(q, eq)
