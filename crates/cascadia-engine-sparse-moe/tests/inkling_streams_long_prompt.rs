@@ -224,6 +224,22 @@ async fn pipeline(
     (e0, workers)
 }
 
+/// One step of rank 0 while only the task "warm" may emit: push its tokens
+/// to `toks`; `true` once it is done.
+fn step_warm(e0: &mut PipelineEngine<InklingRunner>, toks: &mut Vec<i64>) -> bool {
+    let mut done = false;
+    for (id, c) in e0.step().expect("step") {
+        assert_eq!(id, "warm", "only the short task emits");
+        assert!(c.error.is_none(), "warm errored: {:?}", c.error);
+        if c.is_final {
+            done = true;
+        } else {
+            toks.push(c.token_id);
+        }
+    }
+    done
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn windowed_prompts_match_single_stage() {
     let Some(dir) = fixture() else { return };
@@ -246,16 +262,40 @@ async fn windowed_prompts_match_single_stage() {
     // long task that is cancelled while its windows are still going down.
     let (mut e0, workers) = pipeline(&dir, tok).await;
     let ids2 = ids.clone();
+    let warm_ref = expected[3][..4].to_vec();
     let got = tokio::task::spawn_blocking(move || {
-        // A long prompt cancelled after its first window: its slot must come
-        // back on every rank, or the five tasks below run out of slots.
-        let mut doomed = GenerationTask::new("doomed", PROMPTS[0]);
+        // A 40-token prompt cancelled while its windows go down. A short task
+        // decodes next to it, so a step sends only some of its 10 windows.
+        let doomed_id = "doomed".to_string();
+        let prompt: Vec<String> = (1..=40).map(|i| format!("a{i}")).collect();
+        let mut doomed = GenerationTask::new(doomed_id.clone(), prompt.join(" "));
         doomed.max_tokens = 4;
         doomed.temperature = 0.0;
+        let mut warm = tasks().remove(3);
+        warm.task_id = "warm".into();
+        warm.max_tokens = 4;
+        e0.submit(warm).unwrap();
         e0.submit(doomed).unwrap();
-        let first = e0.step().expect("step");
-        assert!(first.is_empty(), "no token before the last window");
-        e0.cancel(&"doomed".to_string().into());
+        let mut warm_toks = Vec::new();
+        step_warm(&mut e0, &mut warm_toks);
+        assert!(e0.has_stream(&doomed_id), "the long prompt is admitted");
+        e0.cancel(&doomed_id);
+        // Rank 0 admits only while it holds fewer streams than slots, so a
+        // stale entry would only slow the tasks below: check it directly.
+        // The ranks behind must free the slot too, or the tasks below that
+        // reuse it fail.
+        let mut warm_done = step_warm(&mut e0, &mut warm_toks);
+        assert!(
+            !e0.has_stream(&doomed_id),
+            "the cancelled prompt still holds a stream on rank 0"
+        );
+        let mut steps = 0;
+        while !warm_done {
+            steps += 1;
+            assert!(steps < 100, "the short task did not finish");
+            warm_done = step_warm(&mut e0, &mut warm_toks);
+        }
+        assert_eq!(warm_toks, warm_ref, "the short task's tokens");
         for t in tasks() {
             e0.submit(t).unwrap();
         }

@@ -5792,6 +5792,12 @@ impl<R: StagedRunner> PipelineEngine<R> {
         self.stream_cap
     }
 
+    /// Rank 0: whether a stream for `id` is still open (for tests).
+    #[doc(hidden)]
+    pub fn has_stream(&self, id: &TaskId) -> bool {
+        self.streams.iter().any(|st| &st.id == id)
+    }
+
     /// Rank 0 of a multi-stream pipeline: keep the downstream link alive while
     /// idle. `step` only runs while a request is being served, so without this
     /// a link that died between requests (the ranks behind restarted) stays
