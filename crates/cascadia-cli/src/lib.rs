@@ -364,6 +364,11 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub decision_dump: Option<PathBuf>,
 
+    /// Stop appending to --decision-dump once the file would pass BYTES (a request's lines are
+    /// written whole or not at all). Default: unlimited.
+    #[arg(long, value_name = "BYTES")]
+    pub decision_dump_max_bytes: Option<u64>,
+
     /// OV performance hint (PERFORMANCE_HINT). LATENCY suits single-user
     /// decode; THROUGHPUT enables NUM_STREAMS auto-tuning. See OpenVINO
     /// high-level-performance-hints docs (2026).
@@ -741,6 +746,11 @@ pub struct RunArgs {
     #[arg(long)]
     pub decision_dump: Option<PathBuf>,
 
+    /// Stop appending to --decision-dump once the file would pass BYTES (a request's lines are
+    /// written whole or not at all). Default: unlimited.
+    #[arg(long, value_name = "BYTES")]
+    pub decision_dump_max_bytes: Option<u64>,
+
     /// Expert placement JSON (requires --ep-workers). See worker --help.
     #[arg(long)]
     pub ep_placement: Option<PathBuf>,
@@ -796,6 +806,7 @@ impl WorkerArgs {
             prefix_cache_gb,
             api_max_body_mb,
             decision_dump,
+            decision_dump_max_bytes: None,
             ep_workers,
             ep_worker_index: None,
             ep_worker_count: None,
@@ -1095,6 +1106,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         args.ep_placement,
         args.decision_dump,
     );
+    worker.decision_dump_max_bytes = args.decision_dump_max_bytes;
     // Carry the elastic posture onto the worker so the OV memory-knob seeding
     // (ov_perf_properties) fires; the interposer itself was already activated
     // in main before the async runtime started.
@@ -2391,6 +2403,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             if cfg.decisions.is_some() {
                 warn!(path = %p.display(), "--decision-dump records request-derived token ids to disk; use for parity checks only");
                 cfg.decision_dump = Some(p.clone());
+                cfg.decision_dump_max_bytes = args.decision_dump_max_bytes;
             } else {
                 warn!(path = %p.display(), "--decision-dump ignored: no decision model is loaded");
             }
@@ -3977,6 +3990,21 @@ mod tests {
             worker.decision_dump.as_deref(),
             Some(std::path::Path::new("/tmp/d.jsonl"))
         );
+        assert_eq!(worker.decision_dump_max_bytes, None);
+        let cli = Cli::try_parse_from([
+            "cascadia",
+            "run",
+            "some-model-dir",
+            "--decision-dump",
+            "/tmp/d.jsonl",
+            "--decision-dump-max-bytes",
+            "1000000",
+        ])
+        .expect("parse run argv");
+        let Command::Run(args) = cli.cmd else {
+            panic!("expected run subcommand")
+        };
+        assert_eq!(args.decision_dump_max_bytes, Some(1_000_000));
     }
 
     #[test]

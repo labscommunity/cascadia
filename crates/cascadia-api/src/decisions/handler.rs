@@ -184,24 +184,33 @@ pub(crate) async fn evaluate(
             svc.max_total_tokens
         )));
     }
-    if let Some(f) = &state.decision_dump {
-        use std::io::Write;
-        // A poisoned lock (a panic mid-write) must not take the endpoint down: keep writing.
-        let mut f = f.lock().unwrap_or_else(|e| e.into_inner());
-        for p in &passes {
-            let parts: Vec<_> = p
-                .parts
-                .iter()
-                .map(|x| (&x.question_id, x.logits.start, x.logits.end))
-                .collect();
-            if let Err(e) = writeln!(
-                f,
-                "{}",
-                serde_json::json!({"parts": parts, "readout": p.readout})
-            ) {
-                tracing::warn!(error = %e, "--decision-dump write failed");
-                break;
+    if let Some(dump) = state.decision_dump.clone() {
+        // Serialize and write off the async workers (P2-SEC-5): a request's lines can reach
+        // ~16 MB, and a synchronous write under the lock would stall chat streams and timers.
+        let dumped = passes.clone();
+        let wrote = tokio::task::spawn_blocking(move || {
+            let mut lines = Vec::new();
+            for p in &dumped {
+                let parts: Vec<_> = p
+                    .parts
+                    .iter()
+                    .map(|x| (&x.question_id, x.logits.start, x.logits.end))
+                    .collect();
+                let line = serde_json::json!({"parts": parts, "readout": p.readout});
+                if serde_json::to_writer(&mut lines, &line).is_err() {
+                    return Err(std::io::Error::other("serialize"));
+                }
+                lines.push(b'\n');
             }
+            // A poisoned lock (a panic mid-write) must not take the endpoint down: keep writing.
+            let mut f = dump.lock().unwrap_or_else(|e| e.into_inner());
+            f.append(&lines)
+        })
+        .await;
+        match wrote {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "--decision-dump write failed"),
+            Err(e) => tracing::warn!(error = %e, "--decision-dump writer panicked"),
         }
     }
     super::mark_required_reuse(&mut passes, svc.max_total_tokens, svc.prefix_reuse);
