@@ -412,7 +412,8 @@ pub struct WorkerArgs {
     #[arg(long, default_value_t = 1.0)]
     pub api_max_body_mb: f64,
 
-    /// Append every /v1/decisions pass (codec token ids + head layout) as JSONL to FILE, mode 0600.
+    /// Append every decision pass (/v1/decisions and /v1/systemone; codec token ids + head
+    /// layout) as JSONL to FILE, mode 0600. FILE must be a regular file (or absent).
     /// For parity checks only: the file holds request-derived data.
     #[arg(long)]
     pub decision_dump: Option<PathBuf>,
@@ -817,7 +818,8 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 1.0)]
     pub api_max_body_mb: f64,
 
-    /// Append every /v1/decisions pass (codec token ids + head layout) as JSONL to FILE, mode 0600.
+    /// Append every decision pass (/v1/decisions and /v1/systemone; codec token ids + head
+    /// layout) as JSONL to FILE, mode 0600. FILE must be a regular file (or absent).
     /// For parity checks only: the file holds request-derived data.
     #[arg(long)]
     pub decision_dump: Option<PathBuf>,
@@ -2583,12 +2585,22 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             match cascadia_api::decisions::DecisionService::load(std::path::Path::new(&args.model))
             {
                 Ok(Some(svc)) => {
-                    info!(model = %args.model, "decision.json found; serving /v1/decisions (OpenAI format) and /v1/systemone");
                     // The shared-prefix budget discount needs real reuse: a single box with the
                     // prefix cache on. Pipeline ranks re-prefill Kev's state per question.
                     let mut svc = std::sync::Arc::try_unwrap(svc)
                         .unwrap_or_else(|_| unreachable!("fresh Arc"));
                     svc.prefix_reuse = args.total <= 1 && prefix_cache_bytes > 0;
+                    // The values every 413 and the docs' limits table depend on. For Clef,
+                    // max_tokens is the effective joint prompt cap after the head-input clamp.
+                    info!(
+                        model = %args.model,
+                        family = ?svc.family,
+                        max_tokens = svc.max_tokens,
+                        max_total_tokens = svc.max_total_tokens,
+                        max_questions = svc.max_questions,
+                        prefix_reuse = svc.prefix_reuse,
+                        "decision.json found; serving /v1/decisions (OpenAI format) and /v1/systemone"
+                    );
                     cfg.decisions = Some(std::sync::Arc::new(svc));
                 }
                 Ok(None) => {}
