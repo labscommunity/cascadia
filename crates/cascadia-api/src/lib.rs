@@ -4001,6 +4001,7 @@ mod tests {
                 max_total_tokens,
                 max_questions: 32,
                 prefix_reuse: true,
+                encode_slots: decisions::default_encode_slots(),
             })),
             decision_dump: dump,
             max_body_bytes: 1 << 20,
@@ -4459,6 +4460,98 @@ mod tests {
         }
     }
 
+    /// Records how many encodes run at once (each holds the tokenizer for 50 ms).
+    struct CountingCodec {
+        inner: GateCodec,
+        now: std::sync::atomic::AtomicUsize,
+        max: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl decisions::Codec for CountingCodec {
+        fn limits(&self) -> decisions::schema::Limits {
+            self.inner.limits()
+        }
+        fn encode_until(
+            &self,
+            req: &decisions::schema::DecisionRequest,
+            cancel: &std::sync::atomic::AtomicBool,
+        ) -> Result<Vec<decisions::Pass>, decisions::DecisionError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let n = self.now.fetch_add(1, SeqCst) + 1;
+            self.max.fetch_max(n, SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            self.now.fetch_sub(1, SeqCst);
+            self.inner.encode_until(req, cancel)
+        }
+        fn probabilities(
+            &self,
+            req: &decisions::schema::DecisionRequest,
+            part: &decisions::PassPart,
+            logits: &[f32],
+        ) -> Vec<f64> {
+            self.inner.probabilities(req, part, logits)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn decision_encodes_are_bounded_by_their_own_slots_not_the_request_permits() {
+        // P2-SEC-3: 16 request permits must not mean 16 concurrent tokenizer transients. Six
+        // requests within the permits all answer, but at most `encode_slots` (2) encode at once.
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let max = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let codec = CountingCodec {
+            inner: GateCodec {
+                started: std::sync::Mutex::new(None),
+                release: std::sync::Mutex::new(None),
+                saw_cancel: Default::default(),
+                finished: Default::default(),
+            },
+            now: Default::default(),
+            max: max.clone(),
+        };
+        let cfg = Config {
+            decisions: Some(Arc::new(decisions::DecisionService {
+                family: decisions::profile::Family::Kev,
+                codec: Box::new(codec),
+                max_tokens: 1000,
+                max_total_tokens: 4000,
+                max_questions: 32,
+                prefix_reuse: false,
+                encode_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            })),
+            max_concurrent_requests: 16,
+            ..Config::default()
+        };
+        let app = make_router_with_stats(
+            Arc::new(runner),
+            "mock-model",
+            cfg,
+            Arc::new(ApiStats::default()),
+        );
+        let body = r#"{"model": "m", "state": "s", "questions": {"u": {"type": "noul"}}}"#;
+        let reqs: Vec<_> = (0..6)
+            .map(|_| tokio::spawn(app.clone().oneshot(systemone_request(body))))
+            .collect();
+        for r in reqs {
+            assert_eq!(r.await.unwrap().unwrap().status(), StatusCode::OK);
+        }
+        let seen = max.load(std::sync::atomic::Ordering::SeqCst);
+        assert!((1..=2).contains(&seen), "{seen} encodes ran at once");
+    }
+
+    #[test]
+    fn default_encode_slots_are_few() {
+        let n = decisions::default_encode_slots().available_permits();
+        assert!((1..=4).contains(&n), "{n}");
+    }
+
     fn systemone_request(body: &str) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -4499,6 +4592,7 @@ mod tests {
                 max_total_tokens: 4000,
                 max_questions: 32,
                 prefix_reuse: false,
+                encode_slots: decisions::default_encode_slots(),
             })),
             max_concurrent_requests: 1,
             ..Config::default()
