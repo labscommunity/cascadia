@@ -354,9 +354,9 @@ async fn groups_in_flight_overlap_the_ranks() {
         w1.as_secs_f64() / w4.as_secs_f64()
     );
     assert_eq!(peak1, 1, "one group in flight: the ranks must take turns");
-    assert!(
-        peak4 >= 2,
-        "no overlap: with 4 groups in flight at most {peak4} rank decoded at a time"
+    assert_eq!(
+        peak4, 4,
+        "with 4 groups in flight all 4 ranks must decode at once, at most {peak4} did"
     );
     // Requests that arrive one per round (a server's submits wait for the
     // engine lock a round holds) must still spread over the groups. Every
