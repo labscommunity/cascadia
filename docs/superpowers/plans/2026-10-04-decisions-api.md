@@ -54,7 +54,53 @@ Model trees are built by an extended exporter: Intel's stock int8 IR, plus an op
   PY=$SPIKE_DIR/clef-spike/.venv/bin/python
   export RUN=~/decisions-runs     # private: dumps, parity/golden slices, references, logs, PID files, request files
   mkdir -m 700 -p "$RUN" && chmod 700 "$RUN"
+  # Start-helper building blocks (used by start_ranks, serve, start_rank0/1). None of them ever
+  # connects to a worker's --listen port: a rank accepts its upstream connection exactly once, so a
+  # probe (nc -z, curl, telnet) would become that upstream and break the chain.
+  port_in_use() {   # PORT -> 0: a TCP socket listens on PORT; 1: free; 2: cannot tell. Lists sockets, never connects.
+    if command -v ss > /dev/null; then
+      ss -ltn "sport = :$1" | tail -n +2 | grep -q .
+    elif [ "$(uname)" = Darwin ]; then   # BSD netstat: column 4 is the local address, column 6 the state
+      netstat -an -p tcp | awk -v p="$1" '$6 == "LISTEN" && $4 ~ ("[.:]" p "$") { f = 1 } END { exit !f }'
+    else
+      echo "port_in_use needs ss (Linux) or netstat (macOS)" >&2; return 2
+    fi
+  }
+  port_free() {     # PORT -> 0 only when nothing listens on PORT (prints why otherwise)
+    port_in_use "$1"
+    case $? in
+      0) echo ":$1 is already in use: stop the process that holds it first"; return 1 ;;
+      2) return 1 ;;
+    esac
+  }
+  wait_log() {      # LOG PID SECONDS OK [FAIL_ERE] -> 0 once LOG holds the fixed string OK; 1 (with the reason)
+                    # when LOG matches FAIL_ERE, PID exits, or SECONDS pass first
+    local log=$1 pid=$2 left=$3 ok=$4 fail=${5:-}
+    while :; do
+      if [ -n "$fail" ] && grep -qE -- "$fail" "$log" 2> /dev/null; then
+        echo "$log: $(grep -E -m1 -- "$fail" "$log")"; return 1
+      fi
+      grep -qF -- "$ok" "$log" 2> /dev/null && return 0
+      kill -0 "$pid" 2> /dev/null || { echo "process $pid exited before logging '$ok'; see $log"; return 1; }
+      [ "$left" -gt 0 ] || { echo "no '$ok' in $log after $3 s"; return 1; }
+      sleep 2; left=$((left - 2))
+    done
+  }
+  wait_health() {   # PID SECONDS -> 0 once the HTTP API on :8080 answers /health (an HTTP port, never a --listen port)
+    local pid=$1 left=$2
+    until curl -sf http://127.0.0.1:8080/health > /dev/null; do
+      kill -0 "$pid" 2> /dev/null || { echo "process $pid exited before /health was ready"; return 1; }
+      [ "$left" -gt 0 ] || { echo "/health not ready after $2 s"; return 1; }
+      sleep 2; left=$((left - 2))
+    done
+  }
+  READY_S=${READY_S:-1800}        # bring-up timeout in seconds (model load + warmup)
   ```
+
+  The helpers read only the workers' own log lines, which this branch and `main` both print at `info` (the worker commands set `RUST_LOG=info` so a stricter `RUST_LOG` in the shell cannot hide them):
+  - `ActivationServer listening` (`cascadia-transport`): a rank with `--listen` has bound its port and waits for its upstream. It is logged before the model loads.
+  - `qwen36 pipeline handshake ok` (`cascadia-engine-openvino`, rank 0's warmup): HELLO went down the chain and came back acked.
+  - `qwen35 startup handshake failed`, `handshake mismatch`, `qwen35 warmup failed` or a Rust `panicked`: the bring-up failed. Rank 0 still serves `/health` after a failed handshake (it is only a warning), which is why `/health` alone is not readiness.
 
   `$RUN` replaces a shared `/tmp`. The decision dump holds request text, and `docs/decisions.md` says to keep it in a directory only you can write. On macOS `/tmp` is the world-writable `/private/tmp`, where another user could pre-create a dump path and make the server refuse to start. `$RUN` is exported because the inline Python snippets read it from `os.environ`. `$PY` runs every tool and is the command `run_capped.py` launches. That venv (transformers 5.18, torch 2.14, openvino 2026.4.1, safetensors 0.8) is where the decision tools were developed and tested; `tools/requirements.txt`'s transformers range is unverified for `codec_golden.py`'s tokenizer-only directories. `cascadia` is this branch's release build on `PATH` (`cargo build --release -p cascadia --features openvino`), against the OpenVINO SDK of the venv's version (2026.4.1, the CI `OV_VERSION` pin). Manual `curl` calls to the decision routes must send `-H 'content-type: application/json'` (axum answers 415 otherwise); the tools set it themselves.
 - **Secrets:** never read `.env*`, keys or tokens. HF downloads use the already-configured CLI login. `backbone_diff.py` reads a gated or private repo with `HF_TOKEN`, which must already be set in the environment (shell profile or secret manager). Never type it on a command line or echo it. The tool sends it only as the `Authorization` header of huggingface.co requests and never prints it. A local snapshot directory needs no token. Subagent prompts carry the same rule.
@@ -5033,22 +5079,27 @@ git commit -m "feat(tools): decision_export.py builds jev/kev/clef decision tree
 
 This is the first point where a 2-stage decision tree exists, so it is where the pipeline frames (Task 11b) are exercised end to end. Build a 2-stage JEV-9B tree, then start the two ranks. Flags are as declared in `WorkerArgs`: the tree is `--model`, and the downstream peer is `--next`. Use the runbook environment from Global Constraints (`$SPIKE_DIR`, `$PY`, `$RUN`, `cascadia` on `PATH`). Every log, dump and request file goes under the private `$RUN` directory, never a shared `/tmp`. Run each process in the background with a Monitor on its log, watching for `Traceback|panic|error|timed out|NAK|epoch|poisoned`.
 
-`start_ranks` records each rank's PID in `$RUN`, and `stop_ranks` kills only those PIDs. Never use `pkill -f`: other sessions on this machine may run their own `cascadia worker`. Rank 0 also writes a decision dump, which the large-body check reads to measure the frame size.
+`start_ranks TREE DUMP [RANK1_BINARY]` records each rank's PID in `$RUN`, and `stop_ranks` kills only those PIDs. Never use `pkill -f`: other sessions on this machine may run their own `cascadia worker`. Rank 0 also writes a decision dump (`DUMP`), which the large-body check reads to measure the frame size. Tasks 19 and 20 reuse both helpers for their pipeline runs.
+
+`start_ranks` returns 1 with the reason when :8080 or :7801 already has a listener (`port_free`: it lists sockets, it never connects), when rank 1 exits or does not log `ActivationServer listening` within 120 s, when rank 0 logs a handshake or warmup failure, exits, or does not log `qwen36 pipeline handshake ok` within `$READY_S`, when `/health` does not come up, when rank 1 has died meanwhile, or when `/v1/models` does not name the tree. **Never test :7801 by connecting to it** (`nc -z`, `curl`, `telnet`): rank 1 accepts exactly one upstream connection, and the probe would take it. On a non-zero status the caller prints `ABORT`, stops whatever started, and keeps the status.
 
 ```bash
 $PY tools/decision_export.py jev --base-ir ~/models/qwen35-9b-int8 --adapter-dir ~/models/jev9b/adapter_vllm --stages 2 --out ~/trees/jev9b-int8-2st
-start_ranks() {   # [RANK1_BINARY]: rank 1 first (it listens), then rank 0 (it dials rank 1 once, at startup)
-  ! curl -sf localhost:8080/health > /dev/null || { echo ":8080 is already serving: stop that server first"; return 1; }
-  "${1:-cascadia}" worker --model ~/trees/jev9b-int8-2st --engine qwen35 --device CPU --rank 1 --total 2 --listen 127.0.0.1:7801 > $RUN/rank1.log 2>&1 &
+start_ranks() {   # TREE DUMP [RANK1_BINARY]: rank 1 first (it listens), then rank 0 (it dials rank 1 once, at startup)
+  local tree=$1 dump=$2 bin1=${3:-cascadia}
+  [ -n "$tree" ] && [ -n "$dump" ] || { echo "usage: start_ranks TREE DUMP [RANK1_BINARY]"; return 1; }
+  port_free 8080 && port_free 7801 || return 1
+  RUST_LOG=info "$bin1" worker --model "$tree" --engine qwen35 --device CPU --rank 1 --total 2 --listen 127.0.0.1:7801 > $RUN/rank1.log 2>&1 &
   echo $! > $RUN/rank1.pid
-  sleep 5
-  cascadia worker --model ~/trees/jev9b-int8-2st --engine qwen35 --device CPU --rank 0 --total 2 --next 127.0.0.1:7801 --api 127.0.0.1:8080 \
-      --decision-dump $RUN/smoke.jsonl > $RUN/rank0.log 2>&1 &
+  wait_log $RUN/rank1.log "$(cat $RUN/rank1.pid)" 120 'ActivationServer listening' 'panicked' || { echo "rank 1 is not listening"; return 1; }
+  RUST_LOG=info cascadia worker --model "$tree" --engine qwen35 --device CPU --rank 0 --total 2 --next 127.0.0.1:7801 --api 127.0.0.1:8080 \
+      --decision-dump "$dump" > $RUN/rank0.log 2>&1 &
   echo $! > $RUN/rank0.pid
-  until curl -sf localhost:8080/health > /dev/null; do
-    kill -0 $(cat $RUN/rank0.pid) 2>/dev/null || { echo "rank 0 exited; see $RUN/rank0.log"; return 1; }
-    sleep 2
-  done
+  wait_log $RUN/rank0.log "$(cat $RUN/rank0.pid)" "$READY_S" 'qwen36 pipeline handshake ok' \
+      'startup handshake failed|handshake mismatch|warmup failed|panicked' || { echo "rank 0 has no working chain to rank 1"; return 1; }
+  wait_health "$(cat $RUN/rank0.pid)" "$READY_S" || return 1
+  kill -0 "$(cat $RUN/rank1.pid)" 2> /dev/null || { echo "rank 1 exited; see $RUN/rank1.log"; return 1; }
+  curl -s http://127.0.0.1:8080/v1/models | grep -qF "$(basename "$tree")" || { echo ":8080 is not serving $tree"; return 1; }
 }
 stop_ranks() {    # only the PIDs start_ranks recorded
   for r in rank0 rank1; do
@@ -5059,7 +5110,7 @@ stop_ranks() {    # only the PIDs start_ranks recorded
   done
 }
 rm -f $RUN/smoke.jsonl
-start_ranks
+start_ranks ~/trees/jev9b-int8-2st $RUN/smoke.jsonl || { echo "ABORT: the ranks did not come up; stop here"; stop_ranks; false; }
 H='content-type: application/json'
 SMALL='{"model":"jev","state":"I was charged twice","questions":{"team":{"type":"choice","instructions":"Which team?","criteria":{"billing":"charges","tech":"bugs"}}}}'
 curl -s -H "$H" localhost:8080/v1/systemone -d "$SMALL" | tee $RUN/small-base.json
@@ -5127,14 +5178,16 @@ Expected: 200 on both, with `"choice":"billing"` and identical probabilities. (W
   ```bash
   stop_ranks
   git worktree add $RUN/cascadia-main origin/main && (cd $RUN/cascadia-main && cargo build --release -p cascadia --features openvino)
-  start_ranks $RUN/cascadia-main/target/release/cascadia    # main-build rank 1, branch rank 0
+  start_ranks ~/trees/jev9b-int8-2st $RUN/smoke.jsonl $RUN/cascadia-main/target/release/cascadia \
+      || { echo "ABORT: main-build rank 1 + branch rank 0 did not come up"; stop_ranks; false; }   # main-build rank 1, branch rank 0
   curl -s -H "$H" localhost:8080/v1/systemone -d '{"model":"jev","state":"x","questions":{"u":{"type":"noul","instructions":"Is it?"}}}' -w ' %{http_code}\n'    # {"error":"this model does not serve decisions"} 501
   curl -s -H "$H" localhost:8080/v1/decisions -d '{"model":"jev","input":"x","questions":[{"type":"predicate","name":"u","instructions":"Is it?"}]}' -w ' %{http_code}\n'   # {"error":{"message":"this model does not serve decisions","type":"server_error","code":null}} 501
   curl -s -H "$H" localhost:8080/v1/chat/completions -d '{"model":"jev","messages":[{"role":"user","content":"Say hi."}],"max_tokens":8}' -o /dev/null -w 'chat %{http_code}\n'   # 200
   grep -c 'decision_unsupported: a pipeline rank cannot serve decision passes' $RUN/rank0.log    # >= 2 (one per decision request)
   stop_ranks
   git worktree remove $RUN/cascadia-main
-  start_ranks                                                # restore: both ranks on the branch build
+  start_ranks ~/trees/jev9b-int8-2st $RUN/smoke.jsonl \
+      || { echo "ABORT: the branch ranks did not come back"; stop_ranks; false; }               # restore: both ranks on the branch build
   curl -s -H "$H" localhost:8080/v1/systemone -d "$SMALL" -o $RUN/restored.json -w 'restored %{http_code}\n'
   $PY -c 'import json, os; R = os.environ["RUN"]; L = lambda f: json.load(open(f"{R}/{f}"))["answers"]; assert L("restored.json") == L("small-base.json"); print("branch ranks restored")'
   stop_ranks
@@ -5172,7 +5225,7 @@ Neither check can stand in for the other.
   - With `--answers`, the server's top-1 on the 50 records must agree with the saved spike reference on ≥ 98%. For Kev and Clef that covers every question. For JEV it covers every question too (score references rescaled to the record's L levels first). `reference_jev.pt` was measured on sorted choices, so the answer run sends each JEV choice question with its criteria sorted (`jev_sorted`), and the prompts it dumps must equal `jev.questions()`'s ids exactly. (Fix round 1, FID-3: the plan code below still shows the earlier informational-only JEV choice line; the shipped `codec_golden.py` gates all 82.)
   - The 27B models have no saved spike reference; for them only the encoder comparison runs, and parity (Task 17) is the answer check.
 - `openai_equivalence.py --url URL`: converts each of the 50 records into an OpenAI-format request (`to_openai(rec)`), POSTs it to `/v1/decisions` and the original to `/v1/systemone`, and exits non-zero unless every question's probabilities, choice/score and confidence are identical. The records' score levels are plain strings (no descriptions), so both routes build byte-identical prompts, and any difference is an adapter bug. Everything verified through `/v1/systemone` (golden, parity) then carries over to `/v1/decisions`.
-- `backbone_diff.py A B [--per-layer] [--slice BYTES]`: matches tensors per layer index and suffix after stripping the repo's `model.language_model.` / `model.` prefix (vision and MTP tensors ignored), hashes both ends of every backbone tensor (all projections, norms, embeddings, final norm, lm_head), prints per-tensor / per-layer `SAME`/`DIFF`, and ends with one `VERDICT: STOCK | FINETUNED | MERGED | UNKNOWN` line; UNKNOWN (no comparable decoder-layer tensors, different layer sets, a tensor on one side only (lm_head, embed and the final norm included), or a dtype/shape mismatch) exits 2. (Fix round 1, BLD-1, replaces the sampled/gate_proj-only probe below.) Fix round 2: A and B may each be a local snapshot dir instead of an HF repo id; a gated repo is read with `HF_TOKEN` from the environment (sent only as the Authorization header of huggingface.co requests, never printed); every ranged read must be HTTP 206 with the exact length; `--adapter DIR` turns a FINETUNED whose every difference is an adapter target module into `MERGED` (exit 3: the LoRA is already in the shards, P2-BLD-1). `decision_export.py jev --weights` additionally requires `--weights-not-merged`. Fix round 3: MERGED is proved, not inferred (P3-BLD-5). For the one or two smallest differing decoder-layer targets (at most `--merge-check-bytes`, default 32 MiB, each), both tensors and the adapter's `lora_A`/`lora_B` are read whole, and `B − A` must equal ±scale·`lora_B`@`lora_A` (scale from `adapter_config.json`) within the shard dtype's rounding, with |cosine| ≥ 0.9. If the difference is clearly unrelated to that delta (|cosine| < 0.5), the verdict is FINETUNED; anything else is UNKNOWN. That includes a config-only `--adapter` (no lora tensors to check), rank/alpha patterns, DoRA, and in-between evidence. A config-only `target_modules: "all-linear"` (alone or in a list) means every 2-D decoder-layer projection, and an `--adapter` whose targets match none of the compared tensors gives UNKNOWN (P3-BLD-4). `HF_TOKEN` is stripped of surrounding whitespace, and a value still holding a space, control or non-ASCII character is refused without being shown. Every request failure becomes a SystemExit naming only the URL and the exception type (P3-BLD-2).
+- `backbone_diff.py A B [--per-layer] [--slice BYTES]`: matches tensors per layer index and suffix after stripping the repo's `model.language_model.` / `model.` prefix (vision and MTP tensors ignored), hashes both ends of every backbone tensor (all projections, norms, embeddings, final norm, lm_head), prints per-tensor / per-layer `SAME`/`DIFF`, and ends with one `VERDICT: STOCK | FINETUNED | MERGED | UNKNOWN` line; UNKNOWN (no comparable decoder-layer tensors, different layer sets, a tensor on one side only (lm_head, embed and the final norm included), or a dtype/shape mismatch) exits 2. (Fix round 1, BLD-1, replaces the sampled/gate_proj-only probe below.) Fix round 2: A and B may each be a local snapshot dir instead of an HF repo id; a gated repo is read with `HF_TOKEN` from the environment (sent only as the Authorization header of huggingface.co requests, never printed); every ranged read must be HTTP 206 with the exact length; `--adapter DIR` turns a FINETUNED whose every difference is an adapter target module into `MERGED` (exit 3: the LoRA is already in the shards, P2-BLD-1). `decision_export.py jev --weights` additionally requires `--weights-not-merged`. Fix round 3: MERGED is proved, not inferred (P3-BLD-5). For the one or two smallest differing decoder-layer targets (at most `--merge-check-bytes`, default 32 MiB, each), both tensors and the adapter's `lora_A`/`lora_B` are read whole, and `B − A` must equal ±scale·`lora_B`@`lora_A` (scale from `adapter_config.json`) within the shard dtype's rounding, with |cosine| ≥ 0.9. If the difference is clearly unrelated to that delta (|cosine| < 0.5), the verdict is FINETUNED; anything else is UNKNOWN. That includes a config-only `--adapter` (no lora tensors to check), rank/alpha patterns, DoRA, and in-between evidence. A config-only `target_modules: "all-linear"` (alone or in a list) means every 2-D decoder-layer projection, and an `--adapter` whose targets match none of the compared tensors gives UNKNOWN (P3-BLD-4). `HF_TOKEN` is stripped of surrounding whitespace, and a value still holding a space, control or non-ASCII character is refused without being shown. Every request failure becomes a SystemExit naming only the URL and the exception type (P3-BLD-2). Fix round 4: FINETUNED from the merge check also needs the residual to clearly exceed rounding (at least 5% of the elements outside the half-ulp bound a genuine merge obeys; a merge puts none there). A small cosine with the residual inside rounding is a delta lost below the dtype's resolution and gives UNKNOWN (P4-BLD-2). A config-only regex `target_modules` is fullmatched against the module name bare and with the `model.`, `model.language_model.` and `language_model.model.` prefixes, as PEFT sees it in a text-only or a VLM-class model (P4-BLD-3). `parity_check.py --answers-out FILE` saves a run's answers in the `--ref` format (0600, never overwritten without `--force`), so a pipeline tree can be gated against its single box with `--min-agree 1 --confident 0` (P4-DRIFT-3).
 - `def answer_probs(ans: dict) -> list[float]` and `def margin(p: list[float]) -> float` (in parity_check, tested).
 
 - [ ] **Step 1: Write the failing tests** (`tools/tests/test_decision_tools.py`)
@@ -6019,18 +6072,15 @@ Each model task is manual (it needs OpenVINO and downloads), stays under 7 GB pe
 
 The dump is opened in append mode, so every task first removes the previous files: `rm -f $RUN/<model>.jsonl $RUN/<model>.parity.jsonl $RUN/<model>.golden.jsonl`. Every path is under the private `$RUN` (Global Constraints), never `/tmp`.
 
-Each single-box task starts its server with `serve` and stops it with `stop_server` at the end of the task (Step 4b), so the next task's health wait can never pass against the previous model. `serve` refuses to start while :8080 still answers. It records the server's PID in `$RUN/<name>.pid`, fails if that process exits before `/health` turns ready, and checks that `/v1/models` names the tree it started (the model id defaults to the `--model` directory name). `stop_server` kills only that recorded PID and waits for it to exit. Never use `pkill -f`: other sessions on this machine run their own `cascadia` processes.
+Each single-box task starts its server with `serve` and stops it with `stop_server` at the end of the task (Step 4b), so the next task's health wait can never pass against the previous model. `serve` refuses to start while anything listens on :8080 (`port_free`, which lists sockets and never connects). It records the server's PID in `$RUN/<name>.pid`, fails if that process exits or `$READY_S` passes before `/health` turns ready, and checks that `/v1/models` names the tree it started (the model id defaults to the `--model` directory name). `stop_server` kills only that recorded PID and waits for it to exit. Never use `pkill -f`: other sessions on this machine run their own `cascadia` processes.
 
 ```bash
 serve() {        # serve NAME TREE [cascadia run flags...]
   local name=$1 tree=$2; shift 2
-  ! curl -sf http://127.0.0.1:8080/health > /dev/null || { echo ":8080 is still serving: stop_server the previous task first"; return 1; }
-  cascadia run "$tree" "$@" > $RUN/$name-server.log 2>&1 &
+  port_free 8080 || { echo "stop_server the previous task first"; return 1; }
+  RUST_LOG=info cascadia run "$tree" "$@" > $RUN/$name-server.log 2>&1 &
   echo $! > $RUN/$name.pid
-  until curl -sf http://127.0.0.1:8080/health > /dev/null; do
-    kill -0 $(cat $RUN/$name.pid) 2>/dev/null || { echo "$name server exited; see $RUN/$name-server.log"; return 1; }
-    sleep 2
-  done
+  wait_health "$(cat $RUN/$name.pid)" "$READY_S" || { echo "see $RUN/$name-server.log"; return 1; }
   curl -s http://127.0.0.1:8080/v1/models | grep -qF "$(basename "$tree")" || { echo ":8080 is not serving $tree"; return 1; }
 }
 stop_server() {  # stop_server NAME
@@ -6150,10 +6200,10 @@ Expected: `kev: 86 passes match kev.questions` (82 + 4 synthetic), and `kev: ser
 CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision/reference_stream.py kev --weights ~/models/qwen35-9b-base \
     --lora ~/models/kev9b/adapter_model.safetensors --tree ~/trees/kev9b-int8 \
     --dump $RUN/kev9b.parity.jsonl --out $RUN/kev9b-ref.json
-$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref $RUN/kev9b-ref.json
+$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref $RUN/kev9b-ref.json --answers-out $RUN/kev9b-single.answers.json
 ```
 
-Expected: `PASS` (spike: 82/82).
+Expected: `PASS` (spike: 82/82), then `saved 82 answers to $RUN/kev9b-single.answers.json` (Step 4d gates the pipeline tree against them).
 
 - [ ] **Step 4b: OpenAI route equivalence**: `$PY tools/decision/openai_equivalence.py --url http://127.0.0.1:8080`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`. Then stop the server: `stop_server kev9b`.
 
@@ -6180,7 +6230,49 @@ Expected: `PASS` (spike: 82/82).
 
   Expected: `cache=default 200`, `cache=0.001 413` (body mentions prefix reuse, time far below the default run's), `cache=0 413`. The tree's `decision.json` is restored byte for byte.
 
-- [ ] **Step 5: Docs and commit** (Kev-9B section; `git commit -m "docs(decisions): Kev-9B recipe and measured parity"`)
+- [ ] **Step 4d: Pipeline acceptance (one host, two processes).** Kev's pointer head runs on the last rank over the final hidden state, and its pipeline budget has no prefix discount; neither is exercised by the single-box steps. Export a 2-stage tree, start it with `start_ranks`/`stop_ranks` from Task 15 Step 6 (the single-box server is already stopped in Step 4b), and repeat the parity, golden and reference checks against it. Then gate it against the single-box run: every question's top-1 must equal Step 4's saved answers (`--min-agree 1 --confident 0`: any flip fails).
+
+  ```bash
+  CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision_export.py kev --base-ir ~/models/qwen35-9b-int8 --weights ~/models/qwen35-9b-base \
+      --lora ~/models/kev9b/adapter_model.safetensors --head-pt ~/models/kev9b/head.pt --stages 2 --out ~/trees/kev9b-int8-2st
+  rm -f $RUN/kev9b-2st.jsonl $RUN/kev9b-2st.parity.jsonl $RUN/kev9b-2st.golden.jsonl
+  start_ranks ~/trees/kev9b-int8-2st $RUN/kev9b-2st.jsonl || { echo "ABORT: the Kev pipeline did not come up; stop here"; stop_ranks; false; }
+  $PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump $RUN/kev9b-2st.jsonl
+  $PY tools/decision/codec_golden.py kev --url http://127.0.0.1:8080 --dump $RUN/kev9b-2st.jsonl --tokenizer ~/models/kev9b --answers
+  $PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref $RUN/kev9b-ref.json
+  $PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref $RUN/kev9b-single.answers.json --min-agree 1 --confident 0
+  stop_ranks
+  ```
+
+  Expected, in order: `wrote 82 passes for 50 records to $RUN/kev9b-2st.parity.jsonl`; `kev: 86 passes match kev.questions` and answers N ≥ 81 of 82 against `reference_kev.pt`; `PASS` against the torch reference; `PASS agreement 82/82` against the single-box answers.
+
+  **No prefix discount in pipeline mode.** With Step 4c's `max_total_tokens: 20000` profile, `$RUN/kev-long.json` (about 45k tokens over its 5 passes in full) must be refused with a 413 at admission, before any prefill. The message is the plain budget one, `this request needs N prefill tokens; the per-request limit is 20000` with N > 20000, not the single box's `without prefix reuse` one, and the dump gains no line for it.
+
+  ```bash
+  D2=~/trees/kev9b-int8-2st/decision.json
+  cp $D2 $RUN/kev9b-2st-decision.json.orig
+  $PY -c 'import json, sys; p = sys.argv[1]; d = json.load(open(p)); d["max_total_tokens"] = 20000; json.dump(d, open(p, "w"))' $D2
+  rm -f $RUN/kev9b-2st-budget.jsonl
+  start_ranks ~/trees/kev9b-int8-2st $RUN/kev9b-2st-budget.jsonl || { echo "ABORT: the Kev pipeline did not come up"; stop_ranks; false; }
+  curl -s -H 'content-type: application/json' --data-binary @$RUN/kev-long.json http://127.0.0.1:8080/v1/systemone \
+      -o $RUN/kev-2st-budget.json -w "pipeline %{http_code} %{time_total}s\n"
+  stop_ranks
+  cp $RUN/kev9b-2st-decision.json.orig $D2
+  $PY - <<'EOF'
+  import json, os, re
+  run = os.environ["RUN"]
+  err = json.load(open(f"{run}/kev-2st-budget.json"))["error"]
+  m = re.fullmatch(r"this request needs (\d+) prefill tokens; the per-request limit is 20000", err)
+  assert m and int(m.group(1)) > 20000, err
+  dump = f"{run}/kev9b-2st-budget.jsonl"
+  assert not os.path.exists(dump) or os.path.getsize(dump) == 0, "a refused request reached the dump"
+  print("pipeline 413 at admission:", err)
+  EOF
+  ```
+
+  Expected: `pipeline 413` with a `time_total` far below one cold prefill of the state (nothing was prefilled), then `pipeline 413 at admission: …`. The tree's `decision.json` is restored byte for byte.
+
+- [ ] **Step 5: Docs and commit** (Kev-9B section, including the pipeline results; `git commit -m "docs(decisions): Kev-9B recipe and measured parity"`)
 
 ### Task 20: Clef-flash
 
@@ -6220,47 +6312,64 @@ Expected: `clef: 54 records match encode_record` (50 + 4 synthetic; the 50 also 
 CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision/reference_stream.py clef --weights ~/models/clef-flash \
     --clef-dir ~/models/clef-flash --tree ~/trees/clef-flash-int8 \
     --dump $RUN/clef-flash.parity.jsonl --out $RUN/clef-flash-ref.json
-$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref $RUN/clef-flash-ref.json
+$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref $RUN/clef-flash-ref.json --answers-out $RUN/clef-flash-single.answers.json
 ```
 
-Expected: `PASS` (spike: 82/82).
+Expected: `PASS` (spike: 82/82), then `saved 82 answers to $RUN/clef-flash-single.answers.json` (Step 4c gates the pipeline tree against them).
 
 - [ ] **Step 4b: OpenAI route equivalence**: `$PY tools/decision/openai_equivalence.py --url http://127.0.0.1:8080`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`. Then stop the server: `stop_server clef-flash`.
 
-- [ ] **Step 5: Docs and commit** (Clef-flash section; `git commit -m "docs(decisions): Clef-flash recipe and measured parity"`)
+- [ ] **Step 4c: Pipeline acceptance (one host, two processes).** The joint head runs on the last rank over the whole request's hidden states; on hardware it is otherwise exercised in pipeline mode only by the two-machine Clef-27B run. Export a 2-stage tree, start it with `start_ranks`/`stop_ranks` from Task 15 Step 6 (the single-box server is already stopped in Step 4b), repeat the parity, golden and reference checks, and gate it against the single-box answers from Step 4.
+
+  ```bash
+  CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision_export.py clef --base-ir ~/models/qwen35-9b-int8 --weights ~/models/clef-flash \
+      --clef-dir ~/models/clef-flash --stages 2 --out ~/trees/clef-flash-int8-2st
+  rm -f $RUN/clef-flash-2st.jsonl $RUN/clef-flash-2st.parity.jsonl $RUN/clef-flash-2st.golden.jsonl
+  start_ranks ~/trees/clef-flash-int8-2st $RUN/clef-flash-2st.jsonl || { echo "ABORT: the Clef-flash pipeline did not come up; stop here"; stop_ranks; false; }
+  $PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump $RUN/clef-flash-2st.jsonl
+  $PY tools/decision/codec_golden.py clef --url http://127.0.0.1:8080 --dump $RUN/clef-flash-2st.jsonl --tokenizer ~/models/clef-flash --answers
+  $PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref $RUN/clef-flash-ref.json
+  $PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref $RUN/clef-flash-single.answers.json --min-agree 1 --confident 0
+  stop_ranks
+  ```
+
+  Expected, in order: `wrote 50 passes for 50 records to $RUN/clef-flash-2st.parity.jsonl`; `clef: 54 records match encode_record` and answers N ≥ 81 of 82 against `reference_flash.pt`; `PASS` against the torch reference; `PASS agreement 82/82` against the single-box answers.
+
+- [ ] **Step 5: Docs and commit** (Clef-flash section, including the pipeline results; `git commit -m "docs(decisions): Clef-flash recipe and measured parity"`)
 
 ### Two-machine runbook (Tasks 21 and 22)
 
 Host A runs rank 0 (the API, the dump and every tool); host B runs rank 1. `RANK1_HOST` is host B's LAN address. Both hosts need the **whole tree at the same `--model` path** (rank ≥ 1 reads `config.json` and, as the last rank, the `decision/` assets), the same branch build of `cascadia`, and OpenVINO 2026.4.1. Each task sets `TREE` and `MODEL` on both hosts (Task 21: `TREE=jev27b-int8 MODEL=jev27b`; Task 22: `TREE=clef-int8 MODEL=clef27b`).
 
-Every check aborts. `start_rank1` and `start_rank0` print why and return status 1 in three cases: the port is already in use, the rank exits before it is ready, or (rank 0) `/v1/models` does not name `$TREE`. The calls below then print `ABORT …` and keep the non-zero status. **On ABORT, stop. Do not run the task's steps against whatever answers on the port.**
+Run the Global Constraints preamble on **both** hosts first: it defines `port_free`, `wait_log`, `wait_health` and `READY_S`. Readiness comes only from each rank's own log. **Never test :7801 by connecting to it** (`nc -z`, `curl`, `telnet`): rank 1 accepts exactly one upstream connection, and a probe would take that slot, leaving rank 0's real dial unanswered.
+
+Every check aborts. `start_rank1` and `start_rank0` print why and return status 1 when:
+- the port already has a listener (`port_free`: :7801 on host B, :8080 on host A);
+- the rank exits, or does not log its readiness line in time (rank 1: `ActivationServer listening` within 120 s; rank 0: `qwen36 pipeline handshake ok` within `$READY_S`);
+- (rank 0) its log shows the startup handshake failing (`qwen35 startup handshake failed`, a handshake mismatch), a failed warmup or a panic. Rank 0 keeps serving `/health` after a failed handshake, so `/health` alone is not readiness;
+- (rank 0) `/health` does not come up, or `/v1/models` does not name `$TREE`. The calls below then print `ABORT …` and keep the non-zero status. **On ABORT, stop. Do not run the task's steps against whatever answers on the port.**
 
 ```bash
 # on host A, after the export
 rsync -a ~/trees/$TREE/ RANK1_HOST:trees/$TREE/
 # host B (rank 1 listens on the LAN; start it first). $RUN is the same private dir on both hosts.
 start_rank1() {
-  command -v nc > /dev/null || { echo "start_rank1 needs nc (netcat) for its port checks"; return 1; }
-  ! nc -z 127.0.0.1 7801 2> /dev/null || { echo ":7801 is already in use: stop the previous rank 1 first"; return 1; }
-  cascadia worker --model ~/trees/$TREE --engine qwen35 --device CPU --rank 1 --total 2 --listen 0.0.0.0:7801 > $RUN/rank1.log 2>&1 &
+  port_free 7801 || { echo "stop the previous rank 1 first"; return 1; }
+  RUST_LOG=info cascadia worker --model ~/trees/$TREE --engine qwen35 --device CPU --rank 1 --total 2 --listen 0.0.0.0:7801 > $RUN/rank1.log 2>&1 &
   echo $! > $RUN/rank1.pid
-  until nc -z 127.0.0.1 7801 2> /dev/null; do
-    kill -0 $(cat $RUN/rank1.pid) 2>/dev/null || { echo "rank 1 exited; see $RUN/rank1.log"; return 1; }
-    sleep 2
-  done
+  wait_log $RUN/rank1.log "$(cat $RUN/rank1.pid)" 120 'ActivationServer listening' 'panicked'
 }
 start_rank1 || { echo "ABORT: rank 1 did not start; fix it before going on"; false; }
 # host A (rank 0 dials rank 1 once, at startup; the API stays on loopback because the dump holds request text)
 start_rank0() {
-  ! curl -sf http://127.0.0.1:8080/health > /dev/null || { echo ":8080 is still serving: stop the previous task's server first"; return 1; }
+  port_free 8080 || { echo "stop the previous task's server first"; return 1; }
   rm -f $RUN/$MODEL.jsonl $RUN/$MODEL.parity.jsonl $RUN/$MODEL.golden.jsonl
-  cascadia worker --model ~/trees/$TREE --engine qwen35 --device CPU --rank 0 --total 2 --next RANK1_HOST:7801 \
+  RUST_LOG=info cascadia worker --model ~/trees/$TREE --engine qwen35 --device CPU --rank 0 --total 2 --next RANK1_HOST:7801 \
       --api 127.0.0.1:8080 --decision-dump $RUN/$MODEL.jsonl > $RUN/rank0.log 2>&1 &
   echo $! > $RUN/rank0.pid
-  until curl -sf http://127.0.0.1:8080/health > /dev/null; do
-    kill -0 $(cat $RUN/rank0.pid) 2>/dev/null || { echo "rank 0 exited; see $RUN/rank0.log"; return 1; }
-    sleep 2
-  done
+  wait_log $RUN/rank0.log "$(cat $RUN/rank0.pid)" "$READY_S" 'qwen36 pipeline handshake ok' \
+      'startup handshake failed|handshake mismatch|warmup failed|panicked' || return 1
+  wait_health "$(cat $RUN/rank0.pid)" "$READY_S" || return 1
   curl -s http://127.0.0.1:8080/v1/models | grep -qF "$TREE" || { echo ":8080 is not serving $TREE"; return 1; }
 }
 start_rank0 || { echo "ABORT: rank 0 is not serving $TREE; stop here"; false; }
@@ -6288,13 +6397,13 @@ $PY tools/decision/backbone_diff.py Qwen/Qwen3.8-27B ~/models/jev27b --adapter ~
 
 `backbone_diff.py` matches tensors by layer index and suffix, so a text-only `model.layers.N.*` checkpoint lines up with a VLM `model.language_model.layers.N.*` one. It hashes every backbone tensor (all projections, norms, embeddings, the final norm and lm_head). With `--adapter`, it also checks whether every difference falls on a module that JEV's own LoRA targets. It ends with one line:
 - `VERDICT: STOCK` (exit 0): the backbone is stock Qwen3.8-27B. Export without `--weights`. The reference runs with `--lora`.
-- `VERDICT: FINETUNED` (exit 0): this is an independent fine-tune. Either at least one difference lies outside the adapter's target modules, or every difference is on a target but the merge check found it unrelated to the adapter's delta. Export with `--weights ~/models/jev27b --weights-not-merged`; the flag states that the shards do not already hold the adapter, and the exporter refuses `jev --weights` without it. The reference runs with `--lora`. `swap_stage` never swaps `lm_head`, and JEV reads verbalizer logits from it. So if the per-tensor lines show `lm_head.weight` DIFF, stop and extend `swap_stage` to the lm_head constants before continuing.
+- `VERDICT: FINETUNED` (exit 0): this is an independent fine-tune. Either at least one difference lies outside the adapter's target modules, or every difference is on a target but the merge check found it unrelated to the adapter's delta and clearly beyond rounding. Export with `--weights ~/models/jev27b --weights-not-merged`; the flag states that the shards do not already hold the adapter, and the exporter refuses `jev --weights` without it. The reference runs with `--lora`. `swap_stage` never swaps `lm_head`, and JEV reads verbalizer logits from it. So if the per-tensor lines show `lm_head.weight` DIFF, stop and extend `swap_stage` to the lm_head constants before continuing.
 - `VERDICT: MERGED` (exit 3): every differing tensor is one of the adapter's target modules, **and** the merge check proved it. For the one or two smallest differing targets, the shard minus the stock tensor equals scale·`lora_B`@`lora_A` within bf16 rounding (the `merge check …` lines show the cosine and the residual). The upload holds the stock backbone with this LoRA merged in. Exporting those shards with the adapter grafted again would apply it twice, and a reference built the same way would agree, so parity would pass on a wrong model. Instead:
   - export as for STOCK (no `--weights`; the adapter is grafted onto the stock IR);
   - run the reference on JEV-27B's own shards **without** `--lora`, because the adapter is already in them.
 
   The two sides then come from different weights. If the merge was anything other than this adapter on the stock base, parity fails instead of passing.
-- `VERDICT: UNKNOWN` (exit 2): nothing comparable was found, or the merge question could not be settled. Examples: no common layers, a dtype or shape difference, lm_head, embed or the final norm present on one side only (tied vs untied heads), adapter targets that match none of the tensors, or every difference on a target but a merge check that neither proved nor refuted the merge (the `merge check …` lines say why). **Stop** and inspect the two repos' headers and those lines; do not export.
+- `VERDICT: UNKNOWN` (exit 2): nothing comparable was found, or the merge question could not be settled. Examples: no common layers, a dtype or shape difference, lm_head, embed or the final norm present on one side only (tied vs untied heads), adapter targets that match none of the tensors, or every difference on a target but a merge check that neither proved nor refuted the merge, for example an adapter delta below bf16's resolution (the `merge check …` lines say why). **Stop** and inspect the two repos' headers and those lines; do not export.
 
 In every case the reference (Step 4) runs on JEV-27B's **own** shards, so it is independent of the verdict. A wrong STOCK verdict then fails parity instead of passing a circular one.
 
@@ -6374,6 +6483,7 @@ Expected: `PASS`, with the same escalation rule as Task 21.
 
 - **Spec coverage:**
   - All five models: Tasks 18–22, one each (export → serve → golden → reference → parity → docs).
+  - Pipeline mode, per family: JEV-9B two processes on one host (Task 15 Step 6, frames and recovery), Kev-9B and Clef-flash two processes on one host with parity, golden and top-1 equal to the single box (Task 19 Step 4d, Task 20 Step 4c), JEV-27B and Clef-27B on two machines (Tasks 21 and 22).
   - API: Tasks 3, 4 and 8 (docs/decisions.md starts in Task 8).
   - Codecs: Tasks 5–7.
   - Engine, single box and pipeline: Tasks 9–11.
