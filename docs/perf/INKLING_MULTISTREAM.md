@@ -95,7 +95,7 @@ the real thing. Ranks hold `[0,3) [3,5) [6,8) [9,11)` (rank 0: the two
 dense layers + one MoE + embed; two MoE layers per NUC; head on rank 3): a
 32 GB box cannot hold three MoE layers (23 GB) next to Windows.
 `CASCADIA_STREAMS=16`, four groups in flight, 32-token answers, load from
-the miner over the LAN (`lan_load.py`), rates from rank 0's log.
+a client on the LAN, rates from rank 0's log.
 
 **Plain memory-mapped experts (the OS page cache holds the slice):**
 
@@ -182,42 +182,25 @@ cannot hold their layers and reading a token's experts on several NVMes at
 once is worth 64 network rounds. For the installation, run the pipeline with
 streams; keep the star as a fallback if boxes turn out smaller than 64 GB.
 
-## Deploying 12 boxes offline
+## Restarts
 
-Rank `r` of 12 needs only its layer slice: `manifest.json`, the tokenizer
-files, `shells/layer_NN.safetensors`, `experts/layer_NN/`, optionally
-`attn_ov/layer_NN/`, plus `embed.safetensors` on rank 0 and
-`head.safetensors` (+ `head_ov/`) on rank 11 — 36 to 48 GB per box, from the
-export on the miner's portable SSD. Each box runs
-
-```
-cascadia worker --rank r --total 12 --engine sparse-moe --model <slice dir> \
-  --listen :91<r> --next <ip of r+1>:91<r+1> [--api :8000 on rank 0]
-```
-
-with the promoted CPU read profile (`tools/inkling_autolab/ptl-profile.ps1`),
-`CASCADIA_STREAMS=<slots>` identical on every rank, and, where the iGPU is
-used, `CASCADIA_INKLING_OV_ATTN=1 CASCADIA_INKLING_OV_ATTN_DIR=attn_ov_int8
-CASCADIA_INKLING_OV_ATTN_DROP_RUST=1 CASCADIA_INKLING_OV_HEAD=1` (last rank).
-Start the last rank first, rank 0 last (or in any order under a supervisor:
-ranks retry their downstream until it accepts).
-
-**Restarts.** A worker rank exits when a neighbour goes away, by design (its
-listener accepts exactly once, so a fresh process is the only clean
-reconnect), so every rank runs under a supervisor that relaunches it: the
-installers use systemd `Restart=always` and a scheduled-task loop. Rank 0 is
-the exception: it is a client of rank 1, so it keeps its process and its API
-and dials again in place. Before admitting a request on an idle link it
+A worker rank exits when a neighbour goes away, by design: its listener
+accepts exactly once, so a fresh process is the only clean reconnect. Run
+every worker rank under a supervisor that starts it again. Rank 0 is the
+exception: it is a client of rank 1, so it keeps its process and its API
+and dials again in place. Before it admits a request on an idle link it
 probes the socket (the downstream never sends unsolicited bytes, so EOF, an
-error or data means dead or out of sync), and a latched wire failure aborts
-the open streams and re-dials with a 2 s budget at most every 3 s.
+error or data means dead or out of sync). While no request is in progress,
+a background keeper does the same probe every 2 s and dials again when the
+link is dead. A latched wire failure aborts the open streams and dials
+again with a 2 s budget at most every 3 s.
 
 What that looks like from outside, measured on the four-box bed:
 
-- a box restarts or is re-installed: the ranks behind rank 0 restart once
-  (about five seconds plus load time); the next request is served on a fresh
-  connection and does not fail (rank 0's log: `downstream link found dead
-  while idle; re-dialing`, reconnected 22 ms later);
+- a box restarts: the ranks behind rank 0 restart once (about five seconds
+  plus load time); the next request is served on a fresh connection and
+  does not fail (rank 0's log: `downstream link found dead while idle;
+  re-dialing`, reconnected 22 ms later);
 - a request made while a rank is still down waits on rank 1, which is itself
   waiting for its neighbour: it completes if the box comes back within rank
   1's 300 s connect budget and fails otherwise; requests after that fail
@@ -225,21 +208,12 @@ What that looks like from outside, measured on the four-box bed:
 - an idle pipeline stays up. It did not before: the last rank waited for its
   next frame in a receive the transport bounds at 900 s, so every 15 minutes
   of silence the pipeline rebuilt itself. The last rank now waits with the
-  same peek the middle ranks use, and the installers also set
-  `CASCADIA_FRAME_IDLE_CEILING_SECS=0` (which is what protects binaries
-  built before that change).
+  same readiness peek the middle ranks use. For binaries built before that
+  change, set `CASCADIA_FRAME_IDLE_CEILING_SECS=0` on every rank.
 
-Bugs found on the bed along the way, all fixed on this branch: rank 0 kept
-serving a dead socket's error until restarted by hand (first made to exit,
-`b7336add`, then replaced by the in-place re-dial, `ea7a54ed`); the last rank
-spun forever on `worker recv_kind failed: not connected` after its upstream
-reset, so the restarted middle rank could never reconnect (`44f6b909`); the
-Windows installer unregistered the previous task without ending its
-`run.ps1` loop, which relaunched an orphan that held port 8000 (`9a33b412`);
-the 15-minute idle teardown (`5bf7f9b1`, `ea7a54ed`).
-
-The `cascadia-array` control plane
-does exactly this for a ring of Windows boxes (bundled DHCP + mDNS, USB
-enrollment, artifact pull over LAN HTTP, reverse-order start, health polls);
-what it lacks for Inkling is the per-rank slice packaging, an env profile in
-the plan, and a concurrent load generator — see its `docs/INKLING.md`.
+Bugs found on the bed along the way, all fixed in this change: rank 0 kept
+serving a dead socket's error until it was restarted by hand (now it dials
+again in place); the last rank spun forever on `worker recv_kind failed:
+not connected` after its upstream reset, so the restarted middle rank could
+never reconnect (now it exits for its supervisor); the 15-minute idle
+teardown described above.
