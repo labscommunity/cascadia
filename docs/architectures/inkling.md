@@ -364,7 +364,11 @@ per layer). `inkling/ov_moe.rs` runs them: `CASCADIA_INKLING_OV_MOE=1`
 (`_OV_MOE_DEVICE`, `_OV_MOE_CACHE_DIR`, `_OV_MOE_OFFLOAD` = the plugin's
 `OFFLOAD_RATIO`), one call per layer per token or per prefill batch,
 precedence over the per-expert backend for layers that have an IR, per-layer
-fallback otherwise.
+fallback otherwise. `_OV_MOE_PRECISION` sets the plugin's
+`INFERENCE_PRECISION_HINT` and defaults to `f32`. At `f16`, the fused layers
+of the deeper ranks of the full 66-layer model overflow half precision and
+every logit comes out NaN (the pipeline then emits token 0, `!`, at every
+step). Layers 0–10 alone did not show it.
 
 Findings on the Arc B390 (driver 32.0.101.8860, OpenVINO 2026.3.1 and the
 2026.5 nightly), all reproduced on Intel's own optimum-intel Qwen3-MoE
@@ -472,8 +476,9 @@ at load and frees the five bf16 projection tables (264 MB per layer,
 copy in unified memory. A layer whose IR fails to compile keeps its
 tables; after a release a refused backend call is fatal and says so. On a
 64 GB box that RAM is what the expert cache lives on
-(`CASCADIA_INKLING_EXPERT_CACHE_MIB`, now allowed up to 1024 per layer),
-which is the point. `CASCADIA_INKLING_OV_MOE_LAYERS=2,3,4` restricts the
+(`CASCADIA_INKLING_EXPERT_CACHE_MIB`, now allowed up to 16384 per layer),
+which is the point. A resident rank sets it at or above a layer's ~7.7 GiB
+of experts, so that its slice stays in RAM. `CASCADIA_INKLING_OV_MOE_LAYERS=2,3,4` restricts the
 fused-MoE backend to a subset of the layers that have IRs (the Windows
 rank budget below).
 
@@ -563,6 +568,14 @@ the way to get five or six layers per 64 GB; that is unmeasured here.
   rows, a single-stage scheduler (`CASCADIA_STREAMS=N`) and a pipeline wire
   with G micro-batches in flight (`CASCADIA_STREAMS_INFLIGHT`) — see
   [`../perf/INKLING_MULTISTREAM.md`](../perf/INKLING_MULTISTREAM.md).
-  Still open: real-model aggregate numbers on hardware, prefill/decode
-  mixing inside one micro-batch (a prefill currently stalls the other
-  streams for its duration), and per-stream prefix caching.
+  Still open: numbers on a full-length pipeline, prefill/decode mixing
+  inside one micro-batch, and per-stream prefix caching. On a single stage
+  a prefill stalls the other streams for its duration. On the pipeline the
+  other streams' decode frames go between the `StreamFeed` windows of a
+  long prompt; a prompt with no other stream open is fed in one step.
+
+- Per-rank KV-prefix cache and the qwen35-style in-process prefix cache (TTFT).
+- MTP draft head (exported? no — dropped) / n-gram speculative decode: the
+  rewind slack is in place.
+- Vision / audio inputs (encoders dropped).
+- Hot/cold expert residency (`CASCADIA_GLM5_HOTCOLD` port) for paged runs.

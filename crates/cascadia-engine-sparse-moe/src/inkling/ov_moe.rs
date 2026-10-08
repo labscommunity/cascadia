@@ -208,9 +208,9 @@ impl OvMoe {
         }
         // f32, not the plugin's f16: on the full 66-layer model the fused layers of the
         // deeper ranks overflow half precision and every logit comes out NaN (the
-        // pipeline then emits token 0, '!', at every step). Seen on an 11-box fleet;
-        // layers 0-10 alone (the four-box bed) never showed it. f32 is correct on all
-        // 33 fused layers of that fleet. Override with the env var to experiment.
+        // pipeline then emits token 0, '!', at every step). Layers 0-10 alone (the
+        // four-box bed) never showed it. f32 is correct on all 33 fused layers of the
+        // full-model run. Override with the env var to experiment.
         let precision =
             std::env::var("CASCADIA_INKLING_OV_MOE_PRECISION").unwrap_or_else(|_| "f32".into());
         let mut plugin = PluginConfig::new().with("INFERENCE_PRECISION_HINT", precision);
