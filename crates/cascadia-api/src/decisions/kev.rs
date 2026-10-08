@@ -166,7 +166,10 @@ fn option_text(
     Ok(match desc {
         None | Some(OrderedValue::Null) => name.to_string(),
         Some(OrderedValue::String(s)) if s.is_empty() => name.to_string(),
-        Some(d) => format!("{name}: {}", b.render(d)?),
+        Some(d) => {
+            b.take(": ")?;
+            format!("{name}: {}", b.render(d)?)
+        }
     })
 }
 
@@ -415,6 +418,30 @@ mod tests {
         .unwrap();
         let c = KevCodec::new(tok(), KevProfile { temperature: 1.0 }, 1000, 2).unwrap();
         assert!(matches!(c.encode(&r), Err(DecisionError::TooLong(_))));
+        // Option text "name: desc" is charged in full, separator included: state "a" (1) +
+        // "no: x" (5) is 6 bytes, so a 5-byte budget fits only if ": " were free.
+        let r: DecisionRequest = serde_json::from_str(
+            r#"{"model": "m", "state": "a", "questions": {"u": {"type": "noul", "criteria": {"false": "x"}}}}"#,
+        )
+        .unwrap();
+        let mut b = Budget {
+            left: 5,
+            total: 5,
+            tokens: 0,
+        };
+        b.render(&r.state).unwrap();
+        let crit = r.questions["u"].criteria.as_ref().unwrap();
+        assert!(option_text("no", crit.get("false"), &mut b).is_err());
+        let mut b = Budget {
+            left: 6,
+            total: 6,
+            tokens: 0,
+        };
+        assert_eq!(
+            option_text("no", crit.get("false"), &mut b).unwrap(),
+            "no: x"
+        );
+        assert_eq!(b.left, 1, "6 - len(\"no: x\")");
     }
 
     #[test]
