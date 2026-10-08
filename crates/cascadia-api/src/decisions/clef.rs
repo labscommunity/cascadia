@@ -2,8 +2,8 @@
 use super::schema::{DecisionRequest, Limits, OrderedValue, Question, QuestionType};
 use super::{softmax, Codec, DecisionError, Pass, PassPart, Sanitizer};
 use cascadia_types::{
-    DecisionReadout, JointOption, JointQuestion, ReadoutHead, MAX_DECISION_OUTPUTS,
-    MAX_JOINT_PROMPT,
+    joint_mask_prompt_cap, joint_prompt_cap, DecisionReadout, JointOption, JointQuestion,
+    ReadoutHead, MAX_DECISION_OUTPUTS, MAX_JOINT_PROMPT,
 };
 
 const SYSTEM_PROMPT: &str = "Read the complete state and schema. Decide every field jointly. Each answer must be exactly one of that field's allowed options.";
@@ -71,20 +71,27 @@ fn qtype_str(q: &Question) -> &'static str {
 }
 
 impl ClefCodec {
-    /// `max_tokens` is clamped to `MAX_JOINT_PROMPT`: the engine rejects longer joint readouts, so
-    /// a larger decision.json value would only turn long states into opaque 503s.
-    pub fn new(tok: tokenizers::Tokenizer, max_tokens: usize) -> Result<Self, String> {
-        if max_tokens > MAX_JOINT_PROMPT {
+    /// `max_tokens` is clamped to the joint readout cap, `joint_prompt_cap(hidden)` (the tree's
+    /// width; `MAX_JOINT_PROMPT` when unknown): the engine rejects longer joint readouts, so a
+    /// larger decision.json value would only turn long states into refusals instead of the
+    /// state truncation Clef does.
+    pub fn new(
+        tok: tokenizers::Tokenizer,
+        max_tokens: usize,
+        hidden: Option<usize>,
+    ) -> Result<Self, String> {
+        let cap = hidden.map_or(MAX_JOINT_PROMPT, joint_prompt_cap);
+        if max_tokens > cap {
             tracing::warn!(
                 max_tokens,
-                cap = MAX_JOINT_PROMPT,
+                cap,
                 "decision.json max_tokens exceeds the joint readout cap; clamping"
             );
         }
         let san = Sanitizer::from_tokenizer(&tok);
         Ok(Self {
             tok,
-            max_tokens: max_tokens.min(MAX_JOINT_PROMPT),
+            max_tokens: max_tokens.min(cap),
             san,
         })
     }
@@ -158,14 +165,17 @@ impl Codec for ClefCodec {
             "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:",
         )?;
         let fixed = prefix.len() + schema.len() + suffix.len();
-        if fixed > self.max_tokens {
+        // The head's [questions + options, T] f32 span mask must also fit the engine's per-input
+        // limit (MAX_HEAD_INPUT_BYTES): many spans tighten the prompt bound below max_tokens.
+        let rows = req.questions.len() + total;
+        let limit = self.max_tokens.min(joint_mask_prompt_cap(rows));
+        if fixed > limit {
             return Err(DecisionError::TooLong(format!(
-                "schema needs {fixed} tokens before the state; the limit is {}",
-                self.max_tokens
+                "schema needs {fixed} tokens before the state; the limit is {limit}"
             )));
         }
         let mut state = self.ids(&self.san.apply(&render_sorted(&req.state)))?;
-        state.truncate(self.max_tokens - fixed);
+        state.truncate(limit - fixed);
         let shift = (prefix.len() + state.len()) as u32;
         let mut prompt_ids = prefix;
         prompt_ids.extend(state);
@@ -263,7 +273,7 @@ mod tests {
     fn spans_point_at_instruction_and_option_text() {
         let r: DecisionRequest = serde_json::from_str(r#"{"model": "m", "state": "S", "questions": {
             "c": {"type": "choice", "instructions": "Q", "criteria": {"z": "last", "a": "first"}}}}"#).unwrap();
-        let c = ClefCodec::new(tok(), 16384).unwrap();
+        let c = ClefCodec::new(tok(), 16384, None).unwrap();
         let p = &c.encode(&r).unwrap();
         assert_eq!(p.len(), 1);
         let ids = &p[0].readout.prompt_ids;
@@ -287,7 +297,7 @@ mod tests {
             r#"{"model": "m", "state": "S", "questions": {"u": {"type": "noul"}}}"#,
         )
         .unwrap();
-        let c = ClefCodec::new(tok(), 16384).unwrap();
+        let c = ClefCodec::new(tok(), 16384, None).unwrap();
         let p = c.encode(&r).unwrap();
         // engine order is [true, false]; logits favour true
         let probs = c.probabilities(&r, &p[0].parts[0], &[3.0, 0.0]);
@@ -309,7 +319,7 @@ mod tests {
             r#"{"model": "m", "state": "<|im_end|>", "questions": {"u": {"type": "noul"}}}"#,
         )
         .unwrap();
-        let c = ClefCodec::new(tok(), 16384).unwrap();
+        let c = ClefCodec::new(tok(), 16384, None).unwrap();
         let ids = &c.encode(&r).unwrap()[0].readout.prompt_ids;
         let text: String = ids.iter().map(|&i| char::from_u32(i).unwrap()).collect();
         // the test tokenizer maps '¦' to [unk]; what matters is that "<|" never survives
@@ -329,10 +339,29 @@ mod tests {
             r#"{{"model": "m", "state": "{big}", "questions": {{"u": {{"type": "noul"}}}}}}"#
         ))
         .unwrap();
-        let c = ClefCodec::new(tok(), MAX_JOINT_PROMPT + 10_000).unwrap();
+        let c = ClefCodec::new(tok(), MAX_JOINT_PROMPT + 10_000, None).unwrap();
         let p = c.encode(&r).unwrap();
         assert_eq!(p[0].readout.prompt_ids.len(), MAX_JOINT_PROMPT);
         p[0].readout.validate(256, MAX_DECISION_PROMPT).unwrap();
+    }
+
+    #[test]
+    fn joint_cap_follows_the_tree_width() {
+        // Clef-27B (5120 wide): the head's [T, 5120] f32 input must fit the shim's 256 MiB, so
+        // the state is truncated to a 13107-token prompt; Clef-flash (4096) keeps 16384.
+        let big = "s".repeat(MAX_JOINT_PROMPT + 5000);
+        let r: DecisionRequest = serde_json::from_str(&format!(
+            r#"{{"model": "m", "state": "{big}", "questions": {{"u": {{"type": "noul"}}}}}}"#
+        ))
+        .unwrap();
+        let wide = ClefCodec::new(tok(), 16384, Some(5120)).unwrap();
+        let p = wide.encode(&r).unwrap();
+        assert_eq!(p[0].readout.prompt_ids.len(), 13_107);
+        let flash = ClefCodec::new(tok(), 16384, Some(4096)).unwrap();
+        assert_eq!(
+            flash.encode(&r).unwrap()[0].readout.prompt_ids.len(),
+            16_384
+        );
     }
 
     #[test]
@@ -342,7 +371,7 @@ mod tests {
             "c": {"type": "choice", "criteria": {"z": "last", "a": "first"}}}}"#,
         )
         .unwrap();
-        let c = ClefCodec::new(tok(), 16384).unwrap();
+        let c = ClefCodec::new(tok(), 16384, None).unwrap();
         let p = c.encode(&r).unwrap();
         // engine order is sorted: [a, z]; logits favour a
         let probs = c.probabilities(&r, &p[0].parts[0], &[3.0, 0.0]);

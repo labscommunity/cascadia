@@ -38,6 +38,11 @@ fn engine_failure(reason: &str) -> DecisionError {
     if reason.starts_with("decision_unsupported") {
         return DecisionError::NotServed;
     }
+    // The engine's joint input limit (MAX_HEAD_INPUT_BYTES): a too-long request, refused before
+    // any prefill. The codec clamps first, so this only fires for a width the API did not know.
+    if reason.starts_with("decision_too_long") {
+        return DecisionError::TooLong("decision prompt too long for the model's head".into());
+    }
     DecisionError::Engine("decision engine error".into())
 }
 
@@ -201,4 +206,20 @@ pub(crate) async fn evaluate(
         answers.insert(id.clone(), answer_from_probs(q, p));
     }
     Ok((answers, input_tokens))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_joint_input_refusal_is_413_not_503() {
+        let e = engine_failure("decision_too_long: joint readout of 13108 tokens exceeds 13107");
+        assert!(matches!(e, DecisionError::TooLong(_)), "{e:?}");
+        assert_eq!(e.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(matches!(
+            engine_failure("decision_invalid: x"),
+            DecisionError::Engine(_)
+        ));
+    }
 }
