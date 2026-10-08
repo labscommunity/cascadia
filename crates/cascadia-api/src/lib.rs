@@ -3943,6 +3943,8 @@ mod tests {
         vocab.insert("__non_finite__".into(), 999_998);
         // ... and fails a `require_warm` pass containing 999_997 as an evicted snapshot.
         vocab.insert("__evicted__".into(), 999_997);
+        // ... and fails a `needs_snapshot` pass containing 999_996 as a prefix the cache cannot hold.
+        vocab.insert("__uncacheable__".into(), 999_996);
         let model = tokenizers::models::wordlevel::WordLevel::builder()
             .vocab(vocab.into_iter().collect())
             .unk_token("[unk]".into())
@@ -4151,7 +4153,7 @@ mod tests {
 
     #[tokio::test]
     async fn decisions_over_the_total_token_budget_is_413() {
-        // state prefix counted once + 32 branches of ~8 tokens > max_total_tokens = 40
+        // 32 passes of ~11 tokens > max_total_tokens = 40
         let qs: Vec<String> = (0..32)
             .map(|i| format!(r#""q{i}": {{"type": "noul"}}"#))
             .collect();
@@ -4162,11 +4164,12 @@ mod tests {
         let app = make_decision_app_with(1000, 40).await;
         let (status, v, _) = post_decisions(app, &body).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
-        // 3-token prefix (<fim_prefix> a b) + 32 x 8-token branches = 259: the prefill budget, not
-        // the per-pass cap (each pass is 11 tokens), is what rejects it.
+        // 32 passes of 11 tokens (<fim_prefix> a b + an 8-token branch) = 352: the prefill budget,
+        // not the per-pass cap, is what rejects it. A 3-token prefix is under MIN_PREFIX_TOKENS,
+        // which the engine never caches, so it is counted in every pass (P2-CE-2).
         assert_eq!(
             v["error"],
-            "this request needs 259 prefill tokens; the per-request limit is 40"
+            "this request needs 352 prefill tokens; the per-request limit is 40"
         );
     }
 
@@ -4438,6 +4441,7 @@ mod tests {
                     },
                     cache_prefix: None,
                     require_warm: false,
+                    needs_snapshot: false,
                 },
                 parts: vec![decisions::PassPart {
                     question_id: qid,
@@ -4593,10 +4597,50 @@ mod tests {
             v["error"],
             "engine at capacity; retry after current requests complete"
         );
+        // On the discount at all, every later pass resumes (P2-SEC-2): 66 used to let pass 2 run
+        // cold; now the request fails at the first pass that misses its snapshot.
+        let (status, v, _) = post_decisions(make_decision_app_with(1000, 66).await, &body).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
         // A budget that covers every pass cold never asks for a warm resume.
         let (status, v, _) = post_decisions(make_decision_app_with(1000, 100).await, &body).await;
         assert_eq!(status, StatusCode::OK, "{v}");
         assert_eq!(v["usage"]["input_tokens"], 87);
+    }
+
+    #[tokio::test]
+    async fn kev_prefix_the_cache_can_never_hold_is_a_413_not_a_retry() {
+        // P2-SEC-1/2: the engine refuses the FIRST pass (no prefill) when its cache can never hold
+        // the shared prefix; the client is told the full need, not to retry.
+        let state = format!("__uncacheable__{}", " a".repeat(19));
+        let body = format!(
+            r#"{{"model": "m", "state": "{state}", "questions": {{"a": {{"type": "noul"}}, "b": {{"type": "noul"}}, "c": {{"type": "noul"}}}}}}"#
+        );
+        let (status, v, _) = post_decisions(make_decision_app_with(1000, 60).await, &body).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+        assert_eq!(
+            v["error"],
+            "this request needs 87 prefill tokens without prefix reuse (the shared prefix cannot \
+             fit the prefix cache); the per-request limit is 60"
+        );
+        // Within the budget in full: nothing is flagged, the cache is not needed.
+        let (status, v, _) = post_decisions(make_decision_app_with(1000, 87).await, &body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
+    #[tokio::test]
+    async fn kev_state_too_short_to_cache_is_budgeted_in_full() {
+        // P2-CE-2: a 6-token prefix (<state> + 5) is under MIN_PREFIX_TOKENS, which the engine
+        // never snapshots, so it earns no discount: 3 passes of 14 need 42, not 6 + 3 x 8 = 30.
+        let body = r#"{"model": "m", "state": "x a a a a", "questions": {"a": {"type": "noul"}, "b": {"type": "noul"}, "c": {"type": "noul"}}}"#;
+        let (status, v, _) = post_decisions(make_decision_app_with(1000, 30).await, body).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+        assert_eq!(
+            v["error"],
+            "this request needs 42 prefill tokens; the per-request limit is 30"
+        );
+        let (status, v, _) = post_decisions(make_decision_app_with(1000, 42).await, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["usage"]["input_tokens"], 42);
     }
 
     #[tokio::test]
