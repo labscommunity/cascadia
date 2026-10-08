@@ -1,6 +1,7 @@
 """Build a Cascadia decision-model tree (docs/decisions.md).
 
   jev:  python tools/decision_export.py jev  --base-ir STOCK_INT8_IR --adapter-dir JEV/adapter_vllm --out TREE [--stages N]
+        (--weights FT_DIR only for a fine-tuned, NOT LoRA-merged backbone, with --weights-not-merged)
   kev:  python tools/decision_export.py kev  --base-ir STOCK_INT8_IR --weights QWEN35_9B_BASE --lora KEV/adapter_model.safetensors \
                                              --head-pt KEV/head.pt --out TREE
         (--weights and --lora are required; the tree ships KEV/tokenizer.json, the one beside head.pt,
@@ -145,6 +146,9 @@ def main():
     ap.add_argument("--layer-split", default=None)
     ap.add_argument("--weights", default=None, help="HF checkpoint whose weights replace the IR's (clef: defaults to --clef-dir)")
     ap.add_argument("--lora", default=None)
+    ap.add_argument("--weights-not-merged", action="store_true",
+                    help="jev with --weights: state that those shards do NOT already hold the LoRA merged "
+                         "(backbone_diff.py --adapter said FINETUNED, not MERGED); the adapter is grafted on top")
     ap.add_argument("--lora-scale", type=float, default=None, help="override adapter_config.json")
     ap.add_argument("--adapter-dir", default=None, help="jev: dir with decision_head.json + adapter_model.safetensors")
     ap.add_argument("--calibration", default=None, help="jev: calibration.json (default: ADAPTER_DIR/../calibration.json)")
@@ -157,6 +161,12 @@ def main():
     attr, flag = need[a.family]
     if not getattr(a, attr):
         ap.error(f"{a.family} needs {flag}")
+    if a.family == "jev" and a.weights and not a.weights_not_merged:
+        # JEV always grafts its adapter; shards uploaded with that adapter merged in would get it
+        # twice, and a reference built on the same shards with the same --lora agrees (P2-BLD-1).
+        ap.error("jev --weights grafts the adapter onto those shards: pass --weights-not-merged to state "
+                 "they do not already contain it (run tools/decision/backbone_diff.py STOCK_REPO WEIGHTS "
+                 "--adapter ADAPTER_DIR first; VERDICT: MERGED means export without --weights instead)")
     tokenizer = a.tokenizer
     if a.family == "kev":
         # Kev's pointer head was trained on its fine-tuned backbone's hidden states (Base + LoRA):
