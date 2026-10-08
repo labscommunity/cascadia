@@ -3439,14 +3439,6 @@ mod tests {
         max_total_tokens: usize,
         dump: Option<std::path::PathBuf>,
     ) -> Router {
-        let runner = Runner::new(Box::new(MockBuilder::new()));
-        runner
-            .start(
-                PeerLayout::single_stage(),
-                ShardSpec::single_stage("mock-model", "CPU"),
-            )
-            .await
-            .unwrap();
         let words = [
             "[unk]",
             "<|fim_prefix|>",
@@ -3486,9 +3478,35 @@ mod tests {
             max_total_tokens,
         )
         .unwrap();
+        decision_app_with_codec(
+            Box::new(codec),
+            max_tokens,
+            max_total_tokens,
+            dump,
+            Arc::new(ApiStats::default()),
+        )
+        .await
+    }
+
+    /// A mock-engine router serving decisions through `codec` (any family).
+    async fn decision_app_with_codec(
+        codec: Box<dyn decisions::Codec>,
+        max_tokens: usize,
+        max_total_tokens: usize,
+        dump: Option<std::path::PathBuf>,
+        stats: Arc<ApiStats>,
+    ) -> Router {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
         let cfg = Config {
             decisions: Some(Arc::new(decisions::DecisionService {
-                codec: Box::new(codec),
+                codec,
                 max_tokens,
                 max_total_tokens,
                 max_questions: 32,
@@ -3498,13 +3516,7 @@ mod tests {
             max_body_bytes: 1 << 20,
             ..Config::default()
         };
-        make_router_with_config(Arc::new(runner), "mock-model", cfg)
-    }
-
-    /// Same as `post_decisions`; named for tests whose body is large (the router's body limit is
-    /// raised to 1 MiB in `make_decision_app_full`).
-    async fn post_decisions_sized(app: Router, payload: &str) -> (StatusCode, Value, String) {
-        post_decisions(app, payload).await
+        make_router_with_stats(Arc::new(runner), "mock-model", cfg, stats)
     }
 
     /// Raw JSON text: `serde_json::json!` sorts object keys, which would hide question-order bugs.
@@ -3683,7 +3695,7 @@ mod tests {
         );
         assert!(body.len() < 1 << 20);
         let app = make_decision_app_with(100_000, 400_000).await;
-        let (status, v, _) = post_decisions_sized(app, &body).await;
+        let (status, v, _) = post_decisions(app, &body).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
         assert_eq!(
             v["error"],
@@ -3797,8 +3809,7 @@ mod tests {
         let body = format!(
             r#"{{"model": "m", "state": "{big}", "questions": {{"u": {{"type": "noul"}}}}}}"#
         );
-        let (status, v, _) =
-            post_decisions_sized(make_decision_app_with(1000, 4000).await, &body).await;
+        let (status, v, _) = post_decisions(make_decision_app_with(1000, 4000).await, &body).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         // The byte pre-check fired (64000 > 4000 x 8), not a token-count check after encoding.
         assert_eq!(v["error"], "state is 64000 bytes; the limit is 32000");
@@ -3873,6 +3884,7 @@ mod tests {
                 max_options: 16,
                 min_levels: 2,
                 max_levels: 16,
+                image_parts: false,
             }
         }
         fn encode_until(
@@ -3993,6 +4005,224 @@ mod tests {
             2,
             "the refusal is not a request"
         );
+    }
+
+    /// One noul pass with a probability vector one short: a codec bug must be a 503, not a panic
+    /// or a silently truncated answer (QUA-6).
+    struct ShortCodec(GateCodec);
+
+    impl decisions::Codec for ShortCodec {
+        fn limits(&self) -> decisions::schema::Limits {
+            self.0.limits()
+        }
+        fn encode_until(
+            &self,
+            req: &decisions::schema::DecisionRequest,
+            cancel: &std::sync::atomic::AtomicBool,
+        ) -> Result<Vec<decisions::Pass>, decisions::DecisionError> {
+            self.0.encode_until(req, cancel)
+        }
+        fn probabilities(
+            &self,
+            _req: &decisions::schema::DecisionRequest,
+            _part: &decisions::PassPart,
+            _logits: &[f32],
+        ) -> Vec<f64> {
+            vec![1.0]
+        }
+    }
+
+    #[tokio::test]
+    async fn decisions_probability_count_mismatch_is_a_503() {
+        let codec = ShortCodec(GateCodec {
+            started: std::sync::Mutex::new(None),
+            release: std::sync::Mutex::new(None),
+            saw_cancel: Default::default(),
+            finished: Default::default(),
+        });
+        let app =
+            decision_app_with_codec(Box::new(codec), 1000, 4000, None, Default::default()).await;
+        let (status, v, _) = post_decisions(
+            app,
+            r#"{"model": "m", "state": "s", "questions": {"u": {"type": "noul"}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert_eq!(v["error"], "decision engine error");
+    }
+
+    #[tokio::test]
+    async fn kev_score_legend_is_the_rendered_level_text() {
+        let (status, v, _) = post_decisions(
+            make_decision_app().await,
+            r#"{"model": "m", "state": "a", "questions": {"s": {"type": "score", "criteria": [{"name": "x"}, "lo"]}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(
+            v["answers"]["s"]["legend"],
+            serde_json::json!({"0": "name: x", "1": "lo"})
+        );
+    }
+
+    /// One token per character (Clef span arithmetic stays checkable).
+    fn char_tokenizer() -> tokenizers::Tokenizer {
+        let mut vocab: std::collections::HashMap<String, u32> = (32u8..127)
+            .map(|b| ((b as char).to_string(), b as u32))
+            .collect();
+        vocab.insert("\n".into(), 10);
+        vocab.insert("[unk]".into(), 0);
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(vocab.into_iter().collect())
+            .unk_token("[unk]".into())
+            .build()
+            .unwrap();
+        let mut t = tokenizers::Tokenizer::new(model);
+        t.with_pre_tokenizer(Some(
+            tokenizers::pre_tokenizers::split::Split::new(
+                tokenizers::pre_tokenizers::split::SplitPattern::Regex("".into()),
+                tokenizers::SplitDelimiterBehavior::Isolated,
+                false,
+            )
+            .unwrap(),
+        ));
+        t
+    }
+
+    async fn clef_app() -> Router {
+        let codec = decisions::clef::ClefCodec::new(char_tokenizer(), 16384, None).unwrap();
+        decision_app_with_codec(Box::new(codec), 16384, 65536, None, Default::default()).await
+    }
+
+    async fn jev_app() -> Router {
+        let verbalizers: Vec<String> = [
+            "false", "true", "0", "1", "2", "3", "4", "5", "A", "B", "C", "D",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let kinds = |v: [(&str, f64); 3]| v.into_iter().map(|(k, x)| (k.to_string(), x)).collect();
+        let profile = decisions::profile::JevProfile {
+            verbalizer_ids: (100..112).collect(),
+            bias: vec![0.0; 12],
+            verbalizers,
+            slots: [("noul", [0, 2]), ("score", [2, 8]), ("choice", [8, 12])]
+                .into_iter()
+                .map(|(k, r)| (k.to_string(), r))
+                .collect(),
+            temperature: kinds([("noul", 1.0), ("score", 1.0), ("choice", 1.0)]),
+        };
+        let codec = decisions::jev::JevCodec::new(char_tokenizer(), profile)
+            .unwrap()
+            .with_pass_cap(4000);
+        decision_app_with_codec(Box::new(codec), 4000, 16000, None, Default::default()).await
+    }
+
+    fn close(v: &Value, want: f64) -> bool {
+        (v.as_f64().unwrap() - want).abs() < 1e-4
+    }
+
+    #[tokio::test]
+    async fn clef_one_joint_pass_is_sliced_per_question_on_both_routes() {
+        // CMP-2: one joint pass carries every option; the mock returns logits -(i) over all of
+        // them, so the choice gets [0, -1, -2] (sorted keys a, m, z) and the noul [-3, -4]
+        // (Clef order true, false).
+        let (status, v, body) = post_decisions(
+            clef_app().await,
+            r#"{"model": "m", "state": "S", "questions": {
+              "c": {"type": "choice", "instructions": "Q", "criteria": {"z": "zz", "a": "aa", "m": "mm"}},
+              "u": {"type": "noul", "instructions": "U"}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let c = &v["answers"]["c"];
+        assert_eq!(c["choice"], "a");
+        assert!(close(&c["probabilities"]["a"], 0.6652), "{c}");
+        assert!(close(&c["probabilities"]["m"], 0.2447), "{c}");
+        assert!(close(&c["probabilities"]["z"], 0.09), "{c}");
+        // reported in request order
+        let (z, a) = (body.find("\"z\":").unwrap(), body.find("\"a\":").unwrap());
+        assert!(z < a, "{body}");
+        assert!(close(&v["answers"]["u"]["noul"], 0.7311), "{v}");
+        let (status, v) = post_openai(
+            clef_app().await,
+            r#"{"input": "S", "questions": [
+              {"type": "choice", "name": "c", "instructions": "Q", "choices": [{"value": "z"}, {"value": "a"}, {"value": "m"}]},
+              {"type": "predicate", "name": "u", "instructions": "U"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["answers"][0]["choice"], "a");
+        assert_eq!(v["answers"][0]["probabilities"][0]["value"], "z");
+        assert!(close(
+            &v["answers"][0]["probabilities"][1]["probability"],
+            0.6652
+        ));
+        assert!(close(&v["answers"][1]["probability"], 0.7311), "{v}");
+    }
+
+    #[tokio::test]
+    async fn jev_passes_answer_every_kind_on_both_routes() {
+        // CMP-2: one verbalizer pass per question; mock logits -(i) over each pass's slots.
+        let (status, v, _) = post_decisions(
+            jev_app().await,
+            r#"{"model": "m", "state": "S", "questions": {
+              "u": {"type": "noul", "instructions": "U"},
+              "c": {"type": "choice", "instructions": "Q", "criteria": {"x": "1", "y": "2", "w": "3"}},
+              "s": {"type": "score", "instructions": "R", "criteria": ["a", "b", "c", "d"]}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        // noul slots [false, true] get [0, -1]
+        assert!(close(&v["answers"]["u"]["noul"], 0.2689), "{v}");
+        let c = &v["answers"]["c"];
+        assert_eq!(c["choice"], "x");
+        assert!(close(&c["probabilities"]["x"], 0.6652), "{c}");
+        let s = &v["answers"]["s"];
+        let probs = s["probabilities"].as_object().unwrap();
+        assert_eq!(
+            probs.len(),
+            4,
+            "6 JEV score slots rescaled onto 4 levels: {s}"
+        );
+        let total: f64 = probs.values().map(|p| p.as_f64().unwrap()).sum();
+        assert!((total - 1.0).abs() < 1e-3, "{s}");
+        assert_eq!(
+            s["legend"],
+            serde_json::json!({"0": "a", "1": "b", "2": "c", "3": "d"})
+        );
+        let (status, v) = post_openai(
+            jev_app().await,
+            r#"{"input": "S", "questions": [
+              {"type": "predicate", "name": "u", "instructions": "U"},
+              {"type": "choice", "name": "c", "instructions": "Q", "choices": [{"value": "x"}, {"value": "y"}, {"value": "w"}]},
+              {"type": "score", "name": "s", "instructions": "R", "levels": [{"label": "a"}, {"label": "b"}, {"label": "c"}, {"label": "d"}]}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert!(close(&v["answers"][0]["probability"], 0.2689), "{v}");
+        assert_eq!(v["answers"][1]["choice"], "x");
+        assert_eq!(
+            v["answers"][2]["probabilities"].as_array().unwrap().len(),
+            4,
+            "{v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn jev_list_state_image_part_is_400_but_kev_reads_it_as_data() {
+        // EDGE-1: only JEV reads list elements as message parts.
+        let body = r#"{"model": "m", "state": [{"sku": 1, "image": "https://x/1.jpg"}], "questions": {"u": {"type": "noul"}}}"#;
+        let (status, v, _) = post_decisions(jev_app().await, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(
+            v["error"],
+            "image parts in state are not supported (text-only server)"
+        );
+        let (status, v, _) = post_decisions(make_decision_app().await, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let (status, v, _) = post_decisions(clef_app().await, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
     }
 
     /// A router whose model carries a (minimal) tools-capable chat template.
