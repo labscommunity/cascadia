@@ -1185,15 +1185,6 @@ impl Builder for SparseMoEBuilder {
     }
 }
 
-/// Build a SamplingConfig for one task from the request's `temperature` +
-/// `SamplingParams` (top_p / top_k / seed / frequency & presence penalty).
-/// `repetition_penalty` / `repetition_window` are K2.6-tuned defaults not
-/// exposed on the OpenAI surface. Lifted out so the single-stage and
-/// multi-stage entry paths can't drift.
-/// Infer the OpenAI `finish_reason` for a completed decode: hitting the token
-/// cap is `length`; stopping short of it (EOS / stop sequence) is `stop`. The
-/// runner returns the generated ids excluding EOS, so `n >= max_new` means the
-/// cap was the limiter. An EOS landing exactly at the cap reports `length`.
 /// The message carried by a caught forward panic.
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     payload
@@ -1203,6 +1194,15 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "forward panicked".to_string())
 }
 
+/// Build a SamplingConfig for one task from the request's `temperature` +
+/// `SamplingParams` (top_p / top_k / seed / frequency & presence penalty).
+/// `repetition_penalty` / `repetition_window` are K2.6-tuned defaults not
+/// exposed on the OpenAI surface. Lifted out so the single-stage and
+/// multi-stage entry paths can't drift.
+/// Infer the OpenAI `finish_reason` for a completed decode: hitting the token
+/// cap is `length`; stopping short of it (EOS / stop sequence) is `stop`. The
+/// runner returns the generated ids excluding EOS, so `n >= max_new` means the
+/// cap was the limiter. An EOS landing exactly at the cap reports `length`.
 fn finish_reason_for(n_tokens: usize, max_new: usize) -> FinishReason {
     if n_tokens >= max_new {
         FinishReason::Length
@@ -1339,11 +1339,6 @@ fn even_moe_split(total_moe: u32, rank: u32, total: u32) -> (u32, u32) {
     (start, end)
 }
 
-/// Whether a worker-rank `step()` should surface its latched upstream
-/// disconnect as a connection-fatal `Err` this call: yes exactly once, on the
-/// first step after the link drops. After that the one-shot is spent so a
-/// re-poll (the relay loop has already exited on the first one) doesn't flood.
-/// Pure, for testing.
 /// Whether a failed upstream receive on a pipeline worker means the link is
 /// gone for good. The server reports `NotConnected` both before the previous
 /// rank has dialed in (keep waiting) and after a once-live socket was dropped
@@ -1362,6 +1357,11 @@ pub(crate) fn worker_recv_failure_is_fatal(
     }
 }
 
+/// Whether a worker-rank `step()` should surface its latched upstream
+/// disconnect as a connection-fatal `Err` this call: yes exactly once, on the
+/// first step after the link drops. After that the one-shot is spent so a
+/// re-poll (the relay loop has already exited on the first one) doesn't flood.
+/// Pure, for testing.
 fn worker_should_report_disconnect(peer_disconnected: bool, already_reported: bool) -> bool {
     peer_disconnected && !already_reported
 }
@@ -5385,9 +5385,6 @@ pub struct PipelineEngine<R: StagedRunner> {
     stage_profile: Option<StageProfile>,
 }
 
-/// One task inside the multi-stream single-stage scheduler: its slot in the
-/// runner, its own sampling state, and the token sampled but not yet emitted
-/// (`next`), mirroring `PipeActive` per stream.
 /// Per-slot sampling state on the last rank (the driver keeps the tokens).
 struct StreamSampler {
     cfg: crate::sampling::SamplingConfig,
@@ -5637,6 +5634,9 @@ enum StreamState {
     InFlight,
 }
 
+/// One task inside the multi-stream scheduler: its slot in the runner, its
+/// own sampling state, and the token sampled but not yet emitted (`next`),
+/// mirroring `PipeActive` per stream.
 struct StreamActive {
     id: TaskId,
     slot: usize,
@@ -8564,10 +8564,6 @@ mod tests {
         assert_eq!((s, e), (0, u32::MAX));
     }
 
-    /// A latched worker disconnect must surface a connection-fatal Err to the
-    /// relay loop — exactly once — so run_relay_loop exits and systemd
-    /// rebuilds the stage instead of backing off Ok(empty) forever. The Err
-    /// step() emits (EngineError::NotConnected) must be recognized as fatal.
     #[test]
     fn stage_profile_counts_work_and_drops_idle_gaps() {
         let mut p = StageProfile::new(Duration::from_millis(50));
@@ -8603,6 +8599,10 @@ mod tests {
         assert_eq!((p.frames, p.wait), (0, Duration::ZERO));
     }
 
+    /// A latched worker disconnect must surface a connection-fatal Err to the
+    /// relay loop — exactly once — so run_relay_loop exits and systemd
+    /// rebuilds the stage instead of backing off Ok(empty) forever. The Err
+    /// step() emits (EngineError::NotConnected) must be recognized as fatal.
     #[test]
     fn worker_disconnect_reports_fatal_once() {
         // Connected: nothing to report.
