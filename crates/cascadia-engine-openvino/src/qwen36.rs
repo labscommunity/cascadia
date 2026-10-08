@@ -451,6 +451,9 @@ pub struct Qwen36Builder {
     decision_assets: Option<crate::decision::HeadAssets>,
     /// Vocabulary bound from config.json (every rank; tolerant, see `read_vocab`).
     vocab: Option<usize>,
+    /// Lower bound on a prefix-cache snapshot's bytes from config.json (decision trees only; see
+    /// `prefix_cache::config_state_floor`).
+    state_floor: Option<(usize, usize)>,
 }
 
 impl Qwen36Builder {
@@ -520,6 +523,7 @@ impl Qwen36Builder {
             final_hidden_output: false,
             decision_assets: None,
             vocab: None,
+            state_floor: None,
         }
     }
 
@@ -666,6 +670,12 @@ impl Builder for Qwen36Builder {
         // (manifest.json + stage<i>/) must not warn about it.
         let decision_tree = dir.join("decision.json").exists() || dir.join("decision").exists();
         self.vocab = read_vocab(&dir, decision_tree);
+        // Only decision passes read the size estimate: a chat-only tree keeps its cache as is.
+        self.state_floor = if decision_tree {
+            read_state_floor(&dir)
+        } else {
+            None
+        };
         let head_owner = owns_head(self.rank, self.total);
         self.decision_assets = if head_owner && dir.join("decision").join("head.json").exists() {
             progress.push(LoadProgress::message(
@@ -778,7 +788,7 @@ impl Builder for Qwen36Builder {
             )),
             #[cfg(feature = "kv_coord")]
             kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
-            prefix_cache: crate::prefix_cache::PrefixCache::new(prefix_cache_bytes),
+            prefix_cache: new_prefix_cache(prefix_cache_bytes, self.state_floor),
             im_start_id: self.im_start_id,
             primed: false,
             stages_dirty: false,
@@ -861,6 +871,63 @@ fn read_vocab(dir: &Path, warn_missing: bool) -> Option<usize> {
         warn!("qwen35: config.json states no vocab_size; decision passes will be refused");
     }
     v.map(|v| v as usize)
+}
+
+/// `prefix_cache::config_state_floor` of the tree's config.json, with a warning when a decision
+/// tree states too little to bound a snapshot (the first over-budget request then pays one pass
+/// before its 413).
+fn read_state_floor(dir: &Path) -> Option<(usize, usize)> {
+    let cfg: serde_json::Value = std::fs::read_to_string(dir.join("config.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())?;
+    let floor = crate::prefix_cache::config_state_floor(&cfg);
+    if floor.is_none() {
+        warn!(
+            "qwen35: config.json does not state the attention dims; the prefix cache cannot bound \
+             a decision snapshot's size before measuring one"
+        );
+    }
+    floor
+}
+
+/// The engine's prefix cache, seeded with the load-time snapshot size floor when one is known, so
+/// a decision snapshot that can never fit is refused before the first request prefills (P3-CE-1).
+fn new_prefix_cache(
+    budget_bytes: usize,
+    floor: Option<(usize, usize)>,
+) -> crate::prefix_cache::PrefixCache {
+    let mut cache = crate::prefix_cache::PrefixCache::new(budget_bytes);
+    if let Some((fixed, per_token)) = floor.filter(|_| cache.enabled()) {
+        cache.seed_floor(fixed, per_token);
+    }
+    cache
+}
+
+/// This pass's snapshot plan. Only a `needs_snapshot` decision pass (the first pass of a request
+/// admitted on the shared-prefix discount) bypasses the chat refresh rule: its later passes must
+/// find that exact key (P2-CE-1). Every other pass, decision or chat, plans as a chat turn does,
+/// so an unflagged decision pass does not pay a multi-GB copy for a few tokens (P3-REG-1).
+fn plan_pass_snapshots(
+    decision: Option<&cascadia_types::DecisionReadout>,
+    prompt: &[u32],
+    boundaries: &[usize],
+    warm_prefix: usize,
+    cache: &crate::prefix_cache::PrefixCache,
+    costs: &crate::prefix_cache::RefreshCosts,
+    state_bytes: usize,
+) -> Vec<usize> {
+    if decision.is_some_and(|d| d.needs_snapshot) {
+        crate::prefix_cache::plan_decision_snapshots(prompt, boundaries, warm_prefix, cache)
+    } else {
+        crate::prefix_cache::plan_snapshots(
+            prompt,
+            boundaries,
+            warm_prefix,
+            cache,
+            costs,
+            state_bytes,
+        )
+    }
 }
 
 /// Decision passes prefill the codec's exact ids: no tokenization, no think block.
@@ -3061,26 +3128,18 @@ impl Qwen36Engine {
                     .map(|im| crate::prefix_cache::chat_boundaries(&prompt_ids, im))
                     .unwrap_or_default(),
             };
-            // A decision pass always snapshots its request's shared prefix when the cache can hold
-            // it: the refresh rule is for chat turns, and a request whose later passes resume
-            // there must find that exact key (P2-CE-1).
-            let snapshot_at = if task.decision.is_some() {
-                crate::prefix_cache::plan_decision_snapshots(
-                    &prompt_ids,
-                    &boundaries,
-                    warm_prefix,
-                    &self.prefix_cache,
-                )
-            } else {
-                crate::prefix_cache::plan_snapshots(
-                    &prompt_ids,
-                    &boundaries,
-                    warm_prefix,
-                    &self.prefix_cache,
-                    &self.refresh_costs,
-                    state_bytes,
-                )
-            };
+            // A needs_snapshot decision pass always snapshots its request's shared prefix when the
+            // cache can hold it (its later passes resume there, P2-CE-1); every other pass keeps
+            // the chat refresh rule (P3-REG-1).
+            let snapshot_at = plan_pass_snapshots(
+                task.decision.as_ref(),
+                &prompt_ids,
+                &boundaries,
+                warm_prefix,
+                &self.prefix_cache,
+                &self.refresh_costs,
+                state_bytes,
+            );
             if self.prefix_cache.enabled() {
                 info!(
                     warm_prefix,
@@ -3304,7 +3363,10 @@ impl Engine for Qwen36Engine {
         }
         self.reset_all();
         match self.run_span(&[1000], 0) {
-            Ok(_) => info!("qwen35 warmup ok"),
+            Ok(_) => {
+                info!("qwen35 warmup ok");
+                self.observe_warmup_state();
+            }
             Err(e) => warn!(error = %e, "qwen35 warmup failed"),
         }
         self.reset_all();
@@ -3532,6 +3594,26 @@ impl Qwen36Engine {
     /// kv_coord plane frames them with [`crate::prefix_cache::frame_blobs`]). The failure reason
     /// is returned rather than logged: it is the only signal the always-on prefix cache has when
     /// a snapshot does not happen, and that caller reports it at `warn!`.
+    /// Decision trees with the prefix cache on: measure the warmup's one-token state (the fixed
+    /// recurrent state plus one token of KV, one copy of tens of MB) and record it as the size
+    /// model's first point, without caching it (P3-CE-1). Chat-only trees skip the copy.
+    fn observe_warmup_state(&mut self) {
+        if !self.prefix_cache.enabled() || self.decision_assets.is_none() || self.stages_dirty {
+            return;
+        }
+        match self.parts_local_stages() {
+            Ok(parts) => {
+                let bytes: usize = parts.iter().map(Vec::len).sum();
+                self.prefix_cache.observe(1, bytes);
+                info!(
+                    bytes,
+                    "qwen35 prefix-cache: measured the one-token state size"
+                );
+            }
+            Err(e) => warn!(error = %e, "qwen35 prefix-cache: could not measure the state size"),
+        }
+    }
+
     fn parts_local_stages(&mut self) -> Result<Vec<Vec<u8>>, String> {
         let mut blobs = Vec::with_capacity(self.stages.len());
         for st in self.stages.iter_mut() {
@@ -4803,6 +4885,77 @@ mod tests {
         assert_eq!(
             decision_cache_refusal(&kev_pass(40, 20), 0, &PrefixCache::new(0)),
             None
+        );
+    }
+
+    #[test]
+    fn a_fresh_engine_refuses_an_uncacheable_first_pass_before_any_prefill() {
+        // P3-CE-1: nothing measured yet on a fresh server. The size floor seeded at load (here
+        // a 25 MB fixed state against a 1 MiB budget) refuses the first pass with
+        // decision_uncacheable at warm 0, before its prefill and copy.
+        let cache = new_prefix_cache(1 << 20, Some((25 << 20, 4096)));
+        let mut first = kev_pass(9100, 9001);
+        first.needs_snapshot = true;
+        let why = decision_cache_refusal(&first, 0, &cache).unwrap();
+        assert!(why.starts_with("decision_uncacheable"), "{why}");
+        // A budget that holds the floor still lets the pass run and snapshot.
+        let roomy = new_prefix_cache(1 << 30, Some((25 << 20, 4096)));
+        assert_eq!(decision_cache_refusal(&first, 0, &roomy), None);
+        // Chat-only or unknown dims: no floor, the cache behaves as before.
+        assert!(new_prefix_cache(1 << 20, None).can_hold(9001));
+        assert!(!new_prefix_cache(0, Some((1, 1))).enabled());
+    }
+
+    #[test]
+    fn only_a_needs_snapshot_pass_bypasses_the_chat_refresh_rule() {
+        // P3-REG-1: a decision pass that restored a shorter entry (its state extends a cached one)
+        // snapshots its own prefix regardless of cost only when its later passes depend on it.
+        // Other decision passes keep the chat refresh rule: no multi-GB copy for a few tokens.
+        use crate::prefix_cache::{PrefixCache, RefreshCosts};
+        let mut cache = PrefixCache::new(1 << 30);
+        let mut d = kev_pass(60, 40);
+        assert!(cache.insert(d.prompt_ids[..30].to_vec(), vec![vec![0; 8]]));
+        let costs = RefreshCosts {
+            prefill_tok_s: Some(455.0),
+            snapshot_s_per_byte: Some(2.6 / 1.2e9),
+        };
+        let bytes = 1_200_000_000;
+        let plan = |d: Option<&cascadia_types::DecisionReadout>| {
+            plan_pass_snapshots(
+                d,
+                &d.map_or(vec![0; 60], |d| d.prompt_ids.clone()),
+                &[40],
+                30,
+                &cache,
+                &costs,
+                bytes,
+            )
+        };
+        assert!(
+            plan(Some(&d)).is_empty(),
+            "unflagged: the refresh rule says no"
+        );
+        d.require_warm = true;
+        assert!(
+            plan(Some(&d)).is_empty(),
+            "require_warm resumes; it never needs the copy"
+        );
+        d.require_warm = false;
+        d.needs_snapshot = true;
+        assert_eq!(plan(Some(&d)), vec![40]);
+        // A cold unflagged pass snapshots as a cold chat turn does.
+        let cold = kev_pass(60, 40);
+        assert_eq!(
+            plan_pass_snapshots(
+                Some(&cold),
+                &cold.prompt_ids,
+                &[40],
+                0,
+                &cache,
+                &costs,
+                bytes
+            ),
+            vec![40]
         );
     }
 
