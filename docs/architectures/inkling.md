@@ -368,7 +368,11 @@ fallback otherwise. `_OV_MOE_PRECISION` sets the plugin's
 `INFERENCE_PRECISION_HINT` and defaults to `f32`. At `f16`, the fused layers
 of the deeper ranks of the full 66-layer model overflow half precision and
 every logit comes out NaN (the pipeline then emits token 0, `!`, at every
-step). Layers 0–10 alone did not show it.
+step). Layers 0–10 alone did not show it. The Arc 140V (Lunar Lake, OpenVINO
+2026.4) has no f32 kernel for the fused op: at the default the layer does not
+compile ("No layout format available for ... MOECompressed ... f32") and runs
+on the CPU path, with a warning. At `f16` the same IR runs on that GPU, so
+use `f16` there only for layers that stay in half-precision range.
 
 Findings on the Arc B390 (driver 32.0.101.8860, OpenVINO 2026.3.1 and the
 2026.5 nightly), all reproduced on Intel's own optimum-intel Qwen3-MoE
