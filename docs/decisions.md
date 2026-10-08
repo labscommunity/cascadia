@@ -6,7 +6,7 @@ single prefill pass. They never generate text. A model directory turns into a de
 it carries a `decision.json` next to the shard tree:
 
 ```bash
-cascadia run /models/kev-9b-int8 --engine qwen35 --api 127.0.0.1:8000
+cascadia run /models/kev-9b-int8 --engine qwen35 --device CPU --api 127.0.0.1:8000
 ```
 
 The server logs `decision.json found; serving /v1/decisions (OpenAI format) and /v1/systemone` and
@@ -114,7 +114,9 @@ The OpenAI request is translated into the internal (SystemOne) form before the m
 - `predicate` becomes a yes/no question with no criteria.
 - `choice` becomes a choice with criteria `{value: description}` in request order. A number value
   is keyed by Python's `str()` of the number (`2` → `"2"`, `1e5` → `"100000.0"`); a missing
-  description is `null`.
+  description is `null`. A negative zero (`-0`, which the JSON parser cannot tell from `-0.0`)
+  is the integer `0`, keyed `"0"` as Python's `json.loads("-0")` is, so `0` and `-0` are
+  duplicates.
 - **Score levels are rendered as one text per level**, `"label: description"`, or just `"label"`
   when the description is missing or empty, before the codec sees them. This approximates the single-text
   levels the models were trained on; nothing in the reference implementations says which form
@@ -171,14 +173,18 @@ The server does not check `api_key`; the SDK only requires that one is set.
 }
 ```
 
-- `state` is any JSON value. The codecs render it exactly as the reference servers do, so key
-  order is kept as sent.
+- `state` is any JSON value, rendered exactly as each reference server renders it: JEV and Kev
+  keep object keys in the order sent; Clef sorts them (`json.dumps(sort_keys=True)`, as
+  Cloudflare's `encode_record` does).
 - `questions` is an object keyed by question id. Answers come back in the same order.
   - `noul`: yes/no. `criteria` is optional.
   - `choice`: `criteria` is an object, option name → description.
   - `score`: `criteria` is an array of level descriptions, lowest first.
-- `images` and `videos` must be absent or empty (400 otherwise). Image parts inside `state` are
-  also a 400.
+- `images` and `videos` must be absent, `null` or empty (400 otherwise).
+- A list `state` is read differently per family, as by each reference. JEV reads its elements as
+  message parts (serve_decide `_parts`), so an image part there (`{"image": ...}` or
+  `{"type": "image_url", ...}`) is a 400. Kev and Clef render list elements as plain data, so a
+  catalogue record with an `image` field is just text to them.
 
 ### Response
 
@@ -202,7 +208,10 @@ is always 0: decision models do not decode.
 
 ### Errors
 
-Errors are `{"error": "<message>"}` with the status codes below.
+Errors are `{"error": "<message>"}` with the status codes below. As on the OpenAI route, a body
+that is not valid JSON or does not match the request schema (a missing `questions`, an unknown
+question `type`, a value nested deeper than 128 levels) is rejected by the HTTP framework before
+the handler runs, with its default 4xx text body rather than this shape.
 
 ## Status codes
 
@@ -211,10 +220,10 @@ Both routes share these statuses.
 | Status | When |
 |---|---|
 | 200 | Every question answered. |
-| 400 | Validation: no questions or more than `max_questions`; an empty question name, or (OpenAI format) a duplicate question name or choice value; a choice with no options or more than the model allows; a score with fewer than 2 levels; images; a request the tokenizer cannot encode; Clef's option cap (see [Limits](#limits)). |
-| 413 | Too long: the state is more than `max_total_tokens × 8` bytes (checked before tokenizing); one pass is longer than `max_tokens` (JEV and Kev; Clef truncates the state instead); the request's prefill work is more than `max_total_tokens`; or the engine reports the prompt too long. |
-| 501 | The model serves no decisions: no `decision.json`, an engine other than `qwen35`, or the engine reports the model has no decision head. |
-| 503 | The server is at capacity (`engine at capacity; retry after current requests complete`), or any other engine error. Decisions share the API's concurrency permits with chat requests. |
+| 400 | Validation: no questions or more than `max_questions`; an empty question name, or (OpenAI format) a duplicate question name or choice value; a choice with no options or more than the model allows; a score with fewer levels than the model allows (2, or 1 for Kev) or more; images; an image part in a list `state` (JEV); a request the tokenizer cannot encode; Clef's option cap (see [Limits](#limits)). |
+| 413 | Too long: the state is more than `max_total_tokens × 8` bytes (checked before tokenizing); Kev's whole rendered text (state, instructions, options and levels) is more than `max_total_tokens × 8` bytes; Kev's state is more than 65,536 tokens (`SERVE_MAX_STATE`, `<state>` included) or reaches `max_tokens`; one pass is longer than `max_tokens` (JEV and Kev; Clef truncates the state instead); Clef's schema alone fills the joint pass, leaving no room for a non-empty state; the request's prefill work is more than `max_total_tokens`; or the engine reports the prompt too long. |
+| 501 | The model serves no decisions: no `decision.json` (or one that fails its load checks; see the startup log), an engine other than `qwen35`, the engine has no decision head (`decision/` missing on the single box or the pipeline's last rank), the tree was exported without `--final-hidden` (Kev and Clef), or a pipeline rank cannot serve decision passes (an older build, or a rank without `config.json` `vocab_size` or, on the last rank, `decision/`). Rank 0 refuses the pipeline cases before any prefill. |
+| 503 | The server is at capacity (`engine at capacity; retry after current requests complete`): every concurrency permit is taken, or a Kev pass that must resume its shared state from the prefix cache found the snapshot evicted (see [Limits](#limits)). Any other engine error is `decision engine error`. Decisions share the API's concurrency permits with chat requests. |
 
 Error messages are deliberately terse:
 
@@ -232,15 +241,23 @@ Error messages are deliberately terse:
 
 | Limit | Source | Default |
 |---|---|---|
-| Questions per request | `max_questions` in `decision.json` | 32 |
+| Questions per request | `max_questions` in `decision.json` | 32 (Clef: at most 256, the joint head's cap) |
 | Tokens in one pass | `max_tokens` in `decision.json` | required field |
 | Prefill tokens per request | `max_total_tokens` in `decision.json` | 4 × `max_tokens` |
-| Options per choice | per model family | JEV: 16 for the shipped JEV profiles (the profile's choice slot count); Kev and Clef: 256 |
+| Options per choice | per model family | JEV: 16 for the shipped JEV profiles (the profile's choice slot count); Kev: 255 (Kev's `MAX_OPTIONS`); Clef: 256 |
 | Options per request (Clef) | engine readout cap | 4096 across all questions, because Clef answers them in one pass |
 | Tokens in the joint pass (Clef) | `MAX_JOINT_PROMPT` and the head's input limit | the smaller of `max_tokens`, 16,384 and 256 MiB ÷ (4 × width): 16,384 for Clef-flash (width 4096), about 13,107 for Clef-27B (width 5120) |
-| Levels per score | per model family | 2 to 256 |
+| Levels per score | per model family | JEV and Clef: 2 to 256; Kev: 1 to 255 |
+| State tokens (Kev) | Kev's `SERVE_MAX_STATE` | 65,536, `<state>` included; only the whole pass may reach `max_tokens` |
 | Request body | `--api-max-body-mb` | 1 MiB |
 
+- **`decision.json` is checked at load.** `max_tokens`, `max_total_tokens` and `max_questions`
+  must be at least 1, a JEV choice slot range at least 1 wide, and Clef's `max_total_tokens` must
+  cover one full joint pass. `max_tokens` above the engine's 131,072-token decision prompt cap,
+  and Clef's `max_questions` above 256, are clamped with a warning, so a request over the
+  engine's own limits is a 400 or 413 rather than a 503. A profile that fails these checks
+  disables decisions with a startup warning. The startup log names the family and the
+  effective limits.
 - **Clef truncates the state to fit `max_tokens`** (as Cloudflare's `encode_record` does), so a
   long state never makes a Clef pass too long; JEV and Kev return 413 when a pass exceeds
   `max_tokens`. Clef's effective bound is also capped by the joint head's inputs, each of which
@@ -258,12 +275,20 @@ Error messages are deliberately terse:
   about 64K plus five short branches. In pipeline mode (`--total` > 1) or with
   `--prefix-cache-gb 0`, every pass counts in full, because the engine re-prefills the state per
   question.
+- **The discount is never exceeded.** A cached state can be evicted (by another request's passes,
+  or because it never fit the prefix cache) before a later question's pass. A request whose budget
+  covers every pass in full runs as usual. Otherwise the passes the budget cannot cover cold must
+  resume the cached state, and if it is gone the request gets the capacity 503 instead of
+  prefilling the state again past its budget. Retry, or raise `max_total_tokens` or
+  `--prefix-cache-gb`.
 - **Raise `--api-max-body-mb` for long states.** The default 1 MiB body cap (it applies to every API route) holds roughly 250K
   tokens of English, but JSON escaping and a long Kev state with many questions can exceed it.
   The flag applies to every route, chat included.
 - **Shared concurrency permits.** Decision requests take the same concurrency permits as chat
   requests. A request that finds none free gets 503 (`engine at capacity; retry after current
-  requests complete`) at once rather than queueing.
+  requests complete`) at once rather than queueing. A request holds its permit until its
+  tokenization has finished, even if the client disconnects first. Decision requests count in the
+  request total, the in-flight gauge and the `capacity` rejection metric like chat requests.
 
 ## Confidence
 
@@ -317,7 +342,8 @@ key order, separators, and Python `str()` / `json.dumps` formatting.
 ## `--decision-dump FILE`
 
 ```bash
-cascadia run /models/kev-9b-int8 --engine qwen35 --decision-dump /tmp/kev-passes.jsonl
+mkdir -m 700 -p ~/parity
+cascadia run /models/kev-9b-int8 --engine qwen35 --device CPU --api 127.0.0.1:8000 --decision-dump ~/parity/kev-passes.jsonl
 ```
 
 `cascadia run` and `cascadia worker` accept `--decision-dump FILE`. Every decision pass is
@@ -332,14 +358,18 @@ encoders.
   state and questions. Use it for parity checks only, never on a production endpoint. The server
   logs a warning at startup when the flag is set.
 - The file is opened once at startup in append mode with permissions 0600. An existing file is
-  tightened to 0600, and a symlink at the path is refused. A failure to open it stops startup.
+  tightened to 0600. The path must be absent or a regular file this user owns with a single
+  link: a symlink, FIFO, device or hard-linked file is refused. A failure to open it stops
+  startup. Keep it in a directory only you can write (not a shared `/tmp`), and bind the API to
+  loopback while it is on: the file grows by every pass of every request.
 - It is a startup flag only; there is no environment variable for it.
 - It takes effect only when a decision model is loaded. Otherwise the server logs that
   `--decision-dump` is ignored and opens no file.
 
 ## Limitations
 
-- **Text only.** Images in either format are a 400.
+- **Text only.** Images in either format are a 400 (`images`, `videos`, OpenAI `input_image`
+  parts, and JEV image parts in a list `state`).
 - **Batch 1.** The engine runs one decision pass at a time; concurrent requests beyond the engine's
   capacity get 503.
 - **int8 weights only.** Decision trees are built from Intel's int8 OpenVINO exports. int4 measured
