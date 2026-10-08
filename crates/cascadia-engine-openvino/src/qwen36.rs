@@ -1489,6 +1489,18 @@ impl Qwen36Engine {
         if head_reads_hidden(d) && !self.final_hidden_output {
             return Err("decision_unsupported: tree was exported without --final-hidden".into());
         }
+        // Joint (Clef) inputs must fit the shim's per-input limit, or set_input fails after a
+        // full prefill. `hidden` comes from the shared manifest, so rank 0 refuses up front too.
+        if let cascadia_types::ReadoutHead::Joint { questions } = &d.head {
+            let options: usize = questions.iter().map(|q| q.options.len()).sum();
+            cascadia_types::joint_inputs_fit(
+                d.prompt_ids.len(),
+                questions.len() + options,
+                options,
+                self.hidden,
+            )
+            .map_err(|e| format!("decision_too_long: {e}"))?;
+        }
         Ok(())
     }
 
@@ -4540,6 +4552,32 @@ mod tests {
             .admit_decision_check(&pointer)
             .unwrap_err()
             .contains("decision_unsupported"));
+    }
+
+    #[test]
+    fn joint_readout_over_the_shim_input_limit_is_refused_before_prefill() {
+        use cascadia_types::{DecisionReadout, JointOption, JointQuestion, ReadoutHead};
+        let joint = |n: usize| DecisionReadout {
+            prompt_ids: vec![1; n],
+            head: ReadoutHead::Joint {
+                questions: vec![JointQuestion {
+                    qtype: 0,
+                    span: [0, 1],
+                    options: vec![JointOption { span: [1, 2] }, JointOption { span: [2, 3] }],
+                }],
+            },
+            cache_prefix: None,
+        };
+        let mut e = bare_engine(2, "{}");
+        e.rank = 0;
+        e.vocab = Some(16);
+        e.final_hidden_output = true;
+        e.hidden = 5120; // Clef-27B: [T, 5120] f32 fits 256 MiB up to T = 13107
+        assert!(e.admit_decision_check(&joint(13_107)).is_ok());
+        let err = e.admit_decision_check(&joint(13_108)).unwrap_err();
+        assert!(err.starts_with("decision_too_long"), "{err}");
+        e.hidden = 4096; // Clef-flash: the full 16384 fits
+        assert!(e.admit_decision_check(&joint(16_384)).is_ok());
     }
 
     #[test]

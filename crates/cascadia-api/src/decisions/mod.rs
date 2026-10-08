@@ -96,7 +96,11 @@ impl DecisionService {
                 prof.max_tokens,
                 max_total_tokens,
             )?),
-            profile::Family::Clef => Box::new(clef::ClefCodec::new(tok, prof.max_tokens)?),
+            profile::Family::Clef => Box::new(clef::ClefCodec::new(
+                tok,
+                prof.max_tokens,
+                tree_hidden(model_dir),
+            )?),
         };
         let max_questions = prof.max_questions.unwrap_or(32);
         Ok(Some(Arc::new(DecisionService {
@@ -115,6 +119,24 @@ impl DecisionService {
             ..self.codec.limits()
         }
     }
+}
+
+/// The tree's activation width, as the engine reads it: manifest.json `hidden_size`, else
+/// config.json's (`text_config` first). `None` when neither states it; the engine then enforces
+/// the joint input limits alone.
+fn tree_hidden(model_dir: &Path) -> Option<usize> {
+    let read = |f: &str| -> Option<serde_json::Value> {
+        serde_json::from_str(&std::fs::read_to_string(model_dir.join(f)).ok()?).ok()
+    };
+    let width = |v: &serde_json::Value| v.get("hidden_size")?.as_u64().map(|h| h as usize);
+    read("manifest.json")
+        .as_ref()
+        .and_then(width)
+        .or_else(|| {
+            let c = read("config.json")?;
+            c.get("text_config").and_then(width).or_else(|| width(&c))
+        })
+        .filter(|&h| h > 0)
 }
 
 /// A tokenizer failure inside a codec's `encode`. The tokenizer's own text can carry vocab or path
@@ -239,6 +261,26 @@ pub(crate) fn softmax(z: &[f64]) -> Vec<f64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tree_hidden_reads_manifest_then_config() {
+        let d = std::env::temp_dir().join(format!("tree-hidden-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(super::tree_hidden(&d), None);
+        std::fs::write(
+            d.join("config.json"),
+            r#"{"text_config": {"hidden_size": 4096}}"#,
+        )
+        .unwrap();
+        assert_eq!(super::tree_hidden(&d), Some(4096));
+        std::fs::write(
+            d.join("manifest.json"),
+            r#"{"hidden_size": 5120, "stages": []}"#,
+        )
+        .unwrap();
+        assert_eq!(super::tree_hidden(&d), Some(5120));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
     use super::*;
     use cascadia_types::{DecisionReadout, ReadoutHead};
 
