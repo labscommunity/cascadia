@@ -17,7 +17,7 @@ use cascadia_engine_sparse_moe::inkling::stage::InklingRunner;
 use cascadia_engine_sparse_moe::sampling::SamplingConfig;
 use cascadia_engine_sparse_moe::staged::StagedRunner;
 use cascadia_transport::{ActivationClient, ActivationServer};
-use cascadia_types::GenerationTask;
+use cascadia_types::{FinishReason, GenerationTask};
 use tokio::sync::Mutex;
 
 fn fixture() -> Option<PathBuf> {
@@ -410,6 +410,182 @@ async fn failed_stream_frame_closes_the_link_at_once() {
         .await
         .unwrap();
     assert!(joined, "the last rank panicked");
+}
+
+/// A 3-rank loopback pipeline with `caps[r]` stream slots on rank `r`.
+/// Returns rank 0, the stop flag, rank 0's two links and the worker threads
+/// for ranks 1 and 2. A worker thread returns `true` when its `step` failed.
+#[allow(clippy::type_complexity)]
+async fn pipeline(
+    dir: &std::path::Path,
+    handle: &tokio::runtime::Handle,
+    caps: [usize; 3],
+) -> (
+    PipelineEngine<InklingRunner>,
+    Arc<AtomicBool>,
+    [Arc<Mutex<ActivationClient>>; 2],
+    Vec<std::thread::JoinHandle<bool>>,
+) {
+    let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
+    let (s01, c01) = link().await;
+    let (s12, c12) = link().await;
+    let load = |rank, lo, hi| {
+        InklingRunner::load_staged(dir, 64, rank, 3, lo, hi, Some("eager".into()), None).unwrap()
+    };
+    let transport = |up, down| StageTransport {
+        upstream: up,
+        downstream: down,
+    };
+    let mut e0 = PipelineEngine::new(
+        load(0, 0, 2),
+        Some(tok),
+        transport(None, Some(c01.clone())),
+        handle.clone(),
+        0,
+        3,
+        None,
+    );
+    let mut e1 = PipelineEngine::new(
+        load(1, 2, 3),
+        None,
+        transport(Some(s01), Some(c12.clone())),
+        handle.clone(),
+        1,
+        3,
+        None,
+    );
+    let mut e2 = PipelineEngine::new(
+        load(2, 3, 4),
+        None,
+        transport(Some(s12), None),
+        handle.clone(),
+        2,
+        3,
+        None,
+    );
+    for (e, n) in [&mut e0, &mut e1, &mut e2].into_iter().zip(caps) {
+        assert_eq!(e.enable_streams(n), n);
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let workers = [Box::new(e1) as Box<dyn Engine>, Box::new(e2)]
+        .into_iter()
+        .map(|mut e| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if e.step().is_err() {
+                        return true;
+                    }
+                }
+                false
+            })
+        })
+        .collect();
+    (e0, stop, [c01, c12], workers)
+}
+
+/// Rank 1 configured with fewer stream slots than rank 0 (`CASCADIA_STREAMS`
+/// not set on every rank). Rank 1 must exit with an error at the first slot
+/// it cannot hold, and rank 0's task must get an error chunk soon, not hang
+/// until its reply deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rank_with_fewer_slots_fails_fast() {
+    let Some(dir) = fixture() else { return };
+    let handle = tokio::runtime::Handle::current();
+    let (e0, stop, [c01, c12], mut workers) = pipeline(&dir, &handle, [3, 1, 3]).await;
+    let started = std::time::Instant::now();
+    let (e0, got) = tokio::task::spawn_blocking(move || {
+        let mut e0 = e0;
+        let got = run_round(&mut e0, "mismatch", 3);
+        (e0, got)
+    })
+    .await
+    .unwrap();
+    assert!(
+        got.iter().any(|r| r.is_err()),
+        "a stream on a slot rank 1 cannot hold must fail, got {got:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "and fail fast, not at the reply deadline"
+    );
+    let w1 = workers.remove(0);
+    let w1_failed = tokio::task::spawn_blocking(move || w1.join().unwrap())
+        .await
+        .unwrap();
+    assert!(w1_failed, "rank 1 must exit with an error");
+
+    stop.store(true, Ordering::Relaxed);
+    drop(e0);
+    c01.lock().await.close().await;
+    c12.lock().await.close().await;
+    for w in workers {
+        let _ = w.join();
+    }
+}
+
+/// One task that asks for more tokens than the 64-position budget holds
+/// must end with `FinishReason::Length`, on a single stage and on the
+/// pipeline, with the same tokens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn over_budget_stream_finishes_with_length() {
+    let Some(dir) = fixture() else { return };
+    let handle = tokio::runtime::Handle::current();
+    fn run(e: &mut dyn Engine) -> (Vec<i64>, Option<FinishReason>) {
+        let mut t = GenerationTask::new("long".to_string(), PROMPTS[0]);
+        t.max_tokens = 100;
+        t.temperature = 0.0;
+        e.submit(t).unwrap();
+        let mut toks = Vec::new();
+        for _ in 0..500 {
+            for (_, c) in e.step().expect("step") {
+                assert!(c.error.is_none(), "task errored: {:?}", c.error);
+                if c.is_final {
+                    return (toks, c.finish_reason);
+                }
+                toks.push(c.token_id);
+            }
+        }
+        panic!("the task did not finish");
+    }
+
+    let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
+    let runner =
+        InklingRunner::load_staged(&dir, 64, 0, 1, 0, 0, Some("eager".into()), None).unwrap();
+    let mut single = PipelineEngine::new(
+        runner,
+        Some(tok),
+        StageTransport::default(),
+        handle.clone(),
+        0,
+        1,
+        None,
+    );
+    assert_eq!(single.enable_streams(3), 3);
+    let (single_toks, single_reason) = tokio::task::spawn_blocking(move || run(&mut single))
+        .await
+        .unwrap();
+    assert_eq!(single_reason, Some(FinishReason::Length), "single stage");
+    assert!(!single_toks.is_empty() && single_toks.len() < 100);
+
+    let (e0, stop, [c01, c12], workers) = pipeline(&dir, &handle, [3, 3, 3]).await;
+    let (piped_toks, piped_reason) = tokio::task::spawn_blocking(move || {
+        let mut e0 = e0;
+        run(&mut e0)
+    })
+    .await
+    .unwrap();
+    stop.store(true, Ordering::Relaxed);
+    c01.lock().await.close().await;
+    c12.lock().await.close().await;
+    for w in workers {
+        let _ = w.join();
+    }
+    assert_eq!(piped_reason, Some(FinishReason::Length), "pipeline");
+    assert_eq!(
+        piped_toks, single_toks,
+        "pipeline tokens differ from single stage"
+    );
 }
 
 /// Like `collect`, but a task may end in an error chunk (returned as Err) and
