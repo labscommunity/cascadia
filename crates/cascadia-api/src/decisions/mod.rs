@@ -11,6 +11,7 @@ pub mod schema;
 
 use std::ops::Range;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::http::StatusCode;
@@ -54,7 +55,17 @@ pub struct PassPart {
 
 pub trait Codec: Send + Sync {
     fn limits(&self) -> Limits;
-    fn encode(&self, req: &DecisionRequest) -> Result<Vec<Pass>, DecisionError>;
+    /// Encode the request into engine passes. `cancel` is set when the client is gone (the
+    /// request future was dropped): codecs check it between questions and stop early, so an
+    /// orphaned encode does not keep tokenizing (SEC-2). The error is never seen by anyone.
+    fn encode_until(
+        &self,
+        req: &DecisionRequest,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<Pass>, DecisionError>;
+    fn encode(&self, req: &DecisionRequest) -> Result<Vec<Pass>, DecisionError> {
+        self.encode_until(req, &AtomicBool::new(false))
+    }
     fn probabilities(&self, req: &DecisionRequest, part: &PassPart, logits: &[f32]) -> Vec<f64>;
 }
 
@@ -89,7 +100,9 @@ impl DecisionService {
             .map_err(|e| format!("{}: tokenizer.json: {e}", model_dir.display()))?;
         let max_total_tokens = prof.max_total_tokens.unwrap_or(prof.max_tokens * 4);
         let codec: Box<dyn Codec> = match prof.family {
-            profile::Family::Jev => Box::new(jev::JevCodec::new(tok, prof.jev.clone().unwrap())?),
+            profile::Family::Jev => Box::new(
+                jev::JevCodec::new(tok, prof.jev.clone().unwrap())?.with_pass_cap(prof.max_tokens),
+            ),
             profile::Family::Kev => Box::new(kev::KevCodec::new(
                 tok,
                 prof.kev.clone().unwrap(),
@@ -145,6 +158,21 @@ fn tree_hidden(model_dir: &Path) -> Option<usize> {
 pub(crate) fn tokenize_failed(e: impl std::fmt::Display) -> DecisionError {
     tracing::warn!(error = %e, "decision tokenization failed");
     DecisionError::BadRequest(TOKENIZE_FAILED.into())
+}
+
+/// The 413 for a pass over the per-pass cap (the handler's check, or a codec's early stop).
+pub(crate) fn pass_too_long(len: usize, max_tokens: usize) -> DecisionError {
+    DecisionError::TooLong(format!(
+        "a decision pass is {len} tokens; the limit is {max_tokens}"
+    ))
+}
+
+/// `Err` once `cancel` is set (see [`Codec::encode_until`]).
+pub(crate) fn check_cancel(cancel: &AtomicBool) -> Result<(), DecisionError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(DecisionError::Engine("request cancelled".into()));
+    }
+    Ok(())
 }
 
 pub(crate) const TOKENIZE_FAILED: &str = "request could not be tokenized";

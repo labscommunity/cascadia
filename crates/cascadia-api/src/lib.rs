@@ -4321,6 +4321,145 @@ mod tests {
         assert_eq!(v["error"]["type"], "server_error");
     }
 
+    /// A codec whose first encode blocks until released (a slow tokenization), then records
+    /// whether it saw the cancel flag. Every encode answers one noul question with a tiny
+    /// pointer pass.
+    struct GateCodec {
+        started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        saw_cancel: Arc<std::sync::atomic::AtomicBool>,
+        finished: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl decisions::Codec for GateCodec {
+        fn limits(&self) -> decisions::schema::Limits {
+            decisions::schema::Limits {
+                max_questions: 32,
+                max_options: 16,
+                min_levels: 2,
+                max_levels: 16,
+            }
+        }
+        fn encode_until(
+            &self,
+            req: &decisions::schema::DecisionRequest,
+            cancel: &std::sync::atomic::AtomicBool,
+        ) -> Result<Vec<decisions::Pass>, decisions::DecisionError> {
+            if let Some(tx) = self.started.lock().unwrap().take() {
+                let _ = tx.send(());
+                let rx = self.release.lock().unwrap().take().unwrap();
+                let _ = rx.recv();
+                self.saw_cancel.store(
+                    cancel.load(std::sync::atomic::Ordering::SeqCst),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                self.finished
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let qid = req.questions.keys().next().unwrap().clone();
+            Ok(vec![decisions::Pass {
+                readout: cascadia_types::DecisionReadout {
+                    prompt_ids: vec![1, 2, 3, 4],
+                    head: cascadia_types::ReadoutHead::Pointer {
+                        decide_pos: 3,
+                        option_pos: vec![1, 2],
+                    },
+                    cache_prefix: None,
+                },
+                parts: vec![decisions::PassPart {
+                    question_id: qid,
+                    logits: 0..2,
+                }],
+            }])
+        }
+        fn probabilities(
+            &self,
+            _req: &decisions::schema::DecisionRequest,
+            _part: &decisions::PassPart,
+            logits: &[f32],
+        ) -> Vec<f64> {
+            decisions::softmax(&logits.iter().map(|&x| x as f64).collect::<Vec<_>>())
+        }
+    }
+
+    fn systemone_request(body: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/systemone")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn decisions_disconnect_keeps_the_permit_until_the_encode_ends() {
+        // SEC-2: a client disconnect drops the request future but not its spawn_blocking encode.
+        // The permit must stay held by the encode, or orphaned encodes pile up unbounded.
+        use std::sync::atomic::Ordering::SeqCst;
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let saw_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let codec = GateCodec {
+            started: std::sync::Mutex::new(Some(started_tx)),
+            release: std::sync::Mutex::new(Some(release_rx)),
+            saw_cancel: saw_cancel.clone(),
+            finished: finished.clone(),
+        };
+        let cfg = Config {
+            decisions: Some(Arc::new(decisions::DecisionService {
+                codec: Box::new(codec),
+                max_tokens: 1000,
+                max_total_tokens: 4000,
+                max_questions: 32,
+                prefix_reuse: false,
+            })),
+            max_concurrent_requests: 1,
+            ..Config::default()
+        };
+        let stats = Arc::new(ApiStats::default());
+        let app = make_router_with_stats(Arc::new(runner), "mock-model", cfg, stats.clone());
+        let body = r#"{"model": "m", "state": "s", "questions": {"u": {"type": "noul"}}}"#;
+        let first = tokio::spawn(app.clone().oneshot(systemone_request(body)));
+        started_rx.await.unwrap();
+        assert_eq!(stats.requests_in_flight.load(SeqCst), 1);
+        assert_eq!(stats.requests_total.load(SeqCst), 1);
+        // The client goes away mid-encode.
+        first.abort();
+        let _ = first.await;
+        // The orphaned encode still holds the only permit: a new request is refused.
+        let r = app.clone().oneshot(systemone_request(body)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(stats.requests_in_flight.load(SeqCst), 1);
+        release_tx.send(()).unwrap();
+        for _ in 0..200 {
+            if finished.load(SeqCst) && stats.requests_in_flight.load(SeqCst) == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            saw_cancel.load(SeqCst),
+            "the encode was told the client left"
+        );
+        assert_eq!(stats.requests_in_flight.load(SeqCst), 0);
+        let r = app.oneshot(systemone_request(body)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            stats.requests_total.load(SeqCst),
+            2,
+            "the refusal is not a request"
+        );
+    }
+
     /// A router whose model carries a (minimal) tools-capable chat template.
     /// Tool requests need one: without a template there is nothing that can
     /// render tool definitions, and the API refuses rather than answering as
