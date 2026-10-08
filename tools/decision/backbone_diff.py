@@ -24,7 +24,8 @@ norm and lm_head. Each tensor's first and last SLICE bytes are hashed (a fine-tu
 moves essentially every element).
 
 --adapter (a PEFT adapter dir or its adapter_model.safetensors; adapter_config.json's
-target_modules when there is no adapter file: a list of module-name suffixes, a regex, or
+target_modules when there is no adapter file: a list of module-name suffixes, a regex fullmatched
+against the PEFT module name with or without its `model.` / `model.language_model.` prefix, or
 "all-linear") names the modules the fine-tune's LoRA targets. When every differing tensor is the
 `.weight` of one of those modules, the shards may carry the adapter already merged, and exporting
 them with the same adapter grafted again would apply it twice. That pattern alone does not prove
@@ -32,9 +33,11 @@ a merge (an independent fine-tune of the same modules looks the same), so it is 
 the one or two smallest differing decoder-layer targets (at most --merge-check-bytes each) both
 tensors and the adapter's lora_A/lora_B are read whole, and (B - A) must equal +-scale * lora_B @
 lora_A within the shard dtype's rounding (residual RMS <= RMS of one ulp, |cosine| >= 0.9). If it
-does, MERGED; if the difference is clearly unrelated to the adapter's delta (|cosine| < 0.5) on every
-checked tensor, FINETUNED; anything else (a config-only --adapter with no lora tensors, rank/alpha patterns, DoRA,
-no small target, mixed or in-between evidence) is UNKNOWN. An --adapter whose targets match none of
+does, MERGED; if the difference is unrelated to the adapter's delta (|cosine| < 0.5) AND clearly
+beyond rounding (at least 5% of the elements outside the half-ulp bound a merge obeys) on every
+checked tensor, FINETUNED; anything else (a config-only --adapter with no lora tensors, rank/alpha
+patterns, DoRA, no small target, a delta below the dtype's resolution, mixed or in-between
+evidence) is UNKNOWN. An --adapter whose targets match none of
 the compared tensors is UNKNOWN as well.
 
 The last line is always one verdict:
@@ -268,6 +271,11 @@ def adapter_lora(path):
     return out
 
 
+# Full-name prefixes a canonical `layers.N.…` module can carry under PEFT: bare, text-only CausalLM,
+# a Qwen3.5 VLM-class model, and the older LLaVA-style wrapper.
+_MODULE_PREFIXES = ("", "model.", "model.language_model.", "language_model.model.")
+
+
 def adapter_targets(path):
     """Predicate over canonical tensor names: is this the `.weight` of a module the PEFT adapter at
     `path` targets? `path` is adapter_model.safetensors or a dir holding it (exact modules, from the
@@ -307,7 +315,9 @@ def adapter_targets(path):
             return False
         mod = name[:-len(".weight")]
         if isinstance(tm, str):
-            return rx.fullmatch(mod) is not None or rx.fullmatch("model." + mod) is not None
+            # PEFT fullmatches the regex against the module's full name, which depends on the model
+            # class: text-only `model.layers.N.…`, a Qwen3.5 VLM `model.language_model.layers.N.…`
+            return any(rx.fullmatch(pre + mod) is not None for pre in _MODULE_PREFIXES)
         return any(mod == t or mod.endswith("." + t) for t in tm)
     return on
 
@@ -316,6 +326,8 @@ def adapter_targets(path):
 
 _MANT_BITS = {"BF16": 7, "F16": 10, "F32": 23}
 MERGE_CHECK_BYTES = 32 << 20
+# FINETUNED needs this share of elements outside a genuine merge's rounding bound (a merge has 0).
+BEYOND_ROUNDING_FRAC = 0.05
 
 
 def read_tensor(entry):
@@ -342,9 +354,16 @@ def _ulp(x, dtype):
 def merge_evidence(stock, tuned, lora_a, lora_b, scale, dtype):
     """-> (verdict, why) for one target tensor. MERGED when tuned - stock equals +-scale*B@A within
     `dtype`'s rounding (residual RMS no larger than the RMS of one ulp of the larger operand) and
-    follows it closely (|cosine| >= 0.9: a delta below the dtype's resolution proves nothing);
-    FINETUNED when the difference is clearly unrelated to the adapter delta (|cosine| < 0.5);
-    UNKNOWN otherwise (e.g. the right direction at the wrong scale)."""
+    follows it closely (|cosine| >= 0.9: a delta below the dtype's resolution proves nothing).
+
+    FINETUNED only when the difference is unrelated to the adapter delta (|cosine| < 0.5) AND the
+    residual clearly exceeds rounding: at least BEYOND_ROUNDING_FRAC of the elements sit outside the
+    bound a genuine merge obeys. Merging rounds each element once, so |diff - delta| is at most half
+    an ulp of the larger operand, plus half an ulp of the delta when the delta was itself rounded to
+    `dtype` first; a merge lands exactly 0 elements outside, an independent change of any size a
+    sizeable share. A small cosine with the residual inside rounding is a delta lost below the
+    dtype's resolution, not evidence of an independent fine-tune: UNKNOWN. UNKNOWN also for the right
+    direction at the wrong scale."""
     import numpy as np
     if lora_a.ndim != 2 or lora_b.ndim != 2 or lora_b.shape[1] != lora_a.shape[0]:
         return "UNKNOWN", f"lora_A {lora_a.shape} / lora_B {lora_b.shape} do not compose"
@@ -357,13 +376,20 @@ def merge_evidence(stock, tuned, lora_a, lora_b, scale, dtype):
         return "UNKNOWN", "zero adapter delta or zero difference"
     cos = float(np.vdot(diff, delta)) / (nd * nf)
     sign = 1.0 if cos >= 0 else -1.0
-    resid = float(np.sqrt(np.mean((diff - sign * delta) ** 2)))
-    noise = float(np.sqrt(np.mean(_ulp(np.maximum(np.abs(stock), np.abs(tuned)), dtype) ** 2)))
-    stats = f"cos {cos:+.4f}, residual RMS {resid:.3g} vs rounding RMS {noise:.3g}"
+    r = np.abs(diff - sign * delta)
+    ulp = _ulp(np.maximum(np.abs(stock), np.abs(tuned)), dtype)
+    resid = float(np.sqrt(np.mean(r ** 2)))
+    noise = float(np.sqrt(np.mean(ulp ** 2)))
+    bound = (0.5 * ulp + 2.0 ** -(_MANT_BITS[dtype] + 1) * np.abs(delta)) * (1 + 1e-9)
+    beyond = float(np.mean(r > bound))
+    stats = (f"cos {cos:+.4f}, residual RMS {resid:.3g} vs rounding RMS {noise:.3g}, "
+             f"{beyond:.1%} of elements beyond rounding")
     if resid <= noise and abs(cos) >= 0.9:
         return "MERGED", stats
-    if abs(cos) < 0.5:
+    if abs(cos) < 0.5 and beyond >= BEYOND_ROUNDING_FRAC:
         return "FINETUNED", stats
+    if abs(cos) < 0.5:
+        return "UNKNOWN", f"{stats}: the difference is within rounding of the adapter delta (a delta below the dtype's resolution)"
     return "UNKNOWN", stats
 
 
