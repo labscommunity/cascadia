@@ -3601,9 +3601,11 @@ impl Qwen36Engine {
         }
     }
 
-    /// Decision trees with the prefix cache on: measure the warmup's one-token state (the fixed
-    /// recurrent state plus one token of KV, one copy of tens of MB) and record it as the size
-    /// model's first point, without caching it (P3-CE-1). Chat-only trees skip the copy.
+    /// Decision trees with the prefix cache on: copy the warmup's one-token state (the fixed
+    /// recurrent state plus one token of KV, one copy of tens of MB) and read the snapshot size
+    /// model from it, without caching it: each KV state's bytes per token and the fixed rest
+    /// ([`crate::prefix_cache::PrefixCache::observe_state`]), so the size estimate is exact from
+    /// the first request (P3-CE-1, P4-CE-1). Chat-only trees skip the copy.
     fn observe_warmup_state(&mut self) {
         if !self.prefix_cache.enabled() || self.decision_assets.is_none() || self.stages_dirty {
             return;
@@ -3611,11 +3613,19 @@ impl Qwen36Engine {
         match self.parts_local_stages() {
             Ok(parts) => {
                 let bytes: usize = parts.iter().map(Vec::len).sum();
-                self.prefix_cache.observe(1, bytes);
-                info!(
-                    bytes,
-                    "qwen35 prefix-cache: measured the one-token state size"
-                );
+                match self.prefix_cache.observe_state(&parts) {
+                    Some((fixed, per_token)) => info!(
+                        bytes,
+                        fixed,
+                        per_token,
+                        "qwen35 prefix-cache: measured the snapshot size model from the warmup state"
+                    ),
+                    None => warn!(
+                        bytes,
+                        "qwen35 prefix-cache: the warmup state has no readable KV layout; only a \
+                         lower bound on a decision snapshot's size is known until one is taken"
+                    ),
+                }
             }
             Err(e) => warn!(error = %e, "qwen35 prefix-cache: could not measure the state size"),
         }
