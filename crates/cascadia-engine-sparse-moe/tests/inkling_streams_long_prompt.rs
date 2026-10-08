@@ -5,19 +5,22 @@
 //! minutes of outage per request). Long prompts now travel as `StreamFeed`
 //! windows. Here the window is 4 rows, so ordinary fixture prompts split into
 //! 2-4 windows, and the tokens must equal the single-stage engine's (which
-//! never windows). One binary, one test: the window size is read once per
-//! process from the environment.
+//! never windows). The window size is read once per process from the
+//! environment, so every test in this binary sets the same value.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use cascadia_engine::Engine;
+use async_trait::async_trait;
+use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_engine_sparse_moe::dist::StageTransport;
 use cascadia_engine_sparse_moe::engine::PipelineEngine;
 use cascadia_engine_sparse_moe::inkling::stage::InklingRunner;
+use cascadia_runner::Runner;
 use cascadia_transport::{ActivationClient, ActivationServer};
-use cascadia_types::GenerationTask;
+use cascadia_types::{GenerationTask, PeerLayout, ShardSpec};
+use futures::StreamExt;
 use tokio::sync::Mutex;
 
 fn fixture() -> Option<PathBuf> {
@@ -94,54 +97,68 @@ async fn link() -> (Arc<Mutex<ActivationServer>>, Arc<Mutex<ActivationClient>>) 
     (server, Arc::new(Mutex::new(client)))
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn windowed_prompts_match_single_stage() {
-    let Some(dir) = fixture() else { return };
-    std::env::set_var("CASCADIA_STREAMS_PREFILL_WINDOW", "4");
-    let handle = tokio::runtime::Handle::current();
-    let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
-    let ids: Vec<String> = (0..PROMPTS.len()).map(|i| format!("t{i}")).collect();
-    let lens: Vec<usize> = PROMPTS
-        .iter()
-        .map(|p| tok.encode(*p, true).unwrap().get_ids().len())
-        .collect();
-    assert!(
-        lens.iter().filter(|&&n| n > 4).count() >= 4 && lens.iter().any(|&n| n <= 4),
-        "the fixture prompts must cover windowed and plain admission: {lens:?}"
+/// The tokens of the single-stage engine (which never windows a prompt).
+async fn reference(
+    dir: &std::path::Path,
+    tok: &tokenizers::Tokenizer,
+    tasks: Vec<GenerationTask>,
+) -> Vec<Vec<i64>> {
+    let runner =
+        InklingRunner::load_staged(dir, 64, 0, 1, 0, 0, Some("eager".into()), None).unwrap();
+    let mut e = PipelineEngine::new(
+        runner,
+        Some(tok.clone()),
+        StageTransport::default(),
+        tokio::runtime::Handle::current(),
+        0,
+        1,
+        None,
     );
+    let ids: Vec<String> = tasks.iter().map(|t| t.task_id.to_string()).collect();
+    tokio::task::spawn_blocking(move || {
+        for t in tasks {
+            e.submit(t).unwrap();
+        }
+        collect(&mut e, &ids)
+    })
+    .await
+    .unwrap()
+}
 
-    // Reference: the single-stage engine, which never windows a prompt.
-    let expected = {
-        let runner =
-            InklingRunner::load_staged(&dir, 64, 0, 1, 0, 0, Some("eager".into()), None).unwrap();
-        let mut e = PipelineEngine::new(
-            runner,
-            Some(tok.clone()),
-            StageTransport::default(),
-            handle.clone(),
-            0,
-            1,
-            None,
-        );
-        let ids2 = ids.clone();
-        tokio::task::spawn_blocking(move || {
-            for t in tasks() {
-                e.submit(t).unwrap();
-            }
-            collect(&mut e, &ids2)
-        })
-        .await
-        .unwrap()
-    };
-    assert!(expected.iter().all(|t| !t.is_empty()));
+/// Ranks 1 and 2 of a 3-rank loopback pipeline, stepped on their own threads.
+struct Workers {
+    stop: Arc<AtomicBool>,
+    died: Arc<AtomicBool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+    links: [Arc<Mutex<ActivationClient>>; 2],
+}
 
-    // 3 ranks over loopback, 3 slots for 5 tasks (slots are reused), plus one
-    // long task that is cancelled while its windows are still going down.
+impl Workers {
+    /// Stop the workers; `true` if one of them dropped out before.
+    async fn shutdown(self) -> bool {
+        let died = self.died.load(Ordering::Relaxed);
+        self.stop.store(true, Ordering::Relaxed);
+        for c in &self.links {
+            c.lock().await.close().await;
+        }
+        for w in self.threads {
+            let _ = w.join();
+        }
+        died
+    }
+}
+
+/// A 3-rank loopback pipeline with 3 stream slots: rank 0, and the workers.
+async fn pipeline(
+    dir: &std::path::Path,
+    tok: tokenizers::Tokenizer,
+) -> (PipelineEngine<InklingRunner>, Workers) {
+    let handle = tokio::runtime::Handle::current();
     let (s01, c01) = link().await;
     let (s12, c12) = link().await;
-    let r0 = InklingRunner::load_staged(&dir, 64, 0, 3, 0, 2, Some("eager".into()), None).unwrap();
-    let r1 = InklingRunner::load_staged(&dir, 64, 1, 3, 2, 3, Some("eager".into()), None).unwrap();
-    let r2 = InklingRunner::load_staged(&dir, 64, 2, 3, 3, 4, Some("eager".into()), None).unwrap();
+    let r0 = InklingRunner::load_staged(dir, 64, 0, 3, 0, 2, Some("eager".into()), None).unwrap();
+    let r1 = InklingRunner::load_staged(dir, 64, 1, 3, 2, 3, Some("eager".into()), None).unwrap();
+    let r2 = InklingRunner::load_staged(dir, 64, 2, 3, 3, 4, Some("eager".into()), None).unwrap();
     let mut e0 = PipelineEngine::new(
         r0,
         Some(tok),
@@ -184,7 +201,7 @@ async fn windowed_prompts_match_single_stage() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let died = Arc::new(AtomicBool::new(false));
-    let workers: Vec<_> = [Box::new(e1) as Box<dyn Engine>, Box::new(e2)]
+    let threads = [Box::new(e1) as Box<dyn Engine>, Box::new(e2)]
         .into_iter()
         .map(|mut e| {
             let (stop, died) = (stop.clone(), died.clone());
@@ -198,7 +215,36 @@ async fn windowed_prompts_match_single_stage() {
             })
         })
         .collect();
+    let workers = Workers {
+        stop,
+        died,
+        threads,
+        links: [c01, c12],
+    };
+    (e0, workers)
+}
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windowed_prompts_match_single_stage() {
+    let Some(dir) = fixture() else { return };
+    std::env::set_var("CASCADIA_STREAMS_PREFILL_WINDOW", "4");
+    let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
+    let ids: Vec<String> = (0..PROMPTS.len()).map(|i| format!("t{i}")).collect();
+    let lens: Vec<usize> = PROMPTS
+        .iter()
+        .map(|p| tok.encode(*p, true).unwrap().get_ids().len())
+        .collect();
+    assert!(
+        lens.iter().filter(|&&n| n > 4).count() >= 4 && lens.iter().any(|&n| n <= 4),
+        "the fixture prompts must cover windowed and plain admission: {lens:?}"
+    );
+
+    let expected = reference(&dir, &tok, tasks()).await;
+    assert!(expected.iter().all(|t| !t.is_empty()));
+
+    // 3 ranks over loopback, 3 slots for 5 tasks (slots are reused), plus one
+    // long task that is cancelled while its windows are still going down.
+    let (mut e0, workers) = pipeline(&dir, tok).await;
     let ids2 = ids.clone();
     let got = tokio::task::spawn_blocking(move || {
         // A long prompt cancelled after its first window: its slot must come
@@ -220,15 +266,9 @@ async fn windowed_prompts_match_single_stage() {
     .await
     .unwrap();
     assert!(
-        !died.load(Ordering::Relaxed),
+        !workers.shutdown().await,
         "a worker rank dropped out while the prompts were fed"
     );
-    stop.store(true, Ordering::Relaxed);
-    c01.lock().await.close().await;
-    c12.lock().await.close().await;
-    for w in workers {
-        let _ = w.join();
-    }
     for (i, (g, e)) in got.iter().zip(&expected).enumerate() {
         assert_eq!(
             g, e,
@@ -237,4 +277,77 @@ async fn windowed_prompts_match_single_stage() {
         );
         assert_eq!(g.len() as u32, MAX_TOKENS[i], "task {i}: token count");
     }
+}
+
+struct PrebuiltBuilder {
+    engine: Option<Box<dyn Engine>>,
+}
+
+#[async_trait]
+impl Builder for PrebuiltBuilder {
+    async fn connect(&mut self, _peers: PeerLayout) -> EngineResult<()> {
+        Ok(())
+    }
+    async fn load(&mut self, _shard: ShardSpec) -> EngineResult<LoadStream> {
+        Ok(Box::pin(futures::stream::iter(Vec::new())))
+    }
+    fn build(mut self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
+        self.engine.take().ok_or(EngineError::NotLoaded)
+    }
+}
+
+/// A prompt of more than three rounds of windows, alone on an idle pipeline,
+/// through the runner's chunk stream. The runner fails a task after three
+/// steps with no chunk; a step used to send only one window per group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lone_long_prompt_finishes_through_the_runner() {
+    let Some(dir) = fixture() else { return };
+    std::env::set_var("CASCADIA_STREAMS_PREFILL_WINDOW", "4");
+    let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
+    let prompt: Vec<String> = (1..=44).map(|i| format!("a{i}")).collect();
+    let prompt = prompt.join(" ");
+    let task = || {
+        let mut t = GenerationTask::new("long", prompt.as_str());
+        t.max_tokens = 6;
+        t.temperature = 0.0;
+        t
+    };
+    // 3 groups, 4-row windows: more than 3 rounds of windows, inside max_seq.
+    let n = tok.encode(prompt.as_str(), true).unwrap().get_ids().len();
+    assert!(n > 3 * 3 * 4 && n + 6 <= 64, "prompt tokens: {n}");
+
+    let expected = reference(&dir, &tok, vec![task()]).await.remove(0);
+    assert_eq!(expected.len(), 6);
+
+    let (e0, workers) = pipeline(&dir, tok).await;
+    let runner = Arc::new(Runner::new(Box::new(PrebuiltBuilder {
+        engine: Some(Box::new(e0)),
+    })));
+    let spec = ShardSpec {
+        model_id: "inkling".into(),
+        layer_start: 0,
+        layer_end: 2,
+        total_layers: 4,
+        device: "CPU".into(),
+        is_first_stage: true,
+        is_last_stage: false,
+        tp_size: 1,
+        tp_rank: 0,
+    };
+    runner.start(PeerLayout::default(), spec).await.unwrap();
+    let mut stream = runner.generate_async(task()).await.unwrap();
+    let mut got = Vec::new();
+    while let Some(c) = stream.next().await {
+        assert!(c.error.is_none(), "the long prompt failed: {:?}", c.error);
+        if !c.is_final {
+            got.push(c.token_id);
+        }
+    }
+    drop(stream);
+    runner.close();
+    assert!(
+        !workers.shutdown().await,
+        "a worker rank dropped out while the prompt was fed"
+    );
+    assert_eq!(got, expected, "tokens differ from the single-stage path");
 }
