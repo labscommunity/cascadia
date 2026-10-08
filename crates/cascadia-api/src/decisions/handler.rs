@@ -62,7 +62,8 @@ fn engine_failure(reason: &str) -> DecisionError {
         return DecisionError::TooLong("decision prompt too long for the model's head".into());
     }
     // A `require_warm` pass whose shared-prefix snapshot was evicted (SEC-3): the engine refused
-    // to prefill past the request's budget. Busy, not broken: the capacity 503, retry.
+    // to prefill past the request's budget. Busy, not broken: the capacity 503, retry. (A
+    // snapshot that can never fit is `decision_uncacheable`, a 413, handled by the caller.)
     if reason.starts_with("decision_cold") {
         return DecisionError::Engine(CAPACITY.into());
     }
@@ -70,6 +71,16 @@ fn engine_failure(reason: &str) -> DecisionError {
 }
 
 const CAPACITY: &str = "engine at capacity; retry after current requests complete";
+
+/// The 413 for a request admitted on the shared-prefix discount whose prefix the engine's cache
+/// can never hold (`decision_uncacheable`): without reuse it needs every pass in full.
+fn uncacheable(passes: &[super::Pass], max_total: usize) -> DecisionError {
+    let full: usize = passes.iter().map(|p| p.readout.prompt_ids.len()).sum();
+    DecisionError::TooLong(format!(
+        "this request needs {full} prefill tokens without prefix reuse (the shared prefix cannot \
+         fit the prefix cache); the per-request limit is {max_total}"
+    ))
+}
 
 /// POST /v1/systemone: the Jev/SystemOne wire format.
 pub async fn decide(State(state): State<AppState>, Json(req): Json<DecisionRequest>) -> Response {
@@ -211,6 +222,12 @@ pub(crate) async fn evaluate(
         let mut logits = None;
         while let Some(chunk) = stream.next().await {
             if let Some(reason) = &chunk.error {
+                // The cache can never hold this request's shared prefix (refused before the first
+                // pass prefilled anything): the request needs its full length, a 413.
+                if reason.starts_with("decision_uncacheable") {
+                    tracing::warn!(reason, "decision pass failed");
+                    return Err(uncacheable(&passes, svc.max_total_tokens));
+                }
                 return Err(engine_failure(reason));
             }
             if chunk.is_final {
