@@ -221,8 +221,11 @@ const FRAME_DECISION: u32 = 16;
 const CAP_CAPTURE_V2: u32 = 1;
 const CAP_DECISION: u32 = 2;
 
-fn own_caps() -> u32 {
-    (CAPTURE_V2_CAP & CAP_CAPTURE_V2) | CAP_DECISION
+/// This rank's capability bits. CAP_DECISION only when the rank can take part in a decision pass
+/// (`Qwen36Engine::serves_decisions`), so a chain with a rank that would refuse at DECIDE_RUN,
+/// after a full chain prefill, is refused by rank 0 before any frame goes out.
+fn own_caps(serves_decisions: bool) -> u32 {
+    (CAPTURE_V2_CAP & CAP_CAPTURE_V2) | if serves_decisions { CAP_DECISION } else { 0 }
 }
 
 fn combine_caps(own: u32, down: u32) -> u32 {
@@ -659,18 +662,37 @@ impl Builder for Qwen36Builder {
         }
 
         // Every rank: pipeline ranks other than 0 have no tokenizer, yet validate readouts too.
-        self.vocab = read_vocab(&dir);
-        self.decision_assets = if owns_head(self.rank, self.total)
-            && dir.join("decision").join("head.json").exists()
-        {
+        // A missing config.json only matters to a decision tree; chat-only pipeline ranks
+        // (manifest.json + stage<i>/) must not warn about it.
+        let decision_tree = dir.join("decision.json").exists() || dir.join("decision").exists();
+        self.vocab = read_vocab(&dir, decision_tree);
+        let head_owner = owns_head(self.rank, self.total);
+        self.decision_assets = if head_owner && dir.join("decision").join("head.json").exists() {
             progress.push(LoadProgress::message(
                 "loading decision head assets".to_string(),
             ));
-            Some(
-                crate::decision::HeadAssets::load(&dir, manifest.hidden())
-                    .map_err(EngineError::Backend)?,
-            )
+            let assets = crate::decision::HeadAssets::load(&dir, manifest.hidden())
+                .map_err(EngineError::Backend)?;
+            info!(
+                head = assets.kind(),
+                hidden = manifest.hidden(),
+                "qwen35: loaded the decision head"
+            );
+            if assets.reads_hidden() && !manifest.final_hidden_output {
+                warn!(
+                    head = assets.kind(),
+                    "qwen35: the tree was exported without --final-hidden; every decision pass \
+                     will be refused (501)"
+                );
+            }
+            Some(assets)
         } else {
+            if head_owner && dir.join("decision.json").exists() {
+                warn!(
+                    "qwen35: decision.json is present but decision/head.json is not; every \
+                     decision pass will be refused (501)"
+                );
+            }
             None
         };
 
@@ -819,13 +841,15 @@ fn read_max_ctx(dir: &Path) -> Option<usize> {
     max
 }
 
-/// `text_config.vocab_size` (or top-level `vocab_size`) from the tree's config.json; `None` with a
-/// warning when absent. Only decision admission needs it.
-fn read_vocab(dir: &Path) -> Option<usize> {
+/// `text_config.vocab_size` (or top-level `vocab_size`) from the tree's config.json; `None` when
+/// absent (with a warning when `warn_missing`: a decision tree). Only decision admission needs it.
+fn read_vocab(dir: &Path, warn_missing: bool) -> Option<usize> {
     let raw = match std::fs::read_to_string(dir.join("config.json")) {
         Ok(r) => r,
         Err(e) => {
-            warn!(error = %e, "qwen35: no config.json; decision passes will be refused");
+            if warn_missing {
+                warn!(error = %e, "qwen35: no config.json; decision passes will be refused");
+            }
             return None;
         }
     };
@@ -833,7 +857,7 @@ fn read_vocab(dir: &Path) -> Option<usize> {
     let v = cfg["text_config"]["vocab_size"]
         .as_u64()
         .or_else(|| cfg["vocab_size"].as_u64());
-    if v.is_none() {
+    if v.is_none() && warn_missing {
         warn!("qwen35: config.json states no vocab_size; decision passes will be refused");
     }
     v.map(|v| v as usize)
@@ -912,6 +936,23 @@ fn decision_warm_probe<'a>(d: &cascadia_types::DecisionReadout, ids: &'a [u32]) 
         0 => &ids[..0],
         lim => &ids[..(lim + 1).min(ids.len())],
     }
+}
+
+/// A `require_warm` pass whose restore stopped short of its shared prefix: the request's snapshot
+/// was evicted (another request's pass took the cache) or never fit the cache budget. Prefilling
+/// the prefix again would exceed the budget the API admitted the request under (SEC-3), so the
+/// pass is refused before any prefill and the API answers 503 (retry).
+fn decision_cold_refusal(
+    d: &cascadia_types::DecisionReadout,
+    warm_prefix: usize,
+) -> Option<String> {
+    let need = d.cache_prefix? as usize;
+    (d.require_warm && warm_prefix < need).then(|| {
+        format!(
+            "decision_cold: the shared prefix snapshot ({need} tokens) is not cached; restored \
+             {warm_prefix}"
+        )
+    })
 }
 
 /// The empty think block the official chat template injects for `enable_thinking=false`.
@@ -1042,9 +1083,11 @@ pub struct Qwen36Engine {
     vocab: Option<usize>,
     /// The active pass needs final hidden rows: `chain_pass_inner` copies output 1 only while
     /// set, so chat traffic on a decision tree never pays the [1, n, hidden] copy. Assigned on
-    /// every admission.
+    /// every single-box and rank-0 admission; on the pipeline last rank it is set at
+    /// FRAME_DECIDE and cleared by RESET, RESTORE and DECIDE_RUN.
     want_final_hidden: bool,
-    /// Final hidden of the latest `chain_pass` (when `want_final_hidden`), taken by `run_span`.
+    /// Final hidden of the latest `chain_pass` (when `want_final_hidden`), taken by `run_span`
+    /// (single box) or by the pipeline last rank's FORWARD arm.
     last_final_hidden: Option<Vec<f32>>,
     /// Pipeline last rank: the readout FRAME_DECIDE announced (see [`PendingDecision`]).
     pending_decision: PendingDecision,
@@ -1438,6 +1481,29 @@ impl Qwen36Engine {
         owns_head(self.rank, self.total)
     }
 
+    /// The rank can take part in a decision pass: it validates readouts against its vocab, and
+    /// the head-owning rank has head assets. Advertised in the HELLO capability bits.
+    fn serves_decisions(&self) -> bool {
+        self.vocab.is_some() && (!self.owns_head() || self.decision_assets.is_some())
+    }
+
+    /// Rank 0's up-front refusal of a decision pass: a malformed readout, or a chain in which some
+    /// rank (an older build, or one without config.json vocab_size or decision/ assets) cannot
+    /// serve it. Refused before any frame of the task goes out.
+    fn pipe_decision_refusal(&self, d: &cascadia_types::DecisionReadout) -> Option<String> {
+        if d.require_warm {
+            // Pipeline ranks never resume a decision prefix (the API sets this only with reuse).
+            return Some("decision_invalid: require_warm needs the single-box prefix cache".into());
+        }
+        self.admit_decision_check(d).err().or_else(|| {
+            (!chain_decision(self.chain_caps)).then(|| {
+                "decision_unsupported: a pipeline rank cannot serve decision passes (an older \
+                 build, or no config.json vocab_size or decision/ head assets on that rank)"
+                    .to_string()
+            })
+        })
+    }
+
     /// End a decision pass: run the head on the collected state, emit ONE final chunk, reset.
     fn finish_decision(&mut self) -> Vec<(TaskId, Chunk)> {
         self.want_final_hidden = false;
@@ -1561,7 +1627,7 @@ impl Qwen36Engine {
                 "qwen36 pipeline handshake refused: {reason}"
             )));
         }
-        let caps = combine_caps(own_caps(), down_cap);
+        let caps = combine_caps(own_caps(self.serves_decisions()), down_cap);
         self.chain_caps = caps;
         self.chain_capture_v2 = (caps & CAP_CAPTURE_V2).min(CAPTURE_V2_CAP);
         self.handshake_done = true;
@@ -1959,13 +2025,7 @@ impl Qwen36Engine {
             // well-formedness check) and require every rank to speak the decision frames,
             // before any frame of this task goes out.
             if let Some(d) = &task.decision {
-                let refused = self.admit_decision_check(d).err().or_else(|| {
-                    (!chain_decision(self.chain_caps)).then(|| {
-                        "decision_unsupported: a pipeline rank predates the decision frames"
-                            .to_string()
-                    })
-                });
-                if let Some(reason) = refused {
+                if let Some(reason) = self.pipe_decision_refusal(d) {
                     let id = task.task_id.clone();
                     return vec![(id.clone(), Chunk::error(id, reason))];
                 }
@@ -2438,7 +2498,7 @@ impl Qwen36Engine {
                 // Chain capability bits: this rank's own, ANDed with everything below it. The last
                 // rank has nothing below, so it reports its own. An old downstream rank replies its
                 // capture floor (0/1), which clears CAP_DECISION and keeps bit 0's meaning.
-                let mut cap = own_caps();
+                let mut cap = own_caps(self.serves_decisions());
                 if reason.is_none() && !is_last {
                     match self.forward_hello_downstream(&payload) {
                         Ok((r, down_cap)) => {
@@ -2945,6 +3005,15 @@ impl Qwen36Engine {
                     "stage state reset failed; refusing to serve on unknown state",
                 );
                 return vec![(id, c)];
+            }
+            if let Some(reason) = task
+                .decision
+                .as_ref()
+                .and_then(|d| decision_cold_refusal(d, warm_prefix))
+            {
+                warn!(task = %task.task_id, %reason, "qwen35: decision pass refused");
+                let id = task.task_id.clone();
+                return vec![(id.clone(), Chunk::error(id, reason))];
             }
             // Snapshot points for THIS turn (end of the system block, and the position before the
             // prompt's last `<|im_start|>`, which the next turn re-sends verbatim): only positions
@@ -3710,7 +3779,12 @@ mod tests {
 
     #[test]
     fn capability_bits_degrade_to_old_ranks() {
-        let own = own_caps();
+        let own = own_caps(true);
+        assert!(
+            !chain_decision(own_caps(false)),
+            "a rank that cannot serve decisions clears the bit"
+        );
+        assert_eq!(own_caps(false) & CAP_CAPTURE_V2, own & CAP_CAPTURE_V2);
         assert!(
             chain_decision(own),
             "a new build advertises decision frames"
@@ -4382,6 +4456,7 @@ mod tests {
                 prompt_ids: vec![7, 8, 9, 10],
                 head,
                 cache_prefix,
+                require_warm: false,
             }),
         }
     }
@@ -4448,6 +4523,7 @@ mod tests {
             prompt_ids: (100..100 + n).collect(),
             head,
             cache_prefix: None,
+            require_warm: false,
         }
     }
 
@@ -4533,6 +4609,7 @@ mod tests {
                 option_pos: vec![0, 1],
             },
             cache_prefix: None,
+            require_warm: false,
         };
         let err = e.admit_decision_check(&pointer).unwrap_err();
         assert!(
@@ -4544,6 +4621,7 @@ mod tests {
             prompt_ids: vec![1, 2, 3],
             head: ReadoutHead::Verbalizer { token_ids: vec![1] },
             cache_prefix: None,
+            require_warm: false,
         };
         assert!(e.admit_decision_check(&verbalizer).is_ok());
         e.final_hidden_output = true;
@@ -4555,6 +4633,112 @@ mod tests {
             .admit_decision_check(&pointer)
             .unwrap_err()
             .contains("decision_unsupported"));
+    }
+
+    #[test]
+    fn rank0_refuses_a_chain_that_cannot_serve_decisions_up_front() {
+        // QUA-3 / Task 15 ruling: an old rank (or one without vocab or head assets) clears
+        // CAP_DECISION, and rank 0 refuses with 501 before any frame goes out.
+        use cascadia_types::{DecisionReadout, ReadoutHead};
+        let mut e = bare_engine(2, "{}");
+        e.rank = 0;
+        e.vocab = Some(16);
+        let verbalizer = DecisionReadout {
+            prompt_ids: vec![1, 2, 3],
+            head: ReadoutHead::Verbalizer { token_ids: vec![1] },
+            cache_prefix: None,
+            require_warm: false,
+        };
+        // An old last rank replies its capture floor (0 or 1).
+        for old in [0, 1] {
+            e.chain_caps = combine_caps(own_caps(e.serves_decisions()), old);
+            let why = e.pipe_decision_refusal(&verbalizer).unwrap();
+            assert!(why.starts_with("decision_unsupported"), "{why}");
+        }
+        e.chain_caps = combine_caps(own_caps(true), own_caps(true));
+        assert_eq!(e.pipe_decision_refusal(&verbalizer), None);
+        // A malformed readout is refused first, as decision_invalid.
+        let bad = DecisionReadout {
+            prompt_ids: vec![99],
+            ..verbalizer.clone()
+        };
+        assert!(e
+            .pipe_decision_refusal(&bad)
+            .unwrap()
+            .starts_with("decision_invalid"));
+    }
+
+    #[test]
+    fn a_require_warm_pass_that_missed_its_snapshot_is_refused() {
+        // SEC-3: a later Kev pass admitted on the shared-prefix discount must not re-prefill the
+        // state when the snapshot is gone.
+        use cascadia_types::{DecisionReadout, ReadoutHead};
+        let mut d = DecisionReadout {
+            prompt_ids: vec![1; 10],
+            head: ReadoutHead::Pointer {
+                decide_pos: 9,
+                option_pos: vec![7, 8],
+            },
+            cache_prefix: Some(6),
+            require_warm: true,
+        };
+        let why = decision_cold_refusal(&d, 0).unwrap();
+        assert!(why.starts_with("decision_cold"), "{why}");
+        assert!(
+            decision_cold_refusal(&d, 5).is_some(),
+            "a shorter restore re-prefills too"
+        );
+        assert_eq!(decision_cold_refusal(&d, 6), None);
+        assert_eq!(decision_cold_refusal(&d, 7), None);
+        d.require_warm = false;
+        assert_eq!(
+            decision_cold_refusal(&d, 0),
+            None,
+            "cold is fine when not required"
+        );
+        // Pipelines never resume a decision prefix.
+        d.require_warm = true;
+        let mut e = bare_engine(2, "{}");
+        e.rank = 0;
+        e.vocab = Some(16);
+        e.final_hidden_output = true;
+        e.chain_caps = own_caps(true);
+        assert!(e
+            .pipe_decision_refusal(&d)
+            .unwrap()
+            .starts_with("decision_invalid"));
+    }
+
+    #[test]
+    fn a_rank_without_vocab_or_head_assets_does_not_advertise_decisions() {
+        // REG-2: a chat-only last rank (no config.json, no decision/) clears CAP_DECISION, so rank
+        // 0 refuses up front instead of the last rank refusing after a full chain prefill.
+        let mut e = bare_engine(2, "{}");
+        e.rank = 0;
+        assert!(!e.serves_decisions(), "no vocab");
+        e.vocab = Some(16);
+        assert!(e.serves_decisions(), "rank 0 needs no head assets");
+        e.rank = 1;
+        assert!(
+            !e.serves_decisions(),
+            "the head-owning rank needs decision/ assets"
+        );
+        e.decision_assets = Some(crate::decision::HeadAssets::Verbalizer);
+        assert!(e.serves_decisions());
+    }
+
+    #[test]
+    fn read_vocab_is_quiet_on_chat_only_ranks() {
+        let d = std::env::temp_dir().join(format!("vocab-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(read_vocab(&d, false), None);
+        std::fs::write(
+            d.join("config.json"),
+            r#"{"text_config": {"vocab_size": 7}}"#,
+        )
+        .unwrap();
+        assert_eq!(read_vocab(&d, false), Some(7));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -4570,6 +4754,7 @@ mod tests {
                 }],
             },
             cache_prefix: None,
+            require_warm: false,
         };
         let mut e = bare_engine(2, "{}");
         e.rank = 0;
@@ -4599,6 +4784,7 @@ mod tests {
             prompt_ids: vec![1, 2],
             head: ReadoutHead::Verbalizer { token_ids: vec![1] },
             cache_prefix: None,
+            require_warm: false,
         };
         e.want_final_hidden = true;
         e.last_final_hidden = Some(vec![0.5; 8]);
@@ -4632,6 +4818,7 @@ mod tests {
             prompt_ids: vec![1, 2],
             head: ReadoutHead::Verbalizer { token_ids: vec![1] },
             cache_prefix: None,
+            require_warm: false,
         };
         let mut p = Some((
             7,

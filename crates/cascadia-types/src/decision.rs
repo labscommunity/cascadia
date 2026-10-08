@@ -82,6 +82,12 @@ pub struct DecisionReadout {
     /// The engine snapshots the prefix cache there so later passes prefill only their tail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_prefix: Option<u32>,
+    /// The pass must resume from the prefix cache at `cache_prefix` or later (single box). Set by
+    /// the API on a later pass of a request whose budget counted the shared prefix once: if the
+    /// snapshot was evicted, the engine refuses the pass (`decision_cold`) instead of prefilling
+    /// the prefix again past the budget the request was admitted under.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_warm: bool,
 }
 
 /// Which head reads the prefilled state. Positions/spans index `prompt_ids`.
@@ -286,6 +292,7 @@ mod tests {
                 token_ids: vec![10, 11],
             },
             cache_prefix: None,
+            require_warm: false,
         };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("\"kind\":\"verbalizer\""));
@@ -337,6 +344,7 @@ mod tests {
                 }],
             },
             cache_prefix: None,
+            require_warm: false,
         };
         let vocab = MAX_JOINT_PROMPT + 10;
         assert!(joint(MAX_JOINT_PROMPT as u32)
@@ -354,6 +362,7 @@ mod tests {
                 option_pos: vec![1],
             },
             cache_prefix: None,
+            require_warm: false,
         };
         assert!(long_ptr.validate(vocab, MAX_DECISION_PROMPT).is_ok());
     }
@@ -363,6 +372,7 @@ mod tests {
             prompt_ids: (0..prompt_len).collect(),
             head,
             cache_prefix: None,
+            require_warm: false,
         }
     }
 

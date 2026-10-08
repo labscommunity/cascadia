@@ -61,8 +61,15 @@ fn engine_failure(reason: &str) -> DecisionError {
     if reason.starts_with("decision_too_long") {
         return DecisionError::TooLong("decision prompt too long for the model's head".into());
     }
+    // A `require_warm` pass whose shared-prefix snapshot was evicted (SEC-3): the engine refused
+    // to prefill past the request's budget. Busy, not broken: the capacity 503, retry.
+    if reason.starts_with("decision_cold") {
+        return DecisionError::Engine(CAPACITY.into());
+    }
     DecisionError::Engine("decision engine error".into())
 }
+
+const CAPACITY: &str = "engine at capacity; retry after current requests complete";
 
 /// POST /v1/systemone: the Jev/SystemOne wire format.
 pub async fn decide(State(state): State<AppState>, Json(req): Json<DecisionRequest>) -> Response {
@@ -97,9 +104,7 @@ pub(crate) async fn evaluate(
         Ok(p) => p,
         Err(_) => {
             crate::count_rejected("capacity");
-            return Err(DecisionError::Engine(
-                "engine at capacity; retry after current requests complete".into(),
-            ));
+            return Err(DecisionError::Engine(CAPACITY.into()));
         }
     };
     state
@@ -144,7 +149,7 @@ pub(crate) async fn evaluate(
     // Codecs mask tokenizer failures themselves (`tokenize_failed`); every other encode error is
     // a reason the client should see (Clef's option cap as 400; Kev's render budget and state
     // length, Clef's schema size and JEV's early pass cap as 413).
-    let passes = encoded?;
+    let mut passes = encoded?;
     if let Some(p) = passes
         .iter()
         .find(|p| p.readout.prompt_ids.len() > svc.max_tokens)
@@ -181,6 +186,7 @@ pub(crate) async fn evaluate(
             }
         }
     }
+    super::mark_required_reuse(&mut passes, svc.max_total_tokens, svc.prefix_reuse);
     let mut probs: IndexMap<String, Vec<f64>> = IndexMap::new();
     let mut input_tokens: u64 = 0;
     for pass in &passes {
@@ -272,5 +278,10 @@ mod tests {
             engine_failure("decision_invalid: x"),
             DecisionError::Engine(_)
         ));
+        match engine_failure("decision_cold: the shared prefix snapshot (21 tokens) is not cached")
+        {
+            DecisionError::Engine(m) => assert_eq!(m, CAPACITY),
+            e => panic!("{e:?}"),
+        }
     }
 }
