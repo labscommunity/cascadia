@@ -10,6 +10,24 @@ use indexmap::IndexMap;
 use super::schema::{self, answer_from_probs, Answer, DecisionRequest, DecisionResponse, Usage};
 use super::DecisionError;
 use crate::AppState;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+/// What one admitted decision request holds until both its handler future and its blocking
+/// encode are finished.
+struct Held {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    _inflight: crate::InFlightGuard,
+}
+
+/// Sets the flag when dropped: the request future ended (finished, failed or disconnected).
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 fn err(e: DecisionError) -> Response {
     (
@@ -74,14 +92,29 @@ pub(crate) async fn evaluate(
     };
     req.validate(&svc.limits())?;
     // Take the permit BEFORE tokenizing: encode() is CPU work proportional to the request.
-    let _permit = match state.permits.clone().try_acquire_owned() {
+    // Counted like chat (SEC-5): a capacity refusal, the request total and the in-flight gauge.
+    let permit = match state.permits.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
+            crate::count_rejected("capacity");
             return Err(DecisionError::Engine(
                 "engine at capacity; retry after current requests complete".into(),
-            ))
+            ));
         }
     };
+    state
+        .stats
+        .requests_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The permit (and the in-flight gauge) is shared with the blocking encode below: a client
+    // disconnect drops this future but not a running `spawn_blocking` closure, so the permit is
+    // released only once both are done (SEC-2). Orphaned encodes stay bounded by the permit count.
+    let held = Arc::new(Held {
+        _permit: permit,
+        _inflight: crate::InFlightGuard::new(state.stats.clone()),
+    });
+    // Set when this future is dropped (client gone): the codec stops between questions.
+    let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
     // Cheap pre-check before any tokenization: a token is at least one byte, and this bound is
     // generous (~8 bytes per token) so honest requests never hit it.
     let state_bytes = match &req.state {
@@ -95,8 +128,13 @@ pub(crate) async fn evaluate(
         )));
     }
     // Tokenization is CPU work proportional to the request: run it off the async executor.
-    let (svc2, req2) = (svc.clone(), req.clone());
-    let encoded = match tokio::task::spawn_blocking(move || svc2.codec.encode(&req2)).await {
+    let (svc2, req2, held2, cancel2) = (svc.clone(), req.clone(), held.clone(), cancel.0.clone());
+    let encoded = match tokio::task::spawn_blocking(move || {
+        let _held = held2;
+        svc2.codec.encode_until(&req2, &cancel2)
+    })
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "decision encode task panicked");
@@ -104,17 +142,17 @@ pub(crate) async fn evaluate(
         }
     };
     // Codecs mask tokenizer failures themselves (`tokenize_failed`); every other encode error is
-    // a validation reason the client should see (Clef's option cap, JEV's image parts).
+    // a reason the client should see (Clef's option cap as 400; Kev's render budget and state
+    // length, Clef's schema size and JEV's early pass cap as 413).
     let passes = encoded?;
     if let Some(p) = passes
         .iter()
         .find(|p| p.readout.prompt_ids.len() > svc.max_tokens)
     {
-        return Err(DecisionError::TooLong(format!(
-            "a decision pass is {} tokens; the limit is {}",
+        return Err(super::pass_too_long(
             p.readout.prompt_ids.len(),
-            svc.max_tokens
-        )));
+            svc.max_tokens,
+        ));
     }
     let total = super::prefill_work(&passes, svc.prefix_reuse);
     if total > svc.max_total_tokens {

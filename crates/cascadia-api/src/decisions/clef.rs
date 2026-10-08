@@ -5,6 +5,7 @@ use cascadia_types::{
     joint_mask_prompt_cap, joint_prompt_cap, DecisionReadout, JointOption, JointQuestion,
     ReadoutHead, MAX_DECISION_OUTPUTS, MAX_JOINT_PROMPT,
 };
+use std::sync::atomic::AtomicBool;
 
 const SYSTEM_PROMPT: &str = "Read the complete state and schema. Decide every field jointly. Each answer must be exactly one of that field's allowed options.";
 
@@ -116,7 +117,11 @@ impl Codec for ClefCodec {
         }
     }
 
-    fn encode(&self, req: &DecisionRequest) -> Result<Vec<Pass>, DecisionError> {
+    fn encode_until(
+        &self,
+        req: &DecisionRequest,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<Pass>, DecisionError> {
         // One joint pass carries every option of every question; the engine caps a readout at
         // MAX_DECISION_OUTPUTS logits, so reject here with 400 instead of an opaque engine 503.
         let total: usize = req.questions.values().map(|q| options(q).len()).sum();
@@ -128,6 +133,7 @@ impl Codec for ClefCodec {
         let mut schema = self.ids("\n\nSCHEMA FIELDS:\n")?;
         let mut questions = Vec::new();
         for (i, (qid, q)) in req.questions.iter().enumerate() {
+            super::check_cancel(cancel)?;
             schema.extend(self.ids(&format!(
                 "\nFIELD {}\nID: {}\nTYPE: {}\nINSTRUCTION: ",
                 i + 1,
