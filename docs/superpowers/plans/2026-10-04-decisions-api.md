@@ -52,10 +52,12 @@ Model trees are built by an extended exporter: Intel's stock int8 IR, plus an op
   ```bash
   export SPIKE_DIR=/Users/blokchainaholic/Desktop/clabs/tahoma/experiments
   PY=$SPIKE_DIR/clef-spike/.venv/bin/python
+  export RUN=~/decisions-runs     # private: dumps, parity/golden slices, references, logs, PID files, request files
+  mkdir -m 700 -p "$RUN" && chmod 700 "$RUN"
   ```
 
-  `$PY` runs every tool and is the command `run_capped.py` launches. That venv (transformers 5.18, torch 2.14, openvino 2026.4.1, safetensors 0.8) is where the decision tools were developed and tested; `tools/requirements.txt`'s transformers range is unverified for `codec_golden.py`'s tokenizer-only directories. `cascadia` is this branch's release build on `PATH` (`cargo build --release -p cascadia --features openvino`), against the OpenVINO SDK of the venv's version (2026.4.1, the CI `OV_VERSION` pin). Manual `curl` calls to the decision routes must send `-H 'content-type: application/json'` (axum answers 415 otherwise); the tools set it themselves.
-- **Secrets:** never read `.env*`, keys or tokens. HF downloads use the already-configured CLI login. Subagent prompts carry the same rule.
+  `$RUN` replaces a shared `/tmp`. The decision dump holds request text, and `docs/decisions.md` says to keep it in a directory only you can write. On macOS `/tmp` is the world-writable `/private/tmp`, where another user could pre-create a dump path and make the server refuse to start. `$RUN` is exported because the inline Python snippets read it from `os.environ`. `$PY` runs every tool and is the command `run_capped.py` launches. That venv (transformers 5.18, torch 2.14, openvino 2026.4.1, safetensors 0.8) is where the decision tools were developed and tested; `tools/requirements.txt`'s transformers range is unverified for `codec_golden.py`'s tokenizer-only directories. `cascadia` is this branch's release build on `PATH` (`cargo build --release -p cascadia --features openvino`), against the OpenVINO SDK of the venv's version (2026.4.1, the CI `OV_VERSION` pin). Manual `curl` calls to the decision routes must send `-H 'content-type: application/json'` (axum answers 415 otherwise); the tools set it themselves.
+- **Secrets:** never read `.env*`, keys or tokens. HF downloads use the already-configured CLI login. `backbone_diff.py` reads a gated or private repo with `HF_TOKEN`, which must already be set in the environment (shell profile or secret manager). Never type it on a command line or echo it. The tool sends it only as the `Authorization` header of huggingface.co requests and never prints it. A local snapshot directory needs no token. Subagent prompts carry the same rule.
 - **Commits:** no `Co-Authored-By` or session trailers. No push or PR without the user's approval.
 - **Tests:** Rust: `cargo test -p <crate>`. Python: `python -m pytest tools/tests/<file> -v` (OpenVINO-dependent tests `pytest.importorskip("openvino")`).
 
@@ -5029,73 +5031,113 @@ git commit -m "feat(tools): decision_export.py builds jev/kev/clef decision tree
 
 - [ ] **Step 6: Pipeline smoke test** (manual, needs OpenVINO and Tasks 11/11b; one machine, two processes; nothing to commit)
 
-This is the first point where a 2-stage decision tree exists, so it is where the pipeline frames (Task 11b) are exercised end to end. Build a 2-stage JEV-9B tree, then start the two ranks. Flags are as declared in `WorkerArgs`: the tree is `--model`, and the downstream peer is `--next`. Use the runbook environment from Global Constraints (`$SPIKE_DIR`, `$PY`, `cascadia` on `PATH`). Run each process in the background with a Monitor on its log, watching for `Traceback|panic|error|timed out|NAK|epoch|poisoned`.
+This is the first point where a 2-stage decision tree exists, so it is where the pipeline frames (Task 11b) are exercised end to end. Build a 2-stage JEV-9B tree, then start the two ranks. Flags are as declared in `WorkerArgs`: the tree is `--model`, and the downstream peer is `--next`. Use the runbook environment from Global Constraints (`$SPIKE_DIR`, `$PY`, `$RUN`, `cascadia` on `PATH`). Every log, dump and request file goes under the private `$RUN` directory, never a shared `/tmp`. Run each process in the background with a Monitor on its log, watching for `Traceback|panic|error|timed out|NAK|epoch|poisoned`.
+
+`start_ranks` records each rank's PID in `$RUN`, and `stop_ranks` kills only those PIDs. Never use `pkill -f`: other sessions on this machine may run their own `cascadia worker`. Rank 0 also writes a decision dump, which the large-body check reads to measure the frame size.
 
 ```bash
 $PY tools/decision_export.py jev --base-ir ~/models/qwen35-9b-int8 --adapter-dir ~/models/jev9b/adapter_vllm --stages 2 --out ~/trees/jev9b-int8-2st
-start_ranks() {   # rank 1 first (it listens), then rank 0 (it dials rank 1 once, at startup)
-  cascadia worker --model ~/trees/jev9b-int8-2st --engine qwen35 --device CPU --rank 1 --total 2 --listen 127.0.0.1:7801 > /tmp/rank1.log 2>&1 &
+start_ranks() {   # [RANK1_BINARY]: rank 1 first (it listens), then rank 0 (it dials rank 1 once, at startup)
+  ! curl -sf localhost:8080/health > /dev/null || { echo ":8080 is already serving: stop that server first"; return 1; }
+  "${1:-cascadia}" worker --model ~/trees/jev9b-int8-2st --engine qwen35 --device CPU --rank 1 --total 2 --listen 127.0.0.1:7801 > $RUN/rank1.log 2>&1 &
+  echo $! > $RUN/rank1.pid
   sleep 5
-  cascadia worker --model ~/trees/jev9b-int8-2st --engine qwen35 --device CPU --rank 0 --total 2 --next 127.0.0.1:7801 --api 127.0.0.1:8080 > /tmp/rank0.log 2>&1 &
-  until curl -sf localhost:8080/health > /dev/null; do sleep 2; done
+  cascadia worker --model ~/trees/jev9b-int8-2st --engine qwen35 --device CPU --rank 0 --total 2 --next 127.0.0.1:7801 --api 127.0.0.1:8080 \
+      --decision-dump $RUN/smoke.jsonl > $RUN/rank0.log 2>&1 &
+  echo $! > $RUN/rank0.pid
+  until curl -sf localhost:8080/health > /dev/null; do
+    kill -0 $(cat $RUN/rank0.pid) 2>/dev/null || { echo "rank 0 exited; see $RUN/rank0.log"; return 1; }
+    sleep 2
+  done
 }
-stop_ranks() { pkill -f 'cascadia worker --model' ; sleep 2; }
+stop_ranks() {    # only the PIDs start_ranks recorded
+  for r in rank0 rank1; do
+    [ -f $RUN/$r.pid ] || continue
+    kill $(cat $RUN/$r.pid) 2>/dev/null
+    while kill -0 $(cat $RUN/$r.pid) 2>/dev/null; do sleep 1; done
+    rm -f $RUN/$r.pid
+  done
+}
+rm -f $RUN/smoke.jsonl
 start_ranks
 H='content-type: application/json'
-curl -s -H "$H" localhost:8080/v1/systemone -d '{"model":"jev","state":"I was charged twice","questions":{"team":{"type":"choice","instructions":"Which team?","criteria":{"billing":"charges","tech":"bugs"}}}}' | tee /tmp/small-base.json
+SMALL='{"model":"jev","state":"I was charged twice","questions":{"team":{"type":"choice","instructions":"Which team?","criteria":{"billing":"charges","tech":"bugs"}}}}'
+curl -s -H "$H" localhost:8080/v1/systemone -d "$SMALL" | tee $RUN/small-base.json
 curl -s -H "$H" localhost:8080/v1/decisions -d '{"model":"jev","input":"I was charged twice","questions":[{"type":"choice","name":"team","instructions":"Which team?","choices":[{"value":"billing","description":"charges"},{"value":"tech","description":"bugs"}]}]}'
 ```
 
 Expected: 200 on both, with `"choice":"billing"` and identical probabilities. (Without the `content-type` header axum answers 415.) Then, on the same two ranks:
 
-- **Large-body check.** A JEV state of at least 12k tokens, so FRAME_DECIDE (about 6–7 bytes of JSON per prompt id) is well past 64 KiB; JEV's `max_tokens` is 32768. It must return 200 and report `usage.input_tokens` ≥ 12000. Its answer is the baseline for the next two checks.
+- **Large-body check.** The JEV state must make FRAME_DECIDE larger than 64 KiB. On this text, a prompt id costs about 4.9 bytes of compact JSON (the ids are low numbers), so the request is sized at about 20k ids, roughly 98 KB, for a wide margin. JEV's `max_tokens` is 32768. The check proves the frame crossed the limit, rather than estimating it: the pass's `prompt_ids` in rank 0's dump are a lower bound on the FRAME_DECIDE body, and the check asserts that their compact JSON is more than 65,536 bytes. The request must return 200 and report `usage.input_tokens` ≥ 20000. Its answer is the baseline for the next two checks.
 
   ```bash
   $PY - <<'EOF'
-  import json
-  state = "The quick brown fox jumps over the lazy dog. " * 1500   # about 13.5k Qwen tokens, ~68 KB
+  import json, os
+  state = "The quick brown fox jumps over the lazy dog. " * 2000   # about 20k Qwen tokens
   q = {"team": {"type": "choice", "instructions": "Which team?", "criteria": {"billing": "charges", "tech": "bugs"}}}
-  json.dump({"model": "jev", "state": state, "questions": q}, open("/tmp/jev-large.json", "w"))
+  json.dump({"model": "jev", "state": state, "questions": q}, open(os.path.join(os.environ["RUN"], "jev-large.json"), "w"))
   EOF
-  curl -s -H "$H" --data-binary @/tmp/jev-large.json localhost:8080/v1/systemone -o /tmp/large-base.json -w '%{http_code}\n'
-  $PY -c 'import json; r = json.load(open("/tmp/large-base.json")); print(r["usage"]["input_tokens"], r["answers"]["team"])'
+  T=$(curl -s -H "$H" --data-binary @$RUN/jev-large.json localhost:8080/v1/systemone -o $RUN/large-base.json -w '%{time_total}')
+  echo "large request took ${T}s"
+  $PY - <<'EOF'
+  import json, os
+  run = os.environ["RUN"]
+  r = json.load(open(f"{run}/large-base.json"))
+  ids = json.loads(open(f"{run}/smoke.jsonl").read().splitlines()[-1])["readout"]["prompt_ids"]
+  n = len(json.dumps(ids, separators=(",", ":")))
+  print("input_tokens", r["usage"]["input_tokens"], "| prompt ids", len(ids), "| prompt_ids JSON bytes", n, "|", r["answers"]["team"])
+  assert r["usage"]["input_tokens"] >= 20000 and n > 65536, "FRAME_DECIDE did not cross 64 KiB"
+  EOF
   ```
 
-- **Abort, then warm chat.** Drop a large decision mid-prefill, then at once send a chat request and the same decision again. Both must return 200, and the decision's answer must equal `/tmp/large-base.json` exactly (a fresh-server run).
+- **Abort, then warm chat.** Drop a large decision mid-prefill, then at once send a chat request and the same decision again. Both must return 200, and the decision's answer must equal `$RUN/large-base.json` exactly (a fresh-server run).
 
   ```bash
-  curl -s -H "$H" --max-time 1 --data-binary @/tmp/jev-large.json localhost:8080/v1/systemone; echo "abort exit=$?"   # 28 = client timed out mid-prefill
+  curl -s -H "$H" --max-time 1 --data-binary @$RUN/jev-large.json localhost:8080/v1/systemone; echo "abort exit=$?"   # 28 = client timed out mid-prefill
   curl -s -H "$H" localhost:8080/v1/chat/completions -d '{"model":"jev","messages":[{"role":"user","content":"Say hi."}],"max_tokens":8}' -o /dev/null -w 'chat %{http_code}\n'
-  curl -s -H "$H" --data-binary @/tmp/jev-large.json localhost:8080/v1/systemone -o /tmp/large-after-abort.json -w 'decision %{http_code}\n'
-  $PY -c 'import json; a, b = (json.load(open(f))["answers"] for f in ("/tmp/large-base.json", "/tmp/large-after-abort.json")); assert a == b, (a, b); print("same answer")'
+  curl -s -H "$H" --data-binary @$RUN/jev-large.json localhost:8080/v1/systemone -o $RUN/large-after-abort.json -w 'decision %{http_code}\n'
+  $PY -c 'import json, os; R = os.environ["RUN"]; a, b = (json.load(open(f"{R}/{f}"))["answers"] for f in ("large-base.json", "large-after-abort.json")); assert a == b, (a, b); print("same answer")'
   ```
 
-- **Stale-epoch DECIDE.** Abort at several points of the large request's lifetime, so some aborts land after prefill and before FRAME_DECIDE_RUN, then send two decisions back to back. Every follow-up must return 200 with the baseline answer. A `dropping stale DECIDE frame` / `dropping stale frame` warning on rank 1 is the expected drop and is fine; `timed out`, `decision engine error`, `poisoned` or a NAK in either log fails the step.
+- **Stale-epoch DECIDE (best effort).** Abort the large request at fractions of its measured duration `T` (from the large-body check): 0.5, 0.9, 0.97, 0.99 and 1.0 × `T`. Late aborts can then land after prefill and before FRAME_DECIDE_RUN, where the last rank holds a `pending_decision` for the aborted epoch, which the next RESET clears. After each abort, send two decisions back to back. Every follow-up must return 200 with the baseline answer. A `dropping stale DECIDE frame` or `dropping stale frame` warning on rank 1 is an expected drop and is fine. `timed out`, `decision engine error`, `poisoned` or a NAK in either log fails the step.
+
+  This step is **best-effort** for the post-prefill window. No log line marks a pending decision that a RESET cleared, so a pass does not prove that an abort landed in that window. It proves abort recovery at points across the whole request lifetime. The pending-decision and stale-epoch paths themselves are covered by `take_pending_matches_epoch_and_surfaces_errors` and the stale-epoch drop branches in `qwen36.rs`. The curl exit code shows where each abort landed: 28 means it was aborted, and 0 means the request finished before the timeout.
 
   ```bash
-  for t in 0.5 1 2 3 5; do
-    curl -s -H "$H" --max-time $t --data-binary @/tmp/jev-large.json localhost:8080/v1/systemone > /dev/null
-    curl -s -H "$H" --data-binary @/tmp/jev-large.json localhost:8080/v1/systemone -o /tmp/stale-a.json -w "t=$t a %{http_code} "
-    curl -s -H "$H" localhost:8080/v1/systemone -d '{"model":"jev","state":"I was charged twice","questions":{"team":{"type":"choice","instructions":"Which team?","criteria":{"billing":"charges","tech":"bugs"}}}}' -o /tmp/stale-b.json -w "b %{http_code}\n"
-    $PY -c 'import json; L = lambda f: json.load(open(f))["answers"]; assert L("/tmp/stale-a.json") == L("/tmp/large-base.json") and L("/tmp/stale-b.json") == L("/tmp/small-base.json"); print("baseline answers")'
+  for f in 0.5 0.9 0.97 0.99 1.0; do
+    t=$($PY -c "print(round($T * $f, 3))")
+    curl -s -H "$H" --max-time $t --data-binary @$RUN/jev-large.json localhost:8080/v1/systemone > /dev/null; echo -n "f=$f t=${t}s abort exit=$? "
+    curl -s -H "$H" --data-binary @$RUN/jev-large.json localhost:8080/v1/systemone -o $RUN/stale-a.json -w "a %{http_code} "
+    curl -s -H "$H" localhost:8080/v1/systemone -d "$SMALL" -o $RUN/stale-b.json -w "b %{http_code}\n"
+    $PY -c 'import json, os; R = os.environ["RUN"]; L = lambda f: json.load(open(f"{R}/{f}"))["answers"]; assert L("stale-a.json") == L("large-base.json") and L("stale-b.json") == L("small-base.json"); print("baseline answers")'
   done
-  grep -nE 'stale|epoch|timed out|decision engine error|poisoned|NAK' /tmp/rank0.log /tmp/rank1.log
+  grep -nE 'stale|epoch|timed out|decision engine error|poisoned|NAK' $RUN/rank0.log $RUN/rank1.log
   ```
 
-- **Old-rank check.** Rank 0 dials rank 1 once, at startup, and keeps its handshake, so restarting rank 1 alone only breaks the socket (a 503 or a timeout, not 501). Stop **both** ranks, start a `main`-build rank 1, then a fresh branch rank 0. The decision routes must answer 501 `decision_unsupported` and chat must still answer 200. Then restore the branch ranks.
+- **Old-rank check.** Rank 0 dials rank 1 once, at startup, and keeps its handshake. Restarting rank 1 alone therefore only breaks the socket, which gives a 503 or a timeout, not a 501. So stop **both** ranks, start a `main`-build rank 1, then a fresh branch rank 0.
+  - Both decision routes must answer HTTP 501 with the message `this model does not serve decisions`:
+    - SystemOne: `{"error":"this model does not serve decisions"}`.
+    - OpenAI: `{"error":{"message":"this model does not serve decisions","type":"server_error","code":null}}`.
+    - Neither body carries `decision_unsupported`.
+  - Chat must still answer 200.
+  - Rank 0's log must hold the capability refusal `decision_unsupported: a pipeline rank cannot serve decision passes`. That line proves the 501 came from the up-front chain check, before any prefill, and not from some other source.
+
+  Then restore the branch ranks and check that the small request still returns its baseline answer.
 
   ```bash
   stop_ranks
-  git worktree add /tmp/cascadia-main origin/main && (cd /tmp/cascadia-main && cargo build --release -p cascadia --features openvino)
-  /tmp/cascadia-main/target/release/cascadia worker --model ~/trees/jev9b-int8-2st --engine qwen35 --device CPU --rank 1 --total 2 --listen 127.0.0.1:7801 > /tmp/rank1-main.log 2>&1 &
-  sleep 5
-  cascadia worker --model ~/trees/jev9b-int8-2st --engine qwen35 --device CPU --rank 0 --total 2 --next 127.0.0.1:7801 --api 127.0.0.1:8080 > /tmp/rank0.log 2>&1 &
-  until curl -sf localhost:8080/health > /dev/null; do sleep 2; done
-  curl -s -H "$H" localhost:8080/v1/systemone -d '{"model":"jev","state":"x","questions":{"u":{"type":"noul","instructions":"Is it?"}}}' -w ' %{http_code}\n'    # 501, "code":"decision_unsupported"
-  curl -s -H "$H" localhost:8080/v1/decisions -d '{"model":"jev","input":"x","questions":[{"type":"predicate","name":"u","instructions":"Is it?"}]}' -w ' %{http_code}\n'   # 501
+  git worktree add $RUN/cascadia-main origin/main && (cd $RUN/cascadia-main && cargo build --release -p cascadia --features openvino)
+  start_ranks $RUN/cascadia-main/target/release/cascadia    # main-build rank 1, branch rank 0
+  curl -s -H "$H" localhost:8080/v1/systemone -d '{"model":"jev","state":"x","questions":{"u":{"type":"noul","instructions":"Is it?"}}}' -w ' %{http_code}\n'    # {"error":"this model does not serve decisions"} 501
+  curl -s -H "$H" localhost:8080/v1/decisions -d '{"model":"jev","input":"x","questions":[{"type":"predicate","name":"u","instructions":"Is it?"}]}' -w ' %{http_code}\n'   # {"error":{"message":"this model does not serve decisions","type":"server_error","code":null}} 501
   curl -s -H "$H" localhost:8080/v1/chat/completions -d '{"model":"jev","messages":[{"role":"user","content":"Say hi."}],"max_tokens":8}' -o /dev/null -w 'chat %{http_code}\n'   # 200
+  grep -c 'decision_unsupported: a pipeline rank cannot serve decision passes' $RUN/rank0.log    # >= 2 (one per decision request)
   stop_ranks
-  git worktree remove /tmp/cascadia-main
+  git worktree remove $RUN/cascadia-main
+  start_ranks                                                # restore: both ranks on the branch build
+  curl -s -H "$H" localhost:8080/v1/systemone -d "$SMALL" -o $RUN/restored.json -w 'restored %{http_code}\n'
+  $PY -c 'import json, os; R = os.environ["RUN"]; L = lambda f: json.load(open(f"{R}/{f}"))["answers"]; assert L("restored.json") == L("small-base.json"); print("branch ranks restored")'
+  stop_ranks
   ```
 
   The 501 must come back within the request timeout, not hang.
@@ -5130,7 +5172,7 @@ Neither check can stand in for the other.
   - With `--answers`, the server's top-1 on the 50 records must agree with the saved spike reference on ≥ 98%. For Kev and Clef that covers every question. For JEV it covers every question too (score references rescaled to the record's L levels first). `reference_jev.pt` was measured on sorted choices, so the answer run sends each JEV choice question with its criteria sorted (`jev_sorted`), and the prompts it dumps must equal `jev.questions()`'s ids exactly. (Fix round 1, FID-3: the plan code below still shows the earlier informational-only JEV choice line; the shipped `codec_golden.py` gates all 82.)
   - The 27B models have no saved spike reference; for them only the encoder comparison runs, and parity (Task 17) is the answer check.
 - `openai_equivalence.py --url URL`: converts each of the 50 records into an OpenAI-format request (`to_openai(rec)`), POSTs it to `/v1/decisions` and the original to `/v1/systemone`, and exits non-zero unless every question's probabilities, choice/score and confidence are identical. The records' score levels are plain strings (no descriptions), so both routes build byte-identical prompts, and any difference is an adapter bug. Everything verified through `/v1/systemone` (golden, parity) then carries over to `/v1/decisions`.
-- `backbone_diff.py A B [--per-layer] [--slice BYTES]`: matches tensors per layer index and suffix after stripping the repo's `model.language_model.` / `model.` prefix (vision and MTP tensors ignored), hashes both ends of every backbone tensor (all projections, norms, embeddings, final norm, lm_head), prints per-tensor / per-layer `SAME`/`DIFF`, and ends with one `VERDICT: STOCK | FINETUNED | UNKNOWN` line; UNKNOWN (no comparable decoder-layer tensors, different layer sets, or a dtype/shape mismatch) exits 2. (Fix round 1, BLD-1, replaces the sampled/gate_proj-only probe below.)
+- `backbone_diff.py A B [--per-layer] [--slice BYTES]`: matches tensors per layer index and suffix after stripping the repo's `model.language_model.` / `model.` prefix (vision and MTP tensors ignored), hashes both ends of every backbone tensor (all projections, norms, embeddings, final norm, lm_head), prints per-tensor / per-layer `SAME`/`DIFF`, and ends with one `VERDICT: STOCK | FINETUNED | MERGED | UNKNOWN` line; UNKNOWN (no comparable decoder-layer tensors, different layer sets, a tensor on one side only (lm_head, embed and the final norm included), or a dtype/shape mismatch) exits 2. (Fix round 1, BLD-1, replaces the sampled/gate_proj-only probe below.) Fix round 2: A and B may each be a local snapshot dir instead of an HF repo id; a gated repo is read with `HF_TOKEN` from the environment (sent only as the Authorization header of huggingface.co requests, never printed); every ranged read must be HTTP 206 with the exact length; `--adapter DIR` turns a FINETUNED whose every difference is an adapter target module into `MERGED` (exit 3: the LoRA is already in the shards, P2-BLD-1). `decision_export.py jev --weights` additionally requires `--weights-not-merged`.
 - `def answer_probs(ans: dict) -> list[float]` and `def margin(p: list[float]) -> float` (in parity_check, tested).
 
 - [ ] **Step 1: Write the failing tests** (`tools/tests/test_decision_tools.py`)
@@ -5967,7 +6009,7 @@ git commit -m "feat(tools): layer-streamed fp32 decision reference for jev/kev/c
 
 ## Model acceptance (Tasks 18–22)
 
-Each model task is manual (it needs OpenVINO and downloads), stays under 7 GB per step unless stated otherwise, and ends by appending its recipe and measured numbers to `docs/decisions.md`. Every command below assumes the runbook environment from Global Constraints (`$SPIKE_DIR`, `$PY`, `cascadia` on `PATH`). Each task runs the same six checks:
+Each model task is manual (it needs OpenVINO and downloads), stays under 7 GB per step unless stated otherwise, and ends by appending its recipe and measured numbers to `docs/decisions.md`. Every command below assumes the runbook environment from Global Constraints (`$SPIKE_DIR`, `$PY`, `$RUN`, `cascadia` on `PATH`). Each task runs the same six checks:
 1. **Export** the tree.
 2. **Serve** it with `--decision-dump`, then drive the 50 records once with `parity_check.py --dump` (no `--ref`). That writes `<dump>.parity.jsonl`: exactly this run's passes, 0600, never overwritten without `--force`.
 3. **Golden:** `codec_golden.py` (it slices its own `<dump>.golden.jsonl`), plus `--answers` against the running server.
@@ -5975,7 +6017,29 @@ Each model task is manual (it needs OpenVINO and downloads), stays under 7 GB pe
 5. **Parity:** `parity_check.py --ref` must print `PASS`: raw agreement ≥ 96% and no flip where the reference margin is ≥ 0.05.
 6. **OpenAI route equivalence:** `openai_equivalence.py --url …` must report every question identical (JEV: add `--all-states`). This carries checks 3–5 over to `/v1/decisions`.
 
-The dump is opened in append mode, so every task first removes the previous files: `rm -f /tmp/<model>.jsonl /tmp/<model>.parity.jsonl /tmp/<model>.golden.jsonl`.
+The dump is opened in append mode, so every task first removes the previous files: `rm -f $RUN/<model>.jsonl $RUN/<model>.parity.jsonl $RUN/<model>.golden.jsonl`. Every path is under the private `$RUN` (Global Constraints), never `/tmp`.
+
+Each single-box task starts its server with `serve` and stops it with `stop_server` at the end of the task (Step 4b), so the next task's health wait can never pass against the previous model. `serve` refuses to start while :8080 still answers. It records the server's PID in `$RUN/<name>.pid`, fails if that process exits before `/health` turns ready, and checks that `/v1/models` names the tree it started (the model id defaults to the `--model` directory name). `stop_server` kills only that recorded PID and waits for it to exit. Never use `pkill -f`: other sessions on this machine run their own `cascadia` processes.
+
+```bash
+serve() {        # serve NAME TREE [cascadia run flags...]
+  local name=$1 tree=$2; shift 2
+  ! curl -sf http://127.0.0.1:8080/health > /dev/null || { echo ":8080 is still serving: stop_server the previous task first"; return 1; }
+  cascadia run "$tree" "$@" > $RUN/$name-server.log 2>&1 &
+  echo $! > $RUN/$name.pid
+  until curl -sf http://127.0.0.1:8080/health > /dev/null; do
+    kill -0 $(cat $RUN/$name.pid) 2>/dev/null || { echo "$name server exited; see $RUN/$name-server.log"; return 1; }
+    sleep 2
+  done
+  curl -s http://127.0.0.1:8080/v1/models | grep -qF "$(basename "$tree")" || { echo ":8080 is not serving $tree"; return 1; }
+}
+stop_server() {  # stop_server NAME
+  [ -f $RUN/$1.pid ] || return 0
+  kill $(cat $RUN/$1.pid) 2>/dev/null
+  while kill -0 $(cat $RUN/$1.pid) 2>/dev/null; do sleep 1; done
+  rm -f $RUN/$1.pid
+}
+```
 
 Every long step (exports, reference runs, server bring-up) runs in the background with a Monitor on its log. The Monitor watches for completion **and** for failure signatures (`Traceback`, `Error`, `killed`, `CAP`, `MISMATCH`, `FLIP`, `epoch`, non-zero `exit=`), so silence can't look like success. Wrap exports and references in `$SPIKE_DIR/jev-spike/run_capped.py` (`CAP_GB=7`), which watches phys_footprint and kills the step if it goes over. `run_capped.py` is **macOS-only** (it loads `/usr/lib/libproc.dylib`): on a Linux box run the step under `/usr/bin/time -v` and a cgroup memory limit instead (`systemd-run --user --scope -p MemoryMax=7G …`).
 
@@ -5994,18 +6058,17 @@ Expected: 8 stages, `grafted N LoRA branches` summing to the adapter's target co
 - [ ] **Step 2: Serve and drive the parity run**
 
 ```bash
-rm -f /tmp/jev9b.jsonl /tmp/jev9b.parity.jsonl /tmp/jev9b.golden.jsonl
-cascadia run ~/trees/jev9b-int8 --engine qwen35 --device CPU --api 127.0.0.1:8080 --decision-dump /tmp/jev9b.jsonl > /tmp/jev9b-server.log 2>&1 &
-until curl -sf http://127.0.0.1:8080/health > /dev/null; do sleep 2; done
-$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump /tmp/jev9b.jsonl
+rm -f $RUN/jev9b.jsonl $RUN/jev9b.parity.jsonl $RUN/jev9b.golden.jsonl
+serve jev9b ~/trees/jev9b-int8 --engine qwen35 --device CPU --api 127.0.0.1:8080 --decision-dump $RUN/jev9b.jsonl
+$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump $RUN/jev9b.jsonl
 ```
 
-Expected: `wrote 82 passes for 50 records to /tmp/jev9b.parity.jsonl`.
+Expected: `wrote 82 passes for 50 records to $RUN/jev9b.parity.jsonl`.
 
 - [ ] **Step 3: Golden check**
 
 ```bash
-$PY tools/decision/codec_golden.py jev --url http://127.0.0.1:8080 --dump /tmp/jev9b.jsonl --tokenizer ~/models/jev9b --adapter-dir ~/models/jev9b/adapter_vllm --answers
+$PY tools/decision/codec_golden.py jev --url http://127.0.0.1:8080 --dump $RUN/jev9b.jsonl --tokenizer ~/models/jev9b --adapter-dir ~/models/jev9b/adapter_vllm --answers
 ```
 
 Expected:
@@ -6020,13 +6083,13 @@ The reference needs JEV's BF16 shards: `hf download autotrust/JEV-9B --include "
 ```bash
 CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision/reference_stream.py jev --weights ~/models/jev9b \
     --lora ~/models/jev9b/adapter_vllm/adapter_model.safetensors --tree ~/trees/jev9b-int8 \
-    --dump /tmp/jev9b.parity.jsonl --out /tmp/jev9b-ref.json
-$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref /tmp/jev9b-ref.json
+    --dump $RUN/jev9b.parity.jsonl --out $RUN/jev9b-ref.json
+$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref $RUN/jev9b-ref.json
 ```
 
 Expected: `wrote 82 reference distributions`, then `PASS`. This is the **re-measure** that decision A requires: request-order choices and rescaled scores, replacing the spike's 98.8% (sorted choices, 6-way scores). Record the per-type lines too.
 
-- [ ] **Step 4b: OpenAI route equivalence**: `$PY tools/decision/openai_equivalence.py --url http://127.0.0.1:8080 --all-states`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`.
+- [ ] **Step 4b: OpenAI route equivalence**: `$PY tools/decision/openai_equivalence.py --url http://127.0.0.1:8080 --all-states`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`. Then stop the server: `stop_server jev9b`.
 
 - [ ] **Step 5: Docs and commit** (append the JEV-9B section to `docs/decisions.md`: the recipe above, the measured agreement, per-type counts, flips)
 
@@ -6053,31 +6116,30 @@ CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision_export.py kev
 - [ ] **Step 2: Serve and drive the parity run**
 
 ```bash
-rm -f /tmp/kev9b.jsonl /tmp/kev9b.parity.jsonl /tmp/kev9b.golden.jsonl
-cascadia run ~/trees/kev9b-int8 --engine qwen35 --device CPU --api 127.0.0.1:8080 --decision-dump /tmp/kev9b.jsonl > /tmp/kev9b-server.log 2>&1 &
-until curl -sf http://127.0.0.1:8080/health > /dev/null; do sleep 2; done
-$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump /tmp/kev9b.jsonl
+rm -f $RUN/kev9b.jsonl $RUN/kev9b.parity.jsonl $RUN/kev9b.golden.jsonl
+serve kev9b ~/trees/kev9b-int8 --engine qwen35 --device CPU --api 127.0.0.1:8080 --decision-dump $RUN/kev9b.jsonl
+$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump $RUN/kev9b.jsonl
 ```
 
-Expected: `wrote 82 passes for 50 records to /tmp/kev9b.parity.jsonl`. Then check the state reuse works:
+Expected: `wrote 82 passes for 50 records to $RUN/kev9b.parity.jsonl`. Then check the state reuse works:
 - the server log shows `qwen35 prefix-cache hit` from the second question of each multi-question record whose `<|fim_prefix|>` + state is ≥ 16 tokens (12 of the 24 multi-question records; shorter states are below `MIN_PREFIX_TOKENS` and never snapshot);
-- one synthetic long-state request (a ~8k-token state with 5 noul questions) shows one cold prefill, then hits whose `warm_prefix` equals the state length:
+- one synthetic long-state request (a ~9k-token state with 5 noul questions) shows one cold prefill, then hits whose `warm_prefix` equals the state length. Its answers are Step 4c's baseline:
 
   ```bash
   $PY - <<'EOF'
-  import json
-  state = "The quick brown fox jumps over the lazy dog. " * 900   # about 8k tokens
+  import json, os
+  state = "The quick brown fox jumps over the lazy dog. " * 900   # 9,001 tokens
   qs = {f"q{i}": {"type": "noul", "instructions": f"Does the text mention animal number {i}?"} for i in range(5)}
-  json.dump({"model": "kev", "state": state, "questions": qs}, open("/tmp/kev-long.json", "w"))
+  json.dump({"model": "kev", "state": state, "questions": qs}, open(os.path.join(os.environ["RUN"], "kev-long.json"), "w"))
   EOF
-  curl -s -H 'content-type: application/json' --data-binary @/tmp/kev-long.json http://127.0.0.1:8080/v1/systemone -w ' %{http_code}\n'
-  grep -n 'prefix-cache hit' /tmp/kev9b-server.log | tail -4
+  curl -s -H 'content-type: application/json' --data-binary @$RUN/kev-long.json http://127.0.0.1:8080/v1/systemone -o $RUN/kev-long-base.json -w ' %{http_code}\n'
+  grep -n 'prefix-cache hit' $RUN/kev9b-server.log | tail -4
   ```
 
 - [ ] **Step 3: Golden check**
 
 ```bash
-$PY tools/decision/codec_golden.py kev --url http://127.0.0.1:8080 --dump /tmp/kev9b.jsonl --tokenizer ~/models/kev9b --answers
+$PY tools/decision/codec_golden.py kev --url http://127.0.0.1:8080 --dump $RUN/kev9b.jsonl --tokenizer ~/models/kev9b --answers
 ```
 
 Expected: `kev: 86 passes match kev.questions` (82 + 4 synthetic), and `kev: server answers agree with the saved reference on N/82` with N ≥ 81 against `reference_kev.pt`.
@@ -6087,13 +6149,36 @@ Expected: `kev: 86 passes match kev.questions` (82 + 4 synthetic), and `kev: ser
 ```bash
 CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision/reference_stream.py kev --weights ~/models/qwen35-9b-base \
     --lora ~/models/kev9b/adapter_model.safetensors --tree ~/trees/kev9b-int8 \
-    --dump /tmp/kev9b.parity.jsonl --out /tmp/kev9b-ref.json
-$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref /tmp/kev9b-ref.json
+    --dump $RUN/kev9b.parity.jsonl --out $RUN/kev9b-ref.json
+$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref $RUN/kev9b-ref.json
 ```
 
 Expected: `PASS` (spike: 82/82).
 
-- [ ] **Step 4b: OpenAI route equivalence**: `$PY tools/decision/openai_equivalence.py --url http://127.0.0.1:8080`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`.
+- [ ] **Step 4b: OpenAI route equivalence**: `$PY tools/decision/openai_equivalence.py --url http://127.0.0.1:8080`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`. Then stop the server: `stop_server kev9b`.
+
+- [ ] **Step 4c: Prefix-reuse budget (the `require_warm` path).** A Kev request is admitted with its shared state counted once (`prefill_work`). When the request would not fit `max_total_tokens` without that discount, the passes that can no longer afford a cold prefill must resume the cached state snapshot. The shipped budget (4 × 73,728 = 294,912 tokens) never reaches this path in Steps 2–4 (the long-state request needs ~45k without reuse). So lower `max_total_tokens` to 20,000 in the tree's `decision.json` for this step only, and restore it afterwards. `$RUN/kev-long.json` then needs ~45k tokens without reuse and ~9.2k with it, so it is admitted, and its later passes are marked `require_warm`. Expected status codes:
+  1. **Default prefix cache: 200**, with the same `answers` as `$RUN/kev-long-base.json`. The pass at the shared prefix always snapshots the state when the cache can hold it, so the later passes resume it. One cold prefill shows in the log, then hits.
+  2. **`--prefix-cache-gb 0.001`** (the cache is on, but far too small for one ~9k-token snapshot): **413 at once**. The message says the request needs N tokens without prefix reuse, over the limit of 20000. The engine refuses before prefilling the first pass, so no prefill is spent, and `time_total` is a small fraction of case 1's. This is a client error to fix (raise `max_total_tokens` or `--prefix-cache-gb`, or shorten the request), not a retryable 503.
+  3. **`--prefix-cache-gb 0`** (reuse off, so every pass counts in full): **413** at admission (prefill work over `max_total_tokens`), also before any prefill.
+  4. **503** (`engine at capacity; retry …`) remains only for real contention: a snapshot that the cache could hold but that other requests evicted mid-request. The request then fails at its first pass that misses, with no further work. This step does not force it; the engine unit tests cover it.
+
+  ```bash
+  D=~/trees/kev9b-int8/decision.json
+  cp $D $RUN/kev9b-decision.json.orig
+  $PY -c 'import json, sys; p = sys.argv[1]; d = json.load(open(p)); d["max_total_tokens"] = 20000; json.dump(d, open(p, "w"))' $D
+  for gb in default 0.001 0; do
+    flag=(); [ $gb = default ] || flag=(--prefix-cache-gb $gb)
+    serve kev9b-budget ~/trees/kev9b-int8 --engine qwen35 --device CPU --api 127.0.0.1:8080 "${flag[@]}"
+    curl -s -H 'content-type: application/json' --data-binary @$RUN/kev-long.json http://127.0.0.1:8080/v1/systemone \
+        -o $RUN/kev-budget-$gb.json -w "cache=$gb %{http_code} %{time_total}s\n"
+    stop_server kev9b-budget
+  done
+  cp $RUN/kev9b-decision.json.orig $D
+  $PY -c 'import json, os; R = os.environ["RUN"]; L = lambda f: json.load(open(f"{R}/{f}")); assert L("kev-budget-default.json")["answers"] == L("kev-long-base.json")["answers"]; print(L("kev-budget-0.001.json")); print(L("kev-budget-0.json"))'
+  ```
+
+  Expected: `cache=default 200`, `cache=0.001 413` (body mentions prefix reuse, time far below the default run's), `cache=0 413`. The tree's `decision.json` is restored byte for byte.
 
 - [ ] **Step 5: Docs and commit** (Kev-9B section; `git commit -m "docs(decisions): Kev-9B recipe and measured parity"`)
 
@@ -6109,13 +6194,12 @@ CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision_export.py cle
 - [ ] **Step 2: Serve and drive the parity run**
 
 ```bash
-rm -f /tmp/clef-flash.jsonl /tmp/clef-flash.parity.jsonl /tmp/clef-flash.golden.jsonl
-cascadia run ~/trees/clef-flash-int8 --engine qwen35 --device CPU --api 127.0.0.1:8080 --decision-dump /tmp/clef-flash.jsonl > /tmp/clef-flash-server.log 2>&1 &
-until curl -sf http://127.0.0.1:8080/health > /dev/null; do sleep 2; done
-$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump /tmp/clef-flash.jsonl
+rm -f $RUN/clef-flash.jsonl $RUN/clef-flash.parity.jsonl $RUN/clef-flash.golden.jsonl
+serve clef-flash ~/trees/clef-flash-int8 --engine qwen35 --device CPU --api 127.0.0.1:8080 --decision-dump $RUN/clef-flash.jsonl
+$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump $RUN/clef-flash.jsonl
 ```
 
-Expected: `wrote 50 passes for 50 records to /tmp/clef-flash.parity.jsonl` (one joint pass per record). Then send the same request twice and confirm both return 200. This is the regression check for the prefix-cache bug: Joint passes always prefill cold.
+Expected: `wrote 50 passes for 50 records to $RUN/clef-flash.parity.jsonl` (one joint pass per record). Then send the same request twice and confirm both return 200. This is the regression check for the prefix-cache bug: Joint passes always prefill cold.
 
 ```bash
 for i in 1 2; do curl -s -H 'content-type: application/json' http://127.0.0.1:8080/v1/systemone \
@@ -6125,7 +6209,7 @@ for i in 1 2; do curl -s -H 'content-type: application/json' http://127.0.0.1:80
 - [ ] **Step 3: Golden check**
 
 ```bash
-$PY tools/decision/codec_golden.py clef --url http://127.0.0.1:8080 --dump /tmp/clef-flash.jsonl --tokenizer ~/models/clef-flash --answers
+$PY tools/decision/codec_golden.py clef --url http://127.0.0.1:8080 --dump $RUN/clef-flash.jsonl --tokenizer ~/models/clef-flash --answers
 ```
 
 Expected: `clef: 54 records match encode_record` (50 + 4 synthetic; the 50 also match the saved `input_ids`), and answers ≥ 98% (N ≥ 81 of 82) against `reference_flash.pt`. That answer check is what catches noul inversion.
@@ -6135,13 +6219,13 @@ Expected: `clef: 54 records match encode_record` (50 + 4 synthetic; the 50 also 
 ```bash
 CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision/reference_stream.py clef --weights ~/models/clef-flash \
     --clef-dir ~/models/clef-flash --tree ~/trees/clef-flash-int8 \
-    --dump /tmp/clef-flash.parity.jsonl --out /tmp/clef-flash-ref.json
-$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref /tmp/clef-flash-ref.json
+    --dump $RUN/clef-flash.parity.jsonl --out $RUN/clef-flash-ref.json
+$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref $RUN/clef-flash-ref.json
 ```
 
 Expected: `PASS` (spike: 82/82).
 
-- [ ] **Step 4b: OpenAI route equivalence**: `$PY tools/decision/openai_equivalence.py --url http://127.0.0.1:8080`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`.
+- [ ] **Step 4b: OpenAI route equivalence**: `$PY tools/decision/openai_equivalence.py --url http://127.0.0.1:8080`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`. Then stop the server: `stop_server clef-flash`.
 
 - [ ] **Step 5: Docs and commit** (Clef-flash section; `git commit -m "docs(decisions): Clef-flash recipe and measured parity"`)
 
@@ -6152,16 +6236,20 @@ Host A runs rank 0 (the API, the dump and every tool); host B runs rank 1. `RANK
 ```bash
 # on host A, after the export
 rsync -a ~/trees/<tree>/ RANK1_HOST:trees/<tree>/
-# host B (rank 1 listens on the LAN; start it first)
-cascadia worker --model ~/trees/<tree> --engine qwen35 --device CPU --rank 1 --total 2 --listen 0.0.0.0:7801 > /tmp/rank1.log 2>&1 &
+# host B (rank 1 listens on the LAN; start it first). $RUN is the same private dir on both hosts.
+cascadia worker --model ~/trees/<tree> --engine qwen35 --device CPU --rank 1 --total 2 --listen 0.0.0.0:7801 > $RUN/rank1.log 2>&1 &
+echo $! > $RUN/rank1.pid
 # host A (rank 0 dials rank 1 once, at startup; the API stays on loopback because the dump holds request text)
-rm -f /tmp/<model>.jsonl /tmp/<model>.parity.jsonl /tmp/<model>.golden.jsonl
+! curl -sf http://127.0.0.1:8080/health > /dev/null || echo ":8080 is still serving: stop the previous task's server first"
+rm -f $RUN/<model>.jsonl $RUN/<model>.parity.jsonl $RUN/<model>.golden.jsonl
 cascadia worker --model ~/trees/<tree> --engine qwen35 --device CPU --rank 0 --total 2 --next RANK1_HOST:7801 \
-    --api 127.0.0.1:8080 --decision-dump /tmp/<model>.jsonl > /tmp/rank0.log 2>&1 &
-until curl -sf http://127.0.0.1:8080/health > /dev/null; do sleep 2; done
+    --api 127.0.0.1:8080 --decision-dump $RUN/<model>.jsonl > $RUN/rank0.log 2>&1 &
+echo $! > $RUN/rank0.pid
+until curl -sf http://127.0.0.1:8080/health > /dev/null; do kill -0 $(cat $RUN/rank0.pid) 2>/dev/null || break; sleep 2; done
+curl -s http://127.0.0.1:8080/v1/models | grep -F '<tree>'
 ```
 
-Monitor both logs. If rank 1 restarts, restart rank 0 too (it never re-dials).
+Monitor both logs. If rank 1 restarts, restart rank 0 too (it never re-dials). At the end of the task (Step 4b), stop each rank by its recorded PID, never with `pkill -f`: run `kill $(cat $RUN/rank0.pid)` on host A and `kill $(cat $RUN/rank1.pid)` on host B, wait until each process has exited (`kill -0` fails), then remove the PID files.
 
 ### Task 21: JEV-27B (pipeline, 2 machines)
 
@@ -6169,48 +6257,58 @@ The 27B models were never measured in the spike, so this task establishes the nu
 
 - [ ] **Step 1: Check the base, then export**
 
+JEV-27B's own BF16 shards are needed by the reference in Step 4 whatever the verdict, so download them first. `backbone_diff.py` then reads that side from disk, and only the stock side goes over the network.
+
 ```bash
 hf download OpenVINO/Qwen3.8-27B-int8-ov --local-dir ~/models/qwen38-27b-int8
-hf download autotrust/JEV-27B --include "adapter_vllm/*" --include calibration.json --include tokenizer.json --include tokenizer_config.json --local-dir ~/models/jev27b
-$PY tools/decision/backbone_diff.py autotrust/JEV-27B Qwen/Qwen3.8-27B --per-layer
+hf download autotrust/JEV-27B --include "adapter_vllm/*" --include calibration.json --include tokenizer.json --include tokenizer_config.json \
+    --include "model-*" --include "model.safetensors.index.json" --include config.json --local-dir ~/models/jev27b
+$PY tools/decision/backbone_diff.py Qwen/Qwen3.8-27B ~/models/jev27b --adapter ~/models/jev27b/adapter_vllm --per-layer \
+    > $RUN/jev27b-backbone.log 2>&1; echo "exit=$?" >> $RUN/jev27b-backbone.log
 ```
 
-`backbone_diff.py` matches tensors per layer index and suffix (a text-only `model.layers.N.*` checkpoint lines up with a VLM `model.language_model.layers.N.*` one), hashes every backbone tensor (all projections, norms, embeddings, final norm and lm_head) and ends with one line:
-- `VERDICT: STOCK`: the backbone is stock Qwen3.8-27B. Export without `--weights`.
-- `VERDICT: FINETUNED`: export with `--weights ~/models/jev27b` (download the shards first, below). `swap_stage` never swaps `lm_head`, and JEV reads verbalizer logits from it: if the per-tensor lines show `lm_head.weight` DIFF, stop and extend `swap_stage` to the lm_head constants before continuing.
-- `VERDICT: UNKNOWN` (exit 2): nothing comparable was found. **Stop** and inspect the two repos' headers; do not export.
+**Cost.** This is not a quick probe. The tool hashes the first and last 256 KiB of each of the ~850 backbone tensors. For the remote stock repo that is about 900+ sequential HTTPS range requests and ~0.45 GB, which can take tens of minutes; the local side costs disk reads only. Add `--slice 65536` to cut the bytes about 4×, with both ends of every tensor still covered. Run it in the background with a Monitor on `$RUN/jev27b-backbone.log` that watches for `VERDICT`, `exit=`, `Traceback` and `HTTP`. If the stock repo is gated, `HF_TOKEN` must already be in the environment (Global Constraints, Secrets). It is never typed on the command line and never printed. Alternatively, download the stock checkpoint once and pass its local directory instead.
 
-Either way the reference (Step 4) runs on JEV-27B's **own** shards, so it is independent of this call: a wrong STOCK verdict then fails parity instead of passing a circular one.
+`backbone_diff.py` matches tensors by layer index and suffix, so a text-only `model.layers.N.*` checkpoint lines up with a VLM `model.language_model.layers.N.*` one. It hashes every backbone tensor (all projections, norms, embeddings, the final norm and lm_head). With `--adapter`, it also checks whether every difference falls on a module that JEV's own LoRA targets. It ends with one line:
+- `VERDICT: STOCK` (exit 0): the backbone is stock Qwen3.8-27B. Export without `--weights`. The reference runs with `--lora`.
+- `VERDICT: FINETUNED` (exit 0): at least one difference lies outside the adapter's target modules, so this is an independent fine-tune. Export with `--weights ~/models/jev27b --weights-not-merged`; the flag states that the shards do not already hold the adapter, and the exporter refuses `jev --weights` without it. The reference runs with `--lora`. `swap_stage` never swaps `lm_head`, and JEV reads verbalizer logits from it. So if the per-tensor lines show `lm_head.weight` DIFF, stop and extend `swap_stage` to the lm_head constants before continuing.
+- `VERDICT: MERGED` (exit 3): every differing tensor is one of the adapter's target modules. The upload most likely holds the stock backbone with the LoRA already merged in. Exporting those shards with the adapter grafted again would apply it twice, and a reference built the same way would agree, so parity would pass on a wrong model. Instead:
+  - export as for STOCK (no `--weights`; the adapter is grafted onto the stock IR);
+  - run the reference on JEV-27B's own shards **without** `--lora`, because the adapter is already in them.
+
+  The two sides then come from different weights. If the merge was anything other than this adapter on the stock base, parity fails instead of passing.
+- `VERDICT: UNKNOWN` (exit 2): nothing comparable was found. Examples: no common layers, a dtype or shape difference, or lm_head, embed or the final norm present on one side only (tied vs untied heads). **Stop** and inspect the two repos' headers; do not export.
+
+In every case the reference (Step 4) runs on JEV-27B's **own** shards, so it is independent of the verdict. A wrong STOCK verdict then fails parity instead of passing a circular one.
 
 ```bash
-hf download autotrust/JEV-27B --include "model-*" --include "model.safetensors.index.json" --include config.json --local-dir ~/models/jev27b
-# STOCK:
+# STOCK or MERGED:
 CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision_export.py jev --base-ir ~/models/qwen38-27b-int8 --adapter-dir ~/models/jev27b/adapter_vllm --stages 2 --out ~/trees/jev27b-int8
-# FINETUNED: the same command plus --weights ~/models/jev27b
+# FINETUNED: the same command plus --weights ~/models/jev27b --weights-not-merged
 ```
 
-- [ ] **Step 2: Serve on two machines** per the two-machine runbook above, with `<tree>` = `jev27b-int8` and `<model>` = `jev27b`. Then drive the parity run: `$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump /tmp/jev27b.jsonl` (expected: `wrote 82 passes for 50 records to /tmp/jev27b.parity.jsonl`).
+- [ ] **Step 2: Serve on two machines** per the two-machine runbook above, with `<tree>` = `jev27b-int8` and `<model>` = `jev27b`. Then drive the parity run: `$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump $RUN/jev27b.jsonl` (expected: `wrote 82 passes for 50 records to $RUN/jev27b.parity.jsonl`).
 
 - [ ] **Step 3: Golden**
 
 ```bash
-$PY tools/decision/codec_golden.py jev --url http://127.0.0.1:8080 --dump /tmp/jev27b.jsonl --tokenizer ~/models/jev27b --adapter-dir ~/models/jev27b/adapter_vllm
+$PY tools/decision/codec_golden.py jev --url http://127.0.0.1:8080 --dump $RUN/jev27b.jsonl --tokenizer ~/models/jev27b --adapter-dir ~/models/jev27b/adapter_vllm
 ```
 
 No `--answers`: there is no saved 27B reference. Expected: `jev: 86 passes match the serve_decide layout and decision_head.json`.
 
-- [ ] **Step 4: Reference and parity.** The reference always uses JEV-27B's own BF16 shards, the same backbone the tree serves (stock, or `--weights ~/models/jev27b`); never the stock Qwen3.8-27B checkpoint. The peak is about 4 GB (one fp32 decoder layer plus its loaded state dict, ~3.4 GB, plus one LoRA delta), under the cap.
+- [ ] **Step 4: Reference and parity.** The reference always uses JEV-27B's own BF16 shards, the same backbone the tree serves (stock, or `--weights ~/models/jev27b`); never the stock Qwen3.8-27B checkpoint. With `VERDICT: MERGED`, drop the `--lora` line: the shards already contain the adapter. The peak is about 4 GB (one fp32 decoder layer plus its loaded state dict, ~3.4 GB, plus one LoRA delta), under the cap.
 
 ```bash
 CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision/reference_stream.py jev --weights ~/models/jev27b \
     --lora ~/models/jev27b/adapter_vllm/adapter_model.safetensors --tree ~/trees/jev27b-int8 \
-    --dump /tmp/jev27b.parity.jsonl --out /tmp/jev27b-ref.json
-$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref /tmp/jev27b-ref.json
+    --dump $RUN/jev27b.parity.jsonl --out $RUN/jev27b-ref.json
+$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref $RUN/jev27b-ref.json
 ```
 
 Expected: `PASS`. If it fails, record the number, the per-type breakdown and the confident flips in the docs, and raise it with the user before calling the model supported.
 
-- [ ] **Step 4b: OpenAI route equivalence**: `$PY tools/decision/openai_equivalence.py --url http://127.0.0.1:8080 --all-states`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`.
+- [ ] **Step 4b: OpenAI route equivalence**: `$PY tools/decision/openai_equivalence.py --url http://127.0.0.1:8080 --all-states`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`. Then stop both ranks by their PID files (two-machine runbook).
 
 - [ ] **Step 5: Docs and commit** (JEV-27B section, including the backbone verdict; `git commit -m "docs(decisions): JEV-27B recipe and measured parity"`)
 
@@ -6223,12 +6321,12 @@ hf download Cloudflare/clef --local-dir ~/models/clef
 $PY tools/decision_export.py clef --base-ir ~/models/qwen38-27b-int8 --weights ~/models/clef --clef-dir ~/models/clef --stages 2 --out ~/trees/clef-int8
 ```
 
-- [ ] **Step 2: Serve on two machines** per the two-machine runbook above, with `<tree>` = `clef-int8` and `<model>` = `clef27b`. Then drive the parity run: `$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump /tmp/clef27b.jsonl` (expected: `wrote 50 passes for 50 records to /tmp/clef27b.parity.jsonl`).
+- [ ] **Step 2: Serve on two machines** per the two-machine runbook above, with `<tree>` = `clef-int8` and `<model>` = `clef27b`. Then drive the parity run: `$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump $RUN/clef27b.jsonl` (expected: `wrote 50 passes for 50 records to $RUN/clef27b.parity.jsonl`).
 
 - [ ] **Step 3: Golden**
 
 ```bash
-$PY tools/decision/codec_golden.py clef --url http://127.0.0.1:8080 --dump /tmp/clef27b.jsonl --tokenizer ~/models/clef
+$PY tools/decision/codec_golden.py clef --url http://127.0.0.1:8080 --dump $RUN/clef27b.jsonl --tokenizer ~/models/clef
 ```
 
 No `--answers`; the 50 records' saved `input_ids` check still applies, since Clef 27B shares the tokenizer. Expected: `clef: 54 records match encode_record`.
@@ -6238,13 +6336,13 @@ No `--answers`; the 50 records' saved `input_ids` check still applies, since Cle
 ```bash
 CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision/reference_stream.py clef --weights ~/models/clef \
     --clef-dir ~/models/clef --tree ~/trees/clef-int8 \
-    --dump /tmp/clef27b.parity.jsonl --out /tmp/clef27b-ref.json
-$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref /tmp/clef27b-ref.json
+    --dump $RUN/clef27b.parity.jsonl --out $RUN/clef27b-ref.json
+$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref $RUN/clef27b-ref.json
 ```
 
 Expected: `PASS`, with the same escalation rule as Task 21.
 
-- [ ] **Step 4b: OpenAI route equivalence**: `$PY tools/decision/openai_equivalence.py --url http://127.0.0.1:8080`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`.
+- [ ] **Step 4b: OpenAI route equivalence**: `$PY tools/decision/openai_equivalence.py --url http://127.0.0.1:8080`. Expected: every question identical across `/v1/decisions` and `/v1/systemone`. Then stop both ranks by their PID files (two-machine runbook).
 
 - [ ] **Step 5: Docs and commit** (Clef-27B section, including the 16 GB export note; `git commit -m "docs(decisions): Clef 27B recipe and measured parity"`)
 
