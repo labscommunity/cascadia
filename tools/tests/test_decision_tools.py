@@ -533,9 +533,23 @@ _TARGETS = {f"layers.{i}.{s}" for i in range(3) for s in ("self_attn.q_proj.weig
 
 def test_backbone_diff_merged_when_every_difference_is_an_adapter_target():
     changed = {"layers.0.self_attn.q_proj.weight", "layers.2.mlp.down_proj.weight", "lm_head.weight"}
-    v, code, lines = _run(_hdr("model."), _hdr("model.", changed=changed), adapter=_TARGETS.__contains__)
+    seen = []
+
+    def proved(names, a, b):
+        seen.append(sorted(names))
+        return "MERGED", "checked: do not graft --lora again"
+    v, code, lines = _run(_hdr("model."), _hdr("model.", changed=changed), adapter=_TARGETS.__contains__,
+                          merge_check=proved)
     assert (v, code) == ("MERGED", 3)
     assert "--lora" in lines[-1]
+    assert seen == [sorted(changed)]
+    # P3-BLD-5: the all-on-target pattern alone is not a proof
+    v, code, lines = _run(_hdr("model."), _hdr("model.", changed=changed), adapter=_TARGETS.__contains__)
+    assert (v, code) == ("UNKNOWN", 2)
+    for verdict, code in (("FINETUNED", 0), ("UNKNOWN", 2)):
+        got = _run(_hdr("model."), _hdr("model.", changed=changed), adapter=_TARGETS.__contains__,
+                   merge_check=lambda n, a, b, v=verdict: (v, "check said so"))[:2]
+        assert got == (verdict, code)
 
 
 def test_backbone_diff_finetuned_when_a_difference_is_off_target():
@@ -608,7 +622,8 @@ def test_backbone_diff_reads_local_snapshot_dirs(tmp_path, monkeypatch, capsys):
     assert capsys.readouterr().out.strip().splitlines()[-1].startswith("VERDICT: FINETUNED")
 
 
-def test_backbone_diff_main_exits_3_on_merged(tmp_path, monkeypatch, capsys):
+def test_backbone_diff_config_only_adapter_cannot_prove_merged(tmp_path, monkeypatch, capsys):
+    """P3-BLD-5: with only adapter_config.json there are no lora tensors to verify a merge: UNKNOWN."""
     import backbone_diff as bd
     ad = tmp_path / "cfg"
     ad.mkdir()
@@ -617,8 +632,9 @@ def test_backbone_diff_main_exits_3_on_merged(tmp_path, monkeypatch, capsys):
     b = _local_repo(tmp_path / "b", changed={"model.layers.0.self_attn.q_proj.weight"})
     with pytest.raises(SystemExit) as e:
         bd.main([str(a), str(b), "--adapter", str(ad)])
-    assert e.value.code == 3
-    assert capsys.readouterr().out.strip().splitlines()[-1].startswith("VERDICT: MERGED")
+    assert e.value.code == 2
+    last = capsys.readouterr().out.strip().splitlines()[-1]
+    assert last.startswith("VERDICT: UNKNOWN") and "adapter_model.safetensors" in last
 
 
 class _Resp:
@@ -683,3 +699,221 @@ def test_backbone_diff_http_error_never_shows_the_token(monkeypatch):
     with pytest.raises(SystemExit) as e:
         bd.get("https://huggingface.co/x/resolve/main/f", (0, 3))
     assert "401" in str(e.value) and DUMMY_TOKEN not in str(e.value)
+
+
+# ---- Fix round 3: HF_TOKEN hygiene (P3-BLD-2) ----------------------------------------------------
+
+CRLF_DUMMY = "hf_dummy_crlf_not_a_secret\r\n"
+INNER_DUMMY = "hf_dummy_inner\r\nnot_a_secret"
+
+
+def test_backbone_diff_token_is_stripped_of_surrounding_whitespace(monkeypatch):
+    import backbone_diff as bd
+    seen = []
+    monkeypatch.setattr(bd, "_open", lambda req: seen.append(req) or _Resp(206, b"abcd"))
+    monkeypatch.setenv("HF_TOKEN", CRLF_DUMMY)
+    bd.get("https://huggingface.co/x/resolve/main/f", (0, 3))
+    assert seen[0].unredirected_hdrs["Authorization"] == "Bearer " + CRLF_DUMMY.strip()
+    monkeypatch.setenv("HF_TOKEN", " \t\r\n")
+    bd.get("https://huggingface.co/x/resolve/main/f", (0, 3))
+    assert "Authorization" not in seen[1].unredirected_hdrs
+
+
+@pytest.mark.parametrize("bad", [INNER_DUMMY, "hf_dummy has_space", "hf_dummy\x07bel", "hf_dummy_é"])
+def test_backbone_diff_malformed_token_is_refused_without_showing_it(monkeypatch, bad):
+    import backbone_diff as bd
+    monkeypatch.setattr(bd, "_open", lambda req: pytest.fail("a malformed token must fail before any request"))
+    monkeypatch.setenv("HF_TOKEN", bad)
+    with pytest.raises(SystemExit) as e:
+        bd.get("https://huggingface.co/x/resolve/main/f", (0, 3))
+    assert "HF_TOKEN is malformed" in str(e.value)
+    for part in bad.split():
+        assert part.strip() not in str(e.value)
+
+
+@pytest.mark.parametrize("exc", ["ValueError", "URLError", "HTTPException", "OSError", "RuntimeError"])
+def test_backbone_diff_request_errors_never_show_the_token(monkeypatch, capsys, exc):
+    import http.client
+    import urllib.error
+    import backbone_diff as bd
+    tok = CRLF_DUMMY.strip()
+
+    def boom(req):
+        # mimic http.client / urllib errors that quote the header value
+        msg = f"Invalid header value {req.unredirected_hdrs.get('Authorization')!r}"
+        raise {"ValueError": ValueError(msg), "URLError": urllib.error.URLError(msg),
+               "HTTPException": http.client.HTTPException(msg), "OSError": OSError(msg),
+               "RuntimeError": RuntimeError(msg)}[exc]
+    monkeypatch.setattr(bd, "_open", boom)
+    monkeypatch.setenv("HF_TOKEN", CRLF_DUMMY)
+    url = "https://huggingface.co/x/resolve/main/f"
+    with pytest.raises(SystemExit) as e:
+        bd.get(url, (0, 3))
+    text = str(e.value)
+    assert url in text and tok not in text
+    assert e.value.__suppress_context__ and e.value.__cause__ is None
+    out = capsys.readouterr()
+    assert tok not in out.out and tok not in out.err
+
+
+def test_backbone_diff_cli_with_a_malformed_token_prints_no_token(tmp_path):
+    """End to end in a subprocess whose environment holds only PATH and a dummy HF_TOKEN."""
+    import subprocess
+    script = Path(__file__).resolve().parent.parent / "decision" / "backbone_diff.py"
+    env = {"PATH": os.environ.get("PATH", ""), "HF_TOKEN": INNER_DUMMY}
+    r = subprocess.run([sys.executable, str(script), "org/a-repo", "org/b-repo"], env=env, cwd=tmp_path,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0
+    assert "HF_TOKEN is malformed" in r.stderr and "Traceback" not in r.stderr
+    for part in ("hf_dummy_inner", "not_a_secret"):
+        assert part not in r.stdout and part not in r.stderr
+
+
+# ---- Fix round 3: config-only target_modules (P3-BLD-4) ------------------------------------------
+
+@pytest.mark.parametrize("tm", ["all-linear", ["all-linear"], "ALL-LINEAR"])
+def test_backbone_diff_all_linear_target_modules(tmp_path, tm):
+    import backbone_diff as bd
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"target_modules": tm}))
+    on = bd.adapter_targets(str(tmp_path))
+    for n in ("layers.0.self_attn.q_proj.weight", "layers.3.mlp.down_proj.weight",
+              "layers.1.linear_attn.in_proj_qkvz.weight", "layers.1.linear_attn.out_proj.weight"):
+        assert on(n), n
+    for n in ("layers.0.input_layernorm.weight", "layers.1.linear_attn.norm.weight",
+              "layers.1.linear_attn.conv1d.weight", "layers.1.linear_attn.A_log", "embed_tokens.weight",
+              "norm.weight", "lm_head.weight", "layers.0.self_attn.q_norm.weight"):
+        assert not on(n), n
+    # a merged all-linear upload no longer reads FINETUNED: it reaches the merge check
+    changed = {"layers.0.self_attn.q_proj.weight", "layers.1.mlp.up_proj.weight"}
+    v, code, lines = _run(_hdr("model."), _hdr("model.", changed=changed), adapter=on)
+    assert (v, code) == ("UNKNOWN", 2) and "no merge check" in lines[-1]
+
+
+def test_backbone_diff_targets_matching_nothing_are_unknown(tmp_path):
+    import backbone_diff as bd
+    for tm in ("nothing_proj", ["nothing_proj"]):
+        (tmp_path / "adapter_config.json").write_text(json.dumps({"target_modules": tm}))
+        on = bd.adapter_targets(str(tmp_path))
+        v, code, lines = _run(_hdr("model."), _hdr("model.", changed={"layers.0.self_attn.q_proj.weight"}), adapter=on)
+        assert (v, code) == ("UNKNOWN", 2) and "match none" in lines[-1]
+
+
+# ---- Fix round 3: MERGED must be proved (P3-BLD-5) -----------------------------------------------
+
+def _bf16_bits(x):
+    """float32 array -> bf16 bit patterns (round to nearest even)."""
+    import numpy as np
+    u = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32).astype(np.uint64)
+    return ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
+
+
+def _bf16(x):
+    import numpy as np
+    return (_bf16_bits(x).astype(np.uint32) << 16).view(np.float32)
+
+
+def _write_st(path, tensors):
+    """Raw safetensors writer: {name: float32 array}, stored as BF16 when name is in `bf16` (all)."""
+    import struct as st
+    import numpy as np
+    hdr, blobs, off = {}, [], 0
+    for name, arr in tensors.items():
+        raw = _bf16_bits(arr).tobytes()
+        hdr[name] = {"dtype": "BF16", "shape": list(np.shape(arr)), "data_offsets": [off, off + len(raw)]}
+        blobs.append(raw)
+        off += len(raw)
+    h = json.dumps(hdr).encode()
+    Path(path).write_bytes(st.pack("<Q", len(h)) + h + b"".join(blobs))
+
+
+def _merge_case(seed=0, out=48, inp=32, r=4, alpha=8.0):
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    w = _bf16(rng.normal(0, 0.02, (out, inp)).astype(np.float32))
+    la = rng.normal(0, 0.05, (r, inp)).astype(np.float32)
+    lb = rng.normal(0, 0.05, (out, r)).astype(np.float32)
+    la, lb = _bf16(la), _bf16(lb)
+    scale = alpha / r
+    delta = scale * (lb.astype(np.float64) @ la.astype(np.float64))
+    return w, la, lb, scale, delta
+
+
+def test_backbone_diff_merge_evidence_on_synthetic_tensors():
+    import numpy as np
+    import backbone_diff as bd
+    w, la, lb, scale, delta = _merge_case()
+    up = lambda x: x.astype(np.float64)
+    merged = _bf16((w + delta).astype(np.float32))
+    assert bd.merge_evidence(up(w), up(merged), up(la), up(lb), scale, "BF16")[0] == "MERGED"
+    # either argument order (A = fine-tune, B = stock) proves it too
+    assert bd.merge_evidence(up(merged), up(w), up(la), up(lb), scale, "BF16")[0] == "MERGED"
+    # an independent fine-tune of the same module, of the same size: unrelated to B@A
+    other = np.random.default_rng(7).normal(0, float(np.std(delta)), w.shape)
+    indep = _bf16((w + other).astype(np.float32))
+    assert bd.merge_evidence(up(w), up(indep), up(la), up(lb), scale, "BF16")[0] == "FINETUNED"
+    # the adapter's direction at the wrong scale: neither proved nor refuted
+    twice = _bf16((w + 2 * delta).astype(np.float32))
+    assert bd.merge_evidence(up(w), up(twice), up(la), up(lb), scale, "BF16")[0] == "UNKNOWN"
+    # a merge done in bf16 arithmetic (delta rounded to bf16 first, as PEFT does for bf16 weights)
+    merged16 = _bf16((w + _bf16(delta.astype(np.float32))).astype(np.float32))
+    assert bd.merge_evidence(up(w), up(merged16), up(la), up(lb), scale, "BF16")[0] == "MERGED"
+    # a delta far below bf16's resolution proves nothing, even though the residual is tiny
+    tiny = np.random.default_rng(9).normal(0, 1e-7, w.shape)
+    assert bd.merge_evidence(up(w), up(w + tiny), up(la), up(lb), 1e-5, "BF16")[0] != "MERGED"
+    # shapes that do not compose
+    assert bd.merge_evidence(up(w), up(merged), up(la), up(lb.T), scale, "BF16")[0] == "UNKNOWN"
+
+
+def _merge_repos(tmp_path, kind, cfg=None):
+    """Stock repo A, fine-tune repo B (q_proj of layers 0 and 1 changed per `kind`) and a PEFT adapter."""
+    import numpy as np
+    rng = np.random.default_rng(3)
+    names = [f"model.layers.{i}.{s}" for i in range(2) for s in _LAYER_SUFFIXES] + \
+        ["model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"]
+    stock = {n: _bf16(rng.normal(0, 0.02, (48, 32)).astype(np.float32)) for n in names}
+    tuned, lora = dict(stock), {}
+    for i in range(2):
+        n = f"model.layers.{i}.self_attn.q_proj.weight"
+        _, la, lb, scale, delta = _merge_case(seed=10 + i)
+        lora[f"base_model.model.model.language_model.layers.{i}.self_attn.q_proj.lora_A.weight"] = la
+        lora[f"base_model.model.model.language_model.layers.{i}.self_attn.q_proj.lora_B.weight"] = lb
+        if kind == "merged":
+            add = delta
+        else:
+            add = np.random.default_rng(20 + i).normal(0, float(np.std(delta)), delta.shape)
+        tuned[n] = _bf16((stock[n] + add).astype(np.float32))
+    for side, ts in (("a", stock), ("b", tuned)):
+        (tmp_path / side).mkdir()
+        _write_st(tmp_path / side / "model.safetensors", ts)
+    ad = tmp_path / "adapter_vllm"
+    ad.mkdir()
+    _write_st(ad / "adapter_model.safetensors", lora)
+    (ad / "adapter_config.json").write_text(json.dumps(cfg or {"r": 4, "lora_alpha": 8.0,
+                                                               "target_modules": ["q_proj"]}))
+    return tmp_path / "a", tmp_path / "b", ad
+
+
+@pytest.mark.parametrize("kind,code,verdict", [("merged", 3, "MERGED"), ("independent", 0, "FINETUNED")])
+def test_backbone_diff_main_verifies_the_merge(tmp_path, monkeypatch, capsys, kind, code, verdict):
+    import backbone_diff as bd
+    monkeypatch.setattr(bd, "get", lambda *a, **k: pytest.fail("local dirs must not touch the network"))
+    a, b, ad = _merge_repos(tmp_path, kind)
+    with pytest.raises(SystemExit) as e:
+        bd.main([str(a), str(b), "--adapter", str(ad)])
+    out = capsys.readouterr().out.strip().splitlines()
+    assert e.value.code == code, out
+    assert out[-1].startswith(f"VERDICT: {verdict}")
+    assert sum("merge check layers." in l for l in out) == 2
+
+
+def test_backbone_diff_merge_check_unknown_when_it_cannot_run(tmp_path, monkeypatch, capsys):
+    import backbone_diff as bd
+    a, b, ad = _merge_repos(tmp_path, "merged", cfg={"r": 4, "lora_alpha": 8.0, "target_modules": ["q_proj"],
+                                                     "use_dora": True})
+    with pytest.raises(SystemExit) as e:
+        bd.main([str(a), str(b), "--adapter", str(ad)])
+    assert e.value.code == 2 and "use_dora" in capsys.readouterr().out.strip().splitlines()[-1]
+    (ad / "adapter_config.json").write_text(json.dumps({"r": 4, "lora_alpha": 8.0, "target_modules": ["q_proj"]}))
+    with pytest.raises(SystemExit) as e:  # every target larger than the read cap
+        bd.main([str(a), str(b), "--adapter", str(ad), "--merge-check-bytes", "16"])
+    assert e.value.code == 2 and "at most 16 bytes" in capsys.readouterr().out.strip().splitlines()[-1]

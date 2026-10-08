@@ -8,9 +8,12 @@ usage: python backbone_diff.py A B [--per-layer] [--slice BYTES] [--adapter ADAP
 
 A and B are each a Hugging Face repo id (read with HTTP range requests) or a local snapshot
 directory (`model.safetensors.index.json` + shards, or a single `model.safetensors`; read from
-disk, no network). For a gated or private repo set HF_TOKEN in the environment: it is sent only as
-the `Authorization` header of huggingface.co requests (never to the CDN a download redirects to)
-and is never printed or logged.
+disk, no network). A is the stock base, B the fine-tune (the merge check below accepts either
+order). For a gated or private repo set HF_TOKEN in the environment: surrounding whitespace is
+stripped, a value holding any other control, space or non-ASCII character is refused without being
+shown, and it is sent only as the `Authorization` header of huggingface.co requests (never to the
+CDN a download redirects to). It is never printed or logged: every request failure is reported by
+URL and exception type only.
 
 Names are matched per repo after normalisation, so a text-only `Qwen3_5ForCausalLM` checkpoint
 (`model.layers.N.*`, `model.embed_tokens`, `model.norm`) lines up with a VLM checkpoint
@@ -21,18 +24,29 @@ norm and lm_head. Each tensor's first and last SLICE bytes are hashed (a fine-tu
 moves essentially every element).
 
 --adapter (a PEFT adapter dir or its adapter_model.safetensors; adapter_config.json's
-target_modules when there is no adapter file) names the modules the fine-tune's LoRA targets. When
-every differing tensor is the `.weight` of one of those modules, the shards most likely carry the
-adapter already merged, and exporting them with the same adapter grafted again applies it twice.
+target_modules when there is no adapter file: a list of module-name suffixes, a regex, or
+"all-linear") names the modules the fine-tune's LoRA targets. When every differing tensor is the
+`.weight` of one of those modules, the shards may carry the adapter already merged, and exporting
+them with the same adapter grafted again would apply it twice. That pattern alone does not prove
+a merge (an independent fine-tune of the same modules looks the same), so it is then verified: for
+the one or two smallest differing decoder-layer targets (at most --merge-check-bytes each) both
+tensors and the adapter's lora_A/lora_B are read whole, and (B - A) must equal +-scale * lora_B @
+lora_A within the shard dtype's rounding (residual RMS <= RMS of one ulp, |cosine| >= 0.9). If it
+does, MERGED; if the difference is clearly unrelated to the adapter's delta (|cosine| < 0.5) on every
+checked tensor, FINETUNED; anything else (a config-only --adapter with no lora tensors, rank/alpha patterns, DoRA,
+no small target, mixed or in-between evidence) is UNKNOWN. An --adapter whose targets match none of
+the compared tensors is UNKNOWN as well.
 
 The last line is always one verdict:
   VERDICT: STOCK      every compared tensor is identical                              (exit 0)
   VERDICT: FINETUNED  at least one compared tensor differs (with --adapter: at least one of them
                       outside the adapter's targets)                                  (exit 0)
-  VERDICT: MERGED     with --adapter: every difference is on an adapter target        (exit 3)
+  VERDICT: MERGED     with --adapter: every difference is on an adapter target and the
+                      merge check proved B - A = scale * lora_B @ lora_A               (exit 3)
   VERDICT: UNKNOWN    nothing comparable: no common decoder-layer tensors, layer sets differ, a
                       tensor (decoder-layer, embed_tokens, final norm or lm_head) exists on one
-                      side only, or a common tensor has a different dtype/shape        (exit 2)
+                      side only, or a common tensor has a different dtype/shape; with
+                      --adapter: targets match nothing, or the merge is not decidable  (exit 2)
 --per-layer prints one `layer {i}: SAME|DIFF (n tensors[, differing: ...])` line per decoder layer.
 
 Cost (remote repos): one header request per shard, then 1-2 range requests per tensor per repo
@@ -79,13 +93,29 @@ def _open(req):
     return _OPENER.open(req)
 
 
+def hf_token():
+    """HF_TOKEN from the environment with surrounding whitespace stripped, or None when unset/blank.
+    A value that still holds anything but printable ASCII (a stray CR/LF inside, a space, a control
+    or non-ASCII character) is refused: http.client would otherwise reject the header with an error
+    that quotes it. The message never contains the value."""
+    tok = os.environ.get("HF_TOKEN", "").strip()
+    if not tok:
+        return None
+    if any(not 0x21 <= ord(c) <= 0x7E for c in tok):
+        raise SystemExit("HF_TOKEN is malformed: it holds a space, control or non-ASCII character "
+                         "(value not shown); fix it in the environment")
+    return tok
+
+
 def get(url, rng=None):
     """GET `url` (bytes rng[0]..rng[1] inclusive when given). HF_TOKEN, when set, goes only into the
-    Authorization header of this request; it is never printed, and errors name the URL only."""
+    Authorization header of this request; it is never printed, and every failure (HTTP status, URL,
+    connection, header or socket error) becomes a SystemExit naming only the URL and the error type:
+    an exception's own text (which may quote a header) is never shown."""
     req = urllib.request.Request(url)
     if rng:
         req.add_header("Range", f"bytes={rng[0]}-{rng[1]}")
-    token = os.environ.get("HF_TOKEN")
+    token = hf_token()
     if token:
         req.add_unredirected_header("Authorization", f"Bearer {token}")
     try:
@@ -94,6 +124,8 @@ def get(url, rng=None):
     except urllib.error.HTTPError as e:
         hint = " (gated or private: set HF_TOKEN, or pass a local snapshot dir)" if e.code in (401, 403) else ""
         raise SystemExit(f"HTTP {e.code} for {url}{hint}") from None
+    except Exception as e:  # URLError, http.client.HTTPException, ValueError (bad header), OSError, ...
+        raise SystemExit(f"request to {url} failed: {type(e).__name__}") from None
     if rng:
         want = rng[1] - rng[0] + 1
         if status != 206 or len(body) != want:
@@ -199,14 +231,52 @@ def layer_of(name):
     return int(m.group(1)) if m else None
 
 
+def _adapter_file(path):
+    p = Path(path).expanduser()
+    f = p / "adapter_model.safetensors" if p.is_dir() else p
+    return f if f.is_file() else None
+
+
+def _all_linear(name):
+    """PEFT's `target_modules: "all-linear"`: every nn.Linear except the output layer. In a Qwen3.5
+    decoder layer that is each 2-D projection `.weight` (attention, linear-attention in_proj_* /
+    out_proj, MLP); norms, the depthwise conv1d, A_log, dt_bias, embed_tokens and lm_head are not."""
+    if layer_of(name) is None or not name.endswith(".weight"):
+        return False
+    leaf = name[:-len(".weight")].rsplit(".", 1)[-1]
+    return "norm" not in leaf and leaf != "conv1d"
+
+
+def adapter_lora(path):
+    """{canonical target `.weight` name: (lora_A entry, lora_B entry)} from the adapter file at `path`
+    (adapter_model.safetensors or a dir holding it), or None when there is no adapter file."""
+    f = _adapter_file(path)
+    if f is None:
+        return None
+    hdr, base = shard_header(f)
+    out = {}
+    for k, t in hdr.items():
+        if not k.endswith(".lora_A.weight"):
+            continue
+        stem = k[:-len(".lora_A.weight")]
+        c = canonical(stem.removeprefix("base_model.model.") + ".weight")
+        tb = hdr.get(stem + ".lora_B.weight")
+        if c is None or tb is None:
+            continue
+        ent = lambda tt: (f, tt["dtype"], tuple(tt["shape"]), base + tt["data_offsets"][0], base + tt["data_offsets"][1])
+        out[c] = (ent(t), ent(tb))
+    return out
+
+
 def adapter_targets(path):
     """Predicate over canonical tensor names: is this the `.weight` of a module the PEFT adapter at
     `path` targets? `path` is adapter_model.safetensors or a dir holding it (exact modules, from the
     `*.lora_A.weight` keys), else a dir with only adapter_config.json (its `target_modules`: a list
-    of module-name suffixes, or a regex string matched against the whole module name)."""
+    of module-name suffixes, a regex string matched against the whole module name, or "all-linear",
+    alone or in a list)."""
     p = Path(path).expanduser()
-    f = p / "adapter_model.safetensors" if p.is_dir() else p
-    if f.is_file():
+    f = _adapter_file(path)
+    if f is not None:
         hdr, _ = shard_header(f)
         mods = set()
         for k in hdr:
@@ -223,20 +293,142 @@ def adapter_targets(path):
     tm = json.loads(cfg_file.read_text()).get("target_modules")
     if not tm:
         raise SystemExit(f"{cfg_file}: no target_modules")
+    if isinstance(tm, str) and tm.lower() == "all-linear":
+        return _all_linear
+    if isinstance(tm, str):
+        rx = re.compile(tm)
+    else:
+        tm = [t for t in tm if isinstance(t, str)]
+        if any(t.lower() == "all-linear" for t in tm):
+            return _all_linear
 
     def on(name):
         if not name.endswith(".weight"):
             return False
         mod = name[:-len(".weight")]
         if isinstance(tm, str):
-            return re.fullmatch(tm, mod) is not None or re.fullmatch(tm, "model." + mod) is not None
+            return rx.fullmatch(mod) is not None or rx.fullmatch("model." + mod) is not None
         return any(mod == t or mod.endswith("." + t) for t in tm)
     return on
 
 
-def compare(a_hdr, b_hdr, sha=tensor_sha, per_layer=False, log=print, adapter=None):
+# ---- MERGED proof: (B - A) == +-scale * lora_B @ lora_A within the shard's rounding --------------
+
+_MANT_BITS = {"BF16": 7, "F16": 10, "F32": 23}
+MERGE_CHECK_BYTES = 32 << 20
+
+
+def read_tensor(entry):
+    """The whole tensor as a float64 numpy array (BF16 / F16 / F32), or None for another dtype."""
+    import numpy as np
+    src, dtype, shape, s, e = entry
+    if dtype not in _MANT_BITS:
+        return None
+    raw = read_range(src, s, e - 1) if e > s else b""
+    if dtype == "BF16":
+        arr = (np.frombuffer(raw, "<u2").astype(np.uint32) << 16).view(np.float32)
+    else:
+        arr = np.frombuffer(raw, "<f2" if dtype == "F16" else "<f4")
+    return arr.astype(np.float64).reshape(shape)
+
+
+def _ulp(x, dtype):
+    """One unit in the last place of each |x| in `dtype` (0 where x is 0)."""
+    import numpy as np
+    _, e = np.frexp(np.abs(x))
+    return np.where(x == 0, 0.0, np.ldexp(1.0, e - 1 - _MANT_BITS[dtype]))
+
+
+def merge_evidence(stock, tuned, lora_a, lora_b, scale, dtype):
+    """-> (verdict, why) for one target tensor. MERGED when tuned - stock equals +-scale*B@A within
+    `dtype`'s rounding (residual RMS no larger than the RMS of one ulp of the larger operand) and
+    follows it closely (|cosine| >= 0.9: a delta below the dtype's resolution proves nothing);
+    FINETUNED when the difference is clearly unrelated to the adapter delta (|cosine| < 0.5);
+    UNKNOWN otherwise (e.g. the right direction at the wrong scale)."""
+    import numpy as np
+    if lora_a.ndim != 2 or lora_b.ndim != 2 or lora_b.shape[1] != lora_a.shape[0]:
+        return "UNKNOWN", f"lora_A {lora_a.shape} / lora_B {lora_b.shape} do not compose"
+    delta = scale * (lora_b @ lora_a)
+    diff = tuned - stock
+    if delta.shape != diff.shape:
+        return "UNKNOWN", f"adapter delta {delta.shape} vs tensor {diff.shape}"
+    nd, nf = float(np.linalg.norm(delta)), float(np.linalg.norm(diff))
+    if nd == 0.0 or nf == 0.0:
+        return "UNKNOWN", "zero adapter delta or zero difference"
+    cos = float(np.vdot(diff, delta)) / (nd * nf)
+    sign = 1.0 if cos >= 0 else -1.0
+    resid = float(np.sqrt(np.mean((diff - sign * delta) ** 2)))
+    noise = float(np.sqrt(np.mean(_ulp(np.maximum(np.abs(stock), np.abs(tuned)), dtype) ** 2)))
+    stats = f"cos {cos:+.4f}, residual RMS {resid:.3g} vs rounding RMS {noise:.3g}"
+    if resid <= noise and abs(cos) >= 0.9:
+        return "MERGED", stats
+    if abs(cos) < 0.5:
+        return "FINETUNED", stats
+    return "UNKNOWN", stats
+
+
+def lora_scale(adapter_path):
+    """(scale, None) from adapter_config.json beside the adapter file (alpha/r, alpha/sqrt(r) with
+    rsLoRA), or (None, reason) when one global scale cannot describe the adapter."""
+    f = _adapter_file(adapter_path)
+    cfg_file = f.parent / "adapter_config.json"
+    if not cfg_file.is_file():
+        return None, f"no adapter_config.json beside {f}"
+    cfg = json.loads(cfg_file.read_text())
+    for k in ("rank_pattern", "alpha_pattern"):
+        if cfg.get(k):
+            return None, f"adapter_config.json has a non-empty {k}"
+    if cfg.get("use_dora"):
+        return None, "adapter_config.json has use_dora: true"
+    if "r" not in cfg or "lora_alpha" not in cfg:
+        return None, "adapter_config.json lacks r / lora_alpha"
+    r, alpha = cfg["r"], cfg["lora_alpha"]
+    return (alpha / (r ** 0.5) if cfg.get("use_rslora") else alpha / r), None
+
+
+def merge_checker(adapter_path, max_tensors=2, max_bytes=MERGE_CHECK_BYTES, log=print):
+    """A `merge_check(names, a, b) -> (verdict, why)` for `compare`, proving or refuting MERGED on
+    the `max_tensors` smallest differing decoder-layer targets of at most `max_bytes` each."""
+    lora = adapter_lora(adapter_path)
+
+    def check(names, a, b):
+        if lora is None:
+            return "UNKNOWN", ("the pattern fits a merged LoRA, but --adapter has no adapter_model.safetensors "
+                               "to verify it; pass the adapter file")
+        scale, why = lora_scale(adapter_path)
+        if scale is None:
+            return "UNKNOWN", f"the pattern fits a merged LoRA, but it cannot be verified: {why}"
+        cands = sorted((n for n in names if n in lora and layer_of(n) is not None and len(a[n][2]) == 2
+                        and a[n][4] - a[n][3] <= max_bytes), key=lambda n: (a[n][4] - a[n][3], n))[:max_tensors]
+        if not cands:
+            return "UNKNOWN", (f"the pattern fits a merged LoRA, but no differing decoder-layer target of at most "
+                               f"{max_bytes} bytes has adapter tensors to verify it")
+        results = []
+        for n in cands:
+            stock, tuned = read_tensor(a[n]), read_tensor(b[n])
+            la, lb = read_tensor(lora[n][0]), read_tensor(lora[n][1])
+            if stock is None or tuned is None or la is None or lb is None:
+                v, w = "UNKNOWN", "unsupported dtype"
+            else:
+                v, w = merge_evidence(stock, tuned, la, lb, scale, a[n][1])
+            log(f"  merge check {n}: {v} ({w})")
+            results.append(v)
+        if all(v == "MERGED" for v in results):
+            return "MERGED", (f"all {len(names)} differing tensor(s) are the adapter's target modules and "
+                              f"{len(results)} checked tensor(s) equal stock + scale*B@A: the shards hold the LoRA "
+                              f"merged; do not graft --lora onto them again")
+        if all(v == "FINETUNED" for v in results):
+            return "FINETUNED", (f"every difference is on an adapter target, but {len(results)} checked tensor(s) "
+                                 f"differ from stock by something unrelated to scale*B@A: an independent fine-tune")
+        return "UNKNOWN", f"merge check inconclusive ({', '.join(results)}); inspect the tensors"
+    return check
+
+
+def compare(a_hdr, b_hdr, sha=tensor_sha, per_layer=False, log=print, adapter=None, merge_check=None):
     """-> (verdict, exit code). Prints the evidence through `log`; the verdict line is printed last.
-    `adapter`: a predicate from `adapter_targets`, which turns an all-on-target FINETUNED into MERGED."""
+    `adapter`: a predicate from `adapter_targets`. When every difference is on an adapter target,
+    `merge_check(differing names, a, b) -> (verdict, why)` (from `merge_checker`) decides between
+    MERGED, FINETUNED and UNKNOWN; without one the merge is unproven and the verdict is UNKNOWN."""
     a, b = normalise(a_hdr), normalise(b_hdr)
     la = {layer_of(n) for n in a} - {None}
     lb = {layer_of(n) for n in b} - {None}
@@ -268,6 +460,9 @@ def compare(a_hdr, b_hdr, sha=tensor_sha, per_layer=False, log=print, adapter=No
     if mism:
         return verdict("UNKNOWN", f"{len(mism)} common tensor(s) differ in dtype/shape, e.g. "
                                   f"{mism[0]}: {a[mism[0]][1:3]} vs {b[mism[0]][1:3]}")
+    if adapter is not None and not any(adapter(n) for n in common):
+        return verdict("UNKNOWN", "--adapter's target modules match none of the compared tensors; "
+                                  "check target_modules (or pass the adapter file)")
     diff_by_layer, top_diff, n_diff, differing = {}, [], 0, []
     for n in common:
         same = sha(a[n]) == sha(b[n])
@@ -294,8 +489,10 @@ def compare(a_hdr, b_hdr, sha=tensor_sha, per_layer=False, log=print, adapter=No
     if n_diff and adapter is not None:
         off = [n for n in differing if not adapter(n)]
         if not off:
-            return verdict("MERGED", f"all {n_diff} differing tensor(s) are the adapter's target modules: the "
-                                     f"shards likely hold the LoRA merged; do not graft --lora onto them again")
+            if merge_check is None:
+                return verdict("UNKNOWN", f"all {n_diff} differing tensor(s) are the adapter's target modules, "
+                                          f"but no merge check ran to prove MERGED")
+            return verdict(*merge_check(differing, a, b))
         log(f"{len(off)} differing tensor(s) outside the adapter's targets, e.g. {off[:3]}")
     if n_diff:
         return verdict("FINETUNED", f"{len(changed)} layer(s) and {len(top_diff)} top-level tensor(s) differ")
@@ -310,14 +507,18 @@ def main(argv=None):
     ap.add_argument("--slice", type=int, default=SLICE, help="bytes hashed at each end of every tensor")
     ap.add_argument("--adapter", default=None,
                     help="PEFT adapter dir / adapter_model.safetensors of the fine-tune: an all-on-target "
-                         "difference is reported as MERGED (exit 3)")
+                         "difference is verified and reported as MERGED (exit 3), FINETUNED or UNKNOWN")
+    ap.add_argument("--merge-check-bytes", type=int, default=MERGE_CHECK_BYTES,
+                    help="largest target tensor the merge check reads whole (bytes, per side)")
     a = ap.parse_args(argv)
     if a.slice < 1:
         ap.error("--slice must be at least 1")
+    hf_token()  # a malformed HF_TOKEN fails here, before any work, without being shown
     targets = adapter_targets(a.adapter) if a.adapter else None
+    check = merge_checker(a.adapter, max_bytes=a.merge_check_bytes) if a.adapter else None
     print(f"A = {a.a_repo}\nB = {a.b_repo}")
     _, code = compare(headers(a.a_repo), headers(a.b_repo), sha=lambda e: tensor_sha(e, a.slice),
-                      per_layer=a.per_layer, adapter=targets)
+                      per_layer=a.per_layer, adapter=targets, merge_check=check)
     sys.exit(code)
 
 
