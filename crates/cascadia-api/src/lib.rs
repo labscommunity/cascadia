@@ -151,7 +151,38 @@ pub struct AppState {
     pub decisions: Option<Arc<decisions::DecisionService>>,
     /// `--decision-dump FILE`, opened once at startup (0600, no symlinks): one JSON line per
     /// decision pass. Records request-derived token ids.
-    pub decision_dump: Option<Arc<std::sync::Mutex<std::fs::File>>>,
+    pub decision_dump: Option<Arc<std::sync::Mutex<DecisionDump>>>,
+}
+
+/// The open `--decision-dump` file and its optional size cap (`--decision-dump-max-bytes`).
+#[derive(Debug)]
+pub struct DecisionDump {
+    file: std::fs::File,
+    /// File size so far (the length found at open plus every line appended since).
+    len: u64,
+    max_bytes: Option<u64>,
+    warned_full: bool,
+}
+
+impl DecisionDump {
+    /// Append one request's lines whole, or none of them once the file would pass the cap.
+    pub(crate) fn append(&mut self, lines: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        let after = self.len.saturating_add(lines.len() as u64);
+        if self.max_bytes.is_some_and(|m| after > m) {
+            if !self.warned_full {
+                self.warned_full = true;
+                tracing::warn!(
+                    max_bytes = self.max_bytes,
+                    "--decision-dump reached --decision-dump-max-bytes; later requests are not recorded"
+                );
+            }
+            return Ok(());
+        }
+        self.file.write_all(lines)?;
+        self.len = after;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -177,6 +208,8 @@ pub struct Config {
     pub decisions: Option<Arc<decisions::DecisionService>>,
     /// See [`AppState::decision_dump`]. Startup only (the CLI's `--decision-dump`), never an env var.
     pub decision_dump: Option<std::path::PathBuf>,
+    /// Stop appending to the dump once it would pass this many bytes (`None`: unlimited).
+    pub decision_dump_max_bytes: Option<u64>,
 }
 
 impl Default for Config {
@@ -191,6 +224,7 @@ impl Default for Config {
             marker_dialect: None,
             decisions: None,
             decision_dump: None,
+            decision_dump_max_bytes: None,
         }
     }
 }
@@ -533,9 +567,15 @@ pub fn make_router_with_stats(
     stats: Arc<ApiStats>,
 ) -> Router {
     let decision_dump = cfg.decision_dump.as_ref().map(|p| {
-        let f = open_decision_dump(p)
+        let file = open_decision_dump(p)
             .unwrap_or_else(|e| panic!("--decision-dump {}: {e}", p.display()));
-        Arc::new(std::sync::Mutex::new(f))
+        let len = file.metadata().map_or(0, |m| m.len());
+        Arc::new(std::sync::Mutex::new(DecisionDump {
+            file,
+            len,
+            max_bytes: cfg.decision_dump_max_bytes,
+            warned_full: false,
+        }))
     });
     let state = AppState {
         runner,
@@ -3922,7 +3962,7 @@ mod tests {
     async fn make_decision_app_full(
         max_tokens: usize,
         max_total_tokens: usize,
-        dump: Option<std::path::PathBuf>,
+        dump: Option<(std::path::PathBuf, Option<u64>)>,
     ) -> Router {
         let words = [
             "[unk]",
@@ -3982,7 +4022,7 @@ mod tests {
         codec: Box<dyn decisions::Codec>,
         max_tokens: usize,
         max_total_tokens: usize,
-        dump: Option<std::path::PathBuf>,
+        dump: Option<(std::path::PathBuf, Option<u64>)>,
         stats: Arc<ApiStats>,
     ) -> Router {
         let runner = Runner::new(Box::new(MockBuilder::new()));
@@ -4003,7 +4043,8 @@ mod tests {
                 prefix_reuse: true,
                 encode_slots: decisions::default_encode_slots(),
             })),
-            decision_dump: dump,
+            decision_dump: dump.as_ref().map(|d| d.0.clone()),
+            decision_dump_max_bytes: dump.and_then(|d| d.1),
             max_body_bytes: 1 << 20,
             ..Config::default()
         };
@@ -4223,7 +4264,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
-        let app = make_decision_app_full(1000, 4000, Some(path.clone())).await;
+        let app = make_decision_app_full(1000, 4000, Some((path.clone(), None))).await;
         let (status, v, _) = post_decisions(
             app,
             r#"{"model": "m", "state": "a", "questions": {"u": {"type": "noul"}, "w": {"type": "noul"}}}"#,
@@ -4251,6 +4292,38 @@ mod tests {
             );
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn decisions_dump_stops_appending_at_its_byte_cap() {
+        // P2-SEC-5: --decision-dump-max-bytes. A request's lines are written whole or not at
+        // all, and the request itself is unaffected.
+        let dir = std::env::temp_dir().join(format!("decision-dump-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = r#"{"model": "m", "state": "a", "questions": {"u": {"type": "noul"}, "w": {"type": "noul"}}}"#;
+        let free = dir.join("free.jsonl");
+        let app = make_decision_app_full(1000, 4000, Some((free.clone(), None))).await;
+        assert_eq!(post_decisions(app, body).await.0, StatusCode::OK);
+        let one = std::fs::metadata(&free).unwrap().len();
+        assert!(one > 0);
+        // Room for exactly one request's lines: the first is written, the second skipped.
+        let capped = dir.join("capped.jsonl");
+        let app = make_decision_app_full(1000, 4000, Some((capped.clone(), Some(one)))).await;
+        assert_eq!(post_decisions(app.clone(), body).await.0, StatusCode::OK);
+        assert_eq!(std::fs::metadata(&capped).unwrap().len(), one);
+        assert_eq!(post_decisions(app, body).await.0, StatusCode::OK);
+        assert_eq!(
+            std::fs::metadata(&capped).unwrap().len(),
+            one,
+            "over the cap"
+        );
+        // Too small for even one request: nothing, not half a request.
+        let tiny = dir.join("tiny.jsonl");
+        let app = make_decision_app_full(1000, 4000, Some((tiny.clone(), Some(one - 1)))).await;
+        assert_eq!(post_decisions(app, body).await.0, StatusCode::OK);
+        assert_eq!(std::fs::metadata(&tiny).unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
