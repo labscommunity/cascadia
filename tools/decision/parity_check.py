@@ -2,8 +2,14 @@
 
   python tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump d.jsonl        # drive the server, slice its dump
   python tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref ref.json        # gate: raw >= 96% and no flip with reference margin >= 0.05
-  python tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref ref.json --answers-out single.json   # also save this run's answers
-  python tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref single.json --min-agree 1 --confident 0  # top-1 identical to that run
+  python tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref ref.json --answers-out single.json   # also save this run's answers (only on PASS)
+  python tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref single.json --min-agree 0 --confident 0.05  # pipeline vs single box
+
+Against another server's saved answers (a pipeline tree against its single box), the two runs take
+different numeric paths, so a question the single box itself answered on a near-tie can flip on
+float noise. `--min-agree 0 --confident 0.05` fails on any flip where the saved run's margin is
+>= 0.05 and reports the others as `FLIP ... (near-tie, informational)`; `max |dp|` bounds how far
+any probability moved. `--min-agree 1 --confident 0` is the strict form: any flip fails.
 
 Without --ref the server must run with `--decision-dump DUMP` and have no other client: this run's
 passes (the bytes the dump grew by while the 50 records were posted) are written to
@@ -47,6 +53,19 @@ def gate(flip_margins, agree, total, min_agree, confident):
     if rate < min_agree:
         return False, f"agreement {rate:.3f} < {min_agree}"
     return True, f"agreement {agree}/{total} = {rate:.3f}, every flip had reference margin < {confident}"
+
+
+def max_abs_delta(ref, results):
+    """Largest |p_server - p_ref| over every option of every answered question (0.0 when none)."""
+    worst = 0.0
+    for rec, resp in results:
+        for qid, ans in resp["answers"].items():
+            want = ref.get(f"{rec['id']}.{qid}")
+            if want is None:
+                continue
+            got = answer_probs(ans)
+            worst = max([worst] + [abs(g - w) for g, w in zip(got, want)])
+    return worst
 
 
 def systemone(url, rec):
@@ -148,8 +167,9 @@ def main(argv=None):
     ap.add_argument("--min-agree", type=float, default=0.96, help="raw top-1 agreement floor (0.96 = at most 3 flips of 82)")
     ap.add_argument("--confident", type=float, default=0.05, help="a flip where the reference margin is >= this fails the gate")
     ap.add_argument("--answers-out", default=None,
-                    help="also save this run's answers as a REF file (0600), e.g. a single-box run that a pipeline "
-                         "run of the same model is then gated against with --min-agree 1 --confident 0")
+                    help="also save this run's answers as a REF file (0600); with --ref only after the gate PASSes. E.g. a "
+                         "single-box run that a pipeline run of the same model is then gated against with "
+                         "--min-agree 0 --confident 0.05 (near-tie flips informational)")
     a = ap.parse_args(argv)
     url = a.url.rstrip("/")
     if not a.ref:
@@ -162,15 +182,20 @@ def main(argv=None):
     with open(a.ref) as f:
         ref = json.load(f)
     results = [(rec, systemone(url, rec)) for rec in records()]
-    if a.answers_out:
-        save_answers(a.answers_out, results, force=a.force)
     per_type, agree, total, flips = tally(ref, results)
     for key, kind, m, got, want in flips:
-        print(f"FLIP {key} {kind} ref_margin={m:.3f} got={[round(x, 3) for x in got]} ref={[round(x, 3) for x in want]}")
+        note = "" if m >= a.confident else " (near-tie, informational)"
+        print(f"FLIP {key} {kind} ref_margin={m:.3f} got={[round(x, 3) for x in got]} ref={[round(x, 3) for x in want]}{note}")
     for kind, (g, n) in sorted(per_type.items()):
         print(f"  {kind}: {g}/{n}")
+    print(f"  max |dp| = {max_abs_delta(ref, results):.4f}")
     ok, why = gate([f[2] for f in flips], agree, total, a.min_agree, a.confident)
     print(("PASS " if ok else "FAIL ") + why)
+    if a.answers_out:
+        if ok:  # a run that failed its gate must never become another run's reference
+            save_answers(a.answers_out, results, force=a.force)
+        else:
+            print(f"answers not saved to {a.answers_out}: the gate failed")
     sys.exit(0 if ok else 1)
 
 

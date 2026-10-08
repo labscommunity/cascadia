@@ -1019,3 +1019,75 @@ def test_parity_answers_out_saves_a_reference_the_gate_reads(tmp_path, monkeypat
     with pytest.raises(SystemExit) as e:
         pc.main(["--url", "http://x", "--ref", str(saved), "--min-agree", "1", "--confident", "0"])
     assert e.value.code == 1 and "FAIL" in capsys.readouterr().out
+
+
+# ---- P5-RUN-3 / P5-RUN-5: near-tie flips against a saved run; --answers-out only after a PASS ------
+
+def _saved_answers(tmp_path, monkeypatch):
+    dump = tmp_path / "single.jsonl"
+    dump.write_text("")
+    _answering_server(monkeypatch, dump)
+    saved = tmp_path / "single.answers.json"
+    pc.main(["--url", "http://x", "--dump", str(dump), "--answers-out", str(saved)])
+    return saved
+
+
+def test_parity_near_tie_flip_against_saved_answers_is_informational(tmp_path, monkeypatch, capsys):
+    saved = _saved_answers(tmp_path, monkeypatch)
+    ref = json.loads(saved.read_text())
+    key = next(k for k in ref if k.startswith("r01."))
+    n, top = len(ref[key]), max(range(len(ref[key])), key=ref[key].__getitem__)
+    # the saved (single-box) run was a near-tie on this question, leaning away from the server's top-1
+    near = [0.0] * n
+    near[top], near[(top + 1) % n] = 0.49, 0.51
+    ref[key] = near
+    saved.write_text(json.dumps(ref))
+    _answering_server(monkeypatch, tmp_path / "pipe.jsonl")
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        pc.main(["--url", "http://x", "--ref", str(saved), "--min-agree", "0", "--confident", "0.05"])
+    out = capsys.readouterr().out
+    assert e.value.code == 0 and "PASS" in out, out
+    assert f"FLIP {key}" in out and "(near-tie, informational)" in out
+    assert "max |dp| =" in out
+    # the strict form still fails on it
+    with pytest.raises(SystemExit) as e:
+        pc.main(["--url", "http://x", "--ref", str(saved), "--min-agree", "1", "--confident", "0"])
+    assert e.value.code == 1
+
+
+def test_parity_confident_flip_against_saved_answers_still_fails(tmp_path, monkeypatch, capsys):
+    saved = _saved_answers(tmp_path, monkeypatch)
+    _answering_server(monkeypatch, tmp_path / "pipe.jsonl", flip="r01")   # saved margin 0.6 on the flipped question
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        pc.main(["--url", "http://x", "--ref", str(saved), "--min-agree", "0", "--confident", "0.05"])
+    out = capsys.readouterr().out
+    assert e.value.code == 1 and "FAIL 1 confident flip" in out and "near-tie" not in out
+
+
+def test_parity_answers_out_is_written_only_after_a_pass(tmp_path, monkeypatch, capsys):
+    saved = _saved_answers(tmp_path, monkeypatch)
+    # PASS: the verdict prints first, then the save
+    _answering_server(monkeypatch, tmp_path / "a.jsonl")
+    capsys.readouterr()
+    ok_out = tmp_path / "pass.answers.json"
+    with pytest.raises(SystemExit) as e:
+        pc.main(["--url", "http://x", "--ref", str(saved), "--answers-out", str(ok_out)])
+    out = capsys.readouterr().out
+    assert e.value.code == 0 and ok_out.exists()
+    assert out.index("PASS") < out.index(f"saved 82 answers to {ok_out}")
+    # FAIL: nothing is written
+    _answering_server(monkeypatch, tmp_path / "b.jsonl", flip="r01")
+    bad_out = tmp_path / "fail.answers.json"
+    with pytest.raises(SystemExit) as e:
+        pc.main(["--url", "http://x", "--ref", str(saved), "--min-agree", "1", "--confident", "0",
+                 "--answers-out", str(bad_out)])
+    out = capsys.readouterr().out
+    assert e.value.code == 1 and not bad_out.exists()
+    assert "FAIL" in out and "answers not saved" in out
+
+
+def test_max_abs_delta():
+    rec = {"id": "r", "questions": {"q": {"type": "noul"}}}
+    assert pc.max_abs_delta({"r.q": [0.3, 0.7]}, [(rec, {"answers": {"q": {"type": "noul", "noul": 0.6}}})]) == pytest.approx(0.1)
