@@ -2,6 +2,8 @@
 
   python tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump d.jsonl        # drive the server, slice its dump
   python tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref ref.json        # gate: raw >= 96% and no flip with reference margin >= 0.05
+  python tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref ref.json --answers-out single.json   # also save this run's answers
+  python tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref single.json --min-agree 1 --confident 0  # top-1 identical to that run
 
 Without --ref the server must run with `--decision-dump DUMP` and have no other client: this run's
 passes (the bytes the dump grew by while the 50 records were posted) are written to
@@ -97,21 +99,43 @@ def parity_slice(dump):
     return Path(dump).with_suffix(".parity.jsonl")
 
 
-def drive_and_slice(url, dump, force=False):
+def answers_ref(results):
+    """[(record, /v1/systemone response)] -> {"<record id>.<question id>": probabilities}, the REF
+    format, so one server's answers can gate another's (a pipeline tree against its single box)."""
+    out = {}
+    for rec, resp in results:
+        if list(resp["answers"]) != list(rec["questions"]):
+            raise SystemExit(f"ERROR {rec['id']}: server answered {list(resp['answers'])}, asked {list(rec['questions'])}")
+        for qid, ans in resp["answers"].items():
+            out[f"{rec['id']}.{qid}"] = answer_probs(ans)
+    return out
+
+
+def save_answers(path, results, force=False):
+    """Write this run's answers as a REF file (mode 0600, never overwritten without --force)."""
+    ref = answers_ref(results)
+    write_private(path, json.dumps(ref, indent=0) + "\n", force=force)
+    print(f"saved {len(ref)} answers to {path}")
+
+
+def drive_and_slice(url, dump, force=False, answers_out=None):
     """POST the 50 records and write exactly the dump bytes they added to parity_slice(dump),
     then check the slice aligns with the records (one run, nothing else)."""
     out = parity_slice(dump)
     if out.exists() and not force:
         raise SystemExit(f"{out} exists; pass --force to overwrite it")
+    if answers_out and Path(answers_out).exists() and not force:
+        raise SystemExit(f"{answers_out} exists; pass --force to overwrite it")
     if not Path(dump).exists():
         raise SystemExit(f"{dump} does not exist: start the server with --decision-dump {dump}")
     start = Path(dump).stat().st_size
     recs = records()
-    for rec in recs:
-        systemone(url, rec)
+    results = [(rec, systemone(url, rec)) for rec in recs]
     write_private(out, Path(dump).read_bytes()[start:].decode(), force=force)
     passes = sum(len(ps) for _, ps in align(str(out), recs))
     print(f"wrote {passes} passes for {len(recs)} records to {out}")
+    if answers_out:
+        save_answers(answers_out, results, force=force)
     return out
 
 
@@ -123,16 +147,23 @@ def main(argv=None):
     ap.add_argument("--force", action="store_true", help="overwrite an existing <dump>.parity.jsonl")
     ap.add_argument("--min-agree", type=float, default=0.96, help="raw top-1 agreement floor (0.96 = at most 3 flips of 82)")
     ap.add_argument("--confident", type=float, default=0.05, help="a flip where the reference margin is >= this fails the gate")
+    ap.add_argument("--answers-out", default=None,
+                    help="also save this run's answers as a REF file (0600), e.g. a single-box run that a pipeline "
+                         "run of the same model is then gated against with --min-agree 1 --confident 0")
     a = ap.parse_args(argv)
     url = a.url.rstrip("/")
     if not a.ref:
         if not a.dump:
             ap.error("without --ref, pass --dump (the server's --decision-dump) so this run's passes are sliced out")
-        drive_and_slice(url, a.dump, a.force)
+        drive_and_slice(url, a.dump, a.force, a.answers_out)
         return
-    results = [(rec, systemone(url, rec)) for rec in records()]
+    if a.answers_out and Path(a.answers_out).exists() and not a.force:
+        raise SystemExit(f"{a.answers_out} exists; pass --force to overwrite it")
     with open(a.ref) as f:
         ref = json.load(f)
+    results = [(rec, systemone(url, rec)) for rec in records()]
+    if a.answers_out:
+        save_answers(a.answers_out, results, force=a.force)
     per_type, agree, total, flips = tally(ref, results)
     for key, kind, m, got, want in flips:
         print(f"FLIP {key} {kind} ref_margin={m:.3f} got={[round(x, 3) for x in got]} ref={[round(x, 3) for x in want]}")
