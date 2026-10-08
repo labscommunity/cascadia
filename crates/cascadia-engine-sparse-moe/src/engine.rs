@@ -5892,14 +5892,27 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // every group's frame is in flight at once, which is the overlap.
         let mut out: Vec<(TaskId, Chunk)> = Vec::new();
         let groups = self.stream_groups.max(1);
-        for g in 0..groups {
-            self.stream_step += 1;
-            let done = self.step_stream_group(g, &mut out);
-            if !done {
-                break;
+        loop {
+            for g in 0..groups {
+                self.stream_step += 1;
+                let done = self.step_stream_group(g, &mut out);
+                if !done {
+                    return out;
+                }
+            }
+            // A long prompt with no other stream emits nothing while its
+            // windows go down (one per group turn). Keep feeding until a
+            // chunk comes out or the last window is sent; else the guard
+            // closes the task after three rounds of windows.
+            if !out.is_empty()
+                || !self
+                    .streams
+                    .iter()
+                    .any(|st| st.state == StreamState::Feeding)
+            {
+                return out;
             }
         }
-        out
     }
 
     /// Serve group `g` (see [`Self::step_streams_pipeline`]); `false` once
