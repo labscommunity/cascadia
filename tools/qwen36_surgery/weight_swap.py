@@ -263,12 +263,17 @@ def swap_embeddings(src_xml, weights, out_dir, chunk=16384):
     ov.save_model(model, str(Path(out_dir) / "openvino_text_embeddings_model.xml"), compress_to_fp16=False)
 
 
-def graft_lora(model, adapter_file, scale):
+def graft_lora(model, adapter_file, scale, layers=None, lm_head=True):
     """y += scale * (x A^T) B^T on every LoRA-targeted MatMul in `model` (fp32 constants, LoRA term
     first in the Add: OpenVINO's ARM CPU plugin produced NaN with fp16 constants / base-first adds).
     Returns the number of branches added. Adapter keys with no matching MatMul in this stage are
     skipped silently (a stage holds only some layers), so the exporter MUST assert that the sum of
-    graft_lora over all stages == lora_targets(adapter_file)."""
+    graft_lora over all stages == lora_targets(adapter_file).
+
+    `layers` (a range) limits grafting to the stage's own decoder layers and `lm_head` to the last
+    stage: a stage > 0 also keeps shape-only copies of earlier layers (the stock IR's mask/position
+    bookkeeping reads their output shapes), whose values never reach the stage output. Grafting those
+    would be dead work and would break the sum check. None = every match (a whole model)."""
     from openvino import opset13 as ops
     from safetensors.torch import load_file
     pairs = {}
@@ -283,6 +288,11 @@ def graft_lora(model, adapter_file, scale):
         m = re.search(r"__module\.(?:model\.)*(?:language_model\.)?((?:layers\.\d+\.[\w.]+)|lm_head)/(?:aten|ov_ext)::linear/MatMul$",
                       op.get_friendly_name())
         if not m or m.group(1) not in pairs:
+            continue
+        if m.group(1) == "lm_head":
+            if not lm_head:
+                continue
+        elif layers is not None and int(m.group(1).split(".")[1]) not in layers:
             continue
         a, b = pairs[m.group(1)]["A"], pairs[m.group(1)]["B"]
         x = op.input_value(0)

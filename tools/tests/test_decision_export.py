@@ -89,7 +89,8 @@ def stubbed(tmp_path, monkeypatch):
 def _lora(monkeypatch, ws, calls, per_stage, targets, cfg_scale=2.0):
     monkeypatch.setattr(ws, "lora_scale_from_config", lambda f: cfg_scale)
     monkeypatch.setattr(ws, "lora_targets", lambda f: targets)
-    monkeypatch.setattr(ws, "graft_lora", lambda stage, f, s: calls.append(("graft", s)) or per_stage)
+    monkeypatch.setattr(ws, "graft_lora",
+                        lambda stage, f, s, layers=None, lm_head=True: calls.append(("graft", s)) or per_stage)
 
 
 def test_chat_export_unchanged_without_decision_flags(stubbed):
