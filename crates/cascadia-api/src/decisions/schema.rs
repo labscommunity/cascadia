@@ -415,10 +415,12 @@ pub struct DecisionRequest {
     /// Any JSON value, in request order; codecs render it.
     pub state: OrderedValue,
     pub questions: IndexMap<String, Question>,
+    /// Absent, `null` or `[]` (a SystemOne client may serialise absent media as null); anything
+    /// else is refused, the server is text-only.
     #[serde(default)]
-    pub images: Vec<serde_json::Value>,
+    pub images: Option<Vec<serde_json::Value>>,
     #[serde(default)]
-    pub videos: Vec<serde_json::Value>,
+    pub videos: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -449,6 +451,10 @@ pub struct Limits {
     pub max_options: usize,
     pub min_levels: usize,
     pub max_levels: usize,
+    /// The codec reads a list `state` as message parts (JEV, serve_decide `_parts`), so an image
+    /// part there is a 400 on this text-only server. Kev and Clef render list elements as plain
+    /// data, an object with an `image` key included, exactly like their references.
+    pub image_parts: bool,
 }
 
 impl Question {
@@ -486,15 +492,15 @@ pub fn is_image_part(v: &OrderedValue) -> bool {
 impl DecisionRequest {
     pub fn validate(&self, limits: &Limits) -> Result<(), DecisionError> {
         let bad = |m: String| Err(DecisionError::BadRequest(m));
-        if !self.images.is_empty() || !self.videos.is_empty() {
+        let media = |m: &Option<Vec<serde_json::Value>>| m.as_ref().is_some_and(|v| !v.is_empty());
+        if media(&self.images) || media(&self.videos) {
             return bad(
                 "images and videos are not supported by this server (text-only decision models)"
                     .into(),
             );
         }
-        // Every family is text-only: an image part in a list state is a 400 for all of them, not
-        // just JEV (Kev and Clef would otherwise render the part into the prompt as text).
-        if let OrderedValue::Array(parts) = &self.state {
+        // Only a codec that reads list elements as message parts (JEV) has image parts to refuse.
+        if let (true, OrderedValue::Array(parts)) = (limits.image_parts, &self.state) {
             if parts.iter().any(is_image_part) {
                 return bad("image parts in state are not supported (text-only server)".into());
             }
@@ -620,6 +626,17 @@ pub fn score_confidence(p: &[f64]) -> f64 {
 /// (first on ties) with normalized confidence; score = probability-weighted level with the MAD
 /// confidence; noul = p(true). `probs` is in `Question::option_keys` order.
 pub fn answer_from_probs(q: &Question, probs: &[f64]) -> Answer {
+    answer_with_legend(q, probs, None)
+}
+
+/// [`answer_from_probs`] with a codec's own score legend (`Codec::legend`; Kev echoes rendered
+/// level text). `None` echoes the raw levels. The caller guarantees `probs.len()` equals the
+/// option count (`handler::evaluate` checks it).
+pub fn answer_with_legend(
+    q: &Question,
+    probs: &[f64],
+    legend: Option<Vec<OrderedValue>>,
+) -> Answer {
     let keys = q.option_keys();
     debug_assert_eq!(probs.len(), keys.len());
     let dist: IndexMap<String, f64> = keys
@@ -643,7 +660,10 @@ pub fn answer_from_probs(q: &Question, probs: &[f64]) -> Answer {
         QuestionType::Score => Answer::Score {
             score: round_prob(probs.iter().enumerate().map(|(i, p)| i as f64 * p).sum()),
             confidence: round_prob(score_confidence(probs)),
-            legend: keys.into_iter().zip(q.score_levels()).collect(),
+            legend: keys
+                .into_iter()
+                .zip(legend.unwrap_or_else(|| q.score_levels()))
+                .collect(),
             probabilities: dist,
         },
     }
@@ -667,6 +687,7 @@ mod tests {
         max_options: 16,
         min_levels: 2,
         max_levels: 10,
+        image_parts: true,
     };
 
     #[test]
@@ -747,7 +768,38 @@ mod tests {
     }
 
     #[test]
-    fn image_parts_in_state_are_rejected_for_every_family() {
+    fn null_media_is_accepted_as_empty() {
+        let r = req_str(
+            r#"{"model": "m", "state": "s", "images": null, "videos": null, "questions": {"u": {"type": "noul"}}}"#,
+        );
+        r.validate(&LIMITS).unwrap();
+        let r = req_str(
+            r#"{"model": "m", "state": "s", "images": [], "questions": {"u": {"type": "noul"}}}"#,
+        );
+        r.validate(&LIMITS).unwrap();
+        let r = req_str(
+            r#"{"model": "m", "state": "s", "videos": ["v"], "questions": {"u": {"type": "noul"}}}"#,
+        );
+        assert!(r.validate(&LIMITS).is_err());
+    }
+
+    #[test]
+    fn image_parts_in_state_are_data_when_the_codec_does_not_read_parts() {
+        // EDGE-1: Kev and Clef render list elements as data; a catalogue record with an `image`
+        // field is a valid state for both references.
+        let text_only = Limits {
+            image_parts: false,
+            ..LIMITS
+        };
+        let r = req_str(
+            r#"{"model": "m", "state": [{"sku": 1, "image": "https://x/1.jpg"}, {"type": "image_url", "image_url": {"url": "u"}}], "questions": {"u": {"type": "noul"}}}"#,
+        );
+        r.validate(&text_only).unwrap();
+        assert!(r.validate(&LIMITS).is_err());
+    }
+
+    #[test]
+    fn image_parts_in_state_are_rejected_when_the_codec_reads_parts() {
         for state in [
             r#"[{"image": "data:x"}]"#,
             r#"["hi", {"type": "image_url", "image_url": {"url": "data:x"}}]"#,

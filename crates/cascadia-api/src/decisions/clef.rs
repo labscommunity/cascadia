@@ -114,6 +114,7 @@ impl Codec for ClefCodec {
             max_options: 256,
             min_levels: 2,
             max_levels: 256,
+            image_parts: false,
         }
     }
 
@@ -181,6 +182,13 @@ impl Codec for ClefCodec {
             )));
         }
         let mut state = self.ids(&self.san.apply(&render_sorted(&req.state)))?;
+        // Truncating to fit is ruled (Task 8b), but truncating a non-empty state to nothing would
+        // answer every question without the caller's input as a normal 200 (EDGE-2).
+        if fixed == limit && !state.is_empty() {
+            return Err(DecisionError::TooLong(format!(
+                "schema needs {fixed} tokens, leaving no room for the state; the limit is {limit}"
+            )));
+        }
         state.truncate(limit - fixed);
         let shift = (prefix.len() + state.len()) as u32;
         let mut prompt_ids = prefix;
@@ -367,6 +375,50 @@ mod tests {
         assert_eq!(
             flash.encode(&r).unwrap()[0].readout.prompt_ids.len(),
             16_384
+        );
+    }
+
+    #[test]
+    fn a_schema_that_fills_the_limit_is_413_not_an_empty_state() {
+        let q = r#""questions": {"u": {"type": "noul"}}"#;
+        let r = |state: &str| -> DecisionRequest {
+            serde_json::from_str(&format!(r#"{{"model": "m", "state": "{state}", {q}}}"#)).unwrap()
+        };
+        let fixed = ClefCodec::new(tok(), 16384, None)
+            .unwrap()
+            .encode(&r(""))
+            .unwrap()[0]
+            .readout
+            .prompt_ids
+            .len();
+        let exact = ClefCodec::new(tok(), fixed, None).unwrap();
+        match exact.encode(&r("S")) {
+            Err(DecisionError::TooLong(m)) => assert!(m.contains("no room for the state"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(exact.encode(&r("")).is_ok(), "an empty state loses nothing");
+        // One token of room keeps one state token (the ruled truncation).
+        let one = ClefCodec::new(tok(), fixed + 1, None).unwrap();
+        assert_eq!(
+            one.encode(&r("SSS")).unwrap()[0].readout.prompt_ids.len(),
+            fixed + 1
+        );
+    }
+
+    #[test]
+    fn list_state_with_image_fields_is_plain_data() {
+        // EDGE-1: encode_record json.dumps the state; Clef takes images only from `images`.
+        let c = ClefCodec::new(tok(), 16384, None).unwrap();
+        let r: DecisionRequest = serde_json::from_str(
+            r#"{"model": "m", "state": [{"sku": 1, "image": "a"}], "questions": {"u": {"type": "noul"}}}"#,
+        )
+        .unwrap();
+        r.validate(&c.limits()).unwrap();
+        let ids = &c.encode(&r).unwrap()[0].readout.prompt_ids;
+        let text: String = ids.iter().map(|&i| char::from_u32(i).unwrap()).collect();
+        assert!(
+            text.contains("STATE:\n[{\"image\":\"a\",\"sku\":1}]"),
+            "{text}"
         );
     }
 

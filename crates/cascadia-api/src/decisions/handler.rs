@@ -7,7 +7,7 @@ use axum::Json;
 use futures::StreamExt;
 use indexmap::IndexMap;
 
-use super::schema::{self, answer_from_probs, Answer, DecisionRequest, DecisionResponse, Usage};
+use super::schema::{self, answer_with_legend, Answer, DecisionRequest, DecisionResponse, Usage};
 use super::DecisionError;
 use crate::AppState;
 use std::sync::atomic::AtomicBool;
@@ -241,7 +241,20 @@ pub(crate) async fn evaluate(
         let Some(p) = probs.get(id) else {
             return Err(engine_failure("codec produced no answer for a question"));
         };
-        answers.insert(id.clone(), answer_from_probs(q, p));
+        // A codec bug (an off-by-one logits range, a rescale to the wrong level count) would
+        // otherwise truncate the distribution silently or panic on `probs[1]` (QUA-6).
+        if p.len() != q.option_keys().len() {
+            return Err(engine_failure(&format!(
+                "codec returned {} probabilities for {} options",
+                p.len(),
+                q.option_keys().len()
+            )));
+        }
+        let legend = match q.qtype {
+            schema::QuestionType::Score => svc.codec.legend(q),
+            _ => None,
+        };
+        answers.insert(id.clone(), answer_with_legend(q, p, legend));
     }
     Ok((answers, input_tokens))
 }

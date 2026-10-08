@@ -67,6 +67,10 @@ pub trait Codec: Send + Sync {
         self.encode_until(req, &AtomicBool::new(false))
     }
     fn probabilities(&self, req: &DecisionRequest, part: &PassPart, logits: &[f32]) -> Vec<f64>;
+    /// A score answer's `legend` values, one per level; `None` echoes the request's raw levels.
+    fn legend(&self, _q: &schema::Question) -> Option<Vec<schema::OrderedValue>> {
+        None
+    }
 }
 
 pub struct DecisionService {
