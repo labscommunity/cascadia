@@ -917,3 +917,105 @@ def test_backbone_diff_merge_check_unknown_when_it_cannot_run(tmp_path, monkeypa
     with pytest.raises(SystemExit) as e:  # every target larger than the read cap
         bd.main([str(a), str(b), "--adapter", str(ad), "--merge-check-bytes", "16"])
     assert e.value.code == 2 and "at most 16 bytes" in capsys.readouterr().out.strip().splitlines()[-1]
+
+
+# ---- Fix round 4: FINETUNED needs a residual beyond rounding (P4-BLD-2) ---------------------------
+
+def _reviewer_merge(dstd, seed=0, out=1024, inp=4096, r=32, scale=2.0):
+    """P4-BLD-2's reproduction: a 1024x4096 bf16 weight of std 0.02 and an r=32, scale-2 adapter whose
+    delta has std `dstd`, merged in bf16. -> (stock, merged, lora_A, lora_B, scale, rng), all float64."""
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    w = _bf16(rng.normal(0, 0.02, (out, inp)).astype(np.float32)).astype(np.float64)
+    s = float(np.sqrt(dstd / (scale * np.sqrt(r))))
+    la = _bf16(rng.normal(0, s, (r, inp)).astype(np.float32)).astype(np.float64)
+    lb = _bf16(rng.normal(0, s, (out, r)).astype(np.float32)).astype(np.float64)
+    merged = _bf16((w + scale * (lb @ la)).astype(np.float32)).astype(np.float64)
+    return w, merged, la, lb, scale, rng
+
+
+def test_backbone_diff_merge_below_resolution_is_unknown_not_finetuned():
+    import numpy as np
+    import backbone_diff as bd
+    # a genuine merge whose delta (std 1e-5, ~0.1 ulp) mostly vanishes in bf16: small cosine, but the
+    # residual is far inside rounding, so it is no evidence of an independent fine-tune
+    w, merged, la, lb, scale, rng = _reviewer_merge(1e-5)
+    v, why = bd.merge_evidence(w, merged, la, lb, scale, "BF16")
+    assert v == "UNKNOWN" and "resolution" in why, why
+    w2, merged2, la2, lb2, _, _ = _reviewer_merge(2e-6, seed=1)
+    assert bd.merge_evidence(w2, merged2, la2, lb2, scale, "BF16")[0] == "UNKNOWN"
+    # independent changes on the same weight, from about one ulp down to the delta's own size: their
+    # residual RMS is no larger than rounding's, but many elements sit outside a merge's rounding
+    # bound (a merge puts none there) -> FINETUNED
+    for istd in (1e-4, 1e-5):
+        indep = _bf16((w + rng.normal(0, istd, w.shape)).astype(np.float32)).astype(np.float64)
+        v, why = bd.merge_evidence(w, indep, la, lb, scale, "BF16")
+        assert v == "FINETUNED", (istd, why)
+    assert "0.0% of elements beyond rounding" in bd.merge_evidence(w, merged, la, lb, scale, "BF16")[1]
+    # and a merge of std 1e-4 is still proved
+    w3, merged3, la3, lb3, _, _ = _reviewer_merge(1e-4, seed=2)
+    assert bd.merge_evidence(w3, merged3, la3, lb3, scale, "BF16")[0] == "MERGED"
+
+
+# ---- Fix round 4: config-only regex target_modules see the VLM prefix (P4-BLD-3) ------------------
+
+@pytest.mark.parametrize("rx", [
+    r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)",
+    r"model\.language_model\.layers\.\d+\.(self_attn|mlp)\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)",
+])
+def test_backbone_diff_config_regex_matches_vlm_module_names(tmp_path, rx):
+    import backbone_diff as bd
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"target_modules": rx}))
+    on = bd.adapter_targets(str(tmp_path))
+    for n in ("layers.3.self_attn.q_proj.weight", "layers.0.mlp.up_proj.weight", "layers.5.mlp.down_proj.weight"):
+        assert on(n), n
+    for n in ("layers.0.input_layernorm.weight", "embed_tokens.weight", "lm_head.weight",
+              "layers.0.self_attn.q_proj.bias", "layers.1.linear_attn.in_proj_qkvz.weight"):
+        assert not on(n), n
+    # so a change on those modules reaches the merge stage instead of "targets match nothing"
+    v, code, lines = _run(_hdr("model."), _hdr("model.language_model.", changed={"layers.0.self_attn.q_proj.weight"}),
+                          adapter=on)
+    assert (v, code) == ("UNKNOWN", 2) and "no merge check" in lines[-1], lines[-1]
+
+
+# ---- Fix round 4: a run's answers can be saved and gated against (P4-DRIFT-3) --------------------
+
+def _answering_server(monkeypatch, dump, flip=None):
+    """pc.systemone replaced by a server that appends one pass per question and answers every question
+    (noul 0.8, choice/score: the first option 0.7); `flip` turns that record's first answer around."""
+    def systemone(url, rec):
+        answers = {}
+        with open(dump, "a") as f:
+            for i, (qid, q) in enumerate(rec["questions"].items()):
+                f.write(_pass_line(qid) + "\n")
+                hi = 0.05 if (rec["id"] == flip and i == 0) else 0.8
+                if q["type"] == "noul":
+                    answers[qid] = {"type": "noul", "noul": hi}
+                else:
+                    c = q["criteria"]
+                    opts = list(c) if isinstance(c, dict) else [str(k) for k in range(len(c))]
+                    rest = (1 - hi) / (len(opts) - 1)
+                    answers[qid] = {"type": q["type"], "probabilities": {o: (hi if k == 0 else rest) for k, o in enumerate(opts)}}
+        return {"answers": answers}
+    monkeypatch.setattr(pc, "systemone", systemone)
+
+
+def test_parity_answers_out_saves_a_reference_the_gate_reads(tmp_path, monkeypatch, capsys):
+    dump = tmp_path / "kev9b.jsonl"
+    dump.write_text("")
+    _answering_server(monkeypatch, dump)
+    saved = tmp_path / "kev9b.answers.json"
+    pc.main(["--url", "http://x", "--dump", str(dump), "--answers-out", str(saved)])
+    ans = json.loads(saved.read_text())
+    assert len(ans) == 82 and stat.S_IMODE(saved.stat().st_mode) == 0o600
+    with pytest.raises(SystemExit, match="--force"):  # never silently overwritten
+        pc.main(["--url", "http://x", "--ref", str(saved), "--answers-out", str(saved)])
+    # the same answers gate at 100% with every flip counted (the pipeline-vs-single-box check)
+    with pytest.raises(SystemExit) as e:
+        pc.main(["--url", "http://x", "--ref", str(saved), "--min-agree", "1", "--confident", "0"])
+    assert e.value.code == 0 and "PASS agreement 82/82" in capsys.readouterr().out
+    # one flipped top-1 fails it
+    _answering_server(monkeypatch, tmp_path / "other.jsonl", flip="r01")
+    with pytest.raises(SystemExit) as e:
+        pc.main(["--url", "http://x", "--ref", str(saved), "--min-agree", "1", "--confident", "0"])
+    assert e.value.code == 1 and "FAIL" in capsys.readouterr().out
