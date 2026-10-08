@@ -5172,7 +5172,7 @@ Neither check can stand in for the other.
   - With `--answers`, the server's top-1 on the 50 records must agree with the saved spike reference on ≥ 98%. For Kev and Clef that covers every question. For JEV it covers every question too (score references rescaled to the record's L levels first). `reference_jev.pt` was measured on sorted choices, so the answer run sends each JEV choice question with its criteria sorted (`jev_sorted`), and the prompts it dumps must equal `jev.questions()`'s ids exactly. (Fix round 1, FID-3: the plan code below still shows the earlier informational-only JEV choice line; the shipped `codec_golden.py` gates all 82.)
   - The 27B models have no saved spike reference; for them only the encoder comparison runs, and parity (Task 17) is the answer check.
 - `openai_equivalence.py --url URL`: converts each of the 50 records into an OpenAI-format request (`to_openai(rec)`), POSTs it to `/v1/decisions` and the original to `/v1/systemone`, and exits non-zero unless every question's probabilities, choice/score and confidence are identical. The records' score levels are plain strings (no descriptions), so both routes build byte-identical prompts, and any difference is an adapter bug. Everything verified through `/v1/systemone` (golden, parity) then carries over to `/v1/decisions`.
-- `backbone_diff.py A B [--per-layer] [--slice BYTES]`: matches tensors per layer index and suffix after stripping the repo's `model.language_model.` / `model.` prefix (vision and MTP tensors ignored), hashes both ends of every backbone tensor (all projections, norms, embeddings, final norm, lm_head), prints per-tensor / per-layer `SAME`/`DIFF`, and ends with one `VERDICT: STOCK | FINETUNED | MERGED | UNKNOWN` line; UNKNOWN (no comparable decoder-layer tensors, different layer sets, a tensor on one side only (lm_head, embed and the final norm included), or a dtype/shape mismatch) exits 2. (Fix round 1, BLD-1, replaces the sampled/gate_proj-only probe below.) Fix round 2: A and B may each be a local snapshot dir instead of an HF repo id; a gated repo is read with `HF_TOKEN` from the environment (sent only as the Authorization header of huggingface.co requests, never printed); every ranged read must be HTTP 206 with the exact length; `--adapter DIR` turns a FINETUNED whose every difference is an adapter target module into `MERGED` (exit 3: the LoRA is already in the shards, P2-BLD-1). `decision_export.py jev --weights` additionally requires `--weights-not-merged`.
+- `backbone_diff.py A B [--per-layer] [--slice BYTES]`: matches tensors per layer index and suffix after stripping the repo's `model.language_model.` / `model.` prefix (vision and MTP tensors ignored), hashes both ends of every backbone tensor (all projections, norms, embeddings, final norm, lm_head), prints per-tensor / per-layer `SAME`/`DIFF`, and ends with one `VERDICT: STOCK | FINETUNED | MERGED | UNKNOWN` line; UNKNOWN (no comparable decoder-layer tensors, different layer sets, a tensor on one side only (lm_head, embed and the final norm included), or a dtype/shape mismatch) exits 2. (Fix round 1, BLD-1, replaces the sampled/gate_proj-only probe below.) Fix round 2: A and B may each be a local snapshot dir instead of an HF repo id; a gated repo is read with `HF_TOKEN` from the environment (sent only as the Authorization header of huggingface.co requests, never printed); every ranged read must be HTTP 206 with the exact length; `--adapter DIR` turns a FINETUNED whose every difference is an adapter target module into `MERGED` (exit 3: the LoRA is already in the shards, P2-BLD-1). `decision_export.py jev --weights` additionally requires `--weights-not-merged`. Fix round 3: MERGED is proved, not inferred (P3-BLD-5). For the one or two smallest differing decoder-layer targets (at most `--merge-check-bytes`, default 32 MiB, each), both tensors and the adapter's `lora_A`/`lora_B` are read whole, and `B − A` must equal ±scale·`lora_B`@`lora_A` (scale from `adapter_config.json`) within the shard dtype's rounding, with |cosine| ≥ 0.9. If the difference is clearly unrelated to that delta (|cosine| < 0.5), the verdict is FINETUNED; anything else is UNKNOWN. That includes a config-only `--adapter` (no lora tensors to check), rank/alpha patterns, DoRA, and in-between evidence. A config-only `target_modules: "all-linear"` (alone or in a list) means every 2-D decoder-layer projection, and an `--adapter` whose targets match none of the compared tensors gives UNKNOWN (P3-BLD-4). `HF_TOKEN` is stripped of surrounding whitespace, and a value still holding a space, control or non-ASCII character is refused without being shown. Every request failure becomes a SystemExit naming only the URL and the exception type (P3-BLD-2).
 - `def answer_probs(ans: dict) -> list[float]` and `def margin(p: list[float]) -> float` (in parity_check, tested).
 
 - [ ] **Step 1: Write the failing tests** (`tools/tests/test_decision_tools.py`)
@@ -6231,22 +6231,38 @@ Expected: `PASS` (spike: 82/82).
 
 ### Two-machine runbook (Tasks 21 and 22)
 
-Host A runs rank 0 (the API, the dump and every tool); host B runs rank 1. `RANK1_HOST` is host B's LAN address. Both hosts need the **whole tree at the same `--model` path** (rank ≥ 1 reads `config.json` and, as the last rank, the `decision/` assets), the same branch build of `cascadia`, and OpenVINO 2026.4.1:
+Host A runs rank 0 (the API, the dump and every tool); host B runs rank 1. `RANK1_HOST` is host B's LAN address. Both hosts need the **whole tree at the same `--model` path** (rank ≥ 1 reads `config.json` and, as the last rank, the `decision/` assets), the same branch build of `cascadia`, and OpenVINO 2026.4.1. Each task sets `TREE` and `MODEL` on both hosts (Task 21: `TREE=jev27b-int8 MODEL=jev27b`; Task 22: `TREE=clef-int8 MODEL=clef27b`).
+
+Every check aborts. `start_rank1` and `start_rank0` print why and return status 1 in three cases: the port is already in use, the rank exits before it is ready, or (rank 0) `/v1/models` does not name `$TREE`. The calls below then print `ABORT …` and keep the non-zero status. **On ABORT, stop. Do not run the task's steps against whatever answers on the port.**
 
 ```bash
 # on host A, after the export
-rsync -a ~/trees/<tree>/ RANK1_HOST:trees/<tree>/
+rsync -a ~/trees/$TREE/ RANK1_HOST:trees/$TREE/
 # host B (rank 1 listens on the LAN; start it first). $RUN is the same private dir on both hosts.
-cascadia worker --model ~/trees/<tree> --engine qwen35 --device CPU --rank 1 --total 2 --listen 0.0.0.0:7801 > $RUN/rank1.log 2>&1 &
-echo $! > $RUN/rank1.pid
+start_rank1() {
+  ! nc -z 127.0.0.1 7801 2> /dev/null || { echo ":7801 is already in use: stop the previous rank 1 first"; return 1; }
+  cascadia worker --model ~/trees/$TREE --engine qwen35 --device CPU --rank 1 --total 2 --listen 0.0.0.0:7801 > $RUN/rank1.log 2>&1 &
+  echo $! > $RUN/rank1.pid
+  until nc -z 127.0.0.1 7801 2> /dev/null; do
+    kill -0 $(cat $RUN/rank1.pid) 2>/dev/null || { echo "rank 1 exited; see $RUN/rank1.log"; return 1; }
+    sleep 2
+  done
+}
+start_rank1 || { echo "ABORT: rank 1 did not start; fix it before going on"; false; }
 # host A (rank 0 dials rank 1 once, at startup; the API stays on loopback because the dump holds request text)
-! curl -sf http://127.0.0.1:8080/health > /dev/null || echo ":8080 is still serving: stop the previous task's server first"
-rm -f $RUN/<model>.jsonl $RUN/<model>.parity.jsonl $RUN/<model>.golden.jsonl
-cascadia worker --model ~/trees/<tree> --engine qwen35 --device CPU --rank 0 --total 2 --next RANK1_HOST:7801 \
-    --api 127.0.0.1:8080 --decision-dump $RUN/<model>.jsonl > $RUN/rank0.log 2>&1 &
-echo $! > $RUN/rank0.pid
-until curl -sf http://127.0.0.1:8080/health > /dev/null; do kill -0 $(cat $RUN/rank0.pid) 2>/dev/null || break; sleep 2; done
-curl -s http://127.0.0.1:8080/v1/models | grep -F '<tree>'
+start_rank0() {
+  ! curl -sf http://127.0.0.1:8080/health > /dev/null || { echo ":8080 is still serving: stop the previous task's server first"; return 1; }
+  rm -f $RUN/$MODEL.jsonl $RUN/$MODEL.parity.jsonl $RUN/$MODEL.golden.jsonl
+  cascadia worker --model ~/trees/$TREE --engine qwen35 --device CPU --rank 0 --total 2 --next RANK1_HOST:7801 \
+      --api 127.0.0.1:8080 --decision-dump $RUN/$MODEL.jsonl > $RUN/rank0.log 2>&1 &
+  echo $! > $RUN/rank0.pid
+  until curl -sf http://127.0.0.1:8080/health > /dev/null; do
+    kill -0 $(cat $RUN/rank0.pid) 2>/dev/null || { echo "rank 0 exited; see $RUN/rank0.log"; return 1; }
+    sleep 2
+  done
+  curl -s http://127.0.0.1:8080/v1/models | grep -qF "$TREE" || { echo ":8080 is not serving $TREE"; return 1; }
+}
+start_rank0 || { echo "ABORT: rank 0 is not serving $TREE; stop here"; false; }
 ```
 
 Monitor both logs. If rank 1 restarts, restart rank 0 too (it never re-dials). At the end of the task (Step 4b), stop each rank by its recorded PID, never with `pkill -f`: run `kill $(cat $RUN/rank0.pid)` on host A and `kill $(cat $RUN/rank1.pid)` on host B, wait until each process has exited (`kill -0` fails), then remove the PID files.
@@ -6271,13 +6287,13 @@ $PY tools/decision/backbone_diff.py Qwen/Qwen3.8-27B ~/models/jev27b --adapter ~
 
 `backbone_diff.py` matches tensors by layer index and suffix, so a text-only `model.layers.N.*` checkpoint lines up with a VLM `model.language_model.layers.N.*` one. It hashes every backbone tensor (all projections, norms, embeddings, the final norm and lm_head). With `--adapter`, it also checks whether every difference falls on a module that JEV's own LoRA targets. It ends with one line:
 - `VERDICT: STOCK` (exit 0): the backbone is stock Qwen3.8-27B. Export without `--weights`. The reference runs with `--lora`.
-- `VERDICT: FINETUNED` (exit 0): at least one difference lies outside the adapter's target modules, so this is an independent fine-tune. Export with `--weights ~/models/jev27b --weights-not-merged`; the flag states that the shards do not already hold the adapter, and the exporter refuses `jev --weights` without it. The reference runs with `--lora`. `swap_stage` never swaps `lm_head`, and JEV reads verbalizer logits from it. So if the per-tensor lines show `lm_head.weight` DIFF, stop and extend `swap_stage` to the lm_head constants before continuing.
-- `VERDICT: MERGED` (exit 3): every differing tensor is one of the adapter's target modules. The upload most likely holds the stock backbone with the LoRA already merged in. Exporting those shards with the adapter grafted again would apply it twice, and a reference built the same way would agree, so parity would pass on a wrong model. Instead:
+- `VERDICT: FINETUNED` (exit 0): this is an independent fine-tune. Either at least one difference lies outside the adapter's target modules, or every difference is on a target but the merge check found it unrelated to the adapter's delta. Export with `--weights ~/models/jev27b --weights-not-merged`; the flag states that the shards do not already hold the adapter, and the exporter refuses `jev --weights` without it. The reference runs with `--lora`. `swap_stage` never swaps `lm_head`, and JEV reads verbalizer logits from it. So if the per-tensor lines show `lm_head.weight` DIFF, stop and extend `swap_stage` to the lm_head constants before continuing.
+- `VERDICT: MERGED` (exit 3): every differing tensor is one of the adapter's target modules, **and** the merge check proved it. For the one or two smallest differing targets, the shard minus the stock tensor equals scale·`lora_B`@`lora_A` within bf16 rounding (the `merge check …` lines show the cosine and the residual). The upload holds the stock backbone with this LoRA merged in. Exporting those shards with the adapter grafted again would apply it twice, and a reference built the same way would agree, so parity would pass on a wrong model. Instead:
   - export as for STOCK (no `--weights`; the adapter is grafted onto the stock IR);
   - run the reference on JEV-27B's own shards **without** `--lora`, because the adapter is already in them.
 
   The two sides then come from different weights. If the merge was anything other than this adapter on the stock base, parity fails instead of passing.
-- `VERDICT: UNKNOWN` (exit 2): nothing comparable was found. Examples: no common layers, a dtype or shape difference, or lm_head, embed or the final norm present on one side only (tied vs untied heads). **Stop** and inspect the two repos' headers; do not export.
+- `VERDICT: UNKNOWN` (exit 2): nothing comparable was found, or the merge question could not be settled. Examples: no common layers, a dtype or shape difference, lm_head, embed or the final norm present on one side only (tied vs untied heads), adapter targets that match none of the tensors, or every difference on a target but a merge check that neither proved nor refuted the merge (the `merge check …` lines say why). **Stop** and inspect the two repos' headers and those lines; do not export.
 
 In every case the reference (Step 4) runs on JEV-27B's **own** shards, so it is independent of the verdict. A wrong STOCK verdict then fails parity instead of passing a circular one.
 
@@ -6287,7 +6303,7 @@ CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision_export.py jev
 # FINETUNED: the same command plus --weights ~/models/jev27b --weights-not-merged
 ```
 
-- [ ] **Step 2: Serve on two machines** per the two-machine runbook above, with `<tree>` = `jev27b-int8` and `<model>` = `jev27b`. Then drive the parity run: `$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump $RUN/jev27b.jsonl` (expected: `wrote 82 passes for 50 records to $RUN/jev27b.parity.jsonl`).
+- [ ] **Step 2: Serve on two machines** per the two-machine runbook above, with `TREE=jev27b-int8 MODEL=jev27b`; both `start_rank1` and `start_rank0` must return 0. Then drive the parity run: `$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump $RUN/jev27b.jsonl` (expected: `wrote 82 passes for 50 records to $RUN/jev27b.parity.jsonl`).
 
 - [ ] **Step 3: Golden**
 
@@ -6297,12 +6313,17 @@ $PY tools/decision/codec_golden.py jev --url http://127.0.0.1:8080 --dump $RUN/j
 
 No `--answers`: there is no saved 27B reference. Expected: `jev: 86 passes match the serve_decide layout and decision_head.json`.
 
-- [ ] **Step 4: Reference and parity.** The reference always uses JEV-27B's own BF16 shards, the same backbone the tree serves (stock, or `--weights ~/models/jev27b`); never the stock Qwen3.8-27B checkpoint. With `VERDICT: MERGED`, drop the `--lora` line: the shards already contain the adapter. The peak is about 4 GB (one fp32 decoder layer plus its loaded state dict, ~3.4 GB, plus one LoRA delta), under the cap.
+- [ ] **Step 4: Reference and parity.** The reference always uses JEV-27B's own BF16 shards, the same backbone the tree serves (stock, or `--weights ~/models/jev27b`); never the stock Qwen3.8-27B checkpoint. Run the command for the Step 1 verdict. With `VERDICT: MERGED` the shards already contain the adapter, so that command has no `--lora` (and keeps `--tree`). The peak is about 4 GB (one fp32 decoder layer plus its loaded state dict, ~3.4 GB, plus one LoRA delta), under the cap.
 
 ```bash
+# STOCK or FINETUNED: the adapter is applied on top of JEV-27B's shards
 CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision/reference_stream.py jev --weights ~/models/jev27b \
     --lora ~/models/jev27b/adapter_vllm/adapter_model.safetensors --tree ~/trees/jev27b-int8 \
     --dump $RUN/jev27b.parity.jsonl --out $RUN/jev27b-ref.json
+# MERGED (instead of the command above): the shards already hold the adapter, so no --lora
+CAP_GB=7 $PY $SPIKE_DIR/jev-spike/run_capped.py $PY tools/decision/reference_stream.py jev --weights ~/models/jev27b \
+    --tree ~/trees/jev27b-int8 --dump $RUN/jev27b.parity.jsonl --out $RUN/jev27b-ref.json
+# either way
 $PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref $RUN/jev27b-ref.json
 ```
 
@@ -6321,7 +6342,7 @@ hf download Cloudflare/clef --local-dir ~/models/clef
 $PY tools/decision_export.py clef --base-ir ~/models/qwen38-27b-int8 --weights ~/models/clef --clef-dir ~/models/clef --stages 2 --out ~/trees/clef-int8
 ```
 
-- [ ] **Step 2: Serve on two machines** per the two-machine runbook above, with `<tree>` = `clef-int8` and `<model>` = `clef27b`. Then drive the parity run: `$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump $RUN/clef27b.jsonl` (expected: `wrote 50 passes for 50 records to $RUN/clef27b.parity.jsonl`).
+- [ ] **Step 2: Serve on two machines** per the two-machine runbook above, with `TREE=clef-int8 MODEL=clef27b`; both `start_rank1` and `start_rank0` must return 0. Then drive the parity run: `$PY tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump $RUN/clef27b.jsonl` (expected: `wrote 50 passes for 50 records to $RUN/clef27b.parity.jsonl`).
 
 - [ ] **Step 3: Golden**
 
