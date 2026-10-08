@@ -906,7 +906,10 @@ fn new_prefix_cache(
 /// This pass's snapshot plan. Only a `needs_snapshot` decision pass (the first pass of a request
 /// admitted on the shared-prefix discount) bypasses the chat refresh rule: its later passes must
 /// find that exact key (P2-CE-1). Every other pass, decision or chat, plans as a chat turn does,
-/// so an unflagged decision pass does not pay a multi-GB copy for a few tokens (P3-REG-1).
+/// so an unflagged decision pass does not pay a multi-GB copy for a few tokens (P3-REG-1). A
+/// decision pass, flagged or not, also never copies a snapshot the cache can never hold
+/// ([`crate::prefix_cache::PrefixCache::can_hold`]: the key's length and the size estimate),
+/// which `insert` would only drop after the copy (P4-CE-2). Chat keeps its own rule unchanged.
 fn plan_pass_snapshots(
     decision: Option<&cascadia_types::DecisionReadout>,
     prompt: &[u32],
@@ -919,14 +922,18 @@ fn plan_pass_snapshots(
     if decision.is_some_and(|d| d.needs_snapshot) {
         crate::prefix_cache::plan_decision_snapshots(prompt, boundaries, warm_prefix, cache)
     } else {
-        crate::prefix_cache::plan_snapshots(
+        let mut plan = crate::prefix_cache::plan_snapshots(
             prompt,
             boundaries,
             warm_prefix,
             cache,
             costs,
             state_bytes,
-        )
+        );
+        if decision.is_some() {
+            plan.retain(|&b| cache.can_hold(b));
+        }
+        plan
     }
 }
 
@@ -936,10 +943,14 @@ fn decision_admission(task: &GenerationTask) -> Option<Vec<u32>> {
 }
 
 /// A decision pass snapshots only where its request's passes share a prefix (Kev: the state);
-/// chat-style `<|im_start|>` boundaries would only evict chat entries.
+/// chat-style `<|im_start|>` boundaries would only evict chat entries. A prefix under
+/// [`crate::prefix_cache::MIN_PREFIX_TOKENS`] is never a boundary: `insert` would drop it after
+/// the copy (P4-CE-2), as [`crate::prefix_cache::chat_boundaries`] already filters for chat.
 fn decision_snapshot_boundaries(d: &cascadia_types::DecisionReadout, cache_on: bool) -> Vec<usize> {
     match d.cache_prefix {
-        Some(c) if cache_on => vec![c as usize],
+        Some(c) if cache_on && c as usize >= crate::prefix_cache::MIN_PREFIX_TOKENS => {
+            vec![c as usize]
+        }
         _ => Vec::new(),
     }
 }
@@ -3590,10 +3601,6 @@ impl Qwen36Engine {
         }
     }
 
-    /// One `get_state_blob` per local stage, unframed (the prefix cache stores these as-is; the
-    /// kv_coord plane frames them with [`crate::prefix_cache::frame_blobs`]). The failure reason
-    /// is returned rather than logged: it is the only signal the always-on prefix cache has when
-    /// a snapshot does not happen, and that caller reports it at `warn!`.
     /// Decision trees with the prefix cache on: measure the warmup's one-token state (the fixed
     /// recurrent state plus one token of KV, one copy of tens of MB) and record it as the size
     /// model's first point, without caching it (P3-CE-1). Chat-only trees skip the copy.
@@ -3614,6 +3621,10 @@ impl Qwen36Engine {
         }
     }
 
+    /// One `get_state_blob` per local stage, unframed (the prefix cache stores these as-is; the
+    /// kv_coord plane frames them with [`crate::prefix_cache::frame_blobs`]). The failure reason
+    /// is returned rather than logged: it is the only signal the always-on prefix cache has when
+    /// a snapshot does not happen, and that caller reports it at `warn!`.
     fn parts_local_stages(&mut self) -> Result<Vec<Vec<u8>>, String> {
         let mut blobs = Vec::with_capacity(self.stages.len());
         for st in self.stages.iter_mut() {
@@ -4598,10 +4609,16 @@ mod tests {
             },
             Some(2),
         );
-        let d = t.decision.as_ref().unwrap();
-        assert_eq!(decision_snapshot_boundaries(d, true), vec![2]);
+        let mut d = t.decision.clone().unwrap();
         assert!(
-            decision_snapshot_boundaries(d, false).is_empty(),
+            decision_snapshot_boundaries(&d, true).is_empty(),
+            "under MIN_PREFIX_TOKENS: never cached, never copied (P4-CE-2)"
+        );
+        let min = crate::prefix_cache::MIN_PREFIX_TOKENS;
+        d.cache_prefix = Some(min as u32);
+        assert_eq!(decision_snapshot_boundaries(&d, true), vec![min]);
+        assert!(
+            decision_snapshot_boundaries(&d, false).is_empty(),
             "prefix cache disabled"
         );
         let j = decision_task(
@@ -4955,6 +4972,46 @@ mod tests {
                 &costs,
                 bytes
             ),
+            vec![40]
+        );
+    }
+
+    #[test]
+    fn an_unflagged_decision_pass_never_copies_a_snapshot_the_cache_cannot_hold() {
+        // P4-CE-2: an unflagged decision pass plans through the chat rule, but a snapshot the
+        // cache can never keep (a key under MIN_PREFIX_TOKENS, or one the size estimate already
+        // puts over the budget) is not copied: insert would only drop it.
+        use crate::prefix_cache::{PrefixCache, RefreshCosts, MIN_PREFIX_TOKENS};
+        let costs = RefreshCosts::default();
+        let roomy = PrefixCache::new(1 << 30);
+        let tiny = kev_pass(40, 5);
+        let boundaries = decision_snapshot_boundaries(&tiny, true);
+        assert!(boundaries.is_empty(), "a 5-token state is never a boundary");
+        assert!(
+            plan_pass_snapshots(Some(&tiny), &tiny.prompt_ids, &[5], 0, &roomy, &costs, 0)
+                .is_empty(),
+            "a key under MIN_PREFIX_TOKENS plans nothing"
+        );
+        let at_min = kev_pass(40, MIN_PREFIX_TOKENS as u32);
+        assert_eq!(
+            decision_snapshot_boundaries(&at_min, true),
+            vec![MIN_PREFIX_TOKENS]
+        );
+        // The load-time estimate already puts this state over a 1 MiB budget.
+        let small = new_prefix_cache(1 << 20, Some((25 << 20, 4096)));
+        let fits = kev_pass(60, 40);
+        assert!(
+            plan_pass_snapshots(Some(&fits), &fits.prompt_ids, &[40], 0, &small, &costs, 0)
+                .is_empty(),
+            "an estimate over the budget plans nothing"
+        );
+        assert_eq!(
+            plan_pass_snapshots(Some(&fits), &fits.prompt_ids, &[40], 0, &roomy, &costs, 0),
+            vec![40]
+        );
+        // Chat is unchanged: it plans from its own boundaries without the size estimate.
+        assert_eq!(
+            plan_pass_snapshots(None, &fits.prompt_ids, &[40], 0, &small, &costs, 0),
             vec![40]
         );
     }
