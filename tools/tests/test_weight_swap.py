@@ -109,6 +109,30 @@ def test_graft_lora_adds_scaled_branch(tmp_path, prefix):
     np.testing.assert_allclose(out, [[7.0, 8.0, 9.0]], rtol=1e-6)
 
 
+def test_graft_lora_only_touches_the_stage_layers(tmp_path):
+    """A stage > 0 keeps shape-only copies of earlier layers (mask/position bookkeeping); grafting
+    them inflates the count and fails the exporter's sum check, so only the stage's own layers
+    (and lm_head on the last stage) are grafted."""
+    ov = pytest.importorskip("openvino")
+    from openvino import opset13 as ops
+    torch = pytest.importorskip("torch")
+    from safetensors.torch import save_file
+    x = ops.parameter([1, 3], np.float32, name="x")
+    outs, keys = [], {}
+    for name in ("layers.0.mlp.down_proj", "layers.5.mlp.down_proj", "lm_head"):
+        mm = ops.matmul(x, ops.constant(np.eye(3, dtype=np.float32)), False, True)
+        mm.set_friendly_name(f"__module.model.model.language_model.{name}/ov_ext::linear/MatMul")
+        outs.append(ops.result(mm))
+        p = "base_model.model." + ("" if name == "lm_head" else "model.") + name
+        keys[f"{p}.lora_A.weight"] = torch.ones(1, 3)
+        keys[f"{p}.lora_B.weight"] = torch.full((3, 1), 0.5)
+    path = str(tmp_path / "adapter_model.safetensors")
+    save_file(keys, path)
+    assert ws.graft_lora(ov.Model(outs, [x], "t"), path, 1.0, layers=range(4, 8), lm_head=False) == 1
+    assert ws.graft_lora(ov.Model(outs, [x], "t"), path, 1.0, layers=range(4, 8), lm_head=True) == 2
+    assert ws.graft_lora(ov.Model(outs, [x], "t"), path, 1.0) == 3
+
+
 def test_add_final_hidden_output_exposes_lm_head_input():
     ov = pytest.importorskip("openvino")
     from openvino import opset13 as ops

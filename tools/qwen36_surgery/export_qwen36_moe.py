@@ -503,7 +503,7 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
             print(f"  stage{i}: swapped layers {a}..{b} from {weights}", flush=True)
         if lora:
             from weight_swap import graft_lora
-            g = graft_lora(stage, lora, lora_scale)
+            g = graft_lora(stage, lora, lora_scale, layers=range(a, b + 1), lm_head=last)
             grafted += g
             print(f"  stage{i}: grafted {g} LoRA branches", flush=True)
         if last and final_hidden:
