@@ -958,14 +958,22 @@ impl Builder for SparseMoEBuilder {
             );
             // `CASCADIA_STREAMS=N`: decode up to N requests together (single
             // stage). Off by default; the pipeline wire is a follow-up.
-            let streams = std::env::var("CASCADIA_STREAMS")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0);
+            let streams = env_count(
+                "CASCADIA_STREAMS",
+                std::env::var("CASCADIA_STREAMS").ok().as_deref(),
+                0,
+                usize::MAX,
+                0,
+            );
             if streams > 0 {
                 // Every rank of a pipeline must configure the same slot count:
                 // rank 0 picks slot ids, workers open the same ids.
-                engine.enable_streams(streams);
+                if engine.enable_streams(streams) == 0 {
+                    warn!(
+                        requested = streams,
+                        "CASCADIA_STREAMS is set but this runner cannot batch streams; using 0"
+                    );
+                }
             }
             return Ok(Box::new(engine));
         }
@@ -5407,13 +5415,34 @@ fn stream_prefill_window_rows() -> usize {
     use std::sync::OnceLock;
     static W: OnceLock<usize> = OnceLock::new();
     *W.get_or_init(|| {
-        std::env::var("CASCADIA_STREAMS_PREFILL_WINDOW")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&v| v >= 1)
-            .unwrap_or(128)
-            .min(crate::dist::MAX_STREAM_ROWS as usize)
+        env_count(
+            "CASCADIA_STREAMS_PREFILL_WINDOW",
+            std::env::var("CASCADIA_STREAMS_PREFILL_WINDOW")
+                .ok()
+                .as_deref(),
+            1,
+            crate::dist::MAX_STREAM_ROWS as usize,
+            128,
+        )
     })
+}
+
+/// Parse a count from the env value `raw` of `name`. Unset or empty gives
+/// `default`. A value that is not a number or is below `min` gives `default`;
+/// a value above `max` gives `max`. Both cases log a warning.
+fn env_count(name: &str, raw: Option<&str>, min: usize, max: usize, default: usize) -> usize {
+    let raw = match raw.map(str::trim) {
+        None | Some("") => return default,
+        Some(r) => r,
+    };
+    let used = match raw.parse::<usize>() {
+        Ok(v) if v < min => default,
+        Ok(v) if v > max => max,
+        Ok(v) => return v,
+        Err(_) => default,
+    };
+    warn!(env = name, value = raw, used, "ignoring invalid env value");
+    used
 }
 
 /// A stream frame rank 0 has sent and is owed a `StreamTokens` reply for.
@@ -5726,21 +5755,25 @@ impl<R: StagedRunner> PipelineEngine<R> {
             return 0;
         }
         self.stream_cap = self.runner.stream_capacity().min(n);
-        self.stream_admit_per_step = std::env::var("CASCADIA_STREAMS_ADMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&v: &usize| v >= 1)
-            .unwrap_or(1);
+        self.stream_admit_per_step = env_count(
+            "CASCADIA_STREAMS_ADMIT",
+            std::env::var("CASCADIA_STREAMS_ADMIT").ok().as_deref(),
+            1,
+            usize::MAX,
+            1,
+        );
         // Frames in flight = ranks (rank 0 computes too), unless overridden;
         // never more groups than slots.
         let default_groups = (self.total.max(1) as usize).max(1);
-        self.stream_groups = std::env::var("CASCADIA_STREAMS_INFLIGHT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&v: &usize| v >= 1)
-            .unwrap_or(default_groups)
-            .min(self.stream_cap)
-            .max(1);
+        self.stream_groups = env_count(
+            "CASCADIA_STREAMS_INFLIGHT",
+            std::env::var("CASCADIA_STREAMS_INFLIGHT").ok().as_deref(),
+            1,
+            usize::MAX,
+            default_groups,
+        )
+        .min(self.stream_cap)
+        .max(1);
         self.stream_inflight = (0..self.stream_groups).map(|_| VecDeque::new()).collect();
         self.stage_profile = StageProfile::from_env();
         if self.stage_profile.is_some() {
@@ -8295,6 +8328,22 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unset, empty, non-numeric and below-min values give the default; a
+    /// value above max gives max; a valid value is used as is.
+    #[test]
+    fn env_count_rejects_bad_values() {
+        let f = |raw| env_count("X", raw, 1, 512, 128);
+        assert_eq!(f(None), 128);
+        assert_eq!(f(Some("")), 128);
+        assert_eq!(f(Some("abc")), 128);
+        assert_eq!(f(Some("-1")), 128);
+        assert_eq!(f(Some("0")), 128);
+        assert_eq!(f(Some(" 3 ")), 3);
+        assert_eq!(f(Some("9999")), 512);
+        // `CASCADIA_STREAMS` accepts 0 (off).
+        assert_eq!(env_count("X", Some("0"), 0, usize::MAX, 0), 0);
+    }
 
     /// The per-token streaming deltas (PipelineEngine::decode_step) must
     /// reconstruct the full text exactly, never emit a lone U+FFFD, and hold a
