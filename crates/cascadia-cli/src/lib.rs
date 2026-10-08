@@ -2344,6 +2344,14 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // the thinking-OFF path (engine sets apply_chat_template=false then);
         // thinking-ON stays on ov-genai's native template, untouched.
         cfg.defer_template_on_thinking = matches!(args.engine, EngineKind::OvGenai);
+        // `CASCADIA_API_MAX_CONCURRENT`: in-flight request cap (backpressure is
+        // 503 beyond it). A multi-stream engine serves `CASCADIA_STREAMS` at
+        // once, so a client that sends that many requests at once needs the
+        // cap above it.
+        cfg.max_concurrent_requests = api_max_concurrent(
+            std::env::var("CASCADIA_API_MAX_CONCURRENT").ok().as_deref(),
+            cfg.max_concurrent_requests,
+        );
         let max_concurrent = cfg.max_concurrent_requests as u64;
         // Shared live counters: the API bumps them on the chat hot path,
         // the dashboard's /api/stats reads them — same Arc, so the cluster
@@ -2861,6 +2869,27 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Parse `CASCADIA_API_MAX_CONCURRENT`. Unset or empty gives `default`. A
+/// value that is not a positive number logs a warning and gives `default`.
+fn api_max_concurrent(raw: Option<&str>, default: usize) -> usize {
+    let raw = match raw.map(str::trim) {
+        None | Some("") => return default,
+        Some(r) => r,
+    };
+    match raw.parse::<usize>() {
+        Ok(n) if n >= 1 => n,
+        _ => {
+            warn!(
+                env = "CASCADIA_API_MAX_CONCURRENT",
+                value = raw,
+                used = default,
+                "ignoring invalid env value"
+            );
+            default
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3525,6 +3554,16 @@ mod cli_version_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_max_concurrent_rejects_bad_values() {
+        assert_eq!(api_max_concurrent(None, 64), 64);
+        assert_eq!(api_max_concurrent(Some(""), 64), 64);
+        assert_eq!(api_max_concurrent(Some("abc"), 64), 64);
+        assert_eq!(api_max_concurrent(Some("0"), 64), 64);
+        assert_eq!(api_max_concurrent(Some("-1"), 64), 64);
+        assert_eq!(api_max_concurrent(Some("8"), 64), 8);
+    }
 
     /// Parse a `cascadia shard …` argv into its `ShardArgs` (panics on a
     /// non-shard parse) so the flag-builder tests exercise the real clap path.
