@@ -541,3 +541,125 @@ async fn rank0_redials_after_downstream_restart() {
     drop(e0);
     tail.kill().await;
 }
+
+/// The link to rank 1 dies while streams are in flight: each in-flight task
+/// ends with exactly one error chunk and gets no chunk after it, and once the
+/// neighbours are back, rank 0 re-dials and serves the next round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn link_loss_mid_round_fails_each_stream_once() {
+    let Some(dir) = fixture() else { return };
+    let handle = tokio::runtime::Handle::current();
+    let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
+    let n = PROMPTS.len();
+
+    let tail = Tail::start(&dir, &handle, (0, 0, 0)).await;
+    let mut c01 = ActivationClient::new("127.0.0.1", tail.ports.0);
+    c01.connect_with_timeout(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    let r0 = InklingRunner::load_staged(&dir, 64, 0, 3, 0, 2, Some("eager".into()), None).unwrap();
+    let mut e0 = PipelineEngine::new(
+        r0,
+        Some(tok),
+        StageTransport {
+            upstream: None,
+            downstream: Some(Arc::new(Mutex::new(c01))),
+        },
+        handle.clone(),
+        0,
+        3,
+        None,
+    );
+    assert_eq!(e0.enable_streams(3), 3);
+
+    let (e0, healthy) = tokio::task::spawn_blocking(move || {
+        let got = run_round(&mut e0, "healthy", n);
+        (e0, got)
+    })
+    .await
+    .unwrap();
+    let expected: Vec<Vec<i64>> = healthy
+        .into_iter()
+        .map(|r| r.expect("healthy round"))
+        .collect();
+
+    // 3 tasks, one per slot and group. After the first step that emits a
+    // token, every group has a decode frame in flight; the test then cuts
+    // the link and lets rank 0 step on.
+    let (in_flight_tx, in_flight_rx) = std::sync::mpsc::channel::<()>();
+    let (cut_tx, cut_rx) = std::sync::mpsc::channel::<()>();
+    let cut = tokio::task::spawn_blocking(move || {
+        let mut e0 = e0;
+        let ids: Vec<String> = (0..3).map(|i| format!("cut-{i}")).collect();
+        for (i, id) in ids.iter().enumerate() {
+            let mut t = GenerationTask::new(id.clone(), PROMPTS[i]);
+            t.max_tokens = MAX_TOKENS[i];
+            t.temperature = 0.0;
+            e0.submit(t).unwrap();
+        }
+        let mut errors = vec![0usize; ids.len()];
+        let mut ended = vec![false; ids.len()];
+        let mut signalled = false;
+        let mut steps = 0;
+        while ended.iter().any(|d| !d) {
+            steps += 1;
+            assert!(steps < 500, "engine did not end the tasks");
+            let Ok(chunks) = e0.step() else { continue };
+            let mut token = false;
+            for (id, c) in chunks {
+                let i = ids.iter().position(|x| x == &id).expect("known task");
+                assert!(!ended[i], "task {id} got a chunk after its end: {c:?}");
+                if c.error.is_some() {
+                    errors[i] += 1;
+                    ended[i] = true;
+                } else {
+                    assert!(!c.is_final, "task {id} ended without the cut: {c:?}");
+                    token = true;
+                }
+            }
+            if token && !signalled {
+                signalled = true;
+                in_flight_tx.send(()).unwrap();
+                cut_rx.recv().unwrap();
+            }
+        }
+        // A few more steps: nothing more may arrive for the ended tasks.
+        for _ in 0..5 {
+            if let Ok(chunks) = e0.step() {
+                assert!(
+                    chunks.is_empty(),
+                    "chunks after the tasks ended: {chunks:?}"
+                );
+            }
+        }
+        (e0, errors)
+    });
+    tokio::task::spawn_blocking(move || in_flight_rx.recv().unwrap())
+        .await
+        .unwrap();
+    let ports = tail.kill().await;
+    cut_tx.send(()).unwrap();
+    let (e0, errors) = cut.await.unwrap();
+    assert_eq!(
+        errors,
+        vec![1; 3],
+        "each in-flight task must end with exactly one error chunk"
+    );
+
+    // The neighbours come back; rank 0 re-dials once its retry interval has passed.
+    let tail = Tail::start(&dir, &handle, ports).await;
+    tokio::time::sleep(std::time::Duration::from_millis(3200)).await;
+    let (e0, got) = tokio::task::spawn_blocking(move || {
+        let mut e0 = e0;
+        let got = run_round(&mut e0, "back", n);
+        (e0, got)
+    })
+    .await
+    .unwrap();
+    for (i, (g, e)) in got.iter().zip(&expected).enumerate() {
+        assert_eq!(g.as_ref(), Ok(e), "task {i} after the link came back");
+    }
+
+    drop(e0);
+    tail.kill().await;
+}
