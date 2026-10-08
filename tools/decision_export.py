@@ -72,6 +72,8 @@ def kev_head_meta(head_pt):
     """head.pt's recorded backbone: {"base": HF id or None, "weights": "lora" | ... | None}."""
     import torch
     meta = torch.load(head_pt, map_location="cpu", weights_only=True)
+    if not isinstance(meta, dict):
+        raise ValueError(f"expected a dict, got {type(meta).__name__}")
     return {"base": meta.get("base"), "weights": meta.get("weights")}
 
 
@@ -160,7 +162,10 @@ def main():
         # Kev's pointer head was trained on its fine-tuned backbone's hidden states (Base + LoRA):
         # without either, the tree is the stock backbone under Kev's head and serves wrong answers
         # that a reference built the same way would not catch.
-        meta = kev_head_meta(a.head_pt)
+        try:
+            meta = kev_head_meta(a.head_pt)
+        except Exception as e:  # missing file, or torch's varied unpickling errors: a bad head.pt
+            ap.error(f"--head-pt {a.head_pt} is not a readable head.pt: {type(e).__name__}: {e}")
         missing = [f for f, v in (("--weights", a.weights), ("--lora", a.lora)) if not v]
         if missing:
             rec = f" ({a.head_pt} records base {meta['base']!r}, weights {meta['weights']!r})" \

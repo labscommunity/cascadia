@@ -641,3 +641,22 @@ def test_cli_jev_and_clef_pass_no_tokenizer_by_default(cli, monkeypatch):
     run("clef", "--base-ir", str(base), "--clef-dir", "C", "--out", str(tmp / "t"))
     (_, a, kw, _), = calls
     assert "tokenizer" not in kw
+
+
+@pytest.mark.parametrize("content", [None, b"not a torch file", "list"])
+def test_cli_bad_head_pt_is_a_clean_error(cli, monkeypatch, capsys, content):
+    # A missing, unreadable or non-dict head.pt must exit with a message, not a traceback.
+    run, calls, base, tmp = cli
+    kd = _kev_dir(tmp)
+    pt = kd / "head.pt"
+    if content == "list":
+        torch = pytest.importorskip("torch")
+        torch.save([1, 2], pt)
+    elif content is not None:
+        pt.write_bytes(content)
+    with pytest.raises(SystemExit) as e:
+        run("kev", "--base-ir", str(base), "--weights", "W", "--lora", "L.safetensors",
+            "--head-pt", str(pt), "--out", str(tmp / "t"))
+    assert e.value.code == 2
+    assert str(pt) in capsys.readouterr().err
+    assert calls == [] and not (tmp / "t").exists()
