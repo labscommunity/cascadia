@@ -102,6 +102,69 @@ pub(crate) fn kv_seq_from_framed_blob(blob: &[u8]) -> Option<usize> {
     kv_seq_from_parts(&unframe_blobs(blob)?)
 }
 
+/// Exact snapshot size model `(fixed, per_token)` read from one snapshot's per-stage
+/// `get_state_blob` parts (same layout as [`kv_seq_from_blob`]): a snapshot at `len` tokens is
+/// `fixed + per_token × len` bytes. Each attention KV state (rank ≥ 3, not `conv`/`ssm`) holds
+/// `nb / shape[2]` bytes per token at its own precision; everything else (recurrent state,
+/// names, shapes, counts) is fixed. One blob at any depth is enough, so the engine's warmup
+/// state gives the slope before the first request (P4-CE-1). `None` when a part does not parse
+/// exactly, a KV state's bytes are not a whole multiple of its depth, or no KV state is found.
+pub(crate) fn state_size_model(parts: &[Vec<u8>]) -> Option<(usize, usize)> {
+    fn u32_at(b: &[u8], p: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(
+            b.get(p..p.checked_add(4)?)?.try_into().ok()?,
+        ))
+    }
+    fn u64_at(b: &[u8], p: usize) -> Option<u64> {
+        Some(u64::from_le_bytes(
+            b.get(p..p.checked_add(8)?)?.try_into().ok()?,
+        ))
+    }
+    let (mut fixed, mut per_token, mut kv_states) = (0usize, 0usize, 0usize);
+    for blob in parts {
+        let mut p = 0usize;
+        let count = u32_at(blob, p)?;
+        p += 4;
+        let mut kv_bytes = 0usize;
+        for _ in 0..count {
+            let name_len = u32_at(blob, p)? as usize;
+            let name_at = p.checked_add(4)?;
+            let name = blob.get(name_at..name_at.checked_add(name_len)?)?;
+            let n = String::from_utf8_lossy(name);
+            let recurrent = n.contains("conv") || n.contains("ssm");
+            p = name_at.checked_add(name_len)?;
+            let rank = *blob.get(p.checked_add(1)?)? as usize;
+            p = p.checked_add(2)?;
+            let mut seq = 0usize;
+            for i in 0..rank {
+                let d = u64_at(blob, p)? as usize;
+                p = p.checked_add(8)?;
+                if i == 2 {
+                    seq = d;
+                }
+            }
+            let nb = u64_at(blob, p)? as usize;
+            p = p.checked_add(8)?.checked_add(nb)?;
+            if p > blob.len() {
+                return None;
+            }
+            if rank >= 3 && !recurrent {
+                if seq == 0 || nb % seq != 0 {
+                    return None;
+                }
+                per_token = per_token.checked_add(nb / seq)?;
+                kv_bytes = kv_bytes.checked_add(nb)?;
+                kv_states += 1;
+            }
+        }
+        if p != blob.len() {
+            return None;
+        }
+        fixed = fixed.checked_add(blob.len() - kv_bytes)?;
+    }
+    (kv_states > 0).then_some((fixed, per_token))
+}
+
 /// Frame N opaque per-stage blobs into one: `u32 count | (u32 len | bytes)×count`. A rank that holds
 /// several local stages (qwen36 `stages`, dist-spec target+draft) snapshots each and ships the bundle
 /// as a single opaque blob — `OvKvCache` and the wire treat it as one payload. The u32 length is a
@@ -234,6 +297,26 @@ impl PrefixCache {
                 if obs.0 >= hi.0 { obs } else { hi },
             ),
         });
+    }
+
+    /// Record a measured snapshot's per-stage parts as the size model, without caching anything
+    /// (the engine's warmup state, P4-CE-1). When the parts parse ([`state_size_model`]) the
+    /// model's line is recorded exactly, as the points `(0, fixed)` and `(1, fixed + per_token)`,
+    /// and returned; otherwise the total is recorded at the parts' KV depth (else one token), a
+    /// single point that only bounds longer keys from below.
+    pub fn observe_state(&mut self, parts: &[Vec<u8>]) -> Option<(usize, usize)> {
+        match state_size_model(parts) {
+            Some((fixed, per_token)) => {
+                self.observe(0, fixed);
+                self.observe(1, fixed.saturating_add(per_token));
+                Some((fixed, per_token))
+            }
+            None => {
+                let len = kv_seq_from_parts(parts).unwrap_or(1);
+                self.observe(len, parts_bytes(parts));
+                None
+            }
+        }
     }
 
     pub fn enabled(&self) -> bool {
@@ -839,6 +922,92 @@ mod tests {
             !c.can_hold(300),
             "350 + 2.5 * 299 > 1000, though the floor alone is 700"
         );
+    }
+
+    /// A `get_state_blob` blob in the shim's layout: `(name, dtype, shape, element bytes)` per state.
+    fn state_blob(states: &[(&str, &[u64], u64)]) -> Vec<u8> {
+        let mut b = (states.len() as u32).to_le_bytes().to_vec();
+        for (name, shape, elem) in states {
+            b.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            b.extend_from_slice(name.as_bytes());
+            b.push(1); // dtype tag; the size model reads only nb
+            b.push(shape.len() as u8);
+            for d in *shape {
+                b.extend_from_slice(&d.to_le_bytes());
+            }
+            let nb = shape.iter().product::<u64>() * elem;
+            b.extend_from_slice(&nb.to_le_bytes());
+            b.extend(std::iter::repeat_n(0u8, nb as usize));
+        }
+        b
+    }
+
+    /// A small hybrid stage at `seq` tokens: recurrent conv/ssm state (fixed) and f32 KV.
+    fn hybrid_stage(seq: u64) -> Vec<u8> {
+        state_blob(&[
+            ("layer0.conv_state", &[1, 48, 4], 4),
+            ("layer0.ssm_state", &[1, 4, 8, 8], 4),
+            ("layer3.key_cache", &[1, 2, seq, 16], 4),
+            ("layer3.value_cache", &[1, 2, seq, 16], 4),
+            ("layer7.key_cache", &[1, 2, seq, 16], 2),
+            ("layer7.value_cache", &[1, 2, seq, 16], 2),
+        ])
+    }
+
+    #[test]
+    fn the_state_size_model_read_from_one_blob_predicts_every_length() {
+        // P4-CE-1: the warmup blob alone gives the exact per-token slope (each KV state's bytes
+        // over its sequence depth) and the fixed part (recurrent state plus framing), so the size
+        // estimate is exact from the first request, not a lower bound.
+        let warm = vec![hybrid_stage(1), hybrid_stage(1)];
+        let (fixed, per_token) = state_size_model(&warm).unwrap();
+        assert_eq!(per_token, 2 * (2 * 2 * 16 * 4 + 2 * 2 * 16 * 2));
+        for seq in [1u64, 3, 17, 1000] {
+            let at = hybrid_stage(seq).len() * 2;
+            assert_eq!(fixed + per_token * seq as usize, at, "seq {seq}");
+        }
+        // Read at any depth, the model is the same.
+        assert_eq!(
+            state_size_model(&[hybrid_stage(5), hybrid_stage(5)]),
+            Some((fixed, per_token))
+        );
+        // No KV state, or an unparseable blob: no model (the caller falls back).
+        let recurrent_only = state_blob(&[("layer0.ssm_state", &[1, 4, 8, 8], 4)]);
+        assert_eq!(state_size_model(&[recurrent_only]), None);
+        assert_eq!(state_size_model(&[vec![1, 2, 3]]), None);
+        assert_eq!(state_size_model(&[]), None);
+        let mut torn = hybrid_stage(1);
+        torn.pop();
+        assert_eq!(state_size_model(&[torn]), None);
+        let mut trailing = hybrid_stage(1);
+        trailing.push(0);
+        assert_eq!(state_size_model(&[trailing]), None);
+    }
+
+    #[test]
+    fn the_warmup_blob_makes_the_estimate_exact_from_the_first_request() {
+        // P4-CE-1 trace, scaled down: the config floor (half a byte per element) admits a key
+        // whose real snapshot is over the budget; the warmup blob's size model refuses it before
+        // any prefill, and still admits one that fits.
+        let warm = vec![hybrid_stage(1)];
+        let (fixed, per_token) = state_size_model(&warm).unwrap();
+        let real = |len: usize| fixed + per_token * len;
+        let budget = real(400);
+        let mut c = PrefixCache::new(budget);
+        c.seed_floor(fixed / 8, per_token / 8);
+        assert!(c.can_hold(1000), "the floor alone admits a 1000-token key");
+        assert_eq!(c.observe_state(&warm), Some((fixed, per_token)));
+        assert!(c.is_empty() && c.worth_copying(1_000_000));
+        assert_eq!(c.estimated_bytes(1000), Some(real(1000)));
+        assert!(c.can_hold(400) && !c.can_hold(401) && !c.can_hold(1000));
+        // A real snapshot later keeps the line exact.
+        assert!(c.insert(key(300, 0), vec![vec![0; real(300)]]));
+        assert_eq!(c.estimated_bytes(401), Some(real(401)));
+        // No KV state in the blob: its total is recorded as the one-token point, as before.
+        let mut c = PrefixCache::new(budget);
+        let recurrent_only = vec![state_blob(&[("layer0.ssm_state", &[1, 4, 8, 8], 4)])];
+        assert_eq!(c.observe_state(&recurrent_only), None);
+        assert_eq!(c.estimated_bytes(1), Some(recurrent_only[0].len()));
     }
 
     #[test]
