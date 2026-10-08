@@ -220,9 +220,9 @@ async fn three_rank_multistream_matches_single_stage() {
 /// rank's process is killed) must exit its step loop with an error so the
 /// supervisor rebuilds it, instead of spinning on `NotConnected` forever
 /// while the restarted upstream can never reconnect (the listener accepted
-/// exactly once).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn last_rank_exits_after_upstream_reset() {
+/// exactly once). `streams` = 0 runs the one-task path, more runs the
+/// stream-mode readiness wait.
+async fn last_rank_exits_after_upstream_reset(streams: usize) {
     let Some(dir) = fixture() else { return };
     let handle = tokio::runtime::Handle::current();
     let mut server = ActivationServer::new("127.0.0.1", 0);
@@ -249,6 +249,9 @@ async fn last_rank_exits_after_upstream_reset() {
         3,
         None,
     );
+    if streams > 0 {
+        assert_eq!(e2.enable_streams(streams), streams);
+    }
     let exited = Arc::new(AtomicBool::new(false));
     let flag = exited.clone();
     let worker = std::thread::spawn(move || {
@@ -275,6 +278,16 @@ async fn last_rank_exits_after_upstream_reset() {
         exited.load(Ordering::Relaxed),
         "last rank kept stepping after its upstream reset; the supervisor can never rebuild it"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn last_rank_exits_after_upstream_reset_one_task() {
+    last_rank_exits_after_upstream_reset(0).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn last_rank_exits_after_upstream_reset_streams() {
+    last_rank_exits_after_upstream_reset(3).await;
 }
 
 /// A lone stream-mode last rank (rank 2 of 3) that the test feeds frames by
