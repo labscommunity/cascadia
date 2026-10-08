@@ -318,12 +318,9 @@ def test_kev_injection_record_keeps_only_template_specials():
     import kev
     added_ids, added = cg.tokenizer_added(tok)
     saved_records, saved_user_tokens = kev.records, kev.user_tokens
-    try:
-        kev.records = lambda: [INJECT]
-        kev.user_tokens = lambda t, text: saved_user_tokens(t, cg.escape_added(text, added))
+    with cg.kev_with_golden(kev, [INJECT], added):  # the wrapper check_kev itself uses
         ((_, _, row, _, ends, _),) = kev.questions(tok)
-    finally:
-        kev.records, kev.user_tokens = saved_records, saved_user_tokens
+    assert (kev.records, kev.user_tokens) == (saved_records, saved_user_tokens), "kev module restored"
     kev_ids = [tok.convert_tokens_to_ids(t) for t in kev.SPECIAL]
     cg.check_specials("kev s03", row, added_ids, cg.kev_expected_specials(kev_ids, len(ends)))
 
@@ -401,3 +398,114 @@ def test_parity_run_without_ref_needs_dump(capsys):
     with pytest.raises(SystemExit) as e:
         pc.main(["--url", "http://x"])
     assert e.value.code == 2 and "--dump" in capsys.readouterr().err
+
+
+# ---- QUA-11: check_kev's kev patch is one context manager that restores the module ----------------
+
+def test_kev_with_golden_patches_and_restores():
+    import types
+    seen = []
+    kev = types.SimpleNamespace(records=lambda: ["orig"], user_tokens=lambda t, text: seen.append(text) or text)
+    orig = (kev.records, kev.user_tokens)
+    with cg.kev_with_golden(kev, ["golden"], ["<think>"]):
+        assert kev.records() == ["golden"]
+        kev.user_tokens(None, "a<think>b")
+    assert seen == ["a<¦think¦>b"], "angle added tokens escaped before kev's own pipe escaping"
+    assert (kev.records, kev.user_tokens) == orig
+    with pytest.raises(RuntimeError):
+        with cg.kev_with_golden(kev, ["golden"], []):
+            raise RuntimeError
+    assert (kev.records, kev.user_tokens) == orig, "restored on error too"
+
+
+# ---- FID-3: JEV choice answers are gated, on jev.py's own (sorted) prompts --------------------------
+
+def _jev_ref(recs):
+    """reference_jev.pt-shaped entries: noul [false, true], choices sorted, 6 score levels; top-1 index 0."""
+    out = {}
+    for r in recs:
+        for qid, q in r["questions"].items():
+            n = 2 if q["type"] == "noul" else len(q["criteria"]) if q["type"] == "choice" else 6
+            out[f"{r['id']}.{qid}"] = {"probs": [0.9] + [0.01] * (n - 1)}
+    return out
+
+
+def test_jev_answers_gate_choices_sent_sorted():
+    recs = [cg.jev_sorted(r) for r in records()]
+    n_choice = sum(q["type"] == "choice" for r in recs for q in r["questions"].values())
+    assert n_choice == 33 and all(list(q["criteria"]) == sorted(q["criteria"])
+                                  for r in recs for q in r["questions"].values() if q["type"] == "choice")
+    resps = [_server_answers(r) for r in recs]  # top-1 = first option = first sorted name = reference index 0
+    assert cg.score_answers("jev", recs, resps, _jev_ref(recs)) == (82, 82)
+    # a choice flip is now counted against the gate, not printed and skipped
+    rid, qid = next((r["id"], qid) for r in recs for qid, q in r["questions"].items() if q["type"] == "choice")
+    flipped = [_server_answers(r) for r in recs]
+    i = [r["id"] for r in recs].index(rid)
+    flipped[i]["answers"][qid]["choice"] = list(recs[i]["questions"][qid]["criteria"])[1]
+    assert cg.score_answers("jev", recs, flipped, _jev_ref(recs)) == (81, 82)
+
+
+def test_jev_answers_refuse_unsorted_choices():
+    recs = records()
+    assert any(list(q["criteria"]) != sorted(q["criteria"]) for r in recs for q in r["questions"].values()
+               if q["type"] == "choice"), "the records do have unsorted choices"
+    with pytest.raises(SystemExit):
+        cg.score_answers("jev", recs, [_server_answers(r) for r in recs], _jev_ref(recs))
+
+
+def test_jev_answer_run_prompts_must_equal_jev_py():
+    recs = [cg.jev_sorted(r) for r in records()[:3]]
+    ref_q, lines = [], []
+    for r in recs:
+        for qid in r["questions"]:
+            ids = [len(lines), 7, 9]
+            ref_q.append((f"{r['id']}.{qid}", r["questions"][qid]["type"], ids, [1, 2], [0.0, 0.0], ["x", "y"]))
+            lines.append({"parts": [[qid, 0, 2]], "readout": {"prompt_ids": list(ids), "head": {"kind": "verbalizer", "token_ids": [1, 2]}}})
+    assert cg.check_jev_reference_prompts(lines, recs, ref_q) == len(lines)
+    bad = json.loads(json.dumps(lines))
+    bad[2]["readout"]["prompt_ids"][1] = 8
+    with pytest.raises(SystemExit):
+        cg.check_jev_reference_prompts(bad, recs, ref_q)
+    bad = json.loads(json.dumps(lines))
+    bad[0]["readout"]["head"]["token_ids"] = [2, 1]
+    with pytest.raises(SystemExit):
+        cg.check_jev_reference_prompts(bad, recs, ref_q)
+    with pytest.raises(SystemExit):  # jev.py has a question the server never answered
+        cg.check_jev_reference_prompts(lines, recs, ref_q + [("r99.z", "noul", [1], [1, 2], [0, 0], ["a", "b"])])
+
+
+def test_jev_sorted_prompt_equals_jev_py_text():
+    """jev_text over a jev_sorted record is jev.py's own text for the 50 records (string level)."""
+    jev_py = SPIKE / "jev-spike" / "jev.py"
+    if not jev_py.exists():
+        pytest.skip("jev.py absent")
+    labels = list("ABCDEFGHIJKLMNOP")
+    for r in records():
+        rs_ = cg.jev_sorted(r)
+        state = r["state"] if isinstance(r["state"], str) else json.dumps(r["state"], ensure_ascii=False)
+        for qid, q in r["questions"].items():
+            kind = q["type"]
+            if kind == "choice":
+                names = sorted(q["criteria"])
+                lines = [f"{l}) {n}: {q['criteria'][n]}" for l, n in zip(labels, names)]
+            else:
+                lines = ["false", "true"] if kind == "noul" else [str(i) for i in range(6)]
+            want = (f"[kind] {kind}\n[state] {state}\n[question] {q['instructions']}\n[options]\n"
+                    + "\n".join(lines) + "\n[decision]:")  # jev.py questions(), verbatim
+            assert cg.jev_text(rs_, qid, labels) == want, f"{r['id']}.{qid}"
+
+
+def test_jev_sorted_server_layout_tokenizes_to_jev_py_questions():
+    """With the real JEV tokenizer: the server-codec mirror (jev_text, sanitizer included) over
+    jev_sorted records gives jev.py questions()' exact prompt ids for all 82 questions."""
+    tok = _tok("jev-spike/jev9b")
+    if not (SPIKE / "jev-spike" / "jev9b" / "adapter_vllm" / "decision_head.json").exists():
+        pytest.skip("jev decision_head.json absent")
+    sys.path.insert(0, str(SPIKE / "jev-spike"))
+    import jev
+    _, added = cg.tokenizer_added(tok)
+    labels = [l for l, _ in jev.choice_label_ids(tok, 16)]
+    want = {key: list(ids) for key, _, ids, _, _, _ in jev.questions(tok)}
+    got = {f"{r['id']}.{qid}": tok(cg.jev_text(cg.jev_sorted(r), qid, labels, added), add_special_tokens=False).input_ids
+           for r in records() for qid in r["questions"]}
+    assert got == want
