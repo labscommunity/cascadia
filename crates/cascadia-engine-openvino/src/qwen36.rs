@@ -1496,10 +1496,14 @@ impl Qwen36Engine {
         owns_head(self.rank, self.total)
     }
 
-    /// The rank can take part in a decision pass: it validates readouts against its vocab, and
-    /// the head-owning rank has head assets. Advertised in the HELLO capability bits.
+    /// The rank can take part in a decision pass. Rank 0 and the head-owning (last) rank validate
+    /// readouts against their vocab, and the head owner also needs head assets; a middle rank
+    /// only relays FRAME_DECIDE, so it needs neither (P2-REG-1). Advertised in the HELLO
+    /// capability bits.
     fn serves_decisions(&self) -> bool {
-        self.vocab.is_some() && (!self.owns_head() || self.decision_assets.is_some())
+        let reads_readouts = self.rank == 0 || self.owns_head();
+        !reads_readouts
+            || (self.vocab.is_some() && (!self.owns_head() || self.decision_assets.is_some()))
     }
 
     /// Rank 0's up-front refusal of a decision pass: a malformed readout, or a chain in which some
@@ -4850,6 +4854,19 @@ mod tests {
         );
         e.decision_assets = Some(crate::decision::HeadAssets::Verbalizer);
         assert!(e.serves_decisions());
+        // P2-REG-1: a middle rank only relays FRAME_DECIDE; it never reads a vocab or a head, so
+        // a manifest + stage-only middle rank still serves decisions.
+        let mut mid = bare_engine(3, "{}");
+        mid.rank = 1;
+        assert!(mid.vocab.is_none() && mid.decision_assets.is_none());
+        assert!(mid.serves_decisions(), "middle rank relays only");
+        mid.rank = 0;
+        assert!(
+            !mid.serves_decisions(),
+            "rank 0 validates against its vocab"
+        );
+        mid.rank = 2;
+        assert!(!mid.serves_decisions(), "the last rank runs the head");
     }
 
     #[test]
