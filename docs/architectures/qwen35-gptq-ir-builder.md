@@ -4,7 +4,10 @@ Status (2026-10-09): 35B-A3B validated end to end (text identical to Intel's off
 coherent). **397B-A17B built and validated**: 204 GB language-model IR (+1 GB embeddings, +0.9 GB
 vision/merger) in 74 min on a 400 GiB guest, peak ~160 GB RAM; `gen_check` on the full model (CPU, 8 vCPU):
 compile 435 s, 5-token prefill 16.6 s, top-1 ` Paris` (17.9 vs 14.8 runner-up), 12 greedy tokens in 8.6 s =
-` Paris.<|im_end|>\n<|im_start|>assistant\n<think>\nThinking Process:` (dense-bmm over all 512 experts). Tools: `tools/qwen36_surgery/gptq_builder/`.
+` Paris.<|im_end|>\n<|im_start|>assistant\n<think>\nThinking Process:` (dense-bmm over all 512 experts).
+Six-stage cut with `export_qwen36_moe.py --total 6 --validate`: chain-vs-full logits rel 4.1e-3, top-1 match,
+top-5 5/5, 8-token greedy parity 8/8; shards 32 GB + 5 × 42 GB. For 64 GB CPU ranks cut ~10 stages (the CPU
+plugin holds ~2× the IR in RSS) or place stages on the iGPU. Tools: `tools/qwen36_surgery/gptq_builder/`.
 
 ## Why
 
