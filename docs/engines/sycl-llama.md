@@ -233,7 +233,11 @@ Guidance:
   then writes a call as plain text); a named choice
   (`{"type":"function","function":{"name":N}}`) is sent as `"required"` with
   `tools` narrowed to that one function (llama-server itself parses only the
-  string forms, silently treating an object as `"auto"`). An unknown string,
+  string forms, silently treating an object as `"auto"`). llama-server's
+  `"required"` is weaker than OpenAI's: its grammar allows free text before
+  the call, so a model can spend `max_tokens` on text and return
+  `finish_reason: "length"` with no call (seen once with Qwen2.5-1.5B on an
+  Arc B390, named choice). An unknown string,
   a malformed object, or a name absent from `tools` is rejected with a 400
   before the request reaches the engine. The child's streamed `delta.tool_calls` fragments
   are re-assembled and emitted as `<tool_call>` text before the final chunk,
