@@ -701,8 +701,20 @@ impl MoeLayer {
     /// router, same gate-order accumulation, then shared), but each unique
     /// routed expert is visited once per block and computes all its rows back
     /// to back — so an mmap'd expert's int4 pages are faulted in once. The
-    /// prefill / batched-verify path.
+    /// prefill / batched-verify path: the expert cache is read but never
+    /// grown here (a long prompt must not evict the decode hot set).
     pub fn forward_batch(&self, xs: &[f32], rows: usize) -> Vec<f32> {
+        self.forward_batch_rows(xs, rows, false)
+    }
+
+    /// [`Self::forward_batch`] for one decode token per stream (multi-stream
+    /// decode): the same arithmetic, and a missed expert is admitted to the
+    /// cache after its rows computed, the way single-token decode admits.
+    pub fn forward_batch_decode(&self, xs: &[f32], rows: usize) -> Vec<f32> {
+        self.forward_batch_rows(xs, rows, true)
+    }
+
+    fn forward_batch_rows(&self, xs: &[f32], rows: usize, admit: bool) -> Vec<f32> {
         assert_eq!(xs.len(), rows * self.hidden, "moe forward_batch: xs len");
         if self.remote.is_some() {
             return self.forward_remote(xs, rows);
@@ -733,16 +745,20 @@ impl MoeLayer {
         let mut lo = 0;
         while lo < rows {
             let hi = (lo + Self::ROW_BLOCK).min(rows);
-            self.forward_block(xs, lo, hi, &mut out);
+            self.forward_block(xs, lo, hi, &mut out, admit);
             lo = hi;
         }
         out
     }
 
-    fn forward_block(&self, xs: &[f32], lo: usize, hi: usize, out: &mut [f32]) {
-        self.forward_block_with_reads(xs, lo, hi, out, prefill_reads());
+    fn forward_block(&self, xs: &[f32], lo: usize, hi: usize, out: &mut [f32], admit: bool) {
+        self.forward_block_with_reads(xs, lo, hi, out, prefill_reads(), admit);
     }
 
+    /// `streamed`: read experts through the owned-buffer schedule (and look
+    /// them up in the expert cache). `admit`: also retain cache misses after
+    /// their rows computed — decode rows only; prefill never grows the cache
+    /// (see `ExpertCache::configured_bytes`).
     fn forward_block_with_reads(
         &self,
         xs: &[f32],
@@ -750,6 +766,7 @@ impl MoeLayer {
         hi: usize,
         out: &mut [f32],
         streamed: bool,
+        admit: bool,
     ) {
         let (hidden, k) = (self.hidden, self.top_k);
         let nblk = hi - lo;
@@ -781,12 +798,48 @@ impl MoeLayer {
             s.prefetch();
         }
 
+        // 2b. The explicit expert cache (the streamed/owned-buffer path only):
+        //     one lookup for the block's unique experts — a hit computes its
+        //     rows straight from the retained bytes, a miss is read once and
+        //     admitted after compute. This is what lets multi-stream decode
+        //     (which batches rows exactly like prefill) run from the cache
+        //     instead of re-reading every expert per step.
+        let cache_on = streamed && self.expert_cache.stats().capacity_bytes > 0;
+        let unique: Vec<usize> = occ
+            .iter()
+            .enumerate()
+            .filter(|(_, slots)| !slots.is_empty())
+            .map(|(e, _)| e)
+            .collect();
+        let hit_map: std::collections::HashMap<usize, Arc<super::read_buffers::ReadBuffer>> =
+            if cache_on {
+                match self.expert_cache.lookup(&unique) {
+                    Some(hits) => unique
+                        .iter()
+                        .zip(hits)
+                        .filter_map(|(&e, h)| h.map(|b| (e, b)))
+                        .collect(),
+                    None => Default::default(),
+                }
+            } else {
+                Default::default()
+            };
+
         // 3. One visit per unique routed expert, its rows hot. The experts
         //    run concurrently; each computes its rows back to back, so an
         //    mmap'd expert's int4 pages are still faulted in once.
         let mut ey = vec![0.0f32; nblk * k * hidden];
         let visit = |(e, slots): (usize, &Vec<usize>)| {
             let mapped = self.w.experts[e].as_mmap();
+            if let (Some(m), Some(hit)) = (mapped, hit_map.get(&e)) {
+                let mut ys = Vec::with_capacity(slots.len() * hidden);
+                for &s in slots {
+                    let br = s / k;
+                    let x = &xs[(lo + br) * hidden..(lo + br + 1) * hidden];
+                    ys.extend_from_slice(&m.swiglu_from(hit.as_slice(), x));
+                }
+                return (e, ys);
+            }
             let mut lease = (streamed && mapped.is_some())
                 .then(|| super::read_buffers::ReadBuffers::acquire(1));
             let ready = match (mapped, lease.as_mut()) {
@@ -817,6 +870,12 @@ impl MoeLayer {
                     self.w.experts[e].forward(x, hidden, self.inter)
                 };
                 ys.extend_from_slice(&y);
+            }
+            if ready && cache_on && admit {
+                // Admit the freshly read bytes (a miss) after its rows computed;
+                // the lease gets any evicted allocation back and drops it.
+                self.expert_cache
+                    .retain(e, &mut lease.as_mut().unwrap().buffers[0]);
             }
             (e, ys)
         };
@@ -988,8 +1047,8 @@ mod prefill_read_tests {
         }
         let mut expected = vec![0.0; xs.len()];
         let mut actual = vec![0.0; xs.len()];
-        layer.forward_block_with_reads(&xs, 0, 17, &mut expected, false);
-        layer.forward_block_with_reads(&xs, 0, 17, &mut actual, true);
+        layer.forward_block_with_reads(&xs, 0, 17, &mut expected, false, false);
+        layer.forward_block_with_reads(&xs, 0, 17, &mut actual, true, true);
         assert_eq!(
             actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
             expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()

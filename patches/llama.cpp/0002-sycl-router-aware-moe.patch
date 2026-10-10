@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index a617d69cb..f104ce4b2 100644
+index 1f8352b40..d8906a576 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
 @@ -4420,7 +4420,34 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
@@ -37,7 +37,7 @@ index a617d69cb..f104ce4b2 100644
      return g_ggml_sycl_enable_optimize && //allow optimize, controlled by $GGML_SYCL_ENABLE_OPT
             ctx.opt_feature.reorder &&      //allow this device due to good perf, skip the devices with bad perf.
             dst->op == GGML_OP_MUL_MAT &&   //limit to some supported cases of Q4_0, to do for more cases.
-@@ -5085,6 +5112,306 @@ static sycl::event sycl_stream_copy_submit(sycl::queue * cq, char * dst,
+@@ -5085,6 +5112,307 @@ static sycl::event sycl_stream_copy_submit(sycl::queue * cq, char * dst,
      return deps.empty() ? cq->memcpy(dst, b.ptr, n) : cq->memcpy(dst, b.ptr, n, deps);
  }
  
@@ -125,6 +125,7 @@ index a617d69cb..f104ce4b2 100644
 +        // a larger n_ids (different top-k) would wrap slots mid-call
 +        if (n_ids > a.n_scratch) {
 +            sycl_stream_copy_queue(a.device)->wait();  // pending copies target a.base
++            q->wait();  // a kernel of the previous op may still read a.base
 +            ggml_sycl_free_device(a.base, *q);
 +            const size_t bytes = (size_t) (a.n_cache + n_ids) * a.stride;
 +            a.base = (char *) ggml_sycl_malloc_device(bytes, *q);
@@ -344,7 +345,7 @@ index a617d69cb..f104ce4b2 100644
  static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                   ggml_tensor *dst) try {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
-@@ -5100,11 +5427,32 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+@@ -5100,11 +5428,32 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
      const int64_t n_as = ne02;
      const int64_t n_ids = ids->ne[0];
  
@@ -378,7 +379,7 @@ index a617d69cb..f104ce4b2 100644
  
      std::vector<char> ids_host(ggml_nbytes(ids));
      const char * ids_dev = (const char *) ids->data;
-@@ -5119,7 +5467,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+@@ -5119,7 +5468,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
      ggml_tensor src1_row = *src1;
      ggml_tensor dst_row = *dst;
  
@@ -386,7 +387,7 @@ index a617d69cb..f104ce4b2 100644
      char *src1_original = (char *)src1->data;
      char *dst_original = (char *)dst->data;
  
-@@ -5150,7 +5497,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+@@ -5150,7 +5498,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                  const int64_t i1 = id;
                  const int64_t i2 = i12;
  
@@ -395,7 +396,7 @@ index a617d69cb..f104ce4b2 100644
              src1_row.data = src1_original + i11*nb11 + i12*nb12;
              dst_row.data = dst_original + i1*nb1 + i2*nb2;
  
-@@ -5212,7 +5559,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+@@ -5212,7 +5560,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
  
              const int64_t expert_row_offset = expert_row_offsets[i02];
  
@@ -404,7 +405,7 @@ index a617d69cb..f104ce4b2 100644
  
              GGML_ASSERT(nb11 == sizeof(float)*ne10);
              GGML_ASSERT(nb1 == sizeof(float)*ne0);
-@@ -6034,7 +6381,10 @@ static bool ggml_sycl_stream_build(sycl_stream_pool & sw, ggml_backend_buffer_t
+@@ -6034,7 +6382,10 @@ static bool ggml_sycl_stream_build(sycl_stream_pool & sw, ggml_backend_buffer_t
      std::vector<const ggml_tensor *> ts;
      std::vector<ggml_stream_src>     recs;
      for (int i = 0; i < n0; i++) {
@@ -416,7 +417,7 @@ index a617d69cb..f104ce4b2 100644
              ts.push_back(ts0[i]);
              recs.push_back(recs0[i]);
          }
-@@ -6216,6 +6566,9 @@ static void ggml_sycl_stream_sources(const ggml_tensor * n,
+@@ -6216,6 +6567,9 @@ static void ggml_sycl_stream_sources(const ggml_tensor * n,
          while (s->view_src != nullptr) {
              s = s->view_src;
          }
@@ -426,7 +427,7 @@ index a617d69cb..f104ce4b2 100644
          const ggml_stream_src * rec = ggml_stream_find(s);
          if (rec == nullptr || s->buffer == nullptr || !ggml_backend_buffer_is_sycl(s->buffer)) {
              continue;
-@@ -6348,9 +6701,39 @@ static void ggml_sycl_stream_buffer_teardown(ggml_backend_buffer_t buffer, queue
+@@ -6348,9 +6702,39 @@ static void ggml_sycl_stream_buffer_teardown(ggml_backend_buffer_t buffer, queue
      // drop this buffer's stream registrations and the dup()d descriptors
      // they were the last to hold; other live models keep theirs
      ggml_stream_purge_buffer(buffer);
@@ -466,8 +467,8 @@ index a617d69cb..f104ce4b2 100644
 -
  static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
      ggml_sycl_set_main_device(sycl_ctx->device);
-     const bool stream_weights = ggml_stream_weights_enabled();
-@@ -6358,6 +6741,35 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+     const bool stream_weights = ggml_stream_active();
+@@ -6358,6 +6742,35 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
      int cur_layer = -1;
      int prefetch_j = 0;
  

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use super::read_buffers::ReadBuffer;
 
-#[derive(Clone, Copy, Default, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct ExpertCacheStats {
     pub capacity_bytes: usize,
     pub retained_bytes: usize,
@@ -93,18 +93,18 @@ impl ExpertCache {
         }))
     }
 
-    /// Per-MoE-layer MiB; default zero. Invalid or >1024 MiB settings disable
-    /// it (256 MiB × 64 layers = the 16 GiB the campaign-129 profile runs;
-    /// the headroom above that is for boxes that free RAM elsewhere, e.g.
-    /// attention served from an iGPU copy). Allocations grow only on
-    /// successful decode reads, never during prefill.
+    /// Per-MoE-layer MiB; default zero. Invalid or >16384 MiB settings
+    /// disable it (256 MiB × 64 layers = the 16 GiB the campaign-129 profile
+    /// runs on a paged 64 GB box; a resident pipeline rank sets it at or
+    /// above a layer's 7.7 GiB of experts so its slice stays in RAM).
+    /// Allocations grow only on successful decode reads, never during
+    /// prefill.
     pub fn configured_bytes() -> usize {
-        std::env::var("CASCADIA_INKLING_EXPERT_CACHE_MIB")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&mib| mib <= 1024)
-            .unwrap_or(0)
-            * 1024
+        configured_mib(
+            std::env::var("CASCADIA_INKLING_EXPERT_CACHE_MIB")
+                .ok()
+                .as_deref(),
+        ) * 1024
             * 1024
     }
 
@@ -280,10 +280,46 @@ impl ExpertCache {
     }
 }
 
+/// Parse a `CASCADIA_INKLING_EXPERT_CACHE_MIB` value. Unset or empty gives 0.
+/// A non-number or a value above 16384 gives 0 (no cache) and logs a warning
+/// once (each MoE layer reads the value).
+fn configured_mib(raw: Option<&str>) -> usize {
+    let raw = match raw {
+        None | Some("") => return 0,
+        Some(r) => r,
+    };
+    match raw.parse::<usize>() {
+        Ok(mib) if mib <= 16384 => mib,
+        _ => {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    env = "CASCADIA_INKLING_EXPERT_CACHE_MIB",
+                    value = raw,
+                    used = 0,
+                    "ignoring invalid env value (accepted: 0..=16384); the expert cache is off"
+                );
+            });
+            0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn configured_mib_rejects_bad_values() {
+        assert_eq!(configured_mib(None), 0);
+        assert_eq!(configured_mib(Some("")), 0);
+        assert_eq!(configured_mib(Some("abc")), 0);
+        assert_eq!(configured_mib(Some("0")), 0);
+        assert_eq!(configured_mib(Some("256")), 256);
+        assert_eq!(configured_mib(Some("16384")), 16384);
+        assert_eq!(configured_mib(Some("16385")), 0);
+    }
 
     fn bytes(value: u8, length: usize) -> ReadBuffer {
         let mut file = tempfile::NamedTempFile::new().unwrap();
