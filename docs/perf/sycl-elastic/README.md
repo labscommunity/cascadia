@@ -23,6 +23,8 @@ All numbers come from [`data.json`](./data.json) (verbatim copy of
 | ![fig15](fig15_readerpool_b70.png) | `fig15_readerpool_b70.png` — reader-pool thread sweep on the fully streamed 27B (+7-9% over serial pread). |
 | ![fig16](fig16_sharecap_b70.png) | `fig16_sharecap_b70.png` — `--elastic-share N` resident-weight caps vs the uncapped automatic budget. |
 | ![fig17](fig17_mtp.png) | `fig17_mtp.png` — `--llama-mtp` decode on Qwen3.8-27B per `--elastic-vram` budget (median of 3 runs, whiskers = run spread) and its VRAM cost. Data: `data.json` `mtp`; harness `experiments/2026-10-10-review3/spec/mtp_sweep.py`. |
+| ![fig18](fig18_mtp_draft_n.png) | `fig18_mtp_draft_n.png` — `--spec-draft-n-max` sweep under `--llama-mtp`: resident vs 8 GiB budget, speed relative to plain decode, and draft acceptance. Data: `data.json` `mtp_draft_n`. |
+| ![fig19](fig19_mtp_cpu_gpu.png) | `fig19_mtp_cpu_gpu.png` — `--llama-mtp` through `cascadia run` on GPU (resident, 8 GiB streamed) and CPU: client t/s, CPU cores, peak VRAM and host RSS, with deltas. Data: `data.json` `mtp_cpu_gpu`; harness `experiments/2026-10-10-review3/spec/mtp_cpu_gpu.py`. |
 
 Placement study on a UMA iGPU (Arc B390, Linux), stock vs streaming vs
 pinned host memory computed in place: [`placement-b390.md`](placement-b390.md).
