@@ -198,14 +198,15 @@ Guidance:
 ## Faster decode and prefill
 
 Measured on the Arc Pro B70 (Qwen3.8-27B UD-Q4_K_S, ctx 4096, KV q8_0,
-`-fa on`, 3 chat prompts, 128 tokens; 48 when fully streamed):
+`-fa on`, 3 chat prompts x 64 tokens; median of 3 fresh server runs, all
+runs within 2.5% of the median). Chart: [fig17](../perf/sycl-elastic/fig17_mtp.png).
 
-| `--elastic-vram` | decode | with `--llama-mtp` | MTP tokens accepted |
-|---|---|---|---|
-| resident (fits) | 19.0 t/s | **26.2 t/s** (+38%) | 199/270 |
-| 12 (62/65 resident) | 18.9 t/s | 19.8 t/s | 199/270 |
-| 8 (42/65) | 0.83 t/s | **2.43 t/s** (2.9x) | 199/271 |
-| 0 (fully streamed) | 0.67 t/s | **2.11 t/s** (3.1x) | 90/118 |
+| `--elastic-vram` | decode | with `--llama-mtp` | peak VRAM cost | MTP tokens accepted |
+|---|---|---|---|---|
+| resident (fits) | 19.0 t/s | **26.5 t/s** (+39%) | +0.76 GiB | 111/149 |
+| 12 (62/65 resident) | 18.6 t/s | 19.3 t/s (+4%) | +0.59 GiB | 111/149 |
+| 8 (42/65) | 0.80 t/s | **2.39 t/s** (3.0x) | +1.13 GiB | 111/149 |
+| 0 (fully streamed) | 0.67 t/s | **2.02 t/s** (3.0x) | +1.12 GiB | 110/151 |
 
 - **`--llama-mtp` is the largest decode lever under streaming.** Every
   forward pass re-reads the streamed weights; MTP drafts several tokens
@@ -215,8 +216,13 @@ Measured on the Arc Pro B70 (Qwen3.8-27B UD-Q4_K_S, ctx 4096, KV q8_0,
   in their slots and decode runs at resident speed.
 - Output: the target model decides every token, but verification runs as a
   small batch, so greedy text can flip at a near-tie, like any batch-size
-  change (1 of 3 prompts here, one capitalization; the streamed and
-  resident MTP runs accept exactly the same token counts).
+  change. In the n=3 sweep, MTP text matched plain decode on 11 of 12
+  prompt/arm pairs; the miss was the fully streamed arm.
+- MTP also costs VRAM: the draft context's KV and compute buffers add
+  0.6-1.1 GiB on top of the budget, so leave that headroom.
+- `--llama-args "--spec-type ..."` is rejected next to `--llama-mtp`:
+  llama-server appends spec types instead of replacing them, so both modes
+  would run. `--spec-draft-n-max` and other draft knobs stay allowed.
 - Keeping the MTP layer resident ahead of the budget was measured and
   rejected: no gain at 0 or 8 GiB, and at 12 GiB it costs a regular layer
   (19.8 → 9.7 t/s).
