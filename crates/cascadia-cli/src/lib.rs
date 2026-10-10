@@ -2676,6 +2676,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             prompt: line,
             messages: Vec::new(),
             tools: None,
+            tool_choice: None,
             max_tokens: args.max_tokens,
             temperature: 0.0,
             logprobs: 0,

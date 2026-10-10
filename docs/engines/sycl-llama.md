@@ -107,7 +107,7 @@ one-GPU box.
 |---|---|---|
 | `--engine sycl-llama` | — | Select this engine. |
 | `--elastic` | off | `GGML_STREAM_WEIGHTS=1` on the child. Before spawn, the resolved binary (and `libggml-base*` next to it) is probed for the `GGML_STREAM_WEIGHTS` marker — a stock build fails fast with an error instead of silently running resident. The host `--elastic` interposer is NOT activated for this engine and is scrubbed from the child's environment (see below). With the default `--elastic-vram auto`, a model that fits runs at stock speed (streaming turns itself off). |
-| `--elastic-vram` | `auto` | Resident-weight VRAM budget in GiB for `--elastic`, passed as `GGML_STREAM_VRAM_MB`. `auto` = free device memory − non-streamed weights − 2× largest layer − `GGML_STREAM_RESERVE_MB`; `0` = stream every layer (maximum packing). If the whole model fits, streaming is disabled entirely (stock path, fusion back on). |
+| `--elastic-vram` | `auto` | Resident-weight VRAM budget in GiB for `--elastic`, passed as `GGML_STREAM_VRAM_MB`. `auto` = free device memory − non-streamed weights − 2× largest layer − `GGML_STREAM_RESERVE_MB`; `0` = stream every layer (maximum packing). If the whole model fits, that model streams nothing; fused ops and SYCL graphs come back on once no loaded model streams. The decision is per load: a draft model (`--llama-args "-md draft.gguf"`) that fits does not change the main model's budget, and the reverse. |
 | `--elastic-share` | — | Expected co-tenant count, forwarded as `GGML_STREAM_VRAM_SHARE` when `--elastic` is on and `--elastic-vram` is `auto`. The child then caps its automatic resident-weight budget at `min(free − overhead, (total − overhead) / N)` so N instances loaded in sequence each target a 1/N share of the card. Warns when combined with an explicit `--elastic-vram` or set without `--elastic`; `GGML_STREAM_RESIDENT_LAYERS` still wins. This is a load-time weight cap only — it does not rebalance KV cache, expert caches, or running instances. |
 | `--device` | `GPU` (run) / `CPU` (worker) | Device mapping: `GPU` → `SYCL0`, `GPU.N` → `SYCLN`, `CPU` → `--device none` + `-ngl 0`; anything else (`SYCL1`, `Vulkan0`, `SYCL0,SYCL1`) is passed verbatim. |
 | `--llama-bin` | auto | `llama-server` path. Resolution: flag > `CASCADIA_LLAMA_BIN` > `llama-server` (`llama-server.exe`) on `PATH`. |
@@ -122,7 +122,7 @@ one-GPU box.
 | `GGML_STREAM_RESERVE_MB` | `2048` | (child env) headroom `auto` leaves for KV + compute buffers. |
 | `GGML_STREAM_RESIDENT_LAYERS` | — | (child env) keep the first N layers resident directly; overrides the budget. Passed through to the child with a warning when set. |
 | `GGML_STREAM_VRAM_SHARE` | set by `--elastic-share` | (child env) co-tenant divisor for the automatic budget (strict decimal, 1..=u32::MAX; invalid values fail the load). With no flag, an ambient value passes through untouched. |
-| `GGML_STREAM_READ_THREADS` | `4` | (child env) reader-pool size for streamed fills: file reads happen on worker threads while an in-order-queue host task gates each H2D copy on the fill completing. `0` = inline reads on the dispatch thread (old behavior). |
+| `GGML_STREAM_READ_THREADS` | `4` | (child env) reader-pool size for streamed fills: file reads happen on worker threads while an in-order-queue host task gates each H2D copy on the fill completing. `0` = inline reads on the dispatch thread (old behavior). The patch clamps the value to `0..16` (negatives to 0, anything > 16 to 16). |
 | `GGML_STREAM_STAGING_BUFS` | `8` | (child env) pinned staging-ring slots per device, capped at 64. |
 | `CASCADIA_EXPERT_CACHE_MB` | `0` | (cascadia env) forwarded as `GGML_STREAM_EXPERT_CACHE_MB`: hot-expert device cache for router-aware MoE streaming (0002). |
 
@@ -198,8 +198,9 @@ Guidance:
 
 - Single-stage only (`--total 1`), one request at a time (batch=1).
 - SYCL backend only; the streaming patch is a SYCL backend feature.
-- Under `--elastic`, fused ops and SYCL graphs are disabled (correctness
-  requirement of streaming).
+- Fused ops and SYCL graphs are disabled while any loaded model streams
+  (correctness requirement of streaming); a process whose models all fit
+  keeps them.
 - KV cache is still reserved against the full `-c` context on device —
   streaming removes *weight* residency, not KV.
 - MoE expert residency is opt-in (`CASCADIA_EXPERT_CACHE_MB`); by default
@@ -221,12 +222,24 @@ Guidance:
 - Chat turns carry `role` + `content` + tool-call fields (`tool_calls`,
   `tool_call_id`, `name`) and request-level `tools` in the OpenAI wire
   form; the child runs with `--jinja` so tool calls render through the
-  model's template (a `--no-jinja` in `--llama-args` overrides). The
-  child's streamed `delta.tool_calls` fragments are re-assembled and
-  emitted as `<tool_call>` text before the final chunk, so streaming and
-  non-streaming clients get the same structured `tool_calls` the API
-  produces for other engines. Multimodal parts are not plumbed;
-  `prompt` remains the fallback for non-chat engines.
+  model's template (a `--no-jinja` in `--llama-args` overrides). `--jinja`
+  is on for *every* request, not just tool requests: every prompt renders
+  through the GGUF's embedded jinja chat template, so a model whose template
+  is broken fails at load or request time. `--llama-args "--no-jinja"` falls
+  back to llama-server's built-in template detection (tool calls are then
+  unavailable). `tool_choice` is honored: `"auto"` / `"required"`
+  are forwarded verbatim; `"none"` sends the request without `tools`
+  (llama-server would still render them into the prompt, and the model
+  then writes a call as plain text); a named choice
+  (`{"type":"function","function":{"name":N}}`) is sent as `"required"` with
+  `tools` narrowed to that one function (llama-server itself parses only the
+  string forms, silently treating an object as `"auto"`). An unknown string,
+  a malformed object, or a name absent from `tools` is rejected with a 400
+  before the request reaches the engine. The child's streamed `delta.tool_calls` fragments
+  are re-assembled and emitted as `<tool_call>` text before the final chunk,
+  so streaming and non-streaming clients get the same structured
+  `tool_calls` the API produces for other engines. Multimodal parts are not
+  plumbed; `prompt` remains the fallback for non-chat engines.
 
 ## Doctor
 

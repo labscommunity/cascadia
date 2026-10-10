@@ -206,7 +206,7 @@ fn check_sycl_llama(r: &mut Report) {
         Ok(StreamWeightsSupport::Unknown) => r.line(
             Level::Info,
             "weight streaming",
-            "could not verify (no libggml-base next to the binary)",
+            "could not verify (no libggml-base* / ggml-base*.dll next to the binary)",
         ),
         Err(e) => r.line(Level::Warn, "weight streaming", &e),
     }
