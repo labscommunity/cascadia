@@ -1137,5 +1137,152 @@
     ]
    }
   }
+ },
+ "mtp": {
+  "date": "2026-10-10",
+  "setup": "Qwen3.8-27B UD-Q4_K_S, Arc Pro B70 (SYCL1), patched llama-server (0001+0002), ctx 4096, KV q8_0, -fa on, --parallel 1; 3 chat prompts x 64 tokens, greedy, thinking off; --spec-type draft-mtp for the MTP arms. n=3 fresh server processes per arm; tps_median = median over runs of the per-run mean over prompts. peak_gib_max = max over runs of (vram_mm peak - idle) through load + generation. draft counts are summed over the 3 prompts of one run.",
+  "tokens": 64,
+  "arms": [
+   {
+    "arm": "resident",
+    "budget_mib": null,
+    "mtp": false,
+    "tps_runs": [
+     19.044,
+     19.008,
+     18.986
+    ],
+    "tps_median": 19.008,
+    "peak_gib_max": 15.38,
+    "draft_acc": 0,
+    "draft_n": 0,
+    "split": [],
+    "retries": 0
+   },
+   {
+    "arm": "resident",
+    "budget_mib": null,
+    "mtp": true,
+    "tps_runs": [
+     26.466,
+     26.478,
+     26.48
+    ],
+    "tps_median": 26.478,
+    "peak_gib_max": 16.14,
+    "draft_acc": 111,
+    "draft_n": 149,
+    "split": [],
+    "retries": 0
+   },
+   {
+    "arm": "12 GiB",
+    "budget_mib": 12288,
+    "mtp": false,
+    "tps_runs": [
+     18.577,
+     18.535,
+     18.56
+    ],
+    "tps_median": 18.56,
+    "peak_gib_max": 15.52,
+    "draft_acc": 0,
+    "draft_n": 0,
+    "split": [
+     "stream-weights: resident layers 62/65 (12265 MiB resident, 821 MiB streamed per token)"
+    ],
+    "retries": 0
+   },
+   {
+    "arm": "12 GiB",
+    "budget_mib": 12288,
+    "mtp": true,
+    "tps_runs": [
+     19.369,
+     19.096,
+     19.325
+    ],
+    "tps_median": 19.325,
+    "peak_gib_max": 16.11,
+    "draft_acc": 111,
+    "draft_n": 149,
+    "split": [
+     "stream-weights: resident layers 62/65 (12265 MiB resident, 821 MiB streamed per token)"
+    ],
+    "retries": 0
+   },
+   {
+    "arm": "8 GiB",
+    "budget_mib": 8192,
+    "mtp": false,
+    "tps_runs": [
+     0.781,
+     0.8,
+     0.805
+    ],
+    "tps_median": 0.8,
+    "peak_gib_max": 10.74,
+    "draft_acc": 0,
+    "draft_n": 0,
+    "split": [
+     "stream-weights: resident layers 42/65 (8012 MiB resident, 5074 MiB streamed per token)"
+    ],
+    "retries": 0
+   },
+   {
+    "arm": "8 GiB",
+    "budget_mib": 8192,
+    "mtp": true,
+    "tps_runs": [
+     2.385,
+     2.397,
+     2.336
+    ],
+    "tps_median": 2.385,
+    "peak_gib_max": 11.87,
+    "draft_acc": 111,
+    "draft_n": 149,
+    "split": [
+     "stream-weights: resident layers 42/65 (8012 MiB resident, 5074 MiB streamed per token)"
+    ],
+    "retries": 0
+   },
+   {
+    "arm": "0 (fully streamed)",
+    "budget_mib": 0,
+    "mtp": false,
+    "tps_runs": [
+     0.667,
+     0.666,
+     0.668
+    ],
+    "tps_median": 0.667,
+    "peak_gib_max": 3.01,
+    "draft_acc": 0,
+    "draft_n": 0,
+    "split": [
+     "stream-weights: resident layers 0/65 (0 MiB resident, 13087 MiB streamed per token)"
+    ],
+    "retries": 0
+   },
+   {
+    "arm": "0 (fully streamed)",
+    "budget_mib": 0,
+    "mtp": true,
+    "tps_runs": [
+     2.018,
+     2.017,
+     2.067
+    ],
+    "tps_median": 2.018,
+    "peak_gib_max": 4.13,
+    "draft_acc": 110,
+    "draft_n": 151,
+    "split": [
+     "stream-weights: resident layers 0/65 (0 MiB resident, 13087 MiB streamed per token)"
+    ],
+    "retries": 0
+   }
+  ]
  }
 }

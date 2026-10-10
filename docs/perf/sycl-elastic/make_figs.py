@@ -931,8 +931,70 @@ def fig9():
     save(fig, "fig9_windows.png")
 
 
+# ---------------- fig17 ----------------
+def fig17():
+    m = DATA["mtp"]
+    arms = []
+    for a in m["arms"]:
+        if not a["mtp"]:
+            b = next(x for x in m["arms"] if x["arm"] == a["arm"] and x["mtp"])
+            arms.append((a, b))
+    fig = newfig(6.9)
+    header(fig, "--llama-mtp: several tokens per weight pass",
+           "Qwen3.8-27B decode with and without MTP speculative decoding "
+           "(the model's own nextn head drafts, the model verifies).\n"
+           "Each bar is the median of 3 server runs x 3 chat prompts x "
+           f"{m['tokens']} tokens; whiskers span the 3 runs.")
+    ax = fig.add_axes([0.07, 0.15, 0.58, 0.60])
+    style_ax(ax)
+    ax.set_yscale("log")
+    w = 0.38
+    for i, (off, on) in enumerate(arms):
+        for x, arm, col, lab in ((i - w / 2, off, STOCK, "plain decode"),
+                                 (i + w / 2, on, ELASTIC, "--llama-mtp")):
+            med, lo, hi = arm["tps_median"], min(arm["tps_runs"]), max(arm["tps_runs"])
+            ax.bar(x, med, width=w, color=col, label=lab if i == 0 else None)
+            ax.plot([x, x], [lo, hi], color=TEXT, linewidth=1.2)
+            ax.text(x, hi * 1.12, sf(med), ha="center", va="bottom", fontsize=10.5,
+                    fontweight="bold", color=col if col == ELASTIC else TEXT)
+        gain = on["tps_median"] / off["tps_median"]
+        badge = f"{gain:.1f}x" if gain >= 1.95 else f"+{round(100 * (gain - 1))}%"
+        ax.text(i, max(on["tps_runs"] + off["tps_runs"]) * 2.1, badge, ha="center",
+                va="bottom", fontsize=11, fontweight="bold", color=BG,
+                bbox=dict(boxstyle="round,pad=0.3", facecolor=ELASTIC if gain >= 1.2 else MUTED,
+                          edgecolor="none"))
+    ax.set_xticks(range(len(arms)))
+    ax.set_xticklabels([off["arm"].replace(" (", "\n(") for off, _ in arms], fontsize=11, color=TEXT)
+    ax.set_xlabel("--elastic-vram budget", fontsize=12)
+    ax.set_ylabel("decode, tokens/s (log)", fontsize=12)
+    ax.set_ylim(0.3, 120)
+    ticks = [0.5, 1, 2, 5, 10, 20, 50]
+    ax.set_yticks(ticks)
+    ax.set_yticklabels([f"{t:g}" for t in ticks])
+    ax.yaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+    ax.legend(loc="upper right", fontsize=10, frameon=True, facecolor=PANEL, edgecolor=GRID)
+
+    axb = fig.add_axes([0.73, 0.15, 0.24, 0.60])
+    style_ax(axb)
+    axb.grid(axis="x", color=GRID, alpha=0.6)
+    axb.grid(axis="y", visible=False)
+    for i, (off, on) in enumerate(arms):
+        d = on["peak_gib_max"] - off["peak_gib_max"]
+        axb.barh(i, on["peak_gib_max"], height=0.55, color=ELASTIC)
+        axb.text(on["peak_gib_max"] + 0.4, i, f"{on['peak_gib_max']:.1f} ({d:+.2f})",
+                 va="center", fontsize=10, color=TEXT)
+    axb.set_yticks(range(len(arms)))
+    axb.set_yticklabels([off["arm"].replace(" (fully streamed)", "") for off, _ in arms], fontsize=10, color=TEXT)
+    axb.invert_yaxis()
+    axb.set_xlim(0, 30)
+    axb.set_xlabel("peak VRAM with MTP, GiB\n(delta vs plain decode)", fontsize=11)
+    axb.set_title("memory cost", fontsize=11, color=MUTED)
+    footer(fig)
+    save(fig, "fig17_mtp.png")
+
+
 if __name__ == "__main__":
-    fig0(); fig1(); fig2(); fig3(); fig4(); fig5(); fig6(); fig7(); fig8(); fig9()
+    fig0(); fig1(); fig2(); fig3(); fig4(); fig5(); fig6(); fig7(); fig8(); fig9(); fig17()
     if QC_ERRORS:
         print("\n=== QC FAILURES ===")
         for name, kind, detail in QC_ERRORS:
