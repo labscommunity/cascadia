@@ -514,19 +514,23 @@ pub fn cmd_doctor(args: DoctorArgs) -> Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 
-    fn script(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    /// Writes `body` to a script and returns it; tests run it as
+    /// `/bin/sh <script>` rather than exec()ing the file. exec() of a file
+    /// fails with ETXTBSY while ANY process holds it open for writing, and a
+    /// child forked by a parallel test inherits our write fd until its own
+    /// exec — so even a closed-at-once `fs::write` races (seen in CI).
+    fn script(body: &str) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.sh");
-        // fs::write closes the handle — exec() of a still-open-for-write
-        // file fails with ETXTBSY
         std::fs::write(&p, body).unwrap();
-        let mut perm = std::fs::metadata(&p).unwrap().permissions();
-        perm.set_mode(0o755);
-        std::fs::set_permissions(&p, perm).unwrap();
-        (dir, p)
+        let s = p.to_str().unwrap().to_string();
+        (dir, s)
+    }
+
+    fn sh() -> &'static std::path::Path {
+        std::path::Path::new("/bin/sh")
     }
 
     /// A child that writes past the ~64 KiB pipe buffer must not deadlock
@@ -535,7 +539,7 @@ mod tests {
     fn run_capturing_drains_output_larger_than_the_pipe() {
         let (_dir, f) =
             script("#!/bin/sh\nhead -c 200000 /dev/zero | tr '\\0' 'x'\necho err >&2\n");
-        let out = run_capturing(&f, "", 10).expect("large output captured");
+        let out = run_capturing(sh(), &f, 10).expect("large output captured");
         assert_eq!(out.len(), 200000);
         assert!(out.chars().all(|c| c == 'x'));
     }
@@ -548,7 +552,7 @@ mod tests {
         // the background sleep inherits stdout; the foreground exits at once
         let (_dir, f) = script("#!/bin/sh\nsleep 60 &\necho done\n");
         let t0 = Instant::now();
-        let out = run_capturing(&f, "", 10).expect("capture returned");
+        let out = run_capturing(sh(), &f, 10).expect("capture returned");
         assert_eq!(out, "done");
         assert!(t0.elapsed() < Duration::from_secs(15));
     }
@@ -559,7 +563,7 @@ mod tests {
     fn run_capturing_kills_and_reaps_on_timeout() {
         let (_dir, f) = script("#!/bin/sh\nsleep 60\n");
         let t0 = Instant::now();
-        let err = run_capturing(&f, "", 1).unwrap_err();
+        let err = run_capturing(sh(), &f, 1).unwrap_err();
         assert!(err.contains("timed out"), "{err}");
         assert!(t0.elapsed() < Duration::from_secs(10));
         std::thread::sleep(Duration::from_millis(300));
