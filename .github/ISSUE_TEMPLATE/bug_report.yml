@@ -44,7 +44,7 @@ body:
     id: openvino
     attributes:
       label: OpenVINO version (if using an OV engine)
-      placeholder: openvino_genai 2026.2.0.0
+      placeholder: "openvino_genai 2026.4.1.0 (the `OpenVINO GenAI` line of `cascadia doctor`)"
   - type: textarea
     id: logs
     attributes:

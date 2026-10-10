@@ -63,7 +63,7 @@ SDK to install.
 GPU runtime stack) — then build with the feature enabled:
 
 ```bash
-INTEL_OPENVINO_DIR=/path/to/openvino_genai_2026.2.0.0 \
+INTEL_OPENVINO_DIR=/path/to/openvino_genai_2026.4.1.0 \
   cargo build --release -p cascadia --features openvino
 ```
 

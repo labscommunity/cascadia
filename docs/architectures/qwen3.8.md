@@ -187,7 +187,7 @@ it includes prefill of the 19-token prompt and HTTP.
 
 So on this box the single-stage GenAI path is the fastest (its PagedAttention
 backend has the optimised GatedDeltaNet kernel) and works on both the
-2026.2.1 SDK the repo pins and 2026.3; the staged path is ~15 % behind on
+2026.2.1 SDK the repo pinned when this was measured and 2026.3; the staged path is ~15 % behind on
 GPU.
 
 **Why Intel's published IR throws, and the fix.** Its `openvino_tokenizer`
@@ -206,8 +206,9 @@ the Intel directory served by the same binary:
 | as published, GenAI **2026.5 nightly** Python `VLMPipeline` | creates in 9 s, generates correctly (`LLMPipeline` still rejects the template's `is undefined`) |
 
 The chat template is not the problem on Cascadia's path (the API renders it
-itself). So, until the shim is built against a 2026.4+ GenAI SDK, serve
-Intel's IR after one command with the *installed* openvino-tokenizers:
+itself). So, with a shim built against a pre-2026.4 GenAI SDK, serve
+Intel's IR after one command with the *installed* openvino-tokenizers (release
+bundles now pin 2026.4.1.0, which this table has not been re-measured on):
 
 ```bash
 convert_tokenizer /path/to/Qwen3.8-27B-int4-ov --with-detokenizer -o /path/to/Qwen3.8-27B-int4-ov
