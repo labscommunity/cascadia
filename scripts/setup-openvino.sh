@@ -13,6 +13,21 @@
 # Safe to re-run. Ubuntu 22.04 / 24.04. Other distros: see INSTALL.md.
 set -euo pipefail
 
+# The SDK release bundles ship is pinned once, as OV_VERSION in release.yml;
+# read it from there (relative to this script, so any cwd works).
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OV_VERSION="$(sed -nE 's/^[[:space:]]*OV_VERSION:[[:space:]]*"([^"]+)".*/\1/p' \
+  "$REPO_ROOT/.github/workflows/release.yml" 2>/dev/null | head -n1 || true)"
+OV_VERSION="${OV_VERSION:-<OV_VERSION from .github/workflows/release.yml>}"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  echo "Usage: scripts/setup-openvino.sh"
+  echo "Installs the Linux GPU runtime stack OpenVINO needs (apt + render group)."
+  echo "Release bundles pin OpenVINO GenAI $OV_VERSION; fetch that SDK with:"
+  echo "  python3 $REPO_ROOT/scripts/ov_sdk.py fetch $OV_VERSION --dest \$HOME/openvino/$OV_VERSION"
+  exit 0
+fi
+
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "This script targets Linux. On Windows, run scripts/setup-openvino.ps1."
   echo "On macOS there is no Intel GPU runtime to install (dev/stub use only)."
@@ -126,8 +141,8 @@ fi
 
 echo
 echo "Done. Next:"
-echo "  1. Fetch the OpenVINO GenAI SDK (2026.2+; releases bundle 2026.4.1.0) and set INTEL_OPENVINO_DIR:"
-echo "       export INTEL_OPENVINO_DIR=\"\$(python3 scripts/ov_sdk.py fetch 2026.4.1.0 --dest \$HOME/openvino/2026.4.1.0)\""
+echo "  1. Fetch the OpenVINO GenAI SDK (2026.2+; releases bundle $OV_VERSION) and set INTEL_OPENVINO_DIR:"
+echo "       export INTEL_OPENVINO_DIR=\"\$(python3 $REPO_ROOT/scripts/ov_sdk.py fetch $OV_VERSION --dest \$HOME/openvino/$OV_VERSION)\""
 echo "     (any published version works, e.g. 2026.5.0.0beta1 — see INSTALL.md)"
 echo "  2. Build:   INTEL_OPENVINO_DIR=... cargo build --release -p cascadia --features openvino"
 echo "  3. Verify:  cascadia doctor   (should list a GPU device, not just CPU)"
