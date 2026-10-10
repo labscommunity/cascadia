@@ -310,7 +310,7 @@ All flags exist on both `cascadia run` and `cascadia worker`.
 | `--llama-load-retries <N>` | `1` | — | Extra load attempts after a child exit or health timeout. |
 | `--elastic-vram <auto\|GiB>` | `auto` | `GGML_STREAM_VRAM_MB` | Resident-weight budget for `--elastic`: `auto` = free VRAM − non-streamed weights − 2× largest layer − reserve; `0` = stream every layer. |
 | `--elastic-share <N>` | — | `GGML_STREAM_VRAM_SHARE` | Expected co-tenant count for `--elastic-vram auto` (sycl-llama): caps automatic resident weights at 1/N of the card so N instances load equal shares. Ignored with an explicit `--elastic-vram` or `GGML_STREAM_RESIDENT_LAYERS`. |
-| `--llama-mtp` | off | — | Speculative decoding with the model's own MTP head (`--spec-type draft-mtp`; GGUF needs nextn layers, e.g. Qwen3.8-27B). Qwen3.8-27B on the B70: 19.0 → 26.5 t/s resident, 0.83 → 2.39 t/s at `--elastic-vram 8`, 0.67 → 2.02 t/s fully streamed. |
+| `--llama-mtp` | off | — | Speculative decoding with the model's own MTP head (`--spec-type draft-mtp`; GGUF needs nextn layers, e.g. Qwen3.8-27B). Qwen3.8-27B on the B70: 19.0 → 26.5 t/s resident, 0.80 → 2.39 t/s at `--elastic-vram 8`, 0.67 → 2.02 t/s fully streamed. |
 | — | `0` | `CASCADIA_EXPERT_CACHE_MB` → `GGML_STREAM_EXPERT_CACHE_MB` | MiB of hot-expert residency on MoE models under `--elastic`. Default 0: only the experts the router selects are read per token (automatic, any MoE); a budget pins the hottest expert slices on device. |
 
 ### Other
