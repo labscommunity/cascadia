@@ -711,6 +711,12 @@ impl LlamaCppBuilder {
             // tool calls only render through the jinja chat template; a
             // --no-jinja in --llama-args still wins (last flag applies)
             .arg("--jinja")
+            // the engine runs one task at a time; llama-server's default
+            // (-1 = auto) opens 4 slots, and with --llama-mtp each slot's
+            // draft state costs VRAM no request can use. --llama-args
+            // "-np N" still wins (the last flag applies)
+            .arg("--parallel")
+            .arg("1")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         scrub_child_env(&mut cmd, self.cfg.elastic, self.cfg.elastic_share);
