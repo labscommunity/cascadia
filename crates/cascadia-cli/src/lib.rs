@@ -1924,7 +1924,7 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
                 .filter(|a| !a.is_empty())
                 .cloned()
                 .collect();
-            validate_extra_args(&extra_args).map_err(|e| anyhow!("{e}"))?;
+            validate_extra_args(&extra_args, args.llama_mtp).map_err(|e| anyhow!("{e}"))?;
             Ok(Box::new(LlamaCppBuilder::new(LlamaCppConfig {
                 llama_bin: bin,
                 model: args.model.clone().into(),

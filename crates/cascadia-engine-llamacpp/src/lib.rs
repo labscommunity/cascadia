@@ -629,12 +629,27 @@ const RESERVED_LLAMA_ARGS: &[(&str, &str)] = &[
 
 /// Reject `extra_args` tokens that shadow engine-owned flags — a token equal
 /// to a reserved flag or of the `<flag>=<value>` form.
-pub fn validate_extra_args(extra_args: &[String]) -> Result<(), String> {
+pub fn validate_extra_args(extra_args: &[String], mtp: bool) -> Result<(), String> {
     for arg in extra_args {
+        // llama-server rewrites '_' to '-' in long flags (`--ctx_size` is
+        // `--ctx-size`), so compare in that form
+        let norm = if arg.starts_with("--") {
+            arg.replace('_', "-")
+        } else {
+            arg.clone()
+        };
         for (reserved, hint) in RESERVED_LLAMA_ARGS {
-            if arg == reserved || arg.starts_with(&format!("{reserved}=")) {
+            if norm == *reserved || norm.starts_with(&format!("{reserved}=")) {
                 return Err(format!("--llama-args '{arg}' shadows '{reserved}': {hint}"));
             }
+        }
+        // llama-server appends every --spec-type value (it does not replace
+        // the earlier one), so a raw spec type would run next to MTP
+        if mtp && (norm == "--spec-type" || norm.starts_with("--spec-type=")) {
+            return Err(format!(
+                "--llama-args '{arg}' adds a speculative type next to --llama-mtp; \
+                 llama-server would run both. Drop one of them"
+            ));
         }
     }
     Ok(())
@@ -2113,27 +2128,54 @@ mod tests {
             "-c",
             "--ctx-size",
         ] {
-            let err = validate_extra_args(&[arg.to_string()]).unwrap_err();
+            let err = validate_extra_args(&[arg.to_string()], false).unwrap_err();
             assert!(err.contains(arg), "{err}");
         }
         // the <flag>=<value> form shadows just the same
-        let err = validate_extra_args(&["--port=1".to_string()]).unwrap_err();
+        let err = validate_extra_args(&["--port=1".to_string()], false).unwrap_err();
         assert!(err.contains("--port"), "{err}");
-        let err = validate_extra_args(&["-c=8192".to_string()]).unwrap_err();
+        let err = validate_extra_args(&["-c=8192".to_string()], false).unwrap_err();
         assert!(err.contains("--llama-ctx"), "{err}");
     }
 
     #[test]
     fn extra_args_allows_non_reserved() {
-        assert!(validate_extra_args(&[
-            "-ctk".into(),
-            "q8_0".into(),
-            "-fa".into(),
-            "on".into(),
-            "--no-jinja".into(),
-        ])
+        assert!(validate_extra_args(
+            &[
+                "-ctk".into(),
+                "q8_0".into(),
+                "-fa".into(),
+                "on".into(),
+                "--no-jinja".into(),
+            ],
+            false
+        )
         .is_ok());
-        assert!(validate_extra_args(&[]).is_ok());
+        assert!(validate_extra_args(&[], false).is_ok());
+    }
+
+    #[test]
+    fn extra_args_underscore_spelling_is_still_reserved() {
+        // llama-server reads `--ctx_size` as `--ctx-size`
+        let err = validate_extra_args(&["--ctx_size".to_string()], false).unwrap_err();
+        assert!(err.contains("--llama-ctx"), "{err}");
+        let err = validate_extra_args(&["--n_gpu_layers=10".to_string()], false).unwrap_err();
+        assert!(err.contains("--llama-ngl"), "{err}");
+    }
+
+    #[test]
+    fn raw_spec_type_conflicts_only_with_mtp() {
+        let sep = vec!["--spec-type".to_string(), "ngram-mod".to_string()];
+        let eq = vec!["--spec-type=ngram-mod".to_string()];
+        let under = vec!["--spec_type".to_string(), "draft-simple".to_string()];
+        for args in [&sep, &eq, &under] {
+            let err = validate_extra_args(args, true).unwrap_err();
+            assert!(err.contains("--llama-mtp"), "{err}");
+            // without --llama-mtp a raw spec type is the user's own choice
+            assert!(validate_extra_args(args, false).is_ok(), "{args:?}");
+        }
+        // other speculative knobs tune MTP and stay allowed
+        assert!(validate_extra_args(&["--spec-draft-n-max".into(), "4".into()], true).is_ok());
     }
 }
 
