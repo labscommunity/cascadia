@@ -993,8 +993,106 @@ def fig17():
     save(fig, "fig17_mtp.png")
 
 
+# ---------------- fig18 ----------------
+def fig18():
+    pts = DATA["mtp_draft_n"]["points"]
+    base = {a["arm"]: a["tps_median"] for a in DATA["mtp"]["arms"] if not a["mtp"]}
+    fig = newfig(6.4)
+    header(fig, "How many tokens to draft: --spec-draft-n-max",
+           "--llama-mtp on Qwen3.8-27B, speed relative to plain decode at the "
+           "same budget (median of 2 runs).\nResident peaks at 2-3 drafted tokens; "
+           "streamed keeps gaining to 6, since each extra accepted token\nsaves a "
+           "whole weight pass. Set it with --llama-args \"--spec-draft-n-max N\" "
+           "(default 3).")
+    ax = fig.add_axes([0.08, 0.14, 0.62, 0.58])
+    style_ax(ax)
+    for arm, col in (("resident", BLUE), ("8 GiB", ELASTIC)):
+        xs = [p["n_max"] for p in pts if p["arm"] == arm]
+        ys = [p["tps_median"] / base[arm] for p in pts if p["arm"] == arm]
+        ax.plot(xs, ys, marker="o", color=col, linewidth=2.2, markersize=7,
+                label=f"{arm} (plain {base[arm]:.2f} t/s)")
+        for x, y in zip(xs, ys):
+            ax.text(x + 0.12, y + 0.09, f"{y:.2f}x", ha="left", fontsize=10, color=col,
+                    bbox=REF_LABEL_BOX)
+    ax.axhline(1.0, color=MUTED, linestyle="--", linewidth=1)
+    ax.axvline(3, color=AMBER, linestyle=":", linewidth=1.2)
+    ax.text(3.08, 0.55, "default 3", color=AMBER, fontsize=10, bbox=REF_LABEL_BOX)
+    ax.set_xticks([1, 2, 3, 4, 6])
+    ax.set_xlabel("--spec-draft-n-max", fontsize=12)
+    ax.set_ylabel("speed vs plain decode", fontsize=12)
+    ax.set_ylim(0.4, 4.0)
+    ax.legend(loc="upper left", fontsize=10, frameon=True, facecolor=PANEL, edgecolor=GRID)
+
+    axb = fig.add_axes([0.78, 0.14, 0.19, 0.58])
+    style_ax(axb)
+    xs = [p["n_max"] for p in pts if p["arm"] == "8 GiB"]
+    acc = [100 * p["draft_acc"] / p["draft_n"] for p in pts if p["arm"] == "8 GiB"]
+    axb.bar(range(len(xs)), acc, color=MUTED, width=0.6)
+    for i, a in enumerate(acc):
+        axb.text(i, a + 2, f"{a:.0f}%", ha="center", fontsize=9.5, color=TEXT)
+    axb.set_xticks(range(len(xs)))
+    axb.set_xticklabels([str(x) for x in xs])
+    axb.set_ylim(0, 110)
+    axb.set_xlabel("--spec-draft-n-max", fontsize=11)
+    axb.set_title("drafted tokens accepted", fontsize=11, color=MUTED)
+    footer(fig)
+    save(fig, "fig18_mtp_draft_n.png")
+
+
+# ---------------- fig19 ----------------
+def fig19():
+    m = DATA["mtp_cpu_gpu"]
+    labels = {"gpu-resident": "GPU, resident", "gpu-streamed-8": "GPU, 8 GiB budget\n(streamed)",
+              "cpu": "CPU only\n(--device CPU)"}
+    names = [a["arm"] for a in m["arms"] if not a["mtp"]]
+    get = lambda n, mtp: next(a for a in m["arms"] if a["arm"] == n and a["mtp"] == mtp)
+    fig = newfig(7.2)
+    header(fig, "--llama-mtp through cascadia run: GPU and CPU",
+           "Qwen3.8-27B, end-to-end tokens/s seen by the client (3 chat prompts x 64 "
+           "tokens, median of 3 cascadia runs).\nHost cost = CPU cores busy in llama-server "
+           "while generating; peak device memory = GPU vram_mm, peak host memory = RSS.")
+    panels = [("tokens/s (client)", "wall_tps", sf, 0.04),
+              ("CPU cores busy", "cores", lambda v: f"{v:.1f}", 0.265),
+              ("peak GPU memory, GiB", "peak_vram_gib", lambda v: f"{v:.1f}", 0.49),
+              ("peak host RSS, GiB", "peak_rss_gib", lambda v: f"{v:.1f}", 0.715)]
+    for title, key, fmt, x0 in panels:
+        ax = fig.add_axes([x0 + 0.09, 0.16, 0.15, 0.56])
+        style_ax(ax)
+        ax.grid(axis="x", color=GRID, alpha=0.6)
+        ax.grid(axis="y", visible=False)
+        top = 0
+        for i, n in enumerate(names):
+            off, on = get(n, False), get(n, True)
+            top = max(top, off[key], on[key])
+            ax.barh(i + 0.19, off[key], height=0.36, color=STOCK, label="plain" if i == 0 else None)
+            ax.barh(i - 0.19, on[key], height=0.36, color=ELASTIC, label="--llama-mtp" if i == 0 else None)
+        for i, n in enumerate(names):
+            off, on = get(n, False), get(n, True)
+            if key == "peak_vram_gib" and off[key] == 0:
+                ax.text(top * 0.03, i, "no GPU", va="center", fontsize=9.5, color=MUTED)
+                continue
+            ax.text(off[key] + top * 0.03, i + 0.19, fmt(off[key]), va="center", fontsize=9.5, color=TEXT)
+            if key == "wall_tps":
+                d = f"{on[key] / off[key]:.2f}x"
+            else:
+                diff = on[key] - off[key]
+                d = "±0" if abs(diff) < 0.05 else f"{diff:+.1f}"
+            ax.text(on[key] + top * 0.03, i - 0.19, f"{fmt(on[key])}  ({d})", va="center",
+                    fontsize=9.5, color=ELASTIC, fontweight="bold")
+        ax.set_xlim(0, top * 1.75)
+        ax.set_yticks(range(len(names)))
+        ax.set_yticklabels([labels[n] for n in names] if x0 < 0.1 else ["" for _ in names],
+                           fontsize=10, color=TEXT)
+        ax.invert_yaxis()
+        ax.set_title(title, fontsize=11, color=MUTED)
+        if x0 < 0.1:
+            ax.legend(loc="lower right", fontsize=9, frameon=True, facecolor=PANEL, edgecolor=GRID)
+    footer(fig)
+    save(fig, "fig19_mtp_cpu_gpu.png")
+
+
 if __name__ == "__main__":
-    fig0(); fig1(); fig2(); fig3(); fig4(); fig5(); fig6(); fig7(); fig8(); fig9(); fig17()
+    fig0(); fig1(); fig2(); fig3(); fig4(); fig5(); fig6(); fig7(); fig8(); fig9(); fig17(); fig18(); fig19()
     if QC_ERRORS:
         print("\n=== QC FAILURES ===")
         for name, kind, detail in QC_ERRORS:
