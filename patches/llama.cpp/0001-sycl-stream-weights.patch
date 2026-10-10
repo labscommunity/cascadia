@@ -1,8 +1,8 @@
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index cc3f8cd36..d47d397a8 100644
+index cc3f8cd36..df29440eb 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -432,6 +432,43 @@ extern "C" {
+@@ -432,6 +432,50 @@ extern "C" {
      GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
      GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
  
@@ -20,13 +20,20 @@ index cc3f8cd36..d47d397a8 100644
 +        struct ggml_backend_buffer * buffer;  // owning buffer (per-model cleanup)
 +    };
 +
++    // GGML_STREAM_WEIGHTS is set: loads plan streaming. What a given load
++    // streams is decided per load by its plan below, never process-wide
 +    GGML_API int  ggml_stream_weights_enabled(void);
++    // at least one streamed tensor is registered by a live model: the
++    // compute path must stream (fused ops and SYCL graphs off). Goes false
++    // again once the last streaming model is freed
++    GGML_API int  ggml_stream_active(void);
 +    GGML_API bool ggml_stream_is_weight(const struct ggml_tensor * tensor);
 +    GGML_API bool ggml_stream_is_streamable(const struct ggml_tensor * tensor);
-+    // keep layers < n resident (partial streaming); GGML_STREAM_RESIDENT_LAYERS wins
-+    GGML_API void ggml_stream_set_resident_layers(int n);
-+    // turn streaming off entirely (model fits); re-enables fusion/graphs
-+    GGML_API void ggml_stream_disable(void);
++    // this load keeps layers < n resident: drops them from the plan
++    GGML_API void ggml_stream_plan_keep_resident(int n);
++    // this load streams nothing (model fits): empties the plan. Models
++    // already streaming are not affected
++    GGML_API void ggml_stream_plan_clear(void);
 +    // the loader plans which tensors stream (by name, before buffers are
 +    // allocated); only planned tensors get a zero-size allocation. A tensor
 +    // the loader never saw (a LoRA adapter, a control vector) is allocated
@@ -47,13 +54,14 @@ index cc3f8cd36..d47d397a8 100644
  }
  #endif
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index f6fb91798..19e5cd07f 100644
+index f6fb91798..7ee909217 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -20,6 +20,17 @@
+@@ -20,6 +20,18 @@
  #include <stdlib.h>
  #include <string.h>
  #include <algorithm>
++#include <atomic>
 +#include <mutex>
 +#include <unordered_map>
 +#include <unordered_set>
@@ -68,7 +76,7 @@ index f6fb91798..19e5cd07f 100644
  #include <vector>
  
  #ifdef __APPLE__
-@@ -2429,3 +2440,192 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size)
+@@ -2429,3 +2441,200 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size)
      GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
      return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
  }
@@ -109,34 +117,37 @@ index f6fb91798..19e5cd07f 100644
 +    return (int) l;
 +}
 +
-+static int g_stream_resident = 0;
-+static bool g_stream_disabled = false;
-+
-+void ggml_stream_set_resident_layers(int n) {
-+    g_stream_resident = n;
-+}
-+
-+void ggml_stream_disable(void) {
-+    g_stream_disabled = true;
-+}
-+
-+static int ggml_stream_n_resident(void) {
-+    static int env = -2;
-+    if (env == -2) {
-+        const char * e = getenv("GGML_STREAM_RESIDENT_LAYERS");
-+        env = e ? atoi(e) : -1;
-+    }
-+    return env >= 0 ? env : g_stream_resident;
-+}
-+
++// GGML_STREAM_WEIGHTS only arms streaming for the process. Every decision
++// that depends on a model (which layers stay resident, whether it fits) is
++// recorded in that load's plan, and the compute path keys off live
++// registrations: a draft model or a server-side model switch must not
++// inherit another load's decision
 +int ggml_stream_weights_enabled(void) {
-+    return ggml_stream_env_flag() && !g_stream_disabled;
++    return ggml_stream_env_flag();
 +}
 +
 +static std::unordered_map<const ggml_tensor *, ggml_stream_src> g_stream_map;
 +static std::mutex g_stream_mu;
 +static std::unordered_set<std::string> g_stream_planned;
 +static std::unordered_map<int, int> g_stream_fds;
++// g_stream_map.size(), readable without the lock from the dispatch path
++static std::atomic<int> g_stream_n_registered{0};
++
++int ggml_stream_active(void) {
++    return ggml_stream_env_flag() && g_stream_n_registered.load(std::memory_order_acquire) > 0;
++}
++
++void ggml_stream_plan_keep_resident(int n) {
++    std::lock_guard<std::mutex> lock(g_stream_mu);
++    for (auto it = g_stream_planned.begin(); it != g_stream_planned.end();) {
++        it = ggml_stream_parse_layer(it->c_str()) < n ? g_stream_planned.erase(it) : std::next(it);
++    }
++}
++
++void ggml_stream_plan_clear(void) {
++    std::lock_guard<std::mutex> lock(g_stream_mu);
++    g_stream_planned.clear();
++}
 +
 +void ggml_stream_plan(const char * name) {
 +    if (name == NULL) {
@@ -153,7 +164,6 @@ index f6fb91798..19e5cd07f 100644
 +    // server-side model switch can load while another model streams) - the
 +    // per-buffer purge in ggml_stream_purge_buffer owns that cleanup
 +    g_stream_planned.clear();
-+    g_stream_disabled = false;
 +    // g_stream_fds is only the load-time orig->dup dedupe: the loader's
 +    // source fds die with it, so any entry left from a previous load maps
 +    // a dead number that a new model's file may legitimately reuse. The
@@ -186,6 +196,7 @@ index f6fb91798..19e5cd07f 100644
 +            }
 +        }
 +        it = g_stream_map.erase(it);
++        g_stream_n_registered.fetch_sub(1, std::memory_order_release);
 +    }
 +}
 +
@@ -222,10 +233,9 @@ index f6fb91798..19e5cd07f 100644
 +           ggml_nbytes(tensor) >= ggml_stream_min_bytes();
 +}
 +
++// the plan already excludes this load's resident layers
 +bool ggml_stream_is_weight(const ggml_tensor * tensor) {
-+    return ggml_stream_is_streamable(tensor) &&
-+           ggml_stream_parse_layer(tensor->name) >= ggml_stream_n_resident() &&
-+           ggml_stream_is_planned(tensor);
++    return ggml_stream_is_streamable(tensor) && ggml_stream_is_planned(tensor);
 +}
 +
 +void ggml_stream_register(ggml_tensor * tensor, const void * host_ptr, int fd, size_t file_off) {
@@ -234,13 +244,19 @@ index f6fb91798..19e5cd07f 100644
 +        return;
 +    }
 +    std::lock_guard<std::mutex> lock(g_stream_mu);
++    // index within (owning buffer, layer): another model's registrations
++    // must not shift this buffer's slot layout
 +    int widx = 0;
 +    for (auto & kv : g_stream_map) {
-+        if (kv.second.layer == layer) {
++        if (kv.second.layer == layer && kv.second.buffer == tensor->buffer && kv.first != tensor) {
 +            widx++;
 +        }
 +    }
++    const bool fresh = g_stream_map.find(tensor) == g_stream_map.end();
 +    g_stream_map[tensor] = { host_ptr, fd, file_off, layer, widx, tensor->buffer };
++    if (fresh) {
++        g_stream_n_registered.fetch_add(1, std::memory_order_release);
++    }
 +}
 +
 +const ggml_stream_src * ggml_stream_find(const ggml_tensor * tensor) {
@@ -262,7 +278,7 @@ index f6fb91798..19e5cd07f 100644
 +    return n;
 +}
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index d1456a867..a617d69cb 100644
+index d1456a867..1f8352b40 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
 @@ -18,8 +18,10 @@
@@ -1075,7 +1091,7 @@ index d1456a867..a617d69cb 100644
 +
  static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
      ggml_sycl_set_main_device(sycl_ctx->device);
-+    const bool stream_weights = ggml_stream_weights_enabled();
++    const bool stream_weights = ggml_stream_active();
 +    const uint64_t graph_seq = stream_weights ? ++g_stream_graph_seq : 0;
 +    int cur_layer = -1;
 +    int prefetch_j = 0;
@@ -1139,7 +1155,7 @@ index d1456a867..a617d69cb 100644
  #ifdef GGML_SYCL_GRAPH
      bool use_sycl_graph = false;
 -    if (g_ggml_sycl_enable_graph) {
-+    if (g_ggml_sycl_enable_graph && !ggml_stream_weights_enabled()) {
++    if (g_ggml_sycl_enable_graph && !ggml_stream_active()) {
          use_sycl_graph = check_graph_compatibility(cgraph);
      }
      if (use_sycl_graph) {
@@ -1201,7 +1217,7 @@ index 5c5e97fbc..69ae87c03 100644
              const auto & mapping = mappings.at(weight->idx);
              ggml_backend_buffer_t buf_mmap = nullptr;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index c81005505..05719242a 100644
+index c81005505..b395f8217 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -1264,6 +1264,27 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
@@ -1232,18 +1248,20 @@ index c81005505..05719242a 100644
  bool llama_model_base::load_tensors(llama_model_loader & ml) {
      const auto & split_mode   = params.split_mode;
      const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
-@@ -1558,6 +1579,116 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1558,6 +1579,119 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
      ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
      pimpl->mappings.reserve(ml.mappings.size());
  
 +    // stream-weights: decide how many leading layers stay resident before
 +    // buffers are allocated (alloc sizes depend on it). explicit
-+    // GGML_STREAM_RESIDENT_LAYERS wins over the GGML_STREAM_VRAM_MB budget
++    // GGML_STREAM_RESIDENT_LAYERS wins over the GGML_STREAM_VRAM_MB budget.
++    // the plan is per load: reset it first so a load that plans nothing
++    // (no devices) cannot inherit the previous load's tensor names
++    ggml_stream_plan_reset();
 +    if (ggml_stream_weights_enabled() && !devices.empty()) {
 +        // per-layer streamable bytes, evaluated with everything streamable
 +        std::map<int, size_t> s_layer;
 +        size_t total_weights = 0;
-+        ggml_stream_plan_reset();
 +        for (const auto & it : ml.weights_map) {
 +            const size_t nb = ggml_nbytes(it.second.tensor);
 +            total_weights += nb;
@@ -1325,15 +1343,16 @@ index c81005505..05719242a 100644
 +                resident += s_layer[l];
 +                n_res++;
 +            }
-+            ggml_stream_set_resident_layers(n_res);
 +        }
 +        // fprintf on purpose: the server filters LLAMA_LOG_INFO at default
 +        // verbosity, and callers need this split on stderr unconditionally
 +        if (n_res >= (int) n_layer_all) {
-+            ggml_stream_disable();
++            // this load streams nothing; other live models keep streaming
++            ggml_stream_plan_clear();
 +            fprintf(stderr, "stream-weights: model fits (%.0f MiB), streaming disabled\n",
 +                    s_total / 1048576.0);
 +        } else {
++            ggml_stream_plan_keep_resident(n_res);
 +            fprintf(stderr, "stream-weights: resident layers %d/%d (%.0f MiB resident, %.0f MiB streamed per token)\n",
 +                    n_res, (int) n_layer_all, resident / 1048576.0,
 +                    (s_total - resident) / 1048576.0);

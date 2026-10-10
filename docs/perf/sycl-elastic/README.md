@@ -64,6 +64,24 @@ and the suspend/resume and driver-vmem shapes that could be):
   `timings.predicted_per_second` / `prompt_per_second` (not end-to-end).
 - **VRAM:** kernel `vram_mm` under debugfs, sampled ~3 Hz during
   load + decode; peak reported.
+- **Greedy parity:** compare streamed arms against an *unfused* resident
+  reference (`GGML_SYCL_ENABLE_FUSION=0`; streaming turns fusion off, and
+  fused kernels change numerics), and run **both** arms with
+  `GGML_SYCL_ENABLE_DNN=0 GGML_SYCL_ENABLE_OPT=0`. Two upstream effects
+  otherwise make the *reference* move:
+  - oneDNN's fp16 prefill GEMM is not run-to-run deterministic on this
+    stack; an unpatched build at the pinned base flips its own greedy
+    output at near-ties (Qwen1.5-MoE, top-2 gap 0.006).
+  - resident MoE experts are reordered in place on the first single-token
+    MoE op, so later prefills in the same server use the reorder kernels
+    while streamed expert slices stay in file layout. The resident output
+    then depends on request order (a fresh server matches the streamed
+    arm on whichever prompt it answers first).
+
+  Measured 2026-10-10 (3 prompts x 64 tokens): 27B at 0/65 and 62/65
+  resident matches byte for byte with oneDNN off alone; 35B-A3B at 0/40 and
+  20/40 resident matches with both knobs off; Qwen1.5-MoE logprobs are
+  float-equal with oneDNN off.
 - **Hunter laptop (fig6 only):** Core Ultra 9 285H (Arc 140T iGPU, RTX 5060
   Laptop, AI Boost NPU), 32 GB RAM, Windows 11, OpenVINO GenAI 2026.4 via
   `ov-genai`; 48 tokens after an 8-token warmup.
