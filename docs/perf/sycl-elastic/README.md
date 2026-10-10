@@ -70,7 +70,7 @@ pinned host memory computed in place: [`placement-b390.md`](placement-b390.md).
   resident matches byte for byte with oneDNN off alone; 35B-A3B at 0/40 and
   20/40 resident matches with both knobs off; Qwen1.5-MoE logprobs are
   float-equal with oneDNN off.
-- **Hunter laptop (fig6 only):** Core Ultra 9 285H (Arc 140T iGPU, RTX 5060
+- **Laptop (fig6 only):** Core Ultra 9 285H (Arc 140T iGPU, RTX 5060
   Laptop, AI Boost NPU), 32 GB RAM, Windows 11, OpenVINO GenAI 2026.4 via
   `ov-genai`; 48 tokens after an 8-token warmup.
 - **Windows (fig9):** Core Ultra X7 358H (Arc B390 iGPU, 16.4 GiB device
