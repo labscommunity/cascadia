@@ -999,11 +999,10 @@ def fig18():
     base = {a["arm"]: a["tps_median"] for a in DATA["mtp"]["arms"] if not a["mtp"]}
     fig = newfig(6.4)
     header(fig, "How many tokens to draft: --spec-draft-n-max",
-           "--llama-mtp on Qwen3.8-27B, speed relative to plain decode at the "
-           "same budget (median of 2 runs).\nResident peaks at 2-3 drafted tokens; "
-           "streamed keeps gaining to 6, since each extra accepted token\nsaves a "
-           "whole weight pass. Set it with --llama-args \"--spec-draft-n-max N\" "
-           "(default 3).")
+           "--llama-mtp on Qwen3.8-27B, speed relative to plain decode at the same budget "
+           "(median of 2 runs).\nServer decode-only t/s, excludes prompt processing. "
+           "Resident peaks at 2-3 drafted tokens; streamed\nkeeps gaining to 6. "
+           "Set with --llama-args \"--spec-draft-n-max N\" (default 3).")
     ax = fig.add_axes([0.08, 0.14, 0.62, 0.58])
     style_ax(ax)
     for arm, col in (("resident", BLUE), ("8 GiB", ELASTIC)):
