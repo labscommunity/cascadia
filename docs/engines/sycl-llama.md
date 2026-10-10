@@ -148,6 +148,15 @@ free the child early; on Windows every child is assigned to a
 `KILL_ON_JOB_CLOSE` Job Object. An orphaned llama-server can't hold
 VRAM or its loopback port.
 
+The reverse also holds: if the *child* dies mid-session (driver reset,
+OOM kill), the engine brings it back instead of failing every later
+request. The next queued task triggers a reload on a fresh port under
+the same `--llama-load-timeout` / `--llama-load-retries` policy and waits
+on progress markers while the model reloads; a task in flight when the
+child exits still fails with `llama-server exited mid-task`. When the
+reload itself fails, that task fails with `llama-server respawn failed`
+and the next one gets a fresh attempt.
+
 Sampling knobs (`top_p`, `top_k`, `seed`, `frequency_penalty`,
 `presence_penalty`, `stop`) are forwarded to the child only when they differ
 from the defaults.
@@ -343,6 +352,10 @@ oneAPI runtime), reports the weight-streaming preflight result, and lists
   correlate with xe copy-engine resets: check
   `dmesg | grep -i 'engine reset'`. The final error includes the last ~20
   child stderr lines.
+- **`llama-server respawn failed: ...`** — the child died mid-session and
+  the automatic reload exhausted its attempts; the failing task errors but
+  the engine keeps trying for the next request. The embedded message is the
+  load failure (usually a child exit or health timeout; see above).
 - **intermittent load hang (child never becomes healthy)** — on this xe
   host, model load occasionally stalls at buffer clear
   (`dmesg` shows `Engine memory CAT error ... class=bcs` followed by a

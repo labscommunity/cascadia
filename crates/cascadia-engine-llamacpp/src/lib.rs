@@ -107,13 +107,14 @@ pub struct LlamaCppConfig {
     /// Experimental placement: layer tensors whose names match this regex
     /// live in the backend's pinned HOST buffer and the GPU computes on them
     /// in place (`-ot '<regex>=SYCL_Host'`, with mmap off so the loader
-    /// honours the host buffer). Needs a llama-server built with
-    /// `patches/llama.cpp/0003-sycl-host-buffer-compute.patch`. On a
-    /// discrete card this reads the overflow over the link every token with
-    /// stable pointers (fused ops and graphs stay on) instead of streaming
-    /// it through a staging copy; on a UMA iGPU it is slower than device
-    /// placement and frees no device-pool memory (see
-    /// `docs/perf/sycl-elastic/placement-b390.md`).
+    /// honours the host buffer). Engine plumbing only — the
+    /// `--llama-host-layers` flag and the llama.cpp host-buffer-compute
+    /// patch it needs land with the stacked follow-up PR; a stock child
+    /// ignores the override. On a discrete card this reads the overflow
+    /// over the link every token with stable pointers (fused ops and
+    /// graphs stay on) instead of streaming it through a staging copy;
+    /// on a UMA iGPU it is slower than device placement and frees no
+    /// device-pool memory.
     pub host_layers: Option<String>,
     /// Speculative decoding with the model's own MTP (nextn) head:
     /// `--spec-type draft-mtp` on the child. The target model verifies every
@@ -191,9 +192,11 @@ fn spawn_on_parent_thread(cmd: Command) -> std::io::Result<Child> {
             .spawn(move || {
                 while let Ok((mut cmd, reply)) = rx.recv() {
                     let r = cmd.spawn();
-                    // caller went away; don't leak the child
+                    // caller went away; kill + reap the child, a bare kill
+                    // would still leave a zombie
                     if let Err(std::sync::mpsc::SendError(Ok(mut c))) = reply.send(r) {
                         let _ = c.kill();
+                        let _ = c.wait();
                     }
                 }
             })
@@ -209,7 +212,20 @@ fn spawn_on_parent_thread(cmd: Command) -> std::io::Result<Child> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn arm_death_guard(_cmd: &mut Command) {}
+fn arm_death_guard(_cmd: &mut Command) {
+    // Windows ties the child to a kill-on-close Job Object after spawn
+    // (ChildJob). Other unixes have no portable parent-death primitive, so
+    // there is no guard there — warn once rather than orphan silently.
+    #[cfg(not(windows))]
+    {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "sycl-llama: no parent-death guard on this platform; a killed cascadia may orphan llama-server"
+            );
+        }
+    }
+}
 
 /// Windows half of the death guard: the job the child is assigned to after
 /// spawn. Keeping the handle in the engine ties the child's life to ours.
@@ -485,10 +501,30 @@ pub enum StreamWeightsSupport {
     Unknown,
 }
 
+/// Scan a file for a byte marker without reading it whole — the probe
+/// targets are hundred-MB shared libraries. The tail of each block is
+/// carried into the next scan window so a marker may straddle boundaries.
 fn file_contains(path: &Path, needle: &[u8]) -> bool {
-    std::fs::read(path)
-        .map(|b| b.windows(needle.len()).any(|w| w == needle))
-        .unwrap_or(false)
+    if needle.is_empty() {
+        return true;
+    }
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let keep = needle.len() - 1;
+    let mut buf = vec![0u8; keep + (1 << 20)];
+    loop {
+        let n = match f.read(&mut buf[keep..]) {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => n,
+        };
+        let end = keep + n;
+        if buf[..end].windows(needle.len()).any(|w| w == needle) {
+            return true;
+        }
+        buf.copy_within(end - keep..end, 0);
+    }
 }
 
 /// Shared-library names that may carry the streaming markers beside the
@@ -655,59 +691,51 @@ pub fn validate_extra_args(extra_args: &[String], mtp: bool) -> Result<(), Strin
     Ok(())
 }
 
-/// Builder: spawns and readiness-checks the llama-server child.
-pub struct LlamaCppBuilder {
-    cfg: LlamaCppConfig,
-    port: u16,
-    child: Option<Child>,
-    /// Windows: the kill-on-close job the child is assigned to at spawn;
-    /// handed to the engine with the child.
-    #[cfg(windows)]
-    child_job: Option<ChildJob>,
-    stderr_tail: StderrTail,
-    stream_lines: StreamLines,
-    stderr_drain: Option<std::thread::JoinHandle<()>>,
+/// Pick a free loopback port by binding :0 and dropping the listener.
+fn pick_port() -> EngineResult<u16> {
+    let l = TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| EngineError::Backend(format!("port probe: {e}")))?;
+    Ok(l.local_addr().unwrap().port())
 }
 
-impl LlamaCppBuilder {
-    pub fn new(cfg: LlamaCppConfig) -> Self {
-        Self {
-            cfg,
-            port: 0,
-            child: None,
-            #[cfg(windows)]
-            child_job: None,
-            stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
-            stream_lines: Arc::new(Mutex::new(Vec::new())),
-            stderr_drain: None,
-        }
-    }
+/// A spawned llama-server child: the port it listens on, the drainer
+/// thread consuming its stderr, and (Windows) the kill-on-close job.
+/// Owns the process lifecycle — `kill` on drop. Shared by the builder's
+/// first spawn and the engine's respawn after a mid-session crash.
+struct SpawnedChild {
+    port: u16,
+    child: Child,
+    stderr_drain: Option<std::thread::JoinHandle<()>>,
+    /// Windows: the kill-on-close job the child is assigned to at spawn
+    /// (see `ChildJob`).
+    #[cfg(windows)]
+    job: Option<ChildJob>,
+}
 
-    /// Pick a free loopback port by binding :0 and dropping the listener.
-    fn pick_port() -> EngineResult<u16> {
-        let l = TcpListener::bind("127.0.0.1:0")
-            .map_err(|e| EngineError::Backend(format!("port probe: {e}")))?;
-        Ok(l.local_addr().unwrap().port())
-    }
-
-    /// Spawn the llama-server child on `self.port`. stderr is piped and a
-    /// drainer thread forwards every line to our stderr while keeping the
-    /// last 40 in a ring buffer for error messages — the drainer must run
-    /// for the child's whole life or a full pipe would block the child.
-    fn spawn_child(&mut self) -> Result<(), String> {
-        let (dev_args, ngl) = llama_device_args(&self.cfg.device, self.cfg.ngl);
-        let mut cmd = Command::new(&self.cfg.llama_bin);
+impl SpawnedChild {
+    /// Spawn the llama-server child on a fresh loopback port. stderr is
+    /// piped and a drainer thread forwards every line to our stderr while
+    /// keeping the last 40 in `tail` for error messages — the drainer must
+    /// run for the child's whole life or a full pipe would block the child.
+    fn spawn(
+        cfg: &LlamaCppConfig,
+        tail: &StderrTail,
+        slines: &StreamLines,
+    ) -> Result<Self, String> {
+        let port = pick_port().map_err(|e| e.to_string())?;
+        let (dev_args, ngl) = llama_device_args(&cfg.device, cfg.ngl);
+        let mut cmd = Command::new(&cfg.llama_bin);
         cmd.arg("-m")
-            .arg(&self.cfg.model)
+            .arg(&cfg.model)
             .args(&dev_args)
             .arg("-ngl")
             .arg(ngl.to_string())
             .arg("-c")
-            .arg(self.cfg.ctx.to_string())
+            .arg(cfg.ctx.to_string())
             .arg("--host")
             .arg("127.0.0.1")
             .arg("--port")
-            .arg(self.port.to_string())
+            .arg(port.to_string())
             // tool calls only render through the jinja chat template; a
             // --no-jinja in --llama-args still wins (last flag applies)
             .arg("--jinja")
@@ -719,17 +747,17 @@ impl LlamaCppBuilder {
             .arg("1")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        scrub_child_env(&mut cmd, self.cfg.elastic, self.cfg.elastic_share);
+        scrub_child_env(&mut cmd, cfg.elastic, cfg.elastic_share);
         arm_death_guard(&mut cmd);
-        if self.cfg.elastic {
+        if cfg.elastic {
             // Device-side O1: weights stay on disk, streamed per layer.
             cmd.env("GGML_STREAM_WEIGHTS", "1");
-            cmd.env("GGML_STREAM_VRAM_MB", self.cfg.elastic_vram.to_string());
+            cmd.env("GGML_STREAM_VRAM_MB", cfg.elastic_vram.to_string());
             // --elastic-share caps only the 'auto' budget; the child
             // applies it to nothing else (explicit MiB wins, and an
             // ambient share passes through untouched when no flag is set)
-            if let Some(n) = self.cfg.elastic_share {
-                if matches!(self.cfg.elastic_vram, ElasticVram::Auto) {
+            if let Some(n) = cfg.elastic_share {
+                if matches!(cfg.elastic_vram, ElasticVram::Auto) {
                     cmd.env("GGML_STREAM_VRAM_SHARE", n.to_string());
                 } else {
                     tracing::warn!(
@@ -737,7 +765,7 @@ impl LlamaCppBuilder {
                     );
                 }
             }
-        } else if self.cfg.elastic_share.is_some() {
+        } else if cfg.elastic_share.is_some() {
             tracing::warn!("sycl-llama: --elastic-share has no effect without --elastic");
         }
         // Router-aware MoE streaming lives entirely in the child (0002
@@ -750,9 +778,9 @@ impl LlamaCppBuilder {
         {
             cmd.env("GGML_STREAM_EXPERT_CACHE_MB", mb);
         }
-        cmd.args(llama_spec_args(self.cfg.mtp));
-        cmd.args(llama_host_layer_args(self.cfg.host_layers.as_deref()));
-        for a in self.cfg.extra_args.iter().filter(|a| !a.is_empty()) {
+        cmd.args(llama_spec_args(cfg.mtp));
+        cmd.args(llama_host_layer_args(cfg.host_layers.as_deref()));
+        for a in cfg.extra_args.iter().filter(|a| !a.is_empty()) {
             cmd.arg(a);
         }
         #[cfg(target_os = "linux")]
@@ -763,20 +791,21 @@ impl LlamaCppBuilder {
             .spawn()
             .map_err(|e| format!("spawn llama-server: {e}"))?;
         #[cfg(windows)]
-        {
-            match ChildJob::new_kill_on_close() {
-                Some(job) if job.assign(&child) => self.child_job = Some(job),
-                _ => tracing::warn!(
+        let job = match ChildJob::new_kill_on_close() {
+            Some(job) if job.assign(&child) => Some(job),
+            _ => {
+                tracing::warn!(
                     "sycl-llama: could not tie llama-server to a job object; a killed cascadia may orphan it"
-                ),
+                );
+                None
             }
-        }
-        self.stderr_tail.lock().unwrap().clear();
-        self.stream_lines.lock().unwrap().clear();
-        if let Some(err) = child.stderr.take() {
-            let tail = self.stderr_tail.clone();
-            let slines = self.stream_lines.clone();
-            self.stderr_drain = Some(std::thread::spawn(move || {
+        };
+        tail.lock().unwrap().clear();
+        slines.lock().unwrap().clear();
+        let stderr_drain = child.stderr.take().map(|err| {
+            let tail = tail.clone();
+            let slines = slines.clone();
+            std::thread::spawn(move || {
                 for line in BufReader::new(err).lines().map_while(Result::ok) {
                     eprintln!("{line}");
                     if line.starts_with("stream-weights: warning:") {
@@ -797,10 +826,15 @@ impl LlamaCppBuilder {
                     }
                     t.push_back(line);
                 }
-            }));
-        }
-        self.child = Some(child);
-        Ok(())
+            })
+        });
+        Ok(Self {
+            port,
+            child,
+            stderr_drain,
+            #[cfg(windows)]
+            job,
+        })
     }
 
     /// Poll `/health` until the server answers, the child exits, or the
@@ -811,10 +845,8 @@ impl LlamaCppBuilder {
         let port = self.port;
         let t0 = Instant::now();
         loop {
-            if let Some(c) = self.child.as_mut() {
-                if let Ok(Some(st)) = c.try_wait() {
-                    return Err(format!("llama-server exited during load: {st}"));
-                }
+            if let Ok(Some(st)) = self.child.try_wait() {
+                return Err(format!("llama-server exited during load: {st}"));
             }
             if health_ok(port) {
                 return Ok(());
@@ -829,11 +861,9 @@ impl LlamaCppBuilder {
     /// Kill + reap the child, then give the stderr drainer a short grace to
     /// reach EOF and flush the tail. A grandchild may still hold the pipe
     /// open, in which case the drainer is detached and keeps forwarding.
-    fn kill_child(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
+    fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
         if let Some(t) = self.stderr_drain.take() {
             for _ in 0..50 {
                 if t.is_finished() {
@@ -845,14 +875,91 @@ impl LlamaCppBuilder {
         }
     }
 
-    /// The last `n` captured child stderr lines, joined.
-    fn tail_lines(&self, n: usize) -> String {
-        let t = self.stderr_tail.lock().unwrap();
-        t.iter()
-            .skip(t.len().saturating_sub(n))
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n")
+    /// The child has exited (also reaps the zombie).
+    fn exited(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+}
+
+impl Drop for SpawnedChild {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// The last `n` captured child stderr lines, joined.
+fn tail_lines(tail: &StderrTail, n: usize) -> String {
+    let t = tail.lock().unwrap();
+    t.iter()
+        .skip(t.len().saturating_sub(n))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Spawn + health-check with the retry policy shared by `load` and the
+/// engine's crash respawn. xe copy-engine resets hang the load path
+/// intermittently; the next attempt on a fresh port nearly always
+/// succeeds. `load_retries` extra attempts follow the first failure
+/// (child exit or health timeout).
+fn spawn_and_healthy(
+    cfg: &LlamaCppConfig,
+    tail: &StderrTail,
+    slines: &StreamLines,
+) -> Result<SpawnedChild, String> {
+    let timeout = cfg
+        .load_timeout
+        .unwrap_or_else(|| auto_load_timeout(&cfg.model));
+    let attempts = 1 + cfg.load_retries;
+    let mut last_err = String::new();
+    for attempt in 1..=attempts {
+        if attempt > 1 {
+            tracing::warn!(
+                attempt,
+                "retrying llama-server load ({last_err}); intermittent load hangs \
+                 correlate with xe copy-engine resets: check \
+                 `dmesg | grep -i 'engine reset'`"
+            );
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        match SpawnedChild::spawn(cfg, tail, slines)
+            .and_then(|mut s| s.wait_healthy(timeout).map(|()| s))
+        {
+            Ok(s) => {
+                tracing::info!(port = s.port, "llama-server ready");
+                return Ok(s);
+            }
+            Err(e) => {
+                let tail = tail_lines(tail, 20);
+                last_err = if tail.is_empty() {
+                    e
+                } else {
+                    format!("{e}; child stderr (last lines): {tail}")
+                };
+            }
+        }
+    }
+    Err(format!(
+        "llama-server failed to load after {attempts} attempt(s): {last_err}"
+    ))
+}
+
+/// Builder: spawns and readiness-checks the llama-server child.
+pub struct LlamaCppBuilder {
+    cfg: Arc<LlamaCppConfig>,
+    spawned: Option<SpawnedChild>,
+    stderr_tail: StderrTail,
+    stream_lines: StreamLines,
+}
+
+impl LlamaCppBuilder {
+    pub fn new(cfg: LlamaCppConfig) -> Self {
+        Self {
+            cfg: Arc::new(cfg),
+            spawned: None,
+            stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+            stream_lines: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 }
 
@@ -877,10 +984,6 @@ impl Builder for LlamaCppBuilder {
     }
 
     async fn load(&mut self, _shard: ShardSpec) -> EngineResult<LoadStream> {
-        let timeout = self
-            .cfg
-            .load_timeout
-            .unwrap_or_else(|| auto_load_timeout(&self.cfg.model));
         if self.cfg.elastic && self.cfg.device.eq_ignore_ascii_case("cpu") {
             tracing::warn!(
                 "sycl-llama --elastic on a CPU device: GGML_STREAM_WEIGHTS \
@@ -888,38 +991,9 @@ impl Builder for LlamaCppBuilder {
                  for `--device none` (the host interposer still applies)"
             );
         }
-        let attempts = 1 + self.cfg.load_retries;
-        let mut last_err = String::new();
-        for attempt in 1..=attempts {
-            if attempt > 1 {
-                tracing::warn!(
-                    attempt,
-                    "retrying llama-server load ({last_err}); intermittent load hangs \
-                     correlate with xe copy-engine resets: check \
-                     `dmesg | grep -i 'engine reset'`"
-                );
-                std::thread::sleep(Duration::from_secs(3));
-            }
-            self.port = Self::pick_port()?;
-            match self.spawn_child().and_then(|()| self.wait_healthy(timeout)) {
-                Ok(()) => break,
-                Err(e) => {
-                    self.kill_child();
-                    let tail = self.tail_lines(20);
-                    last_err = if tail.is_empty() {
-                        e
-                    } else {
-                        format!("{e}; child stderr (last lines): {tail}")
-                    };
-                }
-            }
-            if attempt == attempts {
-                return Err(EngineError::Backend(format!(
-                    "llama-server failed to load after {attempts} attempt(s): {last_err}"
-                )));
-            }
-        }
-        tracing::info!(port = self.port, "llama-server ready");
+        let spawned = spawn_and_healthy(&self.cfg, &self.stderr_tail, &self.stream_lines)
+            .map_err(EngineError::Backend)?;
+        self.spawned = Some(spawned);
 
         let mut evs = vec![
             LoadProgress::message("llama-server spawned"),
@@ -949,26 +1023,24 @@ impl Builder for LlamaCppBuilder {
     }
 
     fn build(mut self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
-        let child = self.child.take().ok_or(EngineError::NotLoaded)?;
-        // Detach the stderr drainer: it must keep draining until the child's
-        // stderr hits EOF (child exit), so Drop must not join it here.
-        let _ = self.stderr_drain.take();
+        let spawned = self.spawned.take().ok_or(EngineError::NotLoaded)?;
         Ok(Box::new(LlamaCppEngine {
-            base: format!("http://127.0.0.1:{}", self.port),
-            child,
+            base: format!("http://127.0.0.1:{}", spawned.port),
+            cfg: self.cfg.clone(),
+            proc: spawned,
             pending: Vec::new(),
             active: None,
             rx: None,
+            respawn: None,
             last_chunk_at: Instant::now(),
-            #[cfg(windows)]
-            child_job: self.child_job.take(),
             cancelled: Arc::new(AtomicBool::new(false)),
             socket: None,
         }))
     }
 
     fn close(&mut self) {
-        self.kill_child();
+        // SpawnedChild::drop kills + reaps the child
+        self.spawned = None;
     }
 }
 
@@ -983,24 +1055,48 @@ impl Drop for LlamaCppBuilder {
 /// drains whatever has arrived.
 pub struct LlamaCppEngine {
     base: String,
-    child: Child,
+    /// Kept so a crashed child can be respawned (see `start_respawn`).
+    cfg: Arc<LlamaCppConfig>,
+    proc: SpawnedChild,
     pending: Vec<GenerationTask>,
     active: Option<TaskId>,
     rx: Option<Receiver<EngineResult<(TaskId, Chunk)>>>,
+    /// A child reload running on a helper thread after a crash. The next
+    /// queued task gets progress markers until it resolves.
+    respawn: Option<Receiver<Result<SpawnedChild, String>>>,
     /// When the active task last produced a real chunk (or started): the
     /// 300 s stall limit is measured against this, not against one blocking
     /// receive, so `step()` can poll briefly and let the runtime thread go.
     last_chunk_at: Instant,
     cancelled: Arc<AtomicBool>,
     socket: Option<TcpStream>,
-    /// Windows: the kill-on-close job the child lives in (see `ChildJob`);
-    /// held only so its Drop closes the job with the engine.
-    #[cfg(windows)]
-    #[allow(dead_code)]
-    child_job: Option<ChildJob>,
 }
 
 impl LlamaCppEngine {
+    /// The child process has exited (also reaps the zombie).
+    fn child_dead(&mut self) -> bool {
+        self.proc.exited()
+    }
+
+    /// Reload the model into a fresh child on a helper thread — the load
+    /// retry loop can take the full health timeout, far past what a
+    /// runtime poll may block. `step()` polls the receiver and feeds the
+    /// queued task progress markers meanwhile. The old child's drainer is
+    /// detached: it exits on its own at the corpse's stderr EOF.
+    fn start_respawn(&mut self) {
+        self.proc.stderr_drain = None;
+        let cfg = self.cfg.clone();
+        let (tx, rx) = channel();
+        self.respawn = Some(rx);
+        std::thread::Builder::new()
+            .name("llamacpp-respawn".into())
+            .spawn(move || {
+                let r = spawn_and_healthy(&cfg, &Default::default(), &Default::default());
+                let _ = tx.send(r);
+            })
+            .expect("spawn llamacpp respawn thread");
+    }
+
     /// Start the SSE reader for `task` against the child's completion API.
     /// Raw TcpStream + manual chunked decode: reqwest::blocking cannot be
     /// trusted anywhere near a process that also runs a tokio runtime (its
@@ -1067,14 +1163,16 @@ impl LlamaCppEngine {
             });
             if let Some(tools) = &task.tools {
                 body["tools"] = tools.clone();
-                // tool_choice only means anything alongside tools. The API
-                // already 400s a malformed one; this guards other callers and
-                // fails the task as a final error chunk, like a connect
-                // failure below.
-                if let Err(e) = apply_tool_choice(&mut body, task.tool_choice.as_ref()) {
-                    let _ = tx.send(Err(EngineError::InvalidConfig(e)));
-                    return;
-                }
+            }
+            // tool_choice only means anything alongside tools, but it is
+            // validated unconditionally: a named choice without tools is a
+            // caller bug that must not pass silently, and string forms are
+            // forwarded for the child to apply. The API already 400s a
+            // malformed one; this guards other callers and fails the task
+            // as a final error chunk, like a connect failure below.
+            if let Err(e) = apply_tool_choice(&mut body, task.tool_choice.as_ref()) {
+                let _ = tx.send(Err(EngineError::InvalidConfig(e)));
+                return;
             }
             ("/v1/chat/completions", body)
         };
@@ -1385,11 +1483,12 @@ fn handle_sse_line(
         return true;
     };
     // The child can emit an error object mid-stream; surface it instead of
-    // letting the stream end as an ambiguous EOF.
-    if v.get("error").is_some() {
-        let msg = v["error"]["message"]
+    // letting the stream end as an ambiguous EOF. A literal `"error": null`
+    // is not an error — filter it before probing for message.
+    if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+        let msg = err["message"]
             .as_str()
-            .or_else(|| v["error"].as_str())
+            .or_else(|| err.as_str())
             .unwrap_or("llama-server stream error")
             .to_string();
         send(Ok((tid.clone(), Chunk::error(tid.clone(), msg))));
@@ -1475,9 +1574,57 @@ impl Engine for LlamaCppEngine {
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        // A child respawn in flight gates task pickup. The reload runs on a
+        // helper thread (it may take the full load timeout); the queue head
+        // gets progress markers so its stream stays alive meanwhile.
+        if let Some(rrx) = &self.respawn {
+            match rrx.try_recv() {
+                Ok(Ok(spawned)) => {
+                    tracing::info!(port = spawned.port, "llama-server respawned");
+                    self.base = format!("http://127.0.0.1:{}", spawned.port);
+                    self.proc = spawned;
+                    self.respawn = None;
+                }
+                Ok(Err(e)) => {
+                    self.respawn = None;
+                    // fail the head task; the next one gets a fresh attempt
+                    if let Some(task) = self.pending.first() {
+                        let tid = task.task_id.clone();
+                        self.pending.remove(0);
+                        return Ok(vec![(
+                            tid.clone(),
+                            Chunk::error(tid, format!("llama-server respawn failed: {e}")),
+                        )]);
+                    }
+                    return Ok(vec![]);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    let tid = self
+                        .active
+                        .clone()
+                        .or_else(|| self.pending.first().map(|t| t.task_id.clone()));
+                    return Ok(match tid {
+                        Some(tid) => vec![(tid.clone(), Chunk::progress(tid))],
+                        None => vec![],
+                    });
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // respawn thread died before answering; a task pickup
+                    // below starts a fresh attempt
+                    self.respawn = None;
+                }
+            }
+        }
         // Pick up a task if idle.
         if self.active.is_none() {
             if let Some(task) = self.pending.first().cloned() {
+                if self.child_dead() {
+                    // the child crashed between tasks: respawn it and park
+                    // the task on progress markers until it is healthy
+                    self.start_respawn();
+                    let tid = task.task_id.clone();
+                    return Ok(vec![(tid.clone(), Chunk::progress(tid))]);
+                }
                 self.active = Some(task.task_id.clone());
                 self.pending.remove(0);
                 self.start_stream(task);
@@ -1555,14 +1702,16 @@ impl Engine for LlamaCppEngine {
             }
         }
         // Child died mid-stream?
-        if self.active.is_some() {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                let tid = self.active.take().unwrap();
-                let mut c = Chunk::token(tid.clone(), 0, "");
-                c.is_final = true;
-                c.error = Some("llama-server exited mid-task".into());
-                out.push((tid, c));
-                self.rx = None;
+        if self.active.is_some() && self.proc.exited() {
+            let tid = self.active.take().unwrap();
+            let mut c = Chunk::token(tid.clone(), 0, "");
+            c.is_final = true;
+            c.error = Some("llama-server exited mid-task".into());
+            out.push((tid, c));
+            self.rx = None;
+            // wake the SSE reader now rather than at its read timeout
+            if let Some(s) = self.socket.take() {
+                let _ = s.shutdown(std::net::Shutdown::Both);
             }
         }
         Ok(out)
@@ -1585,8 +1734,7 @@ impl Engine for LlamaCppEngine {
         if let Some(s) = self.socket.take() {
             let _ = s.shutdown(std::net::Shutdown::Both);
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.proc.kill();
     }
 }
 
@@ -1786,6 +1934,30 @@ mod tests {
         assert_eq!(out[0].as_ref().unwrap().1.prompt_tokens, Some(7));
     }
 
+    /// A literal `"error": null` is not an error object; a real one ends
+    /// the stream as a final error chunk.
+    #[test]
+    fn sse_error_null_ignored_but_error_object_is_fatal() {
+        let tid = "t1".to_string();
+        let mut st = SseState::default();
+        let (go, out) = collect(
+            r#"data: {"choices":[{"delta":{"content":"x"}}],"error":null}"#,
+            &tid,
+            &mut st,
+        );
+        assert!(go);
+        assert_eq!(out[0].as_ref().unwrap().1.text, "x");
+
+        let (_go, out) = collect(
+            r#"data: {"error":{"message":"slot overhead exceeded"}}"#,
+            &tid,
+            &mut st,
+        );
+        let c = &out[0].as_ref().unwrap().1;
+        assert!(c.is_final);
+        assert_eq!(c.error.as_deref(), Some("slot overhead exceeded"));
+    }
+
     #[test]
     fn sse_non_data_and_malformed_lines_are_skipped() {
         let mut st = SseState::default();
@@ -1911,6 +2083,20 @@ mod tests {
             body["tools"],
             serde_json::json!([{"type": "function", "function": {"name": "get_time"}}])
         );
+    }
+
+    #[test]
+    fn apply_tool_choice_without_tools_only_named_errors() {
+        // string forms are inert without tools but still validate/forward;
+        // a named choice can never resolve — that is a caller bug, not a no-op
+        for s in ["auto", "none", "required"] {
+            let mut body = serde_json::json!({});
+            apply_tool_choice(&mut body, Some(&serde_json::json!(s))).unwrap();
+        }
+        let mut body = serde_json::json!({});
+        let choice = serde_json::json!({"type": "function", "function": {"name": "get_time"}});
+        let e = apply_tool_choice(&mut body, Some(&choice)).unwrap_err();
+        assert!(e.contains("no tools"), "{e}");
     }
 
     #[test]
@@ -2232,13 +2418,19 @@ mod unix_tests {
     fn test_engine(port: u16) -> LlamaCppEngine {
         LlamaCppEngine {
             base: format!("http://127.0.0.1:{port}"),
-            child: Command::new("sleep").arg("60").spawn().unwrap(),
+            cfg: Arc::new(cfg_for(PathBuf::from("/bin/true"), 0)),
+            proc: SpawnedChild {
+                port,
+                child: Command::new("sleep").arg("60").spawn().unwrap(),
+                stderr_drain: None,
+                #[cfg(windows)]
+                job: None,
+            },
             pending: Vec::new(),
             active: None,
             rx: None,
+            respawn: None,
             last_chunk_at: Instant::now(),
-            #[cfg(windows)]
-            child_job: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             socket: None,
         }
@@ -2420,13 +2612,14 @@ mod unix_tests {
             cmd.arg("30");
             arm_death_guard(&mut cmd);
             let child = spawn_on_parent_thread(cmd).unwrap();
-            tx.send(child.id()).unwrap();
+            tx.send(child).unwrap();
             // the calling thread exits here: a naive PDEATHSIG spawn
             // would already have killed the child
         });
-        let pid = rx.recv().unwrap();
+        let mut child = rx.recv().unwrap();
         t.join().unwrap();
         std::thread::sleep(Duration::from_millis(300));
+        let pid = child.id();
         let state = std::fs::read_to_string(format!("/proc/{pid}/status"))
             .unwrap_or_default()
             .lines()
@@ -2437,7 +2630,9 @@ mod unix_tests {
             !state.is_empty() && !state.contains('Z'),
             "child {pid} did not survive the caller thread: {state}"
         );
-        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
+        // kill + reap: a bare SIGKILL would leave the test's child a zombie
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// The host interposer's environment (#132) never reaches the child,
@@ -2591,6 +2786,46 @@ mod unix_tests {
         let err = b.load(dummy_shard()).await.err().unwrap().to_string();
         assert!(err.contains("after 2 attempt(s)"), "{err}");
         assert!(err.contains("boom-marker-xyz"), "{err}");
+    }
+
+    /// A dead child between tasks triggers a respawn; when the reload
+    /// cannot succeed the queued task fails with a respawn error rather
+    /// than a bare connect failure. The respawn runs off-thread, so step()
+    /// answers with progress markers while it runs.
+    #[test]
+    fn engine_respawns_dead_child_and_fails_task_when_it_cannot() {
+        let dir = tempfile::tempdir().unwrap();
+        // exits immediately: every respawn attempt fails health-check-fast
+        let bin = write_script(dir.path(), "llama-server", "#!/bin/sh\nexit 1\n");
+        let mut engine = test_engine(1); // port unused; the child is replaced
+        engine.cfg = Arc::new(cfg_for(bin, 0));
+        engine.proc.child.kill().unwrap();
+        engine.proc.child.wait().unwrap();
+        engine.submit(chat_task()).unwrap();
+        // first step notices the dead child, starts the respawn thread, and
+        // parks the task on a progress marker
+        let out = engine.step().unwrap();
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].1.is_progress(), "{:?}", out[0].1);
+        // the respawn fails after ~one health poll (script exits, timeout
+        // 1 s): the task ends in a final respawn error, never a connect
+        // refusal. Time-bounded — the helper thread waits ~2 s per attempt.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let last = loop {
+            let batch = engine.step().unwrap();
+            if let Some((_, c)) = batch.iter().find(|(_, c)| c.is_final) {
+                break c.clone();
+            }
+            assert!(Instant::now() < deadline, "respawn never resolved");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(
+            last.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("respawn failed"),
+            "{last:?}"
+        );
     }
 
     #[tokio::test]

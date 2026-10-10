@@ -26,6 +26,27 @@ if not exist "%DEST%\.git" (
 )
 cd /d "%DEST%"
 git checkout "%LLAMA_BASE%" || exit /b 1
+REM A tree whose markers survive from an OLDER patch revision would fool the
+REM per-patch skip checks below; pin the exact revision set in a manifest and
+REM refuse to build on top of a stale one (same guard as the .sh).
+set "MANIFEST=.cascadia-patches.manifest"
+> "%MANIFEST%.new" echo base=%LLAMA_BASE%
+for %%P in ("%PATCH1%" "%PATCH2%") do (
+  for /f "usebackq delims=" %%H in (`certutil -hashfile "%%~P" SHA256 ^| findstr /v /c:"CertUtil" /c:"hash of"`) do (
+    >> "%MANIFEST%.new" echo %%~nxP sha256:%%H
+  )
+)
+if exist "%MANIFEST%" (
+  fc /b "%MANIFEST%" "%MANIFEST%.new" >nul 2>&1
+  if errorlevel 1 (
+    echo ERROR: %DEST% has a different patch/base revision applied: 1>&2
+    type "%MANIFEST%" 1>&2
+    echo --- expected: 1>&2
+    type "%MANIFEST%.new" 1>&2
+    echo reset to a clean base first: git -C "%DEST%" checkout %LLAMA_BASE% -- . then delete %DEST%\%MANIFEST% 1>&2
+    exit /b 1
+  )
+)
 REM Apply the chain in order. Skip a patch only when its own marker proves it
 REM applied; otherwise verify with --check, apply, and abort on any failure.
 findstr /m /c:"GGML_STREAM_WEIGHTS" ggml\src\ggml-backend.cpp >nul 2>&1
@@ -58,6 +79,7 @@ if errorlevel 1 (
 ) else (
   echo patch2 already applied; continuing
 )
+move /y "%MANIFEST%.new" "%MANIFEST%" >nul
 
 REM VS + oneAPI environments. VS2022INSTALLDIR lets setvars find the Build Tools.
 if "%VS2022INSTALLDIR%"=="" set "VS2022INSTALLDIR=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
