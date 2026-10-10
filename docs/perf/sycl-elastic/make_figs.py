@@ -43,7 +43,7 @@ PARITY_NOTE = ("64/64 greedy tokens byte-identical to stock (fusion off), "
 
 FOOTER = ("Intel Arc Pro B70 32 GB | llama.cpp SYCL + stream-weights patch | "
           "Qwen GGUF Q4_K, ctx 4096, KV q8_0 | data: docs/perf/sycl-elastic/data.json")
-FOOTER_LAPTOP = "Hunter laptop, Windows 11 | data: docs/perf/sycl-elastic/data.json"
+FOOTER_LAPTOP = "Core Ultra 9 285H laptop, Windows 11 | data: docs/perf/sycl-elastic/data.json"
 
 plt.rcParams.update({
     "font.family": "DejaVu Sans",
@@ -609,7 +609,7 @@ def fig6():
            "OpenVINO GenAI 2026.4 (the runtime under cascadia's ov-genai "
            "engine),\n48 tokens after a warmup pass. sycl-llama --elastic "
            "was not measured on this laptop.")
-    bench = DATA["hunter"]["bench"]
+    bench = DATA["laptop"]["bench"]
     dev_color = {"CPU": AMBER, "GPU.0": BLUE, "GPU.1": "#a371f7",
                  "NPU": "#db61a2"}
     labels = {
@@ -649,7 +649,7 @@ def fig6():
 
     axr = fig.add_axes([0.76, 0.16, 0.20, 0.58])
     style_ax(axr)
-    cot = DATA["hunter"]["cpu_cotenancy"]
+    cot = DATA["laptop"]["cpu_cotenancy"]
     cpu_shades = ["#d29922", "#e0aa35", "#b9831d"]
     axr.bar(0, cot["single"]["aggregate_tps"], width=0.55,
             color=cpu_shades[0])
