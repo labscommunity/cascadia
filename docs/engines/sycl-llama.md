@@ -214,12 +214,44 @@ runs within 2.5% of the median). Chart: [fig17](../perf/sycl-elastic/fig17_mtp.p
   pass, so the weight traffic is shared by every accepted token. The gain
   is smallest at 62/65, where the two streamed layers already stay pinned
   in their slots and decode runs at resident speed.
-- Output: the target model decides every token, but verification runs as a
-  small batch, so greedy text can flip at a near-tie, like any batch-size
-  change. In the n=3 sweep, MTP text matched plain decode on 11 of 12
-  prompt/arm pairs; the miss was the fully streamed arm.
+- Output: the target model decides every token, but MTP is not proven
+  byte-identical to plain decode. Timing is n=3; the text comparison is
+  the first run of each arm only: MTP matched plain decode on 11 of 12
+  prompt/arm pairs, the miss on the fully streamed arm. The cause of the
+  miss is not established: with oneDNN on (the default), text varied
+  between the 3 runs of the same arm in 5 of 8 arms (plain and MTP), so
+  run-to-run noise and batched verification are both candidates.
 - MTP also costs VRAM: the draft context's KV and compute buffers add
-  0.6-1.1 GiB on top of the budget, so leave that headroom.
+  0.5-1.1 GiB on top of the budget, so leave that headroom. The engine
+  starts llama-server with `--parallel 1` (it serves one task at a time);
+  llama-server's own default opens 4 slots, which cost an extra 2.0 GiB
+  with `--llama-mtp` (resident 17.9 → 15.9 GiB) and 0.4 GiB without.
+- **GPU and CPU through `cascadia run`**
+  ([fig19](../perf/sycl-elastic/fig19_mtp_cpu_gpu.png); client-side t/s,
+  which includes prefill; median of 3 runs):
+
+  | device | plain | `--llama-mtp` | CPU cores busy | peak VRAM | peak host RSS |
+  |---|---|---|---|---|---|
+  | GPU, resident | 13.7 t/s | **16.4 t/s** (1.20x) | 1.0 → 1.0 | 15.4 → 15.9 GiB | 15.6 → 15.6 GiB |
+  | GPU, `--elastic-vram 8` | 0.79 t/s | **2.11 t/s** (2.66x) | 3.1 → 2.9 | 11.4 → 12.0 GiB | 15.4 → 15.6 GiB |
+  | CPU (`--device CPU`) | 1.76 t/s | **2.44 t/s** (1.39x) | 8.0 → 9.7 | - | 18.4 → 19.2 GiB |
+
+  On the GPU, MTP costs no extra host CPU. On the CPU it uses 1.7 more
+  cores and 0.9 GiB more RAM for +39%. Host RSS on GPU arms is mostly the
+  page-cached GGUF mapping.
+- **Draft length** is set with `--llama-args "--spec-draft-n-max N"`
+  (llama-server default 3). The best value depends on the budget
+  ([fig18](../perf/sycl-elastic/fig18_mtp_draft_n.png), n=2 per point):
+
+  | `--spec-draft-n-max` | 1 | 2 | 3 | 4 | 6 |
+  |---|---|---|---|---|---|
+  | resident, t/s | 23.9 | **26.4** | 26.3 | 25.0 | 22.4 |
+  | 8 GiB budget, t/s | 1.47 | 1.99 | 2.45 | 2.70 | **2.82** |
+  | drafted tokens accepted (8 GiB) | 87% | 84% | 74% | 66% | 47% |
+
+  Resident decode is compute-bound, so rejected drafts cost real time and
+  2-3 is best. Streamed decode pays a whole weight pass per verify, so a
+  longer draft keeps winning even as acceptance falls: 4-6 at 8 GiB.
 - `--llama-args "--spec-type ..."` is rejected next to `--llama-mtp`:
   llama-server appends spec types instead of replacing them, so both modes
   would run. `--spec-draft-n-max` and other draft knobs stay allowed.

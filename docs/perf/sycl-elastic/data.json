@@ -1284,5 +1284,268 @@
     "retries": 0
    }
   ]
+ },
+ "mtp_draft_n": {
+  "date": "2026-10-10",
+  "setup": "--llama-mtp with --llama-args \"--spec-draft-n-max N\" (llama-server default 3). Same model, prompts and settings as `mtp`; n=2 fresh servers per point, tps_median = median of the 2 run means. draft counts from the first run, summed over 3 prompts.",
+  "points": [
+   {
+    "arm": "resident",
+    "n_max": 1,
+    "tps_runs": [
+     23.974,
+     23.916
+    ],
+    "tps_median": 23.945,
+    "draft_acc": 76,
+    "draft_n": 85,
+    "peak_gib_max": 15.85
+   },
+   {
+    "arm": "resident",
+    "n_max": 2,
+    "tps_runs": [
+     26.485,
+     26.391
+    ],
+    "tps_median": 26.438,
+    "draft_acc": 103,
+    "draft_n": 122,
+    "peak_gib_max": 15.74
+   },
+   {
+    "arm": "resident",
+    "n_max": 3,
+    "tps_runs": [
+     26.148,
+     26.528
+    ],
+    "tps_median": 26.338,
+    "draft_acc": 110,
+    "draft_n": 151,
+    "peak_gib_max": 16.14
+   },
+   {
+    "arm": "resident",
+    "n_max": 4,
+    "tps_runs": [
+     25.257,
+     24.658
+    ],
+    "tps_median": 24.958,
+    "draft_acc": 117,
+    "draft_n": 178,
+    "peak_gib_max": 16.29
+   },
+   {
+    "arm": "resident",
+    "n_max": 6,
+    "tps_runs": [
+     22.375,
+     22.45
+    ],
+    "tps_median": 22.412,
+    "draft_acc": 123,
+    "draft_n": 244,
+    "peak_gib_max": 16.58
+   },
+   {
+    "arm": "8 GiB",
+    "n_max": 1,
+    "tps_runs": [
+     1.554,
+     1.395
+    ],
+    "tps_median": 1.474,
+    "draft_acc": 75,
+    "draft_n": 86,
+    "peak_gib_max": 11.67
+   },
+   {
+    "arm": "8 GiB",
+    "n_max": 2,
+    "tps_runs": [
+     1.953,
+     2.035
+    ],
+    "tps_median": 1.994,
+    "draft_acc": 102,
+    "draft_n": 122,
+    "peak_gib_max": 11.72
+   },
+   {
+    "arm": "8 GiB",
+    "n_max": 3,
+    "tps_runs": [
+     2.451,
+     2.455
+    ],
+    "tps_median": 2.453,
+    "draft_acc": 111,
+    "draft_n": 149,
+    "peak_gib_max": 11.82
+   },
+   {
+    "arm": "8 GiB",
+    "n_max": 4,
+    "tps_runs": [
+     2.714,
+     2.69
+    ],
+    "tps_median": 2.702,
+    "draft_acc": 117,
+    "draft_n": 178,
+    "peak_gib_max": 12.01
+   },
+   {
+    "arm": "8 GiB",
+    "n_max": 6,
+    "tps_runs": [
+     2.751,
+     2.895
+    ],
+    "tps_median": 2.823,
+    "draft_acc": 121,
+    "draft_n": 255,
+    "peak_gib_max": 12.3
+   }
+  ]
+ },
+ "mtp_cpu_gpu": {
+  "date": "2026-10-10",
+  "setup": "Through `cascadia run --engine sycl-llama` (child pinned to --parallel 1), Qwen3.8-27B UD-Q4_K_S, ctx 4096, -ctk q8_0 -fa on, 3 chat prompts x 64 tokens, greedy, thinking off, n=3 cascadia processes per arm. wall_tps = completion_tokens / request wall time at the client (includes prefill and the first request's warmup; cascadia itself adds no measurable latency: 3.67 s vs 3.71 s for the same request sent to the child directly). cores = llama-server (utime+stime) / wall over the 3 requests. peak_rss_gib = llama-server VmRSS peak (on GPU arms mostly the page-cached mmap of the GGUF). peak_vram_gib = vram_mm peak - idle on SYCL1.",
+  "arms": [
+   {
+    "arm": "gpu-resident",
+    "mtp": false,
+    "wall_tps_runs": [
+     13.724,
+     13.69,
+     13.712
+    ],
+    "wall_tps": 13.712,
+    "cores": 1.004,
+    "peak_rss_gib": 15.59,
+    "peak_vram_gib": 15.38,
+    "texts_stable": false
+   },
+   {
+    "arm": "gpu-resident",
+    "mtp": true,
+    "wall_tps_runs": [
+     16.319,
+     16.535,
+     16.407
+    ],
+    "wall_tps": 16.407,
+    "cores": 1.0,
+    "peak_rss_gib": 15.59,
+    "peak_vram_gib": 15.88,
+    "texts_stable": true
+   },
+   {
+    "arm": "gpu-streamed-8",
+    "mtp": false,
+    "wall_tps_runs": [
+     0.794,
+     0.792,
+     0.791
+    ],
+    "wall_tps": 0.792,
+    "cores": 3.081,
+    "peak_rss_gib": 15.43,
+    "peak_vram_gib": 11.37,
+    "texts_stable": true
+   },
+   {
+    "arm": "gpu-streamed-8",
+    "mtp": true,
+    "wall_tps_runs": [
+     2.108,
+     2.138,
+     2.099
+    ],
+    "wall_tps": 2.108,
+    "cores": 2.942,
+    "peak_rss_gib": 15.59,
+    "peak_vram_gib": 11.97,
+    "texts_stable": true
+   },
+   {
+    "arm": "cpu",
+    "mtp": false,
+    "wall_tps_runs": [
+     1.75,
+     1.76,
+     1.761
+    ],
+    "wall_tps": 1.76,
+    "cores": 7.985,
+    "peak_rss_gib": 18.35,
+    "peak_vram_gib": 0.0,
+    "texts_stable": true
+   },
+   {
+    "arm": "cpu",
+    "mtp": true,
+    "wall_tps_runs": [
+     2.447,
+     2.444,
+     2.443
+    ],
+    "wall_tps": 2.444,
+    "cores": 9.662,
+    "peak_rss_gib": 19.25,
+    "peak_vram_gib": 0.0,
+    "texts_stable": true
+   }
+  ],
+  "before_parallel_1": {
+   "note": "same harness before the engine pinned --parallel 1 (llama-server default -1 = 4 slots, unified KV)",
+   "arms": [
+    {
+     "arm": "gpu-resident",
+     "mtp": false,
+     "wall_tps": 13.654,
+     "peak_vram_gib": 15.81,
+     "peak_rss_gib": 15.58
+    },
+    {
+     "arm": "gpu-resident",
+     "mtp": true,
+     "wall_tps": 16.463,
+     "peak_vram_gib": 17.91,
+     "peak_rss_gib": 15.47
+    },
+    {
+     "arm": "gpu-streamed-8",
+     "mtp": false,
+     "wall_tps": 0.77,
+     "peak_vram_gib": 11.18,
+     "peak_rss_gib": 15.39
+    },
+    {
+     "arm": "gpu-streamed-8",
+     "mtp": true,
+     "wall_tps": 2.097,
+     "peak_vram_gib": 13.64,
+     "peak_rss_gib": 15.43
+    },
+    {
+     "arm": "cpu",
+     "mtp": false,
+     "wall_tps": 1.75,
+     "peak_vram_gib": 0.0,
+     "peak_rss_gib": 18.79
+    },
+    {
+     "arm": "cpu",
+     "mtp": true,
+     "wall_tps": 2.39,
+     "peak_vram_gib": 0.0,
+     "peak_rss_gib": 21.02
+    }
+   ]
+  }
  }
 }

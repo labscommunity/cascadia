@@ -16,6 +16,8 @@ All numbers come from [`data.json`](./data.json) (verbatim copy of
 | ![fig8](fig8_partial.png) | `fig8_partial.png` — `--elastic-vram` budget sweep: speed follows how much of the model fits. |
 | ![fig9](fig9_windows.png) | `fig9_windows.png` — the same streaming on Windows (Arc B390 iGPU): Linux vs Windows device memory + decode retention. |
 | ![fig17](fig17_mtp.png) | `fig17_mtp.png` — `--llama-mtp` decode on Qwen3.8-27B per `--elastic-vram` budget (median of 3 runs, whiskers = run spread) and its VRAM cost. Data: `data.json` `mtp`; harness `experiments/2026-10-10-review3/spec/mtp_sweep.py`. |
+| ![fig18](fig18_mtp_draft_n.png) | `fig18_mtp_draft_n.png` — `--spec-draft-n-max` sweep under `--llama-mtp`: resident vs 8 GiB budget, speed relative to plain decode, and draft acceptance. Data: `data.json` `mtp_draft_n`. |
+| ![fig19](fig19_mtp_cpu_gpu.png) | `fig19_mtp_cpu_gpu.png` — `--llama-mtp` through `cascadia run` on GPU (resident, 8 GiB streamed) and CPU: client t/s, CPU cores, peak VRAM and host RSS, with deltas. Data: `data.json` `mtp_cpu_gpu`; harness `experiments/2026-10-10-review3/spec/mtp_cpu_gpu.py`. |
 
 ## Methodology
 
