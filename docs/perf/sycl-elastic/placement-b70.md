@@ -80,7 +80,8 @@ Other deviations:
   (`auto|none|mmap|mlock|mmap+mlock|dio`); the host arms used
   `--load-mode none`, which is what the patch intends (mmap off -> the
   loader reads weights into the host buffer; cascadia's
-  `--llama-host-layers` emits the equivalent `--no-mmap`).
+  `--llama-host-layers` emitted the equivalent `--no-mmap` for this study and
+  emits `--load-mode none` since 2026-10-10).
 - The stack's 0001/0002 differ from the PR-171 head's regenerated pair
   (ours adds the slot-pool teardown in 0001, the expert-arena cleanup in
   0002, and the `host_unified_memory` iGPU-classification fallback). None
@@ -138,7 +139,8 @@ resident set (N = layers kept on device).
 | 0 | **0.54** | 0.45 | 3.05 / 3.43 GiB |
 
 Engine-path check: `cascadia run ... --llama-host-layers 'blk\.6[2-4]\..*'`
-emits `--no-mmap -ot ...=SYCL_Host`, decodes at **6.25 t/s** (bench: 6.36),
+emitted `--no-mmap -ot ...=SYCL_Host` (now `--load-mode none`, the same
+mode), decodes at **6.25 t/s** (bench: 6.36),
 output byte-identical to the resident arm.
 
 Note on N=34/33: the streaming budget that came closest gave 34/65
