@@ -470,12 +470,81 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # ── Patched llama-server (SYCL, weight streaming + SYCL_Host) for linux.
+  #    Built on a hosted runner: the oneAPI toolchain is needed to compile but
+  #    not to run — the bundle carries its own SYCL/MKL runtime and only needs
+  #    the Level-Zero driver on the target box.
+  build-sycl-llama:
+    name: linux-x86_64 (sycl-llama child)
+    needs: [plan, ensure-release]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.plan.outputs.dry_run == 'true' || needs.ensure-release.result == 'success') }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      VER: ${{ needs.plan.outputs.ver }}
+      DRY_RUN: ${{ needs.plan.outputs.dry_run }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - name: Install oneAPI DPC++ toolchain
+        run: |
+          wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+            | sudo gpg --dearmor -o /usr/share/keyrings/oneapi-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+            | sudo tee /etc/apt/sources.list.d/oneapi.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends intel-oneapi-compiler-dpcpp-cpp patchelf
+
+      - name: Build patched llama-server
+        run: scripts/build-llama-stream.sh "$RUNNER_TEMP/llama-stream"
+
+      - name: Package bundle
+        id: pkg
+        run: |
+          name="cascadia-llama-sycl-${VER}-linux-x86_64"
+          scripts/package-llama-stream.sh "$RUNNER_TEMP/llama-stream" "$RUNNER_TEMP/$name.tar.gz"
+          echo "asset=$RUNNER_TEMP/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke-test the bundle (linkage closed, stream markers present)
+        run: |
+          tar -xzf "${{ steps.pkg.outputs.asset }}" -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/cascadia-llama-sycl"
+          if ldd ./llama-server | grep "not found"; then
+            echo "::error::bundle has unresolved libraries"; exit 1
+          fi
+          grep -l GGML_STREAM_WEIGHTS ./libggml-base.so* >/dev/null \
+            || { echo "::error::GGML_STREAM_WEIGHTS marker missing"; exit 1; }
+          grep -l GGML_STREAM_EXPERT_CACHE_MB ./libggml-sycl.so* >/dev/null \
+            || { echo "::error::GGML_STREAM_EXPERT_CACHE_MB marker missing"; exit 1; }
+
+      - name: Upload bundle to release
+        if: ${{ env.DRY_RUN != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "$TAG" "${{ steps.pkg.outputs.asset }}" --clobber
+
+      - name: Keep bundle as a workflow artifact (dry run)
+        if: ${{ env.DRY_RUN == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bundle-sycl-llama-linux-x86_64
+          path: ${{ steps.pkg.outputs.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
   # ── Promote once both bundles are attached: a release only loses its
   #    pre-release badge when its binaries are verifiably present.
   promote:
     name: promote release
-    needs: [plan, build-linux, build-windows]
-    if: ${{ !cancelled() && needs.plan.outputs.dry_run != 'true' && needs.build-linux.result == 'success' && needs.build-windows.result == 'success' }}
+    needs: [plan, build-linux, build-windows, build-sycl-llama]
+    if: ${{ !cancelled() && needs.plan.outputs.dry_run != 'true' && needs.build-linux.result == 'success' && needs.build-windows.result == 'success' && needs.build-sycl-llama.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -493,6 +562,10 @@ jobs:
           case "$assets" in
             *linux-x86_64*windows-x86_64*|*windows-x86_64*linux-x86_64*) ;;
             *) echo "::error::expected both linux and windows bundles on $TAG, found: $assets"; exit 1 ;;
+          esac
+          case "$assets" in
+            *llama-sycl*) ;;
+            *) echo "::error::expected a sycl-llama bundle on $TAG, found: $assets"; exit 1 ;;
           esac
           gh release edit "$TAG" --prerelease=false --latest
           echo "release $TAG promoted"

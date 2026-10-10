@@ -19,6 +19,9 @@ All numbers come from [`data.json`](./data.json) (verbatim copy of
 | ![fig18](fig18_mtp_draft_n.png) | `fig18_mtp_draft_n.png` — `--spec-draft-n-max` sweep under `--llama-mtp`: resident vs 8 GiB budget, speed relative to plain decode, and draft acceptance. Data: `data.json` `mtp_draft_n`. |
 | ![fig19](fig19_mtp_cpu_gpu.png) | `fig19_mtp_cpu_gpu.png` — `--llama-mtp` through `cascadia run` on GPU (resident, 8 GiB streamed) and CPU: client t/s, CPU cores, peak VRAM and host RSS, with deltas. Data: `data.json` `mtp_cpu_gpu`; harness `experiments/2026-10-10-review3/spec/mtp_cpu_gpu.py`. |
 
+Placement study on a UMA iGPU (Arc B390, Linux), stock vs streaming vs
+pinned host memory computed in place: [`placement-b390.md`](placement-b390.md).
+
 ## Methodology
 
 - **Hardware (B70 box):** 2x Intel Arc Pro B70 32 GB, kernel 7.0.0-28 (`xe`

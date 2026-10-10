@@ -22,6 +22,7 @@ JOBS="${JOBS:-$(nproc)}"
 PATCHES=(
     "$REPO_ROOT/patches/llama.cpp/0001-sycl-stream-weights.patch:ggml/src/ggml-backend.cpp:GGML_STREAM_WEIGHTS"
     "$REPO_ROOT/patches/llama.cpp/0002-sycl-router-aware-moe.patch:ggml/src/ggml-sycl/ggml-sycl.cpp:GGML_STREAM_EXPERT_CACHE_MB"
+    "$REPO_ROOT/patches/llama.cpp/0003-sycl-host-buffer-compute.patch:ggml/src/ggml-sycl/ggml-sycl.cpp:CASCADIA_HOST_BUFT"
 )
 
 if [ ! -d "$DEST/.git" ]; then

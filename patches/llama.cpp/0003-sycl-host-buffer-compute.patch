@@ -1,0 +1,51 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 1f70d0ad4..fb397fddd 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -260,6 +260,10 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
+         if (buft) {
+             buft_list[ggml_backend_buft_name(buft)] = buft;
+         }
++        auto * hbuft = ggml_backend_dev_host_buffer_type(dev);
++        if (hbuft) {
++            buft_list[ggml_backend_buft_name(hbuft)] = hbuft;
++        }
+     }
+ 
+     for (const auto & override : string_split<std::string>(value, ',')) {
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index d1456a867..42107883b 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -6306,6 +6306,16 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
+ }
+ 
+ static bool ggml_backend_sycl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
++    // CASCADIA_HOST_BUFT: weights in the pinned host buffer (USM host) are
++    // device-accessible pointers; compute on them in place instead of
++    // handing the op to the CPU backend (UMA: same DRAM; PCIe: link-bound).
++    // pinned USM is allocated under device 0's context and the unpinned
++    // fallback (GGML_SYCL_ENABLE_HOST_PINNED_MEM=0) is ordinary pageable
++    // memory, so only device 0 with pinned memory enabled can claim it
++    if (buft == ggml_backend_sycl_host_buffer_type()) {
++        ggml_backend_sycl_device_context * dev_ctx = (ggml_backend_sycl_device_context *) dev->context;
++        return g_ggml_sycl_enable_host_pinned_mem && dev_ctx->device == 0;
++    }
+     if (buft->iface.get_name != ggml_backend_sycl_buffer_type_get_name) {
+         return false;
+     }
+diff --git a/tools/llama-bench/llama-bench.cpp b/tools/llama-bench/llama-bench.cpp
+index 7c495afe2..750c9e179 100644
+--- a/tools/llama-bench/llama-bench.cpp
++++ b/tools/llama-bench/llama-bench.cpp
+@@ -937,6 +937,10 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
+                         if (buft) {
+                             buft_list[ggml_backend_buft_name(buft)] = buft;
+                         }
++                        auto * hbuft = ggml_backend_dev_host_buffer_type(dev);
++                        if (hbuft) {
++                            buft_list[ggml_backend_buft_name(hbuft)] = hbuft;
++                        }
+                     }
+                 }
+                 auto override_group_span_len = std::strcspn(value, ",");
