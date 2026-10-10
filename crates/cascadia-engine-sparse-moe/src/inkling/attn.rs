@@ -144,6 +144,11 @@ pub struct AttnWeights {
 }
 
 pub struct AttentionLayer {
+    /// Parked KV states for multi-stream decode (see [`Self::select`]);
+    /// empty on the single-sequence path. The k/v convs keep their own pools.
+    slots: Vec<AttnSlot>,
+    /// Which parked slot the live `k/v/len/hwm` currently belong to.
+    live: usize,
     /// Optional OpenVINO backend for the five projections (`(layer, backend)`);
     /// see [`super::ov_attn`].
     ov: Option<(u32, std::sync::Arc<super::ov_attn::OvAttn>)>,
@@ -161,6 +166,16 @@ pub struct AttentionLayer {
     len: usize,
     /// Write high-water mark: one past the furthest position written since the
     /// last `reset` / `restore` (`>= len`; module docs).
+    hwm: usize,
+}
+
+/// One parked sequence's attention state (multi-stream decode): the full
+/// k/v cache buffers plus `len`/`hwm`, swapped whole with the live state by
+/// [`AttentionLayer::select`] (pointer swaps — no copying).
+struct AttnSlot {
+    k: Vec<f32>,
+    v: Vec<f32>,
+    len: usize,
     hwm: usize,
 }
 
@@ -262,6 +277,8 @@ impl AttentionLayer {
         };
         Self {
             ov: None,
+            slots: Vec::new(),
+            live: 0,
             scale: 1.0 / d as f32,
             dims,
             w,
@@ -316,6 +333,51 @@ impl AttentionLayer {
     #[inline]
     fn kv_off(&self, kvh: usize, slot: usize) -> usize {
         (kvh * self.rows + slot) * self.dims.head_dim
+    }
+
+    /// Size the multi-stream slot pool to `n` sequences: each slot owns a full
+    /// k/v cache (`cache_bytes` each) and conv histories. Slot 0 is the state
+    /// live at the call. Growing keeps existing slots.
+    pub fn ensure_slots(&mut self, n: usize) {
+        while self.slots.len() < n {
+            self.slots.push(AttnSlot {
+                k: vec![0.0; self.k.len()],
+                v: vec![0.0; self.v.len()],
+                len: 0,
+                hwm: 0,
+            });
+        }
+        self.k_sconv.ensure_slots(n);
+        self.v_sconv.ensure_slots(n);
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Make sequence `slot`'s KV cache and conv histories the live ones,
+    /// parking the current sequence's. O(1) pointer swaps.
+    pub fn select(&mut self, slot: usize) {
+        assert!(
+            slot < self.slots.len(),
+            "AttentionLayer::select({slot}): pool holds {} slots",
+            self.slots.len()
+        );
+        self.k_sconv.select(slot);
+        self.v_sconv.select(slot);
+        if slot == self.live {
+            return;
+        }
+        let cur = self.live;
+        std::mem::swap(&mut self.k, &mut self.slots[cur].k);
+        std::mem::swap(&mut self.v, &mut self.slots[cur].v);
+        std::mem::swap(&mut self.len, &mut self.slots[cur].len);
+        std::mem::swap(&mut self.hwm, &mut self.slots[cur].hwm);
+        std::mem::swap(&mut self.k, &mut self.slots[slot].k);
+        std::mem::swap(&mut self.v, &mut self.slots[slot].v);
+        std::mem::swap(&mut self.len, &mut self.slots[slot].len);
+        std::mem::swap(&mut self.hwm, &mut self.slots[slot].hwm);
+        self.live = slot;
     }
 
     /// Clear the KV cache and conv histories (new sequence). O(1): nothing is
@@ -706,6 +768,42 @@ impl AttentionLayer {
             ctx_all[row * qd..(row + 1) * qd].copy_from_slice(&c);
         }
         let _ = hd;
+        self.project_out_rows(&ctx_all, t)
+    }
+
+    /// Multi-stream decode: `t` input-normed rows (`hs` = `[t, H]`), row `i`
+    /// belonging to sequence `slots[i]` at that sequence's next position.
+    /// Projections run as one batch (the weights are read once for all
+    /// streams), then each row selects its slot and attends against its own
+    /// cache; returns `[t, H]` before the layer's `attn_sconv`. Per row this
+    /// is the same op sequence as [`Self::forward_token`] on that sequence
+    /// alone (bit-identical on the CPU projections). A slot may appear once
+    /// per call.
+    pub fn forward_rows(&mut self, hs: &[f32], t: usize, slots: &[usize]) -> Vec<f32> {
+        let (hd, hq, hkv, d, dr) = (
+            self.dims.hidden,
+            self.dims.n_heads,
+            self.dims.n_kv_heads,
+            self.dims.head_dim,
+            self.dims.d_rel,
+        );
+        assert_eq!(slots.len(), t, "attn forward_rows: one slot per row");
+        assert_eq!(hs.len(), t * hd, "attn forward_rows: hs len != t * hidden");
+        let (qd, kd, rd) = (hq * d, hkv * d, hq * dr);
+        let (q_all, kr_all, vr_all, r_all) = self.project_rows(hs, t);
+        let mut ctx_all = vec![0.0f32; t * qd];
+        for (row, &slot) in slots.iter().enumerate() {
+            self.select(slot);
+            let kc = self.k_sconv.decode(&kr_all[row * kd..(row + 1) * kd]);
+            let v = self.v_sconv.decode(&vr_all[row * kd..(row + 1) * kd]);
+            let c = self.attend(
+                q_all[row * qd..(row + 1) * qd].to_vec(),
+                kc,
+                &v,
+                &r_all[row * rd..(row + 1) * rd],
+            );
+            ctx_all[row * qd..(row + 1) * qd].copy_from_slice(&c);
+        }
         self.project_out_rows(&ctx_all, t)
     }
 }
