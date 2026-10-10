@@ -115,6 +115,12 @@ pub struct LlamaCppConfig {
     /// placement and frees no device-pool memory (see
     /// `docs/perf/sycl-elastic/placement-b390.md`).
     pub host_layers: Option<String>,
+    /// Speculative decoding with the model's own MTP (nextn) head:
+    /// `--spec-type draft-mtp` on the child. The target model verifies every
+    /// drafted token, so one weight pass yields several tokens: this is the
+    /// biggest decode lever when weights stream (each pass re-reads them).
+    /// Needs a GGUF that carries nextn layers (e.g. Qwen3.8-27B).
+    pub mtp: bool,
     /// Extra raw args appended verbatim to the server command line.
     pub extra_args: Vec<String>,
     /// Health deadline per load attempt. `None` = auto: 60 s + 8 s per GiB
@@ -433,6 +439,20 @@ pub fn llama_host_layer_args(host_layers: Option<&str>) -> Vec<String> {
     }
 }
 
+/// `--spec-type draft-mtp` for [`LlamaCppConfig::mtp`], or nothing. The
+/// draft context runs against the same loaded weights, so no second model
+/// is read. The target model decides every accepted token; its verification
+/// runs as a small batch, so greedy text can differ from plain decoding at
+/// near-ties (batched kernels round differently), as any batch-size change
+/// does.
+pub fn llama_spec_args(mtp: bool) -> Vec<String> {
+    if mtp {
+        vec!["--spec-type".into(), "draft-mtp".into()]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Map a cascadia `--device` value to llama.cpp `--device` args + the ngl
 /// actually in force. `GPU` -> `SYCL0`, `GPU.N` -> `SYCLN`, `CPU` (any case)
 /// -> `--device none` with ngl forced to 0; anything else (SYCL1, Vulkan0,
@@ -709,6 +729,7 @@ impl LlamaCppBuilder {
         {
             cmd.env("GGML_STREAM_EXPERT_CACHE_MB", mb);
         }
+        cmd.args(llama_spec_args(self.cfg.mtp));
         cmd.args(llama_host_layer_args(self.cfg.host_layers.as_deref()));
         for a in self.cfg.extra_args.iter().filter(|a| !a.is_empty()) {
             cmd.arg(a);
@@ -2503,6 +2524,7 @@ mod unix_tests {
             elastic_vram: ElasticVram::Auto,
             elastic_share: None,
             host_layers: None,
+            mtp: false,
             extra_args: vec![],
             load_timeout: Some(Duration::from_secs(1)),
             load_retries: retries,

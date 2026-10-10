@@ -109,6 +109,7 @@ one-GPU box.
 | `--elastic` | off | `GGML_STREAM_WEIGHTS=1` on the child. Before spawn, the resolved binary (and `libggml-base*` next to it) is probed for the `GGML_STREAM_WEIGHTS` marker — a stock build fails fast with an error instead of silently running resident. The host `--elastic` interposer is NOT activated for this engine and is scrubbed from the child's environment (see below). With the default `--elastic-vram auto`, a model that fits runs at stock speed (streaming turns itself off). |
 | `--elastic-vram` | `auto` | Resident-weight VRAM budget in GiB for `--elastic`, passed as `GGML_STREAM_VRAM_MB`. `auto` = free device memory − non-streamed weights − 2× largest layer − `GGML_STREAM_RESERVE_MB`; `0` = stream every layer (maximum packing). If the whole model fits, that model streams nothing; fused ops and SYCL graphs come back on once no loaded model streams. The decision is per load: a draft model (`--llama-args "-md draft.gguf"`) that fits does not change the main model's budget, and the reverse. |
 | `--elastic-share` | — | Expected co-tenant count, forwarded as `GGML_STREAM_VRAM_SHARE` when `--elastic` is on and `--elastic-vram` is `auto`. The child then caps its automatic resident-weight budget at `min(free − overhead, (total − overhead) / N)` so N instances loaded in sequence each target a 1/N share of the card. Warns when combined with an explicit `--elastic-vram` or set without `--elastic`; `GGML_STREAM_RESIDENT_LAYERS` still wins. This is a load-time weight cap only — it does not rebalance KV cache, expert caches, or running instances. |
+| `--llama-mtp` | off | Speculative decoding with the model's own MTP (nextn) head: `--spec-type draft-mtp` on the child. The draft runs against the already loaded weights (no second model). Needs a GGUF with nextn layers; a model without them fails at load. See "Faster decode and prefill". |
 | `--device` | `GPU` (run) / `CPU` (worker) | Device mapping: `GPU` → `SYCL0`, `GPU.N` → `SYCLN`, `CPU` → `--device none` + `-ngl 0`; anything else (`SYCL1`, `Vulkan0`, `SYCL0,SYCL1`) is passed verbatim. |
 | `--llama-bin` | auto | `llama-server` path. Resolution: flag > `CASCADIA_LLAMA_BIN` > `llama-server` (`llama-server.exe`) on `PATH`. |
 | `CASCADIA_LLAMA_BIN` | — | Env fallback for `--llama-bin`. |
@@ -211,6 +212,38 @@ Guidance:
   decode 0.25 -> 2.60 t/s at 1.89 GiB peak; a partial budget adds resident
   layers on top. Set `CASCADIA_EXPERT_CACHE_MB=<MiB>` to pin a hot-expert
   cache on the device (default 0 keeps the resident-layer budget exact).
+
+## Faster decode and prefill
+
+Measured on the Arc Pro B70 (Qwen3.8-27B UD-Q4_K_S, ctx 4096, KV q8_0,
+`-fa on`, 3 chat prompts, 128 tokens; 48 when fully streamed):
+
+| `--elastic-vram` | decode | with `--llama-mtp` | MTP tokens accepted |
+|---|---|---|---|
+| resident (fits) | 19.0 t/s | **26.2 t/s** (+38%) | 199/270 |
+| 12 (62/65 resident) | 18.9 t/s | 19.8 t/s | 199/270 |
+| 8 (42/65) | 0.83 t/s | **2.43 t/s** (2.9x) | 199/271 |
+| 0 (fully streamed) | 0.67 t/s | **2.11 t/s** (3.1x) | 90/118 |
+
+- **`--llama-mtp` is the largest decode lever under streaming.** Every
+  forward pass re-reads the streamed weights; MTP drafts several tokens
+  with the model's own nextn head and the target verifies them in one
+  pass, so the weight traffic is shared by every accepted token. The gain
+  is smallest at 62/65, where the two streamed layers already stay pinned
+  in their slots and decode runs at resident speed.
+- Output: the target model decides every token, but verification runs as a
+  small batch, so greedy text can flip at a near-tie, like any batch-size
+  change (1 of 3 prompts here, one capitalization; the streamed and
+  resident MTP runs accept exactly the same token counts).
+- Keeping the MTP layer resident ahead of the budget was measured and
+  rejected: no gain at 0 or 8 GiB, and at 12 GiB it costs a regular layer
+  (19.8 → 9.7 t/s).
+- MoE (Qwen3.6-35B-A3B) ships no nextn layers, so `--llama-mtp` does not
+  apply. For **streamed MoE prefill**, a larger micro-batch amortizes the
+  expert reads: `--llama-args "-ub 2048"` takes a 2,444-token prompt from
+  185 to 265 t/s (+43%) at +0.3 GiB VRAM. Do not raise it for dense
+  models: on the 27B it is 12-13% slower (resident 194 → 168 t/s, fully
+  streamed 171 → 150 t/s), and resident MoE is 18% slower.
 
 ## Limitations
 
