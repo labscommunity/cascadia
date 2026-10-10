@@ -22,6 +22,7 @@ All numbers come from [`data.json`](./data.json) (verbatim copy of
 | ![fig14](fig14_async_b70.png) | `fig14_async_b70.png` — async stream pool vs the synchronous uploader on the same arms. |
 | ![fig15](fig15_readerpool_b70.png) | `fig15_readerpool_b70.png` — reader-pool thread sweep on the fully streamed 27B (+7-9% over serial pread). |
 | ![fig16](fig16_sharecap_b70.png) | `fig16_sharecap_b70.png` — `--elastic-share N` resident-weight caps vs the uncapped automatic budget. |
+| ![fig17](fig17_mtp.png) | `fig17_mtp.png` — `--llama-mtp` decode on Qwen3.8-27B per `--elastic-vram` budget (median of 3 runs, whiskers = run spread) and its VRAM cost. Data: `data.json` `mtp`; harness `experiments/2026-10-10-review3/spec/mtp_sweep.py`. |
 
 Placement study on a UMA iGPU (Arc B390, Linux), stock vs streaming vs
 pinned host memory computed in place: [`placement-b390.md`](placement-b390.md).
