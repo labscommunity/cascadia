@@ -20,6 +20,6 @@ pub use peer::{PeerEndpoint, PeerLayout};
 pub use shard::{ShardPlan, ShardSpec};
 pub use stats::ApiStats;
 pub use task::{
-    append_resume_ids, resume_generated_seed, validate_resume_ids, GenerationTask, SamplingParams,
-    TaskId,
+    append_resume_ids, resume_generated_seed, validate_resume_ids, ChatTurn, GenerationTask,
+    SamplingParams, TaskId,
 };

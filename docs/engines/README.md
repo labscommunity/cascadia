@@ -1,7 +1,8 @@
 # Engine deep-dives
 
-Cascadia ships seven engines (`cascadia engines` lists them). The three
-OpenVINO pipeline engines are documented here:
+Cascadia ships eight engines (`cascadia engines` lists them). The
+OpenVINO pipeline engines and the external llama.cpp engine are
+documented here:
 
 - [`ov-genai.md`](./ov-genai.md) — single-stage
   `openvino_genai.LLMPipeline`; FastDraft + Prompt Lookup decoding.
@@ -9,6 +10,9 @@ OpenVINO pipeline engines are documented here:
   over pre-exported per-stage shards.
 - [`ov-dist-spec.md`](./ov-dist-spec.md) — multi-stage distributed
   speculative decoding with mask-based KV rewind.
+- [`sycl-llama.md`](./sycl-llama.md) — external llama.cpp SYCL engine
+  (GGUF via a spawned `llama-server`); `--elastic` = device-side weight
+  streaming.
 
 The remaining engines are documented with their model families under
 [`../architectures/`](../architectures/):

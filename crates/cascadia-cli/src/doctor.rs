@@ -14,9 +14,13 @@
 //! `--features openvino`, the `INTEL_OPENVINO_DIR` env, and enumerates
 //! the OV devices the runtime can actually reach.
 
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
 
 use anyhow::Result;
+use cascadia_engine_llamacpp::{
+    probe_expert_streaming, probe_stream_weights, resolve_llama_bin, StreamWeightsSupport,
+};
 use clap::Parser;
 
 /// Run environment + hardware checks and print a readable report.
@@ -88,6 +92,147 @@ fn first_line_of(cmd: &str, arg: &str) -> Option<String> {
         String::from_utf8_lossy(&out.stderr)
     };
     text.lines().next().map(|l| l.trim().to_string())
+}
+
+/// Run `<bin> <arg>` capturing stdout+stderr, with a hard timeout so a
+/// hung binary can't wedge the report. Returns the trimmed output (stderr
+/// included so loader errors like a missing shared library show up).
+fn run_capturing(bin: &std::path::Path, arg: &str, secs: u64) -> Result<String, String> {
+    use std::sync::mpsc::channel;
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new(bin)
+        .arg(arg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn failed: {e}"))?;
+    // Drain both pipes from the start on their own threads: a child that
+    // fills the ~64 KiB pipe buffer would otherwise block mid-write and
+    // never exit, deadlocking the wait loop below. Chunks go over a
+    // channel rather than a join-on-exit: a probed binary that leaves a
+    // daemon behind keeps the pipe's write end open forever, so joining
+    // the readers would hang the report even though the child is gone.
+    let (tx, rx) = channel::<(bool, Vec<u8>)>();
+    let pipes: [(bool, Option<Box<dyn Read + Send>>); 2] = [
+        (true, child.stdout.take().map(|p| Box::new(p) as _)),
+        (false, child.stderr.take().map(|p| Box::new(p) as _)),
+    ];
+    for (is_out, pipe) in pipes {
+        let Some(mut p) = pipe else { continue };
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match p.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send((is_out, buf[..n].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+    drop(tx);
+    for _ in 0..secs * 10 {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let _ = child.wait();
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                // Readers EOF once every writer is gone; a daemon that
+                // inherited the pipe may never let that happen, so bound
+                // the drain and keep whatever arrived.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while let Some(rem) = deadline.checked_duration_since(Instant::now()) {
+                    match rx.recv_timeout(rem) {
+                        Ok((is_out, chunk)) => {
+                            if is_out {
+                                out.extend_from_slice(&chunk);
+                            } else {
+                                err.extend_from_slice(&chunk);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let text = String::from_utf8_lossy(if !out.is_empty() { &out } else { &err });
+                return Ok(text.trim().to_string());
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    // kill() alone leaves a zombie; wait() reaps it.
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(format!("timed out after {secs} s"))
+}
+
+/// sycl-llama: is there a usable llama-server, does it have the
+/// weight-streaming patch, and which SYCL devices does it see.
+fn check_sycl_llama(r: &mut Report) {
+    let bin = match resolve_llama_bin(
+        None,
+        std::env::var_os("CASCADIA_LLAMA_BIN"),
+        std::env::var_os("PATH"),
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            // Optional engine: a missing binary is a note, not a failure.
+            r.line(Level::Info, "llama-server", "not found");
+            r.note(&format!("{e} (needed only for `--engine sycl-llama`)"));
+            return;
+        }
+    };
+    r.line(Level::Ok, "llama-server", &format!("{}", bin.display()));
+
+    match run_capturing(&bin, "--version", 10) {
+        Ok(v) if v.contains("shared libraries") || v.contains("error while loading") => {
+            r.line(Level::Warn, "llama-server --version", &v);
+            r.note("oneAPI runtime missing: `source /opt/intel/oneapi/setvars.sh` before launching cascadia");
+        }
+        Ok(v) => r.line(Level::Ok, "llama-server --version", &v),
+        Err(e) => r.line(Level::Warn, "llama-server --version", &e),
+    }
+
+    match probe_stream_weights(&bin) {
+        Ok(StreamWeightsSupport::Present) => {
+            r.line(Level::Ok, "weight streaming", "supported (--elastic works)")
+        }
+        Ok(StreamWeightsSupport::Unknown) => r.line(
+            Level::Info,
+            "weight streaming",
+            "could not verify (no libggml-base* / ggml-base*.dll next to the binary)",
+        ),
+        Err(e) => r.line(Level::Warn, "weight streaming", &e),
+    }
+    if probe_expert_streaming(&bin) {
+        r.line(
+            Level::Ok,
+            "MoE expert streaming",
+            "router-aware (--elastic streams selected experts only)",
+        );
+    } else {
+        r.line(
+            Level::Info,
+            "MoE expert streaming",
+            "not present: MoE models stream every expert per token",
+        );
+    }
+
+    match run_capturing(&bin, "--list-devices", 10) {
+        Ok(devs) if !devs.is_empty() => {
+            r.line(Level::Ok, "llama-server devices", "");
+            for l in devs.lines().take(10) {
+                r.note(l);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn check_rust(r: &mut Report) {
@@ -344,6 +489,9 @@ pub fn cmd_doctor(args: DoctorArgs) -> Result<()> {
     check_ov_version(&mut r);
     check_ov_devices(&mut r);
 
+    println!("\nsycl-llama:");
+    check_sycl_llama(&mut r);
+
     println!();
     match r.worst {
         Level::Ok | Level::Info => {
@@ -361,4 +509,75 @@ pub fn cmd_doctor(args: DoctorArgs) -> Result<()> {
         anyhow::bail!("doctor: --strict and one or more checks were not OK");
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Writes `body` to a script and returns it; tests run it as
+    /// `/bin/sh <script>` rather than exec()ing the file. exec() of a file
+    /// fails with ETXTBSY while ANY process holds it open for writing, and a
+    /// child forked by a parallel test inherits our write fd until its own
+    /// exec — so even a closed-at-once `fs::write` races (seen in CI).
+    fn script(body: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.sh");
+        std::fs::write(&p, body).unwrap();
+        let s = p.to_str().unwrap().to_string();
+        (dir, s)
+    }
+
+    fn sh() -> &'static std::path::Path {
+        std::path::Path::new("/bin/sh")
+    }
+
+    /// A child that writes past the ~64 KiB pipe buffer must not deadlock
+    /// the capture: both pipes drain from the start on their own threads.
+    #[test]
+    fn run_capturing_drains_output_larger_than_the_pipe() {
+        let (_dir, f) =
+            script("#!/bin/sh\nhead -c 200000 /dev/zero | tr '\\0' 'x'\necho err >&2\n");
+        let out = run_capturing(sh(), &f, 10).expect("large output captured");
+        assert_eq!(out.len(), 200000);
+        assert!(out.chars().all(|c| c == 'x'));
+    }
+
+    /// A probed binary that leaves a daemon behind keeps the pipe's write
+    /// end open; the capture must return when the foreground child exits
+    /// instead of hanging on the reader threads' join.
+    #[test]
+    fn run_capturing_returns_when_grandchild_holds_the_pipe() {
+        // the background sleep inherits stdout; the foreground exits at once
+        let (_dir, f) = script("#!/bin/sh\nsleep 60 &\necho done\n");
+        let t0 = Instant::now();
+        let out = run_capturing(sh(), &f, 10).expect("capture returned");
+        assert_eq!(out, "done");
+        assert!(t0.elapsed() < Duration::from_secs(15));
+    }
+
+    /// A child sleeping past the deadline is killed AND reaped — kill()
+    /// alone would leave it as a zombie child of this process.
+    #[test]
+    fn run_capturing_kills_and_reaps_on_timeout() {
+        let (_dir, f) = script("#!/bin/sh\nsleep 60\n");
+        let t0 = Instant::now();
+        let err = run_capturing(sh(), &f, 1).unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(t0.elapsed() < Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(300));
+        // An unreaped (or still-running) child is still listed among this
+        // process's children; a reaped one is gone entirely.
+        let children = Command::new("pgrep")
+            .arg("-P")
+            .arg(std::process::id().to_string())
+            .output()
+            .expect("pgrep");
+        assert!(
+            children.stdout.is_empty(),
+            "timed-out child was left behind: {}",
+            String::from_utf8_lossy(&children.stdout)
+        );
+    }
 }

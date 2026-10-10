@@ -1,0 +1,1551 @@
+{
+ "units": "GiB = 2^30 bytes; decode/prefill from llama-server timings",
+ "single_v3_campaign": {
+  "1_5B_stock": {
+   "n": 3,
+   "model": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+   "elastic": false,
+   "load_s": [
+    5.177,
+    0.952
+   ],
+   "peak_vram_gib": [
+    3.353,
+    0.003
+   ],
+   "vram_after_load_gib": [
+    3.268,
+    0.001
+   ],
+   "decode_tps": [
+    206.073,
+    3.767
+   ],
+   "prefill_tps": [
+    27.824,
+    0.837
+   ],
+   "all_exit_clean": true,
+   "vram_back_to_baseline": true
+  },
+  "1_5B_elastic": {
+   "n": 3,
+   "model": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+   "elastic": true,
+   "load_s": [
+    4.504,
+    0.0
+   ],
+   "peak_vram_gib": [
+    3.352,
+    0.005
+   ],
+   "vram_after_load_gib": [
+    3.269,
+    0.005
+   ],
+   "decode_tps": [
+    206.151,
+    2.371
+   ],
+   "prefill_tps": [
+    29.021,
+    0.564
+   ],
+   "all_exit_clean": true,
+   "vram_back_to_baseline": true
+  },
+  "27B_stock": {
+   "n": 3,
+   "model": "Qwen3.8-27B-UD-Q4_K_S.gguf",
+   "elastic": false,
+   "load_s": [
+    18.013,
+    0.0
+   ],
+   "peak_vram_gib": [
+    17.796,
+    0.001
+   ],
+   "vram_after_load_gib": [
+    16.57,
+    0.001
+   ],
+   "decode_tps": [
+    17.846,
+    0.016
+   ],
+   "prefill_tps": [
+    16.515,
+    0.358
+   ],
+   "all_exit_clean": true,
+   "vram_back_to_baseline": true
+  },
+  "27B_elastic": {
+   "n": 3,
+   "model": "Qwen3.8-27B-UD-Q4_K_S.gguf",
+   "elastic": true,
+   "load_s": [
+    18.515,
+    0.003
+   ],
+   "peak_vram_gib": [
+    17.793,
+    0.002
+   ],
+   "vram_after_load_gib": [
+    16.566,
+    0.002
+   ],
+   "decode_tps": [
+    17.825,
+    0.02
+   ],
+   "prefill_tps": [
+    16.772,
+    0.081
+   ],
+   "all_exit_clean": true,
+   "vram_back_to_baseline": true
+  },
+  "35B_a3b_stock": {
+   "n": 3,
+   "model": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+   "elastic": false,
+   "load_s": [
+    26.686,
+    0.944
+   ],
+   "peak_vram_gib": [
+    23.57,
+    0.002
+   ],
+   "vram_after_load_gib": [
+    22.906,
+    0.002
+   ],
+   "decode_tps": [
+    30.287,
+    0.675
+   ],
+   "prefill_tps": [
+    24.892,
+    4.951
+   ],
+   "all_exit_clean": true,
+   "vram_back_to_baseline": true
+  },
+  "35B_a3b_elastic": {
+   "n": 3,
+   "model": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+   "elastic": true,
+   "load_s": [
+    26.519,
+    0.0
+   ],
+   "peak_vram_gib": [
+    23.573,
+    0.002
+   ],
+   "vram_after_load_gib": [
+    22.91,
+    0.002
+   ],
+   "decode_tps": [
+    30.707,
+    0.05
+   ],
+   "prefill_tps": [
+    27.512,
+    0.54
+   ],
+   "all_exit_clean": true,
+   "vram_back_to_baseline": true
+  }
+ },
+ "single": {
+  "1_5B_stock": {
+   "n": 3,
+   "model": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+   "elastic": false,
+   "load_s": [
+    3.003,
+    0.005
+   ],
+   "peak_vram_gib": [
+    1.437,
+    0.081
+   ],
+   "vram_after_load_gib": null,
+   "decode_tps": [
+    204.599,
+    2.856
+   ],
+   "prefill_tps": [
+    9.868,
+    0.12
+   ],
+   "all_exit_clean": null,
+   "vram_back_to_baseline": false
+  },
+  "1_5B_elastic": {
+   "n": 3,
+   "model": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+   "elastic": true,
+   "load_s": [
+    4.01,
+    0.0
+   ],
+   "peak_vram_gib": [
+    1.487,
+    0.617
+   ],
+   "vram_after_load_gib": null,
+   "decode_tps": [
+    14.768,
+    0.266
+   ],
+   "prefill_tps": [
+    8.56,
+    0.058
+   ],
+   "all_exit_clean": null,
+   "vram_back_to_baseline": false
+  },
+  "27B_stock": {
+   "n": 3,
+   "model": "Qwen3.8-27B-UD-Q4_K_S.gguf",
+   "elastic": false,
+   "load_s": [
+    29.06,
+    15.212
+   ],
+   "peak_vram_gib": [
+    15.997,
+    0.172
+   ],
+   "vram_after_load_gib": null,
+   "decode_tps": [
+    16.337,
+    1.585
+   ],
+   "prefill_tps": [
+    4.44,
+    3.019
+   ],
+   "all_exit_clean": null,
+   "vram_back_to_baseline": false
+  },
+  "27B_elastic": {
+   "n": 3,
+   "model": "Qwen3.8-27B-UD-Q4_K_S.gguf",
+   "elastic": true,
+   "load_s": [
+    14.213,
+    0.252
+   ],
+   "peak_vram_gib": [
+    3.38,
+    0.354
+   ],
+   "vram_after_load_gib": null,
+   "decode_tps": [
+    0.645,
+    0.012
+   ],
+   "prefill_tps": [
+    1.334,
+    0.014
+   ],
+   "all_exit_clean": null,
+   "vram_back_to_baseline": false
+  },
+  "35B_a3b_stock": {
+   "n": 3,
+   "model": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+   "elastic": false,
+   "load_s": [
+    25.533,
+    0.005
+   ],
+   "peak_vram_gib": [
+    21.52,
+    0.0
+   ],
+   "vram_after_load_gib": null,
+   "decode_tps": [
+    72.297,
+    0.216
+   ],
+   "prefill_tps": [
+    8.773,
+    0.09
+   ],
+   "all_exit_clean": null,
+   "vram_back_to_baseline": true
+  },
+  "35B_a3b_elastic": {
+   "n": 3,
+   "model": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+   "elastic": true,
+   "load_s": [
+    13.52,
+    0.0
+   ],
+   "peak_vram_gib": [
+    1.96,
+    0.0
+   ],
+   "vram_after_load_gib": null,
+   "decode_tps": [
+    3.441,
+    0.034
+   ],
+   "prefill_tps": [
+    4.141,
+    0.022
+   ],
+   "all_exit_clean": null,
+   "vram_back_to_baseline": true
+  }
+ },
+ "partial": {
+  "models": {
+   "1.5B": [
+    {
+     "arm": "v0",
+     "budget_gib": 0,
+     "mode": "streamed",
+     "resident_layers": 0,
+     "n_layers": 28,
+     "resident_mib": 0,
+     "streamed_mib": 743,
+     "peak_vram_gib": [
+      1.487,
+      0.617
+     ],
+     "decode_tps": [
+      14.768,
+      0.266
+     ],
+     "n": 3,
+     "tokens_identical": true
+    },
+    {
+     "arm": "auto",
+     "budget_gib": "auto",
+     "mode": "resident (fits)",
+     "resident_layers": null,
+     "n_layers": null,
+     "resident_mib": null,
+     "streamed_mib": 0,
+     "peak_vram_gib": [
+      1.38,
+      0.0
+     ],
+     "decode_tps": [
+      206.771,
+      0.0
+     ],
+     "n": 1,
+     "tokens_identical": true
+    }
+   ],
+   "27B": [
+    {
+     "arm": "v0",
+     "budget_gib": 0,
+     "mode": "streamed",
+     "resident_layers": 0,
+     "n_layers": 65,
+     "resident_mib": 0,
+     "streamed_mib": 13087,
+     "peak_vram_gib": [
+      3.38,
+      0.354
+     ],
+     "decode_tps": [
+      0.645,
+      0.012
+     ],
+     "n": 3,
+     "tokens_identical": true
+    },
+    {
+     "arm": "v2",
+     "budget_gib": 2,
+     "mode": "streamed",
+     "resident_layers": 10,
+     "n_layers": 65,
+     "resident_mib": 1920,
+     "streamed_mib": 11167,
+     "peak_vram_gib": [
+      4.94,
+      0.0
+     ],
+     "decode_tps": [
+      0.399,
+      0.0
+     ],
+     "n": 1,
+     "tokens_identical": true
+    },
+    {
+     "arm": "v4",
+     "budget_gib": 4,
+     "mode": "streamed",
+     "resident_layers": 22,
+     "n_layers": 65,
+     "resident_mib": 4035,
+     "streamed_mib": 9051,
+     "peak_vram_gib": [
+      7.0,
+      0.0
+     ],
+     "decode_tps": [
+      0.486,
+      0.0
+     ],
+     "n": 1,
+     "tokens_identical": true
+    },
+    {
+     "arm": "v8",
+     "budget_gib": 8,
+     "mode": "streamed",
+     "resident_layers": 42,
+     "n_layers": 65,
+     "resident_mib": 8012,
+     "streamed_mib": 5074,
+     "peak_vram_gib": [
+      11.565,
+      0.715
+     ],
+     "decode_tps": [
+      0.923,
+      0.061
+     ],
+     "n": 2,
+     "tokens_identical": true
+    },
+    {
+     "arm": "v10",
+     "budget_gib": 10,
+     "mode": "streamed",
+     "resident_layers": 53,
+     "n_layers": 65,
+     "resident_mib": 10212,
+     "streamed_mib": 2874,
+     "peak_vram_gib": [
+      13.0,
+      0.0
+     ],
+     "decode_tps": [
+      1.757,
+      0.0
+     ],
+     "n": 1,
+     "tokens_identical": true
+    },
+    {
+     "arm": "v12",
+     "budget_gib": 12,
+     "mode": "streamed",
+     "resident_layers": 62,
+     "n_layers": 65,
+     "resident_mib": 12265,
+     "streamed_mib": 821,
+     "peak_vram_gib": [
+      16.03,
+      0.0
+     ],
+     "decode_tps": [
+      17.319,
+      0.025
+     ],
+     "n": 2,
+     "tokens_identical": true
+    },
+    {
+     "arm": "v40",
+     "budget_gib": 40,
+     "mode": "resident (fits)",
+     "resident_layers": null,
+     "n_layers": null,
+     "resident_mib": null,
+     "streamed_mib": 0,
+     "peak_vram_gib": [
+      15.89,
+      0.0
+     ],
+     "decode_tps": [
+      17.597,
+      0.0
+     ],
+     "n": 1,
+     "tokens_identical": true
+    },
+    {
+     "arm": "auto",
+     "budget_gib": "auto",
+     "mode": "resident (fits)",
+     "resident_layers": null,
+     "n_layers": null,
+     "resident_mib": null,
+     "streamed_mib": 0,
+     "peak_vram_gib": [
+      15.89,
+      0.0
+     ],
+     "decode_tps": [
+      17.512,
+      0.0
+     ],
+     "n": 1,
+     "tokens_identical": true
+    }
+   ],
+   "MoE": [
+    {
+     "arm": "v0",
+     "budget_gib": 0,
+     "mode": "streamed",
+     "resident_layers": 0,
+     "n_layers": 40,
+     "resident_mib": 0,
+     "streamed_mib": 20279,
+     "peak_vram_gib": [
+      1.96,
+      0.0
+     ],
+     "decode_tps": [
+      3.441,
+      0.034
+     ],
+     "n": 3,
+     "tokens_identical": true
+    },
+    {
+     "arm": "v4",
+     "budget_gib": 4,
+     "mode": "streamed",
+     "resident_layers": 7,
+     "n_layers": 40,
+     "resident_mib": 3617,
+     "streamed_mib": 16662,
+     "peak_vram_gib": [
+      5.81,
+      0.0
+     ],
+     "decode_tps": [
+      2.945,
+      0.0
+     ],
+     "n": 1,
+     "tokens_identical": true
+    },
+    {
+     "arm": "v10",
+     "budget_gib": 10,
+     "mode": "streamed",
+     "resident_layers": 20,
+     "n_layers": 40,
+     "resident_mib": 10137,
+     "streamed_mib": 10141,
+     "peak_vram_gib": [
+      11.99,
+      0.0
+     ],
+     "decode_tps": [
+      4.706,
+      0.0
+     ],
+     "n": 1,
+     "tokens_identical": true
+    },
+    {
+     "arm": "v16",
+     "budget_gib": 16,
+     "mode": "streamed",
+     "resident_layers": 32,
+     "n_layers": 40,
+     "resident_mib": 16161,
+     "streamed_mib": 4118,
+     "peak_vram_gib": [
+      17.71,
+      0.0
+     ],
+     "decode_tps": [
+      10.673,
+      0.0
+     ],
+     "n": 1,
+     "tokens_identical": true
+    },
+    {
+     "arm": "auto",
+     "budget_gib": "auto",
+     "mode": "resident (fits)",
+     "resident_layers": null,
+     "n_layers": null,
+     "resident_mib": null,
+     "streamed_mib": 0,
+     "peak_vram_gib": [
+      21.52,
+      0.0
+     ],
+     "decode_tps": [
+      72.933,
+      0.0
+     ],
+     "n": 1,
+     "tokens_identical": true
+    }
+   ]
+  },
+  "parity": {
+   "identical": 23,
+   "total": 23
+  },
+  "load_hangs": {
+   "not_ready": 7,
+   "starts": 42,
+   "note": "7 load hangs (not ready within 240 s), all recovered by retry; one 27B v40 record overwritten, count kept from sweep-27B.out console; coincides with xe 'Engine memory CAT error class=bcs' resets; stock arms affected too"
+  }
+ },
+ "cotenant_auto": {
+  "cotenant-auto-2": {
+   "n": 2,
+   "instances": [
+    {
+     "stream_line": "stream-weights: model fits (13087 MiB), streaming disabled",
+     "vram_after_load_gib": 14.67,
+     "decode_tps_alone": 17.679,
+     "decode_tps_concurrent": 4.499
+    },
+    {
+     "stream_line": "stream-weights: resident layers 61/65 (12027 MiB resident, 1060 MiB streamed per token)",
+     "vram_after_load_gib": 29.26,
+     "decode_tps_alone": 7.391,
+     "decode_tps_concurrent": 3.871
+    }
+   ],
+   "aggregate_concurrent_tps": 8.37,
+   "peak_vram_gib": 29.44
+  },
+  "cotenant-auto-3": {
+   "n": 3,
+   "instances": [
+    {
+     "stream_line": "stream-weights: model fits (13087 MiB), streaming disabled",
+     "vram_after_load_gib": 14.67,
+     "decode_tps_alone": 17.628,
+     "decode_tps_concurrent": 6.835
+    },
+    {
+     "stream_line": "stream-weights: resident layers 61/65 (12027 MiB resident, 1060 MiB streamed per token)",
+     "vram_after_load_gib": 29.26,
+     "decode_tps_alone": 7.435,
+     "decode_tps_concurrent": 3.252
+    },
+    {
+     "stream_line": "stream-weights: warning: 1406 MiB free, fully streamed needs ~4267 MiB; the driver may evict other processes to host memory",
+     "vram_after_load_gib": 18.06,
+     "decode_tps_alone": 0.711,
+     "decode_tps_concurrent": 0.68
+    }
+   ],
+   "aggregate_concurrent_tps": 10.767,
+   "peak_vram_gib": 30.93
+  }
+ },
+ "metric_note": "decode = llama-server timings.predicted_per_second; single/partial: 2026-10-04 post-reboot sweep, posix_fadvise cold model file, n=3 for stock and fully-streamed arms, n=1-2 for budget arms; v3 MoE stock 34.2 t/s superseded (host state; 78 t/s with both binaries post-reboot)",
+ "concurrent_v3": [
+  {
+   "fleet": "conc_3x27B",
+   "ready": "3/3",
+   "models": [
+    "27B",
+    "27B",
+    "27B"
+   ],
+   "vram_after_each_load_gib": [
+    15.698,
+    30.269,
+    19.054
+   ],
+   "per_instance_tps": [
+    0.531,
+    0.997,
+    0.281
+   ],
+   "aggregate_tps": 1.808,
+   "peak_vram_gib": 31.89,
+   "peak_gtt_gib": 33.527,
+   "all_text_nonempty": true
+  },
+  {
+   "fleet": "conc_5x27B",
+   "ready": "5/5",
+   "models": [
+    "27B",
+    "27B",
+    "27B",
+    "27B",
+    "27B"
+   ],
+   "vram_after_each_load_gib": [
+    16.575,
+    30.217,
+    17.908,
+    30.098,
+    19.915
+   ],
+   "per_instance_tps": [
+    1.431,
+    0.066,
+    0.082,
+    0.067,
+    0.081
+   ],
+   "aggregate_tps": 1.727,
+   "peak_vram_gib": 31.891,
+   "peak_gtt_gib": 45.17,
+   "all_text_nonempty": true
+  },
+  {
+   "fleet": "conc_3x35B",
+   "ready": "3/3",
+   "models": [
+    "35B_a3b",
+    "35B_a3b",
+    "35B_a3b"
+   ],
+   "vram_after_each_load_gib": [
+    21.497,
+    28.694,
+    30.556
+   ],
+   "per_instance_tps": [
+    7.798,
+    1.857,
+    1.868
+   ],
+   "aggregate_tps": 11.523,
+   "peak_vram_gib": 31.525,
+   "peak_gtt_gib": 4.923,
+   "all_text_nonempty": true
+  },
+  {
+   "fleet": "conc_mix",
+   "ready": "5/5",
+   "models": [
+    "27B",
+    "27B",
+    "1.5B",
+    "1.5B",
+    "1.5B"
+   ],
+   "vram_after_each_load_gib": [
+    15.159,
+    30.065,
+    30.772,
+    31.478,
+    18.371
+   ],
+   "per_instance_tps": [
+    3.827,
+    2.405,
+    1.995,
+    1.997,
+    1.979
+   ],
+   "aggregate_tps": 12.204,
+   "peak_vram_gib": 31.889,
+   "peak_gtt_gib": 19.049,
+   "all_text_nonempty": true
+  }
+ ],
+ "fleets_v2": {
+  "fleet_5x27B_elastic": {
+   "vram_after_each_load_gib": [
+    2.543,
+    5.048,
+    7.552,
+    10.056,
+    12.56
+   ],
+   "all_ready": true,
+   "all_query_ok": true,
+   "trace_peak_gib": 14.866
+  },
+  "fleet_mix_2x27B_3x1.5B": {
+   "vram_after_each_load_gib": [
+    2.543,
+    5.048,
+    5.696,
+    6.345,
+    6.994
+   ],
+   "all_ready": true,
+   "all_query_ok": true,
+   "trace_peak_gib": 8.113
+  },
+  "fleet_3x35B_a3b_elastic": {
+   "vram_after_each_load_gib": [
+    2.008,
+    3.976,
+    5.945
+   ],
+   "all_ready": true,
+   "all_query_ok": true,
+   "trace_peak_gib": 6.942
+  },
+  "fleet_2x35B_a3b_stock": {
+   "vram_after_each_load_gib": [
+    21.019,
+    21.431
+   ],
+   "all_ready": true,
+   "all_query_ok": true,
+   "trace_peak_gib": 21.902
+  },
+  "fleet_3x27B_stock": {
+   "vram_after_each_load_gib": [
+    14.681,
+    29.322,
+    30.249
+   ],
+   "all_ready": true,
+   "all_query_ok": true,
+   "trace_peak_gib": 31.475,
+   "note": "3rd instance spilled ~15 GiB to host GTT; concurrent load -> host OOM -> reboot (v2 RUN.md incident log)"
+  }
+ },
+ "latency": {
+  "lat_27B_stock": {
+   "cold_first_ttft_s": 1.343,
+   "warm_ttft_s": [
+    0.43,
+    0.253
+   ],
+   "warm_itl_median_s": [
+    0.0565,
+    0.0563
+   ]
+  },
+  "lat_27B_elastic": {
+   "cold_first_ttft_s": 1.325,
+   "warm_ttft_s": [
+    0.428,
+    0.252
+   ],
+   "warm_itl_median_s": [
+    0.0562,
+    0.0564
+   ]
+  },
+  "lat_35B_a3b_stock": {
+   "cold_first_ttft_s": 0.797,
+   "warm_ttft_s": [
+    0.175,
+    0.099
+   ],
+   "warm_itl_median_s": [
+    0.0137,
+    0.0137
+   ]
+  },
+  "lat_35B_a3b_elastic": {
+   "cold_first_ttft_s": 0.773,
+   "warm_ttft_s": [
+    0.174,
+    0.101
+   ],
+   "warm_itl_median_s": [
+    0.0137,
+    0.0137
+   ]
+  }
+ },
+ "lifecycle": {
+  "cycles_1_5B_stock": {
+   "cycles": 10,
+   "gen_ok": 10,
+   "not_ready": 0,
+   "leaks": 1,
+   "child_survived_exit": 0,
+   "settle_s_max": null,
+   "load_s": [
+    23.366,
+    28.921
+   ],
+   "xe_resets": 145
+  },
+  "cycles_27B_elastic": {
+   "cycles": 5,
+   "gen_ok": 5,
+   "not_ready": 0,
+   "leaks": 0,
+   "child_survived_exit": 0,
+   "settle_s_max": null,
+   "load_s": [
+    84.552,
+    85.782
+   ],
+   "xe_resets": 3
+  }
+ },
+ "lifecycle_retry": {
+  "note": "after this PR: in-engine load retry, default timeouts, 1.5B stock, SYCL1",
+  "cycles": 15,
+  "gen_ok": 15,
+  "cycles_needing_retry": 1,
+  "leaks": 0,
+  "child_survived_exit": 0,
+  "xe_resets": 4,
+  "settle_s_max": 0.0431,
+  "load_s": [
+   4.52,
+   71.57,
+   6.51,
+   8.52,
+   6.52,
+   8.52,
+   6.52,
+   6.52,
+   10.54,
+   6.51,
+   8.52,
+   6.52,
+   6.51,
+   6.51,
+   4.51
+  ],
+  "vram_settled_gib": [
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391
+  ],
+  "vram_before_gib": [
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391,
+   0.0391
+  ]
+ },
+ "parity": [
+  {
+   "tag": "par_27B_stock_SYCL0",
+   "elastic": false,
+   "device": "SYCL0",
+   "decode_tps": 17.839,
+   "peak_vram_gib": 15.83,
+   "back_to_idle": true
+  },
+  {
+   "tag": "par_27B_elastic_SYCL0",
+   "elastic": true,
+   "device": "SYCL0",
+   "decode_tps": 17.828,
+   "peak_vram_gib": 16.635,
+   "back_to_idle": true
+  }
+ ],
+ "sweeps": {
+  "ctx": [
+   {
+    "tag": "ctx2048_stock",
+    "ctx": 2048,
+    "kv": "q8_0",
+    "elastic": false,
+    "peak_vram_gib": 16.284,
+    "decode_tps": 17.822
+   },
+   {
+    "tag": "ctx2048_elastic",
+    "ctx": 2048,
+    "kv": "q8_0",
+    "elastic": true,
+    "peak_vram_gib": 16.097,
+    "decode_tps": 17.834
+   },
+   {
+    "tag": "ctx4096_stock",
+    "ctx": 4096,
+    "kv": "q8_0",
+    "elastic": false,
+    "peak_vram_gib": 16.381,
+    "decode_tps": 17.851
+   },
+   {
+    "tag": "ctx4096_elastic",
+    "ctx": 4096,
+    "kv": "q8_0",
+    "elastic": true,
+    "peak_vram_gib": 16.382,
+    "decode_tps": 17.794
+   },
+   {
+    "tag": "ctx8192_stock",
+    "ctx": 8192,
+    "kv": "q8_0",
+    "elastic": false,
+    "peak_vram_gib": 16.577,
+    "decode_tps": 17.86
+   },
+   {
+    "tag": "ctx8192_elastic",
+    "ctx": 8192,
+    "kv": "q8_0",
+    "elastic": true,
+    "peak_vram_gib": 16.577,
+    "decode_tps": 17.819
+   }
+  ],
+  "kv": [
+   {
+    "tag": "kv_f16_elastic",
+    "ctx": 4096,
+    "kv": "f16",
+    "elastic": true,
+    "peak_vram_gib": 16.437,
+    "decode_tps": 17.94
+   },
+   {
+    "tag": "kv_q8_0_elastic",
+    "ctx": 4096,
+    "kv": "q8_0",
+    "elastic": true,
+    "peak_vram_gib": 16.371,
+    "decode_tps": 17.839
+   },
+   {
+    "tag": "kv_q4_0_elastic",
+    "ctx": 4096,
+    "kv": "q4_0",
+    "elastic": true,
+    "peak_vram_gib": 16.34,
+    "decode_tps": 17.834
+   }
+  ]
+ },
+ "laptop": {
+  "bench": [
+   {
+    "tag": "qwen1.5b_cpu",
+    "model": "qwen2.5-1.5b-int8-ov",
+    "device": "CPU",
+    "load_s": 1.29313325881958,
+    "warmup_s": 0.51,
+    "tok_s": 36.98,
+    "error": null
+   },
+   {
+    "tag": "qwen1.5b_igpu",
+    "model": "qwen2.5-1.5b-int8-ov",
+    "device": "GPU.0",
+    "load_s": 7.316797494888306,
+    "warmup_s": 2.3,
+    "tok_s": 39.04,
+    "error": null
+   },
+   {
+    "tag": "qwen1.5b_rtx",
+    "model": "qwen2.5-1.5b-int8-ov",
+    "device": "GPU.1",
+    "load_s": 10.129847764968872,
+    "warmup_s": 1.25,
+    "tok_s": 8.61,
+    "error": null
+   },
+   {
+    "tag": "qwen1.5b_npu",
+    "model": "qwen2.5-1.5b-int8-ov",
+    "device": "NPU",
+    "load_s": 2.1919796466827393,
+    "warmup_s": 49.03,
+    "tok_s": 0.17,
+    "error": null
+   },
+   {
+    "tag": "gemma_e2b_igpu",
+    "model": "gemma-4-e2b-int4-ov",
+    "device": "GPU.0",
+    "load_s": 14.522903442382812,
+    "warmup_s": 2.28,
+    "tok_s": 14.66,
+    "error": null
+   },
+   {
+    "tag": "gemma_e2b_npu",
+    "model": "gemma-4-e2b-int4-ov",
+    "device": "NPU",
+    "load_s": null,
+    "warmup_s": null,
+    "tok_s": null,
+    "error": "load: RuntimeError('Exception from src\\\\inference\\\\src\\\\cpp\\\\core.cpp:120:\\nException from src\\\\inference\\\\src\\\\dev\\\\plugin.cpp:54:\\nException from src\\\\inference\\\\src\\\\dev\\\\plugin.cpp:54:\\nException from src\\\\plugins\\\\intel_npu\\\\src\\\\plugin\\\\src\\\\plugin.cpp:552:\\nException from src\\\\plugins\\\\intel_npu\\\\src\\\\compiler_adapter\\\\src\\\\ze_graph_ext_wrappers.cpp:433:\\nCompilation failed. Level0 pfnCreate2 result: ZE_RESULT_ERROR_INVALID_NULL_POINTER, code 0x78000007 - pointer argument may not be nullptr . [NPU_VCL] Compiler returned msg:\\nCompilation failed\\n\\n\\n\\n\\n')"
+   }
+  ],
+  "cpu_cotenancy": {
+   "single": {
+    "n": 1,
+    "aggregate_tps": 33.36,
+    "per_instance_tps": [
+     33.36
+    ],
+    "ws_mb_each": [
+     3131
+    ]
+   },
+   "triple": {
+    "n": 3,
+    "aggregate_tps": 40.15,
+    "per_instance_tps": [
+     13.28,
+     13.47,
+     13.4
+    ],
+    "ws_mb_each": [
+     3130,
+     3127,
+     3130
+    ]
+   }
+  }
+ },
+ "mtp": {
+  "date": "2026-10-10",
+  "setup": "Qwen3.8-27B UD-Q4_K_S, Arc Pro B70 (SYCL1), patched llama-server (0001+0002), ctx 4096, KV q8_0, -fa on, --parallel 1; 3 chat prompts x 64 tokens, greedy, thinking off; --spec-type draft-mtp for the MTP arms. n=3 fresh server processes per arm; tps_median = median over runs of the per-run mean over prompts. peak_gib_max = max over runs of (vram_mm peak - idle) through load + generation. draft counts are summed over the 3 prompts of one run.",
+  "tokens": 64,
+  "arms": [
+   {
+    "arm": "resident",
+    "budget_mib": null,
+    "mtp": false,
+    "tps_runs": [
+     19.044,
+     19.008,
+     18.986
+    ],
+    "tps_median": 19.008,
+    "peak_gib_max": 15.38,
+    "draft_acc": 0,
+    "draft_n": 0,
+    "split": [],
+    "retries": 0
+   },
+   {
+    "arm": "resident",
+    "budget_mib": null,
+    "mtp": true,
+    "tps_runs": [
+     26.466,
+     26.478,
+     26.48
+    ],
+    "tps_median": 26.478,
+    "peak_gib_max": 16.14,
+    "draft_acc": 111,
+    "draft_n": 149,
+    "split": [],
+    "retries": 0
+   },
+   {
+    "arm": "12 GiB",
+    "budget_mib": 12288,
+    "mtp": false,
+    "tps_runs": [
+     18.577,
+     18.535,
+     18.56
+    ],
+    "tps_median": 18.56,
+    "peak_gib_max": 15.52,
+    "draft_acc": 0,
+    "draft_n": 0,
+    "split": [
+     "stream-weights: resident layers 62/65 (12265 MiB resident, 821 MiB streamed per token)"
+    ],
+    "retries": 0
+   },
+   {
+    "arm": "12 GiB",
+    "budget_mib": 12288,
+    "mtp": true,
+    "tps_runs": [
+     19.369,
+     19.096,
+     19.325
+    ],
+    "tps_median": 19.325,
+    "peak_gib_max": 16.11,
+    "draft_acc": 111,
+    "draft_n": 149,
+    "split": [
+     "stream-weights: resident layers 62/65 (12265 MiB resident, 821 MiB streamed per token)"
+    ],
+    "retries": 0
+   },
+   {
+    "arm": "8 GiB",
+    "budget_mib": 8192,
+    "mtp": false,
+    "tps_runs": [
+     0.781,
+     0.8,
+     0.805
+    ],
+    "tps_median": 0.8,
+    "peak_gib_max": 10.74,
+    "draft_acc": 0,
+    "draft_n": 0,
+    "split": [
+     "stream-weights: resident layers 42/65 (8012 MiB resident, 5074 MiB streamed per token)"
+    ],
+    "retries": 0
+   },
+   {
+    "arm": "8 GiB",
+    "budget_mib": 8192,
+    "mtp": true,
+    "tps_runs": [
+     2.385,
+     2.397,
+     2.336
+    ],
+    "tps_median": 2.385,
+    "peak_gib_max": 11.87,
+    "draft_acc": 111,
+    "draft_n": 149,
+    "split": [
+     "stream-weights: resident layers 42/65 (8012 MiB resident, 5074 MiB streamed per token)"
+    ],
+    "retries": 0
+   },
+   {
+    "arm": "0 (fully streamed)",
+    "budget_mib": 0,
+    "mtp": false,
+    "tps_runs": [
+     0.667,
+     0.666,
+     0.668
+    ],
+    "tps_median": 0.667,
+    "peak_gib_max": 3.01,
+    "draft_acc": 0,
+    "draft_n": 0,
+    "split": [
+     "stream-weights: resident layers 0/65 (0 MiB resident, 13087 MiB streamed per token)"
+    ],
+    "retries": 0
+   },
+   {
+    "arm": "0 (fully streamed)",
+    "budget_mib": 0,
+    "mtp": true,
+    "tps_runs": [
+     2.018,
+     2.017,
+     2.067
+    ],
+    "tps_median": 2.018,
+    "peak_gib_max": 4.13,
+    "draft_acc": 110,
+    "draft_n": 151,
+    "split": [
+     "stream-weights: resident layers 0/65 (0 MiB resident, 13087 MiB streamed per token)"
+    ],
+    "retries": 0
+   }
+  ]
+ },
+ "mtp_draft_n": {
+  "date": "2026-10-10",
+  "setup": "--llama-mtp with --llama-args \"--spec-draft-n-max N\" (llama-server default 3). Same model, prompts and settings as `mtp`; n=2 fresh servers per point, tps_median = median of the 2 run means. draft counts from the first run, summed over 3 prompts.",
+  "points": [
+   {
+    "arm": "resident",
+    "n_max": 1,
+    "tps_runs": [
+     23.974,
+     23.916
+    ],
+    "tps_median": 23.945,
+    "draft_acc": 76,
+    "draft_n": 85,
+    "peak_gib_max": 15.85
+   },
+   {
+    "arm": "resident",
+    "n_max": 2,
+    "tps_runs": [
+     26.485,
+     26.391
+    ],
+    "tps_median": 26.438,
+    "draft_acc": 103,
+    "draft_n": 122,
+    "peak_gib_max": 15.74
+   },
+   {
+    "arm": "resident",
+    "n_max": 3,
+    "tps_runs": [
+     26.148,
+     26.528
+    ],
+    "tps_median": 26.338,
+    "draft_acc": 110,
+    "draft_n": 151,
+    "peak_gib_max": 16.14
+   },
+   {
+    "arm": "resident",
+    "n_max": 4,
+    "tps_runs": [
+     25.257,
+     24.658
+    ],
+    "tps_median": 24.958,
+    "draft_acc": 117,
+    "draft_n": 178,
+    "peak_gib_max": 16.29
+   },
+   {
+    "arm": "resident",
+    "n_max": 6,
+    "tps_runs": [
+     22.375,
+     22.45
+    ],
+    "tps_median": 22.412,
+    "draft_acc": 123,
+    "draft_n": 244,
+    "peak_gib_max": 16.58
+   },
+   {
+    "arm": "8 GiB",
+    "n_max": 1,
+    "tps_runs": [
+     1.554,
+     1.395
+    ],
+    "tps_median": 1.474,
+    "draft_acc": 75,
+    "draft_n": 86,
+    "peak_gib_max": 11.67
+   },
+   {
+    "arm": "8 GiB",
+    "n_max": 2,
+    "tps_runs": [
+     1.953,
+     2.035
+    ],
+    "tps_median": 1.994,
+    "draft_acc": 102,
+    "draft_n": 122,
+    "peak_gib_max": 11.72
+   },
+   {
+    "arm": "8 GiB",
+    "n_max": 3,
+    "tps_runs": [
+     2.451,
+     2.455
+    ],
+    "tps_median": 2.453,
+    "draft_acc": 111,
+    "draft_n": 149,
+    "peak_gib_max": 11.82
+   },
+   {
+    "arm": "8 GiB",
+    "n_max": 4,
+    "tps_runs": [
+     2.714,
+     2.69
+    ],
+    "tps_median": 2.702,
+    "draft_acc": 117,
+    "draft_n": 178,
+    "peak_gib_max": 12.01
+   },
+   {
+    "arm": "8 GiB",
+    "n_max": 6,
+    "tps_runs": [
+     2.751,
+     2.895
+    ],
+    "tps_median": 2.823,
+    "draft_acc": 121,
+    "draft_n": 255,
+    "peak_gib_max": 12.3
+   }
+  ]
+ },
+ "mtp_cpu_gpu": {
+  "date": "2026-10-10",
+  "setup": "Through `cascadia run --engine sycl-llama` (child pinned to --parallel 1), Qwen3.8-27B UD-Q4_K_S, ctx 4096, -ctk q8_0 -fa on, 3 chat prompts x 64 tokens, greedy, thinking off, n=3 cascadia processes per arm. wall_tps = completion_tokens / request wall time at the client (includes prefill and the first request's warmup; cascadia itself adds no measurable latency: 3.67 s vs 3.71 s for the same request sent to the child directly). cores = llama-server (utime+stime) / wall over the 3 requests. peak_rss_gib = llama-server VmRSS peak (on GPU arms mostly the page-cached mmap of the GGUF). peak_vram_gib = vram_mm peak - idle on SYCL1.",
+  "arms": [
+   {
+    "arm": "gpu-resident",
+    "mtp": false,
+    "wall_tps_runs": [
+     13.724,
+     13.69,
+     13.712
+    ],
+    "wall_tps": 13.712,
+    "cores": 1.004,
+    "peak_rss_gib": 15.59,
+    "peak_vram_gib": 15.38,
+    "texts_stable": false
+   },
+   {
+    "arm": "gpu-resident",
+    "mtp": true,
+    "wall_tps_runs": [
+     16.319,
+     16.535,
+     16.407
+    ],
+    "wall_tps": 16.407,
+    "cores": 1.0,
+    "peak_rss_gib": 15.59,
+    "peak_vram_gib": 15.88,
+    "texts_stable": true
+   },
+   {
+    "arm": "gpu-streamed-8",
+    "mtp": false,
+    "wall_tps_runs": [
+     0.794,
+     0.792,
+     0.791
+    ],
+    "wall_tps": 0.792,
+    "cores": 3.081,
+    "peak_rss_gib": 15.43,
+    "peak_vram_gib": 11.37,
+    "texts_stable": true
+   },
+   {
+    "arm": "gpu-streamed-8",
+    "mtp": true,
+    "wall_tps_runs": [
+     2.108,
+     2.138,
+     2.099
+    ],
+    "wall_tps": 2.108,
+    "cores": 2.942,
+    "peak_rss_gib": 15.59,
+    "peak_vram_gib": 11.97,
+    "texts_stable": true
+   },
+   {
+    "arm": "cpu",
+    "mtp": false,
+    "wall_tps_runs": [
+     1.75,
+     1.76,
+     1.761
+    ],
+    "wall_tps": 1.76,
+    "cores": 7.985,
+    "peak_rss_gib": 18.35,
+    "peak_vram_gib": 0.0,
+    "texts_stable": true
+   },
+   {
+    "arm": "cpu",
+    "mtp": true,
+    "wall_tps_runs": [
+     2.447,
+     2.444,
+     2.443
+    ],
+    "wall_tps": 2.444,
+    "cores": 9.662,
+    "peak_rss_gib": 19.25,
+    "peak_vram_gib": 0.0,
+    "texts_stable": true
+   }
+  ],
+  "before_parallel_1": {
+   "note": "same harness before the engine pinned --parallel 1 (llama-server default -1 = 4 slots, unified KV)",
+   "arms": [
+    {
+     "arm": "gpu-resident",
+     "mtp": false,
+     "wall_tps": 13.654,
+     "peak_vram_gib": 15.81,
+     "peak_rss_gib": 15.58
+    },
+    {
+     "arm": "gpu-resident",
+     "mtp": true,
+     "wall_tps": 16.463,
+     "peak_vram_gib": 17.91,
+     "peak_rss_gib": 15.47
+    },
+    {
+     "arm": "gpu-streamed-8",
+     "mtp": false,
+     "wall_tps": 0.77,
+     "peak_vram_gib": 11.18,
+     "peak_rss_gib": 15.39
+    },
+    {
+     "arm": "gpu-streamed-8",
+     "mtp": true,
+     "wall_tps": 2.097,
+     "peak_vram_gib": 13.64,
+     "peak_rss_gib": 15.43
+    },
+    {
+     "arm": "cpu",
+     "mtp": false,
+     "wall_tps": 1.75,
+     "peak_vram_gib": 0.0,
+     "peak_rss_gib": 18.79
+    },
+    {
+     "arm": "cpu",
+     "mtp": true,
+     "wall_tps": 2.39,
+     "peak_vram_gib": 0.0,
+     "peak_rss_gib": 21.02
+    }
+   ]
+  }
+ }
+}

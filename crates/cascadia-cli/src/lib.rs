@@ -10,6 +10,10 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use cascadia_engine::Builder;
+use cascadia_engine_llamacpp::{
+    probe_stream_weights, resolve_llama_bin, validate_extra_args, ElasticVram, LlamaCppBuilder,
+    LlamaCppConfig, StreamWeightsSupport,
+};
 use cascadia_engine_mock::MockBuilder;
 use cascadia_engine_openvino::{
     Gemma4Builder, OvDistSpecBuilder, OvDistSpecWorkerBuilder, OvGenaiBuilder, OvRuntimeBuilder,
@@ -50,6 +54,7 @@ fn engine_name(kind: EngineKind) -> &'static str {
         EngineKind::Gemma4 => "gemma4",
         EngineKind::SparseMoe => "sparse-moe",
         EngineKind::Qwen36Moe => "qwen35",
+        EngineKind::SyclLlama => "sycl-llama",
     }
 }
 
@@ -223,6 +228,12 @@ pub enum EngineKind {
     /// docs/architectures/qwen36-moe-support.md and qwen3.8.md).
     #[value(name = "qwen35", alias = "qwen36-moe")]
     Qwen36Moe,
+    /// External llama.cpp SYCL engine: spawns a llama-server child and
+    /// proxies its OpenAI API. Single-stage, batch=1. On this engine,
+    /// `--elastic` maps to GGML_STREAM_WEIGHTS=1 on the child — device-side
+    /// weight streaming (disk-tier O1), orthogonal to the host interposer.
+    #[value(name = "sycl-llama")]
+    SyclLlama,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -253,6 +264,41 @@ pub struct WorkerArgs {
     /// worker never downloads or converts models; only `cascadia shard` does.
     #[arg(long)]
     pub model: String,
+
+    /// Path to a llama-server binary — sycl-llama engine only. Optional:
+    /// resolved as --llama-bin > $CASCADIA_LLAMA_BIN > `llama-server` on
+    /// PATH. With `--elastic` the resolved build is probed for
+    /// weight-streaming support (GGML_STREAM_WEIGHTS) and a stock build is
+    /// rejected — see scripts/build-llama-stream.sh.
+    #[arg(long)]
+    pub llama_bin: Option<String>,
+
+    /// Context size for the spawned llama-server (-c). sycl-llama only.
+    #[arg(long, default_value_t = 4096)]
+    pub llama_ctx: u32,
+
+    /// GPU layers for the spawned llama-server (-ngl). sycl-llama only.
+    #[arg(long, default_value_t = 99)]
+    pub llama_ngl: u32,
+
+    /// Extra raw arguments appended to the llama-server command line,
+    /// verbatim. One value per occurrence, split on spaces — quote args
+    /// that contain spaces: `--llama-args "-ctk q8_0 -fa on"`. Repeatable.
+    /// sycl-llama only.
+    #[arg(long, allow_hyphen_values = true, value_delimiter = ' ')]
+    pub llama_args: Vec<String>,
+
+    /// Per-attempt health deadline for the spawned llama-server, in
+    /// seconds. Default: auto = 60 + 8 per GiB of model file (300 when the
+    /// file is unreadable). sycl-llama only.
+    #[arg(long, value_name = "SECS")]
+    pub llama_load_timeout: Option<u64>,
+
+    /// Extra load attempts when llama-server exits or hangs during load
+    /// (xe copy-engine resets intermittently hang the load path; the next
+    /// attempt nearly always succeeds). sycl-llama only.
+    #[arg(long, default_value_t = 1)]
+    pub llama_load_retries: u32,
 
     /// Name reported by `/v1/models` and accepted as the `model` field in
     /// requests. Defaults to the basename of `--model` (so a local path like
@@ -412,6 +458,11 @@ pub struct WorkerArgs {
     /// in-process via Detours (built only when DETOURS_DIR was set — otherwise
     /// the flag parses but reports inactive). The OV knobs cannot substitute:
     /// they cannot disable oneDNN's dirty repacked copies (D-004).
+    ///
+    /// On `--engine sycl-llama` this instead maps to GGML_STREAM_WEIGHTS=1
+    /// on the spawned llama-server (device-side weight streaming — O1
+    /// posture); the resolved binary (see --llama-bin) is probed for
+    /// streaming support before spawn and a stock build is rejected.
     #[arg(long)]
     pub elastic: bool,
 
@@ -427,6 +478,30 @@ pub struct WorkerArgs {
     /// tax). Ignored without `--elastic`.
     #[arg(long, value_name = "MB", default_value_t = 8192)]
     pub elastic_pool_mb: u32,
+
+    /// Resident-weight VRAM budget for `--elastic` on sycl-llama, in GiB:
+    /// `auto` keeps whatever fits resident on the GPU, `0` streams every
+    /// layer (maximum packing). Passed to the child as
+    /// GGML_STREAM_VRAM_MB. sycl-llama only; ignored without `--elastic`.
+    #[arg(long, value_name = "auto|GiB", default_value_t = ElasticVram::Auto)]
+    pub elastic_vram: ElasticVram,
+
+    /// Expected co-tenant count for `--elastic` on sycl-llama: caps the
+    /// child's automatic resident-weight budget at a 1/N share of the card
+    /// (GGML_STREAM_VRAM_SHARE), so N co-loaded instances get an equal
+    /// share instead of first-come-takes-all. Only applies to
+    /// `--elastic-vram auto`; explicit budgets and
+    /// GGML_STREAM_RESIDENT_LAYERS win. sycl-llama only; ignored without
+    /// `--elastic`.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub elastic_share: Option<u32>,
+
+    /// sycl-llama: speculative decoding with the model's own MTP (nextn)
+    /// head (`--spec-type draft-mtp`). The target verifies every drafted
+    /// token; needs a GGUF with nextn layers (e.g. Qwen3.8-27B). Biggest
+    /// gain when `--elastic` streams weights: one pass yields several tokens.
+    #[arg(long)]
+    pub llama_mtp: bool,
 
     /// NPU LLM prefill chunk size (NPUW_LLM_PREFILL_CHUNK_SIZE, OV 2025.3+).
     /// Applied only with --engine ov-genai on an NPU device; dropped with a
@@ -735,8 +810,66 @@ pub struct RunArgs {
     /// mappings so RAM stays kernel-reclaimable (ramlab exp 198). See
     /// `cascadia worker --help` for `--elastic-min-mb` / `--elastic-pool-mb`
     /// tuning; `run` uses the measured defaults (1 MB threshold, pool on).
+    /// On `--engine sycl-llama` this maps to GGML_STREAM_WEIGHTS=1 on the
+    /// spawned llama-server (device-side weight streaming — O1 posture);
+    /// the resolved llama-server build is probed for streaming support
+    /// first (see --llama-bin).
     #[arg(long)]
     pub elastic: bool,
+
+    /// Resident-weight VRAM budget for `--elastic` on sycl-llama, in GiB:
+    /// `auto` keeps whatever fits resident on the GPU, `0` streams every
+    /// layer (maximum packing). Passed to the child as
+    /// GGML_STREAM_VRAM_MB. sycl-llama only; ignored without `--elastic`.
+    #[arg(long, value_name = "auto|GiB", default_value_t = ElasticVram::Auto)]
+    pub elastic_vram: ElasticVram,
+
+    /// Expected co-tenant count for `--elastic` on sycl-llama: caps the
+    /// child's automatic resident-weight budget at a 1/N share of the card
+    /// (GGML_STREAM_VRAM_SHARE), so N co-loaded instances get an equal
+    /// share instead of first-come-takes-all. Only applies to
+    /// `--elastic-vram auto`; explicit budgets and
+    /// GGML_STREAM_RESIDENT_LAYERS win. sycl-llama only; ignored without
+    /// `--elastic`.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub elastic_share: Option<u32>,
+
+    /// sycl-llama: speculative decoding with the model's own MTP (nextn)
+    /// head (`--spec-type draft-mtp`). The target verifies every drafted
+    /// token; needs a GGUF with nextn layers (e.g. Qwen3.8-27B). Biggest
+    /// gain when `--elastic` streams weights: one pass yields several tokens.
+    #[arg(long)]
+    pub llama_mtp: bool,
+
+    /// Path to a llama-server binary — sycl-llama engine only. Optional:
+    /// resolved as --llama-bin > $CASCADIA_LLAMA_BIN > `llama-server` on
+    /// PATH. See `cascadia worker --help`.
+    #[arg(long)]
+    pub llama_bin: Option<String>,
+
+    /// Context size for the spawned llama-server (-c). sycl-llama only.
+    #[arg(long, default_value_t = 4096)]
+    pub llama_ctx: u32,
+
+    /// GPU layers for the spawned llama-server (-ngl). sycl-llama only.
+    #[arg(long, default_value_t = 99)]
+    pub llama_ngl: u32,
+
+    /// Extra raw arguments for the spawned llama-server. One value per
+    /// occurrence, split on spaces: `--llama-args "-ctk q8_0 -fa on"`.
+    /// Repeatable. sycl-llama only.
+    #[arg(long, allow_hyphen_values = true, value_delimiter = ' ')]
+    pub llama_args: Vec<String>,
+
+    /// Per-attempt llama-server health deadline (seconds). Default: auto =
+    /// 60 + 8 per GiB of model file. sycl-llama only.
+    #[arg(long, value_name = "SECS")]
+    pub llama_load_timeout: Option<u64>,
+
+    /// Extra load attempts when llama-server exits or hangs during load.
+    /// sycl-llama only.
+    #[arg(long, default_value_t = 1)]
+    pub llama_load_retries: u32,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -828,6 +961,15 @@ impl WorkerArgs {
             ffn_axpy_prebuild: false,
             ffn_sparsity_thresholds_file: None,
             ffn_sparsity_capture_dir: None,
+            llama_bin: None,
+            llama_ctx: 4096,
+            llama_ngl: 99,
+            llama_args: Vec::new(),
+            llama_load_timeout: None,
+            llama_load_retries: 1,
+            elastic_vram: ElasticVram::Auto,
+            elastic_share: None,
+            llama_mtp: false,
         }
     }
 }
@@ -1015,9 +1157,15 @@ impl OvExecutionMode {
 /// so `main` can call it while the process is still single-threaded — env
 /// mutation and `execv` are only safe there.
 pub fn activate_elastic_if_requested(cli: &Cli) {
+    // sycl-llama's --elastic is the child's own device-side streaming
+    // (GGML_STREAM_WEIGHTS); the host interposer would only intercept the
+    // tiny cascadia parent's allocations and must not be inherited by
+    // llama-server (its staging buffer needs plain anonymous pages).
     let (min_mb, pool_mb) = match &cli.cmd {
-        Command::Worker(a) if a.elastic => (a.elastic_min_mb, a.elastic_pool_mb),
-        Command::Run(a) if a.elastic => (1, 8192),
+        Command::Worker(a) if a.elastic && a.engine != EngineKind::SyclLlama => {
+            (a.elastic_min_mb, a.elastic_pool_mb)
+        }
+        Command::Run(a) if a.elastic && a.engine != EngineKind::SyclLlama => (1, 8192),
         _ => return,
     };
     if cascadia_elastic::is_active() {
@@ -1082,6 +1230,15 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     // (ov_perf_properties) fires; the interposer itself was already activated
     // in main before the async runtime started.
     worker.elastic = args.elastic;
+    worker.llama_bin = args.llama_bin;
+    worker.llama_ctx = args.llama_ctx;
+    worker.llama_ngl = args.llama_ngl;
+    worker.llama_args = args.llama_args;
+    worker.llama_load_timeout = args.llama_load_timeout;
+    worker.llama_load_retries = args.llama_load_retries;
+    worker.elastic_vram = args.elastic_vram;
+    worker.elastic_share = args.elastic_share;
+    worker.llama_mtp = args.llama_mtp;
     cmd_worker(worker).await
 }
 
@@ -1107,6 +1264,7 @@ fn cmd_engines() -> Result<()> {
     println!("  ov-dist-spec   multi-stage spec decode (mask-based KV rewind); v5 shards");
     println!("  gemma4         Gemma 4 multi-stage (per-layer-type attn, KV-sharing, PLI, sliding window); gemma4_cached_v1.x shards");
     println!("  sparse-moe     sparse mixture-of-experts on CPU: Kimi K2.6 (AVX-512 int4 GEMM), MiniMax-M2 (OV-IR shells), GLM-5 / DeepSeek-V4 / Inkling (Rust shells + int4 mmap experts, N-rank pipeline)");
+    println!("  sycl-llama     external llama.cpp SYCL server (GGUF, spawned subprocess); bin via --llama-bin / CASCADIA_LLAMA_BIN / PATH; --elastic = GGML_STREAM_WEIGHTS device-side streaming (needs a streaming build, scripts/build-llama-stream.sh)");
     println!("  qwen35         Qwen3.5-family staged chain (GatedDeltaNet; 3.5/3.6 MoE or 3.8 dense); qwen3_5* IR-surgery shards (alias: qwen36-moe)");
     Ok(())
 }
@@ -1715,6 +1873,59 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
             }
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }
+        EngineKind::SyclLlama => {
+            if args.total != 1 {
+                return Err(anyhow!("sycl-llama is single-stage only; use --total 1"));
+            }
+            let bin = resolve_llama_bin(
+                args.llama_bin.as_deref(),
+                std::env::var_os("CASCADIA_LLAMA_BIN"),
+                std::env::var_os("PATH"),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+            // --elastic on sycl-llama = GGML_STREAM_WEIGHTS=1 on the child:
+            // device-side O1 (weights stay on disk, streamed per layer).
+            // The host interposer still applies to the process itself.
+            if args.elastic {
+                match probe_stream_weights(&bin) {
+                    Ok(StreamWeightsSupport::Present) => {}
+                    Ok(StreamWeightsSupport::Unknown) => {
+                        warn!(
+                            bin = %bin.display(),
+                            "could not verify weight-streaming support in this llama-server \
+                             build; --elastic may not reduce VRAM"
+                        );
+                    }
+                    Err(e) => return Err(anyhow!("{e}")),
+                }
+                tracing::warn!(
+                    "sycl-llama --elastic: enabling GGML_STREAM_WEIGHTS on the child \
+                     (device weight streaming; ~8 GB/s / model_GB decode, KV still reserved)"
+                );
+            }
+            let extra_args: Vec<String> = args
+                .llama_args
+                .iter()
+                .filter(|a| !a.is_empty())
+                .cloned()
+                .collect();
+            validate_extra_args(&extra_args, args.llama_mtp).map_err(|e| anyhow!("{e}"))?;
+            Ok(Box::new(LlamaCppBuilder::new(LlamaCppConfig {
+                llama_bin: bin,
+                model: args.model.clone().into(),
+                device: args.device.clone(),
+                ctx: args.llama_ctx,
+                ngl: args.llama_ngl,
+                elastic: args.elastic,
+                elastic_vram: args.elastic_vram,
+                elastic_share: args.elastic_share,
+                host_layers: None,
+                mtp: args.llama_mtp,
+                extra_args,
+                load_timeout: args.llama_load_timeout.map(std::time::Duration::from_secs),
+                load_retries: args.llama_load_retries,
+            })))
+        }
         EngineKind::Qwen36Moe => {
             // These three were added to Qwen36Builder (bd75446 / fdbc11e) but never wired HERE, so the
             // setters had no caller and the "fix" has never executed in a cert run. Every other OV arm
@@ -2298,6 +2509,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             EngineKind::Qwen36Moe => {
                 cascadia_api::load_chat_template_config_at(std::path::Path::new(&args.model))
             }
+            EngineKind::SyclLlama => cascadia_api::ChatTemplateConfig::default(),
             // sparse-moe exports (dsv4) keep the tokenizer files and
             // chat_template.jinja at the model root, not in a tokenizer/
             // subdir. Read the root first; fall back to the subdir layout so
@@ -2344,6 +2556,10 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // the thinking-OFF path (engine sets apply_chat_template=false then);
         // thinking-ON stays on ov-genai's native template, untouched.
         cfg.defer_template_on_thinking = matches!(args.engine, EngineKind::OvGenai);
+        // sycl-llama's child renders the GGUF template itself (the engine
+        // forwards the structured turns + tools); the API-side render is
+        // only a placeholder so tool requests are not refused here
+        cfg.engine_applies_template = matches!(args.engine, EngineKind::SyclLlama);
         // `CASCADIA_API_MAX_CONCURRENT`: in-flight request cap (backpressure is
         // 503 beyond it). A multi-stream engine serves `CASCADIA_STREAMS` at
         // once, so a client that sends that many requests at once needs the
@@ -2475,6 +2691,9 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         let task = GenerationTask {
             task_id: format!("stdin-{counter}"),
             prompt: line,
+            messages: Vec::new(),
+            tools: None,
+            tool_choice: None,
             max_tokens: args.max_tokens,
             temperature: 0.0,
             logprobs: 0,
@@ -3991,5 +4210,202 @@ mod tests {
                 ("10.0.0.2".to_string(), 9100)
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod sycl_llama_flag_tests {
+    use super::*;
+
+    fn run_args(argv: &[&str]) -> RunArgs {
+        let cli = Cli::try_parse_from(argv).expect("parse run argv");
+        match cli.cmd {
+            Command::Run(args) => args,
+            _ => panic!("expected run subcommand"),
+        }
+    }
+
+    fn worker_args(argv: &[&str]) -> WorkerArgs {
+        let cli = Cli::try_parse_from(argv).expect("parse worker argv");
+        match cli.cmd {
+            Command::Worker(args) => args,
+            _ => panic!("expected worker subcommand"),
+        }
+    }
+
+    #[test]
+    fn run_llama_args_split_on_spaces_and_following_flags_parse() {
+        let a = run_args(&[
+            "cascadia",
+            "run",
+            "m.gguf",
+            "--engine",
+            "sycl-llama",
+            "--llama-args",
+            "-ctk q8_0 -fa on",
+            "--elastic",
+        ]);
+        assert_eq!(a.llama_args, ["-ctk", "q8_0", "-fa", "on"]);
+        assert!(a.elastic);
+    }
+
+    #[test]
+    fn worker_llama_args_split_on_spaces() {
+        let a = worker_args(&[
+            "cascadia",
+            "worker",
+            "--rank",
+            "0",
+            "--total",
+            "1",
+            "--model",
+            "m.gguf",
+            "--engine",
+            "sycl-llama",
+            "--llama-args",
+            "-ctk q8_0 -fa on",
+            "--elastic",
+        ]);
+        assert_eq!(a.llama_args, ["-ctk", "q8_0", "-fa", "on"]);
+        assert!(a.elastic);
+    }
+
+    #[test]
+    fn llama_args_equals_form_and_repeated() {
+        let a = run_args(&[
+            "cascadia",
+            "run",
+            "m.gguf",
+            "--engine",
+            "sycl-llama",
+            "--llama-args=-fa on",
+            "--llama-args",
+            "-ctk q8_0",
+        ]);
+        assert_eq!(a.llama_args, ["-fa", "on", "-ctk", "q8_0"]);
+    }
+
+    #[test]
+    fn llama_load_flags_parse_on_run_and_worker() {
+        let r = run_args(&[
+            "cascadia",
+            "run",
+            "m.gguf",
+            "--engine",
+            "sycl-llama",
+            "--llama-load-timeout",
+            "300",
+            "--llama-load-retries",
+            "3",
+        ]);
+        assert_eq!(r.llama_load_timeout, Some(300));
+        assert_eq!(r.llama_load_retries, 3);
+        let w = worker_args(&[
+            "cascadia",
+            "worker",
+            "--rank",
+            "0",
+            "--total",
+            "1",
+            "--model",
+            "m.gguf",
+            "--engine",
+            "sycl-llama",
+        ]);
+        assert_eq!(w.llama_load_timeout, None);
+        assert_eq!(w.llama_load_retries, 1);
+    }
+
+    #[test]
+    fn elastic_vram_parses_on_run_and_worker() {
+        let r = run_args(&[
+            "cascadia",
+            "run",
+            "m.gguf",
+            "--engine",
+            "sycl-llama",
+            "--elastic",
+            "--elastic-vram",
+            "7.5",
+        ]);
+        assert_eq!(r.elastic_vram, ElasticVram::MiB(7680));
+        assert!(
+            run_args(&["cascadia", "run", "m.gguf", "--engine", "sycl-llama",]).elastic_vram
+                == ElasticVram::Auto
+        );
+        let w = worker_args(&[
+            "cascadia",
+            "worker",
+            "--rank",
+            "0",
+            "--total",
+            "1",
+            "--model",
+            "m.gguf",
+            "--engine",
+            "sycl-llama",
+            "--elastic-vram",
+            "0",
+        ]);
+        assert_eq!(w.elastic_vram, ElasticVram::MiB(0));
+        // garbage rejected at parse time
+        let bad = Cli::try_parse_from([
+            "cascadia",
+            "run",
+            "m.gguf",
+            "--engine",
+            "sycl-llama",
+            "--elastic-vram",
+            "lots",
+        ]);
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn elastic_share_parses_and_rejects_zero() {
+        let r = run_args(&[
+            "cascadia",
+            "run",
+            "m.gguf",
+            "--engine",
+            "sycl-llama",
+            "--elastic",
+            "--elastic-share",
+            "3",
+        ]);
+        assert_eq!(r.elastic_share, Some(3));
+        let w = worker_args(&[
+            "cascadia",
+            "worker",
+            "--rank",
+            "0",
+            "--total",
+            "1",
+            "--model",
+            "m.gguf",
+            "--engine",
+            "sycl-llama",
+            "--elastic-share",
+            "4294967295",
+        ]);
+        assert_eq!(w.elastic_share, Some(u32::MAX));
+        // unset is None so an ambient GGML_STREAM_VRAM_SHARE survives
+        assert_eq!(run_args(&["cascadia", "run", "m.gguf"]).elastic_share, None);
+        // 0, negative, and non-numeric rejected at parse time
+        for bad_n in ["0", "-1", "lots"] {
+            assert!(
+                Cli::try_parse_from([
+                    "cascadia",
+                    "run",
+                    "m.gguf",
+                    "--engine",
+                    "sycl-llama",
+                    "--elastic-share",
+                    bad_n,
+                ])
+                .is_err(),
+                "{bad_n} must not parse"
+            );
+        }
     }
 }

@@ -3,8 +3,8 @@
 //! Mirrors `cascadia/worker/runner.py`. Lifecycle:
 //!
 //! 1. [`Runner::start`] — connect transport, load weights, build engine, warm up.
-//! 2a. (first stage)  [`Runner::generate`] — submit task and stream chunks.
-//! 2b. (other stages) [`Runner::run_relay_loop`] — drive engine forever.
+//!    2a. (first stage)  [`Runner::generate`] — submit task and stream chunks.
+//!    2b. (other stages) [`Runner::run_relay_loop`] — drive engine forever.
 //! 3. [`Runner::close`].
 //!
 //! `generate()` is safe to call concurrently. Each call shares the engine
@@ -399,7 +399,17 @@ impl Runner {
         let model = shard.model_id.clone();
         let device = shard.device.clone();
         let load_started = Instant::now();
-        let mut load_stream = builder.load(shard).await?;
+        // engines may implement load() with synchronous spawn/health-poll
+        // loops; on a multi-thread runtime drive it through run_async so a
+        // blocking load migrates other tasks off this worker instead of
+        // stalling them. current_thread runtimes have no block_in_place;
+        // await directly there
+        let mut load_stream = match tokio::runtime::Handle::try_current() {
+            Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                run_async(&h, builder.load(shard))?
+            }
+            _ => builder.load(shard).await?,
+        };
         // drain the load progress stream
         use futures::StreamExt;
         while let Some(progress) = load_stream.next().await {
