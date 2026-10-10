@@ -407,7 +407,7 @@ pub fn resolve_llama_bin(
     ))
 }
 
-/// `-ot '<regex>=SYCL_Host' --no-mmap` for [`LlamaCppConfig::host_layers`],
+/// `-ot '<regex>=SYCL_Host' --load-mode none` for [`LlamaCppConfig::host_layers`],
 /// or nothing. mmap must be off: with it on, the loader silently replaces a
 /// host-buffer placement by the CPU buffer (llama-model-loader.cpp, "avoid
 /// using a host buffer when using mmap") and the CPU backend computes the
@@ -422,7 +422,13 @@ pub fn llama_host_layer_args(host_layers: Option<&str>) -> Vec<String> {
             );
             Vec::new()
         }
-        Some(re) => vec!["--no-mmap".into(), "-ot".into(), format!("{re}=SYCL_Host")],
+        // `--load-mode none` is what the deprecated `--no-mmap` maps to
+        Some(re) => vec![
+            "--load-mode".into(),
+            "none".into(),
+            "-ot".into(),
+            format!("{re}=SYCL_Host"),
+        ],
         None => Vec::new(),
     }
 }
@@ -1943,7 +1949,7 @@ mod tests {
         assert!(llama_host_layer_args(Some("  ")).is_empty());
         assert_eq!(
             llama_host_layer_args(Some(r"blk\.(6[2-4])\..*")),
-            ["--no-mmap", "-ot", r"blk\.(6[2-4])\..*=SYCL_Host"]
+            ["--load-mode", "none", "-ot", r"blk\.(6[2-4])\..*=SYCL_Host"]
         );
         // the override syntax's own separators cannot be part of the pattern
         assert!(llama_host_layer_args(Some("a=b")).is_empty());
