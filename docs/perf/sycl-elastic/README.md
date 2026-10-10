@@ -15,12 +15,24 @@ All numbers come from [`data.json`](./data.json) (verbatim copy of
 | ![fig7](fig7_reliability.png) | `fig7_reliability.png` — 15 load/unload cycles, leak-free, plus second-card parity. |
 | ![fig8](fig8_partial.png) | `fig8_partial.png` — `--elastic-vram` budget sweep: speed follows how much of the model fits. |
 | ![fig9](fig9_windows.png) | `fig9_windows.png` — the same streaming on Windows (Arc B390 iGPU): Linux vs Windows device memory + decode retention. |
+| ![fig10](fig10_placement_b70.png) | `fig10_placement_b70.png` — discrete B70: streaming vs pinned host memory at matched resident layers (log scale). |
+| ![fig11](fig11_link_b70.png) | `fig11_link_b70.png` — effective PCIe 4.0 x8 read rate per arm; neither mechanism nears the ceiling. |
+| ![fig12](fig12_cotenancy_b70.png) | `fig12_cotenancy_b70.png` — three 27B instances on one card: auto / budgets / driver oversubscription / host placement. |
+| ![fig13](fig13_regression_b70.png) | `fig13_regression_b70.png` — section-A regression check on the stack build (27B + MoE). |
+| ![fig14](fig14_async_b70.png) | `fig14_async_b70.png` — async stream pool vs the synchronous uploader on the same arms. |
+| ![fig15](fig15_readerpool_b70.png) | `fig15_readerpool_b70.png` — reader-pool thread sweep on the fully streamed 27B (+7-9% over serial pread). |
+| ![fig16](fig16_sharecap_b70.png) | `fig16_sharecap_b70.png` — `--elastic-share N` resident-weight caps vs the uncapped automatic budget. |
 | ![fig17](fig17_mtp.png) | `fig17_mtp.png` — `--llama-mtp` decode on Qwen3.8-27B per `--elastic-vram` budget (median of 3 runs, whiskers = run spread) and its VRAM cost. Data: `data.json` `mtp`; harness `experiments/2026-10-10-review3/spec/mtp_sweep.py`. |
 | ![fig18](fig18_mtp_draft_n.png) | `fig18_mtp_draft_n.png` — `--spec-draft-n-max` sweep under `--llama-mtp`: resident vs 8 GiB budget, speed relative to plain decode, and draft acceptance. Data: `data.json` `mtp_draft_n`. |
 | ![fig19](fig19_mtp_cpu_gpu.png) | `fig19_mtp_cpu_gpu.png` — `--llama-mtp` through `cascadia run` on GPU (resident, 8 GiB streamed) and CPU: client t/s, CPU cores, peak VRAM and host RSS, with deltas. Data: `data.json` `mtp_cpu_gpu`; harness `experiments/2026-10-10-review3/spec/mtp_cpu_gpu.py`. |
 
 Placement study on a UMA iGPU (Arc B390, Linux), stock vs streaming vs
 pinned host memory computed in place: [`placement-b390.md`](placement-b390.md).
+The discrete-card counterpart on the Arc Pro B70 (streaming vs pinned host
+memory vs driver oversubscription): [`placement-b70.md`](placement-b70.md).
+The KV-cache side of elasticity (why per-token KV streaming is not viable,
+and the suspend/resume and driver-vmem shapes that could be):
+[`kv-elasticity.md`](kv-elasticity.md).
 
 ## Methodology
 
