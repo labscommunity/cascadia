@@ -259,12 +259,12 @@ runs within 2.5% of the median). Chart: [fig17](../perf/sycl-elastic/fig17_mtp.p
   page-cached GGUF mapping.
 - **Draft length** is set with `--llama-args "--spec-draft-n-max N"`
   (llama-server default 3). The best value depends on the budget
-  ([fig18](../perf/sycl-elastic/fig18_mtp_draft_n.png), n=2 per point):
+  ([fig18](../perf/sycl-elastic/fig18_mtp_draft_n.png), n=2 per point). These are server decode-only tokens/s (llama-server `predicted_per_second`, excludes prompt processing), so they run higher than the client-side rates in the GPU/CPU table above:
 
   | `--spec-draft-n-max` | 1 | 2 | 3 | 4 | 6 |
   |---|---|---|---|---|---|
-  | resident, t/s | 23.9 | **26.4** | 26.3 | 25.0 | 22.4 |
-  | 8 GiB budget, t/s | 1.47 | 1.99 | 2.45 | 2.70 | **2.82** |
+  | resident, decode t/s | 23.9 | **26.4** | 26.3 | 25.0 | 22.4 |
+  | 8 GiB budget, decode t/s | 1.47 | 1.99 | 2.45 | 2.70 | **2.82** |
   | drafted tokens accepted (8 GiB) | 87% | 84% | 74% | 66% | 47% |
 
   Resident decode is compute-bound, so rejected drafts cost real time and
