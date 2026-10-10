@@ -302,7 +302,10 @@ fn filter_ld_preload(v: &str) -> Option<String> {
 /// stream without `--elastic` (the engine sets both itself when it is on).
 /// `GGML_STREAM_RESIDENT_LAYERS` is a documented child knob that overrides
 /// the budget, so it passes through — with a warning when it will.
-fn scrub_child_env(cmd: &mut Command, elastic: bool) {
+/// `elastic_share` is the `--elastic-share` value, if any: when it is set the
+/// engine writes `GGML_STREAM_VRAM_SHARE` itself (after this scrub), so an
+/// ambient value is overridden rather than merely warned about.
+fn scrub_child_env(cmd: &mut Command, elastic: bool, elastic_share: Option<u32>) {
     for k in HOST_ELASTIC_ENV {
         cmd.env_remove(k);
     }
@@ -339,8 +342,11 @@ fn scrub_child_env(cmd: &mut Command, elastic: bool) {
             }
         }
         // an ambient GGML_STREAM_VRAM_SHARE passes through like
-        // RESIDENT_LAYERS does; --elastic-share overrides it when given
-        if std::env::var("GGML_STREAM_VRAM_SHARE").is_ok_and(|v| !v.trim().is_empty()) {
+        // RESIDENT_LAYERS does; --elastic-share overrides it when given, so
+        // only warn when no explicit share will overwrite it
+        if elastic_share.is_none()
+            && std::env::var("GGML_STREAM_VRAM_SHARE").is_ok_and(|v| !v.trim().is_empty())
+        {
             tracing::warn!(
                 "sycl-llama: ambient GGML_STREAM_VRAM_SHARE reaches the child; --elastic-share sets it explicitly"
             );
@@ -401,7 +407,7 @@ pub fn resolve_llama_bin(
     ))
 }
 
-/// `-ot '<regex>=SYCL_Host' --no-mmap` for [`LlamaCppConfig::host_layers`],
+/// `-ot '<regex>=SYCL_Host' --load-mode none` for [`LlamaCppConfig::host_layers`],
 /// or nothing. mmap must be off: with it on, the loader silently replaces a
 /// host-buffer placement by the CPU buffer (llama-model-loader.cpp, "avoid
 /// using a host buffer when using mmap") and the CPU backend computes the
@@ -416,7 +422,13 @@ pub fn llama_host_layer_args(host_layers: Option<&str>) -> Vec<String> {
             );
             Vec::new()
         }
-        Some(re) => vec!["--no-mmap".into(), "-ot".into(), format!("{re}=SYCL_Host")],
+        // `--load-mode none` is what the deprecated `--no-mmap` maps to
+        Some(re) => vec![
+            "--load-mode".into(),
+            "none".into(),
+            "-ot".into(),
+            format!("{re}=SYCL_Host"),
+        ],
         None => Vec::new(),
     }
 }
@@ -666,7 +678,7 @@ impl LlamaCppBuilder {
             .arg("--jinja")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        scrub_child_env(&mut cmd, self.cfg.elastic);
+        scrub_child_env(&mut cmd, self.cfg.elastic, self.cfg.elastic_share);
         arm_death_guard(&mut cmd);
         if self.cfg.elastic {
             // Device-side O1: weights stay on disk, streamed per layer.
@@ -1013,6 +1025,14 @@ impl LlamaCppEngine {
             });
             if let Some(tools) = &task.tools {
                 body["tools"] = tools.clone();
+                // tool_choice only means anything alongside tools. The API
+                // already 400s a malformed one; this guards other callers and
+                // fails the task as a final error chunk, like a connect
+                // failure below.
+                if let Err(e) = apply_tool_choice(&mut body, task.tool_choice.as_ref()) {
+                    let _ = tx.send(Err(EngineError::InvalidConfig(e)));
+                    return;
+                }
             }
             ("/v1/chat/completions", body)
         };
@@ -1162,6 +1182,88 @@ fn apply_sampling(body: &mut serde_json::Value, sp: &SamplingParams) {
     }
     if !sp.stop.is_empty() {
         o.insert("stop".into(), sp.stop.clone().into());
+    }
+}
+
+/// Translate an OpenAI `tool_choice` into the form llama-server parses.
+///
+/// llama-server understands only the string forms `"auto"`, `"none"` and
+/// `"required"`; a JSON object silently degrades to `"auto"`, so a caller
+/// asking for one specific function would instead let the model call any
+/// tool. A named choice is therefore narrowed to that single entry of
+/// `body["tools"]` plus `"required"`. `"none"` drops `tools` altogether:
+/// llama-server still renders them into the prompt under `"none"`, and the
+/// model then writes a call as plain text (measured on Qwen2.5-1.5B), so
+/// the only reliable "no tools" is a prompt without them (vLLM does the
+/// same). `None` leaves `body` untouched (the child's own default is
+/// `"auto"`). An unknown string or malformed object is an error, never a
+/// silent pass-through. Call only when tools were sent.
+fn apply_tool_choice(
+    body: &mut serde_json::Value,
+    choice: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    let Some(choice) = choice else {
+        return Ok(());
+    };
+    match choice {
+        serde_json::Value::String(s) => match s.as_str() {
+            "none" => {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove("tools");
+                }
+                Ok(())
+            }
+            "auto" | "required" => {
+                body["tool_choice"] = serde_json::json!(s);
+                Ok(())
+            }
+            other => Err(format!(
+                "tool_choice string '{other}' is not one of \"auto\", \"none\", \"required\""
+            )),
+        },
+        serde_json::Value::Object(_) => {
+            let name = choice
+                .get("type")
+                .and_then(|t| t.as_str())
+                .filter(|t| *t == "function")
+                .and_then(|_| choice.get("function"))
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .filter(|n| !n.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "tool_choice object {choice} is not the OpenAI \
+                         {{\"type\":\"function\",\"function\":{{\"name\":N}}}} form"
+                    )
+                })?;
+            let tools = body
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .ok_or_else(|| {
+                    format!("tool_choice names function '{name}' but no tools were sent")
+                })?;
+            let kept: Vec<serde_json::Value> = tools
+                .iter()
+                .filter(|t| {
+                    t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        == Some(name)
+                })
+                .cloned()
+                .collect();
+            if kept.is_empty() {
+                return Err(format!(
+                    "tool_choice names function '{name}', which is not in tools"
+                ));
+            }
+            body["tools"] = serde_json::Value::Array(kept);
+            body["tool_choice"] = serde_json::json!("required");
+            Ok(())
+        }
+        other => Err(format!(
+            "tool_choice {other} is not a string or an OpenAI function object"
+        )),
     }
 }
 
@@ -1724,6 +1826,84 @@ mod tests {
         assert_eq!(body["stop"], serde_json::json!(["###"]));
     }
 
+    fn two_tools() -> serde_json::Value {
+        serde_json::json!([
+            {"type": "function", "function": {"name": "get_weather"}},
+            {"type": "function", "function": {"name": "get_time"}},
+        ])
+    }
+
+    #[test]
+    fn apply_tool_choice_none_leaves_body_untouched() {
+        let mut body = serde_json::json!({"tools": two_tools()});
+        apply_tool_choice(&mut body, None).unwrap();
+        assert!(body.get("tool_choice").is_none());
+        assert_eq!(body["tools"], two_tools());
+    }
+
+    #[test]
+    fn apply_tool_choice_strings_pass_through() {
+        for s in ["auto", "required"] {
+            let mut body = serde_json::json!({"tools": two_tools()});
+            apply_tool_choice(&mut body, Some(&serde_json::json!(s))).unwrap();
+            assert_eq!(body["tool_choice"], serde_json::json!(s), "{s}");
+            assert_eq!(body["tools"], two_tools(), "{s}");
+        }
+    }
+
+    #[test]
+    fn apply_tool_choice_none_keeps_tools_out_of_the_prompt() {
+        let mut body = serde_json::json!({"tools": two_tools()});
+        apply_tool_choice(&mut body, Some(&serde_json::json!("none"))).unwrap();
+        assert!(body.get("tools").is_none(), "{body}");
+        assert!(body.get("tool_choice").is_none(), "{body}");
+    }
+
+    #[test]
+    fn apply_tool_choice_named_narrows_tools_and_requires() {
+        let mut body = serde_json::json!({"tools": two_tools()});
+        let choice = serde_json::json!({"type": "function", "function": {"name": "get_time"}});
+        apply_tool_choice(&mut body, Some(&choice)).unwrap();
+        assert_eq!(body["tool_choice"], serde_json::json!("required"));
+        assert_eq!(
+            body["tools"],
+            serde_json::json!([{"type": "function", "function": {"name": "get_time"}}])
+        );
+    }
+
+    #[test]
+    fn apply_tool_choice_unknown_name_errors() {
+        let mut body = serde_json::json!({"tools": two_tools()});
+        let choice = serde_json::json!({"type": "function", "function": {"name": "nope"}});
+        let e = apply_tool_choice(&mut body, Some(&choice)).unwrap_err();
+        assert!(e.contains("'nope'"), "{e}");
+        assert!(e.contains("not in tools"), "{e}");
+    }
+
+    #[test]
+    fn apply_tool_choice_bogus_string_errors() {
+        let mut body = serde_json::json!({"tools": two_tools()});
+        let e = apply_tool_choice(&mut body, Some(&serde_json::json!("sometimes"))).unwrap_err();
+        assert!(e.contains("sometimes"), "{e}");
+    }
+
+    #[test]
+    fn apply_tool_choice_malformed_choice_errors() {
+        // malformed objects, a non-string/object scalar, and an object whose
+        // named function is absent from `tools` all fail loudly
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"type": "function"}),
+            serde_json::json!({"function": {"name": "get_time"}}),
+            serde_json::json!({"type": "function", "function": {"name": ""}}),
+            serde_json::json!(42),
+            serde_json::json!(true),
+        ] {
+            let mut body = serde_json::json!({"tools": two_tools()});
+            assert!(apply_tool_choice(&mut body, Some(&bad)).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn resolve_llama_bin_prefers_flag_then_env_then_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -1769,7 +1949,7 @@ mod tests {
         assert!(llama_host_layer_args(Some("  ")).is_empty());
         assert_eq!(
             llama_host_layer_args(Some(r"blk\.(6[2-4])\..*")),
-            ["--no-mmap", "-ot", r"blk\.(6[2-4])\..*=SYCL_Host"]
+            ["--load-mode", "none", "-ot", r"blk\.(6[2-4])\..*=SYCL_Host"]
         );
         // the override syntax's own separators cannot be part of the pattern
         assert!(llama_host_layer_args(Some("a=b")).is_empty());
@@ -2202,7 +2382,7 @@ mod unix_tests {
                 .collect()
         }
         let mut off = Command::new("true");
-        scrub_child_env(&mut off, false);
+        scrub_child_env(&mut off, false, None);
         let r = removed(&off);
         for k in HOST_ELASTIC_ENV {
             assert!(r.iter().any(|x| x == k), "{k} not removed: {r:?}");
@@ -2219,7 +2399,7 @@ mod unix_tests {
         // the documented child knob GGML_STREAM_RESIDENT_LAYERS passes
         // through (warned about when set).
         let mut on = Command::new("true");
-        scrub_child_env(&mut on, true);
+        scrub_child_env(&mut on, true, None);
         on.env("GGML_STREAM_WEIGHTS", "1");
         let r = removed(&on);
         assert!(

@@ -814,6 +814,45 @@ impl ChatCompletionRequest {
         }
     }
 
+    /// `tool_choice` must be one of the OpenAI shapes: `"auto"`, `"none"`,
+    /// `"required"`, or `{"type":"function","function":{"name":N}}` naming a
+    /// function present in `tools`. Anything else is the caller's mistake
+    /// (a 400), not something an engine should guess at.
+    fn validate_tool_choice(&self) -> Result<(), String> {
+        let Some(choice) = &self.tool_choice else {
+            return Ok(());
+        };
+        if let Some(s) = choice.as_str() {
+            return match s {
+                "auto" | "none" | "required" => Ok(()),
+                other => Err(format!(
+                    "tool_choice '{other}' is not one of \"auto\", \"none\", \"required\""
+                )),
+            };
+        }
+        let name = choice
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+            .filter(|n| choice.get("type").and_then(|t| t.as_str()) == Some("function") && !n.is_empty())
+            .ok_or_else(|| {
+                "tool_choice must be a string or {\"type\":\"function\",\"function\":{\"name\":...}}"
+                    .to_string()
+            })?;
+        let declared = self
+            .tools
+            .iter()
+            .flatten()
+            .any(|t| t.function.get("name").and_then(|n| n.as_str()) == Some(name));
+        if declared {
+            Ok(())
+        } else {
+            Err(format!(
+                "tool_choice names function '{name}', which is not in tools"
+            ))
+        }
+    }
+
     /// Resolves `enable_thinking`, highest precedence first:
     /// `chat_template_kwargs.enable_thinking` (the vLLM/SGLang convention),
     /// then the legacy top-level `enable_thinking`, then `reasoning_effort:
@@ -2258,6 +2297,14 @@ async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
+    if let Err(e) = req.validate_tool_choice() {
+        count_rejected("invalid_request");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response();
+    }
     let enable_thinking = req.effective_enable_thinking();
     // effective_reasoning_effort() hardcodes GLM's high/max vocabulary and is
     // applied to every model this server serves, not just GLM-5. A template
@@ -2370,6 +2417,7 @@ async fn chat_completions(
         // the field and keep consuming `prompt`.
         messages: chat_turns(&req),
         tools: chat_tools(&req),
+        tool_choice: req.tool_choice.clone(),
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         logprobs: req.logprobs_count(),
@@ -2605,6 +2653,7 @@ async fn completions(
         // Prompt-only: no structured turns on the /v1/completions path.
         messages: Vec::new(),
         tools: None,
+        tool_choice: None,
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         logprobs: req.logprobs_count(),
@@ -5657,6 +5706,49 @@ level={{ effort_map[eff] }}";
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn tool_choice_shape_is_validated_before_the_engine() {
+        // a templated app, so the only thing that can 400 here is tool_choice
+        let app = make_tool_app().await;
+        for (choice, want) in [
+            (serde_json::json!("sometimes"), StatusCode::BAD_REQUEST),
+            (
+                serde_json::json!({"type": "function", "function": {"name": "get_time"}}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"type": "function"}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"type": "function", "function": {"name": "get_weather"}}),
+                StatusCode::OK,
+            ),
+            (serde_json::json!("required"), StatusCode::OK),
+        ] {
+            let payload = serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "weather in Paris?"}],
+                "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+                "tool_choice": choice,
+                "stream": false
+            });
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), want, "{choice}");
+        }
     }
 
     #[test]

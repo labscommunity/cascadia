@@ -90,6 +90,14 @@ pub struct GenerationTask {
     /// `[{"type":"function","function":{...}}]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<serde_json::Value>,
+    /// Caller's tool-selection directive (OpenAI wire form): `"auto"`,
+    /// `"none"`, `"required"`, or `{"type":"function","function":{"name":N}}`.
+    /// Engines that cannot honor it ignore it. The llama-server bridge
+    /// forwards `"auto"`/`"required"`, sends `"none"` without `tools`, and
+    /// translates a named choice to `"required"` with `tools` narrowed to
+    /// that one function (the child drops an object form to `"auto"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     #[serde(default)]
@@ -203,6 +211,7 @@ impl GenerationTask {
             prompt: prompt.into(),
             messages: Vec::new(),
             tools: None,
+            tool_choice: None,
             max_tokens: default_max_tokens(),
             temperature: 0.0,
             logprobs: 0,
@@ -248,6 +257,7 @@ mod tests {
             prompt: "hello".to_string(),
             messages: Vec::new(),
             tools: None,
+            tool_choice: None,
             max_tokens: default_max_tokens(),
             temperature: 0.0,
             logprobs: 0,
