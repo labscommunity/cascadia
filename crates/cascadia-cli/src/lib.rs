@@ -496,6 +496,13 @@ pub struct WorkerArgs {
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub elastic_share: Option<u32>,
 
+    /// sycl-llama: speculative decoding with the model's own MTP (nextn)
+    /// head (`--spec-type draft-mtp`). The target verifies every drafted
+    /// token; needs a GGUF with nextn layers (e.g. Qwen3.8-27B). Biggest
+    /// gain when `--elastic` streams weights: one pass yields several tokens.
+    #[arg(long)]
+    pub llama_mtp: bool,
+
     /// NPU LLM prefill chunk size (NPUW_LLM_PREFILL_CHUNK_SIZE, OV 2025.3+).
     /// Applied only with --engine ov-genai on an NPU device; dropped with a
     /// warning otherwise (only ov-genai routes it through an ov::genai
@@ -827,6 +834,13 @@ pub struct RunArgs {
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub elastic_share: Option<u32>,
 
+    /// sycl-llama: speculative decoding with the model's own MTP (nextn)
+    /// head (`--spec-type draft-mtp`). The target verifies every drafted
+    /// token; needs a GGUF with nextn layers (e.g. Qwen3.8-27B). Biggest
+    /// gain when `--elastic` streams weights: one pass yields several tokens.
+    #[arg(long)]
+    pub llama_mtp: bool,
+
     /// Path to a llama-server binary — sycl-llama engine only. Optional:
     /// resolved as --llama-bin > $CASCADIA_LLAMA_BIN > `llama-server` on
     /// PATH. See `cascadia worker --help`.
@@ -955,6 +969,7 @@ impl WorkerArgs {
             llama_load_retries: 1,
             elastic_vram: ElasticVram::Auto,
             elastic_share: None,
+            llama_mtp: false,
         }
     }
 }
@@ -1223,6 +1238,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     worker.llama_load_retries = args.llama_load_retries;
     worker.elastic_vram = args.elastic_vram;
     worker.elastic_share = args.elastic_share;
+    worker.llama_mtp = args.llama_mtp;
     cmd_worker(worker).await
 }
 
@@ -1904,6 +1920,7 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
                 elastic_vram: args.elastic_vram,
                 elastic_share: args.elastic_share,
                 host_layers: None,
+                mtp: args.llama_mtp,
                 extra_args,
                 load_timeout: args.llama_load_timeout.map(std::time::Duration::from_secs),
                 load_retries: args.llama_load_retries,
