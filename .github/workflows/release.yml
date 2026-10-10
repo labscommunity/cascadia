@@ -345,6 +345,11 @@ jobs:
           out="$(cd "$BUNDLE_DIR" && ./cascadia doctor)" || true
           printf '%s\n' "$out" | sed -n '/^OpenVINO:/,$p'
           want="$(printf '%s' "$OV_VERSION_SELECTED" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')"
+          # Reject doctor's skew warning ("runtime X but built against GenAI
+          # <want>"), which would otherwise satisfy the version match below.
+          if printf '%s\n' "$out" | grep -q "OpenVINO GenAI.*but built against"; then
+            echo "::error::doctor reports an OpenVINO GenAI runtime/build skew in the bundled lib/"; exit 1
+          fi
           printf '%s\n' "$out" | grep -q "OpenVINO GenAI.*$want" \
             || { echo "::error::doctor did not report OpenVINO GenAI $want from the bundled lib/"; exit 1; }
           printf '%s\n' "$out" | grep -q "OpenVINO devices.*CPU" \
@@ -455,6 +460,8 @@ jobs:
           $out = (& (Join-Path $env:BUNDLE_DIR 'cascadia.exe') doctor) -join "`n"
           $i = $out.IndexOf('OpenVINO:'); if ($i -ge 0) { $out.Substring($i) } else { $out }
           $want = [regex]::Match($env:OV_VERSION_SELECTED, '^\d+\.\d+\.\d+').Value
+          # Reject doctor's skew warning ("runtime X but built against GenAI <want>").
+          if ($out -match "OpenVINO GenAI.*but built against") { throw "doctor reports an OpenVINO GenAI runtime/build skew in the bundled DLLs" }
           if ($out -notmatch "OpenVINO GenAI.*$([regex]::Escape($want))") { throw "doctor did not report OpenVINO GenAI $want from the bundled DLLs" }
           if ($out -notmatch "OpenVINO devices.*CPU") { throw "doctor did not enumerate the CPU device from the bundled runtime" }
 
