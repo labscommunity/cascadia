@@ -234,6 +234,10 @@ jobs:
     needs: [plan, ensure-release, build-spa]
     # Runs after a skipped ensure-release on a dry run, never after a failure.
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build-spa.result == 'success' && (needs.plan.outputs.dry_run == 'true' || needs.ensure-release.result == 'success') }}
+    # Only the pinned default leg gates promotion; an OV_EXTRA_VERSIONS
+    # variant that fails must not block the default release. An explicit
+    # `ov_version` build has no default leg, so it stays blocking.
+    continue-on-error: ${{ matrix.ov_version != needs.plan.outputs.default && !inputs.ov_version }}
     strategy:
       fail-fast: false
       matrix:
@@ -366,6 +370,7 @@ jobs:
     name: windows-x86_64 (openvino ${{ matrix.ov_version }})
     needs: [plan, ensure-release, build-spa]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build-spa.result == 'success' && (needs.plan.outputs.dry_run == 'true' || needs.ensure-release.result == 'success') }}
+    continue-on-error: ${{ matrix.ov_version != needs.plan.outputs.default && !inputs.ov_version }}
     strategy:
       fail-fast: false
       matrix:
@@ -482,6 +487,8 @@ jobs:
       contents: write
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
+      VER: ${{ needs.plan.outputs.ver }}
+      REQUESTED: ${{ inputs.ov_version }}
     steps:
       - name: Verify assets and drop the pre-release badge
         env:
@@ -490,9 +497,23 @@ jobs:
         run: |
           assets="$(gh release view "$TAG" --json assets --jq '[.assets[].name] | join(" ")')"
           echo "assets: $assets"
-          case "$assets" in
-            *linux-x86_64*windows-x86_64*|*windows-x86_64*linux-x86_64*) ;;
-            *) echo "::error::expected both linux and windows bundles on $TAG, found: $assets"; exit 1 ;;
-          esac
+          # The default (unsuffixed) bundles must be present — variant legs
+          # are non-blocking, so their assets alone don't count. An explicit
+          # `ov_version` build only carries that version's bundles.
+          if [ -z "${REQUESTED:-}" ]; then
+            want=" cascadia-$VER-linux-x86_64.tar.gz cascadia-$VER-windows-x86_64.zip "
+          else
+            want=""
+            case "$assets" in
+              *linux-x86_64*windows-x86_64*|*windows-x86_64*linux-x86_64*) ;;
+              *) echo "::error::expected both linux and windows bundles on $TAG, found: $assets"; exit 1 ;;
+            esac
+          fi
+          for a in $want; do
+            case " $assets " in
+              *" $a "*) ;;
+              *) echo "::error::expected default bundle $a on $TAG, found: $assets"; exit 1 ;;
+            esac
+          done
           gh release edit "$TAG" --prerelease=false --latest
           echo "release $TAG promoted"
