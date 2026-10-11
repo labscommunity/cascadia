@@ -278,7 +278,7 @@ index f6fb91798..7ee909217 100644
 +    return n;
 +}
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index d1456a867..1f8352b40 100644
+index d1456a867..ccc93ae 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
 @@ -18,8 +18,10 @@
@@ -349,7 +349,7 @@ index d1456a867..1f8352b40 100644
      size_t size = ggml_nbytes(tensor);
      int64_t ne0 = tensor->ne[0];
  
-@@ -4766,6 +4792,299 @@ static void mmid_counting_sort_rows(
+@@ -4766,6 +4792,313 @@ static void mmid_counting_sort_rows(
      }
  }
  
@@ -454,6 +454,9 @@ index d1456a867..1f8352b40 100644
 +    size_t       off      = 0;
 +    size_t       n        = 0;
 +    const char * name     = nullptr;   // debug only
++    // the weight buffer this fill belongs to: a teardown drains only its
++    // own jobs, not the whole per-device pool
++    ggml_backend_buffer_t owner = nullptr;
 +};
 +
 +struct sycl_stream_readers {
@@ -463,6 +466,7 @@ index d1456a867..1f8352b40 100644
 +    std::deque<std::shared_ptr<sycl_stream_read_job>>    jobs;
 +    std::vector<std::thread>                             th;
 +    int                                                  outstanding = 0; // queued + filling
++    std::unordered_map<ggml_backend_buffer_t, int>       outstanding_by_buf;
 +    bool                                                 started     = false;
 +};
 +
@@ -570,9 +574,12 @@ index d1456a867..1f8352b40 100644
 +        job->cv.notify_all();
 +        {
 +            std::lock_guard<std::mutex> lock(r->mu);
-+            if (--r->outstanding == 0) {
-+                r->drained.notify_all();
++            --r->outstanding;
++            auto it = r->outstanding_by_buf.find(job->owner);
++            if (it != r->outstanding_by_buf.end() && --it->second == 0) {
++                r->outstanding_by_buf.erase(it);
 +            }
++            r->drained.notify_all();
 +        }
 +    }
 +}
@@ -594,19 +601,25 @@ index d1456a867..1f8352b40 100644
 +        }
 +        r.jobs.push_back(job);
 +        r.outstanding++;
++        r.outstanding_by_buf[job->owner]++;
 +    }
 +    r.cv.notify_one();
 +}
 +
-+// wait until every queued fill has finished writing its staging buffer;
-+// must run before freeing a ring or the pool the copies write into
-+static void sycl_stream_read_drain(int device) {
++// wait until every queued fill *for this buffer* has finished writing its
++// staging buffer; must run before freeing a ring or the pool the copies
++// write into. The pool is per device and shared by every live model, so a
++// device-wide wait could be starved forever by another model's fills
++static void sycl_stream_read_drain(int device, ggml_backend_buffer_t buffer) {
 +    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
 +        return;
 +    }
 +    sycl_stream_readers & r = sycl_stream_readers_for(device);
 +    std::unique_lock<std::mutex> lock(r.mu);
-+    r.drained.wait(lock, [&] { return r.outstanding == 0; });
++    r.drained.wait(lock, [&] {
++        auto it = r.outstanding_by_buf.find(buffer);
++        return it == r.outstanding_by_buf.end() || it->second == 0;
++    });
 +}
 +
 +// submit dst <- staging copy gated on the fill. With reader threads the
@@ -627,6 +640,7 @@ index d1456a867..1f8352b40 100644
 +        job->off      = off;
 +        job->n        = n;
 +        job->name     = name;
++        job->owner    = src.buffer;
 +        sycl_stream_read_push(device, job);
 +        sycl::event gate = cq->submit([job](sycl::handler & h) {
 +            h.host_task([job] {
@@ -649,7 +663,7 @@ index d1456a867..1f8352b40 100644
  static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                   ggml_tensor *dst) try {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
-@@ -5446,6 +5765,10 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
+@@ -5446,6 +5779,10 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
      GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
      GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
      GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
@@ -660,7 +674,7 @@ index d1456a867..1f8352b40 100644
      ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
-@@ -5603,8 +5926,437 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
+@@ -5603,8 +5940,437 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
      return skip;
  }
  
@@ -1060,7 +1074,7 @@ index d1456a867..1f8352b40 100644
 +        std::lock_guard<std::mutex> lock(sw.mu);
 +        // reader fills may still be writing the staging ring; wait for them
 +        // before draining the copies that consume those buffers
-+        sycl_stream_read_drain(sw.device);
++        sycl_stream_read_drain(sw.device, buffer);
 +        // copies still in flight read the staging ring and write the pool
 +        sycl::queue * cq = sw.device >= 0 ? sycl_stream_copy_queue(sw.device) : nullptr;
 +        if (cq != nullptr) {
@@ -1098,7 +1112,7 @@ index d1456a867..1f8352b40 100644
  
      for (int i = 0; i < cgraph->n_nodes; i++) {
          ggml_tensor * node = cgraph->nodes[i];
-@@ -5615,7 +6367,17 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -5615,7 +6381,17 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
              continue;
          }
  
@@ -1117,7 +1131,7 @@ index d1456a867..1f8352b40 100644
          if (nodes_to_skip != 0) {
              i += nodes_to_skip;
              continue;
-@@ -5629,7 +6391,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -5629,7 +6405,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
          }
  #endif
          // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
@@ -1126,7 +1140,7 @@ index d1456a867..1f8352b40 100644
              ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
              const int gdn_nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
              if (gdn_nodes_to_skip > 0) {
-@@ -5638,20 +6400,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -5638,20 +6414,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                  continue;
              }
          }
@@ -1150,7 +1164,7 @@ index d1456a867..1f8352b40 100644
              i += 2;
              continue;
          }
-@@ -5712,7 +6474,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
+@@ -5712,7 +6488,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
  
  #ifdef GGML_SYCL_GRAPH
      bool use_sycl_graph = false;
@@ -1159,7 +1173,7 @@ index d1456a867..1f8352b40 100644
          use_sycl_graph = check_graph_compatibility(cgraph);
      }
      if (use_sycl_graph) {
-@@ -5849,6 +6611,13 @@ static enum ggml_backend_dev_type ggml_backend_sycl_device_get_type(ggml_backend
+@@ -5849,6 +6625,13 @@ static enum ggml_backend_dev_type ggml_backend_sycl_device_get_type(ggml_backend
      if (info.l0_device_type_valid && !info.l0_discrete_gpu) {
          return GGML_BACKEND_DEVICE_TYPE_IGPU;
      }
