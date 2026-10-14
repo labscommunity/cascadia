@@ -104,6 +104,61 @@ fn count_rejected(reason: &str) {
         .inc();
 }
 
+/// An error response in the OpenAI shape:
+/// `{"error":{"message","type","param","code"}}`. The SDKs read
+/// `error.message`; a bare `{"error":"..."}` string surfaces as a generic
+/// failure with the reason lost. `type` follows OpenAI's split: a 4xx is the
+/// caller's (`invalid_request_error`), a 5xx is ours (`server_error`).
+fn api_error(status: StatusCode, message: impl Into<String>, code: Option<&str>) -> Response {
+    let kind = if status.is_client_error() {
+        "invalid_request_error"
+    } else {
+        "server_error"
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "error": {
+                "message": message.into(),
+                "type": kind,
+                "param": null,
+                "code": code,
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// `Json<T>` whose rejections (bad JSON, wrong field types, unsupported
+/// content parts) come back as an OpenAI-shaped error instead of axum's
+/// plain-text 400/415/422.
+struct OpenAiJson<T>(T);
+
+#[axum::async_trait]
+impl<S, T> axum::extract::FromRequest<S> for OpenAiJson<T>
+where
+    Json<T>: axum::extract::FromRequest<S, Rejection = axum::extract::rejection::JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(v)) => Ok(Self(v)),
+            Err(rej) => {
+                count_rejected("malformed_body");
+                // A body over the limit keeps its 413; everything else is
+                // the caller's malformed request.
+                let status = match rej.status() {
+                    StatusCode::PAYLOAD_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
+                    _ => StatusCode::BAD_REQUEST,
+                };
+                Err(api_error(status, rej.body_text(), None))
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub runner: Arc<Runner>,
@@ -704,9 +759,40 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
-/// null/missing content -> "" (assistant tool-call turns send content: null).
+/// OpenAI `content` is a string, null, or an array of typed parts.
+/// null/missing -> "" (assistant tool-call turns send content: null). An
+/// array of `text` parts joins with "\n" into the one string the chat
+/// template sees. Any other part type is rejected by name: silently dropping
+/// an image would have the model answer a question about a picture it never
+/// saw.
 fn de_null_content<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+    use serde::de::Error;
+    match Option::<serde_json::Value>::deserialize(d)? {
+        None | Some(serde_json::Value::Null) => Ok(String::new()),
+        Some(serde_json::Value::String(s)) => Ok(s),
+        Some(serde_json::Value::Array(parts)) => {
+            let mut texts = Vec::with_capacity(parts.len());
+            for part in parts {
+                let kind = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                match (kind, part.get("text").and_then(|t| t.as_str())) {
+                    ("text", Some(text)) => texts.push(text.to_owned()),
+                    ("text", None) => {
+                        return Err(D::Error::custom("content part of type `text` needs a string `text`"))
+                    }
+                    ("", _) => return Err(D::Error::custom("content part is missing its `type`")),
+                    (other, _) => {
+                        return Err(D::Error::custom(format!(
+                            "content part type `{other}` is not supported; only `text` parts are accepted"
+                        )))
+                    }
+                }
+            }
+            Ok(texts.join("\n"))
+        }
+        Some(_) => Err(D::Error::custom(
+            "`content` must be a string, null, or an array of content parts",
+        )),
+    }
 }
 
 /// OpenAI `stop` is either a single string or an array of strings.
@@ -2446,7 +2532,7 @@ fn chat_tools(req: &ChatCompletionRequest) -> Option<serde_json::Value> {
 
 async fn chat_completions(
     State(state): State<AppState>,
-    Json(req): Json<ChatCompletionRequest>,
+    OpenAiJson(req): OpenAiJson<ChatCompletionRequest>,
 ) -> axum::response::Response {
     let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
     if let Err(e) = req.validate_tool_choice() {
@@ -2482,11 +2568,7 @@ async fn chat_completions(
         // model would answer without ever seeing the tools, and the caller
         // cannot tell that from "the model chose not to call one".
         Err(e @ PromptRenderError::Rejected(_)) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
+            return api_error(StatusCode::BAD_REQUEST, e.to_string(), None);
         }
         Err(e @ PromptRenderError::Failed(_)) => {
             tracing::error!(error = %e, "chat_template render failed for a request that needs it");
@@ -2494,11 +2576,7 @@ async fn chat_completions(
             // an operator needs to see, not the caller's mistake. But it is
             // raised before the engine is involved, so it must not latch
             // readiness — see `PreEngineFailure`.
-            let mut resp = (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
+            let mut resp = api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), None);
             resp.extensions_mut().insert(PreEngineFailure);
             return resp;
         }
@@ -2509,27 +2587,23 @@ async fn chat_completions(
     // with empty content — indistinguishable from a real failure.
     if prompt.trim().is_empty() {
         count_rejected("empty_prompt");
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "no prompt content: `messages` is empty or rendered to an empty prompt"
-            })),
-        )
-            .into_response();
+            "no prompt content: `messages` is empty or rendered to an empty prompt",
+            None,
+        );
     }
     if prompt.len() > state.max_prompt_bytes {
         count_rejected("prompt_too_large");
-        return (
+        return api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({
-                "error": format!(
-                    "prompt is {} bytes; max allowed is {} (max_prompt_bytes)",
-                    prompt.len(),
-                    state.max_prompt_bytes,
-                )
-            })),
-        )
-            .into_response();
+            format!(
+                "prompt is {} bytes; max allowed is {} (max_prompt_bytes)",
+                prompt.len(),
+                state.max_prompt_bytes,
+            ),
+            None,
+        );
     }
     // Same bound on the structured turns: tool-call results ride as
     // messages and never count toward prompt.len(), so a request could
@@ -2598,13 +2672,11 @@ async fn chat_completions(
         Ok(p) => p,
         Err(_) => {
             count_rejected("capacity");
-            return (
+            return api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "engine at capacity; retry after current requests complete"
-                })),
-            )
-                .into_response();
+                "engine at capacity; retry after current requests complete",
+                None,
+            );
         }
     };
 
@@ -2660,11 +2732,7 @@ async fn chat_completions(
         // handshake/manifest mismatch).
         if let Some(reason) = &chunk.error {
             warn!(task = %task_id, reason = %reason, "engine failed task; returning 503");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": reason })),
-            )
-                .into_response();
+            return api_error(StatusCode::SERVICE_UNAVAILABLE, reason.clone(), None);
         }
         // Count every chunk, but replace the running sum when the final
         // carries authoritative usage (including hidden thinking/tools).
@@ -2754,7 +2822,7 @@ async fn chat_completions(
 /// of a `message`. Reuses the same sampling/finish_reason/usage path.
 async fn completions(
     State(state): State<AppState>,
-    Json(req): Json<CompletionRequest>,
+    OpenAiJson(req): OpenAiJson<CompletionRequest>,
 ) -> axum::response::Response {
     // Multi-prompt batching needs cross-task batching infra the engines don't
     // have yet (one task per step). Reject the array form with a clean 400.
@@ -2762,37 +2830,33 @@ async fn completions(
         PromptSpec::Single(s) => s.clone(),
         PromptSpec::Multiple(_) => {
             count_rejected("multi_prompt");
-            return (
+            return api_error(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "multi-prompt batching not yet supported; submit one prompt per request"
-                })),
-            )
-                .into_response();
+                "multi-prompt batching not yet supported; submit one prompt per request",
+                None,
+            );
         }
     };
     let task_id = format!("cmpl-{}", Uuid::new_v4().simple());
     if prompt.trim().is_empty() {
         count_rejected("empty_prompt");
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "no prompt content: `prompt` is empty" })),
-        )
-            .into_response();
+            "no prompt content: `prompt` is empty",
+            None,
+        );
     }
     if prompt.len() > state.max_prompt_bytes {
         count_rejected("prompt_too_large");
-        return (
+        return api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({
-                "error": format!(
-                    "prompt is {} bytes; max allowed is {} (max_prompt_bytes)",
-                    prompt.len(),
-                    state.max_prompt_bytes,
-                )
-            })),
-        )
-            .into_response();
+            format!(
+                "prompt is {} bytes; max allowed is {} (max_prompt_bytes)",
+                prompt.len(),
+                state.max_prompt_bytes,
+            ),
+            None,
+        );
     }
     let task = GenerationTask {
         task_id: task_id.clone(),
@@ -2818,13 +2882,11 @@ async fn completions(
         Ok(p) => p,
         Err(_) => {
             count_rejected("capacity");
-            return (
+            return api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "engine at capacity; retry after current requests complete"
-                })),
-            )
-                .into_response();
+                "engine at capacity; retry after current requests complete",
+                None,
+            );
         }
     };
     state.stats.requests_total.fetch_add(1, Ordering::Relaxed);
@@ -2865,11 +2927,7 @@ async fn completions(
     while let Some(chunk) = chunk_stream.next().await {
         if let Some(reason) = &chunk.error {
             warn!(task = %task_id, reason = %reason, "engine failed task; returning 503");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": reason })),
-            )
-                .into_response();
+            return api_error(StatusCode::SERVICE_UNAVAILABLE, reason.clone(), None);
         }
         match marker.as_mut() {
             Some(f) => {
@@ -3592,7 +3650,10 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
         // this node's to explain, like any other engine failure.
         EngineError::BatchAborted(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    (status, Json(serde_json::json!({"error": err.to_string()}))).into_response()
+    // OpenAI's code for a prompt over the model's window; SDKs and agents
+    // key retries/truncation off it.
+    let code = matches!(err, EngineError::PromptTooLong(_)).then_some("context_length_exceeded");
+    api_error(status, err.to_string(), code)
 }
 
 async fn cancel(State(state): State<AppState>, Path(task_id): Path<String>) -> impl IntoResponse {
@@ -3657,6 +3718,17 @@ mod tests {
             "prompt is 207 tokens but this worker's per-slot KV region holds 127".into(),
         ));
         assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// Over-window is OpenAI's `context_length_exceeded`; clients key
+    /// truncate-and-retry off that code, not off the message text.
+    #[tokio::test]
+    async fn prompt_too_long_carries_context_length_exceeded() {
+        let r = engine_error_response(cascadia_engine::EngineError::PromptTooLong("x".into()));
+        let body = to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["code"], "context_length_exceeded");
     }
 
     /// The window rejection is a rejection, and it must be countable on its
@@ -4483,6 +4555,59 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
+    /// End to end: an array-content request is served like the string form.
+    #[tokio::test]
+    async fn chat_accepts_content_part_array() {
+        let (status, v) = post_chat(
+            make_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hello there"}]}],
+                "max_tokens": 4,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {v}");
+        assert_eq!(v["object"], "chat.completion");
+    }
+
+    /// Every pre-engine error, including a body that fails to parse, comes
+    /// back in OpenAI's `{"error":{message,type,param,code}}` shape — the
+    /// SDKs read `error.message` and drop anything else.
+    #[tokio::test]
+    async fn errors_use_openai_shape() {
+        let image = serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]}],
+        });
+        let empty = serde_json::json!({"model": "mock-model", "messages": []});
+        let missing_model = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+        for (payload, needle) in [
+            (image, "image_url"),
+            (empty, "no prompt content"),
+            (missing_model, "model"),
+        ] {
+            let (status, v) = post_chat(make_app().await, payload).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body: {v}");
+            let err = &v["error"];
+            assert_eq!(err["type"], "invalid_request_error", "body: {v}");
+            assert!(err["param"].is_null() && err["code"].is_null(), "body: {v}");
+            let msg = err["message"].as_str().unwrap_or_default();
+            assert!(msg.contains(needle), "expected {needle:?} in {msg:?}");
+        }
+        let (status, v) = post_completions(
+            make_app().await,
+            serde_json::json!({"model": "mock-model", "prompt": ["one", "two"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("multi-prompt"));
+    }
+
     #[tokio::test]
     async fn completions_honor_stop_and_finish_reason() {
         let (status, v) = post_completions(
@@ -4649,7 +4774,10 @@ mod tests {
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert!(
-            v["error"].as_str().unwrap().contains("mock injected"),
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("mock injected"),
             "5xx body should carry the engine's failure reason, got {v}"
         );
     }
@@ -4840,6 +4968,48 @@ mod tests {
         assert_eq!(tools[0].r#type, "function");
         assert_eq!(tools[0].function["name"], "get_weather");
         assert_eq!(req.tool_choice.unwrap(), serde_json::json!("auto"));
+    }
+
+    /// OpenAI SDKs and LangChain send `content` as an array of parts even
+    /// for plain text. Text parts join into the one string the template sees.
+    #[test]
+    fn message_accepts_text_content_parts() {
+        let raw = r#"{"role":"user","content":[
+            {"type":"text","text":"first"},{"type":"text","text":"second"}]}"#;
+        let m: ChatMessage = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.content, "first\nsecond");
+        let m: ChatMessage = serde_json::from_str(r#"{"role":"user","content":[]}"#).unwrap();
+        assert!(m.content.is_empty());
+    }
+
+    /// A part the model cannot see is refused by name, never dropped: a
+    /// silently stripped image would get an answer about a picture the model
+    /// never saw.
+    #[test]
+    fn message_rejects_non_text_content_parts() {
+        for (raw, needle) in [
+            (
+                r#"{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:,"}}]}"#,
+                "`image_url` is not supported",
+            ),
+            (
+                r#"{"role":"user","content":[{"text":"no type"}]}"#,
+                "missing its `type`",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"text"}]}"#,
+                "needs a string `text`",
+            ),
+            (
+                r#"{"role":"user","content":42}"#,
+                "must be a string, null, or an array",
+            ),
+        ] {
+            let err = serde_json::from_str::<ChatMessage>(raw)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{raw}: {err}");
+        }
     }
 
     #[test]
@@ -7321,7 +7491,7 @@ level={{ effort_map[eff] }}";
             "teardown must not return 200: {body}"
         );
         assert!(
-            body["error"]
+            body["error"]["message"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("shutting down"),
