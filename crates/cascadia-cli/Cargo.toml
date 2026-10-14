@@ -34,6 +34,7 @@ cascadia-engine = { workspace = true }
 cascadia-engine-mock = { workspace = true }
 cascadia-engine-openvino = { workspace = true }
 cascadia-engine-sparse-moe = { workspace = true }
+cascadia-engine-llamacpp = { workspace = true }
 cascadia-ov-genai-shim = { workspace = true }
 cascadia-runner = { workspace = true }
 cascadia-api = { workspace = true }

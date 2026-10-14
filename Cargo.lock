@@ -293,6 +293,7 @@ dependencies = [
  "cascadia-discovery",
  "cascadia-elastic",
  "cascadia-engine",
+ "cascadia-engine-llamacpp",
  "cascadia-engine-mock",
  "cascadia-engine-openvino",
  "cascadia-engine-sparse-moe",
@@ -381,6 +382,23 @@ dependencies = [
  "futures",
  "thiserror 1.0.69",
  "tracing",
+]
+
+[[package]]
+name = "cascadia-engine-llamacpp"
+version = "0.2.5"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cascadia-engine",
+ "cascadia-types",
+ "futures",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2373,9 +2391,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
