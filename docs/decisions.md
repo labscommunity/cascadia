@@ -487,3 +487,44 @@ The warmup measured the prefix-cache snapshot model at 53.5 MB fixed + 64 KiB pe
 **Apple Silicon:** OpenVINO's ARM CPU plugin expands quantized weights when it compiles, so one process
 serving all 8 stages needs far more than the 8.3 GB of int8 weights (it went to ~37 GB of swap on a 36 GB
 M4 Max). Serve the 9B models on x86 (Intel) hosts; on a Mac, only one stage per process fits.
+
+### Kev-9B
+
+**Model:** [jaredpalmer/kev-9b](https://huggingface.co/jaredpalmer/kev-9b) (LoRA + pointer head on
+Qwen3.5-9B-Base). The base is not the instruct model that Intel's int8 IR was built from, so the export
+swaps the base weights into that IR (`--weights`, checked per stage by `check_swap`), grafts the adapter,
+ships Kev's own tokenizer and swaps the text embeddings. The repo's `adapter_config.json` is used as is.
+
+```bash
+hf download Qwen/Qwen3.5-9B-Base --revision 68c46c4b3498877f3ef123c856ecfde50c39f404 --local-dir ~/models/qwen35-9b-base
+hf download jaredpalmer/kev-9b adapter_model.safetensors adapter_config.json head.pt tokenizer.json --local-dir ~/models/kev9b
+python tools/decision_export.py kev --base-ir ~/models/qwen35-9b-int8 --weights ~/models/qwen35-9b-base \
+    --lora ~/models/kev9b/adapter_model.safetensors --head-pt ~/models/kev9b/head.pt \
+    --out ~/trees/kev9b-int8           # 8 stages; 248 LoRA branches grafted (31 per stage)
+cascadia run ~/trees/kev9b-int8 --engine qwen35 --device CPU --api 127.0.0.1:8080
+```
+
+**Measured parity** (same host and set as JEV-9B):
+
+| Check | Single box (8 stages, 1 process) | Pipeline (2 stages, 2 processes) |
+|---|---|---|
+| Passes vs `kev.questions` (82 + 4 synthetic) | 86/86 | 86/86 |
+| Answers vs the spike's saved full-precision reference | 82/82 | 82/82 |
+| int8 vs streamed fp32 reference | **82/82** (choice 33/33, predicate 24/24, score 25/25), max \|Δp\| 0.069, no flips | **82/82**, max \|Δp\| 0.083, no flips |
+| Pipeline vs single-box answers (`--confident 0.05`) | — | 82/82, max \|Δp\| 0.023, no flips |
+| `/v1/decisions` vs `/v1/systemone` | 62/62 identical | — |
+
+The route check covers the 62 questions whose state is a string. Kev and Clef render an object state
+structurally, while an OpenAI `input` is always text, so an object state sent as `json.dumps` text renders
+differently by design. `openai_equivalence.py --all-states` is for JEV only.
+
+**Prefix reuse.** A 9,001-token state with 5 predicate questions (45,095 tokens without reuse) prefills
+the state once (about 395 s on this CPU), then resumes the snapshot for every later pass
+(`warm_prefix=9002`). With `max_total_tokens` lowered to 20,000:
+
+| Server | Result |
+|---|---|
+| Default prefix cache | 200, answers identical to the unlimited run (the later passes must resume the snapshot) |
+| `--prefix-cache-gb 0.001` | 413 in 0.02 s: `needs 45095 prefill tokens without prefix reuse (the shared prefix cannot fit the prefix cache); the per-request limit is 20000` |
+| `--prefix-cache-gb 0` | 413 in 0.02 s: `needs 45095 prefill tokens; the per-request limit is 20000` |
+| Pipeline (no prefix discount) | 413 in 0.02 s, the plain message; nothing reaches the dump |
