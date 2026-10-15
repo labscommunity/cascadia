@@ -103,3 +103,55 @@ def test_run_export_rejects_nonpositive_num_stages(tmp_path):
         export_gemma4_text.run_export(
             model=str(tmp_path / "ir"), output_dir=str(tmp_path / "out"),
             num_stages=0)
+
+
+# --- vision_frontend: the image inputs survive, degenerate per-layer goes ---
+
+def _tiny_lm(tmp_path, real_per_layer=False):
+    """A stand-in openvino_language_model.xml with gemma-4's VLM inputs:
+    inputs_embeds, token_type_ids (consumed), per_layer_inputs (degenerate
+    unless ``real_per_layer``), attention_mask, position_ids, beam_idx."""
+    import numpy as np
+    import openvino as ov
+    from openvino import opset13 as ops
+
+    def param(name, shape, et):
+        p = ops.parameter(ov.PartialShape(shape), et, name=name)
+        p.output(0).set_names({name})
+        return p
+
+    emb = param("inputs_embeds", [-1, -1, 8], ov.Type.f32)
+    tt = param("token_type_ids", [-1, -1], ov.Type.i64)
+    pl = param("per_layer_inputs", [-1, -1, -1, 4 if real_per_layer else 0], ov.Type.f32)
+    am = param("attention_mask", [-1, -1], ov.Type.i64)
+    pos = param("position_ids", [-1, -1], ov.Type.i64)
+    beam = param("beam_idx", [-1], ov.Type.i32)
+    # token_type_ids feeds the output (as gemma-4's mask does); the rest are
+    # consumed trivially so the model is well formed.
+    tt_f = ops.convert(ops.unsqueeze(tt, ops.constant(np.array([2]))), ov.Type.f32)
+    out = ops.add(emb, tt_f)
+    out = ops.add(out, ops.convert(ops.unsqueeze(ops.add(am, pos), ops.constant(np.array([2]))), ov.Type.f32))
+    if real_per_layer:
+        pl_sum = ops.reduce_sum(pl, ops.constant(np.array([2, 3])))
+        out = ops.add(out, ops.unsqueeze(pl_sum, ops.constant(np.array([2]))))
+    model = ov.Model([ops.result(out)], [emb, tt, pl, am, pos, beam], "tiny")
+    ov.save_model(model, str(tmp_path / "openvino_language_model.xml"))
+
+
+def test_vision_frontend_keeps_image_inputs(tmp_path):
+    _tiny_lm(tmp_path)
+    model, info = export_gemma4_text.vision_frontend(str(tmp_path))
+    names = [sorted(p.output(0).get_names()) for p in model.get_parameters()]
+    flat = [n for ns in names for n in ns]
+    assert "inputs_embeds" in flat and "token_type_ids" in flat
+    assert not any("per_layer" in n for n in flat), "degenerate per-layer input is dropped"
+    assert info["token_type_ids"] is True
+    emb = next(p for p in model.get_parameters() if "inputs_embeds" in p.output(0).get_names())
+    assert export_gemma4_text.GRAFTED_EMBEDS_NAME in emb.output(0).get_names(), \
+        "tagged so the slicer re-routes it off mid/last stages"
+
+
+def test_vision_frontend_refuses_real_per_layer_embeddings(tmp_path):
+    _tiny_lm(tmp_path, real_per_layer=True)
+    with pytest.raises(SystemExit, match="per-layer"):
+        export_gemma4_text.vision_frontend(str(tmp_path))
