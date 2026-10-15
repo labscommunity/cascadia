@@ -19,11 +19,11 @@ use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_ov_genai_shim::{
     CbFinish, CbHandle, CbPipeline, CbRead, CbSchedulerConfig, CbStatus, Error as OvError,
-    GenConfig, LlmPipeline, PluginConfig,
+    GenConfig, LlmPipeline, Media, MediaKind as ShimMediaKind, PluginConfig,
 };
 use cascadia_types::{
-    Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, SamplingParams, ShardSpec,
-    TaskId,
+    Chunk, FinishReason, GenerationTask, LoadProgress, MediaKind, PeerLayout, SamplingParams,
+    ShardSpec, TaskId,
 };
 use futures::stream;
 use tracing::{info, warn};
@@ -357,6 +357,33 @@ fn map_ov_err(err: OvError) -> EngineError {
     }
 }
 
+/// Borrow a task's decoded media in the shim's form. A kind this engine
+/// cannot feed GenAI fails the task: answering from the text alone would
+/// describe media the model never saw.
+fn shim_media(task: &GenerationTask) -> EngineResult<Vec<Media<'_>>> {
+    task.media
+        .iter()
+        .map(|m| {
+            let kind = match m.kind {
+                MediaKind::Image => ShimMediaKind::Image,
+                #[allow(unreachable_patterns)]
+                other => {
+                    return Err(EngineError::InvalidConfig(format!(
+                        "ov-genai: unsupported media kind {other:?}"
+                    )))
+                }
+            };
+            Ok(Media {
+                kind,
+                pixels: &m.pixels,
+                num_frames: m.num_frames,
+                height: m.height,
+                width: m.width,
+            })
+        })
+        .collect()
+}
+
 pub struct OvGenaiEngine {
     pipe: LlmPipeline,
     speculative_k: u32,
@@ -372,9 +399,10 @@ impl Engine for OvGenaiEngine {
             /*max_tokens*/ 4,
             /*temperature*/ 0.0,
             /*enable_thinking*/ false,
+            /*prompt_rendered*/ false,
             &SamplingParams::default(),
         );
-        match self.pipe.generate("Hi", &cfg) {
+        match self.pipe.generate("Hi", &[], &cfg) {
             Ok(_) => info!(
                 spec_k = self.speculative_k,
                 prompt_lookup = self.prompt_lookup_ngram,
@@ -436,11 +464,17 @@ impl Engine for OvGenaiEngine {
             max_new,
             task.temperature,
             task.enable_thinking,
+            task.prompt_rendered,
             &task.sampling,
         );
 
         let started = Instant::now();
-        let result = match self.pipe.generate(&task.prompt, &cfg) {
+        let generated = shim_media(&task).and_then(|media| {
+            self.pipe
+                .generate(&task.prompt, &media, &cfg)
+                .map_err(map_ov_err)
+        });
+        let result = match generated {
             Ok(r) => r,
             Err(err) => {
                 warn!(task = %task.task_id, error = %err, "generate failed");
@@ -499,7 +533,13 @@ impl Engine for OvGenaiEngine {
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text)
             .with_n_tokens(tokens)
             .with_finish_reason(finish);
-        if let Some(prompt_tokens) = self.pipe.count_tokens(&task.prompt) {
+        // The pipeline's own count is exact and includes image tokens; the
+        // tokenizer count of the prompt text is the fallback for plain LLM
+        // exports, which do not report one.
+        if let Some(prompt_tokens) = result
+            .input_tokens
+            .or_else(|| self.pipe.count_tokens(&task.prompt))
+        {
             chunk = chunk.with_prompt_tokens(prompt_tokens);
         }
         Ok(vec![(task.task_id, chunk)])
@@ -544,6 +584,7 @@ trait CbPipe: Send {
         &self,
         request_id: u64,
         prompt: &str,
+        media: &[Media<'_>],
         cfg: &GenConfig,
     ) -> Result<Box<dyn CbReq>, OvError>;
     fn step(&self) -> Result<(), OvError>;
@@ -554,6 +595,8 @@ trait CbPipe: Send {
 trait CbReq: Send {
     fn read(&mut self) -> Result<CbRead, OvError>;
     fn cancel(&self) -> Result<(), OvError>;
+    /// Prompt length as the model saw it, image tokens included.
+    fn input_tokens(&self) -> Option<u32>;
 }
 
 impl CbPipe for CbPipeline {
@@ -561,10 +604,11 @@ impl CbPipe for CbPipeline {
         &self,
         request_id: u64,
         prompt: &str,
+        media: &[Media<'_>],
         cfg: &GenConfig,
     ) -> Result<Box<dyn CbReq>, OvError> {
         Ok(Box::new(CbPipeline::add_request(
-            self, request_id, prompt, cfg,
+            self, request_id, prompt, media, cfg,
         )?))
     }
     fn step(&self) -> Result<(), OvError> {
@@ -581,6 +625,9 @@ impl CbReq for CbHandle {
     }
     fn cancel(&self) -> Result<(), OvError> {
         CbHandle::cancel(self)
+    }
+    fn input_tokens(&self) -> Option<u32> {
+        CbHandle::input_tokens(self)
     }
 }
 
@@ -631,10 +678,11 @@ impl Engine for OvGenaiCbEngine {
             /*max_tokens*/ 4,
             /*temperature*/ 0.0,
             /*enable_thinking*/ false,
+            /*prompt_rendered*/ false,
             &SamplingParams::default(),
         );
         // u64::MAX cannot collide with the sequential request-id counter.
-        match self.pipe.add_request(u64::MAX, "Hi", &cfg) {
+        match self.pipe.add_request(u64::MAX, "Hi", &[], &cfg) {
             Ok(mut handle) => {
                 // Only a terminal status means the pipeline actually served a
                 // request. Reporting "ok" after a failed step told operators
@@ -720,13 +768,15 @@ impl Engine for OvGenaiCbEngine {
             max_tokens,
             task.temperature,
             task.enable_thinking,
+            task.prompt_rendered,
             &task.sampling,
         );
+        let media = shim_media(&task)?;
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
         let handle = self
             .pipe
-            .add_request(request_id, &task.prompt, &cfg)
+            .add_request(request_id, &task.prompt, &media, &cfg)
             .map_err(map_ov_err)?;
         self.active.push(ActiveCbTask {
             prompt_tokens: self.pipe.count_tokens(&task.prompt),
@@ -876,7 +926,9 @@ impl Engine for OvGenaiCbEngine {
                     let mut chunk = Chunk::final_marker(t.task_id.clone(), read.text_delta)
                         .with_n_tokens(read.new_tokens)
                         .with_finish_reason(finish);
-                    if let Some(prompt_tokens) = t.prompt_tokens {
+                    // The request's perf metrics are exact and count image
+                    // tokens; the submit-time tokenizer count is the fallback.
+                    if let Some(prompt_tokens) = t.handle.input_tokens().or(t.prompt_tokens) {
                         chunk = chunk.with_prompt_tokens(prompt_tokens);
                     }
                     out.push((t.task_id, chunk));
@@ -945,6 +997,7 @@ fn build_gen_config(
     max_tokens: u32,
     temperature: f32,
     enable_thinking: bool,
+    prompt_rendered: bool,
     sampling: &SamplingParams,
 ) -> GenConfig {
     let do_sample = temperature > 0.0;
@@ -958,7 +1011,9 @@ fn build_gen_config(
         // template loaded AND this request is thinking-OFF — do we tell
         // ov-genai to skip its own apply. Thinking-ON keeps ov-genai's
         // native templating (the legacy join the API emitted), untouched.
-        skip_chat_template: prompt_pretemplated && !enable_thinking,
+        // A task the API rendered itself (every media request) skips it
+        // regardless of thinking.
+        skip_chat_template: (prompt_pretemplated && !enable_thinking) || prompt_rendered,
         // OpenAI sampling knobs (#14). top_p/top_k take effect in the
         // sampling regime (do_sample, i.e. temperature > 0); penalties and
         // seed are forwarded regardless.
@@ -1008,6 +1063,7 @@ impl OvGenaiEngine {
         max_tokens: u32,
         temperature: f32,
         enable_thinking: bool,
+        prompt_rendered: bool,
         sampling: &SamplingParams,
     ) -> GenConfig {
         build_gen_config(
@@ -1017,6 +1073,7 @@ impl OvGenaiEngine {
             max_tokens,
             temperature,
             enable_thinking,
+            prompt_rendered,
             sampling,
         )
     }
@@ -1046,6 +1103,10 @@ mod tests {
         steps: usize,
         added: Vec<u64>,
         cancelled: Vec<u64>,
+        /// Per enrolled request: (media items, skip_chat_template).
+        enrolled: Vec<(usize, bool)>,
+        /// What every handle reports from its perf metrics.
+        input_tokens: Option<u32>,
     }
 
     struct MockPipe {
@@ -1062,10 +1123,12 @@ mod tests {
             &self,
             request_id: u64,
             _prompt: &str,
-            _cfg: &GenConfig,
+            media: &[Media<'_>],
+            cfg: &GenConfig,
         ) -> Result<Box<dyn CbReq>, OvError> {
             let mut st = self.st.lock().unwrap();
             st.added.push(request_id);
+            st.enrolled.push((media.len(), cfg.skip_chat_template));
             let idx = st.added.len() - 1;
             while st.reads.len() <= idx {
                 st.reads.push(VecDeque::new());
@@ -1104,6 +1167,9 @@ mod tests {
         fn cancel(&self) -> Result<(), OvError> {
             self.st.lock().unwrap().cancelled.push(self.id);
             Ok(())
+        }
+        fn input_tokens(&self) -> Option<u32> {
+            self.st.lock().unwrap().input_tokens
         }
     }
 
@@ -1285,6 +1351,72 @@ mod tests {
         e.submit(task("t1", 4096)).unwrap();
         let out = e.step().unwrap();
         assert_eq!(out[0].1.finish_reason, Some(FinishReason::Length));
+    }
+
+    fn image_task(id: &str) -> GenerationTask {
+        let mut t = task(id, 4096);
+        t.media.push(cascadia_types::MediaInput {
+            kind: MediaKind::Image,
+            pixels: vec![0u8; 2 * 2 * 3].into(),
+            num_frames: 1,
+            width: 2,
+            height: 2,
+            timestamps_ms: None,
+            sha256: [0; 32],
+        });
+        t.prompt_rendered = true;
+        t
+    }
+
+    /// A media task reaches the pipeline with its media and with GenAI's own
+    /// templating off, even with thinking on: the API rendered it so each
+    /// image tag sits inside its message, and a second template pass would
+    /// wrap the whole prompt again.
+    #[test]
+    fn cb_media_task_carries_media_and_skips_native_template() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        let mut t = image_task("img");
+        t.enable_thinking = true;
+        e.submit(t).unwrap();
+        e.submit(task("txt", 8)).unwrap();
+        assert_eq!(st.lock().unwrap().enrolled, vec![(1, true), (0, false)]);
+    }
+
+    /// usage.prompt_tokens must count image tokens, which only the pipeline
+    /// knows. The tokenizer count of the prompt text (the mock's 7) sees the
+    /// placeholder tag, not the ~200 tokens an image expands to.
+    #[test]
+    fn cb_final_chunk_reports_the_pipelines_input_tokens() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        {
+            let mut g = st.lock().unwrap();
+            g.input_tokens = Some(218);
+            g.reads.push(VecDeque::from(vec![Ok(read_of(
+                CbStatus::Finished,
+                1,
+                "ok",
+                CbFinish::Stop,
+            ))]));
+        }
+        let mut e = mock_engine(&st);
+        e.submit(image_task("img")).unwrap();
+        let out = e.step().unwrap();
+        assert_eq!(out[0].1.prompt_tokens, Some(218));
+    }
+
+    /// The flag only adds skips: a text task keeps today's rule.
+    #[test]
+    fn gen_config_skips_template_for_rendered_prompts() {
+        let s = SamplingParams::default();
+        let skip = |pre, think, rendered| {
+            build_gen_config(0, 0, pre, 8, 0.0, think, rendered, &s).skip_chat_template
+        };
+        assert!(skip(true, false, false));
+        assert!(!skip(true, true, false));
+        assert!(!skip(false, false, false));
+        assert!(skip(false, true, true));
+        assert!(skip(true, true, true));
     }
 
     /// ...and fall back to the token-count inference when it reports nothing,
