@@ -2272,7 +2272,11 @@ impl Qwen36Engine {
                             g.send_raw(&frame_header(FRAME_HELLO_ACK, 0, cap)).await
                         })
                         .map_err(map_wire)?;
-                        info!(capture_v2 = cap, "qwen36 pipeline handshake ok");
+                        info!(
+                            capture_v2 = capture,
+                            mrope = mrope != 0,
+                            "qwen36 pipeline handshake ok"
+                        );
                     }
                     Some(reason) => {
                         warn!(reason = %reason, "qwen36 pipeline handshake mismatch; refusing to serve");
