@@ -126,3 +126,23 @@ silently stays compiled out.
 Reference run (2026-10-01, HunterLaptopSergio, Qwen2.5-1.5B-int8-ov, CPU):
 **W1/W2/W3 PASS** — private commit 1646 → 171 MB (10% of stock), working set
 3098 → 3114 MB, output byte-identical.
+
+# OpenAI SDK conformance
+
+`test_openai_sdk.py` drives a `cascadia` binary on the mock engine (no model
+files) with the unmodified `openai` Python SDK, pinned in
+`requirements-openai-sdk.txt`. It checks what SDK callers depend on: the models
+list (with `input_modalities`), string and content-part-array messages,
+streaming, and that refusals raise the SDK's own `BadRequestError` with
+OpenAI's `{"error": {message, type, param, code}}` body. CI runs it after the
+workspace tests.
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r tests/conformance/requirements-openai-sdk.txt
+cargo build -p cascadia
+.venv/bin/python tests/conformance/test_openai_sdk.py --bin target/debug/cascadia
+```
+
+Image answers need a real VLM and are not in CI; the same SDK drives them by
+hand against `cascadia run <vlm-export>` (see `docs/rfcs/vlm-support.md`,
+"Phase 1b").

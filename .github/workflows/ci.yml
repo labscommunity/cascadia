@@ -121,6 +121,16 @@ jobs:
         # e2e tests against the mock engine.
         run: cargo test --workspace --all-targets
 
+      - name: OpenAI SDK conformance (mock engine)
+        # The unmodified `openai` Python SDK against the binary built above:
+        # wire shape, streaming, and the SDK's error classes, including
+        # image_url refused by a text-only model. A venv, because the
+        # runner's system Python refuses `pip install` (PEP 668).
+        run: |
+          python3 -m venv "$RUNNER_TEMP/sdk"
+          "$RUNNER_TEMP/sdk/bin/pip" install --quiet -r tests/conformance/requirements-openai-sdk.txt
+          "$RUNNER_TEMP/sdk/bin/python" tests/conformance/test_openai_sdk.py --bin target/debug/cascadia
+
       # Everything above builds default features, and `dashboard-embed` is
       # default-off — so without these steps the whole embedded-SPA path
       # (spa.rs, rust-embed, mime_guess, and build.rs's success branch) is
