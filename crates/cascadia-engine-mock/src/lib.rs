@@ -37,6 +37,10 @@ impl Engine for MockEngine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        // Media is accepted and ignored on purpose: the API's image tests use
+        // the mock as an image-capable stand-in (the echo shows where each
+        // placeholder landed). Real text-only engines refuse it in `submit`
+        // via `cascadia_engine::refuse_media`.
         if self.pending.iter().any(|(t, _)| t.task_id == task.task_id) {
             return Ok(());
         }

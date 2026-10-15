@@ -2944,6 +2944,9 @@ impl Engine for Qwen36Engine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        if self.vision.is_none() {
+            cascadia_engine::refuse_media(&task, "qwen35 (tree without vision IRs)")?;
+        }
         if self.pending.iter().any(|t| t.task_id == task.task_id) {
             return Ok(());
         }

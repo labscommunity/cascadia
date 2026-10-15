@@ -1453,6 +1453,9 @@ impl Engine for OvDistSpecEngine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        // Draft and target both take ids and must see the same sequence; an
+        // image turn would need both to be VLMs with identical layouts.
+        cascadia_engine::refuse_media(&task, "ov-dist-spec")?;
         if self.pending.iter().any(|t| t.task_id == task.task_id)
             || self
                 .active

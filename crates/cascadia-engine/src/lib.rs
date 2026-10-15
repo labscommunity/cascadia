@@ -55,6 +55,12 @@ pub enum EngineError {
     #[error("prompt too long: {0}")]
     PromptTooLong(String),
 
+    /// The request carries input this engine cannot consume (today: images
+    /// on a text-only engine or tree). Permanent for the request, like
+    /// `PromptTooLong`, so the API answers 400 rather than a retryable 5xx.
+    #[error("unsupported input: {0}")]
+    UnsupportedInput(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -86,6 +92,19 @@ pub enum EngineError {
         #[source]
         source: Box<EngineError>,
     },
+}
+
+/// The [`GenerationTask::media`] contract for an engine that cannot consume
+/// media: fail the task rather than answer from its text alone. Call first in
+/// `submit`; `engine` names the engine in the message the caller sees.
+pub fn refuse_media(task: &GenerationTask, engine: &str) -> EngineResult<()> {
+    if task.media.is_empty() {
+        return Ok(());
+    }
+    Err(EngineError::UnsupportedInput(format!(
+        "the {engine} engine does not accept image input ({} image(s) in the request)",
+        task.media.len()
+    )))
 }
 
 impl EngineError {
@@ -555,5 +574,33 @@ mod tests {
                 "must stay fatal: {msg}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod refuse_media_tests {
+    use super::*;
+
+    #[test]
+    fn text_tasks_pass_and_image_tasks_are_refused_with_the_engine_named() {
+        let mut t = GenerationTask::new("t", "hello");
+        assert!(refuse_media(&t, "x").is_ok());
+        t.media.push(cascadia_types::MediaInput {
+            kind: cascadia_types::MediaKind::Image,
+            pixels: std::sync::Arc::from(vec![0u8; 3]),
+            num_frames: 1,
+            width: 1,
+            height: 1,
+            timestamps_ms: None,
+            sha256: [0; 32],
+        });
+        let e = refuse_media(&t, "gemma4").unwrap_err();
+        assert!(matches!(e, EngineError::UnsupportedInput(_)));
+        assert!(
+            e.to_string()
+                .contains("gemma4 engine does not accept image input"),
+            "{e}"
+        );
+        assert!(!e.is_connection_fatal());
     }
 }

@@ -1489,6 +1489,9 @@ impl Engine for Gemma4Engine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        // gemma4_cached trees embed ids inside stage 0 (no inputs_embeds),
+        // so images are refused; the ov-runtime surgery trees serve them.
+        cascadia_engine::refuse_media(&task, "gemma4")?;
         if !self.spec.is_first_stage {
             warn!("gemma4 submit() ignored on non-first stage");
             return Err(EngineError::Backend(

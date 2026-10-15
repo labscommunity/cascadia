@@ -1670,6 +1670,7 @@ impl Engine for SparseMoEEngine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        cascadia_engine::refuse_media(&task, "sparse-moe")?;
         if self.rank != 0 {
             return Err(EngineError::InvalidConfig(
                 "only rank 0 accepts tasks; worker ranks drive themselves from upstream frames"
@@ -5039,6 +5040,7 @@ impl Engine for OvMoeEngine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        cascadia_engine::refuse_media(&task, "sparse-moe (ov)")?;
         if self.rank != 0 {
             return Err(EngineError::InvalidConfig(
                 "only rank 0 accepts tasks; worker ranks drive themselves from upstream frames"
@@ -8258,6 +8260,7 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        cascadia_engine::refuse_media(&task, "sparse-moe (pipeline)")?;
         if self.rank != 0 {
             return Err(EngineError::InvalidConfig(
                 "only rank 0 accepts tasks; worker ranks drive themselves from upstream frames"
