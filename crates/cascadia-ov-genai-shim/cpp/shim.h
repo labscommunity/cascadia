@@ -111,14 +111,39 @@ void cascadia_genconfig_set_frequency_penalty(cascadia_genconfig_t* cfg, float v
 void cascadia_genconfig_set_presence_penalty(cascadia_genconfig_t* cfg, float v);
 void cascadia_genconfig_set_rng_seed(cascadia_genconfig_t* cfg, uint64_t v);
 
+// ---- Media -----------------------------------------------------------------
+
+// Values for cascadia_media_t.kind. Only IMAGE is accepted today; a video kind
+// will map onto GenAI's videos overload without changing this ABI.
+#define CASCADIA_MEDIA_IMAGE 0
+
+// One decoded media item, borrowed for the duration of the call (the shim
+// copies the pixels). `pixels` is RGB8, frame-major
+// [num_frames, height, width, 3]; an image has num_frames == 1. Items are
+// matched to the prompt's image tags in order.
+typedef struct {
+    int32_t kind;
+    const uint8_t* pixels;
+    uint32_t num_frames;
+    uint32_t height;
+    uint32_t width;
+} cascadia_media_t;
+
 // ---- Generation -----------------------------------------------------------
 
+/// `media` may be NULL when `media_count` is 0. Media on a plain LLM export is
+/// an error, not a silent text-only answer. `out_input_tokens` (nullable)
+/// receives the prompt length as the model saw it, image tokens included; 0
+/// when the pipeline did not report one.
 int32_t cascadia_pipeline_generate(
     cascadia_pipeline_t* handle,
     const char* prompt,
+    const cascadia_media_t* media,
+    size_t media_count,
     const cascadia_genconfig_t* cfg,
     char** out_text,
-    uint32_t* out_token_count);
+    uint32_t* out_token_count,
+    uint32_t* out_input_tokens);
 
 void cascadia_free_string(char* s);
 
@@ -167,10 +192,15 @@ void cascadia_cb_pipeline_destroy(cascadia_cb_pipeline_t* handle);
 /// returned handle must be destroyed AFTER the request finishes or is
 /// cancelled, and before the pipeline is destroyed — the Rust wrapper enforces
 /// the ordering by having each handle hold an Arc on its pipeline.
+///
+/// With `media_count > 0` the prompt goes through GenAI's images overload,
+/// which honours cfg's apply_chat_template (verified on 2026.4.1).
 int32_t cascadia_cb_add_request(
     cascadia_cb_pipeline_t* handle,
     uint64_t request_id,
     const char* prompt,
+    const cascadia_media_t* media,
+    size_t media_count,
     const cascadia_genconfig_t* cfg,
     cascadia_cb_handle_t** out_handle);
 
@@ -210,6 +240,10 @@ int32_t cascadia_cb_handle_read(
 int32_t cascadia_cb_handle_cancel(cascadia_cb_handle_t* handle);
 
 void cascadia_cb_handle_destroy(cascadia_cb_handle_t* handle);
+
+/// Prompt length as the model saw it, image tokens included, from the
+/// request's perf metrics. Writes 0 when the pipeline has not reported one.
+int32_t cascadia_cb_handle_input_tokens(cascadia_cb_handle_t* handle, uint32_t* out_count);
 
 /// Token count via the CB pipeline's tokenizer (usage reporting).
 int32_t cascadia_cb_count_tokens(
