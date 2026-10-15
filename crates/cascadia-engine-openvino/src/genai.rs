@@ -353,12 +353,38 @@ impl Builder for OvGenaiBuilder {
 /// Whether an export serves images: a VLM layout (language model IR, no
 /// `openvino_model.xml`) with its vision encoder IR, the same test the CLI
 /// uses to offer image input. Anything else answers images with a 400.
-pub(crate) fn takes_images(model_dir: &Path) -> bool {
+pub fn takes_images(model_dir: &Path) -> bool {
     model_dir.join("openvino_language_model.xml").exists()
         && !model_dir.join("openvino_model.xml").exists()
         && model_dir
             .join("openvino_vision_embeddings_model.xml")
             .exists()
+        && unsupported_vision(model_dir).is_none()
+}
+
+/// Why GenAI cannot serve this VLM export's images correctly, if it cannot.
+///
+/// GenAI 2026.4.1 has no Pixtral path: `model_type: "llava"` maps a Pixtral
+/// checkpoint onto its LLaVA-1.5 preprocessing (`visual_language/llava/
+/// classes.cpp`), which resizes the shortest edge and center-crops a fixed
+/// square and expands each image without Pixtral's `[IMG_BREAK]` row tokens
+/// and `[IMG_END]`. The model then answers about a different picture (903
+/// prompt tokens where HF counts 832 on a 448x448 image). Such exports serve
+/// text only here; their images go through ov-runtime.
+pub fn unsupported_vision(model_dir: &Path) -> Option<String> {
+    let cfg: serde_json::Value = std::fs::read(model_dir.join("config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())?;
+    let vision = cfg
+        .get("vision_config")
+        .and_then(|v| v.get("model_type"))
+        .and_then(serde_json::Value::as_str)?;
+    (vision == "pixtral").then(|| {
+        "GenAI preprocesses Pixtral as LLaVA-1.5 (center crop, no [IMG_BREAK]/[IMG_END]) \
+         and answers about a different image; serve this export's images with ov-runtime \
+         (tools/vlm_surgery/cut_vlm_lm.py --family pixtral, --num-stages 1 on one box)"
+            .to_string()
+    })
 }
 
 fn map_ov_err(err: OvError) -> EngineError {
@@ -1106,6 +1132,24 @@ impl OvGenaiEngine {
 
 #[cfg(test)]
 mod tests {
+    /// Pixtral exports are text-only on ov-genai (GenAI preprocesses them as
+    /// LLaVA-1.5); other VLM families and configs without a vision tower pass.
+    #[test]
+    fn pixtral_images_are_not_served_by_genai() {
+        let dir = std::env::temp_dir().join(format!("cascadia-genai-pix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |v: &str| std::fs::write(dir.join("config.json"), v).unwrap();
+        write(r#"{"model_type":"llava","vision_config":{"model_type":"pixtral"}}"#);
+        assert!(unsupported_vision(&dir).unwrap().contains("Pixtral"));
+        write(
+            r#"{"model_type":"qwen3_5_moe","vision_config":{"model_type":"qwen3_5_moe_vision"}}"#,
+        );
+        assert!(unsupported_vision(&dir).is_none());
+        write(r#"{"model_type":"qwen3"}"#);
+        assert!(unsupported_vision(&dir).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
 
     use std::collections::VecDeque;
