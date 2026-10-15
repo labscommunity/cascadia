@@ -227,3 +227,193 @@ mod tests {
         assert!((s[0] - 3.0).abs() < 1e-6);
     }
 }
+
+/// The `vision_config` fields the encoder needs (`config.json`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VisionConfig {
+    pub num_position_embeddings: usize,
+    pub hidden_size: usize,
+    pub num_heads: usize,
+    pub spatial_merge_size: usize,
+    pub out_hidden_size: usize,
+}
+
+impl VisionConfig {
+    /// Read `vision_config` from a Hugging Face `config.json`.
+    pub fn from_config_json(path: &std::path::Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("reading {}: {e}", path.display()))?;
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))?;
+        let vc = v
+            .get("vision_config")
+            .ok_or("config.json has no vision_config")?;
+        let get = |k: &str| {
+            vc.get(k)
+                .and_then(serde_json::Value::as_u64)
+                .map(|x| x as usize)
+                .ok_or_else(|| format!("vision_config.{k} missing"))
+        };
+        Ok(Self {
+            num_position_embeddings: get("num_position_embeddings")?,
+            hidden_size: get("hidden_size")?,
+            num_heads: get("num_heads")?,
+            spatial_merge_size: get("spatial_merge_size")?,
+            out_hidden_size: get("out_hidden_size")?,
+        })
+    }
+
+    pub fn grid_side(&self) -> usize {
+        (self.num_position_embeddings as f64).sqrt().round() as usize
+    }
+
+    /// `rotary_pos_emb` width: half the attention head dimension.
+    pub fn rotary_dim(&self) -> usize {
+        self.hidden_size / self.num_heads / 2
+    }
+}
+
+/// Every stage's output for one item, for parity checks.
+#[derive(Clone, Debug)]
+pub struct EncodeTrace {
+    /// `[N, hidden]` from the patch embedding IR.
+    pub patch_embeds: Vec<f32>,
+    /// `[N, hidden]` patch embeddings plus interpolated positions.
+    pub hidden_states: Vec<f32>,
+    /// `[N / merge^2, out_hidden]`, one row per prompt image token.
+    pub image_embeds: Vec<f32>,
+}
+
+/// The export's three vision IRs (`openvino_vision_embeddings{,_pos,_merger}_model.xml`)
+/// driven with the host inputs above.
+pub struct VisionEncoder {
+    patch: cascadia_ov_genai_shim::Runtime,
+    pos: cascadia_ov_genai_shim::Runtime,
+    merger: cascadia_ov_genai_shim::Runtime,
+    cfg: VisionConfig,
+}
+
+fn f32_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+fn read_f32(
+    rt: &cascadia_ov_genai_shim::Runtime,
+    what: &str,
+) -> Result<(Vec<usize>, Vec<f32>), String> {
+    let (dtype, shape, bytes) = rt.output(0).map_err(|e| format!("{what}: {e}"))?;
+    if dtype != cascadia_ov_genai_shim::DType::F32 {
+        return Err(format!("{what}: output is {dtype:?}, expected f32"));
+    }
+    let v = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    Ok((shape, v))
+}
+
+impl VisionEncoder {
+    /// Compile the three IRs from `model_dir` on `device`.
+    pub fn load(
+        model_dir: &std::path::Path,
+        device: &str,
+        plugin: &cascadia_ov_genai_shim::PluginConfig,
+        cfg: VisionConfig,
+    ) -> Result<Self, String> {
+        let compile = |suffix: &str| {
+            let path = model_dir.join(format!("openvino_vision_embeddings{suffix}_model.xml"));
+            cascadia_ov_genai_shim::Runtime::compile(&path.to_string_lossy(), device, plugin)
+                .map_err(|e| format!("compiling {}: {e}", path.display()))
+        };
+        Ok(Self {
+            patch: compile("")?,
+            pos: compile("_pos")?,
+            merger: compile("_merger")?,
+            cfg,
+        })
+    }
+
+    /// Image embeddings `[tokens, out_hidden]` for one preprocessed item.
+    pub fn encode(&mut self, p: &super::Patches) -> Result<Vec<f32>, String> {
+        Ok(self.encode_traced(p)?.image_embeds)
+    }
+
+    /// [`Self::encode`], keeping every stage's output.
+    pub fn encode_traced(&mut self, p: &super::Patches) -> Result<EncodeTrace, String> {
+        use cascadia_ov_genai_shim::DType;
+        let (n, d) = (p.rows, self.cfg.hidden_size);
+        let grids = [p.grid_thw];
+        let merge = self.cfg.spatial_merge_size;
+
+        self.patch
+            .set_input(
+                "hidden_states",
+                DType::F32,
+                &[p.rows, p.cols],
+                &f32_bytes(&p.pixel_values),
+            )
+            .and_then(|_| self.patch.infer())
+            .map_err(|e| format!("patch embedding: {e}"))?;
+        let (shape, patch_embeds) = read_f32(&self.patch, "patch embedding")?;
+        if shape != [n, d] {
+            return Err(format!(
+                "patch embedding returned {shape:?}, expected [{n}, {d}]"
+            ));
+        }
+
+        let b = bilinear_indices_and_weights(&grids, self.cfg.grid_side(), merge);
+        let idx: Vec<u8> = b.indices.iter().flat_map(|x| x.to_le_bytes()).collect();
+        self.pos
+            .set_input("input", DType::I64, &[4, n], &idx)
+            .and_then(|_| self.pos.infer())
+            .map_err(|e| format!("position embedding: {e}"))?;
+        let (shape, corners) = read_f32(&self.pos, "position embedding")?;
+        if shape != [4, n, d] {
+            return Err(format!(
+                "position embedding returned {shape:?}, expected [4, {n}, {d}]"
+            ));
+        }
+        let mut hidden_states = weighted_corner_sum(&corners, &b.weights, n, d);
+        for (h, pe) in hidden_states.iter_mut().zip(&patch_embeds) {
+            *h += pe;
+        }
+
+        let rot_dim = self.cfg.rotary_dim();
+        let rot = rotary_pos_emb(&grids, merge, rot_dim, 10_000.0);
+        let mask = attention_mask(&grids);
+        self.merger
+            .set_input(
+                "hidden_states",
+                DType::F32,
+                &[n, d],
+                &f32_bytes(&hidden_states),
+            )
+            .and_then(|_| {
+                self.merger.set_input(
+                    "rotary_pos_emb",
+                    DType::F32,
+                    &[n, rot_dim],
+                    &f32_bytes(&rot),
+                )
+            })
+            .and_then(|_| {
+                self.merger
+                    .set_input("attention_mask", DType::F32, &[1, n, n], &f32_bytes(&mask))
+            })
+            .and_then(|_| self.merger.infer())
+            .map_err(|e| format!("merger: {e}"))?;
+        let (shape, image_embeds) = read_f32(&self.merger, "merger")?;
+        let tokens = n / (merge * merge);
+        if shape != [tokens, self.cfg.out_hidden_size] {
+            return Err(format!(
+                "merger returned {shape:?}, expected [{tokens}, {}]",
+                self.cfg.out_hidden_size
+            ));
+        }
+        Ok(EncodeTrace {
+            patch_embeds,
+            hidden_states,
+            image_embeds,
+        })
+    }
+}
