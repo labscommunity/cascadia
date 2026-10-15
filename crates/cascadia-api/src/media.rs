@@ -224,8 +224,6 @@ pub fn is_remote(url: &str) -> bool {
 /// Redirects followed per image, each re-validated like the original URL.
 const MAX_REDIRECTS: usize = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Whole fetch of one image, headers and body.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Who a fetch may reach. Production is [`FetchPolicy::PUBLIC_HTTPS`]; tests
 /// use a policy that also allows plain HTTP to loopback so they can run a
@@ -234,12 +232,21 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct FetchPolicy {
     pub allow_http: bool,
     pub allow_non_public: bool,
+    /// Whole fetch of one image: DNS, every redirect hop, headers and body.
+    /// One deadline, not one per hop, so redirects cannot stretch it.
+    pub per_image: Duration,
+    /// All remote images of one request together. The request holds an
+    /// in-flight permit while it fetches, so this bounds how long a caller
+    /// can occupy one.
+    pub per_request: Duration,
 }
 
 impl FetchPolicy {
     pub const PUBLIC_HTTPS: Self = Self {
         allow_http: false,
         allow_non_public: false,
+        per_image: Duration::from_secs(10),
+        per_request: Duration::from_secs(20),
     };
 }
 
@@ -252,8 +259,29 @@ impl FetchPolicy {
 ///   inside v6), and the connection is pinned to the checked address, so a
 ///   second DNS answer cannot redirect it (rebinding);
 /// - at most [`MAX_REDIRECTS`] redirects, each checked the same way;
-/// - `image/*` content type, and at most `max_bytes`, enforced while reading.
+/// - `image/*` content type, and at most `max_bytes`, enforced while reading;
+/// - one deadline ([`FetchPolicy::per_image`]) over the whole fetch.
+///
+/// Errors a caller could use to map the inside (what a host resolves to, DNS
+/// or connection failures) are reported generically and logged in detail.
 pub async fn fetch_image(
+    url: &str,
+    max_bytes: usize,
+    policy: FetchPolicy,
+) -> Result<Vec<u8>, String> {
+    match tokio::time::timeout(policy.per_image, fetch_image_inner(url, max_bytes, policy)).await {
+        Ok(r) => r,
+        Err(_) => Err(format!(
+            "fetching the image took longer than {} s",
+            policy.per_image.as_secs_f32()
+        )),
+    }
+}
+
+/// Fetch failures whose cause stays in the server log.
+const UNREACHABLE: &str = "could not fetch the image from this server";
+
+async fn fetch_image_inner(
     url: &str,
     max_bytes: usize,
     policy: FetchPolicy,
@@ -266,17 +294,15 @@ pub async fn fetch_image(
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(FETCH_TIMEOUT)
             .https_only(!policy.allow_http)
             .resolve(&host, addr)
             .user_agent("cascadia-image-fetch")
             .build()
             .map_err(|e| format!("could not set up the image fetch: {e}"))?;
-        let mut resp = client
-            .get(current.clone())
-            .send()
-            .await
-            .map_err(|e| format!("could not fetch the image: {}", without_url(e)))?;
+        let mut resp = client.get(current.clone()).send().await.map_err(|e| {
+            tracing::warn!(host = %host, error = %without_url(e), "image fetch failed");
+            UNREACHABLE.to_string()
+        })?;
         if resp.status().is_redirection() {
             let next = resp
                 .headers()
@@ -308,11 +334,10 @@ pub async fn fetch_image(
             return Err(format!("image is larger than the {max_bytes}-byte limit"));
         }
         let mut body = Vec::new();
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|e| format!("could not read the image: {}", without_url(e)))?
-        {
+        while let Some(chunk) = resp.chunk().await.map_err(|e| {
+            tracing::warn!(host = %host, error = %without_url(e), "image fetch failed mid-body");
+            UNREACHABLE.to_string()
+        })? {
             if body.len() + chunk.len() > max_bytes {
                 return Err(format!("image is larger than the {max_bytes}-byte limit"));
             }
@@ -362,21 +387,25 @@ async fn check_target(url: &url::Url, policy: FetchPolicy) -> Result<SocketAddr,
         Some(url::Host::Ipv6(ip)) => ip.to_string(),
         None => return Err("image URL has no host".into()),
     };
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
-        .await
-        .map_err(|e| format!("could not resolve the image host: {e}"))?
-        .collect();
+    let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host.as_str(), port)).await {
+        Ok(a) => a.collect(),
+        Err(e) => {
+            tracing::warn!(host = %host, error = %e, "image host did not resolve");
+            return Err(UNREACHABLE.into());
+        }
+    };
     let Some(first) = addrs.first().copied() else {
-        return Err("image host did not resolve".into());
+        tracing::warn!(host = %host, "image host resolved to no addresses");
+        return Err(UNREACHABLE.into());
     };
     // Every answer must be public: a host that resolves to one public and one
     // internal address would otherwise be a coin flip away from the inside.
+    // The caller learns only that the host is refused, never what it
+    // resolved to: that would turn the endpoint into an internal DNS oracle.
     if !policy.allow_non_public {
         if let Some(bad) = addrs.iter().find(|a| !is_public(a.ip())) {
-            return Err(format!(
-                "image host resolves to {}, which is not a public address",
-                bad.ip()
-            ));
+            tracing::warn!(host = %host, ip = %bad.ip(), "image host refused: not a public address");
+            return Err("image host is not a public address".into());
         }
     }
     Ok(first)
@@ -584,6 +613,32 @@ mod tests {
                 .unwrap_err();
             assert!(err.contains(needle), "{url}: {err}");
         }
+        // What a refused name resolved to stays in the server log.
+        let err = fetch_image(
+            "https://localhost/a.png",
+            1 << 20,
+            FetchPolicy::PUBLIC_HTTPS,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "image host is not a public address");
+    }
+
+    /// One deadline covers DNS, redirects and the body; a slow host cannot
+    /// hold the request's in-flight permit past it.
+    #[tokio::test]
+    async fn fetch_has_one_deadline() {
+        let base = image_server().await;
+        let quick = FetchPolicy {
+            per_image: Duration::from_millis(300),
+            ..LOCAL
+        };
+        let t0 = std::time::Instant::now();
+        let err = fetch_image(&format!("{base}/slow"), 1 << 20, quick)
+            .await
+            .unwrap_err();
+        assert!(err.contains("took longer than"), "{err}");
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
     }
 
     /// A local server stands in for a remote host; the test policy allows
@@ -631,7 +686,14 @@ mod tests {
                     move || async move { ([(header::CONTENT_TYPE, "image/png")], png2.repeat(50)) },
                 ),
             )
-            .route("/gone", get(|| async { axum::http::StatusCode::NOT_FOUND }));
+            .route("/gone", get(|| async { axum::http::StatusCode::NOT_FOUND }))
+            .route(
+                "/slow",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    "late"
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -641,6 +703,7 @@ mod tests {
     const LOCAL: FetchPolicy = FetchPolicy {
         allow_http: true,
         allow_non_public: true,
+        ..FetchPolicy::PUBLIC_HTTPS
     };
 
     #[tokio::test]
