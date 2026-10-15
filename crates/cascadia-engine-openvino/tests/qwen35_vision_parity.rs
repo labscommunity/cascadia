@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use cascadia_engine_openvino::qwen35_vision::{preprocess, rope, PreprocessConfig};
+use cascadia_engine_openvino::qwen35_vision::{encoder, preprocess, rope, PreprocessConfig};
 use serde_json::Value;
 
 fn fixtures() -> PathBuf {
@@ -269,4 +269,63 @@ fn llm_tokens_match_the_prompt_image_runs() {
         .to_rgb8();
     let p = preprocess(&[png.as_raw()], 448, 448, &cfg).unwrap();
     assert_eq!(p.llm_tokens(cfg.merge_size), pads);
+}
+
+/// The vision IRs' host inputs equal transformers' `vision_utils`: corner
+/// indices and cu_seqlens exactly, weights and rotary to float rounding.
+#[test]
+fn encoder_inputs_match_vision_utils() {
+    let r = reference();
+    let enc = &r["encoder"];
+    let side = enc["num_grid_per_side"].as_u64().unwrap() as usize;
+    let rot_dim = enc["rotary_dim"].as_u64().unwrap() as usize;
+    let merge = r["spatial_merge_size"].as_u64().unwrap() as usize;
+    let grids = enc["grids"].as_object().unwrap();
+    assert!(
+        grids.contains_key("video_4f_128x96"),
+        "video grid must be covered"
+    );
+    for (name, e) in grids {
+        let g = grid(&e["grid_thw"]);
+        let b = encoder::bilinear_indices_and_weights(&[g], side, merge);
+        let n = b.positions;
+        match &e["indices"] {
+            Value::Array(all) => {
+                let want: Vec<i64> = all.iter().map(|x| x.as_i64().unwrap()).collect();
+                if let Some(i) = want.iter().zip(&b.indices).position(|(a, b)| a != b) {
+                    panic!(
+                        "{name}: index {i} (corner {}, pos {}) got {} want {}",
+                        i / n,
+                        i % n,
+                        b.indices[i],
+                        want[i]
+                    );
+                }
+                assert_eq!(want.len(), b.indices.len(), "{name}: index count");
+            }
+            summary => {
+                let as_f32: Vec<f32> = b.indices.iter().map(|&v| v as f32).collect();
+                check_summary(name, "indices", &as_f32, 4, n, summary, 0.0);
+            }
+        }
+        check_summary(name, "weights", &b.weights, 4, n, &e["weights"], 1e-6);
+        let rot = encoder::rotary_pos_emb(&[g], merge, rot_dim, 10000.0);
+        // Rust's powf and torch's pow may differ in the last bit of a
+        // frequency; scaled by positions up to ~100 that stays far below 1e-4.
+        check_summary(name, "rotary", &rot, n, rot_dim, &e["rotary_pos_emb"], 1e-4);
+        let cu: Vec<i64> = e["cu_seqlens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_i64().unwrap())
+            .collect();
+        assert_eq!(
+            encoder::cu_seqlens(&[g])
+                .iter()
+                .map(|&v| i64::from(v))
+                .collect::<Vec<_>>(),
+            cu,
+            "{name}: cu_seqlens"
+        );
+    }
 }

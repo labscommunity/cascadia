@@ -15,6 +15,7 @@
 //! frame. Parity with transformers 5.14.1 is pinned by
 //! `tests/qwen35_vision_parity.rs` against `tests/fixtures/qwen35_vision/`.
 
+pub mod encoder;
 pub mod resample;
 pub mod rope;
 
