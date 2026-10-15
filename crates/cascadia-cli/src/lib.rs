@@ -1566,13 +1566,24 @@ fn parse_ov_config(entries: &[String]) -> Vec<(String, String)> {
 /// Load a whole-model chat template for ov-genai, tolerating both layouts:
 /// `tokenizer/tokenizer_config.json` (HF subdir) and a root-level
 /// `tokenizer_config.json` / `chat_template.jinja` (OV int4 exports).
-/// True when `model` is a pipeline dir whose `pipeline_config.json` carries a
-/// `vision` block (a Gemma 4 vision tree from `tools/gemma4_surgery --vision`).
-fn pipeline_has_vision(model: &str) -> bool {
-    std::fs::read(std::path::Path::new(model).join("pipeline_config.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .is_some_and(|v| v.get("vision").is_some_and(|x| x.is_object()))
+/// The image family of a pipeline dir: its `pipeline_config.json` `vision`
+/// block's `family`, or `gemma4` for a block written by the Gemma 4 vision
+/// surgery before the field existed. `None` without a `vision` block.
+fn pipeline_vision_family(model: &str) -> Option<String> {
+    let v: serde_json::Value =
+        std::fs::read(std::path::Path::new(model).join("pipeline_config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())?;
+    let block = v.get("vision").filter(|x| x.is_object())?;
+    match block.get("family").and_then(serde_json::Value::as_str) {
+        Some(f) => Some(f.to_string()),
+        None if v.get("export_version").and_then(serde_json::Value::as_str)
+            == Some("gemma4_vision_surgery_v1") =>
+        {
+            Some("gemma4".into())
+        }
+        None => Some(String::new()),
+    }
 }
 
 fn ovgenai_chat_template(model: &str) -> cascadia_api::ChatTemplateConfig {
@@ -2629,9 +2640,14 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         let media_kind = match args.engine {
             EngineKind::OvGenai if has_vision => Some(cascadia_api::MediaConfig::ov_genai()),
             EngineKind::Qwen36Moe if has_vision => Some(cascadia_api::MediaConfig::qwen35_native()),
-            EngineKind::OvRuntime if has_vision && pipeline_has_vision(&args.model) => {
-                Some(cascadia_api::MediaConfig::gemma4_native())
-            }
+            EngineKind::OvRuntime if has_vision => match pipeline_vision_family(&args.model) {
+                Some(f) if f == "gemma4" => Some(cascadia_api::MediaConfig::gemma4_native()),
+                Some(f) => {
+                    warn!(family = %f, "pipeline vision family has no API image tag; serving text only");
+                    None
+                }
+                None => None,
+            },
             _ => None,
         };
         if let Some(mut media) = media_kind {
@@ -3865,19 +3881,24 @@ mod cli_version_tests {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn pipeline_vision_block_is_detected() {
+    fn pipeline_vision_family_is_read() {
         let dir = std::env::temp_dir().join(format!("cascadia-pv-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let d = dir.to_str().unwrap();
-        assert!(!pipeline_has_vision(d), "no pipeline_config.json");
-        std::fs::write(dir.join("pipeline_config.json"), r#"{"num_stages":2}"#).unwrap();
-        assert!(!pipeline_has_vision(d));
-        std::fs::write(
-            dir.join("pipeline_config.json"),
-            r#"{"num_stages":2,"vision":{"text_embeddings":"t.xml"}}"#,
-        )
-        .unwrap();
-        assert!(pipeline_has_vision(d));
+        let write = |s: &str| std::fs::write(dir.join("pipeline_config.json"), s).unwrap();
+        assert_eq!(pipeline_vision_family(d), None, "no pipeline_config.json");
+        write(r#"{"num_stages":2}"#);
+        assert_eq!(pipeline_vision_family(d), None);
+        write(r#"{"vision":{"family":"gemma4"}}"#);
+        assert_eq!(pipeline_vision_family(d).as_deref(), Some("gemma4"));
+        write(r#"{"export_version":"gemma4_vision_surgery_v1","vision":{"text_embeddings":"t"}}"#);
+        assert_eq!(
+            pipeline_vision_family(d).as_deref(),
+            Some("gemma4"),
+            "pre-field trees"
+        );
+        write(r#"{"vision":{"family":"mistral3"}}"#);
+        assert_eq!(pipeline_vision_family(d).as_deref(), Some("mistral3"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

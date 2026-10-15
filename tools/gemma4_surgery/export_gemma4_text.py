@@ -1094,6 +1094,8 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
     if vision:
         # Rank 0 embeds the prompt and runs the vision encoder itself.
         pipeline_config["vision"] = {
+            # Picks rank 0's preprocessing and the API's image placeholder.
+            "family": "gemma4",
             "text_embeddings": "openvino_text_embeddings_model.xml",
             "vision_embeddings": "openvino_vision_embeddings_model.xml",
             "inputs_embeds": True,
