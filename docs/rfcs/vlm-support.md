@@ -551,6 +551,26 @@ stages of a vision tree this way.
 the text tree's, and the 4-stage tree across pawan-02 and pawan-04 passes the SDK check
 11/11 (`prompt_tokens` 289 and 554; one-image prefill about 80 s on CPU).
 
+## Gemma 4 E2B/E4B on the `gemma4` engine (2026-10-15)
+
+E2B/E4B have real per-layer embeddings and KV sharing across layers, so the IR surgery
+refuses them; their staged path is the `gemma4` engine (`tools/export_gemma4.py`, traced
+from PyTorch). Its stage 0 embeds ids inside the IR, so the image splice goes in the
+graph: `--vision DIR` adds a trailing `image_features [M, hidden]` input, image tokens
+embed and look up their per-layer embedding as the pad id, their rows are replaced in
+order by the image features, and the per-layer projection reads the spliced embedding,
+which is what HF's `Gemma4Model.forward` does. E2B/E4B use plain causal attention
+(`use_bidirectional_attention: null`), so no `token_type_ids` cross the wire. The encoder
+is OpenVINO's published vision IR (`OpenVINO/gemma-4-E2B-it-fp16-ov`, Apache-2.0).
+
+Verified with E2B, 2 stages, across pawan-02 (rank 0) and pawan-04 (rank 1): the SDK
+check passes 11/11, and the answers are word-for-word HF PyTorch's (fp32, same images):
+"The image contains a red square and a blue circle." and "the first picture contains
+red and blue, and the second picture contains green and yellow." Prompt token counts
+differ from HF's by 1 and 4 (285 vs 284, 550 vs 546), the chat template's whitespace
+between text parts rather than the image path; noted as a follow-up. Encode is about
+3 s per image. The stage-1 IR exported on each node is byte-identical in weights.
+
 ## Engines that do not take images (2026-10-15)
 
 Every engine either serves images or refuses them with an OpenAI 400; none answers
@@ -561,7 +581,7 @@ from the text alone.
 | `ov-genai` | VLM exports with the vision IR | served; on a text-only export the API offers no image input (400), and `submit` refuses too |
 | `qwen35` | trees with the vision IRs | served; otherwise 400 at the API and at `submit` |
 | `ov-runtime` | Gemma 4 vision trees (`vision.family = "gemma4"`) | served; other trees 400; an unknown `vision.family` fails to load |
-| `gemma4` (`gemma4_cached` trees) | no | 400 (`EngineError::UnsupportedInput` at `submit`); its stage 0 embeds ids inside the IR |
+| `gemma4` (`gemma4_cached` trees) | E2B/E4B trees from `export_gemma4.py --vision` | served; other trees 400 at the API and at `submit` |
 | `ov-dist-spec` | no | 400; draft and target would both need the expanded image prompt |
 | `sparse-moe` | no | 400 |
 | `mock` | accepts and ignores | test stand-in for the API's image tests |

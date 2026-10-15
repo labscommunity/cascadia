@@ -2640,14 +2640,18 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         let media_kind = match args.engine {
             EngineKind::OvGenai if has_vision => Some(cascadia_api::MediaConfig::ov_genai()),
             EngineKind::Qwen36Moe if has_vision => Some(cascadia_api::MediaConfig::qwen35_native()),
-            EngineKind::OvRuntime if has_vision => match pipeline_vision_family(&args.model) {
-                Some(f) if f == "gemma4" => Some(cascadia_api::MediaConfig::gemma4_native()),
-                Some(f) => {
-                    warn!(family = %f, "pipeline vision family has no API image tag; serving text only");
-                    None
+            // ov-runtime (Gemma 4 surgery trees) and gemma4 (gemma4_cached E2B/E4B
+            // trees from export_gemma4.py --vision) both carry a `vision` block.
+            EngineKind::OvRuntime | EngineKind::Gemma4 if has_vision => {
+                match pipeline_vision_family(&args.model) {
+                    Some(f) if f == "gemma4" => Some(cascadia_api::MediaConfig::gemma4_native()),
+                    Some(f) => {
+                        warn!(family = %f, "pipeline vision family has no API image tag; serving text only");
+                        None
+                    }
+                    None => None,
                 }
-                None => None,
-            },
+            }
             _ => None,
         };
         if let Some(mut media) = media_kind {
