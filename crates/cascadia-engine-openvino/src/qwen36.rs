@@ -1239,7 +1239,7 @@ impl Qwen36Engine {
                 .encoder
                 .encode(&p)
                 .map_err(|e| format!("image {i}: {e}"))?;
-            images.push((rows, p.grid_thw));
+            images.push((rows, p.grid_thw, m.sha256));
         }
         crate::qwen35_vision::prompt::VisionPrompt::new(
             prompt_ids,
@@ -2599,14 +2599,19 @@ impl Qwen36Engine {
             };
             // Issue-34 warm-resume: restore a cached strict-prefix blob and prefill only the suffix;
             // else cold reset. Gated + best-effort (stub ⇒ no blob ⇒ cold). 0 on the default path.
+            // Image turns key the local prefix cache on `cache_key`: real ids with every pad
+            // token replaced by a pseudo-id from its image's pixel hash. Text before the first
+            // image matches any turn; a resent image matches through itself; a different image
+            // never matches. Prefill still feeds the real ids.
+            let cache_key: Vec<u32> = vision
+                .as_ref()
+                .map_or_else(|| prompt_ids.clone(), |v| v.cache_key.clone());
             let warm_prefix: usize = {
-                // An image turn never warm-resumes: every cache here keys on token ids, and an
-                // image's pad tokens are identical for every image.
+                // The cross-node KV plane keys on real ids, so image turns stay off it.
                 #[cfg(feature = "kv_coord")]
                 {
                     if vision.is_some() {
-                        self.reset_all();
-                        0
+                        self.local_warm_or_cold(&cache_key)
                     } else {
                         let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
                         match self.kv.take_warm(&task.tenant, &prompt_i32) {
@@ -2637,12 +2642,7 @@ impl Qwen36Engine {
                 }
                 #[cfg(not(feature = "kv_coord"))]
                 {
-                    if vision.is_some() {
-                        self.reset_all();
-                        0
-                    } else {
-                        self.local_warm_or_cold(&prompt_ids)
-                    }
+                    self.local_warm_or_cold(&cache_key)
                 }
             };
             // Every arm above resets (or restores over) the stage requests. If the reset FAILED the
@@ -2675,14 +2675,13 @@ impl Qwen36Engine {
             // already refused is dropped by `plan_snapshots` before the copy, not by `insert`
             // after it (`PrefixCache::worth_copying`).
             let state_bytes = self.last_restore_bytes;
-            // Nor does it snapshot: a later turn with a different image would match the key.
             let boundaries = self
                 .im_start_id
-                .filter(|_| self.prefix_cache.enabled() && !self.stages_dirty && vision.is_none())
-                .map(|im| crate::prefix_cache::chat_boundaries(&prompt_ids, im))
+                .filter(|_| self.prefix_cache.enabled() && !self.stages_dirty)
+                .map(|im| crate::prefix_cache::chat_boundaries(&cache_key, im))
                 .unwrap_or_default();
             let snapshot_at = crate::prefix_cache::plan_snapshots(
-                &prompt_ids,
+                &cache_key,
                 &boundaries,
                 warm_prefix,
                 &self.prefix_cache,
@@ -2745,8 +2744,11 @@ impl Qwen36Engine {
                         t.logits = l;
                         t.prefill_idx = end;
                         t.step += toks.len();
-                        let snap_key =
-                            (t.snapshot_at.contains(&end)).then(|| t.prompt_ids[..end].to_vec());
+                        // Snapshots key on the same content-hashed sequence restores look up.
+                        let snap_key = (t.snapshot_at.contains(&end)).then(|| match &t.vision {
+                            Some(v) => v.cache_key[..end].to_vec(),
+                            None => t.prompt_ids[..end].to_vec(),
+                        });
                         // Same diagnostics as the multi-stage loop, mirrored onto the SINGLE-STAGE
                         // path. On a 1-stage (single-box) topology every stage is local, so these
                         // fingerprints cover the WHOLE model state — the 2-stage head-only view left
