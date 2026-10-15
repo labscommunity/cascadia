@@ -481,6 +481,15 @@ Still open:
 - HF-logit parity on image prompts (Phase 2 exit criterion) beyond the GenAI answer match
   (needs the original weights); 397B (Phase 3).
 
+## Other families on the single-box path (2026-10-15)
+
+`--engine ov-genai` uses GenAI's universal `<ov_genai_image_N>` tag, so any VLM GenAI
+supports works without family code. Verified with Gemma 4 26B-A4B (int4, CPU, pawan-04)
+and no code change: the full SDK check passes (one image "There is a red square and a
+blue circle.", `prompt_tokens` 289; two images in order; streaming; OpenAI-shaped
+refusals). Staged engines other than `qwen35` still refuse images; each family needs its
+own host code and a stage 0 that takes embeddings (section D).
+
 ## Video: out of scope, kept cheap
 
 Video ships in no phase of this RFC. The image work must still leave nothing that
