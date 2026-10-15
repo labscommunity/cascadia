@@ -815,7 +815,8 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
 pub struct ChatMessage {
     pub role: String,
     /// The message's text: the string form as sent, or the array form's text
-    /// parts joined with "\n".
+    /// parts joined with "\n". A message with images is rebuilt from its
+    /// text parts and image tags back to back (`MediaConfig::trim_text_parts`).
     pub content: String,
     pub name: Option<String>,
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -2164,7 +2165,7 @@ async fn prepare_media(
             let mut pieces = Vec::with_capacity(m.parts.len());
             for part in std::mem::take(&mut m.parts) {
                 match part {
-                    ContentPart::Text(t) => pieces.push(t),
+                    ContentPart::Text(t) => pieces.push(decode_cfg.text_part(t)),
                     ContentPart::ImageUrl { url, detail } => {
                         let i = inputs.len();
                         let input = match fetched[i].take() {
@@ -2179,7 +2180,9 @@ async fn prepare_media(
                     }
                 }
             }
-            m.content = pieces.join("\n");
+            // Back to back, as the model's own template writes a content
+            // array (see `MediaConfig::trim_text_parts`).
+            m.content = pieces.concat();
             out.push(m);
         }
         Ok::<_, String>((out, inputs))
@@ -5190,6 +5193,50 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("<|image_pad|>"));
+    }
+
+    /// Gemma 4's template writes a content array's parts back to back, each
+    /// text part trimmed; joining with "\n" instead put one extra token per
+    /// join into the prompt (285 vs HF's 284 for one image, 550 vs 546 for
+    /// two). The mock echoes whitespace-split words, so a correct join comes
+    /// back as one word.
+    #[tokio::test]
+    async fn gemma_parts_join_like_the_template() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some("{% for m in messages %}{{ m.content }}\n{% endfor %}".into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            media: Some(MediaConfig::gemma4_native()),
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let png = png_url(4, 4);
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({"model": "mock-model", "max_tokens": 64, "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": " one "},
+                    {"type": "image_url", "image_url": {"url": png}},
+                    {"type": "text", "text": "two\n"},
+                    {"type": "image_url", "image_url": {"url": png}}]}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {v}");
+        let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(
+            content.contains("one<|image|>two<|image|>"),
+            "parts not joined like the template: {content:?}"
+        );
     }
 
     /// Everything the image path refuses comes back as an OpenAI-shaped 400
