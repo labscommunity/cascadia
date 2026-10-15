@@ -425,6 +425,7 @@ dependencies = [
  "crc32fast",
  "futures",
  "half",
+ "image",
  "serde",
  "serde_json",
  "tempfile",
