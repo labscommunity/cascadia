@@ -81,8 +81,8 @@ def toy_stage(seed: int = 0, head_dims=(HD, HD)) -> ov.Model:
 
 def test_ports_and_shapes():
     m = toy_stage()
-    layers, kvh, hd = sv.make_stateless(m, has_head=False)
-    assert (layers, kvh, hd) == (LAYERS, KVH, HD)
+    geom = sv.make_stateless(m, has_head=False)
+    assert geom == [(KVH, HD)] * LAYERS
     assert not m.get_variables() and not m.get_sinks()
     names = [i.get_any_name() for i in m.inputs]
     assert "beam_idx" not in names
@@ -149,8 +149,31 @@ def test_unslice_last_position_logits():
     assert m.outputs[0].get_partial_shape().to_string() == "[1,?,4]"
 
 
-def test_mixed_kv_geometry_is_refused():
-    # Gemma 4 style: layers with different head_dim cannot share one ring.
+def test_mixed_kv_geometry_is_listed_per_layer():
+    # Gemma 4 style: layers differ in head_dim; each keeps its own, in the
+    # local order of the ports (global layer 20 is local 0).
     m = toy_stage(head_dims=(HD, HD * 2))
-    with pytest.raises(SystemExit, match="mix KV geometries"):
-        sv.make_stateless(m, has_head=False)
+    assert sv.make_stateless(m, has_head=False) == [(KVH, HD * 2), (KVH, HD)]
+    sv.pin_shapes(m, 1, 16)
+    shapes = {i.get_any_name(): list(i.get_shape()) for i in m.inputs}
+    assert shapes["past_key_values.0.key"] == [1, KVH, 15, HD * 2]
+    assert shapes["past_key_values.1.value"] == [1, KVH, 15, HD]
+
+
+def test_shared_prefill_ir_takes_any_query_width():
+    # CPU/GPU: one IR, past fixed, query width (and mask length) dynamic.
+    m = toy_stage()
+    sv.make_stateless(m, has_head=False)
+    sv.pin_shapes(m, -1, 16, past=15)
+    shapes = {i.get_any_name(): i.get_partial_shape() for i in m.inputs}
+    assert str(shapes["past_key_values.0.key"]) == f"[1,{KVH},15,{HD}]"
+    assert str(shapes["inputs_embeds"]) == f"[1,?,{HIDDEN}]"
+    assert str(shapes["attention_mask"]) == "[1,?]"
+    req = ov.Core().compile_model(m, "CPU").create_infer_request()
+    past = {f"past_key_values.{l}.{k}": np.zeros((1, KVH, 15, HD), np.float16)
+            for l in range(LAYERS) for k in ("key", "value")}
+    for seq in (1, 3):
+        out = req.infer({"inputs_embeds": np.ones((1, seq, HIDDEN), np.float32),
+                         "attention_mask": np.ones((1, 15 + seq), np.int64),
+                         "position_ids": np.arange(seq, dtype=np.int64)[None], **past})
+        assert out["present.0.key"].shape == (1, KVH, 15 + seq, HD)
