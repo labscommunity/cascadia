@@ -86,6 +86,29 @@ impl MediaConfig {
         }
     }
 
+    /// Settings for a Gemma 4 vision tree on the `ov-runtime` engine (rank 0
+    /// encodes the images): the chat template's own `<|image|>`, which rank 0
+    /// expands to begin-of-image, the image's soft tokens and end-of-image.
+    /// Gemma 4 spends at most 280 tokens on an image whatever its size, so
+    /// the pixel budget only bounds decode and resize work.
+    pub fn gemma4_native() -> Self {
+        Self {
+            image_placeholder: "<|image|>".into(),
+            reserved_text: [
+                "<|image|>",
+                "<|image>",
+                "<image|>",
+                "<|video|>",
+                "<|audio|>",
+                "<|audio>",
+                "<audio|>",
+            ]
+            .map(String::from)
+            .to_vec(),
+            ..Self::ov_genai()
+        }
+    }
+
     pub fn placeholder(&self, i: usize) -> String {
         self.image_placeholder.replace("{i}", &i.to_string())
     }
@@ -816,5 +839,17 @@ mod tests {
             Some("<|image_pad|>")
         );
         assert_eq!(q.reserved_in("plain text"), None);
+
+        let g = MediaConfig::gemma4_native();
+        let tag = g.placeholder(0);
+        assert_eq!(tag, "<|image|>");
+        assert_eq!(
+            g.placeholders_complete(&format!("A:{tag}B:{tag}"), 2),
+            Ok(())
+        );
+        assert_eq!(g.placeholders_complete(&tag, 2), Err(1));
+        assert_eq!(g.reserved_in("raw <image|> text"), Some("<image|>"));
+        assert!(g.reserved_in("raw <|image> text").is_some());
+        assert_eq!(g.reserved_in("plain text"), None);
     }
 }

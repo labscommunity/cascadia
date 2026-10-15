@@ -69,6 +69,18 @@ struct PipelineConfig {
     hidden_size: u32,
     #[serde(default)]
     export_version: Option<String>,
+    /// Gemma 4 vision trees (`tools/gemma4_surgery --vision`): see
+    /// [`VisionTree`]. Every rank must load the same block.
+    #[serde(default)]
+    vision: Option<PipelineVision>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PipelineVision {
+    /// Text embedding table IR in the pipeline dir (rank 0 embeds the prompt).
+    text_embeddings: String,
+    /// Vision encoder IR in the pipeline dir.
+    vision_embeddings: String,
 }
 
 fn default_true() -> bool {
@@ -699,6 +711,41 @@ fn decode_wire_lead(t: &WireTensor, want_pos: bool) -> EngineResult<(u32, Option
     Ok((seq, position))
 }
 
+/// Encode a vision tree's per-step `token_type_ids` (1 on image soft tokens)
+/// as I64 `[1,1,n]`, the frame that follows the hidden. Every stage's
+/// sliding-window layers need it: they attend bidirectionally inside each
+/// image, and only rank 0 knows where the images are.
+fn encode_wire_types(types: &[i64]) -> WireTensor {
+    let bytes = types.iter().flat_map(|t| t.to_le_bytes()).collect();
+    WireTensor::new(WireDType::I64, [1, 1, types.len() as u32], bytes)
+}
+
+/// Decode + strictly validate the types frame against the hidden's token
+/// count `seq`. Values must be 0 or 1 (text or image; video is not served).
+fn decode_wire_types(t: &WireTensor, seq: usize) -> EngineResult<Vec<i64>> {
+    if t.dtype != WireDType::I64 || t.shape != [1, 1, seq as u32] || t.data.len() != seq * 8 {
+        return Err(EngineError::Backend(format!(
+            "expected an I64 [1,1,{seq}] token_type_ids frame after the hidden, got dtype={:?} \
+             shape={:?} len={} — a vision tree's ranks must all load the same \
+             pipeline_config.json (with its `vision` block)",
+            t.dtype,
+            t.shape,
+            t.data.len()
+        )));
+    }
+    let types: Vec<i64> = t
+        .data
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    if let Some(bad) = types.iter().find(|&&v| v != 0 && v != 1) {
+        return Err(EngineError::Backend(format!(
+            "token_type_ids frame carries {bad}; only 0 (text) and 1 (image) are served"
+        )));
+    }
+    Ok(types)
+}
+
 /// Encode a token + the echoed per-hop seq as I32 `[1,1,2]` = `[token, seq]`
 /// (8 bytes): the token is element 0, the seq element 1 — i.e. the seq occupies
 /// bytes 4..8, the HIGH half if the payload is read as one little-endian i64.
@@ -764,7 +811,8 @@ fn decode_token_with_seq(t: &WireTensor) -> EngineResult<(i32, u32)> {
 const NACK_TOKEN: i32 = -1;
 
 /// Send the downstream activation frames in wire order: `[lead] [hidden]`,
-/// where `lead` is `[seq]` or `[seq, position]` (see `encode_wire_lead`).
+/// where `lead` is `[seq]` or `[seq, position]` (see `encode_wire_lead`),
+/// then `[types]` on a vision tree (see `encode_wire_types`).
 ///
 /// Takes the VALUES, not pre-encoded frames, and encodes here: the lead and the
 /// hidden are both `WireTensor`, so a pre-encoded signature let the two be
@@ -776,11 +824,15 @@ async fn send_hidden_frames(
     seq: u32,
     position: Option<i64>,
     hid: WireTensor,
+    types: Option<WireTensor>,
 ) -> Result<(), cascadia_transport::TransportError> {
     let lead = encode_wire_lead(seq, position);
     let mut guard = downstream.lock().await;
     guard.send(&lead).await?;
     guard.send(&hid).await?;
+    if let Some(t) = types {
+        guard.send(&t).await?;
+    }
     Ok(())
 }
 
@@ -803,21 +855,31 @@ async fn send_hidden_frames(
 /// waits again. Peeking here rather than in the caller is what keeps this the
 /// literal body of `recv_hidden_from_upstream`, and so keeps the loopback tests
 /// below covering it: a peek inlined at the call site would be untested.
+///
+/// On a vision tree (`want_types`) a third frame, the step's
+/// `token_type_ids`, follows the hidden and is deadlined like it.
 async fn recv_hidden_frames(
     upstream: &Arc<tokio::sync::Mutex<ActivationServer>>,
     want_pos: bool,
-) -> Result<(WireTensor, Option<WireTensor>), cascadia_transport::TransportError> {
+    want_types: bool,
+) -> Result<(WireTensor, Option<WireTensor>, Option<WireTensor>), cascadia_transport::TransportError>
+{
     let mut guard = upstream.lock().await;
     let lead = guard.recv().await?.0;
     // A static shard never receives control frames, and its lead is I64 either
     // way — so the check costs nothing there and cannot shadow an activation.
     #[cfg(feature = "kv_coord")]
     if !want_pos && lead.dtype == WireDType::I8 {
-        return Ok((lead, None));
+        return Ok((lead, None, None));
     }
     let _ = want_pos;
     let hid = guard.recv_reply().await?.0;
-    Ok((lead, Some(hid)))
+    let types = if want_types {
+        Some(guard.recv_reply().await?.0)
+    } else {
+        None
+    };
+    Ok((lead, Some(hid), types))
 }
 
 /// Hard ceiling on the active token-response wait, independent of the body
@@ -1398,9 +1460,145 @@ fn import_plugin(plugin: &PluginConfig) -> PluginConfig {
 
 // -------- Engine --------
 
+/// A Gemma 4 vision tree: stage 0 takes `inputs_embeds` instead of ids and
+/// every stage takes `token_type_ids` (1 on image soft tokens: sliding-window
+/// layers attend bidirectionally inside each image), so that row rides the
+/// wire as a third frame `[lead] [hidden] [types]`. Served on the stateful
+/// path only; the static, chunked-prefill and packed paths are refused at load.
+struct VisionTree {
+    /// Rank 0 only.
+    first: Option<VisionFirst>,
+}
+
+/// Rank 0's half of a vision tree: the text embedding table it embeds every
+/// step through, and the vision encoder whose rows it splices into a prompt.
+struct VisionFirst {
+    embed: OvRuntime,
+    embed_input: String,
+    encoder: crate::gemma4_vision::encoder::VisionEncoder,
+    preprocess: crate::gemma4_vision::PreprocessConfig,
+    tokens: crate::gemma4_vision::ImageTokens,
+}
+
+impl VisionFirst {
+    fn load(pipeline_dir: &Path, cfg: &PipelineVision) -> EngineResult<Self> {
+        let invalid = |m: String| EngineError::InvalidConfig(format!("vision tree: {m}"));
+        // Small next to a stage; the CPU keeps them off the stage's device.
+        let plugin = PluginConfig::new();
+        let embed_xml = pipeline_dir.join(&cfg.text_embeddings);
+        let embed = OvRuntime::compile(embed_xml.to_string_lossy().as_ref(), "CPU", &plugin)
+            .map_err(|e| invalid(format!("compiling {}: {e}", embed_xml.display())))?;
+        let embed_input = embed.input_name(0).map_err(map_ov_err)?;
+        if cfg.vision_embeddings != "openvino_vision_embeddings_model.xml" {
+            return Err(invalid(format!(
+                "vision_embeddings {:?} is not the Gemma 4 encoder IR name",
+                cfg.vision_embeddings
+            )));
+        }
+        let preprocess = crate::gemma4_vision::PreprocessConfig::from_model_dir(pipeline_dir)
+            .map_err(invalid)?;
+        let encoder = crate::gemma4_vision::encoder::VisionEncoder::load(
+            pipeline_dir,
+            "CPU",
+            &plugin,
+            preprocess.pooling_kernel_size,
+        )
+        .map_err(invalid)?;
+        // The flattened config.json is text-only; the VLM original keeps the
+        // image token ids.
+        let vlm = pipeline_dir.join("config.vlm.json");
+        let v: serde_json::Value = std::fs::read(&vlm)
+            .map_err(|e| invalid(format!("reading {}: {e}", vlm.display())))
+            .and_then(|b| {
+                serde_json::from_slice(&b)
+                    .map_err(|e| invalid(format!("parsing {}: {e}", vlm.display())))
+            })?;
+        let id = |k: &str| {
+            v.get(k)
+                .or_else(|| v.get("text_config").and_then(|t| t.get(k)))
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| invalid(format!("{} lacks {k}", vlm.display())))
+        };
+        let tokens = crate::gemma4_vision::ImageTokens {
+            image: id("image_token_id")?,
+            boi: id("boi_token_id")?,
+            eoi: id("eoi_token_id")?,
+            pad: id("pad_token_id")?,
+        };
+        Ok(Self {
+            embed,
+            embed_input,
+            encoder,
+            preprocess,
+            tokens,
+        })
+    }
+
+    /// Row-major `[ids.len(), hidden]` text embeddings for `ids` (image soft
+    /// tokens embed as pad), and `hidden`.
+    fn embed(&mut self, ids: &[i64]) -> EngineResult<(Vec<f32>, usize)> {
+        let ids = crate::gemma4_vision::text_embedding_ids(ids, &self.tokens);
+        self.embed
+            .set_input(
+                &self.embed_input,
+                ShimDType::I64,
+                &[1, ids.len()],
+                &i64_to_bytes(&ids),
+            )
+            .map_err(map_ov_err)?;
+        self.embed.infer().map_err(map_ov_err)?;
+        let (dtype, shape, bytes) = self.embed.output(0).map_err(map_ov_err)?;
+        let v = bytes_to_f32(dtype, &bytes)?;
+        let hidden = shape.last().copied().unwrap_or(0);
+        if hidden == 0 || v.len() != ids.len() * hidden {
+            return Err(EngineError::Backend(format!(
+                "text embeddings returned shape {shape:?} for {} ids",
+                ids.len()
+            )));
+        }
+        Ok((v, hidden))
+    }
+
+    /// Encode a task's images and expand the prompt's one image placeholder
+    /// per image into its soft-token run. Returns the expanded ids and each
+    /// image's embedding rows.
+    fn prepare(
+        &mut self,
+        media: &[cascadia_types::MediaInput],
+        prompt_ids: &[i64],
+    ) -> Result<(Vec<i64>, Vec<Vec<f32>>), String> {
+        let mut rows = Vec::with_capacity(media.len());
+        let mut counts = Vec::with_capacity(media.len());
+        for (i, m) in media.iter().enumerate() {
+            match m.kind {
+                cascadia_types::MediaKind::Image => {}
+                #[allow(unreachable_patterns)]
+                other => return Err(format!("media {i}: {other:?} is not supported")),
+            }
+            if m.num_frames != 1 || m.pixels.len() != m.expected_len() {
+                return Err(format!("image {i}: malformed pixel buffer"));
+            }
+            let p =
+                crate::gemma4_vision::preprocess(&m.pixels, m.width, m.height, &self.preprocess)
+                    .map_err(|e| format!("image {i}: {e}"))?;
+            let (emb, _hidden) = self
+                .encoder
+                .encode(&p)
+                .map_err(|e| format!("image {i}: {e}"))?;
+            counts.push(p.soft_tokens(self.preprocess.pooling_kernel_size));
+            rows.push(emb);
+        }
+        let ids = crate::gemma4_vision::expand_image_tokens(prompt_ids, &self.tokens, &counts)?;
+        Ok((ids, rows))
+    }
+}
+
 struct ActiveTask {
     task: GenerationTask,
     prompt_ids: Vec<i64>,
+    /// Vision trees: each image's embedding rows, spliced into the prefill's
+    /// embeddings and then dropped (taken by the first feed).
+    image_rows: Vec<Vec<f32>>,
     generated: Vec<i32>,
     /// Bytes already handed to the client. Not the decoded text: the delta is
     /// computed by `advance_emitted`, which holds back an unresolved
@@ -1434,6 +1632,11 @@ struct ActiveTask {
 
 pub struct OvRuntimeEngine {
     spec: ShardSpec,
+    /// Gemma 4 vision tree: see [`VisionTree`].
+    vision: Option<VisionTree>,
+    /// Vision trees: the `token_type_ids` of the step being fed — computed on
+    /// rank 0, received as the third frame elsewhere, forwarded downstream.
+    step_types: Vec<i64>,
     runtime: OvRuntime,
     rotary: Rotary,
     hidden_size: usize,
@@ -1590,10 +1793,22 @@ impl OvRuntimeEngine {
         let attn = vec![1i64; total];
         let pos: Vec<i64> = (position..position + seq_len as i64).collect();
 
-        let in_ids = self
-            .input_named("input_ids")
-            .ok_or_else(|| EngineError::Backend("v5 IR missing input_ids".into()))?
-            .to_string();
+        if self.vision.is_some() {
+            self.feed_vision_embeds(input_ids)?;
+        } else {
+            let in_ids = self
+                .input_named("input_ids")
+                .ok_or_else(|| EngineError::Backend("v5 IR missing input_ids".into()))?
+                .to_string();
+            self.runtime
+                .set_input(
+                    &in_ids,
+                    ShimDType::I64,
+                    &[1, seq_len],
+                    &i64_to_bytes(input_ids),
+                )
+                .map_err(map_ov_err)?;
+        }
         let in_attn = self
             .input_named("attention_mask")
             .ok_or_else(|| EngineError::Backend("v5 IR missing attention_mask".into()))?
@@ -1605,14 +1820,6 @@ impl OvRuntimeEngine {
         let in_beam = self.input_named("beam_idx").map(|s| s.to_string());
 
         self.runtime
-            .set_input(
-                &in_ids,
-                ShimDType::I64,
-                &[1, seq_len],
-                &i64_to_bytes(input_ids),
-            )
-            .map_err(map_ov_err)?;
-        self.runtime
             .set_input(&in_attn, ShimDType::I64, &[1, total], &i64_to_bytes(&attn))
             .map_err(map_ov_err)?;
         self.runtime
@@ -1623,6 +1830,59 @@ impl OvRuntimeEngine {
                 .set_input(&beam, ShimDType::I32, &[1], &0i32.to_le_bytes())
                 .map_err(map_ov_err)?;
         }
+        Ok(())
+    }
+
+    /// Vision tree, rank 0: embed `input_ids` through the text embedding
+    /// table, splice the active task's image rows into a prefill, and set
+    /// stage 0's `inputs_embeds` and `token_type_ids` (kept in `step_types`
+    /// for the wire).
+    fn feed_vision_embeds(&mut self, input_ids: &[i64]) -> EngineResult<()> {
+        let rows = self
+            .active
+            .as_mut()
+            .map(|a| std::mem::take(&mut a.image_rows))
+            .unwrap_or_default();
+        let first = self
+            .vision
+            .as_mut()
+            .and_then(|v| v.first.as_mut())
+            .ok_or_else(|| EngineError::Backend("vision tree: rank 0 lacks its encoder".into()))?;
+        let image = first.tokens.image;
+        let (mut embeds, hidden) = first.embed(input_ids)?;
+        if !rows.is_empty() {
+            let refs: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
+            crate::gemma4_vision::splice_images(&mut embeds, hidden, input_ids, image, &refs)
+                .map_err(EngineError::Backend)?;
+        }
+        self.step_types = crate::gemma4_vision::token_type_ids(input_ids, image);
+        let in_embeds = self
+            .input_named("inputs_embeds")
+            .ok_or_else(|| EngineError::Backend("vision tree: stage 0 lacks inputs_embeds".into()))?
+            .to_string();
+        let in_types = self
+            .input_named("token_type_ids")
+            .ok_or_else(|| {
+                EngineError::Backend("vision tree: stage 0 lacks token_type_ids".into())
+            })?
+            .to_string();
+        let bytes: Vec<u8> = embeds.iter().flat_map(|x| x.to_le_bytes()).collect();
+        self.runtime
+            .set_input(
+                &in_embeds,
+                ShimDType::F32,
+                &[1, input_ids.len(), hidden],
+                &bytes,
+            )
+            .map_err(map_ov_err)?;
+        self.runtime
+            .set_input(
+                &in_types,
+                ShimDType::I64,
+                &[1, input_ids.len()],
+                &i64_to_bytes(&self.step_types),
+            )
+            .map_err(map_ov_err)?;
         Ok(())
     }
 
@@ -1700,6 +1960,28 @@ impl OvRuntimeEngine {
         self.runtime
             .set_input(&in_hs, ShimDType::F16, &shape, &hs_bytes)
             .map_err(map_ov_err)?;
+        if self.vision.is_some() {
+            let in_types = self
+                .input_named("token_type_ids")
+                .ok_or_else(|| {
+                    EngineError::Backend("vision tree: stage lacks token_type_ids".into())
+                })?
+                .to_string();
+            if self.step_types.len() != seq_len {
+                return Err(EngineError::Backend(format!(
+                    "vision tree: {} token types for a {seq_len}-token hidden",
+                    self.step_types.len()
+                )));
+            }
+            self.runtime
+                .set_input(
+                    &in_types,
+                    ShimDType::I64,
+                    &[1, seq_len],
+                    &i64_to_bytes(&self.step_types),
+                )
+                .map_err(map_ov_err)?;
+        }
         self.runtime
             .set_input(&in_attn, ShimDType::I64, &[1, total], &i64_to_bytes(&attn))
             .map_err(map_ov_err)?;
@@ -1953,7 +2235,18 @@ impl OvRuntimeEngine {
         // [seq] (stateful) or [seq, position] (static);
         // recv_hidden_from_upstream mirrors it.
         let pos = self.static_kv.is_some().then_some(position);
-        self.block_on(send_hidden_frames(&downstream, seq, pos, hid))
+        let types = match self.vision {
+            Some(_) if self.step_types.len() != shape[1] => {
+                return Err(EngineError::Backend(format!(
+                    "vision tree: {} token types for a {}-token hidden",
+                    self.step_types.len(),
+                    shape[1]
+                )))
+            }
+            Some(_) => Some(encode_wire_types(&self.step_types)),
+            None => None,
+        };
+        self.block_on(send_hidden_frames(&downstream, seq, pos, hid, types))
             .map_err(|e| EngineError::Backend(e.to_string()))?;
         debug!(position, "downstream send: done");
         Ok(())
@@ -2017,8 +2310,9 @@ impl OvRuntimeEngine {
                 .clone()
                 .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
             debug!(want_pos, "upstream recv: waiting");
-            let (lead, hidden) = self
-                .block_on(recv_hidden_frames(&upstream, want_pos))
+            let want_types = self.vision.is_some();
+            let (lead, hidden, types) = self
+                .block_on(recv_hidden_frames(&upstream, want_pos, want_types))
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
             info!(dtype = ?lead.dtype, len = lead.data.len(), want_pos, "ov_tail_upstream_frame_recv");
             let tensor = match hidden {
@@ -2047,6 +2341,9 @@ impl OvRuntimeEngine {
                 tensor.shape[1] as usize,
                 tensor.shape[2] as usize,
             ];
+            if let Some(t) = types {
+                self.step_types = decode_wire_types(&t, shape[1])?;
+            }
             let floats = match tensor.dtype {
                 WireDType::F32 => tensor
                     .data
@@ -2132,13 +2429,52 @@ impl OvRuntimeEngine {
                 }
             }
             cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
+            // Vision trees: encode the images and expand each one's placeholder
+            // into its soft-token run. Images reach no other tree.
+            let mut image_rows = Vec::new();
+            if !task.media.is_empty() {
+                let refuse = |reason: String| {
+                    warn!(task = %task.task_id, reason = %reason, "ov-runtime: image turn refused");
+                    let id = task.task_id.clone();
+                    vec![(id.clone(), Chunk::error(id, reason))]
+                };
+                if resume.is_some() {
+                    return Ok(refuse(
+                        "resume_unsupported: a resumed turn cannot carry images".into(),
+                    ));
+                }
+                let Some(first) = self.vision.as_mut().and_then(|v| v.first.as_mut()) else {
+                    return Ok(refuse(
+                        "this model tree takes no images (no `vision` block in \
+                         pipeline_config.json); re-export it with tools/gemma4_surgery --vision"
+                            .into(),
+                    ));
+                };
+                let started = std::time::Instant::now();
+                match first.prepare(&task.media, &prompt_ids) {
+                    Ok((ids, rows)) => {
+                        info!(
+                            task = %task.task_id,
+                            images = rows.len(),
+                            prompt = ids.len(),
+                            encode_ms = started.elapsed().as_millis() as u64,
+                            "ov-runtime: images encoded"
+                        );
+                        prompt_ids = ids;
+                        image_rows = rows;
+                    }
+                    Err(e) => return Ok(refuse(e)),
+                }
+            }
             // Issue-34 warm-resume: if a pulled/cached KV blob covers a strict prefix of this
             // prompt, restore it and prefill only the suffix. Gated + best-effort — off-rig
             // set_state_blob returns Stub, so this stays cold. Only the stateful (non-static) path.
             #[cfg_attr(not(feature = "kv_coord"), allow(unused_mut))]
             let mut warm_prefix = 0usize;
+            // Never for a turn with images: the blob is keyed on token ids, and
+            // every image of one size has the same ids.
             #[cfg(feature = "kv_coord")]
-            if self.static_kv.is_none() {
+            if self.static_kv.is_none() && image_rows.is_empty() {
                 let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
                 if let Some((blob, len, plane_pulled)) =
                     self.kv.take_warm(&task.tenant, &prompt_i32)
@@ -2254,6 +2590,7 @@ impl OvRuntimeEngine {
             self.active = Some(ActiveTask {
                 task,
                 prompt_ids,
+                image_rows,
                 generated: resume_seed,
                 emitted: resume_last_text.into_bytes(),
                 prefilled: false,
@@ -3161,8 +3498,9 @@ impl OvRuntimeEngine {
             }
             // Issue-34: capture the full post-turn KV under (prompt + generated) for warm-pull.
             // Best-effort + gated — off-rig get_state_blob returns Stub, so nothing is cached.
+            // Not for a turn with images: its ids do not identify its KV.
             #[cfg(feature = "kv_coord")]
-            {
+            if active.task.media.is_empty() {
                 let mut full: Vec<i32> = active.prompt_ids.iter().map(|&t| t as i32).collect();
                 // Skip the resume seed: `prompt_ids` already carries those ids.
                 full.extend_from_slice(
@@ -4138,6 +4476,10 @@ pub(crate) fn resolve_canonical_inputs(
         "attention_mask",
         "position_ids",
         "beam_idx",
+        // Gemma 4 vision trees: stage 0's (tagged `grafted_inputs_embeds`)
+        // and every stage's image-attention row.
+        "inputs_embeds",
+        "token_type_ids",
     ] {
         for idx in 0..n_inputs {
             let aliases = runtime.input_aliases(idx).map_err(map_ov_err)?;
@@ -4613,6 +4955,8 @@ pub struct OvRuntimeBuilder {
     static_prefill_params: Option<(u32, u32)>,
     /// Resolved packed geometry: (slots, packed_seq, packed_context).
     packed_params: Option<(u32, u32, u32)>,
+    /// Gemma 4 vision tree, loaded with the stage.
+    vision: Option<VisionTree>,
 }
 
 impl OvRuntimeBuilder {
@@ -5140,6 +5484,31 @@ impl Builder for OvRuntimeBuilder {
             }
         }
 
+        if let Some(v) = pipeline_cfg.vision.as_ref() {
+            if !stage_cfg.stateful || self.packed_slots > 0 {
+                return Err(EngineError::InvalidConfig(
+                    "a Gemma 4 vision tree is served on the stateful path only \
+                     (no static/NPU shards, no --packed-slots)"
+                        .into(),
+                ));
+            }
+            let first = if is_first {
+                let f = VisionFirst::load(&self.pipeline_dir, v)?;
+                events.push(LoadProgress::message(format!(
+                    "vision tree: rank 0 embeds the prompt and encodes images \
+                     ({} soft tokens per image at most)",
+                    f.preprocess.max_soft_tokens
+                )));
+                Some(f)
+            } else {
+                events.push(LoadProgress::message(
+                    "vision tree: relaying token_type_ids".to_string(),
+                ));
+                None
+            };
+            self.vision = Some(VisionTree { first });
+        }
+
         events.push(LoadProgress::ready());
         Ok(Box::pin(stream::iter(events)))
     }
@@ -5376,8 +5745,34 @@ impl Builder for OvRuntimeBuilder {
             }
         };
 
+        if let Some(v) = self.vision.as_ref() {
+            let need: &[&str] = if v.first.is_some() {
+                &["inputs_embeds", "token_type_ids"]
+            } else {
+                &["hidden_states", "token_type_ids"]
+            };
+            if let Some(m) = need.iter().find(|n| !canonical_inputs.contains_key(**n)) {
+                return Err(EngineError::InvalidConfig(format!(
+                    "vision tree: stage {} IR has no {m} input; re-export with \
+                     tools/gemma4_surgery --vision",
+                    self.rank
+                )));
+            }
+        } else if canonical_inputs.contains_key("token_type_ids")
+            || (canonical_inputs.contains_key("inputs_embeds")
+                && !canonical_inputs.contains_key("input_ids"))
+        {
+            return Err(EngineError::InvalidConfig(
+                "this stage takes image inputs (token_type_ids / inputs_embeds) but \
+                 pipeline_config.json has no `vision` block"
+                    .into(),
+            ));
+        }
+
         Ok(Box::new(OvRuntimeEngine {
             packed,
+            vision: self.vision,
+            step_types: Vec::new(),
             spec,
             runtime,
             rotary,
@@ -6740,11 +7135,11 @@ mod tests {
 
         let stamped = 7u32;
         let hid = WireTensor::new(WireDType::F16, [1, 1, 2], vec![1, 2, 3, 4]);
-        send_hidden_frames(&downstream, stamped, None, hid.clone())
+        send_hidden_frames(&downstream, stamped, None, hid.clone(), None)
             .await
             .unwrap();
 
-        let (lead, hid_t) = recv_hidden_frames(&upstream, false).await.unwrap();
+        let (lead, hid_t, _) = recv_hidden_frames(&upstream, false, false).await.unwrap();
         let hid_t = hid_t.expect("an activation lead is always followed by its hidden");
         let (inbound, pos) = decode_wire_lead(&lead, false).unwrap();
         assert!(pos.is_none());
@@ -6779,7 +7174,7 @@ mod tests {
         let ctrl = WireTensor::new(WireDType::I8, [1, 1, 1], vec![OPCODE_CAPTURE]);
         downstream.lock().await.send(&ctrl).await.unwrap();
 
-        let (frame, hidden) = recv_hidden_frames(&upstream, false).await.unwrap();
+        let (frame, hidden, _) = recv_hidden_frames(&upstream, false, false).await.unwrap();
         assert_eq!(frame.dtype, WireDType::I8, "control frame comes back as-is");
         assert!(
             hidden.is_none(),
@@ -6788,10 +7183,10 @@ mod tests {
 
         // The very next activation must be unaffected.
         let hid = WireTensor::new(WireDType::F16, [1, 1, 2], vec![4, 3, 2, 1]);
-        send_hidden_frames(&downstream, 9, None, hid.clone())
+        send_hidden_frames(&downstream, 9, None, hid.clone(), None)
             .await
             .unwrap();
-        let (lead, hid_t) = recv_hidden_frames(&upstream, false).await.unwrap();
+        let (lead, hid_t, _) = recv_hidden_frames(&upstream, false, false).await.unwrap();
         let hid_t = hid_t.expect("an activation lead is always followed by its hidden");
         assert_eq!(decode_wire_lead(&lead, false).unwrap(), (9, None));
         assert_eq!(
@@ -6809,11 +7204,11 @@ mod tests {
         let upstream = Arc::new(tokio::sync::Mutex::new(server));
 
         let hid = WireTensor::new(WireDType::F16, [1, 1, 2], vec![9, 8, 7, 6]);
-        send_hidden_frames(&downstream, 3, Some(11), hid.clone())
+        send_hidden_frames(&downstream, 3, Some(11), hid.clone(), None)
             .await
             .unwrap();
 
-        let (lead, hid_t) = recv_hidden_frames(&upstream, true).await.unwrap();
+        let (lead, hid_t, _) = recv_hidden_frames(&upstream, true, false).await.unwrap();
         let hid_t = hid_t.expect("an activation lead is always followed by its hidden");
         assert_eq!(
             decode_wire_lead(&lead, true).unwrap(),
@@ -6821,6 +7216,47 @@ mod tests {
             "lead carries seq then position"
         );
         assert_eq!(hid_t.data, hid.data, "hidden is the second frame");
+    }
+
+    #[tokio::test]
+    async fn vision_wire_is_lead_hidden_then_types() {
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+
+        let hid = WireTensor::new(WireDType::F16, [1, 3, 1], vec![1, 2, 3, 4, 5, 6]);
+        let types = [0i64, 1, 1];
+        send_hidden_frames(
+            &downstream,
+            4,
+            None,
+            hid.clone(),
+            Some(encode_wire_types(&types)),
+        )
+        .await
+        .unwrap();
+        let (lead, hid_t, types_t) = recv_hidden_frames(&upstream, false, true).await.unwrap();
+        assert_eq!(decode_wire_lead(&lead, false).unwrap(), (4, None));
+        assert_eq!(hid_t.unwrap().data, hid.data, "hidden is the second frame");
+        let types_t = types_t.expect("a vision tree's hidden is followed by its types");
+        assert_eq!(decode_wire_types(&types_t, 3).unwrap(), types);
+    }
+
+    #[test]
+    fn types_frame_is_validated_against_the_hidden() {
+        let t = encode_wire_types(&[0, 1]);
+        assert!(
+            decode_wire_types(&t, 3).is_err(),
+            "length must match the hidden"
+        );
+        assert!(
+            decode_wire_types(&encode_wire_types(&[2]), 1).is_err(),
+            "video is not served"
+        );
+        // A next step's lead read where types were expected (an upstream rank
+        // without the vision block) fails the value check, not misread.
+        assert!(decode_wire_types(&encode_wire_lead(5, None), 1).is_err());
+        assert_eq!(decode_wire_types(&t, 2).unwrap(), vec![0, 1]);
     }
 
     /// The seq is carried as an i64 lane on the lead wire and an i32 lane on
