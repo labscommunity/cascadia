@@ -1,0 +1,2 @@
+# Pinned for tests/conformance/test_openai_sdk.py; bump deliberately.
+openai==3.31.0
