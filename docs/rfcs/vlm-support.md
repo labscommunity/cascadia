@@ -193,10 +193,12 @@ something, we fail the way OpenAI fails: same status code, same error object.
   that branch on list content.
   - The ov-genai "thinking ON" legacy path (`lib.rs:1744-1751`) sends only the last user
     message. With images it must keep the image order consistent with the prompt.
-- **Task.** Add `images: Vec<ImageInput>` to `GenerationTask`, where
-  `ImageInput { rgb: Arc<[u8]>, width, height, sha256 }`. Decode once, in the API.
-  Engines get pixels, never URLs. `GenerationTask` is in-process only, so this costs no
-  wire versioning.
+- **Task.** Add `media: Vec<MediaInput>` to `GenerationTask`, where
+  `MediaInput { kind: MediaKind, frames: Arc<[u8]>, num_frames, width, height,
+  timestamps_ms: Option<Vec<u32>>, sha256 }` and `MediaKind` is `Image` (one frame,
+  no timestamps) or, later, `Video`. Decode once, in the API. Engines get pixels, never
+  URLs. `GenerationTask` is in-process only, so this costs no wire versioning. See
+  "Video: out of scope, kept cheap" for why the shape is general from day one.
 - **Capability gate.** Each engine reports `supports_images()`. Image parts sent to a
   text-only engine get an OpenAI-shaped 400 (`invalid_request_error`, "model X does not
   accept image input"), not a serde error.
@@ -220,8 +222,10 @@ something, we fail the way OpenAI fails: same status code, same error object.
     - With no tags at all, GenAI *prepends* the tags to the prompt. For a pre-templated
       prompt that would put the image before `<|im_start|>`, so the API must always
       render image parts through the template.
-    - Still to check: whether the shim's `generate` call re-applies the chat template to
-      an already-rendered prompt.
+    - Re-templating is not a problem [verified on pawan-04, 2026-10-15]. The engine
+      already sets `apply_chat_template=false` when the API renders the template
+      (`cascadia-cli/src/lib.rs:2293`). A pre-templated prompt with the native tag and
+      templating off answered correctly on the 35B IR (see Phase 0 results).
   - Upstream also ships a C API (`ov_genai_vlm_pipeline_generate(..., const ov_tensor_t** rgbs, size_t num_images, ...)`).
     We keep our own shim for consistency.
 - **Batching.** `VLMPipeline` handles one request at a time. GenAI 2026.4.1's
@@ -249,13 +253,14 @@ Everything image-related stays there.
    - **Host glue [verified, GenAI 2026.4.1 `qwen3_vl/classes.cpp:455-622`; Qwen3.5
      reuses `VisionEncoderQwen3VL`].** The vision IRs are not self-contained. The host
      must:
-     - compute bilinear-interpolation `input` indices and `weights` for
-       `vision_embeddings_pos` from `grid_thw`, then add the weighted 4-corner sum to
-       the patch embeddings (`:455-513`);
-     - compute `rotary_pos_emb` for the merger (`get_rotary_pos_emb`);
-     - pass either `cu_seqlens` or a block-diagonal `attention_mask`, depending on how
-       the IR was exported (`:609-621`);
-     - read `last_hidden_state` back out.
+     - compute bilinear-interpolation corner indices from `grid_thw` and feed them to
+       `vision_embeddings_pos` (`input [4,N]` i64, output `[4,N,1152]`). The weights
+       are not an IR input: the host applies them and adds the weighted 4-corner sum
+       to the patch embeddings (`:455-513`);
+     - compute `rotary_pos_emb` (`[N,36]` f32) for the merger (`get_rotary_pos_emb`);
+     - build a block-diagonal `attention_mask` (`[1,N,N]` f32). The 35B export takes
+       the mask, not `cu_seqlens` [verified from the IR on pawan-04] (`:609-621`);
+     - read `last_hidden_state` back out (`[N/4, 2048]`, one row per image token).
 
      None of this is in our tree. Rank-0 vision is therefore a port of GenAI's
      Apache-2.0 Qwen2-VL/Qwen3-VL embedder logic: preprocessing, the pieces above, and
@@ -275,8 +280,8 @@ Everything image-related stays there.
    task, as in `get_rope_index`. `chain_pass_inner` then slices it instead of building
    `t0..t1` (`qwen36.rs:997`). Decode uses `step + rope_delta` in rows 1-3, while row 0
    stays the plain token index (prefill `0..T`, decode `history_size`). This matches
-   GenAI's Qwen3.5 embedder [verified, see above]. Still check it once against the #174
-   IR's `position_ids` input shape.
+   GenAI's Qwen3.5 embedder [verified, see above]. The 35B IR's language model takes
+   `position_ids [4,?,?]` i64 and `inputs_embeds [?,?,2048]` [verified from the IR].
 4. **Wire.** Downstream ranks currently derive positions from the FORWARD header's
    `pos`. Two options:
    - **(a)** Add an optional i64 position tensor to FORWARD under a new append-only
@@ -355,29 +360,82 @@ Answered from source on 2026-10-14 (GenAI tag `2026.4.1.0`, transformers 5.14.1,
 hub configs); details are in the sections above:
 
 1. ~~Position input layout.~~ **Answered:** `[4,B,T]`; row 0 is the token index, rows
-   1-3 are M-RoPE (GenAI `qwen3_5/classes.cpp:41-108`). One confirmation against the
-   #174 IR's `model.inputs` remains.
-2. ~~Merger inputs.~~ **Answered:**
-   - merger: `hidden_states`, `rotary_pos_emb`, and `cu_seqlens` or `attention_mask`;
-   - pos IR: `input` indices and `weights`.
-   All of these are host-computed. Which of `cu_seqlens` and `attention_mask` the #174
-   IR takes still needs reading from `model.inputs`.
+   1-3 are M-RoPE (GenAI `qwen3_5/classes.cpp:41-108`). The 35B IR's `position_ids` is
+   `[4,?,?]` i64.
+2. ~~Merger inputs.~~ **Answered** from the 35B IR:
+   - embeddings: `hidden_states [?,?]` f32 -> `[?,1152]`;
+   - pos: `input [4,?]` i64 -> `[4,?,1152]` (weights applied on the host);
+   - merger: `hidden_states [?,1152]`, `attention_mask [1,?,?]` f32,
+     `rotary_pos_emb [?,36]` f32 -> `[?,2048]`.
+   The #174 builder's own output should be checked the same way when one exists.
 3. ~~Placeholder.~~ **Answered:** the native tag
    `<|vision_start|><|image_pad|><|vision_end|>`, one per image, with the count checked.
-   **Still open:** whether our shim's `generate` re-applies the chat template.
+   Re-templating is not an issue (see B).
 4. ~~Continuous batching with images.~~ **Answered: yes** in 2026.4.1
    (`continuous_batching_pipeline.hpp:284-285`).
+5. ~~Rust vs GenAI internals.~~ **Decided:** write the rank-0 vision glue in Rust,
+   after Phase 1b, and test it against GenAI's output on the same images.
+7. ~~End to end on our pinned GenAI.~~ **Answered: yes.** See Phase 0 results.
 
-Still open:
+6. ~~Video in scope?~~ **Decided: no**, but every image-path interface is built so
+   video slots in without rework. See "Video: out of scope, kept cheap".
 
-5. Port GenAI's embedder logic to Rust, or link GenAI internals from the shim? This is
-   now a real trade-off; see C1.
-6. Is video in scope? Qwen3.5 supports it (timestamped frames, `get_rope_index` splits
-   `video_grid_thw`, and CB has a videos overload). This RFC treats it as a later
-   extension.
-7. Does the image path work end to end on our pinned GenAI (2026.4.1) with a
-   Qwen3.5-35B VLM IR? This needs model files: run once through Python `VLMPipeline`
-   before Phase 1b.
+No questions remain open.
+
+## Video: out of scope, kept cheap
+
+Video ships in no phase of this RFC. The image work must still leave nothing that
+would have to be redone to add it. Each item below is a requirement on the image work,
+checked in review and, where marked, by a test:
+
+1. **Task shape.** `GenerationTask.media` is a list of `MediaInput` with a `kind` and
+   a frame count, not `images: Vec<ImageInput>` (section A). An image is one frame.
+2. **Vision runner input.** The rank-0 runner takes a frame stack `[T,H,W,3]` plus
+   optional timestamps. An image is `T=1`, padded to the temporal patch size (2) the
+   same way the HF processor does. No image-only entry point.
+3. **Positions.** The position code takes a full `(t, h, w)` grid per media item and
+   the optional timestamps, following `get_rope_index`'s video branch. **Test:** the
+   parity suite against HF `get_rope_index` includes a synthetic video grid
+   (`t>1`, with timestamps), not only images. This is the piece that is costly to
+   retrofit, so it is tested now.
+4. **Caches.** Prefix-cache and encoder-cache keys use the per-item `sha256` of the
+   decoded frames, regardless of kind.
+5. **Shim and FFI.** The shim's media entry point takes a list of tensors plus a kind
+   per tensor, so GenAI's `add_request(..., videos, ...)` overload is a new branch,
+   not a new ABI.
+6. **API.** The content-part parser has one dispatch point for media parts. `video_url`
+   gets an OpenAI-shaped 400 naming the type (as today) until video lands.
+7. **Exporter.** `video_preprocessor_config.json` is copied and listed in the manifest
+   alongside the image config (C7).
+
+Adding video later is then: a decoder and frame sampler in the API with its own
+limits (duration, frame count, container size), the `video_url` part behind a flag,
+the video branch in the shim, and `MediaKind::Video` reaching the runner. The
+positions, caches, task shape and wire stay as they are.
+
+## Phase 0 results (pawan-04, 2026-10-15)
+
+Setup: Core Ultra 7 258V, 32 GB, CPU device; Python `openvino-genai==2026.4.1.0`
+(our pin) in a throwaway venv; `C:\cascadia\models\Qwen3.6-35B-A3B-int4-ov` (optimum
+export, `qwen3_5_moe`, language model 17.4 GB int4, vision IRs about 0.4 GB). Test image:
+448x448 synthetic, a red square left and a blue circle right.
+
+| Run | Input tokens | TTFT | TPOT | Answer |
+|---|---|---|---|---|
+| plain prompt + image (GenAI templates, thinking on) | 227 | 43.3 s (first call) | 163 ms | starts reasoning about "two distinct geometric shapes" |
+| plain prompt, no image | 29 | 2.7 s | 139 ms | text-only reasoning |
+| pre-templated + native tag, `apply_chat_template=false` | 229 | 21.5 s | 140 ms | "A red square and a blue circle." |
+
+- The image path works end to end on our pinned GenAI with the 35B export.
+- A 448x448 image costs 198 tokens: (448/16)^2 / 4 = 196 image tokens plus the two
+  vision tags. This matches the token math in "How a Qwen3.5 image request works".
+- The pre-templated run is exactly what our API plus engine will send, so Phase 1b
+  needs no prompt-format work beyond rendering the tag through the template.
+- On CPU one small image adds about 19 s to TTFT after warm-up (21.5 s against
+  2.7 s for text). That covers the vision encoder and about 200 extra prefill tokens;
+  this run did not split the two. Pixel caps and iGPU placement for the
+  vision IRs matter for latency, not only memory.
+- Model load took 88 s.
 
 ## Sources
 
