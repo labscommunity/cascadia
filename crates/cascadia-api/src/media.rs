@@ -27,6 +27,13 @@ pub struct MediaConfig {
     /// Text a caller's message must not contain: the engine would read it as
     /// an image tag and fail the request or misplace an image.
     pub reserved_text: Vec<String>,
+    /// A message with images reaches the chat template as one string: its
+    /// text parts and image tags back to back, as HF's templates (Qwen,
+    /// Gemma 4, Pixtral) and GenAI's own tag insertion write a content array.
+    /// Joining with "\n" instead put one extra token per join into the
+    /// prompt. Gemma 4's template also trims each text part; this does the
+    /// same.
+    pub trim_text_parts: bool,
     /// Images allowed in one request.
     pub max_images: usize,
     /// Images larger than this many pixels are downscaled to fit, keeping
@@ -57,6 +64,7 @@ impl MediaConfig {
         Self {
             image_placeholder: "<ov_genai_image_{i}>".into(),
             reserved_text: vec!["<ov_genai_image_".into()],
+            trim_text_parts: false,
             max_images: 8,
             // 1024x1024: about 1000 image tokens on Qwen3.5.
             max_image_pixels: 1 << 20,
@@ -105,6 +113,7 @@ impl MediaConfig {
             ]
             .map(String::from)
             .to_vec(),
+            trim_text_parts: true,
             ..Self::ov_genai()
         }
     }
@@ -121,6 +130,15 @@ impl MediaConfig {
                 .map(String::from)
                 .to_vec(),
             ..Self::ov_genai()
+        }
+    }
+
+    /// One text part of a message with images, as it enters the prompt.
+    pub fn text_part(&self, t: String) -> String {
+        if self.trim_text_parts {
+            t.trim().to_string()
+        } else {
+            t
         }
     }
 
@@ -867,7 +885,10 @@ mod tests {
         assert!(g.reserved_in("raw <|image> text").is_some());
         assert_eq!(g.reserved_in("plain text"), None);
 
+        assert_eq!(g.text_part("  a b \n".into()), "a b");
+
         let x = MediaConfig::pixtral_native();
+        assert_eq!(x.text_part(" a ".into()), " a ");
         assert_eq!(x.placeholder(1), "[IMG]");
         assert_eq!(x.placeholders_complete("[IMG]a[IMG]", 2), Ok(()));
         assert_eq!(x.reserved_in("raw [IMG_END] text"), Some("[IMG_END]"));
