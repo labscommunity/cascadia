@@ -1375,8 +1375,11 @@ impl Qwen36Engine {
         };
         // Issue-34: capture this rank's local KV under (prompt + generated) BEFORE reset_all wipes
         // it. Keyed by the full sequence (session-resume). Gated + best-effort (stub ⇒ no-op).
+        // Never for a turn with images: its ids (one pad per image token, the
+        // same for every same-grid image) do not identify its KV, so a later
+        // turn matching them would restore another image's state.
         #[cfg(feature = "kv_coord")]
-        {
+        if t.vision.is_none() {
             // Skip the resume seed: `prompt_ids` already carries those ids, so
             // counting them again keys the blob at a depth that never matches
             // the fed sequence (same defect dist_spec fixed).
