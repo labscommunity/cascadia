@@ -1248,6 +1248,7 @@ impl Qwen36Engine {
             &images,
             hidden,
             v.merge,
+            &task.tenant,
         )
         .map(Some)
     }
