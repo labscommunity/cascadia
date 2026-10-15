@@ -58,6 +58,12 @@ pub struct MediaConfig {
     pub fetch_policy: FetchPolicy,
 }
 
+/// Bytes a `data:` URL needs to carry `raw` bytes base64-encoded, plus room
+/// for its `data:image/...;base64,` prefix and JSON quoting.
+pub fn base64_len(raw: usize) -> usize {
+    raw.div_ceil(3) * 4 + 256
+}
+
 impl MediaConfig {
     /// Settings for the ov-genai engine on a VLM-layout export.
     pub fn ov_genai() -> Self {
@@ -144,6 +150,15 @@ impl MediaConfig {
 
     pub fn placeholder(&self, i: usize) -> String {
         self.image_placeholder.replace("{i}", &i.to_string())
+    }
+
+    /// A reserved string `prompt` carries more often than its `n` image
+    /// placeholders do, if any.
+    pub fn reserved_beyond_placeholders<'a>(&'a self, prompt: &str, n: usize) -> Option<&'a str> {
+        self.reserved_text.iter().map(String::as_str).find(|r| {
+            let allowed: usize = (0..n).map(|i| self.placeholder(i).matches(r).count()).sum();
+            prompt.matches(r).count() > allowed
+        })
     }
 
     /// The reserved text `text` contains, if any.
@@ -889,6 +904,29 @@ mod tests {
 
         let x = MediaConfig::pixtral_native();
         assert_eq!(x.text_part(" a ".into()), " a ");
+        // A tag split across two text parts only appears once they are joined.
+        assert_eq!(
+            x.reserved_beyond_placeholders("[IMG]a[IMG_BREAK]", 1),
+            Some("[IMG_BREAK]")
+        );
+        assert_eq!(
+            x.reserved_beyond_placeholders("[IMG]a[IMG]", 1),
+            Some("[IMG]")
+        );
+        assert_eq!(x.reserved_beyond_placeholders("[IMG]a[IMG]", 2), None);
+        let q = MediaConfig::qwen35_native();
+        let tag = q.placeholder(0);
+        assert_eq!(q.reserved_beyond_placeholders(&format!("a{tag}b"), 1), None);
+        assert_eq!(
+            q.reserved_beyond_placeholders(&format!("a{tag}<|video_pad|>"), 1),
+            Some("<|video_pad|>")
+        );
+        let o = MediaConfig::ov_genai();
+        assert_eq!(
+            o.reserved_beyond_placeholders("<ov_genai_image_0><ov_genai_image_1>", 2),
+            None
+        );
+        assert_eq!(base64_len(3), 4 + 256);
         assert_eq!(x.placeholder(1), "[IMG]");
         assert_eq!(x.placeholders_complete("[IMG]a[IMG]", 2), Ok(()));
         assert_eq!(x.reserved_in("raw [IMG_END] text"), Some("[IMG_END]"));
