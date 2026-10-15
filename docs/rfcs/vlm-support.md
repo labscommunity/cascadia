@@ -465,8 +465,12 @@ Still open:
 
 - A multi-rank run on hardware with images (one 32 GB box cannot hold four 35B stage
   processes next to its other workload; needs a second machine or the 2-stage tree pair).
-- Image turns could reuse a text-only prefix before the first image; today they always
-  prefill cold. Cache keys that include the image `sha256` would allow more.
+- ~~Prefix reuse for image turns.~~ Done: single-box image turns key the local prefix
+  cache on `VisionPrompt::cache_key` (pad tokens replaced by pseudo-ids from the image's
+  pixel hash, row and tenant). Measured on pawan-04: a follow-up turn on the same image
+  restored past it (72.5 s -> 11.5 s); a different image reused only the system prompt and
+  answered about its own image. The local text prefix cache is not tenant-namespaced (a
+  pre-existing property); image spans are, once tenants are asserted.
 - Vision IR placement (iGPU) and timing; HF-logit parity on image prompts (Phase 2 exit
   criterion) beyond the GenAI answer match; 397B (Phase 3).
 
