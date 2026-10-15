@@ -186,7 +186,13 @@ impl PackedState {
             .min(prompt_ids.len().saturating_sub(1));
         self.kv.reset_slot_reusing(slot, shared);
         // Nothing cached yet? This request populates the shared prefix.
-        if self.kv.prefix_valid == 0 && self.populating.is_none() && self.kv.prefix_capacity > 0 {
+        // A prompt that opens with an image (`shareable == 0`) has nothing
+        // shareable; claiming would pin one image row as the prefix for good.
+        if self.kv.prefix_valid == 0
+            && self.populating.is_none()
+            && self.kv.prefix_capacity > 0
+            && shareable > 0
+        {
             self.populating = Some(slot);
             self.prefix_ids = prompt_ids
                 .iter()

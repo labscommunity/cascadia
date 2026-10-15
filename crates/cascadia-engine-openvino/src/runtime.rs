@@ -2877,19 +2877,29 @@ impl OvRuntimeEngine {
                 .tokenizer
                 .clone()
                 .ok_or_else(|| EngineError::Backend("first stage requires tokenizer".into()))?;
-            // Admission failures are attributed to the failed task so the
-            // runner routes them to its stream — a bare Err here would kill
-            // whichever concurrent stream happened to be polling.
-            let enc = tok.encode(task.prompt.clone(), false).map_err(|e| {
-                EngineError::Backend(format!("tokenizer encode: {e}"))
-                    .for_task(task.task_id.clone())
-            })?;
+            // Admission failures become the failed task's own error chunk:
+            // a bare Err here would kill whichever concurrent stream happened
+            // to be polling, and returning one would drop the chunks already
+            // queued in `out` for tasks this loop has taken off `pending`.
+            let enc = match tok.encode(task.prompt.clone(), false) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    let id = task.task_id.clone();
+                    out.push((
+                        id.clone(),
+                        Chunk::error(id, format!("tokenizer encode: {e}")),
+                    ));
+                    continue;
+                }
+            };
             let mut prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
             if prompt_ids.is_empty() {
-                return Err(
-                    EngineError::Backend("empty prompt: no tokens to prefill".into())
-                        .for_task(task.task_id),
-                );
+                let id = task.task_id.clone();
+                out.push((
+                    id.clone(),
+                    Chunk::error(id, "empty prompt: no tokens to prefill"),
+                ));
+                continue;
             }
             // Vision tree: expand and encode the images, then embed the whole
             // prompt with their rows spliced in. Prefix sharing stops at the
@@ -2932,7 +2942,11 @@ impl OvRuntimeEngine {
                 });
                 match embedded {
                     Ok(rows) => prompt_rows = rows,
-                    Err(e) => return Err(e.for_task(task.task_id)),
+                    Err(e) => {
+                        let id = task.task_id.clone();
+                        out.push((id.clone(), Chunk::error(id, e.to_string())));
+                        continue;
+                    }
                 }
             }
             let (id, prompt_tokens, images) =
@@ -5868,6 +5882,13 @@ impl Builder for OvRuntimeBuilder {
                     "static IR has none of input_ids / hidden_states / inputs_embeds".into(),
                 ));
             }
+            if ids_in.is_some() && embeds_in.is_some() {
+                return Err(EngineError::InvalidConfig(
+                    "static stage 0 takes both input_ids and inputs_embeds; the static \
+                     path feeds one (re-export the stage with a single primary input)"
+                        .into(),
+                ));
+            }
             Some(StaticKv {
                 past_len,
                 sink: crate::packed::KV_SINK.min(past_len / 2),
@@ -5993,6 +6014,23 @@ impl Builder for OvRuntimeBuilder {
                 } else {
                     0
                 };
+                // The packed IR must feed what this rank has: embedding rows on
+                // a vision tree's rank 0, ids on a text tree's. A mismatched
+                // file (stale, or built from another export) would otherwise
+                // drop the images silently or fail every step.
+                let vision_first = self.vision.as_ref().is_some_and(|v| v.first.is_some());
+                if spec.is_first_stage && embeds_in.is_some() != vision_first {
+                    return Err(EngineError::InvalidConfig(format!(
+                        "packed variant {} inputs_embeds but this tree {} a vision block; \
+                         rebuild it with tools/packed_variant.py from this tree's static stage",
+                        if embeds_in.is_some() {
+                            "takes"
+                        } else {
+                            "lacks"
+                        },
+                        if vision_first { "has" } else { "has no" },
+                    )));
+                }
                 let ids_in = embeds_in
                     .or_else(|| pcanon.get("input_ids").cloned())
                     .unwrap_or_default();

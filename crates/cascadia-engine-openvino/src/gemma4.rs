@@ -631,7 +631,10 @@ impl Gemma4Engine {
 
     /// Vision tree, stage 0: the rows of exactly the image tokens in this
     /// span, in order; none on a text span or a decode step (the IR appends a
-    /// zero row so an empty input still gathers).
+    /// zero row so an empty input still gathers). An image token with no
+    /// image left to supply it (the model emitting `<|image|>` while decoding,
+    /// or one in a turn without images) gets a zero row instead of failing
+    /// the turn.
     fn feed_image_features(&mut self, port: &str, input_ids: &[i64]) -> EngineResult<()> {
         let image = self.vision.as_ref().map(|v| v.tokens.image);
         let k = input_ids.iter().filter(|&&t| Some(t) == image).count();
@@ -642,6 +645,13 @@ impl Gemma4Engine {
                 EngineError::Backend("image tokens with no active task to splice".into())
             })?;
             let start = a.image_rows_fed * h;
+            if start >= a.image_rows.len() {
+                rows.resize(k * h, 0.0);
+                return self
+                    .runtime
+                    .set_input(port, ShimDType::F32, &[k, h], &f32_to_bytes(&rows))
+                    .map_err(map_ov_err);
+            }
             let slice = a.image_rows.get(start..start + k * h).ok_or_else(|| {
                 EngineError::Backend(format!(
                     "span carries {k} image tokens but only {} image rows remain",
