@@ -1,10 +1,14 @@
 //! Image input for `/v1/chat/completions`: OpenAI `image_url` content parts.
 //!
 //! Every image is decoded, bounded and hashed here, once, so engines only see
-//! RGB pixels ([`MediaInput`]). Only `data:` URLs are accepted; fetching
-//! remote URLs needs SSRF guards and is a separate, opt-in feature.
+//! RGB pixels ([`MediaInput`]). `data:` URLs are always accepted. Remote
+//! `https` URLs are fetched only when the operator opts in
+//! ([`MediaConfig::allow_remote_urls`]), and only from public addresses: see
+//! [`fetch_image`].
 
 use std::io::Cursor;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use base64::Engine as _;
 use cascadia_types::{MediaInput, MediaKind};
@@ -32,8 +36,15 @@ pub struct MediaConfig {
     /// before decoding (decompression bombs).
     pub max_source_pixels: u64,
     /// Encoded image bytes one request may carry, on top of the text body
-    /// limit.
+    /// limit. Also the cap on bytes fetched for one request.
     pub max_request_image_bytes: usize,
+    /// Fetch `https` image URLs (public addresses only). Off by default: the
+    /// server then makes outbound requests on a caller's behalf.
+    pub allow_remote_urls: bool,
+    /// Who a fetch may reach. Always [`FetchPolicy::PUBLIC_HTTPS`] outside
+    /// tests; not exposed as a flag.
+    #[doc(hidden)]
+    pub fetch_policy: FetchPolicy,
 }
 
 impl MediaConfig {
@@ -48,6 +59,8 @@ impl MediaConfig {
             low_detail_pixels: 512 * 512,
             max_source_pixels: 50_000_000,
             max_request_image_bytes: 20 << 20,
+            allow_remote_urls: false,
+            fetch_policy: FetchPolicy::PUBLIC_HTTPS,
         }
     }
 
@@ -72,24 +85,39 @@ const MAX_SIDE: u32 = 16_384;
 /// caller a 400 instead of an engine failure.
 const MAX_ASPECT: u32 = 200;
 
-/// Decode one `image_url` into pixels the engine can take as is.
+/// Decode one `data:` image URL into pixels the engine can take as is.
 pub fn decode_image_url(
     url: &str,
     detail: Option<&str>,
     cfg: &MediaConfig,
 ) -> Result<MediaInput, String> {
+    check_detail(detail)?;
+    let bytes = data_url_bytes(url, cfg.allow_remote_urls)?;
+    decode_image_bytes(&bytes, detail, cfg)
+}
+
+fn check_detail(detail: Option<&str>) -> Result<(), String> {
+    match detail {
+        None | Some("auto" | "high" | "low") => Ok(()),
+        Some(other) => Err(format!(
+            "image detail `{other}` is not supported; use `low`, `high` or `auto`"
+        )),
+    }
+}
+
+/// Decode encoded image bytes (from a `data:` URL or a fetch).
+pub fn decode_image_bytes(
+    bytes: &[u8],
+    detail: Option<&str>,
+    cfg: &MediaConfig,
+) -> Result<MediaInput, String> {
+    check_detail(detail)?;
     let budget = match detail {
         None | Some("auto") | Some("high") => cfg.max_image_pixels,
-        Some("low") => cfg.low_detail_pixels,
-        Some(other) => {
-            return Err(format!(
-                "image detail `{other}` is not supported; use `low`, `high` or `auto`"
-            ))
-        }
+        _ => cfg.low_detail_pixels,
     };
-    let bytes = data_url_bytes(url)?;
 
-    let format = ImageReader::new(Cursor::new(&bytes))
+    let format = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| format!("could not read the image: {e}"))?
         .format();
@@ -99,12 +127,12 @@ pub fn decode_image_url(
     }
 
     // Check the declared size before decoding a single pixel.
-    let (w, h) = ImageReader::with_format(Cursor::new(&bytes), format.unwrap())
+    let (w, h) = ImageReader::with_format(Cursor::new(bytes), format.unwrap())
         .into_dimensions()
         .map_err(|e| format!("could not read the image header: {e}"))?;
     check_dimensions(w, h, cfg)?;
 
-    let mut reader = ImageReader::with_format(Cursor::new(&bytes), format.unwrap());
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), format.unwrap());
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_SIDE);
     limits.max_image_height = Some(MAX_SIDE);
@@ -160,13 +188,15 @@ fn check_dimensions(w: u32, h: u32, cfg: &MediaConfig) -> Result<(), String> {
 }
 
 /// The payload of a base64 `data:image/...` URL.
-fn data_url_bytes(url: &str) -> Result<Vec<u8>, String> {
+fn data_url_bytes(url: &str, remote_allowed: bool) -> Result<Vec<u8>, String> {
     let Some(rest) = url.strip_prefix("data:") else {
-        return Err(
-            "only `data:` image URLs are supported; send the image base64-encoded \
-             (`data:image/png;base64,...`)"
-                .into(),
-        );
+        return Err(if remote_allowed {
+            "image URLs must be `https://` or `data:` (base64-encoded)".into()
+        } else {
+            "only `data:` image URLs are supported on this server; send the image \
+             base64-encoded (`data:image/png;base64,...`)"
+                .into()
+        });
     };
     let Some((meta, payload)) = rest.split_once(',') else {
         return Err("malformed data URL: no `,` before the payload".into());
@@ -184,6 +214,232 @@ fn data_url_bytes(url: &str) -> Result<Vec<u8>, String> {
         .decode(payload)
         .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(payload))
         .map_err(|e| format!("data URL payload is not valid base64: {e}"))
+}
+
+/// Whether `url` should be fetched rather than decoded inline.
+pub fn is_remote(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://")
+}
+
+/// Redirects followed per image, each re-validated like the original URL.
+const MAX_REDIRECTS: usize = 3;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Whole fetch of one image, headers and body.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Who a fetch may reach. Production is [`FetchPolicy::PUBLIC_HTTPS`]; tests
+/// use a policy that also allows plain HTTP to loopback so they can run a
+/// local server.
+#[derive(Clone, Copy, Debug)]
+pub struct FetchPolicy {
+    pub allow_http: bool,
+    pub allow_non_public: bool,
+}
+
+impl FetchPolicy {
+    pub const PUBLIC_HTTPS: Self = Self {
+        allow_http: false,
+        allow_non_public: false,
+    };
+}
+
+/// Fetch an image over HTTPS for a caller, without letting the caller point
+/// the server at anything it should not reach (SSRF):
+///
+/// - `https` on port 443 only, no credentials in the URL, no proxy;
+/// - every address the host resolves to must be public (no loopback,
+///   private, link-local, CGNAT/Tailscale, multicast, reserved, or v4 hidden
+///   inside v6), and the connection is pinned to the checked address, so a
+///   second DNS answer cannot redirect it (rebinding);
+/// - at most [`MAX_REDIRECTS`] redirects, each checked the same way;
+/// - `image/*` content type, and at most `max_bytes`, enforced while reading.
+pub async fn fetch_image(
+    url: &str,
+    max_bytes: usize,
+    policy: FetchPolicy,
+) -> Result<Vec<u8>, String> {
+    let mut current = url::Url::parse(url).map_err(|e| format!("invalid image URL: {e}"))?;
+    for _ in 0..=MAX_REDIRECTS {
+        let addr = check_target(&current, policy).await?;
+        let host = current.host_str().unwrap_or_default().to_owned();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(FETCH_TIMEOUT)
+            .https_only(!policy.allow_http)
+            .resolve(&host, addr)
+            .user_agent("cascadia-image-fetch")
+            .build()
+            .map_err(|e| format!("could not set up the image fetch: {e}"))?;
+        let mut resp = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(|e| format!("could not fetch the image: {}", without_url(e)))?;
+        if resp.status().is_redirection() {
+            let next = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or("image URL redirected without a Location")?;
+            current = current
+                .join(next)
+                .map_err(|e| format!("image URL redirected to an invalid URL: {e}"))?;
+            continue;
+        }
+        if !resp.status().is_success() {
+            return Err(format!(
+                "fetching the image returned HTTP {}",
+                resp.status().as_u16()
+            ));
+        }
+        let ctype = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !ctype.starts_with("image/") {
+            return Err(format!(
+                "image URL returned content type `{ctype}`, not an image"
+            ));
+        }
+        if resp.content_length().is_some_and(|n| n > max_bytes as u64) {
+            return Err(format!("image is larger than the {max_bytes}-byte limit"));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| format!("could not read the image: {}", without_url(e)))?
+        {
+            if body.len() + chunk.len() > max_bytes {
+                return Err(format!("image is larger than the {max_bytes}-byte limit"));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        return Ok(body);
+    }
+    Err(format!(
+        "image URL redirected more than {MAX_REDIRECTS} times"
+    ))
+}
+
+/// reqwest errors embed the URL, which may carry the caller's tokens in its
+/// query; the message the caller sees does not need it.
+fn without_url(e: reqwest::Error) -> String {
+    let e = e.without_url();
+    let mut msg = e.to_string();
+    let mut src = std::error::Error::source(&e);
+    while let Some(s) = src {
+        msg = format!("{msg}: {s}");
+        src = s.source();
+    }
+    msg
+}
+
+/// Validate a URL and resolve it to the one address the fetch will use.
+async fn check_target(url: &url::Url, policy: FetchPolicy) -> Result<SocketAddr, String> {
+    match url.scheme() {
+        "https" => {}
+        "http" if policy.allow_http => {}
+        other => {
+            return Err(format!(
+                "image URL scheme `{other}` is not allowed; use https"
+            ))
+        }
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("image URLs must not carry credentials".into());
+    }
+    let port = url.port_or_known_default().unwrap_or(0);
+    if !policy.allow_http && port != 443 {
+        return Err(format!("image URLs must use port 443, not {port}"));
+    }
+    let host = match url.host() {
+        Some(url::Host::Domain(d)) => d.to_owned(),
+        Some(url::Host::Ipv4(ip)) => ip.to_string(),
+        Some(url::Host::Ipv6(ip)) => ip.to_string(),
+        None => return Err("image URL has no host".into()),
+    };
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| format!("could not resolve the image host: {e}"))?
+        .collect();
+    let Some(first) = addrs.first().copied() else {
+        return Err("image host did not resolve".into());
+    };
+    // Every answer must be public: a host that resolves to one public and one
+    // internal address would otherwise be a coin flip away from the inside.
+    if !policy.allow_non_public {
+        if let Some(bad) = addrs.iter().find(|a| !is_public(a.ip())) {
+            return Err(format!(
+                "image host resolves to {}, which is not a public address",
+                bad.ip()
+            ));
+        }
+    }
+    Ok(first)
+}
+
+/// Globally routable unicast only.
+pub fn is_public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_public_v4(v4),
+        IpAddr::V6(v6) => is_public_v6(v6),
+    }
+}
+
+fn is_public_v4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    !(ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_documentation()
+        || o[0] == 0 // 0.0.0.0/8 "this network"
+        || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT (Tailscale)
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 IETF assignments
+        || (o[0] == 198 && (o[1] & 0xfe) == 18) // 198.18.0.0/15 benchmarking
+        || o[0] >= 240) // 240.0.0.0/4 reserved
+}
+
+fn is_public_v6(ip: Ipv6Addr) -> bool {
+    let s = ip.segments();
+    // v4 carried inside v6 is judged as that v4 address.
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_public_v4(v4);
+    }
+    if s[0] == 0x0064 && s[1] == 0xff9b {
+        // 64:ff9b::/96 NAT64
+        return is_public_v4(Ipv4Addr::new(
+            (s[6] >> 8) as u8,
+            s[6] as u8,
+            (s[7] >> 8) as u8,
+            s[7] as u8,
+        ));
+    }
+    if s[0] == 0x2002 {
+        // 2002::/16 6to4 embeds the v4 address in segments 1-2
+        return is_public_v4(Ipv4Addr::new(
+            (s[1] >> 8) as u8,
+            s[1] as u8,
+            (s[2] >> 8) as u8,
+            s[2] as u8,
+        ));
+    }
+    !(ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_multicast()
+        || (s[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
+        || (s[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        || (s[0] & 0xffc0) == 0xfec0 // fec0::/10 site-local (deprecated)
+        || (s[0] == 0x2001 && s[1] == 0x0db8) // 2001:db8::/32 documentation
+        || (s[0] == 0x2001 && s[1] == 0) // 2001::/32 Teredo
+        || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0) // 100::/64 discard
+        || s[..6] == [0, 0, 0, 0, 0, 0]) // ::/96 v4-compatible (deprecated)
 }
 
 #[cfg(test)]
@@ -233,6 +489,7 @@ mod tests {
         let cfg = MediaConfig::ov_genai();
         for (url, detail, needle) in [
             ("https://example.com/a.png", None, "only `data:`"),
+            ("ftp://example.com/a.png", None, "only `data:`"),
             ("data:text/plain;base64,aGk=", None, "not an image type"),
             ("data:image/png,rawbytes", None, "base64-encoded"),
             ("data:image/png;base64,@@@", None, "not valid base64"),
@@ -253,6 +510,174 @@ mod tests {
         small.max_source_pixels = 100;
         let err = decode_image_url(&png_data_url(20, 20), None, &small).unwrap_err();
         assert!(err.contains("pixels in total"), "{err}");
+    }
+
+    #[test]
+    fn public_address_rules() {
+        let public = [
+            "8.8.8.8",
+            "1.1.1.1",
+            "2606:4700:4700::1111",
+            "100.63.255.255",
+            "100.128.0.1",
+        ];
+        let internal = [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.72.95.18",
+            "100.64.0.1",
+            "0.0.0.0",
+            "0.1.2.3",
+            "255.255.255.255",
+            "224.0.0.1",
+            "240.0.0.1",
+            "192.0.2.1",
+            "198.18.0.1",
+            "192.0.0.8",
+            "::",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "fec0::1",
+            "ff02::1",
+            "2001:db8::1",
+            "2001::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "64:ff9b::a00:1",
+            "2002:7f00:1::1",
+            "::127.0.0.1",
+            "100::1",
+        ];
+        for ip in public {
+            assert!(is_public(ip.parse().unwrap()), "{ip} should be public");
+        }
+        for ip in internal {
+            assert!(!is_public(ip.parse().unwrap()), "{ip} should be refused");
+        }
+        // v4 inside v6 is judged as the v4 address.
+        assert!(is_public("::ffff:8.8.8.8".parse().unwrap()));
+        assert!(is_public("2002:0808:0808::1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn remote_urls_are_refused_before_any_connection() {
+        for (url, needle) in [
+            ("http://example.com/a.png", "scheme `http`"),
+            ("https://user:pw@example.com/a.png", "credentials"),
+            ("https://example.com:8443/a.png", "port 443"),
+            ("https://127.0.0.1/a.png", "not a public address"),
+            ("https://localhost/a.png", "not a public address"),
+            ("https://10.0.0.5/a.png", "not a public address"),
+            ("https://100.72.95.18/a.png", "not a public address"),
+            (
+                "https://[::ffff:169.254.169.254]/a.png",
+                "not a public address",
+            ),
+            ("https://[fd00::1]/a.png", "not a public address"),
+        ] {
+            let err = fetch_image(url, 1 << 20, FetchPolicy::PUBLIC_HTTPS)
+                .await
+                .unwrap_err();
+            assert!(err.contains(needle), "{url}: {err}");
+        }
+    }
+
+    /// A local server stands in for a remote host; the test policy allows
+    /// plain HTTP to loopback, which production never does.
+    async fn image_server() -> String {
+        use axum::http::header;
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+        let png = {
+            let img = image::RgbImage::from_pixel(6, 4, image::Rgb([1, 2, 3]));
+            let mut buf = Vec::new();
+            img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+                .unwrap();
+            buf
+        };
+        let png2 = png.clone();
+        let app = axum::Router::new()
+            .route(
+                "/img.png",
+                get(move || async move { ([(header::CONTENT_TYPE, "image/png")], png.clone()) }),
+            )
+            .route(
+                "/hop",
+                get(|| async {
+                    (
+                        axum::http::StatusCode::FOUND,
+                        [(header::LOCATION, "/img.png")],
+                    )
+                        .into_response()
+                }),
+            )
+            .route(
+                "/loop",
+                get(|| async {
+                    (axum::http::StatusCode::FOUND, [(header::LOCATION, "/loop")]).into_response()
+                }),
+            )
+            .route(
+                "/page",
+                get(|| async { ([(header::CONTENT_TYPE, "text/html")], "<html/>") }),
+            )
+            .route(
+                "/big",
+                get(
+                    move || async move { ([(header::CONTENT_TYPE, "image/png")], png2.repeat(50)) },
+                ),
+            )
+            .route("/gone", get(|| async { axum::http::StatusCode::NOT_FOUND }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    const LOCAL: FetchPolicy = FetchPolicy {
+        allow_http: true,
+        allow_non_public: true,
+    };
+
+    #[tokio::test]
+    async fn fetch_follows_checked_redirects_and_enforces_limits() {
+        let base = image_server().await;
+        let cfg = MediaConfig::ov_genai();
+        let bytes = fetch_image(&format!("{base}/img.png"), 1 << 20, LOCAL)
+            .await
+            .unwrap();
+        let m = decode_image_bytes(&bytes, None, &cfg).unwrap();
+        assert_eq!((m.width, m.height), (6, 4));
+        assert_eq!(
+            fetch_image(&format!("{base}/hop"), 1 << 20, LOCAL)
+                .await
+                .unwrap(),
+            bytes
+        );
+        for (path, max, needle) in [
+            ("/loop", 1 << 20, "more than 3 times"),
+            ("/page", 1 << 20, "content type `text/html`"),
+            ("/big", bytes.len() * 10, "byte limit"),
+            ("/gone", 1 << 20, "HTTP 404"),
+        ] {
+            let err = fetch_image(&format!("{base}{path}"), max, LOCAL)
+                .await
+                .unwrap_err();
+            assert!(err.contains(needle), "{path}: {err}");
+        }
+        // The same local server is out of reach under the production policy.
+        let err = fetch_image(
+            &format!("{base}/img.png"),
+            1 << 20,
+            FetchPolicy::PUBLIC_HTTPS,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("scheme `http`"), "{err}");
     }
 
     #[test]

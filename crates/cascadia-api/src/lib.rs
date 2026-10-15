@@ -2105,6 +2105,23 @@ async fn prepare_media(
             cfg.max_images
         )));
     }
+    // Remote images are fetched first, outside the decode slot (a fetch
+    // waits on the network, not the CPU), sharing one byte budget per request.
+    let mut fetched: Vec<Option<Vec<u8>>> = Vec::with_capacity(count);
+    let mut budget = cfg.max_request_image_bytes;
+    for (i, (url, _)) in messages.iter().flat_map(|m| m.images()).enumerate() {
+        if !(cfg.allow_remote_urls && media::is_remote(url)) {
+            fetched.push(None);
+            continue;
+        }
+        match media::fetch_image(url, budget, cfg.fetch_policy).await {
+            Ok(bytes) => {
+                budget -= bytes.len();
+                fetched.push(Some(bytes));
+            }
+            Err(e) => return Err(reject(format!("image {i}: {e}"))),
+        }
+    }
     let messages = messages.to_vec();
     let decode_cfg = Arc::clone(&cfg);
     // Waits rather than refusing: the caller already holds an in-flight
@@ -2115,6 +2132,7 @@ async fn prepare_media(
         .expect("decode semaphore is never closed");
     let decoded = tokio::task::spawn_blocking(move || {
         let _decode_permit = decode_permit;
+        let mut fetched = fetched;
         let mut inputs = Vec::with_capacity(count);
         let mut out = Vec::with_capacity(messages.len());
         for mut m in messages {
@@ -2128,8 +2146,13 @@ async fn prepare_media(
                     ContentPart::Text(t) => pieces.push(t),
                     ContentPart::ImageUrl { url, detail } => {
                         let i = inputs.len();
-                        let input = media::decode_image_url(&url, detail.as_deref(), &decode_cfg)
-                            .map_err(|e| format!("image {i}: {e}"))?;
+                        let input = match fetched[i].take() {
+                            Some(bytes) => {
+                                media::decode_image_bytes(&bytes, detail.as_deref(), &decode_cfg)
+                            }
+                            None => media::decode_image_url(&url, detail.as_deref(), &decode_cfg),
+                        }
+                        .map_err(|e| format!("image {i}: {e}"))?;
                         inputs.push(input);
                         pieces.push(decode_cfg.placeholder(i));
                     }
@@ -5130,6 +5153,67 @@ mod tests {
             let msg = v["error"]["message"].as_str().unwrap_or_default();
             assert!(msg.contains(needle), "expected {needle:?} in {msg:?}");
         }
+    }
+
+    /// With remote URLs enabled the image is fetched, decoded and placed like
+    /// a `data:` one; with them disabled (the default) the same URL is a 400.
+    #[tokio::test]
+    async fn remote_image_urls_are_opt_in() {
+        let png = {
+            let img = image::RgbImage::from_pixel(4, 4, image::Rgb([9, 9, 9]));
+            let mut buf = Vec::new();
+            img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .unwrap();
+            buf
+        };
+        let srv = Router::new().route(
+            "/a.png",
+            get(move || async move { ([(header::CONTENT_TYPE, "image/png")], png.clone()) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/a.png", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, srv).await.unwrap() });
+
+        let app = |allow: bool| async move {
+            let runner = Runner::new(Box::new(MockBuilder::new()));
+            runner
+                .start(
+                    PeerLayout::single_stage(),
+                    ShardSpec::single_stage("mock-model", "CPU"),
+                )
+                .await
+                .unwrap();
+            let mut media = MediaConfig::ov_genai();
+            media.allow_remote_urls = allow;
+            // Loopback over plain HTTP stands in for a public host here; the
+            // production policy refuses both (see media::tests).
+            media.fetch_policy = media::FetchPolicy {
+                allow_http: true,
+                allow_non_public: true,
+            };
+            let cfg = Config {
+                chat_template: ChatTemplateConfig {
+                    template: Some("{% for m in messages %}{{ m.content }}\n{% endfor %}".into()),
+                    bos_token: None,
+                    eos_token: None,
+                },
+                media: Some(media),
+                ..Config::default()
+            };
+            make_router_with_config(Arc::new(runner), "mock-model", cfg)
+        };
+        let body = serde_json::json!({"model": "mock-model", "max_tokens": 16,
+            "messages": [image_msg("look", &url)]});
+        let (status, v) = post_chat(app(true).await, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "body: {v}");
+        let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(content.contains("<ov_genai_image_0>"), "{content:?}");
+        let (status, v) = post_chat(app(false).await, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {v}");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("only `data:`"));
     }
 
     /// An image request is admitted (or refused) before any decoding: with

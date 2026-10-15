@@ -411,6 +411,14 @@ pub struct WorkerArgs {
     #[arg(long, default_value_t = 1.0)]
     pub api_max_body_mb: f64,
 
+    /// Fetch `https://` image URLs in chat requests (VLM models only).
+    /// Off by default: `data:` URLs always work, and enabling this makes the
+    /// server issue outbound requests for callers. Fetches go to public
+    /// addresses on port 443 only, pinned to the checked address, with at
+    /// most 3 redirects and the request's image byte budget.
+    #[arg(long)]
+    pub api_allow_image_urls: bool,
+
     /// OV performance hint (PERFORMANCE_HINT). LATENCY suits single-user
     /// decode; THROUGHPUT enables NUM_STREAMS auto-tuning. See OpenVINO
     /// high-level-performance-hints docs (2026).
@@ -810,6 +818,11 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 1.0)]
     pub api_max_body_mb: f64,
 
+    /// Fetch `https://` image URLs (VLM models; public addresses only). See
+    /// `cascadia worker --help`.
+    #[arg(long)]
+    pub api_allow_image_urls: bool,
+
     /// Expert placement JSON (requires --ep-workers). See worker --help.
     #[arg(long)]
     pub ep_placement: Option<PathBuf>,
@@ -909,6 +922,7 @@ impl WorkerArgs {
         api: String,
         prefix_cache_gb: Option<f64>,
         api_max_body_mb: f64,
+        api_allow_image_urls: bool,
         ep_workers: Vec<String>,
         ep_placement: Option<PathBuf>,
     ) -> Self {
@@ -926,6 +940,7 @@ impl WorkerArgs {
             engine,
             prefix_cache_gb,
             api_max_body_mb,
+            api_allow_image_urls,
             ep_workers,
             ep_worker_index: None,
             ep_worker_count: None,
@@ -1237,6 +1252,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         args.api,
         args.prefix_cache_gb,
         args.api_max_body_mb,
+        args.api_allow_image_urls,
         args.ep_workers,
         args.ep_placement,
     );
@@ -2583,13 +2599,17 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
                 .join("openvino_vision_embeddings_model.xml")
                 .exists()
         {
-            let media = cascadia_api::MediaConfig::ov_genai();
+            let mut media = cascadia_api::MediaConfig::ov_genai();
+            media.allow_remote_urls = args.api_allow_image_urls;
             info!(
                 max_images = media.max_images,
                 max_image_pixels = media.max_image_pixels,
+                remote_urls = media.allow_remote_urls,
                 "VLM export: accepting image_url content parts"
             );
             cfg.media = Some(media);
+        } else if args.api_allow_image_urls {
+            warn!("--api-allow-image-urls has no effect: this model takes no image input");
         }
         // `CASCADIA_API_MAX_CONCURRENT`: in-flight request cap (backpressure is
         // 503 beyond it). A multi-stream engine serves `CASCADIA_STREAMS` at
@@ -3156,6 +3176,7 @@ mod python_tests {
             ":8000".into(),
             None,
             1.0,
+            false,
             Vec::new(),
             None,
         );
@@ -3601,6 +3622,7 @@ mod ov_property_tests {
             "127.0.0.1:8080".into(),
             None,
             1.0,
+            false,
             Vec::new(),
             None,
         )
@@ -4122,13 +4144,40 @@ mod tests {
             args.api,
             args.prefix_cache_gb,
             args.api_max_body_mb,
+            args.api_allow_image_urls,
             Vec::new(),
             args.ep_placement,
         );
         assert_eq!(worker.prefix_cache_gb, Some(0.0));
         assert_eq!(worker.api_max_body_mb, 2.0);
+        assert!(
+            !worker.api_allow_image_urls,
+            "remote image URLs are off unless asked for"
+        );
         assert_eq!(worker.rank, 0);
         assert_eq!(worker.total, 1);
+    }
+
+    /// `run --api-allow-image-urls` must reach the worker that builds the API.
+    #[test]
+    fn run_forwards_the_image_url_opt_in() {
+        let cli = Cli::try_parse_from(["cascadia", "run", "m", "--api-allow-image-urls"])
+            .expect("parse run argv");
+        let Command::Run(args) = cli.cmd else {
+            panic!("expected run");
+        };
+        let worker = WorkerArgs::single_node(
+            args.model,
+            args.device,
+            args.engine,
+            args.api,
+            args.prefix_cache_gb,
+            args.api_max_body_mb,
+            args.api_allow_image_urls,
+            args.ep_workers,
+            args.ep_placement,
+        );
+        assert!(worker.api_allow_image_urls);
     }
 
     #[test]
@@ -4155,6 +4204,7 @@ mod tests {
             args.api,
             args.prefix_cache_gb,
             args.api_max_body_mb,
+            args.api_allow_image_urls,
             args.ep_workers,
             args.ep_placement,
         );
