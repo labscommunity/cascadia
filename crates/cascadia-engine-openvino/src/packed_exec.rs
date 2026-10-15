@@ -23,12 +23,22 @@ pub(crate) enum PackedPrimary<'a> {
     Ids(&'a [i64]),
     /// `rows * hidden_size` f32 in row-major order, converted to the IR's f16.
     Hidden(&'a [f32], usize),
+    /// A vision tree's stage 0: `rows * hidden_size` embedding rows, fed as
+    /// f32 into the `inputs_embeds` port (held in `ids_in`).
+    Embeds(&'a [f32], usize),
 }
+
+/// Rank 0 of a vision tree embeds ids itself: the text embedding table,
+/// returning `ids.len() * hidden` row-major f32.
+pub(crate) type EmbedFn<'a> = &'a mut dyn FnMut(&[i64]) -> EngineResult<Vec<f32>>;
 
 /// One request occupying a packed slot.
 pub(crate) struct PackedSlot {
     pub(crate) task: GenerationTask,
     pub(crate) prompt_ids: Vec<i64>,
+    /// Vision trees: the prompt's embedding rows (`prompt_ids.len() *
+    /// hidden`, image rows spliced in); empty on id-fed stages.
+    pub(crate) prompt_rows: Vec<f32>,
     /// Prompt tokens already consumed; `== prompt_ids.len()` once prefilled.
     pub(crate) prompt_fed: usize,
     pub(crate) generated: Vec<i32>,
@@ -72,8 +82,12 @@ pub(crate) struct PackedState {
     pub(crate) runtime: OvRuntime,
     pub(crate) kv: PackedKv,
     pub(crate) slots: Vec<Option<PackedSlot>>,
+    /// `input_ids`, or `inputs_embeds` when `embed_hidden > 0`.
     pub(crate) ids_in: String,
     pub(crate) hidden_in: String,
+    /// Row width of a vision tree's stage 0 (fed embedding rows); 0 when the
+    /// stage takes ids or hidden states.
+    pub(crate) embed_hidden: usize,
     pub(crate) mask_in: String,
     pub(crate) pos_in: String,
     pub(crate) mask_dtype: ShimDType,
@@ -97,6 +111,7 @@ impl PackedState {
         layers: Vec<PackedLayer>,
         ids_in: String,
         hidden_in: String,
+        embed_hidden: usize,
         mask_in: String,
         pos_in: String,
         mask_dtype: ShimDType,
@@ -108,6 +123,7 @@ impl PackedState {
             slots: (0..slots).map(|_| None).collect(),
             ids_in,
             hidden_in,
+            embed_hidden,
             mask_in,
             pos_in,
             mask_dtype,
@@ -150,8 +166,24 @@ impl PackedState {
 
     /// Place a task into `slot`, reusing `shared` cached prefix tokens and
     /// clearing only that slot's own KV region.
-    pub(crate) fn admit(&mut self, slot: usize, task: GenerationTask, prompt_ids: Vec<i64>) {
-        let shared = self.prefix_reuse(&prompt_ids);
+    ///
+    /// `shareable` caps how much of the prompt may be matched against, or
+    /// populate, the shared prefix: a vision prompt passes the index of its
+    /// first image token, since every image of one size has the same ids and
+    /// matching past it would reuse another image's K/V.
+    ///
+    /// Returns how many prompt tokens come from the shared prefix.
+    pub(crate) fn admit(
+        &mut self,
+        slot: usize,
+        task: GenerationTask,
+        prompt_ids: Vec<i64>,
+        prompt_rows: Vec<f32>,
+        shareable: usize,
+    ) -> usize {
+        let shared = self
+            .prefix_reuse(&prompt_ids[..shareable.min(prompt_ids.len())])
+            .min(prompt_ids.len().saturating_sub(1));
         self.kv.reset_slot_reusing(slot, shared);
         // Nothing cached yet? This request populates the shared prefix.
         if self.kv.prefix_valid == 0 && self.populating.is_none() && self.kv.prefix_capacity > 0 {
@@ -159,12 +191,13 @@ impl PackedState {
             self.prefix_ids = prompt_ids
                 .iter()
                 .copied()
-                .take(self.kv.prefix_capacity)
+                .take(self.kv.prefix_capacity.min(shareable))
                 .collect();
         }
         self.slots[slot] = Some(PackedSlot {
             task,
             prompt_ids,
+            prompt_rows,
             prompt_fed: shared,
             generated: Vec::new(),
             emitted: Vec::new(),
@@ -172,6 +205,7 @@ impl PackedState {
             started: Instant::now(),
             t_prefill: Duration::ZERO,
         });
+        shared
     }
 
     pub(crate) fn retire(&mut self, slot: usize) -> Option<PackedSlot> {
@@ -195,16 +229,33 @@ impl PackedState {
 
     /// Run exactly one packed inference. Returns the primary output
     /// (dtype, shape, bytes) plus what the step did.
+    ///
+    /// A vision tree's stage 0 (`embed_hidden > 0`) feeds embedding rows: a
+    /// prefill chunk slices the slot's spliced prompt rows, a decode step
+    /// embeds the sampled tokens through `embed`.
     pub(crate) fn step(
         &mut self,
+        embed: Option<EmbedFn<'_>>,
     ) -> EngineResult<Option<(ShimDType, Vec<usize>, Vec<u8>, PackedStepKind)>> {
         let s = self.kv.packed_seq;
+        let h = self.embed_hidden;
+        let mut rows: Vec<f32> = Vec::new();
         let (plan, ids, positions, kind) = if let Some(slot) = self.next_prefill_slot() {
             // ---- prefill chunk for one slot ----
             let t = self.slots[slot].as_ref().unwrap();
             let start = t.prompt_fed;
             let take = (t.prompt_ids.len() - start).min(s);
             let ids: Vec<i64> = t.prompt_ids[start..start + take].to_vec();
+            if h > 0 {
+                if t.prompt_rows.len() != t.prompt_ids.len() * h {
+                    return Err(EngineError::Backend(format!(
+                        "packed slot {slot}: {} embedding floats for {} prompt tokens of {h}",
+                        t.prompt_rows.len(),
+                        t.prompt_ids.len()
+                    )));
+                }
+                rows = t.prompt_rows[start * h..(start + take) * h].to_vec();
+            }
             let base = self.kv.position(slot);
             let positions: Vec<i64> = (0..take).map(|i| (base + i) as i64).collect();
             let finished = start + take >= t.prompt_ids.len();
@@ -245,13 +296,30 @@ impl PackedState {
         if plan.is_empty() {
             return Ok(None);
         }
+        if h > 0 && matches!(kind, PackedStepKind::Decode { .. }) {
+            let embed = embed.ok_or_else(|| {
+                EngineError::Backend("packed vision stage stepped without its embedder".into())
+            })?;
+            rows = embed(&ids)?;
+            if rows.len() != ids.len() * h {
+                return Err(EngineError::Backend(format!(
+                    "embedder returned {} floats for {} tokens of {h}",
+                    rows.len(),
+                    ids.len()
+                )));
+            }
+        }
         let reuse: Vec<usize> = plan
             .rows
             .iter()
             .map(|r| r.map(|pr| self.kv.shared_use(pr.slot)).unwrap_or(0))
             .collect();
-        let (odt, oshape, obytes) =
-            self.run_plan(&plan, PackedPrimary::Ids(&ids), &positions, &reuse)?;
+        let primary = if h > 0 {
+            PackedPrimary::Embeds(&rows, h)
+        } else {
+            PackedPrimary::Ids(&ids)
+        };
+        let (odt, oshape, obytes) = self.run_plan(&plan, primary, &positions, &reuse)?;
         if let PackedStepKind::Prefill { slot, .. } = &kind {
             if let Some(t) = self.slots[*slot].as_mut() {
                 t.prompt_fed += plan.active_rows().count();
@@ -299,7 +367,7 @@ impl PackedState {
             .collect();
         let ids: Vec<i64> = match primary {
             PackedPrimary::Ids(v) => v.to_vec(),
-            PackedPrimary::Hidden(_, _) => Vec::new(),
+            PackedPrimary::Hidden(_, _) | PackedPrimary::Embeds(_, _) => Vec::new(),
         };
 
         // ---- feed ----
@@ -341,6 +409,18 @@ impl PackedState {
                         &[1, s, hidden_size],
                         &bytes,
                     )
+                    .map_err(crate::runtime::map_ov_err)?;
+            }
+            PackedPrimary::Embeds(rows, hidden_size) => {
+                // Same layout as Hidden, kept f32 like every other
+                // `inputs_embeds` feed.
+                let mut bytes = vec![0u8; s * hidden_size * 4];
+                let n = (rows.len() / hidden_size).min(s) * hidden_size;
+                for (dst, v) in bytes.chunks_exact_mut(4).zip(&rows[..n]) {
+                    dst.copy_from_slice(&v.to_le_bytes());
+                }
+                self.runtime
+                    .set_input(&self.ids_in, ShimDType::F32, &[1, s, hidden_size], &bytes)
                     .map_err(crate::runtime::map_ov_err)?;
             }
         }

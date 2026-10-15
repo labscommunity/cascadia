@@ -1191,9 +1191,11 @@ struct StaticKv {
     kv_dtype: ShimDType,
     /// Resolved primary input port names (cached at build so the per-token
     /// decode loop does no HashMap lookups / string allocs). `ids_in` is set
-    /// for the embed stage, `hidden_in` for relay/head stages.
+    /// for the embed stage, `hidden_in` for relay/head stages, `embeds_in`
+    /// for a vision tree's stage 0 (rank 0 embeds the prompt itself).
     ids_in: Option<String>,
     hidden_in: Option<String>,
+    embeds_in: Option<String>,
     attn_in: String,
     pos_in: String,
     layers: Vec<StaticKvLayer>,
@@ -1373,12 +1375,25 @@ fn chunk_take(c: usize, remaining: usize, position: usize, past_len: usize) -> u
 }
 
 /// Primary input of one prefill chunk: prompt ids on the embed stage, hidden
-/// rows (`hid` floats per token, row-major) on relay/head stages. Conversion
+/// rows (`hid` floats per token, row-major) on relay/head stages, embedding
+/// rows on a vision tree's stage 0. Conversion
 /// into the IR's dtype happens directly inside the reusable `primary_buf`.
 #[derive(Clone, Copy)]
 enum ChunkInput<'a> {
     Ids(&'a [i64]),
     Hidden(&'a [f32], usize),
+    /// A vision tree's stage 0: rank 0's embedding rows (`inputs_embeds`,
+    /// fed as f32 like the stateful path).
+    Embeds(&'a [f32], usize),
+}
+
+/// Name of a static IR's primary input kind, for error messages.
+fn primary_kind(ids: bool, embeds: bool) -> &'static str {
+    match (ids, embeds) {
+        (true, _) => "input_ids",
+        (false, true) => "inputs_embeds",
+        (false, false) => "hidden_states",
+    }
 }
 
 /// Byte width of a float output element, for prefix-slicing converted rows.
@@ -1414,6 +1429,7 @@ struct StaticPrefill {
     context: usize,
     ids_in: Option<String>,
     hidden_in: Option<String>,
+    embeds_in: Option<String>,
     attn_in: String,
     pos_in: String,
     layers: Vec<StaticKvLayer>,
@@ -1524,8 +1540,10 @@ fn vision_family(v: &PipelineVision, export_version: Option<&str>) -> EngineResu
 /// embeds the prompt and splices image rows). On a Gemma 4 tree every stage
 /// also takes `token_type_ids` (1 on image soft tokens: sliding-window layers
 /// attend bidirectionally inside each image), so that row rides the wire as a
-/// third frame `[lead] [hidden] [types]`. Served on the stateful path only;
-/// the static, chunked-prefill and packed paths are refused at load.
+/// third frame `[lead] [hidden] [types]`. Causal families (Pixtral) are also
+/// served on the static and packed paths (trees from
+/// `tools/vlm_surgery/static_variant.py`, stage 0 fed embedding rows);
+/// `token_type_ids` trees are refused there at load.
 struct VisionTree {
     /// Rank 0 only.
     first: Option<VisionFirst>,
@@ -1749,6 +1767,10 @@ pub struct OvRuntimeEngine {
     /// node id, not the canonical name). Empty for v3 IRs.
     canonical_inputs: std::collections::HashMap<String, String>,
     pending: Vec<GenerationTask>,
+    /// Packed vision tree: each pending image task's expanded prompt ids and
+    /// image rows, encoded at `submit` so an over-region prompt is refused
+    /// there (413) like a long text prompt; taken at admission.
+    packed_images: std::collections::HashMap<TaskId, (Vec<i64>, Vec<Vec<f32>>)>,
     active: Option<ActiveTask>,
     /// `--packed-slots`: multi-slot packed decode state (own compiled variant,
     /// per-slot KV regions, slot table). Mutually exclusive with `static_kv`
@@ -1927,16 +1949,10 @@ impl OvRuntimeEngine {
         Ok(())
     }
 
-    /// A vision tree whose stages take `token_type_ids` (the third frame).
-    fn vision_token_types(&self) -> bool {
-        self.vision.as_ref().is_some_and(|v| v.token_types)
-    }
-
-    /// Vision tree, rank 0: embed `input_ids` through the text embedding
-    /// table, splice the active task's image rows into a prefill, and set
-    /// stage 0's `inputs_embeds` and `token_type_ids` (kept in `step_types`
-    /// for the wire).
-    fn feed_vision_embeds(&mut self, input_ids: &[i64]) -> EngineResult<()> {
+    /// Vision tree, rank 0: row-major `[input_ids.len(), hidden]` embeddings
+    /// of `input_ids` with the active task's image rows spliced in (taken:
+    /// the first call of a task's prefill consumes them), and `hidden`.
+    fn vision_rows(&mut self, input_ids: &[i64]) -> EngineResult<(Vec<f32>, usize)> {
         let rows = self
             .active
             .as_mut()
@@ -1954,6 +1970,50 @@ impl OvRuntimeEngine {
             crate::gemma4_vision::splice_images(&mut embeds, hidden, input_ids, image, &refs)
                 .map_err(EngineError::Backend)?;
         }
+        Ok((embeds, hidden))
+    }
+
+    fn vision_image_token(&self) -> EngineResult<i64> {
+        self.vision
+            .as_ref()
+            .and_then(|v| v.first.as_ref())
+            .map(|f| f.frontend.image_token())
+            .ok_or_else(|| EngineError::Backend("vision tree: rank 0 lacks its encoder".into()))
+    }
+
+    /// A static vision tree's stage 0: the IR takes `inputs_embeds`, so rank
+    /// 0 embeds every prompt and generated token itself.
+    fn static_takes_embeds(&self) -> bool {
+        self.static_kv
+            .as_ref()
+            .is_some_and(|sk| sk.embeds_in.is_some())
+    }
+
+    /// One static seq=1 step on an embedding row (`hidden` floats).
+    fn run_first_row(
+        &mut self,
+        row: &[f32],
+        hidden: usize,
+        position: i64,
+    ) -> EngineResult<(Vec<f32>, Vec<usize>)> {
+        let bytes: Vec<u8> = row.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let (dtype, shape, out) =
+            self.static_infer(false, ShimDType::F32, &[1, 1, hidden], &bytes, position)?;
+        Ok((bytes_to_f32(dtype, &out)?, shape))
+    }
+
+    /// A vision tree whose stages take `token_type_ids` (the third frame).
+    fn vision_token_types(&self) -> bool {
+        self.vision.as_ref().is_some_and(|v| v.token_types)
+    }
+
+    /// Vision tree, rank 0: embed `input_ids` through the text embedding
+    /// table, splice the active task's image rows into a prefill, and set
+    /// stage 0's `inputs_embeds` and `token_type_ids` (kept in `step_types`
+    /// for the wire).
+    fn feed_vision_embeds(&mut self, input_ids: &[i64]) -> EngineResult<()> {
+        let (embeds, hidden) = self.vision_rows(input_ids)?;
+        let image = self.vision_image_token()?;
         let token_types = self.vision_token_types();
         let in_embeds = self
             .input_named("inputs_embeds")
@@ -2111,6 +2171,10 @@ impl OvRuntimeEngine {
                     "static shard processes one token per step, got {}",
                     input_ids.len()
                 )));
+            }
+            if self.static_takes_embeds() {
+                let (row, hidden) = self.vision_rows(input_ids)?;
+                return self.run_first_row(&row, hidden, position);
             }
             let (dtype, shape, bytes) = self.static_infer(
                 false,
@@ -2272,14 +2336,16 @@ impl OvRuntimeEngine {
     /// whose logits nothing reads.
     fn run_first_chunk(
         &mut self,
-        chunk: &[i64],
+        chunk: ChunkInput<'_>,
         position: i64,
         want_output: bool,
     ) -> EngineResult<(Vec<f32>, Vec<usize>)> {
-        let take = chunk.len();
+        let take = match chunk {
+            ChunkInput::Ids(ids) => ids.len(),
+            ChunkInput::Hidden(rows, h) | ChunkInput::Embeds(rows, h) => rows.len() / h.max(1),
+        };
         debug!(take, position, "first-stage chunk: infer start");
-        let (dtype, shape, bytes) =
-            self.static_infer_chunk(ChunkInput::Ids(chunk), take, position, want_output)?;
+        let (dtype, shape, bytes) = self.static_infer_chunk(chunk, take, position, want_output)?;
         debug!(take, position, "first-stage chunk: infer+absorb done");
         if !want_output {
             return Ok((Vec::new(), Vec::new()));
@@ -2770,6 +2836,7 @@ impl OvRuntimeEngine {
                 return Ok(Vec::new());
             }
             let msg = packed_abort_message(&fatal);
+            self.packed_images.clear();
             let out = self
                 .pending
                 .drain(..)
@@ -2817,20 +2884,72 @@ impl OvRuntimeEngine {
                 EngineError::Backend(format!("tokenizer encode: {e}"))
                     .for_task(task.task_id.clone())
             })?;
-            let prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
+            let mut prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
             if prompt_ids.is_empty() {
                 return Err(
                     EngineError::Backend("empty prompt: no tokens to prefill".into())
                         .for_task(task.task_id),
                 );
             }
+            // Vision tree: expand and encode the images, then embed the whole
+            // prompt with their rows spliced in. Prefix sharing stops at the
+            // first image token (`admit`).
+            let mut prompt_rows = Vec::new();
+            let mut shareable = prompt_ids.len();
+            if let Some(first) = self.vision.as_mut().and_then(|v| v.first.as_mut()) {
+                let mut image_rows = Vec::new();
+                if !task.media.is_empty() {
+                    // Encoded and length-checked at submit.
+                    let Some((ids, rows)) = self.packed_images.remove(&task.task_id) else {
+                        let id = task.task_id.clone();
+                        out.push((
+                            id.clone(),
+                            Chunk::error(id, "image rows missing at admission"),
+                        ));
+                        continue;
+                    };
+                    prompt_ids = ids;
+                    image_rows = rows;
+                }
+                let image = first.frontend.image_token();
+                shareable = prompt_ids
+                    .iter()
+                    .position(|&t| t == image)
+                    .unwrap_or(prompt_ids.len());
+                let embedded = first.embed(&prompt_ids).and_then(|(mut rows, hidden)| {
+                    if !image_rows.is_empty() {
+                        let refs: Vec<&[f32]> = image_rows.iter().map(Vec::as_slice).collect();
+                        crate::gemma4_vision::splice_images(
+                            &mut rows,
+                            hidden,
+                            &prompt_ids,
+                            image,
+                            &refs,
+                        )
+                        .map_err(EngineError::Backend)?;
+                    }
+                    Ok(rows)
+                });
+                match embedded {
+                    Ok(rows) => prompt_rows = rows,
+                    Err(e) => return Err(e.for_task(task.task_id)),
+                }
+            }
+            let (id, prompt_tokens, images) =
+                (task.task_id.clone(), prompt_ids.len(), task.media.len());
+            let shared =
+                self.packed
+                    .as_mut()
+                    .unwrap()
+                    .admit(slot, task, prompt_ids, prompt_rows, shareable);
             info!(
-                task = %task.task_id,
+                task = %id,
                 slot,
-                prompt_tokens = prompt_ids.len(),
+                prompt_tokens,
+                images,
+                shared_prefix = shared,
                 "task admitted to packed slot"
             );
-            self.packed.as_mut().unwrap().admit(slot, task, prompt_ids);
         }
 
         // Keep inferring until this call produces at least one chunk. A prompt
@@ -2846,7 +2965,17 @@ impl OvRuntimeEngine {
             // gets its own attributed error and every slot is retired. A
             // bare `?` would kill whichever stream happened to be polling
             // and leave the other slots wedged-active forever.
-            let stepped = match self.packed.as_mut().unwrap().step() {
+            // A vision tree's rank 0 embeds the sampled tokens itself.
+            let packed = self.packed.as_mut().unwrap();
+            let first = self.vision.as_mut().and_then(|v| v.first.as_mut());
+            let stepped = match first {
+                Some(first) => {
+                    let mut embed = |ids: &[i64]| first.embed(ids).map(|(rows, _)| rows);
+                    packed.step(Some(&mut embed))
+                }
+                None => packed.step(None),
+            };
+            let stepped = match stepped {
                 Ok(s) => s,
                 Err(e) => return self.abort_packed_batch(e, out),
             };
@@ -3321,6 +3450,13 @@ impl OvRuntimeEngine {
                     }
                 }
             }
+            // A vision tree's stage 0 takes embeddings: embed the whole
+            // prompt once (image rows spliced in) and feed it row by row.
+            let vrows = if self.static_takes_embeds() {
+                Some(self.vision_rows(&tokens)?)
+            } else {
+                None
+            };
             let nt = if prefill && self.prefill.is_some() {
                 // Chunked prefill: up to C prompt tokens per inference
                 // instead of one — stage weights stream from DRAM once per
@@ -3352,11 +3488,13 @@ impl OvRuntimeEngine {
                         // Single-stage: nothing reads a non-final chunk's
                         // logits — skip the [1,C,vocab] copy + convert.
                         let want_output = !single_stage || is_final_chunk;
-                        let (out, shape) = self.run_first_chunk(
-                            &tokens[idx..idx + take],
-                            chunk_start,
-                            want_output,
-                        )?;
+                        let input = match &vrows {
+                            Some((rows, h)) => {
+                                ChunkInput::Embeds(&rows[idx * h..(idx + take) * h], *h)
+                            }
+                            None => ChunkInput::Ids(&tokens[idx..idx + take]),
+                        };
+                        let (out, shape) = self.run_first_chunk(input, chunk_start, want_output)?;
                         let alpha = ts.elapsed();
                         self.position += take as i64;
                         idx += take;
@@ -3378,7 +3516,12 @@ impl OvRuntimeEngine {
                         // Window cap (or a 1-token remainder): one seq=1 step
                         // through the decode model — the exact sliding-window
                         // semantics for over-window rows.
-                        let (out, shape) = self.run_first(&[tokens[idx]], chunk_start)?;
+                        let (out, shape) = match &vrows {
+                            Some((rows, h)) => {
+                                self.run_first_row(&rows[idx * h..(idx + 1) * h], *h, chunk_start)?
+                            }
+                            None => self.run_first(&[tokens[idx]], chunk_start)?,
+                        };
                         let alpha = ts.elapsed();
                         self.position += 1;
                         idx += 1;
@@ -3395,10 +3538,15 @@ impl OvRuntimeEngine {
                 nt
             } else {
                 let mut nt = 0i32;
-                for &t in &tokens {
+                for (i, &t) in tokens.iter().enumerate() {
                     let position = self.position;
                     let ts = std::time::Instant::now();
-                    let (out, shape) = self.run_first(&[t], position)?;
+                    let (out, shape) = match &vrows {
+                        Some((rows, h)) => {
+                            self.run_first_row(&rows[i * h..(i + 1) * h], *h, position)?
+                        }
+                        None => self.run_first(&[t], position)?,
+                    };
                     let alpha = ts.elapsed();
                     self.position += 1;
                     // Static prefill round-trips per prompt token — each reply
@@ -3669,7 +3817,7 @@ impl OvRuntimeEngine {
             let in_main = if use_hidden {
                 sk.hidden_in.as_deref()
             } else {
-                sk.ids_in.as_deref()
+                sk.ids_in.as_deref().or(sk.embeds_in.as_deref())
             }
             .ok_or_else(|| EngineError::Backend("static IR missing primary input".into()))?;
             self.runtime
@@ -3873,6 +4021,19 @@ impl OvRuntimeEngine {
                 pf.primary_buf.resize(pf.seq * hid * 2, 0);
                 pf.hidden_in.as_deref()
             }
+            ChunkInput::Embeds(rows, hid) => {
+                if hid == 0 || rows.len() != real * hid {
+                    return Err(EngineError::Backend(format!(
+                        "chunk embeddings len {} != {real} rows of {hid}",
+                        rows.len()
+                    )));
+                }
+                for v in rows {
+                    pf.primary_buf.extend_from_slice(&v.to_le_bytes());
+                }
+                pf.primary_buf.resize(pf.seq * hid * 4, 0);
+                pf.embeds_in.as_deref()
+            }
         }
         .ok_or_else(|| EngineError::Backend("prefill IR missing primary input".into()))?;
 
@@ -3889,6 +4050,9 @@ impl OvRuntimeEngine {
                 .map_err(map_ov_err)?,
             ChunkInput::Hidden(_, hid) => prt
                 .set_input(in_main, ShimDType::F16, &[1, pf.seq, hid], &pf.primary_buf)
+                .map_err(map_ov_err)?,
+            ChunkInput::Embeds(_, hid) => prt
+                .set_input(in_main, ShimDType::F32, &[1, pf.seq, hid], &pf.primary_buf)
                 .map_err(map_ov_err)?,
         }
         prt.set_input(
@@ -4189,10 +4353,17 @@ impl Engine for OvRuntimeEngine {
                     // Ensure covers a future re-warm with --park-prefill:
                     // today warmup precedes any park, but that ordering is
                     // an invariant nothing else enforces.
-                    if let Err(e) = self
-                        .ensure_prefill_loaded()
-                        .and_then(|_| self.run_first_chunk(warm, 0, true).map(|_| ()))
-                    {
+                    let warm_chunk = |s: &mut Self| -> EngineResult<()> {
+                        s.ensure_prefill_loaded()?;
+                        if s.static_takes_embeds() {
+                            let (rows, h) = s.vision_rows(warm)?;
+                            s.run_first_chunk(ChunkInput::Embeds(&rows, h), 0, true)?;
+                        } else {
+                            s.run_first_chunk(ChunkInput::Ids(warm), 0, true)?;
+                        }
+                        Ok(())
+                    };
+                    if let Err(e) = warm_chunk(self) {
                         warn!(error = %e, "ov-runtime warmup (prefill model) failed");
                     }
                 }
@@ -4261,15 +4432,33 @@ impl Engine for OvRuntimeEngine {
         // would receive a non-standard error frame instead.
         if let Some(packed) = self.packed.as_ref() {
             if let Some(tok) = self.tokenizer.as_ref() {
-                let n = tok
+                let mut ids: Vec<i64> = tok
                     .encode(task.prompt.clone(), false)
                     .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?
                     .get_ids()
-                    .len();
-                if let Some(msg) = packed_prompt_too_long(n, packed.kv.region) {
-                    warn!(task = %task.task_id, prompt_tokens = n,
+                    .iter()
+                    .map(|&u| u as i64)
+                    .collect();
+                // A vision tree's images expand the prompt: encode them now so
+                // the region check sees the real length.
+                let mut images = None;
+                if !task.media.is_empty() {
+                    if let Some(first) = self.vision.as_mut().and_then(|v| v.first.as_mut()) {
+                        let (expanded, rows) = first
+                            .frontend
+                            .prepare(&task.media, &ids)
+                            .map_err(EngineError::UnsupportedInput)?;
+                        ids = expanded;
+                        images = Some(rows);
+                    }
+                }
+                if let Some(msg) = packed_prompt_too_long(ids.len(), packed.kv.region) {
+                    warn!(task = %task.task_id, prompt_tokens = ids.len(),
                           region = packed.kv.region, "refusing over-region prompt");
                     return Err(EngineError::PromptTooLong(msg));
+                }
+                if let Some(rows) = images {
+                    self.packed_images.insert(task.task_id.clone(), (ids, rows));
                 }
             }
         }
@@ -4314,6 +4503,7 @@ impl Engine for OvRuntimeEngine {
 
     fn cancel(&mut self, task_id: &TaskId) {
         self.pending.retain(|t| t.task_id != *task_id);
+        self.packed_images.remove(task_id);
         // Packed path: drop just this request's slot. Its KV region is cleared
         // and returned to the free pool immediately, so a disconnecting client
         // frees capacity for the next admission without disturbing the other
@@ -5587,12 +5777,11 @@ impl Builder for OvRuntimeBuilder {
         if let Some(v) = pipeline_cfg.vision.as_ref() {
             let family = vision_family(v, pipeline_cfg.export_version.as_deref())?;
             let token_types = v.token_type_ids.unwrap_or(family == VisionFamily::Gemma4);
-            if !stage_cfg.stateful || self.packed_slots > 0 {
-                return Err(EngineError::InvalidConfig(
-                    "a vision tree is served on the stateful path only \
-                     (no static/NPU shards, no --packed-slots)"
-                        .into(),
-                ));
+            if !stage_cfg.stateful && token_types {
+                return Err(EngineError::InvalidConfig(format!(
+                    "a {family:?} vision tree attends bidirectionally inside each image \
+                     (token_type_ids); the static path cannot, serve the stateful tree"
+                )));
             }
             let first = if is_first {
                 let f = VisionFirst::load(&self.pipeline_dir, v, family)?;
@@ -5673,9 +5862,10 @@ impl Builder for OvRuntimeBuilder {
                 })?;
             let ids_in = canonical_inputs.get("input_ids").cloned();
             let hidden_in = canonical_inputs.get("hidden_states").cloned();
-            if ids_in.is_none() && hidden_in.is_none() {
+            let embeds_in = canonical_inputs.get("inputs_embeds").cloned();
+            if ids_in.is_none() && hidden_in.is_none() && embeds_in.is_none() {
                 return Err(EngineError::Backend(
-                    "static IR has neither input_ids nor hidden_states input".into(),
+                    "static IR has none of input_ids / hidden_states / inputs_embeds".into(),
                 ));
             }
             Some(StaticKv {
@@ -5688,6 +5878,7 @@ impl Builder for OvRuntimeBuilder {
                 kv_dtype,
                 ids_in,
                 hidden_in,
+                embeds_in,
                 attn_in,
                 pos_in,
                 layers,
@@ -5738,27 +5929,21 @@ impl Builder for OvRuntimeBuilder {
                 })?;
                 let ids_in = pcanon.get("input_ids").cloned();
                 let hidden_in = pcanon.get("hidden_states").cloned();
-                if ids_in.is_none() && hidden_in.is_none() {
+                let embeds_in = pcanon.get("inputs_embeds").cloned();
+                if ids_in.is_none() && hidden_in.is_none() && embeds_in.is_none() {
                     return Err(EngineError::Backend(
-                        "prefill IR has neither input_ids nor hidden_states input".into(),
+                        "prefill IR has none of input_ids / hidden_states / inputs_embeds".into(),
                     ));
                 }
                 if ids_in.is_some() != sk.ids_in.is_some()
                     || hidden_in.is_some() != sk.hidden_in.is_some()
+                    || embeds_in.is_some() != sk.embeds_in.is_some()
                 {
                     return Err(EngineError::Backend(format!(
                         "prefill/decode variants disagree on the primary input kind \
                          (decode: {}, prefill: {}) — the two IRs are not siblings of one export",
-                        if sk.ids_in.is_some() {
-                            "input_ids"
-                        } else {
-                            "hidden_states"
-                        },
-                        if ids_in.is_some() {
-                            "input_ids"
-                        } else {
-                            "hidden_states"
-                        },
+                        primary_kind(sk.ids_in.is_some(), sk.embeds_in.is_some()),
+                        primary_kind(ids_in.is_some(), embeds_in.is_some()),
                     )));
                 }
                 Some(StaticPrefill {
@@ -5767,6 +5952,7 @@ impl Builder for OvRuntimeBuilder {
                     context: pctx as usize,
                     ids_in,
                     hidden_in,
+                    embeds_in,
                     attn_in,
                     pos_in,
                     layers: players,
@@ -5799,11 +5985,22 @@ impl Builder for OvRuntimeBuilder {
                     })
                     .collect::<Vec<_>>();
                 let pcanon = resolve_canonical_inputs(&prt)?;
-                let ids_in = pcanon.get("input_ids").cloned().unwrap_or_default();
+                // A vision tree's stage 0 takes `inputs_embeds` where an
+                // id-fed stage takes `input_ids`; both ride `ids_in`.
+                let embeds_in = pcanon.get("inputs_embeds").cloned();
+                let embed_hidden = if embeds_in.is_some() {
+                    self.hidden_size
+                } else {
+                    0
+                };
+                let ids_in = embeds_in
+                    .or_else(|| pcanon.get("input_ids").cloned())
+                    .unwrap_or_default();
                 let hidden_in = pcanon.get("hidden_states").cloned().unwrap_or_default();
                 if ids_in.is_empty() && hidden_in.is_empty() {
                     return Err(EngineError::Backend(
-                        "packed variant has neither input_ids nor hidden_states".into(),
+                        "packed variant has none of input_ids / inputs_embeds / hidden_states"
+                            .into(),
                     ));
                 }
                 let pos_in = pcanon.get("position_ids").cloned().ok_or_else(|| {
@@ -5846,7 +6043,15 @@ impl Builder for OvRuntimeBuilder {
                     "packed multi-slot decode active"
                 );
                 Some(crate::packed_exec::PackedState::new(
-                    prt, kv, players, ids_in, hidden_in, mask_in, pos_in, mask_dtype,
+                    prt,
+                    kv,
+                    players,
+                    ids_in,
+                    hidden_in,
+                    embed_hidden,
+                    mask_in,
+                    pos_in,
+                    mask_dtype,
                 ))
             }
         };
@@ -5897,6 +6102,7 @@ impl Builder for OvRuntimeBuilder {
             input_names: self.input_names,
             canonical_inputs,
             pending: Vec::new(),
+            packed_images: std::collections::HashMap::new(),
             active: None,
             static_kv,
             prefill,
@@ -6044,6 +6250,7 @@ mod tests {
             kv_dtype: ShimDType::F16,
             ids_in: Some("input_ids".into()),
             hidden_in: None,
+            embeds_in: None,
             attn_in: "attention_mask".into(),
             pos_in: "position_ids".into(),
             layers: (0..layers)
