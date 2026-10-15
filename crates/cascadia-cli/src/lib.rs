@@ -2637,8 +2637,21 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         let has_vision = std::path::Path::new(&args.model)
             .join("openvino_vision_embeddings_model.xml")
             .exists();
+        // GenAI mishandles some families' images (Pixtral): text only there.
+        let genai_gap = matches!(args.engine, EngineKind::OvGenai)
+            .then(|| {
+                cascadia_engine_openvino::genai::unsupported_vision(std::path::Path::new(
+                    &args.model,
+                ))
+            })
+            .flatten();
+        if let (true, Some(why)) = (has_vision, genai_gap.as_ref()) {
+            warn!(reason = %why, "ov-genai: serving this VLM export text only");
+        }
         let media_kind = match args.engine {
-            EngineKind::OvGenai if has_vision => Some(cascadia_api::MediaConfig::ov_genai()),
+            EngineKind::OvGenai if has_vision && genai_gap.is_none() => {
+                Some(cascadia_api::MediaConfig::ov_genai())
+            }
             EngineKind::Qwen36Moe if has_vision => Some(cascadia_api::MediaConfig::qwen35_native()),
             // ov-runtime (Gemma 4 surgery trees) and gemma4 (gemma4_cached E2B/E4B
             // trees from export_gemma4.py --vision) both carry a `vision` block.
