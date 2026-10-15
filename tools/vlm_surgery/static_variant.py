@@ -24,8 +24,13 @@ last-position logits slice is dropped so a prefill chunk returns every row
 does the same job for whole optimum exports but rejects cut stages (their
 beam_idx Gathers do not match its pattern), hence this tool.
 
-Only uniform-KV text towers fit the ring (one kv_heads/head_dim for every
-layer); Gemma 4's mixed sliding/global head sizes are refused.
+Layers may differ in KV geometry (Gemma 4: 8x256 sliding, 2x512 global);
+stage_config.json then lists `kv_layers` ([kv_heads, head_dim] per layer) for
+the runtime's ring. Gemma 4 trees keep `token_type_ids` (bidirectional
+attention inside an image), so they need `--prefill-seq` at least one image
+wide, and context + prefill-seq within the sliding window: the IR masks the
+window by ring index, which runs ahead of the real distance across the
+ring's padding.
 
 Usage:
   python static_variant.py --tree <stateful tree> --output-dir <static tree> \
@@ -91,8 +96,8 @@ def unslice_logits(model: ov.Model) -> bool:
     return changed
 
 
-def make_stateless(model: ov.Model, has_head: bool) -> tuple[int, int, int]:
-    """Rewrite `model` in place; returns (layers, kv_heads, head_dim)."""
+def make_stateless(model: ov.Model, has_head: bool) -> list[tuple[int, int]]:
+    """Rewrite `model` in place; returns each layer's (kv_heads, head_dim)."""
     fold_beam_idx(model)
     reads = {n.get_variable_id(): n for n in model.get_ordered_ops()
              if n.get_type_name() == "ReadValue"}
@@ -102,7 +107,7 @@ def make_stateless(model: ov.Model, has_head: bool) -> tuple[int, int, int]:
     order = kv_order(list(reads))
     if len(order) % 2:
         raise SystemExit(f"odd number of KV variables ({len(order)})")
-    dims = set()
+    geom = []
     params, results = [], []
     for j, vid in enumerate(order):
         local, kind = j // 2, KV_RE.match(vid).group(2)
@@ -112,7 +117,11 @@ def make_stateless(model: ov.Model, has_head: bool) -> tuple[int, int, int]:
         shape = rv.get_output_partial_shape(0)
         if shape.rank.get_length() != 4 or not shape[1].is_static or not shape[3].is_static:
             raise SystemExit(f"{vid}: KV shape {shape} is not [batch, kv_heads, seq, head_dim]")
-        dims.add((shape[1].get_length(), shape[3].get_length()))
+        g = (shape[1].get_length(), shape[3].get_length())
+        if kind == "key":
+            geom.append(g)
+        elif geom[-1] != g:
+            raise SystemExit(f"layer {local}: key {geom[-1]} and value {g} geometries differ")
         name = f"past_key_values.{local}.{kind}"
         p = ops.parameter([1, shape[1], -1, shape[3]], ov.Type.f16, name=name)
         p.output(0).set_names({name})
@@ -130,10 +139,6 @@ def make_stateless(model: ov.Model, has_head: bool) -> tuple[int, int, int]:
         model.remove_sink(a)
         params.append(p)
         results.append(r)
-    if len(dims) != 1:
-        raise SystemExit(
-            f"layers mix KV geometries {sorted(dims)} (kv_heads, head_dim); the static "
-            "ring needs one geometry for every layer")
     for v in list(model.get_variables()):
         model.remove_variable(v)
     model.add_parameters(params)
@@ -142,38 +147,46 @@ def make_stateless(model: ov.Model, has_head: bool) -> tuple[int, int, int]:
         unslice_logits(model)
     model.outputs[0].set_names({"logits" if has_head else "hidden_states"})
     model.validate_nodes_and_infer_types()
-    (kvh, hd), = dims
-    return len(order) // 2, kvh, hd
+    return geom
 
 
-def pin_shapes(model: ov.Model, seq: int, context: int) -> None:
-    """Make every input static for a `seq`-row query over `context` slots."""
-    past = context - seq
+def pin_shapes(model: ov.Model, seq: int, context: int, past: int | None = None) -> None:
+    """Make every input static for a `seq`-row query over `context` slots.
+    `seq == -1` leaves the query width (and so the mask length) dynamic over a
+    fixed `past`: one IR then serves seq=1 decode and wide prefill chunks."""
+    if seq != -1:
+        past = context - seq
     shapes = {}
+    canon = ("inputs_embeds", "hidden_states", "input_ids", "attention_mask",
+             "position_ids", "token_type_ids")
     for inp in model.inputs:
+        names = inp.get_names()
         name = inp.get_any_name()
+        # A port's canonical name may be an alias (the Gemma surgery's stage 0
+        # is `grafted_inputs_embeds`, aliased `inputs_embeds`); reshape keys
+        # take any of a port's names.
+        kind = next((c for c in canon if c in names), name)
         ps = inp.get_partial_shape()
-        if name in ("inputs_embeds", "hidden_states"):
+        if kind in ("inputs_embeds", "hidden_states"):
             shapes[name] = [1, seq, ps[2].get_length()]
-        elif name == "input_ids":
+        elif kind == "input_ids":
             shapes[name] = [1, seq]
-        elif name == "attention_mask":
-            shapes[name] = [1, context]
-        elif name == "position_ids":
+        elif kind == "attention_mask":
+            shapes[name] = [1, context if seq != -1 else -1]
+        elif kind == "position_ids":
             if ps.rank.get_length() != 2:
                 raise SystemExit(f"position_ids rank {ps.rank} (multi-axis rope) is not supported")
             shapes[name] = [1, seq]
         elif name.startswith("past_key_values."):
             shapes[name] = [1, ps[1].get_length(), past, ps[3].get_length()]
-        elif name == "token_type_ids":
-            raise SystemExit("token_type_ids stages (bidirectional image attention) "
-                             "cannot run on the static path")
+        elif kind == "token_type_ids":
+            shapes[name] = [1, seq]
         else:
             raise SystemExit(f"unexpected stage input {name!r}")
     model.reshape(shapes)
     bad = [f"{p.get_any_name()}{p.partial_shape}"
            for p in list(model.inputs) + list(model.outputs) if not p.partial_shape.is_static]
-    if bad:
+    if bad and seq != -1:
         raise SystemExit(f"reshape left dynamic dims: {bad}")
 
 
@@ -185,7 +198,8 @@ def copy_file(src: str, dst: str) -> None:
     shutil.copy2(src, dst)
 
 
-def convert_stage(tree: str, out: str, i: int, context: int, prefill_seq: int) -> None:
+def convert_stage(tree: str, out: str, i: int, context: int, prefill_seq: int,
+                  shared_prefill: bool = False) -> None:
     sdir, odir = os.path.join(tree, f"stage_{i}"), os.path.join(out, f"stage_{i}")
     with open(os.path.join(sdir, "stage_config.json")) as f:
         meta = json.load(f)
@@ -196,21 +210,35 @@ def convert_stage(tree: str, out: str, i: int, context: int, prefill_seq: int) -
     t0 = time.time()
     core = ov.Core()
     model = core.read_model(xml)
-    layers, kvh, hd = make_stateless(model, meta["has_head"])
-    pin_shapes(model, 1, context)
+    geom = make_stateless(model, meta["has_head"])
+    if shared_prefill:
+        # CPU/GPU: one IR with a dynamic query width serves decode and
+        # prefill chunks, so the weights are compiled once, not twice.
+        pin_shapes(model, -1, context, past=context - 1)
+    else:
+        pin_shapes(model, 1, context)
     ov.save_model(model, os.path.join(odir, "openvino_model.xml"), compress_to_fp16=False)
-    log(f"stage_{i}: {layers} layers, kv {kvh}x{hd}, decode IR saved ({time.time() - t0:.0f}s)")
+    kinds = sorted(set(geom))
+    log(f"stage_{i}: {len(geom)} layers, kv {kinds}, decode IR saved ({time.time() - t0:.0f}s)")
     meta.update({
         "stateful": False, "static_seq": 1, "static_context": context,
         "static_prefill_seq": None, "static_prefill_context": None,
-        "num_kv_heads": kvh, "head_dim": hd, "target": "npu",
+        # Uniform trees keep the scalar pair; mixed ones list every layer.
+        "num_kv_heads": geom[0][0], "head_dim": geom[0][1],
+        "kv_layers": [list(g) for g in geom] if len(kinds) > 1 else None,
+        "target": "npu",
         "static_from": "tools/vlm_surgery/static_variant.py",
     })
     prefill = os.path.join(odir, "openvino_prefill_model.xml")
     for stale in (prefill, prefill[:-4] + ".bin"):
         if os.path.exists(stale):
             os.remove(stale)
-    if prefill_seq > 1:
+    if prefill_seq > 1 and shared_prefill:
+        meta.update({"static_prefill_seq": prefill_seq,
+                     "static_prefill_context": context - 1 + prefill_seq,
+                     "prefill_shares_decode": True})
+        log(f"stage_{i}: the decode IR also serves prefill chunks of {prefill_seq}")
+    elif prefill_seq > 1:
         # Same contract as export_shards: the prefill window's past length
         # equals the decode model's, so both share one host-side ring.
         pctx = context - 1 + prefill_seq
@@ -248,6 +276,9 @@ def main() -> None:
                     help="static context (KV ring is context-1 tokens)")
     ap.add_argument("--prefill-seq", type=int, default=0,
                     help="also write a chunked-prefill IR with this many rows")
+    ap.add_argument("--shared-prefill", action="store_true",
+                    help="CPU/GPU: one IR with a dynamic query width serves both decode and "
+                         "prefill (weights compiled once); NPU needs the separate static IRs")
     ap.add_argument("--stage", type=int, default=None,
                     help="convert only this stage (a worker holding one stage)")
     args = ap.parse_args()
@@ -262,17 +293,26 @@ def main() -> None:
         pipeline = json.load(f)
     v = pipeline.get("vision") or {}
     # Gemma 4 trees default to token_type_ids when the block does not say.
-    if v.get("token_type_ids", v.get("family") == "gemma4"):
+    if v.get("token_type_ids", v.get("family") == "gemma4") and args.prefill_seq < 2:
         raise SystemExit(
             f"vision family {v.get('family')!r} attends bidirectionally inside images "
-            "(token_type_ids); the static path steps one token at a time and cannot")
+            "(token_type_ids): an image must sit whole in one inference, so pass "
+            "--prefill-seq at least one image wide (Gemma 4: 280)")
+    with open(os.path.join(args.tree, "config.json")) as f:
+        window = json.load(f).get("sliding_window")
+    if window and args.context + max(args.prefill_seq, 1) > window + 1:
+        raise SystemExit(
+            f"--context {args.context} + --prefill-seq {args.prefill_seq} exceeds the "
+            f"sliding window ({window}) + 1: the IR masks the window by ring index, so "
+            "a longer ring would cut sliding layers off from tokens inside their window")
     os.makedirs(args.output_dir, exist_ok=True)
     marker = os.path.join(args.output_dir, "pipeline_config.json")
     if os.path.exists(marker):
         os.remove(marker)
     stages = range(pipeline["num_stages"]) if args.stage is None else [args.stage]
     for i in stages:
-        convert_stage(args.tree, args.output_dir, i, args.context, args.prefill_seq)
+        convert_stage(args.tree, args.output_dir, i, args.context, args.prefill_seq,
+                      args.shared_prefill)
     copy_root(args.tree, args.output_dir)
     for s in pipeline["stages"]:
         s.update({"stateful": False, "static_seq": 1, "static_context": args.context})
