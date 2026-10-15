@@ -360,6 +360,66 @@ pub fn splice_images(
     Ok(())
 }
 
+/// Rank 0's image front end for a Gemma 4 tree: the vision encoder IR, its
+/// processor settings, and the token ids that frame an image. Shared by the
+/// `ov-runtime` vision trees and the `gemma4` engine's vision trees.
+pub struct ImageFrontend {
+    encoder: encoder::VisionEncoder,
+    pub preprocess: PreprocessConfig,
+    pub tokens: ImageTokens,
+}
+
+impl ImageFrontend {
+    /// Compile `openvino_vision_embeddings_model.xml` from `dir` on the CPU
+    /// and read the processor settings beside it.
+    pub fn load(dir: &Path, tokens: ImageTokens) -> Result<Self, String> {
+        let preprocess = PreprocessConfig::from_model_dir(dir)?;
+        let encoder = encoder::VisionEncoder::load(
+            dir,
+            "CPU",
+            &cascadia_ov_genai_shim::PluginConfig::new(),
+            preprocess.pooling_kernel_size,
+        )?;
+        Ok(Self {
+            encoder,
+            preprocess,
+            tokens,
+        })
+    }
+
+    /// Encode a task's images and expand the prompt's one image placeholder
+    /// per image into its framed soft-token run. Returns the expanded ids and
+    /// each image's embedding rows, in prompt order.
+    pub fn prepare(
+        &mut self,
+        media: &[cascadia_types::MediaInput],
+        prompt_ids: &[i64],
+    ) -> Result<(Vec<i64>, Vec<Vec<f32>>), String> {
+        let mut rows = Vec::with_capacity(media.len());
+        let mut counts = Vec::with_capacity(media.len());
+        for (i, m) in media.iter().enumerate() {
+            match m.kind {
+                cascadia_types::MediaKind::Image => {}
+                #[allow(unreachable_patterns)]
+                other => return Err(format!("media {i}: {other:?} is not supported")),
+            }
+            if m.num_frames != 1 || m.pixels.len() != m.expected_len() {
+                return Err(format!("image {i}: malformed pixel buffer"));
+            }
+            let p = preprocess(&m.pixels, m.width, m.height, &self.preprocess)
+                .map_err(|e| format!("image {i}: {e}"))?;
+            let (emb, _hidden) = self
+                .encoder
+                .encode(&p)
+                .map_err(|e| format!("image {i}: {e}"))?;
+            counts.push(p.soft_tokens(self.preprocess.pooling_kernel_size));
+            rows.push(emb);
+        }
+        let ids = expand_image_tokens(prompt_ids, &self.tokens, &counts)?;
+        Ok((ids, rows))
+    }
+}
+
 /// The language model's `token_type_ids` for a prompt: 1 on image soft
 /// tokens, 0 elsewhere. Sliding-window layers attend bidirectionally inside
 /// each run of 1s (one image), so a run must reach the model in one chunk.

@@ -60,6 +60,23 @@ struct PipelineConfig {
     num_layers: u32,
     #[serde(default)]
     num_kv_shared_layers: u32,
+    #[serde(default)]
+    hidden_size: usize,
+    /// `tools/export_gemma4.py --vision`: stage 0 takes `image_features`.
+    #[serde(default)]
+    vision: Option<G4Vision>,
+}
+
+/// The `vision` block of a gemma4_cached vision tree (E2B/E4B): stage 0
+/// splices `image_features` rows into its embedding at image tokens, and the
+/// tree root carries the vision encoder IR and processor configs for rank 0.
+#[derive(Debug, Deserialize)]
+struct G4Vision {
+    family: String,
+    image_token_id: i64,
+    boi_token_id: i64,
+    eoi_token_id: i64,
+    pad_token_id: i64,
 }
 
 fn default_true() -> bool {
@@ -421,6 +438,11 @@ fn decode_wire_position(t: &WireTensor) -> EngineResult<i64> {
 struct ActiveTask {
     task: GenerationTask,
     prompt_ids: Vec<i64>,
+    /// Vision trees: every image's rows, flattened in prompt order, and how
+    /// many rows the stage-0 feeds have consumed (each span takes the rows of
+    /// the image tokens it carries).
+    image_rows: Vec<f32>,
+    image_rows_fed: usize,
     generated: Vec<i32>,
     last_text: String,
     prefilled: bool,
@@ -513,6 +535,11 @@ fn final_chunk(
 
 pub struct Gemma4Engine {
     spec: ShardSpec,
+    /// Rank 0 of a vision tree: the image front end, the stage-0
+    /// `image_features` port, and the width of one row.
+    vision: Option<crate::gemma4_vision::ImageFrontend>,
+    image_features_in: Option<String>,
+    hidden_size: usize,
     /// Count of layers whose own KV lives entirely in stage_0 and is SHARED by later stages
     /// (Gemma 4 E2B/E4B KV-sharing). Own-KV layers are `[0, total_layers - num_kv_shared_layers)`.
     /// Zero for dense models (every stage bears its own KV).
@@ -595,8 +622,38 @@ impl Gemma4Engine {
         self.runtime
             .set_input(&in_pos, ShimDType::I64, &[1, seq_len], &i64_to_bytes(&pos))
             .map_err(map_ov_err)?;
+        if let Some(port) = self.image_features_in.clone() {
+            self.feed_image_features(&port, input_ids)?;
+        }
         self.feed_external_kv()?;
         Ok(())
+    }
+
+    /// Vision tree, stage 0: the rows of exactly the image tokens in this
+    /// span, in order; none on a text span or a decode step (the IR appends a
+    /// zero row so an empty input still gathers).
+    fn feed_image_features(&mut self, port: &str, input_ids: &[i64]) -> EngineResult<()> {
+        let image = self.vision.as_ref().map(|v| v.tokens.image);
+        let k = input_ids.iter().filter(|&&t| Some(t) == image).count();
+        let h = self.hidden_size;
+        let mut rows: Vec<f32> = Vec::new();
+        if k > 0 {
+            let a = self.active.as_mut().ok_or_else(|| {
+                EngineError::Backend("image tokens with no active task to splice".into())
+            })?;
+            let start = a.image_rows_fed * h;
+            let slice = a.image_rows.get(start..start + k * h).ok_or_else(|| {
+                EngineError::Backend(format!(
+                    "span carries {k} image tokens but only {} image rows remain",
+                    (a.image_rows.len() / h.max(1)).saturating_sub(a.image_rows_fed)
+                ))
+            })?;
+            rows.extend_from_slice(slice);
+            a.image_rows_fed += k;
+        }
+        self.runtime
+            .set_input(port, ShimDType::F32, &[k, h], &f32_to_bytes(&rows))
+            .map_err(map_ov_err)
     }
 
     fn build_feed_relay(
@@ -982,12 +1039,47 @@ impl Gemma4Engine {
                 }
             }
             cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
+            // Vision trees: encode the images and expand each placeholder into
+            // its framed soft-token run; stage 0 splices the rows.
+            let mut image_rows = Vec::new();
+            if !task.media.is_empty() {
+                let refuse = |reason: String| {
+                    warn!(task = %task.task_id, reason = %reason, "gemma4: image turn refused");
+                    let id = task.task_id.clone();
+                    vec![(id.clone(), Chunk::error(id, reason))]
+                };
+                if resume.is_some() {
+                    return Ok(refuse(
+                        "resume_unsupported: a resumed turn cannot carry images".into(),
+                    ));
+                }
+                let Some(frontend) = self.vision.as_mut() else {
+                    return Ok(refuse("this gemma4 tree takes no images".into()));
+                };
+                let started = std::time::Instant::now();
+                match frontend.prepare(&task.media, &prompt_ids) {
+                    Ok((ids, rows)) => {
+                        info!(
+                            task = %task.task_id,
+                            images = rows.len(),
+                            prompt = ids.len(),
+                            encode_ms = started.elapsed().as_millis() as u64,
+                            "gemma4: images encoded"
+                        );
+                        prompt_ids = ids;
+                        image_rows = rows.concat();
+                    }
+                    Err(e) => return Ok(refuse(e)),
+                }
+            }
             // Issue-34 warm-resume (gated, single-stage for now — multi-stage needs the RESTORE
             // broadcast). Restore a cached strict-prefix blob and prefill only the suffix; else cold.
             #[cfg_attr(not(feature = "kv_coord"), allow(unused_mut))]
             let mut warm_prefix = 0usize;
+            // Never for a turn with images: blobs are keyed on token ids, and
+            // every image of one size has the same ids.
             #[cfg(feature = "kv_coord")]
-            {
+            if image_rows.is_empty() {
                 let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
                 if let Some((blob, len, plane_pulled)) =
                     self.kv.take_warm(&task.tenant, &prompt_i32)
@@ -1108,6 +1200,8 @@ impl Gemma4Engine {
             self.active = Some(ActiveTask {
                 task,
                 prompt_ids,
+                image_rows,
+                image_rows_fed: 0,
                 generated: resume_seed,
                 last_text: resume_last_text,
                 prefilled: false,
@@ -1378,8 +1472,9 @@ impl Gemma4Engine {
             );
             // Issue-34: capture this stage's KV under (prompt + generated) for warm-pull. Best-effort
             // + gated. (Multi-stage CAPTURE broadcast added with the control protocol.)
+            // Not for a turn with images: its ids do not identify its KV.
             #[cfg(feature = "kv_coord")]
-            {
+            if active.task.media.is_empty() {
                 // Skip the resume seed: `prompt_ids` already carries those ids.
                 let full: Vec<i32> = active
                     .prompt_ids
@@ -1489,9 +1584,10 @@ impl Engine for Gemma4Engine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
-        // gemma4_cached trees embed ids inside stage 0 (no inputs_embeds),
-        // so images are refused; the ov-runtime surgery trees serve them.
-        cascadia_engine::refuse_media(&task, "gemma4")?;
+        // Only a vision tree (stage 0 takes image_features) serves images.
+        if self.vision.is_none() {
+            cascadia_engine::refuse_media(&task, "gemma4 (tree without a `vision` block)")?;
+        }
         if !self.spec.is_first_stage {
             warn!("gemma4 submit() ignored on non-first stage");
             return Err(EngineError::Backend(
@@ -1983,6 +2079,10 @@ pub struct Gemma4Builder {
     /// Global source-layer id for each `external_kv.{i}` this stage consumes, in
     /// port-index order (= external_shared_sources[i].src_global_layer).
     external_src_ids: Vec<i64>,
+    /// The tree has a `vision` block; rank 0 also holds its image front end.
+    vision_tree: bool,
+    vision_frontend: Option<crate::gemma4_vision::ImageFrontend>,
+    hidden_size: usize,
 }
 
 impl Gemma4Builder {
@@ -2228,6 +2328,32 @@ impl Builder for Gemma4Builder {
             }
         }
 
+        if let Some(v) = pipeline_cfg.vision.as_ref() {
+            if v.family != "gemma4" {
+                return Err(EngineError::InvalidConfig(format!(
+                    "pipeline_config.json `vision.family` is {:?}; the gemma4 engine serves \
+                     \"gemma4\" only",
+                    v.family
+                )));
+            }
+            self.vision_tree = true;
+            self.hidden_size = pipeline_cfg.hidden_size;
+            if stage_cfg.has_embed {
+                let tokens = crate::gemma4_vision::ImageTokens {
+                    image: v.image_token_id,
+                    boi: v.boi_token_id,
+                    eoi: v.eoi_token_id,
+                    pad: v.pad_token_id,
+                };
+                let f = crate::gemma4_vision::ImageFrontend::load(&self.pipeline_dir, tokens)
+                    .map_err(|e| EngineError::InvalidConfig(format!("vision tree: {e}")))?;
+                events.push(LoadProgress::message(format!(
+                    "vision tree: rank 0 encodes images ({} soft tokens per image at most)",
+                    f.preprocess.max_soft_tokens
+                )));
+                self.vision_frontend = Some(f);
+            }
+        }
         events.push(LoadProgress::ready());
         Ok(Box::pin(stream::iter(events)))
     }
@@ -2311,7 +2437,38 @@ impl Builder for Gemma4Builder {
             );
         }
 
+        // A vision tree's stage 0 must take `image_features`, and only a
+        // vision tree's may: rank 0 feeds it every step.
+        let image_features_in = runtime
+            .input_names()
+            .map_err(map_ov_err)?
+            .into_iter()
+            .find(|n| n == "image_features");
+        match (&self.vision_frontend, &image_features_in) {
+            (Some(_), None) => {
+                return Err(EngineError::InvalidConfig(
+                    "vision tree: stage 0 IR has no image_features input; re-export with \
+                     tools/export_gemma4.py --vision"
+                        .into(),
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(EngineError::InvalidConfig(
+                    "stage 0 takes image_features but pipeline_config.json has no `vision` block"
+                        .into(),
+                ))
+            }
+            _ => {}
+        }
+        if self.vision_tree && self.hidden_size == 0 {
+            return Err(EngineError::InvalidConfig(
+                "vision tree: pipeline_config.json lacks hidden_size".into(),
+            ));
+        }
         Ok(Box::new(Gemma4Engine {
+            vision: self.vision_frontend,
+            image_features_in,
+            hidden_size: self.hidden_size,
             spec,
             num_kv_shared_layers: self.num_kv_shared_layers,
             num_stages: self.total,

@@ -1520,9 +1520,7 @@ struct VisionTree {
 struct VisionFirst {
     embed: OvRuntime,
     embed_input: String,
-    encoder: crate::gemma4_vision::encoder::VisionEncoder,
-    preprocess: crate::gemma4_vision::PreprocessConfig,
-    tokens: crate::gemma4_vision::ImageTokens,
+    frontend: crate::gemma4_vision::ImageFrontend,
 }
 
 impl VisionFirst {
@@ -1540,15 +1538,6 @@ impl VisionFirst {
                 cfg.vision_embeddings
             )));
         }
-        let preprocess = crate::gemma4_vision::PreprocessConfig::from_model_dir(pipeline_dir)
-            .map_err(invalid)?;
-        let encoder = crate::gemma4_vision::encoder::VisionEncoder::load(
-            pipeline_dir,
-            "CPU",
-            &plugin,
-            preprocess.pooling_kernel_size,
-        )
-        .map_err(invalid)?;
         // The flattened config.json is text-only; the VLM original keeps the
         // image token ids.
         let vlm = pipeline_dir.join("config.vlm.json");
@@ -1570,19 +1559,19 @@ impl VisionFirst {
             eoi: id("eoi_token_id")?,
             pad: id("pad_token_id")?,
         };
+        let frontend =
+            crate::gemma4_vision::ImageFrontend::load(pipeline_dir, tokens).map_err(invalid)?;
         Ok(Self {
             embed,
             embed_input,
-            encoder,
-            preprocess,
-            tokens,
+            frontend,
         })
     }
 
     /// Row-major `[ids.len(), hidden]` text embeddings for `ids` (image soft
     /// tokens embed as pad), and `hidden`.
     fn embed(&mut self, ids: &[i64]) -> EngineResult<(Vec<f32>, usize)> {
-        let ids = crate::gemma4_vision::text_embedding_ids(ids, &self.tokens);
+        let ids = crate::gemma4_vision::text_embedding_ids(ids, &self.frontend.tokens);
         self.embed
             .set_input(
                 &self.embed_input,
@@ -1602,39 +1591,6 @@ impl VisionFirst {
             )));
         }
         Ok((v, hidden))
-    }
-
-    /// Encode a task's images and expand the prompt's one image placeholder
-    /// per image into its soft-token run. Returns the expanded ids and each
-    /// image's embedding rows.
-    fn prepare(
-        &mut self,
-        media: &[cascadia_types::MediaInput],
-        prompt_ids: &[i64],
-    ) -> Result<(Vec<i64>, Vec<Vec<f32>>), String> {
-        let mut rows = Vec::with_capacity(media.len());
-        let mut counts = Vec::with_capacity(media.len());
-        for (i, m) in media.iter().enumerate() {
-            match m.kind {
-                cascadia_types::MediaKind::Image => {}
-                #[allow(unreachable_patterns)]
-                other => return Err(format!("media {i}: {other:?} is not supported")),
-            }
-            if m.num_frames != 1 || m.pixels.len() != m.expected_len() {
-                return Err(format!("image {i}: malformed pixel buffer"));
-            }
-            let p =
-                crate::gemma4_vision::preprocess(&m.pixels, m.width, m.height, &self.preprocess)
-                    .map_err(|e| format!("image {i}: {e}"))?;
-            let (emb, _hidden) = self
-                .encoder
-                .encode(&p)
-                .map_err(|e| format!("image {i}: {e}"))?;
-            counts.push(p.soft_tokens(self.preprocess.pooling_kernel_size));
-            rows.push(emb);
-        }
-        let ids = crate::gemma4_vision::expand_image_tokens(prompt_ids, &self.tokens, &counts)?;
-        Ok((ids, rows))
     }
 }
 
@@ -1893,7 +1849,7 @@ impl OvRuntimeEngine {
             .as_mut()
             .and_then(|v| v.first.as_mut())
             .ok_or_else(|| EngineError::Backend("vision tree: rank 0 lacks its encoder".into()))?;
-        let image = first.tokens.image;
+        let image = first.frontend.tokens.image;
         let (mut embeds, hidden) = first.embed(input_ids)?;
         if !rows.is_empty() {
             let refs: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
@@ -2496,7 +2452,7 @@ impl OvRuntimeEngine {
                     ));
                 };
                 let started = std::time::Instant::now();
-                match first.prepare(&task.media, &prompt_ids) {
+                match first.frontend.prepare(&task.media, &prompt_ids) {
                     Ok((ids, rows)) => {
                         info!(
                             task = %task.task_id,
@@ -5541,7 +5497,7 @@ impl Builder for OvRuntimeBuilder {
                 events.push(LoadProgress::message(format!(
                     "vision tree: rank 0 embeds the prompt and encodes images \
                      ({} soft tokens per image at most)",
-                    f.preprocess.max_soft_tokens
+                    f.frontend.preprocess.max_soft_tokens
                 )));
                 Some(f)
             } else {
