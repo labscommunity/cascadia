@@ -12,6 +12,7 @@
 
 pub mod dist_spec;
 pub mod gemma4;
+pub mod gemma4_vision;
 pub mod genai;
 #[cfg(feature = "kv_coord")]
 pub mod kv_coordination;
