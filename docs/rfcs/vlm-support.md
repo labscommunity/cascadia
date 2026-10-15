@@ -571,6 +571,36 @@ differ from HF's by 1 and 4 (285 vs 284, 550 vs 546), the chat template's whites
 between text parts rather than the image path; noted as a follow-up. Encode is about
 3 s per image. The stage-1 IR exported on each node is byte-identical in weights.
 
+**Gemma 4 E4B** (`google/gemma-4-E4B-it`, Apache-2.0 and not gated; vision IR from
+`OpenVINO/gemma-4-E4B-it-fp16-ov`) passes the same way: 11/11 across two machines,
+"The two shapes are a red square and a blue circle.", stage 1 byte-identical across nodes.
+
+## Pixtral on `ov-runtime` (2026-10-15)
+
+The first non-Gemma family on the staged path, from `OpenVINO/pixtral-12b-int4-ov`
+(LLaVA layout: Mistral text tower, Pixtral encoder; Apache-2.0).
+
+- **Cut.** `tools/vlm_surgery/cut_vlm_lm.py` slices an OpenVINO VLM export's language
+  model (which already takes `inputs_embeds`) into stages with the Gemma surgery's stage
+  extraction, and writes a `vision` block (`family: "pixtral"`, `token_type_ids: false`):
+  Pixtral attends causally, so the wire stays `[lead] [hidden]`.
+- **Rank 0** (`pixtral_vision`): HF's Pixtral resize (fit the longest edge in 1024 with
+  floor, then round each side up to 16-px patches), CLIP normalisation, the vision IR,
+  and each `[IMG]` expanded to its rows of `[IMG]` closed by `[IMG_BREAK]` and, last,
+  `[IMG_END]`. Bit-identical to HF's PIL processor on the eight fixture images; that
+  surfaced a Pillow 12 rule (an image more than 100:1 tall shrinks height first, in two
+  calls) now mirrored in the shared resampler.
+- **Verified** across pawan-02 and pawan-04 (2 stages, CPU): 11/11, e.g. "There is a red
+  square and a blue circle." and "first picture has red and blue, second picture has
+  green and yellow."; one 448x448 image is 832 prompt tokens, encoded in about 1 s.
+- **GenAI on the same export is wrong.** Single-box `ov-genai` needs two fixes to load it
+  (the repo ships no tokenizer IRs; GenAI 2026.4.1 rejects `patch_size` as an object) and
+  then answers incorrectly ("a square and a triangle. The square is blue", "black and
+  white"), with 903 instead of 832 prompt tokens: its Pixtral preprocessing differs from
+  HF's. The staged path, with HF-exact preprocessing on the same IRs, answers correctly,
+  so this is GenAI's, not the export's. Pixtral is served staged; single box it needs a
+  GenAI fix.
+
 ## Engines that do not take images (2026-10-15)
 
 Every engine either serves images or refuses them with an OpenAI 400; none answers
@@ -580,7 +610,7 @@ from the text alone.
 |---|---|---|
 | `ov-genai` | VLM exports with the vision IR | served; on a text-only export the API offers no image input (400), and `submit` refuses too |
 | `qwen35` | trees with the vision IRs | served; otherwise 400 at the API and at `submit` |
-| `ov-runtime` | Gemma 4 vision trees (`vision.family = "gemma4"`) | served; other trees 400; an unknown `vision.family` fails to load |
+| `ov-runtime` | Gemma 4 surgery trees (`vision.family = "gemma4"`) and Pixtral trees (`"pixtral"`) | served; other trees 400; an unknown `vision.family` fails to load |
 | `gemma4` (`gemma4_cached` trees) | E2B/E4B trees from `export_gemma4.py --vision` | served; other trees 400 at the API and at `submit` |
 | `ov-dist-spec` | no | 400; draft and target would both need the expanded image prompt |
 | `sparse-moe` | no | 400 |
