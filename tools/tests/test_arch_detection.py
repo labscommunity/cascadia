@@ -117,6 +117,40 @@ def test_mistral3_wrapper_does_not_reject_text_path():
     assert export_shards.detect_architecture(cfg) == "mistral"
 
 
+def test_mllama_is_rejected_not_exported_as_llama():
+    """Llama 3.2 Vision's text tower has cross-attention layers; "mllama"
+    contains "llama", so it must be rejected before the accept list."""
+    for cfg in (
+        _FakeConfig(model_type="mllama", architectures=["MllamaForConditionalGeneration"]),
+        _FakeConfig(
+            model_type="mllama",
+            architectures=["MllamaForConditionalGeneration"],
+            text_config=_FakeConfig(
+                model_type="mllama_text_model", architectures=["MllamaForCausalLM"]
+            ),
+        ),
+    ):
+        with pytest.raises(export_shards.UnsupportedModelError, match="mllama"):
+            export_shards.detect_architecture(cfg)
+
+
+def test_vision_checkpoints_get_a_dropped_vision_note():
+    """A VLM wrapper exports its text tower; the note says images will be
+    refused. Text-only configs get no note."""
+    mistral3 = _FakeConfig(
+        model_type="mistral3",
+        vision_config=_FakeConfig(model_type="pixtral"),
+        text_config=_FakeConfig(model_type="mistral"),
+    )
+    note = export_shards.vision_dropped_note(mistral3)
+    assert note and "vision encoder is dropped" in note and "400" in note
+    assert export_shards.vision_dropped_note(_FakeConfig(model_type="qwen2_vl"))
+    assert export_shards.vision_dropped_note(_FakeConfig(model_type="llama")) is None
+    assert export_shards.vision_dropped_note(
+        _FakeConfig(model_type="llama", vision_config=None)
+    ) is None
+
+
 def test_unknown_family_falls_through_to_llama_with_warning(capsys):
     cfg = _FakeConfig(
         model_type="brand_new_model_2027",

@@ -260,6 +260,17 @@ def detect_architecture(config) -> str:
             "qwen35` (docs/architectures/qwen3.8.md)."
         )
 
+    # Llama 3.2 Vision (model_type 'mllama'): the text tower interleaves
+    # gated cross-attention layers that read image states. "mllama" CONTAINS
+    # "llama", so without this branch it would export through the plain
+    # Llama path with those layers mis-wired — garbage even on text.
+    if _has("mllama"):
+        raise UnsupportedModelError(
+            "Llama 3.2 Vision (model_type 'mllama') interleaves cross-attention "
+            "layers into its text tower; the generic exporter models only "
+            "self-attention decoder layers. Not supported (text or images)."
+        )
+
     # ---- Accept list — families that load and run.
 
     if _has("llama"):
@@ -285,6 +296,31 @@ def detect_architecture(config) -> str:
         flush=True,
     )
     return "llama"
+
+
+# Wrapper model_types of vision-language checkpoints whose text tower the
+# generic exporter can cut (the vision tower is then left out).
+_VLM_WRAPPER_TYPES = ("mistral3", "pixtral", "llava", "qwen2_vl", "qwen2_5_vl", "idefics", "paligemma")
+
+
+def vision_dropped_note(config):
+    """The note to print when ``config`` is a vision-language checkpoint.
+
+    The generic exporter cuts only the text tower, so its shards serve text
+    and the API answers ``image_url`` parts with a 400. Saying so at export
+    time beats discovering it from a refused request. ``None`` for a
+    text-only checkpoint.
+    """
+    outer = getattr(config, "model_type", "").lower()
+    has_vision = getattr(config, "vision_config", None) is not None
+    if not has_vision and not any(t in outer for t in _VLM_WRAPPER_TYPES):
+        return None
+    return (
+        f"'{outer or 'this model'}' is a vision-language checkpoint: only its text "
+        "tower is exported; the vision encoder is dropped, so these shards serve "
+        "text and the API refuses image input with a 400. Staged image input "
+        "needs a family-specific export (see docs/rfcs/vlm-support.md)."
+    )
 
 
 def is_moe_config(config) -> bool:
@@ -2197,6 +2233,9 @@ def main():
     # the text tower once: for a multimodal wrapper (e.g. Mistral 3.x) those
     # fields live under config.text_config, not the wrapper. For a plain
     # decoder-only config _text_config is the identity, so this is a no-op.
+    note = vision_dropped_note(config)
+    if note:
+        print(f"  NOTE: {note}", flush=True)
     config = _text_config(config)
 
     # Accepted — now fetch the weights.

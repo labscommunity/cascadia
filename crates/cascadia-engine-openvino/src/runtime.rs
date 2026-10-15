@@ -77,6 +77,10 @@ struct PipelineConfig {
 
 #[derive(Debug, Deserialize)]
 struct PipelineVision {
+    /// Which model family's image path the tree carries. Only `gemma4` is
+    /// served; trees from before the field are Gemma 4 surgery trees.
+    #[serde(default)]
+    family: Option<String>,
     /// Text embedding table IR in the pipeline dir (rank 0 embeds the prompt).
     text_embeddings: String,
     /// Vision encoder IR in the pipeline dir.
@@ -1482,6 +1486,24 @@ fn import_plugin(plugin: &PluginConfig) -> PluginConfig {
 }
 
 // -------- Engine --------
+
+/// The family of a pipeline's `vision` block. A tree without the field is
+/// accepted only when it is a Gemma 4 vision surgery tree (written before the
+/// field existed); any other family is refused rather than fed Gemma's
+/// preprocessing.
+fn vision_family(v: &PipelineVision, export_version: Option<&str>) -> EngineResult<&'static str> {
+    match (v.family.as_deref(), export_version) {
+        (Some("gemma4"), _) | (None, Some("gemma4_vision_surgery_v1")) => Ok("gemma4"),
+        (Some(f), _) => Err(EngineError::InvalidConfig(format!(
+            "pipeline_config.json `vision.family` is {f:?}; ov-runtime serves image input \
+             for \"gemma4\" only"
+        ))),
+        (None, other) => Err(EngineError::InvalidConfig(format!(
+            "pipeline_config.json has a `vision` block without `family` on a {other:?} \
+             export; re-export the tree so it names its family"
+        ))),
+    }
+}
 
 /// A Gemma 4 vision tree: stage 0 takes `inputs_embeds` instead of ids and
 /// every stage takes `token_type_ids` (1 on image soft tokens: sliding-window
@@ -5506,6 +5528,7 @@ impl Builder for OvRuntimeBuilder {
         }
 
         if let Some(v) = pipeline_cfg.vision.as_ref() {
+            vision_family(v, pipeline_cfg.export_version.as_deref())?;
             if !stage_cfg.stateful || self.packed_slots > 0 {
                 return Err(EngineError::InvalidConfig(
                     "a Gemma 4 vision tree is served on the stateful path only \
@@ -7261,6 +7284,23 @@ mod tests {
         assert_eq!(hid_t.unwrap().data, hid.data, "hidden is the second frame");
         let types_t = types_t.expect("a vision tree's hidden is followed by its types");
         assert_eq!(decode_wire_types(&types_t, 3).unwrap(), types);
+    }
+
+    #[test]
+    fn vision_block_family_is_checked() {
+        let v = |f: Option<&str>| PipelineVision {
+            family: f.map(String::from),
+            text_embeddings: "t.xml".into(),
+            vision_embeddings: "openvino_vision_embeddings_model.xml".into(),
+        };
+        assert_eq!(vision_family(&v(Some("gemma4")), None).unwrap(), "gemma4");
+        assert_eq!(
+            vision_family(&v(None), Some("gemma4_vision_surgery_v1")).unwrap(),
+            "gemma4",
+            "trees from before the field still load"
+        );
+        assert!(vision_family(&v(Some("mistral3")), None).is_err());
+        assert!(vision_family(&v(None), Some("something_else_v1")).is_err());
     }
 
     #[test]
