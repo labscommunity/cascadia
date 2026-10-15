@@ -556,3 +556,45 @@ cascadia run ~/trees/clef-flash-int8 --engine qwen35 --device CPU --api 127.0.0.
 The same request sent twice returns 200 both times with identical answers (joint passes always prefill
 cold). For comparison, the spike's int4 export on Apple Silicon agreed on 79/82; int8 on x86 removes
 those flips, including the near-tie `r07.severity`.
+
+### JEV-27B
+
+**Model:** [autotrust/JEV-27B](https://huggingface.co/autotrust/JEV-27B) (verbalizer LoRA on Qwen3.8-27B),
+served across two machines on Intel's stock
+[OpenVINO/Qwen3.8-27B-int8-ov](https://huggingface.co/OpenVINO/Qwen3.8-27B-int8-ov). The 27B models were
+never measured in the spike, so these numbers are the first ones.
+
+**Backbone check.** `backbone_diff.py` against `Qwen/Qwen3.8-27B` reports `VERDICT: STOCK`: all 851
+backbone tensors are identical, `lm_head` included. The export therefore grafts the adapter onto the
+stock IR with no `--weights`, and the reference applies the adapter (`--lora`) on JEV-27B's own BF16
+shards.
+
+```bash
+hf download OpenVINO/Qwen3.8-27B-int8-ov --local-dir ~/models/qwen38-27b-int8
+hf download autotrust/JEV-27B --include "adapter_vllm/*" --include calibration.json --include tokenizer.json \
+    --include tokenizer_config.json --include config.json --local-dir ~/models/jev27b
+python tools/decision_export.py jev --base-ir ~/models/qwen38-27b-int8 --adapter-dir ~/models/jev27b/adapter_vllm \
+    --stages 2 --out ~/trees/jev27b-int8   # 401 LoRA branches grafted (200 + 201)
+# host B (rank 1), then host A (rank 0, API on loopback)
+cascadia worker --model ~/trees/jev27b-int8 --engine qwen35 --device CPU --rank 1 --total 2 --listen 0.0.0.0:7801
+CASCADIA_ACTIVATION_TIMEOUT_SECS=1800 cascadia worker --model ~/trees/jev27b-int8 --engine qwen35 --device CPU \
+    --rank 0 --total 2 --next HOST_B:7801 --api 127.0.0.1:8080
+```
+
+Each host needs the whole tree at the same path. The export is deterministic: two hosts that each
+downloaded from Hugging Face and exported with the same commit produced byte-identical trees (13/13
+files by SHA-256), so a slow link between the hosts never has to carry the 28 GB tree.
+
+**Measured parity** (rank 0 and rank 1 on two Intel Core Ultra 7 258V / 32 GB hosts, CPU, OpenVINO GenAI
+2026.4.0, linked over a relayed Tailscale path of about 0.4 MB/s; the 50 records / 82 questions of the
+spike set):
+
+| Check | Result |
+|---|---|
+| Prompt layout vs serve_decide + `decision_head.json` (82 + 4 synthetic) | 86/86 |
+| int8 (2 machines) vs streamed fp32 reference | **82/82** (choice 33/33, predicate 24/24, score 25/25), max \|Δp\| 0.0187, no flips |
+| `/v1/decisions` vs `/v1/systemone` (`--all-states`) | 82/82 identical |
+
+**Reference memory.** `reference_stream.py` keeps one fp32 decoder layer resident (about 8 GB private
+for 27B). On a 32 GB host it still cannot share memory with a running rank 0 (13–25 GB), so run the
+reference with the ranks stopped, then restart them for the parity verdict.
