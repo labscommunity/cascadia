@@ -104,6 +104,17 @@ pub struct GenerationTask {
     /// also covers tasks constructed in-process).
     #[serde(default, deserialize_with = "de_resume_ids")]
     pub resume_token_ids: Option<Vec<i32>>,
+    /// Decoded media, in the order their placeholders appear in `prompt`.
+    /// Empty for text-only requests. An engine that cannot consume media must
+    /// fail a task that carries any rather than generate from the text alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<crate::MediaInput>,
+    /// The API already applied the model's chat template to `prompt`. An
+    /// engine that templates natively (ov-genai) must not apply it again.
+    /// Set for media requests, which are always rendered API-side so each
+    /// placeholder lands inside the right message.
+    #[serde(default)]
+    pub prompt_rendered: bool,
 }
 
 /// See `resume_token_ids`: `Some([])` on the wire normalizes to `None`.
@@ -177,6 +188,8 @@ impl GenerationTask {
             trust_remote_code: false,
             tenant: String::new(), // LOCAL_NS — see the field doc
             resume_token_ids: None,
+            media: Vec::new(),
+            prompt_rendered: false,
         }
     }
 
@@ -220,6 +233,8 @@ mod tests {
             trust_remote_code: false,
             tenant: String::new(),
             resume_token_ids: None,
+            media: Vec::new(),
+            prompt_rendered: false,
         };
         let json = serde_json::to_string(&t).unwrap();
         let back: GenerationTask = serde_json::from_str(&json).unwrap();

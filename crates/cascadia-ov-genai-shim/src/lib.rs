@@ -68,6 +68,16 @@ mod sys {
     pub struct cascadia_cb_handle_t {
         _private: [u8; 0],
     }
+    /// Mirrors `cascadia_media_t` in shim.h.
+    #[repr(C)]
+    pub struct cascadia_media_t {
+        pub kind: i32,
+        pub pixels: *const u8,
+        pub num_frames: u32,
+        pub height: u32,
+        pub width: u32,
+    }
+    pub const CASCADIA_MEDIA_IMAGE: i32 = 0;
 
     extern "C" {
         pub fn cascadia_last_error_message() -> *const c_char;
@@ -139,9 +149,12 @@ mod sys {
         pub fn cascadia_pipeline_generate(
             handle: *mut cascadia_pipeline_t,
             prompt: *const c_char,
+            media: *const cascadia_media_t,
+            media_count: usize,
             cfg: *const cascadia_genconfig_t,
             out_text: *mut *mut c_char,
             out_token_count: *mut u32,
+            out_input_tokens: *mut u32,
         ) -> c_int;
 
         pub fn cascadia_free_string(s: *mut c_char);
@@ -163,8 +176,14 @@ mod sys {
             handle: *mut cascadia_cb_pipeline_t,
             request_id: u64,
             prompt: *const c_char,
+            media: *const cascadia_media_t,
+            media_count: usize,
             cfg: *const cascadia_genconfig_t,
             out_handle: *mut *mut cascadia_cb_handle_t,
+        ) -> c_int;
+        pub fn cascadia_cb_handle_input_tokens(
+            handle: *mut cascadia_cb_handle_t,
+            out_count: *mut u32,
         ) -> c_int;
         pub fn cascadia_cb_step(handle: *mut cascadia_cb_pipeline_t) -> c_int;
         pub fn cascadia_cb_handle_read(
@@ -462,11 +481,64 @@ impl PluginConfig {
     }
 }
 
+/// What a [`Media`] holds. Only images today; video maps onto GenAI's
+/// videos overload later without changing the C ABI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MediaKind {
+    Image,
+}
+
+/// One decoded media item, borrowed for a call; the shim copies the pixels.
+/// `pixels` is RGB8, frame-major `[num_frames, height, width, 3]`. Items
+/// match the prompt's image tags in order.
+#[derive(Clone, Copy, Debug)]
+pub struct Media<'a> {
+    pub kind: MediaKind,
+    pub pixels: &'a [u8],
+    pub num_frames: u32,
+    pub height: u32,
+    pub width: u32,
+}
+
+#[cfg(feature = "openvino")]
+fn native_media(media: &[Media<'_>]) -> Result<Vec<sys::cascadia_media_t>> {
+    media
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let want = m.num_frames as usize * m.height as usize * m.width as usize * 3;
+            if m.pixels.len() != want {
+                return Err(Error::Native(format!(
+                    "media {i}: {} pixel bytes for a {}x{}x{} RGB stack (want {want})",
+                    m.pixels.len(),
+                    m.num_frames,
+                    m.height,
+                    m.width
+                )));
+            }
+            let kind = match m.kind {
+                MediaKind::Image => sys::CASCADIA_MEDIA_IMAGE,
+            };
+            Ok(sys::cascadia_media_t {
+                kind,
+                pixels: m.pixels.as_ptr(),
+                num_frames: m.num_frames,
+                height: m.height,
+                width: m.width,
+            })
+        })
+        .collect()
+}
+
 /// One generate result.
 #[derive(Clone, Debug)]
 pub struct GenResult {
     pub text: String,
     pub generated_tokens: u32,
+    /// Prompt length as the model saw it, image tokens included. `None` when
+    /// the pipeline did not report one (plain LLM exports).
+    pub input_tokens: Option<u32>,
 }
 
 /// Owned LLMPipeline handle.
@@ -600,23 +672,40 @@ impl LlmPipeline {
     }
 
     #[cfg(not(feature = "openvino"))]
-    pub fn generate(&self, _prompt: &str, _cfg: &GenConfig) -> Result<GenResult> {
+    pub fn generate(
+        &self,
+        _prompt: &str,
+        _media: &[Media<'_>],
+        _cfg: &GenConfig,
+    ) -> Result<GenResult> {
         Err(Error::Stub)
     }
 
+    /// Generate from `prompt`, with `media` matched to its image tags in
+    /// order. Media on a plain LLM export is an error.
     #[cfg(feature = "openvino")]
-    pub fn generate(&self, prompt: &str, cfg: &GenConfig) -> Result<GenResult> {
+    pub fn generate(
+        &self,
+        prompt: &str,
+        media: &[Media<'_>],
+        cfg: &GenConfig,
+    ) -> Result<GenResult> {
         let prompt_c = cstr(prompt)?;
+        let native = native_media(media)?;
         unsafe {
             let raw_cfg = native_genconfig(cfg)?;
             let mut text_p: *mut c_char = ptr::null_mut();
             let mut tok_count: u32 = 0;
+            let mut input_tokens: u32 = 0;
             let rc = sys::cascadia_pipeline_generate(
                 self.handle,
                 prompt_c.as_ptr(),
+                native.as_ptr(),
+                native.len(),
                 raw_cfg,
                 &mut text_p,
                 &mut tok_count,
+                &mut input_tokens,
             );
             sys::cascadia_genconfig_destroy(raw_cfg);
             if rc != 0 || text_p.is_null() {
@@ -627,6 +716,7 @@ impl LlmPipeline {
             Ok(GenResult {
                 text,
                 generated_tokens: tok_count,
+                input_tokens: (input_tokens > 0).then_some(input_tokens),
             })
         }
     }
@@ -916,16 +1006,25 @@ impl CbPipeline {
         &self,
         _request_id: u64,
         _prompt: &str,
+        _media: &[Media<'_>],
         _cfg: &GenConfig,
     ) -> Result<CbHandle> {
         Err(Error::Stub)
     }
 
-    /// Enroll a prompt into the running batch. `request_id` must be unique
-    /// among live requests on this pipeline.
+    /// Enroll a prompt into the running batch, with `media` matched to its
+    /// image tags in order. `request_id` must be unique among live requests
+    /// on this pipeline.
     #[cfg(feature = "openvino")]
-    pub fn add_request(&self, request_id: u64, prompt: &str, cfg: &GenConfig) -> Result<CbHandle> {
+    pub fn add_request(
+        &self,
+        request_id: u64,
+        prompt: &str,
+        media: &[Media<'_>],
+        cfg: &GenConfig,
+    ) -> Result<CbHandle> {
         let prompt_c = cstr(prompt)?;
+        let native = native_media(media)?;
         unsafe {
             let raw_cfg = native_genconfig(cfg)?;
             let mut handle: *mut sys::cascadia_cb_handle_t = ptr::null_mut();
@@ -933,6 +1032,8 @@ impl CbPipeline {
                 self.inner.ptr,
                 request_id,
                 prompt_c.as_ptr(),
+                native.as_ptr(),
+                native.len(),
                 raw_cfg,
                 &mut handle,
             );
@@ -1073,6 +1174,20 @@ impl CbHandle {
         let first_divergence = diverged && !self.warned_divergence;
         self.warned_divergence |= diverged;
         (delta, first_divergence)
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    pub fn input_tokens(&self) -> Option<u32> {
+        None
+    }
+
+    /// Prompt length as the model saw it, image tokens included, from the
+    /// request's perf metrics. `None` until the pipeline reports one.
+    #[cfg(feature = "openvino")]
+    pub fn input_tokens(&self) -> Option<u32> {
+        let mut out: u32 = 0;
+        let rc = unsafe { sys::cascadia_cb_handle_input_tokens(self.handle, &mut out) };
+        (rc == 0 && out > 0).then_some(out)
     }
 
     #[cfg(not(feature = "openvino"))]

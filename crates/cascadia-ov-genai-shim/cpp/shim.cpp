@@ -186,10 +186,34 @@ std::string join_port_names(const Set& names) {
 
 }  // namespace
 
+// Copy borrowed media into owned u8 tensors. GenAI takes an image as
+// [1, H, W, 3] (or [H, W, 3]) RGB8. The copy keeps the caller's buffer
+// lifetime out of the picture: the CB pipeline may read the tensors after
+// add_request returns.
+static std::vector<ov::Tensor> media_tensors(const cascadia_media_t* media, size_t count) {
+    std::vector<ov::Tensor> images;
+    if (count == 0) return images;
+    if (!media) throw std::runtime_error("media is null but media_count > 0");
+    images.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        const cascadia_media_t& m = media[i];
+        if (m.kind != CASCADIA_MEDIA_IMAGE) {
+            throw std::runtime_error("unsupported media kind " + std::to_string(m.kind));
+        }
+        if (!m.pixels || m.num_frames != 1 || m.height == 0 || m.width == 0) {
+            throw std::runtime_error("image " + std::to_string(i) +
+                                     " needs pixels and exactly one non-empty frame");
+        }
+        ov::Tensor t(ov::element::u8, ov::Shape{1, m.height, m.width, 3});
+        std::memcpy(t.data(), m.pixels, t.get_byte_size());
+        images.push_back(std::move(t));
+    }
+    return images;
+}
+
 struct cascadia_pipeline_t {
     // Exactly one of `pipe` / `vlm` is set; generate / get_tokenizer
-    // dispatch on which. VLM handles are text-only (no image inputs
-    // through this ABI).
+    // dispatch on which. Media is only accepted on `vlm`.
     std::unique_ptr<ov::genai::LLMPipeline> pipe;
     std::unique_ptr<ov::genai::VLMPipeline> vlm;
 };
@@ -388,29 +412,41 @@ void cascadia_genconfig_set_rng_seed(cascadia_genconfig_t* cfg, uint64_t v) {
 }
 
 int32_t cascadia_pipeline_generate(
-    cascadia_pipeline_t* handle, const char* prompt, const cascadia_genconfig_t* cfg,
-    char** out_text, uint32_t* out_token_count) {
+    cascadia_pipeline_t* handle, const char* prompt, const cascadia_media_t* media,
+    size_t media_count, const cascadia_genconfig_t* cfg, char** out_text,
+    uint32_t* out_token_count, uint32_t* out_input_tokens) {
     if (!handle || (!handle->pipe && !handle->vlm) || !prompt || !out_text) {
         set_last_error("null arg in pipeline_generate"); return 1;
     }
+    if (out_input_tokens) *out_input_tokens = 0;
     try {
         std::string text;
         uint32_t generated = 0;
+        if (media_count > 0 && !handle->vlm) {
+            set_last_error("media given but the model is not a VLM-layout export");
+            return 1;
+        }
         if (handle->vlm) {
-            // Text-only generate on a VLM-layout export; no image tensors.
+            std::vector<ov::Tensor> images = media_tensors(media, media_count);
             ov::genai::GenerationConfig gen_cfg =
                 cfg ? cfg->cfg : ov::genai::GenerationConfig{};
             // StreamerVariant{} default-constructs its FIRST alternative —
             // an empty std::function — which fast-fails (0xc0000409) when
             // invoked. Pass monostate explicitly: "no streamer".
             ov::genai::VLMDecodedResults results = handle->vlm->generate(
-                std::string(prompt), std::vector<ov::Tensor>{}, gen_cfg,
+                std::string(prompt), images, gen_cfg,
                 ov::genai::StreamerVariant{std::monostate{}});
             text = results.texts.empty() ? std::string{} : results.texts[0];
             try {
                 generated = static_cast<uint32_t>(
                     results.perf_metrics.get_num_generated_tokens());
             } catch (...) { generated = 0; }
+            if (out_input_tokens) {
+                try {
+                    *out_input_tokens = static_cast<uint32_t>(
+                        results.perf_metrics.get_num_input_tokens());
+                } catch (...) { *out_input_tokens = 0; }
+            }
         } else {
             ov::genai::DecodedResults results = cfg
                 ? handle->pipe->generate(std::string(prompt), cfg->cfg)
@@ -509,6 +545,7 @@ void cascadia_cb_pipeline_destroy(cascadia_cb_pipeline_t* handle) { delete handl
 
 int32_t cascadia_cb_add_request(
     cascadia_cb_pipeline_t* handle, uint64_t request_id, const char* prompt,
+    const cascadia_media_t* media, size_t media_count,
     const cascadia_genconfig_t* cfg, cascadia_cb_handle_t** out_handle) {
     if (!handle || !handle->pipe || !prompt || !cfg || !out_handle) {
         set_last_error("null arg in cb_add_request");
@@ -516,6 +553,16 @@ int32_t cascadia_cb_add_request(
     }
     try {
         auto h = std::make_unique<cascadia_cb_handle_t>();
+        if (media_count > 0) {
+            // The images overload honours apply_chat_template itself (verified
+            // on 2026.4.1: off keeps a pre-rendered prompt as is, on wraps it
+            // again), so none of the manual templating below applies.
+            std::vector<ov::Tensor> images = media_tensors(media, media_count);
+            h->handle = handle->pipe->add_request(
+                request_id, std::string(prompt), images, cfg->cfg);
+            *out_handle = h.release();
+            return 0;
+        }
         // ContinuousBatchingPipeline's string add_request() overload does NOT
         // honour GenerationConfig::apply_chat_template — verified on OV GenAI
         // 2026.2 by an A/B against LLMPipeline, where the same flag through the
@@ -687,6 +734,25 @@ int32_t cascadia_cb_handle_cancel(cascadia_cb_handle_t* handle) {
 }
 
 void cascadia_cb_handle_destroy(cascadia_cb_handle_t* handle) { delete handle; }
+
+int32_t cascadia_cb_handle_input_tokens(cascadia_cb_handle_t* handle, uint32_t* out_count) {
+    if (!handle || !handle->handle || !out_count) {
+        set_last_error("null arg in cb_handle_input_tokens");
+        return 1;
+    }
+    *out_count = 0;
+    try {
+        *out_count = static_cast<uint32_t>(
+            handle->handle->get_perf_metrics().get_num_input_tokens());
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e);
+        return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in cb_handle_input_tokens");
+        return 1;
+    }
+}
 
 int32_t cascadia_cb_count_tokens(
     cascadia_cb_pipeline_t* handle, const char* text, uint32_t* out_count) {
