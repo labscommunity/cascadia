@@ -490,8 +490,61 @@ Still open:
 supports works without family code. Verified with Gemma 4 26B-A4B (int4, CPU, pawan-04)
 and no code change: the full SDK check passes (one image "There is a red square and a
 blue circle.", `prompt_tokens` 289; two images in order; streaming; OpenAI-shaped
-refusals). Staged engines other than `qwen35` still refuse images; each family needs its
-own host code and a stage 0 that takes embeddings (section D).
+refusals). Staged engines need family host code and a stage 0 that takes embeddings
+(section D); Gemma 4 on `ov-runtime` is next.
+
+## Gemma 4 on the staged `ov-runtime` engine (2026-10-15)
+
+The 26B-A4B and 31B have no real per-layer embeddings (the input is `[?,?,?,0]`), so the
+section D problem does not arise for them; E2B/E4B are still refused by the surgery.
+
+- **Export.** `tools/gemma4_surgery/export_gemma4_text.py --vision` keeps stage 0's
+  `inputs_embeds` (tagged `grafted_inputs_embeds`) and every stage's `token_type_ids`,
+  copies the text embedding and vision IRs and the processor configs, keeps the VLM
+  config as `config.vlm.json`, and writes a `vision` block into `pipeline_config.json`.
+  Checked in Python on the 2-stage 26B-A4B tree before any Rust: stage 0 then stage 1
+  agree with the uncut language model on the next token for a text and an image prompt
+  (max logit gap about 4% of the largest logit, the f16 hop), and greedy decoding
+  through the stages answers "There is a red square and a blue circle in this picture."
+- **Preprocessing** (`gemma4_vision`): HF's aspect-preserving size (edge cases
+  included), Pillow-exact bicubic shared with Qwen, rescale without normalisation,
+  `(row, col)` patches with `(x, y)` positions padded to 2520 rows with `-1`, and the
+  `<|image>` + N x `<|image|>` + `<image|>` expansion. Bit-identical to HF's PIL
+  processor on nine fixtures (`tests/fixtures/gemma4_vision`); HF's default torchvision
+  processor is not Pillow-exact (about 45% of values differ, by at most 2/255), so that
+  is the tolerance against it.
+- **Engine.** Rank 0 embeds every step through the text embedding IR, encodes images
+  on CPU and splices their rows into the prefill. `token_type_ids` (1 on image soft
+  tokens) cross the wire as a third frame `[lead] [hidden] [types]`, because every
+  stage's sliding-window layers attend bidirectionally inside an image and only rank 0
+  knows where images are. The stateful path prefills the whole prompt in one inference,
+  so an image is never split across chunks; static, chunked-prefill and packed shards
+  are refused for vision trees. Turns with images skip KV warm-resume and capture,
+  because every same-size image has the same ids.
+- **API.** `MediaConfig::gemma4_native` uses the template's own `<|image|>` and reserves
+  the image/video/audio markers in user text; the CLI enables it for `ov-runtime` when
+  the pipeline has a `vision` block.
+- **Fixed on the way:** `ov-runtime`'s single-task stream reported `usage.prompt_tokens`
+  0 and always finished `"stop"`; it now reports both, like the packed path.
+
+Verified with both ranks of the 2-stage 26B-A4B tree on pawan-02 over the TCP wire
+(CPU): the SDK check passes 11/11. That covers one image (`prompt_tokens` 289), two
+images in order (554), streaming with low detail, text only, a same-size image right
+after another (described correctly, so no stale KV), an image from an earlier turn,
+the reserved marker refused, and OpenAI-shaped refusals. Image encode is about 6 s per
+image on CPU; a one-image prefill is about 12 s; decode is 6-10 tok/s with both ranks on one
+box.
+
+**Across two machines** (4-stage tree, layers 0-6 / 7-13 / 14-20 / 21-29): ranks 0-1 on
+pawan-02 and ranks 2-3 on pawan-04, with rank 1 sending to rank 2 over Tailscale. The SDK
+check passes 11/11 with the same answers and `prompt_tokens` (289 and 554). One-image
+prefill is about 20-26 s and decode 2-5 tok/s on CPU across the link. pawan-04 had 2.8 GB
+free, so it needed no new weights: the `--vision` surgery leaves every stage after
+stage 0 byte-identical to the text-only tree's (`openvino_model.bin` SHA-256 equal for
+stages 1-3), so pawan-04 runs the new 2-3 MB `.xml` graphs over hardlinks to the text
+tree's existing weights. Only stage 0 (and rank 0's embedding and vision IRs) are new
+data. Any node already holding a text tree of the same split can serve the later
+stages of a vision tree this way.
 
 ## Video: out of scope, kept cheap
 
