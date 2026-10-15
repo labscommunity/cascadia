@@ -382,6 +382,42 @@ hub configs); details are in the sections above:
 
 No questions remain open.
 
+## Phase 1b: what was built and verified
+
+Verified on pawan-04 against GenAI 2026.4.1 and the 35B export before coding:
+
+- **Universal tags work.** `<ov_genai_image_N>` placed in a pre-rendered prompt
+  (`apply_chat_template=false`) answers correctly for one image and keeps order for two;
+  a tag/image count mismatch raises "Missing image/video with index 1". The API inserts
+  universal tags, so the same code serves every GenAI VLM family.
+- **CB images overload honours `apply_chat_template`.** Off: the pre-rendered prompt is
+  used as is (218 input tokens, correct answer). On: GenAI wraps it again (227 tokens,
+  thinking switches on). Unlike the string overload, no shim-side templating is needed.
+- **Exact prompt length is available.** `VLMDecodedResults.perf_metrics` and the CB
+  handle's `get_perf_metrics()` both report input tokens including image tokens (218 for
+  one 448x448 image), so `usage.prompt_tokens` is exact.
+
+Built (local commits on `pawan/vlm-research`):
+
+- Task: `GenerationTask.media: Vec<MediaInput>` (frame stack, kind-tagged) and
+  `prompt_rendered`.
+- Shim: `cascadia_media_t` list on `cascadia_pipeline_generate` and
+  `cascadia_cb_add_request`; `cascadia_cb_handle_input_tokens`. Media on a plain LLM
+  export is an error.
+- Engine: media passed on both paths; `skip_chat_template` also when `prompt_rendered`;
+  prompt tokens from perf metrics with the tokenizer count as fallback.
+- API: `image_url` parts (object or bare-string form) on `user` messages; `data:` URLs
+  only (PNG, JPEG, WEBP, GIF); header check before decode (50 MP, 16384 a side, 200:1);
+  downscale to 1 MP (512x512 for `detail: low`); SHA-256 over the pixels; at most 8 per
+  request. Image requests always render the template API-side, and every image must
+  reach the rendered prompt exactly once or the request is a 400. Image requests take
+  the in-flight permit before decoding, and at most 2 decodes run at once.
+- CLI: enabled for `--engine ov-genai` when `openvino_vision_embeddings_model.xml` is
+  present; body limit grows by 20 MiB of image bytes.
+
+Not yet: remote `https` image URLs (needs SSRF guards, opt-in flag), the `/v1/models`
+capability field, and an SDK conformance suite in CI.
+
 ## Video: out of scope, kept cheap
 
 Video ships in no phase of this RFC. The image work must still leave nothing that
