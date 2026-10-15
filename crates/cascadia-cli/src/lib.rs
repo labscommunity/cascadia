@@ -2414,6 +2414,9 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             EngineKind::OvRuntime | EngineKind::Gemma4 if has_vision => {
                 match pipeline_vision_family(&args.model) {
                     Some(f) if f == "gemma4" => Some(cascadia_api::MediaConfig::gemma4_native()),
+                    Some(f) if f == "pixtral" && matches!(args.engine, EngineKind::OvRuntime) => {
+                        Some(cascadia_api::MediaConfig::pixtral_native())
+                    }
                     Some(f) => {
                         warn!(family = %f, "pipeline vision family has no API image tag; serving text only");
                         None
