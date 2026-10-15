@@ -98,6 +98,18 @@ VALIDATE_PROMPT_IDS = [2, 651, 6037, 603, 578, 3311]
 # can identify which exporter produced these shards.
 EXPORT_VERSION = "gemma4_text_surgery_v1"
 
+# Vision trees (``--vision``): stage 0 takes ``inputs_embeds`` (rank 0 embeds
+# the prompt and splices image rows in) and every stage whose attention reads
+# it keeps ``token_type_ids`` (1 on image tokens), so gemma-4's bidirectional
+# image attention survives the cut. The image path needs these source files
+# beside the stages.
+EXPORT_VERSION_VISION = "gemma4_vision_surgery_v1"
+VISION_AUX_COPY = [
+    "openvino_text_embeddings_model.xml", "openvino_text_embeddings_model.bin",
+    "openvino_vision_embeddings_model.xml", "openvino_vision_embeddings_model.bin",
+    "preprocessor_config.json", "processor_config.json",
+]
+
 
 def log(msg: str) -> None:
     print(msg, flush=True)
@@ -289,6 +301,72 @@ def graft_text_frontend(src_dir: str, tag_inputs_embeds: bool = False):
         "num_sinks": len(grafted.get_sinks()),
     }
     return grafted, info
+
+
+def vision_frontend(src_dir: str, tag_inputs_embeds: bool = True):
+    """The gemma-4 language model with its image inputs kept, for ``--vision``.
+
+    Where :func:`graft_text_frontend` builds ``input_ids -> embeddings`` into
+    the graph and zeroes ``token_type_ids`` (text only), this keeps both as
+    real inputs:
+
+    * ``inputs_embeds`` — rank 0 runs ``openvino_text_embeddings_model`` on the
+      prompt and overwrites the image-token rows with the vision encoder's
+      output (as transformers' ``masked_scatter``);
+    * ``token_type_ids`` — 1 on image tokens. gemma-4 builds its mask from it:
+      full-attention layers stay causal, sliding layers let tokens of the same
+      image attend to each other both ways. Zeroing it would make image tokens
+      purely causal.
+
+    Per-layer embeddings: 26B/31B carry a degenerate ``per_layer_inputs``
+    (last dim 0, no consumers) that is dropped; E2B/E4B have real ones, which
+    this path does not feed (and those models cannot be sliced anyway: KV
+    sharing), so they are refused.
+
+    The ``inputs_embeds`` Output is tagged ``GRAFTED_EMBEDS_NAME`` so the slicer
+    re-routes its shape-only consumers off mid/last stages, exactly as for the
+    grafted text path.
+    """
+    core = ov.Core()
+    path = os.path.join(src_dir, "openvino_language_model.xml")
+    if not os.path.exists(path):
+        raise RuntimeError(f"required gemma-4 sub-IR missing: {path}")
+    lm = core.read_model(path)
+    p_embeds = find_param(lm, "inputs_embeds")
+    p_tok_type = find_param(lm, "token_type_ids")
+    p_perlayer = find_param(lm, "per_layer")
+    p_attn = find_param(lm, "attention_mask")
+    p_pos = find_param(lm, "position_ids")
+    p_beam = find_param(lm, "beam_idx")
+    if p_embeds is None:
+        raise RuntimeError("no `inputs_embeds` Parameter in openvino_language_model.xml")
+    n_consumers = lambda p: len(list(p.output(0).get_target_inputs())) if p is not None else 0
+    if n_consumers(p_perlayer):
+        raise SystemExit(
+            "this gemma-4 has real per-layer embeddings (E2B/E4B); the vision "
+            "slice path does not feed per_layer_inputs. Use a 26B/31B export.")
+    if not n_consumers(p_tok_type):
+        log("  WARNING: no consumed token_type_ids in this IR: image tokens will "
+            "attend causally only (export with use_bidirectional_attention=vision "
+            "for gemma-4's image attention)")
+        p_tok_type = None
+    if tag_inputs_embeds:
+        names = set(p_embeds.output(0).get_names())
+        p_embeds.output(0).set_names(names | {GRAFTED_EMBEDS_NAME, "inputs_embeds"})
+    params = [p for p in (p_embeds, p_tok_type, p_attn, p_pos, p_beam) if p is not None]
+    model = ov.Model(list(lm.get_results()), list(lm.get_sinks()), params,
+                     "gemma4_vision_llm")
+    inputs = [sorted(p.output(0).get_names()) for p in model.get_parameters()]
+    log(f"vision LM inputs: {inputs}")
+    log(f"vision LM sinks (stateful KV): {len(model.get_sinks())}")
+    info = {
+        "per_layer_dropped": True,
+        "has_beam_idx": p_beam is not None,
+        "inputs": [n[0] if n else "" for n in inputs],
+        "num_sinks": len(model.get_sinks()),
+        "token_type_ids": p_tok_type is not None,
+    }
+    return model, info
 
 
 # ===========================================================================
@@ -937,7 +1015,8 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
                  skip_tokenizer_regen: bool = False,
                  allow_kv_share: bool = False,
                  validate: bool = False,
-                 num_kv_heads=None, head_dim=None) -> None:
+                 num_kv_heads=None, head_dim=None,
+                 vision: bool = False) -> None:
     """N>1: slice the grafted IR into per-stage stateful shards, emitting the
     v3 on-disk layout that the ov-runtime engine loads.
 
@@ -995,12 +1074,13 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
     # diagnostics ov-runtime ignores (no deny_unknown_fields) but keep for the
     # on-node operator.
     model_id = os.path.basename(os.path.abspath(src_dir))
+    export_version = EXPORT_VERSION_VISION if vision else EXPORT_VERSION
     pipeline_config = {
         "model_id": model_id,
         "num_stages": num_stages,
         "num_layers": num_layers,
         "hidden_size": hidden_size,
-        "export_version": EXPORT_VERSION,
+        "export_version": export_version,
         # gemma-4 diagnostics (ignored by ov-runtime's PipelineConfig):
         "arch": "gemma4_text",
         "num_kv_shared_layers": num_kv_shared_layers,
@@ -1011,6 +1091,13 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
         "kv_share_overridden": bool(allow_kv_share and num_kv_shared_layers),
         "stages": [],
     }
+    if vision:
+        # Rank 0 embeds the prompt and runs the vision encoder itself.
+        pipeline_config["vision"] = {
+            "text_embeddings": "openvino_text_embeddings_model.xml",
+            "vision_embeddings": "openvino_vision_embeddings_model.xml",
+            "inputs_embeds": True,
+        }
 
     try:
         for i, (a, b) in enumerate(ranges):
@@ -1038,7 +1125,7 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
                 "has_embed": first, "has_head": last, "stateful": True,
                 "num_kv_heads": num_kv_heads,
                 "head_dim": head_dim,
-                "export_version": EXPORT_VERSION,
+                "export_version": export_version,
                 "inputs": inputs,
                 "state_vars": state_vars,
             }
@@ -1054,6 +1141,17 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
         # tokenizer/detokenizer/config alongside the stages (single-dir UX),
         # same as qwen36 — plus the proven BOS regen + config flatten.
         copy_aux(src_dir, out_dir)
+        if vision:
+            for fn in VISION_AUX_COPY:
+                src = os.path.join(src_dir, fn)
+                if not os.path.exists(src):
+                    raise SystemExit(f"--vision needs {fn} in {src_dir}")
+                shutil.copy2(src, os.path.join(out_dir, fn))
+                log(f"copied {fn} (vision)")
+            # flatten_config rewrites config.json to the text-only shape; keep
+            # the VLM original (image_token_id, vision_config) for rank 0.
+            shutil.copy2(os.path.join(src_dir, "config.json"),
+                         os.path.join(out_dir, "config.vlm.json"))
         flatten_config(os.path.join(out_dir, "config.json"))
         if skip_tokenizer_regen:
             log("skipping BOS tokenizer regen (--skip-tokenizer-regen)")
@@ -1075,7 +1173,10 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
         # Parity gate (on-node): chained stages vs the grafted whole IR. Run
         # before the temp grafted IR is removed. Can't chain a partial export.
         if validate:
-            if only_stage is not None:
+            if vision:
+                log("  (--validate skipped for --vision: the parity gate feeds "
+                    "input_ids; vision trees are validated through the engine)")
+            elif only_stage is not None:
                 log("  (--validate skipped: --stage exports a single shard, "
                     "cannot chain — this also bypasses the cross-stage "
                     "KV-ownership refusal, which fires in the SIBLING stage "
@@ -1231,7 +1332,7 @@ def run_export(model, output_dir, num_stages=1, quantization="int4",
                boundary_suffix=DEFAULT_LAYERNORM_SUFFIX,
                stage=None, num_layers=None, hidden_size=None,
                no_last_logits_only=False, keep_grafted=False,
-               skip_tokenizer_regen=False, **_ignored) -> None:
+               skip_tokenizer_regen=False, vision=False, **_ignored) -> None:
     """Programmatic entry point for the gemma-4 VLM-IR -> text surgery.
 
     Mirrors ``qwen36_surgery/export_qwen36_moe.run_export``: ``main()`` parses
@@ -1256,12 +1357,17 @@ def run_export(model, output_dir, num_stages=1, quantization="int4",
             "config.json / tokenizer in the output dir in place)")
 
     t0 = time.time()
-    grafted, info = graft_text_frontend(model,
-                                        tag_inputs_embeds=(num_stages > 1))
+    if vision:
+        grafted, info = vision_frontend(model, tag_inputs_embeds=True)
+    else:
+        grafted, info = graft_text_frontend(model,
+                                            tag_inputs_embeds=(num_stages > 1))
     log(f"graft done at +{time.time() - t0:.1f}s (per_layer_dropped="
         f"{info['per_layer_dropped']})")
 
-    if num_stages == 1:
+    # Vision trees always take the slice path (also for one stage): their
+    # layout is the ov-runtime v3 one, which the image path builds on.
+    if num_stages == 1 and not vision:
         save_whole(grafted, model, output_dir,
                    skip_tokenizer_regen=skip_tokenizer_regen)
     else:
@@ -1291,7 +1397,7 @@ def run_export(model, output_dir, num_stages=1, quantization="int4",
             only_stage=stage, keep_grafted=keep_grafted,
             skip_tokenizer_regen=skip_tokenizer_regen,
             allow_kv_share=allow_kv_share, validate=validate,
-            num_kv_heads=n_kv_heads, head_dim=hd)
+            num_kv_heads=n_kv_heads, head_dim=hd, vision=vision)
 
     log(f"ALL DONE in {time.time() - t0:.0f}s")
 
@@ -1325,6 +1431,9 @@ def main() -> None:
                          "(UNSAFE unless boundaries keep sharing groups intact)")
     ap.add_argument("--validate", action="store_true",
                     help="N>1 on-node parity gate: chained stages vs whole IR")
+    ap.add_argument("--vision", action="store_true",
+                    help="keep inputs_embeds and token_type_ids for image input "
+                         "(rank 0 embeds + splices images); copies the vision IR")
     args = ap.parse_args()
 
     num_stages = args.total if args.total is not None else args.num_stages
@@ -1336,7 +1445,8 @@ def main() -> None:
         num_layers=args.num_layers, hidden_size=args.hidden_size,
         no_last_logits_only=args.no_last_logits_only,
         keep_grafted=args.keep_grafted,
-        skip_tokenizer_regen=args.skip_tokenizer_regen)
+        skip_tokenizer_regen=args.skip_tokenizer_regen,
+        vision=args.vision)
 
 
 if __name__ == "__main__":
