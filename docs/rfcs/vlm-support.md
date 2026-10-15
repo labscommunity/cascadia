@@ -568,9 +568,8 @@ Verified with E2B, 2 stages, across pawan-02 (rank 0) and pawan-04 (rank 1): the
 check passes 11/11, and the answers are word-for-word HF PyTorch's (fp32, same images):
 "The image contains a red square and a blue circle." and "the first picture contains
 red and blue, and the second picture contains green and yellow." Prompt token counts
-differ from HF's by 1 and 4 (285 vs 284, 550 vs 546), the chat template's whitespace
-between text parts rather than the image path; noted as a follow-up. Encode is about
-3 s per image. The stage-1 IR exported on each node is byte-identical in weights.
+then differed from HF's by 1 and 4 (285 vs 284, 550 vs 546); fixed since, see "Prompt
+tokens match HF" below. Encode is about 3 s per image. The stage-1 IR exported on each node is byte-identical in weights.
 
 **Gemma 4 E4B** (`google/gemma-4-E4B-it`, Apache-2.0 and not gated; vision IR from
 `OpenVINO/gemma-4-E4B-it-fp16-ov`) passes the same way: 11/11 across two machines,
@@ -647,6 +646,24 @@ serve causal vision trees. Pixtral is the one today.
 - **Unit test:** `tools/tests/test_vlm_static_variant.py` converts a toy two-layer
   stateful stage and checks the port contract and that one stateless step with the
   stateful past fed explicitly matches the stateful step.
+
+## Prompt tokens match HF (2026-10-16)
+
+A message with images reached the chat template as one string whose parts the API
+joined with "\n". HF's templates write a content array's parts back to back (Gemma 4's
+also trims each text part), and GenAI inserts its own tags the same way, so every join
+cost one extra token. `MediaConfig` now joins parts with nothing between them and, for
+Gemma 4, trims text parts (`trim_text_parts`). Text-only arrays keep "\n".
+
+| Model (engine) | One image | Two images | HF |
+|---|---|---|---|
+| Gemma 4 E2B (`gemma4`, 2 machines) | 284 (was 285) | 546 (was 550) | 284 / 546 |
+| Pixtral (`ov-runtime`, one box) | 832 | 1648 (was 1650) | 832 / 1648 |
+| Qwen3.6-35B-A3B (`ov-genai`, one box, thinking off) | 227 | 429 | 227 / 429 |
+
+All three pass 11/11 after the change. The staged `qwen35` path takes the same join; its
+rendered prompt equals HF's (`apply_chat_template` on the content array vs on our
+string, Qwen3.6 template, 29 tokens each), but it was not re-served.
 
 ## Engines that do not take images (2026-10-15)
 
