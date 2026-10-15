@@ -471,8 +471,15 @@ Still open:
   restored past it (72.5 s -> 11.5 s); a different image reused only the system prompt and
   answered about its own image. The local text prefix cache is not tenant-namespaced (a
   pre-existing property); image spans are, once tenants are asserted.
-- Vision IR placement (iGPU) and timing; HF-logit parity on image prompts (Phase 2 exit
-  criterion) beyond the GenAI answer match; 397B (Phase 3).
+- ~~Vision IR placement.~~ `--vision-device GPU` (default: the stage device). Measured on
+  pawan-04 (Arc 140V, OV 2026.4.1), stages on CPU: warm encode of a 640x360 image 1.9 s on
+  CPU vs 188 ms on the iGPU; two images 4.4 s vs 0.46 s; SDK answers identical. The iGPU
+  runs f16 and its final embeddings drift up to 14% (sampled max-abs, relative) from the f32
+  reference, so CPU stays the default; the f32 precision hint on the iGPU gives wrong merger
+  output in this OV release (patch/position stages exact) and is not offered. The iGPU
+  shares system memory: on a 32 GB box holding the 35B stages it left 0.2 GB free.
+- HF-logit parity on image prompts (Phase 2 exit criterion) beyond the GenAI answer match
+  (needs the original weights); 397B (Phase 3).
 
 ## Video: out of scope, kept cheap
 
