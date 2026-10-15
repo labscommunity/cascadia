@@ -21,6 +21,25 @@ pub struct VisionPrompt {
     pub rows: Vec<f32>,
     pub hidden: usize,
     pub mrope: MropePositions,
+    /// `ids` with every pad token replaced by a pseudo-id derived from its
+    /// image's pixel hash and its row in that image ([`pad_cache_id`]). Prefix
+    /// caches key on this, not on `ids`: pad tokens are identical for every
+    /// image, so keying on `ids` would serve one image's state for another.
+    pub cache_key: Vec<u32>,
+}
+
+/// The cache-key stand-in for row `row` of the image hashed `sha256`. The
+/// high bit is set, so it can never equal a real token id (vocabularies are
+/// far below 2^31); 31 hash bits per row over a run of hundreds of rows make
+/// two different images' runs agreeing vanishingly unlikely.
+pub fn pad_cache_id(sha256: &[u8; 32], row: u32) -> u32 {
+    // FNV-1a, 64-bit, over the hash and the row index.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in sha256.iter().chain(row.to_le_bytes().iter()) {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    0x8000_0000 | ((h ^ (h >> 32)) as u32 & 0x7fff_ffff)
 }
 
 /// Expand the `i`-th single `pad` token in `ids` into `counts[i]` copies.
@@ -50,18 +69,20 @@ pub fn expand_pads(ids: &[u32], pad: u32, counts: &[usize]) -> Result<Vec<u32>, 
 
 impl VisionPrompt {
     /// Build from the unexpanded prompt ids and each image's encoder output
-    /// (`[tokens_i, hidden]`) and grid.
-    #[allow(clippy::too_many_arguments)]
+    /// (`[tokens_i, hidden]`), grid and pixel hash.
     pub fn new(
         ids: &[u32],
         image_pad: u32,
         video_pad: u32,
-        images: &[(Vec<f32>, [u32; 3])],
+        images: &[(Vec<f32>, [u32; 3], [u8; 32])],
         hidden: usize,
         merge: u32,
     ) -> Result<Self, String> {
-        let counts: Vec<usize> = images.iter().map(|(rows, _)| rows.len() / hidden).collect();
-        for (i, (rows, [t, h, w])) in images.iter().enumerate() {
+        let counts: Vec<usize> = images
+            .iter()
+            .map(|(rows, _, _)| rows.len() / hidden)
+            .collect();
+        for (i, (rows, [t, h, w], _)) in images.iter().enumerate() {
             let want = (t * (h / merge) * (w / merge)) as usize;
             if rows.len() != want * hidden {
                 return Err(format!(
@@ -77,7 +98,7 @@ impl VisionPrompt {
             .filter_map(|(i, &t)| (t == image_pad).then_some(i))
             .collect();
         let ids_i64: Vec<i64> = ids.iter().map(|&t| i64::from(t)).collect();
-        let grids: Vec<[u32; 3]> = images.iter().map(|(_, g)| *g).collect();
+        let grids: Vec<[u32; 3]> = images.iter().map(|(_, g, _)| *g).collect();
         let mrope = mrope_positions(
             &ids_i64,
             i64::from(image_pad),
@@ -86,13 +107,25 @@ impl VisionPrompt {
             &[],
             merge,
         )?;
-        let rows = images.iter().flat_map(|(r, _)| r.iter().copied()).collect();
+        let rows = images
+            .iter()
+            .flat_map(|(r, _, _)| r.iter().copied())
+            .collect();
+        let mut cache_key = ids.clone();
+        let mut at = 0;
+        for ((_, _, sha), &count) in images.iter().zip(&counts) {
+            for row in 0..count {
+                cache_key[pad_positions[at]] = pad_cache_id(sha, row as u32);
+                at += 1;
+            }
+        }
         Ok(Self {
             ids,
             pad_positions,
             rows,
             hidden,
             mrope,
+            cache_key,
         })
     }
 
@@ -156,12 +189,36 @@ mod tests {
         assert!(expand_pads(&[1], PAD, &[3]).is_err());
     }
 
-    fn two_by_two_image(hidden: usize, base: f32) -> (Vec<f32>, [u32; 3]) {
-        // grid 1x4x4 -> 2x2 merged = 4 tokens.
+    fn two_by_two_image(hidden: usize, base: f32) -> (Vec<f32>, [u32; 3], [u8; 32]) {
+        // grid 1x4x4 -> 2x2 merged = 4 tokens; the pixel hash follows `base`.
         (
             (0..4 * hidden).map(|i| base + i as f32).collect(),
             [1, 4, 4],
+            [base as u8; 32],
         )
+    }
+
+    /// The cache key keeps text ids, gives each image row a high-bit
+    /// pseudo-id, matches for the same image and differs for another one.
+    #[test]
+    fn cache_key_follows_image_content() {
+        let mk = |base| {
+            VisionPrompt::new(&[1, PAD, 2], PAD, 8, &[two_by_two_image(1, base)], 1, 2).unwrap()
+        };
+        let (a, same, other) = (mk(10.0), mk(10.0), mk(20.0));
+        assert_eq!(a.cache_key, same.cache_key);
+        assert_eq!(
+            (a.cache_key[0], a.cache_key[5]),
+            (1, 2),
+            "text ids unchanged"
+        );
+        assert!(a.cache_key[1..5].iter().all(|&k| k & 0x8000_0000 != 0));
+        assert_ne!(
+            a.cache_key[1], a.cache_key[2],
+            "rows differ within an image"
+        );
+        assert!((1..5).all(|i| a.cache_key[i] != other.cache_key[i]));
+        assert_eq!(a.ids, other.ids, "the model still sees the real pad ids");
     }
 
     #[test]
@@ -211,7 +268,7 @@ mod tests {
 
     #[test]
     fn wrong_row_count_is_refused() {
-        let bad = (vec![0f32; 3], [1, 4, 4]);
+        let bad = (vec![0f32; 3], [1, 4, 4], [0u8; 32]);
         assert!(VisionPrompt::new(&[PAD], PAD, 8, &[bad], 1, 2).is_err());
     }
 }
