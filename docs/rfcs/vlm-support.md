@@ -665,6 +665,21 @@ All three pass 11/11 after the change. The staged `qwen35` path takes the same j
 rendered prompt equals HF's (`apply_chat_template` on the content array vs on our
 string, Qwen3.6 template, 29 tokens each), but it was not re-served.
 
+## Branch review (2026-10-16)
+
+Four read-only reviews (API, `ov-runtime`, vision preprocessing and the other engines,
+the Python tools) found no high-severity defect; the fixes for what they found are in
+the three `fix(...)` commits after this RFC's prompt-token entry. Re-verified after the
+fixes: Gemma 4 E2B on `gemma4` across two machines 11/11 (284/546 tokens), Qwen3.6 on
+`ov-genai` 11/11 (227/429), Pixtral packed with `--packed-prefix 64` 10/11 plus the
+designed 413 and the concurrent check (image prompts now log `shared_prefix=18`, the
+text before the first image).
+
+Left open, not caused by this branch: downstream packed stages never `admit`, so with
+`--packed-prefix` on a multi-stage tree their prefix bookkeeping would drift from rank
+0's; the CLI refuses `--packed-prefix` on more than one stage, which keeps this
+unreachable.
+
 ## Engines that do not take images (2026-10-15)
 
 Every engine either serves images or refuses them with an OpenAI 400; none answers
