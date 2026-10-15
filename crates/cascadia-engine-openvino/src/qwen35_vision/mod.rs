@@ -16,6 +16,7 @@
 //! `tests/qwen35_vision_parity.rs` against `tests/fixtures/qwen35_vision/`.
 
 pub mod encoder;
+pub mod prompt;
 pub mod resample;
 pub mod rope;
 
