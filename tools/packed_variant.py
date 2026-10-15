@@ -83,7 +83,14 @@ def build_packed_model(ov_model, packed_seq: int, has_embed: bool, hidden_size: 
     params = [p for p in ov_model.get_parameters() if p is not old_mask] + [new_mask]
     packed = ov.Model(ov_model.get_results(), params, "packed_slots")
 
-    main_name = "input_ids" if has_embed else "hidden_states"
+    names = {p.get_any_name() for p in packed.inputs}
+    # A VLM tree's stage 0 takes rank 0's embedding rows (`inputs_embeds`,
+    # tools/vlm_surgery/static_variant.py) instead of ids.
+    main_name = next(
+        n for n in ("input_ids", "inputs_embeds", "hidden_states") if n in names
+    )
+    if has_embed and main_name == "hidden_states":
+        raise RuntimeError("embed stage has no input_ids / inputs_embeds input")
     shape_map = {}
     for p in packed.inputs:
         name = p.get_any_name()
@@ -93,7 +100,9 @@ def build_packed_model(ov_model, packed_seq: int, has_embed: bool, hidden_size: 
         elif name == "attn_mask_4d":
             shape = [1, 1, packed_seq, packed_context]
         elif name == main_name:
-            shape = [1, packed_seq] if has_embed else [1, packed_seq, hidden_size]
+            shape = (
+                [1, packed_seq] if name == "input_ids" else [1, packed_seq, hidden_size]
+            )
         elif name == "position_ids":
             shape = [1, packed_seq]
         shape_map[name] = ov.PartialShape(shape)
@@ -128,11 +137,17 @@ def write_packed_variant(stage_dir: str, slots: int, packed_seq: int = None) -> 
     packed_seq = packed_seq or slots
     src = os.path.join(stage_dir, "openvino_model.xml")
     model = ov.Core().read_model(src)
+    hidden_size = cfg.get("hidden_size")
+    if hidden_size is None:
+        # Surgery trees (vlm_surgery) keep it in the IR, not stage_config.
+        for p in model.inputs:
+            if p.get_any_name() in ("inputs_embeds", "hidden_states"):
+                hidden_size = p.get_partial_shape()[2].get_length()
     packed, packed_context = build_packed_model(
         model,
         packed_seq,
         bool(cfg.get("has_embed")),
-        int(cfg["hidden_size"]),
+        int(hidden_size),
     )
     out = os.path.join(stage_dir, "openvino_packed_model.xml")
     ov.save_model(packed, out, compress_to_fp16=True)
