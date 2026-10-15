@@ -546,6 +546,31 @@ tree's existing weights. Only stage 0 (and rank 0's embedding and vision IRs) ar
 data. Any node already holding a text tree of the same split can serve the later
 stages of a vision tree this way.
 
+**Gemma 4 31B** (dense, 60 layers) passes the same way: the `--vision` surgery accepts it
+(its per-layer input is empty, like 26B-A4B's), stages 1-3 are again byte-identical to
+the text tree's, and the 4-stage tree across pawan-02 and pawan-04 passes the SDK check
+11/11 (`prompt_tokens` 289 and 554; one-image prefill about 80 s on CPU).
+
+## Engines that do not take images (2026-10-15)
+
+Every engine either serves images or refuses them with an OpenAI 400; none answers
+from the text alone.
+
+| Engine | Images | How a request with images is answered |
+|---|---|---|
+| `ov-genai` | VLM exports with the vision IR | served; on a text-only export the API offers no image input (400), and `submit` refuses too |
+| `qwen35` | trees with the vision IRs | served; otherwise 400 at the API and at `submit` |
+| `ov-runtime` | Gemma 4 vision trees (`vision.family = "gemma4"`) | served; other trees 400; an unknown `vision.family` fails to load |
+| `gemma4` (`gemma4_cached` trees) | no | 400 (`EngineError::UnsupportedInput` at `submit`); its stage 0 embeds ids inside the IR |
+| `ov-dist-spec` | no | 400; draft and target would both need the expanded image prompt |
+| `sparse-moe` | no | 400 |
+| `mock` | accepts and ignores | test stand-in for the API's image tests |
+
+A body over the size limit stays a 413, now with a message pointing at
+`input_modalities`. `tools/export_shards.py` rejects Llama 3.2 Vision (`mllama`, whose
+text tower has cross-attention) and notes at export time when it drops a checkpoint's
+vision tower (Mistral 3, Qwen2-VL, LLaVA).
+
 ## Video: out of scope, kept cheap
 
 Video ships in no phase of this RFC. The image work must still leave nothing that
