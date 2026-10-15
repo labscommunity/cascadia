@@ -28,14 +28,26 @@ pub struct VisionPrompt {
     pub cache_key: Vec<u32>,
 }
 
-/// The cache-key stand-in for row `row` of the image hashed `sha256`. The
-/// high bit is set, so it can never equal a real token id (vocabularies are
-/// far below 2^31); 31 hash bits per row over a run of hundreds of rows make
-/// two different images' runs agreeing vanishingly unlikely.
-pub fn pad_cache_id(sha256: &[u8; 32], row: u32) -> u32 {
-    // FNV-1a, 64-bit, over the hash and the row index.
+/// The cache-key stand-in for row `row` of the image hashed `sha256`, in the
+/// cache namespace `ns` (the turn's tenant). The high bit is set, so it can
+/// never equal a real token id (vocabularies are far below 2^31); 31 hash
+/// bits per row over a run of hundreds of rows make two different images'
+/// runs agreeing vanishingly unlikely.
+///
+/// `ns` keeps image spans from matching across tenants: otherwise a caller
+/// could time a request to learn whether another tenant recently sent the
+/// same image. Tenants are `""` until the plane asserts them (design H.1b),
+/// so today every caller shares one namespace, as the text prefix cache does.
+pub fn pad_cache_id(ns: &str, sha256: &[u8; 32], row: u32) -> u32 {
+    // FNV-1a, 64-bit, over the namespace (length-prefixed), hash and row.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in sha256.iter().chain(row.to_le_bytes().iter()) {
+    let ns_len = (ns.len() as u32).to_le_bytes();
+    for &b in ns_len
+        .iter()
+        .chain(ns.as_bytes())
+        .chain(sha256.iter())
+        .chain(row.to_le_bytes().iter())
+    {
         h ^= u64::from(b);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -69,7 +81,9 @@ pub fn expand_pads(ids: &[u32], pad: u32, counts: &[usize]) -> Result<Vec<u32>, 
 
 impl VisionPrompt {
     /// Build from the unexpanded prompt ids and each image's encoder output
-    /// (`[tokens_i, hidden]`), grid and pixel hash.
+    /// (`[tokens_i, hidden]`), grid and pixel hash. `cache_ns` namespaces the
+    /// image spans of [`Self::cache_key`] (the turn's tenant).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ids: &[u32],
         image_pad: u32,
@@ -77,6 +91,7 @@ impl VisionPrompt {
         images: &[(Vec<f32>, [u32; 3], [u8; 32])],
         hidden: usize,
         merge: u32,
+        cache_ns: &str,
     ) -> Result<Self, String> {
         let counts: Vec<usize> = images
             .iter()
@@ -115,7 +130,7 @@ impl VisionPrompt {
         let mut at = 0;
         for ((_, _, sha), &count) in images.iter().zip(&counts) {
             for row in 0..count {
-                cache_key[pad_positions[at]] = pad_cache_id(sha, row as u32);
+                cache_key[pad_positions[at]] = pad_cache_id(cache_ns, sha, row as u32);
                 at += 1;
             }
         }
@@ -203,7 +218,7 @@ mod tests {
     #[test]
     fn cache_key_follows_image_content() {
         let mk = |base| {
-            VisionPrompt::new(&[1, PAD, 2], PAD, 8, &[two_by_two_image(1, base)], 1, 2).unwrap()
+            VisionPrompt::new(&[1, PAD, 2], PAD, 8, &[two_by_two_image(1, base)], 1, 2, "").unwrap()
         };
         let (a, same, other) = (mk(10.0), mk(10.0), mk(20.0));
         assert_eq!(a.cache_key, same.cache_key);
@@ -219,6 +234,19 @@ mod tests {
         );
         assert!((1..5).all(|i| a.cache_key[i] != other.cache_key[i]));
         assert_eq!(a.ids, other.ids, "the model still sees the real pad ids");
+        // Another tenant sending the same image gets different image ids.
+        let ns = VisionPrompt::new(
+            &[1, PAD, 2],
+            PAD,
+            8,
+            &[two_by_two_image(1, 10.0)],
+            1,
+            2,
+            "t2",
+        )
+        .unwrap();
+        assert_eq!(ns.cache_key[0], a.cache_key[0]);
+        assert!((1..5).all(|i| ns.cache_key[i] != a.cache_key[i]));
     }
 
     #[test]
@@ -231,6 +259,7 @@ mod tests {
             &[two_by_two_image(hidden, 100.0)],
             hidden,
             2,
+            "",
         )
         .unwrap();
         assert_eq!(vp.ids, vec![1, PAD, PAD, PAD, PAD, 2]);
@@ -247,7 +276,7 @@ mod tests {
     #[test]
     fn positions_cover_prompt_then_decode() {
         let vp =
-            VisionPrompt::new(&[1, PAD, 2], PAD, 8, &[two_by_two_image(1, 0.0)], 1, 2).unwrap();
+            VisionPrompt::new(&[1, PAD, 2], PAD, 8, &[two_by_two_image(1, 0.0)], 1, 2, "").unwrap();
         // text 0; image rows 1..: t=1 h=1,1,2,2 w=1,2,1,2; advance 2 -> text 3.
         let all = vp.positions(0, 6);
         assert_eq!(&all[0..6], &[0, 1, 2, 3, 4, 5]);
@@ -269,6 +298,6 @@ mod tests {
     #[test]
     fn wrong_row_count_is_refused() {
         let bad = (vec![0f32; 3], [1, 4, 4], [0u8; 32]);
-        assert!(VisionPrompt::new(&[PAD], PAD, 8, &[bad], 1, 2).is_err());
+        assert!(VisionPrompt::new(&[PAD], PAD, 8, &[bad], 1, 2, "").is_err());
     }
 }
