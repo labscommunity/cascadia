@@ -519,7 +519,8 @@ section D problem does not arise for them; E2B/E4B are still refused by the surg
   stage's sliding-window layers attend bidirectionally inside an image and only rank 0
   knows where images are. The stateful path prefills the whole prompt in one inference,
   so an image is never split across chunks; static, chunked-prefill and packed shards
-  are refused for Gemma 4 vision trees (Pixtral takes them, see below). Turns with
+  serve Gemma 4 too since 2026-10-16 (static only; see "Gemma 4 on the static
+  path"). Turns with
   images skip KV warm-resume and capture,
   because every same-size image has the same ids.
 - **API.** `MediaConfig::gemma4_native` uses the template's own `<|image|>` and reserves
@@ -600,6 +601,15 @@ The first non-Gemma family on the staged path, from `OpenVINO/pixtral-12b-int4-o
   HF's. The staged path, with HF-exact preprocessing on the same IRs, answers correctly,
   so this is GenAI's, not the export's. Pixtral is served by `ov-runtime`, staged or
   as a one-stage tree on a single box (next section).
+- **Root cause (2026-10-16).** GenAI 2026.4.1 has no Pixtral path: `model_type:
+  "llava"` maps it onto LLaVA-1.5 (`src/cpp/src/visual_language/llava/classes.cpp`,
+  tag `2026.4.1.0`), which resizes the shortest edge, center-crops a fixed square, and
+  expands each image as a flat run plus "\n", without `[IMG_BREAK]` after each patch
+  row or `[IMG_END]`. Pixtral keeps the aspect ratio (longest edge fit to whole 16-px
+  patches) and needs those tokens. `ov-genai` now serves a Pixtral export as text only
+  (`genai::unsupported_vision`; the CLI logs why and the API answers images with a
+  400), so it no longer gives wrong image answers. A fix belongs upstream: a Pixtral
+  `InputsEmbedder` doing what `pixtral_vision` here does.
 
 ## Static (NPU) and packed paths for vision trees (2026-10-16)
 
@@ -626,10 +636,8 @@ serve causal vision trees. Pixtral is the one today.
   size has the same ids, so matching past it would reuse another image's K/V. Images
   are encoded at `submit`, so a prompt that outgrows the slot's region is refused there
   with the same 413 `context_length_exceeded` a long text prompt gets.
-- **Refused at load:** `token_type_ids` trees (Gemma 4). Their sliding layers attend
-  bidirectionally inside an image, which seq=1 stepping cannot do, and their layers mix
-  KV geometries (256-wide sliding, 512-wide global heads) that one ring cannot hold.
-  `static_variant.py` refuses them too.
+- **Gemma 4** (`token_type_ids` trees) was refused here at first; it is served on the
+  static path since 2026-10-16 (next section) and stays refused on packed slots.
 - **Verified** across pawan-02 and pawan-04 (2 stages, CPU, context 2048):
   - static, prefill chunks of 256: 11/11, the same answers and token counts as the
     stateful tree ("There is a red square and a blue circle.", 832 prompt tokens; two
@@ -647,6 +655,36 @@ serve causal vision trees. Pixtral is the one today.
   stateful stage and checks the port contract and that one stateless step with the
   stateful past fed explicitly matches the stateful step.
 
+## Gemma 4 on the static path (2026-10-16)
+
+Two things kept Gemma 4 off the static path; both are handled now.
+
+- **Mixed KV geometry.** A stage mixes sliding layers (8 KV heads x 256) and global
+  layers (2 x 512). `static_variant.py` records each layer's geometry in
+  `stage_config.kv_layers`, and the host ring (`StaticKv`) sizes, feeds and absorbs
+  every layer with its own heads and width.
+- **Bidirectional attention inside an image.** The exported IR builds its image
+  groups from `token_type_ids`, front-padding the past's types as text: an image sees
+  itself bidirectionally only if the whole image is in the current inference. So a
+  Gemma static tree needs a chunked prefill at least one image wide (280 tokens at
+  most), and rank 0 never ends a chunk inside an image (`image_safe_take`; relays split
+  their frames the same way). Every inference feeds its rows' token types, and the
+  types frame rides the static wire as on the stateful one. Packed slots still refuse
+  `token_type_ids` trees: their per-row mask carries no image blocks.
+- **Sliding window.** The IR masks the sliding window by ring index, and the ring's
+  padding between the valid past and the query window makes the index distance run
+  ahead of the real one. `static_variant.py` therefore refuses a context plus prefill
+  width beyond the window (1024 + 1): 736 + 288 here, room for two images.
+- **One compiled model on CPU/GPU.** Compiling a separate prefill IR doubles a
+  stage's weights in RAM, and two 26B stages per 32 GB node ran out of memory.
+  `--shared-prefill` writes one IR with a dynamic query width over the fixed past; the
+  runtime runs both decode and prefill chunks on that one compilation
+  (`stage_config.prefill_shares_decode`). The NPU still needs the two static IRs.
+- **Verified:** Gemma 4 26B-A4B, 4 static stages across pawan-02 and pawan-04 (CPU,
+  context 736, prefill 288, shared IR): 11/11, "There is a red square and a blue
+  circle.", 288 / 550 prompt tokens, which is HF's processor count on the 26B template
+  (its generation prompt adds an empty thought channel, hence 4 more than E2B).
+
 ## Prompt tokens match HF (2026-10-16)
 
 A message with images reached the chat template as one string whose parts the API
@@ -661,9 +699,8 @@ Gemma 4, trims text parts (`trim_text_parts`). Text-only arrays keep "\n".
 | Pixtral (`ov-runtime`, one box) | 832 | 1648 (was 1650) | 832 / 1648 |
 | Qwen3.6-35B-A3B (`ov-genai`, one box, thinking off) | 227 | 429 | 227 / 429 |
 
-All three pass 11/11 after the change. The staged `qwen35` path takes the same join; its
-rendered prompt equals HF's (`apply_chat_template` on the content array vs on our
-string, Qwen3.6 template, 29 tokens each), but it was not re-served.
+All three pass 11/11 after the change. The staged `qwen35` path (Qwen3.6, 2 stages
+across both machines) re-served on 2026-10-16: 11/11, 227 / 429 tokens, HF's counts.
 
 ## Branch review (2026-10-16)
 
@@ -689,7 +726,7 @@ from the text alone.
 |---|---|---|
 | `ov-genai` | VLM exports with the vision IR | served; on a text-only export the API offers no image input (400), and `submit` refuses too |
 | `qwen35` | trees with the vision IRs | served; otherwise 400 at the API and at `submit` |
-| `ov-runtime` | Gemma 4 surgery trees (`vision.family = "gemma4"`, stateful path) and Pixtral trees (`"pixtral"`, stateful, static and packed paths) | served; other trees 400; an unknown `vision.family` fails to load |
+| `ov-runtime` | Gemma 4 surgery trees (`vision.family = "gemma4"`, stateful and static paths) and Pixtral trees (`"pixtral"`, stateful, static and packed paths) | served; other trees 400; an unknown `vision.family` fails to load |
 | `gemma4` (`gemma4_cached` trees) | E2B/E4B trees from `export_gemma4.py --vision` | served; other trees 400 at the API and at `submit` |
 | `ov-dist-spec` | no | 400; draft and target would both need the expanded image prompt |
 | `sparse-moe` | no | 400 |
