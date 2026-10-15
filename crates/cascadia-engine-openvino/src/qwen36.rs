@@ -386,6 +386,8 @@ pub struct Qwen36Builder {
     max_ctx: Option<usize>,
     /// Rank 0's image path, when the tree carries the vision IRs.
     vision: Option<VisionRuntime>,
+    /// Device for the vision IRs; `None` = the stage device.
+    vision_device: Option<String>,
 }
 
 /// Rank 0's image path: the vision IRs, the processor settings and the
@@ -513,7 +515,16 @@ impl Qwen36Builder {
             im_start_id: None,
             max_ctx: None,
             vision: None,
+            vision_device: None,
         }
+    }
+
+    /// Run rank 0's vision IRs on `device` (e.g. the iGPU) instead of the
+    /// stage device. They then compile with only the cache dir: the stages'
+    /// plugin properties are tuned for their own device and may not apply.
+    pub fn with_vision_device(mut self, device: impl Into<String>) -> Self {
+        self.vision_device = Some(device.into());
+        self
     }
 
     pub fn with_rank(mut self, rank: u32, total: u32) -> Self {
@@ -673,12 +684,26 @@ impl Builder for Qwen36Builder {
         // Images enter at the decode driver only: the encoder's rows replace
         // pad-token embeddings before stage 0.
         if self.rank == 0 {
-            self.vision = VisionRuntime::load(&dir, &self.device, &plugin, manifest.hidden())
-                .map_err(|e| EngineError::InvalidConfig(format!("qwen35 vision IRs: {e}")))?;
+            let device = self
+                .vision_device
+                .clone()
+                .unwrap_or_else(|| self.device.clone());
+            let vision_plugin = if device == self.device {
+                plugin.clone()
+            } else {
+                match &self.cache_dir {
+                    Some(d) => PluginConfig::new().with("CACHE_DIR", d),
+                    None => PluginConfig::new(),
+                }
+            };
+            self.vision = VisionRuntime::load(&dir, &device, &vision_plugin, manifest.hidden())
+                .map_err(|e| {
+                    EngineError::InvalidConfig(format!("qwen35 vision IRs on {device}: {e}"))
+                })?;
             if self.vision.is_some() {
-                progress.push(LoadProgress::message(
-                    "compiled vision IRs: image input enabled".to_string(),
-                ));
+                progress.push(LoadProgress::message(format!(
+                    "compiled vision IRs on {device}: image input enabled"
+                )));
             }
         }
 
