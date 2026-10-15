@@ -755,6 +755,8 @@ impl Builder for Qwen36Builder {
             last_restore_bytes: 0,
             vision: self.vision,
             chain_mrope: false,
+            #[cfg(test)]
+            last_positions: None,
         }))
     }
 }
@@ -923,6 +925,9 @@ pub struct Qwen36Engine {
     /// Every downstream rank accepts `FRAME_FORWARD_MROPE` (negotiated at HELLO). Image turns
     /// on a chain without it are refused: those ranks would read the plain token index.
     chain_mrope: bool,
+    /// The position block the last FORWARD ran with (relay side), for the wire tests.
+    #[cfg(test)]
+    last_positions: Option<Vec<i64>>,
 }
 
 /// In-flight task state. `step()` advances one token per call so the
@@ -2405,6 +2410,10 @@ impl Qwen36Engine {
                     None => crate::qwen35_vision::prompt::text_positions(t0, t0 + n),
                 };
                 let out = self.chain_pass(&hidden, t0, t0 + n, &pos_block)?;
+                #[cfg(test)]
+                {
+                    self.last_positions = Some(pos_block.clone());
+                }
                 // rank>0 counterpart of the head's `qwen36_fp_at (cold fold)`. The tail folds via this
                 // frame, not the prefill loop, so without this its COLD state at `pos` is unmeasurable
                 // and only its warm-RESTORED state (logged by restore_local_stages) is visible. Single-box
@@ -3542,6 +3551,7 @@ mod tests {
             last_restore_bytes: 0,
             vision: None,
             chain_mrope: false,
+            last_positions: None,
         }
     }
 
@@ -3653,6 +3663,65 @@ mod tests {
             "poisoned head must emit an error chunk, got a silent empty success"
         );
         assert!(chunk.error.as_deref().unwrap().contains("manifest"));
+    }
+
+    /// Two engines over a real localhost socket (no stages, so a stage pass
+    /// is the identity): the HELLO_ACK carries the M-RoPE bit, a text frame
+    /// runs at the token index, and an image frame delivers its explicit
+    /// position block to the downstream rank unchanged.
+    #[test]
+    fn pipeline_carries_mrope_positions_for_image_turns() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (server, client) = rt.block_on(async {
+            let mut server = ActivationServer::new("127.0.0.1", 0);
+            server.start().await.unwrap();
+            let port = server.port();
+            let accept = tokio::spawn(async move {
+                server.accept().await.unwrap();
+                server
+            });
+            let mut client = ActivationClient::new("127.0.0.1", port);
+            client.connect().await.unwrap();
+            (accept.await.unwrap(), client)
+        });
+        let mut head = bare_engine(2, "{}");
+        head.rank = 0;
+        head.downstream = Some(Arc::new(tokio::sync::Mutex::new(client)));
+        head.runtime_handle = Some(rt.handle().clone());
+        let mut tail = bare_engine(2, "{}");
+        tail.upstream = Some(Arc::new(tokio::sync::Mutex::new(server)));
+        tail.runtime_handle = Some(rt.handle().clone());
+        let tail_thread = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..3 {
+                tail.step_pipe_relay().unwrap();
+                seen.push(tail.last_positions.take());
+            }
+            seen
+        });
+
+        head.handshake_a().unwrap();
+        assert!(
+            head.chain_mrope,
+            "a current downstream advertises M-RoPE frames"
+        );
+        let hidden = vec![0.5f32; 2 * head.hidden];
+        head.forward_downstream(0, &hidden, 2, 7, None).unwrap();
+        let block = vec![7, 8, 3, 3, 3, 4, 3, 5];
+        head.forward_downstream(0, &hidden, 2, 7, Some(&block))
+            .unwrap();
+
+        let seen = tail_thread.join().unwrap();
+        assert_eq!(seen[0], None, "HELLO runs no stage pass");
+        assert_eq!(
+            seen[1],
+            Some(crate::qwen35_vision::prompt::text_positions(7, 9))
+        );
+        assert_eq!(seen[2], Some(block));
     }
 
     fn image_task(id: &str) -> GenerationTask {
