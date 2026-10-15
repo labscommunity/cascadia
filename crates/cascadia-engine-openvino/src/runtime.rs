@@ -711,6 +711,29 @@ fn decode_wire_lead(t: &WireTensor, want_pos: bool) -> EngineResult<(u32, Option
     Ok((seq, position))
 }
 
+/// The single-task path's last chunk: usage and finish reason, as the packed
+/// path's. `prompt_len` is every prompt token the model consumed (images'
+/// soft tokens included), which is what OpenAI's `usage.prompt_tokens`
+/// counts; without it the API reported 0. `n_tokens` is this chunk's one
+/// token, so an EOS that decodes to "" still counts.
+fn single_task_final_chunk(
+    task_id: TaskId,
+    token: i32,
+    delta: String,
+    prompt_len: usize,
+    is_eos: bool,
+) -> Chunk {
+    Chunk::final_marker(task_id, delta)
+        .with_n_tokens(1)
+        .with_prompt_tokens(prompt_len as u32)
+        .with_token_ids(vec![token as i64])
+        .with_finish_reason(if is_eos {
+            cascadia_types::FinishReason::Stop
+        } else {
+            cascadia_types::FinishReason::Length
+        })
+}
+
 /// Encode a vision tree's per-step `token_type_ids` (1 on image soft tokens)
 /// as I64 `[1,1,n]`, the frame that follows the hidden. Every stage's
 /// sliding-window layers need it: they attend bidirectionally inside each
@@ -3444,23 +3467,18 @@ impl OvRuntimeEngine {
             warn!(task = %task_id, "detokenizer decode diverged; re-anchored");
         }
         let chunk = if is_final {
-            Chunk {
-                task_id: task_id.clone(),
-                token_id: next_token as i64,
-                text: delta,
-                is_final: true,
-                logprobs: None,
-                n_tokens: None,
-                prompt_tokens: None,
-                completion_tokens: None,
-                error: None,
-                token_ids: Vec::new(),
-                // ov-runtime doesn't yet distinguish length vs stop here; the
-                // API falls back to "stop" (unchanged behavior). #14 follow-up.
-                finish_reason: None,
-            }
+            single_task_final_chunk(
+                task_id.clone(),
+                next_token,
+                delta,
+                active.prompt_ids.len(),
+                is_eos,
+            )
         } else {
+            // Counted explicitly, as the packed path does: a token whose text
+            // lands in a later chunk would otherwise count 0.
             Chunk::token(task_id.clone(), next_token as i64, delta)
+                .with_n_tokens(1)
                 .with_token_ids(vec![next_token as i64])
         };
 
@@ -7240,6 +7258,18 @@ mod tests {
         assert_eq!(hid_t.unwrap().data, hid.data, "hidden is the second frame");
         let types_t = types_t.expect("a vision tree's hidden is followed by its types");
         assert_eq!(decode_wire_types(&types_t, 3).unwrap(), types);
+    }
+
+    #[test]
+    fn single_task_final_chunk_carries_usage_and_reason() {
+        let c = single_task_final_chunk("t".into(), 1, String::new(), 289, true);
+        assert!(c.is_final);
+        assert_eq!(c.prompt_tokens, Some(289));
+        assert_eq!(c.n_tokens, Some(1), "an empty EOS delta still counts");
+        assert_eq!(c.finish_reason, Some(cascadia_types::FinishReason::Stop));
+        let c = single_task_final_chunk("t".into(), 7, "x".into(), 3, false);
+        assert_eq!(c.finish_reason, Some(cascadia_types::FinishReason::Length));
+        assert_eq!(c.token_ids, vec![7]);
     }
 
     #[test]
