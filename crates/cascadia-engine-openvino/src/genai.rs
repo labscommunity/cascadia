@@ -249,11 +249,12 @@ impl Builder for OvGenaiBuilder {
             if is_vlm_layout {
                 // ContinuousBatchingPipeline grew a VLM path (images overload,
                 // VLMDecodedResults) in GenAI 2026.2 — VLM-layout dirs now
-                // construct. Text-only serving; the constructor error surfaces
+                // construct, and image tasks go through the images overload
+                // (verified on 2026.4.1). The constructor error surfaces
                 // cleanly if the installed runtime predates the support.
-                tracing::warn!(
-                    "--cb on a VLM-layout export: text-only serving via the \
-                     CB pipeline's VLM path (needs OpenVINO GenAI >= 2026.2)"
+                info!(
+                    "--cb on a VLM-layout export: serving text and images through \
+                     the CB pipeline's VLM path (needs OpenVINO GenAI >= 2026.2)"
                 );
             }
             progress.push(LoadProgress::message(format!(
