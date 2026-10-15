@@ -247,11 +247,14 @@ impl Builder for OvGenaiBuilder {
             && !model_dir.join("openvino_model.xml").exists();
         if let Some(sched) = &self.continuous_batching {
             if is_vlm_layout {
-                return Err(EngineError::InvalidConfig(
-                    "--cb is not supported on VLM-layout exports; \
-                     ContinuousBatchingPipeline needs a plain LM export"
-                        .into(),
-                ));
+                // ContinuousBatchingPipeline grew a VLM path (images overload,
+                // VLMDecodedResults) in GenAI 2026.2 — VLM-layout dirs now
+                // construct. Text-only serving; the constructor error surfaces
+                // cleanly if the installed runtime predates the support.
+                tracing::warn!(
+                    "--cb on a VLM-layout export: text-only serving via the \
+                     CB pipeline's VLM path (needs OpenVINO GenAI >= 2026.2)"
+                );
             }
             progress.push(LoadProgress::message(format!(
                 "compiling ContinuousBatchingPipeline on {} (cache {} GB, max_num_seqs {}, \
@@ -1506,7 +1509,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cb_rejects_vlm_layout() {
+    async fn cb_no_longer_gates_vlm_layout() {
+        // GenAI 2026.2's ContinuousBatchingPipeline handles VLM-layout dirs
+        // (text-only); the old hard reject is gone. On stub/invalid IRs the
+        // load still fails — but in the pipeline constructor, not the gate.
         let dir = tempfile::tempdir().unwrap();
         for f in [
             "openvino_language_model.xml",
@@ -1518,8 +1524,8 @@ mod tests {
         let mut b = OvGenaiBuilder::new(dir.path().to_str().unwrap(), "CPU")
             .with_continuous_batching(CbSchedulerConfig::default());
         let shard = ShardSpec::single_stage("model", "CPU");
-        let err = b.load(shard).await.err().expect("must reject");
-        assert!(err.to_string().contains("VLM-layout"), "{err}");
+        let err = b.load(shard).await.err().expect("stub IRs still fail");
+        assert!(!err.to_string().contains("VLM-layout"), "{err}");
     }
 
     /// Stub builds surface a Backend error from CbPipeline::new — proves the
