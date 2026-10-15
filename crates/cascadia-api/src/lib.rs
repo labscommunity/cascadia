@@ -646,7 +646,11 @@ pub fn make_router_with_stats(
         // a multi-GB request. Apply at router level so it applies to
         // every route, not just chat_completions.
         .layer(DefaultBodyLimit::max(
-            cfg.max_body_bytes + cfg.media.as_ref().map_or(0, |m| m.max_request_image_bytes),
+            cfg.max_body_bytes
+                + cfg
+                    .media
+                    .as_ref()
+                    .map_or(0, |m| media::base64_len(m.max_request_image_bytes)),
         ))
         // Outermost: request count + latency per matched route (#16), so it
         // observes rejections from the inner layers too.
@@ -1987,15 +1991,27 @@ impl PreparedMedia {
     /// (or the no-template fallback, which keeps only the last user message)
     /// that drops a message would otherwise leave GenAI with more images than
     /// tags, and the model would never see the dropped ones.
+    ///
+    /// Reserved text is checked here too, on the whole rendered prompt: the
+    /// per-message check sees text parts joined with "\n", but an image
+    /// message's parts reach the prompt back to back, so a tag split across
+    /// two parts would only appear here (as would one in tool-call arguments
+    /// or tool definitions). Each reserved string may occur only as often as
+    /// the placeholders themselves carry it.
     fn check_placeholders(&self, prompt: &str) -> Result<(), String> {
         let n = self.inputs.len();
-        match self.cfg.placeholders_complete(prompt, n) {
-            Ok(()) => Ok(()),
-            Err(found) => Err(format!(
+        if let Err(found) = self.cfg.placeholders_complete(prompt, n) {
+            return Err(format!(
                 "{n} images were sent but the rendered prompt carries {found} image \
                  placeholders; this model's prompt format dropped the messages holding the rest"
-            )),
+            ));
         }
+        if let Some(tag) = self.cfg.reserved_beyond_placeholders(prompt, n) {
+            return Err(format!(
+                "message text must not contain `{tag}`: it is reserved for image placeholders"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -2125,11 +2141,15 @@ async fn prepare_media(
         Ok(Err(msg)) => Err(reject(msg)),
         Err(join_err) => {
             tracing::error!(error = %join_err, "image decode task failed");
-            Err(api_error(
+            // A decoder fault on one upload says nothing about the pipeline:
+            // keep it out of readiness (see `PreEngineFailure`).
+            let mut resp = api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "image decoding failed",
                 None,
-            ))
+            );
+            resp.extensions_mut().insert(PreEngineFailure);
+            Err(resp)
         }
     }
 }
@@ -4530,6 +4550,46 @@ mod tests {
             content.contains("one<|image|>two<|image|>"),
             "parts not joined like the template: {content:?}"
         );
+    }
+
+    /// A reserved tag split across two text parts passes the per-message check
+    /// (it sees the parts joined with "\n") but is whole once an image
+    /// message's parts are joined back to back; the rendered prompt is checked
+    /// too, so it is still a 400 and never reaches the engine.
+    #[tokio::test]
+    async fn split_reserved_tag_is_a_400() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some("{% for m in messages %}{{ m.content }}\n{% endfor %}".into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            media: Some(MediaConfig::qwen35_native()),
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({"model": "mock-model", "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "<|video"},
+                    {"type": "text", "text": "_pad|>"},
+                    {"type": "image_url", "image_url": {"url": png_url(4, 4)}}]}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {v}");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("<|video_pad|>"));
     }
 
     /// Everything the image path refuses comes back as an OpenAI-shaped 400
