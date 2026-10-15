@@ -165,10 +165,45 @@ where
                     StatusCode::PAYLOAD_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
                     _ => StatusCode::BAD_REQUEST,
                 };
-                Err(api_error(status, rej.body_text(), None))
+                Err(api_error(status, rejection_message(&rej), None))
             }
         }
     }
+}
+
+/// The caller-facing reason for a body that did not parse: serde's message
+/// with its JSON path (`messages[0]: missing field ...`), without axum's
+/// "Failed to deserialize the JSON body into the target type" wrapper or the
+/// `at line N column M` position, which OpenAI's errors do not carry either.
+fn rejection_message(rej: &axum::extract::rejection::JsonRejection) -> String {
+    use axum::extract::rejection::JsonRejection;
+    use std::error::Error as _;
+    let inner = match rej {
+        JsonRejection::JsonDataError(e) => e.source().map(|s| s.to_string()),
+        JsonRejection::JsonSyntaxError(e) => e
+            .source()
+            .map(|s| format!("request body is not valid JSON: {s}")),
+        JsonRejection::MissingJsonContentType(_) => {
+            Some("request must have `Content-Type: application/json`".into())
+        }
+        _ => None,
+    };
+    let msg = inner.unwrap_or_else(|| rej.body_text());
+    strip_json_position(&msg).to_string()
+}
+
+/// `"... at line 1 column 139"` -> `"..."`.
+fn strip_json_position(msg: &str) -> &str {
+    if let Some(at) = msg.rfind(" at line ") {
+        let tail = &msg[at + " at line ".len()..];
+        let mut it = tail.splitn(3, ' ');
+        if let (Some(line), Some("column"), Some(col)) = (it.next(), it.next(), it.next()) {
+            if line.parse::<u64>().is_ok() && col.parse::<u64>().is_ok() {
+                return &msg[..at];
+            }
+        }
+    }
+    msg
 }
 
 #[derive(Clone)]
@@ -4897,6 +4932,65 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("multi-prompt"));
+    }
+
+    /// A body that fails to parse reports serde's reason and JSON path only:
+    /// no axum wrapper text, no `at line N column M`.
+    #[tokio::test]
+    async fn parse_errors_carry_only_the_reason() {
+        let cases = [
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":[{"type":"input_audio"}]}]}"#,
+                "messages[0]: content part type `input_audio` is not supported; only `text` and \
+                 `image_url` parts are accepted",
+            ),
+            (r#"{"messages":[]}"#, "missing field `model`"),
+        ];
+        for (body, want) in cases {
+            let response = make_app()
+                .await
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let v: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                    .unwrap();
+            assert_eq!(v["error"]["message"], want, "body: {v}");
+        }
+        let response = make_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.starts_with("request body is not valid JSON") && !msg.contains(" at line "),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn strip_json_position_only_strips_a_real_position() {
+        assert_eq!(strip_json_position("bad at line 1 column 9"), "bad");
+        assert_eq!(strip_json_position("look at line one"), "look at line one");
+        assert_eq!(strip_json_position("plain"), "plain");
     }
 
     /// A router whose model takes images, with a template that prints each
