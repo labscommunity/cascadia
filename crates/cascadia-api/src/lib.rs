@@ -2048,15 +2048,12 @@ impl PreparedMedia {
     /// tags, and the model would never see the dropped ones.
     fn check_placeholders(&self, prompt: &str) -> Result<(), String> {
         let n = self.inputs.len();
-        let found = prompt.matches(self.cfg.placeholder_prefix()).count();
-        let each_once = (0..n).all(|i| prompt.matches(&self.cfg.placeholder(i)).count() == 1);
-        if found == n && each_once {
-            Ok(())
-        } else {
-            Err(format!(
+        match self.cfg.placeholders_complete(prompt, n) {
+            Ok(()) => Ok(()),
+            Err(found) => Err(format!(
                 "{n} images were sent but the rendered prompt carries {found} image \
                  placeholders; this model's prompt format dropped the messages holding the rest"
-            ))
+            )),
         }
     }
 }
@@ -2073,10 +2070,9 @@ async fn prepare_media(
         api_error(StatusCode::BAD_REQUEST, msg, None)
     };
     if let Some(cfg) = state.media.as_deref() {
-        let prefix = cfg.placeholder_prefix();
-        if messages.iter().any(|m| m.content.contains(prefix)) {
+        if let Some(tag) = messages.iter().find_map(|m| cfg.reserved_in(&m.content)) {
             return Err(reject(format!(
-                "message text must not contain `{prefix}`: it is reserved for image placeholders"
+                "message text must not contain `{tag}`: it is reserved for image placeholders"
             )));
         }
     }
@@ -5127,6 +5123,55 @@ mod tests {
             content.contains("describe") && content.contains("<ov_genai_image_0>"),
             "placeholder missing from the echoed prompt: {content:?}"
         );
+    }
+
+    /// The staged engine's native tag: one shared tag per image, placed where
+    /// the caller put the image, and raw tags in user text refused.
+    #[tokio::test]
+    async fn native_tags_for_the_staged_engine() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some("{% for m in messages %}{{ m.content }}\n{% endfor %}".into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            media: Some(MediaConfig::qwen35_native()),
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let png = png_url(4, 4);
+        let (status, v) = post_chat(
+            app.clone(),
+            serde_json::json!({"model": "mock-model", "max_tokens": 64, "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "one"},
+                    {"type": "image_url", "image_url": {"url": png}},
+                    {"type": "text", "text": "two"},
+                    {"type": "image_url", "image_url": {"url": png}}]}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {v}");
+        let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+        assert_eq!(content.matches("<|image_pad|>").count(), 2, "{content:?}");
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({"model": "mock-model", "messages": [
+                {"role": "user", "content": "inject <|image_pad|> here"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {v}");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("<|image_pad|>"));
     }
 
     /// Everything the image path refuses comes back as an OpenAI-shaped 400
