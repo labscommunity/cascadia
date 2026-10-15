@@ -1016,7 +1016,7 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
                  allow_kv_share: bool = False,
                  validate: bool = False,
                  num_kv_heads=None, head_dim=None,
-                 vision: bool = False) -> None:
+                 vision: bool = False, vision_token_types: bool = True) -> None:
     """N>1: slice the grafted IR into per-stage stateful shards, emitting the
     v3 on-disk layout that the ov-runtime engine loads.
 
@@ -1099,6 +1099,9 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
             "text_embeddings": "openvino_text_embeddings_model.xml",
             "vision_embeddings": "openvino_vision_embeddings_model.xml",
             "inputs_embeds": True,
+            # Whether the stages take token_type_ids (bidirectional image
+            # attention); the runtime sends the third wire frame only then.
+            "token_type_ids": vision_token_types,
         }
 
     try:
@@ -1399,7 +1402,8 @@ def run_export(model, output_dir, num_stages=1, quantization="int4",
             only_stage=stage, keep_grafted=keep_grafted,
             skip_tokenizer_regen=skip_tokenizer_regen,
             allow_kv_share=allow_kv_share, validate=validate,
-            num_kv_heads=n_kv_heads, head_dim=hd, vision=vision)
+            num_kv_heads=n_kv_heads, head_dim=hd, vision=vision,
+            vision_token_types=bool(info.get("token_type_ids", True)) if vision else True)
 
     log(f"ALL DONE in {time.time() - t0:.0f}s")
 

@@ -177,13 +177,12 @@ def pin_shapes(model: ov.Model, seq: int, context: int) -> None:
         raise SystemExit(f"reshape left dynamic dims: {bad}")
 
 
-def link_or_copy(src: str, dst: str) -> None:
+def copy_file(src: str, dst: str) -> None:
+    """A real copy, not a hardlink: cut_vlm_lm.py rewrites these paths in
+    place, which would change a linked static tree under it."""
     if os.path.exists(dst):
         os.remove(dst)
-    try:
-        os.link(src, dst)
-    except OSError:
-        shutil.copy2(src, dst)
+    shutil.copy2(src, dst)
 
 
 def convert_stage(tree: str, out: str, i: int, context: int, prefill_seq: int) -> None:
@@ -235,9 +234,10 @@ def copy_root(tree: str, out: str) -> None:
         if os.path.isdir(src):
             os.makedirs(os.path.join(out, name), exist_ok=True)
             for fn in os.listdir(src):
-                link_or_copy(os.path.join(src, fn), os.path.join(out, name, fn))
+                if os.path.isfile(os.path.join(src, fn)):
+                    copy_file(os.path.join(src, fn), os.path.join(out, name, fn))
         else:
-            link_or_copy(src, os.path.join(out, name))
+            copy_file(src, os.path.join(out, name))
 
 
 def main() -> None:
@@ -251,8 +251,9 @@ def main() -> None:
     ap.add_argument("--stage", type=int, default=None,
                     help="convert only this stage (a worker holding one stage)")
     args = ap.parse_args()
-    if os.path.abspath(args.tree) == os.path.abspath(args.output_dir):
-        raise SystemExit("--output-dir must differ from --tree")
+    tree, out = os.path.abspath(args.tree), os.path.abspath(args.output_dir)
+    if out == tree or out.startswith(tree + os.sep) or tree.startswith(out + os.sep):
+        raise SystemExit("--output-dir must be outside --tree (and not contain it)")
     if args.context < 2:
         raise SystemExit("--context must be >= 2")
     if args.prefill_seq > args.context - 1:
@@ -260,7 +261,8 @@ def main() -> None:
     with open(os.path.join(args.tree, "pipeline_config.json")) as f:
         pipeline = json.load(f)
     v = pipeline.get("vision") or {}
-    if v.get("token_type_ids"):
+    # Gemma 4 trees default to token_type_ids when the block does not say.
+    if v.get("token_type_ids", v.get("family") == "gemma4"):
         raise SystemExit(
             f"vision family {v.get('family')!r} attends bidirectionally inside images "
             "(token_type_ids); the static path steps one token at a time and cannot")
