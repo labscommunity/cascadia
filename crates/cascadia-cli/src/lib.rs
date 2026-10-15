@@ -1393,6 +1393,15 @@ fn parse_ov_config(entries: &[String]) -> Vec<(String, String)> {
 /// Load a whole-model chat template for ov-genai, tolerating both layouts:
 /// `tokenizer/tokenizer_config.json` (HF subdir) and a root-level
 /// `tokenizer_config.json` / `chat_template.jinja` (OV int4 exports).
+/// True when `model` is a pipeline dir whose `pipeline_config.json` carries a
+/// `vision` block (a Gemma 4 vision tree from `tools/gemma4_surgery --vision`).
+fn pipeline_has_vision(model: &str) -> bool {
+    std::fs::read(std::path::Path::new(model).join("pipeline_config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .is_some_and(|v| v.get("vision").is_some_and(|x| x.is_object()))
+}
+
 fn ovgenai_chat_template(model: &str) -> cascadia_api::ChatTemplateConfig {
     let p = std::path::Path::new(model);
     let sub = cascadia_api::load_chat_template_config(p);
@@ -2381,12 +2390,17 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // The body limit grows by the image allowance; the prompt cap does not.
         // `qwen35` trees carrying the vision IRs encode images on rank 0 (the
         // rank that serves this API) and take Qwen's native tag.
+        // `ov-runtime` serves images on a Gemma 4 vision tree (a `vision` block
+        // in pipeline_config.json; rank 0 encodes them) with Gemma's own tag.
         let has_vision = std::path::Path::new(&args.model)
             .join("openvino_vision_embeddings_model.xml")
             .exists();
         let media_kind = match args.engine {
             EngineKind::OvGenai if has_vision => Some(cascadia_api::MediaConfig::ov_genai()),
             EngineKind::Qwen36Moe if has_vision => Some(cascadia_api::MediaConfig::qwen35_native()),
+            EngineKind::OvRuntime if has_vision && pipeline_has_vision(&args.model) => {
+                Some(cascadia_api::MediaConfig::gemma4_native())
+            }
             _ => None,
         };
         if let Some(mut media) = media_kind {
@@ -3616,6 +3630,23 @@ mod cli_version_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pipeline_vision_block_is_detected() {
+        let dir = std::env::temp_dir().join(format!("cascadia-pv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        assert!(!pipeline_has_vision(d), "no pipeline_config.json");
+        std::fs::write(dir.join("pipeline_config.json"), r#"{"num_stages":2}"#).unwrap();
+        assert!(!pipeline_has_vision(d));
+        std::fs::write(
+            dir.join("pipeline_config.json"),
+            r#"{"num_stages":2,"vision":{"text_embeddings":"t.xml"}}"#,
+        )
+        .unwrap();
+        assert!(pipeline_has_vision(d));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
 
     #[test]
