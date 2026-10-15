@@ -463,8 +463,11 @@ The pipeline wire is covered by an in-process two-rank test over a real socket.
 
 Still open:
 
-- A multi-rank run on hardware with images (one 32 GB box cannot hold four 35B stage
-  processes next to its other workload; needs a second machine or the 2-stage tree pair).
+- ~~A multi-rank run on hardware with images.~~ Done 2026-10-15: two machines over
+  Tailscale, rank 0 (stage 0 + vision IRs) on pawan-04 and rank 1 (stage 1) on pawan-02,
+  the Qwen3.6-35B 2-stage tree. HELLO negotiated `mrope=true`; the full SDK check passes
+  (one image "A red square and a blue circle.", `prompt_tokens` 228, 13 s; two images in
+  order; streaming; refusals).
 - ~~Prefix reuse for image turns.~~ Done: single-box image turns key the local prefix
   cache on `VisionPrompt::cache_key` (pad tokens replaced by pseudo-ids from the image's
   pixel hash, row and tenant). Measured on pawan-04: a follow-up turn on the same image
