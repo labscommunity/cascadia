@@ -2344,6 +2344,22 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // the thinking-OFF path (engine sets apply_chat_template=false then);
         // thinking-ON stays on ov-genai's native template, untouched.
         cfg.defer_template_on_thinking = matches!(args.engine, EngineKind::OvGenai);
+        // Image input: ov-genai on a VLM-layout export (vision encoder IRs
+        // present). Every other engine answers `image_url` parts with a 400.
+        // The body limit grows by the image allowance; the prompt cap does not.
+        if matches!(args.engine, EngineKind::OvGenai)
+            && std::path::Path::new(&args.model)
+                .join("openvino_vision_embeddings_model.xml")
+                .exists()
+        {
+            let media = cascadia_api::MediaConfig::ov_genai();
+            info!(
+                max_images = media.max_images,
+                max_image_pixels = media.max_image_pixels,
+                "VLM export: accepting image_url content parts"
+            );
+            cfg.media = Some(media);
+        }
         // `CASCADIA_API_MAX_CONCURRENT`: in-flight request cap (backpressure is
         // 503 beyond it). A multi-stream engine serves `CASCADIA_STREAMS` at
         // once, so a client that sends that many requests at once needs the

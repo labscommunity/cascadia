@@ -990,6 +990,7 @@ impl Engine for OvGenaiCbEngine {
 
 /// Shared `GenConfig` assembly for both ov-genai engines (the CB engine
 /// passes 0 for the speculative knobs — the CB scheduler owns batching).
+#[allow(clippy::too_many_arguments)] // one flat knob list, mirrored by both engines
 fn build_gen_config(
     speculative_k: u32,
     prompt_lookup_ngram: u32,

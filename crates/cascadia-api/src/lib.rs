@@ -52,6 +52,9 @@ pub const DEFAULT_MAX_PROMPT_BYTES: usize = 32 * 1024;
 /// this whole HTTP-server crate.
 pub use cascadia_types::ApiStats;
 
+mod media;
+pub use media::MediaConfig;
+
 /// Tokens a chunk contributes to the cumulative counter. The convention
 /// (engine `n_tokens` authoritative, else one per non-empty chunk — #55)
 /// lives on [`cascadia_types::Chunk::token_count`] so the API's `usage`,
@@ -180,6 +183,8 @@ pub struct AppState {
     /// `false`, a success flips it back `true` — so `/health` reflects the real
     /// state of the chain instead of always returning 200 while requests 503.
     pub ready: Arc<std::sync::atomic::AtomicBool>,
+    /// See [`Config::media`].
+    pub media: Option<Arc<MediaConfig>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -199,6 +204,10 @@ pub struct Config {
     pub defer_template_on_thinking: bool,
     /// See [`MarkerDialect`]; the CLI loads it with [`MarkerDialect::load`].
     pub marker_dialect: Option<MarkerDialect>,
+    /// Image input settings; `None` (the default) when the served model takes
+    /// no images, so every `image_url` part is a 400. Raises the body limit by
+    /// [`MediaConfig::max_request_image_bytes`].
+    pub media: Option<MediaConfig>,
 }
 
 impl Default for Config {
@@ -210,6 +219,7 @@ impl Default for Config {
             chat_template: ChatTemplateConfig::default(),
             defer_template_on_thinking: false,
             marker_dialect: None,
+            media: None,
         }
     }
 }
@@ -543,6 +553,7 @@ pub fn make_router_with_stats(
         effort_words: false,
         marker_dialect: cfg.marker_dialect.clone(),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        media: cfg.media.clone().map(Arc::new),
     };
     let state = AppState {
         effort_words: state
@@ -579,7 +590,9 @@ pub fn make_router_with_stats(
         // Cap the JSON body so an attacker can't OOM the server with
         // a multi-GB request. Apply at router level so it applies to
         // every route, not just chat_completions.
-        .layer(DefaultBodyLimit::max(cfg.max_body_bytes))
+        .layer(DefaultBodyLimit::max(
+            cfg.max_body_bytes + cfg.media.as_ref().map_or(0, |m| m.max_request_image_bytes),
+        ))
         // Outermost: request count + latency per matched route (#16), so it
         // observes rejections from the inner layers too.
         .layer(axum::middleware::from_fn(track_http_metrics))
@@ -701,16 +714,65 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+#[serde(try_from = "RawChatMessage")]
 pub struct ChatMessage {
     pub role: String,
-    #[serde(default, deserialize_with = "de_null_content")]
+    /// The message's text: the string form as sent, or the array form's text
+    /// parts joined with "\n".
     pub content: String,
-    #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
     pub tool_calls: Option<Vec<ToolCall>>,
-    #[serde(default)]
     pub tool_call_id: Option<String>,
+    /// Every content part in order, kept only when the array form carried an
+    /// image (empty otherwise). The image path rebuilds the text from these so
+    /// each image's placeholder lands where the caller put the image.
+    pub parts: Vec<ContentPart>,
+}
+
+/// One OpenAI content part the server accepts.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContentPart {
+    Text(String),
+    ImageUrl { url: String, detail: Option<String> },
+}
+
+#[derive(Deserialize)]
+struct RawChatMessage {
+    role: String,
+    #[serde(default)]
+    content: Option<serde_json::Value>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+}
+
+impl TryFrom<RawChatMessage> for ChatMessage {
+    type Error = String;
+
+    fn try_from(raw: RawChatMessage) -> Result<Self, String> {
+        let (content, parts) = parse_content(raw.content)?;
+        Ok(Self {
+            role: raw.role,
+            content,
+            name: raw.name,
+            tool_calls: raw.tool_calls,
+            tool_call_id: raw.tool_call_id,
+            parts,
+        })
+    }
+}
+
+impl ChatMessage {
+    /// The image parts, in order.
+    pub fn images(&self) -> impl Iterator<Item = (&str, Option<&str>)> {
+        self.parts.iter().filter_map(|p| match p {
+            ContentPart::ImageUrl { url, detail } => Some((url.as_str(), detail.as_deref())),
+            ContentPart::Text(_) => None,
+        })
+    }
 }
 
 /// OpenAI tool spec (request input). `function` is opaque JSON (name,
@@ -737,39 +799,68 @@ pub struct FunctionCall {
 }
 
 /// OpenAI `content` is a string, null, or an array of typed parts.
-/// null/missing -> "" (assistant tool-call turns send content: null). An
-/// array of `text` parts joins with "\n" into the one string the chat
-/// template sees. Any other part type is rejected by name: silently dropping
-/// an image would have the model answer a question about a picture it never
-/// saw.
-fn de_null_content<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    use serde::de::Error;
-    match Option::<serde_json::Value>::deserialize(d)? {
-        None | Some(serde_json::Value::Null) => Ok(String::new()),
-        Some(serde_json::Value::String(s)) => Ok(s),
-        Some(serde_json::Value::Array(parts)) => {
-            let mut texts = Vec::with_capacity(parts.len());
-            for part in parts {
-                let kind = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                match (kind, part.get("text").and_then(|t| t.as_str())) {
-                    ("text", Some(text)) => texts.push(text.to_owned()),
-                    ("text", None) => {
-                        return Err(D::Error::custom("content part of type `text` needs a string `text`"))
-                    }
-                    ("", _) => return Err(D::Error::custom("content part is missing its `type`")),
-                    (other, _) => {
-                        return Err(D::Error::custom(format!(
-                            "content part type `{other}` is not supported; only `text` parts are accepted"
-                        )))
-                    }
-                }
-            }
-            Ok(texts.join("\n"))
+/// null/missing -> "" (assistant tool-call turns send content: null). The
+/// array's `text` parts join with "\n" into the one string the chat template
+/// sees; `image_url` parts are kept (with the text) in `parts` for the image
+/// path. Any other part type is rejected by name: silently dropping it would
+/// have the model answer about input it never saw.
+fn parse_content(value: Option<serde_json::Value>) -> Result<(String, Vec<ContentPart>), String> {
+    let parts = match value {
+        None | Some(serde_json::Value::Null) => return Ok((String::new(), Vec::new())),
+        Some(serde_json::Value::String(s)) => return Ok((s, Vec::new())),
+        Some(serde_json::Value::Array(parts)) => parts,
+        Some(_) => {
+            return Err("`content` must be a string, null, or an array of content parts".into())
         }
-        Some(_) => Err(D::Error::custom(
-            "`content` must be a string, null, or an array of content parts",
-        )),
+    };
+    let mut out = Vec::with_capacity(parts.len());
+    for part in parts {
+        let kind = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match kind {
+            "text" => match part.get("text").and_then(|t| t.as_str()) {
+                Some(text) => out.push(ContentPart::Text(text.to_owned())),
+                None => return Err("content part of type `text` needs a string `text`".into()),
+            },
+            // `image_url` is an object `{url, detail}`; some clients send
+            // the bare URL string.
+            "image_url" => {
+                let (url, detail) = match part.get("image_url") {
+                    Some(serde_json::Value::String(u)) => (Some(u.as_str()), None),
+                    Some(obj) => (
+                        obj.get("url").and_then(|u| u.as_str()),
+                        obj.get("detail").and_then(|d| d.as_str()),
+                    ),
+                    None => (None, None),
+                };
+                let Some(url) = url else {
+                    return Err("content part of type `image_url` needs `image_url.url`".into());
+                };
+                out.push(ContentPart::ImageUrl {
+                    url: url.to_owned(),
+                    detail: detail.map(str::to_owned),
+                });
+            }
+            "" => return Err("content part is missing its `type`".into()),
+            other => {
+                return Err(format!(
+                    "content part type `{other}` is not supported; only `text` and \
+                     `image_url` parts are accepted"
+                ))
+            }
+        }
     }
+    let text = out
+        .iter()
+        .filter_map(|p| match p {
+            ContentPart::Text(t) => Some(t.as_str()),
+            ContentPart::ImageUrl { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let has_image = out
+        .iter()
+        .any(|p| matches!(p, ContentPart::ImageUrl { .. }));
+    Ok((text, if has_image { out } else { Vec::new() }))
 }
 
 /// OpenAI `stop` is either a single string or an array of strings.
@@ -1360,6 +1451,7 @@ fn chat_template_smoke_failures(
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }
     }
     let tools = [Tool {
@@ -1672,6 +1764,7 @@ pub fn template_speaks_effort_words(
         name: None,
         tool_calls: None,
         tool_call_id: None,
+        parts: Vec::new(),
     }];
     let render =
         |w: &str| render_with_chat_env(env, &msgs, bos_token, eos_token, true, Some(w), None);
@@ -1811,6 +1904,125 @@ fn render_or_fallback(
                 "chat_template render failed; falling back to legacy formatter — prompt will lack role markers"
             );
             Ok(render_prompt_legacy(messages))
+        }
+    }
+}
+
+/// A chat request's images, decoded, and its messages with each image part
+/// replaced by that image's placeholder.
+struct PreparedMedia {
+    messages: Vec<ChatMessage>,
+    inputs: Vec<cascadia_types::MediaInput>,
+    cfg: Arc<MediaConfig>,
+}
+
+impl PreparedMedia {
+    /// Every image must reach the rendered prompt exactly once. A template
+    /// (or the no-template fallback, which keeps only the last user message)
+    /// that drops a message would otherwise leave GenAI with more images than
+    /// tags, and the model would never see the dropped ones.
+    fn check_placeholders(&self, prompt: &str) -> Result<(), String> {
+        let n = self.inputs.len();
+        let found = prompt.matches(self.cfg.placeholder_prefix()).count();
+        let each_once = (0..n).all(|i| prompt.matches(&self.cfg.placeholder(i)).count() == 1);
+        if found == n && each_once {
+            Ok(())
+        } else {
+            Err(format!(
+                "{n} images were sent but the rendered prompt carries {found} image \
+                 placeholders; this model's prompt format dropped the messages holding the rest"
+            ))
+        }
+    }
+}
+
+/// Validate and decode a chat request's `image_url` parts. `Ok(None)` for a
+/// text-only request. Decoding runs on the blocking pool: a large JPEG takes
+/// tens of milliseconds and would stall every connection on this worker.
+async fn prepare_media(
+    state: &AppState,
+    messages: &[ChatMessage],
+) -> Result<Option<PreparedMedia>, Response> {
+    let reject = |msg: String| {
+        count_rejected("invalid_media");
+        api_error(StatusCode::BAD_REQUEST, msg, None)
+    };
+    if let Some(cfg) = state.media.as_deref() {
+        let prefix = cfg.placeholder_prefix();
+        if messages.iter().any(|m| m.content.contains(prefix)) {
+            return Err(reject(format!(
+                "message text must not contain `{prefix}`: it is reserved for image placeholders"
+            )));
+        }
+    }
+    let count: usize = messages.iter().map(|m| m.images().count()).sum();
+    if count == 0 {
+        return Ok(None);
+    }
+    let Some(cfg) = state.media.clone() else {
+        return Err(reject(format!(
+            "model `{}` does not accept image input (`image_url` content parts)",
+            state.model_id
+        )));
+    };
+    if let Some(m) = messages
+        .iter()
+        .find(|m| m.role != "user" && m.images().next().is_some())
+    {
+        return Err(reject(format!(
+            "`image_url` parts are only accepted in `user` messages, not `{}`",
+            m.role
+        )));
+    }
+    if count > cfg.max_images {
+        return Err(reject(format!(
+            "{count} images in one request; the limit is {}",
+            cfg.max_images
+        )));
+    }
+    let messages = messages.to_vec();
+    let decode_cfg = Arc::clone(&cfg);
+    let decoded = tokio::task::spawn_blocking(move || {
+        let mut inputs = Vec::with_capacity(count);
+        let mut out = Vec::with_capacity(messages.len());
+        for mut m in messages {
+            if m.parts.is_empty() {
+                out.push(m);
+                continue;
+            }
+            let mut pieces = Vec::with_capacity(m.parts.len());
+            for part in std::mem::take(&mut m.parts) {
+                match part {
+                    ContentPart::Text(t) => pieces.push(t),
+                    ContentPart::ImageUrl { url, detail } => {
+                        let i = inputs.len();
+                        let input = media::decode_image_url(&url, detail.as_deref(), &decode_cfg)
+                            .map_err(|e| format!("image {i}: {e}"))?;
+                        inputs.push(input);
+                        pieces.push(decode_cfg.placeholder(i));
+                    }
+                }
+            }
+            m.content = pieces.join("\n");
+            out.push(m);
+        }
+        Ok::<_, String>((out, inputs))
+    })
+    .await;
+    match decoded {
+        Ok(Ok((messages, inputs))) => Ok(Some(PreparedMedia {
+            messages,
+            inputs,
+            cfg,
+        })),
+        Ok(Err(msg)) => Err(reject(msg)),
+        Err(join_err) => {
+            tracing::error!(error = %join_err, "image decode task failed");
+            Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "image decoding failed",
+                None,
+            ))
         }
     }
 }
@@ -2310,18 +2522,38 @@ async fn chat_completions(
     // client's "low" reaches such a template unescalated — or, when the caller
     // sent nothing of their own, with the effort undefined (the template's
     // default). A caller word the template also rejects is a 400.
-    let prompt = match render_prompt(
-        &state,
-        &req.messages,
-        enable_thinking,
-        EffortArgs {
-            mapped: Some(req.effective_reasoning_effort()),
-            raw: req.reasoning_effort.as_deref(),
-            explicit_thinking: req.enable_thinking.is_some(),
-            template_words: state.effort_words,
-        },
-        req.tools.as_deref(),
-    ) {
+    let media = match prepare_media(&state, &req.messages).await {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    let effort = EffortArgs {
+        mapped: Some(req.effective_reasoning_effort()),
+        raw: req.reasoning_effort.as_deref(),
+        explicit_thinking: req.enable_thinking.is_some(),
+        template_words: state.effort_words,
+    };
+    let rendered = match &media {
+        // Image requests always render here, thinking or not, so each
+        // placeholder sits inside its own message; the engine is told not to
+        // template again (`prompt_rendered`).
+        Some(m) => render_or_fallback(
+            state.chat_env.as_deref(),
+            &m.messages,
+            &state.bos_token,
+            &state.eos_token,
+            enable_thinking,
+            effort,
+            req.tools.as_deref(),
+        ),
+        None => render_prompt(
+            &state,
+            &req.messages,
+            enable_thinking,
+            effort,
+            req.tools.as_deref(),
+        ),
+    };
+    let prompt = match rendered {
         Ok(p) => p,
         // A tools request that cannot be templated must not return a 200: the
         // model would answer without ever seeing the tools, and the caller
@@ -2364,6 +2596,14 @@ async fn chat_completions(
             None,
         );
     }
+    if let Some(m) = &media {
+        if let Err(msg) = m.check_placeholders(&prompt) {
+            count_rejected("invalid_media");
+            return api_error(StatusCode::BAD_REQUEST, msg, None);
+        }
+    }
+    let prompt_rendered = media.is_some() && state.chat_env.is_some();
+    let media = media.map(|m| m.inputs).unwrap_or_default();
     let task = GenerationTask {
         task_id: task_id.clone(),
         prompt,
@@ -2382,8 +2622,8 @@ async fn chat_completions(
         // model's context PAST the rendered prompt. Only the scheduler's
         // rescue path sets it, engine-side of this API.
         resume_token_ids: None,
-        media: Vec::new(),
-        prompt_rendered: false,
+        media,
+        prompt_rendered,
     };
 
     // Acquire a request slot before touching the engine. Contended streams
@@ -3381,6 +3621,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }
     }
 
@@ -3914,6 +4155,141 @@ mod tests {
             .contains("multi-prompt"));
     }
 
+    /// A router whose model takes images, with a template that prints each
+    /// message so the placeholder's position is visible in the mock's echo.
+    async fn make_image_app() -> Router {
+        let mut runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some(
+                    "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}".into(),
+                ),
+                bos_token: None,
+                eos_token: None,
+            },
+            media: Some(MediaConfig::ov_genai()),
+            ..Config::default()
+        };
+        make_router_with_config(Arc::new(runner), "mock-model", cfg)
+    }
+
+    fn png_url(w: u32, h: u32) -> String {
+        use base64::Engine as _;
+        let img = image::RgbImage::from_pixel(w, h, image::Rgb([200, 10, 10]));
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(buf)
+        )
+    }
+
+    fn image_msg(text: &str, url: &str) -> serde_json::Value {
+        serde_json::json!({"role": "user", "content": [
+            {"type": "text", "text": text},
+            {"type": "image_url", "image_url": {"url": url}}]})
+    }
+
+    /// End to end on a model that takes images: the request is served, and
+    /// the image's placeholder lands in the prompt where the caller put the
+    /// image (the mock engine echoes prompt words back).
+    #[tokio::test]
+    async fn image_request_is_served_with_its_placeholder_in_place() {
+        let (status, v) = post_chat(
+            make_image_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [image_msg("describe", &png_url(8, 8))],
+                "max_tokens": 16,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {v}");
+        let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(
+            content.contains("describe") && content.contains("<ov_genai_image_0>"),
+            "placeholder missing from the echoed prompt: {content:?}"
+        );
+    }
+
+    /// Everything the image path refuses comes back as an OpenAI-shaped 400
+    /// naming the reason.
+    #[tokio::test]
+    async fn image_requests_are_refused_with_openai_400s() {
+        let png = png_url(4, 4);
+        let nine: Vec<_> = (0..9).map(|_| image_msg("x", &png)).collect();
+        let cases = [
+            (
+                serde_json::json!([image_msg("x", "https://example.com/a.png")]),
+                "only `data:`",
+            ),
+            (
+                serde_json::json!([image_msg("x", "data:image/png;base64,aGVsbG8=")]),
+                "image 0: unsupported image format",
+            ),
+            (serde_json::json!(nine), "the limit is 8"),
+            (
+                serde_json::json!([{"role": "system", "content": [
+                    {"type": "image_url", "image_url": {"url": png}}]}]),
+                "only accepted in `user` messages",
+            ),
+            (
+                serde_json::json!([{"role": "user", "content": "see <ov_genai_image_0>"}]),
+                "reserved for image placeholders",
+            ),
+        ];
+        for (messages, needle) in cases {
+            let (status, v) = post_chat(
+                make_image_app().await,
+                serde_json::json!({"model": "mock-model", "messages": messages}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body: {v}");
+            assert_eq!(v["error"]["type"], "invalid_request_error");
+            let msg = v["error"]["message"].as_str().unwrap_or_default();
+            assert!(msg.contains(needle), "expected {needle:?} in {msg:?}");
+        }
+    }
+
+    /// Without a chat template only the last user message is sent, so an
+    /// image in an earlier one would never reach the model. That is a 400,
+    /// not an answer that silently ignores the image.
+    #[tokio::test]
+    async fn image_dropped_by_the_prompt_format_is_a_400() {
+        let mut runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            media: Some(MediaConfig::ov_genai()),
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({"model": "mock-model", "messages": [
+                image_msg("first", &png_url(4, 4)),
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "and now?"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {v}");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("1 images were sent"), "{msg}");
+    }
+
     #[tokio::test]
     async fn completions_honor_stop_and_finish_reason() {
         let (status, v) = post_completions(
@@ -4133,6 +4509,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         let env = build_chat_env(MACRO_TEMPLATE).expect("macro-based template must parse");
         let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true, None, None)
@@ -4162,6 +4539,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         let on = renderer.render_with_tools(&msgs, None).unwrap();
         assert!(on.ends_with("<think>"), "thinking-on render: {on}");
@@ -4195,6 +4573,7 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         let env = build_chat_env(T).expect("template parses");
         let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true, None, None)
@@ -4211,6 +4590,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
 
         // Template present: renders through the parsed env (parsed once in `new`).
@@ -4291,12 +4671,48 @@ mod tests {
     /// A part the model cannot see is refused by name, never dropped: a
     /// silently stripped image would get an answer about a picture the model
     /// never saw.
+    /// Image parts are kept in order with the text around them; the plain
+    /// `content` string stays the text alone, so every text-only path is
+    /// unchanged. Both `image_url` shapes (object and bare string) parse.
+    #[test]
+    fn message_keeps_image_parts_in_order() {
+        let raw = r#"{"role":"user","content":[
+            {"type":"text","text":"compare"},
+            {"type":"image_url","image_url":{"url":"data:a","detail":"low"}},
+            {"type":"image_url","image_url":"data:b"}]}"#;
+        let m: ChatMessage = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.content, "compare");
+        assert_eq!(
+            m.parts,
+            vec![
+                ContentPart::Text("compare".into()),
+                ContentPart::ImageUrl {
+                    url: "data:a".into(),
+                    detail: Some("low".into())
+                },
+                ContentPart::ImageUrl {
+                    url: "data:b".into(),
+                    detail: None
+                },
+            ]
+        );
+        assert_eq!(m.images().count(), 2);
+        let text_only: ChatMessage =
+            serde_json::from_str(r#"{"role":"user","content":[{"type":"text","text":"hi"}]}"#)
+                .unwrap();
+        assert!(text_only.parts.is_empty());
+    }
+
     #[test]
     fn message_rejects_non_text_content_parts() {
         for (raw, needle) in [
             (
-                r#"{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:,"}}]}"#,
-                "`image_url` is not supported",
+                r#"{"role":"user","content":[{"type":"input_audio","input_audio":{}}]}"#,
+                "`input_audio` is not supported",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"image_url","image_url":{}}]}"#,
+                "needs `image_url.url`",
             ),
             (
                 r#"{"role":"user","content":[{"text":"no type"}]}"#,
@@ -4747,6 +5163,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         let tools = vec![Tool {
             r#type: "function".into(),
@@ -4772,6 +5189,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         let tools = vec![Tool {
             r#type: "function".into(),
@@ -4928,6 +5346,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         let tools = vec![Tool {
             r#type: "function".into(),
@@ -4994,6 +5413,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         let tools = vec![Tool {
             r#type: "function".into(),
@@ -5057,6 +5477,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
 
         let unset = render_with_chat_env(&env, &msgs, "", "", true, None, None).unwrap();
@@ -5571,6 +5992,7 @@ level={{ effort_map[eff] }}";
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         let tools = vec![Tool {
             r#type: "function".into(),
@@ -5624,6 +6046,7 @@ level={{ effort_map[eff] }}";
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         match render_or_fallback(
             Some(&env),
@@ -5687,6 +6110,7 @@ level={{ effort_map[eff] }}";
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         let out = render_with_chat_env(&env, &msgs, "", "", true, None, Some(&tools)).unwrap();
         assert_eq!(out, r#"{"description": "a", "name": "b"}"#);
@@ -5704,6 +6128,7 @@ level={{ effort_map[eff] }}";
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         let out = render_with_chat_env(&env, &msgs, "", "", true, None, None).unwrap();
         assert_eq!(out.len(), 4, "expected a 4-digit year, got {out:?}");
@@ -5733,6 +6158,7 @@ level={{ effort_map[eff] }}";
                     },
                 }]),
                 tool_call_id: None,
+                parts: Vec::new(),
             },
             ChatMessage {
                 role: "tool".into(),
@@ -5740,6 +6166,7 @@ level={{ effort_map[eff] }}";
                 name: Some("get_weather".into()),
                 tool_calls: None,
                 tool_call_id: Some("call_1".into()),
+                parts: Vec::new(),
             },
         ];
         let out = render_with_chat_env(&env, &msgs, "", "", true, None, None).unwrap();
