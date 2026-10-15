@@ -428,6 +428,48 @@ Follow-ups, also built:
 - `tests/conformance/test_openai_sdk.py`: the pinned `openai` SDK against the mock
   engine, run in CI.
 
+## Phase 2: what was built and verified (2026-10-15)
+
+Rank-0 vision for the staged `qwen35` engine, in Rust (`crates/cascadia-engine-openvino/src/qwen35_vision/`):
+
+- **Preprocessing** (`mod.rs`, `resample.rs`): `smart_resize`, a bicubic resize that
+  reproduces Pillow's fixed-point `Resample.c`, rescale/normalise in the PIL backend's
+  dtypes, temporal padding, patch layout. Bit-identical in f32 to transformers 5.14.1's PIL
+  processor on seven fixtures (including a 2.8x antialiased downscale), within one 8-bit
+  level of the torchvision processor.
+- **M-RoPE** (`rope.rs`): `get_rope_index` for images and videos (per-frame split), the
+  4-row layout, decode positions from `rope_delta`. Exact against HF on one image, two
+  images, multi-turn, a 4-frame video and text only.
+- **Vision IR host inputs** (`encoder.rs`): bilinear indices/weights (torch.linspace's f32
+  rounding reproduced), weighted corner sum, `rotary_pos_emb`, per-frame `cu_seqlens` and
+  the merger's block-diagonal mask; `VisionEncoder` drives the three IRs. On pawan-04 the
+  Rust chain matches HF's processor and `vision_utils` driving the same IRs at every stage
+  (gaps ~1e-16 on sampled values).
+- **Engine** (`qwen36.rs`, `prompt.rs`): admission encodes images and expands each
+  `<|image_pad|>`; prefill splices image rows over pad embeddings (also across chunk
+  boundaries); `chain_pass` takes explicit positions. Pipelines send `FRAME_FORWARD_MROPE`
+  (kind 13) for image turns only, gated by the `MROPE_CAP` bit in the HELLO_ACK capability
+  field; image turns are refused (never answered text-only) without vision IRs, on a chain
+  lacking the bit, when resumed, or past the window. Image turns skip every prefix/KV cache.
+- **API/CLI/exporter**: `MediaConfig::qwen35_native` (native tag, reserved tags refused in
+  caller text); enabled for `--engine qwen35` when the tree has the vision IRs;
+  `export_qwen36_moe.py` copies them and records `manifest.vision`.
+
+End to end on pawan-04 (Qwen3.6-35B-A3B 4-stage tree, single box, CPU), unmodified
+`openai` SDK: one image "A red square and a blue circle." (`prompt_tokens` 228), two images
+described in order (433), streaming and refusals as in Phase 1b. Answers and token counts
+are identical to the GenAI `VLMPipeline` path. Image encode about 1.8 s per image on CPU.
+The pipeline wire is covered by an in-process two-rank test over a real socket.
+
+Still open:
+
+- A multi-rank run on hardware with images (one 32 GB box cannot hold four 35B stage
+  processes next to its other workload; needs a second machine or the 2-stage tree pair).
+- Image turns could reuse a text-only prefix before the first image; today they always
+  prefill cold. Cache keys that include the image `sha256` would allow more.
+- Vision IR placement (iGPU) and timing; HF-logit parity on image prompts (Phase 2 exit
+  criterion) beyond the GenAI answer match; 397B (Phase 3).
+
 ## Video: out of scope, kept cheap
 
 Video ships in no phase of this RFC. The image work must still leave nothing that
