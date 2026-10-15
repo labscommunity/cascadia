@@ -768,6 +768,11 @@ struct ModelEntry {
     object: &'static str,
     created: i64,
     owned_by: &'static str,
+    /// Additive to OpenAI's model object (the SDKs keep unknown fields):
+    /// which input kinds `/v1/chat/completions` accepts, in OpenRouter's
+    /// `input_modalities` vocabulary. `["text", "image"]` when `image_url`
+    /// parts are served, `["text"]` otherwise.
+    input_modalities: Vec<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -784,6 +789,11 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
             object: "model",
             created: 0,
             owned_by: "cascadia",
+            input_modalities: if state.media.is_some() {
+                vec!["text", "image"]
+            } else {
+                vec!["text"]
+            },
         }],
     })
 }
@@ -4613,6 +4623,31 @@ mod tests {
         let body = to_bytes(response.into_body(), 1024).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["data"][0]["id"], "mock-model");
+        assert_eq!(
+            v["data"][0]["input_modalities"],
+            serde_json::json!(["text"])
+        );
+    }
+
+    /// Clients discover image support from `/v1/models` before sending one.
+    #[tokio::test]
+    async fn list_models_advertises_image_input_on_vlm() {
+        let response = make_image_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap()).unwrap();
+        assert_eq!(
+            v["data"][0]["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
     }
 
     #[tokio::test]
