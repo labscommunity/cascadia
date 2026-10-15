@@ -80,9 +80,24 @@ fn clip8(ss: i64) -> u8 {
 }
 
 /// Resize packed RGB8 `src` (`w x h`) to `nw x nh`, exactly as Pillow does.
+///
+/// Pillow >= 12 (`Image.resize`) shrinks an image more than 100 times taller
+/// than wide in two calls, height first and then width; the result differs
+/// from the single two-pass resize by up to an 8-bit level, so it is
+/// mirrored here. HF's processors resize through whatever Pillow is
+/// installed; the fixtures were made with 12.3.
 pub fn resize_rgb8_bicubic(src: &[u8], w: usize, h: usize, nw: usize, nh: usize) -> Vec<u8> {
     assert_eq!(src.len(), w * h * 3, "src is not {w}x{h} RGB8");
     assert!(nw > 0 && nh > 0, "empty target size");
+    if h > w * 100 && nh < h {
+        let tall = resize_two_pass(src, w, h, w, nh);
+        return resize_two_pass(&tall, w, nh, nw, nh);
+    }
+    resize_two_pass(src, w, h, nw, nh)
+}
+
+/// Pillow's `ImagingResampleInner`: a horizontal pass, then a vertical one.
+fn resize_two_pass(src: &[u8], w: usize, h: usize, nw: usize, nh: usize) -> Vec<u8> {
     let need_h = nw != w;
     let need_v = nh != h;
     let bias: i64 = 1 << (PRECISION_BITS - 1);
