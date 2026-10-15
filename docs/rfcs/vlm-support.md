@@ -519,7 +519,8 @@ section D problem does not arise for them; E2B/E4B are still refused by the surg
   stage's sliding-window layers attend bidirectionally inside an image and only rank 0
   knows where images are. The stateful path prefills the whole prompt in one inference,
   so an image is never split across chunks; static, chunked-prefill and packed shards
-  are refused for vision trees. Turns with images skip KV warm-resume and capture,
+  are refused for Gemma 4 vision trees (Pixtral takes them, see below). Turns with
+  images skip KV warm-resume and capture,
   because every same-size image has the same ids.
 - **API.** `MediaConfig::gemma4_native` uses the template's own `<|image|>` and reserves
   the image/video/audio markers in user text; the CLI enables it for `ov-runtime` when
@@ -598,8 +599,54 @@ The first non-Gemma family on the staged path, from `OpenVINO/pixtral-12b-int4-o
   then answers incorrectly ("a square and a triangle. The square is blue", "black and
   white"), with 903 instead of 832 prompt tokens: its Pixtral preprocessing differs from
   HF's. The staged path, with HF-exact preprocessing on the same IRs, answers correctly,
-  so this is GenAI's, not the export's. Pixtral is served staged; single box it needs a
-  GenAI fix.
+  so this is GenAI's, not the export's. Pixtral is served by `ov-runtime`, staged or
+  as a one-stage tree on a single box (next section).
+
+## Static (NPU) and packed paths for vision trees (2026-10-16)
+
+`ov-runtime`'s static path (stateless shards, host-side KV ring) and its packed
+multi-slot path (several requests in one inference, built on the static shards) now
+serve causal vision trees. Pixtral is the one today.
+
+- **Export.** `tools/vlm_surgery/static_variant.py` turns a stateful tree from
+  `cut_vlm_lm.py` into the static contract `export_shards --target npu` writes. Per
+  stage: `beam_idx` becomes the constant `[0]`; each KV `ReadValue` becomes a
+  `past_key_values.{i}` input and each `Assign` a `present.{i}` output (f16, numbered
+  by layer within the stage); the head's last-position slice is dropped so a prefill
+  chunk returns every row; every shape is pinned. `--prefill-seq C` adds the chunked
+  prefill IR. OpenVINO's own `stateful_to_stateless_transformation` rejects cut stages
+  (their `beam_idx` Gathers do not match its pattern). `tools/packed_variant.py`
+  then builds the packed IR from the static one unchanged: the optimum IR also feeds
+  every SDPA from one additive f32 mask node.
+- **Rank 0** embeds the prompt once (text rows from the embedding IR, image rows
+  spliced in) and feeds `inputs_embeds` rows: one per seq=1 step, `C` per prefill
+  chunk, or the slot's rows per packed inference. A decode step embeds the sampled
+  token. Downstream stages are unchanged.
+- **Packed slots** hold their own spliced prompt rows. The shared prefix (`--packed-prefix`)
+  is matched and populated only up to a prompt's first image token: every image of one
+  size has the same ids, so matching past it would reuse another image's K/V. Images
+  are encoded at `submit`, so a prompt that outgrows the slot's region is refused there
+  with the same 413 `context_length_exceeded` a long text prompt gets.
+- **Refused at load:** `token_type_ids` trees (Gemma 4). Their sliding layers attend
+  bidirectionally inside an image, which seq=1 stepping cannot do, and their layers mix
+  KV geometries (256-wide sliding, 512-wide global heads) that one ring cannot hold.
+  `static_variant.py` refuses them too.
+- **Verified** across pawan-02 and pawan-04 (2 stages, CPU, context 2048):
+  - static, prefill chunks of 256: 11/11, the same answers and token counts as the
+    stateful tree ("There is a red square and a blue circle.", 832 prompt tokens; two
+    images 1650);
+  - packed, 2 slots of 32 rows: a red/blue and a green/yellow image of the same size
+    plus a text prompt sent at once each get their own answer.
+- **Single box.** `cut_vlm_lm.py --num-stages 1` now cuts a one-stage tree, so Pixtral
+  is served on one box by `ov-runtime` (GenAI answers it wrongly, see above). On
+  pawan-02: stateful 11/11 (one image in 27 s); packed with 2 slots and
+  `--packed-prefix 64` (which is single-stage only) 10/11 with the two-image check
+  refused 413 as designed (1650 tokens, 991-token slots), the same-size image swap
+  answering about the new image with the shared prefix live, and the concurrent check
+  passing.
+- **Unit test:** `tools/tests/test_vlm_static_variant.py` converts a toy two-layer
+  stateful stage and checks the port contract and that one stateless step with the
+  stateful past fed explicitly matches the stateful step.
 
 ## Engines that do not take images (2026-10-15)
 
@@ -610,7 +657,7 @@ from the text alone.
 |---|---|---|
 | `ov-genai` | VLM exports with the vision IR | served; on a text-only export the API offers no image input (400), and `submit` refuses too |
 | `qwen35` | trees with the vision IRs | served; otherwise 400 at the API and at `submit` |
-| `ov-runtime` | Gemma 4 surgery trees (`vision.family = "gemma4"`) and Pixtral trees (`"pixtral"`) | served; other trees 400; an unknown `vision.family` fails to load |
+| `ov-runtime` | Gemma 4 surgery trees (`vision.family = "gemma4"`, stateful path) and Pixtral trees (`"pixtral"`, stateful, static and packed paths) | served; other trees 400; an unknown `vision.family` fails to load |
 | `gemma4` (`gemma4_cached` trees) | E2B/E4B trees from `export_gemma4.py --vision` | served; other trees 400 at the API and at `submit` |
 | `ov-dist-spec` | no | 400; draft and target would both need the expanded image prompt |
 | `sparse-moe` | no | 400 |
