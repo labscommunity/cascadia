@@ -415,8 +415,18 @@ Built (local commits on `pawan/vlm-research`):
 - CLI: enabled for `--engine ov-genai` when `openvino_vision_embeddings_model.xml` is
   present; body limit grows by 20 MiB of image bytes.
 
-Not yet: remote `https` image URLs (needs SSRF guards, opt-in flag), the `/v1/models`
-capability field, and an SDK conformance suite in CI.
+Follow-ups, also built:
+
+- `/v1/models` reports `input_modalities` (`["text", "image"]` on a VLM, else `["text"]`).
+- Remote images behind `--api-allow-image-urls` (off by default): `https` on port 443
+  only, no credentials, no proxy; every resolved address must be public and the
+  connection is pinned to it (no rebinding); at most 3 redirects, each re-checked;
+  `image/*` only; the request's 20 MiB byte budget; one 10 s deadline per image across
+  DNS, hops and body, and 20 s for all of a request's fetches. Errors never reveal what a
+  refused host resolved to or why a connection failed.
+- Malformed-body 400s carry serde's reason and JSON path only.
+- `tests/conformance/test_openai_sdk.py`: the pinned `openai` SDK against the mock
+  engine, run in CI.
 
 ## Video: out of scope, kept cheap
 
