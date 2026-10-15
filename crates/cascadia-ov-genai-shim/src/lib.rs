@@ -580,7 +580,8 @@ impl LlmPipeline {
     }
 
     /// VLM-layout export (e.g. Qwen3.5/3.6: `openvino_language_model.xml`
-    /// + separate embeddings IRs), served text-only via `VLMPipeline`.
+    /// and separate embeddings IRs), served via `VLMPipeline`; images go in
+    /// through [`LlmPipeline::generate`]'s `media`.
     /// `prompt_lookup` enables prompt-lookup decoding (OV GenAI >= 2026.2
     /// supports it on VLM pipelines).
     pub fn vlm(
