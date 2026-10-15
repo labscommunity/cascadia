@@ -438,19 +438,34 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
         print(f"stage{i}: layers {a}..{b} saved in {time.time()-t0:.0f}s "
               f"inputs={info['inputs']} states={len(info['state_vars'])}", flush=True)
 
+    # Vision tower (VLM exports): rank 0 encodes images with these three IRs
+    # and the processor settings; the engine enables image input when the
+    # first IR is present (crates/cascadia-engine-openvino/src/qwen35_vision).
+    vision_files = [f"openvino_vision_embeddings{s}_model.{ext}"
+                    for s in ("", "_pos", "_merger") for ext in ("xml", "bin")]
+    have_vision = all(os.path.exists(os.path.join(model_dir, f)) for f in vision_files)
+    if have_vision:
+        manifest["vision"] = {
+            "embeddings": "openvino_vision_embeddings_model.xml",
+            "pos": "openvino_vision_embeddings_pos_model.xml",
+            "merger": "openvino_vision_embeddings_merger_model.xml",
+        }
     with open(os.path.join(output_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
     # aux files the engine needs alongside the stages (single-dir UX)
     import shutil
-    for aux in ("openvino_text_embeddings_model.xml", "openvino_text_embeddings_model.bin",
-                "tokenizer.json", "generation_config.json", "config.json",
-                # API renders /v1/chat/completions through this when present
-                # (legacy "role: content" formatting otherwise)
-                "chat_template.jinja"):
+    aux_files = ["openvino_text_embeddings_model.xml", "openvino_text_embeddings_model.bin",
+                 "tokenizer.json", "generation_config.json", "config.json",
+                 # API renders /v1/chat/completions through this when present
+                 # (legacy "role: content" formatting otherwise)
+                 "chat_template.jinja"]
+    if have_vision:
+        aux_files += vision_files + ["preprocessor_config.json", "video_preprocessor_config.json"]
+    for aux in aux_files:
         src = os.path.join(model_dir, aux)
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(output_dir, aux))
-    print("manifest + aux files written", flush=True)
+    print("manifest + aux files written" + (" (with vision IRs)" if have_vision else ""), flush=True)
 
     if not validate:
         return

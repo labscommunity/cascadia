@@ -21,8 +21,12 @@ use sha2::{Digest, Sha256};
 pub struct MediaConfig {
     /// Text that marks image `i` in the prompt, with `{i}` replaced by the
     /// image's index in the request. ov-genai uses its universal tag, which
-    /// GenAI maps to each model's native one.
+    /// GenAI maps to each model's native one; the staged Qwen3.5 engine takes
+    /// the native tag, the same for every image (no `{i}`).
     pub image_placeholder: String,
+    /// Text a caller's message must not contain: the engine would read it as
+    /// an image tag and fail the request or misplace an image.
+    pub reserved_text: Vec<String>,
     /// Images allowed in one request.
     pub max_images: usize,
     /// Images larger than this many pixels are downscaled to fit, keeping
@@ -52,6 +56,7 @@ impl MediaConfig {
     pub fn ov_genai() -> Self {
         Self {
             image_placeholder: "<ov_genai_image_{i}>".into(),
+            reserved_text: vec!["<ov_genai_image_".into()],
             max_images: 8,
             // 1024x1024: about 1000 image tokens on Qwen3.5.
             max_image_pixels: 1 << 20,
@@ -64,18 +69,59 @@ impl MediaConfig {
         }
     }
 
+    /// Settings for the staged `qwen35` engine (rank 0 encodes the images):
+    /// Qwen's native tag, which rank 0 expands to the image's token count.
+    pub fn qwen35_native() -> Self {
+        Self {
+            image_placeholder: "<|vision_start|><|image_pad|><|vision_end|>".into(),
+            reserved_text: [
+                "<|vision_start|>",
+                "<|image_pad|>",
+                "<|vision_end|>",
+                "<|video_pad|>",
+            ]
+            .map(String::from)
+            .to_vec(),
+            ..Self::ov_genai()
+        }
+    }
+
     pub fn placeholder(&self, i: usize) -> String {
         self.image_placeholder.replace("{i}", &i.to_string())
     }
 
-    /// The part of the placeholder before the index. User text containing it
-    /// is refused: GenAI would read it as an image tag and fail the request
-    /// or misplace an image.
-    pub fn placeholder_prefix(&self) -> &str {
-        self.image_placeholder
-            .split("{i}")
-            .next()
-            .unwrap_or(&self.image_placeholder)
+    /// The reserved text `text` contains, if any.
+    pub fn reserved_in<'a>(&'a self, text: &str) -> Option<&'a str> {
+        self.reserved_text
+            .iter()
+            .map(String::as_str)
+            .find(|r| text.contains(r))
+    }
+
+    /// Whether the rendered `prompt` carries `n` images' placeholders, each
+    /// exactly once (indexed tags), or exactly `n` of the one shared tag.
+    pub fn placeholders_complete(&self, prompt: &str, n: usize) -> Result<(), usize> {
+        if self.image_placeholder.contains("{i}") {
+            let prefix = self
+                .image_placeholder
+                .split("{i}")
+                .next()
+                .unwrap_or_default();
+            let found = prompt.matches(prefix).count();
+            let each_once = (0..n).all(|i| prompt.matches(&self.placeholder(i)).count() == 1);
+            if found == n && each_once {
+                Ok(())
+            } else {
+                Err(found)
+            }
+        } else {
+            let found = prompt.matches(self.image_placeholder.as_str()).count();
+            if found == n {
+                Ok(())
+            } else {
+                Err(found)
+            }
+        }
     }
 }
 
@@ -744,9 +790,31 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_and_prefix() {
+    fn placeholders_and_reserved_text() {
         let cfg = MediaConfig::ov_genai();
         assert_eq!(cfg.placeholder(3), "<ov_genai_image_3>");
-        assert_eq!(cfg.placeholder_prefix(), "<ov_genai_image_");
+        assert_eq!(
+            cfg.reserved_in("see <ov_genai_image_0>"),
+            Some("<ov_genai_image_")
+        );
+        assert_eq!(
+            cfg.placeholders_complete("<ov_genai_image_0> a <ov_genai_image_1>", 2),
+            Ok(())
+        );
+        assert_eq!(cfg.placeholders_complete("<ov_genai_image_1>", 2), Err(1));
+        assert!(cfg
+            .placeholders_complete("<ov_genai_image_0><ov_genai_image_0>", 2)
+            .is_err());
+
+        let q = MediaConfig::qwen35_native();
+        let tag = q.placeholder(0);
+        assert_eq!(tag, q.placeholder(5), "one shared tag for every image");
+        assert_eq!(q.placeholders_complete(&format!("{tag}x{tag}"), 2), Ok(()));
+        assert_eq!(q.placeholders_complete(&tag, 2), Err(1));
+        assert_eq!(
+            q.reserved_in("raw <|image_pad|> text"),
+            Some("<|image_pad|>")
+        );
+        assert_eq!(q.reserved_in("plain text"), None);
     }
 }
