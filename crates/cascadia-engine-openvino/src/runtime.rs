@@ -4136,6 +4136,9 @@ impl Engine for OvRuntimeEngine {
                 "non-first stage does not accept tasks directly".into(),
             ));
         }
+        if self.vision.as_ref().is_none_or(|v| v.first.is_none()) {
+            cascadia_engine::refuse_media(&task, "ov-runtime (tree without a `vision` block)")?;
+        }
         // Dead-wire latch: refuse before the request costs anything. This is
         // synchronous with the HTTP request, so the non-streaming path answers
         // 5xx (and the API's readiness tracker sees a failure) rather than

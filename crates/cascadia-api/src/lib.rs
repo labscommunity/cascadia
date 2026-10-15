@@ -161,11 +161,23 @@ where
                 count_rejected("malformed_body");
                 // A body over the limit keeps its 413; everything else is
                 // the caller's malformed request.
-                let status = match rej.status() {
-                    StatusCode::PAYLOAD_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
-                    _ => StatusCode::BAD_REQUEST,
-                };
-                Err(api_error(status, rejection_message(&rej), None))
+                if rej.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                    // axum's own text ("length limit exceeded") names no
+                    // cause. Images are the usual one, and a server whose
+                    // model takes none grants them no allowance.
+                    return Err(api_error(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "request body is larger than this server accepts; if it carries \
+                         images, check that the model accepts image input \
+                         (`input_modalities` in `/v1/models`) and send fewer or smaller images",
+                        None,
+                    ));
+                }
+                Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    rejection_message(&rej),
+                    None,
+                ))
             }
         }
     }
@@ -3997,6 +4009,7 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
         EngineError::InvalidConfig(_)
         | EngineError::PeerRejected(_)
         | EngineError::ShardRejected(_)
+        | EngineError::UnsupportedInput(_)
         | EngineError::ModelNotFound(_) => "invalid_request",
     });
     let status = match &err {
@@ -4007,7 +4020,8 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
         EngineError::PromptTooLong(_) => StatusCode::PAYLOAD_TOO_LARGE,
         EngineError::InvalidConfig(_)
         | EngineError::PeerRejected(_)
-        | EngineError::ShardRejected(_) => StatusCode::BAD_REQUEST,
+        | EngineError::ShardRejected(_)
+        | EngineError::UnsupportedInput(_) => StatusCode::BAD_REQUEST,
         EngineError::ModelNotFound(_) => StatusCode::NOT_FOUND,
         EngineError::Backend(_) | EngineError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // A task-attributed step failure: the engine abandoned a task; the
@@ -4125,6 +4139,10 @@ mod tests {
             (EngineError::BatchAborted("x".into()), "engine_error"),
             (EngineError::InvalidConfig("bad".into()), "invalid_request"),
             (EngineError::ModelNotFound("nope".into()), "invalid_request"),
+            (
+                EngineError::UnsupportedInput("img".into()),
+                "invalid_request",
+            ),
         ];
         for (err, reason) in cases {
             let before = cascadia_metrics::API_REJECTED_TOTAL
@@ -5176,6 +5194,57 @@ mod tests {
 
     /// Everything the image path refuses comes back as an OpenAI-shaped 400
     /// naming the reason.
+    /// A model without image input refuses `image_url` parts with an OpenAI
+    /// 400 naming the cause, and an engine that still receives media (the
+    /// in-engine refusal) maps to the same 400.
+    #[tokio::test]
+    async fn text_only_models_refuse_images_with_a_400() {
+        let (status, v) = post_chat(
+            make_app().await,
+            serde_json::json!({"model": "mock-model",
+                "messages": [image_msg("what is this?", &png_url(4, 4))]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("does not accept image input"), "{msg}");
+
+        let r = engine_error_response(cascadia_engine::EngineError::UnsupportedInput(
+            "the gemma4 engine does not accept image input (1 image(s) in the request)".into(),
+        ));
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A body over the limit stays a 413, with a message that names the
+    /// likely cause instead of axum's "length limit exceeded".
+    #[tokio::test]
+    async fn oversized_bodies_get_a_readable_openai_413() {
+        let big = "A".repeat(DEFAULT_MAX_BODY_BYTES + 1024);
+        let response = make_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"model": "mock-model", "messages": [
+                            image_msg("x", &format!("data:image/png;base64,{big}"))]})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), 16384).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("larger than this server accepts"), "{msg}");
+        assert!(msg.contains("input_modalities"), "{msg}");
+    }
+
     #[tokio::test]
     async fn image_requests_are_refused_with_openai_400s() {
         let png = png_url(4, 4);

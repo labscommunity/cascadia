@@ -12,7 +12,7 @@
 //! `perf_metrics` defaults to `max_new_tokens` when EOS fires early on
 //! short greedy decodes, which inflates reported tok/s).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -328,6 +328,7 @@ impl Builder for OvGenaiBuilder {
         if let Some(pipe) = self.cb_pipe {
             return Ok(Box::new(OvGenaiCbEngine {
                 active: Vec::new(),
+                accepts_images: takes_images(Path::new(&self.model_path)),
                 pipe: Box::new(pipe),
                 prompt_pretemplated: self.prompt_pretemplated,
                 next_request_id: 0,
@@ -339,6 +340,7 @@ impl Builder for OvGenaiBuilder {
         let pipe = self.pipe.ok_or(EngineError::NotLoaded)?;
         Ok(Box::new(OvGenaiEngine {
             pipe,
+            accepts_images: takes_images(Path::new(&self.model_path)),
             speculative_k: self.speculative_k,
             prompt_lookup_ngram: self.prompt_lookup_ngram,
             prompt_pretemplated: self.prompt_pretemplated,
@@ -346,6 +348,17 @@ impl Builder for OvGenaiBuilder {
             max_tokens_default: 256,
         }))
     }
+}
+
+/// Whether an export serves images: a VLM layout (language model IR, no
+/// `openvino_model.xml`) with its vision encoder IR, the same test the CLI
+/// uses to offer image input. Anything else answers images with a 400.
+pub(crate) fn takes_images(model_dir: &Path) -> bool {
+    model_dir.join("openvino_language_model.xml").exists()
+        && !model_dir.join("openvino_model.xml").exists()
+        && model_dir
+            .join("openvino_vision_embeddings_model.xml")
+            .exists()
 }
 
 fn map_ov_err(err: OvError) -> EngineError {
@@ -387,6 +400,8 @@ fn shim_media(task: &GenerationTask) -> EngineResult<Vec<Media<'_>>> {
 
 pub struct OvGenaiEngine {
     pipe: LlmPipeline,
+    /// The export is a VLM layout with its vision encoder: see [`takes_images`].
+    accepts_images: bool,
     speculative_k: u32,
     prompt_lookup_ngram: u32,
     prompt_pretemplated: bool,
@@ -423,6 +438,9 @@ impl Engine for OvGenaiEngine {
             return Err(EngineError::Backend(
                 "resume_unsupported: ov-genai has no forced-prefix path".to_string(),
             ));
+        }
+        if !self.accepts_images {
+            cascadia_engine::refuse_media(&task, "ov-genai (text-only export)")?;
         }
         if self.pending.iter().any(|t| t.task_id == task.task_id) {
             return Ok(());
@@ -659,6 +677,8 @@ struct ActiveCbTask {
 /// no-progress guard relies on that distinction.
 pub struct OvGenaiCbEngine {
     active: Vec<ActiveCbTask>,
+    /// See [`takes_images`].
+    accepts_images: bool,
     pipe: Box<dyn CbPipe>,
     prompt_pretemplated: bool,
     next_request_id: u64,
@@ -730,6 +750,9 @@ impl Engine for OvGenaiCbEngine {
             return Err(EngineError::Backend(
                 "resume_unsupported: ov-genai has no forced-prefix path".to_string(),
             ));
+        }
+        if !self.accepts_images {
+            cascadia_engine::refuse_media(&task, "ov-genai (text-only export)")?;
         }
         if self.active.iter().any(|t| t.task_id == task.task_id) {
             return Ok(());
@@ -1194,6 +1217,7 @@ mod tests {
     fn mock_engine(st: &Arc<Mutex<MockState>>) -> OvGenaiCbEngine {
         OvGenaiCbEngine {
             active: Vec::new(),
+            accepts_images: true,
             pipe: Box::new(MockPipe { st: st.clone() }),
             prompt_pretemplated: false,
             next_request_id: 0,
@@ -1368,6 +1392,18 @@ mod tests {
         });
         t.prompt_rendered = true;
         t
+    }
+
+    /// A text-only export refuses an image task at submit with the 400-class
+    /// error, before it reaches the pipeline.
+    #[test]
+    fn text_only_export_refuses_image_tasks() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        e.accepts_images = false;
+        let err = e.submit(image_task("img")).unwrap_err();
+        assert!(matches!(err, EngineError::UnsupportedInput(_)), "{err}");
+        assert!(e.submit(task("txt", 4)).is_ok(), "text still served");
     }
 
     /// A media task reaches the pipeline with its media and with GenAI's own
