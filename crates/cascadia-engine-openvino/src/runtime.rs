@@ -140,6 +140,15 @@ struct StageConfig {
     num_kv_heads: Option<u32>,
     #[serde(default)]
     head_dim: Option<u32>,
+    /// Static shards whose layers differ in KV geometry (Gemma 4's sliding
+    /// and global layers): `[kv_heads, head_dim]` per layer in port order.
+    /// Absent = every layer is `num_kv_heads` x `head_dim`.
+    #[serde(default)]
+    kv_layers: Option<Vec<[u32; 2]>>,
+    /// The decode IR has a dynamic query width and serves prefill chunks too
+    /// (CPU/GPU): one compiled model instead of two copies of the weights.
+    #[serde(default)]
+    prefill_shares_decode: bool,
 }
 
 fn read_pipeline_config(p: &Path) -> Result<PipelineConfig, EngineError> {
@@ -1166,6 +1175,10 @@ struct StaticKvLayer {
     val_in: String,
     key_out: usize,
     val_out: usize,
+    /// This layer's KV geometry. Uniform on most exports; Gemma 4 mixes
+    /// sliding (8x256) and global (2x512) layers within a stage.
+    kv_heads: usize,
+    head_dim: usize,
 }
 
 /// Host-side bounded KV ring for the stateless static-shape (NPU) path.
@@ -1185,8 +1198,6 @@ struct StaticKv {
     /// never crowd out the sliding portion.
     sink: usize,
     context: usize,
-    kv_heads: usize,
-    head_dim: usize,
     elem_bytes: usize,
     kv_dtype: ShimDType,
     /// Resolved primary input port names (cached at build so the per-token
@@ -1196,6 +1207,11 @@ struct StaticKv {
     ids_in: Option<String>,
     hidden_in: Option<String>,
     embeds_in: Option<String>,
+    /// Gemma 4 vision trees: `token_type_ids` (1 on image soft tokens).
+    types_in: Option<String>,
+    /// Token types of the rows the next inference feeds, set by the caller
+    /// and taken by `static_infer`/`static_infer_chunk` (zeros when unset).
+    next_types: Vec<i64>,
     attn_in: String,
     pos_in: String,
     layers: Vec<StaticKvLayer>,
@@ -1218,8 +1234,9 @@ impl StaticKv {
     /// Expected byte length of one layer's `present.*` output:
     /// `kv_heads * context * head_dim * elem_bytes`. Used to validate the IR's
     /// output shape/dtype before `absorb_layer` slices it.
-    fn present_layer_bytes(&self) -> usize {
-        self.kv_heads * self.context * self.head_dim * self.elem_bytes
+    fn present_layer_bytes(&self, li: usize) -> usize {
+        let l = &self.layers[li];
+        l.kv_heads * self.context * l.head_dim * self.elem_bytes
     }
 
     /// Set how many real past tokens are visible for a token at absolute
@@ -1268,11 +1285,11 @@ impl StaticKv {
     ) {
         // Read scalar fields into locals before borrowing the buffer field,
         // so the mutable buffer borrow stays disjoint from these reads.
-        let slot = self.head_dim * self.elem_bytes;
+        let slot = self.layers[li].head_dim * self.elem_bytes;
         let present_row = present_ctx * slot; // per-head stride in present
         let buf_row = self.past_len * slot; // per-head stride in the ring
         let full = valid_now >= self.past_len;
-        let kv_heads = self.kv_heads;
+        let kv_heads = self.layers[li].kv_heads;
         let past_len = self.past_len;
         let sink = self.sink;
         let buf: &mut [u8] = if is_value {
@@ -1362,6 +1379,35 @@ fn fill_static_mask(buf: &mut Vec<u8>, ctx: usize, past_len: usize, valid: usize
     }
 }
 
+/// Rows of the next prefill chunk at `idx`, at most `take`, never ending
+/// inside a run of image tokens (`types` 1). Gemma 4 attends bidirectionally
+/// within an image, and one inference only sees that whole: the IR pads the
+/// past's token types as text. Err when an image starting at `idx` is longer
+/// than `take` (the chunk window, or a one-row step). Empty `types` (no
+/// token types on this tree) leaves `take` as is.
+fn image_safe_take(types: &[i64], idx: usize, take: usize) -> Result<usize, String> {
+    let end = idx + take;
+    if types.is_empty() || take == 0 || end >= types.len() {
+        return Ok(take);
+    }
+    if types[end - 1] != 1 || types[end] != 1 {
+        return Ok(take);
+    }
+    let mut start = end - 1;
+    while start > idx && types[start - 1] == 1 {
+        start -= 1;
+    }
+    if start > idx {
+        return Ok(start - idx);
+    }
+    let run = types[idx..].iter().take_while(|&&t| t == 1).count();
+    Err(format!(
+        "an image of {run} tokens does not fit one prefill inference of {take} rows; \
+         export the static tree with a --prefill-seq at least that wide and a context \
+         that holds the whole prompt"
+    ))
+}
+
 /// Width of the next prefill chunk starting at absolute `position`: bounded
 /// by the model's chunk window `c`, the `remaining` prompt tokens, and — the
 /// parity cap — the number of rows that keep every query's absolute position
@@ -1423,6 +1469,10 @@ struct StaticPrefill {
     /// `ensure_prefill_loaded` re-creates it from `PrefillReload` on demand.
     /// Wiring, window dims, and buffers persist across park/reload.
     runtime: Option<OvRuntime>,
+    /// The decode IR itself serves prefill (CPU/GPU trees whose one IR has a
+    /// dynamic query width, `stage_config.prefill_shares_decode`): chunks run
+    /// on the engine's main runtime and there is nothing to park or reload.
+    shared: bool,
     /// Fixed query-window width C of the prefill IR.
     seq: usize,
     /// Fixed total context of the prefill IR (= ring past_len + seq).
@@ -1430,6 +1480,7 @@ struct StaticPrefill {
     ids_in: Option<String>,
     hidden_in: Option<String>,
     embeds_in: Option<String>,
+    types_in: Option<String>,
     attn_in: String,
     pos_in: String,
     layers: Vec<StaticKvLayer>,
@@ -1540,10 +1591,11 @@ fn vision_family(v: &PipelineVision, export_version: Option<&str>) -> EngineResu
 /// embeds the prompt and splices image rows). On a Gemma 4 tree every stage
 /// also takes `token_type_ids` (1 on image soft tokens: sliding-window layers
 /// attend bidirectionally inside each image), so that row rides the wire as a
-/// third frame `[lead] [hidden] [types]`. Causal families (Pixtral) are also
-/// served on the static and packed paths (trees from
-/// `tools/vlm_surgery/static_variant.py`, stage 0 fed embedding rows);
-/// `token_type_ids` trees are refused there at load.
+/// third frame `[lead] [hidden] [types]`. The static path (trees from
+/// `tools/vlm_surgery/static_variant.py`, stage 0 fed embedding rows) serves
+/// both: a `token_type_ids` tree needs a chunked-prefill IR at least one
+/// image wide, and no chunk ends inside an image (`image_safe_take`). The
+/// packed path serves causal families (Pixtral) only.
 struct VisionTree {
     /// Rank 0 only.
     first: Option<VisionFirst>,
@@ -1583,6 +1635,15 @@ impl Frontend {
         match self {
             Frontend::Gemma4(f) => f.prepare(media, prompt_ids),
             Frontend::Pixtral(f) => f.prepare(media, prompt_ids),
+        }
+    }
+
+    /// Most tokens one image's bidirectional run can take, for families that
+    /// attend bidirectionally inside images.
+    fn max_image_tokens(&self) -> Option<usize> {
+        match self {
+            Frontend::Gemma4(f) => Some(f.preprocess.max_soft_tokens as usize),
+            Frontend::Pixtral(_) => None,
         }
     }
 
@@ -1989,6 +2050,16 @@ impl OvRuntimeEngine {
             .is_some_and(|sk| sk.embeds_in.is_some())
     }
 
+    /// Token types of the rows the next static inference feeds: into that
+    /// inference (`next_types`) and onto the wire with its hidden rows
+    /// (`step_types`).
+    fn set_static_types(&mut self, types: &[i64]) {
+        self.step_types = types.to_vec();
+        if let Some(sk) = self.static_kv.as_mut() {
+            sk.next_types = types.to_vec();
+        }
+    }
+
     /// One static seq=1 step on an embedding row (`hidden` floats).
     fn run_first_row(
         &mut self,
@@ -2205,6 +2276,12 @@ impl OvRuntimeEngine {
                 return self.run_relay_chunk(hidden, shape, position);
             }
             let hs_bytes = f32_to_f16_bytes(hidden);
+            if self.vision_token_types() {
+                let types = self.step_types.clone();
+                if let Some(sk) = self.static_kv.as_mut() {
+                    sk.next_types = types;
+                }
+            }
             let (dtype, out_shape, bytes) =
                 self.static_infer(true, ShimDType::F16, &shape, &hs_bytes, position)?;
             return Ok((bytes_to_f32(dtype, &bytes)?, out_shape));
@@ -2247,6 +2324,18 @@ impl OvRuntimeEngine {
         let past_len = self.static_kv.as_ref().map(|sk| sk.past_len).unwrap_or(0);
         let in_window = (position as usize).saturating_add(r) <= past_len + 1;
         let pf_seq = self.prefill.as_ref().map(|p| p.seq);
+        // This frame's token types (Gemma 4 vision trees), one per row.
+        let types: Vec<i64> = if self.vision_token_types() {
+            self.step_types.clone()
+        } else {
+            Vec::new()
+        };
+        if !types.is_empty() && types.len() != r {
+            return Err(EngineError::Backend(format!(
+                "{} token types for a {r}-row frame",
+                types.len()
+            )));
+        }
 
         if let (Some(pf_seq), true) = (pf_seq, in_window) {
             self.ensure_prefill_loaded()?;
@@ -2254,7 +2343,13 @@ impl OvRuntimeEngine {
             let mut x_out = 0usize;
             let mut off = 0usize;
             while off < r {
-                let take = pf_seq.min(r - off);
+                let take = image_safe_take(&types, off, pf_seq.min(r - off))
+                    .map_err(EngineError::UnsupportedInput)?;
+                if !types.is_empty() {
+                    if let Some(sk) = self.static_kv.as_mut() {
+                        sk.next_types = types[off..off + take].to_vec();
+                    }
+                }
                 let final_sub = off + take == r;
                 // Head stage: only the final sub-chunk's last row is ever
                 // read — skip the whole-[1,C,vocab] output copy otherwise.
@@ -2298,6 +2393,12 @@ impl OvRuntimeEngine {
         let mut rows: Vec<f32> = Vec::new();
         let mut x = 0usize;
         for t in 0..r {
+            if !types.is_empty() {
+                image_safe_take(&types, t, 1).map_err(EngineError::UnsupportedInput)?;
+                if let Some(sk) = self.static_kv.as_mut() {
+                    sk.next_types = vec![types[t]];
+                }
+            }
             let row = f32_to_f16_bytes(&hidden[t * h..(t + 1) * h]);
             let (dt, os, by) =
                 self.static_infer(true, ShimDType::F16, &[1, 1, h], &row, position + t as i64)?;
@@ -3471,6 +3572,16 @@ impl OvRuntimeEngine {
             } else {
                 None
             };
+            // Gemma 4: each inference also takes its rows' token types, and
+            // an image must sit whole inside one inference.
+            let vtypes = if vrows.is_some() && self.vision_token_types() {
+                Some(crate::gemma4_vision::token_type_ids(
+                    &tokens,
+                    self.vision_image_token()?,
+                ))
+            } else {
+                None
+            };
             let nt = if prefill && self.prefill.is_some() {
                 // Chunked prefill: up to C prompt tokens per inference
                 // instead of one — stage weights stream from DRAM once per
@@ -3492,7 +3603,17 @@ impl OvRuntimeEngine {
                 let mut idx = 0usize;
                 while idx < tokens.len() {
                     let chunk_start = self.position;
-                    let take = chunk_take(c, tokens.len() - idx, chunk_start as usize, past_len);
+                    let mut take =
+                        chunk_take(c, tokens.len() - idx, chunk_start as usize, past_len);
+                    if let Some(vt) = &vtypes {
+                        let safe = image_safe_take(vt, idx, take.max(1))
+                            .map_err(EngineError::UnsupportedInput)?;
+                        if take > 0 {
+                            take = safe;
+                        }
+                        let n = take.max(1);
+                        self.set_static_types(&vt[idx..idx + n]);
+                    }
                     let ts = std::time::Instant::now();
                     let (token, wire) = if take >= 2 {
                         // Lazy so a prompt that never chunks (1-token, or
@@ -3553,6 +3674,10 @@ impl OvRuntimeEngine {
             } else {
                 let mut nt = 0i32;
                 for (i, &t) in tokens.iter().enumerate() {
+                    if let Some(vt) = &vtypes {
+                        image_safe_take(vt, i, 1).map_err(EngineError::UnsupportedInput)?;
+                        self.set_static_types(&vt[i..i + 1]);
+                    }
                     let position = self.position;
                     let ts = std::time::Instant::now();
                     let (out, shape) = match &vrows {
@@ -3848,8 +3973,14 @@ impl OvRuntimeEngine {
             self.runtime
                 .set_input(&sk.pos_in, ShimDType::I64, &[1, 1], &pos_bytes)
                 .map_err(map_ov_err)?;
-            let shape = [1, sk.kv_heads, sk.past_len, sk.head_dim];
+            if let Some(types_in) = sk.types_in.as_deref() {
+                let t = sk.next_types.first().copied().unwrap_or(0);
+                self.runtime
+                    .set_input(types_in, ShimDType::I64, &[1, 1], &t.to_le_bytes())
+                    .map_err(map_ov_err)?;
+            }
             for (li, layer) in sk.layers.iter().enumerate() {
+                let shape = [1, layer.kv_heads, sk.past_len, layer.head_dim];
                 self.runtime
                     .set_input(&layer.key_in, sk.kv_dtype, &shape, &sk.key_buf[li])
                     .map_err(map_ov_err)?;
@@ -3859,6 +3990,7 @@ impl OvRuntimeEngine {
             }
         }
         self.runtime.infer().map_err(map_ov_err)?;
+        self.static_kv.as_mut().unwrap().next_types.clear();
 
         // Primary output (index 0): logits on the head stage, hidden_states
         // otherwise — the static export emits it before the present.* outputs.
@@ -3867,21 +3999,17 @@ impl OvRuntimeEngine {
         // Absorb the new token's K/V. Validate each present.* output's byte
         // length AND shape against [1, kv_heads, context, head_dim] so a
         // dtype/factorization mismatch is a clear error, not silent corruption.
-        let (n, expect, kvh, ctx, hd) = {
-            let sk = self.static_kv.as_ref().unwrap();
-            (
-                sk.layers.len(),
-                sk.present_layer_bytes(),
-                sk.kv_heads,
-                sk.context,
-                sk.head_dim,
-            )
-        };
-        let want_shape = [1usize, kvh, ctx, hd];
+        let n = self.static_kv.as_ref().unwrap().layers.len();
         for li in 0..n {
-            let (ko, vo) = {
-                let l = &self.static_kv.as_ref().unwrap().layers[li];
-                (l.key_out, l.val_out)
+            let (ko, vo, expect, want_shape) = {
+                let sk = self.static_kv.as_ref().unwrap();
+                let l = &sk.layers[li];
+                (
+                    l.key_out,
+                    l.val_out,
+                    sk.present_layer_bytes(li),
+                    [1usize, l.kv_heads, sk.context, l.head_dim],
+                )
             };
             let (_, kshape, kpres) = self.runtime.output(ko).map_err(map_ov_err)?;
             let (_, vshape, vpres) = self.runtime.output(vo).map_err(map_ov_err)?;
@@ -3909,7 +4037,10 @@ impl OvRuntimeEngine {
     /// a variant). Reload cost is logged; with a CACHE_DIR-backed compile the
     /// reload comes from the OV blob/UMD cache rather than a cold compile.
     fn ensure_prefill_loaded(&mut self) -> EngineResult<()> {
-        let parked = self.prefill.as_ref().is_some_and(|p| p.runtime.is_none());
+        let parked = self
+            .prefill
+            .as_ref()
+            .is_some_and(|p| !p.shared && p.runtime.is_none());
         if !parked {
             return Ok(());
         }
@@ -3995,11 +4126,15 @@ impl OvRuntimeEngine {
         // Parked check FIRST: begin_token/write_prefill_mask mutate ring
         // state — advancing the cursor for a token whose K/V is never
         // absorbed would desync the ring if this error ever fires.
-        let prt = pf.runtime.as_mut().ok_or_else(|| {
-            EngineError::Backend(
-                "prefill model is parked — callers must ensure_prefill_loaded first".into(),
-            )
-        })?;
+        let prt = if pf.shared {
+            &mut self.runtime
+        } else {
+            pf.runtime.as_mut().ok_or_else(|| {
+                EngineError::Backend(
+                    "prefill model is parked — callers must ensure_prefill_loaded first".into(),
+                )
+            })?
+        };
         sk.begin_token(position as usize);
         sk.write_prefill_mask(&mut pf.mask_bytes, pf.context, real);
 
@@ -4078,8 +4213,23 @@ impl OvRuntimeEngine {
         .map_err(map_ov_err)?;
         prt.set_input(&pf.pos_in, ShimDType::I64, &[1, pf.seq], &pf.pos_buf)
             .map_err(map_ov_err)?;
-        let kv_shape = [1, sk.kv_heads, sk.past_len, sk.head_dim];
+        if let Some(types_in) = pf.types_in.as_deref() {
+            // Pad rows are text: masked out anyway, and never an image.
+            let types = std::mem::take(&mut sk.next_types);
+            let mut buf = Vec::with_capacity(pf.seq * 8);
+            for i in 0..pf.seq {
+                let t = if i < real {
+                    types.get(i).copied().unwrap_or(0)
+                } else {
+                    0
+                };
+                buf.extend_from_slice(&t.to_le_bytes());
+            }
+            prt.set_input(types_in, ShimDType::I64, &[1, pf.seq], &buf)
+                .map_err(map_ov_err)?;
+        }
         for (li, layer) in pf.layers.iter().enumerate() {
+            let kv_shape = [1, layer.kv_heads, sk.past_len, layer.head_dim];
             prt.set_input(&layer.key_in, sk.kv_dtype, &kv_shape, &sk.key_buf[li])
                 .map_err(map_ov_err)?;
             prt.set_input(&layer.val_in, sk.kv_dtype, &kv_shape, &sk.val_buf[li])
@@ -4096,10 +4246,11 @@ impl OvRuntimeEngine {
         // Absorb the `real` new tokens' K/V from each present.* (rows of
         // pf.context slots; chunk token t at slot past_len + t). Validate
         // length AND shape first, as the seq=1 path does.
-        let expect = sk.kv_heads * pf.context * sk.head_dim * sk.elem_bytes;
-        let want_shape = [1usize, sk.kv_heads, pf.context, sk.head_dim];
         for li in 0..pf.layers.len() {
-            let (ko, vo) = (pf.layers[li].key_out, pf.layers[li].val_out);
+            let l = &pf.layers[li];
+            let (ko, vo) = (l.key_out, l.val_out);
+            let expect = l.kv_heads * pf.context * l.head_dim * sk.elem_bytes;
+            let want_shape = [1usize, l.kv_heads, pf.context, l.head_dim];
             let (_, kshape, kpres) = prt.output(ko).map_err(map_ov_err)?;
             let (_, vshape, vpres) = prt.output(vo).map_err(map_ov_err)?;
             if kpres.len() != expect
@@ -4846,6 +4997,9 @@ fn resolve_static_layers(runtime: &OvRuntime, what: &str) -> EngineResult<Vec<St
             val_in,
             key_out,
             val_out,
+            // Filled in from stage_config by the caller.
+            kv_heads: 0,
+            head_dim: 0,
         });
     }
     if layers.is_empty() {
@@ -5254,6 +5408,11 @@ pub struct OvRuntimeBuilder {
     /// None for the stateful path. static_seq is validated == 1 at load and not
     /// stored (the ring math assumes one token per step).
     static_params: Option<(u32, u32, u32)>,
+    /// Per-layer `(kv_heads, head_dim)` of a static shard with mixed KV
+    /// geometry (`stage_config.kv_layers`); None = uniform `static_params`.
+    static_kv_layers: Option<Vec<(usize, usize)>>,
+    /// `stage_config.prefill_shares_decode`: no separate prefill compile.
+    prefill_shared: bool,
     /// (seq, context) of the chunked-prefill IR variant, when the stage
     /// exports one (stage_config.static_prefill_*) and it isn't disabled.
     static_prefill_params: Option<(u32, u32)>,
@@ -5423,6 +5582,11 @@ impl Builder for OvRuntimeBuilder {
         // equals the decode variant's (context - 1) — that identity is what
         // lets both compiled models share one host KV ring.
         let prefill_xml = stage_dir.join("openvino_prefill_model.xml");
+        self.prefill_shared = stage_cfg.prefill_shares_decode;
+        self.static_kv_layers = stage_cfg
+            .kv_layers
+            .as_ref()
+            .map(|v| v.iter().map(|&[k, d]| (k as usize, d as usize)).collect());
         self.static_prefill_params = match (self.static_params, stage_cfg.static_prefill_seq) {
             (Some((ctx, _, _)), Some(pseq)) if !self.disable_chunked_prefill => {
                 let pctx = stage_cfg.static_prefill_context.unwrap_or(0);
@@ -5435,7 +5599,7 @@ impl Builder for OvRuntimeBuilder {
                         ctx - 1 + pseq
                     )));
                 }
-                if !prefill_xml.exists() {
+                if !stage_cfg.prefill_shares_decode && !prefill_xml.exists() {
                     return Err(EngineError::InvalidConfig(format!(
                         "stage_config advertises a chunked-prefill variant \
                          (static_prefill_seq={pseq}) but {} is missing — re-export the stage",
@@ -5675,7 +5839,22 @@ impl Builder for OvRuntimeBuilder {
         // copy of the stage weights resident (a compiled model owns its own
         // weight allocation per device) — the price of the split; KV is NOT
         // duplicated (the host ring is shared).
-        if let Some((pseq, pctx)) = self.static_prefill_params {
+        if let (Some((pseq, _)), true) = (self.static_prefill_params, self.prefill_shared) {
+            if self
+                .prefill_device
+                .as_ref()
+                .is_some_and(|d| *d != self.device)
+            {
+                return Err(EngineError::InvalidConfig(
+                    "--prefill-device needs a separate prefill IR; this stage's decode IR \
+                     serves prefill itself (prefill_shares_decode)"
+                        .into(),
+                ));
+            }
+            events.push(LoadProgress::message(format!(
+                "chunked prefill (seq={pseq}) runs on the decode IR (one compiled model)"
+            )));
+        } else if let Some((pseq, pctx)) = self.static_prefill_params {
             let pdev = self
                 .prefill_device
                 .clone()
@@ -5791,14 +5970,42 @@ impl Builder for OvRuntimeBuilder {
         if let Some(v) = pipeline_cfg.vision.as_ref() {
             let family = vision_family(v, pipeline_cfg.export_version.as_deref())?;
             let token_types = v.token_type_ids.unwrap_or(family == VisionFamily::Gemma4);
-            if !stage_cfg.stateful && token_types {
+            // Bidirectional image attention (token_type_ids) needs each image
+            // whole inside one inference: on the static path that is a
+            // chunked-prefill IR at least one image wide. Packed slots build
+            // their own per-row mask and carry no token types.
+            if token_types && self.packed_slots > 0 {
                 return Err(EngineError::InvalidConfig(format!(
                     "a {family:?} vision tree attends bidirectionally inside each image \
-                     (token_type_ids); the static path cannot, serve the stateful tree"
+                     (token_type_ids), which --packed-slots does not carry; serve it \
+                     without packed slots"
                 )));
             }
+            let static_window = if !stage_cfg.stateful && token_types {
+                match self.static_prefill_params {
+                    Some((pseq, _)) => Some(pseq as usize),
+                    None => {
+                        return Err(EngineError::InvalidConfig(format!(
+                            "a static {family:?} vision tree needs a chunked-prefill IR on \
+                             every stage (an image is attended bidirectionally, so it must \
+                             sit whole inside one inference); convert it with \
+                             tools/vlm_surgery/static_variant.py --prefill-seq"
+                        )))
+                    }
+                }
+            } else {
+                None
+            };
             let first = if is_first {
                 let f = VisionFirst::load(&self.pipeline_dir, v, family)?;
+                if let (Some(pseq), Some(max)) = (static_window, f.frontend.max_image_tokens()) {
+                    if pseq < max {
+                        return Err(EngineError::InvalidConfig(format!(
+                            "static prefill IR takes {pseq} rows but an image can be {max} \
+                             tokens; re-convert with --prefill-seq {max} or more"
+                        )));
+                    }
+                }
                 events.push(LoadProgress::message(format!(
                     "vision tree: rank 0 embeds the prompt and encodes images ({})",
                     f.frontend.describe()
@@ -5844,8 +6051,23 @@ impl Builder for OvRuntimeBuilder {
         // host-side KV ring. The primary output (logits on the head stage,
         // hidden_states otherwise) is output index 0 — no alias guess needed.
         let static_kv = if let Some((ctx, kvh, hd)) = self.static_params {
-            let layers = resolve_static_layers(&runtime, "static shard")?;
+            let mut layers = resolve_static_layers(&runtime, "static shard")?;
             let (kvh, hd) = (kvh as usize, hd as usize);
+            let geom = self
+                .static_kv_layers
+                .clone()
+                .unwrap_or_else(|| vec![(kvh, hd); layers.len()]);
+            if geom.len() != layers.len() || geom.iter().any(|&(k, d)| k == 0 || d == 0) {
+                return Err(EngineError::InvalidConfig(format!(
+                    "stage_config.kv_layers lists {} layers but the static IR has {}",
+                    geom.len(),
+                    layers.len()
+                )));
+            }
+            for (l, &(k, d)) in layers.iter_mut().zip(&geom) {
+                l.kv_heads = k;
+                l.head_dim = d;
+            }
             let past_len = (ctx - 1) as usize;
             // KV activations are f16 in the static export; derive elem_bytes
             // from the dtype so the two can never drift.
@@ -5856,8 +6078,9 @@ impl Builder for OvRuntimeBuilder {
                 ShimDType::I64 => 8,
                 ShimDType::I8 => 1,
             };
-            let layer_bytes = kvh * past_len * hd * elem_bytes;
-            let n = layers.len();
+            let layer_bytes = |l: &StaticKvLayer| l.kv_heads * past_len * l.head_dim * elem_bytes;
+            let key_buf: Vec<Vec<u8>> = layers.iter().map(|l| vec![0u8; layer_bytes(l)]).collect();
+            let val_buf = key_buf.clone();
             // Cache the resolved primary/aux input port names so the per-token
             // decode loop does no HashMap lookups or string allocs. A static
             // shard always has attention_mask + position_ids; embed stages have
@@ -5893,18 +6116,18 @@ impl Builder for OvRuntimeBuilder {
                 past_len,
                 sink: crate::packed::KV_SINK.min(past_len / 2),
                 context: ctx as usize,
-                kv_heads: kvh,
-                head_dim: hd,
                 elem_bytes,
                 kv_dtype,
                 ids_in,
                 hidden_in,
                 embeds_in,
+                types_in: canonical_inputs.get("token_type_ids").cloned(),
+                next_types: Vec::new(),
                 attn_in,
                 pos_in,
                 layers,
-                key_buf: vec![vec![0u8; layer_bytes]; n],
-                val_buf: vec![vec![0u8; layer_bytes]; n],
+                key_buf,
+                val_buf,
                 valid: 0,
                 mask_bytes: vec![0u8; ctx as usize * 8],
             })
@@ -5919,9 +6142,14 @@ impl Builder for OvRuntimeBuilder {
         // including the primary-input KIND (an embed-stage prefill IR built
         // around hidden_states, or vice versa, is not a sibling of one
         // export and would otherwise only fail at the first chunk).
-        let prefill = match self.prefill_runtime {
-            None => None,
-            Some(prt) => {
+        // A shared prefill runs on the decode compilation: resolve its ports
+        // there and keep no runtime of its own.
+        let shared = self.prefill_shared && self.static_prefill_params.is_some();
+        let prefill_rt = if shared { None } else { self.prefill_runtime };
+        let prefill = match (prefill_rt, shared) {
+            (None, false) => None,
+            (prt, _) => {
+                let prt_ref = prt.as_ref().unwrap_or(&runtime);
                 let (pseq, pctx) = self.static_prefill_params.ok_or_else(|| {
                     EngineError::Backend(
                         "inconsistent builder state: prefill runtime without prefill params".into(),
@@ -5932,8 +6160,12 @@ impl Builder for OvRuntimeBuilder {
                         "inconsistent builder state: prefill runtime without static ring".into(),
                     )
                 })?;
-                let pcanon = resolve_canonical_inputs(&prt)?;
-                let players = resolve_static_layers(&prt, "chunked-prefill variant")?;
+                let pcanon = resolve_canonical_inputs(prt_ref)?;
+                let mut players = resolve_static_layers(prt_ref, "chunked-prefill variant")?;
+                for (p, d) in players.iter_mut().zip(&sk.layers) {
+                    p.kv_heads = d.kv_heads;
+                    p.head_dim = d.head_dim;
+                }
                 if players.len() != sk.layers.len() {
                     return Err(EngineError::Backend(format!(
                         "chunked-prefill variant has {} KV layers but the decode variant has \
@@ -5968,12 +6200,14 @@ impl Builder for OvRuntimeBuilder {
                     )));
                 }
                 Some(StaticPrefill {
-                    runtime: Some(prt),
+                    runtime: prt,
+                    shared,
                     seq: pseq as usize,
                     context: pctx as usize,
                     ids_in,
                     hidden_in,
                     embeds_in,
+                    types_in: pcanon.get("token_type_ids").cloned(),
                     attn_in,
                     pos_in,
                     layers: players,
@@ -6282,13 +6516,13 @@ mod tests {
             past_len,
             sink: crate::packed::KV_SINK.min(past_len / 2),
             context: past_len + 1,
-            kv_heads,
-            head_dim,
             elem_bytes: elem,
             kv_dtype: ShimDType::F16,
             ids_in: Some("input_ids".into()),
             hidden_in: None,
             embeds_in: None,
+            types_in: None,
+            next_types: Vec::new(),
             attn_in: "attention_mask".into(),
             pos_in: "position_ids".into(),
             layers: (0..layers)
@@ -6297,12 +6531,65 @@ mod tests {
                     val_in: "v".into(),
                     key_out: 1,
                     val_out: 2,
+                    kv_heads,
+                    head_dim,
                 })
                 .collect(),
             key_buf: vec![vec![0u8; layer_bytes]; layers],
             val_buf: vec![vec![0u8; layer_bytes]; layers],
             valid: 0,
             mask_bytes: vec![0u8; (past_len + 1) * 8],
+        }
+    }
+
+    /// A chunk never ends inside an image (types 1); it shrinks to the image's
+    /// start, and an image that starts the chunk but is longer is an error.
+    #[test]
+    fn image_safe_take_keeps_images_whole() {
+        let t = [0, 0, 1, 1, 1, 0, 0];
+        assert_eq!(image_safe_take(&t, 0, 3), Ok(2)); // would split at 2..5
+        assert_eq!(image_safe_take(&t, 0, 5), Ok(5)); // ends after the image
+        assert_eq!(image_safe_take(&t, 0, 2), Ok(2)); // ends before it
+        assert_eq!(image_safe_take(&t, 2, 3), Ok(3)); // exactly the image
+        assert!(image_safe_take(&t, 2, 2).is_err()); // image wider than the chunk
+        assert!(image_safe_take(&t, 2, 1).is_err()); // a one-row step inside it
+        assert_eq!(image_safe_take(&t, 5, 1), Ok(1));
+        assert_eq!(image_safe_take(&[], 0, 4), Ok(4)); // no token types
+        assert_eq!(image_safe_take(&t, 6, 4), Ok(4)); // runs off the end
+        assert_eq!(image_safe_take(&[1], 0, 1), Ok(1)); // a 1-token image
+    }
+
+    /// Layers with different KV geometry (Gemma 4: 8x256 sliding, 2x512
+    /// global) each absorb into a buffer of their own size and stride.
+    #[test]
+    fn ring_absorbs_mixed_layer_geometry() {
+        let mut ring = test_ring(4, 8, 4, 2);
+        ring.layers[1].kv_heads = 2;
+        ring.layers[1].head_dim = 8;
+        ring.key_buf[1] = vec![0u8; 2 * 4 * 8 * 2];
+        ring.val_buf[1] = vec![0u8; 2 * 4 * 8 * 2];
+        assert_eq!(ring.present_layer_bytes(0), 8 * 5 * 4 * 2);
+        assert_eq!(ring.present_layer_bytes(1), 2 * 5 * 8 * 2);
+        ring.begin_token(0);
+        // Layer 1's present: [1, 2, ctx=5, 8] f16; the new token at slot 4.
+        let slot = 8 * 2;
+        let mut p = vec![0u8; ring.present_layer_bytes(1)];
+        for h in 0..2 {
+            let src = h * 5 * slot + 4 * slot;
+            for b in 0..slot {
+                p[src + b] = (h * 50 + b + 1) as u8;
+            }
+        }
+        ring.absorb_layer(1, false, &p);
+        for h in 0..2 {
+            let dst = h * 4 * slot;
+            for b in 0..slot {
+                assert_eq!(
+                    ring.key_buf[1][dst + b],
+                    (h * 50 + b + 1) as u8,
+                    "h{h} b{b}"
+                );
+            }
         }
     }
 
@@ -6328,10 +6615,10 @@ mod tests {
         real: usize,
         is_value: bool,
     ) -> Vec<u8> {
-        let slot = ring.head_dim * ring.elem_bytes;
+        let slot = ring.layers[0].head_dim * ring.elem_bytes;
         let ctx = ring.past_len + c;
-        let mut p = vec![0xEEu8; ring.kv_heads * ctx * slot];
-        for h in 0..ring.kv_heads {
+        let mut p = vec![0xEEu8; ring.layers[0].kv_heads * ctx * slot];
+        for h in 0..ring.layers[0].kv_heads {
             for t in 0..real {
                 let base = h * ctx * slot + (ring.past_len + t) * slot;
                 for b in 0..slot {
@@ -6619,7 +6906,7 @@ mod tests {
     /// Which token sits in each ring slot, recovered by matching the
     /// deterministic per-token byte pattern back.
     fn ring_tokens(ring: &StaticKv, n: usize) -> Vec<Option<usize>> {
-        let slot = ring.head_dim * ring.elem_bytes;
+        let slot = ring.layers[0].head_dim * ring.elem_bytes;
         (0..ring.past_len)
             .map(|i| {
                 (0..n).find(|&t| {
