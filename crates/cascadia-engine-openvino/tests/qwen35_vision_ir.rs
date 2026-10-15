@@ -58,7 +58,22 @@ fn vision_embeddings_match_the_hf_driven_reference() {
             .unwrap();
     let pp = PreprocessConfig::from_json_file(&dir.join("preprocessor_config.json")).unwrap();
     let vc = VisionConfig::from_config_json(&dir.join("config.json")).unwrap();
-    let mut enc = VisionEncoder::load(dir, "CPU", &PluginConfig::new(), vc).unwrap();
+    // CPU by default; `CASCADIA_QWEN35_VISION_DEVICE=GPU` measures the iGPU, whose
+    // f16 execution drifts from the f32 reference, so its bound is looser.
+    let device = std::env::var("CASCADIA_QWEN35_VISION_DEVICE").unwrap_or_else(|_| "CPU".into());
+    let bound = if device == "CPU" { 1e-3 } else { 5e-2 };
+    let t_load = std::time::Instant::now();
+    // `CASCADIA_QWEN35_VISION_PRECISION=f32` sets INFERENCE_PRECISION_HINT (the
+    // GPU plugin defaults to f16).
+    let plugin = match std::env::var("CASCADIA_QWEN35_VISION_PRECISION") {
+        Ok(p) => PluginConfig::new().with("INFERENCE_PRECISION_HINT", p),
+        Err(_) => PluginConfig::new(),
+    };
+    let mut enc = VisionEncoder::load(dir, &device, &plugin, vc).unwrap();
+    println!(
+        "{device}: compiled the vision IRs in {:.1}s",
+        t_load.elapsed().as_secs_f64()
+    );
     let cases = r["vision_ir"]
         .as_object()
         .expect("fixtures lack vision_ir; regenerate with --run-ir");
@@ -68,7 +83,15 @@ fn vision_embeddings_match_the_hf_driven_reference() {
             .to_rgb8();
         let (w, h) = png.dimensions();
         let p = preprocess(&[png.as_raw()], w, h, &pp).unwrap();
+        // First call warms the kernels for this shape; time the second.
+        enc.encode_traced(&p).unwrap();
+        let t_enc = std::time::Instant::now();
         let t = enc.encode_traced(&p).unwrap();
+        println!(
+            "{device} {name}: grid {:?}, warm encode {:.0} ms",
+            p.grid_thw,
+            t_enc.elapsed().as_secs_f64() * 1e3
+        );
         for (stage, got) in [
             ("patch_embeds", &t.patch_embeds),
             ("hidden_states", &t.hidden_states),
@@ -78,7 +101,10 @@ fn vision_embeddings_match_the_hf_driven_reference() {
             println!("{name} {stage}: max abs gap {abs:.3e}, relative {rel:.3e}");
             // Same IRs and bit-identical pixels: what remains is float
             // summation order in the corner sum and rotary rounding.
-            assert!(rel < 1e-3, "{name} {stage}: relative gap {rel:.3e}");
+            assert!(
+                rel < bound,
+                "{device} {name} {stage}: relative gap {rel:.3e}"
+            );
         }
     }
 }

@@ -419,6 +419,11 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub api_allow_image_urls: bool,
 
+    /// Device for the `qwen35` vision encoder on rank 0 (e.g. `GPU` for the
+    /// iGPU while the stages run on `CPU`). Defaults to `--device`.
+    #[arg(long)]
+    pub vision_device: Option<String>,
+
     /// OV performance hint (PERFORMANCE_HINT). LATENCY suits single-user
     /// decode; THROUGHPUT enables NUM_STREAMS auto-tuning. See OpenVINO
     /// high-level-performance-hints docs (2026).
@@ -823,6 +828,11 @@ pub struct RunArgs {
     #[arg(long)]
     pub api_allow_image_urls: bool,
 
+    /// Device for the `qwen35` vision encoder (e.g. `GPU`). See
+    /// `cascadia worker --help`.
+    #[arg(long)]
+    pub vision_device: Option<String>,
+
     /// Expert placement JSON (requires --ep-workers). See worker --help.
     #[arg(long)]
     pub ep_placement: Option<PathBuf>,
@@ -923,6 +933,7 @@ impl WorkerArgs {
         prefix_cache_gb: Option<f64>,
         api_max_body_mb: f64,
         api_allow_image_urls: bool,
+        vision_device: Option<String>,
         ep_workers: Vec<String>,
         ep_placement: Option<PathBuf>,
     ) -> Self {
@@ -941,6 +952,7 @@ impl WorkerArgs {
             prefix_cache_gb,
             api_max_body_mb,
             api_allow_image_urls,
+            vision_device,
             ep_workers,
             ep_worker_index: None,
             ep_worker_count: None,
@@ -1253,6 +1265,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         args.prefix_cache_gb,
         args.api_max_body_mb,
         args.api_allow_image_urls,
+        args.vision_device,
         args.ep_workers,
         args.ep_placement,
     );
@@ -1976,6 +1989,9 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
                 b = b.with_dyn_quant_group(group);
             }
             b = b.with_ov_properties(ov_perf_properties(args));
+            if let Some(dev) = &args.vision_device {
+                b = b.with_vision_device(dev);
+            }
             info!(
                 prefix_cache_gib = prefix_cache_bytes >> 30,
                 "qwen35 prefix-cache budget"
@@ -3182,6 +3198,7 @@ mod python_tests {
             None,
             1.0,
             false,
+            None,
             Vec::new(),
             None,
         );
@@ -3628,6 +3645,7 @@ mod ov_property_tests {
             None,
             1.0,
             false,
+            None,
             Vec::new(),
             None,
         )
@@ -4150,6 +4168,7 @@ mod tests {
             args.prefix_cache_gb,
             args.api_max_body_mb,
             args.api_allow_image_urls,
+            args.vision_device,
             Vec::new(),
             args.ep_placement,
         );
@@ -4179,6 +4198,7 @@ mod tests {
             args.prefix_cache_gb,
             args.api_max_body_mb,
             args.api_allow_image_urls,
+            args.vision_device,
             args.ep_workers,
             args.ep_placement,
         );
@@ -4210,6 +4230,7 @@ mod tests {
             args.prefix_cache_gb,
             args.api_max_body_mb,
             args.api_allow_image_urls,
+            args.vision_device,
             args.ep_workers,
             args.ep_placement,
         );
