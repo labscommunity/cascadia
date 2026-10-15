@@ -185,7 +185,14 @@ pub struct AppState {
     pub ready: Arc<std::sync::atomic::AtomicBool>,
     /// See [`Config::media`].
     pub media: Option<Arc<MediaConfig>>,
+    /// Image decodes running at once, across all requests. Each can hold a
+    /// full-size source image, so this bounds the API's decode memory to
+    /// about this many times the largest accepted image.
+    pub decode_permits: Arc<Semaphore>,
 }
+
+/// See [`AppState::decode_permits`].
+const MAX_CONCURRENT_DECODES: usize = 2;
 
 #[derive(Clone, Debug, Default)]
 pub struct ChatTemplateConfig {
@@ -554,6 +561,7 @@ pub fn make_router_with_stats(
         marker_dialect: cfg.marker_dialect.clone(),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         media: cfg.media.clone().map(Arc::new),
+        decode_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
     };
     let state = AppState {
         effort_words: state
@@ -1982,7 +1990,14 @@ async fn prepare_media(
     }
     let messages = messages.to_vec();
     let decode_cfg = Arc::clone(&cfg);
+    // Waits rather than refusing: the caller already holds an in-flight
+    // permit, so the queue here is bounded by the request cap.
+    let decode_permit = Arc::clone(&state.decode_permits)
+        .acquire_owned()
+        .await
+        .expect("decode semaphore is never closed");
     let decoded = tokio::task::spawn_blocking(move || {
+        let _decode_permit = decode_permit;
         let mut inputs = Vec::with_capacity(count);
         let mut out = Vec::with_capacity(messages.len());
         for mut m in messages {
@@ -2522,6 +2537,25 @@ async fn chat_completions(
     // client's "low" reaches such a template unescalated — or, when the caller
     // sent nothing of their own, with the effort undefined (the template's
     // default). A caller word the template also rejects is a 400.
+    // An image request takes its in-flight permit BEFORE decoding: decoding
+    // is the expensive part (a source image may hold ~150 MB of RGB), and
+    // doing it ahead of the gate let any number of concurrent requests decode
+    // at once. Text requests keep the gate where it was, after rendering.
+    let early_permit = if req.messages.iter().any(|m| m.images().next().is_some()) {
+        match state.permits.clone().try_acquire_owned() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                count_rejected("capacity");
+                return api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "engine at capacity; retry after current requests complete",
+                    None,
+                );
+            }
+        }
+    } else {
+        None
+    };
     let media = match prepare_media(&state, &req.messages).await {
         Ok(m) => m,
         Err(resp) => return resp,
@@ -2633,16 +2667,19 @@ async fn chat_completions(
     // finite: the engine's own queue/slot depth, and the blocking pool the
     // submits land on. Backpressure is 503; clients should retry with
     // backoff.
-    let permit = match state.permits.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            count_rejected("capacity");
-            return api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "engine at capacity; retry after current requests complete",
-                None,
-            );
-        }
+    let permit = match early_permit {
+        Some(p) => p,
+        None => match state.permits.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                count_rejected("capacity");
+                return api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "engine at capacity; retry after current requests complete",
+                    None,
+                );
+            }
+        },
     };
 
     // Past the gate = an admitted request. Bump the cumulative counter and
@@ -4158,7 +4195,7 @@ mod tests {
     /// A router whose model takes images, with a template that prints each
     /// message so the placeholder's position is visible in the mock's echo.
     async fn make_image_app() -> Router {
-        let mut runner = Runner::new(Box::new(MockBuilder::new()));
+        let runner = Runner::new(Box::new(MockBuilder::new()));
         runner
             .start(
                 PeerLayout::single_stage(),
@@ -4259,12 +4296,40 @@ mod tests {
         }
     }
 
+    /// An image request is admitted (or refused) before any decoding: with
+    /// no capacity left, even an undecodable image gets the 503, proving no
+    /// decode ran outside the in-flight cap.
+    #[tokio::test]
+    async fn image_request_takes_its_permit_before_decoding() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            media: Some(MediaConfig::ov_genai()),
+            max_concurrent_requests: 0,
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({"model": "mock-model", "messages": [
+                image_msg("x", "data:image/png;base64,aGVsbG8=")]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {v}");
+    }
+
     /// Without a chat template only the last user message is sent, so an
     /// image in an earlier one would never reach the model. That is a 400,
     /// not an answer that silently ignores the image.
     #[tokio::test]
     async fn image_dropped_by_the_prompt_format_is_a_400() {
-        let mut runner = Runner::new(Box::new(MockBuilder::new()));
+        let runner = Runner::new(Box::new(MockBuilder::new()));
         runner
             .start(
                 PeerLayout::single_stage(),
