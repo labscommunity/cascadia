@@ -286,6 +286,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "parking_lot",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
@@ -294,6 +295,7 @@ dependencies = [
  "tower",
  "tower-http 0.5.2",
  "tracing",
+ "url",
  "uuid",
 ]
 

@@ -41,6 +41,9 @@ minijinja-contrib = { version = "2", default-features = false, features = ["pyco
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 base64 = "0.22"
 sha2 = "0.10"
+# Opt-in remote image fetch (`--api-allow-image-urls`).
+reqwest = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
