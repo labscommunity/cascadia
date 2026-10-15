@@ -52,6 +52,11 @@ class Ckpt:
         s = self._file(name).get_slice(name)
         return torch.stack([s[int(i):int(i) + 1][0] for i in ids]).float()
 
+    def release(self):
+        """Close every open shard. Windows charges a mapped shard's touched pages to the process
+        until its handle closes, so a 27B checkpoint (~54 GB of shards) outgrows a 32 GB host."""
+        self._f.clear()
+
 
 class Lora:
     """PEFT adapter: delta(module) = scale * B @ A in fp32, or None when the module has no adapter.
@@ -133,6 +138,7 @@ def stream_hidden(weights_dir, passes, lora=None, lora_scale=None, threads=4, al
             # attention_mask=None: sdpa runs causal; the linear-attention layers need no mask at batch 1
             acts[j] = layer(acts[j], position_embeddings=pe[j], attention_mask=None, position_ids=pos[j][0])
         del layer, sd
+        ck.release()
         gc.collect()
         print(f"layer {i} ({cfg.layer_types[i]}, {merged} LoRA merged)", flush=True)
     # every adapter must have been merged; lm_head only for JEV (applied in family_probs)
