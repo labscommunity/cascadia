@@ -528,3 +528,31 @@ the state once (about 395 s on this CPU), then resumes the snapshot for every la
 | `--prefix-cache-gb 0.001` | 413 in 0.02 s: `needs 45095 prefill tokens without prefix reuse (the shared prefix cannot fit the prefix cache); the per-request limit is 20000` |
 | `--prefix-cache-gb 0` | 413 in 0.02 s: `needs 45095 prefill tokens; the per-request limit is 20000` |
 | Pipeline (no prefix discount) | 413 in 0.02 s, the plain message; nothing reaches the dump |
+
+### Clef-flash
+
+**Model:** [Cloudflare/clef-flash](https://huggingface.co/Cloudflare/clef-flash) (a full fine-tune of
+Qwen3.5-9B, all 32 layers changed, plus a joint head over every position's final hidden state). The
+export swaps all of Clef's weights into Intel's int8 IR (`--weights`) and installs the joint head from
+the same directory (`--clef-dir`).
+
+```bash
+hf download Cloudflare/clef-flash --local-dir ~/models/clef-flash      # 17.8 GB (BF16)
+python tools/decision_export.py clef --base-ir ~/models/qwen35-9b-int8 --weights ~/models/clef-flash \
+    --clef-dir ~/models/clef-flash --out ~/trees/clef-flash-int8
+cascadia run ~/trees/clef-flash-int8 --engine qwen35 --device CPU --api 127.0.0.1:8080
+```
+
+**Measured parity** (same host and set as JEV-9B; one joint pass per record, 50 passes for 82 questions):
+
+| Check | Single box (8 stages, 1 process) | Pipeline (2 stages, 2 processes) |
+|---|---|---|
+| Records vs the spike's `encode_record` (50 + 4 synthetic) | 54/54 | 54/54 |
+| Answers vs the spike's saved full-precision reference | 82/82 | 82/82 |
+| int8 vs streamed fp32 reference | **82/82** (choice 33/33, predicate 24/24, score 25/25), max \|Δp\| 0.072, no flips | **82/82**, max \|Δp\| 0.069, no flips |
+| Pipeline vs single-box answers (`--confident 0.05`) | — | 82/82, max \|Δp\| 0.012, no flips |
+| `/v1/decisions` vs `/v1/systemone` (string states) | 62/62 identical | — |
+
+The same request sent twice returns 200 both times with identical answers (joint passes always prefill
+cold). For comparison, the spike's int4 export on Apple Silicon agreed on 79/82; int8 on x86 removes
+those flips, including the near-tie `r07.severity`.
