@@ -12,11 +12,17 @@ weights) and writes what the Rust port must reproduce:
 Pixel tensors are large, so each is summarised (shape, sum, abs-sum, sum of
 squares, first/last 64 values, every 1009th value) rather than stored.
 
-Usage (needs torch, torchvision, transformers==5.14.1, pillow, numpy):
-  python gen_qwen35_fixtures.py --model <Qwen3.5/3.6 export dir> --out <dir>
+  <out>/reference.json     also: `encoder` (vision_utils bilinear indices
+                           and weights, rotary_pos_emb, cu_seqlens per grid)
+                           and, with --run-ir, `vision_ir` (the export's
+                           three vision IRs driven by HF's host inputs)
 
-The model dir only supplies config.json, the processor configs and the
-tokenizer; the weights are not read.
+Usage (needs torch, torchvision, transformers==5.14.1, pillow, numpy; and
+openvino for --run-ir):
+  python gen_qwen35_fixtures.py --model <Qwen3.5/3.6 export dir> --out <dir> [--run-ir]
+
+Without --run-ir the model dir only supplies config.json, the processor
+configs and the tokenizer; with it, the three vision IRs are run on CPU.
 """
 import argparse
 import hashlib
@@ -30,6 +36,7 @@ import torchvision
 import transformers
 from PIL import Image
 from transformers import AutoConfig, AutoImageProcessor, AutoProcessor
+from transformers import vision_utils as vu
 from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as qm
 
 
@@ -87,6 +94,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--run-ir", action="store_true", help="also run the vision IRs (needs openvino)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -193,10 +201,65 @@ def main():
         ref["prompts"][name] = entry
         print(f"[{name}] tokens={ids.shape[1]} images={entry['image_grid_thw']} videos={entry['video_grid_thw']} rope_delta={entry['rope_delta']}")
 
+    # Host inputs of the vision IRs, straight from transformers' vision_utils.
+    vc = config.vision_config
+    side = int(vc.num_position_embeddings ** 0.5)
+    rotary = qm.Qwen3_5MoeVisionRotaryEmbedding((vc.hidden_size // vc.num_heads) // 2)
+    grids = {n: e["slow"]["grid_thw"] for n, e in ref["images"].items()}
+    grids["video_4f_128x96"] = ref["prompts"]["video"]["video_grid_thw"][0]
+    ref["encoder"] = {"num_grid_per_side": side, "rotary_dim": (vc.hidden_size // vc.num_heads) // 2,
+                      "hidden_size": vc.hidden_size, "out_hidden_size": vc.out_hidden_size, "grids": {}}
+    for name, g in grids.items():
+        gt = torch.tensor([g])
+        idx, wts = vu.get_vision_bilinear_indices_and_weights(gt, side, vc.spatial_merge_size)
+        pos = vu.get_vision_position_ids(gt, vc.spatial_merge_size)
+        rot = rotary(pos)
+        ref["encoder"]["grids"][name] = {
+            "grid_thw": g,
+            # Exact integers either way; in full only where that stays small.
+            "indices": idx.flatten().tolist() if idx.shape[1] <= 3000 else summary(idx),
+            "weights": summary(wts),
+            "rotary_pos_emb": summary(rot),
+            "cu_seqlens": vu.get_vision_cu_seqlens(gt).tolist(),
+        }
+
+    if args.run_ir:
+        ref["vision_ir"] = run_vision_irs(args.model, slow, imgs, side, vc, rotary)
+
     with open(os.path.join(args.out, "reference.json"), "w") as f:
         json.dump(ref, f, separators=(",", ":"))
     for name, e in ref["images"].items():
         print(f"{name}: grid fast={e['fast']['grid_thw']} slow={e['slow']['grid_thw']} fast_vs_slow max={e['fast_vs_slow']['max_abs']:.4f} mean={e['fast_vs_slow']['mean_abs']:.5f}")
+
+
+def run_vision_irs(model_dir, proc, imgs, side, vc, rotary):
+    """HF's preprocessing and host inputs driving the export's three vision
+    IRs: the reference the Rust host glue must reproduce end to end."""
+    import openvino as ov
+    core = ov.Core()
+    irs = {k: core.compile_model(os.path.join(model_dir, f"openvino_vision_embeddings{s}_model.xml"), "CPU")
+           for k, s in (("patch", ""), ("pos", "_pos"), ("merger", "_merger"))}
+    out = {}
+    for name in ("tiny_40x30", "square_448", "landscape_640x360"):
+        o = proc(images=[imgs[name]], return_tensors="pt")
+        pv, g = o["pixel_values"], o["image_grid_thw"]
+        patch = torch.from_numpy(irs["patch"]({"hidden_states": pv.numpy()})[0])
+        idx, wts = vu.get_vision_bilinear_indices_and_weights(g, side, vc.spatial_merge_size)
+        corners = torch.from_numpy(irs["pos"]({"input": idx.numpy()})[0])
+        hidden = patch + (corners * wts[:, :, None]).sum(0)
+        rot = rotary(vu.get_vision_position_ids(g, vc.spatial_merge_size))
+        cu = vu.get_vision_cu_seqlens(g).tolist()
+        n = hidden.shape[0]
+        mask = torch.full((1, n, n), float("-inf"))
+        for a, b in zip(cu[:-1], cu[1:]):
+            mask[0, a:b, a:b] = 0
+        emb = irs["merger"]({"hidden_states": hidden.numpy(), "attention_mask": mask.numpy(),
+                             "rotary_pos_emb": rot.numpy()})[0]
+        emb = torch.from_numpy(emb)
+        out[name] = {"grid_thw": g.tolist()[0], "patch_embeds": summary(patch),
+                     "hidden_states": summary(hidden), "image_embeds": summary(emb)}
+        print(f"[vision_ir] {name}: grid={g.tolist()[0]} embeds={list(emb.shape)}")
+    return out
 
 
 if __name__ == "__main__":
