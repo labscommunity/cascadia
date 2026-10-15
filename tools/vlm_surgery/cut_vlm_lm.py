@@ -22,7 +22,7 @@ Families (the `vision.family` rank 0 serves):
            token_type_ids frame.
 
 Usage:
-  python cut_vlm_lm.py --model <OV VLM dir> --output-dir <tree> --num-stages 2 \
+  python cut_vlm_lm.py --model <OV VLM dir> --output-dir <tree> --num-stages N \
       --family pixtral [--stage I]
 """
 
@@ -194,8 +194,10 @@ def main() -> None:
     ap.add_argument("--stage", type=int, default=None, help="cut only this stage")
     ap.add_argument("--boundary-suffix", default=g.DEFAULT_LAYERNORM_SUFFIX)
     args = ap.parse_args()
-    if args.num_stages < 2:
-        raise SystemExit("--num-stages must be >= 2 (serve one box with ov-genai)")
+    # One stage serves a single box through ov-runtime: GenAI's own Pixtral
+    # preprocessing differs from HF's (see docs/rfcs/vlm-support.md).
+    if args.num_stages < 1:
+        raise SystemExit("--num-stages must be >= 1")
     run(args.model, args.output_dir, args.num_stages, args.family,
         args.boundary_suffix, args.stage)
 
