@@ -2035,21 +2035,34 @@ async fn prepare_media(
     }
     // Remote images are fetched first, outside the decode slot (a fetch
     // waits on the network, not the CPU), sharing one byte budget per request.
-    let mut fetched: Vec<Option<Vec<u8>>> = Vec::with_capacity(count);
-    let mut budget = cfg.max_request_image_bytes;
-    for (i, (url, _)) in messages.iter().flat_map(|m| m.images()).enumerate() {
-        if !(cfg.allow_remote_urls && media::is_remote(url)) {
-            fetched.push(None);
-            continue;
-        }
-        match media::fetch_image(url, budget, cfg.fetch_policy).await {
-            Ok(bytes) => {
-                budget -= bytes.len();
-                fetched.push(Some(bytes));
+    // One deadline over all of them: each fetch has its own, but eight
+    // images back to back would still hold the permit for eight of those.
+    let fetch_all = async {
+        let mut fetched: Vec<Option<Vec<u8>>> = Vec::with_capacity(count);
+        let mut budget = cfg.max_request_image_bytes;
+        for (i, (url, _)) in messages.iter().flat_map(|m| m.images()).enumerate() {
+            if !(cfg.allow_remote_urls && media::is_remote(url)) {
+                fetched.push(None);
+                continue;
             }
-            Err(e) => return Err(reject(format!("image {i}: {e}"))),
+            let bytes = media::fetch_image(url, budget, cfg.fetch_policy)
+                .await
+                .map_err(|e| format!("image {i}: {e}"))?;
+            budget -= bytes.len();
+            fetched.push(Some(bytes));
         }
-    }
+        Ok::<_, String>(fetched)
+    };
+    let fetched = match tokio::time::timeout(cfg.fetch_policy.per_request, fetch_all).await {
+        Ok(Ok(f)) => f,
+        Ok(Err(msg)) => return Err(reject(msg)),
+        Err(_) => {
+            return Err(reject(format!(
+                "fetching this request's images took longer than {} s",
+                cfg.fetch_policy.per_request.as_secs_f32()
+            )))
+        }
+    };
     let messages = messages.to_vec();
     let decode_cfg = Arc::clone(&cfg);
     // Waits rather than refusing: the caller already holds an in-flight
@@ -4483,6 +4496,7 @@ mod tests {
             media.fetch_policy = media::FetchPolicy {
                 allow_http: true,
                 allow_non_public: true,
+                ..media::FetchPolicy::PUBLIC_HTTPS
             };
             let cfg = Config {
                 chat_template: ChatTemplateConfig {
