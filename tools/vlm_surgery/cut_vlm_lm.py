@@ -118,9 +118,15 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
         if not os.path.exists(os.path.join(model_dir, fn)):
             raise SystemExit(f"{model_dir} lacks {fn}; not an OpenVINO VLM export")
 
+    if num_stages > num_layers:
+        raise SystemExit(f"--num-stages {num_stages} exceeds the {num_layers} decoder layers")
+    if only_stage is not None and not 0 <= only_stage < num_stages:
+        raise SystemExit(f"--stage {only_stage} is not in 0..{num_stages - 1}")
     os.makedirs(out_dir, exist_ok=True)
+    # Removed up front and written last, so a run that dies (a whole cut or a
+    # one-stage re-cut) never leaves a tree that reads as complete.
     marker = os.path.join(out_dir, "pipeline_config.json")
-    if only_stage is None and os.path.exists(marker):
+    if os.path.exists(marker):
         os.remove(marker)
     ranges = g.stage_ranges(num_stages, num_layers)
     stages_meta = []
@@ -148,20 +154,29 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
         log(f"stage_{i}: layers {a}..{b} saved in {time.time() - t0:.0f}s "
             f"inputs={meta['inputs']} states={len(state_vars)}")
 
+    def put(src: str, dst: str) -> None:
+        # Replace, never write through: dst may be a hardlink in another tree.
+        if os.path.exists(dst):
+            os.remove(dst)
+        shutil.copy2(src, dst)
+
     for fn in ROOT_FILES:
         src = os.path.join(model_dir, fn)
         if os.path.exists(src):
-            shutil.copy2(src, os.path.join(out_dir, fn))
-    shutil.copy2(os.path.join(model_dir, "config.json"), os.path.join(out_dir, "config.vlm.json"))
-    with open(os.path.join(out_dir, "config.json"), "w") as f:
+            put(src, os.path.join(out_dir, fn))
+    put(os.path.join(model_dir, "config.json"), os.path.join(out_dir, "config.vlm.json"))
+    cfg_out = os.path.join(out_dir, "config.json")
+    if os.path.exists(cfg_out):
+        os.remove(cfg_out)
+    with open(cfg_out, "w") as f:
         json.dump(text, f, indent=2)
     tok = os.path.join(out_dir, "tokenizer")
     os.makedirs(tok, exist_ok=True)
     for fn in TOKENIZER_FILES:
         src = os.path.join(model_dir, fn)
         if os.path.exists(src):
-            shutil.copy2(src, os.path.join(tok, fn))
-    shutil.copy2(os.path.join(out_dir, "config.json"), os.path.join(tok, "config.json"))
+            put(src, os.path.join(tok, fn))
+    put(cfg_out, os.path.join(tok, "config.json"))
     if not os.path.exists(os.path.join(tok, "tokenizer.json")):
         raise SystemExit(f"{model_dir} has no tokenizer.json; ov-runtime needs it")
 
