@@ -2363,12 +2363,17 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // Image input: ov-genai on a VLM-layout export (vision encoder IRs
         // present). Every other engine answers `image_url` parts with a 400.
         // The body limit grows by the image allowance; the prompt cap does not.
-        if matches!(args.engine, EngineKind::OvGenai)
-            && std::path::Path::new(&args.model)
-                .join("openvino_vision_embeddings_model.xml")
-                .exists()
-        {
-            let mut media = cascadia_api::MediaConfig::ov_genai();
+        // `qwen35` trees carrying the vision IRs encode images on rank 0 (the
+        // rank that serves this API) and take Qwen's native tag.
+        let has_vision = std::path::Path::new(&args.model)
+            .join("openvino_vision_embeddings_model.xml")
+            .exists();
+        let media_kind = match args.engine {
+            EngineKind::OvGenai if has_vision => Some(cascadia_api::MediaConfig::ov_genai()),
+            EngineKind::Qwen36Moe if has_vision => Some(cascadia_api::MediaConfig::qwen35_native()),
+            _ => None,
+        };
+        if let Some(mut media) = media_kind {
             media.allow_remote_urls = args.api_allow_image_urls;
             info!(
                 max_images = media.max_images,
