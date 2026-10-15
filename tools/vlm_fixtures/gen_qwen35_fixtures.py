@@ -55,7 +55,12 @@ IMAGES = {
     "portrait_300x1000": (300, 1000, 3),
     "tiny_40x30": (40, 30, 4),
     "odd_1001x777": (1001, 777, 5),
+    "big_1600x1200": (1600, 1200, 6),
 }
+
+# Extra processor runs with a lowered max_pixels: they force a strong
+# downscale, which exercises the antialiased (widened) kernel path.
+LOW_BUDGET = {"big_1600x1200_maxpx262144": ("big_1600x1200", 262144)}
 
 
 def summary(t):
@@ -116,6 +121,18 @@ def main():
         outs = {}
         for kind, proc in (("fast", fast), ("slow", slow)):
             o = proc(images=[img], return_tensors="pt")
+            outs[kind] = o["pixel_values"]
+            entry[kind] = {"grid_thw": o["image_grid_thw"].tolist()[0], "pixel_values": summary(o["pixel_values"])}
+        d = (outs["fast"].double() - outs["slow"].double()).abs()
+        entry["fast_vs_slow"] = {"max_abs": float(d.max()), "mean_abs": float(d.mean())}
+        ref["images"][name] = entry
+
+    for name, (src, max_px) in LOW_BUDGET.items():
+        img = imgs[src]
+        entry = {"size": list(img.size), "source": src, "max_pixels": max_px}
+        outs = {}
+        for kind, proc in (("fast", fast), ("slow", slow)):
+            o = proc(images=[img], max_pixels=max_px, min_pixels=proc.size["shortest_edge"], return_tensors="pt")
             outs[kind] = o["pixel_values"]
             entry[kind] = {"grid_thw": o["image_grid_thw"].tolist()[0], "pixel_values": summary(o["pixel_values"])}
         d = (outs["fast"].double() - outs["slow"].double()).abs()
