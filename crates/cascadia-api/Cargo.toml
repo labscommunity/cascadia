@@ -35,6 +35,12 @@ bytes = { workspace = true }
 # formatter, silently stripping tools from the prompt.
 minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "macros", "multi_template", "json"] }
 minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
+# Image input (`image_url` content parts): decode, downscale and hash once in
+# the API so engines only ever see RGB pixels. Formats limited to what
+# OpenAI accepts (PNG, JPEG, WEBP, non-animated GIF).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+base64 = "0.22"
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true }
