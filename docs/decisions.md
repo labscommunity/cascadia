@@ -453,3 +453,37 @@ python tools/decision_export.py clef --base-ir STOCK_INT8_IR \
 
 Each supported decision model has a section below with its `decision.json`, export steps and
 measured parity.
+
+### JEV-9B
+
+**Model:** [autotrust/JEV-9B](https://huggingface.co/autotrust/JEV-9B) (verbalizer LoRA on Qwen3.5-9B),
+served on Intel's stock [OpenVINO/Qwen3.5-9B-int8-ov](https://huggingface.co/OpenVINO/Qwen3.5-9B-int8-ov)
+with the adapter grafted at export. No `--weights`: the backbone is stock.
+
+```bash
+hf download OpenVINO/Qwen3.5-9B-int8-ov --include "openvino_language_model.*" --include "openvino_text_embeddings_model.*" \
+    --include config.json --include "tokenizer*.json" --include generation_config.json --include "chat_template*" \
+    --local-dir ~/models/qwen35-9b-int8
+hf download autotrust/JEV-9B --include "adapter_vllm/*" --include calibration.json --include tokenizer.json \
+    --include tokenizer_config.json --local-dir ~/models/jev9b
+python tools/decision_export.py jev --base-ir ~/models/qwen35-9b-int8 --adapter-dir ~/models/jev9b/adapter_vllm \
+    --out ~/trees/jev9b-int8           # 8 stages; 201 LoRA branches grafted (25 per stage, 26 on the last)
+cascadia run ~/trees/jev9b-int8 --engine qwen35 --device CPU --api 127.0.0.1:8080
+```
+
+**Measured parity** (single box, CPU, Intel Core Ultra 7 258V, 32 GB, OpenVINO GenAI 2026.4.0; the 50
+records / 82 questions of the spike set):
+
+| Check | Result |
+|---|---|
+| Prompt layout vs serve_decide + `decision_head.json` (82 + 4 synthetic) | 86/86 |
+| Prompts byte-equal to the spike's `jev.py` (choices sorted) | 82/82 |
+| Answers vs the spike's saved full-precision reference | 82/82 |
+| int8 vs streamed fp32 reference on the server's own prompts | **82/82** (choice 33/33, predicate 24/24, score 25/25), max \|Δp\| 0.0175, no flips |
+| `/v1/decisions` vs `/v1/systemone` | 82/82 identical |
+
+The warmup measured the prefix-cache snapshot model at 53.5 MB fixed + 64 KiB per token.
+
+**Apple Silicon:** OpenVINO's ARM CPU plugin expands quantized weights when it compiles, so one process
+serving all 8 stages needs far more than the 8.3 GB of int8 weights (it went to ~37 GB of swap on a 36 GB
+M4 Max). Serve the 9B models on x86 (Intel) hosts; on a Mac, only one stage per process fits.
