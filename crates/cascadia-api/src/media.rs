@@ -109,6 +109,21 @@ impl MediaConfig {
         }
     }
 
+    /// Settings for a Pixtral (LLaVA-layout) vision tree on `ov-runtime`:
+    /// the template's own `[IMG]`, which rank 0 expands to the image's rows
+    /// of `[IMG]` closed by `[IMG_BREAK]` and, last, `[IMG_END]`. Pixtral
+    /// spends a token per 16x16 patch (up to 64x64 at its 1024 px edge), so
+    /// the pixel budget bounds prompt length too.
+    pub fn pixtral_native() -> Self {
+        Self {
+            image_placeholder: "[IMG]".into(),
+            reserved_text: ["[IMG]", "[IMG_BREAK]", "[IMG_END]"]
+                .map(String::from)
+                .to_vec(),
+            ..Self::ov_genai()
+        }
+    }
+
     pub fn placeholder(&self, i: usize) -> String {
         self.image_placeholder.replace("{i}", &i.to_string())
     }
@@ -851,5 +866,12 @@ mod tests {
         assert_eq!(g.reserved_in("raw <image|> text"), Some("<image|>"));
         assert!(g.reserved_in("raw <|image> text").is_some());
         assert_eq!(g.reserved_in("plain text"), None);
+
+        let x = MediaConfig::pixtral_native();
+        assert_eq!(x.placeholder(1), "[IMG]");
+        assert_eq!(x.placeholders_complete("[IMG]a[IMG]", 2), Ok(()));
+        assert_eq!(x.reserved_in("raw [IMG_END] text"), Some("[IMG_END]"));
+        assert!(x.reserved_in("raw [IMG_BREAK] text").is_some());
+        assert_eq!(x.reserved_in("plain text"), None);
     }
 }

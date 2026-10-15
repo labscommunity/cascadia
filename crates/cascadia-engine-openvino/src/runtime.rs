@@ -81,6 +81,11 @@ struct PipelineVision {
     /// served; trees from before the field are Gemma 4 surgery trees.
     #[serde(default)]
     family: Option<String>,
+    /// Whether every stage takes `token_type_ids` (the third wire frame).
+    /// Absent means the family's default: on for gemma4 (bidirectional image
+    /// attention), off otherwise.
+    #[serde(default)]
+    token_type_ids: Option<bool>,
     /// Text embedding table IR in the pipeline dir (rank 0 embeds the prompt).
     text_embeddings: String,
     /// Vision encoder IR in the pipeline dir.
@@ -1487,16 +1492,26 @@ fn import_plugin(plugin: &PluginConfig) -> PluginConfig {
 
 // -------- Engine --------
 
+/// Image families ov-runtime serves on a vision tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VisionFamily {
+    /// Gemma 4 surgery trees (26B-A4B/31B): `token_type_ids` on every stage.
+    Gemma4,
+    /// LLaVA-layout Pixtral trees from tools/vlm_surgery: causal attention.
+    Pixtral,
+}
+
 /// The family of a pipeline's `vision` block. A tree without the field is
 /// accepted only when it is a Gemma 4 vision surgery tree (written before the
-/// field existed); any other family is refused rather than fed Gemma's
-/// preprocessing.
-fn vision_family(v: &PipelineVision, export_version: Option<&str>) -> EngineResult<&'static str> {
+/// field existed); any other family is refused rather than fed another
+/// family's preprocessing.
+fn vision_family(v: &PipelineVision, export_version: Option<&str>) -> EngineResult<VisionFamily> {
     match (v.family.as_deref(), export_version) {
-        (Some("gemma4"), _) | (None, Some("gemma4_vision_surgery_v1")) => Ok("gemma4"),
+        (Some("gemma4"), _) | (None, Some("gemma4_vision_surgery_v1")) => Ok(VisionFamily::Gemma4),
+        (Some("pixtral"), _) => Ok(VisionFamily::Pixtral),
         (Some(f), _) => Err(EngineError::InvalidConfig(format!(
             "pipeline_config.json `vision.family` is {f:?}; ov-runtime serves image input \
-             for \"gemma4\" only"
+             for \"gemma4\" and \"pixtral\""
         ))),
         (None, other) => Err(EngineError::InvalidConfig(format!(
             "pipeline_config.json has a `vision` block without `family` on a {other:?} \
@@ -1505,14 +1520,66 @@ fn vision_family(v: &PipelineVision, export_version: Option<&str>) -> EngineResu
     }
 }
 
-/// A Gemma 4 vision tree: stage 0 takes `inputs_embeds` instead of ids and
-/// every stage takes `token_type_ids` (1 on image soft tokens: sliding-window
-/// layers attend bidirectionally inside each image), so that row rides the
-/// wire as a third frame `[lead] [hidden] [types]`. Served on the stateful
-/// path only; the static, chunked-prefill and packed paths are refused at load.
+/// A vision tree: stage 0 takes `inputs_embeds` instead of ids (rank 0
+/// embeds the prompt and splices image rows). On a Gemma 4 tree every stage
+/// also takes `token_type_ids` (1 on image soft tokens: sliding-window layers
+/// attend bidirectionally inside each image), so that row rides the wire as a
+/// third frame `[lead] [hidden] [types]`. Served on the stateful path only;
+/// the static, chunked-prefill and packed paths are refused at load.
 struct VisionTree {
     /// Rank 0 only.
     first: Option<VisionFirst>,
+    /// Stages take `token_type_ids` and the wire carries the third frame.
+    token_types: bool,
+}
+
+/// Rank 0's image front end, per family.
+enum Frontend {
+    Gemma4(crate::gemma4_vision::ImageFrontend),
+    Pixtral(crate::pixtral_vision::Frontend),
+}
+
+impl Frontend {
+    /// The soft-token id whose rows the encoder supplies.
+    fn image_token(&self) -> i64 {
+        match self {
+            Frontend::Gemma4(f) => f.tokens.image,
+            Frontend::Pixtral(f) => f.tokens.image,
+        }
+    }
+
+    /// Ids for the text embedding table (Gemma embeds image tokens as pad;
+    /// their rows are overwritten either way).
+    fn embedding_ids(&self, ids: &[i64]) -> Vec<i64> {
+        match self {
+            Frontend::Gemma4(f) => crate::gemma4_vision::text_embedding_ids(ids, &f.tokens),
+            Frontend::Pixtral(_) => ids.to_vec(),
+        }
+    }
+
+    fn prepare(
+        &mut self,
+        media: &[cascadia_types::MediaInput],
+        prompt_ids: &[i64],
+    ) -> Result<(Vec<i64>, Vec<Vec<f32>>), String> {
+        match self {
+            Frontend::Gemma4(f) => f.prepare(media, prompt_ids),
+            Frontend::Pixtral(f) => f.prepare(media, prompt_ids),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Frontend::Gemma4(f) => format!(
+                "Gemma 4 images, {} soft tokens each at most",
+                f.preprocess.max_soft_tokens
+            ),
+            Frontend::Pixtral(f) => format!(
+                "Pixtral images, longest edge {} px, one token per {}px patch",
+                f.preprocess.longest_edge, f.preprocess.patch_size
+            ),
+        }
+    }
 }
 
 /// Rank 0's half of a vision tree: the text embedding table it embeds every
@@ -1520,11 +1587,11 @@ struct VisionTree {
 struct VisionFirst {
     embed: OvRuntime,
     embed_input: String,
-    frontend: crate::gemma4_vision::ImageFrontend,
+    frontend: Frontend,
 }
 
 impl VisionFirst {
-    fn load(pipeline_dir: &Path, cfg: &PipelineVision) -> EngineResult<Self> {
+    fn load(pipeline_dir: &Path, cfg: &PipelineVision, family: VisionFamily) -> EngineResult<Self> {
         let invalid = |m: String| EngineError::InvalidConfig(format!("vision tree: {m}"));
         // Small next to a stage; the CPU keeps them off the stage's device.
         let plugin = PluginConfig::new();
@@ -1534,7 +1601,7 @@ impl VisionFirst {
         let embed_input = embed.input_name(0).map_err(map_ov_err)?;
         if cfg.vision_embeddings != "openvino_vision_embeddings_model.xml" {
             return Err(invalid(format!(
-                "vision_embeddings {:?} is not the Gemma 4 encoder IR name",
+                "vision_embeddings {:?} is not the encoder IR name",
                 cfg.vision_embeddings
             )));
         }
@@ -1553,14 +1620,40 @@ impl VisionFirst {
                 .and_then(serde_json::Value::as_i64)
                 .ok_or_else(|| invalid(format!("{} lacks {k}", vlm.display())))
         };
-        let tokens = crate::gemma4_vision::ImageTokens {
-            image: id("image_token_id")?,
-            boi: id("boi_token_id")?,
-            eoi: id("eoi_token_id")?,
-            pad: id("pad_token_id")?,
+        let frontend = match family {
+            VisionFamily::Gemma4 => {
+                let tokens = crate::gemma4_vision::ImageTokens {
+                    image: id("image_token_id")?,
+                    boi: id("boi_token_id")?,
+                    eoi: id("eoi_token_id")?,
+                    pad: id("pad_token_id")?,
+                };
+                Frontend::Gemma4(
+                    crate::gemma4_vision::ImageFrontend::load(pipeline_dir, tokens)
+                        .map_err(invalid)?,
+                )
+            }
+            VisionFamily::Pixtral => {
+                // LLaVA configs name the image id `image_token_index`; the
+                // row break and end are special tokens of the tokenizer.
+                let tok_path = pipeline_dir.join("tokenizer").join("tokenizer.json");
+                let tok = Tokenizer::from_file(&tok_path)
+                    .map_err(|e| invalid(format!("reading {}: {e}", tok_path.display())))?;
+                let special = |t: &str| {
+                    tok.token_to_id(t)
+                        .map(i64::from)
+                        .ok_or_else(|| invalid(format!("tokenizer has no {t}")))
+                };
+                let tokens = crate::pixtral_vision::ImageTokens {
+                    image: id("image_token_index").or_else(|_| special("[IMG]"))?,
+                    image_break: special("[IMG_BREAK]")?,
+                    image_end: special("[IMG_END]")?,
+                };
+                Frontend::Pixtral(
+                    crate::pixtral_vision::Frontend::load(pipeline_dir, tokens).map_err(invalid)?,
+                )
+            }
         };
-        let frontend =
-            crate::gemma4_vision::ImageFrontend::load(pipeline_dir, tokens).map_err(invalid)?;
         Ok(Self {
             embed,
             embed_input,
@@ -1571,7 +1664,7 @@ impl VisionFirst {
     /// Row-major `[ids.len(), hidden]` text embeddings for `ids` (image soft
     /// tokens embed as pad), and `hidden`.
     fn embed(&mut self, ids: &[i64]) -> EngineResult<(Vec<f32>, usize)> {
-        let ids = crate::gemma4_vision::text_embedding_ids(ids, &self.frontend.tokens);
+        let ids = self.frontend.embedding_ids(ids);
         self.embed
             .set_input(
                 &self.embed_input,
@@ -1834,6 +1927,11 @@ impl OvRuntimeEngine {
         Ok(())
     }
 
+    /// A vision tree whose stages take `token_type_ids` (the third frame).
+    fn vision_token_types(&self) -> bool {
+        self.vision.as_ref().is_some_and(|v| v.token_types)
+    }
+
     /// Vision tree, rank 0: embed `input_ids` through the text embedding
     /// table, splice the active task's image rows into a prefill, and set
     /// stage 0's `inputs_embeds` and `token_type_ids` (kept in `step_types`
@@ -1849,23 +1947,17 @@ impl OvRuntimeEngine {
             .as_mut()
             .and_then(|v| v.first.as_mut())
             .ok_or_else(|| EngineError::Backend("vision tree: rank 0 lacks its encoder".into()))?;
-        let image = first.frontend.tokens.image;
+        let image = first.frontend.image_token();
         let (mut embeds, hidden) = first.embed(input_ids)?;
         if !rows.is_empty() {
             let refs: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
             crate::gemma4_vision::splice_images(&mut embeds, hidden, input_ids, image, &refs)
                 .map_err(EngineError::Backend)?;
         }
-        self.step_types = crate::gemma4_vision::token_type_ids(input_ids, image);
+        let token_types = self.vision_token_types();
         let in_embeds = self
             .input_named("inputs_embeds")
             .ok_or_else(|| EngineError::Backend("vision tree: stage 0 lacks inputs_embeds".into()))?
-            .to_string();
-        let in_types = self
-            .input_named("token_type_ids")
-            .ok_or_else(|| {
-                EngineError::Backend("vision tree: stage 0 lacks token_type_ids".into())
-            })?
             .to_string();
         let bytes: Vec<u8> = embeds.iter().flat_map(|x| x.to_le_bytes()).collect();
         self.runtime
@@ -1876,14 +1968,23 @@ impl OvRuntimeEngine {
                 &bytes,
             )
             .map_err(map_ov_err)?;
-        self.runtime
-            .set_input(
-                &in_types,
-                ShimDType::I64,
-                &[1, input_ids.len()],
-                &i64_to_bytes(&self.step_types),
-            )
-            .map_err(map_ov_err)?;
+        if token_types {
+            self.step_types = crate::gemma4_vision::token_type_ids(input_ids, image);
+            let in_types = self
+                .input_named("token_type_ids")
+                .ok_or_else(|| {
+                    EngineError::Backend("vision tree: stage 0 lacks token_type_ids".into())
+                })?
+                .to_string();
+            self.runtime
+                .set_input(
+                    &in_types,
+                    ShimDType::I64,
+                    &[1, input_ids.len()],
+                    &i64_to_bytes(&self.step_types),
+                )
+                .map_err(map_ov_err)?;
+        }
         Ok(())
     }
 
@@ -1961,7 +2062,7 @@ impl OvRuntimeEngine {
         self.runtime
             .set_input(&in_hs, ShimDType::F16, &shape, &hs_bytes)
             .map_err(map_ov_err)?;
-        if self.vision.is_some() {
+        if self.vision_token_types() {
             let in_types = self
                 .input_named("token_type_ids")
                 .ok_or_else(|| {
@@ -2236,7 +2337,7 @@ impl OvRuntimeEngine {
         // [seq] (stateful) or [seq, position] (static);
         // recv_hidden_from_upstream mirrors it.
         let pos = self.static_kv.is_some().then_some(position);
-        let types = match self.vision {
+        let types = match self.vision.as_ref().filter(|v| v.token_types) {
             Some(_) if self.step_types.len() != shape[1] => {
                 return Err(EngineError::Backend(format!(
                     "vision tree: {} token types for a {}-token hidden",
@@ -2311,7 +2412,7 @@ impl OvRuntimeEngine {
                 .clone()
                 .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
             debug!(want_pos, "upstream recv: waiting");
-            let want_types = self.vision.is_some();
+            let want_types = self.vision_token_types();
             let (lead, hidden, types) = self
                 .block_on(recv_hidden_frames(&upstream, want_pos, want_types))
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
@@ -5484,29 +5585,34 @@ impl Builder for OvRuntimeBuilder {
         }
 
         if let Some(v) = pipeline_cfg.vision.as_ref() {
-            vision_family(v, pipeline_cfg.export_version.as_deref())?;
+            let family = vision_family(v, pipeline_cfg.export_version.as_deref())?;
+            let token_types = v.token_type_ids.unwrap_or(family == VisionFamily::Gemma4);
             if !stage_cfg.stateful || self.packed_slots > 0 {
                 return Err(EngineError::InvalidConfig(
-                    "a Gemma 4 vision tree is served on the stateful path only \
+                    "a vision tree is served on the stateful path only \
                      (no static/NPU shards, no --packed-slots)"
                         .into(),
                 ));
             }
             let first = if is_first {
-                let f = VisionFirst::load(&self.pipeline_dir, v)?;
+                let f = VisionFirst::load(&self.pipeline_dir, v, family)?;
                 events.push(LoadProgress::message(format!(
-                    "vision tree: rank 0 embeds the prompt and encodes images \
-                     ({} soft tokens per image at most)",
-                    f.frontend.preprocess.max_soft_tokens
+                    "vision tree: rank 0 embeds the prompt and encodes images ({})",
+                    f.frontend.describe()
                 )));
                 Some(f)
             } else {
-                events.push(LoadProgress::message(
-                    "vision tree: relaying token_type_ids".to_string(),
-                ));
+                events.push(LoadProgress::message(format!(
+                    "vision tree ({family:?}): {}",
+                    if token_types {
+                        "relaying token_type_ids"
+                    } else {
+                        "relaying hidden states"
+                    }
+                )));
                 None
             };
-            self.vision = Some(VisionTree { first });
+            self.vision = Some(VisionTree { first, token_types });
         }
 
         events.push(LoadProgress::ready());
@@ -5746,15 +5852,20 @@ impl Builder for OvRuntimeBuilder {
         };
 
         if let Some(v) = self.vision.as_ref() {
-            let need: &[&str] = if v.first.is_some() {
-                &["inputs_embeds", "token_type_ids"]
+            let main = if v.first.is_some() {
+                "inputs_embeds"
             } else {
-                &["hidden_states", "token_type_ids"]
+                "hidden_states"
+            };
+            let need: &[&str] = if v.token_types {
+                &[main, "token_type_ids"][..]
+            } else {
+                &[main][..]
             };
             if let Some(m) = need.iter().find(|n| !canonical_inputs.contains_key(**n)) {
                 return Err(EngineError::InvalidConfig(format!(
-                    "vision tree: stage {} IR has no {m} input; re-export with \
-                     tools/gemma4_surgery --vision",
+                    "vision tree: stage {} IR has no {m} input; re-export the tree \
+                     (tools/gemma4_surgery --vision or tools/vlm_surgery)",
                     self.rank
                 )));
             }
@@ -7246,14 +7357,22 @@ mod tests {
     fn vision_block_family_is_checked() {
         let v = |f: Option<&str>| PipelineVision {
             family: f.map(String::from),
+            token_type_ids: None,
             text_embeddings: "t.xml".into(),
             vision_embeddings: "openvino_vision_embeddings_model.xml".into(),
         };
-        assert_eq!(vision_family(&v(Some("gemma4")), None).unwrap(), "gemma4");
+        assert_eq!(
+            vision_family(&v(Some("gemma4")), None).unwrap(),
+            VisionFamily::Gemma4
+        );
         assert_eq!(
             vision_family(&v(None), Some("gemma4_vision_surgery_v1")).unwrap(),
-            "gemma4",
+            VisionFamily::Gemma4,
             "trees from before the field still load"
+        );
+        assert_eq!(
+            vision_family(&v(Some("pixtral")), None).unwrap(),
+            VisionFamily::Pixtral
         );
         assert!(vision_family(&v(Some("mistral3")), None).is_err());
         assert!(vision_family(&v(None), Some("something_else_v1")).is_err());

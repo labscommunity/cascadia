@@ -18,6 +18,7 @@ pub mod genai;
 pub mod kv_coordination;
 pub mod packed;
 mod packed_exec;
+pub mod pixtral_vision;
 pub mod prefix_cache;
 pub mod qwen35_vision;
 pub mod qwen36;
