@@ -11,6 +11,7 @@
 //! distributed spec-decode protocol; tracked separately.
 
 pub mod dist_spec;
+pub mod gemma3_vision;
 pub mod gemma4;
 pub mod gemma4_vision;
 pub mod genai;
