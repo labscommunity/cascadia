@@ -37,9 +37,11 @@ in [rfcs/vlm-support.md](rfcs/vlm-support.md). Video and audio are not supported
 | Gemma 4 E2B / E4B | `gemma4` | 1+ machines | `tools/export_gemma4.py --vision DIR` |
 | Pixtral 12B | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family pixtral` |
 | Mistral 3 (Ministral-3, Mistral Small 3.1/3.2) | `ov-runtime` | 1+ machines | export with optimum-intel, then `tools/vlm_surgery/cut_vlm_lm.py --family mistral3` |
+| Pixtral 12B target, Ministral-3-3B draft | `ov-dist-spec` | 2+ machines, stateful | `cut_vlm_lm.py --family pixtral --all-logits` for the target, `tools/vlm_surgery/make_text_draft.py` for the draft |
 
-Every other engine and tree refuses images with a `400`: `ov-dist-spec`, `sparse-moe`,
-`ov-genai` on a text-only export, any tree without a `vision` block. Not supported:
+Every other engine and tree refuses images with a `400`: `ov-dist-spec` on a v5 (text)
+target, `sparse-moe`, `ov-genai` on a text-only export, any tree without a `vision`
+block. `ov-dist-spec` refuses a Gemma 4 target tree at load. Not supported:
 
 - **Pixtral on `ov-genai`.** GenAI 2026.4.1 preprocesses Pixtral as LLaVA-1.5 and
   describes a different picture; `ov-genai` serves such an export as text only. Use
@@ -101,6 +103,26 @@ The export holds four IRs; rank 0 runs the vision tower, regroups each 2x2 block
 patches and runs `openvino_multi_modal_projector_model.xml` on them. Exporting on Windows
 is fine: the chat template it writes has CRLF line endings, which the server normalises.
 
+### Pixtral with speculative decoding (ov-dist-spec)
+
+Only the target sees images; the draft is a text model fed the expanded prompt ids
+(image tokens as plain tokens), so it changes the acceptance rate, never the answer.
+The target's last stage must return logits for every position (`--all-logits`), and the
+draft must be one IR that takes `input_ids`:
+
+```bash
+python tools/vlm_surgery/cut_vlm_lm.py --model <OpenVINO/pixtral-12b-int4-ov dir> \
+    --output-dir <tree> --num-stages 2 --family pixtral --all-logits
+python tools/vlm_surgery/make_text_draft.py --model <ministral3-3b-int4-ov export> \
+    --output-dir <draft dir>
+```
+
+`make_text_draft.py` wires `openvino_text_embeddings_model.xml` in front of
+`openvino_language_model.xml` and saves `openvino_model.xml` (inputs `input_ids`,
+`attention_mask`, `position_ids`, `beam_idx`, stateful KV). Serving and logs are in
+[engines/ov-dist-spec.md](engines/ov-dist-spec.md#image-input-pixtral-target). With
+`kv_coord`, image turns there prefill cold and are not captured for warm resume.
+
 ### Static and packed trees (NPU, or CPU/GPU without OpenVINO state)
 
 Convert a stateful vision tree from the tools above:
@@ -130,10 +152,15 @@ cascadia worker --total 1 --rank 0 --engine ov-runtime --model <tree> --api 127.
 # two machines (rank 1 first)
 cascadia worker --total 2 --rank 1 --engine ov-runtime --model <tree> --listen <host>:9201
 cascadia worker --total 2 --rank 0 --engine ov-runtime --model <tree> --next <host>:9201 --api 127.0.0.1:8099
+
+# speculative decoding on a Pixtral --all-logits tree (rank 1 first)
+cascadia worker --total 2 --rank 1 --engine ov-dist-spec --model <tree> --listen <host>:9201
+cascadia worker --total 2 --rank 0 --engine ov-dist-spec --model <tree> --draft-model <draft dir> \
+    --spec-k 4 --next <host>:9201 --api 127.0.0.1:8099
 ```
 
 Image input switches on by itself when the model dir or tree carries a vision encoder
-(`openvino_vision_embeddings_model.xml`, and for `ov-runtime`/`gemma4` a `vision` block
+(`openvino_vision_embeddings_model.xml`, and for `ov-runtime`/`gemma4`/`ov-dist-spec` a `vision` block
 in `pipeline_config.json`). The startup log says so (`accepting image_url content parts`)
 or says why not. Static trees: add `--device NPU` (and `--ov-cache-dir` so a restart
 loads compiled blobs instead of recompiling, which takes about ten minutes per stage IR).
