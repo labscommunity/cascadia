@@ -62,7 +62,7 @@ impl PreprocessConfig {
             num_crops: 4,
             num_img_tokens: 144,
             image_mean: [0.481_454_66, 0.457_827_5, 0.408_210_73],
-            image_std: [0.268_629_54, 0.261_302_58, 0.275_777_11],
+            image_std: [0.268_629_55, 0.261_302_6, 0.275_777_1],
         }
     }
 
@@ -352,7 +352,7 @@ pub fn assemble(
 ) -> Result<Vec<f32>, String> {
     let (rows, cols) = crops;
     let views = 1 + rows * cols;
-    if d == 0 || feat.len() % (views * d) != 0 {
+    if d == 0 || !feat.len().is_multiple_of(views * d) {
         return Err(format!(
             "{} vision values for {views} views of width {d}",
             feat.len()
@@ -360,7 +360,7 @@ pub fn assemble(
     }
     let l = feat.len() / (views * d);
     let side = (l as f64).sqrt() as usize;
-    if side * side != l || side % 2 != 0 {
+    if side * side != l || !side.is_multiple_of(2) {
         return Err(format!("{l} patches per view is not an even square grid"));
     }
     let width = 4 * d;
