@@ -2508,6 +2508,7 @@ async fn chat_completions(
         // rescue path sets it, engine-side of this API.
         resume_token_ids: None,
         decision: None,
+        lora_scale: None,
     };
 
     // Acquire a request slot before touching the engine. Contended streams
@@ -2736,6 +2737,7 @@ async fn completions(
         // Never client-settable; see the chat endpoint's note.
         resume_token_ids: None,
         decision: None,
+        lora_scale: None,
     };
 
     let permit = match state.permits.clone().try_acquire_owned() {

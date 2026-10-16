@@ -633,15 +633,17 @@ python tools/decision_export.py clef --base-ir STOCK_INT8_IR \
   with no `tokenizer.json` (from `--tokenizer`, `--weights` or the base IR) is refused. Both
   fields are optional: a tree exported without them still loads.
 - JEV takes `--switchable-lora` to make the adapter switchable at runtime, the first step toward
-  adaptive thinking (System 2), which runs the unmodified base model. The scale is no longer baked
+  adaptive thinking (System 2), which runs without the adapter. The scale is no longer baked
   into the grafted branches: every stage that carries one gains a scalar f32 input `lora_scale`,
   and each branch adds `lora_scale · (x·Aᵀ)·Bᵀ`. Feeding the trained scale gives the JEV model and
-  feeding 0 gives the base model, from the same tree. The trained scale (`lora_alpha / r` from
+  feeding 0 removes the adapter, from the same tree. Scale 0 is the stock base model only when
+  the tree was exported from the stock IR with no `--weights` (the shipped JEV recipe above); a
+  tree exported with `--weights` runs that backbone at 0. The trained scale (`lora_alpha / r` from
   `adapter_config.json`, or `--lora-scale`; 2.0 for the shipped adapters) is written to the `jev`
   object of `decision.json` as `lora_scale`. A tree without that field has its scale baked in and
-  no such input; that is the default, and a default export is unchanged byte for byte. The server
-  does not feed `lora_scale` yet, so do not serve a switchable tree until it does. Kev and Clef
-  refuse the flag.
+  no such input; that is the default, and a default export is unchanged byte for byte. The qwen35
+  engine feeds the input on every pass (see [Runtime LoRA scale](#runtime-lora-scale)). Kev and
+  Clef refuse the flag.
 - Kev and Clef trees are exported with the final hidden-state output their heads read; JEV's
   verbalizer reads only the logits.
 - Clef takes no `--lora` or `--lora-scale`: `--clef-dir` is the full checkpoint its joint head
@@ -656,6 +658,42 @@ python tools/decision_export.py clef --base-ir STOCK_INT8_IR \
   equal to the q/k row count, no saved head (`head: None`), or head tensors other than `q`/`k`
   weight and bias.
 - The manifest is written last, so a tree whose export stopped part way is not loadable.
+
+## Runtime LoRA scale
+
+The qwen35 engine serves a switchable JEV tree (`--switchable-lora`, above) as either model:
+
+- At load the engine reads which stages take `lora_scale` from `manifest.json` (each stage's
+  `inputs`) and checks every compiled stage IR against it; a stage whose IR and manifest entry
+  disagree fails the load. A tree is switchable when any stage takes the input. Rank 0 (or the
+  single box) also needs `jev.lora_scale` in `decision.json`: a switchable tree without it fails
+  the load.
+- A task's `lora_scale` (`GenerationTask::lora_scale`) picks the scale. `None` is the trained
+  scale, used by chat and every System 1 pass; `Some(0.0)` removes the adapter (System 2). The
+  scale must be a finite number ≥ 0 (`-0.0` is 0). The engine feeds it to every stage that has the
+  input on every infer: prefill, decode, the decision readout's prefill, the priming fold before a
+  prefix-cache restore, and warmup (which runs the trained scale). Stages without a LoRA branch
+  have no input and are not fed.
+- A tree whose scale is baked in has no input and runs as before. A task that sets `lora_scale`
+  on it (any `Some`, 0 included) is refused at submit with `backend error: tree has no switchable
+  LoRA`, never served with the adapter on.
+- The single box's prefix cache scopes every snapshot by the scale it was taken at, so a
+  base-model state and a LoRA state of the same tokens never restore for each other. The scopes
+  share one byte budget and one LRU. A `require_warm` pass whose prefix was cached at the other
+  scale gets `decision_cold`, as if it had been evicted.
+- With `kv_coord`, the KV plane keys its blobs by tokens alone, so on a switchable tree only
+  trained-scale turns are captured into it or warm-resumed from it; a scale-0 turn runs cold.
+- In a pipeline every rank feeds its own stage, and rank 0 carries the task's scale to the other
+  ranks. HELLO_ACK capability bit 2 (`CAP_LORA_SCALE`, value 4, ANDed along the chain like the
+  decision bit) says a rank takes the scale, and rank 0's HELLO payload carries `"lora_scale": 1`
+  for the same thing upstream. On a switchable tree, rank 0 or a middle rank refuses a chain
+  whose ACK lacks the bit, and a downstream rank refuses (NAKs) an upstream whose HELLO lacks the
+  key, so an old build on either side fails the handshake with a reason naming `lora_scale`. A
+  tree with its scale baked in ignores both, and old and new ranks keep working together.
+- The scale rides in the `pos` field of the task-start frames, RESET and (with `kv_coord`)
+  RESTORE, as its f32 bits. Those frames carried `pos = 0`, which an older rank ignores, and the
+  field is set only on a switchable tree whose chain agreed on the bit, so the frame layout is
+  unchanged. Each rank relays the scale it received down the chain.
 
 ## Pipeline reply timeouts
 

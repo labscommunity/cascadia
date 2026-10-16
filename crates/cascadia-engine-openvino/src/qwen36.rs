@@ -223,15 +223,28 @@ const FRAME_DECIDE_RUN: u32 = 15;
 const FRAME_DECISION: u32 = 16;
 
 /// HELLO_ACK `pos` is a capability bit set. Bit 0 keeps the pre-existing capture_v2 meaning
-/// (old ranks send exactly 0 or 1 there), bit 1 = this rank speaks the decision frames.
+/// (old ranks send exactly 0 or 1 there), bit 1 = this rank speaks the decision frames, bit 2 =
+/// this rank takes the task's LoRA scale from the `pos` of RESET/RESTORE (Task 42).
 const CAP_CAPTURE_V2: u32 = 1;
 const CAP_DECISION: u32 = 2;
+const CAP_LORA_SCALE: u32 = 4;
+
+/// Name of the scalar f32 stage input a switchable-LoRA tree has on every stage with a grafted
+/// branch (`decision_export.py jev --switchable-lora`).
+const LORA_SCALE_INPUT: &str = "lora_scale";
+/// HELLO payload key of the LoRA scale capability (`CAP_LORA_SCALE`'s upstream half): a rank of a
+/// switchable tree refuses an upstream that does not send it, since that build cannot carry the
+/// scale on RESET.
+const HELLO_LORA_SCALE: &str = "lora_scale";
 
 /// This rank's capability bits. CAP_DECISION only when the rank can take part in a decision pass
 /// (`Qwen36Engine::serves_decisions`), so a chain with a rank that would refuse at DECIDE_RUN,
-/// after a full chain prefill, is refused by rank 0 before any frame goes out.
+/// after a full chain prefill, is refused by rank 0 before any frame goes out. CAP_LORA_SCALE
+/// always: every build with it reads the scale from the task-start frames.
 fn own_caps(serves_decisions: bool) -> u32 {
-    (CAPTURE_V2_CAP & CAP_CAPTURE_V2) | if serves_decisions { CAP_DECISION } else { 0 }
+    (CAPTURE_V2_CAP & CAP_CAPTURE_V2)
+        | if serves_decisions { CAP_DECISION } else { 0 }
+        | CAP_LORA_SCALE
 }
 
 fn combine_caps(own: u32, down: u32) -> u32 {
@@ -240,6 +253,22 @@ fn combine_caps(own: u32, down: u32) -> u32 {
 
 fn chain_decision(caps: u32) -> bool {
     caps & CAP_DECISION != 0
+}
+
+fn chain_lora_scale(caps: u32) -> bool {
+    caps & CAP_LORA_SCALE != 0
+}
+
+/// HELLO refusal of a chain that cannot carry the LoRA scale, on a switchable tree only: an old
+/// rank would run its stage without the `lora_scale` input (or not forward the scale), so the
+/// tree is refused at startup rather than at the first pass. Baked trees keep working with old
+/// ranks.
+fn lora_chain_refusal(switchable: bool, caps: u32) -> Option<String> {
+    (switchable && !chain_lora_scale(caps)).then(|| {
+        "a downstream rank cannot take the task's lora_scale (an older build); this tree has a \
+         switchable LoRA"
+            .to_string()
+    })
 }
 
 /// The one method chunked body reads need, on both ends of a pipeline link.
@@ -415,6 +444,57 @@ impl Manifest {
     fn hidden(&self) -> usize {
         self.hidden_size.unwrap_or(LEGACY_HIDDEN)
     }
+
+    /// The tree has a switchable LoRA: some stage takes `lora_scale`. Read from the manifest, so
+    /// every rank of a chain (HELLO compares the full text) agrees, including a rank whose own
+    /// stage carries no branch and only relays the scale.
+    fn lora_switchable(&self) -> bool {
+        self.stages.iter().any(StageInfo::lora_input)
+    }
+}
+
+/// `jev.lora_scale` from the tree's decision.json: the trained scale a switchable tree feeds for
+/// `GenerationTask::lora_scale == None`. `Ok(None)` when the file or the field is absent (a baked
+/// tree); a present field that is not a finite number >= 0 is an error.
+fn read_trained_lora_scale(dir: &Path) -> Result<Option<f32>, String> {
+    let Ok(raw) = std::fs::read_to_string(dir.join("decision.json")) else {
+        return Ok(None);
+    };
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("decision.json: {e}"))?;
+    let field = &v["jev"]["lora_scale"];
+    if field.is_null() {
+        return Ok(None);
+    }
+    match field.as_f64().map(|x| x as f32) {
+        Some(x) if x.is_finite() && x >= 0.0 => Ok(Some(x)),
+        _ => Err(format!(
+            "decision.json jev.lora_scale must be a finite number >= 0, got {field}"
+        )),
+    }
+}
+
+/// The scale a task runs at on a tree, or the refusal (the engine's `backend error:` text). A
+/// baked tree has no scale to set: `None` runs as today and any `Some` is refused, never served
+/// with the adapter on. A switchable tree runs `None` at the trained scale. `-0.0` is 0.
+fn resolve_lora_scale(
+    requested: Option<f32>,
+    switchable: bool,
+    trained: Option<f32>,
+) -> Result<Option<f32>, String> {
+    if !switchable {
+        return match requested {
+            None => Ok(None),
+            Some(_) => Err("tree has no switchable LoRA".into()),
+        };
+    }
+    let s = requested
+        .or(trained)
+        .ok_or("switchable LoRA tree has no trained scale (decision.json jev.lora_scale)")?;
+    if !(s.is_finite() && s >= 0.0) {
+        return Err(format!("lora_scale must be a finite number >= 0, got {s}"));
+    }
+    Ok(Some(s + 0.0))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -422,6 +502,16 @@ struct StageInfo {
     stage: usize,
     layer_start: u32,
     layer_end: u32,
+    /// The stage IR's parameter names, as the exporter wrote them (absent in hand-written test
+    /// manifests). A switchable-LoRA tree lists `lora_scale` on each stage with a branch.
+    #[serde(default)]
+    inputs: Vec<String>,
+}
+
+impl StageInfo {
+    fn lora_input(&self) -> bool {
+        self.inputs.iter().any(|n| n == LORA_SCALE_INPUT)
+    }
 }
 
 pub struct Qwen36Builder {
@@ -439,6 +529,10 @@ pub struct Qwen36Builder {
     emb: Option<Runtime>,
     stages: Option<Vec<Runtime>>,
     tokenizer: Option<Tokenizer>,
+    /// Manifest: some stage takes `lora_scale` (set by `load`).
+    lora_switchable: bool,
+    /// decision.json `jev.lora_scale` (set by `load`).
+    trained_lora_scale: Option<f32>,
     eos: Option<u32>,
     last_logits_only: bool,
     /// Activation width from the manifest (set by `load`).
@@ -538,6 +632,8 @@ impl Qwen36Builder {
             emb: None,
             stages: None,
             tokenizer: None,
+            lora_switchable: false,
+            trained_lora_scale: None,
             eos: None,
             last_logits_only: false,
             hidden: LEGACY_HIDDEN,
@@ -735,6 +831,7 @@ impl Builder for Qwen36Builder {
         };
 
         let mut stages = Vec::new();
+        let mut local_lora = false;
         for s in &manifest.stages {
             if pipeline && s.stage != self.rank as usize {
                 continue;
@@ -744,11 +841,49 @@ impl Builder for Qwen36Builder {
                 "compiling stage{} (layers {}..{}) on {}",
                 s.stage, s.layer_start, s.layer_end, self.device
             )));
-            stages.push(
-                Runtime::compile(xml.to_str().unwrap_or_default(), &self.device, &plugin)
-                    .map_err(map_ov)?,
+            let rt = Runtime::compile(xml.to_str().unwrap_or_default(), &self.device, &plugin)
+                .map_err(map_ov)?;
+            let has = rt
+                .input_names()
+                .map_err(map_ov)?
+                .iter()
+                .any(|n| n == LORA_SCALE_INPUT);
+            // The manifest is what every rank agrees on (switchability, HELLO), so an IR that
+            // disagrees with its own entry is a mixed tree, not something to serve.
+            if !s.inputs.is_empty() && has != s.lora_input() {
+                return Err(EngineError::InvalidConfig(format!(
+                    "stage{}: the IR {} a lora_scale input but manifest.json says otherwise",
+                    s.stage,
+                    if has { "has" } else { "lacks" }
+                )));
+            }
+            local_lora |= has;
+            stages.push(rt);
+        }
+        let lora_switchable = manifest.lora_switchable() || local_lora;
+        let trained = read_trained_lora_scale(&dir).map_err(EngineError::InvalidConfig)?;
+        // Rank 0 (and the single box) turns a task's `None` into the trained scale, so it cannot
+        // serve a switchable tree without one. Other ranks take the scale from RESET.
+        if lora_switchable && self.rank == 0 && trained.is_none() {
+            return Err(EngineError::InvalidConfig(
+                "the tree has a switchable LoRA (a lora_scale stage input) but decision.json \
+                 states no jev.lora_scale"
+                    .into(),
+            ));
+        }
+        if lora_switchable {
+            info!(
+                trained_scale = ?trained,
+                "qwen35: switchable LoRA tree; every pass feeds lora_scale"
+            );
+        } else if trained.is_some() {
+            warn!(
+                "qwen35: decision.json states jev.lora_scale but no stage takes lora_scale; the \
+                 scale is baked in and the field is ignored"
             );
         }
+        self.lora_switchable = lora_switchable;
+        self.trained_lora_scale = trained;
 
         self.manifest_json = Some(manifest_raw);
         self.last_logits_only = manifest.last_logits_only;
@@ -782,9 +917,17 @@ impl Builder for Qwen36Builder {
             "qwen35 prefix cache"
         );
         Ok(Box::new(Qwen36Engine {
-            emb: self.emb,
-            stages: self.stages.ok_or(EngineError::NotLoaded)?,
+            emb: self.emb.map(OvStage::Ov),
+            stages: self
+                .stages
+                .ok_or(EngineError::NotLoaded)?
+                .into_iter()
+                .map(OvStage::Ov)
+                .collect(),
             tokenizer: self.tokenizer,
+            lora_switchable: self.lora_switchable,
+            trained_lora_scale: self.trained_lora_scale,
+            lora_scale: self.trained_lora_scale.unwrap_or(0.0),
             eos: self.eos,
             max_tokens_default: self.max_tokens_default,
             last_logits_only: self.last_logits_only,
@@ -832,6 +975,57 @@ impl Builder for Qwen36Builder {
             pending_decision: None,
             last_logits: Vec::new(),
         }))
+    }
+}
+
+/// A compiled IR the engine runs: OpenVINO when serving, a scripted stage in unit tests (a stub
+/// build cannot compile one, and the LoRA scale feed is only observable at `set_input`).
+enum OvStage {
+    Ov(Runtime),
+    #[cfg(test)]
+    Mock(tests::MockStage),
+}
+
+macro_rules! ov_stage_call {
+    ($s:expr, $m:ident($($a:expr),*)) => {
+        match $s {
+            OvStage::Ov(r) => r.$m($($a),*),
+            #[cfg(test)]
+            OvStage::Mock(m) => m.$m($($a),*),
+        }
+    };
+}
+
+impl OvStage {
+    fn input_names(&self) -> cascadia_ov_genai_shim::Result<Vec<String>> {
+        ov_stage_call!(self, input_names())
+    }
+    fn set_input(
+        &mut self,
+        name: &str,
+        dtype: DType,
+        shape: &[usize],
+        data: &[u8],
+    ) -> cascadia_ov_genai_shim::Result<()> {
+        ov_stage_call!(self, set_input(name, dtype, shape, data))
+    }
+    fn infer(&mut self) -> cascadia_ov_genai_shim::Result<()> {
+        ov_stage_call!(self, infer())
+    }
+    fn output(&self, idx: usize) -> cascadia_ov_genai_shim::Result<(DType, Vec<usize>, Vec<u8>)> {
+        ov_stage_call!(self, output(idx))
+    }
+    fn reset_state(&mut self) -> cascadia_ov_genai_shim::Result<()> {
+        ov_stage_call!(self, reset_state())
+    }
+    fn recreate_request(&mut self) -> cascadia_ov_genai_shim::Result<()> {
+        ov_stage_call!(self, recreate_request())
+    }
+    fn get_state_blob(&mut self) -> cascadia_ov_genai_shim::Result<Vec<u8>> {
+        ov_stage_call!(self, get_state_blob())
+    }
+    fn set_state_blob(&mut self, blob: &[u8]) -> cascadia_ov_genai_shim::Result<()> {
+        ov_stage_call!(self, set_state_blob(blob))
     }
 }
 
@@ -1111,10 +1305,18 @@ fn map_wire(err: TransportError) -> EngineError {
 
 pub struct Qwen36Engine {
     /// Rank 0 only in pipeline mode.
-    emb: Option<Runtime>,
-    stages: Vec<Runtime>,
+    emb: Option<OvStage>,
+    stages: Vec<OvStage>,
     /// Rank 0 only in pipeline mode.
     tokenizer: Option<Tokenizer>,
+    /// The tree has a switchable LoRA (manifest: some stage takes `lora_scale`), chain-wide.
+    lora_switchable: bool,
+    /// decision.json `jev.lora_scale`: what a task's `lora_scale: None` runs at (rank 0 and the
+    /// single box; required there on a switchable tree).
+    trained_lora_scale: Option<f32>,
+    /// Fed to every local `lora_scale` input on each infer. Set per task at admission (single box,
+    /// rank 0) or from the RESET/RESTORE `pos` (downstream ranks); warmup runs the trained scale.
+    lora_scale: f32,
     eos: Option<u32>,
     max_tokens_default: u32,
     last_logits_only: bool,
@@ -1418,7 +1620,11 @@ async fn skip_stale_body<G: RawRecv>(g: &mut G, kind: u32) -> Result<usize, Tran
 /// One inbound frame on the upstream session (downstream rank's view).
 enum InFrame {
     Hello(Vec<u8>),
-    Reset(u32),
+    /// FRAME_RESET; `pos` carries the task's LoRA scale bits on a switchable tree.
+    Reset {
+        epoch: u32,
+        pos: u32,
+    },
     /// FRAME_DECIDE: the task's readout, still length-prefixed (`decision::encode_readout`).
     Decide {
         epoch: u32,
@@ -1450,6 +1656,8 @@ enum InFrame {
         task_epoch: u32,
         kv_epoch: u64,
         blob: Vec<u8>,
+        /// The task's LoRA scale bits on a switchable tree, as RESET's.
+        pos: u32,
     },
 }
 
@@ -1513,10 +1721,16 @@ impl Qwen36Engine {
         let n_stages = self.stages.len();
         let want_fh = self.want_final_hidden && self.final_hidden_output && self.owns_head();
         let mut final_hidden = None;
+        // Only a switchable tree's stages have this input; every infer feeds it, so no pass can
+        // run on a value an earlier task left in the request.
+        let lora_scale = le_bytes_f32(&[self.lora_scale]);
         for (j, st) in self.stages.iter_mut().enumerate() {
             let names = st.input_names().map_err(map_ov)?;
             for name in &names {
                 match name.as_str() {
+                    LORA_SCALE_INPUT => st
+                        .set_input(name, DType::F32, &[], &lora_scale)
+                        .map_err(map_ov)?,
                     "stage_hidden" => st
                         .set_input(name, DType::F32, &[1, n, width], &le_bytes_f32(&hidden))
                         .map_err(map_ov)?,
@@ -1632,12 +1846,15 @@ impl Qwen36Engine {
             // Skip the resume seed: `prompt_ids` already carries those ids, so
             // counting them again keys the blob at a depth that never matches
             // the fed sequence (same defect dist_spec fixed).
-            let tokens: Vec<i32> = t
-                .prompt_ids
-                .iter()
-                .chain(t.gen_ids.iter().skip(t.resume_seed_len))
-                .map(|&u| u as i32)
-                .collect();
+            let tokens: Vec<i32> = if self.plane_scale_ok() {
+                t.prompt_ids
+                    .iter()
+                    .chain(t.gen_ids.iter().skip(t.resume_seed_len))
+                    .map(|&u| u as i32)
+                    .collect()
+            } else {
+                Vec::new() // not the trained scale: nothing for the plane (see plane_scale_ok)
+            };
             // Pipeline head: broadcast CAPTURE so every downstream rank snapshots its slice under the
             // same content epoch (workers have no tokens). Best-effort. rank0's own slice is stashed
             // token-keyed by kv_capture_local below (the NEGOTIATE/offers path).
@@ -1707,6 +1924,58 @@ impl Qwen36Engine {
         self.last_final_hidden = None;
         self.pending_decision = None;
         self.last_logits = Vec::new();
+    }
+
+    /// The scale `task` runs at on this tree, or its refusal (see [`resolve_lora_scale`]).
+    fn task_lora_scale(&self, task: &GenerationTask) -> Result<Option<f32>, String> {
+        resolve_lora_scale(
+            task.lora_scale,
+            self.lora_switchable,
+            self.trained_lora_scale,
+        )
+    }
+
+    /// Run the admitted task at its resolved scale: every infer feeds it, and the prefix cache
+    /// scopes its snapshots by it, so base-model and LoRA states never mix. `None` (a baked
+    /// tree) changes nothing.
+    fn apply_lora_scale(&mut self, scale: Option<f32>) {
+        if let Some(s) = scale {
+            self.lora_scale = s;
+            self.prefix_cache.set_scope(s.to_bits());
+        }
+    }
+
+    /// The `pos` of a task-start frame (RESET, RESTORE) this rank sends: the task's scale bits on
+    /// a switchable tree whose chain agreed `CAP_LORA_SCALE` at HELLO, else 0 as before.
+    fn task_start_pos(&self) -> u32 {
+        if self.lora_switchable && chain_lora_scale(self.chain_caps) {
+            self.lora_scale.to_bits()
+        } else {
+            0
+        }
+    }
+
+    /// Downstream: take the task's scale from a task-start frame's `pos`. Only a switchable tree
+    /// reads it; its HELLO refused any upstream that does not send it.
+    fn take_task_start_pos(&mut self, pos: u32) -> EngineResult<()> {
+        if !self.lora_switchable {
+            return Ok(());
+        }
+        let s = f32::from_bits(pos);
+        if !(s.is_finite() && s >= 0.0) {
+            return Err(EngineError::Backend(format!(
+                "task-start frame carries lora_scale {s}, not a finite number >= 0"
+            )));
+        }
+        self.lora_scale = s;
+        Ok(())
+    }
+
+    /// The kv_coord plane keys its blobs by tokens alone, so on a switchable tree only states
+    /// at the trained scale (every chat turn and System 1 pass) enter or leave it.
+    #[cfg(feature = "kv_coord")]
+    fn plane_scale_ok(&self) -> bool {
+        !self.lora_switchable || Some(self.lora_scale) == self.trained_lora_scale
     }
 
     /// This process runs the last stage, where the final hidden states and the decision head live.
@@ -1832,13 +2101,15 @@ impl Qwen36Engine {
     /// wire dtype, protocol version. The shim exposes no OV version
     /// string; the manifest compare covers export-level skew.
     fn hello_payload(&self) -> Vec<u8> {
-        #[cfg_attr(not(feature = "kv_coord"), allow(unused_mut))]
         let mut v = serde_json::json!({
             "proto": PROTO_VERSION,
             "total": self.total,
             "wire": "f32",
             "manifest": self.manifest_json,
         });
+        // Task 42: this build carries the task's LoRA scale on RESET/RESTORE. Additive: an older
+        // peer ignores the key, and only a switchable tree's ranks require it.
+        v[HELLO_LORA_SCALE] = serde_json::json!(1);
         // Advertised only by a build that can actually speak v2. A build without `kv_coord` has no
         // CAPTURE path at all, so it must read to its peers as a LEGACY rank (key absent ⇒ chain
         // floor 0 ⇒ v1) rather than as an explicit disagreement that would NAK the handshake.
@@ -1862,6 +2133,12 @@ impl Qwen36Engine {
             )));
         }
         let caps = combine_caps(own_caps(self.serves_decisions()), down_cap);
+        if let Some(reason) = lora_chain_refusal(self.lora_switchable, caps) {
+            self.poisoned = Some(reason.clone());
+            return Err(EngineError::Backend(format!(
+                "qwen36 pipeline handshake refused: {reason}"
+            )));
+        }
         self.chain_caps = caps;
         self.chain_capture_v2 = (caps & CAP_CAPTURE_V2).min(CAPTURE_V2_CAP);
         self.handshake_done = true;
@@ -2063,6 +2340,7 @@ impl Qwen36Engine {
     /// Middle: forward RESET downstream, await its ack.
     fn forward_reset_downstream(&mut self, epoch: u32) -> EngineResult<()> {
         let drain = self.link_ready()?;
+        let pos = self.task_start_pos();
         let downstream = self
             .downstream
             .clone()
@@ -2072,7 +2350,7 @@ impl Qwen36Engine {
         let ph = &phase;
         self.run_exchange(&h, "RESET_ACK", Late::Skip, ph, async move {
             let mut g = downstream.lock().await;
-            g.send_raw(&frame_header(FRAME_RESET, epoch, 0)).await?;
+            g.send_raw(&frame_header(FRAME_RESET, epoch, pos)).await?;
             let (kind, e, _) =
                 recv_reply_header(&mut *g, ph, drain, FRAME_RESET_ACK, epoch).await?;
             if kind != FRAME_RESET_ACK || e != epoch {
@@ -2271,11 +2549,12 @@ impl Qwen36Engine {
             );
         }
         let h = self.handle()?;
+        let pos = self.task_start_pos();
         let phase = ExchangePhase::new();
         let ph = &phase;
         self.run_exchange(&h, "RESTORE_ACK", Late::Skip, ph, async move {
             let mut g = downstream.lock().await;
-            g.send_raw(&frame_header(FRAME_RESTORE, task_epoch, 0))
+            g.send_raw(&frame_header(FRAME_RESTORE, task_epoch, pos))
                 .await?;
             g.send_raw(&kv_epoch.to_le_bytes()).await?;
             g.send_raw(&(blob.len() as u32).to_be_bytes()).await?;
@@ -2340,6 +2619,14 @@ impl Qwen36Engine {
                 let id = task.task_id.clone();
                 let reason = "decision_invalid: resume_token_ids not allowed on a decision task";
                 return vec![(id.clone(), Chunk::error(id, reason))];
+            }
+            // Before the RESET, which carries the scale to every rank.
+            match self.task_lora_scale(&task) {
+                Ok(s) => self.apply_lora_scale(s),
+                Err(reason) => {
+                    let id = task.task_id.clone();
+                    return vec![(id.clone(), Chunk::error(id, reason))];
+                }
             }
             let tokenizer = self.tokenizer.as_ref().expect("rank 0 has tokenizer");
             // Same encode + think-block append as before, shared with single-box admission; a
@@ -2431,7 +2718,12 @@ impl Qwen36Engine {
                 #[cfg(feature = "kv_coord")]
                 {
                     let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
-                    match self.kv.take_warm(&task.tenant, &prompt_i32) {
+                    let plane_warm = if self.plane_scale_ok() {
+                        self.kv.take_warm(&task.tenant, &prompt_i32)
+                    } else {
+                        None
+                    };
+                    match plane_warm {
                         Some((blob, len, plane_pulled)) => {
                             let kv_epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
                             let local_ok = self.restore_local_stages(&blob);
@@ -2706,7 +2998,7 @@ impl Qwen36Engine {
                     let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
                     Ok(InFrame::Hello(g.recv_raw(n).await?))
                 }
-                FRAME_RESET => Ok(InFrame::Reset(epoch)),
+                FRAME_RESET => Ok(InFrame::Reset { epoch, pos }),
                 FRAME_DECIDE => Ok(InFrame::Decide {
                     epoch,
                     body: recv_decision_body(&mut *g, "decide body").await?,
@@ -2774,6 +3066,7 @@ impl Qwen36Engine {
                         task_epoch: epoch,
                         kv_epoch,
                         blob,
+                        pos,
                     })
                 }
                 FRAME_FORWARD => {
@@ -2816,6 +3109,9 @@ impl Qwen36Engine {
                         }
                     }
                 }
+                if reason.is_none() {
+                    reason = lora_chain_refusal(self.lora_switchable, cap);
+                }
                 self.chain_caps = cap;
                 self.chain_capture_v2 = (cap & CAP_CAPTURE_V2).min(CAPTURE_V2_CAP);
                 let h = self.handle()?;
@@ -2848,7 +3144,7 @@ impl Qwen36Engine {
                 }
                 Ok(())
             }
-            InFrame::Reset(epoch) => {
+            InFrame::Reset { epoch, pos } => {
                 // Chain the reset before acking upstream: the ack means
                 // "everything downstream of you is at position 0". A
                 // failed downstream reset = no ack = task fails loud at
@@ -2857,6 +3153,8 @@ impl Qwen36Engine {
                 self.peer_epoch = epoch;
                 // A new task: no decision state may survive from the previous one.
                 self.clear_decision_state();
+                // ...and it runs at its own LoRA scale, relayed on below.
+                self.take_task_start_pos(pos)?;
                 if !is_last {
                     self.forward_reset_downstream(epoch)?;
                 }
@@ -2905,6 +3203,7 @@ impl Qwen36Engine {
                 task_epoch,
                 kv_epoch,
                 blob,
+                pos,
             } => {
                 // Consume warm-resume: set_state this rank's pulled slice, chain RESTORE downstream,
                 // ack with the all-or-nothing verdict (local && downstream restored). A miss anywhere
@@ -2913,6 +3212,7 @@ impl Qwen36Engine {
                 // RESTORE starts a new (warm) task exactly like RESET: drop any decision state an
                 // aborted decision left, or every chat FORWARD after it pays the final-hidden copy.
                 self.clear_decision_state();
+                self.take_task_start_pos(pos)?;
                 // Carried blob wins: on a CROSS-chain move this rank has no capture under the source
                 // chain's epoch, so the local stash is empty and only the head's inline copy exists.
                 // Drain FIRST — same reason as ov-runtime's RESTORE arm: in plane mode the head
@@ -3162,6 +3462,15 @@ impl Qwen36Engine {
                 theirs["capture_v2"]
             ));
         }
+        // Task 42: a switchable tree needs the task's scale on every RESET, which an older
+        // upstream build never sends. A baked tree accepts that build as before.
+        if self.lora_switchable && theirs[HELLO_LORA_SCALE] != serde_json::json!(1) {
+            return Some(
+                "the upstream rank cannot carry lora_scale (an older build); this tree has a \
+                 switchable LoRA"
+                    .into(),
+            );
+        }
         None
     }
 
@@ -3175,6 +3484,14 @@ impl Qwen36Engine {
             }
             let task = self.pending.remove(0);
             // reset moved below — Issue-34 warm-resume may restore a cached prefix blob instead.
+            // Before any restore: the prefix cache only resumes a state taken at this scale.
+            match self.task_lora_scale(&task) {
+                Ok(s) => self.apply_lora_scale(s),
+                Err(reason) => {
+                    let id = task.task_id.clone();
+                    return vec![(id.clone(), Chunk::error(id, reason))];
+                }
+            }
             let tokenizer = self.tokenizer.as_ref().expect("single-box has tokenizer");
             let mut prompt_ids: Vec<u32> = match admitted_prompt_ids(tokenizer, &task) {
                 Ok(ids) => ids,
@@ -3269,7 +3586,12 @@ impl Qwen36Engine {
                 #[cfg(feature = "kv_coord")]
                 {
                     let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
-                    match self.kv.take_warm(&task.tenant, &prompt_i32) {
+                    let plane_warm = if self.plane_scale_ok() {
+                        self.kv.take_warm(&task.tenant, &prompt_i32)
+                    } else {
+                        None
+                    };
+                    match plane_warm {
                         Some((blob, len, plane_pulled)) if self.restore_local_stages(&blob) => {
                             // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
                             // See the sibling site: kv_seq_from_framed_blob now skips conv/ssm and returns
@@ -3565,6 +3887,10 @@ impl Engine for Qwen36Engine {
             info!("qwen35 rank {}: skipping warmup (relay)", self.rank);
             return;
         }
+        // A switchable tree warms as the model it serves by default (the trained scale).
+        if let Some(s) = self.trained_lora_scale {
+            self.lora_scale = s;
+        }
         if self.total > 1 {
             // Local stage pass only (no logits on rank 0), then the
             // startup handshake — fail-loud at boot, not first request.
@@ -3608,6 +3934,9 @@ impl Engine for Qwen36Engine {
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
             });
         }
+        // A scale the tree cannot run (`Some` on a baked tree) is refused here, before it queues;
+        // admission checks again for tasks that reach `pending` another way.
+        self.task_lora_scale(&task).map_err(EngineError::Backend)?;
         // The API bounds request BYTES; this bounds tokens against the model's window so a
         // multi-MB prompt is a 413, not an hours-long prefill holding the batch=1 slot.
         if let Some(max) = self.max_ctx {
@@ -4283,6 +4612,9 @@ mod tests {
             emb: None,
             stages: Vec::new(),
             tokenizer: None,
+            lora_switchable: false,
+            trained_lora_scale: None,
+            lora_scale: 0.0,
             eos: None,
             max_tokens_default: 256,
             last_logits_only: false,
@@ -4804,6 +5136,7 @@ mod tests {
                 require_warm: false,
                 needs_snapshot: false,
             }),
+            lora_scale: None,
         }
     }
 
@@ -5845,5 +6178,541 @@ mod tests {
         assert_eq!(e.down_link, DownLink::Clean);
         e.reset_exchange().expect("a clean link after the retry");
         rt.block_on(fake).unwrap();
+    }
+
+    // ---- Task 42: the runtime `lora_scale` of switchable JEV trees ----
+
+    /// Every infer's fed `lora_scale` (`None` = not fed) on one mock stage.
+    type ScaleLog = Arc<std::sync::Mutex<Vec<Option<f32>>>>;
+
+    /// A scripted stage for unit tests (no `openvino` build): it records the `lora_scale` each
+    /// infer was fed and forgets it after the infer, so a pass that does not feed it again logs
+    /// `None`. Output 0 is `[1, n, width]`, every row zero but `peak` (a logits argmax).
+    pub(super) struct MockStage {
+        inputs: Vec<String>,
+        width: usize,
+        peak: Option<usize>,
+        n: usize,
+        fed: Option<f32>,
+        log: ScaleLog,
+        state: Vec<u8>,
+    }
+
+    impl MockStage {
+        fn new(inputs: &[&str], width: usize, peak: Option<usize>) -> (Self, ScaleLog) {
+            let log = ScaleLog::default();
+            let st = Self {
+                inputs: inputs.iter().map(|s| s.to_string()).collect(),
+                width,
+                peak,
+                n: 0,
+                fed: None,
+                log: Arc::clone(&log),
+                state: vec![3u8; 64],
+            };
+            (st, log)
+        }
+        pub(super) fn input_names(&self) -> cascadia_ov_genai_shim::Result<Vec<String>> {
+            Ok(self.inputs.clone())
+        }
+        pub(super) fn set_input(
+            &mut self,
+            name: &str,
+            dtype: DType,
+            shape: &[usize],
+            data: &[u8],
+        ) -> cascadia_ov_genai_shim::Result<()> {
+            if name == LORA_SCALE_INPUT {
+                assert!(dtype == DType::F32 && shape.is_empty(), "a scalar f32");
+                self.fed = Some(f32::from_le_bytes(data.try_into().expect("4 bytes")));
+            } else if name == "input_ids" || name == "stage_hidden" || name.contains("embed") {
+                self.n = shape[1];
+            }
+            Ok(())
+        }
+        pub(super) fn infer(&mut self) -> cascadia_ov_genai_shim::Result<()> {
+            self.log.lock().unwrap().push(self.fed.take());
+            Ok(())
+        }
+        pub(super) fn output(
+            &self,
+            _idx: usize,
+        ) -> cascadia_ov_genai_shim::Result<(DType, Vec<usize>, Vec<u8>)> {
+            let mut row = vec![0f32; self.width];
+            if let Some(p) = self.peak {
+                row[p] = 1.0;
+            }
+            let data: Vec<f32> = (0..self.n).flat_map(|_| row.clone()).collect();
+            Ok((DType::F32, vec![1, self.n, self.width], le_bytes_f32(&data)))
+        }
+        pub(super) fn reset_state(&mut self) -> cascadia_ov_genai_shim::Result<()> {
+            Ok(())
+        }
+        pub(super) fn recreate_request(&mut self) -> cascadia_ov_genai_shim::Result<()> {
+            Ok(())
+        }
+        pub(super) fn get_state_blob(&mut self) -> cascadia_ov_genai_shim::Result<Vec<u8>> {
+            Ok(self.state.clone())
+        }
+        pub(super) fn set_state_blob(&mut self, blob: &[u8]) -> cascadia_ov_genai_shim::Result<()> {
+            self.state = blob.to_vec();
+            Ok(())
+        }
+    }
+
+    const MOCK_HIDDEN: usize = 4;
+    const MOCK_VOCAB: usize = 8;
+    const TRAINED: f32 = 2.0;
+
+    /// The last stage's inputs; a switchable tree adds `lora_scale`.
+    fn last_stage_inputs(switchable: bool) -> Vec<&'static str> {
+        let mut v = vec![
+            "stage_hidden",
+            "inputs_embeds",
+            "attention_mask",
+            "position_ids",
+            "beam_idx",
+        ];
+        if switchable {
+            v.push(LORA_SCALE_INPUT);
+        }
+        v
+    }
+
+    /// A single box over mock IRs: stage0 has no LoRA branch (so never takes `lora_scale`), the
+    /// last stage has one on a switchable tree. Returns the two stages' scale logs.
+    fn mock_box(switchable: bool) -> (Qwen36Engine, ScaleLog, ScaleLog) {
+        let mut e = bare_engine(1, "{}");
+        e.rank = 0;
+        e.hidden = MOCK_HIDDEN;
+        e.tokenizer = Some(tiny_tokenizer());
+        e.vocab = Some(MOCK_VOCAB);
+        e.decision_assets = Some(crate::decision::HeadAssets::Verbalizer);
+        e.lora_switchable = switchable;
+        e.trained_lora_scale = switchable.then_some(TRAINED);
+        e.lora_scale = 7.0; // not a scale any pass may run at
+        let (emb, _) = MockStage::new(&["input_ids"], MOCK_HIDDEN, None);
+        let (s0, log0) = MockStage::new(
+            &[
+                "inputs_embeds",
+                "attention_mask",
+                "position_ids",
+                "beam_idx",
+            ],
+            MOCK_HIDDEN,
+            None,
+        );
+        let (s1, log1) = MockStage::new(&last_stage_inputs(switchable), MOCK_VOCAB, Some(1));
+        e.emb = Some(OvStage::Mock(emb));
+        e.stages = vec![OvStage::Mock(s0), OvStage::Mock(s1)];
+        (e, log0, log1)
+    }
+
+    /// Step until the task's final chunk.
+    fn run_to_final(e: &mut Qwen36Engine) -> Chunk {
+        for _ in 0..50 {
+            for (_, c) in e.step().expect("step") {
+                if c.is_final {
+                    return c;
+                }
+            }
+        }
+        panic!("no final chunk");
+    }
+
+    fn take_log(log: &ScaleLog) -> Vec<Option<f32>> {
+        std::mem::take(&mut *log.lock().unwrap())
+    }
+
+    fn chat(id: &str, scale: Option<f32>) -> GenerationTask {
+        let mut t = windowed_task(id, "hi hi hi");
+        t.max_tokens = 2;
+        t.lora_scale = scale;
+        t
+    }
+
+    fn verbalizer_pass(id: &str, scale: Option<f32>) -> GenerationTask {
+        let mut t = decision_task(
+            cascadia_types::ReadoutHead::Verbalizer {
+                token_ids: vec![1, 2],
+            },
+            None,
+        );
+        t.task_id = id.into();
+        t.decision.as_mut().unwrap().prompt_ids = vec![0, 1, 2, 3];
+        t.lora_scale = scale;
+        t
+    }
+
+    #[test]
+    fn resolve_lora_scale_runs_none_at_the_trained_scale_and_refuses_a_baked_override() {
+        let t = Some(TRAINED);
+        assert_eq!(
+            resolve_lora_scale(None, false, None),
+            Ok(None),
+            "baked: as today"
+        );
+        for s in [0.0, TRAINED] {
+            assert_eq!(
+                resolve_lora_scale(Some(s), false, t).unwrap_err(),
+                "tree has no switchable LoRA"
+            );
+        }
+        assert_eq!(resolve_lora_scale(None, true, t), Ok(Some(TRAINED)));
+        assert_eq!(resolve_lora_scale(Some(0.0), true, t), Ok(Some(0.0)));
+        let neg_zero = resolve_lora_scale(Some(-0.0), true, t).unwrap().unwrap();
+        assert_eq!(
+            neg_zero.to_bits(),
+            0.0f32.to_bits(),
+            "-0.0 is the base scope"
+        );
+        for bad in [f32::NAN, f32::INFINITY, -1.0] {
+            assert!(resolve_lora_scale(Some(bad), true, t).is_err(), "{bad}");
+        }
+        assert!(
+            resolve_lora_scale(None, true, None).is_err(),
+            "no trained scale"
+        );
+    }
+
+    #[test]
+    fn the_manifest_says_which_trees_are_switchable_and_decision_json_their_scale() {
+        let sw = Manifest::parse(
+            r#"{"arch":"qwen3_5","hidden_size":4096,"stages":[
+                {"stage":0,"layer_start":0,"layer_end":3,"inputs":["inputs_embeds","beam_idx"]},
+                {"stage":1,"layer_start":4,"layer_end":7,
+                 "inputs":["stage_hidden","inputs_embeds","lora_scale"]}]}"#,
+        )
+        .unwrap();
+        assert!(sw.lora_switchable());
+        assert!(!sw.stages[0].lora_input() && sw.stages[1].lora_input());
+        let baked = Manifest::parse(
+            r#"{"arch":"qwen3_5","hidden_size":4096,"stages":[
+                {"stage":0,"layer_start":0,"layer_end":7,"inputs":["inputs_embeds"]}]}"#,
+        )
+        .unwrap();
+        assert!(!baked.lora_switchable());
+
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_trained_lora_scale(d.path()),
+            Ok(None),
+            "no decision.json"
+        );
+        let w = |j: &str| std::fs::write(d.path().join("decision.json"), j).unwrap();
+        w(r#"{"family":"jev","jev":{"choice_labels":["A"]}}"#);
+        assert_eq!(read_trained_lora_scale(d.path()), Ok(None), "a baked tree");
+        w(r#"{"family":"jev","jev":{"lora_scale":2.0}}"#);
+        assert_eq!(read_trained_lora_scale(d.path()), Ok(Some(2.0)));
+        for bad in [
+            r#"{"jev":{"lora_scale":-1}}"#,
+            r#"{"jev":{"lora_scale":"2"}}"#,
+            "{ no",
+        ] {
+            w(bad);
+            assert!(read_trained_lora_scale(d.path()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_switchable_tree_feeds_the_scale_on_every_infer() {
+        let (mut e, log0, log1) = mock_box(true);
+        // Warmup runs the trained scale.
+        cascadia_engine::Engine::warmup(&mut e);
+        assert_eq!(take_log(&log1), vec![Some(TRAINED)]);
+
+        // Chat, None: prefill and both decode steps at the trained scale.
+        e.submit(chat("c1", None)).unwrap();
+        let c = run_to_final(&mut e);
+        assert!(c.error.is_none(), "{c:?}");
+        let fed = take_log(&log1);
+        assert_eq!(fed.len(), 3, "one prefill span, two decode steps");
+        assert!(fed.iter().all(|&f| f == Some(TRAINED)), "{fed:?}");
+
+        // Chat, Some(0.0): the base scale on every infer, not the previous task's.
+        e.submit(chat("c2", Some(0.0))).unwrap();
+        assert!(run_to_final(&mut e).error.is_none());
+        let fed = take_log(&log1);
+        assert_eq!(fed, vec![Some(0.0); 3]);
+
+        // A decision readout (JEV, None): its prefill at the trained scale.
+        e.submit(verbalizer_pass("d1", None)).unwrap();
+        let c = run_to_final(&mut e);
+        assert!(c.error.is_none() && c.decision_logits.is_some(), "{c:?}");
+        assert_eq!(take_log(&log1), vec![Some(TRAINED)]);
+
+        // A stage without a LoRA branch has no input and is never fed.
+        assert!(take_log(&log0).iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn a_baked_tree_refuses_a_scale_and_runs_none_as_today() {
+        let (mut e, _, log1) = mock_box(false);
+        for s in [0.0, TRAINED] {
+            let err = e.submit(chat("refused", Some(s))).unwrap_err().to_string();
+            assert_eq!(err, "backend error: tree has no switchable LoRA");
+        }
+        assert!(e.pending.is_empty(), "refused before it queues");
+        // A task that reached `pending` another way is refused at admission, before any infer.
+        e.pending.push(chat("queued", Some(0.0)));
+        let c = run_to_final(&mut e);
+        assert_eq!(c.error.as_deref(), Some("tree has no switchable LoRA"));
+        assert!(
+            take_log(&log1).is_empty(),
+            "never served with the adapter on"
+        );
+        // None runs as before: the IR has no lora_scale input, nothing is fed.
+        e.submit(chat("plain", None)).unwrap();
+        assert!(run_to_final(&mut e).error.is_none());
+        let fed = take_log(&log1);
+        assert_eq!(fed, vec![None; 3]);
+        assert_eq!(
+            e.prefix_cache.scope(),
+            0,
+            "a baked tree keeps the default scope"
+        );
+    }
+
+    #[test]
+    fn prefix_cache_snapshots_are_keyed_by_scale() {
+        // A Kev-style request shape on a switchable tree: the first pass snapshots the shared
+        // prefix at the trained scale, so a base-model (0) pass that requires that snapshot finds
+        // none (decision_cold) instead of resuming a LoRA state, and a trained-scale pass resumes.
+        let (mut e, _, log1) = mock_box(true);
+        e.prefix_cache = crate::prefix_cache::PrefixCache::new(1 << 20);
+        let min = crate::prefix_cache::MIN_PREFIX_TOKENS;
+        let pass = |id: &str, scale: Option<f32>, first: bool| {
+            let mut t = verbalizer_pass(id, scale);
+            let d = t.decision.as_mut().unwrap();
+            d.prompt_ids = (0..min as u32 + 8).map(|i| i % MOCK_VOCAB as u32).collect();
+            d.cache_prefix = Some(min as u32);
+            d.needs_snapshot = first;
+            d.require_warm = !first;
+            t
+        };
+        e.submit(pass("first", None, true)).unwrap();
+        assert!(run_to_final(&mut e).error.is_none());
+        assert_eq!(e.prefix_cache.len(), 1, "the shared prefix was snapshotted");
+        take_log(&log1);
+
+        e.submit(pass("base", Some(0.0), false)).unwrap();
+        let c = run_to_final(&mut e);
+        let why = c.error.expect("refused");
+        assert!(why.starts_with("decision_cold"), "{why}");
+        assert!(take_log(&log1).is_empty(), "refused before any prefill");
+
+        e.submit(pass("lora", None, false)).unwrap();
+        let c = run_to_final(&mut e);
+        assert!(c.error.is_none(), "{c:?}");
+        let fed = take_log(&log1);
+        assert!(
+            !fed.is_empty() && fed.iter().all(|&f| f == Some(TRAINED)),
+            "{fed:?}"
+        );
+    }
+
+    /// The plane keys blobs by tokens alone: only trained-scale turns enter it.
+    #[cfg(feature = "kv_coord")]
+    #[test]
+    fn only_trained_scale_turns_reach_the_kv_plane() {
+        let probe = [0i32, 0, 0, 1, 1, 0]; // prompt + the two decoded tokens, plus one
+        let (mut e, _, _) = mock_box(true);
+        e.submit(chat("base", Some(0.0))).unwrap();
+        assert!(run_to_final(&mut e).error.is_none());
+        assert!(
+            e.kv.lookup("", &probe).is_none(),
+            "a base-model state was captured"
+        );
+        e.submit(chat("lora", None)).unwrap();
+        assert!(run_to_final(&mut e).error.is_none());
+        assert!(
+            e.kv.lookup("", &probe).is_some(),
+            "a trained-scale turn is captured"
+        );
+    }
+
+    #[test]
+    fn the_lora_scale_bit_degrades_to_old_ranks_and_refuses_only_switchable_trees() {
+        let own = own_caps(true);
+        assert!(chain_lora_scale(own) && chain_lora_scale(own_caps(false)));
+        // An old downstream rank replies 0, 1 or (decision-capable) 3: no scale bit.
+        for old in [0, 1, CAP_CAPTURE_V2 | CAP_DECISION] {
+            let caps = combine_caps(own, old);
+            assert!(!chain_lora_scale(caps));
+            assert!(lora_chain_refusal(true, caps).is_some_and(|r| r.contains("lora_scale")));
+            assert_eq!(
+                lora_chain_refusal(false, caps),
+                None,
+                "baked trees keep old ranks"
+            );
+        }
+        assert_eq!(lora_chain_refusal(true, combine_caps(own, own)), None);
+        // The bit does not disturb the earlier ones.
+        assert_eq!(own & (CAP_CAPTURE_V2 | CAP_DECISION), own_caps(true) & 3);
+    }
+
+    #[test]
+    fn a_switchable_rank_refuses_an_upstream_that_cannot_carry_the_scale() {
+        let mut e = bare_engine(2, "{}");
+        let mut legacy: serde_json::Value = serde_json::from_slice(&e.hello_payload()).unwrap();
+        legacy.as_object_mut().unwrap().remove(HELLO_LORA_SCALE);
+        let legacy = legacy.to_string();
+        assert_eq!(
+            e.validate_hello(legacy.as_bytes()),
+            None,
+            "baked: old rank 0 accepted"
+        );
+        e.lora_switchable = true;
+        let why = e.validate_hello(legacy.as_bytes()).expect("refused");
+        assert!(why.contains("lora_scale"), "{why}");
+        assert_eq!(e.validate_hello(&e.hello_payload()), None, "a new rank 0");
+    }
+
+    /// Fake rank 1: answer one HELLO with `cap`.
+    async fn fake_hello(s: &mut ActivationServer, cap: u32) {
+        let (k, _, _) = parse_header(&s.recv_raw(12).await.unwrap());
+        assert_eq!(k, FRAME_HELLO);
+        let lb = s.recv_raw(4).await.unwrap();
+        s.recv_raw(u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize)
+            .await
+            .unwrap();
+        s.send_raw(&frame_header(FRAME_HELLO_ACK, 0, cap))
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn rank0_refuses_an_old_downstream_at_hello_only_on_a_switchable_tree() {
+        let old = CAP_CAPTURE_V2 | CAP_DECISION;
+        let rt = pipe_rt();
+        let (mut e, mut server) = pipe_rank0(&rt);
+        e.handshake_done = false;
+        e.lora_switchable = true;
+        let fake = rt.spawn(async move {
+            fake_hello(&mut server, old).await;
+            server
+        });
+        let err = e.handshake_a().expect_err("old rank 1").to_string();
+        assert!(err.contains("lora_scale"), "{err}");
+        assert!(!e.handshake_done);
+        e.pending.push(GenerationTask::new("t1", "hello"));
+        let out = e.step_pipe_first();
+        let msg = out[0].1.error.clone().expect("refused loud");
+        assert!(msg.contains("lora_scale"), "{msg}");
+        let _server = rt.block_on(fake).unwrap();
+
+        // The same old rank under a baked tree keeps working.
+        let mut baked = pipe_rank0(&rt);
+        baked.0.handshake_done = false;
+        let fake = rt.spawn(async move { fake_hello(&mut baked.1, old).await });
+        baked.0.handshake_a().expect("baked tree, old rank");
+        assert!(!chain_lora_scale(baked.0.chain_caps));
+        assert_eq!(baked.0.task_start_pos(), 0, "RESET pos as before");
+        rt.block_on(fake).unwrap();
+
+        // A new rank 1 on the switchable tree: accepted.
+        let mut fresh = pipe_rank0(&rt);
+        fresh.0.handshake_done = false;
+        fresh.0.lora_switchable = true;
+        let fake = rt.spawn(async move { fake_hello(&mut fresh.1, own_caps(true)).await });
+        fresh.0.handshake_a().expect("new rank 1");
+        assert!(chain_lora_scale(fresh.0.chain_caps));
+        rt.block_on(fake).unwrap();
+    }
+
+    #[test]
+    fn rank0_carries_the_task_scale_on_reset_and_feeds_its_own_stage() {
+        let rt = pipe_rt();
+        let (mut e, mut server) = pipe_rank0(&rt);
+        e.hidden = MOCK_HIDDEN;
+        e.tokenizer = Some(tiny_tokenizer());
+        e.lora_switchable = true;
+        e.trained_lora_scale = Some(TRAINED);
+        e.chain_caps = combine_caps(own_caps(false), own_caps(true));
+        let (emb, _) = MockStage::new(&["input_ids"], MOCK_HIDDEN, None);
+        let (s0, log0) = MockStage::new(
+            &[
+                "inputs_embeds",
+                "attention_mask",
+                "position_ids",
+                "beam_idx",
+                LORA_SCALE_INPUT,
+            ],
+            MOCK_HIDDEN,
+            None,
+        );
+        e.emb = Some(OvStage::Mock(emb));
+        e.stages = vec![OvStage::Mock(s0)];
+        let fake = rt.spawn(async move {
+            let s = &mut server;
+            let mut seen = Vec::new();
+            for epoch in [1, 2] {
+                let (k, ep, pos) = parse_header(&s.recv_raw(12).await.unwrap());
+                assert_eq!((k, ep), (FRAME_RESET, epoch));
+                seen.push(pos);
+                fake_ack(s, FRAME_RESET_ACK, epoch).await;
+                fake_expect(s, FRAME_FORWARD, epoch).await;
+                fake_token(s, epoch, 1).await;
+            }
+            seen
+        });
+        for (id, scale) in [("t1", None), ("t2", Some(0.0))] {
+            e.pending.push(chat(id, scale));
+            assert!(e.step_pipe_first().is_empty(), "prefill done, no error");
+            e.cancel(&id.to_string());
+        }
+        let seen = rt.block_on(fake).unwrap();
+        assert_eq!(seen, vec![TRAINED.to_bits(), 0.0f32.to_bits()]);
+        assert_eq!(take_log(&log0), vec![Some(TRAINED), Some(0.0)]);
+    }
+
+    #[test]
+    fn a_downstream_rank_runs_the_scale_its_reset_carried() {
+        let rt = pipe_rt();
+        let (server, mut client) = rt.block_on(async {
+            let mut server = ActivationServer::new("127.0.0.1", 0);
+            server.start().await.unwrap();
+            let mut client = ActivationClient::new("127.0.0.1", server.port());
+            let (c, a) = tokio::join!(client.connect(), server.accept());
+            c.unwrap();
+            a.unwrap();
+            (server, client)
+        });
+        let mut e = bare_engine(2, "{}");
+        e.rank = 1;
+        e.hidden = MOCK_HIDDEN;
+        e.lora_switchable = true;
+        e.upstream = Some(Arc::new(tokio::sync::Mutex::new(server)));
+        e.runtime_handle = Some(rt.handle().clone());
+        let (s1, log1) = MockStage::new(&last_stage_inputs(true), MOCK_VOCAB, Some(1));
+        e.stages = vec![OvStage::Mock(s1)];
+        let fake = rt.spawn(async move {
+            let c = &mut client;
+            for (epoch, scale) in [(1u32, 0.5f32), (2, 0.0)] {
+                c.send_raw(&frame_header(FRAME_RESET, epoch, scale.to_bits()))
+                    .await
+                    .unwrap();
+                let (k, _, _) = parse_header(&c.recv_raw(12).await.unwrap());
+                assert_eq!(k, FRAME_RESET_ACK);
+                c.send_raw(&frame_header(FRAME_FORWARD, epoch, 0))
+                    .await
+                    .unwrap();
+                let t = WireTensor::new(
+                    WireDType::F32,
+                    [1, 1, MOCK_HIDDEN as u32],
+                    le_bytes_f32(&[0.0; MOCK_HIDDEN]),
+                );
+                c.send(&t).await.unwrap();
+                let (k, _, _) = parse_header(&c.recv_raw(12).await.unwrap());
+                assert_eq!(k, FRAME_TOKEN);
+                let tb = c.recv_raw(8).await.unwrap();
+                assert_eq!(i32::from_be_bytes([tb[0], tb[1], tb[2], tb[3]]), 1);
+            }
+        });
+        for _ in 0..4 {
+            e.step_pipe_relay().expect("relay step");
+        }
+        rt.block_on(fake).unwrap();
+        assert_eq!(take_log(&log1), vec![Some(0.5), Some(0.0)]);
     }
 }
