@@ -76,7 +76,7 @@ struct PipelineConfig {
 }
 
 #[derive(Debug, Deserialize)]
-struct PipelineVision {
+pub(crate) struct PipelineVision {
     /// Which model family's image path the tree carries. Only `gemma4` is
     /// served; trees from before the field are Gemma 4 surgery trees.
     #[serde(default)]
@@ -85,7 +85,7 @@ struct PipelineVision {
     /// Absent means the family's default: on for gemma4 (bidirectional image
     /// attention), off otherwise.
     #[serde(default)]
-    token_type_ids: Option<bool>,
+    pub(crate) token_type_ids: Option<bool>,
     /// Text embedding table IR in the pipeline dir (rank 0 embeds the prompt).
     text_embeddings: String,
     /// Vision encoder IR in the pipeline dir.
@@ -1561,7 +1561,7 @@ fn import_plugin(plugin: &PluginConfig) -> PluginConfig {
 
 /// Image families ov-runtime serves on a vision tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum VisionFamily {
+pub(crate) enum VisionFamily {
     /// Gemma 4 surgery trees (26B-A4B/31B): `token_type_ids` on every stage.
     Gemma4,
     /// LLaVA-layout Pixtral trees from tools/vlm_surgery: causal attention.
@@ -1572,7 +1572,10 @@ enum VisionFamily {
 /// accepted only when it is a Gemma 4 vision surgery tree (written before the
 /// field existed); any other family is refused rather than fed another
 /// family's preprocessing.
-fn vision_family(v: &PipelineVision, export_version: Option<&str>) -> EngineResult<VisionFamily> {
+pub(crate) fn vision_family(
+    v: &PipelineVision,
+    export_version: Option<&str>,
+) -> EngineResult<VisionFamily> {
     match (v.family.as_deref(), export_version) {
         (Some("gemma4"), _) | (None, Some("gemma4_vision_surgery_v1")) => Ok(VisionFamily::Gemma4),
         // Mistral 3 is Pixtral's processor and tower plus a 2x2 patch merger,
@@ -1606,14 +1609,14 @@ struct VisionTree {
 }
 
 /// Rank 0's image front end, per family.
-enum Frontend {
+pub(crate) enum Frontend {
     Gemma4(crate::gemma4_vision::ImageFrontend),
     Pixtral(crate::pixtral_vision::Frontend),
 }
 
 impl Frontend {
     /// The soft-token id whose rows the encoder supplies.
-    fn image_token(&self) -> i64 {
+    pub(crate) fn image_token(&self) -> i64 {
         match self {
             Frontend::Gemma4(f) => f.tokens.image,
             Frontend::Pixtral(f) => f.tokens.image,
@@ -1629,7 +1632,7 @@ impl Frontend {
         }
     }
 
-    fn prepare(
+    pub(crate) fn prepare(
         &mut self,
         media: &[cascadia_types::MediaInput],
         prompt_ids: &[i64],
@@ -1650,7 +1653,7 @@ impl Frontend {
         }
     }
 
-    fn describe(&self) -> String {
+    pub(crate) fn describe(&self) -> String {
         match self {
             Frontend::Gemma4(f) => format!(
                 "Gemma 4 images, {} soft tokens each at most",
@@ -1675,14 +1678,18 @@ impl Frontend {
 
 /// Rank 0's half of a vision tree: the text embedding table it embeds every
 /// step through, and the vision encoder whose rows it splices into a prompt.
-struct VisionFirst {
+pub(crate) struct VisionFirst {
     embed: OvRuntime,
     embed_input: String,
-    frontend: Frontend,
+    pub(crate) frontend: Frontend,
 }
 
 impl VisionFirst {
-    fn load(pipeline_dir: &Path, cfg: &PipelineVision, family: VisionFamily) -> EngineResult<Self> {
+    pub(crate) fn load(
+        pipeline_dir: &Path,
+        cfg: &PipelineVision,
+        family: VisionFamily,
+    ) -> EngineResult<Self> {
         let invalid = |m: String| EngineError::InvalidConfig(format!("vision tree: {m}"));
         // Small next to a stage; the CPU keeps them off the stage's device.
         let plugin = PluginConfig::new();
@@ -1754,7 +1761,7 @@ impl VisionFirst {
 
     /// Row-major `[ids.len(), hidden]` text embeddings for `ids` (image soft
     /// tokens embed as pad), and `hidden`.
-    fn embed(&mut self, ids: &[i64]) -> EngineResult<(Vec<f32>, usize)> {
+    pub(crate) fn embed(&mut self, ids: &[i64]) -> EngineResult<(Vec<f32>, usize)> {
         let ids = self.frontend.embedding_ids(ids);
         self.embed
             .set_input(
