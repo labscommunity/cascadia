@@ -2,7 +2,7 @@
 //!
 //! Mirrors the subset of `cascadia/api/server.py` needed for parity with PR
 //! #2's e2e bench: `/health`, `/v1/models`, `/v1/chat/completions`
-//! (non-streaming + SSE streaming). Tools, logprobs, /events, /state,
+//! (non-streaming + SSE streaming), plus `/v1/responses` (see `responses`). Tools, logprobs, /events, /state,
 //! Ollama dialect deferred — see Phase 5 follow-up.
 
 use std::sync::atomic::Ordering;
@@ -54,6 +54,8 @@ pub use cascadia_types::ApiStats;
 
 mod media;
 pub use media::MediaConfig;
+mod responses;
+pub use responses::{ReasoningParam, ResponsesRequest};
 
 /// Tokens a chunk contributes to the cumulative counter. The convention
 /// (engine `n_tokens` authoritative, else one per non-empty chunk — #55)
@@ -100,6 +102,17 @@ fn count_rejected(reason: &str) {
 /// failure with the reason lost. `type` follows OpenAI's split: a 4xx is the
 /// caller's (`invalid_request_error`), a 5xx is ours (`server_error`).
 fn api_error(status: StatusCode, message: impl Into<String>, code: Option<&str>) -> Response {
+    api_error_for(status, message, None, code)
+}
+
+/// [`api_error`] naming the request field at fault in `param`, as OpenAI
+/// does for a refused parameter (`"tools"`, `"input[0].content[1]"`).
+fn api_error_for(
+    status: StatusCode,
+    message: impl Into<String>,
+    param: Option<&str>,
+    code: Option<&str>,
+) -> Response {
     let kind = if status.is_client_error() {
         "invalid_request_error"
     } else {
@@ -111,7 +124,7 @@ fn api_error(status: StatusCode, message: impl Into<String>, code: Option<&str>)
             "error": {
                 "message": message.into(),
                 "type": kind,
-                "param": null,
+                "param": param,
                 "code": code,
             }
         })),
@@ -633,6 +646,7 @@ pub fn make_router_with_stats(
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
+        .route("/v1/responses", post(responses::create_response))
         .route("/v1/cancel/:task_id", post(cancel))
         .with_state(state)
         // Flip `ready` from each completion's final status so /health tracks the
@@ -714,7 +728,10 @@ async fn track_pipeline_health(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use std::sync::atomic::Ordering;
-    let is_completion = matches!(req.uri().path(), "/v1/chat/completions" | "/v1/completions");
+    let is_completion = matches!(
+        req.uri().path(),
+        "/v1/chat/completions" | "/v1/completions" | "/v1/responses"
+    );
     let resp = next.run(req).await;
     if is_completion {
         let s = resp.status();
@@ -753,9 +770,9 @@ struct ModelEntry {
     created: i64,
     owned_by: &'static str,
     /// Additive to OpenAI's model object (the SDKs keep unknown fields):
-    /// which input kinds `/v1/chat/completions` accepts, in OpenRouter's
-    /// `input_modalities` vocabulary. `["text", "image"]` when `image_url`
-    /// parts are served, `["text"]` otherwise.
+    /// which input kinds `/v1/chat/completions` and `/v1/responses` accept,
+    /// in OpenRouter's `input_modalities` vocabulary. `["text", "image"]`
+    /// when image parts are served, `["text"]` otherwise.
     input_modalities: Vec<&'static str>,
 }
 
@@ -2642,11 +2659,25 @@ pub fn render_chat_prompt(
     ChatPromptRenderer::new(cfg).render(messages)
 }
 
-async fn chat_completions(
-    State(state): State<AppState>,
-    OpenAiJson(req): OpenAiJson<ChatCompletionRequest>,
-) -> axum::response::Response {
-    let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
+/// A chat request past every pre-engine check: the task to submit, and the
+/// request slot and in-flight guard it holds until generation ends.
+struct AdmittedChat {
+    task: GenerationTask,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    inflight: InFlightGuard,
+}
+
+/// Everything `/v1/chat/completions` does before the engine: images, the
+/// chat template, the prompt checks and the request gate. Shared with
+/// `/v1/responses`, which maps its request onto a chat request first, so
+/// both endpoints refuse and admit the same requests. `empty_hint` names the
+/// caller's field in the empty-prompt 400.
+async fn admit_chat(
+    state: &AppState,
+    req: &ChatCompletionRequest,
+    task_id: String,
+    empty_hint: &str,
+) -> Result<AdmittedChat, Response> {
     let enable_thinking = req.effective_enable_thinking();
     // effective_reasoning_effort() hardcodes GLM's high/max vocabulary and is
     // applied to every model this server serves, not just GLM-5. A template
@@ -2664,20 +2695,17 @@ async fn chat_completions(
             Ok(p) => Some(p),
             Err(_) => {
                 count_rejected("capacity");
-                return api_error(
+                return Err(api_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "engine at capacity; retry after current requests complete",
                     None,
-                );
+                ));
             }
         }
     } else {
         None
     };
-    let media = match prepare_media(&state, &req.messages).await {
-        Ok(m) => m,
-        Err(resp) => return resp,
-    };
+    let media = prepare_media(state, &req.messages).await?;
     let effort = EffortArgs {
         mapped: Some(req.effective_reasoning_effort()),
         raw: req.reasoning_effort.as_deref(),
@@ -2698,7 +2726,7 @@ async fn chat_completions(
             req.tools.as_deref(),
         ),
         None => render_prompt(
-            &state,
+            state,
             &req.messages,
             enable_thinking,
             effort,
@@ -2711,7 +2739,7 @@ async fn chat_completions(
         // model would answer without ever seeing the tools, and the caller
         // cannot tell that from "the model chose not to call one".
         Err(e @ PromptRenderError::Rejected(_)) => {
-            return api_error(StatusCode::BAD_REQUEST, e.to_string(), None);
+            return Err(api_error(StatusCode::BAD_REQUEST, e.to_string(), None));
         }
         Err(e @ PromptRenderError::Failed(_)) => {
             tracing::error!(error = %e, "chat_template render failed for a request that needs it");
@@ -2721,7 +2749,7 @@ async fn chat_completions(
             // readiness — see `PreEngineFailure`.
             let mut resp = api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), None);
             resp.extensions_mut().insert(PreEngineFailure);
-            return resp;
+            return Err(resp);
         }
     };
     // Degenerate input (no messages, or a render that collapses to nothing)
@@ -2730,15 +2758,15 @@ async fn chat_completions(
     // with empty content — indistinguishable from a real failure.
     if prompt.trim().is_empty() {
         count_rejected("empty_prompt");
-        return api_error(
+        return Err(api_error(
             StatusCode::BAD_REQUEST,
-            "no prompt content: `messages` is empty or rendered to an empty prompt",
+            format!("no prompt content: {empty_hint}"),
             None,
-        );
+        ));
     }
     if prompt.len() > state.max_prompt_bytes {
         count_rejected("prompt_too_large");
-        return api_error(
+        return Err(api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             format!(
                 "prompt is {} bytes; max allowed is {} (max_prompt_bytes)",
@@ -2746,18 +2774,18 @@ async fn chat_completions(
                 state.max_prompt_bytes,
             ),
             None,
-        );
+        ));
     }
     if let Some(m) = &media {
         if let Err(msg) = m.check_placeholders(&prompt) {
             count_rejected("invalid_media");
-            return api_error(StatusCode::BAD_REQUEST, msg, None);
+            return Err(api_error(StatusCode::BAD_REQUEST, msg, None));
         }
     }
     let prompt_rendered = media.is_some() && state.chat_env.is_some();
     let media = media.map(|m| m.inputs).unwrap_or_default();
     let task = GenerationTask {
-        task_id: task_id.clone(),
+        task_id,
         prompt,
         max_tokens: req.max_tokens,
         temperature: req.temperature,
@@ -2791,11 +2819,11 @@ async fn chat_completions(
             Ok(p) => p,
             Err(_) => {
                 count_rejected("capacity");
-                return api_error(
+                return Err(api_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "engine at capacity; retry after current requests complete",
                     None,
-                );
+                ));
             }
         },
     };
@@ -2806,35 +2834,44 @@ async fn chat_completions(
     state.stats.requests_total.fetch_add(1, Ordering::Relaxed);
     let inflight = InFlightGuard::new(state.stats.clone());
 
-    if req.stream {
-        let include_usage = req
-            .stream_options
-            .as_ref()
-            .map(|o| o.include_usage)
-            .unwrap_or(false);
-        let tool_choice = req.tool_choice.clone();
-        let tools_present = req.tools.as_ref().is_some_and(|t| !t.is_empty());
-        return stream_completion(
-            state,
-            req.model,
-            task,
-            permit,
-            inflight,
-            include_usage,
-            tool_choice,
-            tools_present,
-        )
-        .await
-        .into_response();
-    }
+    Ok(AdmittedChat {
+        task,
+        permit,
+        inflight,
+    })
+}
 
-    // Non-streaming: collect full output. Hold the permit + in-flight guard
-    // until the task completes; drop frees the slot.
+/// A non-streaming generation, collected.
+struct Collected {
+    text: String,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    /// OpenAI `finish_reason`: `stop` or `length`.
+    finish_reason: &'static str,
+    logprobs: Vec<cascadia_types::TokenLogprobs>,
+    /// The engine's own reason from the final chunk (`Stop` when it gave
+    /// none); `None` when the stream ended without one, as a cancelled task's
+    /// does. `finish_reason` folds `Cancelled` into `stop`; this keeps it.
+    end: Option<cascadia_types::FinishReason>,
+}
+
+/// Run an admitted task to completion. Holds the permit + in-flight guard
+/// until the task completes; drop frees the slot.
+async fn collect_generation(
+    state: &AppState,
+    AdmittedChat {
+        task,
+        permit,
+        inflight,
+    }: AdmittedChat,
+    stops: &[String],
+) -> Result<Collected, Response> {
     let _permit = permit;
     let _inflight = inflight;
-    let mut chunk_stream = match state.runner.generate_async(task.clone()).await {
+    let task_id = task.task_id.clone();
+    let mut chunk_stream = match state.runner.generate_async(task).await {
         Ok(s) => s,
-        Err(err) => return engine_error_response(err),
+        Err(err) => return Err(engine_error_response(err)),
     };
     let mut marker = state.marker_dialect.clone().map(MarkerFilter::new);
     let mut buf = String::new();
@@ -2844,6 +2881,7 @@ async fn chat_completions(
     // `stop`. Engines that don't distinguish leave it None → "stop".
     let mut finish_reason: &'static str = "stop";
     let mut logprobs_content: Vec<cascadia_types::TokenLogprobs> = Vec::new();
+    let mut end = None;
     while let Some(chunk) = chunk_stream.next().await {
         // A failed task carries `error` on its final chunk. Without this
         // branch the empty text below would build a normal 200 with empty
@@ -2852,7 +2890,11 @@ async fn chat_completions(
         // handshake/manifest mismatch).
         if let Some(reason) = &chunk.error {
             warn!(task = %task_id, reason = %reason, "engine failed task; returning 503");
-            return api_error(StatusCode::SERVICE_UNAVAILABLE, reason.clone(), None);
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                reason.clone(),
+                None,
+            ));
         }
         // Count tokens for EVERY chunk including the final one — engines
         // like ov-genai deliver their whole output on a single final
@@ -2878,6 +2920,11 @@ async fn chat_completions(
             if let Some(fr) = chunk.finish_reason {
                 finish_reason = fr.as_openai_str();
             }
+            end = Some(
+                chunk
+                    .finish_reason
+                    .unwrap_or(cascadia_types::FinishReason::Stop),
+            );
         }
     }
     state
@@ -2889,7 +2936,6 @@ async fn chat_completions(
     // match. The engines don't early-stop on strings yet (an engine-side
     // follow-up would also save compute), so this enforces the OpenAI output
     // contract at the API boundary and forces finish_reason = "stop".
-    let stops = req.sampling_params().stop;
     if !stops.is_empty() {
         if let Some(cut) = stops
             .iter()
@@ -2902,6 +2948,67 @@ async fn chat_completions(
         }
     }
 
+    Ok(Collected {
+        text: buf,
+        prompt_tokens,
+        completion_tokens,
+        finish_reason,
+        logprobs: logprobs_content,
+        end,
+    })
+}
+
+async fn chat_completions(
+    State(state): State<AppState>,
+    OpenAiJson(req): OpenAiJson<ChatCompletionRequest>,
+) -> axum::response::Response {
+    let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
+    let admitted = match admit_chat(
+        &state,
+        &req,
+        task_id.clone(),
+        "`messages` is empty or rendered to an empty prompt",
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let enable_thinking = admitted.task.enable_thinking;
+
+    if req.stream {
+        let include_usage = req
+            .stream_options
+            .as_ref()
+            .map(|o| o.include_usage)
+            .unwrap_or(false);
+        let tool_choice = req.tool_choice.clone();
+        let tools_present = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+        return stream_completion(
+            state,
+            req.model,
+            admitted.task,
+            admitted.permit,
+            admitted.inflight,
+            include_usage,
+            tool_choice,
+            tools_present,
+        )
+        .await
+        .into_response();
+    }
+
+    let Collected {
+        text: buf,
+        prompt_tokens,
+        completion_tokens,
+        mut finish_reason,
+        logprobs: logprobs_content,
+        ..
+    } = match collect_generation(&state, admitted, &req.sampling_params().stop).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
     let (message, choice_finish) = build_choice(
         buf,
         &req.tool_choice,
@@ -3851,7 +3958,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    async fn make_app() -> Router {
+    pub(crate) async fn make_app() -> Router {
         let mut runner = Runner::new(Box::new(MockBuilder::new()));
         runner
             .start(
@@ -4402,7 +4509,7 @@ mod tests {
 
     /// A router whose model takes images, with a template that prints each
     /// message so the placeholder's position is visible in the mock's echo.
-    async fn make_image_app() -> Router {
+    pub(crate) async fn make_image_app() -> Router {
         let runner = Runner::new(Box::new(MockBuilder::new()));
         runner
             .start(
@@ -4425,7 +4532,7 @@ mod tests {
         make_router_with_config(Arc::new(runner), "mock-model", cfg)
     }
 
-    fn png_url(w: u32, h: u32) -> String {
+    pub(crate) fn png_url(w: u32, h: u32) -> String {
         use base64::Engine as _;
         let img = image::RgbImage::from_pixel(w, h, image::Rgb([200, 10, 10]));
         let mut buf = Vec::new();
