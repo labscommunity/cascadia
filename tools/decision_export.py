@@ -69,19 +69,52 @@ def write_jev_profile(adapter_dir, calibration_json, out_dir, max_tokens=32768):
     _write(out_dir, profile, {"kind": "verbalizer"})
 
 
+# The pointer head the server runs (decision.rs HeadAssets::Pointer, kev.rs): z = k(h_opt) . q(h_decide)
+# / sqrt(dp) / temperature on causal rows of the stock tokenizer's embeddings.
+KEV_HEAD_TENSORS = {"q.weight", "q.bias", "k.weight", "k.bias"}
+
+
+def kev_head_unsupported(meta):
+    """head.pt features (kev.checkpoint.Meta fields) that pointer head does not implement, as messages.
+    Absent fields take Meta's defaults, which the server matches. weights_dtype is not refused: it only
+    names the dtype upstream ran the backbone in; the tree is int8 either way and parity measures it."""
+    bad = []
+    if meta.get("option_isolation", False):
+        bad.append(f"option_isolation={meta['option_isolation']!r} (each option attends only to the state, "
+                   "a packed mask the server's causal rows do not build)")
+    if meta.get("special_embeddings", False):
+        bad.append(f"special_embeddings={meta['special_embeddings']!r} (trained special-token embedding "
+                   "rows the export does not carry)")
+    if meta.get("weights") not in (None, "lora"):
+        bad.append(f"weights {meta['weights']!r} (a kev export grafts a LoRA onto --weights)")
+    head = meta.get("head")
+    if isinstance(head, dict):
+        extra = sorted(set(head) - KEV_HEAD_TENSORS)
+        missing = sorted(KEV_HEAD_TENSORS - set(head))
+        if extra or missing:
+            bad.append(f"head tensors {sorted(head)} (the pointer head has exactly {sorted(KEV_HEAD_TENSORS)})")
+        elif "head_dim" in meta and int(meta["head_dim"]) != head["q.weight"].shape[0]:
+            bad.append(f"head_dim {meta['head_dim']} but q.weight has {head['q.weight'].shape[0]} rows")
+    return bad
+
+
 def kev_head_meta(head_pt):
-    """head.pt's recorded backbone: {"base": HF id or None, "weights": "lora" | ... | None}."""
+    """head.pt's recorded backbone: {"base": HF id or None, "weights": "lora" | ... | None,
+    "unsupported": kev_head_unsupported's messages}."""
     import torch
     meta = torch.load(head_pt, map_location="cpu", weights_only=True)
     if not isinstance(meta, dict):
         raise ValueError(f"expected a dict, got {type(meta).__name__}")
-    return {"base": meta.get("base"), "weights": meta.get("weights")}
+    return {"base": meta.get("base"), "weights": meta.get("weights"), "unsupported": kev_head_unsupported(meta)}
 
 
 def write_kev_profile(head_pt, out_dir, max_tokens=73728, hidden=None):
     """`hidden`: the base IR's hidden size; the q/k weights' input dim must equal it."""
     import torch
     meta = torch.load(head_pt, map_location="cpu", weights_only=True)
+    bad = kev_head_unsupported(meta)
+    if bad:
+        raise ValueError(f"{head_pt}: the server's Kev pointer head cannot serve " + "; ".join(bad))
     w = meta["head"]
     dp = w["q.weight"].shape[0]
     if hidden is not None:
@@ -185,6 +218,8 @@ def main():
         if meta["weights"] not in (None, "lora"):
             ap.error(f"{a.head_pt} records weights {meta['weights']!r}; a kev export grafts a LoRA "
                      f"(weights 'lora') onto --weights")
+        if meta.get("unsupported"):
+            ap.error(f"{a.head_pt}: the server's Kev pointer head cannot serve " + "; ".join(meta["unsupported"]))
         # The spike (and so the golden reference) tokenizes with Kev's own tokenizer.json, which
         # differs from the Base checkpoint's that run_export would otherwise copy from --weights.
         tokenizer = tokenizer or str(Path(a.head_pt).parent / "tokenizer.json")

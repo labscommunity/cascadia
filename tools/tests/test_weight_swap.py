@@ -95,6 +95,78 @@ def test_lora_scale_comes_from_adapter_config(tmp_path):
     assert ws.lora_scale_from_config(str(tmp_path / "adapter_model.safetensors")) == 2.0
 
 
+def write_audit_adapter(d):
+    """limits-audit B2 repro: one decoder LoRA plus an embedding LoRA, with `norm` in modules_to_save
+    (PEFT saves the trained norm as a plain tensor). A count-only check saw 1 target and 1 graft."""
+    import json
+    torch = pytest.importorskip("torch")
+    from safetensors.torch import save_file
+    path = str(d / "adapter_model.safetensors")
+    save_file({"base_model.model.model.layers.0.mlp.down_proj.lora_A.weight": torch.ones(1, 3),
+               "base_model.model.model.layers.0.mlp.down_proj.lora_B.weight": torch.ones(3, 1),
+               "base_model.model.model.embed_tokens.lora_embedding_A": torch.ones(1, 16),
+               "base_model.model.model.embed_tokens.lora_embedding_B": torch.ones(3, 1),
+               "base_model.model.model.norm.weight": torch.ones(3)}, path)
+    (d / "adapter_config.json").write_text(json.dumps({"r": 1, "lora_alpha": 1, "modules_to_save": ["norm"]}))
+    return path
+
+
+def save_adapter(path, keys):
+    torch = pytest.importorskip("torch")
+    from safetensors.torch import save_file
+    save_file({k: torch.ones(1, 3) for k in keys}, str(path))
+    return str(path)
+
+
+def test_lora_targets_refuses_embedding_lora_and_saved_modules(tmp_path):
+    path = write_audit_adapter(tmp_path)
+    with pytest.raises(ValueError, match=r"embedding LoRA keys.*embed_tokens\.lora_embedding_A"):
+        ws.lora_targets(path)
+    p = "base_model.model.model.layers.0.mlp.down_proj"
+    path = save_adapter(tmp_path / "saved.safetensors", [f"{p}.lora_A.weight", f"{p}.lora_B.weight",
+                                                         "base_model.model.model.norm.weight"])
+    with pytest.raises(ValueError, match=r"model\.norm\.weight"):
+        ws.lora_targets(path)
+
+
+def test_lora_targets_refuses_unpaired_and_duplicate_modules(tmp_path):
+    p = "base_model.model.model.layers.0.mlp.down_proj"
+    with pytest.raises(ValueError, match="lora_B"):
+        ws.lora_targets(save_adapter(tmp_path / "a.safetensors", [f"{p}.lora_A.weight"]))
+    with pytest.raises(ValueError, match="lora_A"):
+        ws.lora_targets(save_adapter(tmp_path / "b.safetensors", [f"{p}.lora_B.weight"]))
+    # the same module named twice (with and without the "model." prefix): the graft would apply one
+    q = "base_model.model.layers.0.mlp.down_proj"
+    with pytest.raises(ValueError, match=r"layers\.0\.mlp\.down_proj"):
+        ws.lora_targets(save_adapter(tmp_path / "c.safetensors", [f"{p}.lora_A.weight", f"{p}.lora_B.weight",
+                                                                  f"{q}.lora_A.weight", f"{q}.lora_B.weight"]))
+    ok = save_adapter(tmp_path / "d.safetensors", [f"{p}.lora_A.weight", f"{p}.lora_B.weight",
+                                                   "base_model.model.lm_head.lora_A.weight",
+                                                   "base_model.model.lm_head.lora_B.weight"])
+    assert ws.lora_targets(ok) == ["layers.0.mlp.down_proj", "lm_head"]
+
+
+def test_lora_config_refuses_modules_to_save(tmp_path):
+    import json
+    write_audit_adapter(tmp_path)
+    with pytest.raises(ValueError, match=r"modules_to_save.*norm"):
+        ws.lora_scale_from_config(str(tmp_path / "adapter_model.safetensors"))
+    for empty in (None, []):
+        (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16, "lora_alpha": 32, "modules_to_save": empty}))
+        assert ws.lora_scale_from_config(str(tmp_path / "adapter_model.safetensors")) == 2.0
+
+
+def test_graft_lora_refuses_the_audit_adapter(tmp_path):
+    ov = pytest.importorskip("openvino")
+    from openvino import opset13 as ops
+    path = write_audit_adapter(tmp_path)
+    x = ops.parameter([1, 3], np.float32, name="x")
+    mm = ops.matmul(x, ops.constant(np.eye(3, dtype=np.float32)), False, True)
+    mm.set_friendly_name("__module.model.model.language_model.layers.0.mlp.down_proj/ov_ext::linear/MatMul")
+    with pytest.raises(ValueError, match="lora_embedding"):
+        ws.graft_lora(ov.Model([ops.result(mm)], [x], "t"), path, 1.0)
+
+
 def test_float_transform_table():
     w = np.array([0.5, -0.25], dtype=np.float32)
     assert np.allclose(ws.TRANSFORMS[ws.FLOAT_KIND_TRANSFORM["input_layernorm.weight"]](w), 1 + w)
@@ -118,8 +190,8 @@ def test_graft_lora_adds_scaled_branch(tmp_path, prefix):
     path = str(tmp_path / "adapter_model.safetensors")
     save_file({f"base_model.model.model.{prefix}layers.0.mlp.down_proj.lora_A.weight": a,
                f"base_model.model.model.{prefix}layers.0.mlp.down_proj.lora_B.weight": b}, path)
-    assert ws.lora_targets(path) == 1
-    assert ws.graft_lora(model, path, 2.0) == 1
+    assert ws.lora_targets(path) == ["layers.0.mlp.down_proj"]
+    assert ws.graft_lora(model, path, 2.0) == ["layers.0.mlp.down_proj"]
     out = ov.Core().compile_model(model, "CPU")([np.array([[1.0, 2.0, 3.0]], np.float32)])[0]
     # base = x ; lora = 2 * (x·1)·0.5 = sum(x) = 6
     np.testing.assert_allclose(out, [[7.0, 8.0, 9.0]], rtol=1e-6)
@@ -127,7 +199,7 @@ def test_graft_lora_adds_scaled_branch(tmp_path, prefix):
 
 def test_graft_lora_only_touches_the_stage_layers(tmp_path):
     """A stage > 0 keeps shape-only copies of earlier layers (mask/position bookkeeping); grafting
-    them inflates the count and fails the exporter's sum check, so only the stage's own layers
+    them grafts a module twice and fails the exporter's coverage check, so only the stage's own layers
     (and lm_head on the last stage) are grafted."""
     ov = pytest.importorskip("openvino")
     from openvino import opset13 as ops
@@ -144,9 +216,12 @@ def test_graft_lora_only_touches_the_stage_layers(tmp_path):
         keys[f"{p}.lora_B.weight"] = torch.full((3, 1), 0.5)
     path = str(tmp_path / "adapter_model.safetensors")
     save_file(keys, path)
-    assert ws.graft_lora(ov.Model(outs, [x], "t"), path, 1.0, layers=range(4, 8), lm_head=False) == 1
-    assert ws.graft_lora(ov.Model(outs, [x], "t"), path, 1.0, layers=range(4, 8), lm_head=True) == 2
-    assert ws.graft_lora(ov.Model(outs, [x], "t"), path, 1.0) == 3
+    assert ws.graft_lora(ov.Model(outs, [x], "t"), path, 1.0, layers=range(4, 8), lm_head=False) == \
+        ["layers.5.mlp.down_proj"]
+    assert sorted(ws.graft_lora(ov.Model(outs, [x], "t"), path, 1.0, layers=range(4, 8), lm_head=True)) == \
+        ["layers.5.mlp.down_proj", "lm_head"]
+    assert sorted(ws.graft_lora(ov.Model(outs, [x], "t"), path, 1.0)) == \
+        ["layers.0.mlp.down_proj", "layers.5.mlp.down_proj", "lm_head"]
 
 
 def test_add_final_hidden_output_exposes_lm_head_input():

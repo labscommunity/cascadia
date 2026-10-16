@@ -285,6 +285,70 @@ def test_lm_head_adapter_fails_outside_jev(tmp_path):
                      lora=str(tmp_path / "adapter.safetensors"), lora_scale=1.0, threads=1)
 
 
+def write_audit_adapter(tmp_path, model, config=True):
+    """limits-audit B2 repro on the tiny model: a decoder LoRA plus embed_tokens.lora_embedding_A/B
+    and a saved `norm` (modules_to_save). Before Task 23 the reference merged the decoder LoRA and
+    silently dropped the rest, exactly as the export did, so parity agreed on a wrong model."""
+    from safetensors.torch import save_file
+    t = write_lora(tmp_path / "adapter_model.safetensors", model, ["layers.0.mlp.down_proj"])
+    t["base_model.model.model.embed_tokens.lora_embedding_A"] = torch.ones(2, 64)
+    t["base_model.model.model.embed_tokens.lora_embedding_B"] = torch.ones(32, 2)
+    t["base_model.model.model.norm.weight"] = torch.ones(32)
+    save_file(t, str(tmp_path / "adapter_model.safetensors"))
+    if config:
+        (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 2, "lora_alpha": 4, "modules_to_save": ["norm"]}))
+    return str(tmp_path / "adapter_model.safetensors")
+
+
+def test_audit_adapter_refused_by_the_reference(tmp_path):
+    model = tiny(tmp_path)
+    ad = write_audit_adapter(tmp_path, model)
+    passes = [{"readout": {"prompt_ids": [1, 2, 3]}}]
+    with pytest.raises(ValueError, match="modules_to_save"):
+        rs.resolve_lora_scale(ad)
+    # an explicit scale skips nothing: the config and key refusals still run
+    with pytest.raises(ValueError, match="modules_to_save|lora_embedding"):
+        rs.stream_hidden(str(tmp_path), passes, lora=ad, lora_scale=1.0, threads=1)
+    (tmp_path / "adapter_config.json").unlink()
+    with pytest.raises(ValueError, match=r"embedding LoRA keys.*embed_tokens\.lora_embedding_A"):
+        rs.stream_hidden(str(tmp_path), passes, lora=ad, lora_scale=1.0, threads=1)
+    with pytest.raises(ValueError, match="lora_embedding"):
+        rs.Lora(ad, 1.0)
+
+
+def test_modules_to_save_config_alone_refused_by_the_reference(tmp_path):
+    model = tiny(tmp_path)
+    write_lora(tmp_path / "adapter_model.safetensors", model, ["layers.0.mlp.down_proj"])
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 2, "lora_alpha": 4, "modules_to_save": ["norm"]}))
+    with pytest.raises(ValueError, match=r"modules_to_save.*norm"):
+        rs.Lora(str(tmp_path / "adapter_model.safetensors"), 1.0)
+
+
+def test_every_adapter_module_merged_exactly_once(tmp_path):
+    model = tiny(tmp_path)
+    ad = str(tmp_path / "adapter.safetensors")
+    write_lora(ad, model, ["layers.0.mlp.down_proj", "layers.1.mlp.up_proj"])
+    lo = rs.Lora(ad, 1.0)
+    assert sorted(lo.mods) == ["layers.0.mlp.down_proj", "layers.1.mlp.up_proj"]
+    passes = [{"readout": {"prompt_ids": [1, 2, 3]}}]
+    rs.stream_hidden(str(tmp_path), passes, lora=ad, lora_scale=1.0, threads=1)
+    # a delta applied twice (e.g. two weights resolving to one module) fails instead of passing a count
+    real = rs.Lora.delta
+
+    def twice(self, module):
+        d = real(self, module)
+        if d is not None and module == "layers.0.mlp.down_proj":
+            real(self, module)
+        return d
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rs.Lora, "delta", twice)
+    try:
+        with pytest.raises(SystemExit, match=r"merged more than once.*layers\.0\.mlp\.down_proj"):
+            rs.stream_hidden(str(tmp_path), passes, lora=ad, lora_scale=1.0, threads=1)
+    finally:
+        mp.undo()
+
+
 def drop_lm_head(tmp_path, tied):
     idx = json.loads((tmp_path / "model.safetensors.index.json").read_text())
     del idx["weight_map"]["lm_head.weight"]
