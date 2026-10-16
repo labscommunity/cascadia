@@ -8,7 +8,11 @@ takes `inputs_embeds`, `attention_mask`, `position_ids` and `beam_idx`
 (`openvino_language_model.xml`). This tool slices the language model at
 decoder-layer boundaries into the v3 tree ov-runtime loads: stage 0 keeps
 `inputs_embeds` (rank 0 embeds the prompt and splices image rows itself),
-later stages take `hidden_states`, the last ends in last-position logits.
+later stages take `hidden_states`, the last ends in last-position logits
+(ov-runtime samples only the last row). `--all-logits` keeps the head's logits
+for every fed position instead, which ov-dist-spec needs as a target: it
+verifies each drafted token from its own row. The last stage's
+`stage_config.json` records which with `"logits": "all" | "last"`.
 
 The slicing is the Gemma 4 surgery's `extract_stage` (each stage owns the KV
 state of its own layers; the cut is the residual stream entering a layer's
@@ -26,7 +30,7 @@ Families (the `vision.family` rank 0 serves):
 
 Usage:
   python cut_vlm_lm.py --model <OV VLM dir> --output-dir <tree> --num-stages N \
-      --family pixtral [--stage I]
+      --family pixtral [--stage I] [--all-logits]
 """
 
 from __future__ import annotations
@@ -117,7 +121,7 @@ def check_family(cfg: dict, family: str) -> None:
 
 
 def run(model_dir: str, out_dir: str, num_stages: int, family: str,
-        suffix: str, only_stage: int | None) -> None:
+        suffix: str, only_stage: int | None, all_logits: bool = False) -> None:
     with open(os.path.join(model_dir, "config.json")) as f:
         cfg = json.load(f)
     check_family(cfg, family)
@@ -157,11 +161,14 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
             "head_dim": text.get("head_dim") or hidden // int(text["num_attention_heads"]),
             "export_version": EXPORT_VERSION,
         }
+        if last:
+            meta["logits"] = "all" if all_logits else "last"
         stages_meta.append(meta)
         if only_stage is not None and i != only_stage:
             continue
         t0 = time.time()
-        stage, state_vars, _ = g.extract_stage(lm_xml, a, b, first, last, suffix, True)
+        stage, state_vars, _ = g.extract_stage(lm_xml, a, b, first, last, suffix,
+                                               not all_logits)
         sdir = os.path.join(out_dir, f"stage_{i}")
         os.makedirs(sdir, exist_ok=True)
         ov.save_model(stage, os.path.join(sdir, "openvino_model.xml"), compress_to_fp16=False)
@@ -226,13 +233,15 @@ def main() -> None:
     ap.add_argument("--family", required=True, choices=sorted(FAMILIES))
     ap.add_argument("--stage", type=int, default=None, help="cut only this stage")
     ap.add_argument("--boundary-suffix", default=g.DEFAULT_LAYERNORM_SUFFIX)
+    ap.add_argument("--all-logits", action="store_true",
+                    help="keep logits for every fed position (an ov-dist-spec target)")
     args = ap.parse_args()
     # One stage serves a single box through ov-runtime: GenAI's own Pixtral
     # preprocessing differs from HF's (see docs/rfcs/vlm-support.md).
     if args.num_stages < 1:
         raise SystemExit("--num-stages must be >= 1")
     run(args.model, args.output_dir, args.num_stages, args.family,
-        args.boundary_suffix, args.stage)
+        args.boundary_suffix, args.stage, args.all_logits)
 
 
 if __name__ == "__main__":
