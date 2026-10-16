@@ -269,7 +269,7 @@ framework's plain-text body.
 | 415 | The request lacks `content-type: application/json`. |
 | 422 | `/v1/systemone` only: valid JSON that does not match the request schema, a `strategy` that is none of the four values included (the OpenAI route answers 400 instead). |
 | 501 | The model serves no decisions: no `decision.json` (or one that fails its load checks; see the startup log), an engine other than `qwen35`, the engine has no decision head (`decision/` missing on the single box or the pipeline's last rank), the tree was exported without `--final-hidden` (Kev and Clef), or a pipeline rank cannot serve decision passes (an older build, rank 0 or the last rank without `config.json` `vocab_size`, or the last rank without `decision/`; a middle rank only relays and needs neither). Rank 0 refuses the pipeline cases before any prefill. |
-| 503 | The server is at capacity (`engine at capacity; retry after current requests complete`): every decision permit is taken (`--max-decision-requests`, default 16), or a Kev pass that must resume its shared state from the prefix cache found the snapshot evicted by other requests (see [Limits](#limits)); retrying can succeed. Any other engine error is `decision engine error`, including non-finite logits or probabilities (never a 200 with `null`s). Decisions have their own admission pool: chat requests never take its permits, and decisions never take chat's. Chat can still cause this 503 by evicting a Kev snapshot. |
+| 503 | The server is at capacity (`engine at capacity; retry after current requests complete`): every decision permit is taken (`--max-decision-requests`, default 16), or a Kev pass that must resume its shared state from the prefix cache found the snapshot evicted by other requests (see [Limits](#limits)); retrying can succeed. Any other engine error is `decision engine error`, including non-finite logits or probabilities (never a 200 with `null`s), and a failed System 2 task under `thinking: "on"` (under `auto` the question answers from System 1 instead, see [Failures](#failures)). Decisions have their own admission pool: chat requests never take its permits, and decisions never take chat's. Chat can still cause this 503 by evicting a Kev snapshot. |
 
 Error messages are deliberately terse:
 
@@ -585,7 +585,8 @@ Every noul and choice answer of a request whose mode is `auto` or `on` carries `
   `mode`, `used: false`, `threshold` and `budget`, and its probabilities are System 1's.
 - `reason`: `"budget"` on an `auto` answer that would have thought (System 1 was below the
   threshold) but whose System 2 worst case did not fit what the request had left (see below).
-  Its probabilities are System 1's.
+  `"error"` on an `auto` answer whose System 2 failed in the engine (see
+  [Failures](#failures)). Either way its probabilities are System 1's.
 - `think_tokens`: tokens generated, the closing `</think>` included.
 - `finished_within_budget`: the thought closed, or the model stopped on its own, before the
   budget ran out. A thought cut at the budget is still read back, with `</think>` appended.
@@ -626,6 +627,34 @@ thinking token, and `usage.input_tokens` adds each generation's and read-back's 
 - **Admission.** System 2 runs inside the request: the same decision permit, the same engine
   queue, no extra admission. A thinking request holds its permit for as long as it thinks.
 - `--decision-dump` records System 1 passes only.
+
+### Failures
+
+A System 2 task can fail in the engine: its generation refused at submit, an engine error before
+the first token or mid-stream (on hardware, a decode infer that threw: `decode failed: backend
+error: unknown C++ exception in infer`), a stream that ends without its final chunk, or a failed
+read-back. Every one ends the request's wait at once, as any engine failure does:
+
+- `on`: the request fails like any engine failure, on both routes: the 503 `decision engine error`
+  (or the capacity 503 and the 413 that the engine's refusals map to, as for System 1 passes).
+- `auto`: the question answers from System 1 alone with `thinking: {"used": false, "reason":
+  "error"}` and the request is a 200. The other questions still think. Tokens the generation
+  streamed before it failed count in `usage`.
+
+Each failure is one `warn` line, `System 2 task failed`, with the task id (`think-…` for the
+generation, `dec-…` for the read-back), the `phase` (`generate` or `readback`), `prompt_tokens`,
+the tokens `generated` before the failure, the mode and the engine's reason. Whether the prompt
+resumed a cached prefix is in the engine's own lines for the same task id: qwen35's `decode
+failed` line carries `prompt`, `warm_prefix` (0 for a cold prefill) and `generated`. The engine's
+text is logged, never returned.
+
+The engine returns a failed task's error before it scrubs the stage requests: the scrub runs when
+the next task is admitted. On the GPU, a request once waited more than 15 minutes after a failed
+decode infer: the engine logged `decode failed`, but the API never logged receiving the error, and
+the only work between the two was that scrub (a native `recreate_request` per stage), so it
+most likely blocked there. That is deduced from the log and not reproduced. Chat requests take
+the same path and benefit equally. A scrub that does block still holds the engine, now at the
+next admission: the failed request gets its 503 (or its System 1 answer), and the next one waits.
 
 ### decision.json
 
