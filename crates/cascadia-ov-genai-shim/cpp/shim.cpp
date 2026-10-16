@@ -125,8 +125,13 @@ ov::AnyMap collect_properties(const char* const* kv, size_t count) {
 // Hard caps for input-tensor sanity. set_input is called with
 // caller-supplied (rank, shape, data_size); validate they're sane to
 // avoid wild reads on `shape`/`data` and gigantic allocations.
+// MAX_TENSOR_BYTES is sized to the largest input the decision heads pass:
+// the Clef-27B joint head's `hidden` at its 16,384-token max_length,
+// [16384, 5120] f32 = exactly 320 MiB (pipeline stage inputs are 256-token
+// prefill chunks, a few MiB). Mirrored as MAX_HEAD_INPUT_BYTES in
+// crates/cascadia-types/src/decision.rs, whose test parses this line.
 static constexpr size_t MAX_TENSOR_RANK = 16;
-static constexpr size_t MAX_TENSOR_BYTES = 256 * 1024 * 1024; // 256 MiB
+static constexpr size_t MAX_TENSOR_BYTES = 320 * 1024 * 1024; // 320 MiB
 
 // Cap returned text size from generate(). At 4 bytes/UTF-8 char and
 // 4096 max_new_tokens, even a UTF-8-heavy alphabet tops out around
@@ -1430,7 +1435,7 @@ int32_t cascadia_runtime_set_input(
         set_last_error("set_input: null data with data_size>0"); return 1;
     }
     if (data_size > MAX_TENSOR_BYTES) {
-        set_last_error("set_input: data_size exceeds MAX_TENSOR_BYTES=256MiB");
+        set_last_error("set_input: data_size exceeds MAX_TENSOR_BYTES=320MiB");
         return 1;
     }
     // Bound the shape product so we don't construct a tensor that

@@ -326,7 +326,8 @@ int32_t cascadia_runtime_output_name_all(
 
 /// Bind an input tensor by name. `shape` is `rank` element counts (no
 /// padding); `data` is row-major raw bytes whose total length must equal
-/// product(shape) * dtype.bytes_per_element.
+/// product(shape) * dtype.bytes_per_element. Refuses `data_size` over
+/// MAX_TENSOR_BYTES (320 MiB, shim.cpp) and `rank` over 16.
 int32_t cascadia_runtime_set_input(
     cascadia_runtime_t* handle,
     const char* tensor_name,

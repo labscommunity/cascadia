@@ -5309,12 +5309,14 @@ mod tests {
         e.rank = 0;
         e.vocab = Some(16);
         e.final_hidden_output = true;
-        e.hidden = 5120; // Clef-27B: [T, 5120] f32 fits 256 MiB up to T = 13107
-        assert!(e.admit_decision_check(&joint(13_107)).is_ok());
-        let err = e.admit_decision_check(&joint(13_108)).unwrap_err();
-        assert!(err.starts_with("decision_too_long"), "{err}");
+        e.hidden = 5120; // Clef-27B: [16384, 5120] f32 is exactly the shim's 320 MiB
+        assert!(e.admit_decision_check(&joint(16_384)).is_ok());
         e.hidden = 4096; // Clef-flash: the full 16384 fits
         assert!(e.admit_decision_check(&joint(16_384)).is_ok());
+        e.hidden = 8192; // a wider tree: 320 MiB / (4 * 8192) = 10240 rows
+        assert!(e.admit_decision_check(&joint(10_240)).is_ok());
+        let err = e.admit_decision_check(&joint(10_241)).unwrap_err();
+        assert!(err.starts_with("decision_too_long"), "{err}");
     }
 
     #[test]
