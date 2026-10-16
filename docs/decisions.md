@@ -424,6 +424,37 @@ Where this differs from serve_decide:
 - **A second round** needs the tokenizer again: a tournament request holds its concurrency permit
   and waits for a tokenization slot once more between its rounds.
 
+**Checking wide choices.** The parity tools take `--wide` to drive `WIDE_RECORDS`
+(`tools/decision/records.py`) instead of the 50 parity records: four requests with choices of 17,
+24, 40 + 100 and 256 options, each sent once per strategy (12 records, 21 questions, native
+questions included). Start the server with `--decision-dump` and no other client, then:
+
+```bash
+python tools/decision/codec_golden.py jev --url http://127.0.0.1:8080 --dump ~/parity/jev.jsonl \
+    --tokenizer ~/models/jev9b --adapter-dir ~/models/jev9b/adapter_vllm --wide     # prompts and plans
+python tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump ~/parity/jev.jsonl --wide   # writes jev.wide.parity.jsonl
+python tools/decision/reference_stream.py jev --weights JEV_BF16 --lora ~/models/jev9b/adapter_vllm/adapter_model.safetensors \
+    --tree ~/trees/jev9b-int8 --dump ~/parity/jev.wide.parity.jsonl --out ~/parity/jev.wide.ref.json --wide
+python tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref ~/parity/jev.wide.ref.json --wide  # the gate
+```
+
+- `codec_golden.py --wide` (JEV only, no `--answers`) checks each question ran the strategy its
+  request asked for, re-derives every round-1 pass's prompt and label ids with serve_decide's
+  layout and its single-token labels (`A`..`Z`, `AA`, ...; the first 16 must be the trained
+  head's), with the permute orders drawn by CPython's own `random`, and reads a tournament's
+  final back from its prompt: a sorted set of 16 with a member of every group, re-derived in the
+  same layout. It writes `<dump>.wide.golden.jsonl`.
+- The dump holds no logits, so the combinations are checked where probabilities exist:
+  `reference_stream.py --wide` computes each pass in fp32 (the trained bias on the first 16
+  positions, none beyond) and combines them with Python ports of serve_decide's formulas, over the
+  server's own tournament final (read back through the tree's `tokenizer.json`; a `NOTE` names
+  any question where the reference's groups would pick other finalists). `parity_check.py --wide`
+  then gates the server's answers against it.
+- The gate is the 50 records' gate (`--min-agree 0.96`, `--confident 0.05`). Over 21 questions
+  0.96 allows no flip at all; pass `--min-agree 0.95` to allow one near-tie.
+- The wide files never replace the 50-record ones: `jev.wide.parity.jsonl` and
+  `jev.wide.golden.jsonl` sit beside `jev.parity.jsonl` and `jev.golden.jsonl`.
+
 ## Confidence
 
 **Confidence follows TypeSafe's system-one-adapter 0.2.1**, the formulas Kev's own server also
