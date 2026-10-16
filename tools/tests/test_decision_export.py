@@ -1068,6 +1068,8 @@ def test_bounds_mirror_the_rust_constants():
     prof = _rust_consts("crates/cascadia-api/src/decisions/profile.rs")
     assert (de.MIN_TEMPERATURE, de.MAX_TEMPERATURE, de.MAX_ABS_BIAS) == \
         (prof["MIN_TEMPERATURE"], prof["MAX_TEMPERATURE"], prof["MAX_ABS_BIAS"])
+    # Task 36: the server refuses a profile with more choice labels than the exporter writes.
+    assert de.MAX_CHOICE_LABELS == prof["MAX_CHOICE_LABELS"]
     types = _rust_consts("crates/cascadia-types/src/decision.rs")
     assert (de.MAX_DECISION_PROMPT, de.MAX_JOINT_PROMPT, de.MAX_HEAD_INPUT_BYTES) == \
         (types["MAX_DECISION_PROMPT"], types["MAX_JOINT_PROMPT"], types["MAX_HEAD_INPUT_BYTES"])

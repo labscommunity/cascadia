@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::str::FromStr;
 
 use serde::Deserialize;
 
@@ -9,6 +10,36 @@ use serde::Deserialize;
 pub const MIN_TEMPERATURE: f64 = 1e-3;
 pub const MAX_TEMPERATURE: f64 = 1e3;
 pub const MAX_ABS_BIAS: f64 = 1e4;
+/// Most choice labels a JEV profile carries: serve_decide's MAX_OPTIONS, mirrored as
+/// `MAX_CHOICE_LABELS` in tools/decision_export.py (pinned by its test).
+pub const MAX_CHOICE_LABELS: usize = 256;
+
+/// How JEV answers a choice question with more options than trained choice slots
+/// (serve_decide `s1_dist`): one pass over all of them, a tournament of groups of at most 16 and
+/// a final of 16, or the mean of four passes over permuted orders. Default `single`, the
+/// reference's default for the Qwen-based JEV models.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum JevStrategy {
+    #[default]
+    Single,
+    Tournament,
+    Permute,
+}
+
+impl FromStr for JevStrategy {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "single" => Ok(Self::Single),
+            "tournament" => Ok(Self::Tournament),
+            "permute" => Ok(Self::Permute),
+            other => Err(format!(
+                "unknown JEV strategy {other:?}: expected single, tournament or permute"
+            )),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -27,6 +58,16 @@ pub struct JevProfile {
     pub slots: HashMap<String, [usize; 2]>,
     /// kind → calibration temperature.
     pub temperature: HashMap<String, f64>,
+    /// Single-token choice labels (A..Z, AA..) and their ids, at most MAX_CHOICE_LABELS, the
+    /// first `hi - lo` being the trained choice slots (Task 35's export). A pass over m options
+    /// labels them `[..m]`. Empty in a decision.json from before Task 35: max 16 options then.
+    #[serde(default)]
+    pub choice_labels: Vec<String>,
+    #[serde(default)]
+    pub choice_label_ids: Vec<u32>,
+    /// The plan for choices beyond the trained slots.
+    #[serde(default)]
+    pub strategy: JevStrategy,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -74,7 +115,9 @@ impl DecisionProfile {
                 format!("{:?}", p.family).to_lowercase()
             ));
         }
-        let checked = p.jev.as_ref().map_or(Ok(()), JevProfile::check_calibration);
+        let checked = p.jev.as_ref().map_or(Ok(()), |j| {
+            j.check_calibration().and_then(|()| j.check_choice_labels())
+        });
         checked
             .and(p.kev.as_ref().map_or(Ok(()), KevProfile::check_calibration))
             .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -114,6 +157,48 @@ impl JevProfile {
     /// The calibration bounds, checked at load and again by `JevCodec::new`.
     pub fn check_calibration(&self) -> Result<(), String> {
         check_calibration(self.temperature.values(), &self.bias)
+    }
+
+    /// Choice labels, when present, pair up, fit MAX_CHOICE_LABELS and start with the trained
+    /// choice slots (the reference asserts the same, serve_decide.py:128). Checked at load and
+    /// again by `JevCodec::new`; a profile without a choice range is refused there instead.
+    pub fn check_choice_labels(&self) -> Result<(), String> {
+        let (labels, ids) = (&self.choice_labels, &self.choice_label_ids);
+        if labels.len() != ids.len() {
+            return Err(format!(
+                "jev.choice_labels and choice_label_ids must have equal length, got {} and {}",
+                labels.len(),
+                ids.len()
+            ));
+        }
+        if labels.len() > MAX_CHOICE_LABELS {
+            return Err(format!(
+                "jev.choice_labels must have at most {MAX_CHOICE_LABELS} entries, got {}",
+                labels.len()
+            ));
+        }
+        let Some(&[lo, hi]) = self.slots.get("choice") else {
+            return Ok(());
+        };
+        if ids.is_empty() || hi > self.verbalizer_ids.len() || lo > hi {
+            return Ok(());
+        }
+        if ids.len() < hi - lo {
+            return Err(format!(
+                "jev.choice_labels has {} entries, fewer than the {} trained choice slots",
+                ids.len(),
+                hi - lo
+            ));
+        }
+        if ids[..hi - lo] != self.verbalizer_ids[lo..hi] {
+            return Err(format!(
+                "jev.choice_label_ids[..{}] {:?} must equal the trained choice verbalizer_ids[{lo}..{hi}] {:?}",
+                hi - lo,
+                &ids[..hi - lo],
+                &self.verbalizer_ids[lo..hi]
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -208,6 +293,90 @@ mod tests {
             assert!(e.contains(what), "{bad}: {e}");
         }
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn jev_json(extra: &str) -> String {
+        format!(
+            r#"{{"family":"jev","max_tokens":10,"jev":{{"verbalizers":["false","true","0","1","2","3","4","5","A","B"],"verbalizer_ids":[1,2,3,4,5,6,7,8,9,10],"bias":[0,0,0,0,0,0,0,0,0,0],"slots":{{"noul":[0,2],"score":[2,8],"choice":[8,10]}},"temperature":{{"noul":1,"choice":1,"score":1}}{extra}}}}}"#
+        )
+    }
+
+    #[test]
+    fn choice_labels_and_strategy_are_optional() {
+        // Task 36: a decision.json from before Task 35 has neither field and keeps loading.
+        let d = std::env::temp_dir().join(format!("dprof-t36-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("decision.json");
+        std::fs::write(&p, jev_json("")).unwrap();
+        let j = DecisionProfile::load(&p).unwrap().jev.unwrap();
+        assert!(j.choice_labels.is_empty() && j.choice_label_ids.is_empty());
+        assert_eq!(j.strategy, JevStrategy::Single);
+        std::fs::write(
+            &p,
+            jev_json(r#","choice_labels":["A","B","C"],"choice_label_ids":[9,10,77],"strategy":"tournament""#),
+        )
+        .unwrap();
+        let j = DecisionProfile::load(&p).unwrap().jev.unwrap();
+        assert_eq!(j.choice_labels, ["A", "B", "C"]);
+        assert_eq!(j.choice_label_ids, [9, 10, 77]);
+        assert_eq!(j.strategy, JevStrategy::Tournament);
+        std::fs::write(&p, jev_json(r#","strategy":"vote""#)).unwrap();
+        assert!(DecisionProfile::load(&p).unwrap_err().contains("vote"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn choice_labels_must_extend_the_trained_choice_head() {
+        let d = std::env::temp_dir().join(format!("dprof-t36b-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("decision.json");
+        let many = |n: usize| {
+            let labels: Vec<String> = (0..n).map(|i| format!("\"L{i}\"")).collect();
+            let ids: Vec<String> = (0..n).map(|i| (9 + i).to_string()).collect();
+            format!(
+                r#","choice_labels":[{}],"choice_label_ids":[{}]"#,
+                labels.join(","),
+                ids.join(",")
+            )
+        };
+        std::fs::write(&p, jev_json(&many(MAX_CHOICE_LABELS))).unwrap();
+        assert_eq!(
+            DecisionProfile::load(&p)
+                .unwrap()
+                .jev
+                .unwrap()
+                .choice_labels
+                .len(),
+            256
+        );
+        for (extra, why) in [
+            (many(MAX_CHOICE_LABELS + 1), "at most 256"),
+            (
+                r#","choice_labels":["A","B"],"choice_label_ids":[9]"#.into(),
+                "equal length",
+            ),
+            (
+                r#","choice_labels":["A"],"choice_label_ids":[9]"#.into(),
+                "the 2 trained",
+            ),
+            (
+                r#","choice_labels":["A","B"],"choice_label_ids":[9,11]"#.into(),
+                "verbalizer_ids[8..10]",
+            ),
+        ] {
+            std::fs::write(&p, jev_json(&extra)).unwrap();
+            let e = DecisionProfile::load(&p).unwrap_err();
+            assert!(e.contains(why), "{extra}: {e}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn strategy_parses_from_its_name() {
+        assert_eq!("single".parse(), Ok(JevStrategy::Single));
+        assert_eq!("tournament".parse(), Ok(JevStrategy::Tournament));
+        assert_eq!("permute".parse(), Ok(JevStrategy::Permute));
+        assert!("Permute".parse::<JevStrategy>().is_err());
     }
 
     #[test]
