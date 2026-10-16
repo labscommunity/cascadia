@@ -27,6 +27,11 @@ Families (the `vision.family` rank 0 serves):
   mistral3  Mistral3ForConditionalGeneration (e.g. Ministral-3, exported with
             optimum-intel): the Pixtral encoder plus a 2x2 patch merger in
             openvino_multi_modal_projector_model.xml, which rank 0 runs.
+  gemma3    Gemma3ForConditionalGeneration (e.g. OpenVINO/gemma-3-12b-it-int4-ov):
+            SigLIP encoder whose IR already pools and projects to 256 rows
+            per image. The language model takes token_type_ids (each image is
+            attended both ways in its full and sliding masks), so every stage
+            keeps them and they ride the wire as a third frame.
 
 Usage:
   python cut_vlm_lm.py --model <OV VLM dir> --output-dir <tree> --num-stages N \
@@ -63,6 +68,12 @@ FAMILIES = {
         "model_types": ("mistral3",),
         "vision_types": ("pixtral",),
         "token_type_ids": False,
+    },
+    # Gemma 3: SigLIP tower; projector and 4x4 pool are inside the vision IR.
+    "gemma3": {
+        "model_types": ("gemma3",),
+        "vision_types": ("siglip_vision_model",),
+        "token_type_ids": True,
     },
 }
 
@@ -136,9 +147,19 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
         # the projector on the merged rows; without them the tree would serve
         # as plain Pixtral and fail only at image time.
         required += ["openvino_multi_modal_projector_model.xml", "processor_config.json"]
+    if family == "gemma3":
+        # Rank 0 reads the 896x896 SigLIP settings from it.
+        required += ["preprocessor_config.json"]
     for fn in required:
         if not os.path.exists(os.path.join(model_dir, fn)):
             raise SystemExit(f"{model_dir} lacks {fn}; not an OpenVINO {family} VLM export")
+
+    if FAMILIES[family]["token_type_ids"]:
+        lm_inputs = [p.get_friendly_name() for p in ov.Core().read_model(lm_xml).get_parameters()]
+        if "token_type_ids" not in lm_inputs:
+            raise SystemExit(f"--family {family}: openvino_language_model.xml takes no "
+                             f"token_type_ids ({lm_inputs}); images would be attended "
+                             "causally. Re-export it with a newer optimum-intel")
 
     if num_stages > num_layers:
         raise SystemExit(f"--num-stages {num_stages} exceeds the {num_layers} decoder layers")
@@ -173,6 +194,9 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
         os.makedirs(sdir, exist_ok=True)
         ov.save_model(stage, os.path.join(sdir, "openvino_model.xml"), compress_to_fp16=False)
         meta["inputs"] = [p.get_friendly_name() for p in stage.get_parameters()]
+        if FAMILIES[family]["token_type_ids"] and "token_type_ids" not in meta["inputs"]:
+            raise SystemExit(f"stage_{i} lost token_type_ids ({meta['inputs']}); every stage "
+                             "must take them for bidirectional image attention")
         meta["state_vars"] = len(state_vars)
         with open(os.path.join(sdir, "stage_config.json"), "w") as f:
             json.dump(meta, f, indent=2)
