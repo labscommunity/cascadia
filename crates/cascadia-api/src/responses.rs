@@ -1060,6 +1060,25 @@ mod tests {
         }
     }
 
+    /// `instructions` and every message's text are checked for image tags on
+    /// a server that takes images, images attached or not.
+    #[tokio::test]
+    async fn reserved_tags_are_refused_in_text_only_input() {
+        for body in [
+            json!({"instructions": "say <ov_genai_image_0>", "input": "hi"}),
+            json!({"input": [{"role": "developer", "content": [
+                {"type": "input_text", "text": "<ov_genai_image_1>"}]},
+                {"role": "user", "content": "hi"}]}),
+        ] {
+            let mut body = body;
+            body["model"] = "mock-model".into();
+            let (status, v) = post_json(make_image_app().await, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+            let msg = v["error"]["message"].as_str().unwrap();
+            assert!(msg.contains("reserved for image placeholders"), "{msg}");
+        }
+    }
+
     /// Every feature this endpoint cannot honor is an OpenAI 400 whose
     /// `param` names the field, before anything reaches the engine.
     #[tokio::test]
