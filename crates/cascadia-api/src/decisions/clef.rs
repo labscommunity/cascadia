@@ -288,6 +288,13 @@ mod tests {
         let v: OrderedValue = serde_json::from_str(r#"{"b": 1, "a": "é"}"#).unwrap();
         assert_eq!(render_sorted(&v), "{\"a\":\"é\",\"b\":1}");
         assert_eq!(render_sorted(&OrderedValue::String("x".into())), "x");
+        // L9: integers of any size keep every digit; floats are Python's repr.
+        let v: OrderedValue =
+            serde_json::from_str(r#"{"n": 123456789012345678901234567890, "f": 1e20}"#).unwrap();
+        assert_eq!(
+            render_sorted(&v),
+            "{\"f\":1e+20,\"n\":123456789012345678901234567890}"
+        );
     }
 
     #[test]
