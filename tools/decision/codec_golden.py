@@ -9,7 +9,8 @@ The server must run with `--decision-dump DUMP`, and this tool needs the server 
 runs (any other request's passes land in the dump and fail the alignment). Each dump line is one
 decision pass, written by crates/cascadia-api/src/decisions/handler.rs: {"parts": [[question_id,
 logit_start, logit_end], ...], "readout": {"prompt_ids": [...], "head": {"kind": "verbalizer"|
-"pointer"|"joint", ...}, "cache_prefix"?: n}}.
+"pointer"|"joint", ...}, "cache_prefix"?: n}}, plus "strategy" and "round" on a JEV choice pass
+("native" and 1 within the trained slots; wider questions are not checked here yet).
 
 Reference encoders come from the spike sources under $SPIKE_DIR (imported at run time, never vendored):
 Kev `kev-spike/kev.py` questions(), Clef `clef-spike/flash/joint_schema_model.py` encode_record(),

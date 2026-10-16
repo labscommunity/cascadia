@@ -11,7 +11,9 @@ use axum::Json;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use super::schema::{parse_ordered, Answer, DecisionRequest, OrderedValue, Question, QuestionType};
+use super::schema::{
+    parse_ordered, Answer, DecisionRequest, OrderedValue, Question, QuestionType, RequestStrategy,
+};
 use super::DecisionError;
 use crate::AppState;
 use cascadia_types::MAX_DECISION_OUTPUTS;
@@ -22,6 +24,9 @@ pub struct OaRequest {
     pub model: String,
     pub input: OaInput,
     pub questions: Vec<OaQuestion>,
+    /// As `/v1/systemone`'s top-level `strategy` (JEV only).
+    #[serde(default)]
+    pub strategy: Option<RequestStrategy>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -391,6 +396,7 @@ pub fn to_internal(r: &OaRequest) -> Result<(DecisionRequest, Vec<OaMeta>), Deci
         questions,
         images: None,
         videos: None,
+        strategy: r.strategy,
     };
     Ok((req, meta))
 }

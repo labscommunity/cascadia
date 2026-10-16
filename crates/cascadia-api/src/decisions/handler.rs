@@ -111,6 +111,14 @@ pub(crate) async fn evaluate(
         return Err(DecisionError::NotServed);
     };
     req.validate(&svc.limits())?;
+    // `strategy` picks among JEV's multi-pass plans; Kev and Clef read any option count in one
+    // pass and have none.
+    let fixed = req.strategy.and_then(schema::RequestStrategy::fixed);
+    if fixed.is_some() && svc.family != super::profile::Family::Jev {
+        return Err(DecisionError::BadRequest(
+            "strategy applies to JEV only".into(),
+        ));
+    }
     // Take the permit BEFORE tokenizing: encode() is CPU work proportional to the request.
     // Counted like chat (SEC-5): a capacity refusal, the request total and the in-flight gauge.
     let permit = match state.permits.clone().try_acquire_owned() {
@@ -145,86 +153,202 @@ pub(crate) async fn evaluate(
             "state is {state_bytes} bytes; the limit is {byte_limit}"
         )));
     }
-    // At most `encode_slots` tokenizations at once, whatever the request permits allow (each can
-    // hold a few hundred MB of tokenizer transients, P2-SEC-3). Waits rather than refusing: the
-    // request already holds its permit. Moved into the encode, so an orphaned encode keeps it.
-    let Ok(slot) = svc.encode_slots.clone().acquire_owned().await else {
-        return Err(DecisionError::Engine("decision engine error".into()));
-    };
-    // Tokenization is CPU work proportional to the request: run it off the async executor.
-    let (svc2, req2, held2, cancel2) = (svc.clone(), req.clone(), held.clone(), cancel.0.clone());
-    let encoded = match tokio::task::spawn_blocking(move || {
-        let _held = held2;
-        let _slot = slot;
-        svc2.codec.encode_until(&req2, &cancel2)
+    // The request is shared by both rounds' blocking encodes.
+    let req = Arc::new(req.clone());
+    let (svc2, req2, cancel2) = (svc.clone(), req.clone(), cancel.0.clone());
+    let encoded = off_executor(&svc, &held, move || {
+        svc2.codec.encode_rounds(&req2, &cancel2)
     })
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, "decision encode task panicked");
-            return Err(DecisionError::Engine("decision engine error".into()));
-        }
-    };
+    .await?;
     // Codecs mask tokenizer failures themselves (`tokenize_failed`); every other encode error is
     // a reason the client should see (Clef's option cap as 400; Kev's render budget and state
     // length, Clef's schema size and JEV's early pass cap as 413).
-    let mut passes = encoded?;
-    if let Some(p) = passes
-        .iter()
-        .find(|p| p.readout.prompt_ids.len() > svc.max_tokens)
-    {
-        return Err(super::pass_too_long(
-            p.readout.prompt_ids.len(),
-            svc.max_tokens,
-        ));
-    }
-    let total = super::prefill_work(&passes, svc.prefix_reuse);
+    let (mut passes, reserve) = encoded?;
+    check_pass_lengths(&passes, svc.max_tokens)?;
+    // A second round (JEV's tournament finals) is counted now, at its worst case, so a request
+    // is refused before its first pass rather than half way.
+    let total = super::prefill_work(&passes, svc.prefix_reuse) + reserve;
     if total > svc.max_total_tokens {
         return Err(DecisionError::TooLong(format!(
             "this request needs {total} prefill tokens; the per-request limit is {}",
             svc.max_total_tokens
         )));
     }
-    if let Some(dump) = state.decision_dump.clone().filter(|d| !d.is_closed()) {
-        // Serialize and write off the async workers (P2-SEC-5): a request's lines can reach
-        // ~16 MB, and a synchronous write under the lock would stall chat streams and timers.
-        // The write carries the request's permit, so a client that leaves cannot orphan
-        // request-sized writes past the permits (P3-SEC-1). A closed dump (cap reached, write
-        // failed) costs nothing: no clone, no serialization.
-        let dumped = passes.clone();
-        let held3 = held.clone();
-        let wrote = tokio::task::spawn_blocking(move || {
-            let _held = held3;
-            if dump.is_closed() {
-                return Ok(());
-            }
-            let mut lines = Vec::new();
-            for p in &dumped {
-                let parts: Vec<_> = p
-                    .parts
-                    .iter()
-                    .map(|x| (&x.question_id, x.logits.start, x.logits.end))
-                    .collect();
-                let line = serde_json::json!({"parts": parts, "readout": p.readout});
-                if serde_json::to_writer(&mut lines, &line).is_err() {
-                    return Err(std::io::Error::other("serialize"));
-                }
-                lines.push(b'\n');
-            }
-            dump.append(&lines)
+    dump_passes(state, &svc, &req, &held, &passes, 1).await;
+    super::mark_required_reuse(&mut passes, svc.max_total_tokens, svc.prefix_reuse);
+    // Every question's per-pass probabilities, in submission order.
+    let mut probs: IndexMap<String, Vec<Vec<f64>>> = IndexMap::new();
+    let mut input_tokens = run_passes(state, &svc, &req, &passes, &mut probs).await?;
+    // Only a request that reserved tokens has a second round (a final is never empty), so every
+    // other request skips this encode.
+    if reserve > 0 {
+        let (svc2, req2, cancel2, first) =
+            (svc.clone(), req.clone(), cancel.0.clone(), probs.clone());
+        let second = off_executor(&svc, &held, move || {
+            svc2.codec.second_round(&req2, &first, &cancel2)
         })
-        .await;
-        match wrote {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(error = %e, "--decision-dump write failed"),
-            Err(e) => tracing::warn!(error = %e, "--decision-dump writer panicked"),
+        .await??;
+        check_pass_lengths(&second, svc.max_tokens)?;
+        // Within the reserve by construction; a tokenizer that merges across line starts could
+        // still exceed it, and then the request stops here rather than overspend. Second-round
+        // passes share no prefix, so every one counts in full.
+        let spent = super::prefill_work(&passes, svc.prefix_reuse)
+            + second
+                .iter()
+                .map(|p| p.readout.prompt_ids.len())
+                .sum::<usize>();
+        if spent > svc.max_total_tokens {
+            return Err(DecisionError::TooLong(format!(
+                "this request needs {spent} prefill tokens; the per-request limit is {}",
+                svc.max_total_tokens
+            )));
+        }
+        dump_passes(state, &svc, &req, &held, &second, 2).await;
+        input_tokens += run_passes(state, &svc, &req, &second, &mut probs).await?;
+    }
+    let mut answers = IndexMap::with_capacity(req.questions.len());
+    for (id, q) in &req.questions {
+        let Some(p) = probs
+            .get(id)
+            .and_then(|passes| svc.codec.combine(&req, id, passes))
+        else {
+            return Err(engine_failure("codec produced no answer for a question"));
+        };
+        // A codec bug (an off-by-one logits range, a rescale to the wrong level count) would
+        // otherwise truncate the distribution silently or panic on `probs[1]` (QUA-6).
+        if p.len() != q.option_keys().len() {
+            return Err(engine_failure(&format!(
+                "codec returned {} probabilities for {} options",
+                p.len(),
+                q.option_keys().len()
+            )));
+        }
+        // Finite logits can still give NaN/inf probabilities if a calibration overflows
+        // (`(l + b) / t`, H17); the profile bounds prevent it, and this keeps it from ever
+        // reaching a client as `null` in a 200.
+        if !p.iter().all(|x| x.is_finite()) {
+            return Err(engine_failure("non-finite decision probabilities"));
+        }
+        let legend = match q.qtype {
+            schema::QuestionType::Score => svc.codec.legend(q),
+            _ => None,
+        };
+        answers.insert(id.clone(), answer_with_legend(q, &p, legend));
+    }
+    Ok((answers, input_tokens))
+}
+
+/// Run tokenization work `f` off the async executor (it is CPU work proportional to the
+/// request), in one of the service's encode slots. At most `encode_slots` tokenizations run at
+/// once, whatever the request permits allow (each can hold a few hundred MB of tokenizer
+/// transients, P2-SEC-3); this waits rather than refusing, since the request already holds its
+/// permit. The closure keeps the slot and the request's permit (SEC-2), so an orphaned encode
+/// keeps both until it ends.
+async fn off_executor<T: Send + 'static>(
+    svc: &Arc<super::DecisionService>,
+    held: &Arc<Held>,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, DecisionError> {
+    let Ok(slot) = svc.encode_slots.clone().acquire_owned().await else {
+        return Err(DecisionError::Engine("decision engine error".into()));
+    };
+    let held = held.clone();
+    match tokio::task::spawn_blocking(move || {
+        let _held = held;
+        let _slot = slot;
+        f()
+    })
+    .await
+    {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            tracing::warn!(error = %e, "decision encode task panicked");
+            Err(DecisionError::Engine("decision engine error".into()))
         }
     }
-    super::mark_required_reuse(&mut passes, svc.max_total_tokens, svc.prefix_reuse);
-    let mut probs: IndexMap<String, Vec<f64>> = IndexMap::new();
+}
+
+/// The 413 for the first pass over the per-pass cap.
+fn check_pass_lengths(passes: &[super::Pass], max_tokens: usize) -> Result<(), DecisionError> {
+    match passes
+        .iter()
+        .find(|p| p.readout.prompt_ids.len() > max_tokens)
+    {
+        Some(p) => Err(super::pass_too_long(p.readout.prompt_ids.len(), max_tokens)),
+        None => Ok(()),
+    }
+}
+
+/// Append `passes` to `--decision-dump`, if it is open. A JEV choice pass's line also names its
+/// plan (`strategy`) and `round`, so the tools can rebuild the combination.
+async fn dump_passes(
+    state: &AppState,
+    svc: &super::DecisionService,
+    req: &DecisionRequest,
+    held: &Arc<Held>,
+    passes: &[super::Pass],
+    round: u32,
+) {
+    let Some(dump) = state.decision_dump.clone().filter(|d| !d.is_closed()) else {
+        return;
+    };
+    let tags: Vec<Option<&'static str>> = passes
+        .iter()
+        .map(|p| match p.parts.as_slice() {
+            [part] => svc.codec.dump_strategy(req, &part.question_id),
+            _ => None,
+        })
+        .collect();
+    // Serialize and write off the async workers (P2-SEC-5): a request's lines can reach
+    // ~16 MB, and a synchronous write under the lock would stall chat streams and timers.
+    // The write carries the request's permit, so a client that leaves cannot orphan
+    // request-sized writes past the permits (P3-SEC-1). A closed dump (cap reached, write
+    // failed) costs nothing: no clone, no serialization.
+    let dumped = passes.to_vec();
+    let held = held.clone();
+    let wrote = tokio::task::spawn_blocking(move || {
+        let _held = held;
+        if dump.is_closed() {
+            return Ok(());
+        }
+        let mut lines = Vec::new();
+        for (p, tag) in dumped.iter().zip(tags) {
+            let parts: Vec<_> = p
+                .parts
+                .iter()
+                .map(|x| (&x.question_id, x.logits.start, x.logits.end))
+                .collect();
+            let mut line = serde_json::json!({"parts": parts, "readout": p.readout});
+            if let Some(strategy) = tag {
+                line["strategy"] = strategy.into();
+                line["round"] = round.into();
+            }
+            if serde_json::to_writer(&mut lines, &line).is_err() {
+                return Err(std::io::Error::other("serialize"));
+            }
+            lines.push(b'\n');
+        }
+        dump.append(&lines)
+    })
+    .await;
+    match wrote {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "--decision-dump write failed"),
+        Err(e) => tracing::warn!(error = %e, "--decision-dump writer panicked"),
+    }
+}
+
+/// Run `passes` one after another (the engine runs one decision pass at a time) and append
+/// each part's probabilities to its question's list. Returns the prompt tokens prefilled.
+async fn run_passes(
+    state: &AppState,
+    svc: &super::DecisionService,
+    req: &DecisionRequest,
+    passes: &[super::Pass],
+    probs: &mut IndexMap<String, Vec<Vec<f64>>>,
+) -> Result<u64, DecisionError> {
     let mut input_tokens: u64 = 0;
-    for pass in &passes {
+    for pass in passes {
         let task = cascadia_types::GenerationTask {
             task_id: format!("dec-{}", uuid::Uuid::new_v4().simple()),
             prompt: String::new(),
@@ -250,7 +374,7 @@ pub(crate) async fn evaluate(
                 // pass prefilled anything): the request needs its full length, a 413.
                 if reason.starts_with("decision_uncacheable") {
                     tracing::warn!(reason, "decision pass failed");
-                    return Err(uncacheable(&passes, svc.max_total_tokens));
+                    return Err(uncacheable(passes, svc.max_total_tokens));
                 }
                 return Err(engine_failure(reason));
             }
@@ -273,40 +397,16 @@ pub(crate) async fn evaluate(
             return Err(engine_failure("non-finite decision logits"));
         }
         for part in &pass.parts {
-            probs.insert(
-                part.question_id.clone(),
-                svc.codec
-                    .probabilities(req, part, &logits[part.logits.clone()]),
-            );
+            probs
+                .entry(part.question_id.clone())
+                .or_default()
+                .push(
+                    svc.codec
+                        .probabilities(req, part, &logits[part.logits.clone()]),
+                );
         }
     }
-    let mut answers = IndexMap::with_capacity(req.questions.len());
-    for (id, q) in &req.questions {
-        let Some(p) = probs.get(id) else {
-            return Err(engine_failure("codec produced no answer for a question"));
-        };
-        // A codec bug (an off-by-one logits range, a rescale to the wrong level count) would
-        // otherwise truncate the distribution silently or panic on `probs[1]` (QUA-6).
-        if p.len() != q.option_keys().len() {
-            return Err(engine_failure(&format!(
-                "codec returned {} probabilities for {} options",
-                p.len(),
-                q.option_keys().len()
-            )));
-        }
-        // Finite logits can still give NaN/inf probabilities if a calibration overflows
-        // (`(l + b) / t`, H17); the profile bounds prevent it, and this keeps it from ever
-        // reaching a client as `null` in a 200.
-        if !p.iter().all(|x| x.is_finite()) {
-            return Err(engine_failure("non-finite decision probabilities"));
-        }
-        let legend = match q.qtype {
-            schema::QuestionType::Score => svc.codec.legend(q),
-            _ => None,
-        };
-        answers.insert(id.clone(), answer_with_legend(q, p, legend));
-    }
-    Ok((answers, input_tokens))
+    Ok(input_tokens)
 }
 
 #[cfg(test)]
