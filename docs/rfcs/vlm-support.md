@@ -865,7 +865,7 @@ from the text alone.
 | `qwen35` | trees with the vision IRs | served; otherwise 400 at the API and at `submit` |
 | `ov-runtime` | Gemma 4 surgery trees (`vision.family = "gemma4"`, stateful and static paths), Pixtral trees (`"pixtral"`, stateful, static and packed paths) and Mistral 3 trees (`"mistral3"`) | served; other trees 400; an unknown `vision.family` fails to load |
 | `gemma4` (`gemma4_cached` trees) | E2B/E4B trees from `export_gemma4.py --vision` | served; other trees 400 at the API and at `submit` |
-| `ov-dist-spec` | no | 400; draft and target would both need the expanded image prompt |
+| `ov-dist-spec` | Pixtral / Mistral 3 target trees cut with `--all-logits` (`vision.family` `"pixtral"` / `"mistral3"`); the draft stays text-only | served; v5 (text) targets 400 at the API and at `submit`; a Gemma 4 target fails to load |
 | `sparse-moe` | no | 400 |
 | `mock` | accepts and ignores | test stand-in for the API's image tests |
 
@@ -873,6 +873,30 @@ A body over the size limit stays a 413, now with a message pointing at
 `input_modalities`. `tools/export_shards.py` rejects Llama 3.2 Vision (`mllama`, whose
 text tower has cross-attention) and notes at export time when it drops a checkpoint's
 vision tower (Mistral 3, Qwen2-VL, LLaVA).
+
+## Pixtral on `ov-dist-spec` (2026-10-16, not yet run on hardware)
+
+Design: only the target sees images. Rank 0 expands and encodes them with the Pixtral
+front end and feeds stage 0 `inputs_embeds` (the text-embedding rows of the expanded
+prompt with the image rows spliced in); every later span (the drafted tokens and the
+correction) is embedded through the same table with no image rows, so the mask-based
+rewind and the `valid_mask` only ever cover text rows. The draft (Ministral-3-3B,
+`tools/vlm_surgery/make_text_draft.py`) is fed the expanded ids, image tokens as plain
+tokens; its ids match Pixtral's apart from seven renamed reserved specials, and the
+target's tokenizer tokenizes once. Pixtral's text tower uses 1-D RoPE, so dist-spec's
+1-D positions hold.
+
+What changed to make a `cut_vlm_lm.py` tree a dist-spec target: stage 0 takes
+`inputs_embeds` (the driver now resolves it when the tree has a `vision` block), and the
+last stage must emit logits for every fed position. The cut sliced the head to the last
+row; `--all-logits` keeps them all and records `"logits": "all"` in the last stage's
+config, which rank 0 and the last worker check at load (an older cut without the field
+is refused). The API's image tag for these trees is `pixtral_native`.
+
+Not covered: KV warm resume of image turns under `kv_coord` (they prefill cold and are
+not captured), Gemma 4 targets (their `token_type_ids` frame does not ride the wire),
+static or packed dist-spec. To verify on the cluster: greedy answers match `ov-runtime`
+on the same `--all-logits` tree, and the logged acceptance rate on image prompts.
 
 ## Video: out of scope, kept cheap
 

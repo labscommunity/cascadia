@@ -234,6 +234,14 @@ struct PipelineConfig {
     model_id: String,
     #[serde(default)]
     export_version: Option<String>,
+    /// Per-stage metadata (`tools/vlm_surgery/cut_vlm_lm.py` writes it; v5
+    /// shards from `export_shards.py` may not).
+    #[serde(default)]
+    stages: Vec<StageConfig>,
+    /// A VLM tree's image block (`cut_vlm_lm.py`): stage 0 takes
+    /// `inputs_embeds` and rank 0 embeds ids and encodes images itself.
+    #[serde(default)]
+    vision: Option<crate::runtime::PipelineVision>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -244,6 +252,74 @@ struct StageConfig {
     has_head: bool,
     #[serde(default)]
     export_version: Option<String>,
+    /// Last stage only: `"all"` when the head emits logits for every fed
+    /// position, `"last"` when it was sliced to the final one.
+    #[serde(default)]
+    logits: Option<String>,
+}
+
+/// `export_version` of `cut_vlm_lm.py` trees. Its cuts before `--all-logits`
+/// existed carry no `logits` field and always sliced the head.
+const VLM_CUT_EXPORT: &str = "vlm_lm_surgery_v1";
+
+/// Why a last stage cannot serve dist-spec verification, if it cannot: the
+/// verify step reads the target's logits at every fed position, so a head
+/// sliced to the last position would verify one draft at most.
+fn last_stage_logits_refusal(cfg: &StageConfig) -> Option<String> {
+    let sliced = match cfg.logits.as_deref() {
+        Some("all") => false,
+        Some(_) => true,
+        None => cfg.export_version.as_deref() == Some(VLM_CUT_EXPORT),
+    };
+    sliced.then(|| {
+        "the last stage's head returns last-position logits only, but dist-spec verifies \
+         every drafted position; re-cut the tree with tools/vlm_surgery/cut_vlm_lm.py \
+         --all-logits"
+            .to_string()
+    })
+}
+
+/// Refuse prompt ids the draft's embedding table cannot index (`vocab` from
+/// the draft's config.json; unknown vocab passes).
+fn check_draft_ids(ids: &[i64], vocab: Option<usize>) -> Result<(), String> {
+    let Some(vocab) = vocab else { return Ok(()) };
+    match ids.iter().find(|&&t| t < 0 || t as usize >= vocab) {
+        Some(t) => Err(format!(
+            "prompt token {t} is outside the draft's {vocab}-token vocabulary; the draft \
+             must share the target's tokenizer"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Overwrite the image soft-token rows of row-major `[ids.len(), hidden]`
+/// text embeddings with `images`' rows, in prompt order; the number of rows
+/// written. No images (every span but a prompt with images: drafted and
+/// accepted tokens, text prompts) leaves the text rows as they are, even on an
+/// id that happens to be the image token.
+fn splice_prompt_rows(
+    embeds: &mut [f32],
+    hidden: usize,
+    ids: &[i64],
+    image_token: i64,
+    images: &[Vec<f32>],
+) -> Result<usize, String> {
+    if images.is_empty() {
+        return Ok(0);
+    }
+    let refs: Vec<&[f32]> = images.iter().map(Vec::as_slice).collect();
+    crate::gemma4_vision::splice_images(embeds, hidden, ids, image_token, &refs)?;
+    Ok(images.iter().map(Vec::len).sum::<usize>() / hidden.max(1))
+}
+
+/// The `vocab_size` in `dir/config.json` (top level or `text_config`).
+fn config_vocab(dir: &std::path::Path) -> Option<usize> {
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).ok()?).ok()?;
+    v.get("vocab_size")
+        .or_else(|| v.get("text_config").and_then(|t| t.get("vocab_size")))
+        .and_then(serde_json::Value::as_u64)
+        .map(|n| n as usize)
 }
 
 fn read_pipeline_config(p: &std::path::Path) -> Result<PipelineConfig, EngineError> {
@@ -627,6 +703,10 @@ pub struct TargetSendHandle {
 pub struct DistributedMaskedReq {
     stage0: OvRuntime,
     stage0_inputs: std::collections::HashMap<String, String>,
+    /// A VLM tree's rank-0 half (text embedding table + image encoder):
+    /// stage 0 takes `inputs_embeds`, so every span is embedded here. `None`
+    /// on a v5 tree, whose stage 0 takes `input_ids`.
+    vision: Option<crate::runtime::VisionFirst>,
     downstream: Arc<tokio::sync::Mutex<ActivationClient>>,
     runtime_handle: tokio::runtime::Handle,
     valid_mask: Vec<i64>,
@@ -797,8 +877,24 @@ impl DistributedMaskedReq {
         downstream: Arc<tokio::sync::Mutex<ActivationClient>>,
         runtime_handle: tokio::runtime::Handle,
     ) -> Result<Self, EngineError> {
+        Self::with_vision(stage0, downstream, runtime_handle, None)
+    }
+
+    /// [`Self::new`] for a VLM tree: `vision` embeds every span for a stage 0
+    /// that takes `inputs_embeds`.
+    pub(crate) fn with_vision(
+        stage0: OvRuntime,
+        downstream: Arc<tokio::sync::Mutex<ActivationClient>>,
+        runtime_handle: tokio::runtime::Handle,
+        vision: Option<crate::runtime::VisionFirst>,
+    ) -> Result<Self, EngineError> {
         let inputs = v5_inputs(&stage0)?;
-        for k in ["input_ids", "attention_mask", "position_ids", "beam_idx"] {
+        let token_in = if vision.is_some() {
+            "inputs_embeds"
+        } else {
+            "input_ids"
+        };
+        for k in [token_in, "attention_mask", "position_ids", "beam_idx"] {
             if !inputs.contains_key(k) {
                 return Err(EngineError::Backend(format!(
                     "stage 0 IR is missing v5 input: {k}"
@@ -808,6 +904,7 @@ impl DistributedMaskedReq {
         Ok(Self {
             stage0,
             stage0_inputs: inputs,
+            vision,
             downstream,
             runtime_handle,
             valid_mask: vec![1i64; 4096],
@@ -858,14 +955,11 @@ impl DistributedMaskedReq {
         let pos: Vec<i64> = (self.logical_pos as i64..(self.logical_pos + n) as i64).collect();
 
         // Run stage 0 locally (synchronous GPU compute).
-        let in_ids = self.stage0_inputs.get("input_ids").unwrap().clone();
         let attn_name = self.stage0_inputs.get("attention_mask").unwrap().clone();
         let pos_name = self.stage0_inputs.get("position_ids").unwrap().clone();
         let beam_name = self.stage0_inputs.get("beam_idx").unwrap().clone();
         let _ts = std::time::Instant::now();
-        self.stage0
-            .set_input(&in_ids, ShimDType::I64, &[1, n], &i64_to_bytes(input_ids))
-            .map_err(map_ov_err)?;
+        self.set_stage0_tokens(input_ids, &[])?;
         self.stage0
             .set_input(
                 &attn_name,
@@ -980,6 +1074,17 @@ impl DistributedMaskedReq {
     }
 
     pub fn feed(&mut self, input_ids: &[i64]) -> Result<(Vec<f32>, [usize; 3]), EngineError> {
+        self.feed_prompt(input_ids, &[])
+    }
+
+    /// [`Self::feed`] with each image's encoder rows spliced over the image
+    /// soft tokens of `input_ids` (a VLM tree's prompt; `images` is empty for
+    /// every other span, so image rows never reach a speculative span).
+    pub(crate) fn feed_prompt(
+        &mut self,
+        input_ids: &[i64],
+        images: &[Vec<f32>],
+    ) -> Result<(Vec<f32>, [usize; 3]), EngineError> {
         let n = input_ids.len();
         let total = self.cache_len + n;
         if total > self.valid_mask.len() {
@@ -994,14 +1099,11 @@ impl DistributedMaskedReq {
         let pos: Vec<i64> = (self.logical_pos as i64..(self.logical_pos + n) as i64).collect();
 
         // Run stage 0 locally.
-        let in_ids = self.stage0_inputs.get("input_ids").unwrap().clone();
         let attn_name = self.stage0_inputs.get("attention_mask").unwrap().clone();
         let pos_name = self.stage0_inputs.get("position_ids").unwrap().clone();
         let beam_name = self.stage0_inputs.get("beam_idx").unwrap().clone();
         let _ts = std::time::Instant::now();
-        self.stage0
-            .set_input(&in_ids, ShimDType::I64, &[1, n], &i64_to_bytes(input_ids))
-            .map_err(map_ov_err)?;
+        self.set_stage0_tokens(input_ids, images)?;
         self.stage0
             .set_input(
                 &attn_name,
@@ -1168,6 +1270,60 @@ impl DistributedMaskedReq {
         }
         self.logical_pos = self.logical_pos.saturating_sub(k);
     }
+
+    /// Whether stage 0 takes embeddings (a VLM tree), so image turns can run.
+    pub(crate) fn takes_images(&self) -> bool {
+        self.vision.is_some()
+    }
+
+    /// Set stage 0's token input for `ids`: the ids on a v5 tree; on a VLM
+    /// tree, their text-embedding rows with `images` spliced in.
+    fn set_stage0_tokens(&mut self, ids: &[i64], images: &[Vec<f32>]) -> Result<(), EngineError> {
+        let Some(vision) = self.vision.as_mut() else {
+            if !images.is_empty() {
+                return Err(EngineError::Backend(
+                    "image rows for a target whose stage 0 takes input_ids".into(),
+                ));
+            }
+            let in_ids = self.stage0_inputs.get("input_ids").unwrap();
+            return self
+                .stage0
+                .set_input(in_ids, ShimDType::I64, &[1, ids.len()], &i64_to_bytes(ids))
+                .map_err(map_ov_err);
+        };
+        let (mut rows, hidden) = vision.embed(ids)?;
+        let image = vision.frontend.image_token();
+        let spliced = splice_prompt_rows(&mut rows, hidden, ids, image, images)
+            .map_err(EngineError::Backend)?;
+        if spliced > 0 {
+            info!(
+                images = images.len(),
+                rows = spliced,
+                span = ids.len(),
+                "ov-dist-spec: image rows spliced into the target's stage 0 prefill"
+            );
+        }
+        let bytes: Vec<u8> = rows.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let in_embeds = self.stage0_inputs.get("inputs_embeds").unwrap();
+        self.stage0
+            .set_input(in_embeds, ShimDType::F32, &[1, ids.len(), hidden], &bytes)
+            .map_err(map_ov_err)
+    }
+}
+
+/// The target's logits must cover every fed position for verification; a
+/// head sliced to the last position (a VLM tree cut without `--all-logits`)
+/// would otherwise index out of bounds.
+fn check_verify_rows(logits_len: usize, vocab: usize, span: usize) -> Result<(), EngineError> {
+    if vocab == 0 || logits_len < span * vocab {
+        return Err(EngineError::Backend(format!(
+            "target returned {} logits rows for a {span}-token verify span; the last stage \
+             must emit logits for every position (re-cut a VLM tree with \
+             tools/vlm_surgery/cut_vlm_lm.py --all-logits)",
+            logits_len / vocab.max(1)
+        )));
+    }
+    Ok(())
 }
 
 // -------- spec_decode loop --------
@@ -1283,6 +1439,7 @@ pub fn spec_decode_greedy(
         let (t_logits, t_shape) = target.feed_recv_async(target_handle)?;
         t_target += _ts.elapsed();
         let v = t_shape[2];
+        check_verify_rows(t_logits.len(), v, verify.len())?;
         let mut t_greedy = Vec::with_capacity(verify.len());
         for i in 0..verify.len() {
             let row = &t_logits[i * v..(i + 1) * v];
@@ -1398,6 +1555,10 @@ struct ActiveSpec {
     stats: SpecDecodeStats,
     /// Whether we already emitted the first sampled token's chunk.
     initialized: bool,
+    /// Images this turn's prompt carries (VLM target). An image turn stays
+    /// out of the KV warm-resume cache: its key would be placeholder ids that
+    /// every image of one size shares.
+    images: usize,
 }
 
 pub struct OvDistSpecEngine {
@@ -1408,6 +1569,9 @@ pub struct OvDistSpecEngine {
     /// at the first token that matches ANY of these.
     eos_token_ids: Vec<u32>,
     k: usize,
+    /// The draft's vocabulary (its config.json), to refuse prompt ids it
+    /// cannot embed. `None` when unknown.
+    draft_vocab: Option<usize>,
     pending: Vec<GenerationTask>,
     active: Option<ActiveSpec>,
     /// Issue-34: opaque KV blob cache + a stable model id (the target pipeline dir) for the
@@ -1453,9 +1617,15 @@ impl Engine for OvDistSpecEngine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
-        // Draft and target both take ids and must see the same sequence; an
-        // image turn would need both to be VLMs with identical layouts.
-        cascadia_engine::refuse_media(&task, "ov-dist-spec")?;
+        // Only the target sees images: rank 0 encodes them and splices their
+        // rows into stage 0's embeddings, while the draft reads the expanded
+        // ids as text. A target whose stage 0 takes ids has no image path.
+        if !self.target.takes_images() {
+            cascadia_engine::refuse_media(
+                &task,
+                "ov-dist-spec (target tree without a `vision` block)",
+            )?;
+        }
         if self.pending.iter().any(|t| t.task_id == task.task_id)
             || self
                 .active
@@ -1534,15 +1704,61 @@ impl Engine for OvDistSpecEngine {
                 }
             }
             cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
+            // VLM target: expand each image placeholder into its soft-token run
+            // and encode the images (cached per tenant by content hash). The
+            // draft is fed the same expanded ids, image tokens as plain text.
+            let mut image_rows = Vec::new();
+            if !task.media.is_empty() {
+                let refuse = |reason: String| {
+                    warn!(task = %task.task_id, reason = %reason, "ov-dist-spec: image turn refused");
+                    let id = task.task_id.clone();
+                    vec![(id.clone(), Chunk::error(id, reason))]
+                };
+                if resume.is_some() {
+                    return Ok(refuse(
+                        "resume_unsupported: a resumed turn cannot carry images".into(),
+                    ));
+                }
+                let Some(vision) = self.target.vision.as_mut() else {
+                    return Ok(refuse(
+                        "this target tree takes no images (no `vision` block in \
+                         pipeline_config.json)"
+                            .into(),
+                    ));
+                };
+                let started = std::time::Instant::now();
+                match vision
+                    .frontend
+                    .prepare(&task.media, &prompt_ids, &task.tenant)
+                {
+                    Ok((ids, rows)) => {
+                        info!(
+                            task = %task.task_id,
+                            images = rows.len(),
+                            prompt = ids.len(),
+                            encode_ms = started.elapsed().as_millis() as u64,
+                            "ov-dist-spec: images encoded"
+                        );
+                        prompt_ids = ids;
+                        image_rows = rows;
+                    }
+                    Err(e) => return Ok(refuse(e)),
+                }
+            }
+            if let Err(e) = check_draft_ids(&prompt_ids, self.draft_vocab) {
+                let task_id = task.task_id.clone();
+                return Ok(vec![(task_id, Chunk::error(task.task_id, e))]);
+            }
             info!(
                 task = %task.task_id,
                 prompt_tokens = prompt_ids.len(),
+                images = image_rows.len(),
                 k = self.k,
                 "ov-dist-spec task active"
             );
 
             let task_id = task.task_id.clone();
-            match self.start_task(task, &prompt_ids) {
+            match self.start_task(task, &prompt_ids, image_rows) {
                 Ok(active) => self.active = Some(active),
                 Err(e) => {
                     warn!(task = %task_id, error = %e, "ov-dist-spec start failed");
@@ -1680,11 +1896,18 @@ impl OvDistSpecEngine {
         &mut self,
         task: GenerationTask,
         prompt_ids: &[i64],
+        image_rows: Vec<Vec<f32>>,
     ) -> Result<ActiveSpec, EngineError> {
+        let images = image_rows.len();
         // Issue-34: warm-resume a cached strict prefix (restores draft+target+chain, all-or-nothing)
         // and feed only the suffix; else cold-reset + feed the full prompt. 0 on the default build.
+        // An image turn always prefills cold: its rows splice into the whole prompt.
         #[cfg(feature = "kv_coord")]
-        let warm_len = self.kv_try_warm_resume(&task.tenant, prompt_ids);
+        let warm_len = if images > 0 {
+            0
+        } else {
+            self.kv_try_warm_resume(&task.tenant, prompt_ids)
+        };
         #[cfg(not(feature = "kv_coord"))]
         let warm_len = 0usize;
         if warm_len == 0 {
@@ -1697,7 +1920,10 @@ impl OvDistSpecEngine {
         self.target.t_wire = std::time::Duration::ZERO;
 
         let feed_ids = &prompt_ids[warm_len..];
-        let (t_logits, t_shape) = self.target.feed(feed_ids)?;
+        // Target: embeddings with the image rows spliced (VLM tree) or ids.
+        // Draft: the same ids, image soft tokens included as ordinary tokens.
+        let (t_logits, t_shape) = self.target.feed_prompt(feed_ids, &image_rows)?;
+        drop(image_rows);
         self.draft.feed(feed_ids)?;
         let vocab = t_shape[2];
         let first = argmax(&t_logits[t_logits.len() - vocab..]) as i64;
@@ -1740,6 +1966,7 @@ impl OvDistSpecEngine {
             d_last_logit,
             stats: SpecDecodeStats::default(),
             initialized: false,
+            images,
         })
     }
 
@@ -1769,6 +1996,7 @@ impl OvDistSpecEngine {
         verify.extend_from_slice(&drafts);
         let (t_logits, t_shape) = self.target.feed(&verify)?;
         let v = t_shape[2];
+        check_verify_rows(t_logits.len(), v, verify.len())?;
         let mut t_greedy = Vec::with_capacity(verify.len());
         for i in 0..verify.len() {
             t_greedy.push(argmax(&t_logits[i * v..(i + 1) * v]) as i64);
@@ -1869,13 +2097,21 @@ impl OvDistSpecEngine {
                 .collect();
             // H.1b R2: this turn's namespace, read off THIS task's own state — never off a
             // plane-asserted value, which describes a pulled entry, not this turn.
-            self.kv_capture(&active.task.tenant, tokens);
+            if active.images == 0 {
+                self.kv_capture(&active.task.tenant, tokens);
+            } else {
+                info!(task = %active.task.task_id, images = active.images,
+                    "ov-dist-spec: image turn kept out of the KV cache");
+            }
         }
         info!(
             task = %active.task.task_id,
             tokens = active.out.len(),
             steps = active.stats.n_steps,
+            drafted = active.stats.total_drafts,
+            accepted = active.stats.total_accepted,
             accept = active.stats.accept_rate(),
+            images = active.images,
             "ov-dist-spec done"
         );
         // Surface every id this round appended, in order — including a
@@ -1951,6 +2187,9 @@ pub struct OvDistSpecBuilder {
     tokenizer: Option<Arc<Tokenizer>>,
     eos_token_ids: Vec<u32>,
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
+    /// VLM target tree: rank 0's text embedding table + image encoder.
+    vision: Option<crate::runtime::VisionFirst>,
+    draft_vocab: Option<usize>,
 }
 
 impl OvDistSpecBuilder {
@@ -1976,6 +2215,8 @@ impl OvDistSpecBuilder {
             tokenizer: None,
             eos_token_ids: Vec::new(),
             downstream: None,
+            vision: None,
+            draft_vocab: None,
         }
     }
 
@@ -2065,6 +2306,41 @@ impl Builder for OvDistSpecBuilder {
                 "driver requires v5 shards (canonical inputs)".into(),
             ));
         }
+        if let Some(v) = pipeline_cfg.vision.as_ref() {
+            let family = crate::runtime::vision_family(v, pipeline_cfg.export_version.as_deref())?;
+            // The FORWARD wire carries hidden states and the mask only, and the
+            // draft reads the prompt as plain ids: families that attend
+            // bidirectionally inside an image (token_type_ids) cannot ride it.
+            if family != crate::runtime::VisionFamily::Pixtral || v.token_type_ids.unwrap_or(false)
+            {
+                return Err(EngineError::ShardRejected(format!(
+                    "ov-dist-spec takes a VLM target only for Pixtral / Mistral 3 trees \
+                     (tools/vlm_surgery/cut_vlm_lm.py --family pixtral|mistral3); this tree's \
+                     vision family is {family:?}{}",
+                    if v.token_type_ids.unwrap_or(false) {
+                        " with token_type_ids"
+                    } else {
+                        ""
+                    }
+                )));
+            }
+            if let Some(why) = pipeline_cfg
+                .stages
+                .last()
+                .and_then(last_stage_logits_refusal)
+            {
+                return Err(EngineError::ShardRejected(why));
+            }
+            let first = crate::runtime::VisionFirst::load(&self.pipeline_dir, v, family)?;
+            let msg = format!(
+                "vision target: rank 0 embeds every span and encodes images ({}); the draft \
+                 reads the expanded prompt as ids",
+                first.frontend.describe()
+            );
+            info!("ov-dist-spec: {msg}");
+            events.push(LoadProgress::message(msg));
+            self.vision = Some(first);
+        }
         let plugin = self.plugin();
 
         events.push(LoadProgress::message(
@@ -2101,7 +2377,21 @@ impl Builder for OvDistSpecBuilder {
             "compiling draft {}",
             self.draft_model_path
         )));
-        let draft_xml = std::path::Path::new(&self.draft_model_path).join("openvino_model.xml");
+        let draft_dir = std::path::Path::new(&self.draft_model_path);
+        self.draft_vocab = config_vocab(draft_dir);
+        let target_vocab =
+            config_vocab(&self.pipeline_dir.join("tokenizer")).or(config_vocab(&self.pipeline_dir));
+        if let (Some(d), Some(t)) = (self.draft_vocab, target_vocab) {
+            if d != t {
+                warn!(
+                    draft_vocab = d,
+                    target_vocab = t,
+                    "ov-dist-spec: draft and target vocabularies differ; prompt ids past the \
+                     draft's are refused, and acceptance suffers if the tokenizers disagree"
+                );
+            }
+        }
+        let draft_xml = draft_dir.join("openvino_model.xml");
         let draft = OvRuntime::compile(
             draft_xml.to_str().unwrap_or_default(),
             &self.draft_device,
@@ -2119,8 +2409,12 @@ impl Builder for OvDistSpecBuilder {
         let draft = self.draft.ok_or(EngineError::NotLoaded)?;
         let tokenizer = self.tokenizer.ok_or(EngineError::NotLoaded)?;
         let downstream = self.downstream.ok_or(EngineError::NotConnected)?;
-        let target =
-            DistributedMaskedReq::new(stage0, downstream, tokio::runtime::Handle::current())?;
+        let target = DistributedMaskedReq::with_vision(
+            stage0,
+            downstream,
+            tokio::runtime::Handle::current(),
+            self.vision,
+        )?;
         let masked_draft = MaskedReq::new(draft)?;
         Ok(Box::new(OvDistSpecEngine {
             #[cfg(feature = "kv_coord")]
@@ -2130,6 +2424,7 @@ impl Builder for OvDistSpecBuilder {
             tokenizer,
             eos_token_ids: self.eos_token_ids.clone(),
             k: self.k as usize,
+            draft_vocab: self.draft_vocab,
             pending: Vec::new(),
             active: None,
             #[cfg(feature = "kv_coord")]
@@ -2797,6 +3092,15 @@ impl Builder for OvDistSpecWorkerBuilder {
                 self.rank
             )));
         }
+        if let Some(why) = is_last
+            .then(|| last_stage_logits_refusal(&stage_cfg))
+            .flatten()
+        {
+            return Err(EngineError::ShardRejected(format!(
+                "rank {}: {why}",
+                self.rank
+            )));
+        }
         if stage_cfg
             .export_version
             .as_deref()
@@ -3316,6 +3620,104 @@ fn lookup_eos(model_dir: &std::path::Path) -> Vec<u32> {
 mod tests {
     use super::*;
     use cascadia_transport::{ActivationClient, ActivationServer};
+
+    const IMG: i64 = 10;
+
+    /// Text rows `[ids.len(), 2]` whose values encode the id, so a test can
+    /// tell an untouched row from a spliced one.
+    fn text_rows(ids: &[i64]) -> Vec<f32> {
+        ids.iter().flat_map(|&t| [t as f32, -(t as f32)]).collect()
+    }
+
+    #[test]
+    fn prompt_span_splices_image_rows_in_order() {
+        let ids = [1, IMG, IMG, 5, IMG, 2];
+        let mut rows = text_rows(&ids);
+        let images = vec![vec![100.0, 101.0, 102.0, 103.0], vec![200.0, 201.0]];
+        assert_eq!(splice_prompt_rows(&mut rows, 2, &ids, IMG, &images), Ok(3));
+        assert_eq!(
+            rows,
+            vec![1.0, -1.0, 100.0, 101.0, 102.0, 103.0, 5.0, -5.0, 200.0, 201.0, 2.0, -2.0]
+        );
+    }
+
+    #[test]
+    fn speculative_span_keeps_text_rows_even_on_the_image_id() {
+        // A drafted/accepted span carries no images: a draft that proposes the
+        // image token id embeds it through the text table like any token.
+        let ids = [IMG, 7];
+        let mut rows = text_rows(&ids);
+        assert_eq!(splice_prompt_rows(&mut rows, 2, &ids, IMG, &[]), Ok(0));
+        assert_eq!(rows, text_rows(&ids));
+    }
+
+    #[test]
+    fn image_row_count_must_match_the_placeholders() {
+        let ids = [1, IMG, IMG];
+        let mut rows = text_rows(&ids);
+        let err = splice_prompt_rows(&mut rows, 2, &ids, IMG, &[vec![9.0, 9.0]]).unwrap_err();
+        assert!(err.contains("2 image rows"), "{err}");
+    }
+
+    #[test]
+    fn draft_is_fed_ids_it_can_embed() {
+        // The draft reads the expanded prompt (image soft tokens included).
+        assert!(check_draft_ids(&[1, IMG, IMG, 12, 2], Some(131072)).is_ok());
+        assert!(check_draft_ids(&[1, 131072], Some(131072)).is_err());
+        assert!(check_draft_ids(&[-1], Some(8)).is_err());
+        assert!(check_draft_ids(&[1 << 40], None).is_ok());
+    }
+
+    #[test]
+    fn last_stage_must_emit_every_position() {
+        let cfg = |logits: Option<&str>, ver: Option<&str>| StageConfig {
+            has_head: true,
+            logits: logits.map(str::to_string),
+            export_version: ver.map(str::to_string),
+            ..Default::default()
+        };
+        assert!(last_stage_logits_refusal(&cfg(Some("all"), Some(VLM_CUT_EXPORT))).is_none());
+        assert!(last_stage_logits_refusal(&cfg(Some("last"), Some(VLM_CUT_EXPORT))).is_some());
+        // A cut from before --all-logits always sliced the head.
+        let why = last_stage_logits_refusal(&cfg(None, Some(VLM_CUT_EXPORT))).unwrap();
+        assert!(why.contains("--all-logits"), "{why}");
+        // export_shards.py v5 shards: full logits, no field.
+        assert!(last_stage_logits_refusal(&cfg(None, Some("v5_canonical_inputs"))).is_none());
+        assert!(last_stage_logits_refusal(&cfg(None, None)).is_none());
+    }
+
+    #[test]
+    fn verify_needs_a_logits_row_per_fed_position() {
+        assert!(check_verify_rows(5 * 32, 32, 5).is_ok());
+        let err = check_verify_rows(32, 32, 5).unwrap_err().to_string();
+        assert!(err.contains("1 logits rows for a 5-token"), "{err}");
+        assert!(check_verify_rows(0, 0, 1).is_err());
+    }
+
+    #[test]
+    fn reads_a_cut_vlm_pipeline_config() {
+        let cfg: PipelineConfig = serde_json::from_str(
+            r#"{"model_id":"pixtral-12b-int4-ov","num_stages":2,"export_version":"vlm_lm_surgery_v1",
+                "stages":[{"stage":0,"has_embed":true,"has_head":false},
+                          {"stage":1,"has_embed":false,"has_head":true,"logits":"all",
+                           "export_version":"vlm_lm_surgery_v1"}],
+                "vision":{"family":"pixtral","text_embeddings":"openvino_text_embeddings_model.xml",
+                          "vision_embeddings":"openvino_vision_embeddings_model.xml",
+                          "token_type_ids":false,"image_token_id":10}}"#,
+        )
+        .unwrap();
+        let v = cfg.vision.as_ref().unwrap();
+        assert_eq!(
+            crate::runtime::vision_family(v, cfg.export_version.as_deref()).unwrap(),
+            crate::runtime::VisionFamily::Pixtral
+        );
+        assert!(last_stage_logits_refusal(cfg.stages.last().unwrap()).is_none());
+        // A v5 shard's pipeline_config (no stages / vision) still parses.
+        let v5: PipelineConfig =
+            serde_json::from_str(r#"{"model_id":"m","export_version":"v5_canonical_inputs"}"#)
+                .unwrap();
+        assert!(v5.vision.is_none() && v5.stages.is_empty());
+    }
 
     /// `decode_delta` used to remember a byte LENGTH and slice `full[len..]`.
     /// Its only guard was `full.len() <= last_text_len`, which catches a decode
