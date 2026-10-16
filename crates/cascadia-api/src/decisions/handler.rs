@@ -313,7 +313,9 @@ mod tests {
 
     #[test]
     fn engine_joint_input_refusal_is_413_not_503() {
-        let e = engine_failure("decision_too_long: joint readout of 13108 tokens exceeds 13107");
+        let e = engine_failure(
+            "decision_too_long: joint readout of 10241 tokens exceeds 10240 at width 8192",
+        );
         assert!(matches!(e, DecisionError::TooLong(_)), "{e:?}");
         assert_eq!(e.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
         assert!(matches!(

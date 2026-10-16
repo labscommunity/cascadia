@@ -1508,7 +1508,9 @@ impl Runtime {
         Ok(v)
     }
 
-    /// Bind input by name. `data` must be `product(shape) * dtype.bytes_per_element` bytes.
+    /// Bind input by name. `data` must be `product(shape) * dtype.bytes_per_element` bytes, at
+    /// most 320 MiB (`MAX_TENSOR_BYTES` in cpp/shim.cpp; mirrored as
+    /// `cascadia_types::MAX_HEAD_INPUT_BYTES`).
     pub fn set_input(
         &mut self,
         name: &str,

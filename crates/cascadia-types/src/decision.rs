@@ -14,37 +14,41 @@ pub const MAX_JOINT_QUESTIONS: usize = 256;
 /// (pipeline ranks other than 0 never read `max_position_embeddings`).
 pub const MAX_DECISION_PROMPT: usize = 131_072;
 /// Prompt-length bound for a joint (Clef) readout, Clef's training `max_length`. The effective
-/// bound also depends on the model width: see [`joint_prompt_cap`] (16,384 at Clef-flash's 4096,
-/// about 13,107 at Clef-27B's 5120).
+/// bound also depends on the model width: see [`joint_prompt_cap`] (16,384 for both Clef-flash's
+/// 4096 and Clef-27B's 5120; only a wider tree is tightened).
 ///
 /// Memory: the joint head reads EVERY final-hidden row, and `run_head` hands OpenVINO a dense
 /// `[R, T]` f32 span mask (R = questions + options). Per pass the head-owning process holds the
 /// collected rows (`T * hidden * 4` bytes), OpenVINO's copy of them, and the mask (`R * T * 4`)
 /// plus OpenVINO's copy; the mask buffer is freed before the rows are copied, so the transient
 /// peak is `rows + max(2 * mask, mask + rows)`. [`joint_inputs_fit`] holds every input to
-/// [`MAX_HEAD_INPUT_BYTES`], so that peak is at most 3 x 256 MiB (~0.8 GB), checked before any
+/// [`MAX_HEAD_INPUT_BYTES`], so that peak is at most 3 x 320 MiB (~0.94 GiB), checked before any
 /// allocation or prefill, for HTTP and peer readouts alike. OpenVINO keeps its input copies
 /// until the next joint pass.
 pub const MAX_JOINT_PROMPT: usize = 16_384;
 
 /// Largest input tensor the native shim accepts: `MAX_TENSOR_BYTES` in
-/// crates/cascadia-ov-genai-shim/cpp/shim.cpp:129 (`cascadia_runtime_set_input` refuses anything
+/// crates/cascadia-ov-genai-shim/cpp/shim.cpp (`cascadia_runtime_set_input` refuses anything
 /// larger). Mirrored here so a joint readout that would overflow it is refused up front, as a
-/// too-long request, instead of failing inside the shim after a full prefill. Keep in sync.
-pub const MAX_HEAD_INPUT_BYTES: usize = 256 * 1024 * 1024;
+/// too-long request, instead of failing inside the shim after a full prefill; a test parses the
+/// C++ constant to keep the two equal. Sized to Clef-27B's joint `hidden` input at
+/// [`MAX_JOINT_PROMPT`]: [16384, 5120] f32 is exactly 320 MiB, with no slack (each input is
+/// checked on its own, and the others are smaller: lexical <= 80 MiB, span mask <= 272 MiB).
+pub const MAX_HEAD_INPUT_BYTES: usize = 320 * 1024 * 1024;
 
 /// Shortest prefix the engine's prefix cache stores: a snapshot under it is not worth the
 /// `get_state_blob` copy. Shared so the API never counts a reuse discount the cache cannot give.
 pub const MIN_PREFIX_TOKENS: usize = 16;
 
 /// The joint prompt bound at model width `hidden`: [`MAX_JOINT_PROMPT`], tightened so the head's
-/// `hidden` input (`[T, hidden]` f32) fits [`MAX_HEAD_INPUT_BYTES`]. 4096 wide (Clef-flash):
-/// 16,384 (unaffected); 5120 wide (Clef-27B): 13,107.
+/// `hidden` input (`[T, hidden]` f32) fits [`MAX_HEAD_INPUT_BYTES`]. 4096 wide (Clef-flash) and
+/// 5120 wide (Clef-27B): 16,384; a wider tree is tightened (8192 wide: 10,240).
 pub fn joint_prompt_cap(hidden: usize) -> usize {
     MAX_JOINT_PROMPT.min(MAX_HEAD_INPUT_BYTES / (4 * hidden.max(1)))
 }
 
-/// Longest joint prompt whose `[rows, T]` f32 span mask fits [`MAX_HEAD_INPUT_BYTES`].
+/// Longest joint prompt whose `[rows, T]` f32 span mask fits [`MAX_HEAD_INPUT_BYTES`]. At most
+/// 256 questions + 4096 options give 19,275, so today it never binds below [`MAX_JOINT_PROMPT`].
 pub fn joint_mask_prompt_cap(rows: usize) -> usize {
     MAX_HEAD_INPUT_BYTES / (4 * rows.max(1))
 }
@@ -272,26 +276,53 @@ mod tests {
 
     #[test]
     fn joint_prompt_cap_follows_the_shim_input_limit() {
-        // Clef-27B (5120 wide): 2^28 / (4 * 5120) = 13107.2 -> 13107 rows of hidden.
-        assert_eq!(joint_prompt_cap(5120), 13_107);
-        assert!(13_107 * 5120 * 4 <= MAX_HEAD_INPUT_BYTES);
-        assert!(13_108 * 5120 * 4 > MAX_HEAD_INPUT_BYTES);
-        // Clef-flash (4096 wide): exactly 256 MiB at 16384, so the training max_length stands.
+        // Clef-27B (5120 wide): [16384, 5120] f32 is exactly 320 MiB, the shim's limit, so the
+        // training max_length binds for both Clef models.
+        assert_eq!(MAX_JOINT_PROMPT * 5120 * 4, MAX_HEAD_INPUT_BYTES);
+        assert_eq!(joint_prompt_cap(5120), MAX_JOINT_PROMPT);
         assert_eq!(joint_prompt_cap(4096), MAX_JOINT_PROMPT);
-        assert_eq!(MAX_JOINT_PROMPT * 4096 * 4, MAX_HEAD_INPUT_BYTES);
         assert_eq!(joint_prompt_cap(0), MAX_JOINT_PROMPT);
+        // The bound still holds a wider model to the limit: 2^28 * 1.25 / (4 * 8192) = 10240.
+        assert_eq!(joint_prompt_cap(8192), 10_240);
+        assert_eq!(joint_prompt_cap(6144), 13_653);
+    }
+
+    #[test]
+    fn head_input_limit_mirrors_the_shim() {
+        // MAX_HEAD_INPUT_BYTES mirrors MAX_TENSOR_BYTES in shim.cpp (compiled into the same
+        // binary by build.rs): parse the C++ constant so the two can never drift apart.
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cascadia-ov-genai-shim/cpp/shim.cpp"
+        ));
+        let line = src
+            .lines()
+            .find(|l| l.contains("constexpr size_t MAX_TENSOR_BYTES ="))
+            .expect("shim.cpp declares MAX_TENSOR_BYTES");
+        let expr = line.split('=').nth(1).unwrap().split(';').next().unwrap();
+        let bytes: usize = expr
+            .split('*')
+            .map(|f| f.trim().parse::<usize>().expect("integer factor"))
+            .product();
+        assert_eq!(bytes, MAX_HEAD_INPUT_BYTES, "{line}");
+        let mib = format!("MAX_TENSOR_BYTES={}MiB", MAX_HEAD_INPUT_BYTES >> 20);
+        assert!(src.contains(&mib), "shim error text must say {mib}");
     }
 
     #[test]
     fn joint_mask_bound_is_rows_times_t() {
-        // 32 questions + 4096 options = 4128 spans: 2^26 / 4128 = 16256 tokens.
-        assert_eq!(joint_mask_prompt_cap(4128), 16_256);
-        assert!(joint_inputs_fit(16_256, 4128, 4096, 4096).is_ok());
-        let e = joint_inputs_fit(16_257, 4128, 4096, 4096).unwrap_err();
+        // At most 256 questions + 4096 options = 4352 spans: 320 MiB / (4 * 4352) = 19275, so
+        // the mask never binds below MAX_JOINT_PROMPT; it still bounds a larger row count.
+        assert_eq!(joint_mask_prompt_cap(4352), 19_275);
+        assert_eq!(joint_mask_prompt_cap(8192), 10_240);
+        assert!(joint_inputs_fit(10_240, 8192, 4096, 4096).is_ok());
+        let e = joint_inputs_fit(10_241, 8192, 4096, 4096).unwrap_err();
         assert!(e.contains("span mask"), "{e}");
-        assert!(joint_inputs_fit(13_107, 2, 1, 5120).is_ok());
-        let e = joint_inputs_fit(13_108, 2, 1, 5120).unwrap_err();
+        assert!(joint_inputs_fit(MAX_JOINT_PROMPT, 4352, 4096, 5120).is_ok());
+        let e = joint_inputs_fit(MAX_JOINT_PROMPT + 1, 2, 1, 5120).unwrap_err();
         assert!(e.contains("width 5120"), "{e}");
+        let e = joint_inputs_fit(10_241, 2, 1, 8192).unwrap_err();
+        assert!(e.contains("width 8192"), "{e}");
     }
 
     #[test]
