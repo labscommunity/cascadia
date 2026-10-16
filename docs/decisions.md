@@ -558,8 +558,8 @@ changes. Measured on an Intel Core Ultra 7 258V (Arc 140V iGPU), single box, def
 
 Every flip in these runs had a reference margin under 0.05, so no f32 override was needed. On the
 typed-decisions benchmark (400 cases, five questions each) the GPU served all three models with
-no errors at about 1.3–3.5 s per case (JEV-9B 3.3 s, against 34 s on the CPU), roughly ten times
-faster. GPU probabilities differ from the CPU's by up to about 0.16 on near-ties, so a caller that
+no errors. With the box otherwise idle, JEV-9B took 3.3 s per case against 34 s on the CPU, and
+Clef-flash 1.3 s; Kev-9B's median was 13 s, measured while another job shared the CPU. GPU probabilities differ from the CPU's by up to about 0.16 on near-ties, so a caller that
 compares raw probabilities across hosts should keep one device. The 27B models were validated on
 CPU only.
 
