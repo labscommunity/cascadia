@@ -703,8 +703,8 @@ minutes (Pixtral: ten), using 9-11 GB of process memory throughout and still gro
 when stopped; node free memory went from 28 to 17 GB. So Gemma 26B on these NPUs is not
 practical: eight such compiles for four stages, two stages per 32 GB node each holding a
 decode and a prefill compilation. The likely cost is the mixture-of-experts layers
-(128 experts per layer, all compiled for static shapes). Gemma 4 26B runs on CPU/GPU
-static trees (see above); on the NPU, Pixtral and other dense models are the fit.
+(128 experts per layer, all compiled for static shapes). Gemma 4 26B runs on CPU static
+and stateful trees (see above); on the NPU, Pixtral and other dense models are the fit.
 
 ## Mistral 3 on `ov-runtime` (2026-10-16)
 

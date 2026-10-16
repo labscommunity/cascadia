@@ -140,7 +140,7 @@ loads compiled blobs instead of recompiling, which takes about ten minutes per s
 Verified on the Lunar Lake NPU with Pixtral (one 12B stage per 32 GB node); a node
 needs RAM for both the decode and prefill IRs of every stage it holds. Gemma 4 26B-A4B
 is not practical on the NPU: one stage's decode IR had not compiled after 90 minutes
-(its mixture-of-experts layers); serve it from CPU/GPU static or stateful trees.
+(its mixture-of-experts layers); serve it from CPU static or stateful trees.
 
 ## Limits worth knowing
 
