@@ -1404,6 +1404,7 @@ fn vision_tree_media(engine: EngineKind, family: &str) -> Option<cascadia_api::M
         (EngineKind::OvRuntime | EngineKind::Gemma4, "gemma4") => {
             Some(cascadia_api::MediaConfig::gemma4_native())
         }
+        (EngineKind::OvRuntime, "gemma3") => Some(cascadia_api::MediaConfig::gemma3_native()),
         (EngineKind::OvRuntime | EngineKind::OvDistSpec, "pixtral" | "mistral3") => {
             Some(cascadia_api::MediaConfig::pixtral_native())
         }
@@ -3706,7 +3707,14 @@ mod tests {
             tag(EngineKind::OvDistSpec, "mistral3").as_deref(),
             Some("[IMG]")
         );
-        // dist-spec refuses Gemma 4 targets at load; gemma4 has no Pixtral path.
+        assert_eq!(
+            tag(EngineKind::OvRuntime, "gemma3").as_deref(),
+            Some("<start_of_image>")
+        );
+        // dist-spec refuses Gemma 3 / 4 targets at load; the gemma4 engine
+        // serves only its own family.
+        assert_eq!(tag(EngineKind::OvDistSpec, "gemma3"), None);
+        assert_eq!(tag(EngineKind::Gemma4, "gemma3"), None);
         assert_eq!(tag(EngineKind::OvDistSpec, "gemma4"), None);
         assert_eq!(tag(EngineKind::Gemma4, "pixtral"), None);
         assert_eq!(tag(EngineKind::OvDistSpec, "qwen35"), None);
