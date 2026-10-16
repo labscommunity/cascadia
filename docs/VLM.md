@@ -164,7 +164,8 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
 - Packed slots (`--packed-slots N`, continuous batching on static shards): build the
   packed IR per stage of the static tree with `python tools/packed_variant.py <stage dir>
   --slots N [--packed-seq S]`, then serve every rank with `--packed-slots N`.
-- **Gemma 4 on packed slots**: same two steps. `packed_variant.py` finds the stage's two
+- **Gemma 4 on packed slots** (26B-A4B: about 18 GB per packed stage at 288 rows, so one
+  stage per 32 GB node): same two steps. `packed_variant.py` finds the stage's two
   mask producers (sliding window and full attention), tells them apart from the tree's
   `config.json` `layer_types`, and gives each its own input (`attn_mask_sliding_4d`,
   `attn_mask_4d`); the runtime builds both masks, with each image open both ways. An
