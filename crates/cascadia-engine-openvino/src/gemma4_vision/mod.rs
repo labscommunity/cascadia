@@ -398,6 +398,7 @@ impl ImageFrontend {
         &mut self,
         media: &[cascadia_types::MediaInput],
         prompt_ids: &[i64],
+        tenant: &str,
     ) -> Result<(Vec<i64>, Vec<Vec<f32>>), String> {
         let mut rows = Vec::with_capacity(media.len());
         let mut counts = Vec::with_capacity(media.len());
@@ -411,7 +412,7 @@ impl ImageFrontend {
             if m.num_frames != 1 || m.pixels.len() != m.expected_len() {
                 return Err(format!("image {i}: malformed pixel buffer"));
             }
-            if let Some((emb, count)) = self.cache.get(&m.sha256) {
+            if let Some((emb, count)) = self.cache.get(tenant, &m.sha256) {
                 counts.push(count);
                 rows.push(emb);
                 from_cache += 1;
@@ -424,7 +425,7 @@ impl ImageFrontend {
                 .encode(&p)
                 .map_err(|e| format!("image {i}: {e}"))?;
             let count = p.soft_tokens(self.preprocess.pooling_kernel_size);
-            self.cache.put(m.sha256, &emb, count);
+            self.cache.put(tenant, m.sha256, &emb, count);
             counts.push(count);
             rows.push(emb);
         }
