@@ -120,8 +120,9 @@ pub(crate) async fn evaluate(
         ));
     }
     // Take the permit BEFORE tokenizing: encode() is CPU work proportional to the request.
+    // Decisions have their own pool, so a burst of them never refuses chat, nor chat them.
     // Counted like chat (SEC-5): a capacity refusal, the request total and the in-flight gauge.
-    let permit = match state.permits.clone().try_acquire_owned() {
+    let permit = match state.decision_permits.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
             crate::count_rejected("capacity");
@@ -240,7 +241,7 @@ pub(crate) async fn evaluate(
 
 /// Run tokenization work `f` off the async executor (it is CPU work proportional to the
 /// request), in one of the service's encode slots. At most `encode_slots` tokenizations run at
-/// once, whatever the request permits allow (each can hold a few hundred MB of tokenizer
+/// once, whatever the decision permits allow (each can hold a few hundred MB of tokenizer
 /// transients, P2-SEC-3); this waits rather than refusing, since the request already holds its
 /// permit. The closure keeps the slot and the request's permit (SEC-2), so an orphaned encode
 /// keeps both until it ends.
