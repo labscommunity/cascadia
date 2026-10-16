@@ -9774,6 +9774,8 @@ level={{ effort_map[eff] }}";
         thoughts: Arc<std::sync::Mutex<std::collections::VecDeque<Vec<u32>>>>,
         /// How the next System 2 task of its kind fails (once).
         fail: Arc<std::sync::Mutex<Option<Fail>>>,
+        /// The runner serving it, for [`Fail::Closed`].
+        runner: Arc<std::sync::Mutex<Option<std::sync::Weak<Runner>>>>,
     }
 
     /// A System 2 failure a [`ThinkEngine`] plays, as the hardware engines report one.
@@ -9784,8 +9786,12 @@ level={{ effort_map[eff] }}";
         /// The generation sends an error chunk after this many tokens (0: before the first),
         /// the way qwen36's `finalize_error` does after a failed decode.
         ErrorAfter(usize),
-        /// The generation is dropped after this many tokens without a final chunk.
+        /// The generation is dropped after this many tokens without a final chunk (the runner
+        /// then fails the stream with an error chunk).
         Vanish(usize),
+        /// The generation's stream ends (`None`) after this many tokens with no final chunk:
+        /// the task is tombstoned under it, as a cancel from elsewhere would.
+        Closed(usize),
         /// The read-back pass sends an error chunk.
         ReadBack,
     }
@@ -9882,6 +9888,13 @@ level={{ effort_map[eff] }}";
                 }
                 // Forgotten: no chunk ever again.
                 Some(Fail::Vanish(n)) if at == n => return Ok(Vec::new()),
+                Some(Fail::Closed(n)) if at == n => {
+                    let runner = self.s.runner.lock().unwrap().clone();
+                    if let Some(r) = runner.and_then(|w| w.upgrade()) {
+                        r.cancel(&id);
+                    }
+                    return Ok(Vec::new());
+                }
                 _ => {}
             }
             if let Some(d) = &task.decision {
@@ -10061,7 +10074,9 @@ level={{ effort_map[eff] }}";
             max_body_bytes: 1 << 20,
             ..Config::default()
         };
-        make_router_with_stats(Arc::new(runner), "mock-model", cfg, Default::default())
+        let runner = Arc::new(runner);
+        *s.runner.lock().unwrap() = Some(Arc::downgrade(&runner));
+        make_router_with_stats(runner, "mock-model", cfg, Default::default())
     }
 
     async fn think_app(s: &Thinker) -> Router {
@@ -10437,12 +10452,14 @@ level={{ effort_map[eff] }}";
     }
 
     /// Every way a System 2 task fails: its generation refused at submit, failing before its
-    /// first token, failing mid-stream, dropped with no final chunk; its read-back failing.
-    const S2_FAILURES: [Fail; 5] = [
+    /// first token, failing mid-stream, dropped with no final chunk, its stream closed with no
+    /// final chunk; its read-back failing.
+    const S2_FAILURES: [Fail; 6] = [
         Fail::Submit,
         Fail::ErrorAfter(0),
         Fail::ErrorAfter(2),
         Fail::Vanish(2),
+        Fail::Closed(2),
         Fail::ReadBack,
     ];
 
@@ -10480,13 +10497,12 @@ level={{ effort_map[eff] }}";
     }
 
     #[tokio::test]
-    async fn a_failed_system2_task_answers_from_system_one_under_auto() {
+    async fn a_failed_system2_task_answers_from_system_one_under_auto_and_ends_system_2() {
         for fail in S2_FAILURES {
-            // u's System 2 fails; c's runs as usual after it.
+            // Both questions would think; u's System 2 fails first.
             let s = Thinker::failing(fail);
-            // A failed read-back answers before it takes logits: the third set is c's.
             s.queue(
-                vec![vec![0.0, -1.0], vec![0.0, -1.0, -2.0], ln(&[0.1, 0.1, 0.8])],
+                vec![vec![0.0, -1.0], vec![0.0, -1.0, -2.0]],
                 vec![ids("Hmm."), ids("ok")],
             );
             let (status, v, _) = promptly(post_decisions(
@@ -10503,12 +10519,23 @@ level={{ effort_map[eff] }}";
                                    "threshold": 0.8, "budget": 50}),
                 "{fail:?}"
             );
+            // c submits nothing after the failure (a scrub that blocks would hold it): it
+            // answers from System 1 too.
             let c = &v["answers"]["c"];
-            assert_eq!(c["thinking"]["used"], true, "{fail:?}: {c}");
-            assert_eq!(c["choice"], "w", "{fail:?}: {c}");
-            // Tokens streamed before a failure count: u's two, then c's two.
-            if matches!(fail, Fail::ErrorAfter(2) | Fail::Vanish(2)) {
-                assert_eq!(v["usage"]["output_tokens"], 4, "{fail:?}: {v}");
+            assert!(close(&c["probabilities"]["x"], 0.6652), "{fail:?}: {c}");
+            assert_eq!(c["thinking"], u["thinking"], "{fail:?}: {c}");
+            let want = if matches!(fail, Fail::ReadBack) { 4 } else { 3 };
+            assert_eq!(
+                s.tasks().len(),
+                want,
+                "{fail:?}: S1 u, S1 c, think u (and read u), nothing after"
+            );
+            // Tokens streamed before a failure count.
+            if matches!(
+                fail,
+                Fail::ErrorAfter(2) | Fail::Vanish(2) | Fail::Closed(2)
+            ) {
+                assert_eq!(v["usage"]["output_tokens"], 2, "{fail:?}: {v}");
             }
 
             // The OpenAI route answers the same way.
