@@ -23,6 +23,7 @@ pub mod pixtral_vision;
 pub mod prefix_cache;
 pub mod qwen35_vision;
 pub mod qwen36;
+pub mod qwen_vl_vision;
 pub mod rotary;
 pub mod runtime;
 pub mod vision_kv;
