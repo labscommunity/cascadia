@@ -20,7 +20,9 @@ exposes two routes over the same core:
 Both routes run identical prompts through the same model; only the request and response shapes
 differ. Only `--engine qwen35` serves decisions. With any other engine a `decision.json` is ignored
 with a startup warning, and both routes answer 501. A `decision.json` that fails to load (bad JSON,
-missing `tokenizer.json`) is logged and decisions stay off; chat keeps working.
+missing `tokenizer.json`) is logged and decisions stay off; chat keeps working. So is one that is
+there but cannot be read, such as a dangling symlink or a directory: it logs `decision.json present
+but unusable`, never passes for a plain chat model.
 
 > **Security.** Like the rest of the HTTP API, these routes are plaintext and unauthenticated. See
 > [SECURITY.md](../SECURITY.md).
@@ -58,7 +60,9 @@ missing `tokenizer.json`) is logged and decisions stay off; chat keeps working.
   `role` counts as `"user"`).
   `input_image` parts are a 400: this server is text-only.
 - `questions[].name` is required, non-empty and unique. Answers come back in request order.
-- `choices[].value` is a string or a number; any other JSON type is a 400. Duplicate values are a
+- `choices[].value` is a string or a number; any other JSON type is a 400. Numbers are read
+  exactly, by the same reader as `/v1/systemone`: an integer keeps every digit at any size, and a
+  float is the correctly rounded double of its literal. Duplicate values are a
   400. Values are compared by their internal key, Python's `str()` for a number (see
   [Mapping notes](#mapping-notes)), so `2` and `"2"` count as the same value and are a 400 too.
 - `choices[].description` and `levels[].description` are optional.
@@ -112,7 +116,9 @@ Errors use OpenAI's envelope, which the OpenAI SDKs parse into typed exceptions:
 `type` is `invalid_request_error` for 400 and 413, and `server_error` for 501 and 503. A body that
 does not match the request schema is a 400 in this envelope too, never the framework's 422 text.
 An unknown or malformed content part is named, for example `unsupported content part type
-'input_file'` or `input_text parts need a string "text"`; any other schema mismatch (a missing
+'input_file'` (an unknown type is echoed up to 64 characters, then `…`) or `input_text parts need
+a string "text"`. A key repeated in the same object is a 400 (`invalid request body: duplicate
+field ...`), not last-one-wins; any other schema mismatch (a missing
 `questions`, an unknown question `type`) is `invalid request body: <parser message>`. A body that
 is not valid JSON (400), a missing `content-type: application/json` (415) or a body over
 `--api-max-body-mb` (413) keeps the framework's status and message, inside this envelope with
@@ -124,10 +130,11 @@ The OpenAI request is translated into the internal (SystemOne) form before the m
 
 - `predicate` becomes a yes/no question with no criteria.
 - `choice` becomes a choice with criteria `{value: description}` in request order. A number value
-  is keyed by Python's `str()` of the number (`2` → `"2"`, `1e5` → `"100000.0"`); a missing
-  description is `null`. A negative zero (`-0`, which the JSON parser cannot tell from `-0.0`)
-  is the integer `0`, keyed `"0"` as Python's `json.loads("-0")` is, so `0` and `-0` are
-  duplicates.
+  is keyed by Python's `str()` of the parsed number, exactly as `/v1/systemone` renders the same
+  literal (`2` → `"2"`, `1e5` → `"100000.0"`, `1e20` → `"1e+20"`, a 30-digit integer → all 30
+  digits); a missing description is `null`. `-0` is the integer `0`, keyed `"0"` as Python's
+  `json.loads("-0")` is, so `0` and `-0` are duplicates; `-0.0` is a float, keyed `"-0.0"`. The
+  answer echoes the value as sent, every digit included.
 - **Score levels are rendered as one text per level**, `"label: description"`, or just `"label"`
   when the description is missing or empty, before the codec sees them. This approximates the single-text
   levels the models were trained on; nothing in the reference implementations says which form
@@ -194,8 +201,10 @@ The server does not check `api_key`; the SDK only requires that one is set.
 - `images` and `videos` must be absent, `null` or empty (400 otherwise).
 - A list `state` is read differently per family, as by each reference. JEV reads its elements as
   message parts (serve_decide `_parts`), so an image part there (`{"image": ...}` or
-  `{"type": "image_url", ...}`) is a 400. Kev and Clef render list elements as plain data, so a
-  catalogue record with an `image` field is just text to them.
+  `{"type": "image_url", ...}`) is a 400, and so is a `{"type": "text"}` part without a string
+  `text` (`text parts in state need a string "text"`; serve_decide would fail on it). Kev and
+  Clef render list elements as plain data, so a catalogue record with an `image` field is just
+  text to them.
 
 ### Response
 
@@ -238,7 +247,7 @@ Both routes share these statuses.
 | Status | When |
 |---|---|
 | 200 | Every question answered. |
-| 400 | Validation: no questions or more than `max_questions`; an empty question name, or (OpenAI format) a duplicate question name or choice value; a choice with no options or more than the model allows; a score with fewer levels than the model allows (2 for JEV, 1 for Kev and Clef) or more; images; an image part in a list `state` (JEV); a request the tokenizer cannot encode; Clef's option cap (see [Limits](#limits)). |
+| 400 | Validation: no questions or more than `max_questions`; an empty question name, or (OpenAI format) a duplicate question name or choice value; a choice with no options or more than the model allows; a score with fewer levels than the model allows (2 for JEV, 1 for Kev and Clef) or more; images; an image part, or a text part without a string `text`, in a list `state` (JEV); a request the tokenizer cannot encode; Clef's option cap (see [Limits](#limits)). |
 | 413 | Too long: the state is more than `max_total_tokens × 8` bytes (checked before tokenizing); Kev's whole rendered text (state, instructions, options and levels) is more than `max_total_tokens × 8` bytes; Kev's rendered state is more than 524,288 bytes (65,536 × 8, checked before tokenizing); one Kev question's instructions and option texts render to more than 8 bytes per token the pass has left after the state (`max_tokens` minus the state's tokens, checked before tokenizing); Kev's state is more than 65,536 tokens (`SERVE_MAX_STATE`, `<state>` included) or reaches `max_tokens`; one pass is longer than `max_tokens` (JEV and Kev; Clef truncates the state instead); Clef's schema alone fills the joint pass, leaving no room for a non-empty state; the request's prefill work is more than `max_total_tokens` (JEV stops tokenizing at the first question that takes it over: `needs at least N`); a Kev request that needs the shared-state discount when the prefix cache can never hold that state (`this request needs N prefill tokens without prefix reuse (the shared prefix cannot fit the prefix cache); the per-request limit is M`, refused before any prefill once the engine knows the snapshot's size, which its warmup measures at startup; see [Limits](#limits) for when the first such request can still spend one pass); or the engine reports the prompt too long. |
 | 501 | The model serves no decisions: no `decision.json` (or one that fails its load checks; see the startup log), an engine other than `qwen35`, the engine has no decision head (`decision/` missing on the single box or the pipeline's last rank), the tree was exported without `--final-hidden` (Kev and Clef), or a pipeline rank cannot serve decision passes (an older build, rank 0 or the last rank without `config.json` `vocab_size`, or the last rank without `decision/`; a middle rank only relays and needs neither). Rank 0 refuses the pipeline cases before any prefill. |
 | 503 | The server is at capacity (`engine at capacity; retry after current requests complete`): every concurrency permit is taken, or a Kev pass that must resume its shared state from the prefix cache found the snapshot evicted by other requests (see [Limits](#limits)); retrying can succeed. Any other engine error is `decision engine error`, including non-finite logits or probabilities (never a 200 with `null`s). Decisions share the API's concurrency permits with chat requests. |
@@ -372,10 +381,9 @@ or Clef.
 Each model family has a codec that reproduces its reference implementation's prompt text exactly:
 key order, separators, and Python `str()` / `json.dumps` formatting.
 
-- **Numbers.** Floats in request JSON are parsed exactly and rendered like Python's `repr`
-  (`1e-05`, `1.0`, `0.1`), as the reference servers would print them. Integers outside the
-  i64/u64 range are the one known gap: they are rendered as floats, where Python would keep every
-  digit.
+- **Numbers.** Numbers in request JSON, on both routes, are parsed exactly and rendered as the
+  reference servers would print them: integers of any size with every digit, floats like Python's
+  `repr` (`1e-05`, `1.0`, `0.1`, `1e+20`).
 - **Caller text is sanitized.** Hugging Face tokenizers match special tokens inside plain text, so
   a state or option text containing `<|im_end|>` could otherwise forge the prompt's structure and
   steer the decision. The server rewrites every `<|name|>` sequence, and every other angle-bracket

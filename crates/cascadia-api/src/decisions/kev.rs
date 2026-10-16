@@ -125,7 +125,9 @@ impl Renderer {
         match v {
             OrderedValue::Null => Ok(()),
             OrderedValue::String(s) => self.push(s),
-            OrderedValue::Bool(_) | OrderedValue::Number(_) => self.push(&v.py_str()),
+            OrderedValue::Bool(_) | OrderedValue::Number(_) | OrderedValue::BigInt(_) => {
+                self.push(&v.py_str())
+            }
             OrderedValue::Array(a) => {
                 for (i, x) in a.iter().enumerate() {
                     if i > 0 {
@@ -423,6 +425,11 @@ mod tests {
                 0
             ),
             "z:\n  - 1\n  - 2.5\n  - p: False\n    q:\n      - True\n      - \na:\n  b:\n    c: 1e+20\n  d: \ne: 0.1\nf:\n"
+        );
+        // L9: an integer beyond u64 prints every digit, as Python's str(int) does.
+        assert_eq!(
+            render(&ov(r#"{"id": 123456789012345678901234567890}"#), 0),
+            "id: 123456789012345678901234567890"
         );
         assert_eq!(
             render(&ov(r#"[[1, [2, 3]], {"x": {"y": 1}}]"#), 0),
