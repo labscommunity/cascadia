@@ -316,6 +316,28 @@ async fn recv_decision_body<G: RawRecv>(g: &mut G, what: &str) -> Result<Vec<u8>
     Ok(body)
 }
 
+/// The one final chunk of a successful decision pass (single box and pipeline rank 0).
+fn decision_final_chunk(id: TaskId, prompt_tokens: u32, logits: Vec<f32>) -> (TaskId, Chunk) {
+    (
+        id.clone(),
+        Chunk::final_marker(id, "")
+            .with_prompt_tokens(prompt_tokens)
+            .with_finish_reason(FinishReason::Stop)
+            .with_decision_logits(logits),
+    )
+}
+
+/// A single-box head failure's reason. A coded refusal (`decision_unsupported: …`, …) passes
+/// through unprefixed, since the API maps it by prefix (501, 413, …); anything else is a head
+/// fault (a 503).
+fn head_failure_reason(e: String) -> String {
+    if e.starts_with("decision_") {
+        e
+    } else {
+        format!("decision head failed: {e}")
+    }
+}
+
 fn frame_header(kind: u32, epoch: u32, pos: u32) -> [u8; 12] {
     let mut h = [0u8; 12];
     h[0..4].copy_from_slice(&kind.to_be_bytes());
@@ -1299,7 +1321,9 @@ enum Late {
     Skip,
     /// The HELLO reply: the retried handshake waits for it.
     Await,
-    /// Untagged (CAPTURE_ACK carries epoch 0): it cannot be told from a later reply.
+    /// Untagged (CAPTURE_ACK carries epoch 0): it cannot be told from a later reply. Only the
+    /// kv_coord CAPTURE exchange uses it.
+    #[cfg_attr(not(feature = "kv_coord"), allow(dead_code))]
     Desync,
 }
 
@@ -1740,15 +1764,9 @@ impl Qwen36Engine {
                 let id = t.task_id.clone();
                 self.active = None;
                 self.reset_all();
-                vec![(
-                    id.clone(),
-                    Chunk::final_marker(id, "")
-                        .with_prompt_tokens(n)
-                        .with_finish_reason(FinishReason::Stop)
-                        .with_decision_logits(logits),
-                )]
+                vec![decision_final_chunk(id, n, logits)]
             }
-            Err(e) => self.finalize_error(format!("decision head failed: {e}")),
+            Err(e) => self.finalize_error(head_failure_reason(e)),
         }
     }
 
@@ -1859,9 +1877,14 @@ impl Qwen36Engine {
     /// skip late replies of earlier ones.
     fn link_ready(&self) -> EngineResult<bool> {
         match &self.down_link {
-            // HelloOwed resolves in the handshake retry, which always runs before a task does.
-            DownLink::Clean | DownLink::HelloOwed => Ok(false),
+            DownLink::Clean => Ok(false),
             DownLink::Owed => Ok(true),
+            // Only the handshake retry may run on a link whose HELLO reply is still owed: a
+            // tagged exchange would read that untagged reply as its own. Rank 0 always retries
+            // the handshake before a task, so this is refused, not reached.
+            DownLink::HelloOwed => Err(EngineError::Backend(
+                "qwen36 pipeline handshake reply still owed; retry the handshake first".into(),
+            )),
             DownLink::Desynced(why) => Err(EngineError::Backend(why.clone())),
         }
     }
@@ -2006,7 +2029,9 @@ impl Qwen36Engine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
-        self.link_ready()?;
+        if let DownLink::Desynced(why) = &self.down_link {
+            return Err(EngineError::Backend(why.clone()));
+        }
         // A HELLO that timed out is still answered (the peer was loading): read that reply.
         let resend = self.down_link != DownLink::HelloOwed;
         let h = self.handle()?;
@@ -2087,7 +2112,9 @@ impl Qwen36Engine {
     /// Rank 0: announce the active task's readout to the chain for the current epoch.
     fn decide_exchange(&mut self, d: &cascadia_types::DecisionReadout) -> EngineResult<()> {
         let epoch = self.epoch;
-        self.forward_decide_downstream(epoch, &crate::decision::encode_readout(d))
+        let body = crate::decision::encode_readout(d)
+            .map_err(|e| EngineError::Backend(format!("qwen36 pipeline DECIDE body: {e}")))?;
+        self.forward_decide_downstream(epoch, &body)
     }
 
     /// Rank 0 / middle: FRAME_DECIDE_RUN → FRAME_DECISION for `epoch`; returns the result body
@@ -2133,15 +2160,8 @@ impl Qwen36Engine {
                     return Vec::new();
                 };
                 let n = t.prompt_ids.len() as u32;
-                let id = t.task_id;
                 self.reset_all();
-                vec![(
-                    id.clone(),
-                    Chunk::final_marker(id, "")
-                        .with_prompt_tokens(n)
-                        .with_finish_reason(FinishReason::Stop)
-                        .with_decision_logits(logits),
-                )]
+                vec![decision_final_chunk(t.task_id, n, logits)]
             }
             Ok(Err(why)) => self.finalize_error(why),
             Err(e) => {
@@ -2235,6 +2255,8 @@ impl Qwen36Engine {
         // Take THIS frame's recipient (self.rank + 1), not "whatever was stashed for this epoch":
         // every rank of one pull shares the content epoch, so an epoch-only take returned the
         // last-stashed rank's tensors — wrong state for any chain deeper than 2 stages.
+        // A desynced link fails before the stashed blob is taken.
+        let drain = self.link_ready()?;
         let down_rank = (self.rank + 1) as u16;
         let blob = self
             .kv
@@ -2248,7 +2270,6 @@ impl Qwen36Engine {
                 "qwen36_restore_carry_downstream"
             );
         }
-        let drain = self.link_ready()?;
         let h = self.handle()?;
         let phase = ExchangePhase::new();
         let ph = &phase;
@@ -2806,7 +2827,11 @@ impl Qwen36Engine {
                             g.send_raw(&frame_header(FRAME_HELLO_ACK, 0, cap)).await
                         })
                         .map_err(map_wire)?;
-                        info!(caps = cap, "qwen36 pipeline handshake ok");
+                        info!(
+                            caps = cap,
+                            capture_v2 = self.chain_capture_v2,
+                            "qwen36 pipeline handshake ok"
+                        );
                     }
                     Some(reason) => {
                         warn!(reason = %reason, "qwen36 pipeline handshake mismatch; refusing to serve");
@@ -5676,6 +5701,149 @@ mod tests {
             .to_string();
         assert!(err.contains("desynced") && err.contains("restart"), "{err}");
         cascadia_transport::set_activation_timeout_secs(0);
+        rt.block_on(fake).unwrap();
+    }
+
+    #[test]
+    fn a_coded_head_refusal_keeps_its_code() {
+        // H23: the API maps `decision_*` reasons by prefix; a "decision head failed: " prefix
+        // turned a 501 (`decision_unsupported`) into a 503.
+        assert_eq!(
+            head_failure_reason("decision_unsupported: no head assets".into()),
+            "decision_unsupported: no head assets"
+        );
+        assert_eq!(
+            head_failure_reason("joint infer: boom".into()),
+            "decision head failed: joint infer: boom"
+        );
+        let mut e = bare_engine(1, "{}");
+        e.active = Some(ActiveTask {
+            decision: Some(cascadia_types::DecisionReadout {
+                prompt_ids: vec![1, 2, 3],
+                head: cascadia_types::ReadoutHead::Verbalizer { token_ids: vec![1] },
+                cache_prefix: None,
+                require_warm: false,
+                needs_snapshot: false,
+            }),
+            ..finalizable_task(4, 0)
+        });
+        let out = e.finish_decision();
+        assert_eq!(
+            out[0].1.error.as_deref(),
+            Some("decision_unsupported: no head assets")
+        );
+        assert!(e.active.is_none());
+    }
+
+    /// A RawRecv over a byte buffer that records every read size; a read past the end is short.
+    struct BufRecv {
+        data: std::collections::VecDeque<u8>,
+        reads: Vec<usize>,
+    }
+
+    impl BufRecv {
+        fn new(data: Vec<u8>) -> Self {
+            Self {
+                data: data.into(),
+                reads: Vec::new(),
+            }
+        }
+    }
+
+    impl RawRecv for BufRecv {
+        fn recv_raw(
+            &mut self,
+            n: usize,
+        ) -> impl std::future::Future<Output = TransportResult<Vec<u8>>> + Send {
+            self.reads.push(n);
+            let take = n.min(self.data.len());
+            std::future::ready(Ok(self.data.drain(..take).collect()))
+        }
+    }
+
+    #[test]
+    fn chunked_body_reads_drain_an_over_ceiling_body_to_stay_framed() {
+        // H25: an accepted body is read in <= MAX_RAW_BYTES chunks; an over-ceiling one is read
+        // to its end and discarded, so the next frame starts where it should.
+        let rt = pipe_rt();
+        let max = cascadia_transport::MAX_RAW_BYTES;
+        let n = 2 * max + 5;
+        let mut body = vec![7u8; n];
+        body.push(0xAB);
+        let mut g = BufRecv::new(body.clone());
+        let got = rt
+            .block_on(recv_body_chunked(&mut g, n, n, "body"))
+            .unwrap();
+        assert_eq!(got, body[..n]);
+        assert_eq!(g.reads, vec![max, max, 5]);
+        let mut g = BufRecv::new(body);
+        let err = rt
+            .block_on(recv_body_chunked(&mut g, n, n - 1, "body"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("drained to stay framed"), "{err}");
+        assert_eq!(g.reads, vec![max, max, 5]);
+        assert_eq!(g.data, [0xAB], "the next frame is untouched");
+        // A short read (the peer closed mid-body) is a closed socket, not a short body.
+        let mut g = BufRecv::new(vec![1, 2, 3]);
+        assert!(matches!(
+            rt.block_on(recv_body_chunked(&mut g, 4, 4, "body")),
+            Err(TransportError::SocketClosed)
+        ));
+    }
+
+    #[test]
+    fn decision_bodies_keep_their_length_prefix() {
+        // H25: recv_decision_body returns the body still framed (relays forward it verbatim).
+        let rt = pipe_rt();
+        let framed = crate::decision::encode_result(&Ok(vec![0.5]));
+        let mut wire = framed.clone();
+        wire.push(0xAB);
+        let mut g = BufRecv::new(wire);
+        let got = rt
+            .block_on(recv_decision_body(&mut g, "decision body"))
+            .unwrap();
+        assert_eq!(got, framed);
+        assert_eq!(g.data, [0xAB]);
+        // An over-ceiling length is drained, then refused.
+        let n = crate::decision::MAX_DECISION_BODY_BYTES + 1;
+        let mut wire = (n as u32).to_be_bytes().to_vec();
+        wire.resize(4 + n, 0);
+        wire.push(0xAB);
+        let mut g = BufRecv::new(wire);
+        assert!(rt
+            .block_on(recv_decision_body(&mut g, "decision body"))
+            .is_err());
+        assert_eq!(g.data, [0xAB]);
+        let mut g = BufRecv::new(vec![0, 0]);
+        assert!(matches!(
+            rt.block_on(recv_decision_body(&mut g, "decision body")),
+            Err(TransportError::SocketClosed)
+        ));
+    }
+
+    /// Task 27 M2: on a link whose HELLO reply is still owed, only the handshake retry may run;
+    /// a tagged exchange is refused before it writes anything.
+    #[test]
+    fn a_hello_owed_link_admits_only_the_handshake_retry() {
+        let rt = pipe_rt();
+        let (mut e, mut server) = pipe_rank0(&rt);
+        e.down_link = DownLink::HelloOwed;
+        e.epoch = 1;
+        let err = e.reset_exchange().expect_err("owed HELLO").to_string();
+        assert!(err.contains("handshake reply still owed"), "{err}");
+        let fake = rt.spawn(async move {
+            let s = &mut server;
+            // The late HELLO_ACK; the retry sends no second HELLO, so the next request is RESET.
+            s.send_raw(&frame_header(FRAME_HELLO_ACK, 0, 0))
+                .await
+                .unwrap();
+            fake_expect(s, FRAME_RESET, 1).await;
+            fake_ack(s, FRAME_RESET_ACK, 1).await;
+        });
+        assert_eq!(e.forward_hello_downstream(b"m").unwrap(), (None, 0));
+        assert_eq!(e.down_link, DownLink::Clean);
+        e.reset_exchange().expect("a clean link after the retry");
         rt.block_on(fake).unwrap();
     }
 }
