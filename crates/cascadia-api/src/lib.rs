@@ -43,8 +43,10 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_CONCURRENT: usize = 16;
 
 /// Default cap on concurrent decision requests (`/v1/decisions`, `/v1/systemone`), a pool of
-/// its own so decisions and chat never refuse each other. Like chat's, it bounds admission and
-/// queue depth, not parallelism: the engine still runs one pass at a time. Adjustable via
+/// its own so decisions and chat never take each other's permits: up to
+/// [`DEFAULT_MAX_CONCURRENT`] chat plus this many decision requests are admitted at once. Like
+/// chat's, it bounds admission and queue depth, not parallelism: the engine still runs one pass
+/// at a time. Adjustable via
 /// [`Config::max_concurrent_decisions`] (the CLI's `--max-decision-requests`).
 pub const DEFAULT_MAX_CONCURRENT_DECISIONS: usize = 16;
 
