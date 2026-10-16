@@ -778,8 +778,9 @@ unreachable.
 
 The `kv_coord` cache keys a captured turn (prompt plus reply) on its token ids, and a
 follow-up turn resumes from the longest cached strict prefix. Image soft tokens are one
-id repeated, the same for every image of one size, so `ov-runtime` and `gemma4` kept
-image turns out of the cache: every chat turn re-prefilled every earlier image.
+id repeated, the same for every image of one size, so `ov-runtime`, `gemma4` and the
+`qwen35` pipeline kept image turns out of the cache: every chat turn re-prefilled every
+earlier image.
 
 `vision_kv` builds the key instead: the prompt ids with each image's soft tokens
 replaced by `pad_cache_id(tenant, sha256, row)`, the ids the `qwen35` prefix cache
@@ -787,7 +788,10 @@ already uses (high bit set, so never a real token id; per row, so two images agr
 if their pixels do). Capture, lookup and the downstream CAPTURE/RESTORE epochs all use
 the key. A cached prefix whose KV depth falls strictly inside an image is refused (cold),
 and on a resume only the images past the prefix are spliced into the suffix prefill.
-Tenants namespace the stand-ins as they do the text cache.
+Tenants namespace the stand-ins as they do the text cache. `qwen35` keys on
+`VisionPrompt::cache_key`, the same ids; its image rows and M-RoPE positions are looked
+up by absolute index, so the suffix prefill needed no change (decode positions, index
+plus `rope_delta`, are what the next turn's prompt computes for those tokens).
 
 Verified with a three-turn chat per image, two same-size images in different colours
 (`sdk_vlm_kv.py`: A red square / blue circle, B green / yellow), greedy:
@@ -797,15 +801,24 @@ Verified with a three-turn chat per image, two same-size images in different col
 | Ministral-3-3B, `ov-runtime`, one stage | 11 s | 1.0 s, 0.9 s | 824 of 838, 840 of 850 |
 | Ministral-3-3B, `ov-runtime`, two machines | 13-16 s | 1.0 s, 0.9 s | same |
 | Gemma 4 E4B, `gemma4`, one stage | 13-14 s | 1.1-1.4 s, 0.9-1.0 s | 296 of 317, 318 of 335 |
+| Qwen3.6-35B-A3B, `qwen35`, two machines | 11-13 s | 1.4-1.5 s, 1.3 s | 235 of 260, 261 of 282 |
 
-All 18 answers are right. Conversation B's first turn misses (`n_entries` 1, A's entry
+All 24 answers are right. Conversation B's first turn misses (`n_entries` 1, A's entry
 present) and never resumes from A's KV. On two machines rank 1 captures each turn under
 the epoch rank 0 later restores. Gemma 4 E4B needs `enable_thinking: false` for this
 test: a reply cut off inside the thought channel re-renders differently, so the next
 turn misses (a cold reprefill, not a wrong answer).
 
-Still re-prefilled: static and packed shards (the cache is stateful-only), and `qwen36`
-staged turns (its M-RoPE positions for a resumed suffix are not wired).
+The single-box `qwen35` run (`tree-oss4-vision`, one process) also answers 6/6, with
+follow-ups at 3-6 s against 20-56 s cold, but from the local prefix cache: `kv_coord`
+misses every follow-up there, text-only turns included, because that tree's chat template
+re-renders an earlier reply differently from the tokens generated, so no whole-sequence
+key is a prefix of the next prompt. The prefix cache snapshots at the last
+`<|im_start|>` and is unaffected.
+
+Still re-prefilled: static and packed shards (the cache is stateful-only). A plane peer
+on another chain looks entries up by real token ids, so image entries are only resumed
+on the chain that captured them.
 
 ## Engines that do not take images (2026-10-15)
 
