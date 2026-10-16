@@ -60,7 +60,8 @@ def _mask_producer(mask, types, x, name, use_types, weight=-0.5):
     return out
 
 
-def toy_stage(producers: int, seed: int = 0, extra_types_use: bool = False, outputs=None):
+def toy_stage(producers: int, seed: int = 0, extra_types_use: bool = False, outputs=None,
+              grafted: bool = False):
     """Three attention layers over a static past of PAST tokens.
 
     `producers == 1`: one mask feeds every SDPA. `producers == 2`: layers 0, 1
@@ -70,7 +71,9 @@ def toy_stage(producers: int, seed: int = 0, extra_types_use: bool = False, outp
     """
     rng = np.random.default_rng(seed)
     x = ops.parameter([1, -1, HIDDEN], ov.Type.f32, name="inputs_embeds")
-    x.output(0).set_names({"inputs_embeds"})
+    # The Gemma surgery's stage 0 port is `grafted_inputs_embeds`, aliased.
+    x.output(0).set_names({"grafted_inputs_embeds", "inputs_embeds"} if grafted
+                          else {"inputs_embeds"})
     mask = ops.parameter([1, -1], ov.Type.i64, name="attention_mask")
     mask.output(0).set_names({"attention_mask"})
     pos = ops.parameter([1, -1], ov.Type.i64, name="position_ids")
@@ -129,7 +132,8 @@ F32 = {"INFERENCE_PRECISION_HINT": "f32"}
 
 def pinned(m, seq=1):
     """Pin the toy to the static decode shape, as static exports are."""
-    shapes = {"inputs_embeds": [1, seq, HIDDEN], "attention_mask": [1, PAST + seq],
+    embeds = next(i.get_any_name() for i in m.inputs if "inputs_embeds" in i.get_names())
+    shapes = {embeds: [1, seq, HIDDEN], "attention_mask": [1, PAST + seq],
               "position_ids": [1, seq]}
     if any(i.get_any_name() == "token_type_ids" for i in m.inputs):
         shapes["token_type_ids"] = [1, seq]
@@ -267,3 +271,37 @@ def test_write_packed_variant_records_mask_ports(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"layer_types": LAYER_TYPES}))
     with pytest.raises(RuntimeError, match="sliding_window"):
         pv.write_packed_variant(str(stage), slots=2, packed_seq=3)
+
+
+def test_gemma_embed_stage_without_hidden_size(tmp_path):
+    # Gemma 4 vision surgery stage 0: no hidden_size in stage_config, and its
+    # embedding port is `grafted_inputs_embeds` (alias `inputs_embeds`).
+    stage = tmp_path / "stage_0"
+    stage.mkdir()
+    m = pinned(toy_stage(2, grafted=True))
+    assert m.inputs[0].get_any_name() == "grafted_inputs_embeds"
+    ov.save_model(m, str(stage / "openvino_model.xml"), compress_to_fp16=False)
+    (stage / "stage_config.json").write_text(json.dumps({
+        "stateful": False, "has_embed": True, "static_seq": 1,
+        "static_context": PAST + 1, "layer_start": 0, "layer_end": 3,
+        "export_version": "gemma4_vision_surgery_v1"}))
+    (tmp_path / "config.json").write_text(json.dumps({
+        "layer_types": LAYER_TYPES, "sliding_window": 1024}))
+    assert pv.stage_hidden_size(m, {}, str(stage)) == HIDDEN
+    pv.write_packed_variant(str(stage), slots=2, packed_seq=3)
+    packed = ov.Core().read_model(str(stage / "openvino_packed_model.xml"))
+    port = next(i for i in packed.inputs if "inputs_embeds" in i.get_names())
+    assert list(port.get_shape()) == [1, 3, HIDDEN]
+
+
+def test_hidden_size_falls_back_to_the_tree_config(tmp_path):
+    stage = tmp_path / "stage_0"
+    stage.mkdir()
+    m = toy_stage(1)
+    # An embedding port without a static width: config.json decides.
+    x = ops.parameter([1, -1, -1], ov.Type.f32, name="inputs_embeds")
+    x.output(0).set_names({"inputs_embeds"})
+    dyn = ov.Model([ops.result(x)], [x], "dyn")
+    (tmp_path / "config.json").write_text(json.dumps({"text_config": {"hidden_size": 640}}))
+    assert pv.stage_hidden_size(dyn, {}, str(stage)) == 640
+    assert pv.stage_hidden_size(m, {"hidden_size": 12}, str(stage)) == 12

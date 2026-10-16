@@ -227,17 +227,23 @@ def build_packed_model(
         params = _rewire_masks(ov_model, sdpa, kinds, info)
     packed = ov.Model(ov_model.get_results(), params, "packed_slots")
 
-    names = {p.get_any_name() for p in packed.inputs}
+    # A port's canonical name may be an alias: the Gemma surgery's stage 0
+    # input is `grafted_inputs_embeds`, aliased `inputs_embeds`.
+    names = {n for p in packed.inputs for n in p.get_names()}
     # A VLM tree's stage 0 takes rank 0's embedding rows (`inputs_embeds`,
     # tools/vlm_surgery/static_variant.py) instead of ids.
     main_name = next(
         n for n in ("input_ids", "inputs_embeds", "hidden_states") if n in names
     )
+    if main_name != "input_ids" and not hidden_size:
+        raise RuntimeError(f"{main_name} input needs a hidden size and none was found")
     if has_embed and main_name == "hidden_states":
         raise RuntimeError("embed stage has no input_ids / inputs_embeds input")
     shape_map = {}
+    canon = ("input_ids", "inputs_embeds", "hidden_states", "position_ids", "token_type_ids")
     for p in packed.inputs:
-        name = p.get_any_name()
+        key = p.get_any_name()
+        name = next((c for c in canon if c in p.get_names()), key)
         ps = p.get_partial_shape()
         # A `--shared-prefill` IR leaves the query width dynamic; every port
         # below that has one is given its packed shape.
@@ -257,7 +263,7 @@ def build_packed_model(
             shape = [1, packed_seq]
         if shape is None:
             raise RuntimeError(f"stage input {name}{ps} is dynamic and has no packed shape")
-        shape_map[name] = ov.PartialShape(shape)
+        shape_map[key] = ov.PartialShape(shape)
     packed.reshape(shape_map)
     packed.validate_nodes_and_infer_types()
 
@@ -272,6 +278,32 @@ def build_packed_model(
             f"the NPU compiler will reject this IR: {bad}"
         )
     return packed, packed_context
+
+
+def stage_hidden_size(model, cfg: dict, stage_dir: str):
+    """Row width of the stage's embedding / hidden input.
+
+    `stage_config.hidden_size` when present; else the IR's `inputs_embeds` /
+    `hidden_states` port (found by any of its names: the Gemma surgery's
+    stage 0 port is `grafted_inputs_embeds`, aliased `inputs_embeds`); else
+    the tree's config.json (`hidden_size`, or `text_config.hidden_size`).
+    None on an id-fed stage that has none of these (it needs no width).
+    """
+    if cfg.get("hidden_size") is not None:
+        return int(cfg["hidden_size"])
+    for p in model.inputs:
+        if p.get_names() & {"inputs_embeds", "hidden_states"}:
+            dim = p.get_partial_shape()[2]
+            if dim.is_static:
+                return dim.get_length()
+    path = os.path.join(os.path.dirname(os.path.abspath(stage_dir)), "config.json")
+    if os.path.exists(path):
+        with open(path) as fh:
+            c = json.load(fh)
+        width = c.get("hidden_size") or (c.get("text_config") or {}).get("hidden_size")
+        if width:
+            return int(width)
+    return None
 
 
 def tree_layer_types(stage_dir: str):
@@ -303,12 +335,7 @@ def write_packed_variant(stage_dir: str, slots: int, packed_seq: int = None) -> 
     packed_seq = packed_seq or slots
     src = os.path.join(stage_dir, "openvino_model.xml")
     model = ov.Core().read_model(src)
-    hidden_size = cfg.get("hidden_size")
-    if hidden_size is None:
-        # Surgery trees (vlm_surgery) keep it in the IR, not stage_config.
-        for p in model.inputs:
-            if p.get_any_name() in ("inputs_embeds", "hidden_states"):
-                hidden_size = p.get_partial_shape()[2].get_length()
+    hidden_size = stage_hidden_size(model, cfg, stage_dir)
     layer_types, window = tree_layer_types(stage_dir)
     start, end = cfg.get("layer_start"), cfg.get("layer_end")
     info = {}
@@ -316,7 +343,7 @@ def write_packed_variant(stage_dir: str, slots: int, packed_seq: int = None) -> 
         model,
         packed_seq,
         bool(cfg.get("has_embed")),
-        int(hidden_size),
+        int(hidden_size) if hidden_size is not None else 0,
         layer_types=layer_types,
         layer_start=int(start or 0),
         num_layers=(int(end) - int(start)) if start is not None and end else None,
