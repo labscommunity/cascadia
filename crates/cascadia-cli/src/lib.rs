@@ -1580,6 +1580,12 @@ fn vision_tree_media(engine: EngineKind, family: &str) -> Option<cascadia_api::M
         (EngineKind::OvRuntime | EngineKind::OvDistSpec, "pixtral" | "mistral3") => {
             Some(cascadia_api::MediaConfig::pixtral_native())
         }
+        // Qwen2.5-VL / Qwen3-VL: Qwen's native tag, as the staged qwen35
+        // engine; rank 0 expands `<|image_pad|>`. ov-runtime only: dist-spec
+        // feeds 1-D positions and refuses these trees.
+        (EngineKind::OvRuntime, "qwen2_5_vl" | "qwen3_vl") => {
+            Some(cascadia_api::MediaConfig::qwen35_native())
+        }
         _ => None,
     }
 }
@@ -3944,6 +3950,17 @@ mod tests {
         assert_eq!(tag(EngineKind::OvDistSpec, "gemma4"), None);
         assert_eq!(tag(EngineKind::Gemma4, "pixtral"), None);
         assert_eq!(tag(EngineKind::OvDistSpec, "qwen35"), None);
+        let qwen = "<|vision_start|><|image_pad|><|vision_end|>";
+        assert_eq!(
+            tag(EngineKind::OvRuntime, "qwen2_5_vl").as_deref(),
+            Some(qwen)
+        );
+        assert_eq!(
+            tag(EngineKind::OvRuntime, "qwen3_vl").as_deref(),
+            Some(qwen)
+        );
+        assert_eq!(tag(EngineKind::OvDistSpec, "qwen2_5_vl"), None);
+        assert_eq!(tag(EngineKind::OvDistSpec, "qwen3_vl"), None);
     }
 
     #[test]
