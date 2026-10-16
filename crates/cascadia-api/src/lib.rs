@@ -3752,6 +3752,86 @@ mod tests {
         assert!(v["error"]["message"].is_string());
     }
 
+    /// L5: every response carries a unique `id` and the `usage` the core computed.
+    #[tokio::test]
+    async fn openai_response_has_id_and_usage() {
+        let oa = r#"{"input": "a b", "questions": [{"type": "predicate", "name": "u", "instructions": "x"}]}"#;
+        let so = r#"{"model": "m", "state": "a b", "questions": {"u": {"type": "noul", "instructions": "x"}}}"#;
+        let (status, a) = post_openai(make_decision_app().await, oa).await;
+        assert_eq!(status, StatusCode::OK, "{a}");
+        let (_, b) = post_openai(make_decision_app().await, oa).await;
+        let id = a["id"].as_str().unwrap();
+        assert!(id.starts_with("dec-"), "{id}");
+        assert_ne!(a["id"], b["id"], "ids must be unique per response");
+        let (_, s, _) = post_decisions(make_decision_app().await, so).await;
+        let input = a["usage"]["input_tokens"].as_u64().unwrap();
+        assert!(input > 0);
+        assert_eq!(input, s["usage"]["input_tokens"].as_u64().unwrap());
+        assert_eq!(a["usage"]["output_tokens"], 0);
+        assert_eq!(a["usage"]["total_tokens"].as_u64(), Some(input));
+    }
+
+    /// L8: a body the request schema rejects gets OpenAI's envelope, not the framework's 422 text.
+    #[tokio::test]
+    async fn openai_bad_content_parts_use_openai_error_shape() {
+        let q = r#""questions": [{"type": "predicate", "name": "u", "instructions": "x"}]"#;
+        let cases = [
+            (
+                format!(
+                    r#"{{"input": [{{"role": "user", "content": [{{"type": "input_file", "file_id": "f"}}]}}], {q}}}"#
+                ),
+                "unsupported content part type 'input_file'",
+            ),
+            (
+                format!(
+                    r#"{{"input": [{{"role": "user", "content": [{{"type": "input_text"}}]}}], {q}}}"#
+                ),
+                "input_text",
+            ),
+            (
+                format!(
+                    r#"{{"input": [{{"role": "user", "content": [{{"text": "x"}}]}}], {q}}}"#
+                ),
+                "type",
+            ),
+            // an unknown question type and plain malformed JSON get the envelope too
+            (
+                r#"{"input": "x", "questions": [{"type": "rank", "name": "u", "instructions": "x"}]}"#
+                    .to_string(),
+                "rank",
+            ),
+            (r#"{"input": "x", "#.to_string(), "JSON"),
+        ];
+        for (body, needle) in cases {
+            let (status, v) = post_openai(make_decision_app().await, &body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {v}");
+            assert_eq!(v["error"]["type"], "invalid_request_error", "{body}: {v}");
+            assert!(v["error"]["code"].is_null(), "{v}");
+            let m = v["error"]["message"].as_str().unwrap();
+            assert!(m.contains(needle), "{body}: {m}");
+        }
+        // the framework's other rejections keep their status, inside the envelope
+        let big = format!(r#"{{"input": "{}", {q}}}"#, "x".repeat(2 << 20));
+        let (status, v) = post_openai(make_decision_app().await, &big).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        let response = make_decision_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/decisions")
+                    .body(Body::from(format!(r#"{{"input": "x", {q}}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
     #[tokio::test]
     async fn openai_and_systemone_routes_agree() {
         let oa = r#"{"input": "a b", "questions": [{"type": "choice", "name": "team", "instructions": "who", "choices": [{"value": "billing", "description": "x"}, {"value": "tech", "description": "y"}]},
