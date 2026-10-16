@@ -7,6 +7,7 @@
         (--weights and --lora are required; the tree ships KEV/tokenizer.json, the one beside head.pt,
         not the Base checkpoint's; --tokenizer FILE overrides that for any family)
   clef: python tools/decision_export.py clef --base-ir STOCK_INT8_IR --weights CLEF_DIR --clef-dir CLEF_DIR --out TREE
+  any family: --max-tokens N sets decision.json max_tokens (default: resolve_max_tokens)
 
 The stage IRs come from export_qwen36_moe.run_export (one stage in memory at a time).
 The decision profile and head assets are written BEFORE the stage export, so the
@@ -31,7 +32,59 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "qwen36_surgery"))
 sys.path.insert(0, os.path.dirname(__file__))
 
 
+# Calibration bounds DecisionProfile::load refuses a profile outside of
+# (MIN_TEMPERATURE, MAX_TEMPERATURE, MAX_ABS_BIAS in crates/cascadia-api/src/decisions/profile.rs).
+MIN_TEMPERATURE = 1e-3
+MAX_TEMPERATURE = 1e3
+MAX_ABS_BIAS = 1e4
+# Pass-length caps the server clamps max_tokens to (crates/cascadia-types/src/decision.rs):
+# every decision pass, and Clef's joint pass. test_bounds_mirror_the_rust_constants pins all five.
+MAX_DECISION_PROMPT = 131_072
+MAX_JOINT_PROMPT = 16_384
+DEFAULT_MAX_TOKENS = {"jev": 32768, "kev": 73728, "clef": 16384}
+HARD_MAX_TOKENS = {"jev": ("MAX_DECISION_PROMPT", MAX_DECISION_PROMPT),
+                   "kev": ("MAX_DECISION_PROMPT", MAX_DECISION_PROMPT),
+                   "clef": ("MAX_JOINT_PROMPT", MAX_JOINT_PROMPT)}
+
+
+def resolve_max_tokens(family, requested, mpe, src="the checkpoint"):
+    """decision.json max_tokens: `requested` (--max-tokens) or the family default, the default
+    capped by the max_position_embeddings `mpe` that `src`/config.json records (None: not recorded). A
+    requested value above `mpe` or the family's server cap is refused (ValueError), never silently lowered."""
+    if requested is None:
+        return min(DEFAULT_MAX_TOKENS[family], mpe) if mpe else DEFAULT_MAX_TOKENS[family]
+    name, cap = HARD_MAX_TOKENS[family]
+    if requested > cap:
+        raise ValueError(f"--max-tokens {requested} exceeds {family}'s {cap} ({name} in "
+                         f"crates/cascadia-types/src/decision.rs; the server would clamp it)")
+    if mpe and requested > mpe:
+        raise ValueError(f"--max-tokens {requested} exceeds the max_position_embeddings {mpe} of {src}/config.json")
+    return requested
+
+
+def _in_bounds(v, lo, hi):
+    # serde reads a JSON number into f64, never a bool or string; NaN fails both comparisons
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and lo <= v <= hi
+
+
+def check_calibration(profile):
+    """Refuse a profile DecisionProfile::load would reject at startup: every JEV and Kev temperature
+    in [MIN_TEMPERATURE, MAX_TEMPERATURE], every JEV bias in [-MAX_ABS_BIAS, MAX_ABS_BIAS]."""
+    temps = [(f"jev.temperature.{k}", t) for k, t in (profile.get("jev") or {}).get("temperature", {}).items()]
+    if "kev" in profile:
+        temps.append(("kev.temperature", profile["kev"].get("temperature")))
+    for field, t in temps:
+        if not _in_bounds(t, MIN_TEMPERATURE, MAX_TEMPERATURE):
+            raise ValueError(f"{field} must be in [{MIN_TEMPERATURE:g}, {MAX_TEMPERATURE:g}] (the server "
+                             f"refuses the profile otherwise), got {t!r}")
+    for i, b in enumerate((profile.get("jev") or {}).get("bias", [])):
+        if not _in_bounds(b, -MAX_ABS_BIAS, MAX_ABS_BIAS):
+            raise ValueError(f"jev.bias[{i}] must be in [-{MAX_ABS_BIAS:g}, {MAX_ABS_BIAS:g}] (the server "
+                             f"refuses the profile otherwise), got {b!r}")
+
+
 def _write(out_dir, profile, head):
+    check_calibration(profile)
     out = Path(out_dir)
     (out / "decision").mkdir(parents=True, exist_ok=True)
     (out / "decision.json").write_text(json.dumps(profile, indent=1))
@@ -122,12 +175,16 @@ def write_kev_profile(head_pt, out_dir, max_tokens=73728, hidden=None):
             if w[key].shape[1] != hidden:
                 raise ValueError(f"{head_pt}: {key} has hidden dim {w[key].shape[1]} but the base IR's "
                                  f"hidden_size is {hidden}")
+    profile = {"family": "kev", "max_tokens": max_tokens, "kev": {"temperature": float(meta["temperature"])}}
+    try:
+        check_calibration(profile)  # before the pointer files, as the other head.pt checks
+    except ValueError as e:
+        raise ValueError(f"{head_pt}: {e}") from None
     d = Path(out_dir) / "decision"
     d.mkdir(parents=True, exist_ok=True)
     for key, fname in (("q.weight", "pointer_q_w"), ("q.bias", "pointer_q_b"), ("k.weight", "pointer_k_w"), ("k.bias", "pointer_k_b")):
         w[key].float().contiguous().numpy().astype("<f4").tofile(d / f"{fname}.f32")
-    _write(out_dir, {"family": "kev", "max_tokens": max_tokens, "kev": {"temperature": float(meta["temperature"])}},
-           {"kind": "pointer", "dp": int(dp)})
+    _write(out_dir, profile, {"kind": "pointer", "dp": int(dp)})
 
 
 def _lm_head_name(W, clef_dir):
@@ -147,6 +204,25 @@ def _lm_head_name(W, clef_dir):
 def _text_config(model_dir):
     cfg = json.loads((Path(model_dir) / "config.json").read_text())
     return cfg.get("text_config") or cfg
+
+
+def _max_position_embeddings(model_dir):
+    """The text config's max_position_embeddings, or None when model_dir has no config.json or it
+    records none."""
+    if not (Path(model_dir) / "config.json").exists():
+        return None
+    mpe = _text_config(model_dir).get("max_position_embeddings")
+    return int(mpe) if mpe is not None else None
+
+
+def _positive_int(s):
+    try:
+        n = int(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{s!r} is not an integer") from None
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {n}")
+    return n
 
 
 def write_clef_profile(clef_dir, out_dir, max_tokens=16384, chunk=8192):
@@ -189,6 +265,9 @@ def main():
     ap.add_argument("--clef-dir", default=None, help="clef: dir with joint_head.* and the checkpoint")
     ap.add_argument("--tokenizer", default=None,
                     help="tokenizer.json the tree ships instead of the --weights/IR one (kev default: the one beside --head-pt)")
+    ap.add_argument("--max-tokens", type=_positive_int, default=None,
+                    help="decision.json max_tokens, the longest pass (default: jev 32768, kev 73728, clef 16384, "
+                         "each capped by the checkpoint's max_position_embeddings; a larger N is refused)")
     a = ap.parse_args()
     need = {"jev": ("adapter_dir", "--adapter-dir"), "kev": ("head_pt", "--head-pt"), "clef": ("clef_dir", "--clef-dir")}
     attr, flag = need[a.family]
@@ -228,6 +307,14 @@ def main():
                  f"trained with (pass --tokenizer FILE)")
     # Only an explicit override reaches run_export; jev/clef keep its default tokenizer choice.
     tok_kw = {"tokenizer": tokenizer} if tokenizer is not None else {}
+    # The tree's window is the config.json run_export ships: the fine-tune's when --weights has one
+    # (clef's --weights defaults to --clef-dir), else the base IR's.
+    weights = a.weights or (a.clef_dir if a.family == "clef" else None)
+    src = weights if weights and (Path(weights) / "config.json").exists() else a.base_ir
+    try:
+        max_tokens = resolve_max_tokens(a.family, a.max_tokens, _max_position_embeddings(src), src)
+    except ValueError as e:
+        ap.error(str(e))
     from export_qwen36_moe import run_export
 
     # The decision assets below are written before run_export; drop any manifest from an
@@ -243,18 +330,15 @@ def main():
     if a.family == "jev":
         lora = a.lora or os.path.join(a.adapter_dir, "adapter_model.safetensors")
         cal = a.calibration or os.path.join(os.path.dirname(os.path.abspath(a.adapter_dir)), "calibration.json")
-        # run_export ships the fine-tune's config.json in the tree when --weights is given
-        src = a.weights if a.weights and (Path(a.weights) / "config.json").exists() else a.base_ir
-        mpe = _text_config(src).get("max_position_embeddings", 32768)
-        write_jev_profile(a.adapter_dir, cal, a.out, max_tokens=min(int(mpe), 32768))
+        write_jev_profile(a.adapter_dir, cal, a.out, max_tokens=max_tokens)
         run_export(a.base_ir, a.out, a.stages, False, a.layer_split, weights=a.weights, lora=lora,
                    lora_scale=a.lora_scale, final_hidden=False, **tok_kw)
     elif a.family == "kev":
-        write_kev_profile(a.head_pt, a.out, hidden=int(_text_config(a.base_ir)["hidden_size"]))
+        write_kev_profile(a.head_pt, a.out, hidden=int(_text_config(a.base_ir)["hidden_size"]), max_tokens=max_tokens)
         run_export(a.base_ir, a.out, a.stages, False, a.layer_split, weights=a.weights, lora=a.lora,
                    lora_scale=a.lora_scale, final_hidden=True, **tok_kw)
     else:
-        write_clef_profile(a.clef_dir, a.out)
+        write_clef_profile(a.clef_dir, a.out, max_tokens=max_tokens)
         run_export(a.base_ir, a.out, a.stages, False, a.layer_split, weights=a.weights or a.clef_dir,
                    lora=a.lora, lora_scale=a.lora_scale, final_hidden=True, **tok_kw)
     print(f"decision tree written: {a.out}")
