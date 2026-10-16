@@ -443,6 +443,10 @@ struct ActiveTask {
     /// the image tokens it carries).
     image_rows: Vec<f32>,
     image_rows_fed: usize,
+    /// The prompt's KV cache key (`vision_kv`); `None` keeps the turn out of
+    /// the cache.
+    #[cfg(feature = "kv_coord")]
+    kv_key: Option<Vec<i32>>,
     generated: Vec<i32>,
     last_text: String,
     prefilled: bool,
@@ -1050,7 +1054,11 @@ impl Gemma4Engine {
             cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
             // Vision trees: encode the images and expand each placeholder into
             // its framed soft-token run; stage 0 splices the rows.
-            let mut image_rows = Vec::new();
+            let mut image_rows: Vec<Vec<f32>> = Vec::new();
+            // The warm-resume key (`vision_kv`): image soft tokens stand for
+            // their image's hash. `None` keeps the turn out of the KV cache.
+            #[cfg(feature = "kv_coord")]
+            let mut kv_key: Option<(Vec<i32>, Option<crate::vision_kv::ImageSpans>)> = None;
             if !task.media.is_empty() {
                 let refuse = |reason: String| {
                     warn!(task = %task.task_id, reason = %reason, "gemma4: image turn refused");
@@ -1075,8 +1083,20 @@ impl Gemma4Engine {
                             encode_ms = started.elapsed().as_millis() as u64,
                             "gemma4: images encoded"
                         );
+                        #[cfg(feature = "kv_coord")]
+                        match crate::vision_kv::for_turn(
+                            &ids,
+                            frontend.tokens.image,
+                            &rows,
+                            &task.media,
+                            &task.tenant,
+                        ) {
+                            Ok((key, spans)) => kv_key = Some((key, Some(spans))),
+                            Err(e) => warn!(task = %task.task_id, reason = %e,
+                                "gemma4: no KV warm-resume key for this image turn"),
+                        }
                         prompt_ids = ids;
-                        image_rows = rows.concat();
+                        image_rows = rows;
                     }
                     Err(e) => return Ok(refuse(e)),
                 }
@@ -1085,14 +1105,30 @@ impl Gemma4Engine {
             // broadcast). Restore a cached strict-prefix blob and prefill only the suffix; else cold.
             #[cfg_attr(not(feature = "kv_coord"), allow(unused_mut))]
             let mut warm_prefix = 0usize;
-            // Never for a turn with images: blobs are keyed on token ids, and
-            // every image of one size has the same ids.
+            // A turn with images keys on its images' hashes (`vision_kv`), never
+            // on their placeholder ids, which every image of one size shares.
             #[cfg(feature = "kv_coord")]
-            if image_rows.is_empty() {
-                let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
-                if let Some((blob, len, plane_pulled)) =
-                    self.kv.take_warm(&task.tenant, &prompt_i32)
-                {
+            if task.media.is_empty() {
+                kv_key = Some((prompt_ids.iter().map(|&t| t as i32).collect(), None));
+            }
+            #[cfg(feature = "kv_coord")]
+            if let Some((prompt_i32, spans)) = &kv_key {
+                // A prefix that ends inside an image cannot resume: the
+                // prefill would feed only part of its rows.
+                let taken = self
+                    .kv
+                    .take_warm(&task.tenant, prompt_i32)
+                    .filter(|(blob, len, _)| {
+                        let depth = crate::kv_coordination::kv_seq_from_blob(blob)
+                            .map(|s| s.min(*len))
+                            .unwrap_or(*len);
+                        let splits = spans.as_ref().is_some_and(|sp| sp.splits(depth));
+                        if splits {
+                            info!(depth, "gemma4: cached prefix ends inside an image; cold");
+                        }
+                        !splits
+                    });
+                if let Some((blob, len, plane_pulled)) = taken {
                     // Restore must land on a CLEAN request: this model's `reset_state` leaves residue
                     // (shim.cpp), and set_state over the prior throwaway turn's live state corrupts the
                     // warm continuation + leaks into the next cold turn. Rebuild first, mark restored so
@@ -1171,6 +1207,20 @@ impl Gemma4Engine {
                     self.runtime.reset_state().map_err(map_ov_err)?;
                 }
             }
+            #[cfg(feature = "kv_coord")]
+            if warm_prefix > 0 {
+                // Images inside the resumed prefix are already in the KV.
+                if let Some((_, Some(spans))) = &kv_key {
+                    let before = image_rows.len();
+                    image_rows = spans.rows_from(warm_prefix, image_rows);
+                    info!(
+                        images_resumed = before - image_rows.len(),
+                        images_prefilled = image_rows.len(),
+                        "gemma4: image turn warm-resumed"
+                    );
+                }
+            }
+            let image_rows = image_rows.concat();
             self.position = warm_prefix as i64;
             info!(
                 task = %task.task_id,
@@ -1211,6 +1261,8 @@ impl Gemma4Engine {
                 prompt_ids,
                 image_rows,
                 image_rows_fed: 0,
+                #[cfg(feature = "kv_coord")]
+                kv_key: kv_key.map(|(k, _)| k),
                 generated: resume_seed,
                 last_text: resume_last_text,
                 prefilled: false,
@@ -1481,14 +1533,12 @@ impl Gemma4Engine {
             );
             // Issue-34: capture this stage's KV under (prompt + generated) for warm-pull. Best-effort
             // + gated. (Multi-stage CAPTURE broadcast added with the control protocol.)
-            // Not for a turn with images: its ids do not identify its KV.
+            // Keyed on `kv_key`, which names each image by its hash.
             #[cfg(feature = "kv_coord")]
-            if active.task.media.is_empty() {
+            if let Some(key) = active.kv_key.take() {
                 // Skip the resume seed: `prompt_ids` already carries those ids.
-                let full: Vec<i32> = active
-                    .prompt_ids
-                    .iter()
-                    .map(|&t| t as i32)
+                let full: Vec<i32> = key
+                    .into_iter()
                     .chain(
                         active
                             .generated
