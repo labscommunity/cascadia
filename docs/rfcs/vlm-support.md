@@ -936,6 +936,93 @@ The Ministral NPU run, compile included, took about ten minutes (`--ov-cache-dir
 a restart load the blobs). Not run on GPU: the staged multi-machine trees and the 26B /
 31B models, whose two stages per node already fill the shared memory on CPU.
 
+## Phi-3.5-vision and InternVL2 on `ov-runtime` (2026-10-16)
+
+Both were single-box only (`ov-genai`, 785 and 282 prompt tokens on the SDK check). Both
+have a Phi-3 text tower that takes `inputs_embeds` and attends causally, so they cut and
+serve like Pixtral: `cut_vlm_lm.py --family phi3_v | internvl_chat`, `token_type_ids`
+off, the wire `[lead] [hidden]`.
+
+**IR facts** (read from the published `.xml` files; no weights fetched):
+
+| Export | Vision IRs | Host work on rank 0 |
+|---|---|---|
+| `OpenVINO/Phi-3.5-vision-instruct-int4-ov` | `openvino_vision_embeddings_model.xml`: `pixel_values [N,3,336,336]` to `[N,576,1024]` (CLIP layer -2, class token dropped); `openvino_vision_projection_model.xml`: `input [1,T,4096]` to `[1,T,3072]` | HD transform, global view, 2x2 merge, crop tiling, `sub_GN` / `glb_GN` rows (in `config.json`) |
+| `OpenVINO/InternVL2-4B-int4-ov` | `openvino_vision_embeddings_model.xml`: `pixel_values [N,3,448,448]` to `[N,256,3072]` (InternViT, pixel shuffle and `mlp1` inside) | tiling and thumbnail only |
+
+Both language models take `inputs_embeds`, `attention_mask`, `position_ids`, `beam_idx`
+(64 KV states, 32 layers, `layers.N.input_layernorm` boundaries). Their rotary
+`inv_freq` is a constant `[1,48,1]` traced once; there is no switch to the su/longrope
+long factors past `original_max_position_embeddings` (4096) in the graph, so a cut
+serves them exactly as the export and GenAI do, HF-exact up to 4096 positions. The load
+log warns.
+
+**Phi-3.5-vision** (`phi3v_vision`; source: the export's `processing_phi3_v.py` and
+`modeling_phi3_v.py`):
+
+- `HD_transform`: transpose a portrait image, scale the long side to the largest
+  `k * 336` with `k * ceil(k / ratio) <= num_crops` (4), resize with Pillow bilinear
+  (torchvision's default on a PIL image; the shared resampler gained the filter), pad
+  the short side to whole 336-px crops with white, centred. The global view is
+  `F.interpolate(..., (336, 336), mode="bicubic")` on the normalised tensor (torch's CPU
+  kernel, ported in f32). The vision IR gets the global view, then the crops row-major;
+  the processor's zero padding to `num_crops + 1` views is skipped (unused rows).
+- `hd_feature_transform`: each 24x24 grid merged 2x2 into 12x12 rows of 4096, crops
+  tiled into one grid, every grid row closed by `sub_GN`, then `glb_GN`, then the global
+  view's 12 rows each closed by `sub_GN`; then the projection IR. An image is
+  `(crops + 1) * 144 + 1 + (crop rows + 1) * 12` tokens (757 for 448x448).
+- Prompt: `Phi3VProcessor` cuts the prompt at each `<|image_N|>` and tokenizes every
+  chunk on its own, so each chunk after an image starts with its own `<s>` (and the
+  tokenizer's `▁`); the soft tokens are negative ids embedded as id 0. Rank 0 does the
+  same through `Frontend::encode_prompt` (text-only prompts too, which gives them the
+  BOS the template lacks) and marks soft tokens with `<|image|>` (32044). The API writes
+  `<|image_N|>\n` (numbered from 1: `MediaConfig` placeholders take `{n}`), the model
+  card's and GenAI's form, and reserves `<|image_` and `<|image|>`.
+- The export's `generation_config.json` stops on `<|endoftext|>` only; the cut adds
+  `<|end|>`, the template's turn end (InternVL2's Phi-3 tower lists both).
+
+**InternVL2** (`internvl_vision`; source: the OpenGVLab/InternVL2-4B model card and
+`modeling_internvl_chat.py`): `dynamic_preprocess` picks the tile grid of at most
+`max_dynamic_patch` (12) tiles whose ratio is closest to the image's, visiting grids in
+Python's `sorted(set(...), key=area)` order (embedded for 1..12: ties in closeness
+depend on it), resizes with Pillow bicubic, cuts 448-px tiles row-major and adds a
+448x448 thumbnail when there is more than one; ImageNet normalisation. The prompt
+carries `<img><IMG_CONTEXT></img>\n` per image (three special tokens, so tokenizing it
+and widening `<IMG_CONTEXT>` to 256 per tile gives the ids of the string `chat`
+builds). The reference prompt is the export's chat template (which writes `<s>`), as
+Cascadia renders it, not `chat`'s Chinese system prompt; optimum's `preprocess_inputs`
+tokenizes that template again with a BOS, which doubles it.
+
+**Parity** (`tests/phi3v_vision_parity.rs`, `tests/internvl_vision_parity.rs`, fixtures
+from `tools/vlm_fixtures/gen_{phi3v,internvl}_fixtures.py` on the eight Pixtral fixture
+images, transformers 5.14.1, torch 2.14, Pillow 12.3): sizes, grids and token counts
+equal from size alone; Phi crops and InternVL tiles bit-identical; the Phi global view
+within one f32 ulp (torch's kernel fuses multiply-adds); the Phi feature assembly
+bit-identical to `hd_feature_transform` on synthetic features with the real separators;
+the prompt layouts reproduce the processors' ids. HF prompt tokens on the fixture
+prompts:
+
+| Model | One image (448x448) | Two images (640x360, 300x1000) |
+|---|---|---|
+| Phi-3.5-vision | 774 (757 image) | 1403 |
+| InternVL2-4B | 269 (256 + 2 framing) | 1809 (3 + 4 tiles) |
+
+The SDK check's 785 / 282 on `ov-genai` is the same 757 / 258 image tokens plus a
+question 11 tokens longer in both families, so the staged counts are expected to equal
+GenAI's there; not yet run on the cluster.
+
+**Paths.** Causal, so the static (`static_variant.py`) and packed paths take both under
+the Pixtral rules: the shared prefix stops at the first image token, the expanded length
+is computed from image sizes before any encode (a too-long prompt is refused at submit
+with no encoder work), the encode cache keys on (tenant, sha256), and `vision_kv` keys
+image turns on the soft-token runs. `ov-dist-spec` still refuses non-Pixtral targets.
+An InternVL2 image can take 13 tiles (3328 tokens) whatever its size, so packed slots
+need a region that holds one.
+
+**Not yet verified on the cluster:** the cut on the real language models (the toy tests
+cover the config layouts), the vision IR rows against `--run-ir` fixtures, and the SDK
+check across two machines.
+
 ## Engines that do not take images (2026-10-15)
 
 Every engine either serves images or refuses them with an OpenAI 400; none answers

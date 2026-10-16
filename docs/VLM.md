@@ -60,6 +60,8 @@ names the field.
 | Gemma 4 E2B / E4B | `gemma4` | 1+ machines | `tools/export_gemma4.py --vision DIR` |
 | Pixtral 12B | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family pixtral` |
 | Mistral 3 (Ministral-3, Mistral Small 3.1/3.2) | `ov-runtime` | 1+ machines | export with optimum-intel, then `tools/vlm_surgery/cut_vlm_lm.py --family mistral3` |
+| Phi-3.5-vision | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family phi3_v` on `OpenVINO/Phi-3.5-vision-instruct-int4-ov` |
+| InternVL2 (Phi-3 text tower, e.g. InternVL2-4B) | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family internvl_chat` on `OpenVINO/InternVL2-4B-int4-ov` |
 | Pixtral 12B target, Ministral-3-3B draft | `ov-dist-spec` | 2+ machines, stateful | `cut_vlm_lm.py --family pixtral --all-logits` for the target, `tools/vlm_surgery/make_text_draft.py` for the draft |
 
 Every other engine and tree refuses images with a `400`: `ov-dist-spec` on a v5 (text)
@@ -72,8 +74,10 @@ block. `ov-dist-spec` refuses a Gemma 4 target tree at load. Not supported:
 - **Llama 3.2 Vision** (`mllama`), refused at export: its text tower has cross-attention.
 - **MiniCPM-V 4.7**: GenAI 2026.4.1 does not know its model type (`minicpmv4_7`) and the
   engine fails to load.
-- Staged (multi-machine) serving of the GenAI-only families above: their trees are not
-  exported with the vision tower yet (`export_shards.py` notes when it drops one).
+- Staged (multi-machine) serving of the GenAI-only families above other than
+  Phi-3.5-vision and InternVL2: their trees are not exported with the vision tower yet
+  (`export_shards.py` notes when it drops one).
+- Phi-3.5-vision and InternVL2 on `ov-dist-spec`: it takes Pixtral targets only.
 
 ## Exporting
 
@@ -125,6 +129,34 @@ python tools/vlm_surgery/cut_vlm_lm.py --model <export dir> --output-dir <tree> 
 The export holds four IRs; rank 0 runs the vision tower, regroups each 2x2 block of
 patches and runs `openvino_multi_modal_projector_model.xml` on them. Exporting on Windows
 is fine: the chat template it writes has CRLF line endings, which the server normalises.
+
+### Phi-3.5-vision (ov-runtime)
+
+```bash
+python tools/vlm_surgery/cut_vlm_lm.py --model <OpenVINO/Phi-3.5-vision-instruct-int4-ov dir> \
+    --output-dir <tree> --num-stages 2 --family phi3_v
+```
+
+The export holds four IRs: the CLIP tower (`openvino_vision_embeddings_model.xml`, one
+336-px view to 576 patch rows), the projector (`openvino_vision_projection_model.xml`),
+the text embeddings and the language model. Rank 0 does the processor's HD transform
+(up to `num_crops` 4 crops of 336 px plus a global view), merges each view's patches 2x2,
+lays the crops out with the `sub_GN` / `glb_GN` separator rows from `config.json`, and
+runs the projector. Each image is `<|image_N|>` followed by a newline in the prompt, as
+the model card writes it; rank 0 tokenizes the text between tags chunk by chunk, each
+with its BOS, as `Phi3VProcessor` does. The tree also stops on `<|end|>`.
+
+### InternVL2 (ov-runtime)
+
+```bash
+python tools/vlm_surgery/cut_vlm_lm.py --model <OpenVINO/InternVL2-4B-int4-ov dir> \
+    --output-dir <tree> --num-stages 2 --family internvl_chat
+```
+
+The vision IR already ends in the projector (448-px tile to 256 rows). Rank 0 cuts the
+image into the closest grid of at most `max_dynamic_patch` (12) tiles plus a thumbnail,
+as the model card's `load_image` does, and writes each image as
+`<img>` + `<IMG_CONTEXT>` x 256 per tile + `</img>`, a newline after it.
 
 ### Pixtral with speculative decoding (ov-dist-spec)
 
@@ -215,7 +247,13 @@ is not practical on the NPU: one stage's decode IR had not compiled after 90 min
 
 - Prompt tokens count the image's tokens (Gemma 4: at most 280 per image; Pixtral: one per
   16x16 patch plus row breaks, 832 for a 448x448 image with its text; Qwen: about one per
-  1000 pixels). The counts match Hugging Face's processor for the same request.
+  1000 pixels; Phi-3.5-vision: `(crops + 1) * 144 + 1 + (crop rows + 1) * 12`, 757 for a
+  448x448 image; InternVL2: 256 per tile, one tile for 448x448, up to 13 tiles (3328
+  tokens) for an image whose aspect ratio matches a 12-tile grid, small images included).
+  The counts match Hugging Face's processor for the same request.
+- Phi-3.5-vision and InternVL2: these exports carry Phi-3's RoPE frequencies as a traced
+  constant, with no switch to the long factors past 4096 positions, so longer sequences
+  differ from Hugging Face; ov-genai runs the same IRs. The load log says so.
 - Packed slots: a prompt must fit one slot's region, `(context - 1 - packed_prefix) /
   slots`; two Pixtral images do not fit two slots of a 2048 context.
 - Gemma 4 packed slots: a request whose image is wider than `--packed-seq` rows is
