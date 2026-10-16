@@ -18,6 +18,7 @@ pub mod genai;
 pub mod image_cache;
 #[cfg(feature = "kv_coord")]
 pub mod kv_coordination;
+pub mod llava_next_vision;
 pub mod packed;
 mod packed_exec;
 pub mod pixtral_vision;
