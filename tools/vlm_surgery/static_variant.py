@@ -26,9 +26,9 @@ beam_idx Gathers do not match its pattern), hence this tool.
 
 Layers may differ in KV geometry (Gemma 4: 8x256 sliding, 2x512 global);
 stage_config.json then lists `kv_layers` ([kv_heads, head_dim] per layer) for
-the runtime's ring. Gemma 4 trees keep `token_type_ids` (bidirectional
-attention inside an image), so they need `--prefill-seq` at least one image
-wide, and context + prefill-seq within the sliding window: the IR masks the
+the runtime's ring. Gemma 4 and Gemma 3 trees keep `token_type_ids`
+(bidirectional attention inside an image), so they need `--prefill-seq` at
+least one image wide (Gemma 4: 280, Gemma 3: 256), and context + prefill-seq within the sliding window: the IR masks the
 window by ring index, which runs ahead of the real distance across the
 ring's padding.
 
@@ -292,12 +292,13 @@ def main() -> None:
     with open(os.path.join(args.tree, "pipeline_config.json")) as f:
         pipeline = json.load(f)
     v = pipeline.get("vision") or {}
-    # Gemma 4 trees default to token_type_ids when the block does not say.
+    # Gemma 4 trees default to token_type_ids when the block does not say
+    # (cut_vlm_lm.py writes it explicitly, true for gemma3).
     if v.get("token_type_ids", v.get("family") == "gemma4") and args.prefill_seq < 2:
         raise SystemExit(
             f"vision family {v.get('family')!r} attends bidirectionally inside images "
             "(token_type_ids): an image must sit whole in one inference, so pass "
-            "--prefill-seq at least one image wide (Gemma 4: 280)")
+            "--prefill-seq at least one image wide (Gemma 4: 280, Gemma 3: 256)")
     with open(os.path.join(args.tree, "config.json")) as f:
         window = json.load(f).get("sliding_window")
     if window and args.context + max(args.prefill_seq, 1) > window + 1:

@@ -27,6 +27,16 @@ Families (the `vision.family` rank 0 serves):
   mistral3  Mistral3ForConditionalGeneration (e.g. Ministral-3, exported with
             optimum-intel): the Pixtral encoder plus a 2x2 patch merger in
             openvino_multi_modal_projector_model.xml, which rank 0 runs.
+  gemma3    Gemma3ForConditionalGeneration (e.g. OpenVINO/gemma-3-12b-it-int4-ov):
+            SigLIP encoder whose IR already pools and projects to 256 rows
+            per image. The language model takes token_type_ids (each image is
+            attended both ways in its full and sliding masks), so every stage
+            keeps them and they ride the wire as a third frame.
+  llava_next LLaVA-NeXT / llava-v1.6 (e.g. OpenVINO/llava-v1.6-mistral-7b-hf-int4-ov):
+            CLIP tower whose IR already ends in the projector, anyres tiles;
+            rank 0 packs the tiles and inserts `image_newline`, which the
+            export keeps in config.json (copied to config.vlm.json).
+            Causal attention.
   phi3_v    Phi-3.5-vision (e.g. OpenVINO/Phi-3.5-vision-instruct-int4-ov):
             Phi-3 text tower (config at the top level), CLIP tower in the
             vision IR, MLP projector in openvino_vision_projection_model.xml;
@@ -47,7 +57,7 @@ export does: HF-exact up to 4096 positions.
 
 Usage:
   python cut_vlm_lm.py --model <OV VLM dir> --output-dir <tree> --num-stages N \
-      --family pixtral|mistral3|phi3_v|internvl_chat [--stage I] [--all-logits]
+      --family pixtral|mistral3|gemma3|llava_next|phi3_v|internvl_chat [--stage I] [--all-logits]
 """
 
 from __future__ import annotations
@@ -96,6 +106,19 @@ FAMILIES = {
         "vision_types": ("intern_vit_6b",),
         "token_type_ids": False,
         "text_key": "llm_config",
+    },
+    # Gemma 3: SigLIP tower; projector and 4x4 pool are inside the vision IR.
+    "gemma3": {
+        "model_types": ("gemma3",),
+        "vision_types": ("siglip_vision_model",),
+        "token_type_ids": True,
+    },
+    # LLaVA-NeXT: one IR (CLIP tower + projector); image_newline lives in
+    # config.json, and rank 0 does the tiling and packing.
+    "llava_next": {
+        "model_types": ("llava_next",),
+        "vision_types": ("clip_vision_model",),
+        "token_type_ids": False,
     },
 }
 
@@ -199,6 +222,21 @@ def add_stop_token(path: str, token_id: int) -> None:
         json.dump(gen, f, indent=2)
 
 
+def check_llava_next(cfg: dict, hidden: int) -> None:
+    """What rank 0's LLaVA-NeXT front end needs from config.json."""
+    nl = cfg.get("image_newline")
+    if not isinstance(nl, list) or len(nl) != hidden:
+        raise SystemExit(
+            f"config.json has no {hidden}-wide image_newline (optimum-intel writes it there); "
+            "re-export the model with optimum-intel")
+    strategy = cfg.get("vision_feature_select_strategy", "default")
+    if strategy != "default":
+        raise SystemExit(f"vision_feature_select_strategy {strategy!r} is not supported "
+                         "(rank 0 expects the CLS row dropped)")
+    if cfg.get("image_token_index") is None:
+        raise SystemExit("config.json lacks image_token_index")
+
+
 def run(model_dir: str, out_dir: str, num_stages: int, family: str,
         suffix: str, only_stage: int | None, all_logits: bool = False) -> None:
     with open(os.path.join(model_dir, "config.json")) as f:
@@ -216,9 +254,22 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
         # as plain Pixtral and fail only at image time.
         required += ["openvino_multi_modal_projector_model.xml", "processor_config.json"]
     required += list(FAMILIES[family].get("requires", ()))
+    if family in ("gemma3", "llava_next"):
+        # Rank 0 reads the image processor settings from it (Gemma 3's 896x896
+        # SigLIP resize; LLaVA-NeXT's tiling pinpoints and image_newline packing).
+        required += ["preprocessor_config.json"]
     for fn in required:
         if not os.path.exists(os.path.join(model_dir, fn)):
             raise SystemExit(f"{model_dir} lacks {fn}; not an OpenVINO {family} VLM export")
+    if family == "llava_next":
+        check_llava_next(cfg, hidden)
+
+    if FAMILIES[family]["token_type_ids"]:
+        lm_inputs = [p.get_friendly_name() for p in ov.Core().read_model(lm_xml).get_parameters()]
+        if "token_type_ids" not in lm_inputs:
+            raise SystemExit(f"--family {family}: openvino_language_model.xml takes no "
+                             f"token_type_ids ({lm_inputs}); images would be attended "
+                             "causally. Re-export it with a newer optimum-intel")
 
     if num_stages > num_layers:
         raise SystemExit(f"--num-stages {num_stages} exceeds the {num_layers} decoder layers")
@@ -253,6 +304,9 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
         os.makedirs(sdir, exist_ok=True)
         ov.save_model(stage, os.path.join(sdir, "openvino_model.xml"), compress_to_fp16=False)
         meta["inputs"] = [p.get_friendly_name() for p in stage.get_parameters()]
+        if FAMILIES[family]["token_type_ids"] and "token_type_ids" not in meta["inputs"]:
+            raise SystemExit(f"stage_{i} lost token_type_ids ({meta['inputs']}); every stage "
+                             "must take them for bidirectional image attention")
         meta["state_vars"] = len(state_vars)
         with open(os.path.join(sdir, "stage_config.json"), "w") as f:
             json.dump(meta, f, indent=2)
