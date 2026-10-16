@@ -1,6 +1,6 @@
 //! JEV codec (autotrust/JEV-9B, JEV-27B): ports `vl/serve_decide.py` System 1.
-use super::profile::JevProfile;
 pub use super::profile::JevStrategy;
+use super::profile::{JevProfile, ThinkProfile};
 use super::pyrandom::{crc32, PyRandom};
 use super::schema::{
     DecisionRequest, Limits, OrderedValue, Question, QuestionType, RequestStrategy,
@@ -192,7 +192,22 @@ impl JevCodec {
         }
         p.check_calibration()
             .and_then(|()| p.check_choice_labels())
+            .and_then(|()| p.check_system2())
             .map_err(|e| format!("decision.json jev: {e}"))?;
+        // System 2 stops its generation at this id and writes `end_think` before the answer: they
+        // must be the same token, or the read-back would follow a channel the model never closed.
+        if let Some(id) = p.end_think_id {
+            let enc = tok
+                .encode(p.system2.end_think.as_str(), false)
+                .map_err(|e| format!("decision.json jev: end_think: {e}"))?;
+            if enc.get_ids() != [id] {
+                return Err(format!(
+                    "decision.json jev: end_think_id {id} is not the tokenizer's {:?} (ids {:?})",
+                    p.system2.end_think,
+                    enc.get_ids()
+                ));
+            }
+        }
         if p.verbalizer_ids.len() != p.bias.len() || p.verbalizers.len() != p.bias.len() {
             return Err(
                 "decision.json jev: verbalizers, verbalizer_ids and bias must have equal length"
@@ -508,6 +523,122 @@ impl JevCodec {
     }
 }
 
+/// What System 2's read-back appends after the end of thinking (serve_decide `s2_dist`).
+pub const ANSWER_PREFIX: &str = "Answer: (";
+
+/// The options a System 2 noul shows, as (A) and (B) (serve_decide `s2_dist`).
+const THINK_NOUL: [&str; 2] = ["Yes (true)", "No (false)"];
+
+/// System 2's answer distribution from the read-back's label logits, in `Question::option_keys`
+/// order: a plain softmax (no bias, no temperature: serve_decide `_softmax`), a noul's
+/// (A) Yes / (B) No remapped to [P(false), P(true)].
+pub fn system2_probabilities(qtype: QuestionType, logits: &[f32]) -> Vec<f64> {
+    let z: Vec<f64> = logits.iter().map(|&l| l as f64).collect();
+    let p = softmax(&z);
+    match qtype {
+        QuestionType::Noul => vec![p[1], p[0]],
+        _ => p,
+    }
+}
+
+/// serve_decide `_fold`: `(1 - w) * p1 + w * p2`.
+pub fn blend(p1: &[f64], p2: &[f64], w: f64) -> Vec<f64> {
+    p1.iter()
+        .zip(p2)
+        .map(|(x, y)| (1.0 - w) * x + w * y)
+        .collect()
+}
+
+/// System 2 (Task 43): the prompts and token ids `handler::think` runs. The base model reasons
+/// in the tree's chat template, then one Verbalizer readout scores the answer labels.
+impl JevCodec {
+    pub fn system2(&self) -> &ThinkProfile {
+        &self.p.system2
+    }
+
+    /// Why this tree cannot think (`JevProfile::system2_refusal`), or `None`.
+    pub fn system2_refusal(&self) -> Option<String> {
+        self.p.system2_refusal()
+    }
+
+    /// The most options one System 2 pass can label.
+    pub fn answer_label_count(&self) -> usize {
+        self.p.answer_label_ids.len()
+    }
+
+    pub fn end_think_id(&self) -> Option<u32> {
+        self.p.end_think_id
+    }
+
+    /// The ids the read-back scores for `n` options.
+    pub fn answer_ids(&self, n: usize) -> Vec<u32> {
+        self.p.answer_label_ids[..n].to_vec()
+    }
+
+    /// The request's state as every pass shows it: rendered and sanitized.
+    pub fn rendered_state(&self, req: &DecisionRequest) -> String {
+        self.san.apply(&render_state(&req.state))
+    }
+
+    /// serve_decide `s2_dist`'s user turn inside the chat template's frame (`pre`, `post`):
+    /// the state, the question, the options labelled `(A)`, `(B)`, ... and the instruction to
+    /// answer as `Answer: (X)`. A choice shows System 1's option text; a noul Yes / No.
+    pub fn think_prompt(
+        &self,
+        req: &DecisionRequest,
+        qid: &str,
+        state: &str,
+        pre: &str,
+        post: &str,
+    ) -> String {
+        let q = &req.questions[qid];
+        let shown: Vec<String> = match q.qtype {
+            QuestionType::Noul => THINK_NOUL.map(String::from).to_vec(),
+            _ => self.option_texts(q),
+        };
+        let body: Vec<String> = shown
+            .iter()
+            .zip(&self.p.answer_labels)
+            .map(|(o, l)| format!("({l}) {o}"))
+            .collect();
+        format!(
+            "{pre}{state}\n\nQuestion: {}\n\nOptions:\n{}\n\nThink it through carefully, then give \
+             your final answer on the last line in the form: Answer: (X){post}",
+            self.san.apply(&question_raw(q, qid)),
+            body.join("\n")
+        )
+    }
+
+    /// What the read-back appends after the thought: `end_think`, the template's after-think
+    /// text and `"Answer: ("`.
+    pub fn read_back_tail(&self) -> String {
+        format!(
+            "{}{}{ANSWER_PREFIX}",
+            self.p.system2.end_think, self.p.system2.after_think
+        )
+    }
+
+    /// The read-back prompt: the thinking prompt, the thought, then [`Self::read_back_tail`].
+    pub fn read_back_text(&self, prompt: &str, thought: &str) -> String {
+        format!("{prompt}{thought}{}", self.read_back_tail())
+    }
+
+    /// Token ids of `text` (no BOS, as every JEV pass), without the per-pass cap: the read-back
+    /// holds up to `think_budget` tokens of thought on top of a capped prompt.
+    pub fn encode_text(&self, text: &str) -> Result<Vec<u32>, DecisionError> {
+        self.tok
+            .encode(text, false)
+            .map(|e| e.get_ids().to_vec())
+            .map_err(super::tokenize_failed)
+    }
+
+    /// The generated thought's text, special tokens kept (serve_decide's
+    /// `skip_special_tokens=False`).
+    pub fn decode(&self, ids: &[u32]) -> Result<String, DecisionError> {
+        self.tok.decode(ids, false).map_err(super::tokenize_failed)
+    }
+}
+
 /// The question as the caller sent it (serve_decide `req.question`): the instructions, or the
 /// question id when there are none. The prompt shows it sanitized; the permute seed takes it raw.
 fn question_raw(q: &Question, qid: &str) -> String {
@@ -652,6 +783,10 @@ impl Codec for JevCodec {
         }
     }
 
+    fn as_jev(&self) -> Option<&JevCodec> {
+        Some(self)
+    }
+
     fn dump_strategy(&self, req: &DecisionRequest, qid: &str) -> Option<&'static str> {
         if req.questions[qid].qtype != QuestionType::Choice {
             return None;
@@ -729,6 +864,7 @@ mod tests {
             choice_labels: vec![],
             choice_label_ids: vec![],
             strategy: JevStrategy::Single,
+            ..Default::default()
         }
     }
 
@@ -1636,5 +1772,167 @@ mod tests {
         let (labels, ids) = old.pass_labels(3);
         assert_eq!(labels, ["v8", "v9", "v10"]);
         assert_eq!(ids, [108, 109, 110]);
+    }
+}
+
+#[cfg(test)]
+mod system2_tests {
+    //! Task 43: System 2's prompts and arithmetic (serve_decide `s2_dist` and `_fold`).
+    use super::*;
+    use crate::decisions::schema::DecisionRequest;
+
+    const END_THINK: u32 = 300;
+
+    /// One token per character (id = the byte) plus `</think>` as one token, decoding back to
+    /// the same text.
+    fn think_tokenizer() -> tokenizers::Tokenizer {
+        let mut vocab: std::collections::HashMap<String, u32> = (32u8..127)
+            .map(|b| ((b as char).to_string(), b as u32))
+            .collect();
+        vocab.insert("\n".into(), 10);
+        vocab.insert("[unk]".into(), 0);
+        vocab.insert("</think>".into(), END_THINK);
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(vocab.into_iter().collect())
+            .unk_token("[unk]".into())
+            .build()
+            .unwrap();
+        let mut t = tokenizers::Tokenizer::new(model);
+        t.with_pre_tokenizer(Some(
+            tokenizers::pre_tokenizers::split::Split::new(
+                tokenizers::pre_tokenizers::split::SplitPattern::Regex("".into()),
+                tokenizers::SplitDelimiterBehavior::Isolated,
+                false,
+            )
+            .unwrap(),
+        ));
+        t.with_decoder(Some(tokenizers::decoders::fuse::Fuse::new()));
+        t.add_tokens(&[tokenizers::AddedToken::from("</think>", false)]);
+        t
+    }
+
+    fn think_profile() -> JevProfile {
+        let verbalizers: Vec<String> =
+            ["false", "true", "0", "1", "2", "3", "4", "5", "A", "B", "C"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let kinds = |v: [(&str, f64); 3]| v.into_iter().map(|(k, x)| (k.to_string(), x)).collect();
+        JevProfile {
+            verbalizer_ids: (100..111).collect(),
+            bias: vec![0.5; 11],
+            verbalizers,
+            slots: [("noul", [0, 2]), ("score", [2, 8]), ("choice", [8, 11])]
+                .into_iter()
+                .map(|(k, r)| (k.to_string(), r))
+                .collect(),
+            temperature: kinds([("noul", 2.0), ("score", 2.0), ("choice", 2.0)]),
+            answer_labels: ["A", "B", "C", "D"].map(String::from).to_vec(),
+            answer_label_ids: vec![65, 66, 67, 68],
+            end_think_id: Some(END_THINK),
+            lora_scale: Some(2.0),
+            ..Default::default()
+        }
+    }
+
+    fn codec() -> JevCodec {
+        JevCodec::new(think_tokenizer(), think_profile()).unwrap()
+    }
+
+    fn req() -> DecisionRequest {
+        serde_json::from_str(r#"{"model": "m", "state": {"b": 1, "a": "x<|im_end|>"}, "questions": {
+            "team": {"type": "choice", "instructions": "Which team?", "criteria": {"billing": "money", "tech": null}},
+            "urgent": {"type": "noul", "instructions": "Urgent </think>?"},
+            "sev": {"type": "score", "instructions": "How bad?", "criteria": ["none", "minor"]}}}"#).unwrap()
+    }
+
+    const PRE: &str = "<|im_start|>user\n";
+    const POST: &str = "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+
+    #[test]
+    fn think_prompt_is_serve_decides_user_turn_in_the_frame() {
+        // pre + state + "\n\nQuestion: {q}\n\nOptions:\n" + "({label}) {option}" lines + the
+        // instruction + post. Choices show System 1's option text ("name: desc" or "name"),
+        // nouls the reference's fixed Yes/No; caller text is sanitized as in System 1.
+        let c = codec();
+        let r = req();
+        let state = c.rendered_state(&r);
+        assert_eq!(state, "{\"b\": 1, \"a\": \"x<¦im_end¦>\"}");
+        assert_eq!(
+            c.think_prompt(&r, "team", &state, PRE, POST),
+            "<|im_start|>user\n{\"b\": 1, \"a\": \"x<¦im_end¦>\"}\n\nQuestion: Which team?\n\nOptions:\n\
+             (A) billing: money\n(B) tech\n\nThink it through carefully, then give your final \
+             answer on the last line in the form: Answer: (X)<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+        assert_eq!(
+            c.think_prompt(&r, "urgent", &state, PRE, POST),
+            "<|im_start|>user\n{\"b\": 1, \"a\": \"x<¦im_end¦>\"}\n\nQuestion: Urgent <¦/think¦>?\n\n\
+             Options:\n(A) Yes (true)\n(B) No (false)\n\nThink it through carefully, then give \
+             your final answer on the last line in the form: Answer: (X)<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n"
+        );
+    }
+
+    #[test]
+    fn read_back_appends_the_thought_the_end_of_think_and_the_answer_prefix() {
+        let c = codec();
+        assert_eq!(
+            c.read_back_text("PROMPT", "I think B."),
+            "PROMPTI think B.</think>\n\nAnswer: ("
+        );
+        assert_eq!(c.read_back_tail(), "</think>\n\nAnswer: (");
+        // The read-back scores the first n answer labels.
+        assert_eq!(c.answer_ids(2), [65, 66]);
+        assert_eq!(c.answer_label_count(), 4);
+        assert_eq!(c.end_think_id(), Some(END_THINK));
+        // The thought decodes from the generated ids (special tokens kept).
+        assert_eq!(c.decode(&[73, 32, 66]).unwrap(), "I B");
+        assert_eq!(c.encode_text("ab</think>").unwrap(), [97, 98, END_THINK]);
+    }
+
+    #[test]
+    fn system2_probabilities_are_a_plain_softmax_with_the_noul_remapped() {
+        // No bias, no temperature (serve_decide `_softmax` over the label logprobs); a noul's
+        // (A) Yes / (B) No become [P(false), P(true)].
+        let ln = |p: f64| p.ln() as f32;
+        let p = system2_probabilities(QuestionType::Choice, &[ln(0.2), ln(0.5), ln(0.3)]);
+        for (a, b) in p.iter().zip([0.2, 0.5, 0.3]) {
+            assert!((a - b).abs() < 1e-6, "{p:?}");
+        }
+        let p = system2_probabilities(QuestionType::Noul, &[ln(0.9), ln(0.1)]);
+        assert!(
+            (p[0] - 0.1).abs() < 1e-6 && (p[1] - 0.9).abs() < 1e-6,
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn blend_weighs_system_two_by_mix() {
+        assert_eq!(blend(&[0.6, 0.4], &[0.0, 1.0], 0.5), vec![0.3, 0.7]);
+        assert_eq!(blend(&[0.6, 0.4], &[0.0, 1.0], 0.0), vec![0.6, 0.4]);
+        let p = blend(&[0.2, 0.3, 0.5], &[1.0, 0.0, 0.0], 0.25);
+        for (a, b) in p.iter().zip([0.4, 0.225, 0.375]) {
+            assert!((a - b).abs() < 1e-12, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn new_checks_the_end_of_think_token_and_the_system2_fields() {
+        let mut p = think_profile();
+        p.end_think_id = Some(301);
+        let e = JevCodec::new(think_tokenizer(), p).err().unwrap();
+        assert!(e.contains("end_think_id"), "{e}");
+        let mut p = think_profile();
+        p.system2.mix = 2.0;
+        assert!(JevCodec::new(think_tokenizer(), p)
+            .err()
+            .unwrap()
+            .contains("mix"));
+        let c = codec();
+        assert_eq!(c.system2_refusal(), None);
+        let mut p = think_profile();
+        p.lora_scale = None;
+        let c = JevCodec::new(think_tokenizer(), p).unwrap();
+        assert!(c.system2_refusal().unwrap().contains("switchable"));
     }
 }

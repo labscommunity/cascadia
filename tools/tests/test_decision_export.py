@@ -1285,3 +1285,58 @@ def test_cli_switchable_lora_is_jev_only(cli, monkeypatch, capsys, family):
     with pytest.raises(SystemExit) as e:
         run(family, *_family_argv(family, base, tmp), "--switchable-lora")
     assert e.value.code == 2 and "--switchable-lora is jev only" in capsys.readouterr().err and calls == []
+
+
+# Task 43: System 2's answer labels and end-of-think token (serve_decide.py setup / s2_dist).
+
+def _answer_tok(extra=None):
+    """"Answer: (" is one token (50) and ")" another (51); A..Z are ids 8.. as in _jev_tok."""
+    vocab = {"Answer: (": 50, ")": 51, "</think>": 52}
+    vocab.update({lab: i for lab, i in zip(_LETTERS, list(range(8, 24)) + list(range(500, 510)))})
+    vocab.update(extra or {})
+    return _FakeTok(vocab)
+
+
+def test_answer_labels_keep_a_label_followed_by_exactly_one_more_token():
+    # "C)" merges (one token after the prefix), "Answer: (D" swallows the prefix, "AB" is two
+    # tokens: all three skipped. "AA" is one token and kept, as the first of its two.
+    tok = _answer_tok({"C)": 900, "Answer: (D": 901, "AA": 902})
+    labels = de.answer_labels(tok)
+    names = [lab for lab, _ in labels]
+    assert "C" not in names and "D" not in names and "AB" not in names
+    assert names[:3] == ["A", "B", "E"] and "AA" in names
+    assert dict(labels)["A"] == 8 and dict(labels)["AA"] == 902
+
+
+def test_answer_labels_cap_at_256():
+    two = {a + b: 2000 + 26 * i + j for i, a in enumerate(_LETTERS) for j, b in enumerate(_LETTERS)}
+    labels = de.answer_labels(_answer_tok(two))
+    assert len(labels) == de.MAX_CHOICE_LABELS == 256
+    assert [lab for lab, _ in labels[:28]] == _LETTERS + ["AA", "AB"]
+
+
+def test_end_think_id_is_the_single_token_or_none():
+    assert de.end_think_id(_answer_tok()) == 52
+    assert de.end_think_id(_jev_tok()) is None  # "</think>" is not one token: no System 2
+
+
+def test_jev_profile_writes_answer_labels_and_end_think_id(tmp_path):
+    adapter, cal = _jev_adapter(tmp_path)
+    out = tmp_path / "tree"
+    tok = _answer_tok()
+    de.write_jev_profile(str(adapter), str(cal), str(out), tokenizer=tok)
+    jev = json.loads((out / "decision.json").read_text())["jev"]
+    assert jev["answer_labels"] == _LETTERS
+    assert jev["answer_label_ids"] == list(range(8, 24)) + list(range(500, 510))
+    assert jev["end_think_id"] == 52
+    # no `</think>` token: the labels are still written, the end-of-think id is not
+    de.write_jev_profile(str(adapter), str(cal), str(tmp_path / "t2"), tokenizer=_jev_tok())
+    jev = json.loads((tmp_path / "t2" / "decision.json").read_text())["jev"]
+    assert "end_think_id" not in jev
+
+
+def test_jev_profile_without_tokenizer_has_no_system2_fields(tmp_path):
+    adapter, cal = _jev_adapter(tmp_path)
+    de.write_jev_profile(str(adapter), str(cal), str(tmp_path / "tree"))
+    jev = json.loads((tmp_path / "tree" / "decision.json").read_text())["jev"]
+    assert not {"answer_labels", "answer_label_ids", "end_think_id"} & set(jev)

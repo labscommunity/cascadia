@@ -1758,6 +1758,41 @@ fn render_with_chat_env(
     tmpl.render(ctx).map_err(|e| classify_render_error(&e))
 }
 
+/// The user content System 2's frame is rendered around (serve_decide `PLACEHOLDER`).
+const THINK_PLACEHOLDER: &str = "XQXCONTENTXQX";
+
+/// System 2's chat-template frame (serve_decide `_think_frame`): the model's template rendered
+/// for one user turn whose content is [`THINK_PLACEHOLDER`], with the generation prompt and
+/// thinking on and the template's own `reasoning_effort` default, split around the placeholder
+/// into what precedes and what follows the user content. `None` without a template, when it
+/// fails to render, or when the placeholder does not come back exactly once.
+pub(crate) fn think_frame(state: &AppState) -> Option<(String, String)> {
+    let env = state.chat_env.as_deref()?;
+    let msg = ChatMessage {
+        role: "user".into(),
+        content: THINK_PLACEHOLDER.into(),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+    };
+    let chat = render_with_chat_env(
+        env,
+        &[msg],
+        &state.bos_token,
+        &state.eos_token,
+        true,
+        None,
+        None,
+    )
+    .map_err(|e| warn!(error = %e, "chat_template failed to render System 2's frame"))
+    .ok()?;
+    let (pre, post) = chat.split_once(THINK_PLACEHOLDER)?;
+    if post.contains(THINK_PLACEHOLDER) {
+        return None;
+    }
+    Some((pre.to_string(), post.to_string()))
+}
+
 /// Marker attached to `raise_exception(...)` errors so a template's own
 /// validation stays distinguishable from an engine compatibility gap after
 /// minijinja has wrapped it in template context.
@@ -5541,6 +5576,7 @@ mod tests {
             choice_labels: vec![],
             choice_label_ids: vec![],
             strategy: Default::default(),
+            ..Default::default()
         };
         let codec = decisions::jev::JevCodec::new(char_tokenizer(), profile)
             .unwrap()
@@ -5782,6 +5818,7 @@ mod tests {
                 .map(|i| if i < 16 { 108 + i } else { 1000 + i })
                 .collect(),
             strategy,
+            ..Default::default()
         };
         decisions::jev::JevCodec::new(char_tokenizer(), profile)
             .unwrap()
@@ -9693,6 +9730,626 @@ level={{ effort_map[eff] }}";
         assert!(
             text.contains("cascadia_api_rejected_total{reason=\"empty_prompt\"}"),
             "{text}"
+        );
+    }
+
+    // ---- Task 43: System 2 (adaptive thinking) for JEV ----
+
+    /// What a [`ThinkEngine`] ran, and what it answers with: decision passes take the next
+    /// queued logits (`-(i)` once empty), generations the next queued token ids.
+    #[derive(Clone, Default)]
+    struct Thinker {
+        tasks: Arc<std::sync::Mutex<Vec<cascadia_types::GenerationTask>>>,
+        cancelled: Arc<std::sync::Mutex<Vec<String>>>,
+        logits: Arc<std::sync::Mutex<std::collections::VecDeque<Vec<f32>>>>,
+        thoughts: Arc<std::sync::Mutex<std::collections::VecDeque<Vec<u32>>>>,
+    }
+
+    impl Thinker {
+        fn tasks(&self) -> Vec<cascadia_types::GenerationTask> {
+            self.tasks.lock().unwrap().clone()
+        }
+        fn queue(&self, logits: Vec<Vec<f32>>, thoughts: Vec<Vec<u32>>) {
+            self.logits.lock().unwrap().extend(logits);
+            self.thoughts.lock().unwrap().extend(thoughts);
+        }
+    }
+
+    /// Decision passes answer in one chunk; a generation emits its script one token per step,
+    /// then ends `stop` (script done) or `length` (`max_tokens` reached), and honours cancel.
+    struct ThinkEngine {
+        s: Thinker,
+        pending: std::collections::VecDeque<(cascadia_types::GenerationTask, Vec<u32>, usize)>,
+    }
+
+    impl cascadia_engine::Engine for ThinkEngine {
+        fn warmup(&mut self) {}
+        fn submit(
+            &mut self,
+            task: cascadia_types::GenerationTask,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            self.s.tasks.lock().unwrap().push(task.clone());
+            let script = if task.decision.is_none() {
+                self.s
+                    .thoughts
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            self.pending.push_back((task, script, 0));
+            Ok(())
+        }
+        fn cancel(&mut self, task_id: &cascadia_types::TaskId) {
+            self.s.cancelled.lock().unwrap().push(task_id.clone());
+            self.pending.retain(|(t, _, _)| &t.task_id != task_id);
+        }
+        fn step(
+            &mut self,
+        ) -> Result<Vec<(cascadia_types::TaskId, Chunk)>, cascadia_engine::EngineError> {
+            let Some((task, script, at)) = self.pending.pop_front() else {
+                return Ok(Vec::new());
+            };
+            let id = task.task_id.clone();
+            if let Some(d) = &task.decision {
+                let n = d.head.output_len();
+                let logits = self
+                    .s
+                    .logits
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| (0..n).map(|i| -(i as f32)).collect());
+                let chunk = Chunk::final_marker(id.clone(), "")
+                    .with_prompt_tokens(d.prompt_ids.len() as u32)
+                    .with_finish_reason(cascadia_types::FinishReason::Stop)
+                    .with_decision_logits(logits);
+                return Ok(vec![(id, chunk)]);
+            }
+            if at >= task.max_tokens as usize || at >= script.len() {
+                let reason = if at >= script.len() {
+                    cascadia_types::FinishReason::Stop
+                } else {
+                    cascadia_types::FinishReason::Length
+                };
+                let chunk = Chunk::final_marker(id.clone(), "")
+                    .with_prompt_tokens(7)
+                    .with_finish_reason(reason);
+                return Ok(vec![(id, chunk)]);
+            }
+            let tok = script[at];
+            let chunk = Chunk::token(id.clone(), tok as i64, "x").with_token_ids(vec![tok as i64]);
+            self.pending.push_front((task, script, at + 1));
+            Ok(vec![(id, chunk)])
+        }
+    }
+
+    struct ThinkBuilder(Thinker);
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for ThinkBuilder {
+        async fn connect(
+            &mut self,
+            _peers: PeerLayout,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, cascadia_engine::EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> Result<Box<dyn cascadia_engine::Engine>, cascadia_engine::EngineError> {
+            Ok(Box::new(ThinkEngine {
+                s: self.0,
+                pending: Default::default(),
+            }))
+        }
+    }
+
+    const END_THINK: u32 = 300;
+
+    /// Qwen's shape: one user turn, then the assistant turn opened with `<think>\n`.
+    const THINK_TEMPLATE: &str = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% if enable_thinking %}<think>\n{% endif %}{% endif %}";
+
+    /// [`char_tokenizer`] plus `</think>` as one token, decoding back to the same text.
+    fn think_tokenizer() -> tokenizers::Tokenizer {
+        let mut vocab: std::collections::HashMap<String, u32> = (32u8..127)
+            .map(|b| ((b as char).to_string(), b as u32))
+            .collect();
+        vocab.insert("\n".into(), 10);
+        vocab.insert("[unk]".into(), 0);
+        vocab.insert("</think>".into(), END_THINK);
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(vocab.into_iter().collect())
+            .unk_token("[unk]".into())
+            .build()
+            .unwrap();
+        let mut t = tokenizers::Tokenizer::new(model);
+        t.with_pre_tokenizer(Some(
+            tokenizers::pre_tokenizers::split::Split::new(
+                tokenizers::pre_tokenizers::split::SplitPattern::Regex("".into()),
+                tokenizers::SplitDelimiterBehavior::Isolated,
+                false,
+            )
+            .unwrap(),
+        ));
+        t.with_decoder(Some(tokenizers::decoders::fuse::Fuse::new()));
+        t.add_tokens(&[tokenizers::AddedToken::from("</think>", false)]);
+        t
+    }
+
+    fn ids(text: &str) -> Vec<u32> {
+        think_tokenizer()
+            .encode(text, false)
+            .unwrap()
+            .get_ids()
+            .to_vec()
+    }
+
+    /// A switchable JEV (trained scale 2) with 4 choice slots and System 2's export: answer
+    /// labels A..D (ids 2001..2004) and `</think>`.
+    fn think_profile() -> decisions::profile::JevProfile {
+        let verbalizers: Vec<String> = [
+            "false", "true", "0", "1", "2", "3", "4", "5", "A", "B", "C", "D",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let kinds = |v: [(&str, f64); 3]| v.into_iter().map(|(k, x)| (k.to_string(), x)).collect();
+        decisions::profile::JevProfile {
+            verbalizer_ids: (100..112).collect(),
+            bias: vec![0.0; 12],
+            verbalizers,
+            slots: [("noul", [0, 2]), ("score", [2, 8]), ("choice", [8, 12])]
+                .into_iter()
+                .map(|(k, r)| (k.to_string(), r))
+                .collect(),
+            temperature: kinds([("noul", 1.0), ("score", 1.0), ("choice", 1.0)]),
+            answer_labels: ["A", "B", "C", "D"].map(String::from).to_vec(),
+            answer_label_ids: vec![2001, 2002, 2003, 2004],
+            end_think_id: Some(END_THINK),
+            lora_scale: Some(2.0),
+            ..Default::default()
+        }
+    }
+
+    async fn think_app_with(
+        s: &Thinker,
+        profile: decisions::profile::JevProfile,
+        max_total: usize,
+        template: Option<&str>,
+    ) -> Router {
+        let runner = Runner::new(Box::new(ThinkBuilder(s.clone())));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let codec = decisions::jev::JevCodec::new(think_tokenizer(), profile)
+            .unwrap()
+            .with_pass_cap(4000)
+            .with_total_cap(max_total);
+        let cfg = Config {
+            decisions: Some(Arc::new(decisions::DecisionService {
+                family: decisions::profile::Family::Jev,
+                codec: Box::new(codec),
+                max_tokens: 4000,
+                max_total_tokens: max_total,
+                max_questions: 32,
+                prefix_reuse: false,
+                encode_slots: decisions::default_encode_slots(),
+            })),
+            chat_template: ChatTemplateConfig {
+                template: template.map(str::to_string),
+                bos_token: None,
+                eos_token: None,
+            },
+            max_body_bytes: 1 << 20,
+            ..Config::default()
+        };
+        make_router_with_stats(Arc::new(runner), "mock-model", cfg, Default::default())
+    }
+
+    async fn think_app(s: &Thinker) -> Router {
+        think_app_with(s, think_profile(), 64000, Some(THINK_TEMPLATE)).await
+    }
+
+    /// A noul `u` and a choice `c` over x, y, w, with `extra` top-level fields.
+    fn think_body(extra: &str) -> String {
+        format!(
+            r#"{{"model": "m", "state": "S", {extra}"questions": {{
+              "u": {{"type": "noul", "instructions": "U?"}},
+              "c": {{"type": "choice", "instructions": "Q?", "criteria": {{"x": "1", "y": "2", "w": ""}}}}}}}}"#
+        )
+    }
+
+    const TAIL: &str = "\n\nThink it through carefully, then give your final answer on the last line in the form: Answer: (X)<|im_end|>\n<|im_start|>assistant\n<think>\n";
+
+    fn think_prompt_u() -> String {
+        format!(
+            "<|im_start|>user\nS\n\nQuestion: U?\n\nOptions:\n(A) Yes (true)\n(B) No (false){TAIL}"
+        )
+    }
+
+    fn think_prompt_c() -> String {
+        format!("<|im_start|>user\nS\n\nQuestion: Q?\n\nOptions:\n(A) x: 1\n(B) y: 2\n(C) w{TAIL}")
+    }
+
+    fn ln(p: &[f64]) -> Vec<f32> {
+        p.iter().map(|x| x.ln() as f32).collect()
+    }
+
+    fn head(t: &cascadia_types::GenerationTask) -> Vec<u32> {
+        match &t.decision.as_ref().unwrap().head {
+            cascadia_types::ReadoutHead::Verbalizer { token_ids } => token_ids.clone(),
+            h => panic!("{h:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn thinking_on_runs_the_base_model_then_reads_the_answer_and_blends() {
+        let s = Thinker::default();
+        let mut hmm = ids("Hmm.");
+        hmm.push(END_THINK);
+        hmm.extend(ids("junk")); // past the close: never generated by our count
+        s.queue(
+            vec![
+                vec![0.0, -1.0],       // System 1 u: p1 = [0.7311, 0.2689]
+                vec![0.0, -1.0, -2.0], // System 1 c: p1 = [0.6652, 0.2447, 0.0900]
+                ln(&[0.9, 0.1]),       // u's read-back: Yes 0.9
+                ln(&[0.1, 0.1, 0.8]),  // c's read-back
+            ],
+            vec![hmm, ids("ok")],
+        );
+        let (status, v, _) = post_decisions(
+            think_app(&s).await,
+            &think_body(r#""thinking": "on", "think_budget": 50, "#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let tasks = s.tasks();
+        assert_eq!(
+            tasks.len(),
+            6,
+            "S1 u, S1 c, think u, read u, think c, read c"
+        );
+        // System 1 at the trained scale; System 2's generation and read-back on the base model.
+        for t in &tasks[..2] {
+            assert!(t.decision.is_some() && t.lora_scale.is_none());
+        }
+        let think = &tasks[2];
+        assert!(think.decision.is_none());
+        assert_eq!(think.lora_scale, Some(0.0));
+        assert!(think.enable_thinking, "no empty think block appended");
+        assert_eq!((think.temperature, think.max_tokens), (0.0, 50));
+        assert_eq!(think.prompt, think_prompt_u());
+        // Stopped at `</think>`: the task was cancelled, "junk" never read.
+        assert!(s.cancelled.lock().unwrap().contains(&think.task_id));
+        let read = &tasks[3];
+        assert_eq!(read.lora_scale, Some(0.0));
+        assert_eq!(
+            read.decision.as_ref().unwrap().prompt_ids,
+            ids(&format!("{}Hmm.</think>\n\nAnswer: (", think_prompt_u()))
+        );
+        assert_eq!(head(read), [2001, 2002]);
+        assert_eq!(tasks[4].prompt, think_prompt_c());
+        // A thought the model ended itself (eos) without `</think>`: the read-back adds it.
+        assert_eq!(
+            tasks[5].decision.as_ref().unwrap().prompt_ids,
+            ids(&format!("{}ok</think>\n\nAnswer: (", think_prompt_c()))
+        );
+        assert_eq!(head(&tasks[5]), [2001, 2002, 2003]);
+        // Blend at mix 0.5; the noul's (A) Yes 0.9 is P(true).
+        let u = &v["answers"]["u"];
+        assert!(close(&u["noul"], 0.5 * 0.2689 + 0.5 * 0.9), "{u}");
+        assert_eq!(
+            u["thinking"],
+            serde_json::json!({"mode": "on", "used": true, "threshold": 0.8, "budget": 50,
+                               "think_tokens": 5, "finished_within_budget": true})
+        );
+        let c = &v["answers"]["c"];
+        assert_eq!(c["choice"], "w");
+        assert!(close(&c["probabilities"]["x"], 0.5 * 0.6652 + 0.05), "{c}");
+        assert!(close(&c["probabilities"]["y"], 0.5 * 0.2447 + 0.05), "{c}");
+        assert!(close(&c["probabilities"]["w"], 0.5 * 0.0900 + 0.4), "{c}");
+        assert_eq!(c["thinking"]["think_tokens"], 2);
+        assert!(c["thinking"].get("reasoning").is_none(), "only when asked");
+        assert_eq!(v["usage"]["output_tokens"], 7, "{v}");
+    }
+
+    #[tokio::test]
+    async fn thinking_auto_skips_a_confident_system_one() {
+        // threshold 0.7: u's p1 leads with 0.7311 (no thinking), c's with 0.6652 (thinks).
+        let s = Thinker::default();
+        s.queue(
+            vec![vec![0.0, -1.0], vec![0.0, -1.0, -2.0], ln(&[0.1, 0.1, 0.8])],
+            vec![ids("ok")],
+        );
+        let (status, v, _) = post_decisions(
+            think_app(&s).await,
+            &think_body(r#""thinking": "auto", "threshold": 0.7, "think_budget": 50, "#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let tasks = s.tasks();
+        assert_eq!(tasks.len(), 4, "S1 u, S1 c, think c, read c");
+        assert_eq!(tasks[2].prompt, think_prompt_c());
+        assert!(
+            close(&v["answers"]["u"]["noul"], 0.2689),
+            "System 1 alone: {v}"
+        );
+        assert_eq!(
+            v["answers"]["u"]["thinking"],
+            serde_json::json!({"mode": "auto", "used": false, "threshold": 0.7, "budget": 50})
+        );
+        assert_eq!(v["answers"]["c"]["thinking"]["used"], true);
+        assert_eq!(v["answers"]["c"]["choice"], "w");
+        // The default threshold (0.8) thinks on both.
+        let s = Thinker::default();
+        s.queue(vec![], vec![ids("a"), ids("b")]);
+        let (status, v, _) = post_decisions(
+            think_app(&s).await,
+            &think_body(r#""thinking": "auto", "think_budget": 50, "#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(s.tasks().len(), 6);
+        assert_eq!(v["answers"]["u"]["thinking"]["threshold"], 0.8);
+    }
+
+    #[tokio::test]
+    async fn thinking_off_or_absent_is_byte_identical_and_never_generates() {
+        let base = Thinker::default();
+        let (status, _, want) = post_decisions(think_app(&base).await, &think_body("")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!want.contains("thinking"), "{want}");
+        // An older profile (no System 2 export) answers the same bytes.
+        let old = Thinker::default();
+        let mut p = think_profile();
+        p.answer_labels.clear();
+        p.answer_label_ids.clear();
+        p.end_think_id = None;
+        p.lora_scale = None;
+        let (_, _, got) =
+            post_decisions(think_app_with(&old, p, 64000, None).await, &think_body("")).await;
+        assert_eq!(got, want);
+        // Off ignores the other fields, as the reference does.
+        for extra in [
+            r#""thinking": "off", "#,
+            r#""thinking": null, "#,
+            r#""thinking": "off", "threshold": 5, "think_budget": 0, "return_reasoning": true, "#,
+        ] {
+            let s = Thinker::default();
+            let (status, _, got) = post_decisions(think_app(&s).await, &think_body(extra)).await;
+            assert_eq!(status, StatusCode::OK, "{extra}");
+            assert_eq!(got, want, "{extra}");
+            assert!(s
+                .tasks()
+                .iter()
+                .all(|t| t.decision.is_some() && t.lora_scale.is_none()));
+        }
+        for t in base.tasks() {
+            assert!(t.decision.is_some() && t.lora_scale.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn thinking_returns_the_reasoning_when_asked_and_reports_a_spent_budget() {
+        let s = Thinker::default();
+        let mut thought = ids("  I pick B.\n");
+        thought.push(END_THINK);
+        s.queue(vec![], vec![thought, ids("abcdef")]);
+        let (status, v, _) = post_decisions(
+            think_app(&s).await,
+            &think_body(r#""thinking": "on", "think_budget": 3, "return_reasoning": true, "#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        // u's thought would close at token 13: the engine stops it at the budget (3) first.
+        let u = &v["answers"]["u"]["thinking"];
+        assert_eq!(u["think_tokens"], 3, "{u}");
+        assert_eq!(u["finished_within_budget"], false, "{u}");
+        assert_eq!(u["reasoning"], "I", "trimmed: {u}");
+        let c = &v["answers"]["c"]["thinking"];
+        assert_eq!(
+            (c["think_tokens"].clone(), c["reasoning"].clone()),
+            (3.into(), "abc".into())
+        );
+        assert_eq!(c["finished_within_budget"], false);
+        let tasks = s.tasks();
+        assert_eq!(
+            tasks[5].decision.as_ref().unwrap().prompt_ids,
+            ids(&format!("{}abc</think>\n\nAnswer: (", think_prompt_c()))
+        );
+        // A thought that closes within its budget keeps its text, trimmed.
+        let s = Thinker::default();
+        let mut thought = ids("  I pick B.\n");
+        thought.push(END_THINK);
+        s.queue(vec![], vec![thought]);
+        let body = r#"{"model": "m", "state": "S", "thinking": "on", "think_budget": 50, "return_reasoning": true, "questions": {"u": {"type": "noul", "instructions": "U?"}}}"#;
+        let (status, v, _) = post_decisions(think_app(&s).await, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["answers"]["u"]["thinking"]["reasoning"], "I pick B.");
+        assert_eq!(
+            v["answers"]["u"]["thinking"]["finished_within_budget"],
+            true
+        );
+        assert_eq!(v["answers"]["u"]["thinking"]["think_tokens"], 13);
+    }
+
+    #[tokio::test]
+    async fn score_questions_never_think() {
+        let body = r#"{"model": "m", "state": "S", "thinking": "on", "questions": {
+          "u": {"type": "noul"}, "s": {"type": "score", "criteria": ["a", "b"]}}}"#;
+        let s = Thinker::default();
+        let (status, v, _) = post_decisions(think_app(&s).await, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(
+            v["error"],
+            "thinking is supported for noul and choice questions; s is a score question"
+        );
+        assert!(s.tasks().is_empty());
+        // Under the profile's default, a score question just answers.
+        let mut p = think_profile();
+        p.system2.thinking = decisions::profile::ThinkingMode::On;
+        let s = Thinker::default();
+        s.queue(vec![], vec![ids("ok")]);
+        let body = r#"{"model": "m", "state": "S", "think_budget": 9, "questions": {
+          "u": {"type": "noul"}, "s": {"type": "score", "criteria": ["a", "b"]}}}"#;
+        let (status, v, _) = post_decisions(
+            think_app_with(&s, p, 64000, Some(THINK_TEMPLATE)).await,
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["answers"]["u"]["thinking"]["mode"], "on");
+        assert!(v["answers"]["s"].get("thinking").is_none(), "{v}");
+        let generations = s.tasks().iter().filter(|t| t.decision.is_none()).count();
+        assert_eq!(generations, 1, "only the noul thinks");
+    }
+
+    #[tokio::test]
+    async fn thinking_is_refused_where_it_cannot_run() {
+        let on = think_body(r#""thinking": "on", "#);
+        // Not JEV.
+        let (status, v, _) = post_decisions(make_decision_app().await, &on).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(
+            v["error"],
+            "thinking, threshold, think_budget and return_reasoning apply to JEV only"
+        );
+        let (status, v, _) = post_decisions(
+            make_decision_app().await,
+            &think_body(r#""think_budget": 10, "#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        let (status, v) = post_openai(
+            make_decision_app().await,
+            r#"{"input": "S", "thinking": "auto", "questions": [{"type": "predicate", "name": "u", "instructions": "U"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        // A baked tree: System 2 would run with the adapter on.
+        let mut baked = think_profile();
+        baked.lora_scale = None;
+        let mut no_export = think_profile();
+        no_export.answer_labels.clear();
+        no_export.answer_label_ids.clear();
+        let mut two_labels = think_profile();
+        two_labels.answer_labels.truncate(2);
+        two_labels.answer_label_ids.truncate(2);
+        for (p, template, body, want) in [
+            (baked, Some(THINK_TEMPLATE), on.clone(), "switchable tree"),
+            (
+                no_export,
+                Some(THINK_TEMPLATE),
+                on.clone(),
+                "System 2's export",
+            ),
+            (think_profile(), None, on.clone(), "chat template"),
+            (
+                two_labels,
+                Some(THINK_TEMPLATE),
+                on.clone(),
+                "c: thinking labels at most 2 options, got 3",
+            ),
+            (
+                think_profile(),
+                Some(THINK_TEMPLATE),
+                think_body(r#""thinking": "on", "think_budget": 0, "#),
+                "think_budget must be 1..=4000 tokens, got 0",
+            ),
+            (
+                think_profile(),
+                Some(THINK_TEMPLATE),
+                think_body(r#""thinking": "auto", "think_budget": 4001, "#),
+                "think_budget must be 1..=4000",
+            ),
+            (
+                think_profile(),
+                Some(THINK_TEMPLATE),
+                think_body(r#""thinking": "auto", "threshold": 1.5, "#),
+                "threshold must be in [0, 1]",
+            ),
+        ] {
+            let s = Thinker::default();
+            let (status, v, _) =
+                post_decisions(think_app_with(&s, p, 64000, template).await, &body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{want}: {v}");
+            let e = v["error"].as_str().unwrap();
+            assert!(e.contains(want), "{want}: {e}");
+            assert!(s.tasks().is_empty(), "{want}: refused before any pass");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_think_budget_the_request_cannot_afford_is_413_up_front() {
+        // System 1 needs two short passes; each question that may think needs its prompt and
+        // the budget twice (generation, then read-back) plus the read-back's tail.
+        let s = Thinker::default();
+        let app = think_app_with(&s, think_profile(), 3000, Some(THINK_TEMPLATE)).await;
+        let (status, v, _) = post_decisions(
+            app,
+            &think_body(r#""thinking": "auto", "think_budget": 600, "#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+        let e = v["error"].as_str().unwrap();
+        assert!(
+            e.contains("think_budget 600") && e.contains("lower think_budget"),
+            "{e}"
+        );
+        assert!(s.tasks().is_empty(), "refused before System 1");
+        // The same request with a smaller budget fits.
+        let s = Thinker::default();
+        let app = think_app_with(&s, think_profile(), 3000, Some(THINK_TEMPLATE)).await;
+        let (status, v, _) = post_decisions(
+            app,
+            &think_body(r#""thinking": "auto", "think_budget": 400, "#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
+    #[tokio::test]
+    async fn thinking_on_the_openai_route() {
+        // A calibrated noul (bias 0.5 on false, temperature 2) and mix 0.25: System 1 is
+        // softmax([0.25, -0.5]), P(true) = 0.32082; System 2 is the plain softmax of its label
+        // logits (no bias, no temperature), P(true) = 0.9; blended 0.75 · 0.32082 + 0.25 · 0.9.
+        let mut p = think_profile();
+        p.bias[0] = 0.5;
+        p.temperature.insert("noul".into(), 2.0);
+        p.system2.mix = 0.25;
+        let s = Thinker::default();
+        let mut hmm = ids("Hmm.");
+        hmm.push(END_THINK);
+        s.queue(vec![vec![0.0, -1.0], ln(&[0.9, 0.1])], vec![hmm]);
+        let (status, v) = post_openai(
+            think_app_with(&s, p, 64000, Some(THINK_TEMPLATE)).await,
+            r#"{"input": "S", "thinking": "on", "think_budget": 50, "return_reasoning": true,
+                "questions": [{"type": "predicate", "name": "u", "instructions": "U?"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let a = &v["answers"][0];
+        assert!(close(&a["probability"], 0.75 * 0.32082 + 0.25 * 0.9), "{a}");
+        assert_eq!(a["thinking"]["reasoning"], "Hmm.");
+        assert_eq!(a["thinking"]["think_tokens"], 5);
+        assert_eq!(s.tasks()[1].prompt, think_prompt_u());
+        let u = &v["usage"];
+        assert_eq!(u["output_tokens"], 5);
+        assert_eq!(
+            u["total_tokens"].as_u64().unwrap(),
+            u["input_tokens"].as_u64().unwrap() + 5
         );
     }
 }
