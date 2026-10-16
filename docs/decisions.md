@@ -538,6 +538,12 @@ of a chain must be built with the same features: a chain that mixes builds with 
 coordination (the `kv_coord` feature) is unsupported. No metric reports the desynced state yet;
 watch for the error line.
 
+**Measured on hardware** (JEV-27B across two hosts, rank 0 with a 40 s timeout): rank 1 was frozen
+for 70 s during a 1,967-token request. That request returned 503, rank 0 logged the late TOKEN
+reply as skipped, and the next task logged `skipped a late reply of an earlier task` (epoch 3,
+then its own epoch 4). The two requests after it returned 200 with answers identical to a run
+without the timeout, in normal time.
+
 ## Limitations
 
 - **Text only.** Images in either format are a 400 (`images`, `videos`, OpenAI `input_image`
@@ -729,6 +735,11 @@ questions):
 | Records vs the spike's `encode_record` (50 + 4 synthetic) | 54/54 |
 | int8 (2 machines) vs streamed fp32 reference | **81/82** (choice 32/33, predicate 24/24, score 25/25), max \|Δp\| 0.067; the one flip, `r41.team`, has a reference margin of 0.048 |
 | `/v1/decisions` vs `/v1/systemone` (string states) | 62/62 identical |
+| Long joint pass (2 machines, CPU) | 9,609 tokens: 200 in 18 min; 16,384 tokens (a longer state, truncated to the cap): 200 in 37 min |
+
+At 16,384 tokens the last rank (which runs the joint head) peaked at 20.7 GB private memory and a
+28.0 GB working set on a 32 GB host, with under 1 GB of physical memory free during the pass;
+rank 0 peaked at 13.3 GB private. Leave the last rank's host otherwise idle for requests this long.
 
 **The swap must keep zero in each row's int8 range.** The first Clef 27B tree measured 78/82 with two
 confident flips and max |Δp| 0.30. The cause was the swap's quantizer: it scaled each row over
