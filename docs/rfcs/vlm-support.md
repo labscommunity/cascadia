@@ -640,7 +640,8 @@ serve causal vision trees. Pixtral is the one today.
   are encoded at `submit`, so a prompt that outgrows the slot's region is refused there
   with the same 413 `context_length_exceeded` a long text prompt gets.
 - **Gemma 4** (`token_type_ids` trees) was refused here at first; it is served on the
-  static path since 2026-10-16 (next section) and stays refused on packed slots.
+  static path since 2026-10-16 (next section) and on packed slots since the same day
+  (see "Gemma 4 on packed slots").
 - **Verified** across pawan-02 and pawan-04 (2 stages, CPU, context 2048):
   - static, prefill chunks of 256: 11/11, the same answers and token counts as the
     stateful tree ("There is a red square and a blue circle.", 832 prompt tokens; two
@@ -672,8 +673,8 @@ Two things kept Gemma 4 off the static path; both are handled now.
   Gemma static tree needs a chunked prefill at least one image wide (280 tokens at
   most), and rank 0 never ends a chunk inside an image (`image_safe_take`; relays split
   their frames the same way). Every inference feeds its rows' token types, and the
-  types frame rides the static wire as on the stateful one. Packed slots still refuse
-  `token_type_ids` trees: their per-row mask carries no image blocks.
+  types frame rides the static wire as on the stateful one. Packed slots served
+  `token_type_ids` trees later (next section).
 - **Sliding window.** The IR masks the sliding window by ring index, and the ring's
   padding between the valid past and the query window makes the index distance run
   ahead of the real one. `static_variant.py` therefore refuses a context plus prefill
@@ -687,6 +688,60 @@ Two things kept Gemma 4 off the static path; both are handled now.
   context 736, prefill 288, shared IR): 11/11, "There is a red square and a blue
   circle.", 288 / 550 prompt tokens, which is HF's processor count on the 26B template
   (its generation prompt adds an empty thought channel, hence 4 more than E2B).
+
+## Gemma 4 on packed slots (2026-10-16)
+
+Packed slots (`--packed-slots N`) refused Gemma 4 trees because their host mask had no
+image blocks and the packed IR builder expected one mask. They serve them now, single-
+and multi-stage, text and image requests in the same inference:
+
+- **Build.** `static_variant.py` as for the static path, then `tools/packed_variant.py
+  <stage> --slots N --packed-seq S` per stage. A Gemma 4 stage feeds its SDPAs from two
+  mask producers (`layers.0.self_attn/.../Slice_11` sliding, `layers.5...` full: the
+  shared masks keep the name of the first layer that built them). The tool classifies
+  each from `config.json` `layer_types` by that index, cross-checked against the layers
+  the producer feeds when the stage has one SDPA per layer, replaces each with its own
+  Parameter (`attn_mask_sliding_4d`, `attn_mask_4d`, both `[1,1,S,T]`), drops inputs
+  left without a consumer (`attention_mask`, `token_type_ids`) and records
+  `packed_masks`, `packed_sliding_window` and `packed_dropped_inputs` in
+  `stage_config.json`. One full-attention producer (every other family) takes the
+  original edit; its output is byte-identical to before.
+- **Per-layer KV.** `PackedKv` sizes each layer's ring from `stage_config.kv_layers`
+  (8 x 256 sliding, 2 x 512 global), as `StaticKv` does.
+- **Sliding window.** The sliding port gets the same mask with every column whose
+  absolute position is `window` (1024) or more behind the query row blocked (HF: visible
+  iff `0 <= q - k < window`). Positions are known from the slot's layout: the shared
+  prefix holds `0..`, the region the slot's own tokens from `shared_use` on, and once it
+  has slid, its pinned sink columns keep the first own tokens while the rest hold the
+  latest `region - sink`. A query row is at its slot's next position plus its order. So
+  unlike the static IR, which masks by ring index, the packed window is exact for any
+  region size.
+- **Image blocks.** Rank 0 numbers each contiguous run of image soft tokens in a
+  prompt (0, 1, ...); same-slot rows of one image are open both ways in both masks, on
+  top of causal order. A packed prefill chunk never ends inside an image
+  (`packed::image_safe_take`); submit refuses a prompt whose image is wider than
+  `packed_seq` with a 400 (`UnsupportedInput`), and the load log warns when `packed_seq`
+  is narrower than the widest image.
+- **Wire.** Downstream stages rebuild the plan from the plan frame. On a
+  `token_type_ids` tree it carries a fourth row, each row's image id (`-1` for text and
+  idle rows): `[1,4,S]` instead of `[1,3,S]`. The row count is the version: a stage that
+  masks image blocks refuses a 3-row frame, every other stage (and any build from
+  before) refuses a 4-row one, so mixed builds fail loudly instead of masking
+  differently. Other trees send the unchanged 3-row frame.
+- **Still refused**, by name: a packed IR that still reads the 2D `attention_mask`
+  (some other node consumes it), and a mixed-geometry Gemma stage whose packed IR has
+  no sliding port (built without `layer_types`). `token_type_ids` kept by the tool
+  (something besides the masks reads it) is fed 1 on image rows.
+- **Constraints.** Every packed inference is `packed_seq` rows, so `--packed-seq 288`
+  (one image) makes each decode step a 288-row inference. `static_variant.py` still
+  caps context plus prefill at the window + 1, because the static IR it also writes
+  masks by ring index; at `--context 736` two slots hold 367 tokens each, one image
+  and its text.
+- **Verified** locally only (unit tests: masks for causal, window across the slide and
+  the sinks, the shared prefix, image blocks and cross-slot isolation, mixed-geometry
+  absorb, the wire round trip and version checks; a toy two-producer stage in
+  `tools/tests/test_packed_variant.py` whose packed IR, fed the producers' own masks,
+  matches the original). Not yet run on the 26B tree.
 
 ## On the NPU (2026-10-16)
 
@@ -883,7 +938,7 @@ from the text alone.
 |---|---|---|
 | `ov-genai` | VLM exports with the vision IR | served; on a text-only export the API offers no image input (400), and `submit` refuses too |
 | `qwen35` | trees with the vision IRs | served; otherwise 400 at the API and at `submit` |
-| `ov-runtime` | Gemma 4 surgery trees (`vision.family = "gemma4"`, stateful and static paths), Pixtral trees (`"pixtral"`, stateful, static and packed paths) and Mistral 3 trees (`"mistral3"`) | served; other trees 400; an unknown `vision.family` fails to load |
+| `ov-runtime` | Gemma 4 surgery trees (`vision.family = "gemma4"`, stateful, static and packed paths), Pixtral trees (`"pixtral"`, stateful, static and packed paths) and Mistral 3 trees (`"mistral3"`) | served; other trees 400; an unknown `vision.family` fails to load |
 | `gemma4` (`gemma4_cached` trees) | E2B/E4B trees from `export_gemma4.py --vision` | served; other trees 400 at the API and at `submit` |
 | `ov-dist-spec` | no | 400; draft and target would both need the expanded image prompt |
 | `sparse-moe` | no | 400 |
