@@ -16,8 +16,11 @@ import numpy as np
 
 
 def q_asym(w, bits, axis):
+    # NNCF's asymmetric range always contains zero: a single-signed row (common in the 4-tap
+    # linear-attention conv1d) would otherwise clamp its zero point and saturate.
     hi = 2 ** bits - 1
-    lo_v, hi_v = w.min(axis=axis, keepdims=True), w.max(axis=axis, keepdims=True)
+    lo_v = np.minimum(w.min(axis=axis, keepdims=True), 0)
+    hi_v = np.maximum(w.max(axis=axis, keepdims=True), 0)
     scale = (hi_v - lo_v) / hi
     scale = np.where(scale == 0, np.finfo(np.float32).eps, scale)
     zp = np.clip(np.round(-lo_v / scale), 0, hi)
