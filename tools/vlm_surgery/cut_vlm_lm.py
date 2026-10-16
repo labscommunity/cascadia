@@ -125,10 +125,16 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
     num_layers = int(text["num_hidden_layers"])
     hidden = int(text["hidden_size"])
     lm_xml = os.path.join(model_dir, "openvino_language_model.xml")
-    for fn in ("openvino_language_model.xml", "openvino_text_embeddings_model.xml",
-               "openvino_vision_embeddings_model.xml"):
+    required = ["openvino_language_model.xml", "openvino_text_embeddings_model.xml",
+                "openvino_vision_embeddings_model.xml"]
+    if family == "mistral3":
+        # Rank 0 reads spatial_merge_size from processor_config.json and runs
+        # the projector on the merged rows; without them the tree would serve
+        # as plain Pixtral and fail only at image time.
+        required += ["openvino_multi_modal_projector_model.xml", "processor_config.json"]
+    for fn in required:
         if not os.path.exists(os.path.join(model_dir, fn)):
-            raise SystemExit(f"{model_dir} lacks {fn}; not an OpenVINO VLM export")
+            raise SystemExit(f"{model_dir} lacks {fn}; not an OpenVINO {family} VLM export")
 
     if num_stages > num_layers:
         raise SystemExit(f"--num-stages {num_stages} exceeds the {num_layers} decoder layers")

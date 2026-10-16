@@ -262,6 +262,26 @@ pub fn expand_image_tokens(
     Ok(out)
 }
 
+/// `spatial_merge_size` from `processor_config.json`, a processor (not image
+/// processor) setting. `None` when the file or the key is absent, so the image
+/// processor's value stands.
+fn processor_spatial_merge(dir: &Path) -> Result<Option<u32>, String> {
+    let Some(v) = std::fs::read(dir.join("processor_config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+    else {
+        return Ok(None);
+    };
+    match v
+        .get("spatial_merge_size")
+        .and_then(serde_json::Value::as_u64)
+    {
+        Some(0) => Err("processor_config.json: spatial_merge_size is 0".into()),
+        Some(m) => Ok(Some(m as u32)),
+        None => Ok(None),
+    }
+}
+
 /// Rank 0's Pixtral image front end: the vision IR, its processor settings
 /// and the framing token ids.
 pub struct Frontend {
@@ -282,9 +302,8 @@ impl Frontend {
     pub fn load(dir: &Path, tokens: ImageTokens) -> Result<Self, String> {
         let mut preprocess =
             PreprocessConfig::from_json_file(&dir.join("preprocessor_config.json"))?;
-        // `spatial_merge_size` is a processor (not image processor) setting.
-        if let Ok(p) = PreprocessConfig::from_json_file(&dir.join("processor_config.json")) {
-            preprocess.spatial_merge = p.spatial_merge;
+        if let Some(m) = processor_spatial_merge(dir)? {
+            preprocess.spatial_merge = m;
         }
         let compile = |name: &str| {
             let path = dir.join(name);
@@ -417,6 +436,23 @@ impl Frontend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn processor_config_overrides_merge_only_when_it_names_one() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(processor_spatial_merge(dir.path()), Ok(None));
+        let write = |v: &str| std::fs::write(dir.path().join("processor_config.json"), v).unwrap();
+        write(r#"{"processor_class":"PixtralProcessor"}"#);
+        assert_eq!(
+            processor_spatial_merge(dir.path()),
+            Ok(None),
+            "absent key keeps the default"
+        );
+        write(r#"{"spatial_merge_size":2}"#);
+        assert_eq!(processor_spatial_merge(dir.path()), Ok(Some(2)));
+        write(r#"{"spatial_merge_size":0}"#);
+        assert!(processor_spatial_merge(dir.path()).is_err());
+    }
 
     /// `unfold(kernel=2, stride=2)` on a 2x4 patch grid of 2 channels: token
     /// (0, c) takes patches (0,2c), (0,2c+1), (1,2c), (1,2c+1), channel-major.
