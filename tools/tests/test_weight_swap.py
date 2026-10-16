@@ -24,6 +24,22 @@ def test_int8_asym_per_channel_formula():
     assert np.abs(deq - w).max() <= float(s.astype(np.float32).max())
 
 
+def test_int8_asym_single_signed_rows_keep_zero_in_range():
+    # NNCF's asymmetric range is [min(w, 0), max(w, 0)]. A 4-tap linear-attention conv1d channel is
+    # often all one sign (row 10 of Qwen3.8-27B layer 0's conv1d below); a [min, max] range would
+    # clamp the zero point to 0/255 and saturate the row ([186, 255, 255, 255] instead of Intel's
+    # [107, 178, 255, 173]).
+    w = np.array([[0.03540039, 0.05859375, 0.08398438, 0.05688477],
+                  [-0.01452637, -0.10058594, -0.07861328, -0.06591797]], dtype=np.float32)
+    q, zp, s = ws.q_asym(w, 8, axis=-1)
+    np.testing.assert_array_equal(q[0], [107, 178, 255, 173])
+    np.testing.assert_array_equal(zp[:, 0], [0, 255])
+    span = np.maximum(w.max(-1, keepdims=True), 0) - np.minimum(w.min(-1, keepdims=True), 0)
+    np.testing.assert_array_equal(s, (span / 255.0).astype(np.float16))
+    deq = (q.astype(np.float32) - zp) * s.astype(np.float32)
+    assert np.abs(deq - w).max() <= float(s.astype(np.float32).max())
+
+
 def test_sym8_rows():
     w = np.array([[1.0, -2.0], [0.0, 0.0]], dtype=np.float32)
     q, s = ws.q_sym8(w)
