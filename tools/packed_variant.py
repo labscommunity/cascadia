@@ -13,6 +13,18 @@ replacing that node with a `[1, 1, S, T]` Parameter — and dropping the now-unu
 2D `attention_mask` — hands mask construction to the host, which is where the
 per-slot policy belongs anyway.
 
+Some families build more than one mask. Gemma 4's stages feed their SDPAs from
+TWO producers: one for the sliding-window layers and one for the full-attention
+layers (both also open each image bidirectionally, from `token_type_ids`). Each
+producer is classified from the tree's `config.json` `layer_types` (by the
+layer index in the producer's name, cross-checked against the SDPA order) and
+replaced by its own Parameter: `attn_mask_4d` for full attention,
+`attn_mask_sliding_4d` for the sliding window. Inputs left with no consumer
+(`attention_mask`, `token_type_ids`) are dropped, and `stage_config.json`
+records the ports under `packed_masks` (plus `packed_sliding_window`) so the
+runtime knows what to feed. One full-attention producer (every family served
+before Gemma 4) takes the original edit unchanged and records nothing new.
+
 Reusable on an already-exported stage (no HF model, no torch, no re-trace):
 
     python tools/packed_variant.py <stage_dir> --slots 8
@@ -20,6 +32,7 @@ Reusable on an already-exported stage (no HF model, no torch, no re-trace):
 
 import json
 import os
+import re
 
 import openvino as ov
 
@@ -29,12 +42,137 @@ except ImportError:  # pragma: no cover - depends on installed OV version
     from openvino import op as _ovop
 
 
-def build_packed_model(ov_model, packed_seq: int, has_embed: bool, hidden_size: int):
-    """Return `ov_model` rewired to take a `[1,1,S,T]` mask and seq=S queries.
+FULL, SLIDING = "full_attention", "sliding_attention"
+# Parameter name per mask kind. The full-attention name is the one every
+# packed IR has had; the runtime feeds whichever of the two the IR declares.
+MASK_PORTS = {FULL: "attn_mask_4d", SLIDING: "attn_mask_sliding_4d"}
+_LAYER_RE = re.compile(r"layers\.(\d+)\.")
+
+
+def _kind(layer_type) -> str:
+    if layer_type in (FULL, SLIDING):
+        return layer_type
+    raise RuntimeError(f"unknown layer type {layer_type!r} in config.json layer_types")
+
+
+def classify_mask_producers(sdpa, layer_types=None, layer_start: int = 0, num_layers=None):
+    """Map each SDPA mask producer's friendly name to FULL or SLIDING.
+
+    Without sliding layers in `layer_types` every producer is full attention
+    (the families served before Gemma 4).
+    With it, a producer's kind comes from the layer index in its name (the
+    surgery keeps the full model's node names, and the shared mask is named
+    after the first layer that built it, e.g. `layers.5.self_attn/.../Slice_11`).
+    When the stage has one SDPA per layer, the SDPA order gives each consumer's
+    own layer; that must agree, and it decides when the name carries no index.
+    """
+    producers = {}
+    for k, node in enumerate(sdpa):
+        src = node.input_value(3).get_node()
+        producers.setdefault(src.get_friendly_name(), []).append(k)
+    if not layer_types or SLIDING not in layer_types:
+        # No sliding layers anywhere: whatever else the config lists, every
+        # mask is the plain causal one.
+        return {name: FULL for name in producers}
+    by_order = num_layers is not None and len(sdpa) == num_layers
+    out = {}
+    for name, consumers in producers.items():
+        named = None
+        m = _LAYER_RE.search(name)
+        if m and int(m.group(1)) < len(layer_types):
+            named = _kind(layer_types[int(m.group(1))])
+        ordered = None
+        if by_order:
+            kinds = {_kind(layer_types[layer_start + k]) for k in consumers}
+            if len(kinds) != 1:
+                raise RuntimeError(
+                    f"mask producer {name} feeds layers of several types {sorted(kinds)}; "
+                    "one host mask cannot serve both")
+            ordered = kinds.pop()
+        if named and ordered and named != ordered:
+            raise RuntimeError(
+                f"mask producer {name}: its name says {named} but the layers it feeds "
+                f"(stage SDPAs {consumers}, layer_start {layer_start}) are {ordered}")
+        kind = named or ordered
+        if kind is None:
+            raise RuntimeError(
+                f"cannot tell whether mask producer {name} is sliding or full attention: "
+                "no layer index in its name and the stage's SDPA count "
+                f"({len(sdpa)}) does not match its layer count ({num_layers})")
+        out[name] = kind
+    return out
+
+
+def _reachable_parameters(model):
+    """Parameters some Result still depends on."""
+    seen, stack, found = set(), list(model.get_results()), set()
+    while stack:
+        node = stack.pop()
+        if node.get_instance_id() in seen:
+            continue
+        seen.add(node.get_instance_id())
+        if node.get_type_name() == "Parameter":
+            found.add(node.get_friendly_name())
+        for inp in node.inputs():
+            stack.append(inp.get_source_output().get_node())
+    return found
+
+
+def _rewire_masks(ov_model, sdpa, kinds, info):
+    """Several producers (or a sliding one): one Parameter per mask kind.
+    Returns the new parameter list; fills `info` with what changed."""
+    by_name = {}
+    for node in sdpa:
+        src = node.input_value(3).get_node()
+        by_name.setdefault(src.get_friendly_name(), src)
+    new_params = {}
+    for name, src in by_name.items():
+        kind = kinds[name]
+        port = MASK_PORTS[kind]
+        if port not in new_params:
+            # Current (possibly dynamic) shape; the caller reshapes to [1,1,S,T].
+            p = _ovop.Parameter(
+                src.output(0).get_element_type(), src.output(0).get_partial_shape()
+            )
+            p.set_friendly_name(port)
+            p.output(0).set_names({port})
+            new_params[port] = p
+        p = new_params[port]
+        if p.output(0).get_element_type() != src.output(0).get_element_type():
+            raise RuntimeError(f"{port}: mask producers disagree on element type")
+        for target in list(src.output(0).get_target_inputs()):
+            target.replace_source_output(p.output(0))
+    old = list(ov_model.get_parameters())
+    probe = ov.Model(ov_model.get_results(), old + list(new_params.values()), "probe")
+    live = _reachable_parameters(probe)
+    dropped = [p.get_friendly_name() for p in old if p.get_friendly_name() not in live]
+    for port in new_params:
+        if port not in live:
+            raise RuntimeError(f"{port} feeds nothing after the rewrite")
+    info["packed_masks"] = {port: kind for kind, port in MASK_PORTS.items() if port in new_params}
+    info["packed_dropped_inputs"] = dropped
+    info["mask_producers"] = {n: kinds[n] for n in by_name}
+    return [p for p in old if p.get_friendly_name() in live] + list(new_params.values())
+
+
+def build_packed_model(
+    ov_model,
+    packed_seq: int,
+    has_embed: bool,
+    hidden_size: int,
+    layer_types=None,
+    layer_start: int = 0,
+    num_layers=None,
+    info=None,
+):
+    """Return `ov_model` rewired to take `[1,1,S,T]` mask(s) and seq=S queries.
 
     Mutates and returns a NEW ov.Model sharing the original's ops; the caller's
-    handle should be considered consumed.
+    handle should be considered consumed. `layer_types` (config.json, whole
+    model) and `layer_start` / `num_layers` (this stage) classify several mask
+    producers; `info`, when given, receives what the edit did.
     """
+    info = {} if info is None else info
     sdpa = [
         o
         for o in ov_model.get_ordered_ops()
@@ -47,12 +185,15 @@ def build_packed_model(ov_model, packed_seq: int, has_embed: bool, hidden_size: 
         )
     mask_src = sdpa[0].input_value(3).get_node()
     feeders = {s.input_value(3).get_node().get_friendly_name() for s in sdpa}
-    if len(feeders) != 1:
+    kinds = classify_mask_producers(sdpa, layer_types, layer_start, num_layers)
+    if len(feeders) > 1 and set(kinds.values()) == {FULL}:
         raise RuntimeError(
             f"expected ONE shared mask producer across {len(sdpa)} SDPA nodes, "
-            f"found {len(feeders)}: {sorted(feeders)}. Packing needs a single "
-            "cut point; per-layer masks would need per-layer edits."
+            f"found {len(feeders)}: {sorted(feeders)}. Several producers are "
+            "supported only as sliding + full attention, told apart by config.json "
+            "`layer_types` (with sliding layers) beside the stage."
         )
+    single = len(feeders) == 1 and set(kinds.values()) == {FULL}
 
     past_len = None
     for p in ov_model.get_parameters():
@@ -63,24 +204,27 @@ def build_packed_model(ov_model, packed_seq: int, has_embed: bool, hidden_size: 
         raise RuntimeError("no past_key_values.* inputs: not a stateless static export")
     packed_context = past_len + packed_seq
 
-    # Create the Parameter at the graph's CURRENT mask shape, then move
-    # everything to seq=S in one reshape(). Building it pre-shaped fails SDPA
-    # shape inference at construction time, because the rest of the graph is
-    # still seq=1 at that moment.
-    et = mask_src.output(0).get_element_type()
-    cur = [int(d) for d in mask_src.output(0).get_partial_shape().get_shape()]
-    new_mask = _ovop.Parameter(et, ov.PartialShape(cur))
-    new_mask.set_friendly_name("attn_mask_4d")
-    new_mask.output(0).set_names({"attn_mask_4d"})
-    for target in list(mask_src.output(0).get_target_inputs()):
-        target.replace_source_output(new_mask.output(0))
+    if single:
+        # Create the Parameter at the graph's CURRENT mask shape, then move
+        # everything to seq=S in one reshape(). Building it pre-shaped fails SDPA
+        # shape inference at construction time, because the rest of the graph is
+        # still seq=1 at that moment.
+        et = mask_src.output(0).get_element_type()
+        cur = [int(d) for d in mask_src.output(0).get_partial_shape().get_shape()]
+        new_mask = _ovop.Parameter(et, ov.PartialShape(cur))
+        new_mask.set_friendly_name("attn_mask_4d")
+        new_mask.output(0).set_names({"attn_mask_4d"})
+        for target in list(mask_src.output(0).get_target_inputs()):
+            target.replace_source_output(new_mask.output(0))
 
-    old_mask = next(
-        p
-        for p in ov_model.get_parameters()
-        if "attention_mask" in p.output(0).get_any_name()
-    )
-    params = [p for p in ov_model.get_parameters() if p is not old_mask] + [new_mask]
+        old_mask = next(
+            p
+            for p in ov_model.get_parameters()
+            if "attention_mask" in p.output(0).get_any_name()
+        )
+        params = [p for p in ov_model.get_parameters() if p is not old_mask] + [new_mask]
+    else:
+        params = _rewire_masks(ov_model, sdpa, kinds, info)
     packed = ov.Model(ov_model.get_results(), params, "packed_slots")
 
     names = {p.get_any_name() for p in packed.inputs}
@@ -94,17 +238,25 @@ def build_packed_model(ov_model, packed_seq: int, has_embed: bool, hidden_size: 
     shape_map = {}
     for p in packed.inputs:
         name = p.get_any_name()
-        shape = [int(d) for d in p.get_partial_shape().get_shape()]
+        ps = p.get_partial_shape()
+        # A `--shared-prefill` IR leaves the query width dynamic; every port
+        # below that has one is given its packed shape.
+        shape = [int(d) for d in ps.get_shape()] if ps.is_static else None
         if "past_key_values" in name:
             pass
-        elif name == "attn_mask_4d":
+        elif name in MASK_PORTS.values():
             shape = [1, 1, packed_seq, packed_context]
+        elif name == "token_type_ids":
+            # Kept only when something besides the masks still reads it.
+            shape = [1, packed_seq]
         elif name == main_name:
             shape = (
                 [1, packed_seq] if name == "input_ids" else [1, packed_seq, hidden_size]
             )
         elif name == "position_ids":
             shape = [1, packed_seq]
+        if shape is None:
+            raise RuntimeError(f"stage input {name}{ps} is dynamic and has no packed shape")
         shape_map[name] = ov.PartialShape(shape)
     packed.reshape(shape_map)
     packed.validate_nodes_and_infer_types()
@@ -120,6 +272,20 @@ def build_packed_model(ov_model, packed_seq: int, has_embed: bool, hidden_size: 
             f"the NPU compiler will reject this IR: {bad}"
         )
     return packed, packed_context
+
+
+def tree_layer_types(stage_dir: str):
+    """`(layer_types, sliding_window)` from the tree's config.json (one level
+    above the stage), or `(None, None)` when the tree has neither."""
+    path = os.path.join(os.path.dirname(os.path.abspath(stage_dir)), "config.json")
+    if not os.path.exists(path):
+        return None, None
+    with open(path) as fh:
+        c = json.load(fh)
+    text = c.get("text_config") or {}
+    layer_types = c.get("layer_types") or text.get("layer_types")
+    window = c.get("sliding_window") or text.get("sliding_window")
+    return layer_types, window
 
 
 def write_packed_variant(stage_dir: str, slots: int, packed_seq: int = None) -> dict:
@@ -143,12 +309,24 @@ def write_packed_variant(stage_dir: str, slots: int, packed_seq: int = None) -> 
         for p in model.inputs:
             if p.get_any_name() in ("inputs_embeds", "hidden_states"):
                 hidden_size = p.get_partial_shape()[2].get_length()
+    layer_types, window = tree_layer_types(stage_dir)
+    start, end = cfg.get("layer_start"), cfg.get("layer_end")
+    info = {}
     packed, packed_context = build_packed_model(
         model,
         packed_seq,
         bool(cfg.get("has_embed")),
         int(hidden_size),
+        layer_types=layer_types,
+        layer_start=int(start or 0),
+        num_layers=(int(end) - int(start)) if start is not None and end else None,
+        info=info,
     )
+    if "packed_masks" in info and SLIDING in info["packed_masks"].values() and not window:
+        raise RuntimeError(
+            f"{stage_dir}: the stage has sliding-window layers but config.json gives "
+            "no sliding_window"
+        )
     out = os.path.join(stage_dir, "openvino_packed_model.xml")
     ov.save_model(packed, out, compress_to_fp16=True)
 
@@ -157,6 +335,15 @@ def write_packed_variant(stage_dir: str, slots: int, packed_seq: int = None) -> 
     cfg["packed_seq"] = packed_seq
     cfg["packed_context"] = packed_context
     cfg["packed_region"] = past_len // slots
+    # Only a multi-mask (or sliding) rewrite records its ports; a stage
+    # without `packed_masks` has the one full-attention `attn_mask_4d`.
+    for key in ("packed_masks", "packed_sliding_window", "packed_dropped_inputs"):
+        cfg.pop(key, None)
+    if "packed_masks" in info:
+        cfg["packed_masks"] = info["packed_masks"]
+        cfg["packed_dropped_inputs"] = info["packed_dropped_inputs"]
+        if SLIDING in info["packed_masks"].values():
+            cfg["packed_sliding_window"] = int(window)
     with open(cfg_path, "w") as fh:
         json.dump(cfg, fh, indent=2)
     size_mb = os.path.getsize(out.replace(".xml", ".bin")) / 1e6
@@ -165,6 +352,12 @@ def write_packed_variant(stage_dir: str, slots: int, packed_seq: int = None) -> 
         f"slots={slots} seq={packed_seq} context={packed_context} "
         f"region={past_len // slots}"
     )
+    if "packed_masks" in info:
+        print(
+            f"  mask producers {info['mask_producers']} -> ports {info['packed_masks']}"
+            f"{f' window={window}' if 'packed_sliding_window' in cfg else ''}; "
+            f"dropped inputs {info['packed_dropped_inputs']}"
+        )
     return cfg
 
 
