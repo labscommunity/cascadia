@@ -1577,8 +1577,18 @@ fn vision_tree_media(engine: EngineKind, family: &str) -> Option<cascadia_api::M
         (EngineKind::OvRuntime | EngineKind::Gemma4, "gemma4") => {
             Some(cascadia_api::MediaConfig::gemma4_native())
         }
+        (EngineKind::OvRuntime, "gemma3") => Some(cascadia_api::MediaConfig::gemma3_native()),
         (EngineKind::OvRuntime | EngineKind::OvDistSpec, "pixtral" | "mistral3") => {
             Some(cascadia_api::MediaConfig::pixtral_native())
+        }
+        // Staged ov-runtime only: ov-dist-spec takes Pixtral targets alone.
+        (EngineKind::OvRuntime, "phi3_v") => Some(cascadia_api::MediaConfig::phi3v_native()),
+        (EngineKind::OvRuntime, "internvl_chat") => {
+            Some(cascadia_api::MediaConfig::internvl_native())
+        }
+        // ov-dist-spec refuses a LLaVA-NeXT target at load.
+        (EngineKind::OvRuntime, "llava_next") => {
+            Some(cascadia_api::MediaConfig::llava_next_native())
         }
         // Qwen2.5-VL / Qwen3-VL: Qwen's native tag, as the staged qwen35
         // engine; rank 0 expands `<|image_pad|>`. ov-runtime only: dist-spec
@@ -3946,7 +3956,24 @@ mod tests {
             tag(EngineKind::OvDistSpec, "mistral3").as_deref(),
             Some("[IMG]")
         );
-        // dist-spec refuses Gemma 4 targets at load; gemma4 has no Pixtral path.
+        assert_eq!(
+            tag(EngineKind::OvRuntime, "phi3_v").as_deref(),
+            Some("<|image_{n}|>\n")
+        );
+        assert_eq!(
+            tag(EngineKind::OvRuntime, "internvl_chat").as_deref(),
+            Some("<img><IMG_CONTEXT></img>\n")
+        );
+        assert_eq!(tag(EngineKind::OvDistSpec, "phi3_v"), None);
+        assert_eq!(tag(EngineKind::OvDistSpec, "internvl_chat"), None);
+        assert_eq!(
+            tag(EngineKind::OvRuntime, "gemma3").as_deref(),
+            Some("<start_of_image>")
+        );
+        // dist-spec refuses Gemma 3 / 4 targets at load; the gemma4 engine
+        // serves only its own family.
+        assert_eq!(tag(EngineKind::OvDistSpec, "gemma3"), None);
+        assert_eq!(tag(EngineKind::Gemma4, "gemma3"), None);
         assert_eq!(tag(EngineKind::OvDistSpec, "gemma4"), None);
         assert_eq!(tag(EngineKind::Gemma4, "pixtral"), None);
         assert_eq!(tag(EngineKind::OvDistSpec, "qwen35"), None);
@@ -3961,6 +3988,11 @@ mod tests {
         );
         assert_eq!(tag(EngineKind::OvDistSpec, "qwen2_5_vl"), None);
         assert_eq!(tag(EngineKind::OvDistSpec, "qwen3_vl"), None);
+        assert_eq!(
+            tag(EngineKind::OvRuntime, "llava_next").as_deref(),
+            Some("<image>\n")
+        );
+        assert_eq!(tag(EngineKind::OvDistSpec, "llava_next"), None);
     }
 
     #[test]

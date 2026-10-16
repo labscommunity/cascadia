@@ -58,8 +58,12 @@ names the field.
 | Qwen2.5-VL, Qwen3-VL, InternVL2, Phi-3.5-vision, LLaVA-NeXT (llava-v1.6), Gemma 3 | `ov-genai` | one box | the OpenVINO exports as published (`OpenVINO/<model>-int4-ov`) |
 | Gemma 4 26B-A4B / 31B | `ov-runtime` | 2+ machines, stateful, static or packed | `tools/gemma4_surgery/export_gemma4_text.py --vision` |
 | Gemma 4 E2B / E4B | `gemma4` | 1+ machines | `tools/export_gemma4.py --vision DIR` |
+| Gemma 3 (4B / 12B / 27B) | `ov-runtime` | 1+ machines, stateful or static | `tools/vlm_surgery/cut_vlm_lm.py --family gemma3` |
 | Pixtral 12B | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family pixtral` |
 | Mistral 3 (Ministral-3, Mistral Small 3.1/3.2) | `ov-runtime` | 1+ machines | export with optimum-intel, then `tools/vlm_surgery/cut_vlm_lm.py --family mistral3` |
+| Phi-3.5-vision | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family phi3_v` on `OpenVINO/Phi-3.5-vision-instruct-int4-ov` |
+| InternVL2 (Phi-3 text tower, e.g. InternVL2-4B) | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family internvl_chat` on `OpenVINO/InternVL2-4B-int4-ov` |
+| LLaVA-NeXT (llava-v1.6-mistral-7b) | `ov-runtime` | 1+ machines | `tools/vlm_surgery/cut_vlm_lm.py --family llava_next` on `OpenVINO/llava-v1.6-mistral-7b-hf-int4-ov` |
 | Pixtral 12B target, Ministral-3-3B draft | `ov-dist-spec` | 2+ machines, stateful | `cut_vlm_lm.py --family pixtral --all-logits` for the target, `tools/vlm_surgery/make_text_draft.py` for the draft |
 | Qwen2.5-VL (7B) | `ov-runtime` | 1+ machines, stateful | `tools/vlm_surgery/cut_vlm_lm.py --family qwen2_5_vl` |
 | Qwen3-VL (4B) | `ov-runtime` | 1+ machines, stateful | `tools/vlm_surgery/cut_vlm_lm.py --family qwen3_vl` |
@@ -74,9 +78,11 @@ block. `ov-dist-spec` refuses a Gemma 4 target tree at load. Not supported:
 - **Llama 3.2 Vision** (`mllama`), refused at export: its text tower has cross-attention.
 - **MiniCPM-V 4.7**: GenAI 2026.4.1 does not know its model type (`minicpmv4_7`) and the
   engine fails to load.
-- Staged (multi-machine) serving of the other GenAI-only families above (InternVL2,
-  Phi-3.5-vision, LLaVA-NeXT, Gemma 3): their trees are not exported with the vision
-  tower yet (`export_shards.py` notes when it drops one).
+- Staged (multi-machine) serving of the GenAI-only families above other than
+  Phi-3.5-vision, InternVL2, LLaVA-NeXT, Qwen2.5-VL and Qwen3-VL: their trees are not
+  exported with the vision tower yet (`export_shards.py` notes when it drops one).
+- Phi-3.5-vision and InternVL2 on `ov-dist-spec`: it takes Pixtral targets only.
+- **LLaVA-NeXT on `ov-dist-spec`**: refused at load (Pixtral / Mistral 3 targets only).
 - Qwen2.5-VL / Qwen3-VL on static, packed or `ov-dist-spec` trees: those paths feed 1-D
   positions and these models need M-RoPE positions on every stage, so the tree is
   refused at load (`ov-dist-spec` offers no image input for it).
@@ -115,6 +121,25 @@ python tools/vlm_surgery/cut_vlm_lm.py --model <OpenVINO/pixtral-12b-int4-ov dir
 `--num-stages 1` cuts a one-stage tree for a single box. `--stage I` cuts one stage on a
 worker that holds only that one.
 
+### Gemma 3 (ov-runtime)
+
+```bash
+python tools/vlm_surgery/cut_vlm_lm.py --model <OpenVINO/gemma-3-12b-it-int4-ov dir> \
+    --output-dir <tree> --num-stages 2 --family gemma3
+```
+
+The published export already fits: its language model takes `inputs_embeds` and
+`token_type_ids`, and its vision IR (SigLIP, the 4x4 pool and the projector) returns
+256 rows per image at the text width. Rank 0 resizes each image to 896x896 (bilinear,
+as HF's processor), expands each `<start_of_image>` of the rendered prompt into
+HF's `\n\n<start_of_image>` + 256 x `<image_soft_token>` + `<end_of_image>\n\n` before
+tokenizing, and splices the image rows in. Every stage takes `token_type_ids`: Gemma 3
+opens each image both ways in its full and sliding masks, so the types ride the wire as
+a third frame, as for Gemma 4. For the static path pass `--prefill-seq` of at least 256
+and keep `--context` + `--prefill-seq` within 1025 (sliding window 1024), for example
+`--context 768 --prefill-seq 256` (two images). Pan-and-scan (off in the published
+processor config) is refused at load.
+
 ### Mistral 3 (ov-runtime)
 
 No OpenVINO export is published, so make one with optimum-intel (`main`; release 2.2.0
@@ -131,6 +156,48 @@ python tools/vlm_surgery/cut_vlm_lm.py --model <export dir> --output-dir <tree> 
 The export holds four IRs; rank 0 runs the vision tower, regroups each 2x2 block of
 patches and runs `openvino_multi_modal_projector_model.xml` on them. Exporting on Windows
 is fine: the chat template it writes has CRLF line endings, which the server normalises.
+
+### Phi-3.5-vision (ov-runtime)
+
+```bash
+python tools/vlm_surgery/cut_vlm_lm.py --model <OpenVINO/Phi-3.5-vision-instruct-int4-ov dir> \
+    --output-dir <tree> --num-stages 2 --family phi3_v
+```
+
+The export holds four IRs: the CLIP tower (`openvino_vision_embeddings_model.xml`, one
+336-px view to 576 patch rows), the projector (`openvino_vision_projection_model.xml`),
+the text embeddings and the language model. Rank 0 does the processor's HD transform
+(up to `num_crops` 4 crops of 336 px plus a global view), merges each view's patches 2x2,
+lays the crops out with the `sub_GN` / `glb_GN` separator rows from `config.json`, and
+runs the projector. Each image is `<|image_N|>` followed by a newline in the prompt, as
+the model card writes it; rank 0 tokenizes the text between tags chunk by chunk, each
+with its BOS, as `Phi3VProcessor` does. The tree also stops on `<|end|>`.
+
+### InternVL2 (ov-runtime)
+
+```bash
+python tools/vlm_surgery/cut_vlm_lm.py --model <OpenVINO/InternVL2-4B-int4-ov dir> \
+    --output-dir <tree> --num-stages 2 --family internvl_chat
+```
+
+The vision IR already ends in the projector (448-px tile to 256 rows). Rank 0 cuts the
+image into the closest grid of at most `max_dynamic_patch` (12) tiles plus a thumbnail,
+as the model card's `load_image` does, and writes each image as
+`<img>` + `<IMG_CONTEXT>` x 256 per tile + `</img>`, a newline after it.
+
+### LLaVA-NeXT (ov-runtime)
+
+```bash
+python tools/vlm_surgery/cut_vlm_lm.py --model <OpenVINO/llava-v1.6-mistral-7b-hf-int4-ov dir> \
+    --output-dir <tree> --num-stages 2 --family llava_next
+```
+
+The export's vision IR is the CLIP tower plus projector (`[n, 3, 336, 336]` to
+`[n, 576, 4096]`); `image_newline` is a 4096-float array in its `config.json`, which the
+cut keeps as `config.vlm.json`. Rank 0 picks the image's pinpoint, encodes the 336x336
+base view and the tiles in one inference and packs the rows as HF does (the base view,
+then the tile grid without its padding, `image_newline` after each row). A message's
+images go before its text (`<image>\n` each), as the processor's template writes them.
 
 ### Qwen2.5-VL / Qwen3-VL (ov-runtime)
 
@@ -183,6 +250,8 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
 - `--prefill-seq C` adds a chunked prefill (C rows per inference). On CPU/GPU,
   `--shared-prefill` writes one IR that serves both decode and prefill, so the weights
   are compiled once; the NPU needs the two separate static IRs (omit the flag).
+- **LLaVA-NeXT** spends up to 2928 tokens on an image, so give it `--context 4096` or
+  more; it attends causally, so any `--prefill-seq` works (not yet run on hardware).
 - **Gemma 4** needs `--prefill-seq` at least one image wide (280), and `--context` plus
   `--prefill-seq` must stay within the sliding window + 1 (1025): for example
   `--context 736 --prefill-seq 288`, which holds about two images.
@@ -238,12 +307,22 @@ is not practical on the NPU: one stage's decode IR had not compiled after 90 min
 
 ## Limits worth knowing
 
-- Prompt tokens count the image's tokens (Gemma 4: at most 280 per image; Pixtral: one per
-  16x16 patch plus row breaks, 832 for a 448x448 image with its text; Qwen: about one per
-  1000 pixels, a 448x448 image is 196 tokens on Qwen3.5 / Qwen3-VL and 256 on Qwen2.5-VL).
-  The counts match Hugging Face's processor for the same request.
+- Prompt tokens count the image's tokens (Gemma 4: at most 280 per image; Gemma 3: 256 per
+  image plus its markers and blank lines, 286 for a 448x448 image with the SDK test's text;
+  Pixtral: one per 16x16 patch plus row breaks, 832 for a 448x448 image with its text;
+  LLaVA-NeXT: 576 plus its unpadded tile rows, at most 2928, so 2945 for a 448x448 image
+  with its text; Phi-3.5-vision: `(crops + 1) * 144 + 1 + (crop rows + 1) * 12`, 757 for a
+  448x448 image; InternVL2: 256 per tile, one tile for 448x448, up to 13 tiles (3328
+  tokens) for an image whose aspect ratio matches a 12-tile grid, small images included;
+  Qwen: about one per 1000 pixels, a 448x448 image is 196 tokens on Qwen3.5 / Qwen3-VL
+  and 256 on Qwen2.5-VL). The counts match Hugging Face's processor for the same
+  request (`ov-genai` counts 2956 for that LLaVA-NeXT request).
+- Phi-3.5-vision and InternVL2: these exports carry Phi-3's RoPE frequencies as a traced
+  constant, with no switch to the long factors past 4096 positions, so longer sequences
+  differ from Hugging Face; ov-genai runs the same IRs. The load log says so.
 - Packed slots: a prompt must fit one slot's region, `(context - 1 - packed_prefix) /
-  slots`; two Pixtral images do not fit two slots of a 2048 context.
+  slots`; two Pixtral images do not fit two slots of a 2048 context, and one 448x448
+  LLaVA-NeXT image (2945 tokens with its text) needs a region of at least that.
 - Gemma 4 packed slots: a request whose image is wider than `--packed-seq` rows is
   refused with a 400 (lower detail sends a smaller image). Every inference is
   `--packed-seq` rows, decode included, so a 288-row variant decodes at a 288-row
