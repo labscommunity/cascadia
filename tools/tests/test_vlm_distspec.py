@@ -181,3 +181,22 @@ def test_cut_all_logits_keeps_every_row(tmp_path, all_logits):
     rows = np.zeros((1, len(span), HIDDEN), np.float32)
     got = req.infer({"inputs_embeds": rows, **_feed(span, 0)})[req.model_outputs[0]]
     assert got.shape == ((1, len(span), VOCAB) if all_logits else (1, 1, VOCAB))
+
+
+def test_check_text_draft_greedy_matches_on_a_composed_toy(tmp_path):
+    import check_text_draft as chk
+
+    core = ov.Core()
+    ref = chk.Stateful(core.compile_model(toy_lm(), "CPU"),
+                       core.compile_model(toy_embeddings(), "CPU"))
+    draft = chk.Stateful(core.compile_model(mtd.compose(toy_embeddings(), toy_lm()), "CPU"))
+    ids = [1, 4, 9, 10, 10, 3]
+    r, d = chk.greedy(ref, ids, 6), chk.greedy(draft, ids, 6)
+    assert len(r) == 6 and chk.first_diff(r, d) is None
+    # A rejected span is masked out and its positions reused, as dist-spec does.
+    draft.reset()
+    draft.feed(ids)
+    draft.feed([5, 6])
+    draft.rewind(2)
+    assert draft.mask == [1] * len(ids) + [0, 0] and draft.pos == len(ids)
+    assert chk.first_diff([1, 2], [1, 3]) == 1 and chk.first_diff([1], [1, 2]) == 1

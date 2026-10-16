@@ -128,8 +128,8 @@ is fine: the chat template it writes has CRLF line endings, which the server nor
 
 ### Pixtral with speculative decoding (ov-dist-spec)
 
-Only the target sees images; the draft is a text model fed the expanded prompt ids
-(image tokens as plain tokens), so it changes the acceptance rate, never the answer.
+Only the target sees images; the draft is a text model fed the prompt without its
+image ids, so it changes the acceptance rate, never the answer.
 The target's last stage must return logits for every position (`--all-logits`), and the
 draft must be one IR that takes `input_ids`:
 
