@@ -420,7 +420,7 @@ def test_cli_kev_final_hidden_weights_lora(cli, monkeypatch):
     seen = {}
     monkeypatch.setattr(de, "kev_head_meta", lambda pt: {"base": None, "weights": None})
     monkeypatch.setattr(de, "write_kev_profile",
-                        lambda pt, out, hidden: seen.update(pt=pt, hidden=hidden) or de._write(out, {"family": "kev"}, {"kind": "pointer"}))
+                        lambda pt, out, hidden, max_tokens=None: seen.update(pt=pt, hidden=hidden) or de._write(out, {"family": "kev"}, {"kind": "pointer"}))
     pt = str(_kev_dir(tmp) / "H.pt")
     run("kev", "--base-ir", str(base), "--weights", "W", "--lora", "L.safetensors", "--lora-scale", "2",
         "--head-pt", pt, "--stages", "2", "--out", str(tmp / "t"))
@@ -434,7 +434,7 @@ def test_cli_kev_final_hidden_weights_lora(cli, monkeypatch):
 def test_cli_clef_weights_default_to_clef_dir(cli, monkeypatch):
     run, calls, base, tmp = cli
     monkeypatch.setattr(de, "write_clef_profile",
-                        lambda cd, out: de._write(out, {"family": "clef"}, {"kind": "joint"}))
+                        lambda cd, out, max_tokens=None: de._write(out, {"family": "clef"}, {"kind": "joint"}))
     run("clef", "--base-ir", str(base), "--clef-dir", "C", "--out", str(tmp / "t"))
     (_, a, kw, assets_first), = calls
     assert a[3] is False and kw == {"weights": "C", "lora": None, "lora_scale": None, "final_hidden": True}
@@ -604,7 +604,7 @@ def _kev_dir(tmp, tokenizer=True):
 def _stub_kev(monkeypatch, meta=None):
     monkeypatch.setattr(de, "kev_head_meta", lambda pt: meta or {"base": "Qwen/Qwen3.5-9B-Base", "weights": "lora"})
     monkeypatch.setattr(de, "write_kev_profile",
-                        lambda pt, out, hidden: de._write(out, {"family": "kev"}, {"kind": "pointer"}))
+                        lambda pt, out, hidden, max_tokens=None: de._write(out, {"family": "kev"}, {"kind": "pointer"}))
 
 
 def test_cli_kev_ships_the_tokenizer_beside_head_pt(cli, monkeypatch):
@@ -681,7 +681,7 @@ def test_kev_head_meta_reads_base_and_weights_mode(tmp_path):
 def test_cli_jev_and_clef_pass_no_tokenizer_by_default(cli, monkeypatch):
     run, calls, base, tmp = cli
     monkeypatch.setattr(de, "write_clef_profile",
-                        lambda cd, out: de._write(out, {"family": "clef"}, {"kind": "joint"}))
+                        lambda cd, out, max_tokens=None: de._write(out, {"family": "clef"}, {"kind": "joint"}))
     run("clef", "--base-ir", str(base), "--clef-dir", "C", "--out", str(tmp / "t"))
     (_, a, kw, _), = calls
     assert "tokenizer" not in kw
@@ -785,3 +785,189 @@ def test_cli_kev_unsupported_head_flag_is_a_clean_error(cli, capsys, flag):
     assert e.value.code == 2
     assert f"{flag}=True" in capsys.readouterr().err
     assert calls == [] and not (tmp / "t").exists()
+
+
+# Task 30 (limits-audit L6): --max-tokens for every family, capped like JEV by the checkpoint's
+# max_position_embeddings; calibration bounds mirrored from DecisionProfile::load.
+
+def test_max_tokens_defaults_are_capped_by_max_position_embeddings():
+    assert de.resolve_max_tokens("jev", None, None) == 32768
+    assert de.resolve_max_tokens("jev", None, 262144) == 32768
+    assert de.resolve_max_tokens("jev", None, 4096) == 4096
+    assert de.resolve_max_tokens("kev", None, None) == 73728
+    assert de.resolve_max_tokens("kev", None, 262144) == 73728
+    assert de.resolve_max_tokens("kev", None, 40960) == 40960
+    assert de.resolve_max_tokens("clef", None, None) == 16384
+    assert de.resolve_max_tokens("clef", None, 8192) == 8192
+
+
+@pytest.mark.parametrize("family", ["jev", "kev", "clef"])
+def test_max_tokens_override_is_used_as_given(family):
+    assert de.resolve_max_tokens(family, 2048, 262144) == 2048
+    assert de.resolve_max_tokens(family, 2048, None) == 2048
+    assert de.resolve_max_tokens(family, 4096, 4096) == 4096
+
+
+@pytest.mark.parametrize("family", ["jev", "kev", "clef"])
+def test_max_tokens_override_above_max_position_embeddings_refused(family):
+    with pytest.raises(ValueError, match="--max-tokens 4097 exceeds the max_position_embeddings 4096 of the checkpoint"):
+        de.resolve_max_tokens(family, 4097, 4096)
+
+
+@pytest.mark.parametrize("family,cap,name", [("jev", 131072, "MAX_DECISION_PROMPT"),
+                                             ("kev", 131072, "MAX_DECISION_PROMPT"),
+                                             ("clef", 16384, "MAX_JOINT_PROMPT")])
+def test_max_tokens_override_above_the_family_hard_cap_refused(family, cap, name):
+    assert de.resolve_max_tokens(family, cap, None) == cap
+    with pytest.raises(ValueError, match=f"--max-tokens {cap + 1} exceeds {family}'s {cap} \\({name}"):
+        de.resolve_max_tokens(family, cap + 1, None)
+    with pytest.raises(ValueError, match=name):
+        de.resolve_max_tokens(family, cap + 1, 10 ** 7)
+
+
+def _seen_writers(monkeypatch, seen):
+    monkeypatch.setattr(de, "write_jev_profile", lambda ad, cal, out, max_tokens: seen.update(mt=max_tokens))
+    monkeypatch.setattr(de, "kev_head_meta", lambda pt: {"base": None, "weights": None})
+    monkeypatch.setattr(de, "write_kev_profile",
+                        lambda pt, out, hidden, max_tokens=None: seen.update(mt=max_tokens))
+    monkeypatch.setattr(de, "write_clef_profile", lambda cd, out, max_tokens=None: seen.update(mt=max_tokens))
+
+
+def _family_argv(family, base, tmp):
+    return {"jev": ["--adapter-dir", str(tmp / "jev" / "adapter_vllm")],
+            "kev": ["--weights", "W", "--lora", "L.safetensors", "--head-pt", str(_kev_dir(tmp) / "head.pt")],
+            "clef": ["--clef-dir", "C"]}[family] + ["--base-ir", str(base), "--out", str(tmp / "t")]
+
+
+@pytest.mark.parametrize("family,default", [("jev", 32768), ("kev", 73728), ("clef", 16384)])
+def test_cli_max_tokens_reaches_every_family(cli, monkeypatch, family, default):
+    run, calls, base, tmp = cli
+    seen = {}
+    _seen_writers(monkeypatch, seen)
+    run(family, *_family_argv(family, base, tmp))
+    assert seen == {"mt": default}  # base config's 262144 does not bind
+    run(family, *_family_argv(family, base, tmp), "--max-tokens", "1024")
+    assert seen == {"mt": 1024}
+
+
+def test_cli_kev_default_capped_by_the_weights_config(cli, monkeypatch):
+    run, calls, base, tmp = cli
+    seen = {}
+    _seen_writers(monkeypatch, seen)
+    w = tmp / "ft"
+    w.mkdir()
+    (w / "config.json").write_text(json.dumps({"text_config": {"max_position_embeddings": 40960}}))
+    run("kev", "--base-ir", str(base), "--weights", str(w), "--lora", "L.safetensors",
+        "--head-pt", str(_kev_dir(tmp) / "head.pt"), "--out", str(tmp / "t"))
+    assert seen == {"mt": 40960}
+
+
+def test_cli_clef_default_capped_by_the_clef_dir_config(cli, monkeypatch):
+    run, calls, base, tmp = cli
+    seen = {}
+    _seen_writers(monkeypatch, seen)
+    cd = tmp / "clef"
+    cd.mkdir()
+    (cd / "config.json").write_text(json.dumps({"max_position_embeddings": 8192}))
+    run("clef", "--base-ir", str(base), "--clef-dir", str(cd), "--out", str(tmp / "t"))
+    assert seen == {"mt": 8192}
+
+
+@pytest.mark.parametrize("family", ["jev", "kev", "clef"])
+def test_cli_max_tokens_above_max_position_embeddings_is_a_clean_error(cli, monkeypatch, capsys, family):
+    run, calls, base, tmp = cli
+    seen = {}
+    _seen_writers(monkeypatch, seen)
+    (base / "config.json").write_text(json.dumps({"text_config": {"max_position_embeddings": 4096, "hidden_size": 8}}))
+    out = tmp / "t"
+    out.mkdir()
+    (out / "manifest.json").write_text("{}")
+    with pytest.raises(SystemExit) as e:
+        run(family, *_family_argv(family, base, tmp), "--max-tokens", "8192")
+    assert e.value.code == 2
+    err = capsys.readouterr().err
+    assert "--max-tokens 8192" in err and "max_position_embeddings 4096" in err
+    # refused before anything is touched: no writer ran, the earlier tree is left as it was
+    assert seen == {} and calls == [] and (out / "manifest.json").exists()
+
+
+def test_cli_clef_max_tokens_above_the_joint_cap_is_a_clean_error(cli, monkeypatch, capsys):
+    run, calls, base, tmp = cli
+    seen = {}
+    _seen_writers(monkeypatch, seen)
+    with pytest.raises(SystemExit) as e:
+        run("clef", *_family_argv("clef", base, tmp), "--max-tokens", "16385")
+    assert e.value.code == 2 and "MAX_JOINT_PROMPT" in capsys.readouterr().err
+    assert seen == {} and calls == []
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", "lots", ""])
+def test_cli_max_tokens_must_be_a_positive_integer(cli, monkeypatch, capsys, value):
+    run, calls, base, tmp = cli
+    seen = {}
+    _seen_writers(monkeypatch, seen)
+    with pytest.raises(SystemExit) as e:
+        run("kev", *_family_argv("kev", base, tmp), f"--max-tokens={value}")
+    assert e.value.code == 2 and "--max-tokens" in capsys.readouterr().err
+    assert seen == {} and calls == []
+
+
+@pytest.mark.parametrize("per_kind,field", [
+    ({"noul": 1.0, "choice": 0.0009, "score": 1.0}, "jev.temperature.choice"),
+    ({"noul": 1.0, "choice": 1.0, "score": 1000.5}, "jev.temperature.score"),
+    ({"noul": 0, "choice": 1.0, "score": 1.0}, "jev.temperature.noul"),
+    ({"noul": float("nan"), "choice": 1.0, "score": 1.0}, "jev.temperature.noul"),
+    ({"noul": "1.0", "choice": 1.0, "score": 1.0}, "jev.temperature.noul"),
+])
+def test_jev_temperature_outside_the_server_bounds_refused(tmp_path, per_kind, field):
+    adapter, cal = _jev_adapter(tmp_path, per_kind=per_kind)
+    out = tmp_path / "tree"
+    with pytest.raises(ValueError, match=f"{field} must be in \\[0.001, 1000\\]"):
+        de.write_jev_profile(str(adapter), str(cal), str(out))
+    assert not (out / "decision.json").exists()
+
+
+@pytest.mark.parametrize("bias", [10000.5, -10001, float("inf"), float("nan")])
+def test_jev_bias_outside_the_server_bounds_refused(tmp_path, bias):
+    adapter, cal = _jev_adapter(tmp_path)
+    h = json.loads((adapter / "decision_head.json").read_text())
+    h["bias"][3] = bias
+    (adapter / "decision_head.json").write_text(json.dumps(h))
+    out = tmp_path / "tree"
+    with pytest.raises(ValueError, match=r"jev.bias\[3\] must be in \[-10000, 10000\]"):
+        de.write_jev_profile(str(adapter), str(cal), str(out))
+    assert not (out / "decision.json").exists()
+
+
+def test_jev_calibration_at_the_server_bounds_exports(tmp_path):
+    adapter, cal = _jev_adapter(tmp_path, per_kind={"noul": 0.001, "choice": 1000, "score": 1.0})
+    h = json.loads((adapter / "decision_head.json").read_text())
+    h["bias"][0], h["bias"][1] = 10000, -10000
+    (adapter / "decision_head.json").write_text(json.dumps(h))
+    de.write_jev_profile(str(adapter), str(cal), str(tmp_path / "tree"))
+    assert json.loads((tmp_path / "tree" / "decision.json").read_text())["jev"]["bias"][:2] == [10000, -10000]
+
+
+@pytest.mark.parametrize("t", [0.0009, 1001.0, 0.0])
+def test_kev_temperature_outside_the_server_bounds_refused_before_any_asset(tmp_path, t):
+    pt = _kev_head(tmp_path / "head.pt", temperature=t)
+    with pytest.raises(ValueError, match=r"kev.temperature must be in \[0.001, 1000\]"):
+        de.write_kev_profile(pt, str(tmp_path / "tree"), hidden=8)
+    assert not (tmp_path / "tree").exists()
+    for ok in (0.001, 1000.0):
+        de.write_kev_profile(_kev_head(tmp_path / "ok.pt", temperature=ok), str(tmp_path / "ok"), hidden=8)
+
+
+def _rust_consts(rel):
+    import re
+    src = open(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, rel)).read()
+    return {k: float(v.replace("_", "")) for k, v in re.findall(r"pub const (\w+): \w+ = ([0-9_.e+-]+);", src)}
+
+
+def test_bounds_mirror_the_rust_constants():
+    """The exporter refuses what the server would: these must stay equal to the Rust constants."""
+    prof = _rust_consts("crates/cascadia-api/src/decisions/profile.rs")
+    assert (de.MIN_TEMPERATURE, de.MAX_TEMPERATURE, de.MAX_ABS_BIAS) == \
+        (prof["MIN_TEMPERATURE"], prof["MAX_TEMPERATURE"], prof["MAX_ABS_BIAS"])
+    types = _rust_consts("crates/cascadia-types/src/decision.rs")
+    assert (de.MAX_DECISION_PROMPT, de.MAX_JOINT_PROMPT) == (types["MAX_DECISION_PROMPT"], types["MAX_JOINT_PROMPT"])

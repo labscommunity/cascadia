@@ -458,6 +458,14 @@ python tools/decision_export.py clef --base-ir STOCK_INT8_IR \
 ```
 
 - `--stages N` sets the stage cut count: 8 for a single box, one per rank for a pipeline.
+- `--max-tokens N` sets `decision.json` `max_tokens` for any family. The default is 32,768 for
+  JEV, 73,728 for Kev and 16,384 for Clef, each lowered to the tree's `max_position_embeddings`
+  (from the `config.json` the tree ships: the one in `--weights`, which for Clef defaults to
+  `--clef-dir`, when it has one, else the base IR's). An `N` above that window, or above the server's own cap
+  (131,072 for JEV and Kev, Clef's 16,384 joint pass), is refused rather than lowered.
+- The exporter refuses calibration the server would refuse at load (see [Limits](#limits)): a JEV
+  or Kev `temperature` outside [0.001, 1000] or a JEV `bias` outside [-10,000, 10,000]. The error
+  names the field, such as `jev.temperature.choice` or `jev.bias[3]`.
 - JEV takes `--weights` only for a fine-tuned backbone that does not already hold the adapter
   merged, stated with `--weights-not-merged` (check with `tools/decision/backbone_diff.py`).
 - Kev ships the `tokenizer.json` beside `head.pt`, not the Base checkpoint's (`--tokenizer FILE`
