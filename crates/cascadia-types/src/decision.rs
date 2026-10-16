@@ -307,6 +307,12 @@ mod tests {
         assert_eq!(bytes, MAX_HEAD_INPUT_BYTES, "{line}");
         let mib = format!("MAX_TENSOR_BYTES={}MiB", MAX_HEAD_INPUT_BYTES >> 20);
         assert!(src.contains(&mib), "shim error text must say {mib}");
+        // The margin is zero (Clef-27B's `hidden` at MAX_JOINT_PROMPT is exactly the limit), so
+        // the shim must refuse only what is strictly larger: `>=` would refuse an admitted input.
+        assert!(
+            src.contains("if (data_size > MAX_TENSOR_BYTES)"),
+            "shim must compare with a strict >"
+        );
     }
 
     #[test]
@@ -539,6 +545,113 @@ mod tests {
             cp.validate(100, 64).is_err(),
             "cache_prefix must leave >= 1 token to prefill"
         );
+    }
+
+    #[test]
+    fn validate_pins_every_reason() {
+        let joint = |questions: Vec<JointQuestion>| ReadoutHead::Joint { questions };
+        let q = |qtype: u8, span: [u32; 2], opts: &[[u32; 2]]| JointQuestion {
+            qtype,
+            span,
+            options: opts.iter().map(|&span| JointOption { span }).collect(),
+        };
+        let err = |r: DecisionReadout| r.validate(100, 64).unwrap_err();
+        let verb = |ids: Vec<u32>| ReadoutHead::Verbalizer { token_ids: ids };
+        assert_eq!(
+            err(readout(0, verb(vec![1]))),
+            "decision prompt has 0 tokens; allowed 1..=64"
+        );
+        assert_eq!(
+            err(readout(65, verb(vec![1]))),
+            "decision prompt has 65 tokens; allowed 1..=64"
+        );
+        let mut bad_id = readout(3, verb(vec![1]));
+        bad_id.prompt_ids[1] = 100;
+        assert_eq!(err(bad_id), "decision prompt id 100 >= vocab 100");
+        assert_eq!(
+            err(readout(10, verb(vec![100]))),
+            "verbalizer id 100 >= vocab 100"
+        );
+        assert_eq!(
+            err(readout(10, verb(vec![]))),
+            format!("decision head asks for 0 logits; allowed 1..={MAX_DECISION_OUTPUTS}")
+        );
+        // One past MAX_DECISION_OUTPUTS (ids are in range, so only the count is wrong).
+        assert_eq!(
+            readout(10, verb(vec![1; MAX_DECISION_OUTPUTS + 1]))
+                .validate(100, 64)
+                .unwrap_err(),
+            format!(
+                "decision head asks for {} logits; allowed 1..={MAX_DECISION_OUTPUTS}",
+                MAX_DECISION_OUTPUTS + 1
+            )
+        );
+        assert!(readout(10, verb(vec![1; MAX_DECISION_OUTPUTS]))
+            .validate(100, 64)
+            .is_ok());
+        assert_eq!(
+            err(readout(
+                10,
+                ReadoutHead::Pointer {
+                    decide_pos: 10,
+                    option_pos: vec![3]
+                }
+            )),
+            "pointer position 10 outside the 10-token prompt"
+        );
+        let mut cp = readout(10, verb(vec![1]));
+        cp.cache_prefix = Some(10);
+        assert_eq!(err(cp), "cache_prefix 10 must be < prompt length 10");
+        // A valid cache_prefix (the last one that leaves a token to prefill) is accepted.
+        let mut cp = readout(10, verb(vec![1]));
+        cp.cache_prefix = Some(9);
+        assert!(cp.validate(100, 64).is_ok());
+        assert_eq!(
+            err(readout(10, joint(vec![]))),
+            format!("decision head asks for 0 logits; allowed 1..={MAX_DECISION_OUTPUTS}")
+        );
+        // More than MAX_JOINT_QUESTIONS questions (one option each, so the logit count is fine).
+        let n = 2 * (MAX_JOINT_QUESTIONS as u32 + 1) + 1;
+        let many: Vec<_> = (0..=MAX_JOINT_QUESTIONS as u32)
+            .map(|i| q(0, [2 * i, 2 * i + 1], &[[2 * i + 1, 2 * i + 2]]))
+            .collect();
+        assert_eq!(
+            readout(n, joint(many.clone()))
+                .validate(1000, 1000)
+                .unwrap_err(),
+            format!(
+                "joint readout has {} questions; allowed 1..={MAX_JOINT_QUESTIONS}",
+                MAX_JOINT_QUESTIONS + 1
+            )
+        );
+        assert!(readout(n, joint(many[1..].to_vec()))
+            .validate(1000, 1000)
+            .is_ok());
+        assert_eq!(
+            err(readout(10, joint(vec![q(3, [1, 2], &[[2, 3]])]))),
+            "joint question 0: bad qtype or no options"
+        );
+        assert_eq!(
+            err(readout(10, joint(vec![q(0, [4, 4], &[[5, 6]])]))),
+            "joint question 0: span [4, 4] empty, out of range or out of order"
+        );
+        // Each question is in order on its own, but the second starts before the first ends.
+        assert_eq!(
+            err(readout(
+                10,
+                joint(vec![q(0, [4, 5], &[[5, 6]]), q(0, [1, 2], &[[2, 3]])])
+            )),
+            "joint question 1: span [1, 2] empty, out of range or out of order"
+        );
+        assert!(readout(
+            10,
+            joint(vec![
+                q(0, [1, 2], &[[2, 3]]),
+                q(1, [4, 5], &[[5, 6], [6, 8]])
+            ])
+        )
+        .validate(100, 64)
+        .is_ok());
     }
 
     #[test]

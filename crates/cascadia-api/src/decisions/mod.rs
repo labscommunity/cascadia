@@ -111,17 +111,19 @@ impl std::fmt::Debug for DecisionService {
 /// Whether `model_dir` has a `decision.json` entry at all. `Path::exists` follows symlinks and
 /// reads a dangling one as absent, so a broken `decision.json` would silently mean "chat model"
 /// (H5); any entry, or a lookup that fails for another reason than "not found", counts as present.
+/// A `model_dir` that is a regular file (NotADirectory) has no entry either.
 pub fn decision_json_present(model_dir: &Path) -> bool {
+    use std::io::ErrorKind;
     match std::fs::symlink_metadata(model_dir.join("decision.json")) {
         Ok(_) => true,
-        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        Err(e) => !matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory),
     }
 }
 
 impl DecisionService {
     /// `Ok(None)` when the model directory has no `decision.json` (a plain chat model). An entry
     /// that is there but cannot be read (a dangling symlink, a directory) is an `Err`.
-    pub fn load(model_dir: &Path) -> Result<Option<Arc<DecisionService>>, String> {
+    pub fn load(model_dir: &Path) -> Result<Option<DecisionService>, String> {
         let path = model_dir.join("decision.json");
         if !decision_json_present(model_dir) {
             return Ok(None);
@@ -130,7 +132,7 @@ impl DecisionService {
         let tok = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| format!("{}: tokenizer.json: {e}", model_dir.display()))?;
         Self::from_profile(&prof, tok, tree_hidden(model_dir))
-            .map(|s| Some(Arc::new(s)))
+            .map(Some)
             .map_err(|e| format!("{}: {e}", path.display()))
     }
 
@@ -447,6 +449,17 @@ mod tests {
         assert!(super::decision_json_present(&d));
         assert!(super::DecisionService::load(&d).is_err());
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A `--model` that is a regular file (a typo, or a weights file) has no `decision.json`:
+    /// the lookup fails with NotADirectory, which must read as absent, not "present but unusable".
+    #[test]
+    fn a_model_path_that_is_a_file_has_no_decision_json() {
+        let f = std::env::temp_dir().join(format!("dec-file-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&f, b"weights").unwrap();
+        assert!(!super::decision_json_present(&f));
+        assert!(matches!(super::DecisionService::load(&f), Ok(None)));
+        std::fs::remove_file(&f).unwrap();
     }
 
     use super::*;

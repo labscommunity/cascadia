@@ -56,8 +56,10 @@ pub enum OaPart {
     InputImage { image_url: String },
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+/// Tagged by `type`, but not with `#[serde(tag)]`: an internally tagged enum buffers the whole
+/// question through serde's f64 number path, which refuses an integer of 310+ digits ("number
+/// out of range") before any field is read. See the `Deserialize` impl below.
+#[derive(Clone, Debug)]
 pub enum OaQuestion {
     Predicate {
         name: String,
@@ -75,12 +77,88 @@ pub enum OaQuestion {
     },
 }
 
+#[derive(Deserialize)]
+struct OaQuestionTag<'a> {
+    #[serde(rename = "type", borrow)]
+    qtype: std::borrow::Cow<'a, str>,
+}
+
+#[derive(Deserialize)]
+struct OaPredicateFields {
+    name: String,
+    instructions: String,
+}
+
+#[derive(Deserialize)]
+struct OaChoiceFields {
+    name: String,
+    instructions: String,
+    choices: Vec<OaChoice>,
+}
+
+#[derive(Deserialize)]
+struct OaScoreFields {
+    name: String,
+    instructions: String,
+    levels: Vec<OaLevel>,
+}
+
+/// Reads the question's raw text twice, never buffering it: once for `type` (other fields are
+/// skipped unparsed), once into that type's fields (unknown fields, `type` included, ignored, as
+/// the tagged derive did). Needs a serde_json deserializer, which [`parse_request`] is.
+impl<'de> Deserialize<'de> for OaQuestion {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let raw = <&serde_json::value::RawValue>::deserialize(d)?;
+        // The outer error adds its own position; keep only the message of the inner one.
+        let inner = |e: serde_json::Error| {
+            let m = e.to_string();
+            D::Error::custom(match m.rfind(" at line ") {
+                Some(i) => m[..i].to_string(),
+                None => m,
+            })
+        };
+        let tag: OaQuestionTag = serde_json::from_str(raw.get()).map_err(inner)?;
+        Ok(match tag.qtype.as_ref() {
+            "predicate" => {
+                let f: OaPredicateFields = serde_json::from_str(raw.get()).map_err(inner)?;
+                OaQuestion::Predicate {
+                    name: f.name,
+                    instructions: f.instructions,
+                }
+            }
+            "choice" => {
+                let f: OaChoiceFields = serde_json::from_str(raw.get()).map_err(inner)?;
+                OaQuestion::Choice {
+                    name: f.name,
+                    instructions: f.instructions,
+                    choices: f.choices,
+                }
+            }
+            "score" => {
+                let f: OaScoreFields = serde_json::from_str(raw.get()).map_err(inner)?;
+                OaQuestion::Score {
+                    name: f.name,
+                    instructions: f.instructions,
+                    levels: f.levels,
+                }
+            }
+            other => {
+                return Err(D::Error::unknown_variant(
+                    &echo(other),
+                    &["predicate", "choice", "score"],
+                ))
+            }
+        })
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct OaChoice {
     /// A string or a number, exactly as `/v1/systemone` would parse the same literal. Serde
-    /// buffers the internally tagged `OaQuestion` through f64, so the derive only checks that the
-    /// field is there (and leaves `Null`); `parse_request` fills it from the body's raw text.
-    /// `to_internal` rejects any other JSON type.
+    /// would read a number through f64, so the derive only checks that the field is there (and
+    /// leaves `Null`, skipping the literal unparsed); `parse_request` fills it from the body's
+    /// raw text. `to_internal` rejects any other JSON type.
     #[serde(deserialize_with = "present")]
     pub value: OrderedValue,
     #[serde(default)]
@@ -400,8 +478,18 @@ fn oa_err(e: DecisionError) -> Response {
     oa_envelope(e.status(), kind, e.to_string())
 }
 
-/// How much of a caller's unknown content-part `type` an error message echoes, in characters.
+/// How much of a caller's unknown content-part or question `type` an error message echoes, in
+/// characters.
 const ECHO_CHARS: usize = 64;
+
+/// `s` capped at [`ECHO_CHARS`] characters, with `…` when cut.
+fn echo(s: &str) -> String {
+    let mut shown: String = s.chars().take(ECHO_CHARS).collect();
+    if shown.len() < s.len() {
+        shown.push('…');
+    }
+    shown
+}
 
 /// The first content part in `body` that `OaPart` cannot read, named for the caller. The untagged
 /// `OaContent` reports only that no variant matched, which does not say which part is at fault.
@@ -422,11 +510,7 @@ fn bad_content_part(body: &serde_json::Value) -> Option<String> {
             "input_text" => "text",
             "input_image" => "image_url",
             other => {
-                let mut shown: String = other.chars().take(ECHO_CHARS).collect();
-                if shown.len() < other.len() {
-                    shown.push('…');
-                }
-                return Some(format!("unsupported content part type '{shown}'"));
+                return Some(format!("unsupported content part type '{}'", echo(other)));
             }
         };
         if !part.get(field).is_some_and(serde_json::Value::is_string) {
@@ -551,6 +635,51 @@ mod tests {
     }
 
     #[test]
+    fn an_integer_choice_value_of_any_size_keeps_every_digit() {
+        // Task 26 M1: 310+ digits overflow f64, which an internally tagged enum's buffering used
+        // to hit ("number out of range"); `/v1/systemone` reads the literal as a big int.
+        let big = format!("1{}", "0".repeat(400));
+        let (r, meta) = to_internal(&oa(&one_choice(&format!(
+            r#"{{"value": {big}}}, {{"value": "b"}}"#
+        ))))
+        .unwrap();
+        assert_eq!(r.questions["c"].option_keys(), [big.as_str(), "b"]);
+        assert_eq!(
+            serde_json::to_string(&meta[0].choice_values[0]).unwrap(),
+            big
+        );
+        // The question-level checks are unchanged: a missing field, an unknown type, a
+        // non-string type.
+        for (q, want) in [
+            (
+                r#"{"type": "choice", "name": "c", "choices": []}"#,
+                "missing field `instructions`",
+            ),
+            (
+                r#"{"type": "maybe", "name": "c"}"#,
+                "unknown variant `maybe`, expected one of `predicate`, `choice`, `score`",
+            ),
+            (r#"{"name": "c"}"#, "missing field `type`"),
+            (
+                r#"{"type": 5, "name": "c"}"#,
+                "invalid type: integer `5`, expected a string",
+            ),
+        ] {
+            let body = format!(r#"{{"input": "x", "questions": [{q}]}}"#);
+            match parse_request(&body) {
+                Err(DecisionError::BadRequest(m)) => {
+                    assert!(
+                        m.starts_with(&format!("invalid request body: {want}")),
+                        "{m}"
+                    );
+                    assert_eq!(m.matches(" at line ").count(), 1, "one position: {m}");
+                }
+                other => panic!("{q}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn duplicate_keys_in_the_body_are_rejected() {
         // Task 25 review (a): a repeated top-level key used to be a 400, not last-one-wins.
         let q = r#""questions": [{"type": "predicate", "name": "a", "instructions": "x"}]"#;
@@ -577,6 +706,18 @@ mod tests {
             Err(DecisionError::BadRequest(m)) => assert_eq!(
                 m,
                 format!("unsupported content part type '{}…'", "é".repeat(64))
+            ),
+            other => panic!("{other:?}"),
+        }
+        // An unknown question type is capped the same way.
+        let body = format!(r#"{{"input": "x", "questions": [{{"type": "{long}"}}]}}"#);
+        match parse_request(&body) {
+            Err(DecisionError::BadRequest(m)) => assert!(
+                m.starts_with(&format!(
+                    "invalid request body: unknown variant `{}…`, expected one of",
+                    "é".repeat(64)
+                )),
+                "{m}"
             ),
             other => panic!("{other:?}"),
         }

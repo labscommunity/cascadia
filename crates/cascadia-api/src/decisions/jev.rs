@@ -80,6 +80,8 @@ impl JevCodec {
                 ));
             }
         }
+        p.check_calibration()
+            .map_err(|e| format!("decision.json jev: {e}"))?;
         if p.verbalizer_ids.len() != p.bias.len() || p.verbalizers.len() != p.bias.len() {
             return Err(
                 "decision.json jev: verbalizers, verbalizer_ids and bias must have equal length"
@@ -215,6 +217,9 @@ impl Codec for JevCodec {
         for (qid, q) in &req.questions {
             super::check_cancel(cancel)?;
             let text = self.prompt_with_state(req, qid, &state);
+            // No BOS (`add_special_tokens = false`, none in the text): serve_decide does the same
+            // for the Qwen-based JEV models, whose tokenizers add none. A JEV on a base that
+            // expects `<bos>` (Gemma) would need it prepended here; none ships (H6).
             let enc = self
                 .tok
                 .encode(text.as_str(), false)
@@ -353,6 +358,22 @@ mod tests {
     }
 
     #[test]
+    fn empty_descriptions_and_missing_instructions_render_like_serve_decide() {
+        // H7: an empty (or null) description drops the `: ` (`A) name`), and a question without
+        // instructions asks its own id.
+        let c = JevCodec::new(tiny_tokenizer(), profile()).unwrap();
+        let r: DecisionRequest = serde_json::from_str(
+            r#"{"model": "m", "state": "s", "questions": {
+            "pick_one": {"type": "choice", "criteria": {"billing": "", "tech": null, "ops": "on call"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.prompt_text(&r, "pick_one"),
+            "[kind] choice\n[state] s\n[question] pick_one\n[options]\nA) billing\nB) tech\nC) ops: on call\n[decision]:"
+        );
+    }
+
+    #[test]
     fn one_pass_per_question_with_verbalizer_slots() {
         let c = JevCodec::new(tiny_tokenizer(), profile()).unwrap();
         let passes = c.encode(&req()).unwrap();
@@ -469,6 +490,19 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn new_rechecks_the_calibration_bounds() {
+        // Task 24 M1: a profile built without `DecisionProfile::load` gets the same refusal.
+        let mut p = profile();
+        p.temperature.insert("score".into(), 0.0);
+        let e = JevCodec::new(tiny_tokenizer(), p).err().unwrap();
+        assert!(e.contains("temperature must be in"), "{e}");
+        let mut p = profile();
+        p.bias[3] = 1e308;
+        let e = JevCodec::new(tiny_tokenizer(), p).err().unwrap();
+        assert!(e.contains("bias must be in"), "{e}");
     }
 
     #[test]
