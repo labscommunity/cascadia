@@ -827,6 +827,33 @@ Still re-prefilled: static and packed shards (the cache is stateful-only). A pla
 on another chain looks entries up by real token ids, so image entries are only resumed
 on the chain that captured them.
 
+## Final regression pass (2026-10-16)
+
+Two read-only reviews of everything after the earlier branch review (engines; API, CLI
+and tools) found nothing high or medium; the five low findings they verified are fixed:
+Mistral 3's `spatial_merge` no longer resets to 1 when `processor_config.json` lacks it,
+`cut_vlm_lm.py --family mistral3` requires the projector IR and `processor_config.json`,
+GenAI's text-only hint names `--family mistral3`, the image encode cache keys on the
+tenant as well as the pixel hash, and a cached prefix that ends inside an image is skipped
+without being dropped (`take_warm_where`). The workspace passes 1195 tests (1301 with
+`kv_coord`); clippy reports the same 228 warnings as `main`; formatting is clean.
+
+One binary built from the result (and its `kv_coord` twin) then passed the 11-check SDK
+test on every serving path, on CPU:
+
+| Engine, placement | Model | Prompt tokens (1 / 2 images) |
+|---|---|---|
+| `ov-genai`, one box | Qwen3.6-35B-A3B | 227 |
+| `ov-genai`, one box | Gemma 3 4B | 286 |
+| `ov-runtime` stateful, one box | Ministral-3-3B | 815 |
+| `ov-runtime` stateful, one box | Pixtral 12B (re-cut) | 832 |
+| `ov-runtime` static, 4 stages on two machines | Gemma 4 26B-A4B (re-converted, shared prefill IR) | 288 / 550 |
+| `gemma4`, one box | Gemma 4 E4B | 284 |
+| `qwen35`, two machines | Qwen3.6-35B-A3B | 227 |
+
+With `kv_coord`, a text-only chat still warm-resumes (535 of 545 tokens on turn 2), and
+the image chat check (`sdk_vlm_kv.py`) passes 6/6 with its follow-ups resumed.
+
 ## Engines that do not take images (2026-10-15)
 
 Every engine either serves images or refuses them with an OpenAI 400; none answers
