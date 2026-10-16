@@ -1043,8 +1043,11 @@ the published `OpenVINO/gemma-3-12b-it-int4-ov` (Gemma license, not gated).
   expanded text; the processor's `token_type_ids` equal what rank 0 sends; and,
   with `CASCADIA_GEMMA3_TOKENIZER` set to the export's `tokenizer.json`, the Rust
   tokenizer gives HF's ids on every prompt. Prompt tokens: one image 270, two images 535.
-- **Not yet run** on the cluster: the cut itself (the IR cannot be cut without its
-  weights), the encoder against HF features, the SDK check, and packed slots.
+- **Verified** with Gemma 3 12B (`OpenVINO/gemma-3-12b-it-int4-ov`, public, revision
+  60f9d951), cut into 2 stages (layers 0-23 / 24-47) on each node and served across
+  pawan-02 (rank 0) and pawan-04 (rank 1), CPU: the 11-check SDK test passes, "There is a
+  red square and a blue circle.", 286 / 550 prompt tokens, which equals `ov-genai` on the
+  same export on one box (also 11/11). Not run: packed slots and the static path.
 
 ## Video: out of scope, kept cheap
 
