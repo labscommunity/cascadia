@@ -2183,7 +2183,7 @@ async fn prepare_media(
             let mut pieces = Vec::with_capacity(m.parts.len());
             for part in std::mem::take(&mut m.parts) {
                 match part {
-                    ContentPart::Text(t) => pieces.push(decode_cfg.text_part(t)),
+                    ContentPart::Text(t) => pieces.push((false, decode_cfg.text_part(t))),
                     ContentPart::ImageUrl { url, detail } => {
                         let i = inputs.len();
                         let input = match fetched[i].take() {
@@ -2194,13 +2194,13 @@ async fn prepare_media(
                         }
                         .map_err(|e| format!("image {i}: {e}"))?;
                         inputs.push(input);
-                        pieces.push(decode_cfg.placeholder(i));
+                        pieces.push((true, decode_cfg.placeholder(i)));
                     }
                 }
             }
             // Back to back, as the model's own template writes a content
-            // array (see `MediaConfig::trim_text_parts`).
-            m.content = pieces.concat();
+            // array (see `MediaConfig::trim_text_parts`, `images_first`).
+            m.content = decode_cfg.join_parts(pieces);
             out.push(m);
         }
         Ok::<_, String>((out, inputs))
