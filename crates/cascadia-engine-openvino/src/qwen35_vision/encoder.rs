@@ -452,9 +452,11 @@ impl VisionEncoder {
                 let (shape, v) = read_f32_at(&self.merger, i, "merger deepstack")?;
                 match shape[..] {
                     [layers, t, h] if t == tokens && h == out && layers > 0 => Some((layers, v)),
-                    _ => return Err(format!(
+                    _ => {
+                        return Err(format!(
                         "merger deepstack returned {shape:?}, expected [layers, {tokens}, {out}]"
-                    )),
+                    ))
+                    }
                 }
             }
             None => None,
