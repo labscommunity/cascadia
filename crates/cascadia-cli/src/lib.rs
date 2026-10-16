@@ -1396,6 +1396,21 @@ fn parse_ov_config(entries: &[String]) -> Vec<(String, String)> {
 /// The image family of a pipeline dir: its `pipeline_config.json` `vision`
 /// block's `family`, or `gemma4` for a block written by the Gemma 4 vision
 /// surgery before the field existed. `None` without a `vision` block.
+/// The API's image settings for a vision tree of `family` served by `engine`
+/// (the tag rank 0 expands), or `None` where that engine has no image path for
+/// the family.
+fn vision_tree_media(engine: EngineKind, family: &str) -> Option<cascadia_api::MediaConfig> {
+    match (engine, family) {
+        (EngineKind::OvRuntime | EngineKind::Gemma4, "gemma4") => {
+            Some(cascadia_api::MediaConfig::gemma4_native())
+        }
+        (EngineKind::OvRuntime | EngineKind::OvDistSpec, "pixtral" | "mistral3") => {
+            Some(cascadia_api::MediaConfig::pixtral_native())
+        }
+        _ => None,
+    }
+}
+
 fn pipeline_vision_family(model: &str) -> Option<String> {
     let v: serde_json::Value =
         std::fs::read(std::path::Path::new(model).join("pipeline_config.json"))
@@ -2403,6 +2418,8 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // rank that serves this API) and take Qwen's native tag.
         // `ov-runtime` serves images on a Gemma 4 vision tree (a `vision` block
         // in pipeline_config.json; rank 0 encodes them) with Gemma's own tag.
+        // `ov-dist-spec` serves them on a Pixtral / Mistral 3 target tree
+        // (cut_vlm_lm.py --all-logits): rank 0 encodes, the draft stays text.
         let has_vision = std::path::Path::new(&args.model)
             .join("openvino_vision_embeddings_model.xml")
             .exists();
@@ -2424,18 +2441,14 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             EngineKind::Qwen36Moe if has_vision => Some(cascadia_api::MediaConfig::qwen35_native()),
             // ov-runtime (Gemma 4 surgery trees) and gemma4 (gemma4_cached E2B/E4B
             // trees from export_gemma4.py --vision) both carry a `vision` block.
-            EngineKind::OvRuntime | EngineKind::Gemma4 if has_vision => {
+            EngineKind::OvRuntime | EngineKind::Gemma4 | EngineKind::OvDistSpec if has_vision => {
                 match pipeline_vision_family(&args.model) {
-                    Some(f) if f == "gemma4" => Some(cascadia_api::MediaConfig::gemma4_native()),
-                    Some(f)
-                        if (f == "pixtral" || f == "mistral3")
-                            && matches!(args.engine, EngineKind::OvRuntime) =>
-                    {
-                        Some(cascadia_api::MediaConfig::pixtral_native())
-                    }
                     Some(f) => {
-                        warn!(family = %f, "pipeline vision family has no API image tag; serving text only");
-                        None
+                        let media = vision_tree_media(args.engine, &f);
+                        if media.is_none() {
+                            warn!(family = %f, "pipeline vision family has no API image tag; serving text only");
+                        }
+                        media
                     }
                     None => None,
                 }
@@ -3669,6 +3682,36 @@ mod cli_version_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vision_tree_media_per_engine() {
+        use super::{vision_tree_media, EngineKind};
+        let tag = |e, f| vision_tree_media(e, f).map(|m| m.image_placeholder);
+        assert_eq!(
+            tag(EngineKind::OvRuntime, "gemma4").as_deref(),
+            Some("<|image|>")
+        );
+        assert_eq!(
+            tag(EngineKind::Gemma4, "gemma4").as_deref(),
+            Some("<|image|>")
+        );
+        assert_eq!(
+            tag(EngineKind::OvRuntime, "pixtral").as_deref(),
+            Some("[IMG]")
+        );
+        assert_eq!(
+            tag(EngineKind::OvDistSpec, "pixtral").as_deref(),
+            Some("[IMG]")
+        );
+        assert_eq!(
+            tag(EngineKind::OvDistSpec, "mistral3").as_deref(),
+            Some("[IMG]")
+        );
+        // dist-spec refuses Gemma 4 targets at load; gemma4 has no Pixtral path.
+        assert_eq!(tag(EngineKind::OvDistSpec, "gemma4"), None);
+        assert_eq!(tag(EngineKind::Gemma4, "pixtral"), None);
+        assert_eq!(tag(EngineKind::OvDistSpec, "qwen35"), None);
+    }
+
     #[test]
     fn pipeline_vision_family_is_read() {
         let dir = std::env::temp_dir().join(format!("cascadia-pv-{}", std::process::id()));
