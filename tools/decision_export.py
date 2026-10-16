@@ -129,6 +129,34 @@ def single_token_labels(tok, context=CHOICE_LABEL_CONTEXT, cap=MAX_CHOICE_LABELS
     return out
 
 
+# System 2's answer labels, ported from serve_decide.py setup: A..Z then AA..ZZ, each kept when
+# "Answer: ({label})" encodes as "Answer: (" plus exactly two more tokens, the label's (kept) and the
+# ")"'s, at most MAX_OPTIONS (256). The read-back after thinking scores these ids after "Answer: (".
+ANSWER_PREFIX = "Answer: ("
+# The token that closes Qwen's thinking channel (serve_decide PROFILES["qwen"]["end_think"]).
+END_THINK = "</think>"
+
+
+def answer_labels(tok, cap=MAX_CHOICE_LABELS):
+    """[(label, token id)] in label order, by serve_decide's System 2 rule."""
+    base = tok.encode(ANSWER_PREFIX, add_special_tokens=False)
+    out = []
+    for lab in list(string.ascii_uppercase) + [a + b for a in string.ascii_uppercase for b in string.ascii_uppercase]:
+        ids = tok.encode(f"{ANSWER_PREFIX}{lab})", add_special_tokens=False)
+        if ids[: len(base)] == base and len(ids) == len(base) + 2:
+            out.append((lab, ids[len(base)]))
+        if len(out) == cap:
+            break
+    return out
+
+
+def end_think_id(tok):
+    """The id of END_THINK when it is one token (serve_decide's convert_tokens_to_ids), else None:
+    a tokenizer without it has no thinking channel to stop at."""
+    ids = tok.encode(END_THINK, add_special_tokens=False)
+    return ids[0] if len(ids) == 1 else None
+
+
 class _TokenizerJson:
     """A tokenizer.json behind the transformers-style encode() single_token_labels calls."""
 
@@ -194,6 +222,14 @@ def write_jev_profile(adapter_dir, calibration_json, out_dir, max_tokens=32768, 
                              f"{slots['verbalizers'][lo:hi]}): the tree's tokenizer.json is not JEV's")
         profile["jev"]["choice_labels"] = [lab for lab, _ in labels]
         profile["jev"]["choice_label_ids"] = [t for _, t in labels]
+        # System 2 (adaptive thinking): the labels its read-back scores, and the token its
+        # generation stops at. The server refuses `thinking` on a tree without them.
+        answers = answer_labels(tokenizer)
+        profile["jev"]["answer_labels"] = [lab for lab, _ in answers]
+        profile["jev"]["answer_label_ids"] = [t for _, t in answers]
+        think = end_think_id(tokenizer)
+        if think is not None:
+            profile["jev"]["end_think_id"] = think
     if lora_scale is not None:
         # A switchable tree (--switchable-lora): the scale its stages' `lora_scale` input takes for
         # the grafted model. Absent = the scale is baked into the graft.
