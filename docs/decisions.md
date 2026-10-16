@@ -598,3 +598,37 @@ spike set):
 **Reference memory.** `reference_stream.py` keeps one fp32 decoder layer resident (about 8 GB private
 for 27B). On a 32 GB host it still cannot share memory with a running rank 0 (13–25 GB), so run the
 reference with the ranks stopped, then restart them for the parity verdict.
+
+### Clef 27B
+
+**Model:** [Cloudflare/clef](https://huggingface.co/Cloudflare/clef) (Qwen3.8-27B with a joint head over
+every position's final hidden state), served across two machines like JEV-27B. Against stock Qwen3.8-27B,
+`backbone_diff.py` finds layers 0–39, the embeddings, the norms and `lm_head` identical; only the
+projection weights of layers 40–63 are fine-tuned. The export swaps the whole checkpoint into Intel's
+int8 IR (`--weights`), as for Clef-flash.
+
+```bash
+hf download Cloudflare/clef --local-dir ~/models/clef      # 55 GB (BF16)
+python tools/decision_export.py clef --base-ir ~/models/qwen38-27b-int8 --weights ~/models/clef \
+    --clef-dir ~/models/clef --stages 2 --out ~/trees/clef-int8
+```
+
+The export holds a whole stage's new int8 constants (12–15 GB) and needs about 16 GB free; it is the one
+export above the 7 GB cap. Serve it with the two `cascadia worker` commands shown for JEV-27B.
+
+**Measured parity** (same two hosts and set as JEV-27B; one joint pass per record, 50 passes for 82
+questions):
+
+| Check | Result |
+|---|---|
+| Records vs the spike's `encode_record` (50 + 4 synthetic) | 54/54 |
+| int8 (2 machines) vs streamed fp32 reference | **81/82** (choice 32/33, predicate 24/24, score 25/25), max \|Δp\| 0.067; the one flip, `r41.team`, has a reference margin of 0.048 |
+| `/v1/decisions` vs `/v1/systemone` (string states) | 62/62 identical |
+
+**The swap must keep zero in each row's int8 range.** The first Clef 27B tree measured 78/82 with two
+confident flips and max |Δp| 0.30. The cause was the swap's quantizer: it scaled each row over
+[min, max], while NNCF (which built Intel's IR) uses [min(w, 0), max(w, 0)]. The two agree on every
+projection row, but a 4-tap linear-attention `conv1d` channel is single-signed in about a quarter of
+rows, and those rows saturated. That garbled the convolution in all 48 linear-attention layers of every
+`--weights` tree. With the fix, the swapped `conv1d` matches Intel's constants in at least 99.9% of
+entries.
