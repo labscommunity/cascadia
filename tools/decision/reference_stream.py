@@ -6,10 +6,19 @@ codec_golden.py's job). Peak memory ~ one fp32 layer + the passes' activations.
   python tools/decision/reference_stream.py jev  --weights JEV_BF16 --lora JEV/adapter_vllm/adapter_model.safetensors --tree TREE --dump d.parity.jsonl --out ref.json
   python tools/decision/reference_stream.py kev  --weights QWEN35_9B_BASE --lora KEV/adapter_model.safetensors --tree TREE --dump d.parity.jsonl --out ref.json
   python tools/decision/reference_stream.py clef --weights CLEF_DIR --clef-dir CLEF_DIR --tree TREE --dump d.parity.jsonl --out ref.json
+  python tools/decision/reference_stream.py jev  --weights JEV_BF16 --lora JEV/adapter_vllm/adapter_model.safetensors --tree TREE --dump d.wide.parity.jsonl --out wide_ref.json --wide
 
 REF.json maps "<record id>.<question id>" to probabilities in API option order (noul [false, true];
 choice in request order; score by level index): exactly one entry per question of the 50 records,
 which is what parity_check.py --ref requires.
+
+--wide replays WIDE_RECORDS (JEV choices past the trained slots; the slice parity_check.py --wide
+wrote). Each pass of a question's plan is one fp32 choice pass over its own options (trained bias on
+the first slots, none beyond), and the passes are combined with codec_golden's ports of
+serve_decide's formulas: the permute mean over the orders CPython's random draws, or the tournament
+combination over the server's own final (its finalists read back through the tree's
+tokenizer.json). Where the reference's group passes would pick other finalists, a NOTE says so; the
+combination still uses the final the server ran, so this measures quantization of the same passes.
 """
 import argparse
 import gc
@@ -27,8 +36,9 @@ from safetensors import safe_open
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "qwen36_surgery"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from codec_golden import align, rescale_score  # noqa: E402
-from records import records  # noqa: E402
+from codec_golden import (TokenizerFile, align, final_indices, groups, jev_plan_probs, rescale_score,  # noqa: E402
+                          tokenizer_added, tournament_final)
+from records import WIDE_RECORDS, records  # noqa: E402
 
 
 class Ckpt:
@@ -215,10 +225,30 @@ def single_part(rec, p):
     return p["parts"][0][0]
 
 
-def family_probs(family, rec, passes, hidden, tree, weights_dir, lora, lora_scale, clef_dir):
-    """{question id: probabilities in API option order} for one record's passes."""
+def tree_tokenizer(tree):
+    """The tree's tokenizer.json (a JEV tree ships the one its choice labels were checked against)."""
+    path = Path(tree) / "tokenizer.json"
+    if not path.is_file():
+        raise SystemExit(f"ERROR {path} not found: a tournament's final is read back through the tree's tokenizer")
+    return TokenizerFile(path)
+
+
+def server_finalists(rec, qid, final, tok, jev_prof):
+    """The options the server's tournament final ran over, read back from its prompt."""
+    if tok is None:
+        raise SystemExit(f"MISMATCH {rec['id']}.{qid}: a tournament final needs the tree's tokenizer to read its options")
+    labels = jev_prof.get("choice_labels")
+    if not labels:
+        raise SystemExit(f"MISMATCH {rec['id']}.{qid}: decision.json has no choice_labels, yet the server ran a tournament")
+    return final_indices(rec, qid, final["readout"]["prompt_ids"], tok, labels, tokenizer_added(tok)[1])
+
+
+def family_probs(family, rec, passes, hidden, tree, weights_dir, lora, lora_scale, clef_dir, tok=None):
+    """{question id: probabilities in API option order} for one record's passes. `tok` (JEV): reads a
+    tournament's final back (tree_tokenizer)."""
     prof = json.loads((Path(tree) / "decision.json").read_text())
     out = {}
+    plans = {}  # JEV qid -> (strategy, [(pass, distribution)]) of a choice past the trained slots
     lo_ad = Lora(lora, lora_scale) if family == "jev" else None
     for p, h in zip(passes, hidden, strict=True):
         head = p["readout"]["head"]
@@ -227,13 +257,21 @@ def family_probs(family, rec, passes, hidden, tree, weights_dir, lora, lora_scal
             qid = single_part(rec, p)
             q = rec["questions"][qid]
             kind = q["type"]
-            lo_slot = j["slots"][kind][0]
+            lo_slot, hi_slot = j["slots"][kind]
             vids = head["token_ids"]
             last = h[-1]
             logits = lm_rows(weights_dir, vids) @ last
             d = lo_ad.lm_head_logits(vids, last)
             if d is not None:
                 logits = logits + d
+            strategy = p.get("strategy", "native")
+            if strategy != "native":
+                # one pass of a multi-pass plan over its own options by position: the trained bias
+                # where the choice slots reach, none beyond (serve_decide s1_pass)
+                z = [(float(l) + (j["bias"][lo_slot + i] if lo_slot + i < hi_slot else 0.0)) / j["temperature"][kind]
+                     for i, l in enumerate(logits)]
+                plans.setdefault(qid, (strategy, []))[1].append((p, softmax(z)))
+                continue
             z = [(float(l) + j["bias"][lo_slot + i]) / j["temperature"][kind] for i, l in enumerate(logits)]
             pr = softmax(z)
             out[qid] = rescale_score(pr, len(q["criteria"])) if kind == "score" else pr
@@ -274,10 +312,19 @@ def family_probs(family, rec, passes, hidden, tree, weights_dir, lora, lora_scal
                 out[qid] = pr
         else:
             raise ValueError(f"unknown family {family!r}")
+    for qid, (strategy, ps) in plans.items():
+        dists, fin = [d for _, d in ps], None
+        if strategy == "tournament":
+            fin = server_finalists(rec, qid, ps[-1][0], tok, prof["jev"])
+            own = tournament_final(groups(len(rec["questions"][qid]["criteria"])), dists[:-1])
+            if own != fin:
+                print(f"NOTE {rec['id']}.{qid}: the reference's groups pick finalists {own}, the server ran {fin}; "
+                      f"combined over the server's final", flush=True)
+        out[qid] = jev_plan_probs(rec, qid, strategy, dists, fin)
     return out
 
 
-def build_ref(family, weights_dir, dump, recs, tree, lora=None, lora_scale=None, clef_dir=None, threads=4):
+def build_ref(family, weights_dir, dump, recs, tree, lora=None, lora_scale=None, clef_dir=None, threads=4, tok=None):
     """{"<record>.<qid>": probs} over EVERY question of `recs`, in record/question order.
     A dump out of step with `recs`, a question left unanswered, a duplicate or a wrong option
     count fails: parity_check scores every reference entry, so partial output must never be written."""
@@ -286,7 +333,7 @@ def build_ref(family, weights_dir, dump, recs, tree, lora=None, lora_scale=None,
     hidden = stream_hidden(weights_dir, flat, lora, lora_scale, threads=threads, allow_lm_head_lora=family == "jev")
     ref, k = {}, 0
     for rec, ps in aligned:
-        probs = family_probs(family, rec, ps, hidden[k:k + len(ps)], tree, weights_dir, lora, lora_scale, clef_dir)
+        probs = family_probs(family, rec, ps, hidden[k:k + len(ps)], tree, weights_dir, lora, lora_scale, clef_dir, tok=tok)
         k += len(ps)
         if set(probs) != set(rec["questions"]):
             raise SystemExit(f"MISMATCH {rec['id']}: reference answered {sorted(probs)}, record asks {sorted(rec['questions'])}")
@@ -316,14 +363,19 @@ def main():
     ap.add_argument("family", choices=["jev", "kev", "clef"])
     ap.add_argument("--weights", required=True, help="HF safetensors checkpoint (bf16/fp32)")
     ap.add_argument("--dump", required=True,
-                    help="the <dump>.parity.jsonl slice `parity_check.py --dump` wrote (exactly one run of the 50 records)")
+                    help="the <dump>.parity.jsonl slice `parity_check.py --dump` wrote (exactly one run of the 50 records; "
+                         "with --wide, the <dump>.wide.parity.jsonl slice of WIDE_RECORDS)")
     ap.add_argument("--tree", required=True, help="exported tree: decision.json (+ decision/ pointer weights for kev)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--lora", default=None)
     ap.add_argument("--lora-scale", type=float, default=None, help="override adapter_config.json")
     ap.add_argument("--clef-dir", default=None, help="clef: dir with joint_head.safetensors + joint_head_config.json")
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--wide", action="store_true",
+                    help="jev: the dump is parity_check.py --wide's slice of WIDE_RECORDS (needs the tree's tokenizer.json)")
     a = ap.parse_args()
+    if a.wide and a.family != "jev":
+        ap.error("--wide is for jev only")
     if a.family == "clef" and not a.clef_dir:
         ap.error("clef needs --clef-dir")
     if a.family == "kev" and not a.lora:
@@ -331,7 +383,8 @@ def main():
         # the stock backbone, and parity against a tree exported the same way would still pass.
         ap.error("kev needs --lora (Kev's adapter_model.safetensors) with --weights (its Base checkpoint)")
     scale = resolve_lora_scale(a.lora, a.lora_scale)
-    ref = build_ref(a.family, a.weights, a.dump, records(), a.tree, a.lora, scale, a.clef_dir, threads=a.threads)
+    recs, tok = (WIDE_RECORDS, tree_tokenizer(a.tree)) if a.wide else (records(), None)
+    ref = build_ref(a.family, a.weights, a.dump, recs, a.tree, a.lora, scale, a.clef_dir, threads=a.threads, tok=tok)
     Path(a.out).write_text(json.dumps(ref))
     print(f"wrote {len(ref)} reference distributions to {a.out}")
 

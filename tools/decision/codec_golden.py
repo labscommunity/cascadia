@@ -4,13 +4,23 @@ spike's saved full-precision references. Catches codec bugs that int8-vs-fp32 pa
   python tools/decision/codec_golden.py kev  --url http://127.0.0.1:8080 --dump kev.jsonl  --tokenizer ~/models/kev9b [--answers]
   python tools/decision/codec_golden.py clef --url http://127.0.0.1:8080 --dump clef.jsonl --tokenizer ~/models/clef-flash [--answers]
   python tools/decision/codec_golden.py jev  --url http://127.0.0.1:8080 --dump jev.jsonl  --tokenizer ~/models/jev9b --adapter-dir ~/models/jev9b/adapter_vllm [--answers]
+  python tools/decision/codec_golden.py jev  --url http://127.0.0.1:8080 --dump jev.jsonl  --tokenizer ~/models/jev9b --adapter-dir ~/models/jev9b/adapter_vllm --wide
 
 The server must run with `--decision-dump DUMP`, and this tool needs the server to itself while it
 runs (any other request's passes land in the dump and fail the alignment). Each dump line is one
 decision pass, written by crates/cascadia-api/src/decisions/handler.rs: {"parts": [[question_id,
 logit_start, logit_end], ...], "readout": {"prompt_ids": [...], "head": {"kind": "verbalizer"|
 "pointer"|"joint", ...}, "cache_prefix"?: n}}, plus "strategy" and "round" on a JEV choice pass
-("native" and 1 within the trained slots; wider questions are not checked here yet).
+("native" and 1 within the trained slots).
+
+--wide posts WIDE_RECORDS (records.py: JEV choices of 17 to 256 options, each asked with each
+strategy) and checks every pass of their plans: the strategy the request asked for, each round-1
+pass re-derived with serve_decide's layout and extended labels (single_token_labels, ported below;
+permute orders from CPython's random with the server's seed), and a tournament's final read back
+from its prompt (a sorted set of 16 with a member of every group) and re-derived. The dump holds no
+logits, so the combinations (the ports of serve_decide's formulas, below) are checked where the
+probabilities exist: reference_stream.py combines its fp32 passes with them and parity_check.py
+--wide gates the server's answers against that.
 
 Reference encoders come from the spike sources under $SPIKE_DIR (imported at run time, never vendored):
 Kev `kev-spike/kev.py` questions(), Clef `clef-spike/flash/joint_schema_model.py` encode_record(),
@@ -27,13 +37,16 @@ import contextlib
 import json
 import math
 import os
+import random
+import string
 import sys
 import urllib.error
 import urllib.request
+import zlib
 from collections import Counter
 from pathlib import Path
 
-from records import records
+from records import WIDE_RECORDS, records
 
 SPIKE_DIR = Path(os.environ.get("SPIKE_DIR", Path(__file__).resolve().parents[2] / "experiments"))
 
@@ -53,22 +66,72 @@ def align(dump_path, recs):
 
 
 def align_lines(lines, recs):
-    """align() over already-parsed dump lines."""
+    """align() over already-parsed dump lines. A line with a "strategy" (a JEV choice pass) opens its
+    question's plan: one pass for "native" and "single", four for "permute", the groups then one
+    round-2 final for "tournament". The question stays open until the plan's last pass, and the
+    record until every question is closed (its finals come after all its round-1 passes)."""
     i = 0
     for rec in recs:
         need, got = set(rec["questions"]), []
-        while need:
+        left = {}  # qid -> [round-1 passes left, finals left, strategy]
+        while need or any(l[0] or l[1] for l in left.values()):
             if i >= len(lines):
                 raise SystemExit(f"MISMATCH dump ends before record {rec['id']} is covered")
-            qids = {p[0] for p in lines[i]["parts"]}
-            if not qids <= need:
-                raise SystemExit(f"MISMATCH dump line {i + 1} covers {sorted(qids - need)}, not open questions of {rec['id']}")
-            got.append(lines[i])
-            need -= qids
+            line = lines[i]
+            qids = {p[0] for p in line["parts"]}
+            open_ = need | {q for q, l in left.items() if l[0] or l[1]}
+            if not qids <= open_:
+                raise SystemExit(f"MISMATCH dump line {i + 1} covers {sorted(qids - open_)}, not open questions of {rec['id']}")
+            if "strategy" not in line:
+                if qids & set(left):
+                    raise SystemExit(f"MISMATCH dump line {i + 1}: a pass without a strategy for {sorted(qids & set(left))}, "
+                                     f"whose plan is still open in {rec['id']}")
+                need -= qids
+            else:
+                plan_step(rec, line, i, need, left)
+            got.append(line)
             i += 1
         yield rec, got
     if i != len(lines):
         raise SystemExit(f"MISMATCH dump has {len(lines) - i} pass(es) beyond the {len(recs)} records sent")
+
+
+def plan_passes(rec, qid, strategy):
+    """(round-1 passes, round-2 finals) of a JEV choice under `strategy` (serve_decide s1_dist)."""
+    if strategy in ("native", "single"):
+        return 1, 0
+    q = rec["questions"][qid]
+    if strategy not in ("permute", "tournament") or q["type"] != "choice":
+        raise SystemExit(f"MISMATCH {rec['id']}.{qid}: strategy {strategy!r} on a {q['type']} question")
+    return (4, 0) if strategy == "permute" else (len(groups(len(q["criteria"]))), 1)
+
+
+def plan_step(rec, line, i, need, left):
+    """Count one JEV choice pass against its question's plan (align_lines)."""
+    if len(line["parts"]) != 1:
+        raise SystemExit(f"MISMATCH dump line {i + 1}: a JEV choice pass with {len(line['parts'])} parts")
+    qid, strategy, rnd = line["parts"][0][0], line["strategy"], line.get("round", 1)
+    if qid in need:
+        left[qid] = [*plan_passes(rec, qid, strategy), strategy]
+        need.discard(qid)
+    l = left[qid]
+    if strategy != l[2]:
+        raise SystemExit(f"MISMATCH dump line {i + 1}: {rec['id']}.{qid} changed strategy from {l[2]!r} to {strategy!r}")
+    if rnd == 1 and l[0]:
+        l[0] -= 1
+    elif rnd == 2 and not l[0] and l[1]:
+        l[1] -= 1
+    else:
+        raise SystemExit(f"MISMATCH dump line {i + 1}: {rec['id']}.{qid} {strategy} pass of round {rnd} out of order "
+                         f"({l[0]} round-1 and {l[1]} final pass(es) left)")
+
+
+def question_passes(passes):
+    """One record's aligned passes -> {qid: [pass, ...]} in dump order (a plan's round 1, then its final)."""
+    out = {}
+    for p in passes:
+        out.setdefault(p["parts"][0][0], []).append(p)
+    return out
 
 
 # ---------------------------------------------------------------------------------------------
@@ -144,6 +207,31 @@ def tokenizer_added(tok):
     """(ids of every added token, the sanitizer's angle-token list) for an HF tokenizer."""
     dec = tok.added_tokens_decoder
     return set(dec), angle_added_tokens(a.content for a in dec.values())
+
+
+class TokenizerFile:
+    """A tokenizer.json behind the slice of the transformers tokenizer API these tools use
+    (`tok(text, add_special_tokens=False).input_ids`, encode, decode, added_tokens_decoder), for
+    hosts without transformers: reference_stream reads a tree's tokenizer.json through it."""
+
+    def __init__(self, path):
+        from tokenizers import Tokenizer
+        self._tok = Tokenizer.from_file(str(path))
+
+    def encode(self, text, add_special_tokens=True):
+        return self._tok.encode(text, add_special_tokens=add_special_tokens).ids
+
+    def __call__(self, text, add_special_tokens=True):
+        class _Enc:
+            input_ids = self.encode(text, add_special_tokens)
+        return _Enc
+
+    def decode(self, ids, skip_special_tokens=False, clean_up_tokenization_spaces=False):
+        return self._tok.decode(list(ids), skip_special_tokens=skip_special_tokens)
+
+    @property
+    def added_tokens_decoder(self):
+        return self._tok.get_added_tokens_decoder()
 
 
 def check_specials(label, prompt_ids, added_ids, expected):
@@ -271,6 +359,32 @@ def jev_choice_slots(head, q):
     return lo, hi
 
 
+def question_raw(q, qid):
+    """serve_decide's `req.question`: the instructions as received (a non-string as its json.dumps),
+    or the question id without them. The prompt shows it sanitized; the permute seed takes it raw."""
+    return jev_value(q["instructions"]) if q.get("instructions") is not None else qid
+
+
+def jev_option_texts(q, added=()):
+    """Each choice option's text after its label, sanitized: `name: description`, or `name` alone."""
+    out = []
+    for n, d in q["criteria"].items():
+        name, desc = sanitize(n, added), sanitize(jev_value(d), added)
+        out.append(f"{name}: {desc}" if desc else name)
+    return out
+
+
+def jev_head(rec, qid, added=()):
+    """serve_decide s1_pass's content up to the option lines."""
+    q = rec["questions"][qid]
+    question = sanitize(question_raw(q, qid), added)
+    state = sanitize(jev_state(rec["state"]), added)
+    return f"[kind] {q['type']}\n[state] {state}\n[question] {question}\n[options]\n"
+
+
+JEV_TAIL = "\n[decision]:"
+
+
 def jev_text(rec, qid, labels, added=()):
     """serve_decide s1_pass layout, caller order; mirrors the server codec's rendering rules, including
     its sanitizer on the name, the rendered description, the question and the rendered state."""
@@ -279,17 +393,201 @@ def jev_text(rec, qid, labels, added=()):
     if kind == "choice":
         if len(q["criteria"]) > len(labels):
             raise SystemExit(f"MISMATCH {rec['id']}.{qid}: {len(q['criteria'])} options; JEV has only {len(labels)} choice labels")
-        lines = []
-        for i, (n, d) in enumerate(q["criteria"].items()):
-            name, desc = sanitize(n, added), sanitize(jev_value(d), added)
-            lines.append(f"{labels[i]}) {name}: {desc}" if desc else f"{labels[i]}) {name}")
+        lines = [f"{labels[i]}) {t}" for i, t in enumerate(jev_option_texts(q, added))]
     elif kind == "noul":
         lines = ["false", "true"]
     else:
         lines = [str(i) for i in range(6)]
-    question = sanitize(jev_value(q["instructions"]) if q.get("instructions") is not None else qid, added)
-    state = sanitize(jev_state(rec["state"]), added)
-    return f"[kind] {kind}\n[state] {state}\n[question] {question}\n[options]\n" + "\n".join(lines) + "\n[decision]:"
+    return jev_head(rec, qid, added) + "\n".join(lines) + JEV_TAIL
+
+
+def jev_pass_text(rec, qid, idx, labels, added=()):
+    """One pass of a multi-pass plan: serve_decide s1_pass over `[opts[i] for i in idx]`, labelled by
+    position from labels[0]."""
+    texts = jev_option_texts(rec["questions"][qid], added)
+    if len(idx) > len(labels):
+        raise SystemExit(f"MISMATCH {rec['id']}.{qid}: a pass over {len(idx)} options; JEV has only {len(labels)} choice labels")
+    return jev_head(rec, qid, added) + "\n".join(f"{labels[k]}) {texts[o]}" for k, o in enumerate(idx)) + JEV_TAIL
+
+
+# ---------------------------------------------------------------------------------------------
+# JEV choices past the trained slots: serve_decide s1_dist's plans and combinations, copied from
+# experiments/jev-spike/vl/serve_decide.py (single_token_labels :117-125, _groups :263-267,
+# s1_dist :275-303) so the tools check the server's Rust port (jev.rs groups, combine_permute,
+# tournament_final, combine_tournament) independently. The permute orders use CPython's own
+# `random`, which is what the server's PyRandom ports.
+
+TOURNAMENT_WIDTH = 16  # serve_decide _groups(n, k=16) and its final of 16, whatever the trained slots
+MAX_CHOICE_LABELS = 256  # serve_decide MAX_OPTIONS
+
+
+def single_token_labels(tok, context="x\n{}) y", cap=MAX_CHOICE_LABELS):
+    """serve_decide setup's single_token_labels: [(label, token id)] for A..Z, AA..ZZ, each kept when
+    it is one token that survives intact in an option line, at most `cap`."""
+    out = []
+    for lab in list(string.ascii_uppercase) + [a + b for a in string.ascii_uppercase for b in string.ascii_uppercase]:
+        t = tok.encode(lab, add_special_tokens=False)
+        if len(t) == 1 and t[0] in tok.encode(context.format(lab), add_special_tokens=False):
+            out.append((lab, t[0]))
+        if len(out) == cap:
+            break
+    return out
+
+
+def jev_choice_labels(tok, head):
+    """(labels, token ids) of every multi-pass position, checked as serve_decide asserts: the first
+    labels ARE the trained choice head (serve_decide.py:129)."""
+    labs = single_token_labels(tok)
+    lo, hi = head["slots"]["ranges"]["choice"]
+    if [t for _, t in labs[: hi - lo]] != head["verbalizer_ids"][lo:hi]:
+        raise SystemExit(f"MISMATCH the tokenizer's first {hi - lo} single-token choice labels "
+                         f"{[l for l, _ in labs[: hi - lo]]} are not the trained choice verbalizers")
+    return [l for l, _ in labs], [t for _, t in labs]
+
+
+def groups(n, k=TOURNAMENT_WIDTH):
+    """serve_decide _groups: ceil(n/k) contiguous groups, the first n mod g one larger."""
+    g = math.ceil(n / k)
+    base, extra = divmod(n, g)
+    out, i = [], 0
+    for j in range(g):
+        size = base + (1 if j < extra else 0)
+        out.append(list(range(i, i + size)))
+        i += size
+    return out
+
+
+def permute_orders(n, question):
+    """serve_decide s1_dist's permute orders: request order, then three rng.sample()s."""
+    rng = random.Random(zlib.crc32(question.encode()))
+    return [list(range(n))] + [rng.sample(range(n), n) for _ in range(3)]
+
+
+def combine_permute(orders, dists):
+    """serve_decide s1_dist's permute mean (no renormalisation)."""
+    p = [0.0] * len(orders[0])
+    for o, r in zip(orders, dists):
+        for i, v in zip(o, r):
+            p[i] += v / len(orders)
+    return p
+
+
+def tournament_final(gs, in_group_passes):
+    """serve_decide s1_dist's finalists, sorted: each group's winner, topped up to 16 with the best rest.
+    `in_group_passes[g]` is group g's pass, aligned with gs[g]."""
+    in_group = {o: p for g, ps in zip(gs, in_group_passes) for o, p in zip(g, ps)}
+    chosen = [max(g, key=lambda o: (in_group[o], -o)) for g in gs]
+    rest = sorted((o for g in gs for o in g if o not in set(chosen)), key=lambda o: (-in_group[o], o))
+    return sorted(chosen + rest[: max(0, TOURNAMENT_WIDTH - len(chosen))])
+
+
+def combine_tournament(gs, in_group_passes, fin, final_pass):
+    """serve_decide s1_dist's tournament combination over the finalists `fin` and their final pass."""
+    in_group = {o: p for g, ps in zip(gs, in_group_passes) for o, p in zip(g, ps)}
+    final = dict(zip(fin, final_pass))
+    group_of = {o: gi for gi, g in enumerate(gs) for o in g}
+    share = [0.0] * len(gs)
+    cap = [0.0] * len(gs)
+    for f in fin:
+        share[group_of[f]] += final[f]
+        cap[group_of[f]] += in_group[f]
+    among = sum(a * b for a, b in zip(share, cap))
+    n = sum(len(g) for g in gs)
+    p = [final[o] * among if o in final else share[group_of[o]] * in_group[o] for o in range(n)]
+    s = sum(p)
+    return [x / s for x in p]
+
+
+def plan_indices(rec, qid, strategy):
+    """The option indices of each round-1 pass of `strategy` (a final depends on the passes)."""
+    q = rec["questions"][qid]
+    n = len(q["criteria"])
+    if strategy == "single":
+        return [list(range(n))]
+    if strategy == "permute":
+        return permute_orders(n, question_raw(q, qid))
+    return groups(n)
+
+
+def jev_plan_probs(rec, qid, strategy, dists, fin=None):
+    """A multi-pass question's probabilities from its passes' distributions (dump order), combined as
+    serve_decide does. `fin`: the tournament's finalists (default: tournament_final of the groups)."""
+    want = len(plan_indices(rec, qid, strategy)) + (strategy == "tournament")
+    if len(dists) != want:
+        raise SystemExit(f"MISMATCH {rec['id']}.{qid}: {len(dists)} {strategy} pass(es), the plan has {want}")
+    if strategy == "single":
+        return list(dists[0])
+    if strategy == "permute":
+        return combine_permute(plan_indices(rec, qid, strategy), dists)
+    gs = groups(len(rec["questions"][qid]["criteria"]))
+    in_group, final = dists[:-1], dists[-1]
+    if fin is None:
+        fin = tournament_final(gs, in_group)
+    if len(fin) != len(final):
+        raise SystemExit(f"MISMATCH {rec['id']}.{qid}: {len(fin)} finalists for a final over {len(final)} options")
+    return combine_tournament(gs, in_group, fin, final)
+
+
+def final_indices(rec, qid, prompt_ids, tok, labels, added=()):
+    """The options a tournament's final pass is over, read back from its prompt: the decoded option
+    lines must be labels[0..m) in order, each followed by exactly one option's text."""
+    key = f"{rec['id']}.{qid}"
+    texts = jev_option_texts(rec["questions"][qid], added)
+    if any("\n" in t for t in texts) or len(set(texts)) != len(texts):
+        fail(f"jev {key}: option texts with newlines or duplicates; the final cannot be read back")
+    text, head = tok.decode(prompt_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False), jev_head(rec, qid, added)
+    if not (text.startswith(head) and text.endswith(JEV_TAIL)):
+        fail(f"jev {key}: the tournament final's prompt is not the serve_decide layout")
+    index = {t: i for i, t in enumerate(texts)}
+    out = []
+    for k, line in enumerate(text[len(head):len(text) - len(JEV_TAIL)].split("\n")):
+        lead = f"{labels[k]}) " if k < len(labels) else None
+        if lead is None or not line.startswith(lead) or line[len(lead):] not in index:
+            fail(f"jev {key}: final line {k + 1} {line[:60]!r} is not {lead!r} and an option")
+        out.append(index[line[len(lead):]])
+    return out
+
+
+def check_jev_pass(key, p, want_ids, want_token_ids, added_ids):
+    if p["readout"]["prompt_ids"] != want_ids:
+        fail(f"jev {key}: prompt_ids differ")
+    check_specials(f"jev {key}", p["readout"]["prompt_ids"], added_ids, [])
+    if p["readout"]["head"]["token_ids"] != want_token_ids:
+        fail(f"jev {key}: verbalizer token_ids differ")
+    check_parts(f"jev {key}", p)
+
+
+def check_jev_plan(rec, qid, ps, tok, head, wide, added_ids, added):
+    """A choice past the trained slots: the plan the record's strategy asks for, every round-1 pass's
+    prompt and label ids re-derived (permute orders from CPython's random), and a tournament's final
+    over a sorted set of 16 that holds a member of every group, in the same layout."""
+    key = f"{rec['id']}.{qid}"
+    q = rec["questions"][qid]
+    n, (lo, hi) = len(q["criteria"]), head["slots"]["ranges"]["choice"]
+    strategy = ps[0]["strategy"]
+    if n <= hi - lo:
+        fail(f"jev {key}: {n} options fit the {hi - lo} trained slots, so the pass must be native, not {strategy!r}")
+    asked = rec.get("strategy")
+    if asked not in (None, "auto") and strategy != asked:
+        fail(f"jev {key}: the request asked for strategy {asked!r}, the server ran {strategy!r}")
+    labels, label_ids = wide
+    if n > len(labels):
+        fail(f"jev {key}: {n} options; the tokenizer has only {len(labels)} choice labels")
+    rounds = plan_indices(rec, qid, strategy)
+    for k, idx in enumerate(rounds):
+        want = tok(jev_pass_text(rec, qid, idx, labels, added), add_special_tokens=False).input_ids
+        check_jev_pass(f"{key} {strategy} pass {k + 1}", ps[k], want, label_ids[:len(idx)], added_ids)
+    if strategy == "tournament":
+        p = ps[len(rounds)]
+        fin = final_indices(rec, qid, p["readout"]["prompt_ids"], tok, labels, added)
+        gs = groups(n)
+        if fin != sorted(set(fin)) or len(fin) != min(TOURNAMENT_WIDTH, n) or \
+                any(not set(g) & set(fin) for g in gs):
+            fail(f"jev {key}: tournament final over {fin}: not a sorted set of {min(TOURNAMENT_WIDTH, n)} "
+                 f"with a member of every group")
+        want = tok(jev_pass_text(rec, qid, fin, labels, added), add_special_tokens=False).input_ids
+        check_jev_pass(f"{key} tournament final", p, want, label_ids[:len(fin)], added_ids)
+    return len(ps)
 
 
 def check_jev(dump, tok, adapter_dir, recs):
@@ -297,10 +595,15 @@ def check_jev(dump, tok, adapter_dir, recs):
     ranges = head["slots"]["ranges"]
     labels = head["slots"]["verbalizers"][ranges["choice"][0]:ranges["choice"][1]]
     added_ids, added = tokenizer_added(tok)
+    wide = None  # (labels, ids) past the trained slots, read from the tokenizer on first use
     n = 0
     for rec, passes in align(dump, recs):
-        for p in passes:
-            qid = p["parts"][0][0]
+        for qid, ps in question_passes(passes).items():
+            if ps[0].get("strategy", "native") != "native":
+                wide = wide or jev_choice_labels(tok, head)
+                n += check_jev_plan(rec, qid, ps, tok, head, wide, added_ids, added)
+                continue
+            (p,) = ps
             q = rec["questions"][qid]
             lo, hi = jev_choice_slots(head, q)
             want = tok(jev_text(rec, qid, labels, added), add_special_tokens=False).input_ids
@@ -570,10 +873,17 @@ def rescale_score(p6, levels):
     return out
 
 
+def request_body(rec):
+    """A record as a /v1/systemone body: the wide records also carry their top-level `strategy`."""
+    body = {"model": "m", "state": rec["state"], "questions": rec["questions"]}
+    if "strategy" in rec:
+        body["strategy"] = rec["strategy"]
+    return json.dumps(body).encode()
+
+
 def systemone(url, rec):
     """POST one record to /v1/systemone; a non-2xx reply is a golden failure with the server's message."""
-    body = json.dumps({"model": "m", "state": rec["state"], "questions": rec["questions"]}).encode()
-    req = urllib.request.Request(url + "/v1/systemone", data=body, headers={"content-type": "application/json"})
+    req = urllib.request.Request(url + "/v1/systemone", data=request_body(rec), headers={"content-type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=1800) as r:
             return json.load(r)
@@ -663,10 +973,17 @@ def main():
     ap.add_argument("--adapter-dir", default=None, help="jev: dir with decision_head.json")
     ap.add_argument("--answers", action="store_true", help="also compare top-1 answers with the saved spike reference")
     ap.add_argument("--force", action="store_true", help="overwrite an existing <dump>.golden.jsonl")
+    ap.add_argument("--wide", action="store_true",
+                    help="jev: post WIDE_RECORDS (choices past the trained slots, each strategy) instead of the golden "
+                         "set, into <dump>.wide.golden.jsonl")
     a = ap.parse_args()
     if a.family == "jev" and not a.adapter_dir:
         raise SystemExit("jev needs --adapter-dir (decision_head.json)")
-    fresh = Path(a.dump).with_suffix(".golden.jsonl")
+    if a.wide and a.family != "jev":
+        ap.error("--wide is for jev only (Kev and Clef answer any option count in one pass)")
+    if a.wide and a.answers:
+        ap.error("--wide has no saved spike reference; gate its answers with parity_check.py --wide")
+    fresh = Path(a.dump).with_suffix(".wide.golden.jsonl" if a.wide else ".golden.jsonl")
     if fresh.exists() and not a.force:
         raise SystemExit(f"{fresh} exists; pass --force to overwrite it")
     from transformers import AutoTokenizer
@@ -674,7 +991,7 @@ def main():
     url = a.url.rstrip("/")
     # Compare only what THIS run appends: earlier parity runs may already be in the dump.
     start = Path(a.dump).stat().st_size if Path(a.dump).exists() else 0
-    recs = golden_records()
+    recs = WIDE_RECORDS if a.wide else golden_records()
     post_all(url, recs)
     write_private(fresh, Path(a.dump).read_bytes()[start:].decode(), force=a.force)
     {"jev": check_jev, "kev": check_kev, "clef": check_clef}[a.family](str(fresh), tok, a.adapter_dir, recs)
