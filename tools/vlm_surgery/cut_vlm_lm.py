@@ -17,9 +17,12 @@ layers are named `...layers.N.input_layernorm` and no KV is shared across
 layers.
 
 Families (the `vision.family` rank 0 serves):
-  pixtral  LLaVA layout, Mistral text tower, Pixtral encoder (e.g.
-           OpenVINO/pixtral-12b-int4-ov). Causal attention, so no
-           token_type_ids frame.
+  pixtral   LLaVA layout, Mistral text tower, Pixtral encoder (e.g.
+            OpenVINO/pixtral-12b-int4-ov). Causal attention, so no
+            token_type_ids frame.
+  mistral3  Mistral3ForConditionalGeneration (e.g. Ministral-3, exported with
+            optimum-intel): the Pixtral encoder plus a 2x2 patch merger in
+            openvino_multi_modal_projector_model.xml, which rank 0 runs.
 
 Usage:
   python cut_vlm_lm.py --model <OV VLM dir> --output-dir <tree> --num-stages N \
@@ -50,6 +53,13 @@ FAMILIES = {
         "vision_types": ("pixtral",),
         "token_type_ids": False,
     },
+    # Mistral 3 (e.g. Ministral-3): Pixtral tower + 2x2 patch merger; rank 0
+    # also runs openvino_multi_modal_projector_model.xml.
+    "mistral3": {
+        "model_types": ("mistral3",),
+        "vision_types": ("pixtral",),
+        "token_type_ids": False,
+    },
 }
 
 ROOT_FILES = (
@@ -57,6 +67,8 @@ ROOT_FILES = (
     "openvino_text_embeddings_model.bin",
     "openvino_vision_embeddings_model.xml",
     "openvino_vision_embeddings_model.bin",
+    "openvino_multi_modal_projector_model.xml",
+    "openvino_multi_modal_projector_model.bin",
     "preprocessor_config.json",
     "processor_config.json",
     "generation_config.json",

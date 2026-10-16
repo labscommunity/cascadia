@@ -35,6 +35,7 @@ in [rfcs/vlm-support.md](rfcs/vlm-support.md). Video and audio are not supported
 | Gemma 4 26B-A4B / 31B | `ov-runtime` | 2+ machines, stateful or static | `tools/gemma4_surgery/export_gemma4_text.py --vision` |
 | Gemma 4 E2B / E4B | `gemma4` | 1+ machines | `tools/export_gemma4.py --vision DIR` |
 | Pixtral 12B | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family pixtral` |
+| Mistral 3 (Ministral-3, Mistral Small 3.1/3.2) | `ov-runtime` | 1+ machines | export with optimum-intel, then `tools/vlm_surgery/cut_vlm_lm.py --family mistral3` |
 
 Every other engine and tree refuses images with a `400`: `ov-dist-spec`, `sparse-moe`,
 `ov-genai` on a text-only export, any tree without a `vision` block. Not supported:
@@ -43,7 +44,7 @@ Every other engine and tree refuses images with a `400`: `ov-dist-spec`, `sparse
   describes a different picture; `ov-genai` serves such an export as text only. Use
   `ov-runtime` (a one-stage tree runs on one box).
 - **Llama 3.2 Vision** (`mllama`), refused at export: its text tower has cross-attention.
-- **Mistral 3**, Qwen2-VL and other families: not exported with their vision tower yet
+- Qwen2-VL, InternVL and other families: not exported with their vision tower yet
   (`export_shards.py` notes when it drops one).
 
 ## Exporting
@@ -79,6 +80,23 @@ python tools/vlm_surgery/cut_vlm_lm.py --model <OpenVINO/pixtral-12b-int4-ov dir
 
 `--num-stages 1` cuts a one-stage tree for a single box. `--stage I` cuts one stage on a
 worker that holds only that one.
+
+### Mistral 3 (ov-runtime)
+
+No OpenVINO export is published, so make one with optimum-intel (`main`; release 2.2.0
+lacks the `ministral3` text tower), then cut it like Pixtral:
+
+```bash
+pip install "optimum-intel[openvino] @ https://github.com/huggingface/optimum-intel/archive/<commit>.zip" nncf
+optimum-cli export openvino --model <mistralai/Ministral-3-3B-Instruct-2512-BF16 dir> \
+    --task image-text-to-text --weight-format int4 <export dir>
+python tools/vlm_surgery/cut_vlm_lm.py --model <export dir> --output-dir <tree> \
+    --num-stages 2 --family mistral3
+```
+
+The export holds four IRs; rank 0 runs the vision tower, regroups each 2x2 block of
+patches and runs `openvino_multi_modal_projector_model.xml` on them. Exporting on Windows
+is fine: the chat template it writes has CRLF line endings, which the server normalises.
 
 ### Static and packed trees (NPU, or CPU/GPU without OpenVINO state)
 

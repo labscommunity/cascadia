@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Reference fixtures for the Rust Pixtral image preprocessing and prompt layout.
 
+Also covers Mistral 3 (Ministral-3 and friends): the same `PixtralProcessor`
+with `spatial_merge_size` 2, so images resize to whole `patch * merge` cells.
+
 Runs Hugging Face's own Pixtral processor (no language model weights) and
 writes what the Rust port must reproduce:
 
@@ -14,6 +17,8 @@ writes what the Rust port must reproduce:
 Usage (transformers==5.14.1, torch, torchvision, pillow, numpy; openvino
 for --run-ir):
   python gen_pixtral_fixtures.py --model <Pixtral OV export> --out <dir> [--run-ir]
+  python gen_pixtral_fixtures.py --model <Mistral 3 OV export> --out <dir> --run-ir \
+      --hf-features <HF checkpoint>   # torch: HF get_image_features vs the OV chain
 """
 import argparse
 import hashlib
@@ -80,6 +85,8 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--run-ir", action="store_true")
+    ap.add_argument("--hf-features", default=None,
+                    help="HF checkpoint: compare get_image_features with the OV vision chain")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -87,7 +94,12 @@ def main():
     fast = AutoImageProcessor.from_pretrained(args.model, backend="torchvision")
     slow = AutoImageProcessor.from_pretrained(args.model, backend="pil")
     tok = processor.tokenizer
+    merge = int(getattr(processor, "spatial_merge_size", 1) or 1)
+    patch = int(processor.patch_size)
+    # PixtralProcessor hands the image processor patch * merge as the patch.
+    cell = patch * merge
     ref = {
+        "patch_size": patch, "spatial_merge_size": merge,
         "versions": {"transformers": transformers.__version__, "torch": torch.__version__,
                      "torchvision": torchvision.__version__},
         "processor": {k: (list(v) if isinstance(v, tuple) else v) for k, v in slow.to_dict().items()
@@ -106,11 +118,11 @@ def main():
         entry = {"size": [w, h], "png_sha256": hashlib.sha256(open(path, "rb").read()).hexdigest()}
         outs = {}
         for kind, proc in (("fast", fast), ("slow", slow)):
-            o = proc(images=[img], return_tensors="pt")
+            o = proc(images=[img], return_tensors="pt", patch_size={"height": cell, "width": cell})
             pv = o["pixel_values"][0]
             hh, ww = (int(x) for x in o["image_sizes"][0])
             outs[kind] = pv
-            entry[kind] = {"resized_hw": [hh, ww], "grid": [hh // 16, ww // 16],
+            entry[kind] = {"resized_hw": [hh, ww], "grid": [hh // cell, ww // cell],
                            "pixel_values": summary(pv[:, :hh, :ww])}
         d = (outs["fast"].double() - outs["slow"].double()).abs()
         entry["fast_vs_slow"] = {"max_abs": float(d.max()), "mean_abs": float(d.mean())}
@@ -138,18 +150,54 @@ def main():
                                 "grids": [ref["images"][n]["fast"]["grid"] for n in names]}
         print(f"[{name}] tokens={o['input_ids'].shape[1]} images={names}", flush=True)
 
-    if args.run_ir:
+    def ov_chain(core, name):
+        """The OV vision chain for one image: vision IR, then (Mistral 3) the
+        host unfold and the projector IR. Returns (pixel input, rows)."""
+        o = slow(images=[imgs[name]], return_tensors="np", patch_size={"height": cell, "width": cell})
+        hh, ww = (int(x) for x in o["image_sizes"][0])
+        pv = o["pixel_values"][:, :, :hh, :ww].astype(np.float32)
+        emb = vis({"pixel_values": pv})[0]
+        emb = emb[0] if emb.ndim == 3 else emb
+        if merge > 1:
+            ph, pw, d = hh // patch, ww // patch, emb.shape[-1]
+            grid = torch.from_numpy(np.ascontiguousarray(emb)).view(ph, pw, d).permute(2, 0, 1)[None]
+            un = torch.nn.functional.unfold(grid, kernel_size=merge, stride=merge)
+            merged = un.view(d * merge * merge, -1).t().contiguous().numpy()
+            emb = proj({proj.inputs[0].get_any_name(): merged})[0]
+        return o, hh, ww, np.ascontiguousarray(emb)
+
+    if args.run_ir or args.hf_features:
         import openvino as ov
-        ir = ov.Core().compile_model(os.path.join(args.model, "openvino_vision_embeddings_model.xml"), "CPU")
+        core = ov.Core()
+        vis = core.compile_model(os.path.join(args.model, "openvino_vision_embeddings_model.xml"), "CPU")
+        proj = (core.compile_model(os.path.join(args.model, "openvino_multi_modal_projector_model.xml"), "CPU")
+                if merge > 1 else None)
         ref["vision_ir"] = {}
         for name in ("tiny_40x30", "square_448"):
-            o = slow(images=[imgs[name]], return_tensors="np")
-            hh, ww = (int(x) for x in o["image_sizes"][0])
-            pv = o["pixel_values"][:, :, :hh, :ww].astype(np.float32)
-            emb = ir({"pixel_values": pv})[0]
-            ref["vision_ir"][name] = {"grid": [hh // 16, ww // 16], "out_shape": list(emb.shape),
-                                      "image_embeds": summary(torch.from_numpy(np.ascontiguousarray(emb[0])))}
+            _, hh, ww, emb = ov_chain(core, name)
+            ref["vision_ir"][name] = {"grid": [hh // cell, ww // cell], "out_shape": list(emb.shape),
+                                      "image_embeds": summary(torch.from_numpy(emb))}
             print(f"[vision_ir] {name}: out={list(emb.shape)}", flush=True)
+
+    if args.hf_features:
+        from transformers import AutoModelForImageTextToText
+        model = AutoModelForImageTextToText.from_pretrained(args.hf_features, torch_dtype=torch.float32)
+        model.eval()
+        ref["hf_features"] = {}
+        for name in ("tiny_40x30", "square_448"):
+            o, hh, ww, emb = ov_chain(core, name)
+            with torch.no_grad():
+                feats = model.model.get_image_features(
+                    pixel_values=torch.from_numpy(o["pixel_values"]).float(),
+                    image_sizes=torch.tensor(o["image_sizes"]))
+            hf = feats.pooler_output if hasattr(feats, "pooler_output") else feats
+            hf = torch.cat(list(hf), 0).float().numpy() if isinstance(hf, (list, tuple)) else hf.float().numpy()
+            d = np.abs(hf - emb)
+            cos = float((hf * emb).sum() / (np.linalg.norm(hf) * np.linalg.norm(emb)))
+            ref["hf_features"][name] = {"shape": list(hf.shape), "max_abs": float(d.max()),
+                                        "mean_abs": float(d.mean()), "cosine": cos}
+            print(f"[hf_features] {name}: hf={list(hf.shape)} ov={list(emb.shape)} "
+                  f"max_abs={d.max():.4f} mean_abs={d.mean():.5f} cos={cos:.6f}", flush=True)
 
     with open(os.path.join(args.out, "reference.json"), "w") as f:
         json.dump(ref, f, separators=(",", ":"))
