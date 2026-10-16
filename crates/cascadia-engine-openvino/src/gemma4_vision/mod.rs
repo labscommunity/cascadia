@@ -190,6 +190,20 @@ pub struct Patches {
     pub resized_hw: (u32, u32),
 }
 
+/// Soft tokens an image of `width x height` occupies, from its size alone
+/// (what [`preprocess`] then [`Patches::soft_tokens`] give, without decoding
+/// pixels or running the encoder).
+pub fn soft_tokens_for_size(
+    width: u32,
+    height: u32,
+    cfg: &PreprocessConfig,
+) -> Result<usize, String> {
+    let (rh, rw) = target_size(height, width, cfg)?;
+    let p = cfg.patch_size;
+    let patches = (rh / p) as usize * (rw / p) as usize;
+    Ok(patches / (cfg.pooling_kernel_size * cfg.pooling_kernel_size) as usize)
+}
+
 impl Patches {
     /// Tokens this image occupies in the language model's prompt (between
     /// its begin- and end-of-image tokens).
@@ -391,6 +405,25 @@ impl ImageFrontend {
         })
     }
 
+    /// The expanded prompt ids `prepare` would return, computed from each
+    /// image's size without encoding anything: admission checks run on these
+    /// before any encoder work.
+    pub fn expand_ids(
+        &self,
+        media: &[cascadia_types::MediaInput],
+        prompt_ids: &[i64],
+    ) -> Result<Vec<i64>, String> {
+        let mut counts = Vec::with_capacity(media.len());
+        for (i, m) in media.iter().enumerate() {
+            check_image(i, m)?;
+            counts.push(
+                soft_tokens_for_size(m.width, m.height, &self.preprocess)
+                    .map_err(|e| format!("image {i}: {e}"))?,
+            );
+        }
+        expand_image_tokens(prompt_ids, &self.tokens, &counts)
+    }
+
     /// Encode a task's images and expand the prompt's one image placeholder
     /// per image into its framed soft-token run. Returns the expanded ids and
     /// each image's embedding rows, in prompt order.
@@ -404,14 +437,7 @@ impl ImageFrontend {
         let mut counts = Vec::with_capacity(media.len());
         let mut from_cache = 0;
         for (i, m) in media.iter().enumerate() {
-            match m.kind {
-                cascadia_types::MediaKind::Image => {}
-                #[allow(unreachable_patterns)]
-                other => return Err(format!("media {i}: {other:?} is not supported")),
-            }
-            if m.num_frames != 1 || m.pixels.len() != m.expected_len() {
-                return Err(format!("image {i}: malformed pixel buffer"));
-            }
+            check_image(i, m)?;
             if let Some((emb, count)) = self.cache.get(tenant, &m.sha256) {
                 counts.push(count);
                 rows.push(emb);
@@ -433,6 +459,19 @@ impl ImageFrontend {
         let ids = expand_image_tokens(prompt_ids, &self.tokens, &counts)?;
         Ok((ids, rows))
     }
+}
+
+/// One media input must be a single well-formed RGB8 image.
+pub(crate) fn check_image(i: usize, m: &cascadia_types::MediaInput) -> Result<(), String> {
+    match m.kind {
+        cascadia_types::MediaKind::Image => {}
+        #[allow(unreachable_patterns)]
+        other => return Err(format!("media {i}: {other:?} is not supported")),
+    }
+    if m.num_frames != 1 || m.pixels.len() != m.expected_len() {
+        return Err(format!("image {i}: malformed pixel buffer"));
+    }
+    Ok(())
 }
 
 /// The language model's `token_type_ids` for a prompt: 1 on image soft
@@ -541,5 +580,27 @@ mod tests {
     #[test]
     fn token_types_mark_image_tokens() {
         assert_eq!(token_type_ids(&[2, 9, 9, 3, 9], 9), vec![0, 1, 1, 0, 1]);
+    }
+
+    /// Admission counts an image's tokens from its size before encoding;
+    /// that must be what preprocessing then produces.
+    #[test]
+    fn soft_tokens_from_size_match_preprocessing() {
+        let cfg = PreprocessConfig::gemma4();
+        for (w, h) in [
+            (64u32, 64u32),
+            (640, 480),
+            (37, 900),
+            (1200, 30),
+            (448, 448),
+        ] {
+            let rgb = vec![128u8; (w * h * 3) as usize];
+            let p = preprocess(&rgb, w, h, &cfg).unwrap();
+            assert_eq!(
+                soft_tokens_for_size(w, h, &cfg).unwrap(),
+                p.soft_tokens(cfg.pooling_kernel_size),
+                "{w}x{h}"
+            );
+        }
     }
 }

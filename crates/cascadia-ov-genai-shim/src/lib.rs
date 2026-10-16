@@ -1262,6 +1262,13 @@ pub struct Runtime {
 unsafe impl Send for Runtime {}
 
 impl Runtime {
+    /// A runtime with no model, for unit tests of code that holds one but
+    /// never runs it. Only the stub build (no `openvino` feature) has it.
+    #[cfg(not(feature = "openvino"))]
+    pub fn stub() -> Self {
+        Self {}
+    }
+
     /// Compile a model from disk and create an InferRequest.
     pub fn compile(model_xml_path: &str, device: &str, plugin: &PluginConfig) -> Result<Self> {
         Self::do_compile(model_xml_path, device, plugin)
