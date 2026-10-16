@@ -189,9 +189,9 @@ pub(crate) async fn evaluate(
         })
         .await??;
         check_pass_lengths(&second, svc.max_tokens)?;
-        // Within the reserve by construction; a tokenizer that merges across line starts could
-        // still exceed it, and then the request stops here rather than overspend. Second-round
-        // passes share no prefix, so every one counts in full.
+        // Within the reserve whenever the codec's per-line costs add up (they do for Qwen); a
+        // tokenizer where they do not could still exceed it, and then the request stops here
+        // rather than overspend. Second-round passes share no prefix, so every one counts in full.
         let spent = super::prefill_work(&passes, svc.prefix_reuse)
             + second
                 .iter()

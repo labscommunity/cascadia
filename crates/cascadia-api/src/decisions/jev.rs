@@ -445,10 +445,14 @@ impl JevCodec {
         }
     }
 
-    /// The longest final a tournament over `texts` can need: its TOURNAMENT_WIDTH longest option
-    /// lines (in tokens, ties to the lower index), in index order and labelled from A. A real
-    /// final takes some of those lines' places with shorter ones; with a tokenizer whose pieces
-    /// never cross a line start (Qwen's), it is never longer. The handler checks the real one too.
+    /// The longest final a tournament over `texts` can need: its TOURNAMENT_WIDTH costliest option
+    /// lines (ties to the lower index), in index order and labelled from A. A line's cost is its
+    /// text as the prompt holds it, between `") "` and the newline: `" {t}\n"`. Not the text
+    /// alone: with Qwen's pre-tokenizer the leading space joins the first word (`"Merkel"` is 3
+    /// tokens alone, `" Merkel"` 1) or splits off before a digit or CJK text, and trailing
+    /// punctuation joins the newline. Where these costs add up, as they do for Qwen (the label
+    /// and `)` are pretokens of their own), no final the groups pick is longer; the handler
+    /// still checks the real one for tokenizers where they do not.
     fn worst_final(
         &self,
         q: &Question,
@@ -462,7 +466,7 @@ impl JevCodec {
             .map(|(i, t)| {
                 let enc = self
                     .tok
-                    .encode(t.as_str(), false)
+                    .encode(format!(" {t}\n"), false)
                     .map_err(super::tokenize_failed)?;
                 Ok((enc.len(), i))
             })
@@ -1301,6 +1305,93 @@ mod tests {
         let t = decoded(&c.encode(&r).unwrap()[1]);
         assert!(t.contains("[question] q\n"), "{t}");
         assert!(t.contains(&format!("L0) o{}\n", order_for("q")[0])), "{t}");
+    }
+
+    /// One token per pretoken of `pattern` (WordLevel over single ASCII characters, anything
+    /// longer unknown): token counts are pretoken counts, so a pattern decides where the leading
+    /// space and the newline go.
+    fn regex_tokenizer(pattern: &str) -> tokenizers::Tokenizer {
+        let mut vocab: std::collections::HashMap<String, u32> = (32u8..127)
+            .map(|b| ((b as char).to_string(), b as u32))
+            .collect();
+        vocab.insert("\n".into(), 10);
+        vocab.insert("[unk]".into(), 0);
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(vocab.into_iter().collect())
+            .unk_token("[unk]".into())
+            .build()
+            .unwrap();
+        let mut t = tokenizers::Tokenizer::new(model);
+        t.with_pre_tokenizer(Some(
+            tokenizers::pre_tokenizers::split::Split::new(
+                tokenizers::pre_tokenizers::split::SplitPattern::Regex(pattern.into()),
+                tokenizers::SplitDelimiterBehavior::Isolated,
+                false,
+            )
+            .unwrap(),
+        ));
+        t
+    }
+
+    /// Qwen2's pre-tokenizer split (tokenizer.json of the JEV models).
+    const QWEN_SPLIT: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    /// A 17-option tournament whose options 0..15 are lowercase words and option 16 is `last`,
+    /// played so that option 16 wins group 2 and option 0 is the weakest loser: the final is
+    /// 1..=16. Returns (reserve, real final length).
+    fn reserve_and_real_final(tok: tokenizers::Tokenizer, last: &str) -> (usize, usize) {
+        let mut names: Vec<String> = (0..16)
+            .map(|i| format!("w{}", ((b'b' + i) as char).to_string().repeat(5)))
+            .collect();
+        names.push(last.to_string());
+        let criteria: Vec<String> = names.iter().map(|n| format!("\"{n}\": \"\"")).collect();
+        let r: DecisionRequest = serde_json::from_str(&format!(
+            r#"{{"model": "m", "state": "s", "strategy": "tournament", "questions": {{"q": {{"type": "choice", "instructions": "Pick", "criteria": {{{}}}}}}}}}"#,
+            criteria.join(", ")
+        ))
+        .unwrap();
+        let c = JevCodec::new(tok, wide_profile(16, 256)).unwrap();
+        let (passes, reserve) = c.encode_rounds(&r, &AtomicBool::new(false)).unwrap();
+        assert_eq!(passes.len(), 2, "groups 0..9 and 9..17");
+        let mut g0 = vec![0.99 / 8.0; 9];
+        g0[0] = 0.01;
+        let mut g1 = vec![0.5 / 7.0; 8];
+        g1[7] = 0.5;
+        let first: IndexMap<String, Vec<Vec<f64>>> = [("q".to_string(), vec![g0, g1])].into();
+        let fin = c.second_round(&r, &first, &AtomicBool::new(false)).unwrap();
+        let text: String = fin[0]
+            .readout
+            .prompt_ids
+            .iter()
+            .map(|&i| i as u8 as char)
+            .collect();
+        assert!(
+            !text.contains("wbbbbb") && text.contains(last),
+            "final is 1..=16: {text}"
+        );
+        (reserve, fin[0].readout.prompt_ids.len())
+    }
+
+    #[test]
+    fn worst_final_counts_each_line_as_the_prompt_holds_it() {
+        // I1: a tokenizer that joins a leading space to a lowercase word. Alone, "wbbbbb" is 6
+        // tokens and "XYZ" 3; in the prompt " wbbbbb" is 1 and " XYZ" 4. Ranking the texts alone
+        // reserved a final of 16 words, and the real final with XYZ in it was 3 tokens longer.
+        let (reserve, real) = reserve_and_real_final(regex_tokenizer(r" [a-z]+|[\s\S]"), "XYZ");
+        assert!(real <= reserve, "real final {real} > reserve {reserve}");
+        assert_eq!(
+            real, reserve,
+            "the line costs add up here, so the bound is tight"
+        );
+    }
+
+    #[test]
+    fn worst_final_covers_the_real_final_with_qwens_split() {
+        // Qwen's split: "wbbbbb" and "7" are one pretoken each alone, but in the prompt the line
+        // " wbbbbb\n" is 2 (" wbbbbb", "\n") and " 7\n" is 3 (" ", "7", "\n").
+        let (reserve, real) = reserve_and_real_final(regex_tokenizer(QWEN_SPLIT), "7");
+        assert!(real <= reserve, "real final {real} > reserve {reserve}");
+        assert_eq!(real, reserve);
     }
 
     #[test]
