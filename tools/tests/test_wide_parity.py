@@ -77,7 +77,9 @@ def test_wide_records_are_twelve_requests_of_every_size_and_strategy():
             if q["type"] == "choice" and len(q["criteria"]) > 16:
                 wide.setdefault(len(q["criteria"]), set()).add(r["strategy"])
     assert wide == {n: {"single", "tournament", "permute"} for n in (17, 24, 40, 100, 256)}
-    assert sum(len(r["questions"]) for r in WIDE_RECORDS) == 21
+    assert sum(len(r["questions"]) for r in WIDE_RECORDS) == 17
+    natives = [qid for r in WIDE_RECORDS for qid, q in r["questions"].items() if len(q.get("criteria") or []) <= 16]
+    assert sorted(natives) == ["team", "urgent"], "each native question asked once"
     assert any(q.get("instructions") is None for r in WIDE_RECORDS for q in r["questions"].values())
 
 
@@ -271,19 +273,19 @@ def test_align_refuses_a_plan_with_the_wrong_number_of_passes(cut):
     elif cut == "drop_permute":
         lines = lines[:-1]
     else:
-        lines = lines[:2] + [lines[2]] + lines[2:]
+        lines = lines[:1] + [lines[1]] + lines[1:]
     with pytest.raises(SystemExit, match="MISMATCH"):
         list(cg.align_lines(lines, [rec]))
 
 
 def test_align_refuses_a_final_before_its_groups_or_a_changed_strategy():
     rec = next(r for r in WIDE_RECORDS if r["id"] == "w0-tournament")
-    lines = server_lines(rec)  # team, product g0, product g1, product final
-    early = [lines[0], lines[1], lines[3], lines[2]]
+    lines = server_lines(rec)  # product g0, product g1, product final
+    early = [lines[0], lines[2], lines[1]]
     with pytest.raises(SystemExit, match="round"):
         list(cg.align_lines(early, [rec]))
     changed = [dict(x) for x in lines]
-    changed[2]["strategy"] = "permute"
+    changed[1]["strategy"] = "permute"
     with pytest.raises(SystemExit, match="strategy"):
         list(cg.align_lines(changed, [rec]))
 
@@ -488,7 +490,7 @@ def test_parity_wide_gates_against_a_wide_reference(tmp_path, monkeypatch, capsy
     (tmp_path / "ref.json").write_text(json.dumps(ref))
     with pytest.raises(SystemExit) as e:
         pc.main(["--url", "http://x", "--ref", str(tmp_path / "ref.json"), "--wide"])
-    assert e.value.code == 0 and "PASS agreement 21/21" in capsys.readouterr().out
+    assert e.value.code == 0 and "PASS agreement 17/17" in capsys.readouterr().out
     # the 50-record gate refuses the wide reference: its entries are never answered
     with pytest.raises(SystemExit) as e:
         pc.main(["--url", "http://x", "--ref", str(tmp_path / "ref.json")])
@@ -527,8 +529,16 @@ def test_reference_stream_combines_each_plan(tmp_path, monkeypatch):
     for rec in recs:
         lines = server_lines(rec)
         hs = [torch.randn(3, hidden_size, generator=gen) for _ in lines]
-        probs = rs.family_probs("jev", rec, lines, hs, str(tree), "w", None, None, None, tok=TOK)
-        assert set(probs) == {"team", "product"} and len(probs["product"]) == 17
+        pending = []
+        probs = rs.family_probs("jev", rec, lines, hs, str(tree), "w", None, None, None, tok=TOK, pending=pending)
+        own = None
+        if pending:  # the random model's groups pick other finalists than the synthetic server's
+            ((prec, pqid, own),) = pending
+            assert (prec["id"], pqid, probs["product"]) == (rec["id"], "product", None)
+            own_final = [1 / 16] * 16
+            probs = rs.family_probs("jev", rec, lines, hs, str(tree), "w", None, None, None, tok=TOK,
+                                    own_finals={(rec["id"], "product"): own_final})
+        assert set(probs) == set(rec["questions"]) and len(probs["product"]) == 17
         assert sum(probs["product"]) == pytest.approx(1.0)
 
         def dist(line, h):
@@ -546,7 +556,10 @@ def test_reference_stream_combines_each_plan(tmp_path, monkeypatch):
                 for i, v in zip(o, d):
                     want[i] += v / 4
         else:
-            want = cg.combine_tournament(cg.groups(17), dists[:-1], _finalists(17), dists[-1])
+            gs = cg.groups(17)
+            assert (own is None) == (cg.tournament_final(gs, dists[:-1]) == _finalists(17))
+            want = (cg.combine_tournament(gs, dists[:-1], _finalists(17), dists[-1]) if own is None else
+                    cg.combine_tournament(gs, dists[:-1], own, own_final))
         assert probs["product"] == pytest.approx(want, abs=1e-12), rec["id"]
 
 
@@ -603,3 +616,146 @@ def test_real_jev_tokenizer_labels_extend_the_trained_head_and_finals_parse():
         fin = sorted(fin + [o for o in range(n) if o not in fin][:16 - len(fin)])
         p = tok(cg.jev_pass_text(rec, qid, fin, labels, added), add_special_tokens=False).input_ids
         assert cg.final_indices(rec, qid, p, tok, labels, added) == fin
+
+
+# ---- end to end: server bugs in the tournament fail the wide gate (fix round 1) -----------------
+
+DIM = 300
+
+
+def _scored_model(monkeypatch, rs, scores, calls):
+    """reference_stream's fp32 model replaced by one that scores options by name: a pass's logit at
+    label position k is scores[name of the option on line k] (one-hot lm_head rows for the labels)."""
+    torch = pytest.importorskip("torch")
+
+    def lm_rows(weights_dir, ids):
+        rows = torch.zeros(len(ids), DIM)
+        for r, i in enumerate(ids):
+            if 1000 <= int(i) < 1000 + DIM:
+                rows[r, int(i) - 1000] = 1.0
+        return rows
+
+    def hidden_of(line):
+        text = TOK.decode(line["readout"]["prompt_ids"])
+        h = torch.zeros(2, DIM)
+        body = text.split("\n[options]\n", 1)[1].rsplit("\n[decision]:", 1)[0]
+        for k, ln in enumerate(body.split("\n")):
+            if ") " in ln:
+                h[-1, k] = scores.get(ln.split(") ", 1)[1].split(":")[0], 0.0)
+        return h
+
+    def stream_hidden(weights_dir, passes, lora=None, lora_scale=None, threads=4, allow_lm_head_lora=False):
+        calls.append(len(passes))
+        return [hidden_of(p) for p in passes]
+    monkeypatch.setattr(rs, "lm_rows", lm_rows)
+    monkeypatch.setattr(rs, "stream_hidden", stream_hidden)
+    return hidden_of
+
+
+def _server_answer(rs, j, rec, lines, hidden_of, combine):
+    """The synthetic server's answers on the same model: each plan's passes combined by `combine`."""
+    lo_ad = rs.Lora(None, None)
+    answers = {}
+    for qid, ps in cg.question_passes(lines).items():
+        q = rec["questions"][qid]
+        dists = [rs.wide_dist(j, p, hidden_of(p), "w", lo_ad) for p in ps]
+        fin = cg.final_indices(rec, qid, ps[-1]["readout"]["prompt_ids"], TOK, LABELS)
+        answers[qid] = {"type": "choice", "probabilities": dict(zip(q["criteria"], combine(cg.groups(len(q["criteria"])),
+                                                                                         dists[:-1], fin, dists[-1]))),
+                        "_fin": fin}
+    return answers
+
+
+def _gate(monkeypatch, tmp_path, rec, ref, answers):
+    monkeypatch.setattr(pc, "WIDE_RECORDS", [rec])
+    monkeypatch.setattr(pc, "systemone", lambda url, r: {"answers": answers})
+    (tmp_path / "ref.json").write_text(json.dumps(ref))
+    with pytest.raises(SystemExit) as e:
+        pc.main(["--url", "http://x", "--ref", str(tmp_path / "ref.json"), "--wide"])
+    return e.value.code
+
+
+def test_wrong_tournament_finalists_fail_the_wide_gate(tmp_path, monkeypatch, capsys):
+    pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    import reference_stream as rs
+    tree, j = _jev_tree(tmp_path)
+    rec = next(r for r in WIDE_RECORDS if r["id"] == "w0-tournament")
+    names = list(rec["questions"]["product"]["criteria"])
+    calls = []
+    hidden_of = _scored_model(monkeypatch, rs, {names[1]: 9.0, names[2]: 8.9, names[10]: 9.0}, calls)
+    # a server whose leftover sort is flipped: it tops up with the worst losers and drops option 2,
+    # the best loser of group 0 (groups 0..8 and 9..16)
+    buggy = [o for o in range(17) if o != 2]
+    lines = server_lines(rec, finals=lambda n: buggy)
+    write_dump(tmp_path / "d.jsonl", [rec], finals=lambda n: buggy)
+    ref = rs.build_ref("jev", "w", str(tmp_path / "d.jsonl"), [rec], str(tree), threads=1, tok=TOK)
+    out = capsys.readouterr().out
+    assert calls == [3, 1], "a second fp32 sweep ran the reference's own final"
+    assert "FINALISTS w0-tournament.product" in out and "server only [0]" in out and "reference only [2]" in out
+    answers = _server_answer(rs, j, rec, lines, hidden_of, cg.combine_tournament)
+    assert answers["product"].pop("_fin") == buggy
+    # the old reference (the server's own final, replayed) agreed with the bug exactly
+    dists = [rs.wide_dist(j, p, hidden_of(p), "w", rs.Lora(None, None)) for p in lines]
+    old = cg.combine_tournament(cg.groups(17), dists[:-1], buggy, dists[-1])
+    assert old == pytest.approx(list(answers["product"]["probabilities"].values()), abs=1e-12)
+    assert _gate(monkeypatch, tmp_path, rec, {"w0-tournament.product": old}, answers) == 0
+    assert _gate(monkeypatch, tmp_path, rec, ref, answers) == 1
+    assert "FAIL" in capsys.readouterr().out
+
+
+def _no_among(gs, in_group_passes, fin, final_pass):
+    """combine_tournament with the `among` factor dropped (finalists keep their bare final probability)."""
+    in_group = {o: p for g, ps in zip(gs, in_group_passes) for o, p in zip(g, ps)}
+    final = dict(zip(fin, final_pass))
+    group_of = {o: gi for gi, g in enumerate(gs) for o in g}
+    share = [0.0] * len(gs)
+    for f in fin:
+        share[group_of[f]] += final[f]
+    p = [final[o] if o in final else share[group_of[o]] * in_group[o] for o in range(len(group_of))]
+    return [x / sum(p) for x in p]
+
+
+def test_a_combine_that_keeps_the_top_1_still_fails_the_wide_gate(tmp_path, monkeypatch, capsys):
+    pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    import reference_stream as rs
+    tree, j = _jev_tree(tmp_path)
+    rec = next(r for r in WIDE_RECORDS if r["id"] == "w3-tournament")
+    names = list(rec["questions"]["queue"]["criteria"])
+    hidden_of = _scored_model(monkeypatch, rs, {names[0]: 3.0, names[17]: 1.0}, [])
+    # the server picks the right finalists (the model's own), so only the combination differs
+    groups_only = server_lines(rec)[:-1]
+    dists = [rs.wide_dist(j, p, hidden_of(p), "w", rs.Lora(None, None)) for p in groups_only]
+    fin = cg.tournament_final(cg.groups(256), dists)
+    write_dump(tmp_path / "d.jsonl", [rec], finals=lambda n: fin)
+    lines = server_lines(rec, finals=lambda n: fin)
+    ref = rs.build_ref("jev", "w", str(tmp_path / "d.jsonl"), [rec], str(tree), threads=1, tok=TOK)
+    good = _server_answer(rs, j, rec, lines, hidden_of, cg.combine_tournament)
+    bad = _server_answer(rs, j, rec, lines, hidden_of, _no_among)
+    for a in (good, bad):
+        a["queue"].pop("_fin")
+    got, want = list(bad["queue"]["probabilities"].values()), ref["w3-tournament.queue"]
+    assert max(range(256), key=got.__getitem__) == max(range(256), key=want.__getitem__), "same top-1"
+    assert _gate(monkeypatch, tmp_path, rec, ref, good) == 0
+    capsys.readouterr()
+    assert _gate(monkeypatch, tmp_path, rec, ref, bad) == 1
+    out = capsys.readouterr().out
+    assert "agreement" not in out.split("FAIL", 1)[1] and "multi-pass max |dp|" in out
+
+
+def test_max_dp_flag_overrides_the_wide_default_and_prints_native_dp(tmp_path, monkeypatch, capsys):
+    rec = next(r for r in WIDE_RECORDS if r["id"] == "w1-single")
+    n = len(rec["questions"]["destination"]["criteria"])
+    ref = {"w1-single.destination": [1 / n] * n, "w1-single.urgent": [0.3, 0.7]}
+    probs = [1 / n] * n
+    probs[0], probs[1] = probs[0] + 0.03, probs[1] - 0.03
+    answers = {"urgent": {"type": "noul", "noul": 0.69},
+               "destination": {"type": "choice", "probabilities": dict(zip(rec["questions"]["destination"]["criteria"], probs))}}
+    assert _gate(monkeypatch, tmp_path, rec, ref, answers) == 0
+    out = capsys.readouterr().out
+    assert "max |dp| multi-pass = 0.0300, native = 0.0100 (limit 0.05)" in out
+    monkeypatch.setattr(pc, "WIDE_RECORDS", [rec])
+    with pytest.raises(SystemExit) as e:
+        pc.main(["--url", "http://x", "--ref", str(tmp_path / "ref.json"), "--wide", "--max-dp", "0.02"])
+    assert e.value.code == 1 and "multi-pass max |dp| 0.0300 > 0.02" in capsys.readouterr().out

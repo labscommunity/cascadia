@@ -76,8 +76,9 @@ def records(n=50):
 # ---------------------------------------------------------------------------------------------
 # Wide JEV choices (Task 38): choice questions past JEV's 16 trained slots, kept apart from the 50
 # parity records above (whose saved spike references cover only those). Four requests of 17, 24,
-# 40 + 100 and 256 options, each asked once per multi-pass strategy: 12 records, 21 questions.
-# Native questions ride along, so a request mixes native and multi-pass lines in its dump.
+# 40 + 100 and 256 options, each asked once per multi-pass strategy: 12 records, 17 questions.
+# Two native questions ride along in the `single` requests only (asked once each, so their flips
+# do not count three times), so those requests mix native and multi-pass lines in their dump.
 
 WIDE_STRATEGIES = ("single", "tournament", "permute")
 
@@ -131,22 +132,24 @@ REGIONS = ["nepal", "india", "gulf", "uk", "ireland", "france", "germany", "bene
 QUEUE = {"type": "choice", "instructions": "Which support queue should receive this ticket?",
          "criteria": {f"{t}_{r}": "" for t in TEAMS for r in REGIONS}}
 
+# (id, state, questions, native questions asked in the `single` request only)
 WIDE_CASES = [
     ("w0", "My credit card statement shows an annual fee I was told would be waived.",
-     {"team": ROUTING, "product": PRODUCT}),
+     {"product": PRODUCT}, {"team": ROUTING}),
     ("w1", {"traveller": "Asha Gurung", "booking": "PNR 7XK2QD", "message": "Please rebook me onto tomorrow's "
             "first flight; my connection through Doha was cancelled.", "loyalty_tier": "gold"},
-     {"destination": DESTINATION, "urgent": URGENT}),
+     {"destination": DESTINATION}, {"urgent": URGENT}),
     ("w2", "Bonjour, je n'arrive pas a me connecter a l'application depuis Lyon depuis hier soir.",
-     {"country": COUNTRY, "language": LANGUAGE}),
+     {"country": COUNTRY, "language": LANGUAGE}, {}),
     ("w3", "Business customer in Toronto: two payroll transfers to our staff in Mexico were rejected today.",
-     {"queue": QUEUE}),
+     {"queue": QUEUE}, {}),
 ]
 
 
 def _wide_records():
-    return [{"id": f"{cid}-{s}", "state": state, "strategy": s, "questions": qs}
-            for cid, state, qs in WIDE_CASES for s in WIDE_STRATEGIES]
+    return [{"id": f"{cid}-{s}", "state": state, "strategy": s,
+             "questions": {**native, **qs} if s == "single" else dict(qs)}
+            for cid, state, qs, native in WIDE_CASES for s in WIDE_STRATEGIES]
 
 
 WIDE_RECORDS = _wide_records()
