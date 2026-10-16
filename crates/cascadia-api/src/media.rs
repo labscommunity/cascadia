@@ -21,7 +21,8 @@ use sha2::{Digest, Sha256};
 #[derive(Clone, Debug)]
 pub struct MediaConfig {
     /// Text that marks image `i` in the prompt, with `{i}` replaced by the
-    /// image's index in the request. ov-genai uses its universal tag, which
+    /// image's index in the request (`{n}`: the index plus one, for
+    /// processors that number images from 1). ov-genai uses its universal tag, which
     /// GenAI maps to each model's native one; the staged Qwen3.5 engine takes
     /// the native tag, the same for every image (no `{i}`).
     pub image_placeholder: String,
@@ -140,6 +141,33 @@ impl MediaConfig {
         }
     }
 
+    /// Settings for a Phi-3.5-vision (`phi3_v`) vision tree on `ov-runtime`:
+    /// the processor's numbered `<|image_N|>` tag (from 1) and the newline
+    /// the model card and GenAI put after it. Rank 0 cuts the prompt at each
+    /// tag, as `Phi3VProcessor` does, and expands it to the image's soft
+    /// tokens (757 for a 448x448 image with 4 crops).
+    pub fn phi3v_native() -> Self {
+        Self {
+            image_placeholder: "<|image_{n}|>\n".into(),
+            reserved_text: ["<|image_", "<|image|>"].map(String::from).to_vec(),
+            ..Self::ov_genai()
+        }
+    }
+
+    /// Settings for an InternVL2 (`internvl_chat`) vision tree on
+    /// `ov-runtime`: `<img><IMG_CONTEXT></img>` and a newline, the string
+    /// `chat` writes for `<image>\n` with one context token; rank 0 widens
+    /// it to 256 per tile.
+    pub fn internvl_native() -> Self {
+        Self {
+            image_placeholder: "<img><IMG_CONTEXT></img>\n".into(),
+            reserved_text: ["<img>", "</img>", "<IMG_CONTEXT>"]
+                .map(String::from)
+                .to_vec(),
+            ..Self::ov_genai()
+        }
+    }
+
     /// One text part of a message with images, as it enters the prompt.
     pub fn text_part(&self, t: String) -> String {
         if self.trim_text_parts {
@@ -150,7 +178,18 @@ impl MediaConfig {
     }
 
     pub fn placeholder(&self, i: usize) -> String {
-        self.image_placeholder.replace("{i}", &i.to_string())
+        self.image_placeholder
+            .replace("{i}", &i.to_string())
+            .replace("{n}", &(i + 1).to_string())
+    }
+
+    /// The placeholder's text before its index, when it is indexed.
+    fn indexed_prefix(&self) -> Option<&str> {
+        let at = ["{i}", "{n}"]
+            .iter()
+            .filter_map(|k| self.image_placeholder.find(k))
+            .min()?;
+        Some(&self.image_placeholder[..at])
     }
 
     /// A reserved string `prompt` carries more often than its `n` image
@@ -173,12 +212,7 @@ impl MediaConfig {
     /// Whether the rendered `prompt` carries `n` images' placeholders, each
     /// exactly once (indexed tags), or exactly `n` of the one shared tag.
     pub fn placeholders_complete(&self, prompt: &str, n: usize) -> Result<(), usize> {
-        if self.image_placeholder.contains("{i}") {
-            let prefix = self
-                .image_placeholder
-                .split("{i}")
-                .next()
-                .unwrap_or_default();
+        if let Some(prefix) = self.indexed_prefix() {
             let found = prompt.matches(prefix).count();
             let each_once = (0..n).all(|i| prompt.matches(&self.placeholder(i)).count() == 1);
             if found == n && each_once {
@@ -902,6 +936,30 @@ mod tests {
         assert_eq!(g.reserved_in("plain text"), None);
 
         assert_eq!(g.text_part("  a b \n".into()), "a b");
+
+        // Phi-3.5-vision numbers its tags from 1.
+        let p = MediaConfig::phi3v_native();
+        assert_eq!(p.placeholder(0), "<|image_1|>\n");
+        assert_eq!(p.placeholder(1), "<|image_2|>\n");
+        let two = format!("{}a{}", p.placeholder(0), p.placeholder(1));
+        assert_eq!(p.placeholders_complete(&two, 2), Ok(()));
+        assert_eq!(p.placeholders_complete(&p.placeholder(1), 1), Err(1));
+        assert_eq!(p.reserved_beyond_placeholders(&two, 2), None);
+        assert_eq!(
+            p.reserved_beyond_placeholders(&format!("{two}<|image_9|>"), 2),
+            Some("<|image_")
+        );
+        assert_eq!(p.reserved_in("a <|image|> b"), Some("<|image|>"));
+
+        let iv = MediaConfig::internvl_native();
+        let tag = iv.placeholder(3);
+        assert_eq!(tag, "<img><IMG_CONTEXT></img>\n");
+        assert_eq!(iv.placeholders_complete(&format!("{tag}{tag}"), 2), Ok(()));
+        assert_eq!(
+            iv.reserved_beyond_placeholders(&format!("{tag}</img>"), 1),
+            Some("</img>")
+        );
+        assert_eq!(iv.reserved_in("<image> is fine"), None);
 
         let x = MediaConfig::pixtral_native();
         assert_eq!(x.text_part(" a ".into()), " a ");

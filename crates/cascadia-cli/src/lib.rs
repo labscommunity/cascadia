@@ -1580,6 +1580,11 @@ fn vision_tree_media(engine: EngineKind, family: &str) -> Option<cascadia_api::M
         (EngineKind::OvRuntime | EngineKind::OvDistSpec, "pixtral" | "mistral3") => {
             Some(cascadia_api::MediaConfig::pixtral_native())
         }
+        // Staged ov-runtime only: ov-dist-spec takes Pixtral targets alone.
+        (EngineKind::OvRuntime, "phi3_v") => Some(cascadia_api::MediaConfig::phi3v_native()),
+        (EngineKind::OvRuntime, "internvl_chat") => {
+            Some(cascadia_api::MediaConfig::internvl_native())
+        }
         _ => None,
     }
 }
@@ -3940,6 +3945,16 @@ mod tests {
             tag(EngineKind::OvDistSpec, "mistral3").as_deref(),
             Some("[IMG]")
         );
+        assert_eq!(
+            tag(EngineKind::OvRuntime, "phi3_v").as_deref(),
+            Some("<|image_{n}|>\n")
+        );
+        assert_eq!(
+            tag(EngineKind::OvRuntime, "internvl_chat").as_deref(),
+            Some("<img><IMG_CONTEXT></img>\n")
+        );
+        assert_eq!(tag(EngineKind::OvDistSpec, "phi3_v"), None);
+        assert_eq!(tag(EngineKind::OvDistSpec, "internvl_chat"), None);
         // dist-spec refuses Gemma 4 targets at load; gemma4 has no Pixtral path.
         assert_eq!(tag(EngineKind::OvDistSpec, "gemma4"), None);
         assert_eq!(tag(EngineKind::Gemma4, "pixtral"), None);
