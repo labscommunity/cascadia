@@ -2849,6 +2849,10 @@ struct Collected {
     /// OpenAI `finish_reason`: `stop` or `length`.
     finish_reason: &'static str,
     logprobs: Vec<cascadia_types::TokenLogprobs>,
+    /// The engine's own reason from the final chunk (`Stop` when it gave
+    /// none); `None` when the stream ended without one, as a cancelled task's
+    /// does. `finish_reason` folds `Cancelled` into `stop`; this keeps it.
+    end: Option<cascadia_types::FinishReason>,
 }
 
 /// Run an admitted task to completion. Holds the permit + in-flight guard
@@ -2877,6 +2881,7 @@ async fn collect_generation(
     // `stop`. Engines that don't distinguish leave it None → "stop".
     let mut finish_reason: &'static str = "stop";
     let mut logprobs_content: Vec<cascadia_types::TokenLogprobs> = Vec::new();
+    let mut end = None;
     while let Some(chunk) = chunk_stream.next().await {
         // A failed task carries `error` on its final chunk. Without this
         // branch the empty text below would build a normal 200 with empty
@@ -2915,6 +2920,11 @@ async fn collect_generation(
             if let Some(fr) = chunk.finish_reason {
                 finish_reason = fr.as_openai_str();
             }
+            end = Some(
+                chunk
+                    .finish_reason
+                    .unwrap_or(cascadia_types::FinishReason::Stop),
+            );
         }
     }
     state
@@ -2944,6 +2954,7 @@ async fn collect_generation(
         completion_tokens,
         finish_reason,
         logprobs: logprobs_content,
+        end,
     })
 }
 
@@ -2993,6 +3004,7 @@ async fn chat_completions(
         completion_tokens,
         mut finish_reason,
         logprobs: logprobs_content,
+        ..
     } = match collect_generation(&state, admitted, &req.sampling_params().stop).await {
         Ok(c) => c,
         Err(resp) => return resp,
