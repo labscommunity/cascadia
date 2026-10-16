@@ -372,10 +372,12 @@ pub struct WorkerArgs {
     pub decision_dump_max_bytes: Option<u64>,
 
     /// Decision requests (/v1/decisions and /v1/systemone) admitted at once; one more is a 503
-    /// `engine at capacity`. A pool of its own: decisions and chat never refuse each other.
-    /// The engine still runs one pass at a time, so N sets queue depth, not parallelism. With
-    /// Kev and the prefix cache, more admitted requests evict more shared-prefix snapshots,
-    /// and an evicted one is also a 503. Must be at least 1.
+    /// `engine at capacity`. A pool of its own: decisions and chat never take each other's
+    /// permits, so up to 16 chat + N decision requests are admitted at once. The engine still
+    /// runs one pass at a time, so N sets queue depth, not parallelism. With Kev and the prefix
+    /// cache, more admitted requests (chat included) evict more shared-prefix snapshots, and an
+    /// evicted one is also a 503. 1 to 240: chat's 16 plus N must fit the engine's 256-task
+    /// pending queue.
     #[arg(long, value_name = "N", default_value_t = cascadia_api::DEFAULT_MAX_CONCURRENT_DECISIONS, value_parser = parse_max_decision_requests)]
     pub max_decision_requests: usize,
 
@@ -763,7 +765,7 @@ pub struct RunArgs {
     pub decision_dump_max_bytes: Option<u64>,
 
     /// Decision requests admitted at once, a pool separate from chat's. See
-    /// `cascadia worker --help`. Must be at least 1.
+    /// `cascadia worker --help`. 1 to 240.
     #[arg(long, value_name = "N", default_value_t = cascadia_api::DEFAULT_MAX_CONCURRENT_DECISIONS, value_parser = parse_max_decision_requests)]
     pub max_decision_requests: usize,
 
@@ -1376,13 +1378,30 @@ fn ov_perf_properties(args: &WorkerArgs) -> Vec<(String, String)> {
     props
 }
 
-/// `--max-decision-requests`: a whole number of at least 1. Zero would refuse every decision
-/// with a 503 that reads like load, so it is a startup error instead.
+/// Largest `--max-decision-requests`: every admitted request can have a pass queued in the
+/// engine, so the decision pool plus chat's (fixed at [`cascadia_api::DEFAULT_MAX_CONCURRENT`])
+/// must fit its pending queue, or decisions would fill it and chat would get `QueueFull` 503s.
+const MAX_DECISION_REQUESTS: usize =
+    cascadia_engine_openvino::dist_spec::MAX_PENDING_TASKS - cascadia_api::DEFAULT_MAX_CONCURRENT;
+
+/// `--max-decision-requests`: a whole number from 1 to [`MAX_DECISION_REQUESTS`]. Zero would
+/// refuse every decision with a 503 that reads like load, so it is a startup error instead.
 fn parse_max_decision_requests(s: &str) -> Result<usize, String> {
+    let range = format!("a whole number from 1 to {MAX_DECISION_REQUESTS}");
     match s.parse::<usize>() {
         Ok(0) => Err("must be at least 1 (0 would refuse every decision request)".into()),
+        Ok(n) if n > MAX_DECISION_REQUESTS => Err(format!(
+            "must be at most {MAX_DECISION_REQUESTS}: the {} chat permits plus N must fit the \
+             engine's {}-task pending queue",
+            cascadia_api::DEFAULT_MAX_CONCURRENT,
+            cascadia_engine_openvino::dist_spec::MAX_PENDING_TASKS,
+        )),
         Ok(n) => Ok(n),
-        Err(_) => Err(format!("{s:?} is not a whole number of at least 1")),
+        // Past usize too: the same bound, never a panic later in `Semaphore::new`.
+        Err(_) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => {
+            Err(format!("must be at most {MAX_DECISION_REQUESTS} ({range})"))
+        }
+        Err(_) => Err(format!("{s:?} is not {range}")),
     }
 }
 
@@ -4116,6 +4135,45 @@ mod tests {
             panic!("expected worker subcommand");
         };
         assert_eq!(args.max_decision_requests, 2);
+        // The cap keeps decisions plus chat's pool within the engine's pending queue.
+        let cap = cascadia_engine_openvino::dist_spec::MAX_PENDING_TASKS
+            - cascadia_api::DEFAULT_MAX_CONCURRENT;
+        assert_eq!(MAX_DECISION_REQUESTS, cap);
+        assert_eq!(
+            parse_max_decision_requests(&cap.to_string()),
+            Ok(cap),
+            "a value at the cap is accepted"
+        );
+        let Command::Run(args) = parse(&["--max-decision-requests", &cap.to_string()])
+            .expect("parse run argv at the cap")
+            .cmd
+        else {
+            panic!("expected run subcommand")
+        };
+        assert_eq!(args.max_decision_requests, cap);
+        // The help text spells the cap out; it must follow the constants.
+        let help = <Cli as clap::CommandFactory>::command()
+            .find_subcommand_mut("worker")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains(&format!("1 to {cap}")), "{help}");
+        assert!(
+            help.contains(&format!(
+                "{}-task pending queue",
+                cascadia_engine_openvino::dist_spec::MAX_PENDING_TASKS
+            )),
+            "{help}"
+        );
+        for over in [(cap + 1).to_string(), usize::MAX.to_string()] {
+            let err = parse_max_decision_requests(&over).unwrap_err();
+            assert!(err.contains(&format!("at most {cap}")), "{over}: {err}");
+            let err = parse(&["--max-decision-requests", &over])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--max-decision-requests"), "{over}: {err}");
+            assert!(err.contains(&format!("at most {cap}")), "{over}: {err}");
+        }
         assert!(Cli::try_parse_from([
             "cascadia",
             "worker",
