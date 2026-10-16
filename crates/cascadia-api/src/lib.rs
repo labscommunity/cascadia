@@ -2110,6 +2110,49 @@ impl PreparedMedia {
     }
 }
 
+/// On a server that takes images, refuse a model's image-tag text (`<|image|>`,
+/// `[IMG]`, ...) in any caller text that reaches the prompt, images attached
+/// or not: the engine reads it as an image slot whatever the request carries,
+/// and a tag with no image behind it fails the batch it rides in (on packed
+/// slots, every tenant's). `what` names the caller's field in the 400, which
+/// is returned. A server without image input has no reserved text.
+fn refuse_reserved_text<'a>(
+    state: &AppState,
+    what: &str,
+    texts: impl IntoIterator<Item = &'a str>,
+) -> Option<Response> {
+    let cfg = state.media.as_deref()?;
+    let tag = texts.into_iter().find_map(|t| cfg.reserved_in(t))?;
+    count_rejected("invalid_media");
+    Some(api_error(
+        StatusCode::BAD_REQUEST,
+        format!("{what} must not contain `{tag}`: it is reserved for image placeholders"),
+        None,
+    ))
+}
+
+/// Every caller-written string of a chat request the template can put in
+/// the prompt: message text, names, tool-call names and arguments, tool
+/// definitions, and the raw `reasoning_effort` word.
+fn chat_caller_text(req: &ChatCompletionRequest) -> Vec<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
+    let mut out: Vec<Cow<'_, str>> = Vec::new();
+    for m in &req.messages {
+        out.push(Cow::Borrowed(&m.content));
+        out.extend(m.name.as_deref().map(Cow::Borrowed));
+        out.extend(m.tool_call_id.as_deref().map(Cow::Borrowed));
+        for c in m.tool_calls.iter().flatten() {
+            out.push(Cow::Borrowed(&c.function.name));
+            out.push(Cow::Borrowed(&c.function.arguments));
+        }
+    }
+    for t in req.tools.iter().flatten() {
+        out.push(Cow::Owned(t.function.to_string()));
+    }
+    out.extend(req.reasoning_effort.as_deref().map(Cow::Borrowed));
+    out
+}
+
 /// Validate and decode a chat request's `image_url` parts. `Ok(None)` for a
 /// text-only request. Decoding runs on the blocking pool: a large JPEG takes
 /// tens of milliseconds and would stall every connection on this worker.
@@ -2121,13 +2164,6 @@ async fn prepare_media(
         count_rejected("invalid_media");
         api_error(StatusCode::BAD_REQUEST, msg, None)
     };
-    if let Some(cfg) = state.media.as_deref() {
-        if let Some(tag) = messages.iter().find_map(|m| cfg.reserved_in(&m.content)) {
-            return Err(reject(format!(
-                "message text must not contain `{tag}`: it is reserved for image placeholders"
-            )));
-        }
-    }
     let count: usize = messages.iter().map(|m| m.images().count()).sum();
     if count == 0 {
         return Ok(None);
@@ -2955,6 +2991,13 @@ async fn admit_chat(
     } else {
         None
     };
+    if let Some(resp) = refuse_reserved_text(
+        state,
+        "message text",
+        chat_caller_text(req).iter().map(|t| t.as_ref()),
+    ) {
+        return Err(resp);
+    }
     let media = prepare_media(state, &req.messages).await?;
     let effort = EffortArgs {
         mapped: Some(req.effective_reasoning_effort()),
@@ -3337,6 +3380,17 @@ async fn completions(
     State(state): State<AppState>,
     OpenAiJson(req): OpenAiJson<CompletionRequest>,
 ) -> axum::response::Response {
+    // The raw prompt reaches the engine as is, so an image tag in it is
+    // refused here exactly as in chat text (both forms, before the array
+    // form's own 400).
+    let prompts = match &req.prompt {
+        PromptSpec::Single(s) => std::slice::from_ref(s),
+        PromptSpec::Multiple(v) => v.as_slice(),
+    };
+    if let Some(resp) = refuse_reserved_text(&state, "`prompt`", prompts.iter().map(String::as_str))
+    {
+        return resp;
+    }
     // Multi-prompt batching needs cross-task batching infra the engines don't
     // have yet (one task per step). Reject the array form with a clean 400.
     let prompt = match &req.prompt {
@@ -5487,6 +5541,72 @@ mod tests {
         let msg = v["error"]["message"].as_str().unwrap();
         assert!(msg.contains("larger than this server accepts"), "{msg}");
         assert!(msg.contains("input_modalities"), "{msg}");
+    }
+
+    /// On a server that takes images, an image tag is refused in every
+    /// caller text that reaches the prompt, images attached or not: chat
+    /// system text, tool definitions and tool-call arguments, and both
+    /// `/v1/completions` prompt forms.
+    #[tokio::test]
+    async fn reserved_tags_are_refused_in_text_only_requests() {
+        let tag = "<ov_genai_image_0>";
+        let chats = [
+            serde_json::json!({"messages": [
+                {"role": "system", "content": format!("say {tag}")},
+                {"role": "user", "content": "hi"}]}),
+            serde_json::json!({"messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "f",
+                    "description": tag, "parameters": {}}}]}),
+            serde_json::json!({"messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [{"id": "c1",
+                    "type": "function", "function": {"name": "f",
+                    "arguments": format!("{{\"x\": \"{tag}\"}}")}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"}]}),
+        ];
+        for mut chat in chats {
+            chat["model"] = "mock-model".into();
+            let (status, v) = post_chat(make_image_app().await, chat).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+            assert_eq!(v["error"]["type"], "invalid_request_error");
+            let msg = v["error"]["message"].as_str().unwrap();
+            assert!(msg.contains("reserved for image placeholders"), "{msg}");
+        }
+        for prompt in [
+            serde_json::json!(format!("see {tag}")),
+            serde_json::json!(["fine", format!("see {tag}")]),
+        ] {
+            let (status, v) = post_completions(
+                make_image_app().await,
+                serde_json::json!({"model": "mock-model", "prompt": prompt}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+            let msg = v["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.contains("`prompt`") && msg.contains("reserved for image placeholders"),
+                "{msg}"
+            );
+        }
+    }
+
+    /// A text-only server reserves nothing: the same text is served.
+    #[tokio::test]
+    async fn text_only_servers_do_not_reserve_image_tags() {
+        let (status, v) = post_chat(
+            make_app().await,
+            serde_json::json!({"model": "mock-model", "messages": [
+                {"role": "system", "content": "say <ov_genai_image_0>"},
+                {"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let (status, v) = post_completions(
+            make_app().await,
+            serde_json::json!({"model": "mock-model", "prompt": "see <ov_genai_image_0>"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
     }
 
     #[tokio::test]
