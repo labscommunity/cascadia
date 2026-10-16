@@ -14,6 +14,7 @@ pub mod dist_spec;
 pub mod gemma4;
 pub mod gemma4_vision;
 pub mod genai;
+pub mod image_cache;
 #[cfg(feature = "kv_coord")]
 pub mod kv_coordination;
 pub mod packed;
