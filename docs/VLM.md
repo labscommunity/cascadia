@@ -149,8 +149,8 @@ needs RAM for both the decode and prefill IRs of every stage it holds.
   slots`; two Pixtral images do not fit two slots of a 2048 context.
 - Rank 0 keeps each encoded image (keyed on a hash of its pixels) so a chat's earlier
   images are not re-encoded every turn: `CASCADIA_IMAGE_CACHE_MB` per vision front end,
-  default 256, 0 to disable. With `kv_coord`, `ov-runtime` and `gemma4` also resume a
-  chat's KV past its earlier images (keyed on each image's hash), so a follow-up turn
-  prefills only its new text: about 1 s instead of 11-14 s on CPU for Ministral-3-3B and
-  Gemma 4 E4B. Static and packed shards and staged `qwen36` turns still re-prefill images;
-  the single-box `qwen35` prefix cache keys on the image too.
+  default 256, 0 to disable. With `kv_coord`, `ov-runtime`, `gemma4` and `qwen35` also
+  resume a chat's KV past its earlier images (keyed on each image's hash), so a follow-up
+  turn prefills only its new text: about 1-1.5 s instead of 11-14 s on CPU (Ministral-3-3B,
+  Gemma 4 E4B, Qwen3.6-35B-A3B on two machines). Static and packed shards still re-prefill
+  images; the single-box `qwen35` prefix cache keys on the image too.
