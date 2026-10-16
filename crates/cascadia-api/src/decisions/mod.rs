@@ -116,7 +116,7 @@ pub struct DecisionService {
     /// The engine can resume a shared prefix (single box, prefix cache on). Only then does the
     /// budget count Kev's state once; pipeline ranks re-prefill it per question.
     pub prefix_reuse: bool,
-    /// Concurrent decision encodes (tokenizations), separate from the request permits: each
+    /// Concurrent decision encodes (tokenizations), separate from the decision permits: each
     /// holds up to a few hundred MB of tokenizer transients, so 16 permits must not mean 16 of
     /// them at once (P2-SEC-3). Held by the blocking encode itself, like the request permit.
     pub encode_slots: Arc<tokio::sync::Semaphore>,

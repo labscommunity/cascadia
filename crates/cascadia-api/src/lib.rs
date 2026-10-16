@@ -42,6 +42,12 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
 /// [`Config::max_concurrent_requests`].
 pub const DEFAULT_MAX_CONCURRENT: usize = 16;
 
+/// Default cap on concurrent decision requests (`/v1/decisions`, `/v1/systemone`), a pool of
+/// its own so decisions and chat never refuse each other. Like chat's, it bounds admission and
+/// queue depth, not parallelism: the engine still runs one pass at a time. Adjustable via
+/// [`Config::max_concurrent_decisions`] (the CLI's `--max-decision-requests`).
+pub const DEFAULT_MAX_CONCURRENT_DECISIONS: usize = 16;
+
 /// Default cap on tokenized prompt length passed to the engine.
 /// Bounded so a 64 KiB JSON body of "a"*N characters that compresses
 /// to a multi-million-token prompt cannot trigger O(seq²) GPU work.
@@ -98,6 +104,9 @@ pub struct AppState {
     pub runner: Arc<Runner>,
     pub model_id: String,
     pub permits: Arc<Semaphore>,
+    /// Admission for decision requests, separate from chat's [`AppState::permits`]. A decision
+    /// holds one from before its encode until its last pass (a tournament's finals included).
+    pub decision_permits: Arc<Semaphore>,
     /// Live counters, shared with the dashboard. See [`ApiStats`].
     pub stats: Arc<ApiStats>,
     pub max_prompt_bytes: usize,
@@ -251,6 +260,8 @@ pub struct ChatTemplateConfig {
 pub struct Config {
     pub max_body_bytes: usize,
     pub max_concurrent_requests: usize,
+    /// See [`DEFAULT_MAX_CONCURRENT_DECISIONS`].
+    pub max_concurrent_decisions: usize,
     pub max_prompt_bytes: usize,
     pub chat_template: ChatTemplateConfig,
     /// See [`AppState::defer_template_on_thinking`]. Set by the CLI for ov-genai.
@@ -271,6 +282,7 @@ impl Default for Config {
         Self {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_concurrent_requests: DEFAULT_MAX_CONCURRENT,
+            max_concurrent_decisions: DEFAULT_MAX_CONCURRENT_DECISIONS,
             max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
             chat_template: ChatTemplateConfig::default(),
             defer_template_on_thinking: false,
@@ -644,6 +656,7 @@ fn make_router_inner(
         runner,
         model_id: model_id.into(),
         permits: Arc::new(Semaphore::new(cfg.max_concurrent_requests)),
+        decision_permits: Arc::new(Semaphore::new(cfg.max_concurrent_decisions)),
         stats,
         max_prompt_bytes: cfg.max_prompt_bytes,
         // Parse the chat template once here (not per request). A parse error
@@ -4278,7 +4291,7 @@ mod tests {
                 prefix_reuse: false,
                 encode_slots: decisions::default_encode_slots(),
             })),
-            max_concurrent_requests: 1,
+            max_concurrent_decisions: 1,
             ..Config::default()
         };
         let stats = Arc::new(ApiStats::default());
@@ -4649,7 +4662,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn decision_encodes_are_bounded_by_their_own_slots_not_the_request_permits() {
-        // P2-SEC-3: 16 request permits must not mean 16 concurrent tokenizer transients. Six
+        // P2-SEC-3: 16 decision permits must not mean 16 concurrent tokenizer transients. Six
         // requests within the permits all answer, but at most `encode_slots` (2) encode at once.
         let runner = Runner::new(Box::new(MockBuilder::new()));
         runner
@@ -4680,7 +4693,7 @@ mod tests {
                 prefix_reuse: false,
                 encode_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             })),
-            max_concurrent_requests: 16,
+            max_concurrent_decisions: 16,
             ..Config::default()
         };
         let app = make_router_with_stats(
@@ -4713,6 +4726,111 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(body.to_owned()))
             .unwrap()
+    }
+
+    /// A router whose decision codec holds its first encode until `release` sends, so a test can
+    /// keep one decision permit taken while it sends other requests.
+    async fn gated_decision_app(
+        max_concurrent_requests: usize,
+        max_concurrent_decisions: usize,
+    ) -> (
+        Router,
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let codec = GateCodec {
+            started: std::sync::Mutex::new(Some(started_tx)),
+            release: std::sync::Mutex::new(Some(release_rx)),
+            saw_cancel: Default::default(),
+            finished: Default::default(),
+        };
+        let cfg = Config {
+            decisions: Some(Arc::new(decisions::DecisionService {
+                family: decisions::profile::Family::Kev,
+                codec: Box::new(codec),
+                max_tokens: 1000,
+                max_total_tokens: 4000,
+                max_questions: 32,
+                prefix_reuse: false,
+                encode_slots: decisions::default_encode_slots(),
+            })),
+            max_concurrent_requests,
+            max_concurrent_decisions,
+            ..Config::default()
+        };
+        let app = make_router_with_stats(
+            Arc::new(runner),
+            "mock-model",
+            cfg,
+            Arc::new(ApiStats::default()),
+        );
+        (app, started_rx, release_tx)
+    }
+
+    fn chat_hello() -> serde_json::Value {
+        serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false,
+        })
+    }
+
+    #[test]
+    fn decision_pool_defaults_to_the_chat_pool_size() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.max_concurrent_decisions,
+            DEFAULT_MAX_CONCURRENT_DECISIONS
+        );
+        assert_eq!(DEFAULT_MAX_CONCURRENT_DECISIONS, 16);
+        assert_eq!(cfg.max_concurrent_requests, DEFAULT_MAX_CONCURRENT);
+    }
+
+    #[tokio::test]
+    async fn a_full_decision_pool_refuses_decisions_but_not_chat() {
+        let body = r#"{"model": "m", "state": "s", "questions": {"u": {"type": "noul"}}}"#;
+        let (app, started, release) = gated_decision_app(1, 1).await;
+        let first = tokio::spawn(app.clone().oneshot(systemone_request(body)));
+        started.await.unwrap();
+        // The one decision permit is held mid-encode: a second decision is refused at once, with
+        // the same text as before.
+        let (status, v, _) = post_decisions(app.clone(), body).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert_eq!(
+            v["error"],
+            "engine at capacity; retry after current requests complete"
+        );
+        // The chat pool's only permit is still free.
+        let (status, v) = post_chat(app.clone(), chat_hello()).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        release.send(()).unwrap();
+        let r = first.await.unwrap().unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let (status, v, _) = post_decisions(app, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_chat_pool_does_not_refuse_decisions() {
+        // A chat pool of zero is one that is always full.
+        let body = r#"{"model": "m", "state": "s", "questions": {"u": {"type": "noul"}}}"#;
+        let (app, _started, release) = gated_decision_app(0, 1).await;
+        let (status, _) = post_chat(app.clone(), chat_hello()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        // The gate holds only the first encode; release it up front so the decision runs.
+        release.send(()).unwrap();
+        let (status, v, _) = post_decisions(app, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
     }
 
     #[tokio::test]
@@ -4748,7 +4866,7 @@ mod tests {
                 prefix_reuse: false,
                 encode_slots: decisions::default_encode_slots(),
             })),
-            max_concurrent_requests: 1,
+            max_concurrent_decisions: 1,
             ..Config::default()
         };
         let stats = Arc::new(ApiStats::default());
