@@ -1783,6 +1783,10 @@ struct ActiveTask {
     /// Vision trees: each image's embedding rows, spliced into the prefill's
     /// embeddings and then dropped (taken by the first feed).
     image_rows: Vec<Vec<f32>>,
+    /// The prompt's KV cache key (`vision_kv`); `None` keeps the turn out of
+    /// the cache.
+    #[cfg(feature = "kv_coord")]
+    kv_key: Option<Vec<i32>>,
     generated: Vec<i32>,
     /// Bytes already handed to the client. Not the decoded text: the delta is
     /// computed by `advance_emitted`, which holds back an unresolved
@@ -2712,6 +2716,11 @@ impl OvRuntimeEngine {
             // Vision trees: encode the images and expand each one's placeholder
             // into its soft-token run. Images reach no other tree.
             let mut image_rows = Vec::new();
+            // The warm-resume key: the prompt ids, image soft tokens replaced
+            // by stand-ins for each image's hash. `None` keeps the turn out of
+            // the KV cache.
+            #[cfg(feature = "kv_coord")]
+            let mut kv_key: Option<(Vec<i32>, Option<crate::vision_kv::ImageSpans>)> = None;
             if !task.media.is_empty() {
                 let refuse = |reason: String| {
                     warn!(task = %task.task_id, reason = %reason, "ov-runtime: image turn refused");
@@ -2740,6 +2749,18 @@ impl OvRuntimeEngine {
                             encode_ms = started.elapsed().as_millis() as u64,
                             "ov-runtime: images encoded"
                         );
+                        #[cfg(feature = "kv_coord")]
+                        match crate::vision_kv::for_turn(
+                            &ids,
+                            first.frontend.image_token(),
+                            &rows,
+                            &task.media,
+                            &task.tenant,
+                        ) {
+                            Ok((key, spans)) => kv_key = Some((key, Some(spans))),
+                            Err(e) => warn!(task = %task.task_id, reason = %e,
+                                "ov-runtime: no KV warm-resume key for this image turn"),
+                        }
                         prompt_ids = ids;
                         image_rows = rows;
                     }
@@ -2751,14 +2772,33 @@ impl OvRuntimeEngine {
             // set_state_blob returns Stub, so this stays cold. Only the stateful (non-static) path.
             #[cfg_attr(not(feature = "kv_coord"), allow(unused_mut))]
             let mut warm_prefix = 0usize;
-            // Never for a turn with images: the blob is keyed on token ids, and
-            // every image of one size has the same ids.
+            // A turn with images keys on its images' hashes (`vision_kv`), never
+            // on their placeholder ids, which every image of one size shares.
             #[cfg(feature = "kv_coord")]
-            if self.static_kv.is_none() && image_rows.is_empty() {
-                let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
-                if let Some((blob, len, plane_pulled)) =
-                    self.kv.take_warm(&task.tenant, &prompt_i32)
-                {
+            if task.media.is_empty() {
+                kv_key = Some((prompt_ids.iter().map(|&t| t as i32).collect(), None));
+            }
+            #[cfg(feature = "kv_coord")]
+            if let (None, Some((prompt_i32, spans))) = (&self.static_kv, &kv_key) {
+                // A prefix that ends inside an image cannot resume: the
+                // prefill would splice only part of its rows.
+                let taken = self
+                    .kv
+                    .take_warm(&task.tenant, prompt_i32)
+                    .filter(|(blob, len, _)| {
+                        let depth = crate::kv_coordination::kv_seq_from_blob(blob)
+                            .map(|s| s.min(*len))
+                            .unwrap_or(*len);
+                        let splits = spans.as_ref().is_some_and(|sp| sp.splits(depth));
+                        if splits {
+                            info!(
+                                depth,
+                                "ov-runtime: cached prefix ends inside an image; cold"
+                            );
+                        }
+                        !splits
+                    });
+                if let Some((blob, len, plane_pulled)) = taken {
                     match self.runtime.set_state_blob(&blob) {
                         Ok(()) => {
                             // Multi-stage: RESTORE the whole downstream chain too (all-or-nothing).
@@ -2823,6 +2863,19 @@ impl OvRuntimeEngine {
                     }
                 }
             }
+            #[cfg(feature = "kv_coord")]
+            if warm_prefix > 0 {
+                // Images inside the resumed prefix are already in the KV.
+                if let Some((_, Some(spans))) = &kv_key {
+                    let before = image_rows.len();
+                    image_rows = spans.rows_from(warm_prefix, image_rows);
+                    info!(
+                        images_resumed = before - image_rows.len(),
+                        images_prefilled = image_rows.len(),
+                        "ov-runtime: image turn warm-resumed"
+                    );
+                }
+            }
             if warm_prefix == 0 && self.static_kv.is_none() {
                 self.runtime.reset_state().map_err(map_ov_err)?;
             }
@@ -2871,6 +2924,8 @@ impl OvRuntimeEngine {
                 task,
                 prompt_ids,
                 image_rows,
+                #[cfg(feature = "kv_coord")]
+                kv_key: kv_key.map(|(k, _)| k),
                 generated: resume_seed,
                 emitted: resume_last_text.into_bytes(),
                 prefilled: false,
@@ -3893,10 +3948,9 @@ impl OvRuntimeEngine {
             }
             // Issue-34: capture the full post-turn KV under (prompt + generated) for warm-pull.
             // Best-effort + gated — off-rig get_state_blob returns Stub, so nothing is cached.
-            // Not for a turn with images: its ids do not identify its KV.
+            // Keyed on `kv_key`, which names each image by its hash.
             #[cfg(feature = "kv_coord")]
-            if active.task.media.is_empty() {
-                let mut full: Vec<i32> = active.prompt_ids.iter().map(|&t| t as i32).collect();
+            if let Some(mut full) = active.kv_key.take() {
                 // Skip the resume seed: `prompt_ids` already carries those ids.
                 full.extend_from_slice(
                     &active.generated[active.resume_seed_len.min(active.generated.len())..],

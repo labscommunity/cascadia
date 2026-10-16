@@ -25,6 +25,7 @@ pub mod qwen35_vision;
 pub mod qwen36;
 pub mod rotary;
 pub mod runtime;
+pub mod vision_kv;
 mod warn_limit;
 
 pub use dist_spec::{
