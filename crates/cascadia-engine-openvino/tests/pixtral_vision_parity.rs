@@ -1,6 +1,9 @@
 //! Parity of the Rust Pixtral image preprocessing and prompt layout with
 //! Hugging Face transformers 5.14.1, against `tests/fixtures/pixtral_vision/`
-//! (`tools/vlm_fixtures/gen_pixtral_fixtures.py` on OpenVINO/pixtral-12b-int4-ov).
+//! (`tools/vlm_fixtures/gen_pixtral_fixtures.py` on OpenVINO/pixtral-12b-int4-ov)
+//! and `tests/fixtures/mistral3_vision/` (the same processor with
+//! `spatial_merge_size` 2, on an optimum-intel export of
+//! mistralai/Ministral-3-3B-Instruct-2512-BF16; the same eight images).
 //!
 //! - resized size and patch grid: equal to both HF processors';
 //! - pixel values: bit-identical to the PIL processor (the torchvision one
@@ -20,9 +23,32 @@ fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pixtral_vision")
 }
 
+fn reference_in(dir: &str) -> Value {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(dir)
+        .join("reference.json");
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
 fn reference() -> Value {
-    serde_json::from_str(&std::fs::read_to_string(fixtures().join("reference.json")).unwrap())
-        .unwrap()
+    reference_in("pixtral_vision")
+}
+
+/// The processor settings a fixture set was made with.
+fn config_of(r: &Value) -> PreprocessConfig {
+    let p = &r["processor"];
+    let patch = p["patch_size"]
+        .get("height")
+        .unwrap_or(&p["patch_size"])
+        .as_u64()
+        .unwrap() as u32;
+    PreprocessConfig {
+        patch_size: patch,
+        spatial_merge: r["spatial_merge_size"].as_u64().unwrap_or(1) as u32,
+        longest_edge: p["size"]["longest_edge"].as_u64().unwrap() as u32,
+        ..PreprocessConfig::pixtral()
+    }
 }
 
 fn floats(v: &Value) -> Vec<f64> {
@@ -53,17 +79,43 @@ fn tokens(r: &Value) -> ImageTokens {
 #[test]
 fn preprocessing_is_bit_identical_to_the_pil_processor() {
     let r = reference();
-    let p = &r["processor"];
     let cfg = PreprocessConfig::pixtral();
-    assert_eq!(p["size"]["longest_edge"], cfg.longest_edge);
-    assert_eq!(p["patch_size"]["height"], cfg.patch_size);
+    assert_eq!(
+        config_of(&r),
+        cfg,
+        "Pixtral fixtures match the shipped defaults"
+    );
+    check_preprocessing(&r, &cfg);
+}
+
+/// Mistral 3: 14-px patches merged 2x2, so sides are whole 28-px cells and
+/// the token grid is half the patch grid; the pixels are still the PIL
+/// processor's, bit for bit.
+#[test]
+fn mistral3_preprocessing_is_bit_identical_to_the_pil_processor() {
+    let r = reference_in("mistral3_vision");
+    let cfg = config_of(&r);
+    assert_eq!(
+        (cfg.patch_size, cfg.spatial_merge, cfg.longest_edge),
+        (14, 2, 1540)
+    );
+    check_preprocessing(&r, &cfg);
+}
+
+#[test]
+fn mistral3_prompt_expansion_reproduces_the_processor_ids() {
+    check_expansion(&reference_in("mistral3_vision"));
+}
+
+fn check_preprocessing(r: &Value, cfg: &PreprocessConfig) {
+    let p = &r["processor"];
     assert_eq!(p["resample"], 3, "fixtures were made with bicubic");
     for (name, e) in r["images"].as_object().unwrap() {
         let png = image::open(fixtures().join(format!("{name}.png")))
             .unwrap()
             .to_rgb8();
         let (w, h) = png.dimensions();
-        let px = preprocess(png.as_raw(), w, h, &cfg).unwrap();
+        let px = preprocess(png.as_raw(), w, h, cfg).unwrap();
         for which in ["slow", "fast"] {
             let hw = ints(&e[which]["resized_hw"]);
             assert_eq!(
@@ -107,8 +159,11 @@ fn preprocessing_is_bit_identical_to_the_pil_processor() {
 
 #[test]
 fn prompt_expansion_reproduces_the_processor_ids() {
-    let r = reference();
-    let t = tokens(&r);
+    check_expansion(&reference());
+}
+
+fn check_expansion(r: &Value) {
+    let t = tokens(r);
     for (name, e) in r["prompts"].as_object().unwrap() {
         let ids = ints(&e["input_ids"]);
         let grids: Vec<(u32, u32)> = e["grids"]

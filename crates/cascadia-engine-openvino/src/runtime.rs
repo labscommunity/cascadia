@@ -1575,10 +1575,12 @@ enum VisionFamily {
 fn vision_family(v: &PipelineVision, export_version: Option<&str>) -> EngineResult<VisionFamily> {
     match (v.family.as_deref(), export_version) {
         (Some("gemma4"), _) | (None, Some("gemma4_vision_surgery_v1")) => Ok(VisionFamily::Gemma4),
-        (Some("pixtral"), _) => Ok(VisionFamily::Pixtral),
+        // Mistral 3 is Pixtral's processor and tower plus a 2x2 patch merger,
+        // which the Pixtral front end runs when the export carries it.
+        (Some("pixtral" | "mistral3"), _) => Ok(VisionFamily::Pixtral),
         (Some(f), _) => Err(EngineError::InvalidConfig(format!(
             "pipeline_config.json `vision.family` is {f:?}; ov-runtime serves image input \
-             for \"gemma4\" and \"pixtral\""
+             for \"gemma4\", \"pixtral\" and \"mistral3\""
         ))),
         (None, other) => Err(EngineError::InvalidConfig(format!(
             "pipeline_config.json has a `vision` block without `family` on a {other:?} \
@@ -1652,6 +1654,15 @@ impl Frontend {
             Frontend::Gemma4(f) => format!(
                 "Gemma 4 images, {} soft tokens each at most",
                 f.preprocess.max_soft_tokens
+            ),
+            Frontend::Pixtral(f) if f.preprocess.spatial_merge > 1 => format!(
+                "Mistral 3 images, longest edge {} px, one token per {}px cell \
+                 ({}px patches merged {}x{})",
+                f.preprocess.longest_edge,
+                f.preprocess.patch_size * f.preprocess.spatial_merge,
+                f.preprocess.patch_size,
+                f.preprocess.spatial_merge,
+                f.preprocess.spatial_merge
             ),
             Frontend::Pixtral(f) => format!(
                 "Pixtral images, longest edge {} px, one token per {}px patch",
@@ -7906,7 +7917,11 @@ mod tests {
             vision_family(&v(Some("pixtral")), None).unwrap(),
             VisionFamily::Pixtral
         );
-        assert!(vision_family(&v(Some("mistral3")), None).is_err());
+        assert_eq!(
+            vision_family(&v(Some("mistral3")), None).unwrap(),
+            VisionFamily::Pixtral
+        );
+        assert!(vision_family(&v(Some("qwen2_vl")), None).is_err());
         assert!(vision_family(&v(None), Some("something_else_v1")).is_err());
     }
 
