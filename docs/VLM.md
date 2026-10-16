@@ -58,6 +58,7 @@ names the field.
 | Qwen2.5-VL, Qwen3-VL, InternVL2, Phi-3.5-vision, LLaVA-NeXT (llava-v1.6), Gemma 3 | `ov-genai` | one box | the OpenVINO exports as published (`OpenVINO/<model>-int4-ov`) |
 | Gemma 4 26B-A4B / 31B | `ov-runtime` | 2+ machines, stateful, static or packed | `tools/gemma4_surgery/export_gemma4_text.py --vision` |
 | Gemma 4 E2B / E4B | `gemma4` | 1+ machines | `tools/export_gemma4.py --vision DIR` |
+| Gemma 3 (4B / 12B / 27B) | `ov-runtime` | 1+ machines, stateful or static | `tools/vlm_surgery/cut_vlm_lm.py --family gemma3` |
 | Pixtral 12B | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family pixtral` |
 | Mistral 3 (Ministral-3, Mistral Small 3.1/3.2) | `ov-runtime` | 1+ machines | export with optimum-intel, then `tools/vlm_surgery/cut_vlm_lm.py --family mistral3` |
 | Pixtral 12B target, Ministral-3-3B draft | `ov-dist-spec` | 2+ machines, stateful | `cut_vlm_lm.py --family pixtral --all-logits` for the target, `tools/vlm_surgery/make_text_draft.py` for the draft |
@@ -108,6 +109,25 @@ python tools/vlm_surgery/cut_vlm_lm.py --model <OpenVINO/pixtral-12b-int4-ov dir
 
 `--num-stages 1` cuts a one-stage tree for a single box. `--stage I` cuts one stage on a
 worker that holds only that one.
+
+### Gemma 3 (ov-runtime)
+
+```bash
+python tools/vlm_surgery/cut_vlm_lm.py --model <OpenVINO/gemma-3-12b-it-int4-ov dir> \
+    --output-dir <tree> --num-stages 2 --family gemma3
+```
+
+The published export already fits: its language model takes `inputs_embeds` and
+`token_type_ids`, and its vision IR (SigLIP, the 4x4 pool and the projector) returns
+256 rows per image at the text width. Rank 0 resizes each image to 896x896 (bilinear,
+as HF's processor), expands each `<start_of_image>` of the rendered prompt into
+HF's `\n\n<start_of_image>` + 256 x `<image_soft_token>` + `<end_of_image>\n\n` before
+tokenizing, and splices the image rows in. Every stage takes `token_type_ids`: Gemma 3
+opens each image both ways in its full and sliding masks, so the types ride the wire as
+a third frame, as for Gemma 4. For the static path pass `--prefill-seq` of at least 256
+and keep `--context` + `--prefill-seq` within 1025 (sliding window 1024), for example
+`--context 768 --prefill-seq 256` (two images). Pan-and-scan (off in the published
+processor config) is refused at load.
 
 ### Mistral 3 (ov-runtime)
 
@@ -213,7 +233,8 @@ is not practical on the NPU: one stage's decode IR had not compiled after 90 min
 
 ## Limits worth knowing
 
-- Prompt tokens count the image's tokens (Gemma 4: at most 280 per image; Pixtral: one per
+- Prompt tokens count the image's tokens (Gemma 4: at most 280 per image; Gemma 3: 256 per
+  image plus its markers and blank lines, 270 for one image with "Describe."; Pixtral: one per
   16x16 patch plus row breaks, 832 for a 448x448 image with its text; Qwen: about one per
   1000 pixels). The counts match Hugging Face's processor for the same request.
 - Packed slots: a prompt must fit one slot's region, `(context - 1 - packed_prefix) /

@@ -996,6 +996,56 @@ square and a blue circle.", 832 prompt tokens, two images 1648). Draft acceptanc
 on image and text turns, about two tokens per target step (10 tokens in 5 steps for one
 image, 14 in 6 for two).
 
+## Gemma 3 on `ov-runtime` (2026-10-16)
+
+Gemma 3 was served only on one box by `ov-genai`. The staged path now takes it, from
+the published `OpenVINO/gemma-3-12b-it-int4-ov` (Gemma license, not gated).
+
+- **The export.** `openvino_language_model.xml` takes `attention_mask`, `position_ids`,
+  `token_type_ids`, `inputs_embeds [?,?,3840]` and `beam_idx` (stateful KV) and returns
+  logits `[?,?,262208]`; `openvino_text_embeddings_model.xml` maps `input` ids to
+  `[?,?,3840]` (the sqrt(hidden) scale is inside it); `openvino_vision_embeddings_model.xml`
+  maps `pixel_values [?,3,?,?]` to `[?,256,3840]`: SigLIP, the 4x4 average pool, the
+  soft-embedding norm and the projection are all in the IR, so rank 0 needs no projector
+  step. In the language model graph `token_type_ids` reaches all 48 attention layers.
+- **Masks.** transformers 5.14.1 `modeling_gemma3.py`, `create_masks_for_vision_model`:
+  full layers use OR(causal, same image block), sliding layers AND(window, OR(causal,
+  same block)); blocks are contiguous runs of `token_type_ids == 1`
+  (`get_block_sequence_ids_for_mask`). So, unlike Gemma 4's sliding-only case, both
+  masks open each image, which is what the packed host masks already do. The Gemma 4
+  machinery is reused unchanged: `token_type_ids` on every stage, the third wire frame,
+  `image_safe_take` on the static path (an image is 256 rows, so `--prefill-seq 256` or
+  more) and the 1025 window cap in `static_variant.py`.
+- **Prompt.** `Gemma3Processor` replaces each `<start_of_image>` of the rendered
+  template on the text with `"\n\n<start_of_image>" + 256 x "<image_soft_token>" +
+  "<end_of_image>\n\n"` (`full_image_sequence`) and then tokenizes. The blank lines
+  merge with their neighbours (`"user\n" + "\n\n"` is the single token 109; two images
+  back to back give one `"\n\n\n\n"`, 110), so the expansion cannot be done on ids as
+  for Pixtral and Gemma 4: rank 0 expands the prompt text of a turn with images before
+  tokenizing it (`Frontend::prompt_text`), and `gemma3_vision::check_expanded` then
+  checks one 256-token run per image. The soft token id 262144 is inside the vocabulary
+  (262208), so it embeds as itself, as in HF; its rows are overwritten either way.
+- **Preprocessing** (`gemma3_vision`): resize to 896x896 ignoring the aspect ratio with
+  `resample: 2` (bilinear; the shared Pillow-exact resampler gained the bilinear
+  kernel), rescale 1/255, normalise with mean/std 0.5. Pan-and-scan defaults off in the
+  processor (`do_pan_and_scan: null` in the config) and is refused if switched on.
+- **API.** `MediaConfig::gemma3_native`: the template's own `<start_of_image>`; reserved
+  `<start_of_image>`, `<image_soft_token>`, `<end_of_image>`; text parts trimmed, as the
+  template trims each one. The CLI enables it for `ov-runtime` on a `gemma3` tree.
+  `ov-dist-spec` refuses the tree (token types), as for Gemma 4.
+- **Cut.** `cut_vlm_lm.py --family gemma3` checks `gemma3` / `siglip_vision_model`,
+  refuses a language model without `token_type_ids`, and refuses a stage that lost them;
+  `config.json` keeps `sliding_window` and `layer_types`.
+- **Parity** (`tests/fixtures/gemma3_vision`, made with transformers 5.14.1 and
+  Pillow 12.3 from the export's configs and tokenizer, no weights): pixel values
+  bit-identical to HF's PIL processor on the eight fixture images (the torchvision
+  processor differs by one 8-bit level); the text expansion equals the processor's
+  expanded text; the processor's `token_type_ids` equal what rank 0 sends; and,
+  with `CASCADIA_GEMMA3_TOKENIZER` set to the export's `tokenizer.json`, the Rust
+  tokenizer gives HF's ids on every prompt. Prompt tokens: one image 270, two images 535.
+- **Not yet run** on the cluster: the cut itself (the IR cannot be cut without its
+  weights), the encoder against HF features, the SDK check, and packed slots.
+
 ## Video: out of scope, kept cheap
 
 Video ships in no phase of this RFC. The image work must still leave nothing that
