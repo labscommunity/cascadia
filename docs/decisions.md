@@ -466,6 +466,35 @@ python tools/decision_export.py clef --base-ir STOCK_INT8_IR \
   count, or head tensors other than `q`/`k` weight and bias.
 - The manifest is written last, so a tree whose export stopped part way is not loadable.
 
+## Pipeline reply timeouts
+
+In pipeline mode (`--total` > 1) rank 0 waits for each reply from the next rank for the activation
+timeout (`CASCADIA_ACTIVATION_TIMEOUT_SECS`, default 60 s): the TOKEN after each FORWARD, and for a
+decision pass the RESET_ACK, DECIDE_ACK and DECISION. When a reply is later than that, rank 0 fails
+that task, and the late reply still arrives afterwards. What happens next depends on where the
+wait stopped:
+
+- **Before the reply's first byte** (the usual case: the next rank is still computing). The link
+  is still frame-aligned. Every reply header carries the task epoch, so the next task skips the
+  late frames of earlier tasks until it reads its own reply, then carries on normally. The skip is
+  bounded: at most 16 stale frames and 32 MiB, within that task's own timeout. The log shows
+  `pipeline reply timed out; its late reply will be skipped`, then one
+  `skipped a late reply of an earlier task` per frame skipped.
+- **Mid-frame, mid-request, or on a reply with no task tag** (CAPTURE_ACK, used only with KV
+  coordination), or after any other wire error on the link. Rank 0 can no longer find frame
+  boundaries, so it marks the link desynced and logs one error,
+  `qwen36 pipeline link desynced after …; restart the pipeline`. Every later task, chat and
+  decisions alike, fails at once with that message, and nothing more is written to the link.
+  Restart both ranks to recover.
+- **The startup handshake** (HELLO). A rank 1 that is still loading can answer after the timeout.
+  The first request then fails, and the next one waits for that HELLO's reply instead of sending a
+  second HELLO. A long load therefore costs one failed request rather than a restart. The JEV-27B
+  runbook below still raises the timeout, so that no request fails.
+
+A middle rank applies the same rules to its own downstream link. The wire format is unchanged, so
+ranks of older builds work with this one as before. No metric reports the desynced state yet;
+watch for the error line.
+
 ## Limitations
 
 - **Text only.** Images in either format are a 400 (`images`, `videos`, OpenAI `input_image`
