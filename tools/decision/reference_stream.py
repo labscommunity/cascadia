@@ -16,9 +16,10 @@ which is what parity_check.py --ref requires.
 wrote). Each pass of a question's plan is one fp32 choice pass over its own options (trained bias on
 the first slots, none beyond), and the passes are combined with codec_golden's ports of
 serve_decide's formulas: the permute mean over the orders CPython's random draws, or the tournament
-combination over the server's own final (its finalists read back through the tree's
-tokenizer.json). Where the reference's group passes would pick other finalists, a NOTE says so; the
-combination still uses the final the server ran, so this measures quantization of the same passes.
+combination over the reference's own finalists: the server's final (read back through the tree's
+tokenizer.json) when its fp32 group passes pick the same ones, else a second fp32 sweep runs the
+final over the reference's finalists (FINALISTS names the options swapped), so a server that picks
+the wrong finalists differs from the reference and the gate sees it.
 """
 import argparse
 import gc
@@ -36,8 +37,8 @@ from safetensors import safe_open
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "qwen36_surgery"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from codec_golden import (TokenizerFile, align, final_indices, groups, jev_plan_probs, rescale_score,  # noqa: E402
-                          tokenizer_added, tournament_final)
+from codec_golden import (TokenizerFile, align, final_indices, groups, jev_pass_text, jev_plan_probs,  # noqa: E402
+                          rescale_score, tokenizer_added, tournament_final)
 from records import WIDE_RECORDS, records  # noqa: E402
 
 
@@ -243,9 +244,36 @@ def server_finalists(rec, qid, final, tok, jev_prof):
     return final_indices(rec, qid, final["readout"]["prompt_ids"], tok, labels, tokenizer_added(tok)[1])
 
 
-def family_probs(family, rec, passes, hidden, tree, weights_dir, lora, lora_scale, clef_dir, tok=None):
+def wide_dist(j, p, h, weights_dir, lo_ad):
+    """One pass of a JEV multi-pass plan over its own options by position: the trained bias where the
+    choice slots reach, none beyond, and the choice temperature (serve_decide s1_pass)."""
+    lo_slot, hi_slot = j["slots"]["choice"]
+    vids = p["readout"]["head"]["token_ids"]
+    logits = lm_rows(weights_dir, vids) @ h[-1]
+    d = lo_ad.lm_head_logits(vids, h[-1])
+    if d is not None:
+        logits = logits + d
+    return softmax([(float(l) + (j["bias"][lo_slot + i] if lo_slot + i < hi_slot else 0.0)) / j["temperature"]["choice"]
+                    for i, l in enumerate(logits)])
+
+
+def reference_final(rec, qid, own, tok, jev_prof):
+    """A dump-style pass for the tournament final over the REFERENCE's finalists `own`: the server
+    codec's layout (codec_golden.jev_pass_text, checked against the server by codec_golden --wide)
+    through the tree's tokenizer, labelled from the tree's first choice labels."""
+    labels, ids = jev_prof["choice_labels"], jev_prof["choice_label_ids"]
+    prompt = tok(jev_pass_text(rec, qid, own, labels, tokenizer_added(tok)[1]), add_special_tokens=False).input_ids
+    return {"parts": [[qid, 0, len(own)]], "strategy": "tournament", "round": 2,
+            "readout": {"prompt_ids": list(prompt), "head": {"kind": "verbalizer", "token_ids": ids[:len(own)]}}}
+
+
+def family_probs(family, rec, passes, hidden, tree, weights_dir, lora, lora_scale, clef_dir, tok=None,
+                 own_finals=None, pending=None):
     """{question id: probabilities in API option order} for one record's passes. `tok` (JEV): reads a
-    tournament's final back (tree_tokenizer)."""
+    tournament's final back (tree_tokenizer). Where the reference's fp32 groups pick other finalists
+    than the server ran, the reference is combined over its OWN final: `own_finals[(record, qid)]` is
+    that final's distribution; without it the question is appended to `pending` as (record, qid,
+    finalists) with a None answer, for build_ref's second sweep."""
     prof = json.loads((Path(tree) / "decision.json").read_text())
     out = {}
     plans = {}  # JEV qid -> (strategy, [(pass, distribution)]) of a choice past the trained slots
@@ -266,11 +294,7 @@ def family_probs(family, rec, passes, hidden, tree, weights_dir, lora, lora_scal
                 logits = logits + d
             strategy = p.get("strategy", "native")
             if strategy != "native":
-                # one pass of a multi-pass plan over its own options by position: the trained bias
-                # where the choice slots reach, none beyond (serve_decide s1_pass)
-                z = [(float(l) + (j["bias"][lo_slot + i] if lo_slot + i < hi_slot else 0.0)) / j["temperature"][kind]
-                     for i, l in enumerate(logits)]
-                plans.setdefault(qid, (strategy, []))[1].append((p, softmax(z)))
+                plans.setdefault(qid, (strategy, []))[1].append((p, wide_dist(j, p, h, weights_dir, lo_ad)))
                 continue
             z = [(float(l) + j["bias"][lo_slot + i]) / j["temperature"][kind] for i, l in enumerate(logits)]
             pr = softmax(z)
@@ -318,8 +342,19 @@ def family_probs(family, rec, passes, hidden, tree, weights_dir, lora, lora_scal
             fin = server_finalists(rec, qid, ps[-1][0], tok, prof["jev"])
             own = tournament_final(groups(len(rec["questions"][qid]["criteria"])), dists[:-1])
             if own != fin:
-                print(f"NOTE {rec['id']}.{qid}: the reference's groups pick finalists {own}, the server ran {fin}; "
-                      f"combined over the server's final", flush=True)
+                key = (rec["id"], qid)
+                if own_finals is not None and key in own_finals:
+                    out[qid] = jev_plan_probs(rec, qid, strategy, dists[:-1] + [own_finals[key]], own)
+                    continue
+                print(f"FINALISTS {rec['id']}.{qid}: the reference's fp32 groups pick {own}, the server ran {fin} "
+                      f"(server only {sorted(set(fin) - set(own))}, reference only {sorted(set(own) - set(fin))}); "
+                      f"the reference uses its own fp32 final", flush=True)
+                if pending is None:
+                    raise SystemExit(f"MISMATCH {rec['id']}.{qid}: the reference's finalists differ from the server's "
+                                     f"and no fp32 final over them was run (build_ref runs it)")
+                pending.append((rec, qid, own))
+                out[qid] = None
+                continue
         out[qid] = jev_plan_probs(rec, qid, strategy, dists, fin)
     return out
 
@@ -331,10 +366,28 @@ def build_ref(family, weights_dir, dump, recs, tree, lora=None, lora_scale=None,
     aligned = list(align(dump, recs))
     flat = [p for _, ps in aligned for p in ps]
     hidden = stream_hidden(weights_dir, flat, lora, lora_scale, threads=threads, allow_lm_head_lora=family == "jev")
-    ref, k = {}, 0
-    for rec, ps in aligned:
-        probs = family_probs(family, rec, ps, hidden[k:k + len(ps)], tree, weights_dir, lora, lora_scale, clef_dir, tok=tok)
+    spans, k = [], 0
+    for _, ps in aligned:
+        spans.append(hidden[k:k + len(ps)])
         k += len(ps)
+    pending = []
+    answers = [family_probs(family, rec, ps, h, tree, weights_dir, lora, lora_scale, clef_dir, tok=tok, pending=pending)
+               for (rec, ps), h in zip(aligned, spans)]
+    if pending:
+        # A second, small fp32 sweep: the finals over the reference's own finalists, so a server that
+        # picked the wrong ones is measured against what it should have run, not against itself.
+        j = json.loads((Path(tree) / "decision.json").read_text())["jev"]
+        finals = [reference_final(rec, qid, own, tok, j) for rec, qid, own in pending]
+        hs = stream_hidden(weights_dir, finals, lora, lora_scale, threads=threads, allow_lm_head_lora=True)
+        lo_ad = Lora(lora, lora_scale)
+        own_finals = {(rec["id"], qid): wide_dist(j, f, h, weights_dir, lo_ad)
+                      for (rec, qid, _), f, h in zip(pending, finals, hs)}
+        redo = {rec["id"] for rec, _, _ in pending}
+        answers = [family_probs(family, rec, ps, h, tree, weights_dir, lora, lora_scale, clef_dir, tok=tok,
+                                own_finals=own_finals) if rec["id"] in redo else a
+                   for (rec, ps), h, a in zip(aligned, spans, answers)]
+    ref = {}
+    for (rec, ps), probs in zip(aligned, answers):
         if set(probs) != set(rec["questions"]):
             raise SystemExit(f"MISMATCH {rec['id']}: reference answered {sorted(probs)}, record asks {sorted(rec['questions'])}")
         for qid, q in rec["questions"].items():
