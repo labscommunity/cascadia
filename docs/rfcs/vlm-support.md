@@ -57,7 +57,8 @@ Recommended order:
 | Gemma 4 (E2B/E4B/31B; 26B-A4B rejected today) | Yes | The exporter must stop dropping vision; stage 0 currently takes `input_ids` plus per-layer embeddings derived from ids |
 | Mistral Small 3.1 (`mistral3`, Pixtral) | Yes | Generic exporter keeps `text_config` only |
 | Inkling | Yes (`model.visual.*` hMLP, plus audio) | sparse-moe; vision weights dropped at export |
-| Kimi K2.6, GLM-5.x, DeepSeek-V4, MiniMax-M2, R1-distill, Phi-3/4 | Not stated or no | Out of scope |
+| Kimi K2.6 | Yes (MoonViT, about 400M, projector to 7168) | sparse-moe, native K2.6 path; about 1T parameters, built for one large node, not these 32 GB nodes; vision not exported |
+| GLM-5.x, DeepSeek-V4, MiniMax-M2, R1-distill, Phi-3/4 | No, as exported (GLM-5V and DeepSeek-V4-Flash-Vision-Exp are separate checkpoints) | Out of scope |
 
 ## How a Qwen3.5 image request works
 
