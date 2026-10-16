@@ -632,8 +632,9 @@ pub struct Thinking {
     pub mode: ThinkingMode,
     /// The base model thought and its answer was blended in.
     pub used: bool,
-    /// Why a question that would have thought did not: `"budget"` (`auto` only: its worst
-    /// case did not fit what the request had left).
+    /// Why a question that would have thought did not (`auto` only): `"budget"` (its worst
+    /// case did not fit what the request had left) or `"error"` (its System 2 task failed in
+    /// the engine).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
     pub threshold: f64,

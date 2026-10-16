@@ -964,6 +964,7 @@ impl Builder for Qwen36Builder {
             im_start_id: self.im_start_id,
             primed: false,
             stages_dirty: false,
+            scrub_pending: false,
             max_ctx: self.max_ctx,
             refresh_costs: Default::default(),
             last_restore_bytes: 0,
@@ -1391,6 +1392,11 @@ pub struct Qwen36Engine {
     /// must not snapshot from it (a poisoned entry would serve every later hit). Cleared by
     /// the next successful reset.
     stages_dirty: bool,
+    /// A task failed and the stage requests still hold its state: `finalize_error` leaves the
+    /// scrub (`reset_all`) to the next admission, so the failed task's error chunk is returned
+    /// first (Task 45: on the GPU the scrub after a failed infer did not return, and the error
+    /// built after it never reached the request).
+    scrub_pending: bool,
     /// `max_position_embeddings` of the model (from the tree's config.json); prompts at or past it
     /// are refused at submit rather than prefilled for hours on the single batch=1 slot. `None`
     /// when the tree does not state it (guard off; `read_max_ctx` warns which case it was).
@@ -2079,14 +2085,26 @@ impl Qwen36Engine {
     /// streamed. For mid-generation backend/wire errors that previously
     /// fell through to `finalize` and read as a clean (empty/partial)
     /// success.
+    /// Fail the active task: its error chunk, now. The stage requests are scrubbed when the
+    /// next task is admitted ([`Self::scrub_failed_task`]), not here: the chunk only reaches
+    /// the request once `step` returns, and a scrub that blocks after a failed native call
+    /// (a GPU infer that threw) would hold it, and the request, for good.
     fn finalize_error(&mut self, reason: String) -> Vec<(TaskId, Chunk)> {
         self.want_final_hidden = false;
         self.last_final_hidden = None;
         let Some(t) = self.active.take() else {
             return Vec::new();
         };
-        self.reset_all();
+        self.scrub_pending = true;
         vec![(t.task_id.clone(), Chunk::error(t.task_id, reason))]
+    }
+
+    /// The scrub a failed task left (see [`Self::finalize_error`]), before anything reads or
+    /// restores over the stage requests: every admission runs it first.
+    fn scrub_failed_task(&mut self) {
+        if std::mem::take(&mut self.scrub_pending) {
+            self.reset_all();
+        }
     }
 
     // -------- pipeline mode --------
@@ -2578,6 +2596,7 @@ impl Qwen36Engine {
             if self.pending.is_empty() {
                 return Vec::new();
             }
+            self.scrub_failed_task();
             let task = self.pending.remove(0);
             if let Some(reason) = &self.poisoned {
                 warn!(task = %task.task_id, reason = %reason, "qwen36: refusing task (handshake mismatch)");
@@ -3482,6 +3501,7 @@ impl Qwen36Engine {
             if self.pending.is_empty() {
                 return Vec::new();
             }
+            self.scrub_failed_task();
             let task = self.pending.remove(0);
             // reset moved below — Issue-34 warm-resume may restore a cached prefix blob instead.
             // Before any restore: the prefix cache only resumes a state taken at this scale.
@@ -3871,7 +3891,15 @@ impl Qwen36Engine {
                     )]
                 }
                 Err(e) => {
-                    warn!(task = %task_id, error = %e, "decode failed");
+                    let t = self.active.as_ref().unwrap();
+                    warn!(
+                        task = %task_id,
+                        prompt = t.prompt_ids.len(),
+                        warm_prefix = t.warm_prefix,
+                        generated = t.gen_ids.len(),
+                        error = %e,
+                        "decode failed"
+                    );
                     self.finalize_error(format!("decode failed: {e}"))
                 }
             }
@@ -4651,6 +4679,7 @@ mod tests {
             im_start_id: None,
             primed: false,
             stages_dirty: false,
+            scrub_pending: false,
             max_ctx: None,
             refresh_costs: Default::default(),
             last_restore_bytes: 0,
@@ -6196,6 +6225,11 @@ mod tests {
         fed: Option<f32>,
         log: ScaleLog,
         state: Vec<u8>,
+        /// The infer (counted from 0) that fails, as the GPU plugin's did on hardware.
+        fail_infer_at: Option<usize>,
+        infers: usize,
+        /// Every infer and reset, in order.
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
     }
 
     impl MockStage {
@@ -6209,6 +6243,9 @@ mod tests {
                 fed: None,
                 log: Arc::clone(&log),
                 state: vec![3u8; 64],
+                fail_infer_at: None,
+                infers: 0,
+                events: Default::default(),
             };
             (st, log)
         }
@@ -6231,6 +6268,13 @@ mod tests {
             Ok(())
         }
         pub(super) fn infer(&mut self) -> cascadia_ov_genai_shim::Result<()> {
+            self.events.lock().unwrap().push("infer");
+            self.infers += 1;
+            if self.fail_infer_at == Some(self.infers - 1) {
+                return Err(cascadia_ov_genai_shim::Error::Native(
+                    "unknown C++ exception in infer".into(),
+                ));
+            }
             self.log.lock().unwrap().push(self.fed.take());
             Ok(())
         }
@@ -6246,9 +6290,11 @@ mod tests {
             Ok((DType::F32, vec![1, self.n, self.width], le_bytes_f32(&data)))
         }
         pub(super) fn reset_state(&mut self) -> cascadia_ov_genai_shim::Result<()> {
+            self.events.lock().unwrap().push("reset");
             Ok(())
         }
         pub(super) fn recreate_request(&mut self) -> cascadia_ov_genai_shim::Result<()> {
+            self.events.lock().unwrap().push("reset");
             Ok(())
         }
         pub(super) fn get_state_blob(&mut self) -> cascadia_ov_genai_shim::Result<Vec<u8>> {
@@ -6443,6 +6489,51 @@ mod tests {
 
         // A stage without a LoRA branch has no input and is never fed.
         assert!(take_log(&log0).iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn a_failed_decode_returns_its_error_before_the_scrub() {
+        // Task 45: on the GPU, a decode infer threw and the request never heard of it; the warn
+        // was logged, and the scrub that ran before the error chunk was returned did not return.
+        // The error chunk now comes first; the next admission scrubs before it touches a stage.
+        let (mut e, _, _) = mock_box(true);
+        let events = match &mut e.stages[1] {
+            OvStage::Mock(m) => {
+                m.fail_infer_at = Some(1); // the prefill is infer 0, the first decode infer 1
+                Arc::clone(&m.events)
+            }
+            _ => unreachable!(),
+        };
+        let since = |n: usize| events.lock().unwrap()[n..].to_vec();
+        e.submit(chat("think-1", Some(0.0))).unwrap();
+        let out = e.step().unwrap();
+        assert!(out.is_empty(), "admission and prefill: {out:?}");
+        let before = events.lock().unwrap().len();
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 1);
+        let (id, c) = &out[0];
+        assert_eq!(id, "think-1");
+        assert!(c.is_final, "{c:?}");
+        assert_eq!(
+            c.error.as_deref(),
+            Some("decode failed: backend error: unknown C++ exception in infer"),
+            "the error Task 44 saw"
+        );
+        assert!(e.active.is_none(), "the failed task is gone");
+        assert_eq!(
+            since(before),
+            ["infer"],
+            "no reset before the error is returned"
+        );
+
+        // The next task (chat too) is served on scrubbed requests.
+        e.submit(chat("c2", None)).unwrap();
+        let c = run_to_final(&mut e);
+        assert!(c.error.is_none(), "{c:?}");
+        let after = since(before + 1);
+        assert_eq!(after.first(), Some(&"reset"), "scrubbed first: {after:?}");
+        // Scrubbed once: a second task's admission has nothing left to scrub.
+        assert!(!e.scrub_pending);
     }
 
     #[test]
