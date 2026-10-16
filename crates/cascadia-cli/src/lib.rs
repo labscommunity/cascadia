@@ -425,6 +425,14 @@ pub struct WorkerArgs {
     #[arg(long, value_name = "BYTES")]
     pub decision_dump_max_bytes: Option<u64>,
 
+    /// Decision requests (/v1/decisions and /v1/systemone) admitted at once; one more is a 503
+    /// `engine at capacity`. A pool of its own: decisions and chat never refuse each other.
+    /// The engine still runs one pass at a time, so N sets queue depth, not parallelism. With
+    /// Kev and the prefix cache, more admitted requests evict more shared-prefix snapshots,
+    /// and an evicted one is also a 503. Must be at least 1.
+    #[arg(long, value_name = "N", default_value_t = cascadia_api::DEFAULT_MAX_CONCURRENT_DECISIONS, value_parser = parse_max_decision_requests)]
+    pub max_decision_requests: usize,
+
     /// OV performance hint (PERFORMANCE_HINT). LATENCY suits single-user
     /// decode; THROUGHPUT enables NUM_STREAMS auto-tuning. See OpenVINO
     /// high-level-performance-hints docs (2026).
@@ -837,6 +845,11 @@ pub struct RunArgs {
     #[arg(long, value_name = "BYTES")]
     pub decision_dump_max_bytes: Option<u64>,
 
+    /// Decision requests admitted at once, a pool separate from chat's. See
+    /// `cascadia worker --help`. Must be at least 1.
+    #[arg(long, value_name = "N", default_value_t = cascadia_api::DEFAULT_MAX_CONCURRENT_DECISIONS, value_parser = parse_max_decision_requests)]
+    pub max_decision_requests: usize,
+
     /// Expert placement JSON (requires --ep-workers). See worker --help.
     #[arg(long)]
     pub ep_placement: Option<PathBuf>,
@@ -956,6 +969,7 @@ impl WorkerArgs {
             api_max_body_mb,
             decision_dump,
             decision_dump_max_bytes: None,
+            max_decision_requests: cascadia_api::DEFAULT_MAX_CONCURRENT_DECISIONS,
             ep_workers,
             ep_worker_index: None,
             ep_worker_count: None,
@@ -1272,6 +1286,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         args.decision_dump,
     );
     worker.decision_dump_max_bytes = args.decision_dump_max_bytes;
+    worker.max_decision_requests = args.max_decision_requests;
     // Carry the elastic posture onto the worker so the OV memory-knob seeding
     // (ov_perf_properties) fires; the interposer itself was already activated
     // in main before the async runtime started.
@@ -1532,6 +1547,16 @@ fn ov_perf_properties(args: &WorkerArgs) -> Vec<(String, String)> {
     }
 
     props
+}
+
+/// `--max-decision-requests`: a whole number of at least 1. Zero would refuse every decision
+/// with a 503 that reads like load, so it is a startup error instead.
+fn parse_max_decision_requests(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(0) => Err("must be at least 1 (0 would refuse every decision request)".into()),
+        Ok(n) => Ok(n),
+        Err(_) => Err(format!("{s:?} is not a whole number of at least 1")),
+    }
 }
 
 /// clap value-parser for `--ov-config`: require a `KEY=VALUE` shape with a
@@ -2665,6 +2690,8 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             std::env::var("CASCADIA_API_MAX_CONCURRENT").ok().as_deref(),
             cfg.max_concurrent_requests,
         );
+        // Decision admission, separate from chat's `max_concurrent_requests` above.
+        cfg.max_concurrent_decisions = args.max_decision_requests;
         let max_concurrent = cfg.max_concurrent_requests as u64;
         // Shared live counters: the API bumps them on the chat hot path,
         // the dashboard's /api/stats reads them — same Arc, so the cluster
@@ -4256,6 +4283,86 @@ mod tests {
             panic!("expected run subcommand")
         };
         assert_eq!(args.decision_dump_max_bytes, Some(1_000_000));
+    }
+
+    #[test]
+    fn max_decision_requests_parses_defaults_and_forwards() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["cascadia", "run", "some-model-dir"];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        let Command::Run(args) = parse(&[]).expect("parse run argv").cmd else {
+            panic!("expected run subcommand")
+        };
+        assert_eq!(
+            args.max_decision_requests,
+            cascadia_api::DEFAULT_MAX_CONCURRENT_DECISIONS
+        );
+        let Command::Run(args) = parse(&["--max-decision-requests", "4"])
+            .expect("parse run argv")
+            .cmd
+        else {
+            panic!("expected run subcommand")
+        };
+        assert_eq!(args.max_decision_requests, 4);
+        let mut worker = WorkerArgs::single_node(
+            args.model,
+            args.device,
+            args.engine,
+            args.api,
+            args.prefix_cache_gb,
+            args.api_max_body_mb,
+            Vec::new(),
+            args.ep_placement,
+            args.decision_dump,
+        );
+        assert_eq!(
+            worker.max_decision_requests,
+            cascadia_api::DEFAULT_MAX_CONCURRENT_DECISIONS
+        );
+        worker.max_decision_requests = args.max_decision_requests;
+        assert_eq!(worker.max_decision_requests, 4);
+        for bad in ["0", "many"] {
+            let err = parse(&["--max-decision-requests", bad])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--max-decision-requests"), "{bad}: {err}");
+        }
+        let err = parse(&["--max-decision-requests", "0"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at least 1"), "{err}");
+        let cli = Cli::try_parse_from([
+            "cascadia",
+            "worker",
+            "--rank",
+            "0",
+            "--total",
+            "1",
+            "--model",
+            "m",
+            "--max-decision-requests",
+            "2",
+        ])
+        .expect("parse worker argv");
+        let Command::Worker(args) = cli.cmd else {
+            panic!("expected worker subcommand");
+        };
+        assert_eq!(args.max_decision_requests, 2);
+        assert!(Cli::try_parse_from([
+            "cascadia",
+            "worker",
+            "--rank",
+            "0",
+            "--total",
+            "1",
+            "--model",
+            "m",
+            "--max-decision-requests",
+            "0",
+        ])
+        .is_err());
     }
 
     #[test]
