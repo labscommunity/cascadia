@@ -433,6 +433,35 @@ pub struct DecisionRequest {
     pub images: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub videos: Option<Vec<serde_json::Value>>,
+    /// How JEV answers a choice with more options than trained slots (serve_decide's
+    /// `strategy`). Absent, `null` and `"auto"` mean the profile's default; any other value is a
+    /// 400 on Kev and Clef.
+    #[serde(default)]
+    pub strategy: Option<RequestStrategy>,
+}
+
+/// The request's `strategy`: `auto` (the profile's default) or one of JEV's plans.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RequestStrategy {
+    #[default]
+    Auto,
+    Single,
+    Tournament,
+    Permute,
+}
+
+impl RequestStrategy {
+    /// The plan this asks for, `None` for `auto`.
+    pub fn fixed(self) -> Option<super::profile::JevStrategy> {
+        use super::profile::JevStrategy;
+        match self {
+            RequestStrategy::Auto => None,
+            RequestStrategy::Single => Some(JevStrategy::Single),
+            RequestStrategy::Tournament => Some(JevStrategy::Tournament),
+            RequestStrategy::Permute => Some(JevStrategy::Permute),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

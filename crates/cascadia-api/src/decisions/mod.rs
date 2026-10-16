@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::http::StatusCode;
+use indexmap::IndexMap;
 use schema::{DecisionRequest, Limits};
 
 #[derive(Debug, thiserror::Error)]
@@ -67,7 +68,39 @@ pub trait Codec: Send + Sync {
     fn encode(&self, req: &DecisionRequest) -> Result<Vec<Pass>, DecisionError> {
         self.encode_until(req, &AtomicBool::new(false))
     }
+    /// [`Self::encode_until`] plus the prefill tokens a second round may still need at most
+    /// ([`Self::second_round`]), which the request's budget counts before any pass runs.
+    fn encode_rounds(
+        &self,
+        req: &DecisionRequest,
+        cancel: &AtomicBool,
+    ) -> Result<(Vec<Pass>, usize), DecisionError> {
+        Ok((self.encode_until(req, cancel)?, 0))
+    }
+    /// The passes that depend on the first round's answers (JEV's tournament finals), given every
+    /// question's per-pass probabilities in submission order. Empty for every other codec.
+    fn second_round(
+        &self,
+        _req: &DecisionRequest,
+        _first: &IndexMap<String, Vec<Vec<f64>>>,
+        _cancel: &AtomicBool,
+    ) -> Result<Vec<Pass>, DecisionError> {
+        Ok(Vec::new())
+    }
     fn probabilities(&self, req: &DecisionRequest, part: &PassPart, logits: &[f32]) -> Vec<f64>;
+    /// A question's distribution from its passes' probabilities, in submission order; `None` when
+    /// they do not make one. Default: its single pass.
+    fn combine(&self, _req: &DecisionRequest, _qid: &str, passes: &[Vec<f64>]) -> Option<Vec<f64>> {
+        match passes {
+            [p] => Some(p.clone()),
+            _ => None,
+        }
+    }
+    /// The `strategy` a `--decision-dump` line names for a pass answering `qid` (the handler adds
+    /// its `round`); `None` leaves the line as it was (everything but JEV choices).
+    fn dump_strategy(&self, _req: &DecisionRequest, _qid: &str) -> Option<&'static str> {
+        None
+    }
     /// A score answer's `legend` values, one per level; `None` echoes the request's raw levels.
     fn legend(&self, _q: &schema::Question) -> Option<Vec<schema::OrderedValue>> {
         None

@@ -66,6 +66,9 @@ but unusable`, never passes for a plain chat model.
   400. Values are compared by their internal key, Python's `str()` for a number (see
   [Mapping notes](#mapping-notes)), so `2` and `"2"` count as the same value and are a 400 too.
 - `choices[].description` and `levels[].description` are optional.
+- `strategy` (optional, top level): how a JEV choice with more options than its trained slots is
+  answered, `"auto"` (the default), `"single"`, `"tournament"` or `"permute"`. See
+  [JEV choices past the trained slots](#jev-choices-past-the-trained-slots).
 
 ### Response
 
@@ -200,6 +203,9 @@ The server does not check `api_key`; the SDK only requires that one is set.
   - `choice`: `criteria` is an object, option name → description.
   - `score`: `criteria` is an array of level descriptions, lowest first.
 - `images` and `videos` must be absent, `null` or empty (400 otherwise).
+- `strategy` (optional): as on the OpenAI route, `"auto"` (the default; `null` too), `"single"`,
+  `"tournament"` or `"permute"`. See
+  [JEV choices past the trained slots](#jev-choices-past-the-trained-slots).
 - A list `state` is read differently per family, as by each reference. JEV reads its elements as
   message parts (serve_decide `_parts`), so an image part there (`{"image": ...}` or
   `{"type": "image_url", ...}`) is a 400, and so is a `{"type": "text"}` part without a string
@@ -250,10 +256,10 @@ framework's plain-text body.
 | Status | When |
 |---|---|
 | 200 | Every question answered. |
-| 400 | A body that is not valid JSON; on the OpenAI route, also a body that does not match the request schema (a missing `questions`, an unknown question `type`, a repeated key). Validation: no questions or more than `max_questions`; an empty question name, or (OpenAI format) a duplicate question name or choice value; a choice with no options or more than the model allows; a score with fewer levels than the model allows (2 for JEV, 1 for Kev and Clef) or more; images; an image part, or a text part without a string `text`, in a list `state` (JEV); a request the tokenizer cannot encode; Clef's option cap (see [Limits](#limits)). |
-| 413 | The body is over `--api-max-body-mb`. Too long: the state is more than `max_total_tokens × 8` bytes (checked before tokenizing); Kev's whole rendered text (state, instructions, options and levels) is more than `max_total_tokens × 8` bytes; Kev's rendered state is more than 524,288 bytes (65,536 × 8, checked before tokenizing); one Kev question's instructions and option texts render to more than 8 bytes per token the pass has left after the state (`max_tokens` minus the state's tokens, checked before tokenizing); Kev's state is more than 65,536 tokens (`SERVE_MAX_STATE`, `<state>` included) or reaches `max_tokens`; one pass is longer than `max_tokens` (JEV and Kev; Clef truncates the state instead); Clef's schema alone fills the joint pass, leaving no room for a non-empty state; the request's prefill work is more than `max_total_tokens` (JEV stops tokenizing at the first question that takes it over: `needs at least N`); a Kev request that needs the shared-state discount when the prefix cache can never hold that state (`this request needs N prefill tokens without prefix reuse (the shared prefix cannot fit the prefix cache); the per-request limit is M`, refused before any prefill once the engine knows the snapshot's size, which its warmup measures at startup; see [Limits](#limits) for when the first such request can still spend one pass); or the engine reports the prompt too long. |
+| 400 | A body that is not valid JSON; on the OpenAI route, also a body that does not match the request schema (a missing `questions`, an unknown question `type`, a repeated key). Validation: no questions or more than `max_questions`; an empty question name, or (OpenAI format) a duplicate question name or choice value; a choice with no options or more than the model allows; a score with fewer levels than the model allows (2 for JEV, 1 for Kev and Clef) or more; images; an image part, or a text part without a string `text`, in a list `state` (JEV); a request the tokenizer cannot encode; Clef's option cap (see [Limits](#limits)); a `strategy` other than `"auto"` on Kev or Clef (`strategy applies to JEV only`); on the OpenAI route, a `strategy` that is none of the four values. |
+| 413 | The body is over `--api-max-body-mb`. Too long: the state is more than `max_total_tokens × 8` bytes (checked before tokenizing); Kev's whole rendered text (state, instructions, options and levels) is more than `max_total_tokens × 8` bytes; Kev's rendered state is more than 524,288 bytes (65,536 × 8, checked before tokenizing); one Kev question's instructions and option texts render to more than 8 bytes per token the pass has left after the state (`max_tokens` minus the state's tokens, checked before tokenizing); Kev's state is more than 65,536 tokens (`SERVE_MAX_STATE`, `<state>` included) or reaches `max_tokens`; one pass is longer than `max_tokens` (JEV and Kev; Clef truncates the state instead); Clef's schema alone fills the joint pass, leaving no room for a non-empty state; the request's prefill work is more than `max_total_tokens` (JEV stops tokenizing at the first pass that takes it over: `needs at least N`; a JEV tournament's final counts at its worst case before any pass runs, see [JEV choices past the trained slots](#jev-choices-past-the-trained-slots)); a Kev request that needs the shared-state discount when the prefix cache can never hold that state (`this request needs N prefill tokens without prefix reuse (the shared prefix cannot fit the prefix cache); the per-request limit is M`, refused before any prefill once the engine knows the snapshot's size, which its warmup measures at startup; see [Limits](#limits) for when the first such request can still spend one pass); or the engine reports the prompt too long. |
 | 415 | The request lacks `content-type: application/json`. |
-| 422 | `/v1/systemone` only: valid JSON that does not match the request schema (the OpenAI route answers 400 instead). |
+| 422 | `/v1/systemone` only: valid JSON that does not match the request schema, a `strategy` that is none of the four values included (the OpenAI route answers 400 instead). |
 | 501 | The model serves no decisions: no `decision.json` (or one that fails its load checks; see the startup log), an engine other than `qwen35`, the engine has no decision head (`decision/` missing on the single box or the pipeline's last rank), the tree was exported without `--final-hidden` (Kev and Clef), or a pipeline rank cannot serve decision passes (an older build, rank 0 or the last rank without `config.json` `vocab_size`, or the last rank without `decision/`; a middle rank only relays and needs neither). Rank 0 refuses the pipeline cases before any prefill. |
 | 503 | The server is at capacity (`engine at capacity; retry after current requests complete`): every concurrency permit is taken, or a Kev pass that must resume its shared state from the prefix cache found the snapshot evicted by other requests (see [Limits](#limits)); retrying can succeed. Any other engine error is `decision engine error`, including non-finite logits or probabilities (never a 200 with `null`s). Decisions share the API's concurrency permits with chat requests. |
 
@@ -276,7 +282,7 @@ Error messages are deliberately terse:
 | Questions per request | `max_questions` in `decision.json` | 32 (Clef: at most 256, the joint head's cap) |
 | Tokens in one pass | `max_tokens` in `decision.json` | required field |
 | Prefill tokens per request | `max_total_tokens` in `decision.json` | 4 × `max_tokens` |
-| Options per choice | per model family | JEV: 16 for the shipped JEV profiles (the profile's choice slot count); Kev: 255 (Kev's `MAX_OPTIONS`); Clef: 256 |
+| Options per choice | per model family | JEV: as many as the profile's `choice_labels`, at most 256 (serve_decide's `MAX_OPTIONS`); a profile without them, the choice slot count (16 for the shipped JEV profiles); Kev: 255 (Kev's `MAX_OPTIONS`); Clef: 256 |
 | Options per request (Clef) | engine readout cap | 4096 across all questions, because Clef answers them in one pass |
 | Tokens in the joint pass (Clef) | `MAX_JOINT_PROMPT` and the head's input limit | the smaller of `max_tokens`, 16,384 and 320 MiB ÷ (4 × width): 16,384 for both Clef-flash (width 4096) and Clef-27B (width 5120) |
 | Levels per score | per model family | JEV: 2 to 256; Clef: 1 to 256; Kev: 1 to 255 |
@@ -314,7 +320,9 @@ Error messages are deliberately terse:
   format is unchanged. The request-level `max_total_tokens` byte pre-check still applies to every
   family.
 - **JEV and Kev run one prefill pass per question**, so `max_questions` bounds the engine work of
-  one request. Clef runs one pass for the whole request.
+  one request. A JEV choice past the trained slots runs its plan's passes instead (up to 17, see
+  [JEV choices past the trained slots](#jev-choices-past-the-trained-slots)); every one of them
+  counts toward `max_total_tokens`. Clef runs one pass for the whole request.
 - **Prefill work** is the sum of all passes' prompt lengths. Kev repeats the state at the start of
   every question's pass. On a single box with the prefix cache on (`--total 1` and
   `--prefix-cache-gb` > 0, the default), the engine prefills that shared prefix once and resumes it
@@ -359,6 +367,59 @@ Error messages are deliberately terse:
   8 bytes per allowed token (524,288 bytes) before tokenizing it, and a question whose
   instructions and option texts render to more than 8 bytes per token the pass has left after the
   state; honest text tokenizes at about 4 bytes per token.
+
+## JEV choices past the trained slots
+
+JEV's head has a fixed number of trained choice slots (16, `A`..`P`, for the shipped JEV models).
+A choice question within them is one pass, exactly as before, whatever `strategy` says. A choice
+with more options, up to the profile's `choice_labels` (at most 256, written by the exporter), is
+answered the way the reference server answers it (serve_decide `s1_dist`), by one of three plans:
+
+| `strategy` | Passes | What runs |
+|---|---|---|
+| `single` | 1 | One pass over all n options, labelled `A`..`P`, then `Q`..`Z`, `AA`, ... |
+| `tournament` | ⌈n/16⌉ + 1 | Contiguous groups of at most 16 options (⌈n/16⌉ groups, the first n mod ⌈n/16⌉ one larger), then a final over 16: each group's winner and the best of the rest by in-group probability. A finalist gets its final probability times the finalists' joint in-group mass; any other option keeps its in-group probability scaled by its group's share of the final. The whole is normalised. |
+| `permute` | 4 | The options in request order, then in three orders drawn by CPython's `random.Random(zlib.crc32(question))` (`rng.sample`); the answer is the mean of the four passes. |
+
+- **Choosing a plan.** The request's `strategy` (top level, both routes) picks one. `"auto"`, `null`
+  or no field means the profile's default: `strategy` in the `jev` object of `decision.json`
+  (`"single"`, `"tournament"` or `"permute"`; default `"single"`, the reference's default for the
+  Qwen-based JEV models). The exporter does not write it; set it by hand. Kev and Clef answer any
+  option count in one pass, so a `strategy` other than `"auto"` is a 400 there
+  (`strategy applies to JEV only`).
+- **Every pass is an ordinary JEV choice pass** over its own options, labelled by position from
+  `A` (a tournament group or final of at most 16 options reads the trained slots), with the
+  trained bias for the positions the trained slots cover and none beyond, and the choice
+  temperature.
+- **Budget.** Every pass counts toward `max_total_tokens` before any runs, and each must fit
+  `max_tokens`. A tournament's final depends on the group passes, so it counts at its worst case:
+  the 16 longest option lines (by tokens), labelled `A`..`P`. A request that does not fit is a
+  413 with no pass run. (The real final is never longer with a tokenizer that does not merge
+  tokens across a line start, as Qwen's does not; if one ever were, the request stops with a 413
+  before the final instead of overspending.)
+- **Order.** The engine runs one pass at a time: every question's round-1 passes in request
+  order, then every tournament's final. serve_decide runs a plan's passes concurrently; the
+  result is the same.
+- **The answer** covers all n options in request order, like any choice: `choice` is the most
+  likely option (the first on a tie) and `confidence` the usual choice confidence. `usage`
+  counts every pass.
+
+Where this differs from serve_decide:
+
+- **Options.** serve_decide takes an `options` list of strings; here they are the choice's
+  criteria in request order (the OpenAI route's `choices` in order), and each option's text is
+  the codec's line, `name: description` (`name` alone without a description), sanitized like all
+  caller text. Groups, permutations and the worst-case final are over those lines.
+- **The permute seed** is serve_decide's `req.question`: the question's `instructions` exactly
+  as received, before sanitizing (a non-string value as its `json.dumps`), or the question id when
+  there are none; the prompt shows the same text sanitized.
+- **Arithmetic.** The combinations are serve_decide's, in f64 and in its order. Its sums (each
+  pass's softmax normaliser, the tournament's `among` and final normaliser) use Python's `sum()`,
+  which compensates rounding from CPython 3.12 on, where the server adds left to right; so
+  probabilities can differ in the last bit or so, as for every JEV pass today, far below the 4
+  decimals returned.
+- **A second round** needs the tokenizer again: a tournament request holds its concurrency permit
+  and waits for a tokenization slot once more between its rounds.
 
 ## Confidence
 
@@ -424,6 +485,12 @@ appended to FILE as one JSON line, `{"parts": [[question_id, start, end], ...], 
 the prompt token ids, the readout head layout, and which logit range answers which question. The
 parity and golden tooling reads this file to compare the server's prompts with the reference
 encoders.
+
+- A JEV choice pass's line also has `"strategy"` (`"native"` for a choice within the trained
+  slots, else `"single"`, `"permute"` or `"tournament"`) and `"round"` (1, or 2 for a
+  tournament's final), so the tools can rebuild the combination. A question's passes are written
+  in the order they run: its round-1 passes with the other questions', then the finals once round
+  1 has finished. Other lines are unchanged.
 
 - The pass is written **before the engine runs**, so a pass the engine later rejects is still
   recorded.
@@ -588,8 +655,9 @@ linear-attention and KV state. That is a separate project, not a flag.
   capacity get 503.
 - **int8 weights only.** Decision trees are built from Intel's int8 OpenVINO exports. int4 measured
   87.8–96.3% top-1 agreement with full precision, against 98.8–100% for int8, and is not supported.
-- **JEV choice questions take at most 16 options** for the shipped JEV profiles (the profile's
-  choice slot count).
+- **JEV choices past the trained slots are multi-pass.** They take up to 256 options, but the
+  model was trained on 16: the extra passes cost prefill, and the answers are serve_decide's
+  approximations (see [JEV choices past the trained slots](#jev-choices-past-the-trained-slots)).
 - **`--engine qwen35` only.** Other engines cannot run decision passes.
 
 ## Models
