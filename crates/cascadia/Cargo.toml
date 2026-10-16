@@ -28,3 +28,7 @@ cascadia-ov-genai-shim = { workspace = true, optional = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+
+# The shim dependency is read for its `links` metadata only (see build.rs), never from code.
+[package.metadata.cargo-machete]
+ignored = ["cascadia-ov-genai-shim"]
