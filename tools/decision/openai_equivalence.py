@@ -43,8 +43,9 @@ def post(url, body):
 
 
 def choice_key(v):
-    """The server's internal key for an OpenAI choice value: the string itself, or a number's JSON text."""
-    return v if isinstance(v, str) else json.dumps(v)
+    """The server's internal key for an OpenAI choice value (choice_key in openai.rs): the string
+    itself, or Python's str() of a number (2 -> "2", 1e5 -> "100000.0")."""
+    return v if isinstance(v, str) else str(v)
 
 
 def flat_openai(a):

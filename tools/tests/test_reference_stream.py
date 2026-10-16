@@ -47,30 +47,33 @@ def test_streamed_hidden_matches_full_model(tmp_path):
     assert torch.allclose(h, full, atol=1e-4), float((h - full).abs().max())
 
 
-def write_lora(path, model, modules, rank=2, seed=1):
-    """A PEFT-shaped adapter over `modules` (paths under model.model, e.g. "layers.0.mlp.down_proj")."""
+def write_lora(path, model, modules, rank=2, seed=1, prefix="model."):
+    """A PEFT-shaped adapter over `modules` (paths under model.model, e.g. "layers.0.mlp.down_proj"),
+    keyed base_model.model.<prefix><module> for decoder modules."""
     from safetensors.torch import save_file
     g = torch.Generator().manual_seed(seed)
     t = {}
     for m in modules:
         w = model.get_submodule(m if m == "lm_head" else f"model.{m}").weight
-        key = m if m == "lm_head" else f"model.{m}"
+        key = m if m == "lm_head" else f"{prefix}{m}"
         t[f"base_model.model.{key}.lora_A.weight"] = torch.randn(rank, w.shape[1], generator=g) * 0.1
         t[f"base_model.model.{key}.lora_B.weight"] = torch.randn(w.shape[0], rank, generator=g) * 0.1
     save_file(t, str(path))
     return t
 
 
-def test_lora_merged_per_layer_matches_merged_full_model(tmp_path):
+# H41: every key prefix weight_swap.LORA_KEY (and so the export's graft) accepts
+@pytest.mark.parametrize("prefix", ["model.", "", "model.language_model.", "language_model."])
+def test_lora_merged_per_layer_matches_merged_full_model(tmp_path, prefix):
     model = tiny(tmp_path)
     mods = ["layers.0.mlp.down_proj", "layers.0.linear_attn.in_proj_qkv", "layers.1.self_attn.q_proj"]
-    t = write_lora(tmp_path / "adapter.safetensors", model, mods)
+    t = write_lora(tmp_path / "adapter.safetensors", model, mods, prefix=prefix)
     scale = 2.0
     ids = [7, 2, 61, 30, 4]
     with torch.no_grad():
         (plain,) = rs.stream_hidden(str(tmp_path), [{"readout": {"prompt_ids": ids}}], threads=1)
         for m in mods:
-            k = f"base_model.model.model.{m}"
+            k = f"base_model.model.{prefix}{m}"
             model.get_submodule(f"model.{m}").weight += scale * (t[f"{k}.lora_B.weight"] @ t[f"{k}.lora_A.weight"])
         full = model(torch.tensor([ids]), output_hidden_states=True).hidden_states[-1][0]
     (h,) = rs.stream_hidden(str(tmp_path), [{"readout": {"prompt_ids": ids}}],
@@ -103,6 +106,17 @@ def test_streams_several_passes_of_different_lengths(tmp_path):
 def test_lm_rows_reads_lm_head(tmp_path):
     model = tiny(tmp_path)
     assert torch.equal(rs.lm_rows(str(tmp_path), [5, 0, 5]), model.lm_head.weight.detach()[[5, 0, 5]])
+    # H42: the checkpoint is opened once, not per call
+    assert rs._lm_head(str(tmp_path)) is rs._lm_head(str(tmp_path))
+
+
+def test_stream_hidden_restores_the_callers_thread_count(tmp_path):
+    # H42: set_num_threads is process-wide; the reference must not leave its setting behind
+    tiny(tmp_path)
+    before = torch.get_num_threads()
+    want = 1 if before != 1 else 2
+    rs.stream_hidden(str(tmp_path), [{"readout": {"prompt_ids": [1, 2]}}], threads=want)
+    assert torch.get_num_threads() == before
 
 
 # ---------------------------------------------------------------------------------------------

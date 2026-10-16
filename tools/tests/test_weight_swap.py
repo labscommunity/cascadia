@@ -40,6 +40,44 @@ def test_int8_asym_single_signed_rows_keep_zero_in_range():
     assert np.abs(deq - w).max() <= float(s.astype(np.float32).max())
 
 
+def test_q_asym_zero_and_constant_rows():
+    # H32: a zero row keeps a positive scale and dequantizes to exactly 0; a constant row's range
+    # is [0, c] (or [c, 0]), so it lands on the top (bottom) code and dequantizes to ~c.
+    w = np.array([[0.0] * 4, [0.25] * 4, [-0.5] * 4], dtype=np.float32)
+    q, zp, s = ws.q_asym(w, 8, axis=-1)
+    assert s[0, 0] > 0 and (q[0] == zp[0]).all()
+    np.testing.assert_array_equal(q[1], [255] * 4)
+    np.testing.assert_array_equal(zp[:, 0], [0, 0, 255])
+    np.testing.assert_array_equal(q[2], [0] * 4)
+    deq = (q.astype(np.float32) - zp) * s.astype(np.float32)
+    np.testing.assert_array_equal(deq[0], [0.0] * 4)
+    np.testing.assert_allclose(deq[1:], w[1:], rtol=1e-3)
+
+
+def test_q_asym_u4_groups():
+    # H32: the u4 path quantizes [out, G, 128] per group (axis -1) into 0..15
+    rng = np.random.default_rng(3)
+    w = rng.normal(size=(2, 3, 128)).astype(np.float32)
+    q, zp, s = ws.q_asym(w, 4, axis=-1)
+    assert q.shape == w.shape and zp.shape == s.shape == (2, 3, 1)
+    assert q.dtype == zp.dtype == np.uint8 and s.dtype == np.float16
+    assert q.max() <= 15 and zp.max() <= 15
+    span = np.maximum(w.max(-1, keepdims=True), 0) - np.minimum(w.min(-1, keepdims=True), 0)
+    np.testing.assert_array_equal(s, (span / 15.0).astype(np.float16))
+    deq = (q.astype(np.float32) - zp) * s.astype(np.float32)
+    assert np.abs(deq - w).max() <= float(s.astype(np.float32).max())
+
+
+@pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64])
+def test_q_asym_output_dtypes_do_not_follow_the_input(dtype):
+    # H32: whatever the checkpoint dtype, the codes are u8 and the scale f16 (the stock IR's types)
+    w = np.linspace(-1, 2, 16, dtype=dtype).reshape(2, 8)
+    q, zp, s = ws.q_asym(w, 8, axis=-1)
+    assert (q.dtype, zp.dtype, s.dtype) == (np.uint8, np.uint8, np.float16)
+    deq = (q.astype(np.float32) - zp) * s.astype(np.float32)
+    assert np.abs(deq - w.astype(np.float32)).max() <= float(s.astype(np.float32).max())
+
+
 def test_sym8_rows():
     w = np.array([[1.0, -2.0], [0.0, 0.0]], dtype=np.float32)
     q, s = ws.q_sym8(w)
@@ -224,6 +262,33 @@ def test_graft_lora_only_touches_the_stage_layers(tmp_path):
         ["layers.0.mlp.down_proj", "layers.5.mlp.down_proj", "lm_head"]
 
 
+def test_graft_lora_reports_a_module_once_per_matching_matmul(tmp_path):
+    """Two MatMuls carrying the same module name are each grafted and each reported; a module with no
+    MatMul is not reported. The exporter's coverage check (test_decision_export's two-MatMuls case,
+    which stubs graft_lora) relies on exactly this."""
+    ov = pytest.importorskip("openvino")
+    from openvino import opset13 as ops
+    torch = pytest.importorskip("torch")
+    from safetensors.torch import save_file
+    x = ops.parameter([1, 3], np.float32, name="x")
+    outs = []
+    for _ in range(2):
+        mm = ops.matmul(x, ops.constant(np.eye(3, dtype=np.float32)), False, True)
+        mm.set_friendly_name("__module.model.model.language_model.layers.0.mlp.down_proj/ov_ext::linear/MatMul")
+        outs.append(ops.result(mm))
+    keys = {}
+    for m in ("layers.0.mlp.down_proj", "layers.0.mlp.up_proj"):
+        keys[f"base_model.model.model.{m}.lora_A.weight"] = torch.ones(1, 3)
+        keys[f"base_model.model.model.{m}.lora_B.weight"] = torch.full((3, 1), 0.5)
+    path = str(tmp_path / "adapter_model.safetensors")
+    save_file(keys, path)
+    model = ov.Model(outs, [x], "t")
+    assert ws.graft_lora(model, path, 2.0) == ["layers.0.mlp.down_proj", "layers.0.mlp.down_proj"]
+    got = ov.Core().compile_model(model, "CPU")([np.array([[1.0, 2.0, 3.0]], np.float32)])
+    for out in got.values():  # both branches grafted: x + 2 * sum(x) * 0.5
+        np.testing.assert_allclose(out, [[7.0, 8.0, 9.0]], rtol=1e-6)
+
+
 def test_add_final_hidden_output_exposes_lm_head_input():
     ov = pytest.importorskip("openvino")
     from openvino import opset13 as ops
@@ -343,6 +408,59 @@ def test_swap_stage_round_trips_through_check_swap():
                                rtol=1e-6)
     out = ov.Core().compile_model(model, "CPU")([np.ones((1, 8), np.float32)])
     assert all(np.isfinite(v).all() for v in out.values())
+
+
+def test_swap_stage_leaves_other_consumers_of_a_shared_float_constant_alone():
+    """H31: a float constant also read by an op that is not one of FLOAT_KINDS keeps feeding that op
+    the stock value; only the matched consumer gets the swapped weights."""
+    ov = pytest.importorskip("openvino")
+    from openvino import opset13 as ops
+    x = ops.parameter([1, 4], np.float32, name="x")
+    c = ops.constant(np.full(4, 3.0, np.float32))
+    norm = ops.multiply(x, c)
+    norm.set_friendly_name(f"{_PFX}layers.0.input_layernorm/aten::mul/Multiply_1")
+    other = ops.multiply(x, c)
+    other.set_friendly_name("unrelated/aten::mul/Multiply")
+    model = ov.Model([ops.result(norm), ops.result(other)], [x], "t")
+    hf = np.array([0.5, -0.5, 1.0, 0.0], np.float32)
+    report = ws.swap_stage(model, _FakeWeights({"layers.0.input_layernorm.weight": hf}))
+    assert report["float"] == {0: ["input_layernorm.weight"]}
+    np.testing.assert_array_equal(norm.input_value(1).get_node().get_data(), 1.0 + hf)
+    np.testing.assert_array_equal(other.input_value(1).get_node().get_data(), [3.0] * 4)
+
+
+def test_swap_stage_u4_projection_round_trips():
+    """H32: a u4 [out, G, 128] projection is re-quantized per group with u4 codes and zero points."""
+    ov = pytest.importorskip("openvino")
+    from openvino import opset13 as ops
+    out_f, g = 2, 2
+    x = ops.parameter([1, g * 128], np.float32, name="x")
+    name = f"{_PFX}layers.0.mlp.down_proj._openvino_orig_weight"
+    w = ops.constant(np.full((out_f, g, 128), 8, np.uint8), dtype=ov.Type.u4)
+    w.set_friendly_name(name)
+    zp = ops.constant(np.full((out_f, g, 1), 8, np.uint8), dtype=ov.Type.u4)
+    zp.set_friendly_name(name + "/zero_point")
+    sc = ops.constant(np.ones((out_f, g, 1), np.float16), dtype=ov.Type.f16)
+    sc.set_friendly_name(name + "/scale")
+    f = lambda n: ops.convert(n, ov.Type.f32)  # noqa: E731
+    deq = ops.reshape(ops.multiply(ops.subtract(f(w), f(zp)), f(sc)), ops.constant(np.array([out_f, g * 128])), False)
+    model = ov.Model([ops.result(ops.matmul(x, deq, False, True))], [x], "t")
+    hf = np.random.default_rng(4).normal(size=(out_f, g * 128)).astype(np.float32)
+    report = ws.swap_stage(model, _FakeWeights({"layers.0.mlp.down_proj.weight": hf}))
+    assert report["proj"] == {0: ["mlp.down_proj"]}
+    q, zq, s = (_const(model, name + sfx) for sfx in ("", "/zero_point", "/scale"))
+    assert q.get_element_type() == zq.get_element_type() == ov.Type.u4
+    eq, ezp, es = ws.q_asym(hf.reshape(out_f, g, 128), 4, axis=-1)
+
+    def unpack(c):  # u4 constants hold two codes per byte, low nibble first
+        d = c.get_data().reshape(-1)
+        return np.stack([d & 0xF, d >> 4], -1).reshape(-1)
+    np.testing.assert_array_equal(unpack(q), eq.reshape(-1))
+    np.testing.assert_array_equal(unpack(zq), ezp.reshape(-1))
+    np.testing.assert_array_equal(s.get_data(), es)
+    got = ov.Core().compile_model(model, "CPU", {"INFERENCE_PRECISION_HINT": "f32"})([np.ones((1, g * 128), np.float32)])[0]
+    want = ((eq.astype(np.float32) - ezp) * es.astype(np.float32)).reshape(out_f, -1).sum(-1)
+    np.testing.assert_allclose(got[0], want, rtol=1e-4, atol=1e-3)
 
 
 def test_swap_stage_missing_projection_fails_check_swap():
