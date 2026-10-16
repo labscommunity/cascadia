@@ -1387,16 +1387,17 @@ impl Qwen36Engine {
         };
         // Issue-34: capture this rank's local KV under (prompt + generated) BEFORE reset_all wipes
         // it. Keyed by the full sequence (session-resume). Gated + best-effort (stub ⇒ no-op).
-        // Never for a turn with images: its ids (one pad per image token, the
-        // same for every same-grid image) do not identify its KV, so a later
-        // turn matching them would restore another image's state.
+        // A turn with images keys on `cache_key`: its pad ids are the same for
+        // every same-grid image, so they would restore another image's state.
         #[cfg(feature = "kv_coord")]
-        if t.vision.is_none() {
+        {
             // Skip the resume seed: `prompt_ids` already carries those ids, so
             // counting them again keys the blob at a depth that never matches
             // the fed sequence (same defect dist_spec fixed).
             let tokens: Vec<i32> = t
-                .prompt_ids
+                .vision
+                .as_ref()
+                .map_or(&t.prompt_ids, |v| &v.cache_key)
                 .iter()
                 .chain(t.gen_ids.iter().skip(t.resume_seed_len))
                 .map(|&u| u as i32)
@@ -1900,60 +1901,60 @@ impl Qwen36Engine {
             // Issue-34 warm-resume: a cached strict-prefix blob ⇒ RESTORE this rank + the whole
             // downstream chain (all-or-nothing); any rank short ⇒ cold. 0 ⇒ full prefill (default).
             let warm_prefix: usize = {
-                // Image turns always admit cold (see the single-box path).
+                // Image turns key on `cache_key` (each pad stands for its image's hash);
+                // positions and image rows are by absolute index, so a suffix prefill
+                // needs nothing else.
                 #[cfg(feature = "kv_coord")]
                 {
-                    if vision.is_some() {
-                        cold_admit!();
-                        0
-                    } else {
-                        let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
-                        match self.kv.take_warm(&task.tenant, &prompt_i32) {
-                            Some((blob, len, plane_pulled)) => {
-                                let kv_epoch =
-                                    crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
-                                let local_ok = self.restore_local_stages(&blob);
-                                // ALWAYS send the RESTORE, including in plane mode. It is the only thing on
-                                // the warm path that advances the downstream ranks' `peer_epoch` (their
-                                // InFrame::Restore sets it) and `self.epoch` was already bumped at
-                                // admission — short-circuiting it left every subsequent FORWARD dropped as
-                                // "stale frame". It is also the real restore on the same-chain path, where
-                                // no plane pull ever armed the downstream ranks.
-                                let plane_turn = self.plane_restore && plane_pulled;
-                                let chain_ok = local_ok && {
-                                    // Binding in BOTH modes, matching ov-runtime: a plane rank arms
-                                    // in-band inside its own OPCODE_RESTORE handler, so a `false` here
-                                    // means it really is cold. The old `chain_verdict` override existed
-                                    // for the out-of-band arm and would now mask exactly that — turning
-                                    // a retracted or dropped downstream slice into a warm head over a
-                                    // cold rank, which is wrong output rather than a cold reprefill.
-                                    self.forward_restore_downstream(self.epoch, kv_epoch)
-                                        .unwrap_or(false)
-                                };
-                                if chain_ok {
-                                    // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
-                                    // kv_seq_from_framed_blob now ignores the fixed-shape DeltaNet conv/ssm
-                                    // states (they poisoned the depth max with a constant 128), so it returns
-                                    // the TRUE attention fold depth. Resume there (`.min(len)`, matching the
-                                    // GREEN ov-runtime path). Resuming at len-1 re-fed the last folded token,
-                                    // which the position-free DeltaNet layers double-applied ⇒ cross-chain
-                                    // DIVERGE; the attention-only depth is correct for both attention and SSM.
-                                    let warm =
-                                        crate::kv_coordination::kv_seq_from_framed_blob(&blob)
-                                            .map(|s| s.min(len))
-                                            .unwrap_or(len);
-                                    info!(task = %task.task_id, warm_prefix = warm, matched = len, plane_pulled, plane_turn, "qwen36 pipeline warm-resumed");
-                                    warm
-                                } else {
-                                    warn!(task = %task.task_id, "qwen36: pipeline restore incomplete; cold reset");
-                                    cold_admit!();
-                                    0
-                                }
-                            }
-                            None => {
+                    let prompt_i32: Vec<i32> = vision
+                        .as_ref()
+                        .map_or(&prompt_ids, |v| &v.cache_key)
+                        .iter()
+                        .map(|&u| u as i32)
+                        .collect();
+                    match self.kv.take_warm(&task.tenant, &prompt_i32) {
+                        Some((blob, len, plane_pulled)) => {
+                            let kv_epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
+                            let local_ok = self.restore_local_stages(&blob);
+                            // ALWAYS send the RESTORE, including in plane mode. It is the only thing on
+                            // the warm path that advances the downstream ranks' `peer_epoch` (their
+                            // InFrame::Restore sets it) and `self.epoch` was already bumped at
+                            // admission — short-circuiting it left every subsequent FORWARD dropped as
+                            // "stale frame". It is also the real restore on the same-chain path, where
+                            // no plane pull ever armed the downstream ranks.
+                            let plane_turn = self.plane_restore && plane_pulled;
+                            let chain_ok = local_ok && {
+                                // Binding in BOTH modes, matching ov-runtime: a plane rank arms
+                                // in-band inside its own OPCODE_RESTORE handler, so a `false` here
+                                // means it really is cold. The old `chain_verdict` override existed
+                                // for the out-of-band arm and would now mask exactly that — turning
+                                // a retracted or dropped downstream slice into a warm head over a
+                                // cold rank, which is wrong output rather than a cold reprefill.
+                                self.forward_restore_downstream(self.epoch, kv_epoch)
+                                    .unwrap_or(false)
+                            };
+                            if chain_ok {
+                                // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
+                                // kv_seq_from_framed_blob now ignores the fixed-shape DeltaNet conv/ssm
+                                // states (they poisoned the depth max with a constant 128), so it returns
+                                // the TRUE attention fold depth. Resume there (`.min(len)`, matching the
+                                // GREEN ov-runtime path). Resuming at len-1 re-fed the last folded token,
+                                // which the position-free DeltaNet layers double-applied ⇒ cross-chain
+                                // DIVERGE; the attention-only depth is correct for both attention and SSM.
+                                let warm = crate::kv_coordination::kv_seq_from_framed_blob(&blob)
+                                    .map(|s| s.min(len))
+                                    .unwrap_or(len);
+                                info!(task = %task.task_id, warm_prefix = warm, matched = len, plane_pulled, plane_turn, "qwen36 pipeline warm-resumed");
+                                warm
+                            } else {
+                                warn!(task = %task.task_id, "qwen36: pipeline restore incomplete; cold reset");
                                 cold_admit!();
                                 0
                             }
+                        }
+                        None => {
+                            cold_admit!();
+                            0
                         }
                     }
                 }
@@ -2652,37 +2653,34 @@ impl Qwen36Engine {
                 .as_ref()
                 .map_or_else(|| prompt_ids.clone(), |v| v.cache_key.clone());
             let warm_prefix: usize = {
-                // The cross-node KV plane keys on real ids, so image turns stay off it.
+                // Keyed on `cache_key` too. A plane peer looks up by real ids, which
+                // never match an image's stand-ins, so image entries stay local.
                 #[cfg(feature = "kv_coord")]
                 {
-                    if vision.is_some() {
-                        self.local_warm_or_cold(&cache_key)
-                    } else {
-                        let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
-                        match self.kv.take_warm(&task.tenant, &prompt_i32) {
-                            Some((blob, len, plane_pulled)) if self.restore_local_stages(&blob) => {
-                                // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
-                                // See the sibling site: kv_seq_from_framed_blob now skips conv/ssm and returns
-                                // the true attention depth, so resume at `.min(len)` (matching ov-runtime).
-                                let warm = crate::kv_coordination::kv_seq_from_framed_blob(&blob)
-                                    .map(|s| s.min(len))
-                                    .unwrap_or(len);
-                                info!(
-                                    warm_prefix = warm,
-                                    matched = len,
-                                    plane_pulled,
-                                    "qwen36 single-box warm-resumed from KV blob"
-                                );
-                                warm
-                            }
-                            Some(_) => {
-                                // A plane blob that failed to restore may have dirtied some stages:
-                                // scrub before the local cache gets to try.
-                                self.reset_all();
-                                self.local_warm_or_cold(&prompt_ids)
-                            }
-                            None => self.local_warm_or_cold(&prompt_ids),
+                    let prompt_i32: Vec<i32> = cache_key.iter().map(|&u| u as i32).collect();
+                    match self.kv.take_warm(&task.tenant, &prompt_i32) {
+                        Some((blob, len, plane_pulled)) if self.restore_local_stages(&blob) => {
+                            // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
+                            // See the sibling site: kv_seq_from_framed_blob now skips conv/ssm and returns
+                            // the true attention depth, so resume at `.min(len)` (matching ov-runtime).
+                            let warm = crate::kv_coordination::kv_seq_from_framed_blob(&blob)
+                                .map(|s| s.min(len))
+                                .unwrap_or(len);
+                            info!(
+                                warm_prefix = warm,
+                                matched = len,
+                                plane_pulled,
+                                "qwen36 single-box warm-resumed from KV blob"
+                            );
+                            warm
                         }
+                        Some(_) => {
+                            // A plane blob that failed to restore may have dirtied some stages:
+                            // scrub before the local cache gets to try.
+                            self.reset_all();
+                            self.local_warm_or_cold(&cache_key)
+                        }
+                        None => self.local_warm_or_cold(&cache_key),
                     }
                 }
                 #[cfg(not(feature = "kv_coord"))]
