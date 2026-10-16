@@ -1826,6 +1826,9 @@ pub(crate) enum VisionFamily {
     Gemma4,
     /// LLaVA-layout Pixtral trees from tools/vlm_surgery: causal attention.
     Pixtral,
+    /// LLaVA-NeXT (llava-v1.6) trees from tools/vlm_surgery: anyres tiles,
+    /// causal attention.
+    LlavaNext,
 }
 
 /// The family of a pipeline's `vision` block. A tree without the field is
@@ -1841,9 +1844,10 @@ pub(crate) fn vision_family(
         // Mistral 3 is Pixtral's processor and tower plus a 2x2 patch merger,
         // which the Pixtral front end runs when the export carries it.
         (Some("pixtral" | "mistral3"), _) => Ok(VisionFamily::Pixtral),
+        (Some("llava_next"), _) => Ok(VisionFamily::LlavaNext),
         (Some(f), _) => Err(EngineError::InvalidConfig(format!(
             "pipeline_config.json `vision.family` is {f:?}; ov-runtime serves image input \
-             for \"gemma4\", \"pixtral\" and \"mistral3\""
+             for \"gemma4\", \"pixtral\", \"mistral3\" and \"llava_next\""
         ))),
         (None, other) => Err(EngineError::InvalidConfig(format!(
             "pipeline_config.json has a `vision` block without `family` on a {other:?} \
@@ -1875,11 +1879,12 @@ struct VisionTree {
 pub(crate) enum Frontend {
     Gemma4(crate::gemma4_vision::ImageFrontend),
     Pixtral(crate::pixtral_vision::Frontend),
+    LlavaNext(crate::llava_next_vision::Frontend),
 }
 
 impl Frontend {
     /// A `prompt_len`-token prompt's length once `media` expand, from the
-    /// images' dimensions alone (no encode). Pixtral / Mistral 3 only.
+    /// images' dimensions alone (no encode). Pixtral / Mistral 3 / LLaVA-NeXT.
     pub(crate) fn expanded_len(
         &self,
         prompt_len: usize,
@@ -1887,6 +1892,7 @@ impl Frontend {
     ) -> Result<usize, String> {
         match self {
             Frontend::Pixtral(f) => f.expanded_len(prompt_len, media),
+            Frontend::LlavaNext(f) => f.expanded_len(prompt_len, media),
             Frontend::Gemma4(_) => Err("expanded length is sized for Pixtral images only".into()),
         }
     }
@@ -1896,6 +1902,8 @@ impl Frontend {
         match self {
             Frontend::Gemma4(f) => vec![f.tokens.image, f.tokens.boi, f.tokens.eoi],
             Frontend::Pixtral(f) => vec![f.tokens.image, f.tokens.image_break, f.tokens.image_end],
+            // Newline rows are image tokens too; nothing frames an image.
+            Frontend::LlavaNext(f) => vec![f.image_token],
         }
     }
 
@@ -1904,6 +1912,7 @@ impl Frontend {
         match self {
             Frontend::Gemma4(f) => f.tokens.image,
             Frontend::Pixtral(f) => f.tokens.image,
+            Frontend::LlavaNext(f) => f.image_token,
         }
     }
 
@@ -1912,7 +1921,7 @@ impl Frontend {
     fn embedding_ids(&self, ids: &[i64]) -> Vec<i64> {
         match self {
             Frontend::Gemma4(f) => crate::gemma4_vision::text_embedding_ids(ids, &f.tokens),
-            Frontend::Pixtral(_) => ids.to_vec(),
+            Frontend::Pixtral(_) | Frontend::LlavaNext(_) => ids.to_vec(),
         }
     }
 
@@ -1925,6 +1934,7 @@ impl Frontend {
         match self {
             Frontend::Gemma4(f) => f.prepare(media, prompt_ids, tenant),
             Frontend::Pixtral(f) => f.prepare(media, prompt_ids, tenant),
+            Frontend::LlavaNext(f) => f.prepare(media, prompt_ids, tenant),
         }
     }
 
@@ -1937,6 +1947,7 @@ impl Frontend {
         match self {
             Frontend::Gemma4(f) => f.expand_ids(media, prompt_ids),
             Frontend::Pixtral(f) => f.expand_ids(media, prompt_ids),
+            Frontend::LlavaNext(f) => f.expand_ids(media, prompt_ids),
         }
     }
 
@@ -1945,7 +1956,7 @@ impl Frontend {
     fn max_image_tokens(&self) -> Option<usize> {
         match self {
             Frontend::Gemma4(f) => Some(f.preprocess.max_soft_tokens as usize),
-            Frontend::Pixtral(_) => None,
+            Frontend::Pixtral(_) | Frontend::LlavaNext(_) => None,
         }
     }
 
@@ -1967,6 +1978,10 @@ impl Frontend {
             Frontend::Pixtral(f) => format!(
                 "Pixtral images, longest edge {} px, one token per {}px patch",
                 f.preprocess.longest_edge, f.preprocess.patch_size
+            ),
+            Frontend::LlavaNext(f) => format!(
+                "LLaVA-NeXT images, a {} px base view plus tiles over pinpoints {:?}",
+                f.preprocess.tile, f.preprocess.pinpoints
             ),
         }
     }
@@ -2047,6 +2062,10 @@ impl VisionFirst {
                     crate::pixtral_vision::Frontend::load(pipeline_dir, tokens).map_err(invalid)?,
                 )
             }
+            VisionFamily::LlavaNext => Frontend::LlavaNext(
+                crate::llava_next_vision::Frontend::load(pipeline_dir, id("image_token_index")?)
+                    .map_err(invalid)?,
+            ),
         };
         Ok(Self {
             embed,
@@ -7329,6 +7348,42 @@ mod tests {
         assert!(matches!(r, Err(EngineError::Backend(_))));
     }
 
+    /// LLaVA-NeXT on packed slots follows Pixtral's rules (causal: no image
+    /// blocks, so an image may span packed inferences): a prompt is sized from
+    /// its images' dimensions and refused with a 413 before any encode when it
+    /// outgrows the slot's region. One 448x448 image is 2928 soft tokens.
+    #[test]
+    fn packed_llava_next_prompt_is_sized_before_encoding() {
+        use crate::llava_next_vision::{expand_image_tokens, image_tokens, PreprocessConfig};
+        let n = image_tokens(448, 448, &PreprocessConfig::llava_v16()).unwrap();
+        assert_eq!(n, 2928);
+        let ids = [1i64, 32000, 13, 5];
+        let run = |region: usize| {
+            let mut encodes = 0usize;
+            let r = packed_check_then_encode(
+                &mut encodes,
+                &ids,
+                true,
+                Some(32000),
+                false,
+                32,
+                region,
+                |_: &usize, ids: &[i64]| expand_image_tokens(ids, 32000, &[n]),
+                |c: &mut usize, ids: &[i64]| {
+                    *c += 1;
+                    Ok((expand_image_tokens(ids, 32000, &[n])?, ()))
+                },
+            );
+            (r, encodes)
+        };
+        let (r, encodes) = run(991);
+        assert!(matches!(r, Err(EngineError::PromptTooLong(_))), "{r:?}");
+        assert_eq!(encodes, 0);
+        let (r, encodes) = run(4096);
+        assert_eq!(r.unwrap().0.len(), 3 + n);
+        assert_eq!(encodes, 1, "wider than packed_seq is fine on a causal tree");
+    }
+
     #[test]
     fn packed_refuses_an_image_wider_than_one_inference() {
         let ids = [1i64, 9, 9, 9, 2, 9, 9];
@@ -8635,6 +8690,10 @@ mod tests {
         assert_eq!(
             vision_family(&v(Some("mistral3")), None).unwrap(),
             VisionFamily::Pixtral
+        );
+        assert_eq!(
+            vision_family(&v(Some("llava_next")), None).unwrap(),
+            VisionFamily::LlavaNext
         );
         assert!(vision_family(&v(Some("qwen2_vl")), None).is_err());
         assert!(vision_family(&v(None), Some("something_else_v1")).is_err());
