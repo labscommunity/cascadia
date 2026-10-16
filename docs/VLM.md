@@ -56,7 +56,7 @@ names the field.
 | Qwen3.5 / Qwen3.6 VLM | `qwen35` | 2+ machines | `tools/qwen36_surgery/export_qwen36_moe.py`; the vision IRs in the source dir are carried into the tree |
 | Gemma 4 26B-A4B / 31B | `ov-genai` | one box | the OpenVINO VLM export as published |
 | Qwen2.5-VL, Qwen3-VL, InternVL2, Phi-3.5-vision, LLaVA-NeXT (llava-v1.6), Gemma 3 | `ov-genai` | one box | the OpenVINO exports as published (`OpenVINO/<model>-int4-ov`) |
-| Gemma 4 26B-A4B / 31B | `ov-runtime` | 2+ machines, stateful or static | `tools/gemma4_surgery/export_gemma4_text.py --vision` |
+| Gemma 4 26B-A4B / 31B | `ov-runtime` | 2+ machines, stateful, static or packed | `tools/gemma4_surgery/export_gemma4_text.py --vision` |
 | Gemma 4 E2B / E4B | `gemma4` | 1+ machines | `tools/export_gemma4.py --vision DIR` |
 | Pixtral 12B | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family pixtral` |
 | Mistral 3 (Ministral-3, Mistral Small 3.1/3.2) | `ov-runtime` | 1+ machines | export with optimum-intel, then `tools/vlm_surgery/cut_vlm_lm.py --family mistral3` |
@@ -140,8 +140,24 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
   `--prefill-seq` must stay within the sliding window + 1 (1025): for example
   `--context 736 --prefill-seq 288`, which holds about two images.
 - Packed slots (`--packed-slots N`, continuous batching on static shards): build the
-  packed IR per stage with `python tools/packed_variant.py <stage dir> --slots N
-  [--packed-seq S]`. Pixtral only; Gemma 4 trees are refused on packed slots.
+  packed IR per stage of the static tree with `python tools/packed_variant.py <stage dir>
+  --slots N [--packed-seq S]`, then serve every rank with `--packed-slots N`.
+- **Gemma 4 on packed slots**: same two steps. `packed_variant.py` finds the stage's two
+  mask producers (sliding window and full attention), tells them apart from the tree's
+  `config.json` `layer_types`, and gives each its own input (`attn_mask_sliding_4d`,
+  `attn_mask_4d`); the runtime builds both masks, with each image open both ways. An
+  image must fit one packed inference, so pass `--packed-seq` at least one image wide:
+
+  ```bash
+  python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <static tree> \
+      --context 736 --prefill-seq 288
+  for i in 0 1 2 3; do
+    python tools/packed_variant.py <static tree>/stage_$i --slots 2 --packed-seq 288
+  done
+  ```
+
+  The load log line `packed multi-slot decode active` names the mask ports, the window
+  and the KV geometry (`8x256 x6, 2x512 x1`, ...) each stage loaded.
 
 ## Serving
 
@@ -174,6 +190,13 @@ is not practical on the NPU: one stage's decode IR had not compiled after 90 min
   1000 pixels). The counts match Hugging Face's processor for the same request.
 - Packed slots: a prompt must fit one slot's region, `(context - 1 - packed_prefix) /
   slots`; two Pixtral images do not fit two slots of a 2048 context.
+- Gemma 4 packed slots: a request whose image is wider than `--packed-seq` rows is
+  refused with a 400 (lower detail sends a smaller image). Every inference is
+  `--packed-seq` rows, decode included, so a 288-row variant decodes at a 288-row
+  cost; `static_variant.py` still caps `--context` + `--prefill-seq` at the sliding
+  window + 1 (1025), which leaves two slots of 367 tokens at `--context 736`. Every
+  stage must run the same build: the packed plan frame carries image ids (four rows
+  instead of three), and a stage refuses the other kind.
 - Rank 0 keeps each encoded image (keyed on a hash of its pixels) so a chat's earlier
   images are not re-encoded every turn: `CASCADIA_IMAGE_CACHE_MB` per vision front end,
   default 256, 0 to disable. With `kv_coord`, `ov-runtime`, `gemma4` and `qwen35` also

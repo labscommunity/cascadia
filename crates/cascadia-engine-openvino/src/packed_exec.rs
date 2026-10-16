@@ -15,7 +15,7 @@ use cascadia_engine::{EngineError, EngineResult};
 use cascadia_ov_genai_shim::{DType as ShimDType, Runtime as OvRuntime};
 use cascadia_types::GenerationTask;
 
-use crate::packed::{PackedKv, PackedPlan};
+use crate::packed::{image_safe_take, prompt_image_ids, PackedKv, PackedPlan};
 
 /// Primary input of a packed inference: prompt/decode token ids on the embed
 /// stage, upstream hidden rows on relay + head stages.
@@ -39,6 +39,9 @@ pub(crate) struct PackedSlot {
     /// Vision trees: the prompt's embedding rows (`prompt_ids.len() *
     /// hidden`, image rows spliced in); empty on id-fed stages.
     pub(crate) prompt_rows: Vec<f32>,
+    /// Image id per prompt token when the tree masks image blocks (Gemma 4),
+    /// else empty. Prefill chunks never split an image.
+    pub(crate) prompt_images: Vec<Option<u32>>,
     /// Prompt tokens already consumed; `== prompt_ids.len()` once prefilled.
     pub(crate) prompt_fed: usize,
     pub(crate) generated: Vec<i32>,
@@ -64,6 +67,34 @@ pub(crate) struct PackedLayer {
     pub(crate) val_out: usize,
 }
 
+/// One attention-mask input of the packed IR. Most families have one,
+/// `attn_mask_4d` (full attention); Gemma 4 adds `attn_mask_sliding_4d`, fed
+/// the same mask with its sliding window applied.
+pub(crate) struct PackedMask {
+    pub(crate) port: String,
+    pub(crate) dtype: ShimDType,
+    /// `Some(window)` for a sliding-window mask.
+    pub(crate) window: Option<usize>,
+    pub(crate) bytes: Vec<u8>,
+}
+
+impl PackedMask {
+    pub(crate) fn new(port: String, dtype: ShimDType, window: Option<usize>) -> Self {
+        Self {
+            port,
+            dtype,
+            window,
+            bytes: Vec::new(),
+        }
+    }
+}
+
+/// One row of a packed plan as it travels between stages: slot, absolute
+/// position, shared-prefix reuse length.
+pub(crate) type WireRow = (usize, i64, usize);
+/// A [`WireRow`], or `None` for an idle row.
+pub(crate) type WireRowOpt = Option<WireRow>;
+
 /// What one packed inference did, so the caller can sample the right rows.
 pub(crate) enum PackedStepKind {
     /// Prefill chunk for `slot`; `finished_prompt` marks the chunk that
@@ -88,9 +119,15 @@ pub(crate) struct PackedState {
     /// Row width of a vision tree's stage 0 (fed embedding rows); 0 when the
     /// stage takes ids or hidden states.
     pub(crate) embed_hidden: usize,
-    pub(crate) mask_in: String,
+    /// Every mask port the packed IR declares (one, or Gemma 4's two).
+    pub(crate) masks: Vec<PackedMask>,
     pub(crate) pos_in: String,
-    pub(crate) mask_dtype: ShimDType,
+    /// `token_type_ids`, when the packed IR still reads it (something other
+    /// than the replaced mask producers consumed it); fed 1 on image rows.
+    pub(crate) types_in: Option<String>,
+    /// The image soft-token id on a tree whose masks open image blocks
+    /// (Gemma 4, rank 0): admission derives each prompt's image ids from it.
+    pub(crate) image_token: Option<i64>,
     pub(crate) layers: Vec<PackedLayer>,
     /// Token ids whose K/V now sit in the shared prefix region. Only the
     /// driver stage matches against these; relay stages are told the reuse
@@ -98,13 +135,17 @@ pub(crate) struct PackedState {
     pub(crate) prefix_ids: Vec<i64>,
     /// Slot currently populating the shared prefix, if any.
     populating: Option<usize>,
-    last_plan_rows: Vec<Option<(usize, i64, usize)>>,
-    mask_bytes: Vec<u8>,
+    last_plan_rows: Vec<WireRowOpt>,
+    /// Per-row image ids of the most recent inference (see `last_plan_rows`).
+    last_plan_images: Vec<Option<u32>>,
     ids_bytes: Vec<u8>,
+    types_bytes: Vec<u8>,
     pos_bytes: Vec<u8>,
 }
 
 impl PackedState {
+    /// `types_in` and `image_token` start unset; a Gemma 4 tree sets them.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         runtime: OvRuntime,
         kv: PackedKv,
@@ -112,9 +153,8 @@ impl PackedState {
         ids_in: String,
         hidden_in: String,
         embed_hidden: usize,
-        mask_in: String,
+        masks: Vec<PackedMask>,
         pos_in: String,
-        mask_dtype: ShimDType,
     ) -> Self {
         let slots = kv.slots;
         Self {
@@ -124,15 +164,17 @@ impl PackedState {
             ids_in,
             hidden_in,
             embed_hidden,
-            mask_in,
+            masks,
             pos_in,
-            mask_dtype,
+            types_in: None,
+            image_token: None,
             layers,
             prefix_ids: Vec::new(),
             populating: None,
             last_plan_rows: Vec::new(),
-            mask_bytes: Vec::new(),
+            last_plan_images: Vec::new(),
             ids_bytes: Vec::new(),
+            types_bytes: Vec::new(),
             pos_bytes: Vec::new(),
         }
     }
@@ -143,8 +185,14 @@ impl PackedState {
 
     /// Per-row `(slot, position)` of the most recent inference — what a
     /// pipeline stage ships downstream so every stage masks identically.
-    pub(crate) fn last_plan_rows(&self) -> Vec<Option<(usize, i64, usize)>> {
+    pub(crate) fn last_plan_rows(&self) -> Vec<WireRowOpt> {
         self.last_plan_rows.clone()
+    }
+
+    /// Per-row image ids of the most recent inference, for the wire of a
+    /// tree whose masks open image blocks.
+    pub(crate) fn last_plan_images(&self) -> Vec<Option<u32>> {
+        self.last_plan_images.clone()
     }
 
     pub(crate) fn occupied(&self) -> usize {
@@ -200,10 +248,15 @@ impl PackedState {
                 .take(self.kv.prefix_capacity.min(shareable))
                 .collect();
         }
+        let prompt_images = match self.image_token {
+            Some(image) => prompt_image_ids(&prompt_ids, image),
+            None => Vec::new(),
+        };
         self.slots[slot] = Some(PackedSlot {
             task,
             prompt_ids,
             prompt_rows,
+            prompt_images,
             prompt_fed: shared,
             generated: Vec::new(),
             emitted: Vec::new(),
@@ -250,8 +303,18 @@ impl PackedState {
             // ---- prefill chunk for one slot ----
             let t = self.slots[slot].as_ref().unwrap();
             let start = t.prompt_fed;
-            let take = (t.prompt_ids.len() - start).min(s);
+            // An image is attended bidirectionally only inside one inference:
+            // end the chunk before it rather than split it. Submit refused
+            // any image wider than `packed_seq`, so this only errs on a bug.
+            let take =
+                image_safe_take(&t.prompt_images, start, (t.prompt_ids.len() - start).min(s))
+                    .map_err(|e| EngineError::Backend(format!("packed slot {slot}: {e}")))?;
             let ids: Vec<i64> = t.prompt_ids[start..start + take].to_vec();
+            let images = t
+                .prompt_images
+                .get(start..start + take)
+                .unwrap_or_default()
+                .to_vec();
             if h > 0 {
                 if t.prompt_rows.len() != t.prompt_ids.len() * h {
                     return Err(EngineError::Backend(format!(
@@ -266,7 +329,11 @@ impl PackedState {
             let positions: Vec<i64> = (0..take).map(|i| (base + i) as i64).collect();
             let finished = start + take >= t.prompt_ids.len();
             (
-                PackedPlan::chunk(s, slot, take),
+                if images.is_empty() {
+                    PackedPlan::chunk(s, slot, take)
+                } else {
+                    PackedPlan::chunk_with_images(s, slot, &images)
+                },
                 ids,
                 positions,
                 PackedStepKind::Prefill {
@@ -371,14 +438,19 @@ impl PackedState {
                 })
             })
             .collect();
+        self.last_plan_images = (0..s)
+            .map(|r| plan.rows.get(r).copied().flatten().and_then(|pr| pr.image))
+            .collect();
         let ids: Vec<i64> = match primary {
             PackedPrimary::Ids(v) => v.to_vec(),
             PackedPrimary::Hidden(_, _) | PackedPrimary::Embeds(_, _) => Vec::new(),
         };
 
         // ---- feed ----
-        self.kv
-            .fill_mask(&plan, &mut self.mask_bytes, self.mask_dtype);
+        for m in self.masks.iter_mut() {
+            self.kv
+                .fill_mask_window(plan, &mut m.bytes, m.dtype, m.window);
+        }
         // Idle rows still need a defined token/position; row 0's values are
         // safe filler because an idle row attends only to itself and its
         // output is never read.
@@ -430,19 +502,36 @@ impl PackedState {
                     .map_err(crate::runtime::map_ov_err)?;
             }
         }
-        self.runtime
-            .set_input(
-                &self.mask_in,
-                self.mask_dtype,
-                &[1, 1, s, self.kv.context],
-                &self.mask_bytes,
-            )
-            .map_err(crate::runtime::map_ov_err)?;
+        for m in &self.masks {
+            self.runtime
+                .set_input(&m.port, m.dtype, &[1, 1, s, self.kv.context], &m.bytes)
+                .map_err(crate::runtime::map_ov_err)?;
+        }
+        if let Some(types_in) = &self.types_in {
+            self.types_bytes.clear();
+            for r in 0..s {
+                let t: i64 = plan
+                    .rows
+                    .get(r)
+                    .copied()
+                    .flatten()
+                    .map_or(0, |pr| pr.image.is_some() as i64);
+                self.types_bytes.extend_from_slice(&t.to_le_bytes());
+            }
+            self.runtime
+                .set_input(types_in, ShimDType::I64, &[1, s], &self.types_bytes)
+                .map_err(crate::runtime::map_ov_err)?;
+        }
         self.runtime
             .set_input(&self.pos_in, ShimDType::I64, &[1, s], &self.pos_bytes)
             .map_err(crate::runtime::map_ov_err)?;
-        let kv_shape = [1, self.kv.kv_heads(), self.kv.past_len, self.kv.head_dim()];
         for (li, layer) in self.layers.iter().enumerate() {
+            let kv_shape = [
+                1,
+                self.kv.kv_heads(li),
+                self.kv.past_len,
+                self.kv.head_dim(li),
+            ];
             self.runtime
                 .set_input(
                     &layer.key_in,
@@ -465,19 +554,19 @@ impl PackedState {
         let (odt, oshape, obytes) = self.runtime.output(0).map_err(crate::runtime::map_ov_err)?;
 
         // ---- scatter present rows back into their owning slot regions ----
-        let expect = self.kv.present_layer_bytes();
-        let want_shape = [
-            1usize,
-            self.kv.kv_heads(),
-            self.kv.context,
-            self.kv.head_dim(),
-        ];
         // occupancy per slot BEFORE this step drives append-vs-slide
         let mut at: HashMap<usize, usize> = HashMap::new();
         for (_r, pr) in plan.active_rows() {
             at.entry(pr.slot).or_insert_with(|| self.kv.valid(pr.slot));
         }
         for li in 0..self.layers.len() {
+            let expect = self.kv.present_layer_bytes(li);
+            let want_shape = [
+                1usize,
+                self.kv.kv_heads(li),
+                self.kv.context,
+                self.kv.head_dim(li),
+            ];
             let (ko, vo) = (self.layers[li].key_out, self.layers[li].val_out);
             let (_, kshape, kpres) = self
                 .runtime

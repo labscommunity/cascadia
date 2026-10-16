@@ -22,6 +22,20 @@
 //! noise, and throughput is 3.1x at 8 slots / 6.0x at 16 vs seq=1 — because
 //! weights outweigh KV traffic 16:1, so the per-iteration weight stream amortizes
 //! across slots. See docs/perf/NPU_PACKED_SLOTS.md.
+//!
+//! Gemma 4 adds three things, all off by default so the other families mask
+//! exactly as before:
+//! - **Per-layer KV geometry.** Sliding layers are 8 KV heads x 256 and global
+//!   layers 2 x 512; each layer's ring is sized by its own `(kv_heads,
+//!   head_dim)` ([`PackedKv::with_layers`], from `stage_config.kv_layers`).
+//! - **A sliding-window mask.** The packed IR then has a second mask port fed
+//!   by [`PackedKv::fill_mask_window`]: the same mask with every column whose
+//!   absolute position is `window` or more behind the query row blocked. A
+//!   column's position is known from the slot's layout (shared prefix, the
+//!   pinned sink columns, then the slid window), see `column_position`.
+//! - **Image blocks.** Rows of one image ([`PackedRow::image`]) attend to each
+//!   other both ways, on top of causal order, in both masks. An image must
+//!   therefore sit whole inside one inference ([`image_safe_take`]).
 
 use cascadia_ov_genai_shim::DType as ShimDType;
 
@@ -43,10 +57,16 @@ pub(crate) const KV_SINK: usize = 4;
 /// Which slot a query row belongs to, and its ordinal among that slot's rows in
 /// this same inference (0 for decode; 0..n for a prefill chunk). `order` drives
 /// causal masking within a slot.
+///
+/// `image` names the image a row belongs to (Gemma 4: rows with
+/// `token_type_ids == 1`, one id per contiguous run in the prompt). Same-slot
+/// rows of the same image attend to each other regardless of order. `None` on
+/// text rows and on every family without bidirectional image attention.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackedRow {
     pub slot: usize,
     pub order: usize,
+    pub image: Option<u32>,
 }
 
 /// Row assignment for one packed inference. `rows.len() == packed_seq`; `None`
@@ -67,7 +87,11 @@ impl PackedPlan {
     pub fn decode(packed_seq: usize, slots: &[usize]) -> Self {
         let mut rows = vec![None; packed_seq];
         for (r, &slot) in slots.iter().take(packed_seq).enumerate() {
-            rows[r] = Some(PackedRow { slot, order: 0 });
+            rows[r] = Some(PackedRow {
+                slot,
+                order: 0,
+                image: None,
+            });
         }
         Self { rows }
     }
@@ -76,9 +100,23 @@ impl PackedPlan {
     pub fn chunk(packed_seq: usize, slot: usize, n: usize) -> Self {
         let mut rows = vec![None; packed_seq];
         for (order, row) in rows.iter_mut().take(n.min(packed_seq)).enumerate() {
-            *row = Some(PackedRow { slot, order });
+            *row = Some(PackedRow {
+                slot,
+                order,
+                image: None,
+            });
         }
         Self { rows }
+    }
+
+    /// A prefill chunk whose rows carry their image ids (`images.len()` rows,
+    /// `None` for text) — the Gemma 4 shape of [`PackedPlan::chunk`].
+    pub fn chunk_with_images(packed_seq: usize, slot: usize, images: &[Option<u32>]) -> Self {
+        let mut plan = Self::chunk(packed_seq, slot, images.len());
+        for (row, &image) in plan.rows.iter_mut().flatten().zip(images) {
+            row.image = image;
+        }
+        plan
     }
 
     pub fn active_rows(&self) -> impl Iterator<Item = (usize, PackedRow)> + '_ {
@@ -113,8 +151,9 @@ pub struct PackedKv {
     pub packed_seq: usize,
     /// `present.*` length = `past_len + packed_seq`.
     pub context: usize,
-    kv_heads: usize,
-    head_dim: usize,
+    /// `(kv_heads, head_dim)` per layer, in port order. Uniform on most
+    /// families; Gemma 4 mixes sliding (8 x 256) and global (2 x 512) layers.
+    geom: Vec<(usize, usize)>,
     elem_bytes: usize,
     key_buf: Vec<Vec<u8>>,
     val_buf: Vec<Vec<u8>>,
@@ -128,6 +167,7 @@ pub struct PackedKv {
 }
 
 impl PackedKv {
+    /// Every layer `kv_heads` x `head_dim`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         slots: usize,
@@ -139,12 +179,34 @@ impl PackedKv {
         kv_dtype: ShimDType,
         prefix_capacity: usize,
     ) -> Self {
+        Self::with_layers(
+            slots,
+            past_len,
+            packed_seq,
+            vec![(kv_heads, head_dim); layers],
+            kv_dtype,
+            prefix_capacity,
+        )
+    }
+
+    /// Each layer with its own `(kv_heads, head_dim)` (`stage_config.kv_layers`).
+    pub fn with_layers(
+        slots: usize,
+        past_len: usize,
+        packed_seq: usize,
+        geom: Vec<(usize, usize)>,
+        kv_dtype: ShimDType,
+        prefix_capacity: usize,
+    ) -> Self {
         let elem_bytes = match kv_dtype {
             ShimDType::F32 | ShimDType::I32 => 4,
             ShimDType::I64 => 8,
             _ => 2,
         };
-        let per_layer = kv_heads * past_len * head_dim * elem_bytes;
+        let key_buf: Vec<Vec<u8>> = geom
+            .iter()
+            .map(|&(kv_heads, head_dim)| vec![0u8; kv_heads * past_len * head_dim * elem_bytes])
+            .collect();
         let prefix_capacity = prefix_capacity.min(past_len.saturating_sub(slots));
         let region = (past_len - prefix_capacity) / slots;
         Self {
@@ -156,11 +218,10 @@ impl PackedKv {
             past_len,
             packed_seq,
             context: past_len + packed_seq,
-            kv_heads,
-            head_dim,
+            geom,
             elem_bytes,
-            key_buf: vec![vec![0u8; per_layer]; layers],
-            val_buf: vec![vec![0u8; per_layer]; layers],
+            val_buf: key_buf.clone(),
+            key_buf,
             pos: vec![0; slots],
             shared_use: vec![0; slots],
         }
@@ -200,14 +261,17 @@ impl PackedKv {
     /// the first `shared` shared-prefix columns.
     pub fn reset_slot_reusing(&mut self, s: usize, shared: usize) {
         let shared = shared.min(self.prefix_valid);
-        let (region, kv_heads, past_len) = (self.region, self.kv_heads, self.past_len);
-        let slot_bytes = self.head_dim * self.elem_bytes;
-        let buf_row = past_len * slot_bytes;
-        let start = self.region_start(s) * slot_bytes;
-        for buf in self.key_buf.iter_mut().chain(self.val_buf.iter_mut()) {
-            for h in 0..kv_heads {
-                let base = h * buf_row + start;
-                buf[base..base + region * slot_bytes].fill(0);
+        let (region, past_len) = (self.region, self.past_len);
+        let start_col = self.region_start(s);
+        for (li, &(kv_heads, head_dim)) in self.geom.iter().enumerate() {
+            let slot_bytes = head_dim * self.elem_bytes;
+            let buf_row = past_len * slot_bytes;
+            let start = start_col * slot_bytes;
+            for buf in [&mut self.key_buf[li], &mut self.val_buf[li]] {
+                for h in 0..kv_heads {
+                    let base = h * buf_row + start;
+                    buf[base..base + region * slot_bytes].fill(0);
+                }
             }
         }
         self.pos[s] = shared;
@@ -222,19 +286,21 @@ impl PackedKv {
         if n == 0 || self.prefix_valid > 0 {
             return;
         }
-        let slot_bytes = self.head_dim * self.elem_bytes;
-        let buf_row = self.past_len * slot_bytes;
-        let src_start = self.region_start(src) * slot_bytes;
-        let kv_heads = self.kv_heads;
-        for buf in self.key_buf.iter_mut().chain(self.val_buf.iter_mut()) {
-            for h in 0..kv_heads {
-                let base = h * buf_row;
-                let from = base + src_start;
-                let to = base;
-                // Non-overlapping by construction: the shared region is
-                // [0, prefix_capacity) and every slot region starts at or after
-                // prefix_capacity.
-                buf.copy_within(from..from + n * slot_bytes, to);
+        let src_col = self.region_start(src);
+        for (li, &(kv_heads, head_dim)) in self.geom.iter().enumerate() {
+            let slot_bytes = head_dim * self.elem_bytes;
+            let buf_row = self.past_len * slot_bytes;
+            let src_start = src_col * slot_bytes;
+            for buf in [&mut self.key_buf[li], &mut self.val_buf[li]] {
+                for h in 0..kv_heads {
+                    let base = h * buf_row;
+                    let from = base + src_start;
+                    let to = base;
+                    // Non-overlapping by construction: the shared region is
+                    // [0, prefix_capacity) and every slot region starts at or
+                    // after prefix_capacity.
+                    buf.copy_within(from..from + n * slot_bytes, to);
+                }
             }
         }
         self.prefix_valid = n;
@@ -250,16 +316,25 @@ impl PackedKv {
         &self.val_buf[li]
     }
 
-    pub fn kv_heads(&self) -> usize {
-        self.kv_heads
+    /// KV heads of layer `li`.
+    pub fn kv_heads(&self, li: usize) -> usize {
+        self.geom[li].0
     }
 
-    pub fn head_dim(&self) -> usize {
-        self.head_dim
+    /// Head width of layer `li`.
+    pub fn head_dim(&self, li: usize) -> usize {
+        self.geom[li].1
     }
 
-    pub fn present_layer_bytes(&self) -> usize {
-        self.kv_heads * self.context * self.head_dim * self.elem_bytes
+    /// `(kv_heads, head_dim)` of every layer, in port order.
+    pub fn geometry(&self) -> &[(usize, usize)] {
+        &self.geom
+    }
+
+    /// Bytes of layer `li`'s `present.*` output (`[1, kv_heads, context, head_dim]`).
+    pub fn present_layer_bytes(&self, li: usize) -> usize {
+        let (kv_heads, head_dim) = self.geom[li];
+        kv_heads * self.context * head_dim * self.elem_bytes
     }
 
     /// Advance a slot's absolute position after its row(s) were absorbed.
@@ -284,12 +359,12 @@ impl PackedKv {
         slot: usize,
         at: usize,
     ) {
-        let slot_bytes = self.head_dim * self.elem_bytes;
+        let (kv_heads, head_dim) = self.geom[li];
+        let slot_bytes = head_dim * self.elem_bytes;
         let present_row = self.context * slot_bytes;
         let buf_row = self.past_len * slot_bytes;
         let region = self.region;
         let sink = self.sink;
-        let kv_heads = self.kv_heads;
         let src_slot = self.past_len + row;
         let full = at >= region;
         let region_start = self.region_start(slot) * slot_bytes;
@@ -319,21 +394,68 @@ impl PackedKv {
         }
     }
 
+    /// Absolute position of the token held in past column `c` for `slot`, or
+    /// `None` when the column holds nothing `slot` may read.
+    ///
+    /// Layout: the shared prefix `[0, shared_use)` holds positions `0..`; the
+    /// slot's region holds its own tokens from position `shared_use` on. Once
+    /// more own tokens than `region` went through it, the region has slid: its
+    /// first `sink` columns stay pinned to the first own tokens, and the rest
+    /// hold the most recent `region - sink` tokens in order, the last at
+    /// `pos - 1`.
+    fn column_position(&self, slot: usize, c: usize) -> Option<usize> {
+        let shared = self.shared_use[slot];
+        if c < shared {
+            return Some(c);
+        }
+        let start = self.region_start(slot);
+        if c < start {
+            return None;
+        }
+        let i = c - start;
+        if i >= self.valid(slot) {
+            return None;
+        }
+        let own = self.pos[slot] - shared;
+        Some(if own <= self.region || i < self.sink {
+            shared + i
+        } else {
+            shared + own - self.region + i
+        })
+    }
+
     /// Write the additive attention mask for `plan` into `buf` as a
     /// `[1, 1, packed_seq, context]` tensor of `dtype`.
     ///
     /// Row `r` is opened on exactly: its slot's occupied past region, and the
-    /// query columns of same-slot rows with `order <= its order`. Everything
-    /// else is blocked. An idle row is opened on its own query column only —
-    /// never fully blocked, which would make softmax produce NaN and poison the
-    /// whole inference including live rows.
+    /// query columns of same-slot rows with `order <= its order`, or of the
+    /// same image (see [`PackedRow::image`]). Everything else is blocked. An
+    /// idle row is opened on its own query column only — never fully blocked,
+    /// which would make softmax produce NaN and poison the whole inference
+    /// including live rows.
     pub fn fill_mask(&self, plan: &PackedPlan, buf: &mut Vec<u8>, dtype: ShimDType) {
+        self.fill_mask_window(plan, buf, dtype, None);
+    }
+
+    /// [`PackedKv::fill_mask`] for a sliding-window layer when `window` is
+    /// set: additionally block every column whose token sits `window` or more
+    /// positions behind the query row (HF: visible iff `0 <= q - k < window`).
+    /// Positions are absolute, so the region's slide and the pinned sink
+    /// columns are accounted for (`column_position`). A query row's position
+    /// is its slot's next position plus its `order`. Image blocks stay open:
+    /// an image never spans a window.
+    pub fn fill_mask_window(
+        &self,
+        plan: &PackedPlan,
+        buf: &mut Vec<u8>,
+        dtype: ShimDType,
+        window: Option<usize>,
+    ) {
         let elem = match dtype {
             ShimDType::F32 => 4,
             _ => 2,
         };
-        let (s, ctx, region, past_len) =
-            (self.packed_seq, self.context, self.region, self.past_len);
+        let (s, ctx, past_len) = (self.packed_seq, self.context, self.past_len);
         buf.clear();
         buf.resize(s * ctx * elem, 0);
         let blocked: [u8; 4] = {
@@ -344,27 +466,33 @@ impl PackedKv {
             }
             b
         };
+        let in_window = |q: usize, k: usize| window.is_none_or(|w| q >= k && q - k < w);
         for r in 0..s {
             let row_base = r * ctx * elem;
             let me = plan.rows.get(r).copied().flatten();
+            let my_pos = me.map(|pr| self.pos[pr.slot] + pr.order);
             for c in 0..ctx {
                 let allow = match me {
                     None => c == past_len + r, // idle: self only, keeps softmax finite
                     Some(pr) => {
+                        let q_pos = my_pos.unwrap_or(0);
                         if c < past_len {
-                            // shared prefix this slot is reusing ...
-                            if c < self.shared_use[pr.slot] {
-                                true
-                            } else {
-                                // ... plus its own occupied region
-                                let start = self.region_start(pr.slot);
-                                c >= start && c < start + self.valid(pr.slot)
+                            // the shared prefix this slot reuses, plus its own
+                            // occupied region
+                            match self.column_position(pr.slot, c) {
+                                Some(k) => window.is_none() || in_window(q_pos, k),
+                                None => false,
                             }
                         } else {
                             let q = c - past_len;
                             match plan.rows.get(q).copied().flatten() {
-                                Some(other) => other.slot == pr.slot && other.order <= pr.order,
-                                None => false,
+                                Some(other) if other.slot == pr.slot => {
+                                    let same_image = pr.image.is_some() && other.image == pr.image;
+                                    same_image
+                                        || (other.order <= pr.order
+                                            && in_window(q_pos, self.pos[pr.slot] + other.order))
+                                }
+                                _ => false,
                             }
                         }
                     }
@@ -376,6 +504,57 @@ impl PackedKv {
             }
         }
     }
+}
+
+/// Rows of the next prefill chunk starting at prompt index `idx`, at most
+/// `take`, never ending inside an image (`images`: one entry per prompt token,
+/// the image id or `None`). Err when an image starting at `idx` is wider than
+/// `take`. Empty `images` (a tree without image blocks) leaves `take` as is.
+pub fn image_safe_take(images: &[Option<u32>], idx: usize, take: usize) -> Result<usize, String> {
+    let end = idx + take;
+    if images.is_empty() || take == 0 || end >= images.len() {
+        return Ok(take);
+    }
+    let (last, next) = (images[end - 1], images[end]);
+    if last.is_none() || last != next {
+        return Ok(take);
+    }
+    let mut start = end - 1;
+    while start > idx && images[start - 1] == last {
+        start -= 1;
+    }
+    if start > idx {
+        return Ok(start - idx);
+    }
+    let run = images[idx..].iter().take_while(|&&t| t == last).count();
+    Err(format!(
+        "an image of {run} tokens does not fit one packed inference of {take} rows; \
+         rebuild the packed variant with a --packed-seq at least that wide"
+    ))
+}
+
+/// Image id per prompt token: each contiguous run of `image_token` gets the
+/// next id (0, 1, ...), text tokens `None`. The ids only need to tell one
+/// image from another inside one slot's chunk.
+pub fn prompt_image_ids(prompt_ids: &[i64], image_token: i64) -> Vec<Option<u32>> {
+    let mut next = 0u32;
+    let mut prev_image = false;
+    prompt_ids
+        .iter()
+        .map(|&t| {
+            let is_image = t == image_token;
+            let id = if is_image {
+                if !prev_image {
+                    next += 1;
+                }
+                Some(next - 1)
+            } else {
+                None
+            };
+            prev_image = is_image;
+            id
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -495,7 +674,7 @@ mod tests {
         let present = {
             // present is [heads=1][context=10][head_dim=2] f16; make row r's
             // bytes recognisable: value (r+1) repeated.
-            let mut p = vec![0u8; k.present_layer_bytes()];
+            let mut p = vec![0u8; k.present_layer_bytes(0)];
             for c in 0..k.context {
                 for e in 0..2 {
                     let off = (c * 2 + e) * 2;
@@ -529,7 +708,7 @@ mod tests {
         let mut k = kv(2, 8, 1); // region 4, sink 2, packed_seq 1
                                  // Snapshot geometry first: the closure must not hold a borrow of `k`
                                  // across the &mut self absorb calls below.
-        let (plb, ctx) = (k.present_layer_bytes(), k.context);
+        let (plb, ctx) = (k.present_layer_bytes(0), k.context);
         let mk = move |tag: u16| {
             let mut p = vec![0u8; plb];
             for c in 0..ctx {
@@ -563,7 +742,7 @@ mod tests {
     #[test]
     fn reset_slot_clears_only_that_slot() {
         let mut k = kv(2, 8, 1);
-        let mut p = vec![0u8; k.present_layer_bytes()];
+        let mut p = vec![0u8; k.present_layer_bytes(0)];
         p.iter_mut().for_each(|b| *b = 0xAB);
         k.absorb_row(0, false, &p, 0, 0, 0);
         k.absorb_row(0, false, &p, 0, 1, 0);
@@ -603,6 +782,7 @@ mod tests {
                     r.map(|p| PackedRow {
                         slot: p.slot,
                         order: 0,
+                        image: p.image,
                     })
                 })
                 .collect(),
@@ -679,7 +859,7 @@ mod tests {
             }
             p
         };
-        let (plb, ctx) = (k.present_layer_bytes(), k.context);
+        let (plb, ctx) = (k.present_layer_bytes(0), k.context);
         // slot 1 sentinel must survive
         k.absorb_row(0, false, &mk(999, plb, ctx), 0, 1, 0);
         let slot1 = k.key_bytes(0)[(4 + 4) * 4..(4 + 4) * 4 + 4].to_vec();
@@ -724,7 +904,7 @@ mod tests {
     /// Feed `n` single-row tokens into `slot`, tagging each one's K/V with its
     /// own byte so the surviving entries are identifiable afterwards.
     fn feed_tokens(k: &mut PackedKv, slot: usize, n: u8) {
-        let slot_bytes = k.head_dim * k.elem_bytes;
+        let slot_bytes = k.head_dim(0) * k.elem_bytes;
         for t in 1..=n {
             let mut present = vec![0u8; k.context * slot_bytes];
             let src = k.past_len * slot_bytes; // query row 0
@@ -736,7 +916,7 @@ mod tests {
     }
 
     fn region_bytes(k: &PackedKv, slot: usize) -> Vec<u8> {
-        let slot_bytes = k.head_dim * k.elem_bytes;
+        let slot_bytes = k.head_dim(0) * k.elem_bytes;
         let start = k.region_start(slot) * slot_bytes;
         (0..k.region)
             .map(|i| k.key_buf[0][start + i * slot_bytes])
@@ -780,5 +960,278 @@ mod tests {
         assert_eq!((k.region, k.sink), (4, 2));
         feed_tokens(&mut k, 0, 9);
         assert_eq!(region_bytes(&k, 0), vec![1, 2, 8, 9]);
+    }
+
+    // ---- Gemma 4: sliding window, image blocks, mixed KV geometry ----
+
+    fn allowed_cols(buf: &[u8], ctx: usize, r: usize) -> Vec<usize> {
+        (0..ctx).filter(|&c| mask_allows(buf, ctx, r, c)).collect()
+    }
+
+    /// Without a window the windowed writer is the plain mask, byte for byte.
+    #[test]
+    fn no_window_is_the_plain_mask() {
+        let mut k = kv(2, 8, 4);
+        k.advance(0, 3);
+        k.advance(1, 2);
+        let plan = PackedPlan::chunk(4, 1, 3);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        k.fill_mask(&plan, &mut a, ShimDType::F16);
+        k.fill_mask_window(&plan, &mut b, ShimDType::F16, None);
+        assert_eq!(a, b);
+    }
+
+    /// A decode row sees only the last `window` positions, itself included.
+    #[test]
+    fn sliding_window_blocks_columns_window_or_more_behind() {
+        let mut k = kv(2, 20, 2); // region 10
+        k.advance(0, 6); // positions 0..5 in cols 0..5; next row is position 6
+        let plan = PackedPlan::decode(2, &[0]);
+        let mut full = Vec::new();
+        k.fill_mask(&plan, &mut full, ShimDType::F16);
+        assert_eq!(
+            allowed_cols(&full, k.context, 0),
+            vec![0, 1, 2, 3, 4, 5, 20]
+        );
+        let mut sw = Vec::new();
+        k.fill_mask_window(&plan, &mut sw, ShimDType::F16, Some(3));
+        // 6 - k < 3 -> positions 4, 5 (cols 4, 5) and itself.
+        assert_eq!(allowed_cols(&sw, k.context, 0), vec![4, 5, 20]);
+    }
+
+    /// Within a prefill chunk the window applies between query rows too.
+    #[test]
+    fn sliding_window_applies_inside_a_chunk() {
+        let mut k = kv(2, 8, 4); // region 4
+        k.advance(1, 1); // slot 1: one past token at position 0 (col 4)
+        let plan = PackedPlan::chunk(4, 1, 4); // positions 1..4
+        let mut sw = Vec::new();
+        k.fill_mask_window(&plan, &mut sw, ShimDType::F16, Some(2));
+        let ctx = k.context;
+        assert_eq!(allowed_cols(&sw, ctx, 0), vec![4, 8]); // pos 1 sees 0 and 1
+        assert_eq!(allowed_cols(&sw, ctx, 1), vec![8, 9]); // pos 2 sees 1, 2
+        assert_eq!(allowed_cols(&sw, ctx, 3), vec![10, 11]); // pos 4 sees 3, 4
+    }
+
+    /// Once a region has slid, its columns are no longer in position order:
+    /// the pinned sink columns keep the slot's first tokens and the rest hold
+    /// the most recent ones. The window must judge each by its real position.
+    #[test]
+    fn sliding_window_accounts_for_the_slide_and_the_sinks() {
+        let mut k = kv(2, 20, 2); // region 10, sink 4
+        feed_tokens(&mut k, 0, 16); // cols hold positions [0,1,2,3, 10..=15]
+        assert_eq!(k.position(0), 16);
+        let plan = PackedPlan::decode(2, &[0]);
+        let mut full = Vec::new();
+        k.fill_mask(&plan, &mut full, ShimDType::F16);
+        assert_eq!(
+            allowed_cols(&full, k.context, 0),
+            (0..10).chain([20]).collect::<Vec<_>>()
+        );
+        let mut sw = Vec::new();
+        k.fill_mask_window(&plan, &mut sw, ShimDType::F16, Some(5));
+        // 16 - k < 5 -> positions 12..=15 = cols 6..=9; the sinks (0..=3) are
+        // far behind and blocked, though they never slide out.
+        assert_eq!(allowed_cols(&sw, k.context, 0), vec![6, 7, 8, 9, 20]);
+        // A window wider than everything opens exactly what the full mask does.
+        let mut wide = Vec::new();
+        k.fill_mask_window(&plan, &mut wide, ShimDType::F16, Some(100));
+        assert_eq!(wide, full);
+    }
+
+    /// Shared-prefix columns sit at positions 0.. and are windowed as such.
+    #[test]
+    fn sliding_window_covers_the_shared_prefix() {
+        let mut k = kv_prefix(2, 12, 2, 4); // prefix 4, region 4
+        k.prefix_valid = 4;
+        k.reset_slot_reusing(0, 4); // positions 0..3 in the prefix
+        k.advance(0, 2); // own positions 4, 5 in cols 4, 5; next is 6
+        let plan = PackedPlan::decode(2, &[0]);
+        let mut sw = Vec::new();
+        k.fill_mask_window(&plan, &mut sw, ShimDType::F16, Some(4));
+        // 6 - k < 4 -> positions 3..=5: prefix col 3, own cols 4, 5, itself.
+        assert_eq!(allowed_cols(&sw, k.context, 0), vec![3, 4, 5, 12]);
+    }
+
+    fn image_plan(packed_seq: usize, slot: usize, images: &[Option<u32>]) -> PackedPlan {
+        PackedPlan::chunk_with_images(packed_seq, slot, images)
+    }
+
+    /// Rows of one image see each other both ways; text keeps causal order,
+    /// and text before an image never sees it.
+    #[test]
+    fn image_rows_attend_to_each_other_both_ways() {
+        let k = kv(2, 8, 6); // region 4, nothing in the past
+        let imgs = [None, Some(0), Some(0), Some(0), None];
+        let plan = image_plan(6, 0, &imgs);
+        for window in [None, Some(1024)] {
+            let mut buf = Vec::new();
+            k.fill_mask_window(&plan, &mut buf, ShimDType::F16, window);
+            let q = |r: usize| -> Vec<usize> {
+                allowed_cols(&buf, k.context, r)
+                    .iter()
+                    .map(|c| c - 8)
+                    .collect()
+            };
+            assert_eq!(q(0), vec![0], "text before the image ({window:?})");
+            for r in 1..4 {
+                assert_eq!(q(r), vec![0, 1, 2, 3], "image row {r} ({window:?})");
+            }
+            assert_eq!(q(4), vec![0, 1, 2, 3, 4], "text after the image");
+            assert_eq!(q(5), vec![5], "idle row: itself only");
+        }
+    }
+
+    /// Two images in one chunk stay separate blocks.
+    #[test]
+    fn different_images_do_not_see_each_other_ahead() {
+        let k = kv(2, 8, 4);
+        let plan = image_plan(4, 0, &[Some(0), Some(0), Some(1), Some(1)]);
+        let mut buf = Vec::new();
+        k.fill_mask(&plan, &mut buf, ShimDType::F16);
+        let q = |r: usize| -> Vec<usize> {
+            allowed_cols(&buf, k.context, r)
+                .iter()
+                .map(|c| c - 8)
+                .collect()
+        };
+        assert_eq!(q(0), vec![0, 1]);
+        assert_eq!(q(1), vec![0, 1]);
+        assert_eq!(
+            q(2),
+            vec![0, 1, 2, 3],
+            "causal to image 0, block to image 1"
+        );
+        assert_eq!(q(3), vec![0, 1, 2, 3]);
+    }
+
+    /// Image blocks never cross slots, even when both slots' rows carry the
+    /// same image id (ids are per prompt).
+    #[test]
+    fn image_blocks_stay_inside_their_slot() {
+        let mut k = kv(2, 8, 4);
+        k.advance(0, 2);
+        k.advance(1, 3);
+        let row = |slot, order| {
+            Some(PackedRow {
+                slot,
+                order,
+                image: Some(0),
+            })
+        };
+        let plan = PackedPlan {
+            rows: vec![row(0, 0), row(0, 1), row(1, 0), row(1, 1)],
+        };
+        for window in [None, Some(3)] {
+            let mut buf = Vec::new();
+            k.fill_mask_window(&plan, &mut buf, ShimDType::F16, window);
+            for r in 0..4 {
+                let slot = r / 2;
+                for c in allowed_cols(&buf, k.context, r) {
+                    let owner = if c < 8 { c / 4 } else { (c - 8) / 2 };
+                    assert_eq!(owner, slot, "row {r} opened col {c} of slot {owner}");
+                }
+            }
+        }
+    }
+
+    /// Mixed geometry: each layer's ring has its own heads and width, and
+    /// absorb / reset / populate keep every layer inside its own layout.
+    #[test]
+    fn mixed_geometry_absorbs_each_layer_by_its_own_shape() {
+        // layer 0: 1 head x 2; layer 1: 2 heads x 4 (f16)
+        let mut k = PackedKv::with_layers(2, 8, 2, vec![(1, 2), (2, 4)], ShimDType::F16, 0);
+        assert_eq!(k.key_bytes(0).len(), 8 * 2 * 2);
+        assert_eq!(k.key_bytes(1).len(), 2 * 8 * 4 * 2);
+        assert_eq!(k.present_layer_bytes(0), 10 * 2 * 2);
+        assert_eq!(k.present_layer_bytes(1), 2 * 10 * 4 * 2);
+        assert_eq!(k.geometry(), &[(1, 2), (2, 4)]);
+        // present for layer 1: [heads 2][ctx 10][hd 4]; tag each (head, col).
+        let mut p1 = vec![0u8; k.present_layer_bytes(1)];
+        for h in 0..2 {
+            for c in 0..10 {
+                for e in 0..4 {
+                    let off = ((h * 10 + c) * 4 + e) * 2;
+                    let tag = (h * 100 + c) as u16;
+                    p1[off..off + 2].copy_from_slice(&tag.to_le_bytes());
+                }
+            }
+        }
+        let p0 = vec![0x11u8; k.present_layer_bytes(0)];
+        k.absorb_row(0, false, &p0, 1, 1, 0);
+        k.absorb_row(1, false, &p1, 1, 1, 0); // row 1 -> slot 1 (cols 4..8) @0
+        let rd = |buf: &[u8], h: usize, col: usize| {
+            let off = (h * 8 + col) * 4 * 2;
+            u16::from_le_bytes([buf[off], buf[off + 1]])
+        };
+        // present row 1 sits at present column past_len + 1 = 9.
+        assert_eq!(rd(k.key_bytes(1), 0, 4), 9);
+        assert_eq!(
+            rd(k.key_bytes(1), 1, 4),
+            109,
+            "head 1 lands in head 1's row"
+        );
+        assert!(
+            k.key_bytes(1)[..4 * 4 * 2].iter().all(|&b| b == 0),
+            "slot 0 untouched"
+        );
+        assert_eq!(k.key_bytes(0)[4 * 2 * 2], 0x11, "layer 0 by its own width");
+        k.advance(1, 1);
+        k.reset_slot(1);
+        assert!(k.key_bytes(0).iter().all(|&b| b == 0));
+        assert!(k.key_bytes(1).iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn mixed_geometry_populates_the_prefix_per_layer() {
+        let mut k = PackedKv::with_layers(2, 12, 1, vec![(1, 2), (2, 4)], ShimDType::F16, 4);
+        let mut p1 = vec![0u8; k.present_layer_bytes(1)];
+        let col = k.past_len; // query row 0
+        for h in 0..2 {
+            let off = (h * k.context + col) * 4 * 2;
+            p1[off..off + 8].fill(0x40 + h as u8);
+        }
+        k.absorb_row(1, false, &p1, 0, 0, 0);
+        k.advance(0, 1);
+        k.populate_prefix_from(0, 1);
+        assert_eq!(k.prefix_valid, 1);
+        // prefix col 0 of each head holds that head's row
+        assert_eq!(k.key_bytes(1)[0], 0x40);
+        assert_eq!(k.key_bytes(1)[12 * 4 * 2], 0x41);
+    }
+
+    #[test]
+    fn image_ids_number_each_run() {
+        let ids = [5, 9, 9, 9, 6, 7, 9, 9, 8];
+        assert_eq!(
+            prompt_image_ids(&ids, 9),
+            vec![
+                None,
+                Some(0),
+                Some(0),
+                Some(0),
+                None,
+                None,
+                Some(1),
+                Some(1),
+                None
+            ]
+        );
+        assert!(prompt_image_ids(&[1, 2], 9).iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn packed_chunks_never_split_an_image() {
+        let imgs = prompt_image_ids(&[1, 9, 9, 9, 2, 3], 9);
+        assert_eq!(image_safe_take(&imgs, 0, 3), Ok(1)); // would split 1..4
+        assert_eq!(image_safe_take(&imgs, 0, 4), Ok(4)); // ends after it
+        assert_eq!(image_safe_take(&imgs, 1, 3), Ok(3)); // exactly the image
+        assert!(image_safe_take(&imgs, 1, 2).is_err()); // wider than the chunk
+        assert_eq!(image_safe_take(&imgs, 4, 2), Ok(2));
+        assert_eq!(image_safe_take(&[], 0, 4), Ok(4)); // no image blocks
+                                                       // two adjacent images (different ids) may be cut between them
+        let two = [Some(0), Some(0), Some(1), Some(1)];
+        assert_eq!(image_safe_take(&two, 0, 2), Ok(2));
+        assert_eq!(image_safe_take(&two, 0, 3), Ok(2));
     }
 }
