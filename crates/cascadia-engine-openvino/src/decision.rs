@@ -219,8 +219,14 @@ pub fn span_mask_le(spans: &[[u32; 2]], t: usize) -> Vec<u8> {
     m
 }
 
-fn lm_head_mean(path: &Path, hidden: usize, vocab: usize, ids: &[u32]) -> Result<Vec<f32>, String> {
-    let mut f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+/// Mean of the lm_head rows of `ids` (one option's span), read from the f16 `[vocab, hidden]`
+/// table in `f`, which the caller opens once per pass.
+fn lm_head_mean<F: Read + Seek>(
+    f: &mut F,
+    hidden: usize,
+    vocab: usize,
+    ids: &[u32],
+) -> Result<Vec<f32>, String> {
     let mut acc = vec![0f32; hidden];
     let mut buf = vec![0u8; hidden * 2];
     for &id in ids {
@@ -311,11 +317,13 @@ pub fn run_head(
             let mut spans: Vec<[u32; 2]> = questions.iter().map(|q| q.span).collect();
             let mut lexical = Vec::new();
             let mut option_q = Vec::new();
+            let mut lm = std::fs::File::open(&*lm_head)
+                .map_err(|e| format!("{}: {e}", lm_head.display()))?;
             for (qi, q) in questions.iter().enumerate() {
                 for o in &q.options {
                     spans.push(o.span);
                     lexical.extend(lm_head_mean(
-                        lm_head,
+                        &mut lm,
                         *hidden,
                         *vocab,
                         &prompt_ids[o.span[0] as usize..o.span[1] as usize],
@@ -376,12 +384,22 @@ pub fn run_head(
 /// Ceiling for a FRAME_DECIDE / FRAME_DECISION body. A 73,728-token Kev readout is ~600 KB of JSON.
 pub const MAX_DECISION_BODY_BYTES: usize = 16 << 20;
 
-fn framed(json: Vec<u8>) -> Vec<u8> {
+/// u32 BE length + `json`, refused above [`MAX_DECISION_BODY_BYTES`] (the receiver would refuse
+/// it anyway, after reading it all).
+fn framed(json: Vec<u8>) -> Result<Vec<u8>, String> {
+    if json.len() > MAX_DECISION_BODY_BYTES {
+        return Err(format!(
+            "decision body {} bytes exceeds {MAX_DECISION_BODY_BYTES}",
+            json.len()
+        ));
+    }
     let mut b = (json.len() as u32).to_be_bytes().to_vec();
     b.extend(json);
-    b
+    Ok(b)
 }
 
+/// The JSON of a framed body. Bytes after the stated length are ignored: the receivers read
+/// exactly that many (`recv_decision_body`), so none ever follow.
 fn unframe(b: &[u8]) -> Result<&[u8], String> {
     let n =
         u32::from_be_bytes(b.get(..4).ok_or("short decision body")?.try_into().unwrap()) as usize;
@@ -395,8 +413,9 @@ fn unframe(b: &[u8]) -> Result<&[u8], String> {
 }
 
 /// FRAME_DECIDE body: u32 BE length + JSON(DecisionReadout). The receiver still runs
-/// `DecisionReadout::validate` before using it.
-pub fn encode_readout(r: &DecisionReadout) -> Vec<u8> {
+/// `DecisionReadout::validate` before using it. `Err` above [`MAX_DECISION_BODY_BYTES`]
+/// (unreachable for a validated readout: ~1 MB at the largest prompt).
+pub fn encode_readout(r: &DecisionReadout) -> Result<Vec<u8>, String> {
     framed(serde_json::to_vec(r).expect("readout serializes"))
 }
 
@@ -412,13 +431,17 @@ enum Outcome {
 }
 
 /// FRAME_DECISION body: u32 BE length + JSON `{"ok":[logits]}` or `{"err":"why"}`; the last rank
-/// reports a head failure instead of hanging rank 0.
+/// reports a head failure instead of hanging rank 0. A result over [`MAX_DECISION_BODY_BYTES`]
+/// is sent as that error instead.
 pub fn encode_result(r: &Result<Vec<f32>, String>) -> Vec<u8> {
     let o = match r {
         Ok(v) => Outcome::Ok(v.clone()),
         Err(e) => Outcome::Err(e.clone()),
     };
-    framed(serde_json::to_vec(&o).expect("outcome serializes"))
+    framed(serde_json::to_vec(&o).expect("outcome serializes")).unwrap_or_else(|why| {
+        let o = Outcome::Err(format!("decision result: {why}"));
+        framed(serde_json::to_vec(&o).expect("outcome serializes")).expect("short error")
+    })
 }
 
 pub fn decode_result(b: &[u8]) -> Result<Result<Vec<f32>, String>, String> {
@@ -530,6 +553,121 @@ mod tests {
     }
 
     #[test]
+    fn frame_bodies_are_capped_on_encode() {
+        // H20: the sender refuses what the receiver would refuse.
+        assert!(framed(vec![b'1'; MAX_DECISION_BODY_BYTES]).is_ok());
+        let e = framed(vec![b'1'; MAX_DECISION_BODY_BYTES + 1]).unwrap_err();
+        assert!(e.contains("exceeds"), "{e}");
+        let huge = Err("x".repeat(MAX_DECISION_BODY_BYTES));
+        match decode_result(&encode_result(&huge)).unwrap() {
+            Err(why) => assert!(why.starts_with("decision result: decision body"), "{why}"),
+            Ok(v) => panic!("{v:?}"),
+        }
+    }
+
+    fn head_dir(head_json: &str, files: &[(&str, usize)]) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "dec-head-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(d.join("decision")).unwrap();
+        std::fs::write(d.join("decision/head.json"), head_json).unwrap();
+        for (name, floats) in files {
+            let b: Vec<u8> = (0..*floats)
+                .flat_map(|i| (i as f32).to_le_bytes())
+                .collect();
+            std::fs::write(d.join("decision").join(name), b).unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn head_assets_load_verbalizer_and_pointer() {
+        // H22: hidden 3, dp 2.
+        let d = head_dir(r#"{"kind":"verbalizer"}"#, &[]);
+        let a = HeadAssets::load(&d, 3).unwrap();
+        assert_eq!(a.kind(), "verbalizer");
+        assert!(!a.reads_hidden());
+        std::fs::remove_dir_all(&d).unwrap();
+        let ok = [
+            ("pointer_q_w.f32", 6),
+            ("pointer_q_b.f32", 2),
+            ("pointer_k_w.f32", 6),
+            ("pointer_k_b.f32", 2),
+        ];
+        let d = head_dir(r#"{"kind":"pointer","dp":2}"#, &ok);
+        match HeadAssets::load(&d, 3).unwrap() {
+            HeadAssets::Pointer {
+                dp,
+                hidden,
+                q_w,
+                k_b,
+                ..
+            } => {
+                assert_eq!((dp, hidden), (2, 3));
+                assert_eq!(q_w, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+                assert_eq!(k_b, vec![0.0, 1.0]);
+            }
+            other => panic!("{}", other.kind()),
+        }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn head_assets_load_refuses_bad_files() {
+        // H22: a .f32 of the wrong size, a pointer without dp, an unknown kind, no head.json.
+        let short = [
+            ("pointer_q_w.f32", 6),
+            ("pointer_q_b.f32", 2),
+            ("pointer_k_w.f32", 5),
+            ("pointer_k_b.f32", 2),
+        ];
+        let d = head_dir(r#"{"kind":"pointer","dp":2}"#, &short);
+        let e = HeadAssets::load(&d, 3).err().unwrap();
+        assert!(
+            e.contains("pointer_k_w.f32") && e.contains("20 bytes, expected 24"),
+            "{e}"
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+        for (meta, want) in [
+            (r#"{"kind":"pointer"}"#, "pointer head.json lacks dp"),
+            (r#"{"kind":"ranker"}"#, "unknown kind"),
+            (r#"{"kind":"joint"}"#, "joint head.json lacks vocab"),
+        ] {
+            let d = head_dir(meta, &[]);
+            let e = HeadAssets::load(&d, 3).err().unwrap();
+            assert!(e.contains(want), "{meta}: {e}");
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+        let d = head_dir("{}", &[]);
+        std::fs::remove_file(d.join("decision/head.json")).unwrap();
+        let e = HeadAssets::load(&d, 3).err().unwrap();
+        assert!(e.starts_with("decision/head.json"), "{e}");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn lm_head_mean_averages_rows_and_refuses_ids_past_vocab() {
+        // H22: vocab 3, hidden 2, f16 rows [1,2], [3,4], [5,6].
+        let table: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+            .iter()
+            .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+            .collect();
+        let mut f = std::io::Cursor::new(table);
+        assert_eq!(lm_head_mean(&mut f, 2, 3, &[0, 2]).unwrap(), vec![3.0, 4.0]);
+        // The same handle serves the next option (the pass opens the file once, H19).
+        assert_eq!(lm_head_mean(&mut f, 2, 3, &[1]).unwrap(), vec![3.0, 4.0]);
+        assert_eq!(
+            lm_head_mean(&mut f, 2, 3, &[1, 3]).unwrap_err(),
+            "lexical id 3 >= vocab 3"
+        );
+    }
+
+    #[test]
     fn frame_bodies_round_trip() {
         let r = cascadia_types::DecisionReadout {
             prompt_ids: vec![1, 2],
@@ -541,7 +679,7 @@ mod tests {
             require_warm: false,
             needs_snapshot: false,
         };
-        assert_eq!(decode_readout(&encode_readout(&r)).unwrap(), r);
+        assert_eq!(decode_readout(&encode_readout(&r).unwrap()).unwrap(), r);
         assert_eq!(
             decode_result(&encode_result(&Ok(vec![1.5, -2.0]))).unwrap(),
             Ok(vec![1.5, -2.0])
