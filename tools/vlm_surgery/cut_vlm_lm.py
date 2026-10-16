@@ -27,6 +27,11 @@ Families (the `vision.family` rank 0 serves):
   mistral3  Mistral3ForConditionalGeneration (e.g. Ministral-3, exported with
             optimum-intel): the Pixtral encoder plus a 2x2 patch merger in
             openvino_multi_modal_projector_model.xml, which rank 0 runs.
+  llava_next LLaVA-NeXT / llava-v1.6 (e.g. OpenVINO/llava-v1.6-mistral-7b-hf-int4-ov):
+            CLIP tower whose IR already ends in the projector, anyres tiles;
+            rank 0 packs the tiles and inserts `image_newline`, which the
+            export keeps in config.json (copied to config.vlm.json).
+            Causal attention.
 
 Usage:
   python cut_vlm_lm.py --model <OV VLM dir> --output-dir <tree> --num-stages N \
@@ -62,6 +67,13 @@ FAMILIES = {
     "mistral3": {
         "model_types": ("mistral3",),
         "vision_types": ("pixtral",),
+        "token_type_ids": False,
+    },
+    # LLaVA-NeXT: one IR (CLIP tower + projector); image_newline lives in
+    # config.json, and rank 0 does the tiling and packing.
+    "llava_next": {
+        "model_types": ("llava_next",),
+        "vision_types": ("clip_vision_model",),
         "token_type_ids": False,
     },
 }
@@ -120,6 +132,21 @@ def check_family(cfg: dict, family: str) -> None:
         raise SystemExit("cross-layer KV sharing cannot be cut by this tool")
 
 
+def check_llava_next(cfg: dict, hidden: int) -> None:
+    """What rank 0's LLaVA-NeXT front end needs from config.json."""
+    nl = cfg.get("image_newline")
+    if not isinstance(nl, list) or len(nl) != hidden:
+        raise SystemExit(
+            f"config.json has no {hidden}-wide image_newline (optimum-intel writes it there); "
+            "re-export the model with optimum-intel")
+    strategy = cfg.get("vision_feature_select_strategy", "default")
+    if strategy != "default":
+        raise SystemExit(f"vision_feature_select_strategy {strategy!r} is not supported "
+                         "(rank 0 expects the CLS row dropped)")
+    if cfg.get("image_token_index") is None:
+        raise SystemExit("config.json lacks image_token_index")
+
+
 def run(model_dir: str, out_dir: str, num_stages: int, family: str,
         suffix: str, only_stage: int | None, all_logits: bool = False) -> None:
     with open(os.path.join(model_dir, "config.json")) as f:
@@ -136,9 +163,15 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
         # the projector on the merged rows; without them the tree would serve
         # as plain Pixtral and fail only at image time.
         required += ["openvino_multi_modal_projector_model.xml", "processor_config.json"]
+    if family == "llava_next":
+        # Rank 0 tiles from the image processor's pinpoints and closes each
+        # packed row with image_newline.
+        required += ["preprocessor_config.json"]
     for fn in required:
         if not os.path.exists(os.path.join(model_dir, fn)):
             raise SystemExit(f"{model_dir} lacks {fn}; not an OpenVINO {family} VLM export")
+    if family == "llava_next":
+        check_llava_next(cfg, hidden)
 
     if num_stages > num_layers:
         raise SystemExit(f"--num-stages {num_stages} exceeds the {num_layers} decoder layers")
