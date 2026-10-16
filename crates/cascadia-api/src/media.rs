@@ -1,4 +1,5 @@
-//! Image input for `/v1/chat/completions`: OpenAI `image_url` content parts.
+//! Image input for `/v1/chat/completions`: OpenAI `image_url` content parts
+//! (and `/v1/responses`, whose `input_image` parts become them).
 //!
 //! Every image is decoded, bounded and hashed here, once, so engines only see
 //! RGB pixels ([`MediaInput`]). `data:` URLs are always accepted. Remote

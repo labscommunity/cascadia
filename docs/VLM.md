@@ -25,6 +25,28 @@ in [rfcs/vlm-support.md](rfcs/vlm-support.md). Video and audio are not supported
   (`context_length_exceeded`). Text that spells a model's own image tag (for example
   `<|image|>` or `[IMG]`) is refused with `400`.
 
+### The Responses API
+
+`POST /v1/responses` takes the same images as `input_image` parts and serves them through
+the chat path, so every limit and error above applies unchanged:
+
+```json
+{"model": "m", "instructions": "Answer in one line.", "input": [{"role": "user", "content": [
+  {"type": "input_text", "text": "What is in this picture?"},
+  {"type": "input_image", "image_url": "data:image/png;base64,...", "detail": "auto"}
+]}]}
+```
+
+`input` may also be a plain string; `instructions` becomes a system message;
+`max_output_tokens`, `temperature`, `top_p` and `reasoning.effort` map onto their chat
+counterparts, and `stream: true` sends OpenAI's event sequence (`response.created` through
+`response.completed`, or `response.incomplete` at the token cap). Cascadia keeps no state
+and serves no tools here: `store: true`, `previous_response_id`, `conversation`,
+`background`, `tools`, `include`, `prompt`, `stop`, structured `text.format`,
+`reasoning.summary`, `truncation: "auto"`, `file_id` images, `input_file` and
+`input_audio` parts and non-message input items are refused with a `400` whose `param`
+names the field.
+
 ## What takes images
 
 | Model | Engine | Placement | How to get the model dir |
