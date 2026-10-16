@@ -56,6 +56,12 @@ const MAX_CARRY_BLOB_BYTES: usize = 256 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameKind {
     Forward = 1,
+    /// FORWARD whose LOGITS_RESPONSE carries the last position's row only
+    /// (`[1, 1, vocab]`): a prompt prefill chunk, where the driver samples
+    /// from that row alone. Same body as FORWARD. A distinct kind rather than
+    /// a flag in the body, so a worker built before it fails loudly ("bad
+    /// kind 10") instead of answering every row.
+    ForwardLastRow = 10,
     Reset = 3,
     LogitsResponse = 4,
     // Issue-34 §8 multi-stage KV coordination (append-only; `kv_coord`-gated). CAPTURE snapshots a
@@ -83,6 +89,7 @@ impl FrameKind {
     fn from_u32(v: u32) -> Option<Self> {
         match v {
             1 => Some(Self::Forward),
+            10 => Some(Self::ForwardLastRow),
             3 => Some(Self::Reset),
             4 => Some(Self::LogitsResponse),
             #[cfg(feature = "kv_coord")]
@@ -302,14 +309,13 @@ fn splice_prompt_rows(
     hidden: usize,
     ids: &[i64],
     image_token: i64,
-    images: &[Vec<f32>],
+    images: &[&[f32]],
 ) -> Result<usize, String> {
     if images.is_empty() {
         return Ok(0);
     }
-    let refs: Vec<&[f32]> = images.iter().map(Vec::as_slice).collect();
-    crate::gemma4_vision::splice_images(embeds, hidden, ids, image_token, &refs)?;
-    Ok(images.iter().map(Vec::len).sum::<usize>() / hidden.max(1))
+    crate::gemma4_vision::splice_images(embeds, hidden, ids, image_token, images)?;
+    Ok(images.iter().map(|im| im.len()).sum::<usize>() / hidden.max(1))
 }
 
 /// The `vocab_size` in `dir/config.json` (top level or `text_config`).
@@ -1073,17 +1079,80 @@ impl DistributedMaskedReq {
         result.map_err(|e| EngineError::Backend(e.to_string()))
     }
 
+    /// Feed `input_ids` and return the target's logits for every one of them
+    /// (a verify span).
     pub fn feed(&mut self, input_ids: &[i64]) -> Result<(Vec<f32>, [usize; 3]), EngineError> {
-        self.feed_prompt(input_ids, &[])
+        self.feed_span(input_ids, &[], FrameKind::Forward)
     }
 
-    /// [`Self::feed`] with each image's encoder rows spliced over the image
-    /// soft tokens of `input_ids` (a VLM tree's prompt; `images` is empty for
-    /// every other span, so image rows never reach a speculative span).
+    /// Prefill a prompt in [`PREFILL_CHUNK`]-row chunks, each answered with
+    /// its last row's logits only; returns the final chunk's `[1, 1, vocab]`.
+    /// On a VLM tree each image's encoder rows are spliced over the image soft
+    /// tokens of the chunk that holds them (`images` is empty for every other
+    /// span, so image rows never reach a speculative span).
     pub(crate) fn feed_prompt(
         &mut self,
         input_ids: &[i64],
         images: &[Vec<f32>],
+    ) -> Result<(Vec<f32>, [usize; 3]), EngineError> {
+        if input_ids.is_empty() {
+            return self.feed_span(input_ids, &[], FrameKind::ForwardLastRow);
+        }
+        let image = match (&self.vision, images.is_empty()) {
+            (_, true) => None,
+            (Some(v), false) => Some(v.frontend.image_token()),
+            (None, false) => {
+                return Err(EngineError::Backend(
+                    "image rows for a target whose stage 0 takes input_ids".into(),
+                ))
+            }
+        };
+        // Values per image row: the images' values over the prompt's image tokens.
+        let hidden = match image {
+            Some(t) => {
+                let tokens = input_ids.iter().filter(|&&x| x == t).count();
+                let values: usize = images.iter().map(Vec::len).sum();
+                if tokens == 0 || !values.is_multiple_of(tokens) {
+                    return Err(EngineError::Backend(format!(
+                        "{tokens} image tokens in the prompt for {values} image values"
+                    )));
+                }
+                values / tokens
+            }
+            None => 0,
+        };
+        let (mut before, mut spliced, mut last) = (0usize, 0usize, None);
+        for chunk in input_ids.chunks(PREFILL_CHUNK) {
+            let in_chunk = image.map_or(0, |t| chunk.iter().filter(|&&x| x == t).count());
+            let rows = if in_chunk > 0 {
+                image_rows_span(images, hidden, before, in_chunk).map_err(EngineError::Backend)?
+            } else {
+                Vec::new()
+            };
+            before += in_chunk;
+            spliced += in_chunk;
+            last = Some(self.feed_span(chunk, &rows, FrameKind::ForwardLastRow)?);
+        }
+        if spliced > 0 {
+            info!(
+                images = images.len(),
+                rows = spliced,
+                prompt = input_ids.len(),
+                chunks = input_ids.len().div_ceil(PREFILL_CHUNK),
+                "ov-dist-spec: image rows spliced into the target's stage 0 prefill"
+            );
+        }
+        Ok(last.expect("a non-empty prompt has a chunk"))
+    }
+
+    /// One stage-0 inference + FORWARD round trip for `input_ids`, with
+    /// `images` (rows of this span's image tokens, in order) spliced in. `kind`
+    /// picks every row's logits (`Forward`) or the last row's (`ForwardLastRow`).
+    fn feed_span(
+        &mut self,
+        input_ids: &[i64],
+        images: &[&[f32]],
+        kind: FrameKind,
     ) -> Result<(Vec<f32>, [usize; 3]), EngineError> {
         let n = input_ids.len();
         let total = self.cache_len + n;
@@ -1162,7 +1231,7 @@ impl DistributedMaskedReq {
             // attention_mask + hidden via send_tensor).
             let _ts_send = std::time::Instant::now();
             let mut header = [0u8; 8];
-            header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
+            header[0..4].copy_from_slice(&(kind as u32).to_be_bytes());
             header[4..8].copy_from_slice(&logical_pos_start.to_be_bytes());
             g.send_raw(&header).await?;
             let attn_tensor = WireTensor::new(
@@ -1278,7 +1347,7 @@ impl DistributedMaskedReq {
 
     /// Set stage 0's token input for `ids`: the ids on a v5 tree; on a VLM
     /// tree, their text-embedding rows with `images` spliced in.
-    fn set_stage0_tokens(&mut self, ids: &[i64], images: &[Vec<f32>]) -> Result<(), EngineError> {
+    fn set_stage0_tokens(&mut self, ids: &[i64], images: &[&[f32]]) -> Result<(), EngineError> {
         let Some(vision) = self.vision.as_mut() else {
             if !images.is_empty() {
                 return Err(EngineError::Backend(
@@ -1293,16 +1362,7 @@ impl DistributedMaskedReq {
         };
         let (mut rows, hidden) = vision.embed(ids)?;
         let image = vision.frontend.image_token();
-        let spliced = splice_prompt_rows(&mut rows, hidden, ids, image, images)
-            .map_err(EngineError::Backend)?;
-        if spliced > 0 {
-            info!(
-                images = images.len(),
-                rows = spliced,
-                span = ids.len(),
-                "ov-dist-spec: image rows spliced into the target's stage 0 prefill"
-            );
-        }
+        splice_prompt_rows(&mut rows, hidden, ids, image, images).map_err(EngineError::Backend)?;
         let bytes: Vec<u8> = rows.iter().flat_map(|x| x.to_le_bytes()).collect();
         let in_embeds = self.stage0_inputs.get("inputs_embeds").unwrap();
         self.stage0
@@ -1324,6 +1384,97 @@ fn check_verify_rows(logits_len: usize, vocab: usize, span: usize) -> Result<(),
         )));
     }
     Ok(())
+}
+
+/// Rows a prompt prefill feeds per inference. Bounds every rank's per-chunk
+/// activations and the last stage's logits (`PREFILL_CHUNK x vocab`) whatever
+/// the prompt length: an image turn expands to thousands of tokens.
+pub(crate) const PREFILL_CHUNK: usize = 512;
+
+/// The rows `[start, start + n)` of the images' rows taken end to end
+/// (`hidden` values per row), as slices of the images that hold them: the
+/// image rows of one prefill chunk.
+fn image_rows_span(
+    images: &[Vec<f32>],
+    hidden: usize,
+    start: usize,
+    n: usize,
+) -> Result<Vec<&[f32]>, String> {
+    let mut out = Vec::new();
+    let (mut skip, mut want) = (start, n);
+    for im in images {
+        let rows = im.len() / hidden.max(1);
+        if skip >= rows {
+            skip -= rows;
+            continue;
+        }
+        let take = want.min(rows - skip);
+        if take > 0 {
+            out.push(&im[skip * hidden..(skip + take) * hidden]);
+        }
+        want -= take;
+        skip = 0;
+        if want == 0 {
+            break;
+        }
+    }
+    if want > 0 {
+        return Err(format!(
+            "image rows {start}..{} requested, but the images carry fewer",
+            start + n
+        ));
+    }
+    Ok(out)
+}
+
+/// A last stage's output cut to its final position: `[1, T, V]` (or
+/// `[T, V]`) logits of `elem`-byte values become `[1, 1, V]`.
+fn last_row_only(
+    bytes: Vec<u8>,
+    shape: &[usize],
+    elem: usize,
+) -> Result<(Vec<u8>, Vec<usize>), String> {
+    let vocab = match shape {
+        [1, _, v] | [_, v] => *v,
+        _ => return Err(format!("last-row logits from a {shape:?} output")),
+    };
+    let row = vocab * elem;
+    if row == 0 || bytes.len() < row || !bytes.len().is_multiple_of(row) {
+        return Err(format!(
+            "{} logits bytes do not hold whole rows of {vocab}",
+            bytes.len()
+        ));
+    }
+    Ok((bytes[bytes.len() - row..].to_vec(), vec![1, 1, vocab]))
+}
+
+/// The 413 for a prompt at or past the target's window, if it is.
+fn prompt_window_refusal(n: usize, max: Option<usize>) -> Option<String> {
+    let max = max?;
+    (n >= max).then(|| {
+        format!("prompt is {n} tokens; the target's window is {max} (max_position_embeddings)")
+    })
+}
+
+/// `max_position_embeddings` from a target tree's config.json (the tree root,
+/// else `tokenizer/`; `text_config` when nested).
+fn config_max_ctx(dir: &std::path::Path) -> Option<usize> {
+    [
+        dir.join("config.json"),
+        dir.join("tokenizer").join("config.json"),
+    ]
+    .iter()
+    .find_map(|p| {
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(p).ok()?).ok()?;
+        v.get("max_position_embeddings")
+            .or_else(|| {
+                v.get("text_config")
+                    .and_then(|t| t.get("max_position_embeddings"))
+            })
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&m| m > 0)
+            .map(|m| m as usize)
+    })
 }
 
 // -------- spec_decode loop --------
@@ -1572,6 +1723,9 @@ pub struct OvDistSpecEngine {
     /// The draft's vocabulary (its config.json), to refuse prompt ids it
     /// cannot embed. `None` when unknown.
     draft_vocab: Option<usize>,
+    /// The target's window (`max_position_embeddings`); prompts at or past it
+    /// are a 413 at submit. `None` when the tree does not state it.
+    max_ctx: Option<usize>,
     pending: Vec<GenerationTask>,
     active: Option<ActiveSpec>,
     /// Issue-34: opaque KV blob cache + a stable model id (the target pipeline dir) for the
@@ -1625,6 +1779,28 @@ impl Engine for OvDistSpecEngine {
                 &task,
                 "ov-dist-spec (target tree without a `vision` block)",
             )?;
+        }
+        // Synchronous with the HTTP request, so an over-window prompt is a 413
+        // before anything runs. An image turn is sized from its images'
+        // dimensions (their token grids), before any image is encoded.
+        if let Some(max) = self.max_ctx {
+            let n = self
+                .tokenizer
+                .encode(task.prompt.as_str(), false)
+                .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?
+                .len()
+                + task.resume_ids().map_or(0, <[i32]>::len);
+            let n = match self.target.vision.as_ref() {
+                Some(v) if !task.media.is_empty() => v
+                    .frontend
+                    .expanded_len(n, &task.media)
+                    .map_err(EngineError::UnsupportedInput)?,
+                _ => n,
+            };
+            if let Some(why) = prompt_window_refusal(n, Some(max)) {
+                warn!(task = %task.task_id, prompt_tokens = n, max, "ov-dist-spec: refusing over-window prompt");
+                return Err(EngineError::PromptTooLong(why));
+            }
         }
         if self.pending.iter().any(|t| t.task_id == task.task_id)
             || self
@@ -1924,7 +2100,11 @@ impl OvDistSpecEngine {
         // Draft: the same ids, image soft tokens included as ordinary tokens.
         let (t_logits, t_shape) = self.target.feed_prompt(feed_ids, &image_rows)?;
         drop(image_rows);
-        self.draft.feed(feed_ids)?;
+        // Chunked like the target: the draft's prefill logits are discarded,
+        // and a whole image prompt's would be `T x vocab` floats.
+        for chunk in feed_ids.chunks(PREFILL_CHUNK) {
+            self.draft.feed(chunk)?;
+        }
         let vocab = t_shape[2];
         let first = argmax(&t_logits[t_logits.len() - vocab..]) as i64;
 
@@ -2190,6 +2370,7 @@ pub struct OvDistSpecBuilder {
     /// VLM target tree: rank 0's text embedding table + image encoder.
     vision: Option<crate::runtime::VisionFirst>,
     draft_vocab: Option<usize>,
+    max_ctx: Option<usize>,
 }
 
 impl OvDistSpecBuilder {
@@ -2217,6 +2398,7 @@ impl OvDistSpecBuilder {
             downstream: None,
             vision: None,
             draft_vocab: None,
+            max_ctx: None,
         }
     }
 
@@ -2377,6 +2559,10 @@ impl Builder for OvDistSpecBuilder {
             "compiling draft {}",
             self.draft_model_path
         )));
+        self.max_ctx = config_max_ctx(&self.pipeline_dir);
+        if self.max_ctx.is_none() {
+            warn!("ov-dist-spec: the target tree states no max_position_embeddings; the prompt-window guard is OFF");
+        }
         let draft_dir = std::path::Path::new(&self.draft_model_path);
         self.draft_vocab = config_vocab(draft_dir);
         let target_vocab =
@@ -2425,6 +2611,7 @@ impl Builder for OvDistSpecBuilder {
             eos_token_ids: self.eos_token_ids.clone(),
             k: self.k as usize,
             draft_vocab: self.draft_vocab,
+            max_ctx: self.max_ctx,
             pending: Vec::new(),
             active: None,
             #[cfg(feature = "kv_coord")]
@@ -2756,7 +2943,7 @@ impl OvDistSpecWorkerEngine {
             FrameKind::CaptureAck | FrameKind::RestoreAck => Err(EngineError::Backend(
                 "ov-dist-spec worker: unexpected ack frame from upstream".into(),
             )),
-            FrameKind::Forward => {
+            kind @ (FrameKind::Forward | FrameKind::ForwardLastRow) => {
                 // 2. Read FORWARD body (logical_pos, attn, hidden) from upstream.
                 //    Keep hidden as raw bytes (f16 wire format) — the IR
                 //    expects f16 for the hidden_states port and we want
@@ -2865,6 +3052,16 @@ impl OvDistSpecWorkerEngine {
                     output_us,
                     "worker.frame timing"
                 );
+                // A prefill chunk: answer with the last position's row only.
+                let (out_bytes, out_shape) = if self.is_last && kind == FrameKind::ForwardLastRow {
+                    let elem = match out_dtype {
+                        ShimDType::F16 => 2,
+                        _ => 4,
+                    };
+                    last_row_only(out_bytes, &out_shape, elem).map_err(EngineError::Backend)?
+                } else {
+                    (out_bytes, out_shape)
+                };
                 let out_f16_bytes = match out_dtype {
                     ShimDType::F16 => out_bytes,
                     ShimDType::F32 => {
@@ -2918,7 +3115,7 @@ impl OvDistSpecWorkerEngine {
                             i64_to_bytes(&attn),
                         );
                         let mut header = [0u8; 8];
-                        header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
+                        header[0..4].copy_from_slice(&(kind as u32).to_be_bytes());
                         header[4..8].copy_from_slice(&logical_pos_start.to_be_bytes());
                         {
                             let mut dg = downstream.lock().await;
@@ -3633,7 +3830,7 @@ mod tests {
     fn prompt_span_splices_image_rows_in_order() {
         let ids = [1, IMG, IMG, 5, IMG, 2];
         let mut rows = text_rows(&ids);
-        let images = vec![vec![100.0, 101.0, 102.0, 103.0], vec![200.0, 201.0]];
+        let images: [&[f32]; 2] = [&[100.0, 101.0, 102.0, 103.0], &[200.0, 201.0]];
         assert_eq!(splice_prompt_rows(&mut rows, 2, &ids, IMG, &images), Ok(3));
         assert_eq!(
             rows,
@@ -3655,8 +3852,112 @@ mod tests {
     fn image_row_count_must_match_the_placeholders() {
         let ids = [1, IMG, IMG];
         let mut rows = text_rows(&ids);
-        let err = splice_prompt_rows(&mut rows, 2, &ids, IMG, &[vec![9.0, 9.0]]).unwrap_err();
+        let err = splice_prompt_rows(&mut rows, 2, &ids, IMG, &[&[9.0, 9.0]]).unwrap_err();
         assert!(err.contains("2 image rows"), "{err}");
+    }
+
+    #[test]
+    fn prefill_chunks_take_their_own_image_rows() {
+        // Two images of 3 and 2 rows (hidden 1), split across chunks.
+        let images = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0]];
+        let flat = |v: Vec<&[f32]>| v.concat();
+        assert_eq!(
+            flat(image_rows_span(&images, 1, 0, 2).unwrap()),
+            vec![1.0, 2.0]
+        );
+        let across = image_rows_span(&images, 1, 2, 2).unwrap();
+        assert_eq!(across.len(), 2, "one slice per image it spans");
+        assert_eq!(flat(across), vec![3.0, 4.0]);
+        assert_eq!(flat(image_rows_span(&images, 1, 4, 1).unwrap()), vec![5.0]);
+        assert!(image_rows_span(&images, 1, 4, 2).is_err());
+        let wide = vec![vec![1.0, 1.5, 2.0, 2.5]];
+        assert_eq!(
+            flat(image_rows_span(&wide, 2, 1, 1).unwrap()),
+            vec![2.0, 2.5]
+        );
+    }
+
+    #[test]
+    fn chunked_prefill_splices_like_the_whole_prompt() {
+        // Splicing chunk by chunk with each chunk's span of image rows gives the
+        // rows a single whole-prompt splice gives.
+        let ids: Vec<i64> = vec![1, IMG, IMG, IMG, 5, IMG, IMG, 2, 3];
+        let images = vec![
+            vec![10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
+            vec![20.0, 21.0, 22.0, 23.0],
+        ];
+        let mut whole = text_rows(&ids);
+        let refs: Vec<&[f32]> = images.iter().map(Vec::as_slice).collect();
+        splice_prompt_rows(&mut whole, 2, &ids, IMG, &refs).unwrap();
+        for chunk_len in 1..=ids.len() {
+            let (mut before, mut got) = (0, Vec::new());
+            for chunk in ids.chunks(chunk_len) {
+                let n = chunk.iter().filter(|&&t| t == IMG).count();
+                let rows = image_rows_span(&images, 2, before, n).unwrap();
+                before += n;
+                let mut part = text_rows(chunk);
+                splice_prompt_rows(&mut part, 2, chunk, IMG, &rows).unwrap();
+                got.extend(part);
+            }
+            assert_eq!(got, whole, "chunk {chunk_len}");
+        }
+    }
+
+    #[test]
+    fn last_stage_answers_a_prefill_chunk_with_one_row() {
+        // [1, 3, 2] f32 logits -> the last row only.
+        let vals: Vec<f32> = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let bytes: Vec<u8> = vals.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let (row, shape) = last_row_only(bytes, &[1, 3, 2], 4).unwrap();
+        assert_eq!(shape, vec![1, 1, 2]);
+        assert_eq!(
+            row,
+            [4.0f32, 5.0]
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<_>>()
+        );
+        let (row, shape) = last_row_only(vec![1, 2, 3, 4, 5, 6], &[3, 1], 2).unwrap();
+        assert_eq!((row, shape), (vec![5, 6], vec![1, 1, 1]));
+        assert!(last_row_only(vec![0; 6], &[1, 3, 4], 4).is_err());
+        assert!(last_row_only(vec![0; 8], &[2, 1, 1, 4], 2).is_err());
+    }
+
+    #[test]
+    fn over_window_prompt_is_refused() {
+        assert!(prompt_window_refusal(10, None).is_none());
+        assert!(prompt_window_refusal(9, Some(10)).is_none());
+        let why = prompt_window_refusal(10, Some(10)).unwrap();
+        assert!(
+            why.contains("10 tokens") && why.contains("window is 10"),
+            "{why}"
+        );
+        // Sized from image dimensions alone, before any encode: eight 1 MP
+        // images on Pixtral expand a short prompt past a 32k window.
+        let cfg = crate::pixtral_vision::PreprocessConfig::pixtral();
+        let n = crate::pixtral_vision::expanded_prompt_len(40, &[(1024, 1024); 8], &cfg).unwrap();
+        assert!(n > 32_768, "{n}");
+        assert!(prompt_window_refusal(n, Some(32_768)).is_some());
+    }
+
+    #[test]
+    fn reads_the_target_window() {
+        let dir = std::env::temp_dir().join(format!("cascadia-ds-ctx-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("tokenizer")).unwrap();
+        assert_eq!(config_max_ctx(&dir), None);
+        std::fs::write(
+            dir.join("tokenizer").join("config.json"),
+            r#"{"text_config":{"max_position_embeddings":4096}}"#,
+        )
+        .unwrap();
+        assert_eq!(config_max_ctx(&dir), Some(4096));
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"max_position_embeddings":1024000}"#,
+        )
+        .unwrap();
+        assert_eq!(config_max_ctx(&dir), Some(1_024_000));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3749,6 +4050,7 @@ mod tests {
     fn frame_kind_roundtrip() {
         for k in [
             FrameKind::Forward,
+            FrameKind::ForwardLastRow,
             FrameKind::Reset,
             FrameKind::LogitsResponse,
         ] {
@@ -3800,6 +4102,16 @@ mod tests {
     /// mirrors `tests/test_dist_spec_protocol.py::test_forward_roundtrip`.
     #[tokio::test]
     async fn forward_roundtrip() {
+        forward_roundtrip_as(FrameKind::Forward).await;
+    }
+
+    /// The prefill kind travels with the FORWARD body unchanged.
+    #[tokio::test]
+    async fn forward_last_row_roundtrip() {
+        forward_roundtrip_as(FrameKind::ForwardLastRow).await;
+    }
+
+    async fn forward_roundtrip_as(sent: FrameKind) {
         let mut server = ActivationServer::new("127.0.0.1", 0);
         server.start().await.unwrap();
         let port = server.port();
@@ -3820,7 +4132,7 @@ mod tests {
 
         // Send FORWARD frame inline (mirroring DistributedMaskedReq.feed)
         let mut header = [0u8; 8];
-        header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
+        header[0..4].copy_from_slice(&(sent as u32).to_be_bytes());
         header[4..8].copy_from_slice(&42u32.to_be_bytes());
         client.send_raw(&header).await.unwrap();
         let attn = vec![1i64, 1, 1, 0, 1];
@@ -3831,7 +4143,7 @@ mod tests {
         client.send(&hidden_t).await.unwrap();
 
         let (kind, pos, attn_rx, hidden_rx) = h.await.unwrap();
-        assert_eq!(kind, FrameKind::Forward);
+        assert_eq!(kind, sent);
         assert_eq!(pos, 42);
         assert_eq!(attn_rx, i64_to_bytes(&attn));
         assert_eq!(hidden_rx, hidden_data);

@@ -119,6 +119,32 @@ pub fn target_size(height: u32, width: u32, cfg: &PreprocessConfig) -> Result<(u
     Ok((tokens(h) * p, tokens(w) * p))
 }
 
+/// The `(rows, cols)` token grid `preprocess` gives a `width`x`height` image,
+/// from its dimensions alone (no resize, no encoder).
+pub fn image_grid(height: u32, width: u32, cfg: &PreprocessConfig) -> Result<(u32, u32), String> {
+    let (th, tw) = target_size(height, width, cfg)?;
+    let cell = cfg.patch_size * cfg.spatial_merge;
+    Ok((th / cell, tw / cell))
+}
+
+/// Length of a `prompt_len`-token prompt once each image's `[IMG]` placeholder
+/// is expanded (`expand_image_tokens`) for images of the given
+/// `(height, width)`: computed before any image is encoded, so an over-window
+/// prompt is refused without the encoder's cost.
+pub fn expanded_prompt_len(
+    prompt_len: usize,
+    dims: &[(u32, u32)],
+    cfg: &PreprocessConfig,
+) -> Result<usize, String> {
+    let mut n = prompt_len;
+    for (i, &(h, w)) in dims.iter().enumerate() {
+        let (rows, cols) = image_grid(h, w, cfg).map_err(|e| format!("image {i}: {e}"))?;
+        // The placeholder becomes rows * (cols + 1) tokens.
+        n = (n + rows as usize * (cols as usize + 1)).saturating_sub(1);
+    }
+    Ok(n)
+}
+
 /// The vision IR's input for one image.
 #[derive(Clone, Debug)]
 pub struct Pixels {
@@ -395,6 +421,16 @@ impl Frontend {
         Ok((v, out_hidden))
     }
 
+    /// [`expanded_prompt_len`] for `media` under this front end's processor.
+    pub fn expanded_len(
+        &self,
+        prompt_len: usize,
+        media: &[cascadia_types::MediaInput],
+    ) -> Result<usize, String> {
+        let dims: Vec<(u32, u32)> = media.iter().map(|m| (m.height, m.width)).collect();
+        expanded_prompt_len(prompt_len, &dims, &self.preprocess)
+    }
+
     /// Encode a task's images and expand each `[IMG]` into its rows. Returns
     /// the expanded ids and each image's rows, in prompt order.
     pub fn prepare(
@@ -502,6 +538,37 @@ mod tests {
         assert_eq!(target_size(1000, 2048, &c), Ok((512, 1024)));
         // floor, then ceil to the patch: 1600x1200 -> ratio 1.5625 -> 1024 x 768.
         assert_eq!(target_size(1200, 1600, &c), Ok((768, 1024)));
+    }
+
+    #[test]
+    fn expanded_len_matches_the_expansion_without_encoding() {
+        let t = ImageTokens {
+            image: 10,
+            image_break: 12,
+            image_end: 13,
+        };
+        for cfg in [PreprocessConfig::pixtral(), {
+            let mut c = PreprocessConfig::pixtral();
+            c.spatial_merge = 2;
+            c
+        }] {
+            let dims = [(448u32, 448u32), (1000, 1333), (17, 900)];
+            let grids: Vec<(u32, u32)> = dims
+                .iter()
+                .map(|&(h, w)| image_grid(h, w, &cfg).unwrap())
+                .collect();
+            let prompt = [1, 10, 5, 10, 10, 2];
+            let want = expand_image_tokens(&prompt, &t, &grids).unwrap().len();
+            assert_eq!(expanded_prompt_len(prompt.len(), &dims, &cfg), Ok(want));
+            // The grid is the one preprocess produces.
+            let p = preprocess(&vec![0u8; 900 * 17 * 3], 900, 17, &cfg).unwrap();
+            assert_eq!((p.rows, p.cols), grids[2]);
+        }
+        assert_eq!(
+            expanded_prompt_len(3, &[(448, 448)], &PreprocessConfig::pixtral()),
+            Ok(3 - 1 + 28 * 29)
+        );
+        assert!(expanded_prompt_len(3, &[(0, 4)], &PreprocessConfig::pixtral()).is_err());
     }
 
     #[test]

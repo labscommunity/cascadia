@@ -1819,6 +1819,19 @@ pub(crate) enum Frontend {
 }
 
 impl Frontend {
+    /// A `prompt_len`-token prompt's length once `media` expand, from the
+    /// images' dimensions alone (no encode). Pixtral / Mistral 3 only.
+    pub(crate) fn expanded_len(
+        &self,
+        prompt_len: usize,
+        media: &[cascadia_types::MediaInput],
+    ) -> Result<usize, String> {
+        match self {
+            Frontend::Pixtral(f) => f.expanded_len(prompt_len, media),
+            Frontend::Gemma4(_) => Err("expanded length is sized for Pixtral images only".into()),
+        }
+    }
+
     /// The soft-token id whose rows the encoder supplies.
     pub(crate) fn image_token(&self) -> i64 {
         match self {
