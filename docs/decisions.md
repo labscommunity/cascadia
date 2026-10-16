@@ -544,6 +544,25 @@ reply as skipped, and the next task logged `skipped a late reply of an earlier t
 then its own epoch 4). The two requests after it returned 200 with answers identical to a run
 without the timeout, in normal time.
 
+## Devices
+
+Decision trees run on `--device CPU` or `--device GPU` with the same files; no export or flag
+changes. Measured on an Intel Core Ultra 7 258V (Arc 140V iGPU), single box, default GPU precision
+(no `--ov-config`), against the same streamed fp32 references and gate as the CPU rows below:
+
+| Model | GPU parity | max \|Δp\| | `/v1/decisions` vs `/v1/systemone` | CPU parity (for comparison) |
+|---|---|---|---|---|
+| JEV-9B | **80/82** PASS | 0.024 | 62/62 identical | 82/82 |
+| Kev-9B | **82/82** PASS | 0.031 | 62/62 identical | 81/82 |
+| Clef-flash | **82/82** PASS | 0.053 | 62/62 identical | 81/82 |
+
+Every flip in these runs had a reference margin under 0.05, so no f32 override was needed. On the
+typed-decisions benchmark (400 cases, five questions each) the GPU served all three models with
+no errors at about 1.3–3.5 s per case (JEV-9B 3.3 s, against 34 s on the CPU), roughly ten times
+faster. GPU probabilities differ from the CPU's by up to about 0.16 on near-ties, so a caller that
+compares raw probabilities across hosts should keep one device. The 27B models were validated on
+CPU only.
+
 ## Limitations
 
 - **Text only.** Images in either format are a 400 (`images`, `videos`, OpenAI `input_image`
