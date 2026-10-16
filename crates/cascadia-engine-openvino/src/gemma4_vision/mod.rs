@@ -365,6 +365,9 @@ pub fn splice_images(
 /// `ov-runtime` vision trees and the `gemma4` engine's vision trees.
 pub struct ImageFrontend {
     encoder: encoder::VisionEncoder,
+    /// Encoded images by content hash (metadata: soft-token count), so a
+    /// chat's earlier images are not re-encoded every turn.
+    cache: crate::image_cache::EncodeCache<usize>,
     pub preprocess: PreprocessConfig,
     pub tokens: ImageTokens,
 }
@@ -382,6 +385,7 @@ impl ImageFrontend {
         )?;
         Ok(Self {
             encoder,
+            cache: crate::image_cache::EncodeCache::from_env(),
             preprocess,
             tokens,
         })
@@ -397,6 +401,7 @@ impl ImageFrontend {
     ) -> Result<(Vec<i64>, Vec<Vec<f32>>), String> {
         let mut rows = Vec::with_capacity(media.len());
         let mut counts = Vec::with_capacity(media.len());
+        let mut from_cache = 0;
         for (i, m) in media.iter().enumerate() {
             match m.kind {
                 cascadia_types::MediaKind::Image => {}
@@ -406,15 +411,24 @@ impl ImageFrontend {
             if m.num_frames != 1 || m.pixels.len() != m.expected_len() {
                 return Err(format!("image {i}: malformed pixel buffer"));
             }
+            if let Some((emb, count)) = self.cache.get(&m.sha256) {
+                counts.push(count);
+                rows.push(emb);
+                from_cache += 1;
+                continue;
+            }
             let p = preprocess(&m.pixels, m.width, m.height, &self.preprocess)
                 .map_err(|e| format!("image {i}: {e}"))?;
             let (emb, _hidden) = self
                 .encoder
                 .encode(&p)
                 .map_err(|e| format!("image {i}: {e}"))?;
-            counts.push(p.soft_tokens(self.preprocess.pooling_kernel_size));
+            let count = p.soft_tokens(self.preprocess.pooling_kernel_size);
+            self.cache.put(m.sha256, &emb, count);
+            counts.push(count);
             rows.push(emb);
         }
+        self.cache.report(from_cache, media.len());
         let ids = expand_image_tokens(prompt_ids, &self.tokens, &counts)?;
         Ok((ids, rows))
     }

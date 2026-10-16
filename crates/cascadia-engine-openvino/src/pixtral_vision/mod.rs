@@ -270,6 +270,9 @@ pub struct Frontend {
     /// linear + MLP), run on the merged rows. None on Pixtral, whose vision IR
     /// already ends in the projector.
     projector: Option<(Runtime, String)>,
+    /// Encoded images by content hash, so a chat's earlier images are not
+    /// re-encoded every turn. Metadata: the token grid.
+    cache: crate::image_cache::EncodeCache<(u32, u32)>,
     pub preprocess: PreprocessConfig,
     pub tokens: ImageTokens,
 }
@@ -301,6 +304,7 @@ impl Frontend {
         Ok(Self {
             rt,
             projector,
+            cache: crate::image_cache::EncodeCache::from_env(),
             preprocess,
             tokens,
         })
@@ -381,6 +385,7 @@ impl Frontend {
     ) -> Result<(Vec<i64>, Vec<Vec<f32>>), String> {
         let mut rows = Vec::with_capacity(media.len());
         let mut grids = Vec::with_capacity(media.len());
+        let mut from_cache = 0;
         for (i, m) in media.iter().enumerate() {
             match m.kind {
                 cascadia_types::MediaKind::Image => {}
@@ -390,12 +395,20 @@ impl Frontend {
             if m.num_frames != 1 || m.pixels.len() != m.expected_len() {
                 return Err(format!("image {i}: malformed pixel buffer"));
             }
+            if let Some((emb, grid)) = self.cache.get(&m.sha256) {
+                grids.push(grid);
+                rows.push(emb);
+                from_cache += 1;
+                continue;
+            }
             let p = preprocess(&m.pixels, m.width, m.height, &self.preprocess)
                 .map_err(|e| format!("image {i}: {e}"))?;
             let (emb, _) = self.encode(&p).map_err(|e| format!("image {i}: {e}"))?;
+            self.cache.put(m.sha256, &emb, (p.rows, p.cols));
             grids.push((p.rows, p.cols));
             rows.push(emb);
         }
+        self.cache.report(from_cache, media.len());
         let ids = expand_image_tokens(prompt_ids, &self.tokens, &grids)?;
         Ok((ids, rows))
     }
