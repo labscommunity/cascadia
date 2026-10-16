@@ -405,8 +405,8 @@ pub struct WorkerArgs {
 
     /// Largest request body on every API route (MiB): chat/completions,
     /// completions, /v1/decisions and /v1/systemone; a long decision state
-    /// needs it raised. The rendered chat prompt is capped at the same size. 1 MiB ≈ 250 K tokens of English, the
-    /// window of the largest served models. Only `qwen35` also bounds the
+    /// needs it raised. The rendered chat prompt is capped at the same size.
+    /// 1 MiB ≈ 250 K tokens of English, the window of the largest served models. Only `qwen35` also bounds the
     /// prompt in TOKENS (against `max_position_embeddings`); on other engines
     /// this byte cap is the whole guard, so lower it on an exposed endpoint.
     #[arg(long, default_value_t = 1.0)]
@@ -2232,6 +2232,19 @@ fn check_api_addr_is_tcp(api: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Where `--decision-dump` writes, if anywhere: only when a decision model is loaded, since
+/// the file would otherwise stay empty. Logs either way (the file holds request-derived data).
+fn decision_dump_target(dump: Option<&std::path::Path>, decisions_loaded: bool) -> Option<PathBuf> {
+    let p = dump?;
+    if decisions_loaded {
+        warn!(path = %p.display(), "--decision-dump records request-derived token ids to disk; use for parity checks only");
+        Some(p.to_path_buf())
+    } else {
+        warn!(path = %p.display(), "--decision-dump ignored: no decision model is loaded");
+        None
+    }
+}
+
 async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     if args.rank >= args.total {
         return Err(anyhow!(
@@ -2624,14 +2637,11 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         {
             warn!(engine = ?args.engine, "decision.json ignored: only --engine qwen35 serves /v1/decisions");
         }
-        if let Some(p) = &args.decision_dump {
-            if cfg.decisions.is_some() {
-                warn!(path = %p.display(), "--decision-dump records request-derived token ids to disk; use for parity checks only");
-                cfg.decision_dump = Some(p.clone());
-                cfg.decision_dump_max_bytes = args.decision_dump_max_bytes;
-            } else {
-                warn!(path = %p.display(), "--decision-dump ignored: no decision model is loaded");
-            }
+        if let Some(p) =
+            decision_dump_target(args.decision_dump.as_deref(), cfg.decisions.is_some())
+        {
+            cfg.decision_dump = Some(p);
+            cfg.decision_dump_max_bytes = args.decision_dump_max_bytes;
         }
         // Long-context serving: the 64 KiB body / 32 KiB prompt defaults hold
         // ~8 K tokens, a fraction of what the Qwen3.5-family and Llama-3.1
@@ -4186,6 +4196,14 @@ mod tests {
         assert_eq!(worker.api_max_body_mb, 2.0);
         assert_eq!(worker.rank, 0);
         assert_eq!(worker.total, 1);
+    }
+
+    #[test]
+    fn decision_dump_is_kept_only_with_a_decision_model() {
+        let p = std::path::Path::new("/tmp/dump.jsonl");
+        assert_eq!(decision_dump_target(Some(p), true).as_deref(), Some(p));
+        assert_eq!(decision_dump_target(Some(p), false), None);
+        assert_eq!(decision_dump_target(None, true), None);
     }
 
     #[test]
