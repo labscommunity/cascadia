@@ -1,7 +1,8 @@
 """Build a Cascadia decision-model tree (docs/decisions.md).
 
   jev:  python tools/decision_export.py jev  --base-ir STOCK_INT8_IR --adapter-dir JEV/adapter_vllm --out TREE [--stages N]
-        (--weights FT_DIR only for a fine-tuned, NOT LoRA-merged backbone, with --weights-not-merged)
+        (--weights FT_DIR only for a fine-tuned, NOT LoRA-merged backbone, with --weights-not-merged;
+        --switchable-lora adds a runtime `lora_scale` stage input, 0 = the base model)
   kev:  python tools/decision_export.py kev  --base-ir STOCK_INT8_IR --weights QWEN35_9B_BASE --lora KEV/adapter_model.safetensors \
                                              --head-pt KEV/head.pt --out TREE
         (--weights and --lora are required; the tree ships KEV/tokenizer.json, the one beside head.pt,
@@ -152,7 +153,7 @@ def shipped_tokenizer(base_ir, weights=None, override=None):
     return str(Path(base_ir) / "tokenizer.json")
 
 
-def write_jev_profile(adapter_dir, calibration_json, out_dir, max_tokens=32768, tokenizer=None):
+def write_jev_profile(adapter_dir, calibration_json, out_dir, max_tokens=32768, tokenizer=None, lora_scale=None):
     h = json.loads((Path(adapter_dir) / "decision_head.json").read_text())
     cal = json.loads(Path(calibration_json).read_text())["per_kind"]
     slots = h["slots"]
@@ -193,6 +194,10 @@ def write_jev_profile(adapter_dir, calibration_json, out_dir, max_tokens=32768, 
                              f"{slots['verbalizers'][lo:hi]}): the tree's tokenizer.json is not JEV's")
         profile["jev"]["choice_labels"] = [lab for lab, _ in labels]
         profile["jev"]["choice_label_ids"] = [t for _, t in labels]
+    if lora_scale is not None:
+        # A switchable tree (--switchable-lora): the scale its stages' `lora_scale` input takes for
+        # the grafted model. Absent = the scale is baked into the graft.
+        profile["jev"]["lora_scale"] = lora_scale
     _write(out_dir, profile, {"kind": "verbalizer"})
 
 
@@ -348,6 +353,9 @@ def main():
                     help="jev with --weights: state that those shards do NOT already hold the LoRA merged "
                          "(backbone_diff.py --adapter said FINETUNED, not MERGED); the adapter is grafted on top")
     ap.add_argument("--lora-scale", type=float, default=None, help="override adapter_config.json")
+    ap.add_argument("--switchable-lora", action="store_true",
+                    help="jev: graft the adapter behind a runtime `lora_scale` input on every stage (0 = the base "
+                         "model, for System 2) and record the trained scale in decision.json")
     ap.add_argument("--adapter-dir", default=None, help="jev: dir with decision_head.json + adapter_model.safetensors")
     ap.add_argument("--calibration", default=None, help="jev: calibration.json (default: ADAPTER_DIR/../calibration.json)")
     ap.add_argument("--head-pt", default=None, help="kev: head.pt")
@@ -372,6 +380,8 @@ def main():
         # Clef's joint head reads the hidden states of the full checkpoint it was trained on;
         # an adapter grafted on top would move them, and nothing here would notice.
         ap.error("clef takes no --lora/--lora-scale: --clef-dir is the full checkpoint its joint head reads")
+    if a.switchable_lora and a.family != "jev":
+        ap.error("--switchable-lora is jev only: System 2 runs JEV's base model")
     tokenizer = a.tokenizer
     if a.family == "kev":
         # Kev's pointer head was trained on its fine-tuned backbone's hidden states (Base + LoRA):
@@ -400,7 +410,16 @@ def main():
                  f"trained with (pass --tokenizer FILE)")
     # Only an explicit override reaches run_export; jev/clef keep its default tokenizer choice.
     tok_kw = {"tokenizer": tokenizer} if tokenizer is not None else {}
-    jev_tok = None
+    jev_tok, jev_sw = None, {}
+    if a.family == "jev" and a.switchable_lora:
+        # The scale run_export grafts with (the same override rule), recorded in decision.json for
+        # the engine to feed; a default export passes neither, so it stays the call it was.
+        from weight_swap import lora_scale_from_config
+        lora = a.lora or os.path.join(a.adapter_dir, "adapter_model.safetensors")
+        try:
+            jev_sw = {"lora_scale": a.lora_scale if a.lora_scale is not None else lora_scale_from_config(lora)}
+        except FileNotFoundError:
+            ap.error(f"no adapter_config.json beside {lora}: download it, or pass --lora-scale")
     if a.family == "jev":
         # JEV's extended choice labels come from the tokenizer.json the tree ships, so the server
         # encodes them exactly as the export checked them against the trained head.
@@ -437,9 +456,10 @@ def main():
     if a.family == "jev":
         lora = a.lora or os.path.join(a.adapter_dir, "adapter_model.safetensors")
         cal = a.calibration or os.path.join(os.path.dirname(os.path.abspath(a.adapter_dir)), "calibration.json")
-        write_jev_profile(a.adapter_dir, cal, a.out, max_tokens=max_tokens, tokenizer=jev_tok)
+        write_jev_profile(a.adapter_dir, cal, a.out, max_tokens=max_tokens, tokenizer=jev_tok, **jev_sw)
         run_export(a.base_ir, a.out, a.stages, False, a.layer_split, weights=a.weights, lora=lora,
-                   lora_scale=a.lora_scale, final_hidden=False, **tok_kw)
+                   lora_scale=a.lora_scale, final_hidden=False, **tok_kw,
+                   **({"switchable_lora": True} if jev_sw else {}))
     elif a.family == "kev":
         write_kev_profile(a.head_pt, a.out, hidden=int(_text_config(a.base_ir)["hidden_size"]), max_tokens=max_tokens)
         run_export(a.base_ir, a.out, a.stages, False, a.layer_split, weights=a.weights, lora=a.lora,

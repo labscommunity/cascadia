@@ -632,6 +632,16 @@ python tools/decision_export.py clef --base-ir STOCK_INT8_IR \
   differ from the `verbalizer_ids` of the choice slots; the error names both lists. A JEV export
   with no `tokenizer.json` (from `--tokenizer`, `--weights` or the base IR) is refused. Both
   fields are optional: a tree exported without them still loads.
+- JEV takes `--switchable-lora` to make the adapter switchable at runtime, the first step toward
+  adaptive thinking (System 2), which runs the unmodified base model. The scale is no longer baked
+  into the grafted branches: every stage that carries one gains a scalar f32 input `lora_scale`,
+  and each branch adds `lora_scale · (x·Aᵀ)·Bᵀ`. Feeding the trained scale gives the JEV model and
+  feeding 0 gives the base model, from the same tree. The trained scale (`lora_alpha / r` from
+  `adapter_config.json`, or `--lora-scale`; 2.0 for the shipped adapters) is written to the `jev`
+  object of `decision.json` as `lora_scale`. A tree without that field has its scale baked in and
+  no such input; that is the default, and a default export is unchanged byte for byte. The server
+  does not feed `lora_scale` yet, so do not serve a switchable tree until it does. Kev and Clef
+  refuse the flag.
 - Kev and Clef trees are exported with the final hidden-state output their heads read; JEV's
   verbalizer reads only the logits.
 - Clef takes no `--lora` or `--lora-scale`: `--clef-dir` is the full checkpoint its joint head

@@ -1208,3 +1208,80 @@ def test_cli_jev_without_a_tokenizer_refused_before_any_write(cli, capsys):
         run("jev", "--base-ir", str(base), "--adapter-dir", str(adapter), "--out", str(tmp / "t"))
     assert e.value.code == 2 and "tokenizer.json" in capsys.readouterr().err
     assert calls == [] and not (tmp / "t").exists()
+
+
+# Task 41: a switchable LoRA graft (System 2 feeds lora_scale = 0 to run the base model).
+
+def test_switchable_lora_reaches_every_stage_graft(stubbed, tmp_path):
+    model, out, calls, ws, mp = stubbed
+    _lora(mp, ws, calls, per_stage=None, targets=["layers.0.a", "layers.4.a"], cfg_scale=2.0)
+
+    def graft(stage, f, s, layers=None, lm_head=True, **kw):
+        calls.append(("graft", s, kw))
+        return [t for t in ["layers.0.a", "layers.4.a"] if int(t.split(".")[1]) in layers]
+    mp.setattr(ws, "graft_lora", graft)
+    ex.run_export(str(model), str(out), 2, lora=str(tmp_path / "adapter_model.safetensors"), switchable_lora=True)
+    assert [c for c in calls if c[0] == "graft"] == [("graft", 2.0, {"switchable": True})] * 2
+
+
+def test_switchable_lora_without_lora_refused_before_any_work(stubbed):
+    model, out, calls, _, _ = stubbed
+    with pytest.raises(SystemExit, match="--switchable-lora needs --lora"):
+        ex.run_export(str(model), str(out), 2, switchable_lora=True)
+    assert calls == []
+
+
+def test_jev_profile_records_lora_scale_only_when_switchable(tmp_path):
+    adapter, cal = _jev_adapter(tmp_path)
+    de.write_jev_profile(str(adapter), str(cal), str(tmp_path / "baked"))
+    assert "lora_scale" not in json.loads((tmp_path / "baked" / "decision.json").read_text())["jev"]
+    de.write_jev_profile(str(adapter), str(cal), str(tmp_path / "sw"), lora_scale=2.0)
+    assert json.loads((tmp_path / "sw" / "decision.json").read_text())["jev"]["lora_scale"] == 2.0
+
+
+def _jev_cli_adapter(tmp, alpha=32, r=16):
+    adapter, _ = _jev_adapter(tmp)
+    (adapter / "adapter_config.json").write_text(json.dumps({"r": r, "lora_alpha": alpha}))
+    return adapter
+
+
+def test_cli_jev_switchable_lora_records_the_trained_scale(cli):
+    run, calls, base, tmp = cli
+    adapter = _jev_cli_adapter(tmp)
+    run("jev", "--base-ir", str(base), "--adapter-dir", str(adapter), "--out", str(tmp / "t"), "--switchable-lora")
+    (_, a, kw, assets_first), = calls
+    assert kw == {"weights": None, "lora": os.path.join(str(adapter), "adapter_model.safetensors"),
+                  "lora_scale": None, "final_hidden": False, "switchable_lora": True}
+    assert assets_first
+    assert json.loads((tmp / "t" / "decision.json").read_text())["jev"]["lora_scale"] == 2.0  # 32 / 16
+    # an explicit --lora-scale is the scale the tree was grafted for, so the profile records it
+    calls.clear()
+    run("jev", "--base-ir", str(base), "--adapter-dir", str(adapter), "--out", str(tmp / "t2"),
+        "--switchable-lora", "--lora-scale", "0.5")
+    assert json.loads((tmp / "t2" / "decision.json").read_text())["jev"]["lora_scale"] == 0.5
+
+
+def test_cli_jev_default_export_is_unchanged(cli):
+    run, calls, base, tmp = cli
+    adapter = _jev_cli_adapter(tmp)
+    run("jev", "--base-ir", str(base), "--adapter-dir", str(adapter), "--out", str(tmp / "t"))
+    (_, a, kw, _), = calls
+    assert "switchable_lora" not in kw
+    assert "lora_scale" not in json.loads((tmp / "t" / "decision.json").read_text())["jev"]
+
+
+def test_cli_jev_switchable_lora_needs_a_scale(cli, capsys):
+    run, calls, base, tmp = cli
+    adapter, _ = _jev_adapter(tmp)  # no adapter_config.json beside the adapter
+    with pytest.raises(SystemExit) as e:
+        run("jev", "--base-ir", str(base), "--adapter-dir", str(adapter), "--out", str(tmp / "t"), "--switchable-lora")
+    assert e.value.code == 2 and "pass --lora-scale" in capsys.readouterr().err and calls == []
+
+
+@pytest.mark.parametrize("family", ["kev", "clef"])
+def test_cli_switchable_lora_is_jev_only(cli, monkeypatch, capsys, family):
+    run, calls, base, tmp = cli
+    _seen_writers(monkeypatch, {})
+    with pytest.raises(SystemExit) as e:
+        run(family, *_family_argv(family, base, tmp), "--switchable-lora")
+    assert e.value.code == 2 and "--switchable-lora is jev only" in capsys.readouterr().err and calls == []

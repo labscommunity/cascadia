@@ -306,7 +306,7 @@ def swap_embeddings(src_xml, weights, out_dir, chunk=16384):
     ov.save_model(model, str(Path(out_dir) / "openvino_text_embeddings_model.xml"), compress_to_fp16=False)
 
 
-def graft_lora(model, adapter_file, scale, layers=None, lm_head=True):
+def graft_lora(model, adapter_file, scale, layers=None, lm_head=True, switchable=False):
     """y += scale * (x A^T) B^T on every LoRA-targeted MatMul in `model` (fp32 constants, LoRA term
     first in the Add: OpenVINO's ARM CPU plugin produced NaN with fp16 constants / base-first adds).
     Returns the module paths grafted, one per branch added. Adapter modules with no matching MatMul
@@ -316,13 +316,18 @@ def graft_lora(model, adapter_file, scale, layers=None, lm_head=True):
     `layers` (a range) limits grafting to the stage's own decoder layers and `lm_head` to the last
     stage: a stage > 0 also keeps shape-only copies of earlier layers (the stock IR's mask/position
     bookkeeping reads their output shapes), whose values never reach the stage output. Grafting those
-    would be dead work and would break the coverage check. None = every match (a whole model)."""
+    would be dead work and would break the coverage check. None = every match (a whole model).
+
+    `switchable` leaves `scale` out of the constants and multiplies each branch's output by one
+    shared scalar input `lora_scale` (f32, shape []) before the Add: the caller feeds `scale` for
+    the grafted model and 0 for the base model (System 2). Added only when a branch is grafted."""
     from openvino import opset13 as ops
     from safetensors.torch import load_file
     tensors = load_file(adapter_file)
     pairs = {mod: {ab: tensors[k].float().numpy() for ab, k in side.items()}
              for mod, side in lora_modules(tensors, adapter_file).items()}
     grafted = []
+    lora_scale = None
     for op in list(model.get_ordered_ops()):
         if op.get_type_name() != "MatMul":
             continue
@@ -338,12 +343,20 @@ def graft_lora(model, adapter_file, scale, layers=None, lm_head=True):
         a, b = pairs[m.group(1)]["A"], pairs[m.group(1)]["B"]
         x = op.input_value(0)
         xa = ops.matmul(x, ops.constant(np.ascontiguousarray(a.T, dtype=np.float32)), False, False)
-        xab = ops.matmul(xa, ops.constant(np.ascontiguousarray(b.T * scale, dtype=np.float32)), False, False)
+        xab = ops.matmul(xa, ops.constant(np.ascontiguousarray(b.T if switchable else b.T * scale,
+                                                               dtype=np.float32)), False, False)
+        if switchable:
+            if lora_scale is None:
+                lora_scale = ops.parameter([], np.float32, name="lora_scale")
+                lora_scale.output(0).set_names({"lora_scale"})
+            xab = ops.multiply(xab, lora_scale)
         consumers = list(op.output(0).get_target_inputs())
         added = ops.add(xab, op.output(0))
         for c in consumers:
             c.replace_source_output(added.output(0))
         grafted.append(m.group(1))
+    if lora_scale is not None:
+        model.add_parameters([lora_scale])
     model.validate_nodes_and_infer_types()
     return grafted
 

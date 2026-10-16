@@ -4,6 +4,7 @@
 """
 import os
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -287,6 +288,172 @@ def test_graft_lora_reports_a_module_once_per_matching_matmul(tmp_path):
     got = ov.Core().compile_model(model, "CPU")([np.array([[1.0, 2.0, 3.0]], np.float32)])
     for out in got.values():  # both branches grafted: x + 2 * sum(x) * 0.5
         np.testing.assert_allclose(out, [[7.0, 8.0, 9.0]], rtol=1e-6)
+
+
+def _two_matmul_model(tmp_path):
+    """x -> layers.0.mlp.up_proj -> layers.1.mlp.down_proj, each with its own random A/B (r=2), and
+    the adapter for both. Returns (build() -> fresh ov.Model, adapter path)."""
+    ov = pytest.importorskip("openvino")
+    from openvino import opset13 as ops
+    torch = pytest.importorskip("torch")
+    from safetensors.torch import save_file
+    rng = np.random.default_rng(41)
+    w0, w1 = (rng.standard_normal((4, 4)).astype(np.float32) for _ in range(2))
+    keys = {}
+    for m in ("layers.0.mlp.up_proj", "layers.1.mlp.down_proj"):
+        keys[f"base_model.model.model.{m}.lora_A.weight"] = torch.from_numpy(rng.standard_normal((2, 4)).astype(np.float32))
+        keys[f"base_model.model.model.{m}.lora_B.weight"] = torch.from_numpy(rng.standard_normal((4, 2)).astype(np.float32))
+    path = str(tmp_path / "adapter_model.safetensors")
+    save_file(keys, path)
+
+    def build():
+        x = ops.parameter([2, 4], np.float32, name="x")
+        h = ops.matmul(x, ops.constant(w0), False, True)
+        h.set_friendly_name("__module.model.model.language_model.layers.0.mlp.up_proj/ov_ext::linear/MatMul")
+        y = ops.matmul(h, ops.constant(w1), False, True)
+        y.set_friendly_name("__module.model.model.language_model.layers.1.mlp.down_proj/ov_ext::linear/MatMul")
+        return ov.Model([ops.result(y)], [x], "t")
+    return build, path
+
+
+def _run(model, x, scale=None):
+    import openvino as ov
+    feeds = {"x": x} if scale is None else {"x": x, "lora_scale": np.array(scale, np.float32)}
+    # f32 execution: the CPU plugin may otherwise run in f16/bf16 and blur the comparison
+    return ov.Core().compile_model(model, "CPU", {"INFERENCE_PRECISION_HINT": "f32"})(feeds)[0]
+
+
+def test_switchable_graft_is_the_baked_graft_at_its_scale_and_the_base_model_at_zero(tmp_path):
+    """System 2 runs the same tree as the unmodified base model by feeding lora_scale = 0; System 1
+    feeds the trained scale and must get exactly what the baked graft computes."""
+    build, path = _two_matmul_model(tmp_path)
+    x = np.random.default_rng(7).standard_normal((2, 4)).astype(np.float32)
+    base = _run(build(), x)
+    baked = build()
+    assert ws.graft_lora(baked, path, 2.0) == ["layers.0.mlp.up_proj", "layers.1.mlp.down_proj"]
+    sw = build()
+    assert ws.graft_lora(sw, path, 2.0, switchable=True) == ["layers.0.mlp.up_proj", "layers.1.mlp.down_proj"]
+    assert not np.allclose(_run(baked, x), base)  # the adapter does move the output
+    assert np.allclose(_run(sw, x, 2.0), _run(baked, x), rtol=1e-5, atol=1e-5)
+    assert np.allclose(_run(sw, x, 0.0), base, rtol=1e-6, atol=1e-6)
+
+
+def test_switchable_graft_adds_one_shared_scalar_lora_scale_input(tmp_path):
+    build, path = _two_matmul_model(tmp_path)
+    sw = build()
+    ws.graft_lora(sw, path, 2.0, switchable=True)
+    scales = [p for p in sw.get_parameters() if p.get_friendly_name() == "lora_scale"]
+    assert len(scales) == 1 and len(sw.get_parameters()) == 2
+    p, = scales
+    assert p.get_element_type().get_type_name() == "f32" and list(p.get_partial_shape().to_shape()) == []
+    assert "lora_scale" in p.output(0).get_names()
+    # every branch multiplies by that one input, after (x A^T) B^T, LoRA term first in the Add
+    muls = [t.get_node() for t in p.output(0).get_target_inputs()]
+    assert len(muls) == 2 and all(m.get_type_name() == "Multiply" for m in muls)
+    for m in muls:
+        add, = [t.get_node() for t in m.output(0).get_target_inputs()]
+        assert add.get_type_name() == "Add" and add.input_value(0).get_node() is m
+    # B is no longer pre-multiplied by the scale: no Constant on any branch depends on it
+    from safetensors.torch import load_file
+    bs = [v.numpy() for k, v in load_file(path).items() if k.endswith("lora_B.weight")]
+    consts = [op.get_data() for op in sw.get_ops() if op.get_type_name() == "Constant"]
+    for b in bs:
+        assert any(c.shape == b.T.shape and np.array_equal(c, b.T) for c in consts)
+
+
+def test_switchable_graft_leaves_a_stage_without_branches_alone(tmp_path):
+    """Only a stage that carries a grafted branch gains the input (a stage outside `layers` has none)."""
+    build, path = _two_matmul_model(tmp_path)
+    m = build()
+    assert ws.graft_lora(m, path, 2.0, layers=range(4, 8), lm_head=False, switchable=True) == []
+    assert [p.get_friendly_name() for p in m.get_parameters()] == ["x"]
+
+
+# The graft as it was before the switchable option (Task 41), kept verbatim as the reference the
+# default graft must still serialize to byte for byte.
+_PRE_SWITCHABLE_GRAFT = r'''
+def graft_lora(model, adapter_file, scale, layers=None, lm_head=True):
+    from openvino import opset13 as ops
+    from safetensors.torch import load_file
+    tensors = load_file(adapter_file)
+    pairs = {mod: {ab: tensors[k].float().numpy() for ab, k in side.items()}
+             for mod, side in ws.lora_modules(tensors, adapter_file).items()}
+    grafted = []
+    for op in list(model.get_ordered_ops()):
+        if op.get_type_name() != "MatMul":
+            continue
+        m = re.search(r"__module\.(?:model\.)*(?:language_model\.)?((?:layers\.\d+\.[\w.]+)|lm_head)/(?:aten|ov_ext)::linear/MatMul$",
+                      op.get_friendly_name())
+        if not m or m.group(1) not in pairs:
+            continue
+        if m.group(1) == "lm_head":
+            if not lm_head:
+                continue
+        elif layers is not None and int(m.group(1).split(".")[1]) not in layers:
+            continue
+        a, b = pairs[m.group(1)]["A"], pairs[m.group(1)]["B"]
+        x = op.input_value(0)
+        xa = ops.matmul(x, ops.constant(np.ascontiguousarray(a.T, dtype=np.float32)), False, False)
+        xab = ops.matmul(xa, ops.constant(np.ascontiguousarray(b.T * scale, dtype=np.float32)), False, False)
+        consumers = list(op.output(0).get_target_inputs())
+        added = ops.add(xab, op.output(0))
+        for c in consumers:
+            c.replace_source_output(added.output(0))
+        grafted.append(m.group(1))
+    model.validate_nodes_and_infer_types()
+    return grafted
+'''
+
+_SAVE_GRAFTED = r'''
+import re, sys
+from pathlib import Path
+
+import numpy as np
+import openvino as ov
+from openvino import opset13 as ops
+sys.path.insert(0, {surgery!r})
+import weight_swap as ws
+{reference}
+w = np.arange(16, dtype=np.float32).reshape(4, 4) / 7
+outs = []
+for name in ("layers.0.mlp.up_proj", "layers.1.mlp.down_proj", "lm_head"):
+    x = ops.parameter([2, 4], np.float32, name="x" + str(len(outs)))
+    mm = ops.matmul(x, ops.constant(w), False, True)
+    mm.set_friendly_name("__module.model.model.language_model." + name + "/ov_ext::linear/MatMul")
+    outs.append((ops.result(mm), x))
+model = ov.Model([r for r, _ in outs], [x for _, x in outs], "t")
+graft = graft_lora if {use_reference!r} else ws.graft_lora
+graft(model, {adapter!r}, 2.0, layers=range(0, 2), lm_head=True)
+ov.save_model(model, {out!r}, compress_to_fp16=False)
+'''
+
+
+def test_default_graft_serializes_byte_for_byte_as_before(tmp_path):
+    """Default exports must not change: the default graft builds the same graph, node for node, as
+    the graft before `switchable` (each run in a fresh interpreter, so auto-generated node names
+    count from the same start)."""
+    pytest.importorskip("openvino")
+    torch = pytest.importorskip("torch")
+    import subprocess
+    from safetensors.torch import save_file
+    rng = np.random.default_rng(3)
+    keys = {}
+    for m in ("model.layers.0.mlp.up_proj", "model.layers.1.mlp.down_proj", "lm_head"):
+        keys[f"base_model.model.{m}.lora_A.weight"] = torch.from_numpy(rng.standard_normal((2, 4)).astype(np.float32))
+        keys[f"base_model.model.{m}.lora_B.weight"] = torch.from_numpy(rng.standard_normal((4, 2)).astype(np.float32))
+    adapter = str(tmp_path / "adapter_model.safetensors")
+    save_file(keys, adapter)
+    surgery = os.path.join(os.path.dirname(__file__), os.pardir, "qwen36_surgery")
+    files = {}
+    for tag, use_reference in (("before", True), ("now", False)):
+        out = str(tmp_path / tag / "m.xml")
+        script = _SAVE_GRAFTED.format(surgery=os.path.abspath(surgery), adapter=adapter, out=out,
+                                      use_reference=use_reference,
+                                      reference=_PRE_SWITCHABLE_GRAFT if use_reference else "")
+        subprocess.run([sys.executable, "-c", script], check=True)
+        files[tag] = (Path(out).read_bytes(), Path(out).with_suffix(".bin").read_bytes())
+    assert b"Add" in files["now"][0] and b"Multiply" not in files["now"][0]
+    assert files["now"] == files["before"]
 
 
 def test_add_final_hidden_output_exposes_lm_head_input():
