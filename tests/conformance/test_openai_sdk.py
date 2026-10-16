@@ -13,6 +13,8 @@ files) through `openai.OpenAI` rather than raw HTTP:
       - image_url sent to a text-only model -> BadRequestError
       - an unsupported content part -> BadRequestError, reason only
       - legacy completions with a prompt list -> BadRequestError
+  * /v1/responses: a string input, an item list with `instructions`, the
+    streamed event sequence, and refusals naming the field in `param`
 
 Run:  python3 tests/conformance/test_openai_sdk.py --bin target/debug/cascadia
 Requires the pinned SDK: pip install -r tests/conformance/requirements-openai-sdk.txt
@@ -125,6 +127,39 @@ class OpenAISdkConformance(unittest.TestCase):
             lambda: self.client.completions.create(model="mock-model", prompt=["a", "b"],
                                                    max_tokens=4),
             "multi-prompt")
+
+    def test_responses(self):
+        r = self.client.responses.create(model="mock-model", input="hello there friend",
+                                         max_output_tokens=8)
+        self.assertEqual(r.object, "response")
+        self.assertIn(r.status, ("completed", "incomplete"))
+        self.assertTrue(r.output_text)
+        self.assertEqual(r.output[0].content[0].type, "output_text")
+        self.assertGreater(r.usage.output_tokens, 0)
+        r = self.client.responses.create(
+            model="mock-model", instructions="be brief", max_output_tokens=8,
+            input=[{"role": "user", "content": [{"type": "input_text", "text": "one two"}]}])
+        self.assertTrue(r.output_text)
+
+    def test_responses_streaming(self):
+        events = list(self.client.responses.create(
+            model="mock-model", input="one two three four", max_output_tokens=8, stream=True))
+        kinds = [e.type for e in events]
+        self.assertEqual(kinds[0], "response.created")
+        self.assertIn(kinds[-1], ("response.completed", "response.incomplete"))
+        text = "".join(e.delta for e in events if e.type == "response.output_text.delta")
+        self.assertTrue(text)
+        self.assertEqual(events[-1].response.output_text, text)
+
+    def test_responses_refusals_name_the_field(self):
+        for kw, param in (({"previous_response_id": "resp_1"}, "previous_response_id"),
+                          ({"store": True}, "store"),
+                          ({"tools": [{"type": "function", "name": "f",
+                                       "parameters": {}}]}, "tools")):
+            with self.assertRaises(openai.BadRequestError) as ctx:
+                self.client.responses.create(model="mock-model", input="hi", **kw)
+            self.assertEqual(ctx.exception.body["param"], param)
+            self.assertEqual(ctx.exception.body["type"], "invalid_request_error")
 
 
 if __name__ == "__main__":

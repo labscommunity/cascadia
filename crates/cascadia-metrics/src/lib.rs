@@ -88,6 +88,9 @@ pub static INFLIGHT_TASKS: LazyLock<IntGauge> = LazyLock::new(|| {
 ///   (both 503). Add workers.
 /// - `empty_prompt` (400), `multi_prompt` (unsupported batch form, 400) —
 ///   malformed request.
+/// - `unsupported_field` (400) — a well-formed `/v1/responses` field the
+///   server does not serve (tools, stored state, file or audio input); the
+///   error's `param` names it.
 /// - `malformed_body` (400, or 413 over the body limit) — the body did not
 ///   parse as the request: bad JSON, wrong field types, or an unsupported
 ///   content part.
