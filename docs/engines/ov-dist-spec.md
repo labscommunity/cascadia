@@ -80,10 +80,20 @@ cut by `tools/vlm_surgery/cut_vlm_lm.py --all-logits`. Only the target sees imag
   encoder's rows. Stage 0 takes `inputs_embeds`. Drafted and accepted tokens are embedded
   through the same table with no image rows, so image rows only ever enter the prompt
   prefill, never a speculative span, and the mask-based rewind only touches text rows.
-- **The draft** is text-only and is fed the same expanded ids, image tokens as ordinary
-  tokens. Verification keeps the output the target's greedy output; the draft only moves
-  the acceptance rate. It must share the target's token ids (Ministral-3-3B for Pixtral
-  12B: the same tekken vocabulary).
+- **The draft** is text-only and is fed the prompt with the image ids (`[IMG]`,
+  `[IMG_BREAK]`, `[IMG_END]`) dropped: hundreds of placeholders read as text are likely noise
+  to it (0 of 40 drafts accepted on pawan-02). Its cache is its own, so its positions
+  need not match the target's. Verification keeps the output the target's greedy output;
+  the draft only moves the acceptance rate. It must share the target's token ids
+  (Ministral-3-3B for Pixtral 12B: the same tekken vocabulary).
+- **Prefill** runs in 512-row chunks (target and draft) sent as `FORWARD_LAST_ROW`
+  (kind 10), which the last stage answers with the final row's logits only; verify spans
+  keep every row. Wire and memory per inference stay bounded whatever the prompt (8 1 MP
+  images expand to about 33k tokens: one 512-row chunk is 512 x 131072 f32 logits, 256
+  MiB inside the last stage, and one 256 KiB row on the wire). A worker built before
+  kind 10 refuses it loudly (`bad kind 10`): upgrade every rank together.
+- **Window**: `submit` answers a prompt at or past the target's `max_position_embeddings`
+  with a 413, sizing image turns from their dimensions before any encode.
 - **Workers** are unchanged: hidden states and the mask travel as for any v5 tree.
 
 What a target tree must provide, and how a `cut_vlm_lm.py` tree meets it:
@@ -107,6 +117,16 @@ With `kv_coord`, an image turn always prefills cold and is not captured for warm
 (its key would be placeholder ids that every image of one size shares); text turns on
 the same engine capture and resume as before. A resumed turn (`resume_token_ids`) cannot
 carry images.
+
+`usage.prompt_tokens` counts the expanded prompt (image soft tokens included).
+
+Check a draft against its export (greedy draft vs embeddings + language model, and a
+masked-rewind run that must match):
+
+```bash
+python tools/vlm_surgery/check_text_draft.py --export <ministral3-3b-int4-ov> \
+    --draft <ministral3-3b-text-draft> --image-tokens 784
+```
 
 Build the draft and the target tree (Windows paths; models in `C:\vlm\models`, trees in `C:\vlm\trees`):
 

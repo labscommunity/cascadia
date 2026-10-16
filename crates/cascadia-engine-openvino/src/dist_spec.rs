@@ -318,6 +318,17 @@ fn splice_prompt_rows(
     Ok(images.iter().map(|im| im.len()).sum::<usize>() / hidden.max(1))
 }
 
+/// The draft's view of an image turn's expanded prompt: every image id (soft
+/// tokens and their row/end framing) dropped. A text draft cannot read
+/// hundreds of `[IMG]` placeholders as anything but noise, and its cache is
+/// its own, so its positions need not line up with the target's.
+fn draft_prompt_ids(ids: &[i64], image_ids: &[i64]) -> Vec<i64> {
+    ids.iter()
+        .copied()
+        .filter(|t| !image_ids.contains(t))
+        .collect()
+}
+
 /// The `vocab_size` in `dir/config.json` (top level or `text_config`).
 fn config_vocab(dir: &std::path::Path) -> Option<usize> {
     let v: serde_json::Value =
@@ -1706,6 +1717,9 @@ struct ActiveSpec {
     stats: SpecDecodeStats,
     /// Whether we already emitted the first sampled token's chunk.
     initialized: bool,
+    /// Prompt tokens the target consumed (image soft tokens included), for
+    /// `usage.prompt_tokens`.
+    prompt_len: usize,
     /// Images this turn's prompt carries (VLM target). An image turn stays
     /// out of the KV warm-resume cache: its key would be placeholder ids that
     /// every image of one size shares.
@@ -2098,9 +2112,22 @@ impl OvDistSpecEngine {
         // Draft: the same ids, image soft tokens included as ordinary tokens.
         let (t_logits, t_shape) = self.target.feed_prompt(feed_ids, &image_rows)?;
         drop(image_rows);
+        // An image turn's draft reads the prompt without its image ids.
+        let draft_ids = match self.target.vision.as_ref() {
+            Some(v) if images > 0 => {
+                let ids = draft_prompt_ids(feed_ids, &v.frontend.image_framing());
+                info!(
+                    target_prompt = feed_ids.len(),
+                    draft_prompt = ids.len(),
+                    "ov-dist-spec: draft prefill without the image ids"
+                );
+                ids
+            }
+            _ => feed_ids.to_vec(),
+        };
         // Chunked like the target: the draft's prefill logits are discarded,
         // and a whole image prompt's would be `T x vocab` floats.
-        for chunk in feed_ids.chunks(PREFILL_CHUNK) {
+        for chunk in draft_ids.chunks(PREFILL_CHUNK) {
             self.draft.feed(chunk)?;
         }
         let vocab = t_shape[2];
@@ -2144,6 +2171,7 @@ impl OvDistSpecEngine {
             d_last_logit,
             stats: SpecDecodeStats::default(),
             initialized: false,
+            prompt_len: prompt_ids.len(),
             images,
         })
     }
@@ -2312,7 +2340,9 @@ impl OvDistSpecEngine {
                 is_final: true,
                 logprobs: None,
                 n_tokens: if n_tokens > 0 { Some(n_tokens) } else { None },
-                prompt_tokens: None,
+                // OpenAI's usage.prompt_tokens: every prompt token the target
+                // consumed, image soft tokens included.
+                prompt_tokens: Some(active.prompt_len as u32),
                 error: None,
                 token_ids,
                 finish_reason: None,
@@ -3955,6 +3985,14 @@ mod tests {
         .unwrap();
         assert_eq!(config_max_ctx(&dir), Some(1_024_000));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn draft_prompt_drops_the_image_ids() {
+        // [INST] [IMG] [IMG] [IMG_BREAK] [IMG] [IMG] [IMG_END] text [/INST]
+        let ids = [1, 3, IMG, IMG, 12, IMG, IMG, 13, 1784, 4];
+        assert_eq!(draft_prompt_ids(&ids, &[IMG, 12, 13]), vec![1, 3, 1784, 4]);
+        assert_eq!(draft_prompt_ids(&[1, 5], &[IMG, 12, 13]), vec![1, 5]);
     }
 
     #[test]
