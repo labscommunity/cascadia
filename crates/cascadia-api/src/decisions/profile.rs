@@ -4,7 +4,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 /// Calibration bounds checked at load. Shipped profiles use temperatures near 1 (JEV ~0.98,
-/// Kev ~2.19) and biases of a few units; with these bounds `(logit + bias) / temperature` is at
+/// Kev ~2.19) and biases of a few tenths; with these bounds `(logit + bias) / temperature` is at
 /// most ~3.4e41 for any finite f32 logit, far inside f64.
 pub const MIN_TEMPERATURE: f64 = 1e-3;
 pub const MAX_TEMPERATURE: f64 = 1e3;
@@ -74,31 +74,53 @@ impl DecisionProfile {
                 format!("{:?}", p.family).to_lowercase()
             ));
         }
-        // A zero, negative or non-finite temperature turns every probability into NaN, and so
-        // does one small enough (or a bias large enough) for `(logit + bias) / temperature` to
-        // overflow (H17). Within these bounds it stays finite for every finite f32 logit.
-        let temps = p
-            .jev
-            .iter()
-            .flat_map(|j| j.temperature.values())
-            .chain(p.kev.iter().map(|k| &k.temperature));
-        if let Some(t) = temps
-            .copied()
-            .find(|t| !(MIN_TEMPERATURE..=MAX_TEMPERATURE).contains(t))
-        {
-            return Err(format!(
-                "{}: temperature must be in [{MIN_TEMPERATURE}, {MAX_TEMPERATURE}], got {t}",
-                path.display()
-            ));
-        }
-        let biases = p.jev.iter().flat_map(|j| j.bias.iter());
-        if let Some(b) = biases.copied().find(|b| !(b.abs() <= MAX_ABS_BIAS)) {
-            return Err(format!(
-                "{}: bias must be in [-{MAX_ABS_BIAS}, {MAX_ABS_BIAS}], got {b}",
-                path.display()
-            ));
-        }
+        let checked = p.jev.as_ref().map_or(Ok(()), JevProfile::check_calibration);
+        checked
+            .and(p.kev.as_ref().map_or(Ok(()), KevProfile::check_calibration))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         Ok(p)
+    }
+}
+
+/// A zero, negative or non-finite temperature turns every probability into NaN, and so does
+/// one small enough (or a bias large enough) for `(logit + bias) / temperature` to overflow
+/// (H17). Within these bounds it stays finite for every finite f32 logit.
+fn check_calibration<'a>(
+    temps: impl IntoIterator<Item = &'a f64>,
+    biases: impl IntoIterator<Item = &'a f64>,
+) -> Result<(), String> {
+    if let Some(t) = temps
+        .into_iter()
+        .copied()
+        .find(|t| !(MIN_TEMPERATURE..=MAX_TEMPERATURE).contains(t))
+    {
+        return Err(format!(
+            "temperature must be in [{MIN_TEMPERATURE}, {MAX_TEMPERATURE}], got {t}"
+        ));
+    }
+    if let Some(b) = biases
+        .into_iter()
+        .copied()
+        .find(|b| b.is_nan() || b.abs() > MAX_ABS_BIAS)
+    {
+        return Err(format!(
+            "bias must be in [-{MAX_ABS_BIAS}, {MAX_ABS_BIAS}], got {b}"
+        ));
+    }
+    Ok(())
+}
+
+impl JevProfile {
+    /// The calibration bounds, checked at load and again by `JevCodec::new`.
+    pub fn check_calibration(&self) -> Result<(), String> {
+        check_calibration(self.temperature.values(), &self.bias)
+    }
+}
+
+impl KevProfile {
+    /// The temperature bound, checked at load and again by `KevCodec::new`.
+    pub fn check_calibration(&self) -> Result<(), String> {
+        check_calibration([&self.temperature], [])
     }
 }
 

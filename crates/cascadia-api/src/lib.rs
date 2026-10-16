@@ -3594,14 +3594,14 @@ mod tests {
             .enumerate()
             .map(|(i, w)| (w.to_string(), i as u32))
             .collect();
-        // The mock engine fails a decision task whose prompt_ids contain 999_999.
-        vocab.insert("__engine_error__".into(), 999_999);
-        // ... and returns non-finite logits (NaN, +inf, -inf) for one containing 999_998.
-        vocab.insert("__non_finite__".into(), 999_998);
-        // ... and fails a `require_warm` pass containing 999_997 as an evicted snapshot.
-        vocab.insert("__evicted__".into(), 999_997);
-        // ... and fails a `needs_snapshot` pass containing 999_996 as a prefix the cache cannot hold.
-        vocab.insert("__uncacheable__".into(), 999_996);
+        // The mock engine's decision sentinels: a failed task, non-finite logits (NaN, +inf,
+        // -inf), an evicted snapshot (`require_warm`) and a prefix the cache cannot hold
+        // (`needs_snapshot`).
+        use cascadia_engine_mock as mock;
+        vocab.insert("__engine_error__".into(), mock::DECISION_FAIL_ID);
+        vocab.insert("__non_finite__".into(), mock::DECISION_NON_FINITE_ID);
+        vocab.insert("__evicted__".into(), mock::DECISION_EVICTED_ID);
+        vocab.insert("__uncacheable__".into(), mock::DECISION_UNCACHEABLE_ID);
         let model = tokenizers::models::wordlevel::WordLevel::builder()
             .vocab(vocab.into_iter().collect())
             .unk_token("[unk]".into())
@@ -3786,13 +3786,32 @@ mod tests {
                 format!(
                     r#"{{"input": [{{"role": "user", "content": [{{"type": "input_text"}}]}}], {q}}}"#
                 ),
-                "input_text",
+                r#"input_text parts need a string "text""#,
             ),
             (
                 format!(
                     r#"{{"input": [{{"role": "user", "content": [{{"text": "x"}}]}}], {q}}}"#
                 ),
-                "type",
+                r#"every content part needs a "type""#,
+            ),
+            (
+                format!(
+                    r#"{{"input": [{{"role": "user", "content": [{{"type": 5, "text": "x"}}]}}], {q}}}"#
+                ),
+                r#"content part "type" must be a string"#,
+            ),
+            (
+                format!(
+                    r#"{{"input": [{{"role": "user", "content": [{{"type": "input_image"}}]}}], {q}}}"#
+                ),
+                r#"input_image parts need a string "image_url""#,
+            ),
+            // OpenAI's newer object form of `image_url` is not accepted (a string URL only).
+            (
+                format!(
+                    r#"{{"input": [{{"role": "user", "content": [{{"type": "input_image", "image_url": {{"url": "https://x/y.png"}}}}]}}], {q}}}"#
+                ),
+                r#"input_image parts need a string "image_url""#,
             ),
             // an unknown question type and plain malformed JSON get the envelope too
             (
@@ -4380,7 +4399,7 @@ mod tests {
 
     #[tokio::test]
     async fn decisions_engine_error_text_is_not_returned() {
-        // the mock fails a task whose prompt_ids contain the sentinel id 999_999 (Task 2)
+        // the mock fails a task whose prompt_ids contain DECISION_FAIL_ID (Task 2)
         let (status, v, body) = post_decisions(
             make_decision_app().await,
             r#"{"model": "m", "state": "__engine_error__", "questions": {"u": {"type": "noul"}}}"#,
@@ -4393,7 +4412,7 @@ mod tests {
 
     #[tokio::test]
     async fn decisions_non_finite_logits_are_an_engine_error_not_a_200() {
-        // the mock returns NaN/+inf/-inf logits for the sentinel id 999_998; softmax of those is
+        // the mock returns NaN/+inf/-inf logits for DECISION_NON_FINITE_ID; softmax of those is
         // NaN, which would serialise as `null` with a fabricated first-option answer
         for q in [
             r#"{"u": {"type": "noul"}}"#,

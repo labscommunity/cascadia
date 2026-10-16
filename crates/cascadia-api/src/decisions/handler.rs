@@ -56,8 +56,10 @@ fn engine_failure(reason: &str) -> DecisionError {
     if reason.starts_with("decision_unsupported") {
         return DecisionError::NotServed;
     }
-    // The engine's joint input limit (MAX_HEAD_INPUT_BYTES): a too-long request, refused before
-    // any prefill. The codec clamps first, so this only fires for a width the API did not know.
+    // The engine's joint input limit (MAX_HEAD_INPUT_BYTES): a too-long request. The codec
+    // clamps first, so this only fires for a width the API did not know, or in a mixed pipeline
+    // where the last rank caps lower than this rank 0's codec: there it is refused before the
+    // head runs but after the chain prefill. A single box refuses it before any prefill.
     if reason.starts_with("decision_too_long") {
         return DecisionError::TooLong("decision prompt too long for the model's head".into());
     }
