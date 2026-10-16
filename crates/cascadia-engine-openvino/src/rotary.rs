@@ -13,8 +13,13 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct RopeScalingConfig {
-    #[serde(default, alias = "type")]
+    #[serde(default)]
     pub rope_type: Option<String>,
+    /// The older spelling of `rope_type`. A separate field, not a serde alias:
+    /// Qwen2.5-VL's config carries both keys, and an alias rejects that as a
+    /// duplicate field.
+    #[serde(default, rename = "type")]
+    pub legacy_type: Option<String>,
     #[serde(default)]
     pub factor: Option<f32>,
     #[serde(default)]
@@ -23,6 +28,13 @@ pub struct RopeScalingConfig {
     pub high_freq_factor: Option<f32>,
     #[serde(default)]
     pub original_max_position_embeddings: Option<u32>,
+}
+
+impl RopeScalingConfig {
+    /// The scaling kind: `rope_type`, else the older `type`.
+    pub fn kind(&self) -> Option<&str> {
+        self.rope_type.as_deref().or(self.legacy_type.as_deref())
+    }
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -98,7 +110,7 @@ impl Rotary {
         }
 
         if let Some(scale) = &cfg.rope_scaling {
-            if scale.rope_type.as_deref() == Some("llama3") {
+            if scale.kind() == Some("llama3") {
                 Self::apply_llama3_scaling(&mut inv_freq, scale)?;
             }
             // Other scaling types (linear, dynamic, yarn) are no-ops here for now;
@@ -205,6 +217,7 @@ mod tests {
             max_position_embeddings: 131072,
             rope_scaling: Some(RopeScalingConfig {
                 rope_type: Some("llama3".into()),
+                legacy_type: None,
                 factor: Some(8.0),
                 low_freq_factor: Some(1.0),
                 high_freq_factor: Some(4.0),
@@ -274,5 +287,18 @@ mod tests {
         assert!(cfg.text_config.is_some());
         let r = Rotary::from_config(&cfg).unwrap();
         assert_eq!(r.head_dim(), 128);
+    }
+
+    #[test]
+    fn rope_scaling_accepts_type_and_rope_type_together() {
+        // Qwen2.5-VL writes both keys; an alias made serde reject the config.
+        let both: RopeScalingConfig = serde_json::from_str(
+            r#"{"type": "mrope", "rope_type": "default", "mrope_section": [16, 24, 24]}"#,
+        )
+        .unwrap();
+        assert_eq!(both.kind(), Some("default"));
+        let old: RopeScalingConfig =
+            serde_json::from_str(r#"{"type": "llama3", "factor": 8.0}"#).unwrap();
+        assert_eq!(old.kind(), Some("llama3"));
     }
 }
