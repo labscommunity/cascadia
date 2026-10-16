@@ -1580,6 +1580,12 @@ fn chat_template_smoke_failures(
 }
 
 fn build_chat_env(template_src: &str) -> Result<minijinja::Environment<'static>, String> {
+    // Jinja2 (what HF renders with) normalises \r\n and lone \r to \n in the
+    // whole source, string literals included. A template written on Windows
+    // (optimum-cli there writes chat_template.jinja with CRLF) otherwise keeps
+    // a \r per line: Ministral-3's default system prompt cost 51 tokens more
+    // than HF's count.
+    let template_src = &template_src.replace("\r\n", "\n").replace('\r', "\n");
     use minijinja::value::Value;
     use minijinja::{Environment, Error, ErrorKind};
 
@@ -4590,6 +4596,30 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("<|video_pad|>"));
+    }
+
+    /// A template saved with Windows line endings renders exactly like the
+    /// same template with \n, as Jinja2 normalises them.
+    #[test]
+    fn crlf_templates_render_like_lf() {
+        let lf = "{%- set sys = 'line one\nline two' %}[S]{{ sys }}[/S]\n{%- for m in messages %}{{ m.content }}\n{% endfor %}";
+        let crlf = lf.replace('\n', "\r\n");
+        let msgs = [ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            parts: Vec::new(),
+        }];
+        let render = |src: &str| {
+            let env = build_chat_env(src).unwrap();
+            render_with_chat_env(&env, &msgs, "<s>", "</s>", false, None, None).unwrap()
+        };
+        let want = render(lf);
+        assert!(!want.contains('\r'));
+        assert_eq!(render(&crlf), want);
+        assert_eq!(render(&lf.replace('\n', "\r")), want);
     }
 
     /// Everything the image path refuses comes back as an OpenAI-shaped 400
