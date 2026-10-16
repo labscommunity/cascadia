@@ -310,7 +310,9 @@ Error messages are deliberately terse:
   pipeline whose last rank predates this limit, that rank refuses a Clef-27B readout over 13,107
   tokens only after the chain prefill, because rank 0 cannot tell from HELLO which limit the last
   rank holds. A last rank from commit fd87d505 onward refuses it with the same 413
-  (`decision_too_long`); an older one fails it in the native shim, which is a 503. The wire format is unchanged. The request-level `max_total_tokens` byte pre-check still applies to every family.
+  (`decision_too_long`); an older one fails it in the native shim, which is a 503. The wire
+  format is unchanged. The request-level `max_total_tokens` byte pre-check still applies to every
+  family.
 - **JEV and Kev run one prefill pass per question**, so `max_questions` bounds the engine work of
   one request. Clef runs one pass for the whole request.
 - **Prefill work** is the sum of all passes' prompt lengths. Kev repeats the state at the start of
