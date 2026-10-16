@@ -484,6 +484,16 @@ python tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref ~/parity
 - The wide files never replace the 50-record ones: `jev.wide.parity.jsonl` and
   `jev.wide.golden.jsonl` sit beside `jev.parity.jsonl` and `jev.golden.jsonl`.
 
+**Measured** (JEV-9B int8, single box, 2026-10-17): `codec_golden.py --wide` matched all 62 passes
+(every strategy, 17–256 options) to the reference layout and trained head. The wide gate against
+the streamed fp32 reference passed 17/17 on both devices, with every tournament's finalists equal
+to the reference's: max |Δp| 0.019 on CPU (native questions 0.006) and 0.048 on GPU (native
+0.005), so the strategies add nothing measurable on CPU and the GPU's margin is its own precision.
+The 50-record parity on the same build was unchanged (80/82 on GPU, max |Δp| 0.024). JEV-27B
+across two hosts answered a 40-option choice with `single` in 69 s and with `tournament` (three
+groups and a final) in 67 s, both 200 with all 40 probabilities summing to 1; a 16-option choice
+took 17 s as before.
+
 ## Confidence
 
 **Confidence follows TypeSafe's system-one-adapter 0.2.1**, the formulas Kev's own server also
