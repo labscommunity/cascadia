@@ -510,9 +510,12 @@ cascadia run ~/trees/kev9b-int8 --engine qwen35 --device CPU --api 127.0.0.1:808
 |---|---|---|
 | Passes vs `kev.questions` (82 + 4 synthetic) | 86/86 | 86/86 |
 | Answers vs the spike's saved full-precision reference | 82/82 | 82/82 |
-| int8 vs streamed fp32 reference | **82/82** (choice 33/33, predicate 24/24, score 25/25), max \|Δp\| 0.069, no flips | **82/82**, max \|Δp\| 0.083, no flips |
-| Pipeline vs single-box answers (`--confident 0.05`) | — | 82/82, max \|Δp\| 0.023, no flips |
+| int8 vs streamed fp32 reference | **81/82** (choice 33/33, predicate 24/24, score 24/25), max \|Δp\| 0.034; the one flip, `r43.severity`, has a reference margin of 0.007 | **82/82**, max \|Δp\| 0.029, no flips |
 | `/v1/decisions` vs `/v1/systemone` | 62/62 identical | — |
+
+The fp32 and route rows were measured on trees exported after the `q_asym` fix (see Clef 27B); before it,
+the same checks gave max \|Δp\| 0.069 (single box) and 0.083 (pipeline). The prompt-layout row does not
+depend on the weights; the spike-answers row predates the fix.
 
 The route check covers the 62 questions whose state is a string. Kev and Clef render an object state
 structurally, while an OpenAI `input` is always text, so an object state sent as `json.dumps` text renders
@@ -549,13 +552,14 @@ cascadia run ~/trees/clef-flash-int8 --engine qwen35 --device CPU --api 127.0.0.
 |---|---|---|
 | Records vs the spike's `encode_record` (50 + 4 synthetic) | 54/54 | 54/54 |
 | Answers vs the spike's saved full-precision reference | 82/82 | 82/82 |
-| int8 vs streamed fp32 reference | **82/82** (choice 33/33, predicate 24/24, score 25/25), max \|Δp\| 0.072, no flips | **82/82**, max \|Δp\| 0.069, no flips |
-| Pipeline vs single-box answers (`--confident 0.05`) | — | 82/82, max \|Δp\| 0.012, no flips |
+| int8 vs streamed fp32 reference | **81/82** (choice 33/33, predicate 24/24, score 24/25), max \|Δp\| 0.039; the one flip, `r07.severity`, has a reference margin of 0.012 | **81/82**, max \|Δp\| 0.036; the same `r07.severity` near-tie |
 | `/v1/decisions` vs `/v1/systemone` (string states) | 62/62 identical | — |
 
-The same request sent twice returns 200 both times with identical answers (joint passes always prefill
-cold). For comparison, the spike's int4 export on Apple Silicon agreed on 79/82; int8 on x86 removes
-those flips, including the near-tie `r07.severity`.
+As for Kev-9B, the fp32 and route rows come from trees exported after the `q_asym` fix (before it: max
+\|Δp\| 0.072 single box, 0.069 pipeline, no flips); the spike-answers row predates the fix. The same
+request sent twice returns 200 both times with identical answers (joint passes always prefill cold). For
+comparison, the spike's int4 export on Apple Silicon agreed on 79/82. `r07.severity` is a genuine
+near-tie: the reference gives its two leading options 0.419 and 0.407.
 
 ### JEV-27B
 
