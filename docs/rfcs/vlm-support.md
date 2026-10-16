@@ -1266,6 +1266,33 @@ already serves on one box.
 - **Not covered:** `ov-dist-spec` (refused at load: Pixtral / Mistral 3 targets only).
   Not yet run on the cluster.
 
+## Every GenAI-only family across machines (2026-10-17)
+
+The families that only `ov-genai` served (one box) now also run staged on `ov-runtime`,
+each cut into 2 stages by `cut_vlm_lm.py --family <f>` from its public OpenVINO int4 export
+(no Hugging Face token needed), stage 0 on pawan-02 and stage 1 on pawan-04 (each node
+cut its own stage from its own download), CPU, with one binary from this branch. The
+11-check SDK test passes on every one, and the prompt token counts equal `ov-genai`'s
+on the same export except where `ov-genai` is the one that is off:
+
+| Family (`--family`) | Export | Result | Prompt tokens (1 image) | `ov-genai` |
+|---|---|---|---|---|
+| Gemma 3 (`gemma3`) | `OpenVINO/gemma-3-12b-it-int4-ov` | 11/11 | 286 (two images 550) | 286 |
+| LLaVA-NeXT (`llava_next`) | `OpenVINO/llava-v1.6-mistral-7b-hf-int4-ov` | 11/11 | 2956 | 2956 |
+| Phi-3.5-vision (`phi3_v`) | `OpenVINO/Phi-3.5-vision-instruct-int4-ov` | 11/11 | 785 | 785 |
+| InternVL2 (`internvl_chat`) | `OpenVINO/InternVL2-4B-int4-ov` | 11/11 | 280 | 282 |
+| Qwen2.5-VL (`qwen2_5_vl`) | `OpenVINO/Qwen2.5-VL-7B-Instruct-int4-ov` | 11/11 | 294 | 294 |
+| Qwen3-VL (`qwen3_vl`) | `OpenVINO/Qwen3-VL-4B-Instruct-int4-ov` | 11/11 | 223 | 223 |
+
+InternVL2: 280 is HF's count for this request (the export's chat template, then the
+model card's 256 `<IMG_CONTEXT>` per tile: `<s>` + `<|user|>` 2, question 17, image block
+259, `<|end|>` + `<|assistant|>` 2); GenAI's 282 adds a second BOS and a newline.
+Qwen2.5-VL needed one fix found here: its `rope_scaling` carries both `type` and
+`rope_type`, which the config reader's serde alias rejected as a duplicate field
+(`080698fb`). Qwen VL trees carry M-RoPE positions as their own wire frame (checked at
+load) and refuse the static and packed paths; Qwen3-VL's DeepStack features enter after
+LM layers 0-2, inside stage 0 on rank 0, so they never cross the wire.
+
 ## Video: out of scope, kept cheap
 
 Video ships in no phase of this RFC. The image work must still leave nothing that
