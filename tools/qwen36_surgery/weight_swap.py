@@ -108,16 +108,17 @@ def _classify(model):
             for pat, hf in FLOAT_KINDS.items():
                 mm = re.search(pat, cn)
                 if mm:
-                    floats.append((op, (f"layers.{mm.group(1)}." if mm.groups() else "") + hf))
+                    floats.append((op, ti, (f"layers.{mm.group(1)}." if mm.groups() else "") + hf))
                     break
     return proj, conv, floats
 
 
-def _replace(op, arr, et):
+def _replace(op, arr, et, targets=None):
+    """Feed `arr` to `targets` (target inputs of op's output; None = every consumer of op)."""
     from openvino import opset13 as ops
     new = ops.constant(arr, dtype=et)
     new.set_friendly_name(op.get_friendly_name())
-    for t in list(op.output(0).get_target_inputs()):
+    for t in list(op.output(0).get_target_inputs()) if targets is None else targets:
         t.replace_source_output(new.output(0))
 
 
@@ -149,10 +150,12 @@ def swap_stage(model, weights):
         _replace(c["zp"], zp.reshape(list(c["zp"].get_output_shape(0))), ov.Type.u8)
         _replace(c["s"], s.reshape(list(c["s"].get_output_shape(0))), ov.Type.f16)
         report["conv"][layer] = report["conv"].get(layer, 0) + 1
-    for op, hf in floats:
+    for op, ti, hf in floats:
         kind = re.sub(r"layers\.\d+\.", "", hf)
         v = TRANSFORMS[FLOAT_KIND_TRANSFORM[kind]](weights.get(hf)).astype(np.float32)
-        _replace(op, v.reshape(list(op.get_output_shape(0))), op.get_element_type())
+        # only the matched consumer: a float constant shared with another op (or another kind)
+        # must keep feeding that op the stock value
+        _replace(op, v.reshape(list(op.get_output_shape(0))), op.get_element_type(), targets=[ti])
         m = re.match(r"layers\.(\d+)\.", hf)
         report["float"].setdefault(int(m.group(1)) if m else "final", []).append(kind)
     report["proj"] = {k: sorted(v) for k, v in report["proj"].items()}

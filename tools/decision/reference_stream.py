@@ -105,13 +105,22 @@ def text_config(weights_dir):
     return cfg
 
 
-@torch.inference_mode()
 def stream_hidden(weights_dir, passes, lora=None, lora_scale=None, threads=4, allow_lm_head_lora=False):
     """Final-norm hidden [T, H] (fp32) of every pass's prompt_ids, one decoder layer resident at a time.
     Every adapter module must merge into a decoder weight; an lm_head adapter is tolerated only with
-    allow_lm_head_lora (JEV, whose verbalizer head applies it in family_probs)."""
-    from transformers.models.qwen3_5 import modeling_qwen3_5 as M
+    allow_lm_head_lora (JEV, whose verbalizer head applies it in family_probs). torch runs on
+    `threads` threads for the call; the caller's setting is restored after it."""
+    prev = torch.get_num_threads()
     torch.set_num_threads(threads)
+    try:
+        return _stream_hidden(weights_dir, passes, lora, lora_scale, allow_lm_head_lora)
+    finally:
+        torch.set_num_threads(prev)
+
+
+@torch.inference_mode()
+def _stream_hidden(weights_dir, passes, lora, lora_scale, allow_lm_head_lora):
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as M
     ck, cfg = Ckpt(weights_dir), text_config(weights_dir)
     lo = Lora(lora, lora_scale)
     ids = [p["readout"]["prompt_ids"] for p in passes]
@@ -168,10 +177,18 @@ def lm_head_name(ck, weights_dir):
                      f"(and tie_word_embeddings is not set)")
 
 
+@lru_cache(maxsize=1)
+def _lm_head(weights_dir):
+    """(Ckpt, lm_head tensor name), opened once per checkpoint: family_probs reads rows for every
+    pass. Only the shard holding lm_head is ever opened through it."""
+    ck = Ckpt(weights_dir)
+    return ck, lm_head_name(ck, weights_dir)
+
+
 def lm_rows(weights_dir, ids):
     """lm_head rows (fp32) for `ids`; the input embeddings when the checkpoint ties them."""
-    ck = Ckpt(weights_dir)
-    return ck.rows(lm_head_name(ck, weights_dir), ids)
+    ck, name = _lm_head(str(weights_dir))
+    return ck.rows(name, ids)
 
 
 def softmax(z):
