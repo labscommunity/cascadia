@@ -1904,7 +1904,9 @@ impl Frontend {
     pub(crate) fn prompt_text<'a>(&self, prompt: &'a str) -> std::borrow::Cow<'a, str> {
         match self {
             Frontend::Gemma3(f) => std::borrow::Cow::Owned(f.expand_text(prompt)),
-            Frontend::Gemma4(_) | Frontend::Pixtral(_) => std::borrow::Cow::Borrowed(prompt),
+            Frontend::Gemma4(_) | Frontend::Pixtral(_) | Frontend::LlavaNext(_) => {
+                std::borrow::Cow::Borrowed(prompt)
+            }
         }
     }
 
