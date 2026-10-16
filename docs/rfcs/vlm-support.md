@@ -945,7 +945,7 @@ from the text alone.
 |---|---|---|
 | `ov-genai` | VLM exports with the vision IR | served; on a text-only export the API offers no image input (400), and `submit` refuses too |
 | `qwen35` | trees with the vision IRs | served; otherwise 400 at the API and at `submit` |
-| `ov-runtime` | Gemma 4 surgery trees (`vision.family = "gemma4"`, stateful, static and packed paths), Pixtral trees (`"pixtral"`, stateful, static and packed paths) and Mistral 3 trees (`"mistral3"`) | served; other trees 400; an unknown `vision.family` fails to load |
+| `ov-runtime` | Gemma 4 surgery trees (`vision.family = "gemma4"`, stateful, static and packed paths), Pixtral trees (`"pixtral"`, stateful, static and packed paths), Mistral 3 trees (`"mistral3"`) and LLaVA-NeXT trees (`"llava_next"`) | served; other trees 400; an unknown `vision.family` fails to load |
 | `gemma4` (`gemma4_cached` trees) | E2B/E4B trees from `export_gemma4.py --vision` | served; other trees 400 at the API and at `submit` |
 | `ov-dist-spec` | Pixtral / Mistral 3 target trees cut with `--all-logits` (`vision.family` `"pixtral"` / `"mistral3"`); the draft stays text-only | served; v5 (text) targets 400 at the API and at `submit`; a Gemma 4 target fails to load |
 | `sparse-moe` | no | 400 |
@@ -1048,6 +1048,66 @@ the published `OpenVINO/gemma-3-12b-it-int4-ov` (Gemma license, not gated).
   pawan-02 (rank 0) and pawan-04 (rank 1), CPU: the 11-check SDK test passes, "There is a
   red square and a blue circle.", 286 / 550 prompt tokens, which equals `ov-genai` on the
   same export on one box (also 11/11). Not run: packed slots and the static path.
+
+## LLaVA-NeXT on `ov-runtime` (2026-10-16)
+
+`LlavaNextForConditionalGeneration` (llava-v1.6; here `llava-hf/llava-v1.6-mistral-7b-hf`,
+Mistral-7B text tower, 1-D RoPE, causal) served across machines from the public
+`OpenVINO/llava-v1.6-mistral-7b-hf-int4-ov` export (Apache-2.0), which `ov-genai`
+already serves on one box.
+
+- **The export.** Read from its `.xml` and JSON files (no weights): four IRs, as for
+  Pixtral. `openvino_vision_embeddings_model.xml` takes `pixel_values [?, 3, ?, ?]` and
+  returns `last_hidden_state [?, 576, 4096]`: the CLIP tower's penultimate layer with
+  the CLS row dropped (`vision_feature_select_strategy: "default"`) and the projector
+  (`multi_modal_projector.linear_1/2`) inside. There is no `image_newline` IR:
+  optimum-intel writes the 4096 floats into `config.json`. The language model is the
+  usual stateful `inputs_embeds` IR (`__module.model.layers.N.input_layernorm`), and the
+  image token is `<image>` (32000).
+- **Rank 0** (`llava_next_vision`), from transformers 5.14.1
+  (`image_processing_pil_llava_next.py`, `processing_llava_next.py`,
+  `modeling_llava_next.py`):
+  - `select_best_resolution` picks the pinpoint (most kept pixels, then least waste);
+    the image resizes into it with its aspect ratio (`get_patch_output_size`, `ceil`),
+    is centred on black (`divmod` padding) and cut into 336-px tiles row-major, after a
+    base view squashed to 336x336. Every resize is Pillow's bicubic (a same-size resize
+    is a copy), then rescale and CLIP normalisation.
+  - All views go through the vision IR in one inference (at most five on llava-v1.6's
+    pinpoints).
+  - Packing is `pack_image_features`: the base view's 576 rows, then the tiles stitched
+    into one `(rows*24) x (cols*24)` grid, the padding rows or columns dropped
+    (`unpad_image`, Python's `int(round(x, 7))` reproduced), `image_newline` after each
+    kept row. An extreme strip keeps no tile rows at all (1500x4: 576 tokens); a pole
+    keeps no columns but every row's newline (3x1200: 648).
+  - The token count is `LlavaNextProcessor._get_number_of_features` minus the CLS,
+    from the size alone: used before encoding (packed submit, `expanded_len`), and
+    checked against the encoder's at submit on packed slots.
+  - Every soft token, newline rows included, is `<image>`, so the expansion is a run of
+    `<image>` per image; `vision_kv` keys and spans and the `(tenant, sha256)` encode
+    cache apply unchanged.
+- **Prompt.** HF's processor template writes `<image>\n` for each image of a message,
+  then its text parts back to back (`[INST] <image>\nWhat is in this picture? [/INST]`),
+  whatever the parts' order. `MediaConfig::llava_next_native` does the same
+  (`images_first`, placeholder `<image>\n`, `<image>` reserved), and the tree's
+  tokenizer template adds `<s>`. The fixture generator renders this and checks the ids
+  equal the processor's: 2945 tokens for one 448x448 image (`ov-genai`: 2956), 4199
+  for two (640x360, 300x1000).
+- **Parity** (`tests/llava_next_vision_parity.rs`, fixtures from
+  `tools/vlm_fixtures/gen_llava_next_fixtures.py`): pixel values bit-identical to the
+  PIL processor on the eight Pixtral fixture images (the torchvision one differs by up
+  to 0.24 on 3x1200); pinpoint, grid and token count equal HF's on those and on a
+  43x43 sweep of sizes; packing reproduces HF's row order on synthetic features; prompt
+  expansion reproduces the processor's ids. The vision IR's own output was not compared
+  here (no weights fetched); `--run-ir` on the cluster adds it.
+- **Cut.** `cut_vlm_lm.py --family llava_next` requires `preprocessor_config.json` and a
+  hidden-wide `image_newline`, and refuses the `full` feature strategy.
+- **Static and packed.** The family is causal, so Pixtral's rules apply: no image
+  blocks, a prefill chunk may split an image, a packed prompt is sized from its images
+  and refused with a 413 before encoding when it outgrows a slot's region. A static
+  tree needs a context of 4096 or more for one image. Neither path has been run on
+  hardware with this model.
+- **Not covered:** `ov-dist-spec` (refused at load: Pixtral / Mistral 3 targets only).
+  Not yet run on the cluster.
 
 ## Video: out of scope, kept cheap
 
