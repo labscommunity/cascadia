@@ -119,6 +119,18 @@ pub fn target_size(height: u32, width: u32, cfg: &PreprocessConfig) -> Result<(u
     Ok((tokens(h) * p, tokens(w) * p))
 }
 
+/// Token grid `(rows, cols)` of an image of `width x height`, from its size
+/// alone (what [`preprocess`] gives, without decoding pixels or encoding).
+pub fn grid_for_size(
+    width: u32,
+    height: u32,
+    cfg: &PreprocessConfig,
+) -> Result<(u32, u32), String> {
+    let (th, tw) = target_size(height, width, cfg)?;
+    let cell = cfg.patch_size * cfg.spatial_merge;
+    Ok((th / cell, tw / cell))
+}
+
 /// The vision IR's input for one image.
 #[derive(Clone, Debug)]
 pub struct Pixels {
@@ -395,6 +407,24 @@ impl Frontend {
         Ok((v, out_hidden))
     }
 
+    /// The expanded prompt ids `prepare` would return, from each image's
+    /// size, with no encoder work.
+    pub fn expand_ids(
+        &self,
+        media: &[cascadia_types::MediaInput],
+        prompt_ids: &[i64],
+    ) -> Result<Vec<i64>, String> {
+        let mut grids = Vec::with_capacity(media.len());
+        for (i, m) in media.iter().enumerate() {
+            crate::gemma4_vision::check_image(i, m)?;
+            grids.push(
+                grid_for_size(m.width, m.height, &self.preprocess)
+                    .map_err(|e| format!("image {i}: {e}"))?,
+            );
+        }
+        expand_image_tokens(prompt_ids, &self.tokens, &grids)
+    }
+
     /// Encode a task's images and expand each `[IMG]` into its rows. Returns
     /// the expanded ids and each image's rows, in prompt order.
     pub fn prepare(
@@ -407,14 +437,7 @@ impl Frontend {
         let mut grids = Vec::with_capacity(media.len());
         let mut from_cache = 0;
         for (i, m) in media.iter().enumerate() {
-            match m.kind {
-                cascadia_types::MediaKind::Image => {}
-                #[allow(unreachable_patterns)]
-                other => return Err(format!("media {i}: {other:?} is not supported")),
-            }
-            if m.num_frames != 1 || m.pixels.len() != m.expected_len() {
-                return Err(format!("image {i}: malformed pixel buffer"));
-            }
+            crate::gemma4_vision::check_image(i, m)?;
             if let Some((emb, grid)) = self.cache.get(tenant, &m.sha256) {
                 grids.push(grid);
                 rows.push(emb);
@@ -528,5 +551,26 @@ mod tests {
         let green = (0.0f32 - c.image_mean[1]) / c.image_std[1];
         assert!(p.pixel_values[..plane].iter().all(|&v| v == red));
         assert!(p.pixel_values[plane..2 * plane].iter().all(|&v| v == green));
+    }
+
+    /// Admission's size-only grid must equal preprocessing's.
+    #[test]
+    fn grid_from_size_matches_preprocessing() {
+        let cfg = PreprocessConfig::pixtral();
+        for (w, h) in [
+            (64u32, 64u32),
+            (640, 480),
+            (37, 900),
+            (2000, 30),
+            (448, 448),
+        ] {
+            let rgb = vec![128u8; (w * h * 3) as usize];
+            let p = preprocess(&rgb, w, h, &cfg).unwrap();
+            assert_eq!(
+                grid_for_size(w, h, &cfg).unwrap(),
+                (p.rows, p.cols),
+                "{w}x{h}"
+            );
+        }
     }
 }
