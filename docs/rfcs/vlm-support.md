@@ -699,6 +699,34 @@ the NPU: two of its stages per node with separate decode and prefill IRs need ab
 twice the weights in RAM, which already exhausted a node on CPU. That needs one stage
 per node (more machines) or AOT blobs compiled off-node.
 
+## Mistral 3 on `ov-runtime` (2026-10-16)
+
+`Mistral3ForConditionalGeneration` (Ministral-3 3B/8B/14B, Mistral Small 3.1/3.2) is
+Pixtral's processor and vision tower plus a learned 2x2 patch merger. No OpenVINO
+export is published; optimum-intel `main` (commit `d304fb56`; release 2.2.0 lacks the
+`ministral3` text tower) exports it as four IRs: language model, text embeddings, vision
+embeddings (tower + projector norm) and multi-modal projector (merger linear + MLP).
+
+- **Rank 0** (`pixtral_vision` with `spatial_merge` 2): images resize to whole 28-px
+  cells (longest edge 1540), the vision IR returns one row per 14-px patch,
+  `merge_patches` regroups each 2x2 block channel-major exactly like `torch.unfold`, and
+  the projector IR maps them to the text width. Each `[IMG]` expands to rows of tokens
+  closed by `[IMG_BREAK]` and `[IMG_END]`.
+- **Cut**: `cut_vlm_lm.py --family mistral3` (copies the projector IR into the root).
+- **Parity**: the Rust preprocessing is bit-identical to HF's PIL processor on the
+  eight fixture images and the prompt expansion reproduces its ids
+  (`tests/fixtures/mistral3_vision`); the OV image chain against HF
+  `get_image_features` (fp32): cosine 0.9994 on a 2x2-token image, 0.988 on 448x448,
+  the vision IR's weights being int8 (as in OpenVINO's own Pixtral export).
+- **Verified** with Ministral-3-3B-Instruct-2512 (Apache-2.0), int4: 11/11 on one box
+  and across pawan-02 and pawan-04 (2 stages), "Square (red) and circle (blue).", 815 /
+  1091 prompt tokens, which is HF's `apply_chat_template` count. The two machines'
+  exports are byte-identical (stage 1 weights `1B0F50ED...`).
+- **Found on the way:** optimum-cli on Windows writes `chat_template.jinja` with CRLF.
+  Jinja2 normalises line endings; minijinja did not, so the template's default system
+  prompt came out 51 tokens longer than HF's. `build_chat_env` now normalises `\r\n`
+  and `\r` to `\n` for every template.
+
 ## Prompt tokens match HF (2026-10-16)
 
 A message with images reached the chat template as one string whose parts the API
@@ -740,7 +768,7 @@ from the text alone.
 |---|---|---|
 | `ov-genai` | VLM exports with the vision IR | served; on a text-only export the API offers no image input (400), and `submit` refuses too |
 | `qwen35` | trees with the vision IRs | served; otherwise 400 at the API and at `submit` |
-| `ov-runtime` | Gemma 4 surgery trees (`vision.family = "gemma4"`, stateful and static paths) and Pixtral trees (`"pixtral"`, stateful, static and packed paths) | served; other trees 400; an unknown `vision.family` fails to load |
+| `ov-runtime` | Gemma 4 surgery trees (`vision.family = "gemma4"`, stateful and static paths), Pixtral trees (`"pixtral"`, stateful, static and packed paths) and Mistral 3 trees (`"mistral3"`) | served; other trees 400; an unknown `vision.family` fails to load |
 | `gemma4` (`gemma4_cached` trees) | E2B/E4B trees from `export_gemma4.py --vision` | served; other trees 400 at the API and at `submit` |
 | `ov-dist-spec` | no | 400; draft and target would both need the expanded image prompt |
 | `sparse-moe` | no | 400 |
