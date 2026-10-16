@@ -113,6 +113,29 @@ fn main() {
         println!("cargo:rustc-link-search=native={d}/lib");
         println!("cargo:rustc-link-lib=dylib=dnnl");
     }
+    // macOS: the SDK dylibs have `@rpath/` install names, so a binary without
+    // an LC_RPATH only starts with DYLD_LIBRARY_PATH set, which SIP strips when
+    // the process is launched through a system binary such as `nohup`. Embed
+    // the lib and TBB dirs (libopenvino's own rpath misses tbb/lib). Gated on
+    // the TARGET os; Linux and Windows are unchanged. `rustc-link-arg` only
+    // reaches this package's own test binaries, so the dirs also go out as
+    // `links` metadata (DEP_CASCADIA_OV_GENAI_SHIM_RPATH) for the `cascadia`
+    // bin crate's build script to embed.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        let mut rpath = vec![
+            format!("{ov_root}/runtime/lib/arm64/Release"),
+            format!("{ov_root}/runtime/3rdparty/tbb/lib"),
+        ];
+        if let Some(d) = &dnnl_dir {
+            rpath.push(format!("{d}/lib"));
+        }
+        rpath.retain(|d| std::path::Path::new(d).is_dir());
+        for d in &rpath {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{d}");
+        }
+        let joined = std::env::join_paths(&rpath).expect("OpenVINO lib dir contains ':'");
+        println!("cargo:rpath={}", joined.to_string_lossy());
+    }
     println!("cargo:rerun-if-env-changed=DNNL_DIR");
     println!("cargo:rerun-if-changed=cpp/shim.cpp");
     println!("cargo:rerun-if-changed=cpp/shim.h");

@@ -8,6 +8,9 @@ license.workspace = true
 repository.workspace = true
 description = "C++ FFI shim around openvino-genai for the missing pieces (draft_model, Tokenizer, prompt_lookup property)."
 build = "build.rs"
+# Lets dependents' build scripts read the macOS rpath dirs this build script
+# emits (DEP_CASCADIA_OV_GENAI_SHIM_RPATH).
+links = "cascadia_ov_genai_shim"
 
 [features]
 default = []
