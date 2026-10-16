@@ -90,6 +90,11 @@ pub(crate) struct PipelineVision {
     text_embeddings: String,
     /// Vision encoder IR in the pipeline dir.
     vision_embeddings: String,
+    /// The soft-token id rank 0 expands, where the tool names it (Phi-3.5:
+    /// `<|image|>`); otherwise the family reads it from `config.vlm.json` or
+    /// the tokenizer.
+    #[serde(default)]
+    image_token_id: Option<i64>,
 }
 
 fn default_true() -> bool {
@@ -1826,6 +1831,10 @@ pub(crate) enum VisionFamily {
     Gemma4,
     /// LLaVA-layout Pixtral trees from tools/vlm_surgery: causal attention.
     Pixtral,
+    /// Phi-3.5-vision (`phi3_v`) trees from tools/vlm_surgery: causal.
+    Phi3V,
+    /// InternVL2 (`internvl_chat`) trees from tools/vlm_surgery: causal.
+    InternVL,
 }
 
 /// The family of a pipeline's `vision` block. A tree without the field is
@@ -1841,9 +1850,11 @@ pub(crate) fn vision_family(
         // Mistral 3 is Pixtral's processor and tower plus a 2x2 patch merger,
         // which the Pixtral front end runs when the export carries it.
         (Some("pixtral" | "mistral3"), _) => Ok(VisionFamily::Pixtral),
+        (Some("phi3_v"), _) => Ok(VisionFamily::Phi3V),
+        (Some("internvl_chat"), _) => Ok(VisionFamily::InternVL),
         (Some(f), _) => Err(EngineError::InvalidConfig(format!(
             "pipeline_config.json `vision.family` is {f:?}; ov-runtime serves image input \
-             for \"gemma4\", \"pixtral\" and \"mistral3\""
+             for \"gemma4\", \"pixtral\", \"mistral3\", \"phi3_v\" and \"internvl_chat\""
         ))),
         (None, other) => Err(EngineError::InvalidConfig(format!(
             "pipeline_config.json has a `vision` block without `family` on a {other:?} \
@@ -1875,11 +1886,13 @@ struct VisionTree {
 pub(crate) enum Frontend {
     Gemma4(crate::gemma4_vision::ImageFrontend),
     Pixtral(crate::pixtral_vision::Frontend),
+    Phi3V(crate::phi3v_vision::Frontend),
+    InternVL(crate::internvl_vision::Frontend),
 }
 
 impl Frontend {
     /// A `prompt_len`-token prompt's length once `media` expand, from the
-    /// images' dimensions alone (no encode). Pixtral / Mistral 3 only.
+    /// images' dimensions alone (no encode). Not Gemma 4.
     pub(crate) fn expanded_len(
         &self,
         prompt_len: usize,
@@ -1887,6 +1900,8 @@ impl Frontend {
     ) -> Result<usize, String> {
         match self {
             Frontend::Pixtral(f) => f.expanded_len(prompt_len, media),
+            Frontend::Phi3V(f) => f.expanded_len(prompt_len, media),
+            Frontend::InternVL(f) => f.expanded_len(prompt_len, media),
             Frontend::Gemma4(_) => Err("expanded length is sized for Pixtral images only".into()),
         }
     }
@@ -1896,6 +1911,8 @@ impl Frontend {
         match self {
             Frontend::Gemma4(f) => vec![f.tokens.image, f.tokens.boi, f.tokens.eoi],
             Frontend::Pixtral(f) => vec![f.tokens.image, f.tokens.image_break, f.tokens.image_end],
+            Frontend::Phi3V(f) => vec![f.image_token],
+            Frontend::InternVL(f) => vec![f.tokens.context, f.tokens.start, f.tokens.end],
         }
     }
 
@@ -1904,6 +1921,23 @@ impl Frontend {
         match self {
             Frontend::Gemma4(f) => f.tokens.image,
             Frontend::Pixtral(f) => f.tokens.image,
+            Frontend::Phi3V(f) => f.image_token,
+            Frontend::InternVL(f) => f.tokens.context,
+        }
+    }
+
+    /// The rendered prompt's ids as the family's processor lays them out
+    /// before images expand. Phi-3.5-vision tokenizes each chunk between
+    /// `<|image_N|>` tags on its own (each with its BOS) and stands one
+    /// `<|image|>` in for each tag; every other family encodes the prompt
+    /// whole, without special tokens (the template writes them).
+    pub(crate) fn encode_prompt(&self, tok: &Tokenizer, prompt: &str) -> Result<Vec<i64>, String> {
+        match self {
+            Frontend::Phi3V(f) => f.encode_prompt(tok, prompt),
+            _ => tok
+                .encode(prompt, false)
+                .map(|e| e.get_ids().iter().map(|&u| i64::from(u)).collect())
+                .map_err(|e| format!("tokenizer encode: {e}")),
         }
     }
 
@@ -1912,7 +1946,7 @@ impl Frontend {
     fn embedding_ids(&self, ids: &[i64]) -> Vec<i64> {
         match self {
             Frontend::Gemma4(f) => crate::gemma4_vision::text_embedding_ids(ids, &f.tokens),
-            Frontend::Pixtral(_) => ids.to_vec(),
+            Frontend::Pixtral(_) | Frontend::Phi3V(_) | Frontend::InternVL(_) => ids.to_vec(),
         }
     }
 
@@ -1925,6 +1959,8 @@ impl Frontend {
         match self {
             Frontend::Gemma4(f) => f.prepare(media, prompt_ids, tenant),
             Frontend::Pixtral(f) => f.prepare(media, prompt_ids, tenant),
+            Frontend::Phi3V(f) => f.prepare(media, prompt_ids, tenant),
+            Frontend::InternVL(f) => f.prepare(media, prompt_ids, tenant),
         }
     }
 
@@ -1937,6 +1973,8 @@ impl Frontend {
         match self {
             Frontend::Gemma4(f) => f.expand_ids(media, prompt_ids),
             Frontend::Pixtral(f) => f.expand_ids(media, prompt_ids),
+            Frontend::Phi3V(f) => f.expand_ids(media, prompt_ids),
+            Frontend::InternVL(f) => f.expand_ids(media, prompt_ids),
         }
     }
 
@@ -1945,7 +1983,7 @@ impl Frontend {
     fn max_image_tokens(&self) -> Option<usize> {
         match self {
             Frontend::Gemma4(f) => Some(f.preprocess.max_soft_tokens as usize),
-            Frontend::Pixtral(_) => None,
+            Frontend::Pixtral(_) | Frontend::Phi3V(_) | Frontend::InternVL(_) => None,
         }
     }
 
@@ -1968,7 +2006,37 @@ impl Frontend {
                 "Pixtral images, longest edge {} px, one token per {}px patch",
                 f.preprocess.longest_edge, f.preprocess.patch_size
             ),
+            Frontend::Phi3V(f) => format!(
+                "Phi-3.5-vision images, HD transform into at most {} 336-px crops plus a \
+                 global view ({} soft tokens for a 448x448 image)",
+                f.preprocess.num_crops,
+                crate::phi3v_vision::num_image_tokens(448, 448, &f.preprocess).unwrap_or(0)
+            ),
+            Frontend::InternVL(f) => format!(
+                "InternVL images, {}..{} tiles of {} px (plus a thumbnail), {} soft tokens each",
+                f.preprocess.min_tiles,
+                f.preprocess.max_tiles,
+                f.preprocess.image_size,
+                f.preprocess.tokens_per_tile
+            ),
         }
+    }
+}
+
+/// A rank-0 prompt's ids: the vision front end's layout on a vision tree
+/// ([`Frontend::encode_prompt`]), else the prompt encoded whole without
+/// special tokens.
+fn encode_prompt_ids(
+    tok: &Tokenizer,
+    vision: Option<&VisionTree>,
+    prompt: &str,
+) -> Result<Vec<i64>, String> {
+    match vision.and_then(|v| v.first.as_ref()) {
+        Some(first) => first.frontend.encode_prompt(tok, prompt),
+        None => tok
+            .encode(prompt, false)
+            .map(|e| e.get_ids().iter().map(|&u| i64::from(u)).collect())
+            .map_err(|e| format!("tokenizer encode: {e}")),
     }
 }
 
@@ -2046,6 +2114,55 @@ impl VisionFirst {
                 Frontend::Pixtral(
                     crate::pixtral_vision::Frontend::load(pipeline_dir, tokens).map_err(invalid)?,
                 )
+            }
+            VisionFamily::Phi3V | VisionFamily::InternVL => {
+                // Phi-3's su/longrope switches to its long factors past
+                // `original_max_position_embeddings`; optimum traced the
+                // rotary inv_freq as a constant (no position-dependent
+                // switch in the IR), so past that length the export
+                // (ov-genai's too) differs from HF.
+                let text = v.get("llm_config").unwrap_or(&v);
+                if let Some(orig) = text
+                    .get("original_max_position_embeddings")
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    warn!(
+                        positions = orig,
+                        "{family:?} tree: the IR's RoPE is fixed (no long-factor switch); \
+                         sequences past {orig} tokens differ from HF"
+                    );
+                }
+                let tok_path = pipeline_dir.join("tokenizer").join("tokenizer.json");
+                let tok = Tokenizer::from_file(&tok_path)
+                    .map_err(|e| invalid(format!("reading {}: {e}", tok_path.display())))?;
+                let special = |t: &str| {
+                    tok.token_to_id(t)
+                        .map(i64::from)
+                        .ok_or_else(|| invalid(format!("tokenizer has no {t}")))
+                };
+                if family == VisionFamily::Phi3V {
+                    // The processor marks soft tokens with negative ids and
+                    // embeds them as id 0; rank 0 uses `<|image|>` instead
+                    // (its rows are overwritten either way).
+                    let image = cfg
+                        .image_token_id
+                        .map_or_else(|| special("<|image|>"), Ok)?;
+                    Frontend::Phi3V(
+                        crate::phi3v_vision::Frontend::load(pipeline_dir, &v, image)
+                            .map_err(invalid)?,
+                    )
+                } else {
+                    let tokens = crate::internvl_vision::ImageTokens {
+                        context: id("img_context_token_id")
+                            .or_else(|_| special("<IMG_CONTEXT>"))?,
+                        start: special("<img>")?,
+                        end: special("</img>")?,
+                    };
+                    Frontend::InternVL(
+                        crate::internvl_vision::Frontend::load(pipeline_dir, &v, tokens)
+                            .map_err(invalid)?,
+                    )
+                }
             }
         };
         Ok(Self {
@@ -2990,10 +3107,8 @@ impl OvRuntimeEngine {
                 .tokenizer
                 .clone()
                 .ok_or_else(|| EngineError::Backend("first stage requires tokenizer".into()))?;
-            let enc = tok
-                .encode(task.prompt.clone(), false)
-                .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?;
-            let mut prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
+            let mut prompt_ids = encode_prompt_ids(&tok, self.vision.as_ref(), &task.prompt)
+                .map_err(EngineError::Backend)?;
             // Option B forced-prefix resume: append the already-emitted assistant
             // tokens after the rendered prompt (concat, not replace) so the cold
             // prefill below carries them as context. No-op when not resuming.
@@ -3360,18 +3475,14 @@ impl OvRuntimeEngine {
             // a bare Err here would kill whichever concurrent stream happened
             // to be polling, and returning one would drop the chunks already
             // queued in `out` for tasks this loop has taken off `pending`.
-            let enc = match tok.encode(task.prompt.clone(), false) {
-                Ok(enc) => enc,
+            let mut prompt_ids = match encode_prompt_ids(&tok, self.vision.as_ref(), &task.prompt) {
+                Ok(ids) => ids,
                 Err(e) => {
                     let id = task.task_id.clone();
-                    out.push((
-                        id.clone(),
-                        Chunk::error(id, format!("tokenizer encode: {e}")),
-                    ));
+                    out.push((id.clone(), Chunk::error(id, e)));
                     continue;
                 }
             };
-            let mut prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
             if prompt_ids.is_empty() {
                 let id = task.task_id.clone();
                 out.push((
@@ -4978,13 +5089,8 @@ impl Engine for OvRuntimeEngine {
         // would receive a non-standard error frame instead.
         if let Some(packed) = self.packed.as_ref() {
             if let Some(tok) = self.tokenizer.as_ref() {
-                let ids: Vec<i64> = tok
-                    .encode(task.prompt.clone(), false)
-                    .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?
-                    .get_ids()
-                    .iter()
-                    .map(|&u| u as i64)
-                    .collect();
+                let ids = encode_prompt_ids(tok, self.vision.as_ref(), &task.prompt)
+                    .map_err(EngineError::Backend)?;
                 // Every check runs on the prompt as it will be served, with
                 // each image's token count taken from its size, before any
                 // image is encoded: a refused request costs no encoder time
@@ -8618,6 +8724,7 @@ mod tests {
             token_type_ids: None,
             text_embeddings: "t.xml".into(),
             vision_embeddings: "openvino_vision_embeddings_model.xml".into(),
+            image_token_id: None,
         };
         assert_eq!(
             vision_family(&v(Some("gemma4")), None).unwrap(),
@@ -8635,6 +8742,14 @@ mod tests {
         assert_eq!(
             vision_family(&v(Some("mistral3")), None).unwrap(),
             VisionFamily::Pixtral
+        );
+        assert_eq!(
+            vision_family(&v(Some("phi3_v")), None).unwrap(),
+            VisionFamily::Phi3V
+        );
+        assert_eq!(
+            vision_family(&v(Some("internvl_chat")), None).unwrap(),
+            VisionFamily::InternVL
         );
         assert!(vision_family(&v(Some("qwen2_vl")), None).is_err());
         assert!(vision_family(&v(None), Some("something_else_v1")).is_err());
