@@ -299,8 +299,9 @@ pub struct Frontend {
 }
 
 impl Frontend {
-    /// Load from a tree root holding the vision IRs, `preprocessor_config.json`
-    /// and the VLM `config` (already parsed).
+    /// Load from a dir holding the vision IRs and `preprocessor_config.json`
+    /// (a cut tree's root or the export itself), given the VLM `config.json`
+    /// (a tree keeps it as `config.vlm.json`), already parsed.
     pub fn load(dir: &Path, kind: Kind, vlm_config: &serde_json::Value) -> Result<Self, String> {
         let id = |k: &str| {
             vlm_config
@@ -334,8 +335,7 @@ impl Frontend {
                 )
             }
             Kind::Qwen3Vl => {
-                let path = dir.join("config.vlm.json");
-                let cfg = q35::VisionConfig::from_config_json(&path)?;
+                let cfg = q35::VisionConfig::from_value(vlm_config)?;
                 let layers = vlm_config
                     .get("vision_config")
                     .and_then(|v| v.get("deepstack_visual_indexes"))
@@ -462,6 +462,22 @@ impl Frontend {
             deepstack,
             mrope,
         })
+    }
+
+    /// One preprocessed image's rows `[tokens, hidden]` and (Qwen3-VL) its
+    /// DeepStack rows `[layers, tokens, hidden]` (empty otherwise).
+    pub fn encode_patches(&mut self, p: &Patches) -> Result<(Vec<f32>, Vec<f32>), String> {
+        let mut all = self.encode(p)?;
+        let n = p.llm_tokens(self.merge) * self.hidden;
+        if all.len() < n {
+            return Err(format!(
+                "{} encoded values for {} rows",
+                all.len(),
+                n / self.hidden
+            ));
+        }
+        let ds = all.split_off(n);
+        Ok((all, ds))
     }
 
     /// One image's rows followed by its DeepStack rows (Qwen3-VL).
