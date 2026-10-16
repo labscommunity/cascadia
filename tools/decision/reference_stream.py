@@ -16,6 +16,7 @@ import gc
 import json
 import math
 import sys
+from collections import Counter
 from functools import lru_cache
 from pathlib import Path
 
@@ -61,41 +62,39 @@ class Ckpt:
 class Lora:
     """PEFT adapter: delta(module) = scale * B @ A in fp32, or None when the module has no adapter.
     `module` is the path below the decoder ("layers.3.mlp.down_proj") or "lm_head"; the adapter may
-    name it with or without the "model." / "model.language_model." prefix."""
+    name it with or without the "model." / "model.language_model." prefix. weight_swap.lora_modules'
+    refusals (embedding LoRA, modules_to_save tensors, unpaired keys) and, when adapter_config.json is
+    beside the adapter, lora_scale_from_config's (modules_to_save, DoRA, ...) hold even with an
+    explicit scale: the reference must drop nothing the export would also drop."""
 
     def __init__(self, path, scale):
+        from weight_swap import lora_modules, lora_scale_from_config
         self.f = safe_open(path, "pt") if path else None
-        self.keys = set(self.f.keys()) if self.f else set()
         if self.f is not None and scale is None:
             raise ValueError("a LoRA adapter needs a scale (--lora-scale or adapter_config.json)")
+        self.mods = lora_modules(self.f.keys(), path) if self.f else {}
+        if path and (Path(path).parent / "adapter_config.json").exists():
+            lora_scale_from_config(path)
         self.scale = scale
-        self.used = set()
-
-    def _a_key(self, module):
-        for pre in ("", "model.", "model.language_model."):
-            a = f"base_model.model.{pre}{module}.lora_A.weight"
-            if a in self.keys:
-                self.used.add(a)
-                return a
-        return None
+        self.merged = Counter()
 
     def delta(self, module):
         """The full merged delta, for decoder weights (one layer's worth at a time)."""
-        a = self._a_key(module)
-        if a is None:
+        side = self.mods.get(module)
+        if side is None:
             return None
-        b = self.f.get_tensor(a.replace("lora_A", "lora_B")).float()
-        return self.scale * (b @ self.f.get_tensor(a).float())
+        self.merged[module] += 1
+        return self.scale * (self.f.get_tensor(side["B"]).float() @ self.f.get_tensor(side["A"]).float())
 
     def lm_head_logits(self, vids, h):
         """scale * B[vids] @ (A @ h): the lm_head adapter's logit delta for `vids` only. The full
         [vocab, hidden] delta (~4 GB fp32 for a 248k vocab) is never materialised. None without one."""
-        a = self._a_key("lm_head")
-        if a is None:
+        side = self.mods.get("lm_head")
+        if side is None:
             return None
-        s = self.f.get_slice(a.replace("lora_A", "lora_B"))
+        s = self.f.get_slice(side["B"])
         b = torch.stack([s[int(i):int(i) + 1][0] for i in vids]).float()
-        return self.scale * (b @ (self.f.get_tensor(a).float() @ h))
+        return self.scale * (b @ (self.f.get_tensor(side["A"]).float() @ h))
 
 
 def text_config(weights_dir):
@@ -141,11 +140,14 @@ def stream_hidden(weights_dir, passes, lora=None, lora_scale=None, threads=4, al
         ck.release()
         gc.collect()
         print(f"layer {i} ({cfg.layer_types[i]}, {merged} LoRA merged)", flush=True)
-    # every adapter must have been merged; lm_head only for JEV (applied in family_probs)
-    unused = sorted(k for k in lo.keys if k.endswith(".lora_A.weight") and k not in lo.used
-                    and not (allow_lm_head_lora and k.endswith(".lm_head.lora_A.weight")))
+    # every adapter module merged exactly once; lm_head only for JEV (applied in family_probs)
+    want = {m for m in lo.mods if not (allow_lm_head_lora and m == "lm_head")}
+    unused = sorted(want - set(lo.merged))
     if unused:
         raise SystemExit(f"ERROR {lora}: {len(unused)} adapter module(s) matched no decoder weight, e.g. {unused[:3]}")
+    twice = sorted(m for m, n in lo.merged.items() if n > 1)
+    if twice:
+        raise SystemExit(f"ERROR {lora}: {len(twice)} adapter module(s) merged more than once, e.g. {twice[:3]}")
     norm = M.Qwen3_5RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
     norm.load_state_dict({"weight": ck.tensor(f"{ck.prefix}norm.weight")})
     return [norm(a[0]) for a in acts]

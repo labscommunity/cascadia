@@ -193,10 +193,44 @@ def check_swap(report, layers, layer_types, last):
         raise ValueError("final norm not swapped")
 
 
+# A PEFT LoRA key -> (module path below the decoder: "layers.3.mlp.down_proj" or "lm_head", A | B).
+LORA_KEY = re.compile(r"base_model\.model\.(?:model\.)?(?:language_model\.)?(.+)\.lora_([AB])\.weight$")
+
+
+def lora_modules(keys, src="adapter"):
+    """{module: {"A": key, "B": key}} for an adapter's tensor names. The graft and the fp32 reference
+    apply y += scale * x A^T B^T only, so refuse anything else, naming the keys: embedding LoRA
+    (lora_embedding_A/B), any non-LoRA tensor (a modules_to_save copy such as model.norm.weight,
+    trainable token rows), a lora_A without its lora_B or the reverse, and one module named twice."""
+    keys = sorted(keys)
+    emb = [k for k in keys if ".lora_embedding_" in k]
+    if emb:
+        raise ValueError(f"{src}: embedding LoRA keys {emb[:4]}: the graft and the reference apply "
+                         "linear LoRA only, so the embedding delta would be dropped")
+    other = [k for k in keys if not LORA_KEY.match(k)]
+    if other:
+        raise ValueError(f"{src}: non-LoRA tensors {other[:4]} (modules_to_save copies or other trained "
+                         "weights): the graft and the reference would drop them")
+    mods = {}
+    for k in keys:
+        m = LORA_KEY.match(k)
+        side = mods.setdefault(m.group(1), {})
+        if m.group(2) in side:
+            raise ValueError(f"{src}: module {m.group(1)} is named twice ({side[m.group(2)]}, {k})")
+        side[m.group(2)] = k
+    for mod, side in mods.items():
+        for need in ("A", "B"):
+            if need not in side:
+                have = next(iter(side.values()))
+                raise ValueError(f"{src}: {have} has no matching lora_{need} for module {mod}")
+    return mods
+
+
 def lora_targets(adapter_file):
+    """Sorted module paths the adapter targets (lora_modules' refusals apply)."""
     from safetensors import safe_open
     with safe_open(adapter_file, "pt") as f:
-        return sum(1 for k in f.keys() if k.endswith(".lora_A.weight"))
+        return sorted(lora_modules(f.keys(), adapter_file))
 
 
 def lora_scale_from_config(adapter_file):
@@ -210,6 +244,9 @@ def lora_scale_from_config(adapter_file):
         raise ValueError("adapter_config.json has use_dora: true; the graft would drop the DoRA magnitude vectors")
     if cfg.get("lora_bias") not in (None, False):
         raise ValueError(f"adapter_config.json has lora_bias={cfg['lora_bias']!r}; the graft does not add LoRA biases")
+    if cfg.get("modules_to_save"):
+        raise ValueError(f"adapter_config.json has modules_to_save={cfg['modules_to_save']!r}; the graft and the "
+                         "reference keep the base weights of those modules, not the trained copies")
     r, alpha = cfg["r"], cfg["lora_alpha"]
     return alpha / (r ** 0.5) if cfg.get("use_rslora") else alpha / r
 
@@ -269,22 +306,20 @@ def swap_embeddings(src_xml, weights, out_dir, chunk=16384):
 def graft_lora(model, adapter_file, scale, layers=None, lm_head=True):
     """y += scale * (x A^T) B^T on every LoRA-targeted MatMul in `model` (fp32 constants, LoRA term
     first in the Add: OpenVINO's ARM CPU plugin produced NaN with fp16 constants / base-first adds).
-    Returns the number of branches added. Adapter keys with no matching MatMul in this stage are
-    skipped silently (a stage holds only some layers), so the exporter MUST assert that the sum of
-    graft_lora over all stages == lora_targets(adapter_file).
+    Returns the module paths grafted, one per branch added. Adapter modules with no matching MatMul
+    in this stage are skipped silently (a stage holds only some layers), so the exporter MUST assert
+    that over all stages every module of lora_targets(adapter_file) was grafted exactly once.
 
     `layers` (a range) limits grafting to the stage's own decoder layers and `lm_head` to the last
     stage: a stage > 0 also keeps shape-only copies of earlier layers (the stock IR's mask/position
     bookkeeping reads their output shapes), whose values never reach the stage output. Grafting those
-    would be dead work and would break the sum check. None = every match (a whole model)."""
+    would be dead work and would break the coverage check. None = every match (a whole model)."""
     from openvino import opset13 as ops
     from safetensors.torch import load_file
-    pairs = {}
-    for k, v in load_file(adapter_file).items():
-        m = re.match(r"base_model\.model\.(?:model\.)?(?:language_model\.)?(.+)\.lora_([AB])\.weight$", k)
-        if m:
-            pairs.setdefault(m.group(1), {})[m.group(2)] = v.float().numpy()
-    n = 0
+    tensors = load_file(adapter_file)
+    pairs = {mod: {ab: tensors[k].float().numpy() for ab, k in side.items()}
+             for mod, side in lora_modules(tensors, adapter_file).items()}
+    grafted = []
     for op in list(model.get_ordered_ops()):
         if op.get_type_name() != "MatMul":
             continue
@@ -305,9 +340,9 @@ def graft_lora(model, adapter_file, scale, layers=None, lm_head=True):
         added = ops.add(xab, op.output(0))
         for c in consumers:
             c.replace_source_output(added.output(0))
-        n += 1
+        grafted.append(m.group(1))
     model.validate_nodes_and_infer_types()
-    return n
+    return grafted
 
 
 def add_final_hidden_output(model):
