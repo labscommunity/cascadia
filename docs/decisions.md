@@ -563,6 +563,15 @@ Clef-flash 1.3 s; Kev-9B's median was 13 s, measured while another job shared th
 compares raw probabilities across hosts should keep one device. The 27B models were validated on
 CPU only.
 
+**NPU: not supported.** `--device NPU` on the same host (Intel AI Boost, OpenVINO 2026.4) fails
+at load, before any request: the NPU compiler rejects the first stage with `Missing upper bound
+for one or more nodes`, because the qwen35 trees have unbounded dimensions (the embeddings
+input is `[?, ?]`, and every stage takes a `[1, n, width]` hidden of any `n`). The NPU needs
+static or bounded shapes. Cascadia's existing NPU path, for other engines, compiles pre-exported
+static decode and prefill-chunk variants. Bringing decision trees to it would need the same for
+every qwen35 stage: a static prefill chunk with padding, a static readout, and a bounded
+linear-attention and KV state. That is a separate project, not a flag.
+
 ## Limitations
 
 - **Text only.** Images in either format are a 400 (`images`, `videos`, OpenAI `input_image`
