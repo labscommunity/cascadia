@@ -63,10 +63,11 @@ not copied — pulled in via Cargo.
 
 **Author:** Cloudflare, Inc.
 
-**Licence:** Apache-2.0 (the model cards declare `license: apache-2.0`).
-The upstream `joint_schema_model.py` carries no copyright header, and the
-repository's `LICENSE` file is the Apache-2.0 text inherited from the
-Qwen3.5 base model.
+**Licence:** Apache-2.0 (both model cards declare `license: apache-2.0`).
+The two repositories ship the same `joint_schema_model.py`, which carries
+no copyright header. Each repository's `LICENSE` file is the Apache-2.0
+text inherited from its Qwen base model (Qwen3.5-9B for clef-flash,
+Qwen3.8-27B for clef).
 
 **What we borrowed (code):**
 - `EvidenceRoutingLayer` and `JointSchemaHead` are copied verbatim into

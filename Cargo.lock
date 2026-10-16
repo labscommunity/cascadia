@@ -251,6 +251,7 @@ version = "0.2.6"
 dependencies = [
  "anyhow",
  "cascadia-cli",
+ "cascadia-ov-genai-shim",
  "clap",
  "tokio",
 ]
