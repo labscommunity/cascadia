@@ -55,6 +55,13 @@ def test_records_convert_to_openai_requests():
     assert kinds == {"predicate", "choice", "score"}
 
 
+def test_openai_choice_keys_are_python_str_like_the_server():
+    import openai_equivalence as oe
+    # openai.rs choice_key; the docs key numbers by Python str(), not their JSON text
+    assert [oe.choice_key(v) for v in ("b", 2, 1e5, 2.5, 1e16, 10 ** 30)] == \
+        ["b", "2", "100000.0", "2.5", "1e+16", "1" + "0" * 30]
+
+
 def test_dump_passes_align_to_records(tmp_path):
     # JEV/Kev: one pass per question, in record then question order
     lines = []
@@ -66,6 +73,95 @@ def test_dump_passes_align_to_records(tmp_path):
     aligned = list(cg.align(str(p), records()[:2]))
     assert [len(passes) for _, passes in aligned] == [len(r["questions"]) for r in records()[:2]]
     assert aligned[0][0]["id"] == records()[0]["id"]
+
+
+# ---- H39: align is strict, and reference_top1 reads each spike's stored option order -----------
+
+def _line(*qids, lo=0):
+    return {"parts": [[q, lo + i, lo + i + 1] for i, q in enumerate(qids)], "readout": {}}
+
+
+def test_align_refuses_a_pass_for_a_question_that_is_not_open():
+    r0, r1 = records()[:2]
+    q0 = list(r0["questions"])
+    lines = [_line(q) for q in q0] + [_line("not_a_question_of_r1")]  # where r1 is due
+    with pytest.raises(SystemExit, match=f"dump line {len(q0) + 1} covers .'not_a_question_of_r1'., "
+                                         f"not open questions of {r1['id']}"):
+        list(cg.align_lines(lines, [r0, r1]))
+    # a question answered twice inside one record is not open the second time either
+    multi = next(r for r in records() if len(r["questions"]) > 1)
+    first = next(iter(multi["questions"]))
+    with pytest.raises(SystemExit, match="dump line 2 covers"):
+        list(cg.align_lines([_line(first), _line(first)], [multi]))
+
+
+def test_align_refuses_a_short_dump_and_leftover_passes():
+    r0, r1 = records()[:2]
+    lines = [_line(q) for q in r0["questions"]]
+    with pytest.raises(SystemExit, match=f"dump ends before record {r1['id']}"):
+        list(cg.align_lines(lines, [r0, r1]))
+    with pytest.raises(SystemExit, match="dump has 1 pass"):
+        list(cg.align_lines(lines + [_line("extra")], [r0]))
+
+
+@pytest.mark.parametrize("family,probs,want", [
+    ("clef", [0.9, 0.1], "true"), ("clef", [0.1, 0.9], "false"),  # Clef stores noul [true, false]
+    ("kev", [0.9, 0.1], "false"), ("kev", [0.1, 0.9], "true"),    # Kev and JEV store [false, true]
+    ("jev", [0.9, 0.1], "false"), ("jev", [0.1, 0.9], "true"),
+])
+def test_reference_top1_noul_order_per_family(family, probs, want):
+    assert cg.reference_top1(family, {"type": "noul"}, {"probs": probs}) == want
+
+
+def test_reference_top1_choice_order_per_family():
+    q = {"type": "choice", "criteria": {"zeta": "", "alpha": "", "mid": ""}}
+    probs = {"probs": [0.1, 0.7, 0.2]}
+    # Clef and JEV stored choices sorted (alpha, mid, zeta); Kev in caller order (zeta, alpha, mid)
+    assert cg.reference_top1("clef", q, probs) == "mid"
+    assert cg.reference_top1("jev", q, probs) == "mid"
+    assert cg.reference_top1("kev", q, probs) == "alpha"
+    assert cg.reference_top1("kev", {"type": "score", "criteria": ["a", "b", "c"]}, probs) == "1"
+
+
+def test_noul_tie_reads_the_same_in_codec_golden_and_parity_check():
+    # H40: p = 0.5 used to be "true" for codec_golden and "false" for parity_check
+    ans = {"type": "noul", "noul": 0.5}
+    assert cg.top1(ans) == "false"
+    p = pc.answer_probs(ans)
+    assert max(range(2), key=p.__getitem__) == 0  # parity_check: index 0 = false
+    for family, probs in (("clef", [0.5, 0.5]), ("kev", [0.5, 0.5]), ("jev", [0.5, 0.5])):
+        assert cg.reference_top1(family, {"type": "noul"}, {"probs": probs}) == "false"
+    assert cg.top1({"type": "noul", "noul": 0.5000001}) == "true"
+
+
+# ---- H37: each pass's logit ranges must tile its head's outputs ----------------------------------
+
+@pytest.mark.parametrize("head,parts", [
+    ({"kind": "verbalizer", "token_ids": [5, 6, 7]}, [["q", 0, 3]]),
+    ({"kind": "pointer", "decide_pos": 9, "option_pos": [2, 4]}, [["q", 0, 2]]),
+    ({"kind": "joint", "questions": [{"options": [{}, {}]}, {"options": [{}, {}, {}]}]}, [["a", 0, 2], ["b", 2, 5]]),
+])
+def test_check_parts_accepts_ranges_that_tile_the_head(head, parts):
+    cg.check_parts("x", {"parts": parts, "readout": {"head": head}})
+
+
+@pytest.mark.parametrize("head,parts", [
+    ({"kind": "verbalizer", "token_ids": [5, 6, 7]}, [["q", 0, 2]]),        # one logit short
+    ({"kind": "pointer", "decide_pos": 9, "option_pos": [2, 4]}, [["q", 1, 3]]),  # shifted
+    ({"kind": "joint", "questions": [{"options": [{}, {}]}, {"options": [{}, {}, {}]}]}, [["a", 0, 3], ["b", 3, 5]]),
+    ({"kind": "joint", "questions": [{"options": [{}, {}]}, {"options": [{}, {}, {}]}]}, [["b", 2, 5], ["a", 0, 2]]),
+])
+def test_check_parts_refuses_ranges_that_do_not(head, parts, capsys):
+    with pytest.raises(SystemExit):
+        cg.check_parts("x", {"parts": parts, "readout": {"head": head}})
+    assert "MISMATCH x: logit ranges" in capsys.readouterr().out
+
+
+def test_float_branch_reads_values_not_digits_in_strings():
+    # H38: "1e" / ".5" inside a string used to count as float coverage
+    assert "float" not in cg.branches({"state": {"note": "item 1e5 costs .5"}, "questions": {}})
+    assert {"float", "float:2.5"} <= cg.branches({"state": {"x": [{"y": 2.5}]}, "questions": {}})
+    assert "float" not in cg.branches({"state": {"n": 3}, "questions": {}})
 
 
 # ---- BLD-1: backbone_diff matches across checkpoint layouts and always ends with a verdict ---------
@@ -563,7 +659,7 @@ def test_backbone_diff_finetuned_when_a_difference_is_off_target():
 
 def _save_st(path, names, value=0.0):
     import numpy as np
-    from safetensors.numpy import save_file
+    save_file = pytest.importorskip("safetensors.numpy").save_file
     save_file({n: np.full((4, 4), value if not callable(value) else value(n), dtype=np.float32) for n in names}, str(path))
 
 

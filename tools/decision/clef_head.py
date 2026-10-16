@@ -20,10 +20,15 @@ from __future__ import annotations
 
 import math
 import os
+from typing import Any
 
 import torch
 import torch.nn.functional as functional
 import torch.nn.functional as F
+
+# Upstream's joint_schema_model.EncodedRecord (an encode_record result), named by the verbatim
+# JointSchemaHead.forward signature below; only its .questions is read.
+EncodedRecord = Any
 
 
 class EvidenceRoutingLayer(torch.nn.Module):
@@ -299,7 +304,9 @@ class TensorHead(torch.nn.Module):
         prior = prior_scale * (F.normalize(lexical, dim=-1) * anchor).sum(-1)
         options = h.option_norm(routed)
         field = fields[option_q]
-        # F.cosine_similarity has no OpenVINO rule; same formula as torch's (eps=1e-8).
+        # F.cosine_similarity has no OpenVINO rule. torch clamps each norm at eps=1e-8; this
+        # clamps their product at eps^2 instead, so the two agree unless a norm is below ~1e-8
+        # (both vectors come out of LayerNorms: field_norm and option_norm).
         cosine = (field * options).sum(-1) / torch.sqrt(
             ((field * field).sum(-1) * (options * options).sum(-1)).clamp_min(1e-16)
         )
@@ -338,7 +345,8 @@ def load_joint_head(head_dir):
     """head_dir holds Cloudflare's joint_head.safetensors + joint_head_config.json."""
     import json
     from safetensors.torch import load_file
-    cfg = json.loads(open(os.path.join(head_dir, "joint_head_config.json")).read())
+    with open(os.path.join(head_dir, "joint_head_config.json")) as f:
+        cfg = json.load(f)
     head = JointSchemaHead(**cfg)
     head.load_state_dict(load_file(os.path.join(head_dir, "joint_head.safetensors")), strict=True)
     return head.float().eval()

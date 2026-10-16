@@ -155,6 +155,28 @@ def check_specials(label, prompt_ids, added_ids, expected):
 # ---------------------------------------------------------------------------------------------
 # Golden-only records: every rendering branch the 50 parity records never reach. No saved
 # reference exists for them, so they are compared on prompts/positions only, never on answers.
+def head_widths(head):
+    """Logits the readout head produces per question, in output order (ReadoutHead::output_len)."""
+    if head["kind"] == "verbalizer":
+        return [len(head["token_ids"])]
+    if head["kind"] == "pointer":
+        return [len(head["option_pos"])]
+    return [len(q["options"]) for q in head["questions"]]
+
+
+def check_parts(label, p):
+    """A pass's [qid, lo, hi] logit ranges tile its head's outputs: in order from 0, contiguous, one
+    question's width each. A shifted range would score a question on another question's logits."""
+    widths = head_widths(p["readout"]["head"])
+    want, at = [], 0
+    for w in widths:
+        want.append([at, at + w])
+        at += w
+    got = [[lo, hi] for _, lo, hi in p["parts"]]
+    if got != want:
+        fail(f"{label}: logit ranges {got} do not tile the head's outputs {want}")
+
+
 SYNTHETIC = [
     {"id": "s00", "state": ["first turn. ", {"type": "text", "text": "second turn."}, {"k": 1.5}],
      "questions": {"u": {"type": "noul", "instructions": "Is this resolved?",
@@ -172,6 +194,18 @@ SYNTHETIC = [
 ]
 
 
+def floats_in(v):
+    """Every float value in a JSON tree (not digits that happen to sit inside a string)."""
+    if isinstance(v, float):
+        yield v
+    elif isinstance(v, dict):
+        for x in v.values():
+            yield from floats_in(x)
+    elif isinstance(v, list):
+        for x in v:
+            yield from floats_in(x)
+
+
 def branches(rec):
     out = set()
     st = json.dumps(rec["state"])
@@ -180,10 +214,11 @@ def branches(rec):
     if isinstance(rec["state"], dict) and any(isinstance(v, list) and v and all(isinstance(x, dict) for x in v)
                                               for v in rec["state"].values()):
         out.add("nested_list_of_dicts")
+    fl = {json.dumps(f) for f in floats_in(rec["state"])}
     for lit in ("1e-05", "1e+16", "2.5"):
-        if lit in st:
+        if lit in fl:
             out.add(f"float:{lit}")
-    if "1e" in st or ".5" in st:
+    if fl:
         out.add("float")
     texts = [st] + [json.dumps(q) for q in rec["questions"].values()]
     if any("<|im_end|>" in t for t in texts) and any("<think>" in t or "<tool_call>" in t for t in texts):
@@ -272,6 +307,7 @@ def check_jev(dump, tok, adapter_dir, recs):
             check_specials(f"jev {rec['id']}.{qid}", p["readout"]["prompt_ids"], added_ids, [])
             if p["readout"]["head"]["token_ids"] != head["verbalizer_ids"][lo:hi]:
                 fail(f"jev {rec['id']}.{qid}: verbalizer token_ids differ from decision_head.json")
+            check_parts(f"jev {rec['id']}.{qid}", p)
             n += 1
     print(f"jev: {n} passes match the serve_decide layout and decision_head.json")
 
@@ -318,6 +354,7 @@ def check_kev(dump, tok, adapter_dir, recs):
                 fail(f"kev {rec['id']}.{qid}: row/positions differ")
             check_specials(f"kev {rec['id']}.{qid}", r["prompt_ids"], added_ids,
                            kev_expected_specials(kev_ids, len(r["head"]["option_pos"])))
+            check_parts(f"kev {rec['id']}.{qid}", p)
             n += 1
     print(f"kev: {n} passes match kev.questions")
 
@@ -408,6 +445,9 @@ def check_clef(dump, tok, adapter_dir, recs):
             if q["qtype"] != eq.question_type or tuple(q["span"]) != tuple(eq.question_span) or \
                     [tuple(o["span"]) for o in q["options"]] != [tuple(s) for s in eq.option_spans]:
                 fail(f"clef {rec['id']}.{eq.question_id}: spans/type differ")
+        if [q[0] for q in p["parts"]] != list(rec["questions"]):
+            fail(f"clef {rec['id']}: parts answer {[q[0] for q in p['parts']]}, record asks {list(rec['questions'])}")
+        check_parts(f"clef {rec['id']}", p)
         n += 1
     print(f"clef: {n} records match encode_record")
 
@@ -543,9 +583,15 @@ def post_all(url, recs):
         systemone(url, rec)
 
 
+def noul_top1(p_true):
+    """A noul answer's top option. A p = 0.5 tie reads "false", as argmax over the API order
+    [false, true] does in parity_check.py, so the two tools never score the same tie differently."""
+    return "true" if p_true > 0.5 else "false"
+
+
 def top1(ans):
     if ans["type"] == "noul":
-        return "true" if ans["noul"] >= 0.5 else "false"
+        return noul_top1(ans["noul"])
     if ans["type"] == "choice":
         return ans["choice"]
     return str(argmax(list(ans["probabilities"].values())))
@@ -556,11 +602,11 @@ def reference_top1(family, q, r):
     so this is each spike's stored order: Clef noul [true, false] and sorted choices
     (joint_schema_model.question_options); Kev noul [false, true] and caller-order choices
     (kev.questions); JEV noul [false, true] and sorted choices (jev.questions)."""
-    i = argmax(r["probs"])
     kind = q["type"]
     if kind == "noul":
-        order = ["true", "false"] if family == "clef" else ["false", "true"]
-        return order[i]
+        probs = r["probs"].tolist() if hasattr(r["probs"], "tolist") else list(r["probs"])
+        return noul_top1(probs[0] if family == "clef" else probs[1])
+    i = argmax(r["probs"])
     if kind == "choice":
         names = sorted(q["criteria"]) if family in ("clef", "jev") else list(q["criteria"])
         return names[i]

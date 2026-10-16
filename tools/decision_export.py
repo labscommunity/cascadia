@@ -38,22 +38,39 @@ MIN_TEMPERATURE = 1e-3
 MAX_TEMPERATURE = 1e3
 MAX_ABS_BIAS = 1e4
 # Pass-length caps the server clamps max_tokens to (crates/cascadia-types/src/decision.rs):
-# every decision pass, and Clef's joint pass. test_bounds_mirror_the_rust_constants pins all five.
+# every decision pass, and Clef's joint pass, whose `hidden` input must also fit the shim's
+# input limit. test_bounds_mirror_the_rust_constants pins all six.
 MAX_DECISION_PROMPT = 131_072
 MAX_JOINT_PROMPT = 16_384
+MAX_HEAD_INPUT_BYTES = 320 * 1024 * 1024
 DEFAULT_MAX_TOKENS = {"jev": 32768, "kev": 73728, "clef": 16384}
 HARD_MAX_TOKENS = {"jev": ("MAX_DECISION_PROMPT", MAX_DECISION_PROMPT),
                    "kev": ("MAX_DECISION_PROMPT", MAX_DECISION_PROMPT),
                    "clef": ("MAX_JOINT_PROMPT", MAX_JOINT_PROMPT)}
 
 
-def resolve_max_tokens(family, requested, mpe, src="the checkpoint"):
-    """decision.json max_tokens: `requested` (--max-tokens) or the family default, the default
-    capped by the max_position_embeddings `mpe` that `src`/config.json records (None: not recorded). A
-    requested value above `mpe` or the family's server cap is refused (ValueError), never silently lowered."""
-    if requested is None:
-        return min(DEFAULT_MAX_TOKENS[family], mpe) if mpe else DEFAULT_MAX_TOKENS[family]
+def joint_prompt_cap(hidden):
+    """joint_prompt_cap in decision.rs: MAX_JOINT_PROMPT, tightened so a [T, hidden] f32 input fits
+    MAX_HEAD_INPUT_BYTES (it binds only above 5120 wide)."""
+    return min(MAX_JOINT_PROMPT, MAX_HEAD_INPUT_BYTES // (4 * max(hidden, 1)))
+
+
+def _family_cap(family, hidden):
+    """(name, cap): the longest pass the server keeps for `family` at model width `hidden` (None: unknown)."""
     name, cap = HARD_MAX_TOKENS[family]
+    if family == "clef" and hidden and joint_prompt_cap(hidden) < cap:
+        return f"joint_prompt_cap({hidden}) for a {hidden}-wide model", joint_prompt_cap(hidden)
+    return name, cap
+
+
+def resolve_max_tokens(family, requested, mpe, src="the checkpoint", hidden=None):
+    """decision.json max_tokens: `requested` (--max-tokens) or the family default, the default
+    capped by the max_position_embeddings `mpe` that `src`/config.json records (None: not recorded)
+    and by the family's server cap at model width `hidden`. A requested value above `mpe` or the
+    server cap is refused (ValueError), never silently lowered."""
+    name, cap = _family_cap(family, hidden)
+    if requested is None:
+        return min(DEFAULT_MAX_TOKENS[family], cap, mpe) if mpe else min(DEFAULT_MAX_TOKENS[family], cap)
     if requested > cap:
         raise ValueError(f"--max-tokens {requested} exceeds {family}'s {cap} ({name} in "
                          f"crates/cascadia-types/src/decision.rs; the server would clamp it)")
@@ -141,13 +158,20 @@ def kev_head_unsupported(meta):
     if meta.get("weights") not in (None, "lora"):
         bad.append(f"weights {meta['weights']!r} (a kev export grafts a LoRA onto --weights)")
     head = meta.get("head")
-    if isinstance(head, dict):
-        extra = sorted(set(head) - KEV_HEAD_TENSORS)
-        missing = sorted(KEV_HEAD_TENSORS - set(head))
-        if extra or missing:
-            bad.append(f"head tensors {sorted(head)} (the pointer head has exactly {sorted(KEV_HEAD_TENSORS)})")
-        elif "head_dim" in meta and int(meta["head_dim"]) != head["q.weight"].shape[0]:
-            bad.append(f"head_dim {meta['head_dim']} but q.weight has {head['q.weight'].shape[0]} rows")
+    if not isinstance(head, dict):
+        # Meta's default head is None: a run that never saved its pointer head
+        bad.append(f"head tensors {head!r} (the pointer head has exactly {sorted(KEV_HEAD_TENSORS)})")
+        return bad
+    extra = sorted(set(head) - KEV_HEAD_TENSORS)
+    missing = sorted(KEV_HEAD_TENSORS - set(head))
+    if extra or missing:
+        bad.append(f"head tensors {sorted(head)} (the pointer head has exactly {sorted(KEV_HEAD_TENSORS)})")
+    elif "head_dim" in meta:
+        hd = meta["head_dim"]
+        if not isinstance(hd, int) or isinstance(hd, bool):
+            bad.append(f"head_dim {hd!r} (an integer: the pointer head's dp)")
+        elif hd != head["q.weight"].shape[0]:
+            bad.append(f"head_dim {hd} but q.weight has {head['q.weight'].shape[0]} rows")
     return bad
 
 
@@ -215,6 +239,14 @@ def _max_position_embeddings(model_dir):
     return int(mpe) if mpe is not None else None
 
 
+def _hidden_size(model_dir):
+    """The text config's hidden_size, or None when model_dir has no config.json or it records none."""
+    if not (Path(model_dir) / "config.json").exists():
+        return None
+    h = _text_config(model_dir).get("hidden_size")
+    return int(h) if h is not None else None
+
+
 def _positive_int(s):
     try:
         n = int(s)
@@ -279,6 +311,10 @@ def main():
         ap.error("jev --weights grafts the adapter onto those shards: pass --weights-not-merged to state "
                  "they do not already contain it (run tools/decision/backbone_diff.py STOCK_REPO WEIGHTS "
                  "--adapter ADAPTER_DIR first; VERDICT: MERGED means export without --weights instead)")
+    if a.family == "clef" and (a.lora or a.lora_scale is not None):
+        # Clef's joint head reads the hidden states of the full checkpoint it was trained on;
+        # an adapter grafted on top would move them, and nothing here would notice.
+        ap.error("clef takes no --lora/--lora-scale: --clef-dir is the full checkpoint its joint head reads")
     tokenizer = a.tokenizer
     if a.family == "kev":
         # Kev's pointer head was trained on its fine-tuned backbone's hidden states (Base + LoRA):
@@ -311,8 +347,11 @@ def main():
     # (clef's --weights defaults to --clef-dir), else the base IR's.
     weights = a.weights or (a.clef_dir if a.family == "clef" else None)
     src = weights if weights and (Path(weights) / "config.json").exists() else a.base_ir
+    # Clef's joint pass is also bounded by the model width (the base IR's: run_export refuses
+    # --weights of another architecture).
+    hidden = _hidden_size(a.base_ir) if a.family == "clef" else None
     try:
-        max_tokens = resolve_max_tokens(a.family, a.max_tokens, _max_position_embeddings(src), src)
+        max_tokens = resolve_max_tokens(a.family, a.max_tokens, _max_position_embeddings(src), src, hidden)
     except ValueError as e:
         ap.error(str(e))
     from export_qwen36_moe import run_export
@@ -340,7 +379,7 @@ def main():
     else:
         write_clef_profile(a.clef_dir, a.out, max_tokens=max_tokens)
         run_export(a.base_ir, a.out, a.stages, False, a.layer_split, weights=a.weights or a.clef_dir,
-                   lora=a.lora, lora_scale=a.lora_scale, final_hidden=True, **tok_kw)
+                   lora=None, lora_scale=None, final_hidden=True, **tok_kw)
     print(f"decision tree written: {a.out}")
 
 
