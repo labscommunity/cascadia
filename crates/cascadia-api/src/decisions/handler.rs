@@ -141,7 +141,15 @@ struct ThinkPrompt {
     qid: String,
     text: String,
     len: usize,
+    /// Its worst case was reserved up front. Always true under `on` (or the request is a 413);
+    /// under `auto` a question that did not fit answers from System 1 (`reason: "budget"`).
+    fits: bool,
 }
+
+/// The default `think_budget`: 4096 tokens, or `max_tokens` when smaller. The reference's
+/// default is the context window, which on our hardware is hours of decoding per question and
+/// more than a request's `max_total_tokens` can hold.
+pub const DEFAULT_THINK_BUDGET: usize = 4096;
 
 /// The request's [`ThinkPlan`], or `None` when nothing thinks: the mode is `off` (the default),
 /// or the codec has no System 2 and no System 2 field was set. Cheap checks only, run before the
@@ -169,6 +177,22 @@ fn plan_thinking(
     if mode == ThinkingMode::Off {
         return Ok(None);
     }
+    // A tree that cannot think at all (a profile default that thinks is refused at load).
+    if let Some(why) = jev.system2_refusal() {
+        return bad(why);
+    }
+    // Disabled at startup (with a warning) when the template is missing or does not render: a
+    // profile default then serves System 1 alone; asking for thinking is a 400.
+    let Some(frame) = state.think_frame.clone() else {
+        if req.thinking.is_some() {
+            return bad(
+                "thinking is disabled on this server: the model's chat template did not load or \
+                 render (see the startup log)"
+                    .into(),
+            );
+        }
+        return Ok(None);
+    };
     // serve_decide refuses a score question asked to think; under the profile's default it just
     // answers without thinking.
     if req.thinking.is_some() {
@@ -181,9 +205,6 @@ fn plan_thinking(
                 "thinking is supported for noul and choice questions; {id} is a score question"
             ));
         }
-    }
-    if let Some(why) = jev.system2_refusal() {
-        return bad(why);
     }
     let labels = jev.answer_label_count();
     if let Some((id, n)) = req
@@ -201,16 +222,16 @@ fn plan_thinking(
     if !(0.0..=1.0).contains(&threshold) {
         return bad(format!("threshold must be in [0, 1], got {threshold}"));
     }
-    let budget = req.think_budget.unwrap_or(svc.max_tokens);
+    let budget = req
+        .think_budget
+        .unwrap_or(DEFAULT_THINK_BUDGET.min(svc.max_tokens));
     if budget == 0 || budget > svc.max_tokens {
         return bad(format!(
             "think_budget must be 1..={} tokens, got {budget}",
             svc.max_tokens
         ));
     }
-    let Some((pre, post)) = crate::think_frame(state) else {
-        return bad("thinking needs the model's chat template, which did not load".into());
-    };
+    let (pre, post) = (frame.0.clone(), frame.1.clone());
     Ok(Some(ThinkPlan {
         mode,
         threshold,
@@ -249,6 +270,7 @@ fn think_prompts(
             qid: qid.clone(),
             text,
             len,
+            fits: false,
         });
     }
     Ok((out, tail))
@@ -335,43 +357,60 @@ pub(crate) async fn evaluate(
         }
         None => None,
     };
-    // Each question that may think, at its worst case: its prompt and `think_budget` generated,
-    // then the read-back over both plus the tail. Its prompt part is capped like any pass; the
-    // read-back as a whole by the engine's decision prompt cap.
-    let mut think_need = 0usize;
-    if let (Some(p), Some((prompts, tail))) = (&plan, &thinks) {
-        for t in prompts {
-            if t.len + tail > svc.max_tokens {
-                return Err(super::pass_too_long(t.len + tail, svc.max_tokens));
-            }
-            let read_back = t.len + p.budget + tail;
-            if read_back > MAX_DECISION_PROMPT {
-                return Err(DecisionError::TooLong(format!(
-                    "with think_budget {} a read-back pass can reach {read_back} tokens; the \
-                     limit is {MAX_DECISION_PROMPT}",
-                    p.budget
-                )));
-            }
-            think_need += t.len + p.budget + read_back;
-        }
-    }
-    // A second round (JEV's tournament finals) and System 2 are counted now, at their worst
-    // case, so a request is refused before its first pass rather than half way.
+    // A second round (JEV's tournament finals) is counted now, at its worst case, so a request
+    // is refused before its first pass rather than half way.
     let total = super::prefill_work(&passes, svc.prefix_reuse) + reserve;
-    if total + think_need > svc.max_total_tokens {
-        return Err(DecisionError::TooLong(match &plan {
-            Some(p) if think_need > 0 => format!(
+    if total > svc.max_total_tokens {
+        return Err(DecisionError::TooLong(format!(
+            "this request needs {total} prefill tokens; the per-request limit is {}",
+            svc.max_total_tokens
+        )));
+    }
+    // System 2 too, per question that may think, at its worst case: its prompt and
+    // `think_budget` generated, then the read-back over both plus the tail. Its prompt part is
+    // capped like any pass, the read-back by the engine's decision prompt cap (the model's
+    // window, or MAX_DECISION_PROMPT). `on` refuses a request that cannot afford every one
+    // (413); `auto` reserves question by question and lets one that does not fit answer from
+    // System 1 alone, so `auto` never makes a request fail.
+    let mut thinks = thinks;
+    if let (Some(p), Some((prompts, tail))) = (&plan, &mut thinks) {
+        let cap = svc
+            .codec
+            .as_jev()
+            .map_or(MAX_DECISION_PROMPT, |j| j.read_back_cap());
+        let strict = p.mode == ThinkingMode::On;
+        let mut left = svc.max_total_tokens - total;
+        let mut think_need = 0usize;
+        for t in prompts.iter_mut() {
+            let read_back = t.len + p.budget + *tail;
+            let need = t.len + p.budget + read_back;
+            t.fits = t.len + *tail <= svc.max_tokens && read_back <= cap && need <= left;
+            if t.fits {
+                left -= need;
+            } else if strict {
+                if t.len + *tail > svc.max_tokens {
+                    return Err(super::pass_too_long(t.len + *tail, svc.max_tokens));
+                }
+                if read_back > cap {
+                    return Err(DecisionError::TooLong(format!(
+                        "with think_budget {} a read-back pass can reach {read_back} tokens; \
+                         the engine's limit (the model's window, at most \
+                         {MAX_DECISION_PROMPT}) is {cap}",
+                        p.budget
+                    )));
+                }
+            }
+            think_need += need;
+        }
+        if strict && prompts.iter().any(|t| !t.fits) {
+            return Err(DecisionError::TooLong(format!(
                 "this request needs up to {} tokens, {think_need} of them for thinking at \
                  think_budget {}; the per-request limit is {} (lower think_budget)",
                 total + think_need,
                 p.budget,
                 svc.max_total_tokens
-            ),
-            _ => format!(
-                "this request needs {total} prefill tokens; the per-request limit is {}",
-                svc.max_total_tokens
-            ),
-        }));
+            )));
+        }
     }
     dump_passes(state, &svc, &req, &held, &passes, 1).await;
     super::mark_required_reuse(&mut passes, svc.max_total_tokens, svc.prefix_reuse);
@@ -491,9 +530,11 @@ async fn think(
     };
     let p1 = dists[&t.qid].clone();
     let lead = p1.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let wanted = plan.mode == ThinkingMode::On || lead < plan.threshold;
     let mut report = schema::Thinking {
         mode: plan.mode,
-        used: plan.mode == ThinkingMode::On || lead < plan.threshold,
+        used: wanted && t.fits,
+        reason: (wanted && !t.fits).then_some(BUDGET),
         threshold: plan.threshold,
         budget: plan.budget,
         think_tokens: None,
@@ -531,12 +572,20 @@ async fn think(
         Ok::<_, DecisionError>((text, ids))
     })
     .await??;
-    if prompt_ids.len() > MAX_DECISION_PROMPT {
-        return Err(super::pass_too_long(prompt_ids.len(), MAX_DECISION_PROMPT));
-    }
     // Within the worst case admission counted whenever re-encoding the thought gives back no
     // more tokens than were generated; a tokenizer where it does not stops here rather than
-    // overspend.
+    // overspend: `auto` answers from System 1 (the thought is still counted in usage), `on` is
+    // a 413.
+    let cap = jev.read_back_cap();
+    let over = prompt_ids.len() > cap || *spent + prompt_ids.len() > svc.max_total_tokens;
+    if over && plan.mode == ThinkingMode::Auto {
+        report.used = false;
+        report.reason = Some(BUDGET);
+        return Ok(report);
+    }
+    if prompt_ids.len() > cap {
+        return Err(super::pass_too_long(prompt_ids.len(), cap));
+    }
     if *spent + prompt_ids.len() > svc.max_total_tokens {
         return Err(DecisionError::TooLong(format!(
             "this request needs {} tokens with thinking; the per-request limit is {}",
@@ -571,6 +620,9 @@ async fn think(
     }
     Ok(report)
 }
+
+/// `thinking.reason` of a question whose System 2 the request's budget could not cover.
+const BUDGET: &str = "budget";
 
 /// What System 2's generation produced.
 struct Thought {

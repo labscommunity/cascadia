@@ -20,6 +20,9 @@ pub struct JevCodec {
     /// The request's prefill budget (`max_total_tokens`): JEV prefills every pass in full, so
     /// the encode stops once the passes so far exceed it (P2-SEC-4).
     total_cap: usize,
+    /// The model's window (config.json `max_position_embeddings`), when known: the engine caps
+    /// decision prompts at it, which bounds System 2's read-back.
+    window: Option<usize>,
 }
 
 fn kind(q: &Question) -> &'static str {
@@ -244,6 +247,7 @@ impl JevCodec {
             san,
             pass_cap: usize::MAX,
             total_cap: usize::MAX,
+            window: None,
         })
     }
 
@@ -257,6 +261,12 @@ impl JevCodec {
     /// shares a prefix, so the handler's budget counts every one in full).
     pub fn with_total_cap(mut self, max_total_tokens: usize) -> Self {
         self.total_cap = max_total_tokens;
+        self
+    }
+
+    /// The model's window (`max_position_embeddings`), `None` when the tree does not state it.
+    pub fn with_window(mut self, window: Option<usize>) -> Self {
+        self.window = window;
         self
     }
 
@@ -568,6 +578,15 @@ impl JevCodec {
 
     pub fn end_think_id(&self) -> Option<u32> {
         self.p.end_think_id
+    }
+
+    /// The longest read-back the engine admits: the model's window, at most
+    /// `MAX_DECISION_PROMPT` (the engine's `decision_prompt_cap`).
+    pub fn read_back_cap(&self) -> usize {
+        self.window
+            .map_or(cascadia_types::MAX_DECISION_PROMPT, |w| {
+                w.min(cascadia_types::MAX_DECISION_PROMPT)
+            })
     }
 
     /// The ids the read-back scores for `n` options.

@@ -264,8 +264,8 @@ framework's plain-text body.
 | Status | When |
 |---|---|
 | 200 | Every question answered. |
-| 400 | A body that is not valid JSON; on the OpenAI route, also a body that does not match the request schema (a missing `questions`, an unknown question `type`, a repeated key). Validation: no questions or more than `max_questions`; an empty question name, or (OpenAI format) a duplicate question name or choice value; a choice with no options or more than the model allows; a score with fewer levels than the model allows (2 for JEV, 1 for Kev and Clef) or more; images; an image part, or a text part without a string `text`, in a list `state` (JEV); a request the tokenizer cannot encode; Clef's option cap (see [Limits](#limits)); a `strategy` other than `"auto"` on Kev or Clef (`strategy applies to JEV only`); on the OpenAI route, a `strategy` that is none of the four values; thinking that cannot run (see [JEV adaptive thinking (System 2)](#jev-adaptive-thinking-system-2): any System 2 field on Kev or Clef, a score question with an explicit `thinking`, a tree that is not switchable or lacks System 2's export or chat template, more options than answer labels, `threshold` outside [0, 1], `think_budget` outside 1..=`max_tokens`). |
-| 413 | The body is over `--api-max-body-mb`. Too long: the state is more than `max_total_tokens × 8` bytes (checked before tokenizing); Kev's whole rendered text (state, instructions, options and levels) is more than `max_total_tokens × 8` bytes; Kev's rendered state is more than 524,288 bytes (65,536 × 8, checked before tokenizing); one Kev question's instructions and option texts render to more than 8 bytes per token the pass has left after the state (`max_tokens` minus the state's tokens, checked before tokenizing); Kev's state is more than 65,536 tokens (`SERVE_MAX_STATE`, `<state>` included) or reaches `max_tokens`; one pass is longer than `max_tokens` (JEV and Kev; Clef truncates the state instead); Clef's schema alone fills the joint pass, leaving no room for a non-empty state; the request's prefill work is more than `max_total_tokens` (JEV stops tokenizing at the first pass that takes it over: `needs at least N`; a JEV tournament's final counts at its worst case before any pass runs, see [JEV choices past the trained slots](#jev-choices-past-the-trained-slots); so does System 2 at its `think_budget`, see [JEV adaptive thinking (System 2)](#jev-adaptive-thinking-system-2)); a Kev request that needs the shared-state discount when the prefix cache can never hold that state (`this request needs N prefill tokens without prefix reuse (the shared prefix cannot fit the prefix cache); the per-request limit is M`, refused before any prefill once the engine knows the snapshot's size, which its warmup measures at startup; see [Limits](#limits) for when the first such request can still spend one pass); or the engine reports the prompt too long. |
+| 400 | A body that is not valid JSON; on the OpenAI route, also a body that does not match the request schema (a missing `questions`, an unknown question `type`, a repeated key). Validation: no questions or more than `max_questions`; an empty question name, or (OpenAI format) a duplicate question name or choice value; a choice with no options or more than the model allows; a score with fewer levels than the model allows (2 for JEV, 1 for Kev and Clef) or more; images; an image part, or a text part without a string `text`, in a list `state` (JEV); a request the tokenizer cannot encode; Clef's option cap (see [Limits](#limits)); a `strategy` other than `"auto"` on Kev or Clef (`strategy applies to JEV only`); on the OpenAI route, a `strategy` that is none of the four values; thinking that cannot run (see [JEV adaptive thinking (System 2)](#jev-adaptive-thinking-system-2): any System 2 field on Kev or Clef, a score question with an explicit `thinking`, a tree that is not switchable or lacks System 2's export, System 2 disabled at startup for a missing chat template, more options than answer labels, `threshold` outside [0, 1], `think_budget` outside 1..=`max_tokens`). |
+| 413 | The body is over `--api-max-body-mb`. Too long: the state is more than `max_total_tokens × 8` bytes (checked before tokenizing); Kev's whole rendered text (state, instructions, options and levels) is more than `max_total_tokens × 8` bytes; Kev's rendered state is more than 524,288 bytes (65,536 × 8, checked before tokenizing); one Kev question's instructions and option texts render to more than 8 bytes per token the pass has left after the state (`max_tokens` minus the state's tokens, checked before tokenizing); Kev's state is more than 65,536 tokens (`SERVE_MAX_STATE`, `<state>` included) or reaches `max_tokens`; one pass is longer than `max_tokens` (JEV and Kev; Clef truncates the state instead); Clef's schema alone fills the joint pass, leaving no room for a non-empty state; the request's prefill work is more than `max_total_tokens` (JEV stops tokenizing at the first pass that takes it over: `needs at least N`; a JEV tournament's final counts at its worst case before any pass runs, see [JEV choices past the trained slots](#jev-choices-past-the-trained-slots); so does System 2 at its `think_budget` under `thinking: "on"` (`auto` skips a question instead), see [JEV adaptive thinking (System 2)](#jev-adaptive-thinking-system-2)); a Kev request that needs the shared-state discount when the prefix cache can never hold that state (`this request needs N prefill tokens without prefix reuse (the shared prefix cannot fit the prefix cache); the per-request limit is M`, refused before any prefill once the engine knows the snapshot's size, which its warmup measures at startup; see [Limits](#limits) for when the first such request can still spend one pass); or the engine reports the prompt too long. |
 | 415 | The request lacks `content-type: application/json`. |
 | 422 | `/v1/systemone` only: valid JSON that does not match the request schema, a `strategy` that is none of the four values included (the OpenAI route answers 400 instead). |
 | 501 | The model serves no decisions: no `decision.json` (or one that fails its load checks; see the startup log), an engine other than `qwen35`, the engine has no decision head (`decision/` missing on the single box or the pipeline's last rank), the tree was exported without `--final-hidden` (Kev and Clef), or a pipeline rank cannot serve decision passes (an older build, rank 0 or the last rank without `config.json` `vocab_size`, or the last rank without `decision/`; a middle rank only relays and needs neither). Rank 0 refuses the pipeline cases before any prefill. |
@@ -295,7 +295,7 @@ Error messages are deliberately terse:
 | Tokens in the joint pass (Clef) | `MAX_JOINT_PROMPT` and the head's input limit | the smaller of `max_tokens`, 16,384 and 320 MiB ÷ (4 × width): 16,384 for both Clef-flash (width 4096) and Clef-27B (width 5120) |
 | Levels per score | per model family | JEV: 2 to 256; Clef: 1 to 256; Kev: 1 to 255 |
 | State tokens (Kev) | Kev's `SERVE_MAX_STATE` | 65,536, `<state>` included; only the whole pass may reach `max_tokens`. The rendered state is also capped at 8 bytes per token (524,288 bytes) before tokenizing |
-| Thinking tokens per question (JEV System 2) | request `think_budget` | `max_tokens`, also the most allowed |
+| Thinking tokens per question (JEV System 2) | request `think_budget` | 4096 (or `max_tokens` when smaller); at most `max_tokens` |
 | Concurrent decision requests | `--max-decision-requests` | 16 (1 to 240), a pool separate from chat's 16; one more is a 503 |
 | Concurrent tokenizations | fixed | min(4, CPU cores), separate from the decision permits |
 | Request body | `--api-max-body-mb` | 1 MiB |
@@ -522,12 +522,20 @@ apply to JEV only`):
 |---|---|---|
 | `thinking` | `"off"`, `"auto"`, `"on"`; `null` is the default | the profile's, `"off"` |
 | `threshold` | `auto` thinks when System 1's leading probability is below it, in [0, 1] | the profile's, 0.8 |
-| `think_budget` | most tokens the base model may think, 1..=`max_tokens` | `max_tokens` (decision.json) |
+| `think_budget` | most tokens the base model may think, 1..=`max_tokens` | 4096, or `max_tokens` (decision.json) when smaller |
 | `return_reasoning` | `true` returns the thought in `thinking.reasoning` | `false` |
 
 With `thinking` off (or absent with the default profile) the other three fields are ignored, as
 the reference ignores them, and every response is byte for byte what it was before thinking
 existed.
+
+**Why the default budget is 4096, not the reference's.** serve_decide's default is no limit
+beyond the context window (262,144 tokens for Qwen3.5). The engine decodes one token at a time
+on a batch-1 slot, so on our hardware a window-long thought is hours of decoding per question, and
+its worst case (the generation plus
+the read-back, both counted up front) is more than a request's `max_total_tokens` can hold. 4096
+keeps a thinking question to minutes and lets `on` over a few questions fit the default
+`max_total_tokens` (4 × `max_tokens`).
 
 ### Triggers
 
@@ -575,6 +583,9 @@ Every noul and choice answer of a request whose mode is `auto` or `on` carries `
 - `mode`, `threshold`, `budget`: the request's resolved settings.
 - `used`: the base model thought and was blended in. An `auto` answer that did not think has only
   `mode`, `used: false`, `threshold` and `budget`, and its probabilities are System 1's.
+- `reason`: `"budget"` on an `auto` answer that would have thought (System 1 was below the
+  threshold) but whose System 2 worst case did not fit what the request had left (see below).
+  Its probabilities are System 1's.
 - `think_tokens`: tokens generated, the closing `</think>` included.
 - `finished_within_budget`: the thought closed, or the model stopped on its own, before the
   budget ran out. A thought cut at the budget is still read back, with `</think>` appended.
@@ -588,17 +599,30 @@ thinking token, and `usage.input_tokens` adds each generation's and read-back's 
 - **Switchable trees only.** System 2 runs the base model through `lora_scale = 0`, which a
   baked tree refuses at the engine. The API checks first: a tree without `jev.lora_scale` is a
   400 (`thinking needs a switchable tree ...`). So is a tree without System 2's export
-  (`jev.answer_labels`, `jev.end_think_id`; re-export it), one whose chat template did not load,
-  and a choice with more options than answer labels.
+  (`jev.answer_labels`, `jev.end_think_id`; re-export it), and a choice with more options than
+  answer labels.
+- **Chat template.** It is rendered once at startup. If a JEV that could think has no template,
+  or it does not render a user turn, the server logs a warning and disables System 2 for that
+  tree: System 1 keeps serving, a profile default that thinks is ignored, and a request that sets
+  `thinking` to `auto` or `on` is a 400 (`thinking is disabled on this server: the model's chat
+  template did not load or render`).
 - **Budget, up front.** Before any pass runs, each question that may think (every noul and choice
-  under `auto` too) counts at its worst case against `max_total_tokens`: its prompt plus
-  `think_budget` generated, then the read-back over both plus its tail. A request that cannot
-  afford it is a 413 naming the budget (`... for thinking at think_budget N ...; the per-request
-  limit is M (lower think_budget)`). The real read-back is checked again before it runs.
+  under `auto` too) is reserved at its worst case against what `max_total_tokens` leaves after
+  System 1: its prompt plus `think_budget` generated, then the read-back over both plus its tail.
+  - `on` is strict: a request that cannot afford every question is a 413 naming the budget
+    (`... for thinking at think_budget N ...; the per-request limit is M (lower think_budget)`),
+    before any engine call.
+  - `auto` reserves question by question, in request order. A question that does not fit (nor
+    the pass limits below) answers from System 1 alone with `reason: "budget"` if it would have
+    thought. `auto` never makes a request fail; a profile default of `auto` cannot turn a working
+    request into a 413.
+  - The real read-back is checked again before it runs (a 413 under `on`, a budget skip under
+    `auto`).
 - **Pass lengths.** A System 2 prompt plus the read-back's tail must fit `max_tokens`, like any
-  pass (413). The read-back adds up to `think_budget` tokens of thought on top, so it may exceed
-  `max_tokens`, up to the engine's 131,072-token decision prompt cap (413 above it, checked up
-  front at the budget).
+  pass. The read-back adds up to `think_budget` tokens of thought on top, so it may exceed
+  `max_tokens`, up to the engine's decision prompt cap: the model's window (config.json
+  `max_position_embeddings`, read at load as the engine reads it), at most 131,072. Both are
+  checked up front at the budget: a 413 under `on`, a budget skip under `auto`.
 - **Admission.** System 2 runs inside the request: the same decision permit, the same engine
   queue, no extra admission. A thinking request holds its permit for as long as it thinks.
 - `--decision-dump` records System 1 passes only.
@@ -611,6 +635,9 @@ The exporter (`tools/decision_export.py jev`, Task 43) writes, from the tokenize
   when `"Answer: ({label})"` encodes as `"Answer: ("` plus exactly two more tokens (the label's,
   kept, and the `)`), at most 256.
 - `end_think_id`: the id of `</think>` when it is one token (omitted otherwise: no thinking).
+
+A profile with answer labels must have at least 2 (a noul shows two options), or it fails the
+load.
 
 The adaptive-thinking settings default to serve_decide's Qwen profile and can be overridden under
 `jev.system2`: `thinking` (`"off"`), `threshold` (0.8), `mix` (0.5), `end_think` (`"</think>"`,
