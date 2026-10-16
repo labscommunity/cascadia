@@ -484,6 +484,14 @@ python tools/decision_export.py clef --base-ir STOCK_INT8_IR \
   merged, stated with `--weights-not-merged` (check with `tools/decision/backbone_diff.py`).
 - Kev ships the `tokenizer.json` beside `head.pt`, not the Base checkpoint's (`--tokenizer FILE`
   overrides it for any family).
+- JEV writes its choice labels to the `jev` object of `decision.json`: `choice_labels` (strings)
+  and `choice_label_ids` (their token ids), at most 256 of each. The labels are `A`..`Z`, then
+  `AA`, `AB`, ..., `ZZ`, keeping each one that is a single token of the `tokenizer.json` the tree
+  ships and that stays that token in an option line (`x\n{label}) y`). The first labels must be
+  the trained choice verbalizers (`A`..`P` for JEV-9B), so the export is refused when their ids
+  differ from the `verbalizer_ids` of the choice slots; the error names both lists. A JEV export
+  with no `tokenizer.json` (from `--tokenizer`, `--weights` or the base IR) is refused. Both
+  fields are optional: a tree exported without them still loads.
 - Kev and Clef trees are exported with the final hidden-state output their heads read; JEV's
   verbalizer reads only the logits.
 - Clef takes no `--lora` or `--lora-scale`: `--clef-dir` is the full checkpoint its joint head
