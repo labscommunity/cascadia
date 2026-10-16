@@ -77,13 +77,14 @@ struct PipelineConfig {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct PipelineVision {
-    /// Which model family's image path the tree carries. Only `gemma4` is
-    /// served; trees from before the field are Gemma 4 surgery trees.
+    /// Which model family's image path the tree carries (`gemma4`, `gemma3`,
+    /// `pixtral`, `mistral3`); trees from before the field are Gemma 4
+    /// surgery trees.
     #[serde(default)]
     family: Option<String>,
     /// Whether every stage takes `token_type_ids` (the third wire frame).
-    /// Absent means the family's default: on for gemma4 (bidirectional image
-    /// attention), off otherwise.
+    /// Absent means the family's default: on for gemma4 and gemma3
+    /// (bidirectional image attention), off otherwise.
     #[serde(default)]
     pub(crate) token_type_ids: Option<bool>,
     /// Text embedding table IR in the pipeline dir (rank 0 embeds the prompt).
@@ -1829,12 +1830,26 @@ fn import_plugin(plugin: &PluginConfig) -> PluginConfig {
 pub(crate) enum VisionFamily {
     /// Gemma 4 surgery trees (26B-A4B/31B): `token_type_ids` on every stage.
     Gemma4,
+    /// Gemma 3 trees from tools/vlm_surgery (`--family gemma3`):
+    /// `token_type_ids` on every stage, like Gemma 4.
+    Gemma3,
     /// LLaVA-layout Pixtral trees from tools/vlm_surgery: causal attention.
     Pixtral,
     /// Phi-3.5-vision (`phi3_v`) trees from tools/vlm_surgery: causal.
     Phi3V,
     /// InternVL2 (`internvl_chat`) trees from tools/vlm_surgery: causal.
     InternVL,
+    /// LLaVA-NeXT (llava-v1.6) trees from tools/vlm_surgery: anyres tiles,
+    /// causal attention.
+    LlavaNext,
+}
+
+impl VisionFamily {
+    /// Whether the family attends bidirectionally inside an image, so its
+    /// stages take `token_type_ids` unless the tree says otherwise.
+    pub(crate) fn token_types_by_default(self) -> bool {
+        matches!(self, VisionFamily::Gemma4 | VisionFamily::Gemma3)
+    }
 }
 
 /// The family of a pipeline's `vision` block. A tree without the field is
@@ -1847,14 +1862,17 @@ pub(crate) fn vision_family(
 ) -> EngineResult<VisionFamily> {
     match (v.family.as_deref(), export_version) {
         (Some("gemma4"), _) | (None, Some("gemma4_vision_surgery_v1")) => Ok(VisionFamily::Gemma4),
+        (Some("gemma3"), _) => Ok(VisionFamily::Gemma3),
         // Mistral 3 is Pixtral's processor and tower plus a 2x2 patch merger,
         // which the Pixtral front end runs when the export carries it.
         (Some("pixtral" | "mistral3"), _) => Ok(VisionFamily::Pixtral),
         (Some("phi3_v"), _) => Ok(VisionFamily::Phi3V),
         (Some("internvl_chat"), _) => Ok(VisionFamily::InternVL),
+        (Some("llava_next"), _) => Ok(VisionFamily::LlavaNext),
         (Some(f), _) => Err(EngineError::InvalidConfig(format!(
             "pipeline_config.json `vision.family` is {f:?}; ov-runtime serves image input \
-             for \"gemma4\", \"pixtral\", \"mistral3\", \"phi3_v\" and \"internvl_chat\""
+             for \"gemma4\", \"gemma3\", \"pixtral\", \"mistral3\", \"llava_next\", \"phi3_v\" \
+             and \"internvl_chat\""
         ))),
         (None, other) => Err(EngineError::InvalidConfig(format!(
             "pipeline_config.json has a `vision` block without `family` on a {other:?} \
@@ -1885,14 +1903,31 @@ struct VisionTree {
 /// Rank 0's image front end, per family.
 pub(crate) enum Frontend {
     Gemma4(crate::gemma4_vision::ImageFrontend),
+    Gemma3(crate::gemma3_vision::Frontend),
     Pixtral(crate::pixtral_vision::Frontend),
     Phi3V(crate::phi3v_vision::Frontend),
     InternVL(crate::internvl_vision::Frontend),
+    LlavaNext(crate::llava_next_vision::Frontend),
 }
 
 impl Frontend {
+    /// The rendered prompt of a turn with images as the tokenizer must see
+    /// it. Gemma 3 expands each `<start_of_image>` on the text, as HF's
+    /// processor does (its "\n\n" framing merges with the neighbouring
+    /// text's tokens); the other families expand on ids in `prepare`.
+    pub(crate) fn prompt_text<'a>(&self, prompt: &'a str) -> std::borrow::Cow<'a, str> {
+        match self {
+            Frontend::Gemma3(f) => std::borrow::Cow::Owned(f.expand_text(prompt)),
+            Frontend::Gemma4(_)
+            | Frontend::Pixtral(_)
+            | Frontend::LlavaNext(_)
+            | Frontend::Phi3V(_)
+            | Frontend::InternVL(_) => std::borrow::Cow::Borrowed(prompt),
+        }
+    }
+
     /// A `prompt_len`-token prompt's length once `media` expand, from the
-    /// images' dimensions alone (no encode). Not Gemma 4.
+    /// images' dimensions alone (no encode). Not Gemma 4 / Gemma 3.
     pub(crate) fn expanded_len(
         &self,
         prompt_len: usize,
@@ -1902,7 +1937,10 @@ impl Frontend {
             Frontend::Pixtral(f) => f.expanded_len(prompt_len, media),
             Frontend::Phi3V(f) => f.expanded_len(prompt_len, media),
             Frontend::InternVL(f) => f.expanded_len(prompt_len, media),
-            Frontend::Gemma4(_) => Err("expanded length is sized for Pixtral images only".into()),
+            Frontend::LlavaNext(f) => f.expanded_len(prompt_len, media),
+            Frontend::Gemma4(_) | Frontend::Gemma3(_) => {
+                Err("expanded length is sized for Pixtral images only".into())
+            }
         }
     }
 
@@ -1910,9 +1948,12 @@ impl Frontend {
     pub(crate) fn image_framing(&self) -> Vec<i64> {
         match self {
             Frontend::Gemma4(f) => vec![f.tokens.image, f.tokens.boi, f.tokens.eoi],
+            Frontend::Gemma3(f) => vec![f.tokens.image, f.tokens.boi, f.tokens.eoi],
             Frontend::Pixtral(f) => vec![f.tokens.image, f.tokens.image_break, f.tokens.image_end],
             Frontend::Phi3V(f) => vec![f.image_token],
             Frontend::InternVL(f) => vec![f.tokens.context, f.tokens.start, f.tokens.end],
+            // Newline rows are image tokens too; nothing frames an image.
+            Frontend::LlavaNext(f) => vec![f.image_token],
         }
     }
 
@@ -1920,7 +1961,9 @@ impl Frontend {
     pub(crate) fn image_token(&self) -> i64 {
         match self {
             Frontend::Gemma4(f) => f.tokens.image,
+            Frontend::Gemma3(f) => f.tokens.image,
             Frontend::Pixtral(f) => f.tokens.image,
+            Frontend::LlavaNext(f) => f.image_token,
             Frontend::Phi3V(f) => f.image_token,
             Frontend::InternVL(f) => f.tokens.context,
         }
@@ -1946,7 +1989,13 @@ impl Frontend {
     fn embedding_ids(&self, ids: &[i64]) -> Vec<i64> {
         match self {
             Frontend::Gemma4(f) => crate::gemma4_vision::text_embedding_ids(ids, &f.tokens),
-            Frontend::Pixtral(_) | Frontend::Phi3V(_) | Frontend::InternVL(_) => ids.to_vec(),
+            // Gemma 3's soft-token id is inside the vocabulary, so it embeds
+            // as itself, as in HF.
+            Frontend::Gemma3(_)
+            | Frontend::Pixtral(_)
+            | Frontend::LlavaNext(_)
+            | Frontend::Phi3V(_)
+            | Frontend::InternVL(_) => ids.to_vec(),
         }
     }
 
@@ -1958,9 +2007,11 @@ impl Frontend {
     ) -> Result<(Vec<i64>, Vec<Vec<f32>>), String> {
         match self {
             Frontend::Gemma4(f) => f.prepare(media, prompt_ids, tenant),
+            Frontend::Gemma3(f) => f.prepare(media, prompt_ids, tenant),
             Frontend::Pixtral(f) => f.prepare(media, prompt_ids, tenant),
             Frontend::Phi3V(f) => f.prepare(media, prompt_ids, tenant),
             Frontend::InternVL(f) => f.prepare(media, prompt_ids, tenant),
+            Frontend::LlavaNext(f) => f.prepare(media, prompt_ids, tenant),
         }
     }
 
@@ -1972,9 +2023,11 @@ impl Frontend {
     ) -> Result<Vec<i64>, String> {
         match self {
             Frontend::Gemma4(f) => f.expand_ids(media, prompt_ids),
+            Frontend::Gemma3(f) => f.expand_ids(media, prompt_ids),
             Frontend::Pixtral(f) => f.expand_ids(media, prompt_ids),
             Frontend::Phi3V(f) => f.expand_ids(media, prompt_ids),
             Frontend::InternVL(f) => f.expand_ids(media, prompt_ids),
+            Frontend::LlavaNext(f) => f.expand_ids(media, prompt_ids),
         }
     }
 
@@ -1983,7 +2036,11 @@ impl Frontend {
     fn max_image_tokens(&self) -> Option<usize> {
         match self {
             Frontend::Gemma4(f) => Some(f.preprocess.max_soft_tokens as usize),
-            Frontend::Pixtral(_) | Frontend::Phi3V(_) | Frontend::InternVL(_) => None,
+            Frontend::Gemma3(f) => Some(f.preprocess.image_seq_length as usize),
+            Frontend::Pixtral(_)
+            | Frontend::LlavaNext(_)
+            | Frontend::Phi3V(_)
+            | Frontend::InternVL(_) => None,
         }
     }
 
@@ -1992,6 +2049,10 @@ impl Frontend {
             Frontend::Gemma4(f) => format!(
                 "Gemma 4 images, {} soft tokens each at most",
                 f.preprocess.max_soft_tokens
+            ),
+            Frontend::Gemma3(f) => format!(
+                "Gemma 3 images, resized to {}x{}, {} soft tokens each",
+                f.preprocess.width, f.preprocess.height, f.preprocess.image_seq_length
             ),
             Frontend::Pixtral(f) if f.preprocess.spatial_merge > 1 => format!(
                 "Mistral 3 images, longest edge {} px, one token per {}px cell \
@@ -2019,22 +2080,38 @@ impl Frontend {
                 f.preprocess.image_size,
                 f.preprocess.tokens_per_tile
             ),
+            Frontend::LlavaNext(f) => format!(
+                "LLaVA-NeXT images, a {} px base view plus tiles over pinpoints {:?}",
+                f.preprocess.tile, f.preprocess.pinpoints
+            ),
         }
     }
 }
 
+/// The text rank 0 tokenizes a task's prompt from: the rendered prompt, with
+/// a Gemma 3 tree's images expanded on the text ([`Frontend::prompt_text`]).
+fn tokenizer_text(vision: Option<&VisionTree>, task: &GenerationTask) -> String {
+    match vision.and_then(|v| v.first.as_ref()) {
+        Some(first) if !task.media.is_empty() => {
+            first.frontend.prompt_text(&task.prompt).into_owned()
+        }
+        _ => task.prompt.clone(),
+    }
+}
+
 /// A rank-0 prompt's ids: the vision front end's layout on a vision tree
-/// ([`Frontend::encode_prompt`]), else the prompt encoded whole without
-/// special tokens.
+/// ([`Frontend::encode_prompt`]) of the text [`tokenizer_text`] gives, else
+/// that text encoded whole without special tokens.
 fn encode_prompt_ids(
     tok: &Tokenizer,
     vision: Option<&VisionTree>,
-    prompt: &str,
+    task: &GenerationTask,
 ) -> Result<Vec<i64>, String> {
+    let text = tokenizer_text(vision, task);
     match vision.and_then(|v| v.first.as_ref()) {
-        Some(first) => first.frontend.encode_prompt(tok, prompt),
+        Some(first) => first.frontend.encode_prompt(tok, &text),
         None => tok
-            .encode(prompt, false)
+            .encode(text, false)
             .map(|e| e.get_ids().iter().map(|&u| i64::from(u)).collect())
             .map_err(|e| format!("tokenizer encode: {e}")),
     }
@@ -2094,6 +2171,46 @@ impl VisionFirst {
                     crate::gemma4_vision::ImageFrontend::load(pipeline_dir, tokens)
                         .map_err(invalid)?,
                 )
+            }
+            VisionFamily::Gemma3 => {
+                // The ids are in config.json; the processor expands the
+                // prompt text, so rank 0 needs each token's spelling too.
+                let tok_path = pipeline_dir.join("tokenizer").join("tokenizer.json");
+                let tok = Tokenizer::from_file(&tok_path)
+                    .map_err(|e| invalid(format!("reading {}: {e}", tok_path.display())))?;
+                let text = |k: &str| -> EngineResult<(i64, String)> {
+                    let id = id(k)?;
+                    let t = u32::try_from(id)
+                        .ok()
+                        .and_then(|u| tok.id_to_token(u))
+                        .ok_or_else(|| invalid(format!("tokenizer has no token {id} ({k})")))?;
+                    Ok((id, t))
+                };
+                let (image, image_text) = text("image_token_index")?;
+                let (boi, boi_text) = text("boi_token_index")?;
+                let (eoi, eoi_text) = text("eoi_token_index")?;
+                let tokens = crate::gemma3_vision::ImageTokens {
+                    image,
+                    boi,
+                    eoi,
+                    image_text,
+                    boi_text,
+                    eoi_text,
+                };
+                let f =
+                    crate::gemma3_vision::Frontend::load(pipeline_dir, tokens).map_err(invalid)?;
+                if let Some(n) = v
+                    .get("mm_tokens_per_image")
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    if n != u64::from(f.preprocess.image_seq_length) {
+                        return Err(invalid(format!(
+                            "config mm_tokens_per_image {n} != processor image_seq_length {}",
+                            f.preprocess.image_seq_length
+                        )));
+                    }
+                }
+                Frontend::Gemma3(f)
             }
             VisionFamily::Pixtral => {
                 // LLaVA configs name the image id `image_token_index`; the
@@ -2164,6 +2281,10 @@ impl VisionFirst {
                     )
                 }
             }
+            VisionFamily::LlavaNext => Frontend::LlavaNext(
+                crate::llava_next_vision::Frontend::load(pipeline_dir, id("image_token_index")?)
+                    .map_err(invalid)?,
+            ),
         };
         Ok(Self {
             embed,
@@ -3107,7 +3228,7 @@ impl OvRuntimeEngine {
                 .tokenizer
                 .clone()
                 .ok_or_else(|| EngineError::Backend("first stage requires tokenizer".into()))?;
-            let mut prompt_ids = encode_prompt_ids(&tok, self.vision.as_ref(), &task.prompt)
+            let mut prompt_ids = encode_prompt_ids(&tok, self.vision.as_ref(), &task)
                 .map_err(EngineError::Backend)?;
             // Option B forced-prefix resume: append the already-emitted assistant
             // tokens after the rendered prompt (concat, not replace) so the cold
@@ -3475,7 +3596,7 @@ impl OvRuntimeEngine {
             // a bare Err here would kill whichever concurrent stream happened
             // to be polling, and returning one would drop the chunks already
             // queued in `out` for tasks this loop has taken off `pending`.
-            let mut prompt_ids = match encode_prompt_ids(&tok, self.vision.as_ref(), &task.prompt) {
+            let mut prompt_ids = match encode_prompt_ids(&tok, self.vision.as_ref(), &task) {
                 Ok(ids) => ids,
                 Err(e) => {
                     let id = task.task_id.clone();
@@ -5089,7 +5210,7 @@ impl Engine for OvRuntimeEngine {
         // would receive a non-standard error frame instead.
         if let Some(packed) = self.packed.as_ref() {
             if let Some(tok) = self.tokenizer.as_ref() {
-                let ids = encode_prompt_ids(tok, self.vision.as_ref(), &task.prompt)
+                let ids = encode_prompt_ids(tok, self.vision.as_ref(), &task)
                     .map_err(EngineError::Backend)?;
                 // Every check runs on the prompt as it will be served, with
                 // each image's token count taken from its size, before any
@@ -6480,7 +6601,7 @@ impl Builder for OvRuntimeBuilder {
 
         if let Some(v) = pipeline_cfg.vision.as_ref() {
             let family = vision_family(v, pipeline_cfg.export_version.as_deref())?;
-            let token_types = v.token_type_ids.unwrap_or(family == VisionFamily::Gemma4);
+            let token_types = v.token_type_ids.unwrap_or(family.token_types_by_default());
             // Bidirectional image attention (token_type_ids) needs each image
             // whole inside one inference: on the static path that is a
             // chunked-prefill IR at least one image wide. Packed slots build
@@ -7433,6 +7554,42 @@ mod tests {
             |_: &mut usize, _: &[i64]| Ok((vec![1, 9, 9, 9], ())),
         );
         assert!(matches!(r, Err(EngineError::Backend(_))));
+    }
+
+    /// LLaVA-NeXT on packed slots follows Pixtral's rules (causal: no image
+    /// blocks, so an image may span packed inferences): a prompt is sized from
+    /// its images' dimensions and refused with a 413 before any encode when it
+    /// outgrows the slot's region. One 448x448 image is 2928 soft tokens.
+    #[test]
+    fn packed_llava_next_prompt_is_sized_before_encoding() {
+        use crate::llava_next_vision::{expand_image_tokens, image_tokens, PreprocessConfig};
+        let n = image_tokens(448, 448, &PreprocessConfig::llava_v16()).unwrap();
+        assert_eq!(n, 2928);
+        let ids = [1i64, 32000, 13, 5];
+        let run = |region: usize| {
+            let mut encodes = 0usize;
+            let r = packed_check_then_encode(
+                &mut encodes,
+                &ids,
+                true,
+                Some(32000),
+                false,
+                32,
+                region,
+                |_: &usize, ids: &[i64]| expand_image_tokens(ids, 32000, &[n]),
+                |c: &mut usize, ids: &[i64]| {
+                    *c += 1;
+                    Ok((expand_image_tokens(ids, 32000, &[n])?, ()))
+                },
+            );
+            (r, encodes)
+        };
+        let (r, encodes) = run(991);
+        assert!(matches!(r, Err(EngineError::PromptTooLong(_))), "{r:?}");
+        assert_eq!(encodes, 0);
+        let (r, encodes) = run(4096);
+        assert_eq!(r.unwrap().0.len(), 3 + n);
+        assert_eq!(encodes, 1, "wider than packed_seq is fine on a causal tree");
     }
 
     #[test]
@@ -8750,6 +8907,18 @@ mod tests {
         assert_eq!(
             vision_family(&v(Some("internvl_chat")), None).unwrap(),
             VisionFamily::InternVL
+        );
+        let g3 = vision_family(&v(Some("gemma3")), None).unwrap();
+        assert_eq!(g3, VisionFamily::Gemma3);
+        assert!(
+            g3.token_types_by_default(),
+            "Gemma 3 opens images both ways"
+        );
+        assert!(VisionFamily::Gemma4.token_types_by_default());
+        assert!(!VisionFamily::Pixtral.token_types_by_default());
+        assert_eq!(
+            vision_family(&v(Some("llava_next")), None).unwrap(),
+            VisionFamily::LlavaNext
         );
         assert!(vision_family(&v(Some("qwen2_vl")), None).is_err());
         assert!(vision_family(&v(None), Some("something_else_v1")).is_err());
