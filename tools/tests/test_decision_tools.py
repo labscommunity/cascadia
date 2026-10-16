@@ -75,6 +75,28 @@ def test_dump_passes_align_to_records(tmp_path):
     assert aligned[0][0]["id"] == records()[0]["id"]
 
 
+def test_jev_choice_lines_with_strategy_and_round_still_align(tmp_path):
+    # Task 37: a JEV choice pass's dump line also names its plan and round. Within the trained
+    # slots that is one "native" round-1 pass per question, which the tools read as before.
+    lines, plain = [], []
+    for r in records()[:3]:
+        for qid, q in r["questions"].items():
+            line = {"parts": [[qid, 0, 2]], "readout": {"prompt_ids": [1, 2], "head": {"kind": "verbalizer", "token_ids": [1, 2]}}}
+            plain.append(dict(line))
+            if q["type"] == "choice":
+                line.update(strategy="native", round=1)
+            lines.append(line)
+    assert any("strategy" in l for l in lines)
+    p = tmp_path / "d.jsonl"
+    p.write_text("\n".join(json.dumps(l) for l in lines))
+    aligned = list(cg.align(str(p), records()[:3]))
+    assert [len(ps) for _, ps in aligned] == [len(r["questions"]) for r in records()[:3]]
+    for _, ps in aligned:
+        for x in ps:
+            cg.check_parts("jev", x)
+    assert len(list(cg.align_lines(plain, records()[:3]))) == 3, "and the lines without them"
+
+
 # ---- H39: align is strict, and reference_top1 reads each spike's stored option order -----------
 
 def _line(*qids, lo=0):

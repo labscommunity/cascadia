@@ -2,9 +2,12 @@
 use super::profile::JevProfile;
 pub use super::profile::JevStrategy;
 use super::pyrandom::{crc32, PyRandom};
-use super::schema::{DecisionRequest, Limits, OrderedValue, Question, QuestionType};
+use super::schema::{
+    DecisionRequest, Limits, OrderedValue, Question, QuestionType, RequestStrategy,
+};
 use super::{softmax, Codec, DecisionError, Pass, PassPart, Sanitizer};
 use cascadia_types::{DecisionReadout, ReadoutHead};
+use indexmap::IndexMap;
 use std::sync::atomic::AtomicBool;
 
 pub struct JevCodec {
@@ -324,35 +327,172 @@ impl JevCodec {
             QuestionType::Score => (0..6).map(|i| i.to_string()).collect(),
             QuestionType::Choice => {
                 let [lo, _] = self.slot("choice");
-                q.choice_criteria()
+                self.option_texts(q)
                     .iter()
                     .enumerate()
-                    .map(|(i, (name, desc))| {
-                        let label = &self.p.verbalizers[lo + i];
-                        let name = self.san.apply(name);
-                        let d = self.san.apply(&render(desc));
-                        if d.is_empty() {
-                            format!("{label}) {name}")
-                        } else {
-                            format!("{label}) {name}: {d}")
-                        }
-                    })
+                    .map(|(i, t)| format!("{}) {t}", self.p.verbalizers[lo + i]))
                     .collect()
             }
         };
-        let question = self.san.apply(
-            &q.instructions
-                .as_ref()
-                .map(render)
-                .unwrap_or_else(|| qid.to_string()),
-        );
+        self.layout(q, qid, state, &lines)
+    }
+
+    /// Each choice option's line after its label, sanitized: `name`, or `name: description`
+    /// (an empty or null description drops the `: `, H7).
+    fn option_texts(&self, q: &Question) -> Vec<String> {
+        q.choice_criteria()
+            .iter()
+            .map(|(name, desc)| {
+                let name = self.san.apply(name);
+                let d = self.san.apply(&render(desc));
+                if d.is_empty() {
+                    name
+                } else {
+                    format!("{name}: {d}")
+                }
+            })
+            .collect()
+    }
+
+    /// serve_decide `s1_pass`'s content around the option lines.
+    fn layout(&self, q: &Question, qid: &str, state: &str, lines: &[String]) -> String {
         format!(
             "[kind] {}\n[state] {}\n[question] {}\n[options]\n{}\n[decision]:",
             kind(q),
             state,
-            question,
+            self.san.apply(&question_raw(q, qid)),
             lines.join("\n")
         )
+    }
+
+    /// One pass's prompt ids, refused over the per-pass cap. No BOS (`add_special_tokens =
+    /// false`, none in the text): serve_decide does the same for the Qwen-based JEV models, whose
+    /// tokenizers add none. A JEV on a base that expects `<bos>` (Gemma) would need it prepended
+    /// here; none ships (H6).
+    fn tokenize_pass(&self, text: &str) -> Result<Vec<u32>, DecisionError> {
+        let enc = self
+            .tok
+            .encode(text, false)
+            .map_err(super::tokenize_failed)?;
+        if enc.len() > self.pass_cap {
+            return Err(super::pass_too_long(enc.len(), self.pass_cap));
+        }
+        Ok(enc.get_ids().to_vec())
+    }
+
+    /// The plan for question `qid`: Native unless it is a choice past the trained slots, then
+    /// the request's `strategy` (the profile's for `auto`), seeded by the question as received.
+    fn plan_for(&self, req: &DecisionRequest, qid: &str) -> ChoicePlan {
+        let q = &req.questions[qid];
+        if q.qtype != QuestionType::Choice {
+            return ChoicePlan::Native;
+        }
+        let strategy = req
+            .strategy
+            .and_then(RequestStrategy::fixed)
+            .unwrap_or(self.p.strategy);
+        self.plan_choice(q.choice_criteria().len(), strategy, &question_raw(q, qid))
+    }
+
+    /// Today's one pass per question, on the trained slots.
+    fn native_pass(
+        &self,
+        req: &DecisionRequest,
+        qid: &str,
+        state: &str,
+    ) -> Result<Pass, DecisionError> {
+        let q = &req.questions[qid];
+        let prompt_ids = self.tokenize_pass(&self.prompt_with_state(req, qid, state))?;
+        let (lo, hi) = self.slots_for(q);
+        let token_ids = self.p.verbalizer_ids[lo..hi].to_vec();
+        let n = token_ids.len();
+        Ok(Self::pass(qid, prompt_ids, token_ids, n))
+    }
+
+    /// One pass of a multi-pass plan over the options `idx` (indices into `texts`), labelled by
+    /// position from A: serve_decide `s1_pass` over `[opts[i] for i in idx]`.
+    fn plan_pass(
+        &self,
+        q: &Question,
+        qid: &str,
+        state: &str,
+        texts: &[String],
+        idx: &[usize],
+    ) -> Result<Pass, DecisionError> {
+        let (labels, ids) = self.pass_labels(idx.len());
+        let lines: Vec<String> = idx
+            .iter()
+            .zip(labels)
+            .map(|(&o, l)| format!("{l}) {}", texts[o]))
+            .collect();
+        let prompt_ids = self.tokenize_pass(&self.layout(q, qid, state, &lines))?;
+        Ok(Self::pass(qid, prompt_ids, ids.to_vec(), idx.len()))
+    }
+
+    fn pass(qid: &str, prompt_ids: Vec<u32>, token_ids: Vec<u32>, n: usize) -> Pass {
+        Pass {
+            readout: DecisionReadout {
+                prompt_ids,
+                head: ReadoutHead::Verbalizer { token_ids },
+                cache_prefix: None,
+                require_warm: false,
+                needs_snapshot: false,
+            },
+            parts: vec![PassPart {
+                question_id: qid.to_string(),
+                logits: 0..n,
+            }],
+        }
+    }
+
+    /// The longest final a tournament over `texts` can need: its TOURNAMENT_WIDTH longest option
+    /// lines (in tokens, ties to the lower index), in index order and labelled from A. A real
+    /// final takes some of those lines' places with shorter ones; with a tokenizer whose pieces
+    /// never cross a line start (Qwen's), it is never longer. The handler checks the real one too.
+    fn worst_final(
+        &self,
+        q: &Question,
+        qid: &str,
+        state: &str,
+        texts: &[String],
+    ) -> Result<usize, DecisionError> {
+        let mut by_len = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let enc = self
+                    .tok
+                    .encode(t.as_str(), false)
+                    .map_err(super::tokenize_failed)?;
+                Ok((enc.len(), i))
+            })
+            .collect::<Result<Vec<_>, DecisionError>>()?;
+        by_len.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let mut idx: Vec<usize> = by_len
+            .iter()
+            .take(TOURNAMENT_WIDTH)
+            .map(|&(_, i)| i)
+            .collect();
+        idx.sort_unstable();
+        Ok(self
+            .plan_pass(q, qid, state, texts, &idx)?
+            .readout
+            .prompt_ids
+            .len())
+    }
+
+    /// Count `len` more prefill tokens, with `reserve` still owed to second rounds: past the
+    /// request's budget the request is a 413 whatever follows, so the encode stops (P2-SEC-4).
+    fn charge(&self, running: &mut usize, reserve: usize, len: usize) -> Result<(), DecisionError> {
+        *running += len;
+        let need = *running + reserve;
+        if need > self.total_cap {
+            return Err(DecisionError::TooLong(format!(
+                "this request needs at least {need} prefill tokens; the per-request limit is {}",
+                self.total_cap
+            )));
+        }
+        Ok(())
     }
 
     fn slots_for(&self, q: &Question) -> (usize, usize) {
@@ -362,6 +502,15 @@ impl JevCodec {
             _ => (lo, hi),
         }
     }
+}
+
+/// The question as the caller sent it (serve_decide `req.question`): the instructions, or the
+/// question id when there are none. The prompt shows it sanitized; the permute seed takes it raw.
+fn question_raw(q: &Question, qid: &str) -> String {
+    q.instructions
+        .as_ref()
+        .map(render)
+        .unwrap_or_else(|| qid.to_string())
 }
 
 impl Codec for JevCodec {
@@ -388,65 +537,82 @@ impl Codec for JevCodec {
         req: &DecisionRequest,
         cancel: &AtomicBool,
     ) -> Result<Vec<Pass>, DecisionError> {
+        self.encode_rounds(req, cancel).map(|(passes, _)| passes)
+    }
+
+    /// Round 1 of every question in request order: one native pass, or its plan's first passes
+    /// (the single pass, the four permute passes, the tournament groups). A tournament's final
+    /// is counted as its worst case ([`Self::worst_final`]) and returned as the reserve.
+    fn encode_rounds(
+        &self,
+        req: &DecisionRequest,
+        cancel: &AtomicBool,
+    ) -> Result<(Vec<Pass>, usize), DecisionError> {
         let mut out = Vec::with_capacity(req.questions.len());
-        let mut running = 0usize;
+        let (mut running, mut reserve) = (0usize, 0usize);
         // Every pass carries the whole state: render and sanitize it once, not per question.
         let state = self.san.apply(&render_state(&req.state));
         for (qid, q) in &req.questions {
             super::check_cancel(cancel)?;
-            // Multi-pass plans are not wired into the passes yet (Task 37): refuse a choice past
-            // the trained slots rather than index past the trained head.
-            if q.qtype == QuestionType::Choice {
-                let n = q.choice_criteria().len();
-                if n > self.trained_choices() {
-                    return Err(DecisionError::BadRequest(format!(
-                        "{qid}: choice questions with {n} options need a multi-pass plan, which \
-                         this server does not run yet (at most {} options)",
-                        self.trained_choices()
-                    )));
+            let (rounds, with_final): (Vec<Vec<usize>>, bool) = match self.plan_for(req, qid) {
+                ChoicePlan::Native => {
+                    let pass = self.native_pass(req, qid, &state)?;
+                    self.charge(&mut running, reserve, pass.readout.prompt_ids.len())?;
+                    out.push(pass);
+                    continue;
                 }
+                ChoicePlan::Single => (vec![(0..q.choice_criteria().len()).collect()], false),
+                ChoicePlan::Permute { orders } => (orders.into(), false),
+                ChoicePlan::Tournament { groups } => (groups, true),
+            };
+            let texts = self.option_texts(q);
+            if with_final {
+                let worst = self.worst_final(q, qid, &state, &texts)?;
+                reserve += worst;
+                self.charge(&mut running, reserve, 0)?;
             }
-            let text = self.prompt_with_state(req, qid, &state);
-            // No BOS (`add_special_tokens = false`, none in the text): serve_decide does the same
-            // for the Qwen-based JEV models, whose tokenizers add none. A JEV on a base that
-            // expects `<bos>` (Gemma) would need it prepended here; none ships (H6).
-            let enc = self
-                .tok
-                .encode(text.as_str(), false)
-                .map_err(super::tokenize_failed)?;
-            if enc.len() > self.pass_cap {
-                return Err(super::pass_too_long(enc.len(), self.pass_cap));
+            for idx in &rounds {
+                super::check_cancel(cancel)?;
+                let pass = self.plan_pass(q, qid, &state, &texts, idx)?;
+                self.charge(&mut running, reserve, pass.readout.prompt_ids.len())?;
+                out.push(pass);
             }
-            running += enc.len();
-            if running > self.total_cap {
-                return Err(DecisionError::TooLong(format!(
-                    "this request needs at least {running} prefill tokens; the per-request limit \
-                     is {}",
-                    self.total_cap
-                )));
-            }
-            let (lo, hi) = self.slots_for(q);
-            let token_ids = self.p.verbalizer_ids[lo..hi].to_vec();
-            let n = token_ids.len();
-            out.push(Pass {
-                readout: DecisionReadout {
-                    prompt_ids: enc.get_ids().to_vec(),
-                    head: ReadoutHead::Verbalizer { token_ids },
-                    cache_prefix: None,
-                    require_warm: false,
-                    needs_snapshot: false,
-                },
-                parts: vec![PassPart {
-                    question_id: qid.clone(),
-                    logits: 0..n,
-                }],
-            });
+        }
+        Ok((out, reserve))
+    }
+
+    /// Each tournament's final, in request order: the finalists of its groups' passes
+    /// ([`tournament_final`]) in index order, labelled from A.
+    fn second_round(
+        &self,
+        req: &DecisionRequest,
+        first: &IndexMap<String, Vec<Vec<f64>>>,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<Pass>, DecisionError> {
+        let mut out = Vec::new();
+        let mut state = None;
+        for (qid, q) in &req.questions {
+            let ChoicePlan::Tournament { groups } = self.plan_for(req, qid) else {
+                continue;
+            };
+            super::check_cancel(cancel)?;
+            let Some(in_group) = first.get(qid).filter(|d| d.len() == groups.len()) else {
+                return Err(DecisionError::Engine("decision engine error".into()));
+            };
+            let fin = tournament_final(&groups, in_group);
+            let state: &String =
+                state.get_or_insert_with(|| self.san.apply(&render_state(&req.state)));
+            out.push(self.plan_pass(q, qid, state, &self.option_texts(q), &fin)?);
         }
         Ok(out)
     }
 
     fn probabilities(&self, req: &DecisionRequest, part: &PassPart, logits: &[f32]) -> Vec<f64> {
         let q = &req.questions[&part.question_id];
+        if q.qtype == QuestionType::Choice && q.choice_criteria().len() > self.trained_choices() {
+            // One pass of a multi-pass plan, over its own options by position.
+            return self.choice_pass_probabilities(logits);
+        }
         let (lo, _) = self.slots_for(q);
         let t = self.p.temperature[kind(q)];
         let z: Vec<f64> = logits
@@ -459,6 +625,39 @@ impl Codec for JevCodec {
             return rescale_score(&p, q.score_levels().len());
         }
         p
+    }
+
+    /// serve_decide `s1_dist`'s combination for the question's plan.
+    fn combine(&self, req: &DecisionRequest, qid: &str, passes: &[Vec<f64>]) -> Option<Vec<f64>> {
+        match self.plan_for(req, qid) {
+            ChoicePlan::Native | ChoicePlan::Single => match passes {
+                [p] => Some(p.clone()),
+                _ => None,
+            },
+            ChoicePlan::Permute { orders } => {
+                (passes.len() == orders.len()).then(|| combine_permute(&orders, passes))
+            }
+            ChoicePlan::Tournament { groups } => {
+                let (in_group, last) = passes.split_at(groups.len().min(passes.len()));
+                let [final_p] = last else {
+                    return None;
+                };
+                let fin = tournament_final(&groups, in_group);
+                Some(combine_tournament(&groups, in_group, &fin, final_p))
+            }
+        }
+    }
+
+    fn dump_strategy(&self, req: &DecisionRequest, qid: &str) -> Option<&'static str> {
+        if req.questions[qid].qtype != QuestionType::Choice {
+            return None;
+        }
+        Some(match self.plan_for(req, qid) {
+            ChoicePlan::Native => "native",
+            ChoicePlan::Single => "single",
+            ChoicePlan::Permute { .. } => "permute",
+            ChoicePlan::Tournament { .. } => "tournament",
+        })
     }
 }
 
@@ -827,14 +1026,327 @@ mod tests {
         assert!(e.contains("equal length"), "{e}");
     }
 
+    /// One token per character, id = the byte, so a pass's text decodes from its prompt ids.
+    fn char_tokenizer() -> tokenizers::Tokenizer {
+        let mut vocab: std::collections::HashMap<String, u32> = (32u8..127)
+            .map(|b| ((b as char).to_string(), b as u32))
+            .collect();
+        vocab.insert("\n".into(), 10);
+        vocab.insert("[unk]".into(), 0);
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(vocab.into_iter().collect())
+            .unk_token("[unk]".into())
+            .build()
+            .unwrap();
+        let mut t = tokenizers::Tokenizer::new(model);
+        t.with_pre_tokenizer(Some(
+            tokenizers::pre_tokenizers::split::Split::new(
+                tokenizers::pre_tokenizers::split::SplitPattern::Regex("".into()),
+                tokenizers::SplitDelimiterBehavior::Isolated,
+                false,
+            )
+            .unwrap(),
+        ));
+        t
+    }
+
+    const TICKET: &str = "Which team should handle this ticket?";
+
+    /// One choice question `q` over o0..o{n-1} asking `instructions`, with a request `strategy`.
+    fn wide_req(n: usize, strategy: &str, instructions: &str) -> DecisionRequest {
+        let criteria: Vec<String> = (0..n).map(|i| format!("\"o{i}\": \"\"")).collect();
+        let strategy = match strategy {
+            "" => String::new(),
+            s => format!(r#""strategy": "{s}", "#),
+        };
+        serde_json::from_str(&format!(
+            r#"{{"model": "m", "state": "s", {strategy}"questions": {{"q": {{"type": "choice", "instructions": {}, "criteria": {{{}}}}}}}}}"#,
+            serde_json::to_string(instructions).unwrap(),
+            criteria.join(", ")
+        ))
+        .unwrap()
+    }
+
+    fn head_ids(p: &Pass) -> Vec<u32> {
+        match &p.readout.head {
+            ReadoutHead::Verbalizer { token_ids } => token_ids.clone(),
+            h => panic!("{h:?}"),
+        }
+    }
+
+    fn decoded(p: &Pass) -> String {
+        p.readout
+            .prompt_ids
+            .iter()
+            .map(|&i| i as u8 as char)
+            .collect()
+    }
+
+    /// The prompt of a pass over options `idx`, labelled by position from L0.
+    fn sub_prompt(idx: &[usize], instructions: &str) -> String {
+        let lines: Vec<String> = idx
+            .iter()
+            .enumerate()
+            .map(|(i, o)| format!("L{i}) o{o}"))
+            .collect();
+        format!(
+            "[kind] choice\n[state] s\n[question] {instructions}\n[options]\n{}\n[decision]:",
+            lines.join("\n")
+        )
+    }
+
+    fn label_ids(m: usize) -> Vec<u32> {
+        wide_profile(16, 256).choice_label_ids[..m].to_vec()
+    }
+
     #[test]
-    fn encode_refuses_wide_choices_until_the_plans_are_wired() {
-        // limits() admits up to choice_labels.len() options, but encode still builds one native
-        // pass: anything past the trained slots is a 400, not an index past verbalizer_ids.
-        let c = JevCodec::new(tiny_tokenizer(), wide_profile(16, 40)).unwrap();
-        assert_eq!(c.encode(&choice_req(16)).unwrap().len(), 1);
-        match c.encode(&choice_req(17)) {
-            Err(DecisionError::BadRequest(m)) => assert!(m.contains("17 options"), "{m}"),
+    fn native_choices_are_unchanged_by_labels_and_strategy() {
+        // Up to the trained slots the pass is today's: the trained verbalizers (v8.. here, not the
+        // L0.. labels), their ids and the per-question probabilities, whatever the strategy.
+        let old = JevCodec::new(char_tokenizer(), wide_profile(16, 0)).unwrap();
+        let wide = JevCodec::new(char_tokenizer(), wide_profile(16, 256)).unwrap();
+        let logits: Vec<f32> = (0..16).map(|i| (i % 5) as f32 * 0.7).collect();
+        for n in [1, 2, 16] {
+            let base = wide_req(n, "", TICKET);
+            let want = old.encode(&base).unwrap();
+            assert_eq!(want.len(), 1);
+            assert_eq!(decoded(&want[0]), old.prompt_text(&base, "q"));
+            assert!(
+                decoded(&want[0]).contains("\nv8) o0\n"),
+                "{}",
+                decoded(&want[0])
+            );
+            let want_p = old.probabilities(&base, &want[0].parts[0], &logits[..n]);
+            for s in ["", "auto", "single", "tournament", "permute"] {
+                let r = wide_req(n, s, TICKET);
+                let (got, reserve) = wide.encode_rounds(&r, &AtomicBool::new(false)).unwrap();
+                assert_eq!(got.len(), 1, "{s} n={n}");
+                assert_eq!(reserve, 0);
+                assert_eq!(got[0].readout.prompt_ids, want[0].readout.prompt_ids, "{s}");
+                assert_eq!(head_ids(&got[0]), head_ids(&want[0]), "{s}");
+                assert_eq!(got[0].parts[0].logits, 0..n);
+                assert_eq!(
+                    wide.probabilities(&r, &got[0].parts[0], &logits[..n]),
+                    want_p,
+                    "bit for bit"
+                );
+                assert!(wide
+                    .second_round(&r, &IndexMap::new(), &AtomicBool::new(false))
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(wide.dump_strategy(&r, "q"), Some("native"));
+            }
+        }
+    }
+
+    #[test]
+    fn single_plan_is_one_pass_over_every_label() {
+        let c = JevCodec::new(char_tokenizer(), wide_profile(16, 256)).unwrap();
+        let r = wide_req(20, "single", TICKET);
+        let (passes, reserve) = c.encode_rounds(&r, &AtomicBool::new(false)).unwrap();
+        assert_eq!((passes.len(), reserve), (1, 0));
+        let all: Vec<usize> = (0..20).collect();
+        assert_eq!(decoded(&passes[0]), sub_prompt(&all, TICKET));
+        assert_eq!(head_ids(&passes[0]), label_ids(20));
+        assert_eq!(passes[0].parts[0].logits, 0..20);
+        let logits: Vec<f32> = (0..20).map(|i| (i % 3) as f32).collect();
+        let p = c.probabilities(&r, &passes[0].parts[0], &logits);
+        assert_eq!(p, c.choice_pass_probabilities(&logits));
+        assert_eq!(c.combine(&r, "q", std::slice::from_ref(&p)), Some(p));
+        assert_eq!(c.dump_strategy(&r, "q"), Some("single"));
+    }
+
+    #[test]
+    fn permute_plan_is_four_passes_relabelled_from_a() {
+        let c = JevCodec::new(char_tokenizer(), wide_profile(16, 256)).unwrap();
+        let r = wide_req(20, "permute", TICKET);
+        let (passes, reserve) = c.encode_rounds(&r, &AtomicBool::new(false)).unwrap();
+        assert_eq!((passes.len(), reserve), (4, 0));
+        let ChoicePlan::Permute { orders } = c.plan_choice(20, JevStrategy::Permute, TICKET) else {
+            panic!()
+        };
+        for (p, o) in passes.iter().zip(&orders) {
+            assert_eq!(decoded(p), sub_prompt(o, TICKET));
+            assert_eq!(head_ids(p), label_ids(20));
+            assert_eq!(p.parts[0].logits, 0..20);
+        }
+        let dists: Vec<Vec<f64>> = (0..4)
+            .map(|k| {
+                let logits: Vec<f32> = (0..20).map(|i| ((i * 7 + k * 3) % 11) as f32).collect();
+                c.choice_pass_probabilities(&logits)
+            })
+            .collect();
+        assert_eq!(
+            c.combine(&r, "q", &dists),
+            Some(combine_permute(&orders, &dists))
+        );
+        assert_eq!(c.combine(&r, "q", &dists[..3]), None);
+        assert_eq!(c.dump_strategy(&r, "q"), Some("permute"));
+    }
+
+    /// Task 36's hand-computed n = 20 tournament: group passes, final pass and the combination.
+    fn tournament_by_hand() -> (Vec<Vec<f64>>, Vec<f64>, Vec<f64>) {
+        let mut g0 = vec![0.05; 10];
+        g0[2] = 0.3;
+        g0[5] = 0.3;
+        let mut g1 = vec![0.05; 10];
+        g1[3] = 0.55;
+        let mut final_p = vec![0.0; 16];
+        final_p[2] = 0.5;
+        final_p[13] = 0.25;
+        final_p[5] = 0.125;
+        final_p[0] = 0.125;
+        let mut want = vec![0.0; 20];
+        want[2] = 0.475;
+        want[13] = 0.2375;
+        want[5] = 0.11875;
+        want[0] = 0.11875;
+        for w in &mut want[16..] {
+            *w = 0.0125;
+        }
+        (vec![g0, g1], final_p, want)
+    }
+
+    #[test]
+    fn tournament_plan_is_the_groups_then_a_final_over_the_finalists() {
+        let c = JevCodec::new(char_tokenizer(), wide_profile(16, 256)).unwrap();
+        let r = wide_req(20, "tournament", TICKET);
+        let (passes, reserve) = c.encode_rounds(&r, &AtomicBool::new(false)).unwrap();
+        assert_eq!(passes.len(), 2);
+        let g: Vec<Vec<usize>> = vec![(0..10).collect(), (10..20).collect()];
+        for (p, idx) in passes.iter().zip(&g) {
+            // Each group is labelled from A, so it reads the trained slots and their bias.
+            assert_eq!(decoded(p), sub_prompt(idx, TICKET));
+            assert_eq!(head_ids(p), (108..118).collect::<Vec<u32>>());
+        }
+        // The final is budgeted as its worst case: the 16 longest option lines (o10..o19, then
+        // o0..o5 by index), in index order and labelled from A.
+        let worst: Vec<usize> = (0..6).chain(10..20).collect();
+        assert_eq!(reserve, sub_prompt(&worst, TICKET).len());
+        let (in_group, final_p, want) = tournament_by_hand();
+        let first: IndexMap<String, Vec<Vec<f64>>> = [("q".to_string(), in_group.clone())].into();
+        let fin = c.second_round(&r, &first, &AtomicBool::new(false)).unwrap();
+        assert_eq!(fin.len(), 1);
+        assert_eq!(
+            decoded(&fin[0]),
+            sub_prompt(&(0..16).collect::<Vec<_>>(), TICKET)
+        );
+        assert_eq!(head_ids(&fin[0]), (108..124).collect::<Vec<u32>>());
+        assert_eq!(fin[0].parts[0].logits, 0..16);
+        assert!(fin[0].readout.prompt_ids.len() <= reserve);
+        let mut all = in_group.clone();
+        all.push(final_p);
+        let p = c.combine(&r, "q", &all).unwrap();
+        for (o, (got, w)) in p.iter().zip(&want).enumerate() {
+            assert!((got - w).abs() < 1e-15, "option {o}: {got} vs {w}");
+        }
+        assert_eq!(c.combine(&r, "q", &in_group), None, "no final yet");
+        assert_eq!(c.dump_strategy(&r, "q"), Some("tournament"));
+    }
+
+    #[test]
+    fn auto_takes_the_profile_strategy_and_a_request_overrides_it() {
+        let mut p = wide_profile(16, 256);
+        p.strategy = JevStrategy::Tournament;
+        let c = JevCodec::new(char_tokenizer(), p).unwrap();
+        let count = |s: &str| c.encode(&wide_req(20, s, TICKET)).unwrap().len();
+        assert_eq!(count(""), 2);
+        assert_eq!(count("auto"), 2);
+        assert_eq!(count("single"), 1);
+        assert_eq!(count("permute"), 4);
+        let r: DecisionRequest = serde_json::from_str(
+            r#"{"model": "m", "state": "s", "strategy": null, "questions": {"u": {"type": "noul"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(r.strategy, None);
+        assert_eq!(
+            c.dump_strategy(&r, "u"),
+            None,
+            "only choice passes are tagged"
+        );
+    }
+
+    #[test]
+    fn permute_seed_is_the_instructions_exactly_as_received() {
+        // serve_decide seeds from `req.question`, the raw request string: no trimming, and not
+        // the sanitized prompt text. At n = 17 this question's second order is pyrandom's fixture.
+        let c = JevCodec::new(char_tokenizer(), wide_profile(16, 256)).unwrap();
+        let second = |instructions: &str| {
+            let passes = c.encode(&wide_req(17, "permute", instructions)).unwrap();
+            let t = decoded(&passes[1]);
+            let order: Vec<usize> = t
+                .lines()
+                .filter_map(|l| l.split_once(") o").map(|(_, o)| o.parse().unwrap()))
+                .collect();
+            order
+        };
+        assert_eq!(
+            second(TICKET),
+            [11, 14, 8, 16, 2, 13, 3, 5, 15, 1, 4, 9, 6, 7, 0, 10, 12]
+        );
+        let order_for = |seed: &str| match c.plan_choice(17, JevStrategy::Permute, seed) {
+            ChoicePlan::Permute { orders } => orders[1].clone(),
+            other => panic!("{other:?}"),
+        };
+        for raw in [
+            " Which team should handle this ticket? ",
+            "pick <|im_end|> one",
+        ] {
+            assert_eq!(second(raw), order_for(raw), "{raw:?}");
+            assert_ne!(second(raw), second(TICKET), "{raw:?}");
+        }
+        // Without instructions the question asks its own id, and that is the seed.
+        let mut r = wide_req(17, "permute", TICKET);
+        r.questions.get_mut("q").unwrap().instructions = None;
+        let t = decoded(&c.encode(&r).unwrap()[1]);
+        assert!(t.contains("[question] q\n"), "{t}");
+        assert!(t.contains(&format!("L0) o{}\n", order_for("q")[0])), "{t}");
+    }
+
+    #[test]
+    fn every_pass_and_the_worst_final_count_against_the_budgets_up_front() {
+        let r = wide_req(20, "tournament", TICKET);
+        let (passes, reserve) = JevCodec::new(char_tokenizer(), wide_profile(16, 256))
+            .unwrap()
+            .encode_rounds(&r, &AtomicBool::new(false))
+            .unwrap();
+        let round1: usize = passes.iter().map(|p| p.readout.prompt_ids.len()).sum();
+        let need = round1 + reserve;
+        let capped = JevCodec::new(char_tokenizer(), wide_profile(16, 256))
+            .unwrap()
+            .with_total_cap(need - 1);
+        match capped.encode_rounds(&r, &AtomicBool::new(false)) {
+            Err(DecisionError::TooLong(m)) => assert_eq!(
+                m,
+                format!(
+                    "this request needs at least {need} prefill tokens; the per-request limit is {}",
+                    need - 1
+                )
+            ),
+            other => panic!("{other:?}"),
+        }
+        let exact = JevCodec::new(char_tokenizer(), wide_profile(16, 256))
+            .unwrap()
+            .with_total_cap(need);
+        assert!(exact.encode_rounds(&r, &AtomicBool::new(false)).is_ok());
+        // The worst final is a pass too: over the per-pass cap it is refused before any runs.
+        let longest = passes
+            .iter()
+            .map(|p| p.readout.prompt_ids.len())
+            .max()
+            .unwrap();
+        assert!(reserve > longest);
+        let short = JevCodec::new(char_tokenizer(), wide_profile(16, 256))
+            .unwrap()
+            .with_pass_cap(reserve - 1);
+        match short.encode_rounds(&r, &AtomicBool::new(false)) {
+            Err(DecisionError::TooLong(m)) => assert_eq!(
+                m,
+                format!(
+                    "a decision pass is {reserve} tokens; the limit is {}",
+                    reserve - 1
+                )
+            ),
             other => panic!("{other:?}"),
         }
     }
