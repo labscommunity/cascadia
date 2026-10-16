@@ -632,6 +632,10 @@ pub struct Thinking {
     pub mode: ThinkingMode,
     /// The base model thought and its answer was blended in.
     pub used: bool,
+    /// Why a question that would have thought did not: `"budget"` (`auto` only: its worst
+    /// case did not fit what the request had left).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
     pub threshold: f64,
     /// The request's think budget in tokens.
     pub budget: usize,

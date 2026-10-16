@@ -304,6 +304,10 @@ impl JevProfile {
                 labels.len()
             ));
         }
+        // A noul shows two options; fewer labels could not label them.
+        if labels.len() == 1 {
+            return Err("jev.answer_labels must have at least 2 entries, got 1".into());
+        }
         let s = &self.system2;
         for (name, v) in [("threshold", s.threshold), ("mix", s.mix)] {
             if !(0.0..=1.0).contains(&v) {
@@ -562,6 +566,10 @@ mod tests {
             (r#","system2":{"mix":-0.1}"#, "mix must be in [0, 1]"),
             (r#","lora_scale":-1"#, "lora_scale must be finite"),
             (r#","system2":{"thinking":"sometimes"}"#, "sometimes"),
+            (
+                r#","answer_labels":["A"],"answer_label_ids":[9]"#,
+                "at least 2",
+            ),
             // A default that thinks on a tree that cannot: refused at load, not per request.
             (r#","system2":{"thinking":"on"}"#, "switchable"),
             (
