@@ -273,7 +273,7 @@ Error messages are deliberately terse:
 | Prefill tokens per request | `max_total_tokens` in `decision.json` | 4 × `max_tokens` |
 | Options per choice | per model family | JEV: 16 for the shipped JEV profiles (the profile's choice slot count); Kev: 255 (Kev's `MAX_OPTIONS`); Clef: 256 |
 | Options per request (Clef) | engine readout cap | 4096 across all questions, because Clef answers them in one pass |
-| Tokens in the joint pass (Clef) | `MAX_JOINT_PROMPT` and the head's input limit | the smaller of `max_tokens`, 16,384 and 256 MiB ÷ (4 × width): 16,384 for Clef-flash (width 4096), about 13,107 for Clef-27B (width 5120) |
+| Tokens in the joint pass (Clef) | `MAX_JOINT_PROMPT` and the head's input limit | the smaller of `max_tokens`, 16,384 and 320 MiB ÷ (4 × width): 16,384 for both Clef-flash (width 4096) and Clef-27B (width 5120) |
 | Levels per score | per model family | JEV: 2 to 256; Clef: 1 to 256; Kev: 1 to 255 |
 | State tokens (Kev) | Kev's `SERVE_MAX_STATE` | 65,536, `<state>` included; only the whole pass may reach `max_tokens`. The rendered state is also capped at 8 bytes per token (524,288 bytes) before tokenizing |
 | Concurrent tokenizations | fixed | min(4, CPU cores), separate from the request permits |
@@ -292,11 +292,19 @@ Error messages are deliberately terse:
 - **Clef truncates the state to fit `max_tokens`** (as Cloudflare's `encode_record` does), so a
   long state never makes a Clef pass too long; JEV and Kev return 413 when a pass exceeds
   `max_tokens`. Clef's effective bound is also capped by the joint head's inputs, each of which
-  must fit the native shim's 256 MiB per-input limit (`MAX_TENSOR_BYTES`): the `[T, width]`
-  hidden rows give 16,384 tokens at Clef-flash's width 4096 (unaffected) and 13,107 at
-  Clef-27B's 5120, and the `[questions + options, T]` span mask gives 2^26 ÷ (questions +
-  options). The state is truncated to the tightest of these; a schema that alone exceeds it is
-  a 413, and the engine refuses an over-limit joint readout (413) before any prefill. The request-level `max_total_tokens` byte pre-check still applies to every family.
+  must fit the native shim's 320 MiB per-input limit (`MAX_TENSOR_BYTES`, mirrored as
+  `MAX_HEAD_INPUT_BYTES`). The limit is sized to Clef-27B's `[16384, 5120]` f32 hidden rows,
+  exactly 320 MiB, so both Clef models reach the full 16,384 tokens; only a wider tree is
+  tightened (width 8192: 10,240). The `[questions + options, T]` span mask gives 2^26 × 1.25 ÷
+  (questions + options), at least 19,275 within the 256-question and 4096-option caps, so it
+  does not bind today. The state is truncated to the tightest of these; a schema that alone
+  exceeds it is a 413, and the engine refuses an over-limit joint readout (413) before any
+  prefill. The joint head runs where the final hidden rows are (the single box, or the last
+  pipeline rank), so the hidden input never crosses the wire: pipeline prefill sends 256-token
+  chunks (5 MiB at width 5120), far under the transport's 256 MiB frame cap. In a mixed
+  pipeline whose last rank predates this limit, that rank still refuses a Clef-27B readout over
+  13,107 tokens with the same 413 (`decision_too_long`), but only after the chain prefill: rank
+  0 cannot tell from HELLO which limit the last rank holds. The wire format is unchanged. The request-level `max_total_tokens` byte pre-check still applies to every family.
 - **JEV and Kev run one prefill pass per question**, so `max_questions` bounds the engine work of
   one request. Clef runs one pass for the whole request.
 - **Prefill work** is the sum of all passes' prompt lengths. Kev repeats the state at the start of
