@@ -113,7 +113,7 @@ Errors use OpenAI's envelope, which the OpenAI SDKs parse into typed exceptions:
 {"error": {"message": "between 1 and 32 questions are allowed, got 0", "type": "invalid_request_error", "code": null}}
 ```
 
-`type` is `invalid_request_error` for 400 and 413, and `server_error` for 501 and 503. A body that
+`type` is `invalid_request_error` for 400, 413 and 415, and `server_error` for 501 and 503. A body that
 does not match the request schema is a 400 in this envelope too, never the framework's 422 text.
 An unknown or malformed content part is named, for example `unsupported content part type
 'input_file'` (an unknown type is echoed up to 64 characters, then `…`) or `input_text parts need
