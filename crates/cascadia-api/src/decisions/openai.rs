@@ -11,7 +11,7 @@ use axum::Json;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use super::schema::{Answer, DecisionRequest, OrderedValue, Question, QuestionType};
+use super::schema::{parse_ordered, Answer, DecisionRequest, OrderedValue, Question, QuestionType};
 use super::DecisionError;
 use crate::AppState;
 use cascadia_types::MAX_DECISION_OUTPUTS;
@@ -77,12 +77,18 @@ pub enum OaQuestion {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct OaChoice {
-    /// A string or a number. `serde_json::Value`, not `OrderedValue`: `OrderedValue` parses from
-    /// raw JSON text, which serde does not keep inside the internally tagged `OaQuestion`. A
-    /// scalar has no key order to lose; `to_internal` converts it (and rejects other types).
-    pub value: serde_json::Value,
+    /// A string or a number, exactly as `/v1/systemone` would parse the same literal. Serde
+    /// buffers the internally tagged `OaQuestion` through f64, so the derive only checks that the
+    /// field is there (and leaves `Null`); `parse_request` fills it from the body's raw text.
+    /// `to_internal` rejects any other JSON type.
+    #[serde(deserialize_with = "present")]
+    pub value: OrderedValue,
     #[serde(default)]
     pub description: Option<String>,
+}
+
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<OrderedValue, D::Error> {
+    serde::de::IgnoredAny::deserialize(d).map(|_| OrderedValue::Null)
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -190,20 +196,13 @@ fn input_text(input: &OaInput) -> Result<String, DecisionError> {
     }
 }
 
-/// A choice value as the internal model holds it: strings and numbers only.
-fn choice_value(name: &str, v: &serde_json::Value) -> Result<OrderedValue, DecisionError> {
+/// A choice value as the internal model holds it: strings and numbers only. Numbers come from
+/// `parse_ordered`, so `-0` is Python's int 0 and `0` and `-0` are one value.
+fn choice_value(name: &str, v: &OrderedValue) -> Result<OrderedValue, DecisionError> {
     match v {
-        serde_json::Value::String(s) => Ok(OrderedValue::String(s.clone())),
-        // serde_json parses the integer literal `-0` as the float -0.0, and keeps no trace of the
-        // literal; Python's `json.loads("-0")` is the int 0, keyed "0" (as `/v1/systemone` keys
-        // it). So a negative zero is the integer 0, and `0` and `-0` are one value. A `-0.0`
-        // literal is folded too (Python would key it "-0.0"); `0.0` stays "0.0".
-        serde_json::Value::Number(n)
-            if n.is_f64() && n.as_f64().is_some_and(|x| x == 0.0 && x.is_sign_negative()) =>
-        {
-            Ok(OrderedValue::Number(0.into()))
+        OrderedValue::String(_) | OrderedValue::Number(_) | OrderedValue::BigInt(_) => {
+            Ok(v.clone())
         }
-        serde_json::Value::Number(n) => Ok(OrderedValue::Number(n.clone())),
         _ => Err(bad(format!(
             "{name}: choice values must be strings or numbers"
         ))),
@@ -211,7 +210,8 @@ fn choice_value(name: &str, v: &serde_json::Value) -> Result<OrderedValue, Decis
 }
 
 /// The internal criteria key: the string itself, or Python's `str()` of a number (`2` → `"2"`,
-/// `1e5` → `"100000.0"`), as the reference implementations key a parsed number.
+/// `1e5` → `"100000.0"`, every digit of a big int), as the reference implementations key a
+/// parsed number.
 fn choice_key(v: &OrderedValue) -> String {
     match v {
         OrderedValue::String(s) => s.clone(),
@@ -400,6 +400,9 @@ fn oa_err(e: DecisionError) -> Response {
     oa_envelope(e.status(), kind, e.to_string())
 }
 
+/// How much of a caller's unknown content-part `type` an error message echoes, in characters.
+const ECHO_CHARS: usize = 64;
+
 /// The first content part in `body` that `OaPart` cannot read, named for the caller. The untagged
 /// `OaContent` reports only that no variant matched, which does not say which part is at fault.
 fn bad_content_part(body: &serde_json::Value) -> Option<String> {
@@ -418,7 +421,13 @@ fn bad_content_part(body: &serde_json::Value) -> Option<String> {
         let field = match kind {
             "input_text" => "text",
             "input_image" => "image_url",
-            other => return Some(format!("unsupported content part type '{other}'")),
+            other => {
+                let mut shown: String = other.chars().take(ECHO_CHARS).collect();
+                if shown.len() < other.len() {
+                    shown.push('…');
+                }
+                return Some(format!("unsupported content part type '{shown}'"));
+            }
         };
         if !part.get(field).is_some_and(serde_json::Value::is_string) {
             return Some(format!("{kind} parts need a string \"{field}\""));
@@ -427,24 +436,50 @@ fn bad_content_part(body: &serde_json::Value) -> Option<String> {
     None
 }
 
-/// POST /v1/decisions: the OpenAI Decisions API wire format. The body is read as a JSON value and
-/// parsed here rather than by `Json<OaRequest>`, whose schema rejection is a 422 text body the
-/// SDKs do not parse; the framework's other rejections (content type, syntax, body limit) keep
-/// their status but get the envelope too.
+/// The request from the body's raw JSON text. Read straight from the text, not via a
+/// `serde_json::Value`, so a repeated key is a 400 (a `Value` keeps the last one) and number
+/// choice values are exact: the body is read again by `parse_ordered`, the reader `/v1/systemone`
+/// uses (every digit of a big int, correctly rounded floats), and each choice value is taken
+/// from there.
+pub fn parse_request(text: &str) -> Result<OaRequest, DecisionError> {
+    let mut r = serde_json::from_str::<OaRequest>(text).map_err(|e| {
+        let v = serde_json::from_str::<serde_json::Value>(text).unwrap_or_default();
+        bad(bad_content_part(&v).unwrap_or_else(|| format!("invalid request body: {e}")))
+    })?;
+    let body = parse_ordered(text).map_err(|e| bad(format!("invalid request body: {e}")))?;
+    // The typed parse refused repeated keys at every level read here, so each path is unique.
+    let qs = match body.get("questions") {
+        Some(OrderedValue::Array(qs)) => qs.as_slice(),
+        _ => &[],
+    };
+    for (q, node) in r.questions.iter_mut().zip(qs) {
+        let (OaQuestion::Choice { choices, .. }, Some(OrderedValue::Array(cs))) =
+            (q, node.get("choices"))
+        else {
+            continue;
+        };
+        for (c, cn) in choices.iter_mut().zip(cs) {
+            c.value = cn.get("value").cloned().unwrap_or(OrderedValue::Null);
+        }
+    }
+    Ok(r)
+}
+
+/// POST /v1/decisions: the OpenAI Decisions API wire format. The body is taken as raw JSON text
+/// and parsed by `parse_request` rather than by `Json<OaRequest>`, whose schema rejection is a
+/// 422 text body the SDKs do not parse; the framework's other rejections (content type, syntax,
+/// body limit) keep their status but get the envelope too.
 pub async fn decide(
     State(state): State<AppState>,
-    body: Result<Json<serde_json::Value>, JsonRejection>,
+    body: Result<Json<Box<serde_json::value::RawValue>>, JsonRejection>,
 ) -> Response {
-    let v = match body {
-        Ok(Json(v)) => v,
+    let raw = match body {
+        Ok(Json(raw)) => raw,
         Err(r) => return oa_envelope(r.status(), "invalid_request_error", r.body_text()),
     };
-    let r = match OaRequest::deserialize(&v) {
+    let r = match parse_request(raw.get()) {
         Ok(r) => r,
-        Err(e) => {
-            let m = bad_content_part(&v).unwrap_or_else(|| format!("invalid request body: {e}"));
-            return oa_err(bad(m));
-        }
+        Err(e) => return oa_err(e),
     };
     let (req, meta) = match to_internal(&r) {
         Ok(x) => x,
@@ -463,7 +498,95 @@ mod tests {
     use super::*;
 
     fn oa(s: &str) -> OaRequest {
-        serde_json::from_str(s).unwrap()
+        parse_request(s).unwrap()
+    }
+
+    fn one_choice(values: &str) -> String {
+        format!(
+            r#"{{"input": "x", "questions": [{{"type": "choice", "name": "c", "instructions": "x", "choices": [{values}]}}]}}"#
+        )
+    }
+
+    #[test]
+    fn number_choice_values_key_exactly_like_systemone() {
+        // H16/L9: the key is Python's str() of the EXACT parsed literal, as `/v1/systemone`
+        // renders the same literal: every digit of a big int, the correctly rounded 17-digit float
+        // (serde_json's default parser misrounds this one), Python repr for the rest.
+        let lits = [
+            "123456789012345678901234567890",
+            "0.18466034385487662",
+            "1e20",
+            "1.0",
+            "-0.0",
+            "-0",
+        ];
+        let body = one_choice(
+            &lits
+                .iter()
+                .map(|l| format!(r#"{{"value": {l}}}"#))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        let (r, meta) = to_internal(&oa(&body)).unwrap();
+        assert_eq!(
+            r.questions["c"].option_keys(),
+            [
+                "123456789012345678901234567890",
+                "0.18466034385487662",
+                "1e+20",
+                "1.0",
+                "-0.0",
+                "0"
+            ]
+        );
+        for (i, lit) in lits.iter().enumerate() {
+            let so: OrderedValue = serde_json::from_str(lit).unwrap();
+            assert_eq!(meta[0].choice_values[i], so, "{lit}");
+        }
+        // echoed with every digit
+        assert_eq!(
+            serde_json::to_string(&meta[0].choice_values[0]).unwrap(),
+            "123456789012345678901234567890"
+        );
+    }
+
+    #[test]
+    fn duplicate_keys_in_the_body_are_rejected() {
+        // Task 25 review (a): a repeated top-level key used to be a 400, not last-one-wins.
+        let q = r#""questions": [{"type": "predicate", "name": "a", "instructions": "x"}]"#;
+        for body in [
+            format!(r#"{{"input": "x", "input": "y", {q}}}"#),
+            format!(r#"{{"input": "x", {q}, {q}}}"#),
+            one_choice(r#"{"value": 1, "value": 2}"#),
+        ] {
+            match parse_request(&body) {
+                Err(DecisionError::BadRequest(m)) => assert!(m.contains("duplicate field"), "{m}"),
+                other => panic!("{body}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_part_type_is_echoed_truncated() {
+        // Task 25 review (b): the echoed `type` is capped at 64 characters.
+        let long = "é".repeat(1000);
+        let body = format!(
+            r#"{{"input": [{{"role": "user", "content": [{{"type": "{long}"}}]}}], "questions": []}}"#
+        );
+        match parse_request(&body) {
+            Err(DecisionError::BadRequest(m)) => assert_eq!(
+                m,
+                format!("unsupported content part type '{}…'", "é".repeat(64))
+            ),
+            other => panic!("{other:?}"),
+        }
+        let body = r#"{"input": [{"role": "user", "content": [{"type": "input_file"}]}], "questions": []}"#;
+        match parse_request(body) {
+            Err(DecisionError::BadRequest(m)) => {
+                assert_eq!(m, "unsupported content part type 'input_file'")
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -504,9 +627,9 @@ mod tests {
         let (r2, _) = to_internal(&oa(r#"{"input": "x", "questions": [{"type": "choice", "name": "c", "instructions": "x", "choices": [{"value": 1e5}, {"value": 2.50}]}]}"#)).unwrap();
         assert_eq!(r2.questions["c"].option_keys(), ["100000.0", "2.5"]);
         assert_eq!(meta[2].level_labels, ["Cosmetic", "Blocked"]);
-        // EDGE-4: `-0` is Python's int 0 (key "0"), not "-0.0"; `0.0` keeps its float key.
-        let (r3, m3) = to_internal(&oa(r#"{"input": "x", "questions": [{"type": "choice", "name": "c", "instructions": "x", "choices": [{"value": -0}, {"value": 0.0}]}]}"#)).unwrap();
-        assert_eq!(r3.questions["c"].option_keys(), ["0", "0.0"]);
+        // EDGE-4: `-0` is Python's int 0 (key "0"); `0.0` and `-0.0` keep their float keys.
+        let (r3, m3) = to_internal(&oa(r#"{"input": "x", "questions": [{"type": "choice", "name": "c", "instructions": "x", "choices": [{"value": -0}, {"value": 0.0}, {"value": -0.0}]}]}"#)).unwrap();
+        assert_eq!(r3.questions["c"].option_keys(), ["0", "0.0", "-0.0"]);
         assert_eq!(m3[0].choice_values[0], OrderedValue::Number(0.into()));
     }
 

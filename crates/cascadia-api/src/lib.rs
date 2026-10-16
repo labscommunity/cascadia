@@ -3832,6 +3832,59 @@ mod tests {
         assert_eq!(v["error"]["type"], "invalid_request_error");
     }
 
+    /// H16/L9: a 30-digit integer and a 17-digit float survive both routes digit for digit
+    /// (checked on the RAW body: `serde_json::Value` would round both through f64).
+    #[tokio::test]
+    async fn exact_numbers_on_both_routes() {
+        let (big, f17) = ("123456789012345678901234567890", "0.18466034385487662");
+        let oa = format!(
+            r#"{{"input": "a b", "questions": [{{"type": "choice", "name": "c", "instructions": "x", "choices": [{{"value": {big}}}, {{"value": {f17}}}]}}]}}"#
+        );
+        let response = make_decision_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/decisions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(oa))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        // mock logits [0, -1, ...] ⇒ the first option wins
+        assert!(text.contains(&format!(r#""choice":{big},"#)), "{text}");
+        assert!(text.contains(&format!(r#""value":{big},"#)), "{text}");
+        assert!(text.contains(&format!(r#""value":{f17},"#)), "{text}");
+        let so = format!(
+            r#"{{"model": "m", "state": {{"id": {big}, "f": {f17}}}, "questions": {{"s": {{"type": "score", "criteria": [{big}, {f17}]}}}}}}"#
+        );
+        let (status, v, text) = post_decisions(make_decision_app().await, &so).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        // Kev's legend is its rendered level text (Python `str()`), so every digit is there.
+        assert!(
+            text.contains(&format!(r#""legend":{{"0":"{big}","1":"{f17}"}}"#)),
+            "{text}"
+        );
+    }
+
+    /// Task 25 review (a): a repeated top-level key is a 400 in OpenAI's envelope.
+    #[tokio::test]
+    async fn openai_duplicate_keys_are_400() {
+        let (status, v) = post_openai(
+            make_decision_app().await,
+            r#"{"input": "x", "input": "y", "questions": [{"type": "predicate", "name": "u", "instructions": "x"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        let m = v["error"]["message"].as_str().unwrap();
+        assert!(m.contains("duplicate field `input`"), "{m}");
+    }
+
     #[tokio::test]
     async fn openai_and_systemone_routes_agree() {
         let oa = r#"{"input": "a b", "questions": [{"type": "choice", "name": "team", "instructions": "who", "choices": [{"value": "billing", "description": "x"}, {"value": "tech", "description": "y"}]},

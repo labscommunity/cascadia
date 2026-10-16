@@ -2395,9 +2395,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
                     warn!(model = %args.model, error = %e, "decision.json present but unusable; /v1/decisions disabled")
                 }
             }
-        } else if std::path::Path::new(&args.model)
-            .join("decision.json")
-            .exists()
+        } else if cascadia_api::decisions::decision_json_present(std::path::Path::new(&args.model))
         {
             warn!(engine = ?args.engine, "decision.json ignored: only --engine qwen35 serves /v1/decisions");
         }
