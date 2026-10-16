@@ -11,14 +11,18 @@
 //! distributed spec-decode protocol; tracked separately.
 
 pub mod dist_spec;
+pub mod gemma3_vision;
 pub mod gemma4;
 pub mod gemma4_vision;
 pub mod genai;
 pub mod image_cache;
+pub mod internvl_vision;
 #[cfg(feature = "kv_coord")]
 pub mod kv_coordination;
+pub mod llava_next_vision;
 pub mod packed;
 mod packed_exec;
+pub mod phi3v_vision;
 pub mod pixtral_vision;
 pub mod prefix_cache;
 pub mod qwen35_vision;

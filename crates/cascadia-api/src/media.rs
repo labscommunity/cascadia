@@ -21,7 +21,8 @@ use sha2::{Digest, Sha256};
 #[derive(Clone, Debug)]
 pub struct MediaConfig {
     /// Text that marks image `i` in the prompt, with `{i}` replaced by the
-    /// image's index in the request. ov-genai uses its universal tag, which
+    /// image's index in the request (`{n}`: the index plus one, for
+    /// processors that number images from 1). ov-genai uses its universal tag, which
     /// GenAI maps to each model's native one; the staged Qwen3.5 engine takes
     /// the native tag, the same for every image (no `{i}`).
     pub image_placeholder: String,
@@ -35,6 +36,10 @@ pub struct MediaConfig {
     /// prompt. Gemma 4's template also trims each text part; this does the
     /// same.
     pub trim_text_parts: bool,
+    /// Write a message's image tags before its text, whatever the parts'
+    /// order, as LLaVA-NeXT's processor template does (`<image>\n` per image,
+    /// then the text parts back to back).
+    pub images_first: bool,
     /// Images allowed in one request.
     pub max_images: usize,
     /// Images larger than this many pixels are downscaled to fit, keeping
@@ -72,6 +77,7 @@ impl MediaConfig {
             image_placeholder: "<ov_genai_image_{i}>".into(),
             reserved_text: vec!["<ov_genai_image_".into()],
             trim_text_parts: false,
+            images_first: false,
             max_images: 8,
             // 1024x1024: about 1000 image tokens on Qwen3.5.
             max_image_pixels: 1 << 20,
@@ -125,6 +131,23 @@ impl MediaConfig {
         }
     }
 
+    /// Settings for a Gemma 3 vision tree on `ov-runtime`: the template's own
+    /// `<start_of_image>`, which rank 0 expands on the rendered text as HF's
+    /// processor does (blank lines, the soft tokens, `<end_of_image>`).
+    /// The template trims each text part, as Gemma 4's does. Every image
+    /// costs 256 tokens (it is resized to 896x896), so the pixel budget only
+    /// bounds decode and resize work.
+    pub fn gemma3_native() -> Self {
+        Self {
+            image_placeholder: "<start_of_image>".into(),
+            reserved_text: ["<start_of_image>", "<image_soft_token>", "<end_of_image>"]
+                .map(String::from)
+                .to_vec(),
+            trim_text_parts: true,
+            ..Self::ov_genai()
+        }
+    }
+
     /// Settings for a Pixtral (LLaVA-layout) vision tree on `ov-runtime`:
     /// the template's own `[IMG]`, which rank 0 expands to the image's rows
     /// of `[IMG]` closed by `[IMG_BREAK]` and, last, `[IMG_END]`. Pixtral
@@ -140,6 +163,58 @@ impl MediaConfig {
         }
     }
 
+    /// Settings for a Phi-3.5-vision (`phi3_v`) vision tree on `ov-runtime`:
+    /// the processor's numbered `<|image_N|>` tag (from 1) and the newline
+    /// the model card and GenAI put after it. Rank 0 cuts the prompt at each
+    /// tag, as `Phi3VProcessor` does, and expands it to the image's soft
+    /// tokens (757 for a 448x448 image with 4 crops).
+    pub fn phi3v_native() -> Self {
+        Self {
+            image_placeholder: "<|image_{n}|>\n".into(),
+            reserved_text: ["<|image_", "<|image|>"].map(String::from).to_vec(),
+            ..Self::ov_genai()
+        }
+    }
+
+    /// Settings for a LLaVA-NeXT (llava-v1.6) vision tree on `ov-runtime`:
+    /// `<image>` followed by a newline, every image of a message before its
+    /// text, which is what the processor's chat template renders. Rank 0
+    /// expands each `<image>` to the image's tiles and newline rows (at most
+    /// 2928 tokens on llava-v1.6's pinpoints).
+    pub fn llava_next_native() -> Self {
+        Self {
+            image_placeholder: "<image>\n".into(),
+            reserved_text: vec!["<image>".into()],
+            images_first: true,
+            ..Self::ov_genai()
+        }
+    }
+
+    /// Settings for an InternVL2 (`internvl_chat`) vision tree on
+    /// `ov-runtime`: `<img><IMG_CONTEXT></img>` and a newline, the string
+    /// `chat` writes for `<image>\n` with one context token; rank 0 widens
+    /// it to 256 per tile.
+    pub fn internvl_native() -> Self {
+        Self {
+            image_placeholder: "<img><IMG_CONTEXT></img>\n".into(),
+            reserved_text: ["<img>", "</img>", "<IMG_CONTEXT>"]
+                .map(String::from)
+                .to_vec(),
+            ..Self::ov_genai()
+        }
+    }
+
+    /// A message's content once its parts are joined: back to back in order,
+    /// or (`images_first`) every image tag first, then the text parts. Each
+    /// part is `(is_image, text)`.
+    pub fn join_parts(&self, parts: Vec<(bool, String)>) -> String {
+        if !self.images_first {
+            return parts.into_iter().map(|(_, t)| t).collect();
+        }
+        let (images, texts): (Vec<_>, Vec<_>) = parts.into_iter().partition(|(img, _)| *img);
+        images.into_iter().chain(texts).map(|(_, t)| t).collect()
+    }
+
     /// One text part of a message with images, as it enters the prompt.
     pub fn text_part(&self, t: String) -> String {
         if self.trim_text_parts {
@@ -150,7 +225,18 @@ impl MediaConfig {
     }
 
     pub fn placeholder(&self, i: usize) -> String {
-        self.image_placeholder.replace("{i}", &i.to_string())
+        self.image_placeholder
+            .replace("{i}", &i.to_string())
+            .replace("{n}", &(i + 1).to_string())
+    }
+
+    /// The placeholder's text before its index, when it is indexed.
+    fn indexed_prefix(&self) -> Option<&str> {
+        let at = ["{i}", "{n}"]
+            .iter()
+            .filter_map(|k| self.image_placeholder.find(k))
+            .min()?;
+        Some(&self.image_placeholder[..at])
     }
 
     /// A reserved string `prompt` carries more often than its `n` image
@@ -173,12 +259,7 @@ impl MediaConfig {
     /// Whether the rendered `prompt` carries `n` images' placeholders, each
     /// exactly once (indexed tags), or exactly `n` of the one shared tag.
     pub fn placeholders_complete(&self, prompt: &str, n: usize) -> Result<(), usize> {
-        if self.image_placeholder.contains("{i}") {
-            let prefix = self
-                .image_placeholder
-                .split("{i}")
-                .next()
-                .unwrap_or_default();
+        if let Some(prefix) = self.indexed_prefix() {
             let found = prompt.matches(prefix).count();
             let each_once = (0..n).all(|i| prompt.matches(&self.placeholder(i)).count() == 1);
             if found == n && each_once {
@@ -903,6 +984,45 @@ mod tests {
 
         assert_eq!(g.text_part("  a b \n".into()), "a b");
 
+        // Phi-3.5-vision numbers its tags from 1.
+        let p = MediaConfig::phi3v_native();
+        assert_eq!(p.placeholder(0), "<|image_1|>\n");
+        assert_eq!(p.placeholder(1), "<|image_2|>\n");
+        let two = format!("{}a{}", p.placeholder(0), p.placeholder(1));
+        assert_eq!(p.placeholders_complete(&two, 2), Ok(()));
+        assert_eq!(p.placeholders_complete(&p.placeholder(1), 1), Err(1));
+        assert_eq!(p.reserved_beyond_placeholders(&two, 2), None);
+        assert_eq!(
+            p.reserved_beyond_placeholders(&format!("{two}<|image_9|>"), 2),
+            Some("<|image_")
+        );
+        assert_eq!(p.reserved_in("a <|image|> b"), Some("<|image|>"));
+
+        let iv = MediaConfig::internvl_native();
+        let tag = iv.placeholder(3);
+        assert_eq!(tag, "<img><IMG_CONTEXT></img>\n");
+        assert_eq!(iv.placeholders_complete(&format!("{tag}{tag}"), 2), Ok(()));
+        assert_eq!(
+            iv.reserved_beyond_placeholders(&format!("{tag}</img>"), 1),
+            Some("</img>")
+        );
+        assert_eq!(iv.reserved_in("<image> is fine"), None);
+
+        let g3 = MediaConfig::gemma3_native();
+        let tag = g3.placeholder(1);
+        assert_eq!(tag, "<start_of_image>");
+        assert_eq!(g3.placeholders_complete(&format!("{tag}a{tag}"), 2), Ok(()));
+        assert_eq!(
+            g3.reserved_in("raw <image_soft_token> text"),
+            Some("<image_soft_token>")
+        );
+        assert!(g3.reserved_in("x<end_of_image>").is_some());
+        assert_eq!(
+            g3.reserved_beyond_placeholders(&format!("{tag}a{tag}"), 1),
+            Some("<start_of_image>")
+        );
+        assert_eq!(g3.text_part(" a \n".into()), "a");
+
         let x = MediaConfig::pixtral_native();
         assert_eq!(x.text_part(" a ".into()), " a ");
         // A tag split across two text parts only appears once they are joined.
@@ -933,5 +1053,41 @@ mod tests {
         assert_eq!(x.reserved_in("raw [IMG_END] text"), Some("[IMG_END]"));
         assert!(x.reserved_in("raw [IMG_BREAK] text").is_some());
         assert_eq!(x.reserved_in("plain text"), None);
+    }
+
+    /// LLaVA-NeXT's processor template writes `<image>\n` per image, then the
+    /// text parts back to back, whatever the parts' order; HF renders
+    /// `[INST] <image>\n<image>\nA:B:Compare. [/INST]` for this message
+    /// (tests/fixtures/llava_next_vision in the OpenVINO engine crate).
+    #[test]
+    fn llava_next_writes_images_first() {
+        let l = MediaConfig::llava_next_native();
+        let parts = vec![
+            (false, "A:".to_string()),
+            (true, l.placeholder(0)),
+            (false, "B:".to_string()),
+            (true, l.placeholder(1)),
+            (false, "Compare.".to_string()),
+        ];
+        assert_eq!(
+            l.join_parts(parts.clone()),
+            "<image>\n<image>\nA:B:Compare."
+        );
+        assert_eq!(l.placeholders_complete("<image>\n<image>\nA:B:", 2), Ok(()));
+        assert_eq!(l.reserved_in("say <image> please"), Some("<image>"));
+        assert_eq!(
+            l.reserved_beyond_placeholders("<image>\n<image>\nA:B:", 2),
+            None
+        );
+        assert_eq!(
+            l.reserved_beyond_placeholders("<image>\nA <image>", 1),
+            Some("<image>")
+        );
+        // Every other family keeps the parts in order.
+        let x = MediaConfig::pixtral_native();
+        assert_eq!(
+            x.join_parts(vec![(false, "A".into()), (true, "[IMG]".into())]),
+            "A[IMG]"
+        );
     }
 }

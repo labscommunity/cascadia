@@ -27,6 +27,28 @@ Families (the `vision.family` rank 0 serves):
   mistral3  Mistral3ForConditionalGeneration (e.g. Ministral-3, exported with
             optimum-intel): the Pixtral encoder plus a 2x2 patch merger in
             openvino_multi_modal_projector_model.xml, which rank 0 runs.
+  gemma3    Gemma3ForConditionalGeneration (e.g. OpenVINO/gemma-3-12b-it-int4-ov):
+            SigLIP encoder whose IR already pools and projects to 256 rows
+            per image. The language model takes token_type_ids (each image is
+            attended both ways in its full and sliding masks), so every stage
+            keeps them and they ride the wire as a third frame.
+  llava_next LLaVA-NeXT / llava-v1.6 (e.g. OpenVINO/llava-v1.6-mistral-7b-hf-int4-ov):
+            CLIP tower whose IR already ends in the projector, anyres tiles;
+            rank 0 packs the tiles and inserts `image_newline`, which the
+            export keeps in config.json (copied to config.vlm.json).
+            Causal attention.
+  phi3_v    Phi-3.5-vision (e.g. OpenVINO/Phi-3.5-vision-instruct-int4-ov):
+            Phi-3 text tower (config at the top level), CLIP tower in the
+            vision IR, MLP projector in openvino_vision_projection_model.xml;
+            rank 0 does the HD crops and the glb_GN/sub_GN assembly between
+            them (the rows are in config.vlm.json). The soft-token id is
+            `<|image|>`; the tree stops on `<|end|>` as well as
+            `<|endoftext|>`.
+  internvl_chat
+            InternVL2 with a Phi-3 text tower (e.g.
+            OpenVINO/InternVL2-4B-int4-ov; text config under `llm_config`):
+            the vision IR holds InternViT, the pixel shuffle and mlp1; rank 0
+            tiles the image. Soft token `<IMG_CONTEXT>`.
   qwen2_5_vl  Qwen2.5-VL (e.g. OpenVINO/Qwen2.5-VL-7B-Instruct-int4-ov). Every
             stage takes M-RoPE `position_ids [3, B, T]`, which rank 0 computes
             and sends with each hidden; the stages record `position_rows: 3`
@@ -42,9 +64,15 @@ Families (the `vision.family` rank 0 serves):
             converted to the IR's boolean inside the graph (the runtime feeds
             no boolean tensors).
 
+Phi-3's su/longrope RoPE is traced into these exports with a constant
+inv_freq (no switch to the long factors past
+original_max_position_embeddings), so a cut serves them exactly as the
+export does: HF-exact up to 4096 positions.
+
 Usage:
   python cut_vlm_lm.py --model <OV VLM dir> --output-dir <tree> --num-stages N \
-      --family pixtral|mistral3|qwen2_5_vl|qwen3_vl [--stage I] [--all-logits]
+      --family pixtral|mistral3|gemma3|llava_next|phi3_v|internvl_chat|qwen2_5_vl|qwen3_vl \
+      [--stage I] [--all-logits]
 """
 
 from __future__ import annotations
@@ -78,22 +106,56 @@ FAMILIES = {
         "vision_types": ("pixtral",),
         "token_type_ids": False,
     },
+    # Phi-3.5-vision: the vision tower is named in img_processor, not
+    # vision_config; rank 0 also runs openvino_vision_projection_model.xml.
+    "phi3_v": {
+        "model_types": ("phi3_v",),
+        "vision_types": ("clip_vision_model",),
+        "token_type_ids": False,
+        "text_key": None,
+        "requires": ("openvino_vision_projection_model.xml", "preprocessor_config.json"),
+    },
+    # InternVL2 (Phi-3 text tower): the vision IR ends in the projector.
+    "internvl_chat": {
+        "model_types": ("internvl_chat",),
+        "vision_types": ("intern_vit_6b",),
+        "token_type_ids": False,
+        "text_key": "llm_config",
+    },
+    # Gemma 3: SigLIP tower; projector and 4x4 pool are inside the vision IR.
+    "gemma3": {
+        "model_types": ("gemma3",),
+        "vision_types": ("siglip_vision_model",),
+        "token_type_ids": True,
+    },
+    # LLaVA-NeXT: one IR (CLIP tower + projector); image_newline lives in
+    # config.json, and rank 0 does the tiling and packing.
+    "llava_next": {
+        "model_types": ("llava_next",),
+        "vision_types": ("clip_vision_model",),
+        "token_type_ids": False,
+    },
     "qwen2_5_vl": {
         "model_types": ("qwen2_5_vl",),
         "vision_types": ("qwen2_5_vl",),
         "token_type_ids": False,
         "mrope_rows": 3,
-        "required": ("openvino_vision_embeddings_merger_model.xml", "preprocessor_config.json"),
+        "requires": ("openvino_vision_embeddings_merger_model.xml", "preprocessor_config.json"),
     },
     "qwen3_vl": {
         "model_types": ("qwen3_vl",),
         "vision_types": ("qwen3_vl",),
         "token_type_ids": False,
         "mrope_rows": 3,
-        "required": ("openvino_vision_embeddings_merger_model.xml",
+        "requires": ("openvino_vision_embeddings_merger_model.xml",
                      "openvino_vision_embeddings_pos_model.xml", "preprocessor_config.json"),
     },
 }
+
+
+# Top-level phi3_v keys that are the vision side, not the text tower.
+PHI3V_VISION_KEYS = ("glb_GN", "sub_GN", "img_processor", "embd_layer", "auto_map")
+
 
 # Qwen3-VL's DeepStack inputs; they belong to stage 0 only.
 DEEPSTACK_INPUTS = ("visual_pos_masks", "deepstack_visual_embeds")
@@ -109,6 +171,8 @@ ROOT_FILES = (
     "openvino_vision_embeddings_merger_model.bin",
     "openvino_vision_embeddings_pos_model.xml",
     "openvino_vision_embeddings_pos_model.bin",
+    "openvino_vision_projection_model.xml",
+    "openvino_vision_projection_model.bin",
     "preprocessor_config.json",
     "video_preprocessor_config.json",
     "processor_config.json",
@@ -134,10 +198,15 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def flat_text_config(cfg: dict) -> dict:
+def flat_text_config(cfg: dict, family: str = "pixtral") -> dict:
     """The text tower's config at the top level (rotary, eos and layer counts
     for ov-runtime), keeping the ids the VLM wrapper carries."""
-    tc = dict(cfg["text_config"])
+    key = FAMILIES[family].get("text_key", "text_config")
+    if key is None:
+        # phi3_v keeps the text config at the top level, next to the vision
+        # settings and the (large) separator rows.
+        return {k: v for k, v in cfg.items() if k not in PHI3V_VISION_KEYS}
+    tc = dict(cfg[key])
     for k in ("bos_token_id", "eos_token_id", "pad_token_id"):
         if k not in tc and k in cfg:
             tc[k] = cfg[k]
@@ -147,7 +216,10 @@ def flat_text_config(cfg: dict) -> dict:
 def check_family(cfg: dict, family: str) -> None:
     spec = FAMILIES[family]
     mt = cfg.get("model_type", "")
-    vt = (cfg.get("vision_config") or {}).get("model_type", "")
+    if family == "phi3_v":
+        vt = (cfg.get("img_processor") or {}).get("name", "")
+    else:
+        vt = (cfg.get("vision_config") or {}).get("model_type", "")
     if mt not in spec["model_types"] or vt not in spec["vision_types"]:
         raise SystemExit(
             f"--family {family} expects model_type in {spec['model_types']} with a "
@@ -209,6 +281,54 @@ def fix_deepstack_inputs(stage, first: bool, idx: int):
         stage.replace_parameter(stage.get_parameter_index(mask), new)
         stage.validate_nodes_and_infer_types()
     return stage
+def special_token_id(model_dir: str, token: str) -> int:
+    """The id of an added token in the export's tokenizer.json."""
+    with open(os.path.join(model_dir, "tokenizer.json"), encoding="utf-8") as f:
+        tok = json.load(f)
+    for t in tok.get("added_tokens", []):
+        if t.get("content") == token:
+            return int(t["id"])
+    raise SystemExit(f"{model_dir}/tokenizer.json has no {token} token")
+
+
+def image_token_id(model_dir: str, cfg: dict, family: str):
+    """The soft-token id rank 0 expands."""
+    if family == "phi3_v":
+        return special_token_id(model_dir, "<|image|>")
+    if family == "internvl_chat":
+        return cfg.get("img_context_token_id")
+    if family in ("qwen2_5_vl", "qwen3_vl"):
+        return cfg.get("image_token_id")
+    return cfg.get("image_token_index")
+
+
+def add_stop_token(path: str, token_id: int) -> None:
+    """Add `token_id` to a generation_config.json's eos_token_id list."""
+    with open(path, encoding="utf-8") as f:
+        gen = json.load(f)
+    eos = gen.get("eos_token_id")
+    eos = [] if eos is None else (list(eos) if isinstance(eos, list) else [eos])
+    if token_id not in eos:
+        eos.append(token_id)
+    gen["eos_token_id"] = eos
+    os.remove(path)  # may be a hardlink into another tree
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(gen, f, indent=2)
+
+
+def check_llava_next(cfg: dict, hidden: int) -> None:
+    """What rank 0's LLaVA-NeXT front end needs from config.json."""
+    nl = cfg.get("image_newline")
+    if not isinstance(nl, list) or len(nl) != hidden:
+        raise SystemExit(
+            f"config.json has no {hidden}-wide image_newline (optimum-intel writes it there); "
+            "re-export the model with optimum-intel")
+    strategy = cfg.get("vision_feature_select_strategy", "default")
+    if strategy != "default":
+        raise SystemExit(f"vision_feature_select_strategy {strategy!r} is not supported "
+                         "(rank 0 expects the CLS row dropped)")
+    if cfg.get("image_token_index") is None:
+        raise SystemExit("config.json lacks image_token_index")
 
 
 def run(model_dir: str, out_dir: str, num_stages: int, family: str,
@@ -216,20 +336,34 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
     with open(os.path.join(model_dir, "config.json")) as f:
         cfg = json.load(f)
     check_family(cfg, family)
-    text = flat_text_config(cfg)
+    text = flat_text_config(cfg, family)
     num_layers = int(text["num_hidden_layers"])
     hidden = int(text["hidden_size"])
     lm_xml = os.path.join(model_dir, "openvino_language_model.xml")
     required = ["openvino_language_model.xml", "openvino_text_embeddings_model.xml",
-                "openvino_vision_embeddings_model.xml", *FAMILIES[family].get("required", ())]
+                "openvino_vision_embeddings_model.xml"]
     if family == "mistral3":
         # Rank 0 reads spatial_merge_size from processor_config.json and runs
         # the projector on the merged rows; without them the tree would serve
         # as plain Pixtral and fail only at image time.
         required += ["openvino_multi_modal_projector_model.xml", "processor_config.json"]
+    required += list(FAMILIES[family].get("requires", ()))
+    if family in ("gemma3", "llava_next"):
+        # Rank 0 reads the image processor settings from it (Gemma 3's 896x896
+        # SigLIP resize; LLaVA-NeXT's tiling pinpoints and image_newline packing).
+        required += ["preprocessor_config.json"]
     for fn in required:
         if not os.path.exists(os.path.join(model_dir, fn)):
             raise SystemExit(f"{model_dir} lacks {fn}; not an OpenVINO {family} VLM export")
+    if family == "llava_next":
+        check_llava_next(cfg, hidden)
+
+    if FAMILIES[family]["token_type_ids"]:
+        lm_inputs = [p.get_friendly_name() for p in ov.Core().read_model(lm_xml).get_parameters()]
+        if "token_type_ids" not in lm_inputs:
+            raise SystemExit(f"--family {family}: openvino_language_model.xml takes no "
+                             f"token_type_ids ({lm_inputs}); images would be attended "
+                             "causally. Re-export it with a newer optimum-intel")
 
     if num_stages > num_layers:
         raise SystemExit(f"--num-stages {num_stages} exceeds the {num_layers} decoder layers")
@@ -276,6 +410,9 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
         os.makedirs(sdir, exist_ok=True)
         ov.save_model(stage, os.path.join(sdir, "openvino_model.xml"), compress_to_fp16=False)
         meta["inputs"] = [p.get_friendly_name() for p in stage.get_parameters()]
+        if FAMILIES[family]["token_type_ids"] and "token_type_ids" not in meta["inputs"]:
+            raise SystemExit(f"stage_{i} lost token_type_ids ({meta['inputs']}); every stage "
+                             "must take them for bidirectional image attention")
         meta["state_vars"] = len(state_vars)
         with open(os.path.join(sdir, "stage_config.json"), "w") as f:
             json.dump(meta, f, indent=2)
@@ -307,6 +444,15 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
     put(cfg_out, os.path.join(tok, "config.json"))
     if not os.path.exists(os.path.join(tok, "tokenizer.json")):
         raise SystemExit(f"{model_dir} has no tokenizer.json; ov-runtime needs it")
+    if family == "phi3_v":
+        # The chat template closes every turn with <|end|>; the export's
+        # generation_config stops only on <|endoftext|>, one token later.
+        # InternVL2's Phi-3 tower lists both.
+        end = special_token_id(model_dir, "<|end|>")
+        for d in (out_dir, tok):
+            gen = os.path.join(d, "generation_config.json")
+            if os.path.exists(gen):
+                add_stop_token(gen, end)
 
     pipeline = {
         "model_id": os.path.basename(os.path.abspath(model_dir)),
@@ -320,7 +466,7 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
             "text_embeddings": "openvino_text_embeddings_model.xml",
             "vision_embeddings": "openvino_vision_embeddings_model.xml",
             "token_type_ids": FAMILIES[family]["token_type_ids"],
-            "image_token_id": cfg.get("image_token_index", cfg.get("image_token_id")),
+            "image_token_id": image_token_id(model_dir, cfg, family),
         },
     }
     if mrope_rows:
