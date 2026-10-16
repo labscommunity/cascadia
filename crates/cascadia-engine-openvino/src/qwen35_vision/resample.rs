@@ -8,37 +8,44 @@
 //!
 //! - separable: a horizontal pass, then a vertical pass, each rounding back
 //!   to `u8` (the intermediate image is 8-bit, not float);
-//! - a Keys cubic kernel with `a = -0.5`, support 2 (bilinear: a triangle,
-//!   support 1), widened by the scale factor when downsampling
+//! - a Keys cubic kernel with `a = -0.5`, support 2 (bilinear: the triangle
+//!   `1 - |x|`, support 1), widened by the scale factor when downsampling
 //!   (antialiasing);
 //! - per-output-pixel weights normalised to sum 1 in `f64`, then converted to
 //!   22-bit fixed point, accumulated in integers with a rounding bias.
 
 /// Pillow's `PRECISION_BITS` for 8-bit images: 32 - 8 - 2.
 const PRECISION_BITS: u32 = 32 - 8 - 2;
-const BICUBIC_SUPPORT: f64 = 2.0;
 
-/// Pillow's resampling filters this module implements.
+/// Pillow's resampling filters this port reproduces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Filter {
-    /// `Image.BICUBIC` (Pillow's default for `Image.resize`).
-    Bicubic,
-    /// `Image.BILINEAR` (torchvision's default on PIL images).
+    /// `Resampling.BILINEAR` (2): Gemma 3's SigLIP processor.
     Bilinear,
+    /// `Resampling.BICUBIC` (3): Qwen, Gemma 4, Pixtral.
+    Bicubic,
 }
 
 impl Filter {
-    fn support(self) -> f64 {
-        match self {
-            Filter::Bicubic => BICUBIC_SUPPORT,
-            Filter::Bilinear => 1.0,
+    /// The filter for a `PILImageResampling` code, if this port has it.
+    pub fn from_pil(code: u64) -> Option<Self> {
+        match code {
+            2 => Some(Self::Bilinear),
+            3 => Some(Self::Bicubic),
+            _ => None,
         }
     }
 
-    fn eval(self, x: f64) -> f64 {
+    fn support(self) -> f64 {
         match self {
-            Filter::Bicubic => bicubic(x),
-            Filter::Bilinear => {
+            Self::Bilinear => 1.0,
+            Self::Bicubic => 2.0,
+        }
+    }
+
+    fn weight(self, x: f64) -> f64 {
+        match self {
+            Self::Bilinear => {
                 let x = x.abs();
                 if x < 1.0 {
                     1.0 - x
@@ -46,6 +53,7 @@ impl Filter {
                     0.0
                 }
             }
+            Self::Bicubic => bicubic(x),
         }
     }
 }
@@ -89,7 +97,7 @@ fn precompute(in_size: usize, out_size: usize, filter: Filter) -> Coeffs {
         let xmax = ((center + support + 0.5) as i64).min(in_size as i64) as usize - xmin;
         let mut ww = 0.0;
         for (x, kx) in k.iter_mut().enumerate().take(xmax) {
-            let w = filter.eval((x as f64 + xmin as f64 - center + 0.5) * ss);
+            let w = filter.weight((x as f64 + xmin as f64 - center + 0.5) * ss);
             *kx = w;
             ww += w;
         }
@@ -123,7 +131,7 @@ pub fn resize_rgb8_bicubic(src: &[u8], w: usize, h: usize, nw: usize, nh: usize)
     resize_rgb8(src, w, h, nw, nh, Filter::Bicubic)
 }
 
-/// [`resize_rgb8_bicubic`] with any of Pillow's filters here.
+/// [`resize_rgb8_bicubic`] with any of Pillow's [`Filter`]s.
 pub fn resize_rgb8(
     src: &[u8],
     w: usize,
@@ -233,17 +241,19 @@ mod tests {
     #[test]
     fn weights_sum_to_one_in_fixed_point() {
         for (i, o) in [(1000, 320), (40, 320), (777, 768), (5, 2)] {
-            let c = precompute(i, o, Filter::Bicubic);
-            for xx in 0..o {
-                let (_, n) = c.bounds[xx];
-                let s: i64 = c.kk[xx * c.ksize..xx * c.ksize + n]
-                    .iter()
-                    .map(|&v| i64::from(v))
-                    .sum();
-                assert!(
-                    (s - (1 << PRECISION_BITS)).abs() <= n as i64,
-                    "{i}->{o} at {xx}: {s}"
-                );
+            for f in [Filter::Bicubic, Filter::Bilinear] {
+                let c = precompute(i, o, f);
+                for xx in 0..o {
+                    let (_, n) = c.bounds[xx];
+                    let s: i64 = c.kk[xx * c.ksize..xx * c.ksize + n]
+                        .iter()
+                        .map(|&v| i64::from(v))
+                        .sum();
+                    assert!(
+                        (s - (1 << PRECISION_BITS)).abs() <= n as i64,
+                        "{i}->{o} at {xx}: {s}"
+                    );
+                }
             }
         }
     }
