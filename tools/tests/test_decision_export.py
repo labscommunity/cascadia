@@ -4,6 +4,7 @@
 """
 import json
 import os
+import re
 import sys
 
 import pytest
@@ -345,6 +346,7 @@ def _clef_checkpoint(tmp_path, vocab=5, hidden=3, key="lm_head.weight", tied=Fal
 
 
 def test_clef_profile_writes_lm_head_f16_and_joint_head(tmp_path, monkeypatch):
+    pytest.importorskip("torch")  # clef_head imports torch at module level
     from decision import clef_head
     ck, lm = _clef_checkpoint(tmp_path)
     seen = []
@@ -361,6 +363,7 @@ def test_clef_profile_writes_lm_head_f16_and_joint_head(tmp_path, monkeypatch):
 
 
 def test_clef_tied_embeddings_use_embed_tokens(tmp_path, monkeypatch):
+    pytest.importorskip("torch")  # clef_head imports torch at module level
     from decision import clef_head
     ck, lm = _clef_checkpoint(tmp_path, key="model.language_model.embed_tokens.weight", tied=True)
     monkeypatch.setattr(clef_head, "export_joint_head", lambda d, xml: open(xml, "w").close())
@@ -370,6 +373,7 @@ def test_clef_tied_embeddings_use_embed_tokens(tmp_path, monkeypatch):
 
 
 def test_clef_missing_lm_head_refused_without_partial_head_json(tmp_path, monkeypatch):
+    pytest.importorskip("torch")  # clef_head imports torch at module level
     from decision import clef_head
     ck, _ = _clef_checkpoint(tmp_path, key="model.language_model.embed_tokens.weight", tied=False)
     monkeypatch.setattr(clef_head, "export_joint_head", lambda d, xml: open(xml, "w").close())
@@ -439,6 +443,17 @@ def test_cli_clef_weights_default_to_clef_dir(cli, monkeypatch):
     (_, a, kw, assets_first), = calls
     assert a[3] is False and kw == {"weights": "C", "lora": None, "lora_scale": None, "final_hidden": True}
     assert assets_first
+
+
+@pytest.mark.parametrize("flags", [["--lora", "L.safetensors"], ["--lora-scale", "1.0"]])
+def test_cli_clef_refuses_a_lora(cli, monkeypatch, capsys, flags):
+    # H36: Clef's joint head reads its own full checkpoint; a grafted adapter would move it
+    run, calls, base, tmp = cli
+    monkeypatch.setattr(de, "write_clef_profile", lambda *a, **kw: pytest.fail("clef profile written"))
+    with pytest.raises(SystemExit) as e:
+        run("clef", "--base-ir", str(base), "--clef-dir", "C", "--out", str(tmp / "t"), *flags)
+    assert e.value.code == 2 and "clef takes no --lora/--lora-scale" in capsys.readouterr().err
+    assert calls == [] and not (tmp / "t").exists()
 
 
 @pytest.mark.parametrize("family,missing", [("jev", "--adapter-dir"), ("kev", "--head-pt"), ("clef", "--clef-dir")])
@@ -756,12 +771,38 @@ def test_kev_shipped_head_shape_exports(tmp_path):
     ({"special_embeddings": True}, "special_embeddings"),
     ({"head_dim": 256}, "head_dim 256"),
     ({"weights": "full"}, "weights 'full'"),
+    ({"head": None}, "head tensors None"),  # Meta's default: no head saved (was a TypeError)
+    ({"head_dim": None}, "head_dim None"),  # was int(None): a misleading "not a readable head.pt"
 ])
 def test_kev_head_flags_the_server_does_not_implement_refused(tmp_path, meta, match):
     pt = _kev_head(tmp_path / "head.pt", **meta)
     with pytest.raises(ValueError, match=match):
         de.write_kev_profile(pt, str(tmp_path / "tree"), hidden=8)
     assert not (tmp_path / "tree").exists()
+
+
+@pytest.mark.parametrize("meta,match", [
+    ({}, "head tensors None"),
+    ({"head": None}, "head tensors None"),
+    ({"head": [1, 2]}, r"head tensors \[1, 2\]"),
+    ({"head": dict.fromkeys(de.KEV_HEAD_TENSORS), "head_dim": "4"}, "head_dim '4' .an integer"),
+    ({"head": dict.fromkeys(de.KEV_HEAD_TENSORS), "head_dim": True}, "head_dim True .an integer"),
+])
+def test_kev_head_without_a_usable_head_is_a_refusal_not_a_crash(meta, match):
+    # torch-free: kev_head_unsupported only reads the dict, so CI covers it without torch
+    (msg,) = de.kev_head_unsupported(meta)
+    assert re.search(match, msg), msg
+
+
+def test_cli_kev_head_pt_without_a_head_is_a_clean_error(cli, capsys):
+    run, calls, base, tmp = cli
+    kd = _kev_dir(tmp)
+    pt = _kev_head(kd / "head.pt", head=None)
+    with pytest.raises(SystemExit) as e:
+        run("kev", "--base-ir", str(base), "--weights", "W", "--lora", "L.safetensors",
+            "--head-pt", pt, "--out", str(tmp / "t"))
+    assert e.value.code == 2 and "head tensors None" in capsys.readouterr().err
+    assert calls == [] and not (tmp / "t").exists()
 
 
 def test_kev_head_extra_head_tensor_refused(tmp_path):
@@ -901,6 +942,45 @@ def test_cli_clef_max_tokens_above_the_joint_cap_is_a_clean_error(cli, monkeypat
     assert seen == {} and calls == []
 
 
+def test_clef_cap_follows_the_model_width_like_joint_prompt_cap():
+    # T30 M1: clef.rs clamps max_tokens to joint_prompt_cap(hidden); refuse here instead
+    assert [de.joint_prompt_cap(h) for h in (0, 4096, 5120, 6144, 8192)] == [16384, 16384, 16384, 13653, 10240]
+    assert de.resolve_max_tokens("clef", None, None, hidden=5120) == 16384
+    assert de.resolve_max_tokens("clef", None, None, hidden=8192) == 10240
+    assert de.resolve_max_tokens("clef", None, 8192, hidden=6144) == 8192
+    assert de.resolve_max_tokens("clef", 10240, None, hidden=8192) == 10240
+    with pytest.raises(ValueError, match=r"--max-tokens 10241 exceeds clef's 10240 \(joint_prompt_cap\(8192\)"):
+        de.resolve_max_tokens("clef", 10241, None, hidden=8192)
+    # the width never touches jev/kev
+    assert de.resolve_max_tokens("kev", None, None, hidden=8192) == 73728
+
+
+def test_cli_clef_cap_reads_the_base_ir_width(cli, monkeypatch, capsys):
+    run, calls, base, tmp = cli
+    seen = {}
+    _seen_writers(monkeypatch, seen)
+    (base / "config.json").write_text(json.dumps({"text_config": {"max_position_embeddings": 262144, "hidden_size": 8192}}))
+    run("clef", *_family_argv("clef", base, tmp))
+    assert seen == {"mt": 10240}
+    seen.clear()
+    with pytest.raises(SystemExit) as e:
+        run("clef", *_family_argv("clef", base, tmp), "--max-tokens", "16384")
+    assert e.value.code == 2 and "joint_prompt_cap(8192)" in capsys.readouterr().err
+    assert seen == {}
+
+
+@pytest.mark.parametrize("family,default", [("jev", 32768), ("clef", 16384)])
+def test_cli_without_any_config_json_uses_the_family_default(cli, monkeypatch, family, default):
+    # T30 M4: neither --weights/--clef-dir nor the base IR has config.json: no window is known,
+    # so the family default is written (this used to be a FileNotFoundError)
+    run, calls, base, tmp = cli
+    seen = {}
+    _seen_writers(monkeypatch, seen)
+    (base / "config.json").unlink()
+    run(family, *_family_argv(family, base, tmp))
+    assert seen == {"mt": default} and [c[0] for c in calls] == ["export"]
+
+
 @pytest.mark.parametrize("value", ["0", "-1", "1.5", "lots", ""])
 def test_cli_max_tokens_must_be_a_positive_integer(cli, monkeypatch, capsys, value):
     run, calls, base, tmp = cli
@@ -958,10 +1038,24 @@ def test_kev_temperature_outside_the_server_bounds_refused_before_any_asset(tmp_
         de.write_kev_profile(_kev_head(tmp_path / "ok.pt", temperature=ok), str(tmp_path / "ok"), hidden=8)
 
 
-def _rust_consts(rel):
-    import re
-    src = open(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, rel)).read()
-    return {k: float(v.replace("_", "")) for k, v in re.findall(r"pub const (\w+): \w+ = ([0-9_.e+-]+);", src)}
+def _rust_consts(rel, root=os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)):
+    """`pub` (or `pub(crate)` ...) consts of `rel` whose value is a number or a product of numbers
+    (`320 * 1024 * 1024`): a reformatted constant still parses, only a changed value fails."""
+    with open(os.path.join(root, rel)) as f:
+        src = f.read()
+    out = {}
+    for k, expr in re.findall(r"pub(?:\([\w:]+\))? const (\w+): \w+ = ([0-9_.e+\- *]+);", src):
+        v = 1.0
+        for f in expr.split("*"):
+            v *= float(f.strip().replace("_", ""))
+        out[k] = v
+    return out
+
+
+def test_rust_consts_parser_reads_products_and_restricted_visibility(tmp_path):
+    (tmp_path / "x.rs").write_text("pub const A: usize = 16_384;\npub(crate) const B: usize = 16 * 1024;\n"
+                                   "pub const C: f64 = 1e-3;\npub const D: usize = 320 * 1024 * 1024;\n")
+    assert _rust_consts("x.rs", root=str(tmp_path)) == {"A": 16384, "B": 16384, "C": 1e-3, "D": 320 * 1024 * 1024}
 
 
 def test_bounds_mirror_the_rust_constants():
@@ -970,4 +1064,5 @@ def test_bounds_mirror_the_rust_constants():
     assert (de.MIN_TEMPERATURE, de.MAX_TEMPERATURE, de.MAX_ABS_BIAS) == \
         (prof["MIN_TEMPERATURE"], prof["MAX_TEMPERATURE"], prof["MAX_ABS_BIAS"])
     types = _rust_consts("crates/cascadia-types/src/decision.rs")
-    assert (de.MAX_DECISION_PROMPT, de.MAX_JOINT_PROMPT) == (types["MAX_DECISION_PROMPT"], types["MAX_JOINT_PROMPT"])
+    assert (de.MAX_DECISION_PROMPT, de.MAX_JOINT_PROMPT, de.MAX_HEAD_INPUT_BYTES) == \
+        (types["MAX_DECISION_PROMPT"], types["MAX_JOINT_PROMPT"], types["MAX_HEAD_INPUT_BYTES"])

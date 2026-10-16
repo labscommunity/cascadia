@@ -52,15 +52,19 @@ def test_export_dtypes_and_output_match_decision_rs(tmp_path):
     head, *_ = _record(8)
     xml = tmp_path / "joint_head.xml"
     ch.export_module(ch.TensorHead(head), 8, str(xml))
-    m = ov.Core().read_model(str(xml))
+    _check_against_reference(ov, ov.Core().read_model(str(xml)), head, 8)
+
+
+def _check_against_reference(ov, m, head, hs, rtol=0.0):
+    """The IR's contract dtypes, and its logits on a dynamic-shape record equal the reference loop head's."""
     f32, i64 = ov.Type.f32, ov.Type.i64
     assert [i.get_element_type() for i in m.inputs] == [f32, f32, f32, i64, i64]
     assert len(m.outputs) == 1 and m.outputs[0].get_element_type() == f32
     # Dynamic T/Q/O: the export example was T=12, Q=2, O=4; run T=30, Q=3, O=7 against the reference head.
     torch.manual_seed(1)
     t = 30
-    hidden = torch.randn(t, 8)
-    lm_head = torch.randn(50, 8)
+    hidden = torch.randn(t, hs)
+    lm_head = torch.randn(50, hs)
     ids = torch.randint(0, 50, (t,))
     q_spans = [(1, 3), (8, 10), (20, 22)]
     o_spans = [[(4, 5), (5, 7)], [(11, 12), (12, 14), (14, 16)], [(23, 24), (24, 26)]]
@@ -75,11 +79,12 @@ def test_export_dtypes_and_output_match_decision_rs(tmp_path):
     compiled = ov.Core().compile_model(m, "CPU", {"INFERENCE_PRECISION_HINT": "f32"})
     got = compiled([hidden.numpy(), mask.numpy(), lexical.numpy(), option_q.numpy(), torch.tensor(qtypes).numpy()])[0]
     assert got.shape == (7,)
-    assert abs(got - ref.numpy()).max() < 1e-5
+    assert abs(got - ref.numpy()).max() < 1e-5 + rtol * abs(ref.numpy()).max()
 
 
 def test_export_joint_head_from_real_dir(tmp_path):
-    """Real Clef weights: only when CLEF_HEAD_DIR points at joint_head.safetensors + config."""
+    """Real Clef weights: only when CLEF_HEAD_DIR points at joint_head.safetensors + config. Beyond the
+    input names, the exported IR must reproduce the real head's logits (H35)."""
     ov = pytest.importorskip("openvino")
     pytest.importorskip("safetensors")
     head_dir = os.environ.get("CLEF_HEAD_DIR")
@@ -89,3 +94,6 @@ def test_export_joint_head_from_real_dir(tmp_path):
     ch.export_joint_head(head_dir, str(xml))
     m = ov.Core().read_model(str(xml))
     assert [i.get_any_name() for i in m.inputs] == ["hidden", "span_mask", "lexical", "option_q", "type_ids"]
+    head = ch.load_joint_head(head_dir)
+    # 4096/5120-wide sums: allow f32 reassociation noise relative to the logit scale
+    _check_against_reference(ov, m, head, head.hidden_norm.normalized_shape[0], rtol=1e-4)
