@@ -261,7 +261,7 @@ framework's plain-text body.
 | 415 | The request lacks `content-type: application/json`. |
 | 422 | `/v1/systemone` only: valid JSON that does not match the request schema, a `strategy` that is none of the four values included (the OpenAI route answers 400 instead). |
 | 501 | The model serves no decisions: no `decision.json` (or one that fails its load checks; see the startup log), an engine other than `qwen35`, the engine has no decision head (`decision/` missing on the single box or the pipeline's last rank), the tree was exported without `--final-hidden` (Kev and Clef), or a pipeline rank cannot serve decision passes (an older build, rank 0 or the last rank without `config.json` `vocab_size`, or the last rank without `decision/`; a middle rank only relays and needs neither). Rank 0 refuses the pipeline cases before any prefill. |
-| 503 | The server is at capacity (`engine at capacity; retry after current requests complete`): every concurrency permit is taken, or a Kev pass that must resume its shared state from the prefix cache found the snapshot evicted by other requests (see [Limits](#limits)); retrying can succeed. Any other engine error is `decision engine error`, including non-finite logits or probabilities (never a 200 with `null`s). Decisions share the API's concurrency permits with chat requests. |
+| 503 | The server is at capacity (`engine at capacity; retry after current requests complete`): every decision permit is taken (`--max-decision-requests`, default 16), or a Kev pass that must resume its shared state from the prefix cache found the snapshot evicted by other requests (see [Limits](#limits)); retrying can succeed. Any other engine error is `decision engine error`, including non-finite logits or probabilities (never a 200 with `null`s). Decisions have their own admission pool: chat requests never take its permits, and decisions never take chat's. |
 
 Error messages are deliberately terse:
 
@@ -271,7 +271,7 @@ Error messages are deliberately terse:
   or Clef's `N options across all questions; the limit is 4096`) are returned as-is: they name a
   problem the caller can fix.
 - **Engine errors** return a fixed message per category (`decision engine error`, `engine at
-  capacity or unavailable`, `decision prompt too long`). A request that finds every concurrency
+  capacity or unavailable`, `decision prompt too long`). A request that finds every decision
   permit taken gets `engine at capacity; retry after current requests complete`. The engine's text (paths, OpenVINO
   messages) is logged at `warn` and never returned.
 
@@ -287,7 +287,8 @@ Error messages are deliberately terse:
 | Tokens in the joint pass (Clef) | `MAX_JOINT_PROMPT` and the head's input limit | the smaller of `max_tokens`, 16,384 and 320 MiB ÷ (4 × width): 16,384 for both Clef-flash (width 4096) and Clef-27B (width 5120) |
 | Levels per score | per model family | JEV: 2 to 256; Clef: 1 to 256; Kev: 1 to 255 |
 | State tokens (Kev) | Kev's `SERVE_MAX_STATE` | 65,536, `<state>` included; only the whole pass may reach `max_tokens`. The rendered state is also capped at 8 bytes per token (524,288 bytes) before tokenizing |
-| Concurrent tokenizations | fixed | min(4, CPU cores), separate from the request permits |
+| Concurrent decision requests | `--max-decision-requests` | 16, a pool separate from chat's; one more is a 503 |
+| Concurrent tokenizations | fixed | min(4, CPU cores), separate from the decision permits |
 | Request body | `--api-max-body-mb` | 1 MiB |
 
 - **`decision.json` is checked at load.** `max_tokens`, `max_total_tokens` and `max_questions`
@@ -356,14 +357,24 @@ Error messages are deliberately terse:
 - **Raise `--api-max-body-mb` for long states.** The default 1 MiB body cap (it applies to every API route) holds roughly 250K
   tokens of English, but JSON escaping and a long Kev state with many questions can exceed it.
   The flag applies to every route, chat included.
-- **Shared concurrency permits.** Decision requests take the same concurrency permits as chat
-  requests. A request that finds none free gets 503 (`engine at capacity; retry after current
-  requests complete`) at once rather than queueing. A request holds its permit until its
-  tokenization has finished, even if the client disconnects first. Decision requests count in the
-  request total, the in-flight gauge and the `capacity` rejection metric like chat requests.
+- **A separate admission pool.** Decision requests take permits from a pool of their own, sized
+  by `--max-decision-requests N` on `cascadia run` and `cascadia worker` (default 16, at least 1;
+  0 is a startup error). Chat requests keep their own pool of 16 and never take a decision
+  permit, nor decisions a chat one, so a burst of either never refuses the other. A decision
+  request that finds no permit free gets 503 (`engine at capacity; retry after current requests
+  complete`) at once rather than queueing. A request holds its permit until its last pass and
+  tokenization have finished, even if the client disconnects first. Decision requests count in
+  the request total, the in-flight gauge and the `capacity` rejection metric like chat requests.
+- **The pool sets admission, not parallelism.** The engine still runs one pass at a time, for
+  decisions and chat alike. A larger pool lets more requests wait their turn instead of getting a
+  503, at the cost of latency for each; a smaller one refuses sooner.
+- **Kev and the prefix cache.** Every admitted Kev request snapshots its state into the one prefix
+  cache, so more admitted Kev requests evict each other's snapshots more often. A request whose
+  snapshot was evicted already stops with the capacity 503 (see above). Raise
+  `--max-decision-requests` together with `--prefix-cache-gb`, or keep it small.
 - **Bounded tokenizer memory.** Tokenizing a long state takes a few hundred MB of transient memory,
   so at most min(4, CPU cores) decision requests tokenize at once; the others wait their turn
-  (holding their permit) rather than failing. Kev also refuses a state that renders to more than
+  (holding their decision permit) rather than failing. Kev also refuses a state that renders to more than
   8 bytes per allowed token (524,288 bytes) before tokenizing it, and a question whose
   instructions and option texts render to more than 8 bytes per token the pass has left after the
   state; honest text tokenizes at about 4 bytes per token.
@@ -421,7 +432,7 @@ Where this differs from serve_decide:
   which compensates rounding from CPython 3.12 on, where the server adds left to right; so
   probabilities can differ in the last bit or so, as for every JEV pass today, far below the 4
   decimals returned.
-- **A second round** needs the tokenizer again: a tournament request holds its concurrency permit
+- **A second round** needs the tokenizer again: a tournament request holds its decision permit
   and waits for a tokenization slot once more between its rounds.
 
 **Checking wide choices.** The parity tools take `--wide` to drive `WIDE_RECORDS`
@@ -549,7 +560,7 @@ encoders.
   still fit, so the file is always a prefix of the run. A failed write (a full disk) closes it
   the same way and cuts the file back to its last whole line. Each case logs a warning once. The
   default is unlimited. Lines are written off the API's async workers, so a large dump does not
-  stall chat; the write holds the request's concurrency permit until it ends, even if the client
+  stall chat; the write holds the request's decision permit until it ends, even if the client
   disconnects first.
 - It is a startup flag only; there is no environment variable for it.
 - It takes effect only when a decision model is loaded. Otherwise the server logs that
@@ -693,8 +704,8 @@ linear-attention and KV state. That is a separate project, not a flag.
 
 - **Text only.** Images in either format are a 400 (`images`, `videos`, OpenAI `input_image`
   parts, and JEV image parts in a list `state`).
-- **Batch 1.** The engine runs one decision pass at a time; concurrent requests beyond the engine's
-  capacity get 503.
+- **Batch 1.** The engine runs one decision pass at a time. Concurrent requests beyond
+  `--max-decision-requests` get 503; the admitted ones wait their turn for the engine.
 - **int8 weights only.** Decision trees are built from Intel's int8 OpenVINO exports. int4 measured
   87.8–96.3% top-1 agreement with full precision, against 98.8–100% for int8, and is not supported.
 - **JEV choices past the trained slots are multi-pass.** They take up to 256 options, but the
