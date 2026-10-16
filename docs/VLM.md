@@ -32,6 +32,7 @@ in [rfcs/vlm-support.md](rfcs/vlm-support.md). Video and audio are not supported
 | Qwen3.5 / Qwen3.6 VLM | `ov-genai` | one box | the OpenVINO VLM export as published (it has `openvino_vision_embeddings_model.xml`) |
 | Qwen3.5 / Qwen3.6 VLM | `qwen35` | 2+ machines | `tools/qwen36_surgery/export_qwen36_moe.py`; the vision IRs in the source dir are carried into the tree |
 | Gemma 4 26B-A4B / 31B | `ov-genai` | one box | the OpenVINO VLM export as published |
+| Qwen2.5-VL, Qwen3-VL, InternVL2, Phi-3.5-vision, LLaVA-NeXT (llava-v1.6), Gemma 3 | `ov-genai` | one box | the OpenVINO exports as published (`OpenVINO/<model>-int4-ov`) |
 | Gemma 4 26B-A4B / 31B | `ov-runtime` | 2+ machines, stateful or static | `tools/gemma4_surgery/export_gemma4_text.py --vision` |
 | Gemma 4 E2B / E4B | `gemma4` | 1+ machines | `tools/export_gemma4.py --vision DIR` |
 | Pixtral 12B | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family pixtral` |
@@ -44,8 +45,10 @@ Every other engine and tree refuses images with a `400`: `ov-dist-spec`, `sparse
   describes a different picture; `ov-genai` serves such an export as text only. Use
   `ov-runtime` (a one-stage tree runs on one box).
 - **Llama 3.2 Vision** (`mllama`), refused at export: its text tower has cross-attention.
-- Qwen2-VL, InternVL and other families: not exported with their vision tower yet
-  (`export_shards.py` notes when it drops one).
+- **MiniCPM-V 4.7**: GenAI 2026.4.1 does not know its model type (`minicpmv4_7`) and the
+  engine fails to load.
+- Staged (multi-machine) serving of the GenAI-only families above: their trees are not
+  exported with the vision tower yet (`export_shards.py` notes when it drops one).
 
 ## Exporting
 
