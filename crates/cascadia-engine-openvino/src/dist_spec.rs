@@ -1596,6 +1596,7 @@ impl Engine for OvDistSpecEngine {
                         error: None,
                         token_ids: Vec::new(),
                         decision_logits: None,
+                        warm_prefix: None,
                         finish_reason: None,
                     },
                 )]
@@ -1641,6 +1642,7 @@ impl Engine for OvDistSpecEngine {
                                 error: None,
                                 token_ids,
                                 decision_logits: None,
+                                warm_prefix: None,
                                 finish_reason: None,
                             },
                         )]
@@ -1910,6 +1912,7 @@ impl OvDistSpecEngine {
                 error: None,
                 token_ids,
                 decision_logits: None,
+                warm_prefix: None,
                 finish_reason: None,
             },
         )]

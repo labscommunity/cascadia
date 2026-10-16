@@ -630,31 +630,70 @@ thinking token, and `usage.input_tokens` adds each generation's and read-back's 
 
 ### Failures
 
-A System 2 task can fail in the engine: its generation refused at submit, an engine error before
-the first token or mid-stream (on hardware, a decode infer that threw: `decode failed: backend
-error: unknown C++ exception in infer`), a stream that ends without its final chunk, or a failed
-read-back. Every one ends the request's wait at once, as any engine failure does:
+A System 2 task can fail in the engine:
+- its generation is refused at submit;
+- an engine error arrives before the first token or mid-stream. On hardware this was a decode
+  infer that threw: `decode failed: backend error: unknown C++ exception in infer`;
+- its stream ends with no final chunk;
+- its read-back fails.
 
-- `on`: the request fails like any engine failure, on both routes: the 503 `decision engine error`
-  (or the capacity 503 and the 413 that the engine's refusals map to, as for System 1 passes).
+The request learns of each one as soon as the engine reports it:
+
+- `on`: the request fails like any engine failure, on both routes. That is the 503 `decision
+  engine error`, or the capacity 503 or 413 that an engine refusal maps to, as for System 1
+  passes. No further engine task is submitted.
 - `auto`: the question answers from System 1 alone with `thinking: {"used": false, "reason":
-  "error"}` and the request is a 200. The other questions still think. Tokens the generation
-  streamed before it failed count in `usage`.
+  "error"}`, and the request is a 200. **The request submits no further engine work.** Every later
+  question that would have thought also answers from System 1 with `reason: "error"`. Questions
+  that would not have thought report as usual. The reason: what failed may still hold the engine
+  (see below), and the next task would wait behind it. System 1 has already run by then. Tokens
+  the generation streamed before it failed count in `usage`.
 
-Each failure is one `warn` line, `System 2 task failed`, with the task id (`think-…` for the
-generation, `dec-…` for the read-back), the `phase` (`generate` or `readback`), `prompt_tokens`,
-the tokens `generated` before the failure, the mode and the engine's reason. Whether the prompt
-resumed a cached prefix is in the engine's own lines for the same task id: qwen35's `decode
-failed` line carries `prompt`, `warm_prefix` (0 for a cold prefill) and `generated`. The engine's
-text is logged, never returned.
+**The API's line.** Each failure is one `warn` line, `System 2 task failed`, with these fields:
+- `task`: the task id, `think-…` for the generation or `dec-…` for the read-back;
+- `phase`: `generate` or `readback`;
+- `prompt_tokens`;
+- `cache`: `hit` or `miss`, or `unknown` when the engine did not say. That happens for a refusal
+  at submit, a stream the runner or API ended, or an engine that does not report it;
+- `warm_prefix`: the prompt tokens resumed from the prefix cache, 0 on a miss;
+- `generated`: the tokens streamed before the failure;
+- the mode and the reason.
 
-The engine returns a failed task's error before it scrubs the stage requests: the scrub runs when
-the next task is admitted. On the GPU, a request once waited more than 15 minutes after a failed
-decode infer: the engine logged `decode failed`, but the API never logged receiving the error, and
-the only work between the two was that scrub (a native `recreate_request` per stage), so it
-most likely blocked there. That is deduced from the log and not reproduced. Chat requests take
-the same path and benefit equally. A scrub that does block still holds the engine, now at the
-next admission: the failed request gets its 503 (or its System 1 answer), and the next one waits.
+The engine reports the cache state on its error chunk (`Chunk::warm_prefix`, an additive field
+that is omitted when unknown).
+
+**The engine's line.** The engine (`cascadia_engine_openvino::qwen36`) also logs one `warn` line
+per failed task, `qwen36 task failed`. It has the task id, `phase` (`prefill`, `decode` or
+`head`), `prompt`, `warm_prefix`, `generated` and the reason. This covers every failure site:
+single-box prefill, decode and decision head, and the pipeline head's prefill, decode and
+decision. The older per-site lines (`decode failed`, `prefill failed`, ...) remain. The engine's
+text is logged and never returned to the client.
+
+**What the fix covers.** The engine returns a failed task's error before it scrubs the stage
+requests. The scrub (`reset_all`, which runs a native `recreate_request` per stage after a warm
+turn) now runs when the next task is admitted. On the GPU, a request once waited more than 15
+minutes after a failed decode infer. The engine logged `decode failed`, the API never logged
+receiving the error, and an exact replay later completed cleanly. Two explanations fit:
+
+1. *The API was still listening.* The scrub, which used to run before the error chunk was
+   returned, blocked, so the chunk never left the engine. This fix covers that case: the error
+   is returned first, and the request gets its 503 (`on`) or its System 1 answers (`auto`, which
+   submits no further task) at once.
+2. *The API had already stopped listening.* The failing decode belonged to a think task the API
+   had dropped at `</think>`, while its cancel was deferred behind another request's step. The
+   error went to a dropped stream, by design, and the API was waiting on the read-back. That
+   read-back's admission now runs the scrub. If the scrub blocks, the read-back waits as before.
+   **This fix does not cover that case.**
+
+**Telling them apart.** Match the engine's `qwen36 task failed` (or `decode failed`) task id
+against the API's lines:
+- the same `think-…` id in an API `System 2 task failed` line means case 1, which is covered;
+- no API line for that id, with the request still waiting on a later `dec-…` task, means case 2.
+
+**Known limit.** A native scrub that truly blocks still holds the engine lock. It does so at the
+next task's admission: that task, and every request behind it, chat included, waits. There is no
+engine-level timeout on native calls. The API adds none either, since a timeout cannot free the
+engine. Chat requests share the engine path and get the same reordering.
 
 ### decision.json
 
