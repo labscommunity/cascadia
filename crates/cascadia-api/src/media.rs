@@ -345,9 +345,7 @@ pub fn decode_image_bytes(
     let (w, h) = rgb.dimensions();
     let pixels = u64::from(w) * u64::from(h);
     if pixels > budget {
-        let scale = (budget as f64 / pixels as f64).sqrt();
-        let nw = ((f64::from(w) * scale).floor() as u32).max(1);
-        let nh = ((f64::from(h) * scale).floor() as u32).max(1);
+        let (nw, nh) = downscaled_size(w, h, budget);
         rgb = image::imageops::resize(&rgb, nw, nh, FilterType::CatmullRom);
     }
 
@@ -366,6 +364,26 @@ pub fn decode_image_bytes(
         timestamps_ms: None,
         sha256: hasher.finalize().into(),
     })
+}
+
+/// The size a `w x h` image over `budget` pixels is resized to: the short
+/// side rounds up and the long side down (and to what the budget leaves), so
+/// the aspect ratio can only shrink. Flooring both sides let a 16384x82 image
+/// (199.8:1, accepted by `check_dimensions`) become 14474x72 (201:1), which
+/// Qwen's processor refuses after the request has been accepted.
+fn downscaled_size(w: u32, h: u32, budget: u64) -> (u32, u32) {
+    let scale = (budget as f64 / (f64::from(w) * f64::from(h))).sqrt();
+    let (long, short) = (w.max(h), w.min(h));
+    // The epsilon keeps an exact product (200 * 0.05) from rounding up.
+    let ns = ((f64::from(short) * scale - 1e-9).ceil() as u32).clamp(1, short);
+    let nl = ((f64::from(long) * scale).floor() as u32)
+        .min((budget / u64::from(ns)).min(u64::from(u32::MAX)) as u32)
+        .max(ns);
+    if w >= h {
+        (nl, ns)
+    } else {
+        (ns, nl)
+    }
 }
 
 fn check_dimensions(w: u32, h: u32, cfg: &MediaConfig) -> Result<(), String> {
@@ -710,6 +728,34 @@ mod tests {
         cfg.low_detail_pixels = 20 * 10;
         let low = decode_image_url(&png_data_url(400, 200), Some("low"), &cfg).unwrap();
         assert_eq!((low.width, low.height), (20, 10));
+    }
+
+    /// A ratio just under the cap must stay under it through the downscale:
+    /// 16384x82 used to become 14474x72 (201:1), which the Qwen processor
+    /// refuses after the request was accepted.
+    #[test]
+    fn downscale_never_grows_the_aspect_ratio() {
+        let cfg = MediaConfig::qwen35_native();
+        let m = decode_image_url(&png_data_url(16384, 82), None, &cfg).unwrap();
+        let (w, h) = (m.width, m.height);
+        assert!(w <= MAX_ASPECT * h, "{w}x{h} exceeds {MAX_ASPECT}:1");
+        assert!(
+            u64::from(w) * u64::from(h) <= cfg.max_image_pixels,
+            "{w}x{h}"
+        );
+        assert_eq!((w, h), (14364, 73));
+        // Portrait the same way, and exact scales keep exact sizes.
+        assert_eq!(downscaled_size(82, 16384, 1 << 20), (73, 14364));
+        assert_eq!(downscaled_size(400, 200, 20 * 10), (20, 10));
+        for (w, h, b) in [
+            (16384u32, 82u32, 1u64 << 20),
+            (5000, 25, 4096),
+            (1001, 777, 1000),
+        ] {
+            let (nw, nh) = downscaled_size(w, h, b);
+            assert!(u64::from(nw) * u64::from(nh) <= b, "{w}x{h} -> {nw}x{nh}");
+            assert!(nw.max(nh) as f64 / nw.min(nh) as f64 <= w.max(h) as f64 / w.min(h) as f64);
+        }
     }
 
     #[test]
