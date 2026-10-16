@@ -9772,7 +9772,26 @@ level={{ effort_map[eff] }}";
         cancelled: Arc<std::sync::Mutex<Vec<String>>>,
         logits: Arc<std::sync::Mutex<std::collections::VecDeque<Vec<f32>>>>,
         thoughts: Arc<std::sync::Mutex<std::collections::VecDeque<Vec<u32>>>>,
+        /// How the next System 2 task of its kind fails (once).
+        fail: Arc<std::sync::Mutex<Option<Fail>>>,
     }
+
+    /// A System 2 failure a [`ThinkEngine`] plays, as the hardware engines report one.
+    #[derive(Clone, Copy, Debug)]
+    enum Fail {
+        /// The generation's submit is refused.
+        Submit,
+        /// The generation sends an error chunk after this many tokens (0: before the first),
+        /// the way qwen36's `finalize_error` does after a failed decode.
+        ErrorAfter(usize),
+        /// The generation is dropped after this many tokens without a final chunk.
+        Vanish(usize),
+        /// The read-back pass sends an error chunk.
+        ReadBack,
+    }
+
+    /// The error qwen36 sent on hardware (Task 44).
+    const DECODE_FAILED: &str = "decode failed: backend error: unknown C++ exception in infer";
 
     impl Thinker {
         fn tasks(&self) -> Vec<cascadia_types::GenerationTask> {
@@ -9782,6 +9801,20 @@ level={{ effort_map[eff] }}";
             self.logits.lock().unwrap().extend(logits);
             self.thoughts.lock().unwrap().extend(thoughts);
         }
+        fn failing(fail: Fail) -> Self {
+            let s = Self::default();
+            *s.fail.lock().unwrap() = Some(fail);
+            s
+        }
+        /// Take the failure if it is for a task of this kind.
+        fn take_fail(&self, f: impl Fn(Fail) -> bool) -> Option<Fail> {
+            let mut g = self.fail.lock().unwrap();
+            let hit = g.filter(|x| f(*x));
+            if hit.is_some() {
+                *g = None;
+            }
+            hit
+        }
     }
 
     /// Decision passes answer in one chunk; a generation emits its script one token per step,
@@ -9789,6 +9822,8 @@ level={{ effort_map[eff] }}";
     struct ThinkEngine {
         s: Thinker,
         pending: std::collections::VecDeque<(cascadia_types::GenerationTask, Vec<u32>, usize)>,
+        /// The generation that fails, and how.
+        failing: Option<(String, Fail)>,
     }
 
     impl cascadia_engine::Engine for ThinkEngine {
@@ -9798,6 +9833,19 @@ level={{ effort_map[eff] }}";
             task: cascadia_types::GenerationTask,
         ) -> Result<(), cascadia_engine::EngineError> {
             self.s.tasks.lock().unwrap().push(task.clone());
+            if task.decision.is_none() {
+                match self.s.take_fail(|f| !matches!(f, Fail::ReadBack)) {
+                    Some(Fail::Submit) => {
+                        return Err(cascadia_engine::EngineError::Backend("refused".into()))
+                    }
+                    Some(f) => self.failing = Some((task.task_id.clone(), f)),
+                    None => {}
+                }
+            } else if task.lora_scale == Some(0.0)
+                && self.s.take_fail(|f| matches!(f, Fail::ReadBack)).is_some()
+            {
+                self.failing = Some((task.task_id.clone(), Fail::ReadBack));
+            }
             let script = if task.decision.is_none() {
                 self.s
                     .thoughts
@@ -9822,6 +9870,20 @@ level={{ effort_map[eff] }}";
                 return Ok(Vec::new());
             };
             let id = task.task_id.clone();
+            let fail = self
+                .failing
+                .as_ref()
+                .filter(|(t, _)| *t == id)
+                .map(|(_, f)| *f);
+            match fail {
+                Some(Fail::ReadBack) => return Ok(vec![(id.clone(), Chunk::error(id, "boom"))]),
+                Some(Fail::ErrorAfter(n)) if at == n => {
+                    return Ok(vec![(id.clone(), Chunk::error(id, DECODE_FAILED))]);
+                }
+                // Forgotten: no chunk ever again.
+                Some(Fail::Vanish(n)) if at == n => return Ok(Vec::new()),
+                _ => {}
+            }
             if let Some(d) = &task.decision {
                 let n = d.head.output_len();
                 let logits = self
@@ -9877,6 +9939,7 @@ level={{ effort_map[eff] }}";
             Ok(Box::new(ThinkEngine {
                 s: self.0,
                 pending: Default::default(),
+                failing: None,
             }))
         }
     }
@@ -10361,6 +10424,108 @@ level={{ effort_map[eff] }}";
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
+    // ---- Task 45: a failed System 2 task never hangs the request ----
+
+    /// Ends the test instead of waiting when a request does not end (on hardware a failed think
+    /// task once left one waiting more than 15 minutes).
+    async fn promptly<T>(f: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(20), f)
+            .await
+            .expect("the request hung")
+    }
+
+    /// Every way a System 2 task fails: its generation refused at submit, failing before its
+    /// first token, failing mid-stream, dropped with no final chunk; its read-back failing.
+    const S2_FAILURES: [Fail; 5] = [
+        Fail::Submit,
+        Fail::ErrorAfter(0),
+        Fail::ErrorAfter(2),
+        Fail::Vanish(2),
+        Fail::ReadBack,
+    ];
+
+    #[tokio::test]
+    async fn a_failed_system2_task_is_the_engine_503_under_on_on_both_routes() {
+        for fail in S2_FAILURES {
+            let s = Thinker::failing(fail);
+            s.queue(vec![], vec![ids("Hmm.")]);
+            let (status, v, _) = promptly(post_decisions(
+                think_app(&s).await,
+                &think_body(r#""thinking": "on", "think_budget": 50, "#),
+            ))
+            .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{fail:?}: {v}");
+            assert_eq!(
+                v,
+                serde_json::json!({"error": "decision engine error"}),
+                "{fail:?}"
+            );
+            // The request stops at the failure: S1 u, S1 c, think u (and read u).
+            let want = if matches!(fail, Fail::ReadBack) { 4 } else { 3 };
+            assert_eq!(s.tasks().len(), want, "{fail:?}");
+
+            let s = Thinker::failing(fail);
+            s.queue(vec![], vec![ids("Hmm.")]);
+            let (status, v) = promptly(post_openai(
+                think_app(&s).await,
+                r#"{"input": "S", "thinking": "on", "think_budget": 50,
+                    "questions": [{"type": "predicate", "name": "u", "instructions": "U?"}]}"#,
+            ))
+            .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{fail:?}: {v}");
+            assert_eq!(v["error"]["message"], "decision engine error", "{fail:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_system2_task_answers_from_system_one_under_auto() {
+        for fail in S2_FAILURES {
+            // u's System 2 fails; c's runs as usual after it.
+            let s = Thinker::failing(fail);
+            // A failed read-back answers before it takes logits: the third set is c's.
+            s.queue(
+                vec![vec![0.0, -1.0], vec![0.0, -1.0, -2.0], ln(&[0.1, 0.1, 0.8])],
+                vec![ids("Hmm."), ids("ok")],
+            );
+            let (status, v, _) = promptly(post_decisions(
+                think_app(&s).await,
+                &think_body(r#""thinking": "auto", "think_budget": 50, "#),
+            ))
+            .await;
+            assert_eq!(status, StatusCode::OK, "{fail:?}: {v}");
+            let u = &v["answers"]["u"];
+            assert!(close(&u["noul"], 0.2689), "{fail:?}: System 1 alone: {u}");
+            assert_eq!(
+                u["thinking"],
+                serde_json::json!({"mode": "auto", "used": false, "reason": "error",
+                                   "threshold": 0.8, "budget": 50}),
+                "{fail:?}"
+            );
+            let c = &v["answers"]["c"];
+            assert_eq!(c["thinking"]["used"], true, "{fail:?}: {c}");
+            assert_eq!(c["choice"], "w", "{fail:?}: {c}");
+            // Tokens streamed before a failure count: u's two, then c's two.
+            if matches!(fail, Fail::ErrorAfter(2) | Fail::Vanish(2)) {
+                assert_eq!(v["usage"]["output_tokens"], 4, "{fail:?}: {v}");
+            }
+
+            // The OpenAI route answers the same way.
+            let s = Thinker::failing(fail);
+            s.queue(vec![vec![0.0, -1.0]], vec![ids("Hmm.")]);
+            let (status, v) = promptly(post_openai(
+                think_app(&s).await,
+                r#"{"input": "S", "thinking": "auto", "think_budget": 50,
+                    "questions": [{"type": "predicate", "name": "u", "instructions": "U?"}]}"#,
+            ))
+            .await;
+            assert_eq!(status, StatusCode::OK, "{fail:?}: {v}");
+            let a = &v["answers"][0];
+            assert!(close(&a["probability"], 0.2689), "{fail:?}: {a}");
+            assert_eq!(a["thinking"]["used"], false, "{fail:?}: {a}");
+            assert_eq!(a["thinking"]["reason"], "error", "{fail:?}: {a}");
+        }
     }
 
     #[tokio::test]
