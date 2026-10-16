@@ -24,6 +24,7 @@ record missing from reference_flash.pt, a reference with the wrong number of log
 import argparse
 import contextlib
 import json
+import math
 import os
 import sys
 import urllib.error
@@ -532,7 +533,8 @@ def check_answers(family, url, dump=None, tok=None):
         recs = [jev_sorted(r) for r in recs]
     if family == "clef":
         # reference_flash.pt is per RECORD: {id, input_ids, hidden, logits=[one tensor per question]}
-        ref = {k: {"probs": torch.as_tensor(lg).float().softmax(-1)} for k, lg in clef_ref_map(clef_reference(), recs).items()}
+        ref = {k: {"probs": clef_ref_probs(torch.as_tensor(lg).float().tolist())}
+               for k, lg in clef_ref_map(clef_reference(), recs).items()}
     else:
         ref_file = {"kev": SPIKE_DIR / "kev-spike" / "reference_kev.pt", "jev": SPIKE_DIR / "jev-spike" / "reference_jev.pt"}[family]
         ref = {}
@@ -583,10 +585,32 @@ def post_all(url, recs):
         systemone(url, rec)
 
 
-def noul_top1(p_true):
-    """A noul answer's top option. A p = 0.5 tie reads "false", as argmax over the API order
-    [false, true] does in parity_check.py, so the two tools never score the same tie differently."""
-    return "true" if p_true > 0.5 else "false"
+def softmax64(z):
+    """The server's softmax (mod.rs `softmax`): f32 logits widened to f64, max subtracted."""
+    m = max(z)
+    e = [math.exp(float(x) - m) for x in z]
+    s = sum(e)
+    return [x / s for x in e]
+
+
+def clef_ref_probs(logits):
+    """reference_flash.pt's f32 logits for one question -> probabilities computed as clef.rs does
+    (f64 softmax). An f32 softmax rounds p(true) to exactly 0.5 for a true-logit lead of about
+    2e-8..9e-8, which then reads "false" where the server reads "true"."""
+    return softmax64(logits)
+
+
+def noul_top1(p_true, p_false=None):
+    """A noul answer's top option: "true" only when p(true) is strictly the larger. The server
+    reports p(true) and picks no label, so this rule is the tools' own, shared by every tool: an
+    exact tie (p = 0.5, equal logits) reads "false", as argmax over the API order [false, true]
+    does in parity_check.py. This deliberately overrides Clef's native order: Cloudflare's
+    step3a_reference.py takes argmax over [true, false] and calls the tie "true", but scoring the
+    server's p = 0.5 and the reference's tie by two different rules would report a flip that is
+    not one. Do not "fix" it back to the spike's order."""
+    if p_false is None:
+        p_false = 1.0 - p_true
+    return "true" if p_true > p_false else "false"
 
 
 def top1(ans):
@@ -604,8 +628,11 @@ def reference_top1(family, q, r):
     (kev.questions); JEV noul [false, true] and sorted choices (jev.questions)."""
     kind = q["type"]
     if kind == "noul":
+        # both stored probabilities (f64 softmaxes, as the server computes), never a threshold
+        # on one rounded value
         probs = r["probs"].tolist() if hasattr(r["probs"], "tolist") else list(r["probs"])
-        return noul_top1(probs[0] if family == "clef" else probs[1])
+        p_true, p_false = (probs[0], probs[1]) if family == "clef" else (probs[1], probs[0])
+        return noul_top1(p_true, p_false)
     i = argmax(r["probs"])
     if kind == "choice":
         names = sorted(q["criteria"]) if family in ("clef", "jev") else list(q["criteria"])
