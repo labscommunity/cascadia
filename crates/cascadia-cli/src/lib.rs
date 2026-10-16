@@ -2598,11 +2598,9 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         if matches!(args.engine, EngineKind::Qwen36Moe) {
             match cascadia_api::decisions::DecisionService::load(std::path::Path::new(&args.model))
             {
-                Ok(Some(svc)) => {
+                Ok(Some(mut svc)) => {
                     // The shared-prefix budget discount needs real reuse: a single box with the
                     // prefix cache on. Pipeline ranks re-prefill Kev's state per question.
-                    let mut svc = std::sync::Arc::try_unwrap(svc)
-                        .unwrap_or_else(|_| unreachable!("fresh Arc"));
                     svc.prefix_reuse = args.total <= 1 && prefix_cache_bytes > 0;
                     // The values every 413 and the docs' limits table depend on. For Clef,
                     // max_tokens is the effective joint prompt cap after the head-input clamp.

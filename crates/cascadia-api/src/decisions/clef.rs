@@ -321,6 +321,62 @@ mod tests {
     }
 
     #[test]
+    fn more_options_than_one_readout_holds_is_400() {
+        // H11: 17 questions x 256 options = 4352 > MAX_DECISION_OUTPUTS, within the per-question caps.
+        let crit: Vec<String> = (0..256).map(|k| format!(r#""o{k:03}": "d""#)).collect();
+        let qs: Vec<String> = (0..17)
+            .map(|i| {
+                format!(
+                    r#""q{i}": {{"type": "choice", "criteria": {{{}}}}}"#,
+                    crit.join(",")
+                )
+            })
+            .collect();
+        let r: DecisionRequest = serde_json::from_str(&format!(
+            r#"{{"model": "m", "state": "S", "questions": {{{}}}}}"#,
+            qs.join(",")
+        ))
+        .unwrap();
+        let c = ClefCodec::new(tok(), 16384, None).unwrap();
+        match c.encode(&r) {
+            Err(DecisionError::BadRequest(m)) => assert_eq!(
+                m,
+                format!("4352 options across all questions; the limit is {MAX_DECISION_OUTPUTS}")
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_instructions_fall_back_to_the_qid_and_null_noul_criteria_drop_the_description() {
+        // H11: encode_record asks the field id when the instruction is missing or empty, and
+        // leaves `description` out of an option whose description is null.
+        let r: DecisionRequest = serde_json::from_str(
+            r#"{"model": "m", "state": "S", "questions": {
+            "is_spam": {"type": "noul", "instructions": "", "criteria": {"true": null}},
+            "tone": {"type": "score", "criteria": ["low", "high"]}}}"#,
+        )
+        .unwrap();
+        let c = ClefCodec::new(tok(), 16384, None).unwrap();
+        let p = c.encode(&r).unwrap();
+        let ids = &p[0].readout.prompt_ids;
+        let text: String = ids.iter().map(|&i| char::from_u32(i).unwrap()).collect();
+        let at = |s: [u32; 2]| &text[s[0] as usize..s[1] as usize];
+        match &p[0].readout.head {
+            ReadoutHead::Joint { questions } => {
+                assert_eq!(at(questions[0].span), "is_spam");
+                assert_eq!(at(questions[0].options[0].span), r#"{"option_id":"true"}"#);
+                assert_eq!(
+                    at(questions[0].options[1].span),
+                    r#"{"description":"The proposition is false or the answer is no.","option_id":"false"}"#
+                );
+                assert_eq!(at(questions[1].span), "tone");
+            }
+            h => panic!("{h:?}"),
+        }
+    }
+
+    #[test]
     fn noul_probabilities_come_back_false_then_true() {
         let r: DecisionRequest = serde_json::from_str(
             r#"{"model": "m", "state": "S", "questions": {"u": {"type": "noul"}}}"#,
