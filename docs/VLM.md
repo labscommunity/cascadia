@@ -137,7 +137,9 @@ Image input switches on by itself when the model dir or tree carries a vision en
 in `pipeline_config.json`). The startup log says so (`accepting image_url content parts`)
 or says why not. Static trees: add `--device NPU` (and `--ov-cache-dir` so a restart
 loads compiled blobs instead of recompiling, which takes about ten minutes per stage IR).
-Verified on the Lunar Lake NPU with Pixtral (one 12B stage per 32 GB node); a node
+Verified on the Lunar Lake NPU with Pixtral (one 12B stage per 32 GB node) and Ministral-3-3B
+(one box), and on the Arc 140V iGPU (`--device GPU`) with Gemma 3, Qwen3-VL and Ministral-3;
+a node
 needs RAM for both the decode and prefill IRs of every stage it holds. Gemma 4 26B-A4B
 is not practical on the NPU: one stage's decode IR had not compiled after 90 minutes
 (its mixture-of-experts layers); serve it from CPU static or stateful trees.

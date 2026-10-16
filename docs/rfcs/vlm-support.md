@@ -855,6 +855,25 @@ test on every serving path, on CPU:
 With `kv_coord`, a text-only chat still warm-resumes (535 of 545 tokens on turn 2), and
 the image chat check (`sdk_vlm_kv.py`) passes 6/6 with its follow-ups resumed.
 
+## GPU and NPU (2026-10-16)
+
+The same 11-check SDK test, with the same binary as the final regression pass, on
+pawan-02's Arc 140V iGPU (`--device GPU`) and Lunar Lake NPU (`--device NPU`); the vision
+encoder and text embeddings stay on CPU. Answers and prompt token counts equal the CPU
+runs.
+
+| Device | Engine | Model | Result | Prompt tokens |
+|---|---|---|---|---|
+| GPU | `ov-genai` | Gemma 3 4B | 11/11 | 286 |
+| GPU | `ov-genai` | Qwen3-VL-4B | 11/11 | 223 |
+| GPU | `ov-runtime` stateful | Ministral-3-3B | 11/11 | 815 |
+| NPU | `ov-runtime` static (context 2048, prefill 256) | Ministral-3-3B | 11/11 | 815 |
+| NPU | `ov-runtime` static, 2 stages on two machines | Pixtral 12B | 11/11 (earlier) | 832 |
+
+The Ministral NPU run, compile included, took about ten minutes (`--ov-cache-dir` makes
+a restart load the blobs). Not run on GPU: the staged multi-machine trees and the 26B /
+31B models, whose two stages per node already fill the shared memory on CPU.
+
 ## Engines that do not take images (2026-10-15)
 
 Every engine either serves images or refuses them with an OpenAI 400; none answers
