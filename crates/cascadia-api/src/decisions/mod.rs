@@ -108,11 +108,22 @@ impl std::fmt::Debug for DecisionService {
     }
 }
 
+/// Whether `model_dir` has a `decision.json` entry at all. `Path::exists` follows symlinks and
+/// reads a dangling one as absent, so a broken `decision.json` would silently mean "chat model"
+/// (H5); any entry, or a lookup that fails for another reason than "not found", counts as present.
+pub fn decision_json_present(model_dir: &Path) -> bool {
+    match std::fs::symlink_metadata(model_dir.join("decision.json")) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 impl DecisionService {
-    /// `Ok(None)` when the model directory has no `decision.json` (a plain chat model).
+    /// `Ok(None)` when the model directory has no `decision.json` (a plain chat model). An entry
+    /// that is there but cannot be read (a dangling symlink, a directory) is an `Err`.
     pub fn load(model_dir: &Path) -> Result<Option<Arc<DecisionService>>, String> {
         let path = model_dir.join("decision.json");
-        if !path.exists() {
+        if !decision_json_present(model_dir) {
             return Ok(None);
         }
         let prof = profile::DecisionProfile::load(&path)?;
@@ -413,6 +424,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(super::tree_hidden(&d), Some(5120));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// H5: a `decision.json` entry that exists but cannot be read (a dangling symlink, a
+    /// directory) is "present but unusable", never "no decision model".
+    #[cfg(unix)]
+    #[test]
+    fn a_present_but_unreadable_decision_json_is_an_error() {
+        let d = std::env::temp_dir().join(format!("dec-load-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(!super::decision_json_present(&d));
+        assert!(matches!(super::DecisionService::load(&d), Ok(None)));
+        std::os::unix::fs::symlink(d.join("missing.json"), d.join("decision.json")).unwrap();
+        assert!(super::decision_json_present(&d));
+        match super::DecisionService::load(&d) {
+            Err(e) => assert!(e.contains("decision.json"), "{e}"),
+            Ok(s) => panic!("dangling symlink loaded as {s:?}"),
+        }
+        std::fs::remove_file(d.join("decision.json")).unwrap();
+        std::fs::create_dir(d.join("decision.json")).unwrap();
+        assert!(super::decision_json_present(&d));
+        assert!(super::DecisionService::load(&d).is_err());
         std::fs::remove_dir_all(&d).unwrap();
     }
 

@@ -11,6 +11,9 @@ pub enum OrderedValue {
     Null,
     Bool(bool),
     Number(serde_json::Number),
+    /// An integer outside the i64/u64 range, kept as its decimal literal: Python ints are
+    /// unbounded and the references print every digit (`serde_json::Number` would round it).
+    BigInt(String),
     String(String),
     Array(Vec<OrderedValue>),
     Object(Vec<(String, OrderedValue)>),
@@ -31,9 +34,10 @@ const MAX_DEPTH: usize = 128;
 
 /// Strict JSON reader into `OrderedValue`: objects keep request order with Python dict semantics
 /// (a repeated key keeps its first position and takes the last value), strings are decoded by
-/// serde_json (exact escape rules), integers stay integers (`-0` → `0`, as Python), and other
-/// numbers go through `str::parse::<f64>` (correctly rounded). Non-finite numbers are rejected.
-fn parse_ordered(text: &str) -> Result<OrderedValue, String> {
+/// serde_json (exact escape rules), integers stay integers of any size (`-0` → `0`, as
+/// Python), and other numbers go through `str::parse::<f64>` (correctly rounded). Non-finite
+/// numbers are rejected.
+pub(crate) fn parse_ordered(text: &str) -> Result<OrderedValue, String> {
     let mut p = Reader {
         s: text.as_bytes(),
         text,
@@ -156,6 +160,8 @@ impl Reader<'_> {
             if let Ok(n) = lit.parse::<u64>() {
                 return Ok(OrderedValue::Number(n.into()));
             }
+            // JSON grammar already holds: digits only, no leading zero, not `-0`.
+            return Ok(OrderedValue::BigInt(lit.to_string()));
         }
         let x: f64 = lit
             .parse()
@@ -236,6 +242,10 @@ impl Serialize for OrderedValue {
             OrderedValue::Null => s.serialize_unit(),
             OrderedValue::Bool(b) => s.serialize_bool(*b),
             OrderedValue::Number(n) => n.serialize(s),
+            // Every digit, as a JSON number: serde_json writes a `RawValue` verbatim.
+            OrderedValue::BigInt(lit) => serde_json::value::RawValue::from_string(lit.clone())
+                .map_err(serde::ser::Error::custom)?
+                .serialize(s),
             OrderedValue::String(x) => s.serialize_str(x),
             OrderedValue::Array(a) => {
                 let mut q = s.serialize_seq(Some(a.len()))?;
@@ -277,8 +287,8 @@ impl OrderedValue {
     /// Python `json.dumps(v, ensure_ascii=False, sort_keys=sort_keys,
     /// separators=(",", ":") if compact else (", ", ": "))`. String escaping is serde_json's, which
     /// matches Python with ensure_ascii=False (escapes `"` `\` and control chars as `\n`/`\u001f`,
-    /// keeps non-ASCII). Floats use `py_float`, Python's repr. Known gap: integers beyond u64 parse
-    /// as f64 (serde_json has no arbitrary precision here), where Python keeps an int.
+    /// keeps non-ASCII). Floats use `py_float`, Python's repr; integers of any size print every
+    /// digit.
     pub fn py_json(&self, sort_keys: bool, compact: bool) -> String {
         let mut out = String::new();
         self.write_py(&mut out, sort_keys, compact);
@@ -291,6 +301,7 @@ impl OrderedValue {
             OrderedValue::Null => out.push_str("null"),
             OrderedValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
             OrderedValue::Number(n) => out.push_str(&py_number(n)),
+            OrderedValue::BigInt(lit) => out.push_str(lit),
             OrderedValue::String(s) => {
                 out.push_str(&serde_json::to_string(s).expect("string serializes"))
             }
@@ -331,6 +342,7 @@ impl OrderedValue {
             OrderedValue::Bool(true) => "True".into(),
             OrderedValue::Bool(false) => "False".into(),
             OrderedValue::Number(n) => py_number(n),
+            OrderedValue::BigInt(lit) => lit.clone(),
             OrderedValue::String(s) => s.clone(),
             other => other.py_json(false, false),
         }
@@ -503,6 +515,13 @@ impl DecisionRequest {
         if let (true, OrderedValue::Array(parts)) = (limits.image_parts, &self.state) {
             if parts.iter().any(is_image_part) {
                 return bad("image parts in state are not supported (text-only server)".into());
+            }
+            // serve_decide `_parts` reads `p["text"]`: a text part without a string one fails there.
+            if parts.iter().any(|p| {
+                p.get("type").and_then(|t| t.as_str()) == Some("text")
+                    && p.get("text").and_then(|t| t.as_str()).is_none()
+            }) {
+                return bad("text parts in state need a string \"text\"".into());
             }
         }
         if self.questions.is_empty() || self.questions.len() > limits.max_questions {
@@ -939,6 +958,61 @@ mod tests {
             "nesting over the limit"
         );
         assert!(serde_json::from_str::<OrderedValue>(&deep(1000)).is_err());
+    }
+
+    #[test]
+    fn integers_of_any_size_keep_every_digit() {
+        // L9/H16: Python ints are unbounded; json.dumps and str() print every digit.
+        let big = "123456789012345678901234567890";
+        let v: OrderedValue = serde_json::from_str(&format!(
+            r#"{{"id": {big}, "neg": -{big}, "f": 0.18466034385487662}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            v.py_json(false, false),
+            format!(r#"{{"id": {big}, "neg": -{big}, "f": 0.18466034385487662}}"#)
+        );
+        assert_eq!(v.get("id").unwrap().py_str(), big);
+        // echoed (a score legend, an OpenAI choice value) as the same JSON number, every digit kept
+        assert_eq!(
+            serde_json::to_string(&v).unwrap(),
+            format!(r#"{{"id":{big},"neg":-{big},"f":0.18466034385487662}}"#)
+        );
+        // the i64/u64 edges stay ordinary numbers; one past u64 is a big int
+        assert_eq!(
+            parse_ordered("-9223372036854775808").unwrap().py_str(),
+            "-9223372036854775808"
+        );
+        assert_eq!(
+            parse_ordered("18446744073709551616").unwrap().py_str(),
+            "18446744073709551616"
+        );
+    }
+
+    #[test]
+    fn text_parts_need_a_string_text_when_the_codec_reads_parts() {
+        // H8: serve_decide `_parts` reads `p["text"]`; a part without one is a KeyError there.
+        for state in [
+            r#"[{"type": "text"}]"#,
+            r#"["a", {"type": "text", "text": 5}]"#,
+            r#"[{"type": "text", "text": null}]"#,
+        ] {
+            let r = req_str(&format!(
+                r#"{{"model": "m", "state": {state}, "questions": {{"u": {{"type": "noul"}}}}}}"#
+            ));
+            match r.validate(&LIMITS) {
+                Err(DecisionError::BadRequest(m)) => {
+                    assert_eq!(m, "text parts in state need a string \"text\"")
+                }
+                other => panic!("{state}: {other:?}"),
+            }
+            // Kev and Clef render the same element as plain data.
+            let data = Limits {
+                image_parts: false,
+                ..LIMITS
+            };
+            r.validate(&data).unwrap();
+        }
     }
 
     #[test]

@@ -43,6 +43,7 @@ fn render_state(v: &OrderedValue) -> String {
             .iter()
             .map(|p| match p {
                 OrderedValue::String(s) => s.clone(),
+                // `validate` refuses a text part without a string `text` (H8).
                 p if p.get("type").and_then(|t| t.as_str()) == Some("text") => {
                     p.get("text").map(render).unwrap_or_default()
                 }
