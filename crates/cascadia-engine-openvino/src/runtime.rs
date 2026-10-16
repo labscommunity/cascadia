@@ -90,6 +90,11 @@ pub(crate) struct PipelineVision {
     text_embeddings: String,
     /// Vision encoder IR in the pipeline dir.
     vision_embeddings: String,
+    /// Rows of every stage's `position_ids` when the language model takes
+    /// M-RoPE positions (Qwen2.5-VL / Qwen3-VL: 3). Every rank is then fed
+    /// `[rows, T]` positions, which ride the wire as a frame after the hidden.
+    #[serde(default)]
+    pub(crate) mrope_rows: Option<u32>,
 }
 
 fn default_true() -> bool {
@@ -157,6 +162,11 @@ struct StageConfig {
     /// (CPU/GPU): one compiled model instead of two copies of the weights.
     #[serde(default)]
     prefill_shares_decode: bool,
+    /// Rows of this stage's `position_ids` input when it is not the plain
+    /// `[B, T]` (Qwen2.5-VL / Qwen3-VL cuts: 3). Must match the pipeline's
+    /// `vision.mrope_rows`.
+    #[serde(default)]
+    position_rows: Option<u32>,
 }
 
 fn read_pipeline_config(p: &Path) -> Result<PipelineConfig, EngineError> {
@@ -1047,6 +1057,47 @@ fn decode_wire_types(t: &WireTensor, seq: usize) -> EngineResult<Vec<i64>> {
     Ok(types)
 }
 
+/// Encode an M-RoPE tree's per-step positions, row-major `[rows, n]`, as I64
+/// `[1, rows, n]`: the frame after the hidden (and the types frame, if any).
+/// Only rank 0 knows where images sit, so every later stage takes its
+/// `position_ids` from here. The shape's middle dim carries the row count, so
+/// a peer built for another layout (or a 1-D tree) fails on the first frame.
+fn encode_wire_positions(rows: usize, positions: &[i64]) -> WireTensor {
+    let n = positions.len() / rows.max(1);
+    let bytes = positions.iter().flat_map(|p| p.to_le_bytes()).collect();
+    WireTensor::new(WireDType::I64, [1, rows as u32, n as u32], bytes)
+}
+
+/// Decode + strictly validate a positions frame against the hidden's token
+/// count `seq`. Positions are never negative (they start at 0 and the decode
+/// delta only pulls them back to the image span's end).
+fn decode_wire_positions(t: &WireTensor, rows: usize, seq: usize) -> EngineResult<Vec<i64>> {
+    if t.dtype != WireDType::I64
+        || t.shape != [1, rows as u32, seq as u32]
+        || t.data.len() != rows * seq * 8
+    {
+        return Err(EngineError::Backend(format!(
+            "expected an I64 [1,{rows},{seq}] M-RoPE positions frame after the hidden, got \
+             dtype={:?} shape={:?} len={} — every rank of a Qwen VL tree must run a build with \
+             M-RoPE frames and load the same pipeline_config.json",
+            t.dtype,
+            t.shape,
+            t.data.len()
+        )));
+    }
+    let v: Vec<i64> = t
+        .data
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    if let Some(bad) = v.iter().find(|&&p| p < 0) {
+        return Err(EngineError::Backend(format!(
+            "negative M-RoPE position {bad} — corrupted or desynced activation stream"
+        )));
+    }
+    Ok(v)
+}
+
 /// Encode a token + the echoed per-hop seq as I32 `[1,1,2]` = `[token, seq]`
 /// (8 bytes): the token is element 0, the seq element 1 — i.e. the seq occupies
 /// bytes 4..8, the HIGH half if the payload is read as one little-endian i64.
@@ -1113,7 +1164,8 @@ const NACK_TOKEN: i32 = -1;
 
 /// Send the downstream activation frames in wire order: `[lead] [hidden]`,
 /// where `lead` is `[seq]` or `[seq, position]` (see `encode_wire_lead`),
-/// then `[types]` on a vision tree (see `encode_wire_types`).
+/// then `[types]` on a vision tree (see `encode_wire_types`), then
+/// `[positions]` on an M-RoPE tree (see `encode_wire_positions`).
 ///
 /// Takes the VALUES, not pre-encoded frames, and encodes here: the lead and the
 /// hidden are both `WireTensor`, so a pre-encoded signature let the two be
@@ -1126,6 +1178,7 @@ async fn send_hidden_frames(
     position: Option<i64>,
     hid: WireTensor,
     types: Option<WireTensor>,
+    positions: Option<WireTensor>,
 ) -> Result<(), cascadia_transport::TransportError> {
     let lead = encode_wire_lead(seq, position);
     let mut guard = downstream.lock().await;
@@ -1133,6 +1186,9 @@ async fn send_hidden_frames(
     guard.send(&hid).await?;
     if let Some(t) = types {
         guard.send(&t).await?;
+    }
+    if let Some(p) = positions {
+        guard.send(&p).await?;
     }
     Ok(())
 }
@@ -1158,20 +1214,21 @@ async fn send_hidden_frames(
 /// below covering it: a peek inlined at the call site would be untested.
 ///
 /// On a vision tree (`want_types`) a third frame, the step's
-/// `token_type_ids`, follows the hidden and is deadlined like it.
+/// `token_type_ids`, follows the hidden and is deadlined like it; on an
+/// M-RoPE tree (`want_positions`) the step's positions follow last.
 async fn recv_hidden_frames(
     upstream: &Arc<tokio::sync::Mutex<ActivationServer>>,
     want_pos: bool,
     want_types: bool,
-) -> Result<(WireTensor, Option<WireTensor>, Option<WireTensor>), cascadia_transport::TransportError>
-{
+    want_positions: bool,
+) -> Result<HiddenFrames, cascadia_transport::TransportError> {
     let mut guard = upstream.lock().await;
     let lead = guard.recv().await?.0;
     // A static shard never receives control frames, and its lead is I64 either
     // way — so the check costs nothing there and cannot shadow an activation.
     #[cfg(feature = "kv_coord")]
     if !want_pos && lead.dtype == WireDType::I8 {
-        return Ok((lead, None, None));
+        return Ok((lead, None, None, None));
     }
     let _ = want_pos;
     let hid = guard.recv_reply().await?.0;
@@ -1180,8 +1237,21 @@ async fn recv_hidden_frames(
     } else {
         None
     };
-    Ok((lead, Some(hid), types))
+    let positions = if want_positions {
+        Some(guard.recv_reply().await?.0)
+    } else {
+        None
+    };
+    Ok((lead, Some(hid), types, positions))
 }
+
+/// `[lead] [hidden]?` and the optional types and positions frames.
+type HiddenFrames = (
+    WireTensor,
+    Option<WireTensor>,
+    Option<WireTensor>,
+    Option<WireTensor>,
+);
 
 /// Hard ceiling on the active token-response wait, independent of the body
 /// `recv_timeout()`. `recv_timeout` is operator-tunable for slow stages, and
@@ -1826,6 +1896,51 @@ pub(crate) enum VisionFamily {
     Gemma4,
     /// LLaVA-layout Pixtral trees from tools/vlm_surgery: causal attention.
     Pixtral,
+    /// Qwen2.5-VL / Qwen3-VL trees from tools/vlm_surgery: causal attention,
+    /// M-RoPE positions on every stage (`[3, T]`, a wire frame after the
+    /// hidden) and, on Qwen3-VL, DeepStack rows into stage 0.
+    QwenVl(crate::qwen_vl_vision::Kind),
+}
+
+/// A Qwen VL tree is served only where its M-RoPE positions are wired: the
+/// stateful path, with every stage cut for `[3, T]` positions. The static and
+/// packed paths feed 1-D positions (their IRs pin `[1, T]`), so they refuse.
+/// A stage whose `position_rows` disagrees with the pipeline's fails here,
+/// before any peer connects, rather than on its first frame.
+fn check_mrope_tree(
+    family: VisionFamily,
+    mrope_rows: Option<u32>,
+    position_rows: Option<u32>,
+    stateful: bool,
+    packed: bool,
+) -> EngineResult<()> {
+    let want = crate::qwen_vl_vision::MROPE_ROWS as u32;
+    let is_qwen = matches!(family, VisionFamily::QwenVl(_));
+    if !is_qwen {
+        if mrope_rows.is_some() || position_rows.is_some() {
+            return Err(EngineError::InvalidConfig(format!(
+                "a {family:?} vision tree declares M-RoPE positions (mrope_rows {mrope_rows:?}, \
+                 position_rows {position_rows:?}); only qwen2_5_vl / qwen3_vl trees take them"
+            )));
+        }
+        return Ok(());
+    }
+    if mrope_rows != Some(want) || position_rows != Some(want) {
+        return Err(EngineError::InvalidConfig(format!(
+            "{family:?} tree: pipeline vision.mrope_rows is {mrope_rows:?} and this stage's \
+             position_rows is {position_rows:?}, both must be {want}; re-cut the tree with \
+             tools/vlm_surgery/cut_vlm_lm.py from this build"
+        )));
+    }
+    if !stateful || packed {
+        return Err(EngineError::InvalidConfig(format!(
+            "{family:?} trees are served on the stateful path only: the static and packed \
+             paths feed 1-D positions, and these models need [3, T] M-RoPE positions on every \
+             stage; serve the stateful tree from cut_vlm_lm.py without static_variant.py or \
+             --packed-slots"
+        )));
+    }
+    Ok(())
 }
 
 /// The family of a pipeline's `vision` block. A tree without the field is
@@ -1841,9 +1956,11 @@ pub(crate) fn vision_family(
         // Mistral 3 is Pixtral's processor and tower plus a 2x2 patch merger,
         // which the Pixtral front end runs when the export carries it.
         (Some("pixtral" | "mistral3"), _) => Ok(VisionFamily::Pixtral),
+        (Some("qwen2_5_vl"), _) => Ok(VisionFamily::QwenVl(crate::qwen_vl_vision::Kind::Qwen25Vl)),
+        (Some("qwen3_vl"), _) => Ok(VisionFamily::QwenVl(crate::qwen_vl_vision::Kind::Qwen3Vl)),
         (Some(f), _) => Err(EngineError::InvalidConfig(format!(
             "pipeline_config.json `vision.family` is {f:?}; ov-runtime serves image input \
-             for \"gemma4\", \"pixtral\" and \"mistral3\""
+             for \"gemma4\", \"pixtral\", \"mistral3\", \"qwen2_5_vl\" and \"qwen3_vl\""
         ))),
         (None, other) => Err(EngineError::InvalidConfig(format!(
             "pipeline_config.json has a `vision` block without `family` on a {other:?} \
@@ -1869,12 +1986,29 @@ struct VisionTree {
     first: Option<VisionFirst>,
     /// Stages take `token_type_ids` and the wire carries the third frame.
     token_types: bool,
+    /// Stages take `[3, T]` M-RoPE `position_ids` (Qwen2.5-VL / Qwen3-VL),
+    /// computed on rank 0 and carried as a frame after the hidden (and the
+    /// types frame, if any).
+    mrope: bool,
 }
 
 /// Rank 0's image front end, per family.
 pub(crate) enum Frontend {
     Gemma4(crate::gemma4_vision::ImageFrontend),
     Pixtral(crate::pixtral_vision::Frontend),
+    QwenVl(crate::qwen_vl_vision::Frontend),
+}
+
+/// One turn's images as rank 0 prefills them.
+pub(crate) struct PreparedTurn {
+    /// The prompt with each image placeholder expanded.
+    pub(crate) ids: Vec<i64>,
+    /// Each image's embedding rows, in prompt order.
+    pub(crate) rows: Vec<Vec<f32>>,
+    /// Qwen VL: the prompt's M-RoPE positions.
+    pub(crate) mrope: Option<crate::qwen35_vision::rope::MropePositions>,
+    /// Qwen3-VL: each image's DeepStack rows (layer-major).
+    pub(crate) deepstack: Vec<Vec<f32>>,
 }
 
 impl Frontend {
@@ -1887,7 +2021,9 @@ impl Frontend {
     ) -> Result<usize, String> {
         match self {
             Frontend::Pixtral(f) => f.expanded_len(prompt_len, media),
-            Frontend::Gemma4(_) => Err("expanded length is sized for Pixtral images only".into()),
+            Frontend::Gemma4(_) | Frontend::QwenVl(_) => {
+                Err("expanded length is sized for Pixtral images only".into())
+            }
         }
     }
 
@@ -1896,6 +2032,11 @@ impl Frontend {
         match self {
             Frontend::Gemma4(f) => vec![f.tokens.image, f.tokens.boi, f.tokens.eoi],
             Frontend::Pixtral(f) => vec![f.tokens.image, f.tokens.image_break, f.tokens.image_end],
+            Frontend::QwenVl(f) => vec![
+                f.tokens.image_pad,
+                f.tokens.vision_start,
+                f.tokens.vision_end,
+            ],
         }
     }
 
@@ -1904,6 +2045,7 @@ impl Frontend {
         match self {
             Frontend::Gemma4(f) => f.tokens.image,
             Frontend::Pixtral(f) => f.tokens.image,
+            Frontend::QwenVl(f) => f.tokens.image_pad,
         }
     }
 
@@ -1912,7 +2054,7 @@ impl Frontend {
     fn embedding_ids(&self, ids: &[i64]) -> Vec<i64> {
         match self {
             Frontend::Gemma4(f) => crate::gemma4_vision::text_embedding_ids(ids, &f.tokens),
-            Frontend::Pixtral(_) => ids.to_vec(),
+            Frontend::Pixtral(_) | Frontend::QwenVl(_) => ids.to_vec(),
         }
     }
 
@@ -1925,6 +2067,56 @@ impl Frontend {
         match self {
             Frontend::Gemma4(f) => f.prepare(media, prompt_ids, tenant),
             Frontend::Pixtral(f) => f.prepare(media, prompt_ids, tenant),
+            Frontend::QwenVl(f) => f
+                .prepare(media, prompt_ids, tenant)
+                .map(|p| (p.ids, p.rows)),
+        }
+    }
+
+    /// [`Self::prepare`] keeping what a family needs beyond the rows: Qwen
+    /// VL's positions and DeepStack rows.
+    pub(crate) fn prepare_turn(
+        &mut self,
+        media: &[cascadia_types::MediaInput],
+        prompt_ids: &[i64],
+        tenant: &str,
+    ) -> Result<PreparedTurn, String> {
+        match self {
+            Frontend::QwenVl(f) => {
+                // Sized first: a prompt that cannot fit costs no encode.
+                let planned = f.expand_ids(media, prompt_ids)?;
+                let p = f.prepare(media, prompt_ids, tenant)?;
+                if p.ids != planned {
+                    return Err(format!(
+                        "image token counts from sizes ({} prompt tokens) disagree with the \
+                         encoder's ({})",
+                        planned.len(),
+                        p.ids.len()
+                    ));
+                }
+                Ok(PreparedTurn {
+                    ids: p.ids,
+                    rows: p.rows,
+                    mrope: Some(p.mrope),
+                    deepstack: p.deepstack,
+                })
+            }
+            _ => self
+                .prepare(media, prompt_ids, tenant)
+                .map(|(ids, rows)| PreparedTurn {
+                    ids,
+                    rows,
+                    mrope: None,
+                    deepstack: Vec::new(),
+                }),
+        }
+    }
+
+    /// Qwen3-VL: the DeepStack layers stage 0 takes (0 otherwise).
+    fn deepstack_layers(&self) -> usize {
+        match self {
+            Frontend::QwenVl(f) => f.deepstack_layers,
+            _ => 0,
         }
     }
 
@@ -1937,6 +2129,7 @@ impl Frontend {
         match self {
             Frontend::Gemma4(f) => f.expand_ids(media, prompt_ids),
             Frontend::Pixtral(f) => f.expand_ids(media, prompt_ids),
+            Frontend::QwenVl(f) => f.expand_ids(media, prompt_ids),
         }
     }
 
@@ -1945,7 +2138,7 @@ impl Frontend {
     fn max_image_tokens(&self) -> Option<usize> {
         match self {
             Frontend::Gemma4(f) => Some(f.preprocess.max_soft_tokens as usize),
-            Frontend::Pixtral(_) => None,
+            Frontend::Pixtral(_) | Frontend::QwenVl(_) => None,
         }
     }
 
@@ -1968,6 +2161,7 @@ impl Frontend {
                 "Pixtral images, longest edge {} px, one token per {}px patch",
                 f.preprocess.longest_edge, f.preprocess.patch_size
             ),
+            Frontend::QwenVl(f) => f.describe(),
         }
     }
 }
@@ -2047,6 +2241,9 @@ impl VisionFirst {
                     crate::pixtral_vision::Frontend::load(pipeline_dir, tokens).map_err(invalid)?,
                 )
             }
+            VisionFamily::QwenVl(kind) => Frontend::QwenVl(
+                crate::qwen_vl_vision::Frontend::load(pipeline_dir, kind, &v).map_err(invalid)?,
+            ),
         };
         Ok(Self {
             embed,
@@ -2087,6 +2284,12 @@ struct ActiveTask {
     /// Vision trees: each image's embedding rows, spliced into the prefill's
     /// embeddings and then dropped (taken by the first feed).
     image_rows: Vec<Vec<f32>>,
+    /// Qwen VL trees: the prompt's M-RoPE positions (`None` on a text turn:
+    /// the plain index on every row).
+    mrope: Option<crate::qwen35_vision::rope::MropePositions>,
+    /// Qwen3-VL: each image's DeepStack rows, taken by the prefill like
+    /// `image_rows`.
+    deepstack: Vec<Vec<f32>>,
     /// The prompt's KV cache key (`vision_kv`); `None` keeps the turn out of
     /// the cache.
     #[cfg(feature = "kv_coord")]
@@ -2129,6 +2332,9 @@ pub struct OvRuntimeEngine {
     /// Vision trees: the `token_type_ids` of the step being fed — computed on
     /// rank 0, received as the third frame elsewhere, forwarded downstream.
     step_types: Vec<i64>,
+    /// M-RoPE trees: the `[3, T]` positions of the step being fed — computed
+    /// on rank 0, received as the last frame elsewhere, forwarded downstream.
+    step_positions: Vec<i64>,
     runtime: OvRuntime,
     rotary: Rotary,
     hidden_size: usize,
@@ -2287,7 +2493,6 @@ impl OvRuntimeEngine {
         let seq_len = input_ids.len();
         let total = position as usize + seq_len;
         let attn = vec![1i64; total];
-        let pos: Vec<i64> = (position..position + seq_len as i64).collect();
 
         if self.vision.is_some() {
             self.feed_vision_embeds(input_ids)?;
@@ -2318,9 +2523,7 @@ impl OvRuntimeEngine {
         self.runtime
             .set_input(&in_attn, ShimDType::I64, &[1, total], &i64_to_bytes(&attn))
             .map_err(map_ov_err)?;
-        self.runtime
-            .set_input(&in_pos, ShimDType::I64, &[1, seq_len], &i64_to_bytes(&pos))
-            .map_err(map_ov_err)?;
+        self.set_position_ids(&in_pos, position, seq_len)?;
         if let Some(beam) = in_beam {
             self.runtime
                 .set_input(&beam, ShimDType::I32, &[1], &0i32.to_le_bytes())
@@ -2397,6 +2600,50 @@ impl OvRuntimeEngine {
         self.vision.as_ref().is_some_and(|v| v.token_types)
     }
 
+    /// A Qwen VL tree: every stage takes `[3, T]` M-RoPE positions, which
+    /// rank 0 computes and the wire carries after the hidden.
+    fn vision_mrope(&self) -> bool {
+        self.vision.as_ref().is_some_and(|v| v.mrope)
+    }
+
+    /// Set `position_ids` for `seq_len` tokens from `position`: the plain
+    /// `[1, T]` index, or on an M-RoPE tree the `[3, 1, T]` block — computed
+    /// from the active turn's positions on rank 0 (kept in `step_positions`
+    /// for the wire), taken from the upstream frame elsewhere.
+    fn set_position_ids(
+        &mut self,
+        in_pos: &str,
+        position: i64,
+        seq_len: usize,
+    ) -> EngineResult<()> {
+        if !self.vision_mrope() {
+            let pos: Vec<i64> = (position..position + seq_len as i64).collect();
+            return self
+                .runtime
+                .set_input(in_pos, ShimDType::I64, &[1, seq_len], &i64_to_bytes(&pos))
+                .map_err(map_ov_err);
+        }
+        let rows = crate::qwen_vl_vision::MROPE_ROWS;
+        if self.spec.is_first_stage {
+            let mrope = self.active.as_ref().and_then(|a| a.mrope.as_ref());
+            let t0 = position as usize;
+            self.step_positions = crate::qwen_vl_vision::positions(mrope, t0, t0 + seq_len);
+        } else if self.step_positions.len() != rows * seq_len {
+            return Err(EngineError::Backend(format!(
+                "M-RoPE tree: {} positions for a {seq_len}-token hidden",
+                self.step_positions.len()
+            )));
+        }
+        self.runtime
+            .set_input(
+                in_pos,
+                ShimDType::I64,
+                &[rows, 1, seq_len],
+                &i64_to_bytes(&self.step_positions),
+            )
+            .map_err(map_ov_err)
+    }
+
     /// Packed slots on a `token_type_ids` tree: the masks open image blocks
     /// and the plan frame carries each row's image id (`[1, 4, S]`).
     fn packed_image_blocks(&self) -> bool {
@@ -2424,6 +2671,14 @@ impl OvRuntimeEngine {
                 &bytes,
             )
             .map_err(map_ov_err)?;
+        let layers = self
+            .vision
+            .as_ref()
+            .and_then(|v| v.first.as_ref())
+            .map_or(0, |f| f.frontend.deepstack_layers());
+        if layers > 0 {
+            self.feed_deepstack(input_ids, image, layers, hidden)?;
+        }
         if token_types {
             self.step_types = crate::gemma4_vision::token_type_ids(input_ids, image);
             let in_types = self
@@ -2442,6 +2697,45 @@ impl OvRuntimeEngine {
                 .map_err(map_ov_err)?;
         }
         Ok(())
+    }
+
+    /// Qwen3-VL stage 0: `visual_pos_masks` (1 on the fed image tokens) and
+    /// `deepstack_visual_embeds [layers, N, hidden]`, the active turn's
+    /// DeepStack rows (taken by the prefill that feeds them; a decode step
+    /// feeds no image token and gets one zero row per layer).
+    fn feed_deepstack(
+        &mut self,
+        input_ids: &[i64],
+        image: i64,
+        layers: usize,
+        hidden: usize,
+    ) -> EngineResult<()> {
+        let images = self
+            .active
+            .as_mut()
+            .map(|a| std::mem::take(&mut a.deepstack))
+            .unwrap_or_default();
+        let (mask, embeds, n) =
+            crate::qwen_vl_vision::deepstack_inputs(input_ids, image, &images, layers, hidden)
+                .map_err(EngineError::Backend)?;
+        let name = |k: &str| {
+            self.input_named(k)
+                .map(str::to_string)
+                .ok_or_else(|| EngineError::Backend(format!("Qwen3-VL stage 0 lacks {k}")))
+        };
+        let (in_mask, in_embeds) = (name("visual_pos_masks")?, name("deepstack_visual_embeds")?);
+        self.runtime
+            .set_input(
+                &in_mask,
+                ShimDType::I64,
+                &[1, input_ids.len()],
+                &i64_to_bytes(&mask),
+            )
+            .map_err(map_ov_err)?;
+        let bytes: Vec<u8> = embeds.iter().flat_map(|x| x.to_le_bytes()).collect();
+        self.runtime
+            .set_input(&in_embeds, ShimDType::F32, &[layers, n, hidden], &bytes)
+            .map_err(map_ov_err)
     }
 
     fn build_feed_relay(
@@ -2498,7 +2792,6 @@ impl OvRuntimeEngine {
         let seq_len = shape[1];
         let total = position as usize + seq_len;
         let attn = vec![1i64; total];
-        let pos: Vec<i64> = (position..position + seq_len as i64).collect();
 
         let in_hs = self
             .input_named("hidden_states")
@@ -2543,9 +2836,7 @@ impl OvRuntimeEngine {
         self.runtime
             .set_input(&in_attn, ShimDType::I64, &[1, total], &i64_to_bytes(&attn))
             .map_err(map_ov_err)?;
-        self.runtime
-            .set_input(&in_pos, ShimDType::I64, &[1, seq_len], &i64_to_bytes(&pos))
-            .map_err(map_ov_err)?;
+        self.set_position_ids(&in_pos, position, seq_len)?;
         if let Some(beam) = in_beam {
             self.runtime
                 .set_input(&beam, ShimDType::I32, &[1], &0i32.to_le_bytes())
@@ -2840,8 +3131,28 @@ impl OvRuntimeEngine {
             Some(_) => Some(encode_wire_types(&self.step_types)),
             None => None,
         };
-        self.block_on(send_hidden_frames(&downstream, seq, pos, hid, types))
-            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        let positions = if self.vision_mrope() {
+            let rows = crate::qwen_vl_vision::MROPE_ROWS;
+            if self.step_positions.len() != rows * shape[1] {
+                return Err(EngineError::Backend(format!(
+                    "M-RoPE tree: {} positions for a {}-token hidden",
+                    self.step_positions.len(),
+                    shape[1]
+                )));
+            }
+            Some(encode_wire_positions(rows, &self.step_positions))
+        } else {
+            None
+        };
+        self.block_on(send_hidden_frames(
+            &downstream,
+            seq,
+            pos,
+            hid,
+            types,
+            positions,
+        ))
+        .map_err(|e| EngineError::Backend(e.to_string()))?;
         debug!(position, "downstream send: done");
         Ok(())
     }
@@ -2905,8 +3216,14 @@ impl OvRuntimeEngine {
                 .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
             debug!(want_pos, "upstream recv: waiting");
             let want_types = self.vision_token_types();
-            let (lead, hidden, types) = self
-                .block_on(recv_hidden_frames(&upstream, want_pos, want_types))
+            let want_positions = self.vision_mrope();
+            let (lead, hidden, types, positions) = self
+                .block_on(recv_hidden_frames(
+                    &upstream,
+                    want_pos,
+                    want_types,
+                    want_positions,
+                ))
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
             info!(dtype = ?lead.dtype, len = lead.data.len(), want_pos, "ov_tail_upstream_frame_recv");
             let tensor = match hidden {
@@ -2937,6 +3254,10 @@ impl OvRuntimeEngine {
             ];
             if let Some(t) = types {
                 self.step_types = decode_wire_types(&t, shape[1])?;
+            }
+            if let Some(p) = positions {
+                self.step_positions =
+                    decode_wire_positions(&p, crate::qwen_vl_vision::MROPE_ROWS, shape[1])?;
             }
             let floats = match tensor.dtype {
                 WireDType::F32 => tensor
@@ -3026,6 +3347,8 @@ impl OvRuntimeEngine {
             // Vision trees: encode the images and expand each one's placeholder
             // into its soft-token run. Images reach no other tree.
             let mut image_rows = Vec::new();
+            let mut mrope = None;
+            let mut deepstack = Vec::new();
             // The warm-resume key: the prompt ids, image soft tokens replaced
             // by stand-ins for each image's hash. `None` keeps the turn out of
             // the KV cache.
@@ -3052,9 +3375,14 @@ impl OvRuntimeEngine {
                 let started = std::time::Instant::now();
                 match first
                     .frontend
-                    .prepare(&task.media, &prompt_ids, &task.tenant)
+                    .prepare_turn(&task.media, &prompt_ids, &task.tenant)
                 {
-                    Ok((ids, rows)) => {
+                    Ok(PreparedTurn {
+                        ids,
+                        rows,
+                        mrope: positions,
+                        deepstack: ds,
+                    }) => {
                         info!(
                             task = %task.task_id,
                             images = rows.len(),
@@ -3076,6 +3404,8 @@ impl OvRuntimeEngine {
                         }
                         prompt_ids = ids;
                         image_rows = rows;
+                        mrope = positions;
+                        deepstack = ds;
                     }
                     Err(e) => return Ok(refuse(e)),
                 }
@@ -3181,6 +3511,9 @@ impl OvRuntimeEngine {
                 if let Some((_, Some(spans))) = &kv_key {
                     let before = image_rows.len();
                     image_rows = spans.rows_from(warm_prefix, image_rows);
+                    if !deepstack.is_empty() {
+                        deepstack = spans.rows_from(warm_prefix, deepstack);
+                    }
                     info!(
                         images_resumed = before - image_rows.len(),
                         images_prefilled = image_rows.len(),
@@ -3236,6 +3569,8 @@ impl OvRuntimeEngine {
                 task,
                 prompt_ids,
                 image_rows,
+                mrope,
+                deepstack,
                 #[cfg(feature = "kv_coord")]
                 kv_key: kv_key.map(|(k, _)| k),
                 generated: resume_seed,
@@ -5335,6 +5670,9 @@ pub(crate) fn resolve_canonical_inputs(
         // and every stage's image-attention row.
         "inputs_embeds",
         "token_type_ids",
+        // Qwen3-VL stage 0: DeepStack rows and where they go.
+        "visual_pos_masks",
+        "deepstack_visual_embeds",
     ] {
         for idx in 0..n_inputs {
             let aliases = runtime.input_aliases(idx).map_err(map_ov_err)?;
@@ -6375,6 +6713,14 @@ impl Builder for OvRuntimeBuilder {
         if let Some(v) = pipeline_cfg.vision.as_ref() {
             let family = vision_family(v, pipeline_cfg.export_version.as_deref())?;
             let token_types = v.token_type_ids.unwrap_or(family == VisionFamily::Gemma4);
+            let mrope = matches!(family, VisionFamily::QwenVl(_));
+            check_mrope_tree(
+                family,
+                v.mrope_rows,
+                stage_cfg.position_rows,
+                stage_cfg.stateful,
+                self.packed_params.is_some(),
+            )?;
             // Bidirectional image attention (token_type_ids) needs each image
             // whole inside one inference: on the static path that is a
             // chunked-prefill IR at least one image wide. Packed slots build
@@ -6436,13 +6782,19 @@ impl Builder for OvRuntimeBuilder {
                     "vision tree ({family:?}): {}",
                     if token_types {
                         "relaying token_type_ids"
+                    } else if mrope {
+                        "relaying hidden states and M-RoPE positions"
                     } else {
                         "relaying hidden states"
                     }
                 )));
                 None
             };
-            self.vision = Some(VisionTree { first, token_types });
+            self.vision = Some(VisionTree {
+                first,
+                token_types,
+                mrope,
+            });
         }
 
         events.push(LoadProgress::ready());
@@ -6823,8 +7175,14 @@ impl Builder for OvRuntimeBuilder {
             } else {
                 "hidden_states"
             };
+            let deepstack = v
+                .first
+                .as_ref()
+                .is_some_and(|f| f.frontend.deepstack_layers() > 0);
             let need: &[&str] = if v.token_types {
                 &[main, "token_type_ids"][..]
+            } else if deepstack {
+                &[main, "visual_pos_masks", "deepstack_visual_embeds"][..]
             } else {
                 &[main][..]
             };
@@ -6835,7 +7193,15 @@ impl Builder for OvRuntimeBuilder {
                     self.rank
                 )));
             }
+            if v.first.is_none() && canonical_inputs.contains_key("deepstack_visual_embeds") {
+                return Err(EngineError::InvalidConfig(format!(
+                    "Qwen3-VL tree: stage {} takes DeepStack rows, which only stage 0 (on rank \
+                     0) can be fed; re-cut so stage 0 holds the DeepStack layers",
+                    self.rank
+                )));
+            }
         } else if canonical_inputs.contains_key("token_type_ids")
+            || canonical_inputs.contains_key("deepstack_visual_embeds")
             || (canonical_inputs.contains_key("inputs_embeds")
                 && !canonical_inputs.contains_key("input_ids"))
         {
@@ -6850,6 +7216,7 @@ impl Builder for OvRuntimeBuilder {
             packed,
             vision: self.vision,
             step_types: Vec::new(),
+            step_positions: Vec::new(),
             spec,
             runtime,
             rotary,
@@ -8504,11 +8871,13 @@ mod tests {
 
         let stamped = 7u32;
         let hid = WireTensor::new(WireDType::F16, [1, 1, 2], vec![1, 2, 3, 4]);
-        send_hidden_frames(&downstream, stamped, None, hid.clone(), None)
+        send_hidden_frames(&downstream, stamped, None, hid.clone(), None, None)
             .await
             .unwrap();
 
-        let (lead, hid_t, _) = recv_hidden_frames(&upstream, false, false).await.unwrap();
+        let (lead, hid_t, _, _) = recv_hidden_frames(&upstream, false, false, false)
+            .await
+            .unwrap();
         let hid_t = hid_t.expect("an activation lead is always followed by its hidden");
         let (inbound, pos) = decode_wire_lead(&lead, false).unwrap();
         assert!(pos.is_none());
@@ -8543,7 +8912,9 @@ mod tests {
         let ctrl = WireTensor::new(WireDType::I8, [1, 1, 1], vec![OPCODE_CAPTURE]);
         downstream.lock().await.send(&ctrl).await.unwrap();
 
-        let (frame, hidden, _) = recv_hidden_frames(&upstream, false, false).await.unwrap();
+        let (frame, hidden, _, _) = recv_hidden_frames(&upstream, false, false, false)
+            .await
+            .unwrap();
         assert_eq!(frame.dtype, WireDType::I8, "control frame comes back as-is");
         assert!(
             hidden.is_none(),
@@ -8552,10 +8923,12 @@ mod tests {
 
         // The very next activation must be unaffected.
         let hid = WireTensor::new(WireDType::F16, [1, 1, 2], vec![4, 3, 2, 1]);
-        send_hidden_frames(&downstream, 9, None, hid.clone(), None)
+        send_hidden_frames(&downstream, 9, None, hid.clone(), None, None)
             .await
             .unwrap();
-        let (lead, hid_t, _) = recv_hidden_frames(&upstream, false, false).await.unwrap();
+        let (lead, hid_t, _, _) = recv_hidden_frames(&upstream, false, false, false)
+            .await
+            .unwrap();
         let hid_t = hid_t.expect("an activation lead is always followed by its hidden");
         assert_eq!(decode_wire_lead(&lead, false).unwrap(), (9, None));
         assert_eq!(
@@ -8573,11 +8946,13 @@ mod tests {
         let upstream = Arc::new(tokio::sync::Mutex::new(server));
 
         let hid = WireTensor::new(WireDType::F16, [1, 1, 2], vec![9, 8, 7, 6]);
-        send_hidden_frames(&downstream, 3, Some(11), hid.clone(), None)
+        send_hidden_frames(&downstream, 3, Some(11), hid.clone(), None, None)
             .await
             .unwrap();
 
-        let (lead, hid_t, _) = recv_hidden_frames(&upstream, true, false).await.unwrap();
+        let (lead, hid_t, _, _) = recv_hidden_frames(&upstream, true, false, false)
+            .await
+            .unwrap();
         let hid_t = hid_t.expect("an activation lead is always followed by its hidden");
         assert_eq!(
             decode_wire_lead(&lead, true).unwrap(),
@@ -8601,14 +8976,44 @@ mod tests {
             None,
             hid.clone(),
             Some(encode_wire_types(&types)),
+            None,
         )
         .await
         .unwrap();
-        let (lead, hid_t, types_t) = recv_hidden_frames(&upstream, false, true).await.unwrap();
+        let (lead, hid_t, types_t, _) = recv_hidden_frames(&upstream, false, true, false)
+            .await
+            .unwrap();
         assert_eq!(decode_wire_lead(&lead, false).unwrap(), (4, None));
         assert_eq!(hid_t.unwrap().data, hid.data, "hidden is the second frame");
         let types_t = types_t.expect("a vision tree's hidden is followed by its types");
         assert_eq!(decode_wire_types(&types_t, 3).unwrap(), types);
+    }
+
+    #[tokio::test]
+    async fn mrope_wire_is_lead_hidden_then_positions() {
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+        let hid = WireTensor::new(WireDType::F16, [1, 2, 1], vec![1, 2, 3, 4]);
+        let pos = [7i64, 8, 7, 9, 7, 10];
+        send_hidden_frames(
+            &downstream,
+            5,
+            None,
+            hid.clone(),
+            None,
+            Some(encode_wire_positions(3, &pos)),
+        )
+        .await
+        .unwrap();
+        let (lead, hid_t, types_t, pos_t) = recv_hidden_frames(&upstream, false, false, true)
+            .await
+            .unwrap();
+        assert_eq!(decode_wire_lead(&lead, false).unwrap(), (5, None));
+        assert_eq!(hid_t.unwrap().data, hid.data);
+        assert!(types_t.is_none());
+        let pos_t = pos_t.expect("an M-RoPE tree's hidden is followed by its positions");
+        assert_eq!(decode_wire_positions(&pos_t, 3, 2).unwrap(), pos);
     }
 
     #[test]
@@ -8618,6 +9023,7 @@ mod tests {
             token_type_ids: None,
             text_embeddings: "t.xml".into(),
             vision_embeddings: "openvino_vision_embeddings_model.xml".into(),
+            mrope_rows: None,
         };
         assert_eq!(
             vision_family(&v(Some("gemma4")), None).unwrap(),
@@ -8636,8 +9042,53 @@ mod tests {
             vision_family(&v(Some("mistral3")), None).unwrap(),
             VisionFamily::Pixtral
         );
+        assert_eq!(
+            vision_family(&v(Some("qwen2_5_vl")), None).unwrap(),
+            VisionFamily::QwenVl(crate::qwen_vl_vision::Kind::Qwen25Vl)
+        );
+        assert_eq!(
+            vision_family(&v(Some("qwen3_vl")), None).unwrap(),
+            VisionFamily::QwenVl(crate::qwen_vl_vision::Kind::Qwen3Vl)
+        );
         assert!(vision_family(&v(Some("qwen2_vl")), None).is_err());
         assert!(vision_family(&v(None), Some("something_else_v1")).is_err());
+    }
+
+    /// A Qwen VL tree loads only stateful, with 3 position rows declared by
+    /// the pipeline and by the stage; other families must declare none.
+    #[test]
+    fn mrope_trees_are_checked_at_load() {
+        let q = VisionFamily::QwenVl(crate::qwen_vl_vision::Kind::Qwen25Vl);
+        assert!(check_mrope_tree(q, Some(3), Some(3), true, false).is_ok());
+        let err = |r: EngineResult<()>| r.unwrap_err().to_string();
+        assert!(err(check_mrope_tree(q, None, Some(3), true, false)).contains("re-cut"));
+        assert!(err(check_mrope_tree(q, Some(3), None, true, false)).contains("re-cut"));
+        assert!(err(check_mrope_tree(q, Some(4), Some(4), true, false)).contains("re-cut"));
+        assert!(err(check_mrope_tree(q, Some(3), Some(3), false, false)).contains("stateful"));
+        assert!(err(check_mrope_tree(q, Some(3), Some(3), true, true)).contains("stateful"));
+        assert!(check_mrope_tree(VisionFamily::Pixtral, None, None, false, true).is_ok());
+        assert!(check_mrope_tree(VisionFamily::Pixtral, Some(3), None, true, false).is_err());
+        assert!(check_mrope_tree(VisionFamily::Gemma4, None, Some(3), true, false).is_err());
+    }
+
+    #[test]
+    fn positions_frame_round_trips_and_is_strict() {
+        let pos = [0i64, 1, 5, 0, 2, 5, 0, 3, 5];
+        let t = encode_wire_positions(3, &pos);
+        assert_eq!(t.shape, [1, 3, 3]);
+        assert_eq!(decode_wire_positions(&t, 3, 3).unwrap(), pos);
+        // Wrong token count, wrong row count, wrong dtype: all refused.
+        assert!(decode_wire_positions(&t, 3, 2).is_err());
+        assert!(decode_wire_positions(&t, 1, 9).is_err());
+        let types = encode_wire_types(&[0, 1, 1]);
+        assert!(decode_wire_positions(&types, 3, 3).is_err());
+        let mut neg = encode_wire_positions(3, &pos);
+        neg.data[0..8].copy_from_slice(&(-1i64).to_le_bytes());
+        assert!(decode_wire_positions(&neg, 3, 3).is_err());
+        // A positions frame read where the next lead is expected (a peer
+        // that does not expect M-RoPE) is refused, not mis-bound.
+        assert!(decode_wire_lead(&t, false).is_err());
+        assert!(decode_wire_lead(&t, true).is_err());
     }
 
     #[test]
