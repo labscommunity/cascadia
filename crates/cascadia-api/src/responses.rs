@@ -97,7 +97,7 @@ impl Refusal {
     }
 
     fn into_response(self) -> Response {
-        count_rejected("malformed_body");
+        count_rejected("unsupported_field");
         api_error_for(
             StatusCode::BAD_REQUEST,
             self.message,
@@ -386,7 +386,9 @@ struct ResponseShell {
     created_at: i64,
     model: String,
     instructions: Option<String>,
-    max_output_tokens: Option<u32>,
+    /// The cap in force, echoed even when the caller left it to the default:
+    /// an `incomplete` response names it.
+    max_output_tokens: u32,
     temperature: f32,
     top_p: f32,
     effort: Option<String>,
@@ -401,7 +403,7 @@ impl ResponseShell {
             created_at: now_unix(),
             model: req.model.clone(),
             instructions: req.instructions.clone(),
-            max_output_tokens: req.max_output_tokens,
+            max_output_tokens: req.max_output_tokens.unwrap_or_else(default_max_tokens),
             temperature: req.temperature.unwrap_or_default(),
             top_p: req.top_p.unwrap_or(1.0),
             effort: req.reasoning.as_ref().and_then(|r| r.effort.clone()),
@@ -471,13 +473,55 @@ struct Outcome {
     error: Option<String>,
 }
 
-/// `incomplete` when the engine stopped at `max_output_tokens`, as OpenAI
-/// reports it; `completed` otherwise.
-fn status_for(finish_reason: &str) -> &'static str {
-    if finish_reason == "length" {
-        "incomplete"
-    } else {
-        "completed"
+/// How the generation ended, in Responses terms.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum End {
+    Completed,
+    /// Stopped at `max_output_tokens`.
+    TokenCap,
+    /// Cancelled (`/v1/cancel`, or the engine's `Cancelled`), or the stream
+    /// ended without a final chunk: the text is partial either way, so it is
+    /// never reported `completed`.
+    Cancelled,
+}
+
+impl End {
+    /// From the final chunk's reason; `None` = no final chunk.
+    fn from_final(reason: Option<cascadia_types::FinishReason>) -> Self {
+        use cascadia_types::FinishReason;
+        match reason {
+            Some(FinishReason::Stop) => End::Completed,
+            Some(FinishReason::Length) => End::TokenCap,
+            Some(FinishReason::Cancelled) | None => End::Cancelled,
+        }
+    }
+
+    /// The response's `status`: `incomplete` at the token cap and
+    /// `cancelled` for a cancelled turn, as OpenAI's `ResponseStatus` has them.
+    fn status(self) -> &'static str {
+        match self {
+            End::Completed => "completed",
+            End::TokenCap => "incomplete",
+            End::Cancelled => "cancelled",
+        }
+    }
+
+    /// The message item's `status` (items have no `cancelled`).
+    fn item_status(self) -> &'static str {
+        match self {
+            End::Completed => "completed",
+            End::TokenCap | End::Cancelled => "incomplete",
+        }
+    }
+
+    /// The terminal stream event. OpenAI defines none for a cancelled
+    /// response, so it ends on `response.incomplete`, carrying `status:
+    /// "cancelled"`: never `response.completed` for partial text.
+    fn event(self) -> &'static str {
+        match self {
+            End::Completed => "response.completed",
+            End::TokenCap | End::Cancelled => "response.incomplete",
+        }
     }
 }
 
@@ -511,15 +555,15 @@ pub(crate) async fn create_response(
         Ok(c) => c,
         Err(resp) => return resp,
     };
-    let status = status_for(c.finish_reason);
+    let end = End::from_final(c.end);
     let outcome = Outcome {
         prompt_tokens: c.prompt_tokens,
         completion_tokens: c.completion_tokens,
         error: None,
     };
     Json(shell.object(
-        status,
-        json!([shell.message(status, Some(&c.text))]),
+        end.status(),
+        json!([shell.message(end.item_status(), Some(&c.text))]),
         Some(&outcome),
     ))
     .into_response()
@@ -587,8 +631,8 @@ impl ResponseStream {
             return out;
         }
         let Some(chunk) = self.chunks.next().await else {
-            // The engine closed the stream without a final chunk.
-            self.finish(&mut out, "stop");
+            // No final chunk: the runner ends a cancelled task's stream so.
+            self.finish(&mut out, End::Cancelled);
             return out;
         };
         // The 200 is on the wire already, so a failed task is reported the
@@ -628,8 +672,10 @@ impl ResponseStream {
         }
         if chunk.is_final {
             self.prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
-            let reason = chunk.finish_reason.map(|f| f.as_openai_str());
-            self.finish(&mut out, reason.unwrap_or("stop"));
+            let reason = chunk
+                .finish_reason
+                .unwrap_or(cascadia_types::FinishReason::Stop);
+            self.finish(&mut out, End::from_final(Some(reason)));
         }
         // Let the body sink drain this frame first (see `stream_completion`).
         tokio::task::yield_now().await;
@@ -637,14 +683,13 @@ impl ResponseStream {
     }
 
     /// The closing events: text, part and item done, then the response.
-    fn finish(&mut self, out: &mut String, finish_reason: &str) {
-        let status = status_for(finish_reason);
+    fn finish(&mut self, out: &mut String, end: End) {
         let text = self.text.clone();
         let done = self.with_at(json!({"text": text, "logprobs": []}));
         self.emit(out, "response.output_text.done", done);
         let part = self.with_at(json!({"part": output_text(&text)}));
         self.emit(out, "response.content_part.done", part);
-        let item = self.shell.message(status, Some(&text));
+        let item = self.shell.message(end.item_status(), Some(&text));
         self.emit(
             out,
             "response.output_item.done",
@@ -655,13 +700,10 @@ impl ResponseStream {
             completion_tokens: self.completion_tokens,
             error: None,
         };
-        let response = self.shell.object(status, json!([item]), Some(&outcome));
-        let kind = if status == "completed" {
-            "response.completed"
-        } else {
-            "response.incomplete"
-        };
-        self.emit(out, kind, json!({"response": response}));
+        let response = self
+            .shell
+            .object(end.status(), json!([item]), Some(&outcome));
+        self.emit(out, end.event(), json!({"response": response}));
         self.done = true;
     }
 }
@@ -1115,5 +1157,177 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
         assert!(v["error"]["message"].as_str().unwrap().contains("`input`"));
+    }
+
+    /// Echoes `tok ` for its one task. With `cancel_after: Some(n)` it ends
+    /// the task after `n` tokens with a `Cancelled` final marker; with `None`
+    /// it never ends on its own, so only `/v1/cancel` stops it (and the
+    /// runner then ends the stream with no final chunk at all).
+    struct ScriptEngine {
+        task: Option<cascadia_types::TaskId>,
+        cancel_after: Option<usize>,
+        emitted: Arc<std::sync::atomic::AtomicUsize>,
+        seen: Arc<parking_lot::Mutex<Option<cascadia_types::TaskId>>>,
+    }
+
+    impl cascadia_engine::Engine for ScriptEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> Result<(), cascadia_engine::EngineError> {
+            *self.seen.lock() = Some(task.task_id.clone());
+            self.task = Some(task.task_id);
+            Ok(())
+        }
+        fn step(
+            &mut self,
+        ) -> Result<
+            Vec<(cascadia_types::TaskId, cascadia_types::Chunk)>,
+            cascadia_engine::EngineError,
+        > {
+            use std::sync::atomic::Ordering::SeqCst;
+            let Some(id) = self.task.clone() else {
+                return Ok(Vec::new());
+            };
+            let n = self.emitted.load(SeqCst);
+            if self.cancel_after.is_some_and(|max| n >= max) {
+                self.task = None;
+                let end = cascadia_types::Chunk::final_marker(&id, "")
+                    .with_finish_reason(cascadia_types::FinishReason::Cancelled);
+                return Ok(vec![(id, end)]);
+            }
+            self.emitted.fetch_add(1, SeqCst);
+            Ok(vec![(
+                id.clone(),
+                cascadia_types::Chunk::token(&id, n as i64, "tok "),
+            )])
+        }
+    }
+
+    struct ScriptBuilder(Option<ScriptEngine>);
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for ScriptBuilder {
+        async fn connect(
+            &mut self,
+            _peers: cascadia_types::PeerLayout,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: cascadia_types::ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, cascadia_engine::EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(
+            mut self: Box<Self>,
+        ) -> Result<Box<dyn cascadia_engine::Engine>, cascadia_engine::EngineError> {
+            Ok(Box::new(self.0.take().expect("built once")))
+        }
+    }
+
+    /// Run one request against a [`ScriptEngine`]. Without `cancel_after`,
+    /// the request is cancelled through `/v1/cancel/<id>` once a token is out.
+    async fn scripted(cancel_after: Option<usize>, stream: bool) -> (StatusCode, String) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let emitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::new(parking_lot::Mutex::new(None));
+        let runner = Arc::new(Runner::new(Box::new(ScriptBuilder(Some(ScriptEngine {
+            task: None,
+            cancel_after,
+            emitted: emitted.clone(),
+            seen: seen.clone(),
+        })))));
+        runner
+            .start(
+                cascadia_types::PeerLayout::single_stage(),
+                cascadia_types::ShardSpec::single_stage("script-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let app = make_router(runner.clone(), "script-model");
+        let req = tokio::spawn(post(
+            app.clone(),
+            json!({"model": "script-model", "input": "hello", "stream": stream}),
+        ));
+        if cancel_after.is_none() {
+            while emitted.load(SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            let id = seen.lock().clone().unwrap();
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/cancel/{id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        req.await.unwrap()
+    }
+
+    fn assert_cancelled(response: &Value) {
+        assert_eq!(response["status"], "cancelled", "{response}");
+        assert!(response["completed_at"].is_null());
+        let item = &response["output"][0];
+        assert_eq!(item["status"], "incomplete");
+        assert!(item["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("tok"));
+    }
+
+    /// A turn the engine ends with `Cancelled`, and one cut off by
+    /// `/v1/cancel` (whose stream ends with no final chunk), carry partial
+    /// text: neither is ever reported `completed`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_turns_are_not_completed() {
+        for cancel_after in [Some(2), None] {
+            let (status, body) = scripted(cancel_after, false).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_cancelled(&serde_json::from_str(&body).unwrap());
+
+            let (status, body) = scripted(cancel_after, true).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let ev = events(&body);
+            assert!(ev.iter().all(|(k, _)| k != "response.completed"), "{body}");
+            let (kind, data) = ev.last().unwrap();
+            assert_eq!(kind, "response.incomplete");
+            assert_cancelled(&data["response"]);
+        }
+    }
+
+    /// The cap in force is echoed even when the caller left it to the
+    /// default, so an `incomplete` response names a limit the caller can see.
+    #[tokio::test]
+    async fn the_effective_token_cap_is_echoed() {
+        let (_, v) = post_json(
+            make_app().await,
+            json!({"model": "mock-model", "input": "hello"}),
+        )
+        .await;
+        assert_eq!(v["max_output_tokens"], default_max_tokens());
+    }
+
+    /// Refusals book their own rejection reason, apart from bodies that do
+    /// not parse.
+    #[tokio::test]
+    async fn refusals_count_as_unsupported_field() {
+        let count = || {
+            cascadia_metrics::API_REJECTED_TOTAL
+                .with_label_values(&["unsupported_field"])
+                .get()
+        };
+        let before = count();
+        let (status, _) = post_json(
+            make_app().await,
+            json!({"model": "mock-model", "input": "hi", "store": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(count() > before);
     }
 }

@@ -40,7 +40,8 @@ the chat path, so every limit and error above applies unchanged:
 `input` may also be a plain string; `instructions` becomes a system message;
 `max_output_tokens`, `temperature`, `top_p` and `reasoning.effort` map onto their chat
 counterparts, and `stream: true` sends OpenAI's event sequence (`response.created` through
-`response.completed`, or `response.incomplete` at the token cap). Cascadia keeps no state
+`response.completed`, or `response.incomplete` at the token cap and for a cancelled
+turn, whose status is `cancelled`). Cascadia keeps no state
 and serves no tools here: `store: true`, `previous_response_id`, `conversation`,
 `background`, `tools`, `include`, `prompt`, `stop`, structured `text.format`,
 `reasoning.summary`, `truncation: "auto"`, `file_id` images, `input_file` and
