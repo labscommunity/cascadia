@@ -3,7 +3,9 @@
 //! through /v1/systemone.
 use std::collections::HashSet;
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use indexmap::IndexMap;
@@ -133,9 +135,20 @@ pub enum OaAnswer {
     },
 }
 
+/// Token counts in the shape OpenAI's SDKs read. `output_tokens` is always 0: decision models do
+/// not decode.
+#[derive(Clone, Debug, Serialize)]
+pub struct OaUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct OaResponse {
+    pub id: String,
     pub answers: Vec<OaAnswer>,
+    pub usage: OaUsage,
 }
 
 fn bad(m: impl Into<String>) -> DecisionError {
@@ -304,8 +317,13 @@ pub fn to_internal(r: &OaRequest) -> Result<(DecisionRequest, Vec<OaMeta>), Deci
     Ok((req, meta))
 }
 
-/// Internal answers (request order) → OpenAI answers.
-pub fn to_openai(answers: &IndexMap<String, Answer>, meta: &[OaMeta]) -> OaResponse {
+/// Internal answers (request order) → the OpenAI response, with a fresh id and the prompt tokens
+/// the core prefilled.
+pub fn to_openai(
+    answers: &IndexMap<String, Answer>,
+    meta: &[OaMeta],
+    input_tokens: u64,
+) -> OaResponse {
     let out = meta
         .iter()
         .map(|m| match &answers[&m.name] {
@@ -354,30 +372,88 @@ pub fn to_openai(answers: &IndexMap<String, Answer>, meta: &[OaMeta]) -> OaRespo
             },
         })
         .collect();
-    OaResponse { answers: out }
+    OaResponse {
+        id: format!("dec-{}", uuid::Uuid::new_v4().simple()),
+        answers: out,
+        usage: OaUsage {
+            input_tokens,
+            output_tokens: 0,
+            total_tokens: input_tokens,
+        },
+    }
 }
 
 /// OpenAI's error envelope, which its SDKs parse into typed errors.
+fn oa_envelope(status: StatusCode, kind: &str, message: String) -> Response {
+    (
+        status,
+        Json(serde_json::json!({"error": {"message": message, "type": kind, "code": null}})),
+    )
+        .into_response()
+}
+
 fn oa_err(e: DecisionError) -> Response {
     let kind = match e {
         DecisionError::BadRequest(_) | DecisionError::TooLong(_) => "invalid_request_error",
         DecisionError::NotServed | DecisionError::Engine(_) => "server_error",
     };
-    (
-        e.status(),
-        Json(serde_json::json!({"error": {"message": e.to_string(), "type": kind, "code": null}})),
-    )
-        .into_response()
+    oa_envelope(e.status(), kind, e.to_string())
 }
 
-/// POST /v1/decisions: the OpenAI Decisions API wire format.
-pub async fn decide(State(state): State<AppState>, Json(r): Json<OaRequest>) -> Response {
+/// The first content part in `body` that `OaPart` cannot read, named for the caller. The untagged
+/// `OaContent` reports only that no variant matched, which does not say which part is at fault.
+fn bad_content_part(body: &serde_json::Value) -> Option<String> {
+    let msgs = body.get("input")?.as_array()?;
+    for part in msgs
+        .iter()
+        .filter_map(|m| m.get("content")?.as_array())
+        .flatten()
+    {
+        let Some(kind) = part.get("type") else {
+            return Some("every content part needs a \"type\"".into());
+        };
+        let Some(kind) = kind.as_str() else {
+            return Some("content part \"type\" must be a string".into());
+        };
+        let field = match kind {
+            "input_text" => "text",
+            "input_image" => "image_url",
+            other => return Some(format!("unsupported content part type '{other}'")),
+        };
+        if !part.get(field).is_some_and(serde_json::Value::is_string) {
+            return Some(format!("{kind} parts need a string \"{field}\""));
+        }
+    }
+    None
+}
+
+/// POST /v1/decisions: the OpenAI Decisions API wire format. The body is read as a JSON value and
+/// parsed here rather than by `Json<OaRequest>`, whose schema rejection is a 422 text body the
+/// SDKs do not parse; the framework's other rejections (content type, syntax, body limit) keep
+/// their status but get the envelope too.
+pub async fn decide(
+    State(state): State<AppState>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response {
+    let v = match body {
+        Ok(Json(v)) => v,
+        Err(r) => return oa_envelope(r.status(), "invalid_request_error", r.body_text()),
+    };
+    let r = match OaRequest::deserialize(&v) {
+        Ok(r) => r,
+        Err(e) => {
+            let m = bad_content_part(&v).unwrap_or_else(|| format!("invalid request body: {e}"));
+            return oa_err(bad(m));
+        }
+    };
     let (req, meta) = match to_internal(&r) {
         Ok(x) => x,
         Err(e) => return oa_err(e),
     };
     match super::handler::evaluate(&state, &req).await {
-        Ok((answers, _input_tokens)) => Json(to_openai(&answers, &meta)).into_response(),
+        Ok((answers, input_tokens)) => {
+            Json(to_openai(&answers, &meta, input_tokens)).into_response()
+        }
         Err(e) => oa_err(e),
     }
 }
@@ -523,7 +599,7 @@ mod tests {
             "urgent".to_string(),
             crate::decisions::schema::answer_from_probs(&r.questions["urgent"], &[0.2, 0.8]),
         );
-        let v = serde_json::to_value(to_openai(&answers, &meta)).unwrap();
+        let v = serde_json::to_value(to_openai(&answers, &meta, 7)).unwrap();
         // OpenAI's documented examples, reproduced exactly (confidence 0.93 and 0.55 included)
         assert_eq!(
             v["answers"][0],
@@ -543,10 +619,15 @@ mod tests {
             v["answers"][2],
             serde_json::json!({"type": "predicate", "name": "urgent", "probability": 0.8})
         );
+        assert!(v["id"].as_str().unwrap().starts_with("dec-"));
+        assert_eq!(
+            v["usage"],
+            serde_json::json!({"input_tokens": 7, "output_tokens": 0, "total_tokens": 7})
+        );
         assert_eq!(
             v.as_object().unwrap().len(),
-            1,
-            "only `answers`, as in OpenAI's responses"
+            3,
+            "only `id`, `answers` and `usage`"
         );
     }
 }
