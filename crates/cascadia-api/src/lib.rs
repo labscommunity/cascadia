@@ -4116,7 +4116,29 @@ mod tests {
         dump: Option<(std::path::PathBuf, Option<u64>)>,
         stats: Arc<ApiStats>,
     ) -> Router {
-        let runner = Runner::new(Box::new(MockBuilder::new()));
+        decision_app_on(
+            Box::new(MockBuilder::new()),
+            decisions::profile::Family::Kev,
+            codec,
+            max_tokens,
+            max_total_tokens,
+            dump,
+            stats,
+        )
+        .await
+    }
+
+    /// [`decision_app_with_codec`] on any engine, with the service's `family`.
+    async fn decision_app_on(
+        builder: Box<dyn cascadia_engine::Builder>,
+        family: decisions::profile::Family,
+        codec: Box<dyn decisions::Codec>,
+        max_tokens: usize,
+        max_total_tokens: usize,
+        dump: Option<(std::path::PathBuf, Option<u64>)>,
+        stats: Arc<ApiStats>,
+    ) -> Router {
+        let runner = Runner::new(builder);
         runner
             .start(
                 PeerLayout::single_stage(),
@@ -4126,7 +4148,7 @@ mod tests {
             .unwrap();
         let cfg = Config {
             decisions: Some(Arc::new(decisions::DecisionService {
-                family: decisions::profile::Family::Kev,
+                family,
                 codec,
                 max_tokens,
                 max_total_tokens,
@@ -5511,6 +5533,532 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{v}");
         let (status, v, _) = post_decisions(clef_app().await, body).await;
         assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
+    /// What a [`ScriptedEngine`] ran, and the logits it answers the next passes with.
+    #[derive(Clone, Default)]
+    struct Scripted {
+        seen: Arc<std::sync::Mutex<Vec<cascadia_types::DecisionReadout>>>,
+        logits: Arc<std::sync::Mutex<std::collections::VecDeque<Vec<f32>>>>,
+    }
+
+    impl Scripted {
+        fn seen(&self) -> Vec<cascadia_types::DecisionReadout> {
+            self.seen.lock().unwrap().clone()
+        }
+        fn head_ids(&self) -> Vec<Vec<u32>> {
+            self.seen()
+                .iter()
+                .map(|r| match &r.head {
+                    cascadia_types::ReadoutHead::Verbalizer { token_ids } => token_ids.clone(),
+                    h => panic!("{h:?}"),
+                })
+                .collect()
+        }
+    }
+
+    /// A decision engine that records every readout, in the order run, and answers each with the
+    /// next queued logits (the mock's `-(i)` once the queue is empty).
+    struct ScriptedEngine {
+        s: Scripted,
+        pending: std::collections::VecDeque<cascadia_types::GenerationTask>,
+    }
+
+    impl cascadia_engine::Engine for ScriptedEngine {
+        fn warmup(&mut self) {}
+        fn submit(
+            &mut self,
+            task: cascadia_types::GenerationTask,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            self.pending.push_back(task);
+            Ok(())
+        }
+        fn step(
+            &mut self,
+        ) -> Result<Vec<(cascadia_types::TaskId, Chunk)>, cascadia_engine::EngineError> {
+            let Some(task) = self.pending.pop_front() else {
+                return Ok(Vec::new());
+            };
+            let d = task.decision.clone().expect("decision tasks only");
+            self.s.seen.lock().unwrap().push(d.clone());
+            let n = d.head.output_len();
+            let logits = self
+                .s
+                .logits
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| (0..n).map(|i| -(i as f32)).collect());
+            let chunk = Chunk::final_marker(task.task_id.clone(), "")
+                .with_prompt_tokens(d.prompt_ids.len() as u32)
+                .with_finish_reason(cascadia_types::FinishReason::Stop)
+                .with_decision_logits(logits);
+            Ok(vec![(task.task_id, chunk)])
+        }
+    }
+
+    struct ScriptedBuilder(Scripted);
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for ScriptedBuilder {
+        async fn connect(
+            &mut self,
+            _peers: PeerLayout,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, cascadia_engine::EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> Result<Box<dyn cascadia_engine::Engine>, cascadia_engine::EngineError> {
+            Ok(Box::new(ScriptedEngine {
+                s: self.0,
+                pending: Default::default(),
+            }))
+        }
+    }
+
+    /// A JEV with 16 trained choice slots (A..P, ids 108..124) and the first `labels` choice
+    /// labels of A..Z, AA..ZZ (ids 1000 + i past the trained ones), unit temperature, no bias.
+    fn wide_jev_codec(
+        labels: usize,
+        strategy: decisions::profile::JevStrategy,
+        max_total: usize,
+    ) -> decisions::jev::JevCodec {
+        let az: Vec<String> = ('A'..='Z').map(String::from).collect();
+        let all: Vec<String> = az
+            .iter()
+            .cloned()
+            .chain(
+                az.iter()
+                    .flat_map(|a| az.iter().map(move |b| format!("{a}{b}"))),
+            )
+            .take(256)
+            .collect();
+        let verbalizers: Vec<String> = ["false", "true", "0", "1", "2", "3", "4", "5"]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(all[..16].iter().cloned())
+            .collect();
+        let kinds = |v: [(&str, f64); 3]| v.into_iter().map(|(k, x)| (k.to_string(), x)).collect();
+        let profile = decisions::profile::JevProfile {
+            verbalizer_ids: (100..124).collect(),
+            bias: vec![0.0; 24],
+            verbalizers,
+            slots: [("noul", [0, 2]), ("score", [2, 8]), ("choice", [8, 24])]
+                .into_iter()
+                .map(|(k, r)| (k.to_string(), r))
+                .collect(),
+            temperature: kinds([("noul", 1.0), ("score", 1.0), ("choice", 1.0)]),
+            choice_labels: all[..labels].to_vec(),
+            choice_label_ids: (0..labels as u32)
+                .map(|i| if i < 16 { 108 + i } else { 1000 + i })
+                .collect(),
+            strategy,
+        };
+        decisions::jev::JevCodec::new(char_tokenizer(), profile)
+            .unwrap()
+            .with_pass_cap(4000)
+            .with_total_cap(max_total)
+    }
+
+    async fn wide_jev_app(
+        s: &Scripted,
+        labels: usize,
+        strategy: decisions::profile::JevStrategy,
+        max_total: usize,
+        dump: Option<std::path::PathBuf>,
+    ) -> Router {
+        decision_app_on(
+            Box::new(ScriptedBuilder(s.clone())),
+            decisions::profile::Family::Jev,
+            Box::new(wide_jev_codec(labels, strategy, max_total)),
+            4000,
+            max_total,
+            dump.map(|d| (d, None)),
+            Default::default(),
+        )
+        .await
+    }
+
+    /// A `/v1/systemone` body: choice `q` over o0..o{n-1} (descriptions `d0`..), then a noul,
+    /// with a top-level `strategy` unless it is empty.
+    fn wide_body(n: usize, strategy: &str) -> String {
+        let criteria: Vec<String> = (0..n).map(|i| format!(r#""o{i}": "d{i}""#)).collect();
+        let strategy = match strategy {
+            "" => String::new(),
+            s => format!(r#""strategy": "{s}", "#),
+        };
+        format!(
+            r#"{{"model": "m", "state": "S", {strategy}"questions": {{
+              "q": {{"type": "choice", "instructions": "Which team should handle this ticket?", "criteria": {{{}}}}},
+              "u": {{"type": "noul", "instructions": "U"}}}}}}"#,
+            criteria.join(", ")
+        )
+    }
+
+    /// The same question on `/v1/decisions`.
+    fn wide_openai_body(n: usize, strategy: &str) -> String {
+        let choices: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"value": "o{i}", "description": "d{i}"}}"#))
+            .collect();
+        let strategy = match strategy {
+            "" => String::new(),
+            s => format!(r#""strategy": "{s}", "#),
+        };
+        format!(
+            r#"{{"input": "S", {strategy}"questions": [
+              {{"type": "choice", "name": "q", "instructions": "Which team should handle this ticket?", "choices": [{}]}},
+              {{"type": "predicate", "name": "u", "instructions": "U"}}]}}"#,
+            choices.join(", ")
+        )
+    }
+
+    #[tokio::test]
+    async fn jev_sixteen_options_are_unchanged_by_labels_and_strategy() {
+        // Up to the trained slots nothing changes: the same passes and the same answers as a
+        // profile without labels (today's behaviour), whatever the strategy asked for.
+        use decisions::profile::JevStrategy;
+        let old = Scripted::default();
+        let (status, _, want) = post_decisions(
+            wide_jev_app(&old, 0, JevStrategy::Single, 16000, None).await,
+            &wide_body(16, ""),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{want}");
+        let (_, want_oa) = post_openai(
+            wide_jev_app(&Scripted::default(), 0, JevStrategy::Single, 16000, None).await,
+            &wide_openai_body(16, ""),
+        )
+        .await;
+        for s in ["", "auto", "single", "tournament", "permute"] {
+            let wide = Scripted::default();
+            let app = wide_jev_app(&wide, 256, JevStrategy::Tournament, 16000, None).await;
+            let (status, _, got) = post_decisions(app, &wide_body(16, s)).await;
+            assert_eq!(status, StatusCode::OK, "{got}");
+            assert_eq!(got, want, "{s}: byte for byte");
+            assert_eq!(wide.seen().len(), 2, "{s}: one pass per question");
+            for (a, b) in wide.seen().iter().zip(old.seen()) {
+                assert_eq!(a.prompt_ids, b.prompt_ids, "{s}");
+                assert_eq!(a.head, b.head, "{s}");
+            }
+            let app = wide_jev_app(
+                &Scripted::default(),
+                256,
+                JevStrategy::Tournament,
+                16000,
+                None,
+            )
+            .await;
+            let (status, got_oa) = post_openai(app, &wide_openai_body(16, s)).await;
+            assert_eq!(status, StatusCode::OK, "{got_oa}");
+            assert_eq!(got_oa["answers"], want_oa["answers"], "{s}");
+            assert_eq!(got_oa["usage"], want_oa["usage"], "{s}");
+        }
+    }
+
+    /// ln(p), with -1e30 for p = 0 (finite: the handler refuses non-finite logits).
+    fn ln_logits(p: &[f64]) -> Vec<f32> {
+        p.iter()
+            .map(|&x| if x == 0.0 { -1e30 } else { x.ln() as f32 })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn jev_twenty_option_tournament_runs_two_groups_then_a_final() {
+        // Task 36's hand-computed tournament: group 0 ties options 2 and 5, group 1's winner is
+        // 13, the final over 0..16 gives 2 → 0.5, 13 → 0.25, 5 and 0 → 0.125. With unit
+        // temperature and no bias, logits ln(p) give exactly those passes.
+        use decisions::profile::JevStrategy;
+        let mut g0 = vec![0.05; 10];
+        g0[2] = 0.3;
+        g0[5] = 0.3;
+        let mut g1 = vec![0.05; 10];
+        g1[3] = 0.55;
+        let mut fin = vec![0.0; 16];
+        fin[2] = 0.5;
+        fin[13] = 0.25;
+        fin[5] = 0.125;
+        fin[0] = 0.125;
+        let mut want = vec![0.0; 20];
+        want[2] = 0.475;
+        want[13] = 0.2375;
+        want[5] = 0.11875;
+        want[0] = 0.11875;
+        for w in &mut want[16..] {
+            *w = 0.0125;
+        }
+        for route in ["systemone", "openai"] {
+            let s = Scripted::default();
+            s.logits.lock().unwrap().extend([
+                ln_logits(&g0),
+                ln_logits(&g1),
+                vec![0.0, -1.0], // the noul, run between the groups and the final
+                ln_logits(&fin),
+            ]);
+            // The profile's default (single) is overridden by the request.
+            let app = wide_jev_app(&s, 256, JevStrategy::Single, 16000, None).await;
+            let probs: Vec<f64> = if route == "systemone" {
+                let (status, v, _) = post_decisions(app, &wide_body(20, "tournament")).await;
+                assert_eq!(status, StatusCode::OK, "{v}");
+                let q = &v["answers"]["q"];
+                assert_eq!(q["choice"], "o2");
+                assert!(close(&q["confidence"], (0.475 - 0.05) / 0.95), "{q}");
+                assert!(close(&v["answers"]["u"]["noul"], 0.2689), "{v}");
+                let p = q["probabilities"].as_object().unwrap();
+                let keys: Vec<&String> = p.keys().collect();
+                assert_eq!(keys[0], "o0", "request order");
+                (0..20)
+                    .map(|i| p[&format!("o{i}")].as_f64().unwrap())
+                    .collect()
+            } else {
+                let (status, v) = post_openai(app, &wide_openai_body(20, "tournament")).await;
+                assert_eq!(status, StatusCode::OK, "{v}");
+                assert_eq!(v["answers"][0]["choice"], "o2");
+                v["answers"][0]["probabilities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x["probability"].as_f64().unwrap())
+                    .collect()
+            };
+            for (o, (got, w)) in probs.iter().zip(&want).enumerate() {
+                assert!((got - w).abs() < 1e-4, "{route} option {o}: {got} vs {w}");
+            }
+            // Two group passes and the noul in round 1, then the final: 2 + 1 choice passes,
+            // each on the trained slots.
+            let ids = s.head_ids();
+            assert_eq!(ids.len(), 4, "{route}");
+            assert_eq!(ids[0], (108..118).collect::<Vec<u32>>());
+            assert_eq!(ids[1], (108..118).collect::<Vec<u32>>());
+            assert_eq!(ids[2], vec![100, 101]);
+            assert_eq!(ids[3], (108..124).collect::<Vec<u32>>());
+            let fin_text: String = s.seen()[3]
+                .prompt_ids
+                .iter()
+                .map(|&i| i as u8 as char)
+                .collect();
+            assert!(
+                fin_text.contains("\nA) o0: d0\n") && fin_text.contains("\nP) o15: d15\n"),
+                "{fin_text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn jev_twenty_option_permute_and_single_pass_counts() {
+        use decisions::profile::JevStrategy;
+        let label_ids: Vec<u32> = (108..124).chain(1016..1020).collect();
+        // permute: four passes over all 20 labels, and a distribution over all 20 options.
+        let s = Scripted::default();
+        let app = wide_jev_app(&s, 256, JevStrategy::Single, 16000, None).await;
+        let (status, v, _) = post_decisions(app, &wide_body(20, "permute")).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let ids = s.head_ids();
+        assert_eq!(ids.len(), 5, "4 permute passes and the noul");
+        for (i, pass) in ids[..4].iter().enumerate() {
+            assert_eq!(pass, &label_ids, "pass {i}");
+        }
+        // Each pass reads -(i) by position, so option o gets the mean of its four positions'
+        // probabilities: serve_decide's permute combination of those passes.
+        let codec = wide_jev_codec(256, JevStrategy::Single, 16000);
+        let decisions::jev::ChoicePlan::Permute { orders } = codec.plan_choice(
+            20,
+            JevStrategy::Permute,
+            "Which team should handle this ticket?",
+        ) else {
+            panic!()
+        };
+        let pass =
+            codec.choice_pass_probabilities(&(0..20).map(|i| -(i as f32)).collect::<Vec<_>>());
+        let want = decisions::jev::combine_permute(&orders, &vec![pass; 4]);
+        let p = v["answers"]["q"]["probabilities"].as_object().unwrap();
+        assert_eq!(p.len(), 20);
+        for (o, w) in want.iter().enumerate() {
+            assert!(close(&p[&format!("o{o}")], *w), "option {o}: {v}");
+        }
+        // single (the profile's default here): one pass with 20 label ids.
+        let s = Scripted::default();
+        let app = wide_jev_app(&s, 256, JevStrategy::Single, 16000, None).await;
+        let (status, v, _) = post_decisions(app, &wide_body(20, "")).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let ids = s.head_ids();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], label_ids);
+        // mock logits -(i): the first option wins
+        assert_eq!(v["answers"]["q"]["choice"], "o0");
+    }
+
+    #[tokio::test]
+    async fn strategy_is_for_jev_only() {
+        for app in [make_decision_app().await, clef_app().await] {
+            let (status, v, _) = post_decisions(
+                app,
+                r#"{"model": "m", "state": "s", "strategy": "single", "questions": {"u": {"type": "noul"}}}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+            assert_eq!(v["error"], "strategy applies to JEV only");
+        }
+        let (status, v) = post_openai(
+            make_decision_app().await,
+            r#"{"input": "s", "strategy": "tournament", "questions": [{"type": "predicate", "name": "u", "instructions": "x"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"]["message"], "strategy applies to JEV only");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        // "auto" (and null) mean "the profile's default", which every family has.
+        for strategy in [r#""auto""#, "null"] {
+            for app in [make_decision_app().await, clef_app().await] {
+                let (status, v, _) = post_decisions(
+                    app,
+                    &format!(
+                        r#"{{"model": "m", "state": "s", "strategy": {strategy}, "questions": {{"u": {{"type": "noul"}}}}}}"#
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{v}");
+            }
+        }
+        // Not a strategy at all: a schema error, like an unknown question type.
+        let (status, v) = post_openai(
+            jev_app().await,
+            r#"{"input": "s", "strategy": "vote", "questions": [{"type": "predicate", "name": "u", "instructions": "x"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown variant"),
+            "{v}"
+        );
+        let (status, _, _) = post_decisions(
+            jev_app().await,
+            r#"{"model": "m", "state": "s", "strategy": "vote", "questions": {"u": {"type": "noul"}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn an_over_budget_tournament_is_413_before_any_engine_call() {
+        // The final is counted as its worst case up front: a budget that covers round 1 but
+        // not that final refuses the request with nothing run.
+        use decisions::profile::JevStrategy;
+        let body = wide_body(20, "tournament");
+        let req: decisions::schema::DecisionRequest = serde_json::from_str(&body).unwrap();
+        let (passes, reserve) = decisions::Codec::encode_rounds(
+            &wide_jev_codec(256, JevStrategy::Single, usize::MAX),
+            &req,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(passes.len(), 3, "two groups and the noul");
+        let round1: usize = passes.iter().map(|p| p.readout.prompt_ids.len()).sum();
+        let s = Scripted::default();
+        let app = wide_jev_app(&s, 256, JevStrategy::Single, round1 + reserve - 1, None).await;
+        let (status, v, _) = post_decisions(app, &body).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("{}", round1 + reserve)),
+            "{v}"
+        );
+        assert!(s.seen().is_empty(), "no engine call");
+        let s = Scripted::default();
+        let app = wide_jev_app(&s, 256, JevStrategy::Single, round1 + reserve, None).await;
+        let (status, v, _) = post_decisions(app, &body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(s.seen().len(), 4);
+        // The real final fits its reserve.
+        assert!(s.seen()[3].prompt_ids.len() <= reserve);
+        let (status, v) = post_openai(
+            wide_jev_app(
+                &Scripted::default(),
+                256,
+                JevStrategy::Single,
+                round1 + reserve - 1,
+                None,
+            )
+            .await,
+            &wide_openai_body(20, "tournament"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+    }
+
+    #[tokio::test]
+    async fn dump_lines_of_jev_choice_passes_name_their_strategy_and_round() {
+        use decisions::profile::JevStrategy;
+        let path = std::env::temp_dir().join(format!(
+            "decision-dump-wide-{}-{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let app = wide_jev_app(
+            &Scripted::default(),
+            256,
+            JevStrategy::Tournament,
+            16000,
+            Some(path.clone()),
+        )
+        .await;
+        let (status, v, _) = post_decisions(app.clone(), &wide_body(20, "")).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let (status, v, _) = post_decisions(app, &wide_body(3, "")).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let lines: Vec<Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let tags: Vec<(Value, Value, Value)> = lines
+            .iter()
+            .map(|l| {
+                (
+                    l["parts"][0][0].clone(),
+                    l["strategy"].clone(),
+                    l["round"].clone(),
+                )
+            })
+            .collect();
+        let t = |q: &str, s: Option<&str>, r: Option<u64>| {
+            (
+                Value::from(q),
+                s.map_or(Value::Null, Value::from),
+                r.map_or(Value::Null, Value::from),
+            )
+        };
+        assert_eq!(
+            tags,
+            [
+                t("q", Some("tournament"), Some(1)),
+                t("q", Some("tournament"), Some(1)),
+                t("u", None, None),
+                t("q", Some("tournament"), Some(2)),
+                t("q", Some("native"), Some(1)),
+                t("u", None, None),
+            ]
+        );
+        // Every line keeps the shape the parity tools read.
+        for l in &lines {
+            assert!(
+                l["readout"]["prompt_ids"].is_array() && l["parts"][0][2].is_u64(),
+                "{l}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A router whose model carries a (minimal) tools-capable chat template.
