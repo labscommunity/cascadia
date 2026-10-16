@@ -71,3 +71,82 @@ def records(n=50):
         out.append({"id": f"r{i:02d}", "state": STATES[i % len(STATES)],
                     "questions": QUESTION_SETS[(i * 7 + i // len(STATES)) % len(QUESTION_SETS)]})
     return out
+
+
+# ---------------------------------------------------------------------------------------------
+# Wide JEV choices (Task 38): choice questions past JEV's 16 trained slots, kept apart from the 50
+# parity records above (whose saved spike references cover only those). Four requests of 17, 24,
+# 40 + 100 and 256 options, each asked once per multi-pass strategy: 12 records, 21 questions.
+# Native questions ride along, so a request mixes native and multi-pass lines in its dump.
+
+WIDE_STRATEGIES = ("single", "tournament", "permute")
+
+PRODUCT = {"type": "choice", "instructions": "Which product is this ticket about?", "criteria": {
+    "checking": "Everyday checking account.", "savings": "Savings and deposit accounts.",
+    "debit_card": "Debit cards and PINs.", "credit_card": "Credit cards, limits and statements.",
+    "mortgage": "Home loans and remortgages.", "personal_loan": "Unsecured personal loans.",
+    "auto_loan": "Car and vehicle finance.", "student_loan": "Student and education loans.",
+    "business_account": "Accounts for companies and sole traders.", "payroll": "Payroll and salary runs.",
+    "fx_transfer": "Foreign currency transfers and exchange rates.", "wire": "Domestic and international wires.",
+    "mobile_app": "The mobile banking app.", "online_banking": "The web banking site.",
+    "insurance": "Home, travel and life insurance.", "investments": "Brokerage and investment funds.",
+    "pension": "Retirement and pension plans."}}
+
+AIRPORTS = ["KTM", "DEL", "BOM", "DXB", "DOH", "IST", "LHR", "CDG", "FRA", "AMS", "ZRH", "VIE",
+            "JFK", "ORD", "SFO", "LAX", "YYZ", "GRU", "NRT", "HND", "ICN", "SIN", "BKK", "SYD"]
+CITIES = ["Kathmandu", "Delhi", "Mumbai", "Dubai", "Doha", "Istanbul", "London", "Paris", "Frankfurt",
+          "Amsterdam", "Zurich", "Vienna", "New York", "Chicago", "San Francisco", "Los Angeles", "Toronto",
+          "Sao Paulo", "Tokyo Narita", "Tokyo Haneda", "Seoul", "Singapore", "Bangkok", "Sydney"]
+DESTINATION = {"type": "choice", "instructions": "Which airport is the traveller flying to?",
+               "criteria": {code: f"{city} airport." for code, city in zip(AIRPORTS, CITIES)}}
+
+COUNTRIES = ["Nepal", "India", "Bangladesh", "Bhutan", "Sri Lanka", "Pakistan", "China", "Japan",
+             "South Korea", "Vietnam", "Thailand", "Malaysia", "Singapore", "Indonesia", "Philippines",
+             "Australia", "New Zealand", "United Arab Emirates", "Qatar", "Saudi Arabia", "Turkey", "Egypt",
+             "Kenya", "Nigeria", "South Africa", "Morocco", "United Kingdom", "Ireland", "France", "Germany",
+             "Netherlands", "Spain", "Portugal", "Italy", "Poland", "Sweden", "Canada", "United States",
+             "Mexico", "Brazil"]
+# null instructions: the prompt shows the question id and the permute seed is the id
+COUNTRY = {"type": "choice", "instructions": None, "criteria": {c.lower().replace(" ", "_"): c for c in COUNTRIES}}
+
+LANGUAGES = ["Nepali", "Hindi", "Bengali", "Urdu", "Punjabi", "Marathi", "Gujarati", "Tamil", "Telugu",
+             "Kannada", "Malayalam", "Odia", "Assamese", "Sinhala", "Maithili", "Bhojpuri", "Newari", "Tibetan",
+             "Dzongkha", "Burmese", "Thai", "Lao", "Khmer", "Vietnamese", "Malay", "Indonesian", "Javanese",
+             "Sundanese", "Tagalog", "Cebuano", "Mandarin", "Cantonese", "Hakka", "Japanese", "Korean",
+             "Mongolian", "Kazakh", "Uzbek", "Kyrgyz", "Tajik", "Turkmen", "Pashto", "Dari", "Persian",
+             "Kurdish", "Arabic", "Hebrew", "Turkish", "Azerbaijani", "Armenian", "Georgian", "Russian",
+             "Ukrainian", "Belarusian", "Polish", "Czech", "Slovak", "Slovenian", "Croatian", "Serbian",
+             "Bosnian", "Macedonian", "Bulgarian", "Romanian", "Hungarian", "Greek", "Albanian", "Italian",
+             "Spanish", "Catalan", "Basque", "Galician", "Portuguese", "French", "Breton", "German", "Dutch",
+             "Frisian", "Danish", "Swedish", "Norwegian", "Icelandic", "Finnish", "Estonian", "Latvian",
+             "Lithuanian", "Irish", "Welsh", "Scottish Gaelic", "English", "Swahili", "Amharic", "Somali",
+             "Yoruba", "Igbo", "Hausa", "Zulu", "Xhosa", "Afrikaans", "Malagasy"]
+LANGUAGE = {"type": "choice", "instructions": "Which language should the reply be written in?",
+            "criteria": {lang.lower().replace(" ", "_"): "" for lang in LANGUAGES}}
+
+TEAMS = ["billing", "cards", "fraud", "accounts", "loans", "mortgages", "payments", "fx", "app", "web",
+         "security", "compliance", "complaints", "business", "wealth", "insurance"]
+REGIONS = ["nepal", "india", "gulf", "uk", "ireland", "france", "germany", "benelux", "nordics", "iberia",
+           "italy", "us_east", "us_west", "canada", "latam", "apac"]
+QUEUE = {"type": "choice", "instructions": "Which support queue should receive this ticket?",
+         "criteria": {f"{t}_{r}": "" for t in TEAMS for r in REGIONS}}
+
+WIDE_CASES = [
+    ("w0", "My credit card statement shows an annual fee I was told would be waived.",
+     {"team": ROUTING, "product": PRODUCT}),
+    ("w1", {"traveller": "Asha Gurung", "booking": "PNR 7XK2QD", "message": "Please rebook me onto tomorrow's "
+            "first flight; my connection through Doha was cancelled.", "loyalty_tier": "gold"},
+     {"destination": DESTINATION, "urgent": URGENT}),
+    ("w2", "Bonjour, je n'arrive pas a me connecter a l'application depuis Lyon depuis hier soir.",
+     {"country": COUNTRY, "language": LANGUAGE}),
+    ("w3", "Business customer in Toronto: two payroll transfers to our staff in Mexico were rejected today.",
+     {"queue": QUEUE}),
+]
+
+
+def _wide_records():
+    return [{"id": f"{cid}-{s}", "state": state, "strategy": s, "questions": qs}
+            for cid, state, qs in WIDE_CASES for s in WIDE_STRATEGIES]
+
+
+WIDE_RECORDS = _wide_records()

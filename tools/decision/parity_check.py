@@ -4,6 +4,8 @@
   python tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref ref.json        # gate: raw >= 96% and no flip with reference margin >= 0.05
   python tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref ref.json --answers-out single.json   # also save this run's answers (only on PASS)
   python tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref single.json --min-agree 0 --confident 0.05  # pipeline vs single box
+  python tools/decision/parity_check.py --url http://127.0.0.1:8080 --dump d.jsonl --wide       # JEV choices past 16: slice d.wide.parity.jsonl
+  python tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref wide_ref.json --wide  # gate them (reference_stream.py --wide)
 
 Against another server's saved answers (a pipeline tree against its single box), the two runs take
 different numeric paths, so a question the single box itself answered on a near-tie can flip on
@@ -28,8 +30,8 @@ import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
-from codec_golden import align, write_private
-from records import records
+from codec_golden import align, request_body, write_private
+from records import WIDE_RECORDS, records
 
 
 def answer_probs(ans):
@@ -70,8 +72,7 @@ def max_abs_delta(ref, results):
 
 def systemone(url, rec):
     """POST one record to /v1/systemone; a non-2xx reply exits with the server's message."""
-    body = json.dumps({"model": "m", "state": rec["state"], "questions": rec["questions"]}).encode()
-    req = urllib.request.Request(url + "/v1/systemone", data=body, headers={"content-type": "application/json"})
+    req = urllib.request.Request(url + "/v1/systemone", data=request_body(rec), headers={"content-type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=1800) as r:
             return json.load(r)
@@ -113,9 +114,9 @@ def tally(ref, results):
     return per_type, agree, total, flips
 
 
-def parity_slice(dump):
-    """Where a no-ref run writes its own passes: d.jsonl -> d.parity.jsonl."""
-    return Path(dump).with_suffix(".parity.jsonl")
+def parity_slice(dump, wide=False):
+    """Where a no-ref run writes its own passes: d.jsonl -> d.parity.jsonl (--wide: d.wide.parity.jsonl)."""
+    return Path(dump).with_suffix(".wide.parity.jsonl" if wide else ".parity.jsonl")
 
 
 def answers_ref(results):
@@ -137,10 +138,10 @@ def save_answers(path, results, force=False):
     print(f"saved {len(ref)} answers to {path}")
 
 
-def drive_and_slice(url, dump, force=False, answers_out=None):
-    """POST the 50 records and write exactly the dump bytes they added to parity_slice(dump),
-    then check the slice aligns with the records (one run, nothing else)."""
-    out = parity_slice(dump)
+def drive_and_slice(url, dump, force=False, answers_out=None, wide=False):
+    """POST the 50 records (WIDE_RECORDS with `wide`) and write exactly the dump bytes they added to
+    parity_slice(dump), then check the slice aligns with the records (one run, nothing else)."""
+    out = parity_slice(dump, wide)
     if out.exists() and not force:
         raise SystemExit(f"{out} exists; pass --force to overwrite it")
     if answers_out and Path(answers_out).exists() and not force:
@@ -148,7 +149,7 @@ def drive_and_slice(url, dump, force=False, answers_out=None):
     if not Path(dump).exists():
         raise SystemExit(f"{dump} does not exist: start the server with --decision-dump {dump}")
     start = Path(dump).stat().st_size
-    recs = records()
+    recs = WIDE_RECORDS if wide else records()
     results = [(rec, systemone(url, rec)) for rec in recs]
     write_private(out, Path(dump).read_bytes()[start:].decode(), force=force)
     passes = sum(len(ps) for _, ps in align(str(out), recs))
@@ -164,6 +165,9 @@ def main(argv=None):
     ap.add_argument("--ref", default=None, help="omit to only drive the server and slice its --decision-dump (needs --dump)")
     ap.add_argument("--dump", default=None, help="the server's --decision-dump file (same machine); required without --ref")
     ap.add_argument("--force", action="store_true", help="overwrite an existing <dump>.parity.jsonl")
+    ap.add_argument("--wide", action="store_true",
+                    help="drive WIDE_RECORDS (JEV choices past the trained slots, each strategy; 12 records, 21 "
+                         "questions) instead of the 50; the slice is <dump>.wide.parity.jsonl; same gate")
     ap.add_argument("--min-agree", type=float, default=0.96, help="raw top-1 agreement floor (0.96 = at most 3 flips of 82)")
     ap.add_argument("--confident", type=float, default=0.05, help="a flip where the reference margin is >= this fails the gate")
     ap.add_argument("--answers-out", default=None,
@@ -175,13 +179,13 @@ def main(argv=None):
     if not a.ref:
         if not a.dump:
             ap.error("without --ref, pass --dump (the server's --decision-dump) so this run's passes are sliced out")
-        drive_and_slice(url, a.dump, a.force, a.answers_out)
+        drive_and_slice(url, a.dump, a.force, a.answers_out, a.wide)
         return
     if a.answers_out and Path(a.answers_out).exists() and not a.force:
         raise SystemExit(f"{a.answers_out} exists; pass --force to overwrite it")
     with open(a.ref) as f:
         ref = json.load(f)
-    results = [(rec, systemone(url, rec)) for rec in records()]
+    results = [(rec, systemone(url, rec)) for rec in (WIDE_RECORDS if a.wide else records())]
     per_type, agree, total, flips = tally(ref, results)
     for key, kind, m, got, want in flips:
         note = "" if m >= a.confident else " (near-tie, informational)"
