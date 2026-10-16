@@ -394,6 +394,9 @@ pub struct Qwen36Builder {
 /// prompt's image token ids (`crate::qwen35_vision`).
 struct VisionRuntime {
     encoder: crate::qwen35_vision::encoder::VisionEncoder,
+    /// Encoded images by content hash (metadata: `grid_thw`), so a chat's
+    /// earlier images are not re-encoded every turn.
+    cache: crate::image_cache::EncodeCache<[u32; 3]>,
     preprocess: crate::qwen35_vision::PreprocessConfig,
     image_pad: u32,
     video_pad: u32,
@@ -442,6 +445,7 @@ impl VisionRuntime {
         };
         Ok(Some(Self {
             encoder: crate::qwen35_vision::encoder::VisionEncoder::load(dir, device, plugin, vc)?,
+            cache: crate::image_cache::EncodeCache::from_env(),
             preprocess,
             image_pad: id("image_token_id")?,
             video_pad: id("video_token_id")?,
@@ -1247,11 +1251,17 @@ impl Qwen36Engine {
              re-export it with the vision IRs",
         )?;
         let mut images = Vec::with_capacity(task.media.len());
+        let mut from_cache = 0;
         for (i, m) in task.media.iter().enumerate() {
             match m.kind {
                 cascadia_types::MediaKind::Image => {}
                 #[allow(unreachable_patterns)]
                 other => return Err(format!("media {i}: {other:?} is not supported")),
+            }
+            if let Some((rows, grid)) = v.cache.get(&m.sha256) {
+                images.push((rows, grid, m.sha256));
+                from_cache += 1;
+                continue;
             }
             let p = crate::qwen35_vision::preprocess(
                 &[&m.pixels[..]],
@@ -1264,8 +1274,10 @@ impl Qwen36Engine {
                 .encoder
                 .encode(&p)
                 .map_err(|e| format!("image {i}: {e}"))?;
+            v.cache.put(m.sha256, &rows, p.grid_thw);
             images.push((rows, p.grid_thw, m.sha256));
         }
+        v.cache.report(from_cache, task.media.len());
         crate::qwen35_vision::prompt::VisionPrompt::new(
             prompt_ids,
             v.image_pad,

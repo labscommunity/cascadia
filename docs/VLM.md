@@ -144,6 +144,8 @@ needs RAM for both the decode and prefill IRs of every stage it holds.
   1000 pixels). The counts match Hugging Face's processor for the same request.
 - Packed slots: a prompt must fit one slot's region, `(context - 1 - packed_prefix) /
   slots`; two Pixtral images do not fit two slots of a 2048 context.
-- Turns with images skip KV warm-resume and capture, and most paths re-encode and
-  re-prefill an image on every turn; only the single-box `qwen35` prefix cache keys on the
-  image itself.
+- Rank 0 keeps each encoded image (keyed on a hash of its pixels) so a chat's earlier
+  images are not re-encoded every turn: `CASCADIA_IMAGE_CACHE_MB` per vision front end,
+  default 256, 0 to disable. The language model still re-prefills them: turns with images
+  skip KV warm-resume and capture, and only the single-box `qwen35` prefix cache keys on
+  the image itself.
