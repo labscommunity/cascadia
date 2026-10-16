@@ -134,7 +134,8 @@ The OpenAI request is translated into the internal (SystemOne) form before the m
   literal (`2` → `"2"`, `1e5` → `"100000.0"`, `1e20` → `"1e+20"`, a 30-digit integer → all 30
   digits); a missing description is `null`. `-0` is the integer `0`, keyed `"0"` as Python's
   `json.loads("-0")` is, so `0` and `-0` are duplicates; `-0.0` is a float, keyed `"-0.0"`. The
-  answer echoes the value as sent, every digit included.
+  answer echoes the same JSON number: an integer with every digit, a float in serde_json's shortest
+  form (`1E2` comes back as `100.0`, `2.50` as `2.5`), which parses to the same value.
 - **Score levels are rendered as one text per level**, `"label: description"`, or just `"label"`
   when the description is missing or empty, before the codec sees them. This approximates the single-text
   levels the models were trained on; nothing in the reference implementations says which form
@@ -242,13 +243,17 @@ the handler runs, with its default 4xx text body rather than this shape.
 
 ## Status codes
 
-Both routes share these statuses.
+Both routes share these statuses. Request-body errors differ by route (see each route's Errors
+section): the OpenAI route answers all of them in its envelope, `/v1/systemone` with the
+framework's plain-text body.
 
 | Status | When |
 |---|---|
 | 200 | Every question answered. |
-| 400 | Validation: no questions or more than `max_questions`; an empty question name, or (OpenAI format) a duplicate question name or choice value; a choice with no options or more than the model allows; a score with fewer levels than the model allows (2 for JEV, 1 for Kev and Clef) or more; images; an image part, or a text part without a string `text`, in a list `state` (JEV); a request the tokenizer cannot encode; Clef's option cap (see [Limits](#limits)). |
-| 413 | Too long: the state is more than `max_total_tokens × 8` bytes (checked before tokenizing); Kev's whole rendered text (state, instructions, options and levels) is more than `max_total_tokens × 8` bytes; Kev's rendered state is more than 524,288 bytes (65,536 × 8, checked before tokenizing); one Kev question's instructions and option texts render to more than 8 bytes per token the pass has left after the state (`max_tokens` minus the state's tokens, checked before tokenizing); Kev's state is more than 65,536 tokens (`SERVE_MAX_STATE`, `<state>` included) or reaches `max_tokens`; one pass is longer than `max_tokens` (JEV and Kev; Clef truncates the state instead); Clef's schema alone fills the joint pass, leaving no room for a non-empty state; the request's prefill work is more than `max_total_tokens` (JEV stops tokenizing at the first question that takes it over: `needs at least N`); a Kev request that needs the shared-state discount when the prefix cache can never hold that state (`this request needs N prefill tokens without prefix reuse (the shared prefix cannot fit the prefix cache); the per-request limit is M`, refused before any prefill once the engine knows the snapshot's size, which its warmup measures at startup; see [Limits](#limits) for when the first such request can still spend one pass); or the engine reports the prompt too long. |
+| 400 | A body that is not valid JSON; on the OpenAI route, also a body that does not match the request schema (a missing `questions`, an unknown question `type`, a repeated key). Validation: no questions or more than `max_questions`; an empty question name, or (OpenAI format) a duplicate question name or choice value; a choice with no options or more than the model allows; a score with fewer levels than the model allows (2 for JEV, 1 for Kev and Clef) or more; images; an image part, or a text part without a string `text`, in a list `state` (JEV); a request the tokenizer cannot encode; Clef's option cap (see [Limits](#limits)). |
+| 413 | The body is over `--api-max-body-mb`. Too long: the state is more than `max_total_tokens × 8` bytes (checked before tokenizing); Kev's whole rendered text (state, instructions, options and levels) is more than `max_total_tokens × 8` bytes; Kev's rendered state is more than 524,288 bytes (65,536 × 8, checked before tokenizing); one Kev question's instructions and option texts render to more than 8 bytes per token the pass has left after the state (`max_tokens` minus the state's tokens, checked before tokenizing); Kev's state is more than 65,536 tokens (`SERVE_MAX_STATE`, `<state>` included) or reaches `max_tokens`; one pass is longer than `max_tokens` (JEV and Kev; Clef truncates the state instead); Clef's schema alone fills the joint pass, leaving no room for a non-empty state; the request's prefill work is more than `max_total_tokens` (JEV stops tokenizing at the first question that takes it over: `needs at least N`); a Kev request that needs the shared-state discount when the prefix cache can never hold that state (`this request needs N prefill tokens without prefix reuse (the shared prefix cannot fit the prefix cache); the per-request limit is M`, refused before any prefill once the engine knows the snapshot's size, which its warmup measures at startup; see [Limits](#limits) for when the first such request can still spend one pass); or the engine reports the prompt too long. |
+| 415 | The request lacks `content-type: application/json`. |
+| 422 | `/v1/systemone` only: valid JSON that does not match the request schema (the OpenAI route answers 400 instead). |
 | 501 | The model serves no decisions: no `decision.json` (or one that fails its load checks; see the startup log), an engine other than `qwen35`, the engine has no decision head (`decision/` missing on the single box or the pipeline's last rank), the tree was exported without `--final-hidden` (Kev and Clef), or a pipeline rank cannot serve decision passes (an older build, rank 0 or the last rank without `config.json` `vocab_size`, or the last rank without `decision/`; a middle rank only relays and needs neither). Rank 0 refuses the pipeline cases before any prefill. |
 | 503 | The server is at capacity (`engine at capacity; retry after current requests complete`): every concurrency permit is taken, or a Kev pass that must resume its shared state from the prefix cache found the snapshot evicted by other requests (see [Limits](#limits)); retrying can succeed. Any other engine error is `decision engine error`, including non-finite logits or probabilities (never a 200 with `null`s). Decisions share the API's concurrency permits with chat requests. |
 
@@ -286,7 +291,7 @@ Error messages are deliberately terse:
   engine's own limits is a 400 or 413 rather than a 503. Calibration values must keep
   `(logit + bias) / temperature` finite: every JEV and Kev `temperature` in [0.001, 1000] and
   every JEV `bias` in [-10,000, 10,000] (shipped profiles use temperatures near 1 and biases of a
-  few units). A profile that fails these checks
+  few tenths). A profile that fails these checks
   disables decisions with a startup warning. The startup log names the family and the
   effective limits.
 - **Clef truncates the state to fit `max_tokens`** (as Cloudflare's `encode_record` does), so a
@@ -302,9 +307,10 @@ Error messages are deliberately terse:
   prefill. The joint head runs where the final hidden rows are (the single box, or the last
   pipeline rank), so the hidden input never crosses the wire: pipeline prefill sends 256-token
   chunks (5 MiB at width 5120), far under the transport's 256 MiB frame cap. In a mixed
-  pipeline whose last rank predates this limit, that rank still refuses a Clef-27B readout over
-  13,107 tokens with the same 413 (`decision_too_long`), but only after the chain prefill: rank
-  0 cannot tell from HELLO which limit the last rank holds. The wire format is unchanged. The request-level `max_total_tokens` byte pre-check still applies to every family.
+  pipeline whose last rank predates this limit, that rank refuses a Clef-27B readout over 13,107
+  tokens only after the chain prefill, because rank 0 cannot tell from HELLO which limit the last
+  rank holds. A last rank from commit fd87d505 onward refuses it with the same 413
+  (`decision_too_long`); an older one fails it in the native shim, which is a 503. The wire format is unchanged. The request-level `max_total_tokens` byte pre-check still applies to every family.
 - **JEV and Kev run one prefill pass per question**, so `max_questions` bounds the engine work of
   one request. Clef runs one pass for the whole request.
 - **Prefill work** is the sum of all passes' prompt lengths. Kev repeats the state at the start of
@@ -392,6 +398,10 @@ key order, separators, and Python `str()` / `json.dumps` formatting.
 - **Numbers.** Numbers in request JSON, on both routes, are parsed exactly and rendered as the
   reference servers would print them: integers of any size with every digit, floats like Python's
   `repr` (`1e-05`, `1.0`, `0.1`, `1e+20`).
+- **No BOS token.** The codecs encode prompts without a beginning-of-sequence token, as the
+  Qwen3.5 references do (Qwen's tokenizer adds none). A decision model on a backbone that
+  expects one (Gemma's `<bos>`, for example) would get a different prompt from its reference;
+  only Qwen3.5-family trees are supported.
 - **Caller text is sanitized.** Hugging Face tokenizers match special tokens inside plain text, so
   a state or option text containing `<|im_end|>` could otherwise forge the prompt's structure and
   steer the decision. The server rewrites every `<|name|>` sequence, and every other angle-bracket
@@ -461,8 +471,10 @@ python tools/decision_export.py clef --base-ir STOCK_INT8_IR \
 - `--max-tokens N` sets `decision.json` `max_tokens` for any family. The default is 32,768 for
   JEV, 73,728 for Kev and 16,384 for Clef, each lowered to the tree's `max_position_embeddings`
   (from the `config.json` the tree ships: the one in `--weights`, which for Clef defaults to
-  `--clef-dir`, when it has one, else the base IR's). An `N` above that window, or above the server's own cap
-  (131,072 for JEV and Kev, Clef's 16,384 joint pass), is refused rather than lowered.
+  `--clef-dir`, when it has one, else the base IR's; with neither, the default stands). An `N`
+  above that window, or above the server's own cap, is refused rather than lowered. The cap is
+  131,072 for JEV and Kev; for Clef it is the joint pass bound at the base IR's width (16,384
+  for both Clef models, 10,240 at width 8192; see [Limits](#limits)).
 - The exporter refuses calibration the server would refuse at load (see [Limits](#limits)): a JEV
   or Kev `temperature` outside [0.001, 1000] or a JEV `bias` outside [-10,000, 10,000]. The error
   names the field, such as `jev.temperature.choice` or `jev.bias[3]`.
@@ -472,14 +484,17 @@ python tools/decision_export.py clef --base-ir STOCK_INT8_IR \
   overrides it for any family).
 - Kev and Clef trees are exported with the final hidden-state output their heads read; JEV's
   verbalizer reads only the logits.
+- Clef takes no `--lora` or `--lora-scale`: `--clef-dir` is the full checkpoint its joint head
+  was trained on, and an adapter grafted on top would move the hidden states the head reads.
 - A LoRA adapter is grafted as plain linear branches only. The exporter and
   `tools/decision/reference_stream.py` refuse an adapter with embedding LoRA keys
   (`lora_embedding_A/B`), any non-LoRA tensor, a non-empty `modules_to_save` in
   `adapter_config.json` (as well as DoRA, rank/alpha patterns and `lora_bias`), and the export
   fails unless every adapter module is grafted exactly once.
 - Kev refuses a `head.pt` whose head the server's pointer readout cannot run: `option_isolation`
-  or `special_embeddings` set, `weights` other than `lora`, a `head_dim` that is not the q/k row
-  count, or head tensors other than `q`/`k` weight and bias.
+  or `special_embeddings` set, `weights` other than `lora`, a `head_dim` that is not an integer
+  equal to the q/k row count, no saved head (`head: None`), or head tensors other than `q`/`k`
+  weight and bias.
 - The manifest is written last, so a tree whose export stopped part way is not loadable.
 
 ## Pipeline reply timeouts
@@ -504,11 +519,21 @@ wait stopped:
   Restart both ranks to recover.
 - **The startup handshake** (HELLO). A rank 1 that is still loading can answer after the timeout.
   The first request then fails, and the next one waits for that HELLO's reply instead of sending a
-  second HELLO. A long load therefore costs one failed request rather than a restart. The JEV-27B
-  runbook below still raises the timeout, so that no request fails.
+  second HELLO. In the served 2-rank topology a long load therefore costs one failed request
+  rather than a restart. The JEV-27B runbook below still raises the timeout, so that no request
+  fails.
 
-A middle rank applies the same rules to its own downstream link. The wire format is unchanged, so
-ranks of older builds work with this one as before. No metric reports the desynced state yet;
+These guarantees are for the served 2-rank topology. In a longer chain:
+
+- A slow-loading rank below a middle rank makes the middle's own HELLO forward time out. The
+  middle then answers rank 0 with a handshake refusal, which poisons rank 0 until restart, so
+  there a long load costs a restart.
+- A middle rank drains late replies on its own downstream link by the same rules. But a desynced
+  middle cannot pass the restart message upstream, so rank 0 sees only timeouts.
+
+The wire format is unchanged, so ranks of older builds work with this one as before. Every rank
+of a chain must be built with the same features: a chain that mixes builds with and without KV
+coordination (the `kv_coord` feature) is unsupported. No metric reports the desynced state yet;
 watch for the error line.
 
 ## Limitations
