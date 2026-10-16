@@ -26,6 +26,13 @@ Usage (needs torch, torchvision, transformers==5.14.1, pillow, numpy):
 
 The model dirs only supply config.json, the processor configs, the chat
 template and the tokenizer; no IR or weight file is read.
+
+  --run-ir FAMILY   instead drive that family's vision IRs (needs openvino and
+                    the export with its weights, so run it where the model is)
+                    with HF's preprocessing and host inputs, and write
+                    <out>/vision_ir_<FAMILY>.json: per image the grid and a
+                    summary of the image rows (and Qwen3-VL's DeepStack rows).
+                    `tests/qwen_vl_vision_ir.rs` compares the Rust chain to it.
 """
 import argparse
 import glob
@@ -189,16 +196,79 @@ def family(model_dir, name, imgs):
     return ref
 
 
+def run_vision_irs(model_dir, name, imgs):
+    """HF's preprocessing and host inputs driving the export's vision IRs."""
+    import openvino as ov
+    config = AutoConfig.from_pretrained(model_dir)
+    proc = AutoImageProcessor.from_pretrained(model_dir, backend="pil")
+    vc = config.vision_config
+    head_dim = vc.hidden_size // vc.num_heads
+    core = ov.Core()
+    ir = lambda s: core.compile_model(  # noqa: E731
+        os.path.join(model_dir, f"openvino_vision_embeddings{s}_model.xml"), "CPU")
+    patch, merger = ir(""), ir("_merger")
+    out = {}
+    for img_name in ("tiny_40x30", "square_448", "landscape_640x360"):
+        o = proc(images=[imgs[img_name]], return_tensors="pt")
+        pv, g = o["pixel_values"], o["image_grid_thw"]
+        pe = torch.from_numpy(patch({"hidden_states": pv.numpy()})[0])
+        pos_ids = vu.get_vision_position_ids(g, vc.spatial_merge_size)
+        cu = vu.get_vision_cu_seqlens(g).tolist()
+        n = pe.shape[0]
+        mask = torch.full((1, n, n), float("-inf"))
+        for a, b in zip(cu[:-1], cu[1:]):
+            mask[0, a:b, a:b] = 0
+        if name == "qwen2_5_vl":
+            rot = q25.Qwen2_5_VisionRotaryEmbedding(head_dim // 2)(pos_ids)
+            wi, cw = vu.get_vision_window_index(g, vc.spatial_merge_size, vc.window_size,
+                                                vc.patch_size)
+            wmask = torch.full((1, n, n), float("-inf"))
+            cw = cw.tolist()
+            for a, b in zip(cw[:-1], cw[1:]):
+                wmask[0, a:b, a:b] = 0
+            res = merger({"hidden_states": pe.numpy(), "attention_mask": mask.numpy(),
+                          "window_attention_mask": wmask.numpy(), "window_index": wi.numpy(),
+                          "rotary_pos_emb": rot.numpy()})
+            entry = {"image_embeds": summary(torch.from_numpy(res[0]))}
+        else:
+            side = int(vc.num_position_embeddings ** 0.5)
+            pos_ir = ir("_pos")
+            idx, wts = vu.get_vision_bilinear_indices_and_weights(g, side, vc.spatial_merge_size)
+            corners = torch.from_numpy(pos_ir({"input": idx.numpy()})[0])
+            hidden = pe + (corners * wts[:, :, None]).sum(0)
+            rot = q3.Qwen3VLVisionRotaryEmbedding(head_dim // 2)(pos_ids)
+            res = merger({"hidden_states": hidden.numpy(), "attention_mask": mask.numpy(),
+                          "rotary_pos_emb": rot.numpy()})
+            by = {next(iter(k.get_names())): v for k, v in res.items()}
+            entry = {"image_embeds": summary(torch.from_numpy(by["last_hidden_state"])),
+                     "deepstack": summary(torch.from_numpy(by["deepstack_feature_lists"]))}
+        entry["grid_thw"] = g.tolist()[0]
+        out[img_name] = entry
+        print(f"[vision_ir {name}] {img_name}: grid={entry['grid_thw']}")
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--qwen2-5-vl", required=True)
-    ap.add_argument("--qwen3-vl", required=True)
+    ap.add_argument("--qwen2-5-vl")
+    ap.add_argument("--qwen3-vl")
     ap.add_argument("--images", default=DEFAULT_IMAGES)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--run-ir", choices=("qwen2_5_vl", "qwen3_vl"))
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     imgs = {os.path.splitext(os.path.basename(p))[0]: Image.open(p).convert("RGB")
             for p in sorted(glob.glob(os.path.join(args.images, "*.png")))}
+    if args.run_ir:
+        model = args.qwen2_5_vl if args.run_ir == "qwen2_5_vl" else args.qwen3_vl
+        if not model:
+            raise SystemExit(f"--run-ir {args.run_ir} needs that family's model dir")
+        ref = run_vision_irs(model, args.run_ir, imgs)
+        with open(os.path.join(args.out, f"vision_ir_{args.run_ir}.json"), "w") as f:
+            json.dump(ref, f, separators=(",", ":"))
+        return
+    if not (args.qwen2_5_vl and args.qwen3_vl):
+        raise SystemExit("--qwen2-5-vl and --qwen3-vl are both required")
     ref = {
         "versions": {"transformers": transformers.__version__, "torch": torch.__version__,
                      "torchvision": torchvision.__version__},

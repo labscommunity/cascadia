@@ -245,6 +245,11 @@ impl VisionConfig {
             .map_err(|e| format!("reading {}: {e}", path.display()))?;
         let v: serde_json::Value =
             serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))?;
+        Self::from_value(&v)
+    }
+
+    /// Read `vision_config` from a parsed Hugging Face `config.json`.
+    pub fn from_value(v: &serde_json::Value) -> Result<Self, String> {
         let vc = v
             .get("vision_config")
             .ok_or("config.json has no vision_config")?;
