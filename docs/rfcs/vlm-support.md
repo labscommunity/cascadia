@@ -691,6 +691,13 @@ Two things kept Gemma 4 off the static path; both are handled now.
 
 ## Gemma 4 on packed slots (2026-10-16)
 
+**Memory.** On the 26B-A4B tree a packed stage (`--packed-seq 288`) compiles to about
+18 GB resident (its mixture-of-experts layers at 288 rows), so two stages do not fit on
+one 32 GB node: the second rank failed to allocate. Gemma 4 26B on packed slots needs
+one stage per node (four nodes for the four-stage tree); it was not run end to end on
+the two-node cluster. The mask, window, image-block, per-slot failure and wire logic are
+covered by unit tests.
+
 Packed slots (`--packed-slots N`) refused Gemma 4 trees because their host mask had no
 image blocks and the packed IR builder expected one mask. They serve them now, single-
 and multi-stage, text and image requests in the same inference:
@@ -949,7 +956,7 @@ A body over the size limit stays a 413, now with a message pointing at
 text tower has cross-attention) and notes at export time when it drops a checkpoint's
 vision tower (Mistral 3, Qwen2-VL, LLaVA).
 
-## Pixtral on `ov-dist-spec` (2026-10-16, not yet run on hardware)
+## Pixtral on `ov-dist-spec` (2026-10-16)
 
 Design: only the target sees images. Rank 0 expands and encodes them with the Pixtral
 front end and feeds stage 0 `inputs_embeds` (the text-embedding rows of the expanded
@@ -970,8 +977,24 @@ is refused). The API's image tag for these trees is `pixtral_native`.
 
 Not covered: KV warm resume of image turns under `kv_coord` (they prefill cold and are
 not captured), Gemma 4 targets (their `token_type_ids` frame does not ride the wire),
-static or packed dist-spec. To verify on the cluster: greedy answers match `ov-runtime`
-on the same `--all-logits` tree, and the logged acceptance rate on image prompts.
+static or packed dist-spec.
+
+Fixed after the first cluster run: the draft accepted 0 of 40 drafted tokens, because
+it read the 784 `[IMG]` placeholders as text and degenerated ("UserUserUser...";
+`tools/vlm_surgery/check_text_draft.py` shows the draft itself matches Ministral's
+embeddings + LM pipeline token for token, rewinds included). The draft is now prefilled
+with the image ids removed (its KV is its own, so its positions need not match the
+target's). The prefill's all-rows logits overflowed the wire (432 MB for two images,
+`MAX_TENSOR_BYTES` 256 MB) and scaled with the prompt (about 17 GB for eight large images):
+the prefill now goes in 512-row chunks (frame kind 10) answered with the last row's logits
+only, and verify spans keep every row. `usage.prompt_tokens` reports the expanded count.
+
+Verified on pawan-02 (CPU, both ranks on one box; target `cut_vlm_lm.py --num-stages 2
+--family pixtral --all-logits`, draft `make_text_draft.py` from `ministral3-3b-int4-ov`,
+`--spec-k 4`): the 11-check SDK test passes, answers equal `ov-runtime`'s ("There is a red
+square and a blue circle.", 832 prompt tokens, two images 1648). Draft acceptance 25-35%
+on image and text turns, about two tokens per target step (10 tokens in 5 steps for one
+image, 14 in 6 for two).
 
 ## Video: out of scope, kept cheap
 
