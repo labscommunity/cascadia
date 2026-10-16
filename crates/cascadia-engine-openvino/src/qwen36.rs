@@ -211,6 +211,12 @@ const CAPTURE_V2_CAP: u32 = 0;
 /// Decision readout: rank 0 → chain, body = decision::encode_readout. Lockstep-acked.
 const FRAME_DECIDE: u32 = 13;
 const FRAME_DECIDE_ACK: u32 = 14;
+/// Bounds on skipping late replies of earlier tasks (see `recv_reply_header`). One timed-out
+/// exchange owes at most one reply, so 16 covers 16 timeouts in a row; the byte bound is two
+/// worst-case DECISION bodies. The time bound is the exchange's own `recv_timeout`.
+const MAX_STALE_REPLY_FRAMES: usize = 16;
+const MAX_STALE_REPLY_BYTES: usize = 2 * crate::decision::MAX_DECISION_BODY_BYTES;
+
 /// After the prefill FORWARDs: run the head on the last rank.
 const FRAME_DECIDE_RUN: u32 = 15;
 /// Last rank → rank 0 (middles relay verbatim), body = decision::encode_result.
@@ -773,6 +779,7 @@ impl Builder for Qwen36Builder {
             chain_capture_v2: 0,
             chain_caps: 0,
             poisoned: None,
+            down_link: DownLink::Clean,
             pending: Vec::new(),
             active: None,
             #[cfg(feature = "kv_coord")]
@@ -1118,6 +1125,8 @@ pub struct Qwen36Engine {
     /// Set when the startup handshake found a config mismatch (handshake
     /// rule: refuse to serve). Admissions fail loud with this reason.
     poisoned: Option<String>,
+    /// Framing state of the downstream link across failed reply exchanges (see [`DownLink`]).
+    down_link: DownLink,
     pending: Vec<GenerationTask>,
     active: Option<ActiveTask>,
     /// Issue-34 Option C: opaque multi-stage KV blob cache for the coordination plane.
@@ -1260,18 +1269,125 @@ fn run_async<F: std::future::Future>(h: &tokio::runtime::Handle, fut: F) -> F::O
     crate::dist_spec::run_async_pub(h, fut)
 }
 
-/// Bound a driver-side reply exchange. The transport exempts a frame's FIRST
-/// byte from the recv timeout so an idle relay can park on the next request
-/// without killing its socket; a driver that just sent FORWARD/RESET/HELLO is
-/// owed a reply now, so a black-holed downstream must not pin this thread
-/// forever. Times out at the same configured activation timeout.
-async fn reply_bounded<T, F>(fut: F) -> Result<T, TransportError>
-where
-    F: std::future::Future<Output = Result<T, TransportError>>,
-{
-    match tokio::time::timeout(cascadia_transport::recv_timeout(), fut).await {
-        Ok(r) => r,
-        Err(_) => Err(TransportError::SocketClosed),
+/// Framing state of a rank's downstream link across failed reply exchanges.
+///
+/// Every reply frame (TOKEN, RESET_ACK, DECIDE_ACK, DECISION, RESTORE_ACK) carries the task
+/// epoch in its header, and the downstream answers requests in order. So a reply that times out
+/// while rank 0 is still waiting for its first byte leaves the stream frame-aligned: the late
+/// reply arrives later, tagged with an epoch the next task does not use, and is skipped by
+/// [`recv_reply_header`]. A timeout anywhere else (mid-request, mid-reply, or on a reply with no
+/// task tag) leaves the stream at an unknown offset, and no tag can be read from there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DownLink {
+    /// Frame-aligned, nothing owed.
+    Clean,
+    /// Frame-aligned, but late replies of earlier exchanges may still arrive. The next exchange
+    /// skips frames until its own `(kind, epoch)`; reading it proves nothing older is left.
+    Owed,
+    /// The startup HELLO timed out before its reply's first byte (a slow peer load). Its
+    /// HELLO_ACK/NAK carries no task tag, so the retried handshake reads that reply instead of
+    /// sending a second HELLO, whose reply would be left behind for the first task.
+    HelloOwed,
+    /// Alignment lost: every later exchange fails fast with this message until restart.
+    Desynced(String),
+}
+
+/// What a reply that times out before its first byte leaves behind (see `run_exchange`).
+#[derive(Clone, Copy)]
+enum Late {
+    /// Tagged with the task epoch: the next exchange skips it.
+    Skip,
+    /// The HELLO reply: the retried handshake waits for it.
+    Await,
+    /// Untagged (CAPTURE_ACK carries epoch 0): it cannot be told from a later reply.
+    Desync,
+}
+
+/// How far one reply exchange got, read when its bound elapses. Shared by reference between the
+/// exchange future and [`Qwen36Engine::run_exchange`].
+struct ExchangePhase(std::sync::atomic::AtomicU8);
+
+impl ExchangePhase {
+    /// The request is not fully written.
+    const SENDING: u8 = 0;
+    /// The request is written and no reply byte has been read: still frame-aligned.
+    const AWAITING: u8 = 1;
+    /// A reply frame (ours or a stale one) has started.
+    const READING: u8 = 2;
+
+    fn new() -> Self {
+        Self(std::sync::atomic::AtomicU8::new(Self::SENDING))
+    }
+    fn set(&self, p: u8) {
+        self.0.store(p, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn get(&self) -> u8 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Read the header of the reply owed for `(kind, epoch)`, marking `phase` so a timeout can tell
+/// a frame-aligned wait from a cut frame. The first byte is read on its own for that reason:
+/// `recv_raw`'s first read is cancel-safe, its remainder is not.
+///
+/// On a clean link (`drain` false) the next frame is returned as is and the caller checks it as
+/// before. On an [`DownLink::Owed`] link, frames of earlier exchanges are skipped (body
+/// included) until `(kind, epoch)` arrives, bounded by [`MAX_STALE_REPLY_FRAMES`] and
+/// [`MAX_STALE_REPLY_BYTES`]; the caller's `recv_timeout` bounds the time.
+async fn recv_reply_header<G: RawRecv>(
+    g: &mut G,
+    phase: &ExchangePhase,
+    drain: bool,
+    kind: u32,
+    epoch: u32,
+) -> Result<(u32, u32, u32), TransportError> {
+    let mut frames = 0usize;
+    let mut bytes = 0usize;
+    loop {
+        phase.set(ExchangePhase::AWAITING);
+        let mut hb = g.recv_raw(1).await?;
+        phase.set(ExchangePhase::READING);
+        hb.extend(g.recv_raw(11).await?);
+        let (k, e, p) = parse_header(&hb);
+        if !drain || (k == kind && e == epoch) {
+            return Ok((k, e, p));
+        }
+        frames += 1;
+        if frames > MAX_STALE_REPLY_FRAMES {
+            return Err(TransportError::Io(std::io::Error::other(format!(
+                "more than {MAX_STALE_REPLY_FRAMES} stale replies before kind {kind} epoch {epoch}"
+            ))));
+        }
+        bytes += 12 + skip_stale_body(g, k).await?;
+        if bytes > MAX_STALE_REPLY_BYTES {
+            return Err(TransportError::Io(std::io::Error::other(format!(
+                "stale replies exceed {MAX_STALE_REPLY_BYTES} bytes"
+            ))));
+        }
+        warn!(
+            stale_kind = k,
+            stale_epoch = e,
+            kind,
+            epoch,
+            "qwen36: skipped a late reply of an earlier task"
+        );
+    }
+}
+
+/// Consume the body of a stale reply frame; returns its size. A kind with no known body layout
+/// fails, which poisons the link.
+async fn skip_stale_body<G: RawRecv>(g: &mut G, kind: u32) -> Result<usize, TransportError> {
+    match kind {
+        // Only replies a tagged exchange can leave behind: an untagged one (HELLO, CAPTURE)
+        // that times out poisons the link instead of leaving it owed.
+        FRAME_RESET_ACK | FRAME_DECIDE_ACK => Ok(0),
+        #[cfg(feature = "kv_coord")]
+        FRAME_RESTORE_ACK => Ok(0),
+        FRAME_TOKEN => Ok(g.recv_raw(8).await?.len()),
+        FRAME_DECISION => Ok(recv_decision_body(g, "stale decision body").await?.len()),
+        other => Err(TransportError::Io(std::io::Error::other(format!(
+            "unknown reply kind {other} while skipping late replies"
+        )))),
     }
 }
 
@@ -1739,29 +1855,89 @@ impl Qwen36Engine {
         Ok(())
     }
 
+    /// Fail fast on a desynced downstream link; otherwise whether the next exchange must first
+    /// skip late replies of earlier ones.
+    fn link_ready(&self) -> EngineResult<bool> {
+        match &self.down_link {
+            // HelloOwed resolves in the handshake retry, which always runs before a task does.
+            DownLink::Clean | DownLink::HelloOwed => Ok(false),
+            DownLink::Owed => Ok(true),
+            DownLink::Desynced(why) => Err(EngineError::Backend(why.clone())),
+        }
+    }
+
+    /// Mark the downstream link desynced (logged once) so no later exchange reads it.
+    fn desync(&mut self, cause: String) {
+        if matches!(self.down_link, DownLink::Desynced(_)) {
+            return;
+        }
+        let msg = format!("qwen36 pipeline link desynced after {cause}; restart the pipeline");
+        error!(rank = self.rank, "{msg}");
+        self.down_link = DownLink::Desynced(msg);
+    }
+
+    /// Run one downstream request → reply exchange and settle the link's framing state from how
+    /// it ended. The transport exempts a frame's FIRST byte from its recv timeout so an idle
+    /// relay can park on the next request; a driver that just sent a request is owed a reply
+    /// now, so the whole exchange is bounded by the same configured activation timeout.
+    ///
+    /// `late` says what a reply that times out before its first byte leaves behind; any other
+    /// failure (a timeout mid-request or mid-frame, a wire error, an unexpected frame) desyncs.
+    fn run_exchange<T>(
+        &mut self,
+        h: &tokio::runtime::Handle,
+        what: &str,
+        late: Late,
+        phase: &ExchangePhase,
+        fut: impl std::future::Future<Output = Result<T, TransportError>>,
+    ) -> Result<T, TransportError> {
+        // The timer is built inside the future: `timeout` needs the runtime it runs on.
+        let bounded = async { tokio::time::timeout(cascadia_transport::recv_timeout(), fut).await };
+        match run_async(h, bounded) {
+            Ok(Ok(v)) => {
+                // Our own reply came back, so every late one before it has been read past.
+                self.down_link = DownLink::Clean;
+                Ok(v)
+            }
+            Ok(Err(e)) => {
+                self.desync(format!("a failed {what} reply ({e})"));
+                Err(e)
+            }
+            Err(_) => {
+                let at = phase.get();
+                match (late, at) {
+                    (Late::Skip, ExchangePhase::AWAITING) => {
+                        if self.down_link == DownLink::Clean {
+                            warn!(
+                                what,
+                                "qwen36: pipeline reply timed out; its late reply will be skipped"
+                            );
+                            self.down_link = DownLink::Owed;
+                        }
+                    }
+                    (Late::Await, ExchangePhase::AWAITING) => {
+                        warn!("qwen36: handshake reply timed out; the retry waits for it");
+                        self.down_link = DownLink::HelloOwed;
+                    }
+                    _ => {
+                        let at = match at {
+                            ExchangePhase::SENDING => "mid-request",
+                            ExchangePhase::AWAITING => "with no task tag to skip it by",
+                            _ => "mid-frame",
+                        };
+                        self.desync(format!("a {what} reply timeout {at}"));
+                    }
+                }
+                Err(TransportError::SocketClosed)
+            }
+        }
+    }
+
     /// Rank 0: RESET → RESET_ACK for the current epoch.
     /// Fail-loud, no retry — the API caller retries the task.
     fn reset_exchange(&mut self) -> EngineResult<()> {
         let epoch = self.epoch;
-        let downstream = self
-            .downstream
-            .clone()
-            .ok_or_else(|| EngineError::Backend("rank 0 has no downstream".into()))?;
-        let h = self.handle()?;
-        run_async(
-            &h,
-            reply_bounded(async move {
-                let mut g = downstream.lock().await;
-                g.send_raw(&frame_header(FRAME_RESET, epoch, 0)).await?;
-                let hb = g.recv_raw(12).await?;
-                let (kind, e, _) = parse_header(&hb);
-                if kind != FRAME_RESET_ACK || e != epoch {
-                    return Err(TransportError::SocketClosed);
-                }
-                Ok(())
-            }),
-        )
-        .map_err(|e| EngineError::Backend(format!("qwen36 pipeline RESET not acked: {e}")))
+        self.forward_reset_downstream(epoch)
     }
 
     /// One lockstep FORWARD([1,n,hidden] f32 at pos t0) → TOKEN exchange
@@ -1774,6 +1950,7 @@ impl Qwen36Engine {
         n: usize,
         t0: usize,
     ) -> EngineResult<(i32, u32)> {
+        let drain = self.link_ready()?;
         let downstream = self
             .downstream
             .clone()
@@ -1784,25 +1961,23 @@ impl Qwen36Engine {
             [1, n as u32, self.hidden as u32],
             le_bytes_f32(hidden),
         );
-        run_async(
-            &h,
-            reply_bounded(async move {
-                let mut g = downstream.lock().await;
-                g.send_raw(&frame_header(FRAME_FORWARD, epoch, t0 as u32))
-                    .await?;
-                g.send(&tensor).await?;
-                let hb = g.recv_raw(12).await?;
-                let (kind, e, _) = parse_header(&hb);
-                if kind != FRAME_TOKEN || e != epoch {
-                    return Err(TransportError::SocketClosed);
-                }
-                let tb = g.recv_raw(8).await?;
-                Ok((
-                    i32::from_be_bytes([tb[0], tb[1], tb[2], tb[3]]),
-                    u32::from_be_bytes([tb[4], tb[5], tb[6], tb[7]]),
-                ))
-            }),
-        )
+        let phase = ExchangePhase::new();
+        let ph = &phase;
+        self.run_exchange(&h, "TOKEN", Late::Skip, ph, async move {
+            let mut g = downstream.lock().await;
+            g.send_raw(&frame_header(FRAME_FORWARD, epoch, t0 as u32))
+                .await?;
+            g.send(&tensor).await?;
+            let (kind, e, _) = recv_reply_header(&mut *g, ph, drain, FRAME_TOKEN, epoch).await?;
+            if kind != FRAME_TOKEN || e != epoch {
+                return Err(TransportError::SocketClosed);
+            }
+            let tb = g.recv_raw(8).await?;
+            Ok((
+                i32::from_be_bytes([tb[0], tb[1], tb[2], tb[3]]),
+                u32::from_be_bytes([tb[4], tb[5], tb[6], tb[7]]),
+            ))
+        })
         .map_err(map_wire)
     }
 
@@ -1831,52 +2006,55 @@ impl Qwen36Engine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
+        self.link_ready()?;
+        // A HELLO that timed out is still answered (the peer was loading): read that reply.
+        let resend = self.down_link != DownLink::HelloOwed;
         let h = self.handle()?;
         let payload = payload.to_vec();
-        run_async(
-            &h,
-            reply_bounded(async move {
-                let mut g = downstream.lock().await;
+        let phase = ExchangePhase::new();
+        let ph = &phase;
+        self.run_exchange(&h, "HELLO", Late::Await, ph, async move {
+            let mut g = downstream.lock().await;
+            if resend {
                 g.send_raw(&frame_header(FRAME_HELLO, 0, 0)).await?;
                 g.send_raw(&(payload.len() as u32).to_be_bytes()).await?;
                 g.send_raw(&payload).await?;
-                let hb = g.recv_raw(12).await?;
-                let (kind, _, cap) = parse_header(&hb);
-                match kind {
-                    FRAME_HELLO_ACK => Ok((None, cap)),
-                    FRAME_HELLO_NAK => {
-                        let lb = g.recv_raw(4).await?;
-                        let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
-                        let rb = g.recv_raw(n).await?;
-                        Ok((Some(String::from_utf8_lossy(&rb).into_owned()), 0))
-                    }
-                    other => Ok((Some(format!("unexpected handshake reply kind {other}")), 0)),
+            }
+            let (kind, _, cap) = recv_reply_header(&mut *g, ph, false, FRAME_HELLO_ACK, 0).await?;
+            match kind {
+                FRAME_HELLO_ACK => Ok((None, cap)),
+                FRAME_HELLO_NAK => {
+                    let lb = g.recv_raw(4).await?;
+                    let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
+                    let rb = g.recv_raw(n).await?;
+                    Ok((Some(String::from_utf8_lossy(&rb).into_owned()), 0))
                 }
-            }),
-        )
+                other => Ok((Some(format!("unexpected handshake reply kind {other}")), 0)),
+            }
+        })
         .map_err(map_wire)
     }
 
     /// Middle: forward RESET downstream, await its ack.
     fn forward_reset_downstream(&mut self, epoch: u32) -> EngineResult<()> {
+        let drain = self.link_ready()?;
         let downstream = self
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
         let h = self.handle()?;
-        run_async(
-            &h,
-            reply_bounded(async move {
-                let mut g = downstream.lock().await;
-                g.send_raw(&frame_header(FRAME_RESET, epoch, 0)).await?;
-                let hb = g.recv_raw(12).await?;
-                let (kind, e, _) = parse_header(&hb);
-                if kind != FRAME_RESET_ACK || e != epoch {
-                    return Err(TransportError::SocketClosed);
-                }
-                Ok(())
-            }),
-        )
+        let phase = ExchangePhase::new();
+        let ph = &phase;
+        self.run_exchange(&h, "RESET_ACK", Late::Skip, ph, async move {
+            let mut g = downstream.lock().await;
+            g.send_raw(&frame_header(FRAME_RESET, epoch, 0)).await?;
+            let (kind, e, _) =
+                recv_reply_header(&mut *g, ph, drain, FRAME_RESET_ACK, epoch).await?;
+            if kind != FRAME_RESET_ACK || e != epoch {
+                return Err(TransportError::SocketClosed);
+            }
+            Ok(())
+        })
         .map_err(|e| EngineError::Backend(format!("qwen36 pipeline RESET not acked: {e}")))
     }
 
@@ -1887,22 +2065,22 @@ impl Qwen36Engine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
+        let drain = self.link_ready()?;
         let h = self.handle()?;
         let body = body.to_vec();
-        run_async(
-            &h,
-            reply_bounded(async move {
-                let mut g = downstream.lock().await;
-                g.send_raw(&frame_header(FRAME_DECIDE, epoch, 0)).await?;
-                g.send_raw(&body).await?;
-                let hb = g.recv_raw(12).await?;
-                let (kind, e, _) = parse_header(&hb);
-                if kind != FRAME_DECIDE_ACK || e != epoch {
-                    return Err(TransportError::SocketClosed);
-                }
-                Ok(())
-            }),
-        )
+        let phase = ExchangePhase::new();
+        let ph = &phase;
+        self.run_exchange(&h, "DECIDE_ACK", Late::Skip, ph, async move {
+            let mut g = downstream.lock().await;
+            g.send_raw(&frame_header(FRAME_DECIDE, epoch, 0)).await?;
+            g.send_raw(&body).await?;
+            let (kind, e, _) =
+                recv_reply_header(&mut *g, ph, drain, FRAME_DECIDE_ACK, epoch).await?;
+            if kind != FRAME_DECIDE_ACK || e != epoch {
+                return Err(TransportError::SocketClosed);
+            }
+            Ok(())
+        })
         .map_err(|e| EngineError::Backend(format!("qwen36 pipeline DECIDE not acked: {e}")))
     }
 
@@ -1919,21 +2097,20 @@ impl Qwen36Engine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
+        let drain = self.link_ready()?;
         let h = self.handle()?;
-        run_async(
-            &h,
-            reply_bounded(async move {
-                let mut g = downstream.lock().await;
-                g.send_raw(&frame_header(FRAME_DECIDE_RUN, epoch, 0))
-                    .await?;
-                let hb = g.recv_raw(12).await?;
-                let (kind, e, _) = parse_header(&hb);
-                if kind != FRAME_DECISION || e != epoch {
-                    return Err(TransportError::SocketClosed);
-                }
-                recv_decision_body(&mut *g, "decision body").await
-            }),
-        )
+        let phase = ExchangePhase::new();
+        let ph = &phase;
+        self.run_exchange(&h, "DECISION", Late::Skip, ph, async move {
+            let mut g = downstream.lock().await;
+            g.send_raw(&frame_header(FRAME_DECIDE_RUN, epoch, 0))
+                .await?;
+            let (kind, e, _) = recv_reply_header(&mut *g, ph, drain, FRAME_DECISION, epoch).await?;
+            if kind != FRAME_DECISION || e != epoch {
+                return Err(TransportError::SocketClosed);
+            }
+            recv_decision_body(&mut *g, "decision body").await
+        })
         .map_err(map_wire)
     }
 
@@ -2023,21 +2200,22 @@ impl Qwen36Engine {
                 crate::kv_coordination::capture_body_bytes(kv_epoch, tokens),
             )
         };
-        run_async(
-            &h,
-            reply_bounded(async move {
-                let mut g = downstream.lock().await;
-                g.send_raw(&frame_header(kind, task_epoch, 0)).await?;
-                g.send_raw(&(body.len() as u32).to_be_bytes()).await?;
-                g.send_raw(&body).await?;
-                let hb = g.recv_raw(12).await?;
-                let (kind, _, _) = parse_header(&hb);
-                if kind != FRAME_CAPTURE_ACK {
-                    return Err(TransportError::SocketClosed);
-                }
-                Ok(())
-            }),
-        )
+        let drain = self.link_ready()?;
+        let phase = ExchangePhase::new();
+        let ph = &phase;
+        // CAPTURE_ACK carries epoch 0, not the task's: a late one cannot be skipped, so a timeout
+        // desyncs. Skipping stale frames before it still works, as theirs are tagged.
+        self.run_exchange(&h, "CAPTURE_ACK", Late::Desync, ph, async move {
+            let mut g = downstream.lock().await;
+            g.send_raw(&frame_header(kind, task_epoch, 0)).await?;
+            g.send_raw(&(body.len() as u32).to_be_bytes()).await?;
+            g.send_raw(&body).await?;
+            let (kind, _, _) = recv_reply_header(&mut *g, ph, drain, FRAME_CAPTURE_ACK, 0).await?;
+            if kind != FRAME_CAPTURE_ACK {
+                return Err(TransportError::SocketClosed);
+            }
+            Ok(())
+        })
         .map_err(|e| EngineError::Backend(format!("qwen36 CAPTURE not acked: {e}")))
     }
 
@@ -2070,26 +2248,26 @@ impl Qwen36Engine {
                 "qwen36_restore_carry_downstream"
             );
         }
+        let drain = self.link_ready()?;
         let h = self.handle()?;
-        run_async(
-            &h,
-            reply_bounded(async move {
-                let mut g = downstream.lock().await;
-                g.send_raw(&frame_header(FRAME_RESTORE, task_epoch, 0))
-                    .await?;
-                g.send_raw(&kv_epoch.to_le_bytes()).await?;
-                g.send_raw(&(blob.len() as u32).to_be_bytes()).await?;
-                if !blob.is_empty() {
-                    g.send_raw(&blob).await?;
-                }
-                let hb = g.recv_raw(12).await?;
-                let (kind, _, verdict) = parse_header(&hb);
-                if kind != FRAME_RESTORE_ACK {
-                    return Err(TransportError::SocketClosed);
-                }
-                Ok(verdict == 1)
-            }),
-        )
+        let phase = ExchangePhase::new();
+        let ph = &phase;
+        self.run_exchange(&h, "RESTORE_ACK", Late::Skip, ph, async move {
+            let mut g = downstream.lock().await;
+            g.send_raw(&frame_header(FRAME_RESTORE, task_epoch, 0))
+                .await?;
+            g.send_raw(&kv_epoch.to_le_bytes()).await?;
+            g.send_raw(&(blob.len() as u32).to_be_bytes()).await?;
+            if !blob.is_empty() {
+                g.send_raw(&blob).await?;
+            }
+            let (kind, _, verdict) =
+                recv_reply_header(&mut *g, ph, drain, FRAME_RESTORE_ACK, task_epoch).await?;
+            if kind != FRAME_RESTORE_ACK {
+                return Err(TransportError::SocketClosed);
+            }
+            Ok(verdict == 1)
+        })
         .map_err(|e| EngineError::Backend(format!("qwen36 RESTORE not acked: {e}")))
     }
 
@@ -2105,6 +2283,13 @@ impl Qwen36Engine {
                 warn!(task = %task.task_id, reason = %reason, "qwen36: refusing task (handshake mismatch)");
                 let reason = format!("qwen36 pipeline poisoned by handshake mismatch: {reason}");
                 return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
+            }
+            if let DownLink::Desynced(reason) = &self.down_link {
+                warn!(task = %task.task_id, "qwen36: refusing task (pipeline link desynced)");
+                return vec![(
+                    task.task_id.clone(),
+                    Chunk::error(task.task_id, reason.clone()),
+                )];
             }
             if !self.handshake_done {
                 if let Err(e) = self.handshake_a() {
@@ -4089,6 +4274,7 @@ mod tests {
             chain_capture_v2: 0,
             chain_caps: 0,
             poisoned: None,
+            down_link: DownLink::Clean,
             pending: Vec::new(),
             active: None,
             #[cfg(feature = "kv_coord")]
@@ -5205,5 +5391,289 @@ mod tests {
         )> = Some((7, Err("decision_invalid: x".into())));
         assert_eq!(take_pending(&mut p, 7).unwrap_err(), "decision_invalid: x");
         assert!(take_pending(&mut None, 7).is_err(), "nothing pending");
+    }
+
+    // ---- B1: a late pipeline reply never desyncs the next task ----
+
+    /// A rank-0 engine wired to a scripted fake rank 1 over loopback TCP. The fake runs on
+    /// `rt`; the engine's exchanges block on the same runtime through `run_async`, as in serving.
+    fn pipe_rank0(rt: &tokio::runtime::Runtime) -> (Qwen36Engine, ActivationServer) {
+        let (client, server) = rt.block_on(async {
+            let mut server = ActivationServer::new("127.0.0.1", 0);
+            server.start().await.unwrap();
+            let mut client = ActivationClient::new("127.0.0.1", server.port());
+            let (c, a) = tokio::join!(client.connect(), server.accept());
+            c.unwrap();
+            a.unwrap();
+            (client, server)
+        });
+        let mut e = bare_engine(2, "{}");
+        e.rank = 0;
+        e.handshake_done = true;
+        e.downstream = Some(Arc::new(tokio::sync::Mutex::new(client)));
+        e.runtime_handle = Some(rt.handle().clone());
+        (e, server)
+    }
+
+    fn pipe_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// Fake rank 1: read one request header, check its kind and epoch, and skip its body.
+    async fn fake_expect(s: &mut ActivationServer, kind: u32, epoch: u32) {
+        let (k, e, _) = parse_header(&s.recv_raw(12).await.unwrap());
+        assert_eq!(
+            (k, e),
+            (kind, epoch),
+            "fake rank 1 got an unexpected request"
+        );
+        match k {
+            FRAME_FORWARD => {
+                s.recv().await.unwrap();
+            }
+            FRAME_DECIDE => {
+                recv_decision_body(s, "decide body").await.unwrap();
+            }
+            _ => {}
+        }
+    }
+
+    async fn fake_token(s: &mut ActivationServer, epoch: u32, tok: i32) {
+        s.send_raw(&frame_header(FRAME_TOKEN, epoch, 0))
+            .await
+            .unwrap();
+        s.send_raw(&tok.to_be_bytes()).await.unwrap();
+        s.send_raw(&0u32.to_be_bytes()).await.unwrap();
+    }
+
+    async fn fake_ack(s: &mut ActivationServer, kind: u32, epoch: u32) {
+        s.send_raw(&frame_header(kind, epoch, 0)).await.unwrap();
+    }
+
+    fn one_row(e: &Qwen36Engine) -> Vec<f32> {
+        vec![0.0; e.hidden]
+    }
+
+    /// The audit's B1 scenario, for TOKEN and both decision replies: the last rank answers after
+    /// rank 0's reply bound, so rank 0 fails that task and moves on while the late frame is still
+    /// on its way. The next task must read past it to its own reply instead of failing, and the
+    /// task after that must not inherit anything either.
+    #[test]
+    fn a_late_reply_never_desyncs_the_next_task() {
+        let _knob = crate::timeout_knob_lock();
+        cascadia_transport::set_activation_timeout_secs(1);
+        let rt = pipe_rt();
+        let (mut e, mut server) = pipe_rank0(&rt);
+        let late = Duration::from_millis(1600);
+        let fake = rt.spawn(async move {
+            let s = &mut server;
+            // Task 1 (chat): the TOKEN comes back late.
+            fake_expect(s, FRAME_FORWARD, 1).await;
+            tokio::time::sleep(late).await;
+            fake_token(s, 1, 7).await;
+            // Task 2 (decision): RESET and DECIDE on time, the DECISION late.
+            fake_expect(s, FRAME_RESET, 2).await;
+            fake_ack(s, FRAME_RESET_ACK, 2).await;
+            fake_expect(s, FRAME_DECIDE, 2).await;
+            fake_ack(s, FRAME_DECIDE_ACK, 2).await;
+            fake_expect(s, FRAME_DECIDE_RUN, 2).await;
+            tokio::time::sleep(late).await;
+            fake_ack(s, FRAME_DECISION, 2).await;
+            s.send_raw(&crate::decision::encode_result(&Ok(vec![0.25, 0.75])))
+                .await
+                .unwrap();
+            // Task 3 (decision): the DECIDE_ACK comes back late.
+            fake_expect(s, FRAME_RESET, 3).await;
+            fake_ack(s, FRAME_RESET_ACK, 3).await;
+            fake_expect(s, FRAME_DECIDE, 3).await;
+            tokio::time::sleep(late).await;
+            fake_ack(s, FRAME_DECIDE_ACK, 3).await;
+            // Task 4 (chat): everything on time.
+            fake_expect(s, FRAME_RESET, 4).await;
+            fake_ack(s, FRAME_RESET_ACK, 4).await;
+            fake_expect(s, FRAME_FORWARD, 4).await;
+            fake_token(s, 4, 42).await;
+        });
+        let body = crate::decision::encode_result(&Ok(vec![1.0]));
+
+        e.epoch = 1;
+        assert!(
+            e.send_forward_recv_token(one_row(&e), 1, 0).is_err(),
+            "TOKEN past the bound"
+        );
+
+        e.epoch = 2;
+        e.reset_exchange()
+            .expect("the late TOKEN of task 1 must not fail task 2's RESET");
+        e.forward_decide_downstream(2, &body)
+            .expect("DECIDE acked on time");
+        assert!(e.decide_run_exchange().is_err(), "DECISION past the bound");
+
+        e.epoch = 3;
+        e.reset_exchange()
+            .expect("the late DECISION of task 2 must not fail task 3's RESET");
+        assert!(
+            e.forward_decide_downstream(3, &body).is_err(),
+            "DECIDE_ACK past the bound"
+        );
+
+        e.epoch = 4;
+        e.reset_exchange()
+            .expect("the late DECIDE_ACK of task 3 must not fail task 4's RESET");
+        let (tok, _) = e
+            .send_forward_recv_token(one_row(&e), 1, 0)
+            .expect("task 4 reads its own TOKEN");
+        assert_eq!(tok, 42, "task 4 got a stale token");
+        cascadia_transport::set_activation_timeout_secs(0);
+        rt.block_on(fake).unwrap();
+    }
+
+    /// A reply that times out MID-FRAME leaves the stream at an unknown offset: no tag can be
+    /// read from there. The link is poisoned and every later task fails fast with the restart
+    /// error, without writing to the link, until the pipeline restarts.
+    #[test]
+    fn a_reply_cut_mid_frame_poisons_the_link_until_restart() {
+        let _knob = crate::timeout_knob_lock();
+        cascadia_transport::set_activation_timeout_secs(1);
+        let rt = pipe_rt();
+        let (mut e, mut server) = pipe_rank0(&rt);
+        let fake = rt.spawn(async move {
+            fake_expect(&mut server, FRAME_FORWARD, 1).await;
+            // Five bytes of a TOKEN header, then silence past the bound.
+            let h = frame_header(FRAME_TOKEN, 1, 0);
+            server.send_raw(&h[..5]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1600)).await;
+            server.send_raw(&h[5..]).await.unwrap();
+            // Nothing more may arrive: rank 0 must not write to a desynced link.
+            let quiet = tokio::time::timeout(Duration::from_millis(500), server.recv_raw(1)).await;
+            // Silence or EOF (the transport may drop a socket cut mid-frame), never a byte.
+            assert!(
+                !matches!(quiet, Ok(Ok(_))),
+                "rank 0 wrote to a desynced link"
+            );
+        });
+
+        e.epoch = 1;
+        assert!(e.send_forward_recv_token(one_row(&e), 1, 0).is_err());
+        e.epoch = 2;
+        let err = e
+            .reset_exchange()
+            .expect_err("a desynced link must fail fast")
+            .to_string();
+        assert!(err.contains("desynced") && err.contains("restart"), "{err}");
+
+        // The next admission is refused before any frame goes out.
+        e.pending.push(GenerationTask::new("t9", "hello"));
+        let out = e.step_pipe_first();
+        let msg = out[0].1.error.clone().expect("an error chunk");
+        assert!(msg.contains("desynced") && msg.contains("restart"), "{msg}");
+        cascadia_transport::set_activation_timeout_secs(0);
+        rt.block_on(fake).unwrap();
+    }
+
+    /// A slow peer load (the 27B runbook's case): the startup HELLO times out, and the next
+    /// admission retries the handshake. The retry reads the first HELLO's reply rather than
+    /// sending a second HELLO, whose ACK would otherwise sit in front of the first RESET_ACK.
+    #[test]
+    fn a_late_handshake_reply_is_awaited_not_resent() {
+        let _knob = crate::timeout_knob_lock();
+        cascadia_transport::set_activation_timeout_secs(1);
+        let rt = pipe_rt();
+        let (mut e, mut server) = pipe_rank0(&rt);
+        e.handshake_done = false;
+        let fake = rt.spawn(async move {
+            let s = &mut server;
+            let (k, _, _) = parse_header(&s.recv_raw(12).await.unwrap());
+            assert_eq!(k, FRAME_HELLO);
+            let lb = s.recv_raw(4).await.unwrap();
+            s.recv_raw(u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(1600)).await;
+            s.send_raw(&frame_header(FRAME_HELLO_ACK, 0, 0))
+                .await
+                .unwrap();
+            // The next request must be the first task's RESET, not a second HELLO.
+            fake_expect(s, FRAME_RESET, 1).await;
+            fake_ack(s, FRAME_RESET_ACK, 1).await;
+        });
+        assert!(e.handshake_a().is_err(), "HELLO past the bound");
+        e.handshake_a().expect("the retry reads the late HELLO_ACK");
+        assert!(e.handshake_done);
+        e.epoch = 1;
+        e.reset_exchange()
+            .expect("no second HELLO_ACK in front of RESET_ACK");
+        cascadia_transport::set_activation_timeout_secs(0);
+        rt.block_on(fake).unwrap();
+    }
+
+    /// CAPTURE_ACK carries epoch 0, not the task's, so a late one cannot be told from a later
+    /// CAPTURE's: its timeout poisons the link instead of leaving it owed.
+    #[cfg(feature = "kv_coord")]
+    #[test]
+    fn a_late_capture_ack_poisons_the_link() {
+        let _knob = crate::timeout_knob_lock();
+        cascadia_transport::set_activation_timeout_secs(1);
+        let rt = pipe_rt();
+        let (mut e, mut server) = pipe_rank0(&rt);
+        let fake = rt.spawn(async move {
+            let s = &mut server;
+            let (k, _, _) = parse_header(&s.recv_raw(12).await.unwrap());
+            assert_eq!(k, FRAME_CAPTURE);
+            let lb = s.recv_raw(4).await.unwrap();
+            let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
+            recv_body_chunked(s, n, MAX_CARRY_BLOB_BYTES, "capture body")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(1600)).await;
+            s.send_raw(&frame_header(FRAME_CAPTURE_ACK, 0, 0))
+                .await
+                .unwrap();
+        });
+        e.epoch = 1;
+        assert!(e.forward_capture_downstream(7, &[1, 2, 3], "").is_err());
+        e.epoch = 2;
+        let err = e.reset_exchange().expect_err("poisoned").to_string();
+        assert!(err.contains("desynced") && err.contains("restart"), "{err}");
+        cascadia_transport::set_activation_timeout_secs(0);
+        rt.block_on(fake).unwrap();
+    }
+
+    /// Draining is bounded: a peer that floods stale frames poisons the link rather than
+    /// holding rank 0 in the drain.
+    #[test]
+    fn a_stale_reply_flood_poisons_the_link() {
+        let _knob = crate::timeout_knob_lock();
+        cascadia_transport::set_activation_timeout_secs(1);
+        let rt = pipe_rt();
+        let (mut e, mut server) = pipe_rank0(&rt);
+        let fake = rt.spawn(async move {
+            fake_expect(&mut server, FRAME_FORWARD, 1).await;
+            tokio::time::sleep(Duration::from_millis(1600)).await;
+            for _ in 0..=MAX_STALE_REPLY_FRAMES {
+                fake_token(&mut server, 1, 7).await;
+            }
+            fake_expect(&mut server, FRAME_RESET, 2).await;
+            fake_ack(&mut server, FRAME_RESET_ACK, 2).await;
+        });
+        e.epoch = 1;
+        assert!(e.send_forward_recv_token(one_row(&e), 1, 0).is_err());
+        e.epoch = 2;
+        let err = e
+            .reset_exchange()
+            .expect_err("flood must not be drained forever");
+        let err = err.to_string();
+        assert!(err.contains("RESET"), "{err}");
+        let err = e
+            .reset_exchange()
+            .expect_err("poisoned after the flood")
+            .to_string();
+        assert!(err.contains("desynced") && err.contains("restart"), "{err}");
+        cascadia_transport::set_activation_timeout_secs(0);
+        rt.block_on(fake).unwrap();
     }
 }
