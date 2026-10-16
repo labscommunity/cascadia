@@ -477,10 +477,10 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
     manifest = build_manifest(spec, os.path.basename(os.path.abspath(model_dir)),
                               final_hidden=final_hidden)
 
-    grafted = 0
+    grafted = []
     if lora:
         from weight_swap import lora_scale_from_config
-        # ValueError (rank/alpha patterns, DoRA, LoRA bias) propagates: the
+        # ValueError (rank/alpha patterns, DoRA, LoRA bias, modules_to_save) propagates: the
         # graft would be wrong for those adapters whatever the scale.
         try:
             cfg_scale = lora_scale_from_config(lora)
@@ -491,6 +491,9 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
         if lora_scale is not None and abs(lora_scale - cfg_scale) > 1e-9:
             print(f"WARNING: --lora-scale {lora_scale} overrides adapter_config.json's {cfg_scale}", flush=True)
         lora_scale = cfg_scale if lora_scale is None else lora_scale
+        from weight_swap import lora_targets
+        # ValueError (embedding LoRA, modules_to_save tensors, unpaired keys) before the long export
+        want = lora_targets(lora)
 
     for i, (a, b) in enumerate(ranges):
         first, last = i == 0, i == len(ranges) - 1
@@ -505,7 +508,7 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
             from weight_swap import graft_lora
             g = graft_lora(stage, lora, lora_scale, layers=range(a, b + 1), lm_head=last)
             grafted += g
-            print(f"  stage{i}: grafted {g} LoRA branches", flush=True)
+            print(f"  stage{i}: grafted {len(g)} LoRA branches", flush=True)
         if last and final_hidden:
             from weight_swap import add_final_hidden_output
             add_final_hidden_output(stage)
@@ -527,10 +530,15 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
               f"inputs={info['inputs']} states={len(info['state_vars'])}", flush=True)
 
     if lora:
-        from weight_swap import lora_targets
-        want = lora_targets(lora)
-        if grafted != want:
-            raise SystemExit(f"grafted {grafted} LoRA branches but the adapter has {want} targets")
+        # exact coverage: a count would let a module grafted twice hide one grafted nowhere
+        from collections import Counter
+        n = Counter(grafted)
+        twice = sorted(m for m, c in n.items() if c > 1)
+        missing = sorted(set(want) - set(n))
+        extra = sorted(set(n) - set(want))
+        if twice or missing or extra:
+            raise SystemExit(f"LoRA graft does not cover the adapter's {len(want)} modules exactly once: "
+                             f"grafted more than once: {twice}; not grafted: {missing}; not in the adapter: {extra}")
 
     # aux files the engine needs alongside the stages (single-dir UX)
     import shutil

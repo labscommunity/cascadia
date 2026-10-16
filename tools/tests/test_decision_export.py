@@ -87,10 +87,17 @@ def stubbed(tmp_path, monkeypatch):
 
 
 def _lora(monkeypatch, ws, calls, per_stage, targets, cfg_scale=2.0):
+    """graft_lora returns `per_stage` (the modules it grafted) on every stage; None = the targets
+    of that stage's layers (layer index in the module name), so the coverage check passes."""
     monkeypatch.setattr(ws, "lora_scale_from_config", lambda f: cfg_scale)
     monkeypatch.setattr(ws, "lora_targets", lambda f: targets)
-    monkeypatch.setattr(ws, "graft_lora",
-                        lambda stage, f, s, layers=None, lm_head=True: calls.append(("graft", s)) or per_stage)
+
+    def graft(stage, f, s, layers=None, lm_head=True):
+        calls.append(("graft", s))
+        if per_stage is not None:
+            return per_stage
+        return [t for t in targets if int(t.split(".")[1]) in layers]
+    monkeypatch.setattr(ws, "graft_lora", graft)
 
 
 def test_chat_export_unchanged_without_decision_flags(stubbed):
@@ -141,14 +148,49 @@ def test_validate_refused_with_weights_or_lora_before_any_work(stubbed, tmp_path
     assert calls == [] and not out.exists()
 
 
-def test_lora_graft_total_must_match_adapter_targets(stubbed, tmp_path):
+def test_lora_graft_must_cover_every_adapter_module(stubbed, tmp_path):
     model, out, calls, ws, mp = stubbed
-    _lora(mp, ws, calls, per_stage=3, targets=7)
+    _lora(mp, ws, calls, per_stage=["layers.0.a"], targets=["layers.0.a", "layers.4.b"])
     out.mkdir()
     (out / "manifest.json").write_text("{}")  # stale manifest from an earlier run in the same dir
-    with pytest.raises(SystemExit, match="grafted 6 LoRA branches but the adapter has 7 targets"):
+    with pytest.raises(SystemExit, match=r"grafted more than once: \['layers\.0\.a'\]; "
+                                         r"not grafted: \['layers\.4\.b'\]"):
         ex.run_export(str(model), str(out), 2, lora=str(tmp_path / "adapter_model.safetensors"))
     assert not (out / "manifest.json").exists()
+
+
+def test_lora_key_matching_two_matmuls_cannot_cancel_one_matching_none(stubbed, tmp_path):
+    # 2 grafts for 2 targets passed the old count check
+    model, out, calls, ws, mp = stubbed
+    stages = iter([["layers.0.a", "layers.0.a"], []])
+    _lora(mp, ws, calls, per_stage=None, targets=["layers.0.a", "layers.0.b"])
+    mp.setattr(ws, "graft_lora", lambda stage, f, s, layers=None, lm_head=True: next(stages))
+    with pytest.raises(SystemExit, match=r"not grafted: \['layers\.0\.b'\]"):
+        ex.run_export(str(model), str(out), 2, lora=str(tmp_path / "adapter_model.safetensors"))
+    assert not (out / "manifest.json").exists()
+
+
+def test_lora_audit_adapter_refused_before_any_work(stubbed, tmp_path):
+    # limits-audit B2: embedding LoRA + modules_to_save ["norm"]; the real weight_swap checks run
+    model, out, calls, ws, mp = stubbed
+    sys.path.insert(0, os.path.dirname(__file__))
+    from test_weight_swap import save_adapter, write_audit_adapter
+    mp.setattr(ex, "extract_stage", lambda *a: pytest.fail("extract_stage ran"))
+    ad = tmp_path / "ad"
+    ad.mkdir()
+    path = write_audit_adapter(ad)
+    with pytest.raises(ValueError, match="modules_to_save"):
+        ex.run_export(str(model), str(out), 2, lora=path)
+    # without adapter_config.json (explicit --lora-scale) the key check still refuses
+    (ad / "adapter_config.json").unlink()
+    with pytest.raises(ValueError, match="lora_embedding"):
+        ex.run_export(str(model), str(out), 2, lora=path, lora_scale=1.0)
+    p = "base_model.model.model.layers.0.mlp.down_proj"
+    path = save_adapter(ad / "saved.safetensors", [f"{p}.lora_A.weight", f"{p}.lora_B.weight",
+                                                   "base_model.model.model.norm.weight"])
+    with pytest.raises(ValueError, match=r"model\.norm\.weight"):
+        ex.run_export(str(model), str(out), 2, lora=path, lora_scale=1.0)
+    assert calls == []
 
 
 def test_embeddings_swap_failure_leaves_no_manifest(stubbed, tmp_path):
@@ -166,14 +208,14 @@ def test_embeddings_swap_failure_leaves_no_manifest(stubbed, tmp_path):
 
 def test_lora_scale_comes_from_adapter_config(stubbed, tmp_path):
     model, out, calls, ws, mp = stubbed
-    _lora(mp, ws, calls, per_stage=3, targets=6, cfg_scale=2.0)
+    _lora(mp, ws, calls, per_stage=None, targets=["layers.0.a", "layers.4.a"], cfg_scale=2.0)
     ex.run_export(str(model), str(out), 2, lora=str(tmp_path / "adapter_model.safetensors"))
     assert [c for c in calls if c[0] == "graft"] == [("graft", 2.0), ("graft", 2.0)]
 
 
 def test_lora_scale_override_warns(stubbed, tmp_path, capsys):
     model, out, calls, ws, mp = stubbed
-    _lora(mp, ws, calls, per_stage=3, targets=6, cfg_scale=2.0)
+    _lora(mp, ws, calls, per_stage=None, targets=["layers.0.a", "layers.4.a"], cfg_scale=2.0)
     ex.run_export(str(model), str(out), 2, lora=str(tmp_path / "a.safetensors"), lora_scale=0.5)
     assert [c for c in calls if c[0] == "graft"] == [("graft", 0.5), ("graft", 0.5)]
     assert "WARNING: --lora-scale 0.5 overrides adapter_config.json's 2.0" in capsys.readouterr().out
@@ -626,10 +668,11 @@ def test_cli_kev_head_pt_recording_full_weights_refused(cli, monkeypatch, capsys
 def test_kev_head_meta_reads_base_and_weights_mode(tmp_path):
     torch = pytest.importorskip("torch")
     pt = tmp_path / "head.pt"
-    torch.save({"head": {}, "temperature": 1.0, "base": "Qwen/Qwen3.5-9B-Base", "weights": "lora"}, pt)
-    assert de.kev_head_meta(str(pt)) == {"base": "Qwen/Qwen3.5-9B-Base", "weights": "lora"}
-    torch.save({"head": {}, "temperature": 1.0}, pt)
-    assert de.kev_head_meta(str(pt)) == {"base": None, "weights": None}
+    head = {k: torch.zeros(1) for k in ("q.weight", "q.bias", "k.weight", "k.bias")}
+    torch.save({"head": head, "temperature": 1.0, "base": "Qwen/Qwen3.5-9B-Base", "weights": "lora"}, pt)
+    assert de.kev_head_meta(str(pt)) == {"base": "Qwen/Qwen3.5-9B-Base", "weights": "lora", "unsupported": []}
+    torch.save({"head": head, "temperature": 1.0}, pt)
+    assert de.kev_head_meta(str(pt)) == {"base": None, "weights": None, "unsupported": []}
     torch.save({"head": {}, "temperature": 1.0, "x": _Pickled()}, pt)
     with pytest.raises(Exception, match="(?i)weights_only|unsupported|global"):
         de.kev_head_meta(str(pt))
@@ -678,3 +721,67 @@ def test_cli_jev_weights_need_the_not_merged_statement(cli, monkeypatch, capsys)
         "--out", str(tmp / "t"))
     (_, _, kw, _), = calls
     assert kw["weights"] == str(base)
+
+
+# Task 23 (limits-audit B3): head.pt features the server's pointer head does not implement.
+
+def _kev_head(pt, **meta):
+    """A head.pt shaped like jaredpalmer/kev-9b's (kev.checkpoint.Meta fields + training args)."""
+    torch = pytest.importorskip("torch")
+    d = {"head": {"q.weight": torch.ones(4, 8), "q.bias": torch.zeros(4),
+                  "k.weight": torch.ones(4, 8), "k.bias": torch.zeros(4)},
+         "temperature": 2.19, "base": "Qwen/Qwen3.5-9B-Base", "base_revision": "rev", "lora": 16,
+         "head_dim": 4, "option_isolation": False, "special_embeddings": False, "weights_dtype": "fp32",
+         "holdout": [], "weights": "lora", "lora_placement": "full",
+         "args": {"option_isolation": 0, "special_embeddings": 0, "lora_targets": "all"}}
+    d.update(meta)
+    torch.save({k: v for k, v in d.items() if v is not _DROP}, pt)
+    return str(pt)
+
+
+_DROP = object()
+
+
+def test_kev_shipped_head_shape_exports(tmp_path):
+    pt = _kev_head(tmp_path / "head.pt")
+    de.write_kev_profile(pt, str(tmp_path / "tree"), hidden=8)
+    assert json.loads((tmp_path / "tree" / "decision" / "head.json").read_text()) == {"kind": "pointer", "dp": 4}
+    # older checkpoints without the flags take kev.checkpoint.Meta's defaults
+    pt = _kev_head(tmp_path / "old.pt", head_dim=_DROP, option_isolation=_DROP, special_embeddings=_DROP)
+    de.write_kev_profile(pt, str(tmp_path / "old"), hidden=8)
+
+
+@pytest.mark.parametrize("meta,match", [
+    ({"option_isolation": True}, "option_isolation"),
+    ({"special_embeddings": True}, "special_embeddings"),
+    ({"head_dim": 256}, "head_dim 256"),
+    ({"weights": "full"}, "weights 'full'"),
+])
+def test_kev_head_flags_the_server_does_not_implement_refused(tmp_path, meta, match):
+    pt = _kev_head(tmp_path / "head.pt", **meta)
+    with pytest.raises(ValueError, match=match):
+        de.write_kev_profile(pt, str(tmp_path / "tree"), hidden=8)
+    assert not (tmp_path / "tree").exists()
+
+
+def test_kev_head_extra_head_tensor_refused(tmp_path):
+    torch = pytest.importorskip("torch")
+    head = {"q.weight": torch.ones(4, 8), "q.bias": torch.zeros(4), "k.weight": torch.ones(4, 8),
+            "k.bias": torch.zeros(4), "gate.weight": torch.ones(1, 8)}
+    pt = _kev_head(tmp_path / "head.pt", head=head)
+    with pytest.raises(ValueError, match="gate.weight"):
+        de.write_kev_profile(pt, str(tmp_path / "tree"), hidden=8)
+    assert not (tmp_path / "tree").exists()
+
+
+@pytest.mark.parametrize("flag", ["option_isolation", "special_embeddings"])
+def test_cli_kev_unsupported_head_flag_is_a_clean_error(cli, capsys, flag):
+    run, calls, base, tmp = cli
+    kd = _kev_dir(tmp)
+    pt = _kev_head(kd / "head.pt", **{flag: True})
+    with pytest.raises(SystemExit) as e:
+        run("kev", "--base-ir", str(base), "--weights", "W", "--lora", "L.safetensors",
+            "--head-pt", pt, "--out", str(tmp / "t"))
+    assert e.value.code == 2
+    assert f"{flag}=True" in capsys.readouterr().err
+    assert calls == [] and not (tmp / "t").exists()
