@@ -936,6 +936,76 @@ The Ministral NPU run, compile included, took about ten minutes (`--ov-cache-dir
 a restart load the blobs). Not run on GPU: the staged multi-machine trees and the 26B /
 31B models, whose two stages per node already fill the shared memory on CPU.
 
+## Qwen2.5-VL and Qwen3-VL on `ov-runtime` (2026-10-16)
+
+Both served one box only through `ov-genai` (294 / 223 prompt tokens on the SDK check's
+448x448 image). They now take images on staged `ov-runtime` trees, reusing the `qwen35`
+machinery: the Qwen2-VL processor port, `get_rope_index`, pad expansion and the
+`pad_cache_id` image keys.
+
+**IR facts** (`OpenVINO/Qwen2.5-VL-7B-Instruct-int4-ov`, `OpenVINO/Qwen3-VL-4B-Instruct-int4-ov`,
+read from the published `.xml` files) [verified]:
+
+| IR | Qwen2.5-VL-7B | Qwen3-VL-4B |
+|---|---|---|
+| language model | `inputs_embeds [?,?,3584]`, `attention_mask [?,?]`, `position_ids [3,?,?]`, `beam_idx` | the same at 2560, plus `visual_pos_masks [?,?]` boolean and `deepstack_visual_embeds [?,?,2560]` |
+| vision patch | `hidden_states [?,?]` -> `[N,1280]` | `hidden_states [?,?]` -> `[N,1024]` |
+| vision positions | none | `input [4,?]` -> `[4,N,1024]` (Qwen3.5's bilinear table) |
+| vision merger | `hidden_states [N,1280]`, `attention_mask [1,N,N]`, `window_attention_mask [1,N,N]`, `window_index [N/4]`, `rotary_pos_emb [N,40]` -> `[N/4,3584]` | `hidden_states [N,1024]`, `attention_mask`, `rotary_pos_emb [N,32]` -> `last_hidden_state [N/4,2560]` and `deepstack_feature_lists [3,N/4,2560]` |
+
+**M-RoPE.** transformers 5.14.1 `Qwen2_5_VLModel.get_rope_index` and
+`Qwen3VLModel.get_rope_index` give a still image `t = start`, `h/w = start + row/col` and
+advance by `max(h, w) / merge`; Qwen2.5-VL's `tokens_per_second` spacing multiplies the
+temporal index only for videos (`time_interval = 1` for images). That is exactly
+`qwen35_vision::rope::mrope_positions`, so both reuse it; GenAI 2026.4.1's
+`create_position_ids` (`qwen2vl/classes.cpp`) builds the same. The language model takes
+HF's three rows (not Qwen3.5's four) and decode positions are `index + rope_delta` on
+all three (`get_generation_phase_position_ids`). The `mrope_section` split
+(Qwen2.5-VL `[16,24,24]` in contiguous blocks, `apply_multimodal_rotary_pos_emb`;
+Qwen3-VL `[24,20,20]` interleaved, `apply_interleaved_mrope`) is inside the language
+model IR, so the host feeds both the same rows. Parity: the size-only expansion equals
+HF's `input_ids` and the positions equal `get_rope_index` on one image, two images,
+multi-turn and text only, for both families (`tests/qwen_vl_vision_parity.rs`).
+
+**Wire.** A tree's `vision.mrope_rows` (3) and every stage's `position_rows` (3) switch
+on a fourth frame `[lead] [hidden] [positions]`, I64 `[1, 3, T]`, on every step, decode
+included (24 bytes a token). Rank 0 computes it from the turn's positions; other stages
+bind `position_ids [3, 1, T]` from it and forward it. Versioning: a build without the
+family refuses the tree (`vision.family`), a tree cut before the fields refuses to load
+(`re-cut`), and a peer that does not expect the frame reads it as a lead and fails on the
+shape. The static and packed paths pin 1-D positions, so these trees are refused there.
+
+**DeepStack (Qwen3-VL).** `deepstack_visual_indexes [5, 11, 17]` are the *vision*
+layers the features come from; the language model adds feature `k` to the image tokens'
+hidden states after decoder layer `k`, `k < 3` (`Qwen3VLTextModel.forward`,
+`_deepstack_process`), which the IR does with `cumsum(visual_pos_masks)` gathers from
+`deepstack_visual_embeds[k]` feeding layers 1-3's input norms [verified in the IR]. So
+only stage 0 needs the rows, and stage 0 runs on rank 0 beside the encoder: they never
+cross the wire. `cut_vlm_lm.py` refuses a stage 0 shorter than three layers or a later
+stage that keeps a DeepStack input, and turns `visual_pos_masks` into an i64 input
+converted to boolean in the graph (the runtime feeds no boolean tensors). Text and
+decode steps feed an all-zero mask and one zero row per layer, as GenAI does.
+
+**Qwen2.5-VL vision host inputs.** `window_index` / `cu_window_seqlens` port
+`vision_utils.get_vision_window_index` (windows of 112 / 2 / 14 = 4 merge units, empty
+padded windows dropped as `unique_consecutive` does) and the window mask follows GenAI's
+`get_window_attention_mask`; the rotary table and per-frame mask are Qwen3.5's. Exact
+against HF on seven images (`window_index`, `cu_window_seqlens`), and the preprocessing is
+bit-identical to the PIL processor for both families (CLIP mean/std and 14-px patches
+for Qwen2.5-VL).
+
+**Hardening carried over.** The expansion is sized from image dimensions before any
+encode and checked against the encoder's; encodes are cached on (tenant, sha256);
+`<|vision_start|>`, `<|image_pad|>`, `<|vision_end|>` and `<|video_pad|>` are reserved in
+caller text (`MediaConfig::qwen35_native`); `kv_coord` keys image turns on `vision_kv`
+and, since positions are looked up by absolute index, a warm suffix needs no change (the
+DeepStack rows are trimmed with the image rows).
+
+**Not yet verified on hardware**: cutting the published IRs (the tests cut toy models
+with the export's interface, `tools/tests/test_vlm_qwen_cut.py`), the IR parity test
+(`tests/qwen_vl_vision_ir.rs` with `gen_qwen_vl_fixtures.py --run-ir`) and the SDK check
+on two machines.
+
 ## Engines that do not take images (2026-10-15)
 
 Every engine either serves images or refuses them with an OpenAI 400; none answers
@@ -945,7 +1015,7 @@ from the text alone.
 |---|---|---|
 | `ov-genai` | VLM exports with the vision IR | served; on a text-only export the API offers no image input (400), and `submit` refuses too |
 | `qwen35` | trees with the vision IRs | served; otherwise 400 at the API and at `submit` |
-| `ov-runtime` | Gemma 4 surgery trees (`vision.family = "gemma4"`, stateful, static and packed paths), Pixtral trees (`"pixtral"`, stateful, static and packed paths) and Mistral 3 trees (`"mistral3"`) | served; other trees 400; an unknown `vision.family` fails to load |
+| `ov-runtime` | Gemma 4 surgery trees (`vision.family = "gemma4"`, stateful, static and packed paths), Pixtral trees (`"pixtral"`, stateful, static and packed paths) and Mistral 3 trees (`"mistral3"`), Qwen2.5-VL / Qwen3-VL trees (`"qwen2_5_vl"` / `"qwen3_vl"`, stateful only) | served; other trees 400; an unknown `vision.family` fails to load |
 | `gemma4` (`gemma4_cached` trees) | E2B/E4B trees from `export_gemma4.py --vision` | served; other trees 400 at the API and at `submit` |
 | `ov-dist-spec` | Pixtral / Mistral 3 target trees cut with `--all-logits` (`vision.family` `"pixtral"` / `"mistral3"`); the draft stays text-only | served; v5 (text) targets 400 at the API and at `submit`; a Gemma 4 target fails to load |
 | `sparse-moe` | no | 400 |
