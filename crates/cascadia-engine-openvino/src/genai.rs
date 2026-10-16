@@ -379,11 +379,18 @@ pub fn unsupported_vision(model_dir: &Path) -> Option<String> {
         .get("vision_config")
         .and_then(|v| v.get("model_type"))
         .and_then(serde_json::Value::as_str)?;
+    // Mistral 3 exports carry a Pixtral vision tower too; their cut needs
+    // `--family mistral3`.
+    let family = match cfg.get("model_type").and_then(serde_json::Value::as_str) {
+        Some("mistral3") => "mistral3",
+        _ => "pixtral",
+    };
     (vision == "pixtral").then(|| {
-        "GenAI preprocesses Pixtral as LLaVA-1.5 (center crop, no [IMG_BREAK]/[IMG_END]) \
-         and answers about a different image; serve this export's images with ov-runtime \
-         (tools/vlm_surgery/cut_vlm_lm.py --family pixtral, --num-stages 1 on one box)"
-            .to_string()
+        format!(
+            "GenAI preprocesses Pixtral as LLaVA-1.5 (center crop, no [IMG_BREAK]/[IMG_END]) \
+             and answers about a different image; serve this export's images with ov-runtime \
+             (tools/vlm_surgery/cut_vlm_lm.py --family {family}, --num-stages 1 on one box)"
+        )
     })
 }
 
@@ -1140,7 +1147,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let write = |v: &str| std::fs::write(dir.join("config.json"), v).unwrap();
         write(r#"{"model_type":"llava","vision_config":{"model_type":"pixtral"}}"#);
-        assert!(unsupported_vision(&dir).unwrap().contains("Pixtral"));
+        let hint = unsupported_vision(&dir).unwrap();
+        assert!(
+            hint.contains("Pixtral") && hint.contains("--family pixtral"),
+            "{hint}"
+        );
+        // Mistral 3 carries a Pixtral tower too, and is cut as `mistral3`.
+        write(r#"{"model_type":"mistral3","vision_config":{"model_type":"pixtral"}}"#);
+        assert!(unsupported_vision(&dir)
+            .unwrap()
+            .contains("--family mistral3"));
         write(
             r#"{"model_type":"qwen3_5_moe","vision_config":{"model_type":"qwen3_5_moe_vision"}}"#,
         );
