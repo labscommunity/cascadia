@@ -67,6 +67,7 @@ missing `tokenizer.json`) is logged and decisions stay off; chat keeps working.
 
 ```json
 {
+  "id": "dec-3f2a9c0e8b7d4e61a5c2f0b9d8e7a6c5",
   "answers": [
     {"type": "predicate", "name": "urgent", "probability": 0.8},
     {"type": "choice", "name": "department", "choice": "billing",
@@ -83,17 +84,22 @@ missing `tokenizer.json`) is logged and decisions stay off; chat keeps working.
        {"value": 2, "label": "Fully blocked", "probability": 0.2}
      ],
      "confidence": 0.55}
-  ]
+  ],
+  "usage": {"input_tokens": 412, "output_tokens": 0, "total_tokens": 412}
 }
 ```
 
+- `id` is unique per response: `dec-` and 32 hex digits.
+- `usage.input_tokens` is the number of prompt tokens prefilled across all passes, the same count
+  `/v1/systemone` reports. `output_tokens` is always 0 (decision models do not decode), so
+  `total_tokens` equals `input_tokens`.
 - `predicate`: `probability` is p(true).
 - `choice`: `choice` is the most likely value (the first one on a tie), echoed with its original
   JSON type. `probabilities` lists every choice in request order.
 - `score`: `score` is the probability-weighted level index, Σ i·pᵢ. `probabilities` lists every
   level with its index and label.
-- The response is exactly `{"answers": [...]}`. The `refusal` answer type is never emitted,
-  because these models do not refuse.
+- The response is exactly `{"id", "answers", "usage"}`. The `refusal` answer type is never
+  emitted, because these models do not refuse.
 
 ### Errors
 
@@ -104,9 +110,13 @@ Errors use OpenAI's envelope, which the OpenAI SDKs parse into typed exceptions:
 ```
 
 `type` is `invalid_request_error` for 400 and 413, and `server_error` for 501 and 503. A body that
-is not valid JSON, or does not match the request schema, is rejected by the HTTP framework before
-the handler runs, with its default 4xx body rather than this envelope (the same as the other
-routes). SDK clients only send well-formed bodies.
+does not match the request schema is a 400 in this envelope too, never the framework's 422 text.
+An unknown or malformed content part is named, for example `unsupported content part type
+'input_file'` or `input_text parts need a string "text"`; any other schema mismatch (a missing
+`questions`, an unknown question `type`) is `invalid request body: <parser message>`. A body that
+is not valid JSON (400), a missing `content-type: application/json` (415) or a body over
+`--api-max-body-mb` (413) keeps the framework's status and message, inside this envelope with
+`type` `invalid_request_error`.
 
 ### Mapping notes
 
@@ -216,7 +226,7 @@ is always 0: decision models do not decode.
 
 ### Errors
 
-Errors are `{"error": "<message>"}` with the status codes below. As on the OpenAI route, a body
+Errors are `{"error": "<message>"}` with the status codes below. Unlike the OpenAI route, a body
 that is not valid JSON or does not match the request schema (a missing `questions`, an unknown
 question `type`, a value nested deeper than 128 levels) is rejected by the HTTP framework before
 the handler runs, with its default 4xx text body rather than this shape.
