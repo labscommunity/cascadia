@@ -282,6 +282,11 @@ pub struct EncodeTrace {
     pub hidden_states: Vec<f32>,
     /// `[N / merge^2, out_hidden]`, one row per prompt image token.
     pub image_embeds: Vec<f32>,
+    /// Qwen3-VL only: the merger's `deepstack_feature_lists`,
+    /// `[layers, N / merge^2, out_hidden]` layer-major, the features the
+    /// language model adds to its first `layers` decoder layers' output at the
+    /// image tokens. `None` for a merger without that output (Qwen3.5).
+    pub deepstack: Option<(usize, Vec<f32>)>,
 }
 
 /// The export's three vision IRs (`openvino_vision_embeddings{,_pos,_merger}_model.xml`)
@@ -290,6 +295,10 @@ pub struct VisionEncoder {
     patch: cascadia_ov_genai_shim::Runtime,
     pos: cascadia_ov_genai_shim::Runtime,
     merger: cascadia_ov_genai_shim::Runtime,
+    /// Output index of the merger's image rows (`last_hidden_state`).
+    image_out: usize,
+    /// Output index of the merger's `deepstack_feature_lists` (Qwen3-VL).
+    deepstack_out: Option<usize>,
     cfg: VisionConfig,
 }
 
@@ -301,7 +310,15 @@ fn read_f32(
     rt: &cascadia_ov_genai_shim::Runtime,
     what: &str,
 ) -> Result<(Vec<usize>, Vec<f32>), String> {
-    let (dtype, shape, bytes) = rt.output(0).map_err(|e| format!("{what}: {e}"))?;
+    read_f32_at(rt, 0, what)
+}
+
+pub(crate) fn read_f32_at(
+    rt: &cascadia_ov_genai_shim::Runtime,
+    idx: usize,
+    what: &str,
+) -> Result<(Vec<usize>, Vec<f32>), String> {
+    let (dtype, shape, bytes) = rt.output(idx).map_err(|e| format!("{what}: {e}"))?;
     if dtype != cascadia_ov_genai_shim::DType::F32 {
         return Err(format!("{what}: output is {dtype:?}, expected f32"));
     }
@@ -325,12 +342,32 @@ impl VisionEncoder {
             cascadia_ov_genai_shim::Runtime::compile(&path.to_string_lossy(), device, plugin)
                 .map_err(|e| format!("compiling {}: {e}", path.display()))
         };
+        let merger = compile("_merger")?;
+        let (mut image_out, mut deepstack_out) = (None, None);
+        for i in 0..merger.output_count() {
+            let names = merger
+                .output_aliases(i)
+                .map_err(|e| format!("merger output {i}: {e}"))?;
+            if names.iter().any(|n| n.contains("deepstack")) {
+                deepstack_out = Some(i);
+            } else if image_out.is_none() {
+                image_out = Some(i);
+            }
+        }
+        let image_out = image_out.unwrap_or(0);
         Ok(Self {
             patch: compile("")?,
             pos: compile("_pos")?,
-            merger: compile("_merger")?,
+            merger,
+            image_out,
+            deepstack_out,
             cfg,
         })
+    }
+
+    /// Whether the merger also returns DeepStack features (Qwen3-VL).
+    pub fn has_deepstack(&self) -> bool {
+        self.deepstack_out.is_some()
     }
 
     /// Image embeddings `[tokens, out_hidden]` for one preprocessed item.
@@ -402,18 +439,31 @@ impl VisionEncoder {
             })
             .and_then(|_| self.merger.infer())
             .map_err(|e| format!("merger: {e}"))?;
-        let (shape, image_embeds) = read_f32(&self.merger, "merger")?;
+        let (shape, image_embeds) = read_f32_at(&self.merger, self.image_out, "merger")?;
         let tokens = n / (merge * merge);
-        if shape != [tokens, self.cfg.out_hidden_size] {
+        let out = self.cfg.out_hidden_size;
+        if shape != [tokens, out] {
             return Err(format!(
-                "merger returned {shape:?}, expected [{tokens}, {}]",
-                self.cfg.out_hidden_size
+                "merger returned {shape:?}, expected [{tokens}, {out}]"
             ));
         }
+        let deepstack = match self.deepstack_out {
+            Some(i) => {
+                let (shape, v) = read_f32_at(&self.merger, i, "merger deepstack")?;
+                match shape[..] {
+                    [layers, t, h] if t == tokens && h == out && layers > 0 => Some((layers, v)),
+                    _ => return Err(format!(
+                        "merger deepstack returned {shape:?}, expected [layers, {tokens}, {out}]"
+                    )),
+                }
+            }
+            None => None,
+        };
         Ok(EncodeTrace {
             patch_embeds,
             hidden_states,
             image_embeds,
+            deepstack,
         })
     }
 }
