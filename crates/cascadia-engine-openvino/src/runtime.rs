@@ -126,6 +126,14 @@ struct StageConfig {
     packed_seq: Option<u32>,
     #[serde(default)]
     packed_context: Option<u32>,
+    /// Mask ports of a packed IR built from several mask producers
+    /// (`tools/packed_variant.py`, Gemma 4): port name -> `full_attention` or
+    /// `sliding_attention`. Absent = the one full-attention `attn_mask_4d`.
+    #[serde(default)]
+    packed_masks: Option<std::collections::BTreeMap<String, String>>,
+    /// Sliding window (tokens) of the `sliding_attention` mask port.
+    #[serde(default)]
+    packed_sliding_window: Option<u32>,
     /// Chunked-prefill IR variant (openvino_prefill_model.xml) query-window
     /// width, exported via `--static-prefill-seq`. Absent/None on decode-only
     /// static exports and on all stateful exports.
@@ -363,6 +371,105 @@ fn packed_geometry_error(slots: u32, packed_seq: u32) -> Option<String> {
     })
 }
 
+/// Refuse a prompt holding an image wider than one packed inference: its rows
+/// attend to each other both ways (Gemma 4), so the image must sit whole in
+/// one inference of `packed_seq` rows, the packed analogue of the static
+/// path's `image_safe_take` refusal.
+fn packed_image_too_wide(
+    prompt_ids: &[i64],
+    image_token: i64,
+    packed_seq: usize,
+) -> Option<String> {
+    let mut widest = 0;
+    let mut run = 0;
+    for &t in prompt_ids {
+        run = if t == image_token { run + 1 } else { 0 };
+        widest = widest.max(run);
+    }
+    (widest > packed_seq).then(|| {
+        format!(
+            "an image of {widest} tokens does not fit one packed inference of {packed_seq} rows \
+             (this model attends inside an image both ways, so an image is never split); send \
+             a smaller image (lower detail), or serve with a packed variant built with \
+             --packed-seq {widest} or more"
+        )
+    })
+}
+
+/// Mask kinds a packed IR can declare (`stage_config.packed_masks` values).
+const PACKED_FULL: &str = "full_attention";
+const PACKED_SLIDING: &str = "sliding_attention";
+
+/// Turn the packed IR's mask ports (`(kind, port, dtype)`, kind found from
+/// the port's name) into the masks to feed, checked against what
+/// `stage_config.packed_masks` says the tool built. A sliding port needs the
+/// window. No metadata means the one full-attention port of every packed IR
+/// built before Gemma 4.
+fn packed_mask_ports(
+    ports: Vec<(String, String, ShimDType)>,
+    declared: Option<&std::collections::BTreeMap<String, String>>,
+    window: Option<usize>,
+) -> Result<Vec<crate::packed_exec::PackedMask>, String> {
+    if ports.is_empty() {
+        return Err(
+            "packed variant missing the attn_mask_4d input — rebuild it with \
+                    tools/packed_variant.py"
+                .into(),
+        );
+    }
+    let mut kinds: Vec<&str> = ports.iter().map(|(k, _, _)| k.as_str()).collect();
+    kinds.sort_unstable();
+    let mut want: Vec<&str> = match declared {
+        Some(d) => d.values().map(String::as_str).collect(),
+        None => vec![PACKED_FULL],
+    };
+    want.sort_unstable();
+    if kinds != want {
+        return Err(format!(
+            "packed IR mask ports {:?} do not match stage_config.packed_masks {:?}; rebuild \
+             the packed variant with tools/packed_variant.py",
+            ports.iter().map(|(_, p, _)| p).collect::<Vec<_>>(),
+            declared
+        ));
+    }
+    ports
+        .into_iter()
+        .map(|(kind, port, dtype)| {
+            let w = if kind == PACKED_SLIDING {
+                match window {
+                    Some(w) if w > 0 => Some(w),
+                    _ => {
+                        return Err(format!(
+                            "packed IR has a sliding-window mask port ({port}) but \
+                             stage_config.json gives no packed_sliding_window; rebuild the \
+                             packed variant with tools/packed_variant.py"
+                        ))
+                    }
+                }
+            } else {
+                None
+            };
+            Ok(crate::packed_exec::PackedMask::new(port, dtype, w))
+        })
+        .collect()
+}
+
+/// `8x256 x7, 2x512 x1`: each distinct `(kv_heads, head_dim)` and how many
+/// layers have it, in first-seen order, for the load log.
+fn describe_kv_geometry(geom: &[(usize, usize)]) -> String {
+    let mut seen: Vec<((usize, usize), usize)> = Vec::new();
+    for &g in geom {
+        match seen.iter_mut().find(|(k, _)| *k == g) {
+            Some((_, n)) => *n += 1,
+            None => seen.push((g, 1)),
+        }
+    }
+    seen.iter()
+        .map(|((k, d), n)| format!("{k}x{d} x{n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Refuse a prompt that cannot fit one packed slot's KV region.
 ///
 /// A slot's region is a bounded window: once it fills, the oldest entries slide
@@ -388,9 +495,20 @@ fn packed_prompt_too_long(prompt_tokens: usize, region: usize) -> Option<String>
 /// The reuse length must travel: only the driver stage holds the prompt ids to
 /// match against the prefix cache, but EVERY stage has to open the same shared
 /// columns or its attention would disagree with stage 0's.
-fn encode_wire_plan(rows: &[Option<(usize, i64, usize)>]) -> WireTensor {
+///
+/// A tree whose masks open image blocks (Gemma 4) sends `images` too, as a
+/// fourth row (`[1, 4, S]`: the row's image id, `-1` for text and idle rows),
+/// because only rank 0 knows where the images are. The row count is the
+/// version: a peer built before image blocks rejects a 4-row frame as not a
+/// plan, and a Gemma stage rejects a 3-row one, so mixed versions fail loudly
+/// instead of masking differently. Without `images` the frame is unchanged.
+fn encode_wire_plan(
+    rows: &[crate::packed_exec::WireRowOpt],
+    images: Option<&[Option<u32>]>,
+) -> WireTensor {
     let s = rows.len();
-    let mut data = Vec::with_capacity(s * 3 * 8);
+    let n_rows = if images.is_some() { 4 } else { 3 };
+    let mut data = Vec::with_capacity(s * n_rows * 8);
     for r in rows {
         let slot: i64 = r.map(|(sl, _, _)| sl as i64).unwrap_or(-1);
         data.extend_from_slice(&slot.to_le_bytes());
@@ -403,25 +521,66 @@ fn encode_wire_plan(rows: &[Option<(usize, i64, usize)>]) -> WireTensor {
         let sh: i64 = r.map(|(_, _, sh)| sh as i64).unwrap_or(0);
         data.extend_from_slice(&sh.to_le_bytes());
     }
-    WireTensor::new(WireDType::I64, [1, 3, s as u32], data)
+    if let Some(images) = images {
+        for (i, r) in rows.iter().enumerate() {
+            let img: i64 = match (r, images.get(i).copied().flatten()) {
+                (Some(_), Some(id)) => id as i64,
+                _ => -1,
+            };
+            data.extend_from_slice(&img.to_le_bytes());
+        }
+    }
+    WireTensor::new(WireDType::I64, [1, n_rows as u32, s as u32], data)
 }
 
 /// Decode + validate a packed plan frame. Rejects a wrong dtype/rank, a
 /// length/shape disagreement, out-of-range slot ids, and negative positions —
 /// each of which would otherwise index or wrap somewhere downstream.
+#[cfg(test)]
 fn decode_wire_plan(
     t: &WireTensor,
     slots: usize,
-) -> EngineResult<Vec<Option<(usize, i64, usize)>>> {
+) -> EngineResult<Vec<crate::packed_exec::WireRowOpt>> {
+    decode_wire_plan_images(t, slots, false).map(|(rows, _)| rows)
+}
+
+/// [`decode_wire_plan`] for either frame version: `want_images` (this stage
+/// masks image blocks) requires the 4-row frame and returns its per-row image
+/// ids; otherwise the 3-row frame and an empty id list.
+fn decode_wire_plan_images(
+    t: &WireTensor,
+    slots: usize,
+    want_images: bool,
+) -> EngineResult<(Vec<crate::packed_exec::WireRowOpt>, Vec<Option<u32>>)> {
     let s = t.shape[2] as usize;
-    if t.dtype != WireDType::I64 || t.shape[0] != 1 || t.shape[1] != 3 || s == 0 {
+    let n_rows = if want_images { 4 } else { 3 };
+    let other_version = if want_images { 3 } else { 4 };
+    if t.dtype == WireDType::I64 && t.shape[0] == 1 && s > 0 && t.shape[1] == other_version {
+        let (this, peer) = if want_images {
+            (
+                "masks image blocks (a token_type_ids vision tree)",
+                "an upstream built before packed image blocks",
+            )
+        } else {
+            (
+                "does not mask image blocks",
+                "an upstream serving a token_type_ids vision tree",
+            )
+        };
         return Err(EngineError::Backend(format!(
-            "expected an I64 [1,3,S] packed plan frame, got dtype={:?} shape={:?} — likely a \
+            "packed plan frame has {} rows but this stage {this} and needs {n_rows}: likely \
+             {peer}; run the same build and tree on every stage",
+            t.shape[1]
+        )));
+    }
+    if t.dtype != WireDType::I64 || t.shape[0] != 1 || t.shape[1] as usize != n_rows || s == 0 {
+        return Err(EngineError::Backend(format!(
+            "expected an I64 [1,{n_rows},S] packed plan frame, got dtype={:?} shape={:?} — likely a \
              packed/non-packed pipeline mismatch or a desynced activation stream",
             t.dtype, t.shape
         )));
     }
-    if t.data.len() != s * 3 * 8 {
+    if t.data.len() != s * n_rows * 8 {
         return Err(EngineError::Backend(format!(
             "packed plan frame payload {} bytes does not match shape {:?}",
             t.data.len(),
@@ -434,12 +593,17 @@ fn decode_wire_plan(
         i64::from_le_bytes(b)
     };
     let mut out = Vec::with_capacity(s);
+    let mut images = Vec::with_capacity(if want_images { s } else { 0 });
     for r in 0..s {
         let slot = rd(r);
         let pos = rd(s + r);
         let shared = rd(2 * s + r);
+        let image = if want_images { rd(3 * s + r) } else { -1 };
         if slot < 0 {
             out.push(None);
+            if want_images {
+                images.push(None);
+            }
             continue;
         }
         if shared < 0 || shared > pos {
@@ -457,9 +621,46 @@ fn decode_wire_plan(
                 "packed plan row {r} has negative position {pos}"
             )));
         }
+        if image < -1 || image > u32::MAX as i64 {
+            return Err(EngineError::Backend(format!(
+                "packed plan row {r} has image id {image} out of range"
+            )));
+        }
         out.push(Some((slot as usize, pos, shared as usize)));
+        if want_images {
+            images.push((image >= 0).then_some(image as u32));
+        }
     }
-    Ok(out)
+    Ok((out, images))
+}
+
+/// The plan a relay or head stage runs for a plan frame off the wire. Same-slot
+/// rows in one frame are a prefill chunk: their causal order is restored from
+/// arrival order, and their image ids (empty unless the tree masks image
+/// blocks) come from the frame, so this stage masks exactly as the sender did.
+fn relay_plan(
+    rows: &[crate::packed_exec::WireRowOpt],
+    images: &[Option<u32>],
+) -> crate::packed::PackedPlan {
+    let mut seen: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    crate::packed::PackedPlan {
+        rows: rows
+            .iter()
+            .enumerate()
+            .map(|(r, row)| {
+                row.map(|(slot, _, _)| {
+                    let n = seen.entry(slot).or_insert(0);
+                    let order = *n;
+                    *n += 1;
+                    crate::packed::PackedRow {
+                        slot,
+                        order,
+                        image: images.get(r).copied().flatten(),
+                    }
+                })
+            })
+            .collect(),
+    }
 }
 
 /// True when a packed plan carries a prefill chunk: some slot owns more than
@@ -468,7 +669,7 @@ fn decode_wire_plan(
 /// across every remaining stage. A single-row prefill chunk is
 /// indistinguishable from a decode row here and gets the strict decode
 /// deadline, which a one-row tail inference fits comfortably.
-fn plan_has_prefill_rows(rows: &[Option<(usize, i64, usize)>]) -> bool {
+fn plan_has_prefill_rows(rows: &[crate::packed_exec::WireRowOpt]) -> bool {
     let mut seen = std::collections::HashSet::new();
     rows.iter()
         .flatten()
@@ -1597,7 +1798,10 @@ fn vision_family(v: &PipelineVision, export_version: Option<&str>) -> EngineResu
 /// `tools/vlm_surgery/static_variant.py`, stage 0 fed embedding rows) serves
 /// both: a `token_type_ids` tree needs a chunked-prefill IR at least one
 /// image wide, and no chunk ends inside an image (`image_safe_take`). The
-/// packed path serves causal families (Pixtral) only.
+/// packed path serves both too: on a `token_type_ids` tree its host masks open
+/// each image both ways, a packed prefill chunk never splits an image
+/// (`crate::packed::image_safe_take`), and the plan frame carries each row's
+/// image id to the other stages.
 struct VisionTree {
     /// Rank 0 only.
     first: Option<VisionFirst>,
@@ -2092,6 +2296,12 @@ impl OvRuntimeEngine {
     /// A vision tree whose stages take `token_type_ids` (the third frame).
     fn vision_token_types(&self) -> bool {
         self.vision.as_ref().is_some_and(|v| v.token_types)
+    }
+
+    /// Packed slots on a `token_type_ids` tree: the masks open image blocks
+    /// and the plan frame carries each row's image id (`[1, 4, S]`).
+    fn packed_image_blocks(&self) -> bool {
+        self.packed.is_some() && self.vision_token_types()
     }
 
     /// Vision tree, rank 0: embed `input_ids` through the text embedding
@@ -3174,8 +3384,17 @@ impl OvRuntimeEngine {
                 // rows to the same slots) plus the hidden block, then take back
                 // one sampled token per row from the tail.
                 bytes_to_f32(odt, &obytes).and_then(|hidden| {
-                    let plan_rows = self.packed.as_ref().unwrap().last_plan_rows();
-                    let tokens = self.exchange_packed_downstream(&hidden, &oshape, &plan_rows)?;
+                    let packed = self.packed.as_ref().unwrap();
+                    let plan_rows = packed.last_plan_rows();
+                    let images = self
+                        .packed_image_blocks()
+                        .then(|| packed.last_plan_images());
+                    let tokens = self.exchange_packed_downstream(
+                        &hidden,
+                        &oshape,
+                        &plan_rows,
+                        images.as_deref(),
+                    )?;
                     self.emit_packed_tokens(&tokens, kind, &mut out)
                 })
             };
@@ -3236,13 +3455,14 @@ impl OvRuntimeEngine {
         &mut self,
         hidden: &[f32],
         shape: &[usize],
-        plan_rows: &[Option<(usize, i64, usize)>],
+        plan_rows: &[crate::packed_exec::WireRowOpt],
+        plan_images: Option<&[Option<u32>]>,
     ) -> EngineResult<Vec<i32>> {
         let down = self.downstream.clone().ok_or_else(|| {
             EngineError::Backend("packed pipeline stage has no downstream".into())
         })?;
         let s3 = to_shape3(shape);
-        let plan_frame = encode_wire_plan(plan_rows);
+        let plan_frame = encode_wire_plan(plan_rows, plan_images);
         // f16 on the wire, matching the non-packed path: the receiving stage
         // converts to f16 before feeding the IR regardless, so f32 doubled the
         // bytes per stage hop and bought nothing.
@@ -3349,6 +3569,7 @@ impl OvRuntimeEngine {
             .clone()
             .ok_or_else(|| EngineError::Backend("packed relay stage has no upstream".into()))?;
         let slots = self.packed.as_ref().unwrap().kv.slots;
+        let want_images = self.packed_image_blocks();
         let (plan_res, hidden, hshape) = self.block_on(async {
             let mut guard = up.lock().await;
             // The plan frame is this stage's idle wait for the next unit of
@@ -3369,7 +3590,7 @@ impl OvRuntimeEngine {
                 .recv_reply()
                 .await
                 .map_err(|e| EngineError::Backend(format!("packed hidden recv: {e}")))?;
-            let plan_res = decode_wire_plan(&pf, slots);
+            let plan_res = decode_wire_plan_images(&pf, slots, want_images);
             let hidden: Vec<f32> = match hf.dtype {
                 WireDType::F16 => f16_bytes_to_f32(&hf.data),
                 _ => hf
@@ -3419,27 +3640,13 @@ impl OvRuntimeEngine {
     /// turn any failure into an on-wire NACK instead of a swallowed error.
     fn relay_packed_body(
         &mut self,
-        plan_res: EngineResult<Vec<Option<(usize, i64, usize)>>>,
+        plan_res: EngineResult<(Vec<crate::packed_exec::WireRowOpt>, Vec<Option<u32>>)>,
         hidden: Vec<f32>,
         hshape: [u32; MAX_RANK],
     ) -> EngineResult<Vec<i32>> {
-        let plan_rows = plan_res?;
+        let (plan_rows, plan_images) = plan_res?;
         let hidden_size = hshape[2] as usize;
-        let plan = crate::packed::PackedPlan {
-            rows: plan_rows
-                .iter()
-                .map(|r| r.map(|(slot, _, _)| crate::packed::PackedRow { slot, order: 0 }))
-                .collect(),
-        };
-        // Same-slot rows in one frame are a prefill chunk: restore their causal
-        // order so this stage masks them exactly as the sender did.
-        let mut plan = plan;
-        let mut seen: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-        for row in plan.rows.iter_mut().flatten() {
-            let n = seen.entry(row.slot).or_insert(0);
-            row.order = *n;
-            *n += 1;
-        }
+        let plan = relay_plan(&plan_rows, &plan_images);
         let positions: Vec<i64> = plan_rows
             .iter()
             .map(|r| r.map(|(_, p, _)| p).unwrap_or(0))
@@ -3471,7 +3678,8 @@ impl OvRuntimeEngine {
             // A downstream failure (including its NACK) propagates as Err —
             // the caller NACKs our own upstream in turn, so the abort
             // reaches rank 0 no matter how deep the pipeline is.
-            self.exchange_packed_downstream(&hidden_out, &oshape, &plan_rows)
+            let images = self.packed_image_blocks().then_some(plan_images.as_slice());
+            self.exchange_packed_downstream(&hidden_out, &oshape, &plan_rows, images)
         }
     }
 
@@ -4675,12 +4883,25 @@ impl Engine for OvRuntimeEngine {
                 // A vision tree's images expand the prompt: encode them now so
                 // the region check sees the real length.
                 let mut images = None;
+                let image_blocks = self.vision.as_ref().is_some_and(|v| v.token_types);
                 if !task.media.is_empty() {
                     if let Some(first) = self.vision.as_mut().and_then(|v| v.first.as_mut()) {
                         let (expanded, rows) = first
                             .frontend
                             .prepare(&task.media, &ids, &task.tenant)
                             .map_err(EngineError::UnsupportedInput)?;
+                        // Gemma 4 attends inside an image both ways, so each
+                        // image must fit one packed inference.
+                        if image_blocks {
+                            let image = first.frontend.image_token();
+                            if let Some(msg) =
+                                packed_image_too_wide(&expanded, image, packed.kv.packed_seq)
+                            {
+                                warn!(task = %task.task_id, packed_seq = packed.kv.packed_seq,
+                                      "refusing an image wider than one packed inference");
+                                return Err(EngineError::UnsupportedInput(msg));
+                            }
+                        }
                         ids = expanded;
                         images = Some(rows);
                     }
@@ -5486,6 +5707,9 @@ pub struct OvRuntimeBuilder {
     static_prefill_params: Option<(u32, u32)>,
     /// Resolved packed geometry: (slots, packed_seq, packed_context).
     packed_params: Option<(u32, u32, u32)>,
+    /// `stage_config.packed_masks` / `packed_sliding_window` (see StageConfig).
+    packed_masks: Option<std::collections::BTreeMap<String, String>>,
+    packed_window: Option<u32>,
     /// Gemma 4 vision tree, loaded with the stage.
     vision: Option<VisionTree>,
 }
@@ -5734,6 +5958,8 @@ impl Builder for OvRuntimeBuilder {
                      per-request context={}",
                     past_len / slots
                 )));
+                self.packed_masks = stage_cfg.packed_masks.clone();
+                self.packed_window = stage_cfg.packed_sliding_window;
                 Some((slots, pseq, pctx))
             }
         };
@@ -6041,15 +6267,11 @@ impl Builder for OvRuntimeBuilder {
             // Bidirectional image attention (token_type_ids) needs each image
             // whole inside one inference: on the static path that is a
             // chunked-prefill IR at least one image wide. Packed slots build
-            // their own per-row mask and carry no token types.
-            if token_types && self.packed_slots > 0 {
-                return Err(EngineError::InvalidConfig(format!(
-                    "a {family:?} vision tree attends bidirectionally inside each image \
-                     (token_type_ids), which --packed-slots does not carry; serve it \
-                     without packed slots"
-                )));
-            }
-            let static_window = if !stage_cfg.stateful && token_types {
+            // the image blocks into their host mask instead, and keep each
+            // image inside one packed inference (`image_safe_take`); the
+            // image ids ride the plan frame to the other stages.
+            let packed_seq = self.packed_params.map(|(_, pseq, _)| pseq as usize);
+            let static_window = if !stage_cfg.stateful && token_types && packed_seq.is_none() {
                 match self.static_prefill_params {
                     Some((pseq, _)) => Some(pseq as usize),
                     None => {
@@ -6071,6 +6293,25 @@ impl Builder for OvRuntimeBuilder {
                         return Err(EngineError::InvalidConfig(format!(
                             "static prefill IR takes {pseq} rows but an image can be {max} \
                              tokens; re-convert with --prefill-seq {max} or more"
+                        )));
+                    }
+                }
+                // Packed: an image wider than one packed inference is refused
+                // per request (submit), so a narrow variant still serves text
+                // and smaller images. Say so at load.
+                if let (true, Some(pseq), Some(max)) =
+                    (token_types, packed_seq, f.frontend.max_image_tokens())
+                {
+                    if pseq < max {
+                        warn!(
+                            packed_seq = pseq,
+                            max_image_tokens = max,
+                            "packed slots: images wider than packed_seq are refused; rebuild \
+                             the packed variant with --packed-seq {max} to serve every image"
+                        );
+                        events.push(LoadProgress::message(format!(
+                            "packed slots: packed_seq {pseq} is narrower than the widest image \
+                             ({max} tokens); wider images are refused"
                         )));
                     }
                 }
@@ -6346,53 +6587,122 @@ impl Builder for OvRuntimeBuilder {
                 let pos_in = pcanon.get("position_ids").cloned().ok_or_else(|| {
                     EngineError::Backend("packed variant missing position_ids".into())
                 })?;
-                // The packed variant replaces the 2D attention_mask with a 4D
-                // per-row mask parameter; find it by name and take its dtype
-                // from the IR so f16/f32 exports both work.
-                let mut mask_in = None;
-                let mut mask_dtype = ShimDType::F16;
+                // The packed variant replaces the 2D attention_mask with 4D
+                // per-row mask parameters: `attn_mask_4d` (full attention)
+                // and, on Gemma 4, `attn_mask_sliding_4d`. Find each by name
+                // and take its dtype from the IR so f16/f32 exports both work.
+                let mut ports: Vec<(String, String, ShimDType)> = Vec::new();
+                let mut types_in = None;
                 for idx in 0..prt.input_count() {
                     let aliases = prt.input_aliases(idx).map_err(map_ov_err)?;
-                    if aliases.iter().any(|a| a.contains("attn_mask_4d")) {
-                        mask_in = Some(prt.input_name(idx).map_err(map_ov_err)?);
-                        mask_dtype = prt.input_dtype(idx).map_err(map_ov_err)?;
+                    let kind = if aliases.iter().any(|a| a.contains("attn_mask_sliding_4d")) {
+                        Some(PACKED_SLIDING)
+                    } else if aliases.iter().any(|a| a.contains("attn_mask_4d")) {
+                        Some(PACKED_FULL)
+                    } else {
+                        None
+                    };
+                    if let Some(kind) = kind {
+                        ports.push((
+                            kind.to_string(),
+                            prt.input_name(idx).map_err(map_ov_err)?,
+                            prt.input_dtype(idx).map_err(map_ov_err)?,
+                        ));
+                    }
+                    if aliases.iter().any(|a| a == "token_type_ids") {
+                        types_in = Some(prt.input_name(idx).map_err(map_ov_err)?);
                     }
                 }
-                let mask_in = mask_in.ok_or_else(|| {
-                    EngineError::Backend(
-                        "packed variant missing the attn_mask_4d input — rebuild it with \
-                         tools/packed_variant.py"
+                let masks = packed_mask_ports(
+                    ports,
+                    self.packed_masks.as_ref(),
+                    self.packed_window.map(|w| w as usize),
+                )
+                .map_err(EngineError::InvalidConfig)?;
+                // Still unsupported on packed slots, refused by name:
+                // - a packed IR that still reads the 2D attention_mask (some
+                //   node besides the replaced mask producers consumes it), which
+                //   the host has no per-row value for;
+                // - a token_type_ids tree with mixed KV geometry (Gemma 4's
+                //   sliding + global layers) whose packed IR has no sliding
+                //   mask port: it was built without config.json layer_types and
+                //   would let sliding layers see past their window.
+                if pcanon.contains_key("attention_mask") {
+                    return Err(EngineError::InvalidConfig(
+                        "packed variant still reads the 2D attention_mask (a node other than \
+                         the SDPA mask producers consumes it); packed slots feed only 4D \
+                         per-row masks, so this stage cannot be packed"
                             .into(),
-                    )
-                })?;
-                let kv = crate::packed::PackedKv::new(
+                    ));
+                }
+                let has_sliding = masks.iter().any(|m| m.window.is_some());
+                let token_types_tree = self.vision.as_ref().is_some_and(|v| v.token_types);
+                if token_types_tree && self.static_kv_layers.is_some() && !has_sliding {
+                    return Err(EngineError::InvalidConfig(
+                        "this Gemma 4 stage mixes sliding and global layers but its packed \
+                         variant has no attn_mask_sliding_4d port; rebuild it with \
+                         tools/packed_variant.py with the tree's config.json (layer_types, \
+                         sliding_window) beside the stage"
+                            .into(),
+                    ));
+                }
+                let geom = match self.static_kv_layers.clone() {
+                    Some(g) => {
+                        if g.len() != players.len() || g.iter().any(|&(k, d)| k == 0 || d == 0) {
+                            return Err(EngineError::InvalidConfig(format!(
+                                "stage_config.kv_layers lists {} layers but the packed IR has {}",
+                                g.len(),
+                                players.len()
+                            )));
+                        }
+                        g
+                    }
+                    None => vec![(kvh as usize, hd as usize); players.len()],
+                };
+                let kv = crate::packed::PackedKv::with_layers(
                     slots as usize,
                     past_len,
                     pseq as usize,
-                    players.len(),
-                    kvh as usize,
-                    hd as usize,
+                    geom,
                     ShimDType::F16,
                     self.packed_prefix as usize,
                 );
+                let image_blocks = self.vision.as_ref().is_some_and(|v| v.token_types);
+                let image_token = match self.vision.as_ref().and_then(|v| v.first.as_ref()) {
+                    Some(first) if image_blocks => Some(first.frontend.image_token()),
+                    _ => None,
+                };
+                let mask_desc: Vec<String> = masks
+                    .iter()
+                    .map(|m| match m.window {
+                        Some(w) => format!("{} (sliding window {w})", m.port),
+                        None => format!("{} (full)", m.port),
+                    })
+                    .collect();
                 info!(
                     slots,
                     packed_seq = pseq,
                     region = kv.region,
                     shared_prefix = kv.prefix_capacity,
+                    masks = %mask_desc.join(", "),
+                    kv_geometry = %describe_kv_geometry(kv.geometry()),
+                    image_blocks,
+                    token_type_ids_port = types_in.as_deref().unwrap_or("none"),
                     "packed multi-slot decode active"
                 );
-                Some(crate::packed_exec::PackedState::new(
+                let mut state = crate::packed_exec::PackedState::new(
                     prt,
                     kv,
                     players,
                     ids_in,
                     hidden_in,
                     embed_hidden,
-                    mask_in,
+                    masks,
                     pos_in,
-                    mask_dtype,
-                ))
+                );
+                state.types_in = types_in;
+                state.image_token = image_token;
+                Some(state)
             }
         };
 
@@ -6711,7 +7021,7 @@ mod tests {
             Some((3, 12, 12)),
             Some((1, 129, 40)),
         ];
-        let frame = encode_wire_plan(&rows);
+        let frame = encode_wire_plan(&rows, None);
         assert_eq!(frame.shape, [1, 3, 4]);
         let back = decode_wire_plan(&frame, 4).expect("round trip");
         assert_eq!(back, rows);
@@ -6723,13 +7033,160 @@ mod tests {
         let lead = encode_wire_lead(5, None);
         assert!(decode_wire_plan(&lead, 4).is_err());
         // slot id beyond this stage's slot count
-        let frame = encode_wire_plan(&[Some((9usize, 0i64, 0usize))]);
+        let frame = encode_wire_plan(&[Some((9usize, 0i64, 0usize))], None);
         let err = decode_wire_plan(&frame, 4).unwrap_err().to_string();
         assert!(err.contains("slot 9"), "{err}");
         // negative position would wrap in the ring math
-        let mut bad = encode_wire_plan(&[Some((0usize, 1i64, 0usize))]);
+        let mut bad = encode_wire_plan(&[Some((0usize, 1i64, 0usize))], None);
         bad.data[8..16].copy_from_slice(&(-3i64).to_le_bytes());
         assert!(decode_wire_plan(&bad, 4).is_err());
+    }
+
+    /// Gemma 4's plan frame carries each row's image id as a fourth row; it
+    /// round-trips, and idle rows decode as text.
+    #[test]
+    fn packed_plan_frame_round_trips_image_ids() {
+        let rows = vec![
+            Some((1usize, 40i64, 0usize)),
+            Some((1, 41, 0)),
+            None,
+            Some((1, 43, 0)),
+        ];
+        let images = vec![None, Some(0u32), Some(7), Some(2)];
+        let frame = encode_wire_plan(&rows, Some(&images));
+        assert_eq!(frame.shape, [1, 4, 4]);
+        let (back, back_images) = decode_wire_plan_images(&frame, 4, true).expect("round trip");
+        assert_eq!(back, rows);
+        // the idle row's id is not sent
+        assert_eq!(back_images, vec![None, Some(0), None, Some(2)]);
+        // without image ids the frame is exactly the old one
+        assert_eq!(encode_wire_plan(&rows, None).data, {
+            let mut f = encode_wire_plan(&rows, Some(&images)).data;
+            f.truncate(3 * 4 * 8);
+            f
+        });
+    }
+
+    /// Mixed versions fail loudly instead of masking differently: a stage that
+    /// masks image blocks refuses the 3-row frame, every other stage (and any
+    /// peer built before image blocks) refuses the 4-row one.
+    #[test]
+    fn packed_plan_frame_versions_do_not_mix() {
+        let rows = vec![Some((0usize, 3i64, 0usize))];
+        let old = encode_wire_plan(&rows, None);
+        let new = encode_wire_plan(&rows, Some(&[Some(0)]));
+        let err = decode_wire_plan_images(&old, 2, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("masks image blocks") && err.contains("3 rows"),
+            "{err}"
+        );
+        let err = decode_wire_plan_images(&new, 2, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not mask image blocks"), "{err}");
+        assert!(
+            decode_wire_plan(&new, 2).is_err(),
+            "a pre-image peer rejects it"
+        );
+        // an out-of-range image id is rejected
+        let mut bad = encode_wire_plan(&rows, Some(&[Some(0)]));
+        bad.data[24..32].copy_from_slice(&(-5i64).to_le_bytes());
+        assert!(decode_wire_plan_images(&bad, 2, true).is_err());
+    }
+
+    /// A relay rebuilds the sender's plan from the wire, image ids included,
+    /// and its masks (full and sliding) come out byte-identical.
+    #[test]
+    fn relay_rebuilt_image_plan_masks_like_the_sender() {
+        let mut kv =
+            crate::packed::PackedKv::with_layers(2, 16, 6, vec![(8, 4), (2, 8)], ShimDType::F16, 0);
+        kv.advance(1, 3);
+        let images = [None, Some(0), Some(0), Some(0), None];
+        let sender = crate::packed::PackedPlan::chunk_with_images(6, 1, &images);
+        let rows: Vec<crate::packed_exec::WireRowOpt> = sender
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(r, pr)| pr.map(|pr| (pr.slot, 3 + r as i64, 0)))
+            .collect();
+        let ids: Vec<Option<u32>> = sender
+            .rows
+            .iter()
+            .map(|r| r.and_then(|p| p.image))
+            .collect();
+        let frame = encode_wire_plan(&rows, Some(&ids));
+        let (wrows, wimages) = decode_wire_plan_images(&frame, 2, true).unwrap();
+        let rebuilt = relay_plan(&wrows, &wimages);
+        assert_eq!(rebuilt.rows, sender.rows);
+        for window in [None, Some(2)] {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            kv.fill_mask_window(&sender, &mut a, ShimDType::F32, window);
+            kv.fill_mask_window(&rebuilt, &mut b, ShimDType::F32, window);
+            assert_eq!(a, b, "window {window:?}");
+        }
+    }
+
+    #[test]
+    fn packed_refuses_an_image_wider_than_one_inference() {
+        let ids = [1i64, 9, 9, 9, 2, 9, 9];
+        assert!(packed_image_too_wide(&ids, 9, 3).is_none());
+        let msg = packed_image_too_wide(&ids, 9, 2).expect("3-token image, 2 rows");
+        assert!(
+            msg.contains("3 tokens") && msg.contains("--packed-seq 3"),
+            "{msg}"
+        );
+        assert!(packed_image_too_wide(&[1, 2, 3], 9, 1).is_none());
+    }
+
+    #[test]
+    fn packed_mask_ports_follow_the_ir_and_its_metadata() {
+        let full = || {
+            (
+                PACKED_FULL.to_string(),
+                "attn_mask_4d".to_string(),
+                ShimDType::F32,
+            )
+        };
+        let sliding = || {
+            (
+                PACKED_SLIDING.to_string(),
+                "attn_mask_sliding_4d".to_string(),
+                ShimDType::F32,
+            )
+        };
+        // every packed IR before Gemma 4: one full port, no metadata
+        let m = packed_mask_ports(vec![full()], None, None).unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!((m[0].port.as_str(), m[0].window), ("attn_mask_4d", None));
+        // Gemma 4: both, the sliding one with its window
+        let declared: std::collections::BTreeMap<String, String> = [
+            ("attn_mask_4d".to_string(), PACKED_FULL.to_string()),
+            (
+                "attn_mask_sliding_4d".to_string(),
+                PACKED_SLIDING.to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let m = packed_mask_ports(vec![sliding(), full()], Some(&declared), Some(1024)).unwrap();
+        let w: Vec<_> = m.iter().map(|m| (m.port.as_str(), m.window)).collect();
+        assert_eq!(
+            w,
+            vec![("attn_mask_sliding_4d", Some(1024)), ("attn_mask_4d", None)]
+        );
+        // a sliding port without a window, a missing port, no port at all
+        assert!(packed_mask_ports(vec![sliding(), full()], Some(&declared), None).is_err());
+        assert!(packed_mask_ports(vec![full()], Some(&declared), Some(1024)).is_err());
+        assert!(packed_mask_ports(vec![sliding(), full()], None, Some(1024)).is_err());
+        assert!(packed_mask_ports(Vec::new(), None, None).is_err());
+    }
+
+    #[test]
+    fn kv_geometry_is_described_per_shape() {
+        let g = [(8, 256), (8, 256), (2, 512), (8, 256)];
+        assert_eq!(describe_kv_geometry(&g), "8x256 x3, 2x512 x1");
     }
 
     #[test]
