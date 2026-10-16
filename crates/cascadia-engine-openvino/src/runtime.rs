@@ -1633,10 +1633,11 @@ impl Frontend {
         &mut self,
         media: &[cascadia_types::MediaInput],
         prompt_ids: &[i64],
+        tenant: &str,
     ) -> Result<(Vec<i64>, Vec<Vec<f32>>), String> {
         match self {
-            Frontend::Gemma4(f) => f.prepare(media, prompt_ids),
-            Frontend::Pixtral(f) => f.prepare(media, prompt_ids),
+            Frontend::Gemma4(f) => f.prepare(media, prompt_ids, tenant),
+            Frontend::Pixtral(f) => f.prepare(media, prompt_ids, tenant),
         }
     }
 
@@ -2740,7 +2741,10 @@ impl OvRuntimeEngine {
                     ));
                 };
                 let started = std::time::Instant::now();
-                match first.frontend.prepare(&task.media, &prompt_ids) {
+                match first
+                    .frontend
+                    .prepare(&task.media, &prompt_ids, &task.tenant)
+                {
                     Ok((ids, rows)) => {
                         info!(
                             task = %task.task_id,
@@ -2784,16 +2788,15 @@ impl OvRuntimeEngine {
                 // prefill would splice only part of its rows.
                 let taken = self
                     .kv
-                    .take_warm(&task.tenant, prompt_i32)
-                    .filter(|(blob, len, _)| {
+                    .take_warm_where(&task.tenant, prompt_i32, |blob, len| {
                         let depth = crate::kv_coordination::kv_seq_from_blob(blob)
-                            .map(|s| s.min(*len))
-                            .unwrap_or(*len);
+                            .map(|s| s.min(len))
+                            .unwrap_or(len);
                         let splits = spans.as_ref().is_some_and(|sp| sp.splits(depth));
                         if splits {
                             info!(
                                 depth,
-                                "ov-runtime: cached prefix ends inside an image; cold"
+                                "ov-runtime: a cached prefix ends inside an image; skipped"
                             );
                         }
                         !splits
@@ -4676,7 +4679,7 @@ impl Engine for OvRuntimeEngine {
                     if let Some(first) = self.vision.as_mut().and_then(|v| v.first.as_mut()) {
                         let (expanded, rows) = first
                             .frontend
-                            .prepare(&task.media, &ids)
+                            .prepare(&task.media, &ids, &task.tenant)
                             .map_err(EngineError::UnsupportedInput)?;
                         ids = expanded;
                         images = Some(rows);

@@ -1075,7 +1075,7 @@ impl Gemma4Engine {
                     return Ok(refuse("this gemma4 tree takes no images".into()));
                 };
                 let started = std::time::Instant::now();
-                match frontend.prepare(&task.media, &prompt_ids) {
+                match frontend.prepare(&task.media, &prompt_ids, &task.tenant) {
                     Ok((ids, rows)) => {
                         info!(
                             task = %task.task_id,
@@ -1118,14 +1118,16 @@ impl Gemma4Engine {
                 // prefill would feed only part of its rows.
                 let taken = self
                     .kv
-                    .take_warm(&task.tenant, prompt_i32)
-                    .filter(|(blob, len, _)| {
+                    .take_warm_where(&task.tenant, prompt_i32, |blob, len| {
                         let depth = crate::kv_coordination::kv_seq_from_blob(blob)
-                            .map(|s| s.min(*len))
-                            .unwrap_or(*len);
+                            .map(|s| s.min(len))
+                            .unwrap_or(len);
                         let splits = spans.as_ref().is_some_and(|sp| sp.splits(depth));
                         if splits {
-                            info!(depth, "gemma4: cached prefix ends inside an image; cold");
+                            info!(
+                                depth,
+                                "gemma4: a cached prefix ends inside an image; skipped"
+                            );
                         }
                         !splits
                     });

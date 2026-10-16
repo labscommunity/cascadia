@@ -1258,7 +1258,7 @@ impl Qwen36Engine {
                 #[allow(unreachable_patterns)]
                 other => return Err(format!("media {i}: {other:?} is not supported")),
             }
-            if let Some((rows, grid)) = v.cache.get(&m.sha256) {
+            if let Some((rows, grid)) = v.cache.get(&task.tenant, &m.sha256) {
                 images.push((rows, grid, m.sha256));
                 from_cache += 1;
                 continue;
@@ -1274,7 +1274,7 @@ impl Qwen36Engine {
                 .encoder
                 .encode(&p)
                 .map_err(|e| format!("image {i}: {e}"))?;
-            v.cache.put(m.sha256, &rows, p.grid_thw);
+            v.cache.put(&task.tenant, m.sha256, &rows, p.grid_thw);
             images.push((rows, p.grid_thw, m.sha256));
         }
         v.cache.report(from_cache, task.media.len());

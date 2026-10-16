@@ -401,6 +401,7 @@ impl Frontend {
         &mut self,
         media: &[cascadia_types::MediaInput],
         prompt_ids: &[i64],
+        tenant: &str,
     ) -> Result<(Vec<i64>, Vec<Vec<f32>>), String> {
         let mut rows = Vec::with_capacity(media.len());
         let mut grids = Vec::with_capacity(media.len());
@@ -414,7 +415,7 @@ impl Frontend {
             if m.num_frames != 1 || m.pixels.len() != m.expected_len() {
                 return Err(format!("image {i}: malformed pixel buffer"));
             }
-            if let Some((emb, grid)) = self.cache.get(&m.sha256) {
+            if let Some((emb, grid)) = self.cache.get(tenant, &m.sha256) {
                 grids.push(grid);
                 rows.push(emb);
                 from_cache += 1;
@@ -423,7 +424,7 @@ impl Frontend {
             let p = preprocess(&m.pixels, m.width, m.height, &self.preprocess)
                 .map_err(|e| format!("image {i}: {e}"))?;
             let (emb, _) = self.encode(&p).map_err(|e| format!("image {i}: {e}"))?;
-            self.cache.put(m.sha256, &emb, (p.rows, p.cols));
+            self.cache.put(tenant, m.sha256, &emb, (p.rows, p.cols));
             grids.push((p.rows, p.cols));
             rows.push(emb);
         }
