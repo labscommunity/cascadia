@@ -3,6 +3,13 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+/// Calibration bounds checked at load. Shipped profiles use temperatures near 1 (JEV ~0.98,
+/// Kev ~2.19) and biases of a few units; with these bounds `(logit + bias) / temperature` is at
+/// most ~3.4e41 for any finite f32 logit, far inside f64.
+pub const MIN_TEMPERATURE: f64 = 1e-3;
+pub const MAX_TEMPERATURE: f64 = 1e3;
+pub const MAX_ABS_BIAS: f64 = 1e4;
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Family {
@@ -67,15 +74,27 @@ impl DecisionProfile {
                 format!("{:?}", p.family).to_lowercase()
             ));
         }
-        // A zero, negative or non-finite temperature turns every probability into NaN.
+        // A zero, negative or non-finite temperature turns every probability into NaN, and so
+        // does one small enough (or a bias large enough) for `(logit + bias) / temperature` to
+        // overflow (H17). Within these bounds it stays finite for every finite f32 logit.
         let temps = p
             .jev
             .iter()
             .flat_map(|j| j.temperature.values())
             .chain(p.kev.iter().map(|k| &k.temperature));
-        if let Some(t) = temps.copied().find(|t| !(t.is_finite() && *t > 0.0)) {
+        if let Some(t) = temps
+            .copied()
+            .find(|t| !(MIN_TEMPERATURE..=MAX_TEMPERATURE).contains(t))
+        {
             return Err(format!(
-                "{}: temperature must be finite and > 0, got {t}",
+                "{}: temperature must be in [{MIN_TEMPERATURE}, {MAX_TEMPERATURE}], got {t}",
+                path.display()
+            ));
+        }
+        let biases = p.jev.iter().flat_map(|j| j.bias.iter());
+        if let Some(b) = biases.copied().find(|b| !(b.abs() <= MAX_ABS_BIAS)) {
+            return Err(format!(
+                "{}: bias must be in [-{MAX_ABS_BIAS}, {MAX_ABS_BIAS}], got {b}",
                 path.display()
             ));
         }
@@ -124,6 +143,48 @@ mod tests {
         assert!(DecisionProfile::load(&p)
             .unwrap_err()
             .contains("temperature"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn calibration_that_can_overflow_is_refused() {
+        // H17: `(logit + bias) / temperature` must stay finite for every finite f32 logit, or
+        // softmax turns it into NaN probabilities.
+        let d = std::env::temp_dir().join(format!("dprof-h17-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("decision.json");
+        let jev = |bias: &str, t: &str| {
+            format!(
+                r#"{{"family":"jev","max_tokens":10,"jev":{{"verbalizers":["false","true"],"verbalizer_ids":[1,2],"bias":{bias},"slots":{{"noul":[0,2],"score":[2,2],"choice":[2,2]}},"temperature":{{"noul":{t},"choice":1,"score":1}}}}}}"#
+            )
+        };
+        let kev =
+            |t: &str| format!(r#"{{"family":"kev","max_tokens":10,"kev":{{"temperature":{t}}}}}"#);
+        // shipped calibrations (JEV ~0.98 and small biases, Kev 2.19) and the bounds load
+        for ok in [
+            jev("[0.1,-0.3]", "0.98"),
+            jev("[10000,-10000]", "0.001"),
+            jev("[0,0]", "1000"),
+            kev("2.193649959389252"),
+            kev("0.001"),
+            kev("1000"),
+        ] {
+            std::fs::write(&p, &ok).unwrap();
+            assert!(DecisionProfile::load(&p).is_ok(), "{ok}");
+        }
+        for (bad, what) in [
+            (jev("[0,0]", "1e-309"), "temperature"),
+            (jev("[0,0]", "0.0009"), "temperature"),
+            (jev("[0,0]", "1001"), "temperature"),
+            (jev("[1e308,0]", "0.5"), "bias"),
+            (jev("[0,-10000.5]", "1"), "bias"),
+            (kev("1e-309"), "temperature"),
+            (kev("1e300"), "temperature"),
+        ] {
+            std::fs::write(&p, &bad).unwrap();
+            let e = DecisionProfile::load(&p).unwrap_err();
+            assert!(e.contains(what), "{bad}: {e}");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

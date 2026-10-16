@@ -292,6 +292,12 @@ pub(crate) async fn evaluate(
                 q.option_keys().len()
             )));
         }
+        // Finite logits can still give NaN/inf probabilities if a calibration overflows
+        // (`(l + b) / t`, H17); the profile bounds prevent it, and this keeps it from ever
+        // reaching a client as `null` in a 200.
+        if !p.iter().all(|x| x.is_finite()) {
+            return Err(engine_failure("non-finite decision probabilities"));
+        }
         let legend = match q.qtype {
             schema::QuestionType::Score => svc.codec.legend(q),
             _ => None,
