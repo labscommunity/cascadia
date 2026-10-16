@@ -1,5 +1,5 @@
-//! Bicubic resize that reproduces Pillow's `Image.resize(..., BICUBIC)` on
-//! 8-bit RGB bit for bit (Pillow `libImaging/Resample.c`, unchanged in
+//! Bicubic (and bilinear) resize that reproduces Pillow's
+//! `Image.resize(..., BICUBIC | BILINEAR)` on 8-bit RGB bit for bit (Pillow `libImaging/Resample.c`, unchanged in
 //! behaviour since 7.0; the fixtures were made with 12.3).
 //!
 //! Hugging Face's Qwen2-VL/Qwen3.5 PIL processor resizes through Pillow, and
@@ -8,14 +8,47 @@
 //!
 //! - separable: a horizontal pass, then a vertical pass, each rounding back
 //!   to `u8` (the intermediate image is 8-bit, not float);
-//! - a Keys cubic kernel with `a = -0.5`, support 2, widened by the scale
-//!   factor when downsampling (antialiasing);
+//! - a Keys cubic kernel with `a = -0.5`, support 2 (bilinear: a triangle,
+//!   support 1), widened by the scale factor when downsampling
+//!   (antialiasing);
 //! - per-output-pixel weights normalised to sum 1 in `f64`, then converted to
 //!   22-bit fixed point, accumulated in integers with a rounding bias.
 
 /// Pillow's `PRECISION_BITS` for 8-bit images: 32 - 8 - 2.
 const PRECISION_BITS: u32 = 32 - 8 - 2;
 const BICUBIC_SUPPORT: f64 = 2.0;
+
+/// Pillow's resampling filters this module implements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filter {
+    /// `Image.BICUBIC` (Pillow's default for `Image.resize`).
+    Bicubic,
+    /// `Image.BILINEAR` (torchvision's default on PIL images).
+    Bilinear,
+}
+
+impl Filter {
+    fn support(self) -> f64 {
+        match self {
+            Filter::Bicubic => BICUBIC_SUPPORT,
+            Filter::Bilinear => 1.0,
+        }
+    }
+
+    fn eval(self, x: f64) -> f64 {
+        match self {
+            Filter::Bicubic => bicubic(x),
+            Filter::Bilinear => {
+                let x = x.abs();
+                if x < 1.0 {
+                    1.0 - x
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+}
 
 fn bicubic(x: f64) -> f64 {
     const A: f64 = -0.5;
@@ -40,10 +73,10 @@ struct Coeffs {
 
 /// Pillow's `precompute_coeffs` + `normalize_coeffs_8bpc` for the full input
 /// range (`box` = whole image).
-fn precompute(in_size: usize, out_size: usize) -> Coeffs {
+fn precompute(in_size: usize, out_size: usize, filter: Filter) -> Coeffs {
     let scale = in_size as f64 / out_size as f64;
     let filterscale = scale.max(1.0);
-    let support = BICUBIC_SUPPORT * filterscale;
+    let support = filter.support() * filterscale;
     let ksize = support.ceil() as usize * 2 + 1;
     let mut bounds = Vec::with_capacity(out_size);
     let mut kk = vec![0i32; out_size * ksize];
@@ -56,7 +89,7 @@ fn precompute(in_size: usize, out_size: usize) -> Coeffs {
         let xmax = ((center + support + 0.5) as i64).min(in_size as i64) as usize - xmin;
         let mut ww = 0.0;
         for (x, kx) in k.iter_mut().enumerate().take(xmax) {
-            let w = bicubic((x as f64 + xmin as f64 - center + 0.5) * ss);
+            let w = filter.eval((x as f64 + xmin as f64 - center + 0.5) * ss);
             *kx = w;
             ww += w;
         }
@@ -87,24 +120,43 @@ fn clip8(ss: i64) -> u8 {
 /// mirrored here. HF's processors resize through whatever Pillow is
 /// installed; the fixtures were made with 12.3.
 pub fn resize_rgb8_bicubic(src: &[u8], w: usize, h: usize, nw: usize, nh: usize) -> Vec<u8> {
+    resize_rgb8(src, w, h, nw, nh, Filter::Bicubic)
+}
+
+/// [`resize_rgb8_bicubic`] with any of Pillow's filters here.
+pub fn resize_rgb8(
+    src: &[u8],
+    w: usize,
+    h: usize,
+    nw: usize,
+    nh: usize,
+    filter: Filter,
+) -> Vec<u8> {
     assert_eq!(src.len(), w * h * 3, "src is not {w}x{h} RGB8");
     assert!(nw > 0 && nh > 0, "empty target size");
     if h > w * 100 && nh < h {
-        let tall = resize_two_pass(src, w, h, w, nh);
-        return resize_two_pass(&tall, w, nh, nw, nh);
+        let tall = resize_two_pass(src, w, h, w, nh, filter);
+        return resize_two_pass(&tall, w, nh, nw, nh, filter);
     }
-    resize_two_pass(src, w, h, nw, nh)
+    resize_two_pass(src, w, h, nw, nh, filter)
 }
 
 /// Pillow's `ImagingResampleInner`: a horizontal pass, then a vertical one.
-fn resize_two_pass(src: &[u8], w: usize, h: usize, nw: usize, nh: usize) -> Vec<u8> {
+fn resize_two_pass(
+    src: &[u8],
+    w: usize,
+    h: usize,
+    nw: usize,
+    nh: usize,
+    filter: Filter,
+) -> Vec<u8> {
     let need_h = nw != w;
     let need_v = nh != h;
     let bias: i64 = 1 << (PRECISION_BITS - 1);
 
     // Horizontal pass over only the rows the vertical pass will read (Pillow's
     // `ybox_first..ybox_last`); the result is identical to a full pass.
-    let vert = need_v.then(|| precompute(h, nh));
+    let vert = need_v.then(|| precompute(h, nh, filter));
     let (row0, row1) = match &vert {
         Some(c) => {
             let first = c.bounds[0].0;
@@ -115,7 +167,7 @@ fn resize_two_pass(src: &[u8], w: usize, h: usize, nw: usize, nh: usize) -> Vec<
     };
     let tmp_h = row1 - row0;
     let tmp: Vec<u8> = if need_h {
-        let c = precompute(w, nw);
+        let c = precompute(w, nw, filter);
         let mut out = vec![0u8; nw * tmp_h * 3];
         for y in 0..tmp_h {
             let src_row = &src[(y + row0) * w * 3..(y + row0 + 1) * w * 3];
@@ -181,7 +233,7 @@ mod tests {
     #[test]
     fn weights_sum_to_one_in_fixed_point() {
         for (i, o) in [(1000, 320), (40, 320), (777, 768), (5, 2)] {
-            let c = precompute(i, o);
+            let c = precompute(i, o, Filter::Bicubic);
             for xx in 0..o {
                 let (_, n) = c.bounds[xx];
                 let s: i64 = c.kk[xx * c.ksize..xx * c.ksize + n]
