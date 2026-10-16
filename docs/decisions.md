@@ -426,8 +426,8 @@ Where this differs from serve_decide:
 
 **Checking wide choices.** The parity tools take `--wide` to drive `WIDE_RECORDS`
 (`tools/decision/records.py`) instead of the 50 parity records: four requests with choices of 17,
-24, 40 + 100 and 256 options, each sent once per strategy (12 records, 21 questions, native
-questions included). Start the server with `--decision-dump` and no other client, then:
+24, 40 + 100 and 256 options, each sent once per strategy (12 records, 17 questions; the `single`
+requests also carry one native choice and one predicate). Start the server with `--decision-dump` and no other client, then:
 
 ```bash
 python tools/decision/codec_golden.py jev --url http://127.0.0.1:8080 --dump ~/parity/jev.jsonl \
@@ -443,15 +443,23 @@ python tools/decision/parity_check.py --url http://127.0.0.1:8080 --ref ~/parity
   layout and its single-token labels (`A`..`Z`, `AA`, ...; the first 16 must be the trained
   head's), with the permute orders drawn by CPython's own `random`, and reads a tournament's
   final back from its prompt: a sorted set of 16 with a member of every group, re-derived in the
-  same layout. It writes `<dump>.wide.golden.jsonl`.
+  same layout. It writes `<dump>.wide.golden.jsonl`. The records always name their strategy, so
+  the profile's default (`auto`) is not exercised here.
 - The dump holds no logits, so the combinations are checked where probabilities exist:
   `reference_stream.py --wide` computes each pass in fp32 (the trained bias on the first 16
-  positions, none beyond) and combines them with Python ports of serve_decide's formulas, over the
-  server's own tournament final (read back through the tree's `tokenizer.json`; a `NOTE` names
-  any question where the reference's groups would pick other finalists). `parity_check.py --wide`
-  then gates the server's answers against it.
-- The gate is the 50 records' gate (`--min-agree 0.96`, `--confident 0.05`). Over 21 questions
-  0.96 allows no flip at all; pass `--min-agree 0.95` to allow one near-tie.
+  positions, none beyond) and combines them with Python ports of serve_decide's formulas. A
+  tournament's finalists are the reference's own, picked from its fp32 group passes: when they are
+  the ones the server ran (read back from its final through the tree's `tokenizer.json`), the
+  server's final is replayed; otherwise a second, small fp32 sweep runs the final over the
+  reference's finalists, and a `FINALISTS` line names the options swapped. A server that picks the
+  wrong finalists therefore differs from the reference. `parity_check.py --wide` then gates the
+  server's answers against it.
+- The gate is the 50 records' top-1 gate (`--min-agree 0.96`, `--confident 0.05`) plus a
+  probability bound: `--max-dp` (default 0.05 with `--wide`) fails the run when any multi-pass
+  question's max |p_server − p_ref| exceeds it, since a combination bug can keep every top-1.
+  int8 JEV-9B measured max |Δp| 0.018 on CPU and 0.024 on GPU on the 50 records; the output
+  prints the multi-pass and native max |dp| side by side. Over 17 questions 0.96 allows no flip;
+  pass `--min-agree 0.94` to allow one near-tie.
 - The wide files never replace the 50-record ones: `jev.wide.parity.jsonl` and
   `jev.wide.golden.jsonl` sit beside `jev.parity.jsonl` and `jev.golden.jsonl`.
 
