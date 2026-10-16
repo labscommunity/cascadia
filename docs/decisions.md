@@ -435,6 +435,14 @@ python tools/decision_export.py clef --base-ir STOCK_INT8_IR \
   overrides it for any family).
 - Kev and Clef trees are exported with the final hidden-state output their heads read; JEV's
   verbalizer reads only the logits.
+- A LoRA adapter is grafted as plain linear branches only. The exporter and
+  `tools/decision/reference_stream.py` refuse an adapter with embedding LoRA keys
+  (`lora_embedding_A/B`), any non-LoRA tensor, a non-empty `modules_to_save` in
+  `adapter_config.json` (as well as DoRA, rank/alpha patterns and `lora_bias`), and the export
+  fails unless every adapter module is grafted exactly once.
+- Kev refuses a `head.pt` whose head the server's pointer readout cannot run: `option_isolation`
+  or `special_embeddings` set, `weights` other than `lora`, a `head_dim` that is not the q/k row
+  count, or head tensors other than `q`/`k` weight and bias.
 - The manifest is written last, so a tree whose export stopped part way is not loadable.
 
 ## Limitations
