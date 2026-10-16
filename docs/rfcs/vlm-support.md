@@ -694,10 +694,17 @@ IRs) runs on the Lunar Lake NPU (Intel AI Boost, NPU 4000) of both nodes, `--dev
 --ov-cache-dir`: 11/11, the same answers and HF's token counts (832 / 1648), one image
 in 18 s against 53 s on CPU. The vision encoder and text embeddings stay on CPU. Each
 stage IR takes about ten minutes to compile; the compile transient left at least 4.7 GB
-free on a 32 GB node holding one 12B stage (decode + prefill). Gemma 26B was not tried on
-the NPU: two of its stages per node with separate decode and prefill IRs need about
-twice the weights in RAM, which already exhausted a node on CPU. That needs one stage
-per node (more machines) or AOT blobs compiled off-node.
+free on a 32 GB node holding one 12B stage (decode + prefill).
+
+Gemma 4 26B-A4B was sized on the NPU one stage at a time (stage 1 of the 4-stage vision
+tree, `static_variant.py --context 736 --prefill-seq 288`, separate decode and prefill
+IRs as the NPU needs, 11 GB on disk). Its decode IR alone did not finish compiling in 90
+minutes (Pixtral: ten), using 9-11 GB of process memory throughout and still growing
+when stopped; node free memory went from 28 to 17 GB. So Gemma 26B on these NPUs is not
+practical: eight such compiles for four stages, two stages per 32 GB node each holding a
+decode and a prefill compilation. The likely cost is the mixture-of-experts layers
+(128 experts per layer, all compiled for static shapes). Gemma 4 26B runs on CPU/GPU
+static trees (see above); on the NPU, Pixtral and other dense models are the fit.
 
 ## Mistral 3 on `ov-runtime` (2026-10-16)
 
