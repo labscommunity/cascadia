@@ -397,9 +397,14 @@ def cli(monkeypatch, tmp_path):
     base.mkdir()
     (base / "config.json").write_text(json.dumps({"text_config": {"max_position_embeddings": 262144, "hidden_size": 8}}))
 
+    # JEV derives its choice labels from the tokenizer.json the tree ships (the base IR's here)
+    (base / "tokenizer.json").write_text("base tokenizer")
+
     def run(*argv):
         monkeypatch.setattr(sys, "argv", ["decision_export.py", *argv])
         de.main()
+    run.tokenizers = []
+    monkeypatch.setattr(de, "load_tokenizer", lambda path: run.tokenizers.append(path) or _jev_tok())
     return run, calls, base, tmp_path
 
 
@@ -407,7 +412,7 @@ def test_cli_jev_lora_from_adapter_dir_and_no_validate(cli, monkeypatch):
     run, calls, base, tmp = cli
     seen = {}
     monkeypatch.setattr(de, "write_jev_profile",
-                        lambda ad, cal, out, max_tokens: seen.update(ad=ad, cal=cal, mt=max_tokens)
+                        lambda ad, cal, out, max_tokens, tokenizer=None: seen.update(ad=ad, cal=cal, mt=max_tokens)
                         or de._write(out, {"family": "jev"}, {"kind": "verbalizer"}))
     ad = tmp / "jev" / "adapter_vllm"
     run("jev", "--base-ir", str(base), "--adapter-dir", str(ad), "--out", str(tmp / "t"))
@@ -566,7 +571,7 @@ def test_cli_jev_max_tokens_from_weights_config(cli, monkeypatch):
     run, calls, base, tmp = cli
     seen = {}
     monkeypatch.setattr(de, "write_jev_profile",
-                        lambda ad, cal, out, max_tokens: seen.update(mt=max_tokens))
+                        lambda ad, cal, out, max_tokens, tokenizer=None: seen.update(mt=max_tokens))
     w = tmp / "ft"
     w.mkdir()
     (w / "config.json").write_text(json.dumps({"text_config": {"max_position_embeddings": 4096}}))
@@ -726,7 +731,7 @@ def test_cli_jev_weights_need_the_not_merged_statement(cli, monkeypatch, capsys)
     hold it merged; the operator must state they do not (backbone_diff said FINETUNED, not MERGED)."""
     run, calls, base, tmp = cli
     monkeypatch.setattr(de, "write_jev_profile",
-                        lambda ad, cal, out, max_tokens: de._write(out, {"family": "jev"}, {"kind": "verbalizer"}))
+                        lambda ad, cal, out, max_tokens, tokenizer=None: de._write(out, {"family": "jev"}, {"kind": "verbalizer"}))
     ad = tmp / "jev" / "adapter_vllm"
     with pytest.raises(SystemExit) as e:
         run("jev", "--base-ir", str(base), "--adapter-dir", str(ad), "--weights", str(base), "--out", str(tmp / "t"))
@@ -867,7 +872,7 @@ def test_max_tokens_override_above_the_family_hard_cap_refused(family, cap, name
 
 
 def _seen_writers(monkeypatch, seen):
-    monkeypatch.setattr(de, "write_jev_profile", lambda ad, cal, out, max_tokens: seen.update(mt=max_tokens))
+    monkeypatch.setattr(de, "write_jev_profile", lambda ad, cal, out, max_tokens, tokenizer=None: seen.update(mt=max_tokens))
     monkeypatch.setattr(de, "kev_head_meta", lambda pt: {"base": None, "weights": None})
     monkeypatch.setattr(de, "write_kev_profile",
                         lambda pt, out, hidden, max_tokens=None: seen.update(mt=max_tokens))
@@ -1066,3 +1071,138 @@ def test_bounds_mirror_the_rust_constants():
     types = _rust_consts("crates/cascadia-types/src/decision.rs")
     assert (de.MAX_DECISION_PROMPT, de.MAX_JOINT_PROMPT, de.MAX_HEAD_INPUT_BYTES) == \
         (types["MAX_DECISION_PROMPT"], types["MAX_JOINT_PROMPT"], types["MAX_HEAD_INPUT_BYTES"])
+
+
+# Task 35: JEV's extended single-token choice labels (serve_decide.py single_token_labels).
+
+class _FakeTok:
+    """Greedy longest-match tokenizer over `vocab` (str -> id); characters outside it get 1000+ord."""
+
+    def __init__(self, vocab):
+        self.vocab = vocab
+        self.longest = max(map(len, vocab))
+
+    def encode(self, text, add_special_tokens=True):
+        assert add_special_tokens is False  # the reference encodes without BOS/EOS
+        ids, i = [], 0
+        while i < len(text):
+            for n in range(min(self.longest, len(text) - i), 0, -1):
+                if text[i:i + n] in self.vocab:
+                    ids.append(self.vocab[text[i:i + n]])
+                    i += n
+                    break
+            else:
+                ids.append(1000 + ord(text[i]))
+                i += 1
+        return ids
+
+
+_LETTERS = [chr(65 + i) for i in range(26)]
+
+
+def _jev_tok(extra=None, trained=range(8, 24)):
+    """A..P are ids `trained` (the _jev_adapter choice ids); Q..Z follow from 500."""
+    vocab = {lab: i for lab, i in zip(_LETTERS, list(trained) + list(range(500, 526)))}
+    vocab.update(extra or {})
+    return _FakeTok(vocab)
+
+
+def test_single_token_labels_skip_multi_token_labels():
+    # (a) AB is two tokens (A, B), AC is one: AB skipped, AC kept
+    labels = de.single_token_labels(_jev_tok({"AC": 900}))
+    assert labels[:26] == list(zip(_LETTERS, list(range(8, 24)) + list(range(500, 510))))
+    assert labels[26:] == [("AC", 900)]
+
+
+def test_single_token_labels_skip_a_label_the_option_line_merges():
+    # (b) "Q)" merges into one token in "x\nQ) y": Q's own token never reaches the prompt
+    labels = de.single_token_labels(_jev_tok({"Q)": 901}))
+    assert "Q" not in [lab for lab, _ in labels]
+    assert [lab for lab, _ in labels][:17] == _LETTERS[:16] + ["R"]
+
+
+def test_single_token_labels_cap_at_256():
+    # (d) every one- and two-letter label is one token: 702 candidates, the first 256 kept
+    two = {a + b: 2000 + 26 * i + j for i, a in enumerate(_LETTERS) for j, b in enumerate(_LETTERS)}
+    labels = de.single_token_labels(_jev_tok(two))
+    assert len(labels) == de.MAX_CHOICE_LABELS == 256
+    assert [lab for lab, _ in labels[:28]] == _LETTERS + ["AA", "AB"]  # outer letter first
+    assert labels[-1][0] == "IV"  # 26 + 8*26 + 22
+
+
+def test_jev_profile_writes_extended_choice_labels(tmp_path):
+    adapter, cal = _jev_adapter(tmp_path)
+    out = tmp_path / "tree"
+    de.write_jev_profile(str(adapter), str(cal), str(out), tokenizer=_jev_tok({"AC": 900}))
+    jev = json.loads((out / "decision.json").read_text())["jev"]
+    assert jev["choice_labels"] == _LETTERS + ["AC"]
+    assert jev["choice_label_ids"] == list(range(8, 24)) + list(range(500, 510)) + [900]
+    lo, hi = jev["slots"]["choice"]
+    assert jev["choice_label_ids"][:hi - lo] == jev["verbalizer_ids"][lo:hi]
+
+
+def test_jev_profile_without_tokenizer_has_no_label_fields(tmp_path):
+    # old trees (and Kev/Clef) carry neither field; the server reads absence as trained slots only
+    adapter, cal = _jev_adapter(tmp_path)
+    de.write_jev_profile(str(adapter), str(cal), str(tmp_path / "tree"))
+    jev = json.loads((tmp_path / "tree" / "decision.json").read_text())["jev"]
+    assert "choice_labels" not in jev and "choice_label_ids" not in jev
+
+
+def test_jev_labels_not_matching_the_trained_ids_refused(tmp_path):
+    # (c) the tokenizer's first 16 labels are not the trained choice ids: wrong tokenizer.json
+    adapter, cal = _jev_adapter(tmp_path)
+    with pytest.raises(ValueError) as e:
+        de.write_jev_profile(str(adapter), str(cal), str(tmp_path / "tree"), tokenizer=_jev_tok(trained=range(30, 46)))
+    msg = str(e.value)
+    assert str(list(range(30, 46))) in msg and str(list(range(8, 24))) in msg  # both lists named
+    assert not (tmp_path / "tree").exists()
+
+
+def test_jev_too_few_labels_for_the_trained_slots_refused(tmp_path):
+    # "\nP" merges in the option line: only 15 of the 16 trained labels survive
+    adapter, cal = _jev_adapter(tmp_path)
+    with pytest.raises(ValueError, match="verbalizer_ids"):
+        de.write_jev_profile(str(adapter), str(cal), str(tmp_path / "tree"), tokenizer=_jev_tok({"\nP": 902}))
+    assert not (tmp_path / "tree").exists()
+
+
+def test_load_tokenizer_encodes_without_special_tokens(tmp_path):
+    tokenizers = pytest.importorskip("tokenizers")
+    from tokenizers import models, pre_tokenizers, processors
+    t = tokenizers.Tokenizer(models.WordLevel({"<s>": 0, "A": 1, "AB": 2, "[UNK]": 3}, unk_token="[UNK]"))
+    t.pre_tokenizer = pre_tokenizers.Whitespace()
+    t.post_processor = processors.TemplateProcessing(single="<s> $A", special_tokens=[("<s>", 0)])
+    t.save(str(tmp_path / "tokenizer.json"))
+    tok = de.load_tokenizer(str(tmp_path / "tokenizer.json"))
+    assert tok.encode("A AB", add_special_tokens=False) == [1, 2]
+
+
+def test_cli_jev_labels_from_the_tokenizer_the_tree_ships(cli, monkeypatch):
+    run, calls, base, tmp = cli
+    adapter, _ = _jev_adapter(tmp)
+    run("jev", "--base-ir", str(base), "--adapter-dir", str(adapter), "--out", str(tmp / "t"))
+    assert run.tokenizers == [str(base / "tokenizer.json")]
+    jev = json.loads((tmp / "t" / "decision.json").read_text())["jev"]
+    assert jev["choice_labels"] == _LETTERS and jev["choice_label_ids"][:16] == list(range(8, 24))
+    # --weights' tokenizer.json wins over the IR's, as run_export copies it; --tokenizer over both
+    w = tmp / "ft"
+    w.mkdir()
+    (w / "tokenizer.json").write_text("ft tokenizer")
+    run("jev", "--base-ir", str(base), "--weights", str(w), "--weights-not-merged", "--adapter-dir", str(adapter),
+        "--out", str(tmp / "t2"))
+    other = tmp / "other.json"
+    other.write_text("t")
+    run("jev", "--base-ir", str(base), "--weights", str(w), "--weights-not-merged", "--adapter-dir", str(adapter),
+        "--tokenizer", str(other), "--out", str(tmp / "t3"))
+    assert run.tokenizers[1:] == [str(w / "tokenizer.json"), str(other)]
+
+
+def test_cli_jev_without_a_tokenizer_refused_before_any_write(cli, capsys):
+    run, calls, base, tmp = cli
+    (base / "tokenizer.json").unlink()
+    adapter, _ = _jev_adapter(tmp)
+    with pytest.raises(SystemExit) as e:
+        run("jev", "--base-ir", str(base), "--adapter-dir", str(adapter), "--out", str(tmp / "t"))
+    assert e.value.code == 2 and "tokenizer.json" in capsys.readouterr().err
+    assert calls == [] and not (tmp / "t").exists()

@@ -25,6 +25,7 @@ HeadAssets::load in crates/cascadia-engine-openvino/src/decision.rs):
 import argparse
 import json
 import os
+import string
 import sys
 from pathlib import Path
 
@@ -108,7 +109,50 @@ def _write(out_dir, profile, head):
     (out / "decision" / "head.json").write_text(json.dumps(head))
 
 
-def write_jev_profile(adapter_dir, calibration_json, out_dir, max_tokens=32768):
+# JEV's choice labels beyond its trained head, ported from serve_decide.py single_token_labels:
+# A..Z then AA, AB, ..., ZZ, each kept when it is one token that survives intact in an option line
+# ("x\n{label}) y"), at most MAX_OPTIONS (256) of them.
+MAX_CHOICE_LABELS = 256
+CHOICE_LABEL_CONTEXT = "x\n{}) y"
+
+
+def single_token_labels(tok, context=CHOICE_LABEL_CONTEXT, cap=MAX_CHOICE_LABELS):
+    """[(label, token id)] in label order; `tok.encode(text, add_special_tokens=False)` -> ids."""
+    out = []
+    for lab in list(string.ascii_uppercase) + [a + b for a in string.ascii_uppercase for b in string.ascii_uppercase]:
+        t = tok.encode(lab, add_special_tokens=False)
+        if len(t) == 1 and t[0] in tok.encode(context.format(lab), add_special_tokens=False):
+            out.append((lab, t[0]))
+        if len(out) == cap:
+            break
+    return out
+
+
+class _TokenizerJson:
+    """A tokenizer.json behind the transformers-style encode() single_token_labels calls."""
+
+    def __init__(self, path):
+        from tokenizers import Tokenizer
+        self._tok = Tokenizer.from_file(path)
+
+    def encode(self, text, add_special_tokens=True):
+        return self._tok.encode(text, add_special_tokens=add_special_tokens).ids
+
+
+def load_tokenizer(path):
+    return _TokenizerJson(path)
+
+
+def shipped_tokenizer(base_ir, weights=None, override=None):
+    """The tokenizer.json run_export puts in the tree: the override, else --weights', else the IR's."""
+    if override is not None:
+        return override
+    if weights and (Path(weights) / "tokenizer.json").exists():
+        return str(Path(weights) / "tokenizer.json")
+    return str(Path(base_ir) / "tokenizer.json")
+
+
+def write_jev_profile(adapter_dir, calibration_json, out_dir, max_tokens=32768, tokenizer=None):
     h = json.loads((Path(adapter_dir) / "decision_head.json").read_text())
     cal = json.loads(Path(calibration_json).read_text())["per_kind"]
     slots = h["slots"]
@@ -136,6 +180,19 @@ def write_jev_profile(adapter_dir, calibration_json, out_dir, max_tokens=32768):
     profile = {"family": "jev", "max_tokens": max_tokens, "jev": {
         "verbalizers": slots["verbalizers"], "verbalizer_ids": h["verbalizer_ids"], "bias": h["bias"],
         "slots": slots["ranges"], "temperature": {k: cal[k] for k in ("noul", "choice", "score")}}}
+    if tokenizer is not None:
+        # The reference asserts the first labels ARE the trained choice head (serve_decide.py:128);
+        # a mismatch means the tree's tokenizer.json is not the one JEV was trained with.
+        labels = single_token_labels(tokenizer)
+        lo, hi = slots["ranges"]["choice"]
+        got, want = [t for _, t in labels[: hi - lo]], h["verbalizer_ids"][lo:hi]
+        if got != want:
+            raise ValueError(f"{adapter_dir}/decision_head.json: the tokenizer's first {hi - lo} single-token "
+                             f"choice labels {[lab for lab, _ in labels[: hi - lo]]} have ids {got}, not the "
+                             f"trained choice verbalizer_ids[{lo}:{hi}] {want} (verbalizers "
+                             f"{slots['verbalizers'][lo:hi]}): the tree's tokenizer.json is not JEV's")
+        profile["jev"]["choice_labels"] = [lab for lab, _ in labels]
+        profile["jev"]["choice_label_ids"] = [t for _, t in labels]
     _write(out_dir, profile, {"kind": "verbalizer"})
 
 
@@ -343,6 +400,17 @@ def main():
                  f"trained with (pass --tokenizer FILE)")
     # Only an explicit override reaches run_export; jev/clef keep its default tokenizer choice.
     tok_kw = {"tokenizer": tokenizer} if tokenizer is not None else {}
+    jev_tok = None
+    if a.family == "jev":
+        # JEV's extended choice labels come from the tokenizer.json the tree ships, so the server
+        # encodes them exactly as the export checked them against the trained head.
+        tok_path = shipped_tokenizer(a.base_ir, a.weights, tokenizer)
+        if not Path(tok_path).is_file():
+            ap.error(f"{tok_path} not found: a jev tree must ship a tokenizer.json (pass --tokenizer FILE)")
+        try:
+            jev_tok = load_tokenizer(tok_path)
+        except Exception as e:  # the tokenizers library's varied parse errors: a bad tokenizer.json
+            ap.error(f"{tok_path} is not a readable tokenizer.json: {type(e).__name__}: {e}")
     # The tree's window is the config.json run_export ships: the fine-tune's when --weights has one
     # (clef's --weights defaults to --clef-dir), else the base IR's.
     weights = a.weights or (a.clef_dir if a.family == "clef" else None)
@@ -369,7 +437,7 @@ def main():
     if a.family == "jev":
         lora = a.lora or os.path.join(a.adapter_dir, "adapter_model.safetensors")
         cal = a.calibration or os.path.join(os.path.dirname(os.path.abspath(a.adapter_dir)), "calibration.json")
-        write_jev_profile(a.adapter_dir, cal, a.out, max_tokens=max_tokens)
+        write_jev_profile(a.adapter_dir, cal, a.out, max_tokens=max_tokens, tokenizer=jev_tok)
         run_export(a.base_ir, a.out, a.stages, False, a.layer_split, weights=a.weights, lora=lora,
                    lora_scale=a.lora_scale, final_hidden=False, **tok_kw)
     elif a.family == "kev":
