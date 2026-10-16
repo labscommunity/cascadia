@@ -95,6 +95,16 @@ pub(crate) type WireRow = (usize, i64, usize);
 /// A [`WireRow`], or `None` for an idle row.
 pub(crate) type WireRowOpt = Option<WireRow>;
 
+/// One planned packed inference (see [`PackedState::plan_step`]).
+pub(crate) struct Planned {
+    pub(crate) plan: PackedPlan,
+    pub(crate) ids: Vec<i64>,
+    pub(crate) positions: Vec<i64>,
+    pub(crate) kind: PackedStepKind,
+    /// A prefill chunk's embedding rows on a vision stage 0; empty otherwise.
+    pub(crate) rows: Vec<f32>,
+}
+
 /// What one packed inference did, so the caller can sample the right rows.
 pub(crate) enum PackedStepKind {
     /// Prefill chunk for `slot`; `finished_prompt` marks the chunk that
@@ -135,6 +145,8 @@ pub(crate) struct PackedState {
     pub(crate) prefix_ids: Vec<i64>,
     /// Slot currently populating the shared prefix, if any.
     populating: Option<usize>,
+    /// Tasks retired by planning, awaiting their error chunk.
+    failed: Vec<(GenerationTask, String)>,
     last_plan_rows: Vec<WireRowOpt>,
     /// Per-row image ids of the most recent inference (see `last_plan_rows`).
     last_plan_images: Vec<Option<u32>>,
@@ -171,6 +183,7 @@ impl PackedState {
             layers,
             prefix_ids: Vec::new(),
             populating: None,
+            failed: Vec::new(),
             last_plan_rows: Vec::new(),
             last_plan_images: Vec::new(),
             ids_bytes: Vec::new(),
@@ -296,79 +309,17 @@ impl PackedState {
         &mut self,
         embed: Option<EmbedFn<'_>>,
     ) -> EngineResult<Option<(ShimDType, Vec<usize>, Vec<u8>, PackedStepKind)>> {
-        let s = self.kv.packed_seq;
         let h = self.embed_hidden;
-        let mut rows: Vec<f32> = Vec::new();
-        let (plan, ids, positions, kind) = if let Some(slot) = self.next_prefill_slot() {
-            // ---- prefill chunk for one slot ----
-            let t = self.slots[slot].as_ref().unwrap();
-            let start = t.prompt_fed;
-            // An image is attended bidirectionally only inside one inference:
-            // end the chunk before it rather than split it. Submit refused
-            // any image wider than `packed_seq`, so this only errs on a bug.
-            let take =
-                image_safe_take(&t.prompt_images, start, (t.prompt_ids.len() - start).min(s))
-                    .map_err(|e| EngineError::Backend(format!("packed slot {slot}: {e}")))?;
-            let ids: Vec<i64> = t.prompt_ids[start..start + take].to_vec();
-            let images = t
-                .prompt_images
-                .get(start..start + take)
-                .unwrap_or_default()
-                .to_vec();
-            if h > 0 {
-                if t.prompt_rows.len() != t.prompt_ids.len() * h {
-                    return Err(EngineError::Backend(format!(
-                        "packed slot {slot}: {} embedding floats for {} prompt tokens of {h}",
-                        t.prompt_rows.len(),
-                        t.prompt_ids.len()
-                    )));
-                }
-                rows = t.prompt_rows[start * h..(start + take) * h].to_vec();
-            }
-            let base = self.kv.position(slot);
-            let positions: Vec<i64> = (0..take).map(|i| (base + i) as i64).collect();
-            let finished = start + take >= t.prompt_ids.len();
-            (
-                if images.is_empty() {
-                    PackedPlan::chunk(s, slot, take)
-                } else {
-                    PackedPlan::chunk_with_images(s, slot, &images)
-                },
-                ids,
-                positions,
-                PackedStepKind::Prefill {
-                    slot,
-                    last_row: take - 1,
-                    finished_prompt: finished,
-                },
-            )
-        } else {
-            // ---- decode one token for every ready slot ----
-            let ready: Vec<usize> = self
-                .slots
-                .iter()
-                .enumerate()
-                .filter_map(|(i, t)| t.as_ref().map(|_| i))
-                .collect();
-            if ready.is_empty() {
-                return Ok(None);
-            }
-            let ids: Vec<i64> = ready
-                .iter()
-                .map(|&i| self.slots[i].as_ref().unwrap().last_token as i64)
-                .collect();
-            let positions: Vec<i64> = ready.iter().map(|&i| self.kv.position(i) as i64).collect();
-            let rows: Vec<(usize, usize)> = ready.iter().copied().enumerate().collect();
-            (
-                PackedPlan::decode(s, &ready),
-                ids,
-                positions,
-                PackedStepKind::Decode { rows },
-            )
-        };
-        if plan.is_empty() {
+        let Some(Planned {
+            plan,
+            ids,
+            positions,
+            kind,
+            mut rows,
+        }) = self.plan_step()
+        else {
             return Ok(None);
-        }
+        };
         if h > 0 && matches!(kind, PackedStepKind::Decode { .. }) {
             let embed = embed.ok_or_else(|| {
                 EngineError::Backend("packed vision stage stepped without its embedder".into())
@@ -399,6 +350,106 @@ impl PackedState {
             }
         }
         Ok(Some((odt, oshape, obytes, kind)))
+    }
+
+    /// Plan the next inference: a prefill chunk for the first slot still
+    /// prefilling, else one decode row per occupied slot (decode rows are
+    /// embedded by `step`). A slot whose own chunk cannot be planned (an
+    /// image wider than `packed_seq`, embedding rows that do not match its
+    /// prompt) is retired with its own error, collected by
+    /// [`PackedState::take_failed`]; the other slots are planned as if it had
+    /// never been admitted. Nothing here can fail the batch.
+    pub(crate) fn plan_step(&mut self) -> Option<Planned> {
+        while let Some(slot) = self.next_prefill_slot() {
+            match self.plan_prefill(slot) {
+                Ok(p) => return Some(p),
+                Err(e) => {
+                    if let Some(t) = self.retire(slot) {
+                        self.failed.push((t.task, e));
+                    }
+                }
+            }
+        }
+        let s = self.kv.packed_seq;
+        let ready: Vec<usize> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| t.as_ref().map(|_| i))
+            .collect();
+        if ready.is_empty() {
+            return None;
+        }
+        let ids: Vec<i64> = ready
+            .iter()
+            .map(|&i| self.slots[i].as_ref().unwrap().last_token as i64)
+            .collect();
+        let positions: Vec<i64> = ready.iter().map(|&i| self.kv.position(i) as i64).collect();
+        let rows: Vec<(usize, usize)> = ready.iter().copied().enumerate().collect();
+        let plan = PackedPlan::decode(s, &ready);
+        (!plan.is_empty()).then_some(Planned {
+            plan,
+            ids,
+            positions,
+            kind: PackedStepKind::Decode { rows },
+            rows: Vec::new(),
+        })
+    }
+
+    /// The next prefill chunk of `slot`, or why that slot cannot continue.
+    fn plan_prefill(&self, slot: usize) -> Result<Planned, String> {
+        let s = self.kv.packed_seq;
+        let h = self.embed_hidden;
+        let t = self.slots[slot].as_ref().expect("a prefilling slot");
+        let start = t.prompt_fed;
+        // An image is attended bidirectionally only inside one inference:
+        // end the chunk before it rather than split it. Submit refuses any
+        // image wider than `packed_seq`; this guards the slot regardless.
+        let take = image_safe_take(&t.prompt_images, start, (t.prompt_ids.len() - start).min(s))?;
+        if take == 0 {
+            return Err(format!("packed slot {slot}: empty prefill chunk"));
+        }
+        let ids: Vec<i64> = t.prompt_ids[start..start + take].to_vec();
+        let images = t
+            .prompt_images
+            .get(start..start + take)
+            .unwrap_or_default()
+            .to_vec();
+        let mut rows = Vec::new();
+        if h > 0 {
+            if t.prompt_rows.len() != t.prompt_ids.len() * h {
+                return Err(format!(
+                    "packed slot {slot}: {} embedding floats for {} prompt tokens of {h}",
+                    t.prompt_rows.len(),
+                    t.prompt_ids.len()
+                ));
+            }
+            rows = t.prompt_rows[start * h..(start + take) * h].to_vec();
+        }
+        let base = self.kv.position(slot);
+        let positions: Vec<i64> = (0..take).map(|i| (base + i) as i64).collect();
+        let finished = start + take >= t.prompt_ids.len();
+        Ok(Planned {
+            plan: if images.is_empty() {
+                PackedPlan::chunk(s, slot, take)
+            } else {
+                PackedPlan::chunk_with_images(s, slot, &images)
+            },
+            ids,
+            positions,
+            kind: PackedStepKind::Prefill {
+                slot,
+                last_row: take - 1,
+                finished_prompt: finished,
+            },
+            rows,
+        })
+    }
+
+    /// Tasks whose slot was retired by planning since the last call, each
+    /// with its own error. The caller answers each one; the batch goes on.
+    pub(crate) fn take_failed(&mut self) -> Vec<(GenerationTask, String)> {
+        std::mem::take(&mut self.failed)
     }
 
     /// Run one packed inference for a caller-supplied plan. Stage 0 builds the
@@ -619,4 +670,101 @@ impl PackedState {
         }
         Ok((odt, oshape, obytes))
     }
+}
+
+#[cfg(all(test, not(feature = "openvino")))]
+mod tests {
+    use super::*;
+
+    fn state(slots: usize, packed_seq: usize) -> PackedState {
+        let kv = PackedKv::new(slots, 32, packed_seq, 1, 1, 2, ShimDType::F16, 0);
+        let masks = vec![PackedMask::new("attn_mask_4d".into(), ShimDType::F16, None)];
+        PackedState::new(
+            OvRuntime::stub(),
+            kv,
+            Vec::new(),
+            "input_ids".into(),
+            String::new(),
+            0,
+            masks,
+            "position_ids".into(),
+        )
+    }
+
+    /// A slot whose chunk cannot be planned (here an image wider than one
+    /// packed inference, which submit would have refused) is retired with its
+    /// own error; the other slot still decodes in the same step.
+    #[test]
+    fn a_slot_that_cannot_be_planned_fails_alone() {
+        let mut st = state(2, 4);
+        st.image_token = Some(9);
+        st.admit(
+            0,
+            GenerationTask::new("ok", "hi"),
+            vec![1, 2],
+            Vec::new(),
+            2,
+        );
+        {
+            let t = st.slots[0].as_mut().unwrap();
+            t.prompt_fed = 2; // prefilled, decoding
+            t.last_token = 7;
+        }
+        st.kv.advance(0, 2);
+        st.admit(
+            1,
+            GenerationTask::new("bad", "img"),
+            vec![9, 9, 9, 9, 9, 2],
+            Vec::new(),
+            0,
+        );
+        let planned = st.plan_step().expect("slot 0 still decodes");
+        match planned.kind {
+            PackedStepKind::Decode { rows } => assert_eq!(rows, vec![(0, 0)]),
+            _ => panic!("expected a decode step for slot 0"),
+        }
+        assert_eq!(planned.ids, vec![7]);
+        let failed = st.take_failed();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0.task_id, TaskIdOf::from("bad"));
+        assert!(failed[0].1.contains("does not fit"), "{}", failed[0].1);
+        assert!(st.slots[1].is_none(), "the failed slot is free again");
+        assert!(st.slots[0].is_some());
+        assert!(st.take_failed().is_empty());
+    }
+
+    /// Mismatched embedding rows on a vision stage 0 fail that slot only.
+    #[test]
+    fn bad_embedding_rows_fail_only_their_slot() {
+        let mut st = state(2, 4);
+        st.embed_hidden = 3;
+        st.admit(
+            0,
+            GenerationTask::new("a", "x"),
+            vec![1, 2],
+            vec![0.0; 6],
+            2,
+        );
+        st.admit(
+            1,
+            GenerationTask::new("b", "y"),
+            vec![1, 2],
+            vec![0.0; 5],
+            2,
+        );
+        let planned = st.plan_step().expect("slot 0 prefills");
+        assert!(matches!(
+            planned.kind,
+            PackedStepKind::Prefill { slot: 0, .. }
+        ));
+        // slot 0's chunk is planned first; slot 1 fails when its turn comes
+        st.slots[0].as_mut().unwrap().prompt_fed = 2;
+        let _ = st.plan_step();
+        let failed = st.take_failed();
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].1.contains("embedding floats"), "{}", failed[0].1);
+        assert!(st.slots[1].is_none() && st.slots[0].is_some());
+    }
+
+    type TaskIdOf = cascadia_types::TaskId;
 }
