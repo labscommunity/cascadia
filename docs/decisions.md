@@ -393,10 +393,13 @@ answered the way the reference server answers it (serve_decide `s1_dist`), by on
   temperature.
 - **Budget.** Every pass counts toward `max_total_tokens` before any runs, and each must fit
   `max_tokens`. A tournament's final depends on the group passes, so it counts at its worst case:
-  the 16 longest option lines (by tokens), labelled `A`..`P`. A request that does not fit is a
-  413 with no pass run. (The real final is never longer with a tokenizer that does not merge
-  tokens across a line start, as Qwen's does not; if one ever were, the request stops with a 413
-  before the final instead of overspending.)
+  the 16 costliest option lines, labelled `A`..`P`. A line's cost is its text tokenized as the
+  prompt holds it, with the space after `)` and the newline (`" {text}\n"`), not the text alone:
+  Qwen's tokenizer joins that space to a following word (`Merkel` is 3 tokens alone, ` Merkel`
+  1) and splits it off before digits or CJK text. A request that does not fit is a 413 with no
+  pass run. With Qwen's tokenizer these line costs add up, so the real final is never longer; for
+  a tokenizer where they did not, the request would stop with a 413 before the final rather than
+  overspend.
 - **Order.** The engine runs one pass at a time: every question's round-1 passes in request
   order, then every tournament's final. serve_decide runs a plan's passes concurrently; the
   result is the same.
