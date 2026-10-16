@@ -1394,8 +1394,8 @@ pub struct Qwen36Engine {
     stages_dirty: bool,
     /// A task failed and the stage requests still hold its state: `finalize_error` leaves the
     /// scrub (`reset_all`) to the next admission, so the failed task's error chunk is returned
-    /// first (Task 45: on the GPU the scrub after a failed infer did not return, and the error
-    /// built after it never reached the request).
+    /// first even if the scrub would block (Task 45: suspected, not reproduced, on the GPU after
+    /// a failed infer). A scrub that blocks still holds the engine, at that admission.
     scrub_pending: bool,
     /// `max_position_embeddings` of the model (from the tree's config.json); prompts at or past it
     /// are refused at submit rather than prefilled for hours on the single batch=1 slot. `None`
@@ -1807,6 +1807,8 @@ impl Qwen36Engine {
 
     fn reset_all(&mut self) {
         self.primed = false;
+        // This is the scrub a failed task left, too (`scrub_failed_task`).
+        self.scrub_pending = false;
         // After a restore, `reset_state` leaves residue on this model, so rebuild the request
         // instead. With the prefix cache always on that is every WARM turn — `state_restored` is
         // set by each hit — and the cheap reset is what a cold turn (no hit, nothing restored)
@@ -2085,24 +2087,45 @@ impl Qwen36Engine {
     /// streamed. For mid-generation backend/wire errors that previously
     /// fell through to `finalize` and read as a clean (empty/partial)
     /// success.
-    /// Fail the active task: its error chunk, now. The stage requests are scrubbed when the
-    /// next task is admitted ([`Self::scrub_failed_task`]), not here: the chunk only reaches
-    /// the request once `step` returns, and a scrub that blocks after a failed native call
-    /// (a GPU infer that threw) would hold it, and the request, for good.
+    /// Fail the active task: one warn line (task, phase, prompt length, the prefix it resumed
+    /// from the cache), and its error chunk, now, carrying that prefix (`warm_prefix`, 0 = cold)
+    /// so the API's own line can report it. The stage requests are scrubbed when the next task
+    /// is admitted ([`Self::scrub_failed_task`]), not here: the chunk only reaches its stream
+    /// once `step` returns, so a scrub that blocks after a failed native call (a GPU infer that
+    /// threw) would keep the error from a request that is still waiting for it. A scrub that
+    /// blocks still holds the engine, at that next admission.
     fn finalize_error(&mut self, reason: String) -> Vec<(TaskId, Chunk)> {
         self.want_final_hidden = false;
         self.last_final_hidden = None;
         let Some(t) = self.active.take() else {
             return Vec::new();
         };
+        let phase = if t.prefill_idx < t.prompt_ids.len() {
+            "prefill"
+        } else if t.decision.is_some() {
+            "head"
+        } else {
+            "decode"
+        };
+        warn!(
+            task = %t.task_id,
+            phase,
+            prompt = t.prompt_ids.len(),
+            warm_prefix = t.warm_prefix,
+            generated = t.gen_ids.len(),
+            reason = %reason,
+            "qwen36 task failed"
+        );
         self.scrub_pending = true;
-        vec![(t.task_id.clone(), Chunk::error(t.task_id, reason))]
+        let chunk = Chunk::error(t.task_id.clone(), reason).with_warm_prefix(t.warm_prefix);
+        vec![(t.task_id, chunk)]
     }
 
     /// The scrub a failed task left (see [`Self::finalize_error`]), before anything reads or
-    /// restores over the stage requests: every admission runs it first.
+    /// restores over the stage requests: every admission runs it first. Any `reset_all` in
+    /// between does the same job and clears it.
     fn scrub_failed_task(&mut self) {
-        if std::mem::take(&mut self.scrub_pending) {
+        if self.scrub_pending {
             self.reset_all();
         }
     }
@@ -3891,15 +3914,7 @@ impl Qwen36Engine {
                     )]
                 }
                 Err(e) => {
-                    let t = self.active.as_ref().unwrap();
-                    warn!(
-                        task = %task_id,
-                        prompt = t.prompt_ids.len(),
-                        warm_prefix = t.warm_prefix,
-                        generated = t.gen_ids.len(),
-                        error = %e,
-                        "decode failed"
-                    );
+                    warn!(task = %task_id, error = %e, "decode failed");
                     self.finalize_error(format!("decode failed: {e}"))
                 }
             }
@@ -6519,6 +6534,7 @@ mod tests {
             Some("decode failed: backend error: unknown C++ exception in infer"),
             "the error Task 44 saw"
         );
+        assert_eq!(c.warm_prefix, Some(0), "a cold prefill: a cache miss");
         assert!(e.active.is_none(), "the failed task is gone");
         assert_eq!(
             since(before),
@@ -6534,6 +6550,40 @@ mod tests {
         assert_eq!(after.first(), Some(&"reset"), "scrubbed first: {after:?}");
         // Scrubbed once: a second task's admission has nothing left to scrub.
         assert!(!e.scrub_pending);
+    }
+
+    #[test]
+    fn a_failed_task_reports_the_prefix_it_resumed_from_the_cache() {
+        // Task 45: the BUG-1 shape, a warm restore and then a throw in the suffix's prefill. The
+        // error chunk says how much was resumed, so the API's failure line can say "hit".
+        let (mut e, _, _) = mock_box(true);
+        e.prefix_cache = crate::prefix_cache::PrefixCache::new(1 << 20);
+        let min = crate::prefix_cache::MIN_PREFIX_TOKENS;
+        let pass = |id: &str, first: bool| {
+            let mut t = verbalizer_pass(id, None);
+            let d = t.decision.as_mut().unwrap();
+            d.prompt_ids = (0..min as u32 + 8).map(|i| i % MOCK_VOCAB as u32).collect();
+            d.cache_prefix = Some(min as u32);
+            d.needs_snapshot = first;
+            d.require_warm = !first;
+            t
+        };
+        e.submit(pass("first", true)).unwrap();
+        assert!(run_to_final(&mut e).error.is_none());
+        let OvStage::Mock(m) = &mut e.stages[1] else {
+            unreachable!()
+        };
+        // The restore primes the request with one fold (infer +0); the suffix is infer +1.
+        m.fail_infer_at = Some(m.infers + 1);
+        e.submit(pass("warm", false)).unwrap();
+        let c = run_to_final(&mut e);
+        let why = c.error.as_deref().expect("failed");
+        assert!(why.starts_with("prefill failed"), "{why}");
+        assert_eq!(
+            c.warm_prefix,
+            Some(min as u32),
+            "a cache hit at the shared prefix"
+        );
     }
 
     #[test]

@@ -485,6 +485,10 @@ pub(crate) async fn evaluate(
     let mut thinking = IndexMap::new();
     let mut output_tokens = 0u64;
     if let (Some(plan), Some((prompts, _))) = (&plan, thinks) {
+        // Once one System 2 task has failed (`auto`; `on` has returned the error), the request
+        // submits no more engine work: whatever failed may still hold the engine (a scrub that
+        // blocks runs at the next task's admission), so the rest answer from System 1.
+        let mut failed = false;
         for t in prompts {
             let report = think(
                 state,
@@ -493,12 +497,14 @@ pub(crate) async fn evaluate(
                 &req,
                 plan,
                 &t,
+                failed,
                 &mut dists,
                 &mut counted,
                 &mut input_tokens,
                 &mut output_tokens,
             )
             .await?;
+            failed |= report.reason == Some(ERROR);
             thinking.insert(t.qid, report);
         }
     }
@@ -522,6 +528,8 @@ pub(crate) async fn evaluate(
 /// `auto` and System 1's leading probability is below the threshold, the base model thinks
 /// ([`generate_thought`]), one readout scores the answer labels after the thought, and the
 /// question's distribution becomes `(1 - mix) * p1 + mix * p2`. Returns the answer's report.
+/// `after_failure`: an earlier System 2 task of the request failed, so a question that would
+/// think answers from System 1 (`reason: "error"`) without an engine call.
 #[allow(clippy::too_many_arguments)]
 async fn think(
     state: &AppState,
@@ -530,6 +538,7 @@ async fn think(
     req: &Arc<DecisionRequest>,
     plan: &ThinkPlan,
     t: &ThinkPrompt,
+    after_failure: bool,
     dists: &mut IndexMap<String, Vec<f64>>,
     spent: &mut usize,
     input_tokens: &mut u64,
@@ -554,17 +563,30 @@ async fn think(
     if !report.used {
         return Ok(report);
     }
+    if after_failure {
+        report.used = false;
+        report.reason = Some(ERROR);
+        return Ok(report);
+    }
     let Some(end_think) = jev.end_think_id() else {
         return Err(DecisionError::Engine("decision engine error".into()));
     };
     let thought = match generate_thought(state, &t.text, plan.budget, end_think, t.len).await {
         Ok(thought) => thought,
         Err(f) => {
-            // What the engine generated before it failed was spent all the same.
-            if f.generated > 0 {
+            // What the engine streamed before it failed was spent all the same. An admitted task
+            // may have prefilled its prompt before failing: the request's own count takes it
+            // (an over-count only tightens the budget); usage bills it once tokens arrived.
+            if matches!(f.fail, TaskFailure::Stream(..)) {
                 *spent += t.len + f.generated;
+            }
+            if f.generated > 0 {
                 *input_tokens += t.len as u64;
                 *output_tokens += f.generated as u64;
+                state
+                    .stats
+                    .tokens_total
+                    .fetch_add(f.generated as u64, std::sync::atomic::Ordering::Relaxed);
             }
             return system2_failed(plan, report, f);
         }
@@ -630,6 +652,9 @@ async fn think(
     let (logits, prefilled) = match read {
         Ok(r) => r,
         Err(fail) => {
+            if matches!(fail, TaskFailure::Stream(..)) {
+                *spent += readout.prompt_ids.len();
+            }
             let f = S2Failure::new(task_id, READ_BACK, readout.prompt_ids.len(), 0, fail);
             return system2_failed(plan, report, f);
         }
@@ -657,10 +682,18 @@ const GENERATE: &str = "generate";
 const READ_BACK: &str = "readback";
 
 /// Why one engine task failed: the engine refused it at submit, or its stream carried an error
-/// (or ended without what the task needed).
+/// (or ended without what the task needed), with the error chunk's `warm_prefix` (the prompt
+/// tokens the engine resumed from its cache, 0 for a cold prefill; `None` when unknown).
 enum TaskFailure {
     Submit(cascadia_engine::EngineError),
-    Stream(String),
+    Stream(String, Option<u32>),
+}
+
+impl TaskFailure {
+    /// A failure the API found itself, not reported by the engine: the cache state is unknown.
+    fn found(why: &str) -> Self {
+        Self::Stream(why.to_string(), None)
+    }
 }
 
 /// A System 2 task (its generation or its read-back) that failed.
@@ -691,24 +724,31 @@ impl S2Failure {
     }
 }
 
-/// A failed System 2 task, in one warn line (whether its prompt resumed a cached prefix is in
-/// the engine's own line for the same task, `warm_prefix`; the API cannot see it). Then `on`
-/// fails the request as any engine failure does (503 `decision engine error`, or the capacity
-/// 503 and 413 the engine's refusals map to), and `auto` answers from System 1
+/// A failed System 2 task, in one warn line: task id, phase, prompt tokens, and whether the
+/// prompt resumed a cached prefix (`cache` hit, miss or unknown, from the engine's error chunk).
+/// Then `on` fails the request as any engine failure does (503 `decision engine error`, or the
+/// capacity 503 and 413 the engine's refusals map to), and `auto` answers from System 1
 /// (`reason: "error"`): System 2 is best-effort there, as for the budget.
 fn system2_failed(
     plan: &ThinkPlan,
     mut report: schema::Thinking,
     f: S2Failure,
 ) -> Result<schema::Thinking, DecisionError> {
-    let (reason, error) = match &f.fail {
-        TaskFailure::Submit(e) => (e.to_string(), submit_error(e)),
-        TaskFailure::Stream(r) => (r.clone(), failure_error(r)),
+    let (reason, error, warm) = match &f.fail {
+        TaskFailure::Submit(e) => (e.to_string(), submit_error(e), None),
+        TaskFailure::Stream(r, warm) => (r.clone(), failure_error(r), *warm),
+    };
+    let (cache, warm_prefix) = match warm {
+        Some(0) => ("miss", "0".to_string()),
+        Some(n) => ("hit", n.to_string()),
+        None => ("unknown", "unknown".to_string()),
     };
     tracing::warn!(
         task = %f.task_id,
         phase = f.phase,
         prompt_tokens = f.prompt_tokens,
+        cache,
+        warm_prefix,
         generated = f.generated,
         mode = ?plan.mode,
         reason,
@@ -769,7 +809,8 @@ async fn generate_thought(
     let mut ids = Vec::new();
     while let Some(chunk) = stream.next().await {
         if let Some(reason) = &chunk.error {
-            return Err(failed(ids.len(), TaskFailure::Stream(reason.clone())));
+            let fail = TaskFailure::Stream(reason.clone(), chunk.warm_prefix);
+            return Err(failed(ids.len(), fail));
         }
         let got = if chunk.token_ids.is_empty() && !chunk.is_final {
             vec![chunk.token_id]
@@ -778,8 +819,8 @@ async fn generate_thought(
         };
         for id in got {
             let Ok(id) = u32::try_from(id) else {
-                let why = "engine returned a negative token id".to_string();
-                return Err(failed(ids.len(), TaskFailure::Stream(why)));
+                let why = TaskFailure::found("engine returned a negative token id");
+                return Err(failed(ids.len(), why));
             };
             ids.push(id);
             if id == end_think {
@@ -800,8 +841,8 @@ async fn generate_thought(
             });
         }
     }
-    let why = "System 2 generation ended without a final chunk".to_string();
-    Err(failed(ids.len(), TaskFailure::Stream(why)))
+    let why = TaskFailure::found("System 2 generation ended without a final chunk");
+    Err(failed(ids.len(), why))
 }
 
 /// Run tokenization work `f` off the async executor (it is CPU work proportional to the
@@ -948,11 +989,11 @@ async fn run_readout(
         Err(TaskFailure::Submit(e)) => Err(decision_engine_error(e)),
         // The cache can never hold this request's shared prefix (refused before the first
         // pass prefilled anything): the request needs its full length, a 413.
-        Err(TaskFailure::Stream(reason)) if reason.starts_with("decision_uncacheable") => {
+        Err(TaskFailure::Stream(reason, _)) if reason.starts_with("decision_uncacheable") => {
             tracing::warn!(reason, "decision pass failed");
             Err(uncacheable())
         }
-        Err(TaskFailure::Stream(reason)) => Err(engine_failure(&reason)),
+        Err(TaskFailure::Stream(reason, _)) => Err(engine_failure(&reason)),
     }
 }
 
@@ -974,7 +1015,7 @@ async fn readout_once(
     lora_scale: Option<f32>,
     task_id: String,
 ) -> Result<(Vec<f32>, u64), TaskFailure> {
-    let fail = |why: &str| Err(TaskFailure::Stream(why.to_string()));
+    let fail = |why: &str| Err(TaskFailure::found(why));
     let task = cascadia_types::GenerationTask {
         task_id,
         prompt: String::new(),
@@ -998,7 +1039,7 @@ async fn readout_once(
     let mut prefilled = 0u64;
     while let Some(chunk) = stream.next().await {
         if let Some(reason) = &chunk.error {
-            return Err(TaskFailure::Stream(reason.clone()));
+            return Err(TaskFailure::Stream(reason.clone(), chunk.warm_prefix));
         }
         if chunk.is_final {
             prefilled = chunk
