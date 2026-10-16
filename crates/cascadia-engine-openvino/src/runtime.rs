@@ -396,6 +396,65 @@ fn packed_image_too_wide(
     })
 }
 
+/// Packed admission at submit, in the order that keeps a refused request
+/// cheap: refuse stray image tokens, expand the prompt from image sizes alone
+/// (`expand`), check every image fits one packed inference and the prompt fits
+/// a slot's region, and only then encode the images (`encode`, on the same
+/// `front` end). Returns the served ids and the encoded rows (None without
+/// media).
+///
+/// On a tree whose masks open image blocks (`image_blocks`, Gemma 4) a prompt
+/// without media must not hold the image soft token: typed as text (e.g. a
+/// `/v1/completions` prompt of literal `<|image|>`), its run would be masked
+/// as an image and could be wider than any packed inference.
+#[allow(clippy::too_many_arguments)]
+fn packed_check_then_encode<F, E>(
+    front: &mut F,
+    ids: &[i64],
+    has_media: bool,
+    image_token: Option<i64>,
+    image_blocks: bool,
+    packed_seq: usize,
+    region: usize,
+    expand: impl FnOnce(&F, &[i64]) -> Result<Vec<i64>, String>,
+    encode: impl FnOnce(&mut F, &[i64]) -> Result<(Vec<i64>, E), String>,
+) -> EngineResult<(Vec<i64>, Option<E>)> {
+    if let (true, false, Some(image)) = (image_blocks, has_media, image_token) {
+        if ids.contains(&image) {
+            return Err(EngineError::UnsupportedInput(
+                "the prompt contains the image placeholder token but the request carries no \
+                 image; send images as image_url content parts"
+                    .into(),
+            ));
+        }
+    }
+    let planned = if has_media {
+        expand(front, ids).map_err(EngineError::UnsupportedInput)?
+    } else {
+        ids.to_vec()
+    };
+    if let (true, Some(image)) = (image_blocks, image_token) {
+        if let Some(msg) = packed_image_too_wide(&planned, image, packed_seq) {
+            return Err(EngineError::UnsupportedInput(msg));
+        }
+    }
+    if let Some(msg) = packed_prompt_too_long(planned.len(), region) {
+        return Err(EngineError::PromptTooLong(msg));
+    }
+    if !has_media {
+        return Ok((planned, None));
+    }
+    let (expanded, rows) = encode(front, ids).map_err(EngineError::UnsupportedInput)?;
+    if expanded != planned {
+        return Err(EngineError::Backend(format!(
+            "image token counts from sizes ({} prompt tokens) disagree with the encoder's ({})",
+            planned.len(),
+            expanded.len()
+        )));
+    }
+    Ok((expanded, Some(rows)))
+}
+
 /// Mask kinds a packed IR can declare (`stage_config.packed_masks` values).
 const PACKED_FULL: &str = "full_attention";
 const PACKED_SLIDING: &str = "sliding_attention";
@@ -1845,6 +1904,18 @@ impl Frontend {
         match self {
             Frontend::Gemma4(f) => f.prepare(media, prompt_ids, tenant),
             Frontend::Pixtral(f) => f.prepare(media, prompt_ids, tenant),
+        }
+    }
+
+    /// The expanded prompt `prepare` would return, from image sizes alone.
+    pub(crate) fn expand_ids(
+        &self,
+        media: &[cascadia_types::MediaInput],
+        prompt_ids: &[i64],
+    ) -> Result<Vec<i64>, String> {
+        match self {
+            Frontend::Gemma4(f) => f.expand_ids(media, prompt_ids),
+            Frontend::Pixtral(f) => f.expand_ids(media, prompt_ids),
         }
     }
 
@@ -3376,6 +3447,12 @@ impl OvRuntimeEngine {
                 }
                 None => packed.step(None),
             };
+            // A slot whose own chunk could not be planned was retired by the
+            // step; answer just that task and carry on with the rest.
+            for (task, e) in self.packed.as_mut().unwrap().take_failed() {
+                warn!(task = %task.task_id, error = %e, "packed slot failed; retired alone");
+                out.push((task.task_id.clone(), Chunk::error(task.task_id, e)));
+            }
             let stepped = match stepped {
                 Ok(s) => s,
                 Err(e) => return self.abort_packed_batch(e, out),
@@ -4880,44 +4957,50 @@ impl Engine for OvRuntimeEngine {
         // would receive a non-standard error frame instead.
         if let Some(packed) = self.packed.as_ref() {
             if let Some(tok) = self.tokenizer.as_ref() {
-                let mut ids: Vec<i64> = tok
+                let ids: Vec<i64> = tok
                     .encode(task.prompt.clone(), false)
                     .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?
                     .get_ids()
                     .iter()
                     .map(|&u| u as i64)
                     .collect();
-                // A vision tree's images expand the prompt: encode them now so
-                // the region check sees the real length.
-                let mut images = None;
+                // Every check runs on the prompt as it will be served, with
+                // each image's token count taken from its size, before any
+                // image is encoded: a refused request costs no encoder time
+                // (under the engine lock) and leaves the encode cache alone.
+                let (packed_seq, region) = (packed.kv.packed_seq, packed.kv.region);
                 let image_blocks = self.vision.as_ref().is_some_and(|v| v.token_types);
-                if !task.media.is_empty() {
-                    if let Some(first) = self.vision.as_mut().and_then(|v| v.first.as_mut()) {
-                        let (expanded, rows) = first
-                            .frontend
-                            .prepare(&task.media, &ids, &task.tenant)
-                            .map_err(EngineError::UnsupportedInput)?;
-                        // Gemma 4 attends inside an image both ways, so each
-                        // image must fit one packed inference.
-                        if image_blocks {
-                            let image = first.frontend.image_token();
-                            if let Some(msg) =
-                                packed_image_too_wide(&expanded, image, packed.kv.packed_seq)
-                            {
-                                warn!(task = %task.task_id, packed_seq = packed.kv.packed_seq,
-                                      "refusing an image wider than one packed inference");
-                                return Err(EngineError::UnsupportedInput(msg));
-                            }
-                        }
-                        ids = expanded;
-                        images = Some(rows);
+                let (ids, images) = match self.vision.as_mut().and_then(|v| v.first.as_mut()) {
+                    Some(first) => {
+                        let image = first.frontend.image_token();
+                        let (media, tenant) = (&task.media, &task.tenant);
+                        packed_check_then_encode(
+                            &mut first.frontend,
+                            &ids,
+                            !media.is_empty(),
+                            Some(image),
+                            image_blocks,
+                            packed_seq,
+                            region,
+                            |f: &Frontend, ids: &[i64]| f.expand_ids(media, ids),
+                            |f: &mut Frontend, ids: &[i64]| f.prepare(media, ids, tenant),
+                        )
                     }
+                    None => packed_check_then_encode(
+                        &mut (),
+                        &ids,
+                        false,
+                        None,
+                        false,
+                        packed_seq,
+                        region,
+                        |_: &(), ids: &[i64]| Ok(ids.to_vec()),
+                        |_: &mut (), _: &[i64]| Err::<(Vec<i64>, Vec<Vec<f32>>), _>(String::new()),
+                    ),
                 }
-                if let Some(msg) = packed_prompt_too_long(ids.len(), packed.kv.region) {
-                    warn!(task = %task.task_id, prompt_tokens = ids.len(),
-                          region = packed.kv.region, "refusing over-region prompt");
-                    return Err(EngineError::PromptTooLong(msg));
-                }
+                .inspect_err(
+                    |e| warn!(task = %task.task_id, error = %e, "refusing packed prompt at submit"),
+                )?;
                 if let Some(rows) = images {
                     self.packed_images.insert(task.task_id.clone(), (ids, rows));
                 }
@@ -7133,6 +7216,96 @@ mod tests {
             kv.fill_mask_window(&rebuilt, &mut b, ShimDType::F32, window);
             assert_eq!(a, b, "window {window:?}");
         }
+    }
+
+    type SubmitChecked = EngineResult<(Vec<i64>, Option<()>)>;
+
+    /// Submit's packed checks, with a counting stand-in for the encoder:
+    /// `expand` turns each placeholder 9 into `n` soft tokens 9 from the size
+    /// alone, `encode` is what would run the vision encoder.
+    fn submit_check(
+        ids: &[i64],
+        has_media: bool,
+        soft: usize,
+        packed_seq: usize,
+        region: usize,
+    ) -> (SubmitChecked, usize) {
+        let expand_with = move |ids: &[i64]| -> Vec<i64> {
+            ids.iter()
+                .flat_map(|&t| if t == 9 { vec![9; soft] } else { vec![t] })
+                .collect()
+        };
+        let mut encodes = 0usize;
+        let r = packed_check_then_encode(
+            &mut encodes,
+            ids,
+            has_media,
+            Some(9),
+            true,
+            packed_seq,
+            region,
+            |_: &usize, ids: &[i64]| Ok(expand_with(ids)),
+            |n: &mut usize, ids: &[i64]| {
+                *n += 1;
+                Ok((expand_with(ids), ()))
+            },
+        );
+        (r, encodes)
+    }
+
+    /// A text-only prompt holding the image soft token (a /v1/completions
+    /// prompt of literal `<|image|>`) is refused at submit with a 400: on a
+    /// Gemma packed tree its run would be masked as an image, and one wider
+    /// than packed_seq used to abort every tenant's batch at step time.
+    #[test]
+    fn packed_submit_refuses_stray_image_tokens() {
+        let ids: Vec<i64> = std::iter::once(1)
+            .chain(std::iter::repeat_n(9, 600))
+            .collect();
+        let (r, encodes) = submit_check(&ids, false, 0, 288, 4096);
+        let e = r.unwrap_err();
+        assert!(matches!(e, EngineError::UnsupportedInput(_)), "{e}");
+        assert!(e.to_string().contains("no image"), "{e}");
+        assert_eq!(encodes, 0);
+        // a short run too: any image token without media
+        assert!(submit_check(&[1, 9, 2], false, 0, 288, 4096).0.is_err());
+        // plain text passes untouched
+        let (r, _) = submit_check(&[1, 2, 3], false, 0, 288, 4096);
+        assert_eq!(r.unwrap(), (vec![1, 2, 3], None));
+    }
+
+    /// Over-wide and over-region prompts are refused from image sizes alone,
+    /// before the encoder runs; an accepted one encodes exactly once.
+    #[test]
+    fn packed_submit_refuses_before_encoding() {
+        let (r, encodes) = submit_check(&[1, 9, 2], true, 300, 288, 4096);
+        assert!(matches!(r, Err(EngineError::UnsupportedInput(_))));
+        assert_eq!(encodes, 0, "an over-wide image is never encoded");
+        let (r, encodes) = submit_check(&[1, 9, 2, 9], true, 200, 288, 300);
+        assert!(matches!(r, Err(EngineError::PromptTooLong(_))));
+        assert_eq!(encodes, 0, "an over-region prompt is never encoded");
+        let (r, encodes) = submit_check(&[1, 9, 2], true, 280, 288, 4096);
+        let (ids, rows) = r.unwrap();
+        assert_eq!((ids.len(), rows, encodes), (282, Some(()), 1));
+    }
+
+    /// The size-based count must agree with the encoder's, or submit refuses
+    /// instead of serving a prompt that was checked at another length.
+    #[test]
+    fn packed_submit_refuses_a_size_count_mismatch() {
+        let mut n = 0usize;
+        let r = packed_check_then_encode(
+            &mut n,
+            &[1, 9],
+            true,
+            Some(9),
+            true,
+            288,
+            4096,
+            |_: &usize, _: &[i64]| Ok(vec![1, 9, 9]),
+            |_: &mut usize, _: &[i64]| Ok((vec![1, 9, 9, 9], ())),
+        );
+        assert!(matches!(r, Err(EngineError::Backend(_))));
     }
 
     #[test]
