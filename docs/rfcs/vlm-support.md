@@ -523,8 +523,8 @@ section D problem does not arise for them; E2B/E4B are still refused by the surg
   so an image is never split across chunks; static, chunked-prefill and packed shards
   serve Gemma 4 too since 2026-10-16 (static only; see "Gemma 4 on the static
   path"). Turns with
-  images skip KV warm-resume and capture,
-  because every same-size image has the same ids.
+  images first skipped KV warm-resume and capture, because every same-size image has
+  the same ids; they resume since 2026-10-16 (see "KV warm-resume for image turns").
 - **API.** `MediaConfig::gemma4_native` uses the template's own `<|image|>` and reserves
   the image/video/audio markers in user text; the CLI enables it for `ov-runtime` when
   the pipeline has a `vision` block.
@@ -773,6 +773,39 @@ Left open, not caused by this branch: downstream packed stages never `admit`, so
 `--packed-prefix` on a multi-stage tree their prefix bookkeeping would drift from rank
 0's; the CLI refuses `--packed-prefix` on more than one stage, which keeps this
 unreachable.
+
+## KV warm-resume for image turns (2026-10-16)
+
+The `kv_coord` cache keys a captured turn (prompt plus reply) on its token ids, and a
+follow-up turn resumes from the longest cached strict prefix. Image soft tokens are one
+id repeated, the same for every image of one size, so `ov-runtime` and `gemma4` kept
+image turns out of the cache: every chat turn re-prefilled every earlier image.
+
+`vision_kv` builds the key instead: the prompt ids with each image's soft tokens
+replaced by `pad_cache_id(tenant, sha256, row)`, the ids the `qwen35` prefix cache
+already uses (high bit set, so never a real token id; per row, so two images agree only
+if their pixels do). Capture, lookup and the downstream CAPTURE/RESTORE epochs all use
+the key. A cached prefix whose KV depth falls strictly inside an image is refused (cold),
+and on a resume only the images past the prefix are spliced into the suffix prefill.
+Tenants namespace the stand-ins as they do the text cache.
+
+Verified with a three-turn chat per image, two same-size images in different colours
+(`sdk_vlm_kv.py`: A red square / blue circle, B green / yellow), greedy:
+
+| Tree | Turn 1 (cold) | Turns 2-3 (warm) | Resumed at |
+|---|---|---|---|
+| Ministral-3-3B, `ov-runtime`, one stage | 11 s | 1.0 s, 0.9 s | 824 of 838, 840 of 850 |
+| Ministral-3-3B, `ov-runtime`, two machines | 13-16 s | 1.0 s, 0.9 s | same |
+| Gemma 4 E4B, `gemma4`, one stage | 13-14 s | 1.1-1.4 s, 0.9-1.0 s | 296 of 317, 318 of 335 |
+
+All 18 answers are right. Conversation B's first turn misses (`n_entries` 1, A's entry
+present) and never resumes from A's KV. On two machines rank 1 captures each turn under
+the epoch rank 0 later restores. Gemma 4 E4B needs `enable_thinking: false` for this
+test: a reply cut off inside the thought channel re-renders differently, so the next
+turn misses (a cold reprefill, not a wrong answer).
+
+Still re-prefilled: static and packed shards (the cache is stateful-only), and `qwen36`
+staged turns (its M-RoPE positions for a resumed suffix are not wired).
 
 ## Engines that do not take images (2026-10-15)
 
