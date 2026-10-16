@@ -169,7 +169,7 @@ impl DecisionService {
         let prof = profile::DecisionProfile::load(&path)?;
         let tok = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| format!("{}: tokenizer.json: {e}", model_dir.display()))?;
-        Self::from_profile(&prof, tok, tree_hidden(model_dir))
+        Self::from_profile(&prof, tok, tree_hidden(model_dir), tree_window(model_dir))
             .map(Some)
             .map_err(|e| format!("{}: {e}", path.display()))
     }
@@ -181,6 +181,7 @@ impl DecisionService {
         prof: &profile::DecisionProfile,
         tok: tokenizers::Tokenizer,
         hidden: Option<usize>,
+        window: Option<usize>,
     ) -> Result<DecisionService, String> {
         use cascadia_types::{MAX_DECISION_PROMPT, MAX_JOINT_QUESTIONS};
         if prof.max_tokens == 0 {
@@ -204,7 +205,8 @@ impl DecisionService {
             profile::Family::Jev => Box::new(
                 jev::JevCodec::new(tok, prof.jev.clone().unwrap())?
                     .with_pass_cap(max_tokens)
-                    .with_total_cap(max_total_tokens),
+                    .with_total_cap(max_total_tokens)
+                    .with_window(window),
             ),
             profile::Family::Kev => Box::new(kev::KevCodec::new(
                 tok,
@@ -270,6 +272,19 @@ fn tree_hidden(model_dir: &Path) -> Option<usize> {
             c.get("text_config").and_then(width).or_else(|| width(&c))
         })
         .filter(|&h| h > 0)
+}
+
+/// The model's window as the qwen35 engine reads it (`read_max_ctx`): config.json
+/// `max_position_embeddings`, from `text_config` when there is one. `None` when not stated; the
+/// engine then bounds decision prompts by MAX_DECISION_PROMPT alone.
+fn tree_window(model_dir: &Path) -> Option<usize> {
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(model_dir.join("config.json")).ok()?).ok()?;
+    let cfg = v.get("text_config").unwrap_or(&v);
+    cfg.get("max_position_embeddings")?
+        .as_u64()
+        .filter(|&m| m > 0)
+        .map(|m| m as usize)
 }
 
 /// A tokenizer failure inside a codec's `encode`. The tokenizer's own text can carry vocab or path
@@ -464,6 +479,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(super::tree_hidden(&d), Some(5120));
+        // The window, as the engine reads it: text_config's when nested.
+        assert_eq!(super::tree_window(&d), None);
+        std::fs::write(
+            d.join("config.json"),
+            r#"{"max_position_embeddings": 9, "text_config": {"max_position_embeddings": 262144}}"#,
+        )
+        .unwrap();
+        assert_eq!(super::tree_window(&d), Some(262144));
+        std::fs::write(
+            d.join("config.json"),
+            r#"{"max_position_embeddings": 4096}"#,
+        )
+        .unwrap();
+        assert_eq!(super::tree_window(&d), Some(4096));
         std::fs::remove_dir_all(&d).unwrap();
     }
 
@@ -659,7 +688,7 @@ mod tests {
     #[test]
     fn profile_limits_are_range_checked_and_clamped_at_load() {
         use cascadia_types::{MAX_DECISION_PROMPT, MAX_JOINT_PROMPT, MAX_JOINT_QUESTIONS};
-        let load = |j: &str| DecisionService::from_profile(&profile(j), word_tok(), None);
+        let load = |j: &str| DecisionService::from_profile(&profile(j), word_tok(), None, None);
         // Zero limits would fail every request confusingly: refuse the profile.
         for j in [
             r#"{"family":"clef","max_tokens":0}"#,

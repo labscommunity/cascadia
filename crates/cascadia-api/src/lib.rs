@@ -152,6 +152,10 @@ pub struct AppState {
     /// Special-token message framing to translate back into text delimiters
     /// (Inkling). See [`MarkerDialect`].
     pub marker_dialect: Option<MarkerDialect>,
+    /// JEV System 2's chat-template frame (see [`think_frame`]), rendered once at startup.
+    /// `None` disables thinking: no JEV that can think, or its template is missing or does not
+    /// render (logged as a warning; System 1 keeps serving).
+    pub think_frame: Option<Arc<(String, String)>>,
     /// Pipeline readiness for `/health`. Starts `true`; a completion that fails
     /// with a 5xx (e.g. the distributed pipeline dropped a peer link) flips it
     /// `false`, a success flips it back `true` — so `/health` reflects the real
@@ -708,6 +712,11 @@ fn make_router_inner(
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         decisions: cfg.decisions.clone(),
         decision_dump,
+        think_frame: None,
+    };
+    let state = AppState {
+        think_frame: startup_think_frame(&state),
+        ..state
     };
     let state = AppState {
         effort_words: state
@@ -1756,6 +1765,26 @@ fn render_with_chat_env(
         None => ctx,
     };
     tmpl.render(ctx).map_err(|e| classify_render_error(&e))
+}
+
+/// [`think_frame`] for a router whose decision model is a JEV that can think, else `None`. A JEV
+/// that could think but whose template is missing or does not render gets a startup warning and
+/// no System 2, rather than a 400 on every request that asks for it.
+fn startup_think_frame(state: &AppState) -> Option<Arc<(String, String)>> {
+    let jev = state.decisions.as_ref()?.codec.as_jev()?;
+    if jev.system2_refusal().is_some() {
+        return None;
+    }
+    match think_frame(state) {
+        Some(f) => Some(Arc::new(f)),
+        None => {
+            warn!(
+                "JEV System 2 (thinking) disabled: the model's chat template is missing or does \
+                 not render a user turn; System 1 keeps serving"
+            );
+            None
+        }
+    }
 }
 
 /// The user content System 2's frame is rendered around (serve_decide `PLACEHOLDER`).
@@ -9925,6 +9954,19 @@ level={{ effort_map[eff] }}";
         max_total: usize,
         template: Option<&str>,
     ) -> Router {
+        think_app_full(s, profile, 4000, max_total, None, template).await
+    }
+
+    /// [`think_app_with`] with the pass cap (`max_tokens`) and the model window (config.json
+    /// `max_position_embeddings`) chosen.
+    async fn think_app_full(
+        s: &Thinker,
+        profile: decisions::profile::JevProfile,
+        max_tokens: usize,
+        max_total: usize,
+        window: Option<usize>,
+        template: Option<&str>,
+    ) -> Router {
         let runner = Runner::new(Box::new(ThinkBuilder(s.clone())));
         runner
             .start(
@@ -9935,13 +9977,14 @@ level={{ effort_map[eff] }}";
             .unwrap();
         let codec = decisions::jev::JevCodec::new(think_tokenizer(), profile)
             .unwrap()
-            .with_pass_cap(4000)
-            .with_total_cap(max_total);
+            .with_pass_cap(max_tokens)
+            .with_total_cap(max_total)
+            .with_window(window);
         let cfg = Config {
             decisions: Some(Arc::new(decisions::DecisionService {
                 family: decisions::profile::Family::Jev,
                 codec: Box::new(codec),
-                max_tokens: 4000,
+                max_tokens,
                 max_total_tokens: max_total,
                 max_questions: 32,
                 prefix_reuse: false,
@@ -10299,7 +10342,7 @@ level={{ effort_map[eff] }}";
         let app = think_app_with(&s, think_profile(), 3000, Some(THINK_TEMPLATE)).await;
         let (status, v, _) = post_decisions(
             app,
-            &think_body(r#""thinking": "auto", "think_budget": 600, "#),
+            &think_body(r#""thinking": "on", "think_budget": 600, "#),
         )
         .await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
@@ -10314,7 +10357,7 @@ level={{ effort_map[eff] }}";
         let app = think_app_with(&s, think_profile(), 3000, Some(THINK_TEMPLATE)).await;
         let (status, v, _) = post_decisions(
             app,
-            &think_body(r#""thinking": "auto", "think_budget": 400, "#),
+            &think_body(r#""thinking": "on", "think_budget": 400, "#),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
@@ -10350,6 +10393,160 @@ level={{ effort_map[eff] }}";
         assert_eq!(
             u["total_tokens"].as_u64().unwrap(),
             u["input_tokens"].as_u64().unwrap() + 5
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_on_two_questions_fits_at_the_default_budget() {
+        // Fix round 1: the default think budget is 4096 (or max_tokens if smaller), not
+        // max_tokens, so `on` over two questions fits the default 4 × max_tokens.
+        let s = Thinker::default();
+        let app = think_app_full(
+            &s,
+            think_profile(),
+            32768,
+            4 * 32768,
+            None,
+            Some(THINK_TEMPLATE),
+        )
+        .await;
+        let (status, v, _) = post_decisions(app, &think_body(r#""thinking": "on", "#)).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let gens: Vec<_> = s
+            .tasks()
+            .into_iter()
+            .filter(|t| t.decision.is_none())
+            .collect();
+        assert_eq!(gens.len(), 2);
+        assert!(gens.iter().all(|t| t.max_tokens == 4096));
+        assert_eq!(v["answers"]["u"]["thinking"]["budget"], 4096);
+        // A smaller max_tokens is the default itself.
+        let s = Thinker::default();
+        let (status, v, _) =
+            post_decisions(think_app(&s).await, &think_body(r#""thinking": "on", "#)).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["answers"]["u"]["thinking"]["budget"], 4000);
+    }
+
+    #[tokio::test]
+    async fn thinking_auto_skips_a_question_the_budget_cannot_cover_instead_of_413() {
+        // 3000 tokens: System 1's two passes, then u's worst case at budget 600 (~1.5k) is
+        // reserved; c's no longer fits, so c answers from System 1 alone with reason "budget".
+        let s = Thinker::default();
+        s.queue(vec![], vec![ids("ok")]);
+        let app = think_app_with(&s, think_profile(), 3000, Some(THINK_TEMPLATE)).await;
+        let (status, v, _) = post_decisions(
+            app,
+            &think_body(r#""thinking": "auto", "think_budget": 600, "#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["answers"]["u"]["thinking"]["used"], true, "{v}");
+        assert_eq!(
+            v["answers"]["c"]["thinking"],
+            serde_json::json!({"mode": "auto", "used": false, "reason": "budget",
+                               "threshold": 0.8, "budget": 600})
+        );
+        assert!(
+            close(&v["answers"]["c"]["probabilities"]["x"], 0.6652),
+            "{v}"
+        );
+        let gens = s.tasks().iter().filter(|t| t.decision.is_none()).count();
+        assert_eq!(gens, 1, "only u generated");
+        // Nothing fits: every question skips, still a 200 (a profile default of auto too).
+        let mut p = think_profile();
+        p.system2.thinking = decisions::profile::ThinkingMode::Auto;
+        let s = Thinker::default();
+        let app = think_app_with(&s, p, 600, Some(THINK_TEMPLATE)).await;
+        let (status, v, _) = post_decisions(app, &think_body("")).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["answers"]["u"]["thinking"]["reason"], "budget");
+        assert_eq!(v["answers"]["c"]["thinking"]["reason"], "budget");
+        assert!(s.tasks().iter().all(|t| t.decision.is_some()));
+    }
+
+    #[tokio::test]
+    async fn a_read_back_past_the_model_window_is_refused_up_front() {
+        // config.json's window (here 600 tokens) bounds the engine's decision prompts: a
+        // read-back that can outgrow it is a 413 for `on`, a budget skip for `auto`.
+        let s = Thinker::default();
+        let app = think_app_full(
+            &s,
+            think_profile(),
+            4000,
+            64000,
+            Some(600),
+            Some(THINK_TEMPLATE),
+        )
+        .await;
+        let (status, v, _) = post_decisions(
+            app,
+            &think_body(r#""thinking": "on", "think_budget": 500, "#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("window"), "{v}");
+        assert!(s.tasks().is_empty());
+        let s = Thinker::default();
+        let app = think_app_full(
+            &s,
+            think_profile(),
+            4000,
+            64000,
+            Some(600),
+            Some(THINK_TEMPLATE),
+        )
+        .await;
+        let (status, v, _) = post_decisions(
+            app,
+            &think_body(r#""thinking": "auto", "think_budget": 500, "#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["answers"]["u"]["thinking"]["reason"], "budget");
+        // A budget that fits the window thinks.
+        let s = Thinker::default();
+        let app = think_app_full(
+            &s,
+            think_profile(),
+            4000,
+            64000,
+            Some(600),
+            Some(THINK_TEMPLATE),
+        )
+        .await;
+        let (status, v, _) = post_decisions(
+            app,
+            &think_body(r#""thinking": "on", "think_budget": 100, "#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
+    #[tokio::test]
+    async fn a_profile_default_that_thinks_without_a_chat_template_serves_system_one() {
+        // Fix round 1 (M2): System 2 is disabled for a tree whose template did not load (a
+        // startup warning); a request that does not ask for thinking is answered by System 1,
+        // one that asks is a 400.
+        let mut p = think_profile();
+        p.system2.thinking = decisions::profile::ThinkingMode::On;
+        let s = Thinker::default();
+        let (status, v, body) = post_decisions(
+            think_app_with(&s, p.clone(), 64000, None).await,
+            &think_body(""),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert!(!body.contains("thinking"), "{body}");
+        let (status, v, _) = post_decisions(
+            think_app_with(&Thinker::default(), p, 64000, None).await,
+            &think_body(r#""thinking": "auto", "#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert!(
+            v["error"].as_str().unwrap().contains("chat template"),
+            "{v}"
         );
     }
 }
