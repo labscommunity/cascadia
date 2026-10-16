@@ -804,6 +804,19 @@ impl OvKvCache {
         partner: &str,
         prompt: &[i32],
     ) -> Option<(Vec<u8>, usize, bool)> {
+        self.take_warm_where(partner, prompt, |_, _| true)
+    }
+
+    /// [`take_warm`](Self::take_warm) over the entries `usable(blob, len)`
+    /// accepts: the longest of those is removed and returned, and a rejected
+    /// entry stays cached. Image turns use it to skip a prefix whose KV ends
+    /// inside an image without losing a shorter one that does not.
+    pub(crate) fn take_warm_where(
+        &mut self,
+        partner: &str,
+        prompt: &[i32],
+        usable: impl Fn(&[u8], usize) -> bool,
+    ) -> Option<(Vec<u8>, usize, bool)> {
         let idx = self
             .entries
             .iter()
@@ -813,6 +826,7 @@ impl OvKvCache {
                     && !e.tokens.is_empty()
                     && e.tokens.len() < prompt.len()
                     && prompt.starts_with(&e.tokens)
+                    && usable(&e.blob, e.tokens.len())
             })
             .max_by_key(|(_, e)| e.tokens.len())
             .map(|(i, _)| i);
@@ -1207,6 +1221,23 @@ mod tests {
         );
         // request [9] → no prefix
         assert!(c.longest_prefix(LOCAL_NS, &[9]).is_none());
+    }
+
+    #[test]
+    fn take_warm_where_skips_rejected_entries_and_keeps_them() {
+        let mut c = OvKvCache::default();
+        c.capture(LOCAL_NS, vec![1, 2], b"short".to_vec());
+        c.capture(LOCAL_NS, vec![1, 2, 3, 4], b"long".to_vec());
+        let (blob, len, _) = c
+            .take_warm_where(LOCAL_NS, &[1, 2, 3, 4, 5], |_, l| l < 4)
+            .unwrap();
+        assert_eq!((blob.as_slice(), len), (&b"short"[..], 2));
+        let (blob, len, _) = c.take_warm(LOCAL_NS, &[1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(
+            (blob.as_slice(), len),
+            (&b"long"[..], 4),
+            "the rejected entry stayed cached"
+        );
     }
 
     #[test]
