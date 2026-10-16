@@ -111,7 +111,7 @@ impl PreprocessConfig {
             .get("downsample_ratio")
             .and_then(serde_json::Value::as_f64)
             .unwrap_or(0.5);
-        if patch == 0 || c.image_size % patch != 0 {
+        if patch == 0 || !c.image_size.is_multiple_of(patch) {
             return Err(format!(
                 "image size {} is not whole {patch}-px patches",
                 c.image_size
