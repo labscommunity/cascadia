@@ -27,10 +27,24 @@ Families (the `vision.family` rank 0 serves):
   mistral3  Mistral3ForConditionalGeneration (e.g. Ministral-3, exported with
             optimum-intel): the Pixtral encoder plus a 2x2 patch merger in
             openvino_multi_modal_projector_model.xml, which rank 0 runs.
+  qwen2_5_vl  Qwen2.5-VL (e.g. OpenVINO/Qwen2.5-VL-7B-Instruct-int4-ov). Every
+            stage takes M-RoPE `position_ids [3, B, T]`, which rank 0 computes
+            and sends with each hidden; the stages record `position_rows: 3`
+            and the pipeline `vision.mrope_rows: 3`. Rank 0 runs the patch
+            embedding and the merger IR (window attention).
+  qwen3_vl  Qwen3-VL (e.g. OpenVINO/Qwen3-VL-4B-Instruct-int4-ov): as
+            qwen2_5_vl, plus DeepStack. Its language model adds the vision
+            merger's `deepstack_feature_lists` row k to the image tokens after
+            decoder layer k (k < len(deepstack_visual_indexes) = 3) through
+            two inputs, `visual_pos_masks` and `deepstack_visual_embeds`. Those
+            must stay in stage 0 (rank 0 holds the rows), so stage 0 must
+            cover layers 0..2; `visual_pos_masks` becomes an i64 input
+            converted to the IR's boolean inside the graph (the runtime feeds
+            no boolean tensors).
 
 Usage:
   python cut_vlm_lm.py --model <OV VLM dir> --output-dir <tree> --num-stages N \
-      --family pixtral [--stage I] [--all-logits]
+      --family pixtral|mistral3|qwen2_5_vl|qwen3_vl [--stage I] [--all-logits]
 """
 
 from __future__ import annotations
@@ -64,7 +78,25 @@ FAMILIES = {
         "vision_types": ("pixtral",),
         "token_type_ids": False,
     },
+    "qwen2_5_vl": {
+        "model_types": ("qwen2_5_vl",),
+        "vision_types": ("qwen2_5_vl",),
+        "token_type_ids": False,
+        "mrope_rows": 3,
+        "required": ("openvino_vision_embeddings_merger_model.xml", "preprocessor_config.json"),
+    },
+    "qwen3_vl": {
+        "model_types": ("qwen3_vl",),
+        "vision_types": ("qwen3_vl",),
+        "token_type_ids": False,
+        "mrope_rows": 3,
+        "required": ("openvino_vision_embeddings_merger_model.xml",
+                     "openvino_vision_embeddings_pos_model.xml", "preprocessor_config.json"),
+    },
 }
+
+# Qwen3-VL's DeepStack inputs; they belong to stage 0 only.
+DEEPSTACK_INPUTS = ("visual_pos_masks", "deepstack_visual_embeds")
 
 ROOT_FILES = (
     "openvino_text_embeddings_model.xml",
@@ -73,7 +105,12 @@ ROOT_FILES = (
     "openvino_vision_embeddings_model.bin",
     "openvino_multi_modal_projector_model.xml",
     "openvino_multi_modal_projector_model.bin",
+    "openvino_vision_embeddings_merger_model.xml",
+    "openvino_vision_embeddings_merger_model.bin",
+    "openvino_vision_embeddings_pos_model.xml",
+    "openvino_vision_embeddings_pos_model.bin",
     "preprocessor_config.json",
+    "video_preprocessor_config.json",
     "processor_config.json",
     "generation_config.json",
     "tokenizer.json",
@@ -120,6 +157,60 @@ def check_family(cfg: dict, family: str) -> None:
         raise SystemExit("cross-layer KV sharing cannot be cut by this tool")
 
 
+def deepstack_layers(cfg: dict, family: str) -> int:
+    """Decoder layers that take DeepStack rows (Qwen3-VL: one per vision
+    feature level, added after layers 0..n-1), 0 for other families."""
+    if family != "qwen3_vl":
+        return 0
+    n = len((cfg.get("vision_config") or {}).get("deepstack_visual_indexes") or [])
+    if n == 0:
+        raise SystemExit("qwen3_vl export has no vision_config.deepstack_visual_indexes")
+    return n
+
+
+def param_by_name(model, name: str):
+    for p in model.get_parameters():
+        if name in p.output(0).get_names() or p.get_friendly_name() == name:
+            return p
+    return None
+
+
+def check_mrope_positions(stage, rows: int, idx: int) -> None:
+    """Every stage of an M-RoPE family must take `position_ids [rows, ?, ?]`."""
+    p = param_by_name(stage, "position_ids")
+    if p is None:
+        raise SystemExit(f"stage_{idx} has no position_ids input; not an M-RoPE language model")
+    ps = p.get_partial_shape()
+    if ps.rank.get_length() != 3 or not ps[0].is_static or ps[0].get_length() != rows:
+        raise SystemExit(f"stage_{idx} position_ids is {ps}, expected [{rows}, ?, ?]")
+
+
+def fix_deepstack_inputs(stage, first: bool, idx: int):
+    """Stage 0 keeps the DeepStack inputs, with `visual_pos_masks` turned into
+    an i64 input converted to the IR's boolean (the runtime feeds no boolean
+    tensors); any later stage holding one is refused: its rows live on rank 0."""
+    have = [n for n in DEEPSTACK_INPUTS if param_by_name(stage, n) is not None]
+    if not first:
+        if have:
+            raise SystemExit(
+                f"stage_{idx} takes {have}: DeepStack rows feed the first decoder layers, "
+                "which must all sit in stage 0; use fewer stages or a later first cut")
+        return stage
+    if len(have) != len(DEEPSTACK_INPUTS):
+        raise SystemExit(f"stage_0 lacks DeepStack inputs (has {have}); not a Qwen3-VL export")
+    mask = param_by_name(stage, "visual_pos_masks")
+    if mask.get_element_type() == ov.Type.boolean:
+        from openvino import opset13 as ops
+        new = ops.parameter(mask.get_partial_shape(), ov.Type.i64, name="visual_pos_masks")
+        new.output(0).set_names({"visual_pos_masks"})
+        conv = ops.convert(new.output(0), ov.Type.boolean)
+        for tgt in list(mask.output(0).get_target_inputs()):
+            tgt.replace_source_output(conv.output(0))
+        stage.replace_parameter(stage.get_parameter_index(mask), new)
+        stage.validate_nodes_and_infer_types()
+    return stage
+
+
 def run(model_dir: str, out_dir: str, num_stages: int, family: str,
         suffix: str, only_stage: int | None, all_logits: bool = False) -> None:
     with open(os.path.join(model_dir, "config.json")) as f:
@@ -130,7 +221,7 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
     hidden = int(text["hidden_size"])
     lm_xml = os.path.join(model_dir, "openvino_language_model.xml")
     required = ["openvino_language_model.xml", "openvino_text_embeddings_model.xml",
-                "openvino_vision_embeddings_model.xml"]
+                "openvino_vision_embeddings_model.xml", *FAMILIES[family].get("required", ())]
     if family == "mistral3":
         # Rank 0 reads spatial_merge_size from processor_config.json and runs
         # the projector on the merged rows; without them the tree would serve
@@ -151,6 +242,12 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
     if os.path.exists(marker):
         os.remove(marker)
     ranges = g.stage_ranges(num_stages, num_layers)
+    mrope_rows = FAMILIES[family].get("mrope_rows")
+    n_deepstack = deepstack_layers(cfg, family)
+    if n_deepstack and ranges[0][1] + 1 < n_deepstack:
+        raise SystemExit(
+            f"stage 0 would hold layers 0..{ranges[0][1]}, but Qwen3-VL adds DeepStack rows "
+            f"after layers 0..{n_deepstack - 1} and only rank 0 has them; use fewer stages")
     stages_meta = []
     for i, (a, b) in enumerate(ranges):
         first, last = i == 0, i == len(ranges) - 1
@@ -163,12 +260,18 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
         }
         if last:
             meta["logits"] = "all" if all_logits else "last"
+        if mrope_rows:
+            meta["position_rows"] = mrope_rows
         stages_meta.append(meta)
         if only_stage is not None and i != only_stage:
             continue
         t0 = time.time()
         stage, state_vars, _ = g.extract_stage(lm_xml, a, b, first, last, suffix,
                                                not all_logits)
+        if mrope_rows:
+            check_mrope_positions(stage, mrope_rows, i)
+        if family == "qwen3_vl":
+            stage = fix_deepstack_inputs(stage, first, i)
         sdir = os.path.join(out_dir, f"stage_{i}")
         os.makedirs(sdir, exist_ok=True)
         ov.save_model(stage, os.path.join(sdir, "openvino_model.xml"), compress_to_fp16=False)
@@ -217,9 +320,13 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
             "text_embeddings": "openvino_text_embeddings_model.xml",
             "vision_embeddings": "openvino_vision_embeddings_model.xml",
             "token_type_ids": FAMILIES[family]["token_type_ids"],
-            "image_token_id": cfg.get("image_token_index"),
+            "image_token_id": cfg.get("image_token_index", cfg.get("image_token_id")),
         },
     }
+    if mrope_rows:
+        pipeline["vision"]["mrope_rows"] = mrope_rows
+    if n_deepstack:
+        pipeline["vision"]["deepstack_layers"] = n_deepstack
     with open(marker, "w") as f:
         json.dump(pipeline, f, indent=2)
     log(f"CUT DONE -> {out_dir}")
