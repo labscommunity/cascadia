@@ -35,6 +35,10 @@ pub struct MediaConfig {
     /// prompt. Gemma 4's template also trims each text part; this does the
     /// same.
     pub trim_text_parts: bool,
+    /// Write a message's image tags before its text, whatever the parts'
+    /// order, as LLaVA-NeXT's processor template does (`<image>\n` per image,
+    /// then the text parts back to back).
+    pub images_first: bool,
     /// Images allowed in one request.
     pub max_images: usize,
     /// Images larger than this many pixels are downscaled to fit, keeping
@@ -72,6 +76,7 @@ impl MediaConfig {
             image_placeholder: "<ov_genai_image_{i}>".into(),
             reserved_text: vec!["<ov_genai_image_".into()],
             trim_text_parts: false,
+            images_first: false,
             max_images: 8,
             // 1024x1024: about 1000 image tokens on Qwen3.5.
             max_image_pixels: 1 << 20,
@@ -155,6 +160,31 @@ impl MediaConfig {
                 .to_vec(),
             ..Self::ov_genai()
         }
+    }
+
+    /// Settings for a LLaVA-NeXT (llava-v1.6) vision tree on `ov-runtime`:
+    /// `<image>` followed by a newline, every image of a message before its
+    /// text, which is what the processor's chat template renders. Rank 0
+    /// expands each `<image>` to the image's tiles and newline rows (at most
+    /// 2928 tokens on llava-v1.6's pinpoints).
+    pub fn llava_next_native() -> Self {
+        Self {
+            image_placeholder: "<image>\n".into(),
+            reserved_text: vec!["<image>".into()],
+            images_first: true,
+            ..Self::ov_genai()
+        }
+    }
+
+    /// A message's content once its parts are joined: back to back in order,
+    /// or (`images_first`) every image tag first, then the text parts. Each
+    /// part is `(is_image, text)`.
+    pub fn join_parts(&self, parts: Vec<(bool, String)>) -> String {
+        if !self.images_first {
+            return parts.into_iter().map(|(_, t)| t).collect();
+        }
+        let (images, texts): (Vec<_>, Vec<_>) = parts.into_iter().partition(|(img, _)| *img);
+        images.into_iter().chain(texts).map(|(_, t)| t).collect()
     }
 
     /// One text part of a message with images, as it enters the prompt.
@@ -965,5 +995,41 @@ mod tests {
         assert_eq!(x.reserved_in("raw [IMG_END] text"), Some("[IMG_END]"));
         assert!(x.reserved_in("raw [IMG_BREAK] text").is_some());
         assert_eq!(x.reserved_in("plain text"), None);
+    }
+
+    /// LLaVA-NeXT's processor template writes `<image>\n` per image, then the
+    /// text parts back to back, whatever the parts' order; HF renders
+    /// `[INST] <image>\n<image>\nA:B:Compare. [/INST]` for this message
+    /// (tests/fixtures/llava_next_vision in the OpenVINO engine crate).
+    #[test]
+    fn llava_next_writes_images_first() {
+        let l = MediaConfig::llava_next_native();
+        let parts = vec![
+            (false, "A:".to_string()),
+            (true, l.placeholder(0)),
+            (false, "B:".to_string()),
+            (true, l.placeholder(1)),
+            (false, "Compare.".to_string()),
+        ];
+        assert_eq!(
+            l.join_parts(parts.clone()),
+            "<image>\n<image>\nA:B:Compare."
+        );
+        assert_eq!(l.placeholders_complete("<image>\n<image>\nA:B:", 2), Ok(()));
+        assert_eq!(l.reserved_in("say <image> please"), Some("<image>"));
+        assert_eq!(
+            l.reserved_beyond_placeholders("<image>\n<image>\nA:B:", 2),
+            None
+        );
+        assert_eq!(
+            l.reserved_beyond_placeholders("<image>\nA <image>", 1),
+            Some("<image>")
+        );
+        // Every other family keeps the parts in order.
+        let x = MediaConfig::pixtral_native();
+        assert_eq!(
+            x.join_parts(vec![(false, "A".into()), (true, "[IMG]".into())]),
+            "A[IMG]"
+        );
     }
 }

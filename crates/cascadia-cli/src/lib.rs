@@ -1408,6 +1408,10 @@ fn vision_tree_media(engine: EngineKind, family: &str) -> Option<cascadia_api::M
         (EngineKind::OvRuntime | EngineKind::OvDistSpec, "pixtral" | "mistral3") => {
             Some(cascadia_api::MediaConfig::pixtral_native())
         }
+        // ov-dist-spec refuses a LLaVA-NeXT target at load.
+        (EngineKind::OvRuntime, "llava_next") => {
+            Some(cascadia_api::MediaConfig::llava_next_native())
+        }
         _ => None,
     }
 }
@@ -3718,6 +3722,11 @@ mod tests {
         assert_eq!(tag(EngineKind::OvDistSpec, "gemma4"), None);
         assert_eq!(tag(EngineKind::Gemma4, "pixtral"), None);
         assert_eq!(tag(EngineKind::OvDistSpec, "qwen35"), None);
+        assert_eq!(
+            tag(EngineKind::OvRuntime, "llava_next").as_deref(),
+            Some("<image>\n")
+        );
+        assert_eq!(tag(EngineKind::OvDistSpec, "llava_next"), None);
     }
 
     #[test]
