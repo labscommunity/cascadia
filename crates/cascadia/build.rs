@@ -13,8 +13,13 @@ fn main() {
         return;
     }
     if let Some(dirs) = std::env::var_os("DEP_CASCADIA_OV_GENAI_SHIM_RPATH") {
+        // The shim emits no empty or comma-bearing dir; skip them anyway rather than pass
+        // `-Wl,-rpath,` a bad argument.
         for d in std::env::split_paths(&dirs) {
-            println!("cargo:rustc-link-arg-bins=-Wl,-rpath,{}", d.display());
+            let d = d.display().to_string();
+            if !d.is_empty() && !d.contains(',') {
+                println!("cargo:rustc-link-arg-bins=-Wl,-rpath,{d}");
+            }
         }
     }
 }
