@@ -1832,6 +1832,14 @@ impl Frontend {
         }
     }
 
+    /// Every id an image expands to (soft tokens and their framing).
+    pub(crate) fn image_framing(&self) -> Vec<i64> {
+        match self {
+            Frontend::Gemma4(f) => vec![f.tokens.image, f.tokens.boi, f.tokens.eoi],
+            Frontend::Pixtral(f) => vec![f.tokens.image, f.tokens.image_break, f.tokens.image_end],
+        }
+    }
+
     /// The soft-token id whose rows the encoder supplies.
     pub(crate) fn image_token(&self) -> i64 {
         match self {
