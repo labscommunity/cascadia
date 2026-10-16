@@ -125,6 +125,23 @@ impl MediaConfig {
         }
     }
 
+    /// Settings for a Gemma 3 vision tree on `ov-runtime`: the template's own
+    /// `<start_of_image>`, which rank 0 expands on the rendered text as HF's
+    /// processor does (blank lines, the soft tokens, `<end_of_image>`).
+    /// The template trims each text part, as Gemma 4's does. Every image
+    /// costs 256 tokens (it is resized to 896x896), so the pixel budget only
+    /// bounds decode and resize work.
+    pub fn gemma3_native() -> Self {
+        Self {
+            image_placeholder: "<start_of_image>".into(),
+            reserved_text: ["<start_of_image>", "<image_soft_token>", "<end_of_image>"]
+                .map(String::from)
+                .to_vec(),
+            trim_text_parts: true,
+            ..Self::ov_genai()
+        }
+    }
+
     /// Settings for a Pixtral (LLaVA-layout) vision tree on `ov-runtime`:
     /// the template's own `[IMG]`, which rank 0 expands to the image's rows
     /// of `[IMG]` closed by `[IMG_BREAK]` and, last, `[IMG_END]`. Pixtral
@@ -902,6 +919,21 @@ mod tests {
         assert_eq!(g.reserved_in("plain text"), None);
 
         assert_eq!(g.text_part("  a b \n".into()), "a b");
+
+        let g3 = MediaConfig::gemma3_native();
+        let tag = g3.placeholder(1);
+        assert_eq!(tag, "<start_of_image>");
+        assert_eq!(g3.placeholders_complete(&format!("{tag}a{tag}"), 2), Ok(()));
+        assert_eq!(
+            g3.reserved_in("raw <image_soft_token> text"),
+            Some("<image_soft_token>")
+        );
+        assert!(g3.reserved_in("x<end_of_image>").is_some());
+        assert_eq!(
+            g3.reserved_beyond_placeholders(&format!("{tag}a{tag}"), 1),
+            Some("<start_of_image>")
+        );
+        assert_eq!(g3.text_part(" a \n".into()), "a");
 
         let x = MediaConfig::pixtral_native();
         assert_eq!(x.text_part(" a ".into()), " a ");
