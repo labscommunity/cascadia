@@ -178,7 +178,8 @@ impl Codec for ClefCodec {
         )?;
         let fixed = prefix.len() + schema.len() + suffix.len();
         // The head's [questions + options, T] f32 span mask must also fit the engine's per-input
-        // limit (MAX_HEAD_INPUT_BYTES): many spans tighten the prompt bound below max_tokens.
+        // limit (MAX_HEAD_INPUT_BYTES). Within the question and option caps it allows at least
+        // 19,275 tokens, so it never binds below MAX_JOINT_PROMPT today; kept as the bound.
         let rows = req.questions.len() + total;
         let limit = self.max_tokens.min(joint_mask_prompt_cap(rows));
         if fixed > limit {
@@ -375,16 +376,20 @@ mod tests {
 
     #[test]
     fn joint_cap_follows_the_tree_width() {
-        // Clef-27B (5120 wide): the head's [T, 5120] f32 input must fit the shim's 256 MiB, so
-        // the state is truncated to a 13107-token prompt; Clef-flash (4096) keeps 16384.
+        // The head's [T, width] f32 input must fit the shim's 320 MiB: Clef-27B (5120) and
+        // Clef-flash (4096) both keep 16384; a wider tree (8192) is truncated to 10240.
         let big = "s".repeat(MAX_JOINT_PROMPT + 5000);
         let r: DecisionRequest = serde_json::from_str(&format!(
             r#"{{"model": "m", "state": "{big}", "questions": {{"u": {{"type": "noul"}}}}}}"#
         ))
         .unwrap();
-        let wide = ClefCodec::new(tok(), 16384, Some(5120)).unwrap();
-        let p = wide.encode(&r).unwrap();
-        assert_eq!(p[0].readout.prompt_ids.len(), 13_107);
+        let clef27 = ClefCodec::new(tok(), 16384, Some(5120)).unwrap();
+        assert_eq!(
+            clef27.encode(&r).unwrap()[0].readout.prompt_ids.len(),
+            16_384
+        );
+        let wide = ClefCodec::new(tok(), 16384, Some(8192)).unwrap();
+        assert_eq!(wide.encode(&r).unwrap()[0].readout.prompt_ids.len(), 10_240);
         let flash = ClefCodec::new(tok(), 16384, Some(4096)).unwrap();
         assert_eq!(
             flash.encode(&r).unwrap()[0].readout.prompt_ids.len(),
