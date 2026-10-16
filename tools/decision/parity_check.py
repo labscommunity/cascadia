@@ -46,8 +46,12 @@ def margin(p):
     return s[0] - (s[1] if len(s) > 1 else 0.0)
 
 
-def gate(flip_margins, agree, total, min_agree, confident):
-    """Pass iff raw agreement >= min_agree AND no flip where the reference itself was confident."""
+def gate(flip_margins, agree, total, min_agree, confident, wide_dp=None, max_dp=None):
+    """Pass iff raw agreement >= min_agree AND no flip where the reference itself was confident AND,
+    with max_dp, the multi-pass questions' max |dp| (wide_dp) is within it: a combination bug that
+    keeps every top-1 still moves the probabilities."""
+    if max_dp is not None and wide_dp is not None and wide_dp > max_dp:
+        return False, f"multi-pass max |dp| {wide_dp:.4f} > {max_dp}"
     sure = [m for m in flip_margins if m >= confident]
     if sure:
         return False, f"{len(sure)} confident flip(s) (reference margin >= {confident}): {[round(m, 3) for m in sure]}"
@@ -57,13 +61,23 @@ def gate(flip_margins, agree, total, min_agree, confident):
     return True, f"agreement {agree}/{total} = {rate:.3f}, every flip had reference margin < {confident}"
 
 
-def max_abs_delta(ref, results):
-    """Largest |p_server - p_ref| over every option of every answered question (0.0 when none)."""
+# JEV's trained choice slots (16 for the shipped heads): a choice with more options is multi-pass.
+TRAINED_CHOICES = 16
+
+
+def multi_pass(q):
+    """A JEV choice past the trained slots, answered by combining several passes."""
+    return q["type"] == "choice" and len(q["criteria"]) > TRAINED_CHOICES
+
+
+def max_abs_delta(ref, results, which=None):
+    """Largest |p_server - p_ref| over every option of every answered question (0.0 when none);
+    `which(question)` keeps only some questions."""
     worst = 0.0
     for rec, resp in results:
         for qid, ans in resp["answers"].items():
             want = ref.get(f"{rec['id']}.{qid}")
-            if want is None:
+            if want is None or (which is not None and not which(rec["questions"][qid])):
                 continue
             got = answer_probs(ans)
             worst = max([worst] + [abs(g - w) for g, w in zip(got, want)])
@@ -166,9 +180,15 @@ def main(argv=None):
     ap.add_argument("--dump", default=None, help="the server's --decision-dump file (same machine); required without --ref")
     ap.add_argument("--force", action="store_true", help="overwrite an existing <dump>.parity.jsonl")
     ap.add_argument("--wide", action="store_true",
-                    help="drive WIDE_RECORDS (JEV choices past the trained slots, each strategy; 12 records, 21 "
-                         "questions) instead of the 50; the slice is <dump>.wide.parity.jsonl; same gate")
-    ap.add_argument("--min-agree", type=float, default=0.96, help="raw top-1 agreement floor (0.96 = at most 3 flips of 82)")
+                    help="drive WIDE_RECORDS (JEV choices past the trained slots, each strategy; 12 records, 17 "
+                         "questions) instead of the 50; the slice is <dump>.wide.parity.jsonl; the same top-1 gate, "
+                         "plus --max-dp on the multi-pass questions")
+    ap.add_argument("--max-dp", type=float, default=None,
+                    help="fail when the multi-pass questions' max |p_server - p_ref| exceeds this (default 0.05 with "
+                         "--wide, off otherwise; int8 JEV measured 0.018 CPU / 0.024 GPU)")
+    ap.add_argument("--min-agree", type=float, default=0.96,
+                    help="raw top-1 agreement floor (0.96 = at most 3 flips of the 50 records' 82 questions; none of "
+                         "--wide's 17)")
     ap.add_argument("--confident", type=float, default=0.05, help="a flip where the reference margin is >= this fails the gate")
     ap.add_argument("--answers-out", default=None,
                     help="also save this run's answers as a REF file (0600); with --ref only after the gate PASSes. E.g. a "
@@ -193,7 +213,16 @@ def main(argv=None):
     for kind, (g, n) in sorted(per_type.items()):
         print(f"  {kind}: {g}/{n}")
     print(f"  max |dp| = {max_abs_delta(ref, results):.4f}")
-    ok, why = gate([f[2] for f in flips], agree, total, a.min_agree, a.confident)
+    max_dp = a.max_dp if a.max_dp is not None else (0.05 if a.wide else None)
+    wide_dp = None
+    if any(multi_pass(q) for rec, _ in results for q in rec["questions"].values()):
+        wide_dp = max_abs_delta(ref, results, multi_pass)
+        native = [q for rec, _ in results for q in rec["questions"].values() if not multi_pass(q)]
+        line = f"  max |dp| multi-pass = {wide_dp:.4f}"
+        if native:
+            line += f", native = {max_abs_delta(ref, results, lambda q: not multi_pass(q)):.4f}"
+        print(line + (f" (limit {max_dp})" if max_dp is not None else ""))
+    ok, why = gate([f[2] for f in flips], agree, total, a.min_agree, a.confident, wide_dp, max_dp)
     print(("PASS " if ok else "FAIL ") + why)
     if a.answers_out:
         if ok:  # a run that failed its gate must never become another run's reference
