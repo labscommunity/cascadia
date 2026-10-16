@@ -51,7 +51,7 @@ level.
 ## Generation-level
 
 Recorded at the runner's chunk stream, so they cover streaming and
-non-streaming requests on both `/v1/chat/completions` and `/v1/completions`.
+non-streaming requests on `/v1/chat/completions`, `/v1/completions` and `/v1/responses`.
 The `model` label is the shard's `model_id`.
 
 | Name | Type | Labels | Description |
