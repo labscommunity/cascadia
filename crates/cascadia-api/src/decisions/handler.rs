@@ -120,7 +120,7 @@ pub(crate) async fn evaluate(
         ));
     }
     // Take the permit BEFORE tokenizing: encode() is CPU work proportional to the request.
-    // Decisions have their own pool, so a burst of them never refuses chat, nor chat them.
+    // Decisions have their own pool: they never take chat's permits, nor chat theirs.
     // Counted like chat (SEC-5): a capacity refusal, the request total and the in-flight gauge.
     let permit = match state.decision_permits.clone().try_acquire_owned() {
         Ok(p) => p,

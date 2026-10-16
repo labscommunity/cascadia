@@ -52,7 +52,9 @@ pub const SPA_EMBEDDED: bool = cfg!(feature = "embed-spa");
 /// [`ApiStats`] handle the OpenAI-compat server bumps on the chat hot
 /// path, so `/api/stats` reflects live request/token activity rather
 /// than the placeholder zeros it returned before. `max_concurrent` is a
-/// static config value (the admission ceiling), so a plain `u64`.
+/// static config value, so a plain `u64`: CHAT's admission ceiling only.
+/// Decision requests have a pool of their own but also count in
+/// `requests_in_flight`, which can therefore exceed it.
 #[derive(Clone)]
 pub struct DashboardState {
     pub topology: Topology,
