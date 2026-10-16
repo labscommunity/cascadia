@@ -4929,6 +4929,9 @@ mod tests {
                 .map(|(k, r)| (k.to_string(), r))
                 .collect(),
             temperature: kinds([("noul", 1.0), ("score", 1.0), ("choice", 1.0)]),
+            choice_labels: vec![],
+            choice_label_ids: vec![],
+            strategy: Default::default(),
         };
         let codec = decisions::jev::JevCodec::new(char_tokenizer(), profile)
             .unwrap()

@@ -7,6 +7,7 @@ pub mod jev;
 pub mod kev;
 pub mod openai;
 pub mod profile;
+pub mod pyrandom;
 pub mod schema;
 
 use std::ops::Range;
