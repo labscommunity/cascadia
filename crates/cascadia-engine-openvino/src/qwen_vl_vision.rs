@@ -559,8 +559,9 @@ pub fn positions(mrope: Option<&MropePositions>, t0: usize, t1: usize) -> Vec<i6
 /// (1 on image tokens, as i64; the cut converts it to the IR's boolean) and
 /// `deepstack_visual_embeds [layers, N, hidden]` row-major, `N` the image
 /// tokens fed, taken in prompt order from each image's layer-major rows.
-/// With no image token fed, one zero row per layer (GenAI does the same: the
-/// IR gathers row 0 and masks it out).
+/// With no image fed (a text turn, a decode step, even one that sampled the
+/// pad id), the mask is all 0 and each layer gets one zero row (GenAI does the
+/// same: the IR gathers row 0 and masks it out).
 pub fn deepstack_inputs(
     ids: &[i64],
     image_pad: i64,
@@ -568,11 +569,11 @@ pub fn deepstack_inputs(
     layers: usize,
     hidden: usize,
 ) -> Result<(Vec<i64>, Vec<f32>, usize), String> {
+    if images.is_empty() {
+        return Ok((vec![0; ids.len()], vec![0f32; layers * hidden], 1));
+    }
     let mask: Vec<i64> = ids.iter().map(|&t| i64::from(t == image_pad)).collect();
     let n: usize = mask.iter().filter(|&&m| m == 1).count();
-    if n == 0 {
-        return Ok((mask, vec![0f32; layers * hidden], 1));
-    }
     let per: Vec<usize> = images
         .iter()
         .map(|d| d.len() / (layers * hidden).max(1))
@@ -651,6 +652,9 @@ mod tests {
         // No image fed: one zero row per layer.
         let (mask, e, n) = deepstack_inputs(&[5, 6], 9, &[], 3, 2).unwrap();
         assert_eq!((mask, e, n), (vec![0, 0], vec![0.0; 6], 1));
+        // A decode step that sampled the pad id is text, not an image.
+        let (mask, _, n) = deepstack_inputs(&[9], 9, &[], 3, 2).unwrap();
+        assert_eq!((mask, n), (vec![0], 1));
         // A mismatch fails rather than shifting features.
         assert!(deepstack_inputs(&[9, 9], 9, &[vec![1.0, 2.0]], 2, 1).is_err());
     }
