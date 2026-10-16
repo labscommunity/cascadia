@@ -61,6 +61,8 @@ names the field.
 | Pixtral 12B | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family pixtral` |
 | Mistral 3 (Ministral-3, Mistral Small 3.1/3.2) | `ov-runtime` | 1+ machines | export with optimum-intel, then `tools/vlm_surgery/cut_vlm_lm.py --family mistral3` |
 | Pixtral 12B target, Ministral-3-3B draft | `ov-dist-spec` | 2+ machines, stateful | `cut_vlm_lm.py --family pixtral --all-logits` for the target, `tools/vlm_surgery/make_text_draft.py` for the draft |
+| Qwen2.5-VL (7B) | `ov-runtime` | 1+ machines, stateful | `tools/vlm_surgery/cut_vlm_lm.py --family qwen2_5_vl` |
+| Qwen3-VL (4B) | `ov-runtime` | 1+ machines, stateful | `tools/vlm_surgery/cut_vlm_lm.py --family qwen3_vl` |
 
 Every other engine and tree refuses images with a `400`: `ov-dist-spec` on a v5 (text)
 target, `sparse-moe`, `ov-genai` on a text-only export, any tree without a `vision`
@@ -72,8 +74,12 @@ block. `ov-dist-spec` refuses a Gemma 4 target tree at load. Not supported:
 - **Llama 3.2 Vision** (`mllama`), refused at export: its text tower has cross-attention.
 - **MiniCPM-V 4.7**: GenAI 2026.4.1 does not know its model type (`minicpmv4_7`) and the
   engine fails to load.
-- Staged (multi-machine) serving of the GenAI-only families above: their trees are not
-  exported with the vision tower yet (`export_shards.py` notes when it drops one).
+- Staged (multi-machine) serving of the other GenAI-only families above (InternVL2,
+  Phi-3.5-vision, LLaVA-NeXT, Gemma 3): their trees are not exported with the vision
+  tower yet (`export_shards.py` notes when it drops one).
+- Qwen2.5-VL / Qwen3-VL on static, packed or `ov-dist-spec` trees: those paths feed 1-D
+  positions and these models need M-RoPE positions on every stage, so the tree is
+  refused at load (`ov-dist-spec` offers no image input for it).
 
 ## Exporting
 
@@ -125,6 +131,25 @@ python tools/vlm_surgery/cut_vlm_lm.py --model <export dir> --output-dir <tree> 
 The export holds four IRs; rank 0 runs the vision tower, regroups each 2x2 block of
 patches and runs `openvino_multi_modal_projector_model.xml` on them. Exporting on Windows
 is fine: the chat template it writes has CRLF line endings, which the server normalises.
+
+### Qwen2.5-VL / Qwen3-VL (ov-runtime)
+
+```bash
+python tools/vlm_surgery/cut_vlm_lm.py --model <OpenVINO/Qwen2.5-VL-7B-Instruct-int4-ov dir> \
+    --output-dir <tree> --num-stages 2 --family qwen2_5_vl
+python tools/vlm_surgery/cut_vlm_lm.py --model <OpenVINO/Qwen3-VL-4B-Instruct-int4-ov dir> \
+    --output-dir <tree> --num-stages 2 --family qwen3_vl
+```
+
+Rank 0 preprocesses images as HF's Qwen2-VL processor does, runs the vision IRs
+(Qwen2.5-VL: patch embedding and the window-attention merger; Qwen3-VL: Qwen3.5's three)
+and expands each `<|image_pad|>` to the image's tokens. Every stage takes M-RoPE
+`position_ids [3, B, T]`: rank 0 computes them per span (images take a 2-D grid; decode
+continues from `rope_delta`) and sends them after the hidden states, so the stages record
+`position_rows: 3` and the tree `vision.mrope_rows: 3`; ranks on a build without the frame
+refuse the tree at load. Qwen3-VL adds the vision tower's DeepStack features to the image
+tokens after decoder layers 0-2, so stage 0 (on rank 0) must hold those layers: the cut
+refuses a split that puts them elsewhere, and the features never cross the wire.
 
 ### Pixtral with speculative decoding (ov-dist-spec)
 
@@ -215,7 +240,8 @@ is not practical on the NPU: one stage's decode IR had not compiled after 90 min
 
 - Prompt tokens count the image's tokens (Gemma 4: at most 280 per image; Pixtral: one per
   16x16 patch plus row breaks, 832 for a 448x448 image with its text; Qwen: about one per
-  1000 pixels). The counts match Hugging Face's processor for the same request.
+  1000 pixels, a 448x448 image is 196 tokens on Qwen3.5 / Qwen3-VL and 256 on Qwen2.5-VL).
+  The counts match Hugging Face's processor for the same request.
 - Packed slots: a prompt must fit one slot's region, `(context - 1 - packed_prefix) /
   slots`; two Pixtral images do not fit two slots of a 2048 context.
 - Gemma 4 packed slots: a request whose image is wider than `--packed-seq` rows is
