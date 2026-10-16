@@ -90,6 +90,12 @@ struct Renderer {
     trim: bool,
 }
 
+/// Python's `str.isspace`: Unicode White_Space plus the separators \x1c-\x1f, so the list-item
+/// strip matches kev.py's `lstrip()` (H10).
+fn py_space(c: char) -> bool {
+    c.is_whitespace() || ('\x1c'..='\x1f').contains(&c)
+}
+
 impl Renderer {
     fn new(budget: usize) -> Self {
         Self {
@@ -101,7 +107,7 @@ impl Renderer {
 
     fn push(&mut self, mut s: &str) -> Result<(), usize> {
         if self.trim {
-            s = s.trim_start();
+            s = s.trim_start_matches(py_space);
             if s.is_empty() {
                 return Ok(());
             }
@@ -190,6 +196,8 @@ impl KevCodec {
         max_tokens: usize,
         max_total_tokens: usize,
     ) -> Result<Self, String> {
+        p.check_calibration()
+            .map_err(|e| format!("decision.json kev: {e}"))?;
         let mut ids = [0u32; 5];
         for (i, s) in SPECIAL.iter().enumerate() {
             ids[i] = tok
@@ -438,6 +446,43 @@ mod tests {
     }
 
     #[test]
+    fn list_items_strip_leading_space_like_python_lstrip() {
+        // H10: Python's `str.lstrip()` also strips the separators \x1c-\x1f, which Rust's
+        // `char::is_whitespace` does not count; both strip the Unicode spaces (here U+00A0).
+        assert_eq!(
+            render(&ov(r#"["\u001cfoo", "\u001f bar"]"#), 0),
+            "- foo\n- bar"
+        );
+        assert_eq!(render(&ov(r#"["\u00a0\tx"]"#), 0), "- x");
+        // A separator elsewhere is kept.
+        assert_eq!(render(&ov(r#"["a\u001cb"]"#), 0), "- a\u{1c}b");
+    }
+
+    #[test]
+    fn option_text_with_empty_descriptions() {
+        // H9: kev.api.option_text drops the separator only for an absent, null or "" description;
+        // an empty list or object renders to "" after it (`name: `), as kev.py does.
+        let mut b = Budget {
+            left: 1000,
+            total: 1000,
+            tokens: 0,
+        };
+        for (desc, want) in [
+            ("[]", "name: "),
+            ("{}", "name: "),
+            (r#""""#, "name"),
+            ("null", "name"),
+        ] {
+            assert_eq!(
+                option_text("name", Some(&ov(desc)), &mut b).unwrap(),
+                want,
+                "{desc}"
+            );
+        }
+        assert_eq!(option_text("name", None, &mut b).unwrap(), "name");
+    }
+
+    #[test]
     fn bounded_render_matches_render_within_budget() {
         let v = ov(
             r#"{"z": [1, 2.5, {"p": false, "q": [true, null]}], "a": {"b": {"c": 1e20}, "d": null}, "e": 0.1, "f": [], "g": [" lead", [[], "x"], {" ": {"  k": 1}}]}"#,
@@ -509,6 +554,17 @@ mod tests {
             "no: x"
         );
         assert_eq!(b.left, 1, "6 - len(\"no: x\")");
+    }
+
+    #[test]
+    fn new_rechecks_the_temperature_bound() {
+        // Task 24 M1: a profile built without `DecisionProfile::load` gets the same refusal.
+        for t in [0.0, f64::NAN, 1e-309] {
+            let e = KevCodec::new(tok(), KevProfile { temperature: t }, 100, 400)
+                .err()
+                .unwrap();
+            assert!(e.contains("temperature must be in"), "{t}: {e}");
+        }
     }
 
     #[test]
