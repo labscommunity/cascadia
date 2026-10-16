@@ -727,6 +727,21 @@ embeddings (tower + projector norm) and multi-modal projector (merger linear + M
   prompt came out 51 tokens longer than HF's. `build_chat_env` now normalises `\r\n`
   and `\r` to `\n` for every template.
 
+## More families on `ov-genai`, one box (2026-10-16)
+
+OpenVINO's published int4 exports, served with `cascadia run <dir>` on pawan-02 (CPU)
+through the same API path (universal `<ov_genai_image_N>` tags, parts back to back):
+
+| Model | GenAI family | SDK check | One-image prompt tokens |
+|---|---|---|---|
+| Qwen2.5-VL-7B-Instruct | `qwen2_5_vl` | 11/11 | 294 |
+| Qwen3-VL-4B-Instruct | `qwen3_vl` | 11/11 | 223 |
+| InternVL2-4B | `internvl_chat` | 11/11 | 282 |
+| Phi-3.5-vision-instruct | `phi3_v` | 11/11 | 785 |
+| llava-v1.6-mistral-7b | `llava_next` | 11/11 | 2956 (tiled, one image in 56 s) |
+| Gemma-3-4B-it | `gemma3` | 11/11 | 286 |
+| MiniCPM-V-4.7-1B | `minicpmv4_7` | does not load: GenAI 2026.4.1 rejects the model type | - |
+
 ## Prompt tokens match HF (2026-10-16)
 
 A message with images reached the chat template as one string whose parts the API
