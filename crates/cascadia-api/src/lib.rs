@@ -4762,6 +4762,85 @@ mod tests {
         assert_eq!(v["error"]["type"], "server_error");
     }
 
+    /// The Kev test codec with one probability replaced by `bad` (H17: finite logits whose
+    /// calibration overflowed, so the codec's softmax returned NaN or inf).
+    struct NonFiniteProbCodec {
+        inner: decisions::kev::KevCodec,
+        bad: f64,
+    }
+
+    impl decisions::Codec for NonFiniteProbCodec {
+        fn limits(&self) -> decisions::schema::Limits {
+            self.inner.limits()
+        }
+        fn encode_until(
+            &self,
+            req: &decisions::schema::DecisionRequest,
+            cancel: &std::sync::atomic::AtomicBool,
+        ) -> Result<Vec<decisions::Pass>, decisions::DecisionError> {
+            self.inner.encode_until(req, cancel)
+        }
+        fn probabilities(
+            &self,
+            req: &decisions::schema::DecisionRequest,
+            part: &decisions::PassPart,
+            logits: &[f32],
+        ) -> Vec<f64> {
+            let mut p = self.inner.probabilities(req, part, logits);
+            p[0] = self.bad;
+            p
+        }
+    }
+
+    async fn non_finite_prob_app(bad: f64) -> Router {
+        let codec = decisions::kev::KevCodec::new(
+            kev_test_tokenizer(),
+            decisions::profile::KevProfile { temperature: 1.0 },
+            1000,
+            4000,
+        )
+        .unwrap();
+        decision_app_with_codec(
+            Box::new(NonFiniteProbCodec { inner: codec, bad }),
+            1000,
+            4000,
+            None,
+            Arc::new(ApiStats::default()),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn decisions_non_finite_probabilities_are_an_engine_error_not_a_200() {
+        // H17: the logits are finite, but the codec's probabilities are not (a calibration that
+        // overflowed `(l + b) / t`). Without a check they serialise as `null` in a 200.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let (status, v, body) = post_decisions(
+                non_finite_prob_app(bad).await,
+                r#"{"model": "m", "state": "s", "questions": {"u": {"type": "noul"}}}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{bad}: {v}");
+            assert_eq!(v["error"], "decision engine error");
+            assert!(!body.contains("null"), "{body}");
+            let (status, v) = post_openai(
+                non_finite_prob_app(bad).await,
+                r#"{"input": "s", "questions": [{"type": "predicate", "name": "u", "instructions": "x"}]}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{bad}: {v}");
+            assert_eq!(v["error"]["message"], "decision engine error");
+            assert_eq!(v["error"]["type"], "server_error");
+        }
+        // the same app with finite probabilities still answers
+        let (status, v, _) = post_decisions(
+            non_finite_prob_app(0.25).await,
+            r#"{"model": "m", "state": "s", "questions": {"u": {"type": "noul"}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
     /// A codec whose first encode blocks until released (a slow tokenization), then records
     /// whether it saw the cancel flag. Every encode answers one noul question with a tiny
     /// pointer pass.
