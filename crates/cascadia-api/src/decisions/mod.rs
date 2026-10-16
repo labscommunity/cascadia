@@ -105,6 +105,10 @@ pub trait Codec: Send + Sync {
     fn legend(&self, _q: &schema::Question) -> Option<Vec<schema::OrderedValue>> {
         None
     }
+    /// The JEV codec, for System 2 (adaptive thinking, JEV only); `None` for every other codec.
+    fn as_jev(&self) -> Option<&jev::JevCodec> {
+        None
+    }
 }
 
 pub struct DecisionService {

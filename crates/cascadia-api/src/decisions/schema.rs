@@ -438,7 +438,23 @@ pub struct DecisionRequest {
     /// 400 on Kev and Clef.
     #[serde(default)]
     pub strategy: Option<RequestStrategy>,
+    /// System 2 (adaptive thinking, JEV only; serve_decide's `thinking`): `off`, `auto` (think
+    /// when System 1's leading probability is below `threshold`) or `on`. Absent or `null`: the
+    /// profile's default (`off`). Score questions never think.
+    #[serde(default)]
+    pub thinking: Option<ThinkingMode>,
+    /// `auto`'s threshold, in [0, 1] (default: the profile's, 0.8).
+    #[serde(default)]
+    pub threshold: Option<f64>,
+    /// Most tokens System 2 may think, 1..=the profile's `max_tokens` (also the default).
+    #[serde(default)]
+    pub think_budget: Option<usize>,
+    /// Return System 2's reasoning text in each answer's `thinking.reasoning`.
+    #[serde(default)]
+    pub return_reasoning: Option<bool>,
 }
+
+pub use super::profile::ThinkingMode;
 
 /// The request's `strategy`: `auto` (the profile's default) or one of JEV's plans.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -609,16 +625,47 @@ pub enum Answer {
     },
 }
 
+/// What System 2 did for one answer (serve_decide's response `thinking`). Present on every
+/// non-score answer of a request whose mode is `auto` or `on`, absent otherwise.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct Thinking {
+    pub mode: ThinkingMode,
+    /// The base model thought and its answer was blended in.
+    pub used: bool,
+    pub threshold: f64,
+    /// The request's think budget in tokens.
+    pub budget: usize,
+    /// Tokens generated, the closing `</think>` included (when used).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub think_tokens: Option<usize>,
+    /// The thought closed (or the model stopped) before the budget ran out (when used).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_within_budget: Option<bool>,
+    /// The thought, trimmed (when used and `return_reasoning`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+}
+
+/// An answer on the wire: the answer itself plus, when the request thought, its `thinking`.
+#[derive(Clone, Debug, Serialize)]
+pub struct AnswerOut {
+    #[serde(flatten)]
+    pub answer: Answer,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<Thinking>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Usage {
     pub input_tokens: u64,
+    /// System 2's thinking tokens; 0 when nothing thought (decision passes never decode).
     pub output_tokens: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct DecisionResponse {
     pub model: String,
-    pub answers: IndexMap<String, Answer>,
+    pub answers: IndexMap<String, AnswerOut>,
     pub usage: Usage,
 }
 
