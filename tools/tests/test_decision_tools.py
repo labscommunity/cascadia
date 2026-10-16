@@ -134,6 +134,33 @@ def test_noul_tie_reads_the_same_in_codec_golden_and_parity_check():
     assert cg.top1({"type": "noul", "noul": 0.5000001}) == "true"
 
 
+def _server_noul(z_true, z_false):
+    """What the server answers for a noul: p(true) from an f64 softmax of the f32 logits
+    (mod.rs softmax; clef.rs reorders [true, false] to [false, true])."""
+    import math
+    import struct
+    f32 = [struct.unpack("f", struct.pack("f", z))[0] for z in (z_true, z_false)]
+    m = max(f32)
+    e = [math.exp(z - m) for z in f32]
+    return {"type": "noul", "noul": e[0] / sum(e)}
+
+
+@pytest.mark.parametrize("lead", [2e-8, 3e-8, 5e-8, 8e-8, 1e-6, 0.0, -2e-8])
+def test_clef_reference_reads_a_near_tie_exactly_as_the_server(lead):
+    # Fix round 1: an f32 softmax rounded p(true) for a 2e-8..9e-8 lead to exactly 0.5, and the
+    # reference read "false" while the server (f64 softmax) read "true"
+    server = cg.top1(_server_noul(lead, 0.0))
+    ref = cg.reference_top1("clef", {"type": "noul"}, {"probs": cg.clef_ref_probs([lead, 0.0])})
+    assert ref == server == ("true" if lead > 0 else "false")
+
+
+def test_noul_reference_compares_both_stored_probabilities():
+    # a pair rounded apart still reads its larger side, as parity_check's argmax does
+    assert cg.reference_top1("clef", {"type": "noul"}, {"probs": [0.5, 0.49999997]}) == "true"
+    assert cg.reference_top1("kev", {"type": "noul"}, {"probs": [0.49999997, 0.5]}) == "true"
+    assert cg.reference_top1("jev", {"type": "noul"}, {"probs": [0.50000001, 0.49999999]}) == "false"
+
+
 # ---- H37: each pass's logit ranges must tile its head's outputs ----------------------------------
 
 @pytest.mark.parametrize("head,parts", [
