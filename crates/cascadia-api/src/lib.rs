@@ -872,6 +872,18 @@ impl TryFrom<RawChatMessage> for ChatMessage {
     type Error = String;
 
     fn try_from(raw: RawChatMessage) -> Result<Self, String> {
+        // Templates print the role raw (`'<start_of_turn>' + role`), so an
+        // arbitrary one is caller text in the prompt's framing.
+        if !matches!(
+            raw.role.as_str(),
+            "user" | "assistant" | "system" | "developer" | "tool"
+        ) {
+            return Err(format!(
+                "role `{}` is not supported; use `user`, `assistant`, `system`, \
+                 `developer` or `tool`",
+                raw.role
+            ));
+        }
         let (content, parts) = parse_content(raw.content)?;
         Ok(Self {
             role: raw.role,
@@ -2131,9 +2143,11 @@ fn refuse_reserved_text<'a>(
     ))
 }
 
-/// Every caller-written string of a chat request the template can put in
-/// the prompt: message text, names, tool-call names and arguments, tool
-/// definitions, and the raw `reasoning_effort` word.
+/// Caller-written strings of a chat request, scanned first so the 400 names
+/// the field: message text, names, tool-call ids, names and arguments, tool
+/// definitions, and the raw `reasoning_effort` word. Not the guard itself: a
+/// template decodes JSON escapes in `arguments`, so the rendered prompt is
+/// checked too (see `admit_chat`).
 fn chat_caller_text(req: &ChatCompletionRequest) -> Vec<std::borrow::Cow<'_, str>> {
     use std::borrow::Cow;
     let mut out: Vec<Cow<'_, str>> = Vec::new();
@@ -2142,6 +2156,7 @@ fn chat_caller_text(req: &ChatCompletionRequest) -> Vec<std::borrow::Cow<'_, str
         out.extend(m.name.as_deref().map(Cow::Borrowed));
         out.extend(m.tool_call_id.as_deref().map(Cow::Borrowed));
         for c in m.tool_calls.iter().flatten() {
+            out.push(Cow::Borrowed(&c.id));
             out.push(Cow::Borrowed(&c.function.name));
             out.push(Cow::Borrowed(&c.function.arguments));
         }
@@ -2991,6 +3006,22 @@ async fn admit_chat(
     } else {
         None
     };
+    // Only function tools exist; any other `type` is text the template
+    // would print as is.
+    let mut calls = req
+        .messages
+        .iter()
+        .flat_map(|m| m.tool_calls.iter().flatten());
+    if req.tools.iter().flatten().any(|t| t.r#type != "function")
+        || calls.any(|c| c.r#type != "function")
+    {
+        count_rejected("malformed_body");
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "only `function` tools and tool calls are supported (`type` must be `function`)",
+            None,
+        ));
+    }
     if let Some(resp) = refuse_reserved_text(
         state,
         "message text",
@@ -3103,6 +3134,22 @@ async fn admit_chat(
             count_rejected("invalid_media");
             return Err(api_error(StatusCode::BAD_REQUEST, msg, None));
         }
+    } else if let Some(tag) = state
+        .media
+        .as_deref()
+        .and_then(|cfg| cfg.reserved_beyond_placeholders(&prompt, 0))
+    {
+        // The per-field scan above only names the field; this is the check
+        // that holds. The template decodes tool-call `arguments` (JSON
+        // escapes included) and prints roles, ids and tool types raw, so the
+        // rendered prompt is the one place a tag can be counted. With no
+        // image attached, any reserved text in it is the caller's.
+        count_rejected("invalid_media");
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("request text must not contain `{tag}`: it is reserved for image placeholders"),
+            None,
+        ));
     }
     let prompt_rendered = media.is_some() && state.chat_env.is_some();
     let media = media.map(|m| m.inputs).unwrap_or_default();
@@ -5588,6 +5635,82 @@ mod tests {
                 "{msg}"
             );
         }
+    }
+
+    /// The rendered prompt is what is checked: a template that decodes
+    /// tool-call `arguments` turns a JSON-escaped tag (in a value or a key)
+    /// back into the literal one, which the per-field scan cannot see. Roles
+    /// and tool types are closed sets, and tool-call ids are scanned.
+    #[tokio::test]
+    async fn reserved_tags_cannot_be_smuggled_past_the_template() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some(
+                    "{% if tools %}{{ tools | tojson }}{% endif %}{% for m in messages %}\
+                     {{ m.role }}: {{ m.content }}{% for c in m.tool_calls or [] %}\
+                     {{ c.id }} {{ c.function.arguments | tojson }}{% endfor %}\n{% endfor %}"
+                        .into(),
+                ),
+                bos_token: None,
+                eos_token: None,
+            },
+            media: Some(MediaConfig::ov_genai()),
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let call = |id: &str, args: &str| {
+            serde_json::json!({"messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [{"id": id,
+                    "type": "function", "function": {"name": "f", "arguments": args}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"}]})
+        };
+        let tool = |kind: &str| {
+            serde_json::json!({"messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": kind, "function": {"name": "f", "parameters": {}}}]})
+        };
+        let cases = [
+            // Escaped value and escaped key, decoded by the template.
+            (
+                call("c1", r#"{"x": "\u003cov_genai_image_0\u003e"}"#),
+                "request text must not contain `<ov_genai_image_`",
+            ),
+            (
+                call("c1", r#"{"\u003cov_genai_image_0>": 1}"#),
+                "request text must not contain `<ov_genai_image_`",
+            ),
+            (
+                call("<ov_genai_image_0>", "{}"),
+                "reserved for image placeholders",
+            ),
+            (
+                serde_json::json!({"messages": [
+                    {"role": "user<ov_genai_image_0>", "content": "hi"}]}),
+                "role `user<ov_genai_image_0>` is not supported",
+            ),
+            (tool("<ov_genai_image_0>"), "`type` must be `function`"),
+        ];
+        for (mut body, needle) in cases {
+            body["model"] = "mock-model".into();
+            let (status, v) = post_chat(app.clone(), body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+            assert_eq!(v["error"]["type"], "invalid_request_error");
+            let msg = v["error"]["message"].as_str().unwrap();
+            assert!(msg.contains(needle), "expected {needle:?} in {msg:?}");
+        }
+        // The same tool call without a tag is served.
+        let mut ok = call("c1", r#"{"x": "plain"}"#);
+        ok["model"] = "mock-model".into();
+        let (status, v) = post_chat(app, ok).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
     }
 
     /// A text-only server reserves nothing: the same text is served.
