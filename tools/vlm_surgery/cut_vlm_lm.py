@@ -27,10 +27,27 @@ Families (the `vision.family` rank 0 serves):
   mistral3  Mistral3ForConditionalGeneration (e.g. Ministral-3, exported with
             optimum-intel): the Pixtral encoder plus a 2x2 patch merger in
             openvino_multi_modal_projector_model.xml, which rank 0 runs.
+  phi3_v    Phi-3.5-vision (e.g. OpenVINO/Phi-3.5-vision-instruct-int4-ov):
+            Phi-3 text tower (config at the top level), CLIP tower in the
+            vision IR, MLP projector in openvino_vision_projection_model.xml;
+            rank 0 does the HD crops and the glb_GN/sub_GN assembly between
+            them (the rows are in config.vlm.json). The soft-token id is
+            `<|image|>`; the tree stops on `<|end|>` as well as
+            `<|endoftext|>`.
+  internvl_chat
+            InternVL2 with a Phi-3 text tower (e.g.
+            OpenVINO/InternVL2-4B-int4-ov; text config under `llm_config`):
+            the vision IR holds InternViT, the pixel shuffle and mlp1; rank 0
+            tiles the image. Soft token `<IMG_CONTEXT>`.
+
+Phi-3's su/longrope RoPE is traced into these exports with a constant
+inv_freq (no switch to the long factors past
+original_max_position_embeddings), so a cut serves them exactly as the
+export does: HF-exact up to 4096 positions.
 
 Usage:
   python cut_vlm_lm.py --model <OV VLM dir> --output-dir <tree> --num-stages N \
-      --family pixtral [--stage I] [--all-logits]
+      --family pixtral|mistral3|phi3_v|internvl_chat [--stage I] [--all-logits]
 """
 
 from __future__ import annotations
@@ -64,7 +81,26 @@ FAMILIES = {
         "vision_types": ("pixtral",),
         "token_type_ids": False,
     },
+    # Phi-3.5-vision: the vision tower is named in img_processor, not
+    # vision_config; rank 0 also runs openvino_vision_projection_model.xml.
+    "phi3_v": {
+        "model_types": ("phi3_v",),
+        "vision_types": ("clip_vision_model",),
+        "token_type_ids": False,
+        "text_key": None,
+        "requires": ("openvino_vision_projection_model.xml", "preprocessor_config.json"),
+    },
+    # InternVL2 (Phi-3 text tower): the vision IR ends in the projector.
+    "internvl_chat": {
+        "model_types": ("internvl_chat",),
+        "vision_types": ("intern_vit_6b",),
+        "token_type_ids": False,
+        "text_key": "llm_config",
+    },
 }
+
+# Top-level phi3_v keys that are the vision side, not the text tower.
+PHI3V_VISION_KEYS = ("glb_GN", "sub_GN", "img_processor", "embd_layer", "auto_map")
 
 ROOT_FILES = (
     "openvino_text_embeddings_model.xml",
@@ -73,6 +109,8 @@ ROOT_FILES = (
     "openvino_vision_embeddings_model.bin",
     "openvino_multi_modal_projector_model.xml",
     "openvino_multi_modal_projector_model.bin",
+    "openvino_vision_projection_model.xml",
+    "openvino_vision_projection_model.bin",
     "preprocessor_config.json",
     "processor_config.json",
     "generation_config.json",
@@ -97,10 +135,15 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def flat_text_config(cfg: dict) -> dict:
+def flat_text_config(cfg: dict, family: str = "pixtral") -> dict:
     """The text tower's config at the top level (rotary, eos and layer counts
     for ov-runtime), keeping the ids the VLM wrapper carries."""
-    tc = dict(cfg["text_config"])
+    key = FAMILIES[family].get("text_key", "text_config")
+    if key is None:
+        # phi3_v keeps the text config at the top level, next to the vision
+        # settings and the (large) separator rows.
+        return {k: v for k, v in cfg.items() if k not in PHI3V_VISION_KEYS}
+    tc = dict(cfg[key])
     for k in ("bos_token_id", "eos_token_id", "pad_token_id"):
         if k not in tc and k in cfg:
             tc[k] = cfg[k]
@@ -110,7 +153,10 @@ def flat_text_config(cfg: dict) -> dict:
 def check_family(cfg: dict, family: str) -> None:
     spec = FAMILIES[family]
     mt = cfg.get("model_type", "")
-    vt = (cfg.get("vision_config") or {}).get("model_type", "")
+    if family == "phi3_v":
+        vt = (cfg.get("img_processor") or {}).get("name", "")
+    else:
+        vt = (cfg.get("vision_config") or {}).get("model_type", "")
     if mt not in spec["model_types"] or vt not in spec["vision_types"]:
         raise SystemExit(
             f"--family {family} expects model_type in {spec['model_types']} with a "
@@ -120,12 +166,45 @@ def check_family(cfg: dict, family: str) -> None:
         raise SystemExit("cross-layer KV sharing cannot be cut by this tool")
 
 
+def special_token_id(model_dir: str, token: str) -> int:
+    """The id of an added token in the export's tokenizer.json."""
+    with open(os.path.join(model_dir, "tokenizer.json"), encoding="utf-8") as f:
+        tok = json.load(f)
+    for t in tok.get("added_tokens", []):
+        if t.get("content") == token:
+            return int(t["id"])
+    raise SystemExit(f"{model_dir}/tokenizer.json has no {token} token")
+
+
+def image_token_id(model_dir: str, cfg: dict, family: str):
+    """The soft-token id rank 0 expands."""
+    if family == "phi3_v":
+        return special_token_id(model_dir, "<|image|>")
+    if family == "internvl_chat":
+        return cfg.get("img_context_token_id")
+    return cfg.get("image_token_index")
+
+
+def add_stop_token(path: str, token_id: int) -> None:
+    """Add `token_id` to a generation_config.json's eos_token_id list."""
+    with open(path, encoding="utf-8") as f:
+        gen = json.load(f)
+    eos = gen.get("eos_token_id")
+    eos = [] if eos is None else (list(eos) if isinstance(eos, list) else [eos])
+    if token_id not in eos:
+        eos.append(token_id)
+    gen["eos_token_id"] = eos
+    os.remove(path)  # may be a hardlink into another tree
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(gen, f, indent=2)
+
+
 def run(model_dir: str, out_dir: str, num_stages: int, family: str,
         suffix: str, only_stage: int | None, all_logits: bool = False) -> None:
     with open(os.path.join(model_dir, "config.json")) as f:
         cfg = json.load(f)
     check_family(cfg, family)
-    text = flat_text_config(cfg)
+    text = flat_text_config(cfg, family)
     num_layers = int(text["num_hidden_layers"])
     hidden = int(text["hidden_size"])
     lm_xml = os.path.join(model_dir, "openvino_language_model.xml")
@@ -136,6 +215,7 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
         # the projector on the merged rows; without them the tree would serve
         # as plain Pixtral and fail only at image time.
         required += ["openvino_multi_modal_projector_model.xml", "processor_config.json"]
+    required += list(FAMILIES[family].get("requires", ()))
     for fn in required:
         if not os.path.exists(os.path.join(model_dir, fn)):
             raise SystemExit(f"{model_dir} lacks {fn}; not an OpenVINO {family} VLM export")
@@ -204,6 +284,15 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
     put(cfg_out, os.path.join(tok, "config.json"))
     if not os.path.exists(os.path.join(tok, "tokenizer.json")):
         raise SystemExit(f"{model_dir} has no tokenizer.json; ov-runtime needs it")
+    if family == "phi3_v":
+        # The chat template closes every turn with <|end|>; the export's
+        # generation_config stops only on <|endoftext|>, one token later.
+        # InternVL2's Phi-3 tower lists both.
+        end = special_token_id(model_dir, "<|end|>")
+        for d in (out_dir, tok):
+            gen = os.path.join(d, "generation_config.json")
+            if os.path.exists(gen):
+                add_stop_token(gen, end)
 
     pipeline = {
         "model_id": os.path.basename(os.path.abspath(model_dir)),
@@ -217,7 +306,7 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
             "text_embeddings": "openvino_text_embeddings_model.xml",
             "vision_embeddings": "openvino_vision_embeddings_model.xml",
             "token_type_ids": FAMILIES[family]["token_type_ids"],
-            "image_token_id": cfg.get("image_token_index"),
+            "image_token_id": image_token_id(model_dir, cfg, family),
         },
     }
     with open(marker, "w") as f:
