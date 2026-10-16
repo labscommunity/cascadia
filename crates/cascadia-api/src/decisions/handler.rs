@@ -366,6 +366,7 @@ async fn run_passes(
             tenant: String::new(),
             resume_token_ids: None,
             decision: Some(pass.readout.clone()),
+            lora_scale: None,
         };
         let mut stream = match state.runner.generate_async(task).await {
             Ok(s) => s,
