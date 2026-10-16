@@ -23,7 +23,7 @@
 //!   (all 32 blocks, window attention and the 2x2 merger), which takes the
 //!   per-frame `attention_mask`, a `window_attention_mask`, the `window_index`
 //!   that reorders merge units into windows and `rotary_pos_emb`
-//!   ([`window_index`], GenAI `qwen2_5_vl/classes.cpp`).
+//!   ([`window_index`], [`block_mask_bytes`], GenAI `qwen2_5_vl/classes.cpp`).
 //! - **Qwen3-VL vision IRs** are Qwen3.5's three (patch, learned positions,
 //!   merger) plus a second merger output, `deepstack_feature_lists
 //!   [3, tokens, hidden]`. The language model IR adds row `k` of it to the
@@ -101,17 +101,28 @@ pub fn window_index(
     (index, cu)
 }
 
-/// The merger's `[1, N, N]` window mask: 0 inside a window, `-inf` across.
-pub fn window_attention_mask(cu_window_seqlens: &[i32]) -> Vec<f32> {
-    let n = *cu_window_seqlens.last().unwrap_or(&0) as usize;
-    let mut mask = vec![f32::NEG_INFINITY; n * n];
-    for pair in cu_window_seqlens.windows(2) {
-        let (s, e) = (pair[0] as usize, pair[1] as usize);
-        for row in s..e {
-            mask[row * n + s..row * n + e].fill(0.0);
+/// A `[1, N, N]` f32 block mask as the little-endian bytes the IR input
+/// takes: 0 inside each `[cu[k], cu[k+1])` block, `-inf` elsewhere. Built
+/// straight into the byte buffer, with no f32 copy: at ~1 MP (N = 5476
+/// patches) one mask is 120 MB, and the merger takes two (per-frame
+/// `attention_mask` from `cu_seqlens`, `window_attention_mask` from
+/// `cu_window_seqlens`), so the encoder builds, feeds and drops them one at
+/// a time. The shim copies each into its own OpenVINO tensor (at most 256 MiB
+/// each, which the API's 1 MP default budget keeps well under).
+pub fn block_mask_bytes(cu: &[i32]) -> Vec<u8> {
+    let n = *cu.last().unwrap_or(&0) as usize;
+    let ninf = f32::NEG_INFINITY.to_le_bytes();
+    let mut out = Vec::with_capacity(n * n * 4);
+    for _ in 0..n * n {
+        out.extend_from_slice(&ninf);
+    }
+    for pair in cu.windows(2) {
+        let (a, b) = (pair[0] as usize, pair[1] as usize);
+        for row in a..b {
+            out[(row * n + a) * 4..(row * n + b) * 4].fill(0);
         }
     }
-    mask
+    out
 }
 
 /// The Qwen2.5-VL `vision_config` fields the encoder needs.
@@ -210,9 +221,7 @@ impl WindowEncoder {
         }
         let rot_dim = self.cfg.rotary_dim();
         let rot = q35::rotary_pos_emb(&grids, merge, rot_dim, 10_000.0);
-        let mask = q35::attention_mask(&grids);
-        let (index, cu) = window_index(&grids, merge, self.cfg.merger_window());
-        let wmask = window_attention_mask(&cu);
+        let (index, cu_window) = window_index(&grids, merge, self.cfg.merger_window());
         let idx: Vec<u8> = index.iter().flat_map(|x| x.to_le_bytes()).collect();
         let m = &mut self.merger;
         m.set_input(
@@ -221,14 +230,14 @@ impl WindowEncoder {
             &[n, d],
             &f32_bytes(&patch_embeds),
         )
-        .and_then(|_| m.set_input("attention_mask", DType::F32, &[1, n, n], &f32_bytes(&mask)))
+        // One dense mask alive at a time on the host (see `block_mask_bytes`).
         .and_then(|_| {
-            m.set_input(
-                "window_attention_mask",
-                DType::F32,
-                &[1, n, n],
-                &f32_bytes(&wmask),
-            )
+            let mask = block_mask_bytes(&q35::cu_seqlens(&grids));
+            m.set_input("attention_mask", DType::F32, &[1, n, n], &mask)
+        })
+        .and_then(|_| {
+            let mask = block_mask_bytes(&cu_window);
+            m.set_input("window_attention_mask", DType::F32, &[1, n, n], &mask)
         })
         .and_then(|_| m.set_input("window_index", DType::I64, &[index.len()], &idx))
         .and_then(|_| {
@@ -634,10 +643,26 @@ mod tests {
 
     #[test]
     fn window_mask_is_block_diagonal() {
-        let m = window_attention_mask(&[0, 2, 3]);
+        let b = block_mask_bytes(&[0, 2, 3]);
+        let m: Vec<f32> = b
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
         assert_eq!(m.len(), 9);
         assert_eq!((m[0], m[1], m[2]), (0.0, 0.0, f32::NEG_INFINITY));
         assert_eq!((m[6], m[8]), (f32::NEG_INFINITY, 0.0));
+    }
+
+    /// The per-frame mask is Qwen3.5's `attention_mask` byte for byte.
+    #[test]
+    fn block_mask_bytes_match_the_f32_masks() {
+        let grids = [[2u32, 4, 6]];
+        let want: Vec<u8> = q35::attention_mask(&grids)
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        assert_eq!(block_mask_bytes(&q35::cu_seqlens(&grids)), want);
+        assert!(block_mask_bytes(&[0]).is_empty());
     }
 
     #[test]
