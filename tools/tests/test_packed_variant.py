@@ -248,6 +248,47 @@ def test_single_producer_keeps_the_original_edit():
     assert [i.get_any_name() for i in packed2.inputs] == names
 
 
+def test_single_producer_on_a_shared_prefill_dynamic_mask():
+    # A `--shared-prefill` static IR leaves the query width dynamic (one
+    # compiled model serves decode and prefill), so its single mask producer's
+    # shape is [1,1,?,?], not the seq=1 decode shape. packed_variant must still
+    # build a valid packed IR and pin the mask to [1,1,packed_seq,T] — and the
+    # result must match the mask the producer would have built.
+    seq = 3
+    core = ov.Core()
+    rng = np.random.default_rng(11)
+    feed = _feed(seq, rng, types=False)
+
+    # The unpinned toy IS a shared-prefill stage: inputs_embeds [1,?,H],
+    # attention_mask [1,?], past fixed, so the mask producer is dynamic.
+    probe = toy_stage(1)
+    mask_src = next(
+        o for o in probe.get_ordered_ops()
+        if o.get_type_name() == "ScaledDotProductAttention"
+    ).input_value(3).get_node()
+    assert not mask_src.output(0).get_partial_shape().is_static
+
+    prods = []
+    ref = toy_stage(1, outputs=prods)
+    ref.add_results([ops.result(prods[0])])
+    got = core.compile_model(ref, "CPU", F32).create_infer_request().infer(feed)
+    outs = list(got.values())
+    want_h, mask4d = outs[0], outs[-1]
+
+    packed, ctx = pv.build_packed_model(toy_stage(1), seq, has_embed=True, hidden_size=HIDDEN)
+    assert ctx == PAST + seq
+    shapes = {i.get_any_name(): list(i.get_shape()) for i in packed.inputs}
+    assert shapes["attn_mask_4d"] == [1, 1, seq, ctx]
+    assert shapes["inputs_embeds"] == [1, seq, HIDDEN]
+    assert shapes["position_ids"] == [1, seq]
+    assert "attention_mask" not in shapes
+
+    pfeed = {k: v for k, v in feed.items() if k != "attention_mask"}
+    pfeed["attn_mask_4d"] = mask4d
+    res = core.compile_model(packed, "CPU", F32).create_infer_request().infer(pfeed)
+    np.testing.assert_allclose(res["hidden_states"], want_h, rtol=1e-4, atol=1e-4)
+
+
 def test_write_packed_variant_records_mask_ports(tmp_path):
     stage = tmp_path / "stage_0"
     stage.mkdir()
