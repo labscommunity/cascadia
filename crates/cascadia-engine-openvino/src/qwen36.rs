@@ -1978,6 +1978,19 @@ impl Qwen36Engine {
         )])
     }
 
+    /// A relay rank's engine failed (`engine_failed`): the connection-fatal error that makes
+    /// `run_relay_loop` exit for a supervisor rebuild, which also closes the link to the head.
+    fn relay_engine_failed(&self) -> Option<EngineError> {
+        let why = self.engine_failed.as_ref()?;
+        Some(EngineError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            format!(
+                "qwen36 engine failed: {why}; this pipeline stage exits so the supervisor \
+                 rebuilds it"
+            ),
+        )))
+    }
+
     fn reset_all(&mut self) {
         self.primed = false;
         // This is the scrub a failed task left, too (`scrub_failed_task`).
@@ -3391,6 +3404,11 @@ impl Qwen36Engine {
                 // failed downstream reset = no ack = task fails loud at
                 // rank 0 (reset protocol).
                 self.reset_all();
+                // Task 46: a stage abandoned by this reset's recovery. No RESET_ACK: the stage
+                // exits (connection-fatal) and its closed socket fails the head's exchange now.
+                if let Some(e) = self.relay_engine_failed() {
+                    return Err(e);
+                }
                 self.peer_epoch = epoch;
                 // A new task: no decision state may survive from the previous one.
                 self.clear_decision_state();
@@ -4224,7 +4242,21 @@ impl Engine for Qwen36Engine {
         // restart). Swallowing it into Ok(Vec::new()) would leave a silent
         // zombie that never rebuilds. The runner throttles non-fatal errors via
         // RELAY_ERR_BACKOFF, so no in-engine backoff is needed.
-        let result = self.step_pipe_relay().map(|_| Vec::new());
+        //
+        // Task 46: a relay whose engine failed (a stage request abandoned busy) must not keep
+        // the link open, acking RESETs and dropping FORWARDs: the head would wait out its reply
+        // bound on every task. It returns a connection-fatal error instead, before and after
+        // any frame, so `run_relay_loop` exits for a supervisor rebuild and the head sees the
+        // socket close at once. No new frame: any peer build handles a closed socket.
+        if let Some(e) = self.relay_engine_failed() {
+            return Err(e);
+        }
+        let result = self.step_pipe_relay().map(|_| Vec::new()).and_then(|out| {
+            match self.relay_engine_failed() {
+                Some(e) => Err(e),
+                None => Ok(out),
+            }
+        });
         if let Err(e) = &result {
             warn!(error = %e, "qwen36 pipeline step failed");
         }
@@ -6458,8 +6490,9 @@ mod tests {
         infers: usize,
         /// Every infer and reset, in order; and the recovery's cancel, wait and abandon (Task 46).
         events: Arc<std::sync::Mutex<Vec<&'static str>>>,
-        /// Task 46: after the failing infer the request reads busy for this many state reads
-        /// (`u32::MAX`: forever), as the GPU plugin's did. Busy refuses what OpenVINO refuses.
+        /// Task 46: after the failing infer the request stays busy for this many `wait_for`
+        /// calls (`u32::MAX`: forever), as the GPU plugin's did. Busy refuses what OpenVINO
+        /// refuses.
         busy_after_fail: u32,
         busy: u32,
         cancelled: bool,
@@ -7243,6 +7276,103 @@ mod tests {
         let seen = rt.block_on(fake).unwrap();
         assert_eq!(seen, vec![TRAINED.to_bits(), 0.0f32.to_bits()]);
         assert_eq!(take_log(&log0), vec![Some(TRAINED), Some(0.0)]);
+    }
+
+    #[test]
+    fn a_relay_whose_engine_failed_fails_the_heads_task_well_under_the_reply_bound() {
+        // Task 46 review I1: a relay rank whose stage request stays busy used to ack RESET and
+        // then drop every FORWARD, so each head task waited out `recv_timeout` (60 s). The relay
+        // now returns a connection-fatal error instead of the ack; `run_relay_loop` exits and the
+        // closed socket fails the head's exchange at once. Rank 1 is driven here as
+        // `run_relay_loop` drives it: on a connection-fatal error the stage is dropped.
+        let _knob = crate::timeout_knob_lock();
+        cascadia_transport::set_activation_timeout_secs(30);
+        let rt = pipe_rt();
+        let (server, client) = rt.block_on(async {
+            let mut server = ActivationServer::new("127.0.0.1", 0);
+            server.start().await.unwrap();
+            let mut client = ActivationClient::new("127.0.0.1", server.port());
+            let (c, a) = tokio::join!(client.connect(), server.accept());
+            c.unwrap();
+            a.unwrap();
+            (server, client)
+        });
+
+        // Rank 1: its last infer failed and left the request busy for good.
+        let mut relay = bare_engine(2, "{}");
+        relay.rank = 1;
+        relay.hidden = MOCK_HIDDEN;
+        relay.upstream = Some(Arc::new(tokio::sync::Mutex::new(server)));
+        relay.runtime_handle = Some(rt.handle().clone());
+        relay.stage_idle_timeout = Duration::from_millis(200);
+        let (mut s1, _) = MockStage::new(&last_stage_inputs(false), MOCK_VOCAB, Some(1));
+        s1.busy = u32::MAX;
+        relay.stages = vec![OvStage::Mock(s1)];
+        relay.infer_failed = true;
+        let relay_loop = std::thread::spawn(move || loop {
+            match relay.step() {
+                Err(e) if e.is_connection_fatal() => {
+                    let failed = relay.engine_failed.is_some();
+                    drop(relay); // the process exit closes the socket
+                    return (e.to_string(), failed);
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                Ok(_) => {}
+            }
+        });
+
+        // Rank 0.
+        let mut head = bare_engine(2, "{}");
+        head.rank = 0;
+        head.handshake_done = true;
+        head.downstream = Some(Arc::new(tokio::sync::Mutex::new(client)));
+        head.runtime_handle = Some(rt.handle().clone());
+        head.hidden = MOCK_HIDDEN;
+        head.tokenizer = Some(tiny_tokenizer());
+        let (emb, _) = MockStage::new(&["input_ids"], MOCK_HIDDEN, None);
+        let (s0, _) = MockStage::new(
+            &[
+                "inputs_embeds",
+                "attention_mask",
+                "position_ids",
+                "beam_idx",
+            ],
+            MOCK_HIDDEN,
+            None,
+        );
+        head.emb = Some(OvStage::Mock(emb));
+        head.stages = vec![OvStage::Mock(s0)];
+
+        let t0 = Instant::now();
+        head.pending.push(chat("t1", None));
+        let out = head.step_pipe_first();
+        let took = t0.elapsed();
+        let msg = out
+            .first()
+            .and_then(|(_, c)| c.error.clone())
+            .expect("the head's task fails");
+        assert!(
+            took < Duration::from_secs(5),
+            "failed in {took:?}, not after the 30 s reply bound: {msg}"
+        );
+        assert!(
+            msg.contains("RESET not acked"),
+            "no ack, a closed link: {msg}"
+        );
+        let (why, failed) = relay_loop.join().unwrap();
+        assert!(failed, "rank 1's engine is failed");
+        assert!(
+            why.contains("qwen36 engine failed: stage0") && why.contains("supervisor rebuilds"),
+            "{why}"
+        );
+
+        // The task after it fails at once too: the link is gone.
+        let t0 = Instant::now();
+        head.pending.push(chat("t2", None));
+        let out = head.step_pipe_first();
+        assert!(out.first().and_then(|(_, c)| c.error.as_ref()).is_some());
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        cascadia_transport::set_activation_timeout_secs(0);
     }
 
     #[test]
