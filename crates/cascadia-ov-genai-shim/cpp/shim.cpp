@@ -8,6 +8,7 @@
 #include "gemv_offload.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -22,6 +23,7 @@
 #include <vector>
 
 #include <openvino/openvino.hpp>
+#include <openvino/runtime/exception.hpp>
 #include <openvino/runtime/infer_request.hpp>
 #include <openvino/runtime/variable_state.hpp>
 #include <openvino/genai/llm_pipeline.hpp>
@@ -221,6 +223,53 @@ struct cascadia_runtime_t {
     // (and thus the plugin's KV precision) is retained, so the types cannot change.
     std::unordered_map<std::string, ov::element::Type> state_dtypes;
 };
+
+// ───── Task 46: a request a failed infer left busy ─────
+//
+// OpenVINO's `ov::IAsyncInferRequest` (src/inference/src/dev/iasync_infer_request.cpp, 2026.0)
+// keeps an IDLE/BUSY/CANCELLED/STOP state under its own mutex, and every request method checks it
+// first: `query_state`, `set_tensor`, `get_tensor` throw `ov::Busy` ("Infer Request is busy") or
+// `ov::Cancelled` without touching the plugin. Its destructor calls `stop_and_wait()`, which waits
+// on every outstanding future with no timeout. So a request whose state stayed BUSY, with a
+// promise nobody will ever set, blocks forever in its destructor: releasing it in
+// `recreate_request` (or `destroy`) hangs the caller. On the GPU after `unknown C++ exception in
+// infer` (Task 46, pawan-03) `reset_state` reported busy and the next `recreate_request` never
+// returned. The calls below let the engine find out without blocking, try OpenVINO's own way back
+// to idle (`cancel()`, bounded `wait_for`), and abandon a request that never gets there instead of
+// destroying it.
+
+enum : int32_t {
+    CASCADIA_REQ_IDLE = 0,
+    CASCADIA_REQ_BUSY = 1,
+    CASCADIA_REQ_CANCELLED = 2,
+    CASCADIA_REQ_NONE = 3,
+};
+
+// The request's state, without blocking: `query_state()` runs the base class `check_state()` under
+// the request mutex before it reaches the plugin. Any other exception came from past that check,
+// so the request itself is not busy.
+static int32_t request_state_of(const std::shared_ptr<ov::InferRequest>& req) {
+    if (!req) return CASCADIA_REQ_NONE;
+    try {
+        (void)req->query_state();
+        return CASCADIA_REQ_IDLE;
+    } catch (const ov::Busy&) {
+        return CASCADIA_REQ_BUSY;
+    } catch (const ov::Cancelled&) {
+        return CASCADIA_REQ_CANCELLED;
+    } catch (...) {
+        return CASCADIA_REQ_IDLE;
+    }
+}
+
+// Never destroy a request that is not idle (its destructor can wait forever): keep it alive on
+// purpose. A heap holder that is never freed, rather than a static container, so process exit
+// does not run its destructor either.
+static void abandon_request(std::shared_ptr<ov::InferRequest>& req) {
+    if (!req) return;
+    new std::shared_ptr<ov::InferRequest>(std::move(req));  // intentionally leaked
+    req.reset();
+}
 
 extern "C" {
 
@@ -837,7 +886,12 @@ int32_t cascadia_runtime_compile(
     }
 }
 
-void cascadia_runtime_destroy(cascadia_runtime_t* handle) { delete handle; }
+void cascadia_runtime_destroy(cascadia_runtime_t* handle) {
+    if (!handle) return;
+    // A busy request would block this delete forever (Task 46): leak it instead.
+    if (request_state_of(handle->request) != CASCADIA_REQ_IDLE) abandon_request(handle->request);
+    delete handle;
+}
 
 int32_t cascadia_runtime_import_blob(
     const char* blob_path, const char* device,
@@ -1017,6 +1071,20 @@ int32_t cascadia_runtime_recreate_request(cascadia_runtime_t* handle) {
         set_last_error("null runtime handle"); return 1;
     }
     try {
+        // Task 46: releasing a request that is not idle can block forever in its destructor.
+        // Refuse instead; the engine makes it idle first (`cascadia_runtime_cancel` + `wait_for`).
+        const int32_t st = request_state_of(handle->request);
+        if (st == CASCADIA_REQ_BUSY || st == CASCADIA_REQ_CANCELLED) {
+            set_last_error(st == CASCADIA_REQ_BUSY
+                               ? "recreate_request: Infer Request is busy; not releasing it"
+                               : "recreate_request: Infer Request was canceled and is not idle; "
+                                 "not releasing it");
+            return 1;
+        }
+        // Release the old (idle) request before creating the new one, so the two never hold
+        // device memory at the same time. A failed create leaves no request: later calls fail
+        // with "null runtime handle" instead of running on stale state.
+        handle->request.reset();
         handle->request = std::make_shared<ov::InferRequest>(handle->compiled->create_infer_request());
         return 0;
     } catch (const std::exception& e) {
@@ -1024,6 +1092,55 @@ int32_t cascadia_runtime_recreate_request(cascadia_runtime_t* handle) {
     } catch (...) {
         set_last_error("unknown C++ exception in runtime_recreate_request"); return 1;
     }
+}
+
+int32_t cascadia_runtime_request_state(cascadia_runtime_t* handle, int32_t* out_state) {
+    if (!handle || !out_state) {
+        set_last_error("null arg in runtime_request_state"); return 1;
+    }
+    *out_state = request_state_of(handle->request);
+    return 0;
+}
+
+int32_t cascadia_runtime_cancel(cascadia_runtime_t* handle) {
+    if (!handle || !handle->request) {
+        set_last_error("null runtime handle"); return 1;
+    }
+    try {
+        // Base class: BUSY -> CANCELLED under the request mutex; a running pipeline still ends in
+        // IDLE when its last stage completes. It never waits.
+        handle->request->cancel();
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in runtime_cancel"); return 1;
+    }
+}
+
+int32_t cascadia_runtime_wait_for(
+    cascadia_runtime_t* handle, uint32_t timeout_ms, int32_t* out_ready) {
+    if (!handle || !handle->request || !out_ready) {
+        set_last_error("null arg in runtime_wait_for"); return 1;
+    }
+    try {
+        // Bounded by `timeout_ms`. False when nothing completed (or the request never ran).
+        *out_ready = handle->request->wait_for(std::chrono::milliseconds(timeout_ms)) ? 1 : 0;
+        return 0;
+    } catch (...) {
+        // `wait_for` rethrows the failed run's exception (or `ov::Cancelled`) through the ready
+        // future's get(): the run is over, which is all this asks.
+        *out_ready = 1;
+        return 0;
+    }
+}
+
+int32_t cascadia_runtime_abandon_request(cascadia_runtime_t* handle) {
+    if (!handle) {
+        set_last_error("null runtime handle"); return 1;
+    }
+    abandon_request(handle->request);
+    return 0;
 }
 
 // ───── Issue-34: KV state export/import for warm-pull (cascadia_engine::KvCoordination on OV) ─────

@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
-use cascadia_ov_genai_shim::{advance_emitted, DType, PluginConfig, Runtime};
+use cascadia_ov_genai_shim::{advance_emitted, DType, PluginConfig, RequestState, Runtime};
 use cascadia_transport::{
     ActivationClient, ActivationServer, DType as WireDType, Tensor as WireTensor, TransportError,
     TransportResult,
@@ -55,6 +55,12 @@ const LEGACY_HIDDEN: usize = 2048;
 /// per-chunk wire frame (256 * hidden * 4 B: 2 MiB at hidden 2048,
 /// 5 MiB at 5120 — both far under the transport's 256 MiB tensor cap).
 const PREFILL_CHUNK: usize = 256;
+
+/// How long a stage request a failed infer left busy gets to return to idle (OpenVINO `cancel()`,
+/// then `wait_for`) before the engine abandons it and fails (Task 46).
+const STAGE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// One `wait_for` slice inside [`STAGE_IDLE_TIMEOUT`]: the state is re-read after each.
+const STAGE_IDLE_POLL: Duration = Duration::from_millis(100);
 
 /// Effective prefill span. Default = PREFILL_CHUNK (T>1 batched, ~4.2x TTFT win).
 ///
@@ -965,6 +971,9 @@ impl Builder for Qwen36Builder {
             primed: false,
             stages_dirty: false,
             scrub_pending: false,
+            infer_failed: false,
+            engine_failed: None,
+            stage_idle_timeout: STAGE_IDLE_TIMEOUT,
             max_ctx: self.max_ctx,
             refresh_costs: Default::default(),
             last_restore_bytes: 0,
@@ -1022,12 +1031,125 @@ impl OvStage {
     fn recreate_request(&mut self) -> cascadia_ov_genai_shim::Result<()> {
         ov_stage_call!(self, recreate_request())
     }
+    fn request_state(&self) -> cascadia_ov_genai_shim::Result<RequestState> {
+        ov_stage_call!(self, request_state())
+    }
+    fn cancel(&mut self) -> cascadia_ov_genai_shim::Result<()> {
+        ov_stage_call!(self, cancel())
+    }
+    fn wait_for(&mut self, timeout: Duration) -> cascadia_ov_genai_shim::Result<bool> {
+        ov_stage_call!(self, wait_for(timeout))
+    }
+    fn abandon_request(&mut self) -> cascadia_ov_genai_shim::Result<()> {
+        ov_stage_call!(self, abandon_request())
+    }
     fn get_state_blob(&mut self) -> cascadia_ov_genai_shim::Result<Vec<u8>> {
         ov_stage_call!(self, get_state_blob())
     }
     fn set_state_blob(&mut self, blob: &[u8]) -> cascadia_ov_genai_shim::Result<()> {
         ov_stage_call!(self, set_state_blob(blob))
     }
+}
+
+/// Bring one stage request back to idle after a failed infer, without ever blocking on it (Task 46).
+///
+/// OpenVINO's request destructor waits, unbounded, on any run still outstanding, and its
+/// `query_state`/`set_tensor` refuse a busy request. On the GPU a request stayed busy after
+/// `unknown C++ exception in infer`, and the next recreate released it and never returned. So:
+/// read the state (non-blocking); if it is not idle, `cancel()` and `wait_for` in slices until it
+/// is, up to `timeout`; if it never gets there, abandon the request (the shim leaks it rather than
+/// run its destructor) and return why. One `error` line per action: stage, action, outcome, ms.
+fn make_idle(label: &str, st: &mut OvStage, timeout: Duration) -> Result<(), String> {
+    let t0 = Instant::now();
+    let ms = |t0: Instant| t0.elapsed().as_millis() as u64;
+    let state = match st.request_state() {
+        Ok(RequestState::Idle) => {
+            error!(
+                stage = label,
+                action = "probe",
+                outcome = "idle",
+                elapsed_ms = ms(t0),
+                "qwen36: stage recovery"
+            );
+            return Ok(());
+        }
+        Ok(RequestState::None) => {
+            error!(
+                stage = label,
+                action = "probe",
+                outcome = "no request",
+                elapsed_ms = ms(t0),
+                "qwen36: stage recovery"
+            );
+            return Err(format!("{label} has no infer request"));
+        }
+        Ok(s) => s,
+        Err(e) => {
+            error!(stage = label, action = "probe", outcome = "error", error = %e, elapsed_ms = ms(t0), "qwen36: stage recovery");
+            return Err(format!("{label}'s request state is unreadable: {e}"));
+        }
+    };
+    match st.cancel() {
+        Ok(()) => {
+            error!(stage = label, action = "cancel", outcome = "ok", was = ?state, elapsed_ms = ms(t0), "qwen36: stage recovery")
+        }
+        Err(e) => {
+            error!(stage = label, action = "cancel", outcome = "error", was = ?state, error = %e, elapsed_ms = ms(t0), "qwen36: stage recovery")
+        }
+    }
+    let mut last = state;
+    let mut polls = 0u32;
+    loop {
+        let left = timeout.saturating_sub(t0.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        let slice = left.min(STAGE_IDLE_POLL);
+        let w0 = Instant::now();
+        polls += 1;
+        // A failed wait (the request is gone) is read back as the state below.
+        let _ = st.wait_for(slice);
+        match st.request_state() {
+            Ok(RequestState::Idle) => {
+                error!(
+                    stage = label,
+                    action = "wait",
+                    outcome = "idle",
+                    polls,
+                    elapsed_ms = ms(t0),
+                    "qwen36: stage recovery"
+                );
+                return Ok(());
+            }
+            Ok(RequestState::None) | Err(_) => {
+                last = RequestState::None;
+                break;
+            }
+            Ok(s) => last = s,
+        }
+        // `wait_for` returns at once on a request with nothing outstanding: never spin.
+        if let Some(rest) = slice.checked_sub(w0.elapsed()) {
+            std::thread::sleep(rest);
+        }
+    }
+    error!(stage = label, action = "wait", outcome = ?last, polls, elapsed_ms = ms(t0), "qwen36: stage recovery");
+    match st.abandon_request() {
+        Ok(()) => error!(
+            stage = label,
+            action = "abandon",
+            outcome = "ok",
+            elapsed_ms = ms(t0),
+            "qwen36: stage recovery"
+        ),
+        Err(e) => {
+            error!(stage = label, action = "abandon", outcome = "error", error = %e, elapsed_ms = ms(t0), "qwen36: stage recovery")
+        }
+    }
+    Err(format!(
+        "{label}'s infer request was still {last:?} {} ms after a failed infer (cancel + wait); \
+         abandoned",
+        ms(t0)
+    ))
 }
 
 fn map_ov(err: cascadia_ov_genai_shim::Error) -> EngineError {
@@ -1394,9 +1516,19 @@ pub struct Qwen36Engine {
     stages_dirty: bool,
     /// A task failed and the stage requests still hold its state: `finalize_error` leaves the
     /// scrub (`reset_all`) to the next admission, so the failed task's error chunk is returned
-    /// first even if the scrub would block (Task 45: suspected, not reproduced, on the GPU after
-    /// a failed infer). A scrub that blocks still holds the engine, at that admission.
+    /// first. On the GPU after a failed infer the scrub did block (Task 46: it released a request
+    /// still marked busy); it now makes the requests idle first, bounded, or fails the engine.
     scrub_pending: bool,
+    /// An infer on a stage (or the embeddings) returned an error since the last recovery: its
+    /// request may still be marked busy, and OpenVINO blocks forever releasing a busy request.
+    /// The next `reset_all` makes every request idle first ([`make_idle`]), Task 46.
+    infer_failed: bool,
+    /// Set when a request could not be made idle within `stage_idle_timeout` and was abandoned:
+    /// every later task fails at once with this reason (a `backend error`, a 5xx at the API),
+    /// and nothing touches the stage requests again. Only a restart clears it.
+    engine_failed: Option<String>,
+    /// [`STAGE_IDLE_TIMEOUT`]; shorter in tests.
+    stage_idle_timeout: Duration,
     /// `max_position_embeddings` of the model (from the tree's config.json); prompts at or past it
     /// are refused at submit rather than prefilled for hours on the single batch=1 slot. `None`
     /// when the tree does not state it (guard off; `read_max_ctx` warns which case it was).
@@ -1683,7 +1815,10 @@ impl Qwen36Engine {
         let ids: Vec<i64> = toks.iter().map(|&t| t as i64).collect();
         emb.set_input(&name, DType::I64, &[1, toks.len()], &le_bytes_i64(&ids))
             .map_err(map_ov)?;
-        emb.infer().map_err(map_ov)?;
+        if let Err(e) = emb.infer() {
+            self.infer_failed = true;
+            return Err(map_ov(e));
+        }
         let (dtype, shape, bytes) = emb.output(0).map_err(map_ov)?;
         if !matches!(dtype, DType::F32) {
             return Err(EngineError::Backend(format!(
@@ -1767,7 +1902,10 @@ impl Qwen36Engine {
                     }
                 }
             }
-            st.infer().map_err(map_ov)?;
+            if let Err(e) = st.infer() {
+                self.infer_failed = true;
+                return Err(map_ov(e));
+            }
             let (dtype, _shape, bytes) = st.output(0).map_err(map_ov)?;
             if !matches!(dtype, DType::F32) {
                 return Err(EngineError::Backend(format!(
@@ -1805,22 +1943,80 @@ impl Qwen36Engine {
         Ok(out[(n - 1) * row..].to_vec())
     }
 
+    /// Make every request idle after a failed infer ([`make_idle`]), embeddings first. False when
+    /// one never got there: it was abandoned and the engine is failed (`engine_failed`).
+    fn recover_requests(&mut self) -> bool {
+        let timeout = self.stage_idle_timeout;
+        let emb = self.emb.iter_mut().map(|s| ("emb".to_string(), s));
+        let stages = self
+            .stages
+            .iter_mut()
+            .enumerate()
+            .map(|(i, s)| (format!("stage{i}"), s));
+        for (label, st) in emb.chain(stages) {
+            if let Err(why) = make_idle(&label, st, timeout) {
+                error!(reason = %why, "qwen36: engine failed; every later task is refused until a restart");
+                self.engine_failed = Some(why);
+                return false;
+            }
+        }
+        self.infer_failed = false;
+        true
+    }
+
+    /// The refusal every task gets once the engine has failed (`engine_failed`): at once, as a
+    /// `backend error`.
+    fn engine_failed_refusal(&self, task_id: &TaskId) -> Option<Vec<(TaskId, Chunk)>> {
+        let why = self.engine_failed.as_ref()?;
+        warn!(task = %task_id, reason = %why, "qwen36: refusing task (engine failed)");
+        let reason =
+            EngineError::Backend(format!("qwen36 engine failed: {why}; restart the server"))
+                .to_string();
+        Some(vec![(
+            task_id.clone(),
+            Chunk::error(task_id.clone(), reason),
+        )])
+    }
+
     fn reset_all(&mut self) {
         self.primed = false;
         // This is the scrub a failed task left, too (`scrub_failed_task`).
         self.scrub_pending = false;
+        // Task 46: an abandoned request is never touched again (a call on it fails anyway, but
+        // nothing here may release it), and its state is unknown.
+        if self.engine_failed.is_some() {
+            self.stages_dirty = true;
+            return;
+        }
+        // After a failed infer a request may still be busy, and releasing (recreate) or resetting
+        // it then blocks or fails: make every request idle first, or fail the engine.
+        let recovering = self.infer_failed;
+        if recovering && !self.recover_requests() {
+            self.stages_dirty = true;
+            return;
+        }
         // After a restore, `reset_state` leaves residue on this model, so rebuild the request
         // instead. With the prefix cache always on that is every WARM turn — `state_restored` is
         // set by each hit — and the cheap reset is what a cold turn (no hit, nothing restored)
         // gets. A dirty engine escalates the same way: the cheap reset is exactly what failed.
         let recreate = self.state_restored || self.stages_dirty;
         let mut all_ok = true;
-        for st in self.stages.iter_mut() {
+        for (i, st) in self.stages.iter_mut().enumerate() {
+            let t0 = Instant::now();
             let r = if recreate {
                 st.recreate_request()
             } else {
                 st.reset_state()
             };
+            if recovering {
+                error!(
+                    stage = format!("stage{i}"),
+                    action = if recreate { "recreate" } else { "reset" },
+                    outcome = if r.is_ok() { "ok" } else { "error" },
+                    elapsed_ms = t0.elapsed().as_millis() as u64,
+                    "qwen36: stage recovery"
+                );
+            }
             if let Err(e) = r {
                 all_ok = false;
                 // A failed scrub leaves the donor's state live — every later turn serves garbage.
@@ -2092,8 +2288,8 @@ impl Qwen36Engine {
     /// so the API's own line can report it. The stage requests are scrubbed when the next task
     /// is admitted ([`Self::scrub_failed_task`]), not here: the chunk only reaches its stream
     /// once `step` returns, so a scrub that blocks after a failed native call (a GPU infer that
-    /// threw) would keep the error from a request that is still waiting for it. A scrub that
-    /// blocks still holds the engine, at that next admission.
+    /// threw) would keep the error from a request that is still waiting for it. That scrub makes
+    /// every request idle first and is bounded by `stage_idle_timeout` (Task 46, `reset_all`).
     fn finalize_error(&mut self, reason: String) -> Vec<(TaskId, Chunk)> {
         self.want_final_hidden = false;
         self.last_final_hidden = None;
@@ -2621,6 +2817,9 @@ impl Qwen36Engine {
             }
             self.scrub_failed_task();
             let task = self.pending.remove(0);
+            if let Some(refusal) = self.engine_failed_refusal(&task.task_id) {
+                return refusal;
+            }
             if let Some(reason) = &self.poisoned {
                 warn!(task = %task.task_id, reason = %reason, "qwen36: refusing task (handshake mismatch)");
                 let reason = format!("qwen36 pipeline poisoned by handshake mismatch: {reason}");
@@ -3526,6 +3725,9 @@ impl Qwen36Engine {
             }
             self.scrub_failed_task();
             let task = self.pending.remove(0);
+            if let Some(refusal) = self.engine_failed_refusal(&task.task_id) {
+                return refusal;
+            }
             // reset moved below — Issue-34 warm-resume may restore a cached prefix blob instead.
             // Before any restore: the prefix cache only resumes a state taken at this scale.
             match self.task_lora_scale(&task) {
@@ -3668,6 +3870,11 @@ impl Qwen36Engine {
             // previous turn's DeltaNet state is still live, and a prefill on top of it decodes
             // confident garbage that the API would return as a 200. Refuse the turn instead — the
             // snapshot path already refuses to cache from this state; serving from it is worse.
+            // A request abandoned during this admission (a failed priming fold): the engine's own
+            // refusal, not a reset retry.
+            if let Some(refusal) = self.engine_failed_refusal(&task.task_id) {
+                return refusal;
+            }
             if self.stages_dirty {
                 error!(task = %task.task_id, "qwen35: stage reset failed; refusing to serve");
                 // The warm arm restores over the LIVE requests without a reset of its own, so
@@ -4695,6 +4902,9 @@ mod tests {
             primed: false,
             stages_dirty: false,
             scrub_pending: false,
+            infer_failed: false,
+            engine_failed: None,
+            stage_idle_timeout: STAGE_IDLE_TIMEOUT,
             max_ctx: None,
             refresh_costs: Default::default(),
             last_restore_bytes: 0,
@@ -6246,8 +6456,14 @@ mod tests {
         /// The infer (counted from 0) that fails, as the GPU plugin's did on hardware.
         fail_infer_at: Option<usize>,
         infers: usize,
-        /// Every infer and reset, in order.
+        /// Every infer and reset, in order; and the recovery's cancel, wait and abandon (Task 46).
         events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        /// Task 46: after the failing infer the request reads busy for this many state reads
+        /// (`u32::MAX`: forever), as the GPU plugin's did. Busy refuses what OpenVINO refuses.
+        busy_after_fail: u32,
+        busy: u32,
+        cancelled: bool,
+        abandoned: bool,
     }
 
     impl MockStage {
@@ -6264,11 +6480,77 @@ mod tests {
                 fail_infer_at: None,
                 infers: 0,
                 events: Default::default(),
+                busy_after_fail: 0,
+                busy: 0,
+                cancelled: false,
+                abandoned: false,
             };
             (st, log)
         }
         pub(super) fn input_names(&self) -> cascadia_ov_genai_shim::Result<Vec<String>> {
             Ok(self.inputs.clone())
+        }
+        /// What OpenVINO answers a call on a request that is not idle (or the shim, on none).
+        fn refuse(&self) -> cascadia_ov_genai_shim::Result<()> {
+            let why = if self.abandoned {
+                "null runtime handle"
+            } else if self.busy > 0 && self.cancelled {
+                "Infer Request was canceled"
+            } else if self.busy > 0 {
+                "Infer Request is busy"
+            } else {
+                return Ok(());
+            };
+            Err(cascadia_ov_genai_shim::Error::Native(why.into()))
+        }
+        pub(super) fn request_state(&self) -> cascadia_ov_genai_shim::Result<RequestState> {
+            Ok(if self.abandoned {
+                RequestState::None
+            } else if self.busy == 0 {
+                RequestState::Idle
+            } else if self.cancelled {
+                RequestState::Cancelled
+            } else {
+                RequestState::Busy
+            })
+        }
+        pub(super) fn cancel(&mut self) -> cascadia_ov_genai_shim::Result<()> {
+            self.events.lock().unwrap().push("cancel");
+            if self.busy > 0 {
+                self.cancelled = true;
+            }
+            Ok(())
+        }
+        /// Like `ov::InferRequest::wait_for`: blocks the slice while the run is outstanding. Each
+        /// wait is one step toward idle (`busy` counts them down).
+        pub(super) fn wait_for(
+            &mut self,
+            timeout: Duration,
+        ) -> cascadia_ov_genai_shim::Result<bool> {
+            self.events.lock().unwrap().push("wait");
+            self.refuse_if_abandoned()?;
+            if self.busy == u32::MAX {
+                std::thread::sleep(timeout);
+                return Ok(false);
+            }
+            self.busy = self.busy.saturating_sub(1);
+            if self.busy == 0 {
+                self.cancelled = false;
+            }
+            Ok(self.busy == 0)
+        }
+        fn refuse_if_abandoned(&self) -> cascadia_ov_genai_shim::Result<()> {
+            if self.abandoned {
+                return Err(cascadia_ov_genai_shim::Error::Native(
+                    "null runtime handle".into(),
+                ));
+            }
+            Ok(())
+        }
+        pub(super) fn abandon_request(&mut self) -> cascadia_ov_genai_shim::Result<()> {
+            self.events.lock().unwrap().push("abandon");
+            self.abandoned = true;
+            Ok(())
         }
         pub(super) fn set_input(
             &mut self,
@@ -6277,6 +6559,7 @@ mod tests {
             shape: &[usize],
             data: &[u8],
         ) -> cascadia_ov_genai_shim::Result<()> {
+            self.refuse()?;
             if name == LORA_SCALE_INPUT {
                 assert!(dtype == DType::F32 && shape.is_empty(), "a scalar f32");
                 self.fed = Some(f32::from_le_bytes(data.try_into().expect("4 bytes")));
@@ -6286,9 +6569,11 @@ mod tests {
             Ok(())
         }
         pub(super) fn infer(&mut self) -> cascadia_ov_genai_shim::Result<()> {
+            self.refuse()?;
             self.events.lock().unwrap().push("infer");
             self.infers += 1;
             if self.fail_infer_at == Some(self.infers - 1) {
+                self.busy = self.busy_after_fail;
                 return Err(cascadia_ov_genai_shim::Error::Native(
                     "unknown C++ exception in infer".into(),
                 ));
@@ -6308,10 +6593,13 @@ mod tests {
             Ok((DType::F32, vec![1, self.n, self.width], le_bytes_f32(&data)))
         }
         pub(super) fn reset_state(&mut self) -> cascadia_ov_genai_shim::Result<()> {
+            self.refuse()?;
             self.events.lock().unwrap().push("reset");
             Ok(())
         }
+        /// The shim refuses to release a request that is not idle (it would block forever).
         pub(super) fn recreate_request(&mut self) -> cascadia_ov_genai_shim::Result<()> {
+            self.refuse()?;
             self.events.lock().unwrap().push("reset");
             Ok(())
         }
@@ -6553,6 +6841,153 @@ mod tests {
         assert_eq!(after.first(), Some(&"reset"), "scrubbed first: {after:?}");
         // Scrubbed once: a second task's admission has nothing left to scrub.
         assert!(!e.scrub_pending);
+    }
+
+    /// Task 46: stage 1 of a mock box fails infer `at` and then reads busy for `busy` state reads.
+    fn busy_after_failed_infer(
+        e: &mut Qwen36Engine,
+        at: usize,
+        busy: u32,
+    ) -> Arc<std::sync::Mutex<Vec<&'static str>>> {
+        let OvStage::Mock(m) = &mut e.stages[1] else {
+            unreachable!()
+        };
+        m.fail_infer_at = Some(at);
+        m.busy_after_fail = busy;
+        Arc::clone(&m.events)
+    }
+
+    #[test]
+    fn a_request_a_failed_infer_left_busy_is_made_idle_before_the_scrub() {
+        // Task 46, pawan-03: after `unknown C++ exception in infer` the GPU request stayed busy;
+        // the scrub's `reset_state` was refused ("Infer Request is busy") and the recreate that
+        // followed released the busy request and never returned. The scrub now cancels and waits
+        // the request back to idle (bounded) before it resets anything. A decision pass fails
+        // here; the chat task after it gets the recovery.
+        let (mut e, _, _) = mock_box(true);
+        let events = busy_after_failed_infer(&mut e, 0, 3); // the pass's prefill infer
+        e.submit(verbalizer_pass("d1", None)).unwrap();
+        let c = run_to_final(&mut e);
+        let why = c.error.as_deref().expect("the pass fails");
+        assert!(why.contains("unknown C++ exception in infer"), "{why}");
+        assert!(
+            e.infer_failed,
+            "the failed infer is remembered for the scrub"
+        );
+        let before = events.lock().unwrap().len();
+
+        let t0 = Instant::now();
+        e.submit(chat("c2", None)).unwrap();
+        let c = run_to_final(&mut e);
+        assert!(c.error.is_none(), "served after the recovery: {c:?}");
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        let after = events.lock().unwrap()[before..].to_vec();
+        let reset = after.iter().position(|&a| a == "reset").expect("scrubbed");
+        assert_eq!(
+            after[..reset],
+            ["cancel", "wait", "wait", "wait"],
+            "cancel, then wait until idle, and only then reset: {after:?}"
+        );
+        assert!(!after.contains(&"abandon"), "{after:?}");
+        assert!(!e.infer_failed && e.engine_failed.is_none() && !e.stages_dirty);
+    }
+
+    #[test]
+    fn a_request_that_never_goes_idle_fails_the_engine_fast_for_chat_and_decisions() {
+        // Task 46: a request that stays busy is never released (its destructor would wait on it
+        // forever): after `stage_idle_timeout` it is abandoned, and this and every later task
+        // fails at once with a backend error instead of hanging. Chat fails here, a decision pass
+        // and another chat are refused after it.
+        let (mut e, _, _) = mock_box(true);
+        e.stage_idle_timeout = Duration::from_millis(300);
+        let events = busy_after_failed_infer(&mut e, 1, u32::MAX); // the first decode infer
+        e.submit(chat("think-1", Some(0.0))).unwrap();
+        let c = run_to_final(&mut e);
+        assert_eq!(
+            c.error.as_deref(),
+            Some("decode failed: backend error: unknown C++ exception in infer")
+        );
+        let before = events.lock().unwrap().len();
+
+        let t0 = Instant::now();
+        e.submit(chat("c2", None)).unwrap();
+        let c = run_to_final(&mut e);
+        let took = t0.elapsed();
+        let why = c.error.as_deref().expect("refused");
+        assert!(
+            why.starts_with(
+                "backend error: qwen36 engine failed: stage1's infer request was still"
+            ),
+            "{why}"
+        );
+        assert!(why.ends_with("restart the server"), "{why}");
+        assert!(
+            took >= Duration::from_millis(300) && took < Duration::from_secs(3),
+            "bounded by stage_idle_timeout: {took:?}"
+        );
+        let after = events.lock().unwrap()[before..].to_vec();
+        assert_eq!(after.first(), Some(&"cancel"), "{after:?}");
+        assert_eq!(after.last(), Some(&"abandon"), "{after:?}");
+        assert!(
+            !after.contains(&"reset"),
+            "nothing reset or released: {after:?}"
+        );
+        assert!(e.engine_failed.is_some() && e.active.is_none());
+
+        // Every later task: refused at once, nothing touches a stage.
+        let n = events.lock().unwrap().len();
+        for task in [verbalizer_pass("d3", None), chat("c4", None)] {
+            let id = task.task_id.clone();
+            let t0 = Instant::now();
+            e.submit(task).unwrap();
+            let c = run_to_final(&mut e);
+            assert!(
+                t0.elapsed() < Duration::from_millis(100),
+                "{id}: {:?}",
+                t0.elapsed()
+            );
+            assert_eq!(c.error.as_deref(), Some(why), "{id}");
+        }
+        assert_eq!(
+            events.lock().unwrap().len(),
+            n,
+            "no stage call after the failure"
+        );
+    }
+
+    #[test]
+    fn a_priming_fold_that_leaves_a_request_busy_fails_its_own_admission_fast() {
+        // Task 46: an infer that fails inside admission (the fold that primes a warm restore) is
+        // recovered by the cold path's reset, and a request that never goes idle refuses the
+        // task being admitted, not only the next one.
+        let (mut e, _, _) = mock_box(true);
+        e.prefix_cache = crate::prefix_cache::PrefixCache::new(1 << 20);
+        e.stage_idle_timeout = Duration::from_millis(200);
+        let min = crate::prefix_cache::MIN_PREFIX_TOKENS;
+        let pass = |id: &str, first: bool| {
+            let mut t = verbalizer_pass(id, None);
+            let d = t.decision.as_mut().unwrap();
+            d.prompt_ids = (0..min as u32 + 8).map(|i| i % MOCK_VOCAB as u32).collect();
+            d.cache_prefix = Some(min as u32);
+            d.needs_snapshot = first;
+            t
+        };
+        e.submit(pass("first", true)).unwrap();
+        assert!(run_to_final(&mut e).error.is_none());
+        let at = match &e.stages[1] {
+            OvStage::Mock(m) => m.infers, // the priming fold of the next restore
+            _ => unreachable!(),
+        };
+        busy_after_failed_infer(&mut e, at, u32::MAX);
+        let t0 = Instant::now();
+        e.submit(pass("warm", false)).unwrap();
+        let c = run_to_final(&mut e);
+        let why = c.error.as_deref().expect("refused");
+        assert!(
+            why.starts_with("backend error: qwen36 engine failed: stage1"),
+            "{why}"
+        );
+        assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
     }
 
     #[test]
