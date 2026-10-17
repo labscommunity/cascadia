@@ -549,24 +549,32 @@ impl PackedState {
         }
         // Qwen3-VL stage 0: the chunk's DeepStack mask + embeds, image tokens
         // sliced from this slot's buffer at its own image-token cursor (the
-        // image tokens fed before `start`).
+        // image tokens fed before `start`). Once the slot's image tokens are
+        // all fed (a text turn: `ds_total == 0`) every row is text, a pad id
+        // in the text included, so the feed is all zero — as on the static
+        // path (`take_static_deepstack`) and in decode.
         if self.deepstack_layers > 0 {
             let cursor = t.prompt_ids[..start]
                 .iter()
                 .filter(|&&id| id == self.deepstack_image_pad)
                 .count();
-            let (mask, embeds, _k) = crate::qwen_vl_vision::deepstack_window(
-                &ids,
-                self.deepstack_image_pad,
-                &t.ds_global,
-                t.ds_total,
-                cursor,
-                self.deepstack_layers,
-                self.deepstack_hidden,
-                s,
-            )?;
-            extras.ds_mask = mask;
-            extras.ds_embeds = embeds;
+            if cursor >= t.ds_total {
+                extras.ds_mask = self.zero_ds_mask();
+                extras.ds_embeds = self.zero_ds_embeds();
+            } else {
+                let (mask, embeds, _k) = crate::qwen_vl_vision::deepstack_window(
+                    &ids,
+                    self.deepstack_image_pad,
+                    &t.ds_global,
+                    t.ds_total,
+                    cursor,
+                    self.deepstack_layers,
+                    self.deepstack_hidden,
+                    s,
+                )?;
+                extras.ds_mask = mask;
+                extras.ds_embeds = embeds;
+            }
         }
         Ok(Planned {
             plan: if images.is_empty() {
@@ -1013,6 +1021,35 @@ mod tests {
         assert_eq!(failed.len(), 1);
         assert!(failed[0].1.contains("embedding floats"), "{}", failed[0].1);
         assert!(st.slots[1].is_none() && st.slots[0].is_some());
+    }
+
+    /// A Qwen3-VL text turn (`ds_total == 0`) whose prompt carries the image
+    /// pad id still prefills, with the all-zero DeepStack feed decode uses,
+    /// instead of retiring the slot for running past its image tokens.
+    #[test]
+    fn deepstack_text_turn_with_a_pad_id_gets_the_zero_feed() {
+        let mut st = state(1, 4);
+        st.deepstack_layers = 2;
+        st.deepstack_hidden = 3;
+        st.deepstack_image_pad = 9;
+        st.admit(
+            0,
+            GenerationTask::new("t", "x"),
+            vec![1, 9, 2],
+            Vec::new(),
+            3,
+            None,
+            Vec::new(),
+            0,
+        );
+        let planned = st.plan_step().expect("prefill chunk");
+        assert!(st.take_failed().is_empty());
+        assert!(matches!(
+            planned.kind,
+            PackedStepKind::Prefill { slot: 0, .. }
+        ));
+        assert_eq!(planned.extras.ds_mask, vec![0i64; 4]);
+        assert_eq!(planned.extras.ds_embeds, vec![0f32; 2 * 4 * 3]);
     }
 
     type TaskIdOf = cascadia_types::TaskId;
