@@ -129,3 +129,76 @@ def test_compare_cli_exit_code(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "max |dp| = 0.5000" in out and "flips = 1 (confident 1)" in out and "FAIL" in out
     assert bc.main(["compare", str(a), str(a)]) == 0
+
+
+def test_compare_fails_when_both_runs_errored_everywhere():
+    # Server down for both runs: nothing was compared, so it must not read as a PASS.
+    a = [rec(str(i), "w", "m", 0.0, {}, status=0) for i in range(3)]
+    b = [rec(str(i), "w", "m", 0.0, {}, status=0) for i in range(3)]
+    r = bc.compare(a, b, confident=0.05, max_dp=0.05)
+    assert not r["ok"] and r["compared"] == 0
+    assert r["errors_a"] == r["errors_b"] == ["0", "1", "2"]
+    # --allow-errors relaxes only the error rule: an empty comparison still fails.
+    assert not bc.compare(a, b, confident=0.05, max_dp=0.05, allow_errors=True)["ok"]
+
+
+def test_compare_fails_on_a_case_errored_in_one_run_unless_allowed():
+    a = [rec("1", "w", "m", 1.0, {"q": NOUL(0.9)}), rec("2", "w", "m", 1.0, {"q": NOUL(0.2)})]
+    b = [rec("1", "w", "m", 1.0, {"q": NOUL(0.9)}), rec("2", "w", "m", 900.0, {}, status=0)]
+    r = bc.compare(a, b, confident=0.05, max_dp=0.05)
+    assert not r["ok"] and r["errors_a"] == [] and r["errors_b"] == ["2"] and r["compared"] == 1
+    assert r["missing"] == []
+    assert bc.compare(a, b, confident=0.05, max_dp=0.05, allow_errors=True)["ok"]
+
+
+def test_compare_fails_when_nothing_is_compared():
+    assert not bc.compare([], [], confident=0.05, max_dp=0.05)["ok"]
+
+
+def test_compare_checks_questions_on_both_sides():
+    a = [rec("1", "w", "m", 1.0, {"q": NOUL(0.9)})]
+    b = [rec("1", "w", "m", 1.0, {"q": NOUL(0.9), "extra": NOUL(0.5)})]
+    r = bc.compare(a, b, confident=0.05, max_dp=0.05)
+    assert not r["ok"] and r["missing"] == ["1.extra"]
+
+
+def test_compare_cli_reports_errors_and_exits_nonzero(tmp_path, capsys):
+    a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    bc.write_private(a, [rec("1", "w", "m", 0.0, {}, status=0)])
+    bc.write_private(b, [rec("1", "w", "m", 0.0, {}, status=0)])
+    assert bc.main(["compare", str(a), str(b)]) == 1
+    out = capsys.readouterr().out
+    assert "compared 0 cases; errored: 1 in" in out and "nothing compared" in out and "FAIL" in out
+
+
+def test_baseline_noul_is_ordered_false_true_whatever_the_key_order():
+    r = {"id": "1", "latency_s": 1.0, "probs": {"q": {"true": 0.8, "false": 0.2}}}
+    assert bc.probs_of(r) == {"q": [0.2, 0.8]}
+
+
+def test_post_records_invalid_json_as_an_error(monkeypatch):
+    class Resp:
+        status = 200
+
+        def read(self):
+            return b"not json"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(bc.urllib.request, "urlopen", lambda req, timeout: Resp())
+    status, _, data, err = bc.post("http://x", {}, 1.0)
+    assert status == 200 and data is None and "invalid JSON" in err
+    assert not bc.ok({"status": status, "error": err})
+
+
+def test_post_survives_an_incomplete_read(monkeypatch):
+    def boom(req, timeout):
+        raise bc.http.client.IncompleteRead(b"")
+
+    monkeypatch.setattr(bc.urllib.request, "urlopen", boom)
+    status, _, data, err = bc.post("http://x", {}, 1.0)
+    assert status == 0 and data is None and "IncompleteRead" in err
