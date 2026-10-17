@@ -1083,6 +1083,60 @@ def make_stateful_with_init_gemma4(ov_model):
     return new_model
 
 
+def name_stage_ports(ov_model, has_embed, has_head, splice_images, n_external, n_cross):
+    """Name a converted stage's ports and free its sequence dims.
+
+    Inputs, in trace order: `input_ids` (embed stage) or `hidden_states`,
+    `position_ids`, `external_kv.{i}.key|value` (KV shared from an earlier
+    stage), `past_key_values.{i}.key|value`, then, on an embed stage that
+    splices images, `image_features` [M, hidden] with M dynamic (0 on a step
+    without images). Outputs: `logits` or `hidden_states`, then
+    `cross_kv.{i}.key|value` (KV a later stage reads) and
+    `present.{i}.key|value`."""
+    for i, inp in enumerate(ov_model.inputs):
+        shape = inp.partial_shape
+        if splice_images and i == len(ov_model.inputs) - 1:
+            shape[0] = -1
+            inp.node.set_partial_shape(shape)
+            inp.set_names({"image_features"})
+            continue
+        if i == 0:
+            name = "input_ids" if has_embed else "hidden_states"
+            if len(shape) >= 2:
+                shape[1] = -1
+        elif i == 1:
+            name = "position_ids"
+            if len(shape) >= 2:
+                shape[1] = -1
+        elif i < 2 + n_external * 2:
+            ei = (i - 2) // 2
+            kt = "value" if (i - 2) % 2 else "key"
+            name = f"external_kv.{ei}.{kt}"
+            if len(shape) >= 3:
+                shape[2] = -1
+        else:
+            oi = (i - 2 - n_external * 2) // 2
+            kt = "value" if (i - 2 - n_external * 2) % 2 else "key"
+            name = f"past_key_values.{oi}.{kt}"
+            if len(shape) >= 3:
+                shape[2] = -1
+        inp.node.set_partial_shape(shape)
+        inp.set_names({name})
+
+    for i, out in enumerate(ov_model.outputs):
+        if i == 0:
+            name = "logits" if has_head else "hidden_states"
+        elif i < 1 + n_cross * 2:
+            ci = (i - 1) // 2
+            kt = "value" if (i - 1) % 2 else "key"
+            name = f"cross_kv.{ci}.{kt}"
+        else:
+            oi = (i - 1 - n_cross * 2) // 2
+            kt = "value" if (i - 1 - n_cross * 2) % 2 else "key"
+            name = f"present.{oi}.{kt}"
+        out.set_names({name})
+
+
 def export_single_stage(
     model,
     text_config,
@@ -1197,49 +1251,7 @@ def export_single_stage(
         f"{len(ov_model.inputs)} inputs, {len(ov_model.outputs)} outputs"
     )
 
-    # Name I/O ports.
-    for i, inp in enumerate(ov_model.inputs):
-        shape = inp.partial_shape
-        if splice_images and i == len(ov_model.inputs) - 1:
-            shape[0] = -1
-            inp.node.set_partial_shape(shape)
-            inp.set_names({"image_features"})
-            continue
-        if i == 0:
-            name = "input_ids" if has_embed else "hidden_states"
-            if len(shape) >= 2:
-                shape[1] = -1
-        elif i == 1:
-            name = "position_ids"
-            if len(shape) >= 2:
-                shape[1] = -1
-        elif i < 2 + n_external * 2:
-            ei = (i - 2) // 2
-            kt = "value" if (i - 2) % 2 else "key"
-            name = f"external_kv.{ei}.{kt}"
-            if len(shape) >= 3:
-                shape[2] = -1
-        else:
-            oi = (i - 2 - n_external * 2) // 2
-            kt = "value" if (i - 2 - n_external * 2) % 2 else "key"
-            name = f"past_key_values.{oi}.{kt}"
-            if len(shape) >= 3:
-                shape[2] = -1
-        inp.node.set_partial_shape(shape)
-        inp.set_names({name})
-
-    for i, out in enumerate(ov_model.outputs):
-        if i == 0:
-            name = "logits" if has_head else "hidden_states"
-        elif i < 1 + n_cross * 2:
-            ci = (i - 1) // 2
-            kt = "value" if (i - 1) % 2 else "key"
-            name = f"cross_kv.{ci}.{kt}"
-        else:
-            oi = (i - 1 - n_cross * 2) // 2
-            kt = "value" if (i - 1 - n_cross * 2) % 2 else "key"
-            name = f"present.{oi}.{kt}"
-        out.set_names({name})
+    name_stage_ports(ov_model, has_embed, has_head, splice_images, n_external, n_cross)
     ov_model.validate_nodes_and_infer_types()
 
     # Make own KV stateful WITH explicit batch-1 zero-length inits (cross_kv
