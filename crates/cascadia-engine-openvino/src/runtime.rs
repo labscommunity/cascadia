@@ -1113,6 +1113,59 @@ fn decode_wire_positions(t: &WireTensor, rows: usize, seq: usize) -> EngineResul
     Ok(v)
 }
 
+/// A consumed activation group's decode result: `(hidden, shape, position)`,
+/// or the error the upstream must be NACKed with (see
+/// `recv_hidden_from_upstream`).
+type OwedGroup = EngineResult<(Vec<f32>, [usize; 3], Option<i64>)>;
+
+/// The decoded body of an activation group (everything after the lead).
+#[derive(Debug)]
+struct DecodedGroup {
+    hidden: Vec<f32>,
+    shape: [usize; 3],
+    types: Option<Vec<i64>>,
+    positions: Option<Vec<i64>>,
+}
+
+/// Decode + validate the frames that follow a group's lead: the hidden, and
+/// the optional `token_type_ids` and M-RoPE positions frames, both checked
+/// against the hidden's token count. Pure, so the "decode failure after the
+/// group was consumed" path is testable without a socket.
+fn decode_hidden_group(
+    hidden: &WireTensor,
+    types: Option<&WireTensor>,
+    positions: Option<&WireTensor>,
+) -> EngineResult<DecodedGroup> {
+    let shape = [
+        hidden.shape[0] as usize,
+        hidden.shape[1] as usize,
+        hidden.shape[2] as usize,
+    ];
+    let types = types.map(|t| decode_wire_types(t, shape[1])).transpose()?;
+    let positions = positions
+        .map(|p| decode_wire_positions(p, crate::qwen_vl_vision::MROPE_ROWS, shape[1]))
+        .transpose()?;
+    let hidden = match hidden.dtype {
+        WireDType::F32 => hidden
+            .data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        WireDType::F16 => f16_bytes_to_f32(&hidden.data),
+        other => {
+            return Err(EngineError::Backend(format!(
+                "unexpected upstream dtype {other:?}"
+            )))
+        }
+    };
+    Ok(DecodedGroup {
+        hidden,
+        shape,
+        types,
+        positions,
+    })
+}
+
 /// Encode a token + the echoed per-hop seq as I32 `[1,1,2]` = `[token, seq]`
 /// (8 bytes): the token is element 0, the seq element 1 — i.e. the seq occupies
 /// bytes 4..8, the HIGH half if the payload is read as one little-endian i64.
@@ -3658,7 +3711,13 @@ impl OvRuntimeEngine {
         outcome.map_err(TokenWaitFailure::into_error)
     }
 
-    fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], Option<i64>)> {
+    /// Receive one activation group. The OUTER error means nothing is owed:
+    /// no group arrived, its frames lost alignment, or the lead could not be
+    /// decoded (no seq to echo). Once the lead decodes, `inbound_seq` is set
+    /// and the upstream is owed a reply, so any later decode failure comes
+    /// back as the INNER error for the caller to NACK (`answer_upstream`),
+    /// the same rule `step_relay_packed` follows.
+    fn recv_hidden_from_upstream(&mut self) -> EngineResult<OwedGroup> {
         // Wire order is [lead] [hidden] (see send_hidden_frames), where lead is
         // [seq] or [seq, position]. The LEAD frame's wait is lenient
         // (idle-between-requests); the hidden that must follow it is deadlined,
@@ -3708,32 +3767,16 @@ impl OvRuntimeEngine {
             // frame yields a clear EngineError, not a desync.
             let (inbound_seq, position) = decode_wire_lead(&lead, want_pos)?;
             self.inbound_seq = Some(inbound_seq);
-            let shape = [
-                tensor.shape[0] as usize,
-                tensor.shape[1] as usize,
-                tensor.shape[2] as usize,
-            ];
-            if let Some(t) = types {
-                self.step_types = decode_wire_types(&t, shape[1])?;
-            }
-            if let Some(p) = positions {
-                self.step_positions =
-                    decode_wire_positions(&p, crate::qwen_vl_vision::MROPE_ROWS, shape[1])?;
-            }
-            let floats = match tensor.dtype {
-                WireDType::F32 => tensor
-                    .data
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect(),
-                WireDType::F16 => f16_bytes_to_f32(&tensor.data),
-                other => {
-                    return Err(EngineError::Backend(format!(
-                        "unexpected upstream dtype {other:?}"
-                    )))
+            let group = decode_hidden_group(&tensor, types.as_ref(), positions.as_ref()).map(|g| {
+                if let Some(t) = g.types {
+                    self.step_types = t;
                 }
-            };
-            return Ok((floats, shape, position));
+                if let Some(p) = g.positions {
+                    self.step_positions = p;
+                }
+                (g.hidden, g.shape, position)
+            });
+            return Ok(group);
         }
     }
 
@@ -5691,9 +5734,11 @@ impl OvRuntimeEngine {
         // Before this point nothing is owed: a failed recv either got no group
         // at all, or lost frame alignment, in which case the socket is gone and
         // there is nothing to answer on. After it, `inbound_seq` is set and
-        // every failure must answer.
-        let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
-        let step = self.relay_last_body(hidden, shape, pos_opt);
+        // every failure must answer — a bad types / positions / hidden frame
+        // included, which is why it arrives as the inner `group` error.
+        let group = self.recv_hidden_from_upstream()?;
+        let step =
+            group.and_then(|(hidden, shape, pos_opt)| self.relay_last_body(hidden, shape, pos_opt));
         self.answer_upstream(step)
     }
 
@@ -5736,8 +5781,9 @@ impl OvRuntimeEngine {
             return self.step_relay_packed();
         }
         // See `step_last`: nothing is owed until the group is consumed.
-        let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
-        let step = self.relay_middle_body(hidden, shape, pos_opt);
+        let group = self.recv_hidden_from_upstream()?;
+        let step = group
+            .and_then(|(hidden, shape, pos_opt)| self.relay_middle_body(hidden, shape, pos_opt));
         let answered = self.answer_upstream(step);
         self.escalate_if_downstream_is_gone(answered)
     }
@@ -9905,6 +9951,36 @@ mod tests {
         // without the vision block) fails the value check, not misread.
         assert!(decode_wire_types(&encode_wire_lead(5, None), 1).is_err());
         assert_eq!(decode_wire_types(&t, 2).unwrap(), vec![0, 1]);
+    }
+
+    /// A consumed group whose follow-on frames do not decode is an inner
+    /// (owed, NACKed) error, never a panic or a silent default; a good group
+    /// decodes every frame against the hidden's token count.
+    #[test]
+    fn hidden_group_decode_failures_are_reported_after_the_lead() {
+        let hidden = WireTensor::new(
+            WireDType::F32,
+            [1, 2, 1],
+            [1.0f32, 2.0].iter().flat_map(|f| f.to_le_bytes()).collect(),
+        );
+        let rows = crate::qwen_vl_vision::MROPE_ROWS;
+        let pos = encode_wire_positions(rows, &vec![0; rows * 2]);
+        let g =
+            decode_hidden_group(&hidden, Some(&encode_wire_types(&[0, 1])), Some(&pos)).unwrap();
+        assert_eq!(g.hidden, vec![1.0, 2.0]);
+        assert_eq!(g.shape, [1, 2, 1]);
+        assert_eq!(g.types, Some(vec![0, 1]));
+        assert_eq!(g.positions.unwrap().len(), rows * 2);
+        let g = decode_hidden_group(&hidden, None, None).unwrap();
+        assert!(g.types.is_none() && g.positions.is_none());
+        // Types frame for the wrong token count.
+        assert!(decode_hidden_group(&hidden, Some(&encode_wire_types(&[0])), None).is_err());
+        // Positions frame for the wrong token count.
+        let short = encode_wire_positions(rows, &vec![0; rows]);
+        assert!(decode_hidden_group(&hidden, None, Some(&short)).is_err());
+        // A hidden in a dtype no stage sends.
+        let bad = WireTensor::new(WireDType::I64, [1, 1, 1], vec![0; 8]);
+        assert!(decode_hidden_group(&bad, None, None).is_err());
     }
 
     /// The seq is carried as an i64 lane on the lead wire and an i32 lane on
