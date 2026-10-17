@@ -58,12 +58,12 @@ names the field.
 | Qwen2.5-VL, Qwen3-VL, InternVL2, Phi-3.5-vision, LLaVA-NeXT (llava-v1.6), Gemma 3 | `ov-genai` | one box | the OpenVINO exports as published (`OpenVINO/<model>-int4-ov`) |
 | Gemma 4 26B-A4B / 31B | `ov-runtime` | 2+ machines, stateful, static or packed | `tools/gemma4_surgery/export_gemma4_text.py --vision` |
 | Gemma 4 E2B / E4B | `gemma4` | 1+ machines | `tools/export_gemma4.py --vision DIR` |
-| Gemma 3 (4B / 12B / 27B) | `ov-runtime` | 1+ machines, stateful or static | `tools/vlm_surgery/cut_vlm_lm.py --family gemma3` |
+| Gemma 3 (4B / 12B / 27B) | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family gemma3` |
 | Pixtral 12B | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family pixtral` |
-| Mistral 3 (Ministral-3, Mistral Small 3.1/3.2) | `ov-runtime` | 1+ machines | export with optimum-intel, then `tools/vlm_surgery/cut_vlm_lm.py --family mistral3` |
+| Mistral 3 (Ministral-3, Mistral Small 3.1/3.2) | `ov-runtime` | 1+ machines, stateful, static or packed | export with optimum-intel, then `tools/vlm_surgery/cut_vlm_lm.py --family mistral3` |
 | Phi-3.5-vision | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family phi3_v` on `OpenVINO/Phi-3.5-vision-instruct-int4-ov` |
 | InternVL2 (Phi-3 text tower, e.g. InternVL2-4B) | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family internvl_chat` on `OpenVINO/InternVL2-4B-int4-ov` |
-| LLaVA-NeXT (llava-v1.6-mistral-7b) | `ov-runtime` | 1+ machines | `tools/vlm_surgery/cut_vlm_lm.py --family llava_next` on `OpenVINO/llava-v1.6-mistral-7b-hf-int4-ov` |
+| LLaVA-NeXT (llava-v1.6-mistral-7b) | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family llava_next` on `OpenVINO/llava-v1.6-mistral-7b-hf-int4-ov` |
 | Pixtral 12B target, Ministral-3-3B draft | `ov-dist-spec` | 2+ machines, stateful | `cut_vlm_lm.py --family pixtral --all-logits` for the target, `tools/vlm_surgery/make_text_draft.py` for the draft |
 | Qwen2.5-VL (7B) | `ov-runtime` | 1+ machines, stateful | `tools/vlm_surgery/cut_vlm_lm.py --family qwen2_5_vl` |
 | Qwen3-VL (4B) | `ov-runtime` | 1+ machines, stateful | `tools/vlm_surgery/cut_vlm_lm.py --family qwen3_vl` |
@@ -79,8 +79,8 @@ block. `ov-dist-spec` refuses a Gemma 4 target tree at load. Not supported:
 - **MiniCPM-V 4.7**: GenAI 2026.4.1 does not know its model type (`minicpmv4_7`) and the
   engine fails to load.
 - Staged (multi-machine) serving of the GenAI-only families above other than
-  Phi-3.5-vision, InternVL2, LLaVA-NeXT, Qwen2.5-VL and Qwen3-VL: their trees are not
-  exported with the vision tower yet (`export_shards.py` notes when it drops one).
+  Gemma 3, Phi-3.5-vision, InternVL2, LLaVA-NeXT, Qwen2.5-VL and Qwen3-VL: their trees are
+  not exported with the vision tower yet (`export_shards.py` notes when it drops one).
 - Phi-3.5-vision and InternVL2 on `ov-dist-spec`: it takes Pixtral targets only.
 - **LLaVA-NeXT on `ov-dist-spec`**: refused at load (Pixtral / Mistral 3 targets only).
 - Qwen2.5-VL / Qwen3-VL on static, packed or `ov-dist-spec` trees: those paths feed 1-D
@@ -251,13 +251,23 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
   `--shared-prefill` writes one IR that serves both decode and prefill, so the weights
   are compiled once; the NPU needs the two separate static IRs (omit the flag).
 - **LLaVA-NeXT** spends up to 2928 tokens on an image, so give it `--context 4096` or
-  more; it attends causally, so any `--prefill-seq` works (not yet run on hardware).
+  more; it attends causally, so any `--prefill-seq` works. For packed slots a 448x448
+  image (2956 prompt tokens with the SDK test's text) must fit one slot's region, so a
+  two-slot variant needs `--context` near 6016 (region 3007); a narrower context refuses
+  such an image with a 413. Verified static and packed on CPU (prompt_tokens 2956).
 - **Gemma 4** needs `--prefill-seq` at least one image wide (280), and `--context` plus
   `--prefill-seq` must stay within the sliding window + 1 (1025): for example
   `--context 736 --prefill-seq 288`, which holds about two images.
 - Packed slots (`--packed-slots N`, continuous batching on static shards): build the
   packed IR per stage of the static tree with `python tools/packed_variant.py <stage dir>
-  --slots N [--packed-seq S]`, then serve every rank with `--packed-slots N`.
+  --slots N [--packed-seq S]`, then serve every rank with `--packed-slots N`. On CPU/GPU
+  run it on the same `--shared-prefill` tree: the packed IR sits beside the shared decode
+  IR, so one tree serves both the static and the packed paths. Every inference is
+  `--packed-seq` rows (decode included), so a smaller `--packed-seq` (e.g. 64) decodes
+  faster on a causal family while prefill chunks that many rows at a time; a bidirectional
+  family (Gemma 3 / Gemma 4) keeps `--packed-seq` at least one image wide (below). A
+  request whose prompt does not fit one slot's region `(context - 1 - packed_prefix) / N`
+  is refused with a 413.
 - **Gemma 4 on packed slots** (26B-A4B: about 18 GB per packed stage at 288 rows, so one
   stage per 32 GB node): same two steps. `packed_variant.py` finds the stage's two
   mask producers (sliding window and full attention), tells them apart from the tree's
@@ -275,6 +285,14 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
 
   The load log line `packed multi-slot decode active` names the mask ports, the window
   and the KV geometry (`8x256 x6, 2x512 x1`, ...) each stage loaded.
+- **Gemma 3 on packed slots** takes the same two-producer recipe (sliding window + full
+  attention, `token_type_ids`), so build its static tree with `--context 768
+  --prefill-seq 256` (sliding window 1024) and `--packed-seq 256` (one image wide). Each
+  slot's region is `(context - 1) / slots`, so two images do not fit one slot of a
+  two-slot 768-context tree (they are refused per request with a 413); one 448x448 image
+  (286 tokens) fits.
+- On CPU/GPU the packed variant is built from the same `--shared-prefill` static tree as
+  the static path, so one tree serves both.
 
 ## Serving
 
