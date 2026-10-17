@@ -78,15 +78,11 @@ block. `ov-dist-spec` refuses a Gemma 4 target tree at load. Not supported:
 - **Llama 3.2 Vision** (`mllama`), refused at export: its text tower has cross-attention.
 - **MiniCPM-V 4.7**: GenAI 2026.4.1 does not know its model type (`minicpmv4_7`) and the
   engine fails to load.
-- Staged (multi-machine) serving of the GenAI-only families above other than
-  Gemma 3, Phi-3.5-vision, InternVL2, LLaVA-NeXT, Qwen2.5-VL and Qwen3-VL: their trees are
-  not exported with the vision tower yet (`export_shards.py` notes when it drops one).
-- Phi-3.5-vision and InternVL2 on `ov-dist-spec`: it takes Pixtral targets only.
-- **LLaVA-NeXT on `ov-dist-spec`**: refused at load (Pixtral / Mistral 3 targets only).
-- Qwen2.5-VL / Qwen3-VL on `ov-dist-spec`: it takes Pixtral / Mistral 3 targets only, and
-  its text draft runs no vision tower, so it offers no image input for these models (the
-  tree is refused at load). Static and packed trees now serve both models — the M-RoPE
-  positions ride every stage (see "Static and packed trees").
+- Images on `ov-dist-spec` for any target but Pixtral / Mistral 3 (Gemma 3, Phi-3.5-vision,
+  InternVL2, LLaVA-NeXT, Qwen2.5-VL, Qwen3-VL): such a tree is refused at load. Serve
+  these on `ov-runtime`.
+- Trees made with `export_shards.py` carry no vision tower (it notes when it drops one);
+  cut vision trees with `tools/vlm_surgery/cut_vlm_lm.py`.
 
 ## Exporting
 
