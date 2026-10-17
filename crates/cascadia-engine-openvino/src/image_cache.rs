@@ -7,9 +7,12 @@
 //! Pixtral, three for Gemma 4 E2B. The key is the hash of the decoded pixels
 //! and dimensions, never the placeholder ids, which are the same for every
 //! image of one size. Each front end owns one cache, so its preprocessing
-//! settings are part of the key implicitly. The tenant is part of the key as
-//! it is of the KV cache's image stand-ins: otherwise a tenant could time a
-//! request to learn whether another tenant recently sent the same image.
+//! settings are part of the key implicitly. The turn's tenant is part of the
+//! key as it is of the KV cache's image stand-ins, so tenants would not share
+//! entries; but the API sets no tenant today (every task's is empty), so the
+//! cache is shared by every caller of a server, and a caller can time a
+//! request to learn whether anyone recently sent the same image (docs/VLM.md,
+//! Limits).
 //!
 //! Bounded by bytes, least recently used out first. `CASCADIA_IMAGE_CACHE_MB`
 //! sets the bound per front end (default 256; 0 disables the cache).
