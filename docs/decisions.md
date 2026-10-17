@@ -330,9 +330,7 @@ Error messages are deliberately terse:
   for each question, so it counts once: a Kev request with a 64K-token state and 5 questions costs
   about 64K plus five short branches. In pipeline mode (`--total` > 1) or with
   `--prefix-cache-gb 0`, every pass counts in full, because the engine re-prefills the state per
-  question. A request that does not need the discount may also re-prefill a short state when the
-  box has measured that restoring it costs more (see Kev-9B, Prefix reuse); its budget already
-  covers every pass in full.
+  question.
 - **The discount is never exceeded.** A request whose budget covers every pass in full runs as
   usual. A request that needs the discount (its passes in full exceed `max_total_tokens`) relies
   on the prefix cache:
@@ -832,7 +830,7 @@ linear-attention and KV state. That is a separate project, not a flag.
 
 Per-pass timings are logged at debug level on target `cascadia::perf`; start the server with
 `RUST_LOG=info,cascadia::perf=debug` to see them. With plain `RUST_LOG=info` they cost nothing
-beyond a few clock reads per stage infer. Two events come from the API and two from the engine:
+beyond a few clock reads per stage infer. Two events come from the API and one from the engine:
 
 - `decision request done` (API, per request): `family`, `passes`, `input_tokens`, `encode_ms`,
   `passes_ms`, `total_ms`.
@@ -843,10 +841,6 @@ beyond a few clock reads per stage infer. Two events come from the API and two f
   `stage_ms` (per stage, comma-separated), `host_copy_ms`, `head_ms`, `reset_ms`, `recreate`,
   `total_ms`. `reset_ms` and `recreate` are the reset after the head (`recreate=true` after a
   prefix-cache restore); `admit_reset_ms` is a cold pass's reset at admission.
-- `qwen36 decision reuse rule` (engine, per unflagged decision pass at snapshot planning and at a
-  cache hit, once its rates are measured): `n`, `prompt`, `spans_saved`, `bytes`, `restore_ms`,
-  `prefill_ms`, `fold_ms`, `recreate_extra_ms`, `prefill_us_per_tok`, `pays` (see Kev-9B, Prefix
-  reuse).
 
 `tools/decision/bench_cases.py` drives a running server and compares runs:
 
@@ -962,26 +956,6 @@ the state once (about 395 s on this CPU), then resumes the snapshot for every la
 | `--prefix-cache-gb 0.001` | 413 in 0.02 s: `needs 45095 prefill tokens without prefix reuse (the shared prefix cannot fit the prefix cache); the per-request limit is 20000` |
 | `--prefix-cache-gb 0` | 413 in 0.02 s: `needs 45095 prefill tokens; the per-request limit is 20000` |
 | Pipeline (no prefix discount) | 413 in 0.02 s, the plain message; nothing reaches the dump |
-
-A decision pass skips the cache when the box has measured that restoring loses. On the Arc 140V a Kev
-restore costs about 300 ms: a one-token priming fold over all weights (~197 ms) plus the state writes
-(~96 ms), and the pass after it ends with a request rebuild instead of the cheap reset. A typical
-~171-token state prefills again for less than that. The rule compares, from the engine's own latest
-measurements:
-
-- restore = priming fold + snapshot bytes × `set_state` seconds per byte (the snapshot copy's rate
-  until a restore has been measured) + (rebuild reset − cheap reset);
-- prefill = shared tokens × the marginal seconds per token (the latest prefill of at least 128 tokens,
-  less one priming fold per span) + one priming fold per extra span the shared tokens would take.
-
-The cache is used when restore < prefill. Any rate not yet measured means reuse, so the first request
-after startup behaves as before, and the rule only turns reuse off once this box has measured that it
-loses. It applies to unflagged decision passes only, at both places the cache is used: the first pass
-skips the snapshot, and a later pass whose hit loses goes cold. A request admitted on the shared-prefix
-discount always reuses (its budget assumed it), so the 9,001-token example above still resumes, and at
-9K tokens restoring is a clear win anyway. Chat never consults the rule: a long shared chat prefix
-restores as before. With `RUST_LOG=info,cascadia::perf=debug` the engine logs each evaluation as
-`qwen36 decision reuse rule` with both sides (`restore_ms`, `prefill_ms`), its inputs and `pays`.
 
 ### Clef-flash
 
