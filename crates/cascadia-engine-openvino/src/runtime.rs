@@ -7628,6 +7628,24 @@ impl Builder for OvRuntimeBuilder {
                         primary_kind(ids_in.is_some(), embeds_in.is_some()),
                     )));
                 }
+                // Qwen3-VL stage 0: a prefill IR without the DeepStack ports
+                // would run every prefill chunk without them — silently wrong
+                // output, so refuse it here as the packed variant does.
+                let visual_mask_in = pcanon.get("visual_pos_masks").cloned();
+                let deepstack_in = pcanon.get("deepstack_visual_embeds").cloned();
+                let ds_layers = self
+                    .vision
+                    .as_ref()
+                    .and_then(|v| v.first.as_ref())
+                    .map_or(0, |f| f.frontend.deepstack_layers());
+                if ds_layers > 0 && (visual_mask_in.is_none() || deepstack_in.is_none()) {
+                    return Err(EngineError::InvalidConfig(
+                        "Qwen3-VL chunked-prefill stage 0 is missing visual_pos_masks / \
+                         deepstack_visual_embeds; rebuild it with tools/vlm_surgery/static_variant.py \
+                         from this build"
+                            .into(),
+                    ));
+                }
                 Some(StaticPrefill {
                     runtime: prt,
                     shared,
@@ -7637,8 +7655,8 @@ impl Builder for OvRuntimeBuilder {
                     hidden_in,
                     embeds_in,
                     types_in: pcanon.get("token_type_ids").cloned(),
-                    visual_mask_in: pcanon.get("visual_pos_masks").cloned(),
-                    deepstack_in: pcanon.get("deepstack_visual_embeds").cloned(),
+                    visual_mask_in,
+                    deepstack_in,
                     attn_in,
                     pos_in,
                     layers: players,
