@@ -160,6 +160,94 @@ def test_mixed_kv_geometry_is_listed_per_layer():
     assert shapes["past_key_values.1.value"] == [1, KVH, 15, HD]
 
 
+def toy_qwen_stage(deepstack_layers: int = 0) -> ov.Model:
+    """A stage 0 like the Qwen VL language model's: M-RoPE position_ids
+    `[3, ?, ?]`, and (Qwen3-VL) the DeepStack inputs. Each input is touched so
+    its port survives make_stateless / reshape."""
+    rng = np.random.default_rng(0)
+    x = ops.parameter([-1, -1, HIDDEN], ov.Type.f32, name="inputs_embeds")
+    x.output(0).set_names({"inputs_embeds"})
+    mask = ops.parameter([-1, -1], ov.Type.i64, name="attention_mask")
+    mask.output(0).set_names({"attention_mask"})
+    pos = ops.parameter([3, -1, -1], ov.Type.i64, name="position_ids")
+    pos.output(0).set_names({"position_ids"})
+    beam = ops.parameter([-1], ov.Type.i32, name="beam_idx")
+    beam.output(0).set_names({"beam_idx"})
+    extra = []
+    h = x.output(0)
+    # Fold a scalar of the M-RoPE positions back into the stream so the port
+    # is reachable from the result (else reshape would drop it).
+    pbias = ops.convert(ops.reduce_sum(pos, ops.constant(np.array([0, 1, 2], np.int64)), False),
+                        ov.Type.f32)
+    h = ops.add(h, ops.reshape(pbias, ops.constant(np.array([1, 1, 1], np.int64)), False)).output(0)
+    if deepstack_layers:
+        vpm = ops.parameter([-1, -1], ov.Type.i64, name="visual_pos_masks")
+        vpm.output(0).set_names({"visual_pos_masks"})
+        dse = ops.parameter([-1, -1, HIDDEN], ov.Type.f32, name="deepstack_visual_embeds")
+        dse.output(0).set_names({"deepstack_visual_embeds"})
+        extra = [vpm, dse]
+        # Gather layer 0's rows at a cumsum index of the mask, exactly the
+        # export's `max(0, cumsum(mask) - 1)` gather, so N may exceed the
+        # image-token count without the padded rows ever being read.
+        cum = ops.cumsum(ops.reshape(vpm, ops.constant(np.array([-1], np.int64)), False),
+                         ops.constant(np.int64(0)))
+        idx = ops.maximum(ops.subtract(cum, ops.constant(np.int64(1))),
+                          ops.constant(np.int64(0)))
+        layer0 = ops.gather(dse, ops.constant(np.int64(0)), ops.constant(np.int64(0)))
+        rows = ops.gather(layer0, idx, ops.constant(np.int64(0)))
+        h = ops.add(h, ops.reshape(rows, ops.constant(np.array([1, -1, HIDDEN], np.int64)),
+                                   False)).output(0)
+    sinks = []
+    for layer in (21, 20):
+        outs = {}
+        for kind in ("key", "value"):
+            w = ops.constant(rng.standard_normal((HIDDEN, KVH * HD)).astype(np.float32))
+            new = ops.matmul(h, w, False, False)
+            new = ops.reshape(new, ops.constant(np.array([0, 0, KVH, HD], np.int64)), True)
+            new = ops.transpose(new, ops.constant(np.array([0, 2, 1, 3], np.int64)))
+            vid = f"past_key_values.{layer}.{kind}present.{layer}.{kind}"
+            info = ov.op.util.VariableInfo()
+            info.variable_id = vid
+            info.data_shape = ov.PartialShape([-1, KVH, -1, HD])
+            info.data_type = ov.Type.f32
+            var = ov.op.util.Variable(info)
+            init = ops.broadcast(ops.constant(np.float32(0)),
+                                 ops.constant(np.array([1, KVH, 0, HD], np.int64)))
+            rv = ops.read_value(init, var)
+            past = ops.gather(rv, beam, ops.constant(np.int64(0)))
+            cat = ops.concat([past, new], 2)
+            sinks.append(ops.assign(cat, var))
+            outs[kind] = cat
+        k = ops.reduce_sum(outs["key"], ops.constant(np.array([1, 2, 3], np.int64)), True)
+        kv = ops.reshape(k, ops.constant(np.array([-1, 1, 1], np.int64)), False)
+        h = ops.add(h, ops.multiply(kv, ops.constant(np.float32(0.01)))).output(0)
+    params = [x, mask, pos, beam] + extra
+    return ov.Model([ops.result(h)], sinks, params, "toy_qwen")
+
+
+def test_mrope_position_ids_pinned_to_three_rows():
+    m = toy_qwen_stage()
+    sv.make_stateless(m, has_head=False)
+    sv.pin_shapes(m, 1, 16)
+    shapes = {i.get_any_name(): list(i.get_shape()) for i in m.inputs}
+    # [rows, batch, seq] — the shape the host feeds M-RoPE positions in.
+    assert shapes["position_ids"] == [3, 1, 1]
+    sv.pin_shapes(m, 5, 20)  # a prefill window
+    assert list(next(i for i in m.inputs
+                     if i.get_any_name() == "position_ids").get_shape()) == [3, 1, 5]
+
+
+def test_deepstack_inputs_pinned_to_seq_width():
+    m = toy_qwen_stage(deepstack_layers=3)
+    sv.make_stateless(m, has_head=False)
+    sv.pin_shapes(m, 4, 16, deepstack_layers=3)
+    shapes = {i.get_any_name(): list(i.get_shape()) for i in m.inputs}
+    assert shapes["position_ids"] == [3, 1, 4]
+    assert shapes["visual_pos_masks"] == [1, 4]
+    # [layers, seq, hidden] — N pinned to the query width, padded rows unread.
+    assert shapes["deepstack_visual_embeds"] == [3, 4, HIDDEN]
+
+
 def test_shared_prefill_ir_takes_any_query_width():
     # CPU/GPU: one IR, past fixed, query width (and mask length) dynamic.
     m = toy_stage()

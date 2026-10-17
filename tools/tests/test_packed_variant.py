@@ -294,6 +294,111 @@ def test_gemma_embed_stage_without_hidden_size(tmp_path):
     assert list(port.get_shape()) == [1, 3, HIDDEN]
 
 
+def toy_qwen_stage(deepstack_layers: int = 0):
+    """A causal stage like Qwen VL's: one full-attention mask producer, M-RoPE
+    `position_ids [3, ?, ?]`, and (Qwen3-VL) the DeepStack inputs."""
+    rng = np.random.default_rng(3)
+    x = ops.parameter([1, -1, HIDDEN], ov.Type.f32, name="inputs_embeds")
+    x.output(0).set_names({"inputs_embeds"})
+    mask = ops.parameter([1, -1], ov.Type.i64, name="attention_mask")
+    mask.output(0).set_names({"attention_mask"})
+    pos = ops.parameter([3, -1, -1], ov.Type.i64, name="position_ids")
+    pos.output(0).set_names({"position_ids"})
+    params = [x, mask, pos]
+    shared = _mask_producer(mask, None, x, "__module.model/aten::mask/Slice_11", False)
+    # Fold the 3 position rows back in so the rank-3 port is reachable:
+    # sum axis 0 -> [1, seq], trailing unsqueeze -> [1, seq, 1] broadcasts.
+    pbias = ops.convert(ops.reduce_sum(pos, _const([0]), False), ov.Type.f32)
+    pbias = ops.unsqueeze(pbias, _const([2]))
+    h = ops.add(x.output(0), ops.multiply(pbias, ops.constant(np.float32(0.01)))).output(0)
+    if deepstack_layers:
+        vpm = ops.parameter([1, -1], ov.Type.i64, name="visual_pos_masks")
+        vpm.output(0).set_names({"visual_pos_masks"})
+        dse = ops.parameter([-1, -1, HIDDEN], ov.Type.f32, name="deepstack_visual_embeds")
+        dse.output(0).set_names({"deepstack_visual_embeds"})
+        params += [vpm, dse]
+        cum = ops.cumsum(ops.reshape(vpm, _const([-1]), False), _const(0))
+        idx = ops.maximum(ops.subtract(cum, _const(1)), _const(0))
+        layer0 = ops.gather(dse, _const(0), _const(0))
+        rows = ops.gather(layer0, idx, _const(0))
+        h = ops.add(h, ops.reshape(rows, _const([1, -1, HIDDEN]), False)).output(0)
+    results = []
+    for li in range(3):
+        def proj():
+            w = ops.constant(rng.standard_normal((HIDDEN, HEADS * HD)).astype(np.float32) * 0.3)
+            y = ops.reshape(ops.matmul(h, w, False, False), _const([0, 0, HEADS, HD]), True)
+            return ops.transpose(y, _const([0, 2, 1, 3]))
+        q, k_new, v_new = proj(), proj(), proj()
+        kv = {}
+        for kind, new in (("key", k_new), ("value", v_new)):
+            name = f"past_key_values.{li}.{kind}"
+            past = ops.parameter([1, HEADS, PAST, HD], ov.Type.f16, name=name)
+            past.output(0).set_names({name})
+            params.append(past)
+            cat = ops.concat([ops.convert(past, ov.Type.f32), new], 2)
+            r = ops.result(ops.convert(cat, ov.Type.f16))
+            r.output(0).set_names({f"present.{li}.{kind}"})
+            results.append(r)
+            kv[kind] = cat
+        att = ops.scaled_dot_product_attention(q, kv["key"], kv["value"], shared)
+        att = ops.reshape(ops.transpose(att, _const([0, 2, 1, 3])), _const([0, 0, -1]), True)
+        wo = ops.constant(rng.standard_normal((HEADS * HD, HIDDEN)).astype(np.float32) * 0.3)
+        h = ops.add(h, ops.matmul(att, wo, False, False)).output(0)
+    out = ops.result(h)
+    out.output(0).set_names({"hidden_states"})
+    return ov.Model([out] + results, params, "toy_qwen_static")
+
+
+def _pin_qwen(m, seq=1, deepstack_layers=0):
+    shapes = {"inputs_embeds": [1, seq, HIDDEN], "attention_mask": [1, PAST + seq],
+              "position_ids": [3, 1, seq]}
+    if deepstack_layers:
+        shapes["visual_pos_masks"] = [1, seq]
+        shapes["deepstack_visual_embeds"] = [deepstack_layers, seq, HIDDEN]
+    m.reshape(shapes)
+    return m
+
+
+def test_packed_mrope_position_ids_pinned_to_three_rows():
+    seq = 4
+    packed, ctx = pv.build_packed_model(_pin_qwen(toy_qwen_stage()), seq, True, HIDDEN)
+    port = next(i for i in packed.inputs if "position_ids" in i.get_names())
+    assert list(port.get_shape()) == [3, 1, seq]
+    assert ctx == PAST + seq
+
+
+def test_packed_deepstack_inputs_pinned_to_seq_width():
+    seq = 4
+    packed, _ = pv.build_packed_model(
+        _pin_qwen(toy_qwen_stage(3), seq, 3), seq, True, HIDDEN, deepstack_layers=3)
+    shapes = {i.get_any_name(): list(i.get_shape()) for i in packed.inputs}
+    assert shapes["position_ids"] == [3, 1, seq]
+    assert shapes["visual_pos_masks"] == [1, seq]
+    assert shapes["deepstack_visual_embeds"] == [3, seq, HIDDEN]
+    # The 2D attention_mask is replaced by the 4D per-row mask as usual.
+    assert "attn_mask_4d" in shapes and "attention_mask" not in shapes
+
+
+def test_packed_deepstack_layer_count_from_tree_config(tmp_path):
+    stage = tmp_path / "stage_0"
+    stage.mkdir()
+    ov.save_model(_pin_qwen(toy_qwen_stage(3), 1, 3),
+                  str(stage / "openvino_model.xml"), compress_to_fp16=False)
+    (stage / "stage_config.json").write_text(json.dumps({
+        "stateful": False, "has_embed": True, "static_seq": 1,
+        "static_context": PAST + 1, "layer_start": 0, "layer_end": 3,
+        "position_rows": 3, "hidden_size": HIDDEN}))
+    (tmp_path / "pipeline_config.json").write_text(json.dumps({
+        "vision": {"family": "qwen3_vl", "mrope_rows": 3, "deepstack_layers": 3}}))
+    assert pv.tree_deepstack_layers(str(stage)) == 3
+    cfg = pv.write_packed_variant(str(stage), slots=2, packed_seq=4)
+    assert cfg["packed_seq"] == 4
+    packed = ov.Core().read_model(str(stage / "openvino_packed_model.xml"))
+    shapes = {i.get_any_name(): list(i.get_shape()) for i in packed.inputs}
+    assert shapes["deepstack_visual_embeds"] == [3, 4, HIDDEN]
+    assert shapes["position_ids"] == [3, 1, 4]
+
+
 def test_hidden_size_falls_back_to_the_tree_config(tmp_path):
     stage = tmp_path / "stage_0"
     stage.mkdir()
