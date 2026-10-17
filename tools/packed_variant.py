@@ -237,15 +237,25 @@ def build_packed_model(
     # A port's canonical name may be an alias: the Gemma surgery's stage 0
     # input is `grafted_inputs_embeds`, aliased `inputs_embeds`.
     names = {n for p in packed.inputs for n in p.get_names()}
-    # A VLM tree's stage 0 takes rank 0's embedding rows (`inputs_embeds`,
-    # tools/vlm_surgery/static_variant.py) instead of ids.
-    main_name = next(
-        n for n in ("input_ids", "inputs_embeds", "hidden_states") if n in names
-    )
+    # The main input follows `has_embed`: an embed stage takes ids (or, on a
+    # VLM tree, rank 0's embedding rows `inputs_embeds`,
+    # tools/vlm_surgery/static_variant.py), every later stage `hidden_states`.
+    # Picking it by name instead would pack a stray `input_ids` on a later
+    # stage and leave its `hidden_states` at the decode shape.
+    mains = [n for n in ("input_ids", "inputs_embeds", "hidden_states") if n in names]
+    if len(mains) > 1:
+        raise RuntimeError(
+            f"stage takes {mains}: more than one main input, so which one to pack "
+            "is ambiguous (an embed stage takes input_ids or inputs_embeds, a later "
+            "stage hidden_states only)")
+    want = ("input_ids", "inputs_embeds") if has_embed else ("hidden_states",)
+    if not mains or mains[0] not in want:
+        raise RuntimeError(
+            f"{'embed' if has_embed else 'non-embed'} stage has no "
+            f"{' / '.join(want)} input (it takes {mains or 'none'})")
+    main_name = mains[0]
     if main_name != "input_ids" and not hidden_size:
         raise RuntimeError(f"{main_name} input needs a hidden size and none was found")
-    if has_embed and main_name == "hidden_states":
-        raise RuntimeError("embed stage has no input_ids / inputs_embeds input")
     shape_map = {}
     canon = ("input_ids", "inputs_embeds", "hidden_states", "position_ids",
              "token_type_ids", "visual_pos_masks", "deepstack_visual_embeds")
