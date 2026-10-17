@@ -17,13 +17,25 @@ in [rfcs/vlm-support.md](rfcs/vlm-support.md). Video and audio are not supported
 - `data:` URLs (PNG, JPEG, WEBP, GIF) work by default. `https://` URLs only with
   `--api-allow-image-urls` (public addresses only, each redirect re-checked).
 - Up to 8 images per request. An image over about 1 MP is downscaled (`detail: "low"`:
-  512x512). The request body may carry 20 MiB of images on top of the text limit.
+  512x512; `"original"` is served as `"high"`). The chat and Responses bodies may carry
+  20 MiB of images on top of the text limit; the text itself (everything but image URLs)
+  stays held to that limit (`413`), and `/v1/completions` gets no image allowance.
+- A request's images may declare 100 MP of source pixels together (two images at the
+  50 MP per-image cap), checked from their headers before any decode. Two images decode
+  at once across the server; a request that waits more than 10 s for a decode slot gets
+  the capacity `503` with `Retry-After`.
 - Images can sit anywhere in a user message and in earlier turns.
 - `/v1/models` lists `input_modalities` (`["text", "image"]` when images are accepted).
 - Errors are OpenAI-shaped: a model or tree without image input answers `400`, an
   undecodable image `400`, a prompt that does not fit the context `413`
   (`context_length_exceeded`). Text that spells a model's own image tag (for example
-  `<|image|>` or `[IMG]`) is refused with `400`.
+  `<|image|>` or `[IMG]`) is refused with `400`. On `ov-genai` that covers GenAI's
+  universal `<ov_genai_image_N>` / `<ov_genai_video_N>` and the export's native image and
+  video tags (by `config.json` `model_type`; every known one for an unlisted type), which
+  GenAI would otherwise read as media slots.
+- A text-only content array joins its text parts back to back, as an image message's do
+  (and as Hugging Face's templates write one). The deprecated `function` role is served as
+  `tool`.
 
 ### The Responses API
 
@@ -368,3 +380,7 @@ matching the stateful tree (223), and the packed concurrent test too. Gemma 3 12
   turn prefills only its new text: about 1-1.5 s instead of 11-14 s on CPU (Ministral-3-3B,
   Gemma 4 E4B, Qwen3.6-35B-A3B on two machines). Static and packed shards still re-prefill
   images; the single-box `qwen35` prefix cache keys on the image too.
+- The image encode cache and image warm-resume are shared across all callers of a server,
+  as the prefix cache is: the API sets no tenant, so a caller who has an image can tell
+  from the latency whether someone sent the same image recently. Serve callers who must
+  not learn that from separate servers.
