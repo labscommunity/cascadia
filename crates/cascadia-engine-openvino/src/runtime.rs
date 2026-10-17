@@ -5842,6 +5842,11 @@ impl Engine for OvRuntimeEngine {
             if self.static_kv.is_some() && self.hidden_size > 0 {
                 let zero = vec![0f32; self.hidden_size];
                 let hs = self.hidden_size;
+                // An M-RoPE relay reads its positions from the wire frame;
+                // warm it with one zero column in place of that frame.
+                if self.vision_mrope() {
+                    self.step_positions = vec![0; crate::qwen_vl_vision::MROPE_ROWS];
+                }
                 if let Err(e) = self.run_relay(&zero, [1, 1, hs], 0) {
                     warn!(error = %e, "ov-runtime relay warmup (decode model) failed");
                 }
@@ -5853,6 +5858,7 @@ impl Engine for OvRuntimeEngine {
                 if let Some(sk) = self.static_kv.as_mut() {
                     sk.reset();
                 }
+                self.step_positions.clear();
                 self.position = 0;
                 info!("ov-runtime warmup ok (static relay)");
             } else {
