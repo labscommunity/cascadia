@@ -46,6 +46,8 @@ use futures::stream;
 use tokenizers::Tokenizer;
 use tracing::{error, info, warn};
 
+use crate::pass_timing::{ms, PassTiming};
+
 /// Hidden width of shard trees exported before `manifest.hidden_size`
 /// existed (the Qwen3.6-35B-A3B surgery, hidden 2048). Newer manifests
 /// carry the width explicitly; the 27B dense export is 5120.
@@ -984,6 +986,9 @@ impl Builder for Qwen36Builder {
             last_final_hidden: None,
             pending_decision: None,
             last_logits: Vec::new(),
+            timing: PassTiming::default(),
+            last_timing: None,
+            pass_started: None,
         }))
     }
 }
@@ -1558,6 +1563,13 @@ pub struct Qwen36Engine {
     /// Pipeline last rank: the latest FORWARD's last-position logits row, kept only while a
     /// decision is pending (a Verbalizer head reads it at FRAME_DECIDE_RUN).
     last_logits: Vec<f32>,
+    /// Single box: the timings of the pass being served (`crate::pass_timing`), reset at each
+    /// admission. Chat turns fill it too but never log it.
+    timing: PassTiming,
+    /// The timings of the last finished decision pass (read by tests).
+    last_timing: Option<PassTiming>,
+    /// Single box: when the pass being served was popped from `pending` (`PassTiming::total`).
+    pass_started: Option<Instant>,
 }
 
 /// In-flight task state. `step()` advances one token per call so the
@@ -1866,6 +1878,7 @@ impl Qwen36Engine {
         // run on a value an earlier task left in the request.
         let lora_scale = le_bytes_f32(&[self.lora_scale]);
         for (j, st) in self.stages.iter_mut().enumerate() {
+            let t_in = Instant::now();
             let names = st.input_names().map_err(map_ov)?;
             for name in &names {
                 match name.as_str() {
@@ -1902,10 +1915,17 @@ impl Qwen36Engine {
                     }
                 }
             }
-            if let Err(e) = st.infer() {
+            self.timing.host_copy += t_in.elapsed();
+            let t_inf = Instant::now();
+            let r = st.infer();
+            if let Some(s) = self.timing.stage_infer.get_mut(j) {
+                *s += t_inf.elapsed();
+            }
+            if let Err(e) = r {
                 self.infer_failed = true;
                 return Err(map_ov(e));
             }
+            let t_out = Instant::now();
             let (dtype, _shape, bytes) = st.output(0).map_err(map_ov)?;
             if !matches!(dtype, DType::F32) {
                 return Err(EngineError::Backend(format!(
@@ -1917,6 +1937,7 @@ impl Qwen36Engine {
                 final_hidden = Some(f32_from_le(&fh));
             }
             hidden = f32_from_le(&bytes);
+            self.timing.host_copy += t_out.elapsed();
         }
         self.last_final_hidden = final_hidden;
         Ok(hidden)
@@ -1926,7 +1947,10 @@ impl Qwen36Engine {
     /// LAST position's logits row. Single-box only (needs the full chain).
     fn run_span(&mut self, toks: &[u32], t0: usize) -> EngineResult<Vec<f32>> {
         let n = toks.len();
+        let t_embed = Instant::now();
         let e = self.embed_seq(toks)?;
+        self.timing.embed += t_embed.elapsed();
+        self.timing.add_span(n);
         let out = self.chain_pass(&e, t0, t0 + n)?;
         if let Some(fh) = self.last_final_hidden.take() {
             if let Some(c) = self.active.as_mut().and_then(|t| t.collector.as_mut()) {
@@ -2014,6 +2038,7 @@ impl Qwen36Engine {
         // gets. A dirty engine escalates the same way: the cheap reset is exactly what failed.
         let recreate = self.state_restored || self.stages_dirty;
         let mut all_ok = true;
+        let reset_started = Instant::now();
         for (i, st) in self.stages.iter_mut().enumerate() {
             let t0 = Instant::now();
             let r = if recreate {
@@ -2038,6 +2063,8 @@ impl Qwen36Engine {
                 error!(error = %e, recreate, "qwen36: stage reset failed; state may be dirty");
             }
         }
+        self.timing.reset = reset_started.elapsed();
+        self.timing.recreate = recreate;
         if all_ok {
             self.state_restored = false;
         }
@@ -2240,16 +2267,40 @@ impl Qwen36Engine {
         let d = t.decision.as_ref().expect("decision task");
         let empty = crate::decision::Collector::new(cascadia_types::HiddenNeed::None, self.hidden);
         let col = t.collector.as_ref().unwrap_or(&empty);
+        let d_kind = match &d.head {
+            cascadia_types::ReadoutHead::Verbalizer { .. } => "verbalizer",
+            cascadia_types::ReadoutHead::Pointer { .. } => "pointer",
+            cascadia_types::ReadoutHead::Joint { .. } => "joint",
+        };
+        let t_head = Instant::now();
         let result = match self.decision_assets.as_mut() {
             Some(a) => crate::decision::run_head(&d.head, a, &d.prompt_ids, &t.logits, col),
             None => Err("decision_unsupported: no head assets".into()),
         };
+        self.timing.head = t_head.elapsed();
         match result {
             Ok(logits) => {
                 let n = t.prompt_ids.len() as u32;
                 let id = t.task_id.clone();
                 self.active = None;
                 self.reset_all();
+                if let Some(started) = self.pass_started.take() {
+                    self.timing.total = started.elapsed();
+                }
+                let t = &self.timing;
+                tracing::debug!(
+                    target: "cascadia::perf",
+                    task = %id, head = d_kind, prompt = t.prompt, warm_prefix = t.warm_prefix,
+                    prefilled = t.prefilled(), spans = t.spans, span_max = t.span_max,
+                    admit_ms = ms(t.admit), admit_reset_ms = ms(t.admit_reset),
+                    restore_ms = ms(t.restore), prime_ms = ms(t.prime),
+                    set_state_ms = ms(t.set_state), snapshot_ms = ms(t.snapshot),
+                    embed_ms = ms(t.embed), infer_ms = ms(t.infer()), stage_ms = %t.stage_ms(),
+                    host_copy_ms = ms(t.host_copy), head_ms = ms(t.head), reset_ms = ms(t.reset),
+                    recreate = t.recreate, total_ms = ms(t.total),
+                    "qwen36 decision pass done"
+                );
+                self.last_timing = Some(self.timing.clone());
                 vec![decision_final_chunk(id, n, logits)]
             }
             Err(e) => self.finalize_error(head_failure_reason(e)),
@@ -3743,6 +3794,9 @@ impl Qwen36Engine {
             }
             self.scrub_failed_task();
             let task = self.pending.remove(0);
+            let admit_started = Instant::now();
+            self.pass_started = Some(admit_started);
+            self.timing = PassTiming::new(self.stages.len(), 0);
             if let Some(refusal) = self.engine_failed_refusal(&task.task_id) {
                 return refusal;
             }
@@ -3961,6 +4015,11 @@ impl Qwen36Engine {
                 );
             }
             self.want_final_hidden = task.decision.as_ref().is_some_and(head_reads_hidden);
+            // `reset` is still zero unless this admission ran its own `reset_all` (a cold pass).
+            self.timing.admit_reset = self.timing.reset;
+            self.timing.prompt = prompt_ids.len();
+            self.timing.warm_prefix = warm_prefix;
+            self.timing.admit = admit_started.elapsed();
             self.active = Some(ActiveTask {
                 task_id: task.task_id,
                 tenant: task.tenant,
@@ -4342,6 +4401,7 @@ impl Qwen36Engine {
             if let Some((parts, len)) = self.prefix_cache.longest_prefix(prompt_ids) {
                 let started = Instant::now();
                 if self.restore_local_parts(&parts) {
+                    self.timing.restore = started.elapsed();
                     self.last_restore_bytes = parts.iter().map(Vec::len).sum();
                     // Attention depth from the blob, not the token count (see kv_seq_from_blob).
                     let warm = crate::prefix_cache::kv_seq_from_parts(&parts)
@@ -4386,6 +4446,7 @@ impl Qwen36Engine {
                 debug_assert_eq!(parts.len(), self.stages.len());
                 let stored = self.prefix_cache.insert(key, parts);
                 let secs = started.elapsed().as_secs_f64();
+                self.timing.snapshot += Duration::from_secs_f64(secs);
                 if bytes > 0 && secs > 0.0 {
                     self.refresh_costs.snapshot_s_per_byte = Some(secs / bytes as f64);
                 }
@@ -4512,7 +4573,10 @@ impl Qwen36Engine {
         // inference. The fold's garbage state is overwritten by the restore.
         if !self.primed {
             let zeros = vec![0f32; self.hidden];
-            if let Err(e) = self.chain_pass(&zeros, 0, 1) {
+            let t_prime = Instant::now();
+            let primed = self.chain_pass(&zeros, 0, 1);
+            self.timing.prime += t_prime.elapsed();
+            if let Err(e) = primed {
                 warn!(error = %e, "qwen36: priming fold before restore failed; cold reprefill");
                 self.state_restored = true;
                 return false;
@@ -4525,7 +4589,10 @@ impl Qwen36Engine {
             // points at layout mapping, conv/ssm-only at recurrent state handled as sequence-addressable.
             #[cfg(feature = "kv_coord")]
             crate::kv_coordination::log_blob_tensors("qwen36_restore", 0, part);
-            if let Err(e) = st.set_state_blob(part) {
+            let t_set = Instant::now();
+            let set = st.set_state_blob(part);
+            self.timing.set_state += t_set.elapsed();
+            if let Err(e) = set {
                 warn!(error = %e, "qwen36: set_state_blob failed; cold reprefill");
                 // A partial apply still dirtied earlier stages — make the next reset scrub properly.
                 self.state_restored = true;
@@ -4947,6 +5014,9 @@ mod tests {
             last_final_hidden: None,
             pending_decision: None,
             last_logits: Vec::new(),
+            timing: PassTiming::default(),
+            last_timing: None,
+            pass_started: None,
         }
     }
 
@@ -7083,6 +7153,31 @@ mod tests {
             0,
             "a baked tree keeps the default scope"
         );
+    }
+
+    #[test]
+    fn a_decision_pass_records_its_timing() {
+        let (mut e, _, _) = mock_box(false);
+        e.submit(verbalizer_pass("t", None)).unwrap();
+        assert!(run_to_final(&mut e).error.is_none());
+        let t = e
+            .last_timing
+            .clone()
+            .expect("a finished decision pass records its timing");
+        assert_eq!(
+            (t.prompt, t.warm_prefix, t.prefilled(), t.spans, t.span_max),
+            (4, 0, 4, 1, 4)
+        );
+        assert_eq!(t.stage_infer.len(), 2, "one entry per local stage");
+        assert!(!t.recreate, "a cold pass takes the cheap reset");
+    }
+
+    #[test]
+    fn a_chat_turn_records_no_decision_timing() {
+        let (mut e, _, _) = mock_box(false);
+        e.submit(chat("c", None)).unwrap();
+        assert!(run_to_final(&mut e).error.is_none());
+        assert!(e.last_timing.is_none());
     }
 
     #[test]
