@@ -407,8 +407,7 @@ def build_feeds(model, hidden_size: int, hidden=None, embeds=None):
 
 
 def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=None,
-               weights=None, lora=None, lora_scale=None, final_hidden=False, tokenizer=None,
-               switchable_lora=False):
+               weights=None, lora=None, lora_scale=None, final_hidden=False, tokenizer=None):
     """Cut the official int4 OV IR in `model_dir` into `num_stages` stage
     dirs under `output_dir` + manifest + aux files. Entry point for
     `cascadia shard` dispatch (export_shards.py) and for main() below.
@@ -422,10 +421,6 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
         it, an explicit value overrides it (with a warning when they differ).
         The grafted-branch total over all stages must equal the adapter's
         target count.
-      * `switchable_lora`: the graft leaves the scale out of its constants and
-        every stage with a branch gains a scalar f32 input `lora_scale` (the
-        trained scale = the grafted model, 0 = the base model); see
-        weight_swap.graft_lora. Needs `lora`.
       * `final_hidden`: the last stage also outputs the final-norm hidden
         (output 1, `final_hidden`); recorded as manifest `final_hidden_output`.
       * `tokenizer`: a tokenizer.json that replaces the one the tree would
@@ -446,8 +441,6 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
             "judge a --weights/--lora export; drop --validate (decision trees are "
             "checked by the golden/parity gates instead)"
         )
-    if switchable_lora and not lora:
-        raise SystemExit("--switchable-lora needs --lora: there is no graft to switch")
     if tokenizer is not None and not os.path.isfile(tokenizer):
         raise SystemExit(f"tokenizer override {tokenizer} not found")
     import openvino as ov
@@ -513,9 +506,7 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
             print(f"  stage{i}: swapped layers {a}..{b} from {weights}", flush=True)
         if lora:
             from weight_swap import graft_lora
-            # only a switchable graft passes the option: a default export stays the call it was
-            g = graft_lora(stage, lora, lora_scale, layers=range(a, b + 1), lm_head=last,
-                           **({"switchable": True} if switchable_lora else {}))
+            g = graft_lora(stage, lora, lora_scale, layers=range(a, b + 1), lm_head=last)
             grafted += g
             print(f"  stage{i}: grafted {len(g)} LoRA branches", flush=True)
         if last and final_hidden:

@@ -7,13 +7,9 @@ use axum::Json;
 use futures::StreamExt;
 use indexmap::IndexMap;
 
-use super::schema::{
-    self, answer_with_legend, Answer, AnswerOut, DecisionRequest, DecisionResponse, QuestionType,
-    ThinkingMode, Usage,
-};
+use super::schema::{self, answer_with_legend, Answer, DecisionRequest, DecisionResponse, Usage};
 use super::DecisionError;
 use crate::AppState;
-use cascadia_types::{DecisionReadout, ReadoutHead, MAX_DECISION_PROMPT};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -45,13 +41,8 @@ fn err(e: DecisionError) -> Response {
 /// return a fixed message per category. The chat handlers' `engine_error_response` echoes
 /// `err.to_string()` and must not be reused here.
 fn decision_engine_error(e: cascadia_engine::EngineError) -> DecisionError {
-    tracing::warn!(error = %e, "decision submit failed");
-    submit_error(&e)
-}
-
-/// [`decision_engine_error`]'s mapping, unlogged.
-fn submit_error(e: &cascadia_engine::EngineError) -> DecisionError {
     use cascadia_engine::EngineError as E;
+    tracing::warn!(error = %e, "decision submit failed");
     match e {
         E::PromptTooLong(_) => DecisionError::TooLong("decision prompt too long".into()),
         E::QueueFull { .. } => DecisionError::Engine("engine at capacity or unavailable".into()),
@@ -62,11 +53,6 @@ fn submit_error(e: &cascadia_engine::EngineError) -> DecisionError {
 /// Engine/head failures: log the detail (paths, OpenVINO text), return a fixed message.
 fn engine_failure(reason: &str) -> DecisionError {
     tracing::warn!(reason, "decision pass failed");
-    failure_error(reason)
-}
-
-/// [`engine_failure`]'s mapping, unlogged.
-fn failure_error(reason: &str) -> DecisionError {
     if reason.starts_with("decision_unsupported") {
         return DecisionError::NotServed;
     }
@@ -101,23 +87,12 @@ fn uncacheable(passes: &[super::Pass], max_total: usize) -> DecisionError {
 /// POST /v1/systemone: the Jev/SystemOne wire format.
 pub async fn decide(State(state): State<AppState>, Json(req): Json<DecisionRequest>) -> Response {
     match evaluate(&state, &req).await {
-        Ok(Evaluated {
-            answers,
-            mut thinking,
-            input_tokens,
-            output_tokens,
-        }) => Json(DecisionResponse {
+        Ok((answers, input_tokens)) => Json(DecisionResponse {
             model: state.model_id.clone(),
-            answers: answers
-                .into_iter()
-                .map(|(id, answer)| {
-                    let thinking = thinking.shift_remove(&id);
-                    (id, AnswerOut { answer, thinking })
-                })
-                .collect(),
+            answers,
             usage: Usage {
                 input_tokens,
-                output_tokens,
+                output_tokens: 0,
             },
         })
         .into_response(),
@@ -125,174 +100,13 @@ pub async fn decide(State(state): State<AppState>, Json(req): Json<DecisionReque
     }
 }
 
-/// What [`evaluate`] returns: the answers in request order, System 2's report for each answer
-/// that has one, the prompt tokens prefilled and the tokens System 2 generated.
-pub(crate) struct Evaluated {
-    pub answers: IndexMap<String, Answer>,
-    pub thinking: IndexMap<String, schema::Thinking>,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-}
-
-/// A request's System 2 settings resolved against the profile (serve_decide `decide`), and the
-/// chat template's frame its prompts go in.
-struct ThinkPlan {
-    mode: ThinkingMode,
-    threshold: f64,
-    budget: usize,
-    reasoning: bool,
-    mix: f64,
-    pre: String,
-    post: String,
-}
-
-/// One question's System 2 prompt and its length in tokens.
-struct ThinkPrompt {
-    qid: String,
-    text: String,
-    len: usize,
-    /// Its worst case was reserved up front. Always true under `on` (or the request is a 413);
-    /// under `auto` a question that did not fit answers from System 1 (`reason: "budget"`).
-    fits: bool,
-}
-
-/// The default `think_budget`: 4096 tokens, or `max_tokens` when smaller. The reference's
-/// default is the context window, which on our hardware is hours of decoding per question and
-/// more than a request's `max_total_tokens` can hold.
-pub const DEFAULT_THINK_BUDGET: usize = 4096;
-
-/// The request's [`ThinkPlan`], or `None` when nothing thinks: the mode is `off` (the default),
-/// or the codec has no System 2 and no System 2 field was set. Cheap checks only, run before the
-/// request takes a permit; every refusal is a 400.
-fn plan_thinking(
-    state: &AppState,
-    svc: &super::DecisionService,
-    req: &DecisionRequest,
-) -> Result<Option<ThinkPlan>, DecisionError> {
-    let bad = |m: String| Err(DecisionError::BadRequest(m));
-    let Some(jev) = svc.codec.as_jev() else {
-        let set = req.thinking.is_some_and(|m| m != ThinkingMode::Off)
-            || req.threshold.is_some()
-            || req.think_budget.is_some()
-            || req.return_reasoning == Some(true);
-        if set {
-            return bad(
-                "thinking, threshold, think_budget and return_reasoning apply to JEV only".into(),
-            );
-        }
-        return Ok(None);
-    };
-    let profile = jev.system2();
-    let mode = req.thinking.unwrap_or(profile.thinking);
-    if mode == ThinkingMode::Off {
-        return Ok(None);
-    }
-    // A tree that cannot think at all (a profile default that thinks is refused at load).
-    if let Some(why) = jev.system2_refusal() {
-        return bad(why);
-    }
-    // Disabled at startup (with a warning) when the template is missing or does not render: a
-    // profile default then serves System 1 alone; asking for thinking is a 400.
-    let Some(frame) = state.think_frame.clone() else {
-        if req.thinking.is_some() {
-            return bad(
-                "thinking is disabled on this server: the model's chat template did not load or \
-                 render (see the startup log)"
-                    .into(),
-            );
-        }
-        return Ok(None);
-    };
-    // serve_decide refuses a score question asked to think; under the profile's default it just
-    // answers without thinking.
-    if req.thinking.is_some() {
-        if let Some((id, _)) = req
-            .questions
-            .iter()
-            .find(|(_, q)| q.qtype == QuestionType::Score)
-        {
-            return bad(format!(
-                "thinking is supported for noul and choice questions; {id} is a score question"
-            ));
-        }
-    }
-    let labels = jev.answer_label_count();
-    if let Some((id, n)) = req
-        .questions
-        .iter()
-        .filter(|(_, q)| q.qtype == QuestionType::Choice)
-        .map(|(id, q)| (id, q.choice_criteria().len()))
-        .find(|&(_, n)| n > labels)
-    {
-        return bad(format!(
-            "{id}: thinking labels at most {labels} options, got {n}"
-        ));
-    }
-    let threshold = req.threshold.unwrap_or(profile.threshold);
-    if !(0.0..=1.0).contains(&threshold) {
-        return bad(format!("threshold must be in [0, 1], got {threshold}"));
-    }
-    let budget = req
-        .think_budget
-        .unwrap_or(DEFAULT_THINK_BUDGET.min(svc.max_tokens));
-    if budget == 0 || budget > svc.max_tokens {
-        return bad(format!(
-            "think_budget must be 1..={} tokens, got {budget}",
-            svc.max_tokens
-        ));
-    }
-    let (pre, post) = (frame.0.clone(), frame.1.clone());
-    Ok(Some(ThinkPlan {
-        mode,
-        threshold,
-        budget,
-        reasoning: req.return_reasoning.unwrap_or(false),
-        mix: profile.mix,
-        pre,
-        post,
-    }))
-}
-
-/// Every question that may think (all but score questions) with its System 2 prompt, and the
-/// tokens the read-back appends after the thought. Encoded up front, so the request's budget
-/// counts System 2 before its first pass.
-fn think_prompts(
-    svc: &super::DecisionService,
-    req: &DecisionRequest,
-    pre: &str,
-    post: &str,
-    cancel: &AtomicBool,
-) -> Result<(Vec<ThinkPrompt>, usize), DecisionError> {
-    let Some(jev) = svc.codec.as_jev() else {
-        return Err(DecisionError::Engine("decision engine error".into()));
-    };
-    let state = jev.rendered_state(req);
-    let tail = jev.encode_text(&jev.read_back_tail())?.len();
-    let mut out = Vec::new();
-    for (qid, q) in &req.questions {
-        super::check_cancel(cancel)?;
-        if q.qtype == QuestionType::Score {
-            continue;
-        }
-        let text = jev.think_prompt(req, qid, &state, pre, post);
-        let len = jev.encode_text(&text)?.len();
-        out.push(ThinkPrompt {
-            qid: qid.clone(),
-            text,
-            len,
-            fits: false,
-        });
-    }
-    Ok((out, tail))
-}
-
-/// The core both wire formats share: validate, encode, budget, run every pass (System 2's
-/// included), and return the answers in request order. Errors are `DecisionError`s, so each
+/// The core both wire formats share: validate, encode, budget, run every pass, and return the
+/// answers in request order plus the prompt tokens prefilled. Errors are `DecisionError`s, so each
 /// route renders them in its own format (SystemOne `{"error": msg}`, OpenAI `{"error": {...}}`).
 pub(crate) async fn evaluate(
     state: &AppState,
     req: &DecisionRequest,
-) -> Result<Evaluated, DecisionError> {
+) -> Result<(IndexMap<String, Answer>, u64), DecisionError> {
     let started = std::time::Instant::now();
     let Some(svc) = state.decisions.clone() else {
         return Err(DecisionError::NotServed);
@@ -306,7 +120,6 @@ pub(crate) async fn evaluate(
             "strategy applies to JEV only".into(),
         ));
     }
-    let plan = plan_thinking(state, &svc, req)?;
     // Take the permit BEFORE tokenizing: encode() is CPU work proportional to the request.
     // Decisions have their own pool: they never take chat's permits, nor chat theirs.
     // Counted like chat (SEC-5): a capacity refusal, the request total and the in-flight gauge.
@@ -356,20 +169,6 @@ pub(crate) async fn evaluate(
     // length, Clef's schema size and JEV's early pass cap as 413).
     let (mut passes, reserve) = encoded?;
     check_pass_lengths(&passes, svc.max_tokens)?;
-    // System 2's prompts, for every question that may think (under `auto`, before System 1 says
-    // which will).
-    let thinks = match &plan {
-        Some(p) => {
-            let (svc2, req2, cancel2) = (svc.clone(), req.clone(), cancel.0.clone());
-            let (pre, post) = (p.pre.clone(), p.post.clone());
-            let prompts = off_executor(&svc, &held, move || {
-                think_prompts(&svc2, &req2, &pre, &post, &cancel2)
-            })
-            .await??;
-            Some(prompts)
-        }
-        None => None,
-    };
     // A second round (JEV's tournament finals) is counted now, at its worst case, so a request
     // is refused before its first pass rather than half way.
     let total = super::prefill_work(&passes, svc.prefix_reuse) + reserve;
@@ -379,52 +178,6 @@ pub(crate) async fn evaluate(
             svc.max_total_tokens
         )));
     }
-    // System 2 too, per question that may think, at its worst case: its prompt and
-    // `think_budget` generated, then the read-back over both plus the tail. Its prompt part is
-    // capped like any pass, the read-back by the engine's decision prompt cap (the model's
-    // window, or MAX_DECISION_PROMPT). `on` refuses a request that cannot afford every one
-    // (413); `auto` reserves question by question and lets one that does not fit answer from
-    // System 1 alone, so `auto` never makes a request fail.
-    let mut thinks = thinks;
-    if let (Some(p), Some((prompts, tail))) = (&plan, &mut thinks) {
-        let cap = svc
-            .codec
-            .as_jev()
-            .map_or(MAX_DECISION_PROMPT, |j| j.read_back_cap());
-        let strict = p.mode == ThinkingMode::On;
-        let mut left = svc.max_total_tokens - total;
-        let mut think_need = 0usize;
-        for t in prompts.iter_mut() {
-            let read_back = t.len + p.budget + *tail;
-            let need = t.len + p.budget + read_back;
-            t.fits = t.len + *tail <= svc.max_tokens && read_back <= cap && need <= left;
-            if t.fits {
-                left -= need;
-            } else if strict {
-                if t.len + *tail > svc.max_tokens {
-                    return Err(super::pass_too_long(t.len + *tail, svc.max_tokens));
-                }
-                if read_back > cap {
-                    return Err(DecisionError::TooLong(format!(
-                        "with think_budget {} a read-back pass can reach {read_back} tokens; \
-                         the engine's limit (the model's window, at most \
-                         {MAX_DECISION_PROMPT}) is {cap}",
-                        p.budget
-                    )));
-                }
-            }
-            think_need += need;
-        }
-        if strict && prompts.iter().any(|t| !t.fits) {
-            return Err(DecisionError::TooLong(format!(
-                "this request needs up to {} tokens, {think_need} of them for thinking at \
-                 think_budget {}; the per-request limit is {} (lower think_budget)",
-                total + think_need,
-                p.budget,
-                svc.max_total_tokens
-            )));
-        }
-    }
     dump_passes(state, &svc, &req, &held, &passes, 1).await;
     super::mark_required_reuse(&mut passes, svc.max_total_tokens, svc.prefix_reuse);
     // Every question's per-pass probabilities, in submission order.
@@ -432,8 +185,6 @@ pub(crate) async fn evaluate(
     let passes_started = std::time::Instant::now();
     let mut input_tokens = run_passes(state, &svc, &req, &passes, &mut probs).await?;
     let mut passes_d = passes_started.elapsed();
-    // The tokens spent so far by our own count (System 2's checks continue from it).
-    let mut counted = super::prefill_work(&passes, svc.prefix_reuse);
     // Only a request that reserved tokens has a second round (a final is never empty), so every
     // other request skips this encode.
     if reserve > 0 {
@@ -462,9 +213,8 @@ pub(crate) async fn evaluate(
         let second_started = std::time::Instant::now();
         input_tokens += run_passes(state, &svc, &req, &second, &mut probs).await?;
         passes_d += second_started.elapsed();
-        counted = spent;
     }
-    let mut dists: IndexMap<String, Vec<f64>> = IndexMap::with_capacity(req.questions.len());
+    let mut answers = IndexMap::with_capacity(req.questions.len());
     for (id, q) in &req.questions {
         let Some(p) = probs
             .get(id)
@@ -487,41 +237,11 @@ pub(crate) async fn evaluate(
         if !p.iter().all(|x| x.is_finite()) {
             return Err(engine_failure("non-finite decision probabilities"));
         }
-        dists.insert(id.clone(), p);
-    }
-    let mut thinking = IndexMap::new();
-    let mut output_tokens = 0u64;
-    if let (Some(plan), Some((prompts, _))) = (&plan, thinks) {
-        // Once one System 2 task has failed (`auto`; `on` has returned the error), the request
-        // submits no more engine work: whatever failed may still hold the engine (a scrub that
-        // blocks runs at the next task's admission), so the rest answer from System 1.
-        let mut failed = false;
-        for t in prompts {
-            let report = think(
-                state,
-                &svc,
-                &held,
-                &req,
-                plan,
-                &t,
-                failed,
-                &mut dists,
-                &mut counted,
-                &mut input_tokens,
-                &mut output_tokens,
-            )
-            .await?;
-            failed |= report.reason == Some(ERROR);
-            thinking.insert(t.qid, report);
-        }
-    }
-    let mut answers = IndexMap::with_capacity(req.questions.len());
-    for (id, q) in &req.questions {
         let legend = match q.qtype {
             schema::QuestionType::Score => svc.codec.legend(q),
             _ => None,
         };
-        answers.insert(id.clone(), answer_with_legend(q, &dists[id], legend));
+        answers.insert(id.clone(), answer_with_legend(q, &p, legend));
     }
     tracing::debug!(
         target: "cascadia::perf",
@@ -533,336 +253,7 @@ pub(crate) async fn evaluate(
         total_ms = started.elapsed().as_secs_f64() * 1e3,
         "decision request done"
     );
-    Ok(Evaluated {
-        answers,
-        thinking,
-        input_tokens,
-        output_tokens,
-    })
-}
-
-/// System 2 for one question (serve_decide `decide` and `s2_dist`): when the mode is `on`, or
-/// `auto` and System 1's leading probability is below the threshold, the base model thinks
-/// ([`generate_thought`]), one readout scores the answer labels after the thought, and the
-/// question's distribution becomes `(1 - mix) * p1 + mix * p2`. Returns the answer's report.
-/// `after_failure`: an earlier System 2 task of the request failed, so a question that would
-/// think answers from System 1 (`reason: "error"`) without an engine call.
-#[allow(clippy::too_many_arguments)]
-async fn think(
-    state: &AppState,
-    svc: &Arc<super::DecisionService>,
-    held: &Arc<Held>,
-    req: &Arc<DecisionRequest>,
-    plan: &ThinkPlan,
-    t: &ThinkPrompt,
-    after_failure: bool,
-    dists: &mut IndexMap<String, Vec<f64>>,
-    spent: &mut usize,
-    input_tokens: &mut u64,
-    output_tokens: &mut u64,
-) -> Result<schema::Thinking, DecisionError> {
-    let Some(jev) = svc.codec.as_jev() else {
-        return Err(DecisionError::Engine("decision engine error".into()));
-    };
-    let p1 = dists[&t.qid].clone();
-    let lead = p1.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let wanted = plan.mode == ThinkingMode::On || lead < plan.threshold;
-    let mut report = schema::Thinking {
-        mode: plan.mode,
-        used: wanted && t.fits,
-        reason: (wanted && !t.fits).then_some(BUDGET),
-        threshold: plan.threshold,
-        budget: plan.budget,
-        think_tokens: None,
-        finished_within_budget: None,
-        reasoning: None,
-    };
-    if !report.used {
-        return Ok(report);
-    }
-    if after_failure {
-        report.used = false;
-        report.reason = Some(ERROR);
-        return Ok(report);
-    }
-    let Some(end_think) = jev.end_think_id() else {
-        return Err(DecisionError::Engine("decision engine error".into()));
-    };
-    let thought = match generate_thought(state, &t.text, plan.budget, end_think, t.len).await {
-        Ok(thought) => thought,
-        Err(f) => {
-            // What the engine streamed before it failed was spent all the same. An admitted task
-            // may have prefilled its prompt before failing: the request's own count takes it
-            // (an over-count only tightens the budget); usage bills it once tokens arrived.
-            if matches!(f.fail, TaskFailure::Stream(..)) {
-                *spent += t.len + f.generated;
-            }
-            if f.generated > 0 {
-                *input_tokens += t.len as u64;
-                *output_tokens += f.generated as u64;
-                state
-                    .stats
-                    .tokens_total
-                    .fetch_add(f.generated as u64, std::sync::atomic::Ordering::Relaxed);
-            }
-            return system2_failed(plan, report, f);
-        }
-    };
-    *spent += t.len + thought.ids.len();
-    *input_tokens += thought.prompt_tokens.unwrap_or(t.len as u64);
-    *output_tokens += thought.ids.len() as u64;
-    state.stats.tokens_total.fetch_add(
-        thought.ids.len() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    // The thought without its closing token, as text (the read-back writes `end_think` itself,
-    // as serve_decide does after a thought that ran out of budget too).
-    let body: Vec<u32> = match thought.ids.split_last() {
-        Some((&last, rest)) if last == end_think => rest.to_vec(),
-        _ => thought.ids.clone(),
-    };
-    let (svc2, prompt) = (svc.clone(), t.text.clone());
-    let (text, prompt_ids) = off_executor(svc, held, move || {
-        let jev = svc2
-            .codec
-            .as_jev()
-            .ok_or_else(|| DecisionError::Engine("decision engine error".into()))?;
-        let text = jev.decode(&body)?;
-        let ids = jev.encode_text(&jev.read_back_text(&prompt, &text))?;
-        Ok::<_, DecisionError>((text, ids))
-    })
-    .await??;
-    // Within the worst case admission counted whenever re-encoding the thought gives back no
-    // more tokens than were generated; a tokenizer where it does not stops here rather than
-    // overspend: `auto` answers from System 1 (the thought is still counted in usage), `on` is
-    // a 413.
-    let cap = jev.read_back_cap();
-    let over = prompt_ids.len() > cap || *spent + prompt_ids.len() > svc.max_total_tokens;
-    if over && plan.mode == ThinkingMode::Auto {
-        report.used = false;
-        report.reason = Some(BUDGET);
-        return Ok(report);
-    }
-    if prompt_ids.len() > cap {
-        return Err(super::pass_too_long(prompt_ids.len(), cap));
-    }
-    if *spent + prompt_ids.len() > svc.max_total_tokens {
-        return Err(DecisionError::TooLong(format!(
-            "this request needs {} tokens with thinking; the per-request limit is {}",
-            *spent + prompt_ids.len(),
-            svc.max_total_tokens
-        )));
-    }
-    let q = &req.questions[&t.qid];
-    let n = q.option_keys().len();
-    let readout = DecisionReadout {
-        prompt_ids,
-        head: ReadoutHead::Verbalizer {
-            token_ids: jev.answer_ids(n),
-        },
-        cache_prefix: None,
-        require_warm: false,
-        needs_snapshot: false,
-    };
-    // The base model reads the answer, as it thought.
-    let (task_id, read) = readout_task(state, &readout, Some(0.0)).await;
-    let (logits, prefilled) = match read {
-        Ok(r) => r,
-        Err(fail) => {
-            if matches!(fail, TaskFailure::Stream(..)) {
-                *spent += readout.prompt_ids.len();
-            }
-            let f = S2Failure::new(task_id, READ_BACK, readout.prompt_ids.len(), 0, fail);
-            return system2_failed(plan, report, f);
-        }
-    };
-    *spent += readout.prompt_ids.len();
-    *input_tokens += prefilled;
-    let p2 = super::jev::system2_probabilities(q.qtype, &logits);
-    dists.insert(t.qid.clone(), super::jev::blend(&p1, &p2, plan.mix));
-    report.think_tokens = Some(thought.ids.len());
-    report.finished_within_budget = Some(thought.finished);
-    if plan.reasoning {
-        report.reasoning = Some(text.trim().to_string());
-    }
-    Ok(report)
-}
-
-/// `thinking.reason` of a question whose System 2 the request's budget could not cover.
-const BUDGET: &str = "budget";
-
-/// `thinking.reason` of a question whose System 2 task failed in the engine (`auto` only).
-const ERROR: &str = "error";
-
-/// The phases of System 2, as its failure line names them.
-const GENERATE: &str = "generate";
-const READ_BACK: &str = "readback";
-
-/// Why one engine task failed: the engine refused it at submit, or its stream carried an error
-/// (or ended without what the task needed), with the error chunk's `warm_prefix` (the prompt
-/// tokens the engine resumed from its cache, 0 for a cold prefill; `None` when unknown).
-enum TaskFailure {
-    Submit(cascadia_engine::EngineError),
-    Stream(String, Option<u32>),
-}
-
-impl TaskFailure {
-    /// A failure the API found itself, not reported by the engine: the cache state is unknown.
-    fn found(why: &str) -> Self {
-        Self::Stream(why.to_string(), None)
-    }
-}
-
-/// A System 2 task (its generation or its read-back) that failed.
-struct S2Failure {
-    task_id: String,
-    phase: &'static str,
-    prompt_tokens: usize,
-    /// Tokens the generation streamed before it failed.
-    generated: usize,
-    fail: TaskFailure,
-}
-
-impl S2Failure {
-    fn new(
-        task_id: String,
-        phase: &'static str,
-        prompt_tokens: usize,
-        generated: usize,
-        fail: TaskFailure,
-    ) -> Self {
-        Self {
-            task_id,
-            phase,
-            prompt_tokens,
-            generated,
-            fail,
-        }
-    }
-}
-
-/// A failed System 2 task, in one warn line: task id, phase, prompt tokens, and whether the
-/// prompt resumed a cached prefix (`cache` hit, miss or unknown, from the engine's error chunk).
-/// Then `on` fails the request as any engine failure does (503 `decision engine error`, or the
-/// capacity 503 and 413 the engine's refusals map to), and `auto` answers from System 1
-/// (`reason: "error"`): System 2 is best-effort there, as for the budget.
-fn system2_failed(
-    plan: &ThinkPlan,
-    mut report: schema::Thinking,
-    f: S2Failure,
-) -> Result<schema::Thinking, DecisionError> {
-    let (reason, error, warm) = match &f.fail {
-        TaskFailure::Submit(e) => (e.to_string(), submit_error(e), None),
-        TaskFailure::Stream(r, warm) => (r.clone(), failure_error(r), *warm),
-    };
-    let (cache, warm_prefix) = match warm {
-        Some(0) => ("miss", "0".to_string()),
-        Some(n) => ("hit", n.to_string()),
-        None => ("unknown", "unknown".to_string()),
-    };
-    tracing::warn!(
-        task = %f.task_id,
-        phase = f.phase,
-        prompt_tokens = f.prompt_tokens,
-        cache,
-        warm_prefix,
-        generated = f.generated,
-        mode = ?plan.mode,
-        reason,
-        "System 2 task failed"
-    );
-    if plan.mode == ThinkingMode::On {
-        return Err(error);
-    }
-    report.used = false;
-    report.reason = Some(ERROR);
-    Ok(report)
-}
-
-/// What System 2's generation produced.
-struct Thought {
-    /// The generated ids, the closing `end_think` included when the thought closed.
-    ids: Vec<u32>,
-    /// It closed, or the model stopped, before the budget ran out.
-    finished: bool,
-    /// The engine's prompt count, when its final chunk arrived (it does not after a close).
-    prompt_tokens: Option<u64>,
-}
-
-/// System 2's generation: the base model (`lora_scale = 0`, a switchable tree) decodes greedily
-/// from `prompt` (thinking on, so the engine appends no empty think block) for at most `budget`
-/// tokens, until `end_think`. The engine does not stop at a token id, so the stream is dropped
-/// there, which cancels the task (serve_decide's `stop_token_ids`).
-async fn generate_thought(
-    state: &AppState,
-    prompt: &str,
-    budget: usize,
-    end_think: u32,
-    prompt_tokens: usize,
-) -> Result<Thought, S2Failure> {
-    let task_id = format!("think-{}", uuid::Uuid::new_v4().simple());
-    let failed = |generated: usize, fail: TaskFailure| {
-        S2Failure::new(task_id.clone(), GENERATE, prompt_tokens, generated, fail)
-    };
-    let task = cascadia_types::GenerationTask {
-        task_id: task_id.clone(),
-        prompt: prompt.to_string(),
-        messages: Vec::new(),
-        tools: None,
-        tool_choice: None,
-        max_tokens: u32::try_from(budget).unwrap_or(u32::MAX),
-        temperature: 0.0,
-        logprobs: 0,
-        sampling: Default::default(),
-        enable_thinking: true,
-        trust_remote_code: false,
-        // Never client-settable (see the chat handler): a KV-namespace boundary.
-        tenant: String::new(),
-        resume_token_ids: None,
-        decision: None,
-        lora_scale: Some(0.0),
-    };
-    let mut stream = match state.runner.generate_async(task).await {
-        Ok(s) => s,
-        Err(e) => return Err(failed(0, TaskFailure::Submit(e))),
-    };
-    let mut ids = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        if let Some(reason) = &chunk.error {
-            let fail = TaskFailure::Stream(reason.clone(), chunk.warm_prefix);
-            return Err(failed(ids.len(), fail));
-        }
-        let got = if chunk.token_ids.is_empty() && !chunk.is_final {
-            vec![chunk.token_id]
-        } else {
-            chunk.token_ids.clone()
-        };
-        for id in got {
-            let Ok(id) = u32::try_from(id) else {
-                let why = TaskFailure::found("engine returned a negative token id");
-                return Err(failed(ids.len(), why));
-            };
-            ids.push(id);
-            if id == end_think {
-                return Ok(Thought {
-                    ids,
-                    finished: true,
-                    prompt_tokens: None,
-                });
-            }
-        }
-        if chunk.is_final {
-            let finished = chunk.finish_reason != Some(cascadia_types::FinishReason::Length)
-                && ids.len() < budget;
-            return Ok(Thought {
-                ids,
-                finished,
-                prompt_tokens: chunk.prompt_tokens.map(u64::from),
-            });
-        }
-    }
-    let why = TaskFailure::found("System 2 generation ended without a final chunk");
-    Err(failed(ids.len(), why))
+    Ok((answers, input_tokens))
 }
 
 /// Run tokenization work `f` off the async executor (it is CPU work proportional to the
@@ -976,12 +367,69 @@ async fn run_passes(
 ) -> Result<u64, DecisionError> {
     let mut input_tokens: u64 = 0;
     for pass in passes {
-        // System 1 runs at the tree's trained scale.
-        let (logits, prefilled) = run_readout(state, &pass.readout, None, || {
-            uncacheable(passes, svc.max_total_tokens)
-        })
-        .await?;
-        input_tokens += prefilled;
+        let task_id = format!("dec-{}", uuid::Uuid::new_v4().simple());
+        let perf_task = task_id.clone();
+        let task = cascadia_types::GenerationTask {
+            task_id,
+            prompt: String::new(),
+            messages: Vec::new(),
+            tools: None,
+            tool_choice: None,
+            max_tokens: 1,
+            temperature: 0.0,
+            logprobs: 0,
+            sampling: Default::default(),
+            enable_thinking: false,
+            trust_remote_code: false,
+            // Never client-settable (see the chat handler): a KV-namespace boundary.
+            tenant: String::new(),
+            resume_token_ids: None,
+            decision: Some(pass.readout.clone()),
+        };
+        let started = std::time::Instant::now();
+        let mut stream = match state.runner.generate_async(task).await {
+            Ok(s) => s,
+            Err(e) => return Err(decision_engine_error(e)),
+        };
+        let mut logits = None;
+        let mut prefilled = 0u64;
+        while let Some(chunk) = stream.next().await {
+            if let Some(reason) = &chunk.error {
+                // The cache can never hold this request's shared prefix (refused before the first
+                // pass prefilled anything): the request needs its full length, a 413.
+                if reason.starts_with("decision_uncacheable") {
+                    tracing::warn!(reason, "decision pass failed");
+                    return Err(uncacheable(passes, svc.max_total_tokens));
+                }
+                return Err(engine_failure(reason));
+            }
+            if chunk.is_final {
+                prefilled = chunk
+                    .prompt_tokens
+                    .unwrap_or(pass.readout.prompt_ids.len() as u32)
+                    as u64;
+                input_tokens += prefilled;
+                logits = chunk.decision_logits.clone();
+            }
+        }
+        let Some(logits) = logits.filter(|l| l.len() == pass.readout.head.output_len()) else {
+            return Err(engine_failure(
+                "engine returned no (or mis-sized) decision logits",
+            ));
+        };
+        // NaN/±inf (an fp16 overflow, a degenerate head) would softmax to NaN, serialise as
+        // `null` and argmax to the first option: a silent wrong 200. Fail the request instead.
+        if !logits.iter().all(|x| x.is_finite()) {
+            return Err(engine_failure("non-finite decision logits"));
+        }
+        tracing::debug!(
+            target: "cascadia::perf",
+            task = %perf_task,
+            pass_ms = started.elapsed().as_secs_f64() * 1e3,
+            prompt = pass.readout.prompt_ids.len(),
+            prefilled,
+            "decision pass done"
+        );
         for part in &pass.parts {
             probs
                 .entry(part.question_id.clone())
@@ -993,103 +441,6 @@ async fn run_passes(
         }
     }
     Ok(input_tokens)
-}
-
-/// Run one readout at `lora_scale` (`None`: the tree's trained scale) and return its checked
-/// logits and the prompt tokens it prefilled. `uncacheable` is the error for a shared prefix the
-/// engine's cache can never hold.
-async fn run_readout(
-    state: &AppState,
-    readout: &DecisionReadout,
-    lora_scale: Option<f32>,
-    uncacheable: impl FnOnce() -> DecisionError,
-) -> Result<(Vec<f32>, u64), DecisionError> {
-    match readout_task(state, readout, lora_scale).await.1 {
-        Ok(r) => Ok(r),
-        Err(TaskFailure::Submit(e)) => Err(decision_engine_error(e)),
-        // The cache can never hold this request's shared prefix (refused before the first
-        // pass prefilled anything): the request needs its full length, a 413.
-        Err(TaskFailure::Stream(reason, _)) if reason.starts_with("decision_uncacheable") => {
-            tracing::warn!(reason, "decision pass failed");
-            Err(uncacheable())
-        }
-        Err(TaskFailure::Stream(reason, _)) => Err(engine_failure(&reason)),
-    }
-}
-
-/// [`run_readout`]'s task: its id, and its checked logits and prefilled tokens or why it failed
-/// (unlogged).
-async fn readout_task(
-    state: &AppState,
-    readout: &DecisionReadout,
-    lora_scale: Option<f32>,
-) -> (String, Result<(Vec<f32>, u64), TaskFailure>) {
-    let task_id = format!("dec-{}", uuid::Uuid::new_v4().simple());
-    let r = readout_once(state, readout, lora_scale, task_id.clone()).await;
-    (task_id, r)
-}
-
-async fn readout_once(
-    state: &AppState,
-    readout: &DecisionReadout,
-    lora_scale: Option<f32>,
-    task_id: String,
-) -> Result<(Vec<f32>, u64), TaskFailure> {
-    let fail = |why: &str| Err(TaskFailure::found(why));
-    let perf_task = task_id.clone();
-    let task = cascadia_types::GenerationTask {
-        task_id,
-        prompt: String::new(),
-        messages: Vec::new(),
-        tools: None,
-        tool_choice: None,
-        max_tokens: 1,
-        temperature: 0.0,
-        logprobs: 0,
-        sampling: Default::default(),
-        enable_thinking: false,
-        trust_remote_code: false,
-        // Never client-settable (see the chat handler): a KV-namespace boundary.
-        tenant: String::new(),
-        resume_token_ids: None,
-        decision: Some(readout.clone()),
-        lora_scale,
-    };
-    let started = std::time::Instant::now();
-    let mut stream = match state.runner.generate_async(task).await {
-        Ok(s) => s,
-        Err(e) => return Err(TaskFailure::Submit(e)),
-    };
-    let mut logits = None;
-    let mut prefilled = 0u64;
-    while let Some(chunk) = stream.next().await {
-        if let Some(reason) = &chunk.error {
-            return Err(TaskFailure::Stream(reason.clone(), chunk.warm_prefix));
-        }
-        if chunk.is_final {
-            prefilled = chunk
-                .prompt_tokens
-                .unwrap_or(readout.prompt_ids.len() as u32) as u64;
-            logits = chunk.decision_logits.clone();
-        }
-    }
-    let Some(logits) = logits.filter(|l| l.len() == readout.head.output_len()) else {
-        return fail("engine returned no (or mis-sized) decision logits");
-    };
-    // NaN/±inf (an fp16 overflow, a degenerate head) would softmax to NaN, serialise as
-    // `null` and argmax to the first option: a silent wrong 200. Fail the request instead.
-    if !logits.iter().all(|x| x.is_finite()) {
-        return fail("non-finite decision logits");
-    }
-    tracing::debug!(
-        target: "cascadia::perf",
-        task = %perf_task,
-        pass_ms = started.elapsed().as_secs_f64() * 1e3,
-        prompt = readout.prompt_ids.len(),
-        prefilled,
-        "decision pass done"
-    );
-    Ok((logits, prefilled))
 }
 
 #[cfg(test)]
