@@ -681,6 +681,36 @@ python tools/decision_export.py clef --base-ir STOCK_INT8_IR \
   equal to the q/k row count, no saved head (`head: None`), or head tensors other than `q`/`k`
   weight and bias.
 - The manifest is written last, so a tree whose export stopped part way is not loadable.
+- Every family's last stage runs the LM head on the last position only, and `manifest.json` says
+  so with `"lm_head_last_row": true`. The stock graph computes the logits for every prefill position
+  (`[T, 248320]` on a T-token span) and keeps the last row. Decisions read only that row (JEV) or
+  the final hidden states, which still carry every row (Kev, Clef), so the cut leaves their
+  answers unchanged. JEV-9B's LoRA branch on the LM head is cut the same way. `cascadia shard`
+  exports keep the full head: on the GPU the one-row product can differ from the full one at f16
+  rounding level, which can flip a near-tie first token of a chat reply. A decision tree serving
+  `/v1/chat/completions` has that property.
+
+### Cutting an existing tree
+
+A tree exported before the cut keeps working as it is. To cut it in place instead of
+re-exporting it, stop the server and run:
+
+```bash
+python tools/decision/cut_lm_head.py /models/jev-9b-int8            # cut
+python tools/decision/cut_lm_head.py /models/jev-9b-int8 --restore  # undo, byte for byte
+```
+
+- The tool backs up every file it changes as `<file>.pre-cut`. These are the last stage's
+  `stage.xml` and `stage.bin` (renamed, so no second copy of the stage is written) and
+  `manifest.json` (copied). It then writes the cut stage and adds the manifest key where an export
+  puts it. A tree that is already cut is left alone, and stale backups make it refuse.
+- It produces the same graph as a fresh export. Peak memory is one stage.
+- In a pipeline, every rank compares `manifest.json` byte for byte at startup (HELLO). Cut every
+  rank's copy of the tree with the same commit, or none of them.
+- `tools/decision/head_cut_check.py --old STAGE.xml.pre-cut --new STAGE.xml --device GPU` compares
+  the two last stages on a device. It feeds what the engine feeds and reports the logits and
+  `final_hidden` differences. It also reports the LM head's share of the stage time, before and
+  after the cut. With `--profile-only --old STAGE.xml` it profiles an uncut stage alone.
 
 ## Pipeline reply timeouts
 
