@@ -177,6 +177,10 @@ def pin_shapes(model: ov.Model, seq: int, context: int, past: int | None = None,
         # take any of a port's names.
         kind = next((c for c in canon if c in names), name)
         ps = inp.get_partial_shape()
+        if kind in ("inputs_embeds", "hidden_states", "deepstack_visual_embeds") \
+                and not ps[2].is_static:
+            raise SystemExit(f"stage input {name}{ps} has a dynamic hidden dim; "
+                             "re-export the stage with a static hidden size")
         if kind in ("inputs_embeds", "hidden_states"):
             shapes[name] = [1, seq, ps[2].get_length()]
         elif kind == "input_ids":
