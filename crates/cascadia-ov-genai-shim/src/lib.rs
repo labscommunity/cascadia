@@ -230,6 +230,18 @@ mod sys {
             out_len: *mut usize,
         ) -> c_int;
         pub fn cascadia_runtime_recreate_request(handle: *mut cascadia_runtime_t) -> c_int;
+        // Task 46: make a request a failed infer left busy idle, or abandon it, never blocking.
+        pub fn cascadia_runtime_request_state(
+            handle: *mut cascadia_runtime_t,
+            out_state: *mut i32,
+        ) -> c_int;
+        pub fn cascadia_runtime_cancel(handle: *mut cascadia_runtime_t) -> c_int;
+        pub fn cascadia_runtime_wait_for(
+            handle: *mut cascadia_runtime_t,
+            timeout_ms: u32,
+            out_ready: *mut i32,
+        ) -> c_int;
+        pub fn cascadia_runtime_abandon_request(handle: *mut cascadia_runtime_t) -> c_int;
         // Issue-34: serialize/restore all KV variable-states as one opaque blob (warm-pull).
         pub fn cascadia_runtime_get_state_blob(
             handle: *mut cascadia_runtime_t,
@@ -1138,6 +1150,32 @@ impl DType {
 /// Safe wrapper around the low-level OV Core/CompiledModel/InferRequest.
 /// Used by the ov-runtime + ov-dist-spec engines. The genai LLMPipeline
 /// has its own [`LlmPipeline`] type above.
+/// An `ov::InferRequest`'s state as [`Runtime::request_state`] reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestState {
+    /// Ready for the next call.
+    Idle,
+    /// A run is in progress, or a failed one left the request marked running.
+    Busy,
+    /// Cancelled while busy; back to idle once its run ends.
+    Cancelled,
+    /// No request: abandoned, or a recreate that failed.
+    None,
+}
+
+impl RequestState {
+    /// The shim's code (`cascadia_runtime_request_state`); an unknown code reads as busy, the
+    /// state nothing may release.
+    pub fn from_raw(code: i32) -> Self {
+        match code {
+            0 => Self::Idle,
+            2 => Self::Cancelled,
+            3 => Self::None,
+            _ => Self::Busy,
+        }
+    }
+}
+
 pub struct Runtime {
     #[cfg(feature = "openvino")]
     handle: *mut sys::cascadia_runtime_t,
@@ -1328,7 +1366,9 @@ impl Runtime {
 
     /// Rebuild the InferRequest from the retained CompiledModel, dropping all variable state.
     /// Stronger than [`Runtime::reset_state`], which only calls `VariableState::reset()` — use
-    /// after a [`Runtime::set_state_blob`] whose residue `reset_state` does not clear.
+    /// after a [`Runtime::set_state_blob`] whose residue `reset_state` does not clear. Refuses a
+    /// request that is busy or cancelled (releasing it could block forever in OpenVINO's
+    /// destructor), and releases the old request before it creates the new one.
     pub fn recreate_request(&mut self) -> Result<()> {
         #[cfg(not(feature = "openvino"))]
         return Err(Error::Stub);
@@ -1336,6 +1376,68 @@ impl Runtime {
         unsafe {
             let rc = sys::cascadia_runtime_recreate_request(self.handle);
             if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(())
+        }
+    }
+
+    /// The request's state, read without blocking (OpenVINO's own busy check, under the request
+    /// mutex, before the plugin is reached).
+    pub fn request_state(&self) -> Result<RequestState> {
+        #[cfg(not(feature = "openvino"))]
+        return Err(Error::Stub);
+        #[cfg(feature = "openvino")]
+        unsafe {
+            let mut st: i32 = 0;
+            if sys::cascadia_runtime_request_state(self.handle, &mut st) != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(RequestState::from_raw(st))
+        }
+    }
+
+    /// `ov::InferRequest::cancel()`: a busy request becomes cancelled, and returns to idle when
+    /// its run ends. Never waits.
+    pub fn cancel(&mut self) -> Result<()> {
+        #[cfg(not(feature = "openvino"))]
+        return Err(Error::Stub);
+        #[cfg(feature = "openvino")]
+        unsafe {
+            if sys::cascadia_runtime_cancel(self.handle) != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(())
+        }
+    }
+
+    /// `ov::InferRequest::wait_for`, bounded by `timeout` (clamped to `u32::MAX` ms): true once
+    /// the last run has completed, a failed run included; false on timeout or if it never ran.
+    pub fn wait_for(&mut self, timeout: std::time::Duration) -> Result<bool> {
+        #[cfg(not(feature = "openvino"))]
+        {
+            let _ = timeout;
+            Err(Error::Stub)
+        }
+        #[cfg(feature = "openvino")]
+        unsafe {
+            let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+            let mut ready: i32 = 0;
+            if sys::cascadia_runtime_wait_for(self.handle, ms, &mut ready) != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(ready != 0)
+        }
+    }
+
+    /// Detach the request without destroying it: a busy request's destructor waits on its run
+    /// with no bound, so it is leaked on purpose. Later calls that need a request fail at once.
+    pub fn abandon_request(&mut self) -> Result<()> {
+        #[cfg(not(feature = "openvino"))]
+        return Err(Error::Stub);
+        #[cfg(feature = "openvino")]
+        unsafe {
+            if sys::cascadia_runtime_abandon_request(self.handle) != 0 {
                 return Err(Error::Native(last_native_error()));
             }
             Ok(())
@@ -1976,6 +2078,17 @@ mod holdback_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_state_codes_match_the_shim_and_an_unknown_one_is_busy() {
+        // shim.cpp CASCADIA_REQ_*: an unknown code must never read as releasable.
+        assert_eq!(RequestState::from_raw(0), RequestState::Idle);
+        assert_eq!(RequestState::from_raw(1), RequestState::Busy);
+        assert_eq!(RequestState::from_raw(2), RequestState::Cancelled);
+        assert_eq!(RequestState::from_raw(3), RequestState::None);
+        assert_eq!(RequestState::from_raw(42), RequestState::Busy);
+        assert_eq!(RequestState::from_raw(-1), RequestState::Busy);
+    }
 
     #[cfg(not(feature = "openvino"))]
     #[test]
