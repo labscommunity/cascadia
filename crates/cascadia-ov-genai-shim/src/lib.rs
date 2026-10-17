@@ -1368,7 +1368,7 @@ impl Runtime {
     /// Stronger than [`Runtime::reset_state`], which only calls `VariableState::reset()` — use
     /// after a [`Runtime::set_state_blob`] whose residue `reset_state` does not clear. Refuses a
     /// request that is busy or cancelled (releasing it could block forever in OpenVINO's
-    /// destructor), and releases the old request before it creates the new one.
+    /// destructor). A failed create keeps the old request.
     pub fn recreate_request(&mut self) -> Result<()> {
         #[cfg(not(feature = "openvino"))]
         return Err(Error::Stub);
@@ -1736,6 +1736,20 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         if !self.handle.is_null() {
+            // `cascadia_runtime_destroy` leaks a request that is not idle (its OpenVINO destructor
+            // would wait on it forever). Bounded, one per runtime; say so here, in the shape of
+            // the engine's abandon line.
+            if let Ok(state @ (RequestState::Busy | RequestState::Cancelled)) = self.request_state()
+            {
+                tracing::error!(
+                    action = "abandon",
+                    outcome = "leaked",
+                    state = ?state,
+                    elapsed_ms = 0u64,
+                    "ov runtime destroyed with an infer request that is not idle; the request is \
+                     leaked, not waited on"
+                );
+            }
             unsafe { sys::cascadia_runtime_destroy(self.handle) };
             self.handle = ptr::null_mut();
         }

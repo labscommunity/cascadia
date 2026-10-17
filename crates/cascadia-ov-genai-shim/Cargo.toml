@@ -21,6 +21,7 @@ openvino = []
 
 [dependencies]
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [build-dependencies]
 cc = { workspace = true }
