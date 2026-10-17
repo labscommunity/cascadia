@@ -52,6 +52,15 @@ pub struct MediaConfig {
     /// Images whose header declares more pixels than this are refused
     /// before decoding (decompression bombs).
     pub max_source_pixels: u64,
+    /// Source pixels (each header's width x height) one request's images may
+    /// declare together, checked from the headers before any decode. Decode
+    /// time grows with source pixels, not encoded bytes: eight highly
+    /// compressible 50 MP PNGs fit the byte budget and would hold the decode
+    /// slots for seconds.
+    pub max_request_source_pixels: u64,
+    /// How long a request waits for a decode slot before it is refused with
+    /// a 503, as a request over the in-flight cap is.
+    pub decode_wait: Duration,
     /// Encoded image bytes one request may carry, on top of the text body
     /// limit. Also the cap on bytes fetched for one request.
     pub max_request_image_bytes: usize,
@@ -70,12 +79,89 @@ pub fn base64_len(raw: usize) -> usize {
     raw.div_ceil(3) * 4 + 256
 }
 
+/// GenAI's universal tags: `<ov_genai_image_{i}>` and `<ov_genai_video_{i}>`
+/// mark a slot in every model's prompt.
+const GENAI_UNIVERSAL_TAGS: [&str; 2] = ["<ov_genai_image_", "<ov_genai_video_"];
+
+/// Each family's native image and video tags, which GenAI's VLMPipeline also
+/// reads as media slots ("Use Image or Video Tags in Prompt" in its docs), by
+/// the export's `config.json` `model_type`. A tag in caller text would
+/// either take an image's place or fail the request inside GenAI, which
+/// surfaces as a 5xx and marks the node degraded; refusing it is a 400.
+const GENAI_NATIVE_TAGS: &[(&[&str], &[&str])] = &[
+    // InternVL2, LLaVA-1.5, LLaVA-NeXT, nanoLLaVA, DeepSeek-OCR-2: `<image>`
+    // (some with a newline); MiniCPM-V/-o: `<image>./</image>`.
+    (
+        &[
+            "internvl_chat",
+            "llava",
+            "llava_next",
+            "llava-qwen2",
+            "deepseek_vl_v2",
+            "deepseekocr",
+        ],
+        &["<image>"],
+    ),
+    (&["llava_next_video"], &["<image>", "<video>"]),
+    (&["minicpmv", "minicpmo"], &["<image>", "</image>"]),
+    // Phi-3/3.5-vision, Phi-4-multimodal: `<|image_{n}|>` from 1;
+    // VideoChat-Flash uses the same tag for its videos.
+    (&["phi3_v", "phi4mm", "videochat_flash_qwen"], &["<|image_"]),
+    (
+        &[
+            "qwen2_vl",
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+        ],
+        &[
+            "<|vision_start|>",
+            "<|image_pad|>",
+            "<|video_pad|>",
+            "<|vision_end|>",
+        ],
+    ),
+    // GenAI's docs give `<img>` for gemma-3-4b-it; the template's own
+    // `<start_of_image>` is reserved too.
+    (&["gemma3"], &["<img>", "<start_of_image>"]),
+    (&["gemma3n"], &["<image_soft_token>"]),
+    (&["gemma4"], &["<|image|>", "<|video|>"]),
+];
+
+/// The text an ov-genai export must refuse in caller messages: the universal
+/// tags plus `model_type`'s native ones, or every known native tag when the
+/// type is missing or not listed (a tag GenAI reads that this server does
+/// not know is a 5xx; an over-cautious 400 is the cheaper mistake).
+fn genai_reserved_text(model_type: Option<&str>) -> Vec<String> {
+    let native: Vec<&str> = match model_type.and_then(|t| {
+        GENAI_NATIVE_TAGS
+            .iter()
+            .find(|(types, _)| types.contains(&t))
+    }) {
+        Some((_, tags)) => tags.to_vec(),
+        None => GENAI_NATIVE_TAGS
+            .iter()
+            .flat_map(|(_, tags)| tags.iter().copied())
+            .collect(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for tag in GENAI_UNIVERSAL_TAGS.into_iter().chain(native) {
+        if !out.iter().any(|t| t == tag) {
+            out.push(tag.to_owned());
+        }
+    }
+    out
+}
+
 impl MediaConfig {
-    /// Settings for the ov-genai engine on a VLM-layout export.
-    pub fn ov_genai() -> Self {
+    /// Settings for the ov-genai engine on a VLM-layout export whose
+    /// `config.json` names `model_type` (see [`GENAI_NATIVE_TAGS`]).
+    pub fn ov_genai(model_type: Option<&str>) -> Self {
         Self {
             image_placeholder: "<ov_genai_image_{i}>".into(),
-            reserved_text: vec!["<ov_genai_image_".into()],
+            reserved_text: genai_reserved_text(model_type),
             trim_text_parts: false,
             images_first: false,
             max_images: 8,
@@ -84,6 +170,8 @@ impl MediaConfig {
             // OpenAI's low detail is a 512x512 budget.
             low_detail_pixels: 512 * 512,
             max_source_pixels: 50_000_000,
+            max_request_source_pixels: 100_000_000,
+            decode_wait: Duration::from_secs(10),
             max_request_image_bytes: 20 << 20,
             allow_remote_urls: false,
             fetch_policy: FetchPolicy::PUBLIC_HTTPS,
@@ -103,7 +191,7 @@ impl MediaConfig {
             ]
             .map(String::from)
             .to_vec(),
-            ..Self::ov_genai()
+            ..Self::ov_genai(None)
         }
     }
 
@@ -127,7 +215,7 @@ impl MediaConfig {
             .map(String::from)
             .to_vec(),
             trim_text_parts: true,
-            ..Self::ov_genai()
+            ..Self::ov_genai(None)
         }
     }
 
@@ -144,7 +232,7 @@ impl MediaConfig {
                 .map(String::from)
                 .to_vec(),
             trim_text_parts: true,
-            ..Self::ov_genai()
+            ..Self::ov_genai(None)
         }
     }
 
@@ -159,7 +247,7 @@ impl MediaConfig {
             reserved_text: ["[IMG]", "[IMG_BREAK]", "[IMG_END]"]
                 .map(String::from)
                 .to_vec(),
-            ..Self::ov_genai()
+            ..Self::ov_genai(None)
         }
     }
 
@@ -172,7 +260,7 @@ impl MediaConfig {
         Self {
             image_placeholder: "<|image_{n}|>\n".into(),
             reserved_text: ["<|image_", "<|image|>"].map(String::from).to_vec(),
-            ..Self::ov_genai()
+            ..Self::ov_genai(None)
         }
     }
 
@@ -186,7 +274,7 @@ impl MediaConfig {
             image_placeholder: "<image>\n".into(),
             reserved_text: vec!["<image>".into()],
             images_first: true,
-            ..Self::ov_genai()
+            ..Self::ov_genai(None)
         }
     }
 
@@ -200,7 +288,7 @@ impl MediaConfig {
             reserved_text: ["<img>", "</img>", "<IMG_CONTEXT>"]
                 .map(String::from)
                 .to_vec(),
-            ..Self::ov_genai()
+            ..Self::ov_genai(None)
         }
     }
 
@@ -285,21 +373,70 @@ const MAX_SIDE: u32 = 16_384;
 const MAX_ASPECT: u32 = 200;
 
 /// Decode one `data:` image URL into pixels the engine can take as is.
+#[cfg(test)]
 pub fn decode_image_url(
     url: &str,
     detail: Option<&str>,
     cfg: &MediaConfig,
 ) -> Result<MediaInput, String> {
-    check_detail(detail)?;
-    let bytes = data_url_bytes(url, cfg.allow_remote_urls)?;
+    let bytes = image_url_bytes(url, detail, cfg)?;
     decode_image_bytes(&bytes, detail, cfg)
 }
 
+/// The encoded image a `data:` URL carries, its `detail` checked.
+pub fn image_url_bytes(
+    url: &str,
+    detail: Option<&str>,
+    cfg: &MediaConfig,
+) -> Result<Vec<u8>, String> {
+    check_detail(detail)?;
+    data_url_bytes(url, cfg.allow_remote_urls)
+}
+
+/// The size an encoded image's header declares, refused as
+/// [`decode_image_bytes`] would refuse it, without decoding a pixel.
+pub fn source_size(bytes: &[u8], cfg: &MediaConfig) -> Result<(u32, u32), String> {
+    let format = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("could not read the image: {e}"))?
+        .format();
+    let format = match format {
+        Some(f @ (ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP | ImageFormat::Gif)) => {
+            f
+        }
+        _ => return Err("unsupported image format; send PNG, JPEG, WEBP or GIF".into()),
+    };
+    let (w, h) = ImageReader::with_format(Cursor::new(bytes), format)
+        .into_dimensions()
+        .map_err(|e| format!("could not read the image header: {e}"))?;
+    check_dimensions(w, h, cfg)?;
+    Ok((w, h))
+}
+
+/// Refuse a request whose images declare more source pixels together than
+/// [`MediaConfig::max_request_source_pixels`].
+pub fn check_request_pixels(sizes: &[(u32, u32)], cfg: &MediaConfig) -> Result<(), String> {
+    let total: u64 = sizes
+        .iter()
+        .map(|&(w, h)| u64::from(w) * u64::from(h))
+        .sum();
+    if total > cfg.max_request_source_pixels {
+        return Err(format!(
+            "this request's images are {total} pixels together; the limit is {} \
+             (send fewer or smaller images)",
+            cfg.max_request_source_pixels
+        ));
+    }
+    Ok(())
+}
+
+/// OpenAI's `detail` values. `original` (full resolution, in the current
+/// SDKs' types) is served as `high`: the pixel budget still bounds the image.
 fn check_detail(detail: Option<&str>) -> Result<(), String> {
     match detail {
-        None | Some("auto" | "high" | "low") => Ok(()),
+        None | Some("auto" | "high" | "original" | "low") => Ok(()),
         Some(other) => Err(format!(
-            "image detail `{other}` is not supported; use `low`, `high` or `auto`"
+            "image detail `{other}` is not supported; use `low`, `high`, `original` or `auto`"
         )),
     }
 }
@@ -312,26 +449,19 @@ pub fn decode_image_bytes(
 ) -> Result<MediaInput, String> {
     check_detail(detail)?;
     let budget = match detail {
-        None | Some("auto") | Some("high") => cfg.max_image_pixels,
-        _ => cfg.low_detail_pixels,
+        Some("low") => cfg.low_detail_pixels,
+        _ => cfg.max_image_pixels,
     };
 
+    // Check the declared size before decoding a single pixel.
+    source_size(bytes, cfg)?;
     let format = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| format!("could not read the image: {e}"))?
-        .format();
-    match format {
-        Some(ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP | ImageFormat::Gif) => {}
-        _ => return Err("unsupported image format; send PNG, JPEG, WEBP or GIF".into()),
-    }
+        .format()
+        .expect("source_size checked the format");
 
-    // Check the declared size before decoding a single pixel.
-    let (w, h) = ImageReader::with_format(Cursor::new(bytes), format.unwrap())
-        .into_dimensions()
-        .map_err(|e| format!("could not read the image header: {e}"))?;
-    check_dimensions(w, h, cfg)?;
-
-    let mut reader = ImageReader::with_format(Cursor::new(bytes), format.unwrap());
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_SIDE);
     limits.max_image_height = Some(MAX_SIDE);
@@ -707,7 +837,7 @@ mod tests {
 
     #[test]
     fn decodes_a_png_data_url_to_rgb() {
-        let cfg = MediaConfig::ov_genai();
+        let cfg = MediaConfig::ov_genai(None);
         let m = decode_image_url(&png_data_url(40, 30), None, &cfg).unwrap();
         assert_eq!((m.width, m.height, m.num_frames), (40, 30, 1));
         assert_eq!(m.pixels.len(), m.expected_len());
@@ -721,7 +851,7 @@ mod tests {
 
     #[test]
     fn downscales_to_the_pixel_budget_keeping_aspect() {
-        let mut cfg = MediaConfig::ov_genai();
+        let mut cfg = MediaConfig::ov_genai(None);
         cfg.max_image_pixels = 100 * 50;
         let m = decode_image_url(&png_data_url(400, 200), None, &cfg).unwrap();
         assert_eq!((m.width, m.height), (100, 50));
@@ -760,7 +890,7 @@ mod tests {
 
     #[test]
     fn refuses_what_it_cannot_take() {
-        let cfg = MediaConfig::ov_genai();
+        let cfg = MediaConfig::ov_genai(None);
         for (url, detail, needle) in [
             ("https://example.com/a.png", None, "only `data:`"),
             ("ftp://example.com/a.png", None, "only `data:`"),
@@ -780,7 +910,7 @@ mod tests {
         assert!(err.contains("detail `ultra`"), "{err}");
         let err = decode_image_url(&png_data_url(402, 2), None, &cfg).unwrap_err();
         assert!(err.contains("aspect ratio"), "{err}");
-        let mut small = MediaConfig::ov_genai();
+        let mut small = MediaConfig::ov_genai(None);
         small.max_source_pixels = 100;
         let err = decode_image_url(&png_data_url(20, 20), None, &small).unwrap_err();
         assert!(err.contains("pixels in total"), "{err}");
@@ -954,7 +1084,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_follows_checked_redirects_and_enforces_limits() {
         let base = image_server().await;
-        let cfg = MediaConfig::ov_genai();
+        let cfg = MediaConfig::ov_genai(None);
         let bytes = fetch_image(&format!("{base}/img.png"), 1 << 20, LOCAL)
             .await
             .unwrap();
@@ -990,7 +1120,7 @@ mod tests {
 
     #[test]
     fn placeholders_and_reserved_text() {
-        let cfg = MediaConfig::ov_genai();
+        let cfg = MediaConfig::ov_genai(None);
         assert_eq!(cfg.placeholder(3), "<ov_genai_image_3>");
         assert_eq!(
             cfg.reserved_in("see <ov_genai_image_0>"),
@@ -1088,7 +1218,7 @@ mod tests {
             q.reserved_beyond_placeholders(&format!("a{tag}<|video_pad|>"), 1),
             Some("<|video_pad|>")
         );
-        let o = MediaConfig::ov_genai();
+        let o = MediaConfig::ov_genai(None);
         assert_eq!(
             o.reserved_beyond_placeholders("<ov_genai_image_0><ov_genai_image_1>", 2),
             None
@@ -1135,5 +1265,104 @@ mod tests {
             x.join_parts(vec![(false, "A".into()), (true, "[IMG]".into())]),
             "A[IMG]"
         );
+    }
+
+    /// `original` is served as `high`: the full pixel budget, not low's.
+    #[test]
+    fn original_detail_takes_the_high_budget() {
+        let mut cfg = MediaConfig::ov_genai(None);
+        cfg.max_image_pixels = 100 * 50;
+        cfg.low_detail_pixels = 20 * 10;
+        let m = decode_image_url(&png_data_url(400, 200), Some("original"), &cfg).unwrap();
+        assert_eq!((m.width, m.height), (100, 50));
+        let err = decode_image_url(&png_data_url(4, 4), Some("ultra"), &cfg).unwrap_err();
+        assert!(err.contains("`original`"), "{err}");
+    }
+
+    /// ov-genai reserves the universal image and video tags on every export,
+    /// plus the native tags GenAI reads for the export's family; an unknown
+    /// family reserves every known native tag.
+    #[test]
+    fn ov_genai_reserves_each_familys_native_tags() {
+        for (model_type, native, not_reserved) in [
+            (Some("llava_next"), "say <image> now", Some("<|image|>")),
+            (
+                Some("internvl_chat"),
+                "<image>\nhi",
+                Some("<|vision_start|>"),
+            ),
+            (Some("llava_next_video"), "a <video> b", None),
+            (Some("minicpmv"), "<image>./</image>", None),
+            (Some("phi3_v"), "<|image_1|>\nhi", Some("<image>")),
+            (Some("phi4mm"), "<|image_2|>", None),
+            (
+                Some("qwen2_vl"),
+                "<|vision_start|><|image_pad|><|vision_end|>",
+                Some("<image>"),
+            ),
+            (Some("qwen2_5_vl"), "x<|image_pad|>", None),
+            (Some("qwen3_vl"), "x<|video_pad|>", None),
+            (Some("qwen3_5"), "<|vision_start|>", None),
+            (Some("gemma3"), "<start_of_image>", Some("<|image|>")),
+            (Some("gemma3"), "<img>", None),
+            (Some("gemma3n"), "<image_soft_token>", None),
+            (Some("gemma4"), "<|image|>", Some("<image>")),
+            (Some("gemma4"), "<|video|>", None),
+        ] {
+            let cfg = MediaConfig::ov_genai(model_type);
+            assert!(
+                cfg.reserved_in(native).is_some(),
+                "{model_type:?}: {native:?}"
+            );
+            assert!(cfg.reserved_in("<ov_genai_image_3>").is_some());
+            assert!(cfg.reserved_in("<ov_genai_video_0>").is_some());
+            assert_eq!(cfg.reserved_in("plain text"), None);
+            if let Some(other) = not_reserved {
+                assert_eq!(cfg.reserved_in(other), None, "{model_type:?}: {other:?}");
+            }
+            // The universal placeholder never trips its own family's tags.
+            let tags = format!("{}{}", cfg.placeholder(0), cfg.placeholder(1));
+            assert_eq!(
+                cfg.reserved_beyond_placeholders(&tags, 2),
+                None,
+                "{model_type:?}"
+            );
+        }
+        for unknown in [None, Some("some_new_vlm")] {
+            let cfg = MediaConfig::ov_genai(unknown);
+            for tag in [
+                "<image>",
+                "<video>",
+                "<|image_1|>",
+                "<|vision_start|>",
+                "<|video_pad|>",
+                "<img>",
+                "<start_of_image>",
+                "<image_soft_token>",
+                "<|image|>",
+                "<|video|>",
+            ] {
+                assert!(cfg.reserved_in(tag).is_some(), "{unknown:?}: {tag}");
+            }
+        }
+    }
+
+    /// The request-wide source-pixel budget, from headers alone.
+    #[test]
+    fn request_source_pixels_are_summed_from_headers() {
+        let mut cfg = MediaConfig::ov_genai(None);
+        assert_eq!(
+            cfg.max_request_source_pixels,
+            2 * cfg.max_source_pixels,
+            "default is two full-size images"
+        );
+        let url = png_data_url(30, 20);
+        let bytes = image_url_bytes(&url, None, &cfg).unwrap();
+        assert_eq!(source_size(&bytes, &cfg).unwrap(), (30, 20));
+        cfg.max_request_source_pixels = 1200;
+        assert!(check_request_pixels(&[(30, 20), (30, 20)], &cfg).is_ok());
+        let err = check_request_pixels(&[(30, 20), (30, 20), (1, 1)], &cfg).unwrap_err();
+        assert!(err.contains("1201 pixels"), "{err}");
+        assert!(source_size(b"not an image", &cfg).is_err());
     }
 }
