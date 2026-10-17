@@ -7708,6 +7708,18 @@ impl Builder for OvRuntimeBuilder {
                             .into(),
                     ));
                 }
+                // Gemma 3 / Gemma 4: a prefill IR without the token_type_ids
+                // port would run every prefill chunk causal-only inside the
+                // images (the load check below sees only the decode IR).
+                let types_in = pcanon.get("token_type_ids").cloned();
+                if self.vision.as_ref().is_some_and(|v| v.token_types) && types_in.is_none() {
+                    return Err(EngineError::InvalidConfig(
+                        "token_type_ids tree: the chunked-prefill IR has no token_type_ids \
+                         input, so its images would attend causally; rebuild it with \
+                         tools/vlm_surgery/static_variant.py from this build"
+                            .into(),
+                    ));
+                }
                 Some(StaticPrefill {
                     runtime: prt,
                     shared,
@@ -7716,7 +7728,7 @@ impl Builder for OvRuntimeBuilder {
                     ids_in,
                     hidden_in,
                     embeds_in,
-                    types_in: pcanon.get("token_type_ids").cloned(),
+                    types_in,
                     visual_mask_in,
                     deepstack_in,
                     attn_in,
