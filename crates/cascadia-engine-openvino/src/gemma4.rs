@@ -433,6 +433,34 @@ fn decode_wire_position(t: &WireTensor) -> EngineResult<i64> {
     Ok(i64::from_le_bytes(b))
 }
 
+/// Where a span's `k` image tokens take their rows from, given `total` row
+/// floats of `hidden` width of which `fed` rows are consumed: `Some(range)`
+/// into the turn's rows, or `None` for zero rows. Zero rows are only for an
+/// image token nothing can supply: a decode step (the model emitting
+/// `<|image|>`) or a turn without images. Inside an image turn's prompt the
+/// expansion made one image token per row, so running out there is a
+/// row/token mismatch and answering from blank rows would be silently wrong.
+fn image_feature_rows(
+    total: usize,
+    fed: usize,
+    k: usize,
+    hidden: usize,
+    in_prompt: bool,
+) -> EngineResult<Option<std::ops::Range<usize>>> {
+    let start = fed * hidden;
+    let end = start + k * hidden;
+    if end <= total {
+        return Ok(Some(start..end));
+    }
+    if start >= total && !(in_prompt && total > 0) {
+        return Ok(None);
+    }
+    Err(EngineError::Backend(format!(
+        "span carries {k} image tokens but only {} image rows remain",
+        (total / hidden.max(1)).saturating_sub(fed)
+    )))
+}
+
 // -------- Engine --------
 
 struct ActiveTask {
@@ -626,7 +654,7 @@ impl Gemma4Engine {
             .set_input(&in_pos, ShimDType::I64, &[1, seq_len], &i64_to_bytes(&pos))
             .map_err(map_ov_err)?;
         if let Some(port) = self.image_features_in.clone() {
-            self.feed_image_features(&port, input_ids)?;
+            self.feed_image_features(&port, input_ids, position)?;
         }
         self.feed_external_kv()?;
         Ok(())
@@ -637,8 +665,14 @@ impl Gemma4Engine {
     /// zero row so an empty input still gathers). An image token with no
     /// image left to supply it (the model emitting `<|image|>` while decoding,
     /// or one in a turn without images) gets a zero row instead of failing
-    /// the turn.
-    fn feed_image_features(&mut self, port: &str, input_ids: &[i64]) -> EngineResult<()> {
+    /// the turn; an image turn's PROMPT running out of rows is a count
+    /// mismatch and fails (see `image_feature_rows`).
+    fn feed_image_features(
+        &mut self,
+        port: &str,
+        input_ids: &[i64],
+        position: i64,
+    ) -> EngineResult<()> {
         let image = self.vision.as_ref().map(|v| v.tokens.image);
         let k = input_ids.iter().filter(|&&t| Some(t) == image).count();
         let h = self.hidden_size;
@@ -647,22 +681,14 @@ impl Gemma4Engine {
             let a = self.active.as_mut().ok_or_else(|| {
                 EngineError::Backend("image tokens with no active task to splice".into())
             })?;
-            let start = a.image_rows_fed * h;
-            if start >= a.image_rows.len() {
-                rows.resize(k * h, 0.0);
-                return self
-                    .runtime
-                    .set_input(port, ShimDType::F32, &[k, h], &f32_to_bytes(&rows))
-                    .map_err(map_ov_err);
+            let in_prompt = usize::try_from(position).is_ok_and(|p| p < a.prompt_ids.len());
+            match image_feature_rows(a.image_rows.len(), a.image_rows_fed, k, h, in_prompt)? {
+                Some(range) => {
+                    rows.extend_from_slice(&a.image_rows[range]);
+                    a.image_rows_fed += k;
+                }
+                None => rows.resize(k * h, 0.0),
             }
-            let slice = a.image_rows.get(start..start + k * h).ok_or_else(|| {
-                EngineError::Backend(format!(
-                    "span carries {k} image tokens but only {} image rows remain",
-                    (a.image_rows.len() / h.max(1)).saturating_sub(a.image_rows_fed)
-                ))
-            })?;
-            rows.extend_from_slice(slice);
-            a.image_rows_fed += k;
         }
         self.runtime
             .set_input(port, ShimDType::F32, &[k, h], &f32_to_bytes(&rows))
@@ -2561,6 +2587,21 @@ impl Builder for Gemma4Builder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_rows_run_out_only_outside_an_image_prompt() {
+        // 3 rows of width 2.
+        assert_eq!(image_feature_rows(6, 0, 2, 2, true).unwrap(), Some(0..4));
+        assert_eq!(image_feature_rows(6, 2, 1, 2, true).unwrap(), Some(4..6));
+        // Decode: the model emitting the image token after the rows are used.
+        assert_eq!(image_feature_rows(6, 3, 1, 2, false).unwrap(), None);
+        // A text turn's prompt holding the image token.
+        assert_eq!(image_feature_rows(0, 0, 2, 2, true).unwrap(), None);
+        // An image turn's prompt past its rows, at or across the boundary.
+        assert!(image_feature_rows(6, 3, 1, 2, true).is_err());
+        assert!(image_feature_rows(6, 2, 2, 2, true).is_err());
+        assert!(image_feature_rows(6, 2, 2, 2, false).is_err());
+    }
     use cascadia_types::PeerLayout;
 
     /// Rig incident (2026-08-17): RESTORE/ABORT ack recvs were UNBOUNDED while
