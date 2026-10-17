@@ -52,6 +52,15 @@ pub struct MediaConfig {
     /// Images whose header declares more pixels than this are refused
     /// before decoding (decompression bombs).
     pub max_source_pixels: u64,
+    /// Source pixels (each header's width x height) one request's images may
+    /// declare together, checked from the headers before any decode. Decode
+    /// time grows with source pixels, not encoded bytes: eight highly
+    /// compressible 50 MP PNGs fit the byte budget and would hold the decode
+    /// slots for seconds.
+    pub max_request_source_pixels: u64,
+    /// How long a request waits for a decode slot before it is refused with
+    /// a 503, as a request over the in-flight cap is.
+    pub decode_wait: Duration,
     /// Encoded image bytes one request may carry, on top of the text body
     /// limit. Also the cap on bytes fetched for one request.
     pub max_request_image_bytes: usize,
@@ -161,6 +170,8 @@ impl MediaConfig {
             // OpenAI's low detail is a 512x512 budget.
             low_detail_pixels: 512 * 512,
             max_source_pixels: 50_000_000,
+            max_request_source_pixels: 100_000_000,
+            decode_wait: Duration::from_secs(10),
             max_request_image_bytes: 20 << 20,
             allow_remote_urls: false,
             fetch_policy: FetchPolicy::PUBLIC_HTTPS,
@@ -362,21 +373,70 @@ const MAX_SIDE: u32 = 16_384;
 const MAX_ASPECT: u32 = 200;
 
 /// Decode one `data:` image URL into pixels the engine can take as is.
+#[cfg(test)]
 pub fn decode_image_url(
     url: &str,
     detail: Option<&str>,
     cfg: &MediaConfig,
 ) -> Result<MediaInput, String> {
-    check_detail(detail)?;
-    let bytes = data_url_bytes(url, cfg.allow_remote_urls)?;
+    let bytes = image_url_bytes(url, detail, cfg)?;
     decode_image_bytes(&bytes, detail, cfg)
 }
 
+/// The encoded image a `data:` URL carries, its `detail` checked.
+pub fn image_url_bytes(
+    url: &str,
+    detail: Option<&str>,
+    cfg: &MediaConfig,
+) -> Result<Vec<u8>, String> {
+    check_detail(detail)?;
+    data_url_bytes(url, cfg.allow_remote_urls)
+}
+
+/// The size an encoded image's header declares, refused as
+/// [`decode_image_bytes`] would refuse it, without decoding a pixel.
+pub fn source_size(bytes: &[u8], cfg: &MediaConfig) -> Result<(u32, u32), String> {
+    let format = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("could not read the image: {e}"))?
+        .format();
+    let format = match format {
+        Some(f @ (ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP | ImageFormat::Gif)) => {
+            f
+        }
+        _ => return Err("unsupported image format; send PNG, JPEG, WEBP or GIF".into()),
+    };
+    let (w, h) = ImageReader::with_format(Cursor::new(bytes), format)
+        .into_dimensions()
+        .map_err(|e| format!("could not read the image header: {e}"))?;
+    check_dimensions(w, h, cfg)?;
+    Ok((w, h))
+}
+
+/// Refuse a request whose images declare more source pixels together than
+/// [`MediaConfig::max_request_source_pixels`].
+pub fn check_request_pixels(sizes: &[(u32, u32)], cfg: &MediaConfig) -> Result<(), String> {
+    let total: u64 = sizes
+        .iter()
+        .map(|&(w, h)| u64::from(w) * u64::from(h))
+        .sum();
+    if total > cfg.max_request_source_pixels {
+        return Err(format!(
+            "this request's images are {total} pixels together; the limit is {} \
+             (send fewer or smaller images)",
+            cfg.max_request_source_pixels
+        ));
+    }
+    Ok(())
+}
+
+/// OpenAI's `detail` values. `original` (full resolution, in the current
+/// SDKs' types) is served as `high`: the pixel budget still bounds the image.
 fn check_detail(detail: Option<&str>) -> Result<(), String> {
     match detail {
-        None | Some("auto" | "high" | "low") => Ok(()),
+        None | Some("auto" | "high" | "original" | "low") => Ok(()),
         Some(other) => Err(format!(
-            "image detail `{other}` is not supported; use `low`, `high` or `auto`"
+            "image detail `{other}` is not supported; use `low`, `high`, `original` or `auto`"
         )),
     }
 }
@@ -389,26 +449,19 @@ pub fn decode_image_bytes(
 ) -> Result<MediaInput, String> {
     check_detail(detail)?;
     let budget = match detail {
-        None | Some("auto") | Some("high") => cfg.max_image_pixels,
-        _ => cfg.low_detail_pixels,
+        Some("low") => cfg.low_detail_pixels,
+        _ => cfg.max_image_pixels,
     };
 
+    // Check the declared size before decoding a single pixel.
+    source_size(bytes, cfg)?;
     let format = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| format!("could not read the image: {e}"))?
-        .format();
-    match format {
-        Some(ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP | ImageFormat::Gif) => {}
-        _ => return Err("unsupported image format; send PNG, JPEG, WEBP or GIF".into()),
-    }
+        .format()
+        .expect("source_size checked the format");
 
-    // Check the declared size before decoding a single pixel.
-    let (w, h) = ImageReader::with_format(Cursor::new(bytes), format.unwrap())
-        .into_dimensions()
-        .map_err(|e| format!("could not read the image header: {e}"))?;
-    check_dimensions(w, h, cfg)?;
-
-    let mut reader = ImageReader::with_format(Cursor::new(bytes), format.unwrap());
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_SIDE);
     limits.max_image_height = Some(MAX_SIDE);
@@ -1214,6 +1267,18 @@ mod tests {
         );
     }
 
+    /// `original` is served as `high`: the full pixel budget, not low's.
+    #[test]
+    fn original_detail_takes_the_high_budget() {
+        let mut cfg = MediaConfig::ov_genai(None);
+        cfg.max_image_pixels = 100 * 50;
+        cfg.low_detail_pixels = 20 * 10;
+        let m = decode_image_url(&png_data_url(400, 200), Some("original"), &cfg).unwrap();
+        assert_eq!((m.width, m.height), (100, 50));
+        let err = decode_image_url(&png_data_url(4, 4), Some("ultra"), &cfg).unwrap_err();
+        assert!(err.contains("`original`"), "{err}");
+    }
+
     /// ov-genai reserves the universal image and video tags on every export,
     /// plus the native tags GenAI reads for the export's family; an unknown
     /// family reserves every known native tag.
@@ -1280,5 +1345,24 @@ mod tests {
                 assert!(cfg.reserved_in(tag).is_some(), "{unknown:?}: {tag}");
             }
         }
+    }
+
+    /// The request-wide source-pixel budget, from headers alone.
+    #[test]
+    fn request_source_pixels_are_summed_from_headers() {
+        let mut cfg = MediaConfig::ov_genai(None);
+        assert_eq!(
+            cfg.max_request_source_pixels,
+            2 * cfg.max_source_pixels,
+            "default is two full-size images"
+        );
+        let url = png_data_url(30, 20);
+        let bytes = image_url_bytes(&url, None, &cfg).unwrap();
+        assert_eq!(source_size(&bytes, &cfg).unwrap(), (30, 20));
+        cfg.max_request_source_pixels = 1200;
+        assert!(check_request_pixels(&[(30, 20), (30, 20)], &cfg).is_ok());
+        let err = check_request_pixels(&[(30, 20), (30, 20), (1, 1)], &cfg).unwrap_err();
+        assert!(err.contains("1201 pixels"), "{err}");
+        assert!(source_size(b"not an image", &cfg).is_err());
     }
 }
