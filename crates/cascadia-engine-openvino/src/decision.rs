@@ -566,9 +566,14 @@ mod tests {
     }
 
     fn head_dir(head_json: &str, files: &[(&str, usize)]) -> std::path::PathBuf {
+        // A per-process counter, not the clock alone: tests run in parallel, and two calls in the
+        // same clock tick (microsecond resolution on macOS) shared a directory that one of them
+        // then removed under the other.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let d = std::env::temp_dir().join(format!(
-            "dec-head-{}-{}",
+            "dec-head-{}-{}-{}",
             std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
