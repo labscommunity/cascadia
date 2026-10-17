@@ -3038,6 +3038,14 @@ impl OvRuntimeEngine {
         Ok(())
     }
 
+    /// Drop the turn's DeepStack rows (layers x image tokens x hidden f32,
+    /// often hundreds of MB) when the active task ends, finished or not.
+    fn clear_static_deepstack(&mut self) {
+        self.static_ds_global = Vec::new();
+        self.static_ds_total = 0;
+        self.static_ds_cursor = 0;
+    }
+
     /// This static inference's DeepStack feed for stage 0 of a Qwen3-VL tree:
     /// `visual_pos_masks` (length `width`) and `deepstack_visual_embeds`
     /// (`[layers, width, hidden]`) from the fed `ids`, advancing the cursor by
@@ -3078,6 +3086,11 @@ impl OvRuntimeEngine {
         )
         .map_err(EngineError::Backend)?;
         self.static_ds_cursor += k;
+        // Every image token is fed: no later inference reads the rows (the
+        // cursor check above zero-feeds), so release them now.
+        if self.static_ds_cursor >= self.static_ds_total {
+            self.static_ds_global = Vec::new();
+        }
         Ok(Some((mask, embeds, layers, hidden)))
     }
 
@@ -4055,6 +4068,7 @@ impl OvRuntimeEngine {
             // stream instead of ending whichever stream observes the Err.
             let failed = self.active.as_ref().map(|a| a.task.task_id.clone());
             self.active = None;
+            self.clear_static_deepstack();
             let _ = self.runtime.reset_state();
             if let Some(sk) = self.static_kv.as_mut() {
                 sk.reset();
@@ -4547,17 +4561,20 @@ impl OvRuntimeEngine {
             };
             Ok::<_, EngineError>((plan_res, hidden, hf.shape, mrope_frame))
         })?;
-        let mrope = match mrope_frame {
+        // Decoded like the plan: a malformed frame is a body failure that is
+        // NACKed below, never an early return that leaves the upstream
+        // waiting out its reply deadline.
+        let mrope_res = match mrope_frame {
             Some(f) => {
-                let p = decode_wire_positions(&f, crate::qwen_vl_vision::MROPE_ROWS, pseq)?;
-                debug!(
-                    rows = crate::qwen_vl_vision::MROPE_ROWS,
-                    seq = pseq,
-                    "packed relay: M-RoPE positions frame received"
-                );
-                p
+                decode_wire_positions(&f, crate::qwen_vl_vision::MROPE_ROWS, pseq).inspect(|_| {
+                    debug!(
+                        rows = crate::qwen_vl_vision::MROPE_ROWS,
+                        seq = pseq,
+                        "packed relay: M-RoPE positions frame received"
+                    )
+                })
             }
-            None => Vec::new(),
+            None => Ok(Vec::new()),
         };
 
         // The pair is consumed. From here on, any failure MUST still answer
@@ -4567,7 +4584,7 @@ impl OvRuntimeEngine {
         // frame ([1,1,0]): wire-aligned, unambiguous (a real reply always
         // has one token per row), and it tells the upstream "batch lost,
         // link healthy".
-        let step = self.relay_packed_body(plan_res, hidden, hshape, mrope);
+        let step = self.relay_packed_body(plan_res, hidden, hshape, mrope_res);
         let frame = match &step {
             Ok(tokens) => encode_wire_tokens(tokens),
             Err(e) => {
@@ -4601,9 +4618,10 @@ impl OvRuntimeEngine {
         plan_res: EngineResult<(Vec<crate::packed_exec::WireRowOpt>, Vec<Option<u32>>)>,
         hidden: Vec<f32>,
         hshape: [u32; MAX_RANK],
-        mrope: Vec<i64>,
+        mrope_res: EngineResult<Vec<i64>>,
     ) -> EngineResult<Vec<i32>> {
         let (plan_rows, plan_images) = plan_res?;
+        let mrope = mrope_res?;
         let hidden_size = hshape[2] as usize;
         let plan = relay_plan(&plan_rows, &plan_images);
         let positions: Vec<i64> = plan_rows
@@ -5172,6 +5190,7 @@ impl OvRuntimeEngine {
                 }
             }
             self.active = None;
+            self.clear_static_deepstack();
         }
 
         Ok(vec![(task_id, chunk)])
@@ -5437,10 +5456,12 @@ impl OvRuntimeEngine {
         } else {
             None
         };
+        // Consumed here, as `static_infer` clears it: a stale set must never
+        // feed a later inference's DeepStack mask.
         let next_ids = self
             .static_kv
-            .as_ref()
-            .map(|sk| sk.next_ids.clone())
+            .as_mut()
+            .map(|sk| std::mem::take(&mut sk.next_ids))
             .unwrap_or_default();
         let deepstack = self.take_static_deepstack(&next_ids, width)?;
 
@@ -6073,6 +6094,7 @@ impl Engine for OvRuntimeEngine {
         {
             info!(task = %task_id, "ov-runtime cancel: abandoning active task");
             self.active = None;
+            self.clear_static_deepstack();
             let _ = self.runtime.reset_state();
             if let Some(sk) = self.static_kv.as_mut() {
                 sk.reset();
@@ -7616,6 +7638,24 @@ impl Builder for OvRuntimeBuilder {
                         primary_kind(ids_in.is_some(), embeds_in.is_some()),
                     )));
                 }
+                // Qwen3-VL stage 0: a prefill IR without the DeepStack ports
+                // would run every prefill chunk without them — silently wrong
+                // output, so refuse it here as the packed variant does.
+                let visual_mask_in = pcanon.get("visual_pos_masks").cloned();
+                let deepstack_in = pcanon.get("deepstack_visual_embeds").cloned();
+                let ds_layers = self
+                    .vision
+                    .as_ref()
+                    .and_then(|v| v.first.as_ref())
+                    .map_or(0, |f| f.frontend.deepstack_layers());
+                if ds_layers > 0 && (visual_mask_in.is_none() || deepstack_in.is_none()) {
+                    return Err(EngineError::InvalidConfig(
+                        "Qwen3-VL chunked-prefill stage 0 is missing visual_pos_masks / \
+                         deepstack_visual_embeds; rebuild it with tools/vlm_surgery/static_variant.py \
+                         from this build"
+                            .into(),
+                    ));
+                }
                 Some(StaticPrefill {
                     runtime: prt,
                     shared,
@@ -7625,8 +7665,8 @@ impl Builder for OvRuntimeBuilder {
                     hidden_in,
                     embeds_in,
                     types_in: pcanon.get("token_type_ids").cloned(),
-                    visual_mask_in: pcanon.get("visual_pos_masks").cloned(),
-                    deepstack_in: pcanon.get("deepstack_visual_embeds").cloned(),
+                    visual_mask_in,
+                    deepstack_in,
                     attn_in,
                     pos_in,
                     layers: players,
