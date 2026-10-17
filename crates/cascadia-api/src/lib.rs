@@ -5334,7 +5334,7 @@ mod tests {
                 bos_token: None,
                 eos_token: None,
             },
-            media: Some(MediaConfig::ov_genai()),
+            media: Some(MediaConfig::ov_genai(None)),
             ..Config::default()
         };
         make_router_with_config(Arc::new(runner), "mock-model", cfg)
@@ -5662,7 +5662,7 @@ mod tests {
                 bos_token: None,
                 eos_token: None,
             },
-            media: Some(MediaConfig::ov_genai()),
+            media: Some(MediaConfig::ov_genai(None)),
             ..Config::default()
         };
         let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
@@ -5797,7 +5797,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let mut media = MediaConfig::ov_genai();
+            let mut media = MediaConfig::ov_genai(None);
             media.allow_remote_urls = allow;
             // Loopback over plain HTTP stands in for a public host here; the
             // production policy refuses both (see media::tests).
@@ -5845,7 +5845,7 @@ mod tests {
             .await
             .unwrap();
         let cfg = Config {
-            media: Some(MediaConfig::ov_genai()),
+            media: Some(MediaConfig::ov_genai(None)),
             max_concurrent_requests: 0,
             ..Config::default()
         };
@@ -5873,7 +5873,7 @@ mod tests {
             .await
             .unwrap();
         let cfg = Config {
-            media: Some(MediaConfig::ov_genai()),
+            media: Some(MediaConfig::ov_genai(None)),
             ..Config::default()
         };
         let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);

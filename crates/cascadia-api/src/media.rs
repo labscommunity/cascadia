@@ -70,12 +70,89 @@ pub fn base64_len(raw: usize) -> usize {
     raw.div_ceil(3) * 4 + 256
 }
 
+/// GenAI's universal tags: `<ov_genai_image_{i}>` and `<ov_genai_video_{i}>`
+/// mark a slot in every model's prompt.
+const GENAI_UNIVERSAL_TAGS: [&str; 2] = ["<ov_genai_image_", "<ov_genai_video_"];
+
+/// Each family's native image and video tags, which GenAI's VLMPipeline also
+/// reads as media slots ("Use Image or Video Tags in Prompt" in its docs), by
+/// the export's `config.json` `model_type`. A tag in caller text would
+/// either take an image's place or fail the request inside GenAI, which
+/// surfaces as a 5xx and marks the node degraded; refusing it is a 400.
+const GENAI_NATIVE_TAGS: &[(&[&str], &[&str])] = &[
+    // InternVL2, LLaVA-1.5, LLaVA-NeXT, nanoLLaVA, DeepSeek-OCR-2: `<image>`
+    // (some with a newline); MiniCPM-V/-o: `<image>./</image>`.
+    (
+        &[
+            "internvl_chat",
+            "llava",
+            "llava_next",
+            "llava-qwen2",
+            "deepseek_vl_v2",
+            "deepseekocr",
+        ],
+        &["<image>"],
+    ),
+    (&["llava_next_video"], &["<image>", "<video>"]),
+    (&["minicpmv", "minicpmo"], &["<image>", "</image>"]),
+    // Phi-3/3.5-vision, Phi-4-multimodal: `<|image_{n}|>` from 1;
+    // VideoChat-Flash uses the same tag for its videos.
+    (&["phi3_v", "phi4mm", "videochat_flash_qwen"], &["<|image_"]),
+    (
+        &[
+            "qwen2_vl",
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+        ],
+        &[
+            "<|vision_start|>",
+            "<|image_pad|>",
+            "<|video_pad|>",
+            "<|vision_end|>",
+        ],
+    ),
+    // GenAI's docs give `<img>` for gemma-3-4b-it; the template's own
+    // `<start_of_image>` is reserved too.
+    (&["gemma3"], &["<img>", "<start_of_image>"]),
+    (&["gemma3n"], &["<image_soft_token>"]),
+    (&["gemma4"], &["<|image|>", "<|video|>"]),
+];
+
+/// The text an ov-genai export must refuse in caller messages: the universal
+/// tags plus `model_type`'s native ones, or every known native tag when the
+/// type is missing or not listed (a tag GenAI reads that this server does
+/// not know is a 5xx; an over-cautious 400 is the cheaper mistake).
+fn genai_reserved_text(model_type: Option<&str>) -> Vec<String> {
+    let native: Vec<&str> = match model_type.and_then(|t| {
+        GENAI_NATIVE_TAGS
+            .iter()
+            .find(|(types, _)| types.contains(&t))
+    }) {
+        Some((_, tags)) => tags.to_vec(),
+        None => GENAI_NATIVE_TAGS
+            .iter()
+            .flat_map(|(_, tags)| tags.iter().copied())
+            .collect(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for tag in GENAI_UNIVERSAL_TAGS.into_iter().chain(native) {
+        if !out.iter().any(|t| t == tag) {
+            out.push(tag.to_owned());
+        }
+    }
+    out
+}
+
 impl MediaConfig {
-    /// Settings for the ov-genai engine on a VLM-layout export.
-    pub fn ov_genai() -> Self {
+    /// Settings for the ov-genai engine on a VLM-layout export whose
+    /// `config.json` names `model_type` (see [`GENAI_NATIVE_TAGS`]).
+    pub fn ov_genai(model_type: Option<&str>) -> Self {
         Self {
             image_placeholder: "<ov_genai_image_{i}>".into(),
-            reserved_text: vec!["<ov_genai_image_".into()],
+            reserved_text: genai_reserved_text(model_type),
             trim_text_parts: false,
             images_first: false,
             max_images: 8,
@@ -103,7 +180,7 @@ impl MediaConfig {
             ]
             .map(String::from)
             .to_vec(),
-            ..Self::ov_genai()
+            ..Self::ov_genai(None)
         }
     }
 
@@ -127,7 +204,7 @@ impl MediaConfig {
             .map(String::from)
             .to_vec(),
             trim_text_parts: true,
-            ..Self::ov_genai()
+            ..Self::ov_genai(None)
         }
     }
 
@@ -144,7 +221,7 @@ impl MediaConfig {
                 .map(String::from)
                 .to_vec(),
             trim_text_parts: true,
-            ..Self::ov_genai()
+            ..Self::ov_genai(None)
         }
     }
 
@@ -159,7 +236,7 @@ impl MediaConfig {
             reserved_text: ["[IMG]", "[IMG_BREAK]", "[IMG_END]"]
                 .map(String::from)
                 .to_vec(),
-            ..Self::ov_genai()
+            ..Self::ov_genai(None)
         }
     }
 
@@ -172,7 +249,7 @@ impl MediaConfig {
         Self {
             image_placeholder: "<|image_{n}|>\n".into(),
             reserved_text: ["<|image_", "<|image|>"].map(String::from).to_vec(),
-            ..Self::ov_genai()
+            ..Self::ov_genai(None)
         }
     }
 
@@ -186,7 +263,7 @@ impl MediaConfig {
             image_placeholder: "<image>\n".into(),
             reserved_text: vec!["<image>".into()],
             images_first: true,
-            ..Self::ov_genai()
+            ..Self::ov_genai(None)
         }
     }
 
@@ -200,7 +277,7 @@ impl MediaConfig {
             reserved_text: ["<img>", "</img>", "<IMG_CONTEXT>"]
                 .map(String::from)
                 .to_vec(),
-            ..Self::ov_genai()
+            ..Self::ov_genai(None)
         }
     }
 
@@ -707,7 +784,7 @@ mod tests {
 
     #[test]
     fn decodes_a_png_data_url_to_rgb() {
-        let cfg = MediaConfig::ov_genai();
+        let cfg = MediaConfig::ov_genai(None);
         let m = decode_image_url(&png_data_url(40, 30), None, &cfg).unwrap();
         assert_eq!((m.width, m.height, m.num_frames), (40, 30, 1));
         assert_eq!(m.pixels.len(), m.expected_len());
@@ -721,7 +798,7 @@ mod tests {
 
     #[test]
     fn downscales_to_the_pixel_budget_keeping_aspect() {
-        let mut cfg = MediaConfig::ov_genai();
+        let mut cfg = MediaConfig::ov_genai(None);
         cfg.max_image_pixels = 100 * 50;
         let m = decode_image_url(&png_data_url(400, 200), None, &cfg).unwrap();
         assert_eq!((m.width, m.height), (100, 50));
@@ -760,7 +837,7 @@ mod tests {
 
     #[test]
     fn refuses_what_it_cannot_take() {
-        let cfg = MediaConfig::ov_genai();
+        let cfg = MediaConfig::ov_genai(None);
         for (url, detail, needle) in [
             ("https://example.com/a.png", None, "only `data:`"),
             ("ftp://example.com/a.png", None, "only `data:`"),
@@ -780,7 +857,7 @@ mod tests {
         assert!(err.contains("detail `ultra`"), "{err}");
         let err = decode_image_url(&png_data_url(402, 2), None, &cfg).unwrap_err();
         assert!(err.contains("aspect ratio"), "{err}");
-        let mut small = MediaConfig::ov_genai();
+        let mut small = MediaConfig::ov_genai(None);
         small.max_source_pixels = 100;
         let err = decode_image_url(&png_data_url(20, 20), None, &small).unwrap_err();
         assert!(err.contains("pixels in total"), "{err}");
@@ -954,7 +1031,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_follows_checked_redirects_and_enforces_limits() {
         let base = image_server().await;
-        let cfg = MediaConfig::ov_genai();
+        let cfg = MediaConfig::ov_genai(None);
         let bytes = fetch_image(&format!("{base}/img.png"), 1 << 20, LOCAL)
             .await
             .unwrap();
@@ -990,7 +1067,7 @@ mod tests {
 
     #[test]
     fn placeholders_and_reserved_text() {
-        let cfg = MediaConfig::ov_genai();
+        let cfg = MediaConfig::ov_genai(None);
         assert_eq!(cfg.placeholder(3), "<ov_genai_image_3>");
         assert_eq!(
             cfg.reserved_in("see <ov_genai_image_0>"),
@@ -1088,7 +1165,7 @@ mod tests {
             q.reserved_beyond_placeholders(&format!("a{tag}<|video_pad|>"), 1),
             Some("<|video_pad|>")
         );
-        let o = MediaConfig::ov_genai();
+        let o = MediaConfig::ov_genai(None);
         assert_eq!(
             o.reserved_beyond_placeholders("<ov_genai_image_0><ov_genai_image_1>", 2),
             None
@@ -1135,5 +1212,73 @@ mod tests {
             x.join_parts(vec![(false, "A".into()), (true, "[IMG]".into())]),
             "A[IMG]"
         );
+    }
+
+    /// ov-genai reserves the universal image and video tags on every export,
+    /// plus the native tags GenAI reads for the export's family; an unknown
+    /// family reserves every known native tag.
+    #[test]
+    fn ov_genai_reserves_each_familys_native_tags() {
+        for (model_type, native, not_reserved) in [
+            (Some("llava_next"), "say <image> now", Some("<|image|>")),
+            (
+                Some("internvl_chat"),
+                "<image>\nhi",
+                Some("<|vision_start|>"),
+            ),
+            (Some("llava_next_video"), "a <video> b", None),
+            (Some("minicpmv"), "<image>./</image>", None),
+            (Some("phi3_v"), "<|image_1|>\nhi", Some("<image>")),
+            (Some("phi4mm"), "<|image_2|>", None),
+            (
+                Some("qwen2_vl"),
+                "<|vision_start|><|image_pad|><|vision_end|>",
+                Some("<image>"),
+            ),
+            (Some("qwen2_5_vl"), "x<|image_pad|>", None),
+            (Some("qwen3_vl"), "x<|video_pad|>", None),
+            (Some("qwen3_5"), "<|vision_start|>", None),
+            (Some("gemma3"), "<start_of_image>", Some("<|image|>")),
+            (Some("gemma3"), "<img>", None),
+            (Some("gemma3n"), "<image_soft_token>", None),
+            (Some("gemma4"), "<|image|>", Some("<image>")),
+            (Some("gemma4"), "<|video|>", None),
+        ] {
+            let cfg = MediaConfig::ov_genai(model_type);
+            assert!(
+                cfg.reserved_in(native).is_some(),
+                "{model_type:?}: {native:?}"
+            );
+            assert!(cfg.reserved_in("<ov_genai_image_3>").is_some());
+            assert!(cfg.reserved_in("<ov_genai_video_0>").is_some());
+            assert_eq!(cfg.reserved_in("plain text"), None);
+            if let Some(other) = not_reserved {
+                assert_eq!(cfg.reserved_in(other), None, "{model_type:?}: {other:?}");
+            }
+            // The universal placeholder never trips its own family's tags.
+            let tags = format!("{}{}", cfg.placeholder(0), cfg.placeholder(1));
+            assert_eq!(
+                cfg.reserved_beyond_placeholders(&tags, 2),
+                None,
+                "{model_type:?}"
+            );
+        }
+        for unknown in [None, Some("some_new_vlm")] {
+            let cfg = MediaConfig::ov_genai(unknown);
+            for tag in [
+                "<image>",
+                "<video>",
+                "<|image_1|>",
+                "<|vision_start|>",
+                "<|video_pad|>",
+                "<img>",
+                "<start_of_image>",
+                "<image_soft_token>",
+                "<|image|>",
+                "<|video|>",
+            ] {
+                assert!(cfg.reserved_in(tag).is_some(), "{unknown:?}: {tag}");
+            }
+        }
     }
 }

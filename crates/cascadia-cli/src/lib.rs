@@ -1614,6 +1614,15 @@ fn pipeline_vision_family(model: &str) -> Option<String> {
     }
 }
 
+/// An export's `config.json` `model_type` (`qwen2_5_vl`, `gemma3`, ...),
+/// which picks the native image tags ov-genai reads in a prompt.
+fn export_model_type(model: &str) -> Option<String> {
+    let v: serde_json::Value = std::fs::read(std::path::Path::new(model).join("config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())?;
+    v.get("model_type")?.as_str().map(str::to_owned)
+}
+
 /// Load a whole-model chat template for ov-genai, tolerating both layouts:
 /// `tokenizer/tokenizer_config.json` (HF subdir) and a root-level
 /// `tokenizer_config.json` / `chat_template.jinja` (OV int4 exports).
@@ -2682,9 +2691,11 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             warn!(reason = %why, "ov-genai: serving this VLM export text only");
         }
         let media_kind = match args.engine {
-            EngineKind::OvGenai if has_vision && genai_gap.is_none() => {
-                Some(cascadia_api::MediaConfig::ov_genai())
-            }
+            // GenAI also reads the family's native tags as image slots, so
+            // the API refuses them in caller text by the export's model type.
+            EngineKind::OvGenai if has_vision && genai_gap.is_none() => Some(
+                cascadia_api::MediaConfig::ov_genai(export_model_type(&args.model).as_deref()),
+            ),
             EngineKind::Qwen36Moe if has_vision => Some(cascadia_api::MediaConfig::qwen35_native()),
             // ov-runtime (Gemma 4 surgery trees) and gemma4 (gemma4_cached E2B/E4B
             // trees from export_gemma4.py --vision) both carry a `vision` block.
@@ -3932,6 +3943,25 @@ mod cli_version_tests {
 
 #[cfg(test)]
 mod tests {
+    /// ov-genai's reserved tags follow the export's `config.json` model type.
+    #[test]
+    fn ov_genai_media_reads_the_export_model_type() {
+        use super::export_model_type;
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().to_str().unwrap();
+        assert_eq!(export_model_type(model), None);
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type": "qwen2_5_vl", "vision_config": {"model_type": "x"}}"#,
+        )
+        .unwrap();
+        let t = export_model_type(model);
+        assert_eq!(t.as_deref(), Some("qwen2_5_vl"));
+        let media = cascadia_api::MediaConfig::ov_genai(t.as_deref());
+        assert!(media.reserved_in("<|image_pad|>").is_some());
+        assert!(media.reserved_in("<image>").is_none());
+    }
+
     #[test]
     fn vision_tree_media_per_engine() {
         use super::{vision_tree_media, EngineKind};
