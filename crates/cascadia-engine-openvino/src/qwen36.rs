@@ -59,8 +59,12 @@ const LEGACY_HIDDEN: usize = 2048;
 const PREFILL_CHUNK: usize = 256;
 
 /// How long a stage request a failed infer left busy gets to return to idle (OpenVINO `cancel()`,
-/// then `wait_for`) before the engine abandons it and fails (Task 46).
+/// then `wait_for`) before the engine abandons it (Task 46) and replaces it (Task 54).
 const STAGE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Requests the engine may abandon, and replace with fresh ones, before it fails instead (Task 54).
+/// Each abandoned request is leaked, device memory included, so a fault that recurs on every
+/// request cannot exhaust the GPU: the next abandon past this marks the engine failed.
+const MAX_ABANDONED_REQUESTS: usize = 4;
 /// One `wait_for` slice inside [`STAGE_IDLE_TIMEOUT`]: the state is re-read after each.
 const STAGE_IDLE_POLL: Duration = Duration::from_millis(100);
 
@@ -875,6 +879,9 @@ impl Builder for Qwen36Builder {
             infer_failed: false,
             engine_failed: None,
             stage_idle_timeout: STAGE_IDLE_TIMEOUT,
+            abandoned_requests: 0,
+            max_abandoned_requests: MAX_ABANDONED_REQUESTS,
+            fresh_requests: Vec::new(),
             max_ctx: self.max_ctx,
             refresh_costs: Default::default(),
             last_restore_bytes: 0,
@@ -947,6 +954,9 @@ impl OvStage {
     fn abandon_request(&mut self) -> cascadia_ov_genai_shim::Result<()> {
         ov_stage_call!(self, abandon_request())
     }
+    fn replace_request(&mut self) -> cascadia_ov_genai_shim::Result<()> {
+        ov_stage_call!(self, replace_request())
+    }
     fn get_state_blob(&mut self) -> cascadia_ov_genai_shim::Result<Vec<u8>> {
         ov_stage_call!(self, get_state_blob())
     }
@@ -963,7 +973,7 @@ impl OvStage {
 /// read the state (non-blocking); if it is not idle, `cancel()` and `wait_for` in slices until it
 /// is, up to `timeout`; if it never gets there, abandon the request (the shim leaks it rather than
 /// run its destructor) and return why. One `error` line per action: stage, action, outcome, ms.
-fn make_idle(label: &str, st: &mut OvStage, timeout: Duration) -> Result<(), String> {
+fn make_idle(label: &str, st: &mut OvStage, timeout: Duration) -> Result<(), Stuck> {
     let t0 = Instant::now();
     let ms = |t0: Instant| t0.elapsed().as_millis() as u64;
     let state = match st.request_state() {
@@ -985,12 +995,14 @@ fn make_idle(label: &str, st: &mut OvStage, timeout: Duration) -> Result<(), Str
                 elapsed_ms = ms(t0),
                 "qwen36: stage recovery"
             );
-            return Err(format!("{label} has no infer request"));
+            return Err(Stuck::NoRequest(format!("{label} has no infer request")));
         }
         Ok(s) => s,
         Err(e) => {
             error!(stage = label, action = "probe", outcome = "error", error = %e, elapsed_ms = ms(t0), "qwen36: stage recovery");
-            return Err(format!("{label}'s request state is unreadable: {e}"));
+            return Err(Stuck::Failed(format!(
+                "{label}'s request state is unreadable: {e}"
+            )));
         }
     };
     match st.cancel() {
@@ -1037,23 +1049,57 @@ fn make_idle(label: &str, st: &mut OvStage, timeout: Duration) -> Result<(), Str
         }
     }
     error!(stage = label, action = "wait", outcome = ?last, polls, elapsed_ms = ms(t0), "qwen36: stage recovery");
+    let why = format!(
+        "{label}'s infer request was still {last:?} {} ms after a failed infer (cancel + wait)",
+        ms(t0)
+    );
     match st.abandon_request() {
-        Ok(()) => error!(
-            stage = label,
-            action = "abandon",
-            outcome = "ok",
-            elapsed_ms = ms(t0),
-            "qwen36: stage recovery"
-        ),
+        Ok(()) => {
+            error!(
+                stage = label,
+                action = "abandon",
+                outcome = "ok",
+                elapsed_ms = ms(t0),
+                "qwen36: stage recovery"
+            );
+            Err(Stuck::Abandoned(format!("{why}; abandoned")))
+        }
         Err(e) => {
-            error!(stage = label, action = "abandon", outcome = "error", error = %e, elapsed_ms = ms(t0), "qwen36: stage recovery")
+            error!(stage = label, action = "abandon", outcome = "error", error = %e, elapsed_ms = ms(t0), "qwen36: stage recovery");
+            Err(Stuck::Failed(format!("{why}; abandon failed: {e}")))
         }
     }
-    Err(format!(
-        "{label}'s infer request was still {last:?} {} ms after a failed infer (cancel + wait); \
-         abandoned",
-        ms(t0)
-    ))
+}
+
+/// Why [`make_idle`] could not bring a request back to idle.
+enum Stuck {
+    /// Abandoned (leaked) after the timeout: the slot is empty and may get a fresh request.
+    Abandoned(String),
+    /// There was no request to recover (the slot was already empty).
+    NoRequest(String),
+    /// The request is still in place and not idle, or its state is unknown: nothing may replace
+    /// or release it, so the engine fails.
+    Failed(String),
+}
+
+/// A request slot the engine may replace (Task 54): the embeddings, or a local stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Emb,
+    Stage(usize),
+}
+
+/// The reason, and the log line, when a replaced request fails its first infer (Task 54): the
+/// compiled model itself is then suspect, so the engine fails rather than replace again.
+fn fresh_request_failed(slot: Slot, e: &cascadia_ov_genai_shim::Error) -> String {
+    let label = match slot {
+        Slot::Emb => "emb".to_string(),
+        Slot::Stage(j) => format!("stage{j}"),
+    };
+    let why = format!("{label}'s replacement infer request failed its first infer: {e}");
+    error!(stage = %label, action = "first infer", outcome = "error", error = %e, "qwen36: stage recovery");
+    error!(reason = %why, "qwen36: engine failed; every later task is refused until a restart");
+    why
 }
 
 fn map_ov(err: cascadia_ov_genai_shim::Error) -> EngineError {
@@ -1419,12 +1465,22 @@ pub struct Qwen36Engine {
     /// request may still be marked busy, and OpenVINO blocks forever releasing a busy request.
     /// The next `reset_all` makes every request idle first ([`make_idle`]), Task 46.
     infer_failed: bool,
-    /// Set when a request could not be made idle within `stage_idle_timeout` and was abandoned:
-    /// every later task fails at once with this reason (a `backend error`, a 5xx at the API),
-    /// and nothing touches the stage requests again. Only a restart clears it.
+    /// Set when the engine cannot keep serving after a failed infer (Task 46, narrowed by Task
+    /// 54): a request that could not be made idle could not be replaced either (the fresh create
+    /// failed, or `max_abandoned_requests` were already abandoned), or a replacement failed its
+    /// first infer. Every later task fails at once with this reason (a `backend error`, a 5xx at
+    /// the API), and nothing touches the stage requests again. Only a restart clears it.
     engine_failed: Option<String>,
     /// [`STAGE_IDLE_TIMEOUT`]; shorter in tests.
     stage_idle_timeout: Duration,
+    /// Requests abandoned (and leaked) by this engine so far, Task 54. One engine per process, so
+    /// this is the process's count of qwen36 leaks.
+    abandoned_requests: usize,
+    /// [`MAX_ABANDONED_REQUESTS`]; changed in tests.
+    max_abandoned_requests: usize,
+    /// Replacement requests that have not yet completed an infer (Task 54). A failed first infer
+    /// on one of them fails the engine.
+    fresh_requests: Vec<Slot>,
     /// `max_position_embeddings` of the model (from the tree's config.json); prompts at or past it
     /// are refused at submit rather than prefilled for hours on the single batch=1 slot. `None`
     /// when the tree does not state it (guard off; `read_max_ctx` warns which case it was).
@@ -1714,7 +1770,13 @@ impl Qwen36Engine {
             .map_err(map_ov)?;
         if let Err(e) = emb.infer() {
             self.infer_failed = true;
+            if self.fresh_requests.contains(&Slot::Emb) {
+                self.engine_failed = Some(fresh_request_failed(Slot::Emb, &e));
+            }
             return Err(map_ov(e));
+        }
+        if !self.fresh_requests.is_empty() {
+            self.fresh_requests.retain(|s| *s != Slot::Emb);
         }
         let (dtype, shape, bytes) = emb.output(0).map_err(map_ov)?;
         if !matches!(dtype, DType::F32) {
@@ -1802,7 +1864,13 @@ impl Qwen36Engine {
             }
             if let Err(e) = r {
                 self.infer_failed = true;
+                if self.fresh_requests.contains(&Slot::Stage(j)) {
+                    self.engine_failed = Some(fresh_request_failed(Slot::Stage(j), &e));
+                }
                 return Err(map_ov(e));
+            }
+            if !self.fresh_requests.is_empty() {
+                self.fresh_requests.retain(|s| *s != Slot::Stage(j));
             }
             let t_out = Instant::now();
             let (dtype, _shape, bytes) = st.output(0).map_err(map_ov)?;
@@ -1846,22 +1914,88 @@ impl Qwen36Engine {
         Ok(out[(n - 1) * row..].to_vec())
     }
 
-    /// Make every request idle after a failed infer ([`make_idle`]), embeddings first. False when
-    /// one never got there: it was abandoned and the engine is failed (`engine_failed`).
+    /// Make every request idle after a failed infer ([`make_idle`]), embeddings first. A request
+    /// that never gets there is abandoned (leaked) and replaced with a fresh one from the same
+    /// compiled model (Task 54), up to `max_abandoned_requests` per engine. False when the engine
+    /// is failed instead (`engine_failed`): a request that could not be abandoned, a fresh create
+    /// that failed, or an abandon past the cap.
     fn recover_requests(&mut self) -> bool {
         let timeout = self.stage_idle_timeout;
-        let emb = self.emb.iter_mut().map(|s| ("emb".to_string(), s));
+        let cap = self.max_abandoned_requests;
+        let emb = self
+            .emb
+            .iter_mut()
+            .map(|s| (Slot::Emb, "emb".to_string(), s));
         let stages = self
             .stages
             .iter_mut()
             .enumerate()
-            .map(|(i, s)| (format!("stage{i}"), s));
-        for (label, st) in emb.chain(stages) {
-            if let Err(why) = make_idle(&label, st, timeout) {
-                error!(reason = %why, "qwen36: engine failed; every later task is refused until a restart");
-                self.engine_failed = Some(why);
-                return false;
-            }
+            .map(|(i, s)| (Slot::Stage(i), format!("stage{i}"), s));
+        'stages: for (slot, label, st) in emb.chain(stages) {
+            let failed = 'slot: {
+                let (why, leaked) = match make_idle(&label, st, timeout) {
+                    Ok(()) => continue 'stages,
+                    Err(Stuck::Failed(why)) => break 'slot why,
+                    Err(Stuck::Abandoned(why)) => (why, true),
+                    Err(Stuck::NoRequest(why)) => (why, false),
+                };
+                if leaked {
+                    self.abandoned_requests += 1;
+                }
+                let abandoned = self.abandoned_requests;
+                let process_leaked = cascadia_ov_genai_shim::leaked_request_count();
+                if abandoned > cap {
+                    error!(
+                        stage = %label,
+                        action = "replace",
+                        outcome = "refused: cap",
+                        abandoned,
+                        cap,
+                        process_leaked,
+                        "qwen36: stage recovery"
+                    );
+                    break 'slot format!(
+                        "{why}; {abandoned} infer requests abandoned by this process, past the \
+                         cap of {cap}, so it is not replaced"
+                    );
+                }
+                let t0 = Instant::now();
+                let r = st.replace_request();
+                let elapsed_ms = t0.elapsed().as_millis() as u64;
+                match r {
+                    Ok(()) => {
+                        error!(
+                            stage = %label,
+                            action = "replace",
+                            outcome = "ok",
+                            abandoned,
+                            cap,
+                            process_leaked,
+                            elapsed_ms,
+                            "qwen36: stage recovery"
+                        );
+                        self.fresh_requests.push(slot);
+                        continue 'stages;
+                    }
+                    Err(e) => {
+                        error!(
+                            stage = %label,
+                            action = "replace",
+                            outcome = "error",
+                            error = %e,
+                            abandoned,
+                            cap,
+                            process_leaked,
+                            elapsed_ms,
+                            "qwen36: stage recovery"
+                        );
+                        format!("{why}; its replacement could not be created: {e}")
+                    }
+                }
+            };
+            error!(reason = %failed, "qwen36: engine failed; every later task is refused until a restart");
+            self.engine_failed = Some(failed);
+            return false;
         }
         self.infer_failed = false;
         true
@@ -4765,6 +4899,9 @@ mod tests {
             infer_failed: false,
             engine_failed: None,
             stage_idle_timeout: STAGE_IDLE_TIMEOUT,
+            abandoned_requests: 0,
+            max_abandoned_requests: MAX_ABANDONED_REQUESTS,
+            fresh_requests: Vec::new(),
             max_ctx: None,
             refresh_costs: Default::default(),
             last_restore_bytes: 0,
@@ -6321,6 +6458,8 @@ mod tests {
         busy: u32,
         cancelled: bool,
         abandoned: bool,
+        /// Task 54: `replace_request` fails (the fresh create, as OpenVINO's might).
+        fail_replace: bool,
     }
 
     impl MockStage {
@@ -6338,6 +6477,7 @@ mod tests {
                 busy: 0,
                 cancelled: false,
                 abandoned: false,
+                fail_replace: false,
             }
         }
         pub(super) fn input_names(&self) -> cascadia_ov_genai_shim::Result<Vec<String>> {
@@ -6403,6 +6543,20 @@ mod tests {
         pub(super) fn abandon_request(&mut self) -> cascadia_ov_genai_shim::Result<()> {
             self.events.lock().unwrap().push("abandon");
             self.abandoned = true;
+            Ok(())
+        }
+        /// Like the shim: a fresh request in the slot, whatever the old one's state (the old one
+        /// is leaked, never released). A fresh request is idle with default state.
+        pub(super) fn replace_request(&mut self) -> cascadia_ov_genai_shim::Result<()> {
+            self.events.lock().unwrap().push("replace");
+            if self.fail_replace {
+                return Err(cascadia_ov_genai_shim::Error::Native(
+                    "create_infer_request failed".into(),
+                ));
+            }
+            self.abandoned = false;
+            self.busy = 0;
+            self.cancelled = false;
             Ok(())
         }
         pub(super) fn set_input(
@@ -6787,61 +6941,135 @@ mod tests {
         assert!(!e.infer_failed && e.engine_failed.is_none() && !e.stages_dirty);
     }
 
-    #[test]
-    fn a_request_that_never_goes_idle_fails_the_engine_fast_for_chat_and_decisions() {
-        // Task 46: a request that stays busy is never released (its destructor would wait on it
-        // forever): after `stage_idle_timeout` it is abandoned, and this and every later task
-        // fails at once with a backend error instead of hanging. Chat fails here, a decision pass
-        // and another chat are refused after it.
-        let mut e = mock_box();
-        e.stage_idle_timeout = Duration::from_millis(300);
-        let events = busy_after_failed_infer(&mut e, 1, u32::MAX); // the first decode infer
-        e.submit(chat("c1")).unwrap();
-        let c = run_to_final(&mut e);
-        assert_eq!(
-            c.error.as_deref(),
-            Some("decode failed: backend error: unknown C++ exception in infer")
-        );
-        let before = events.lock().unwrap().len();
+    /// Task 54: arm stage 1 of a mock box so its next infer fails and leaves the request
+    /// `Cancelled` for good once cancelled (`busy` forever), as the GPU request did on pawan-01.
+    fn stuck_on_next_infer(e: &mut Qwen36Engine) -> Arc<std::sync::Mutex<Vec<&'static str>>> {
+        let at = infers(e, 1);
+        busy_after_failed_infer(e, at, u32::MAX)
+    }
 
-        let t0 = Instant::now();
-        e.submit(chat("c2")).unwrap();
+    fn mock1(e: &mut Qwen36Engine) -> &mut MockStage {
+        let OvStage::Mock(m) = &mut e.stages[1] else {
+            unreachable!()
+        };
+        m
+    }
+
+    #[test]
+    fn a_request_that_never_goes_idle_is_replaced_and_chat_and_decisions_keep_serving() {
+        // Task 54, pawan-01: after `unknown C++ exception in infer` stage6 stayed `Cancelled` for
+        // the whole 30 s wait and was abandoned, and Task 46 then failed the engine until a
+        // restart. Now the abandoned request is replaced by a fresh one from the same compiled
+        // model, and the next task is served. Both routes: a failed chat and a failed decision
+        // pass, each followed by the other kind and by its own.
+        for (fail, next) in [
+            (chat("c1"), chat("c2")),
+            (verbalizer_pass("d1"), verbalizer_pass("d2")),
+            (chat("c3"), verbalizer_pass("d3")),
+            (verbalizer_pass("d4"), chat("c4")),
+        ] {
+            let what = format!("{} then {}", fail.task_id, next.task_id);
+            let mut e = mock_box();
+            e.stage_idle_timeout = Duration::from_millis(200);
+            let events = stuck_on_next_infer(&mut e);
+            e.submit(fail).unwrap();
+            let c = run_to_final(&mut e);
+            let why = c.error.as_deref().expect("the first task fails");
+            assert!(
+                why.contains("unknown C++ exception in infer"),
+                "{what}: {why}"
+            );
+            let before = events.lock().unwrap().len();
+
+            let t0 = Instant::now();
+            e.submit(next).unwrap();
+            let c = run_to_final(&mut e);
+            let took = t0.elapsed();
+            assert!(
+                c.error.is_none(),
+                "{what}: served on the fresh request: {c:?}"
+            );
+            assert!(
+                took >= Duration::from_millis(200) && took < Duration::from_secs(3),
+                "{what}: one bounded wait: {took:?}"
+            );
+            let after = events.lock().unwrap()[before..].to_vec();
+            let abandon = after
+                .iter()
+                .position(|&a| a == "abandon")
+                .expect("abandoned");
+            assert_eq!(after[0], "cancel", "{what}: {after:?}");
+            assert!(
+                after[1..abandon].iter().all(|&a| a == "wait"),
+                "{what}: {after:?}"
+            );
+            assert_eq!(
+                &after[abandon..abandon + 3],
+                ["abandon", "replace", "reset"],
+                "{what}: replaced, then scrubbed: {after:?}"
+            );
+            assert!(after[abandon + 3..].contains(&"infer"), "{what}: {after:?}");
+            assert!(e.engine_failed.is_none() && !e.stages_dirty, "{what}");
+            assert_eq!(e.abandoned_requests, 1, "{what}");
+            assert!(
+                e.fresh_requests.is_empty(),
+                "{what}: the replacement has proven itself"
+            );
+
+            // And the task after that, with no recovery at all.
+            let n = events.lock().unwrap().len();
+            e.submit(chat("again")).unwrap();
+            assert!(run_to_final(&mut e).error.is_none(), "{what}");
+            let tail = events.lock().unwrap()[n..].to_vec();
+            assert!(
+                !tail.iter().any(|&a| a == "cancel" || a == "replace"),
+                "{what}: {tail:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn requests_abandoned_past_the_cap_fail_the_engine_for_chat_and_decisions() {
+        // Task 54: each abandoned request is leaked (device memory with it), so replacement is
+        // capped: past `max_abandoned_requests` the engine fails, as Task 46 did on the first.
+        let mut e = mock_box();
+        e.stage_idle_timeout = Duration::from_millis(100);
+        e.max_abandoned_requests = 2;
+        for round in 1..=2 {
+            stuck_on_next_infer(&mut e);
+            e.submit(chat("fails")).unwrap();
+            assert!(run_to_final(&mut e).error.is_some(), "round {round}");
+            e.submit(chat("served")).unwrap();
+            let c = run_to_final(&mut e);
+            assert!(c.error.is_none(), "round {round}: {c:?}");
+            assert_eq!(e.abandoned_requests, round);
+        }
+        let events = stuck_on_next_infer(&mut e);
+        e.submit(verbalizer_pass("fails")).unwrap();
+        assert!(run_to_final(&mut e).error.is_some());
+        let before = events.lock().unwrap().len();
+        e.submit(chat("refused")).unwrap();
         let c = run_to_final(&mut e);
-        let took = t0.elapsed();
         let why = c.error.as_deref().expect("refused");
         assert!(
             why.starts_with(
                 "backend error: qwen36 engine failed: stage1's infer request was still"
-            ),
+            ) && why.contains("3 infer requests abandoned by this process, past the cap of 2")
+                && why.ends_with("restart the server"),
             "{why}"
         );
-        assert!(why.ends_with("restart the server"), "{why}");
-        assert!(
-            took >= Duration::from_millis(300) && took < Duration::from_secs(3),
-            "bounded by stage_idle_timeout: {took:?}"
-        );
         let after = events.lock().unwrap()[before..].to_vec();
-        assert_eq!(after.first(), Some(&"cancel"), "{after:?}");
-        assert_eq!(after.last(), Some(&"abandon"), "{after:?}");
-        assert!(
-            !after.contains(&"reset"),
-            "nothing reset or released: {after:?}"
-        );
-        assert!(e.engine_failed.is_some() && e.active.is_none());
+        assert_eq!(after.last(), Some(&"abandon"), "not replaced: {after:?}");
+        assert!(e.engine_failed.is_some());
 
-        // Every later task: refused at once, nothing touches a stage.
+        // Every later task, either route: refused at once, nothing touches a stage.
         let n = events.lock().unwrap().len();
-        for task in [verbalizer_pass("d3"), chat("c4")] {
-            let id = task.task_id.clone();
+        for task in [verbalizer_pass("d"), chat("c")] {
             let t0 = Instant::now();
             e.submit(task).unwrap();
             let c = run_to_final(&mut e);
-            assert!(
-                t0.elapsed() < Duration::from_millis(100),
-                "{id}: {:?}",
-                t0.elapsed()
-            );
-            assert_eq!(c.error.as_deref(), Some(why), "{id}");
+            assert!(t0.elapsed() < Duration::from_millis(100));
+            assert_eq!(c.error.as_deref(), Some(why));
         }
         assert_eq!(
             events.lock().unwrap().len(),
@@ -6851,10 +7079,71 @@ mod tests {
     }
 
     #[test]
-    fn a_priming_fold_that_leaves_a_request_busy_fails_its_own_admission_fast() {
-        // Task 46: an infer that fails inside admission (the fold that primes a warm restore) is
-        // recovered by the cold path's reset, and a request that never goes idle refuses the
-        // task being admitted, not only the next one.
+    fn a_failed_replacement_create_fails_the_engine() {
+        // Task 54: if the compiled model cannot give a fresh request, there is nothing to serve
+        // on: the engine fails, as before Task 54, and says why.
+        let mut e = mock_box();
+        e.stage_idle_timeout = Duration::from_millis(100);
+        let events = stuck_on_next_infer(&mut e);
+        mock1(&mut e).fail_replace = true;
+        e.submit(chat("c1")).unwrap();
+        assert!(run_to_final(&mut e).error.is_some());
+        e.submit(verbalizer_pass("d2")).unwrap();
+        let c = run_to_final(&mut e);
+        let why = c.error.as_deref().expect("refused");
+        assert!(
+            why.starts_with("backend error: qwen36 engine failed: stage1's infer request")
+                && why.contains("its replacement could not be created: ")
+                && why.contains("create_infer_request failed")
+                && why.ends_with("restart the server"),
+            "{why}"
+        );
+        let ev = events.lock().unwrap().clone();
+        assert_eq!(ev.last(), Some(&"replace"), "{ev:?}");
+        assert!(e.engine_failed.is_some());
+        let t0 = Instant::now();
+        e.submit(chat("c3")).unwrap();
+        assert_eq!(run_to_final(&mut e).error.as_deref(), Some(why));
+        assert!(t0.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn a_replacement_that_fails_its_first_infer_fails_the_engine() {
+        // Task 54: a fresh request whose first infer fails points at the compiled model (or the
+        // device), not the request: the engine fails rather than replace again.
+        let mut e = mock_box();
+        e.stage_idle_timeout = Duration::from_millis(100);
+        let at = infers(&e, 1);
+        busy_after_failed_infer(&mut e, at, u32::MAX);
+        e.submit(chat("c1")).unwrap();
+        assert!(run_to_final(&mut e).error.is_some());
+        // The next infer on stage 1 is the replacement's first.
+        mock1(&mut e).fail_infer_at = Some(at + 1);
+        e.submit(chat("c2")).unwrap();
+        let c = run_to_final(&mut e);
+        let why = c.error.as_deref().expect("fails");
+        assert!(why.contains("unknown C++ exception in infer"), "{why}");
+        let reason = e.engine_failed.clone().expect("the engine is failed");
+        assert!(
+            reason.starts_with("stage1's replacement infer request failed its first infer"),
+            "{reason}"
+        );
+        e.submit(chat("c3")).unwrap();
+        let c = run_to_final(&mut e);
+        assert!(
+            c.error
+                .as_deref()
+                .is_some_and(|w| w.contains("replacement infer request failed its first infer")),
+            "{c:?}"
+        );
+        assert_eq!(e.abandoned_requests, 1, "never replaced a second time");
+    }
+
+    #[test]
+    fn a_priming_fold_that_leaves_a_request_stuck_is_replaced_within_its_own_admission() {
+        // Task 46 failed the admitting task here (the fold that primes a warm restore left its
+        // request busy). Task 54: the cold path's reset replaces the request, and the same task
+        // is served from a cold prefill.
         let mut e = mock_box();
         e.prefix_cache = crate::prefix_cache::PrefixCache::new(1 << 20);
         e.stage_idle_timeout = Duration::from_millis(200);
@@ -6869,20 +7158,15 @@ mod tests {
         };
         e.submit(pass("first", true)).unwrap();
         assert!(run_to_final(&mut e).error.is_none());
-        let at = match &e.stages[1] {
-            OvStage::Mock(m) => m.infers, // the priming fold of the next restore
-            _ => unreachable!(),
-        };
-        busy_after_failed_infer(&mut e, at, u32::MAX);
+        let events = stuck_on_next_infer(&mut e); // the priming fold of the next restore
         let t0 = Instant::now();
         e.submit(pass("warm", false)).unwrap();
         let c = run_to_final(&mut e);
-        let why = c.error.as_deref().expect("refused");
-        assert!(
-            why.starts_with("backend error: qwen36 engine failed: stage1"),
-            "{why}"
-        );
+        assert!(c.error.is_none(), "{c:?}");
         assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+        assert!(events.lock().unwrap().contains(&"replace"));
+        assert!(e.engine_failed.is_none() && e.fresh_requests.is_empty());
+        assert_eq!(e.abandoned_requests, 1);
     }
 
     #[test]
@@ -6950,7 +7234,9 @@ mod tests {
         // then drop every FORWARD, so each head task waited out `recv_timeout` (60 s). The relay
         // now returns a connection-fatal error instead of the ack; `run_relay_loop` exits and the
         // closed socket fails the head's exchange at once. Rank 1 is driven here as
-        // `run_relay_loop` drives it: on a connection-fatal error the stage is dropped.
+        // `run_relay_loop` drives it: on a connection-fatal error the stage is dropped. Task 54:
+        // a relay replaces the request like a single box does, so this rank has used up its
+        // replacements (cap 0) and its engine fails.
         let _knob = crate::timeout_knob_lock();
         cascadia_transport::set_activation_timeout_secs(30);
         let rt = pipe_rt();
@@ -6975,6 +7261,7 @@ mod tests {
         s1.busy = u32::MAX;
         relay.stages = vec![OvStage::Mock(s1)];
         relay.infer_failed = true;
+        relay.max_abandoned_requests = 0;
         let relay_loop = std::thread::spawn(move || loop {
             match relay.step() {
                 Err(e) if e.is_connection_fatal() => {
@@ -7029,6 +7316,83 @@ mod tests {
         let out = head.step_pipe_first();
         assert!(out.first().and_then(|(_, c)| c.error.as_ref()).is_some());
         assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        cascadia_transport::set_activation_timeout_secs(0);
+    }
+
+    #[test]
+    fn a_relay_replaces_a_stuck_request_and_the_heads_task_is_served() {
+        // Task 54 in pipeline mode: the relay's RESET runs the same recovery as a single box, so a
+        // request left stuck on rank 1 is abandoned and replaced inside the RESET, the ack follows,
+        // and the head's task is served. No frame changes: the head only sees a slower ack.
+        let _knob = crate::timeout_knob_lock();
+        cascadia_transport::set_activation_timeout_secs(30);
+        let rt = pipe_rt();
+        let (server, client) = rt.block_on(async {
+            let mut server = ActivationServer::new("127.0.0.1", 0);
+            server.start().await.unwrap();
+            let mut client = ActivationClient::new("127.0.0.1", server.port());
+            let (c, a) = tokio::join!(client.connect(), server.accept());
+            c.unwrap();
+            a.unwrap();
+            (server, client)
+        });
+
+        let mut relay = bare_engine(2, "{}");
+        relay.rank = 1;
+        relay.hidden = MOCK_HIDDEN;
+        relay.upstream = Some(Arc::new(tokio::sync::Mutex::new(server)));
+        relay.runtime_handle = Some(rt.handle().clone());
+        relay.stage_idle_timeout = Duration::from_millis(200);
+        let mut s1 = MockStage::new(&LAST_STAGE_INPUTS, MOCK_VOCAB, Some(1));
+        s1.busy = u32::MAX;
+        let events = Arc::clone(&s1.events);
+        relay.stages = vec![OvStage::Mock(s1)];
+        relay.infer_failed = true;
+        let relay_loop = std::thread::spawn(move || loop {
+            match relay.step() {
+                Err(e) if e.is_connection_fatal() => {
+                    return (relay.engine_failed.clone(), relay.abandoned_requests);
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                Ok(_) => {}
+            }
+        });
+
+        let mut head = bare_engine(2, "{}");
+        head.rank = 0;
+        head.handshake_done = true;
+        head.downstream = Some(Arc::new(tokio::sync::Mutex::new(client)));
+        head.runtime_handle = Some(rt.handle().clone());
+        head.hidden = MOCK_HIDDEN;
+        head.tokenizer = Some(tiny_tokenizer());
+        let emb = MockStage::new(&["input_ids"], MOCK_HIDDEN, None);
+        let s0 = MockStage::new(&FIRST_STAGE_INPUTS, MOCK_HIDDEN, None);
+        head.emb = Some(OvStage::Mock(emb));
+        head.stages = vec![OvStage::Mock(s0)];
+
+        let t0 = Instant::now();
+        head.pending.push(chat("t1"));
+        let mut fin = None;
+        for _ in 0..50 {
+            if let Some((_, c)) = head.step_pipe_first().into_iter().find(|(_, c)| c.is_final) {
+                fin = Some(c);
+                break;
+            }
+        }
+        let c = fin.expect("the head's task finishes");
+        assert!(
+            c.error.is_none(),
+            "served after the relay's replacement: {c:?}"
+        );
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        drop(head); // closes the link; the relay loop exits
+        let (failed, abandoned) = relay_loop.join().unwrap();
+        assert!(failed.is_none(), "{failed:?}");
+        assert_eq!(abandoned, 1);
+        let ev = events.lock().unwrap().clone();
+        let i = ev.iter().position(|&a| a == "replace").expect("replaced");
+        assert_eq!(ev[i - 1], "abandon", "{ev:?}");
+        assert!(ev[i..].contains(&"infer"), "{ev:?}");
         cascadia_transport::set_activation_timeout_secs(0);
     }
 
