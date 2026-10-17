@@ -623,6 +623,86 @@ pub fn deepstack_inputs(
     Ok((mask, out, n))
 }
 
+/// Flatten per-image DeepStack rows (each `[layers, tokens_i, hidden]`,
+/// layer-major) into one `[layers, total, hidden]` layer-major buffer in
+/// prompt order, `total` the image tokens across all images. The static and
+/// packed paths splice one image's rows into a prefill that may span several
+/// inferences, so they slice this buffer by a running image-token cursor
+/// rather than feeding whole images the way the stateful single-forward path
+/// does.
+pub fn flatten_deepstack(
+    images: &[Vec<f32>],
+    layers: usize,
+    hidden: usize,
+) -> Result<(Vec<f32>, usize), String> {
+    if layers == 0 || hidden == 0 {
+        return Ok((Vec::new(), 0));
+    }
+    let per: Vec<usize> = images.iter().map(|d| d.len() / (layers * hidden)).collect();
+    for (d, &k) in images.iter().zip(&per) {
+        if d.len() != layers * k * hidden {
+            return Err(format!(
+                "a DeepStack image has {} values, not a multiple of layers*hidden ({}*{})",
+                d.len(),
+                layers,
+                hidden
+            ));
+        }
+    }
+    let total: usize = per.iter().sum();
+    let mut out = vec![0f32; layers * total * hidden];
+    for l in 0..layers {
+        let mut off = 0usize;
+        for (d, &k) in images.iter().zip(&per) {
+            out[(l * total + off) * hidden..(l * total + off + k) * hidden]
+                .copy_from_slice(&d[l * k * hidden..(l + 1) * k * hidden]);
+            off += k;
+        }
+    }
+    Ok((out, total))
+}
+
+/// One static/packed inference's DeepStack feed for stage 0: `visual_pos_masks`
+/// (1 on the image tokens of `ids`, i64, length `width`) and
+/// `deepstack_visual_embeds [layers, width, hidden]` whose first `k` rows are
+/// the fed image tokens' DeepStack rows taken from `global[cursor..]` in
+/// image-token order (the rest zero). The language model adds row
+/// `max(0, cumsum(mask) - 1)` of the embeds to each image token, so the image
+/// rows belong at the front and the padded tail is never gathered — `width`
+/// may exceed `k`, which is what lets one static shape serve every inference.
+/// Returns the mask, the embeds, and `k` (image tokens fed, to advance the
+/// cursor). `k == 0` (a decode step, a text chunk) yields an all-zero feed.
+pub fn deepstack_window(
+    ids: &[i64],
+    image_pad: i64,
+    global: &[f32],
+    total: usize,
+    cursor: usize,
+    layers: usize,
+    hidden: usize,
+    width: usize,
+) -> Result<(Vec<i64>, Vec<f32>, usize), String> {
+    let mut mask = vec![0i64; width];
+    let mut k = 0usize;
+    for (i, &t) in ids.iter().enumerate().take(width) {
+        if t == image_pad {
+            mask[i] = 1;
+            k += 1;
+        }
+    }
+    if cursor + k > total {
+        return Err(format!(
+            "static DeepStack: {k} image tokens fed at cursor {cursor} run past the turn's {total}"
+        ));
+    }
+    let mut embeds = vec![0f32; layers * width * hidden];
+    for l in 0..layers {
+        let src = &global[(l * total + cursor) * hidden..(l * total + cursor + k) * hidden];
+        embeds[l * width * hidden..l * width * hidden + k * hidden].copy_from_slice(src);
+    }
+    Ok((mask, embeds, k))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,6 +778,47 @@ mod tests {
         assert_eq!((mask, n), (vec![0], 1));
         // A mismatch fails rather than shifting features.
         assert!(deepstack_inputs(&[9, 9], 9, &[vec![1.0, 2.0]], 2, 1).is_err());
+    }
+
+    #[test]
+    fn flatten_deepstack_is_layer_major_in_prompt_order() {
+        // Two images of 2 and 1 tokens, 2 layers, hidden 1.
+        // image A layer0: 1,2  layer1: 3,4 ; image B layer0: 5  layer1: 6
+        let a = vec![1.0, 2.0, 3.0, 4.0];
+        let b = vec![5.0, 6.0];
+        let (g, total) = flatten_deepstack(&[a, b], 2, 1).unwrap();
+        assert_eq!(total, 3);
+        // layer 0: A then B (1,2,5); layer 1: 3,4,6.
+        assert_eq!(g, vec![1.0, 2.0, 5.0, 3.0, 4.0, 6.0]);
+        assert_eq!(flatten_deepstack(&[], 2, 1).unwrap(), (vec![], 0));
+        assert_eq!(flatten_deepstack(&[vec![1.0]], 0, 1).unwrap(), (vec![], 0));
+    }
+
+    /// A chunk boundary falling inside an image feeds that chunk only its own
+    /// image tokens' rows (front-loaded), and the next chunk continues from the
+    /// cursor — the same rows a whole-image chunk would get, since the language
+    /// model gathers by the per-inference cumsum of the mask.
+    #[test]
+    fn deepstack_window_slices_by_cursor_across_a_split_image() {
+        // One image of 3 tokens, 1 layer, hidden 1: rows 10, 20, 30.
+        let (g, total) = flatten_deepstack(&[vec![10.0, 20.0, 30.0]], 1, 1).unwrap();
+        assert_eq!(total, 3);
+        // Whole image in one width-4 inference: ids [t, img, img, img].
+        let (mask, emb, k) = deepstack_window(&[1, 9, 9, 9], 9, &g, total, 0, 1, 1, 4).unwrap();
+        assert_eq!((mask, k), (vec![0, 1, 1, 1], 3));
+        assert_eq!(emb, vec![10.0, 20.0, 30.0, 0.0]);
+        // Split: chunk A = [t, img, img] (cursor 0), chunk B = [img, t] (cursor 2).
+        let (ma, ea, ka) = deepstack_window(&[1, 9, 9], 9, &g, total, 0, 1, 1, 3).unwrap();
+        assert_eq!((ma, ka), (vec![0, 1, 1], 2));
+        assert_eq!(ea, vec![10.0, 20.0, 0.0]); // image rows front-loaded, padded
+        let (mb, eb, kb) = deepstack_window(&[9, 1], 9, &g, total, ka, 1, 1, 2).unwrap();
+        assert_eq!((mb, kb), (vec![1, 0], 1));
+        assert_eq!(eb, vec![30.0, 0.0]);
+        // Decode step (width 1, no image token): all-zero feed, cursor unmoved.
+        let (md, ed, kd) = deepstack_window(&[5], 9, &g, total, 3, 1, 1, 1).unwrap();
+        assert_eq!((md, ed, kd), (vec![0], vec![0.0], 0));
+        // Feeding past the turn's image tokens is an error, not a bad slice.
+        assert!(deepstack_window(&[9], 9, &g, total, 3, 1, 1, 1).is_err());
     }
 
     #[test]
