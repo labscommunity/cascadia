@@ -1159,9 +1159,7 @@ fn new_prefix_cache(
 /// so an unflagged decision pass does not pay a multi-GB copy for a few tokens (P3-REG-1). A
 /// decision pass, flagged or not, also never copies a snapshot the cache can never hold
 /// ([`crate::prefix_cache::PrefixCache::can_hold`]: the key's length and the size estimate),
-/// which `insert` would only drop after the copy (P4-CE-2). An unflagged decision pass also drops
-/// a boundary whose later reuse the box has measured to lose ([`decision_reuse_pays`], Task 49).
-/// Chat keeps its own rule unchanged.
+/// which `insert` would only drop after the copy (P4-CE-2). Chat keeps its own rule unchanged.
 fn plan_pass_snapshots(
     decision: Option<&cascadia_types::DecisionReadout>,
     prompt: &[u32],
@@ -1182,8 +1180,8 @@ fn plan_pass_snapshots(
             costs,
             state_bytes,
         );
-        if let Some(d) = decision {
-            plan.retain(|&b| cache.can_hold(b) && decision_reuse_pays(d, b, cache, costs));
+        if decision.is_some() {
+            plan.retain(|&b| cache.can_hold(b));
         }
         plan
     }
@@ -1266,46 +1264,6 @@ fn decision_warm_probe<'a>(d: &cascadia_types::DecisionReadout, ids: &'a [u32]) 
         0 => &ids[..0],
         lim => &ids[..(lim + 1).min(ids.len())],
     }
-}
-
-/// The decision reuse rule ([`crate::prefix_cache::RefreshCosts::reuse_pays`]) for this pass and a
-/// shared prefix of `n` tokens: restoring its snapshot (`PrefixCache::estimated_bytes`, 0 when
-/// unknown) against prefilling those tokens in this pass, which with them takes
-/// `spans(prompt) - spans(prompt - n)` more prefill spans. A pass whose request was admitted on
-/// the shared-prefix discount (`needs_snapshot`, `require_warm`) always reuses: its budget
-/// assumed it. Chat never calls this. Logs both sides on `cascadia::perf` at debug.
-fn decision_reuse_pays(
-    d: &cascadia_types::DecisionReadout,
-    n: usize,
-    cache: &crate::prefix_cache::PrefixCache,
-    costs: &crate::prefix_cache::RefreshCosts,
-) -> bool {
-    if d.needs_snapshot || d.require_warm {
-        return true;
-    }
-    let prompt = d.prompt_ids.len();
-    let spans = |m: usize| m.div_ceil(prefill_chunk().max(1));
-    let spans_saved = spans(prompt).saturating_sub(spans(prompt.saturating_sub(n)));
-    let bytes = cache.estimated_bytes(n).unwrap_or(0);
-    let Some(cost) = costs.reuse_cost(n, spans_saved, bytes) else {
-        return true;
-    };
-    let pays = cost.restore_s < cost.prefill_s;
-    tracing::debug!(
-        target: "cascadia::perf",
-        n,
-        prompt,
-        spans_saved,
-        bytes,
-        restore_ms = cost.restore_s * 1e3,
-        prefill_ms = cost.prefill_s * 1e3,
-        fold_ms = costs.fold_s.map(|s| s * 1e3),
-        recreate_extra_ms = costs.recreate_extra_s() * 1e3,
-        prefill_us_per_tok = costs.prefill_s_per_token().map(|s| s * 1e6),
-        pays,
-        "qwen36 decision reuse rule"
-    );
-    pays
 }
 
 /// Prefix-cache refusals of a decision pass, checked after the restore and before any prefill
@@ -1988,16 +1946,6 @@ impl Qwen36Engine {
         self.timing.recreate = recreate;
         if all_ok {
             self.state_restored = false;
-            // The decision reuse rule's reset gap (`RefreshCosts::recreate_extra_s`). A
-            // recovery's reset is not the steady-state cost.
-            if !recovering {
-                let secs = Some(self.timing.reset.as_secs_f64());
-                if recreate {
-                    self.refresh_costs.recreate_s = secs;
-                } else {
-                    self.refresh_costs.reset_s = secs;
-                }
-            }
         }
         // A failed scrub leaves whatever was in the requests live; no snapshot of it may enter the
         // prefix cache until a reset succeeds (a warm restore overwrites it and is still allowed).
@@ -3726,18 +3674,7 @@ impl Qwen36Engine {
             // Issue-34 warm-resume: restore a cached strict-prefix blob and prefill only the suffix;
             // else cold reset. Gated + best-effort (stub ⇒ no blob ⇒ cold). 0 on the default path.
             let warm_prefix: usize = if let Some(d) = &task.decision {
-                // Task 49: an unflagged pass whose hit the box has measured to lose goes cold. The
-                // probe is peeked first (no LRU touch, no hit counted); an empty probe misses.
-                let probe = decision_warm_probe(d, &prompt_ids);
-                let probe = match self.prefix_cache.peek_longest(probe) {
-                    Some(n)
-                        if !decision_reuse_pays(d, n, &self.prefix_cache, &self.refresh_costs) =>
-                    {
-                        &probe[..0]
-                    }
-                    _ => probe,
-                };
-                self.local_warm_or_cold(probe)
+                self.local_warm_or_cold(decision_warm_probe(d, &prompt_ids))
             } else {
                 #[cfg(feature = "kv_coord")]
                 {
@@ -3957,15 +3894,6 @@ impl Qwen36Engine {
                 let secs = t.started.elapsed().as_secs_f64() - t.snapshot_secs;
                 if prefilled >= prefill_chunk() && secs > 0.0 {
                     self.refresh_costs.prefill_tok_s = Some(prefilled as f64 / secs);
-                }
-                // The decision reuse rule's prefill side: tokens, spans and wall time, so the
-                // spans' fixed cost can be taken out (`RefreshCosts::prefill_s_per_token`).
-                if prefilled >= crate::prefix_cache::PREFILL_OBS_MIN_TOKENS && secs > 0.0 {
-                    self.refresh_costs.prefill_obs = Some(crate::prefix_cache::PrefillObs {
-                        tokens: prefilled,
-                        spans: self.timing.spans as usize,
-                        secs,
-                    });
                 }
             }
             #[cfg(feature = "kv_coord")]
@@ -4407,14 +4335,11 @@ impl Qwen36Engine {
         // Prime un-run requests: one dummy single-token fold at position 0 so the plugin has
         // materialised its state buffers — otherwise the writes below are dropped on the next
         // inference. The fold's garbage state is overwritten by the restore.
-        let mut fold = None;
-        let mut set_secs = 0.0;
         if !self.primed {
             let zeros = vec![0f32; self.hidden];
             let t_prime = Instant::now();
             let primed = self.chain_pass(&zeros, 0, 1);
             self.timing.prime += t_prime.elapsed();
-            fold = Some(t_prime.elapsed().as_secs_f64());
             if let Err(e) = primed {
                 warn!(error = %e, "qwen36: priming fold before restore failed; cold reprefill");
                 self.state_restored = true;
@@ -4431,7 +4356,6 @@ impl Qwen36Engine {
             let t_set = Instant::now();
             let set = st.set_state_blob(part);
             self.timing.set_state += t_set.elapsed();
-            set_secs += t_set.elapsed().as_secs_f64();
             if let Err(e) = set {
                 warn!(error = %e, "qwen36: set_state_blob failed; cold reprefill");
                 // A partial apply still dirtied earlier stages — make the next reset scrub properly.
@@ -4486,14 +4410,6 @@ impl Qwen36Engine {
             info!(?fps, "qwen36_fp_at (warm restored)");
         }
         self.state_restored = true;
-        // The decision reuse rule's restore side, from this restore's own costs.
-        if fold.is_some() {
-            self.refresh_costs.fold_s = fold;
-        }
-        let bytes: usize = parts.iter().map(Vec::len).sum();
-        if bytes > 0 && set_secs > 0.0 {
-            self.refresh_costs.set_state_s_per_byte = Some(set_secs / bytes as f64);
-        }
         true
     }
 }
@@ -5689,7 +5605,6 @@ mod tests {
         let costs = RefreshCosts {
             prefill_tok_s: Some(455.0),
             snapshot_s_per_byte: Some(2.6 / 1.2e9),
-            ..Default::default()
         };
         let bytes = 1_200_000_000;
         let plan = |d: Option<&cascadia_types::DecisionReadout>| {
@@ -7027,140 +6942,6 @@ mod tests {
         e.submit(chat("c")).unwrap();
         assert!(run_to_final(&mut e).error.is_none());
         assert!(e.last_timing.is_none());
-    }
-
-    // ---- Task 49: the decision reuse rule ----
-
-    /// Measured rates under which every decision reuse loses: a one-second priming fold.
-    fn losing_costs() -> crate::prefix_cache::RefreshCosts {
-        crate::prefix_cache::RefreshCosts {
-            prefill_tok_s: Some(450.0),
-            snapshot_s_per_byte: Some(1.0),
-            prefill_obs: None,
-            fold_s: Some(1.0),
-            set_state_s_per_byte: Some(1.0),
-            recreate_s: Some(0.150),
-            reset_s: Some(0.005),
-        }
-    }
-
-    #[test]
-    fn an_unflagged_decision_pass_skips_reuse_that_does_not_pay() {
-        use crate::prefix_cache::{PrefixCache, RefreshCosts};
-        let cache = PrefixCache::new(1 << 30);
-        let d = kev_pass(60, 40);
-        let plan = |d: &cascadia_types::DecisionReadout, costs: &RefreshCosts| {
-            plan_pass_snapshots(Some(d), &d.prompt_ids, &[40], 0, &cache, costs, 0)
-        };
-        assert!(
-            plan(&d, &losing_costs()).is_empty(),
-            "a cold unflagged pass no longer snapshots a losing prefix"
-        );
-        assert_eq!(
-            plan(&d, &RefreshCosts::default()),
-            vec![40],
-            "unknown rates: as before"
-        );
-        let mut f = kev_pass(60, 40);
-        f.needs_snapshot = true;
-        assert_eq!(
-            plan(&f, &losing_costs()),
-            vec![40],
-            "needs_snapshot always snapshots"
-        );
-        assert!(!decision_reuse_pays(&d, 40, &cache, &losing_costs()));
-        assert!(decision_reuse_pays(&f, 40, &cache, &losing_costs()));
-        let mut w = kev_pass(60, 40);
-        w.require_warm = true;
-        assert!(
-            decision_reuse_pays(&w, 40, &cache, &losing_costs()),
-            "require_warm always reuses"
-        );
-        // Chat plans from its own rule: the losing rates do not reach it.
-        assert_eq!(
-            plan_pass_snapshots(None, &d.prompt_ids, &[40], 0, &cache, &losing_costs(), 0),
-            vec![40]
-        );
-    }
-
-    #[test]
-    fn a_decision_pass_goes_cold_over_a_losing_entry_but_chat_still_restores() {
-        let mut e = mock_box();
-        e.prefix_cache = crate::prefix_cache::PrefixCache::new(1 << 20);
-        e.refresh_costs = losing_costs();
-        let min = crate::prefix_cache::MIN_PREFIX_TOKENS;
-        let mut t = verbalizer_pass("k");
-        {
-            let d = t.decision.as_mut().unwrap();
-            d.prompt_ids = (0..min as u32 + 8).map(|i| i % MOCK_VOCAB as u32).collect();
-            d.cache_prefix = Some(min as u32);
-            assert!(e
-                .prefix_cache
-                .insert(d.prompt_ids[..min].to_vec(), vec![vec![3u8; 64]; 2]));
-        }
-        e.submit(t).unwrap();
-        let c = run_to_final(&mut e);
-        assert!(c.error.is_none(), "{c:?}");
-        // A successful final chunk carries no warm_prefix (only failures do): read the timing.
-        assert_eq!(
-            e.last_timing.as_ref().unwrap().warm_prefix,
-            0,
-            "went cold: restoring loses"
-        );
-        assert_eq!(e.prefix_cache.stats().0, 0, "no hit was taken");
-        assert!(
-            !e.last_timing.as_ref().unwrap().recreate,
-            "a cold pass's cheap reset"
-        );
-
-        // Chat: a long prompt extending a cached entry restores under the same losing rates.
-        e.refresh_costs = losing_costs();
-        let mut ct = chat("c");
-        ct.prompt = vec!["hi"; min + 4].join(" ");
-        let ids = admitted_prompt_ids(e.tokenizer.as_ref().unwrap(), &ct).unwrap();
-        assert_eq!(ids.len(), min + 4);
-        assert!(e
-            .prefix_cache
-            .insert(ids[..ids.len() - 1].to_vec(), vec![vec![3u8; 64]; 2]));
-        e.submit(ct).unwrap();
-        let c = run_to_final(&mut e);
-        assert!(c.error.is_none(), "{c:?}");
-        assert_eq!(
-            e.prefix_cache.stats().0,
-            1,
-            "chat ignores the decision rule: it took the hit"
-        );
-        assert!(
-            e.timing.recreate,
-            "and restored it: the turn's finish rebuilt the requests"
-        );
-    }
-
-    #[test]
-    fn a_restored_pass_measures_the_reuse_rules_costs() {
-        let mut e = mock_box();
-        e.prefix_cache = crate::prefix_cache::PrefixCache::new(1 << 20);
-        let min = crate::prefix_cache::MIN_PREFIX_TOKENS;
-        let pass = |id: &str, first: bool| {
-            let mut t = verbalizer_pass(id);
-            let d = t.decision.as_mut().unwrap();
-            d.prompt_ids = (0..min as u32 + 8).map(|i| i % MOCK_VOCAB as u32).collect();
-            d.cache_prefix = Some(min as u32);
-            d.needs_snapshot = first;
-            d.require_warm = !first;
-            t
-        };
-        e.submit(pass("first", true)).unwrap();
-        assert!(run_to_final(&mut e).error.is_none());
-        let c = e.refresh_costs;
-        assert!(c.reset_s.is_some(), "a cold pass's resets: {c:?}");
-        assert!(c.fold_s.is_none() && c.recreate_s.is_none(), "{c:?}");
-        e.submit(pass("warm", false)).unwrap();
-        assert!(run_to_final(&mut e).error.is_none());
-        assert_eq!(e.last_timing.as_ref().unwrap().warm_prefix, min);
-        let c = e.refresh_costs;
-        assert!(c.fold_s.is_some(), "the restore's priming fold: {c:?}");
-        assert!(c.recreate_s.is_some(), "the restored pass's rebuild: {c:?}");
     }
 
     #[test]
