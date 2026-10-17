@@ -345,8 +345,7 @@ def extract_stage(xml_path: str, spec: ModelSpec, a: int, b: int, first: bool, l
     return stage
 
 
-def build_manifest(spec: ModelSpec, source: str, final_hidden: bool = False,
-                   lm_head_last_row: bool = False) -> dict:
+def build_manifest(spec: ModelSpec, source: str, final_hidden: bool = False) -> dict:
     """The manifest.json head the engine reads (`Manifest::parse` in
     crates/cascadia-engine-openvino/src/qwen36.rs); `stages` is filled in
     as the stages are written.
@@ -362,12 +361,6 @@ def build_manifest(spec: ModelSpec, source: str, final_hidden: bool = False,
     It is written only when true, so a chat export's manifest stays
     byte-identical to one from an exporter that predates the key: ranks
     compare manifests byte for byte (HELLO) and `kv_fingerprint` hashes them.
-
-    `lm_head_last_row` (engine default false) says the last stage's LM head
-    reads only the last position (weight_swap.cut_lm_head_to_last_position),
-    so a prefill span computes one logits row. Also written only when true, so
-    chat manifests stay byte-identical, and an engine that predates the key
-    ignores it.
     """
     m = {
         "arch": spec.model_type,
@@ -380,8 +373,6 @@ def build_manifest(spec: ModelSpec, source: str, final_hidden: bool = False,
     }
     if final_hidden:
         m["final_hidden_output"] = True
-    if lm_head_last_row:
-        m["lm_head_last_row"] = True
     m["stages"] = []
     return m
 
@@ -416,8 +407,7 @@ def build_feeds(model, hidden_size: int, hidden=None, embeds=None):
 
 
 def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=None,
-               weights=None, lora=None, lora_scale=None, final_hidden=False, tokenizer=None,
-               lm_head_last_row=False):
+               weights=None, lora=None, lora_scale=None, final_hidden=False, tokenizer=None):
     """Cut the official int4 OV IR in `model_dir` into `num_stages` stage
     dirs under `output_dir` + manifest + aux files. Entry point for
     `cascadia shard` dispatch (export_shards.py) and for main() below.
@@ -433,13 +423,6 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
         target count.
       * `final_hidden`: the last stage also outputs the final-norm hidden
         (output 1, `final_hidden`); recorded as manifest `final_hidden_output`.
-      * `lm_head_last_row`: the last stage's LM head (MatMul and any grafted
-        lm_head LoRA branch) reads only the last position
-        (weight_swap.cut_lm_head_to_last_position), so a T-token prefill span
-        computes one logits row instead of [T, vocab]; `final_hidden` keeps
-        every row. Recorded as manifest `lm_head_last_row`. Decision trees
-        only: prefill's last logits row may differ from the uncut graph at
-        f16-ulp level on the GPU, so chat (`cascadia shard`) exports leave it off.
       * `tokenizer`: a tokenizer.json that replaces the one the tree would
         otherwise ship (the `weights` checkpoint's, else the stock IR's), for a
         head whose prompts were built with a different tokenizer (Kev: its own
@@ -492,7 +475,7 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
     if os.path.exists(stale):
         os.remove(stale)
     manifest = build_manifest(spec, os.path.basename(os.path.abspath(model_dir)),
-                              final_hidden=final_hidden, lm_head_last_row=lm_head_last_row)
+                              final_hidden=final_hidden)
 
     grafted = []
     if lora:
@@ -529,10 +512,6 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
         if last and final_hidden:
             from weight_swap import add_final_hidden_output
             add_final_hidden_output(stage)
-        if last and lm_head_last_row:
-            from weight_swap import cut_lm_head_to_last_position
-            cut_lm_head_to_last_position(stage)
-            print(f"  stage{i}: LM head cut to the last position", flush=True)
         sdir = os.path.join(output_dir, f"stage{i}")
         os.makedirs(sdir, exist_ok=True)
         ov.save_model(stage, os.path.join(sdir, "stage.xml"), compress_to_fp16=False)
