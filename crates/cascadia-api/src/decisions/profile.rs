@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// Calibration bounds checked at load. Shipped profiles use temperatures near 1 (JEV ~0.98,
 /// Kev ~2.19) and biases of a few tenths; with these bounds `(logit + bias) / temperature` is at
@@ -41,66 +41,9 @@ impl FromStr for JevStrategy {
     }
 }
 
-/// System 2 (adaptive thinking, serve_decide `thinking`): never, when System 1's leading option
-/// is below the threshold, or always. Score questions never think.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ThinkingMode {
-    #[default]
-    Off,
-    Auto,
-    On,
-}
-
-/// serve_decide `PROFILES["qwen"]`'s adaptive-thinking settings, the defaults for every field:
-/// thinking off, threshold 0.8, mix 0.5, and Qwen's thinking channel (`</think>`, then `"\n\n"`
-/// before the answer). decision.json may override them under `jev.system2`.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-pub struct ThinkProfile {
-    /// The mode a request without `thinking` runs.
-    #[serde(default)]
-    pub thinking: ThinkingMode,
-    /// `auto` thinks when System 1's leading probability is below this.
-    #[serde(default = "default_threshold")]
-    pub threshold: f64,
-    /// System 2's weight in the blend `(1 - mix) * p1 + mix * p2`.
-    #[serde(default = "default_mix")]
-    pub mix: f64,
-    /// The text that closes the thinking channel (its token is `jev.end_think_id`).
-    #[serde(default = "default_end_think")]
-    pub end_think: String,
-    /// What the template puts between `end_think` and the answer.
-    #[serde(default = "default_after_think")]
-    pub after_think: String,
-}
-
-fn default_threshold() -> f64 {
-    0.8
-}
-
-fn default_mix() -> f64 {
-    0.5
-}
-
-fn default_end_think() -> String {
-    "</think>".into()
-}
-
-fn default_after_think() -> String {
-    "\n\n".into()
-}
-
-impl Default for ThinkProfile {
-    fn default() -> Self {
-        Self {
-            thinking: ThinkingMode::Off,
-            threshold: default_threshold(),
-            mix: default_mix(),
-            end_think: default_end_think(),
-            after_think: default_after_think(),
-        }
-    }
-}
+/// The load error of a tree exported with the removed `--switchable-lora` (Task 53).
+pub const SWITCHABLE_REFUSAL: &str =
+    "switchable trees are no longer supported; re-export without --switchable-lora";
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -110,7 +53,7 @@ pub enum Family {
     Clef,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct JevProfile {
     pub verbalizers: Vec<String>,
     pub verbalizer_ids: Vec<u32>,
@@ -129,25 +72,6 @@ pub struct JevProfile {
     /// The plan for choices beyond the trained slots.
     #[serde(default)]
     pub strategy: JevStrategy,
-    /// System 2's answer labels (A..Z, AA.., at most MAX_CHOICE_LABELS) and their ids: the
-    /// tokens after `"Answer: ("` the read-back scores (serve_decide's `ans_labels`, Task 43's
-    /// export). Empty in an older decision.json: no thinking then.
-    #[serde(default)]
-    pub answer_labels: Vec<String>,
-    #[serde(default)]
-    pub answer_label_ids: Vec<u32>,
-    /// The token that closes the thinking channel (`</think>` for Qwen); System 2's generation
-    /// stops there. Absent: no thinking.
-    #[serde(default)]
-    pub end_think_id: Option<u32>,
-    /// The trained scale of a switchable tree (`--switchable-lora`, Task 41). Present means the
-    /// engine can run the base model (`lora_scale = 0`), which System 2 needs; absent means the
-    /// adapter is baked in and thinking is refused.
-    #[serde(default)]
-    pub lora_scale: Option<f64>,
-    /// Adaptive-thinking settings (serve_decide `PROFILES`).
-    #[serde(default)]
-    pub system2: ThinkProfile,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -182,6 +106,13 @@ impl DecisionProfile {
         let raw = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let p: DecisionProfile =
             serde_json::from_str(&raw).map_err(|e| format!("{}: {e}", path.display()))?;
+        // A tree exported with the removed `--switchable-lora` records its trained scale here;
+        // its stages take a `lora_scale` input nothing feeds any more (the engine refuses the
+        // tree too). Every other field Task 43 added (answer labels, end_think_id) is ignored.
+        let raw_v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        if !raw_v["jev"]["lora_scale"].is_null() {
+            return Err(format!("{}: {SWITCHABLE_REFUSAL}", path.display()));
+        }
         let ok = match p.family {
             Family::Jev => p.jev.is_some(),
             Family::Kev => p.kev.is_some(),
@@ -196,9 +127,7 @@ impl DecisionProfile {
             ));
         }
         let checked = p.jev.as_ref().map_or(Ok(()), |j| {
-            j.check_calibration()
-                .and_then(|()| j.check_choice_labels())
-                .and_then(|()| j.check_system2())
+            j.check_calibration().and_then(|()| j.check_choice_labels())
         });
         checked
             .and(p.kev.as_ref().map_or(Ok(()), KevProfile::check_calibration))
@@ -281,74 +210,6 @@ impl JevProfile {
             ));
         }
         Ok(())
-    }
-}
-
-impl JevProfile {
-    /// System 2's fields, when present, are well formed: answer labels pair up and fit
-    /// MAX_CHOICE_LABELS, threshold and mix lie in [0, 1], a trained scale is finite and not
-    /// negative, and a profile whose default mode thinks can (Task 43). Checked at load and again
-    /// by `JevCodec::new`.
-    pub fn check_system2(&self) -> Result<(), String> {
-        let (labels, ids) = (&self.answer_labels, &self.answer_label_ids);
-        if labels.len() != ids.len() {
-            return Err(format!(
-                "jev.answer_labels and answer_label_ids must have equal length, got {} and {}",
-                labels.len(),
-                ids.len()
-            ));
-        }
-        if labels.len() > MAX_CHOICE_LABELS {
-            return Err(format!(
-                "jev.answer_labels must have at most {MAX_CHOICE_LABELS} entries, got {}",
-                labels.len()
-            ));
-        }
-        // A noul shows two options; fewer labels could not label them.
-        if labels.len() == 1 {
-            return Err("jev.answer_labels must have at least 2 entries, got 1".into());
-        }
-        let s = &self.system2;
-        for (name, v) in [("threshold", s.threshold), ("mix", s.mix)] {
-            if !(0.0..=1.0).contains(&v) {
-                return Err(format!("jev.system2.{name} must be in [0, 1], got {v}"));
-            }
-        }
-        if let Some(x) = self.lora_scale.filter(|x| !x.is_finite() || *x < 0.0) {
-            return Err(format!(
-                "jev.lora_scale must be finite and at least 0, got {x}"
-            ));
-        }
-        if s.thinking != ThinkingMode::Off {
-            if let Some(why) = self.system2_refusal() {
-                return Err(format!(
-                    "jev.system2.thinking defaults to {:?}, but {why}",
-                    s.thinking
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Why this tree cannot think, or `None` when it can: System 2 runs the base model
-    /// (`lora_scale = 0`, a switchable tree only) and needs the exported answer labels and
-    /// end-of-think token.
-    pub fn system2_refusal(&self) -> Option<String> {
-        if self.lora_scale.is_none() {
-            return Some(
-                "thinking needs a switchable tree (decision.json jev.lora_scale, exported with \
-                 --switchable-lora); this tree has its adapter baked in"
-                    .into(),
-            );
-        }
-        if self.answer_label_ids.is_empty() || self.end_think_id.is_none() {
-            return Some(
-                "thinking needs System 2's export (decision.json jev.answer_labels and \
-                 jev.end_think_id); re-export the tree with tools/decision_export.py"
-                    .into(),
-            );
-        }
-        None
     }
 }
 
@@ -476,6 +337,27 @@ mod tests {
     }
 
     #[test]
+    fn a_switchable_tree_is_refused_and_system2_fields_are_ignored() {
+        // Task 53: trees exported between Tasks 43 and 53 carry System 2's answer labels and
+        // end_think_id; they load, the fields ignored. A switchable tree (jev.lora_scale) does not.
+        let d = std::env::temp_dir().join(format!("dprof-t53-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("decision.json");
+        let s2 = r#","answer_labels":["A","B"],"answer_label_ids":[9,10],"end_think_id":300"#;
+        std::fs::write(&p, jev_json(s2)).unwrap();
+        assert!(DecisionProfile::load(&p).is_ok());
+        std::fs::write(&p, jev_json(&format!(r#"{s2},"lora_scale":2.0"#))).unwrap();
+        let e = DecisionProfile::load(&p).unwrap_err();
+        assert!(
+            e.ends_with(
+                "switchable trees are no longer supported; re-export without --switchable-lora"
+            ),
+            "{e}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn choice_labels_must_extend_the_trained_choice_head() {
         let d = std::env::temp_dir().join(format!("dprof-t36b-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&d).unwrap();
@@ -515,69 +397,6 @@ mod tests {
             ),
         ] {
             std::fs::write(&p, jev_json(&extra)).unwrap();
-            let e = DecisionProfile::load(&p).unwrap_err();
-            assert!(e.contains(why), "{extra}: {e}");
-        }
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn system2_fields_are_optional_and_default_to_the_qwen_profile() {
-        // Task 43: an older decision.json has none of them and keeps loading, without thinking.
-        let d = std::env::temp_dir().join(format!("dprof-t43-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&d).unwrap();
-        let p = d.join("decision.json");
-        std::fs::write(&p, jev_json("")).unwrap();
-        let j = DecisionProfile::load(&p).unwrap().jev.unwrap();
-        assert!(j.answer_labels.is_empty() && j.end_think_id.is_none() && j.lora_scale.is_none());
-        assert_eq!(j.system2, ThinkProfile::default());
-        assert_eq!(j.system2.thinking, ThinkingMode::Off);
-        assert_eq!((j.system2.threshold, j.system2.mix), (0.8, 0.5));
-        assert_eq!(
-            (j.system2.end_think.as_str(), j.system2.after_think.as_str()),
-            ("</think>", "\n\n")
-        );
-        assert!(j.system2_refusal().unwrap().contains("switchable"));
-        let full = r#","answer_labels":["A","B"],"answer_label_ids":[9,10],"end_think_id":77,"lora_scale":2.0,"system2":{"thinking":"auto","mix":0.25}"#;
-        std::fs::write(&p, jev_json(full)).unwrap();
-        let j = DecisionProfile::load(&p).unwrap().jev.unwrap();
-        assert_eq!(j.answer_label_ids, [9, 10]);
-        assert_eq!((j.end_think_id, j.lora_scale), (Some(77), Some(2.0)));
-        assert_eq!(j.system2.thinking, ThinkingMode::Auto);
-        assert_eq!((j.system2.threshold, j.system2.mix), (0.8, 0.25));
-        assert_eq!(j.system2_refusal(), None);
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn malformed_system2_fields_are_refused_at_load() {
-        let d = std::env::temp_dir().join(format!("dprof-t43b-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&d).unwrap();
-        let p = d.join("decision.json");
-        for (extra, why) in [
-            (
-                r#","answer_labels":["A","B"],"answer_label_ids":[9]"#,
-                "equal length",
-            ),
-            (
-                r#","system2":{"threshold":1.5}"#,
-                "threshold must be in [0, 1]",
-            ),
-            (r#","system2":{"mix":-0.1}"#, "mix must be in [0, 1]"),
-            (r#","lora_scale":-1"#, "lora_scale must be finite"),
-            (r#","system2":{"thinking":"sometimes"}"#, "sometimes"),
-            (
-                r#","answer_labels":["A"],"answer_label_ids":[9]"#,
-                "at least 2",
-            ),
-            // A default that thinks on a tree that cannot: refused at load, not per request.
-            (r#","system2":{"thinking":"on"}"#, "switchable"),
-            (
-                r#","lora_scale":1.0,"system2":{"thinking":"auto"}"#,
-                "answer_labels",
-            ),
-        ] {
-            std::fs::write(&p, jev_json(extra)).unwrap();
             let e = DecisionProfile::load(&p).unwrap_err();
             assert!(e.contains(why), "{extra}: {e}");
         }

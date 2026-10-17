@@ -151,13 +151,6 @@ pub struct GenerationTask {
     /// `decision_unsupported:`-prefixed error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<crate::DecisionReadout>,
-    /// Runtime LoRA scale for a tree exported with a switchable adapter (`lora_scale` stage
-    /// input, docs/decisions.md). `None` = the tree's trained scale (`decision.json`
-    /// `jev.lora_scale`), which every System 1 pass and chat use; `Some(0.0)` removes the
-    /// adapter (the tree's backbone, for System 2). An engine refuses `Some` on a tree whose
-    /// scale is baked in rather than serve it with the adapter on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lora_scale: Option<f32>,
 }
 
 /// See `resume_token_ids`: `Some([])` on the wire normalizes to `None`.
@@ -235,7 +228,6 @@ impl GenerationTask {
             tenant: String::new(), // LOCAL_NS — see the field doc
             resume_token_ids: None,
             decision: None,
-            lora_scale: None,
         }
     }
 
@@ -283,7 +275,6 @@ mod tests {
             tenant: String::new(),
             resume_token_ids: None,
             decision: None,
-            lora_scale: None,
         };
         let json = serde_json::to_string(&t).unwrap();
         let back: GenerationTask = serde_json::from_str(&json).unwrap();
@@ -319,25 +310,6 @@ mod tests {
         });
         let back: GenerationTask = serde_json::from_value(payload).unwrap();
         assert_eq!(back.resume_token_ids, Some(vec![7, 8]));
-    }
-
-    #[test]
-    fn lora_scale_is_additive_on_the_wire() {
-        // Old payloads decode to None (the trained scale), and None is not serialized, so a task
-        // without an override encodes exactly as before the field existed.
-        let t = GenerationTask::new("t1", "hello");
-        assert_eq!(t.lora_scale, None);
-        let json = serde_json::to_value(&t).unwrap();
-        assert!(json.get("lora_scale").is_none(), "{json}");
-        let back: GenerationTask =
-            serde_json::from_value(serde_json::json!({"task_id": "t1", "prompt": "p"})).unwrap();
-        assert_eq!(back.lora_scale, None);
-        // The System 2 override survives a round trip, 0.0 included.
-        let mut t = GenerationTask::new("t2", "hello");
-        t.lora_scale = Some(0.0);
-        let back: GenerationTask =
-            serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
-        assert_eq!(back.lora_scale, Some(0.0));
     }
 
     #[test]
