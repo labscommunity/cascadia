@@ -826,7 +826,7 @@ mod tests {
         let roles: Vec<_> = m.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(roles, ["system", "system", "user", "assistant"]);
         assert_eq!(m[0].content, "be brief");
-        assert_eq!(m[2].content, "what\nis this");
+        assert_eq!(m[2].content, "whatis this");
         assert_eq!(
             m[2].parts,
             vec![
@@ -839,7 +839,7 @@ mod tests {
             ]
         );
         assert_eq!(m[3].content, "a dot");
-        assert!(m[3].parts.is_empty());
+        assert_eq!(m[3].parts, vec![ContentPart::Text("a dot".into())]);
 
         let chat = chat_request(
             &request(json!({"model": "m", "input": "x", "max_output_tokens": 7,
@@ -1014,6 +1014,16 @@ mod tests {
             text.contains("describe") && text.contains("<ov_genai_image_0>"),
             "placeholder missing from the echoed prompt: {text:?}"
         );
+        // `detail: "original"` (the SDKs' full-resolution value) is served.
+        let (status, v) = post_json(
+            make_image_app().await,
+            json!({"model": "mock-model", "max_output_tokens": 16, "input": [
+                {"role": "user", "content": [
+                    {"type": "input_text", "text": "describe"},
+                    {"type": "input_image", "image_url": png_url(8, 8), "detail": "original"}]}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
     }
 
     /// The chat endpoint's image refusals hold here too: a text-only model,
