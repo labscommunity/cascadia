@@ -4548,7 +4548,15 @@ impl OvRuntimeEngine {
             Ok::<_, EngineError>((plan_res, hidden, hf.shape, mrope_frame))
         })?;
         let mrope = match mrope_frame {
-            Some(f) => decode_wire_positions(&f, crate::qwen_vl_vision::MROPE_ROWS, pseq)?,
+            Some(f) => {
+                let p = decode_wire_positions(&f, crate::qwen_vl_vision::MROPE_ROWS, pseq)?;
+                debug!(
+                    rows = crate::qwen_vl_vision::MROPE_ROWS,
+                    seq = pseq,
+                    "packed relay: M-RoPE positions frame received"
+                );
+                p
+            }
             None => Vec::new(),
         };
 
