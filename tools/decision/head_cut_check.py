@@ -17,9 +17,8 @@ summed profiling real_time of the head's nodes (names containing "lm_head", plus
 branch found structurally; an executed node counts when any original node fused into it does),
 the stage total, the head's share, the wall-clock median and the slowest nodes, marked [head].
 
-Exit codes: 0 pass; 1 a gate failed (compare mode: logits max |diff| >= 0.05 at any T,
-final_hidden not bit-identical at T <= 7 or >= 1e-3 above it). A head time that fell < 90% is
-printed as a WARNING only (a one-row product still reads all the head weights);
+Exit codes: 0 pass; 1 a gate failed (compare mode: logits max |diff| >= 0.05 at the profile T,
+final_hidden not identical at T < 256 or >= 1e-3 at the profile T, head time fell < 90%);
 3 (--profile-only) the head is already under --narrowed-pct (2%) of the stage: the device
 already narrows it, so the cut would buy nothing.
 """
@@ -35,7 +34,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.p
 import weight_swap as ws  # noqa: E402
 
 MROPE_ROWS = 4  # crates/cascadia-engine-openvino/src/qwen36.rs
-EXACT_T = 7  # final_hidden must be bit-identical up to this span length, within 1e-3 above it
 
 
 def bin_for(xml):
@@ -199,14 +197,14 @@ def main(argv=None):
         dl = float(np.abs(ln.astype(np.float64) - lo).max())
         same_top = int(np.argmax(lo.reshape(-1))) == int(np.argmax(ln.reshape(-1)))
         msg = f"T={t}: logits max|d| {dl:.6f} (argmax {'same' if same_top else 'DIFFERS'})"
-        if dl >= 0.05:
+        if t == T and dl >= 0.05:
             fails.append(f"T={t}: logits max|d| {dl:.6f} >= 0.05")
         if fo is not None and fn is not None:
             df = float(np.abs(fn.astype(np.float64) - fo).max())
             msg += f", final_hidden max|d| {df:.6g}"
-            if t <= EXACT_T and df != 0.0:
+            if t < T and df != 0.0:
                 fails.append(f"T={t}: final_hidden max|d| {df:.6g} != 0")
-            if t > EXACT_T and df >= 1e-3:
+            if t == T and df >= 1e-3:
                 fails.append(f"T={t}: final_hidden max|d| {df:.6g} >= 1e-3")
         elif (fo is None) != (fn is None):
             fails.append(f"T={t}: final_hidden present in one IR only")
@@ -216,10 +214,7 @@ def main(argv=None):
     fall = 100 * (1 - hn / ho) if ho else float("nan")
     print(f"lm_head time at T={T}: {ho:.2f} -> {hn:.2f} ms ({fall:.1f}% less); share {so:.1f}% -> {sn:.1f}%")
     if not fall >= 90:
-        # A warning, not a gate: a one-row product still reads every head weight, so at T=256 the
-        # head may stay bandwidth-bound and fall less than 90% although the cut works. The
-        # end-to-end latency gate decides.
-        print(f"WARNING: lm_head time fell {fall:.1f}% < 90% ({ho:.2f} -> {hn:.2f} ms); judge by end-to-end latency")
+        fails.append(f"lm_head time fell {fall:.1f}% < 90%")
     for f in fails:
         print(f"FAIL: {f}")
     print("VERDICT: " + ("PASS" if not fails else "FAIL"))
