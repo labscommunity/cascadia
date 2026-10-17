@@ -773,11 +773,20 @@ What happens now:
 A fresh request needs nothing re-bound. Every input is set on each infer, and its variable
 state starts empty, as after `recreate_request`. The engine scrubs it like the other stages.
 
+**Both calls on the faulted model are bounded.** The create and the fresh request's first infer
+both run on the compiled model that just faulted. If the fault left a lock held, or the device
+queue wedged, either call could block forever while holding the engine. So each runs on a helper
+thread, with the same 30 s bound as the idle wait. The call itself is OpenVINO's usual
+synchronous one. If it does not return in time, the stage is abandoned with its thread: both are
+leaked, never destroyed. The engine then fails.
+
 **When a restart is still needed.** The engine fails in these cases:
 
-- The fresh request cannot be created.
-- A fresh request's first infer fails: the compiled model or the device is then suspect, not
-  the request.
+- The fresh request cannot be created, or its create does not return within 30 s.
+- A fresh request's first infer fails, or does not return within 30 s. The compiled model or
+  the device is then suspect, not the request. This is a deliberate choice: a single recurrence
+  of the intermittent fault on that first infer looks the same as a broken compiled model, so it
+  fails the engine even when a second replacement might have served.
 - More than 4 requests have been abandoned in this process (`MAX_ABANDONED_REQUESTS`). Each one
   is leaked, so this cap stops a fault that recurs on every task from exhausting GPU memory.
   The fifth abandon fails the engine instead of replacing.
@@ -790,14 +799,17 @@ the cap of 4, so it is not replaced`. Chat and decisions return their 5xx. `/hea
 answering, and reports `degraded` after a failed completion. Only a restart recovers it.
 
 Each recovery step is one `error` line, `qwen36: stage recovery`, with `stage`, `action`
-(`probe`, `cancel`, `wait`, `abandon`, `replace`, `reset`, `recreate` or `first infer`),
+(`probe`, `cancel`, `wait`, `abandon`, `replace`, `first_infer`, `reset` or `recreate`),
 `outcome` and `elapsed_ms`. The `replace` line also carries:
 
 - `abandoned`: this engine's count of abandoned requests;
 - `cap`: the limit, 4;
 - `process_leaked`: every request the native shim has leaked in this process.
 
-Its outcome is `ok`, `error` (the create failed) or `refused: cap`. A failed engine also logs
+Its outcome is `ok`, `error` (the create failed), `timeout` or `refused: cap`. The
+replacement's first infer logs `first_infer` with `ok`, `error` or `timeout`. A worst-case
+recovery therefore takes up to 30 s for the idle wait plus 30 s for the create plus 30 s for
+the first infer, and each wait is bounded. A failed engine also logs
 `qwen36: engine failed` once, and `refusing task (engine failed)` per task.
 
 The shim also guards itself:
@@ -810,9 +822,12 @@ The shim also guards itself:
 
 **Pipeline mode.** A downstream rank runs the same recovery inside the head's RESET. It
 abandons and replaces a stuck request the same way, and then acks, so the head's task is
-served. The head sees only a slower ack. The recovery takes up to 30 s, which fits under the
-head's default 60 s reply bound; a deployment that lowers that bound below the recovery fails
-that one task with `RESET not acked`.
+served. The head sees only a slower ack. The recovery takes up to 30 s for each stuck stage, and
+the time adds up across ranks: a middle rank recovers before it forwards the RESET downstream.
+One stuck stage fits under the head's default 60 s reply bound. Two stuck stages (on one rank,
+or on two) can exceed it, and so can a lower configured bound. The head then fails that task
+with `RESET not acked`. The protocol does not desync: acks carry the task's epoch, and the
+head skips a late one. The next task is served on the replaced requests.
 
 A downstream rank whose engine failed (one of the cases above) does not ack the next RESET. Its step
 returns a connection-fatal error, so the stage process exits for its supervisor to rebuild it.
