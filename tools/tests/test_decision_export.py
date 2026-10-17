@@ -22,6 +22,15 @@ def test_manifest_records_final_hidden():
     assert "final_hidden_output" not in ex.build_manifest(spec, "src")
 
 
+def test_manifest_records_the_lm_head_cut_only_when_true():
+    spec = ex.ModelSpec(model_type="qwen3_5", hidden=8, num_layers=4, layer_types=["linear_attention"] * 3 + ["full_attention"])
+    assert "lm_head_last_row" not in ex.build_manifest(spec, "src")
+    assert "lm_head_last_row" not in ex.build_manifest(spec, "src", final_hidden=True)
+    m = ex.build_manifest(spec, "src", final_hidden=True, lm_head_last_row=True)
+    assert m["lm_head_last_row"] is True
+    assert list(m)[-3:] == ["final_hidden_output", "lm_head_last_row", "stages"]
+
+
 def test_chat_manifest_is_byte_identical_to_the_pre_decision_exporter():
     """Ranks compare manifest.json byte for byte at HELLO and kv_fingerprint hashes it, so a chat
     export must not grow a `final_hidden_output: false` key a tree from main does not have."""
@@ -84,6 +93,7 @@ def stubbed(tmp_path, monkeypatch):
     monkeypatch.setattr(weight_swap, "swap_embeddings",
                         lambda xml, w, out: calls.append(("emb", os.path.basename(xml), w)))
     monkeypatch.setattr(weight_swap, "add_final_hidden_output", lambda stage: calls.append(("fh",)))
+    monkeypatch.setattr(weight_swap, "cut_lm_head_to_last_position", lambda stage: calls.append(("cut",)) or True)
     return model, tmp_path / "out", calls, weight_swap, monkeypatch
 
 
@@ -247,6 +257,20 @@ def test_final_hidden_only_on_last_stage_and_in_manifest(stubbed):
     ex.run_export(str(model), str(out), 2, final_hidden=True)
     assert [c[0] for c in calls] == ["save", "fh", "save"]
     assert json.loads((out / "manifest.json").read_text())["final_hidden_output"] is True
+
+
+def test_lm_head_cut_only_on_last_stage_after_final_hidden_and_in_manifest(stubbed):
+    model, out, calls, _, _ = stubbed
+    ex.run_export(str(model), str(out), 2, final_hidden=True, lm_head_last_row=True)
+    assert [c[0] for c in calls] == ["save", "fh", "cut", "save"]
+    assert json.loads((out / "manifest.json").read_text())["lm_head_last_row"] is True
+
+
+def test_chat_export_never_cuts_the_lm_head(stubbed):
+    model, out, calls, _, _ = stubbed
+    ex.run_export(str(model), str(out), 2, final_hidden=True)
+    assert "cut" not in [c[0] for c in calls]
+    assert "lm_head_last_row" not in json.loads((out / "manifest.json").read_text())
 
 
 def test_cli_flags_reach_run_export(monkeypatch):
@@ -419,7 +443,7 @@ def test_cli_jev_lora_from_adapter_dir_and_no_validate(cli, monkeypatch):
     (_, a, kw, assets_first), = calls
     assert a == (str(base), str(tmp / "t"), 8, False, None)
     assert kw == {"weights": None, "lora": os.path.join(str(ad), "adapter_model.safetensors"),
-                  "lora_scale": None, "final_hidden": False}
+                  "lora_scale": None, "final_hidden": False, "lm_head_last_row": True}
     assert assets_first
     assert seen == {"ad": str(ad), "cal": str(tmp / "jev" / "calibration.json"), "mt": 32768}
 
@@ -436,7 +460,7 @@ def test_cli_kev_final_hidden_weights_lora(cli, monkeypatch):
     (_, a, kw, assets_first), = calls
     assert a == (str(base), str(tmp / "t"), 2, False, None)
     assert kw == {"weights": "W", "lora": "L.safetensors", "lora_scale": 2.0, "final_hidden": True,
-                  "tokenizer": str(tmp / "kev" / "tokenizer.json")}
+                  "lm_head_last_row": True, "tokenizer": str(tmp / "kev" / "tokenizer.json")}
     assert assets_first and seen == {"pt": pt, "hidden": 8}
 
 
@@ -446,7 +470,8 @@ def test_cli_clef_weights_default_to_clef_dir(cli, monkeypatch):
                         lambda cd, out, max_tokens=None: de._write(out, {"family": "clef"}, {"kind": "joint"}))
     run("clef", "--base-ir", str(base), "--clef-dir", "C", "--out", str(tmp / "t"))
     (_, a, kw, assets_first), = calls
-    assert a[3] is False and kw == {"weights": "C", "lora": None, "lora_scale": None, "final_hidden": True}
+    assert a[3] is False and kw == {"weights": "C", "lora": None, "lora_scale": None, "final_hidden": True,
+                                    "lm_head_last_row": True}
     assert assets_first
 
 
