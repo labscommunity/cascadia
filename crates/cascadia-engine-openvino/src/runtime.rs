@@ -2047,6 +2047,25 @@ pub(crate) enum Frontend {
 }
 
 /// One turn's images as rank 0 prefills them.
+/// A packed vision turn encoded at `submit` and taken at admission: the
+/// expanded prompt, its image rows, and (Qwen VL) its M-RoPE positions +
+/// (Qwen3-VL) its DeepStack rows.
+struct PackedTurn {
+    ids: Vec<i64>,
+    rows: Vec<Vec<f32>>,
+    mrope: Option<crate::qwen35_vision::rope::MropePositions>,
+    deepstack: Vec<Vec<f32>>,
+}
+
+/// What a packed vision turn's encode yields beyond the expanded ids: the
+/// image rows, and Qwen VL's M-RoPE positions + Qwen3-VL's DeepStack rows (both
+/// absent for every other family, which `prepare_turn` fills as None / empty).
+type PackedEncoded = (
+    Vec<Vec<f32>>,
+    Option<crate::qwen35_vision::rope::MropePositions>,
+    Vec<Vec<f32>>,
+);
+
 pub(crate) struct PreparedTurn {
     /// The prompt with each image placeholder expanded.
     pub(crate) ids: Vec<i64>,
@@ -2616,7 +2635,7 @@ pub struct OvRuntimeEngine {
     /// Packed vision tree: each pending image task's expanded prompt ids and
     /// image rows, encoded at `submit` so an over-region prompt is refused
     /// there (413) like a long text prompt; taken at admission.
-    packed_images: std::collections::HashMap<TaskId, (Vec<i64>, Vec<Vec<f32>>)>,
+    packed_images: std::collections::HashMap<TaskId, PackedTurn>,
     active: Option<ActiveTask>,
     /// `--packed-slots`: multi-slot packed decode state (own compiled variant,
     /// per-slot KV regions, slot table). Mutually exclusive with `static_kv`
@@ -3026,6 +3045,8 @@ impl OvRuntimeEngine {
     /// (`cursor >= total`) every row is text — a decode step that sampled the
     /// pad id included — so the feed is all zero, matching `deepstack_inputs`
     /// on an empty image list. `None` when the tree has no DeepStack here.
+    /// The tuple is `(visual_pos_masks, deepstack_visual_embeds, layers, hidden)`.
+    #[allow(clippy::type_complexity)]
     fn take_static_deepstack(
         &mut self,
         ids: &[i64],
@@ -4141,11 +4162,24 @@ impl OvRuntimeEngine {
             // first image token (`admit`).
             let mut prompt_rows = Vec::new();
             let mut shareable = prompt_ids.len();
+            // Qwen VL: the turn's M-RoPE positions + Qwen3-VL DeepStack rows,
+            // carried into the slot so its prefill chunks and decode steps feed
+            // the right [3, 1, S] positions and DeepStack windows.
+            let mut mrope = None;
+            let mut deepstack_imgs: Vec<Vec<f32>> = Vec::new();
+            let mut deepstack_layers = 0usize;
             if let Some(first) = self.vision.as_mut().and_then(|v| v.first.as_mut()) {
+                deepstack_layers = first.frontend.deepstack_layers();
                 let mut image_rows = Vec::new();
                 if !task.media.is_empty() {
                     // Encoded and length-checked at submit.
-                    let Some((ids, rows)) = self.packed_images.remove(&task.task_id) else {
+                    let Some(PackedTurn {
+                        ids,
+                        rows,
+                        mrope: positions,
+                        deepstack,
+                    }) = self.packed_images.remove(&task.task_id)
+                    else {
                         let id = task.task_id.clone();
                         out.push((
                             id.clone(),
@@ -4155,6 +4189,8 @@ impl OvRuntimeEngine {
                     };
                     prompt_ids = ids;
                     image_rows = rows;
+                    mrope = positions;
+                    deepstack_imgs = deepstack;
                 }
                 let image = first.frontend.image_token();
                 shareable = prompt_ids
@@ -4186,11 +4222,29 @@ impl OvRuntimeEngine {
             }
             let (id, prompt_tokens, images) =
                 (task.task_id.clone(), prompt_ids.len(), task.media.len());
-            let shared =
-                self.packed
-                    .as_mut()
-                    .unwrap()
-                    .admit(slot, task, prompt_ids, prompt_rows, shareable);
+            // Flatten the per-image DeepStack rows to the slot's global
+            // [layers, total, hidden] buffer (Qwen3-VL; empty otherwise).
+            let (ds_global, ds_total) = match crate::qwen_vl_vision::flatten_deepstack(
+                &deepstack_imgs,
+                deepstack_layers,
+                self.hidden_size,
+            ) {
+                Ok(g) => g,
+                Err(e) => {
+                    out.push((id.clone(), Chunk::error(id, e)));
+                    continue;
+                }
+            };
+            let shared = self.packed.as_mut().unwrap().admit(
+                slot,
+                task,
+                prompt_ids,
+                prompt_rows,
+                shareable,
+                mrope,
+                ds_global,
+                ds_total,
+            );
             info!(
                 task = %id,
                 slot,
@@ -4250,11 +4304,15 @@ impl OvRuntimeEngine {
                     let images = self
                         .packed_image_blocks()
                         .then(|| packed.last_plan_images());
+                    // Qwen VL: the per-row M-RoPE positions this stage fed ride
+                    // the wire to every downstream stage (only rank 0 knows them).
+                    let mrope = self.vision_mrope().then(|| packed.last_plan_mrope());
                     let tokens = self.exchange_packed_downstream(
                         &hidden,
                         &oshape,
                         &plan_rows,
                         images.as_deref(),
+                        mrope.as_deref(),
                     )?;
                     self.emit_packed_tokens(&tokens, kind, &mut out)
                 })
@@ -4318,6 +4376,7 @@ impl OvRuntimeEngine {
         shape: &[usize],
         plan_rows: &[crate::packed_exec::WireRowOpt],
         plan_images: Option<&[Option<u32>]>,
+        mrope: Option<&[i64]>,
     ) -> EngineResult<Vec<i32>> {
         let down = self.downstream.clone().ok_or_else(|| {
             EngineError::Backend("packed pipeline stage has no downstream".into())
@@ -4332,6 +4391,11 @@ impl OvRuntimeEngine {
             [s3[0] as u32, s3[1] as u32, s3[2] as u32],
             f32_to_f16_bytes(hidden),
         );
+        // Qwen VL: the per-row M-RoPE positions as `[1, 3, S]`, sent after the
+        // hidden so the downstream stage feeds the same rows (see the
+        // non-packed `send_hidden_frames`).
+        let mrope_frame =
+            mrope.map(|m| encode_wire_positions(crate::qwen_vl_vision::MROPE_ROWS, m));
         // A prefill reply waits on multi-token compute across every remaining
         // stage — widen its deadline like the non-packed path does.
         let prefill = plan_has_prefill_rows(plan_rows);
@@ -4345,6 +4409,12 @@ impl OvRuntimeEngine {
                 .send(&hidden_frame)
                 .await
                 .map_err(|e| EngineError::Backend(format!("packed hidden send: {e}")))?;
+            if let Some(f) = &mrope_frame {
+                guard
+                    .send(f)
+                    .await
+                    .map_err(|e| EngineError::Backend(format!("packed M-RoPE send: {e}")))?;
+            }
             // Having just sent both frames this stage is OWED a token frame.
             // `recv_reply*`, NOT plain `recv` under an external
             // `tokio::time::timeout` (#122): the deadline lives inside the
@@ -4430,8 +4500,10 @@ impl OvRuntimeEngine {
             .clone()
             .ok_or_else(|| EngineError::Backend("packed relay stage has no upstream".into()))?;
         let slots = self.packed.as_ref().unwrap().kv.slots;
+        let pseq = self.packed.as_ref().unwrap().kv.packed_seq;
         let want_images = self.packed_image_blocks();
-        let (plan_res, hidden, hshape) = self.block_on(async {
+        let want_mrope = self.vision_mrope();
+        let (plan_res, hidden, hshape, mrope_frame) = self.block_on(async {
             let mut guard = up.lock().await;
             // The plan frame is this stage's idle wait for the next unit of
             // work — idle-tolerant `recv`. Once it arrives the upstream owes
@@ -4451,6 +4523,19 @@ impl OvRuntimeEngine {
                 .recv_reply()
                 .await
                 .map_err(|e| EngineError::Backend(format!("packed hidden recv: {e}")))?;
+            // Qwen VL: the per-row M-RoPE positions follow the hidden, deadlined
+            // like it (same owed-frame rule).
+            let mrope_frame = if want_mrope {
+                Some(
+                    guard
+                        .recv_reply()
+                        .await
+                        .map_err(|e| EngineError::Backend(format!("packed M-RoPE recv: {e}")))?
+                        .0,
+                )
+            } else {
+                None
+            };
             let plan_res = decode_wire_plan_images(&pf, slots, want_images);
             let hidden: Vec<f32> = match hf.dtype {
                 WireDType::F16 => f16_bytes_to_f32(&hf.data),
@@ -4460,8 +4545,12 @@ impl OvRuntimeEngine {
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect(),
             };
-            Ok::<_, EngineError>((plan_res, hidden, hf.shape))
+            Ok::<_, EngineError>((plan_res, hidden, hf.shape, mrope_frame))
         })?;
+        let mrope = match mrope_frame {
+            Some(f) => decode_wire_positions(&f, crate::qwen_vl_vision::MROPE_ROWS, pseq)?,
+            None => Vec::new(),
+        };
 
         // The pair is consumed. From here on, any failure MUST still answer
         // the upstream — otherwise it blocks awaiting a token frame that
@@ -4470,7 +4559,7 @@ impl OvRuntimeEngine {
         // frame ([1,1,0]): wire-aligned, unambiguous (a real reply always
         // has one token per row), and it tells the upstream "batch lost,
         // link healthy".
-        let step = self.relay_packed_body(plan_res, hidden, hshape);
+        let step = self.relay_packed_body(plan_res, hidden, hshape, mrope);
         let frame = match &step {
             Ok(tokens) => encode_wire_tokens(tokens),
             Err(e) => {
@@ -4504,6 +4593,7 @@ impl OvRuntimeEngine {
         plan_res: EngineResult<(Vec<crate::packed_exec::WireRowOpt>, Vec<Option<u32>>)>,
         hidden: Vec<f32>,
         hshape: [u32; MAX_RANK],
+        mrope: Vec<i64>,
     ) -> EngineResult<Vec<i32>> {
         let (plan_rows, plan_images) = plan_res?;
         let hidden_size = hshape[2] as usize;
@@ -4516,11 +4606,20 @@ impl OvRuntimeEngine {
             .iter()
             .map(|r| r.map(|(_, _, sh)| sh).unwrap_or(0))
             .collect();
+        // The relay feeds only the M-RoPE positions the wire carried; the
+        // DeepStack rows live on rank 0 (stage 0) alone, so its extras here
+        // carry no mask / embeds.
+        let extras = crate::packed_exec::PackedExtras {
+            mrope,
+            ds_mask: Vec::new(),
+            ds_embeds: Vec::new(),
+        };
         let (odt, oshape, obytes) = self.packed.as_mut().unwrap().run_plan(
             &plan,
             crate::packed_exec::PackedPrimary::Hidden(&hidden, hidden_size),
             &positions,
             &reuse,
+            &extras,
         )?;
 
         if self.spec.is_last_stage {
@@ -4540,7 +4639,8 @@ impl OvRuntimeEngine {
             // the caller NACKs our own upstream in turn, so the abort
             // reaches rank 0 no matter how deep the pipeline is.
             let images = self.packed_image_blocks().then_some(plan_images.as_slice());
-            self.exchange_packed_downstream(&hidden_out, &oshape, &plan_rows, images)
+            let mrope_fwd = self.vision_mrope().then_some(extras.mrope.as_slice());
+            self.exchange_packed_downstream(&hidden_out, &oshape, &plan_rows, images, mrope_fwd)
         }
     }
 
@@ -5859,7 +5959,13 @@ impl Engine for OvRuntimeEngine {
                             packed_seq,
                             region,
                             |f: &Frontend, ids: &[i64]| f.expand_ids(media, ids),
-                            |f: &mut Frontend, ids: &[i64]| f.prepare(media, ids, tenant),
+                            // `prepare_turn` keeps Qwen VL's M-RoPE positions
+                            // and Qwen3-VL's DeepStack rows (None / empty for
+                            // every other family), taken at admission.
+                            |f: &mut Frontend, ids: &[i64]| {
+                                f.prepare_turn(media, ids, tenant)
+                                    .map(|p| (p.ids, (p.rows, p.mrope, p.deepstack)))
+                            },
                         )
                     }
                     None => packed_check_then_encode(
@@ -5871,14 +5977,22 @@ impl Engine for OvRuntimeEngine {
                         packed_seq,
                         region,
                         |_: &(), ids: &[i64]| Ok(ids.to_vec()),
-                        |_: &mut (), _: &[i64]| Err::<(Vec<i64>, Vec<Vec<f32>>), _>(String::new()),
+                        |_: &mut (), _: &[i64]| Err::<(Vec<i64>, PackedEncoded), _>(String::new()),
                     ),
                 }
                 .inspect_err(
                     |e| warn!(task = %task.task_id, error = %e, "refusing packed prompt at submit"),
                 )?;
-                if let Some(rows) = images {
-                    self.packed_images.insert(task.task_id.clone(), (ids, rows));
+                if let Some((rows, mrope, deepstack)) = images {
+                    self.packed_images.insert(
+                        task.task_id.clone(),
+                        PackedTurn {
+                            ids,
+                            rows,
+                            mrope,
+                            deepstack,
+                        },
+                    );
                 }
             }
         }
@@ -7678,6 +7792,25 @@ impl Builder for OvRuntimeBuilder {
                     token_type_ids_port = types_in.as_deref().unwrap_or("none"),
                     "packed multi-slot decode active"
                 );
+                // Qwen VL: this stage feeds [3, 1, S] M-RoPE positions, and
+                // Qwen3-VL stage 0 (rank 0, which holds `first`) feeds the
+                // DeepStack ports. Relay stages hold no DeepStack layers.
+                let mrope = self.vision.as_ref().is_some_and(|v| v.mrope);
+                let ds_layers = self
+                    .vision
+                    .as_ref()
+                    .and_then(|v| v.first.as_ref())
+                    .map_or(0, |f| f.frontend.deepstack_layers());
+                let visual_mask_in = pcanon.get("visual_pos_masks").cloned();
+                let deepstack_in = pcanon.get("deepstack_visual_embeds").cloned();
+                if ds_layers > 0 && (visual_mask_in.is_none() || deepstack_in.is_none()) {
+                    return Err(EngineError::InvalidConfig(
+                        "Qwen3-VL packed stage 0 is missing visual_pos_masks / \
+                         deepstack_visual_embeds; rebuild it with tools/packed_variant.py \
+                         from this build"
+                            .into(),
+                    ));
+                }
                 let mut state = crate::packed_exec::PackedState::new(
                     prt,
                     kv,
@@ -7690,6 +7823,16 @@ impl Builder for OvRuntimeBuilder {
                 );
                 state.types_in = types_in;
                 state.image_token = image_token;
+                state.mrope = mrope;
+                state.deepstack_layers = ds_layers;
+                state.deepstack_hidden = self.hidden_size;
+                state.deepstack_image_pad = self
+                    .vision
+                    .as_ref()
+                    .and_then(|v| v.first.as_ref())
+                    .map_or(0, |f| f.frontend.image_token());
+                state.visual_mask_in = visual_mask_in;
+                state.deepstack_in = deepstack_in;
                 Some(state)
             }
         };

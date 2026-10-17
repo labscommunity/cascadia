@@ -16,6 +16,20 @@ use cascadia_ov_genai_shim::{DType as ShimDType, Runtime as OvRuntime};
 use cascadia_types::GenerationTask;
 
 use crate::packed::{image_safe_take, prompt_image_ids, PackedKv, PackedPlan};
+use crate::qwen35_vision::rope::MropePositions;
+
+/// Qwen VL packed extras fed alongside a plan. `mrope` is the per-row M-RoPE
+/// `position_ids` as `[3, S]` row-major (`mrope[r*S + col]`), empty on a text /
+/// non-Qwen tree. `ds_mask` / `ds_embeds` are Qwen3-VL stage 0's DeepStack
+/// inputs (`visual_pos_masks [S]`, `deepstack_visual_embeds [layers, S,
+/// hidden]`); empty on every other stage, since only stage 0 holds the
+/// DeepStack layers. The relay stages carry only `mrope` on the wire.
+#[derive(Default, Clone)]
+pub(crate) struct PackedExtras {
+    pub(crate) mrope: Vec<i64>,
+    pub(crate) ds_mask: Vec<i64>,
+    pub(crate) ds_embeds: Vec<f32>,
+}
 
 /// Primary input of a packed inference: prompt/decode token ids on the embed
 /// stage, upstream hidden rows on relay + head stages.
@@ -42,6 +56,15 @@ pub(crate) struct PackedSlot {
     /// Image id per prompt token when the tree masks image blocks (Gemma 4),
     /// else empty. Prefill chunks never split an image.
     pub(crate) prompt_images: Vec<Option<u32>>,
+    /// Qwen VL: the prompt's M-RoPE positions (`None` on a text turn, where
+    /// every row is the plain token index). A prefill chunk slices these; a
+    /// decode step continues from `rope_delta`.
+    pub(crate) mrope: Option<MropePositions>,
+    /// Qwen3-VL: this slot's DeepStack rows flattened to `[layers, total,
+    /// hidden]` (prompt order); empty otherwise. `ds_total` is the slot's image
+    /// tokens, so a prefill chunk slices `[cursor, cursor + k)` for its own.
+    pub(crate) ds_global: Vec<f32>,
+    pub(crate) ds_total: usize,
     /// Prompt tokens already consumed; `== prompt_ids.len()` once prefilled.
     pub(crate) prompt_fed: usize,
     pub(crate) generated: Vec<i32>,
@@ -103,6 +126,8 @@ pub(crate) struct Planned {
     pub(crate) kind: PackedStepKind,
     /// A prefill chunk's embedding rows on a vision stage 0; empty otherwise.
     pub(crate) rows: Vec<f32>,
+    /// Qwen VL M-RoPE positions + Qwen3-VL DeepStack feed for this inference.
+    pub(crate) extras: PackedExtras,
 }
 
 /// What one packed inference did, so the caller can sample the right rows.
@@ -138,6 +163,16 @@ pub(crate) struct PackedState {
     /// The image soft-token id on a tree whose masks open image blocks
     /// (Gemma 4, rank 0): admission derives each prompt's image ids from it.
     pub(crate) image_token: Option<i64>,
+    /// Qwen VL: this stage feeds `[3, 1, S]` M-RoPE `position_ids`.
+    pub(crate) mrope: bool,
+    /// Qwen3-VL stage 0: the DeepStack ports and what feeds them.
+    pub(crate) visual_mask_in: Option<String>,
+    pub(crate) deepstack_in: Option<String>,
+    pub(crate) deepstack_layers: usize,
+    /// Row width of the DeepStack embeds (the model hidden size).
+    pub(crate) deepstack_hidden: usize,
+    /// The image soft-token id for the DeepStack mask (Qwen3-VL).
+    pub(crate) deepstack_image_pad: i64,
     pub(crate) layers: Vec<PackedLayer>,
     /// Token ids whose K/V now sit in the shared prefix region. Only the
     /// driver stage matches against these; relay stages are told the reuse
@@ -150,6 +185,9 @@ pub(crate) struct PackedState {
     last_plan_rows: Vec<WireRowOpt>,
     /// Per-row image ids of the most recent inference (see `last_plan_rows`).
     last_plan_images: Vec<Option<u32>>,
+    /// Per-row M-RoPE positions of the most recent inference (`[3, S]`
+    /// row-major), shipped to the relay stages on the wire.
+    last_plan_mrope: Vec<i64>,
     ids_bytes: Vec<u8>,
     types_bytes: Vec<u8>,
     pos_bytes: Vec<u8>,
@@ -180,12 +218,19 @@ impl PackedState {
             pos_in,
             types_in: None,
             image_token: None,
+            mrope: false,
+            visual_mask_in: None,
+            deepstack_in: None,
+            deepstack_layers: 0,
+            deepstack_hidden: 0,
+            deepstack_image_pad: 0,
             layers,
             prefix_ids: Vec::new(),
             populating: None,
             failed: Vec::new(),
             last_plan_rows: Vec::new(),
             last_plan_images: Vec::new(),
+            last_plan_mrope: Vec::new(),
             ids_bytes: Vec::new(),
             types_bytes: Vec::new(),
             pos_bytes: Vec::new(),
@@ -206,6 +251,12 @@ impl PackedState {
     /// tree whose masks open image blocks.
     pub(crate) fn last_plan_images(&self) -> Vec<Option<u32>> {
         self.last_plan_images.clone()
+    }
+
+    /// Per-row M-RoPE positions (`[3, S]` row-major) of the most recent
+    /// inference, shipped to the relay stages of a Qwen VL tree.
+    pub(crate) fn last_plan_mrope(&self) -> Vec<i64> {
+        self.last_plan_mrope.clone()
     }
 
     pub(crate) fn occupied(&self) -> usize {
@@ -234,6 +285,7 @@ impl PackedState {
     /// matching past it would reuse another image's K/V.
     ///
     /// Returns how many prompt tokens come from the shared prefix.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn admit(
         &mut self,
         slot: usize,
@@ -241,6 +293,9 @@ impl PackedState {
         prompt_ids: Vec<i64>,
         prompt_rows: Vec<f32>,
         shareable: usize,
+        mrope: Option<MropePositions>,
+        ds_global: Vec<f32>,
+        ds_total: usize,
     ) -> usize {
         let shared = self
             .prefix_reuse(&prompt_ids[..shareable.min(prompt_ids.len())])
@@ -270,6 +325,9 @@ impl PackedState {
             prompt_ids,
             prompt_rows,
             prompt_images,
+            mrope,
+            ds_global,
+            ds_total,
             prompt_fed: shared,
             generated: Vec::new(),
             emitted: Vec::new(),
@@ -316,6 +374,7 @@ impl PackedState {
             positions,
             kind,
             mut rows,
+            extras,
         }) = self.plan_step()
         else {
             return Ok(None);
@@ -343,7 +402,7 @@ impl PackedState {
         } else {
             PackedPrimary::Ids(&ids)
         };
-        let (odt, oshape, obytes) = self.run_plan(&plan, primary, &positions, &reuse)?;
+        let (odt, oshape, obytes) = self.run_plan(&plan, primary, &positions, &reuse, &extras)?;
         if let PackedStepKind::Prefill { slot, .. } = &kind {
             if let Some(t) = self.slots[*slot].as_mut() {
                 t.prompt_fed += plan.active_rows().count();
@@ -386,6 +445,15 @@ impl PackedState {
             .collect();
         let positions: Vec<i64> = ready.iter().map(|&i| self.kv.position(i) as i64).collect();
         let rows: Vec<(usize, usize)> = ready.iter().copied().enumerate().collect();
+        // Qwen VL: each decode row continues its slot from `rope_delta`. The
+        // DeepStack feed is all zero — a decode token is text (prompt image
+        // tokens are all fed during prefill), matching `deepstack_inputs` on an
+        // empty image list.
+        let extras = PackedExtras {
+            mrope: self.decode_mrope(&ready),
+            ds_mask: self.zero_ds_mask(),
+            ds_embeds: self.zero_ds_embeds(),
+        };
         let plan = PackedPlan::decode(s, &ready);
         (!plan.is_empty()).then_some(Planned {
             plan,
@@ -393,7 +461,42 @@ impl PackedState {
             positions,
             kind: PackedStepKind::Decode { rows },
             rows: Vec::new(),
+            extras,
         })
+    }
+
+    /// `[3, S]` row-major M-RoPE positions for a decode batch: each ready
+    /// slot's next token at its own `rope_delta`. Empty on a non-Qwen tree.
+    fn decode_mrope(&self, ready: &[usize]) -> Vec<i64> {
+        if !self.mrope {
+            return Vec::new();
+        }
+        let (s, r) = (self.kv.packed_seq, crate::qwen_vl_vision::MROPE_ROWS);
+        let mut out = vec![0i64; r * s];
+        for (col, &slot) in ready.iter().enumerate() {
+            let t = self.slots[slot].as_ref().unwrap();
+            let pos = self.kv.position(slot);
+            let p = crate::qwen_vl_vision::positions(t.mrope.as_ref(), pos, pos + 1);
+            for row in 0..r {
+                out[row * s + col] = p[row];
+            }
+        }
+        out
+    }
+
+    /// An all-zero DeepStack mask / embeds of the packed shape (Qwen3-VL stage
+    /// 0), empty on every other stage — fed on a decode step and on idle rows.
+    fn zero_ds_mask(&self) -> Vec<i64> {
+        if self.deepstack_layers == 0 {
+            return Vec::new();
+        }
+        vec![0i64; self.kv.packed_seq]
+    }
+    fn zero_ds_embeds(&self) -> Vec<f32> {
+        if self.deepstack_layers == 0 {
+            return Vec::new();
+        }
+        vec![0f32; self.deepstack_layers * self.kv.packed_seq * self.deepstack_hidden]
     }
 
     /// The next prefill chunk of `slot`, or why that slot cannot continue.
@@ -429,6 +532,42 @@ impl PackedState {
         let base = self.kv.position(slot);
         let positions: Vec<i64> = (0..take).map(|i| (base + i) as i64).collect();
         let finished = start + take >= t.prompt_ids.len();
+        // Qwen VL: this chunk's M-RoPE positions are the slot's prompt
+        // positions over `[base, base + take)`, laid into the plan's first
+        // `take` columns.
+        let mut extras = PackedExtras::default();
+        if self.mrope {
+            let r = crate::qwen_vl_vision::MROPE_ROWS;
+            let p = crate::qwen_vl_vision::positions(t.mrope.as_ref(), base, base + take);
+            let mut out = vec![0i64; r * s];
+            for row in 0..r {
+                for c in 0..take {
+                    out[row * s + c] = p[row * take + c];
+                }
+            }
+            extras.mrope = out;
+        }
+        // Qwen3-VL stage 0: the chunk's DeepStack mask + embeds, image tokens
+        // sliced from this slot's buffer at its own image-token cursor (the
+        // image tokens fed before `start`).
+        if self.deepstack_layers > 0 {
+            let cursor = t.prompt_ids[..start]
+                .iter()
+                .filter(|&&id| id == self.deepstack_image_pad)
+                .count();
+            let (mask, embeds, _k) = crate::qwen_vl_vision::deepstack_window(
+                &ids,
+                self.deepstack_image_pad,
+                &t.ds_global,
+                t.ds_total,
+                cursor,
+                self.deepstack_layers,
+                self.deepstack_hidden,
+                s,
+            )?;
+            extras.ds_mask = mask;
+            extras.ds_embeds = embeds;
+        }
         Ok(Planned {
             plan: if images.is_empty() {
                 PackedPlan::chunk(s, slot, take)
@@ -443,6 +582,7 @@ impl PackedState {
                 finished_prompt: finished,
             },
             rows,
+            extras,
         })
     }
 
@@ -466,6 +606,7 @@ impl PackedState {
         primary: PackedPrimary<'_>,
         positions: &[i64],
         reuse: &[usize],
+        extras: &PackedExtras,
     ) -> EngineResult<(ShimDType, Vec<usize>, Vec<u8>)> {
         let s = self.kv.packed_seq;
         // A row whose absolute position equals its reuse length is the FIRST
@@ -492,6 +633,16 @@ impl PackedState {
         self.last_plan_images = (0..s)
             .map(|r| plan.rows.get(r).copied().flatten().and_then(|pr| pr.image))
             .collect();
+        // M-RoPE positions ship to the relay stages on the wire.
+        self.last_plan_mrope = extras.mrope.clone();
+        if self.mrope && extras.mrope.len() != crate::qwen_vl_vision::MROPE_ROWS * s {
+            return Err(EngineError::Backend(format!(
+                "packed M-RoPE tree: {} positions for {} rows (need {})",
+                extras.mrope.len(),
+                s,
+                crate::qwen_vl_vision::MROPE_ROWS * s
+            )));
+        }
         let ids: Vec<i64> = match primary {
             PackedPrimary::Ids(v) => v.to_vec(),
             PackedPrimary::Hidden(_, _) | PackedPrimary::Embeds(_, _) => Vec::new(),
@@ -573,9 +724,53 @@ impl PackedState {
                 .set_input(types_in, ShimDType::I64, &[1, s], &self.types_bytes)
                 .map_err(crate::runtime::map_ov_err)?;
         }
-        self.runtime
-            .set_input(&self.pos_in, ShimDType::I64, &[1, s], &self.pos_bytes)
-            .map_err(crate::runtime::map_ov_err)?;
+        // Positions: 1-D `[1, S]` on a text/other tree, M-RoPE `[3, 1, S]` on a
+        // Qwen VL tree (per-row t/h/w; the sequential `positions` still drives
+        // the ring reset and mask above).
+        if self.mrope {
+            let mut buf = Vec::with_capacity(extras.mrope.len() * 8);
+            for v in &extras.mrope {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            self.runtime
+                .set_input(
+                    &self.pos_in,
+                    ShimDType::I64,
+                    &[crate::qwen_vl_vision::MROPE_ROWS, 1, s],
+                    &buf,
+                )
+                .map_err(crate::runtime::map_ov_err)?;
+        } else {
+            self.runtime
+                .set_input(&self.pos_in, ShimDType::I64, &[1, s], &self.pos_bytes)
+                .map_err(crate::runtime::map_ov_err)?;
+        }
+        // Qwen3-VL stage 0 DeepStack: `visual_pos_masks [1, S]` +
+        // `deepstack_visual_embeds [layers, S, hidden]`. Only stage 0 has these
+        // ports (the relay stages carry no DeepStack rows on the wire).
+        if let (Some(mask_in), Some(ds_in)) =
+            (self.visual_mask_in.as_deref(), self.deepstack_in.as_deref())
+        {
+            let mut mbuf = Vec::with_capacity(extras.ds_mask.len() * 8);
+            for v in &extras.ds_mask {
+                mbuf.extend_from_slice(&v.to_le_bytes());
+            }
+            let mut ebuf = Vec::with_capacity(extras.ds_embeds.len() * 4);
+            for v in &extras.ds_embeds {
+                ebuf.extend_from_slice(&v.to_le_bytes());
+            }
+            self.runtime
+                .set_input(mask_in, ShimDType::I64, &[1, s], &mbuf)
+                .map_err(crate::runtime::map_ov_err)?;
+            self.runtime
+                .set_input(
+                    ds_in,
+                    ShimDType::F32,
+                    &[self.deepstack_layers, s, self.deepstack_hidden],
+                    &ebuf,
+                )
+                .map_err(crate::runtime::map_ov_err)?;
+        }
         for (li, layer) in self.layers.iter().enumerate() {
             let kv_shape = [
                 1,
@@ -704,6 +899,9 @@ mod tests {
             vec![1, 2],
             Vec::new(),
             2,
+            None,
+            Vec::new(),
+            0,
         );
         {
             let t = st.slots[0].as_mut().unwrap();
@@ -715,6 +913,9 @@ mod tests {
             1,
             GenerationTask::new("bad", "img"),
             vec![9, 9, 9, 9, 9, 2],
+            Vec::new(),
+            0,
+            None,
             Vec::new(),
             0,
         );
@@ -733,6 +934,48 @@ mod tests {
         assert!(st.take_failed().is_empty());
     }
 
+    /// A Qwen VL slot's prefill chunk carries the prompt's M-RoPE positions
+    /// over its rows, and a later decode step continues from `rope_delta` —
+    /// each slot with its own delta.
+    #[test]
+    fn packed_mrope_prefill_and_decode_per_slot() {
+        use crate::qwen35_vision::rope::mrope_positions;
+        let mut st = state(2, 4);
+        st.mrope = true;
+        // [text, image 2x2, text]: the image at index 1 shifts later positions.
+        let ids = vec![1i64, 9, 9, 9, 9, 2];
+        let m = mrope_positions(&ids, 9, 8, &[[1, 4, 4]], &[], 2).unwrap();
+        assert_eq!(m.rope_delta, -2);
+        st.admit(
+            0,
+            GenerationTask::new("q", "p"),
+            ids.clone(),
+            Vec::new(),
+            ids.len(),
+            Some(m.clone()),
+            Vec::new(),
+            0,
+        );
+        let planned = st.plan_step().expect("prefill chunk");
+        let s = st.kv.packed_seq;
+        let take = planned.plan.active_rows().count();
+        assert_eq!(take, 4); // packed_seq-wide chunk of the 6-token prompt
+        let want = crate::qwen_vl_vision::positions(Some(&m), 0, take);
+        for r in 0..3 {
+            for c in 0..take {
+                assert_eq!(planned.extras.mrope[r * s + c], want[r * take + c]);
+            }
+            // Columns past `take` are zero padding.
+            for c in take..s {
+                assert_eq!(planned.extras.mrope[r * s + c], 0);
+            }
+        }
+        // Decode after the whole prompt (position 6): index + rope_delta = 4.
+        st.kv.advance(0, 6);
+        let dec = st.decode_mrope(&[0]);
+        assert_eq!((dec[0], dec[s], dec[2 * s]), (4, 4, 4));
+    }
+
     /// Mismatched embedding rows on a vision stage 0 fail that slot only.
     #[test]
     fn bad_embedding_rows_fail_only_their_slot() {
@@ -744,6 +987,9 @@ mod tests {
             vec![1, 2],
             vec![0.0; 6],
             2,
+            None,
+            Vec::new(),
+            0,
         );
         st.admit(
             1,
@@ -751,6 +997,9 @@ mod tests {
             vec![1, 2],
             vec![0.0; 5],
             2,
+            None,
+            Vec::new(),
+            0,
         );
         let planned = st.plan_step().expect("slot 0 prefills");
         assert!(matches!(
