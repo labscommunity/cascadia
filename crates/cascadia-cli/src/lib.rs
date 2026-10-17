@@ -1390,12 +1390,6 @@ fn parse_ov_config(entries: &[String]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Load a whole-model chat template for ov-genai, tolerating both layouts:
-/// `tokenizer/tokenizer_config.json` (HF subdir) and a root-level
-/// `tokenizer_config.json` / `chat_template.jinja` (OV int4 exports).
-/// The image family of a pipeline dir: its `pipeline_config.json` `vision`
-/// block's `family`, or `gemma4` for a block written by the Gemma 4 vision
-/// surgery before the field existed. `None` without a `vision` block.
 /// The API's image settings for a vision tree of `family` served by `engine`
 /// (the tag rank 0 expands), or `None` where that engine has no image path for
 /// the family.
@@ -1427,6 +1421,9 @@ fn vision_tree_media(engine: EngineKind, family: &str) -> Option<cascadia_api::M
     }
 }
 
+/// The image family of a pipeline dir: its `pipeline_config.json` `vision`
+/// block's `family`, or `gemma4` for a block written by the Gemma 4 vision
+/// surgery before the field existed. `None` without a `vision` block.
 fn pipeline_vision_family(model: &str) -> Option<String> {
     let v: serde_json::Value =
         std::fs::read(std::path::Path::new(model).join("pipeline_config.json"))
@@ -1444,6 +1441,9 @@ fn pipeline_vision_family(model: &str) -> Option<String> {
     }
 }
 
+/// Load a whole-model chat template for ov-genai, tolerating both layouts:
+/// `tokenizer/tokenizer_config.json` (HF subdir) and a root-level
+/// `tokenizer_config.json` / `chat_template.jinja` (OV int4 exports).
 fn ovgenai_chat_template(model: &str) -> cascadia_api::ChatTemplateConfig {
     let p = std::path::Path::new(model);
     let sub = cascadia_api::load_chat_template_config(p);
@@ -1454,10 +1454,6 @@ fn ovgenai_chat_template(model: &str) -> cascadia_api::ChatTemplateConfig {
     }
 }
 
-/// Warn when a performance flag the user explicitly set will be silently
-/// ignored for the chosen engine/device, so an ineffective flag is visible at
-/// runtime instead of vanishing (mirrors the `--ffn-sparsity-capture-dir`
-/// warning in `build_builder`'s sparse-moe arm).
 /// `--cb` targeting the CPU plugin specifically.
 ///
 /// Deliberately an exact match rather than a prefix: `AUTO`/`HETERO` strings
@@ -1467,6 +1463,10 @@ fn cb_on_plain_cpu(args: &WorkerArgs) -> bool {
     args.cb && args.device.trim().eq_ignore_ascii_case("CPU")
 }
 
+/// Warn when a performance flag the user explicitly set will be silently
+/// ignored for the chosen engine/device, so an ineffective flag is visible at
+/// runtime instead of vanishing (mirrors the `--ffn-sparsity-capture-dir`
+/// warning in `build_builder`'s sparse-moe arm).
 fn warn_ignored_ov_perf_flags(args: &WorkerArgs) {
     // NPU LLM knobs apply only to ov-genai on an NPU device (see
     // `ov_perf_properties`). If the user set one but that gate won't fire, the
