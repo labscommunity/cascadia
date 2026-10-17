@@ -192,6 +192,10 @@ def pin_shapes(model: ov.Model, seq: int, context: int, past: int | None = None,
                 shapes[name] = [ps[0].get_length(), 1, seq]
             else:
                 raise SystemExit(f"position_ids rank {ps.rank} (multi-axis rope) is not supported")
+        elif kind == "token_type_ids":
+            # Gemma 3 / Gemma 4 trees ride a per-step token_type_ids frame (1 on
+            # image soft tokens) through every stage; pin it to the query width.
+            shapes[name] = [1, seq]
         elif kind == "visual_pos_masks":
             shapes[name] = [1, seq]
         elif kind == "deepstack_visual_embeds":
