@@ -602,6 +602,10 @@ thinking token, and `usage.input_tokens` adds each generation's and read-back's 
   400 (`thinking needs a switchable tree ...`). So is a tree without System 2's export
   (`jev.answer_labels`, `jev.end_think_id`; re-export it), and a choice with more options than
   answer labels.
+- **Single box verified, pipeline not.** Every hardware run so far is one box serving all 8
+  stages. On a pipeline (e.g. JEV-27B over two boxes) the scale travels to every stage and is
+  unit-tested, but no switchable 27B tree exists yet and System 2 has not run there. Verify it on
+  hardware before relying on it.
 - **Chat template.** It is rendered once at startup. If a JEV that could think has no template,
   or it does not render a user turn, the server logs a warning and disables System 2 for that
   tree: System 1 keeps serving, a profile default that thinks is ignored, and a request that sets
@@ -615,8 +619,9 @@ thinking token, and `usage.input_tokens` adds each generation's and read-back's 
     before any engine call.
   - `auto` reserves question by question, in request order. A question that does not fit (nor
     the pass limits below) answers from System 1 alone with `reason: "budget"` if it would have
-    thought. `auto` never makes a request fail; a profile default of `auto` cannot turn a working
-    request into a 413.
+    thought. The budget never makes an `auto` request fail; a profile default of `auto` cannot
+    turn a working request into a 413. (A choice with more options than answer labels is still a
+    400 whenever thinking is on, a profile default included; see above.)
   - The real read-back is checked again before it runs (a 413 under `on`, a budget skip under
     `auto`).
 - **Pass lengths.** A System 2 prompt plus the read-back's tail must fit `max_tokens`, like any
