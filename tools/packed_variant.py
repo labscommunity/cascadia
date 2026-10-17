@@ -209,10 +209,16 @@ def build_packed_model(
         # Create the Parameter at the graph's CURRENT mask shape, then move
         # everything to seq=S in one reshape(). Building it pre-shaped fails SDPA
         # shape inference at construction time, because the rest of the graph is
-        # still seq=1 at that moment.
+        # still at its original query width at that moment. The current shape is
+        # static on a seq=1 decode IR, but DYNAMIC on a `--shared-prefill` IR
+        # (that IR leaves the query width — and so the mask's S/T — dynamic so
+        # one compiled model serves decode and prefill); pass the partial shape
+        # either way (`get_shape()` would throw on the dynamic one) and let the
+        # reshape() below pin it to [1,1,packed_seq,T]. This mirrors the
+        # multi-producer `_rewire_masks` path, which already builds from the
+        # partial shape.
         et = mask_src.output(0).get_element_type()
-        cur = [int(d) for d in mask_src.output(0).get_partial_shape().get_shape()]
-        new_mask = _ovop.Parameter(et, ov.PartialShape(cur))
+        new_mask = _ovop.Parameter(et, mask_src.output(0).get_partial_shape())
         new_mask.set_friendly_name("attn_mask_4d")
         new_mask.output(0).set_names({"attn_mask_4d"})
         for target in list(mask_src.output(0).get_target_inputs()):
