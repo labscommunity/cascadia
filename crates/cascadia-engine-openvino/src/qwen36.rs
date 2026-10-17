@@ -905,6 +905,9 @@ enum OvStage {
     Ov(Runtime),
     #[cfg(test)]
     Mock(tests::MockStage),
+    /// The stage was handed to a bounded native call that never returned ([`bounded_call`]): it
+    /// is leaked with that call's thread, and every call here fails. The engine is failed.
+    Gone(&'static str),
 }
 
 macro_rules! ov_stage_call {
@@ -913,6 +916,9 @@ macro_rules! ov_stage_call {
             OvStage::Ov(r) => r.$m($($a),*),
             #[cfg(test)]
             OvStage::Mock(m) => m.$m($($a),*),
+            OvStage::Gone(what) => Err(cascadia_ov_genai_shim::Error::Native(format!(
+                "this stage was lost to a native {what} that never returned"
+            ))),
         }
     };
 }
@@ -1071,6 +1077,71 @@ fn make_idle(label: &str, st: &mut OvStage, timeout: Duration) -> Result<(), Stu
     }
 }
 
+/// What [`bounded_call`] got back.
+enum Bounded<T> {
+    /// The call returned in time; the stage is back in place.
+    Done(cascadia_ov_genai_shim::Result<T>),
+    /// The call did not return within the bound. The stage stays with its thread, leaked.
+    TimedOut,
+    /// No helper thread could be started; the stage is lost.
+    NoThread(std::io::Error),
+}
+
+/// A stage that a timed-out [`bounded_call`] may still hand back: if the engine is no longer
+/// waiting, it is leaked, never dropped. Dropping it would run native destructors (the request's
+/// and the compiled model's) on a faulted device, from a stray thread.
+struct Leaky(Option<OvStage>);
+
+impl Drop for Leaky {
+    fn drop(&mut self) {
+        if let Some(stage) = self.0.take() {
+            // `Runtime` implements `Drop` only in an `openvino` build; the lint sees the stub.
+            #[allow(clippy::forget_non_drop)]
+            std::mem::forget(stage);
+        }
+    }
+}
+
+/// Run one native call on `st` on a helper thread, bounded by `timeout` (Task 54, fix round 1).
+///
+/// After an abandon, the engine calls into the compiled model that just faulted: the fresh
+/// create and the replacement's first infer. If the fault left a lock held or the device queue
+/// wedged, either call could block forever while holding the engine. The stage moves to the
+/// thread for the call (OpenVINO's own synchronous call, unchanged) and comes back when it
+/// returns. On a timeout the slot holds [`OvStage::Gone`]; the thread and the stage are leaked.
+fn bounded_call<T: Send + 'static>(
+    st: &mut OvStage,
+    what: &'static str,
+    timeout: Duration,
+    f: impl FnOnce(&mut OvStage) -> cascadia_ov_genai_shim::Result<T> + Send + 'static,
+) -> Bounded<T> {
+    let stage = std::mem::replace(st, OvStage::Gone(what));
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(Leaky, cascadia_ov_genai_shim::Result<T>)>(1);
+    let spawned = std::thread::Builder::new()
+        .name(format!("qwen36-{what}"))
+        .spawn(move || {
+            let mut stage = Leaky(Some(stage));
+            let r = match stage.0.as_mut() {
+                Some(s) => f(s),
+                None => unreachable!(),
+            };
+            // Late (the engine stopped waiting): the send fails and `Leaky` leaks the stage.
+            let _ = tx.send((stage, r));
+        });
+    if let Err(e) = spawned {
+        return Bounded::NoThread(e);
+    }
+    match rx.recv_timeout(timeout) {
+        Ok((mut stage, r)) => {
+            if let Some(s) = stage.0.take() {
+                *st = s;
+            }
+            Bounded::Done(r)
+        }
+        Err(_) => Bounded::TimedOut,
+    }
+}
+
 /// Why [`make_idle`] could not bring a request back to idle.
 enum Stuck {
     /// Abandoned (leaked) after the timeout: the slot is empty and may get a fresh request.
@@ -1097,9 +1168,54 @@ fn fresh_request_failed(slot: Slot, e: &cascadia_ov_genai_shim::Error) -> String
         Slot::Stage(j) => format!("stage{j}"),
     };
     let why = format!("{label}'s replacement infer request failed its first infer: {e}");
-    error!(stage = %label, action = "first infer", outcome = "error", error = %e, "qwen36: stage recovery");
+    error!(stage = %label, action = "first_infer", outcome = "error", error = %e, "qwen36: stage recovery");
     error!(reason = %why, "qwen36: engine failed; every later task is refused until a restart");
     why
+}
+
+/// A replacement request's first infer, bounded ([`bounded_call`]), Task 54 fix round 1. Ok on
+/// success; otherwise the infer's error and, when the engine must fail, its reason (a failed
+/// first infer, or one that did not return within `timeout` and whose stage is now leaked).
+fn first_infer_bounded(
+    slot: Slot,
+    st: &mut OvStage,
+    timeout: Duration,
+) -> Result<(), (cascadia_ov_genai_shim::Error, String)> {
+    let label = match slot {
+        Slot::Emb => "emb".to_string(),
+        Slot::Stage(j) => format!("stage{j}"),
+    };
+    let t0 = Instant::now();
+    let lost = match bounded_call(st, "first_infer", timeout, |s| s.infer()) {
+        Bounded::Done(Ok(())) => {
+            error!(
+                stage = %label,
+                action = "first_infer",
+                outcome = "ok",
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                "qwen36: stage recovery"
+            );
+            return Ok(());
+        }
+        Bounded::Done(Err(e)) => {
+            let why = fresh_request_failed(slot, &e);
+            return Err((e, why));
+        }
+        Bounded::TimedOut => {
+            error!(stage = %label, action = "first_infer", outcome = "timeout", elapsed_ms = t0.elapsed().as_millis() as u64, "qwen36: stage recovery");
+            format!(
+                "{label}'s replacement infer request did not return from its first infer within \
+                 {} ms; it is abandoned",
+                timeout.as_millis()
+            )
+        }
+        Bounded::NoThread(e) => {
+            error!(stage = %label, action = "first_infer", outcome = "error", error = %e, "qwen36: stage recovery");
+            format!("{label}'s replacement infer request could not be run bounded: {e}")
+        }
+    };
+    error!(reason = %lost, "qwen36: engine failed; every later task is refused until a restart");
+    Err((cascadia_ov_genai_shim::Error::Native(lost.clone()), lost))
 }
 
 fn map_ov(err: cascadia_ov_genai_shim::Error) -> EngineError {
@@ -1768,15 +1884,17 @@ impl Qwen36Engine {
         let ids: Vec<i64> = toks.iter().map(|&t| t as i64).collect();
         emb.set_input(&name, DType::I64, &[1, toks.len()], &le_bytes_i64(&ids))
             .map_err(map_ov)?;
-        if let Err(e) = emb.infer() {
-            self.infer_failed = true;
-            if self.fresh_requests.contains(&Slot::Emb) {
-                self.engine_failed = Some(fresh_request_failed(Slot::Emb, &e));
-            }
-            return Err(map_ov(e));
-        }
-        if !self.fresh_requests.is_empty() {
+        if self.fresh_requests.contains(&Slot::Emb) {
+            // A replacement's first infer: bounded, and any failure fails the engine (Task 54).
             self.fresh_requests.retain(|s| *s != Slot::Emb);
+            if let Err((e, why)) = first_infer_bounded(Slot::Emb, emb, self.stage_idle_timeout) {
+                self.infer_failed = true;
+                self.engine_failed = Some(why);
+                return Err(map_ov(e));
+            }
+        } else if let Err(e) = emb.infer() {
+            self.infer_failed = true;
+            return Err(map_ov(e));
         }
         let (dtype, shape, bytes) = emb.output(0).map_err(map_ov)?;
         if !matches!(dtype, DType::F32) {
@@ -1858,19 +1976,26 @@ impl Qwen36Engine {
             }
             self.timing.host_copy += t_in.elapsed();
             let t_inf = Instant::now();
-            let r = st.infer();
+            let fresh =
+                !self.fresh_requests.is_empty() && self.fresh_requests.contains(&Slot::Stage(j));
+            let r = if fresh {
+                // A replacement's first infer: bounded, and any failure fails the engine (Task 54).
+                self.fresh_requests.retain(|s| *s != Slot::Stage(j));
+                first_infer_bounded(Slot::Stage(j), st, self.stage_idle_timeout).map_err(
+                    |(e, why)| {
+                        self.engine_failed = Some(why);
+                        e
+                    },
+                )
+            } else {
+                st.infer()
+            };
             if let Some(s) = self.timing.stage_infer.get_mut(j) {
                 *s += t_inf.elapsed();
             }
             if let Err(e) = r {
                 self.infer_failed = true;
-                if self.fresh_requests.contains(&Slot::Stage(j)) {
-                    self.engine_failed = Some(fresh_request_failed(Slot::Stage(j), &e));
-                }
                 return Err(map_ov(e));
-            }
-            if !self.fresh_requests.is_empty() {
-                self.fresh_requests.retain(|s| *s != Slot::Stage(j));
             }
             let t_out = Instant::now();
             let (dtype, _shape, bytes) = st.output(0).map_err(map_ov)?;
@@ -1960,8 +2085,30 @@ impl Qwen36Engine {
                     );
                 }
                 let t0 = Instant::now();
-                let r = st.replace_request();
+                let r = bounded_call(st, "replace", timeout, |s| s.replace_request());
                 let elapsed_ms = t0.elapsed().as_millis() as u64;
+                let r = match r {
+                    Bounded::Done(r) => r,
+                    Bounded::TimedOut => {
+                        error!(
+                            stage = %label,
+                            action = "replace",
+                            outcome = "timeout",
+                            abandoned,
+                            cap,
+                            process_leaked,
+                            elapsed_ms,
+                            "qwen36: stage recovery"
+                        );
+                        break 'slot format!(
+                            "{why}; creating its replacement did not return within {} ms",
+                            timeout.as_millis()
+                        );
+                    }
+                    Bounded::NoThread(e) => Err(cascadia_ov_genai_shim::Error::Native(format!(
+                        "no thread to bound the create: {e}"
+                    ))),
+                };
                 match r {
                     Ok(()) => {
                         error!(
@@ -6457,6 +6604,10 @@ mod tests {
         abandoned: bool,
         /// Task 54: `replace_request` fails (the fresh create, as OpenVINO's might).
         fail_replace: bool,
+        /// Task 54 fix round 1: `replace_request` never returns (a create blocked on the device).
+        hang_replace: bool,
+        /// Task 54 fix round 1: the infer (counted from 0) that never returns.
+        hang_infer_at: Option<usize>,
     }
 
     impl MockStage {
@@ -6475,6 +6626,8 @@ mod tests {
                 cancelled: false,
                 abandoned: false,
                 fail_replace: false,
+                hang_replace: false,
+                hang_infer_at: None,
             }
         }
         pub(super) fn input_names(&self) -> cascadia_ov_genai_shim::Result<Vec<String>> {
@@ -6546,6 +6699,9 @@ mod tests {
         /// is leaked, never released). A fresh request is idle with default state.
         pub(super) fn replace_request(&mut self) -> cascadia_ov_genai_shim::Result<()> {
             self.events.lock().unwrap().push("replace");
+            if self.hang_replace {
+                hang_forever();
+            }
             if self.fail_replace {
                 return Err(cascadia_ov_genai_shim::Error::Native(
                     "create_infer_request failed".into(),
@@ -6573,6 +6729,9 @@ mod tests {
             self.refuse()?;
             self.events.lock().unwrap().push("infer");
             self.infers += 1;
+            if self.hang_infer_at == Some(self.infers - 1) {
+                hang_forever();
+            }
             if self.fail_infer_at == Some(self.infers - 1) {
                 self.busy = self.busy_after_fail;
                 return Err(cascadia_ov_genai_shim::Error::Native(
@@ -6609,6 +6768,13 @@ mod tests {
         pub(super) fn set_state_blob(&mut self, blob: &[u8]) -> cascadia_ov_genai_shim::Result<()> {
             self.state = blob.to_vec();
             Ok(())
+        }
+    }
+
+    /// A native call that never returns (its thread is leaked; the test process exits anyway).
+    fn hang_forever() -> ! {
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
         }
     }
 
@@ -7134,6 +7300,85 @@ mod tests {
             "{c:?}"
         );
         assert_eq!(e.abandoned_requests, 1, "never replaced a second time");
+    }
+
+    #[test]
+    fn a_replacement_create_that_never_returns_fails_the_engine_within_the_bound() {
+        // Task 54 fix round 1: the create runs on the compiled model that just faulted; if it
+        // blocks (a lock the fault left held), the engine fails after `stage_idle_timeout`
+        // instead of hanging, and later tasks are refused at once.
+        let mut e = mock_box();
+        e.stage_idle_timeout = Duration::from_millis(150);
+        stuck_on_next_infer(&mut e);
+        mock1(&mut e).hang_replace = true;
+        e.submit(chat("c1")).unwrap();
+        assert!(run_to_final(&mut e).error.is_some());
+        let t0 = Instant::now();
+        e.submit(verbalizer_pass("d2")).unwrap();
+        let c = run_to_final(&mut e);
+        let took = t0.elapsed();
+        let why = c.error.as_deref().expect("refused");
+        assert!(
+            why.contains("creating its replacement did not return within 150 ms")
+                && why.ends_with("restart the server"),
+            "{why}"
+        );
+        // The idle wait, then the create's bound: two bounds, not forever.
+        assert!(
+            took >= Duration::from_millis(300) && took < Duration::from_secs(3),
+            "{took:?}"
+        );
+        assert!(matches!(e.stages[1], OvStage::Gone("replace")));
+        let t0 = Instant::now();
+        e.submit(chat("c3")).unwrap();
+        assert_eq!(run_to_final(&mut e).error.as_deref(), Some(why));
+        assert!(t0.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn a_replacement_whose_first_infer_never_returns_fails_the_engine_within_the_bound() {
+        // Task 54 fix round 1: the fresh request's first infer is bounded too (a wedged device
+        // queue). Chat and decisions both: the task fails within the bound, later ones at once.
+        for next in [chat("c2"), verbalizer_pass("d2")] {
+            let id = next.task_id.clone();
+            let mut e = mock_box();
+            e.stage_idle_timeout = Duration::from_millis(150);
+            let at = infers(&e, 1);
+            busy_after_failed_infer(&mut e, at, u32::MAX);
+            e.submit(chat("c1")).unwrap();
+            assert!(run_to_final(&mut e).error.is_some());
+            mock1(&mut e).hang_infer_at = Some(at + 1); // the replacement's first infer
+            let t0 = Instant::now();
+            e.submit(next).unwrap();
+            let c = run_to_final(&mut e);
+            let took = t0.elapsed();
+            let why = c.error.as_deref().expect("fails");
+            assert!(
+                why.contains("did not return from its first infer"),
+                "{id}: {why}"
+            );
+            assert!(
+                took >= Duration::from_millis(300) && took < Duration::from_secs(3),
+                "{id}: {took:?}"
+            );
+            let reason = e.engine_failed.clone().expect("failed");
+            assert!(
+                reason.starts_with(
+                    "stage1's replacement infer request did not return from its first infer \
+                     within 150 ms"
+                ),
+                "{id}: {reason}"
+            );
+            assert!(matches!(e.stages[1], OvStage::Gone("first_infer")), "{id}");
+            let t0 = Instant::now();
+            e.submit(chat("c3")).unwrap();
+            let c = run_to_final(&mut e);
+            assert!(
+                c.error.as_deref().is_some_and(|w| w.contains(&reason)),
+                "{id}"
+            );
+            assert!(t0.elapsed() < Duration::from_millis(100), "{id}");
+        }
     }
 
     #[test]
