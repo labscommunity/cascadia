@@ -289,7 +289,26 @@ int32_t cascadia_runtime_reset_state(cascadia_runtime_t* handle);
 /// Rebuild the InferRequest from the retained CompiledModel, dropping all
 /// variable state. Stronger than `reset_state` — use after a
 /// `set_state_blob` whose residue `reset_state` does not clear.
+/// Refuses (returns 1) when the current request is busy or cancelled: releasing
+/// it would block in OpenVINO's destructor. Releases the old request before
+/// creating the new one.
 int32_t cascadia_runtime_recreate_request(cascadia_runtime_t* handle);
+
+/// The request's state without blocking: 0 idle, 1 busy, 2 cancelled, 3 none
+/// (abandoned, or a failed recreate).
+int32_t cascadia_runtime_request_state(cascadia_runtime_t* handle, int32_t* out_state);
+
+/// `ov::InferRequest::cancel()`. Never waits.
+int32_t cascadia_runtime_cancel(cascadia_runtime_t* handle);
+
+/// `ov::InferRequest::wait_for(timeout_ms)`: `*out_ready` is 1 once the last
+/// run has completed (a failed run counts), 0 on timeout or when it never ran.
+int32_t cascadia_runtime_wait_for(
+    cascadia_runtime_t* handle, uint32_t timeout_ms, int32_t* out_ready);
+
+/// Detach the request without destroying it (it is leaked on purpose: a busy
+/// request's destructor can wait forever). Later calls that need a request fail.
+int32_t cascadia_runtime_abandon_request(cascadia_runtime_t* handle);
 
 size_t cascadia_runtime_input_count(cascadia_runtime_t* handle);
 size_t cascadia_runtime_output_count(cascadia_runtime_t* handle);
