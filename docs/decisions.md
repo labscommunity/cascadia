@@ -763,20 +763,58 @@ What happens now:
    for up to 30 s. Once it is idle, the scrub resets or rebuilds it as before, and the task is
    served.
 3. If it is still not idle after 30 s, the engine abandons the request. The request is never
-   destroyed, because its destructor would block. The engine is then failed. This task fails
-   after that wait, and every later one fails at once, with `backend error: qwen36 engine failed:
-   stageN's infer request was still Busy ... abandoned; restart the server`. Chat and decisions
-   return their 5xx, and `/health` keeps answering (it reports `degraded` after a failed
-   completion). Only a restart recovers the engine.
+   destroyed, because its destructor would block: it is leaked, with its device memory. The
+   engine then replaces it: it creates a fresh request for that stage from the stage's existing
+   compiled model (no recompile), and the scrub and the task continue on it. The task that ran
+   the recovery is served after the wait, and later tasks are served as usual. On pawan-01
+   (Arc 140V, 2026-10-17) stage6 read `Cancelled` for the whole 30 s; before this change that
+   failed the engine until a restart.
+
+A fresh request needs nothing re-bound. Every input is set on each infer, and its variable
+state starts empty, as after `recreate_request`. The engine scrubs it like the other stages.
+
+**When a restart is still needed.** The engine fails in these cases:
+
+- The fresh request cannot be created.
+- A fresh request's first infer fails: the compiled model or the device is then suspect, not
+  the request.
+- More than 4 requests have been abandoned in this process (`MAX_ABANDONED_REQUESTS`). Each one
+  is leaked, so this cap stops a fault that recurs on every task from exhausting GPU memory.
+  The fifth abandon fails the engine instead of replacing.
+- The request could not be abandoned (the shim is out of memory), or its state cannot be read.
+
+A failed engine fails the task that ran the recovery, and every later one at once, with
+`backend error: qwen36 engine failed: <reason>; restart the server`. For example: `stageN's
+infer request was still Cancelled ... abandoned; 5 infer requests abandoned by this process, past
+the cap of 4, so it is not replaced`. Chat and decisions return their 5xx. `/health` keeps
+answering, and reports `degraded` after a failed completion. Only a restart recovers it.
 
 Each recovery step is one `error` line, `qwen36: stage recovery`, with `stage`, `action`
-(`probe`, `cancel`, `wait`, `abandon`, `reset` or `recreate`), `outcome` and `elapsed_ms`. A failed
-engine also logs `qwen36: engine failed` once, and `refusing task (engine failed)` per task.
+(`probe`, `cancel`, `wait`, `abandon`, `replace`, `reset`, `recreate` or `first infer`),
+`outcome` and `elapsed_ms`. The `replace` line also carries:
 
-The shim also guards itself: `recreate_request` refuses a busy request. Destroying a runtime
-leaks a busy request rather than waiting on it, and logs it (`action=abandon outcome=leaked`).
+- `abandoned`: this engine's count of abandoned requests;
+- `cap`: the limit, 4;
+- `process_leaked`: every request the native shim has leaked in this process.
 
-**Pipeline mode.** A downstream rank whose engine failed does not ack the next RESET. Its step
+Its outcome is `ok`, `error` (the create failed) or `refused: cap`. A failed engine also logs
+`qwen36: engine failed` once, and `refusing task (engine failed)` per task.
+
+The shim also guards itself:
+
+- `recreate_request` refuses a busy request.
+- `replace_request` never releases the old request: it leaks it, and it creates the fresh one
+  first, so a failed create changes nothing.
+- Destroying a runtime leaks a busy request rather than waiting on it, and logs it
+  (`action=abandon outcome=leaked`).
+
+**Pipeline mode.** A downstream rank runs the same recovery inside the head's RESET. It
+abandons and replaces a stuck request the same way, and then acks, so the head's task is
+served. The head sees only a slower ack. The recovery takes up to 30 s, which fits under the
+head's default 60 s reply bound; a deployment that lowers that bound below the recovery fails
+that one task with `RESET not acked`.
+
+A downstream rank whose engine failed (one of the cases above) does not ack the next RESET. Its step
 returns a connection-fatal error, so the stage process exits for its supervisor to rebuild it.
 The head sees the socket close and fails the task at once with `qwen36 pipeline RESET not acked:
 socket closed`, instead of waiting out its reply bound on every task. The reason is in the
@@ -794,9 +832,10 @@ after a prefix-cache restore); chat generations of that length can hit it too. I
 unknown. One lead: OpenVINO's `InferRequest` wrapper turns any C++ exception into an
 `ov::Exception`, so an error the shim reports as "unknown" did not pass through it as a C++
 exception. On Windows that suggests a structured (SEH) exception from the driver or plugin. That
-would also explain why the request stayed busy: OpenVINO's own cleanup never ran. Whether such a
-request ever comes back to idle on the GPU is not yet measured. If it does not, the outcome is
-the fail-fast path above.
+would also explain why the request stayed busy: OpenVINO's own cleanup never ran. On pawan-01
+such a request never came back to idle: it stayed `Cancelled` for the full 30 s. The engine now
+replaces it (above). Whether a fresh request on the same compiled model always serves after such
+a fault is still to be confirmed on hardware; if its first infer fails, the engine fails.
 
 ## Devices
 

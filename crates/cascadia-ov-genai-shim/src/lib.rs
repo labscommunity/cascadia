@@ -242,6 +242,9 @@ mod sys {
             out_ready: *mut i32,
         ) -> c_int;
         pub fn cascadia_runtime_abandon_request(handle: *mut cascadia_runtime_t) -> c_int;
+        // Task 54: a fresh request in place of an abandoned one; the process's leak count.
+        pub fn cascadia_runtime_replace_request(handle: *mut cascadia_runtime_t) -> c_int;
+        pub fn cascadia_runtime_leaked_requests() -> u64;
         // Issue-34: serialize/restore all KV variable-states as one opaque blob (warm-pull).
         pub fn cascadia_runtime_get_state_blob(
             handle: *mut cascadia_runtime_t,
@@ -1444,6 +1447,23 @@ impl Runtime {
         }
     }
 
+    /// Install a fresh request from the retained CompiledModel in place of an abandoned one (or
+    /// one that never left busy/cancelled), Task 54. Never releases the old request: one still
+    /// installed is leaked, like [`Runtime::abandon_request`]. The fresh request has default
+    /// variable state and no bound tensors, as after [`Runtime::recreate_request`]. On failure
+    /// nothing changes.
+    pub fn replace_request(&mut self) -> Result<()> {
+        #[cfg(not(feature = "openvino"))]
+        return Err(Error::Stub);
+        #[cfg(feature = "openvino")]
+        unsafe {
+            if sys::cascadia_runtime_replace_request(self.handle) != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(())
+        }
+    }
+
     /// Issue-34: capture all KV variable-states into one opaque blob (two-call: size then fill).
     /// The bytes are self-describing; restore on a peer engine via [`Runtime::set_state_blob`].
     pub fn get_state_blob(&mut self) -> Result<Vec<u8>> {
@@ -1729,6 +1749,17 @@ impl Runtime {
             }
             Ok(DType::from_code(code))
         }
+    }
+}
+
+/// How many infer requests this process has leaked rather than destroyed (abandoned, replaced,
+/// or left non-idle at a runtime's drop), Task 54. 0 in a stub build.
+pub fn leaked_request_count() -> u64 {
+    #[cfg(not(feature = "openvino"))]
+    return 0;
+    #[cfg(feature = "openvino")]
+    unsafe {
+        sys::cascadia_runtime_leaked_requests()
     }
 }
 
@@ -2102,6 +2133,12 @@ mod tests {
         assert_eq!(RequestState::from_raw(3), RequestState::None);
         assert_eq!(RequestState::from_raw(42), RequestState::Busy);
         assert_eq!(RequestState::from_raw(-1), RequestState::Busy);
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    #[test]
+    fn a_stub_build_has_leaked_no_request() {
+        assert_eq!(leaked_request_count(), 0);
     }
 
     #[cfg(not(feature = "openvino"))]

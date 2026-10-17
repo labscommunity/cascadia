@@ -309,6 +309,15 @@ int32_t cascadia_runtime_wait_for(
 /// request's destructor can wait forever). Later calls that need a request fail.
 int32_t cascadia_runtime_abandon_request(cascadia_runtime_t* handle);
 
+/// Install a fresh request from the retained CompiledModel, leaking (never
+/// releasing) any request still installed. For a request that was abandoned or
+/// never left busy/cancelled. On failure nothing changes. Never throws.
+int32_t cascadia_runtime_replace_request(cascadia_runtime_t* handle);
+
+/// How many requests this process has leaked (abandon, replace, or a destroy of
+/// a handle whose request was not idle).
+uint64_t cascadia_runtime_leaked_requests(void);
+
 size_t cascadia_runtime_input_count(cascadia_runtime_t* handle);
 size_t cascadia_runtime_output_count(cascadia_runtime_t* handle);
 
