@@ -293,6 +293,7 @@ pub(crate) async fn evaluate(
     state: &AppState,
     req: &DecisionRequest,
 ) -> Result<Evaluated, DecisionError> {
+    let started = std::time::Instant::now();
     let Some(svc) = state.decisions.clone() else {
         return Err(DecisionError::NotServed);
     };
@@ -344,10 +345,12 @@ pub(crate) async fn evaluate(
     // The request is shared by both rounds' blocking encodes.
     let req = Arc::new(req.clone());
     let (svc2, req2, cancel2) = (svc.clone(), req.clone(), cancel.0.clone());
+    let encode_started = std::time::Instant::now();
     let encoded = off_executor(&svc, &held, move || {
         svc2.codec.encode_rounds(&req2, &cancel2)
     })
     .await?;
+    let encode = encode_started.elapsed();
     // Codecs mask tokenizer failures themselves (`tokenize_failed`); every other encode error is
     // a reason the client should see (Clef's option cap as 400; Kev's render budget and state
     // length, Clef's schema size and JEV's early pass cap as 413).
@@ -426,7 +429,9 @@ pub(crate) async fn evaluate(
     super::mark_required_reuse(&mut passes, svc.max_total_tokens, svc.prefix_reuse);
     // Every question's per-pass probabilities, in submission order.
     let mut probs: IndexMap<String, Vec<Vec<f64>>> = IndexMap::new();
+    let passes_started = std::time::Instant::now();
     let mut input_tokens = run_passes(state, &svc, &req, &passes, &mut probs).await?;
+    let mut passes_d = passes_started.elapsed();
     // The tokens spent so far by our own count (System 2's checks continue from it).
     let mut counted = super::prefill_work(&passes, svc.prefix_reuse);
     // Only a request that reserved tokens has a second round (a final is never empty), so every
@@ -454,7 +459,9 @@ pub(crate) async fn evaluate(
             )));
         }
         dump_passes(state, &svc, &req, &held, &second, 2).await;
+        let second_started = std::time::Instant::now();
         input_tokens += run_passes(state, &svc, &req, &second, &mut probs).await?;
+        passes_d += second_started.elapsed();
         counted = spent;
     }
     let mut dists: IndexMap<String, Vec<f64>> = IndexMap::with_capacity(req.questions.len());
@@ -516,6 +523,16 @@ pub(crate) async fn evaluate(
         };
         answers.insert(id.clone(), answer_with_legend(q, &dists[id], legend));
     }
+    tracing::debug!(
+        target: "cascadia::perf",
+        family = ?svc.family,
+        passes = passes.len(),
+        input_tokens,
+        encode_ms = encode.as_secs_f64() * 1e3,
+        passes_ms = passes_d.as_secs_f64() * 1e3,
+        total_ms = started.elapsed().as_secs_f64() * 1e3,
+        "decision request done"
+    );
     Ok(Evaluated {
         answers,
         thinking,
@@ -1016,6 +1033,7 @@ async fn readout_once(
     task_id: String,
 ) -> Result<(Vec<f32>, u64), TaskFailure> {
     let fail = |why: &str| Err(TaskFailure::found(why));
+    let perf_task = task_id.clone();
     let task = cascadia_types::GenerationTask {
         task_id,
         prompt: String::new(),
@@ -1031,6 +1049,7 @@ async fn readout_once(
         decision: Some(readout.clone()),
         lora_scale,
     };
+    let started = std::time::Instant::now();
     let mut stream = match state.runner.generate_async(task).await {
         Ok(s) => s,
         Err(e) => return Err(TaskFailure::Submit(e)),
@@ -1056,6 +1075,14 @@ async fn readout_once(
     if !logits.iter().all(|x| x.is_finite()) {
         return fail("non-finite decision logits");
     }
+    tracing::debug!(
+        target: "cascadia::perf",
+        task = %perf_task,
+        pass_ms = started.elapsed().as_secs_f64() * 1e3,
+        prompt = readout.prompt_ids.len(),
+        prefilled,
+        "decision pass done"
+    );
     Ok((logits, prefilled))
 }
 
