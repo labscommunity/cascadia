@@ -265,10 +265,15 @@ static int32_t request_state_of(const std::shared_ptr<ov::InferRequest>& req) {
 // Never destroy a request that is not idle (its destructor can wait forever): keep it alive on
 // purpose. A heap holder that is never freed, rather than a static container, so process exit
 // does not run its destructor either.
-static void abandon_request(std::shared_ptr<ov::InferRequest>& req) {
-    if (!req) return;
-    new std::shared_ptr<ov::InferRequest>(std::move(req));  // intentionally leaked
+// False only when the holder cannot be allocated: the request is then left in place, untouched.
+// Never throws, so no exception crosses the extern "C" boundary.
+static bool abandon_request(std::shared_ptr<ov::InferRequest>& req) noexcept {
+    if (!req) return true;
+    auto* holder = new (std::nothrow) std::shared_ptr<ov::InferRequest>();
+    if (!holder) return false;
+    *holder = std::move(req);  // intentionally leaked
     req.reset();
+    return true;
 }
 
 extern "C" {
@@ -888,8 +893,12 @@ int32_t cascadia_runtime_compile(
 
 void cascadia_runtime_destroy(cascadia_runtime_t* handle) {
     if (!handle) return;
-    // A busy request would block this delete forever (Task 46): leak it instead.
-    if (request_state_of(handle->request) != CASCADIA_REQ_IDLE) abandon_request(handle->request);
+    // A busy request would block this delete forever (Task 46): leak it instead. The Rust
+    // `Drop` logs the leak. Out of memory for the holder: leak the whole handle, never block.
+    if (request_state_of(handle->request) != CASCADIA_REQ_IDLE &&
+        !abandon_request(handle->request)) {
+        return;
+    }
     delete handle;
 }
 
@@ -1081,10 +1090,9 @@ int32_t cascadia_runtime_recreate_request(cascadia_runtime_t* handle) {
                                  "not releasing it");
             return 1;
         }
-        // Release the old (idle) request before creating the new one, so the two never hold
-        // device memory at the same time. A failed create leaves no request: later calls fail
-        // with "null runtime handle" instead of running on stale state.
-        handle->request.reset();
+        // Create first, then release the old request, which is idle here so its destructor does
+        // not wait: a failed create keeps the old request, as before (other engines' scrubs
+        // rely on that fallback).
         handle->request = std::make_shared<ov::InferRequest>(handle->compiled->create_infer_request());
         return 0;
     } catch (const std::exception& e) {
@@ -1139,7 +1147,10 @@ int32_t cascadia_runtime_abandon_request(cascadia_runtime_t* handle) {
     if (!handle) {
         set_last_error("null runtime handle"); return 1;
     }
-    abandon_request(handle->request);
+    if (!abandon_request(handle->request)) {
+        set_last_error("abandon_request: out of memory; the request is left in place");
+        return 1;
+    }
     return 0;
 }
 

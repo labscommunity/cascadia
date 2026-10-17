@@ -505,6 +505,7 @@ version = "0.2.7"
 dependencies = [
  "cc",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]

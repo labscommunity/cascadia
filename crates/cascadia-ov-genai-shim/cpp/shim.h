@@ -290,8 +290,7 @@ int32_t cascadia_runtime_reset_state(cascadia_runtime_t* handle);
 /// variable state. Stronger than `reset_state` — use after a
 /// `set_state_blob` whose residue `reset_state` does not clear.
 /// Refuses (returns 1) when the current request is busy or cancelled: releasing
-/// it would block in OpenVINO's destructor. Releases the old request before
-/// creating the new one.
+/// it would block in OpenVINO's destructor.
 int32_t cascadia_runtime_recreate_request(cascadia_runtime_t* handle);
 
 /// The request's state without blocking: 0 idle, 1 busy, 2 cancelled, 3 none
