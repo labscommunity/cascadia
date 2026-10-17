@@ -5448,10 +5448,12 @@ impl OvRuntimeEngine {
         } else {
             None
         };
+        // Consumed here, as `static_infer` clears it: a stale set must never
+        // feed a later inference's DeepStack mask.
         let next_ids = self
             .static_kv
-            .as_ref()
-            .map(|sk| sk.next_ids.clone())
+            .as_mut()
+            .map(|sk| std::mem::take(&mut sk.next_ids))
             .unwrap_or_default();
         let deepstack = self.take_static_deepstack(&next_ids, width)?;
 
