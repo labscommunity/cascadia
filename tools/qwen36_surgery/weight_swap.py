@@ -364,6 +364,9 @@ def add_final_hidden_output(model):
     """Expose the lm_head MatMul's input (= final-norm hidden, all positions) as output 1 `final_hidden`."""
     from openvino import opset13 as ops
     mm = _lm_head_matmul(model)
+    if mm.input_value(0).get_node().get_friendly_name() == LM_HEAD_CUT:
+        raise ValueError("the LM head is already cut to the last position: add final_hidden before "
+                         "cut_lm_head_to_last_position, or it would carry one row")
     if len(model.outputs) != 1:
         raise ValueError(f"expected 1 output (logits) before adding final_hidden, got {len(model.outputs)}")
     res = ops.result(mm.input_value(0))
