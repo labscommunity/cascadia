@@ -272,6 +272,12 @@ def build_packed_model(
             rank = ps.rank.get_length()
             if rank == 3 and ps[0].is_static:
                 shape = [ps[0].get_length(), 1, packed_seq]
+            elif rank == 3:
+                # The host feeds [3, 1, S]; [1, S] would not be M-RoPE at all.
+                raise RuntimeError(
+                    f"position_ids{ps} is M-RoPE with a dynamic row count; "
+                    "re-export the stage with a static rows dim"
+                )
             else:
                 shape = [1, packed_seq]
         elif name == "visual_pos_masks":
