@@ -13,9 +13,6 @@ The stage IRs come from export_qwen36_moe.run_export (one stage in memory at a t
 The decision profile and head assets are written BEFORE the stage export, so the
 manifest run_export writes last stays the commit marker for the whole tree, and a
 bad head.pt / adapter dir fails before the long IR export starts.
-Every family's last stage runs the LM head on the last position only (run_export
-lm_head_last_row, manifest "lm_head_last_row": true); tools/decision/cut_lm_head.py applies the
-same cut to a tree exported before it.
 
 Tree layout (read by crates/cascadia-api/src/decisions/profile.rs and
 HeadAssets::load in crates/cascadia-engine-openvino/src/decision.rs):
@@ -442,15 +439,15 @@ def main():
         cal = a.calibration or os.path.join(os.path.dirname(os.path.abspath(a.adapter_dir)), "calibration.json")
         write_jev_profile(a.adapter_dir, cal, a.out, max_tokens=max_tokens, tokenizer=jev_tok)
         run_export(a.base_ir, a.out, a.stages, False, a.layer_split, weights=a.weights, lora=lora,
-                   lora_scale=a.lora_scale, final_hidden=False, lm_head_last_row=True, **tok_kw)
+                   lora_scale=a.lora_scale, final_hidden=False, **tok_kw)
     elif a.family == "kev":
         write_kev_profile(a.head_pt, a.out, hidden=int(_text_config(a.base_ir)["hidden_size"]), max_tokens=max_tokens)
         run_export(a.base_ir, a.out, a.stages, False, a.layer_split, weights=a.weights, lora=a.lora,
-                   lora_scale=a.lora_scale, final_hidden=True, lm_head_last_row=True, **tok_kw)
+                   lora_scale=a.lora_scale, final_hidden=True, **tok_kw)
     else:
         write_clef_profile(a.clef_dir, a.out, max_tokens=max_tokens)
         run_export(a.base_ir, a.out, a.stages, False, a.layer_split, weights=a.weights or a.clef_dir,
-                   lora=None, lora_scale=None, final_hidden=True, lm_head_last_row=True, **tok_kw)
+                   lora=None, lora_scale=None, final_hidden=True, **tok_kw)
     print(f"decision tree written: {a.out}")
 
 
