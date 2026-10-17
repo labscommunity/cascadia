@@ -300,14 +300,19 @@ pub fn expand_image_tokens(
 
 /// `spatial_merge_size` from `processor_config.json`, a processor (not image
 /// processor) setting. `None` when the file or the key is absent, so the image
-/// processor's value stands.
+/// processor's value stands. A file that is present but unreadable or not JSON
+/// is an error: on a Mistral 3 tree it is where the merge lives, and reading
+/// it as absent would load the tree as plain Pixtral.
 fn processor_spatial_merge(dir: &Path) -> Result<Option<u32>, String> {
-    let Some(v) = std::fs::read(dir.join("processor_config.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-    else {
+    let path = dir.join("processor_config.json");
+    if !path.exists() {
         return Ok(None);
-    };
+    }
+    let v: serde_json::Value = std::fs::read(&path)
+        .map_err(|e| format!("reading {}: {e}", path.display()))
+        .and_then(|b| {
+            serde_json::from_slice(&b).map_err(|e| format!("parsing {}: {e}", path.display()))
+        })?;
     match v
         .get("spatial_merge_size")
         .and_then(serde_json::Value::as_u64)
@@ -316,6 +321,27 @@ fn processor_spatial_merge(dir: &Path) -> Result<Option<u32>, String> {
         Some(m) => Ok(Some(m as u32)),
         None => Ok(None),
     }
+}
+
+/// The processor settings of an export directory: `preprocessor_config.json`
+/// with `processor_config.json`'s merge on top. `mistral3` is the tree's
+/// `vision.family`: Mistral 3 always merges (2x2), so a merge of 1 there means
+/// the processor config is missing or wrong, and the tree would load as plain
+/// Pixtral and fail only at the splice. Refuse it here.
+fn load_preprocess(dir: &Path, mistral3: bool) -> Result<PreprocessConfig, String> {
+    let mut preprocess = PreprocessConfig::from_json_file(&dir.join("preprocessor_config.json"))?;
+    if let Some(m) = processor_spatial_merge(dir)? {
+        preprocess.spatial_merge = m;
+    }
+    if mistral3 && preprocess.spatial_merge < 2 {
+        return Err(format!(
+            "vision family \"mistral3\" needs a spatial_merge_size > 1 (and \
+             openvino_multi_modal_projector_model.xml), but {} names none; copy the model's \
+             processor_config.json into the tree",
+            dir.display()
+        ));
+    }
+    Ok(preprocess)
 }
 
 /// Rank 0's Pixtral image front end: the vision IR, its processor settings
@@ -334,13 +360,11 @@ pub struct Frontend {
 }
 
 impl Frontend {
-    /// Compile `openvino_vision_embeddings_model.xml` from `dir` on the CPU.
-    pub fn load(dir: &Path, tokens: ImageTokens) -> Result<Self, String> {
-        let mut preprocess =
-            PreprocessConfig::from_json_file(&dir.join("preprocessor_config.json"))?;
-        if let Some(m) = processor_spatial_merge(dir)? {
-            preprocess.spatial_merge = m;
-        }
+    /// Compile `openvino_vision_embeddings_model.xml` from `dir` on the CPU,
+    /// plus the projector IR when the processor merges patches. `mistral3`:
+    /// the tree's family is Mistral 3, which must merge (see `load_preprocess`).
+    pub fn load(dir: &Path, tokens: ImageTokens, mistral3: bool) -> Result<Self, String> {
+        let preprocess = load_preprocess(dir, mistral3)?;
         let compile = |name: &str| {
             let path = dir.join(name);
             Runtime::compile(&path.to_string_lossy(), "CPU", &PluginConfig::new())
@@ -510,6 +534,27 @@ mod tests {
         assert_eq!(processor_spatial_merge(dir.path()), Ok(Some(2)));
         write(r#"{"spatial_merge_size":0}"#);
         assert!(processor_spatial_merge(dir.path()).is_err());
+        write("{not json");
+        assert!(
+            processor_spatial_merge(dir.path()).is_err(),
+            "a present but broken file is not read as absent"
+        );
+    }
+
+    /// Mistral 3 must merge: without a merge it would load as plain Pixtral.
+    /// Plain Pixtral needs no processor_config.json at all.
+    #[test]
+    fn mistral3_refuses_a_tree_without_a_spatial_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |f: &str, v: &str| std::fs::write(dir.path().join(f), v).unwrap();
+        write("preprocessor_config.json", "{}");
+        assert_eq!(load_preprocess(dir.path(), false).unwrap().spatial_merge, 1);
+        let e = load_preprocess(dir.path(), true).unwrap_err();
+        assert!(e.contains("mistral3"), "{e}");
+        write("processor_config.json", r#"{"spatial_merge_size":2}"#);
+        assert_eq!(load_preprocess(dir.path(), true).unwrap().spatial_merge, 2);
+        write("processor_config.json", r#"{"spatial_merge_size":1}"#);
+        assert!(load_preprocess(dir.path(), true).is_err());
     }
 
     /// `unfold(kernel=2, stride=2)` on a 2x4 patch grid of 2 channels: token

@@ -2510,7 +2510,12 @@ impl VisionFirst {
                     image_end: special("[IMG_END]")?,
                 };
                 Frontend::Pixtral(
-                    crate::pixtral_vision::Frontend::load(pipeline_dir, tokens).map_err(invalid)?,
+                    crate::pixtral_vision::Frontend::load(
+                        pipeline_dir,
+                        tokens,
+                        cfg.family.as_deref() == Some("mistral3"),
+                    )
+                    .map_err(invalid)?,
                 )
             }
             VisionFamily::Phi3V | VisionFamily::InternVL => {
