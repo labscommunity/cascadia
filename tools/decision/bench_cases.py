@@ -16,7 +16,9 @@ CASES is JSONL, one case per line: {"id": str, "workflow": str, "body": {...}}, 
 /v1/systemone request without "model" (run sets it). Cases are posted one at a time, in file order;
 --per-workflow N keeps the first N of each workflow. OUT is JSONL, one line per case (mode 0600, never
 overwritten). compare matches cases by id and exits 1 when max |dp| > --max-dp, a flip happens where
-the first run's margin is >= --confident, or the two runs hold different cases. It also reads the
+the first run's margin is >= --confident, the two runs hold different cases or questions, no case
+was answered in both, or a case errored in either run (--allow-errors reports those without
+failing). It also reads the
 baseline client's lines ({"id", "latency_s", "probs"}: a noul as {"false": 1-p, "true": p}, a choice
 or score as its probabilities). logsum prints the median and p90 of every numeric key=value field of
 the matching log lines.
@@ -25,6 +27,7 @@ CASES and OUT hold request content (states, questions, answers), like --decision
 private.
 """
 import argparse
+import http.client
 import json
 import os
 import re
@@ -78,8 +81,10 @@ def load_rows(path):
     except json.JSONDecodeError:
         return [json.loads(x) for x in text.splitlines() if x.strip()]
     if isinstance(data, dict):
-        data = data.get("rows", data.get("data"))
-        data = [r.get("row", r) for r in data]
+        rows = data.get("rows", data.get("data"))
+        if not isinstance(rows, list):
+            sys.exit(f"{path}: a JSON object needs a 'rows' or 'data' list")
+        data = [r.get("row", r) for r in rows]
     return data
 
 
@@ -89,12 +94,21 @@ def post(url, body, timeout):
     t0 = time.perf_counter()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = json.loads(r.read())
-            return r.status, time.perf_counter() - t0, data, None
+            status, raw = r.status, r.read()
     except urllib.error.HTTPError as e:
-        return e.code, time.perf_counter() - t0, None, e.read().decode(errors="replace")[:500]
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        return 0, time.perf_counter() - t0, None, str(e)
+        try:
+            body = e.read().decode(errors="replace")[:500]
+        except (http.client.HTTPException, OSError) as e2:
+            body = f"(body unreadable: {e2})"
+        return e.code, time.perf_counter() - t0, None, body
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as e:
+        return 0, time.perf_counter() - t0, None, f"{type(e).__name__}: {e}"
+    lat = time.perf_counter() - t0
+    try:
+        return status, lat, json.loads(raw), None
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        # Not a success: the error field makes `ok` reject it, whatever the status.
+        return status, lat, None, f"invalid JSON in the response: {e}"[:500]
 
 
 def pct(xs, q):
@@ -116,7 +130,11 @@ def probs_of(r):
     """Question id -> probabilities in API option order, from either line format."""
     if "answers" in r:
         return {q: answer_probs(a) for q, a in r["answers"].items()}
-    return {q: list(d.values()) for q, d in (r.get("probs") or {}).items()}
+    out = {}
+    for q, d in (r.get("probs") or {}).items():
+        # A baseline noul is {"false": 1-p, "true": p}: answer_probs order, whatever the key order.
+        out[q] = [d["false"], d["true"]] if set(d) == {"false", "true"} else list(d.values())
+    return out
 
 
 def summary(results):
@@ -131,23 +149,32 @@ def summary(results):
     return out
 
 
-def compare(a, b, confident, max_dp):
+def compare(a, b, confident, max_dp, allow_errors=False):
+    """Fails on cases in only one file, a question in only one run's answer (or with a different
+    option count), max |dp| > max_dp, a flip where a's margin is >= confident, no case compared,
+    or (unless allow_errors) a case that errored in either run."""
     ia = {r["id"]: probs_of(r) for r in a if ok(r)}
     ib = {r["id"]: probs_of(r) for r in b if ok(r)}
-    missing = sorted(set(ia) ^ set(ib))
-    worst, flips, sure = 0.0, 0, 0
+    errors_a = sorted(r["id"] for r in a if not ok(r))
+    errors_b = sorted(r["id"] for r in b if not ok(r))
+    missing = sorted({r["id"] for r in a} ^ {r["id"] for r in b})
+    worst, flips, sure, compared = 0.0, 0, 0, 0
     for cid in sorted(set(ia) & set(ib)):
-        for qid, pa in ia[cid].items():
-            pb = ib[cid].get(qid)
-            if pb is None or len(pb) != len(pa):
+        compared += 1
+        qa, qb = ia[cid], ib[cid]
+        for qid in list(qa) + [q for q in qb if q not in qa]:
+            pa, pb = qa.get(qid), qb.get(qid)
+            if pa is None or pb is None or len(pb) != len(pa):
                 missing.append(f"{cid}.{qid}")
                 continue
             worst = max(worst, max(abs(x - y) for x, y in zip(pa, pb)))
             if pa.index(max(pa)) != pb.index(max(pb)):
                 flips += 1
                 sure += margin(pa) >= confident
-    ok_ = not missing and worst <= max_dp and sure == 0
-    return {"max_dp": worst, "flips": flips, "confident_flips": sure, "missing": missing, "ok": ok_}
+    errored = bool(errors_a or errors_b) and not allow_errors
+    ok_ = not missing and worst <= max_dp and sure == 0 and compared > 0 and not errored
+    return {"max_dp": worst, "flips": flips, "confident_flips": sure, "missing": missing,
+            "errors_a": errors_a, "errors_b": errors_b, "compared": compared, "ok": ok_}
 
 
 def model_pairs(sa, sb):
@@ -215,6 +242,8 @@ def main(argv=None):
     c.add_argument("b")
     c.add_argument("--confident", type=float, default=0.05)
     c.add_argument("--max-dp", type=float, default=0.05)
+    c.add_argument("--allow-errors", action="store_true",
+                   help="do not fail on cases that errored in either run (they are still reported)")
     s = sub.add_parser("logsum")
     s.add_argument("log")
     s.add_argument("--event", default="qwen36 decision pass done")
@@ -251,7 +280,7 @@ def main(argv=None):
         return 0
     if a.cmd == "compare":
         ra, rb = load(a.a), load(a.b)
-        res = compare(ra, rb, a.confident, a.max_dp)
+        res = compare(ra, rb, a.confident, a.max_dp, a.allow_errors)
         sa, sb = summary(ra), summary(rb)
         for ma, mb in model_pairs(sa, sb):
             d = (sb[mb]["p50"] - sa[ma]["p50"]) / sa[ma]["p50"] * 100
@@ -259,10 +288,17 @@ def main(argv=None):
             print(f"{label}: p50 {sa[ma]['p50']:.2f} -> {sb[mb]['p50']:.2f} s ({d:+.1f}%), "
                   f"p90 {sa[ma]['p90']:.2f} -> {sb[mb]['p90']:.2f} s, "
                   f"errors {sa[ma]['errors']} -> {sb[mb]['errors']}")
+        print(f"compared {res['compared']} cases; errored: {len(res['errors_a'])} in {a.a}, "
+              f"{len(res['errors_b'])} in {a.b}" + (" (allowed)" if a.allow_errors else ""))
+        for side, errs in ((a.a, res["errors_a"]), (a.b, res["errors_b"])):
+            if errs:
+                print(f"errored in {side}: {errs}")
+        if res["compared"] == 0:
+            print("no case answered in both runs: nothing compared")
         print(f"max |dp| = {res['max_dp']:.4f}")
         print(f"flips = {res['flips']} (confident {res['confident_flips']})")
         if res["missing"]:
-            print(f"cases in only one run: {res['missing']}")
+            print(f"cases or questions in only one run: {res['missing']}")
         print("PASS" if res["ok"] else "FAIL")
         return 0 if res["ok"] else 1
     with open(a.log, errors="replace") as f:
