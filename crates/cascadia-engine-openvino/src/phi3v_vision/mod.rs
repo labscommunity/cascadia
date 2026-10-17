@@ -486,6 +486,26 @@ pub fn expand_image_tokens(ids: &[i64], image: i64, counts: &[usize]) -> Result<
 
 /// A learned separator row from the VLM `config.json` (`glb_GN`, `sub_GN`):
 /// nested arrays flattened.
+/// `embd_layer.hd_transform_order` of the export's `config.json`. Only
+/// `sub_glb` (sub crops, `glb_GN`, then the global view: what `assemble`
+/// builds, and what Phi-3.5-vision ships) is served. The reference embedding
+/// defaults a missing key to `glb_sub`, so a config without it is refused too
+/// rather than assembled in the other order.
+pub fn check_hd_transform_order(cfg: &serde_json::Value) -> Result<(), String> {
+    match cfg
+        .get("embd_layer")
+        .and_then(|e| e.get("hd_transform_order"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("sub_glb") => Ok(()),
+        other => Err(format!(
+            "config embd_layer.hd_transform_order is {}; only \"sub_glb\" is served (the \
+             reference defaults a missing key to \"glb_sub\")",
+            other.map_or_else(|| "missing".to_string(), |o| format!("{o:?}"))
+        )),
+    }
+}
+
 pub fn separator(cfg: &serde_json::Value, key: &str) -> Result<Vec<f32>, String> {
     fn flat(v: &serde_json::Value, out: &mut Vec<f32>) -> bool {
         match v {
@@ -540,6 +560,7 @@ impl Frontend {
         image_token: i64,
     ) -> Result<Self, String> {
         let preprocess = PreprocessConfig::from_json_file(&dir.join("preprocessor_config.json"))?;
+        check_hd_transform_order(vlm_config)?;
         let compile = |name: &str| {
             let path = dir.join(name);
             Runtime::compile(&path.to_string_lossy(), "CPU", &PluginConfig::new())
@@ -820,5 +841,18 @@ mod tests {
         assert_eq!(separator(&v, "sub_GN").unwrap(), vec![1.0, 2.0]);
         assert_eq!(separator(&v, "glb_GN").unwrap(), vec![3.0]);
         assert!(separator(&v, "nope").is_err());
+    }
+
+    #[test]
+    fn only_the_sub_glb_hd_transform_order_is_served() {
+        let order = |o: serde_json::Value| {
+            check_hd_transform_order(&serde_json::json!({"embd_layer": {"hd_transform_order": o}}))
+        };
+        assert!(order(serde_json::json!("sub_glb")).is_ok());
+        assert!(order(serde_json::json!("glb_sub")).is_err());
+        assert!(order(serde_json::json!(1)).is_err());
+        let e = check_hd_transform_order(&serde_json::json!({"embd_layer": {}})).unwrap_err();
+        assert!(e.contains("missing"), "{e}");
+        assert!(check_hd_transform_order(&serde_json::json!({})).is_err());
     }
 }
