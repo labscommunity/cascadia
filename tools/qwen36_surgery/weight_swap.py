@@ -348,22 +348,14 @@ def graft_lora(model, adapter_file, scale, layers=None, lm_head=True):
     return grafted
 
 
-LM_HEAD_CUT = "cascadia/lm_head_last_row"
-
-
-def _lm_head_matmul(model):
-    mm = next((op for op in model.get_ops()
-               if op.get_type_name() == "MatMul"
-               and op.get_friendly_name().endswith("lm_head/ov_ext::linear/MatMul")), None)
-    if mm is None:
-        raise ValueError("no MatMul named '...lm_head/ov_ext::linear/MatMul' (is this the last stage?)")
-    return mm
-
-
 def add_final_hidden_output(model):
     """Expose the lm_head MatMul's input (= final-norm hidden, all positions) as output 1 `final_hidden`."""
     from openvino import opset13 as ops
-    mm = _lm_head_matmul(model)
+    mm = next((op for op in model.get_ops()
+               if op.get_type_name() == "MatMul" and op.get_friendly_name().endswith("lm_head/ov_ext::linear/MatMul")),
+              None)
+    if mm is None:
+        raise ValueError("no MatMul named '...lm_head/ov_ext::linear/MatMul' (is this the last stage?)")
     if len(model.outputs) != 1:
         raise ValueError(f"expected 1 output (logits) before adding final_hidden, got {len(model.outputs)}")
     res = ops.result(mm.input_value(0))
@@ -372,35 +364,3 @@ def add_final_hidden_output(model):
     model.validate_nodes_and_infer_types()
     if len(model.outputs) != 2 or "final_hidden" not in model.outputs[1].get_names():
         raise ValueError("final_hidden did not land at output index 1")
-
-
-def cut_lm_head_to_last_position(model):
-    """Feed the LM head (its MatMul and any grafted LoRA branch) only the LAST position.
-
-    The exporter slices the logits after the MatMul, so a T-token prefill span still computes
-    [T, vocab] and keeps one row. Slicing the MatMul's input instead computes one row. The
-    `final_hidden` Result (decision heads, output 1) stays on the unsliced tensor, so Kev and Clef
-    read every row as before. Run after graft_lora and add_final_hidden_output. Returns False
-    when the model is already cut.
-
-    Only MatMul consumers of the head input move onto the slice: the head itself and the first
-    MatMul (x A^T) of a grafted lm_head LoRA branch, which reads the same tensor. Any other
-    consumer (the final_hidden Result, a shape-only read) keeps the full [1, T, hidden] tensor."""
-    from openvino import opset13 as ops
-    mm = _lm_head_matmul(model)
-    src = mm.input_value(0)
-    if src.get_node().get_friendly_name() == LM_HEAD_CUT:
-        return False
-    def i64(v, name):
-        # named, not auto-numbered: a patched tree and a fresh export then serialize the same XML
-        c = ops.constant(np.array([v], dtype=np.int64))
-        c.set_friendly_name(f"{LM_HEAD_CUT}/{name}")
-        return c
-    cut = ops.slice(src, i64(-1, "start"), i64(np.iinfo(np.int64).max, "stop"), i64(1, "step"), i64(1, "axis"))
-    cut.set_friendly_name(LM_HEAD_CUT)
-    for tgt in list(src.get_target_inputs()):
-        node = tgt.get_node()
-        if node.get_type_name() == "MatMul" and tgt.get_index() == 0:
-            tgt.replace_source_output(cut.output(0))
-    model.validate_nodes_and_infer_types()
-    return True
