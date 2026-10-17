@@ -481,7 +481,7 @@ impl PrefixCache {
         self.tick += 1;
         let mut best: Option<(usize, usize)> = None; // (index, key len)
         for (i, e) in self.entries.iter_mut().enumerate() {
-            if e.tokens.len() < prompt.len() && prompt.starts_with(&e.tokens) {
+            if strict_prefix_of(&e.tokens, prompt) {
                 e.last_used = self.tick;
                 if best.is_none_or(|(_, len)| len < e.tokens.len()) {
                     best = Some((i, e.tokens.len()));
@@ -499,6 +499,23 @@ impl PrefixCache {
             }
         }
     }
+
+    /// The token count [`Self::longest_prefix`] would match for `prompt`, without touching
+    /// anything: no LRU update and no hit or miss counted. For a caller that decides whether to
+    /// restore at all before it looks the entry up.
+    pub fn peek_longest(&self, prompt: &[u32]) -> Option<usize> {
+        self.entries
+            .iter()
+            .filter(|e| strict_prefix_of(&e.tokens, prompt))
+            .map(|e| e.tokens.len())
+            .max()
+    }
+}
+
+/// The match rule of [`PrefixCache::longest_prefix`] and [`PrefixCache::peek_longest`]: `key` is
+/// a STRICT prefix of `prompt`, so at least one token is left to prefill.
+fn strict_prefix_of(key: &[u32], prompt: &[u32]) -> bool {
+    key.len() < prompt.len() && prompt.starts_with(key)
 }
 
 /// The two measured rates the warm-turn refresh rule needs. Both come from
@@ -507,12 +524,49 @@ impl PrefixCache {
 /// state at ~0.5 GB/s (measured on the B390: 1.2 GB in 2.5 s, 4.45 GB in 9 s)
 /// and a CPU that prefills at 60 tok/s and copies at memcpy speed each get
 /// their own break-even.
+///
+/// The other fields serve the decision reuse rule ([`RefreshCosts::reuse_pays`]). Each is the
+/// latest observation of its kind on this engine, and `None` until one has been seen.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RefreshCosts {
     /// Prompt tokens prefilled per second (restore and snapshot time excluded).
     pub prefill_tok_s: Option<f64>,
     /// Seconds per byte of the last snapshot copy.
     pub snapshot_s_per_byte: Option<f64>,
+    /// The latest prefill of at least [`PREFILL_OBS_MIN_TOKENS`] tokens: its token count, the
+    /// spans it ran in, and its wall time (snapshot copies excluded).
+    pub prefill_obs: Option<PrefillObs>,
+    /// Seconds of the latest priming fold: the one-token pass over all weights that every
+    /// restore runs first. It is also what a prefill span costs before its tokens: on an iGPU a
+    /// span is bound by reading the weights once, whatever its length.
+    pub fold_s: Option<f64>,
+    /// Seconds per byte of the latest restore's `set_state_blob` writes (priming fold excluded).
+    pub set_state_s_per_byte: Option<f64>,
+    /// Seconds of the latest reset after a restored pass (`recreate_request` on every stage).
+    pub recreate_s: Option<f64>,
+    /// Seconds of the latest cheap reset (`reset_state` on every stage).
+    pub reset_s: Option<f64>,
+}
+
+/// One prefill's size and wall time ([`RefreshCosts::prefill_obs`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PrefillObs {
+    pub tokens: usize,
+    pub spans: usize,
+    pub secs: f64,
+}
+
+/// The shortest prefill [`RefreshCosts::prefill_obs`] records. Shorter ones are mostly the
+/// span's fixed cost, so their per-token share is noise.
+pub const PREFILL_OBS_MIN_TOKENS: usize = 128;
+
+/// Both sides of the decision reuse rule, in seconds ([`RefreshCosts::reuse_cost`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReuseCost {
+    /// Priming fold + `set_state` of the snapshot + the extra reset after the pass.
+    pub restore_s: f64,
+    /// What prefilling the shared tokens adds to the pass.
+    pub prefill_s: f64,
 }
 
 impl RefreshCosts {
@@ -532,6 +586,56 @@ impl RefreshCosts {
             }
             _ => true,
         }
+    }
+
+    /// What a restored pass pays at its end beyond a cold pass's reset: `recreate_request` on
+    /// every stage instead of the cheap `reset_state`. 0 until both kinds have been measured.
+    pub fn recreate_extra_s(&self) -> f64 {
+        match (self.recreate_s, self.reset_s) {
+            (Some(r), Some(c)) => (r - c).max(0.0),
+            _ => 0.0,
+        }
+    }
+
+    /// Seconds one more token adds to a prefill: the latest observation's wall time less its
+    /// spans' fixed cost ([`Self::fold_s`]), per token. With no fold measured, or a fixed cost
+    /// that leaves nothing, the plain average (which counts the fixed cost per token, so it
+    /// overstates what a restore saves: the error leans toward reuse). Without an observation,
+    /// the average rate `prefill_tok_s`.
+    pub fn prefill_s_per_token(&self) -> Option<f64> {
+        match self.prefill_obs {
+            Some(o) if o.tokens > 0 && o.secs > 0.0 => {
+                let avg = o.secs / o.tokens as f64;
+                let fixed = self.fold_s.unwrap_or(0.0) * o.spans as f64;
+                let marginal = (o.secs - fixed) / o.tokens as f64;
+                Some(if marginal > 0.0 { marginal } else { avg })
+            }
+            _ => self.prefill_tok_s.filter(|&r| r > 0.0).map(|r| 1.0 / r),
+        }
+    }
+
+    /// The decision reuse rule's two sides for a shared prefix of `tokens` tokens whose snapshot
+    /// is `bytes`, where prefilling the prefix would also take `spans_saved` more spans than
+    /// the pass's tail alone. Restoring costs the priming fold, the `set_state` writes (at the
+    /// snapshot copy's rate until a restore has been measured; the same host-to-GPU copy) and
+    /// the rebuild after the pass ([`Self::recreate_extra_s`]). Prefilling costs the tokens at
+    /// the marginal rate plus each extra span's fixed cost. `None` while the prefill or copy rate
+    /// is unknown.
+    pub fn reuse_cost(&self, tokens: usize, spans_saved: usize, bytes: usize) -> Option<ReuseCost> {
+        let per_token = self.prefill_s_per_token()?;
+        let per_byte = self.set_state_s_per_byte.or(self.snapshot_s_per_byte)?;
+        let fold = self.fold_s.unwrap_or(0.0);
+        Some(ReuseCost {
+            restore_s: fold + bytes as f64 * per_byte + self.recreate_extra_s(),
+            prefill_s: tokens as f64 * per_token + spans_saved as f64 * fold,
+        })
+    }
+
+    /// Decision reuse rule: is restoring the snapshot predicted to cost less than prefilling the
+    /// shared prefix again ([`Self::reuse_cost`])? Any unknown rate: reuse, as before the rule.
+    pub fn reuse_pays(&self, tokens: usize, spans_saved: usize, bytes: usize) -> bool {
+        self.reuse_cost(tokens, spans_saved, bytes)
+            .is_none_or(|c| c.restore_s < c.prefill_s)
     }
 }
 
@@ -788,6 +892,7 @@ mod tests {
         let cpu = RefreshCosts {
             prefill_tok_s: Some(60.0),
             snapshot_s_per_byte: Some(0.4 / 1.2e9),
+            ..Default::default()
         };
         assert!(cpu.refresh_pays(50, bytes));
     }
@@ -797,7 +902,131 @@ mod tests {
         RefreshCosts {
             prefill_tok_s: Some(455.0),
             snapshot_s_per_byte: Some(2.6 / 1.2e9),
+            ..Default::default()
         }
+    }
+
+    /// Kev-9B on pawan-03 (Arc 140V, Task 47 debug timings): priming fold 197 ms, set_state
+    /// 96 ms for the ~171-token state's ~64.7 MB snapshot, a 280-token cold prefill in two spans
+    /// at 1.6 ms per token over the fold. The reset gap (recreate 50 ms, reset 1 ms) is assumed:
+    /// Task 47 did not report it.
+    fn kev_costs() -> RefreshCosts {
+        RefreshCosts {
+            prefill_tok_s: None,
+            snapshot_s_per_byte: Some(0.10 / kev_bytes(171) as f64),
+            prefill_obs: Some(PrefillObs {
+                tokens: 280,
+                spans: 2,
+                secs: 2.0 * 0.197 + 280.0 * 0.0016,
+            }),
+            fold_s: Some(0.197),
+            set_state_s_per_byte: Some(0.096 / kev_bytes(171) as f64),
+            recreate_s: Some(0.050),
+            reset_s: Some(0.001),
+        }
+    }
+
+    /// A Kev-9B snapshot: fixed recurrent state plus 64 KiB of KV per token.
+    fn kev_bytes(n: usize) -> usize {
+        53_500_000 + 65_536 * n
+    }
+
+    #[test]
+    fn reuse_loses_at_kev_state_lengths_and_wins_for_long_prefixes() {
+        let c = kev_costs();
+        let at = |n: usize, spans_saved: usize| c.reuse_cost(n, spans_saved, kev_bytes(n)).unwrap();
+        let kev = at(171, 0);
+        assert!(
+            (kev.restore_s - (0.197 + 0.096 + 0.049)).abs() < 1e-9,
+            "{kev:?}"
+        );
+        assert!((kev.prefill_s - 171.0 * 0.0016).abs() < 1e-9, "{kev:?}");
+        assert!(
+            !c.reuse_pays(171, 0, kev_bytes(171)),
+            "0.34 s to restore vs 0.27 s to prefill"
+        );
+        // Even with no reset gap, the fold and set_state alone outweigh 171 tokens.
+        let mut no_gap = c;
+        no_gap.recreate_s = None;
+        assert!(!no_gap.reuse_pays(171, 0, kev_bytes(171)));
+        // A chat-sized prefix (4,000 tokens, 15 more spans of 256): restore is a clear win.
+        assert!(c.reuse_pays(4_000, 15, kev_bytes(4_000)));
+        assert!(
+            c.reuse_pays(4_000, 0, kev_bytes(4_000)),
+            "even without the span term"
+        );
+        // Near break-even, each extra span the prefix would take counts its fixed cost.
+        assert!(!c.reuse_pays(200, 0, kev_bytes(200)));
+        assert!(c.reuse_pays(200, 1, kev_bytes(200)));
+    }
+
+    #[test]
+    fn unknown_rates_keep_todays_reuse() {
+        assert!(RefreshCosts::default().reuse_pays(171, 0, 64_000_000));
+        let mut c = kev_costs();
+        c.prefill_obs = None;
+        assert!(c.reuse_pays(171, 0, 64_000_000), "no prefill rate: reuse");
+        c.prefill_tok_s = Some(600.0);
+        assert!(
+            !c.reuse_pays(171, 0, kev_bytes(171)),
+            "the average rate stands in: 0.34 s to restore vs 0.29 s to prefill"
+        );
+        let mut c = kev_costs();
+        c.set_state_s_per_byte = None;
+        c.snapshot_s_per_byte = None;
+        assert!(c.reuse_pays(171, 0, 1 << 30), "no copy rate: reuse");
+    }
+
+    #[test]
+    fn before_any_restore_the_snapshot_rate_and_the_average_prefill_stand_in() {
+        // The first request: one cold pass (no fold measured yet) and its snapshot. The rule
+        // then counts the fixed span cost per token and no fold, which leans toward reuse, so
+        // the second pass restores and measures the real costs.
+        let mut c = kev_costs();
+        c.fold_s = None;
+        c.set_state_s_per_byte = None;
+        c.recreate_s = None;
+        let per_token = c.prefill_s_per_token().unwrap();
+        let obs = c.prefill_obs.unwrap();
+        assert!((per_token - obs.secs / 280.0).abs() < 1e-12);
+        assert!(c.reuse_pays(171, 0, kev_bytes(171)));
+    }
+
+    #[test]
+    fn a_fold_larger_than_the_observed_prefill_falls_back_to_the_average() {
+        let mut c = kev_costs();
+        c.fold_s = Some(10.0);
+        let o = c.prefill_obs.unwrap();
+        assert!((c.prefill_s_per_token().unwrap() - o.secs / o.tokens as f64).abs() < 1e-12);
+    }
+
+    #[test]
+    fn recreate_extra_needs_both_kinds_of_reset() {
+        let mut c = kev_costs();
+        assert!((c.recreate_extra_s() - 0.049).abs() < 1e-12);
+        c.reset_s = Some(0.2);
+        assert_eq!(c.recreate_extra_s(), 0.0, "never negative");
+        c.reset_s = None;
+        assert_eq!(c.recreate_extra_s(), 0.0);
+    }
+
+    #[test]
+    fn peek_longest_neither_counts_nor_touches() {
+        let mut c = PrefixCache::new(1 << 20);
+        let p = key(100, 0);
+        assert!(c.insert(p[..40].to_vec(), blob(10)));
+        assert!(c.insert(p[..20].to_vec(), blob(10)));
+        assert_eq!(c.peek_longest(&p), Some(40));
+        assert_eq!(c.peek_longest(&p[..40]), Some(20), "strict prefixes only");
+        assert_eq!(c.peek_longest(&key(100, 1)), None);
+        assert_eq!(c.stats(), (0, 0));
+        // No LRU touch: the 40-token entry stays the older one, so it is still evicted first.
+        let ticks: Vec<u64> = c.entries.iter().map(|e| e.last_used).collect();
+        let _ = c.peek_longest(&p);
+        assert_eq!(
+            c.entries.iter().map(|e| e.last_used).collect::<Vec<_>>(),
+            ticks
+        );
     }
 
     #[test]
