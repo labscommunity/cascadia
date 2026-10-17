@@ -728,6 +728,29 @@ which must encode to `end_think_id`) and `after_think` (`"\n\n"`). A profile who
 - **Several questions.** The reference answers one question per request; here every eligible
   question thinks on its own, and the budget counts all of them.
 
+### Measured
+
+JEV-9B switchable tree (`--switchable-lora`, int8), single box, GPU (Intel Arc 140V, Core Ultra 7
+258V, 32 GB, OpenVINO GenAI 2026.4.0), `think_budget` 4096, threshold 0.8. Three requests: a
+refund case (a noul plus a choice), an ambiguous department choice and an arithmetic choice.
+
+| Request | `off` (System 1) | `on` | `auto` |
+|---|---|---|---|
+| Refund noul | 0.9964 | 0.9979, 491 thought tokens | 0.9964, no thought (confident) |
+| Refund department | billing 1.0 | billing 0.9999, 602 thought tokens | billing 1.0, no thought |
+| Ambiguous department | billing 0.6142 / technical 0.3845 | billing 0.8071 / technical 0.1923, 1429 thought tokens | same as `on` (below threshold, thought) |
+| Arithmetic cost | $8 0.9926 | $8 0.9961, 708 thought tokens | $8 0.9926, no thought |
+| Latency per request | 0.2–0.5 s | 92–188 s | 0.3–0.5 s when confident, 185 s when it thinks |
+
+Every thought finished within budget. The same sequence gave the same answers across three runs.
+One earlier run hit an `unknown C++ exception in infer` on the ambiguous request's think task under
+`auto`, after a prefix-cache restore; two later runs of the same sequence (one on the build with
+the [Failures](#failures) handling) did not reproduce it. The cause is open; the failure lines
+above are what a recurrence must be diagnosed from.
+
+System 1 on the same switchable tree matches the baked tree: CPU 82/82 (max |Δp| 0.0175,
+identical to the baked tree), GPU 81/82 (max |Δp| 0.0269; the flip is fp16 rounding).
+
 ## Confidence
 
 **Confidence follows TypeSafe's system-one-adapter 0.2.1**, the formulas Kev's own server also
