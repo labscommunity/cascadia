@@ -131,7 +131,8 @@ pub fn tournament_final(groups: &[Vec<usize>], in_group: &[Vec<f64>]) -> Vec<usi
     fin
 }
 
-/// serve_decide's tournament combination, in f64 and in its summation order: a finalist gets
+/// serve_decide's tournament combination, in f64 and in its order (its `sum()` compensates
+/// rounding from CPython 3.12 on; this adds left to right, see docs/decisions.md): a finalist gets
 /// `final · Σ_g share[g]·cap[g]`, anyone else `share[group] · in_group`, then the whole is
 /// normalised; `share[g]` / `cap[g]` sum the final / in-group mass of group g's finalists.
 pub fn combine_tournament(

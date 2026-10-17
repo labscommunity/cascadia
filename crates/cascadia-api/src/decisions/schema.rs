@@ -446,7 +446,8 @@ pub struct DecisionRequest {
     /// `auto`'s threshold, in [0, 1] (default: the profile's, 0.8).
     #[serde(default)]
     pub threshold: Option<f64>,
-    /// Most tokens System 2 may think, 1..=the profile's `max_tokens` (also the default).
+    /// Most tokens System 2 may think, 1..=the profile's `max_tokens` (default: 4096, or
+    /// `max_tokens` when smaller).
     #[serde(default)]
     pub think_budget: Option<usize>,
     /// Return System 2's reasoning text in each answer's `thinking.reasoning`.
