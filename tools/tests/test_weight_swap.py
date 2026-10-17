@@ -406,6 +406,13 @@ def test_cut_lm_head_is_idempotent_and_needs_a_head():
         ws.cut_lm_head_to_last_position(ov.Model([ops.result(x)], [x], "t"))
 
 
+def test_add_final_hidden_output_refuses_a_cut_head():
+    _, model = _head_model(final_hidden=False)
+    ws.cut_lm_head_to_last_position(model)
+    with pytest.raises(ValueError, match="already cut"):
+        ws.add_final_hidden_output(model)
+
+
 def test_cut_lm_head_survives_a_save_and_reload(tmp_path):
     ov, model = _head_model()
     ws.cut_lm_head_to_last_position(model)

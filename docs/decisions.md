@@ -704,6 +704,11 @@ python tools/decision/cut_lm_head.py /models/jev-9b-int8 --restore  # undo, byte
   `stage.xml` and `stage.bin` (renamed, so no second copy of the stage is written) and
   `manifest.json` (copied). It then writes the cut stage and adds the manifest key where an export
   puts it. A tree that is already cut is left alone, and stale backups make it refuse.
+- An interrupted cut or restore can be recovered. Before its first change, the tool writes
+  `cut_lm_head.journal` in the tree. When the next run of either command finds that journal, it
+  first moves every backup back, which returns the tree to its uncut files. A cut that fails
+  part way rolls back at once; if the rollback also fails, run `--restore` once the files are
+  free. On Windows, each rename is retried a few times if another process still holds the file.
 - It produces the same graph as a fresh export. Peak memory is one stage.
 - In a pipeline, every rank compares `manifest.json` byte for byte at startup (HELLO). Cut every
   rank's copy of the tree with the same commit, or none of them.
