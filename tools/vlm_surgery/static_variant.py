@@ -150,15 +150,25 @@ def make_stateless(model: ov.Model, has_head: bool) -> list[tuple[int, int]]:
     return geom
 
 
-def pin_shapes(model: ov.Model, seq: int, context: int, past: int | None = None) -> None:
+def pin_shapes(model: ov.Model, seq: int, context: int, past: int | None = None,
+               deepstack_layers: int = 0) -> None:
     """Make every input static for a `seq`-row query over `context` slots.
     `seq == -1` leaves the query width (and so the mask length) dynamic over a
-    fixed `past`: one IR then serves seq=1 decode and wide prefill chunks."""
+    fixed `past`: one IR then serves seq=1 decode and wide prefill chunks.
+
+    Qwen2.5-VL / Qwen3-VL language models take M-RoPE `position_ids [rows, 1,
+    seq]` (rows = 3) instead of the 1-D `[1, seq]`, and Qwen3-VL's stage 0 also
+    takes the DeepStack inputs `visual_pos_masks [1, seq]` and
+    `deepstack_visual_embeds [layers, seq, hidden]`. The language model gathers
+    at most one DeepStack row per image token (`max(0, cumsum(mask) - 1)`), so
+    pinning that port's token dim to `seq` and zero-padding its unused rows is
+    always safe: the gather never reaches a padded row."""
     if seq != -1:
         past = context - seq
     shapes = {}
     canon = ("inputs_embeds", "hidden_states", "input_ids", "attention_mask",
-             "position_ids", "token_type_ids")
+             "position_ids", "token_type_ids", "visual_pos_masks",
+             "deepstack_visual_embeds")
     for inp in model.inputs:
         names = inp.get_names()
         name = inp.get_any_name()
@@ -174,13 +184,24 @@ def pin_shapes(model: ov.Model, seq: int, context: int, past: int | None = None)
         elif kind == "attention_mask":
             shapes[name] = [1, context if seq != -1 else -1]
         elif kind == "position_ids":
-            if ps.rank.get_length() != 2:
+            rank = ps.rank.get_length()
+            if rank == 2:
+                shapes[name] = [1, seq]
+            elif rank == 3 and ps[0].is_static:
+                # M-RoPE: [rows, batch, seq]; the host feeds [3, 1, seq].
+                shapes[name] = [ps[0].get_length(), 1, seq]
+            else:
                 raise SystemExit(f"position_ids rank {ps.rank} (multi-axis rope) is not supported")
+        elif kind == "visual_pos_masks":
             shapes[name] = [1, seq]
+        elif kind == "deepstack_visual_embeds":
+            layers = ps[0].get_length() if ps[0].is_static else deepstack_layers
+            if layers <= 0:
+                raise SystemExit("deepstack_visual_embeds layer count is unknown; pass a "
+                                 "tree whose pipeline_config.json has vision.deepstack_layers")
+            shapes[name] = [layers, seq, ps[2].get_length()]
         elif name.startswith("past_key_values."):
             shapes[name] = [1, ps[1].get_length(), past, ps[3].get_length()]
-        elif kind == "token_type_ids":
-            shapes[name] = [1, seq]
         else:
             raise SystemExit(f"unexpected stage input {name!r}")
     model.reshape(shapes)
@@ -199,7 +220,7 @@ def copy_file(src: str, dst: str) -> None:
 
 
 def convert_stage(tree: str, out: str, i: int, context: int, prefill_seq: int,
-                  shared_prefill: bool = False) -> None:
+                  shared_prefill: bool = False, deepstack_layers: int = 0) -> None:
     sdir, odir = os.path.join(tree, f"stage_{i}"), os.path.join(out, f"stage_{i}")
     with open(os.path.join(sdir, "stage_config.json")) as f:
         meta = json.load(f)
@@ -214,9 +235,9 @@ def convert_stage(tree: str, out: str, i: int, context: int, prefill_seq: int,
     if shared_prefill:
         # CPU/GPU: one IR with a dynamic query width serves decode and
         # prefill chunks, so the weights are compiled once, not twice.
-        pin_shapes(model, -1, context, past=context - 1)
+        pin_shapes(model, -1, context, past=context - 1, deepstack_layers=deepstack_layers)
     else:
-        pin_shapes(model, 1, context)
+        pin_shapes(model, 1, context, deepstack_layers=deepstack_layers)
     ov.save_model(model, os.path.join(odir, "openvino_model.xml"), compress_to_fp16=False)
     kinds = sorted(set(geom))
     log(f"stage_{i}: {len(geom)} layers, kv {kinds}, decode IR saved ({time.time() - t0:.0f}s)")
@@ -242,7 +263,7 @@ def convert_stage(tree: str, out: str, i: int, context: int, prefill_seq: int,
         # Same contract as export_shards: the prefill window's past length
         # equals the decode model's, so both share one host-side ring.
         pctx = context - 1 + prefill_seq
-        pin_shapes(model, prefill_seq, pctx)
+        pin_shapes(model, prefill_seq, pctx, deepstack_layers=deepstack_layers)
         ov.save_model(model, prefill, compress_to_fp16=False)
         meta.update({"static_prefill_seq": prefill_seq, "static_prefill_context": pctx})
         log(f"stage_{i}: prefill IR seq {prefill_seq} context {pctx} saved "
@@ -310,10 +331,13 @@ def main() -> None:
     marker = os.path.join(args.output_dir, "pipeline_config.json")
     if os.path.exists(marker):
         os.remove(marker)
+    # Qwen3-VL stage 0 takes the DeepStack inputs; their layer count pins the
+    # deepstack_visual_embeds port (its first dim is dynamic in the export).
+    deepstack_layers = int(v.get("deepstack_layers") or 0)
     stages = range(pipeline["num_stages"]) if args.stage is None else [args.stage]
     for i in stages:
         convert_stage(args.tree, args.output_dir, i, args.context, args.prefill_seq,
-                      args.shared_prefill)
+                      args.shared_prefill, deepstack_layers)
     copy_root(args.tree, args.output_dir)
     for s in pipeline["stages"]:
         s.update({"stateful": False, "static_seq": 1, "static_context": args.context})
