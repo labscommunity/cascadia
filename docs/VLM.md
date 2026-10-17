@@ -332,7 +332,9 @@ is not practical on the NPU: one stage's decode IR had not compiled after 90 min
 (its mixture-of-experts layers); serve it from CPU static or stateful trees. Qwen3-VL 4B
 static and packed (`--packed-slots 2`) trees passed the SDK image suite on CPU — one box and
 two machines (the M-RoPE positions ride the stage wire) — with the prompt-token count
-matching the stateful tree (223), and the packed concurrent test too.
+matching the stateful tree (223), and the packed concurrent test too. Gemma 3 12B packed
+(`--packed-slots 2`, sliding and full masks) passed the concurrent test across two machines
+(286 tokens per image, no slot leak); it is slow on CPU, about 200-300 s a request.
 
 ## Limits worth knowing
 
