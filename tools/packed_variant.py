@@ -164,6 +164,7 @@ def build_packed_model(
     layer_start: int = 0,
     num_layers=None,
     info=None,
+    deepstack_layers: int = 0,
 ):
     """Return `ov_model` rewired to take `[1,1,S,T]` mask(s) and seq=S queries.
 
@@ -240,7 +241,8 @@ def build_packed_model(
     if has_embed and main_name == "hidden_states":
         raise RuntimeError("embed stage has no input_ids / inputs_embeds input")
     shape_map = {}
-    canon = ("input_ids", "inputs_embeds", "hidden_states", "position_ids", "token_type_ids")
+    canon = ("input_ids", "inputs_embeds", "hidden_states", "position_ids",
+             "token_type_ids", "visual_pos_masks", "deepstack_visual_embeds")
     for p in packed.inputs:
         key = p.get_any_name()
         name = next((c for c in canon if c in p.get_names()), key)
@@ -260,7 +262,25 @@ def build_packed_model(
                 [1, packed_seq] if name == "input_ids" else [1, packed_seq, hidden_size]
             )
         elif name == "position_ids":
+            # Qwen2.5-VL / Qwen3-VL M-RoPE: [rows, 1, S]; 1-D otherwise.
+            rank = ps.rank.get_length()
+            if rank == 3 and ps[0].is_static:
+                shape = [ps[0].get_length(), 1, packed_seq]
+            else:
+                shape = [1, packed_seq]
+        elif name == "visual_pos_masks":
+            # Qwen3-VL: 1 on the image rows of this packed inference.
             shape = [1, packed_seq]
+        elif name == "deepstack_visual_embeds":
+            # Qwen3-VL: [layers, S, hidden]; the LM gathers at most one row per
+            # image token, so S rows (padded) is always enough.
+            layers = ps[0].get_length() if ps[0].is_static else deepstack_layers
+            if layers <= 0:
+                raise RuntimeError(
+                    "deepstack_visual_embeds layer count is unknown; the tree's "
+                    "pipeline_config.json needs vision.deepstack_layers"
+                )
+            shape = [layers, packed_seq, hidden_size]
         if shape is None:
             raise RuntimeError(f"stage input {name}{ps} is dynamic and has no packed shape")
         shape_map[key] = ov.PartialShape(shape)
@@ -306,6 +326,17 @@ def stage_hidden_size(model, cfg: dict, stage_dir: str):
     return None
 
 
+def tree_deepstack_layers(stage_dir: str) -> int:
+    """Qwen3-VL DeepStack layer count from the tree's pipeline_config.json
+    (one level above the stage), 0 when the tree has no DeepStack."""
+    path = os.path.join(os.path.dirname(os.path.abspath(stage_dir)), "pipeline_config.json")
+    if not os.path.exists(path):
+        return 0
+    with open(path) as fh:
+        p = json.load(fh)
+    return int((p.get("vision") or {}).get("deepstack_layers") or 0)
+
+
 def tree_layer_types(stage_dir: str):
     """`(layer_types, sliding_window)` from the tree's config.json (one level
     above the stage), or `(None, None)` when the tree has neither."""
@@ -337,6 +368,7 @@ def write_packed_variant(stage_dir: str, slots: int, packed_seq: int = None) -> 
     model = ov.Core().read_model(src)
     hidden_size = stage_hidden_size(model, cfg, stage_dir)
     layer_types, window = tree_layer_types(stage_dir)
+    deepstack_layers = tree_deepstack_layers(stage_dir)
     start, end = cfg.get("layer_start"), cfg.get("layer_end")
     info = {}
     packed, packed_context = build_packed_model(
@@ -348,6 +380,7 @@ def write_packed_variant(stage_dir: str, slots: int, packed_seq: int = None) -> 
         layer_start=int(start or 0),
         num_layers=(int(end) - int(start)) if start is not None and end else None,
         info=info,
+        deepstack_layers=deepstack_layers,
     )
     if "packed_masks" in info and SLIDING in info["packed_masks"].values() and not window:
         raise RuntimeError(
