@@ -388,6 +388,12 @@ struct Manifest {
     /// (exporter `--final-hidden`). Absent in generation-only trees (default false).
     #[serde(default)]
     final_hidden_output: bool,
+    /// The last stage's LM head (MatMul and any grafted LoRA branch) reads only the last
+    /// position, so a prefill span computes one logits row, not [T, vocab] (decision exports and
+    /// `tools/decision/cut_lm_head.py`). `final_hidden` still carries every row. Absent in chat
+    /// trees (default false).
+    #[serde(default)]
+    lm_head_last_row: bool,
     stages: Vec<StageInfo>,
 }
 
@@ -507,6 +513,8 @@ pub struct Qwen36Builder {
     max_ctx: Option<usize>,
     /// Manifest `final_hidden_output` (set by `load`).
     final_hidden_output: bool,
+    /// Manifest `lm_head_last_row` (set by `load`).
+    lm_head_last_row: bool,
     /// Decision head assets (`<model>/decision/`), loaded only on the head-owning process.
     decision_assets: Option<crate::decision::HeadAssets>,
     /// Vocabulary bound from config.json (every rank; tolerant, see `read_vocab`).
@@ -581,6 +589,7 @@ impl Qwen36Builder {
             im_start_id: None,
             max_ctx: None,
             final_hidden_output: false,
+            lm_head_last_row: false,
             decision_assets: None,
             vocab: None,
             state_floor: None,
@@ -798,6 +807,7 @@ impl Builder for Qwen36Builder {
         self.manifest_json = Some(manifest_raw);
         self.last_logits_only = manifest.last_logits_only;
         self.final_hidden_output = manifest.final_hidden_output;
+        self.lm_head_last_row = manifest.lm_head_last_row;
         self.hidden = manifest.hidden();
         self.stages = Some(stages);
         progress.push(LoadProgress::ready());
@@ -879,6 +889,7 @@ impl Builder for Qwen36Builder {
             refresh_costs: Default::default(),
             last_restore_bytes: 0,
             final_hidden_output: self.final_hidden_output,
+            lm_head_last_row: self.lm_head_last_row,
             decision_assets: self.decision_assets,
             vocab: self.vocab,
             want_final_hidden: false,
@@ -1437,6 +1448,10 @@ pub struct Qwen36Engine {
     last_restore_bytes: usize,
     /// Manifest `final_hidden_output`: the last stage's output 1 is the final-norm hidden.
     final_hidden_output: bool,
+    /// Manifest `lm_head_last_row`: the last stage computes logits for the last position only
+    /// (decision trees). Read by the decision span planner (Task 50).
+    #[allow(dead_code)]
+    lm_head_last_row: bool,
     /// Decision head assets; `Some` only on the head-owning process of a tree with `decision/`.
     decision_assets: Option<crate::decision::HeadAssets>,
     /// Vocabulary bound decision readouts are validated against (`read_vocab`).
@@ -4769,6 +4784,7 @@ mod tests {
             refresh_costs: Default::default(),
             last_restore_bytes: 0,
             final_hidden_output: false,
+            lm_head_last_row: false,
             decision_assets: None,
             vocab: None,
             want_final_hidden: false,
@@ -5304,6 +5320,17 @@ mod tests {
         assert!(m.final_hidden_output);
         let m = Manifest::parse(r#"{"arch":"qwen3_5","hidden_size":4096,"stages":[]}"#).unwrap();
         assert!(!m.final_hidden_output);
+    }
+
+    #[test]
+    fn manifest_reads_lm_head_last_row() {
+        let m = Manifest::parse(
+            r#"{"arch":"qwen3_5","hidden_size":4096,"lm_head_last_row":true,"stages":[]}"#,
+        )
+        .unwrap();
+        assert!(m.lm_head_last_row);
+        let m = Manifest::parse(r#"{"arch":"qwen3_5","hidden_size":4096,"stages":[]}"#).unwrap();
+        assert!(!m.lm_head_last_row, "absent = chat tree, default false");
     }
 
     #[test]
