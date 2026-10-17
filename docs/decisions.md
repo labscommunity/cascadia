@@ -498,7 +498,7 @@ took 17 s as before.
 
 JEV's reference server can also answer with System 2: the base model reasons over the question in
 its chat template, its answer distribution `p2` is read back after the thought and blended with
-System 1's `p1`. Cascadia built it (Tasks 41 to 47, with a switchable-LoRA export that ran the
+System 1's `p1`. Cascadia built it (Tasks 41 to 45, with a switchable-LoRA export that ran the
 base model from the same tree) and removed it in Task 53, after an A/B on hardware:
 
 - **Setup.** typed-decisions on pawan-03's GPU (Intel Arc 140V), 8 cases, the 16 questions that
