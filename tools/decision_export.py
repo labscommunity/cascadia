@@ -1,8 +1,7 @@
 """Build a Cascadia decision-model tree (docs/decisions.md).
 
   jev:  python tools/decision_export.py jev  --base-ir STOCK_INT8_IR --adapter-dir JEV/adapter_vllm --out TREE [--stages N]
-        (--weights FT_DIR only for a fine-tuned, NOT LoRA-merged backbone, with --weights-not-merged;
-        --switchable-lora adds a runtime `lora_scale` stage input, 0 = the base model)
+        (--weights FT_DIR only for a fine-tuned, NOT LoRA-merged backbone, with --weights-not-merged)
   kev:  python tools/decision_export.py kev  --base-ir STOCK_INT8_IR --weights QWEN35_9B_BASE --lora KEV/adapter_model.safetensors \
                                              --head-pt KEV/head.pt --out TREE
         (--weights and --lora are required; the tree ships KEV/tokenizer.json, the one beside head.pt,
@@ -129,34 +128,6 @@ def single_token_labels(tok, context=CHOICE_LABEL_CONTEXT, cap=MAX_CHOICE_LABELS
     return out
 
 
-# System 2's answer labels, ported from serve_decide.py setup: A..Z then AA..ZZ, each kept when
-# "Answer: ({label})" encodes as "Answer: (" plus exactly two more tokens, the label's (kept) and the
-# ")"'s, at most MAX_OPTIONS (256). The read-back after thinking scores these ids after "Answer: (".
-ANSWER_PREFIX = "Answer: ("
-# The token that closes Qwen's thinking channel (serve_decide PROFILES["qwen"]["end_think"]).
-END_THINK = "</think>"
-
-
-def answer_labels(tok, cap=MAX_CHOICE_LABELS):
-    """[(label, token id)] in label order, by serve_decide's System 2 rule."""
-    base = tok.encode(ANSWER_PREFIX, add_special_tokens=False)
-    out = []
-    for lab in list(string.ascii_uppercase) + [a + b for a in string.ascii_uppercase for b in string.ascii_uppercase]:
-        ids = tok.encode(f"{ANSWER_PREFIX}{lab})", add_special_tokens=False)
-        if ids[: len(base)] == base and len(ids) == len(base) + 2:
-            out.append((lab, ids[len(base)]))
-        if len(out) == cap:
-            break
-    return out
-
-
-def end_think_id(tok):
-    """The id of END_THINK when it is one token (serve_decide's convert_tokens_to_ids), else None:
-    a tokenizer without it has no thinking channel to stop at."""
-    ids = tok.encode(END_THINK, add_special_tokens=False)
-    return ids[0] if len(ids) == 1 else None
-
-
 class _TokenizerJson:
     """A tokenizer.json behind the transformers-style encode() single_token_labels calls."""
 
@@ -181,7 +152,7 @@ def shipped_tokenizer(base_ir, weights=None, override=None):
     return str(Path(base_ir) / "tokenizer.json")
 
 
-def write_jev_profile(adapter_dir, calibration_json, out_dir, max_tokens=32768, tokenizer=None, lora_scale=None):
+def write_jev_profile(adapter_dir, calibration_json, out_dir, max_tokens=32768, tokenizer=None):
     h = json.loads((Path(adapter_dir) / "decision_head.json").read_text())
     cal = json.loads(Path(calibration_json).read_text())["per_kind"]
     slots = h["slots"]
@@ -222,18 +193,6 @@ def write_jev_profile(adapter_dir, calibration_json, out_dir, max_tokens=32768, 
                              f"{slots['verbalizers'][lo:hi]}): the tree's tokenizer.json is not JEV's")
         profile["jev"]["choice_labels"] = [lab for lab, _ in labels]
         profile["jev"]["choice_label_ids"] = [t for _, t in labels]
-        # System 2 (adaptive thinking): the labels its read-back scores, and the token its
-        # generation stops at. The server refuses `thinking` on a tree without them.
-        answers = answer_labels(tokenizer)
-        profile["jev"]["answer_labels"] = [lab for lab, _ in answers]
-        profile["jev"]["answer_label_ids"] = [t for _, t in answers]
-        think = end_think_id(tokenizer)
-        if think is not None:
-            profile["jev"]["end_think_id"] = think
-    if lora_scale is not None:
-        # A switchable tree (--switchable-lora): the scale its stages' `lora_scale` input takes for
-        # the grafted model. Absent = the scale is baked into the graft.
-        profile["jev"]["lora_scale"] = lora_scale
     _write(out_dir, profile, {"kind": "verbalizer"})
 
 
@@ -389,9 +348,6 @@ def main():
                     help="jev with --weights: state that those shards do NOT already hold the LoRA merged "
                          "(backbone_diff.py --adapter said FINETUNED, not MERGED); the adapter is grafted on top")
     ap.add_argument("--lora-scale", type=float, default=None, help="override adapter_config.json")
-    ap.add_argument("--switchable-lora", action="store_true",
-                    help="jev: graft the adapter behind a runtime `lora_scale` input on every stage (0 = the base "
-                         "model, for System 2) and record the trained scale in decision.json")
     ap.add_argument("--adapter-dir", default=None, help="jev: dir with decision_head.json + adapter_model.safetensors")
     ap.add_argument("--calibration", default=None, help="jev: calibration.json (default: ADAPTER_DIR/../calibration.json)")
     ap.add_argument("--head-pt", default=None, help="kev: head.pt")
@@ -416,8 +372,6 @@ def main():
         # Clef's joint head reads the hidden states of the full checkpoint it was trained on;
         # an adapter grafted on top would move them, and nothing here would notice.
         ap.error("clef takes no --lora/--lora-scale: --clef-dir is the full checkpoint its joint head reads")
-    if a.switchable_lora and a.family != "jev":
-        ap.error("--switchable-lora is jev only: System 2 runs JEV's base model")
     tokenizer = a.tokenizer
     if a.family == "kev":
         # Kev's pointer head was trained on its fine-tuned backbone's hidden states (Base + LoRA):
@@ -446,16 +400,7 @@ def main():
                  f"trained with (pass --tokenizer FILE)")
     # Only an explicit override reaches run_export; jev/clef keep its default tokenizer choice.
     tok_kw = {"tokenizer": tokenizer} if tokenizer is not None else {}
-    jev_tok, jev_sw = None, {}
-    if a.family == "jev" and a.switchable_lora:
-        # The scale run_export grafts with (the same override rule), recorded in decision.json for
-        # the engine to feed; a default export passes neither, so it stays the call it was.
-        from weight_swap import lora_scale_from_config
-        lora = a.lora or os.path.join(a.adapter_dir, "adapter_model.safetensors")
-        try:
-            jev_sw = {"lora_scale": a.lora_scale if a.lora_scale is not None else lora_scale_from_config(lora)}
-        except FileNotFoundError:
-            ap.error(f"no adapter_config.json beside {lora}: download it, or pass --lora-scale")
+    jev_tok = None
     if a.family == "jev":
         # JEV's extended choice labels come from the tokenizer.json the tree ships, so the server
         # encodes them exactly as the export checked them against the trained head.
@@ -492,10 +437,9 @@ def main():
     if a.family == "jev":
         lora = a.lora or os.path.join(a.adapter_dir, "adapter_model.safetensors")
         cal = a.calibration or os.path.join(os.path.dirname(os.path.abspath(a.adapter_dir)), "calibration.json")
-        write_jev_profile(a.adapter_dir, cal, a.out, max_tokens=max_tokens, tokenizer=jev_tok, **jev_sw)
+        write_jev_profile(a.adapter_dir, cal, a.out, max_tokens=max_tokens, tokenizer=jev_tok)
         run_export(a.base_ir, a.out, a.stages, False, a.layer_split, weights=a.weights, lora=lora,
-                   lora_scale=a.lora_scale, final_hidden=False, **tok_kw,
-                   **({"switchable_lora": True} if jev_sw else {}))
+                   lora_scale=a.lora_scale, final_hidden=False, **tok_kw)
     elif a.family == "kev":
         write_kev_profile(a.head_pt, a.out, hidden=int(_text_config(a.base_ir)["hidden_size"]), max_tokens=max_tokens)
         run_export(a.base_ir, a.out, a.stages, False, a.layer_split, weights=a.weights, lora=a.lora,

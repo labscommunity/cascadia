@@ -229,8 +229,6 @@ pub const DEFAULT_PREFIX_CACHE_BYTES: usize = 16 << 30;
 pub use cascadia_types::MIN_PREFIX_TOKENS;
 
 struct Entry {
-    /// [`PrefixCache::set_scope`] at insert: a lookup only sees its own scope's entries.
-    scope: u32,
     tokens: Vec<u32>,
     /// One `get_state_blob` per stage, unframed (no u32 length field, no copy on hit).
     parts: Arc<Vec<Vec<u8>>>,
@@ -262,8 +260,6 @@ pub struct PrefixCache {
     /// Lower bound on snapshot bytes seeded at load, `(fixed, per_token)`: see
     /// [`Self::seed_floor`].
     floor: Option<(usize, usize)>,
-    /// Scope of every lookup and insert (see [`Self::set_scope`]); 0 by default.
-    scope: u32,
 }
 
 impl PrefixCache {
@@ -279,21 +275,7 @@ impl PrefixCache {
             warned: false,
             size_obs: None,
             floor: None,
-            scope: 0,
         }
-    }
-
-    /// Scope later lookups and inserts to `scope`: an entry is seen only under the scope it was
-    /// inserted in. A switchable-LoRA tree sets it per turn to the bits of the fed `lora_scale`
-    /// (Task 42), so a base-model state and a LoRA state of the same tokens never mix; every other
-    /// tree stays in scope 0. Budget, LRU and the size model are shared across scopes: a state's
-    /// size does not depend on the scale.
-    pub fn set_scope(&mut self, scope: u32) {
-        self.scope = scope;
-    }
-
-    pub fn scope(&self) -> u32 {
-        self.scope
     }
 
     /// Seed a lower bound on snapshot bytes, `fixed + per_token × len`, known before any snapshot
@@ -360,9 +342,7 @@ impl PrefixCache {
     /// True if an entry keyed by exactly `tokens` is cached (so the caller
     /// can skip the snapshot copy).
     pub fn contains(&self, tokens: &[u32]) -> bool {
-        self.entries
-            .iter()
-            .any(|e| e.scope == self.scope && e.tokens == tokens)
+        self.entries.iter().any(|e| e.tokens == tokens)
     }
 
     /// Would a snapshot of `bytes` under a `tokens`-long key fit the budget at
@@ -446,12 +426,7 @@ impl PrefixCache {
         if !self.accepts(tokens.len(), bytes) {
             return false;
         }
-        let scope = self.scope;
-        if let Some(i) = self
-            .entries
-            .iter()
-            .position(|e| e.scope == scope && e.tokens == tokens)
-        {
+        if let Some(i) = self.entries.iter().position(|e| e.tokens == tokens) {
             let old = self.entries.remove(i);
             self.live -= old.bytes;
         }
@@ -478,7 +453,6 @@ impl PrefixCache {
         self.tick += 1;
         self.live += bytes;
         self.entries.push(Entry {
-            scope,
             tokens,
             parts: Arc::new(parts),
             bytes,
@@ -507,10 +481,7 @@ impl PrefixCache {
         self.tick += 1;
         let mut best: Option<(usize, usize)> = None; // (index, key len)
         for (i, e) in self.entries.iter_mut().enumerate() {
-            if e.scope == self.scope
-                && e.tokens.len() < prompt.len()
-                && prompt.starts_with(&e.tokens)
-            {
+            if e.tokens.len() < prompt.len() && prompt.starts_with(&e.tokens) {
                 e.last_used = self.tick;
                 if best.is_none_or(|(_, len)| len < e.tokens.len()) {
                     best = Some((i, e.tokens.len()));
@@ -729,45 +700,6 @@ mod tests {
         );
         assert!(c.longest_prefix(&key(100, 7)).is_none(), "unrelated prompt");
         assert_eq!(c.stats(), (3, 2));
-    }
-
-    #[test]
-    fn scopes_never_share_a_snapshot() {
-        // Task 42: a switchable-LoRA tree scopes its snapshots by the fed scale, so a base-model
-        // state (scale 0) and a LoRA state (the trained scale) of the same tokens never mix.
-        let lora = 2.0f32.to_bits();
-        let base = 0.0f32.to_bits();
-        let mut c = PrefixCache::new(100);
-        let p = key(40, 0);
-        assert_eq!(c.scope(), 0, "a baked tree never leaves the default scope");
-        c.set_scope(lora);
-        assert!(c.insert(p[..20].to_vec(), blob(30)));
-        assert!(c.contains(&p[..20]));
-        c.set_scope(base);
-        assert!(
-            !c.contains(&p[..20]),
-            "the LoRA entry is not the base model's"
-        );
-        assert!(c.longest_prefix(&p).is_none(), "and never restores for it");
-        // The same key may sit in both scopes, each with its own state.
-        assert!(c.insert(p[..20].to_vec(), blob(31)));
-        assert_eq!(
-            c.longest_prefix(&p).map(|(b, l)| (b[0].len(), l)),
-            Some((31, 20))
-        );
-        c.set_scope(lora);
-        assert_eq!(
-            c.longest_prefix(&p).map(|(b, l)| (b[0].len(), l)),
-            Some((30, 20))
-        );
-        assert_eq!((c.len(), c.live_bytes()), (2, 61));
-        // One budget across scopes: a third snapshot evicts the least recently used of either.
-        c.set_scope(base);
-        assert!(c.insert(key(20, 500), blob(40)));
-        assert_eq!(c.live_bytes(), 70);
-        assert!(!c.contains(&p[..20]), "the base entry (LRU) went");
-        c.set_scope(lora);
-        assert!(c.contains(&p[..20]), "the LoRA entry (touched last) stays");
     }
 
     #[test]

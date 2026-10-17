@@ -367,7 +367,6 @@ mod tests {
             tenant: String::new(),
             resume_token_ids: None,
             decision: None,
-            lora_scale: None,
         };
         t.decision = Some(cascadia_types::DecisionReadout {
             prompt_ids: vec![5, 6, 7, 8],
@@ -409,7 +408,6 @@ mod tests {
                 require_warm: false,
                 needs_snapshot: false,
             }),
-            lora_scale: None,
         };
         e.submit(t).unwrap();
         let out = e.step().unwrap();
@@ -446,7 +444,6 @@ mod tests {
                 require_warm: false,
                 needs_snapshot: false,
             }),
-            lora_scale: None,
         };
         e.submit(t).unwrap();
         let out = e.step().unwrap();

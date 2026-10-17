@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 
 use super::schema::{
     parse_ordered, Answer, DecisionRequest, OrderedValue, Question, QuestionType, RequestStrategy,
-    Thinking, ThinkingMode,
 };
 use super::DecisionError;
 use crate::AppState;
@@ -28,15 +27,6 @@ pub struct OaRequest {
     /// As `/v1/systemone`'s top-level `strategy` (JEV only).
     #[serde(default)]
     pub strategy: Option<RequestStrategy>,
-    /// As `/v1/systemone`'s System 2 fields (JEV only).
-    #[serde(default)]
-    pub thinking: Option<ThinkingMode>,
-    #[serde(default)]
-    pub threshold: Option<f64>,
-    #[serde(default)]
-    pub think_budget: Option<usize>,
-    #[serde(default)]
-    pub return_reasoning: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -234,18 +224,8 @@ pub enum OaAnswer {
     },
 }
 
-/// An answer on the wire, with System 2's `thinking` when the request thought (as
-/// `/v1/systemone`'s).
-#[derive(Clone, Debug, Serialize)]
-pub struct OaAnswerOut {
-    #[serde(flatten)]
-    pub answer: OaAnswer,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub thinking: Option<Thinking>,
-}
-
-/// Token counts in the shape OpenAI's SDKs read. `output_tokens` counts System 2's thinking
-/// tokens: 0 unless a question thought (decision passes do not decode).
+/// Token counts in the shape OpenAI's SDKs read. `output_tokens` is always 0: decision models do
+/// not decode.
 #[derive(Clone, Debug, Serialize)]
 pub struct OaUsage {
     pub input_tokens: u64,
@@ -256,7 +236,7 @@ pub struct OaUsage {
 #[derive(Clone, Debug, Serialize)]
 pub struct OaResponse {
     pub id: String,
-    pub answers: Vec<OaAnswerOut>,
+    pub answers: Vec<OaAnswer>,
     pub usage: OaUsage,
 }
 
@@ -417,10 +397,6 @@ pub fn to_internal(r: &OaRequest) -> Result<(DecisionRequest, Vec<OaMeta>), Deci
         images: None,
         videos: None,
         strategy: r.strategy,
-        thinking: r.thinking,
-        threshold: r.threshold,
-        think_budget: r.think_budget,
-        return_reasoning: r.return_reasoning,
     };
     Ok((req, meta))
 }
@@ -432,22 +408,52 @@ pub fn to_openai(
     meta: &[OaMeta],
     input_tokens: u64,
 ) -> OaResponse {
-    to_openai_thinking(answers, &IndexMap::new(), meta, input_tokens, 0)
-}
-
-/// [`to_openai`] with System 2's per-answer `thinking` and its thinking tokens.
-pub fn to_openai_thinking(
-    answers: &IndexMap<String, Answer>,
-    thinking: &IndexMap<String, Thinking>,
-    meta: &[OaMeta],
-    input_tokens: u64,
-    output_tokens: u64,
-) -> OaResponse {
     let out = meta
         .iter()
-        .map(|m| OaAnswerOut {
-            answer: oa_answer(&answers[&m.name], m),
-            thinking: thinking.get(&m.name).cloned(),
+        .map(|m| match &answers[&m.name] {
+            Answer::Noul { noul } => OaAnswer::Predicate {
+                name: m.name.clone(),
+                probability: *noul,
+            },
+            Answer::Choice {
+                choice,
+                confidence,
+                probabilities,
+            } => {
+                let idx = probabilities.get_index_of(choice).unwrap_or(0);
+                OaAnswer::Choice {
+                    name: m.name.clone(),
+                    choice: m.choice_values[idx].clone(),
+                    probabilities: probabilities
+                        .values()
+                        .zip(&m.choice_values)
+                        .map(|(p, v)| OaChoiceProb {
+                            value: v.clone(),
+                            probability: *p,
+                        })
+                        .collect(),
+                    confidence: *confidence,
+                }
+            }
+            Answer::Score {
+                score,
+                confidence,
+                probabilities,
+                ..
+            } => OaAnswer::Score {
+                name: m.name.clone(),
+                score: *score,
+                probabilities: probabilities
+                    .values()
+                    .enumerate()
+                    .map(|(i, p)| OaLevelProb {
+                        value: i,
+                        label: m.level_labels.get(i).cloned().unwrap_or_default(),
+                        probability: *p,
+                    })
+                    .collect(),
+                confidence: *confidence,
+            },
         })
         .collect();
     OaResponse {
@@ -455,56 +461,8 @@ pub fn to_openai_thinking(
         answers: out,
         usage: OaUsage {
             input_tokens,
-            output_tokens,
-            total_tokens: input_tokens + output_tokens,
-        },
-    }
-}
-
-fn oa_answer(a: &Answer, m: &OaMeta) -> OaAnswer {
-    match a {
-        Answer::Noul { noul } => OaAnswer::Predicate {
-            name: m.name.clone(),
-            probability: *noul,
-        },
-        Answer::Choice {
-            choice,
-            confidence,
-            probabilities,
-        } => {
-            let idx = probabilities.get_index_of(choice).unwrap_or(0);
-            OaAnswer::Choice {
-                name: m.name.clone(),
-                choice: m.choice_values[idx].clone(),
-                probabilities: probabilities
-                    .values()
-                    .zip(&m.choice_values)
-                    .map(|(p, v)| OaChoiceProb {
-                        value: v.clone(),
-                        probability: *p,
-                    })
-                    .collect(),
-                confidence: *confidence,
-            }
-        }
-        Answer::Score {
-            score,
-            confidence,
-            probabilities,
-            ..
-        } => OaAnswer::Score {
-            name: m.name.clone(),
-            score: *score,
-            probabilities: probabilities
-                .values()
-                .enumerate()
-                .map(|(i, p)| OaLevelProb {
-                    value: i,
-                    label: m.level_labels.get(i).cloned().unwrap_or_default(),
-                    probability: *p,
-                })
-                .collect(),
-            confidence: *confidence,
+            output_tokens: 0,
+            total_tokens: input_tokens,
         },
     }
 }
@@ -618,14 +576,9 @@ pub async fn decide(
         Err(e) => return oa_err(e),
     };
     match super::handler::evaluate(&state, &req).await {
-        Ok(e) => Json(to_openai_thinking(
-            &e.answers,
-            &e.thinking,
-            &meta,
-            e.input_tokens,
-            e.output_tokens,
-        ))
-        .into_response(),
+        Ok((answers, input_tokens)) => {
+            Json(to_openai(&answers, &meta, input_tokens)).into_response()
+        }
         Err(e) => oa_err(e),
     }
 }

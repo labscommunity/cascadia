@@ -69,8 +69,6 @@ but unusable`, never passes for a plain chat model.
 - `strategy` (optional, top level): how a JEV choice with more options than its trained slots is
   answered, `"auto"` (the default), `"single"`, `"tournament"` or `"permute"`. See
   [JEV choices past the trained slots](#jev-choices-past-the-trained-slots).
-- `thinking`, `threshold`, `think_budget`, `return_reasoning` (optional, top level, JEV only):
-  adaptive thinking. See [JEV adaptive thinking (System 2)](#jev-adaptive-thinking-system-2).
 
 ### Response
 
@@ -100,11 +98,8 @@ but unusable`, never passes for a plain chat model.
 
 - `id` is unique per response: `dec-` and 32 hex digits.
 - `usage.input_tokens` is the number of prompt tokens prefilled across all passes, the same count
-  `/v1/systemone` reports. `output_tokens` is the tokens System 2 generated, 0 unless a question
-  thought (decision passes do not decode). `total_tokens` is their sum.
-- With thinking `auto` or `on`, every non-score answer also carries `thinking` (see
-  [JEV adaptive thinking (System 2)](#jev-adaptive-thinking-system-2)); otherwise answers are
-  exactly as shown.
+  `/v1/systemone` reports. `output_tokens` is always 0 (decision models do not decode), so
+  `total_tokens` equals `input_tokens`.
 - `predicate`: `probability` is p(true).
 - `choice`: `choice` is the most likely value (the first one on a tie), echoed with its original
   JSON type. `probabilities` lists every choice in request order.
@@ -211,8 +206,6 @@ The server does not check `api_key`; the SDK only requires that one is set.
 - `strategy` (optional): as on the OpenAI route, `"auto"` (the default; `null` too), `"single"`,
   `"tournament"` or `"permute"`. See
   [JEV choices past the trained slots](#jev-choices-past-the-trained-slots).
-- `thinking`, `threshold`, `think_budget`, `return_reasoning` (optional, JEV only): as on the
-  OpenAI route. See [JEV adaptive thinking (System 2)](#jev-adaptive-thinking-system-2).
 - A list `state` is read differently per family, as by each reference. JEV reads its elements as
   message parts (serve_decide `_parts`), so an image part there (`{"image": ...}` or
   `{"type": "image_url", ...}`) is a 400, and so is a `{"type": "text"}` part without a string
@@ -245,8 +238,7 @@ The server does not check `api_key`; the SDK only requires that one is set.
   family: its `label` comes from the request's `levels`.
 
 `usage.input_tokens` is the number of prompt tokens prefilled across all passes. `output_tokens`
-is the tokens System 2 generated, 0 unless a question thought (decision passes do not decode).
-With thinking `auto` or `on`, every non-score answer also carries `thinking`.
+is always 0: decision models do not decode.
 
 ### Errors
 
@@ -264,12 +256,12 @@ framework's plain-text body.
 | Status | When |
 |---|---|
 | 200 | Every question answered. |
-| 400 | A body that is not valid JSON; on the OpenAI route, also a body that does not match the request schema (a missing `questions`, an unknown question `type`, a repeated key). Validation: no questions or more than `max_questions`; an empty question name, or (OpenAI format) a duplicate question name or choice value; a choice with no options or more than the model allows; a score with fewer levels than the model allows (2 for JEV, 1 for Kev and Clef) or more; images; an image part, or a text part without a string `text`, in a list `state` (JEV); a request the tokenizer cannot encode; Clef's option cap (see [Limits](#limits)); a `strategy` other than `"auto"` on Kev or Clef (`strategy applies to JEV only`); on the OpenAI route, a `strategy` that is none of the four values; thinking that cannot run (see [JEV adaptive thinking (System 2)](#jev-adaptive-thinking-system-2): any System 2 field on Kev or Clef, a score question with an explicit `thinking`, a tree that is not switchable or lacks System 2's export, System 2 disabled at startup for a missing chat template, more options than answer labels, `threshold` outside [0, 1], `think_budget` outside 1..=`max_tokens`). |
-| 413 | The body is over `--api-max-body-mb`. Too long: the state is more than `max_total_tokens × 8` bytes (checked before tokenizing); Kev's whole rendered text (state, instructions, options and levels) is more than `max_total_tokens × 8` bytes; Kev's rendered state is more than 524,288 bytes (65,536 × 8, checked before tokenizing); one Kev question's instructions and option texts render to more than 8 bytes per token the pass has left after the state (`max_tokens` minus the state's tokens, checked before tokenizing); Kev's state is more than 65,536 tokens (`SERVE_MAX_STATE`, `<state>` included) or reaches `max_tokens`; one pass is longer than `max_tokens` (JEV and Kev; Clef truncates the state instead); Clef's schema alone fills the joint pass, leaving no room for a non-empty state; the request's prefill work is more than `max_total_tokens` (JEV stops tokenizing at the first pass that takes it over: `needs at least N`; a JEV tournament's final counts at its worst case before any pass runs, see [JEV choices past the trained slots](#jev-choices-past-the-trained-slots); so does System 2 at its `think_budget` under `thinking: "on"` (`auto` skips a question instead), see [JEV adaptive thinking (System 2)](#jev-adaptive-thinking-system-2)); a Kev request that needs the shared-state discount when the prefix cache can never hold that state (`this request needs N prefill tokens without prefix reuse (the shared prefix cannot fit the prefix cache); the per-request limit is M`, refused before any prefill once the engine knows the snapshot's size, which its warmup measures at startup; see [Limits](#limits) for when the first such request can still spend one pass); or the engine reports the prompt too long. |
+| 400 | A body that is not valid JSON; on the OpenAI route, also a body that does not match the request schema (a missing `questions`, an unknown question `type`, a repeated key). Validation: no questions or more than `max_questions`; an empty question name, or (OpenAI format) a duplicate question name or choice value; a choice with no options or more than the model allows; a score with fewer levels than the model allows (2 for JEV, 1 for Kev and Clef) or more; images; an image part, or a text part without a string `text`, in a list `state` (JEV); a request the tokenizer cannot encode; Clef's option cap (see [Limits](#limits)); a `strategy` other than `"auto"` on Kev or Clef (`strategy applies to JEV only`); on the OpenAI route, a `strategy` that is none of the four values. |
+| 413 | The body is over `--api-max-body-mb`. Too long: the state is more than `max_total_tokens × 8` bytes (checked before tokenizing); Kev's whole rendered text (state, instructions, options and levels) is more than `max_total_tokens × 8` bytes; Kev's rendered state is more than 524,288 bytes (65,536 × 8, checked before tokenizing); one Kev question's instructions and option texts render to more than 8 bytes per token the pass has left after the state (`max_tokens` minus the state's tokens, checked before tokenizing); Kev's state is more than 65,536 tokens (`SERVE_MAX_STATE`, `<state>` included) or reaches `max_tokens`; one pass is longer than `max_tokens` (JEV and Kev; Clef truncates the state instead); Clef's schema alone fills the joint pass, leaving no room for a non-empty state; the request's prefill work is more than `max_total_tokens` (JEV stops tokenizing at the first pass that takes it over: `needs at least N`; a JEV tournament's final counts at its worst case before any pass runs, see [JEV choices past the trained slots](#jev-choices-past-the-trained-slots)); a Kev request that needs the shared-state discount when the prefix cache can never hold that state (`this request needs N prefill tokens without prefix reuse (the shared prefix cannot fit the prefix cache); the per-request limit is M`, refused before any prefill once the engine knows the snapshot's size, which its warmup measures at startup; see [Limits](#limits) for when the first such request can still spend one pass); or the engine reports the prompt too long. |
 | 415 | The request lacks `content-type: application/json`. |
 | 422 | `/v1/systemone` only: valid JSON that does not match the request schema, a `strategy` that is none of the four values included (the OpenAI route answers 400 instead). |
 | 501 | The model serves no decisions: no `decision.json` (or one that fails its load checks; see the startup log), an engine other than `qwen35`, the engine has no decision head (`decision/` missing on the single box or the pipeline's last rank), the tree was exported without `--final-hidden` (Kev and Clef), or a pipeline rank cannot serve decision passes (an older build, rank 0 or the last rank without `config.json` `vocab_size`, or the last rank without `decision/`; a middle rank only relays and needs neither). Rank 0 refuses the pipeline cases before any prefill. |
-| 503 | The server is at capacity (`engine at capacity; retry after current requests complete`): every decision permit is taken (`--max-decision-requests`, default 16), or a Kev pass that must resume its shared state from the prefix cache found the snapshot evicted by other requests (see [Limits](#limits)); retrying can succeed. Any other engine error is `decision engine error`, including non-finite logits or probabilities (never a 200 with `null`s), and a failed System 2 task under `thinking: "on"` (under `auto` the question answers from System 1 instead, see [Failures](#failures)). Decisions have their own admission pool: chat requests never take its permits, and decisions never take chat's. Chat can still cause this 503 by evicting a Kev snapshot. |
+| 503 | The server is at capacity (`engine at capacity; retry after current requests complete`): every decision permit is taken (`--max-decision-requests`, default 16), or a Kev pass that must resume its shared state from the prefix cache found the snapshot evicted by other requests (see [Limits](#limits)); retrying can succeed. Any other engine error is `decision engine error`, including non-finite logits or probabilities (never a 200 with `null`s) and a task the engine failed (see [Engine failures](#engine-failures)). Decisions have their own admission pool: chat requests never take its permits, and decisions never take chat's. Chat can still cause this 503 by evicting a Kev snapshot. |
 
 Error messages are deliberately terse:
 
@@ -295,7 +287,6 @@ Error messages are deliberately terse:
 | Tokens in the joint pass (Clef) | `MAX_JOINT_PROMPT` and the head's input limit | the smaller of `max_tokens`, 16,384 and 320 MiB ÷ (4 × width): 16,384 for both Clef-flash (width 4096) and Clef-27B (width 5120) |
 | Levels per score | per model family | JEV: 2 to 256; Clef: 1 to 256; Kev: 1 to 255 |
 | State tokens (Kev) | Kev's `SERVE_MAX_STATE` | 65,536, `<state>` included; only the whole pass may reach `max_tokens`. The rendered state is also capped at 8 bytes per token (524,288 bytes) before tokenizing |
-| Thinking tokens per question (JEV System 2) | request `think_budget` | 4096 (or `max_tokens` when smaller); at most `max_tokens` |
 | Concurrent decision requests | `--max-decision-requests` | 16 (1 to 240), a pool separate from chat's 16; one more is a 503 |
 | Concurrent tokenizations | fixed | min(4, CPU cores), separate from the decision permits |
 | Request body | `--api-max-body-mb` | 1 MiB |
@@ -503,301 +494,40 @@ across two hosts answered a 40-option choice with `single` in 69 s and with `tou
 groups and a final) in 67 s, both 200 with all 40 probabilities summing to 1; a 16-option choice
 took 17 s as before.
 
-## JEV adaptive thinking (System 2)
+## System 2 (evaluated, not shipped)
 
-A JEV request can ask the tree's base model to reason before it answers, as the reference server
-does (serve_decide `decide` and `s2_dist`). System 1 is JEV's usual answer (`p1`, every plan
-above). System 2 runs the same tree with its LoRA switched off, so the tree must be switchable
-(`--switchable-lora`, [Runtime LoRA scale](#runtime-lora-scale)). The base model thinks over the
-question in its chat template, the server reads its answer distribution `p2` after the thought,
-and the answer becomes the blend `p = (1 − mix) · p1 + mix · p2`.
+JEV's reference server can also answer with System 2: the base model reasons over the question in
+its chat template, its answer distribution `p2` is read back after the thought and blended with
+System 1's `p1`. Cascadia built it (Tasks 41 to 47, with a switchable-LoRA export that ran the
+base model from the same tree) and removed it in Task 53, after an A/B on hardware:
 
-### Request fields
+- **Setup.** typed-decisions on pawan-03's GPU (Intel Arc 140V), 8 cases, the 16 questions that
+  thought.
+- **Accuracy.** The blend never changed an argmax: 7/16 correct with and without it. The read-back
+  `p2` put 0.975 mean mass on System 1's own argmax.
+- **Calibration.** KL and Brier got worse with every `p2` weight `w`: 0.236 / 0.137 at `w = 0`
+  (System 1), 0.482 / 0.290 at `w = 0.5` (the reference's mix), 3.331 / 0.575 at `w = 1`. The
+  paired bootstrap of blend − System 1 gave accuracy [0, 0], KL [+0.158, +0.334] and Brier
+  [+0.098, +0.204].
+- **Cost.** One thinking question took 90 to 1,300 s on the batch-1 engine, and long generations
+  hit the intermittent native infer exception (BUG-1, see [Engine failures](#engine-failures)).
 
-Top level, on both routes, JEV only (on Kev and Clef any of them, other than `thinking: "off"`
-and `return_reasoning: false`, is a 400 `thinking, threshold, think_budget and return_reasoning
-apply to JEV only`):
+What remains of it:
 
-| Field | Values | Default |
-|---|---|---|
-| `thinking` | `"off"`, `"auto"`, `"on"`; `null` is the default | the profile's, `"off"` |
-| `threshold` | `auto` thinks when System 1's leading probability is below it, in [0, 1] | the profile's, 0.8 |
-| `think_budget` | most tokens the base model may think, 1..=`max_tokens` | 4096, or `max_tokens` (decision.json) when smaller |
-| `return_reasoning` | `true` returns the thought in `thinking.reasoning` | `false` |
-
-With `thinking` off (or absent with the default profile) the other three fields are ignored, as
-the reference ignores them, and every response is byte for byte what it was before thinking
-existed.
-
-**Why the default budget is 4096, not the reference's.** serve_decide's default is no limit
-beyond the context window (262,144 tokens for Qwen3.5). The engine decodes one token at a time
-on a batch-1 slot, so on our hardware a window-long thought is hours of decoding per question, and
-its worst case (the generation plus
-the read-back, both counted up front) is more than a request's `max_total_tokens` can hold. 4096
-keeps a thinking question to minutes and lets `on` over a few questions fit the default
-`max_total_tokens` (4 × `max_tokens`).
-
-### Triggers
-
-- `on` thinks for every noul and choice question; `auto` only for one whose System 1 leading
-  probability `max(p1)` is below `threshold` (equal does not think).
-- Score questions never think (the reference). A request that sets `thinking` to `auto` or `on`
-  and holds a score question is a 400 (`thinking is supported for noul and choice questions; s is
-  a score question`); under a profile whose default thinks, a score question just answers.
-- Each question thinks on its own, in request order, after every System 1 pass. A wide choice
-  ([above](#jev-choices-past-the-trained-slots)) thinks over all its options in one System 2
-  pass, whatever its System 1 plan.
-
-### What runs
-
-1. **Prompt.** The tree's chat template (the one chat uses) is rendered for one user turn whose
-   content is `XQXCONTENTXQX`, with the generation prompt and thinking on, and split around that
-   placeholder. The user content is the state (as System 1 renders it), then
-   `"\n\nQuestion: {question}\n\nOptions:\n{options}\n\nThink it through carefully, then give your
-   final answer on the last line in the form: Answer: (X)"`, where the options are lines
-   `"({label}) {option}"` labelled with the profile's answer labels (`A`, `B`, ...). A noul
-   shows `(A) Yes (true)` and `(B) No (false)`. Caller text is sanitized as in System 1.
-2. **Thinking.** The engine decodes from that prompt on the base model (`lora_scale = 0`),
-   greedily, for at most `think_budget` tokens. The server stops at the end-of-think token
-   (`</think>`): the engine does not stop at a token id, so the server drops the stream there,
-   which cancels the task.
-3. **Read-back.** One Verbalizer readout, also on the base model, over the prompt, the thought
-   (decoded with special tokens kept), `</think>`, `"\n\n"` and `"Answer: ("`, scores the first
-   n answer label ids. `p2` is their plain softmax: no bias and no temperature. A noul's
-   (A) Yes / (B) No become `[P(false), P(true)]`.
-4. **Blend.** `p = (1 − mix) · p1 + mix · p2`, with the profile's `mix` (0.5). `p2` alone is close
-   to one-hot and over-confident; the blend keeps System 1's calibration. Confidence, `choice`
-   and `score` are computed from `p` as usual.
-
-### Response fields
-
-Every noul and choice answer of a request whose mode is `auto` or `on` carries `thinking`:
-
-```json
-"urgent": {"type": "noul", "noul": 0.5845,
-           "thinking": {"mode": "on", "used": true, "threshold": 0.8, "budget": 512,
-                        "think_tokens": 187, "finished_within_budget": true,
-                        "reasoning": "The customer was charged twice ..."}}
-```
-
-- `mode`, `threshold`, `budget`: the request's resolved settings.
-- `used`: the base model thought and was blended in. An `auto` answer that did not think has only
-  `mode`, `used: false`, `threshold` and `budget`, and its probabilities are System 1's.
-- `reason`: `"budget"` on an `auto` answer that would have thought (System 1 was below the
-  threshold) but whose System 2 worst case did not fit what the request had left (see below).
-  `"error"` on an `auto` answer whose System 2 failed in the engine (see
-  [Failures](#failures)). Either way its probabilities are System 1's.
-- `think_tokens`: tokens generated, the closing `</think>` included.
-- `finished_within_budget`: the thought closed, or the model stopped on its own, before the
-  budget ran out. A thought cut at the budget is still read back, with `</think>` appended.
-- `reasoning`: the thought, trimmed, only with `return_reasoning: true`.
-
-On the OpenAI route the same object sits on each answer. `usage.output_tokens` counts every
-thinking token, and `usage.input_tokens` adds each generation's and read-back's prompt.
-
-### Limits and budgets
-
-- **Switchable trees only.** System 2 runs the base model through `lora_scale = 0`, which a
-  baked tree refuses at the engine. The API checks first: a tree without `jev.lora_scale` is a
-  400 (`thinking needs a switchable tree ...`). So is a tree without System 2's export
-  (`jev.answer_labels`, `jev.end_think_id`; re-export it), and a choice with more options than
-  answer labels.
-- **Single box verified, pipeline not.** Every hardware run so far is one box serving all 8
-  stages. On a pipeline (e.g. JEV-27B over two boxes) the scale travels to every stage and is
-  unit-tested, but no switchable 27B tree exists yet and System 2 has not run there. Verify it on
-  hardware before relying on it.
-- **Chat template.** It is rendered once at startup. If a JEV that could think has no template,
-  or it does not render a user turn, the server logs a warning and disables System 2 for that
-  tree: System 1 keeps serving, a profile default that thinks is ignored, and a request that sets
-  `thinking` to `auto` or `on` is a 400 (`thinking is disabled on this server: the model's chat
-  template did not load or render`).
-- **Budget, up front.** Before any pass runs, each question that may think (every noul and choice
-  under `auto` too) is reserved at its worst case against what `max_total_tokens` leaves after
-  System 1: its prompt plus `think_budget` generated, then the read-back over both plus its tail.
-  - `on` is strict: a request that cannot afford every question is a 413 naming the budget
-    (`... for thinking at think_budget N ...; the per-request limit is M (lower think_budget)`),
-    before any engine call.
-  - `auto` reserves question by question, in request order. A question that does not fit (nor
-    the pass limits below) answers from System 1 alone with `reason: "budget"` if it would have
-    thought. The budget never makes an `auto` request fail; a profile default of `auto` cannot
-    turn a working request into a 413. (A choice with more options than answer labels is still a
-    400 whenever thinking is on, a profile default included; see above.)
-  - The real read-back is checked again before it runs (a 413 under `on`, a budget skip under
-    `auto`).
-- **Pass lengths.** A System 2 prompt plus the read-back's tail must fit `max_tokens`, like any
-  pass. The read-back adds up to `think_budget` tokens of thought on top, so it may exceed
-  `max_tokens`, up to the engine's decision prompt cap: the model's window (config.json
-  `max_position_embeddings`, read at load as the engine reads it), at most 131,072. Both are
-  checked up front at the budget: a 413 under `on`, a budget skip under `auto`.
-- **Admission.** System 2 runs inside the request: the same decision permit, the same engine
-  queue, no extra admission. A thinking request holds its permit for as long as it thinks.
-- `--decision-dump` records System 1 passes only.
-
-### Failures
-
-A System 2 task can fail in the engine:
-- its generation is refused at submit;
-- an engine error arrives before the first token or mid-stream. On hardware this was a decode
-  infer that threw: `decode failed: backend error: unknown C++ exception in infer`;
-- its stream ends with no final chunk;
-- its read-back fails.
-
-The request learns of each one as soon as the engine reports it:
-
-- `on`: the request fails like any engine failure, on both routes. That is the 503 `decision
-  engine error`, or the capacity 503 or 413 that an engine refusal maps to, as for System 1
-  passes. No further engine task is submitted.
-- `auto`: the question answers from System 1 alone with `thinking: {"used": false, "reason":
-  "error"}`, and the request is a 200. **The request submits no further engine work.** Every later
-  question that would have thought also answers from System 1 with `reason: "error"`. Questions
-  that would not have thought report as usual. The reason: what failed may still hold the engine
-  (see below), and the next task would wait behind it. System 1 has already run by then. Tokens
-  the generation streamed before it failed count in `usage`.
-
-**The API's line.** Each failure is one `warn` line, `System 2 task failed`, with these fields:
-- `task`: the task id, `think-…` for the generation or `dec-…` for the read-back;
-- `phase`: `generate` or `readback`;
-- `prompt_tokens`;
-- `cache`: `hit` or `miss`, or `unknown` when the engine did not say. That happens for a refusal
-  at submit, a stream the runner or API ended, or an engine that does not report it;
-- `warm_prefix`: the prompt tokens resumed from the prefix cache, 0 on a miss;
-- `generated`: the tokens streamed before the failure;
-- the mode and the reason.
-
-The engine reports the cache state on its error chunk (`Chunk::warm_prefix`, an additive field
-that is omitted when unknown).
-
-**The engine's line.** The engine (`cascadia_engine_openvino::qwen36`) also logs one `warn` line
-per failed task, `qwen36 task failed`. It has the task id, `phase` (`prefill`, `decode` or
-`head`), `prompt`, `warm_prefix`, `generated` and the reason. This covers every failure site:
-single-box prefill, decode and decision head, and the pipeline head's prefill, decode and
-decision. The older per-site lines (`decode failed`, `prefill failed`, ...) remain. The engine's
-text is logged and never returned to the client.
-
-**What the fix covers.** The engine returns a failed task's error before it scrubs the stage
-requests. The scrub (`reset_all`, which runs a native `recreate_request` per stage after a warm
-turn) now runs when the next task is admitted. On the GPU, a request once waited more than 15
-minutes after a failed decode infer. The engine logged `decode failed`, the API never logged
-receiving the error, and an exact replay later completed cleanly. Two explanations fit:
-
-1. *The API was still listening.* The scrub, which used to run before the error chunk was
-   returned, blocked, so the chunk never left the engine. This fix covers that case: the error
-   is returned first, and the request gets its 503 (`on`) or its System 1 answers (`auto`, which
-   submits no further task) at once.
-2. *The API had already stopped listening.* The failing decode belonged to a think task the API
-   had dropped at `</think>`, while its cancel was deferred behind another request's step. The
-   error went to a dropped stream, by design, and the API was waiting on the read-back. That
-   read-back's admission now runs the scrub. The error itself still goes nowhere in that case,
-   but the scrub no longer blocks: see [After a failed infer](#after-a-failed-infer).
-
-**Telling them apart.** Match the engine's `qwen36 task failed` (or `decode failed`) task id
-against the API's lines:
-- the same `think-…` id in an API `System 2 task failed` line means case 1, which is covered;
-- no API line for that id, with the request still waiting on a later `dec-…` task, means case 2.
-
-#### After a failed infer
-
-On the GPU (pawan-03, Arc 140V), a think task's decode threw `unknown C++ exception in infer`.
-25 ms later the next admission's scrub logged `stage reset failed ... Infer Request is busy`, and
-the server then sat idle for 18 minutes, every request waiting. The failed infer had left the
-OpenVINO request marked busy. OpenVINO refuses `reset_state` on a busy request. Its destructor
-waits, with no timeout, for the run to finish. So the scrub's next `recreate_request`, which
-released the old request, never returned.
-
-What happens now, for chat and decision tasks alike (they share the engine path):
-
-1. The engine remembers that an infer failed. The next scrub, normally at the next task's
-   admission, first checks every stage request (and the embeddings), without blocking.
-2. A request that is still busy gets OpenVINO's `cancel()`, then `wait_for` in 100 ms slices,
-   for up to 30 s. Once it is idle, the scrub resets or rebuilds it as before, and the task is
-   served.
-3. If it is still not idle after 30 s, the engine abandons the request. The request is never
-   destroyed, because its destructor would block. The engine is then failed. This task fails
-   after that wait, and every later one fails at once, with `backend error: qwen36 engine failed: stageN's infer request was
-   still Busy ... abandoned; restart the server`. Chat and decisions return their 5xx, and
-   `/health` keeps answering (it reports `degraded` after a failed completion). Only a restart
-   recovers the engine.
-
-Each recovery step is one `error` line, `qwen36: stage recovery`, with `stage`, `action`
-(`probe`, `cancel`, `wait`, `abandon`, `reset` or `recreate`), `outcome` and `elapsed_ms`. A failed
-engine also logs `qwen36: engine failed` once, and `refusing task (engine failed)` per task.
-
-The shim also guards itself: `recreate_request` refuses a busy request. Destroying a runtime
-leaks a busy request rather than waiting on it, and logs it (`action=abandon outcome=leaked`).
-
-**Pipeline mode.** A downstream rank whose engine failed does not ack the next RESET. Its step
-returns a connection-fatal error, so the stage process exits for its supervisor to rebuild it.
-The head sees the socket close and fails the task at once with `qwen36 pipeline RESET not acked:
-socket closed`, instead of waiting out its reply bound on every task. The reason is in the
-downstream rank's log. No frame changed, so a peer without this change handles it as any closed
-link.
-
-During the wait (at most 30 s) the engine is held, so other requests wait for it. That wait is
-bounded; before this change it was not.
-
-**Still open: BUG-1**, the `unknown C++ exception in infer` itself. Its cause is unknown, and
-this change does not fix it. It only recovers afterwards. One lead: OpenVINO's `InferRequest`
-wrapper turns any C++ exception into an `ov::Exception`, so an error the shim reports as
-"unknown" did not pass through it as a C++ exception. On Windows that suggests a structured
-(SEH) exception from the driver or plugin. That would also explain why the request stayed busy:
-OpenVINO's own cleanup never ran. Whether such a request ever comes back to idle on the GPU is not
-yet measured. If it does not, the outcome is the fail-fast path above.
-
-### decision.json
-
-The exporter (`tools/decision_export.py jev`, Task 43) writes, from the tokenizer the tree ships:
-
-- `answer_labels` / `answer_label_ids`: serve_decide's rule, `A`..`Z` then `AA`..`ZZ`, each kept
-  when `"Answer: ({label})"` encodes as `"Answer: ("` plus exactly two more tokens (the label's,
-  kept, and the `)`), at most 256.
-- `end_think_id`: the id of `</think>` when it is one token (omitted otherwise: no thinking).
-
-A profile with answer labels must have at least 2 (a noul shows two options), or it fails the
-load.
-
-The adaptive-thinking settings default to serve_decide's Qwen profile and can be overridden under
-`jev.system2`: `thinking` (`"off"`), `threshold` (0.8), `mix` (0.5), `end_think` (`"</think>"`,
-which must encode to `end_think_id`) and `after_think` (`"\n\n"`). A profile whose default
-`thinking` is not `off` must be able to think (switchable, with the export), or it fails the load.
-
-### Differences from the reference
-
-- **Greedy decoding.** The engine decodes greedily; serve_decide samples the thought with a seed
-  (`crc32(question + options)`). The reasoning text, and so `p2`, differ from the reference's for
-  the same input.
-- **Option text.** Choices show System 1's option line text (`name: description`, or `name` when
-  the description is empty), not the bare option string the reference shows, so System 1 and
-  System 2 see the same options.
-- **Read-back tokens.** The thought is decoded from the generated ids and the read-back prompt is
-  tokenized from text, as the reference renders its read-back. The thought is model output and is
-  not sanitized, also as in the reference.
-- **No `reasoning_effort`, `chat_template_kwargs`, `debug` or `system2_only`.** The template's own
-  `reasoning_effort` default applies (the reference's without kwargs).
-- **Several questions.** The reference answers one question per request; here every eligible
-  question thinks on its own, and the budget counts all of them.
-
-### Measured
-
-JEV-9B switchable tree (`--switchable-lora`, int8), single box, GPU (Intel Arc 140V, Core Ultra 7
-258V, 32 GB, OpenVINO GenAI 2026.4.0), `think_budget` 4096, threshold 0.8. Three requests: a
-refund case (a noul plus a choice), an ambiguous department choice and an arithmetic choice.
-
-| Request | `off` (System 1) | `on` | `auto` |
-|---|---|---|---|
-| Refund noul | 0.9964 | 0.9979, 491 thought tokens | 0.9964, no thought (confident) |
-| Refund department | billing 1.0 | billing 0.9999, 602 thought tokens | billing 1.0, no thought |
-| Ambiguous department | billing 0.6142 / technical 0.3845 | billing 0.8071 / technical 0.1923, 1429 thought tokens | same as `on` (below threshold, thought) |
-| Arithmetic cost | $8 0.9926 | $8 0.9961, 708 thought tokens | $8 0.9926, no thought |
-| Latency per request | 0.2–0.5 s | 92–188 s | 0.3–0.5 s when confident, 185 s when it thinks |
-
-Every thought finished within budget. The same sequence gave the same answers across three runs.
-One earlier run hit an `unknown C++ exception in infer` on the ambiguous request's think task under
-`auto`, after a prefix-cache restore; two later runs of the same sequence (one on the build with
-the [Failures](#failures) handling) did not reproduce it. The cause is open; the failure lines
-above are what a recurrence must be diagnosed from.
-
-System 1 on the same switchable tree matches the baked tree: CPU 82/82 (max |Δp| 0.0175,
-identical to the baked tree), GPU 81/82 (max |Δp| 0.0269; the flip is fp16 rounding).
+- **Requests.** `thinking`, `threshold`, `think_budget` and `return_reasoning` are ignored on both
+  routes, like any field the request schemas do not know (neither refuses unknown fields), whatever
+  their value. Answers carry no `thinking` object, and `usage.output_tokens` is 0.
+- **Trees.** `decision_export.py` no longer takes `--switchable-lora`. A tree exported with it has
+  a `lora_scale` stage input that nothing feeds, and fails the load with `switchable trees are no
+  longer supported; re-export without --switchable-lora` (the engine checks `manifest.json` and
+  each compiled stage, the API checks `jev.lora_scale` in `decision.json`). Re-export it without
+  the flag; `trees/jev9b-int8-sw` on the test boxes is such a tree. The `jev.answer_labels`,
+  `jev.answer_label_ids` and `jev.end_think_id` that trees exported in between carry are ignored,
+  and the exporter no longer writes them.
+- **Pipeline wire.** As before Task 41: HELLO_ACK capability bits 0 (capture_v2) and 1 (decision
+  frames) only, no `lora_scale` key in the HELLO payload, and `pos = 0` in RESET and RESTORE. A
+  rank built between Tasks 42 and 53 still interoperates on a baked tree: its extra bit 2 is
+  dropped by the AND along the chain, and its extra HELLO key is ignored.
 
 ## Confidence
 
@@ -862,8 +592,7 @@ cascadia run /models/kev-9b-int8 --engine qwen35 --device CPU --api 127.0.0.1:80
 appended to FILE as one JSON line, `{"parts": [[question_id, start, end], ...], "readout": {...}}`:
 the prompt token ids, the readout head layout, and which logit range answers which question. The
 parity and golden tooling reads this file to compare the server's prompts with the reference
-encoders. System 2's generation and read-back (see
-[JEV adaptive thinking (System 2)](#jev-adaptive-thinking-system-2)) are not written.
+encoders.
 
 - A JEV choice pass's line also has `"strategy"` (`"native"` for a choice within the trained
   slots, else `"single"`, `"permute"` or `"tournament"`) and `"round"` (1, or 2 for a
@@ -938,18 +667,6 @@ python tools/decision_export.py clef --base-ir STOCK_INT8_IR \
   differ from the `verbalizer_ids` of the choice slots; the error names both lists. A JEV export
   with no `tokenizer.json` (from `--tokenizer`, `--weights` or the base IR) is refused. Both
   fields are optional: a tree exported without them still loads.
-- JEV takes `--switchable-lora` to make the adapter switchable at runtime, the first step toward
-  adaptive thinking (System 2), which runs without the adapter. The scale is no longer baked
-  into the grafted branches: every stage that carries one gains a scalar f32 input `lora_scale`,
-  and each branch adds `lora_scale · (x·Aᵀ)·Bᵀ`. Feeding the trained scale gives the JEV model and
-  feeding 0 removes the adapter, from the same tree. Scale 0 is the stock base model only when
-  the tree was exported from the stock IR with no `--weights` (the shipped JEV recipe above); a
-  tree exported with `--weights` runs that backbone at 0. The trained scale (`lora_alpha / r` from
-  `adapter_config.json`, or `--lora-scale`; 2.0 for the shipped adapters) is written to the `jev`
-  object of `decision.json` as `lora_scale`. A tree without that field has its scale baked in and
-  no such input; that is the default, and a default export is unchanged byte for byte. The qwen35
-  engine feeds the input on every pass (see [Runtime LoRA scale](#runtime-lora-scale)). Kev and
-  Clef refuse the flag.
 - Kev and Clef trees are exported with the final hidden-state output their heads read; JEV's
   verbalizer reads only the logits.
 - Clef takes no `--lora` or `--lora-scale`: `--clef-dir` is the full checkpoint its joint head
@@ -964,44 +681,6 @@ python tools/decision_export.py clef --base-ir STOCK_INT8_IR \
   equal to the q/k row count, no saved head (`head: None`), or head tensors other than `q`/`k`
   weight and bias.
 - The manifest is written last, so a tree whose export stopped part way is not loadable.
-
-## Runtime LoRA scale
-
-The qwen35 engine serves a switchable JEV tree (`--switchable-lora`, above) as either model:
-
-- At load the engine reads which stages take `lora_scale` from `manifest.json` (each stage's
-  `inputs`) and checks every compiled stage IR against it; a stage whose IR and manifest entry
-  disagree fails the load. A tree is switchable when any stage takes the input. Rank 0 (or the
-  single box) also needs `jev.lora_scale` in `decision.json`: a switchable tree without it fails
-  the load.
-- A task's `lora_scale` (`GenerationTask::lora_scale`) picks the scale. `None` is the trained
-  scale, used by chat and every System 1 pass; `Some(0.0)` removes the adapter (System 2's
-  generation and read-back, see
-  [JEV adaptive thinking (System 2)](#jev-adaptive-thinking-system-2)). The
-  scale must be a finite number ≥ 0 (`-0.0` is 0). The engine feeds it to every stage that has the
-  input on every infer: prefill, decode, the decision readout's prefill, the priming fold before a
-  prefix-cache restore, and warmup (which runs the trained scale). Stages without a LoRA branch
-  have no input and are not fed.
-- A tree whose scale is baked in has no input and runs as before. A task that sets `lora_scale`
-  on it (any `Some`, 0 included) is refused at submit with `backend error: tree has no switchable
-  LoRA`, never served with the adapter on.
-- The single box's prefix cache scopes every snapshot by the scale it was taken at, so a
-  base-model state and a LoRA state of the same tokens never restore for each other. The scopes
-  share one byte budget and one LRU. A `require_warm` pass whose prefix was cached at the other
-  scale gets `decision_cold`, as if it had been evicted.
-- With `kv_coord`, the KV plane keys its blobs by tokens alone, so on a switchable tree only
-  trained-scale turns are captured into it or warm-resumed from it; a scale-0 turn runs cold.
-- In a pipeline every rank feeds its own stage, and rank 0 carries the task's scale to the other
-  ranks. HELLO_ACK capability bit 2 (`CAP_LORA_SCALE`, value 4, ANDed along the chain like the
-  decision bit) says a rank takes the scale, and rank 0's HELLO payload carries `"lora_scale": 1`
-  for the same thing upstream. On a switchable tree, rank 0 or a middle rank refuses a chain
-  whose ACK lacks the bit, and a downstream rank refuses (NAKs) an upstream whose HELLO lacks the
-  key, so an old build on either side fails the handshake with a reason naming `lora_scale`. A
-  tree with its scale baked in ignores both, and old and new ranks keep working together.
-- The scale rides in the `pos` field of the task-start frames, RESET and (with `kv_coord`)
-  RESTORE, as its f32 bits. Those frames carried `pos = 0`, which an older rank ignores, and the
-  field is set only on a switchable tree whose chain agreed on the bit, so the frame layout is
-  unchanged. Each rank relays the scale it received down the chain.
 
 ## Pipeline reply timeouts
 
@@ -1048,6 +727,77 @@ reply as skipped, and the next task logged `skipped a late reply of an earlier t
 then its own epoch 4). The two requests after it returned 200 with answers identical to a run
 without the timeout, in normal time.
 
+## Engine failures
+
+The qwen35 engine (`cascadia_engine_openvino::qwen36`) can fail a task in a native call. Chat and
+decision tasks share this path, so what follows holds for both.
+
+**The error comes first.** The engine returns a failed task's error chunk at once and scrubs the
+stage requests (`reset_all`, a native `recreate_request` per stage after a warm turn) when the
+next task is admitted. A scrub that blocked used to hold the error, the request and the engine.
+A decision pass that fails is the 503 `decision engine error` (or the capacity 503 or 413 an
+engine refusal maps to); chat gets its 5xx.
+
+**The engine's line.** Each failed task logs one `warn` line, `qwen36 task failed`: the task id,
+`phase` (`prefill`, `decode` or `head`), `prompt`, `warm_prefix` (prompt tokens resumed from the
+prefix cache, 0 for a cold prefill), `generated` and the reason. It covers every failure site:
+single-box prefill, decode and decision head, and the pipeline head's prefill, decode and
+decision. The older per-site lines (`decode failed`, `prefill failed`, ...) remain. The error
+chunk carries the same `warm_prefix` (`Chunk::warm_prefix`, additive, omitted when unknown). The
+engine's text is logged and never returned to the client.
+
+### After a failed infer
+
+On the GPU (pawan-03, Arc 140V), a decode infer threw `unknown C++ exception in infer`. 25 ms
+later the next admission's scrub logged `stage reset failed ... Infer Request is busy`, and the
+server then sat idle for 18 minutes, every request waiting. The failed infer had left the
+OpenVINO request marked busy. OpenVINO refuses `reset_state` on a busy request. Its destructor
+waits, with no timeout, for the run to finish. So the scrub's next `recreate_request`, which
+released the old request, never returned.
+
+What happens now:
+
+1. The engine remembers that an infer failed. The next scrub, normally at the next task's
+   admission, first checks every stage request (and the embeddings), without blocking.
+2. A request that is still busy gets OpenVINO's `cancel()`, then `wait_for` in 100 ms slices,
+   for up to 30 s. Once it is idle, the scrub resets or rebuilds it as before, and the task is
+   served.
+3. If it is still not idle after 30 s, the engine abandons the request. The request is never
+   destroyed, because its destructor would block. The engine is then failed. This task fails
+   after that wait, and every later one fails at once, with `backend error: qwen36 engine failed:
+   stageN's infer request was still Busy ... abandoned; restart the server`. Chat and decisions
+   return their 5xx, and `/health` keeps answering (it reports `degraded` after a failed
+   completion). Only a restart recovers the engine.
+
+Each recovery step is one `error` line, `qwen36: stage recovery`, with `stage`, `action`
+(`probe`, `cancel`, `wait`, `abandon`, `reset` or `recreate`), `outcome` and `elapsed_ms`. A failed
+engine also logs `qwen36: engine failed` once, and `refusing task (engine failed)` per task.
+
+The shim also guards itself: `recreate_request` refuses a busy request. Destroying a runtime
+leaks a busy request rather than waiting on it, and logs it (`action=abandon outcome=leaked`).
+
+**Pipeline mode.** A downstream rank whose engine failed does not ack the next RESET. Its step
+returns a connection-fatal error, so the stage process exits for its supervisor to rebuild it.
+The head sees the socket close and fails the task at once with `qwen36 pipeline RESET not acked:
+socket closed`, instead of waiting out its reply bound on every task. The reason is in the
+downstream rank's log. No frame changed, so a peer without this change handles it as any closed
+link.
+
+During the wait (at most 30 s) the engine is held, so other requests wait for it. That wait is
+bounded; before this change it was not.
+
+### BUG-1 (open)
+
+The `unknown C++ exception in infer` itself is not fixed; the engine only recovers afterwards.
+On hardware it showed up in long generations on the GPU (System 2's thinking, above, and once
+after a prefix-cache restore); chat generations of that length can hit it too. Its cause is
+unknown. One lead: OpenVINO's `InferRequest` wrapper turns any C++ exception into an
+`ov::Exception`, so an error the shim reports as "unknown" did not pass through it as a C++
+exception. On Windows that suggests a structured (SEH) exception from the driver or plugin. That
+would also explain why the request stayed busy: OpenVINO's own cleanup never ran. Whether such a
+request ever comes back to idle on the GPU is not yet measured. If it does not, the outcome is
+the fail-fast path above.
+
 ## Devices
 
 Decision trees run on `--device CPU` or `--device GPU` with the same files; no export or flag
@@ -1084,8 +834,7 @@ beyond a few clock reads per stage infer. Two events come from the API and one f
 
 - `decision request done` (API, per request): `family`, `passes`, `input_tokens`, `encode_ms`,
   `passes_ms`, `total_ms`.
-- `decision pass done` (API, per pass, System 2 read-backs included): `task`, `pass_ms`, `prompt`,
-  `prefilled`.
+- `decision pass done` (API, per pass): `task`, `pass_ms`, `prompt`, `prefilled`.
 - `qwen36 decision pass done` (engine, per pass, single box only; a pipeline tree logs none):
   `task`, `head`, `prompt`, `warm_prefix`, `prefilled`, `spans`, `span_max`, `admit_ms`,
   `admit_reset_ms`, `restore_ms`, `prime_ms`, `set_state_ms`, `snapshot_ms`, `embed_ms`, `infer_ms`,
