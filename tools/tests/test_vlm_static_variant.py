@@ -248,6 +248,30 @@ def test_deepstack_inputs_pinned_to_seq_width():
     assert shapes["deepstack_visual_embeds"] == [3, 4, HIDDEN]
 
 
+def test_token_type_ids_pinned_to_seq_width():
+    # Gemma 3 / Gemma 4 stages take a per-step token_type_ids frame; pin_shapes
+    # must pin it to [1, seq] (a dropped branch here once made static conversion
+    # of every token_type_ids tree fail with "unexpected stage input").
+    x = ops.parameter([1, -1, HIDDEN], ov.Type.f32, name="inputs_embeds")
+    x.output(0).set_names({"inputs_embeds"})
+    pos = ops.parameter([1, -1], ov.Type.i64, name="position_ids")
+    pos.output(0).set_names({"position_ids"})
+    tt = ops.parameter([1, -1], ov.Type.i64, name="token_type_ids")
+    tt.output(0).set_names({"token_type_ids"})
+    bias = ops.convert(
+        ops.reduce_sum(ops.add(pos, tt), ops.constant(np.array([1], np.int64)), True),
+        ov.Type.f32)
+    h = ops.add(x, ops.unsqueeze(bias, ops.constant(np.array([2], np.int64))))
+    m = ov.Model([ops.result(h)], [x, pos, tt], "toy_token_types")
+    sv.pin_shapes(m, 1, 16)
+    shapes = {i.get_any_name(): list(i.get_shape()) for i in m.inputs}
+    assert shapes["token_type_ids"] == [1, 1]
+    assert shapes["inputs_embeds"] == [1, 1, HIDDEN]
+    sv.pin_shapes(m, 5, 20)  # a prefill window
+    assert list(next(i for i in m.inputs
+                     if i.get_any_name() == "token_type_ids").get_shape()) == [1, 5]
+
+
 def test_shared_prefill_ir_takes_any_query_width():
     # CPU/GPU: one IR, past fixed, query width (and mask length) dynamic.
     m = toy_stage()
