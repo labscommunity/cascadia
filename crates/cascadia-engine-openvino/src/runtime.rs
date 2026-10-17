@@ -235,6 +235,15 @@ fn i64_to_bytes(v: &[i64]) -> Vec<u8> {
     out
 }
 
+/// f32 slice as little-endian bytes (an `inputs_embeds`-style f32 IR input).
+fn f32_vec_bytes(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
 fn f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
     use half::f16;
     bytes
@@ -1545,9 +1554,15 @@ struct StaticKv {
     embeds_in: Option<String>,
     /// Gemma 4 vision trees: `token_type_ids` (1 on image soft tokens).
     types_in: Option<String>,
+    /// Qwen3-VL stage 0: `visual_pos_masks` / `deepstack_visual_embeds`.
+    visual_mask_in: Option<String>,
+    deepstack_in: Option<String>,
     /// Token types of the rows the next inference feeds, set by the caller
     /// and taken by `static_infer`/`static_infer_chunk` (zeros when unset).
     next_types: Vec<i64>,
+    /// Ids of the rows the next static inference feeds (Qwen3-VL stage 0 only,
+    /// to build its DeepStack mask); set by the caller alongside `next_types`.
+    next_ids: Vec<i64>,
     attn_in: String,
     pos_in: String,
     layers: Vec<StaticKvLayer>,
@@ -1817,6 +1832,9 @@ struct StaticPrefill {
     hidden_in: Option<String>,
     embeds_in: Option<String>,
     types_in: Option<String>,
+    /// Qwen3-VL stage 0: `visual_pos_masks` / `deepstack_visual_embeds`.
+    visual_mask_in: Option<String>,
+    deepstack_in: Option<String>,
     attn_in: String,
     pos_in: String,
     layers: Vec<StaticKvLayer>,
@@ -1926,17 +1944,21 @@ impl VisionFamily {
     }
 }
 
-/// A Qwen VL tree is served only where its M-RoPE positions are wired: the
-/// stateful path, with every stage cut for `[3, T]` positions. The static and
-/// packed paths feed 1-D positions (their IRs pin `[1, T]`), so they refuse.
-/// A stage whose `position_rows` disagrees with the pipeline's fails here,
-/// before any peer connects, rather than on its first frame.
+/// Qwen VL trees carry M-RoPE `position_ids [3, T]` on every stage, and every
+/// path now wires them: the stateful IR takes the `[3, 1, T]` block directly,
+/// the static IRs (`static_variant.py`) pin `position_ids [3, 1, seq]`, and the
+/// packed IR (`packed_variant.py`) pins `[3, 1, S]` and carries the rows per
+/// slot on the plan frame. All this function enforces is that the pipeline's
+/// `vision.mrope_rows` and this stage's `position_rows` agree and are 3 (a
+/// peer built for another layout, or a 1-D tree, fails here before any frame),
+/// and that no other family smuggles the fields in. `stateful`/`packed` are
+/// accepted for every mode now; they are kept for the call site's clarity.
 fn check_mrope_tree(
     family: VisionFamily,
     mrope_rows: Option<u32>,
     position_rows: Option<u32>,
-    stateful: bool,
-    packed: bool,
+    _stateful: bool,
+    _packed: bool,
 ) -> EngineResult<()> {
     let want = crate::qwen_vl_vision::MROPE_ROWS as u32;
     let is_qwen = matches!(family, VisionFamily::QwenVl(_));
@@ -1954,14 +1976,6 @@ fn check_mrope_tree(
             "{family:?} tree: pipeline vision.mrope_rows is {mrope_rows:?} and this stage's \
              position_rows is {position_rows:?}, both must be {want}; re-cut the tree with \
              tools/vlm_surgery/cut_vlm_lm.py from this build"
-        )));
-    }
-    if !stateful || packed {
-        return Err(EngineError::InvalidConfig(format!(
-            "{family:?} trees are served on the stateful path only: the static and packed \
-             paths feed 1-D positions, and these models need [3, T] M-RoPE positions on every \
-             stage; serve the stateful tree from cut_vlm_lm.py without static_variant.py or \
-             --packed-slots"
         )));
     }
     Ok(())
@@ -2574,6 +2588,13 @@ pub struct OvRuntimeEngine {
     /// M-RoPE trees: the `[3, T]` positions of the step being fed — computed
     /// on rank 0, received as the last frame elsewhere, forwarded downstream.
     step_positions: Vec<i64>,
+    /// Qwen3-VL static tree, rank 0 stage 0: the active turn's DeepStack rows
+    /// flattened to `[layers, total, hidden]` (built once per prefill from
+    /// `active.deepstack`), and how many image tokens stage 0 has already fed,
+    /// so a chunked prefill slices one image's rows across inferences.
+    static_ds_global: Vec<f32>,
+    static_ds_total: usize,
+    static_ds_cursor: usize,
     runtime: OvRuntime,
     rotary: Rotary,
     hidden_size: usize,
@@ -2821,6 +2842,18 @@ impl OvRuntimeEngine {
         }
     }
 
+    /// Record the ids of the rows the next static inference feeds, so stage 0
+    /// of a Qwen3-VL tree can build their DeepStack mask. A no-op for every
+    /// other tree (and relay stages, which hold no DeepStack layers).
+    fn set_static_ids(&mut self, ids: &[i64]) {
+        if self.static_deepstack_layers() == 0 {
+            return;
+        }
+        if let Some(sk) = self.static_kv.as_mut() {
+            sk.next_ids = ids.to_vec();
+        }
+    }
+
     /// One static seq=1 step on an embedding row (`hidden` floats).
     fn run_first_row(
         &mut self,
@@ -2830,7 +2863,7 @@ impl OvRuntimeEngine {
     ) -> EngineResult<(Vec<f32>, Vec<usize>)> {
         let bytes: Vec<u8> = row.iter().flat_map(|x| x.to_le_bytes()).collect();
         let (dtype, shape, out) =
-            self.static_infer(false, ShimDType::F32, &[1, 1, hidden], &bytes, position)?;
+            self.static_infer(false, ShimDType::F32, &[1, 1, hidden], &bytes, position, 0)?;
         Ok((bytes_to_f32(dtype, &out)?, shape))
     }
 
@@ -2881,6 +2914,150 @@ impl OvRuntimeEngine {
                 &i64_to_bytes(&self.step_positions),
             )
             .map_err(map_ov_err)
+    }
+
+    /// The `[3, count]` row-major M-RoPE positions of a static inference's
+    /// `count` query rows. On the first stage they are computed from the
+    /// active turn's positions at absolute `position` and recorded in
+    /// `step_positions` for the wire; on a relay stage they are the columns
+    /// `[offset, offset + count)` of `step_positions` (the whole frame,
+    /// received after the hidden) — `run_relay_chunk` feeds a frame in
+    /// sub-chunks, so a sub-chunk reads its own slice rather than the frame's
+    /// start. Only the first stage knows where images sit, so it computes;
+    /// every later stage takes what the wire carried, unchanged.
+    fn mrope_static_positions(
+        &mut self,
+        position: i64,
+        offset: usize,
+        count: usize,
+    ) -> EngineResult<Vec<i64>> {
+        let rows = crate::qwen_vl_vision::MROPE_ROWS;
+        if self.spec.is_first_stage {
+            let mrope = self.active.as_ref().and_then(|a| a.mrope.as_ref());
+            let t0 = position as usize;
+            let p = crate::qwen_vl_vision::positions(mrope, t0, t0 + count);
+            self.step_positions = p.clone();
+            return Ok(p);
+        }
+        let width = self.step_positions.len() / rows.max(1);
+        if offset + count > width {
+            return Err(EngineError::Backend(format!(
+                "M-RoPE tree: rows [{offset}, {}) requested of a {width}-wide positions frame",
+                offset + count
+            )));
+        }
+        let mut out = vec![0i64; rows * count];
+        for r in 0..rows {
+            out[r * count..(r + 1) * count].copy_from_slice(
+                &self.step_positions[r * width + offset..r * width + offset + count],
+            );
+        }
+        Ok(out)
+    }
+
+    /// `[3, 1, width]` M-RoPE `position_ids` bytes for a static inference whose
+    /// first `real` rows are real at absolute `position` (`offset` into a relay
+    /// frame). Pad columns continue the plain index — masked out and never
+    /// absorbed, so their value is irrelevant, only non-negative.
+    fn mrope_static_position_bytes(
+        &mut self,
+        position: i64,
+        offset: usize,
+        real: usize,
+        width: usize,
+    ) -> EngineResult<Vec<u8>> {
+        let rows = crate::qwen_vl_vision::MROPE_ROWS;
+        let p = self.mrope_static_positions(position, offset, real)?;
+        let mut buf = Vec::with_capacity(rows * width * 8);
+        for r in 0..rows {
+            for c in 0..width {
+                let v = if c < real {
+                    p[r * real + c]
+                } else {
+                    position + c as i64
+                };
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        Ok(buf)
+    }
+
+    /// DeepStack layers stage 0 of a Qwen3-VL static tree feeds (0 on any other
+    /// stage, family, or a non-DeepStack tree).
+    fn static_deepstack_layers(&self) -> usize {
+        if !self.spec.is_first_stage {
+            return 0;
+        }
+        self.vision
+            .as_ref()
+            .and_then(|v| v.first.as_ref())
+            .map_or(0, |f| f.frontend.deepstack_layers())
+    }
+
+    /// Flatten the active turn's per-image DeepStack rows into the global
+    /// `[layers, total, hidden]` buffer a chunked prefill slices, and reset the
+    /// image-token cursor. Called once when a prefill begins; a no-op (empty
+    /// buffer) on a text turn or a non-DeepStack tree.
+    fn build_static_deepstack(&mut self) -> EngineResult<()> {
+        let layers = self.static_deepstack_layers();
+        self.static_ds_cursor = 0;
+        if layers == 0 {
+            self.static_ds_global = Vec::new();
+            self.static_ds_total = 0;
+            return Ok(());
+        }
+        let hidden = self.hidden_size;
+        let imgs = self
+            .active
+            .as_mut()
+            .map(|a| std::mem::take(&mut a.deepstack))
+            .unwrap_or_default();
+        let (g, total) = crate::qwen_vl_vision::flatten_deepstack(&imgs, layers, hidden)
+            .map_err(EngineError::Backend)?;
+        self.static_ds_global = g;
+        self.static_ds_total = total;
+        Ok(())
+    }
+
+    /// This static inference's DeepStack feed for stage 0 of a Qwen3-VL tree:
+    /// `visual_pos_masks` (length `width`) and `deepstack_visual_embeds`
+    /// (`[layers, width, hidden]`) from the fed `ids`, advancing the cursor by
+    /// the image tokens fed. Once the prompt's image tokens are all fed
+    /// (`cursor >= total`) every row is text — a decode step that sampled the
+    /// pad id included — so the feed is all zero, matching `deepstack_inputs`
+    /// on an empty image list. `None` when the tree has no DeepStack here.
+    fn take_static_deepstack(
+        &mut self,
+        ids: &[i64],
+        width: usize,
+    ) -> EngineResult<Option<(Vec<i64>, Vec<f32>, usize, usize)>> {
+        let layers = self.static_deepstack_layers();
+        if layers == 0 {
+            return Ok(None);
+        }
+        let hidden = self.hidden_size;
+        if self.static_ds_cursor >= self.static_ds_total {
+            return Ok(Some((
+                vec![0i64; width],
+                vec![0f32; layers * width * hidden],
+                layers,
+                hidden,
+            )));
+        }
+        let image = self.vision_image_token()?;
+        let (mask, embeds, k) = crate::qwen_vl_vision::deepstack_window(
+            ids,
+            image,
+            &self.static_ds_global,
+            self.static_ds_total,
+            self.static_ds_cursor,
+            layers,
+            hidden,
+            width,
+        )
+        .map_err(EngineError::Backend)?;
+        self.static_ds_cursor += k;
+        Ok(Some((mask, embeds, layers, hidden)))
     }
 
     /// Packed slots on a `token_type_ids` tree: the masks open image blocks
@@ -3108,6 +3285,7 @@ impl OvRuntimeEngine {
                 &[1, 1],
                 &i64_to_bytes(input_ids),
                 position,
+                0,
             )?;
             return Ok((bytes_to_f32(dtype, &bytes)?, shape));
         }
@@ -3138,7 +3316,7 @@ impl OvRuntimeEngine {
                 }
             }
             let (dtype, out_shape, bytes) =
-                self.static_infer(true, ShimDType::F16, &shape, &hs_bytes, position)?;
+                self.static_infer(true, ShimDType::F16, &shape, &hs_bytes, position, 0)?;
             return Ok((bytes_to_f32(dtype, &bytes)?, out_shape));
         }
         self.build_feed_relay(hidden, shape, position)?;
@@ -3214,6 +3392,7 @@ impl OvRuntimeEngine {
                     take,
                     position + off as i64,
                     want,
+                    off,
                 )?;
                 if want {
                     let x = *oshape.last().unwrap_or(&0);
@@ -3255,8 +3434,15 @@ impl OvRuntimeEngine {
                 }
             }
             let row = f32_to_f16_bytes(&hidden[t * h..(t + 1) * h]);
-            let (dt, os, by) =
-                self.static_infer(true, ShimDType::F16, &[1, 1, h], &row, position + t as i64)?;
+            // Relay sub-token t reads column t of the frame's M-RoPE positions.
+            let (dt, os, by) = self.static_infer(
+                true,
+                ShimDType::F16,
+                &[1, 1, h],
+                &row,
+                position + t as i64,
+                t,
+            )?;
             x = *os.last().unwrap_or(&0);
             if x == 0 || by.len() < x * float_elem_bytes(dt)? {
                 return Err(EngineError::Backend(format!(
@@ -3301,7 +3487,9 @@ impl OvRuntimeEngine {
             ChunkInput::Hidden(rows, h) | ChunkInput::Embeds(rows, h) => rows.len() / h.max(1),
         };
         debug!(take, position, "first-stage chunk: infer start");
-        let (dtype, shape, bytes) = self.static_infer_chunk(chunk, take, position, want_output)?;
+        // First stage feeds the whole chunk in one inference (offset 0).
+        let (dtype, shape, bytes) =
+            self.static_infer_chunk(chunk, take, position, want_output, 0)?;
         debug!(take, position, "first-stage chunk: infer+absorb done");
         if !want_output {
             return Ok((Vec::new(), Vec::new()));
@@ -4522,6 +4710,11 @@ impl OvRuntimeEngine {
             } else {
                 None
             };
+            // Qwen3-VL stage 0: flatten this turn's DeepStack rows once; each
+            // inference below slices its own image tokens from them.
+            if prefill {
+                self.build_static_deepstack()?;
+            }
             // Gemma 4: each inference also takes its rows' token types, and
             // an image must sit whole inside one inference.
             let vtypes = if vrows.is_some() && self.vision_token_types() {
@@ -4573,6 +4766,7 @@ impl OvRuntimeEngine {
                         // Single-stage: nothing reads a non-final chunk's
                         // logits — skip the [1,C,vocab] copy + convert.
                         let want_output = !single_stage || is_final_chunk;
+                        self.set_static_ids(&tokens[idx..idx + take]);
                         let input = match &vrows {
                             Some((rows, h)) => {
                                 ChunkInput::Embeds(&rows[idx * h..(idx + take) * h], *h)
@@ -4601,6 +4795,7 @@ impl OvRuntimeEngine {
                         // Window cap (or a 1-token remainder): one seq=1 step
                         // through the decode model — the exact sliding-window
                         // semantics for over-window rows.
+                        self.set_static_ids(&tokens[idx..idx + 1]);
                         let (out, shape) = match &vrows {
                             Some((rows, h)) => {
                                 self.run_first_row(&rows[idx * h..(idx + 1) * h], *h, chunk_start)?
@@ -4628,6 +4823,7 @@ impl OvRuntimeEngine {
                         image_safe_take(vt, i, 1).map_err(EngineError::UnsupportedInput)?;
                         self.set_static_types(&vt[i..i + 1]);
                     }
+                    self.set_static_ids(&tokens[i..i + 1]);
                     let position = self.position;
                     let ts = std::time::Instant::now();
                     let (out, shape) = match &vrows {
@@ -4886,6 +5082,7 @@ impl OvRuntimeEngine {
         in_shape: &[usize],
         in_bytes: &[u8],
         position: i64,
+        offset: usize,
     ) -> EngineResult<(ShimDType, Vec<usize>, Vec<u8>)> {
         // Align the ring to this absolute position (resets at position 0) and
         // refresh the reusable mask buffer.
@@ -4895,6 +5092,16 @@ impl OvRuntimeEngine {
             sk.write_mask_bytes();
         }
         let pos_bytes = position.to_le_bytes();
+        // M-RoPE trees feed `[3, 1, 1]` positions; DeepStack stage 0 feeds the
+        // one row's (empty for a decode token) DeepStack mask + embeds. Both
+        // need `&mut self`, so compute them before the shared-borrow feed.
+        let mrope_pos = if self.vision_mrope() {
+            Some(self.mrope_static_position_bytes(position, offset, 1, 1)?)
+        } else {
+            None
+        };
+        let next_ids = self.static_kv.as_ref().unwrap().next_ids.clone();
+        let deepstack = self.take_static_deepstack(&next_ids, 1)?;
 
         // Feed primary input + mask + position + the per-layer past-KV ring.
         // self.runtime (mut) and self.static_kv (shared) are disjoint fields,
@@ -4919,13 +5126,39 @@ impl OvRuntimeEngine {
                     &sk.mask_bytes,
                 )
                 .map_err(map_ov_err)?;
-            self.runtime
-                .set_input(&sk.pos_in, ShimDType::I64, &[1, 1], &pos_bytes)
-                .map_err(map_ov_err)?;
+            match &mrope_pos {
+                Some(b) => self.runtime.set_input(
+                    &sk.pos_in,
+                    ShimDType::I64,
+                    &[crate::qwen_vl_vision::MROPE_ROWS, 1, 1],
+                    b,
+                ),
+                None => self
+                    .runtime
+                    .set_input(&sk.pos_in, ShimDType::I64, &[1, 1], &pos_bytes),
+            }
+            .map_err(map_ov_err)?;
             if let Some(types_in) = sk.types_in.as_deref() {
                 let t = sk.next_types.first().copied().unwrap_or(0);
                 self.runtime
                     .set_input(types_in, ShimDType::I64, &[1, 1], &t.to_le_bytes())
+                    .map_err(map_ov_err)?;
+            }
+            if let (Some((mask, embeds, layers, hidden)), Some(mask_in), Some(ds_in)) = (
+                &deepstack,
+                sk.visual_mask_in.as_deref(),
+                sk.deepstack_in.as_deref(),
+            ) {
+                self.runtime
+                    .set_input(mask_in, ShimDType::I64, &[1, 1], &i64_to_bytes(mask))
+                    .map_err(map_ov_err)?;
+                self.runtime
+                    .set_input(
+                        ds_in,
+                        ShimDType::F32,
+                        &[*layers, 1, *hidden],
+                        &f32_vec_bytes(embeds),
+                    )
                     .map_err(map_ov_err)?;
             }
             for (li, layer) in sk.layers.iter().enumerate() {
@@ -4939,7 +5172,11 @@ impl OvRuntimeEngine {
             }
         }
         self.runtime.infer().map_err(map_ov_err)?;
-        self.static_kv.as_mut().unwrap().next_types.clear();
+        {
+            let sk = self.static_kv.as_mut().unwrap();
+            sk.next_types.clear();
+            sk.next_ids.clear();
+        }
 
         // Primary output (index 0): logits on the head stage, hidden_states
         // otherwise — the static export emits it before the present.* outputs.
@@ -5049,40 +5286,67 @@ impl OvRuntimeEngine {
         real: usize,
         position: i64,
         want_output: bool,
+        offset: usize,
     ) -> EngineResult<(ShimDType, Vec<usize>, Vec<u8>)> {
+        // Validate the chunk and that the prefill model is loaded WITHOUT
+        // mutating any state: begin_token/write_prefill_mask below move the ring
+        // cursor for tokens whose K/V this inference absorbs, so a bad chunk or
+        // a parked model must bail before them. The M-RoPE positions and the
+        // DeepStack feed need `&mut self`, which the ring/prefill split borrow
+        // would forbid, so they are computed here first (neither touches the
+        // ring; on an abort the whole task resets).
+        let width = {
+            let pf = self.prefill.as_ref().ok_or_else(|| {
+                EngineError::Backend(
+                    "static_infer_chunk requires the static ring + a prefill variant".into(),
+                )
+            })?;
+            if self.static_kv.is_none() {
+                return Err(EngineError::Backend(
+                    "static_infer_chunk requires the static ring + a prefill variant".into(),
+                ));
+            }
+            if real == 0 || real > pf.seq {
+                return Err(EngineError::Backend(format!(
+                    "chunk of {real} real tokens does not fit the prefill window (seq={})",
+                    pf.seq
+                )));
+            }
+            if position < 0 {
+                return Err(EngineError::Backend(format!(
+                    "negative chunk position {position}"
+                )));
+            }
+            if !pf.shared && pf.runtime.is_none() {
+                return Err(EngineError::Backend(
+                    "prefill model is parked — callers must ensure_prefill_loaded first".into(),
+                ));
+            }
+            pf.seq
+        };
+        let mrope_pos = if self.vision_mrope() {
+            Some(self.mrope_static_position_bytes(position, offset, real, width)?)
+        } else {
+            None
+        };
+        let next_ids = self
+            .static_kv
+            .as_ref()
+            .map(|sk| sk.next_ids.clone())
+            .unwrap_or_default();
+        let deepstack = self.take_static_deepstack(&next_ids, width)?;
+
         // Split-borrow the ring and the prefill model: disjoint fields of
         // self, so ring buffers feed the prefill runtime with no staging copy
         // (beyond the shim's own per-input memcpy, common to every path).
-        let (sk, pf) = match (self.static_kv.as_mut(), self.prefill.as_mut()) {
-            (Some(sk), Some(pf)) => (sk, pf),
-            _ => {
-                return Err(EngineError::Backend(
-                    "static_infer_chunk requires the static ring + a prefill variant".into(),
-                ))
-            }
-        };
-        if real == 0 || real > pf.seq {
-            return Err(EngineError::Backend(format!(
-                "chunk of {real} real tokens does not fit the prefill window (seq={})",
-                pf.seq
-            )));
-        }
-        if position < 0 {
-            return Err(EngineError::Backend(format!(
-                "negative chunk position {position}"
-            )));
-        }
-        // Parked check FIRST: begin_token/write_prefill_mask mutate ring
-        // state — advancing the cursor for a token whose K/V is never
-        // absorbed would desync the ring if this error ever fires.
+        let (sk, pf) = (
+            self.static_kv.as_mut().unwrap(),
+            self.prefill.as_mut().unwrap(),
+        );
         let prt = if pf.shared {
             &mut self.runtime
         } else {
-            pf.runtime.as_mut().ok_or_else(|| {
-                EngineError::Backend(
-                    "prefill model is parked — callers must ensure_prefill_loaded first".into(),
-                )
-            })?
+            pf.runtime.as_mut().unwrap()
         };
         sk.begin_token(position as usize);
         sk.write_prefill_mask(&mut pf.mask_bytes, pf.context, real);
@@ -5136,10 +5400,13 @@ impl OvRuntimeEngine {
         .ok_or_else(|| EngineError::Backend("prefill IR missing primary input".into()))?;
 
         // position_ids [1, C] = position..position+C; the pad tail continues
-        // past the real tokens (masked + never absorbed, value irrelevant).
-        pf.pos_buf.clear();
-        for p in position..position + pf.seq as i64 {
-            pf.pos_buf.extend_from_slice(&p.to_le_bytes());
+        // past the real tokens (masked + never absorbed, value irrelevant). An
+        // M-RoPE tree feeds `[3, 1, C]` from `mrope_pos` instead (same padding).
+        if mrope_pos.is_none() {
+            pf.pos_buf.clear();
+            for p in position..position + pf.seq as i64 {
+                pf.pos_buf.extend_from_slice(&p.to_le_bytes());
+            }
         }
 
         match input {
@@ -5160,8 +5427,16 @@ impl OvRuntimeEngine {
             &pf.mask_bytes,
         )
         .map_err(map_ov_err)?;
-        prt.set_input(&pf.pos_in, ShimDType::I64, &[1, pf.seq], &pf.pos_buf)
-            .map_err(map_ov_err)?;
+        match &mrope_pos {
+            Some(b) => prt.set_input(
+                &pf.pos_in,
+                ShimDType::I64,
+                &[crate::qwen_vl_vision::MROPE_ROWS, 1, pf.seq],
+                b,
+            ),
+            None => prt.set_input(&pf.pos_in, ShimDType::I64, &[1, pf.seq], &pf.pos_buf),
+        }
+        .map_err(map_ov_err)?;
         if let Some(types_in) = pf.types_in.as_deref() {
             // Pad rows are text: masked out anyway, and never an image.
             let types = std::mem::take(&mut sk.next_types);
@@ -5176,6 +5451,23 @@ impl OvRuntimeEngine {
             }
             prt.set_input(types_in, ShimDType::I64, &[1, pf.seq], &buf)
                 .map_err(map_ov_err)?;
+        }
+        // Qwen3-VL stage 0: the chunk's DeepStack mask + embeds, padded to the
+        // prefill window (pad rows are text, pad embeds zero and never gathered).
+        if let (Some((mask, embeds, layers, hidden)), Some(mask_in), Some(ds_in)) = (
+            &deepstack,
+            pf.visual_mask_in.as_deref(),
+            pf.deepstack_in.as_deref(),
+        ) {
+            prt.set_input(mask_in, ShimDType::I64, &[1, pf.seq], &i64_to_bytes(mask))
+                .map_err(map_ov_err)?;
+            prt.set_input(
+                ds_in,
+                ShimDType::F32,
+                &[*layers, pf.seq, *hidden],
+                &f32_vec_bytes(embeds),
+            )
+            .map_err(map_ov_err)?;
         }
         for (li, layer) in pf.layers.iter().enumerate() {
             let kv_shape = [1, layer.kv_heads, sk.past_len, layer.head_dim];
@@ -7122,7 +7414,10 @@ impl Builder for OvRuntimeBuilder {
                 hidden_in,
                 embeds_in,
                 types_in: canonical_inputs.get("token_type_ids").cloned(),
+                visual_mask_in: canonical_inputs.get("visual_pos_masks").cloned(),
+                deepstack_in: canonical_inputs.get("deepstack_visual_embeds").cloned(),
                 next_types: Vec::new(),
+                next_ids: Vec::new(),
                 attn_in,
                 pos_in,
                 layers,
@@ -7208,6 +7503,8 @@ impl Builder for OvRuntimeBuilder {
                     hidden_in,
                     embeds_in,
                     types_in: pcanon.get("token_type_ids").cloned(),
+                    visual_mask_in: pcanon.get("visual_pos_masks").cloned(),
+                    deepstack_in: pcanon.get("deepstack_visual_embeds").cloned(),
                     attn_in,
                     pos_in,
                     layers: players,
@@ -7445,6 +7742,9 @@ impl Builder for OvRuntimeBuilder {
             vision: self.vision,
             step_types: Vec::new(),
             step_positions: Vec::new(),
+            static_ds_global: Vec::new(),
+            static_ds_total: 0,
+            static_ds_cursor: 0,
             spec,
             runtime,
             rotary,
@@ -7606,7 +7906,10 @@ mod tests {
             hidden_in: None,
             embeds_in: None,
             types_in: None,
+            visual_mask_in: None,
+            deepstack_in: None,
             next_types: Vec::new(),
+            next_ids: Vec::new(),
             attn_in: "attention_mask".into(),
             pos_in: "position_ids".into(),
             layers: (0..layers)
@@ -9349,8 +9652,10 @@ mod tests {
         assert!(err(check_mrope_tree(q, None, Some(3), true, false)).contains("re-cut"));
         assert!(err(check_mrope_tree(q, Some(3), None, true, false)).contains("re-cut"));
         assert!(err(check_mrope_tree(q, Some(4), Some(4), true, false)).contains("re-cut"));
-        assert!(err(check_mrope_tree(q, Some(3), Some(3), false, false)).contains("stateful"));
-        assert!(err(check_mrope_tree(q, Some(3), Some(3), true, true)).contains("stateful"));
+        // Static (not stateful) and packed Qwen VL trees are now served, as
+        // long as the rows agree — the M-RoPE positions are wired on both.
+        assert!(check_mrope_tree(q, Some(3), Some(3), false, false).is_ok());
+        assert!(check_mrope_tree(q, Some(3), Some(3), false, true).is_ok());
         assert!(check_mrope_tree(VisionFamily::Pixtral, None, None, false, true).is_ok());
         assert!(check_mrope_tree(VisionFamily::Pixtral, Some(3), None, true, false).is_err());
         assert!(check_mrope_tree(VisionFamily::Gemma4, None, Some(3), true, false).is_err());
