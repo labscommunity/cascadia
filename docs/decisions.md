@@ -1076,6 +1076,42 @@ static decode and prefill-chunk variants. Bringing decision trees to it would ne
 every qwen35 stage: a static prefill chunk with padding, a static readout, and a bounded
 linear-attention and KV state. That is a separate project, not a flag.
 
+### Measuring
+
+Per-pass timings are logged at debug level on target `cascadia::perf`; start the server with
+`RUST_LOG=info,cascadia::perf=debug` to see them. With plain `RUST_LOG=info` they cost nothing
+beyond a few clock reads per stage infer. Two events come from the API and one from the engine:
+
+- `decision request done` (API, per request): `family`, `passes`, `input_tokens`, `encode_ms`,
+  `passes_ms`, `total_ms`.
+- `decision pass done` (API, per pass, System 2 read-backs included): `task`, `pass_ms`, `prompt`,
+  `prefilled`.
+- `qwen36 decision pass done` (engine, per pass, single box only; a pipeline tree logs none):
+  `task`, `head`, `prompt`, `warm_prefix`, `prefilled`, `spans`, `span_max`, `admit_ms`,
+  `admit_reset_ms`, `restore_ms`, `prime_ms`, `set_state_ms`, `snapshot_ms`, `embed_ms`, `infer_ms`,
+  `stage_ms` (per stage, comma-separated), `host_copy_ms`, `head_ms`, `reset_ms`, `recreate`,
+  `total_ms`. `reset_ms` and `recreate` are the reset after the head (`recreate=true` after a
+  prefix-cache restore); `admit_reset_ms` is a cold pass's reset at admission.
+
+`tools/decision/bench_cases.py` drives a running server and compares runs:
+
+```bash
+# Once: the typed-decisions test split -> the 40-case set (first 10 per workflow, round-robin).
+python tools/decision/bench_cases.py cases td-test.json td40.jsonl
+# Post every case to /v1/systemone, one at a time; prints per-case latency and p50/mean/p90.
+python tools/decision/bench_cases.py run --url http://127.0.0.1:8080 --model kev-9b \
+    --cases td40.jsonl --out kev-new.jsonl
+# Run-to-run parity and latency deltas; exits 1 on max |dp| > --max-dp (0.05), a flip where the
+# first run's margin is >= --confident (0.05), or different case sets.
+python tools/decision/bench_cases.py compare kev-base.jsonl kev-new.jsonl
+# Median and p90 of every numeric field of the engine's per-pass lines in a server log.
+python tools/decision/bench_cases.py logsum server.log
+```
+
+The case file and the run files hold request content (states, questions and answers), like
+`--decision-dump`: `run` and `cases` write them with mode 0600 and never overwrite one. Keep them
+private.
+
 ## Limitations
 
 - **Text only.** Images in either format are a 400 (`images`, `videos`, OpenAI `input_image`
