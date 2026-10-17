@@ -1896,7 +1896,8 @@ impl Engine for OvDistSpecEngine {
             cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
             // VLM target: expand each image placeholder into its soft-token run
             // and encode the images (cached per tenant by content hash). The
-            // draft is fed the same expanded ids, image tokens as plain text.
+            // draft is fed the prompt with every image id removed
+            // (`draft_prompt_ids`).
             let mut image_rows = Vec::new();
             if !task.media.is_empty() {
                 let refuse = |reason: String| {
@@ -1935,7 +1936,16 @@ impl Engine for OvDistSpecEngine {
                     Err(e) => return Ok(refuse(e)),
                 }
             }
-            if let Err(e) = check_draft_ids(&prompt_ids, self.draft_vocab) {
+            // Only what the draft is fed is checked against its vocabulary: on
+            // an image turn that is the prompt without its image ids.
+            let draft_view = match self.target.vision.as_ref() {
+                Some(v) if !image_rows.is_empty() => std::borrow::Cow::Owned(draft_prompt_ids(
+                    &prompt_ids,
+                    &v.frontend.image_framing(),
+                )),
+                _ => std::borrow::Cow::Borrowed(prompt_ids.as_slice()),
+            };
+            if let Err(e) = check_draft_ids(&draft_view, self.draft_vocab) {
                 let task_id = task.task_id.clone();
                 return Ok(vec![(task_id, Chunk::error(task.task_id, e))]);
             }
@@ -2109,7 +2119,7 @@ impl OvDistSpecEngine {
 
         let feed_ids = &prompt_ids[warm_len..];
         // Target: embeddings with the image rows spliced (VLM tree) or ids.
-        // Draft: the same ids, image soft tokens included as ordinary tokens.
+        // Draft: ids only; on an image turn, the prompt without its image ids.
         let (t_logits, t_shape) = self.target.feed_prompt(feed_ids, &image_rows)?;
         drop(image_rows);
         // An image turn's draft reads the prompt without its image ids.
@@ -2543,7 +2553,7 @@ impl Builder for OvDistSpecBuilder {
             let first = crate::runtime::VisionFirst::load(&self.pipeline_dir, v, family)?;
             let msg = format!(
                 "vision target: rank 0 embeds every span and encodes images ({}); the draft \
-                 reads the expanded prompt as ids",
+                 reads the prompt as ids, with the image ids removed",
                 first.frontend.describe()
             );
             info!("ov-dist-spec: {msg}");
@@ -3997,11 +4007,16 @@ mod tests {
 
     #[test]
     fn draft_is_fed_ids_it_can_embed() {
-        // The draft reads the expanded prompt (image soft tokens included).
+        // Ids the draft's table can index pass, whatever they spell.
         assert!(check_draft_ids(&[1, IMG, IMG, 12, 2], Some(131072)).is_ok());
         assert!(check_draft_ids(&[1, 131072], Some(131072)).is_err());
         assert!(check_draft_ids(&[-1], Some(8)).is_err());
         assert!(check_draft_ids(&[1 << 40], None).is_ok());
+        // An image turn checks the draft's view: an image id past the draft's
+        // vocabulary is never fed to it, so it does not refuse the turn.
+        let ids = [1, 300, 300, 2];
+        assert!(check_draft_ids(&ids, Some(256)).is_err());
+        assert!(check_draft_ids(&draft_prompt_ids(&ids, &[300]), Some(256)).is_ok());
     }
 
     #[test]
