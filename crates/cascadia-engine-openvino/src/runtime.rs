@@ -4547,9 +4547,12 @@ impl OvRuntimeEngine {
             };
             Ok::<_, EngineError>((plan_res, hidden, hf.shape, mrope_frame))
         })?;
-        let mrope = match mrope_frame {
-            Some(f) => decode_wire_positions(&f, crate::qwen_vl_vision::MROPE_ROWS, pseq)?,
-            None => Vec::new(),
+        // Decoded like the plan: a malformed frame is a body failure that is
+        // NACKed below, never an early return that leaves the upstream
+        // waiting out its reply deadline.
+        let mrope_res = match mrope_frame {
+            Some(f) => decode_wire_positions(&f, crate::qwen_vl_vision::MROPE_ROWS, pseq),
+            None => Ok(Vec::new()),
         };
 
         // The pair is consumed. From here on, any failure MUST still answer
@@ -4559,7 +4562,7 @@ impl OvRuntimeEngine {
         // frame ([1,1,0]): wire-aligned, unambiguous (a real reply always
         // has one token per row), and it tells the upstream "batch lost,
         // link healthy".
-        let step = self.relay_packed_body(plan_res, hidden, hshape, mrope);
+        let step = self.relay_packed_body(plan_res, hidden, hshape, mrope_res);
         let frame = match &step {
             Ok(tokens) => encode_wire_tokens(tokens),
             Err(e) => {
@@ -4593,9 +4596,10 @@ impl OvRuntimeEngine {
         plan_res: EngineResult<(Vec<crate::packed_exec::WireRowOpt>, Vec<Option<u32>>)>,
         hidden: Vec<f32>,
         hshape: [u32; MAX_RANK],
-        mrope: Vec<i64>,
+        mrope_res: EngineResult<Vec<i64>>,
     ) -> EngineResult<Vec<i32>> {
         let (plan_rows, plan_images) = plan_res?;
+        let mrope = mrope_res?;
         let hidden_size = hshape[2] as usize;
         let plan = relay_plan(&plan_rows, &plan_images);
         let positions: Vec<i64> = plan_rows
