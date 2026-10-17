@@ -712,8 +712,8 @@ What happens now, for chat and decision tasks alike (they share the engine path)
    for up to 30 s. Once it is idle, the scrub resets or rebuilds it as before, and the task is
    served.
 3. If it is still not idle after 30 s, the engine abandons the request. The request is never
-   destroyed, because its destructor would block. The engine is then failed: this task and every
-   later one fail at once with `backend error: qwen36 engine failed: stageN's infer request was
+   destroyed, because its destructor would block. The engine is then failed. This task fails
+   after that wait, and every later one fails at once, with `backend error: qwen36 engine failed: stageN's infer request was
    still Busy ... abandoned; restart the server`. Chat and decisions return their 5xx, and
    `/health` keeps answering (it reports `degraded` after a failed completion). Only a restart
    recovers the engine.
@@ -722,9 +722,15 @@ Each recovery step is one `error` line, `qwen36: stage recovery`, with `stage`, 
 (`probe`, `cancel`, `wait`, `abandon`, `reset` or `recreate`), `outcome` and `elapsed_ms`. A failed
 engine also logs `qwen36: engine failed` once, and `refusing task (engine failed)` per task.
 
-The shim also guards itself: `recreate_request` refuses a busy request, and it releases the old
-request before it creates the new one. Destroying a runtime leaks a busy request rather than
-waiting on it.
+The shim also guards itself: `recreate_request` refuses a busy request. Destroying a runtime
+leaks a busy request rather than waiting on it, and logs it (`action=abandon outcome=leaked`).
+
+**Pipeline mode.** A downstream rank whose engine failed does not ack the next RESET. Its step
+returns a connection-fatal error, so the stage process exits for its supervisor to rebuild it.
+The head sees the socket close and fails the task at once with `qwen36 pipeline RESET not acked:
+socket closed`, instead of waiting out its reply bound on every task. The reason is in the
+downstream rank's log. No frame changed, so a peer without this change handles it as any closed
+link.
 
 During the wait (at most 30 s) the engine is held, so other requests wait for it. That wait is
 bounded; before this change it was not.
