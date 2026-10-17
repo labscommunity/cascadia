@@ -23,7 +23,9 @@ use crate::qwen35_vision::rope::MropePositions;
 /// non-Qwen tree. `ds_mask` / `ds_embeds` are Qwen3-VL stage 0's DeepStack
 /// inputs (`visual_pos_masks [S]`, `deepstack_visual_embeds [layers, S,
 /// hidden]`); empty on every other stage, since only stage 0 holds the
-/// DeepStack layers. The relay stages carry only `mrope` on the wire.
+/// DeepStack layers. On stage 0 empty means the all-zero feed (a decode step,
+/// a text chunk), fed from a cached zero buffer. The relay stages carry only
+/// `mrope` on the wire.
 #[derive(Default, Clone)]
 pub(crate) struct PackedExtras {
     pub(crate) mrope: Vec<i64>,
@@ -191,6 +193,9 @@ pub(crate) struct PackedState {
     ids_bytes: Vec<u8>,
     types_bytes: Vec<u8>,
     pos_bytes: Vec<u8>,
+    /// Qwen3-VL stage 0: the all-zero `deepstack_visual_embeds` bytes, built
+    /// once and fed on every step without DeepStack rows.
+    ds_zero_bytes: Vec<u8>,
 }
 
 impl PackedState {
@@ -234,6 +239,7 @@ impl PackedState {
             ids_bytes: Vec::new(),
             types_bytes: Vec::new(),
             pos_bytes: Vec::new(),
+            ds_zero_bytes: Vec::new(),
         }
     }
 
@@ -406,6 +412,10 @@ impl PackedState {
         if let PackedStepKind::Prefill { slot, .. } = &kind {
             if let Some(t) = self.slots[*slot].as_mut() {
                 t.prompt_fed += plan.active_rows().count();
+                // Prefilled: no later step reads the DeepStack rows.
+                if t.prefilled() {
+                    t.ds_global = Vec::new();
+                }
             }
         }
         Ok(Some((odt, oshape, obytes, kind)))
@@ -448,11 +458,10 @@ impl PackedState {
         // Qwen VL: each decode row continues its slot from `rope_delta`. The
         // DeepStack feed is all zero — a decode token is text (prompt image
         // tokens are all fed during prefill), matching `deepstack_inputs` on an
-        // empty image list.
+        // empty image list; `run_plan` feeds it for the empty extras.
         let extras = PackedExtras {
             mrope: self.decode_mrope(&ready),
-            ds_mask: self.zero_ds_mask(),
-            ds_embeds: self.zero_ds_embeds(),
+            ..PackedExtras::default()
         };
         let plan = PackedPlan::decode(s, &ready);
         (!plan.is_empty()).then_some(Planned {
@@ -482,21 +491,6 @@ impl PackedState {
             }
         }
         out
-    }
-
-    /// An all-zero DeepStack mask / embeds of the packed shape (Qwen3-VL stage
-    /// 0), empty on every other stage — fed on a decode step and on idle rows.
-    fn zero_ds_mask(&self) -> Vec<i64> {
-        if self.deepstack_layers == 0 {
-            return Vec::new();
-        }
-        vec![0i64; self.kv.packed_seq]
-    }
-    fn zero_ds_embeds(&self) -> Vec<f32> {
-        if self.deepstack_layers == 0 {
-            return Vec::new();
-        }
-        vec![0f32; self.deepstack_layers * self.kv.packed_seq * self.deepstack_hidden]
     }
 
     /// The next prefill chunk of `slot`, or why that slot cannot continue.
@@ -551,17 +545,14 @@ impl PackedState {
         // sliced from this slot's buffer at its own image-token cursor (the
         // image tokens fed before `start`). Once the slot's image tokens are
         // all fed (a text turn: `ds_total == 0`) every row is text, a pad id
-        // in the text included, so the feed is all zero — as on the static
-        // path (`take_static_deepstack`) and in decode.
+        // in the text included, so the feed is all zero (the empty extras) —
+        // as on the static path (`take_static_deepstack`) and in decode.
         if self.deepstack_layers > 0 {
             let cursor = t.prompt_ids[..start]
                 .iter()
                 .filter(|&&id| id == self.deepstack_image_pad)
                 .count();
-            if cursor >= t.ds_total {
-                extras.ds_mask = self.zero_ds_mask();
-                extras.ds_embeds = self.zero_ds_embeds();
-            } else {
+            if cursor < t.ds_total {
                 let (mask, embeds, _k) = crate::qwen_vl_vision::deepstack_window(
                     &ids,
                     self.deepstack_image_pad,
@@ -759,14 +750,25 @@ impl PackedState {
         if let (Some(mask_in), Some(ds_in)) =
             (self.visual_mask_in.as_deref(), self.deepstack_in.as_deref())
         {
-            let mut mbuf = Vec::with_capacity(extras.ds_mask.len() * 8);
-            for v in &extras.ds_mask {
-                mbuf.extend_from_slice(&v.to_le_bytes());
-            }
-            let mut ebuf = Vec::with_capacity(extras.ds_embeds.len() * 4);
-            for v in &extras.ds_embeds {
-                ebuf.extend_from_slice(&v.to_le_bytes());
-            }
+            let mut mbuf = Vec::with_capacity(s * 8);
+            let mut ebuf = Vec::new();
+            let embeds: &[u8] = if extras.ds_embeds.is_empty() {
+                mbuf.resize(s * 8, 0);
+                let n = self.deepstack_layers * s * self.deepstack_hidden * 4;
+                if self.ds_zero_bytes.len() != n {
+                    self.ds_zero_bytes = vec![0u8; n];
+                }
+                &self.ds_zero_bytes
+            } else {
+                for v in &extras.ds_mask {
+                    mbuf.extend_from_slice(&v.to_le_bytes());
+                }
+                ebuf.reserve(extras.ds_embeds.len() * 4);
+                for v in &extras.ds_embeds {
+                    ebuf.extend_from_slice(&v.to_le_bytes());
+                }
+                &ebuf
+            };
             self.runtime
                 .set_input(mask_in, ShimDType::I64, &[1, s], &mbuf)
                 .map_err(crate::runtime::map_ov_err)?;
@@ -775,7 +777,7 @@ impl PackedState {
                     ds_in,
                     ShimDType::F32,
                     &[self.deepstack_layers, s, self.deepstack_hidden],
-                    &ebuf,
+                    embeds,
                 )
                 .map_err(crate::runtime::map_ov_err)?;
         }
@@ -1048,8 +1050,8 @@ mod tests {
             planned.kind,
             PackedStepKind::Prefill { slot: 0, .. }
         ));
-        assert_eq!(planned.extras.ds_mask, vec![0i64; 4]);
-        assert_eq!(planned.extras.ds_embeds, vec![0f32; 2 * 4 * 3]);
+        // Empty extras are the zero feed `run_plan` fills in.
+        assert!(planned.extras.ds_mask.is_empty() && planned.extras.ds_embeds.is_empty());
     }
 
     type TaskIdOf = cascadia_types::TaskId;

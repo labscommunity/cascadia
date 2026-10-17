@@ -3038,6 +3038,14 @@ impl OvRuntimeEngine {
         Ok(())
     }
 
+    /// Drop the turn's DeepStack rows (layers x image tokens x hidden f32,
+    /// often hundreds of MB) when the active task ends, finished or not.
+    fn clear_static_deepstack(&mut self) {
+        self.static_ds_global = Vec::new();
+        self.static_ds_total = 0;
+        self.static_ds_cursor = 0;
+    }
+
     /// This static inference's DeepStack feed for stage 0 of a Qwen3-VL tree:
     /// `visual_pos_masks` (length `width`) and `deepstack_visual_embeds`
     /// (`[layers, width, hidden]`) from the fed `ids`, advancing the cursor by
@@ -3078,6 +3086,11 @@ impl OvRuntimeEngine {
         )
         .map_err(EngineError::Backend)?;
         self.static_ds_cursor += k;
+        // Every image token is fed: no later inference reads the rows (the
+        // cursor check above zero-feeds), so release them now.
+        if self.static_ds_cursor >= self.static_ds_total {
+            self.static_ds_global = Vec::new();
+        }
         Ok(Some((mask, embeds, layers, hidden)))
     }
 
@@ -4055,6 +4068,7 @@ impl OvRuntimeEngine {
             // stream instead of ending whichever stream observes the Err.
             let failed = self.active.as_ref().map(|a| a.task.task_id.clone());
             self.active = None;
+            self.clear_static_deepstack();
             let _ = self.runtime.reset_state();
             if let Some(sk) = self.static_kv.as_mut() {
                 sk.reset();
@@ -5168,6 +5182,7 @@ impl OvRuntimeEngine {
                 }
             }
             self.active = None;
+            self.clear_static_deepstack();
         }
 
         Ok(vec![(task_id, chunk)])
@@ -6069,6 +6084,7 @@ impl Engine for OvRuntimeEngine {
         {
             info!(task = %task_id, "ov-runtime cancel: abandoning active task");
             self.active = None;
+            self.clear_static_deepstack();
             let _ = self.runtime.reset_state();
             if let Some(sk) = self.static_kv.as_mut() {
                 sk.reset();
