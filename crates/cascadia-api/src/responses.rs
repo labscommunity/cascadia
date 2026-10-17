@@ -1181,10 +1181,13 @@ mod tests {
     /// Echoes `tok ` for its one task. With `cancel_after: Some(n)` it ends
     /// the task after `n` tokens with a `Cancelled` final marker; with `None`
     /// it never ends on its own, so only `/v1/cancel` stops it (and the
-    /// runner then ends the stream with no final chunk at all).
+    /// runner then ends the stream with no final chunk at all). With
+    /// `fail_after: Some(n)` it fails the task after `n` tokens instead (a
+    /// final chunk with `error` set).
     struct ScriptEngine {
         task: Option<cascadia_types::TaskId>,
         cancel_after: Option<usize>,
+        fail_after: Option<usize>,
         emitted: Arc<std::sync::atomic::AtomicUsize>,
         seen: Arc<parking_lot::Mutex<Option<cascadia_types::TaskId>>>,
     }
@@ -1207,6 +1210,11 @@ mod tests {
                 return Ok(Vec::new());
             };
             let n = self.emitted.load(SeqCst);
+            if self.fail_after.is_some_and(|max| n >= max) {
+                self.task = None;
+                let end = cascadia_types::Chunk::error(&id, "peer link dropped");
+                return Ok(vec![(id, end)]);
+            }
             if self.cancel_after.is_some_and(|max| n >= max) {
                 self.task = None;
                 let end = cascadia_types::Chunk::final_marker(&id, "")
@@ -1247,12 +1255,21 @@ mod tests {
     /// Run one request against a [`ScriptEngine`]. Without `cancel_after`,
     /// the request is cancelled through `/v1/cancel/<id>` once a token is out.
     async fn scripted(cancel_after: Option<usize>, stream: bool) -> (StatusCode, String) {
+        scripted_with(cancel_after, None, stream).await
+    }
+
+    async fn scripted_with(
+        cancel_after: Option<usize>,
+        fail_after: Option<usize>,
+        stream: bool,
+    ) -> (StatusCode, String) {
         use std::sync::atomic::Ordering::SeqCst;
         let emitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = Arc::new(parking_lot::Mutex::new(None));
         let runner = Arc::new(Runner::new(Box::new(ScriptBuilder(Some(ScriptEngine {
             task: None,
             cancel_after,
+            fail_after,
             emitted: emitted.clone(),
             seen: seen.clone(),
         })))));
@@ -1268,7 +1285,7 @@ mod tests {
             app.clone(),
             json!({"model": "script-model", "input": "hello", "stream": stream}),
         ));
-        if cancel_after.is_none() {
+        if cancel_after.is_none() && fail_after.is_none() {
             while emitted.load(SeqCst) == 0 {
                 tokio::task::yield_now().await;
             }
@@ -1317,6 +1334,39 @@ mod tests {
             assert_eq!(kind, "response.incomplete");
             assert_cancelled(&data["response"]);
         }
+    }
+
+    /// A task that fails after the 200 is on the wire ends the stream with
+    /// one `response.failed` event: status `failed`, the engine's reason in
+    /// `error`, the tokens so far in `usage`, and nothing after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mid_stream_failure_ends_with_response_failed() {
+        let (status, body) = scripted_with(None, Some(2), true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ev = events(&body);
+        let kinds: Vec<_> = ev.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.delta",
+                "response.failed",
+            ],
+            "{body}"
+        );
+        let (_, data) = ev.last().unwrap();
+        assert_eq!(data["type"], "response.failed");
+        assert_eq!(data["sequence_number"], ev.len() as u64 - 1);
+        let response = &data["response"];
+        assert_eq!(response["status"], "failed", "{response}");
+        assert_eq!(response["error"]["code"], "server_error");
+        assert_eq!(response["error"]["message"], "peer link dropped");
+        assert!(response["completed_at"].is_null());
+        assert_eq!(response["usage"]["output_tokens"], 2);
     }
 
     /// The cap in force is echoed even when the caller left it to the
