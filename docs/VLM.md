@@ -368,3 +368,7 @@ matching the stateful tree (223), and the packed concurrent test too. Gemma 3 12
   turn prefills only its new text: about 1-1.5 s instead of 11-14 s on CPU (Ministral-3-3B,
   Gemma 4 E4B, Qwen3.6-35B-A3B on two machines). Static and packed shards still re-prefill
   images; the single-box `qwen35` prefix cache keys on the image too.
+- The image encode cache and image warm-resume are shared across all callers of a server,
+  as the prefix cache is: the API sets no tenant, so a caller who has an image can tell
+  from the latency whether someone sent the same image recently. Serve callers who must
+  not learn that from separate servers.
