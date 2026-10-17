@@ -687,18 +687,55 @@ receiving the error, and an exact replay later completed cleanly. Two explanatio
 2. *The API had already stopped listening.* The failing decode belonged to a think task the API
    had dropped at `</think>`, while its cancel was deferred behind another request's step. The
    error went to a dropped stream, by design, and the API was waiting on the read-back. That
-   read-back's admission now runs the scrub. If the scrub blocks, the read-back waits as before.
-   **This fix does not cover that case.**
+   read-back's admission now runs the scrub. The error itself still goes nowhere in that case,
+   but the scrub no longer blocks: see [After a failed infer](#after-a-failed-infer).
 
 **Telling them apart.** Match the engine's `qwen36 task failed` (or `decode failed`) task id
 against the API's lines:
 - the same `think-…` id in an API `System 2 task failed` line means case 1, which is covered;
 - no API line for that id, with the request still waiting on a later `dec-…` task, means case 2.
 
-**Known limit.** A native scrub that truly blocks still holds the engine lock. It does so at the
-next task's admission: that task, and every request behind it, chat included, waits. There is no
-engine-level timeout on native calls. The API adds none either, since a timeout cannot free the
-engine. Chat requests share the engine path and get the same reordering.
+#### After a failed infer
+
+On the GPU (pawan-03, Arc 140V), a think task's decode threw `unknown C++ exception in infer`.
+25 ms later the next admission's scrub logged `stage reset failed ... Infer Request is busy`, and
+the server then sat idle for 18 minutes, every request waiting. The failed infer had left the
+OpenVINO request marked busy. OpenVINO refuses `reset_state` on a busy request. Its destructor
+waits, with no timeout, for the run to finish. So the scrub's next `recreate_request`, which
+released the old request, never returned.
+
+What happens now, for chat and decision tasks alike (they share the engine path):
+
+1. The engine remembers that an infer failed. The next scrub, normally at the next task's
+   admission, first checks every stage request (and the embeddings), without blocking.
+2. A request that is still busy gets OpenVINO's `cancel()`, then `wait_for` in 100 ms slices,
+   for up to 30 s. Once it is idle, the scrub resets or rebuilds it as before, and the task is
+   served.
+3. If it is still not idle after 30 s, the engine abandons the request. The request is never
+   destroyed, because its destructor would block. The engine is then failed: this task and every
+   later one fail at once with `backend error: qwen36 engine failed: stageN's infer request was
+   still Busy ... abandoned; restart the server`. Chat and decisions return their 5xx, and
+   `/health` keeps answering (it reports `degraded` after a failed completion). Only a restart
+   recovers the engine.
+
+Each recovery step is one `error` line, `qwen36: stage recovery`, with `stage`, `action`
+(`probe`, `cancel`, `wait`, `abandon`, `reset` or `recreate`), `outcome` and `elapsed_ms`. A failed
+engine also logs `qwen36: engine failed` once, and `refusing task (engine failed)` per task.
+
+The shim also guards itself: `recreate_request` refuses a busy request, and it releases the old
+request before it creates the new one. Destroying a runtime leaks a busy request rather than
+waiting on it.
+
+During the wait (at most 30 s) the engine is held, so other requests wait for it. That wait is
+bounded; before this change it was not.
+
+**Still open: BUG-1**, the `unknown C++ exception in infer` itself. Its cause is unknown, and
+this change does not fix it. It only recovers afterwards. One lead: OpenVINO's `InferRequest`
+wrapper turns any C++ exception into an `ov::Exception`, so an error the shim reports as
+"unknown" did not pass through it as a C++ exception. On Windows that suggests a structured
+(SEH) exception from the driver or plugin. That would also explain why the request stayed busy:
+OpenVINO's own cleanup never ran. Whether such a request ever comes back to idle on the GPU is not
+yet measured. If it does not, the outcome is the fail-fast path above.
 
 ### decision.json
 
