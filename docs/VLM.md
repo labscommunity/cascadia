@@ -65,8 +65,8 @@ names the field.
 | InternVL2 (Phi-3 text tower, e.g. InternVL2-4B) | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family internvl_chat` on `OpenVINO/InternVL2-4B-int4-ov` |
 | LLaVA-NeXT (llava-v1.6-mistral-7b) | `ov-runtime` | 1+ machines | `tools/vlm_surgery/cut_vlm_lm.py --family llava_next` on `OpenVINO/llava-v1.6-mistral-7b-hf-int4-ov` |
 | Pixtral 12B target, Ministral-3-3B draft | `ov-dist-spec` | 2+ machines, stateful | `cut_vlm_lm.py --family pixtral --all-logits` for the target, `tools/vlm_surgery/make_text_draft.py` for the draft |
-| Qwen2.5-VL (7B) | `ov-runtime` | 1+ machines, stateful | `tools/vlm_surgery/cut_vlm_lm.py --family qwen2_5_vl` |
-| Qwen3-VL (4B) | `ov-runtime` | 1+ machines, stateful | `tools/vlm_surgery/cut_vlm_lm.py --family qwen3_vl` |
+| Qwen2.5-VL (7B) | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family qwen2_5_vl` |
+| Qwen3-VL (4B) | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family qwen3_vl` |
 
 Every other engine and tree refuses images with a `400`: `ov-dist-spec` on a v5 (text)
 target, `sparse-moe`, `ov-genai` on a text-only export, any tree without a `vision`
@@ -83,9 +83,10 @@ block. `ov-dist-spec` refuses a Gemma 4 target tree at load. Not supported:
   exported with the vision tower yet (`export_shards.py` notes when it drops one).
 - Phi-3.5-vision and InternVL2 on `ov-dist-spec`: it takes Pixtral targets only.
 - **LLaVA-NeXT on `ov-dist-spec`**: refused at load (Pixtral / Mistral 3 targets only).
-- Qwen2.5-VL / Qwen3-VL on static, packed or `ov-dist-spec` trees: those paths feed 1-D
-  positions and these models need M-RoPE positions on every stage, so the tree is
-  refused at load (`ov-dist-spec` offers no image input for it).
+- Qwen2.5-VL / Qwen3-VL on `ov-dist-spec`: it takes Pixtral / Mistral 3 targets only, and
+  its text draft runs no vision tower, so it offers no image input for these models (the
+  tree is refused at load). Static and packed trees now serve both models — the M-RoPE
+  positions ride every stage (see "Static and packed trees").
 
 ## Exporting
 
@@ -255,6 +256,17 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
 - **Gemma 4** needs `--prefill-seq` at least one image wide (280), and `--context` plus
   `--prefill-seq` must stay within the sliding window + 1 (1025): for example
   `--context 736 --prefill-seq 288`, which holds about two images.
+- **Qwen2.5-VL / Qwen3-VL** carry M-RoPE `position_ids [3, T]` on every stage, which both
+  the static IRs (`[3, 1, seq]`) and the packed IR (`[3, 1, S]`) now take; `static_variant.py`
+  and `packed_variant.py` pin them from the stateful tree, and rank 0 computes each span's
+  rows (decode continues from `rope_delta`) and ships them to the other stages — on the
+  static wire after the hidden, on the packed wire as a `[1, 3, S]` frame. Qwen attends
+  causally, so any `--prefill-seq` / `--packed-seq` works and a chunk boundary may fall
+  inside an image. Qwen3-VL's DeepStack rows feed stage 0 (rank 0) per inference,
+  gathered by image-token order, so they never cross the wire; the cut keeps the DeepStack
+  layers in stage 0, and the static/packed IRs pin `deepstack_visual_embeds [layers, seq,
+  hidden]` (the gather reads at most one row per image token, so padded rows are never
+  touched).
 - Packed slots (`--packed-slots N`, continuous batching on static shards): build the
   packed IR per stage of the static tree with `python tools/packed_variant.py <stage dir>
   --slots N [--packed-seq S]`, then serve every rank with `--packed-slots N`.
@@ -303,7 +315,10 @@ Verified on the Lunar Lake NPU with Pixtral (one 12B stage per 32 GB node) and M
 a node
 needs RAM for both the decode and prefill IRs of every stage it holds. Gemma 4 26B-A4B
 is not practical on the NPU: one stage's decode IR had not compiled after 90 minutes
-(its mixture-of-experts layers); serve it from CPU static or stateful trees.
+(its mixture-of-experts layers); serve it from CPU static or stateful trees. Qwen3-VL 4B
+static and packed (`--packed-slots 2`) trees passed the SDK image suite on CPU — one box and
+two machines (the M-RoPE positions ride the stage wire) — with the prompt-token count
+matching the stateful tree (223), and the packed concurrent test too.
 
 ## Limits worth knowing
 

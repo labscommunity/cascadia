@@ -672,6 +672,7 @@ pub fn flatten_deepstack(
 /// may exceed `k`, which is what lets one static shape serve every inference.
 /// Returns the mask, the embeds, and `k` (image tokens fed, to advance the
 /// cursor). `k == 0` (a decode step, a text chunk) yields an all-zero feed.
+#[allow(clippy::too_many_arguments)]
 pub fn deepstack_window(
     ids: &[i64],
     image_pad: i64,
