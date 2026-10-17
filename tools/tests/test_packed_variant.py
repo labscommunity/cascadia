@@ -451,3 +451,71 @@ def test_hidden_size_falls_back_to_the_tree_config(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"text_config": {"hidden_size": 640}}))
     assert pv.stage_hidden_size(dyn, {}, str(stage)) == 640
     assert pv.stage_hidden_size(m, {"hidden_size": 12}, str(stage)) == 12
+
+
+def retarget_main(m, kind: str, stray_ids: bool = False):
+    """`m` with its `inputs_embeds` port swapped for `kind`: `input_ids`
+    (an id-fed embed stage, through a toy embedding table) or `hidden_states`
+    (a later stage). `stray_ids` adds an `input_ids` port that still feeds the
+    graph beside `hidden_states`, as a later stage the surgery failed to
+    sever would."""
+    old = next(p for p in m.get_parameters() if "inputs_embeds" in p.output(0).get_names())
+    rest = [p for p in m.get_parameters() if p is not old]
+    new = []
+    if kind == "input_ids":
+        ids = ops.parameter([1, -1], ov.Type.i64, name="input_ids")
+        ids.output(0).set_names({"input_ids"})
+        table = np.random.default_rng(5).standard_normal((16, HIDDEN)).astype(np.float32)
+        src = ops.gather(ops.constant(table), ids, _const(0)).output(0)
+        new.append(ids)
+    else:
+        hs = ops.parameter(old.get_partial_shape(), ov.Type.f32, name="hidden_states")
+        hs.output(0).set_names({"hidden_states"})
+        src = hs.output(0)
+        new.append(hs)
+        if stray_ids:
+            ids = ops.parameter([1, -1], ov.Type.i64, name="input_ids")
+            ids.output(0).set_names({"input_ids"})
+            bias = ops.unsqueeze(ops.convert(ids, ov.Type.f32), _const([2]))
+            src = ops.add(src, ops.multiply(bias, ops.constant(np.float32(0.0)))).output(0)
+            new.insert(0, ids)
+    for t in list(old.output(0).get_target_inputs()):
+        t.replace_source_output(src)
+    return ov.Model(list(m.get_results()), new + rest, m.get_friendly_name())
+
+
+def test_later_stage_packs_hidden_states():
+    seq = 3
+    packed, _ = pv.build_packed_model(
+        pinned_main(retarget_main(toy_stage(1), "hidden_states")), seq, False, HIDDEN)
+    shapes = {i.get_any_name(): list(i.get_shape()) for i in packed.inputs}
+    assert shapes["hidden_states"] == [1, seq, HIDDEN]
+
+
+def test_later_stage_with_a_stray_input_ids_is_refused():
+    # Picked by name, `input_ids` would win and `hidden_states` would stay at
+    # the decode width; the main input must follow has_embed instead.
+    m = pinned_main(retarget_main(toy_stage(1), "hidden_states", stray_ids=True))
+    with pytest.raises(RuntimeError, match="more than one main input"):
+        pv.build_packed_model(m, 3, False, HIDDEN)
+
+
+def test_main_input_must_match_has_embed():
+    with pytest.raises(RuntimeError, match="non-embed stage has no hidden_states"):
+        pv.build_packed_model(pinned(toy_stage(1)), 3, False, HIDDEN)
+    with pytest.raises(RuntimeError, match="embed stage has no input_ids / inputs_embeds"):
+        pv.build_packed_model(
+            pinned_main(retarget_main(toy_stage(1), "hidden_states")), 3, True, HIDDEN)
+
+
+def pinned_main(m, seq=1):
+    """`pinned` for a toy whose main port is not `inputs_embeds`."""
+    shapes = {"attention_mask": [1, PAST + seq], "position_ids": [1, seq]}
+    for i in m.inputs:
+        n = i.get_any_name()
+        if n in ("hidden_states", "inputs_embeds", "grafted_inputs_embeds"):
+            shapes[n] = [1, seq, HIDDEN]
+        elif n in ("input_ids", "token_type_ids"):
+            shapes[n] = [1, seq]
+    m.reshape(shapes)
+    return m

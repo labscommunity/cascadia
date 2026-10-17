@@ -99,10 +99,11 @@ VALIDATE_PROMPT_IDS = [2, 651, 6037, 603, 578, 3311]
 EXPORT_VERSION = "gemma4_text_surgery_v1"
 
 # Vision trees (``--vision``): stage 0 takes ``inputs_embeds`` (rank 0 embeds
-# the prompt and splices image rows in) and every stage whose attention reads
-# it keeps ``token_type_ids`` (1 on image tokens), so gemma-4's bidirectional
-# image attention survives the cut. The image path needs these source files
-# beside the stages.
+# the prompt and splices image rows in) and every stage keeps
+# ``token_type_ids`` (1 on image tokens), so gemma-4's bidirectional image
+# attention survives the cut; the runtime sends that frame to every stage, and
+# a stage that lost the input fails the export. The image path needs these
+# source files beside the stages.
 EXPORT_VERSION_VISION = "gemma4_vision_surgery_v1"
 VISION_AUX_COPY = [
     "openvino_text_embeddings_model.xml", "openvino_text_embeddings_model.bin",
@@ -1117,6 +1118,14 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
             ov.save_model(stage, os.path.join(sdir, "openvino_model.xml"),
                           compress_to_fp16=False)
             inputs = [p.get_friendly_name() for p in stage.get_parameters()]
+            if vision and vision_token_types and not any(
+                    "token_type_ids" in p.output(0).get_names() | {p.get_friendly_name()}
+                    for p in stage.get_parameters()):
+                # The runtime sends the token_type_ids frame to every stage;
+                # a stage without it would attend its image tokens causally.
+                raise SystemExit(
+                    f"stage_{i} lost token_type_ids ({inputs}); every stage of a "
+                    "--vision tree must take them for bidirectional image attention")
             # Keys ov-runtime's StageConfig reads (layer_start/end, has_embed,
             # has_head, stateful, num_kv_heads, head_dim, export_version) plus
             # gemma-4 diagnostics it ignores (stage, inputs, state_vars).

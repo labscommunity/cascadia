@@ -11,10 +11,12 @@ the language model and saves one stateful `openvino_model.xml` that takes
 `input_ids`, `attention_mask`, `position_ids` and `beam_idx` and keeps the
 language model's KV state and logits.
 
-The draft never sees images: ov-dist-spec feeds it the target's expanded
-prompt ids, image soft tokens included as ordinary tokens. Only the target's
-verification decides the output, so the draft affects the acceptance rate,
-never the text.
+The draft never sees images: on an image turn ov-dist-spec feeds it the
+target's expanded prompt with every image id (the soft tokens and their
+row/end framing) removed, since a text model reads hundreds of placeholders
+only as noise; its KV cache is its own, so its positions need not line up
+with the target's. Only the target's verification decides the output, so the
+draft affects the acceptance rate, never the text.
 
 Usage:
   python make_text_draft.py --model <OV VLM export> --output-dir <draft dir>
