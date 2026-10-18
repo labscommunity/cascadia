@@ -3,7 +3,8 @@
 Cascadia takes images the way the OpenAI API does: `image_url` content parts in
 `/v1/chat/completions` messages. This page says which models and engines take them, how
 to export each one, and what the limits are. The design and its verification history are
-in [rfcs/vlm-support.md](rfcs/vlm-support.md). Video and audio are not supported.
+in [rfcs/vlm-support.md](rfcs/vlm-support.md). Video is served as sampled frames (see
+[Video](#video)); audio is not supported.
 
 ## The request
 
@@ -16,7 +17,7 @@ in [rfcs/vlm-support.md](rfcs/vlm-support.md). Video and audio are not supported
 
 - `data:` URLs (PNG, JPEG, WEBP, GIF) work by default. `https://` URLs only with
   `--api-allow-image-urls` (public addresses only, each redirect re-checked).
-- Up to 8 images per request. An image over about 1 MP is downscaled (`detail: "low"`:
+- Up to 8 images per request (`--api-max-images`). An image over about 1 MP is downscaled (`detail: "low"`:
   512x512; `"original"` is served as `"high"`). The chat and Responses bodies may carry
   20 MiB of images on top of the text limit; the text itself (everything but image URLs)
   stays held to that limit (`413`), and `/v1/completions` gets no image allowance.
@@ -25,7 +26,8 @@ in [rfcs/vlm-support.md](rfcs/vlm-support.md). Video and audio are not supported
   at once across the server; a request that waits more than 10 s for a decode slot gets
   the capacity `503` with `Retry-After`.
 - Images can sit anywhere in a user message and in earlier turns.
-- `/v1/models` lists `input_modalities` (`["text", "image"]` when images are accepted).
+- `/v1/models` lists `input_modalities` (`["text", "image"]` when images are accepted,
+  `["text", "image", "video"]` when ffmpeg was found too).
 - Errors are OpenAI-shaped: a model or tree without image input answers `400`, an
   undecodable image `400`, a prompt that does not fit the context `413`
   (`context_length_exceeded`). Text that spells a model's own image tag (for example
@@ -59,6 +61,46 @@ and serves no tools here: `store: true`, `previous_response_id`, `conversation`,
 `reasoning.summary`, `truncation: "auto"`, `file_id` images, `input_file` and
 `input_audio` parts and non-message input items are refused with a `400` whose `param`
 names the field.
+
+## Video
+
+OpenAI's APIs take no video. Their documented way is to sample frames and send them as
+`image_url` parts, which works here unchanged: raise `--api-max-images` for more frames.
+
+Cascadia also takes the `video_url` extension vLLM, SGLang and OpenRouter use, and samples
+the frames itself:
+
+```json
+{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,...", "detail": "auto"}}
+```
+
+and in `/v1/responses` OpenRouter's `{"type": "input_video", "video_url": "data:video/mp4;base64,..."}`
+(`{"url": ...}` is accepted too; `file_id` is a `400`, code `video_file_id_not_supported`).
+
+- `data:video/mp4`, `video/webm`, `video/quicktime` and `video/x-matroska` URLs; `https://`
+  only with `--api-allow-image-urls`, under the same checks as images. The container must
+  be MP4/MOV or Matroska/WebM; anything else is a `400`.
+- The video becomes `ceil(duration x --api-video-fps)` frames (default 1 per second), at
+  most `--api-max-video-frames` (default 16), spread uniformly from 0 s. Each frame is
+  scaled to fit `--api-max-video-frame-pixels` (default 448x448; `detail: "low"` takes the
+  image low-detail budget, `"high"` the full image budget) and enters the prompt where the
+  video was, as `Frame k (t s): ` followed by one image, exactly as if the caller had sent
+  those parts. Frames do not count against `--api-max-images`.
+- Each frame costs one image's tokens on that family (Gemma 3: 256 per frame plus its
+  markers, so 16 frames are over 4 K tokens; Qwen: about 196 per 448x448 frame). A video
+  that does not fit the context gets the usual `413` `context_length_exceeded`.
+- Limits: `--api-max-videos` (default 1 per request), `--api-max-video-seconds` (600),
+  `--api-max-video-mb` (32 MiB per request, on top of the image allowance; the chat and
+  Responses body limits grow by it only when video is on), `--api-video-decode-timeout`
+  (30 s for one video's probe and decode; past it ffmpeg is killed and the request gets a
+  `400`). A video decodes under the request's one decode slot.
+- Decoding needs ffmpeg and ffprobe on the server: `--api-ffmpeg PATH`, else `ffmpeg` on
+  `PATH` (ffprobe beside it or on `PATH`). A decode-only LGPL build is enough. ffmpeg runs
+  as a subprocess on a private temp file, restricted to local files, with the container
+  forced. Without ffmpeg a video part is a `400` naming `--api-ffmpeg`, and `/v1/models`
+  does not list `video`.
+- This is frames only. Native temporal video (Qwen's video path, GenAI's video input) is a
+  later phase.
 
 ## What takes images
 
