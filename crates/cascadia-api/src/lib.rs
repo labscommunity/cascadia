@@ -76,6 +76,8 @@ fn record_stream_tokens(
 
 mod media;
 pub use media::MediaConfig;
+mod video;
+pub use video::Ffmpeg;
 mod responses;
 pub use responses::{ReasoningParam, ResponsesRequest};
 
@@ -683,12 +685,17 @@ pub fn make_router_with_stats(
     let mw_state = state.clone();
     // The routes that carry images get the image allowance on top of the
     // text limit; every other route keeps the text limit alone.
+    // A server that decodes videos adds their allowance too.
     let image_body_limit = DefaultBodyLimit::max(
         cfg.max_body_bytes
-            + cfg
-                .media
-                .as_ref()
-                .map_or(0, |m| media::base64_len(m.max_request_image_bytes)),
+            + cfg.media.as_ref().map_or(0, |m| {
+                media::base64_len(m.max_request_image_bytes)
+                    + if m.accepts_video() {
+                        media::base64_len(m.max_request_video_bytes)
+                    } else {
+                        0
+                    }
+            }),
     );
     Router::new()
         .route("/health", get(health))
@@ -823,7 +830,8 @@ struct ModelEntry {
     /// Additive to OpenAI's model object (the SDKs keep unknown fields):
     /// which input kinds `/v1/chat/completions` and `/v1/responses` accept,
     /// in OpenRouter's `input_modalities` vocabulary. `["text", "image"]`
-    /// when image parts are served, `["text"]` otherwise.
+    /// when image parts are served (plus `"video"` when ffmpeg was found
+    /// too), `["text"]` otherwise.
     input_modalities: Vec<&'static str>,
 }
 
@@ -841,10 +849,10 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
             object: "model",
             created: 0,
             owned_by: "cascadia",
-            input_modalities: if state.media.is_some() {
-                vec!["text", "image"]
-            } else {
-                vec!["text"]
+            input_modalities: match state.media.as_deref() {
+                Some(m) if m.accepts_video() => vec!["text", "image", "video"],
+                Some(_) => vec!["text", "image"],
+                None => vec!["text"],
             },
         }],
     })
@@ -873,7 +881,16 @@ pub struct ChatMessage {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContentPart {
     Text(String),
-    ImageUrl { url: String, detail: Option<String> },
+    ImageUrl {
+        url: String,
+        detail: Option<String>,
+    },
+    /// The `video_url` extension (vLLM, SGLang, OpenRouter): served as its
+    /// sampled frames, each one image.
+    VideoUrl {
+        url: String,
+        detail: Option<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -925,8 +942,23 @@ impl ChatMessage {
     pub fn images(&self) -> impl Iterator<Item = (&str, Option<&str>)> {
         self.parts.iter().filter_map(|p| match p {
             ContentPart::ImageUrl { url, detail } => Some((url.as_str(), detail.as_deref())),
-            ContentPart::Text(_) => None,
+            _ => None,
         })
+    }
+
+    /// The video parts, in order.
+    pub fn videos(&self) -> impl Iterator<Item = (&str, Option<&str>)> {
+        self.parts.iter().filter_map(|p| match p {
+            ContentPart::VideoUrl { url, detail } => Some((url.as_str(), detail.as_deref())),
+            _ => None,
+        })
+    }
+
+    /// Whether any part is an image or a video.
+    pub fn has_media(&self) -> bool {
+        self.parts
+            .iter()
+            .any(|p| !matches!(p, ContentPart::Text(_)))
     }
 }
 
@@ -977,10 +1009,10 @@ fn parse_content(value: Option<serde_json::Value>) -> Result<(String, Vec<Conten
                 Some(text) => out.push(ContentPart::Text(text.to_owned())),
                 None => return Err("content part of type `text` needs a string `text`".into()),
             },
-            // `image_url` is an object `{url, detail}`; some clients send
-            // the bare URL string.
-            "image_url" => {
-                let (url, detail) = match part.get("image_url") {
+            // `image_url` (and `video_url`) is an object `{url, detail}`;
+            // some clients send the bare URL string.
+            "image_url" | "video_url" => {
+                let (url, detail) = match part.get(kind) {
                     Some(serde_json::Value::String(u)) => (Some(u.as_str()), None),
                     Some(obj) => (
                         obj.get("url").and_then(|u| u.as_str()),
@@ -989,18 +1021,20 @@ fn parse_content(value: Option<serde_json::Value>) -> Result<(String, Vec<Conten
                     None => (None, None),
                 };
                 let Some(url) = url else {
-                    return Err("content part of type `image_url` needs `image_url.url`".into());
+                    return Err(format!("content part of type `{kind}` needs `{kind}.url`"));
                 };
-                out.push(ContentPart::ImageUrl {
-                    url: url.to_owned(),
-                    detail: detail.map(str::to_owned),
+                let (url, detail) = (url.to_owned(), detail.map(str::to_owned));
+                out.push(if kind == "image_url" {
+                    ContentPart::ImageUrl { url, detail }
+                } else {
+                    ContentPart::VideoUrl { url, detail }
                 });
             }
             "" => return Err("content part is missing its `type`".into()),
             other => {
                 return Err(format!(
-                    "content part type `{other}` is not supported; only `text` and \
-                     `image_url` parts are accepted"
+                    "content part type `{other}` is not supported; only `text`, \
+                     `image_url` and `video_url` parts are accepted"
                 ))
             }
         }
@@ -1009,7 +1043,7 @@ fn parse_content(value: Option<serde_json::Value>) -> Result<(String, Vec<Conten
         .iter()
         .filter_map(|p| match p {
             ContentPart::Text(t) => Some(t.as_str()),
-            ContentPart::ImageUrl { .. } => None,
+            _ => None,
         })
         .collect::<String>();
     Ok((text, out))
@@ -2227,9 +2261,12 @@ fn chat_caller_text(req: &ChatCompletionRequest) -> Vec<std::borrow::Cow<'_, str
     out
 }
 
-/// Validate and decode a chat request's `image_url` parts. `Ok(None)` for a
-/// text-only request. Decoding runs on the blocking pool: a large JPEG takes
-/// tens of milliseconds and would stall every connection on this worker.
+/// Validate and decode a chat request's `image_url` and `video_url` parts.
+/// `Ok(None)` for a text-only request. Image decoding runs on the blocking
+/// pool: a large JPEG takes tens of milliseconds and would stall every
+/// connection on this worker. A video is decoded by an ffmpeg subprocess
+/// (see [`video`]) into frames that are served as images, each behind a
+/// `Frame k (t s): ` label, as if the caller had sent them that way.
 async fn prepare_media(
     state: &AppState,
     messages: &[ChatMessage],
@@ -2239,21 +2276,32 @@ async fn prepare_media(
         api_error(StatusCode::BAD_REQUEST, msg, None)
     };
     let count: usize = messages.iter().map(|m| m.images().count()).sum();
-    if count == 0 {
+    let videos: usize = messages.iter().map(|m| m.videos().count()).sum();
+    if count == 0 && videos == 0 {
         return Ok(None);
     }
     let Some(cfg) = state.media.clone() else {
-        return Err(reject(format!(
-            "model `{}` does not accept image input (`image_url` content parts)",
-            state.model_id
-        )));
+        return Err(reject(if count > 0 {
+            format!(
+                "model `{}` does not accept image input (`image_url` content parts)",
+                state.model_id
+            )
+        } else {
+            format!(
+                "model `{}` does not accept image input, which video input is served as \
+                 (`video_url` content parts)",
+                state.model_id
+            )
+        }));
     };
-    if let Some(m) = messages
-        .iter()
-        .find(|m| m.role != "user" && m.images().next().is_some())
-    {
+    if let Some(m) = messages.iter().find(|m| m.role != "user" && m.has_media()) {
+        let kind = if m.images().next().is_some() {
+            "image_url"
+        } else {
+            "video_url"
+        };
         return Err(reject(format!(
-            "`image_url` parts are only accepted in `user` messages, not `{}`",
+            "`{kind}` parts are only accepted in `user` messages, not `{}`",
             m.role
         )));
     }
@@ -2263,10 +2311,20 @@ async fn prepare_media(
             cfg.max_images
         )));
     }
+    if videos > 0 && !cfg.accepts_video() {
+        return Err(reject(video::NEEDS_FFMPEG.into()));
+    }
+    if videos > cfg.max_videos {
+        return Err(reject(format!(
+            "{videos} videos in one request; the limit is {}",
+            cfg.max_videos
+        )));
+    }
     // Remote images are fetched first, outside the decode slot (a fetch
     // waits on the network, not the CPU), sharing one byte budget per request.
     // One deadline over all of them: each fetch has its own, but eight
     // images back to back would still hold the permit for eight of those.
+    // Remote videos the same way, on a budget of their own.
     let fetch_all = async {
         let mut fetched: Vec<Option<Vec<u8>>> = Vec::with_capacity(count);
         let mut budget = cfg.max_request_image_bytes;
@@ -2281,25 +2339,46 @@ async fn prepare_media(
             budget -= bytes.len();
             fetched.push(Some(bytes));
         }
-        Ok::<_, String>(fetched)
-    };
-    let fetched = match tokio::time::timeout(cfg.fetch_policy.per_request, fetch_all).await {
-        Ok(Ok(f)) => f,
-        Ok(Err(msg)) => return Err(reject(msg)),
-        Err(_) => {
-            return Err(reject(format!(
-                "fetching this request's images took longer than {} s",
-                cfg.fetch_policy.per_request.as_secs_f32()
-            )))
+        let mut fetched_videos: Vec<Option<Vec<u8>>> = Vec::with_capacity(videos);
+        let mut budget = cfg.max_request_video_bytes;
+        for (j, (url, _)) in messages.iter().flat_map(|m| m.videos()).enumerate() {
+            if !(cfg.allow_remote_urls && media::is_remote(url)) {
+                fetched_videos.push(None);
+                continue;
+            }
+            let bytes = media::fetch_remote(url, budget, cfg.fetch_policy, "video")
+                .await
+                .map_err(|e| format!("video {j}: {e}"))?;
+            budget -= bytes.len();
+            fetched_videos.push(Some(bytes));
         }
+        Ok::<_, String>((fetched, fetched_videos))
     };
+    let (fetched, fetched_videos) =
+        match tokio::time::timeout(cfg.fetch_policy.per_request, fetch_all).await {
+            Ok(Ok(f)) => f,
+            Ok(Err(msg)) => return Err(reject(msg)),
+            Err(_) => {
+                return Err(reject(format!(
+                    "fetching this request's {} took longer than {} s",
+                    if videos == 0 { "images" } else { "media" },
+                    cfg.fetch_policy.per_request.as_secs_f32()
+                )))
+            }
+        };
     // Every image's bytes and declared size, outside the decode slot: base64
     // and a header read are cheap next to a decode, and the request's total
-    // source pixels are refused here before any image is decoded.
+    // source pixels are refused here before any image is decoded. Videos'
+    // bytes too, held to their own byte budget.
     let header_cfg = Arc::clone(&cfg);
     let urls: Vec<(String, Option<String>)> = messages
         .iter()
         .flat_map(|m| m.images())
+        .map(|(u, d)| (u.to_owned(), d.map(str::to_owned)))
+        .collect();
+    let video_urls: Vec<(String, Option<String>)> = messages
+        .iter()
+        .flat_map(|m| m.videos())
         .map(|(u, d)| (u.to_owned(), d.map(str::to_owned)))
         .collect();
     let sized = tokio::task::spawn_blocking(move || {
@@ -2315,22 +2394,64 @@ async fn prepare_media(
             bytes.push(b);
         }
         media::check_request_pixels(&sizes, &header_cfg)?;
-        Ok::<_, String>(bytes)
+        let mut videos = Vec::with_capacity(video_urls.len());
+        let mut video_bytes = 0;
+        for (j, ((url, detail), fetched)) in video_urls.into_iter().zip(fetched_videos).enumerate()
+        {
+            let b = match fetched {
+                Some(b) => b,
+                None => video::video_url_bytes(&url, detail.as_deref(), &header_cfg)
+                    .map_err(|e| format!("video {j}: {e}"))?,
+            };
+            video_bytes += b.len();
+            if video_bytes > header_cfg.max_request_video_bytes {
+                return Err(format!(
+                    "this request's videos are over the {}-byte limit",
+                    header_cfg.max_request_video_bytes
+                ));
+            }
+            videos.push((b, detail));
+        }
+        Ok::<_, String>((bytes, videos))
     })
     .await;
-    let image_bytes = match sized {
+    let (image_bytes, video_inputs) = match sized {
         Ok(Ok(b)) => b,
         Ok(Err(msg)) => return Err(reject(msg)),
         Err(join_err) => return Err(decode_task_failed(join_err)),
     };
     let messages = messages.to_vec();
     let decode_cfg = Arc::clone(&cfg);
+    // One slot for the whole request, its videos included: ffmpeg runs
+    // under it, before the images decode.
     let decode_permit =
         acquire_decode_slot(Arc::clone(&state.decode_permits), cfg.decode_wait).await?;
+    let mut video_frames = Vec::with_capacity(video_inputs.len());
+    for (j, (bytes, detail)) in video_inputs.into_iter().enumerate() {
+        match video::decode_video(bytes, detail.as_deref(), &cfg).await {
+            Ok(frames) => video_frames.push(frames),
+            Err(video::VideoError::Invalid(msg)) => {
+                return Err(reject(format!("video {j}: {msg}")))
+            }
+            Err(video::VideoError::Internal(msg)) => {
+                let mut resp = api_error(StatusCode::INTERNAL_SERVER_ERROR, msg, None);
+                resp.extensions_mut().insert(PreEngineFailure);
+                return Err(resp);
+            }
+        }
+    }
+    let frames: usize = video_frames.iter().map(Vec::len).sum();
+    if count + frames > cfg.max_images + cfg.max_videos * cfg.max_video_frames {
+        return Err(reject(format!(
+            "{count} images and {frames} video frames in one request; the limit is {} together",
+            cfg.max_images + cfg.max_videos * cfg.max_video_frames
+        )));
+    }
     let decoded = tokio::task::spawn_blocking(move || {
         let _decode_permit = decode_permit;
         let mut image_bytes = image_bytes.into_iter();
-        let mut inputs = Vec::with_capacity(count);
+        let mut video_frames = video_frames.into_iter();
+        let mut inputs = Vec::with_capacity(count + frames);
         let mut out = Vec::with_capacity(messages.len());
         for mut m in messages {
             if m.parts.is_empty() {
@@ -2349,6 +2470,17 @@ async fn prepare_media(
                                 .map_err(|e| format!("image {i}: {e}"))?;
                         inputs.push(input);
                         pieces.push((true, decode_cfg.placeholder(i)));
+                    }
+                    // Each frame as the caller would have sent it: a text
+                    // part naming it, then the image.
+                    ContentPart::VideoUrl { .. } => {
+                        let frames = video_frames.next().expect("frames for every video");
+                        for (k, frame) in frames.into_iter().enumerate() {
+                            let label = video::frame_label(k + 1, frame.secs);
+                            pieces.push((false, decode_cfg.text_part(label)));
+                            pieces.push((true, decode_cfg.placeholder(inputs.len())));
+                            inputs.push(frame.input);
+                        }
                     }
                 }
             }
@@ -2429,7 +2561,7 @@ fn text_messages<'a>(
                                 .into_iter()
                                 .filter_map(|p| match p {
                                     ContentPart::Text(t) => Some((false, cfg.text_part(t))),
-                                    ContentPart::ImageUrl { .. } => None,
+                                    _ => None,
                                 })
                                 .collect();
                             m.content = cfg.join_parts(pieces);
@@ -3150,7 +3282,7 @@ async fn admit_chat(
     // is the expensive part (a source image may hold ~150 MB of RGB), and
     // doing it ahead of the gate let any number of concurrent requests decode
     // at once. Text requests keep the gate where it was, after rendering.
-    let early_permit = if req.messages.iter().any(|m| m.images().next().is_some()) {
+    let early_permit = if req.messages.iter().any(ChatMessage::has_media) {
         match state.permits.clone().try_acquire_owned() {
             Ok(p) => Some(p),
             Err(_) => {
@@ -5127,7 +5259,7 @@ mod tests {
     }
 
     // Helper: POST a chat-completions request body, return (status, parsed JSON).
-    async fn post_chat(app: Router, payload: serde_json::Value) -> (StatusCode, Value) {
+    pub(crate) async fn post_chat(app: Router, payload: serde_json::Value) -> (StatusCode, Value) {
         let response = app
             .oneshot(
                 Request::builder()
@@ -5422,8 +5554,8 @@ mod tests {
         let cases = [
             (
                 r#"{"model":"m","messages":[{"role":"user","content":[{"type":"input_audio"}]}]}"#,
-                "messages[0]: content part type `input_audio` is not supported; only `text` and \
-                 `image_url` parts are accepted",
+                "messages[0]: content part type `input_audio` is not supported; only `text`, \
+                 `image_url` and `video_url` parts are accepted",
             ),
             (r#"{"messages":[]}"#, "missing field `model`"),
         ];
@@ -6468,6 +6600,40 @@ mod tests {
         let string_form: ChatMessage =
             serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
         assert!(string_form.parts.is_empty());
+    }
+
+    /// `video_url` parses like `image_url`: an object `{url, detail}` or the
+    /// bare URL string, kept in order and out of the text.
+    #[test]
+    fn message_keeps_video_parts_in_order() {
+        let raw = r#"{"role":"user","content":[
+            {"type":"video_url","video_url":{"url":"data:v","detail":"low"}},
+            {"type":"text","text":"and"},
+            {"type":"video_url","video_url":"data:w"}]}"#;
+        let m: ChatMessage = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.content, "and");
+        assert_eq!(
+            m.parts,
+            vec![
+                ContentPart::VideoUrl {
+                    url: "data:v".into(),
+                    detail: Some("low".into())
+                },
+                ContentPart::Text("and".into()),
+                ContentPart::VideoUrl {
+                    url: "data:w".into(),
+                    detail: None
+                },
+            ]
+        );
+        assert_eq!((m.images().count(), m.videos().count()), (0, 2));
+        assert!(m.has_media());
+        let err = serde_json::from_str::<ChatMessage>(
+            r#"{"role":"user","content":[{"type":"video_url","video_url":{}}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("needs `video_url.url`"), "{err}");
     }
 
     #[test]

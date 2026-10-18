@@ -86,6 +86,7 @@ pub struct ReasoningParam {
 struct Refusal {
     param: String,
     message: String,
+    code: Option<&'static str>,
 }
 
 impl Refusal {
@@ -93,6 +94,15 @@ impl Refusal {
         Self {
             param: param.into(),
             message: message.into(),
+            code: None,
+        }
+    }
+
+    /// The machine-readable `code` other servers give this refusal.
+    fn with_code(self, code: &'static str) -> Self {
+        Self {
+            code: Some(code),
+            ..self
         }
     }
 
@@ -102,7 +112,7 @@ impl Refusal {
             StatusCode::BAD_REQUEST,
             self.message,
             Some(&self.param),
-            None,
+            self.code,
         )
     }
 }
@@ -302,8 +312,10 @@ fn text_message(role: &str, content: String) -> ChatMessage {
     }
 }
 
-/// One Responses content part as the chat endpoint's `text` / `image_url`
-/// part. `output_text` and `refusal` are a prior assistant turn's text.
+/// One Responses content part as the chat endpoint's `text` / `image_url` /
+/// `video_url` part. `output_text` and `refusal` are a prior assistant turn's
+/// text. `input_video` is OpenRouter's extension (OpenAI has no video input):
+/// `video_url` is the URL string, or leniently `{url}` as in chat.
 fn chat_part(part: &Value, at: &str) -> Result<Value, Refusal> {
     let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
     let field = |name: &str| part.get(name).and_then(Value::as_str);
@@ -331,6 +343,27 @@ fn chat_part(part: &Value, at: &str) -> Result<Value, Refusal> {
                 "content part of type `input_image` needs `image_url`",
             )),
         },
+        "input_video" => {
+            let url = match part.get("video_url") {
+                Some(Value::String(u)) => Some(u.as_str()),
+                Some(obj) => obj.get("url").and_then(Value::as_str),
+                None => None,
+            };
+            match (url, part.get("file_id")) {
+                (Some(url), _) => Ok(json!({"type": "video_url", "video_url": {
+                    "url": url, "detail": field("detail")}})),
+                (None, Some(f)) if !f.is_null() => Err(Refusal::new(
+                    format!("{at}.file_id"),
+                    "`file_id` videos are not supported: this server keeps no files; \
+                     send the video as a `data:` URL in `video_url`",
+                )
+                .with_code("video_file_id_not_supported")),
+                _ => Err(Refusal::new(
+                    format!("{at}.video_url"),
+                    "content part of type `input_video` needs `video_url`",
+                )),
+            }
+        }
         "input_file" => Err(Refusal::new(
             at,
             "file inputs (`input_file`) are not supported",
@@ -346,8 +379,8 @@ fn chat_part(part: &Value, at: &str) -> Result<Value, Refusal> {
         other => Err(Refusal::new(
             format!("{at}.type"),
             format!(
-                "content part type `{other}` is not supported; only `input_text` and \
-                 `input_image` parts are accepted"
+                "content part type `{other}` is not supported; only `input_text`, \
+                 `input_image` and `input_video` parts are accepted"
             ),
         )),
     }
