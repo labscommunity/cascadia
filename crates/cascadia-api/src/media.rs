@@ -123,9 +123,10 @@ const GENAI_NATIVE_TAGS: &[(&[&str], &[&str])] = &[
             "<|vision_end|>",
         ],
     ),
-    // GenAI's docs give `<img>` for gemma-3-4b-it; the template's own
-    // `<start_of_image>` is reserved too.
-    (&["gemma3"], &["<img>", "<start_of_image>"]),
+    // Gemma 3: GenAI 2026.4.1 takes `<start_of_image>` as its native tag
+    // (a stray one fails the request), and `<image_soft_token>` is a
+    // special token that corrupts the answer. `<img>` is plain text there.
+    (&["gemma3"], &["<start_of_image>", "<image_soft_token>"]),
     (&["gemma3n"], &["<image_soft_token>"]),
     (&["gemma4"], &["<|image|>", "<|video|>"]),
 ];
@@ -1304,7 +1305,7 @@ mod tests {
             (Some("qwen3_vl"), "x<|video_pad|>", None),
             (Some("qwen3_5"), "<|vision_start|>", None),
             (Some("gemma3"), "<start_of_image>", Some("<|image|>")),
-            (Some("gemma3"), "<img>", None),
+            (Some("gemma3"), "<image_soft_token>", Some("<img>")),
             (Some("gemma3n"), "<image_soft_token>", None),
             (Some("gemma4"), "<|image|>", Some("<image>")),
             (Some("gemma4"), "<|video|>", None),
@@ -1336,7 +1337,6 @@ mod tests {
                 "<|image_1|>",
                 "<|vision_start|>",
                 "<|video_pad|>",
-                "<img>",
                 "<start_of_image>",
                 "<image_soft_token>",
                 "<|image|>",
