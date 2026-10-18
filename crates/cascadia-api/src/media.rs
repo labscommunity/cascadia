@@ -5,7 +5,8 @@
 //! RGB pixels ([`MediaInput`]). `data:` URLs are always accepted. Remote
 //! `https` URLs are fetched only when the operator opts in
 //! ([`MediaConfig::allow_remote_urls`]), and only from public addresses: see
-//! [`fetch_image`].
+//! [`fetch_image`]. Videos (`video_url` parts) become frames here too, by
+//! way of [`crate::video`].
 
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -40,7 +41,8 @@ pub struct MediaConfig {
     /// order, as LLaVA-NeXT's processor template does (`<image>\n` per image,
     /// then the text parts back to back).
     pub images_first: bool,
-    /// Images allowed in one request.
+    /// Images allowed in one request. A video's frames do not count
+    /// against it ([`MediaConfig::max_video_frames`] bounds those).
     pub max_images: usize,
     /// Images larger than this many pixels are downscaled to fit, keeping
     /// the aspect ratio. It bounds the image's token cost (about one token
@@ -71,6 +73,30 @@ pub struct MediaConfig {
     /// tests; not exposed as a flag.
     #[doc(hidden)]
     pub fetch_policy: FetchPolicy,
+    /// The ffmpeg and ffprobe that decode `video_url` parts. `None` (no
+    /// ffmpeg found) refuses every video with a 400 naming `--api-ffmpeg`.
+    pub ffmpeg: Option<crate::video::Ffmpeg>,
+    /// Videos allowed in one request.
+    pub max_videos: usize,
+    /// Frames sampled from one video at most, whatever its length.
+    pub max_video_frames: usize,
+    /// Frames sampled per second of video, before the
+    /// [`MediaConfig::max_video_frames`] cap spreads them out.
+    pub video_fps: f64,
+    /// Longest video accepted, in seconds, read from its container before
+    /// any frame is decoded.
+    pub max_video_seconds: f64,
+    /// Each frame is scaled to fit this many pixels, keeping the aspect
+    /// ratio (`detail: "low"` takes [`MediaConfig::low_detail_pixels`],
+    /// `"high"` [`MediaConfig::max_image_pixels`]). Every frame costs one
+    /// image's tokens.
+    pub max_video_frame_pixels: u64,
+    /// Encoded video bytes one request may carry, on top of the image and
+    /// text allowances. Also the cap on video bytes fetched for one request.
+    pub max_request_video_bytes: usize,
+    /// One video's probe and decode together; past it ffmpeg is killed and
+    /// the request gets a 400.
+    pub video_decode_timeout: Duration,
 }
 
 /// Bytes a `data:` URL needs to carry `raw` bytes base64-encoded, plus room
@@ -176,7 +202,20 @@ impl MediaConfig {
             max_request_image_bytes: 20 << 20,
             allow_remote_urls: false,
             fetch_policy: FetchPolicy::PUBLIC_HTTPS,
+            ffmpeg: None,
+            max_videos: 1,
+            max_video_frames: 16,
+            video_fps: 1.0,
+            max_video_seconds: 600.0,
+            max_video_frame_pixels: 448 * 448,
+            max_request_video_bytes: 32 << 20,
+            video_decode_timeout: Duration::from_secs(30),
         }
+    }
+
+    /// Whether `video_url` parts are served: images are, and ffmpeg was found.
+    pub fn accepts_video(&self) -> bool {
+        self.ffmpeg.is_some()
     }
 
     /// Settings for the staged `qwen35` engine (rank 0 encodes the images):
@@ -368,10 +407,10 @@ impl MediaConfig {
 }
 
 /// Hard ceiling on either side, whatever the pixel budget.
-const MAX_SIDE: u32 = 16_384;
+pub(crate) const MAX_SIDE: u32 = 16_384;
 /// Qwen's processor refuses aspect ratios past 200:1; refusing here gives the
 /// caller a 400 instead of an engine failure.
-const MAX_ASPECT: u32 = 200;
+pub(crate) const MAX_ASPECT: u32 = 200;
 
 /// Decode one `data:` image URL into pixels the engine can take as is.
 #[cfg(test)]
@@ -481,12 +520,17 @@ pub fn decode_image_bytes(
     }
 
     let (width, height) = rgb.dimensions();
-    let raw = rgb.into_raw();
+    Ok(rgb_image(width, height, rgb.into_raw()))
+}
+
+/// One RGB8 image as the engine takes it, hashed (size and pixels) so the
+/// encode cache keys on what the model sees. A video frame is one too.
+pub(crate) fn rgb_image(width: u32, height: u32, raw: Vec<u8>) -> MediaInput {
     let mut hasher = Sha256::new();
     hasher.update(width.to_le_bytes());
     hasher.update(height.to_le_bytes());
     hasher.update(&raw);
-    Ok(MediaInput {
+    MediaInput {
         kind: MediaKind::Image,
         pixels: raw.into(),
         num_frames: 1,
@@ -494,7 +538,7 @@ pub fn decode_image_bytes(
         height,
         timestamps_ms: None,
         sha256: hasher.finalize().into(),
-    })
+    }
 }
 
 /// The size a `w x h` image over `budget` pixels is resized to: the short
@@ -502,7 +546,7 @@ pub fn decode_image_bytes(
 /// the aspect ratio can only shrink. Flooring both sides let a 16384x82 image
 /// (199.8:1, accepted by `check_dimensions`) become 14474x72 (201:1), which
 /// Qwen's processor refuses after the request has been accepted.
-fn downscaled_size(w: u32, h: u32, budget: u64) -> (u32, u32) {
+pub(crate) fn downscaled_size(w: u32, h: u32, budget: u64) -> (u32, u32) {
     let scale = (budget as f64 / (f64::from(w) * f64::from(h))).sqrt();
     let (long, short) = (w.max(h), w.min(h));
     // The epsilon keeps an exact product (200 * 0.05) from rounding up.
@@ -546,14 +590,26 @@ fn data_url_bytes(url: &str, remote_allowed: bool) -> Result<Vec<u8>, String> {
                 .into()
         });
     };
+    data_url_payload(rest, |mime| {
+        if mime.starts_with("image/") {
+            Ok(())
+        } else {
+            Err(format!("data URL media type `{mime}` is not an image type"))
+        }
+    })
+}
+
+/// The payload of a `data:` URL (`rest` follows `data:`) whose media type
+/// `check_mime` accepts. Only base64 payloads are taken.
+pub(crate) fn data_url_payload(
+    rest: &str,
+    check_mime: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<Vec<u8>, String> {
     let Some((meta, payload)) = rest.split_once(',') else {
         return Err("malformed data URL: no `,` before the payload".into());
     };
     let mut fields = meta.split(';');
-    let mime = fields.next().unwrap_or("");
-    if !mime.starts_with("image/") {
-        return Err(format!("data URL media type `{mime}` is not an image type"));
-    }
+    check_mime(fields.next().unwrap_or(""))?;
     if !fields.any(|f| f == "base64") {
         return Err("data URL must be base64-encoded (`;base64,`)".into());
     }
@@ -617,26 +673,40 @@ pub async fn fetch_image(
     max_bytes: usize,
     policy: FetchPolicy,
 ) -> Result<Vec<u8>, String> {
-    match tokio::time::timeout(policy.per_image, fetch_image_inner(url, max_bytes, policy)).await {
+    fetch_remote(url, max_bytes, policy, "image").await
+}
+
+/// [`fetch_image`] for any media kind: `what` (`image`, `video`) names it in
+/// errors and is the content type's required top-level type.
+pub async fn fetch_remote(
+    url: &str,
+    max_bytes: usize,
+    policy: FetchPolicy,
+    what: &'static str,
+) -> Result<Vec<u8>, String> {
+    match tokio::time::timeout(policy.per_image, fetch_inner(url, max_bytes, policy, what)).await {
         Ok(r) => r,
         Err(_) => Err(format!(
-            "fetching the image took longer than {} s",
+            "fetching the {what} took longer than {} s",
             policy.per_image.as_secs_f32()
         )),
     }
 }
 
 /// Fetch failures whose cause stays in the server log.
-const UNREACHABLE: &str = "could not fetch the image from this server";
+fn unreachable(what: &str) -> String {
+    format!("could not fetch the {what} from this server")
+}
 
-async fn fetch_image_inner(
+async fn fetch_inner(
     url: &str,
     max_bytes: usize,
     policy: FetchPolicy,
+    what: &'static str,
 ) -> Result<Vec<u8>, String> {
-    let mut current = url::Url::parse(url).map_err(|e| format!("invalid image URL: {e}"))?;
+    let mut current = url::Url::parse(url).map_err(|e| format!("invalid {what} URL: {e}"))?;
     for _ in 0..=MAX_REDIRECTS {
-        let addr = check_target(&current, policy).await?;
+        let addr = check_target(&current, policy, what).await?;
         let host = current.host_str().unwrap_or_default().to_owned();
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -646,25 +716,25 @@ async fn fetch_image_inner(
             .resolve(&host, addr)
             .user_agent("cascadia-image-fetch")
             .build()
-            .map_err(|e| format!("could not set up the image fetch: {e}"))?;
+            .map_err(|e| format!("could not set up the {what} fetch: {e}"))?;
         let mut resp = client.get(current.clone()).send().await.map_err(|e| {
-            tracing::warn!(host = %host, error = %without_url(e), "image fetch failed");
-            UNREACHABLE.to_string()
+            tracing::warn!(host = %host, error = %without_url(e), "{what} fetch failed");
+            unreachable(what)
         })?;
         if resp.status().is_redirection() {
             let next = resp
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
-                .ok_or("image URL redirected without a Location")?;
+                .ok_or_else(|| format!("{what} URL redirected without a Location"))?;
             current = current
                 .join(next)
-                .map_err(|e| format!("image URL redirected to an invalid URL: {e}"))?;
+                .map_err(|e| format!("{what} URL redirected to an invalid URL: {e}"))?;
             continue;
         }
         if !resp.status().is_success() {
             return Err(format!(
-                "fetching the image returned HTTP {}",
+                "fetching the {what} returned HTTP {}",
                 resp.status().as_u16()
             ));
         }
@@ -673,28 +743,33 @@ async fn fetch_image_inner(
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if !ctype.starts_with("image/") {
+        if !ctype.starts_with(&format!("{what}/")) {
+            let article = if what.starts_with(['a', 'e', 'i', 'o', 'u']) {
+                "an"
+            } else {
+                "a"
+            };
             return Err(format!(
-                "image URL returned content type `{ctype}`, not an image"
+                "{what} URL returned content type `{ctype}`, not {article} {what}"
             ));
         }
         if resp.content_length().is_some_and(|n| n > max_bytes as u64) {
-            return Err(format!("image is larger than the {max_bytes}-byte limit"));
+            return Err(format!("{what} is larger than the {max_bytes}-byte limit"));
         }
         let mut body = Vec::new();
         while let Some(chunk) = resp.chunk().await.map_err(|e| {
-            tracing::warn!(host = %host, error = %without_url(e), "image fetch failed mid-body");
-            UNREACHABLE.to_string()
+            tracing::warn!(host = %host, error = %without_url(e), "{what} fetch failed mid-body");
+            unreachable(what)
         })? {
             if body.len() + chunk.len() > max_bytes {
-                return Err(format!("image is larger than the {max_bytes}-byte limit"));
+                return Err(format!("{what} is larger than the {max_bytes}-byte limit"));
             }
             body.extend_from_slice(&chunk);
         }
         return Ok(body);
     }
     Err(format!(
-        "image URL redirected more than {MAX_REDIRECTS} times"
+        "{what} URL redirected more than {MAX_REDIRECTS} times"
     ))
 }
 
@@ -712,39 +787,43 @@ fn without_url(e: reqwest::Error) -> String {
 }
 
 /// Validate a URL and resolve it to the one address the fetch will use.
-async fn check_target(url: &url::Url, policy: FetchPolicy) -> Result<SocketAddr, String> {
+async fn check_target(
+    url: &url::Url,
+    policy: FetchPolicy,
+    what: &str,
+) -> Result<SocketAddr, String> {
     match url.scheme() {
         "https" => {}
         "http" if policy.allow_http => {}
         other => {
             return Err(format!(
-                "image URL scheme `{other}` is not allowed; use https"
+                "{what} URL scheme `{other}` is not allowed; use https"
             ))
         }
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err("image URLs must not carry credentials".into());
+        return Err(format!("{what} URLs must not carry credentials"));
     }
     let port = url.port_or_known_default().unwrap_or(0);
     if !policy.allow_http && port != 443 {
-        return Err(format!("image URLs must use port 443, not {port}"));
+        return Err(format!("{what} URLs must use port 443, not {port}"));
     }
     let host = match url.host() {
         Some(url::Host::Domain(d)) => d.to_owned(),
         Some(url::Host::Ipv4(ip)) => ip.to_string(),
         Some(url::Host::Ipv6(ip)) => ip.to_string(),
-        None => return Err("image URL has no host".into()),
+        None => return Err(format!("{what} URL has no host")),
     };
     let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host.as_str(), port)).await {
         Ok(a) => a.collect(),
         Err(e) => {
-            tracing::warn!(host = %host, error = %e, "image host did not resolve");
-            return Err(UNREACHABLE.into());
+            tracing::warn!(host = %host, error = %e, "{what} host did not resolve");
+            return Err(unreachable(what));
         }
     };
     let Some(first) = addrs.first().copied() else {
-        tracing::warn!(host = %host, "image host resolved to no addresses");
-        return Err(UNREACHABLE.into());
+        tracing::warn!(host = %host, "{what} host resolved to no addresses");
+        return Err(unreachable(what));
     };
     // Every answer must be public: a host that resolves to one public and one
     // internal address would otherwise be a coin flip away from the inside.
@@ -752,8 +831,8 @@ async fn check_target(url: &url::Url, policy: FetchPolicy) -> Result<SocketAddr,
     // resolved to: that would turn the endpoint into an internal DNS oracle.
     if !policy.allow_non_public {
         if let Some(bad) = addrs.iter().find(|a| !is_public(a.ip())) {
-            tracing::warn!(host = %host, ip = %bad.ip(), "image host refused: not a public address");
-            return Err("image host is not a public address".into());
+            tracing::warn!(host = %host, ip = %bad.ip(), "{what} host refused: not a public address");
+            return Err(format!("{what} host is not a public address"));
         }
     }
     Ok(first)
