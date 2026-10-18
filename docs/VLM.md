@@ -78,27 +78,42 @@ and in `/v1/responses` OpenRouter's `{"type": "input_video", "video_url": "data:
 (`{"url": ...}` is accepted too; `file_id` is a `400`, code `video_file_id_not_supported`).
 
 - `data:video/mp4`, `video/webm`, `video/quicktime` and `video/x-matroska` URLs; `https://`
-  only with `--api-allow-image-urls`, under the same checks as images. The container must
-  be MP4/MOV or Matroska/WebM; anything else is a `400`.
+  only with `--api-allow-image-urls`, under the same checks as images (a fetched video may
+  be typed `video/*`, `application/octet-stream` or not at all: its bytes are checked). The
+  container must be MP4/MOV or Matroska/WebM; anything else is a `400`. A WebM that states
+  no duration (as a browser's MediaRecorder writes it) has it read from its packets.
 - The video becomes `ceil(duration x --api-video-fps)` frames (default 1 per second), at
-  most `--api-max-video-frames` (default 16), spread uniformly from 0 s. Each frame is
-  scaled to fit `--api-max-video-frame-pixels` (default 448x448; `detail: "low"` takes the
-  image low-detail budget, `"high"` the full image budget) and enters the prompt where the
-  video was, as `Frame k (t s): ` followed by one image, exactly as if the caller had sent
-  those parts. Frames do not count against `--api-max-images`.
-- Each frame costs one image's tokens on that family (Gemma 3: 256 per frame plus its
-  markers, so 16 frames are over 4 K tokens; Qwen: about 196 per 448x448 frame). A video
-  that does not fit the context gets the usual `413` `context_length_exceeded`.
-- Limits: `--api-max-videos` (default 1 per request), `--api-max-video-seconds` (600),
-  `--api-max-video-mb` (32 MiB per request, on top of the image allowance; the chat and
-  Responses body limits grow by it only when video is on), `--api-video-decode-timeout`
-  (30 s for one video's probe and decode; past it ffmpeg is killed and the request gets a
-  `400`). A video decodes under the request's one decode slot.
+  most `--api-max-video-frames` (default 16), spread uniformly from 0 s. Each frame enters
+  the prompt where the video was, as `Frame k (t s): ` followed by one image (`Video j frame
+  k (t s): ` when a request has several videos), exactly as if the caller had sent those
+  parts. Frames do not count against `--api-max-images`.
+- Frame size: `detail: "auto"` (the default) fits each frame to
+  `--api-max-video-frame-pixels` (default 448x448), `"low"` to a quarter of that (224x224,
+  never more than the image low-detail budget), the smallest; `"high"` to the larger of that
+  and the image budget (about 1 MP). Aspect ratio is kept.
+- Each frame costs one image's tokens on that family: Gemma 3, 256 per frame plus its
+  markers (16 frames are over 4 K tokens); Qwen3-VL and Qwen3.5 (16x16 patches), about 196
+  for a 448x448 frame; Qwen2.5-VL (14x14 patches), about 256. A video that does not fit the
+  context gets the usual `413` `context_length_exceeded`.
+- Limits, all checked from the container before any frame is decoded:
+  `--api-max-videos` (default 1 per request; 0 turns video off), `--api-max-video-seconds`
+  (600), `--api-max-video-source-pixels` (3840x2160 per source frame), and a fixed work
+  bound of 600 s of 1080p30 per video (frames x pixels, from the stated frame count or
+  duration x frame rate; 60 fps assumed when none is stated), so 4K30 is held to 150 s.
+  `--api-max-video-mb` (32 MiB per request, at most 1024; on top of the image allowance,
+  and the chat and Responses body limits grow by it only when video is on).
+  `--api-video-decode-timeout` (30 s for all of a request's videos; past it ffmpeg is
+  killed and the request gets a `400` asking for a shorter or lower-resolution clip).
+  Videos decode under the request's one decode slot.
+- A clip with more than 32 source frames per sampled frame (past about 16 s at 30 fps) is
+  read with one seek per frame instead of one pass: 60 s of 4K30 takes about 3.6 s instead
+  of 9 s on an M-series Mac. ffmpeg's memory follows the source frame size, about 170 MB at
+  4K; it is not capped otherwise.
 - Decoding needs ffmpeg and ffprobe on the server: `--api-ffmpeg PATH`, else `ffmpeg` on
   `PATH` (ffprobe beside it or on `PATH`). A decode-only LGPL build is enough. ffmpeg runs
-  as a subprocess on a private temp file, restricted to local files, with the container
-  forced. Without ffmpeg a video part is a `400` naming `--api-ffmpeg`, and `/v1/models`
-  does not list `video`.
+  as a subprocess on a private temp file (removed afterwards), restricted to local files,
+  with the container forced. Without ffmpeg a video part is a `400` naming `--api-ffmpeg`,
+  and `/v1/models` does not list `video`.
 - This is frames only. Native temporal video (Qwen's video path, GenAI's video input) is a
   later phase.
 

@@ -275,8 +275,14 @@ pub struct ApiMediaArgs {
     #[arg(long, value_name = "PIXELS")]
     pub api_max_video_frame_pixels: Option<u64>,
 
-    /// Encoded video bytes one request may carry, in MiB (default 32), on
-    /// top of the image and text allowances.
+    /// Largest source frame a video may have, in pixels (default 8294400,
+    /// 3840x2160); larger videos are refused before decoding. Each video is
+    /// also held to 600 s of 1080p30 worth of source pixels.
+    #[arg(long, value_name = "PIXELS")]
+    pub api_max_video_source_pixels: Option<u64>,
+
+    /// Encoded video bytes one request may carry, in MiB (default 32, at
+    /// most 1024), on top of the image and text allowances.
     #[arg(long, value_name = "MIB")]
     pub api_max_video_mb: Option<f64>,
 
@@ -297,6 +303,7 @@ impl ApiMediaArgs {
             api_video_fps,
             api_max_video_seconds,
             api_max_video_frame_pixels,
+            api_max_video_source_pixels,
             api_max_video_mb,
             api_video_decode_timeout,
         } = self;
@@ -306,6 +313,7 @@ impl ApiMediaArgs {
             || api_video_fps.is_some()
             || api_max_video_seconds.is_some()
             || api_max_video_frame_pixels.is_some()
+            || api_max_video_source_pixels.is_some()
             || api_max_video_mb.is_some()
             || api_video_decode_timeout.is_some()
     }
@@ -344,8 +352,18 @@ impl ApiMediaArgs {
             }
             media.max_video_frame_pixels = n;
         }
+        if let Some(n) = self.api_max_video_source_pixels {
+            if n < 4 {
+                return Err(anyhow!("--api-max-video-source-pixels must be at least 4"));
+            }
+            media.max_video_source_pixels = n;
+        }
         if let Some(v) = self.api_max_video_mb {
-            media.max_request_video_bytes = (positive("api-max-video-mb", v)? * 1048576.0) as usize;
+            let v = positive("api-max-video-mb", v)?;
+            if v > 1024.0 {
+                return Err(anyhow!("--api-max-video-mb must be at most 1024, not {v}"));
+            }
+            media.max_request_video_bytes = (v * 1048576.0) as usize;
         }
         if let Some(v) = self.api_video_decode_timeout {
             media.video_decode_timeout =
@@ -4577,6 +4595,8 @@ mod tests {
             "60",
             "--api-max-video-mb",
             "8",
+            "--api-max-video-source-pixels",
+            "2073600",
             "--api-video-decode-timeout",
             "5",
         ])
@@ -4610,6 +4630,7 @@ mod tests {
         assert_eq!(media.video_fps, 2.0);
         assert_eq!(media.max_video_seconds, 60.0);
         assert_eq!(media.max_request_video_bytes, 8 << 20);
+        assert_eq!(media.max_video_source_pixels, 1920 * 1080);
         assert_eq!(media.video_decode_timeout.as_secs(), 5);
         assert_eq!(media.max_videos, 1, "unset flags keep the default");
         assert_eq!(media.max_video_frame_pixels, 448 * 448);
@@ -4629,6 +4650,10 @@ mod tests {
             },
             ApiMediaArgs {
                 api_video_decode_timeout: Some(f64::NAN),
+                ..Default::default()
+            },
+            ApiMediaArgs {
+                api_max_video_mb: Some(1e12),
                 ..Default::default()
             },
         ] {
