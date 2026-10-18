@@ -19,7 +19,7 @@ use cascadia_engine_sparse_moe::{SparseMoEBuilder, SparseMoEBuilderConfig};
 use cascadia_runner::Runner;
 use cascadia_transport::TransportAddr;
 use cascadia_types::{GenerationTask, PeerEndpoint, PeerLayout, ShardSpec};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use futures::StreamExt;
 use tracing::{info, warn};
@@ -225,6 +225,125 @@ pub enum EngineKind {
     Qwen36Moe,
 }
 
+/// Image and video input limits for the API (VLM models only). Unset flags
+/// keep the API's defaults.
+#[derive(Args, Debug, Clone, Default, PartialEq)]
+pub struct ApiMediaArgs {
+    /// ffmpeg binary that decodes `video_url` parts into frames (`ffprobe`
+    /// is taken from the same directory, else from PATH). Default: `ffmpeg`
+    /// on PATH. Without one, video parts get a 400 and `/v1/models` does not
+    /// list `video`. A decode-only LGPL build is enough.
+    #[arg(long, value_name = "PATH")]
+    pub api_ffmpeg: Option<PathBuf>,
+
+    /// Images one request may carry (default 8). A video's frames do not
+    /// count against it.
+    #[arg(long, value_name = "N")]
+    pub api_max_images: Option<usize>,
+
+    /// Videos one request may carry (default 1).
+    #[arg(long, value_name = "N")]
+    pub api_max_videos: Option<usize>,
+
+    /// Frames sampled from one video at most (default 16). Each costs one
+    /// image's tokens.
+    #[arg(long, value_name = "N")]
+    pub api_max_video_frames: Option<usize>,
+
+    /// Frames sampled per second of video before the frame cap spreads them
+    /// out (default 1.0).
+    #[arg(long, value_name = "FPS")]
+    pub api_video_fps: Option<f64>,
+
+    /// Longest video accepted, in seconds (default 600).
+    #[arg(long, value_name = "SECS")]
+    pub api_max_video_seconds: Option<f64>,
+
+    /// Pixel budget of one video frame (default 200704, 448x448); frames are
+    /// scaled to fit, keeping the aspect ratio.
+    #[arg(long, value_name = "PIXELS")]
+    pub api_max_video_frame_pixels: Option<u64>,
+
+    /// Encoded video bytes one request may carry, in MiB (default 32), on
+    /// top of the image and text allowances.
+    #[arg(long, value_name = "MIB")]
+    pub api_max_video_mb: Option<f64>,
+
+    /// Seconds one video's probe and decode may take before ffmpeg is
+    /// killed and the request refused (default 30).
+    #[arg(long, value_name = "SECS")]
+    pub api_video_decode_timeout: Option<f64>,
+}
+
+impl ApiMediaArgs {
+    /// Whether any video flag was given (they do nothing without images).
+    fn any_video_flag(&self) -> bool {
+        let Self {
+            api_ffmpeg,
+            api_max_images: _,
+            api_max_videos,
+            api_max_video_frames,
+            api_video_fps,
+            api_max_video_seconds,
+            api_max_video_frame_pixels,
+            api_max_video_mb,
+            api_video_decode_timeout,
+        } = self;
+        api_ffmpeg.is_some()
+            || api_max_videos.is_some()
+            || api_max_video_frames.is_some()
+            || api_video_fps.is_some()
+            || api_max_video_seconds.is_some()
+            || api_max_video_frame_pixels.is_some()
+            || api_max_video_mb.is_some()
+            || api_video_decode_timeout.is_some()
+    }
+
+    /// Write the given limits over `media`'s defaults, refusing values that
+    /// cannot work.
+    fn apply(&self, media: &mut cascadia_api::MediaConfig) -> Result<()> {
+        let positive = |name: &str, v: f64| {
+            if v.is_finite() && v > 0.0 {
+                Ok(v)
+            } else {
+                Err(anyhow!("--{name} must be a positive number, not {v}"))
+            }
+        };
+        if let Some(n) = self.api_max_images {
+            media.max_images = n;
+        }
+        if let Some(n) = self.api_max_videos {
+            media.max_videos = n;
+        }
+        if let Some(n) = self.api_max_video_frames {
+            if n == 0 {
+                return Err(anyhow!("--api-max-video-frames must be at least 1"));
+            }
+            media.max_video_frames = n;
+        }
+        if let Some(v) = self.api_video_fps {
+            media.video_fps = positive("api-video-fps", v)?;
+        }
+        if let Some(v) = self.api_max_video_seconds {
+            media.max_video_seconds = positive("api-max-video-seconds", v)?;
+        }
+        if let Some(n) = self.api_max_video_frame_pixels {
+            if n < 4 {
+                return Err(anyhow!("--api-max-video-frame-pixels must be at least 4"));
+            }
+            media.max_video_frame_pixels = n;
+        }
+        if let Some(v) = self.api_max_video_mb {
+            media.max_request_video_bytes = (positive("api-max-video-mb", v)? * 1048576.0) as usize;
+        }
+        if let Some(v) = self.api_video_decode_timeout {
+            media.video_decode_timeout =
+                std::time::Duration::from_secs_f64(positive("api-video-decode-timeout", v)?);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Parser, Debug, Clone)]
 pub struct WorkerArgs {
     /// 0-based stage index.
@@ -364,6 +483,9 @@ pub struct WorkerArgs {
     /// most 3 redirects and the request's image byte budget.
     #[arg(long)]
     pub api_allow_image_urls: bool,
+
+    #[command(flatten)]
+    pub api_media: ApiMediaArgs,
 
     /// Device for the `qwen35` vision encoder on rank 0 (e.g. `GPU` for the
     /// iGPU while the stages run on `CPU`). Defaults to `--device`.
@@ -745,6 +867,9 @@ pub struct RunArgs {
     #[arg(long)]
     pub api_allow_image_urls: bool,
 
+    #[command(flatten)]
+    pub api_media: ApiMediaArgs,
+
     /// Device for the `qwen35` vision encoder (e.g. `GPU`). See
     /// `cascadia worker --help`.
     #[arg(long)]
@@ -787,6 +912,7 @@ impl WorkerArgs {
         prefix_cache_gb: Option<f64>,
         api_max_body_mb: f64,
         api_allow_image_urls: bool,
+        api_media: ApiMediaArgs,
         vision_device: Option<String>,
         ep_workers: Vec<String>,
         ep_placement: Option<PathBuf>,
@@ -806,6 +932,7 @@ impl WorkerArgs {
             prefix_cache_gb,
             api_max_body_mb,
             api_allow_image_urls,
+            api_media,
             vision_device,
             ep_workers,
             ep_worker_index: None,
@@ -1103,6 +1230,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         args.prefix_cache_gb,
         args.api_max_body_mb,
         args.api_allow_image_urls,
+        args.api_media,
         args.vision_device,
         args.ep_workers,
         args.ep_placement,
@@ -2484,15 +2612,38 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         };
         if let Some(mut media) = media_kind {
             media.allow_remote_urls = args.api_allow_image_urls;
+            args.api_media.apply(&mut media)?;
+            // Video is served as frames through the image path, decoded by
+            // ffmpeg: on when one is found. A path the operator named must
+            // work; a missing default is one line, not a failure.
+            match (
+                cascadia_api::Ffmpeg::locate(args.api_media.api_ffmpeg.as_deref()),
+                &args.api_media.api_ffmpeg,
+            ) {
+                (Ok(f), _) => media.ffmpeg = Some(f),
+                (Err(why), Some(_)) => return Err(anyhow!("--api-ffmpeg: {why}")),
+                (Err(why), None) => info!(
+                    reason = %why,
+                    "video input off: no ffmpeg found (pass --api-ffmpeg to enable it)"
+                ),
+            }
             info!(
                 max_images = media.max_images,
                 max_image_pixels = media.max_image_pixels,
                 remote_urls = media.allow_remote_urls,
+                video = media.accepts_video(),
+                max_videos = media.max_videos,
+                max_video_frames = media.max_video_frames,
                 "VLM export: accepting image_url content parts"
             );
             cfg.media = Some(media);
-        } else if args.api_allow_image_urls {
-            warn!("--api-allow-image-urls has no effect: this model takes no image input");
+        } else {
+            if args.api_allow_image_urls {
+                warn!("--api-allow-image-urls has no effect: this model takes no image input");
+            }
+            if args.api_media.any_video_flag() || args.api_media.api_max_images.is_some() {
+                warn!("the --api-max-* and video flags have no effect: this model takes no image input");
+            }
         }
         // `CASCADIA_API_MAX_CONCURRENT`: in-flight request cap (backpressure is
         // 503 beyond it). A multi-stream engine serves `CASCADIA_STREAMS` at
@@ -3057,6 +3208,7 @@ mod python_tests {
             None,
             1.0,
             false,
+            ApiMediaArgs::default(),
             None,
             Vec::new(),
             None,
@@ -3504,6 +3656,7 @@ mod ov_property_tests {
             None,
             1.0,
             false,
+            ApiMediaArgs::default(),
             None,
             Vec::new(),
             None,
@@ -4131,6 +4284,7 @@ mod tests {
             args.prefix_cache_gb,
             args.api_max_body_mb,
             args.api_allow_image_urls,
+            args.api_media,
             args.vision_device,
             Vec::new(),
             args.ep_placement,
@@ -4161,11 +4315,91 @@ mod tests {
             args.prefix_cache_gb,
             args.api_max_body_mb,
             args.api_allow_image_urls,
+            args.api_media,
             args.vision_device,
             args.ep_workers,
             args.ep_placement,
         );
         assert!(worker.api_allow_image_urls);
+    }
+
+    /// `run`'s image and video limits reach the worker, and land on the
+    /// API's media settings; unset flags keep the API's defaults.
+    #[test]
+    fn run_forwards_the_media_limits() {
+        let cli = Cli::try_parse_from([
+            "cascadia",
+            "run",
+            "m",
+            "--api-ffmpeg",
+            "/opt/ffmpeg/bin/ffmpeg",
+            "--api-max-images",
+            "32",
+            "--api-max-video-frames",
+            "8",
+            "--api-video-fps",
+            "2",
+            "--api-max-video-seconds",
+            "60",
+            "--api-max-video-mb",
+            "8",
+            "--api-video-decode-timeout",
+            "5",
+        ])
+        .expect("parse run argv");
+        let Command::Run(args) = cli.cmd else {
+            panic!("expected run");
+        };
+        let worker = WorkerArgs::single_node(
+            args.model,
+            args.device,
+            args.engine,
+            args.api,
+            args.prefix_cache_gb,
+            args.api_max_body_mb,
+            args.api_allow_image_urls,
+            args.api_media,
+            args.vision_device,
+            args.ep_workers,
+            args.ep_placement,
+        );
+        let m = &worker.api_media;
+        assert_eq!(
+            m.api_ffmpeg.as_deref(),
+            Some(std::path::Path::new("/opt/ffmpeg/bin/ffmpeg"))
+        );
+        assert!(m.any_video_flag());
+        let mut media = cascadia_api::MediaConfig::ov_genai(None);
+        m.apply(&mut media).unwrap();
+        assert_eq!(media.max_images, 32);
+        assert_eq!(media.max_video_frames, 8);
+        assert_eq!(media.video_fps, 2.0);
+        assert_eq!(media.max_video_seconds, 60.0);
+        assert_eq!(media.max_request_video_bytes, 8 << 20);
+        assert_eq!(media.video_decode_timeout.as_secs(), 5);
+        assert_eq!(media.max_videos, 1, "unset flags keep the default");
+        assert_eq!(media.max_video_frame_pixels, 448 * 448);
+
+        let mut media = cascadia_api::MediaConfig::ov_genai(None);
+        ApiMediaArgs::default().apply(&mut media).unwrap();
+        assert_eq!(media.max_images, 8);
+        assert!(!ApiMediaArgs::default().any_video_flag());
+        for bad in [
+            ApiMediaArgs {
+                api_video_fps: Some(0.0),
+                ..Default::default()
+            },
+            ApiMediaArgs {
+                api_max_video_frames: Some(0),
+                ..Default::default()
+            },
+            ApiMediaArgs {
+                api_video_decode_timeout: Some(f64::NAN),
+                ..Default::default()
+            },
+        ] {
+            assert!(bad.apply(&mut media).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -4193,6 +4427,7 @@ mod tests {
             args.prefix_cache_gb,
             args.api_max_body_mb,
             args.api_allow_image_urls,
+            args.api_media,
             args.vision_device,
             args.ep_workers,
             args.ep_placement,
