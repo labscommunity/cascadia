@@ -11,8 +11,10 @@
 //!
 //! ffmpeg reads only a private temp file (`-protocol_whitelist file`), with
 //! the container forced to the one the bytes start with (MP4/MOV or
-//! Matroska/WebM), under one deadline, with its output capped and the child
-//! killed when the request goes away (`kill_on_drop`).
+//! Matroska/WebM), under one deadline per request, with its output capped
+//! and the child killed when the request goes away (`kill_on_drop`). The
+//! probe bounds the work before any decode: source frame size, duration, and
+//! frames x pixels; long clips are read with one seek per sampled frame.
 
 use std::ffi::OsString;
 use std::io::Write as _;
@@ -40,6 +42,14 @@ impl Ffmpeg {
         let exe = |name: &str| format!("{name}{}", std::env::consts::EXE_SUFFIX);
         let ffmpeg = match explicit {
             Some(p) if is_executable(p) => p.to_path_buf(),
+            // `C:\ffmpeg\bin\ffmpeg` names `ffmpeg.exe` on Windows.
+            Some(p)
+                if cfg!(windows)
+                    && p.extension().is_none()
+                    && is_executable(&p.with_extension("exe")) =>
+            {
+                p.with_extension("exe")
+            }
             Some(p) => return Err(format!("`{}` is not an executable file", p.display())),
             None => find_on_path(&exe("ffmpeg")).ok_or("no `ffmpeg` on PATH")?,
         };
@@ -170,13 +180,26 @@ impl Container {
 /// demuxer's and Matroska's.
 const CONTAINER_NAMES: [&str; 8] = ["mov", "mp4", "m4a", "3gp", "3g2", "mj2", "matroska", "webm"];
 
-/// What the probe found: the duration and the frame size as displayed (a
-/// rotated phone video's sides swapped, as ffmpeg's autorotate outputs it).
+/// What the probe found: the duration when the container states one, the
+/// frame size as displayed (a rotated phone video's sides swapped, as
+/// ffmpeg's autorotate outputs it), and the frame rate and count when known.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Probe {
+    pub duration: Option<f64>,
+    pub width: u32,
+    pub height: u32,
+    pub frame_rate: Option<f64>,
+    pub nb_frames: Option<u64>,
+}
+
+/// A probed video within every bound, its duration known.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Video {
     pub duration: f64,
     pub width: u32,
     pub height: u32,
+    /// Frames the source holds, as far as the container says.
+    pub source_frames: f64,
 }
 
 #[derive(Deserialize)]
@@ -192,6 +215,9 @@ struct ProbeStream {
     width: Option<u32>,
     height: Option<u32>,
     duration: Option<String>,
+    avg_frame_rate: Option<String>,
+    r_frame_rate: Option<String>,
+    nb_frames: Option<String>,
     #[serde(default)]
     side_data_list: Vec<ProbeSideData>,
 }
@@ -207,10 +233,20 @@ struct ProbeFormat {
     duration: Option<String>,
 }
 
+/// The frame rate the work bound assumes when the container states none.
+const ASSUMED_FPS: f64 = 60.0;
+
+/// ffprobe's `num/den` rate (`30000/1001`); `0/0` is unknown.
+fn parse_rate(r: &str) -> Option<f64> {
+    let (n, d) = r.split_once('/').unwrap_or((r, "1"));
+    let rate = n.trim().parse::<f64>().ok()? / d.trim().parse::<f64>().ok()?;
+    (rate.is_finite() && rate > 0.0).then_some(rate)
+}
+
 /// Read ffprobe's JSON and refuse, before any frame is decoded, a video
 /// this server will not decode: no video stream, a container outside
-/// [`CONTAINER_NAMES`], no known duration or one past
-/// [`MediaConfig::max_video_seconds`], or frames past the image size caps.
+/// [`CONTAINER_NAMES`], or frames past [`MediaConfig::max_video_source_pixels`].
+/// Its length is checked once it is known ([`Probe::bounded`]).
 pub fn parse_probe(json: &[u8], cfg: &MediaConfig) -> Result<Probe, String> {
     let p: ProbeJson =
         serde_json::from_slice(json).map_err(|_| "could not read the video".to_string())?;
@@ -230,23 +266,15 @@ pub fn parse_probe(json: &[u8], cfg: &MediaConfig) -> Result<Probe, String> {
         d.and_then(|d| d.parse::<f64>().ok())
             .filter(|d| d.is_finite() && *d > 0.0)
     };
-    let duration = secs(format.duration)
-        .or_else(|| secs(stream.duration))
-        .ok_or("the video's duration is unknown")?;
-    if duration > cfg.max_video_seconds {
-        return Err(format!(
-            "video is {duration:.1} s long; the limit is {} s",
-            cfg.max_video_seconds
-        ));
-    }
+    let duration = secs(format.duration).or_else(|| secs(stream.duration));
     let (mut w, mut h) = (stream.width.unwrap_or(0), stream.height.unwrap_or(0));
     if w == 0 || h == 0 {
         return Err("the video's frames have no pixels".into());
     }
-    if w > MAX_SIDE || h > MAX_SIDE || u64::from(w) * u64::from(h) > cfg.max_source_pixels {
+    if w > MAX_SIDE || h > MAX_SIDE || u64::from(w) * u64::from(h) > cfg.max_video_source_pixels {
         return Err(format!(
-            "video is {w}x{h}; the limit is {MAX_SIDE} pixels a side and {} pixels a frame",
-            cfg.max_source_pixels
+            "video is {w}x{h}; the limit is {} pixels a frame; send a lower-resolution clip",
+            cfg.max_video_source_pixels
         ));
     }
     if w.max(h) > MAX_ASPECT * w.min(h) {
@@ -262,40 +290,103 @@ pub fn parse_probe(json: &[u8], cfg: &MediaConfig) -> Result<Probe, String> {
     if quarter_turn {
         std::mem::swap(&mut w, &mut h);
     }
+    let frame_rate = [stream.avg_frame_rate, stream.r_frame_rate]
+        .into_iter()
+        .flatten()
+        .find_map(|r| parse_rate(&r));
     Ok(Probe {
         duration,
         width: w,
         height: h,
+        frame_rate,
+        nb_frames: stream.nb_frames.and_then(|n| n.parse().ok()),
     })
 }
 
+impl Probe {
+    /// Refuse a video longer than [`MediaConfig::max_video_seconds`], or one
+    /// whose frames would make the decoder produce more than
+    /// [`MediaConfig::max_video_decode_pixels`] source pixels (its stated
+    /// frame count or duration x frame rate, whichever is larger).
+    pub fn bounded(&self, duration: f64, cfg: &MediaConfig) -> Result<Video, String> {
+        if duration > cfg.max_video_seconds {
+            return Err(format!(
+                "video is {duration:.1} s long; the limit is {} s",
+                cfg.max_video_seconds
+            ));
+        }
+        let by_rate = duration * self.frame_rate.unwrap_or(ASSUMED_FPS);
+        let source_frames = by_rate.max(self.nb_frames.unwrap_or(0) as f64);
+        let (w, h) = (self.width, self.height);
+        let work = source_frames * f64::from(w) * f64::from(h);
+        if work > cfg.max_video_decode_pixels as f64 {
+            return Err(format!(
+                "video is {w}x{h} with about {source_frames:.0} frames; this server decodes at \
+                 most {} source pixels a video (600 s of 1080p30 by default); send a shorter or \
+                 lower-resolution clip",
+                cfg.max_video_decode_pixels
+            ));
+        }
+        Ok(Video {
+            duration,
+            width: w,
+            height: h,
+            source_frames,
+        })
+    }
+}
+
+/// A video's duration from a packet scan ([`packet_args`]), for a container
+/// that states none (WebM written to a pipe, as browsers' MediaRecorder
+/// does): the last packet's time plus one frame.
+pub fn duration_from_packets(csv: &[u8], frame_rate: Option<f64>) -> Option<f64> {
+    let last = String::from_utf8_lossy(csv)
+        .lines()
+        .filter_map(|l| l.trim().trim_end_matches(',').parse::<f64>().ok())
+        .filter(|t| t.is_finite())
+        .fold(None, |m: Option<f64>, t| Some(m.map_or(t, |m| m.max(t))))?;
+    let d = last + frame_rate.map_or(0.0, |r| 1.0 / r);
+    (d.is_finite() && d > 0.0).then_some(d)
+}
+
+/// Sampled frames whose sources hold more than this many frames each are
+/// read with one seek per frame instead of one pass over the whole video:
+/// a long or high-rate clip then costs a few GOPs per frame, not every
+/// frame it has (60 s of 4K30 on an M-series Mac: 9 s in one pass, 3.6 s
+/// with 16 seeks).
+const SEEK_RATIO: f64 = 32.0;
+
 /// How a probed video is sampled: `frames` frames, uniform over its
-/// duration from 0, each `width x height` RGB.
+/// duration from 0, each `width x height` RGB, in one pass or by `seek`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Plan {
     pub frames: usize,
     pub width: u32,
     pub height: u32,
     pub duration: f64,
+    pub seek: bool,
 }
 
 impl Plan {
     /// `ceil(duration * video_fps)` frames, at least 1 and at most
     /// [`MediaConfig::max_video_frames`], each fit to the `detail` budget
-    /// keeping the aspect ratio, with even sides.
-    pub fn new(probe: &Probe, detail: Option<&str>, cfg: &MediaConfig) -> Self {
-        let wanted = (probe.duration * cfg.video_fps).ceil();
+    /// keeping the aspect ratio, with even sides. `low` is the smallest
+    /// budget (a quarter of the frame budget, at most the image low-detail
+    /// one), `high` the largest.
+    pub fn new(video: &Video, detail: Option<&str>, cfg: &MediaConfig) -> Self {
+        let wanted = (video.duration * cfg.video_fps).ceil();
         let frames = if wanted.is_finite() && wanted >= 1.0 {
             (wanted as usize).min(cfg.max_video_frames.max(1))
         } else {
             1
         };
+        let auto = cfg.max_video_frame_pixels;
         let budget = match detail {
-            Some("low") => cfg.low_detail_pixels,
-            Some("high") => cfg.max_image_pixels,
-            _ => cfg.max_video_frame_pixels,
+            Some("low") => cfg.low_detail_pixels.min(auto / 4).max(4),
+            Some("high") => cfg.max_image_pixels.max(auto),
+            _ => auto,
         };
-        let (w, h) = (probe.width, probe.height);
+        let (w, h) = (video.width, video.height);
         let (w, h) = if u64::from(w) * u64::from(h) > budget {
             media::downscaled_size(w, h, budget)
         } else {
@@ -306,7 +397,8 @@ impl Plan {
             frames,
             width: even(w),
             height: even(h),
-            duration: probe.duration,
+            duration: video.duration,
+            seek: video.source_frames > SEEK_RATIO * frames as f64,
         }
     }
 
@@ -326,16 +418,31 @@ impl Plan {
 }
 
 /// The text a frame's image placeholder follows in the prompt; `k` counts
-/// from 1.
-pub fn frame_label(k: usize, secs: f64) -> String {
-    format!("Frame {k} ({secs:.1}s): ")
+/// from 1, and so does `video` (named only when a request has several).
+pub fn frame_label(video: Option<usize>, k: usize, secs: f64) -> String {
+    match video {
+        Some(j) => format!("Video {j} frame {k} ({secs:.1}s): "),
+        None => format!("Frame {k} ({secs:.1}s): "),
+    }
+}
+
+/// `file:` and the path: ffmpeg reads it as a local file whatever it looks
+/// like (a `C:` drive is not a protocol).
+fn file_url(file: &Path) -> OsString {
+    let mut url = OsString::from("file:");
+    url.push(file);
+    url
+}
+
+fn args(list: &[&str]) -> Vec<OsString> {
+    list.iter().map(OsString::from).collect()
 }
 
 /// ffprobe's arguments: the container forced, local files only, and only the
 /// fields [`parse_probe`] reads (no tags, so a caller cannot bloat the
 /// output). `V` skips cover art.
 pub fn probe_args(container: Container, file: &Path) -> Vec<OsString> {
-    let mut args: Vec<OsString> = [
+    let mut a = args(&[
         "-v",
         "error",
         "-protocol_whitelist",
@@ -347,19 +454,39 @@ pub fn probe_args(container: Container, file: &Path) -> Vec<OsString> {
         "-select_streams",
         "V:0",
         "-show_entries",
-        "format=format_name,duration:stream=codec_type,width,height,duration\
+        "format=format_name,duration\
+         :stream=codec_type,width,height,duration,avg_frame_rate,r_frame_rate,nb_frames\
          :stream_side_data=rotation",
-    ]
-    .map(OsString::from)
-    .to_vec();
-    args.push(file.into());
-    args
+    ]);
+    a.push(file_url(file));
+    a
 }
 
-/// ffmpeg's arguments: one run that samples `plan.frames` frames, scales
-/// them and writes raw RGB to stdout. No audio, subtitle or data streams.
-pub fn decode_args(container: Container, file: &Path, plan: &Plan) -> Vec<OsString> {
-    let mut args: Vec<OsString> = [
+/// ffprobe's arguments for a packet scan: each video packet's time, one per
+/// line (demuxing only, no decode).
+pub fn packet_args(container: Container, file: &Path) -> Vec<OsString> {
+    let mut a = args(&[
+        "-v",
+        "error",
+        "-protocol_whitelist",
+        "file",
+        "-f",
+        container.demuxer(),
+        "-select_streams",
+        "V:0",
+        "-show_entries",
+        "packet=pts_time",
+        "-of",
+        "csv=p=0",
+    ]);
+    a.push(file_url(file));
+    a
+}
+
+/// The input half of a decode: quiet, local files only, two threads, the
+/// container forced, and (`seek`) a fast seek to `seek` seconds first.
+fn input_args(container: Container, file: &Path, seek: Option<f64>) -> Vec<OsString> {
+    let mut a = args(&[
         "-nostdin",
         "-hide_banner",
         "-loglevel",
@@ -368,35 +495,53 @@ pub fn decode_args(container: Container, file: &Path, plan: &Plan) -> Vec<OsStri
         "file",
         "-threads",
         "2",
+    ]);
+    if let Some(t) = seek {
+        a.extend(args(&["-ss", &format!("{t:.6}")]));
+    }
+    a.extend(args(&["-f", container.demuxer(), "-i"]));
+    a.push(file_url(file));
+    a
+}
+
+/// The output half: the first non-cover-art video stream, `filter`, at most
+/// `frames` frames of raw RGB to stdout. No audio, subtitle or data streams.
+fn output_args(filter: &str, frames: usize) -> Vec<OsString> {
+    args(&[
+        "-map",
+        "0:V:0",
+        "-an",
+        "-sn",
+        "-dn",
+        "-vf",
+        filter,
+        "-frames:v",
+        &frames.to_string(),
         "-f",
-        container.demuxer(),
-        "-i",
-    ]
-    .map(OsString::from)
-    .to_vec();
-    args.push(file.into());
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "pipe:1",
+    ])
+}
+
+/// ffmpeg's arguments for one pass that samples `plan.frames` frames.
+pub fn decode_args(container: Container, file: &Path, plan: &Plan) -> Vec<OsString> {
+    let mut a = input_args(container, file, None);
     let filter = format!("fps={:.9},scale={}:{}", plan.fps(), plan.width, plan.height);
-    let frames = plan.frames.to_string();
-    args.extend(
-        [
-            "-map",
-            "0:V:0",
-            "-an",
-            "-sn",
-            "-dn",
-            "-vf",
-            &filter,
-            "-frames:v",
-            &frames,
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "pipe:1",
-        ]
-        .map(OsString::from),
-    );
-    args
+    a.extend(output_args(&filter, plan.frames));
+    a
+}
+
+/// ffmpeg's arguments for frame `k` alone, sought to its time (accurate:
+/// ffmpeg decodes from the keyframe before it up to the time).
+pub fn seek_args(container: Container, file: &Path, plan: &Plan, k: usize) -> Vec<OsString> {
+    let mut a = input_args(container, file, Some(plan.timestamp(k)));
+    a.extend(output_args(
+        &format!("scale={}:{}", plan.width, plan.height),
+        1,
+    ));
+    a
 }
 
 /// A video refused for the caller's reasons (400), or one this server failed
@@ -415,16 +560,65 @@ pub struct Frame {
 
 /// Bytes of ffprobe JSON read at most; the requested fields fit in far less.
 const MAX_PROBE_OUTPUT: usize = 64 << 10;
+/// Bytes of packet times read at most: about 300 000 packets, far past
+/// 600 s at any real frame rate.
+const MAX_PACKET_SCAN: usize = 4 << 20;
 /// ffmpeg's stderr kept for the log.
 const STDERR_KEPT: usize = 2048;
 
-/// Probe, bound and decode one encoded video into its sampled frames. The
-/// probe and the decode share one deadline
-/// ([`MediaConfig::video_decode_timeout`]).
+/// The caller's video on disk for ffmpeg, removed on drop. Removal is
+/// retried off-thread when it fails: on Windows a decoder killed as the
+/// request is dropped may still hold the file open for a moment.
+struct TempVideo(PathBuf);
+
+impl TempVideo {
+    fn write(bytes: &[u8], dir: Option<&Path>) -> std::io::Result<Self> {
+        let mut b = tempfile::Builder::new();
+        b.prefix("cascadia-video-");
+        let mut f = match dir {
+            Some(d) => b.tempfile_in(d)?,
+            None => b.tempfile()?,
+        };
+        f.write_all(bytes)?;
+        f.flush()?;
+        // Our handle closes here; ffmpeg's is then the only one.
+        let path = f.into_temp_path().keep().map_err(|e| e.error)?;
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempVideo {
+    fn drop(&mut self) {
+        let path = std::mem::take(&mut self.0);
+        let gone = |r: std::io::Result<()>| {
+            r.is_ok() || r.is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        };
+        if gone(std::fs::remove_file(&path)) {
+            return;
+        }
+        std::thread::spawn(move || {
+            for _ in 0..50 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if gone(std::fs::remove_file(&path)) {
+                    return;
+                }
+            }
+            tracing::warn!(path = %path.display(), "could not remove a video temp file");
+        });
+    }
+}
+
+/// Probe, bound and decode one encoded video into its sampled frames, by
+/// `deadline` (one per request, shared by its videos).
 pub async fn decode_video(
     bytes: Vec<u8>,
     detail: Option<&str>,
     cfg: &MediaConfig,
+    deadline: Instant,
 ) -> Result<Vec<Frame>, VideoError> {
     let tools = cfg
         .ffmpeg
@@ -436,34 +630,38 @@ pub async fn decode_video(
             "the data is not a video this server decodes; {SUPPORTED}"
         ))
     })?;
-    let deadline = Instant::now() + cfg.video_decode_timeout;
     let timed_out = || {
         VideoError::Invalid(format!(
-            "decoding the video took longer than {} s",
+            "decoding this request's videos took longer than {} s; send a shorter or \
+             lower-resolution clip",
             cfg.video_decode_timeout.as_secs_f32()
         ))
     };
+    let run = |program: &Path, args: Vec<OsString>, cap: usize| {
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args);
+        async move {
+            match run_bounded(cmd, cap, deadline).await {
+                Ok(o) => Ok(o),
+                Err(RunError::TimedOut) => Err(timed_out()),
+                Err(e) => Err(e.into_video_error()),
+            }
+        }
+    };
     // mp4 often needs seeking (its index may sit at the end), so ffmpeg reads
     // a file, not a pipe. Private to this user; removed on drop.
-    let file = tokio::task::spawn_blocking(move || {
-        let mut f = tempfile::Builder::new()
-            .prefix("cascadia-video-")
-            .tempfile()?;
-        f.write_all(&bytes)?;
-        f.flush()?;
-        Ok::<_, std::io::Error>(f)
-    })
-    .await
-    .map_err(|e| VideoError::Internal(format!("video temp file task failed: {e}")))?
-    .map_err(|e| VideoError::Internal(format!("could not write the video temp file: {e}")))?;
+    let dir = cfg.video_temp_dir.clone();
+    let file = tokio::task::spawn_blocking(move || TempVideo::write(&bytes, dir.as_deref()))
+        .await
+        .map_err(|e| VideoError::Internal(format!("video temp file task failed: {e}")))?
+        .map_err(|e| VideoError::Internal(format!("could not write the video temp file: {e}")))?;
 
-    let mut probe = tokio::process::Command::new(&tools.ffprobe);
-    probe.args(probe_args(container, file.path()));
-    let out = match run_bounded(probe, MAX_PROBE_OUTPUT, deadline).await {
-        Ok(o) => o,
-        Err(RunError::TimedOut) => return Err(timed_out()),
-        Err(e) => return Err(e.into_video_error("ffprobe")),
-    };
+    let out = run(
+        &tools.ffprobe,
+        probe_args(container, file.path()),
+        MAX_PROBE_OUTPUT,
+    )
+    .await?;
     if !out.status.success() {
         tracing::warn!(status = %out.status, stderr = %out.stderr, "ffprobe refused a video");
         return Err(VideoError::Invalid(format!(
@@ -471,28 +669,73 @@ pub async fn decode_video(
         )));
     }
     let probed = parse_probe(&out.stdout, cfg).map_err(VideoError::Invalid)?;
-    let plan = Plan::new(&probed, detail, cfg);
-
-    let mut decode = tokio::process::Command::new(&tools.ffmpeg);
-    decode.args(decode_args(container, file.path(), &plan));
-    let out = match run_bounded(decode, plan.frames * plan.frame_bytes(), deadline).await {
-        Ok(o) => o,
-        Err(RunError::TimedOut) => return Err(timed_out()),
-        Err(e) => return Err(e.into_video_error("ffmpeg")),
+    let duration = match probed.duration {
+        Some(d) => d,
+        None => {
+            let mut scan = tokio::process::Command::new(&tools.ffprobe);
+            scan.args(packet_args(container, file.path()));
+            let out = match run_bounded(scan, MAX_PACKET_SCAN, deadline).await {
+                Ok(o) => o,
+                Err(RunError::TimedOut) => return Err(timed_out()),
+                Err(RunError::TooMuchOutput) => {
+                    return Err(VideoError::Invalid(
+                        "the video states no duration and has too many packets to scan".into(),
+                    ))
+                }
+                Err(e) => return Err(e.into_video_error()),
+            };
+            duration_from_packets(&out.stdout, probed.frame_rate)
+                .filter(|_| out.status.success())
+                .ok_or_else(|| VideoError::Invalid("the video's duration is unknown".into()))?
+        }
     };
-    drop(file);
-    if !out.status.success() {
-        tracing::warn!(status = %out.status, stderr = %out.stderr, "ffmpeg failed to decode a video");
-        return Err(VideoError::Invalid("could not decode the video".into()));
+    let video = probed.bounded(duration, cfg).map_err(VideoError::Invalid)?;
+    let plan = Plan::new(&video, detail, cfg);
+
+    let fb = plan.frame_bytes();
+    let mut raw: Vec<(Vec<u8>, f64)> = Vec::with_capacity(plan.frames);
+    if plan.seek {
+        for k in 0..plan.frames {
+            let out = run(
+                &tools.ffmpeg,
+                seek_args(container, file.path(), &plan, k),
+                fb,
+            )
+            .await?;
+            if !out.status.success() {
+                tracing::warn!(status = %out.status, stderr = %out.stderr, "ffmpeg failed to decode a video");
+                return Err(VideoError::Invalid("could not decode the video".into()));
+            }
+            // A time past the last frame gives nothing; the rest still count.
+            if out.stdout.len() == fb {
+                raw.push((out.stdout, plan.timestamp(k)));
+            }
+        }
+    } else {
+        let out = run(
+            &tools.ffmpeg,
+            decode_args(container, file.path(), &plan),
+            plan.frames * fb,
+        )
+        .await?;
+        if !out.status.success() {
+            tracing::warn!(status = %out.status, stderr = %out.stderr, "ffmpeg failed to decode a video");
+            return Err(VideoError::Invalid("could not decode the video".into()));
+        }
+        raw.extend(
+            out.stdout
+                .chunks_exact(fb)
+                .enumerate()
+                .map(|(k, f)| (f.to_vec(), plan.timestamp(k))),
+        );
     }
+    drop(file);
     // Hashing a few MB of pixels is blocking-pool work, as an image decode is.
     let frames = tokio::task::spawn_blocking(move || {
-        out.stdout
-            .chunks_exact(plan.frame_bytes())
-            .enumerate()
-            .map(|(k, raw)| Frame {
-                input: media::rgb_image(plan.width, plan.height, raw.to_vec()),
-                secs: plan.timestamp(k),
+        raw.into_iter()
+            .map(|(f, secs)| Frame {
+                input: media::rgb_image(plan.width, plan.height, f),
+                secs,
             })
             .collect::<Vec<_>>()
     })
@@ -520,15 +763,15 @@ enum RunError {
 }
 
 impl RunError {
-    fn into_video_error(self, tool: &str) -> VideoError {
+    fn into_video_error(self) -> VideoError {
         match self {
             RunError::TimedOut => unreachable!("handled by the caller"),
             RunError::TooMuchOutput => {
-                tracing::warn!(tool, "video decoder wrote more than its output cap; killed");
+                tracing::warn!("video decoder wrote more than its output cap; killed");
                 VideoError::Invalid("could not decode the video".into())
             }
             RunError::Io(e) => {
-                tracing::error!(tool, error = %e, "could not run the video decoder");
+                tracing::error!(error = %e, "could not run the video decoder");
                 VideoError::Internal("video decoding failed".into())
             }
         }
@@ -548,6 +791,8 @@ async fn run_bounded(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     let mut child = cmd.spawn().map_err(RunError::Io)?;
+    #[cfg(test)]
+    tests::SPAWNED.with(|s| s.borrow_mut().extend(child.id()));
     let mut stdout = child.stdout.take().expect("stdout is piped");
     let mut stderr = child.stderr.take().expect("stderr is piped");
     let run = async {
@@ -603,7 +848,8 @@ mod tests {
 
     fn probe_json(format_name: &str, duration: Option<&str>, w: u32, h: u32) -> Vec<u8> {
         let mut v = serde_json::json!({
-            "streams": [{"codec_type": "video", "width": w, "height": h}],
+            "streams": [{"codec_type": "video", "width": w, "height": h,
+                "avg_frame_rate": "30/1"}],
             "format": {"format_name": format_name},
         });
         if let Some(d) = duration {
@@ -612,11 +858,13 @@ mod tests {
         v.to_string().into_bytes()
     }
 
-    fn probe(duration: f64, width: u32, height: u32) -> Probe {
-        Probe {
+    /// A bounded video of `duration` s at 30 fps.
+    fn probe(duration: f64, width: u32, height: u32) -> Video {
+        Video {
             duration,
             width,
             height,
+            source_frames: duration * 30.0,
         }
     }
 
@@ -644,34 +892,58 @@ mod tests {
         let mut fast = MediaConfig::ov_genai(None);
         fast.video_fps = 2.0;
         assert_eq!(Plan::new(&probe(3.0, 320, 240), None, &fast).frames, 6);
-        assert_eq!(frame_label(2, 1.04), "Frame 2 (1.0s): ");
+        assert_eq!(frame_label(None, 2, 1.04), "Frame 2 (1.0s): ");
+        assert_eq!(frame_label(Some(2), 1, 0.0), "Video 2 frame 1 (0.0s): ");
+    }
+
+    /// Short clips decode in one pass; one whose source holds many frames
+    /// per sampled frame is read by seeking.
+    #[test]
+    fn long_clips_are_read_by_seeking() {
+        let cfg = MediaConfig::ov_genai(None);
+        // 3 s at 30 fps: 90 source frames for 3 samples.
+        assert!(!Plan::new(&probe(3.0, 320, 240), None, &cfg).seek);
+        // 16 s: 480 for 16, still one pass.
+        assert!(!Plan::new(&probe(16.0, 320, 240), None, &cfg).seek);
+        // 60 s: 1800 for 16.
+        assert!(Plan::new(&probe(60.0, 320, 240), None, &cfg).seek);
     }
 
     /// Frames fit the detail's pixel budget, keep the aspect ratio and have
-    /// even sides.
+    /// even sides; `low` is the smallest budget and `high` the largest.
     #[test]
     fn frame_size_follows_detail_with_even_sides() {
         let mut cfg = MediaConfig::ov_genai(None);
         let hd = probe(1.0, 1920, 1080);
-        for (detail, budget) in [
-            (None, cfg.max_video_frame_pixels),
-            (Some("auto"), cfg.max_video_frame_pixels),
-            (Some("low"), cfg.low_detail_pixels),
-            (Some("high"), cfg.max_image_pixels),
-        ] {
+        let mut sizes = Vec::new();
+        for detail in [Some("low"), None, Some("auto"), Some("high")] {
             let p = Plan::new(&hd, detail, &cfg);
-            assert!(u64::from(p.width) * u64::from(p.height) <= budget, "{p:?}");
             assert_eq!((p.width % 2, p.height % 2), (0, 0), "{p:?}");
             let ratio = f64::from(p.width) / f64::from(p.height);
             assert!((ratio - 16.0 / 9.0).abs() < 0.02, "{detail:?}: {p:?}");
+            sizes.push(u64::from(p.width) * u64::from(p.height));
         }
+        assert!(sizes[0] <= cfg.max_video_frame_pixels / 4, "{sizes:?}");
+        assert!(
+            sizes[0] < sizes[1] && sizes[1] == sizes[2] && sizes[2] < sizes[3],
+            "{sizes:?}"
+        );
+        assert!(sizes[1] <= cfg.max_video_frame_pixels && sizes[3] <= cfg.max_image_pixels);
         let p = Plan::new(&hd, None, &cfg);
         assert_eq!((p.width, p.height), (596, 336));
+        // The order holds whatever the operator sets: a frame budget past
+        // the image one makes `high` that budget, and `low` stays under it.
+        cfg.max_video_frame_pixels = 2 << 20;
+        let [low, auto, high] =
+            [Some("low"), None, Some("high")].map(|d| Plan::new(&hd, d, &cfg).width);
+        assert!(low <= auto && auto <= high, "{low} {auto} {high}");
         // Under the budget the size is kept, rounded down to even.
+        let cfg = MediaConfig::ov_genai(None);
         let p = Plan::new(&probe(1.0, 321, 241), None, &cfg);
         assert_eq!((p.width, p.height), (320, 240));
-        cfg.max_video_frame_pixels = 4;
-        let p = Plan::new(&probe(1.0, 3, 3), None, &cfg);
+        let mut tiny = MediaConfig::ov_genai(None);
+        tiny.max_video_frame_pixels = 4;
+        let p = Plan::new(&probe(1.0, 3, 3), None, &tiny);
         assert_eq!((p.width, p.height), (2, 2));
     }
 
@@ -679,105 +951,147 @@ mod tests {
     fn probe_json_is_read_and_bounded() {
         let cfg = MediaConfig::ov_genai(None);
         let mp4 = "mov,mp4,m4a,3gp,3g2,mj2";
+        let p = parse_probe(&probe_json(mp4, Some("3.000000"), 320, 240), &cfg).unwrap();
         assert_eq!(
-            parse_probe(&probe_json(mp4, Some("3.000000"), 320, 240), &cfg).unwrap(),
-            probe(3.0, 320, 240)
+            (p.duration, p.width, p.height, p.frame_rate),
+            (Some(3.0), 320, 240, Some(30.0))
         );
         assert_eq!(
-            parse_probe(&probe_json("matroska,webm", Some("2.5"), 64, 48), &cfg).unwrap(),
-            probe(2.5, 64, 48)
+            p.bounded(3.0, &cfg).unwrap(),
+            Video {
+                duration: 3.0,
+                width: 320,
+                height: 240,
+                source_frames: 90.0
+            }
         );
-        // A quarter turn swaps the sides, as ffmpeg's autorotate does.
+        let p = parse_probe(&probe_json("matroska,webm", None, 64, 48), &cfg).unwrap();
+        assert_eq!(p.duration, None, "a streamed WebM states none");
+        // A quarter turn swaps the sides, as ffmpeg's autorotate does; the
+        // stream's duration stands in for the container's; `0/0` is no rate.
         let rotated = serde_json::json!({
             "streams": [{"codec_type": "video", "width": 320, "height": 240,
-                "duration": "3.000000", "side_data_list": [{"rotation": -90}]}],
+                "duration": "3.000000", "avg_frame_rate": "0/0", "r_frame_rate": "30000/1001",
+                "nb_frames": "120", "side_data_list": [{"rotation": -90}]}],
             "format": {"format_name": mp4},
         });
-        assert_eq!(
-            parse_probe(rotated.to_string().as_bytes(), &cfg).unwrap(),
-            probe(3.0, 240, 320),
-            "the stream's duration stands in for the container's"
-        );
-        let mut short = MediaConfig::ov_genai(None);
-        short.max_video_seconds = 2.0;
+        let p = parse_probe(rotated.to_string().as_bytes(), &cfg).unwrap();
+        assert_eq!((p.duration, p.width, p.height), (Some(3.0), 240, 320));
+        assert!((p.frame_rate.unwrap() - 29.97).abs() < 0.01);
+        // The larger of the stated count and duration x rate counts.
+        assert_eq!(p.bounded(3.0, &cfg).unwrap().source_frames, 120.0);
+
         let none = br#"{"streams": [], "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration": "1"}}"#;
-        for (json, cfg, needle) in [
-            (none.to_vec(), &cfg, "no video stream"),
-            (
-                probe_json("hls", Some("3"), 320, 240),
-                &cfg,
-                "container `hls`",
-            ),
+        for (json, needle) in [
+            (none.to_vec(), "no video stream"),
+            (probe_json("hls", Some("3"), 320, 240), "container `hls`"),
             (
                 probe_json("concat", Some("3"), 320, 240),
-                &cfg,
                 "container `concat`",
             ),
-            (
-                probe_json("image2", Some("3"), 320, 240),
-                &cfg,
-                "not supported",
-            ),
+            (probe_json("image2", Some("3"), 320, 240), "not supported"),
             (
                 probe_json("mov,mp4,lavfi", Some("3"), 320, 240),
-                &cfg,
                 "not supported",
             ),
-            (probe_json(mp4, None, 320, 240), &cfg, "duration is unknown"),
+            // 7000x7000 is under the image cap (50 MP) but over the video one.
             (
-                probe_json(mp4, Some("0.000000"), 320, 240),
-                &cfg,
-                "duration is unknown",
+                probe_json(mp4, Some("3"), 7000, 7000),
+                "8294400 pixels a frame",
             ),
-            (
-                probe_json(mp4, Some("N/A"), 320, 240),
-                &cfg,
-                "duration is unknown",
-            ),
-            (
-                probe_json(mp4, Some("3"), 320, 240),
-                &short,
-                "3.0 s long; the limit is 2 s",
-            ),
-            (
-                probe_json(mp4, Some("3"), 10_000, 10_000),
-                &cfg,
-                "pixels a frame",
-            ),
-            (probe_json(mp4, Some("3"), 0, 240), &cfg, "no pixels"),
-            (probe_json(mp4, Some("3"), 4000, 10), &cfg, "aspect ratio"),
-            (b"not json".to_vec(), &cfg, "could not read the video"),
+            (probe_json(mp4, Some("3"), 0, 240), "no pixels"),
+            (probe_json(mp4, Some("3"), 4000, 10), "aspect ratio"),
+            (b"not json".to_vec(), "could not read the video"),
         ] {
-            let err = parse_probe(&json, cfg).unwrap_err();
+            let err = parse_probe(&json, &cfg).unwrap_err();
             assert!(err.contains(needle), "{needle}: {err}");
         }
+        for (d, needle) in [("0.000000", None), ("N/A", None), ("3", Some(3.0))] {
+            let p = parse_probe(&probe_json(mp4, Some(d), 320, 240), &cfg).unwrap();
+            assert_eq!(p.duration, needle, "{d}");
+        }
+
+        let mut short = MediaConfig::ov_genai(None);
+        short.max_video_seconds = 2.0;
+        let p = parse_probe(&probe_json(mp4, Some("3"), 320, 240), &cfg).unwrap();
+        let err = p.bounded(3.0, &short).unwrap_err();
+        assert!(err.contains("3.0 s long; the limit is 2 s"), "{err}");
+        // The work bound: 600 s of 1080p30 passes, 601 s does not, and 4K
+        // gets a quarter of that.
+        let hd = Probe {
+            duration: None,
+            width: 1920,
+            height: 1080,
+            frame_rate: Some(30.0),
+            nb_frames: None,
+        };
+        let mut long = MediaConfig::ov_genai(None);
+        long.max_video_seconds = 10_000.0;
+        assert!(hd.bounded(600.0, &long).is_ok());
+        let err = hd.bounded(601.0, &long).unwrap_err();
+        assert!(err.contains("shorter or lower-resolution"), "{err}");
+        let uhd = Probe {
+            width: 3840,
+            height: 2160,
+            ..hd
+        };
+        assert!(uhd.bounded(150.0, &long).is_ok());
+        assert!(uhd.bounded(151.0, &long).is_err());
+        // No stated rate: the bound assumes 60 fps.
+        let unknown = Probe {
+            frame_rate: None,
+            ..hd
+        };
+        assert!(unknown.bounded(300.0, &long).is_ok());
+        assert!(unknown.bounded(301.0, &long).is_err());
+        // A stated frame count past duration x rate counts.
+        let dense = Probe {
+            nb_frames: Some(100_000),
+            ..hd
+        };
+        assert!(dense.bounded(10.0, &long).is_err());
+    }
+
+    /// A container that states no duration has it read from its packets.
+    #[test]
+    fn duration_comes_from_the_last_packet() {
+        assert_eq!(
+            duration_from_packets(b"0.000000\n0.100000\n2.900000\n2.800000\n", Some(10.0)),
+            Some(3.0)
+        );
+        assert_eq!(duration_from_packets(b"0.5,\n1.5\n", None), Some(1.5));
+        assert_eq!(duration_from_packets(b"0.000000\n", Some(25.0)), Some(0.04));
+        assert_eq!(duration_from_packets(b"", Some(25.0)), None);
+        assert_eq!(duration_from_packets(b"N/A\n", None), None);
     }
 
     #[test]
     fn ffmpeg_reads_only_the_local_file_with_the_container_forced() {
         let file = Path::new("/tmp/v.bin");
-        let args: Vec<String> = probe_args(Container::Mov, file)
-            .into_iter()
-            .map(|a| a.into_string().unwrap())
-            .collect();
+        let strings = |a: Vec<OsString>| -> Vec<String> {
+            a.into_iter().map(|a| a.into_string().unwrap()).collect()
+        };
         let has = |args: &[String], pair: [&str; 2]| args.windows(2).any(|w| w == pair);
-        assert!(has(&args, ["-protocol_whitelist", "file"]), "{args:?}");
-        assert!(has(&args, ["-f", "mov"]), "{args:?}");
-        assert_eq!(args.last().unwrap(), "/tmp/v.bin");
+        for args in [
+            strings(probe_args(Container::Mov, file)),
+            strings(packet_args(Container::Mov, file)),
+        ] {
+            assert!(has(&args, ["-protocol_whitelist", "file"]), "{args:?}");
+            assert!(has(&args, ["-f", "mov"]), "{args:?}");
+            assert_eq!(args.last().unwrap(), "file:/tmp/v.bin");
+        }
         let plan = Plan {
             frames: 3,
             width: 320,
             height: 240,
             duration: 3.0,
+            seek: false,
         };
-        let args: Vec<String> = decode_args(Container::Matroska, file, &plan)
-            .into_iter()
-            .map(|a| a.into_string().unwrap())
-            .collect();
+        let args = strings(decode_args(Container::Matroska, file, &plan));
         for pair in [
             ["-protocol_whitelist", "file"],
             ["-f", "matroska"],
-            ["-i", "/tmp/v.bin"],
+            ["-i", "file:/tmp/v.bin"],
             ["-vf", "fps=1.000000000,scale=320:240"],
             ["-frames:v", "3"],
             ["-pix_fmt", "rgb24"],
@@ -786,10 +1100,21 @@ mod tests {
             assert!(has(&args, pair), "{pair:?} in {args:?}");
         }
         // Input options precede the input.
-        let at = |a: &str| args.iter().position(|x| x == a).unwrap();
-        assert!(at("-protocol_whitelist") < at("-i"));
+        let at = |args: &[String], a: &str| args.iter().position(|x| x == a).unwrap();
+        assert!(at(&args, "-protocol_whitelist") < at(&args, "-i"));
         assert!(args.contains(&"-nostdin".to_string()));
         assert_eq!(args.last().unwrap(), "pipe:1");
+        // A seek reads one frame from its time, the seek before the input.
+        let args = strings(seek_args(Container::Mov, file, &plan, 2));
+        for pair in [
+            ["-ss", "2.000000"],
+            ["-vf", "scale=320:240"],
+            ["-frames:v", "1"],
+            ["-protocol_whitelist", "file"],
+        ] {
+            assert!(has(&args, pair), "{pair:?} in {args:?}");
+        }
+        assert!(at(&args, "-ss") < at(&args, "-i"));
     }
 
     #[test]
@@ -849,22 +1174,26 @@ mod tests {
         assert!(err.contains("`https://` or `data:`"), "{err}");
     }
 
-    /// The children of this process whose command is `name`, zombies
-    /// included: a killed child that was never waited for still shows.
-    fn children_named(name: &str) -> Vec<String> {
+    thread_local! {
+        /// The pids [`run_bounded`] spawned on this thread. `#[tokio::test]`
+        /// runs on one thread, so each test sees only its own.
+        pub(super) static SPAWNED: std::cell::RefCell<Vec<u32>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
+
+    pub(super) fn take_spawned() -> Vec<u32> {
+        SPAWNED.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+
+    /// Whether `pid` is gone: no process and no zombie (a killed child that
+    /// was never waited for still shows, as `Z`).
+    pub(super) fn reaped(pid: u32) -> bool {
         let out = std::process::Command::new("ps")
-            .args(["-A", "-o", "ppid=,pid=,stat=,comm="])
+            .args(["-o", "stat=", "-p", &pid.to_string()])
             .output()
             .unwrap();
-        let me = std::process::id().to_string();
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter(|l| {
-                let f: Vec<&str> = l.split_whitespace().collect();
-                f.first() == Some(&me.as_str()) && f.last().is_some_and(|c| c.ends_with(name))
-            })
-            .map(str::to_owned)
-            .collect()
+        String::from_utf8_lossy(&out.stdout).trim().is_empty()
     }
 
     /// Past the deadline, or past the output cap, the child is killed and
@@ -877,20 +1206,15 @@ mod tests {
         let r = run_bounded(sleep, 1024, Instant::now() + Duration::from_millis(200)).await;
         assert!(matches!(r, Err(RunError::TimedOut)), "{r:?}");
         assert!(t0.elapsed() < Duration::from_secs(5));
-        assert!(
-            children_named("sleep").is_empty(),
-            "{:?}",
-            children_named("sleep")
-        );
+        let pids = take_spawned();
+        assert_eq!(pids.len(), 1);
+        assert!(pids.iter().all(|&p| reaped(p)), "{pids:?}");
 
         let yes = tokio::process::Command::new("yes");
         let r = run_bounded(yes, 1 << 20, Instant::now() + Duration::from_secs(10)).await;
         assert!(matches!(r, Err(RunError::TooMuchOutput)), "{r:?}");
-        assert!(
-            children_named("yes").is_empty(),
-            "{:?}",
-            children_named("yes")
-        );
+        let pids = take_spawned();
+        assert!(pids.iter().all(|&p| reaped(p)), "{pids:?}");
 
         let echo = {
             let mut c = tokio::process::Command::new("sh");
@@ -1255,35 +1579,241 @@ mod tests {
             assert_eq!(status, StatusCode::OK, "{v}");
         }
 
-        /// A decode past its deadline is refused like a slow fetch (a 400),
-        /// and the next request is served. That the child is killed and
-        /// reaped is `bounded_runs_kill_and_reap_their_child`.
+        /// An ffmpeg that probes fine but decodes forever (`sleep` behind
+        /// the real ffprobe): past the request's deadline the decode is
+        /// killed and reaped, the request is a 400 that says what to send,
+        /// the temp file is gone, and the same server serves the next
+        /// request.
+        #[cfg(unix)]
         #[tokio::test]
         async fn a_decode_past_its_deadline_is_killed() {
+            use std::os::unix::fs::PermissionsExt as _;
             let Some(ff) = ffmpeg() else { return };
             let url = clip(&ff, "mp4", "video/mp4", 2);
-            let (app, _) = video_app(ff.clone(), |m| {
-                m.video_decode_timeout = Duration::from_millis(1)
+            let bin = tempfile::tempdir().unwrap();
+            let slow = bin.path().join("ffmpeg");
+            std::fs::write(&slow, "#!/bin/sh\nexec sleep 29\n").unwrap();
+            std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let slow_ff = Ffmpeg {
+                ffmpeg: slow,
+                ffprobe: ff.ffprobe.clone(),
+            };
+            let (app, _) = video_app(slow_ff, |m| {
+                m.video_decode_timeout = Duration::from_millis(1500);
+                m.video_temp_dir = Some(temp.path().to_path_buf());
             })
             .await;
+            super::take_spawned();
+            let t0 = std::time::Instant::now();
             let (status, v) = post_chat(
-                app,
+                app.clone(),
                 json!({"model": "mock-model", "messages": [video_msg("x", &url)]}),
             )
             .await;
+            assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
             assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
             assert!(
-                error_message(&v).contains("decoding the video took longer than"),
+                error_message(&v).contains(
+                    "decoding this request's videos took longer than 1.5 s; send a shorter or \
+                     lower-resolution clip"
+                ),
                 "{v}"
             );
-            let (app, _) = video_app(ff, |_| {}).await;
-            let (status, _) = post_chat(
+            let pids = super::take_spawned();
+            assert_eq!(pids.len(), 2, "the probe, then the decode: {pids:?}");
+            assert!(pids.iter().all(|&p| super::reaped(p)), "{pids:?}");
+            assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+            let (status, v) = post_chat(
                 app,
                 json!({"model": "mock-model", "max_tokens": 1,
-                    "messages": [video_msg("x", &url)]}),
+                    "messages": [{"role": "user", "content": "still there?"}]}),
             )
             .await;
-            assert_eq!(status, StatusCode::OK);
+            assert_eq!(status, StatusCode::OK, "{v}");
+        }
+
+        /// The temp file is removed after a decode that works and after one
+        /// that fails.
+        #[tokio::test]
+        async fn temp_files_are_removed() {
+            let Some(ff) = ffmpeg() else { return };
+            let good = clip(&ff, "mp4", "video/mp4", 1);
+            let bogus = format!(
+                "data:video/mp4;base64,{}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00junkjunkjunk")
+            );
+            let temp = tempfile::tempdir().unwrap();
+            let (app, _) =
+                video_app(ff, |m| m.video_temp_dir = Some(temp.path().to_path_buf())).await;
+            for (url, want) in [(&good, StatusCode::OK), (&bogus, StatusCode::BAD_REQUEST)] {
+                let (status, v) = post_chat(
+                    app.clone(),
+                    json!({"model": "mock-model", "max_tokens": 1,
+                        "messages": [video_msg("x", url)]}),
+                )
+                .await;
+                assert_eq!(status, want, "{v}");
+                assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+            }
+        }
+
+        /// ffmpeg's output for `args`, as a `data:` URL of `mime`; `pipe`
+        /// writes it to stdout, as a browser's MediaRecorder streams WebM
+        /// (no duration, no cues).
+        fn made(ffmpeg: &Ffmpeg, args: &[&str], mime: &str) -> String {
+            let out = std::process::Command::new(&ffmpeg.ffmpeg)
+                .args(["-nostdin", "-loglevel", "error"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            format!(
+                "data:{mime};base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(out.stdout)
+            )
+        }
+
+        async fn frames_of(app: Router, seen: &Seen, url: &str) -> (String, Vec<(u32, u32, u32)>) {
+            let (status, v) = post_chat(
+                app,
+                json!({"model": "mock-model", "max_tokens": 1,
+                    "messages": [video_msg("x", url)]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            seen.lock().unwrap().pop().unwrap()
+        }
+
+        /// A WebM muxed to a pipe states no duration; it is read from the
+        /// packets, and the clip is sampled as any other.
+        #[tokio::test]
+        async fn a_streamed_webm_without_a_duration_is_served() {
+            let Some(ff) = ffmpeg() else { return };
+            let url = made(
+                &ff,
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc=size=320x240:rate=10:duration=3",
+                    "-c:v",
+                    "libvpx",
+                    "-b:v",
+                    "200k",
+                    "-f",
+                    "webm",
+                    "pipe:1",
+                ],
+                "video/webm",
+            );
+            let (app, seen) = video_app(ff, |_| {}).await;
+            let (prompt, sizes) = frames_of(app, &seen, &url).await;
+            assert_eq!(sizes, vec![(320, 240, 1); 3]);
+            assert!(prompt.contains("Frame 3 (2.0s): "), "{prompt:?}");
+        }
+
+        /// A phone video's rotation reaches the model upright: a 320x240
+        /// clip rotated a quarter turn gives 240x320 frames.
+        #[tokio::test]
+        async fn a_rotated_clip_gives_upright_frames() {
+            let Some(ff) = ffmpeg() else { return };
+            let dir = tempfile::tempdir().unwrap();
+            let plain = dir.path().join("plain.mp4");
+            let status = std::process::Command::new(&ff.ffmpeg)
+                .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc=size=320x240:rate=10:duration=2")
+                .args(["-pix_fmt", "yuv420p"])
+                .arg(&plain)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let plain = plain.to_str().unwrap();
+            let url = made(
+                &ff,
+                &[
+                    "-display_rotation",
+                    "90",
+                    "-i",
+                    plain,
+                    "-c",
+                    "copy",
+                    "-f",
+                    "mp4",
+                    "-movflags",
+                    "frag_keyframe+empty_moov",
+                    "pipe:1",
+                ],
+                "video/mp4",
+            );
+            let (app, seen) = video_app(ff, |_| {}).await;
+            let (_, sizes) = frames_of(app, &seen, &url).await;
+            assert_eq!(sizes, vec![(240, 320, 1); 2]);
+        }
+
+        /// A clip with many source frames per sample is read by seeking, one
+        /// frame per sampled time.
+        #[tokio::test]
+        async fn a_long_clip_is_sampled_by_seeking() {
+            let Some(ff) = ffmpeg() else { return };
+            let url = made(
+                &ff,
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc=size=160x120:rate=30:duration=60",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "mp4",
+                    "-movflags",
+                    "frag_keyframe+empty_moov",
+                    "pipe:1",
+                ],
+                "video/mp4",
+            );
+            let (app, seen) = video_app(ff, |_| {}).await;
+            super::take_spawned();
+            let (prompt, sizes) = frames_of(app, &seen, &url).await;
+            assert_eq!(sizes, vec![(160, 120, 1); 16]);
+            assert!(prompt.contains("Frame 2 (3.8s): "), "{prompt:?}");
+            assert!(prompt.contains("Frame 16 ("), "{prompt:?}");
+            assert_eq!(
+                super::take_spawned().len(),
+                1 + 16,
+                "one probe, one run per frame"
+            );
+        }
+
+        /// Several videos in one request name each video in their labels.
+        #[tokio::test]
+        async fn several_videos_are_told_apart() {
+            let Some(ff) = ffmpeg() else { return };
+            let url = clip(&ff, "mp4", "video/mp4", 1);
+            let (app, seen) = video_app(ff, |m| m.max_videos = 2).await;
+            let (status, v) = post_chat(
+                app,
+                json!({"model": "mock-model", "max_tokens": 1, "messages": [
+                    {"role": "user", "content": [
+                        {"type": "video_url", "video_url": {"url": url}},
+                        {"type": "video_url", "video_url": {"url": url}}]}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            let prompt = &seen.lock().unwrap()[0].0;
+            assert!(
+                prompt.contains(
+                    "Video 1 frame 1 (0.0s): <ov_genai_image_0>Video 2 frame 1 (0.0s): \
+                     <ov_genai_image_1>"
+                ),
+                "{prompt:?}"
+            );
         }
 
         /// Without ffmpeg a video is a 400 naming the flag, and `/v1/models`
@@ -1304,6 +1834,18 @@ mod tests {
             };
             let (with, _) = video_app(ff.clone(), |_| {}).await;
             assert_eq!(modalities(with).await, json!(["text", "image", "video"]));
+            let (off, _) = video_app(ff.clone(), |m| m.max_videos = 0).await;
+            assert_eq!(modalities(off.clone()).await, json!(["text", "image"]));
+            let (status, v) = post_chat(
+                off,
+                json!({"model": "mock-model", "messages": [video_msg("x", &url)]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(
+                error_message(&v).contains("video input is turned off"),
+                "{v}"
+            );
             let (without, _) = video_app(ff, |m| m.ffmpeg = None).await;
             assert_eq!(modalities(without.clone()).await, json!(["text", "image"]));
             let (status, v) = post_chat(
@@ -1345,8 +1887,18 @@ mod tests {
                 "{v}"
             );
             let (without, _) = video_app(ff.clone(), |m| m.ffmpeg = None).await;
-            let (status, _) = post_chat(without, body.clone()).await;
+            let (status, v) = post_chat(without, body.clone()).await;
             assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+            assert!(!error_message(&v).contains("--api-max-video-mb"), "{v}");
+            // Over every allowance on a video server, the 413 names the flag.
+            let (tight, _) = video_app(ff.clone(), |m| m.max_request_video_bytes = 1 << 20).await;
+            let (status, v) = post_chat(tight, body.clone()).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+            assert!(
+                error_message(&v).contains("images or videos")
+                    && error_message(&v).contains("`--api-max-video-mb`"),
+                "{v}"
+            );
             // The image allowance still covers the base64 overhead here; the
             // decoded bytes are what the video budget holds.
             let (small, _) = video_app(ff, |m| m.max_request_video_bytes = 29 << 20).await;

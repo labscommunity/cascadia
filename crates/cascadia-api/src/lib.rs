@@ -166,6 +166,7 @@ impl<S, T> axum::extract::FromRequest<S> for OpenAiJson<T>
 where
     Json<T>: axum::extract::FromRequest<S, Rejection = axum::extract::rejection::JsonRejection>,
     S: Send + Sync,
+    AppState: axum::extract::FromRef<S>,
 {
     type Rejection = Response;
 
@@ -178,15 +179,22 @@ where
                 // the caller's malformed request.
                 if rej.status() == StatusCode::PAYLOAD_TOO_LARGE {
                     // axum's own text ("length limit exceeded") names no
-                    // cause. Images are the usual one, and a server whose
-                    // model takes none grants them no allowance.
-                    return Err(api_error(
-                        StatusCode::PAYLOAD_TOO_LARGE,
+                    // cause. Images (and videos) are the usual one, and a
+                    // server whose model takes none grants them no allowance.
+                    let video = <AppState as axum::extract::FromRef<S>>::from_ref(state)
+                        .media
+                        .as_deref()
+                        .is_some_and(MediaConfig::accepts_video);
+                    let msg = if video {
+                        "request body is larger than this server accepts; if it carries \
+                         images or videos, send fewer or smaller images or a shorter video \
+                         (the operator sets the video allowance with `--api-max-video-mb`)"
+                    } else {
                         "request body is larger than this server accepts; if it carries \
                          images, check that the model accepts image input \
-                         (`input_modalities` in `/v1/models`) and send fewer or smaller images",
-                        None,
-                    ));
+                         (`input_modalities` in `/v1/models`) and send fewer or smaller images"
+                    };
+                    return Err(api_error(StatusCode::PAYLOAD_TOO_LARGE, msg, None));
                 }
                 Err(api_error(
                     StatusCode::BAD_REQUEST,
@@ -686,17 +694,15 @@ pub fn make_router_with_stats(
     // The routes that carry images get the image allowance on top of the
     // text limit; every other route keeps the text limit alone.
     // A server that decodes videos adds their allowance too.
-    let image_body_limit = DefaultBodyLimit::max(
-        cfg.max_body_bytes
-            + cfg.media.as_ref().map_or(0, |m| {
-                media::base64_len(m.max_request_image_bytes)
-                    + if m.accepts_video() {
-                        media::base64_len(m.max_request_video_bytes)
-                    } else {
-                        0
-                    }
-            }),
-    );
+    let image_body_limit = DefaultBodyLimit::max(cfg.max_body_bytes.saturating_add(
+        cfg.media.as_ref().map_or(0, |m| {
+            media::base64_len(m.max_request_image_bytes).saturating_add(if m.accepts_video() {
+                media::base64_len(m.max_request_video_bytes)
+            } else {
+                0
+            })
+        }),
+    ));
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
@@ -2146,6 +2152,8 @@ struct PreparedMedia {
     messages: Vec<ChatMessage>,
     inputs: Vec<cascadia_types::MediaInput>,
     cfg: Arc<MediaConfig>,
+    /// How many of `inputs` are video frames.
+    frames: usize,
 }
 
 impl PreparedMedia {
@@ -2163,8 +2171,13 @@ impl PreparedMedia {
     fn check_placeholders(&self, prompt: &str) -> Result<(), String> {
         let n = self.inputs.len();
         if let Err(found) = self.cfg.placeholders_complete(prompt, n) {
+            let sent = if self.frames > 0 {
+                format!("{n} images (video frames included)")
+            } else {
+                format!("{n} images")
+            };
             return Err(format!(
-                "{n} images were sent but the rendered prompt carries {found} image \
+                "{sent} were sent but the rendered prompt carries {found} image \
                  placeholders; this model's prompt format dropped the messages holding the rest"
             ));
         }
@@ -2311,8 +2324,15 @@ async fn prepare_media(
             cfg.max_images
         )));
     }
-    if videos > 0 && !cfg.accepts_video() {
+    if videos > 0 && cfg.ffmpeg.is_none() {
         return Err(reject(video::NEEDS_FFMPEG.into()));
+    }
+    if videos > 0 && cfg.max_videos == 0 {
+        return Err(reject(
+            "video input is turned off on this server; send the video's frames as \
+             `image_url` parts instead"
+                .into(),
+        ));
     }
     if videos > cfg.max_videos {
         return Err(reject(format!(
@@ -2346,7 +2366,7 @@ async fn prepare_media(
                 fetched_videos.push(None);
                 continue;
             }
-            let bytes = media::fetch_remote(url, budget, cfg.fetch_policy, "video")
+            let bytes = media::fetch_remote(url, budget, cfg.fetch_policy, media::Remote::Video)
                 .await
                 .map_err(|e| format!("video {j}: {e}"))?;
             budget -= bytes.len();
@@ -2426,9 +2446,11 @@ async fn prepare_media(
     // under it, before the images decode.
     let decode_permit =
         acquire_decode_slot(Arc::clone(&state.decode_permits), cfg.decode_wait).await?;
+    // One deadline over all of the request's videos, as the fetches have.
+    let deadline = tokio::time::Instant::now() + cfg.video_decode_timeout;
     let mut video_frames = Vec::with_capacity(video_inputs.len());
     for (j, (bytes, detail)) in video_inputs.into_iter().enumerate() {
-        match video::decode_video(bytes, detail.as_deref(), &cfg).await {
+        match video::decode_video(bytes, detail.as_deref(), &cfg, deadline).await {
             Ok(frames) => video_frames.push(frames),
             Err(video::VideoError::Invalid(msg)) => {
                 return Err(reject(format!("video {j}: {msg}")))
@@ -2441,16 +2463,14 @@ async fn prepare_media(
         }
     }
     let frames: usize = video_frames.iter().map(Vec::len).sum();
-    if count + frames > cfg.max_images + cfg.max_videos * cfg.max_video_frames {
-        return Err(reject(format!(
-            "{count} images and {frames} video frames in one request; the limit is {} together",
-            cfg.max_images + cfg.max_videos * cfg.max_video_frames
-        )));
-    }
+    // Each video's plan caps its frames, and the counts were checked above.
+    debug_assert!(count + frames <= cfg.max_images + cfg.max_videos * cfg.max_video_frames);
+    let several_videos = videos > 1;
     let decoded = tokio::task::spawn_blocking(move || {
         let _decode_permit = decode_permit;
         let mut image_bytes = image_bytes.into_iter();
         let mut video_frames = video_frames.into_iter();
+        let mut video_index = 0;
         let mut inputs = Vec::with_capacity(count + frames);
         let mut out = Vec::with_capacity(messages.len());
         for mut m in messages {
@@ -2475,8 +2495,10 @@ async fn prepare_media(
                     // part naming it, then the image.
                     ContentPart::VideoUrl { .. } => {
                         let frames = video_frames.next().expect("frames for every video");
+                        let video_no = several_videos.then_some(video_index + 1);
+                        video_index += 1;
                         for (k, frame) in frames.into_iter().enumerate() {
-                            let label = video::frame_label(k + 1, frame.secs);
+                            let label = video::frame_label(video_no, k + 1, frame.secs);
                             pieces.push((false, decode_cfg.text_part(label)));
                             pieces.push((true, decode_cfg.placeholder(inputs.len())));
                             inputs.push(frame.input);
@@ -2497,6 +2519,7 @@ async fn prepare_media(
             messages,
             inputs,
             cfg,
+            frames,
         })),
         Ok(Err(msg)) => Err(reject(msg)),
         Err(join_err) => Err(decode_task_failed(join_err)),

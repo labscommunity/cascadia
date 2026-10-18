@@ -87,22 +87,34 @@ pub struct MediaConfig {
     /// any frame is decoded.
     pub max_video_seconds: f64,
     /// Each frame is scaled to fit this many pixels, keeping the aspect
-    /// ratio (`detail: "low"` takes [`MediaConfig::low_detail_pixels`],
-    /// `"high"` [`MediaConfig::max_image_pixels`]). Every frame costs one
-    /// image's tokens.
+    /// ratio (`detail: "low"` takes the smaller of this and
+    /// [`MediaConfig::low_detail_pixels`], `"high"` the larger of this and
+    /// [`MediaConfig::max_image_pixels`]). Every frame costs one image's
+    /// tokens.
     pub max_video_frame_pixels: u64,
+    /// Videos whose frames are larger than this are refused before
+    /// decoding: a decoder holds several source frames at once.
+    pub max_video_source_pixels: u64,
+    /// Source pixels one video may make the decoder produce (its frame
+    /// count, from the container, times its frame size), refused before
+    /// decoding. The default is 600 s of 1080p30.
+    pub max_video_decode_pixels: u64,
     /// Encoded video bytes one request may carry, on top of the image and
     /// text allowances. Also the cap on video bytes fetched for one request.
     pub max_request_video_bytes: usize,
-    /// One video's probe and decode together; past it ffmpeg is killed and
-    /// the request gets a 400.
+    /// One request's video probes and decodes together; past it ffmpeg is
+    /// killed and the request gets a 400.
     pub video_decode_timeout: Duration,
+    /// Where video temp files go (the system temp dir when `None`). Tests
+    /// only; not exposed as a flag.
+    #[doc(hidden)]
+    pub video_temp_dir: Option<std::path::PathBuf>,
 }
 
 /// Bytes a `data:` URL needs to carry `raw` bytes base64-encoded, plus room
 /// for its `data:image/...;base64,` prefix and JSON quoting.
 pub fn base64_len(raw: usize) -> usize {
-    raw.div_ceil(3) * 4 + 256
+    raw.div_ceil(3).saturating_mul(4).saturating_add(256)
 }
 
 /// GenAI's universal tags: `<ov_genai_image_{i}>` and `<ov_genai_video_{i}>`
@@ -208,14 +220,18 @@ impl MediaConfig {
             video_fps: 1.0,
             max_video_seconds: 600.0,
             max_video_frame_pixels: 448 * 448,
+            max_video_source_pixels: 3840 * 2160,
+            max_video_decode_pixels: 600 * 30 * 1920 * 1080,
             max_request_video_bytes: 32 << 20,
             video_decode_timeout: Duration::from_secs(30),
+            video_temp_dir: None,
         }
     }
 
-    /// Whether `video_url` parts are served: images are, and ffmpeg was found.
+    /// Whether `video_url` parts are served: images are, ffmpeg was found,
+    /// and a request may carry a video (`max_videos` 0 turns video off).
     pub fn accepts_video(&self) -> bool {
-        self.ffmpeg.is_some()
+        self.ffmpeg.is_some() && self.max_videos > 0
     }
 
     /// Settings for the staged `qwen35` engine (rank 0 encodes the images):
@@ -673,18 +689,50 @@ pub async fn fetch_image(
     max_bytes: usize,
     policy: FetchPolicy,
 ) -> Result<Vec<u8>, String> {
-    fetch_remote(url, max_bytes, policy, "image").await
+    fetch_remote(url, max_bytes, policy, Remote::Image).await
 }
 
-/// [`fetch_image`] for any media kind: `what` (`image`, `video`) names it in
-/// errors and is the content type's required top-level type.
+/// What a remote fetch is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Remote {
+    /// `image/*` only.
+    Image,
+    /// `video/*`, or `application/octet-stream` or no type at all, which
+    /// CDNs often send for video files: the bytes are sniffed before ffmpeg
+    /// sees them.
+    Video,
+}
+
+impl Remote {
+    fn name(self) -> &'static str {
+        match self {
+            Remote::Image => "image",
+            Remote::Video => "video",
+        }
+    }
+
+    fn accepts(self, ctype: &str) -> bool {
+        let essence = ctype.split(';').next().unwrap_or("").trim();
+        match self {
+            Remote::Image => ctype.starts_with("image/"),
+            Remote::Video => {
+                essence.starts_with("video/")
+                    || essence.is_empty()
+                    || essence.eq_ignore_ascii_case("application/octet-stream")
+            }
+        }
+    }
+}
+
+/// [`fetch_image`] for any media kind, named in errors by `kind`.
 pub async fn fetch_remote(
     url: &str,
     max_bytes: usize,
     policy: FetchPolicy,
-    what: &'static str,
+    kind: Remote,
 ) -> Result<Vec<u8>, String> {
-    match tokio::time::timeout(policy.per_image, fetch_inner(url, max_bytes, policy, what)).await {
+    let what = kind.name();
+    match tokio::time::timeout(policy.per_image, fetch_inner(url, max_bytes, policy, kind)).await {
         Ok(r) => r,
         Err(_) => Err(format!(
             "fetching the {what} took longer than {} s",
@@ -702,8 +750,9 @@ async fn fetch_inner(
     url: &str,
     max_bytes: usize,
     policy: FetchPolicy,
-    what: &'static str,
+    kind: Remote,
 ) -> Result<Vec<u8>, String> {
+    let what = kind.name();
     let mut current = url::Url::parse(url).map_err(|e| format!("invalid {what} URL: {e}"))?;
     for _ in 0..=MAX_REDIRECTS {
         let addr = check_target(&current, policy, what).await?;
@@ -743,7 +792,7 @@ async fn fetch_inner(
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if !ctype.starts_with(&format!("{what}/")) {
+        if !kind.accepts(ctype) {
             let article = if what.starts_with(['a', 'e', 'i', 'o', 'u']) {
                 "an"
             } else {
@@ -994,6 +1043,24 @@ mod tests {
         small.max_source_pixels = 100;
         let err = decode_image_url(&png_data_url(20, 20), None, &small).unwrap_err();
         assert!(err.contains("pixels in total"), "{err}");
+    }
+
+    /// A remote video may come as `application/octet-stream` or untyped
+    /// (its bytes are sniffed later); an image must say it is one.
+    #[test]
+    fn remote_content_types_by_kind() {
+        for (ctype, image, video) in [
+            ("image/png", true, false),
+            ("video/mp4", false, true),
+            ("video/webm; codecs=vp9", false, true),
+            ("application/octet-stream", false, true),
+            ("Application/Octet-Stream; charset=binary", false, true),
+            ("", false, true),
+            ("text/html", false, false),
+        ] {
+            assert_eq!(Remote::Image.accepts(ctype), image, "{ctype}");
+            assert_eq!(Remote::Video.accepts(ctype), video, "{ctype}");
+        }
     }
 
     #[test]
