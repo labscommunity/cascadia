@@ -81,7 +81,8 @@ and in `/v1/responses` OpenRouter's `{"type": "input_video", "video_url": "data:
   only with `--api-allow-image-urls`, under the same checks as images (a fetched video may
   be typed `video/*`, `application/octet-stream` or not at all: its bytes are checked). The
   container must be MP4/MOV or Matroska/WebM; anything else is a `400`. A WebM that states
-  no duration (as a browser's MediaRecorder writes it) has it read from its packets.
+  no duration (as a browser's MediaRecorder writes it) has it read from its packets (first
+  to last); timestamps in labels count from the clip's start, whatever its first timestamp.
 - The video becomes `ceil(duration x --api-video-fps)` frames (default 1 per second), at
   most `--api-max-video-frames` (default 16), spread uniformly from 0 s. Each frame enters
   the prompt where the video was, as `Frame k (t s): ` followed by one image (`Video j frame
@@ -98,17 +99,21 @@ and in `/v1/responses` OpenRouter's `{"type": "input_video", "video_url": "data:
 - Limits, all checked from the container before any frame is decoded:
   `--api-max-videos` (default 1 per request; 0 turns video off), `--api-max-video-seconds`
   (600), `--api-max-video-source-pixels` (3840x2160 per source frame), and a fixed work
-  bound of 600 s of 1080p30 per video (frames x pixels, from the stated frame count or
-  duration x frame rate; 60 fps assumed when none is stated), so 4K30 is held to 150 s.
+  bound of 600 s of 1080p30 per video (frames x pixels), so 4K30 is held to 150 s. The
+  frames are counted from the container's packets by a demux-only scan, so the bound is
+  only as good as the container's packets: it is advisory against a crafted file, which
+  the source-frame cap, the decode deadline and the two decode slots still bound.
   `--api-max-video-mb` (32 MiB per request, at most 1024; on top of the image allowance,
   and the chat and Responses body limits grow by it only when video is on).
   `--api-video-decode-timeout` (30 s for all of a request's videos; past it ffmpeg is
   killed and the request gets a `400` asking for a shorter or lower-resolution clip).
   Videos decode under the request's one decode slot.
-- A clip with more than 32 source frames per sampled frame (past about 16 s at 30 fps) is
-  read with one seek per frame instead of one pass: 60 s of 4K30 takes about 3.6 s instead
-  of 9 s on an M-series Mac. ffmpeg's memory follows the source frame size, about 170 MB at
-  4K; it is not capped otherwise.
+- A clip with more than 32 source frames per sampled frame (past about 16 s at 30 fps) and
+  at least one keyframe per sampled frame is read with one seek per frame instead of one
+  pass: 60 s of 4K30 with a 2 s GOP takes about 3.6 s instead of 9 s on an M-series Mac. A
+  clip with rare keyframes (a browser recording, `keyint=infinite`) is read in one pass,
+  since each seek would decode most of it. ffmpeg's memory follows the source frame size,
+  about 170 MB at 4K; it is not capped otherwise.
 - Decoding needs ffmpeg and ffprobe on the server: `--api-ffmpeg PATH`, else `ffmpeg` on
   `PATH` (ffprobe beside it or on `PATH`). A decode-only LGPL build is enough. ffmpeg runs
   as a subprocess on a private temp file (removed afterwards), restricted to local files,
