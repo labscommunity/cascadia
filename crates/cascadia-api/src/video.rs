@@ -198,8 +198,11 @@ pub struct Video {
     pub duration: f64,
     pub width: u32,
     pub height: u32,
-    /// Frames the source holds, as far as the container says.
+    /// Frames the source holds: its packets when they were counted, else
+    /// what the container states.
     pub source_frames: f64,
+    /// Keyframes the source holds, when its packets were counted.
+    pub keyframes: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -235,12 +238,16 @@ struct ProbeFormat {
 
 /// The frame rate the work bound assumes when the container states none.
 const ASSUMED_FPS: f64 = 60.0;
+/// The highest frame rate believed: a variable-rate stream's `r_frame_rate`
+/// can be its timebase (`1000/1`).
+const MAX_FPS: f64 = 120.0;
 
-/// ffprobe's `num/den` rate (`30000/1001`); `0/0` is unknown.
+/// ffprobe's `num/den` rate (`30000/1001`), at most [`MAX_FPS`]; `0/0` is
+/// unknown.
 fn parse_rate(r: &str) -> Option<f64> {
     let (n, d) = r.split_once('/').unwrap_or((r, "1"));
     let rate = n.trim().parse::<f64>().ok()? / d.trim().parse::<f64>().ok()?;
-    (rate.is_finite() && rate > 0.0).then_some(rate)
+    (rate.is_finite() && rate > 0.0).then_some(rate.min(MAX_FPS))
 }
 
 /// Read ffprobe's JSON and refuse, before any frame is decoded, a video
@@ -306,17 +313,26 @@ pub fn parse_probe(json: &[u8], cfg: &MediaConfig) -> Result<Probe, String> {
 impl Probe {
     /// Refuse a video longer than [`MediaConfig::max_video_seconds`], or one
     /// whose frames would make the decoder produce more than
-    /// [`MediaConfig::max_video_decode_pixels`] source pixels (its stated
-    /// frame count or duration x frame rate, whichever is larger).
-    pub fn bounded(&self, duration: f64, cfg: &MediaConfig) -> Result<Video, String> {
+    /// [`MediaConfig::max_video_decode_pixels`] source pixels. Its frames are
+    /// the scanned packets when there was a scan, else the larger of the
+    /// stated frame count and duration x frame rate.
+    pub fn bounded(
+        &self,
+        duration: f64,
+        packets: Option<&Packets>,
+        cfg: &MediaConfig,
+    ) -> Result<Video, String> {
         if duration > cfg.max_video_seconds {
             return Err(format!(
                 "video is {duration:.1} s long; the limit is {} s",
                 cfg.max_video_seconds
             ));
         }
-        let by_rate = duration * self.frame_rate.unwrap_or(ASSUMED_FPS);
-        let source_frames = by_rate.max(self.nb_frames.unwrap_or(0) as f64);
+        let source_frames = match packets {
+            Some(p) => p.count as f64,
+            None => (duration * self.frame_rate.unwrap_or(ASSUMED_FPS))
+                .max(self.nb_frames.unwrap_or(0) as f64),
+        };
         let (w, h) = (self.width, self.height);
         let work = source_frames * f64::from(w) * f64::from(h);
         if work > cfg.max_video_decode_pixels as f64 {
@@ -332,28 +348,58 @@ impl Probe {
             width: w,
             height: h,
             source_frames,
+            keyframes: packets.map(|p| p.keyframes),
         })
     }
 }
 
-/// A video's duration from a packet scan ([`packet_args`]), for a container
-/// that states none (WebM written to a pipe, as browsers' MediaRecorder
-/// does): the last packet's time plus one frame.
-pub fn duration_from_packets(csv: &[u8], frame_rate: Option<f64>) -> Option<f64> {
-    let last = String::from_utf8_lossy(csv)
-        .lines()
-        .filter_map(|l| l.trim().trim_end_matches(',').parse::<f64>().ok())
-        .filter(|t| t.is_finite())
-        .fold(None, |m: Option<f64>, t| Some(m.map_or(t, |m| m.max(t))))?;
-    let d = last + frame_rate.map_or(0.0, |r| 1.0 / r);
-    (d.is_finite() && d > 0.0).then_some(d)
+/// What a demux-only packet scan ([`packet_args`]) found: how many video
+/// packets (frames) and keyframes there are, and the time they span.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Packets {
+    pub count: u64,
+    pub keyframes: u64,
+    /// From the first packet's time to the last's, plus one frame: the
+    /// duration of a container that states none (WebM written to a pipe, as
+    /// browsers' MediaRecorder does), from its start whatever its first
+    /// timestamp.
+    pub span: Option<f64>,
+}
+
+/// Read a packet scan's `pts_time,flags` lines.
+pub fn parse_packets(csv: &[u8], frame_rate: Option<f64>) -> Packets {
+    let (mut count, mut keyframes) = (0, 0);
+    let (mut first, mut last) = (f64::INFINITY, f64::NEG_INFINITY);
+    for line in String::from_utf8_lossy(csv).lines() {
+        let mut fields = line.trim().split(',');
+        let pts = fields.next().and_then(|t| t.parse::<f64>().ok());
+        let flags = fields.next().unwrap_or("");
+        if pts.is_none() && flags.is_empty() {
+            continue;
+        }
+        count += 1;
+        if flags.contains('K') {
+            keyframes += 1;
+        }
+        if let Some(t) = pts.filter(|t| t.is_finite()) {
+            first = first.min(t);
+            last = last.max(t);
+        }
+    }
+    let span = last - first + frame_rate.map_or(0.0, |r| 1.0 / r);
+    Packets {
+        count,
+        keyframes,
+        span: (span.is_finite() && span > 0.0).then_some(span),
+    }
 }
 
 /// Sampled frames whose sources hold more than this many frames each are
-/// read with one seek per frame instead of one pass over the whole video:
-/// a long or high-rate clip then costs a few GOPs per frame, not every
-/// frame it has (60 s of 4K30 on an M-series Mac: 9 s in one pass, 3.6 s
-/// with 16 seeks).
+/// read with one seek per frame instead of one pass over the whole video,
+/// when keyframes are dense enough (see [`Plan::new`]): a long or high-rate
+/// clip then costs about half a GOP per frame, not every frame it has (60 s
+/// of 4K30 at a 2 s GOP on an M-series Mac: 9 s in one pass, 3.6 s with 16
+/// seeks).
 const SEEK_RATIO: f64 = 32.0;
 
 /// How a probed video is sampled: `frames` frames, uniform over its
@@ -373,6 +419,12 @@ impl Plan {
     /// keeping the aspect ratio, with even sides. `low` is the smallest
     /// budget (a quarter of the frame budget, at most the image low-detail
     /// one), `high` the largest.
+    ///
+    /// A seek decodes from the keyframe before its time, about half a GOP,
+    /// so `frames` seeks cost about `frames / (2 * keyframes)` of one pass:
+    /// seeking needs at least one keyframe per sampled frame. A clip with
+    /// rare keyframes (a browser recording, `keyint=infinite`) is read in
+    /// one pass: seeking it would decode most of it once per frame.
     pub fn new(video: &Video, detail: Option<&str>, cfg: &MediaConfig) -> Self {
         let wanted = (video.duration * cfg.video_fps).ceil();
         let frames = if wanted.is_finite() && wanted >= 1.0 {
@@ -398,7 +450,8 @@ impl Plan {
             width: even(w),
             height: even(h),
             duration: video.duration,
-            seek: video.source_frames > SEEK_RATIO * frames as f64,
+            seek: video.source_frames > SEEK_RATIO * frames as f64
+                && video.keyframes.is_some_and(|k| k as usize >= frames),
         }
     }
 
@@ -462,8 +515,8 @@ pub fn probe_args(container: Container, file: &Path) -> Vec<OsString> {
     a
 }
 
-/// ffprobe's arguments for a packet scan: each video packet's time, one per
-/// line (demuxing only, no decode).
+/// ffprobe's arguments for a packet scan: each video packet's time and
+/// flags (`K` for a keyframe), one per line (demuxing only, no decode).
 pub fn packet_args(container: Container, file: &Path) -> Vec<OsString> {
     let mut a = args(&[
         "-v",
@@ -475,7 +528,7 @@ pub fn packet_args(container: Container, file: &Path) -> Vec<OsString> {
         "-select_streams",
         "V:0",
         "-show_entries",
-        "packet=pts_time",
+        "packet=pts_time,flags",
         "-of",
         "csv=p=0",
     ]);
@@ -560,15 +613,15 @@ pub struct Frame {
 
 /// Bytes of ffprobe JSON read at most; the requested fields fit in far less.
 const MAX_PROBE_OUTPUT: usize = 64 << 10;
-/// Bytes of packet times read at most: about 300 000 packets, far past
-/// 600 s at any real frame rate.
+/// Bytes of packet lines read at most: about 250 000 packets, past 600 s at
+/// [`MAX_FPS`] three times over.
 const MAX_PACKET_SCAN: usize = 4 << 20;
 /// ffmpeg's stderr kept for the log.
 const STDERR_KEPT: usize = 2048;
 
 /// The caller's video on disk for ffmpeg, removed on drop. Removal is
-/// retried off-thread when it fails: on Windows a decoder killed as the
-/// request is dropped may still hold the file open for a moment.
+/// retried by one reaper thread when it fails: on Windows a decoder killed
+/// as the request is dropped may still hold the file open for a moment.
 struct TempVideo(PathBuf);
 
 impl TempVideo {
@@ -594,21 +647,63 @@ impl TempVideo {
 impl Drop for TempVideo {
     fn drop(&mut self) {
         let path = std::mem::take(&mut self.0);
-        let gone = |r: std::io::Result<()>| {
-            r.is_ok() || r.is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-        };
-        if gone(std::fs::remove_file(&path)) {
-            return;
+        if !removed(&path) {
+            reap_later(path);
         }
-        std::thread::spawn(move || {
-            for _ in 0..50 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                if gone(std::fs::remove_file(&path)) {
-                    return;
+    }
+}
+
+/// Whether `path` is gone now (removed, or never there).
+fn removed(path: &Path) -> bool {
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Hand a temp file that could not be removed to the one reaper thread,
+/// which retries every 100 ms for 5 s.
+fn reap_later(path: PathBuf) {
+    use std::sync::mpsc;
+    static REAPER: std::sync::OnceLock<Option<mpsc::Sender<PathBuf>>> = std::sync::OnceLock::new();
+    let tx = REAPER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<PathBuf>();
+        std::thread::Builder::new()
+            .name("video-temp-reaper".into())
+            .spawn(move || {
+                let mut pending: Vec<(PathBuf, u32)> = Vec::new();
+                loop {
+                    let next = if pending.is_empty() {
+                        rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+                    } else {
+                        rx.recv_timeout(std::time::Duration::from_millis(100))
+                    };
+                    match next {
+                        Ok(p) => pending.push((p, 0)),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                    pending.retain_mut(|(p, tries)| {
+                        *tries += 1;
+                        if removed(p) {
+                            return false;
+                        }
+                        if *tries >= 50 {
+                            tracing::warn!(path = %p.display(), "could not remove a video temp file");
+                            return false;
+                        }
+                        true
+                    });
                 }
-            }
-            tracing::warn!(path = %path.display(), "could not remove a video temp file");
-        });
+            })
+            .ok()
+            .map(|_| tx)
+    });
+    match tx {
+        Some(tx) => {
+            let _ = tx.send(path);
+        }
+        None => tracing::warn!(path = %path.display(), "could not remove a video temp file"),
     }
 }
 
@@ -669,27 +764,34 @@ pub async fn decode_video(
         )));
     }
     let probed = parse_probe(&out.stdout, cfg).map_err(VideoError::Invalid)?;
-    let duration = match probed.duration {
-        Some(d) => d,
-        None => {
-            let mut scan = tokio::process::Command::new(&tools.ffprobe);
-            scan.args(packet_args(container, file.path()));
-            let out = match run_bounded(scan, MAX_PACKET_SCAN, deadline).await {
-                Ok(o) => o,
-                Err(RunError::TimedOut) => return Err(timed_out()),
-                Err(RunError::TooMuchOutput) => {
-                    return Err(VideoError::Invalid(
-                        "the video states no duration and has too many packets to scan".into(),
-                    ))
-                }
-                Err(e) => return Err(e.into_video_error()),
-            };
-            duration_from_packets(&out.stdout, probed.frame_rate)
-                .filter(|_| out.status.success())
-                .ok_or_else(|| VideoError::Invalid("the video's duration is unknown".into()))?
+    // Demux only: the frame and keyframe counts that bound the work and pick
+    // the decode, and the duration when the container states none.
+    let mut scan = tokio::process::Command::new(&tools.ffprobe);
+    scan.args(packet_args(container, file.path()));
+    let out = match run_bounded(scan, MAX_PACKET_SCAN, deadline).await {
+        Ok(o) => o,
+        Err(RunError::TimedOut) => return Err(timed_out()),
+        Err(RunError::TooMuchOutput) => {
+            return Err(VideoError::Invalid(
+                "the video has too many frames; send a shorter clip".into(),
+            ))
         }
+        Err(e) => return Err(e.into_video_error()),
     };
-    let video = probed.bounded(duration, cfg).map_err(VideoError::Invalid)?;
+    if !out.status.success() {
+        tracing::warn!(status = %out.status, stderr = %out.stderr, "ffprobe could not scan a video");
+        return Err(VideoError::Invalid(format!(
+            "could not read the video; {SUPPORTED}"
+        )));
+    }
+    let packets = parse_packets(&out.stdout, probed.frame_rate);
+    let duration = probed
+        .duration
+        .or(packets.span)
+        .ok_or_else(|| VideoError::Invalid("the video's duration is unknown".into()))?;
+    let video = probed
+        .bounded(duration, Some(&packets), cfg)
+        .map_err(VideoError::Invalid)?;
     let plan = Plan::new(&video, detail, cfg);
 
     let fb = plan.frame_bytes();
@@ -858,13 +960,14 @@ mod tests {
         v.to_string().into_bytes()
     }
 
-    /// A bounded video of `duration` s at 30 fps.
+    /// A bounded video of `duration` s at 30 fps, a keyframe a second.
     fn probe(duration: f64, width: u32, height: u32) -> Video {
         Video {
             duration,
             width,
             height,
             source_frames: duration * 30.0,
+            keyframes: Some(duration.ceil() as u64),
         }
     }
 
@@ -897,7 +1000,8 @@ mod tests {
     }
 
     /// Short clips decode in one pass; one whose source holds many frames
-    /// per sampled frame is read by seeking.
+    /// per sampled frame is read by seeking, if it has a keyframe per
+    /// sampled frame.
     #[test]
     fn long_clips_are_read_by_seeking() {
         let cfg = MediaConfig::ov_genai(None);
@@ -905,8 +1009,17 @@ mod tests {
         assert!(!Plan::new(&probe(3.0, 320, 240), None, &cfg).seek);
         // 16 s: 480 for 16, still one pass.
         assert!(!Plan::new(&probe(16.0, 320, 240), None, &cfg).seek);
-        // 60 s: 1800 for 16.
+        // 60 s: 1800 for 16, with 60 keyframes.
         assert!(Plan::new(&probe(60.0, 320, 240), None, &cfg).seek);
+        // The same clip with one keyframe (`keyint=infinite`, a browser
+        // recording), with fewer keyframes than samples, or uncounted.
+        for keyframes in [Some(1), Some(15), None] {
+            let rare = Video {
+                keyframes,
+                ..probe(60.0, 320, 240)
+            };
+            assert!(!Plan::new(&rare, None, &cfg).seek, "{keyframes:?}");
+        }
     }
 
     /// Frames fit the detail's pixel budget, keep the aspect ratio and have
@@ -957,14 +1070,23 @@ mod tests {
             (Some(3.0), 320, 240, Some(30.0))
         );
         assert_eq!(
-            p.bounded(3.0, &cfg).unwrap(),
+            p.bounded(3.0, None, &cfg).unwrap(),
             Video {
                 duration: 3.0,
                 width: 320,
                 height: 240,
-                source_frames: 90.0
+                source_frames: 90.0,
+                keyframes: None,
             }
         );
+        // A packet scan's count stands in for the stated rate.
+        let scanned = Packets {
+            count: 31,
+            keyframes: 2,
+            span: Some(3.1),
+        };
+        let v = p.bounded(3.0, Some(&scanned), &cfg).unwrap();
+        assert_eq!((v.source_frames, v.keyframes), (31.0, Some(2)));
         let p = parse_probe(&probe_json("matroska,webm", None, 64, 48), &cfg).unwrap();
         assert_eq!(p.duration, None, "a streamed WebM states none");
         // A quarter turn swaps the sides, as ffmpeg's autorotate does; the
@@ -978,8 +1100,16 @@ mod tests {
         let p = parse_probe(rotated.to_string().as_bytes(), &cfg).unwrap();
         assert_eq!((p.duration, p.width, p.height), (Some(3.0), 240, 320));
         assert!((p.frame_rate.unwrap() - 29.97).abs() < 0.01);
+        // A variable-rate stream's timebase is no frame rate past 120 fps.
+        let vfr = serde_json::json!({
+            "streams": [{"codec_type": "video", "width": 320, "height": 240,
+                "avg_frame_rate": "0/0", "r_frame_rate": "1000/1"}],
+            "format": {"format_name": "matroska,webm", "duration": "3"},
+        });
+        let p2 = parse_probe(vfr.to_string().as_bytes(), &cfg).unwrap();
+        assert_eq!(p2.frame_rate, Some(120.0));
         // The larger of the stated count and duration x rate counts.
-        assert_eq!(p.bounded(3.0, &cfg).unwrap().source_frames, 120.0);
+        assert_eq!(p.bounded(3.0, None, &cfg).unwrap().source_frames, 120.0);
 
         let none = br#"{"streams": [], "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration": "1"}}"#;
         for (json, needle) in [
@@ -1014,7 +1144,7 @@ mod tests {
         let mut short = MediaConfig::ov_genai(None);
         short.max_video_seconds = 2.0;
         let p = parse_probe(&probe_json(mp4, Some("3"), 320, 240), &cfg).unwrap();
-        let err = p.bounded(3.0, &short).unwrap_err();
+        let err = p.bounded(3.0, None, &short).unwrap_err();
         assert!(err.contains("3.0 s long; the limit is 2 s"), "{err}");
         // The work bound: 600 s of 1080p30 passes, 601 s does not, and 4K
         // gets a quarter of that.
@@ -1027,42 +1157,56 @@ mod tests {
         };
         let mut long = MediaConfig::ov_genai(None);
         long.max_video_seconds = 10_000.0;
-        assert!(hd.bounded(600.0, &long).is_ok());
-        let err = hd.bounded(601.0, &long).unwrap_err();
+        assert!(hd.bounded(600.0, None, &long).is_ok());
+        let err = hd.bounded(601.0, None, &long).unwrap_err();
         assert!(err.contains("shorter or lower-resolution"), "{err}");
         let uhd = Probe {
             width: 3840,
             height: 2160,
             ..hd
         };
-        assert!(uhd.bounded(150.0, &long).is_ok());
-        assert!(uhd.bounded(151.0, &long).is_err());
+        assert!(uhd.bounded(150.0, None, &long).is_ok());
+        assert!(uhd.bounded(151.0, None, &long).is_err());
         // No stated rate: the bound assumes 60 fps.
         let unknown = Probe {
             frame_rate: None,
             ..hd
         };
-        assert!(unknown.bounded(300.0, &long).is_ok());
-        assert!(unknown.bounded(301.0, &long).is_err());
+        assert!(unknown.bounded(300.0, None, &long).is_ok());
+        assert!(unknown.bounded(301.0, None, &long).is_err());
         // A stated frame count past duration x rate counts.
         let dense = Probe {
             nb_frames: Some(100_000),
             ..hd
         };
-        assert!(dense.bounded(10.0, &long).is_err());
+        assert!(dense.bounded(10.0, None, &long).is_err());
     }
 
-    /// A container that states no duration has it read from its packets.
+    /// A packet scan counts frames and keyframes, and spans first to last
+    /// packet plus one frame, whatever the first timestamp.
     #[test]
-    fn duration_comes_from_the_last_packet() {
-        assert_eq!(
-            duration_from_packets(b"0.000000\n0.100000\n2.900000\n2.800000\n", Some(10.0)),
-            Some(3.0)
+    fn packets_are_counted_and_spanned() {
+        let p = parse_packets(
+            b"0.000000,K__\n0.100000,___\n2.900000,___\n2.800000,K__\n",
+            Some(10.0),
         );
-        assert_eq!(duration_from_packets(b"0.5,\n1.5\n", None), Some(1.5));
-        assert_eq!(duration_from_packets(b"0.000000\n", Some(25.0)), Some(0.04));
-        assert_eq!(duration_from_packets(b"", Some(25.0)), None);
-        assert_eq!(duration_from_packets(b"N/A\n", None), None);
+        assert_eq!((p.count, p.keyframes), (4, 2));
+        assert!((p.span.unwrap() - 3.0).abs() < 1e-9, "{p:?}");
+        // A stream that starts at an hour spans its own length.
+        let p = parse_packets(b"3600.000000,K__\n3602.900000,___\n", Some(10.0));
+        assert!((p.span.unwrap() - 3.0).abs() < 1e-9, "{p:?}");
+        assert_eq!(parse_packets(b"0.5,K_\n", None).span, None);
+        assert_eq!(
+            parse_packets(b"0.000000,K__\n", Some(25.0)).span,
+            Some(0.04)
+        );
+        let empty = parse_packets(b"", Some(25.0));
+        assert_eq!((empty.count, empty.span), (0, None));
+        let untimed = parse_packets(b"N/A,K__\nN/A,___\n", None);
+        assert_eq!(
+            (untimed.count, untimed.keyframes, untimed.span),
+            (2, 1, None)
+        );
     }
 
     #[test]
@@ -1198,6 +1342,7 @@ mod tests {
 
     /// Past the deadline, or past the output cap, the child is killed and
     /// reaped: no process (or zombie) is left behind.
+    #[cfg(unix)]
     #[tokio::test]
     async fn bounded_runs_kill_and_reap_their_child() {
         let mut sleep = tokio::process::Command::new("sleep");
@@ -1601,36 +1746,47 @@ mod tests {
             };
             let (app, _) = video_app(slow_ff, |m| {
                 m.video_decode_timeout = Duration::from_millis(1500);
+                m.decode_wait = Duration::from_millis(500);
                 m.video_temp_dir = Some(temp.path().to_path_buf());
             })
             .await;
             super::take_spawned();
-            let t0 = std::time::Instant::now();
-            let (status, v) = post_chat(
-                app.clone(),
-                json!({"model": "mock-model", "messages": [video_msg("x", &url)]}),
-            )
-            .await;
-            assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
-            assert!(
-                error_message(&v).contains(
-                    "decoding this request's videos took longer than 1.5 s; send a shorter or \
-                     lower-resolution clip"
-                ),
-                "{v}"
-            );
-            let pids = super::take_spawned();
-            assert_eq!(pids.len(), 2, "the probe, then the decode: {pids:?}");
-            assert!(pids.iter().all(|&p| super::reaped(p)), "{pids:?}");
-            assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+            // Twice: a request that kept its decode slot would leave none
+            // for the image below (two slots, a short wait).
+            for _ in 0..2 {
+                let t0 = std::time::Instant::now();
+                let (status, v) = post_chat(
+                    app.clone(),
+                    json!({"model": "mock-model", "messages": [video_msg("x", &url)]}),
+                )
+                .await;
+                assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+                assert!(
+                    error_message(&v).contains(
+                        "decoding this request's videos took longer than 1.5 s; send a shorter \
+                         or lower-resolution clip"
+                    ),
+                    "{v}"
+                );
+                let pids = super::take_spawned();
+                assert_eq!(pids.len(), 3, "probe, packet scan, decode: {pids:?}");
+                assert!(pids.iter().all(|&p| super::reaped(p)), "{pids:?}");
+                assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+            }
             let (status, v) = post_chat(
                 app,
-                json!({"model": "mock-model", "max_tokens": 1,
-                    "messages": [{"role": "user", "content": "still there?"}]}),
+                json!({"model": "mock-model", "max_tokens": 1, "messages": [
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "still there?"},
+                        {"type": "image_url", "image_url": {"url": png_url(8, 8)}}]}]}),
             )
             .await;
-            assert_eq!(status, StatusCode::OK, "{v}");
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the decode slots were released: {v}"
+            );
         }
 
         /// The temp file is removed after a decode that works and after one
@@ -1756,20 +1912,24 @@ mod tests {
             assert_eq!(sizes, vec![(240, 320, 1); 2]);
         }
 
-        /// A clip with many source frames per sample is read by seeking, one
-        /// frame per sampled time.
-        #[tokio::test]
-        async fn a_long_clip_is_sampled_by_seeking() {
-            let Some(ff) = ffmpeg() else { return };
-            let url = made(
-                &ff,
+        /// A `testsrc` clip of `secs` s at 160x120 and 30 fps, its timestamps
+        /// starting at an hour, with `x264` options (its GOP), as streamed
+        /// MP4.
+        fn long_clip(ff: &Ffmpeg, secs: u32, x264: &str) -> String {
+            let src = format!("testsrc=size=160x120:rate=30:duration={secs}");
+            made(
+                ff,
                 &[
                     "-f",
                     "lavfi",
                     "-i",
-                    "testsrc=size=160x120:rate=30:duration=60",
+                    &src,
                     "-pix_fmt",
                     "yuv420p",
+                    "-x264-params",
+                    x264,
+                    "-output_ts_offset",
+                    "3600",
                     "-f",
                     "mp4",
                     "-movflags",
@@ -1777,17 +1937,60 @@ mod tests {
                     "pipe:1",
                 ],
                 "video/mp4",
-            );
+            )
+        }
+
+        /// A clip with many source frames per sample and a keyframe a second
+        /// is read by seeking, one frame per sampled time; the labels count
+        /// from the clip's start, not its first timestamp (an hour).
+        #[tokio::test]
+        async fn a_long_clip_is_sampled_by_seeking() {
+            let Some(ff) = ffmpeg() else { return };
+            let url = long_clip(&ff, 60, "keyint=30:min-keyint=30:scenecut=0");
             let (app, seen) = video_app(ff, |_| {}).await;
             super::take_spawned();
             let (prompt, sizes) = frames_of(app, &seen, &url).await;
             assert_eq!(sizes, vec![(160, 120, 1); 16]);
+            assert!(prompt.contains("Frame 1 (0.0s): "), "{prompt:?}");
             assert!(prompt.contains("Frame 2 (3.8s): "), "{prompt:?}");
-            assert!(prompt.contains("Frame 16 ("), "{prompt:?}");
+            assert!(prompt.contains("Frame 16 (56.2s): "), "{prompt:?}");
             assert_eq!(
                 super::take_spawned().len(),
-                1 + 16,
-                "one probe, one run per frame"
+                2 + 16,
+                "probe, packet scan, one run per frame"
+            );
+        }
+
+        /// The same length with one keyframe (`keyint=infinite`, as a
+        /// browser recording nearly has) is read in one pass: seeking would
+        /// decode most of it once per frame.
+        #[tokio::test]
+        async fn a_clip_with_rare_keyframes_is_read_in_one_pass() {
+            let Some(ff) = ffmpeg() else { return };
+            let url = long_clip(&ff, 60, "keyint=infinite:scenecut=0");
+            let (app, seen) = video_app(ff, |_| {}).await;
+            super::take_spawned();
+            let (prompt, sizes) = frames_of(app, &seen, &url).await;
+            assert_eq!(sizes, vec![(160, 120, 1); 16]);
+            assert!(prompt.contains("Frame 16 (56.2s): "), "{prompt:?}");
+            assert_eq!(
+                super::take_spawned().len(),
+                3,
+                "probe, packet scan, one pass"
+            );
+        }
+
+        /// A short clip starting at an hour: one pass, labels from 0 s.
+        #[tokio::test]
+        async fn timestamps_count_from_the_clips_start() {
+            let Some(ff) = ffmpeg() else { return };
+            let url = long_clip(&ff, 3, "keyint=30");
+            let (app, seen) = video_app(ff, |_| {}).await;
+            let (prompt, sizes) = frames_of(app, &seen, &url).await;
+            assert_eq!(sizes.len(), 3);
+            assert!(
+                prompt.contains("Frame 1 (0.0s): ") && prompt.contains("Frame 3 (2.0s): "),
+                "{prompt:?}"
             );
         }
 
