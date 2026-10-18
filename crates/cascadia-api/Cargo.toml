@@ -44,6 +44,9 @@ sha2 = "0.10"
 # Opt-in remote image fetch (`--api-allow-image-urls`).
 reqwest = { workspace = true }
 url = { workspace = true }
+# Video input (`video_url` parts): ffmpeg reads the caller's bytes from a
+# private temp file, removed when the decode ends.
+tempfile = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
