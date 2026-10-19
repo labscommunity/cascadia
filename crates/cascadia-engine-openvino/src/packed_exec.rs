@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use cascadia_engine::{EngineError, EngineResult};
-use cascadia_ov_genai_shim::{DType as ShimDType, Runtime as OvRuntime};
+use cascadia_ov_genai_shim::{DType as ShimDType, Error as OvError, Runtime as OvRuntime};
 use cascadia_types::GenerationTask;
 
 use crate::packed::{image_safe_take, prompt_image_ids, PackedKv, PackedPlan};
@@ -102,12 +102,46 @@ pub(crate) struct PackedLayer {
     pub(crate) val_out: usize,
 }
 
+/// What a packed inference needs of a compiled model: bind inputs, run,
+/// read outputs. [`OvRuntime`] in serving; a fake in the unit tests, so the
+/// width / padding / scatter path of [`PackedState::run_plan`] runs without
+/// OpenVINO.
+pub(crate) trait PackedRuntime: Send {
+    fn set_input(
+        &mut self,
+        name: &str,
+        dtype: ShimDType,
+        shape: &[usize],
+        data: &[u8],
+    ) -> Result<(), OvError>;
+    fn infer(&mut self) -> Result<(), OvError>;
+    fn output(&self, idx: usize) -> Result<(ShimDType, Vec<usize>, Vec<u8>), OvError>;
+}
+
+impl PackedRuntime for OvRuntime {
+    fn set_input(
+        &mut self,
+        name: &str,
+        dtype: ShimDType,
+        shape: &[usize],
+        data: &[u8],
+    ) -> Result<(), OvError> {
+        OvRuntime::set_input(self, name, dtype, shape, data)
+    }
+    fn infer(&mut self) -> Result<(), OvError> {
+        OvRuntime::infer(self)
+    }
+    fn output(&self, idx: usize) -> Result<(ShimDType, Vec<usize>, Vec<u8>), OvError> {
+        OvRuntime::output(self, idx)
+    }
+}
+
 /// The narrow static decode IR (`openvino_packed_decode_model.xml`, NPU):
 /// the packed graph at `seq` query rows, run for every decode step of at most
 /// `seq` live rows. Same ports as the wide IR; its KV ports resolved on their
 /// own.
 pub(crate) struct PackedNarrow {
-    pub(crate) runtime: OvRuntime,
+    pub(crate) runtime: Box<dyn PackedRuntime>,
     pub(crate) layers: Vec<PackedLayer>,
     pub(crate) seq: usize,
 }
@@ -167,7 +201,7 @@ pub(crate) enum PackedStepKind {
 }
 
 pub(crate) struct PackedState {
-    pub(crate) runtime: OvRuntime,
+    pub(crate) runtime: Box<dyn PackedRuntime>,
     /// The wide IR takes any query width up to `packed_seq` (built with
     /// `packed_variant.py --dynamic-seq`, CPU/GPU): every inference runs at
     /// its plan's own width.
@@ -228,7 +262,7 @@ impl PackedState {
     /// `types_in` and `image_token` start unset; a Gemma 4 tree sets them.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        runtime: OvRuntime,
+        runtime: Box<dyn PackedRuntime>,
         kv: PackedKv,
         layers: Vec<PackedLayer>,
         ids_in: String,
@@ -718,8 +752,8 @@ impl PackedState {
         };
         // The narrow decode IR when this width is its width, else the wide IR.
         let (runtime, layers) = match self.narrow.as_mut() {
-            Some(n) if !self.dynamic && n.seq == s => (&mut n.runtime, &n.layers),
-            _ => (&mut self.runtime, &self.layers),
+            Some(n) if !self.dynamic && n.seq == s => (n.runtime.as_mut(), &n.layers),
+            _ => (self.runtime.as_mut(), &self.layers),
         };
         let context = self.kv.context_at(s);
 
@@ -978,7 +1012,7 @@ mod tests {
         let kv = PackedKv::new(slots, 32, packed_seq, 1, 1, 2, ShimDType::F16, 0);
         let masks = vec![PackedMask::new("attn_mask_4d".into(), ShimDType::F16, None)];
         PackedState::new(
-            OvRuntime::stub(),
+            Box::new(OvRuntime::stub()),
             kv,
             Vec::new(),
             "input_ids".into(),
@@ -1088,7 +1122,7 @@ mod tests {
         assert_eq!(st.exec_width(1), 16, "only the wide IR");
         assert_eq!(st.exec_width(16), 16);
         st.narrow = Some(PackedNarrow {
-            runtime: OvRuntime::stub(),
+            runtime: Box::new(OvRuntime::stub()),
             layers: Vec::new(),
             seq: 4,
         });
@@ -1249,4 +1283,205 @@ mod tests {
     }
 
     type TaskIdOf = cascadia_types::TaskId;
+
+    /// A stand-in compiled model: one layer, one KV head of width 2, f16.
+    /// `infer` answers row `r` of a `[1, S]` id feed with logits `[id, r, S,
+    /// 0]` and present K/V that copy the past window and tag column
+    /// `past + r` with the row's id, so a test can see which rows were run at
+    /// which width and where their K/V landed. Every bound input's shape is
+    /// logged under the fake's name.
+    struct FakeRuntime {
+        name: &'static str,
+        log: FakeLog,
+        inputs: HashMap<String, (Vec<usize>, Vec<u8>)>,
+        outputs: Vec<(ShimDType, Vec<usize>, Vec<u8>)>,
+    }
+
+    impl PackedRuntime for FakeRuntime {
+        fn set_input(
+            &mut self,
+            name: &str,
+            _dtype: ShimDType,
+            shape: &[usize],
+            data: &[u8],
+        ) -> Result<(), OvError> {
+            self.log
+                .lock()
+                .unwrap()
+                .push((self.name, name.to_string(), shape.to_vec()));
+            self.inputs
+                .insert(name.to_string(), (shape.to_vec(), data.to_vec()));
+            Ok(())
+        }
+        fn infer(&mut self) -> Result<(), OvError> {
+            let (ishape, ids) = &self.inputs["input_ids"];
+            let s = ishape[1];
+            let ids: Vec<i64> = ids
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            let mut logits = Vec::new();
+            for (r, &id) in ids.iter().enumerate() {
+                for v in [id as f32, r as f32, s as f32, 0.0] {
+                    logits.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            self.outputs = vec![(ShimDType::F32, vec![1, s, 4], logits)];
+            for port in ["past_key_values.0.key", "past_key_values.0.value"] {
+                let (pshape, past) = &self.inputs[port];
+                let mut present = past.clone();
+                for &id in &ids {
+                    for _ in 0..2 {
+                        present.extend_from_slice(&(id as u16).to_le_bytes());
+                    }
+                }
+                self.outputs
+                    .push((ShimDType::F16, vec![1, 1, pshape[2] + s, 2], present));
+            }
+            Ok(())
+        }
+        fn output(&self, idx: usize) -> Result<(ShimDType, Vec<usize>, Vec<u8>), OvError> {
+            Ok(self.outputs[idx].clone())
+        }
+    }
+
+    type FakeLog = std::sync::Arc<std::sync::Mutex<Vec<(&'static str, String, Vec<usize>)>>>;
+
+    fn fake(name: &'static str, log: &FakeLog) -> Box<dyn PackedRuntime> {
+        Box::new(FakeRuntime {
+            name,
+            log: log.clone(),
+            inputs: HashMap::new(),
+            outputs: Vec::new(),
+        })
+    }
+
+    fn fake_layers() -> Vec<PackedLayer> {
+        vec![PackedLayer {
+            key_in: "past_key_values.0.key".into(),
+            val_in: "past_key_values.0.value".into(),
+            key_out: 1,
+            val_out: 2,
+        }]
+    }
+
+    /// 4 slots over a 32-column past (region 8), `packed_seq` 8, on fakes:
+    /// `narrow` adds a 4-row decode IR, `dynamic` makes the wide IR dynamic.
+    fn fake_state(narrow: bool, dynamic: bool) -> (PackedState, FakeLog) {
+        let log: FakeLog = Default::default();
+        let kv = PackedKv::new(4, 32, 8, 1, 1, 2, ShimDType::F16, 0);
+        let masks = vec![PackedMask::new("attn_mask_4d".into(), ShimDType::F16, None)];
+        let mut st = PackedState::new(
+            fake("wide", &log),
+            kv,
+            fake_layers(),
+            "input_ids".into(),
+            String::new(),
+            0,
+            masks,
+            "position_ids".into(),
+        );
+        st.dynamic = dynamic;
+        if narrow {
+            st.narrow = Some(PackedNarrow {
+                runtime: fake("narrow", &log),
+                layers: fake_layers(),
+                seq: 4,
+            });
+        }
+        (st, log)
+    }
+
+    /// The shapes each fake was fed in the last inference, by port.
+    fn fed(log: &FakeLog) -> HashMap<String, (&'static str, Vec<usize>)> {
+        log.lock()
+            .unwrap()
+            .drain(..)
+            .map(|(who, port, shape)| (port, (who, shape)))
+            .collect()
+    }
+
+    /// The KV a slot's first column holds after a step: the f16 tag its row
+    /// wrote (the row's id).
+    fn first_col(st: &PackedState, slot: usize) -> u16 {
+        let off = st.kv.region * slot * 4; // head_dim 2 x f16
+        u16::from_le_bytes([st.kv.key_bytes(0)[off], st.kv.key_bytes(0)[off + 1]])
+    }
+
+    /// A 2-row decode plan on each kind of stage: the narrow IR (4 rows, 2
+    /// idle), the wide IR alone (8 rows), the dynamic IR (2 rows). Every
+    /// port is bound at that width, the output comes back at the plan's 2
+    /// rows, and each live row's K/V lands in its own slot identically.
+    #[test]
+    fn run_plan_runs_a_decode_plan_at_each_stages_width() {
+        for (narrow, dynamic, who, width) in [
+            (true, false, "narrow", 4usize),
+            (false, false, "wide", 8),
+            (false, true, "wide", 2),
+        ] {
+            let (mut st, log) = fake_state(narrow, dynamic);
+            let plan = PackedPlan::decode(2, &[0, 2]);
+            let (_, shape, bytes) = st
+                .run_plan(
+                    &plan,
+                    PackedPrimary::Ids(&[11, 22]),
+                    &[0, 0],
+                    &[0, 0],
+                    &PackedExtras::default(),
+                )
+                .unwrap();
+            let ports = fed(&log);
+            for (port, want) in [
+                ("input_ids", vec![1, width]),
+                ("position_ids", vec![1, width]),
+                ("attn_mask_4d", vec![1, 1, width, 32 + width]),
+                ("past_key_values.0.key", vec![1, 1, 32, 2]),
+            ] {
+                assert_eq!(ports[port], (who, want), "{who} {width}: {port}");
+            }
+            assert_eq!(shape, vec![1, 2, 4], "trimmed to the plan's rows");
+            let row = |r: usize| -> Vec<f32> {
+                bytes[r * 16..r * 16 + 16]
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .collect()
+            };
+            assert_eq!(row(0), vec![11.0, 0.0, width as f32, 0.0]);
+            assert_eq!(row(1), vec![22.0, 1.0, width as f32, 0.0]);
+            assert_eq!((first_col(&st, 0), first_col(&st, 2)), (11, 22), "{who}");
+            assert_eq!((st.kv.position(0), st.kv.position(2)), (1, 1));
+            assert_eq!(st.last_plan_rows().len(), 2, "the wire carries 2 rows");
+        }
+    }
+
+    /// A prefill chunk (`packed_seq` rows) runs on the wide IR even when a
+    /// narrow decode IR is loaded; a plan wider than `packed_seq` is refused.
+    #[test]
+    fn run_plan_keeps_prefill_on_the_wide_ir() {
+        let (mut st, log) = fake_state(true, false);
+        let plan = PackedPlan::chunk(8, 1, 3);
+        let (_, shape, _) = st
+            .run_plan(
+                &plan,
+                PackedPrimary::Ids(&[5, 6, 7]),
+                &[0, 1, 2],
+                &[0, 0, 0],
+                &PackedExtras::default(),
+            )
+            .unwrap();
+        assert_eq!(fed(&log)["input_ids"], ("wide", vec![1, 8]));
+        assert_eq!(shape, vec![1, 8, 4]);
+        assert_eq!(first_col(&st, 1), 5);
+        assert_eq!(st.kv.position(1), 3);
+        let err = st
+            .run_plan(
+                &PackedPlan::idle(9),
+                PackedPrimary::Ids(&[]),
+                &[],
+                &[],
+                &PackedExtras::default(),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("9 rows"), "{err}");
+    }
 }
