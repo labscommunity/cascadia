@@ -2883,6 +2883,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
                 video = media.accepts_video(),
                 max_videos = media.max_videos,
                 max_video_frames = media.max_video_frames,
+                native_video = media.native_video,
                 "VLM export: accepting image_url content parts"
             );
             cfg.media = Some(media);

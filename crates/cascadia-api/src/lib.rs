@@ -2152,8 +2152,10 @@ struct PreparedMedia {
     messages: Vec<ChatMessage>,
     inputs: Vec<cascadia_types::MediaInput>,
     cfg: Arc<MediaConfig>,
-    /// How many of `inputs` are video frames.
+    /// How many of `inputs` are video frames (served as images).
     frames: usize,
+    /// How many of `inputs` are native videos ([`MediaConfig::native_video`]).
+    videos: usize,
 }
 
 impl PreparedMedia {
@@ -2169,7 +2171,7 @@ impl PreparedMedia {
     /// or tool definitions). Each reserved string may occur only as often as
     /// the placeholders themselves carry it.
     fn check_placeholders(&self, prompt: &str) -> Result<(), String> {
-        let n = self.inputs.len();
+        let n = self.inputs.len() - self.videos;
         if let Err(found) = self.cfg.placeholders_complete(prompt, n) {
             let sent = if self.frames > 0 {
                 format!("{n} images (video frames included)")
@@ -2181,7 +2183,17 @@ impl PreparedMedia {
                  placeholders; this model's prompt format dropped the messages holding the rest"
             ));
         }
-        if let Some(tag) = self.cfg.reserved_beyond_placeholders(prompt, n) {
+        if let Err(found) = self.cfg.video_placeholders_complete(prompt, self.videos) {
+            return Err(format!(
+                "{} videos were sent but the rendered prompt carries {found} video \
+                 placeholders; this model's prompt format dropped the messages holding the rest",
+                self.videos
+            ));
+        }
+        if let Some(tag) = self
+            .cfg
+            .reserved_beyond_placeholders(prompt, n, self.videos)
+        {
             return Err(format!(
                 "message text must not contain `{tag}`: it is reserved for image placeholders"
             ));
@@ -2279,7 +2291,9 @@ fn chat_caller_text(req: &ChatCompletionRequest) -> Vec<std::borrow::Cow<'_, str
 /// pool: a large JPEG takes tens of milliseconds and would stall every
 /// connection on this worker. A video is decoded by an ffmpeg subprocess
 /// (see [`video`]) into frames that are served as images, each behind a
-/// `Frame k (t s): ` label, as if the caller had sent them that way.
+/// `Frame k (t s): ` label, as if the caller had sent them that way; on an
+/// engine that takes video natively ([`MediaConfig::native_video`]) the
+/// frames are one video item behind the video tag instead.
 async fn prepare_media(
     state: &AppState,
     messages: &[ChatMessage],
@@ -2466,12 +2480,22 @@ async fn prepare_media(
     // Each video's plan caps its frames, and the counts were checked above.
     debug_assert!(count + frames <= cfg.max_images + cfg.max_videos * cfg.max_video_frames);
     let several_videos = videos > 1;
+    // A native video is one item behind its own tag; otherwise its frames
+    // are images.
+    let (frames, native_videos) = if cfg.native_video {
+        (0, videos)
+    } else {
+        (frames, 0)
+    };
     let decoded = tokio::task::spawn_blocking(move || {
         let _decode_permit = decode_permit;
         let mut image_bytes = image_bytes.into_iter();
         let mut video_frames = video_frames.into_iter();
         let mut video_index = 0;
-        let mut inputs = Vec::with_capacity(count + frames);
+        // Images (video frames included) and native videos number their
+        // tags apart, as GenAI matches them.
+        let mut image_index = 0;
+        let mut inputs = Vec::with_capacity(count + frames + native_videos);
         let mut out = Vec::with_capacity(messages.len());
         for mut m in messages {
             if m.parts.is_empty() {
@@ -2483,13 +2507,25 @@ async fn prepare_media(
                 match part {
                     ContentPart::Text(t) => pieces.push((false, decode_cfg.text_part(t))),
                     ContentPart::ImageUrl { detail, .. } => {
-                        let i = inputs.len();
+                        let i = image_index;
+                        image_index += 1;
                         let bytes = image_bytes.next().expect("one byte buffer per image");
                         let input =
                             media::decode_image_bytes(&bytes, detail.as_deref(), &decode_cfg)
                                 .map_err(|e| format!("image {i}: {e}"))?;
                         inputs.push(input);
                         pieces.push((true, decode_cfg.placeholder(i)));
+                    }
+                    // The whole video behind its own tag: the engine (GenAI)
+                    // encodes its frames together, with their times.
+                    ContentPart::VideoUrl { .. } if decode_cfg.native_video => {
+                        let frames = video_frames.next().expect("frames for every video");
+                        let j = video_index;
+                        video_index += 1;
+                        let input = video::video_input(frames)
+                            .ok_or_else(|| format!("video {j}: its frames differ in size"))?;
+                        inputs.push(input);
+                        pieces.push((true, decode_cfg.video_tag(j)));
                     }
                     // Each frame as the caller would have sent it: a text
                     // part naming it, then the image.
@@ -2500,7 +2536,8 @@ async fn prepare_media(
                         for (k, frame) in frames.into_iter().enumerate() {
                             let label = video::frame_label(video_no, k + 1, frame.secs);
                             pieces.push((false, decode_cfg.text_part(label)));
-                            pieces.push((true, decode_cfg.placeholder(inputs.len())));
+                            pieces.push((true, decode_cfg.placeholder(image_index)));
+                            image_index += 1;
                             inputs.push(frame.input);
                         }
                     }
@@ -2520,6 +2557,7 @@ async fn prepare_media(
             inputs,
             cfg,
             frames,
+            videos: native_videos,
         })),
         Ok(Err(msg)) => Err(reject(msg)),
         Err(join_err) => Err(decode_task_failed(join_err)),
@@ -3451,7 +3489,7 @@ async fn admit_chat(
     } else if let Some(tag) = state
         .media
         .as_deref()
-        .and_then(|cfg| cfg.reserved_beyond_placeholders(&prompt, 0))
+        .and_then(|cfg| cfg.reserved_beyond_placeholders(&prompt, 0, 0))
     {
         // The per-field scan above only names the field; this is the check
         // that holds. The template decodes tool-call `arguments` (JSON

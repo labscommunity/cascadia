@@ -6,7 +6,8 @@
 //! `https` URLs are fetched only when the operator opts in
 //! ([`MediaConfig::allow_remote_urls`]), and only from public addresses: see
 //! [`fetch_image`]. Videos (`video_url` parts) become frames here too, by
-//! way of [`crate::video`].
+//! way of [`crate::video`], or one native video item where the engine takes
+//! one ([`MediaConfig::native_video`]).
 
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -109,6 +110,20 @@ pub struct MediaConfig {
     /// only; not exposed as a flag.
     #[doc(hidden)]
     pub video_temp_dir: Option<std::path::PathBuf>,
+    /// The engine takes a video whole ([`MediaKind::Video`], its sampled
+    /// frames as one item behind [`MediaConfig::video_placeholder`]) instead
+    /// of as labelled frames through the image path. Only ov-genai, on the
+    /// families GenAI preprocesses video for ([`GENAI_NATIVE_VIDEO`]).
+    pub native_video: bool,
+    /// Text that marks native video `i` in the prompt, with `{i}` replaced by
+    /// the video's index in the request (its own sequence, apart from the
+    /// images'). Unused unless [`MediaConfig::native_video`].
+    pub video_placeholder: String,
+    /// A native video's sampled frames are rounded up to a multiple of this
+    /// (within [`MediaConfig::max_video_frames`]): Qwen's vision encoder takes
+    /// frames in pairs and pads an odd count with a copy of the last frame,
+    /// so the extra frame costs nothing and shows the model one more moment.
+    pub video_frame_multiple: usize,
 }
 
 /// Bytes a `data:` URL needs to carry `raw` bytes base64-encoded, plus room
@@ -169,6 +184,25 @@ const GENAI_NATIVE_TAGS: &[(&[&str], &[&str])] = &[
     (&["gemma4"], &["<|image|>", "<|video|>"]),
 ];
 
+/// The export `model_type`s GenAI 2026.4.1 preprocesses video for, so a video
+/// goes to it whole, and the frame multiple each needs (Qwen's temporal
+/// patch is two frames). Verified live (correct answers, a fraction of the
+/// frames-as-images tokens): qwen2_5_vl, qwen3_vl, qwen3_5_moe, gemma4. The
+/// rest share a verified type's preprocessing in GenAI. `llava_next_video`
+/// is in GenAI's video list but untested here. Every other type
+/// (InternVL2 and LLaVA-NeXT throw "Video preprocessing isn't implemented
+/// for this model") gets a video as labelled frames.
+const GENAI_NATIVE_VIDEO: &[(&str, usize)] = &[
+    ("qwen2_vl", 2),
+    ("qwen2_5_vl", 2),
+    ("qwen3_vl", 2),
+    ("qwen3_vl_moe", 2),
+    ("qwen3_5", 2),
+    ("qwen3_5_moe", 2),
+    ("gemma4", 1),
+    ("llava_next_video", 1),
+];
+
 /// The text an ov-genai export must refuse in caller messages: the universal
 /// tags plus `model_type`'s native ones, or every known native tag when the
 /// type is missing or not listed (a tag GenAI reads that this server does
@@ -198,6 +232,7 @@ impl MediaConfig {
     /// Settings for the ov-genai engine on a VLM-layout export whose
     /// `config.json` names `model_type` (see [`GENAI_NATIVE_TAGS`]).
     pub fn ov_genai(model_type: Option<&str>) -> Self {
+        let native = model_type.and_then(|t| GENAI_NATIVE_VIDEO.iter().find(|(n, _)| *n == t));
         Self {
             image_placeholder: "<ov_genai_image_{i}>".into(),
             reserved_text: genai_reserved_text(model_type),
@@ -225,6 +260,9 @@ impl MediaConfig {
             max_request_video_bytes: 32 << 20,
             video_decode_timeout: Duration::from_secs(30),
             video_temp_dir: None,
+            native_video: native.is_some(),
+            video_placeholder: "<ov_genai_video_{i}>".into(),
+            video_frame_multiple: native.map_or(1, |&(_, m)| m),
         }
     }
 
@@ -374,6 +412,11 @@ impl MediaConfig {
             .replace("{n}", &(i + 1).to_string())
     }
 
+    /// The placeholder of native video `i` (see [`MediaConfig::native_video`]).
+    pub fn video_tag(&self, i: usize) -> String {
+        self.video_placeholder.replace("{i}", &i.to_string())
+    }
+
     /// The placeholder's text before its index, when it is indexed.
     fn indexed_prefix(&self) -> Option<&str> {
         let at = ["{i}", "{n}"]
@@ -384,10 +427,18 @@ impl MediaConfig {
     }
 
     /// A reserved string `prompt` carries more often than its `n` image
-    /// placeholders do, if any.
-    pub fn reserved_beyond_placeholders<'a>(&'a self, prompt: &str, n: usize) -> Option<&'a str> {
+    /// placeholders and `videos` native video placeholders do, if any.
+    pub fn reserved_beyond_placeholders<'a>(
+        &'a self,
+        prompt: &str,
+        n: usize,
+        videos: usize,
+    ) -> Option<&'a str> {
         self.reserved_text.iter().map(String::as_str).find(|r| {
-            let allowed: usize = (0..n).map(|i| self.placeholder(i).matches(r).count()).sum();
+            let allowed: usize = (0..n)
+                .map(|i| self.placeholder(i).matches(r).count())
+                .chain((0..videos).map(|j| self.video_tag(j).matches(r).count()))
+                .sum();
             prompt.matches(r).count() > allowed
         })
     }
@@ -398,6 +449,23 @@ impl MediaConfig {
             .iter()
             .map(String::as_str)
             .find(|r| text.contains(r))
+    }
+
+    /// Whether the rendered `prompt` carries `n` native videos' placeholders,
+    /// each exactly once; `Err` holds how many video tags it carries.
+    pub fn video_placeholders_complete(&self, prompt: &str, n: usize) -> Result<(), usize> {
+        let prefix = self
+            .video_placeholder
+            .find("{i}")
+            .map_or(self.video_placeholder.as_str(), |at| {
+                &self.video_placeholder[..at]
+            });
+        let found = prompt.matches(prefix).count();
+        if found == n && (0..n).all(|j| prompt.matches(&self.video_tag(j)).count() == 1) {
+            Ok(())
+        } else {
+            Err(found)
+        }
     }
 
     /// Whether the rendered `prompt` carries `n` images' placeholders, each
@@ -1266,6 +1334,74 @@ mod tests {
     }
 
     #[test]
+    fn native_video_routes_by_model_type() {
+        for t in [
+            "qwen2_vl",
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+        ] {
+            let cfg = MediaConfig::ov_genai(Some(t));
+            assert!(cfg.native_video, "{t}");
+            assert_eq!(cfg.video_frame_multiple, 2, "{t}");
+        }
+        for t in ["gemma4", "llava_next_video"] {
+            let cfg = MediaConfig::ov_genai(Some(t));
+            assert!(cfg.native_video, "{t}");
+            assert_eq!(cfg.video_frame_multiple, 1, "{t}");
+        }
+        for t in [
+            Some("internvl_chat"),
+            Some("llava_next"),
+            Some("gemma3"),
+            Some("phi3_v"),
+            Some("some_new_vlm"),
+            None,
+        ] {
+            let cfg = MediaConfig::ov_genai(t);
+            assert!(!cfg.native_video, "{t:?}");
+            assert_eq!(cfg.video_frame_multiple, 1, "{t:?}");
+        }
+        // The engines that encode images themselves take video as frames.
+        for cfg in [
+            MediaConfig::qwen35_native(),
+            MediaConfig::gemma4_native(),
+            MediaConfig::gemma3_native(),
+            MediaConfig::pixtral_native(),
+            MediaConfig::phi3v_native(),
+            MediaConfig::llava_next_native(),
+            MediaConfig::internvl_native(),
+        ] {
+            assert!(!cfg.native_video, "{}", cfg.image_placeholder);
+        }
+    }
+
+    #[test]
+    fn video_tags_are_counted_apart_from_image_tags() {
+        let cfg = MediaConfig::ov_genai(Some("qwen3_vl"));
+        assert_eq!(cfg.video_tag(1), "<ov_genai_video_1>");
+        let prompt = "<ov_genai_image_0><ov_genai_video_0>x<ov_genai_image_1><ov_genai_video_1>";
+        assert_eq!(cfg.placeholders_complete(prompt, 2), Ok(()));
+        assert_eq!(cfg.video_placeholders_complete(prompt, 2), Ok(()));
+        assert_eq!(cfg.video_placeholders_complete(prompt, 1), Err(2));
+        assert_eq!(
+            cfg.video_placeholders_complete("<ov_genai_image_0>", 0),
+            Ok(())
+        );
+        assert_eq!(
+            cfg.video_placeholders_complete("<ov_genai_video_1>", 1),
+            Err(1)
+        );
+        assert_eq!(cfg.reserved_beyond_placeholders(prompt, 2, 2), None);
+        assert_eq!(
+            cfg.reserved_beyond_placeholders(prompt, 2, 1),
+            Some("<ov_genai_video_")
+        );
+    }
+
+    #[test]
     fn placeholders_and_reserved_text() {
         let cfg = MediaConfig::ov_genai(None);
         assert_eq!(cfg.placeholder(3), "<ov_genai_image_3>");
@@ -1314,9 +1450,9 @@ mod tests {
         let two = format!("{}a{}", p.placeholder(0), p.placeholder(1));
         assert_eq!(p.placeholders_complete(&two, 2), Ok(()));
         assert_eq!(p.placeholders_complete(&p.placeholder(1), 1), Err(1));
-        assert_eq!(p.reserved_beyond_placeholders(&two, 2), None);
+        assert_eq!(p.reserved_beyond_placeholders(&two, 2, 0), None);
         assert_eq!(
-            p.reserved_beyond_placeholders(&format!("{two}<|image_9|>"), 2),
+            p.reserved_beyond_placeholders(&format!("{two}<|image_9|>"), 2, 0),
             Some("<|image_")
         );
         assert_eq!(p.reserved_in("a <|image|> b"), Some("<|image|>"));
@@ -1326,7 +1462,7 @@ mod tests {
         assert_eq!(tag, "<img><IMG_CONTEXT></img>\n");
         assert_eq!(iv.placeholders_complete(&format!("{tag}{tag}"), 2), Ok(()));
         assert_eq!(
-            iv.reserved_beyond_placeholders(&format!("{tag}</img>"), 1),
+            iv.reserved_beyond_placeholders(&format!("{tag}</img>"), 1, 0),
             Some("</img>")
         );
         assert_eq!(iv.reserved_in("<image> is fine"), None);
@@ -1341,7 +1477,7 @@ mod tests {
         );
         assert!(g3.reserved_in("x<end_of_image>").is_some());
         assert_eq!(
-            g3.reserved_beyond_placeholders(&format!("{tag}a{tag}"), 1),
+            g3.reserved_beyond_placeholders(&format!("{tag}a{tag}"), 1, 0),
             Some("<start_of_image>")
         );
         assert_eq!(g3.text_part(" a \n".into()), "a");
@@ -1350,24 +1486,27 @@ mod tests {
         assert_eq!(x.text_part(" a ".into()), " a ");
         // A tag split across two text parts only appears once they are joined.
         assert_eq!(
-            x.reserved_beyond_placeholders("[IMG]a[IMG_BREAK]", 1),
+            x.reserved_beyond_placeholders("[IMG]a[IMG_BREAK]", 1, 0),
             Some("[IMG_BREAK]")
         );
         assert_eq!(
-            x.reserved_beyond_placeholders("[IMG]a[IMG]", 1),
+            x.reserved_beyond_placeholders("[IMG]a[IMG]", 1, 0),
             Some("[IMG]")
         );
-        assert_eq!(x.reserved_beyond_placeholders("[IMG]a[IMG]", 2), None);
+        assert_eq!(x.reserved_beyond_placeholders("[IMG]a[IMG]", 2, 0), None);
         let q = MediaConfig::qwen35_native();
         let tag = q.placeholder(0);
-        assert_eq!(q.reserved_beyond_placeholders(&format!("a{tag}b"), 1), None);
         assert_eq!(
-            q.reserved_beyond_placeholders(&format!("a{tag}<|video_pad|>"), 1),
+            q.reserved_beyond_placeholders(&format!("a{tag}b"), 1, 0),
+            None
+        );
+        assert_eq!(
+            q.reserved_beyond_placeholders(&format!("a{tag}<|video_pad|>"), 1, 0),
             Some("<|video_pad|>")
         );
         let o = MediaConfig::ov_genai(None);
         assert_eq!(
-            o.reserved_beyond_placeholders("<ov_genai_image_0><ov_genai_image_1>", 2),
+            o.reserved_beyond_placeholders("<ov_genai_image_0><ov_genai_image_1>", 2, 0),
             None
         );
         assert_eq!(base64_len(3), 4 + 256);
@@ -1399,11 +1538,11 @@ mod tests {
         assert_eq!(l.placeholders_complete("<image>\n<image>\nA:B:", 2), Ok(()));
         assert_eq!(l.reserved_in("say <image> please"), Some("<image>"));
         assert_eq!(
-            l.reserved_beyond_placeholders("<image>\n<image>\nA:B:", 2),
+            l.reserved_beyond_placeholders("<image>\n<image>\nA:B:", 2, 0),
             None
         );
         assert_eq!(
-            l.reserved_beyond_placeholders("<image>\nA <image>", 1),
+            l.reserved_beyond_placeholders("<image>\nA <image>", 1, 0),
             Some("<image>")
         );
         // Every other family keeps the parts in order.
@@ -1470,7 +1609,7 @@ mod tests {
             // The universal placeholder never trips its own family's tags.
             let tags = format!("{}{}", cfg.placeholder(0), cfg.placeholder(1));
             assert_eq!(
-                cfg.reserved_beyond_placeholders(&tags, 2),
+                cfg.reserved_beyond_placeholders(&tags, 2, 0),
                 None,
                 "{model_type:?}"
             );
