@@ -111,9 +111,9 @@ On the Arc 140V iGPU (OpenVINO 2026.4.1, same tree, 4 slots, greedy, 128 tokens)
 
 | decode width | s/step | 3 requests, tok/s total | text vs GPU static (0.26 s/step) |
 |---|---|---|---|
-| 64 rows (no flag) | 0.40 | 7.45 | coherent; diverges after ~36 chars |
-| `--decode-seq 4` | 0.33 | 8.91 | coherent; diverges after ~36 chars |
-| `--dynamic-seq` | 0.28 | 10.21 | identical, all 3 requests |
+| 64 rows (no flag) | 0.40 | 7.14 | coherent; diverges after ~36 chars |
+| `--decode-seq 4` | 0.33 | 8.90 | coherent; diverges after ~36 chars |
+| `--dynamic-seq` | 0.28 | 10.29 | identical, all 3 requests |
 
 The fixed-width IRs drift from the static path in f16 (one prefill step's
 logits differ by up to 2.4 against 0.03 for the dynamic IR at the same 64
