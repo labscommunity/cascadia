@@ -2319,7 +2319,8 @@ impl Qwen36Engine {
         let reset_started = Instant::now();
         for (i, st) in self.stages.iter_mut().enumerate() {
             // A stage this recovery just recompiled is fresh (default state, never run): nothing
-            // to scrub, and its first native call stays the bounded first infer (Task 54).
+            // to scrub. Its next device call is the bounded first infer (Task 54); only host-side
+            // input_names/set_input run on it before that.
             if self.fresh_requests.contains(&Slot::Stage(i)) {
                 error!(
                     stage = format!("stage{i}"),
