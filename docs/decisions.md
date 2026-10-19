@@ -778,8 +778,10 @@ With the recompile (build 0c61635a) the same soak on pawan-01 recovered from the
 on stage3 and on stage6, and served the next request each time.
 
 **The old stage is never dropped.** Its destructor could wait forever on the stuck request, so
-the whole old copy (compiled model and weights) is leaked, whatever the recompile does. **Each
-recovery costs about one stage of memory**: the stage's weight file, 1.49 GB for stage6 and
+the whole old copy (compiled model and weights) is leaked, whatever the recompile does. The same
+holds when the engine fails instead (cap reached, no recipe, a request that cannot be abandoned)
+and for a recompiled copy whose first infer fails or does not return: that copy is leaked too,
+never left to drop with the engine. **Each recovery costs about one stage of memory**: the stage's weight file, 1.49 GB for stage6 and
 2.47 GB for stage7 of the 9B int8 tree, on a GPU that shares the host's RAM (31.6 GB on p01).
 
 A recompiled stage needs nothing re-bound. Every input is set on each infer, and its variable
@@ -822,24 +824,31 @@ leaked stage copies (about 3.2 GB) decodes 12-20% slower per stage, the embeddin
 chat took +16% (126 to 146 ms/token); this matches the +15% seen in the soak after the second
 recovery. One leaked copy, or any number of recompiles whose old copies are freed, showed no
 slowdown, so the cost is holding two leaked copies, not the recompile or the fault. Freeing a
-faulted copy is unsafe (its destructor can hang), so the engine keeps serving, slower. When a
-recompile that succeeds brings the engine to two leaked copies, it logs one `warn` line, once per
-engine: `qwen36: engine degraded: 2 stage copies leaked by fault recovery (N bytes); decode is
-slower until the server restarts (measured +16% with two on an Arc 140V); restart recommended`,
-with `leaked_copies`, `leaked_bytes` and `cap` fields (a helper thread leaked by a timed-out
-recompile is named in the text if one has happened). `/metrics` exposes
+faulted copy is unsafe (its destructor can hang), so the engine keeps serving, slower. At the
+engine's second successful recompile it logs one `warn` line, once per engine: `qwen36: engine
+degraded: 2 stage copies leaked by fault recovery (N bytes); decode is slower until the server
+restarts (measured +16% with two on an Arc 140V); restart recommended`, with `leaked_copies`,
+`leaked_bytes` and `cap` fields. The rule keys on successful recompiles: a recovery that fails
+also leaks a copy, but it fails the engine, so no later recompile can warn. The code would name a
+helper thread leaked by a timed-out recompile in the text, but that cannot happen today: a
+timed-out recompile fails the engine. The API process's `/metrics` exposes
 `cascadia_engine_stage_recompiles_total` (counter: successful recompiles) and
-`cascadia_engine_leaked_stage_bytes` (gauge: the leaked copies' weight bytes). Restart to recover
-full speed.
+`cascadia_engine_leaked_stage_bytes` (gauge: the weight bytes of every stage copy fault recovery
+leaked, whether or not its recompile succeeded). Only the API process (rank 0) serves `/metrics`,
+so a pipeline relay's recompiles are counted in the relay's own process and never exposed; they
+show only in that relay's log. Restart to recover full speed.
 
 Each recovery step is one `error` line, `qwen36: stage recovery`, with `stage`, `action`
-(`probe`, `cancel`, `wait`, `abandon`, `recompile`, `first_infer`, `reset` or `recreate`),
-`outcome` and `elapsed_ms`. The `recompile` line also carries:
+(`probe`, `cancel`, `wait`, `abandon`, `recompile`, `first_infer`, `leak`, `reset` or `recreate`),
+`outcome` and `elapsed_ms`. `leak` is logged when the engine fails with the faulted copy still in
+its slot (cap reached, no recipe, or a request that could not be abandoned), with `leaked_bytes`
+and `process_leaked`. The `recompile` line also carries:
 
 - `recompiled`: this engine's count of recompiles, this one included;
 - `cap`: the limit, 2;
 - `leaked_bytes`: the size of the leaked stage's weight file;
-- `process_leaked`: every stage this process has leaked by recompiling;
+- `process_leaked`: the stage copies this process has leaked on purpose (a copy left with a
+  helper thread that timed out or died is not included);
 - `leaked_requests`: every request the native shim has leaked in this process.
 
 Its outcome is `ok`, `failed`, `timeout` or `refused: cap`. The recompiled stage's first infer
@@ -948,10 +957,11 @@ the prefix cache writes the restored state straight over them. This is safe beca
 `set_state_blob` writes every VariableState or fails (the blob's state count must equal the
 request's, and every state must apply); a failed restore recreates the requests and prefills
 cold. Every other admission (a cold decision pass, chat, a kv_coord restore, the scrub after a
-failed task, a stage recovery) runs the deferred scrub first, a recreate, so nothing prefills on
-the finished pass's state. Pipelines are unchanged: they reset after every pass. The cost of that
-scrub moves rather than disappearing: a chat that follows a decision pass pays the recreate at its
-own admission (before its first token), where before the decision request paid it at its finish.
+failed task, a stage recovery) runs the deferred scrub first (a recreate after a warm pass, else
+the cheap reset), so nothing prefills on the finished pass's state. Pipelines are unchanged: they
+reset after every pass. The cost of that scrub moves rather than disappearing: a chat that follows
+a decision pass pays that scrub (a recreate after a warm pass, else the cheap reset) at its own
+admission (before its first token), where before the decision request paid it at its finish.
 Measured on pawan-03 (Arc 140V, 40 td40 cases, build 8f6d8f1a vs 0c61635a): a Kev restore fell
 from about 300 ms to about 91-100 ms with `prime_ms` 0 and no recreate, and Kev p50 fell from
 3.56 s to 2.41 s (-32%, p90 4.13 s to 2.85 s). Answers were identical (max |dp| 0, no flips) for
