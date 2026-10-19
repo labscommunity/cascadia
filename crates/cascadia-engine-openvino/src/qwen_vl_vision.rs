@@ -399,13 +399,23 @@ impl Layout {
             ));
         }
         let tokens_per_second = match kind {
+            // Qwen2.5-VL ships 2 (as does GenAI's default); a config without
+            // it keeps images working and videos on the shipped spacing.
             Kind::Qwen25Vl => Some(
-                vlm_config
+                match vlm_config
                     .get("vision_config")
                     .and_then(|v| v.get("tokens_per_second"))
                     .and_then(serde_json::Value::as_u64)
-                    .ok_or("Qwen2.5-VL config lacks vision_config.tokens_per_second")?
-                    as u32,
+                {
+                    Some(t) => t as u32,
+                    None => {
+                        tracing::warn!(
+                            "Qwen2.5-VL config lacks vision_config.tokens_per_second; \
+                             video positions use 2"
+                        );
+                        2
+                    }
+                },
             ),
             Kind::Qwen3Vl => None,
         };

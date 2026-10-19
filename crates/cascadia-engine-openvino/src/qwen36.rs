@@ -870,9 +870,13 @@ const THINK_BLOCK: &str = "\n<think>\n\n</think>\n\n";
 /// One implementation so `submit`'s window guard and `step_local` cannot size different sequences:
 /// counting the bare prompt let a `max_ctx - 1` prompt through and then prefilled past
 /// `max_position_embeddings`.
-fn admitted_prompt_ids(tok: &Tokenizer, task: &GenerationTask) -> Result<Vec<u32>, String> {
+fn admitted_prompt_ids(
+    tok: &Tokenizer,
+    task: &GenerationTask,
+    temporal: usize,
+) -> Result<Vec<u32>, String> {
     let mut ids = tok
-        .encode(prompt_text(task).as_ref(), true)
+        .encode(prompt_text(task, temporal).as_ref(), true)
         .map_err(|e| e.to_string())?
         .get_ids()
         .to_vec();
@@ -913,10 +917,10 @@ fn encode_video(
 
 /// The text rank 0 tokenizes: the rendered prompt, each video's
 /// `<|video_pad|>` replaced by its per-group timestamp markup as HF's
-/// Qwen3.5 processor writes it (frames in pairs, the vision IRs' temporal
-/// patch). Unchanged for a turn without videos.
-fn prompt_text(task: &GenerationTask) -> std::borrow::Cow<'_, str> {
-    crate::qwen35_vision::video::with_frame_markup(&task.prompt, &task.media, 2)
+/// Qwen3.5 processor writes it (frames grouped by `temporal`, the video
+/// processor's temporal patch). Unchanged for a turn without videos.
+fn prompt_text(task: &GenerationTask, temporal: usize) -> std::borrow::Cow<'_, str> {
+    crate::qwen35_vision::video::with_frame_markup(&task.prompt, &task.media, temporal)
 }
 
 fn map_wire(err: TransportError) -> EngineError {
@@ -1357,6 +1361,14 @@ impl Qwen36Engine {
             &task.tenant,
         )
         .map(Some)
+    }
+
+    /// Frames per temporal group of a video (the video processor's temporal
+    /// patch; 2 without a vision tree, where no video is admitted).
+    fn video_temporal(&self) -> usize {
+        self.vision
+            .as_ref()
+            .map_or(2, |v| v.video.temporal_patch_size as usize)
     }
 
     /// Admission wrapper over [`Self::prepare_vision`]: on success `prompt_ids`
@@ -1879,15 +1891,15 @@ impl Qwen36Engine {
             // warm-resume (chain-wide RESTORE of the pulled KV) or cold-reset to position 0.
             self.epoch = self.epoch.wrapping_add(1);
             let tokenizer = self.tokenizer.as_ref().expect("rank 0 has tokenizer");
-            let mut prompt_ids: Vec<u32> = match tokenizer.encode(prompt_text(&task).as_ref(), true)
-            {
-                Ok(e) => e.get_ids().to_vec(),
-                Err(e) => {
-                    warn!(task = %task.task_id, error = %e, "tokenize failed");
-                    let reason = format!("tokenize failed: {e}");
-                    return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
-                }
-            };
+            let mut prompt_ids: Vec<u32> =
+                match tokenizer.encode(prompt_text(&task, self.video_temporal()).as_ref(), true) {
+                    Ok(e) => e.get_ids().to_vec(),
+                    Err(e) => {
+                        warn!(task = %task.task_id, error = %e, "tokenize failed");
+                        let reason = format!("tokenize failed: {e}");
+                        return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
+                    }
+                };
             if !task.enable_thinking && !task.prompt.trim_end().ends_with("</think>") {
                 // Legacy-rendered prompts only: a chat template injects
                 // the empty think block itself (API passes
@@ -2637,14 +2649,15 @@ impl Qwen36Engine {
             let task = self.pending.remove(0);
             // reset moved below — Issue-34 warm-resume may restore a cached prefix blob instead.
             let tokenizer = self.tokenizer.as_ref().expect("single-box has tokenizer");
-            let mut prompt_ids: Vec<u32> = match admitted_prompt_ids(tokenizer, &task) {
-                Ok(ids) => ids,
-                Err(e) => {
-                    warn!(task = %task.task_id, error = %e, "tokenize failed");
-                    let reason = format!("tokenize failed: {e}");
-                    return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
-                }
-            };
+            let mut prompt_ids: Vec<u32> =
+                match admitted_prompt_ids(tokenizer, &task, self.video_temporal()) {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        warn!(task = %task.task_id, error = %e, "tokenize failed");
+                        let reason = format!("tokenize failed: {e}");
+                        return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
+                    }
+                };
             // Option B forced-prefix resume: append the already-emitted assistant
             // tokens after the rendered prompt (concat, not replace) so the cold
             // prefill below carries them as context. No-op when not resuming.
@@ -3055,7 +3068,7 @@ impl Engine for Qwen36Engine {
                 // The SEQUENCE admission prefills, not the bare prompt: it also carries the
                 // injected think block and the resume prefix, either of which can push a prompt
                 // that passed this guard past the window.
-                if let Ok(ids) = admitted_prompt_ids(tok, &task) {
+                if let Ok(ids) = admitted_prompt_ids(tok, &task, self.video_temporal()) {
                     let n = ids.len() + task.resume_ids().map_or(0, <[i32]>::len);
                     if n >= max {
                         return Err(EngineError::PromptTooLong(format!(
