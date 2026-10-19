@@ -1830,6 +1830,10 @@ mod tests {
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
             assert!(error_message(&v).contains("<ov_genai_video_"), "{v}");
+            assert!(
+                error_message(&v).contains("reserved for video placeholders"),
+                "{v}"
+            );
             assert!(seen.lock().unwrap().is_empty());
         }
 
