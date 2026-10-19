@@ -216,13 +216,20 @@ A video of more than the processor's `num_frames` (32) would keep 32 frames, spa
 samples them; the API's 16-frame cap keeps every frame. E2B / E4B attend causally
 (`use_bidirectional_attention` is unset), so frames need no attention block of their own;
 the encode cache and the KV warm-resume key take the video's hash, which covers its frame
-times. Only the `gemma4` engine opts in: Gemma 4 26B / 31B on `ov-runtime` keep frames.
+times. Only the `gemma4` engine opts in, and only on a tree whose tokenizer has `<|video|>`
+(the engine's own condition; any other tree keeps frames): Gemma 4 26B / 31B on
+`ov-runtime` keep frames.
+
+Rank 0 encodes a video one inference per frame, inside the turn's first step, so a cold
+16-frame video costs about 16 s of encoding on CPU (about 1 s a frame) before prefill;
+repeats come from the encode cache.
 
 Token ids, soft-token counts, frame sampling, `mm:ss` labels, `mm_token_type_ids` and the
 attention blocks (one per frame) equal transformers 5.20.1's, and frame pixels are within
 two 8-bit levels of its torchvision-only video processor
 (`tests/gemma4_video_parity.rs`, fixtures from
-`tools/vlm_fixtures/gen_gemma4_video_fixtures.py`).
+`tools/vlm_fixtures/gen_gemma4_video_fixtures.py`). Pixel parity is measured on
+synthetic gradient frames only, not on decoded camera footage.
 
 Measured on pawan-04 (CPU) with the SDK video suite's 4 s clip on a one-stage E4B tree
 (`trees\e4bv-1stage`): 332 prompt tokens natively where the same clip as labelled frames
