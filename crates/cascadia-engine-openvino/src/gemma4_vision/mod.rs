@@ -443,9 +443,11 @@ impl ImageFrontend {
         }
     }
 
-    /// The expanded prompt ids `prepare` would return, computed from each
-    /// image's size without encoding anything: admission checks run on these
-    /// before any encoder work.
+    /// The expanded prompt ids `prepare` would return for a turn of images
+    /// only, computed from each image's size without encoding anything:
+    /// `ov-runtime`'s admission checks run on these before any encoder work.
+    /// A video is refused here (that engine takes video as frames); the
+    /// `gemma4` engine, which takes video whole, does not call this.
     pub fn expand_ids(
         &self,
         media: &[cascadia_types::MediaInput],
