@@ -764,70 +764,88 @@ What happens now:
    served.
 3. If it is still not idle after 30 s, the engine abandons the request. The request is never
    destroyed, because its destructor would block: it is leaked, with its device memory. The
-   engine then replaces it: it creates a fresh request for that stage from the stage's existing
-   compiled model (no recompile), and the scrub and the task continue on it. The task that ran
-   the recovery is served after the wait, and later tasks are served as usual. On pawan-01
-   (Arc 140V, 2026-10-17) stage6 read `Cancelled` for the whole 30 s; before this change that
-   failed the engine until a restart.
+   engine then recompiles that stage (or the embeddings): it compiles a fresh copy from the same
+   IR, with the same xml path, device and plugin config that the load used. It installs the
+   copy in place of the old one, and the task continues on it. The task that ran the recovery is
+   served after the wait and the compile, and later tasks are served as usual.
 
-A fresh request needs nothing re-bound. Every input is set on each infer, and its variable
-state starts empty, as after `recreate_request`. The engine scrubs it like the other stages.
+**Why recompile, not a fresh request.** On pawan-01 (Arc 140V, build 435c874e) stage6 read
+`Cancelled` for the whole 30 s after the fault. A fresh request from the same compiled model was
+created in 1 ms, but its first infer failed with a shape-inference error, so the engine failed.
+On the same GPU, a fresh request from a healthy compiled model served in every case tested, so
+the fault corrupts state the GPU plugin keeps per compiled model. Only a new compile escapes it.
 
-**Both calls on the faulted model are bounded.** The create and the fresh request's first infer
-both run on the compiled model that just faulted. If the fault left a lock held, or the device
-queue wedged, either call could block forever while holding the engine. So each runs on a helper
-thread, with the same 30 s bound as the idle wait. The call itself is OpenVINO's usual
-synchronous one. If it does not return in time, the stage is abandoned with its thread: both are
-leaked, never destroyed. The engine then fails.
+**The old stage is never dropped.** Its destructor could wait forever on the stuck request, so
+the whole old copy (compiled model and weights) is leaked, whatever the recompile does. **Each
+recovery costs about one stage of memory**: the stage's weight file, 1.49 GB for stage6 and
+2.47 GB for stage7 of the 9B int8 tree, on a GPU that shares the host's RAM (31.6 GB on p01).
+
+A recompiled stage needs nothing re-bound. Every input is set on each infer, and its variable
+state starts empty. The scrub skips it (it is fresh and has never run), so its first native call
+is its first infer.
+
+**Every call after the abandon is bounded.** Each runs on a helper thread, as OpenVINO's usual
+synchronous call:
+
+- The recompile is bounded by 180 s (`RECOMPILE_TIMEOUT`). A cold compile without the model
+  cache can take tens of seconds; a cache-warm one measured 1.2 to 1.7 s on p01.
+- The recompiled stage's first infer is bounded by 30 s, the same as the idle wait.
+
+If either does not return in time, its thread and whatever it holds are leaked, never destroyed,
+and the engine fails. The scrub's `reset_state` and `recreate_request` on the other stages are
+not bounded: they run on compiled models that did not fault.
 
 **When a restart is still needed.** The engine fails in these cases:
 
-- The fresh request cannot be created, or its create does not return within 30 s.
-- A fresh request's first infer fails, or does not return within 30 s. The compiled model or
-  the device is then suspect, not the request. This is a deliberate choice: a single recurrence
-  of the intermittent fault on that first infer looks the same as a broken compiled model, so it
-  fails the engine even when a second replacement might have served.
-- More than 4 requests have been abandoned in this process (`MAX_ABANDONED_REQUESTS`). Each one
-  is leaked, so this cap stops a fault that recurs on every task from exhausting GPU memory.
-  The fifth abandon fails the engine instead of replacing.
+- The recompile fails, does not return within 180 s, or its helper thread dies.
+- A recompiled stage's first infer fails, or does not return within 30 s. The device is then
+  suspect, not the stage. This is a deliberate choice: a single recurrence of the intermittent
+  fault on that first infer looks the same as a broken device, so it fails the engine even when
+  a second recompile might have served.
+- This engine has already recompiled 2 stages (`MAX_RECOMPILES`), and a third request is
+  abandoned. The cap is per engine (one engine per process in production). Each recompile leaks
+  a stage's weights, so this cap stops a fault that recurs from exhausting memory.
 - The request could not be abandoned (the shim is out of memory), or its state cannot be read.
 
 A failed engine fails the task that ran the recovery, and every later one at once, with
-`backend error: qwen36 engine failed: <reason>; restart the server`. For example: `stageN's
-infer request was still Cancelled ... abandoned; 5 infer requests abandoned by this process, past
-the cap of 4, so it is not replaced`. Chat and decisions return their 5xx. `/health` keeps
-answering, and reports `degraded` after a failed completion. Only a restart recovers it.
+`backend error: qwen36 engine failed: <reason>; restart the server`. For example: `stage6's
+infer request was still Cancelled ... abandoned; this engine has already recompiled 2 stages,
+the cap of 2, so stage6 is not recompiled`, or `...; recompiling stage6 timed out after 180000
+ms`. Chat and decisions return their 5xx. `/health` keeps answering, and reports `degraded`
+after a failed completion. Only a restart recovers it.
 
 Each recovery step is one `error` line, `qwen36: stage recovery`, with `stage`, `action`
-(`probe`, `cancel`, `wait`, `abandon`, `replace`, `first_infer`, `reset` or `recreate`),
-`outcome` and `elapsed_ms`. The `replace` line also carries:
+(`probe`, `cancel`, `wait`, `abandon`, `recompile`, `first_infer`, `reset` or `recreate`),
+`outcome` and `elapsed_ms`. The `recompile` line also carries:
 
-- `abandoned`: this engine's count of abandoned requests;
-- `cap`: the limit, 4;
-- `process_leaked`: every request the native shim has leaked in this process.
+- `recompiled`: this engine's count of recompiles, this one included;
+- `cap`: the limit, 2;
+- `leaked_bytes`: the size of the leaked stage's weight file;
+- `process_leaked`: every stage this process has leaked by recompiling;
+- `leaked_requests`: every request the native shim has leaked in this process.
 
-Its outcome is `ok`, `error` (the create failed), `timeout` or `refused: cap`. The
-replacement's first infer logs `first_infer` with `ok`, `error` or `timeout`. A worst-case
-recovery therefore takes up to 30 s for the idle wait plus 30 s for the create plus 30 s for
-the first infer, and each wait is bounded. A failed engine also logs
-`qwen36: engine failed` once, and `refusing task (engine failed)` per task.
+Its outcome is `ok`, `failed`, `timeout` or `refused: cap`. The recompiled stage's first infer
+logs `first_infer` with `ok`, `failed`, `timeout` or `helper thread died`. The scrub logs
+`skipped: recompiled` for the fresh stage. A worst-case recovery therefore takes up to 30 s for
+the idle wait plus 180 s for the compile plus 30 s for the first infer, and each wait is
+bounded. A failed engine also logs `qwen36: engine failed` once, and `refusing task (engine
+failed)` per task.
 
 The shim also guards itself:
 
 - `recreate_request` refuses a busy request.
-- `replace_request` never releases the old request: it leaks it, and it creates the fresh one
-  first, so a failed create changes nothing.
 - Destroying a runtime leaks a busy request rather than waiting on it, and logs it
   (`action=abandon outcome=leaked`).
 
 **Pipeline mode.** A downstream rank runs the same recovery inside the head's RESET. It
-abandons and replaces a stuck request the same way, and then acks, so the head's task is
-served. The head sees only a slower ack. The recovery takes up to 30 s for each stuck stage, and
-the time adds up across ranks: a middle rank recovers before it forwards the RESET downstream.
-One stuck stage fits under the head's default 60 s reply bound. Two stuck stages (on one rank,
-or on two) can exceed it, and so can a lower configured bound. The head then fails that task
-with `RESET not acked`. The protocol does not desync: acks carry the task's epoch, and the
-head skips a late one. The next task is served on the replaced requests.
+abandons the stuck request and recompiles the stage the same way, and then acks, so the head's
+task is served. The head sees only a slower ack. The recovery takes up to 30 s of idle wait plus
+the compile (1 to 2 s cache-warm, up to 180 s) for each stuck stage, and the time adds up across
+ranks: a middle rank recovers before it forwards the RESET downstream. One stuck stage with a
+cache-warm compile fits under the head's default 60 s reply bound. A cold compile, two stuck
+stages (on one rank, or on two), or a lower configured bound can exceed it. The head then fails
+that task with `RESET not acked`. The protocol does not desync: acks carry the task's epoch, and
+the head skips a late one. The next task is served on the recompiled stage.
 
 A downstream rank whose engine failed (one of the cases above) does not ack the next RESET. Its step
 returns a connection-fatal error, so the stage process exits for its supervisor to rebuild it.
@@ -836,8 +854,8 @@ socket closed`, instead of waiting out its reply bound on every task. The reason
 downstream rank's log. No frame changed, so a peer without this change handles it as any closed
 link.
 
-During the wait (at most 30 s) the engine is held, so other requests wait for it. That wait is
-bounded; before this change it was not.
+During the recovery the engine is held, so other requests wait for it. Every wait is bounded;
+before Task 46 none was.
 
 ### BUG-1 (open)
 
@@ -848,9 +866,10 @@ unknown. One lead: OpenVINO's `InferRequest` wrapper turns any C++ exception int
 `ov::Exception`, so an error the shim reports as "unknown" did not pass through it as a C++
 exception. On Windows that suggests a structured (SEH) exception from the driver or plugin. That
 would also explain why the request stayed busy: OpenVINO's own cleanup never ran. On pawan-01
-such a request never came back to idle: it stayed `Cancelled` for the full 30 s. The engine now
-replaces it (above). Whether a fresh request on the same compiled model always serves after such
-a fault is still to be confirmed on hardware; if its first infer fails, the engine fails.
+such a request never came back to idle: it stayed `Cancelled` for the full 30 s, and a fresh
+request on the same compiled model then failed its first infer. The engine now recompiles the
+stage (above). Whether a recompiled stage always serves after such a fault is still to be
+confirmed on hardware; if its first infer fails, the engine fails.
 
 ## Devices
 
