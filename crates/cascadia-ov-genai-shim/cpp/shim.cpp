@@ -1159,34 +1159,6 @@ int32_t cascadia_runtime_abandon_request(cascadia_runtime_t* handle) {
     return 0;
 }
 
-// Task 54: install a fresh request from the retained CompiledModel in place of one that was
-// abandoned (or that never left busy/cancelled). Unlike `recreate_request` it never refuses and
-// never releases: any request still installed is leaked like `abandon_request` does, because its
-// destructor may wait forever. The fresh request is created first; if that fails, nothing changes
-// (an abandoned slot stays empty). The fresh request carries no bound tensors and default variable
-// state, exactly what `recreate_request` gives: every input is set per infer, and `state_dtypes`
-// belongs to the CompiledModel, which is kept.
-int32_t cascadia_runtime_replace_request(cascadia_runtime_t* handle) {
-    if (!handle || !handle->compiled) {
-        set_last_error("null runtime handle"); return 1;
-    }
-    std::shared_ptr<ov::InferRequest> fresh;
-    try {
-        fresh = std::make_shared<ov::InferRequest>(handle->compiled->create_infer_request());
-    } catch (const std::exception& e) {
-        set_last_error(e); return 1;
-    } catch (...) {
-        set_last_error("unknown C++ exception in runtime_replace_request"); return 1;
-    }
-    if (!abandon_request(handle->request)) {
-        // `fresh` has never run, so releasing it here has nothing to wait on.
-        set_last_error("replace_request: out of memory; the old request is left in place");
-        return 1;
-    }
-    handle->request = std::move(fresh);
-    return 0;
-}
-
 uint64_t cascadia_runtime_leaked_requests(void) {
     return g_leaked_requests.load(std::memory_order_relaxed);
 }
