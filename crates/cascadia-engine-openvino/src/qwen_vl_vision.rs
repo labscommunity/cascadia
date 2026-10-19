@@ -125,7 +125,8 @@ pub fn window_index(
 }
 
 /// A `[1, N, N]` f32 block mask as the little-endian bytes the IR input
-/// takes: 0 inside each `[cu[k], cu[k+1])` block, `-inf` elsewhere. Built
+/// takes: 0 inside each `[cu[k], cu[k+1])` block, [`q35::MASK_BLOCKED`]
+/// (f16-safe, not `-inf`: the merger may run on the GPU in f16) elsewhere. Built
 /// straight into the byte buffer, with no f32 copy: at ~1 MP (N = 5476
 /// patches) one mask is 120 MB, and the merger takes two (per-frame
 /// `attention_mask` from `cu_seqlens`, `window_attention_mask` from
@@ -134,10 +135,10 @@ pub fn window_index(
 /// each, which the API's 1 MP default budget keeps well under).
 pub fn block_mask_bytes(cu: &[i32]) -> Vec<u8> {
     let n = *cu.last().unwrap_or(&0) as usize;
-    let ninf = f32::NEG_INFINITY.to_le_bytes();
+    let blocked = q35::MASK_BLOCKED.to_le_bytes();
     let mut out = Vec::with_capacity(n * n * 4);
     for _ in 0..n * n {
-        out.extend_from_slice(&ninf);
+        out.extend_from_slice(&blocked);
     }
     for pair in cu.windows(2) {
         let (a, b) = (pair[0] as usize, pair[1] as usize);
@@ -1049,8 +1050,10 @@ mod tests {
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         assert_eq!(m.len(), 9);
-        assert_eq!((m[0], m[1], m[2]), (0.0, 0.0, f32::NEG_INFINITY));
-        assert_eq!((m[6], m[8]), (f32::NEG_INFINITY, 0.0));
+        let x = q35::MASK_BLOCKED;
+        assert_eq!((m[0], m[1], m[2]), (0.0, 0.0, x));
+        assert_eq!((m[6], m[8]), (x, 0.0));
+        assert!(m.iter().all(|v| v.is_finite()));
     }
 
     /// The per-frame mask is Qwen3.5's `attention_mask` byte for byte.

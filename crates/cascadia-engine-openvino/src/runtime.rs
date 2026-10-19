@@ -7285,14 +7285,6 @@ impl Builder for OvRuntimeBuilder {
                         (false, None) => format!("{pseq} (no narrow decode IR)"),
                     }
                 )));
-                if self.device.to_ascii_uppercase().contains("GPU") {
-                    let msg =
-                        "packed slots on an Intel GPU are known to give wrong output (garbage \
-                               or non-finite logits) while the static path there is correct; \
-                               see docs/perf/NPU_PACKED_SLOTS.md";
-                    warn!("{msg}");
-                    events.push(LoadProgress::message(format!("WARNING: {msg}")));
-                }
                 self.packed_masks = stage_cfg.packed_masks.clone();
                 self.packed_window = stage_cfg.packed_sliding_window;
                 self.packed_dynamic = dynamic;
