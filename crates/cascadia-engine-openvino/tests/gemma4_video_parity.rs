@@ -1,8 +1,9 @@
 //! Native video parity of the Rust Gemma 4 front end with Hugging Face's
 //! `Gemma4Processor` (transformers 5.20.1), against
-//! `tests/fixtures/gemma4_vision/video_reference.json` (made by
+//! `tests/fixtures/gemma4_vision/video_reference.json` (E4B) and
+//! `video_reference_26b_31b.json` (26B-A4B and 31B, which share it), made by
 //! `tools/vlm_fixtures/gen_gemma4_video_fixtures.py` from synthetic frames
-//! this test rebuilds, [`frame_pixels`]):
+//! this test rebuilds, [`frame_pixels`]:
 //!
 //! - frames: the frames HF keeps (all of a pre-sampled video, 32 of a
 //!   40-frame one), their `mm:ss` times, soft tokens per frame, resized size;
@@ -12,15 +13,21 @@
 //!   id expansion gives HF's `input_ids`; `mm_token_type_ids` and the
 //!   attention blocks (one per frame) match `get_block_sequence_ids_for_mask`,
 //!   for one video, two videos, minutes past the hour, a sampled video, and
-//!   videos mixed with images across turns.
+//!   videos mixed with images across turns;
+//! - `ov-runtime` on 26B / 31B (bidirectional inside each image and frame):
+//!   the `token_type_ids` every stage takes, the per-row block ids packed
+//!   slots carry, and the packed host masks (sliding: each frame open both
+//!   ways; full: causal) equal HF's `create_masks_for_vision_model`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use cascadia_engine_openvino::gemma4_vision::video::{self, Item, VideoConfig, VideoMarkup};
 use cascadia_engine_openvino::gemma4_vision::{
-    preprocess, soft_tokens_for_size, ImageTokens, PreprocessConfig,
+    preprocess, soft_tokens_for_size, token_type_ids, ImageTokens, PreprocessConfig,
 };
+use cascadia_engine_openvino::packed::{prompt_image_ids, PackedKv, PackedPlan};
+use cascadia_ov_genai_shim::DType;
 use cascadia_types::{MediaInput, MediaKind};
 use serde_json::Value;
 
@@ -28,8 +35,12 @@ fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gemma4_vision")
 }
 
-fn reference() -> Value {
-    let p = fixtures().join("video_reference.json");
+/// E2B / E4B (causal), and 26B-A4B / 31B (bidirectional inside images).
+const E4B: &str = "video_reference.json";
+const BIG: &str = "video_reference_26b_31b.json";
+
+fn reference(file: &str) -> Value {
+    let p = fixtures().join(file);
     serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
 }
 
@@ -204,8 +215,13 @@ fn check_summary(what: &str, got: &[f64], shape: &[usize], s: &Value, tol: f64) 
 
 #[test]
 fn frames_times_and_pixels_match_the_video_processor() {
-    let r = reference();
-    let cfg = config(&r);
+    for file in [E4B, BIG] {
+        frames_match(&reference(file));
+    }
+}
+
+fn frames_match(r: &Value) {
+    let cfg = config(r);
     let videos = r["videos"].as_object().unwrap();
     assert_eq!(videos.len(), 6);
     for (name, v) in videos {
@@ -310,29 +326,61 @@ fn collapse_image_text(text: &str) -> String {
     out
 }
 
+/// A prompt's media in prompt order, rebuilt from the fixture.
+fn media(r: &Value, p: &Value) -> Vec<MediaInput> {
+    p["media"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            let n = m["name"].as_str().unwrap();
+            match m["kind"].as_str().unwrap() {
+                "video" => video_input(&r["videos"][n], n),
+                _ => image_input(n),
+            }
+        })
+        .collect()
+}
+
+/// Each media item's soft tokens, as rank 0 lays them out from sizes.
+fn items(media: &[MediaInput], cfg: &VideoConfig) -> Vec<Item> {
+    media
+        .iter()
+        .map(|m| match m.kind {
+            MediaKind::Video => {
+                let l = video::layout(m, cfg).unwrap();
+                Item::Video {
+                    frames: l.frames.len(),
+                    soft_tokens: l.soft_tokens,
+                }
+            }
+            _ => Item::Image(
+                soft_tokens_for_size(m.width, m.height, &PreprocessConfig::gemma4()).unwrap(),
+            ),
+        })
+        .collect()
+}
+
 #[test]
 fn prompts_match_the_processor() {
-    let r = reference();
-    let cfg = config(&r);
-    let (t, video_token) = tokens(&r);
-    // E2B / E4B attend causally: the engine needs no per-frame block mask.
+    // E2B / E4B attend causally: the gemma4 engine needs no per-frame block
+    // mask. 26B / 31B open each image and frame both ways (ov-runtime).
+    let r = reference(E4B);
     assert!(r["tokens"]["use_bidirectional_attention"].is_null());
+    prompts_match(&r);
+    let r = reference(BIG);
+    assert_eq!(r["tokens"]["use_bidirectional_attention"], "vision");
+    prompts_match(&r);
+}
+
+fn prompts_match(r: &Value) {
+    let cfg = config(r);
+    let (t, video_token) = tokens(r);
     let markup = VideoMarkup::gemma4();
     let prompts = r["prompts"].as_object().unwrap();
     assert_eq!(prompts.len(), 8);
     for (name, p) in prompts {
-        let media: Vec<MediaInput> = p["media"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|m| {
-                let n = m["name"].as_str().unwrap();
-                match m["kind"].as_str().unwrap() {
-                    "video" => video_input(&r["videos"][n], n),
-                    _ => image_input(n),
-                }
-            })
-            .collect();
+        let media = media(r, p);
 
         // The text rank 0 tokenizes is the text HF tokenized, but for the
         // images, which rank 0 expands on ids.
@@ -347,21 +395,7 @@ fn prompts_match_the_processor() {
         // From the tokenized text (images still one placeholder each), the
         // id expansion gives HF's input_ids.
         let want = ints(&p["input_ids"]);
-        let items: Vec<Item> = media
-            .iter()
-            .map(|m| match m.kind {
-                MediaKind::Video => {
-                    let l = video::layout(m, &cfg).unwrap();
-                    Item::Video {
-                        frames: l.frames.len(),
-                        soft_tokens: l.soft_tokens,
-                    }
-                }
-                _ => Item::Image(
-                    soft_tokens_for_size(m.width, m.height, &PreprocessConfig::gemma4()).unwrap(),
-                ),
-            })
-            .collect();
+        let items = items(&media, &cfg);
         let tokenized = collapse_images(&want, &t);
         let got = video::expand_media_tokens(&tokenized, &t, video_token, &items).unwrap();
         assert_eq!(got, want, "{name}: input_ids");
@@ -406,14 +440,87 @@ fn prompts_match_the_processor() {
     }
 }
 
-/// The API's 4 s clip: 4 frames of 63 soft tokens, 299 tokens with the
-/// template, against E4B's 1109 for the same frames sent as labelled images.
+/// The API's 4 s clip: 4 frames of 63 soft tokens, 299 tokens with E4B's
+/// template (against 1109 for the same frames sent as labelled images) and
+/// 303 with 26B / 31B's (which opens an empty thought channel).
 #[test]
 fn the_api_clip_costs_what_hf_says() {
-    let r = reference();
-    let p = &r["prompts"]["api_like"];
-    assert_eq!(p["input_ids"].as_array().unwrap().len(), 299);
-    assert_eq!(r["videos"]["api4"]["soft_tokens_per_frame"], 63);
+    for (file, want) in [(E4B, 299), (BIG, 303)] {
+        let r = reference(file);
+        let p = &r["prompts"]["api_like"];
+        assert_eq!(p["input_ids"].as_array().unwrap().len(), want, "{file}");
+        assert_eq!(r["videos"]["api4"]["soft_tokens_per_frame"], 63, "{file}");
+    }
+}
+
+/// The keys row `r` of a one-slot packed mask may attend, as one range
+/// (`past` columns of empty KV precede the chunk's own columns).
+fn allowed(buf: &[u8], ctx: usize, past: usize, r: usize) -> [i64; 2] {
+    const BLOCKED: u16 = 0xFBFF; // the most negative finite f16
+    let cols: Vec<usize> = (0..ctx)
+        .filter(|&c| {
+            let off = (r * ctx + c) * 2;
+            u16::from_le_bytes([buf[off], buf[off + 1]]) != BLOCKED
+        })
+        .collect();
+    let (lo, hi) = (cols[0], *cols.last().unwrap());
+    assert!(lo >= past, "row {r} sees an empty past column");
+    assert_eq!(cols.len(), hi - lo + 1, "row {r}: not one range");
+    [(lo - past) as i64, (hi - past) as i64]
+}
+
+/// ov-runtime on 26B / 31B: rank 0 hands stage 0 the video soft tokens as
+/// `<|image|>`, and from those ids every stage's `token_type_ids` (1 on
+/// image and video soft tokens, as GenAI 2026.4.1 feeds the same IR), the
+/// packed rows' block ids and the packed host masks follow; each equals HF.
+#[test]
+fn ov_runtime_types_blocks_and_masks_match_hf() {
+    let r = reference(BIG);
+    let cfg = config(&r);
+    let (t, video_token) = tokens(&r);
+    let window = r["tokens"]["sliding_window"].as_u64().unwrap() as usize;
+    assert_eq!(window, 1024);
+    for (name, p) in r["prompts"].as_object().unwrap() {
+        let media = media(&r, p);
+        let hf = ints(&p["input_ids"]);
+        let tokenized = collapse_images(&hf, &t);
+        let got =
+            video::expand_media_tokens(&tokenized, &t, video_token, &items(&media, &cfg)).unwrap();
+        let staged = video::stage_ids(&got, t.image, video_token);
+
+        let mm = ints(&p["mm_token_type_ids"]);
+        let types = token_type_ids(&staged, t.image);
+        let want: Vec<i64> = mm.iter().map(|&m| i64::from(m != 0)).collect();
+        assert_eq!(types, want, "{name}: token_type_ids");
+
+        let blocks: Vec<i64> = prompt_image_ids(&staged, t.image)
+            .iter()
+            .map(|b| b.map_or(-1, i64::from))
+            .collect();
+        assert_eq!(blocks, ints(&p["block_ids"]), "{name}: packed block ids");
+
+        // The whole prompt as one packed prefill chunk of one slot.
+        let n = staged.len();
+        let kv = PackedKv::new(1, n, n, 1, 1, 2, DType::F16, 0);
+        let plan = PackedPlan::chunk_with_images(n, 0, &prompt_image_ids(&staged, t.image));
+        for (kind, w, open) in [
+            ("sliding_attention", Some(window), true),
+            ("full_attention", None, false),
+        ] {
+            let mut buf = Vec::new();
+            kv.fill_mask_blocks(&plan, &mut buf, DType::F16, w, open);
+            let want = p["masks"][kind].as_array().unwrap();
+            assert_eq!(want.len(), n, "{name} {kind}: rows");
+            for (q, w) in want.iter().enumerate() {
+                let w = ints(w);
+                assert_eq!(
+                    allowed(&buf, kv.context, n, q),
+                    [w[0], w[1]],
+                    "{name} {kind}: row {q}"
+                );
+            }
+        }
+    }
 }
 
 /// With `GEMMA4_TOKENIZER` pointing at a Gemma 4 `tokenizer.json`, the
@@ -427,22 +534,17 @@ fn rank0_tokenizer_reads_the_markup_as_hf() {
         return;
     };
     let tok = tokenizers::Tokenizer::from_file(path).unwrap();
-    let r = reference();
-    let cfg = config(&r);
-    let (t, _) = tokens(&r);
+    // E4B, 26B-A4B and 31B ship the same tokenizer.
+    for file in [E4B, BIG] {
+        rank0_tokenizes(&tok, &reference(file));
+    }
+}
+
+fn rank0_tokenizes(tok: &tokenizers::Tokenizer, r: &Value) {
+    let cfg = config(r);
+    let (t, _) = tokens(r);
     for (name, p) in r["prompts"].as_object().unwrap() {
-        let media: Vec<MediaInput> = p["media"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|m| {
-                let n = m["name"].as_str().unwrap();
-                match m["kind"].as_str().unwrap() {
-                    "video" => video_input(&r["videos"][n], n),
-                    _ => image_input(n),
-                }
-            })
-            .collect();
+        let media = media(r, p);
         let text = video::prompt_text(
             p["template_text"].as_str().unwrap(),
             &media,
