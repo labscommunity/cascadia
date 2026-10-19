@@ -195,9 +195,19 @@ HF keeps around the per-pair markup; this server follows HF); stateful,
 static (`--prefill-seq 256 --shared-prefill`) and packed (`--packed-slots 2
 --packed-seq 64`) trees answer the same and count the same 450. A Qwen2.5-VL-7B tree
 takes 565, as ov-genai does. A two-stage Qwen3-VL tree
-across pawan-04 (rank 0) and pawan-02 also counts 450 and answers the same. The `qwen35`
-engine's video path is pinned by the parity tests but not yet run live (no Qwen3.6
-vision tree on the nodes).
+across pawan-04 (rank 0) and pawan-02 also counts 450 and answers the same.
+
+The `qwen35` engine was verified live on 2026-10-19 with a two-stage Qwen3.6-35B-A3B tree
+(`export_qwen36_moe.py --total 2`), stage 0 and the vision IRs on pawan-04 (rank 0) and
+stage 1 on pawan-02, both CPU: the same clip as a `video_url` (MP4 and WebM), a Responses
+`input_video` and a streamed request all count 454 prompt tokens and answer "The first
+shape is a red circle, and the last shape is a blue square." (about 20 s each). ov-genai's
+native path counts 451 for the same clip, 3 fewer for the same reason as Qwen3-VL's 447
+against 450. The refusals (too long, not a video, bad media type, remote URL) are the
+same `400`s, and the image suite passes 11/11 on the same tree (227 and 429 prompt
+tokens, HF's counts). The video processor's pixel budget comes from
+`processor_config.json`'s `video_processor` in the published export, which the exporter
+copies into the tree.
 
 ## What takes images
 
