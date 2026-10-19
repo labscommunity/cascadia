@@ -4,8 +4,11 @@ A throwaway prototype that answers one question: can a case's shared prefix be p
 question's suffix run from a device-side copy of that state, faster than today and with parity? It
 drives the tree's embeddings IR and stage IRs with the OpenVINO Python API on GPU, mirroring
 qwen36.rs `chain_pass_inner` (inputs per stage, 256-token spans, no fold), and runs the decision
-heads in numpy. Nothing in crates/ uses it. Results feed docs/superpowers/specs/
-2026-10-17-decisions-state-fork.md.
+heads in numpy. Nothing in crates/ uses it. Results fed a local design note that is not in the repo.
+
+Verdict: the fork modes are NO-GO on OpenVINO 2026.4 GPU (RemoteTensor states refused, NaN rows once
+the prefix exceeds 256 tokens with beam_idx expansion, a fault on shrink, unfaithful copies). H-lite
+(mode H) is GO: shipped as Task 55, Kev p50 3.56 s to 2.41 s (docs/decisions.md).
 
   python state_fork_spike.py analyze --family kev --dump fork-kev-9b.jsonl --cases td40.jsonl --tree DIR
   python state_fork_spike.py run     --family kev --dump ... --cases ... --tree DIR --out res-kev.jsonl \
