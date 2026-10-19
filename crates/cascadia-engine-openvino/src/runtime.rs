@@ -2187,6 +2187,10 @@ struct VisionTree {
     first: Option<VisionFirst>,
     /// Stages take `token_type_ids` and the wire carries the third frame.
     token_types: bool,
+    /// Full-attention layers also see each image both ways (Gemma 3); Gemma
+    /// 4 opens images on its sliding layers only and keeps full attention
+    /// causal, as HF does. Read by the packed host masks.
+    full_blocks: bool,
     /// Stages take `[3, T]` M-RoPE `position_ids` (Qwen2.5-VL / Qwen3-VL),
     /// computed on rank 0 and carried as a frame after the hidden (and the
     /// types frame, if any).
@@ -7673,6 +7677,7 @@ impl Builder for OvRuntimeBuilder {
             self.vision = Some(VisionTree {
                 first,
                 token_types,
+                full_blocks: !matches!(family, VisionFamily::Gemma4),
                 mrope,
             });
         }
@@ -7991,12 +7996,18 @@ impl Builder for OvRuntimeBuilder {
                         types_in = Some(prt.input_name(idx).map_err(map_ov_err)?);
                     }
                 }
-                let masks = packed_mask_ports(
+                let mut masks = packed_mask_ports(
                     ports,
                     self.packed_masks.as_ref(),
                     self.packed_window.map(|w| w as usize),
                 )
                 .map_err(EngineError::InvalidConfig)?;
+                // Gemma 4's full-attention layers stay causal over images and
+                // video frames (HF's `create_masks_for_vision_model`).
+                let full_blocks = self.vision.as_ref().is_none_or(|v| v.full_blocks);
+                for m in masks.iter_mut().filter(|m| m.window.is_none()) {
+                    m.blocks = full_blocks;
+                }
                 // Still unsupported on packed slots, refused by name:
                 // - a packed IR that still reads the 2D attention_mask (some
                 //   node besides the replaced mask producers consumes it), which
@@ -8052,9 +8063,10 @@ impl Builder for OvRuntimeBuilder {
                 };
                 let mask_desc: Vec<String> = masks
                     .iter()
-                    .map(|m| match m.window {
-                        Some(w) => format!("{} (sliding window {w})", m.port),
-                        None => format!("{} (full)", m.port),
+                    .map(|m| match (m.window, image_blocks && m.blocks) {
+                        (Some(w), _) => format!("{} (sliding window {w})", m.port),
+                        (None, true) => format!("{} (full, image blocks open)", m.port),
+                        (None, false) => format!("{} (full, causal)", m.port),
                     })
                     .collect();
                 info!(
