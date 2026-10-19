@@ -32,9 +32,11 @@ pub(crate) struct PassTiming {
     pub host_copy: Duration,
     pub head: Duration,
     /// The latest `reset_all` of this pass. Since Task 55 the single-box finish defers its scrub
-    /// to the next admission, so this is the admission's own (`admit_reset`): zero on a warm hit.
+    /// to the next admission, so this is the admission's own (`admit_reset`): zero on a warm hit in the default
+    /// restore mode (`CASCADIA_QWEN36_RESTORE_CLEAR` unset).
     pub reset: Duration,
-    /// That reset recreated the requests (they held a restored state). False on a warm hit.
+    /// That reset recreated the requests (they held a restored state). False on a warm hit in the
+    /// default restore mode.
     pub recreate: bool,
     pub total: Duration,
 }
