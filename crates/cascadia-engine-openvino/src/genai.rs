@@ -369,9 +369,9 @@ pub fn takes_images(model_dir: &Path) -> bool {
 /// classes.cpp`), which resizes the shortest edge and center-crops a fixed
 /// square and expands each image without Pixtral's `[IMG_BREAK]` row tokens
 /// and `[IMG_END]`, behind a hard-coded `<image>` tag that the Pixtral
-/// tokenizer splits into ordinary text tokens. The model then answers about
-/// a different picture (903 prompt tokens where HF counts 832 on a 448x448
-/// image). Such exports serve text only here; the message names the
+/// tokenizer splits into ordinary text tokens, so no image row is merged at
+/// all. The model then answers about a different picture (903 prompt tokens
+/// where HF counts 832 on a 448x448 image). Such exports serve text only here; the message names the
 /// ov-runtime commands that serve their images, and the API returns it with
 /// the 400 that refuses them.
 pub fn unsupported_vision(model_dir: &Path) -> Option<String> {
