@@ -66,13 +66,16 @@ const STAGE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// for stage6 and 2.5 GB for stage7 of the 9B int8 tree, on a GPU that shares system RAM), so a
 /// fault that recurs cannot exhaust memory: the abandon past this marks the engine failed.
 const MAX_RECOMPILES: usize = 2;
-/// Leaked stage copies at which the engine is flagged degraded (Task 54 fix round 3).
-const DEGRADED_AT_LEAKED_COPIES: usize = 2;
+/// Successful recompiles at which the engine is flagged degraded (Task 54 fix round 3): each one
+/// leaves one leaked stage copy, and two leaked copies cost decode about 16%. A recompile that
+/// fails also leaks a copy, but it fails the engine, so no later recompile can warn.
+const DEGRADED_AT_RECOMPILES: usize = 2;
 /// Bound on one stage recompile, run on a helper thread (Task 54 fix round 2). A cold compile
 /// without the model cache can take tens of seconds; a cache-warm one measured 1.2-1.7 s on p01.
 const RECOMPILE_TIMEOUT: Duration = Duration::from_secs(180);
-/// Stage `Runtime`s this process has leaked by recompiling (never dropped: a destructor could wait
-/// forever on the stuck request). Logged as `process_leaked`.
+/// Stage `Runtime`s this process has leaked on purpose ([`leak_stage`]: never dropped, a destructor
+/// could wait forever on the stuck request). A copy left with a timed-out or dead helper thread is
+/// leaked by `Forget` and not counted here. Logged as `process_leaked`.
 static LEAKED_RUNTIMES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// One `wait_for` slice inside [`STAGE_IDLE_TIMEOUT`]: the state is re-read after each.
 const STAGE_IDLE_POLL: Duration = Duration::from_millis(100);
@@ -133,10 +136,22 @@ fn selfchk_at() -> Option<usize> {
 ///
 /// `CASCADIA_QWEN36_RESTORE_CLEAR=recreate|reset` restores the old behaviour for A/B work.
 fn restore_clear_mode() -> &'static str {
-    match std::env::var("CASCADIA_QWEN36_RESTORE_CLEAR")
-        .ok()
-        .as_deref()
-    {
+    // Tests set the knob per thread: the variable is process-global and read on every restore, so
+    // setting it would change every other restore test running in parallel.
+    #[cfg(test)]
+    if let Some(v) = tests::restore_clear_knob() {
+        return restore_clear_mode_of(Some(v));
+    }
+    restore_clear_mode_of(
+        std::env::var("CASCADIA_QWEN36_RESTORE_CLEAR")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`restore_clear_mode`] for a value of `CASCADIA_QWEN36_RESTORE_CLEAR`.
+fn restore_clear_mode_of(knob: Option<&str>) -> &'static str {
+    match knob {
         Some("recreate") => "recreate_request",
         Some("reset") => "reset_state",
         _ => "none",
@@ -922,9 +937,10 @@ enum OvStage {
     Ov(Runtime),
     #[cfg(test)]
     Mock(tests::MockStage),
-    /// The stage was handed to a bounded native call that never returned ([`bounded_call`]), or
-    /// its recompile did not produce a fresh copy (the old one is leaked either way): every call
-    /// here fails. The engine is failed.
+    /// The stage was leaked by fault recovery: handed to a bounded native call that never
+    /// returned or could not start ([`bounded_call`]), faulted on a recompiled copy's first infer,
+    /// replaced by a recompile that did not produce a fresh copy, or left over when the recovery
+    /// failed the engine. Every call here fails. The engine is failed.
     Gone(&'static str),
 }
 
@@ -1126,13 +1142,22 @@ fn run_bounded<T: Send + 'static>(
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Bounded<T> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Forget<T>>(1);
+    let body = move || {
+        let v = Forget(Some(f()));
+        // Late (the engine stopped waiting): the send fails and `Forget` leaks the value.
+        let _ = tx.send(v);
+    };
+    // Tests stand in for an OS that cannot start a thread: `spawn` then drops `body`, so do that.
+    #[cfg(test)]
+    if tests::spawn_refused(what) {
+        drop(body);
+        return Bounded::NoThread(std::io::Error::other("thread spawn refused (test)"));
+    }
     let spawned = std::thread::Builder::new()
         .name(format!("qwen36-{what}"))
-        .spawn(move || {
-            let v = Forget(Some(f()));
-            // Late (the engine stopped waiting): the send fails and `Forget` leaks the value.
-            let _ = tx.send(v);
-        });
+        .spawn(body);
+    // A failed spawn drops `body` and with it `f`: whatever `f` owns must already be leak-safe
+    // (`bounded_call` wraps its stage in `Forget` before handing it over).
     if let Err(e) = spawned {
         return Bounded::NoThread(e);
     }
@@ -1151,17 +1176,19 @@ fn run_bounded<T: Send + 'static>(
 /// After a recompile the engine's first infer runs on a stage nothing has proven yet; if the
 /// device queue is wedged it could block forever while holding the engine. The stage moves to the
 /// thread for the call (OpenVINO's own synchronous call, unchanged) and comes back when it
-/// returns. Otherwise the slot holds [`OvStage::Gone`]; the thread and the stage are leaked.
+/// returns. Otherwise the slot holds [`OvStage::Gone`] and the stage is leaked, never dropped: with
+/// its thread after a timeout or a panic, or at once when no thread could be started.
 fn bounded_call<T: Send + 'static>(
     st: &mut OvStage,
     what: &'static str,
     timeout: Duration,
     f: impl FnOnce(&mut OvStage) -> cascadia_ov_genai_shim::Result<T> + Send + 'static,
 ) -> Bounded<cascadia_ov_genai_shim::Result<T>> {
-    let stage = std::mem::replace(st, OvStage::Gone(what));
+    // Wrapped before it moves into the closure: a panic in `f`, or a thread that never starts
+    // (the closure is then dropped unrun), leaks the stage instead of dropping it.
+    let stage = Forget(Some(std::mem::replace(st, OvStage::Gone(what))));
     let r = run_bounded(what, timeout, move || {
-        // Wrapped before `f` runs, so a panic in `f` leaks the stage too.
-        let mut stage = Forget(Some(stage));
+        let mut stage = stage;
         let r = match stage.0.as_mut() {
             Some(s) => f(s),
             None => unreachable!(),
@@ -1227,17 +1254,21 @@ struct Rebuild {
     cap: usize,
     /// Recompiles this engine has started.
     recompiled: usize,
-    /// Old stage copies this engine leaked by a recompile that succeeded (the old copy leaks when
-    /// the new one is installed). A failed recompile fails the engine and is not counted.
+    /// Recompiles that succeeded (the fresh copy is installed). The degraded warning keys on
+    /// this ([`DEGRADED_AT_RECOMPILES`]).
+    recompiles_ok: usize,
+    /// Stage copies this engine's fault recovery leaked ([`leak_stage`] or a bounded call's
+    /// `Forget`), whatever happened next: the faulted copy every recompile replaces, whether or
+    /// not the recompile succeeds; a faulted copy left in its slot when the engine fails (cap
+    /// reached, no recipe, or a request that cannot be abandoned); and a recompiled copy whose
+    /// first infer failed or did not return.
     leaked_copies: usize,
-    /// Sum of the leaked copies' `weight_bytes`.
+    /// Sum of the leaked copies' `weight_bytes` (0 for a slot with no recipe).
     leaked_bytes: u64,
     /// Helper threads leaked by a timed-out recompile (not counted in `leaked_copies`).
     leaked_threads: usize,
-    /// The degraded-engine warning has been logged (once per engine).
+    /// The degraded-engine warning has been logged (once per engine; tests read it).
     degraded_warned: bool,
-    /// Times the warning was logged (0 or 1; tests read it).
-    degraded_warnings: usize,
 }
 
 impl Rebuild {
@@ -1249,26 +1280,34 @@ impl Rebuild {
             timeout: RECOMPILE_TIMEOUT,
             cap: MAX_RECOMPILES,
             recompiled: 0,
+            recompiles_ok: 0,
             leaked_copies: 0,
             leaked_bytes: 0,
             leaked_threads: 0,
             degraded_warned: false,
-            degraded_warnings: 0,
         }
     }
 
-    /// A recompile succeeded and its old copy stays leaked: update the engine's totals and the
-    /// process metrics, and warn once when `DEGRADED_AT_LEAKED_COPIES` copies are leaked. Measured
-    /// on an Arc 140V: one leaked copy is harmless, two cost decode about 16%.
-    fn note_recompiled(&mut self, copy_bytes: u64) {
+    /// Fault recovery leaked one copy of `slot`'s stage: add it to the engine's totals and to the
+    /// process's `cascadia_engine_leaked_stage_bytes` gauge. Every leaked copy is counted, whether
+    /// or not a recompile follows or succeeds.
+    fn note_leaked(&mut self, slot: Slot) {
+        let copy_bytes = self.recipe(slot).map_or(0, |r| r.weight_bytes);
         self.leaked_copies += 1;
         self.leaked_bytes += copy_bytes;
-        cascadia_metrics::ENGINE_STAGE_RECOMPILES_TOTAL.inc();
         cascadia_metrics::ENGINE_LEAKED_STAGE_BYTES
             .add(i64::try_from(copy_bytes).unwrap_or(i64::MAX));
-        if self.leaked_copies >= DEGRADED_AT_LEAKED_COPIES && !self.degraded_warned {
+    }
+
+    /// A recompile succeeded (its old copy was already counted by [`Self::note_leaked`]): count
+    /// it, and warn once at the [`DEGRADED_AT_RECOMPILES`]th. Measured on an Arc 140V: one leaked
+    /// copy is harmless, two cost decode about 16%. Any failed step of a recovery fails the engine,
+    /// so when this warns every leaked copy came from a recompile that succeeded.
+    fn note_recompiled(&mut self) {
+        self.recompiles_ok += 1;
+        cascadia_metrics::ENGINE_STAGE_RECOMPILES_TOTAL.inc();
+        if self.recompiles_ok >= DEGRADED_AT_RECOMPILES && !self.degraded_warned {
             self.degraded_warned = true;
-            self.degraded_warnings += 1;
             let (n, m, cap) = (self.leaked_copies, self.leaked_bytes, self.cap);
             let msg = degraded_message(n, m, self.leaked_threads);
             warn!(
@@ -1290,7 +1329,9 @@ impl Rebuild {
 }
 
 /// The degraded-engine warning text. `threads` is the number of recompile helper threads a
-/// timed-out recompile leaked (not stage copies), mentioned only when non-zero.
+/// timed-out recompile leaked (not stage copies), mentioned only when non-zero. Today it is always
+/// zero when this is logged: a timed-out recompile fails the engine, so no later recompile
+/// succeeds to warn.
 fn degraded_message(copies: usize, bytes: u64, threads: usize) -> String {
     let mut m = format!(
         "qwen36: engine degraded: {copies} stage copies leaked by fault recovery ({bytes} bytes); \
@@ -1306,7 +1347,8 @@ fn degraded_message(copies: usize, bytes: u64, threads: usize) -> String {
 }
 
 /// Leak a stage's `Runtime` on purpose (never drop it: its destructor may wait forever on the
-/// stuck request). Returns this process's count of leaked runtimes.
+/// stuck request). Returns this process's count of leaked runtimes. The caller counts the copy
+/// ([`Rebuild::note_leaked`]).
 fn leak_stage(st: OvStage) -> usize {
     drop(Forget(Some(st)));
     LEAKED_RUNTIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
@@ -1342,8 +1384,9 @@ impl Slot {
 /// A recompiled stage's first infer, bounded ([`bounded_call`], [`STAGE_IDLE_TIMEOUT`]), Task 54.
 /// Ok on success; otherwise the infer's error and the reason the engine fails: the fresh copy
 /// failed its first infer (the device itself is then suspect, so the engine fails rather than
-/// recompile again), did not return within `timeout` (its stage is now leaked), or its helper
-/// thread died.
+/// recompile again), did not return within `timeout`, or its helper thread died or could not be
+/// started. On every failure the fresh copy is leaked, never dropped (its request may be stuck):
+/// the slot holds [`OvStage::Gone`], and the caller counts the copy ([`Rebuild::note_leaked`]).
 fn first_infer_bounded(
     slot: Slot,
     st: &mut OvStage,
@@ -1365,6 +1408,8 @@ fn first_infer_bounded(
         }
         Bounded::Done(Err(e)) => {
             error!(stage = %label, action = "first_infer", outcome = "failed", error = %e, elapsed_ms = ms(t0), "qwen36: stage recovery");
+            // The copy came back from its thread, but its request just faulted: leak it.
+            leak_stage(std::mem::replace(st, OvStage::Gone("first_infer")));
             let why = format!("{label} was recompiled and its first infer failed: {e}");
             error!(reason = %why, "qwen36: engine failed; every later task is refused until a restart");
             return Err((e, why));
@@ -1756,8 +1801,9 @@ pub struct Qwen36Engine {
     /// stage requests, which stay primed. `finish_decision` sets it instead of running `reset_all`.
     /// The next admission either restores a prefix-cache entry over the live requests (a decision
     /// warm hit: `set_state_blob` overwrites every VariableState or fails, so no recreate and no
-    /// priming fold are needed) or runs the deferred `reset_all` first, which recreates because
-    /// `state_restored` is set ([`Self::scrub_deferred_decision`]). No prefill starts on the
+    /// priming fold are needed) or runs the deferred `reset_all` first
+    /// ([`Self::scrub_deferred_decision`]): a recreate after a warm pass (`state_restored` is
+    /// set), else the cheap `reset_state` of a cold pass. No prefill starts on the
     /// finished pass's state. Cleared by every `reset_all` and by a successful decision warm
     /// restore. Never set on a pipeline (`total > 1`).
     decision_scrub_deferred: bool,
@@ -2070,6 +2116,7 @@ impl Qwen36Engine {
             // A recompiled stage's first infer: bounded, and any failure fails the engine (Task 54).
             self.fresh_requests.retain(|s| *s != Slot::Emb);
             if let Err((e, why)) = first_infer_bounded(Slot::Emb, emb, self.stage_idle_timeout) {
+                self.rebuild.note_leaked(Slot::Emb);
                 self.infer_failed = true;
                 self.engine_failed = Some(why);
                 return Err(map_ov(e));
@@ -2165,6 +2212,7 @@ impl Qwen36Engine {
                 self.fresh_requests.retain(|s| *s != Slot::Stage(j));
                 first_infer_bounded(Slot::Stage(j), st, self.stage_idle_timeout).map_err(
                     |(e, why)| {
+                        self.rebuild.note_leaked(Slot::Stage(j));
                         self.engine_failed = Some(why);
                         e
                     },
@@ -2225,7 +2273,9 @@ impl Qwen36Engine {
     /// that never gets there is abandoned and its stage recompiled from the same IR ([`Rebuild`],
     /// Task 54 fix round 2), up to [`Rebuild::cap`] recompiles per engine. False when the engine
     /// is failed instead (`engine_failed`): a request that could not be abandoned, an abandon past
-    /// the cap, or a recompile that failed, timed out or lost its helper thread.
+    /// the cap, or a recompile that failed, timed out or lost its helper thread. A stage that did
+    /// not come back to idle is never dropped, not even with the engine: it is leaked, and counted
+    /// ([`Rebuild::note_leaked`]), whether it is recompiled or the engine fails.
     fn recover_requests(&mut self) -> bool {
         let timeout = self.stage_idle_timeout;
         let emb = self.emb.iter_mut().map(|s| (Slot::Emb, s));
@@ -2269,8 +2319,10 @@ impl Qwen36Engine {
                 };
                 self.rebuild.recompiled = recompiled;
                 // The old stage is never dropped, whatever the recompile does: its request may be
-                // stuck, and a destructor would wait on it forever.
+                // stuck, and a destructor would wait on it forever. It is counted now, so a
+                // recompile that fails still shows in the totals and the gauge.
                 let process_leaked = leak_stage(std::mem::replace(st, OvStage::Gone("recompile")));
+                self.rebuild.note_leaked(slot);
                 let leaked_bytes = recipe.weight_bytes;
                 let bound = self.rebuild.timeout;
                 let factory = Arc::clone(&self.rebuild.factory);
@@ -2323,13 +2375,29 @@ impl Qwen36Engine {
                 }
                 match failure {
                     None => {
-                        self.rebuild.note_recompiled(leaked_bytes);
+                        self.rebuild.note_recompiled();
                         self.fresh_requests.push(slot);
                         continue 'stages;
                     }
                     Some(why) => why,
                 }
             };
+            // The engine fails with this stage still in its slot (cap reached, no recipe, or a
+            // request that could not be abandoned or read): leak it, so it is not dropped with the
+            // engine. A recompile that failed already leaked it (the slot holds `Gone`).
+            if !matches!(st, OvStage::Gone(_)) {
+                let process_leaked = leak_stage(std::mem::replace(st, OvStage::Gone("recovery")));
+                self.rebuild.note_leaked(slot);
+                error!(
+                    stage = %label,
+                    action = "leak",
+                    outcome = "ok",
+                    elapsed_ms = 0u64,
+                    leaked_bytes = self.rebuild.recipe(slot).map_or(0, |r| r.weight_bytes),
+                    process_leaked,
+                    "qwen36: stage recovery"
+                );
+            }
             error!(reason = %failed, "qwen36: engine failed; every later task is refused until a restart");
             self.engine_failed = Some(failed);
             return false;
@@ -2710,7 +2778,8 @@ impl Qwen36Engine {
     /// `decision_scrub_deferred`). Every admission and restore runs it before it prefills or
     /// writes state, except a decision pass's prefix-cache hit in the default restore mode,
     /// which overwrites every state of the live, primed requests instead (`local_warm_or_cold`).
-    /// `state_restored` is set after any warm pass, so this `reset_all` recreates.
+    /// This `reset_all` recreates after a warm pass (`state_restored` is set), else it is the
+    /// cheap `reset_state` of a cold pass (no restored state, so no residue).
     fn scrub_deferred_decision(&mut self) {
         if self.decision_scrub_deferred {
             self.reset_all();
@@ -5092,6 +5161,24 @@ impl cascadia_engine::KvCoordination for Qwen36Engine {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// The `what` of the bounded call whose helper thread "cannot be started" on this test's
+        /// thread ([`run_bounded`]).
+        static REFUSE_SPAWN: std::cell::Cell<Option<&'static str>> =
+            const { std::cell::Cell::new(None) };
+        /// This test thread's `CASCADIA_QWEN36_RESTORE_CLEAR` ([`restore_clear_mode`]).
+        static RESTORE_CLEAR: std::cell::Cell<Option<&'static str>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn spawn_refused(what: &str) -> bool {
+        REFUSE_SPAWN.with(|c| c.get() == Some(what))
+    }
+
+    pub(super) fn restore_clear_knob() -> Option<&'static str> {
+        RESTORE_CLEAR.with(|c| c.get())
+    }
+
     #[test]
     fn capability_bits_degrade_to_old_ranks() {
         let own = own_caps(true);
@@ -7101,6 +7188,8 @@ mod tests {
         hang_first_infer: bool,
         /// Compiles run so far, by recipe (xml).
         built: Vec<String>,
+        /// The drop counter of each fresh copy built, in order.
+        fresh_drops: Vec<Arc<std::sync::atomic::AtomicUsize>>,
     }
 
     /// Task 54 fix round 2: give every mock slot of `e` a recipe, and a factory that "compiles" a
@@ -7167,6 +7256,7 @@ mod tests {
             if hang_first {
                 m.hang_infer_at = Some(0);
             }
+            c.lock().unwrap().fresh_drops.push(Arc::clone(&m.drops));
             Ok(OvStage::Mock(m))
         });
         ctl
@@ -7591,20 +7681,18 @@ mod tests {
             e.submit(verbalizer_pass("served")).unwrap();
             assert!(run_to_final(&mut e).error.is_none(), "round {round}");
             assert_eq!(e.rebuild.recompiled, round);
+            assert_eq!(e.rebuild.recompiles_ok, round);
             assert_eq!(e.rebuild.leaked_copies, round);
             assert_eq!(e.rebuild.leaked_bytes, 1000 * round as u64);
             assert!(ENGINE_STAGE_RECOMPILES_TOTAL.get() - c0 >= round as u64);
             assert!(ENGINE_LEAKED_STAGE_BYTES.get() - b0 >= 1000 * round as i64);
-            assert_eq!(
-                e.rebuild.degraded_warnings,
-                usize::from(round == 2),
-                "round {round}"
-            );
+            assert_eq!(e.rebuild.degraded_warned, round == 2, "round {round}");
         }
-        // A later task does not warn again.
+        // A later task does not warn again (the flag gates the one `warn!`).
         e.submit(chat("again")).unwrap();
         assert!(run_to_final(&mut e).error.is_none());
-        assert_eq!(e.rebuild.degraded_warnings, 1);
+        assert!(e.rebuild.degraded_warned);
+        assert_eq!(e.rebuild.recompiles_ok, 2);
     }
 
     #[test]
@@ -7672,6 +7760,44 @@ mod tests {
             "no stage call after the failure"
         );
         assert_eq!(dropped(&old_drops), 0);
+        // Sweep item 2: the cap-refused copy is leaked and counted, not left to drop with the
+        // engine. Two recompiled-away copies plus this one.
+        assert!(matches!(e.stages[1], OvStage::Gone("recovery")));
+        assert_eq!((e.rebuild.leaked_copies, e.rebuild.leaked_bytes), (3, 3000));
+        assert_eq!(e.rebuild.recompiles_ok, 2);
+        drop(e);
+        assert_eq!(
+            dropped(&old_drops),
+            0,
+            "the cap-refused copy is never dropped, even with the engine"
+        );
+    }
+
+    #[test]
+    fn an_abandoned_stage_with_no_recipe_is_leaked_and_never_dropped() {
+        // Sweep item 2: no recipe to recompile from fails the engine; the abandoned copy is
+        // leaked, not left in its slot to drop with the engine.
+        let mut e = mock_box();
+        e.stage_idle_timeout = Duration::from_millis(100);
+        e.rebuild.stages.clear();
+        stuck_on_next_infer(&mut e);
+        let old_drops = drops_of(mock1(&mut e));
+        e.submit(chat("c1")).unwrap();
+        assert!(run_to_final(&mut e).error.is_some());
+        e.submit(chat("c2")).unwrap();
+        let c = run_to_final(&mut e);
+        let why = c.error.as_deref().expect("refused");
+        assert!(
+            why.contains("there is no recipe to recompile stage1 from"),
+            "{why}"
+        );
+        assert!(e.engine_failed.is_some());
+        assert_eq!(e.rebuild.recompiled, 0);
+        assert!(matches!(e.stages[1], OvStage::Gone("recovery")));
+        // Counted, with 0 bytes: there is no recipe to size it from.
+        assert_eq!((e.rebuild.leaked_copies, e.rebuild.leaked_bytes), (1, 0));
+        drop(e);
+        assert_eq!(dropped(&old_drops), 0);
     }
 
     #[test]
@@ -7704,6 +7830,10 @@ mod tests {
             0,
             "the old stage is leaked, not dropped"
         );
+        // Sweep item 4: the failed recompile's leaked copy is counted; it is not a recompile.
+        assert_eq!((e.rebuild.leaked_copies, e.rebuild.leaked_bytes), (1, 1000));
+        assert_eq!(e.rebuild.recompiles_ok, 0);
+        assert!(!e.rebuild.degraded_warned);
         let t0 = Instant::now();
         e.submit(chat("c3")).unwrap();
         assert_eq!(run_to_final(&mut e).error.as_deref(), Some(why));
@@ -7777,6 +7907,49 @@ mod tests {
         );
         assert_eq!(e.rebuild.recompiled, 1, "never recompiled a second time");
         assert_eq!(ctl.lock().unwrap().built.len(), 1);
+        // The fresh copy faulted on its first infer: leaked and counted, like the old one.
+        assert!(matches!(e.stages[1], OvStage::Gone("first_infer")));
+        assert_eq!((e.rebuild.leaked_copies, e.rebuild.leaked_bytes), (2, 2000));
+        let fresh = Arc::clone(&ctl.lock().unwrap().fresh_drops[0]);
+        drop(e);
+        assert_eq!(
+            dropped(&fresh),
+            0,
+            "the faulted fresh copy is never dropped"
+        );
+    }
+
+    #[test]
+    fn a_recompiled_stage_whose_first_infer_gets_no_thread_is_leaked_not_dropped() {
+        // Sweep item 3: if the helper thread for the fresh copy's first infer cannot be started,
+        // `spawn` drops the closure that owns the copy. The copy is wrapped in `Forget` first, so
+        // it is leaked, and the engine fails as before.
+        let mut e = mock_box();
+        e.stage_idle_timeout = Duration::from_millis(100);
+        let ctl = arm_recompile(&mut e);
+        stuck_on_next_infer(&mut e);
+        let old_drops = drops_of(mock1(&mut e));
+        e.submit(chat("c1")).unwrap();
+        assert!(run_to_final(&mut e).error.is_some());
+        REFUSE_SPAWN.with(|c| c.set(Some("first_infer")));
+        e.submit(chat("c2")).unwrap();
+        let c = run_to_final(&mut e);
+        REFUSE_SPAWN.with(|c| c.set(None));
+        assert!(c.error.is_some(), "{c:?}");
+        let reason = e.engine_failed.clone().expect("the engine is failed");
+        assert!(
+            reason.contains("stage1 was recompiled and its first infer could not be run bounded")
+                && reason.contains("thread spawn refused (test)"),
+            "{reason}"
+        );
+        assert!(matches!(e.stages[1], OvStage::Gone("first_infer")));
+        assert_eq!(e.rebuild.recompiled, 1);
+        assert_eq!((e.rebuild.leaked_copies, e.rebuild.leaked_bytes), (2, 2000));
+        let fresh = Arc::clone(&ctl.lock().unwrap().fresh_drops[0]);
+        assert_eq!(dropped(&fresh), 0, "the never-run fresh copy is leaked");
+        drop(e);
+        assert_eq!(dropped(&fresh), 0);
+        assert_eq!(dropped(&old_drops), 0);
     }
 
     #[test]
@@ -8154,6 +8327,56 @@ mod tests {
         let t = e.last_timing.clone().unwrap();
         assert_eq!(t.warm_prefix, crate::prefix_cache::MIN_PREFIX_TOKENS);
         assert!(!e.scrub_pending);
+    }
+
+    #[test]
+    fn with_the_restore_clear_knob_a_hit_after_a_decision_pass_scrubs_clears_and_primes() {
+        // Sweep item 6 (the A/B branch in `local_warm_or_cold`): with
+        // `CASCADIA_QWEN36_RESTORE_CLEAR=recreate|reset` a decision pass's hit runs the deferred
+        // scrub first (a recreate: the previous pass restored), then the knob's clear, then one
+        // priming fold, then the set. `reset_state` therefore never runs on a restored request.
+        for knob in ["recreate", "reset"] {
+            RESTORE_CLEAR.with(|c| c.set(Some(knob)));
+            let mut e = cached_box();
+            answer(&mut e, shared_prefix_pass("q0", 0, true));
+            answer(&mut e, shared_prefix_pass("q1", 1, false));
+            assert!(e.decision_scrub_deferred && e.state_restored, "{knob}");
+            let ev = [events_of(&e, 0), events_of(&e, 1)];
+            let n = ev
+                .iter()
+                .map(|v| v.lock().unwrap().len())
+                .collect::<Vec<_>>();
+            let task = shared_prefix_pass("q2", 2, false);
+            assert_eq!(
+                answer(&mut e, task.clone()),
+                fresh_cold_answer(&task),
+                "{knob}"
+            );
+            RESTORE_CLEAR.with(|c| c.set(None));
+            let t = e.last_timing.clone().unwrap();
+            assert_eq!(
+                t.warm_prefix,
+                crate::prefix_cache::MIN_PREFIX_TOKENS,
+                "{knob}: a hit"
+            );
+            assert!(t.recreate, "{knob}: the deferred scrub recreated");
+            for (s, v) in ev.iter().enumerate() {
+                let since = v.lock().unwrap()[n[s]..].to_vec();
+                assert_eq!(
+                    since,
+                    ["reset", "reset", "infer", "set_state", "infer"],
+                    "{knob} stage{s}: scrub, clear, prime, set, suffix"
+                );
+            }
+            assert!(
+                e.decision_scrub_deferred,
+                "{knob}: and this pass defers its own"
+            );
+        }
+        assert_eq!(restore_clear_mode_of(Some("recreate")), "recreate_request");
+        assert_eq!(restore_clear_mode_of(Some("reset")), "reset_state");
+        assert_eq!(restore_clear_mode_of(None), "none");
+        assert_eq!(restore_clear_mode_of(Some("bogus")), "none");
     }
 
     #[test]
