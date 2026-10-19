@@ -891,6 +891,7 @@ impl Builder for Qwen36Builder {
             primed: false,
             stages_dirty: false,
             scrub_pending: false,
+            decision_scrub_deferred: false,
             infer_failed: false,
             engine_failed: None,
             stage_idle_timeout: STAGE_IDLE_TIMEOUT,
@@ -1693,6 +1694,15 @@ pub struct Qwen36Engine {
     /// first. On the GPU after a failed infer the scrub did block (Task 46: it released a request
     /// still marked busy); it now makes the requests idle first, bounded, or fails the engine.
     scrub_pending: bool,
+    /// Task 55 (H-lite), single box only: a decision pass finished and its state is still in the
+    /// stage requests, which stay primed. `finish_decision` sets it instead of running `reset_all`.
+    /// The next admission either restores a prefix-cache entry over the live requests (a decision
+    /// warm hit: `set_state_blob` overwrites every VariableState or fails, so no recreate and no
+    /// priming fold are needed) or runs the deferred `reset_all` first, which recreates because
+    /// `state_restored` is set ([`Self::scrub_deferred_decision`]). No prefill starts on the
+    /// finished pass's state. Cleared by every `reset_all` and by a successful decision warm
+    /// restore. Never set on a pipeline (`total > 1`).
+    decision_scrub_deferred: bool,
     /// An infer on a stage (or the embeddings) returned an error since the last recovery: its
     /// request may still be marked busy, and OpenVINO blocks forever releasing a busy request.
     /// The next `reset_all` makes every request idle first ([`make_idle`]), Task 46.
@@ -2295,8 +2305,10 @@ impl Qwen36Engine {
 
     fn reset_all(&mut self) {
         self.primed = false;
-        // This is the scrub a failed task left, too (`scrub_failed_task`).
+        // This is the scrub a failed task left, too (`scrub_failed_task`), and the one a finished
+        // single-box decision pass deferred (`scrub_deferred_decision`).
         self.scrub_pending = false;
+        self.decision_scrub_deferred = false;
         // Task 46: an abandoned request is never touched again (a call on it fails anyway, but
         // nothing here may release it), and its state is unknown.
         if self.engine_failed.is_some() {
@@ -2519,7 +2531,13 @@ impl Qwen36Engine {
                 let n = t.prompt_ids.len() as u32;
                 let id = t.task_id.clone();
                 self.active = None;
-                self.reset_all();
+                if self.total <= 1 {
+                    // Task 55 (H-lite): keep the primed requests for the next pass. A warm hit
+                    // restores over them; every other admission runs this scrub first.
+                    self.decision_scrub_deferred = true;
+                } else {
+                    self.reset_all();
+                }
                 if let Some(started) = self.pass_started.take() {
                     self.timing.total = started.elapsed();
                 }
@@ -2622,6 +2640,17 @@ impl Qwen36Engine {
     /// between does the same job and clears it.
     fn scrub_failed_task(&mut self) {
         if self.scrub_pending {
+            self.reset_all();
+        }
+    }
+
+    /// The scrub a finished single-box decision pass deferred (Task 55, see
+    /// `decision_scrub_deferred`). Every admission and restore runs it before it prefills or
+    /// writes state, except a decision pass's prefix-cache hit in the default restore mode,
+    /// which overwrites every state of the live, primed requests instead (`local_warm_or_cold`).
+    /// `state_restored` is set after any warm pass, so this `reset_all` recreates.
+    fn scrub_deferred_decision(&mut self) {
+        if self.decision_scrub_deferred {
             self.reset_all();
         }
     }
@@ -3990,6 +4019,11 @@ impl Qwen36Engine {
             }
             self.scrub_failed_task();
             let task = self.pending.remove(0);
+            // Task 55: only a decision pass may restore over the previous pass's live requests
+            // (`local_warm_or_cold`); chat, completion and the kv_coord restore start scrubbed.
+            if task.decision.is_none() {
+                self.scrub_deferred_decision();
+            }
             let admit_started = Instant::now();
             self.pass_started = Some(admit_started);
             self.timing = PassTiming::new(self.stages.len(), 0);
@@ -4576,7 +4610,19 @@ impl Qwen36Engine {
         if self.prefix_cache.enabled() {
             if let Some((parts, len)) = self.prefix_cache.longest_prefix(prompt_ids) {
                 let started = Instant::now();
+                // Task 55 (H-lite): a finished decision pass left its primed requests live. The
+                // default restore writes over them with no recreate and no priming fold: the
+                // shim's `set_state_blob` requires the blob's state count to equal the request's
+                // and every state to apply, else it fails and the cold path below recreates. A
+                // pre-restore clear (the A/B knob) would `reset_state` a restored request, which
+                // leaves residue: scrub first then, as before Task 55.
+                if self.decision_scrub_deferred && restore_clear_mode() != "none" {
+                    self.reset_all();
+                }
                 if self.restore_local_parts(&parts) {
+                    // Every state now holds the restored prefix: nothing of the previous pass
+                    // is left to scrub.
+                    self.decision_scrub_deferred = false;
                     self.timing.restore = started.elapsed();
                     self.last_restore_bytes = parts.iter().map(Vec::len).sum();
                     // Attention depth from the blob, not the token count (see kv_seq_from_blob).
@@ -4712,6 +4758,10 @@ impl Qwen36Engine {
         let Some(parts) = crate::prefix_cache::unframe_blobs(blob) else {
             return false;
         };
+        // The kv_coord restores (take_warm, the plane apply and hand-off) never write over a
+        // finished decision pass's live requests (Task 55): its admission scrubbed already, and
+        // this is the backstop for a path that did not.
+        self.scrub_deferred_decision();
         self.restore_local_parts(&parts)
     }
 
@@ -5174,6 +5224,7 @@ mod tests {
             primed: false,
             stages_dirty: false,
             scrub_pending: false,
+            decision_scrub_deferred: false,
             infer_failed: false,
             engine_failed: None,
             stage_idle_timeout: STAGE_IDLE_TIMEOUT,
@@ -6740,6 +6791,17 @@ mod tests {
         /// Task 54 fix round 2: counts drops of this stage (a recompile must never drop the old
         /// one: its native destructor could wait forever on the stuck request).
         drops: Arc<std::sync::atomic::AtomicUsize>,
+        /// Task 55: a model of the request's state, so a stale or dropped state changes the
+        /// answer. `folded` is the tokens the state holds; the peak logit reads it.
+        folded: usize,
+        /// The request has run an infer since it was created or reset. A `set_state_blob` onto
+        /// a request that has not is dropped, as the GPU plugin drops it (see `primed`).
+        ran: bool,
+        /// A `set_state_blob` landed: `reset_state` then leaves the state in place, as it leaves
+        /// residue on the GPU (see `state_restored`). Only `recreate_request` clears it.
+        residue: bool,
+        /// Task 55: `set_state_blob` refuses, as the shim does on a state-count mismatch.
+        refuse_set: bool,
     }
 
     impl Drop for MockStage {
@@ -6765,6 +6827,10 @@ mod tests {
                 abandoned: false,
                 hang_infer_at: None,
                 drops: Default::default(),
+                folded: 0,
+                ran: false,
+                residue: false,
+                refuse_set: false,
             }
         }
         pub(super) fn input_names(&self) -> cascadia_ov_genai_shim::Result<Vec<String>> {
@@ -6858,6 +6924,8 @@ mod tests {
                     "unknown C++ exception in infer".into(),
                 ));
             }
+            self.folded += self.n;
+            self.ran = true;
             Ok(())
         }
         pub(super) fn output(
@@ -6866,7 +6934,8 @@ mod tests {
         ) -> cascadia_ov_genai_shim::Result<(DType, Vec<usize>, Vec<u8>)> {
             let mut row = vec![0f32; self.width];
             if let Some(p) = self.peak {
-                row[p] = 1.0;
+                // Still the argmax; its value says how many tokens the state holds (Task 55).
+                row[p] = 1.0 + 0.01 * self.folded as f32;
             }
             let data: Vec<f32> = (0..self.n).flat_map(|_| row.clone()).collect();
             Ok((DType::F32, vec![1, self.n, self.width], le_bytes_f32(&data)))
@@ -6874,19 +6943,42 @@ mod tests {
         pub(super) fn reset_state(&mut self) -> cascadia_ov_genai_shim::Result<()> {
             self.refuse()?;
             self.events.lock().unwrap().push("reset");
+            if !self.residue {
+                self.folded = 0;
+            }
+            self.ran = false;
             Ok(())
         }
         /// The shim refuses to release a request that is not idle (it would block forever).
         pub(super) fn recreate_request(&mut self) -> cascadia_ov_genai_shim::Result<()> {
             self.refuse()?;
             self.events.lock().unwrap().push("reset");
+            self.folded = 0;
+            self.ran = false;
+            self.residue = false;
             Ok(())
         }
+        /// The state bytes, with `folded` in the last 8 (a blob `kv_seq_from_blob` cannot parse,
+        /// so the restore depth is the matched length).
         pub(super) fn get_state_blob(&mut self) -> cascadia_ov_genai_shim::Result<Vec<u8>> {
-            Ok(self.state.clone())
+            let mut b = self.state.clone();
+            let at = b.len() - 8;
+            b[at..].copy_from_slice(&(self.folded as u64).to_le_bytes());
+            Ok(b)
         }
         pub(super) fn set_state_blob(&mut self, blob: &[u8]) -> cascadia_ov_genai_shim::Result<()> {
-            self.state = blob.to_vec();
+            self.events.lock().unwrap().push("set_state");
+            if self.refuse_set {
+                return Err(cascadia_ov_genai_shim::Error::Native(
+                    "set_state_blob: blob has 7 states, model has 8".into(),
+                ));
+            }
+            self.residue = true;
+            if self.ran {
+                self.state = blob.to_vec();
+                let at = blob.len() - 8;
+                self.folded = u64::from_le_bytes(blob[at..].try_into().unwrap()) as usize;
+            }
             Ok(())
         }
     }
@@ -7675,7 +7767,9 @@ mod tests {
     fn a_priming_fold_that_leaves_a_request_stuck_is_recompiled_within_its_own_admission() {
         // Task 46 failed the admitting task here (the fold that primes a warm restore left its
         // request busy). Task 54: the cold path's reset recompiles the stage, and the same task
-        // is served from a cold prefill.
+        // is served from a cold prefill. Since Task 55 a warm pass right after a decision pass
+        // restores over the primed requests with no fold, so a chat turn runs in between: its
+        // finish resets the requests, and the next restore must prime them.
         let mut e = mock_box();
         e.prefix_cache = crate::prefix_cache::PrefixCache::new(1 << 20);
         e.stage_idle_timeout = Duration::from_millis(200);
@@ -7690,6 +7784,9 @@ mod tests {
         };
         e.submit(pass("first", true)).unwrap();
         assert!(run_to_final(&mut e).error.is_none());
+        e.submit(chat("between")).unwrap();
+        assert!(run_to_final(&mut e).error.is_none());
+        assert!(!e.primed, "the chat's finish reset the requests");
         let events = stuck_on_next_infer(&mut e); // the priming fold of the next restore
         let t0 = Instant::now();
         e.submit(pass("warm", false)).unwrap();
@@ -7722,8 +7819,9 @@ mod tests {
         let OvStage::Mock(m) = &mut e.stages[1] else {
             unreachable!()
         };
-        // The restore primes the request with one fold (infer +0); the suffix is infer +1.
-        m.fail_infer_at = Some(m.infers + 1);
+        // Task 55: the restore writes over the requests the first pass left primed, with no
+        // priming fold, so the suffix is the next infer.
+        m.fail_infer_at = Some(m.infers);
         e.submit(pass("warm", false)).unwrap();
         let c = run_to_final(&mut e);
         let why = c.error.as_deref().expect("failed");
@@ -7758,6 +7856,268 @@ mod tests {
         e.submit(chat("c")).unwrap();
         assert!(run_to_final(&mut e).error.is_none());
         assert!(e.last_timing.is_none());
+    }
+
+    // ---- Task 55: H-lite, decision requests stay primed between restored passes ----
+
+    /// A pass of one Kev-like request: every question shares the prefix `0..min` (the cached
+    /// state); the suffix differs per question `q`. The first pass snapshots the prefix, the
+    /// later ones require it.
+    fn shared_prefix_pass(id: &str, q: u32, first: bool) -> GenerationTask {
+        let min = crate::prefix_cache::MIN_PREFIX_TOKENS as u32;
+        let mut t = verbalizer_pass(id);
+        let d = t.decision.as_mut().unwrap();
+        d.prompt_ids = (0..min)
+            .map(|i| i % MOCK_VOCAB as u32)
+            .chain((0..8).map(|i| (i + q) % MOCK_VOCAB as u32))
+            .collect();
+        d.cache_prefix = Some(min);
+        d.needs_snapshot = first;
+        d.require_warm = !first;
+        t
+    }
+
+    /// A box with the prefix cache on.
+    fn cached_box() -> Qwen36Engine {
+        let mut e = mock_box();
+        e.prefix_cache = crate::prefix_cache::PrefixCache::new(1 << 20);
+        e
+    }
+
+    /// The answer a fresh engine gives `task` from a cold prefill (no cache, nothing restored).
+    fn fresh_cold_answer(task: &GenerationTask) -> Vec<f32> {
+        let mut t = task.clone();
+        let d = t.decision.as_mut().unwrap();
+        d.cache_prefix = None;
+        d.needs_snapshot = false;
+        d.require_warm = false;
+        let mut e = mock_box();
+        e.submit(t).unwrap();
+        let c = run_to_final(&mut e);
+        assert_eq!(e.last_timing.as_ref().unwrap().warm_prefix, 0, "cold");
+        c.decision_logits.expect("an answer")
+    }
+
+    fn answer(e: &mut Qwen36Engine, task: GenerationTask) -> Vec<f32> {
+        e.submit(task).unwrap();
+        let c = run_to_final(e);
+        assert!(c.error.is_none(), "{c:?}");
+        c.decision_logits.expect("an answer")
+    }
+
+    fn events_of(e: &Qwen36Engine, stage: usize) -> Arc<std::sync::Mutex<Vec<&'static str>>> {
+        let OvStage::Mock(m) = &e.stages[stage] else {
+            unreachable!()
+        };
+        Arc::clone(&m.events)
+    }
+
+    #[test]
+    fn warm_passes_after_a_warm_pass_restore_over_the_live_requests() {
+        // H-lite: hits 2..n write the restored state over the requests the previous pass left
+        // primed: no recreate, no priming fold, no reset. The answers equal a fresh engine's cold
+        // ones (the mock's logit reads the state depth, so a stale or dropped state would show).
+        let min = crate::prefix_cache::MIN_PREFIX_TOKENS;
+        let mut e = cached_box();
+        let first = shared_prefix_pass("q0", 0, true);
+        assert_eq!(answer(&mut e, first.clone()), fresh_cold_answer(&first));
+        assert!(
+            e.decision_scrub_deferred && e.primed,
+            "the finish kept the requests"
+        );
+        for q in 1..5 {
+            let ev = [events_of(&e, 0), events_of(&e, 1)];
+            let n = ev
+                .iter()
+                .map(|v| v.lock().unwrap().len())
+                .collect::<Vec<_>>();
+            let task = shared_prefix_pass(&format!("q{q}"), q, false);
+            assert_eq!(
+                answer(&mut e, task.clone()),
+                fresh_cold_answer(&task),
+                "q{q}"
+            );
+            let t = e.last_timing.clone().unwrap();
+            assert_eq!(t.warm_prefix, min, "q{q}: a hit");
+            assert_eq!(t.prime, Duration::ZERO, "q{q}: no priming fold");
+            assert!(!t.recreate, "q{q}: no recreate");
+            assert_eq!(t.reset, Duration::ZERO, "q{q}: no reset at all");
+            assert_eq!(t.spans, 1, "q{q}: the suffix only");
+            for (s, v) in ev.iter().enumerate() {
+                let since = v.lock().unwrap()[n[s]..].to_vec();
+                assert_eq!(since, ["set_state", "infer"], "q{q} stage{s}: {since:?}");
+            }
+            assert!(e.decision_scrub_deferred && e.primed && e.state_restored);
+        }
+    }
+
+    #[test]
+    fn a_cold_decision_after_a_warm_one_matches_a_fresh_engines_cold_pass() {
+        let mut e = cached_box();
+        answer(&mut e, shared_prefix_pass("q0", 0, true));
+        answer(&mut e, shared_prefix_pass("q1", 1, false));
+        let ev = events_of(&e, 1);
+        let n = ev.lock().unwrap().len();
+        let cold = verbalizer_pass("cold"); // shares nothing with the cached prefix
+        assert_eq!(answer(&mut e, cold.clone()), fresh_cold_answer(&cold));
+        let t = e.last_timing.clone().unwrap();
+        assert_eq!(t.warm_prefix, 0);
+        assert!(
+            t.recreate,
+            "the deferred scrub recreates a restored request"
+        );
+        assert_eq!(t.reset, t.admit_reset, "the admission's own reset");
+        let since = ev.lock().unwrap()[n..].to_vec();
+        assert_eq!(since, ["reset", "infer"], "scrubbed before the prefill");
+        assert!(e.decision_scrub_deferred, "and this pass defers its own");
+    }
+
+    #[test]
+    fn a_chat_after_a_decision_pass_is_served_on_scrubbed_requests() {
+        let min = crate::prefix_cache::MIN_PREFIX_TOKENS;
+        let tokens = |e: &mut Qwen36Engine, id: &str| {
+            // Each `hi` is token 0.
+            let mut t = windowed_task(id, &"hi ".repeat(min + 4));
+            t.max_tokens = 2;
+            e.submit(t).unwrap();
+            let mut ids = Vec::new();
+            for _ in 0..50 {
+                for (_, c) in e.step().expect("step") {
+                    assert!(c.error.is_none(), "{c:?}");
+                    ids.extend(c.token_ids.iter().copied());
+                    if c.is_final {
+                        return ids;
+                    }
+                }
+            }
+            panic!("no final chunk");
+        };
+        let fresh = tokens(&mut mock_box(), "fresh");
+        let mut e = cached_box();
+        answer(&mut e, shared_prefix_pass("q0", 0, true));
+        answer(&mut e, shared_prefix_pass("q1", 1, false));
+        // A cached prefix of the chat prompt, so the chat turn is a prefix-cache hit: only a
+        // decision pass's own hit may write over the live requests.
+        let parts = e.parts_local_stages().unwrap();
+        assert!(e.prefix_cache.insert(vec![0; min], parts));
+        let ev = [events_of(&e, 0), events_of(&e, 1)];
+        let n = ev
+            .iter()
+            .map(|v| v.lock().unwrap().len())
+            .collect::<Vec<_>>();
+        assert_eq!(tokens(&mut e, "c"), fresh);
+        for (s, v) in ev.iter().enumerate() {
+            let since = v.lock().unwrap()[n[s]..].to_vec();
+            assert_eq!(
+                since[..3],
+                ["reset", "infer", "set_state"],
+                "stage{s}: scrubbed (recreate), primed, then restored: {since:?}"
+            );
+        }
+        assert!(!e.decision_scrub_deferred);
+    }
+
+    #[test]
+    fn a_failed_decision_pass_still_scrubs() {
+        let mut e = cached_box();
+        answer(&mut e, shared_prefix_pass("q0", 0, true));
+        // The warm pass restores over the live requests, then its suffix infer throws.
+        let at = infers(&e, 1);
+        mock1(&mut e).fail_infer_at = Some(at);
+        e.submit(shared_prefix_pass("q1", 1, false)).unwrap();
+        let c = run_to_final(&mut e);
+        assert!(
+            c.error.as_deref().unwrap().starts_with("prefill failed"),
+            "{c:?}"
+        );
+        assert!(e.scrub_pending, "the failure scrub is pending");
+        let ev = events_of(&e, 1);
+        let n = ev.lock().unwrap().len();
+        let task = shared_prefix_pass("q2", 2, false);
+        assert_eq!(answer(&mut e, task.clone()), fresh_cold_answer(&task));
+        let since = ev.lock().unwrap()[n..].to_vec();
+        assert_eq!(
+            since,
+            ["reset", "infer", "set_state", "infer"],
+            "scrub (recreate), prime, restore, suffix"
+        );
+        let t = e.last_timing.clone().unwrap();
+        assert_eq!(t.warm_prefix, crate::prefix_cache::MIN_PREFIX_TOKENS);
+        assert!(!e.scrub_pending);
+    }
+
+    #[test]
+    fn a_restore_onto_a_just_recompiled_stage_primes_it_first() {
+        // Task 54 x Task 55: a warm pass gets stage 1 stuck; the next warm pass's admission
+        // recompiles it. The fresh stage is un-run, and a set_state onto an un-run request is
+        // dropped (the mock drops it too, which would change the answer), so the restore must
+        // prime it with one fold first, bounded as its first infer.
+        let mut e = cached_box();
+        e.stage_idle_timeout = Duration::from_millis(200);
+        answer(&mut e, shared_prefix_pass("q0", 0, true));
+        let events = stuck_on_next_infer(&mut e); // q1's suffix (no priming fold since Task 55)
+        e.submit(shared_prefix_pass("q1", 1, false)).unwrap();
+        assert!(run_to_final(&mut e).error.is_some());
+        let n = events.lock().unwrap().len();
+        let task = shared_prefix_pass("q2", 2, false);
+        assert_eq!(answer(&mut e, task.clone()), fresh_cold_answer(&task));
+        let since = events.lock().unwrap()[n..].to_vec();
+        let abandon = since
+            .iter()
+            .position(|&a| a == "abandon")
+            .expect("abandoned");
+        assert_eq!(
+            &since[abandon..],
+            ["abandon", "recompile", "infer", "set_state", "infer"],
+            "recompiled, primed, restored, suffix: {since:?}"
+        );
+        assert_eq!(e.rebuild.recompiled, 1);
+        assert!(e.fresh_requests.is_empty() && e.engine_failed.is_none());
+        let t = e.last_timing.clone().unwrap();
+        assert_eq!(t.warm_prefix, crate::prefix_cache::MIN_PREFIX_TOKENS);
+    }
+
+    #[test]
+    fn a_warm_restore_the_shim_refuses_falls_back_to_a_recreate_and_a_cold_prefill() {
+        // The restore over live requests is safe only because it writes every state: the shim
+        // refuses a blob whose state count differs from the request's (or any state it cannot
+        // apply). Then the pass recreates the requests and prefills cold.
+        let mut e = cached_box();
+        answer(&mut e, shared_prefix_pass("q0", 0, true));
+        mock1(&mut e).refuse_set = true;
+        let mut task = shared_prefix_pass("q1", 1, false);
+        task.decision.as_mut().unwrap().require_warm = false;
+        assert_eq!(answer(&mut e, task.clone()), fresh_cold_answer(&task));
+        let t = e.last_timing.clone().unwrap();
+        assert_eq!(t.warm_prefix, 0, "cold");
+        assert!(t.recreate, "the half-written requests are recreated");
+    }
+
+    #[test]
+    fn a_pipeline_decision_finish_still_resets_and_only_a_single_box_defers() {
+        for total in [1u32, 2] {
+            let mut e = mock_box();
+            e.total = total;
+            e.primed = true;
+            e.state_restored = true;
+            e.active = Some(ActiveTask {
+                decision: verbalizer_pass("d").decision,
+                logits: vec![0.0; MOCK_VOCAB],
+                ..finalizable_task(4, 0)
+            });
+            let ev = events_of(&e, 0);
+            let out = e.finish_decision();
+            assert!(out[0].1.error.is_none(), "total {total}: {:?}", out[0].1);
+            let resets = ev.lock().unwrap().iter().filter(|&&a| a == "reset").count();
+            if total == 1 {
+                assert!(e.decision_scrub_deferred && e.primed && e.state_restored);
+                assert_eq!(resets, 0);
+            } else {
+                assert!(!e.decision_scrub_deferred && !e.primed && !e.state_restored);
+                assert_eq!(resets, 1, "the finish recreates, as before Task 55");
+                assert!(e.timing.recreate);
+            }
+        }
     }
 
     #[test]

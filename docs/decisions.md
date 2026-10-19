@@ -917,8 +917,25 @@ beyond a few clock reads per stage infer. Two events come from the API and one f
   `task`, `head`, `prompt`, `warm_prefix`, `prefilled`, `spans`, `span_max`, `admit_ms`,
   `admit_reset_ms`, `restore_ms`, `prime_ms`, `set_state_ms`, `snapshot_ms`, `embed_ms`, `infer_ms`,
   `stage_ms` (per stage, comma-separated), `host_copy_ms`, `head_ms`, `reset_ms`, `recreate`,
-  `total_ms`. `reset_ms` and `recreate` are the reset after the head (`recreate=true` after a
-  prefix-cache restore); `admit_reset_ms` is a cold pass's reset at admission.
+  `total_ms`. `reset_ms` and `recreate` are the pass's own reset, which runs at admission
+  (`reset_ms` equals `admit_reset_ms`): a cold pass's reset, with `recreate=true` when the
+  previous pass had restored a prefix-cache state. A warm hit runs no reset (`reset_ms` 0,
+  `recreate=false`), and after another decision pass its `prime_ms` is 0 too.
+
+**Primed requests between passes (single box).** A decision pass no longer scrubs the stage
+requests when it finishes. Before, the finish recreated every stage request (because the pass had
+restored a state), and the next pass's restore then had to run one priming fold on the new
+requests before `set_state`, since the GPU plugin drops a state set onto a request that has never
+run. Now the finished pass's requests stay live and primed, and the next decision pass that hits
+the prefix cache writes the restored state straight over them. This is safe because the shim's
+`set_state_blob` writes every VariableState or fails (the blob's state count must equal the
+request's, and every state must apply); a failed restore recreates the requests and prefills
+cold. Every other admission (a cold decision pass, chat, a kv_coord restore, the scrub after a
+failed task, a stage recovery) runs the deferred scrub first, a recreate, so nothing prefills on
+the finished pass's state. Pipelines are unchanged: they reset after every pass. In the Task 51
+spike on pawan-03 (Arc 140V, 40 td40 Kev cases), this cut a Kev restore from 302 ms to 92 ms
+(p50) with bit-identical answers, and projected Kev p50 from 3.56 s to about 2.49 s. JEV passes
+are cold, so JEV does not gain.
 
 `tools/decision/bench_cases.py` drives a running server and compares runs:
 
