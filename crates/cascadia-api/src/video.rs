@@ -1816,6 +1816,49 @@ mod tests {
             );
         }
 
+        /// A staged Qwen3-VL tree (`ov-runtime`) takes each video whole
+        /// behind Qwen's own video tag, the same for every video, next to
+        /// its image tag; rank 0 expands both.
+        #[tokio::test]
+        async fn a_staged_qwen_tree_gets_each_video_behind_qwens_tag() {
+            let Some(ff) = ffmpeg() else { return };
+            let url = clip(&ff, "mp4", "video/mp4", 3);
+            let (app, seen) = video_app(ff, |m| {
+                let q = MediaConfig::qwen35_native().staged_native_video("qwen3_vl");
+                m.image_placeholder = q.image_placeholder;
+                m.reserved_text = q.reserved_text;
+                m.native_video = q.native_video;
+                m.video_placeholder = q.video_placeholder;
+                m.video_frame_multiple = q.video_frame_multiple;
+                m.max_videos = 2;
+            })
+            .await;
+            let content = json!([
+                {"type": "video_url", "video_url": url},
+                {"type": "text", "text": "and"},
+                {"type": "image_url", "image_url": {"url": png_url(4, 4)}},
+                {"type": "video_url", "video_url": url},
+            ]);
+            let (status, v) = post_chat(
+                app,
+                json!({"model": "mock-model", "max_tokens": 1,
+                    "messages": [{"role": "user", "content": content}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            let seen = seen.lock().unwrap();
+            let (prompt, sizes) = &seen[0];
+            // 3 s at 1 fps, rounded up to two frame pairs.
+            assert_eq!(sizes, &vec![(320, 240, 4), (4, 4, 1), (320, 240, 4)]);
+            let vid = "<|vision_start|><|video_pad|><|vision_end|>";
+            let img = "<|vision_start|><|image_pad|><|vision_end|>";
+            assert!(
+                prompt.contains(&format!("{vid}and{img}{vid}")),
+                "{prompt:?}"
+            );
+            assert!(!prompt.contains("Frame"), "{prompt:?}");
+        }
+
         /// Caller text still may not carry the video tag a native video uses.
         #[tokio::test]
         async fn caller_text_cannot_forge_a_video_tag() {
