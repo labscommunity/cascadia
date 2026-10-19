@@ -2123,10 +2123,21 @@ impl PreparedMedia {
             .reserved_beyond_placeholders(prompt, n, self.videos)
         {
             return Err(format!(
-                "message text must not contain `{tag}`: it is reserved for image placeholders"
+                "message text must not contain `{tag}`: it is reserved for {} placeholders",
+                reserved_for(tag)
             ));
         }
         Ok(())
+    }
+}
+
+/// What a reserved tag marks, for the 400 that refuses it: `video` for a
+/// video tag (`<ov_genai_video_`, `<|video_pad|>`, ...), else `image`.
+fn reserved_for(tag: &str) -> &'static str {
+    if tag.contains("video") {
+        "video"
+    } else {
+        "image"
     }
 }
 
@@ -2146,7 +2157,10 @@ fn refuse_reserved_text<'a>(
     count_rejected("invalid_media");
     Some(api_error(
         StatusCode::BAD_REQUEST,
-        format!("{what} must not contain `{tag}`: it is reserved for image placeholders"),
+        format!(
+            "{what} must not contain `{tag}`: it is reserved for {} placeholders",
+            reserved_for(tag)
+        ),
         None,
     ))
 }
@@ -3220,7 +3234,10 @@ async fn admit_chat(
         count_rejected("invalid_media");
         return Err(api_error(
             StatusCode::BAD_REQUEST,
-            format!("request text must not contain `{tag}`: it is reserved for image placeholders"),
+            format!(
+                "request text must not contain `{tag}`: it is reserved for {} placeholders",
+                reserved_for(tag)
+            ),
             None,
         ));
     }
