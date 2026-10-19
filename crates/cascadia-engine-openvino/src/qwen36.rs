@@ -59,12 +59,19 @@ const LEGACY_HIDDEN: usize = 2048;
 const PREFILL_CHUNK: usize = 256;
 
 /// How long a stage request a failed infer left busy gets to return to idle (OpenVINO `cancel()`,
-/// then `wait_for`) before the engine abandons it (Task 46) and replaces it (Task 54).
+/// then `wait_for`) before the engine abandons it (Task 46) and recompiles the stage (Task 54).
 const STAGE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Requests the engine may abandon, and replace with fresh ones, before it fails instead (Task 54).
-/// Each abandoned request is leaked, device memory included, so a fault that recurs on every
-/// request cannot exhaust the GPU: the next abandon past this marks the engine failed.
-const MAX_ABANDONED_REQUESTS: usize = 4;
+/// Stages the engine may recompile after an abandon before it fails instead (Task 54 fix round 2).
+/// Each recompile leaks the old stage's whole `Runtime` (compiled model and weights: about 1.5 GB
+/// for stage6 and 2.5 GB for stage7 of the 9B int8 tree, on a GPU that shares system RAM), so a
+/// fault that recurs cannot exhaust memory: the abandon past this marks the engine failed.
+const MAX_RECOMPILES: usize = 2;
+/// Bound on one stage recompile, run on a helper thread (Task 54 fix round 2). A cold compile
+/// without the model cache can take tens of seconds; a cache-warm one measured 1.2-1.7 s on p01.
+const RECOMPILE_TIMEOUT: Duration = Duration::from_secs(180);
+/// Stage `Runtime`s this process has leaked by recompiling (never dropped: a destructor could wait
+/// forever on the stuck request). Logged as `process_leaked`.
+static LEAKED_RUNTIMES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// One `wait_for` slice inside [`STAGE_IDLE_TIMEOUT`]: the state is re-read after each.
 const STAGE_IDLE_POLL: Duration = Duration::from_millis(100);
 
@@ -474,6 +481,10 @@ pub struct Qwen36Builder {
     manifest_json: Option<String>,
     emb: Option<Runtime>,
     stages: Option<Vec<Runtime>>,
+    /// How `load` compiled the embeddings and each local stage, kept so a faulted stage can be
+    /// recompiled the same way (Task 54 fix round 2).
+    emb_recipe: Option<StageRecipe>,
+    stage_recipes: Vec<StageRecipe>,
     tokenizer: Option<Tokenizer>,
     eos: Option<u32>,
     last_logits_only: bool,
@@ -573,6 +584,8 @@ impl Qwen36Builder {
             manifest_json: None,
             emb: None,
             stages: None,
+            emb_recipe: None,
+            stage_recipes: Vec::new(),
             tokenizer: None,
             eos: None,
             last_logits_only: false,
@@ -712,10 +725,9 @@ impl Builder for Qwen36Builder {
             progress.push(LoadProgress::message(
                 "compiling text-embeddings IR".to_string(),
             ));
-            self.emb = Some(
-                Runtime::compile(emb_xml.to_str().unwrap_or_default(), &self.device, &plugin)
-                    .map_err(map_ov)?,
-            );
+            let recipe = StageRecipe::new(&emb_xml, &self.device, &plugin);
+            self.emb = Some(compile_runtime(&recipe).map_err(map_ov)?);
+            self.emb_recipe = Some(recipe);
             self.tokenizer = Some(
                 Tokenizer::from_file(dir.join("tokenizer.json"))
                     .map_err(|e| EngineError::InvalidConfig(format!("tokenizer.json: {e}")))?,
@@ -776,6 +788,7 @@ impl Builder for Qwen36Builder {
         };
 
         let mut stages = Vec::new();
+        let mut recipes = Vec::new();
         for s in &manifest.stages {
             if pipeline && s.stage != self.rank as usize {
                 continue;
@@ -785,8 +798,8 @@ impl Builder for Qwen36Builder {
                 "compiling stage{} (layers {}..{}) on {}",
                 s.stage, s.layer_start, s.layer_end, self.device
             )));
-            let rt = Runtime::compile(xml.to_str().unwrap_or_default(), &self.device, &plugin)
-                .map_err(map_ov)?;
+            let recipe = StageRecipe::new(&xml, &self.device, &plugin);
+            let rt = compile_runtime(&recipe).map_err(map_ov)?;
             // A manifest without stage inputs (hand-written, or older) cannot say: the IR can.
             if rt
                 .input_names()
@@ -797,7 +810,9 @@ impl Builder for Qwen36Builder {
                 return Err(EngineError::InvalidConfig(SWITCHABLE_REFUSAL.into()));
             }
             stages.push(rt);
+            recipes.push(recipe);
         }
+        self.stage_recipes = recipes;
 
         self.manifest_json = Some(manifest_raw);
         self.last_logits_only = manifest.last_logits_only;
@@ -879,8 +894,7 @@ impl Builder for Qwen36Builder {
             infer_failed: false,
             engine_failed: None,
             stage_idle_timeout: STAGE_IDLE_TIMEOUT,
-            abandoned_requests: 0,
-            max_abandoned_requests: MAX_ABANDONED_REQUESTS,
+            rebuild: Rebuild::new(self.emb_recipe, self.stage_recipes),
             fresh_requests: Vec::new(),
             max_ctx: self.max_ctx,
             refresh_costs: Default::default(),
@@ -905,8 +919,9 @@ enum OvStage {
     Ov(Runtime),
     #[cfg(test)]
     Mock(tests::MockStage),
-    /// The stage was handed to a bounded native call that never returned ([`bounded_call`]): it
-    /// is leaked with that call's thread, and every call here fails. The engine is failed.
+    /// The stage was handed to a bounded native call that never returned ([`bounded_call`]), or
+    /// its recompile did not produce a fresh copy (the old one is leaked either way): every call
+    /// here fails. The engine is failed.
     Gone(&'static str),
 }
 
@@ -959,9 +974,6 @@ impl OvStage {
     }
     fn abandon_request(&mut self) -> cascadia_ov_genai_shim::Result<()> {
         ov_stage_call!(self, abandon_request())
-    }
-    fn replace_request(&mut self) -> cascadia_ov_genai_shim::Result<()> {
-        ov_stage_call!(self, replace_request())
     }
     fn get_state_blob(&mut self) -> cascadia_ov_genai_shim::Result<Vec<u8>> {
         ov_stage_call!(self, get_state_blob())
@@ -1077,74 +1089,173 @@ fn make_idle(label: &str, st: &mut OvStage, timeout: Duration) -> Result<(), Stu
     }
 }
 
-/// What [`bounded_call`] got back.
+/// What [`run_bounded`] (and [`bounded_call`]) got back.
 enum Bounded<T> {
-    /// The call returned in time; the stage is back in place.
-    Done(cascadia_ov_genai_shim::Result<T>),
-    /// The call did not return within the bound. The stage stays with its thread, leaked.
+    /// The call returned in time.
+    Done(T),
+    /// The call did not return within the bound. Whatever it holds stays with its thread, leaked.
     TimedOut,
-    /// No helper thread could be started; the stage is lost.
+    /// The helper thread ended without an answer (it panicked): whatever it held is leaked.
+    Died,
+    /// No helper thread could be started.
     NoThread(std::io::Error),
 }
 
-/// A stage that a timed-out [`bounded_call`] may still hand back: if the engine is no longer
-/// waiting, it is leaked, never dropped. Dropping it would run native destructors (the request's
-/// and the compiled model's) on a faulted device, from a stray thread.
-struct Leaky(Option<OvStage>);
+/// A value a bounded call may still hand back after the engine stopped waiting: it is leaked,
+/// never dropped. Dropping a stage would run native destructors (the request's and the compiled
+/// model's) on a faulted device, from a stray thread.
+struct Forget<T>(Option<T>);
 
-impl Drop for Leaky {
+impl<T> Drop for Forget<T> {
     fn drop(&mut self) {
-        if let Some(stage) = self.0.take() {
-            // `Runtime` implements `Drop` only in an `openvino` build; the lint sees the stub.
-            #[allow(clippy::forget_non_drop)]
-            std::mem::forget(stage);
+        if let Some(v) = self.0.take() {
+            std::mem::forget(v);
         }
     }
 }
 
-/// Run one native call on `st` on a helper thread, bounded by `timeout` (Task 54, fix round 1).
-///
-/// After an abandon, the engine calls into the compiled model that just faulted: the fresh
-/// create and the replacement's first infer. If the fault left a lock held or the device queue
-/// wedged, either call could block forever while holding the engine. The stage moves to the
-/// thread for the call (OpenVINO's own synchronous call, unchanged) and comes back when it
-/// returns. On a timeout the slot holds [`OvStage::Gone`]; the thread and the stage are leaked.
-fn bounded_call<T: Send + 'static>(
-    st: &mut OvStage,
+/// Run `f` on a helper thread named `qwen36-<what>`, and wait at most `timeout` for it (Task 54).
+/// Its result is wrapped in [`Forget`] before it is sent, so a late result (or one left in the
+/// channel) is leaked, not dropped.
+fn run_bounded<T: Send + 'static>(
     what: &'static str,
     timeout: Duration,
-    f: impl FnOnce(&mut OvStage) -> cascadia_ov_genai_shim::Result<T> + Send + 'static,
+    f: impl FnOnce() -> T + Send + 'static,
 ) -> Bounded<T> {
-    let stage = std::mem::replace(st, OvStage::Gone(what));
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(Leaky, cascadia_ov_genai_shim::Result<T>)>(1);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Forget<T>>(1);
     let spawned = std::thread::Builder::new()
         .name(format!("qwen36-{what}"))
         .spawn(move || {
-            let mut stage = Leaky(Some(stage));
-            let r = match stage.0.as_mut() {
-                Some(s) => f(s),
-                None => unreachable!(),
-            };
-            // Late (the engine stopped waiting): the send fails and `Leaky` leaks the stage.
-            let _ = tx.send((stage, r));
+            let v = Forget(Some(f()));
+            // Late (the engine stopped waiting): the send fails and `Forget` leaks the value.
+            let _ = tx.send(v);
         });
     if let Err(e) = spawned {
         return Bounded::NoThread(e);
     }
     match rx.recv_timeout(timeout) {
-        Ok((mut stage, r)) => {
+        Ok(mut v) => match v.0.take() {
+            Some(v) => Bounded::Done(v),
+            None => Bounded::Died,
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Bounded::TimedOut,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Bounded::Died,
+    }
+}
+
+/// Run one native call on `st` on a helper thread, bounded by `timeout` (Task 54, fix round 1).
+///
+/// After a recompile the engine's first infer runs on a stage nothing has proven yet; if the
+/// device queue is wedged it could block forever while holding the engine. The stage moves to the
+/// thread for the call (OpenVINO's own synchronous call, unchanged) and comes back when it
+/// returns. Otherwise the slot holds [`OvStage::Gone`]; the thread and the stage are leaked.
+fn bounded_call<T: Send + 'static>(
+    st: &mut OvStage,
+    what: &'static str,
+    timeout: Duration,
+    f: impl FnOnce(&mut OvStage) -> cascadia_ov_genai_shim::Result<T> + Send + 'static,
+) -> Bounded<cascadia_ov_genai_shim::Result<T>> {
+    let stage = std::mem::replace(st, OvStage::Gone(what));
+    let r = run_bounded(what, timeout, move || {
+        // Wrapped before `f` runs, so a panic in `f` leaks the stage too.
+        let mut stage = Forget(Some(stage));
+        let r = match stage.0.as_mut() {
+            Some(s) => f(s),
+            None => unreachable!(),
+        };
+        (stage, r)
+    });
+    match r {
+        Bounded::Done((mut stage, r)) => {
             if let Some(s) = stage.0.take() {
                 *st = s;
             }
             Bounded::Done(r)
         }
-        Err(_) => Bounded::TimedOut,
+        Bounded::TimedOut => Bounded::TimedOut,
+        Bounded::Died => Bounded::Died,
+        Bounded::NoThread(e) => Bounded::NoThread(e),
     }
+}
+
+/// How `load` compiled one IR, so a faulted stage can be compiled again the same way (Task 54 fix
+/// round 2): the same xml path, device and plugin config. qwen36 has one compile variant
+/// ([`Runtime::compile`]), so there is nothing else to record.
+#[derive(Clone, Debug)]
+struct StageRecipe {
+    xml: String,
+    device: String,
+    plugin: PluginConfig,
+    /// Size of the IR's weight file (the `.bin` next to the xml; 0 when unreadable): what a leaked
+    /// copy of this stage holds, logged as `leaked_bytes`.
+    weight_bytes: u64,
+}
+
+impl StageRecipe {
+    fn new(xml: &Path, device: &str, plugin: &PluginConfig) -> Self {
+        Self {
+            xml: xml.to_str().unwrap_or_default().to_string(),
+            device: device.to_string(),
+            plugin: plugin.clone(),
+            weight_bytes: std::fs::metadata(xml.with_extension("bin"))
+                .map(|m| m.len())
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// The compile `load` runs, and the one a recompile repeats.
+fn compile_runtime(r: &StageRecipe) -> cascadia_ov_genai_shim::Result<Runtime> {
+    Runtime::compile(&r.xml, &r.device, &r.plugin)
+}
+
+/// Builds a fresh stage from its recipe. [`compile_runtime`] when serving; tests inject a mock.
+type StageFactory =
+    Arc<dyn Fn(&StageRecipe) -> cascadia_ov_genai_shim::Result<OvStage> + Send + Sync>;
+
+/// What the engine needs to recompile a faulted stage (Task 54 fix round 2).
+struct Rebuild {
+    emb: Option<StageRecipe>,
+    stages: Vec<StageRecipe>,
+    factory: StageFactory,
+    /// [`RECOMPILE_TIMEOUT`]; shorter in tests.
+    timeout: Duration,
+    /// [`MAX_RECOMPILES`]; changed in tests.
+    cap: usize,
+    /// Recompiles this engine has started.
+    recompiled: usize,
+}
+
+impl Rebuild {
+    fn new(emb: Option<StageRecipe>, stages: Vec<StageRecipe>) -> Self {
+        Self {
+            emb,
+            stages,
+            factory: Arc::new(|r: &StageRecipe| compile_runtime(r).map(OvStage::Ov)),
+            timeout: RECOMPILE_TIMEOUT,
+            cap: MAX_RECOMPILES,
+            recompiled: 0,
+        }
+    }
+
+    fn recipe(&self, slot: Slot) -> Option<&StageRecipe> {
+        match slot {
+            Slot::Emb => self.emb.as_ref(),
+            Slot::Stage(j) => self.stages.get(j),
+        }
+    }
+}
+
+/// Leak a stage's `Runtime` on purpose (never drop it: its destructor may wait forever on the
+/// stuck request). Returns this process's count of leaked runtimes.
+fn leak_stage(st: OvStage) -> usize {
+    drop(Forget(Some(st)));
+    LEAKED_RUNTIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
 /// Why [`make_idle`] could not bring a request back to idle.
 enum Stuck {
-    /// Abandoned (leaked) after the timeout: the slot is empty and may get a fresh request.
+    /// Abandoned (leaked) after the timeout: the stage may be recompiled.
     Abandoned(String),
     /// There was no request to recover (the slot was already empty).
     NoRequest(String),
@@ -1153,69 +1264,74 @@ enum Stuck {
     Failed(String),
 }
 
-/// A request slot the engine may replace (Task 54): the embeddings, or a local stage.
+/// A slot the engine may recompile (Task 54): the embeddings, or a local stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Slot {
     Emb,
     Stage(usize),
 }
 
-/// The reason, and the log line, when a replaced request fails its first infer (Task 54): the
-/// compiled model itself is then suspect, so the engine fails rather than replace again.
-fn fresh_request_failed(slot: Slot, e: &cascadia_ov_genai_shim::Error) -> String {
-    let label = match slot {
-        Slot::Emb => "emb".to_string(),
-        Slot::Stage(j) => format!("stage{j}"),
-    };
-    let why = format!("{label}'s replacement infer request failed its first infer: {e}");
-    error!(stage = %label, action = "first_infer", outcome = "error", error = %e, "qwen36: stage recovery");
-    error!(reason = %why, "qwen36: engine failed; every later task is refused until a restart");
-    why
+impl Slot {
+    fn label(self) -> String {
+        match self {
+            Slot::Emb => "emb".to_string(),
+            Slot::Stage(j) => format!("stage{j}"),
+        }
+    }
 }
 
-/// A replacement request's first infer, bounded ([`bounded_call`]), Task 54 fix round 1. Ok on
-/// success; otherwise the infer's error and, when the engine must fail, its reason (a failed
-/// first infer, or one that did not return within `timeout` and whose stage is now leaked).
+/// A recompiled stage's first infer, bounded ([`bounded_call`], [`STAGE_IDLE_TIMEOUT`]), Task 54.
+/// Ok on success; otherwise the infer's error and the reason the engine fails: the fresh copy
+/// failed its first infer (the device itself is then suspect, so the engine fails rather than
+/// recompile again), did not return within `timeout` (its stage is now leaked), or its helper
+/// thread died.
 fn first_infer_bounded(
     slot: Slot,
     st: &mut OvStage,
     timeout: Duration,
 ) -> Result<(), (cascadia_ov_genai_shim::Error, String)> {
-    let label = match slot {
-        Slot::Emb => "emb".to_string(),
-        Slot::Stage(j) => format!("stage{j}"),
-    };
+    let label = slot.label();
     let t0 = Instant::now();
-    let lost = match bounded_call(st, "first_infer", timeout, |s| s.infer()) {
+    let ms = |t0: Instant| t0.elapsed().as_millis() as u64;
+    let why = match bounded_call(st, "first_infer", timeout, |s| s.infer()) {
         Bounded::Done(Ok(())) => {
             error!(
                 stage = %label,
                 action = "first_infer",
                 outcome = "ok",
-                elapsed_ms = t0.elapsed().as_millis() as u64,
+                elapsed_ms = ms(t0),
                 "qwen36: stage recovery"
             );
             return Ok(());
         }
         Bounded::Done(Err(e)) => {
-            let why = fresh_request_failed(slot, &e);
+            error!(stage = %label, action = "first_infer", outcome = "failed", error = %e, elapsed_ms = ms(t0), "qwen36: stage recovery");
+            let why = format!("{label} was recompiled and its first infer failed: {e}");
+            error!(reason = %why, "qwen36: engine failed; every later task is refused until a restart");
             return Err((e, why));
         }
         Bounded::TimedOut => {
-            error!(stage = %label, action = "first_infer", outcome = "timeout", elapsed_ms = t0.elapsed().as_millis() as u64, "qwen36: stage recovery");
+            error!(stage = %label, action = "first_infer", outcome = "timeout", elapsed_ms = ms(t0), "qwen36: stage recovery");
             format!(
-                "{label}'s replacement infer request did not return from its first infer within \
-                 {} ms; it is abandoned",
+                "{label} was recompiled and its first infer did not return within {} ms; the \
+                 stage is leaked",
                 timeout.as_millis()
             )
         }
+        Bounded::Died => {
+            error!(stage = %label, action = "first_infer", outcome = "helper thread died", elapsed_ms = ms(t0), "qwen36: stage recovery");
+            format!(
+                "{label} was recompiled and the helper thread running its first infer died; the \
+                 stage is leaked"
+            )
+        }
         Bounded::NoThread(e) => {
-            error!(stage = %label, action = "first_infer", outcome = "error", error = %e, "qwen36: stage recovery");
-            format!("{label}'s replacement infer request could not be run bounded: {e}")
+            error!(stage = %label, action = "first_infer", outcome = "failed", error = %e, elapsed_ms = ms(t0), "qwen36: stage recovery");
+            format!("{label} was recompiled and its first infer could not be run bounded: {e}")
         }
     };
-    error!(reason = %lost, "qwen36: engine failed; every later task is refused until a restart");
-    Err((cascadia_ov_genai_shim::Error::Native(lost.clone()), lost))
+    error!(reason = %why, "qwen36: engine failed; every later task is refused until a restart");
+    Err((cascadia_ov_genai_shim::Error::Native(why.clone()), why))
 }
 
 fn map_ov(err: cascadia_ov_genai_shim::Error) -> EngineError {
@@ -1582,20 +1698,18 @@ pub struct Qwen36Engine {
     /// The next `reset_all` makes every request idle first ([`make_idle`]), Task 46.
     infer_failed: bool,
     /// Set when the engine cannot keep serving after a failed infer (Task 46, narrowed by Task
-    /// 54): a request that could not be made idle could not be replaced either (the fresh create
-    /// failed, or `max_abandoned_requests` were already abandoned), or a replacement failed its
-    /// first infer. Every later task fails at once with this reason (a `backend error`, a 5xx at
-    /// the API), and nothing touches the stage requests again. Only a restart clears it.
+    /// 54): a request that could not be made idle could not be recovered either (the stage's
+    /// recompile failed or timed out, or [`Rebuild::cap`] recompiles were already used), or a
+    /// recompiled stage failed its first infer. Every later task fails at once with this reason (a
+    /// `backend error`, a 5xx at the API), and nothing touches the stage requests again. Only a
+    /// restart clears it.
     engine_failed: Option<String>,
     /// [`STAGE_IDLE_TIMEOUT`]; shorter in tests.
     stage_idle_timeout: Duration,
-    /// Requests abandoned (and leaked) by this engine so far, Task 54. One engine per process, so
-    /// this is the process's count of qwen36 leaks.
-    abandoned_requests: usize,
-    /// [`MAX_ABANDONED_REQUESTS`]; changed in tests.
-    max_abandoned_requests: usize,
-    /// Replacement requests that have not yet completed an infer (Task 54). A failed first infer
-    /// on one of them fails the engine.
+    /// How to recompile a faulted stage, and how many times this engine has (Task 54 fix round 2).
+    rebuild: Rebuild,
+    /// Recompiled stages that have not yet completed an infer (Task 54). A failed first infer on
+    /// one of them fails the engine.
     fresh_requests: Vec<Slot>,
     /// `max_position_embeddings` of the model (from the tree's config.json); prompts at or past it
     /// are refused at submit rather than prefilled for hours on the single batch=1 slot. `None`
@@ -1885,7 +1999,7 @@ impl Qwen36Engine {
         emb.set_input(&name, DType::I64, &[1, toks.len()], &le_bytes_i64(&ids))
             .map_err(map_ov)?;
         if self.fresh_requests.contains(&Slot::Emb) {
-            // A replacement's first infer: bounded, and any failure fails the engine (Task 54).
+            // A recompiled stage's first infer: bounded, and any failure fails the engine (Task 54).
             self.fresh_requests.retain(|s| *s != Slot::Emb);
             if let Err((e, why)) = first_infer_bounded(Slot::Emb, emb, self.stage_idle_timeout) {
                 self.infer_failed = true;
@@ -1979,7 +2093,7 @@ impl Qwen36Engine {
             let fresh =
                 !self.fresh_requests.is_empty() && self.fresh_requests.contains(&Slot::Stage(j));
             let r = if fresh {
-                // A replacement's first infer: bounded, and any failure fails the engine (Task 54).
+                // A recompiled stage's first infer: bounded, and any failure fails the engine (Task 54).
                 self.fresh_requests.retain(|s| *s != Slot::Stage(j));
                 first_infer_bounded(Slot::Stage(j), st, self.stage_idle_timeout).map_err(
                     |(e, why)| {
@@ -2040,104 +2154,108 @@ impl Qwen36Engine {
     }
 
     /// Make every request idle after a failed infer ([`make_idle`]), embeddings first. A request
-    /// that never gets there is abandoned (leaked) and replaced with a fresh one from the same
-    /// compiled model (Task 54), up to `max_abandoned_requests` per engine. False when the engine
-    /// is failed instead (`engine_failed`): a request that could not be abandoned, a fresh create
-    /// that failed, or an abandon past the cap.
+    /// that never gets there is abandoned and its stage recompiled from the same IR ([`Rebuild`],
+    /// Task 54 fix round 2), up to [`Rebuild::cap`] recompiles per engine. False when the engine
+    /// is failed instead (`engine_failed`): a request that could not be abandoned, an abandon past
+    /// the cap, or a recompile that failed, timed out or lost its helper thread.
     fn recover_requests(&mut self) -> bool {
         let timeout = self.stage_idle_timeout;
-        let cap = self.max_abandoned_requests;
-        let emb = self
-            .emb
-            .iter_mut()
-            .map(|s| (Slot::Emb, "emb".to_string(), s));
+        let emb = self.emb.iter_mut().map(|s| (Slot::Emb, s));
         let stages = self
             .stages
             .iter_mut()
             .enumerate()
-            .map(|(i, s)| (Slot::Stage(i), format!("stage{i}"), s));
-        'stages: for (slot, label, st) in emb.chain(stages) {
+            .map(|(i, s)| (Slot::Stage(i), s));
+        'stages: for (slot, st) in emb.chain(stages) {
+            let label = slot.label();
             let failed = 'slot: {
-                let (why, leaked) = match make_idle(&label, st, timeout) {
+                let why = match make_idle(&label, st, timeout) {
                     Ok(()) => continue 'stages,
                     Err(Stuck::Failed(why)) => break 'slot why,
-                    Err(Stuck::Abandoned(why)) => (why, true),
-                    Err(Stuck::NoRequest(why)) => (why, false),
+                    Err(Stuck::Abandoned(why) | Stuck::NoRequest(why)) => why,
                 };
-                if leaked {
-                    self.abandoned_requests += 1;
-                }
-                let abandoned = self.abandoned_requests;
-                let process_leaked = cascadia_ov_genai_shim::leaked_request_count();
-                if abandoned > cap {
+                let cap = self.rebuild.cap;
+                let recompiled = self.rebuild.recompiled + 1;
+                if recompiled > cap {
                     error!(
                         stage = %label,
-                        action = "replace",
+                        action = "recompile",
                         outcome = "refused: cap",
-                        abandoned,
+                        elapsed_ms = 0u64,
+                        recompiled = recompiled - 1,
                         cap,
-                        process_leaked,
+                        leaked_bytes = 0u64,
+                        process_leaked =
+                            LEAKED_RUNTIMES.load(std::sync::atomic::Ordering::Relaxed),
                         "qwen36: stage recovery"
                     );
                     break 'slot format!(
-                        "{why}; {abandoned} infer requests abandoned by this process, past the \
-                         cap of {cap}, so it is not replaced"
+                        "{why}; this engine has already recompiled {} stages, the cap of {cap}, \
+                         so {label} is not recompiled",
+                        recompiled - 1
                     );
                 }
-                let t0 = Instant::now();
-                let r = bounded_call(st, "replace", timeout, |s| s.replace_request());
-                let elapsed_ms = t0.elapsed().as_millis() as u64;
-                let r = match r {
-                    Bounded::Done(r) => r,
-                    Bounded::TimedOut => {
-                        error!(
-                            stage = %label,
-                            action = "replace",
-                            outcome = "timeout",
-                            abandoned,
-                            cap,
-                            process_leaked,
-                            elapsed_ms,
-                            "qwen36: stage recovery"
-                        );
-                        break 'slot format!(
-                            "{why}; creating its replacement did not return within {} ms",
-                            timeout.as_millis()
-                        );
-                    }
-                    Bounded::NoThread(e) => Err(cascadia_ov_genai_shim::Error::Native(format!(
-                        "no thread to bound the create: {e}"
-                    ))),
+                let Some(recipe) = self.rebuild.recipe(slot).cloned() else {
+                    error!(stage = %label, action = "recompile", outcome = "failed", error = "no recipe", "qwen36: stage recovery");
+                    break 'slot format!("{why}; there is no recipe to recompile {label} from");
                 };
-                match r {
-                    Ok(()) => {
-                        error!(
-                            stage = %label,
-                            action = "replace",
-                            outcome = "ok",
-                            abandoned,
-                            cap,
-                            process_leaked,
-                            elapsed_ms,
-                            "qwen36: stage recovery"
-                        );
+                self.rebuild.recompiled = recompiled;
+                // The old stage is never dropped, whatever the recompile does: its request may be
+                // stuck, and a destructor would wait on it forever.
+                let process_leaked = leak_stage(std::mem::replace(st, OvStage::Gone("recompile")));
+                let leaked_bytes = recipe.weight_bytes;
+                let bound = self.rebuild.timeout;
+                let factory = Arc::clone(&self.rebuild.factory);
+                let t0 = Instant::now();
+                let r = run_bounded("recompile", bound, move || factory(&recipe));
+                let elapsed_ms = t0.elapsed().as_millis() as u64;
+                let (outcome, failure) = match r {
+                    Bounded::Done(Ok(fresh)) => {
+                        *st = fresh;
+                        ("ok", None)
+                    }
+                    Bounded::Done(Err(e)) => (
+                        "failed",
+                        Some(format!("{why}; recompiling {label} failed: {e}")),
+                    ),
+                    Bounded::NoThread(e) => (
+                        "failed",
+                        Some(format!(
+                            "{why}; recompiling {label} failed: no thread to bound it: {e}"
+                        )),
+                    ),
+                    Bounded::Died => (
+                        "failed",
+                        Some(format!(
+                            "{why}; recompiling {label} failed: its helper thread died"
+                        )),
+                    ),
+                    Bounded::TimedOut => (
+                        "timeout",
+                        Some(format!(
+                            "{why}; recompiling {label} timed out after {} ms",
+                            bound.as_millis()
+                        )),
+                    ),
+                };
+                error!(
+                    stage = %label,
+                    action = "recompile",
+                    outcome,
+                    elapsed_ms,
+                    recompiled,
+                    cap,
+                    leaked_bytes,
+                    process_leaked,
+                    leaked_requests = cascadia_ov_genai_shim::leaked_request_count(),
+                    "qwen36: stage recovery"
+                );
+                match failure {
+                    None => {
                         self.fresh_requests.push(slot);
                         continue 'stages;
                     }
-                    Err(e) => {
-                        error!(
-                            stage = %label,
-                            action = "replace",
-                            outcome = "error",
-                            error = %e,
-                            abandoned,
-                            cap,
-                            process_leaked,
-                            elapsed_ms,
-                            "qwen36: stage recovery"
-                        );
-                        format!("{why}; its replacement could not be created: {e}")
-                    }
+                    Some(why) => why,
                 }
             };
             error!(reason = %failed, "qwen36: engine failed; every later task is refused until a restart");
@@ -2200,6 +2318,18 @@ impl Qwen36Engine {
         let mut all_ok = true;
         let reset_started = Instant::now();
         for (i, st) in self.stages.iter_mut().enumerate() {
+            // A stage this recovery just recompiled is fresh (default state, never run): nothing
+            // to scrub, and its first native call stays the bounded first infer (Task 54).
+            if self.fresh_requests.contains(&Slot::Stage(i)) {
+                error!(
+                    stage = format!("stage{i}"),
+                    action = if recreate { "recreate" } else { "reset" },
+                    outcome = "skipped: recompiled",
+                    elapsed_ms = 0u64,
+                    "qwen36: stage recovery"
+                );
+                continue;
+            }
             let t0 = Instant::now();
             let r = if recreate {
                 st.recreate_request()
@@ -5046,8 +5176,7 @@ mod tests {
             infer_failed: false,
             engine_failed: None,
             stage_idle_timeout: STAGE_IDLE_TIMEOUT,
-            abandoned_requests: 0,
-            max_abandoned_requests: MAX_ABANDONED_REQUESTS,
+            rebuild: Rebuild::new(None, Vec::new()),
             fresh_requests: Vec::new(),
             max_ctx: None,
             refresh_costs: Default::default(),
@@ -6602,12 +6731,17 @@ mod tests {
         busy: u32,
         cancelled: bool,
         abandoned: bool,
-        /// Task 54: `replace_request` fails (the fresh create, as OpenVINO's might).
-        fail_replace: bool,
-        /// Task 54 fix round 1: `replace_request` never returns (a create blocked on the device).
-        hang_replace: bool,
         /// Task 54 fix round 1: the infer (counted from 0) that never returns.
         hang_infer_at: Option<usize>,
+        /// Task 54 fix round 2: counts drops of this stage (a recompile must never drop the old
+        /// one: its native destructor could wait forever on the stuck request).
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for MockStage {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     impl MockStage {
@@ -6625,9 +6759,8 @@ mod tests {
                 busy: 0,
                 cancelled: false,
                 abandoned: false,
-                fail_replace: false,
-                hang_replace: false,
                 hang_infer_at: None,
+                drops: Default::default(),
             }
         }
         pub(super) fn input_names(&self) -> cascadia_ov_genai_shim::Result<Vec<String>> {
@@ -6693,23 +6826,6 @@ mod tests {
         pub(super) fn abandon_request(&mut self) -> cascadia_ov_genai_shim::Result<()> {
             self.events.lock().unwrap().push("abandon");
             self.abandoned = true;
-            Ok(())
-        }
-        /// Like the shim: a fresh request in the slot, whatever the old one's state (the old one
-        /// is leaked, never released). A fresh request is idle with default state.
-        pub(super) fn replace_request(&mut self) -> cascadia_ov_genai_shim::Result<()> {
-            self.events.lock().unwrap().push("replace");
-            if self.hang_replace {
-                hang_forever();
-            }
-            if self.fail_replace {
-                return Err(cascadia_ov_genai_shim::Error::Native(
-                    "create_infer_request failed".into(),
-                ));
-            }
-            self.abandoned = false;
-            self.busy = 0;
-            self.cancelled = false;
             Ok(())
         }
         pub(super) fn set_input(
@@ -6811,7 +6927,92 @@ mod tests {
         let s1 = MockStage::new(&LAST_STAGE_INPUTS, MOCK_VOCAB, Some(1));
         e.emb = Some(OvStage::Mock(emb));
         e.stages = vec![OvStage::Mock(s0), OvStage::Mock(s1)];
+        arm_recompile(&mut e);
         e
+    }
+
+    /// Task 54 fix round 2: what the mock recompile does next.
+    #[derive(Default)]
+    struct RecompileCtl {
+        /// The compile fails.
+        fail: bool,
+        /// The compile never returns.
+        hang: bool,
+        /// The recompiled stage's first infer fails.
+        fail_first_infer: bool,
+        /// The recompiled stage's first infer never returns.
+        hang_first_infer: bool,
+        /// Compiles run so far, by recipe (xml).
+        built: Vec<String>,
+    }
+
+    /// Task 54 fix round 2: give every mock slot of `e` a recipe, and a factory that "compiles" a
+    /// fresh mock of the same shape that logs into the same event list (with a `recompile` event)
+    /// and has its own drop counter. Returns the control for the next compiles.
+    fn arm_recompile(e: &mut Qwen36Engine) -> Arc<std::sync::Mutex<RecompileCtl>> {
+        type Template = (
+            Vec<String>,
+            usize,
+            Option<usize>,
+            Arc<std::sync::Mutex<Vec<&'static str>>>,
+        );
+        let mut templates: Vec<(String, Template)> = Vec::new();
+        let recipe = |xml: &str| StageRecipe {
+            xml: xml.to_string(),
+            device: "MOCK".to_string(),
+            plugin: PluginConfig::new(),
+            weight_bytes: 1000,
+        };
+        let mut template = |xml: &str, st: &OvStage| {
+            if let OvStage::Mock(m) = st {
+                templates.push((
+                    xml.to_string(),
+                    (m.inputs.clone(), m.width, m.peak, Arc::clone(&m.events)),
+                ));
+            }
+            recipe(xml)
+        };
+        let emb = e.emb.as_ref().map(|st| template("emb", st));
+        let stages = e
+            .stages
+            .iter()
+            .enumerate()
+            .map(|(j, st)| template(&format!("stage{j}"), st))
+            .collect();
+        let ctl = Arc::new(std::sync::Mutex::new(RecompileCtl::default()));
+        let c = Arc::clone(&ctl);
+        e.rebuild = Rebuild::new(emb, stages);
+        e.rebuild.factory = Arc::new(move |r: &StageRecipe| {
+            let (_, (inputs, width, peak, events)) = templates
+                .iter()
+                .find(|(xml, _)| *xml == r.xml)
+                .expect("a template for the recipe");
+            events.lock().unwrap().push("recompile");
+            let (fail, hang, fail_first, hang_first) = {
+                let mut c = c.lock().unwrap();
+                c.built.push(r.xml.clone());
+                (c.fail, c.hang, c.fail_first_infer, c.hang_first_infer)
+            };
+            if hang {
+                hang_forever();
+            }
+            if fail {
+                return Err(cascadia_ov_genai_shim::Error::Native(
+                    "compile_model failed".into(),
+                ));
+            }
+            let inputs: Vec<&str> = inputs.iter().map(String::as_str).collect();
+            let mut m = MockStage::new(&inputs, *width, *peak);
+            m.events = Arc::clone(events);
+            if fail_first {
+                m.fail_infer_at = Some(0);
+            }
+            if hang_first {
+                m.hang_infer_at = Some(0);
+            }
+            Ok(OvStage::Mock(m))
+        });
+        ctl
     }
 
     /// Step until the task's final chunk.
@@ -7118,13 +7319,22 @@ mod tests {
         m
     }
 
+    fn drops_of(m: &MockStage) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&m.drops)
+    }
+
+    fn dropped(d: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        d.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     #[test]
-    fn a_request_that_never_goes_idle_is_replaced_and_chat_and_decisions_keep_serving() {
-        // Task 54, pawan-01: after `unknown C++ exception in infer` stage6 stayed `Cancelled` for
-        // the whole 30 s wait and was abandoned, and Task 46 then failed the engine until a
-        // restart. Now the abandoned request is replaced by a fresh one from the same compiled
-        // model, and the next task is served. Both routes: a failed chat and a failed decision
-        // pass, each followed by the other kind and by its own.
+    fn a_stage_whose_request_never_goes_idle_is_recompiled_and_chat_and_decisions_keep_serving() {
+        // Task 54 fix round 2, pawan-01: after `unknown C++ exception in infer` stage6 stayed
+        // `Cancelled` for the whole wait and was abandoned. A fresh request from the same compiled
+        // model then failed its first infer (the fault corrupts per-CompiledModel state), so the
+        // stage is now recompiled from its IR, the old copy leaked (never dropped), and the next
+        // task is served. Both routes: a failed chat and a failed decision pass, each followed by
+        // the other kind and by its own.
         for (fail, next) in [
             (chat("c1"), chat("c2")),
             (verbalizer_pass("d1"), verbalizer_pass("d2")),
@@ -7135,6 +7345,7 @@ mod tests {
             let mut e = mock_box();
             e.stage_idle_timeout = Duration::from_millis(200);
             let events = stuck_on_next_infer(&mut e);
+            let old_drops = drops_of(mock1(&mut e));
             e.submit(fail).unwrap();
             let c = run_to_final(&mut e);
             let why = c.error.as_deref().expect("the first task fails");
@@ -7150,7 +7361,7 @@ mod tests {
             let took = t0.elapsed();
             assert!(
                 c.error.is_none(),
-                "{what}: served on the fresh request: {c:?}"
+                "{what}: served on the recompiled stage: {c:?}"
             );
             assert!(
                 took >= Duration::from_millis(200) && took < Duration::from_secs(3),
@@ -7166,18 +7377,23 @@ mod tests {
                 after[1..abandon].iter().all(|&a| a == "wait"),
                 "{what}: {after:?}"
             );
+            // Review N1: no reset or recreate on the fresh copy; its first call is the infer.
             assert_eq!(
                 &after[abandon..abandon + 3],
-                ["abandon", "replace", "reset"],
-                "{what}: replaced, then scrubbed: {after:?}"
+                ["abandon", "recompile", "infer"],
+                "{what}: recompiled, then served: {after:?}"
             );
-            assert!(after[abandon + 3..].contains(&"infer"), "{what}: {after:?}");
             assert!(e.engine_failed.is_none() && !e.stages_dirty, "{what}");
-            assert_eq!(e.abandoned_requests, 1, "{what}");
+            assert_eq!(e.rebuild.recompiled, 1, "{what}");
             assert!(
                 e.fresh_requests.is_empty(),
-                "{what}: the replacement has proven itself"
+                "{what}: the recompiled stage has proven itself"
             );
+            assert!(
+                !Arc::ptr_eq(&old_drops, &mock1(&mut e).drops),
+                "{what}: a new stage is installed"
+            );
+            assert_eq!(dropped(&old_drops), 0, "{what}: the old stage is leaked");
 
             // And the task after that, with no recovery at all.
             let n = events.lock().unwrap().len();
@@ -7185,29 +7401,37 @@ mod tests {
             assert!(run_to_final(&mut e).error.is_none(), "{what}");
             let tail = events.lock().unwrap()[n..].to_vec();
             assert!(
-                !tail.iter().any(|&a| a == "cancel" || a == "replace"),
+                !tail.iter().any(|&a| a == "cancel" || a == "recompile"),
                 "{what}: {tail:?}"
+            );
+            drop(e);
+            assert_eq!(
+                dropped(&old_drops),
+                0,
+                "{what}: never dropped, even with the engine"
             );
         }
     }
 
     #[test]
-    fn requests_abandoned_past_the_cap_fail_the_engine_for_chat_and_decisions() {
-        // Task 54: each abandoned request is leaked (device memory with it), so replacement is
-        // capped: past `max_abandoned_requests` the engine fails, as Task 46 did on the first.
+    fn the_third_abandon_fails_the_engine_past_the_cap_of_two_recompiles() {
+        // Task 54 fix round 2: each recompile leaks a whole stage (about 1.5-2.5 GB on the 9B
+        // tree), so an engine recompiles at most twice; the third abandon fails it.
         let mut e = mock_box();
+        assert_eq!((e.rebuild.cap, MAX_RECOMPILES), (2, 2));
         e.stage_idle_timeout = Duration::from_millis(100);
-        e.max_abandoned_requests = 2;
+        let ctl = arm_recompile(&mut e);
         for round in 1..=2 {
             stuck_on_next_infer(&mut e);
             e.submit(chat("fails")).unwrap();
             assert!(run_to_final(&mut e).error.is_some(), "round {round}");
-            e.submit(chat("served")).unwrap();
+            e.submit(verbalizer_pass("served")).unwrap();
             let c = run_to_final(&mut e);
             assert!(c.error.is_none(), "round {round}: {c:?}");
-            assert_eq!(e.abandoned_requests, round);
+            assert_eq!(e.rebuild.recompiled, round);
         }
         let events = stuck_on_next_infer(&mut e);
+        let old_drops = drops_of(mock1(&mut e));
         e.submit(verbalizer_pass("fails")).unwrap();
         assert!(run_to_final(&mut e).error.is_some());
         let before = events.lock().unwrap().len();
@@ -7217,12 +7441,14 @@ mod tests {
         assert!(
             why.starts_with(
                 "backend error: qwen36 engine failed: stage1's infer request was still"
-            ) && why.contains("3 infer requests abandoned by this process, past the cap of 2")
+            ) && why.contains("this engine has already recompiled 2 stages, the cap of 2")
                 && why.ends_with("restart the server"),
             "{why}"
         );
         let after = events.lock().unwrap()[before..].to_vec();
-        assert_eq!(after.last(), Some(&"abandon"), "not replaced: {after:?}");
+        assert_eq!(after.last(), Some(&"abandon"), "not recompiled: {after:?}");
+        assert_eq!(ctl.lock().unwrap().built, ["stage1", "stage1"]);
+        assert_eq!(e.rebuild.recompiled, 2);
         assert!(e.engine_failed.is_some());
 
         // Every later task, either route: refused at once, nothing touches a stage.
@@ -7239,16 +7465,19 @@ mod tests {
             n,
             "no stage call after the failure"
         );
+        assert_eq!(dropped(&old_drops), 0);
     }
 
     #[test]
-    fn a_failed_replacement_create_fails_the_engine() {
-        // Task 54: if the compiled model cannot give a fresh request, there is nothing to serve
-        // on: the engine fails, as before Task 54, and says why.
+    fn a_failed_recompile_fails_the_engine() {
+        // Task 54 fix round 2: if the IR cannot be compiled again, there is nothing to serve on:
+        // the engine fails and says which stage and that the compile failed.
         let mut e = mock_box();
         e.stage_idle_timeout = Duration::from_millis(100);
+        let ctl = arm_recompile(&mut e);
+        ctl.lock().unwrap().fail = true;
         let events = stuck_on_next_infer(&mut e);
-        mock1(&mut e).fail_replace = true;
+        let old_drops = drops_of(mock1(&mut e));
         e.submit(chat("c1")).unwrap();
         assert!(run_to_final(&mut e).error.is_some());
         e.submit(verbalizer_pass("d2")).unwrap();
@@ -7256,14 +7485,19 @@ mod tests {
         let why = c.error.as_deref().expect("refused");
         assert!(
             why.starts_with("backend error: qwen36 engine failed: stage1's infer request")
-                && why.contains("its replacement could not be created: ")
-                && why.contains("create_infer_request failed")
+                && why.contains("recompiling stage1 failed: ")
+                && why.contains("compile_model failed")
                 && why.ends_with("restart the server"),
             "{why}"
         );
         let ev = events.lock().unwrap().clone();
-        assert_eq!(ev.last(), Some(&"replace"), "{ev:?}");
-        assert!(e.engine_failed.is_some());
+        assert_eq!(ev.last(), Some(&"recompile"), "{ev:?}");
+        assert!(matches!(e.stages[1], OvStage::Gone("recompile")));
+        assert_eq!(
+            dropped(&old_drops),
+            0,
+            "the old stage is leaked, not dropped"
+        );
         let t0 = Instant::now();
         e.submit(chat("c3")).unwrap();
         assert_eq!(run_to_final(&mut e).error.as_deref(), Some(why));
@@ -7271,46 +7505,17 @@ mod tests {
     }
 
     #[test]
-    fn a_replacement_that_fails_its_first_infer_fails_the_engine() {
-        // Task 54: a fresh request whose first infer fails points at the compiled model (or the
-        // device), not the request: the engine fails rather than replace again.
-        let mut e = mock_box();
-        e.stage_idle_timeout = Duration::from_millis(100);
-        let at = infers(&e, 1);
-        busy_after_failed_infer(&mut e, at, u32::MAX);
-        e.submit(chat("c1")).unwrap();
-        assert!(run_to_final(&mut e).error.is_some());
-        // The next infer on stage 1 is the replacement's first.
-        mock1(&mut e).fail_infer_at = Some(at + 1);
-        e.submit(chat("c2")).unwrap();
-        let c = run_to_final(&mut e);
-        let why = c.error.as_deref().expect("fails");
-        assert!(why.contains("unknown C++ exception in infer"), "{why}");
-        let reason = e.engine_failed.clone().expect("the engine is failed");
-        assert!(
-            reason.starts_with("stage1's replacement infer request failed its first infer"),
-            "{reason}"
-        );
-        e.submit(chat("c3")).unwrap();
-        let c = run_to_final(&mut e);
-        assert!(
-            c.error
-                .as_deref()
-                .is_some_and(|w| w.contains("replacement infer request failed its first infer")),
-            "{c:?}"
-        );
-        assert_eq!(e.abandoned_requests, 1, "never replaced a second time");
-    }
-
-    #[test]
-    fn a_replacement_create_that_never_returns_fails_the_engine_within_the_bound() {
-        // Task 54 fix round 1: the create runs on the compiled model that just faulted; if it
-        // blocks (a lock the fault left held), the engine fails after `stage_idle_timeout`
-        // instead of hanging, and later tasks are refused at once.
+    fn a_recompile_that_never_returns_fails_the_engine_within_the_bound() {
+        // Task 54 fix round 2: the recompile runs on a helper thread bounded by
+        // `RECOMPILE_TIMEOUT` (short here); a compile that never returns fails the engine after
+        // the bound instead of hanging, and later tasks are refused at once.
         let mut e = mock_box();
         e.stage_idle_timeout = Duration::from_millis(150);
+        let ctl = arm_recompile(&mut e);
+        e.rebuild.timeout = Duration::from_millis(150);
+        ctl.lock().unwrap().hang = true;
         stuck_on_next_infer(&mut e);
-        mock1(&mut e).hang_replace = true;
+        let old_drops = drops_of(mock1(&mut e));
         e.submit(chat("c1")).unwrap();
         assert!(run_to_final(&mut e).error.is_some());
         let t0 = Instant::now();
@@ -7319,16 +7524,17 @@ mod tests {
         let took = t0.elapsed();
         let why = c.error.as_deref().expect("refused");
         assert!(
-            why.contains("creating its replacement did not return within 150 ms")
+            why.contains("recompiling stage1 timed out after 150 ms")
                 && why.ends_with("restart the server"),
             "{why}"
         );
-        // The idle wait, then the create's bound: two bounds, not forever.
+        // The idle wait, then the compile's bound: two bounds, not forever.
         assert!(
             took >= Duration::from_millis(300) && took < Duration::from_secs(3),
             "{took:?}"
         );
-        assert!(matches!(e.stages[1], OvStage::Gone("replace")));
+        assert!(matches!(e.stages[1], OvStage::Gone("recompile")));
+        assert_eq!(dropped(&old_drops), 0);
         let t0 = Instant::now();
         e.submit(chat("c3")).unwrap();
         assert_eq!(run_to_final(&mut e).error.as_deref(), Some(why));
@@ -7336,25 +7542,57 @@ mod tests {
     }
 
     #[test]
-    fn a_replacement_whose_first_infer_never_returns_fails_the_engine_within_the_bound() {
-        // Task 54 fix round 1: the fresh request's first infer is bounded too (a wedged device
+    fn a_recompiled_stage_that_fails_its_first_infer_fails_the_engine() {
+        // Task 54: a fresh copy whose first infer fails points at the device, not the stage: the
+        // engine fails rather than recompile again.
+        let mut e = mock_box();
+        e.stage_idle_timeout = Duration::from_millis(100);
+        let ctl = arm_recompile(&mut e);
+        ctl.lock().unwrap().fail_first_infer = true;
+        stuck_on_next_infer(&mut e);
+        e.submit(chat("c1")).unwrap();
+        assert!(run_to_final(&mut e).error.is_some());
+        e.submit(chat("c2")).unwrap();
+        let c = run_to_final(&mut e);
+        let why = c.error.as_deref().expect("fails");
+        assert!(why.contains("unknown C++ exception in infer"), "{why}");
+        let reason = e.engine_failed.clone().expect("the engine is failed");
+        assert!(
+            reason.starts_with("stage1 was recompiled and its first infer failed"),
+            "{reason}"
+        );
+        e.submit(chat("c3")).unwrap();
+        let c = run_to_final(&mut e);
+        assert!(
+            c.error
+                .as_deref()
+                .is_some_and(|w| w.contains("was recompiled and its first infer failed")),
+            "{c:?}"
+        );
+        assert_eq!(e.rebuild.recompiled, 1, "never recompiled a second time");
+        assert_eq!(ctl.lock().unwrap().built.len(), 1);
+    }
+
+    #[test]
+    fn a_recompiled_stage_whose_first_infer_never_returns_fails_the_engine_within_the_bound() {
+        // Task 54 fix round 1, kept: the fresh copy's first infer is bounded (a wedged device
         // queue). Chat and decisions both: the task fails within the bound, later ones at once.
         for next in [chat("c2"), verbalizer_pass("d2")] {
             let id = next.task_id.clone();
             let mut e = mock_box();
             e.stage_idle_timeout = Duration::from_millis(150);
-            let at = infers(&e, 1);
-            busy_after_failed_infer(&mut e, at, u32::MAX);
+            let ctl = arm_recompile(&mut e);
+            ctl.lock().unwrap().hang_first_infer = true;
+            stuck_on_next_infer(&mut e);
             e.submit(chat("c1")).unwrap();
             assert!(run_to_final(&mut e).error.is_some());
-            mock1(&mut e).hang_infer_at = Some(at + 1); // the replacement's first infer
             let t0 = Instant::now();
             e.submit(next).unwrap();
             let c = run_to_final(&mut e);
             let took = t0.elapsed();
             let why = c.error.as_deref().expect("fails");
             assert!(
-                why.contains("did not return from its first infer"),
+                why.contains("its first infer did not return"),
                 "{id}: {why}"
             );
             assert!(
@@ -7364,8 +7602,7 @@ mod tests {
             let reason = e.engine_failed.clone().expect("failed");
             assert!(
                 reason.starts_with(
-                    "stage1's replacement infer request did not return from its first infer \
-                     within 150 ms"
+                    "stage1 was recompiled and its first infer did not return within 150 ms"
                 ),
                 "{id}: {reason}"
             );
@@ -7382,9 +7619,58 @@ mod tests {
     }
 
     #[test]
-    fn a_priming_fold_that_leaves_a_request_stuck_is_replaced_within_its_own_admission() {
+    fn a_recompiled_emb_whose_first_infer_never_returns_fails_the_engine_within_the_bound() {
+        // Task 54 re-review: the embeddings take the same path as a stage. A stuck emb request is
+        // abandoned and the emb recompiled; its first infer is bounded too.
+        let mut e = mock_box();
+        e.stage_idle_timeout = Duration::from_millis(150);
+        let ctl = arm_recompile(&mut e);
+        ctl.lock().unwrap().hang_first_infer = true;
+        let (events, old_drops) = {
+            let Some(OvStage::Mock(m)) = e.emb.as_mut() else {
+                unreachable!()
+            };
+            m.fail_infer_at = Some(m.infers);
+            m.busy_after_fail = u32::MAX;
+            (Arc::clone(&m.events), drops_of(m))
+        };
+        e.submit(chat("c1")).unwrap();
+        assert!(run_to_final(&mut e).error.is_some());
+        let t0 = Instant::now();
+        e.submit(verbalizer_pass("d2")).unwrap();
+        let c = run_to_final(&mut e);
+        let took = t0.elapsed();
+        assert!(c.error.is_some());
+        assert!(
+            took >= Duration::from_millis(300) && took < Duration::from_secs(3),
+            "{took:?}"
+        );
+        let reason = e.engine_failed.clone().expect("failed");
+        assert!(
+            reason
+                .starts_with("emb was recompiled and its first infer did not return within 150 ms"),
+            "{reason}"
+        );
+        assert!(matches!(e.emb, Some(OvStage::Gone("first_infer"))));
+        assert_eq!(ctl.lock().unwrap().built, ["emb"]);
+        let ev = events.lock().unwrap().clone();
+        let i = ev
+            .iter()
+            .position(|&a| a == "recompile")
+            .expect("recompiled");
+        assert_eq!(ev[i - 1], "abandon", "{ev:?}");
+        assert_eq!(dropped(&old_drops), 0);
+        let t0 = Instant::now();
+        e.submit(chat("c3")).unwrap();
+        let c = run_to_final(&mut e);
+        assert!(c.error.as_deref().is_some_and(|w| w.contains(&reason)));
+        assert!(t0.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn a_priming_fold_that_leaves_a_request_stuck_is_recompiled_within_its_own_admission() {
         // Task 46 failed the admitting task here (the fold that primes a warm restore left its
-        // request busy). Task 54: the cold path's reset replaces the request, and the same task
+        // request busy). Task 54: the cold path's reset recompiles the stage, and the same task
         // is served from a cold prefill.
         let mut e = mock_box();
         e.prefix_cache = crate::prefix_cache::PrefixCache::new(1 << 20);
@@ -7406,9 +7692,9 @@ mod tests {
         let c = run_to_final(&mut e);
         assert!(c.error.is_none(), "{c:?}");
         assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
-        assert!(events.lock().unwrap().contains(&"replace"));
+        assert!(events.lock().unwrap().contains(&"recompile"));
         assert!(e.engine_failed.is_none() && e.fresh_requests.is_empty());
-        assert_eq!(e.abandoned_requests, 1);
+        assert_eq!(e.rebuild.recompiled, 1);
     }
 
     #[test]
@@ -7477,8 +7763,8 @@ mod tests {
         // now returns a connection-fatal error instead of the ack; `run_relay_loop` exits and the
         // closed socket fails the head's exchange at once. Rank 1 is driven here as
         // `run_relay_loop` drives it: on a connection-fatal error the stage is dropped. Task 54:
-        // a relay replaces the request like a single box does, so this rank has used up its
-        // replacements (cap 0) and its engine fails.
+        // a relay recompiles the stage like a single box does, so this rank has used up its
+        // recompiles (cap 0) and its engine fails.
         let _knob = crate::timeout_knob_lock();
         cascadia_transport::set_activation_timeout_secs(30);
         let rt = pipe_rt();
@@ -7503,7 +7789,7 @@ mod tests {
         s1.busy = u32::MAX;
         relay.stages = vec![OvStage::Mock(s1)];
         relay.infer_failed = true;
-        relay.max_abandoned_requests = 0;
+        relay.rebuild.cap = 0;
         let relay_loop = std::thread::spawn(move || loop {
             match relay.step() {
                 Err(e) if e.is_connection_fatal() => {
@@ -7562,10 +7848,11 @@ mod tests {
     }
 
     #[test]
-    fn a_relay_replaces_a_stuck_request_and_the_heads_task_is_served() {
+    fn a_relay_recompiles_a_stuck_stage_and_the_heads_task_is_served() {
         // Task 54 in pipeline mode: the relay's RESET runs the same recovery as a single box, so a
-        // request left stuck on rank 1 is abandoned and replaced inside the RESET, the ack follows,
-        // and the head's task is served. No frame changes: the head only sees a slower ack.
+        // request left stuck on rank 1 is abandoned and its stage recompiled inside the RESET, the
+        // ack follows, and the head's task is served. No frame changes: the head only sees a
+        // slower ack.
         let _knob = crate::timeout_knob_lock();
         cascadia_transport::set_activation_timeout_secs(30);
         let rt = pipe_rt();
@@ -7588,12 +7875,14 @@ mod tests {
         let mut s1 = MockStage::new(&LAST_STAGE_INPUTS, MOCK_VOCAB, Some(1));
         s1.busy = u32::MAX;
         let events = Arc::clone(&s1.events);
+        let old_drops = drops_of(&s1);
         relay.stages = vec![OvStage::Mock(s1)];
+        let ctl = arm_recompile(&mut relay);
         relay.infer_failed = true;
         let relay_loop = std::thread::spawn(move || loop {
             match relay.step() {
                 Err(e) if e.is_connection_fatal() => {
-                    return (relay.engine_failed.clone(), relay.abandoned_requests);
+                    return (relay.engine_failed.clone(), relay.rebuild.recompiled);
                 }
                 Err(_) => std::thread::sleep(Duration::from_millis(10)),
                 Ok(_) => {}
@@ -7624,17 +7913,22 @@ mod tests {
         let c = fin.expect("the head's task finishes");
         assert!(
             c.error.is_none(),
-            "served after the relay's replacement: {c:?}"
+            "served after the relay's recompile: {c:?}"
         );
         assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
         drop(head); // closes the link; the relay loop exits
-        let (failed, abandoned) = relay_loop.join().unwrap();
+        let (failed, recompiled) = relay_loop.join().unwrap();
         assert!(failed.is_none(), "{failed:?}");
-        assert_eq!(abandoned, 1);
+        assert_eq!(recompiled, 1);
+        assert_eq!(ctl.lock().unwrap().built, ["stage0"]);
         let ev = events.lock().unwrap().clone();
-        let i = ev.iter().position(|&a| a == "replace").expect("replaced");
+        let i = ev
+            .iter()
+            .position(|&a| a == "recompile")
+            .expect("recompiled");
         assert_eq!(ev[i - 1], "abandon", "{ev:?}");
-        assert!(ev[i..].contains(&"infer"), "{ev:?}");
+        assert_eq!(ev.get(i + 1), Some(&"infer"), "{ev:?}");
+        assert_eq!(dropped(&old_drops), 0, "the relay's old stage is leaked");
         cascadia_transport::set_activation_timeout_secs(0);
     }
 
