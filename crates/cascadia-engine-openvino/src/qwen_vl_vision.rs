@@ -462,8 +462,11 @@ impl Layout {
                 Some(tps) => {
                     p.video_counts.push(t as usize * per_group);
                     let ts = item.timestamps_ms.as_deref().unwrap_or_default();
-                    let spg = video::second_per_grid(ts, self.video.temporal_patch_size);
-                    intervals.push(video::time_interval(spg, tps));
+                    intervals.push(video::temporal_step(
+                        ts,
+                        self.video.temporal_patch_size,
+                        tps,
+                    ));
                 }
                 // Qwen3-VL: one run per group, behind its timestamp.
                 None => {

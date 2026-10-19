@@ -46,8 +46,13 @@ template and tokenizer only), for `qwen2_5_vl`, `qwen3_vl` and
 - `prompts.<name>`: the rendered template, the text and ids with each pad run
   collapsed to one pad (Qwen3-VL's per-group `<t seconds>` markup included),
   HF's expanded `input_ids`, the media in prompt order, the grids,
-  `second_per_grid_ts` (Qwen2.5-VL), HF's 3-row `position_ids` and
-  `rope_delta`.
+  `second_per_grid_ts` (Qwen2.5-VL), the 3-row `position_ids` and
+  `rope_delta`: HF's `get_rope_index` for Qwen3-VL and Qwen3.5; for
+  Qwen2.5-VL the generator's `qwen25_rope_index`, Qwen's original code (the
+  temporal index `floor(k * second_per_grid_t * tokens_per_second)`, the next
+  text one past the largest position), which transformers 5.14.1 departs
+  from (it truncates `second_per_grid_t` and restarts the text inside the
+  video's time range).
 
 The video processors resize with torchvision only, so the Rust (Pillow-exact)
 pixel values are held to two 8-bit levels; grids, text, ids and positions

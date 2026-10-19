@@ -169,11 +169,16 @@ video costs about half the tokens of its frames as images, with no `Frame k` lab
   pair's mean time), size frames with their video processor's budget over all frames
   (`video_preprocessor_config.json`, which the cut copies) and position each pair as its
   own grid.
-- Qwen2.5-VL writes one run of tokens and spaces the pairs in time by
-  `tokens_per_second * int(2 / sampled fps)` (transformers 5.14.1's `get_rope_index`;
-  Qwen's original code and GenAI space them a little differently below 2 fps).
+- Qwen2.5-VL writes one run of tokens and puts pair `k` at time position
+  `floor(k * 2 / sampled fps * tokens_per_second)`, the next text one past the video's
+  last position: Qwen's original `get_rope_index`, which the model was trained with
+  (transformers 5.2 / 5.20 space the pairs the same way). transformers 5.14 / 5.15
+  differ: they truncate `2 / fps` to whole seconds and start the next text inside the
+  video's time range. At the default 1 fps a fractional `2 / fps` is routine (a 5 s clip
+  gives 6 frames, 1.67 s per pair), so this server follows the original, not 5.14.
 
-The token counts and positions equal transformers 5.14.1's for the same frames
+The token counts equal transformers 5.14.1's for the same frames, and the positions
+equal its `get_rope_index` on Qwen3-VL and Qwen3.5 and the original code's on Qwen2.5-VL
 (`tests/qwen_vl_video_parity.rs`). Video works in every mode images do on these trees
 (stateful, static, packed; one box or several): rank 0 encodes it and the stages see the
 same rows and position frames as for an image.

@@ -17,8 +17,10 @@ reproduce for Qwen2.5-VL, Qwen3-VL and Qwen3.5/3.6:
                      as the API writes it), HF's expanded `input_ids`, those
                      ids with each pad run collapsed to one pad and as text,
                      the media in prompt order, the grids,
-                     `second_per_grid_ts` (Qwen2.5-VL), HF's 3-row
-                     `position_ids` and `rope_delta`
+                     `second_per_grid_ts` (Qwen2.5-VL), the 3-row
+                     `position_ids` and `rope_delta` (HF's `get_rope_index`;
+                     Qwen2.5-VL's from `qwen25_rope_index`, Qwen's original
+                     code, where transformers 5.14 departs from it)
 
 Frames are a closed-form pattern (`frame_pixels`) the Rust test rebuilds, so
 no binaries are checked in. Images are the Qwen3.5 fixtures' PNGs.
@@ -124,6 +126,44 @@ def chats(imgs):
     }
 
 
+def qwen25_rope_index(config, ids, mm, image_grid_thw, video_grid_thw, second_per_grid_ts):
+    """Qwen2.5-VL's `get_rope_index` as Qwen's original code (transformers
+    4.x), which the model was trained with: a video's temporal index is
+    `(arange(t) * second_per_grid_t * tokens_per_second).long()` and the next
+    text starts one past the largest position so far. transformers 5.14 /
+    5.15 truncate `second_per_grid_t` to whole seconds and start the next text
+    at `max(h, w) / merge`; 5.20 fixes the first only. Images and one-group
+    videos agree across all of them."""
+    merge = config.vision_config.spatial_merge_size
+    tps = config.vision_config.tokens_per_second
+    grids = {1: iter(image_grid_thw if image_grid_thw is not None else []),
+             2: iter(video_grid_thw if video_grid_thw is not None else [])}
+    spgs = iter(second_per_grid_ts if second_per_grid_ts is not None else [])
+    types = mm[0].tolist()
+    out, pos, i = [], 0, 0
+    while i < len(types):
+        j = i
+        while j < len(types) and types[j] == types[i]:
+            j += 1
+        if types[i] == 0:
+            out.append(torch.arange(j - i).view(1, -1).expand(3, -1) + pos)
+            pos += j - i
+        else:
+            t, h, w = [int(x) for x in next(grids[types[i]])]
+            h, w = h // merge, w // merge
+            step = (torch.as_tensor(next(spgs), dtype=torch.float32) * tps
+                    if types[i] == 2 else torch.tensor(1.0))
+            tt = (torch.arange(t).view(-1, 1).expand(-1, h * w) * step).long().flatten()
+            hh = torch.arange(h).view(1, -1, 1).expand(t, -1, w).flatten()
+            ww = torch.arange(w).view(1, 1, -1).expand(t, h, -1).flatten()
+            block = torch.stack([tt, hh, ww]) + pos
+            out.append(block)
+            pos = int(block.max()) + 1
+        i = j
+    llm = torch.cat(out, dim=1)
+    return llm.unsqueeze(1), torch.tensor([int(llm.max()) + 1 - len(types)])
+
+
 def collapse(ids, pads):
     out, prev = [], None
     for t in ids:
@@ -187,8 +227,19 @@ def family(model_dir, imgs):
         extra = {}
         if name == "qwen2_5_vl" and vgrid is not None:
             extra["second_per_grid_ts"] = o["second_per_grid_ts"]
-        pos, delta = cls.get_rope_index(model, ids, mm, image_grid_thw=igrid, video_grid_thw=vgrid,
-                                        attention_mask=o.get("attention_mask"), **extra)
+        if name == "qwen2_5_vl":
+            pos, delta = qwen25_rope_index(config, ids, mm, igrid, vgrid,
+                                           extra.get("second_per_grid_ts"))
+            # Where 5.14.1 agrees (no video, or one temporal group), it must
+            # give the same.
+            hf, hf_delta = cls.get_rope_index(model, ids, mm, image_grid_thw=igrid,
+                                              video_grid_thw=vgrid, **extra)
+            if vgrid is None or all(int(g[0]) == 1 for g in vgrid):
+                assert torch.equal(hf, pos) and int(hf_delta.flatten()[0]) == int(delta[0])
+        else:
+            pos, delta = cls.get_rope_index(model, ids, mm, image_grid_thw=igrid,
+                                            video_grid_thw=vgrid,
+                                            attention_mask=o.get("attention_mask"), **extra)
         flat = collapse(ids[0].tolist(), (image_token, video_token))
         entry = {
             "template_text": text,

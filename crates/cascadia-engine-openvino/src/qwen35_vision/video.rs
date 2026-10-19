@@ -25,8 +25,8 @@
 //!   Qwen2.5-VL writes one run of `t * h * w / 4` pads.
 //! - **Positions** ([`super::rope::VideoLayout`]): one `t = 1` grid per
 //!   group (Qwen3-VL, Qwen3.5), or one grid whose temporal index steps by
-//!   `tokens_per_second * int(second_per_grid_t)` (Qwen2.5-VL,
-//!   [`time_interval`]).
+//!   `tokens_per_second * second_per_grid_t` (Qwen2.5-VL,
+//!   [`temporal_step`]).
 
 use super::{preprocess_at, smart_resize, Patches, PreprocessConfig};
 
@@ -246,23 +246,25 @@ pub fn expand_video_text(prompt: &str, markups: &[String]) -> String {
 pub fn second_per_grid(timestamps_ms: &[u32], temporal: u32) -> Option<f64> {
     match timestamps_ms {
         [first, .., last] if last > first => {
-            let step = f64::from(last - first) / (timestamps_ms.len() - 1) as f64 / 1000.0;
-            Some(f64::from(temporal) * step)
+            let fps = (timestamps_ms.len() - 1) as f64 * 1000.0 / f64::from(last - first);
+            Some(f64::from(temporal) / fps)
         }
         _ => None,
     }
 }
 
-/// Qwen2.5-VL's temporal position step between a video's groups, as
-/// transformers 5.14.1 `Qwen2_5_VLModel.get_rope_index` computes it:
-/// `tokens_per_second * int(second_per_grid_t)`. The truncation is HF's
-/// (Qwen's original code floored the product instead, and GenAI 2026.4.1
-/// steps by `tokens_per_second`); the millisecond times are rounded to a
-/// microsecond first so a whole number of seconds never truncates down.
-pub fn time_interval(second_per_grid: Option<f64>, tokens_per_second: u32) -> i64 {
-    let spg = second_per_grid.unwrap_or(1.0);
-    let whole = ((spg * 1e6).round() / 1e6).floor() as i64;
-    i64::from(tokens_per_second) * whole
+/// Qwen2.5-VL's temporal position step per group, `tokens_per_second *
+/// second_per_grid_t`, in f32 as Qwen's own `get_rope_index` (and
+/// transformers 4.x, 5.2 and 5.20) multiply it: group `k` sits at
+/// `start + (k * step) as i64` ([`super::rope::VideoLayout::Temporal`]).
+/// transformers 5.14 / 5.15 truncate `second_per_grid_t` to whole seconds
+/// first, a regression the model was not trained with. 0 with one frame.
+pub fn temporal_step(timestamps_ms: &[u32], temporal: u32, tokens_per_second: u32) -> f32 {
+    match second_per_grid(timestamps_ms, temporal) {
+        // HF holds `second_per_grid_ts` as an f32 tensor.
+        Some(spg) => tokens_per_second as f32 * spg as f32,
+        None => 0.0,
+    }
 }
 
 #[cfg(test)]
@@ -347,16 +349,16 @@ mod tests {
     }
 
     #[test]
-    fn qwen25_interval_truncates_seconds_per_group() {
+    fn qwen25_step_keeps_fractional_seconds() {
         // 1 fps: 2 s per group, 2 tokens per second.
-        let s = second_per_grid(&[0, 1000, 2000, 3000], 2);
-        assert_eq!(s, Some(2.0));
-        assert_eq!(time_interval(s, 2), 4);
-        // 1.5 fps: 1.33 s per group truncates to 1.
-        let s = second_per_grid(&[0, 667, 1333, 2000], 2);
-        assert_eq!(time_interval(s, 2), 2);
+        assert_eq!(second_per_grid(&[0, 1000, 2000, 3000], 2), Some(2.0));
+        assert_eq!(temporal_step(&[0, 1000, 2000, 3000], 2, 2), 4.0);
+        // 1.5 fps: 1.33 s per group, 2.67 positions per group.
+        let s = temporal_step(&[0, 667, 1333, 2000], 2, 2);
+        assert_eq!(s, 2.0 * (2.0f64 / 1.5) as f32);
+        assert_eq!((3.0 * s) as i64, 8);
         // 0.5 fps: 4 s.
-        assert_eq!(time_interval(second_per_grid(&[0, 2000], 2), 2), 8);
-        assert_eq!(second_per_grid(&[0], 2), None);
+        assert_eq!(temporal_step(&[0, 2000], 2, 2), 8.0);
+        assert_eq!(temporal_step(&[0], 2, 2), 0.0);
     }
 }
