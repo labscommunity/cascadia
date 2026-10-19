@@ -188,7 +188,8 @@ const GENAI_NATIVE_TAGS: &[(&[&str], &[&str])] = &[
 /// goes to it whole, and the frame multiple each needs (Qwen's temporal
 /// patch is two frames). Verified live (correct answers, a fraction of the
 /// frames-as-images tokens): qwen2_5_vl, qwen3_vl, qwen3_5_moe, gemma4. The
-/// rest share a verified type's preprocessing in GenAI. `llava_next_video`
+/// rest share a verified type's preprocessing in GenAI (it has no
+/// `qwen3_vl_moe` type, so that one is not listed). `llava_next_video`
 /// is in GenAI's video list but untested here. Every other type
 /// (InternVL2 and LLaVA-NeXT throw "Video preprocessing isn't implemented
 /// for this model") gets a video as labelled frames.
@@ -196,7 +197,6 @@ const GENAI_NATIVE_VIDEO: &[(&str, usize)] = &[
     ("qwen2_vl", 2),
     ("qwen2_5_vl", 2),
     ("qwen3_vl", 2),
-    ("qwen3_vl_moe", 2),
     ("qwen3_5", 2),
     ("qwen3_5_moe", 2),
     ("gemma4", 1),
@@ -1339,7 +1339,6 @@ mod tests {
             "qwen2_vl",
             "qwen2_5_vl",
             "qwen3_vl",
-            "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
         ] {
@@ -1357,6 +1356,7 @@ mod tests {
             Some("llava_next"),
             Some("gemma3"),
             Some("phi3_v"),
+            Some("qwen3_vl_moe"),
             Some("some_new_vlm"),
             None,
         ] {
