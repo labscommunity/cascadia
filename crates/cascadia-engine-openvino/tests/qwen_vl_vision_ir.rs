@@ -68,7 +68,7 @@ fn vision_rows_match_the_hf_driven_reference() {
             .unwrap()
             .to_rgb8();
         let (w, h) = png.dimensions();
-        let p = preprocess(&[png.as_raw()], w, h, &f.preprocess).unwrap();
+        let p = preprocess(&[png.as_raw()], w, h, &f.layout.preprocess).unwrap();
         let want: Vec<u32> = e["grid_thw"]
             .as_array()
             .unwrap()

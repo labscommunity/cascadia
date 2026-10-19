@@ -504,6 +504,12 @@ pub fn video_input(frames: Vec<Frame>) -> Option<MediaInput> {
     hasher.update(num_frames.to_le_bytes());
     hasher.update(width.to_le_bytes());
     hasher.update(height.to_le_bytes());
+    // The frame times shape the prompt (Qwen3-VL timestamps) and the
+    // positions (Qwen2.5-VL's spacing), so the same frames at another rate
+    // are another video to every cache.
+    for t in &timestamps_ms {
+        hasher.update(t.to_le_bytes());
+    }
     hasher.update(&pixels);
     Some(MediaInput {
         kind: MediaKind::Video,
@@ -1091,6 +1097,10 @@ mod tests {
         assert_eq!(v.timestamps_ms.as_deref(), Some(&[0, 750, 1500][..]));
         let w = video_input(vec![frame(1, 0.0), frame(2, 0.75), frame(4, 1.5)]).unwrap();
         assert_ne!(v.sha256, w.sha256);
+        // The same frames at another rate are another video.
+        let slow = video_input(vec![frame(1, 0.0), frame(2, 1.5), frame(3, 3.0)]).unwrap();
+        assert_eq!(slow.pixels, v.pixels);
+        assert_ne!(slow.sha256, v.sha256);
         assert!(video_input(Vec::new()).is_none());
         let odd = Frame {
             input: media::rgb_image(1, 1, vec![0; 3]),
@@ -1814,6 +1824,78 @@ mod tests {
                 ),
                 "{prompt:?}"
             );
+        }
+
+        /// A staged Qwen3-VL tree (`ov-runtime`) takes each video whole
+        /// behind Qwen's own video tag, the same for every video, next to
+        /// its image tag; rank 0 expands both.
+        #[tokio::test]
+        async fn a_staged_qwen_tree_gets_each_video_behind_qwens_tag() {
+            let Some(ff) = ffmpeg() else { return };
+            let url = clip(&ff, "mp4", "video/mp4", 3);
+            let (app, seen) = video_app(ff, |m| {
+                let q = MediaConfig::qwen35_native().staged_native_video("qwen3_vl");
+                m.image_placeholder = q.image_placeholder;
+                m.reserved_text = q.reserved_text;
+                m.native_video = q.native_video;
+                m.video_placeholder = q.video_placeholder;
+                m.video_frame_multiple = q.video_frame_multiple;
+                m.max_videos = 2;
+            })
+            .await;
+            let content = json!([
+                {"type": "video_url", "video_url": url},
+                {"type": "text", "text": "and"},
+                {"type": "image_url", "image_url": {"url": png_url(4, 4)}},
+                {"type": "video_url", "video_url": url},
+            ]);
+            let (status, v) = post_chat(
+                app,
+                json!({"model": "mock-model", "max_tokens": 1,
+                    "messages": [{"role": "user", "content": content}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            let seen = seen.lock().unwrap();
+            let (prompt, sizes) = &seen[0];
+            // 3 s at 1 fps, rounded up to two frame pairs.
+            assert_eq!(sizes, &vec![(320, 240, 4), (4, 4, 1), (320, 240, 4)]);
+            let vid = "<|vision_start|><|video_pad|><|vision_end|>";
+            let img = "<|vision_start|><|image_pad|><|vision_end|>";
+            assert!(
+                prompt.contains(&format!("{vid}and{img}{vid}")),
+                "{prompt:?}"
+            );
+            assert!(!prompt.contains("Frame"), "{prompt:?}");
+        }
+
+        /// A Qwen3-VL tree's video encoder refuses a frame under 32 px a
+        /// side; the API says so with a 400 before the engine sees it.
+        #[tokio::test]
+        async fn a_staged_qwen3_video_too_small_to_encode_is_a_400() {
+            let Some(ff) = ffmpeg() else { return };
+            let url = clip(&ff, "mp4", "video/mp4", 2);
+            let (app, seen) = video_app(ff, |m| {
+                let q = MediaConfig::qwen35_native().staged_native_video("qwen3_vl");
+                m.image_placeholder = q.image_placeholder;
+                m.reserved_text = q.reserved_text;
+                m.native_video = q.native_video;
+                m.video_placeholder = q.video_placeholder;
+                m.video_frame_multiple = q.video_frame_multiple;
+                m.video_min_side = q.video_min_side;
+                // 320x240 scaled to fit 40x30.
+                m.max_video_frame_pixels = 40 * 30;
+            })
+            .await;
+            let (status, v) = post_chat(
+                app,
+                json!({"model": "mock-model", "max_tokens": 1,
+                    "messages": [video_msg("what happens?", &url)]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+            assert!(v.to_string().contains("at least 32 pixels a side"), "{v}");
+            assert!(seen.lock().unwrap().is_empty());
         }
 
         /// Caller text still may not carry the video tag a native video uses.

@@ -2134,16 +2134,35 @@ impl Frontend {
     /// The rendered prompt of a turn with images as the tokenizer must see
     /// it. Gemma 3 expands each `<start_of_image>` on the text, as HF's
     /// processor does (its "\n\n" framing merges with the neighbouring
-    /// text's tokens); the other families expand on ids in `prepare`.
-    pub(crate) fn prompt_text<'a>(&self, prompt: &'a str) -> std::borrow::Cow<'a, str> {
+    /// text's tokens), and Qwen3-VL writes each video's timestamp markup;
+    /// the other families expand on ids in `prepare`.
+    pub(crate) fn prompt_text<'a>(
+        &self,
+        prompt: &'a str,
+        media: &[cascadia_types::MediaInput],
+    ) -> std::borrow::Cow<'a, str> {
         match self {
             Frontend::Gemma3(f) => std::borrow::Cow::Owned(f.expand_text(prompt)),
+            Frontend::QwenVl(f) => f.prompt_text(prompt, media),
             Frontend::Gemma4(_)
             | Frontend::Pixtral(_)
             | Frontend::LlavaNext(_)
             | Frontend::Phi3V(_)
-            | Frontend::InternVL(_)
-            | Frontend::QwenVl(_) => std::borrow::Cow::Borrowed(prompt),
+            | Frontend::InternVL(_) => std::borrow::Cow::Borrowed(prompt),
+        }
+    }
+
+    /// Whether the family takes a `MediaKind::Video` item natively (the API
+    /// sends every other family a video's frames as images).
+    pub(crate) fn takes_video(&self) -> bool {
+        match self {
+            Frontend::QwenVl(_) => true,
+            Frontend::Gemma4(_)
+            | Frontend::Gemma3(_)
+            | Frontend::Pixtral(_)
+            | Frontend::LlavaNext(_)
+            | Frontend::Phi3V(_)
+            | Frontend::InternVL(_) => false,
         }
     }
 
@@ -2172,9 +2191,9 @@ impl Frontend {
             Frontend::Gemma3(f) => vec![f.tokens.image, f.tokens.boi, f.tokens.eoi],
             Frontend::Pixtral(f) => vec![f.tokens.image, f.tokens.image_break, f.tokens.image_end],
             Frontend::QwenVl(f) => vec![
-                f.tokens.image_pad,
-                f.tokens.vision_start,
-                f.tokens.vision_end,
+                f.layout.tokens.image_pad,
+                f.layout.tokens.vision_start,
+                f.layout.tokens.vision_end,
             ],
             Frontend::Phi3V(f) => vec![f.image_token],
             Frontend::InternVL(f) => vec![f.tokens.context, f.tokens.start, f.tokens.end],
@@ -2189,7 +2208,7 @@ impl Frontend {
             Frontend::Gemma4(f) => f.tokens.image,
             Frontend::Gemma3(f) => f.tokens.image,
             Frontend::Pixtral(f) => f.tokens.image,
-            Frontend::QwenVl(f) => f.tokens.image_pad,
+            Frontend::QwenVl(f) => f.layout.tokens.image_pad,
             Frontend::LlavaNext(f) => f.image_token,
             Frontend::Phi3V(f) => f.image_token,
             Frontend::InternVL(f) => f.tokens.context,
@@ -2373,9 +2392,10 @@ impl Frontend {
 /// a Gemma 3 tree's images expanded on the text ([`Frontend::prompt_text`]).
 fn tokenizer_text(vision: Option<&VisionTree>, task: &GenerationTask) -> String {
     match vision.and_then(|v| v.first.as_ref()) {
-        Some(first) if !task.media.is_empty() => {
-            first.frontend.prompt_text(&task.prompt).into_owned()
-        }
+        Some(first) if !task.media.is_empty() => first
+            .frontend
+            .prompt_text(&task.prompt, &task.media)
+            .into_owned(),
         _ => task.prompt.clone(),
     }
 }
@@ -5978,7 +5998,15 @@ impl Engine for OvRuntimeEngine {
                 "non-first stage does not accept tasks directly".into(),
             ));
         }
-        cascadia_engine::refuse_video(&task, "ov-runtime")?;
+        // Qwen VL trees take a video whole; every other tree gets frames.
+        if !self
+            .vision
+            .as_ref()
+            .and_then(|v| v.first.as_ref())
+            .is_some_and(|f| f.frontend.takes_video())
+        {
+            cascadia_engine::refuse_video(&task, "ov-runtime")?;
+        }
         if self.vision.as_ref().is_none_or(|v| v.first.is_none()) {
             cascadia_engine::refuse_media(&task, "ov-runtime (tree without a `vision` block)")?;
         }

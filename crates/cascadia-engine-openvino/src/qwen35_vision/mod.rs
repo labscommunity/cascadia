@@ -11,14 +11,19 @@
 //! - [`rope`]: the language model's M-RoPE positions for a prompt holding
 //!   image/video tokens, and the `rope_delta` decode continues from.
 //!
-//! Inputs are frame stacks so video needs no new entry point: an image is one
-//! frame. Parity with transformers 5.14.1 is pinned by
-//! `tests/qwen35_vision_parity.rs` against `tests/fixtures/qwen35_vision/`.
+//! - [`video`]: a video's own `smart_resize`, frame times and prompt markup.
+//!
+//! Inputs are frame stacks: an image is one frame (duplicated into the
+//! temporal patch), a video's consecutive frame pairs fill it. Parity with
+//! transformers 5.14.1 is pinned by `tests/qwen35_vision_parity.rs` against
+//! `tests/fixtures/qwen35_vision/`, and for video by
+//! `tests/qwen_vl_video_parity.rs`.
 
 pub mod encoder;
 pub mod prompt;
 pub mod resample;
 pub mod rope;
+pub mod video;
 
 use std::path::Path;
 
@@ -56,10 +61,31 @@ impl PreprocessConfig {
     /// the legacy `min_pixels`/`max_pixels` keys are honoured when `size` is
     /// absent, as transformers does.
     pub fn from_json_file(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("reading {}: {e}", path.display()))?;
-        let v: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))?;
+        Ok(Self::from_value(&read_json(path)?))
+    }
+
+    /// The video processor's settings for an export or tree dir, found where
+    /// transformers' `AutoVideoProcessor` looks: `video_preprocessor_config.json`,
+    /// then `processor_config.json`'s `video_processor`, then the image
+    /// processor's `preprocessor_config.json`. Qwen3-VL and Qwen3.5 ship a
+    /// video budget apart from the image one (4096..25165824 pixels over all
+    /// frames); Qwen2.5-VL's equals its image budget.
+    pub fn video_from_dir(dir: &Path) -> Result<Self, String> {
+        let video = dir.join("video_preprocessor_config.json");
+        if video.exists() {
+            return Self::from_json_file(&video);
+        }
+        let processor = dir.join("processor_config.json");
+        if processor.exists() {
+            if let Some(v) = read_json(&processor)?.get("video_processor") {
+                return Ok(Self::from_value(v));
+            }
+        }
+        Self::from_json_file(&dir.join("preprocessor_config.json"))
+    }
+
+    /// [`Self::from_json_file`] over a parsed object.
+    pub fn from_value(v: &serde_json::Value) -> Self {
         let mut c = Self::qwen35();
         let u = |k: &str| v.get(k).and_then(serde_json::Value::as_u64);
         if let Some(p) = u("patch_size") {
@@ -99,13 +125,19 @@ impl PreprocessConfig {
         if let Some(r) = v.get("rescale_factor").and_then(serde_json::Value::as_f64) {
             c.rescale_factor = r;
         }
-        Ok(c)
+        c
     }
 
     /// Side length every resized dimension is a multiple of.
     pub fn factor(&self) -> u32 {
         self.patch_size * self.merge_size
     }
+}
+
+fn read_json(path: &Path) -> Result<serde_json::Value, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))
 }
 
 /// transformers' `smart_resize`: the closest `(height, width)` that are
@@ -180,6 +212,31 @@ pub fn preprocess(
         return Err(format!("frame {i} is not {width}x{height} RGB8"));
     }
     let (rh, rw) = smart_resize(height, width, cfg.factor(), cfg.min_pixels, cfg.max_pixels)?;
+    preprocess_at(frames, width, height, rh, rw, cfg)
+}
+
+/// [`preprocess`] to a size already chosen (`rh x rw`, multiples of
+/// [`PreprocessConfig::factor`]): a video's size comes from its own
+/// `smart_resize` ([`video::video_size`]).
+pub fn preprocess_at(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    rh: u32,
+    rw: u32,
+    cfg: &PreprocessConfig,
+) -> Result<Patches, String> {
+    if frames.is_empty() {
+        return Err("no frames".into());
+    }
+    let frame_len = width as usize * height as usize * 3;
+    if let Some(i) = frames.iter().position(|f| f.len() != frame_len) {
+        return Err(format!("frame {i} is not {width}x{height} RGB8"));
+    }
+    let f = cfg.factor();
+    if rh == 0 || rw == 0 || !rh.is_multiple_of(f) || !rw.is_multiple_of(f) {
+        return Err(format!("{rw}x{rh} is not a multiple of {f}"));
+    }
     let resized: Vec<Vec<u8>> = frames
         .iter()
         .map(|f| {

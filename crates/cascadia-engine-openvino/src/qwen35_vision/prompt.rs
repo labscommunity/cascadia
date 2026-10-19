@@ -93,42 +93,97 @@ impl VisionPrompt {
         merge: u32,
         cache_ns: &str,
     ) -> Result<Self, String> {
-        let counts: Vec<usize> = images
+        let kinds = vec![false; images.len()];
+        Self::with_videos(
+            ids, image_pad, video_pad, images, &kinds, hidden, merge, cache_ns,
+        )
+    }
+
+    /// [`Self::new`] over images and videos in prompt order (`is_video[k]`
+    /// for item `k`, its grid `[t, h, w]` with `t` temporal groups). The
+    /// prompt carries one `<|image_pad|>` per image and, per video, one
+    /// `<|video_pad|>` per temporal group behind its timestamp text
+    /// ([`super::video::with_frame_markup`]). Positions come from the real
+    /// ids; then every video pad is fed as an image pad, so the splice and
+    /// the cache key cover video rows the same way (the model never reads a
+    /// pad's own embedding).
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_videos(
+        ids: &[u32],
+        image_pad: u32,
+        video_pad: u32,
+        items: &[(Vec<f32>, [u32; 3], [u8; 32])],
+        is_video: &[bool],
+        hidden: usize,
+        merge: u32,
+        cache_ns: &str,
+    ) -> Result<Self, String> {
+        if is_video.len() != items.len() {
+            return Err(format!(
+                "{} kinds for {} media items",
+                is_video.len(),
+                items.len()
+            ));
+        }
+        let counts: Vec<usize> = items
             .iter()
             .map(|(rows, _, _)| rows.len() / hidden)
             .collect();
-        for (i, (rows, [t, h, w], _)) in images.iter().enumerate() {
-            let want = (t * (h / merge) * (w / merge)) as usize;
+        let (mut image_counts, mut group_counts) = (Vec::new(), Vec::new());
+        let (mut image_grids, mut video_grids) = (Vec::new(), Vec::new());
+        for (i, ((rows, [t, h, w], _), &video)) in items.iter().zip(is_video).enumerate() {
+            let per = ((h / merge) * (w / merge)) as usize;
+            let want = *t as usize * per;
             if rows.len() != want * hidden {
+                let what = if video { "video" } else { "image" };
                 return Err(format!(
-                    "image {i}: {} values for a grid of {want} tokens x {hidden}",
+                    "{what} {i}: {} values for a grid of {want} tokens x {hidden}",
                     rows.len()
                 ));
             }
+            if video {
+                group_counts.extend(std::iter::repeat_n(per, *t as usize));
+                video_grids.push([*t, *h, *w]);
+            } else {
+                image_counts.push(want);
+                image_grids.push([*t, *h, *w]);
+            }
         }
-        let ids = expand_pads(ids, image_pad, &counts)?;
+        let ids = expand_pads(ids, image_pad, &image_counts)?;
+        let found = ids.iter().filter(|&&t| t == video_pad).count();
+        if found != group_counts.len() {
+            return Err(format!(
+                "prompt has {found} video frame placeholders but the videos have {} frame groups",
+                group_counts.len()
+            ));
+        }
+        let mut ids = expand_pads(&ids, video_pad, &group_counts)?;
+        let ids_i64: Vec<i64> = ids.iter().map(|&t| i64::from(t)).collect();
+        let mrope = mrope_positions(
+            &ids_i64,
+            i64::from(image_pad),
+            i64::from(video_pad),
+            &image_grids,
+            &video_grids,
+            merge,
+        )?;
+        for t in &mut ids {
+            if *t == video_pad {
+                *t = image_pad;
+            }
+        }
         let pad_positions: Vec<usize> = ids
             .iter()
             .enumerate()
             .filter_map(|(i, &t)| (t == image_pad).then_some(i))
             .collect();
-        let ids_i64: Vec<i64> = ids.iter().map(|&t| i64::from(t)).collect();
-        let grids: Vec<[u32; 3]> = images.iter().map(|(_, g, _)| *g).collect();
-        let mrope = mrope_positions(
-            &ids_i64,
-            i64::from(image_pad),
-            i64::from(video_pad),
-            &grids,
-            &[],
-            merge,
-        )?;
-        let rows = images
+        let rows = items
             .iter()
             .flat_map(|(r, _, _)| r.iter().copied())
             .collect();
         let mut cache_key = ids.clone();
         let mut at = 0;
-        for ((_, _, sha), &count) in images.iter().zip(&counts) {
+        for ((_, _, sha), &count) in items.iter().zip(&counts) {
             for row in 0..count {
                 cache_key[pad_positions[at]] = pad_cache_id(cache_ns, sha, row as u32);
                 at += 1;
@@ -293,6 +348,45 @@ mod tests {
     #[test]
     fn text_positions_repeat_the_index() {
         assert_eq!(text_positions(3, 5), vec![3, 4, 3, 4, 3, 4, 3, 4]);
+    }
+
+    /// A video's groups each sit behind their own pad (timestamp text
+    /// between them), take one `t = 1` grid each, and are fed as image pads
+    /// with the video's rows in order.
+    #[test]
+    fn video_groups_expand_and_feed_as_image_pads() {
+        const VID: u32 = 8;
+        // image (1x4x4 -> 4 tokens), then a video of 2 groups of 2x2 tokens
+        // (grid 2x4x4) behind "<t0>" (5) and "<t1>" (6).
+        let image = (vec![1.0; 4], [1, 4, 4], [1u8; 32]);
+        let video = (
+            (0..8).map(|v| 10.0 + v as f32).collect(),
+            [2, 4, 4],
+            [2u8; 32],
+        );
+        let ids = [1, PAD, 5, VID, 6, VID, 2];
+        let vp =
+            VisionPrompt::with_videos(&ids, PAD, VID, &[image, video], &[false, true], 1, 2, "")
+                .unwrap();
+        assert_eq!(vp.ids.len(), 1 + 4 + 1 + 4 + 1 + 4 + 1);
+        assert!(!vp.ids.contains(&VID));
+        assert_eq!(vp.pad_positions.len(), 12);
+        let mut e = vec![0f32; vp.ids.len()];
+        vp.splice(0, &mut e);
+        assert_eq!(&e[6..10], &[10.0, 11.0, 12.0, 13.0]);
+        assert_eq!(&e[11..15], &[14.0, 15.0, 16.0, 17.0]);
+        // Positions: image at 1 (advances 2), text 3, group 0 at 4 (h/w
+        // 4..5, advances 2), text 6, group 1 at 7, text 9.
+        assert_eq!(
+            vp.mrope.thw[0][..],
+            [0, 1, 1, 1, 1, 3, 4, 4, 4, 4, 6, 7, 7, 7, 7, 9]
+        );
+        assert_eq!(vp.mrope.thw[2][6..10], [4, 5, 4, 5]);
+        // A video's group count must match its pads.
+        let one = (vec![0.0; 4], [1, 4, 4], [3u8; 32]);
+        assert!(
+            VisionPrompt::with_videos(&[VID, VID], PAD, VID, &[one], &[true], 1, 2, "").is_err()
+        );
     }
 
     #[test]
