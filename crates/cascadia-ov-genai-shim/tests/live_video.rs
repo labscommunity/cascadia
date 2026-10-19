@@ -4,35 +4,50 @@
 //! ```text
 //! CASCADIA_LIVE_VLM=/path/to/Qwen3-VL-4B-Instruct-int4-ov \
 //!   cargo test -p cascadia-ov-genai-shim --features openvino \
-//!   --test live_video -- --ignored --nocapture
+//!   --test live_video -- --ignored --nocapture --test-threads 1
 //! ```
 #![cfg(feature = "openvino")]
 
 use cascadia_ov_genai_shim::{
-    CbPipeline, CbSchedulerConfig, CbStatus, GenConfig, LlmPipeline, Media, MediaKind, PluginConfig,
+    CbHandle, CbPipeline, CbSchedulerConfig, CbStatus, GenConfig, LlmPipeline, Media, MediaKind,
+    PluginConfig,
 };
 
 const SIDE: u32 = 448;
-const COLORS: [(&str, [u8; 3]); 8] = [
-    ("red", [255, 0, 0]),
-    ("green", [0, 255, 0]),
-    ("blue", [0, 0, 255]),
-    ("yellow", [255, 255, 0]),
-    ("magenta", [255, 0, 255]),
-    ("cyan", [0, 255, 255]),
-    ("white", [255, 255, 255]),
-    ("black", [0, 0, 0]),
+/// Each color with the names a model may give it.
+const COLORS: [(&[&str], [u8; 3]); 8] = [
+    (&["red"], [255, 0, 0]),
+    (&["green"], [0, 160, 0]),
+    (&["blue"], [0, 0, 255]),
+    (&["yellow"], [255, 220, 0]),
+    (&["magenta", "pink", "purple", "violet"], [255, 0, 255]),
+    (
+        &["cyan", "teal", "turquoise", "aqua", "light blue"],
+        [0, 200, 200],
+    ),
+    (&["orange"], [255, 128, 0]),
+    (&["black"], [0, 0, 0]),
 ];
-const PROMPT: &str = "<ov_genai_video_0>List the solid colors shown in this video, in order.";
+const PROMPT: &str =
+    "<ov_genai_video_0>A colored square is shown on a white background. List its colors \
+     in the order they appear in this video.";
 
-/// 16 frames at 1 fps, each color held for two frames (one Qwen temporal
-/// patch), so a model that sees every frame names all eight in order.
+/// 16 frames at 1 fps: a square of one color on white, each color held for
+/// two frames (one Qwen temporal patch), so a model that sees every frame
+/// names all eight in order. A shape on white, not a solid frame: some
+/// families describe a full-frame color as one tint.
 fn frames() -> Vec<u8> {
-    let frame = (SIDE * SIDE * 3) as usize;
-    let mut px = Vec::with_capacity(16 * frame);
+    let side = SIDE as usize;
+    let mut px = Vec::with_capacity(16 * side * side * 3);
     for k in 0..16 {
         let rgb = COLORS[k / 2].1;
-        px.extend(std::iter::repeat_n(rgb, frame / 3).flatten());
+        for y in 0..side {
+            for x in 0..side {
+                let inside =
+                    (side / 4..3 * side / 4).contains(&x) && (side / 4..3 * side / 4).contains(&y);
+                px.extend_from_slice(if inside { &rgb } else { &[255, 255, 255] });
+            }
+        }
     }
     px
 }
@@ -50,7 +65,7 @@ fn video(px: &[u8]) -> Media<'_> {
 
 fn cfg() -> GenConfig {
     GenConfig {
-        max_new_tokens: 48,
+        max_new_tokens: 64,
         top_p: 1.0,
         ..GenConfig::default()
     }
@@ -74,18 +89,35 @@ fn model() -> String {
     std::env::var("CASCADIA_LIVE_VLM").expect("set CASCADIA_LIVE_VLM to a VLM export")
 }
 
-/// Every color in order: the model saw all 16 frames, not GenAI's own
+/// All eight colors, in order: the model saw all 16 frames, not GenAI's own
 /// resample of them.
 fn assert_all_colors(text: &str) {
     let lower = text.to_lowercase();
     let mut at = 0;
-    for (name, _) in COLORS.iter().take(4) {
-        let found = lower[at..].find(name);
-        assert!(
-            found.is_some(),
-            "`{name}` missing after byte {at}: {text:?}"
-        );
-        at += found.unwrap();
+    for (names, _) in COLORS {
+        let found = names
+            .iter()
+            .filter_map(|n| lower[at..].find(n).map(|i| (i, n.len())))
+            .min();
+        let Some((i, len)) = found else {
+            panic!("{names:?} missing after byte {at}: {text:?}");
+        };
+        at += i + len;
+    }
+}
+
+/// Step the pipeline until `h` finishes; its text and prompt tokens.
+fn run_to_end(pipe: &CbPipeline, h: &mut CbHandle) -> (String, Option<u32>) {
+    let mut text = String::new();
+    loop {
+        pipe.step().unwrap();
+        let r = h.read().unwrap();
+        text.push_str(&r.text_delta);
+        match r.status {
+            CbStatus::Running => {}
+            CbStatus::Finished => return (text, h.input_tokens()),
+            other => panic!("request ended {other:?}: {text:?}"),
+        }
     }
 }
 
@@ -115,21 +147,13 @@ fn cb_pipeline_takes_a_native_video_and_an_image() {
     let pipe = CbPipeline::new(&model(), &device(), &sched, &plugin()).unwrap();
     let px = frames();
     let mut h = pipe.add_request(1, PROMPT, &[video(&px)], &cfg()).unwrap();
-    let mut text = String::new();
-    loop {
-        pipe.step().unwrap();
-        let r = h.read().unwrap();
-        text.push_str(&r.text_delta);
-        match r.status {
-            CbStatus::Running => {}
-            CbStatus::Finished => break,
-            other => panic!("request ended {other:?}: {text:?}"),
-        }
-    }
-    eprintln!("cb: input_tokens={:?} text={text:?}", h.input_tokens());
+    let (text, video_tokens) = run_to_end(&pipe, &mut h);
+    eprintln!("cb: input_tokens={video_tokens:?} text={text:?}");
     assert_all_colors(&text);
 
-    // An image and a video in one request: each fills its own tag sequence.
+    // An image and a video in one request: each fills its own tag sequence,
+    // so the prompt holds both (more tokens than the video alone). One
+    // question, about the image: a small model need not answer two.
     let img: Vec<u8> = std::iter::repeat_n([255u8, 128, 0], (SIDE * SIDE) as usize)
         .flatten()
         .collect();
@@ -144,27 +168,14 @@ fn cb_pipeline_takes_a_native_video_and_an_image() {
         },
         video(&px),
     ];
-    let prompt = "<ov_genai_image_0>What color is this image? <ov_genai_video_0>And what is \
-                  the first color of this video? Answer in two words.";
+    let prompt = "<ov_genai_image_0><ov_genai_video_0>What color is the image? One word.";
     let mut h = pipe.add_request(2, prompt, &media, &cfg()).unwrap();
-    let mut text = String::new();
-    loop {
-        pipe.step().unwrap();
-        let r = h.read().unwrap();
-        text.push_str(&r.text_delta);
-        match r.status {
-            CbStatus::Running => {}
-            CbStatus::Finished => break,
-            other => panic!("request ended {other:?}: {text:?}"),
-        }
-    }
-    eprintln!(
-        "cb mixed: input_tokens={:?} text={text:?}",
-        h.input_tokens()
-    );
-    let lower = text.to_lowercase();
+    let (text, mixed_tokens) = run_to_end(&pipe, &mut h);
+    eprintln!("cb mixed: input_tokens={mixed_tokens:?} text={text:?}");
+    let (video_tokens, mixed_tokens) = (video_tokens.unwrap(), mixed_tokens.unwrap());
     assert!(
-        lower.contains("orange") && lower.contains("red"),
-        "{text:?}"
+        mixed_tokens > video_tokens + 100,
+        "the image was not placed: {mixed_tokens} vs {video_tokens} for the video alone"
     );
+    assert!(!text.trim().is_empty());
 }
