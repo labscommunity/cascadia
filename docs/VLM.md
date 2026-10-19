@@ -195,7 +195,13 @@ replaces the whole `<|vision_start|><|video_pad|><|vision_end|>`, dropping the o
 HF keeps around the per-pair markup; this server follows HF); stateful,
 static (`--prefill-seq 256 --shared-prefill`) and packed (`--packed-slots 2
 --packed-seq 64`) trees answer the same and count the same 450. A Qwen2.5-VL-7B tree
-takes 565, as ov-genai does. A two-stage Qwen3-VL tree
+takes 565, as ov-genai does, in every mode: one-stage stateful, static
+(`static_variant.py --context 2048 --prefill-seq 256 --shared-prefill`) and packed
+(`packed_variant.py --slots 2 --packed-seq 64 --dynamic-seq`; two slots, since 565
+tokens do not fit a four-slot region of 511), and a two-stage static and packed tree
+across pawan-04 (rank 0) and pawan-02, each answering "The first shape is a red
+circle, and the last shape is a blue square." (about 30-40 s a request on CPU) and
+passing the image suite (294 prompt tokens). A two-stage Qwen3-VL tree
 across pawan-04 (rank 0) and pawan-02 also counts 450 and answers the same.
 
 The `qwen35` engine was verified live on 2026-10-19 with a two-stage Qwen3.6-35B-A3B tree
@@ -491,11 +497,13 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
   `--packed-seq` rows; a decode step runs narrower when the stage has a narrow width:
   pass `--dynamic-seq` on CPU (the packed IR keeps its query width dynamic, so a
   decode step runs at its live rows) or `--decode-seq D` (a second, static `D`-row
-  decode IR, `D` at least the slot count; meant for the NPU, measured on CPU only).
+  decode IR, `D` at least the slot count; the NPU's narrow decode, CPU/GPU too).
   Without either, a decode step is
   `--packed-seq` rows too (CPU, Qwen3-VL-4B, 4 slots: 1.92 s a step at 64 rows,
   0.75 s with `--decode-seq 4`, 0.94 s with `--dynamic-seq`; Arc 140V iGPU: 0.40,
-  0.33 and 0.28 s, `--dynamic-seq` matching the GPU static path token for token; see
+  0.33 and 0.28 s, `--dynamic-seq` matching the GPU static path token for token;
+  NPU, from a static tree without `--shared-prefill`: 0.46 and 0.33 s with
+  `--decode-seq 4`; see
   [perf/NPU_PACKED_SLOTS.md](perf/NPU_PACKED_SLOTS.md)). A bidirectional
   family (Gemma 3 / Gemma 4) keeps `--packed-seq` at least one image wide (below). A
   request whose prompt does not fit one slot's region `(context - 1 - packed_prefix) / N`
@@ -569,6 +577,15 @@ for 11 minutes; a restart from the cache dir served in 4 s. Per request (18 toke
 prefill about 2.2 s and decode 3.4 tok/s on the NPU against 11.8 s and 1.4 tok/s for
 the same tree on CPU (start 27 s), about 7.2 s against 24 s end to end.
 
+Packed on the NPU: the same model's static tree (`static_variant.py --context 2048`)
+with `packed_variant.py --slots 4 --packed-seq 64 --decode-seq 4`, served with
+`--packed-slots 4 --device NPU --ov-cache-dir`, passed the SDK image suite (223
+prompt tokens) and video suite (450) with the same answer, and decodes at 0.33 s a
+step (9.2 tok/s total for three text requests at once; 0.46 s and 6.4 tok/s
+without the narrow decode IR). The first start compiled about 18 minutes (three
+IRs); a restart from the cache dir served in under a minute. See
+[perf/NPU_PACKED_SLOTS.md](perf/NPU_PACKED_SLOTS.md).
+
 ## Limits worth knowing
 
 - Prompt tokens count the image's tokens (Gemma 4: at most 280 per image; Gemma 3: 256 per
@@ -592,8 +609,9 @@ the same tree on CPU (start 27 s), about 7.2 s against 24 s end to end.
   at a 288-row cost unless it was built with `--dynamic-seq` (CPU) or
   `--decode-seq` (static shapes, meant for the NPU); `static_variant.py` still caps `--context` + `--prefill-seq` at the sliding
   window + 1 (1025), which leaves two slots of 367 tokens at `--context 736`. Every
-  stage must run the same build: the packed plan frame carries image ids (four rows
-  instead of three), and a stage refuses the other kind.
+  stage must run the same build and tree kind: the packed plan frame's tag says
+  whether it carries image ids, and a stage refuses a frame of the other kind or of
+  an older, untagged build.
 - Rank 0 keeps each encoded image (keyed on a hash of its pixels) so a chat's earlier
   images are not re-encoded every turn: `CASCADIA_IMAGE_CACHE_MB` per vision front end,
   default 256, 0 to disable. With `kv_coord`, `ov-runtime`, `gemma4` and `qwen35` also
