@@ -18,6 +18,7 @@ kv_coord = ["dep:cascadia-kv-wire", "dep:crc32fast", "cascadia-engine/kv_coord"]
 [dependencies]
 cascadia-types = { workspace = true }
 cascadia-engine = { workspace = true }
+cascadia-metrics = { workspace = true }
 cascadia-runner = { workspace = true }
 cascadia-transport = { workspace = true }
 cascadia-ov-genai-shim = { workspace = true }
