@@ -61,7 +61,7 @@ fn device() -> String {
     std::env::var("CASCADIA_LIVE_DEVICE").unwrap_or_else(|_| "CPU".into())
 }
 
-/// f32 inference on an ARM CPU, whose paged attention has no f16 kernel.
+/// f32 inference on an ARM CPU (the VLMPipeline path).
 fn plugin() -> PluginConfig {
     if cfg!(target_arch = "aarch64") && device() == "CPU" {
         PluginConfig::new().with("INFERENCE_PRECISION_HINT", "f32")
@@ -102,6 +102,12 @@ fn vlm_pipeline_takes_a_native_video() {
 #[test]
 #[ignore = "needs CASCADIA_LIVE_VLM and the OpenVINO GenAI runtime"]
 fn cb_pipeline_takes_a_native_video_and_an_image() {
+    // GenAI 2026.4.1's paged attention has no ARM CPU executor (f16 or f32),
+    // so the CB pipeline cannot be built on an Apple Silicon CPU.
+    if cfg!(target_arch = "aarch64") && device() == "CPU" {
+        eprintln!("skipping: the CB pipeline needs an x86 CPU or a GPU");
+        return;
+    }
     let sched = CbSchedulerConfig {
         cache_size_gb: 2,
         ..CbSchedulerConfig::default()
