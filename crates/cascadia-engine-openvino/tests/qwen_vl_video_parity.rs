@@ -11,11 +11,13 @@
 //!   tokenizes (Qwen3-VL's per-group timestamps), the expanded ids, HF's
 //!   `get_rope_index` positions and decode delta, for one video, two videos,
 //!   videos mixed with images across turns, and Qwen2.5-VL's
-//!   `second_per_grid_ts` spacing at 0.5, 1, 1.5 and 2 frames a second.
+//!   `second_per_grid_ts` spacing at 0.5, 1, 1.5 and 2 frames a second;
+//! - the same prompts on the staged `qwen35` engine (Qwen3.5 / 3.6).
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use cascadia_engine_openvino::qwen35_vision::prompt::VisionPrompt;
 use cascadia_engine_openvino::qwen35_vision::video::{self, VideoResize};
 use cascadia_engine_openvino::qwen35_vision::PreprocessConfig;
 use cascadia_engine_openvino::qwen_vl_vision::{self as qvl, ImageTokens, Kind, Layout};
@@ -308,6 +310,83 @@ fn video_prompts_and_positions_match_hf() {
                 }
             }
         }
+    }
+}
+
+/// The staged `qwen35` engine (Qwen3.5 / 3.6): the text it tokenizes and
+/// [`VisionPrompt::with_videos`]'s ids and positions equal HF's.
+#[test]
+fn qwen35_video_prompts_and_positions_match_hf() {
+    let r = load("video_reference.json");
+    let f = &r["families"]["qwen3_5_moe"];
+    let q35: Value = serde_json::from_str(
+        &std::fs::read_to_string(fixtures().join("qwen35_vision/reference.json")).unwrap(),
+    )
+    .unwrap();
+    let image_cfg = PreprocessConfig::from_value(&q35["processor"]);
+    let video_cfg = PreprocessConfig::from_value(&f["video_processor"]);
+    let tok = |k: &str| f["token_ids"][k].as_i64().unwrap() as u32;
+    let (image, video) = (tok("image"), tok("video"));
+    let prompts = f["prompts"].as_object().unwrap();
+    assert_eq!(prompts.len(), 8);
+    for (name, p) in prompts {
+        let what = format!("qwen3_5_moe {name}");
+        let media: Vec<MediaInput> = p["media"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                let n = m["name"].as_str().unwrap();
+                match m["kind"].as_str().unwrap() {
+                    "video" => video_input(&f["videos"][n], n),
+                    _ => image_input(n),
+                }
+            })
+            .collect();
+        let text = video::with_frame_markup(p["template_text"].as_str().unwrap(), &media, 2);
+        assert_eq!(text, p["prompt_text"].as_str().unwrap(), "{what}: text");
+        // Rows of the right size (hidden 1); the values do not matter here.
+        let items: Vec<(Vec<f32>, [u32; 3], [u8; 32])> = media
+            .iter()
+            .map(|m| {
+                let g = match m.kind {
+                    MediaKind::Video => video::video_grid(
+                        m.num_frames,
+                        m.width,
+                        m.height,
+                        &video_cfg,
+                        VideoResize::Temporal,
+                    )
+                    .unwrap(),
+                    _ => qvl::grid_for_size(m.width, m.height, &image_cfg).unwrap(),
+                };
+                (
+                    vec![0.0; (g[0] * (g[1] / 2) * (g[2] / 2)) as usize],
+                    g,
+                    [0; 32],
+                )
+            })
+            .collect();
+        let kinds: Vec<bool> = media.iter().map(|m| m.kind == MediaKind::Video).collect();
+        let ids: Vec<u32> = ints(&p["prompt_ids"]).iter().map(|&t| t as u32).collect();
+        let vp = VisionPrompt::with_videos(&ids, image, video, &items, &kinds, 1, 2, "").unwrap();
+        let fed: Vec<u32> = ints(&p["input_ids"])
+            .iter()
+            .map(|&t| if t as u32 == video { image } else { t as u32 })
+            .collect();
+        assert_eq!(vp.ids, fed, "{what}: expanded ids");
+        let want: Vec<Vec<i64>> = p["position_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(ints)
+            .collect();
+        assert_eq!(&vp.mrope.thw[..], &want[..], "{what}: positions");
+        assert_eq!(
+            vp.mrope.rope_delta,
+            p["rope_delta"].as_i64().unwrap(),
+            "{what}: rope_delta"
+        );
     }
 }
 
