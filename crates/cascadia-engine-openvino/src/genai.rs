@@ -413,6 +413,9 @@ fn shim_media(task: &GenerationTask) -> EngineResult<Vec<Media<'_>>> {
         .map(|m| {
             let kind = match m.kind {
                 MediaKind::Image => ShimMediaKind::Image,
+                // The API sends one only for the families GenAI preprocesses
+                // video for (`MediaConfig::native_video`).
+                MediaKind::Video => ShimMediaKind::Video,
                 #[allow(unreachable_patterns)]
                 other => {
                     return Err(EngineError::InvalidConfig(format!(
@@ -426,9 +429,23 @@ fn shim_media(task: &GenerationTask) -> EngineResult<Vec<Media<'_>>> {
                 num_frames: m.num_frames,
                 height: m.height,
                 width: m.width,
+                fps: sampled_fps(m.timestamps_ms.as_deref()),
             })
         })
         .collect()
+}
+
+/// The rate a video's frames were sampled at, from their timestamps (the API
+/// spaces them evenly from 0): GenAI stamps Qwen3-VL's frames with their
+/// times from it. 0.0 (unknown) with fewer than two frames.
+fn sampled_fps(timestamps_ms: Option<&[u32]>) -> f32 {
+    match timestamps_ms {
+        Some([first, .., last]) if last > first => {
+            let n = timestamps_ms.map_or(0, <[u32]>::len) - 1;
+            (n as f64 * 1000.0 / f64::from(last - first)) as f32
+        }
+        _ => 0.0,
+    }
 }
 
 pub struct OvGenaiEngine {
@@ -1190,6 +1207,8 @@ mod tests {
         cancelled: Vec<u64>,
         /// Per enrolled request: (media items, skip_chat_template).
         enrolled: Vec<(usize, bool)>,
+        /// Per enrolled request: each item's (kind, frames, fps).
+        media_seen: Vec<Vec<(ShimMediaKind, u32, f32)>>,
         /// What every handle reports from its perf metrics.
         input_tokens: Option<u32>,
     }
@@ -1214,6 +1233,12 @@ mod tests {
             let mut st = self.st.lock().unwrap();
             st.added.push(request_id);
             st.enrolled.push((media.len(), cfg.skip_chat_template));
+            st.media_seen.push(
+                media
+                    .iter()
+                    .map(|m| (m.kind, m.num_frames, m.fps))
+                    .collect(),
+            );
             let idx = st.added.len() - 1;
             while st.reads.len() <= idx {
                 st.reads.push(VecDeque::new());
@@ -1479,6 +1504,41 @@ mod tests {
         e.submit(t).unwrap();
         e.submit(task("txt", 8)).unwrap();
         assert_eq!(st.lock().unwrap().enrolled, vec![(1, true), (0, false)]);
+    }
+
+    /// A native video reaches the pipeline as one video item with its whole
+    /// frame stack and the rate it was sampled at, after the images.
+    #[test]
+    fn cb_video_task_carries_one_video_item_with_its_frames() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        let mut t = image_task("vid");
+        t.media.push(cascadia_types::MediaInput {
+            kind: MediaKind::Video,
+            pixels: vec![0u8; 4 * 2 * 2 * 3].into(),
+            num_frames: 4,
+            width: 2,
+            height: 2,
+            timestamps_ms: Some(vec![0, 500, 1000, 1500]),
+            sha256: [1; 32],
+        });
+        e.submit(t).unwrap();
+        assert_eq!(
+            st.lock().unwrap().media_seen,
+            vec![vec![
+                (ShimMediaKind::Image, 1, 0.0),
+                (ShimMediaKind::Video, 4, 2.0)
+            ]]
+        );
+    }
+
+    #[test]
+    fn sampled_fps_comes_from_the_timestamps() {
+        assert_eq!(sampled_fps(None), 0.0);
+        assert_eq!(sampled_fps(Some(&[0])), 0.0);
+        assert_eq!(sampled_fps(Some(&[0, 1000, 2000])), 1.0);
+        assert_eq!(sampled_fps(Some(&[0, 250])), 4.0);
+        assert_eq!(sampled_fps(Some(&[5, 5])), 0.0);
     }
 
     /// usage.prompt_tokens must count image tokens, which only the pipeline

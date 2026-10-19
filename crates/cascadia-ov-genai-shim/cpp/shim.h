@@ -113,20 +113,27 @@ void cascadia_genconfig_set_rng_seed(cascadia_genconfig_t* cfg, uint64_t v);
 
 // ---- Media -----------------------------------------------------------------
 
-// Values for cascadia_media_t.kind. Only IMAGE is accepted today; a video kind
-// will map onto GenAI's videos overload without changing this ABI.
+// Values for cascadia_media_t.kind. An IMAGE fills the prompt's next image
+// tag; a VIDEO (GenAI's videos argument) its next video tag.
 #define CASCADIA_MEDIA_IMAGE 0
+#define CASCADIA_MEDIA_VIDEO 1
 
 // One decoded media item, borrowed for the duration of the call (the shim
 // copies the pixels). `pixels` is RGB8, frame-major
-// [num_frames, height, width, 3]; an image has num_frames == 1. Items are
-// matched to the prompt's image tags in order.
+// [num_frames, height, width, 3]; an image has num_frames == 1, a video at
+// least one. Images are matched to the prompt's image tags in order and
+// videos to its video tags, each kind its own sequence.
+//
+// `fps` is a video's sampled frame rate (frames per second of the stack, not
+// of its source), 0 when unknown; ignored for an image. Every frame of a
+// video is used as given (GenAI's own frame sampling is skipped).
 typedef struct {
     int32_t kind;
     const uint8_t* pixels;
     uint32_t num_frames;
     uint32_t height;
     uint32_t width;
+    float fps;
 } cascadia_media_t;
 
 // ---- Generation -----------------------------------------------------------
@@ -193,8 +200,9 @@ void cascadia_cb_pipeline_destroy(cascadia_cb_pipeline_t* handle);
 /// cancelled, and before the pipeline is destroyed — the Rust wrapper enforces
 /// the ordering by having each handle hold an Arc on its pipeline.
 ///
-/// With `media_count > 0` the prompt goes through GenAI's images overload,
-/// which honours cfg's apply_chat_template (verified on 2026.4.1).
+/// With `media_count > 0` the prompt goes through GenAI's images overload
+/// (its properties overload when a video is among them), which honours cfg's
+/// apply_chat_template (verified on 2026.4.1).
 int32_t cascadia_cb_add_request(
     cascadia_cb_pipeline_t* handle,
     uint64_t request_id,

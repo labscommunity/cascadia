@@ -186,29 +186,52 @@ std::string join_port_names(const Set& names) {
 
 }  // namespace
 
-// Copy borrowed media into owned u8 tensors. GenAI takes an image as
-// [1, H, W, 3] (or [H, W, 3]) RGB8. The copy keeps the caller's buffer
-// lifetime out of the picture: the CB pipeline may read the tensors after
-// add_request returns.
-static std::vector<ov::Tensor> media_tensors(const cascadia_media_t* media, size_t count) {
+// Borrowed media copied into owned u8 tensors, split by kind as GenAI takes
+// them: an image as [1, H, W, 3] RGB8, a video as [T, H, W, 3] with its
+// metadata. The copy keeps the caller's buffer lifetime out of the picture:
+// the CB pipeline may read the tensors after add_request returns.
+struct MediaTensors {
     std::vector<ov::Tensor> images;
-    if (count == 0) return images;
+    std::vector<ov::Tensor> videos;
+    std::vector<ov::genai::VideoMetadata> videos_metadata;
+};
+
+static MediaTensors media_tensors(const cascadia_media_t* media, size_t count) {
+    MediaTensors out;
+    if (count == 0) return out;
     if (!media) throw std::runtime_error("media is null but media_count > 0");
-    images.reserve(count);
     for (size_t i = 0; i < count; ++i) {
         const cascadia_media_t& m = media[i];
-        if (m.kind != CASCADIA_MEDIA_IMAGE) {
+        if (m.kind == CASCADIA_MEDIA_IMAGE) {
+            if (!m.pixels || m.num_frames != 1 || m.height == 0 || m.width == 0) {
+                throw std::runtime_error("image " + std::to_string(i) +
+                                         " needs pixels and exactly one non-empty frame");
+            }
+            ov::Tensor t(ov::element::u8, ov::Shape{1, m.height, m.width, 3});
+            std::memcpy(t.data(), m.pixels, t.get_byte_size());
+            out.images.push_back(std::move(t));
+        } else if (m.kind == CASCADIA_MEDIA_VIDEO) {
+            if (!m.pixels || m.num_frames == 0 || m.height == 0 || m.width == 0) {
+                throw std::runtime_error("video " + std::to_string(i) +
+                                         " needs pixels and at least one non-empty frame");
+            }
+            ov::Tensor t(ov::element::u8, ov::Shape{m.num_frames, m.height, m.width, 3});
+            std::memcpy(t.data(), m.pixels, t.get_byte_size());
+            out.videos.push_back(std::move(t));
+            // The API already sampled the frames: every one is used, at the
+            // rate it was sampled at. Left empty, GenAI resamples Qwen3-VL's
+            // video assuming a 24 fps source (2026.4.1), keeping 4 of 16
+            // frames and stamping them with the wrong times.
+            ov::genai::VideoMetadata md;
+            md.fps = m.fps > 0.0f ? m.fps : 0.0f;
+            md.frames_indices.resize(m.num_frames);
+            for (uint32_t k = 0; k < m.num_frames; ++k) md.frames_indices[k] = k;
+            out.videos_metadata.push_back(std::move(md));
+        } else {
             throw std::runtime_error("unsupported media kind " + std::to_string(m.kind));
         }
-        if (!m.pixels || m.num_frames != 1 || m.height == 0 || m.width == 0) {
-            throw std::runtime_error("image " + std::to_string(i) +
-                                     " needs pixels and exactly one non-empty frame");
-        }
-        ov::Tensor t(ov::element::u8, ov::Shape{1, m.height, m.width, 3});
-        std::memcpy(t.data(), m.pixels, t.get_byte_size());
-        images.push_back(std::move(t));
     }
-    return images;
+    return out;
 }
 
 struct cascadia_pipeline_t {
@@ -427,15 +450,21 @@ int32_t cascadia_pipeline_generate(
             return 1;
         }
         if (handle->vlm) {
-            std::vector<ov::Tensor> images = media_tensors(media, media_count);
+            MediaTensors m = media_tensors(media, media_count);
             ov::genai::GenerationConfig gen_cfg =
                 cfg ? cfg->cfg : ov::genai::GenerationConfig{};
             // StreamerVariant{} default-constructs its FIRST alternative —
             // an empty std::function — which fast-fails (0xc0000409) when
             // invoked. Pass monostate explicitly: "no streamer".
-            ov::genai::VLMDecodedResults results = handle->vlm->generate(
-                std::string(prompt), images, gen_cfg,
-                ov::genai::StreamerVariant{std::monostate{}});
+            // Image-only requests keep the images overload they always took.
+            ov::genai::VLMDecodedResults results = m.videos.empty()
+                ? handle->vlm->generate(
+                      std::string(prompt), m.images, gen_cfg,
+                      ov::genai::StreamerVariant{std::monostate{}})
+                : handle->vlm->generate(
+                      std::string(prompt), m.images, m.videos, std::vector<ov::Tensor>{},
+                      m.videos_metadata, gen_cfg,
+                      ov::genai::StreamerVariant{std::monostate{}});
             text = results.texts.empty() ? std::string{} : results.texts[0];
             try {
                 generated = static_cast<uint32_t>(
@@ -557,9 +586,22 @@ int32_t cascadia_cb_add_request(
             // The images overload honours apply_chat_template itself (verified
             // on 2026.4.1: off keeps a pre-rendered prompt as is, on wraps it
             // again), so none of the manual templating below applies.
-            std::vector<ov::Tensor> images = media_tensors(media, media_count);
-            h->handle = handle->pipe->add_request(
-                request_id, std::string(prompt), images, cfg->cfg);
+            MediaTensors m = media_tensors(media, media_count);
+            if (m.videos.empty()) {
+                h->handle = handle->pipe->add_request(
+                    request_id, std::string(prompt), m.images, cfg->cfg);
+            } else {
+                // Only the properties overload takes videos_metadata (the
+                // images+videos one would let GenAI resample the frames).
+                ov::AnyMap props{
+                    {"generation_config", cfg->cfg},
+                    ov::genai::images(m.images),
+                    ov::genai::videos(m.videos),
+                    ov::genai::videos_metadata(m.videos_metadata),
+                };
+                h->handle =
+                    handle->pipe->add_request(request_id, std::string(prompt), props);
+            }
             *out_handle = h.release();
             return 0;
         }
