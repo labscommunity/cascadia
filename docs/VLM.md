@@ -263,6 +263,32 @@ took 1109, every check passing ("The first shape is a red circle, and the last s
 a blue square."), the frames encoded once (about 4 s) and served from the encode cache
 on the follow-up requests.
 
+Measured on pawan-02 (CPU) with a two-stage 26B-A4B vision tree (`export_gemma4_text.py
+--num-stages 2 --vision`, each stage cut with `--stage I`), stateful, rank 0 and rank 1
+as two processes on the one box over the stage wire: the SDK video suite's 4 s clip costs
+336 prompt tokens natively, as ov-genai's native path counts on the same export, where the
+suite's frames-as-images case took 561; every check passes ("The first shape is a red
+circle and the last shape is a blue square.", MP4, WebM, Responses `input_video`,
+streamed, the four refusals), and the image suite passes 11/11 (288 prompt tokens for
+one image). The export's stage IRs build their masks as HF does: every sliding-window
+attention reads `token_type_ids`, no full-attention layer does.
+
+On two machines (pawan-04 and pawan-02, CPU, each cutting only its own stage with
+`--stage I`, about 25 s a stage) the same suites pass 11/11 each, stateful (rank 0 on
+pawan-04) and static (`static_variant.py --context 736 --prefill-seq 288
+--shared-prefill`, rank 0 on pawan-02): 336 prompt tokens for the clip, 288 for one image,
+561 for the clip as frames, and the same answer in every video case as on one box. A
+video request takes 17 to 23 s stateful and 30 to 36 s static. Packed slots
+(`packed_variant.py --slots 2 --packed-seq 288 --dynamic-seq`, rank 0 on pawan-04) pass
+both suites 11/11 with the same counts and answers, 35 to 42 s a video request; every stage
+logs `masks=attn_mask_sliding_4d (sliding window 1024), attn_mask_4d (full, causal)`. That
+run used `--context 1280` (a 639-token slot, room for the 561-token frames case and two
+images), which `static_variant.py` refuses for Gemma 4 because the static IR masks the
+window by ring index; the packed IR takes host-built masks, so the cap is not needed there,
+and the tool's guard was bypassed in a local copy for the run. At the allowed
+`--context 736` a slot holds 367 tokens: the 336-token clip and one image fit, the frames
+case and two images get a 413.
+
 ## What takes images
 
 | Model | Engine | Placement | How to get the model dir |
@@ -314,6 +340,11 @@ block. `ov-dist-spec` refuses a Gemma 4 target tree at load. Not supported:
 python tools/gemma4_surgery/export_gemma4_text.py \
     --model <OpenVINO gemma-4 VLM export> --output-dir <tree> --num-stages 4 --vision
 ```
+
+`--stage I` cuts only stage `I`, from the graft in memory (no temporary copy of the whole
+language model, 13 GB on 26B-A4B), so each machine can cut just its own stage; the
+one-stage tree gets its own `pipeline_config.json`, and cutting the other stages into the
+same directory completes it.
 
 Stage 0 takes `inputs_embeds`; rank 0 embeds the prompt, runs the vision encoder on CPU
 and splices the image rows in. Every stage also takes `token_type_ids` (Gemma attends
