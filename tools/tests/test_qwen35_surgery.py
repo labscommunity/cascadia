@@ -290,6 +290,20 @@ def test_manifest_is_json_serialisable():
     assert json.loads(json.dumps(m)) == m
 
 
+def test_aux_files_carry_the_video_processor_settings_with_the_vision_irs():
+    """The published Qwen3.6 export keeps its video budget only in
+    processor_config.json (`video_processor`); without it rank 0 sizes video
+    frames with the image processor's budget."""
+    with_vision = sx.aux_files(True)
+    for f in sx.VISION_FILES + ["preprocessor_config.json",
+                                "video_preprocessor_config.json", "processor_config.json"]:
+        assert f in with_vision
+    text_only = sx.aux_files(False)
+    assert "processor_config.json" not in text_only
+    assert not set(sx.VISION_FILES) & set(text_only)
+    assert "openvino_text_embeddings_model.xml" in text_only
+
+
 # ---------------------------------------------------------------------------
 # validate_verdict — the gate that decides whether a tree may be served
 # ---------------------------------------------------------------------------
