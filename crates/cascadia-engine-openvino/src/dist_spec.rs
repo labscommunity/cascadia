@@ -1788,6 +1788,7 @@ impl Engine for OvDistSpecEngine {
         // Only the target sees images: rank 0 encodes them and splices their
         // rows into stage 0's embeddings, while the draft reads the expanded
         // ids as text. A target whose stage 0 takes ids has no image path.
+        cascadia_engine::refuse_video(&task, "ov-dist-spec")?;
         if !self.target.takes_images() {
             cascadia_engine::refuse_media(
                 &task,

@@ -107,6 +107,25 @@ pub fn refuse_media(task: &GenerationTask, engine: &str) -> EngineResult<()> {
     )))
 }
 
+/// The [`MediaKind::Video`](cascadia_types::MediaKind::Video) contract for an
+/// engine that takes images but not video: fail the task rather than read a
+/// frame stack as one image. The API sends such an engine a video's frames as
+/// images, so this only fires on a routing bug. Call first in `submit`.
+pub fn refuse_video(task: &GenerationTask, engine: &str) -> EngineResult<()> {
+    let videos = task
+        .media
+        .iter()
+        .filter(|m| matches!(m.kind, cascadia_types::MediaKind::Video))
+        .count();
+    if videos == 0 {
+        return Ok(());
+    }
+    Err(EngineError::UnsupportedInput(format!(
+        "the {engine} engine does not accept native video input ({videos} video(s) in the \
+         request); its videos are served as frames"
+    )))
+}
+
 impl EngineError {
     /// The task this error is attributed to, if any. Returns `None` for
     /// engine-level / task-less failures.
@@ -599,6 +618,32 @@ mod refuse_media_tests {
         assert!(
             e.to_string()
                 .contains("gemma4 engine does not accept image input"),
+            "{e}"
+        );
+        assert!(!e.is_connection_fatal());
+    }
+
+    #[test]
+    fn image_tasks_pass_and_video_tasks_are_refused() {
+        let mut t = GenerationTask::new("t", "hello");
+        let item = |kind, num_frames| cascadia_types::MediaInput {
+            kind,
+            pixels: std::sync::Arc::from(vec![0u8; 3 * num_frames as usize]),
+            num_frames,
+            width: 1,
+            height: 1,
+            timestamps_ms: None,
+            sha256: [0; 32],
+        };
+        assert!(refuse_video(&t, "x").is_ok());
+        t.media.push(item(cascadia_types::MediaKind::Image, 1));
+        assert!(refuse_video(&t, "x").is_ok());
+        t.media.push(item(cascadia_types::MediaKind::Video, 4));
+        let e = refuse_video(&t, "gemma4").unwrap_err();
+        assert!(matches!(e, EngineError::UnsupportedInput(_)));
+        assert!(
+            e.to_string()
+                .contains("gemma4 engine does not accept native video input (1 video(s)"),
             "{e}"
         );
         assert!(!e.is_connection_fatal());
