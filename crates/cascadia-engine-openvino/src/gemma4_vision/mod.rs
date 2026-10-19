@@ -12,11 +12,16 @@
 //!   and pad to `max_patches` rows with zero pixels and position `-1`.
 //! - [`encoder`]: the single vision IR, `pixel_values` + `image_position_ids`
 //!   to one embedding row per soft token.
+//! - [`video`]: native video (the `gemma4` engine): each sampled frame
+//!   through the same IR at the video processor's budget, behind per-frame
+//!   `mm:ss` markup.
 //!
 //! Parity with transformers 5.14.1 is pinned by `tests/gemma4_vision_parity.rs`
-//! against `tests/fixtures/gemma4_vision/`.
+//! against `tests/fixtures/gemma4_vision/`; video by
+//! `tests/gemma4_video_parity.rs`.
 
 pub mod encoder;
+pub mod video;
 
 use std::path::Path;
 
@@ -384,6 +389,11 @@ pub struct ImageFrontend {
     cache: crate::image_cache::EncodeCache<usize>,
     pub preprocess: PreprocessConfig,
     pub tokens: ImageTokens,
+    /// The video processor's settings (read even where video is off).
+    pub video: video::VideoConfig,
+    /// `<|video|>`'s id and the markup spellings, once
+    /// [`ImageFrontend::enable_video`] turned native video on.
+    video_tokens: Option<(i64, video::VideoMarkup)>,
 }
 
 impl ImageFrontend {
@@ -391,6 +401,7 @@ impl ImageFrontend {
     /// and read the processor settings beside it.
     pub fn load(dir: &Path, tokens: ImageTokens) -> Result<Self, String> {
         let preprocess = PreprocessConfig::from_model_dir(dir)?;
+        let video = video::VideoConfig::from_model_dir(dir)?;
         let encoder = encoder::VisionEncoder::load(
             dir,
             "CPU",
@@ -402,7 +413,34 @@ impl ImageFrontend {
             cache: crate::image_cache::EncodeCache::from_env(),
             preprocess,
             tokens,
+            video,
+            video_tokens: None,
         })
+    }
+
+    /// Take videos whole ([`MediaKind::Video`](cascadia_types::MediaKind)):
+    /// `video_token` is `<|video|>`'s id, `markup` how the expansion is
+    /// spelled for the tokenizer.
+    pub fn enable_video(&mut self, video_token: i64, markup: video::VideoMarkup) {
+        self.video_tokens = Some((video_token, markup));
+    }
+
+    /// Whether [`ImageFrontend::enable_video`] turned native video on.
+    pub fn takes_video(&self) -> bool {
+        self.video_tokens.is_some()
+    }
+
+    /// The prompt text to tokenize: each video's `<|video|>` expanded
+    /// ([`video::prompt_text`]). Unchanged without native video.
+    pub fn prompt_text<'a>(
+        &self,
+        prompt: &'a str,
+        media: &[cascadia_types::MediaInput],
+    ) -> std::borrow::Cow<'a, str> {
+        match &self.video_tokens {
+            Some((_, markup)) => video::prompt_text(prompt, media, &self.video, markup),
+            None => std::borrow::Cow::Borrowed(prompt),
+        }
     }
 
     /// The expanded prompt ids `prepare` would return, computed from each
@@ -424,9 +462,11 @@ impl ImageFrontend {
         expand_image_tokens(prompt_ids, &self.tokens, &counts)
     }
 
-    /// Encode a task's images and expand the prompt's one image placeholder
-    /// per image into its framed soft-token run. Returns the expanded ids and
-    /// each image's embedding rows, in prompt order.
+    /// Encode a task's images and videos and expand the prompt's one image
+    /// placeholder per image into its framed soft-token run (videos arrive
+    /// expanded, [`ImageFrontend::prompt_text`]). Returns the ids stage 0
+    /// takes (video soft tokens as `<|image|>`, [`video::stage_ids`]) and
+    /// each item's embedding rows, in prompt order.
     pub fn prepare(
         &mut self,
         media: &[cascadia_types::MediaInput],
@@ -434,12 +474,38 @@ impl ImageFrontend {
         tenant: &str,
     ) -> Result<(Vec<i64>, Vec<Vec<f32>>), String> {
         let mut rows = Vec::with_capacity(media.len());
-        let mut counts = Vec::with_capacity(media.len());
+        let mut items = Vec::with_capacity(media.len());
         let mut from_cache = 0;
         for (i, m) in media.iter().enumerate() {
+            if m.kind == cascadia_types::MediaKind::Video && self.video_tokens.is_some() {
+                let l = video::layout(m, &self.video).map_err(|e| format!("video {i}: {e}"))?;
+                items.push(video::Item::Video {
+                    frames: l.frames.len(),
+                    soft_tokens: l.soft_tokens,
+                });
+                if let Some((emb, _)) = self.cache.get(tenant, &m.sha256) {
+                    rows.push(emb);
+                    from_cache += 1;
+                    continue;
+                }
+                let mut emb = Vec::new();
+                for &f in &l.frames {
+                    let p = preprocess(video::frame(m, f), m.width, m.height, &self.video.frame)
+                        .map_err(|e| format!("video {i} frame {f}: {e}"))?;
+                    let (e, _hidden) = self
+                        .encoder
+                        .encode(&p)
+                        .map_err(|e| format!("video {i} frame {f}: {e}"))?;
+                    emb.extend_from_slice(&e);
+                }
+                self.cache
+                    .put(tenant, m.sha256, &emb, l.frames.len() * l.soft_tokens);
+                rows.push(emb);
+                continue;
+            }
             check_image(i, m)?;
             if let Some((emb, count)) = self.cache.get(tenant, &m.sha256) {
-                counts.push(count);
+                items.push(video::Item::Image(count));
                 rows.push(emb);
                 from_cache += 1;
                 continue;
@@ -452,11 +518,26 @@ impl ImageFrontend {
                 .map_err(|e| format!("image {i}: {e}"))?;
             let count = p.soft_tokens(self.preprocess.pooling_kernel_size);
             self.cache.put(tenant, m.sha256, &emb, count);
-            counts.push(count);
+            items.push(video::Item::Image(count));
             rows.push(emb);
         }
         self.cache.report(from_cache, media.len());
-        let ids = expand_image_tokens(prompt_ids, &self.tokens, &counts)?;
+        let ids = match &self.video_tokens {
+            Some((v, _)) => {
+                let hf = video::expand_media_tokens(prompt_ids, &self.tokens, *v, &items)?;
+                video::stage_ids(&hf, self.tokens.image, *v)
+            }
+            None => {
+                let counts: Vec<usize> = items
+                    .iter()
+                    .map(|i| match *i {
+                        video::Item::Image(n) => n,
+                        video::Item::Video { .. } => unreachable!("videos need enable_video"),
+                    })
+                    .collect();
+                expand_image_tokens(prompt_ids, &self.tokens, &counts)?
+            }
+        };
         Ok((ids, rows))
     }
 }

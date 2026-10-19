@@ -1869,6 +1869,66 @@ mod tests {
             assert!(!prompt.contains("Frame"), "{prompt:?}");
         }
 
+        /// A Gemma 4 tree on the gemma4 engine takes each video whole behind
+        /// Gemma 4's `<|video|>` (rank 0 writes the per-frame `mm:ss`
+        /// markup), with every sampled frame: no pairing, no labels.
+        #[tokio::test]
+        async fn a_gemma4_engine_tree_gets_each_video_behind_its_own_tag() {
+            let Some(ff) = ffmpeg() else { return };
+            let url = clip(&ff, "mp4", "video/mp4", 3);
+            let (app, seen) = video_app(ff, |m| {
+                let g = MediaConfig::gemma4_native().staged_native_video("gemma4");
+                m.image_placeholder = g.image_placeholder;
+                m.reserved_text = g.reserved_text;
+                m.trim_text_parts = g.trim_text_parts;
+                m.native_video = g.native_video;
+                m.video_placeholder = g.video_placeholder;
+                m.video_frame_multiple = g.video_frame_multiple;
+                m.video_min_side = g.video_min_side;
+            })
+            .await;
+            let content = json!([
+                {"type": "video_url", "video_url": url},
+                {"type": "text", "text": "and"},
+                {"type": "image_url", "image_url": {"url": png_url(4, 4)}},
+            ]);
+            let (status, v) = post_chat(
+                app,
+                json!({"model": "mock-model", "max_tokens": 1,
+                    "messages": [{"role": "user", "content": content}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            let seen = seen.lock().unwrap();
+            let (prompt, sizes) = &seen[0];
+            // 3 s at 1 fps: three frames, not rounded up to pairs.
+            assert_eq!(sizes, &vec![(320, 240, 3), (4, 4, 1)]);
+            assert!(prompt.contains("<|video|>and<|image|>"), "{prompt:?}");
+            assert!(!prompt.contains("Frame"), "{prompt:?}");
+        }
+
+        /// A caller cannot smuggle Gemma 4's video tag in as text.
+        #[tokio::test]
+        async fn a_gemma4_video_tag_in_caller_text_is_a_400() {
+            let Some(ff) = ffmpeg() else { return };
+            let (app, seen) = video_app(ff, |m| {
+                let g = MediaConfig::gemma4_native().staged_native_video("gemma4");
+                m.image_placeholder = g.image_placeholder;
+                m.reserved_text = g.reserved_text;
+                m.native_video = g.native_video;
+                m.video_placeholder = g.video_placeholder;
+            })
+            .await;
+            let (status, v) = post_chat(
+                app,
+                json!({"model": "mock-model", "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi <|video|>"}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+            assert!(seen.lock().unwrap().is_empty());
+        }
+
         /// A Qwen3-VL tree's video encoder refuses a frame under 32 px a
         /// side; the API says so with a 400 before the engine sees it.
         #[tokio::test]
