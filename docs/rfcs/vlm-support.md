@@ -1358,14 +1358,24 @@ engines' `refuse_video` stays for them.
   before tokenizing and widens each pad on ids. Qwen2.5-VL writes one run of
   `t * h * w / 4` pads, no timestamps.
 - **Positions.** Qwen3-VL / Qwen3.5: one `t = 1` grid per group (`get_rope_index` splits
-  `video_grid_thw` the same way). Qwen2.5-VL: one grid whose temporal index steps by
-  `tokens_per_second * int(second_per_grid_t)`, `second_per_grid_t = 2 / sampled_fps`
-  from the frame times, and the next text starts `max(h, w) / 2` after the run's start:
-  both are transformers 5.14.1's `Qwen2_5_VLModel.get_rope_index` (5.15.1 is the same).
-  Qwen's original code floored the product `t * second_per_grid_t * tokens_per_second`
-  and advanced past the run's largest position, and GenAI 2026.4.1 steps by
-  `tokens_per_second` alone; the three agree when `second_per_grid_t` is 1 (2 fps) up to
-  the text after the video. We follow HF.
+  `video_grid_thw` the same way). Qwen2.5-VL: one grid whose group `k` sits at
+  `start + floor(k * second_per_grid_t * tokens_per_second)` (f32, as HF holds
+  `second_per_grid_ts`), `second_per_grid_t = 2 / sampled_fps` from the frame times, and
+  the next token starts one past the largest position so far. That is Qwen's original
+  `get_rope_index` (transformers 4.x), which the model was trained with; transformers 5.2
+  and 5.20 compute the same temporal steps, GenAI 2026.4.1 and vLLM start the next text
+  the same way. transformers 5.14 / 5.15 depart from it twice, and we do not follow them:
+  they truncate `second_per_grid_t` to whole seconds before multiplying (a transient
+  regression), and they start the next text `max(h, w) / 2` after the run's start, inside
+  the video's time range. The second also breaks warm resume: a later turn's prompt,
+  positioned cold, would put the text after the video below the `rope_delta`-based
+  positions the earlier turn decoded with (16 frames at 1 fps of 448x252: the video's
+  last group at `start + 28`, the next text at `start + 16`). With the API's default
+  1 fps sampling, a fractional `second_per_grid_t` is routine (a 5 s clip gives 6 frames,
+  1.67 s per group), so the two would differ on most requests. The fixtures take
+  Qwen2.5-VL's positions from a port of the original code in the generator
+  (`qwen25_rope_index`), checked equal to 5.14.1 where the two agree (no video, one
+  group) and to 5.20.1's temporal steps inside every video run.
 - **Feeding.** Once positions are fixed, rank 0 feeds every `<|video_pad|>` as
   `<|image_pad|>`. The model never reads a pad's own embedding (its row is replaced, as
   HF's `masked_scatter` does), and Qwen3-VL's `visual_pos_masks` cover image and video
@@ -1374,11 +1384,14 @@ engines' `refuse_video` stays for them.
   no second id. A video is therefore served in stateful, static and packed modes and
   across machines (the `[3, T]` positions frame) wherever images are.
 - **Parity** (`tests/qwen_vl_video_parity.rs`, fixtures from
-  `tools/vlm_fixtures/gen_qwen_vl_video_fixtures.py`, transformers 5.14.1): grids and
+  `tools/vlm_fixtures/gen_qwen_vl_video_fixtures.py`, transformers 5.14.1 for the
+  processors, Qwen2.5-VL positions as above): grids and
   pixels for odd / even / one-frame videos and an 8-frame 448x252 clip on all three
   families; the text rank 0 tokenizes, the expanded ids, `get_rope_index` positions and
   `rope_delta` for one video, two videos, videos with images across turns, and
-  Qwen2.5-VL at 0.5, 1, 1.5 and 2 frames a second.
+  Qwen2.5-VL at 0.5, 1, 1.5 and 2 frames a second; and (`rope.rs`) a later turn's
+  positions, computed cold, equal the ones the earlier turn fed over the shared prefix,
+  for both video layouts.
 
 ## Phase 0 results (pawan-04, 2026-10-15)
 

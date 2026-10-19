@@ -9,7 +9,8 @@
 //!   processors;
 //! - prompts (Qwen2.5-VL, Qwen3-VL on `ov-runtime`): the text rank 0
 //!   tokenizes (Qwen3-VL's per-group timestamps), the expanded ids, HF's
-//!   `get_rope_index` positions and decode delta, for one video, two videos,
+//!   `get_rope_index` positions and decode delta (Qwen2.5-VL: Qwen's original
+//!   `get_rope_index`, see the fixture README), for one video, two videos,
 //!   videos mixed with images across turns, and Qwen2.5-VL's
 //!   `second_per_grid_ts` spacing at 0.5, 1, 1.5 and 2 frames a second;
 //! - the same prompts on the staged `qwen35` engine (Qwen3.5 / 3.6).
