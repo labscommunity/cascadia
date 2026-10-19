@@ -406,6 +406,7 @@ dependencies = [
  "async-trait",
  "cascadia-engine",
  "cascadia-kv-wire",
+ "cascadia-metrics",
  "cascadia-ov-genai-shim",
  "cascadia-runner",
  "cascadia-transport",
