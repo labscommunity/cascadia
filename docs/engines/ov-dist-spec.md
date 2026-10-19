@@ -120,6 +120,11 @@ carry images.
 
 `usage.prompt_tokens` counts the expanded prompt (image soft tokens included).
 
+Video arrives as labelled frames (`Frame k (t s): ` and one image per frame; the engine
+takes no native video), so a video is a multi-image prompt here: the SDK video suite's
+4 s clip is 4 frames, 3322 prompt tokens on Pixtral 12B, accepted at 0.22 with
+Ministral-3-3B at K=4 (pawan-04, CPU). The answer can repeat the frame labels.
+
 Check a draft against its export (greedy draft vs embeddings + language model, and a
 masked-rewind run that must match):
 
