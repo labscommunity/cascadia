@@ -519,3 +519,123 @@ def pinned_main(m, seq=1):
             shapes[n] = [1, seq]
     m.reshape(shapes)
     return m
+
+
+# ---- decode width: a dynamic-width packed IR (CPU/GPU), a narrow one (NPU) ----
+
+
+def _decode_mask(width, live, past_open):
+    """[1,1,width,PAST+width] additive f32 decode mask: live row r opens the
+    past columns `past_open[r]` and its own query column; an idle row opens
+    its own query column only (the runtime's `fill_mask`)."""
+    m = np.full((1, 1, width, PAST + width), -3.0e38, np.float32)
+    for r in range(width):
+        m[0, 0, r, PAST + r] = 0
+        if r < live:
+            m[0, 0, r, list(past_open[r])] = 0
+    return m
+
+
+def _decode_feed(width, live, rng_rows, past, past_open):
+    feed = {
+        "inputs_embeds": np.zeros((1, width, HIDDEN), np.float32),
+        "position_ids": np.zeros((1, width), np.int64),
+        "attn_mask_4d": _decode_mask(width, live, past_open),
+    }
+    feed["inputs_embeds"][0, :live] = rng_rows
+    feed["position_ids"][0, :live] = [3 + r for r in range(live)]
+    feed.update(past)
+    return feed
+
+
+def test_dynamic_seq_ir_takes_any_width():
+    packed, ctx = pv.build_packed_model(toy_stage(1), 4, True, HIDDEN, dynamic=True)
+    assert ctx == PAST + 4, "packed_context records the widest inference"
+    shapes = {i.get_any_name(): i.get_partial_shape() for i in packed.inputs}
+    assert str(shapes["attn_mask_4d"]) == "[1,1,?,?]"
+    assert str(shapes["inputs_embeds"]) == f"[1,?,{HIDDEN}]"
+    assert shapes["past_key_values.0.key"].is_static
+    q = pv.build_packed_model(toy_qwen_stage(2), 4, True, HIDDEN, deepstack_layers=2,
+                              dynamic=True)[0]
+    qs = {i.get_any_name(): str(i.get_partial_shape()) for i in q.inputs}
+    assert qs["position_ids"] == "[3,1,?]"
+    assert qs["deepstack_visual_embeds"] == f"[2,?,{HIDDEN}]"
+
+
+def test_dynamic_seq_needs_a_dynamic_source():
+    with pytest.raises(RuntimeError, match="--shared-prefill"):
+        pv.build_packed_model(pinned(toy_stage(1)), 4, True, HIDDEN, dynamic=True)
+
+
+def test_narrow_decode_matches_the_wide_inference_on_live_rows():
+    """A decode step with 2 live rows run on the wide static IR (6 rows, 4
+    idle) and on the dynamic IR at 2 rows gives the live rows the same hidden
+    states and the same new K/V: idle rows are masked off from live ones, so
+    dropping them changes nothing a live row computes."""
+    core = ov.Core()
+    rng = np.random.default_rng(21)
+    wide_w, live = 6, 2
+    past = {f"past_key_values.{li}.{k}": rng.standard_normal((1, HEADS, PAST, HD))
+            .astype(np.float16) for li in range(3) for k in ("key", "value")}
+    rows = rng.standard_normal((live, HIDDEN)).astype(np.float32)
+    # slot regions of 3 past columns each; slot 0 holds 2 tokens, slot 1 holds 3
+    past_open = [range(0, 2), range(3, 6)]
+    wide, _ = pv.build_packed_model(toy_stage(1), wide_w, True, HIDDEN)
+    dyn, _ = pv.build_packed_model(toy_stage(1), wide_w, True, HIDDEN, dynamic=True)
+    narrow, _ = pv.build_packed_model(toy_stage(1), live, True, HIDDEN)
+    want = core.compile_model(wide, "CPU", F32).create_infer_request().infer(
+        _decode_feed(wide_w, live, rows, past, past_open))
+    dyn_req = core.compile_model(dyn, "CPU", F32).create_infer_request()
+    for name, (model_req, width) in {
+        "dynamic": (dyn_req, live),
+        "narrow static": (core.compile_model(narrow, "CPU", F32).create_infer_request(), live),
+        "dynamic at the wide width": (dyn_req, wide_w),
+    }.items():
+        got = model_req.infer(_decode_feed(width, live, rows, past, past_open))
+        np.testing.assert_allclose(got["hidden_states"][0, :live],
+                                   want["hidden_states"][0, :live], rtol=1e-5, atol=1e-5,
+                                   err_msg=name)
+        for li in range(3):
+            for kind in ("key", "value"):
+                port = f"present.{li}.{kind}"
+                np.testing.assert_array_equal(
+                    got[port][:, :, :PAST + live], want[port][:, :, :PAST + live],
+                    err_msg=f"{name} {port}")
+
+
+def _static_stage(tmp_path, model):
+    stage = tmp_path / "stage_0"
+    stage.mkdir()
+    ov.save_model(model, str(stage / "openvino_model.xml"), compress_to_fp16=False)
+    (stage / "stage_config.json").write_text(json.dumps({
+        "stateful": False, "has_embed": True, "static_seq": 1,
+        "static_context": PAST + 1, "layer_start": 0, "layer_end": 3}))
+    return stage
+
+
+def test_write_packed_variant_decode_seq_writes_the_narrow_ir(tmp_path):
+    stage = _static_stage(tmp_path, pinned(toy_stage(1)))
+    cfg = pv.write_packed_variant(str(stage), slots=2, packed_seq=4, decode_seq=2)
+    assert cfg["packed_decode_seq"] == 2 and "packed_dynamic" not in cfg
+    narrow = ov.Core().read_model(str(stage / pv.DECODE_XML))
+    shapes = {i.get_any_name(): list(i.get_shape()) for i in narrow.inputs}
+    assert shapes["inputs_embeds"] == [1, 2, HIDDEN]
+    assert shapes["attn_mask_4d"] == [1, 1, 2, PAST + 2]
+    assert shapes["past_key_values.0.key"] == [1, HEADS, PAST, HD]
+    # Rebuilt without it: the stale narrow IR and its config key go away.
+    cfg = pv.write_packed_variant(str(stage), slots=2, packed_seq=4)
+    assert "packed_decode_seq" not in cfg
+    assert not (stage / pv.DECODE_XML).exists()
+    for bad in (dict(decode_seq=1), dict(decode_seq=4), dict(decode_seq=2, dynamic=True)):
+        with pytest.raises(RuntimeError):
+            pv.write_packed_variant(str(stage), slots=2, packed_seq=4, **bad)
+
+
+def test_write_packed_variant_dynamic_seq_records_it(tmp_path):
+    stage = _static_stage(tmp_path, toy_stage(1))  # a shared-prefill (dynamic) stage
+    cfg = pv.write_packed_variant(str(stage), slots=2, packed_seq=4, dynamic=True)
+    assert cfg["packed_dynamic"] is True
+    assert cfg["packed_seq"] == 4 and cfg["packed_context"] == PAST + 4
+    packed = ov.Core().read_model(str(stage / "openvino_packed_model.xml"))
+    port = next(i for i in packed.inputs if i.get_any_name() == "attn_mask_4d")
+    assert not port.get_partial_shape().is_static

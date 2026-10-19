@@ -422,9 +422,15 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
   packed IR per stage of the static tree with `python tools/packed_variant.py <stage dir>
   --slots N [--packed-seq S]`, then serve every rank with `--packed-slots N`. On CPU/GPU
   run it on the same `--shared-prefill` tree: the packed IR sits beside the shared decode
-  IR, so one tree serves both the static and the packed paths. Every inference is
-  `--packed-seq` rows (decode included), so a smaller `--packed-seq` (e.g. 64) decodes
-  faster on a causal family while prefill chunks that many rows at a time; a bidirectional
+  IR, so one tree serves both the static and the packed paths. A prefill chunk is
+  `--packed-seq` rows; a decode step runs narrower when the stage has a narrow width:
+  pass `--dynamic-seq` on CPU (the packed IR keeps its query width dynamic, so a
+  decode step runs at its live rows) or `--decode-seq D` (a second, static `D`-row
+  decode IR, `D` at least the slot count; meant for the NPU, measured on CPU only).
+  Packed output on an Intel GPU is wrong at every width (the load warns). Without either, a decode step is
+  `--packed-seq` rows too (CPU, Qwen3-VL-4B, 4 slots: 1.92 s a step at 64 rows,
+  0.75 s with `--decode-seq 4`, 0.94 s with `--dynamic-seq`; see
+  [perf/NPU_PACKED_SLOTS.md](perf/NPU_PACKED_SLOTS.md)). A bidirectional
   family (Gemma 3 / Gemma 4) keeps `--packed-seq` at least one image wide (below). A
   request whose prompt does not fit one slot's region `(context - 1 - packed_prefix) / N`
   is refused with a 413.
@@ -507,9 +513,9 @@ matching the stateful tree (223), and the packed concurrent test too. Gemma 3 12
   slots`; two Pixtral images do not fit two slots of a 2048 context, and one 448x448
   LLaVA-NeXT image (2945 tokens with its text) needs a region of at least that.
 - Gemma 4 packed slots: a request whose image is wider than `--packed-seq` rows is
-  refused with a 400 (lower detail sends a smaller image). Every inference is
-  `--packed-seq` rows, decode included, so a 288-row variant decodes at a 288-row
-  cost; `static_variant.py` still caps `--context` + `--prefill-seq` at the sliding
+  refused with a 400 (lower detail sends a smaller image). A 288-row variant decodes
+  at a 288-row cost unless it was built with `--dynamic-seq` (CPU) or
+  `--decode-seq` (static shapes, meant for the NPU); `static_variant.py` still caps `--context` + `--prefill-seq` at the sliding
   window + 1 (1025), which leaves two slots of 367 tokens at `--context 736`. Every
   stage must run the same build: the packed plan frame carries image ids (four rows
   instead of three), and a stage refuses the other kind.
