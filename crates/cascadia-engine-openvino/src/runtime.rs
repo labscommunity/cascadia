@@ -3278,7 +3278,7 @@ impl OvRuntimeEngine {
     }
 
     /// Packed slots on a `token_type_ids` tree: the masks open image blocks
-    /// and the plan frame carries each row's image id (`[1, 4, S]`).
+    /// and the plan frame carries each row's image id (row 3 of `[1, 5, S]`).
     fn packed_image_blocks(&self) -> bool {
         self.packed.is_some() && self.vision_token_types()
     }
