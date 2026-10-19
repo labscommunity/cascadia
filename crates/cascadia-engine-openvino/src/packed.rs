@@ -147,9 +147,10 @@ pub struct PackedKv {
     /// out the sliding window itself.
     sink: usize,
     pub past_len: usize,
-    /// Query rows per inference (the IR's static seq length).
+    /// Query rows of the widest inference (a prefill chunk). A decode step
+    /// may run narrower (see [`PackedKv::context_at`]).
     pub packed_seq: usize,
-    /// `present.*` length = `past_len + packed_seq`.
+    /// `present.*` length of the widest inference, `past_len + packed_seq`.
     pub context: usize,
     /// `(kv_heads, head_dim)` per layer, in port order. Uniform on most
     /// families; Gemma 4 mixes sliding (8 x 256) and global (2 x 512) layers.
@@ -331,10 +332,19 @@ impl PackedKv {
         &self.geom
     }
 
-    /// Bytes of layer `li`'s `present.*` output (`[1, kv_heads, context, head_dim]`).
-    pub fn present_layer_bytes(&self, li: usize) -> usize {
+    /// `present.*` length of an inference `width` query rows wide: the past
+    /// window plus its own rows. Every width shares the one past window, so
+    /// the host ring serves a narrow decode inference and a wide prefill
+    /// chunk alike.
+    pub fn context_at(&self, width: usize) -> usize {
+        self.past_len + width
+    }
+
+    /// Bytes of layer `li`'s `present.*` output for an inference `width` rows
+    /// wide (`[1, kv_heads, past_len + width, head_dim]`).
+    pub fn present_layer_bytes(&self, li: usize, width: usize) -> usize {
         let (kv_heads, head_dim) = self.geom[li];
-        kv_heads * self.context * head_dim * self.elem_bytes
+        kv_heads * self.context_at(width) * head_dim * self.elem_bytes
     }
 
     /// Advance a slot's absolute position after its row(s) were absorbed.
@@ -343,25 +353,27 @@ impl PackedKv {
     }
 
     /// Absorb query row `row`'s K/V (which sits at `present` index
-    /// `past_len + row`) into `slot`'s region, appending at `at` or sliding the
-    /// region's oldest entry out when it is full. `at` is the caller's running
-    /// occupancy for that slot within this step, so a multi-row prefill chunk
-    /// lands consecutively.
+    /// `past_len + row` of an inference `width` rows wide) into `slot`'s
+    /// region, appending at `at` or sliding the region's oldest entry out when
+    /// it is full. `at` is the caller's running occupancy for that slot within
+    /// this step, so a multi-row prefill chunk lands consecutively.
     ///
     /// The slide is strictly bounded to `[slot*region, (slot+1)*region)` — a
     /// neighbouring slot's KV is never read or written.
+    #[allow(clippy::too_many_arguments)]
     pub fn absorb_row(
         &mut self,
         li: usize,
         is_value: bool,
         present: &[u8],
+        width: usize,
         row: usize,
         slot: usize,
         at: usize,
     ) {
         let (kv_heads, head_dim) = self.geom[li];
         let slot_bytes = head_dim * self.elem_bytes;
-        let present_row = self.context * slot_bytes;
+        let present_row = self.context_at(width) * slot_bytes;
         let buf_row = self.past_len * slot_bytes;
         let region = self.region;
         let sink = self.sink;
@@ -425,7 +437,9 @@ impl PackedKv {
     }
 
     /// Write the additive attention mask for `plan` into `buf` as a
-    /// `[1, 1, packed_seq, context]` tensor of `dtype`.
+    /// `[1, 1, S, past_len + S]` tensor of `dtype`, `S = plan.rows.len()`
+    /// (the inference's width: `packed_seq` for a prefill chunk, possibly
+    /// fewer rows for a decode step).
     ///
     /// Row `r` is opened on exactly: its slot's occupied past region, and the
     /// query columns of same-slot rows with `order <= its order`, or of the
@@ -455,7 +469,8 @@ impl PackedKv {
             ShimDType::F32 => 4,
             _ => 2,
         };
-        let (s, ctx, past_len) = (self.packed_seq, self.context, self.past_len);
+        let s = plan.rows.len();
+        let (ctx, past_len) = (self.context_at(s), self.past_len);
         buf.clear();
         buf.resize(s * ctx * elem, 0);
         let blocked: [u8; 4] = {
@@ -596,6 +611,67 @@ mod tests {
         }
     }
 
+    /// A decode step run narrower (one row per live slot) masks each live row
+    /// exactly as the wide inference did: the same past columns, the same own
+    /// query column. The wide one's extra query columns were blocked for every
+    /// live row, so dropping them changes nothing a live row attends to.
+    #[test]
+    fn narrow_decode_mask_matches_the_wide_one_on_live_rows() {
+        let mut k = kv(4, 16, 8); // region 4, widest inference 8 rows
+        for (s, n) in [(0, 3), (1, 1), (2, 4), (3, 2)] {
+            k.advance(s, n);
+        }
+        let live = [0usize, 2, 3];
+        let (mut wide, mut narrow) = (Vec::new(), Vec::new());
+        k.fill_mask(&PackedPlan::decode(8, &live), &mut wide, ShimDType::F16);
+        k.fill_mask(&PackedPlan::decode(3, &live), &mut narrow, ShimDType::F16);
+        let (wctx, nctx) = (k.context_at(8), k.context_at(3));
+        assert_eq!(narrow.len(), 3 * nctx * 2);
+        for r in 0..3 {
+            for c in 0..16 {
+                assert_eq!(
+                    mask_allows(&narrow, nctx, r, c),
+                    mask_allows(&wide, wctx, r, c),
+                    "row {r} past col {c}"
+                );
+            }
+            for q in 0..8 {
+                let w = mask_allows(&wide, wctx, r, 16 + q);
+                assert_eq!(w, q == r, "wide row {r} query col {q}");
+                if q < 3 {
+                    assert_eq!(mask_allows(&narrow, nctx, r, 16 + q), w);
+                }
+            }
+        }
+    }
+
+    /// The row K/V of an inference `width` rows wide sits at present column
+    /// `past_len + row` of a `past_len + width` long present: absorbing from
+    /// a narrow inference lands the same bytes the wide one would.
+    #[test]
+    fn absorb_reads_the_row_at_the_inference_width() {
+        let present = |k: &PackedKv, width: usize| {
+            let mut p = vec![0u8; k.present_layer_bytes(0, width)];
+            for c in 0..k.context_at(width) {
+                let off = c * 4;
+                p[off..off + 2].copy_from_slice(&((c as u16) + 100).to_le_bytes());
+            }
+            p
+        };
+        let mut wide = kv(2, 8, 6);
+        let mut narrow = kv(2, 8, 6);
+        let (pw, pn) = (present(&wide, 6), present(&narrow, 2));
+        assert_eq!(pn.len(), 10 * 4);
+        wide.absorb_row(0, false, &pw, 6, 1, 1, 0);
+        narrow.absorb_row(0, false, &pn, 2, 1, 1, 0);
+        assert_eq!(wide.key_bytes(0), narrow.key_bytes(0));
+        // slot 1's region starts at column 4 (byte 16): present row 1 = col 9
+        assert_eq!(
+            u16::from_le_bytes([narrow.key_bytes(0)[16], narrow.key_bytes(0)[17]]),
+            109
+        );
+    }
+
     #[test]
     fn a_row_never_sees_another_slots_past_or_query() {
         let mut k = kv(2, 8, 2); // region = 4
@@ -674,7 +750,7 @@ mod tests {
         let present = {
             // present is [heads=1][context=10][head_dim=2] f16; make row r's
             // bytes recognisable: value (r+1) repeated.
-            let mut p = vec![0u8; k.present_layer_bytes(0)];
+            let mut p = vec![0u8; k.present_layer_bytes(0, k.packed_seq)];
             for c in 0..k.context {
                 for e in 0..2 {
                     let off = (c * 2 + e) * 2;
@@ -683,10 +759,10 @@ mod tests {
             }
             p
         };
-        k.absorb_row(0, false, &present, 0, 0, 0); // row 0 -> slot 0 @0
+        k.absorb_row(0, false, &present, k.packed_seq, 0, 0, 0); // row 0 -> slot 0 @0
         let before_slot1 = k.key_bytes(0)[16..32].to_vec();
-        k.absorb_row(0, false, &present, 1, 1, 0); // row 1 -> slot 1 @0
-                                                   // slot 0 occupancy 0 holds present row (past_len+0)=8 -> value 108
+        k.absorb_row(0, false, &present, k.packed_seq, 1, 1, 0); // row 1 -> slot 1 @0
+                                                                 // slot 0 occupancy 0 holds present row (past_len+0)=8 -> value 108
         let v0 = u16::from_le_bytes([k.key_bytes(0)[0], k.key_bytes(0)[1]]);
         assert_eq!(v0, 108);
         // slot 1 region starts at slot index 4 -> byte 16; holds present row 9
@@ -708,7 +784,7 @@ mod tests {
         let mut k = kv(2, 8, 1); // region 4, sink 2, packed_seq 1
                                  // Snapshot geometry first: the closure must not hold a borrow of `k`
                                  // across the &mut self absorb calls below.
-        let (plb, ctx) = (k.present_layer_bytes(0), k.context);
+        let (plb, ctx) = (k.present_layer_bytes(0, k.packed_seq), k.context);
         let mk = move |tag: u16| {
             let mut p = vec![0u8; plb];
             for c in 0..ctx {
@@ -720,13 +796,13 @@ mod tests {
             p
         };
         // fill slot 1 with a sentinel so we can prove it survives
-        k.absorb_row(0, false, &mk(999), 0, 1, 0);
+        k.absorb_row(0, false, &mk(999), k.packed_seq, 0, 1, 0);
         let slot1_before = k.key_bytes(0)[16..20].to_vec();
         for (i, tag) in [11u16, 12, 13, 14].iter().enumerate() {
-            k.absorb_row(0, false, &mk(*tag), 0, 0, i);
+            k.absorb_row(0, false, &mk(*tag), k.packed_seq, 0, 0, i);
         }
         // region now full; one more slides the oldest EVICTABLE tag (13) out
-        k.absorb_row(0, false, &mk(15), 0, 0, 4);
+        k.absorb_row(0, false, &mk(15), k.packed_seq, 0, 0, 4);
         let read = |slot_idx: usize| {
             let off = slot_idx * 4;
             u16::from_le_bytes([k.key_bytes(0)[off], k.key_bytes(0)[off + 1]])
@@ -742,10 +818,10 @@ mod tests {
     #[test]
     fn reset_slot_clears_only_that_slot() {
         let mut k = kv(2, 8, 1);
-        let mut p = vec![0u8; k.present_layer_bytes(0)];
+        let mut p = vec![0u8; k.present_layer_bytes(0, k.packed_seq)];
         p.iter_mut().for_each(|b| *b = 0xAB);
-        k.absorb_row(0, false, &p, 0, 0, 0);
-        k.absorb_row(0, false, &p, 0, 1, 0);
+        k.absorb_row(0, false, &p, k.packed_seq, 0, 0, 0);
+        k.absorb_row(0, false, &p, k.packed_seq, 0, 1, 0);
         k.advance(0, 1);
         k.advance(1, 1);
         k.reset_slot(0);
@@ -859,12 +935,12 @@ mod tests {
             }
             p
         };
-        let (plb, ctx) = (k.present_layer_bytes(0), k.context);
+        let (plb, ctx) = (k.present_layer_bytes(0, k.packed_seq), k.context);
         // slot 1 sentinel must survive
-        k.absorb_row(0, false, &mk(999, plb, ctx), 0, 1, 0);
+        k.absorb_row(0, false, &mk(999, plb, ctx), k.packed_seq, 0, 1, 0);
         let slot1 = k.key_bytes(0)[(4 + 4) * 4..(4 + 4) * 4 + 4].to_vec();
         for (i, tag) in [21u16, 22].iter().enumerate() {
-            k.absorb_row(0, false, &mk(*tag, plb, ctx), 0, 0, i);
+            k.absorb_row(0, false, &mk(*tag, plb, ctx), k.packed_seq, 0, 0, i);
         }
         k.advance(0, 2);
         k.populate_prefix_from(0, 2);
@@ -910,7 +986,7 @@ mod tests {
             let src = k.past_len * slot_bytes; // query row 0
             present[src..src + slot_bytes].fill(t);
             let at = k.valid(slot);
-            k.absorb_row(0, false, &present, 0, slot, at);
+            k.absorb_row(0, false, &present, k.packed_seq, 0, slot, at);
             k.advance(slot, 1);
         }
     }
@@ -1143,11 +1219,11 @@ mod tests {
         let mut k = PackedKv::with_layers(2, 8, 2, vec![(1, 2), (2, 4)], ShimDType::F16, 0);
         assert_eq!(k.key_bytes(0).len(), 8 * 2 * 2);
         assert_eq!(k.key_bytes(1).len(), 2 * 8 * 4 * 2);
-        assert_eq!(k.present_layer_bytes(0), 10 * 2 * 2);
-        assert_eq!(k.present_layer_bytes(1), 2 * 10 * 4 * 2);
+        assert_eq!(k.present_layer_bytes(0, k.packed_seq), 10 * 2 * 2);
+        assert_eq!(k.present_layer_bytes(1, k.packed_seq), 2 * 10 * 4 * 2);
         assert_eq!(k.geometry(), &[(1, 2), (2, 4)]);
         // present for layer 1: [heads 2][ctx 10][hd 4]; tag each (head, col).
-        let mut p1 = vec![0u8; k.present_layer_bytes(1)];
+        let mut p1 = vec![0u8; k.present_layer_bytes(1, k.packed_seq)];
         for h in 0..2 {
             for c in 0..10 {
                 for e in 0..4 {
@@ -1157,9 +1233,9 @@ mod tests {
                 }
             }
         }
-        let p0 = vec![0x11u8; k.present_layer_bytes(0)];
-        k.absorb_row(0, false, &p0, 1, 1, 0);
-        k.absorb_row(1, false, &p1, 1, 1, 0); // row 1 -> slot 1 (cols 4..8) @0
+        let p0 = vec![0x11u8; k.present_layer_bytes(0, k.packed_seq)];
+        k.absorb_row(0, false, &p0, k.packed_seq, 1, 1, 0);
+        k.absorb_row(1, false, &p1, k.packed_seq, 1, 1, 0); // row 1 -> slot 1 (cols 4..8) @0
         let rd = |buf: &[u8], h: usize, col: usize| {
             let off = (h * 8 + col) * 4 * 2;
             u16::from_le_bytes([buf[off], buf[off + 1]])
@@ -1185,13 +1261,13 @@ mod tests {
     #[test]
     fn mixed_geometry_populates_the_prefix_per_layer() {
         let mut k = PackedKv::with_layers(2, 12, 1, vec![(1, 2), (2, 4)], ShimDType::F16, 4);
-        let mut p1 = vec![0u8; k.present_layer_bytes(1)];
+        let mut p1 = vec![0u8; k.present_layer_bytes(1, k.packed_seq)];
         let col = k.past_len; // query row 0
         for h in 0..2 {
             let off = (h * k.context + col) * 4 * 2;
             p1[off..off + 8].fill(0x40 + h as u8);
         }
-        k.absorb_row(1, false, &p1, 0, 0, 0);
+        k.absorb_row(1, false, &p1, k.packed_seq, 0, 0, 0);
         k.advance(0, 1);
         k.populate_prefix_from(0, 1);
         assert_eq!(k.prefix_valid, 1);
