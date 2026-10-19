@@ -27,3 +27,28 @@ template and tokenizer only).
 Against the PIL processor the Rust preprocessing is bit-identical in f32; the
 torchvision processor differs by at most two 8-bit levels. Grids, ids and
 positions must match exactly.
+
+## Native video (`video_reference.json`)
+
+Made by `tools/vlm_fixtures/gen_qwen_vl_video_fixtures.py` (same versions)
+against the two exports above and `Qwen/Qwen3.6-35B-A3B` (configs, chat
+template and tokenizer only), for `qwen2_5_vl`, `qwen3_vl` and
+`qwen3_5_moe`. The frames are a closed-form pattern the test rebuilds
+(`frame_pixels`), so no video is checked in.
+
+- `video_processor`: each family's video processor constants (Qwen3-VL and
+  Qwen3.5: their own 4096..25165824-pixel budget over all frames; Qwen2.5-VL:
+  its image budget per frame).
+- `videos.<name>`: frame count, size, sampling rate and the frame times in ms
+  the API sends; the video processor's `video_grid_thw` and a summary of
+  `pixel_values_videos` (odd and even frame counts, one frame, an 8-frame
+  448x252 clip, 0.5 / 1.5 / 2 frames a second).
+- `prompts.<name>`: the rendered template, the text and ids with each pad run
+  collapsed to one pad (Qwen3-VL's per-group `<t seconds>` markup included),
+  HF's expanded `input_ids`, the media in prompt order, the grids,
+  `second_per_grid_ts` (Qwen2.5-VL), HF's 3-row `position_ids` and
+  `rope_delta`.
+
+The video processors resize with torchvision only, so the Rust (Pillow-exact)
+pixel values are held to two 8-bit levels; grids, text, ids and positions
+must match exactly.
