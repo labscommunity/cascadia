@@ -397,6 +397,27 @@ def build_feeds(model, hidden_size: int, hidden=None, embeds=None):
     return feeds
 
 
+VISION_FILES = [f"openvino_vision_embeddings{s}_model.{ext}"
+                for s in ("", "_pos", "_merger") for ext in ("xml", "bin")]
+
+
+def aux_files(have_vision: bool) -> list:
+    """Files copied from the model dir beside the stages (single-dir UX);
+    a missing one is skipped."""
+    files = ["openvino_text_embeddings_model.xml", "openvino_text_embeddings_model.bin",
+             "tokenizer.json", "generation_config.json", "config.json",
+             # API renders /v1/chat/completions through this when present
+             # (legacy "role: content" formatting otherwise)
+             "chat_template.jinja"]
+    if have_vision:
+        # The video processor's settings live in video_preprocessor_config.json
+        # or, in the published OpenVINO exports, processor_config.json's
+        # `video_processor` (PreprocessConfig::video_from_dir reads both).
+        files += VISION_FILES + ["preprocessor_config.json",
+                                 "video_preprocessor_config.json", "processor_config.json"]
+    return files
+
+
 def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=None):
     """Cut the official int4 OV IR in `model_dir` into `num_stages` stage
     dirs under `output_dir` + manifest + aux files. Entry point for
@@ -441,9 +462,7 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
     # Vision tower (VLM exports): rank 0 encodes images with these three IRs
     # and the processor settings; the engine enables image input when the
     # first IR is present (crates/cascadia-engine-openvino/src/qwen35_vision).
-    vision_files = [f"openvino_vision_embeddings{s}_model.{ext}"
-                    for s in ("", "_pos", "_merger") for ext in ("xml", "bin")]
-    have_vision = all(os.path.exists(os.path.join(model_dir, f)) for f in vision_files)
+    have_vision = all(os.path.exists(os.path.join(model_dir, f)) for f in VISION_FILES)
     if have_vision:
         manifest["vision"] = {
             "embeddings": "openvino_vision_embeddings_model.xml",
@@ -452,16 +471,8 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
         }
     with open(os.path.join(output_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
-    # aux files the engine needs alongside the stages (single-dir UX)
     import shutil
-    aux_files = ["openvino_text_embeddings_model.xml", "openvino_text_embeddings_model.bin",
-                 "tokenizer.json", "generation_config.json", "config.json",
-                 # API renders /v1/chat/completions through this when present
-                 # (legacy "role: content" formatting otherwise)
-                 "chat_template.jinja"]
-    if have_vision:
-        aux_files += vision_files + ["preprocessor_config.json", "video_preprocessor_config.json"]
-    for aux in aux_files:
+    for aux in aux_files(have_vision):
         src = os.path.join(model_dir, aux)
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(output_dir, aux))
