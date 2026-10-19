@@ -398,6 +398,9 @@ struct VisionRuntime {
     /// earlier images are not re-encoded every turn.
     cache: crate::image_cache::EncodeCache<[u32; 3]>,
     preprocess: crate::qwen35_vision::PreprocessConfig,
+    /// The video processor's settings (`Qwen3VLVideoProcessor`: its own pixel
+    /// budget over all frames).
+    video: crate::qwen35_vision::PreprocessConfig,
     image_pad: u32,
     video_pad: u32,
     merge: u32,
@@ -432,6 +435,26 @@ impl VisionRuntime {
             );
             crate::qwen35_vision::PreprocessConfig::qwen35()
         };
+        let video = match crate::qwen35_vision::PreprocessConfig::video_from_dir(dir) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "qwen35: no video processor config; videos take the image settings");
+                preprocess.clone()
+            }
+        };
+        if (
+            video.patch_size,
+            video.merge_size,
+            video.temporal_patch_size,
+        ) != (
+            preprocess.patch_size,
+            preprocess.merge_size,
+            preprocess.temporal_patch_size,
+        ) {
+            return Err(
+                "the video processor's patch layout differs from the image processor's".into(),
+            );
+        }
         let cfg: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(&cfg_path)
                 .map_err(|e| format!("{}: {e}", cfg_path.display()))?,
@@ -447,6 +470,7 @@ impl VisionRuntime {
             encoder: crate::qwen35_vision::encoder::VisionEncoder::load(dir, device, plugin, vc)?,
             cache: crate::image_cache::EncodeCache::from_env(),
             preprocess,
+            video,
             image_pad: id("image_token_id")?,
             video_pad: id("video_token_id")?,
             merge: vc.spatial_merge_size as u32,
@@ -848,7 +872,7 @@ const THINK_BLOCK: &str = "\n<think>\n\n</think>\n\n";
 /// `max_position_embeddings`.
 fn admitted_prompt_ids(tok: &Tokenizer, task: &GenerationTask) -> Result<Vec<u32>, String> {
     let mut ids = tok
-        .encode(task.prompt.as_str(), true)
+        .encode(prompt_text(task).as_ref(), true)
         .map_err(|e| e.to_string())?
         .get_ids()
         .to_vec();
@@ -858,6 +882,41 @@ fn admitted_prompt_ids(tok: &Tokenizer, task: &GenerationTask) -> Result<Vec<u32
         }
     }
     Ok(ids)
+}
+
+/// One video's rows `[tokens, hidden]` and grid `[t, h, w]`: the video
+/// processor's resize, frame pairs into the temporal patch, one temporal
+/// group per encode (the tower attends within a group, so this is the
+/// whole-video encode with a group-sized attention mask).
+fn encode_video(
+    v: &mut VisionRuntime,
+    m: &cascadia_types::MediaInput,
+) -> Result<(Vec<f32>, [u32; 3]), String> {
+    use crate::qwen35_vision::video;
+    if m.timestamps_ms.as_ref().map(Vec::len) != Some(m.num_frames as usize) {
+        return Err("no time for every frame".into());
+    }
+    let p = video::preprocess_video(
+        &m.pixels,
+        m.num_frames,
+        m.width,
+        m.height,
+        &v.video,
+        video::VideoResize::Temporal,
+    )?;
+    let mut rows = Vec::new();
+    for g in 0..p.grid_thw[0] as usize {
+        rows.extend(v.encoder.encode(&video::temporal_group(&p, g))?);
+    }
+    Ok((rows, p.grid_thw))
+}
+
+/// The text rank 0 tokenizes: the rendered prompt, each video's
+/// `<|video_pad|>` replaced by its per-group timestamp markup as HF's
+/// Qwen3.5 processor writes it (frames in pairs, the vision IRs' temporal
+/// patch). Unchanged for a turn without videos.
+fn prompt_text(task: &GenerationTask) -> std::borrow::Cow<'_, str> {
+    crate::qwen35_vision::video::with_frame_markup(&task.prompt, &task.media, 2)
 }
 
 fn map_wire(err: TransportError) -> EngineError {
@@ -1250,44 +1309,49 @@ impl Qwen36Engine {
             "this model tree has no vision encoder (openvino_vision_embeddings*_model.xml); \
              re-export it with the vision IRs",
         )?;
-        let mut images = Vec::with_capacity(task.media.len());
+        let mut items = Vec::with_capacity(task.media.len());
+        let mut is_video = Vec::with_capacity(task.media.len());
         let mut from_cache = 0;
         for (i, m) in task.media.iter().enumerate() {
-            match m.kind {
-                cascadia_types::MediaKind::Image => {}
-                cascadia_types::MediaKind::Video => {
-                    return Err(format!(
-                        "media {i}: native video is not supported (send frames)"
-                    ))
-                }
+            let video = match m.kind {
+                cascadia_types::MediaKind::Image => false,
+                cascadia_types::MediaKind::Video => true,
                 #[allow(unreachable_patterns)]
                 other => return Err(format!("media {i}: {other:?} is not supported")),
-            }
+            };
+            let what = if video { "video" } else { "image" };
+            is_video.push(video);
             if let Some((rows, grid)) = v.cache.get(&task.tenant, &m.sha256) {
-                images.push((rows, grid, m.sha256));
+                items.push((rows, grid, m.sha256));
                 from_cache += 1;
                 continue;
             }
-            let p = crate::qwen35_vision::preprocess(
-                &[&m.pixels[..]],
-                m.width,
-                m.height,
-                &v.preprocess,
-            )
-            .map_err(|e| format!("image {i}: {e}"))?;
-            let rows = v
-                .encoder
-                .encode(&p)
-                .map_err(|e| format!("image {i}: {e}"))?;
-            v.cache.put(&task.tenant, m.sha256, &rows, p.grid_thw);
-            images.push((rows, p.grid_thw, m.sha256));
+            let (rows, grid) = if video {
+                encode_video(v, m).map_err(|e| format!("{what} {i}: {e}"))?
+            } else {
+                let p = crate::qwen35_vision::preprocess(
+                    &[&m.pixels[..]],
+                    m.width,
+                    m.height,
+                    &v.preprocess,
+                )
+                .map_err(|e| format!("{what} {i}: {e}"))?;
+                let rows = v
+                    .encoder
+                    .encode(&p)
+                    .map_err(|e| format!("{what} {i}: {e}"))?;
+                (rows, p.grid_thw)
+            };
+            v.cache.put(&task.tenant, m.sha256, &rows, grid);
+            items.push((rows, grid, m.sha256));
         }
         v.cache.report(from_cache, task.media.len());
-        crate::qwen35_vision::prompt::VisionPrompt::new(
+        crate::qwen35_vision::prompt::VisionPrompt::with_videos(
             prompt_ids,
             v.image_pad,
             v.video_pad,
-            &images,
+            &items,
+            &is_video,
             hidden,
             v.merge,
             &task.tenant,
@@ -1815,7 +1879,8 @@ impl Qwen36Engine {
             // warm-resume (chain-wide RESTORE of the pulled KV) or cold-reset to position 0.
             self.epoch = self.epoch.wrapping_add(1);
             let tokenizer = self.tokenizer.as_ref().expect("rank 0 has tokenizer");
-            let mut prompt_ids: Vec<u32> = match tokenizer.encode(task.prompt.as_str(), true) {
+            let mut prompt_ids: Vec<u32> = match tokenizer.encode(prompt_text(&task).as_ref(), true)
+            {
                 Ok(e) => e.get_ids().to_vec(),
                 Err(e) => {
                     warn!(task = %task.task_id, error = %e, "tokenize failed");
@@ -2962,7 +3027,10 @@ impl Engine for Qwen36Engine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
-        cascadia_engine::refuse_video(&task, "qwen35")?;
+        // A tree with the vision IRs takes a video whole (rank 0 encodes it).
+        if self.vision.is_none() {
+            cascadia_engine::refuse_video(&task, "qwen35")?;
+        }
         if self.vision.is_none() {
             cascadia_engine::refuse_media(&task, "qwen35 (tree without vision IRs)")?;
         }

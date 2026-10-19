@@ -2612,7 +2612,15 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             EngineKind::OvGenai if has_vision && genai_gap.is_none() => Some(
                 cascadia_api::MediaConfig::ov_genai(export_model_type(&args.model).as_deref()),
             ),
-            EngineKind::Qwen36Moe if has_vision => Some(cascadia_api::MediaConfig::qwen35_native()),
+            // Rank 0 also takes each video whole (Qwen3.5's frame pairs and
+            // timestamps), by the export's model type.
+            EngineKind::Qwen36Moe if has_vision => Some(
+                cascadia_api::MediaConfig::qwen35_native().staged_native_video(
+                    export_model_type(&args.model)
+                        .as_deref()
+                        .unwrap_or("qwen3_5_moe"),
+                ),
+            ),
             // ov-runtime (Gemma 4 surgery trees) and gemma4 (gemma4_cached E2B/E4B
             // trees from export_gemma4.py --vision) both carry a `vision` block.
             EngineKind::OvRuntime | EngineKind::Gemma4 | EngineKind::OvDistSpec if has_vision => {
