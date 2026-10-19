@@ -470,6 +470,20 @@ impl PackedKv {
         dtype: ShimDType,
         window: Option<usize>,
     ) {
+        self.fill_mask_blocks(plan, buf, dtype, window, true);
+    }
+
+    /// [`PackedKv::fill_mask_window`], opening image blocks only when
+    /// `blocks`: HF's Gemma 4 keeps its full-attention layers causal (only
+    /// the sliding layers see each image both ways), Gemma 3 opens both.
+    pub fn fill_mask_blocks(
+        &self,
+        plan: &PackedPlan,
+        buf: &mut Vec<u8>,
+        dtype: ShimDType,
+        window: Option<usize>,
+        blocks: bool,
+    ) {
         let elem = match dtype {
             ShimDType::F32 => 4,
             _ => 2,
@@ -507,7 +521,8 @@ impl PackedKv {
                             let q = c - past_len;
                             match plan.rows.get(q).copied().flatten() {
                                 Some(other) if other.slot == pr.slot => {
-                                    let same_image = pr.image.is_some() && other.image == pr.image;
+                                    let same_image =
+                                        blocks && pr.image.is_some() && other.image == pr.image;
                                     same_image
                                         || (other.order <= pr.order
                                             && in_window(q_pos, self.pos[pr.slot] + other.order))
@@ -1184,6 +1199,27 @@ mod tests {
             assert_eq!(q(4), vec![0, 1, 2, 3, 4], "text after the image");
             assert_eq!(q(5), vec![5], "idle row: itself only");
         }
+    }
+
+    /// Without blocks (Gemma 4's full-attention layers) image rows stay
+    /// causal; the sliding mask of the same plan opens them.
+    #[test]
+    fn full_mask_without_blocks_keeps_images_causal() {
+        let k = kv(2, 8, 6);
+        let plan = image_plan(6, 0, &[None, Some(0), Some(0), Some(0), None]);
+        let mut buf = Vec::new();
+        k.fill_mask_blocks(&plan, &mut buf, ShimDType::F16, None, false);
+        let q = |buf: &[u8], r: usize| -> Vec<usize> {
+            allowed_cols(buf, k.context, r)
+                .iter()
+                .map(|c| c - 8)
+                .collect()
+        };
+        for r in 0..5 {
+            assert_eq!(q(&buf, r), (0..=r).collect::<Vec<_>>(), "row {r}");
+        }
+        k.fill_mask_blocks(&plan, &mut buf, ShimDType::F16, Some(1024), true);
+        assert_eq!(q(&buf, 1), vec![0, 1, 2, 3]);
     }
 
     /// Two images in one chunk stay separate blocks.

@@ -443,25 +443,82 @@ impl ImageFrontend {
         }
     }
 
-    /// The expanded prompt ids `prepare` would return for a turn of images
-    /// only, computed from each image's size without encoding anything:
+    /// Turn native video on when `tok` has `<|video|>` (the chat
+    /// template's video tag), spelling the per-frame markup from the
+    /// tokenizer's own begin/end-of-image tokens. Returns whether it did;
+    /// without the token a video is refused and arrives as frames.
+    pub fn enable_video_from_tokenizer(&mut self, tok: &tokenizers::Tokenizer) -> bool {
+        let markup = video::VideoMarkup::gemma4();
+        let Some(id) = tok.token_to_id(&markup.video) else {
+            return false;
+        };
+        let spell = |id: i64| u32::try_from(id).ok().and_then(|i| tok.id_to_token(i));
+        let markup = video::VideoMarkup {
+            boi: spell(self.tokens.boi).unwrap_or(markup.boi),
+            eoi: spell(self.tokens.eoi).unwrap_or(markup.eoi),
+            ..markup
+        };
+        self.enable_video(i64::from(id), markup);
+        true
+    }
+
+    /// Most soft tokens one bidirectional run can hold: an image, or a video
+    /// frame once native video is on (each frame is its own run).
+    pub fn max_run_tokens(&self) -> usize {
+        let image = self.preprocess.max_soft_tokens as usize;
+        match self.video_tokens {
+            Some(_) => image.max(self.video.frame.max_soft_tokens as usize),
+            None => image,
+        }
+    }
+
+    /// The expanded prompt ids `prepare` would return, computed from each
+    /// image's and video frame's size without encoding anything:
     /// `ov-runtime`'s admission checks run on these before any encoder work.
-    /// A video is refused here (that engine takes video as frames); the
-    /// `gemma4` engine, which takes video whole, does not call this.
+    /// A video is refused here unless native video is on.
     pub fn expand_ids(
         &self,
         media: &[cascadia_types::MediaInput],
         prompt_ids: &[i64],
     ) -> Result<Vec<i64>, String> {
-        let mut counts = Vec::with_capacity(media.len());
+        let mut items = Vec::with_capacity(media.len());
         for (i, m) in media.iter().enumerate() {
+            if m.kind == cascadia_types::MediaKind::Video && self.video_tokens.is_some() {
+                let l = video::layout(m, &self.video).map_err(|e| format!("video {i}: {e}"))?;
+                items.push(video::Item::Video {
+                    frames: l.frames.len(),
+                    soft_tokens: l.soft_tokens,
+                });
+                continue;
+            }
             check_image(i, m)?;
-            counts.push(
+            items.push(video::Item::Image(
                 soft_tokens_for_size(m.width, m.height, &self.preprocess)
                     .map_err(|e| format!("image {i}: {e}"))?,
-            );
+            ));
         }
-        expand_image_tokens(prompt_ids, &self.tokens, &counts)
+        self.expand_items(prompt_ids, &items)
+    }
+
+    /// The ids stage 0 takes for `prompt_ids` (videos already expanded in the
+    /// text) and the turn's media `items`.
+    fn expand_items(&self, prompt_ids: &[i64], items: &[video::Item]) -> Result<Vec<i64>, String> {
+        match &self.video_tokens {
+            Some((v, _)) => {
+                let hf = video::expand_media_tokens(prompt_ids, &self.tokens, *v, items)?;
+                Ok(video::stage_ids(&hf, self.tokens.image, *v))
+            }
+            None => {
+                let counts: Vec<usize> = items
+                    .iter()
+                    .map(|i| match *i {
+                        video::Item::Image(n) => n,
+                        video::Item::Video { .. } => unreachable!("videos need enable_video"),
+                    })
+                    .collect();
+                expand_image_tokens(prompt_ids, &self.tokens, &counts)
+            }
+        }
     }
 
     /// Encode a task's images and videos and expand the prompt's one image
@@ -524,22 +581,7 @@ impl ImageFrontend {
             rows.push(emb);
         }
         self.cache.report(from_cache, media.len());
-        let ids = match &self.video_tokens {
-            Some((v, _)) => {
-                let hf = video::expand_media_tokens(prompt_ids, &self.tokens, *v, &items)?;
-                video::stage_ids(&hf, self.tokens.image, *v)
-            }
-            None => {
-                let counts: Vec<usize> = items
-                    .iter()
-                    .map(|i| match *i {
-                        video::Item::Image(n) => n,
-                        video::Item::Video { .. } => unreachable!("videos need enable_video"),
-                    })
-                    .collect();
-                expand_image_tokens(prompt_ids, &self.tokens, &counts)?
-            }
-        };
+        let ids = self.expand_items(prompt_ids, &items)?;
         Ok((ids, rows))
     }
 }

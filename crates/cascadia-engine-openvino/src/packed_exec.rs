@@ -154,6 +154,9 @@ pub(crate) struct PackedMask {
     pub(crate) dtype: ShimDType,
     /// `Some(window)` for a sliding-window mask.
     pub(crate) window: Option<usize>,
+    /// Whether this mask opens each image both ways (every mask but a
+    /// Gemma 4 full-attention one, which HF keeps causal).
+    pub(crate) blocks: bool,
     pub(crate) bytes: Vec<u8>,
 }
 
@@ -163,6 +166,7 @@ impl PackedMask {
             port,
             dtype,
             window,
+            blocks: true,
             bytes: Vec::new(),
         }
     }
@@ -760,7 +764,7 @@ impl PackedState {
         // ---- feed ----
         for mk in self.masks.iter_mut() {
             self.kv
-                .fill_mask_window(wide, &mut mk.bytes, mk.dtype, mk.window);
+                .fill_mask_blocks(wide, &mut mk.bytes, mk.dtype, mk.window, mk.blocks);
         }
         // Idle rows still need a defined token/position; row 0's values are
         // safe filler because an idle row attends only to itself and its

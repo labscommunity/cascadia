@@ -213,9 +213,10 @@ const GENAI_NATIVE_VIDEO: &[(&str, usize)] = &[
 
 /// The families whose rank 0 encodes a video whole on a staged engine
 /// (`ov-runtime` Qwen VL trees, `crates/cascadia-engine-openvino/src/qwen_vl_vision.rs`;
-/// the `qwen35` engine's Qwen3.5 / 3.6 trees, `qwen36.rs`; the `gemma4`
-/// engine's Gemma 4 E2B / E4B trees, `gemma4_vision/video.rs`, but not
-/// `ov-runtime`'s Gemma 4 trees: the caller opts in per engine),
+/// the `qwen35` engine's Qwen3.5 / 3.6 trees, `qwen36.rs`; Gemma 4 trees
+/// whose tokenizer has `<|video|>`, the `gemma4` engine's E2B / E4B and
+/// `ov-runtime`'s 26B / 31B, `gemma4_vision/video.rs`: the caller opts in
+/// per tree),
 /// with the native video tag the API writes (the one HF's chat template
 /// renders for a video, which rank 0 expands as HF's processor does) and the
 /// frame multiple (Qwen's temporal patch is two frames). Every other family
