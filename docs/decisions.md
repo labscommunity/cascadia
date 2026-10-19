@@ -774,6 +774,8 @@ What happens now:
 created in 1 ms, but its first infer failed with a shape-inference error, so the engine failed.
 On the same GPU, a fresh request from a healthy compiled model served in every case tested, so
 the fault corrupts state the GPU plugin keeps per compiled model. Only a new compile escapes it.
+With the recompile (build 0c61635a) the same soak on pawan-01 recovered from the fault twice,
+on stage3 and on stage6, and served the next request each time.
 
 **The old stage is never dropped.** Its destructor could wait forever on the stuck request, so
 the whole old copy (compiled model and weights) is leaked, whatever the recompile does. **Each
@@ -781,11 +783,12 @@ recovery costs about one stage of memory**: the stage's weight file, 1.49 GB for
 2.47 GB for stage7 of the 9B int8 tree, on a GPU that shares the host's RAM (31.6 GB on p01).
 
 A recompiled stage needs nothing re-bound. Every input is set on each infer, and its variable
-state starts empty. The scrub skips it (it is fresh and has never run), so its first native call
-is its first infer.
+state starts empty. The scrub skips its reset and rebuild (it is fresh and has never run). The
+next task then reads its input names and sets its inputs (`input_names`, `set_input`: host-side
+tensor copies, not bounded) and runs its first infer, which is bounded.
 
-**Every call after the abandon is bounded.** Each runs on a helper thread, as OpenVINO's usual
-synchronous call:
+**The two calls that can wait on the device are bounded.** Each runs on a helper thread, as
+OpenVINO's usual synchronous call:
 
 - The recompile is bounded by 180 s (`RECOMPILE_TIMEOUT`). A cold compile without the model
   cache can take tens of seconds; a cache-warm one measured 1.2 to 1.7 s on p01.
@@ -868,8 +871,10 @@ exception. On Windows that suggests a structured (SEH) exception from the driver
 would also explain why the request stayed busy: OpenVINO's own cleanup never ran. On pawan-01
 such a request never came back to idle: it stayed `Cancelled` for the full 30 s, and a fresh
 request on the same compiled model then failed its first infer. The engine now recompiles the
-stage (above). Whether a recompiled stage always serves after such a fault is still to be
-confirmed on hardware; if its first infer fails, the engine fails.
+stage (above). On pawan-01 (build 0c61635a, chat soak) the fault hit stage3 and later stage6 in
+one run; both times the recompile took under 0.4 s, the recompiled stage's first infer
+succeeded, and the next request was served. If a recompiled stage's first infer ever fails, the
+engine fails.
 
 ## Devices
 
