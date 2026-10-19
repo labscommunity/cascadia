@@ -184,7 +184,7 @@ video costs about half the tokens of its frames as images, with no `Frame k` lab
 The token counts equal transformers 5.14.1's for the same frames, and the positions
 equal its `get_rope_index` on Qwen3-VL and Qwen3.5 and the original code's on Qwen2.5-VL
 (`tests/qwen_vl_video_parity.rs`). Video works in every mode images do on these trees
-(stateful, static, packed; one box or several): rank 0 encodes it and the stages see the
+(stateful, static, packed; one box or several; CPU or NPU): rank 0 encodes it and the stages see the
 same rows and position frames as for an image.
 
 Measured on pawan-04 (CPU) with the SDK video suite's 4 s clip (4 frames): a Qwen3-VL-4B
@@ -387,6 +387,16 @@ python tools/vlm_surgery/make_text_draft.py --model <ministral3-3b-int4-ov expor
 [engines/ov-dist-spec.md](engines/ov-dist-spec.md#image-input-pixtral-target). With
 `kv_coord`, image turns there prefill cold and are not captured for warm resume.
 
+Video reaches this engine as labelled frames (the startup log says `native_video=false`):
+each sampled frame is one Pixtral image behind its `Frame k (t s): ` label, and the target
+sees them all; the draft, as for any image, sees only the text. Measured on pawan-04 (CPU,
+both ranks on one box, `--spec-k 4`) with the SDK video suite's 4 s clip: 4 frames, 3322
+prompt tokens, about 335 s a request, answered correctly through `video_url` (MP4 and
+WebM), `input_video` and streaming, with acceptance 0.22 (16 of 72 drafted). On this
+path the answer can echo the labels (`Frame 1 (0.0s): The first shape is a red
+circle.`), since the model reads them as part of the prompt. The image suite passed on
+the same tree (one image 832 tokens, acceptance 0.25 to 0.35).
+
 ### Static and packed trees (NPU, or CPU/GPU without OpenVINO state)
 
 Convert a stateful vision tree from the tools above:
@@ -493,6 +503,15 @@ two machines (the M-RoPE positions ride the stage wire) — with the prompt-toke
 matching the stateful tree (223), and the packed concurrent test too. Gemma 3 12B packed
 (`--packed-slots 2`, sliding and full masks) passed the concurrent test across two machines
 (286 tokens per image, no slot leak); it is slow on CPU, about 200-300 s a request.
+
+Video on the NPU: a Qwen3-VL-4B static tree (`static_variant.py --context 2048
+--prefill-seq 256`, decode and prefill IRs apart) on pawan-04's NPU (`--device NPU
+--ov-cache-dir`) passed the SDK video suite with native video: 450 prompt tokens for the
+4 s clip (436 for its two frames as images), the same answer as on CPU ("The first
+shape is a red circle, and the last shape is a blue square."). The first start compiled
+for 11 minutes; a restart from the cache dir served in 4 s. Per request (18 tokens):
+prefill about 2.2 s and decode 3.4 tok/s on the NPU against 11.8 s and 1.4 tok/s for
+the same tree on CPU (start 27 s), about 7.2 s against 24 s end to end.
 
 ## Limits worth knowing
 
