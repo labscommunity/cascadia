@@ -933,9 +933,17 @@ runs.
 | GPU | `ov-runtime` stateful | Ministral-3-3B | 11/11 | 815 |
 | NPU | `ov-runtime` static (context 2048, prefill 256) | Ministral-3-3B | 11/11 | 815 |
 | NPU | `ov-runtime` static, 2 stages on two machines | Pixtral 12B | 11/11 (earlier) | 832 |
+| NPU | `ov-runtime` static (context 2048, prefill 256), video suite (2026-10-19) | Qwen3-VL-4B, native video | 11/11 | 450 (video), 436 (2 frames) |
 
 The Ministral NPU run, compile included, took about ten minutes (`--ov-cache-dir` makes
-a restart load the blobs). Not run on GPU: the staged multi-machine trees and the 26B /
+a restart load the blobs). The Qwen3-VL video run compiled for 11 minutes and restarted from the
+cache in 4 s; per 18-token answer the NPU took 2.2 s prefill and 3.4 tok/s decode, the
+same static tree on CPU 11.8 s and 1.4 tok/s.
+
+Video on `ov-dist-spec` (2026-10-19, pawan-04 CPU, both ranks on one box): Pixtral 12B
+`--all-logits` target with a Ministral-3-3B text draft at K=4 passed the video suite
+(11/11, frames path: 3322 prompt tokens for 4 frames, acceptance 0.22) and the image
+suite (11/11, 832 tokens, acceptance 0.25-0.35). Not run on GPU: the staged multi-machine trees and the 26B /
 31B models, whose two stages per node already fill the shared memory on CPU.
 
 ## Phi-3.5-vision and InternVL2 on `ov-runtime` (2026-10-16)
