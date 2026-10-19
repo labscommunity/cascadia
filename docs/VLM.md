@@ -3,8 +3,8 @@
 Cascadia takes images the way the OpenAI API does: `image_url` content parts in
 `/v1/chat/completions` messages. This page says which models and engines take them, how
 to export each one, and what the limits are. The design and its verification history are
-in [rfcs/vlm-support.md](rfcs/vlm-support.md). Video is served as sampled frames (see
-[Video](#video)); audio is not supported.
+in [rfcs/vlm-support.md](rfcs/vlm-support.md). Video is served as sampled frames, or
+whole where the engine takes it natively (see [Video](#video)); audio is not supported.
 
 ## The request
 
@@ -155,8 +155,49 @@ frame, so on the Qwen types an odd frame count is rounded up to the next even on
 `--api-max-video-frames` allows (a 3 s clip at 1 fps gives 4 frames, at 0, 0.75, 1.5 and
 2.25 s): the extra frame costs nothing. The other limits and flags are the ones above;
 there is no separate native frame cap (16 frames are 8 Qwen pairs, about 1600 tokens at
-448x448). Every other engine (`ov-runtime`, `gemma4`, `qwen35`, `ov-dist-spec`) and every
+448x448). On the staged engines, Qwen VL trees take video natively too (next section);
+every other engine (`gemma4`, `ov-dist-spec`, `ov-runtime` on other families) and every
 other export takes video as labelled frames. Requests are the same either way.
+
+### Native video (ov-runtime Qwen VL, qwen35)
+
+`ov-runtime` Qwen2.5-VL and Qwen3-VL trees and `qwen35` Qwen3.5 / 3.6 trees take each video
+whole too: the API writes Qwen's own `<|vision_start|><|video_pad|><|vision_end|>` where the
+caller put the video, and rank 0 does what Hugging Face's processor does with it. Frame
+pairs fill the vision encoder's temporal patch (an odd count rounds up as above), so a
+video costs about half the tokens of its frames as images, with no `Frame k` labels:
+
+- Qwen3-VL and Qwen3.5 write each frame pair as `<t seconds>` and its tokens (`t` the
+  pair's mean time), size frames with their video processor's budget over all frames
+  (`video_preprocessor_config.json`, which the cut copies) and position each pair as its
+  own grid. Their video processor refuses a frame under 32 px a side, so a video whose
+  frames scale below that (a tiny clip, or `detail: "low"` on a very wide one) is a
+  `400` naming the bound; send its frames as `image_url` parts instead.
+- Qwen2.5-VL writes one run of tokens and puts pair `k` at time position
+  `floor(k * 2 / sampled fps * tokens_per_second)`, the next text one past the video's
+  last position: Qwen's original `get_rope_index`, which the model was trained with
+  (transformers 5.20.1 spaces the pairs the same way). transformers 5.14 / 5.15
+  differ: they truncate `2 / fps` to whole seconds and start the next text inside the
+  video's time range. At the default 1 fps a fractional `2 / fps` is routine (a 5 s clip
+  gives 6 frames, 1.67 s per pair), so this server follows the original, not 5.14.
+
+The token counts equal transformers 5.14.1's for the same frames, and the positions
+equal its `get_rope_index` on Qwen3-VL and Qwen3.5 and the original code's on Qwen2.5-VL
+(`tests/qwen_vl_video_parity.rs`). Video works in every mode images do on these trees
+(stateful, static, packed; one box or several): rank 0 encodes it and the stages see the
+same rows and position frames as for an image.
+
+Measured on pawan-04 (CPU) with the SDK video suite's 4 s clip (4 frames): a Qwen3-VL-4B
+tree takes 450 prompt tokens natively (one encode, cached for the follow-up turns) where
+the same clip as labelled frames took 871, and ov-genai's native path 447 (GenAI 2026.4.1
+replaces the whole `<|vision_start|><|video_pad|><|vision_end|>`, dropping the outer pair
+HF keeps around the per-pair markup; this server follows HF); stateful,
+static (`--prefill-seq 256 --shared-prefill`) and packed (`--packed-slots 2
+--packed-seq 64`) trees answer the same and count the same 450. A Qwen2.5-VL-7B tree
+takes 565, as ov-genai does. A two-stage Qwen3-VL tree
+across pawan-04 (rank 0) and pawan-02 also counts 450 and answers the same. The `qwen35`
+engine's video path is pinned by the parity tests but not yet run live (no Qwen3.6
+vision tree on the nodes).
 
 ## What takes images
 
@@ -317,7 +358,8 @@ python tools/vlm_surgery/cut_vlm_lm.py --model <OpenVINO/Qwen3-VL-4B-Instruct-in
 
 Rank 0 preprocesses images as HF's Qwen2-VL processor does, runs the vision IRs
 (Qwen2.5-VL: patch embedding and the window-attention merger; Qwen3-VL: Qwen3.5's three)
-and expands each `<|image_pad|>` to the image's tokens. Every stage takes M-RoPE
+and expands each `<|image_pad|>` to the image's tokens; a video goes through the same IRs
+a frame pair at a time ([native video](#native-video-ov-runtime-qwen-vl-qwen35)). Every stage takes M-RoPE
 `position_ids [3, B, T]`: rank 0 computes them per span (images take a 2-D grid; decode
 continues from `rope_delta`) and sends them after the hidden states, so the stages record
 `position_rows: 3` and the tree `vision.mrope_rows: 3`; ranks on a build without the frame
