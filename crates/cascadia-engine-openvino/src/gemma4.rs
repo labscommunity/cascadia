@@ -1671,7 +1671,9 @@ impl Engine for Gemma4Engine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
-        // Only a vision tree (stage 0 takes image_features) serves images.
+        // Only a vision tree (stage 0 takes image_features) serves images;
+        // video arrives as its frames.
+        cascadia_engine::refuse_video(&task, "gemma4")?;
         if self.vision.is_none() {
             cascadia_engine::refuse_media(&task, "gemma4 (tree without a `vision` block)")?;
         }

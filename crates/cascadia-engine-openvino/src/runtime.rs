@@ -5978,6 +5978,7 @@ impl Engine for OvRuntimeEngine {
                 "non-first stage does not accept tasks directly".into(),
             ));
         }
+        cascadia_engine::refuse_video(&task, "ov-runtime")?;
         if self.vision.as_ref().is_none_or(|v| v.first.is_none()) {
             cascadia_engine::refuse_media(&task, "ov-runtime (tree without a `vision` block)")?;
         }

@@ -465,6 +465,11 @@ impl ImageFrontend {
 pub(crate) fn check_image(i: usize, m: &cascadia_types::MediaInput) -> Result<(), String> {
     match m.kind {
         cascadia_types::MediaKind::Image => {}
+        cascadia_types::MediaKind::Video => {
+            return Err(format!(
+                "media {i}: native video is not supported (send frames)"
+            ))
+        }
         #[allow(unreachable_patterns)]
         other => return Err(format!("media {i}: {other:?} is not supported")),
     }
