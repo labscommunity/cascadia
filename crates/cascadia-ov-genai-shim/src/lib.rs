@@ -76,8 +76,10 @@ mod sys {
         pub num_frames: u32,
         pub height: u32,
         pub width: u32,
+        pub fps: f32,
     }
     pub const CASCADIA_MEDIA_IMAGE: i32 = 0;
+    pub const CASCADIA_MEDIA_VIDEO: i32 = 1;
 
     extern "C" {
         pub fn cascadia_last_error_message() -> *const c_char;
@@ -481,17 +483,18 @@ impl PluginConfig {
     }
 }
 
-/// What a [`Media`] holds. Only images today; video maps onto GenAI's
-/// videos overload later without changing the C ABI.
+/// What a [`Media`] holds: an image (GenAI's images argument) or a video
+/// (its videos argument, one `[T, H, W, 3]` tensor).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MediaKind {
     Image,
+    Video,
 }
 
 /// One decoded media item, borrowed for a call; the shim copies the pixels.
-/// `pixels` is RGB8, frame-major `[num_frames, height, width, 3]`. Items
-/// match the prompt's image tags in order.
+/// `pixels` is RGB8, frame-major `[num_frames, height, width, 3]`. Images
+/// match the prompt's image tags in order, videos its video tags.
 #[derive(Clone, Copy, Debug)]
 pub struct Media<'a> {
     pub kind: MediaKind,
@@ -499,6 +502,37 @@ pub struct Media<'a> {
     pub num_frames: u32,
     pub height: u32,
     pub width: u32,
+    /// A video's sampled frame rate (frames per second of the stack), 0.0
+    /// when unknown; unused for an image.
+    pub fps: f32,
+}
+
+/// Check one item's shape before it crosses the FFI: the pixel buffer must
+/// hold the declared stack, an image exactly one frame, a video at least one.
+#[cfg_attr(not(feature = "openvino"), allow(dead_code))]
+fn check_media(i: usize, m: &Media<'_>) -> Result<()> {
+    let want = m.num_frames as usize * m.height as usize * m.width as usize * 3;
+    if m.pixels.len() != want {
+        return Err(Error::Native(format!(
+            "media {i}: {} pixel bytes for a {}x{}x{} RGB stack (want {want})",
+            m.pixels.len(),
+            m.num_frames,
+            m.height,
+            m.width
+        )));
+    }
+    let frames_ok = match m.kind {
+        MediaKind::Image => m.num_frames == 1,
+        MediaKind::Video => m.num_frames >= 1,
+    };
+    if !frames_ok || m.height == 0 || m.width == 0 {
+        return Err(Error::Native(format!(
+            "media {i}: an image needs one frame and a video at least one, both \
+             non-empty (got {:?} of {}x{}x{})",
+            m.kind, m.num_frames, m.height, m.width
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "openvino")]
@@ -507,18 +541,10 @@ fn native_media(media: &[Media<'_>]) -> Result<Vec<sys::cascadia_media_t>> {
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            let want = m.num_frames as usize * m.height as usize * m.width as usize * 3;
-            if m.pixels.len() != want {
-                return Err(Error::Native(format!(
-                    "media {i}: {} pixel bytes for a {}x{}x{} RGB stack (want {want})",
-                    m.pixels.len(),
-                    m.num_frames,
-                    m.height,
-                    m.width
-                )));
-            }
+            check_media(i, m)?;
             let kind = match m.kind {
                 MediaKind::Image => sys::CASCADIA_MEDIA_IMAGE,
+                MediaKind::Video => sys::CASCADIA_MEDIA_VIDEO,
             };
             Ok(sys::cascadia_media_t {
                 kind,
@@ -526,6 +552,11 @@ fn native_media(media: &[Media<'_>]) -> Result<Vec<sys::cascadia_media_t>> {
                 num_frames: m.num_frames,
                 height: m.height,
                 width: m.width,
+                fps: if m.fps.is_finite() && m.fps > 0.0 {
+                    m.fps
+                } else {
+                    0.0
+                },
             })
         })
         .collect()
@@ -682,8 +713,9 @@ impl LlmPipeline {
         Err(Error::Stub)
     }
 
-    /// Generate from `prompt`, with `media` matched to its image tags in
-    /// order. Media on a plain LLM export is an error.
+    /// Generate from `prompt`, with `media` matched to its tags in order
+    /// (images to image tags, videos to video tags). Media on a plain LLM
+    /// export is an error.
     #[cfg(feature = "openvino")]
     pub fn generate(
         &self,
@@ -1014,7 +1046,7 @@ impl CbPipeline {
     }
 
     /// Enroll a prompt into the running batch, with `media` matched to its
-    /// image tags in order. `request_id` must be unique among live requests
+    /// tags in order (images to image tags, videos to video tags). `request_id` must be unique among live requests
     /// on this pipeline.
     #[cfg(feature = "openvino")]
     pub fn add_request(
@@ -1894,6 +1926,47 @@ where
     }
     buf.truncate(len);
     String::from_utf8(buf).map_err(|e| Error::Utf8(e.to_string()))
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::{check_media, Media, MediaKind};
+
+    fn item(kind: MediaKind, num_frames: u32, pixels: &[u8]) -> Media<'_> {
+        Media {
+            kind,
+            pixels,
+            num_frames,
+            height: 2,
+            width: 2,
+            fps: 1.0,
+        }
+    }
+
+    #[test]
+    fn images_take_one_frame_and_videos_a_stack() {
+        let one = [0u8; 12];
+        let four = [0u8; 48];
+        assert!(check_media(0, &item(MediaKind::Image, 1, &one)).is_ok());
+        assert!(check_media(0, &item(MediaKind::Video, 1, &one)).is_ok());
+        assert!(check_media(0, &item(MediaKind::Video, 4, &four)).is_ok());
+        let e = check_media(3, &item(MediaKind::Image, 4, &four)).unwrap_err();
+        assert!(
+            e.to_string().contains("media 3: an image needs one frame"),
+            "{e}"
+        );
+        assert!(check_media(0, &item(MediaKind::Video, 0, &[])).is_err());
+    }
+
+    #[test]
+    fn a_buffer_short_of_the_declared_stack_is_refused() {
+        let e = check_media(1, &item(MediaKind::Video, 4, &[0u8; 47])).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("47 pixel bytes for a 4x2x2 RGB stack"),
+            "{e}"
+        );
+    }
 }
 
 #[cfg(test)]
