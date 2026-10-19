@@ -817,6 +817,21 @@ the cap of 2, so stage6 is not recompiled`, or `...; recompiling stage6 timed ou
 ms`. Chat and decisions return their 5xx. `/health` keeps answering, and reports `degraded`
 after a failed completion. Only a restart recovers it.
 
+**After a second recovery the engine is slower.** On pawan-01 (Arc 140V), an engine that holds two
+leaked stage copies (about 3.2 GB) decodes 12-20% slower per stage, the embeddings about 2x, and a
+chat took +16% (126 to 146 ms/token); this matches the +15% seen in the soak after the second
+recovery. One leaked copy, or any number of recompiles whose old copies are freed, showed no
+slowdown, so the cost is holding two leaked copies, not the recompile or the fault. Freeing a
+faulted copy is unsafe (its destructor can hang), so the engine keeps serving, slower. When a
+recompile that succeeds brings the engine to two leaked copies, it logs one `warn` line, once per
+engine: `qwen36: engine degraded: 2 stage copies leaked by fault recovery (N bytes); decode is
+slower until the server restarts (measured +16% with two on an Arc 140V); restart recommended`,
+with `leaked_copies`, `leaked_bytes` and `cap` fields (a helper thread leaked by a timed-out
+recompile is named in the text if one has happened). `/metrics` exposes
+`cascadia_engine_stage_recompiles_total` (counter: successful recompiles) and
+`cascadia_engine_leaked_stage_bytes` (gauge: the leaked copies' weight bytes). Restart to recover
+full speed.
+
 Each recovery step is one `error` line, `qwen36: stage recovery`, with `stage`, `action`
 (`probe`, `cancel`, `wait`, `abandon`, `recompile`, `first_infer`, `reset` or `recreate`),
 `outcome` and `elapsed_ms`. The `recompile` line also carries:
