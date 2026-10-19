@@ -66,6 +66,8 @@ const STAGE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// for stage6 and 2.5 GB for stage7 of the 9B int8 tree, on a GPU that shares system RAM), so a
 /// fault that recurs cannot exhaust memory: the abandon past this marks the engine failed.
 const MAX_RECOMPILES: usize = 2;
+/// Leaked stage copies at which the engine is flagged degraded (Task 54 fix round 3).
+const DEGRADED_AT_LEAKED_COPIES: usize = 2;
 /// Bound on one stage recompile, run on a helper thread (Task 54 fix round 2). A cold compile
 /// without the model cache can take tens of seconds; a cache-warm one measured 1.2-1.7 s on p01.
 const RECOMPILE_TIMEOUT: Duration = Duration::from_secs(180);
@@ -1225,6 +1227,17 @@ struct Rebuild {
     cap: usize,
     /// Recompiles this engine has started.
     recompiled: usize,
+    /// Old stage copies this engine leaked by a recompile that succeeded (the old copy leaks when
+    /// the new one is installed). A failed recompile fails the engine and is not counted.
+    leaked_copies: usize,
+    /// Sum of the leaked copies' `weight_bytes`.
+    leaked_bytes: u64,
+    /// Helper threads leaked by a timed-out recompile (not counted in `leaked_copies`).
+    leaked_threads: usize,
+    /// The degraded-engine warning has been logged (once per engine).
+    degraded_warned: bool,
+    /// Times the warning was logged (0 or 1; tests read it).
+    degraded_warnings: usize,
 }
 
 impl Rebuild {
@@ -1236,6 +1249,35 @@ impl Rebuild {
             timeout: RECOMPILE_TIMEOUT,
             cap: MAX_RECOMPILES,
             recompiled: 0,
+            leaked_copies: 0,
+            leaked_bytes: 0,
+            leaked_threads: 0,
+            degraded_warned: false,
+            degraded_warnings: 0,
+        }
+    }
+
+    /// A recompile succeeded and its old copy stays leaked: update the engine's totals and the
+    /// process metrics, and warn once when `DEGRADED_AT_LEAKED_COPIES` copies are leaked. Measured
+    /// on an Arc 140V: one leaked copy is harmless, two cost decode about 16%.
+    fn note_recompiled(&mut self, copy_bytes: u64) {
+        self.leaked_copies += 1;
+        self.leaked_bytes += copy_bytes;
+        cascadia_metrics::ENGINE_STAGE_RECOMPILES_TOTAL.inc();
+        cascadia_metrics::ENGINE_LEAKED_STAGE_BYTES
+            .add(i64::try_from(copy_bytes).unwrap_or(i64::MAX));
+        if self.leaked_copies >= DEGRADED_AT_LEAKED_COPIES && !self.degraded_warned {
+            self.degraded_warned = true;
+            self.degraded_warnings += 1;
+            let (n, m, cap) = (self.leaked_copies, self.leaked_bytes, self.cap);
+            let msg = degraded_message(n, m, self.leaked_threads);
+            warn!(
+                leaked_copies = n,
+                leaked_bytes = m,
+                cap,
+                leaked_threads = self.leaked_threads,
+                "{msg}"
+            );
         }
     }
 
@@ -1245,6 +1287,22 @@ impl Rebuild {
             Slot::Stage(j) => self.stages.get(j),
         }
     }
+}
+
+/// The degraded-engine warning text. `threads` is the number of recompile helper threads a
+/// timed-out recompile leaked (not stage copies), mentioned only when non-zero.
+fn degraded_message(copies: usize, bytes: u64, threads: usize) -> String {
+    let mut m = format!(
+        "qwen36: engine degraded: {copies} stage copies leaked by fault recovery ({bytes} bytes); \
+         decode is slower until the server restarts (measured +16% with two on an Arc 140V); \
+         restart recommended"
+    );
+    if threads > 0 {
+        m.push_str(&format!(
+            "; {threads} recompile helper thread(s) also leaked after a timeout"
+        ));
+    }
+    m
 }
 
 /// Leak a stage's `Runtime` on purpose (never drop it: its destructor may wait forever on the
@@ -2260,8 +2318,12 @@ impl Qwen36Engine {
                     leaked_requests = cascadia_ov_genai_shim::leaked_request_count(),
                     "qwen36: stage recovery"
                 );
+                if outcome == "timeout" {
+                    self.rebuild.leaked_threads += 1;
+                }
                 match failure {
                     None => {
+                        self.rebuild.note_recompiled(leaked_bytes);
                         self.fresh_requests.push(slot);
                         continue 'stages;
                     }
@@ -7509,6 +7571,55 @@ mod tests {
                 "{what}: never dropped, even with the engine"
             );
         }
+    }
+
+    #[test]
+    fn the_degraded_warning_fires_once_at_the_second_recompile_and_the_metrics_count() {
+        // Task 54 fix round 3: one leaked copy is harmless, two slow decode ~16%. The warn comes
+        // at the second successful recompile, never at the first, never again. The metrics are
+        // process-global and other recompile tests run in parallel, so they are asserted as
+        // lower-bound deltas; the engine's own totals are exact.
+        use cascadia_metrics::{ENGINE_LEAKED_STAGE_BYTES, ENGINE_STAGE_RECOMPILES_TOTAL};
+        let mut e = mock_box();
+        e.stage_idle_timeout = Duration::from_millis(100);
+        arm_recompile(&mut e);
+        let (c0, b0) = (
+            ENGINE_STAGE_RECOMPILES_TOTAL.get(),
+            ENGINE_LEAKED_STAGE_BYTES.get(),
+        );
+        for round in 1..=2usize {
+            stuck_on_next_infer(&mut e);
+            e.submit(chat("fails")).unwrap();
+            assert!(run_to_final(&mut e).error.is_some(), "round {round}");
+            e.submit(verbalizer_pass("served")).unwrap();
+            assert!(run_to_final(&mut e).error.is_none(), "round {round}");
+            assert_eq!(e.rebuild.recompiled, round);
+            assert_eq!(e.rebuild.leaked_copies, round);
+            assert_eq!(e.rebuild.leaked_bytes, 1000 * round as u64);
+            assert!(ENGINE_STAGE_RECOMPILES_TOTAL.get() - c0 >= round as u64);
+            assert!(ENGINE_LEAKED_STAGE_BYTES.get() - b0 >= 1000 * round as i64);
+            assert_eq!(
+                e.rebuild.degraded_warnings,
+                usize::from(round == 2),
+                "round {round}"
+            );
+        }
+        // A later task does not warn again.
+        e.submit(chat("again")).unwrap();
+        assert!(run_to_final(&mut e).error.is_none());
+        assert_eq!(e.rebuild.degraded_warnings, 1);
+    }
+
+    #[test]
+    fn the_degraded_message_is_the_specified_text_and_names_a_leaked_thread() {
+        let base = "qwen36: engine degraded: 2 stage copies leaked by fault recovery (2000 \
+                    bytes); decode is slower until the server restarts (measured +16% with two \
+                    on an Arc 140V); restart recommended";
+        assert_eq!(degraded_message(2, 2000, 0), base);
+        assert_eq!(
+            degraded_message(2, 2000, 1),
+            format!("{base}; 1 recompile helper thread(s) also leaked after a timeout")
+        );
     }
 
     #[test]
