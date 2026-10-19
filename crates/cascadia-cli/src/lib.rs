@@ -1711,12 +1711,24 @@ fn parse_ov_config(entries: &[String]) -> Vec<(String, String)> {
 
 /// The API's image settings for a vision tree of `family` served by `engine`
 /// (the tag rank 0 expands), or `None` where that engine has no image path for
-/// the family.
-fn vision_tree_media(engine: EngineKind, family: &str) -> Option<cascadia_api::MediaConfig> {
+/// the family. `video_token`: the tree's tokenizer has `<|video|>`
+/// ([`tree_has_video_token`]), which the gemma4 engine needs to take video.
+fn vision_tree_media(
+    engine: EngineKind,
+    family: &str,
+    video_token: bool,
+) -> Option<cascadia_api::MediaConfig> {
     match (engine, family) {
-        (EngineKind::OvRuntime | EngineKind::Gemma4, "gemma4") => {
-            Some(cascadia_api::MediaConfig::gemma4_native())
+        // The gemma4 engine's rank 0 also takes each video whole (Gemma 4's
+        // per-frame `mm:ss` markup) when its tokenizer has `<|video|>`, the
+        // engine's own condition (gemma4.rs load); otherwise, and on
+        // ov-runtime's Gemma 4 trees (26B / 31B, bidirectional inside each
+        // image), a video arrives as frames.
+        (EngineKind::Gemma4, "gemma4") if video_token => {
+            Some(cascadia_api::MediaConfig::gemma4_native().staged_native_video(family))
         }
+        (EngineKind::Gemma4, "gemma4") => Some(cascadia_api::MediaConfig::gemma4_native()),
+        (EngineKind::OvRuntime, "gemma4") => Some(cascadia_api::MediaConfig::gemma4_native()),
         (EngineKind::OvRuntime, "gemma3") => Some(cascadia_api::MediaConfig::gemma3_native()),
         (EngineKind::OvRuntime | EngineKind::OvDistSpec, "pixtral" | "mistral3") => {
             Some(cascadia_api::MediaConfig::pixtral_native())
@@ -1759,6 +1771,33 @@ fn pipeline_vision_family(model: &str) -> Option<String> {
         }
         None => Some(String::new()),
     }
+}
+
+/// Whether a tree's `tokenizer/tokenizer.json` knows `<|video|>` (an added
+/// token or a vocabulary entry), as the gemma4 engine checks at load before
+/// it takes video whole.
+fn tree_has_video_token(model: &str) -> bool {
+    const TOKEN: &str = "<|video|>";
+    let path = std::path::Path::new(model)
+        .join("tokenizer")
+        .join("tokenizer.json");
+    let Some(v) = std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+    else {
+        return false;
+    };
+    let added = v
+        .get("added_tokens")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|a| {
+            a.iter()
+                .any(|t| t.get("content").and_then(serde_json::Value::as_str) == Some(TOKEN))
+        });
+    added
+        || v.pointer("/model/vocab")
+            .and_then(|x| x.get(TOKEN))
+            .is_some()
 }
 
 /// An export's `config.json` `model_type` (`qwen2_5_vl`, `gemma3`, ...),
@@ -2859,7 +2898,14 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             EngineKind::OvRuntime | EngineKind::Gemma4 | EngineKind::OvDistSpec if has_vision => {
                 match pipeline_vision_family(&args.model) {
                     Some(f) => {
-                        let media = vision_tree_media(args.engine, &f);
+                        let video_token =
+                            args.engine == EngineKind::Gemma4 && tree_has_video_token(&args.model);
+                        if args.engine == EngineKind::Gemma4 && f == "gemma4" && !video_token {
+                            warn!(
+                                "gemma4 tree tokenizer has no <|video|>; videos arrive as frames"
+                            );
+                        }
+                        let media = vision_tree_media(args.engine, &f, video_token);
                         if media.is_none() {
                             warn!(family = %f, "pipeline vision family has no API image tag; serving text only");
                         }
@@ -4149,7 +4195,7 @@ mod tests {
     #[test]
     fn vision_tree_media_per_engine() {
         use super::{vision_tree_media, EngineKind};
-        let tag = |e, f| vision_tree_media(e, f).map(|m| m.image_placeholder);
+        let tag = |e, f| vision_tree_media(e, f, true).map(|m| m.image_placeholder);
         assert_eq!(
             tag(EngineKind::OvRuntime, "gemma4").as_deref(),
             Some("<|image|>")
@@ -4207,10 +4253,22 @@ mod tests {
             Some("<image>\n")
         );
         assert_eq!(tag(EngineKind::OvDistSpec, "llava_next"), None);
-        // Native video: the ov-runtime Qwen VL trees only.
-        let native = |e, f| vision_tree_media(e, f).is_some_and(|m| m.native_video);
+        // Native video: the ov-runtime Qwen VL trees and the gemma4 engine's
+        // Gemma 4 trees, behind Gemma 4's own `<|video|>`.
+        let native = |e, f| vision_tree_media(e, f, true).is_some_and(|m| m.native_video);
         assert!(native(EngineKind::OvRuntime, "qwen2_5_vl"));
         assert!(native(EngineKind::OvRuntime, "qwen3_vl"));
+        assert!(native(EngineKind::Gemma4, "gemma4"));
+        assert_eq!(
+            vision_tree_media(EngineKind::Gemma4, "gemma4", true)
+                .map(|m| (m.video_placeholder, m.video_frame_multiple)),
+            Some(("<|video|>".to_string(), 1))
+        );
+        // Without `<|video|>` in its tokenizer the engine refuses native
+        // video, so the API keeps sending frames (images still served).
+        let plain = vision_tree_media(EngineKind::Gemma4, "gemma4", false).unwrap();
+        assert!(!plain.native_video);
+        assert_eq!(plain.image_placeholder, "<|image|>");
         for f in [
             "gemma4",
             "gemma3",
@@ -4222,6 +4280,26 @@ mod tests {
             assert!(!native(EngineKind::OvRuntime, f), "{f}");
         }
         assert!(!native(EngineKind::OvDistSpec, "pixtral"));
+    }
+
+    #[test]
+    fn video_token_is_read_from_the_tree_tokenizer() {
+        use super::tree_has_video_token;
+        let dir = std::env::temp_dir().join(format!("cascadia-vt-{}", std::process::id()));
+        let tok = dir.join("tokenizer");
+        std::fs::create_dir_all(&tok).unwrap();
+        let d = dir.to_str().unwrap();
+        let write = |s: &str| std::fs::write(tok.join("tokenizer.json"), s).unwrap();
+        assert!(!tree_has_video_token(d), "no tokenizer.json");
+        write(r#"{"added_tokens":[{"id":1,"content":"<|image|>"}],"model":{"vocab":{"a":0}}}"#);
+        assert!(!tree_has_video_token(d));
+        write(r#"{"added_tokens":[{"id":7,"content":"<|video|>"}],"model":{"vocab":{}}}"#);
+        assert!(tree_has_video_token(d));
+        write(r#"{"added_tokens":[],"model":{"vocab":{"<|video|>":7}}}"#);
+        assert!(tree_has_video_token(d));
+        write("not json");
+        assert!(!tree_has_video_token(d));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
