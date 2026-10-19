@@ -368,9 +368,12 @@ pub fn takes_images(model_dir: &Path) -> bool {
 /// checkpoint onto its LLaVA-1.5 preprocessing (`visual_language/llava/
 /// classes.cpp`), which resizes the shortest edge and center-crops a fixed
 /// square and expands each image without Pixtral's `[IMG_BREAK]` row tokens
-/// and `[IMG_END]`. The model then answers about a different picture (903
-/// prompt tokens where HF counts 832 on a 448x448 image). Such exports serve
-/// text only here; their images go through ov-runtime.
+/// and `[IMG_END]`, behind a hard-coded `<image>` tag that the Pixtral
+/// tokenizer splits into ordinary text tokens, so no image row is merged at
+/// all. The model then answers about a different picture (903 prompt tokens
+/// where HF counts 832 on a 448x448 image). Such exports serve text only here; the message names the
+/// ov-runtime commands that serve their images, and the API returns it with
+/// the 400 that refuses them.
 pub fn unsupported_vision(model_dir: &Path) -> Option<String> {
     let cfg: serde_json::Value = std::fs::read(model_dir.join("config.json"))
         .ok()
@@ -387,9 +390,12 @@ pub fn unsupported_vision(model_dir: &Path) -> Option<String> {
     };
     (vision == "pixtral").then(|| {
         format!(
-            "GenAI preprocesses Pixtral as LLaVA-1.5 (center crop, no [IMG_BREAK]/[IMG_END]) \
-             and answers about a different image; serve this export's images with ov-runtime \
-             (tools/vlm_surgery/cut_vlm_lm.py --family {family}, --num-stages 1 on one box)"
+            "ov-genai serves this Pixtral export as text only: GenAI preprocesses Pixtral as \
+             LLaVA-1.5 (center crop, no [IMG_BREAK]/[IMG_END]) and answers about a different \
+             image. Serve its images with ov-runtime on a one-stage tree: \
+             `python tools/vlm_surgery/cut_vlm_lm.py --model <export dir> --output-dir <tree> \
+             --num-stages 1 --family {family}`, then `cascadia worker --total 1 --rank 0 \
+             --engine ov-runtime --model <tree> --api <host:port>`"
         )
     })
 }
@@ -1166,7 +1172,9 @@ mod tests {
         write(r#"{"model_type":"llava","vision_config":{"model_type":"pixtral"}}"#);
         let hint = unsupported_vision(&dir).unwrap();
         assert!(
-            hint.contains("Pixtral") && hint.contains("--family pixtral"),
+            hint.contains("Pixtral")
+                && hint.contains("--num-stages 1 --family pixtral")
+                && hint.contains("--engine ov-runtime --model <tree>"),
             "{hint}"
         );
         // Mistral 3 carries a Pixtral tower too, and is cut as `mistral3`.
