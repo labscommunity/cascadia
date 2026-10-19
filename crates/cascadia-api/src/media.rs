@@ -112,12 +112,15 @@ pub struct MediaConfig {
     pub video_temp_dir: Option<std::path::PathBuf>,
     /// The engine takes a video whole ([`MediaKind::Video`], its sampled
     /// frames as one item behind [`MediaConfig::video_placeholder`]) instead
-    /// of as labelled frames through the image path. Only ov-genai, on the
-    /// families GenAI preprocesses video for ([`GENAI_NATIVE_VIDEO`]).
+    /// of as labelled frames through the image path: ov-genai on the
+    /// families GenAI preprocesses video for ([`GENAI_NATIVE_VIDEO`]), and a
+    /// staged engine on the families its rank 0 encodes video for
+    /// ([`STAGED_NATIVE_VIDEO`], [`MediaConfig::staged_native_video`]).
     pub native_video: bool,
     /// Text that marks native video `i` in the prompt, with `{i}` replaced by
     /// the video's index in the request (its own sequence, apart from the
-    /// images'). Unused unless [`MediaConfig::native_video`].
+    /// images'), or the same tag for every video (a staged engine's native
+    /// one). Unused unless [`MediaConfig::native_video`].
     pub video_placeholder: String,
     /// A native video's sampled frames are rounded up to a multiple of this
     /// (within [`MediaConfig::max_video_frames`]): Qwen's vision encoder takes
@@ -203,6 +206,21 @@ const GENAI_NATIVE_VIDEO: &[(&str, usize)] = &[
     ("llava_next_video", 1),
 ];
 
+/// The families whose rank 0 encodes a video whole on a staged engine
+/// (`ov-runtime` Qwen VL trees: `crates/cascadia-engine-openvino/src/qwen_vl_vision.rs`),
+/// with the native video tag the API writes (the one HF's chat template
+/// renders for a video, which rank 0 expands as HF's processor does) and the
+/// frame multiple (Qwen's temporal patch is two frames). Every other family
+/// on a staged engine gets a video as labelled frames.
+const STAGED_NATIVE_VIDEO: &[(&str, &str, usize)] = &[
+    (
+        "qwen2_5_vl",
+        "<|vision_start|><|video_pad|><|vision_end|>",
+        2,
+    ),
+    ("qwen3_vl", "<|vision_start|><|video_pad|><|vision_end|>", 2),
+];
+
 /// The text an ov-genai export must refuse in caller messages: the universal
 /// tags plus `model_type`'s native ones, or every known native tag when the
 /// type is missing or not listed (a tag GenAI reads that this server does
@@ -264,6 +282,19 @@ impl MediaConfig {
             video_placeholder: "<ov_genai_video_{i}>".into(),
             video_frame_multiple: native.map_or(1, |&(_, m)| m),
         }
+    }
+
+    /// Opt a staged engine's settings into native video for `family` (a
+    /// vision tree's family) when its rank 0 takes video whole
+    /// ([`STAGED_NATIVE_VIDEO`]); any other family keeps video as frames.
+    pub fn staged_native_video(mut self, family: &str) -> Self {
+        if let Some(&(_, tag, multiple)) = STAGED_NATIVE_VIDEO.iter().find(|(f, _, _)| *f == family)
+        {
+            self.native_video = true;
+            self.video_placeholder = tag.into();
+            self.video_frame_multiple = multiple;
+        }
+        self
     }
 
     /// Whether `video_url` parts are served: images are, ffmpeg was found,
@@ -452,15 +483,14 @@ impl MediaConfig {
     }
 
     /// Whether the rendered `prompt` carries `n` native videos' placeholders,
-    /// each exactly once; `Err` holds how many video tags it carries.
+    /// each exactly once (indexed tags), or exactly `n` of the one shared
+    /// tag; `Err` holds how many video tags it carries.
     pub fn video_placeholders_complete(&self, prompt: &str, n: usize) -> Result<(), usize> {
-        let prefix = self
-            .video_placeholder
-            .find("{i}")
-            .map_or(self.video_placeholder.as_str(), |at| {
-                &self.video_placeholder[..at]
-            });
-        let found = prompt.matches(prefix).count();
+        let Some(at) = self.video_placeholder.find("{i}") else {
+            let found = prompt.matches(self.video_placeholder.as_str()).count();
+            return if found == n { Ok(()) } else { Err(found) };
+        };
+        let found = prompt.matches(&self.video_placeholder[..at]).count();
         if found == n && (0..n).all(|j| prompt.matches(&self.video_tag(j)).count() == 1) {
             Ok(())
         } else {
@@ -1364,7 +1394,24 @@ mod tests {
             assert!(!cfg.native_video, "{t:?}");
             assert_eq!(cfg.video_frame_multiple, 1, "{t:?}");
         }
-        // The engines that encode images themselves take video as frames.
+        // A staged engine takes video whole only where its rank 0 encodes
+        // it, behind Qwen's own tag.
+        for f in ["qwen2_5_vl", "qwen3_vl"] {
+            let cfg = MediaConfig::qwen35_native().staged_native_video(f);
+            assert!(cfg.native_video, "{f}");
+            assert_eq!(cfg.video_frame_multiple, 2, "{f}");
+            assert_eq!(
+                cfg.video_tag(3),
+                "<|vision_start|><|video_pad|><|vision_end|>"
+            );
+        }
+        for f in ["qwen3_vl_moe", "gemma4", "pixtral", ""] {
+            let cfg = MediaConfig::qwen35_native().staged_native_video(f);
+            assert!(!cfg.native_video, "{f}");
+            assert_eq!(cfg.video_frame_multiple, 1, "{f}");
+        }
+        // The engines that encode images themselves take video as frames
+        // unless they opt in.
         for cfg in [
             MediaConfig::qwen35_native(),
             MediaConfig::gemma4_native(),
@@ -1376,6 +1423,27 @@ mod tests {
         ] {
             assert!(!cfg.native_video, "{}", cfg.image_placeholder);
         }
+    }
+
+    /// A staged engine's video tag is the same for every video, and shares
+    /// Qwen's framing tokens with the image tag.
+    #[test]
+    fn shared_video_tags_are_counted() {
+        let cfg = MediaConfig::qwen35_native().staged_native_video("qwen3_vl");
+        let (img, vid) = (cfg.placeholder(0), cfg.video_tag(0));
+        let prompt = format!("{vid}a{img}b{vid}");
+        assert_eq!(cfg.placeholders_complete(&prompt, 1), Ok(()));
+        assert_eq!(cfg.video_placeholders_complete(&prompt, 2), Ok(()));
+        assert_eq!(cfg.video_placeholders_complete(&prompt, 1), Err(2));
+        assert_eq!(cfg.reserved_beyond_placeholders(&prompt, 1, 2), None);
+        assert_eq!(
+            cfg.reserved_beyond_placeholders(&format!("{prompt}<|video_pad|>"), 1, 2),
+            Some("<|video_pad|>")
+        );
+        assert_eq!(
+            cfg.reserved_beyond_placeholders(&prompt, 1, 1),
+            Some("<|vision_start|>")
+        );
     }
 
     #[test]

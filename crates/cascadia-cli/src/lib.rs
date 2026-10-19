@@ -1730,11 +1730,12 @@ fn vision_tree_media(engine: EngineKind, family: &str) -> Option<cascadia_api::M
         (EngineKind::OvRuntime, "llava_next") => {
             Some(cascadia_api::MediaConfig::llava_next_native())
         }
-        // Qwen2.5-VL / Qwen3-VL: Qwen's native tag, as the staged qwen35
-        // engine; rank 0 expands `<|image_pad|>`. ov-runtime only: dist-spec
-        // feeds 1-D positions and refuses these trees.
+        // Qwen2.5-VL / Qwen3-VL: Qwen's native tags, as the staged qwen35
+        // engine; rank 0 expands `<|image_pad|>` and takes each video whole
+        // behind `<|video_pad|>`. ov-runtime only: dist-spec feeds 1-D
+        // positions and refuses these trees.
         (EngineKind::OvRuntime, "qwen2_5_vl" | "qwen3_vl") => {
-            Some(cascadia_api::MediaConfig::qwen35_native())
+            Some(cascadia_api::MediaConfig::qwen35_native().staged_native_video(family))
         }
         _ => None,
     }
@@ -2862,8 +2863,9 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         if let Some(mut media) = media_kind {
             media.allow_remote_urls = args.api_allow_image_urls;
             args.api_media.apply(&mut media)?;
-            // Video is served as frames through the image path, decoded by
-            // ffmpeg: on when one is found. A path the operator named must
+            // Video is served as frames through the image path, or whole
+            // where the engine takes it natively (`MediaConfig::native_video`),
+            // decoded by ffmpeg: on when one is found. A path the operator named must
             // work; a missing default is one line, not a failure.
             match (
                 cascadia_api::Ffmpeg::locate(args.api_media.api_ffmpeg.as_deref()),
@@ -4195,6 +4197,21 @@ mod tests {
             Some("<image>\n")
         );
         assert_eq!(tag(EngineKind::OvDistSpec, "llava_next"), None);
+        // Native video: the ov-runtime Qwen VL trees only.
+        let native = |e, f| vision_tree_media(e, f).is_some_and(|m| m.native_video);
+        assert!(native(EngineKind::OvRuntime, "qwen2_5_vl"));
+        assert!(native(EngineKind::OvRuntime, "qwen3_vl"));
+        for f in [
+            "gemma4",
+            "gemma3",
+            "pixtral",
+            "phi3_v",
+            "internvl_chat",
+            "llava_next",
+        ] {
+            assert!(!native(EngineKind::OvRuntime, f), "{f}");
+        }
+        assert!(!native(EngineKind::OvDistSpec, "pixtral"));
     }
 
     #[test]
