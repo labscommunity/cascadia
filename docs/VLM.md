@@ -155,9 +155,10 @@ frame, so on the Qwen types an odd frame count is rounded up to the next even on
 `--api-max-video-frames` allows (a 3 s clip at 1 fps gives 4 frames, at 0, 0.75, 1.5 and
 2.25 s): the extra frame costs nothing. The other limits and flags are the ones above;
 there is no separate native frame cap (16 frames are 8 Qwen pairs, about 1600 tokens at
-448x448). On the staged engines, Qwen VL trees take video natively too (next section);
-every other engine (`gemma4`, `ov-dist-spec`, `ov-runtime` on other families) and every
-other export takes video as labelled frames. Requests are the same either way.
+448x448). On the staged engines, Qwen VL trees and the `gemma4` engine's Gemma 4 E2B / E4B
+trees take video natively too (next sections); every other engine (`ov-dist-spec`,
+`ov-runtime` on other families, Gemma 4 26B / 31B included) and every other export takes
+video as labelled frames. Requests are the same either way.
 
 ### Native video (ov-runtime Qwen VL, qwen35)
 
@@ -198,6 +199,36 @@ takes 565, as ov-genai does. A two-stage Qwen3-VL tree
 across pawan-04 (rank 0) and pawan-02 also counts 450 and answers the same. The `qwen35`
 engine's video path is pinned by the parity tests but not yet run live (no Qwen3.6
 vision tree on the nodes).
+
+### Native video (gemma4 engine, Gemma 4 E2B / E4B)
+
+Gemma 4 has no temporal patch: Hugging Face's `Gemma4Processor` (and GenAI 2026.4.1's
+`InputsEmbedderGemma4`) encode each frame through the image encoder on its own, at the video
+processor's smaller budget (`processor_config.json` `video_processor`: 70 soft tokens a
+frame on E2B / E4B, against 280 for an image), and write the chat template's one
+`<|video|>` as, per frame, its time as `mm:ss`, a space, then `<|image>`, `<|video|>` once
+per soft token and `<image|>`, frames joined by a space. The `gemma4` engine does the same:
+the API writes `<|video|>` where the caller put the video (with every sampled frame; no
+pairing, no `Frame k` labels), rank 0 expands it in the text before tokenizing (minutes keep
+counting past the hour, as HF's), encodes the frames, and hands stage 0 the video soft
+tokens as `<|image|>`, the id its IR splices rows at (HF embeds both kinds the same way).
+A video of more than the processor's `num_frames` (32) would keep 32 frames, spaced as HF
+samples them; the API's 16-frame cap keeps every frame. E2B / E4B attend causally
+(`use_bidirectional_attention` is unset), so frames need no attention block of their own;
+the encode cache and the KV warm-resume key take the video's hash, which covers its frame
+times. Only the `gemma4` engine opts in: Gemma 4 26B / 31B on `ov-runtime` keep frames.
+
+Token ids, soft-token counts, frame sampling, `mm:ss` labels, `mm_token_type_ids` and the
+attention blocks (one per frame) equal transformers 5.20.1's, and frame pixels are within
+two 8-bit levels of its torchvision-only video processor
+(`tests/gemma4_video_parity.rs`, fixtures from
+`tools/vlm_fixtures/gen_gemma4_video_fixtures.py`).
+
+Measured on pawan-04 (CPU) with the SDK video suite's 4 s clip on a one-stage E4B tree
+(`trees\e4bv-1stage`): 332 prompt tokens natively where the same clip as labelled frames
+took 1109, every check passing ("The first shape is a red circle, and the last shape is
+a blue square."), the frames encoded once (about 4 s) and served from the encode cache
+on the follow-up requests.
 
 ## What takes images
 

@@ -213,7 +213,9 @@ const GENAI_NATIVE_VIDEO: &[(&str, usize)] = &[
 
 /// The families whose rank 0 encodes a video whole on a staged engine
 /// (`ov-runtime` Qwen VL trees, `crates/cascadia-engine-openvino/src/qwen_vl_vision.rs`;
-/// the `qwen35` engine's Qwen3.5 / 3.6 trees, `qwen36.rs`),
+/// the `qwen35` engine's Qwen3.5 / 3.6 trees, `qwen36.rs`; the `gemma4`
+/// engine's Gemma 4 E2B / E4B trees, `gemma4_vision/video.rs`, but not
+/// `ov-runtime`'s Gemma 4 trees: the caller opts in per engine),
 /// with the native video tag the API writes (the one HF's chat template
 /// renders for a video, which rank 0 expands as HF's processor does) and the
 /// frame multiple (Qwen's temporal patch is two frames). Every other family
@@ -226,6 +228,9 @@ const STAGED_NATIVE_VIDEO: &[(&str, &str, usize, u32)] = &[
     ("qwen3_vl", QWEN_VIDEO_TAG, 2, 32),
     ("qwen3_5", QWEN_VIDEO_TAG, 2, 32),
     ("qwen3_5_moe", QWEN_VIDEO_TAG, 2, 32),
+    // Gemma 4 encodes each frame as an image (no temporal patch), and its
+    // resize takes any frame size.
+    ("gemma4", "<|video|>", 1, 0),
 ];
 
 /// The video tag HF's Qwen chat templates render.
@@ -1420,7 +1425,12 @@ mod tests {
             let min = if f == "qwen2_5_vl" { 0 } else { 32 };
             assert_eq!(cfg.video_min_side, min, "{f}");
         }
-        for f in ["qwen3_vl_moe", "gemma4", "pixtral", ""] {
+        // Gemma 4 (the gemma4 engine): its own tag, frames one by one.
+        let cfg = MediaConfig::gemma4_native().staged_native_video("gemma4");
+        assert!(cfg.native_video);
+        assert_eq!(cfg.video_tag(1), "<|video|>");
+        assert_eq!((cfg.video_frame_multiple, cfg.video_min_side), (1, 0));
+        for f in ["qwen3_vl_moe", "gemma3", "pixtral", ""] {
             let cfg = MediaConfig::qwen35_native().staged_native_video(f);
             assert!(!cfg.native_video, "{f}");
             assert_eq!(cfg.video_frame_multiple, 1, "{f}");
