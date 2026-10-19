@@ -8,7 +8,8 @@ weights) on synthetic videos and writes what the Rust port
   <out>/video_reference.json
     video_processor  the video processor constants
     tokens           `<|image|>`, `<|video|>`, begin/end-of-image and pad ids,
-                     and the text config's `use_bidirectional_attention`
+                     and the text config's `use_bidirectional_attention` and
+                     `sliding_window`
     videos           per synthetic video: its frames (count, size, the frame
                      times in ms the API would send), whether HF samples it,
                      the frames HF keeps, soft tokens per frame, the resized
@@ -19,7 +20,11 @@ weights) on synthetic videos and writes what the Rust port
                      them), the text HF tokenizes after expanding the videos
                      (`expanded_text`), the media in prompt order,
                      `input_ids`, `mm_token_type_ids` and the attention block
-                     ids of `get_block_sequence_ids_for_mask`
+                     ids of `get_block_sequence_ids_for_mask`; on a model with
+                     `use_bidirectional_attention == "vision"` (26B-A4B / 31B)
+                     also `masks`: HF's sliding and full attention masks
+                     (`create_masks_for_vision_model`), each row as the
+                     `[first, last]` key it may attend (always one range)
 
 Frames are a closed-form pattern (`frame_pixels`, the Qwen video fixtures'
 one) the Rust test rebuilds, so no binaries are checked in. Images are the
@@ -31,10 +36,14 @@ are `index / fps`); every video but `long40` is pre-sampled
 its 40 frames.
 
 Usage (needs torch, torchvision, transformers>=5.14.1, pillow, numpy):
-  python gen_gemma4_video_fixtures.py --model <Gemma 4 E2B/E4B dir> --out <dir>
+  python gen_gemma4_video_fixtures.py --model <Gemma 4 dir> [--model <dir> ...] \
+      --out <dir> [--name video_reference.json]
 
-The dir only supplies config.json, processor_config.json, the chat template
-and the tokenizer (e.g. google/gemma-4-E4B-it without its weights).
+A dir only supplies config.json, processor_config.json, the chat template
+and the tokenizer (e.g. google/gemma-4-E4B-it without its weights). Several
+`--model`s must give the same reference (26B-A4B and 31B share their
+processor, tokenizer and attention layout), which is written once with every
+source named in `sources`.
 """
 import argparse
 import glob
@@ -47,7 +56,10 @@ import torchvision
 import transformers
 from PIL import Image
 from transformers import AutoConfig, AutoProcessor
-from transformers.models.gemma4.modeling_gemma4 import get_block_sequence_ids_for_mask
+from transformers.models.gemma4.modeling_gemma4 import (
+    create_masks_for_vision_model,
+    get_block_sequence_ids_for_mask,
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_IMAGES = os.path.join(HERE, os.pardir, os.pardir, "crates", "cascadia-engine-openvino",
@@ -145,20 +157,37 @@ def chats(imgs):
     }
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--images", default=DEFAULT_IMAGES)
-    ap.add_argument("--out", required=True)
-    args = ap.parse_args()
-    os.makedirs(args.out, exist_ok=True)
+def mask_ranges(config, mm):
+    """HF's sliding / full attention masks for a prompt of `mm_token_type_ids`
+    `mm` (`[1, L]`), each row as the one `[first, last]` key range it sees."""
+    text = config.get_text_config()
+    text._attn_implementation = "sdpa"
+    n = mm.shape[1]
+    out = create_masks_for_vision_model(
+        config=text, inputs_embeds=torch.zeros(1, n, 8), attention_mask=torch.ones(1, n, dtype=torch.long),
+        past_key_values=None, position_ids=torch.arange(n).unsqueeze(0),
+        block_sequence_ids=get_block_sequence_ids_for_mask(mm, device="cpu"))
+    ranges = {}
+    for kind, m in out.items():
+        if m is None:  # sdpa leaves a plain causal mask implicit
+            m = torch.ones(n, n, dtype=torch.bool).tril()
+        m = m.reshape(m.shape[-2], m.shape[-1]).to(torch.bool)
+        rows = []
+        for q in range(n):
+            keys = torch.nonzero(m[q]).flatten().tolist()
+            assert keys == list(range(keys[0], keys[-1] + 1)), (kind, q)
+            rows.append([keys[0], keys[-1]])
+        ranges[kind] = rows
+    return ranges
 
-    config = AutoConfig.from_pretrained(args.model)
-    processor = AutoProcessor.from_pretrained(args.model)
+
+def reference(model, images_dir):
+    config = AutoConfig.from_pretrained(model)
+    processor = AutoProcessor.from_pretrained(model)
     vp = processor.video_processor
     tok = processor.tokenizer
     imgs = {os.path.splitext(os.path.basename(p))[0]: Image.open(p).convert("RGB")
-            for p in sorted(glob.glob(os.path.join(args.images, "*.png")))}
+            for p in sorted(glob.glob(os.path.join(images_dir, "*.png")))}
 
     ref = {
         "versions": {"transformers": transformers.__version__, "torch": torch.__version__,
@@ -172,7 +201,8 @@ def main():
                    "eoi": tok.convert_tokens_to_ids(processor.eoi_token),
                    "pad": config.text_config.pad_token_id,
                    "use_bidirectional_attention":
-                       getattr(config.text_config, "use_bidirectional_attention", None)},
+                       getattr(config.text_config, "use_bidirectional_attention", None),
+                   "sliding_window": config.text_config.sliding_window},
         "videos": {}, "prompts": {},
     }
     assert config.video_token_id == processor.video_token_id
@@ -229,9 +259,27 @@ def main():
             "mm_token_type_ids": mm[0].tolist(),
             "block_ids": blocks,
         }
+        if ref["tokens"]["use_bidirectional_attention"] == "vision":
+            ref["prompts"][p_name]["masks"] = mask_ranges(config, mm)
         print(f"[{p_name}] tokens={len(ids)} blocks={max(blocks) + 1}")
+    return ref
 
-    with open(os.path.join(args.out, "video_reference.json"), "w") as f:
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", required=True, action="append")
+    ap.add_argument("--images", default=DEFAULT_IMAGES)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--name", default="video_reference.json")
+    args = ap.parse_args()
+    os.makedirs(args.out, exist_ok=True)
+
+    refs = [reference(m, args.images) for m in args.model]
+    for m, r in zip(args.model[1:], refs[1:]):
+        assert r == refs[0], f"{m} differs from {args.model[0]}"
+    ref = refs[0]
+    ref["sources"] = [os.path.basename(os.path.normpath(m)) for m in args.model]
+    with open(os.path.join(args.out, args.name), "w") as f:
         json.dump(ref, f, separators=(",", ":"))
 
 
