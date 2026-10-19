@@ -152,12 +152,20 @@ pub fn cu_seqlens(grids: &[[u32; 3]]) -> Vec<i32> {
     out
 }
 
+/// Blocked entry of the vision merger's additive masks: f16's most-negative
+/// finite rather than GenAI's `-inf`. The GPU plugin runs the merger in f16
+/// by default, and an -inf additive mask entry reaching its f16 attention
+/// gives wrong output (seen on the packed LM masks, `packed.rs`); -65504
+/// still drives softmax to exactly 0, so CPU output is unchanged.
+pub const MASK_BLOCKED: f32 = -65504.0;
+
 /// The merger's `[1, N, N]` mask for [`cu_seqlens`]: 0 inside a frame,
-/// `-inf` across frames (GenAI `qwen2_vl_utils::get_attention_mask`).
+/// [`MASK_BLOCKED`] across frames (GenAI `qwen2_vl_utils::get_attention_mask`,
+/// which uses `-inf`).
 pub fn attention_mask(grids: &[[u32; 3]]) -> Vec<f32> {
     let cu = cu_seqlens(grids);
     let n = *cu.last().unwrap() as usize;
-    let mut mask = vec![f32::NEG_INFINITY; n * n];
+    let mut mask = vec![MASK_BLOCKED; n * n];
     for pair in cu.windows(2) {
         let (s, e) = (pair[0] as usize, pair[1] as usize);
         for row in s..e {
@@ -215,8 +223,18 @@ mod tests {
         let m = attention_mask(&g);
         assert_eq!(m[0], 0.0);
         assert_eq!(m[3 * 8 + 3], 0.0);
-        assert_eq!(m[3 * 8 + 4], f32::NEG_INFINITY);
+        assert_eq!(m[3 * 8 + 4], MASK_BLOCKED);
         assert_eq!(m[7 * 8 + 4], 0.0);
+    }
+
+    /// The blocked value survives the GPU plugin's f16 conversion: finite and
+    /// exactly representable.
+    #[test]
+    fn blocked_value_is_finite_in_f16() {
+        let h = half::f16::from_f32(MASK_BLOCKED);
+        assert!(h.is_finite());
+        assert_eq!(f32::from(h), MASK_BLOCKED);
+        assert!(attention_mask(&[[2, 2, 2]]).iter().all(|v| v.is_finite()));
     }
 
     #[test]
