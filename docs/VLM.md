@@ -127,26 +127,28 @@ On the `ov-genai` engine, an export whose `config.json` `model_type` GenAI prepr
 video for gets each video whole: its sampled frames go to GenAI as one `[T, H, W, 3]`
 video, behind `<ov_genai_video_j>` where the caller put it (videos numbered from 0, apart
 from the images), with no per-frame labels. The vision encoder then sees the frames
-together, with their times, and spends far fewer tokens on them:
+together, with their times, and spends far fewer tokens on them. Measured end to end
+through `video_url` on GenAI 2026.4.1 (Windows, x86): a 4 s clip (a red circle for 2 s,
+then a blue square), sampled at 1 fps to 4 frames of 448x448, every frame passed as
+sampled; each model described it correctly.
 
-| `model_type` | native video | prompt tokens, 8 frames of 448x448: native vs frames-as-images |
+| `model_type` (export) | native video | prompt tokens |
 |---|---|---|
-| `qwen3_vl` (Qwen3-VL-4B) | yes | 448 vs 1704 (3.3x faster) |
-| `qwen2_5_vl` (Qwen2.5-VL-7B) | yes | 1077 vs 2195 |
-| `qwen3_5_moe` (Qwen3.6-35B-A3B) | yes | 450 vs 1706 |
-| `gemma4` (Gemma 4 26B-A4B) | yes | 628 vs 2189 |
-| `qwen2_vl`, `qwen3_vl_moe`, `qwen3_5` | yes (GenAI's Qwen video path; not measured here) | |
+| `gemma4` (Gemma 4 26B-A4B) | yes | 336 (as frames: 1117) |
+| `qwen3_vl` (Qwen3-VL-4B) | yes | 447 (as frames: 871) |
+| `qwen3_5_moe` (Qwen3.6-35B-A3B) | yes | 451 |
+| `qwen2_5_vl` (Qwen2.5-VL-7B) | yes | 565 |
+| `qwen2_vl`, `qwen3_5` | yes (GenAI's Qwen video path; not measured) | |
 | `llava_next_video` | yes (in GenAI's video list; untested) | |
-| `internvl_chat`, `llava_next`, and every other type | no: GenAI throws "Video preprocessing isn't implemented for this model" | frames |
+| `internvl_chat` (InternVL2-4B), `llava_next`, every other type | no: GenAI has no video preprocessing for them | as frames (InternVL2-4B: 1117) |
 
-The native numbers above were measured with GenAI choosing its own frames. Cascadia
-passes every sampled frame's index and the sampling rate (`VideoMetadata`), so GenAI uses
-the frames as sampled: on GenAI 2026.4.1, Qwen3-VL left to itself assumes a 24 fps source,
-keeps 4 of 16 frames and stamps them with the wrong times (a 16-frame clip of eight
-colours, two frames each, was answered "orange, blue" without metadata and with all eight
-colours in order with it, at 1655 prompt tokens, through this server's own GenAI shim on
-an M-series Mac). Qwen3-VL and Qwen3.5 then spend about
-196 tokens per pair of 448x448 frames, Qwen2.5-VL about 256.
+Cascadia passes each video's frame indices and sampling rate (`VideoMetadata`), so GenAI
+uses the frames as sampled. Without them, GenAI 2026.4.1 resamples Qwen3-VL's video as if
+it were a 24 fps source, keeping 4 of 16 frames with the wrong times. With them, a
+16-frame clip of eight colours (two frames each) costs Qwen3-VL-4B 1655 prompt tokens and
+is answered with all eight in order, on both GenAI pipelines. Because the indices are
+given, GenAI logs "Frames indices already provided in video metadata, skipping ...
+sampling" once per native video request; that warning is expected.
 
 Qwen's encoder takes frames in pairs and pads an odd count with a copy of the last
 frame, so on the Qwen types an odd frame count is rounded up to the next even one when
