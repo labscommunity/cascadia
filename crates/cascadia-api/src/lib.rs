@@ -2538,6 +2538,16 @@ async fn prepare_media(
                         video_index += 1;
                         let input = video::video_input(frames)
                             .ok_or_else(|| format!("video {j}: its frames differ in size"))?;
+                        let min = decode_cfg.video_min_side;
+                        if input.width.min(input.height) < min {
+                            return Err(format!(
+                                "video {j}: its frames are {}x{} after scaling; this model's \
+                                 video encoder needs at least {min} pixels a side (send a \
+                                 larger video, `detail` other than \"low\", or its frames as \
+                                 `image_url` parts)",
+                                input.width, input.height
+                            ));
+                        }
                         inputs.push(input);
                         pieces.push((true, decode_cfg.video_tag(j)));
                     }

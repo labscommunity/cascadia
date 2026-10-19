@@ -127,6 +127,11 @@ pub struct MediaConfig {
     /// frames in pairs and pads an odd count with a copy of the last frame,
     /// so the extra frame costs nothing and shows the model one more moment.
     pub video_frame_multiple: usize,
+    /// A native video's frames must be at least this many pixels a side
+    /// (0: no bound). Qwen3-VL / Qwen3.5's video processor refuses a frame
+    /// under its 32 px resize factor; the API answers that with a 400 before
+    /// the engine is reached.
+    pub video_min_side: u32,
 }
 
 /// Bytes a `data:` URL needs to carry `raw` bytes base64-encoded, plus room
@@ -213,20 +218,18 @@ const GENAI_NATIVE_VIDEO: &[(&str, usize)] = &[
 /// renders for a video, which rank 0 expands as HF's processor does) and the
 /// frame multiple (Qwen's temporal patch is two frames). Every other family
 /// on a staged engine gets a video as labelled frames.
-const STAGED_NATIVE_VIDEO: &[(&str, &str, usize)] = &[
-    (
-        "qwen2_5_vl",
-        "<|vision_start|><|video_pad|><|vision_end|>",
-        2,
-    ),
-    ("qwen3_vl", "<|vision_start|><|video_pad|><|vision_end|>", 2),
-    ("qwen3_5", "<|vision_start|><|video_pad|><|vision_end|>", 2),
-    (
-        "qwen3_5_moe",
-        "<|vision_start|><|video_pad|><|vision_end|>",
-        2,
-    ),
+/// The last field is the smallest frame side the family's video processor
+/// takes (Qwen3-VL / Qwen3.5: their 32 px factor; Qwen2.5-VL scales any frame
+/// up).
+const STAGED_NATIVE_VIDEO: &[(&str, &str, usize, u32)] = &[
+    ("qwen2_5_vl", QWEN_VIDEO_TAG, 2, 0),
+    ("qwen3_vl", QWEN_VIDEO_TAG, 2, 32),
+    ("qwen3_5", QWEN_VIDEO_TAG, 2, 32),
+    ("qwen3_5_moe", QWEN_VIDEO_TAG, 2, 32),
 ];
+
+/// The video tag HF's Qwen chat templates render.
+const QWEN_VIDEO_TAG: &str = "<|vision_start|><|video_pad|><|vision_end|>";
 
 /// The text an ov-genai export must refuse in caller messages: the universal
 /// tags plus `model_type`'s native ones, or every known native tag when the
@@ -288,6 +291,7 @@ impl MediaConfig {
             native_video: native.is_some(),
             video_placeholder: "<ov_genai_video_{i}>".into(),
             video_frame_multiple: native.map_or(1, |&(_, m)| m),
+            video_min_side: 0,
         }
     }
 
@@ -295,11 +299,13 @@ impl MediaConfig {
     /// vision tree's family) when its rank 0 takes video whole
     /// ([`STAGED_NATIVE_VIDEO`]); any other family keeps video as frames.
     pub fn staged_native_video(mut self, family: &str) -> Self {
-        if let Some(&(_, tag, multiple)) = STAGED_NATIVE_VIDEO.iter().find(|(f, _, _)| *f == family)
+        if let Some(&(_, tag, multiple, min_side)) =
+            STAGED_NATIVE_VIDEO.iter().find(|(f, ..)| *f == family)
         {
             self.native_video = true;
             self.video_placeholder = tag.into();
             self.video_frame_multiple = multiple;
+            self.video_min_side = min_side;
         }
         self
     }
@@ -1411,6 +1417,8 @@ mod tests {
                 cfg.video_tag(3),
                 "<|vision_start|><|video_pad|><|vision_end|>"
             );
+            let min = if f == "qwen2_5_vl" { 0 } else { 32 };
+            assert_eq!(cfg.video_min_side, min, "{f}");
         }
         for f in ["qwen3_vl_moe", "gemma4", "pixtral", ""] {
             let cfg = MediaConfig::qwen35_native().staged_native_video(f);

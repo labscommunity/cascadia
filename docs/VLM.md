@@ -168,7 +168,9 @@ video costs about half the tokens of its frames as images, with no `Frame k` lab
 - Qwen3-VL and Qwen3.5 write each frame pair as `<t seconds>` and its tokens (`t` the
   pair's mean time), size frames with their video processor's budget over all frames
   (`video_preprocessor_config.json`, which the cut copies) and position each pair as its
-  own grid.
+  own grid. Their video processor refuses a frame under 32 px a side, so a video whose
+  frames scale below that (a tiny clip, or `detail: "low"` on a very wide one) is a
+  `400` naming the bound; send its frames as `image_url` parts instead.
 - Qwen2.5-VL writes one run of tokens and puts pair `k` at time position
   `floor(k * 2 / sampled fps * tokens_per_second)`, the next text one past the video's
   last position: Qwen's original `get_rope_index`, which the model was trained with
