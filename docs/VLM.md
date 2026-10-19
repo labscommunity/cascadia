@@ -224,8 +224,15 @@ target, `sparse-moe`, `ov-genai` on a text-only export, any tree without a `visi
 block. `ov-dist-spec` refuses a Gemma 4 target tree at load. Not supported:
 
 - **Pixtral on `ov-genai`.** GenAI 2026.4.1 preprocesses Pixtral as LLaVA-1.5 and
-  describes a different picture; `ov-genai` serves such an export as text only. Use
-  `ov-runtime` (a one-stage tree runs on one box).
+  describes a different picture; `ov-genai` serves such an export as text only, and the
+  `400` that refuses an image names the alternative. Use `ov-runtime` on a one-stage
+  tree, which runs on one box:
+
+  ```bash
+  python tools/vlm_surgery/cut_vlm_lm.py --model <OpenVINO/pixtral-12b-int4-ov dir> \
+      --output-dir <tree> --num-stages 1 --family pixtral
+  cascadia worker --total 1 --rank 0 --engine ov-runtime --model <tree> --api 127.0.0.1:8099
+  ```
 - **Llama 3.2 Vision** (`mllama`), refused at export: its text tower has cross-attention.
 - **MiniCPM-V 4.7**: GenAI 2026.4.1 does not know its model type (`minicpmv4_7`) and the
   engine fails to load.
