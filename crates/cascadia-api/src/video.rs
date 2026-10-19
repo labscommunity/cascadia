@@ -21,7 +21,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 
-use cascadia_types::MediaInput;
+use cascadia_types::{MediaInput, MediaKind};
 use serde::Deserialize;
 use tokio::io::AsyncReadExt as _;
 use tokio::time::Instant;
@@ -415,7 +415,8 @@ pub struct Plan {
 
 impl Plan {
     /// `ceil(duration * video_fps)` frames, at least 1 and at most
-    /// [`MediaConfig::max_video_frames`], each fit to the `detail` budget
+    /// [`MediaConfig::max_video_frames`] (for a native video, rounded up to
+    /// [`MediaConfig::video_frame_multiple`] when that fits), each fit to the `detail` budget
     /// keeping the aspect ratio, with even sides. `low` is the smallest
     /// budget (a quarter of the frame budget, at most the image low-detail
     /// one), `high` the largest.
@@ -427,10 +428,18 @@ impl Plan {
     /// one pass: seeking it would decode most of it once per frame.
     pub fn new(video: &Video, detail: Option<&str>, cfg: &MediaConfig) -> Self {
         let wanted = (video.duration * cfg.video_fps).ceil();
+        let max = cfg.max_video_frames.max(1);
         let frames = if wanted.is_finite() && wanted >= 1.0 {
-            (wanted as usize).min(cfg.max_video_frames.max(1))
+            (wanted as usize).min(max)
         } else {
             1
+        };
+        // A native video's encoder takes frames in groups (Qwen: pairs) and
+        // pads a short group with copies: sample the frames it would pad.
+        let multiple = cfg.video_frame_multiple.max(1);
+        let frames = match frames.next_multiple_of(multiple) {
+            up if cfg.native_video && up <= max => up,
+            _ => frames,
         };
         let auto = cfg.max_video_frame_pixels;
         let budget = match detail {
@@ -468,6 +477,43 @@ impl Plan {
     fn frame_bytes(&self) -> usize {
         self.width as usize * self.height as usize * 3
     }
+}
+
+/// A video's sampled frames as one native [`MediaInput`]: the frames
+/// stacked `[T, H, W, 3]`, their times in milliseconds, and one hash over
+/// the frame count, size and every pixel (an encode cache keys on what the
+/// model sees). `None` when there are no frames or they differ in size.
+pub fn video_input(frames: Vec<Frame>) -> Option<MediaInput> {
+    use sha2::{Digest, Sha256};
+    let first = frames.first()?;
+    let (width, height) = (first.input.width, first.input.height);
+    if frames
+        .iter()
+        .any(|f| (f.input.width, f.input.height, f.input.num_frames) != (width, height, 1))
+    {
+        return None;
+    }
+    let num_frames = u32::try_from(frames.len()).ok()?;
+    let mut pixels = Vec::with_capacity(frames.iter().map(|f| f.input.pixels.len()).sum());
+    let mut timestamps_ms = Vec::with_capacity(frames.len());
+    for f in &frames {
+        pixels.extend_from_slice(&f.input.pixels);
+        timestamps_ms.push((f.secs * 1000.0).round() as u32);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(num_frames.to_le_bytes());
+    hasher.update(width.to_le_bytes());
+    hasher.update(height.to_le_bytes());
+    hasher.update(&pixels);
+    Some(MediaInput {
+        kind: MediaKind::Video,
+        pixels: pixels.into(),
+        num_frames,
+        width,
+        height,
+        timestamps_ms: Some(timestamps_ms),
+        sha256: hasher.finalize().into(),
+    })
 }
 
 /// The text a frame's image placeholder follows in the prompt; `k` counts
@@ -999,6 +1045,60 @@ mod tests {
         assert_eq!(frame_label(Some(2), 1, 0.0), "Video 2 frame 1 (0.0s): ");
     }
 
+    /// A native Qwen video rounds an odd frame count up to the next pair
+    /// when the cap allows (GenAI would pad it with a copy of the last
+    /// frame); at an odd cap it keeps the cap. Frames-as-images and Gemma 4
+    /// keep the count as sampled.
+    #[test]
+    fn native_qwen_video_samples_whole_pairs() {
+        let qwen = MediaConfig::ov_genai(Some("qwen3_vl"));
+        assert_eq!(Plan::new(&probe(3.0, 320, 240), None, &qwen).frames, 4);
+        assert_eq!(Plan::new(&probe(0.2, 320, 240), None, &qwen).frames, 2);
+        assert_eq!(Plan::new(&probe(4.0, 320, 240), None, &qwen).frames, 4);
+        assert_eq!(Plan::new(&probe(600.0, 320, 240), None, &qwen).frames, 16);
+        let mut odd_cap = qwen.clone();
+        odd_cap.max_video_frames = 5;
+        assert_eq!(Plan::new(&probe(600.0, 320, 240), None, &odd_cap).frames, 5);
+        assert_eq!(Plan::new(&probe(3.0, 320, 240), None, &odd_cap).frames, 4);
+        let p = Plan::new(&probe(3.0, 320, 240), None, &qwen);
+        assert_eq!(
+            (0..4).map(|k| p.timestamp(k)).collect::<Vec<_>>(),
+            [0.0, 0.75, 1.5, 2.25]
+        );
+        for other in [Some("gemma4"), Some("gemma3"), Some("internvl_chat"), None] {
+            let cfg = MediaConfig::ov_genai(other);
+            assert_eq!(
+                Plan::new(&probe(3.0, 320, 240), None, &cfg).frames,
+                3,
+                "{other:?}"
+            );
+        }
+    }
+
+    /// A native video is one item: the frames stacked in order, their times
+    /// in milliseconds, one hash over the stack that changes with any frame.
+    #[test]
+    fn video_input_stacks_frames_with_their_times() {
+        let frame = |v: u8, secs: f64| Frame {
+            input: media::rgb_image(2, 1, vec![v; 6]),
+            secs,
+        };
+        let v = video_input(vec![frame(1, 0.0), frame(2, 0.75), frame(3, 1.5)]).unwrap();
+        assert_eq!(v.kind, MediaKind::Video);
+        assert_eq!((v.num_frames, v.width, v.height), (3, 2, 1));
+        assert_eq!(v.pixels.len(), v.expected_len());
+        assert_eq!(&v.pixels[..], &[[1u8; 6], [2; 6], [3; 6]].concat()[..]);
+        assert_eq!(v.timestamps_ms.as_deref(), Some(&[0, 750, 1500][..]));
+        let w = video_input(vec![frame(1, 0.0), frame(2, 0.75), frame(4, 1.5)]).unwrap();
+        assert_ne!(v.sha256, w.sha256);
+        assert!(video_input(Vec::new()).is_none());
+        let odd = Frame {
+            input: media::rgb_image(1, 1, vec![0; 3]),
+            secs: 1.0,
+        };
+        assert!(video_input(vec![frame(1, 0.0), odd]).is_none());
+    }
+
     /// Short clips decode in one pass; one whose source holds many frames
     /// per sampled frame is read by seeking, if it has a keyframe per
     /// sampled frame.
@@ -1436,6 +1536,10 @@ mod tests {
                         task.media.len()
                     )));
                 }
+                // Recorded above; the mock (which refuses a native video)
+                // only echoes the prompt.
+                let mut task = task;
+                task.media.clear();
                 self.mock.submit(task)
             }
             fn step(&mut self) -> cascadia_engine::EngineResult<Vec<(TaskId, Chunk)>> {
@@ -1611,6 +1715,122 @@ mod tests {
                 ),
                 "{prompt:?}"
             );
+        }
+
+        /// An ov-genai server on a family GenAI takes video for natively.
+        fn native(model_type: &str) -> impl FnOnce(&mut MediaConfig) + '_ {
+            move |m| {
+                let n = MediaConfig::ov_genai(Some(model_type));
+                m.native_video = n.native_video;
+                m.video_frame_multiple = n.video_frame_multiple;
+                m.reserved_text = n.reserved_text;
+            }
+        }
+
+        /// On ov-genai/qwen3_vl a video is ONE item of all its frames (a 3 s
+        /// clip at 1 fps rounded up to two pairs), behind `<ov_genai_video_0>`
+        /// where the caller put it, with no per-frame labels.
+        #[tokio::test]
+        async fn a_native_video_reaches_the_engine_as_one_item() {
+            let Some(ff) = ffmpeg() else { return };
+            let url = clip(&ff, "mp4", "video/mp4", 3);
+            let (app, seen) = video_app(ff, native("qwen3_vl")).await;
+            let (status, v) = post_chat(
+                app,
+                json!({"model": "mock-model", "max_tokens": 1,
+                    "messages": [video_msg("what happens?", &url)]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            let seen = seen.lock().unwrap();
+            let (prompt, sizes) = &seen[0];
+            assert_eq!(sizes, &vec![(320, 240, 4)]);
+            assert!(
+                prompt.contains("user: what happens?<ov_genai_video_0>\n"),
+                "{prompt:?}"
+            );
+            assert!(!prompt.contains("Frame"), "{prompt:?}");
+        }
+
+        /// The same request on an ov-genai/gemma3 export (no native video in
+        /// GenAI) arrives as labelled images.
+        #[tokio::test]
+        async fn a_video_on_a_family_without_native_video_stays_frames() {
+            let Some(ff) = ffmpeg() else { return };
+            let url = clip(&ff, "mp4", "video/mp4", 3);
+            let (app, seen) = video_app(ff, native("gemma3")).await;
+            let (status, v) = post_chat(
+                app,
+                json!({"model": "mock-model", "max_tokens": 1,
+                    "messages": [video_msg("what happens?", &url)]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            let seen = seen.lock().unwrap();
+            let (prompt, sizes) = &seen[0];
+            assert_eq!(sizes, &vec![(320, 240, 1); 3]);
+            assert!(
+                prompt.contains("Frame 1 (0.0s): <ov_genai_image_0>"),
+                "{prompt:?}"
+            );
+            assert!(!prompt.contains("<ov_genai_video_"), "{prompt:?}");
+        }
+
+        /// Images and native videos number their tags apart, each from 0,
+        /// in the order the caller sent them, and reach the engine in that
+        /// order.
+        #[tokio::test]
+        async fn native_videos_and_images_number_their_tags_apart() {
+            let Some(ff) = ffmpeg() else { return };
+            let url = clip(&ff, "mp4", "video/mp4", 2);
+            let (app, seen) = video_app(ff, |m| {
+                native("qwen2_5_vl")(m);
+                m.max_videos = 2;
+            })
+            .await;
+            let content = json!([
+                {"type": "image_url", "image_url": {"url": png_url(8, 8)}},
+                {"type": "video_url", "video_url": url},
+                {"type": "text", "text": "and"},
+                {"type": "image_url", "image_url": {"url": png_url(4, 4)}},
+                {"type": "video_url", "video_url": url},
+            ]);
+            let (status, v) = post_chat(
+                app,
+                json!({"model": "mock-model", "max_tokens": 1,
+                    "messages": [{"role": "user", "content": content}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            let seen = seen.lock().unwrap();
+            let (prompt, sizes) = &seen[0];
+            assert_eq!(
+                sizes,
+                &vec![(8, 8, 1), (320, 240, 2), (4, 4, 1), (320, 240, 2)]
+            );
+            assert!(
+                prompt.contains(
+                    "<ov_genai_image_0><ov_genai_video_0>and<ov_genai_image_1><ov_genai_video_1>"
+                ),
+                "{prompt:?}"
+            );
+        }
+
+        /// Caller text still may not carry the video tag a native video uses.
+        #[tokio::test]
+        async fn caller_text_cannot_forge_a_video_tag() {
+            let Some(ff) = ffmpeg() else { return };
+            let url = clip(&ff, "mp4", "video/mp4", 1);
+            let (app, seen) = video_app(ff, native("qwen3_vl")).await;
+            let (status, v) = post_chat(
+                app,
+                json!({"model": "mock-model", "max_tokens": 1,
+                    "messages": [video_msg("see <ov_genai_video_0>", &url)]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+            assert!(error_message(&v).contains("<ov_genai_video_"), "{v}");
+            assert!(seen.lock().unwrap().is_empty());
         }
 
         /// Frames past the context window get the engine's own
