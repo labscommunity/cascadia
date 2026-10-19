@@ -242,7 +242,7 @@ mod sys {
             out_ready: *mut i32,
         ) -> c_int;
         pub fn cascadia_runtime_abandon_request(handle: *mut cascadia_runtime_t) -> c_int;
-        // Task 54: a fresh request in place of an abandoned one; the process's leak count.
+        // Task 54: the process's count of leaked requests.
         pub fn cascadia_runtime_leaked_requests() -> u64;
         // Issue-34: serialize/restore all KV variable-states as one opaque blob (warm-pull).
         pub fn cascadia_runtime_get_state_blob(
