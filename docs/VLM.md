@@ -92,7 +92,7 @@ and in `/v1/responses` OpenRouter's `{"type": "input_video", "video_url": "data:
   `--api-max-video-frame-pixels` (default 448x448), `"low"` to a quarter of that (224x224,
   never more than the image low-detail budget), the smallest; `"high"` to the larger of that
   and the image budget (about 1 MP). Aspect ratio is kept.
-- Each frame costs one image's tokens on that family: Gemma 3, 256 per frame plus its
+- As frames, each costs one image's tokens on that family: Gemma 3, 256 per frame plus its
   markers (16 frames are over 4 K tokens); Qwen3-VL and Qwen3.5 (16x16 patches), about 196
   for a 448x448 frame; Qwen2.5-VL (14x14 patches), about 256. A video that does not fit the
   context gets the usual `413` `context_length_exceeded`.
@@ -119,8 +119,42 @@ and in `/v1/responses` OpenRouter's `{"type": "input_video", "video_url": "data:
   as a subprocess on a private temp file (removed afterwards), restricted to local files,
   with the container forced. Without ffmpeg a video part is a `400` naming `--api-ffmpeg`,
   and `/v1/models` does not list `video`.
-- This is frames only. Native temporal video (Qwen's video path, GenAI's video input) is a
-  later phase.
+- Everything above holds on every engine; what differs is how the frames reach the model.
+
+### Native video (ov-genai)
+
+On the `ov-genai` engine, an export whose `config.json` `model_type` GenAI preprocesses
+video for gets each video whole: its sampled frames go to GenAI as one `[T, H, W, 3]`
+video, behind `<ov_genai_video_j>` where the caller put it (videos numbered from 0, apart
+from the images), with no per-frame labels. The vision encoder then sees the frames
+together, with their times, and spends far fewer tokens on them:
+
+| `model_type` | native video | prompt tokens, 8 frames of 448x448: native vs frames-as-images |
+|---|---|---|
+| `qwen3_vl` (Qwen3-VL-4B) | yes | 448 vs 1704 (3.3x faster) |
+| `qwen2_5_vl` (Qwen2.5-VL-7B) | yes | 1077 vs 2195 |
+| `qwen3_5_moe` (Qwen3.6-35B-A3B) | yes | 450 vs 1706 |
+| `gemma4` (Gemma 4 26B-A4B) | yes | 628 vs 2189 |
+| `qwen2_vl`, `qwen3_vl_moe`, `qwen3_5` | yes (GenAI's Qwen video path; not measured here) | |
+| `llava_next_video` | yes (in GenAI's video list; untested) | |
+| `internvl_chat`, `llava_next`, and every other type | no: GenAI throws "Video preprocessing isn't implemented for this model" | frames |
+
+The native numbers above were measured with GenAI choosing its own frames. Cascadia
+passes every sampled frame's index and the sampling rate (`VideoMetadata`), so GenAI uses
+the frames as sampled: on GenAI 2026.4.1, Qwen3-VL left to itself assumes a 24 fps source,
+keeps 4 of 16 frames and stamps them with the wrong times (a 16-frame clip of eight
+colours, two frames each, was answered "orange, blue" without metadata and with all eight
+colours in order with it, at 1655 prompt tokens, through this server's own GenAI shim on
+an M-series Mac). Qwen3-VL and Qwen3.5 then spend about
+196 tokens per pair of 448x448 frames, Qwen2.5-VL about 256.
+
+Qwen's encoder takes frames in pairs and pads an odd count with a copy of the last
+frame, so on the Qwen types an odd frame count is rounded up to the next even one when
+`--api-max-video-frames` allows (a 3 s clip at 1 fps gives 4 frames, at 0, 0.75, 1.5 and
+2.25 s): the extra frame costs nothing. The other limits and flags are the ones above;
+there is no separate native frame cap (16 frames are 8 Qwen pairs, about 1600 tokens at
+448x448). Every other engine (`ov-runtime`, `gemma4`, `qwen35`, `ov-dist-spec`) and every
+other export takes video as labelled frames. Requests are the same either way.
 
 ## What takes images
 
