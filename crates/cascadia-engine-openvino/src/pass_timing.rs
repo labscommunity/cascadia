@@ -16,7 +16,9 @@ pub(crate) struct PassTiming {
     pub span_max: usize,
     /// Pop to prefill start: scrub, probe, restore, refusals, snapshot planning.
     pub admit: Duration,
-    /// The admission's own `reset_all` (a cold pass's cheap reset), inside `admit`.
+    /// The admission's own `reset_all`, inside `admit`: a cold pass's reset, which after a
+    /// decision pass is the scrub that pass deferred (a recreate after a warm pass, Task 55).
+    /// Zero on a warm hit.
     pub admit_reset: Duration,
     /// The whole restore, priming fold included (what `qwen35 prefix-cache hit` logs).
     pub restore: Duration,
@@ -29,8 +31,10 @@ pub(crate) struct PassTiming {
     /// `set_input` (with the LE conversions) plus `output()` and `f32_from_le`, all stages.
     pub host_copy: Duration,
     pub head: Duration,
-    /// The latest `reset_all` of this pass: the finish's, once the head has run.
+    /// The latest `reset_all` of this pass. Since Task 55 the single-box finish defers its scrub
+    /// to the next admission, so this is the admission's own (`admit_reset`): zero on a warm hit.
     pub reset: Duration,
+    /// That reset recreated the requests (they held a restored state). False on a warm hit.
     pub recreate: bool,
     pub total: Duration,
 }
