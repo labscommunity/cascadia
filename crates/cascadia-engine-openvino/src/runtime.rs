@@ -627,9 +627,19 @@ fn packed_prompt_too_long(prompt_tokens: usize, region: usize) -> Option<String>
     })
 }
 
-/// Encode a packed step's per-row assignment as one framed I64 `[1, 3, S]`
+/// Row tag of a packed plan frame, one per column: the frame layout's version
+/// plus whether the sender's tree masks image blocks. A peer that does not
+/// write it is an older build.
+const PLAN_TAG_TEXT: i64 = 0x504B_0002;
+const PLAN_TAG_IMAGES: i64 = 0x504B_0102;
+/// Rows of a plan frame: slot, position, reuse, image id, tag.
+const PLAN_ROWS: usize = 5;
+
+/// Encode a packed step's per-row assignment as one framed I64 `[1, 5, S]`
 /// tensor: row 0 slot ids (`-1` = idle row), row 1 absolute positions, row 2
-/// the shared-prefix reuse length. The packed analogue of
+/// the shared-prefix reuse length, row 3 the row's image id (`-1` for text and
+/// idle rows, and on every tree without image blocks), row 4 the frame tag
+/// ([`PLAN_TAG_TEXT`] / [`PLAN_TAG_IMAGES`]). The packed analogue of
 /// `encode_wire_position` — downstream stages need per-ROW routing, not one
 /// scalar, to rebuild the mask and scatter each row into the right slot's ring.
 ///
@@ -637,19 +647,22 @@ fn packed_prompt_too_long(prompt_tokens: usize, region: usize) -> Option<String>
 /// match against the prefix cache, but EVERY stage has to open the same shared
 /// columns or its attention would disagree with stage 0's.
 ///
-/// A tree whose masks open image blocks (Gemma 4) sends `images` too, as a
-/// fourth row (`[1, 4, S]`: the row's image id, `-1` for text and idle rows),
-/// because only rank 0 knows where the images are. The row count is the
-/// version: a peer built before image blocks rejects a 4-row frame as not a
-/// plan, and a Gemma stage rejects a 3-row one, so mixed versions fail loudly
-/// instead of masking differently. Without `images` the frame is unchanged.
+/// A tree whose masks open image blocks (Gemma 4) sends `images`, because only
+/// rank 0 knows where the images are; the tag says it did, so a stage of the
+/// other kind refuses the frame instead of masking differently.
+///
+/// `S` is the plan's own width: `packed_seq` for a prefill chunk, the live
+/// rows only for a decode step. Builds from before that sent every frame
+/// `packed_seq` rows wide in a 3- or 4-row frame without the tag, which an
+/// older relay would mis-read once narrower; the 5-row tagged layout makes
+/// each side refuse the other's frames instead (an older peer finds a frame of
+/// the wrong shape, this build names the older upstream).
 fn encode_wire_plan(
     rows: &[crate::packed_exec::WireRowOpt],
     images: Option<&[Option<u32>]>,
 ) -> WireTensor {
     let s = rows.len();
-    let n_rows = if images.is_some() { 4 } else { 3 };
-    let mut data = Vec::with_capacity(s * n_rows * 8);
+    let mut data = Vec::with_capacity(s * PLAN_ROWS * 8);
     for r in rows {
         let slot: i64 = r.map(|(sl, _, _)| sl as i64).unwrap_or(-1);
         data.extend_from_slice(&slot.to_le_bytes());
@@ -662,16 +675,22 @@ fn encode_wire_plan(
         let sh: i64 = r.map(|(_, _, sh)| sh as i64).unwrap_or(0);
         data.extend_from_slice(&sh.to_le_bytes());
     }
-    if let Some(images) = images {
-        for (i, r) in rows.iter().enumerate() {
-            let img: i64 = match (r, images.get(i).copied().flatten()) {
-                (Some(_), Some(id)) => id as i64,
-                _ => -1,
-            };
-            data.extend_from_slice(&img.to_le_bytes());
-        }
+    for (i, r) in rows.iter().enumerate() {
+        let img: i64 = match (r, images.and_then(|im| im.get(i).copied().flatten())) {
+            (Some(_), Some(id)) => id as i64,
+            _ => -1,
+        };
+        data.extend_from_slice(&img.to_le_bytes());
     }
-    WireTensor::new(WireDType::I64, [1, n_rows as u32, s as u32], data)
+    let tag = if images.is_some() {
+        PLAN_TAG_IMAGES
+    } else {
+        PLAN_TAG_TEXT
+    };
+    for _ in rows {
+        data.extend_from_slice(&tag.to_le_bytes());
+    }
+    WireTensor::new(WireDType::I64, [1, PLAN_ROWS as u32, s as u32], data)
 }
 
 /// Decode + validate a packed plan frame. Rejects a wrong dtype/rank, a
@@ -685,43 +704,33 @@ fn decode_wire_plan(
     decode_wire_plan_images(t, slots, false).map(|(rows, _)| rows)
 }
 
-/// [`decode_wire_plan`] for either frame version: `want_images` (this stage
-/// masks image blocks) requires the 4-row frame and returns its per-row image
-/// ids; otherwise the 3-row frame and an empty id list.
+/// [`decode_wire_plan`] for either tree kind: `want_images` (this stage masks
+/// image blocks) requires an image-tagged frame and returns its per-row image
+/// ids; otherwise a text-tagged frame and an empty id list. An untagged 3- or
+/// 4-row frame comes from an older build and is refused by name.
 fn decode_wire_plan_images(
     t: &WireTensor,
     slots: usize,
     want_images: bool,
 ) -> EngineResult<(Vec<crate::packed_exec::WireRowOpt>, Vec<Option<u32>>)> {
     let s = t.shape[2] as usize;
-    let n_rows = if want_images { 4 } else { 3 };
-    let other_version = if want_images { 3 } else { 4 };
-    if t.dtype == WireDType::I64 && t.shape[0] == 1 && s > 0 && t.shape[1] == other_version {
-        let (this, peer) = if want_images {
-            (
-                "masks image blocks (a token_type_ids vision tree)",
-                "an upstream built before packed image blocks",
-            )
-        } else {
-            (
-                "does not mask image blocks",
-                "an upstream serving a token_type_ids vision tree",
-            )
-        };
+    if t.dtype == WireDType::I64 && t.shape[0] == 1 && s > 0 && matches!(t.shape[1], 3 | 4) {
         return Err(EngineError::Backend(format!(
-            "packed plan frame has {} rows but this stage {this} and needs {n_rows}: likely \
-             {peer}; run the same build and tree on every stage",
+            "packed plan frame has {} rows and no version tag: the upstream stage runs an \
+             older build (before narrow decode frames); stages run different builds, run the \
+             same build on every stage",
             t.shape[1]
         )));
     }
-    if t.dtype != WireDType::I64 || t.shape[0] != 1 || t.shape[1] as usize != n_rows || s == 0 {
+    if t.dtype != WireDType::I64 || t.shape[0] != 1 || t.shape[1] as usize != PLAN_ROWS || s == 0 {
         return Err(EngineError::Backend(format!(
-            "expected an I64 [1,{n_rows},S] packed plan frame, got dtype={:?} shape={:?} — likely a \
-             packed/non-packed pipeline mismatch or a desynced activation stream",
+            "expected an I64 [1,{PLAN_ROWS},S] packed plan frame, got dtype={:?} shape={:?} — \
+             likely a packed/non-packed pipeline mismatch, stages running different builds, or \
+             a desynced activation stream",
             t.dtype, t.shape
         )));
     }
-    if t.data.len() != s * n_rows * 8 {
+    if t.data.len() != s * PLAN_ROWS * 8 {
         return Err(EngineError::Backend(format!(
             "packed plan frame payload {} bytes does not match shape {:?}",
             t.data.len(),
@@ -733,6 +742,32 @@ fn decode_wire_plan_images(
         b.copy_from_slice(&t.data[i * 8..i * 8 + 8]);
         i64::from_le_bytes(b)
     };
+    let tag = rd(4 * s);
+    if (0..s).any(|r| rd(4 * s + r) != tag) || !matches!(tag, PLAN_TAG_TEXT | PLAN_TAG_IMAGES) {
+        return Err(EngineError::Backend(format!(
+            "packed plan frame has an unknown version tag {tag:#x}: stages run different \
+             builds, run the same build on every stage"
+        )));
+    }
+    let sent_images = tag == PLAN_TAG_IMAGES;
+    if sent_images != want_images {
+        let (this, peer) = if want_images {
+            (
+                "masks image blocks (a token_type_ids vision tree)",
+                "an upstream serving a tree without image blocks",
+            )
+        } else {
+            (
+                "does not mask image blocks",
+                "an upstream serving a token_type_ids vision tree",
+            )
+        };
+        return Err(EngineError::Backend(format!(
+            "packed plan frame {} image ids but this stage {this}: likely {peer}; run the same \
+             build and tree on every stage",
+            if sent_images { "carries" } else { "carries no" }
+        )));
+    }
     let mut out = Vec::with_capacity(s);
     let mut images = Vec::with_capacity(if want_images { s } else { 0 });
     for r in 0..s {
@@ -7221,6 +7256,14 @@ impl Builder for OvRuntimeBuilder {
                         (false, None) => format!("{pseq} (no narrow decode IR)"),
                     }
                 )));
+                if self.device.to_ascii_uppercase().contains("GPU") {
+                    let msg =
+                        "packed slots on an Intel GPU are known to give wrong output (garbage \
+                               or non-finite logits) while the static path there is correct; \
+                               see docs/perf/NPU_PACKED_SLOTS.md";
+                    warn!("{msg}");
+                    events.push(LoadProgress::message(format!("WARNING: {msg}")));
+                }
                 self.packed_masks = stage_cfg.packed_masks.clone();
                 self.packed_window = stage_cfg.packed_sliding_window;
                 self.packed_dynamic = dynamic;
@@ -8024,7 +8067,7 @@ impl Builder for OvRuntimeBuilder {
                     ));
                 }
                 let mut state = crate::packed_exec::PackedState::new(
-                    prt,
+                    Box::new(prt),
                     kv,
                     players,
                     ids_in,
@@ -8079,9 +8122,19 @@ impl Builder for OvRuntimeBuilder {
                             nxml.display()
                         )));
                     }
-                    info!(decode_seq = d, "packed narrow decode IR active");
+                    // A second compiled model: its own resident copy of the
+                    // stage weights. Say so, with the size, so an OOM on a
+                    // big tree has a hint.
+                    let weights_mb = std::fs::metadata(nxml.with_extension("bin"))
+                        .map_or(0, |m| m.len() / 1_000_000);
+                    info!(
+                        decode_seq = d,
+                        weights_mb,
+                        "packed narrow decode IR active: a second compiled copy of the stage \
+                         weights (about {weights_mb} MB on disk) is resident beside the wide IR"
+                    );
                     state.narrow = Some(crate::packed_exec::PackedNarrow {
-                        runtime: nrt,
+                        runtime: Box::new(nrt),
                         layers: nlayers,
                         seq: d as usize,
                     });
@@ -8501,7 +8554,7 @@ mod tests {
             Some((1, 129, 40)),
         ];
         let frame = encode_wire_plan(&rows, None);
-        assert_eq!(frame.shape, [1, 3, 4]);
+        assert_eq!(frame.shape, [1, 5, 4]);
         let back = decode_wire_plan(&frame, 4).expect("round trip");
         assert_eq!(back, rows);
     }
@@ -8519,10 +8572,15 @@ mod tests {
         let mut bad = encode_wire_plan(&[Some((0usize, 1i64, 0usize))], None);
         bad.data[8..16].copy_from_slice(&(-3i64).to_le_bytes());
         assert!(decode_wire_plan(&bad, 4).is_err());
+        // a corrupted tag is not a frame of any build
+        let mut bad = encode_wire_plan(&[Some((0usize, 1i64, 0usize))], None);
+        bad.data[32..40].copy_from_slice(&7i64.to_le_bytes());
+        let err = decode_wire_plan(&bad, 4).unwrap_err().to_string();
+        assert!(err.contains("different builds"), "{err}");
     }
 
-    /// Gemma 4's plan frame carries each row's image id as a fourth row; it
-    /// round-trips, and idle rows decode as text.
+    /// Gemma 4's plan frame carries each row's image id; it round-trips, and
+    /// idle rows decode as text.
     #[test]
     fn packed_plan_frame_round_trips_image_ids() {
         let rows = vec![
@@ -8533,46 +8591,64 @@ mod tests {
         ];
         let images = vec![None, Some(0u32), Some(7), Some(2)];
         let frame = encode_wire_plan(&rows, Some(&images));
-        assert_eq!(frame.shape, [1, 4, 4]);
+        assert_eq!(frame.shape, [1, 5, 4]);
         let (back, back_images) = decode_wire_plan_images(&frame, 4, true).expect("round trip");
         assert_eq!(back, rows);
         // the idle row's id is not sent
         assert_eq!(back_images, vec![None, Some(0), None, Some(2)]);
-        // without image ids the frame is exactly the old one
-        assert_eq!(encode_wire_plan(&rows, None).data, {
-            let mut f = encode_wire_plan(&rows, Some(&images)).data;
-            f.truncate(3 * 4 * 8);
-            f
-        });
     }
 
-    /// Mixed versions fail loudly instead of masking differently: a stage that
-    /// masks image blocks refuses the 3-row frame, every other stage (and any
-    /// peer built before image blocks) refuses the 4-row one.
+    /// Tree kinds do not mix: a stage that masks image blocks refuses a text
+    /// frame, every other stage refuses an image frame.
     #[test]
     fn packed_plan_frame_versions_do_not_mix() {
         let rows = vec![Some((0usize, 3i64, 0usize))];
-        let old = encode_wire_plan(&rows, None);
-        let new = encode_wire_plan(&rows, Some(&[Some(0)]));
-        let err = decode_wire_plan_images(&old, 2, true)
+        let text = encode_wire_plan(&rows, None);
+        let image = encode_wire_plan(&rows, Some(&[Some(0)]));
+        let err = decode_wire_plan_images(&text, 2, true)
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("masks image blocks") && err.contains("3 rows"),
-            "{err}"
-        );
-        let err = decode_wire_plan_images(&new, 2, false)
+        assert!(err.contains("masks image blocks"), "{err}");
+        let err = decode_wire_plan_images(&image, 2, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("does not mask image blocks"), "{err}");
-        assert!(
-            decode_wire_plan(&new, 2).is_err(),
-            "a pre-image peer rejects it"
-        );
         // an out-of-range image id is rejected
         let mut bad = encode_wire_plan(&rows, Some(&[Some(0)]));
         bad.data[24..32].copy_from_slice(&(-5i64).to_le_bytes());
         assert!(decode_wire_plan_images(&bad, 2, true).is_err());
+    }
+
+    /// Builds do not mix. An older upstream's untagged 3- or 4-row frame
+    /// (always `packed_seq` rows) is refused by name; an older relay meets a
+    /// 5-row frame its own decoder rejects (it accepts only 3 or 4 rows, the
+    /// check reproduced here), so neither side reads the other's rows.
+    #[test]
+    fn packed_plan_frames_of_another_build_are_refused() {
+        let old_frame = |n_rows: u32, s: u32| {
+            WireTensor::new(
+                WireDType::I64,
+                [1, n_rows, s],
+                vec![0u8; (n_rows * s * 8) as usize],
+            )
+        };
+        for (n_rows, want_images) in [(3, false), (4, true), (4, false), (3, true)] {
+            let err = decode_wire_plan_images(&old_frame(n_rows, 8), 4, want_images)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("older build") && err.contains("different builds"),
+                "{n_rows} rows: {err}"
+            );
+        }
+        let new = encode_wire_plan(&[Some((0usize, 3i64, 0usize))], None);
+        let old_decoder_accepts = |t: &WireTensor| matches!(t.shape[1], 3 | 4);
+        assert!(
+            !old_decoder_accepts(&new),
+            "an older relay must not read it"
+        );
+        let img = encode_wire_plan(&[Some((0usize, 3i64, 0usize))], Some(&[None]));
+        assert!(!old_decoder_accepts(&img));
     }
 
     /// A relay rebuilds the sender's plan from the wire, image ids included,
