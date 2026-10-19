@@ -2451,32 +2451,20 @@ impl Builder for Gemma4Builder {
                 )));
                 // Native video needs `<|video|>` in the tokenizer (the chat
                 // template's video tag); the markup is spelled from its ids.
-                let tok = self.tokenizer.as_deref();
-                let spell = |id: i64| {
-                    u32::try_from(id)
-                        .ok()
-                        .and_then(|i| tok.and_then(|t| t.id_to_token(i)))
-                };
-                let markup = crate::gemma4_vision::video::VideoMarkup::gemma4();
-                match tok.and_then(|t| t.token_to_id(&markup.video)) {
-                    Some(video) => {
-                        let markup = crate::gemma4_vision::video::VideoMarkup {
-                            boi: spell(v.boi_token_id).unwrap_or(markup.boi),
-                            eoi: spell(v.eoi_token_id).unwrap_or(markup.eoi),
-                            ..markup
-                        };
-                        f.enable_video(i64::from(video), markup);
-                        events.push(LoadProgress::message(format!(
-                            "vision tree: rank 0 takes video whole ({} soft tokens per frame \
-                             at most, up to {} frames)",
-                            f.video.frame.max_soft_tokens, f.video.num_frames
-                        )));
-                    }
-                    None => events.push(LoadProgress::message(
-                        "vision tree: no <|video|> in the tokenizer; native video is refused"
-                            .to_string(),
-                    )),
-                }
+                let video = self
+                    .tokenizer
+                    .as_deref()
+                    .is_some_and(|t| f.enable_video_from_tokenizer(t));
+                events.push(LoadProgress::message(if video {
+                    format!(
+                        "vision tree: rank 0 takes video whole ({} soft tokens per frame \
+                         at most, up to {} frames)",
+                        f.video.frame.max_soft_tokens, f.video.num_frames
+                    )
+                } else {
+                    "vision tree: no <|video|> in the tokenizer; native video is refused"
+                        .to_string()
+                }));
                 self.vision_frontend = Some(f);
             }
         }

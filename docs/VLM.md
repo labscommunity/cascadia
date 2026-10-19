@@ -155,9 +155,9 @@ frame, so on the Qwen types an odd frame count is rounded up to the next even on
 `--api-max-video-frames` allows (a 3 s clip at 1 fps gives 4 frames, at 0, 0.75, 1.5 and
 2.25 s): the extra frame costs nothing. The other limits and flags are the ones above;
 there is no separate native frame cap (16 frames are 8 Qwen pairs, about 1600 tokens at
-448x448). On the staged engines, Qwen VL trees and the `gemma4` engine's Gemma 4 E2B / E4B
-trees take video natively too (next sections); every other engine (`ov-dist-spec`,
-`ov-runtime` on other families, Gemma 4 26B / 31B included) and every other export takes
+448x448). On the staged engines, Qwen VL trees and Gemma 4 trees (the `gemma4` engine's
+E2B / E4B, `ov-runtime`'s 26B-A4B / 31B) take video natively too (next sections); every
+other engine (`ov-dist-spec`, `ov-runtime` on other families) and every other export takes
 video as labelled frames. Requests are the same either way.
 
 ### Native video (ov-runtime Qwen VL, qwen35)
@@ -210,34 +210,50 @@ tokens, HF's counts). The video processor's pixel budget comes from
 `processor_config.json`'s `video_processor` in the published export, which the exporter
 copies into the tree.
 
-### Native video (gemma4 engine, Gemma 4 E2B / E4B)
+### Native video (Gemma 4: gemma4 engine E2B / E4B, ov-runtime 26B / 31B)
 
 Gemma 4 has no temporal patch: Hugging Face's `Gemma4Processor` (and GenAI 2026.4.1's
 `InputsEmbedderGemma4`) encode each frame through the image encoder on its own, at the video
 processor's smaller budget (`processor_config.json` `video_processor`: 70 soft tokens a
-frame on E2B / E4B, against 280 for an image), and write the chat template's one
+frame on E2B / E4B, 26B-A4B and 31B alike, against 280 for an image), and write the chat template's one
 `<|video|>` as, per frame, its time as `mm:ss`, a space, then `<|image>`, `<|video|>` once
-per soft token and `<image|>`, frames joined by a space. The `gemma4` engine does the same:
+per soft token and `<image|>`, frames joined by a space. Rank 0 of a Gemma 4 tree does the
+same, on the `gemma4` engine and on `ov-runtime`:
 the API writes `<|video|>` where the caller put the video (with every sampled frame; no
 pairing, no `Frame k` labels), rank 0 expands it in the text before tokenizing (minutes keep
 counting past the hour, as HF's), encodes the frames, and hands stage 0 the video soft
 tokens as `<|image|>`, the id its IR splices rows at (HF embeds both kinds the same way).
 A video of more than the processor's `num_frames` (32) would keep 32 frames, spaced as HF
-samples them; the API's 16-frame cap keeps every frame. E2B / E4B attend causally
-(`use_bidirectional_attention` is unset), so frames need no attention block of their own;
-the encode cache and the KV warm-resume key take the video's hash, which covers its frame
-times. Only the `gemma4` engine opts in, and only on a tree whose tokenizer has `<|video|>`
-(the engine's own condition; any other tree keeps frames): Gemma 4 26B / 31B on
-`ov-runtime` keep frames.
+samples them; the API's 16-frame cap keeps every frame. The encode cache and the KV
+warm-resume key take the video's hash, which covers its frame times. Native video is on
+only for a tree whose tokenizer has `<|video|>` (both engines check at load and the CLI
+routes on the same check; any other tree keeps frames).
+
+E2B / E4B attend causally (`use_bidirectional_attention` is unset), so frames need no
+attention block of their own. 26B-A4B and 31B (`use_bidirectional_attention: "vision"`)
+attend both ways inside each image on their sliding-window layers, and HF makes each video
+frame a block of its own (`get_block_sequence_ids_for_mask`: every run of image or video
+soft tokens); full-attention layers stay causal. On `ov-runtime` the stages see video soft
+tokens as `<|image|>`, so `token_type_ids` is 1 on every image and video soft token (what
+GenAI 2026.4.1 feeds the same IR), each frame is one run, and the same mask machinery that
+serves images serves frames: the IR's own masks on stateful and static trees (a static
+chunk never ends inside a frame), the host masks on packed slots (each frame open both ways
+on the sliding mask, the full mask causal), and the types frame on the wire between
+machines. A frame is at most 70 tokens, so a static `--prefill-seq` or packed
+`--packed-seq` wide enough for an image holds any frame. Text embeds image and video soft
+tokens as the pad id, as HF does (26B / 31B have no per-layer embeddings).
 
 Rank 0 encodes a video one inference per frame, inside the turn's first step, so a cold
 16-frame video costs about 16 s of encoding on CPU (about 1 s a frame) before prefill;
 repeats come from the encode cache.
 
 Token ids, soft-token counts, frame sampling, `mm:ss` labels, `mm_token_type_ids` and the
-attention blocks (one per frame) equal transformers 5.20.1's, and frame pixels are within
-two 8-bit levels of its torchvision-only video processor
-(`tests/gemma4_video_parity.rs`, fixtures from
+attention blocks (one per frame) equal transformers 5.20.1's for E4B and for 26B-A4B / 31B
+(which share processor, tokenizer and template), and frame pixels are within two 8-bit
+levels of its torchvision-only video processor; on 26B / 31B the `token_type_ids`, the
+packed rows' block ids and the packed sliding and full host masks equal HF's
+`create_masks_for_vision_model` row for row (`tests/gemma4_video_parity.rs`, fixtures
+`video_reference.json` and `video_reference_26b_31b.json` from
 `tools/vlm_fixtures/gen_gemma4_video_fixtures.py`). Pixel parity is measured on
 synthetic gradient frames only, not on decoded camera footage.
 
@@ -504,7 +520,8 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
   stage per 32 GB node): same two steps. `packed_variant.py` finds the stage's two
   mask producers (sliding window and full attention), tells them apart from the tree's
   `config.json` `layer_types`, and gives each its own input (`attn_mask_sliding_4d`,
-  `attn_mask_4d`); the runtime builds both masks, with each image open both ways. An
+  `attn_mask_4d`); the runtime builds both masks, with each image (and each video frame)
+  open both ways on the sliding mask and the full mask causal, as HF's Gemma 4. An
   image must fit one packed inference, so pass `--packed-seq` at least one image wide:
 
   ```bash
