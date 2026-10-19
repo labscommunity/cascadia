@@ -632,13 +632,15 @@ Traced in GenAI `2026.4.1.0` (paths under `src/cpp/src/`):
   in 1024 and rounds each side up to whole patches.
 - **Expansion** (`classes.cpp:92-113`): each image becomes `shape[1]` copies of
   `im_start` plus `"\n"`. `im_start` is the hard-coded `"<image>"` (`vlm_config.hpp:55`;
-  no config key sets it), which the Pixtral (tekken) tokenizer splits into two ordinary
-  text pieces. The image id is the last piece (`classes.cpp:133-137`), and the merge
-  (`utils.cpp:1038-1073`) fills one run of consecutive image ids per image; the pieces
-  alternate, so the run is one token long and one of the 441 image rows reaches the
-  model. That is the 903: 20 text tokens + 441 x 2 pieces + `"\n"`, against HF's 832
-  (20 + 28 x 28 `[IMG]` + 27 `[IMG_BREAK]` + `[IMG_END]`). GenAI has no `[IMG_BREAK]` or
-  `[IMG_END]` at all.
+  no config key sets it), which the Pixtral (tekken) tokenizer splits into ordinary text:
+  `<image>` alone is `<` `image` `>` (1060 5497 1062), but 441 of them and the newline
+  are `<`, then `image` `><` (5497 4812) repeated, then `image` `>\n` (1561): 883 tokens.
+  The image id is the last piece of `<image>` alone, `>` (1062; `classes.cpp:133-137`),
+  which never occurs in the expanded run, so the merge (`utils.cpp:1038-1073`, which
+  overwrites runs of that id) finds nothing and **no image row reaches the model**: it
+  answers from the text `<image><image>...`. That is the 903: 20 text tokens + 883,
+  against HF's 832 (20 + 28 x 28 `[IMG]` + 27 `[IMG_BREAK]` + `[IMG_END]`; checked on
+  pawan-04 with the export's tokenizer). GenAI has no `[IMG_BREAK]` or `[IMG_END]` at all.
 - **Newer GenAI.** `master` at `3869223` (2026-10-19) only adds `minicpmv4_7` to the
   model-type map and leaves `llava/` unchanged: no Pixtral path upstream yet.
 
