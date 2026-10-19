@@ -1048,8 +1048,14 @@ impl Gemma4Engine {
                 .tokenizer
                 .clone()
                 .ok_or_else(|| EngineError::Backend("first stage requires tokenizer".into()))?;
+            // A native video's `<|video|>` is expanded in the text, as HF's
+            // processor does before it tokenizes.
+            let text = match self.vision.as_ref() {
+                Some(v) => v.prompt_text(&task.prompt, &task.media).into_owned(),
+                None => task.prompt.clone(),
+            };
             let enc = tok
-                .encode(task.prompt.clone(), false)
+                .encode(text, false)
                 .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?;
             let mut prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
             // Option B forced-prefix resume: append the already-emitted assistant
@@ -1672,8 +1678,11 @@ impl Engine for Gemma4Engine {
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
         // Only a vision tree (stage 0 takes image_features) serves images;
-        // video arrives as its frames.
-        cascadia_engine::refuse_video(&task, "gemma4")?;
+        // one whose tokenizer has `<|video|>` takes video whole, any other
+        // gets a video as its frames.
+        if !self.vision.as_ref().is_some_and(|v| v.takes_video()) {
+            cascadia_engine::refuse_video(&task, "gemma4")?;
+        }
         if self.vision.is_none() {
             cascadia_engine::refuse_media(&task, "gemma4 (tree without a `vision` block)")?;
         }
@@ -2434,12 +2443,40 @@ impl Builder for Gemma4Builder {
                     eoi: v.eoi_token_id,
                     pad: v.pad_token_id,
                 };
-                let f = crate::gemma4_vision::ImageFrontend::load(&self.pipeline_dir, tokens)
+                let mut f = crate::gemma4_vision::ImageFrontend::load(&self.pipeline_dir, tokens)
                     .map_err(|e| EngineError::InvalidConfig(format!("vision tree: {e}")))?;
                 events.push(LoadProgress::message(format!(
                     "vision tree: rank 0 encodes images ({} soft tokens per image at most)",
                     f.preprocess.max_soft_tokens
                 )));
+                // Native video needs `<|video|>` in the tokenizer (the chat
+                // template's video tag); the markup is spelled from its ids.
+                let tok = self.tokenizer.as_deref();
+                let spell = |id: i64| {
+                    u32::try_from(id)
+                        .ok()
+                        .and_then(|i| tok.and_then(|t| t.id_to_token(i)))
+                };
+                let markup = crate::gemma4_vision::video::VideoMarkup::gemma4();
+                match tok.and_then(|t| t.token_to_id(&markup.video)) {
+                    Some(video) => {
+                        let markup = crate::gemma4_vision::video::VideoMarkup {
+                            boi: spell(v.boi_token_id).unwrap_or(markup.boi),
+                            eoi: spell(v.eoi_token_id).unwrap_or(markup.eoi),
+                            ..markup
+                        };
+                        f.enable_video(i64::from(video), markup);
+                        events.push(LoadProgress::message(format!(
+                            "vision tree: rank 0 takes video whole ({} soft tokens per frame \
+                             at most, up to {} frames)",
+                            f.video.frame.max_soft_tokens, f.video.num_frames
+                        )));
+                    }
+                    None => events.push(LoadProgress::message(
+                        "vision tree: no <|video|> in the tokenizer; native video is refused"
+                            .to_string(),
+                    )),
+                }
                 self.vision_frontend = Some(f);
             }
         }

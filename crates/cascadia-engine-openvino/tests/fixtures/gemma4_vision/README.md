@@ -32,3 +32,14 @@ so 2/255 is its tolerance against torchvision.
 Regenerate with `tools/vlm_fixtures/gen_gemma4_fixtures.py --run-ir`
 (transformers 5.14.1, torch 2.14.1, torchvision 0.29.1; versions are recorded
 in the JSON) against a Gemma 4 export directory, e.g. gemma-4-26b-a4b-int4-ov.
+
+## Video
+
+`video_reference.json` (`tools/vlm_fixtures/gen_gemma4_video_fixtures.py --model <Gemma 4
+E2B/E4B dir>`, transformers 5.20.1, google/gemma-4-E4B-it's configs and tokenizer, no
+weights): the video processor constants, token ids, and per synthetic video (frames rebuilt
+by the test from a closed-form pattern) the frames HF keeps, their `mm:ss` labels, soft
+tokens per frame and summaries of `pixel_values_videos` / `video_position_ids`; per chat
+the template, the text HF tokenized, `input_ids`, `mm_token_type_ids` and the attention
+block ids. HF's video processor resizes with torchvision only; the Rust port (Pillow-exact
+bicubic) is within 2/255 of it.
