@@ -1362,9 +1362,9 @@ engines' `refuse_video` stays for them.
   `start + floor(k * second_per_grid_t * tokens_per_second)` (f32, as HF holds
   `second_per_grid_ts`), `second_per_grid_t = 2 / sampled_fps` from the frame times, and
   the next token starts one past the largest position so far. That is Qwen's original
-  `get_rope_index` (transformers 4.x), which the model was trained with; transformers 5.2
-  and 5.20 compute the same temporal steps, GenAI 2026.4.1 and vLLM start the next text
-  the same way. transformers 5.14 / 5.15 depart from it twice, and we do not follow them:
+  `get_rope_index` (transformers 4.x), which the model was trained with; transformers
+  5.20.1 computes the same temporal steps (checked; 5.2 reportedly too), and GenAI
+  2026.4.1 and vLLM start the next text the same way. transformers 5.14 / 5.15 depart from it twice, and we do not follow them:
   they truncate `second_per_grid_t` to whole seconds before multiplying (a transient
   regression), and they start the next text `max(h, w) / 2` after the run's start, inside
   the video's time range. The second also breaks warm resume: a later turn's prompt,
