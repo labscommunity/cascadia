@@ -105,10 +105,23 @@ Measured on Lunar Lake, Qwen3-VL-4B one-stage tree (`--context 2048 --prefill-se
 `--decode-seq` is the faster of the two on the CPU too (a static shape beats the
 dynamic one), at the cost of a second resident weight copy. Most of what remains
 is the per-step copy of the whole past KV window in and out (the static path,
-one row a step, takes 0.84 s on the same tree). On the Arc 140V iGPU the packed
-path returns garbage at every width (`--dynamic-seq`: non-finite logits), while
-the static path there is correct; packed slots are CPU/NPU only until that is
-fixed.
+one row a step, takes 0.84 s on the same tree).
+
+On the Arc 140V iGPU (OpenVINO 2026.4.1, same tree, 4 slots, greedy, 128 tokens):
+
+| decode width | s/step | 3 requests, tok/s total | text vs GPU static (0.26 s/step) |
+|---|---|---|---|
+| 64 rows (no flag) | 0.40 | 7.45 | coherent; diverges after ~36 chars |
+| `--decode-seq 4` | 0.33 | 8.91 | coherent; diverges after ~36 chars |
+| `--dynamic-seq` | 0.28 | 10.21 | identical, all 3 requests |
+
+The fixed-width IRs drift from the static path in f16 (one prefill step's
+logits differ by up to 2.4 against 0.03 for the dynamic IR at the same 64
+rows), so their greedy text differs while still reading correctly. The packed
+mask's blocked value is -65504 in both mask dtypes: the GPU plugin runs the IR
+in f16 and converts an f32 mask input to f16, so the earlier f32 value (-3e38)
+became -inf there, and the f16 SDPA turned the -inf entries into garbage tokens
+at every width (non-finite logits with `--dynamic-seq`).
 
 The host side lives in `crates/cascadia-engine-openvino/src/packed.rs`. The KV
 window is partitioned into `region = past_len / slots` per slot; slot `s` owns

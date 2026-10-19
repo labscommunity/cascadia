@@ -350,7 +350,8 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
   decode step runs at its live rows) or `--decode-seq D` on the NPU (a second, static
   `D`-row decode IR, `D` at least the slot count). Without either, a decode step is
   `--packed-seq` rows too (CPU, Qwen3-VL-4B, 4 slots: 1.92 s a step at 64 rows,
-  0.75 s with `--decode-seq 4`, 0.94 s with `--dynamic-seq`; see
+  0.75 s with `--decode-seq 4`, 0.94 s with `--dynamic-seq`; Arc 140V iGPU: 0.40,
+  0.33 and 0.28 s, `--dynamic-seq` matching the GPU static path token for token; see
   [perf/NPU_PACKED_SLOTS.md](perf/NPU_PACKED_SLOTS.md)). A bidirectional
   family (Gemma 3 / Gemma 4) keeps `--packed-seq` at least one image wide (below). A
   request whose prompt does not fit one slot's region `(context - 1 - packed_prefix) / N`
