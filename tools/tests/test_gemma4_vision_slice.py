@@ -187,3 +187,32 @@ def test_vision_slice_needs_the_vision_files(tmp_path):
     with pytest.raises(SystemExit, match="--vision needs processor_config.json"):
         slice_vision(src, out)
     assert not (out / "pipeline_config.json").exists()
+
+
+def test_one_stage_export_needs_no_temp_copy(tmp_path):
+    # --stage 1 on a node with room for its stage only: cut from the graft in
+    # memory (no _grafted/ copy) and give the tree its own pipeline_config.
+    src, out = export_dir(tmp_path / "vlm"), tmp_path / "tree"
+    grafted, info = g.vision_frontend(str(src))
+    g.slice_stages(grafted, str(src), str(out), num_stages=2, num_layers=LAYERS,
+                   hidden_size=H, num_kv_shared_layers=0,
+                   suffix=g.DEFAULT_LAYERNORM_SUFFIX, last_logits_only=True,
+                   only_stage=1, skip_tokenizer_regen=True, num_kv_heads=KVH,
+                   head_dim=HD, vision=True, vision_token_types=info["token_type_ids"])
+    assert not (out / "_grafted").exists()
+    assert not (out / "stage_0").exists()
+    assert {"hidden_states", "token_type_ids"} <= stage_inputs(out, 1)
+    pipe = json.loads((out / "pipeline_config.json").read_text())
+    assert pipe["num_stages"] == 2 and pipe["only_stage"] == 1
+    assert [s["stage"] for s in pipe["stages"]] == [1]
+    assert pipe["vision"]["family"] == "gemma4"
+    # The other stage into the same tree completes it.
+    g.slice_stages(g.vision_frontend(str(src))[0], str(src), str(out), num_stages=2,
+                   num_layers=LAYERS, hidden_size=H, num_kv_shared_layers=0,
+                   suffix=g.DEFAULT_LAYERNORM_SUFFIX, last_logits_only=True,
+                   only_stage=0, skip_tokenizer_regen=True, num_kv_heads=KVH,
+                   head_dim=HD, vision=True, vision_token_types=info["token_type_ids"])
+    pipe = json.loads((out / "pipeline_config.json").read_text())
+    assert "only_stage" not in pipe
+    assert [s["stage"] for s in pipe["stages"]] == [0, 1]
+    assert "inputs_embeds" in stage_inputs(out, 0)

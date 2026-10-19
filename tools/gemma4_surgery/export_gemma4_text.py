@@ -756,15 +756,19 @@ def _shapes_compatible(ps_a, ps_b) -> bool:
         return str(ps_a) == str(ps_b)
 
 
-def extract_stage(grafted_xml: str, a: int, b: int, first: bool, last: bool,
+def extract_stage(grafted_xml, a: int, b: int, first: bool, last: bool,
                   suffix: str, last_logits_only: bool):
     """Cut the grafted IR into the stateful shard for layers ``a..b``.
 
     Adapted from qwen36_surgery.extract_stage. Fresh ``read_model`` per stage
-    (mmap; the surgery mutates the graph) so no RAM wall.
+    (mmap; the surgery mutates the graph) so no RAM wall. ``grafted_xml`` may
+    instead be the in-memory grafted ``ov.Model`` (a single ``--stage``
+    export, which mutates it once and needs no temp copy).
     """
-    core = ov.Core()
-    model = core.read_model(grafted_xml)
+    if isinstance(grafted_xml, ov.Model):
+        model = grafted_xml
+    else:
+        model = ov.Core().read_model(grafted_xml)
 
     params_new = []
     if not first:
@@ -1033,6 +1037,10 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
 
     Saves the grafted IR to a temp dir first, then re-reads it per stage
     (mmap, no RAM wall) — mirroring qwen36's ``extract_stage(xml_path, ...)``.
+    A single ``only_stage`` is cut from the in-memory grafted IR instead, with
+    no temp copy (the whole language model, 13 GB on 26B-A4B), so a node
+    with room for its own stage only can export it; such a one-stage tree
+    gets a ``pipeline_config.json`` of its own when it has none.
     ``num_kv_heads`` / ``head_dim`` are best-effort per-model defaults carried
     into each ``stage_config.json`` as the ``Option`` hints StageConfig reads.
     """
@@ -1059,10 +1067,14 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
         os.remove(marker_path)
         log(f"removed stale pipeline_config.json (re-export into {out_dir})")
     grafted_dir = os.path.join(out_dir, "_grafted")
-    os.makedirs(grafted_dir, exist_ok=True)
-    grafted_xml = os.path.join(grafted_dir, "openvino_model.xml")
-    log(f"saving grafted whole IR (temp) -> {grafted_xml}")
-    ov.save_model(grafted, grafted_xml, compress_to_fp16=False)
+    if only_stage is None:
+        os.makedirs(grafted_dir, exist_ok=True)
+        grafted_xml = os.path.join(grafted_dir, "openvino_model.xml")
+        log(f"saving grafted whole IR (temp) -> {grafted_xml}")
+        ov.save_model(grafted, grafted_xml, compress_to_fp16=False)
+    else:
+        grafted_xml = grafted
+        log(f"--stage {only_stage}: cutting from the in-memory graft (no temp copy)")
 
     ranges = stage_ranges(num_stages, num_layers)
     if allow_kv_share and num_kv_shared_layers and num_kv_shared_layers > 0:
@@ -1205,16 +1217,39 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
         if only_stage is None:
             with open(marker_path, "w") as f:
                 json.dump(pipeline_config, f, indent=2)
+        elif not os.path.exists(marker_path):
+            # A node's own one-stage tree: the runtime reads the tree's
+            # shape and vision block from here; `stages` lists the one cut.
+            pipeline_config["only_stage"] = only_stage
+            with open(marker_path, "w") as f:
+                json.dump(pipeline_config, f, indent=2)
+            log(f"  (--stage {only_stage}: wrote pipeline_config.json for this "
+                f"stage's tree)")
         else:
-            log(f"  (--stage {only_stage}: skipping pipeline_config.json "
-                f"write)")
+            # Another stage cut into the same tree: list it beside the ones
+            # already there; once all are, the tree is a whole one again.
+            with open(marker_path) as f:
+                existing = json.load(f)
+            if "only_stage" in existing:
+                cut = {s["stage"]: s for s in existing.get("stages", [])}
+                cut.update({s["stage"]: s for s in pipeline_config["stages"]})
+                existing["stages"] = [cut[k] for k in sorted(cut)]
+                if len(cut) == num_stages:
+                    del existing["only_stage"]
+                with open(marker_path, "w") as f:
+                    json.dump(existing, f, indent=2)
+                log(f"  (--stage {only_stage}: added to pipeline_config.json, "
+                    f"stages {sorted(cut)})")
+            else:
+                log(f"  (--stage {only_stage}: keeping the existing "
+                    f"pipeline_config.json)")
     except BaseException:
         log(f"  ERROR: export failed — PARTIAL tree left at {out_dir} "
             f"(no pipeline_config.json written; _grafted/ retained for "
             f"debugging). Delete the tree before use.")
         raise
 
-    if not keep_grafted:
+    if not keep_grafted and only_stage is None:
         # The last extracted stage still memory-maps ``_grafted/*.bin``; on
         # Windows a mapped file cannot be deleted, and ignore_errors turned
         # that into a silent ~17 GB leak per export (observed on-fleet: every
