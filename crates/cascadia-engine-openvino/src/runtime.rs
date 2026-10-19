@@ -145,6 +145,16 @@ struct StageConfig {
     /// Sliding window (tokens) of the `sliding_attention` mask port.
     #[serde(default)]
     packed_sliding_window: Option<u32>,
+    /// The packed IR takes any query width up to `packed_seq`
+    /// (`packed_variant.py --dynamic-seq`, CPU/GPU): a decode step runs at
+    /// its live rows instead of `packed_seq`.
+    #[serde(default)]
+    packed_dynamic: Option<bool>,
+    /// Query rows of the narrow static decode IR
+    /// (`openvino_packed_decode_model.xml`, `packed_variant.py --decode-seq`,
+    /// NPU) beside the wide one; decode steps run on it.
+    #[serde(default)]
+    packed_decode_seq: Option<u32>,
     /// Chunked-prefill IR variant (openvino_prefill_model.xml) query-window
     /// width, exported via `--static-prefill-seq`. Absent/None on decode-only
     /// static exports and on all stateful exports.
@@ -392,6 +402,53 @@ fn packed_geometry_error(slots: u32, packed_seq: u32) -> Option<String> {
              window cannot be narrower than the slot count, or slots beyond it can never \
              decode. Rebuild with `python tools/packed_variant.py <stage_dir> --slots {slots}` \
              (packed_seq defaults to the slot count)"
+        )
+    })
+}
+
+/// The narrow static decode IR `packed_variant.py --decode-seq` writes beside
+/// the wide packed IR.
+const PACKED_DECODE_XML: &str = "openvino_packed_decode_model.xml";
+
+/// Refuse a packed width setup the stage cannot run: a dynamic-width packed IR
+/// on the NPU (static shapes only), a narrow decode IR together with a dynamic
+/// one, a decode width that cannot hold every slot or is no narrower than the
+/// wide IR, or a decode width without its IR file.
+fn packed_width_error(
+    dynamic: bool,
+    decode_seq: Option<u32>,
+    slots: u32,
+    packed_seq: u32,
+    device: &str,
+    decode_xml_exists: bool,
+) -> Option<String> {
+    let npu = device.to_ascii_uppercase().contains("NPU");
+    if dynamic && npu {
+        return Some(
+            "the packed variant has a dynamic query width (packed_variant.py --dynamic-seq), \
+             which the NPU cannot compile; rebuild it static, with --decode-seq for a narrow \
+             decode IR"
+                .into(),
+        );
+    }
+    let d = decode_seq?;
+    if dynamic {
+        return Some(
+            "stage_config has both packed_dynamic and packed_decode_seq; a dynamic packed IR \
+             already decodes at the live rows, rebuild with one of the two"
+                .into(),
+        );
+    }
+    if d < slots || d >= packed_seq {
+        return Some(format!(
+            "packed_decode_seq={d} must hold every slot ({slots}) and be narrower than \
+             packed_seq={packed_seq}; rebuild with packed_variant.py --decode-seq"
+        ));
+    }
+    (!decode_xml_exists).then(|| {
+        format!(
+            "stage_config sets packed_decode_seq={d} but {PACKED_DECODE_XML} is missing; \
+             rebuild with packed_variant.py --decode-seq"
         )
     })
 }
@@ -745,6 +802,19 @@ fn relay_plan(
             })
             .collect(),
     }
+}
+
+/// The rows rank 0 samples from a packed plan: each slot's last row (a
+/// decode row is its slot's only one; a prefill chunk yields its token on its
+/// last row), in row order.
+fn last_row_per_slot(plan: &crate::packed::PackedPlan) -> Vec<usize> {
+    let mut last: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (r, pr) in plan.active_rows() {
+        last.insert(pr.slot, r);
+    }
+    let mut rows: Vec<usize> = last.into_values().collect();
+    rows.sort_unstable();
+    rows
 }
 
 /// True when a packed plan carries a prefill chunk: some slot owns more than
@@ -4562,7 +4632,6 @@ impl OvRuntimeEngine {
             .clone()
             .ok_or_else(|| EngineError::Backend("packed relay stage has no upstream".into()))?;
         let slots = self.packed.as_ref().unwrap().kv.slots;
-        let pseq = self.packed.as_ref().unwrap().kv.packed_seq;
         let want_images = self.packed_image_blocks();
         let want_mrope = self.vision_mrope();
         let (plan_res, hidden, hshape, mrope_frame) = self.block_on(async {
@@ -4611,13 +4680,15 @@ impl OvRuntimeEngine {
         })?;
         // Decoded like the plan: a malformed frame is a body failure that is
         // NACKed below, never an early return that leaves the upstream
-        // waiting out its reply deadline.
+        // waiting out its reply deadline. The positions cover the plan's own
+        // rows (a decode frame carries only its live rows).
+        let rows = plan_res.as_ref().map_or(0, |(r, _)| r.len());
         let mrope_res = match mrope_frame {
             Some(f) => {
-                decode_wire_positions(&f, crate::qwen_vl_vision::MROPE_ROWS, pseq).inspect(|_| {
+                decode_wire_positions(&f, crate::qwen_vl_vision::MROPE_ROWS, rows).inspect(|_| {
                     debug!(
                         rows = crate::qwen_vl_vision::MROPE_ROWS,
-                        seq = pseq,
+                        seq = rows,
                         "packed relay: M-RoPE positions frame received"
                     )
                 })
@@ -4697,14 +4768,14 @@ impl OvRuntimeEngine {
         )?;
 
         if self.spec.is_last_stage {
+            // Rank 0 reads one token per slot: a decode row (its slot's only
+            // row) or a prefill chunk's last row. Every other row answers 0,
+            // so the head samples no logits nobody reads.
             let logits = bytes_to_f32(odt, &obytes)?;
-            let mut tokens = Vec::with_capacity(plan.rows.len());
-            for (r, row) in plan.rows.iter().enumerate() {
-                tokens.push(if row.is_some() {
-                    argmax_logits_row(&logits, &oshape, r)?
-                } else {
-                    0
-                });
+            let sampled = last_row_per_slot(&plan);
+            let mut tokens = vec![0; plan.rows.len()];
+            for r in sampled {
+                tokens[r] = argmax_logits_row(&logits, &oshape, r)?;
             }
             Ok(tokens)
         } else {
@@ -6880,6 +6951,10 @@ pub struct OvRuntimeBuilder {
     /// `stage_config.packed_masks` / `packed_sliding_window` (see StageConfig).
     packed_masks: Option<std::collections::BTreeMap<String, String>>,
     packed_window: Option<u32>,
+    /// `stage_config.packed_dynamic` / `packed_decode_seq` (see StageConfig),
+    /// checked at load.
+    packed_dynamic: bool,
+    packed_decode_seq: Option<u32>,
     /// Gemma 4 vision tree, loaded with the stage.
     vision: Option<VisionTree>,
 }
@@ -7123,13 +7198,33 @@ impl Builder for OvRuntimeBuilder {
                         "packed_slots={slots} exceeds the KV window ({past_len})"
                     )));
                 }
+                let dynamic = stage_cfg.packed_dynamic.unwrap_or(false);
+                let decode_seq = stage_cfg.packed_decode_seq;
+                let decode_xml = stage_dir.join(PACKED_DECODE_XML);
+                if let Some(msg) = packed_width_error(
+                    dynamic,
+                    decode_seq,
+                    slots,
+                    pseq,
+                    &self.device,
+                    decode_xml.exists(),
+                ) {
+                    return Err(EngineError::InvalidConfig(msg));
+                }
                 events.push(LoadProgress::message(format!(
                     "packed multi-slot variant: slots={slots} seq={pseq} context={pctx} \
-                     per-request context={}",
-                    past_len / slots
+                     per-request context={} decode width={}",
+                    past_len / slots,
+                    match (dynamic, decode_seq) {
+                        (true, _) => "live rows (dynamic IR)".to_string(),
+                        (false, Some(d)) => format!("{d} (narrow decode IR)"),
+                        (false, None) => format!("{pseq} (no narrow decode IR)"),
+                    }
                 )));
                 self.packed_masks = stage_cfg.packed_masks.clone();
                 self.packed_window = stage_cfg.packed_sliding_window;
+                self.packed_dynamic = dynamic;
+                self.packed_decode_seq = decode_seq;
                 Some((slots, pseq, pctx))
             }
         };
@@ -7950,6 +8045,47 @@ impl Builder for OvRuntimeBuilder {
                     .map_or(0, |f| f.frontend.image_token());
                 state.visual_mask_in = visual_mask_in;
                 state.deepstack_in = deepstack_in;
+                state.dynamic = self.packed_dynamic;
+                if let Some(d) = self.packed_decode_seq {
+                    // The narrow decode IR: the same graph at `d` query rows.
+                    // It must take the same ports under the same names, since
+                    // `run_plan` feeds either IR from one set of port names.
+                    let nxml = packed_xml.with_file_name(PACKED_DECODE_XML);
+                    let nrt = OvRuntime::compile(
+                        nxml.to_string_lossy().as_ref(),
+                        &self.device,
+                        &packed_plugin,
+                    )
+                    .map_err(map_ov_err)?;
+                    let ncanon = resolve_canonical_inputs(&nrt)?;
+                    let mut nnames = std::collections::HashSet::new();
+                    for idx in 0..nrt.input_count() {
+                        nnames.insert(nrt.input_name(idx).map_err(map_ov_err)?);
+                    }
+                    let nlayers = resolve_static_layers(&nrt, "packed decode variant")?
+                        .into_iter()
+                        .map(|l| crate::packed_exec::PackedLayer {
+                            key_in: l.key_in,
+                            val_in: l.val_in,
+                            key_out: l.key_out,
+                            val_out: l.val_out,
+                        })
+                        .collect::<Vec<_>>();
+                    let same_masks = state.masks.iter().all(|m| nnames.contains(&m.port));
+                    if ncanon != pcanon || !same_masks || nlayers.len() != state.layers.len() {
+                        return Err(EngineError::InvalidConfig(format!(
+                            "{} does not take the same ports as the packed IR; rebuild both \
+                             with one tools/packed_variant.py run",
+                            nxml.display()
+                        )));
+                    }
+                    info!(decode_seq = d, "packed narrow decode IR active");
+                    state.narrow = Some(crate::packed_exec::PackedNarrow {
+                        runtime: nrt,
+                        layers: nlayers,
+                        seq: d as usize,
+                    });
+                }
                 Some(state)
             }
         };
@@ -8097,6 +8233,80 @@ mod tests {
             old.matches("caf").count() > 1,
             "old logic duplicated the prefix, which is the bug: {old:?}"
         );
+    }
+
+    /// The decode-width setups a stage refuses at load: a dynamic packed IR
+    /// on the NPU, both kinds at once, a decode width that cannot hold every
+    /// slot or is not narrower than the wide IR, and a missing decode IR.
+    #[test]
+    fn packed_width_setups_the_stage_cannot_run_are_refused() {
+        // nothing narrow: the pre-existing setup
+        assert!(packed_width_error(false, None, 4, 64, "NPU", false).is_none());
+        // dynamic on CPU/GPU is the point; on the NPU it cannot compile
+        assert!(packed_width_error(true, None, 4, 64, "CPU", false).is_none());
+        assert!(packed_width_error(true, None, 4, 64, "GPU.0", false).is_none());
+        let npu = packed_width_error(true, None, 4, 64, "NPU", false).unwrap();
+        assert!(npu.contains("--decode-seq"), "{npu}");
+        // a narrow static decode IR beside a static wide one
+        assert!(packed_width_error(false, Some(4), 4, 64, "NPU", true).is_none());
+        assert!(packed_width_error(false, Some(8), 4, 64, "NPU", true).is_none());
+        assert!(packed_width_error(false, Some(3), 4, 64, "NPU", true).is_some());
+        assert!(packed_width_error(false, Some(64), 4, 64, "NPU", true).is_some());
+        assert!(packed_width_error(true, Some(4), 4, 64, "CPU", true).is_some());
+        let missing = packed_width_error(false, Some(4), 4, 64, "NPU", false).unwrap();
+        assert!(missing.contains(PACKED_DECODE_XML), "{missing}");
+    }
+
+    /// The head samples each slot's last row only: every decode row, and the
+    /// final row of a prefill chunk — the rows rank 0 reads.
+    #[test]
+    fn head_samples_each_slots_last_row() {
+        let chunk = crate::packed::PackedPlan::chunk(6, 1, 4);
+        assert_eq!(last_row_per_slot(&chunk), vec![3]);
+        let decode = crate::packed::PackedPlan::decode(3, &[2, 0, 3]);
+        assert_eq!(last_row_per_slot(&decode), vec![0, 1, 2]);
+        assert!(last_row_per_slot(&crate::packed::PackedPlan::idle(4)).is_empty());
+    }
+
+    /// A decode frame carries only its live rows; a relay rebuilds the same
+    /// narrow plan from it, and masks those rows exactly as the sender did
+    /// whatever width it then runs them at.
+    #[test]
+    fn a_narrow_decode_frame_rebuilds_the_senders_rows() {
+        let mut kv = crate::packed::PackedKv::new(4, 16, 8, 1, 1, 2, ShimDType::F16, 0);
+        for (s, n) in [(0, 2), (2, 3)] {
+            kv.advance(s, n);
+        }
+        let sender = crate::packed::PackedPlan::decode(2, &[0, 2]);
+        let rows: Vec<crate::packed_exec::WireRowOpt> = sender
+            .rows
+            .iter()
+            .map(|r| r.map(|pr| (pr.slot, kv.position(pr.slot) as i64, 0)))
+            .collect();
+        let frame = encode_wire_plan(&rows, None);
+        assert_eq!(frame.shape[2], 2, "no idle rows on the wire");
+        let (back, images) = decode_wire_plan_images(&frame, 4, false).unwrap();
+        assert_eq!(back, rows);
+        let relay = relay_plan(&back, &images);
+        assert_eq!(relay.rows, sender.rows);
+        // The relay pads to its own width (here the wide 8): the live rows
+        // mask as the sender's narrow plan did.
+        let mut padded = relay.clone();
+        padded.rows.resize(8, None);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        kv.fill_mask(&sender, &mut a, ShimDType::F16);
+        kv.fill_mask(&padded, &mut b, ShimDType::F16);
+        let (actx, bctx) = (kv.context_at(2), kv.context_at(8));
+        for r in 0..2 {
+            assert_eq!(
+                a[r * actx * 2..(r * actx + 16) * 2],
+                b[r * bctx * 2..(r * bctx + 16) * 2]
+            );
+            assert_eq!(
+                a[(r * actx + 16) * 2..(r * actx + 18) * 2],
+                b[(r * bctx + 16) * 2..(r * bctx + 18) * 2]
+            );
+        }
     }
 
     /// A packed variant narrower than its own slot count can never decode every
