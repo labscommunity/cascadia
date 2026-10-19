@@ -39,11 +39,16 @@
 
 use cascadia_ov_genai_shim::DType as ShimDType;
 
-/// Additive-mask "blocked" value. f16's most-negative finite (-65504) and an
-/// f32 equivalent — finite rather than -inf so a fully-blocked row can never
-/// produce NaN out of softmax.
+/// Additive-mask "blocked" value: f16's most-negative finite, -65504, in
+/// both dtypes — finite rather than -inf so a fully-blocked row can never
+/// produce NaN out of softmax. The f32 value must stay inside f16 range: the
+/// GPU plugin runs the IR in f16 by default and converts an f32 mask input to
+/// f16, where anything below -65504 (e.g. f32's -3e38) becomes -inf, and its
+/// f16 SDPA turns -inf mask entries into wrong-but-finite attention (garbage
+/// tokens). -65504 still underflows softmax to exactly 0 in f32, so CPU output
+/// is unchanged.
 const NEG_F16_BITS: u16 = 0xFBFF;
-const NEG_F32: f32 = -3.0e38;
+const NEG_F32: f32 = -65504.0;
 
 /// Leading KV columns a bounded ring must never evict — attention sinks.
 /// Transformer heads park a large share of their softmax mass on the first few
@@ -975,6 +980,29 @@ mod tests {
         let mut buf = Vec::new();
         k.fill_mask(&PackedPlan::idle(2), &mut buf, ShimDType::F32);
         assert_eq!(buf.len(), 2 * k.context * 4);
+    }
+
+    /// The f32 mask's blocked value survives the f16 conversion the GPU
+    /// plugin applies to it: finite, and the same -65504 the f16 mask writes.
+    #[test]
+    fn f32_mask_blocked_value_is_f16_representable() {
+        let k = kv(2, 8, 2);
+        let (mut b32, mut b16) = (Vec::new(), Vec::new());
+        k.fill_mask(&PackedPlan::idle(2), &mut b32, ShimDType::F32);
+        k.fill_mask(&PackedPlan::idle(2), &mut b16, ShimDType::F16);
+        let v32: Vec<f32> = b32
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let blocked: Vec<f32> = v32.iter().copied().filter(|&v| v != 0.0).collect();
+        assert!(!blocked.is_empty());
+        assert!(blocked.iter().all(|&v| v == -65504.0));
+        assert_eq!(f32::from(half::f16::from_bits(NEG_F16_BITS)), NEG_F32);
+        // Same open/blocked pattern in both dtypes.
+        for (i, &v) in v32.iter().enumerate() {
+            let h = u16::from_le_bytes([b16[2 * i], b16[2 * i + 1]]);
+            assert_eq!(v == 0.0, h == 0, "element {i}");
+        }
     }
 
     /// Feed `n` single-row tokens into `slot`, tagging each one's K/V with its
