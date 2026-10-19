@@ -614,6 +614,46 @@ The first non-Gemma family on the staged path, from `OpenVINO/pixtral-12b-int4-o
   400), so it no longer gives wrong image answers. A fix belongs upstream: a Pixtral
   `InputsEmbedder` doing what `pixtral_vision` here does.
 
+## Pixtral on `ov-genai`: no fix on our side (2026-10-19)
+
+Traced in GenAI `2026.4.1.0` (paths under `src/cpp/src/`):
+
+- **Model type.** `VLMConfig` reads `config.json` `model_type` (`visual_language/
+  vlm_config.cpp:61`); the export says `"llava"`, which maps to `LLAVA` (line 18).
+  `vision_config.model_type` is never read, and there is no `pixtral` or `mistral3`
+  entry, so a Mistral 3 export fails to load (`Unsupported 'mistral3' VLM model type`,
+  line 45). `inputs_embedder.cpp:366` and `vision_encoder.cpp:117` build the LLaVA-1.5
+  classes.
+- **Preprocessing** (`visual_language/llava/classes.cpp:11-33`): resize so the shortest
+  edge is `size.shortest_edge`, center-crop to `crop_size`, CLIP-normalise. Pixtral's
+  `preprocessor_config.json` has neither key (it has `size.longest_edge`), so the
+  defaults apply: 336 and 336x336 (`processor_config.hpp:45-47`). Every image becomes a
+  cropped square of 21x21 16-px patches; HF keeps the aspect ratio, fits the longest edge
+  in 1024 and rounds each side up to whole patches.
+- **Expansion** (`classes.cpp:92-113`): each image becomes `shape[1]` copies of
+  `im_start` plus `"\n"`. `im_start` is the hard-coded `"<image>"` (`vlm_config.hpp:55`;
+  no config key sets it), which the Pixtral (tekken) tokenizer splits into ordinary text:
+  `<image>` alone is `<` `image` `>` (1060 5497 1062), but 441 of them and the newline
+  are `<`, then `image` `><` (5497 4812) repeated, then `image` `>\n` (1561): 883 tokens.
+  The image id is the last piece of `<image>` alone, `>` (1062; `classes.cpp:133-137`),
+  which never occurs in the expanded run, so the merge (`utils.cpp:1038-1073`, which
+  overwrites runs of that id) finds nothing and **no image row reaches the model**: it
+  answers from the text `<image><image>...`. That is the 903: 20 text tokens + 883,
+  against HF's 832 (20 + 28 x 28 `[IMG]` + 27 `[IMG_BREAK]` + `[IMG_END]`; checked on
+  pawan-04 with the export's tokenizer). GenAI has no `[IMG_BREAK]` or `[IMG_END]` at all.
+- **Newer GenAI.** `master` at `3869223` (2026-10-19) only adds `minicpmv4_7` to the
+  model-type map and leaves `llava/` unchanged: no Pixtral path upstream yet.
+
+Nothing inside our control yields HF's prompt. The pipelines take no `inputs_embeds`
+(the public `VLMPipeline` and `ContinuousBatchingPipeline` take text and images only), so
+the shim cannot hand GenAI `pixtral_vision`'s rows. Config edits cannot change the square
+crop (fixed at load; the per-image options set only `patch_size`), the `<image>` tag or
+the extra `"\n"`. A wrapped vision IR that appends the break and end rows, plus a
+tokenizer IR that makes `<image>` one token, would still crop every image square and add
+a newline: HF-exact for square images only, and fragile. So `ov-genai` keeps Pixtral
+exports text only, and the API's `400` for an image now carries the reason and the
+`ov-runtime` commands (`Config::no_media_reason`).
+
 ## Static (NPU) and packed paths for vision trees (2026-10-16)
 
 `ov-runtime`'s static path (stateless shards, host-side KV ring) and its packed

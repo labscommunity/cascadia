@@ -2605,6 +2605,8 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             .flatten();
         if let (true, Some(why)) = (has_vision, genai_gap.as_ref()) {
             warn!(reason = %why, "ov-genai: serving this VLM export text only");
+            // The 400 that refuses its images names the alternative too.
+            cfg.no_media_reason = Some(why.clone());
         }
         let media_kind = match args.engine {
             // GenAI also reads the family's native tags as image slots, so
