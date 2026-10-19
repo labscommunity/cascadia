@@ -283,6 +283,8 @@ pub struct AppState {
     pub ready: Arc<std::sync::atomic::AtomicBool>,
     /// See [`Config::media`].
     pub media: Option<Arc<MediaConfig>>,
+    /// See [`Config::no_media_reason`].
+    pub no_media_reason: Option<Arc<str>>,
     /// Bytes of a chat request's text (everything but its image URLs), when
     /// the body limit was raised for images: [`Config::max_body_bytes`]. A
     /// text-only body may then be as large as the image allowance, and its
@@ -323,6 +325,10 @@ pub struct Config {
     /// by [`MediaConfig::max_request_image_bytes`]; their text stays held to
     /// `max_body_bytes` (see [`AppState::max_text_bytes`]).
     pub media: Option<MediaConfig>,
+    /// Why a model with a vision encoder still takes no images (no `media`),
+    /// appended to the 400 that refuses them, so the caller learns what
+    /// serves them instead (Pixtral on ov-genai).
+    pub no_media_reason: Option<String>,
 }
 
 impl Default for Config {
@@ -336,6 +342,7 @@ impl Default for Config {
             engine_applies_template: false,
             marker_dialect: None,
             media: None,
+            no_media_reason: None,
         }
     }
 }
@@ -671,6 +678,7 @@ pub fn make_router_with_stats(
         marker_dialect: cfg.marker_dialect.clone(),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         media: cfg.media.clone().map(Arc::new),
+        no_media_reason: cfg.no_media_reason.as_deref().map(Arc::from),
         max_text_bytes: cfg.media.as_ref().map(|_| cfg.max_body_bytes),
         decode_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
     };
@@ -2322,15 +2330,20 @@ async fn prepare_media(
         return Ok(None);
     }
     let Some(cfg) = state.media.clone() else {
+        let why = state
+            .no_media_reason
+            .as_deref()
+            .map(|r| format!(": {r}"))
+            .unwrap_or_default();
         return Err(reject(if count > 0 {
             format!(
-                "model `{}` does not accept image input (`image_url` content parts)",
+                "model `{}` does not accept image input (`image_url` content parts){why}",
                 state.model_id
             )
         } else {
             format!(
                 "model `{}` does not accept image input, which video input is served as \
-                 (`video_url` content parts)",
+                 (`video_url` content parts){why}",
                 state.model_id
             )
         }));
@@ -5938,6 +5951,37 @@ mod tests {
             "the gemma4 engine does not accept image input (1 image(s) in the request)".into(),
         ));
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A VLM export served without images (Pixtral on ov-genai) says why and
+    /// what serves them, after the usual refusal.
+    #[tokio::test]
+    async fn image_refusal_carries_the_no_media_reason() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            no_media_reason: Some("serve its images with ov-runtime".into()),
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({"model": "mock-model",
+                "messages": [image_msg("what is this?", &png_url(4, 4))]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(
+            v["error"]["message"],
+            "model `mock-model` does not accept image input (`image_url` content parts): \
+             serve its images with ov-runtime"
+        );
     }
 
     /// A body over the limit stays a 413, with a message that names the
