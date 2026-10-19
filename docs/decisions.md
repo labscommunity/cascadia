@@ -919,8 +919,10 @@ beyond a few clock reads per stage infer. Two events come from the API and one f
   `stage_ms` (per stage, comma-separated), `host_copy_ms`, `head_ms`, `reset_ms`, `recreate`,
   `total_ms`. `reset_ms` and `recreate` are the pass's own reset, which runs at admission
   (`reset_ms` equals `admit_reset_ms`): a cold pass's reset, with `recreate=true` when the
-  previous pass had restored a prefix-cache state. A warm hit runs no reset (`reset_ms` 0,
-  `recreate=false`), and after another decision pass its `prime_ms` is 0 too.
+  previous pass had restored a prefix-cache state. In the default restore mode a warm hit runs no reset (`reset_ms` 0,
+  `recreate=false`), and after another decision pass its `prime_ms` is 0 too. With
+  `CASCADIA_QWEN36_RESTORE_CLEAR=recreate` or `reset` a hit scrubs first as before, so it
+  recreates and primes.
 
 **Primed requests between passes (single box).** A decision pass no longer scrubs the stage
 requests when it finishes. Before, the finish recreated every stage request (because the pass had
@@ -932,10 +934,15 @@ the prefix cache writes the restored state straight over them. This is safe beca
 request's, and every state must apply); a failed restore recreates the requests and prefills
 cold. Every other admission (a cold decision pass, chat, a kv_coord restore, the scrub after a
 failed task, a stage recovery) runs the deferred scrub first, a recreate, so nothing prefills on
-the finished pass's state. Pipelines are unchanged: they reset after every pass. In the Task 51
-spike on pawan-03 (Arc 140V, 40 td40 Kev cases), this cut a Kev restore from 302 ms to 92 ms
-(p50) with bit-identical answers, and projected Kev p50 from 3.56 s to about 2.49 s. JEV passes
-are cold, so JEV does not gain.
+the finished pass's state. Pipelines are unchanged: they reset after every pass. The cost of that
+scrub moves rather than disappearing: a chat that follows a decision pass pays the recreate at its
+own admission (before its first token), where before the decision request paid it at its finish.
+Measured on pawan-03 (Arc 140V, 40 td40 cases, build 8f6d8f1a vs 0c61635a): a Kev restore fell
+from about 300 ms to about 91-100 ms with `prime_ms` 0 and no recreate, and Kev p50 fell from
+3.56 s to 2.41 s (-32%, p90 4.13 s to 2.85 s). Answers were identical (max |dp| 0, no flips) for
+Kev, JEV and Clef; JEV (3.50 to 3.41 s) and Clef (1.41 to 1.38 s) stay within noise, since their
+passes rarely restore. A temperature-0 chat returned the same text before and after the decision
+runs.
 
 `tools/decision/bench_cases.py` drives a running server and compares runs:
 

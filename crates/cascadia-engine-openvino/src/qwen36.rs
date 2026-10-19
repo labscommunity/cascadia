@@ -4604,8 +4604,10 @@ impl Qwen36Engine {
     /// Admission on the single-process path when the plane had no warm blob for this turn: it is
     /// not compiled in, it held nothing, or the blob it held FAILED to restore (that arm scrubs
     /// the half-applied state first, then falls through here). Restores the longest cached prefix
-    /// of `prompt_ids` over the live (already reset) requests and returns the resume depth, else
-    /// cold-resets and returns 0.
+    /// of `prompt_ids` over the live requests and returns the resume depth, else cold-resets and
+    /// returns 0. The live requests are either already scrubbed or, since Task 55, the previous
+    /// decision pass's primed ones (its finish deferred the scrub). A caller that is not a
+    /// decision warm hit must run the deferred scrub (`scrub_deferred_decision`) first.
     fn local_warm_or_cold(&mut self, prompt_ids: &[u32]) -> usize {
         if self.prefix_cache.enabled() {
             if let Some((parts, len)) = self.prefix_cache.longest_prefix(prompt_ids) {
