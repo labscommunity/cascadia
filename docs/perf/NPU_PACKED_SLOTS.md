@@ -76,6 +76,40 @@ It emits `openvino_packed_model.xml` beside the decode IR and records
 `packed_slots` / `packed_seq` / `packed_context` / `packed_region` in
 `stage_config.json`.
 
+**Decode width.** A `packed_seq`-wide IR leaves room for prefill chunks, but a
+decode step has only one live row per slot. Each stage runs a plan at the
+narrowest width it has compiled, so give it a narrow one:
+
+```bash
+# NPU (static shapes): a second, narrow IR for decode steps (D >= slots)
+python tools/packed_variant.py <stage_dir> --slots 4 --packed-seq 64 --decode-seq 4
+# CPU/GPU, from a --shared-prefill static tree: one IR with a dynamic query width
+python tools/packed_variant.py <stage_dir> --slots 4 --packed-seq 64 --dynamic-seq
+```
+
+`--decode-seq D` writes `openvino_packed_decode_model.xml` (`packed_decode_seq`),
+a second compile with its own resident weights; `--dynamic-seq` (`packed_dynamic`)
+runs each decode step at its live rows. Prefill chunks stay `packed_seq` rows
+wide either way, and a decode step ships only its live rows to the next stage.
+Without either, every decode step runs at `packed_seq` rows as before.
+
+Measured on Lunar Lake, Qwen3-VL-4B one-stage tree (`--context 2048 --prefill-seq 64
+--shared-prefill`, `--slots 4 --packed-seq 64`), 128 greedy tokens, 1 and 3 requests:
+
+| CPU | s/step (1 req) | tok/s (3 req, total) | greedy text vs 64 rows |
+|---|---|---|---|
+| 64 rows (no flag) | 1.92 | 1.53 | — |
+| `--decode-seq 4` | 0.75 | 3.69 | identical, all 3 requests |
+| `--dynamic-seq` | 0.94 | 3.02 | 2 of 3 identical; one diverges at token ~80 |
+
+`--decode-seq` is the faster of the two on the CPU too (a static shape beats the
+dynamic one), at the cost of a second resident weight copy. Most of what remains
+is the per-step copy of the whole past KV window in and out (the static path,
+one row a step, takes 0.84 s on the same tree). On the Arc 140V iGPU the packed
+path returns garbage at every width (`--dynamic-seq`: non-finite logits), while
+the static path there is correct; packed slots are CPU/NPU only until that is
+fixed.
+
 The host side lives in `crates/cascadia-engine-openvino/src/packed.rs`. The KV
 window is partitioned into `region = past_len / slots` per slot; slot `s` owns
 `[s*region, (s+1)*region)` in every layer and head. A `PackedPlan` maps each

@@ -739,8 +739,10 @@ and multi-stage, text and image requests in the same inference:
   (some other node consumes it), and a mixed-geometry Gemma stage whose packed IR has
   no sliding port (built without `layer_types`). `token_type_ids` kept by the tool
   (something besides the masks reads it) is fed 1 on image rows.
-- **Constraints.** Every packed inference is `packed_seq` rows, so `--packed-seq 288`
-  (one image) makes each decode step a 288-row inference. `static_variant.py` still
+- **Constraints.** Every packed prefill chunk is `packed_seq` rows, and so is a decode
+  step unless the stage has a narrower width (`packed_variant.py --dynamic-seq` on
+  CPU/GPU, `--decode-seq` on the NPU), so `--packed-seq 288` (one image) alone makes
+  each decode step a 288-row inference. `static_variant.py` still
   caps context plus prefill at the window + 1, because the static IR it also writes
   masks by ring index; at `--context 736` two slots hold 367 tokens each, one image
   and its text.
