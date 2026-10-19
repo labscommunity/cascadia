@@ -729,27 +729,10 @@ impl Frontend {
         )?;
         let groups = p.grid_thw[0] as usize;
         let per = p.llm_tokens(self.layout.merge) / groups.max(1) * self.hidden;
-        let layers = self.deepstack_layers;
-        let mut rows = Vec::with_capacity(per * groups * (1 + layers));
-        let mut ds: Vec<Vec<f32>> = Vec::with_capacity(groups);
-        for g in 0..groups {
-            let mut all = self.encode(&video::temporal_group(&p, g))?;
-            if all.len() != per * (1 + layers) {
-                return Err(format!(
-                    "temporal group {g}: {} encoded values, expected {}",
-                    all.len(),
-                    per * (1 + layers)
-                ));
-            }
-            ds.push(all.split_off(per));
-            rows.extend_from_slice(&all);
-        }
-        for l in 0..layers {
-            for d in &ds {
-                rows.extend_from_slice(&d[l * per..(l + 1) * per]);
-            }
-        }
-        Ok(rows)
+        let encoded = (0..groups)
+            .map(|g| self.encode(&video::temporal_group(&p, g)))
+            .collect::<Result<Vec<_>, _>>()?;
+        join_groups(encoded, per, self.deepstack_layers)
     }
 
     /// One preprocessed image's rows `[tokens, hidden]` and (Qwen3-VL) its
@@ -816,6 +799,30 @@ impl Frontend {
 pub fn grid_for_size(width: u32, height: u32, cfg: &PreprocessConfig) -> Result<[u32; 3], String> {
     let (h, w) = smart_resize(height, width, cfg.factor(), cfg.min_pixels, cfg.max_pixels)?;
     Ok([1, h / cfg.patch_size, w / cfg.patch_size])
+}
+
+/// A video's encoded temporal groups (each its rows `per` values, then
+/// `layers` DeepStack blocks of `per`) as one item: every group's rows in
+/// order, then each DeepStack layer over every group, layer-major as one
+/// image's.
+fn join_groups(groups: Vec<Vec<f32>>, per: usize, layers: usize) -> Result<Vec<f32>, String> {
+    let mut rows = Vec::with_capacity(per * groups.len() * (1 + layers));
+    for (g, all) in groups.iter().enumerate() {
+        if all.len() != per * (1 + layers) {
+            return Err(format!(
+                "temporal group {g}: {} encoded values, expected {}",
+                all.len(),
+                per * (1 + layers)
+            ));
+        }
+        rows.extend_from_slice(&all[..per]);
+    }
+    for l in 1..=layers {
+        for all in &groups {
+            rows.extend_from_slice(&all[l * per..(l + 1) * per]);
+        }
+    }
+    Ok(rows)
 }
 
 /// One video item must hold `num_frames >= 1` frames of its size, and (for
@@ -1120,6 +1127,24 @@ mod tests {
         assert_eq!((md, ed, kd), (vec![0], vec![0.0], 0));
         // Feeding past the turn's image tokens is an error, not a bad slice.
         assert!(deepstack_window(&[9], 9, &g, total, 3, 1, 1, 1).is_err());
+    }
+
+    /// Two groups of 2 values with 2 DeepStack layers: rows of both groups,
+    /// then layer 0 of both, then layer 1 of both.
+    #[test]
+    fn video_groups_join_layer_major() {
+        let g0 = vec![1.0, 2.0, 10.0, 11.0, 20.0, 21.0];
+        let g1 = vec![3.0, 4.0, 12.0, 13.0, 22.0, 23.0];
+        assert_eq!(
+            join_groups(vec![g0.clone(), g1], 2, 2).unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0, 10.0, 11.0, 12.0, 13.0, 20.0, 21.0, 22.0, 23.0]
+        );
+        // No DeepStack (Qwen2.5-VL): the rows alone.
+        assert_eq!(
+            join_groups(vec![vec![1.0], vec![2.0]], 1, 0).unwrap(),
+            vec![1.0, 2.0]
+        );
+        assert!(join_groups(vec![g0], 2, 1).is_err());
     }
 
     #[test]
