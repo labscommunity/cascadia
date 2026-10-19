@@ -37,10 +37,12 @@ impl Engine for MockEngine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
-        // Media is accepted and ignored on purpose: the API's image tests use
-        // the mock as an image-capable stand-in (the echo shows where each
+        // Images are accepted and ignored on purpose: the API's image tests
+        // use the mock as an image-capable stand-in (the echo shows where each
         // placeholder landed). Real text-only engines refuse it in `submit`
-        // via `cascadia_engine::refuse_media`.
+        // via `cascadia_engine::refuse_media`. A native video item is refused,
+        // as on every engine but ov-genai.
+        cascadia_engine::refuse_video(&task, "mock")?;
         if self.pending.iter().any(|(t, _)| t.task_id == task.task_id) {
             return Ok(());
         }

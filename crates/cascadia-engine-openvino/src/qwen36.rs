@@ -1255,6 +1255,11 @@ impl Qwen36Engine {
         for (i, m) in task.media.iter().enumerate() {
             match m.kind {
                 cascadia_types::MediaKind::Image => {}
+                cascadia_types::MediaKind::Video => {
+                    return Err(format!(
+                        "media {i}: native video is not supported (send frames)"
+                    ))
+                }
                 #[allow(unreachable_patterns)]
                 other => return Err(format!("media {i}: {other:?} is not supported")),
             }
@@ -2957,6 +2962,7 @@ impl Engine for Qwen36Engine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        cascadia_engine::refuse_video(&task, "qwen35")?;
         if self.vision.is_none() {
             cascadia_engine::refuse_media(&task, "qwen35 (tree without vision IRs)")?;
         }
