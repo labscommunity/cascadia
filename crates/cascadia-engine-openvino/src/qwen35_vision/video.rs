@@ -193,6 +193,32 @@ pub fn frame_markup(group_times: &[f64]) -> String {
         .collect()
 }
 
+/// The prompt text a Qwen3-VL / Qwen3.5 rank 0 tokenizes: each video's
+/// `<|video_pad|>` replaced by its [`frame_markup`] (frames grouped by
+/// `temporal`). Unchanged without videos. A video without a time per frame
+/// keeps its one pad, for the expansion to refuse.
+pub fn with_frame_markup<'a>(
+    prompt: &'a str,
+    media: &[cascadia_types::MediaInput],
+    temporal: usize,
+) -> std::borrow::Cow<'a, str> {
+    use cascadia_types::MediaKind;
+    if !media.iter().any(|m| m.kind == MediaKind::Video) {
+        return std::borrow::Cow::Borrowed(prompt);
+    }
+    let markups: Vec<String> = media
+        .iter()
+        .filter(|m| m.kind == MediaKind::Video)
+        .map(|m| match m.timestamps_ms.as_deref() {
+            Some(ts) if ts.len() == m.num_frames as usize && !ts.is_empty() => {
+                frame_markup(&group_times(ts, temporal))
+            }
+            _ => VIDEO_PAD.to_owned(),
+        })
+        .collect();
+    std::borrow::Cow::Owned(expand_video_text(prompt, &markups))
+}
+
 /// `prompt` with its `k`-th `<|video_pad|>` replaced by `markups[k]`. A
 /// count mismatch leaves the prompt as it is, for the pad expansion to
 /// refuse with the counts.

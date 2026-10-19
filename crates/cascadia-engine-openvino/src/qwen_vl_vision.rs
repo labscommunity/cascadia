@@ -429,20 +429,12 @@ impl Layout {
     /// ([`video::frame_markup`]), which HF's processor writes into the text
     /// before tokenizing. Unchanged without videos and on Qwen2.5-VL.
     pub fn prompt_text<'a>(&self, prompt: &'a str, media: &[MediaInput]) -> Cow<'a, str> {
-        if self.kind != Kind::Qwen3Vl || !media.iter().any(|m| m.kind == MediaKind::Video) {
-            return Cow::Borrowed(prompt);
+        match self.kind {
+            Kind::Qwen3Vl => {
+                video::with_frame_markup(prompt, media, self.video.temporal_patch_size as usize)
+            }
+            Kind::Qwen25Vl => Cow::Borrowed(prompt),
         }
-        let tp = self.video.temporal_patch_size as usize;
-        let markups: Vec<String> = media
-            .iter()
-            .filter(|m| m.kind == MediaKind::Video)
-            .map(|m| match m.timestamps_ms.as_deref() {
-                Some(ts) if !ts.is_empty() => video::frame_markup(&video::group_times(ts, tp)),
-                // Refused by `plan`; one pad keeps the counts honest meanwhile.
-                _ => video::VIDEO_PAD.to_owned(),
-            })
-            .collect();
-        Cow::Owned(video::expand_video_text(prompt, &markups))
     }
 
     /// Every item's tokens and grid from its size alone (no encode).
