@@ -33,10 +33,11 @@ Decode width. A decode step has one live row per slot, so running it at the
 full `--packed-seq` width pays for idle rows. Two ways out, recorded in
 `stage_config.json` for the runtime:
 
-- `--dynamic-seq` (CPU/GPU, from a `--shared-prefill` static tree): the packed
+- `--dynamic-seq` (CPU, from a `--shared-prefill` static tree): the packed
   IR keeps its query width dynamic (up to `--packed-seq`), and every decode
   step runs at its live rows (`packed_dynamic`).
-- `--decode-seq D` (NPU, static shapes): a second, narrow packed IR at D rows
+- `--decode-seq D` (static shapes, meant for the NPU; measured on CPU only, the
+  NPU's acceptance and output are untested): a second, narrow packed IR at D rows
   (`openvino_packed_decode_model.xml`, D >= slots) beside the wide one; decode
   steps run on it (`packed_decode_seq`). It costs a second compile and its own
   resident copy of the weights.
@@ -525,14 +526,15 @@ def main():
     ap.add_argument(
         "--dynamic-seq",
         action="store_true",
-        help="CPU/GPU: keep the query width dynamic (up to --packed-seq) so a decode "
+        help="CPU: keep the query width dynamic (up to --packed-seq) so a decode "
              "step runs at its live rows; needs a --shared-prefill static tree",
     )
     ap.add_argument(
         "--decode-seq",
         type=int,
         default=None,
-        help="NPU: also write a narrow static decode IR with this many rows "
+        help="static shapes (meant for the NPU, measured on CPU only): also write a "
+             "narrow decode IR with this many rows "
              "(>= --slots, < --packed-seq) for decode steps",
     )
     args = ap.parse_args()

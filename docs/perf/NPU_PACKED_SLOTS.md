@@ -81,15 +81,19 @@ decode step has only one live row per slot. Each stage runs a plan at the
 narrowest width it has compiled, so give it a narrow one:
 
 ```bash
-# NPU (static shapes): a second, narrow IR for decode steps (D >= slots)
+# static shapes (designed for the NPU; measured on CPU only): a second, narrow
+# IR for decode steps (D >= slots)
 python tools/packed_variant.py <stage_dir> --slots 4 --packed-seq 64 --decode-seq 4
-# CPU/GPU, from a --shared-prefill static tree: one IR with a dynamic query width
+# CPU, from a --shared-prefill static tree: one IR with a dynamic query width
 python tools/packed_variant.py <stage_dir> --slots 4 --packed-seq 64 --dynamic-seq
 ```
 
 `--decode-seq D` writes `openvino_packed_decode_model.xml` (`packed_decode_seq`),
-a second compile with its own resident weights; `--dynamic-seq` (`packed_dynamic`)
-runs each decode step at its live rows. Prefill chunks stay `packed_seq` rows
+a second compile with its own resident weights (the load log names its size);
+`--dynamic-seq` (`packed_dynamic`) runs each decode step at its live rows and is
+refused on the NPU. `--decode-seq` is meant for the NPU's static shapes, but it
+has only been measured on the CPU: whether the NPU compiler accepts the narrow
+IR, and what it outputs there, is untested. Prefill chunks stay `packed_seq` rows
 wide either way, and a decode step ships only its live rows to the next stage.
 Without either, every decode step runs at `packed_seq` rows as before.
 
@@ -98,17 +102,22 @@ Measured on Lunar Lake, Qwen3-VL-4B one-stage tree (`--context 2048 --prefill-se
 
 | CPU | s/step (1 req) | tok/s (3 req, total) | greedy text vs 64 rows |
 |---|---|---|---|
-| 64 rows (no flag) | 1.92 | 1.53 | — |
+| 64 rows, build before narrow decode | 1.95 | 1.48 | — |
+| 64 rows (no flag), this build | 1.92 | 1.53 | identical, all 3 requests |
 | `--decode-seq 4` | 0.75 | 3.69 | identical, all 3 requests |
 | `--dynamic-seq` | 0.94 | 3.02 | 2 of 3 identical; one diverges at token ~80 |
+
+The `--dynamic-seq` divergence is the dynamic-shape compile, not the narrow width:
+the same dynamic IR run at the full 64 rows every step (the build before narrow
+decode, which ignores `packed_dynamic`) gives the same diverging text.
 
 `--decode-seq` is the faster of the two on the CPU too (a static shape beats the
 dynamic one), at the cost of a second resident weight copy. Most of what remains
 is the per-step copy of the whole past KV window in and out (the static path,
 one row a step, takes 0.84 s on the same tree). On the Arc 140V iGPU the packed
 path returns garbage at every width (`--dynamic-seq`: non-finite logits), while
-the static path there is correct; packed slots are CPU/NPU only until that is
-fixed.
+the static path there is correct; the load warns, and packed slots are CPU/NPU
+only until that is fixed.
 
 The host side lives in `crates/cascadia-engine-openvino/src/packed.rs`. The KV
 window is partitioned into `region = past_len / slots` per slot; slot `s` owns
