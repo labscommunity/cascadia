@@ -2243,8 +2243,8 @@ impl Frontend {
     /// The rendered prompt of a turn with images as the tokenizer must see
     /// it. Gemma 3 expands each `<start_of_image>` on the text, as HF's
     /// processor does (its "\n\n" framing merges with the neighbouring
-    /// text's tokens), and Qwen3-VL writes each video's timestamp markup;
-    /// the other families expand on ids in `prepare`.
+    /// text's tokens), and Qwen3-VL and Gemma 4 write each video's timestamp
+    /// markup; the other families expand on ids in `prepare`.
     pub(crate) fn prompt_text<'a>(
         &self,
         prompt: &'a str,
@@ -2253,8 +2253,8 @@ impl Frontend {
         match self {
             Frontend::Gemma3(f) => std::borrow::Cow::Owned(f.expand_text(prompt)),
             Frontend::QwenVl(f) => f.prompt_text(prompt, media),
-            Frontend::Gemma4(_)
-            | Frontend::Pixtral(_)
+            Frontend::Gemma4(f) => f.prompt_text(prompt, media),
+            Frontend::Pixtral(_)
             | Frontend::LlavaNext(_)
             | Frontend::Phi3V(_)
             | Frontend::InternVL(_) => std::borrow::Cow::Borrowed(prompt),
@@ -2262,12 +2262,13 @@ impl Frontend {
     }
 
     /// Whether the family takes a `MediaKind::Video` item natively (the API
-    /// sends every other family a video's frames as images).
+    /// sends every other family a video's frames as images): Qwen VL, and
+    /// Gemma 4 when its tokenizer has `<|video|>`.
     pub(crate) fn takes_video(&self) -> bool {
         match self {
             Frontend::QwenVl(_) => true,
-            Frontend::Gemma4(_)
-            | Frontend::Gemma3(_)
+            Frontend::Gemma4(f) => f.takes_video(),
+            Frontend::Gemma3(_)
             | Frontend::Pixtral(_)
             | Frontend::LlavaNext(_)
             | Frontend::Phi3V(_)
@@ -2439,10 +2440,11 @@ impl Frontend {
     }
 
     /// Most tokens one image's bidirectional run can take, for families that
-    /// attend bidirectionally inside images.
+    /// attend bidirectionally inside images (on Gemma 4 a video frame is a
+    /// run of its own, at the video processor's budget).
     fn max_image_tokens(&self) -> Option<usize> {
         match self {
-            Frontend::Gemma4(f) => Some(f.preprocess.max_soft_tokens as usize),
+            Frontend::Gemma4(f) => Some(f.max_run_tokens()),
             Frontend::Gemma3(f) => Some(f.preprocess.image_seq_length as usize),
             Frontend::Pixtral(_)
             | Frontend::LlavaNext(_)
@@ -2454,8 +2456,14 @@ impl Frontend {
 
     pub(crate) fn describe(&self) -> String {
         match self {
+            Frontend::Gemma4(f) if f.takes_video() => format!(
+                "Gemma 4 images, {} soft tokens each at most; videos whole, {} soft tokens a \
+                 frame at most, up to {} frames",
+                f.preprocess.max_soft_tokens, f.video.frame.max_soft_tokens, f.video.num_frames
+            ),
             Frontend::Gemma4(f) => format!(
-                "Gemma 4 images, {} soft tokens each at most",
+                "Gemma 4 images, {} soft tokens each at most (no <|video|> in the tokenizer: \
+                 videos arrive as frames)",
                 f.preprocess.max_soft_tokens
             ),
             Frontend::Gemma3(f) => format!(
@@ -2577,10 +2585,16 @@ impl VisionFirst {
                     eoi: id("eoi_token_id")?,
                     pad: id("pad_token_id")?,
                 };
-                Frontend::Gemma4(
-                    crate::gemma4_vision::ImageFrontend::load(pipeline_dir, tokens)
-                        .map_err(invalid)?,
-                )
+                let mut f = crate::gemma4_vision::ImageFrontend::load(pipeline_dir, tokens)
+                    .map_err(invalid)?;
+                // Native video, as the gemma4 engine: only with `<|video|>`
+                // in the tree's tokenizer (the CLI's `tree_has_video_token`
+                // routes videos here on the same condition).
+                let tok_path = pipeline_dir.join("tokenizer").join("tokenizer.json");
+                if let Ok(tok) = Tokenizer::from_file(&tok_path) {
+                    f.enable_video_from_tokenizer(&tok);
+                }
+                Frontend::Gemma4(f)
             }
             VisionFamily::Gemma3 => {
                 // The ids are in config.json; the processor expands the
@@ -6108,7 +6122,8 @@ impl Engine for OvRuntimeEngine {
                 "non-first stage does not accept tasks directly".into(),
             ));
         }
-        // Qwen VL trees take a video whole; every other tree gets frames.
+        // Qwen VL trees and Gemma 4 trees with `<|video|>` take a video
+        // whole; every other tree gets frames.
         if !self
             .vision
             .as_ref()
@@ -8500,6 +8515,20 @@ mod tests {
         assert_eq!(image_safe_take(&[], 0, 4), Ok(4)); // no token types
         assert_eq!(image_safe_take(&t, 6, 4), Ok(4)); // runs off the end
         assert_eq!(image_safe_take(&[1], 0, 1), Ok(1)); // a 1-token image
+    }
+
+    /// A Gemma 4 video's frames are runs of their own (stage ids carry the
+    /// soft tokens as `<|image|>`, framed and labelled per frame), so a
+    /// static prefill chunk may end between two frames but never inside one.
+    #[test]
+    fn image_safe_take_cuts_a_video_between_frames() {
+        // text, frame 0 (3), eoi + label + boi, frame 1 (3), text
+        let t = [0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 0];
+        assert_eq!(image_safe_take(&t, 0, 8), Ok(8)); // after frame 0's framing
+        assert_eq!(image_safe_take(&t, 0, 10), Ok(8)); // would split frame 1
+        assert_eq!(image_safe_take(&t, 2, 3), Ok(3)); // exactly frame 0
+        assert_eq!(image_safe_take(&t, 8, 4), Ok(4));
+        assert!(image_safe_take(&t, 8, 2).is_err()); // a frame wider than the chunk
     }
 
     /// Layers with different KV geometry (Gemma 4: 8x256 sliding, 2x512

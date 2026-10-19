@@ -43,3 +43,11 @@ tokens per frame and summaries of `pixel_values_videos` / `video_position_ids`; 
 the template, the text HF tokenized, `input_ids`, `mm_token_type_ids` and the attention
 block ids. HF's video processor resizes with torchvision only; the Rust port (Pillow-exact
 bicubic) is within 2/255 of it.
+
+`video_reference_26b_31b.json` (`--model <gemma-4-26B-A4B-it> --model <gemma-4-31B-it> --name
+video_reference_26b_31b.json`, configs and tokenizer only): the same cases for the two
+models, which give identical references (the generator checks), plus per chat HF's
+`sliding_attention` and `full_attention` masks (`create_masks_for_vision_model`, sliding
+window 1024), each row as the one `[first, last]` key range it sees, which pin the
+ov-runtime packed host masks. The E4B file was regenerated with the same tool (it gains
+`sources` and `tokens.sliding_window`; everything else is unchanged).
