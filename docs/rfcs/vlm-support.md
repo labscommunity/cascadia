@@ -170,7 +170,9 @@ something, we fail the way OpenAI fails: same status code, same error object.
 - **Errors.** Every new rejection uses the OpenAI error object with the right `type`
   (`invalid_request_error`), `param`, and status:
   - 400: bad part, unsupported image, images sent to a text-only model;
-  - 413: over the byte cap.
+  - 413: over the byte cap;
+  - 400 `context_length_exceeded` (`param` the prompt field): a prompt whose images
+    take it past the context, as OpenAI answers it (this was a 413 until 2026-10-20).
 - **`/v1/models`.** OpenAI's list has no capability field. Advertising vision support
   there needs an additive field that clients ignore (e.g. `"capabilities": {"vision": true}`),
   so the standard schema stays untouched.
@@ -678,7 +680,8 @@ serve causal vision trees. Pixtral is the one today.
   is matched and populated only up to a prompt's first image token: every image of one
   size has the same ids, so matching past it would reuse another image's K/V. Images
   are encoded at `submit`, so a prompt that outgrows the slot's region is refused there
-  with the same 413 `context_length_exceeded` a long text prompt gets.
+  with the same `context_length_exceeded` a long text prompt gets (a 400 since
+  2026-10-20; the runs below predate it and record the 413 of the time).
 - **Gemma 4** (`token_type_ids` trees) was refused here at first; it is served on the
   static path since 2026-10-16 (next section) and on packed slots since the same day
   (see "Gemma 4 on packed slots").

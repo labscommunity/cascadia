@@ -93,7 +93,7 @@ cut by `tools/vlm_surgery/cut_vlm_lm.py --all-logits`. Only the target sees imag
   MiB inside the last stage, and one 256 KiB row on the wire). A worker built before
   kind 10 refuses it loudly (`bad kind 10`): upgrade every rank together.
 - **Window**: `submit` answers a prompt at or past the target's `max_position_embeddings`
-  with a 413, sizing image turns from their dimensions before any encode.
+  with a 400 `context_length_exceeded`, sizing image turns from their dimensions before any encode.
 - **Workers** are unchanged: hidden states and the mask travel as for any v5 tree.
 
 What a target tree must provide, and how a `cut_vlm_lm.py` tree meets it:
