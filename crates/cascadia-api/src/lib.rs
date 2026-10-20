@@ -5430,7 +5430,7 @@ mod tests {
     /// claim `context_length_exceeded`.
     #[tokio::test]
     async fn prompt_byte_limit_stays_413_without_context_code() {
-        let mut runner = Runner::new(Box::new(MockBuilder::new()));
+        let runner = Runner::new(Box::new(MockBuilder::new()));
         runner
             .start(
                 PeerLayout::single_stage(),
