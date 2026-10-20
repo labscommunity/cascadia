@@ -369,6 +369,12 @@ Pass the snapshot path to `--model` (a pinned download is not resolvable by repo
 offline). `--vision` takes the vision encoder IR and processor configs from the
 OpenVINO export.
 
+Rank 0 reads the window from `tokenizer/config.json` (`text_config.max_position_embeddings`,
+written by the export) and refuses a prompt at or past it with a 400
+`context_length_exceeded`, counted with every image and video expanded to its soft tokens
+(from their sizes, before anything is encoded); a turn's completion stops at the window.
+A tree without that file loads with the guard off and says so in its log.
+
 ### Pixtral (ov-runtime)
 
 ```bash
