@@ -651,8 +651,13 @@ pub fn decode_image_bytes(
     // rotation, as there. A quarter turn swaps the sides; every size check
     // (per side, total, aspect ratio) is the same either way round.
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-    let mut image = DynamicImage::from_decoder(decoder)
-        .map_err(|e| format!("could not decode the image: {e}"))?;
+    // To RGB8 first (the decoded buffer, up to 8 bytes a pixel, is freed by
+    // the conversion), then turned: the rotated copy is 3 bytes a pixel, so
+    // the peak is the decoded buffer plus one RGB8 image, or two RGB8 images.
+    let rgb = DynamicImage::from_decoder(decoder)
+        .map_err(|e| format!("could not decode the image: {e}"))?
+        .into_rgb8();
+    let mut image = DynamicImage::ImageRgb8(rgb);
     image.apply_orientation(orientation);
     let mut rgb = image.into_rgb8();
 
@@ -1165,6 +1170,32 @@ mod tests {
         assert!(px(8, 27)[2] > 200 && px(8, 27)[0] < 60, "{:?}", px(8, 27));
         // The header size is still checked either way round.
         assert_eq!(source_size(&jpeg(Some(&exif)), &cfg), Ok((32, 16)));
+        // A 16-bit RGBA PNG is turned too, after its conversion to RGB8.
+        let wide = image::ImageBuffer::<image::Rgba<u16>, _>::from_fn(32, 16, |x, _| {
+            if x < 16 {
+                image::Rgba([65535, 0, 0, 65535])
+            } else {
+                image::Rgba([0, 0, 65535, 65535])
+            }
+        });
+        let mut png = Vec::new();
+        let mut enc = image::codecs::png::PngEncoder::new(&mut png);
+        enc.set_exif_metadata(exif.to_vec()).unwrap();
+        enc.write_image(
+            &wide
+                .as_raw()
+                .iter()
+                .flat_map(|v| v.to_ne_bytes())
+                .collect::<Vec<u8>>(),
+            32,
+            16,
+            image::ExtendedColorType::Rgba16,
+        )
+        .unwrap();
+        let m = decode_image_bytes(&png, None, &cfg).unwrap();
+        assert_eq!((m.width, m.height), (16, 32));
+        assert_eq!(&m.pixels[(4 * 16 + 8) * 3..][..3], &[255, 0, 0]);
+        assert_eq!(&m.pixels[(27 * 16 + 8) * 3..][..3], &[0, 0, 255]);
     }
 
     /// A source at the pixel limit may decode to 16-bit RGBA (8 bytes a
