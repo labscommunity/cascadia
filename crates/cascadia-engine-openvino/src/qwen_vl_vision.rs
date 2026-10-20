@@ -548,6 +548,14 @@ impl Layout {
         Ok(self.feed_ids(self.expand_true(&plan, prompt_ids)?))
     }
 
+    /// The pads the turn's images and videos expand to, from their sizes
+    /// alone: their soft tokens, without the vision start / end framing or
+    /// Qwen3-VL's timestamp text (ov-genai sizes its prompts from this).
+    pub fn media_tokens(&self, media: &[MediaInput]) -> Result<usize, String> {
+        let plan = self.plan(media)?;
+        Ok(plan.image_counts.iter().chain(&plan.video_counts).sum())
+    }
+
     /// [`Self::expand_ids`] and HF's positions over the expanded prompt, and
     /// each item's grid in prompt order.
     pub fn prepare_ids(
