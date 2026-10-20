@@ -44,7 +44,8 @@ pub struct ResponsesRequest {
     /// Only `{"format": {"type": "text"}}`; structured output is refused.
     #[serde(default)]
     pub text: Option<Value>,
-    /// Only `"disabled"`: a prompt over the window is a 413, never trimmed.
+    /// Only `"disabled"`: a prompt over the window is a 400
+    /// `context_length_exceeded`, never trimmed.
     #[serde(default)]
     pub truncation: Option<String>,
     /// Only `"none"` or `"auto"`, which with no tools mean the same.
@@ -584,7 +585,7 @@ pub(crate) async fn create_response(
     if req.stream {
         return stream_response(state, shell, admitted).await;
     }
-    let c = match collect_generation(&state, admitted, &[]).await {
+    let c = match collect_generation(&state, admitted, &[], "input").await {
         Ok(c) => c,
         Err(resp) => return resp,
     };
@@ -757,7 +758,7 @@ async fn stream_response(
         Ok(s) => s,
         Err(err) => {
             warn!(error = %err, "responses-stream: generate failed");
-            return engine_error_response(err);
+            return engine_error_response(err, "input");
         }
     };
     let st = ResponseStream {
