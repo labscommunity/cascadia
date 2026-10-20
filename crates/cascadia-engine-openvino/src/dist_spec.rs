@@ -502,6 +502,11 @@ pub struct MaskedReq {
     cache_len: usize,
     logical_pos: usize,
     inputs: std::collections::HashMap<String, String>,
+    /// The model's vocabulary when known: `feed` refuses ids past it. The
+    /// prompt is checked at admission, but the draft is also fed every token
+    /// the TARGET samples, and a target with a wider (padded) vocabulary can
+    /// sample one the draft's embedding table cannot index.
+    vocab: Option<usize>,
 }
 
 #[cfg(feature = "kv_coord")]
@@ -570,6 +575,7 @@ impl MaskedReq {
             cache_len: 0,
             logical_pos: 0,
             inputs,
+            vocab: None,
         })
     }
 
@@ -584,6 +590,15 @@ impl MaskedReq {
     }
 
     pub fn feed(&mut self, input_ids: &[i64]) -> Result<(Vec<f32>, [usize; 3]), EngineError> {
+        if let Some(vocab) = self.vocab {
+            if let Some(t) = input_ids.iter().find(|&&t| t < 0 || t as usize >= vocab) {
+                return Err(EngineError::Backend(format!(
+                    "token {t} is outside the draft's {vocab}-token vocabulary (the target \
+                     sampled an id the draft cannot embed); the draft must share the target's \
+                     tokenizer"
+                )));
+            }
+        }
         let n = input_ids.len();
         let total = self.cache_len + n;
         if total > self.valid_mask.len() {
@@ -2640,7 +2655,8 @@ impl Builder for OvDistSpecBuilder {
             tokio::runtime::Handle::current(),
             self.vision,
         )?;
-        let masked_draft = MaskedReq::new(draft)?;
+        let mut masked_draft = MaskedReq::new(draft)?;
+        masked_draft.vocab = self.draft_vocab;
         Ok(Box::new(OvDistSpecEngine {
             #[cfg(feature = "kv_coord")]
             kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
@@ -4243,5 +4259,26 @@ mod tests {
         let (kind, rx) = h.await.unwrap();
         assert_eq!(kind, FrameKind::LogitsResponse);
         assert_eq!(rx, logits);
+    }
+
+    /// The draft refuses a target-sampled id past its vocabulary instead of
+    /// handing OpenVINO an out-of-range embedding index.
+    #[cfg(not(feature = "openvino"))]
+    #[test]
+    fn draft_feed_refuses_ids_past_its_vocabulary() {
+        let mut d = MaskedReq {
+            runtime: OvRuntime::stub(),
+            has_beam: false,
+            valid_mask: vec![1; 8],
+            cache_len: 0,
+            logical_pos: 0,
+            inputs: std::collections::HashMap::new(),
+            vocab: Some(100),
+        };
+        for bad in [100, -1] {
+            let err = d.feed(&[bad]).unwrap_err();
+            assert!(err.to_string().contains("100-token vocabulary"), "{err}");
+        }
+        assert_eq!((d.cache_len, d.logical_pos), (0, 0), "nothing was fed");
     }
 }
