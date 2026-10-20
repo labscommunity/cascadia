@@ -1615,6 +1615,19 @@ def run_export(
     )
 
     plan = compute_stage_plan(text_config.num_hidden_layers, num_stages)
+    if stage is not None:
+        # The untouched stages must also share this plan's layer split, or
+        # the tree skips or repeats layers.
+        _here = os.path.dirname(os.path.abspath(__file__))
+        sys.path.insert(0, os.path.join(_here, "gemma4_surgery"))
+        sys.path.insert(0, _here)
+        from export_gemma4_text import check_reused_tree
+
+        check_reused_tree(
+            output_dir, num_stages, text_config.num_hidden_layers, EXPORT_VERSION,
+            [(s["layer_start"], s["layer_end"] - 1) for s in plan],
+            text_config.hidden_size,
+        )
     log(f"\nStage plan ({num_stages} stages):")
     for s in plan:
         log(

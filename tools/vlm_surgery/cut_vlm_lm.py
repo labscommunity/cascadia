@@ -14,6 +14,10 @@ for every fed position instead, which ov-dist-spec needs as a target: it
 verifies each drafted token from its own row. The last stage's
 `stage_config.json` records which with `"logits": "all" | "last"`.
 
+`--stage I` cuts one stage into a tree that may already hold the others; the
+tool refuses when those come from a cut with another stage count, layer split,
+model or export version (the tree would skip or repeat layers).
+
 The slicing is the Gemma 4 surgery's `extract_stage` (each stage owns the KV
 state of its own layers; the cut is the residual stream entering a layer's
 input RMSNorm), which does not depend on the architecture as long as the
@@ -247,6 +251,22 @@ def param_by_name(model, name: str):
     return None
 
 
+def lm_kv_geometry(lm_xml: str):
+    """(kv_heads, head_dim) of the language model's KV state variables
+    ([batch, kv_heads, seq, head_dim]), or None when they are not static or
+    differ between layers."""
+    geoms = set()
+    for n in ov.Core().read_model(lm_xml).get_ordered_ops():
+        if n.get_type_name() != "ReadValue":
+            continue
+        ps = n.get_output_partial_shape(0)
+        if ps.rank.is_dynamic or ps.rank.get_length() != 4 or not ps[1].is_static \
+                or not ps[3].is_static:
+            return None
+        geoms.add((ps[1].get_length(), ps[3].get_length()))
+    return geoms.pop() if len(geoms) == 1 else None
+
+
 def check_mrope_positions(stage, rows: int, idx: int) -> None:
     """Every stage of an M-RoPE family must take `position_ids [rows, ?, ?]`."""
     p = param_by_name(stage, "position_ids")
@@ -369,27 +389,35 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
         raise SystemExit(f"--num-stages {num_stages} exceeds the {num_layers} decoder layers")
     if only_stage is not None and not 0 <= only_stage < num_stages:
         raise SystemExit(f"--stage {only_stage} is not in 0..{num_stages - 1}")
+    ranges = g.stage_ranges(num_stages, num_layers)
+    if only_stage is not None:
+        # The other stages stay as they are, so they must be this cut's.
+        g.check_reused_tree(out_dir, num_stages, num_layers, EXPORT_VERSION, ranges, hidden)
     os.makedirs(out_dir, exist_ok=True)
     # Removed up front and written last, so a run that dies (a whole cut or a
     # one-stage re-cut) never leaves a tree that reads as complete.
     marker = os.path.join(out_dir, "pipeline_config.json")
     if os.path.exists(marker):
         os.remove(marker)
-    ranges = g.stage_ranges(num_stages, num_layers)
     mrope_rows = FAMILIES[family].get("mrope_rows")
     n_deepstack = deepstack_layers(cfg, family)
     if n_deepstack and ranges[0][1] + 1 < n_deepstack:
         raise SystemExit(
             f"stage 0 would hold layers 0..{ranges[0][1]}, but Qwen3-VL adds DeepStack rows "
             f"after layers 0..{n_deepstack - 1} and only rank 0 has them; use fewer stages")
+    # The IR's KV geometry, not config.json's: transformers drops default
+    # values on save (Gemma 3 12B omits head_dim 256, which is not
+    # hidden_size / num_attention_heads = 240).
+    num_kv_heads, head_dim = lm_kv_geometry(lm_xml) or (
+        text.get("num_key_value_heads"),
+        text.get("head_dim") or hidden // int(text["num_attention_heads"]))
     stages_meta = []
     for i, (a, b) in enumerate(ranges):
         first, last = i == 0, i == len(ranges) - 1
         meta = {
             "stage": i, "layer_start": a, "layer_end": b + 1,
             "has_embed": first, "has_head": last, "stateful": True,
-            "num_kv_heads": text.get("num_key_value_heads"),
-            "head_dim": text.get("head_dim") or hidden // int(text["num_attention_heads"]),
+            "num_kv_heads": num_kv_heads, "head_dim": head_dim,
             "export_version": EXPORT_VERSION,
         }
         if last:
@@ -473,6 +501,7 @@ def run(model_dir: str, out_dir: str, num_stages: int, family: str,
         pipeline["vision"]["mrope_rows"] = mrope_rows
     if n_deepstack:
         pipeline["vision"]["deepstack_layers"] = n_deepstack
+    g.check_contiguous(stages_meta, num_layers, num_stages)
     with open(marker, "w") as f:
         json.dump(pipeline, f, indent=2)
     log(f"CUT DONE -> {out_dir}")
