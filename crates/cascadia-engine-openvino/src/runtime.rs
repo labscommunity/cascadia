@@ -2292,6 +2292,21 @@ fn check_mrope_tree(
     Ok(())
 }
 
+/// A stage whose `position_ids` take M-RoPE rows (a Qwen VL cut) in a
+/// pipeline without a `vision` block would be fed plain `[B, T]` positions
+/// and fail at its first inference (or, on a relay, as a generic downstream
+/// NACK); refuse it at load, as [`check_mrope_tree`] does for a vision tree.
+fn check_positions_without_vision(rank: u32, position_rows: Option<u32>) -> EngineResult<()> {
+    match position_rows {
+        Some(rows) => Err(EngineError::InvalidConfig(format!(
+            "stage_{rank} takes {rows}-row M-RoPE position_ids but pipeline_config.json has no \
+             `vision` block to say so; use the pipeline_config.json the tree was cut with \
+             (tools/vlm_surgery/cut_vlm_lm.py)"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// The family of a pipeline's `vision` block. A tree without the field is
 /// accepted only when it is a Gemma 4 vision surgery tree (written before the
 /// field existed); any other family is refused rather than fed another
@@ -7724,6 +7739,16 @@ impl Builder for OvRuntimeBuilder {
                         .into(),
                 ));
             }
+            // There is no second model to park: the decode IR stays resident.
+            if self.park_prefill {
+                warn!(
+                    "--park-prefill does nothing on this stage: its decode IR serves prefill \
+                     itself (prefill_shares_decode), so no separate prefill model is resident"
+                );
+                events.push(LoadProgress::message(String::from(
+                    "warning: --park-prefill has no effect (prefill runs on the decode IR)",
+                )));
+            }
             events.push(LoadProgress::message(format!(
                 "chunked prefill (seq={pseq}) runs on the decode IR (one compiled model)"
             )));
@@ -7938,6 +7963,8 @@ impl Builder for OvRuntimeBuilder {
                 full_blocks: !matches!(family, VisionFamily::Gemma4),
                 mrope,
             });
+        } else {
+            check_positions_without_vision(self.rank, stage_cfg.position_rows)?;
         }
 
         events.push(LoadProgress::ready());
@@ -10988,5 +11015,16 @@ mod tests {
             check_stage_layers(1, &p, (20, 20), &[]).is_err(),
             "empty range"
         );
+    }
+
+    /// A Qwen VL stage (`position_rows: 3`) in a pipeline without a `vision`
+    /// block is refused at load; a plain stage passes.
+    #[test]
+    fn mrope_stage_without_a_vision_block_is_refused() {
+        assert!(matches!(
+            check_positions_without_vision(1, Some(3)),
+            Err(EngineError::InvalidConfig(_))
+        ));
+        assert!(check_positions_without_vision(1, None).is_ok());
     }
 }
