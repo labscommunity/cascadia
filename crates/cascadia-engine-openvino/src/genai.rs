@@ -26,7 +26,9 @@ use cascadia_types::{
     ShardSpec, TaskId,
 };
 use futures::stream;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+use crate::genai_media::{strip_media_tags, MediaSizer};
 
 #[derive(Default)]
 pub struct OvGenaiBuilder {
@@ -325,11 +327,16 @@ impl Builder for OvGenaiBuilder {
     }
 
     fn build(self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
+        let dir = Path::new(&self.model_path);
+        let accepts_images = takes_images(dir);
+        let max_ctx = crate::read_max_ctx(dir, "ov-genai");
+        let media_sizer = load_media_sizer(dir, accepts_images, max_ctx);
         if let Some(pipe) = self.cb_pipe {
             return Ok(Box::new(OvGenaiCbEngine {
                 active: Vec::new(),
-                accepts_images: takes_images(Path::new(&self.model_path)),
-                max_ctx: crate::read_max_ctx(Path::new(&self.model_path), "ov-genai"),
+                accepts_images,
+                max_ctx,
+                media_sizer,
                 pipe: Box::new(pipe),
                 prompt_pretemplated: self.prompt_pretemplated,
                 next_request_id: 0,
@@ -341,8 +348,9 @@ impl Builder for OvGenaiBuilder {
         let pipe = self.pipe.ok_or(EngineError::NotLoaded)?;
         Ok(Box::new(OvGenaiEngine {
             pipe,
-            accepts_images: takes_images(Path::new(&self.model_path)),
-            max_ctx: crate::read_max_ctx(Path::new(&self.model_path), "ov-genai"),
+            accepts_images,
+            max_ctx,
+            media_sizer,
             speculative_k: self.speculative_k,
             prompt_lookup_ngram: self.prompt_lookup_ngram,
             prompt_pretemplated: self.prompt_pretemplated,
@@ -443,32 +451,103 @@ fn shim_media(task: &GenerationTask) -> EngineResult<Vec<Media<'_>>> {
         .collect()
 }
 
-/// Refuse a text-only prompt at or past the model's window with
-/// [`EngineError::PromptTooLong`] (a 400 `context_length_exceeded`).
+/// Refuse a prompt at or past the model's window with
+/// [`EngineError::PromptTooLong`] (a 400 `context_length_exceeded`), before
+/// GenAI runs it.
 ///
 /// GenAI's CPU/GPU pipelines check no window themselves: an over-window prompt
 /// runs past `max_position_embeddings` or fails as a generic error (a 5xx).
-/// The tokenizer's count of the prompt text is exact for a pre-rendered prompt
-/// and a floor when GenAI applies its own template, so it never refuses a
-/// prompt that fits. A turn with media is not checked: GenAI expands each
-/// image and video inside `generate`, the shim reports that count only after
-/// the run, and a media tag's text tokens are no floor for a small image's.
-fn text_window_check(
+/// A text-only prompt is the tokenizer's count of its text: exact for a
+/// pre-rendered prompt and a floor when GenAI applies its own template.
+///
+/// GenAI expands a turn's images and videos inside `generate` and reports that
+/// count only after the run, so a media turn is sized here from the export's
+/// processor configs ([`MediaSizer`]): each item's soft tokens plus the text
+/// with its `<ov_genai_*>` tags removed, less one token per tag for a merge
+/// across it. Each item's count is meant as a floor of what GenAI 2026.4.1
+/// builds: where GenAI preprocesses differently from Hugging Face (LLaVA-NeXT,
+/// InternVL2, Qwen VL), the smaller of the HF count and a mirror of GenAI's
+/// own code; image framing and timestamp text are not counted. The mirrors
+/// follow GenAI's sources and are swept against transcriptions of them in the
+/// tests; they have not been run against a live GenAI. An export without a
+/// sizer (a family it has no math for, or configs it cannot read), or an item
+/// the sizer cannot size, is left to GenAI as before.
+fn window_check(
     task: &GenerationTask,
     max_ctx: Option<usize>,
+    media: Option<&MediaSizer>,
     count_tokens: impl FnOnce(&str) -> Option<u32>,
 ) -> EngineResult<()> {
     let Some(max) = max_ctx else {
         return Ok(());
     };
-    if !task.media.is_empty() {
-        return Ok(());
+    if task.media.is_empty() {
+        return match count_tokens(&task.prompt) {
+            Some(n) if n as usize >= max => Err(EngineError::PromptTooLong(format!(
+                "prompt is {n} tokens but the model's context is {max}; send a shorter prompt"
+            ))),
+            _ => Ok(()),
+        };
     }
-    match count_tokens(&task.prompt) {
-        Some(n) if n as usize >= max => Err(EngineError::PromptTooLong(format!(
-            "prompt is {n} tokens; the model's window is {max} (max_position_embeddings)"
-        ))),
-        _ => Ok(()),
+    let Some(sizer) = media else {
+        return Ok(());
+    };
+    let soft = match sizer.soft_tokens(&task.media) {
+        Ok(n) => n,
+        Err(why) => {
+            debug!(task = %task.task_id, %why, "ov-genai: media not sized; left to GenAI");
+            return Ok(());
+        }
+    };
+    let (text, tags) = strip_media_tags(&task.prompt);
+    let Some(n) = count_tokens(&text) else {
+        return Ok(());
+    };
+    let planned = (n as usize + soft).saturating_sub(tags);
+    if planned >= max {
+        warn!(task = %task.task_id, prompt_tokens = planned, max, "ov-genai: refusing over-window media prompt");
+        return Err(EngineError::PromptTooLong(format!(
+            "prompt is at least {planned} tokens with its images and videos expanded but the \
+             model's context is {max}; send a shorter prompt (or fewer or smaller images)"
+        )));
+    }
+    Ok(())
+}
+
+/// The media sizer for an image-taking export, if its family has one; says
+/// once at load which way the media window check goes.
+fn load_media_sizer(
+    dir: &Path,
+    accepts_images: bool,
+    max_ctx: Option<usize>,
+) -> Option<MediaSizer> {
+    if !accepts_images || max_ctx.is_none() {
+        return None;
+    }
+    match MediaSizer::from_export(dir) {
+        Ok(Some(s)) => {
+            info!(
+                family = s.name(),
+                "ov-genai: image and video prompts are sized before the run; one past the \
+                 window is refused with context_length_exceeded"
+            );
+            Some(s)
+        }
+        Ok(None) => {
+            warn!(
+                "ov-genai: no image/video token math for this export's model_type; a media \
+                 prompt past the window is not refused up front (GenAI runs or fails it)"
+            );
+            None
+        }
+        Err(why) => {
+            warn!(
+                %why,
+                "ov-genai: cannot read this export's processor configs; a media prompt past \
+                 the window is not refused up front (GenAI runs or fails it)"
+            );
+            None
+        }
     }
 }
 
@@ -489,8 +568,10 @@ pub struct OvGenaiEngine {
     pipe: LlmPipeline,
     /// The export is a VLM layout with its vision encoder: see [`takes_images`].
     accepts_images: bool,
-    /// The model's window from its config.json; see [`text_window_check`].
+    /// The model's window from its config.json; see [`window_check`].
     max_ctx: Option<usize>,
+    /// Sizes media prompts for [`window_check`]; `None` leaves them to GenAI.
+    media_sizer: Option<MediaSizer>,
     speculative_k: u32,
     prompt_lookup_ngram: u32,
     prompt_pretemplated: bool,
@@ -531,7 +612,9 @@ impl Engine for OvGenaiEngine {
         if !self.accepts_images {
             cascadia_engine::refuse_media(&task, "ov-genai (text-only export)")?;
         }
-        text_window_check(&task, self.max_ctx, |p| self.pipe.count_tokens(p))?;
+        window_check(&task, self.max_ctx, self.media_sizer.as_ref(), |p| {
+            self.pipe.count_tokens(p)
+        })?;
         if self.pending.iter().any(|t| t.task_id == task.task_id) {
             return Ok(());
         }
@@ -769,8 +852,10 @@ pub struct OvGenaiCbEngine {
     active: Vec<ActiveCbTask>,
     /// See [`takes_images`].
     accepts_images: bool,
-    /// The model's window from its config.json; see [`text_window_check`].
+    /// The model's window from its config.json; see [`window_check`].
     max_ctx: Option<usize>,
+    /// Sizes media prompts for [`window_check`]; `None` leaves them to GenAI.
+    media_sizer: Option<MediaSizer>,
     pipe: Box<dyn CbPipe>,
     prompt_pretemplated: bool,
     next_request_id: u64,
@@ -846,7 +931,9 @@ impl Engine for OvGenaiCbEngine {
         if !self.accepts_images {
             cascadia_engine::refuse_media(&task, "ov-genai (text-only export)")?;
         }
-        text_window_check(&task, self.max_ctx, |p| self.pipe.count_tokens(p))?;
+        window_check(&task, self.max_ctx, self.media_sizer.as_ref(), |p| {
+            self.pipe.count_tokens(p)
+        })?;
         if self.active.iter().any(|t| t.task_id == task.task_id) {
             return Ok(());
         }
@@ -1349,6 +1436,7 @@ mod tests {
             active: Vec::new(),
             accepts_images: true,
             max_ctx: None,
+            media_sizer: None,
             pipe: Box::new(MockPipe { st: st.clone() }),
             prompt_pretemplated: false,
             next_request_id: 0,
@@ -1363,8 +1451,7 @@ mod tests {
     }
 
     /// A text prompt at or past the window is a 400 before anything is enrolled; one under it,
-    /// an unknown window, or a turn with media (counted only by GenAI, after the run) passes.
-    /// The mock tokenizer counts every prompt as 7 tokens.
+    /// or an unknown window, passes. The mock tokenizer counts every prompt as 7 tokens.
     #[test]
     fn cb_submit_refuses_text_prompts_at_or_past_the_window() {
         let st = Arc::new(Mutex::new(MockState::default()));
@@ -1376,12 +1463,80 @@ mod tests {
             st.lock().unwrap().added.is_empty(),
             "refused before add_request"
         );
-        assert!(e.submit(image_task("media")).is_ok());
         e.max_ctx = Some(8);
         assert!(e.submit(task("under", 4)).is_ok());
         e.max_ctx = None;
         assert!(e.submit(task("unknown", 4)).is_ok());
-        assert_eq!(st.lock().unwrap().added.len(), 3);
+        assert_eq!(st.lock().unwrap().added.len(), 2);
+    }
+
+    /// A media turn is sized before `add_request` (text 7 + a Gemma 3 image's 256 soft
+    /// tokens, less one for its tag) and refused at or past the window; without a sizer
+    /// for the export it is left to GenAI.
+    #[test]
+    fn cb_submit_refuses_media_prompts_at_or_past_the_window() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        e.media_sizer = Some(MediaSizer::Gemma3 { per_image: 256 });
+        let tagged = || {
+            let mut t = image_task("img");
+            t.prompt = "user: <ov_genai_image_0>what is this?".into();
+            t
+        };
+        e.max_ctx = Some(262);
+        let err = e.submit(tagged()).unwrap_err();
+        let EngineError::PromptTooLong(msg) = err else {
+            panic!("{err:?}");
+        };
+        assert!(
+            msg.contains("at least 262 tokens") && msg.contains("context is 262"),
+            "{msg}"
+        );
+        assert!(
+            st.lock().unwrap().added.is_empty(),
+            "refused before add_request"
+        );
+        e.max_ctx = Some(263);
+        assert!(e.submit(tagged()).is_ok());
+        e.media_sizer = None;
+        e.max_ctx = Some(8);
+        let mut t = tagged();
+        t.task_id = "unsized".into();
+        assert!(e.submit(t).is_ok(), "no sizer: left to GenAI");
+        assert_eq!(st.lock().unwrap().added.len(), 2);
+    }
+
+    /// The window check on both engines' submit path: media sized from the sizer and the
+    /// tag-stripped text, a floor that never refuses a prompt that fits.
+    #[test]
+    fn window_check_sizes_media_turns() {
+        let gemma3 = MediaSizer::Gemma3 { per_image: 256 };
+        let mut t = image_task("two");
+        t.media.push(t.media[0].clone());
+        t.prompt = "<ov_genai_image_0>A<ov_genai_image_1>B".into();
+        let seen = std::cell::RefCell::new(String::new());
+        let count = |p: &str| {
+            *seen.borrow_mut() = p.to_string();
+            Some(10)
+        };
+        // 10 text + 2 x 256 - 2 tags = 520.
+        let err = window_check(&t, Some(520), Some(&gemma3), count).unwrap_err();
+        assert!(matches!(err, EngineError::PromptTooLong(_)), "{err:?}");
+        assert_eq!(*seen.borrow(), "AB", "the tags are not counted as text");
+        assert!(window_check(&t, Some(521), Some(&gemma3), |_| Some(10)).is_ok());
+        // No window, no sizer, or no token count: nothing is refused.
+        assert!(window_check(&t, None, Some(&gemma3), |_| Some(10_000)).is_ok());
+        assert!(window_check(&t, Some(8), None, |_| Some(10_000)).is_ok());
+        assert!(window_check(&t, Some(8), Some(&gemma3), |_| None).is_ok());
+        // An item the family cannot size (Gemma 3 takes no native video) is left to GenAI.
+        let mut v = image_task("vid");
+        v.media[0].kind = MediaKind::Video;
+        v.media[0].timestamps_ms = Some(vec![0]);
+        assert!(window_check(&v, Some(8), Some(&gemma3), |_| Some(10_000)).is_ok());
+        // Text-only turns are counted whole, at or past the window refused.
+        let text = task("txt", 4);
+        assert!(window_check(&text, Some(10), Some(&gemma3), |_| Some(10)).is_err());
+        assert!(window_check(&text, Some(11), None, |_| Some(10)).is_ok());
     }
 
     /// Option B: the CB engine has no forced-prefix path — a resumed submit

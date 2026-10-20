@@ -15,6 +15,7 @@ pub mod gemma3_vision;
 pub mod gemma4;
 pub mod gemma4_vision;
 pub mod genai;
+mod genai_media;
 pub mod image_cache;
 pub mod internvl_vision;
 #[cfg(feature = "kv_coord")]
@@ -67,7 +68,7 @@ pub(crate) fn resume_vocab_bound(tok: &tokenizers::Tokenizer) -> u32 {
         .max(tok.get_vocab_size(true) as u32)
 }
 
-/// `max_position_embeddings` from `dir/config.json` (`text_config` when nested), widened by a
+/// `max_position_embeddings` from `dir/config.json` (`text_config` or `llm_config` when nested), widened by a
 /// `rope_scaling` that states its factor over an original window. `None` when the
 /// tree does not state it — the caller's prompt-window guard is then off, so say which of the
 /// three ways that happened rather than letting an unreadable config disable it silently.
@@ -87,11 +88,11 @@ pub(crate) fn read_max_ctx(dir: &std::path::Path, engine: &str) -> Option<usize>
             return None;
         }
     };
-    let cfg = if v.get("text_config").is_some() {
-        &v["text_config"]
-    } else {
-        &v
-    };
+    // InternVL nests its language model's config as `llm_config`.
+    let cfg = ["text_config", "llm_config"]
+        .iter()
+        .find_map(|k| v.get(*k))
+        .unwrap_or(&v);
     let max = cfg["max_position_embeddings"]
         .as_u64()
         .filter(|&m| m > 0)
@@ -139,5 +140,8 @@ mod tests {
         // No original window stated: the key alone.
         write(r#"{"max_position_embeddings":4096,"rope_scaling":{"type":"linear","factor":2.0}}"#);
         assert_eq!(super::read_max_ctx(dir.path(), "t"), Some(4096));
+        // InternVL2 states its language model's window under `llm_config`.
+        write(r#"{"model_type":"internvl_chat","llm_config":{"max_position_embeddings":131072}}"#);
+        assert_eq!(super::read_max_ctx(dir.path(), "t"), Some(131072));
     }
 }
