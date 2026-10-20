@@ -67,7 +67,8 @@ pub(crate) fn resume_vocab_bound(tok: &tokenizers::Tokenizer) -> u32 {
         .max(tok.get_vocab_size(true) as u32)
 }
 
-/// `max_position_embeddings` from `dir/config.json` (`text_config` when nested). `None` when the
+/// `max_position_embeddings` from `dir/config.json` (`text_config` when nested), widened by a
+/// `rope_scaling` that states its factor over an original window. `None` when the
 /// tree does not state it — the caller's prompt-window guard is then off, so say which of the
 /// three ways that happened rather than letting an unreadable config disable it silently.
 /// `engine` prefixes the warning.
@@ -95,10 +96,48 @@ pub(crate) fn read_max_ctx(dir: &std::path::Path, engine: &str) -> Option<usize>
         .as_u64()
         .filter(|&m| m > 0)
         .map(|m| m as usize);
+    // A RoPE scaling that states its original window (YaRN on Qwen2.5, for one) serves
+    // `factor` times it while `max_position_embeddings` keeps the original: the larger wins,
+    // so the guard never refuses a prompt the scaled model takes.
+    let scaled = cfg
+        .get("rope_scaling")
+        .and_then(|r| {
+            Some((
+                r["factor"].as_f64()?,
+                r["original_max_position_embeddings"].as_u64()?,
+            ))
+        })
+        .map(|(f, orig)| (f * orig as f64) as usize);
+    let max = match (max, scaled) {
+        (Some(m), Some(s)) => Some(m.max(s)),
+        (m, _) => m,
+    };
     if max.is_none() {
         tracing::warn!(
             "{engine}: config.json states no max_position_embeddings; the prompt-window guard is OFF"
         );
     }
     max
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn read_max_ctx_widens_by_a_stated_rope_scaling() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |v: &str| std::fs::write(dir.path().join("config.json"), v).unwrap();
+        // Qwen2.5 with YaRN on: the window stays 32768 in the key, 4x that in practice.
+        write(
+            r#"{"max_position_embeddings":32768,"rope_scaling":{"type":"yarn","factor":4.0,"original_max_position_embeddings":32768}}"#,
+        );
+        assert_eq!(super::read_max_ctx(dir.path(), "t"), Some(131072));
+        // Llama 3.1: the key already states the scaled window.
+        write(
+            r#"{"max_position_embeddings":131072,"rope_scaling":{"rope_type":"llama3","factor":8.0,"original_max_position_embeddings":8192}}"#,
+        );
+        assert_eq!(super::read_max_ctx(dir.path(), "t"), Some(131072));
+        // No original window stated: the key alone.
+        write(r#"{"max_position_embeddings":4096,"rope_scaling":{"type":"linear","factor":2.0}}"#);
+        assert_eq!(super::read_max_ctx(dir.path(), "t"), Some(4096));
+    }
 }
