@@ -115,7 +115,7 @@ and in `/v1/responses` OpenRouter's `{"type": "input_video", "video_url": "data:
   the source-frame cap, the decode deadline and the two decode slots still bound.
   `--api-max-video-mb` (32 MiB per request, at most 1024; on top of the image allowance,
   and the chat and Responses body limits grow by it only when video is on).
-  `--api-video-decode-timeout` (30 s for all of a request's videos; past it ffmpeg is
+  `--api-video-decode-timeout` (30 s for all of a request's videos, at most 3600; past it ffmpeg is
   killed and the request gets a `400` asking for a shorter or lower-resolution clip).
   Videos decode under the request's one decode slot.
 - A clip with more than 32 source frames per sampled frame (past about 16 s at 30 fps), at
