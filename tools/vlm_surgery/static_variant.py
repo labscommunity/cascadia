@@ -18,7 +18,13 @@ with every dimension static. This tool rewrites each stage that way:
 `past_key_values` Parameter and each Assign's value a `present` Result,
 numbered by the layer that owns it within the stage. The head's
 last-position logits slice is dropped so a prefill chunk returns every row
-(the runtime reads the last REAL row, not the last padded one).
+(the runtime reads the last REAL row, not the last padded one), so the
+head's stage_config.json records `"logits": "all"`.
+
+`--stage I` converts one stage into an output directory that may hold
+others; they must come from a tree with the same stage count, layer split and
+export version, or the tool refuses (a mixed tree would skip or repeat
+layers).
 
 `openvino._offline_transformations.stateful_to_stateless_transformation`
 does the same job for whole optimum exports but rejects cut stages (their
@@ -59,6 +65,10 @@ import numpy as np
 import openvino as ov
 from openvino import opset13 as ops
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir,
+                                "gemma4_surgery"))
+import export_gemma4_text as g  # noqa: E402  (check_reused_tree, check_contiguous)
+
 KV_RE = re.compile(r"past_key_values\.(\d+)\.(key|value)")
 
 
@@ -90,15 +100,23 @@ def kv_order(variable_ids: list[str]) -> list[str]:
     return sorted(variable_ids, key=key)
 
 
+def last_position_slice(result):
+    """The last-position Slice feeding `result`, or None."""
+    src = result.input_value(0).get_node()
+    if src.get_type_name() != "Slice":
+        return None
+    start = src.input_value(1).get_node()
+    if start.get_type_name() == "Constant" and list(start.get_data().ravel()) == [-1]:
+        return src
+    return None
+
+
 def unslice_logits(model: ov.Model) -> bool:
     """Drop a last-position Slice in front of the head's Result, if any."""
     changed = False
     for r in model.get_results():
-        src = r.input_value(0).get_node()
-        if src.get_type_name() != "Slice":
-            continue
-        start = src.input_value(1).get_node()
-        if start.get_type_name() == "Constant" and list(start.get_data().ravel()) == [-1]:
+        src = last_position_slice(r)
+        if src is not None:
             r.input(0).replace_source_output(src.input_value(0))
             changed = True
     return changed
@@ -249,6 +267,12 @@ def convert_stage(tree: str, out: str, i: int, context: int, prefill_seq: int,
     core = ov.Core()
     model = core.read_model(xml)
     geom = make_stateless(model, meta["has_head"])
+    if meta["has_head"]:
+        if last_position_slice(model.get_results()[0]) is not None:
+            raise SystemExit(f"stage_{i}: the head still ends in a last-position slice")
+        # The head now returns every fed row (cut_vlm_lm.py wrote "last" for a
+        # sliced one); dist-spec reads this to decide whether it can verify.
+        meta["logits"] = "all"
     if shared_prefill:
         # CPU/GPU: one IR with a dynamic query width serves decode and
         # prefill chunks, so the weights are compiled once, not twice.
@@ -382,6 +406,16 @@ def main() -> None:
                        is_gemma4(pipeline, config), args.packed_only)
     if err:
         raise SystemExit(err)
+    if args.stage is not None:
+        if not 0 <= args.stage < pipeline["num_stages"]:
+            raise SystemExit(f"--stage {args.stage} is not in 0..{pipeline['num_stages'] - 1}")
+        # The output's other stages stay as they are: they must come from a
+        # tree with this one's layout, or the result skips or repeats layers.
+        g.check_reused_tree(args.output_dir, pipeline["num_stages"], pipeline.get("num_layers"),
+                            pipeline.get("export_version"),
+                            [(s["layer_start"], s["layer_end"] - 1) for s in pipeline["stages"]],
+                            pipeline.get("hidden_size"))
+    g.check_contiguous(pipeline["stages"], pipeline.get("num_layers"), pipeline["num_stages"])
     os.makedirs(args.output_dir, exist_ok=True)
     marker = os.path.join(args.output_dir, "pipeline_config.json")
     if os.path.exists(marker):
@@ -396,6 +430,9 @@ def main() -> None:
     copy_root(args.tree, args.output_dir)
     for s in pipeline["stages"]:
         s.update({"stateful": False, "static_seq": 1, "static_context": args.context})
+        if s.get("has_head"):
+            # convert_stage unslices every head (see there).
+            s["logits"] = "all"
     pipeline["static_from"] = os.path.basename(os.path.abspath(args.tree))
     pipeline.pop("packed_only", None)
     if args.packed_only:
