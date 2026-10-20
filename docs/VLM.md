@@ -17,10 +17,19 @@ whole where the engine takes it natively (see [Video](#video)); audio is not sup
 
 - `data:` URLs (PNG, JPEG, WEBP, GIF) work by default. `https://` URLs only with
   `--api-allow-image-urls` (public addresses only, each redirect re-checked).
+- Images are decoded as Hugging Face's `load_image` reads them: turned upright by their EXIF
+  orientation (a phone photo's sides swap), then converted to RGB with any alpha dropped
+  (not composited onto white, as the processors of the families served here do it).
+  Line-wrapped base64 (MIME's 76 columns) is accepted.
 - Up to 8 images per request (`--api-max-images`). An image over about 1 MP is downscaled (`detail: "low"`:
   512x512; `"original"` is served as `"high"`). The chat and Responses bodies may carry
   20 MiB of images on top of the text limit; the text itself (everything but image URLs)
   stays held to that limit (`413`), and `/v1/completions` gets no image allowance.
+  Because those bodies can be tens of MB, the chat and Responses routes of a server that
+  takes images admit at most the in-flight cap of requests (`CASCADIA_API_MAX_CONCURRENT`, default 16) before reading
+  any body; one past that gets the capacity `503` with its body unread. An admitted body
+  must arrive within 30 s (about 69 MB at under 20 Mbit/s), else the request gets a `408`
+  and its slot is freed, so slow senders cannot hold every slot.
 - A request's images may declare 100 MP of source pixels together (two images at the
   50 MP per-image cap), checked from their headers before any decode. Two images decode
   at once across the server; a request that waits more than 10 s for a decode slot gets
@@ -61,7 +70,9 @@ and serves no tools here: `store: true`, `previous_response_id`, `conversation`,
 `background`, `tools`, `include`, `prompt`, `stop`, structured `text.format`,
 `reasoning.summary`, `truncation: "auto"`, `file_id` images, `input_file` and
 `input_audio` parts and non-message input items are refused with a `400` whose `param`
-names the field.
+names the field. `metadata` is echoed back, held to OpenAI's limits (an object of at most
+16 string pairs, keys up to 64 characters, values up to 512); anything else is a `400`
+with `param: "metadata"`.
 
 ## Video
 
@@ -81,9 +92,11 @@ and in `/v1/responses` OpenRouter's `{"type": "input_video", "video_url": "data:
 - `data:video/mp4`, `video/webm`, `video/quicktime` and `video/x-matroska` URLs; `https://`
   only with `--api-allow-image-urls`, under the same checks as images (a fetched video may
   be typed `video/*`, `application/octet-stream` or not at all: its bytes are checked). The
-  container must be MP4/MOV or Matroska/WebM; anything else is a `400`. A WebM that states
-  no duration (as a browser's MediaRecorder writes it) has it read from its packets (first
-  to last); timestamps in labels count from the clip's start, whatever its first timestamp.
+  container must be MP4/MOV or Matroska/WebM; anything else is a `400`. The duration is the
+  video stream's; a video stream that states none (Matroska, a browser's MediaRecorder WebM)
+  has it read from its packets (first to last), and the container's duration, which spans
+  its longest track (often the audio), is used only when neither is known. Timestamps in
+  labels count from the clip's start, whatever its first timestamp.
 - The video becomes `ceil(duration x --api-video-fps)` frames (default 1 per second), at
   most `--api-max-video-frames` (default 16), spread uniformly from 0 s. Each frame enters
   the prompt where the video was, as `Frame k (t s): ` followed by one image (`Video j frame
@@ -92,7 +105,8 @@ and in `/v1/responses` OpenRouter's `{"type": "input_video", "video_url": "data:
 - Frame size: `detail: "auto"` (the default) fits each frame to
   `--api-max-video-frame-pixels` (default 448x448), `"low"` to a quarter of that (224x224,
   never more than the image low-detail budget), the smallest; `"high"` to the larger of that
-  and the image budget (about 1 MP). Aspect ratio is kept.
+  and the image budget (about 1 MP). Aspect ratio is kept (sides are rounded down to even,
+  and the long side trimmed if that would take the ratio past 200:1).
 - As frames, each costs one image's tokens on that family: Gemma 3, 256 per frame plus its
   markers (16 frames are over 4 K tokens); Qwen3-VL and Qwen3.5 (16x16 patches), about 196
   for a 448x448 frame; Qwen2.5-VL (14x14 patches), about 256. A video that does not fit the
@@ -106,14 +120,15 @@ and in `/v1/responses` OpenRouter's `{"type": "input_video", "video_url": "data:
   the source-frame cap, the decode deadline and the two decode slots still bound.
   `--api-max-video-mb` (32 MiB per request, at most 1024; on top of the image allowance,
   and the chat and Responses body limits grow by it only when video is on).
-  `--api-video-decode-timeout` (30 s for all of a request's videos; past it ffmpeg is
+  `--api-video-decode-timeout` (30 s for all of a request's videos, at most 3600; past it ffmpeg is
   killed and the request gets a `400` asking for a shorter or lower-resolution clip).
   Videos decode under the request's one decode slot.
-- A clip with more than 32 source frames per sampled frame (past about 16 s at 30 fps) and
-  at least one keyframe per sampled frame is read with one seek per frame instead of one
-  pass: 60 s of 4K30 with a 2 s GOP takes about 3.6 s instead of 9 s on an M-series Mac. A
-  clip with rare keyframes (a browser recording, `keyint=infinite`) is read in one pass,
-  since each seek would decode most of it. ffmpeg's memory follows the source frame size,
+- A clip with more than 32 source frames per sampled frame (past about 16 s at 30 fps), at
+  least one keyframe per sampled frame, and no gap between keyframes longer than the time
+  between sampled frames is read with one seek per frame instead of one pass: 60 s of 4K30
+  with a 2 s GOP takes about 3.6 s instead of 9 s on an M-series Mac. A clip with rare or
+  bunched keyframes (a browser recording, `keyint=infinite`, all keyframes in its first
+  second) is read in one pass, since each seek would decode most of it. ffmpeg's memory follows the source frame size,
   about 170 MB at 4K; it is not capped otherwise.
 - Decoding needs ffmpeg and ffprobe on the server: `--api-ffmpeg PATH`, else `ffmpeg` on
   `PATH` (ffprobe beside it or on `PATH`). A decode-only LGPL build is enough. ffmpeg runs

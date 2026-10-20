@@ -180,12 +180,18 @@ impl Container {
 /// demuxer's and Matroska's.
 const CONTAINER_NAMES: [&str; 8] = ["mov", "mp4", "m4a", "3gp", "3g2", "mj2", "matroska", "webm"];
 
-/// What the probe found: the duration when the container states one, the
-/// frame size as displayed (a rotated phone video's sides swapped, as
-/// ffmpeg's autorotate outputs it), and the frame rate and count when known.
+/// What the probe found: the video stream's duration and the container's
+/// when they are stated, the frame size as displayed (a rotated phone
+/// video's sides swapped, as ffmpeg's autorotate outputs it), and the frame
+/// rate and count when known.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Probe {
+    /// The video stream's own duration (MP4 states it; Matroska usually
+    /// does not).
     pub duration: Option<f64>,
+    /// The container's duration: its longest stream, so an audio track
+    /// longer than the video stretches it. Only a last resort.
+    pub container_duration: Option<f64>,
     pub width: u32,
     pub height: u32,
     pub frame_rate: Option<f64>,
@@ -203,6 +209,9 @@ pub struct Video {
     pub source_frames: f64,
     /// Keyframes the source holds, when its packets were counted.
     pub keyframes: Option<u64>,
+    /// The longest stretch, in seconds, a seek may decode before reaching
+    /// its time, when its packets were timed (see [`Packets`]).
+    pub max_keyframe_gap: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -273,7 +282,8 @@ pub fn parse_probe(json: &[u8], cfg: &MediaConfig) -> Result<Probe, String> {
         d.and_then(|d| d.parse::<f64>().ok())
             .filter(|d| d.is_finite() && *d > 0.0)
     };
-    let duration = secs(format.duration).or_else(|| secs(stream.duration));
+    let duration = secs(stream.duration);
+    let container_duration = secs(format.duration);
     let (mut w, mut h) = (stream.width.unwrap_or(0), stream.height.unwrap_or(0));
     if w == 0 || h == 0 {
         return Err("the video's frames have no pixels".into());
@@ -303,6 +313,7 @@ pub fn parse_probe(json: &[u8], cfg: &MediaConfig) -> Result<Probe, String> {
         .find_map(|r| parse_rate(&r));
     Ok(Probe {
         duration,
+        container_duration,
         width: w,
         height: h,
         frame_rate,
@@ -311,6 +322,15 @@ pub fn parse_probe(json: &[u8], cfg: &MediaConfig) -> Result<Probe, String> {
 }
 
 impl Probe {
+    /// The video's own length: its stream's, else its packets' span, else
+    /// the container's. The container's spans its longest stream (often the
+    /// audio), so a 10 s video with 120 s of audio would be sampled mostly
+    /// past its last frame, and a 30 s clip with 700 s of audio refused as
+    /// too long.
+    pub fn length(&self, packets: &Packets) -> Option<f64> {
+        self.duration.or(packets.span).or(self.container_duration)
+    }
+
     /// Refuse a video longer than [`MediaConfig::max_video_seconds`], or one
     /// whose frames would make the decoder produce more than
     /// [`MediaConfig::max_video_decode_pixels`] source pixels. Its frames are
@@ -349,6 +369,7 @@ impl Probe {
             height: h,
             source_frames,
             keyframes: packets.map(|p| p.keyframes),
+            max_keyframe_gap: packets.and_then(|p| p.max_keyframe_gap),
         })
     }
 }
@@ -364,12 +385,18 @@ pub struct Packets {
     /// browsers' MediaRecorder does), from its start whatever its first
     /// timestamp.
     pub span: Option<f64>,
+    /// The longest time from a keyframe to the next one (or to the first
+    /// keyframe from the first packet, or from the last keyframe to the last
+    /// packet): what one seek decodes at most. `None` without a timed
+    /// keyframe.
+    pub max_keyframe_gap: Option<f64>,
 }
 
 /// Read a packet scan's `pts_time,flags` lines.
 pub fn parse_packets(csv: &[u8], frame_rate: Option<f64>) -> Packets {
     let (mut count, mut keyframes) = (0, 0);
     let (mut first, mut last) = (f64::INFINITY, f64::NEG_INFINITY);
+    let mut key_times = Vec::new();
     for line in String::from_utf8_lossy(csv).lines() {
         let mut fields = line.trim().split(',');
         let pts = fields.next().and_then(|t| t.parse::<f64>().ok());
@@ -378,19 +405,33 @@ pub fn parse_packets(csv: &[u8], frame_rate: Option<f64>) -> Packets {
             continue;
         }
         count += 1;
+        let pts = pts.filter(|t| t.is_finite());
         if flags.contains('K') {
             keyframes += 1;
+            key_times.extend(pts);
         }
-        if let Some(t) = pts.filter(|t| t.is_finite()) {
+        if let Some(t) = pts {
             first = first.min(t);
             last = last.max(t);
         }
     }
     let span = last - first + frame_rate.map_or(0.0, |r| 1.0 / r);
+    // Packets come in decode order, keyframes included: sort by time.
+    key_times.sort_by(f64::total_cmp);
+    let max_keyframe_gap = match (key_times.first(), key_times.last()) {
+        (Some(&k0), Some(&kn)) => Some(
+            key_times
+                .windows(2)
+                .map(|w| w[1] - w[0])
+                .fold((k0 - first).max(last - kn), f64::max),
+        ),
+        _ => None,
+    };
     Packets {
         count,
         keyframes,
         span: (span.is_finite() && span > 0.0).then_some(span),
+        max_keyframe_gap,
     }
 }
 
@@ -423,9 +464,12 @@ impl Plan {
     ///
     /// A seek decodes from the keyframe before its time, about half a GOP,
     /// so `frames` seeks cost about `frames / (2 * keyframes)` of one pass:
-    /// seeking needs at least one keyframe per sampled frame. A clip with
-    /// rare keyframes (a browser recording, `keyint=infinite`) is read in
-    /// one pass: seeking it would decode most of it once per frame.
+    /// seeking needs at least one keyframe per sampled frame, and no gap
+    /// between keyframes longer than the time between sampled frames, so the
+    /// seeks together never decode more than one pass would. A clip with
+    /// rare keyframes (a browser recording, `keyint=infinite`), or with its
+    /// keyframes bunched (all in its first second), is read in one pass:
+    /// seeking it would decode most of it once per frame.
     pub fn new(video: &Video, detail: Option<&str>, cfg: &MediaConfig) -> Self {
         let wanted = (video.duration * cfg.video_fps).ceil();
         let max = cfg.max_video_frames.max(1);
@@ -454,13 +498,25 @@ impl Plan {
             (w, h)
         };
         let even = |x: u32| (x & !1).max(2);
+        let (mut w, mut h) = (even(w), even(h));
+        // Evening can stretch the ratio (600x3, accepted at 200:1, would be
+        // 600x2): trim the long side back to it, or the engine's resize
+        // refuses the frames after the request was accepted.
+        if w > MAX_ASPECT * h {
+            w = MAX_ASPECT * h;
+        } else if h > MAX_ASPECT * w {
+            h = MAX_ASPECT * w;
+        }
         Self {
             frames,
-            width: even(w),
-            height: even(h),
+            width: w,
+            height: h,
             duration: video.duration,
             seek: video.source_frames > SEEK_RATIO * frames as f64
-                && video.keyframes.is_some_and(|k| k as usize >= frames),
+                && video.keyframes.is_some_and(|k| k as usize >= frames)
+                && video
+                    .max_keyframe_gap
+                    .is_some_and(|g| g <= video.duration / frames as f64),
         }
     }
 
@@ -838,8 +894,7 @@ pub async fn decode_video(
     }
     let packets = parse_packets(&out.stdout, probed.frame_rate);
     let duration = probed
-        .duration
-        .or(packets.span)
+        .length(&packets)
         .ok_or_else(|| VideoError::Invalid("the video's duration is unknown".into()))?;
     let video = probed
         .bounded(duration, Some(&packets), cfg)
@@ -1020,6 +1075,7 @@ mod tests {
             height,
             source_frames: duration * 30.0,
             keyframes: Some(duration.ceil() as u64),
+            max_keyframe_gap: Some(1.0),
         }
     }
 
@@ -1130,6 +1186,42 @@ mod tests {
             };
             assert!(!Plan::new(&rare, None, &cfg).seek, "{keyframes:?}");
         }
+        // Enough keyframes, but bunched: 600 s with 20 keyframes all in its
+        // first second. Each seek would decode from there to its time, about
+        // eight passes over the clip together, so it is read in one.
+        let csv: String = (0..18_000)
+            .map(|i| {
+                format!(
+                    "{:.6},{}\n",
+                    i as f64 / 30.0,
+                    if i < 20 { "K_" } else { "__" }
+                )
+            })
+            .collect();
+        let packets = parse_packets(csv.as_bytes(), Some(30.0));
+        assert_eq!(packets.keyframes, 20);
+        assert!(packets.max_keyframe_gap.unwrap() > 599.0, "{packets:?}");
+        let bunched = Video {
+            keyframes: Some(packets.keyframes),
+            max_keyframe_gap: packets.max_keyframe_gap,
+            ..probe(600.0, 320, 240)
+        };
+        assert!(!Plan::new(&bunched, None, &cfg).seek);
+        // A keyframe every 2 s seeks (16 samples, 37.5 s apart); a gap
+        // past the spacing between samples, or untimed packets, do not.
+        for (gap, seek) in [
+            (Some(2.0), true),
+            (Some(37.5), true),
+            (Some(38.0), false),
+            (None, false),
+        ] {
+            let v = Video {
+                keyframes: Some(300),
+                max_keyframe_gap: gap,
+                ..probe(600.0, 320, 240)
+            };
+            assert_eq!(Plan::new(&v, None, &cfg).seek, seek, "{gap:?}");
+        }
     }
 
     /// Frames fit the detail's pixel budget, keep the aspect ratio and have
@@ -1168,6 +1260,12 @@ mod tests {
         tiny.max_video_frame_pixels = 4;
         let p = Plan::new(&probe(1.0, 3, 3), None, &tiny);
         assert_eq!((p.width, p.height), (2, 2));
+        // Evening never takes the ratio past 200:1: 600x3 (200:1) would be
+        // 600x2 (300:1), which the engine's resize refuses.
+        for (w, h, want) in [(600, 3, (400, 2)), (3, 600, (2, 400)), (400, 3, (400, 2))] {
+            let p = Plan::new(&probe(1.0, w, h), None, &cfg);
+            assert_eq!((p.width, p.height), want, "{w}x{h}");
+        }
     }
 
     #[test]
@@ -1176,7 +1274,7 @@ mod tests {
         let mp4 = "mov,mp4,m4a,3gp,3g2,mj2";
         let p = parse_probe(&probe_json(mp4, Some("3.000000"), 320, 240), &cfg).unwrap();
         assert_eq!(
-            (p.duration, p.width, p.height, p.frame_rate),
+            (p.container_duration, p.width, p.height, p.frame_rate),
             (Some(3.0), 320, 240, Some(30.0))
         );
         assert_eq!(
@@ -1187,6 +1285,7 @@ mod tests {
                 height: 240,
                 source_frames: 90.0,
                 keyframes: None,
+                max_keyframe_gap: None,
             }
         );
         // A packet scan's count stands in for the stated rate.
@@ -1194,13 +1293,21 @@ mod tests {
             count: 31,
             keyframes: 2,
             span: Some(3.1),
+            max_keyframe_gap: Some(2.0),
         };
         let v = p.bounded(3.0, Some(&scanned), &cfg).unwrap();
-        assert_eq!((v.source_frames, v.keyframes), (31.0, Some(2)));
+        assert_eq!(
+            (v.source_frames, v.keyframes, v.max_keyframe_gap),
+            (31.0, Some(2), Some(2.0))
+        );
         let p = parse_probe(&probe_json("matroska,webm", None, 64, 48), &cfg).unwrap();
-        assert_eq!(p.duration, None, "a streamed WebM states none");
+        assert_eq!(
+            (p.duration, p.container_duration),
+            (None, None),
+            "a streamed WebM states none"
+        );
         // A quarter turn swaps the sides, as ffmpeg's autorotate does; the
-        // stream's duration stands in for the container's; `0/0` is no rate.
+        // stream states its own duration; `0/0` is no rate.
         let rotated = serde_json::json!({
             "streams": [{"codec_type": "video", "width": 320, "height": 240,
                 "duration": "3.000000", "avg_frame_rate": "0/0", "r_frame_rate": "30000/1001",
@@ -1248,7 +1355,7 @@ mod tests {
         }
         for (d, needle) in [("0.000000", None), ("N/A", None), ("3", Some(3.0))] {
             let p = parse_probe(&probe_json(mp4, Some(d), 320, 240), &cfg).unwrap();
-            assert_eq!(p.duration, needle, "{d}");
+            assert_eq!(p.container_duration, needle, "{d}");
         }
 
         let mut short = MediaConfig::ov_genai(None);
@@ -1260,6 +1367,7 @@ mod tests {
         // gets a quarter of that.
         let hd = Probe {
             duration: None,
+            container_duration: None,
             width: 1920,
             height: 1080,
             frame_rate: Some(30.0),
@@ -1302,6 +1410,13 @@ mod tests {
         );
         assert_eq!((p.count, p.keyframes), (4, 2));
         assert!((p.span.unwrap() - 3.0).abs() < 1e-9, "{p:?}");
+        assert!((p.max_keyframe_gap.unwrap() - 2.8).abs() < 1e-9, "{p:?}");
+        // The gaps before the first keyframe and after the last count too,
+        // and keyframes are ordered by time, not by decode order.
+        let p = parse_packets(b"0.0,___\n3.0,K__\n1.0,K__\n4.0,___\n9.0,___\n", None);
+        assert_eq!(p.max_keyframe_gap, Some(6.0), "{p:?}");
+        let p = parse_packets(b"0.0,___\n1.5,K__\n2.0,___\n", None);
+        assert_eq!(p.max_keyframe_gap, Some(1.5), "{p:?}");
         // A stream that starts at an hour spans its own length.
         let p = parse_packets(b"3600.000000,K__\n3602.900000,___\n", Some(10.0));
         assert!((p.span.unwrap() - 3.0).abs() < 1e-9, "{p:?}");
@@ -1314,9 +1429,50 @@ mod tests {
         assert_eq!((empty.count, empty.span), (0, None));
         let untimed = parse_packets(b"N/A,K__\nN/A,___\n", None);
         assert_eq!(
-            (untimed.count, untimed.keyframes, untimed.span),
-            (2, 1, None)
+            (
+                untimed.count,
+                untimed.keyframes,
+                untimed.span,
+                untimed.max_keyframe_gap
+            ),
+            (2, 1, None, None)
         );
+    }
+
+    /// The video's length is its stream's, else its packets', and the
+    /// container's (which spans the longest track, often the audio) only
+    /// when neither is known.
+    #[test]
+    fn video_length_is_the_video_streams() {
+        let cfg = MediaConfig::ov_genai(None);
+        let mp4 = "mov,mp4,m4a,3gp,3g2,mj2";
+        // A 10 s video with 120 s of audio: the container says 120.
+        let mut json = serde_json::json!({
+            "streams": [{"codec_type": "video", "width": 320, "height": 240,
+                "duration": "10.000000", "avg_frame_rate": "30/1"}],
+            "format": {"format_name": mp4, "duration": "120.000000"},
+        });
+        let scanned = parse_packets(b"0.0,K__\n9.9,___\n", Some(10.0));
+        let p = parse_probe(json.to_string().as_bytes(), &cfg).unwrap();
+        assert_eq!(
+            (p.duration, p.container_duration),
+            (Some(10.0), Some(120.0))
+        );
+        assert_eq!(p.length(&scanned), Some(10.0));
+        let plan = Plan::new(&p.bounded(10.0, Some(&scanned), &cfg).unwrap(), None, &cfg);
+        assert_eq!((plan.frames, plan.timestamp(9)), (10, 9.0));
+        // A Matroska video stream states no duration: its packets' span
+        // stands in, not the container's.
+        json["streams"][0]["duration"] = serde_json::Value::Null;
+        json["format"]["format_name"] = "matroska,webm".into();
+        json["format"]["duration"] = "700.000000".into();
+        let p = parse_probe(json.to_string().as_bytes(), &cfg).unwrap();
+        let length = p.length(&scanned).unwrap();
+        assert!((length - 10.0).abs() < 1e-9, "{length}");
+        assert!(p.bounded(length, Some(&scanned), &cfg).is_ok());
+        // Untimed packets: only then the container's.
+        let untimed = parse_packets(b"N/A,K__\n", None);
+        assert_eq!(p.length(&untimed), Some(700.0));
     }
 
     #[test]

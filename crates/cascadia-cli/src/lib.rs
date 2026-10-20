@@ -287,10 +287,13 @@ pub struct ApiMediaArgs {
     pub api_max_video_mb: Option<f64>,
 
     /// Seconds one video's probe and decode may take before ffmpeg is
-    /// killed and the request refused (default 30).
+    /// killed and the request refused (default 30, at most 3600).
     #[arg(long, value_name = "SECS")]
     pub api_video_decode_timeout: Option<f64>,
 }
+
+/// The longest `--api-video-decode-timeout` taken.
+const MAX_VIDEO_DECODE_TIMEOUT_SECS: f64 = 3600.0;
 
 impl ApiMediaArgs {
     /// Whether any video flag was given (they do nothing without images).
@@ -366,8 +369,17 @@ impl ApiMediaArgs {
             media.max_request_video_bytes = (v * 1048576.0) as usize;
         }
         if let Some(v) = self.api_video_decode_timeout {
-            media.video_decode_timeout =
-                std::time::Duration::from_secs_f64(positive("api-video-decode-timeout", v)?);
+            // Past an hour the deadline is no bound at all, and a huge value
+            // would panic in `Duration` or overflow `Instant::now() + timeout`
+            // on the first video.
+            let v = positive("api-video-decode-timeout", v)?;
+            if v > MAX_VIDEO_DECODE_TIMEOUT_SECS {
+                return Err(anyhow!(
+                    "--api-video-decode-timeout must be at most {MAX_VIDEO_DECODE_TIMEOUT_SECS} \
+                     seconds, not {v}"
+                ));
+            }
+            media.video_decode_timeout = std::time::Duration::from_secs_f64(v);
         }
         Ok(())
     }
@@ -4736,6 +4748,13 @@ mod tests {
         assert_eq!(media.max_request_video_bytes, 8 << 20);
         assert_eq!(media.max_video_source_pixels, 1920 * 1080);
         assert_eq!(media.video_decode_timeout.as_secs(), 5);
+        let hour = ApiMediaArgs {
+            api_video_decode_timeout: Some(3600.0),
+            ..Default::default()
+        };
+        let mut at_cap = cascadia_api::MediaConfig::ov_genai(None);
+        hour.apply(&mut at_cap).unwrap();
+        assert_eq!(at_cap.video_decode_timeout.as_secs(), 3600);
         assert_eq!(media.max_videos, 1, "unset flags keep the default");
         assert_eq!(media.max_video_frame_pixels, 448 * 448);
 
@@ -4758,6 +4777,20 @@ mod tests {
             },
             ApiMediaArgs {
                 api_max_video_mb: Some(1e12),
+                ..Default::default()
+            },
+            // Would panic in `Duration::from_secs_f64`, or overflow the
+            // per-request deadline.
+            ApiMediaArgs {
+                api_video_decode_timeout: Some(1e20),
+                ..Default::default()
+            },
+            ApiMediaArgs {
+                api_video_decode_timeout: Some(1e11),
+                ..Default::default()
+            },
+            ApiMediaArgs {
+                api_video_decode_timeout: Some(3600.5),
                 ..Default::default()
             },
         ] {
