@@ -29,8 +29,9 @@ whole where the engine takes it natively (see [Video](#video)); audio is not sup
 - `/v1/models` lists `input_modalities` (`["text", "image"]` when images are accepted,
   `["text", "image", "video"]` when ffmpeg was found too).
 - Errors are OpenAI-shaped: a model or tree without image input answers `400`, an
-  undecodable image `400`, a prompt that does not fit the context `413`
-  (`context_length_exceeded`). Text that spells a model's own image tag (for example
+  undecodable image `400`, a prompt that does not fit the context `400`
+  (`context_length_exceeded`, as OpenAI answers it; a body over the byte limits stays
+  `413`). Text that spells a model's own image tag (for example
   `<|image|>` or `[IMG]`) is refused with `400`. On `ov-genai` that covers GenAI's
   universal `<ov_genai_image_N>` / `<ov_genai_video_N>` and the export's native image and
   video tags (by `config.json` `model_type`; every known one for an unlisted type), which
@@ -95,7 +96,7 @@ and in `/v1/responses` OpenRouter's `{"type": "input_video", "video_url": "data:
 - As frames, each costs one image's tokens on that family: Gemma 3, 256 per frame plus its
   markers (16 frames are over 4 K tokens); Qwen3-VL and Qwen3.5 (16x16 patches), about 196
   for a 448x448 frame; Qwen2.5-VL (14x14 patches), about 256. A video that does not fit the
-  context gets the usual `413` `context_length_exceeded`.
+  context gets the usual `400` `context_length_exceeded`.
 - Limits, all checked from the container before any frame is decoded:
   `--api-max-videos` (default 1 per request; 0 turns video off), `--api-max-video-seconds`
   (600), `--api-max-video-source-pixels` (3840x2160 per source frame), and a fixed work
@@ -293,7 +294,8 @@ images), past the sliding-window cap the static IR needs, so the tree is built p
 (`static_variant.py --context 1280 --prefill-seq 288 --shared-prefill --packed-only`, see
 Gemma 4 on packed slots below): the packed IR takes host-built masks, so the cap does not
 apply there. Within the cap (`--context 736`, servable static too) a slot holds 367 tokens:
-the 336-token clip and one image fit, the frames case and two images get a 413.
+the 336-token clip and one image fit, the frames case and two images are refused as over
+the context (400 `context_length_exceeded`).
 
 ## What takes images
 
@@ -521,7 +523,7 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
   more; it attends causally, so any `--prefill-seq` works. For packed slots a 448x448
   image (2956 prompt tokens with the SDK test's text) must fit one slot's region, so a
   two-slot variant needs `--context` near 6016 (region 3007); a narrower context refuses
-  such an image with a 413. Verified static and packed on CPU (prompt_tokens 2956).
+  such an image with a 400 `context_length_exceeded`. Verified static and packed on CPU (prompt_tokens 2956).
 - **Gemma 4** needs `--prefill-seq` at least one image wide (280), and `--context` plus
   `--prefill-seq` must stay within the sliding window + 1 (1025): for example
   `--context 736 --prefill-seq 288`, which holds about two images. The static IR masks
@@ -556,7 +558,7 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
   [perf/NPU_PACKED_SLOTS.md](perf/NPU_PACKED_SLOTS.md)). A bidirectional
   family (Gemma 3 / Gemma 4) keeps `--packed-seq` at least one image wide (below). A
   request whose prompt does not fit one slot's region `(context - 1 - packed_prefix) / N`
-  is refused with a 413.
+  is refused with a 400 `context_length_exceeded`.
 - **Gemma 4 on packed slots** (26B-A4B: about 18 GB per packed stage at 288 rows, so one
   stage per 32 GB node): same two steps. `packed_variant.py` finds the stage's two
   mask producers (sliding window and full attention), tells them apart from the tree's
@@ -597,7 +599,7 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
   attention, `token_type_ids`), so build its static tree with `--context 768
   --prefill-seq 256` (sliding window 1024) and `--packed-seq 256` (one image wide). Each
   slot's region is `(context - 1) / slots`, so two images do not fit one slot of a
-  two-slot 768-context tree (they are refused per request with a 413); one 448x448 image
+  two-slot 768-context tree (they are refused per request with a 400 `context_length_exceeded`); one 448x448 image
   (286 tokens) fits.
 - On CPU/GPU the packed variant is built from the same `--shared-prefill` static tree as
   the static path, so one tree serves both.
