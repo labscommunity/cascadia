@@ -4409,6 +4409,11 @@ impl OvRuntimeEngine {
                 break;
             };
             let task = self.pending.remove(0);
+            // The turn's images, encoded at submit. Taken off the map before
+            // any refusal below, so every `continue` (and `?`) drops them with
+            // the task instead of leaving them resident: a Qwen3-VL turn's
+            // DeepStack rows run to hundreds of MB.
+            let mut encoded = self.packed_images.remove(&task.task_id);
             // Option B: the packed path has no forced-prefix support — it neither
             // appends `resume_token_ids` to the prompt nor seeds `generated`/`emitted`.
             // Admitting a resume task here would regenerate the turn FROM SCRATCH and
@@ -4475,7 +4480,7 @@ impl OvRuntimeEngine {
                         rows,
                         mrope: positions,
                         deepstack,
-                    }) = self.packed_images.remove(&task.task_id)
+                    }) = encoded.take()
                     else {
                         let id = task.task_id.clone();
                         out.push((
@@ -6268,7 +6273,10 @@ impl Engine for OvRuntimeEngine {
         // caller gets a 400 before any stream is opened — a streaming client
         // rejected mid-stream would already have had its 200 committed and
         // would receive a non-standard error frame instead.
-        if let Some(packed) = self.packed.as_ref() {
+        // A resumed task skips it: admission refuses it (packed slots have no
+        // forced-prefix path), so encoding its images here would only spend
+        // encoder time under the engine lock on rows nobody reads.
+        if let Some(packed) = self.packed.as_ref().filter(|_| task.resume_ids().is_none()) {
             if let Some(tok) = self.tokenizer.as_ref() {
                 let ids = encode_prompt_ids(tok, self.vision.as_ref(), &task)
                     .map_err(EngineError::Backend)?;
@@ -10671,5 +10679,154 @@ mod tests {
             matches!(&err, EngineError::InvalidConfig(m) if m.contains("stage_1")),
             "{err}"
         );
+    }
+
+    /// One-box packed engine on a stub runtime: enough to run admission
+    /// without OpenVINO.
+    #[cfg(not(feature = "openvino"))]
+    fn packed_test_engine(tokenizer: Option<Tokenizer>) -> OvRuntimeEngine {
+        let kv = crate::packed::PackedKv::new(2, 32, 4, 1, 1, 2, ShimDType::F16, 0);
+        let masks = vec![crate::packed_exec::PackedMask::new(
+            "attn_mask_4d".into(),
+            ShimDType::F16,
+            None,
+        )];
+        let packed = crate::packed_exec::PackedState::new(
+            Box::new(OvRuntime::stub()),
+            kv,
+            Vec::new(),
+            "input_ids".into(),
+            String::new(),
+            0,
+            masks,
+            "position_ids".into(),
+        );
+        OvRuntimeEngine {
+            packed: Some(packed),
+            vision: None,
+            step_types: Vec::new(),
+            step_positions: Vec::new(),
+            static_ds_global: Vec::new(),
+            static_ds_total: 0,
+            static_ds_cursor: 0,
+            spec: ShardSpec {
+                model_id: "t".into(),
+                layer_start: 0,
+                layer_end: 1,
+                total_layers: 1,
+                device: "CPU".into(),
+                is_first_stage: true,
+                is_last_stage: true,
+                tp_size: 1,
+                tp_rank: 0,
+            },
+            runtime: OvRuntime::stub(),
+            rotary: Rotary::from_config_json(r#"{"head_dim":2}"#).unwrap(),
+            hidden_size: 2,
+            tokenizer: tokenizer.map(Arc::new),
+            eos_token_ids: Vec::new(),
+            upstream: None,
+            downstream: None,
+            runtime_handle: tokio::runtime::Handle::current(),
+            position: 0,
+            input_names: Vec::new(),
+            canonical_inputs: std::collections::HashMap::new(),
+            pending: Vec::new(),
+            packed_images: std::collections::HashMap::new(),
+            active: None,
+            static_kv: None,
+            prefill: None,
+            park_prefill: false,
+            prefill_reload: None,
+            step_warn: StepWarnLimiter::default(),
+            wire_dead: WireDeadLatch::default(),
+            awaiting_token_seq: 0,
+            inbound_seq: None,
+            consecutive_token_timeouts: 0,
+            #[cfg(feature = "kv_coord")]
+            kv: crate::kv_coordination::OvKvCache::default(),
+            #[cfg(feature = "kv_coord")]
+            kv_share: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::kv_coordination::OvKvCache::default(),
+            )),
+            #[cfg(feature = "kv_coord")]
+            kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
+            #[cfg(feature = "kv_coord")]
+            kv_warm_pending: false,
+            #[cfg(feature = "kv_coord")]
+            plane_restore: false,
+        }
+    }
+
+    /// A turn's encoded images (`packed_images`) leave the map with the task
+    /// on every admission refusal, not only when the task is admitted.
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test]
+    async fn packed_admission_refusals_drop_the_encoded_images() {
+        let turn = || PackedTurn {
+            ids: vec![1, 2],
+            rows: vec![vec![0.0; 1 << 16]],
+            mrope: None,
+            deepstack: vec![vec![0.0; 1 << 16]],
+        };
+        let tok = Tokenizer::from_bytes(
+            br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+                "normalizer":null,"pre_tokenizer":{"type":"Whitespace"},
+                "post_processor":null,"decoder":null,
+                "model":{"type":"WordLevel","vocab":{"hi":0},"unk_token":"hi"}}"#,
+        )
+        .unwrap();
+
+        let mut e = packed_test_engine(Some(tok));
+        let mut resumed = GenerationTask::new("resumed", "hi");
+        resumed.resume_token_ids = Some(vec![0]);
+        let empty = GenerationTask::new("empty", "");
+        for t in [resumed, empty] {
+            e.packed_images.insert(t.task_id.clone(), turn());
+            e.pending.push(t);
+        }
+        let out = e.step_first_packed().unwrap();
+        assert_eq!(out.len(), 2, "both refused with their own error chunk");
+        assert!(out.iter().all(|(_, c)| c.error.is_some()));
+        assert!(e.packed_images.is_empty(), "a refusal leaked its images");
+
+        // No tokenizer: the engine-level error drops the task's images too.
+        let mut e = packed_test_engine(None);
+        let t = GenerationTask::new("no-tok", "hi");
+        e.packed_images.insert(t.task_id.clone(), turn());
+        e.pending.push(t);
+        assert!(e.step_first_packed().is_err());
+        assert!(e.packed_images.is_empty());
+    }
+
+    /// A resumed task is refused at admission, so submit must not encode (and
+    /// park) its images first.
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test]
+    async fn packed_submit_leaves_a_resumed_task_to_admission() {
+        let tok = Tokenizer::from_bytes(
+            br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+                "normalizer":null,"pre_tokenizer":{"type":"Whitespace"},
+                "post_processor":null,"decoder":null,
+                "model":{"type":"WordLevel","vocab":{"hi":0},"unk_token":"hi"}}"#,
+        )
+        .unwrap();
+        let mut e = packed_test_engine(Some(tok));
+        // Over the 4-token-per-slot region: only checked for a fresh task.
+        let mut resumed = GenerationTask::new(
+            "resumed",
+            "hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi",
+        );
+        resumed.resume_token_ids = Some(vec![0]);
+        assert!(e.submit(resumed).is_ok(), "left for admission to refuse");
+        assert!(e.packed_images.is_empty());
+        let fresh = GenerationTask::new(
+            "fresh",
+            "hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi",
+        );
+        assert!(matches!(
+            e.submit(fresh),
+            Err(EngineError::PromptTooLong(_))
+        ));
     }
 }
