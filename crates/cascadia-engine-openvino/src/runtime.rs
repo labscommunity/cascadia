@@ -780,33 +780,44 @@ fn packed_prompt_too_long(prompt_tokens: usize, region: usize) -> Option<String>
     })
 }
 
-/// Refuse an image/video prompt past a non-packed static tree's KV window.
+/// Refuse a prompt past a non-packed static tree's KV window.
 ///
-/// A static tree holds `past_len` (static_context - 1) entries; a longer
-/// text-only prompt slides its earliest tokens out, but image rows cannot be
-/// split across that slide, so the prefill would fail inside the chunk loop
-/// after the request was accepted. `past_len` is None off that path.
-/// `expand` gives the prompt as it will be prefilled, from image sizes alone;
-/// if it fails, the turn is left for the step path to refuse as before.
-fn static_media_too_long(
+/// A static tree holds `past_len` (static_context - 1) entries. A longer
+/// prompt would slide its earliest tokens (the system prompt first) out of the
+/// ring while it prefills, one token per inference past the window: the
+/// answer comes back 200 from a silently truncated prompt, slowly, holding the
+/// tree's only slot. Image rows cannot slide at all. So the prompt is refused,
+/// as OpenAI does; generation past the window still slides. `past_len` is None
+/// off that path. `expand` gives the prompt as it will be prefilled (images
+/// expanded from their sizes alone); if it fails, the turn is left for the
+/// step path to refuse as before.
+fn static_prompt_too_long(
     ids: &[i64],
     has_media: bool,
     past_len: Option<usize>,
     expand: impl FnOnce(&[i64]) -> Result<Vec<i64>, String>,
 ) -> EngineResult<()> {
-    let Some(past_len) = past_len.filter(|_| has_media) else {
+    let Some(past_len) = past_len else {
         return Ok(());
     };
-    let Ok(planned) = expand(ids) else {
-        return Ok(());
+    let planned = if has_media {
+        match expand(ids) {
+            Ok(p) => p.len(),
+            Err(_) => return Ok(()),
+        }
+    } else {
+        ids.len()
     };
-    if planned.len() > past_len {
+    if planned > past_len {
+        let with = if has_media {
+            " with its images expanded"
+        } else {
+            ""
+        };
         return Err(EngineError::PromptTooLong(format!(
-            "prompt is {} tokens with its images expanded but this static tree's KV window \
-             holds {past_len} (static_context - 1); image tokens cannot slide out of the \
-             window, so send fewer or smaller images (lower detail) or a shorter prompt, or \
-             convert the tree with a larger tools/vlm_surgery/static_variant.py --context",
-            planned.len()
+            "prompt is {planned} tokens{with} but this static tree's KV window holds \
+             {past_len} (static_context - 1); send a shorter prompt (or fewer or smaller \
+             images), or convert the tree with a larger context"
         )));
     }
     Ok(())
@@ -6413,23 +6424,30 @@ impl Engine for OvRuntimeEngine {
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
             });
         }
-        // A non-packed static tree slides a long text prompt through its KV
-        // window, but an image cannot slide: refuse an image/video prompt past
-        // the window here, for the same 400-before-any-stream reason as the
+        // A non-packed static tree would slide an over-window prompt through
+        // its KV window (dropping its start) and an image cannot slide at all:
+        // refuse either here, for the same 400-before-any-stream reason as the
         // packed check below. Counted on the prompt as step_first serves it
         // (resume ids appended, images expanded from their sizes), unencoded.
-        if self.packed.is_none() && !task.media.is_empty() {
-            let past_len = self.static_kv.as_ref().map(|sk| sk.past_len);
+        let past_len = self.static_kv.as_ref().map(|sk| sk.past_len);
+        if let (None, Some(_), Some(tok)) = (&self.packed, past_len, self.tokenizer.as_ref()) {
+            let has_media = !task.media.is_empty();
             let first = self.vision.as_ref().and_then(|v| v.first.as_ref());
-            if let (Some(_), Some(tok), Some(first)) = (past_len, self.tokenizer.as_ref(), first) {
-                let mut ids = encode_prompt_ids(tok, self.vision.as_ref(), &task)
-                    .map_err(EngineError::Backend)?;
+            let ids = match encode_prompt_ids(tok, self.vision.as_ref(), &task) {
+                Ok(ids) => Some(ids),
+                // As before: a media turn that cannot be tokenized is refused
+                // here; a text one is left for the step path to report.
+                Err(e) if has_media => return Err(EngineError::Backend(e)),
+                Err(_) => None,
+            };
+            if let Some(mut ids) = ids {
                 cascadia_types::append_resume_ids(&mut ids, task.resume_ids());
-                static_media_too_long(&ids, true, past_len, |ids| {
-                    first.frontend.expand_ids(&task.media, ids)
+                static_prompt_too_long(&ids, has_media, past_len, |ids| match first {
+                    Some(first) => first.frontend.expand_ids(&task.media, ids),
+                    None => Err("no vision front end".into()),
                 })
                 .inspect_err(
-                    |e| warn!(task = %task.task_id, error = %e, "refusing static image prompt at submit"),
+                    |e| warn!(task = %task.task_id, error = %e, "refusing static prompt at submit"),
                 )?;
             }
         }
@@ -9157,12 +9175,12 @@ mod tests {
         assert!(matches!(r, Err(EngineError::Backend(_))));
     }
 
-    /// A non-packed static tree refuses an image prompt whose expanded length
-    /// passes its KV window (past_len) with PromptTooLong at submit, counted
-    /// after expansion; a prompt that fits, a text-only prompt (which keeps
-    /// sliding), and a non-static tree are let through.
+    /// A non-packed static tree refuses a prompt past its KV window
+    /// (past_len) with PromptTooLong at submit: an image prompt counted after
+    /// expansion, a text-only one as it stands. A prompt that fits and a
+    /// non-static tree are let through.
     #[test]
-    fn static_submit_refuses_an_image_prompt_past_the_window() {
+    fn static_submit_refuses_a_prompt_past_the_window() {
         let expand = |soft: usize| {
             move |ids: &[i64]| -> Result<Vec<i64>, String> {
                 Ok(ids
@@ -9174,23 +9192,33 @@ mod tests {
         let ids = [1i64, 9, 2];
         // 3 ids before expansion, 802 after: past a 767-row window only once
         // the image's soft tokens are counted.
-        let r = static_media_too_long(&ids, true, Some(767), expand(800));
+        let r = static_prompt_too_long(&ids, true, Some(767), expand(800));
         assert!(
             matches!(r, Err(EngineError::PromptTooLong(ref m)) if m.contains("767")),
             "{r:?}"
         );
-        assert!(static_media_too_long(&ids, true, Some(767), expand(256)).is_ok());
+        assert!(static_prompt_too_long(&ids, true, Some(767), expand(256)).is_ok());
         // Exactly the window fits (the eviction warn fires only past it).
-        assert!(static_media_too_long(&ids, true, Some(767), expand(765)).is_ok());
-        assert!(static_media_too_long(&ids, true, Some(767), expand(766)).is_err());
-        // Text-only: the sliding window is unchanged, whatever the length.
+        assert!(static_prompt_too_long(&ids, true, Some(767), expand(765)).is_ok());
+        assert!(static_prompt_too_long(&ids, true, Some(767), expand(766)).is_err());
+        // Text-only: refused past the window (it would slide its start out),
+        // let through up to it; `expand` is not consulted.
         let long: Vec<i64> = (0..2000).collect();
-        assert!(static_media_too_long(&long, false, Some(767), expand(1)).is_ok());
+        let r = static_prompt_too_long(&long, false, Some(767), expand(1));
+        assert!(
+            matches!(r, Err(EngineError::PromptTooLong(ref m)) if m.contains("2000 tokens but")),
+            "{r:?}"
+        );
+        let fits: Vec<i64> = (0..767).collect();
+        let no_expand =
+            |_: &[i64]| -> Result<Vec<i64>, String> { panic!("text needs no expansion") };
+        assert!(static_prompt_too_long(&fits, false, Some(767), no_expand).is_ok());
+        assert!(static_prompt_too_long(&long[..768], false, Some(767), expand(1)).is_err());
         // Not a static tree: no window to check against.
-        assert!(static_media_too_long(&ids, true, None, expand(800)).is_ok());
+        assert!(static_prompt_too_long(&ids, true, None, expand(800)).is_ok());
         // An expansion error leaves the turn to the step path's refusal.
         let fail = |_: &[i64]| -> Result<Vec<i64>, String> { Err("bad".into()) };
-        assert!(static_media_too_long(&ids, true, Some(767), fail).is_ok());
+        assert!(static_prompt_too_long(&ids, true, Some(767), fail).is_ok());
     }
 
     /// LLaVA-NeXT on packed slots follows Pixtral's rules (causal: no image
