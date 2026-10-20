@@ -1991,8 +1991,9 @@ mod tests {
                 json!({"model": "mock-model", "messages": [video_msg("x", &url)]}),
             )
             .await;
-            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
             assert_eq!(v["error"]["code"], "context_length_exceeded", "{v}");
+            assert_eq!(v["error"]["param"], "messages", "{v}");
         }
 
         /// Gemma 3 trims each text part; a frame's label is trimmed as the

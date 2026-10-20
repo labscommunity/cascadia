@@ -1459,7 +1459,8 @@ fn last_row_only(
     Ok((bytes[bytes.len() - row..].to_vec(), vec![1, 1, vocab]))
 }
 
-/// The 413 for a prompt at or past the target's window, if it is.
+/// The refusal (the API's 400 `context_length_exceeded`) for a prompt at or
+/// past the target's window, if it is.
 fn prompt_window_refusal(n: usize, max: Option<usize>) -> Option<String> {
     let max = max?;
     (n >= max).then(|| {
@@ -1738,7 +1739,7 @@ pub struct OvDistSpecEngine {
     /// cannot embed. `None` when unknown.
     draft_vocab: Option<usize>,
     /// The target's window (`max_position_embeddings`); prompts at or past it
-    /// are a 413 at submit. `None` when the tree does not state it.
+    /// are refused at submit (400 `context_length_exceeded`). `None` when the tree does not state it.
     max_ctx: Option<usize>,
     pending: Vec<GenerationTask>,
     active: Option<ActiveSpec>,
@@ -1795,7 +1796,7 @@ impl Engine for OvDistSpecEngine {
                 "ov-dist-spec (target tree without a `vision` block)",
             )?;
         }
-        // Synchronous with the HTTP request, so an over-window prompt is a 413
+        // Synchronous with the HTTP request, so an over-window prompt is a 400
         // before anything runs. An image turn is sized from its images'
         // dimensions (their token grids), before any image is encoded.
         if let Some(max) = self.max_ctx {

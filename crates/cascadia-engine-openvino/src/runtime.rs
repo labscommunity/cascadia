@@ -2889,7 +2889,7 @@ pub struct OvRuntimeEngine {
     pending: Vec<GenerationTask>,
     /// Packed vision tree: each pending image task's expanded prompt ids and
     /// image rows, encoded at `submit` so an over-region prompt is refused
-    /// there (413) like a long text prompt; taken at admission.
+    /// there (400 `context_length_exceeded`) like a long text prompt; taken at admission.
     packed_images: std::collections::HashMap<TaskId, PackedTurn>,
     active: Option<ActiveTask>,
     /// `--packed-slots`: multi-slot packed decode state (own compiled variant,
@@ -6227,7 +6227,7 @@ impl Engine for OvRuntimeEngine {
         // Packed slots divide the KV window, so a prompt can be too long for a
         // slot while the model itself could hold it. Reject here rather than at
         // admission: submit() is synchronous with the HTTP request, so the
-        // caller gets a 413 before any stream is opened — a streaming client
+        // caller gets a 400 before any stream is opened — a streaming client
         // rejected mid-stream would already have had its 200 committed and
         // would receive a non-standard error frame instead.
         if let Some(packed) = self.packed.as_ref() {
@@ -8911,7 +8911,7 @@ mod tests {
 
     /// LLaVA-NeXT on packed slots follows Pixtral's rules (causal: no image
     /// blocks, so an image may span packed inferences): a prompt is sized from
-    /// its images' dimensions and refused with a 413 before any encode when it
+    /// its images' dimensions and refused with a 400 before any encode when it
     /// outgrows the slot's region. One 448x448 image is 2928 soft tokens.
     #[test]
     fn packed_llava_next_prompt_is_sized_before_encoding() {

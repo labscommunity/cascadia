@@ -46,6 +46,15 @@ impl Engine for MockEngine {
         if self.pending.iter().any(|(t, _)| t.task_id == task.task_id) {
             return Ok(());
         }
+        // Test sentinel: a prompt containing `__prompt_too_long__` is refused
+        // at submit as over the window, the way a real engine refuses a
+        // prompt past its context, so the API's over-window shape can be
+        // tested on every route without a tokenizer.
+        if task.prompt.contains("__prompt_too_long__") {
+            return Err(EngineError::PromptTooLong(
+                "prompt is 9000 tokens; the model's window is 8192".into(),
+            ));
+        }
         // Option B resume: the seed ids are already-emitted, so start the
         // echo cursor past them. They are never re-emitted by step().
         //
