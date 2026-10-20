@@ -548,6 +548,10 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
   `context_length_exceeded`, as OpenAI does. Sliding it through the window would drop its
   start (the system prompt first) and answer 200 from what is left, one token per inference
   past the window, holding the tree's only slot. Generation past the window still slides.
+- A stateful tree holds a prompt to the model's context (`config.json`'s
+  `max_position_embeddings`, widened by a stated RoPE scaling): a prompt at or past it, counted
+  with each image expanded, gets the same 400 at submit. A tree whose `config.json` has no
+  context logs that the check is off.
 - **LLaVA-NeXT** spends up to 2928 tokens on an image, so give it `--context 4096` or
   more; it attends causally, so any `--prefill-seq` works. For packed slots a 448x448
   image (2956 prompt tokens with the SDK test's text) must fit one slot's region, so a

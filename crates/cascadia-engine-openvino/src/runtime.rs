@@ -780,24 +780,35 @@ fn packed_prompt_too_long(prompt_tokens: usize, region: usize) -> Option<String>
     })
 }
 
-/// Refuse a prompt past a non-packed static tree's KV window.
-///
-/// A static tree holds `past_len` (static_context - 1) entries. A longer
-/// prompt would slide its earliest tokens (the system prompt first) out of the
-/// ring while it prefills, one token per inference past the window: the
-/// answer comes back 200 from a silently truncated prompt, slowly, holding the
-/// tree's only slot. Image rows cannot slide at all. So the prompt is refused,
-/// as OpenAI does; generation past the window still slides. `past_len` is None
-/// off that path. `expand` gives the prompt as it will be prefilled (images
-/// expanded from their sizes alone); if it fails, the turn is left for the
-/// step path to refuse as before.
-fn static_prompt_too_long(
+/// The bound a non-packed tree holds a prompt to at submit.
+#[derive(Clone, Copy, Debug)]
+enum PromptWindow {
+    /// A static tree's KV ring of `past_len` (static_context - 1) entries. A
+    /// longer prompt would slide its earliest tokens (the system prompt first)
+    /// out of the ring while it prefills, one token per inference past the
+    /// window: the answer comes back 200 from a silently truncated prompt,
+    /// slowly, holding the tree's only slot; image rows cannot slide at all.
+    /// Generation past the window still slides.
+    StaticRing(usize),
+    /// A stateful tree's model context (`max_position_embeddings`, widened by
+    /// a stated RoPE scaling). A prompt at or past it would run positions the
+    /// model was never trained on while the KV cache grows; at-or-past leaves
+    /// the first generated token a position, as the other engines do.
+    ModelContext(usize),
+}
+
+/// Refuse a prompt past `window` with `PromptTooLong` (400
+/// `context_length_exceeded`), as OpenAI does. `None` (a packed tree, a relay,
+/// a tree without a readable context) checks nothing. `expand` gives the
+/// prompt as it will be prefilled (images expanded from their sizes alone); if
+/// it fails, the turn is left for the step path to refuse as before.
+fn prompt_past_window(
     ids: &[i64],
     has_media: bool,
-    past_len: Option<usize>,
+    window: Option<PromptWindow>,
     expand: impl FnOnce(&[i64]) -> Result<Vec<i64>, String>,
 ) -> EngineResult<()> {
-    let Some(past_len) = past_len else {
+    let Some(window) = window else {
         return Ok(());
     };
     let planned = if has_media {
@@ -808,19 +819,24 @@ fn static_prompt_too_long(
     } else {
         ids.len()
     };
-    if planned > past_len {
-        let with = if has_media {
-            " with its images expanded"
-        } else {
-            ""
-        };
-        return Err(EngineError::PromptTooLong(format!(
+    let with = if has_media {
+        " with its images expanded"
+    } else {
+        ""
+    };
+    let msg = match window {
+        PromptWindow::StaticRing(past_len) if planned > past_len => format!(
             "prompt is {planned} tokens{with} but this static tree's KV window holds \
              {past_len} (static_context - 1); send a shorter prompt (or fewer or smaller \
              images), or convert the tree with a larger context"
-        )));
-    }
-    Ok(())
+        ),
+        PromptWindow::ModelContext(max) if planned >= max => format!(
+            "prompt is {planned} tokens{with} but the model's context is {max}; send a \
+             shorter prompt (or fewer or smaller images)"
+        ),
+        _ => return Ok(()),
+    };
+    Err(EngineError::PromptTooLong(msg))
 }
 
 /// Row tag of a packed plan frame, one per column: the frame layout's version
@@ -3068,6 +3084,9 @@ pub struct OvRuntimeEngine {
     rotary: Rotary,
     hidden_size: usize,
     tokenizer: Option<Arc<Tokenizer>>,
+    /// Rank 0's model context (`config.json`'s `max_position_embeddings`, widened by a
+    /// stated RoPE scaling); a stateful tree refuses a prompt at or past it at submit.
+    max_ctx: Option<usize>,
     /// All EOS token ids configured for the model. Generation stops on
     /// the first token that matches ANY of these. See `lookup_eos`.
     eos_token_ids: Vec<u32>,
@@ -6424,13 +6443,19 @@ impl Engine for OvRuntimeEngine {
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
             });
         }
-        // A non-packed static tree would slide an over-window prompt through
-        // its KV window (dropping its start) and an image cannot slide at all:
-        // refuse either here, for the same 400-before-any-stream reason as the
-        // packed check below. Counted on the prompt as step_first serves it
-        // (resume ids appended, images expanded from their sizes), unencoded.
-        let past_len = self.static_kv.as_ref().map(|sk| sk.past_len);
-        if let (None, Some(_), Some(tok)) = (&self.packed, past_len, self.tokenizer.as_ref()) {
+        // Hold the prompt to the tree's window here, for the same
+        // 400-before-any-stream reason as the packed check below: a static
+        // tree's KV ring (an over-window prompt would slide its start out, and
+        // an image cannot slide at all), a stateful tree's model context.
+        // Counted on the prompt as step_first serves it (resume ids appended,
+        // images expanded from their sizes), unencoded. Packed trees check
+        // their slot region below.
+        let window = match (&self.packed, &self.static_kv) {
+            (Some(_), _) => None,
+            (None, Some(sk)) => Some(PromptWindow::StaticRing(sk.past_len)),
+            (None, None) => self.max_ctx.map(PromptWindow::ModelContext),
+        };
+        if let (Some(window), Some(tok)) = (window, self.tokenizer.as_ref()) {
             let has_media = !task.media.is_empty();
             let first = self.vision.as_ref().and_then(|v| v.first.as_ref());
             let ids = match encode_prompt_ids(tok, self.vision.as_ref(), &task) {
@@ -6442,12 +6467,12 @@ impl Engine for OvRuntimeEngine {
             };
             if let Some(mut ids) = ids {
                 cascadia_types::append_resume_ids(&mut ids, task.resume_ids());
-                static_prompt_too_long(&ids, has_media, past_len, |ids| match first {
+                prompt_past_window(&ids, has_media, Some(window), |ids| match first {
                     Some(first) => first.frontend.expand_ids(&task.media, ids),
                     None => Err("no vision front end".into()),
                 })
                 .inspect_err(
-                    |e| warn!(task = %task.task_id, error = %e, "refusing static prompt at submit"),
+                    |e| warn!(task = %task.task_id, error = %e, "refusing prompt at submit"),
                 )?;
             }
         }
@@ -7295,6 +7320,7 @@ pub struct OvRuntimeBuilder {
     rotary: Option<Rotary>,
     hidden_size: usize,
     tokenizer: Option<Arc<Tokenizer>>,
+    max_ctx: Option<usize>,
     eos_token_ids: Vec<u32>,
     input_names: Vec<String>,
     upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
@@ -7918,6 +7944,12 @@ impl Builder for OvRuntimeBuilder {
                 let tok = Tokenizer::from_file(&tok_path)
                     .map_err(|e| EngineError::Backend(format!("tokenizer load: {e}")))?;
                 self.tokenizer = Some(Arc::new(tok));
+                let ctx_dir = if tokenizer_dir.join("config.json").exists() {
+                    &tokenizer_dir
+                } else {
+                    &self.pipeline_dir
+                };
+                self.max_ctx = crate::read_max_ctx(ctx_dir, "ov-runtime");
                 let eos_in_tok = lookup_eos(&tokenizer_dir);
                 self.eos_token_ids = if eos_in_tok.is_empty() {
                     lookup_eos(&self.pipeline_dir)
@@ -8587,6 +8619,7 @@ impl Builder for OvRuntimeBuilder {
             rotary,
             hidden_size: self.hidden_size,
             tokenizer: self.tokenizer,
+            max_ctx: self.max_ctx,
             eos_token_ids: self.eos_token_ids.clone(),
             upstream: self.upstream,
             downstream: self.downstream,
@@ -9192,19 +9225,28 @@ mod tests {
         let ids = [1i64, 9, 2];
         // 3 ids before expansion, 802 after: past a 767-row window only once
         // the image's soft tokens are counted.
-        let r = static_prompt_too_long(&ids, true, Some(767), expand(800));
+        let r = prompt_past_window(&ids, true, Some(PromptWindow::StaticRing(767)), expand(800));
         assert!(
             matches!(r, Err(EngineError::PromptTooLong(ref m)) if m.contains("767")),
             "{r:?}"
         );
-        assert!(static_prompt_too_long(&ids, true, Some(767), expand(256)).is_ok());
+        assert!(
+            prompt_past_window(&ids, true, Some(PromptWindow::StaticRing(767)), expand(256))
+                .is_ok()
+        );
         // Exactly the window fits (the eviction warn fires only past it).
-        assert!(static_prompt_too_long(&ids, true, Some(767), expand(765)).is_ok());
-        assert!(static_prompt_too_long(&ids, true, Some(767), expand(766)).is_err());
+        assert!(
+            prompt_past_window(&ids, true, Some(PromptWindow::StaticRing(767)), expand(765))
+                .is_ok()
+        );
+        assert!(
+            prompt_past_window(&ids, true, Some(PromptWindow::StaticRing(767)), expand(766))
+                .is_err()
+        );
         // Text-only: refused past the window (it would slide its start out),
         // let through up to it; `expand` is not consulted.
         let long: Vec<i64> = (0..2000).collect();
-        let r = static_prompt_too_long(&long, false, Some(767), expand(1));
+        let r = prompt_past_window(&long, false, Some(PromptWindow::StaticRing(767)), expand(1));
         assert!(
             matches!(r, Err(EngineError::PromptTooLong(ref m)) if m.contains("2000 tokens but")),
             "{r:?}"
@@ -9212,13 +9254,57 @@ mod tests {
         let fits: Vec<i64> = (0..767).collect();
         let no_expand =
             |_: &[i64]| -> Result<Vec<i64>, String> { panic!("text needs no expansion") };
-        assert!(static_prompt_too_long(&fits, false, Some(767), no_expand).is_ok());
-        assert!(static_prompt_too_long(&long[..768], false, Some(767), expand(1)).is_err());
+        assert!(
+            prompt_past_window(&fits, false, Some(PromptWindow::StaticRing(767)), no_expand)
+                .is_ok()
+        );
+        assert!(prompt_past_window(
+            &long[..768],
+            false,
+            Some(PromptWindow::StaticRing(767)),
+            expand(1)
+        )
+        .is_err());
         // Not a static tree: no window to check against.
-        assert!(static_prompt_too_long(&ids, true, None, expand(800)).is_ok());
+        assert!(prompt_past_window(&ids, true, None, expand(800)).is_ok());
         // An expansion error leaves the turn to the step path's refusal.
         let fail = |_: &[i64]| -> Result<Vec<i64>, String> { Err("bad".into()) };
-        assert!(static_prompt_too_long(&ids, true, Some(767), fail).is_ok());
+        assert!(prompt_past_window(&ids, true, Some(PromptWindow::StaticRing(767)), fail).is_ok());
+    }
+
+    /// A stateful tree refuses a prompt at or past the model's context
+    /// (leaving the first generated token a position), counted after image
+    /// expansion; one token under it is let through.
+    #[test]
+    fn stateful_submit_refuses_a_prompt_at_the_model_context() {
+        let ctx = Some(PromptWindow::ModelContext(4096));
+        let text = |n: usize| -> Vec<i64> { (0..n as i64).collect() };
+        let no_expand =
+            |_: &[i64]| -> Result<Vec<i64>, String> { panic!("text needs no expansion") };
+        assert!(prompt_past_window(&text(4095), false, ctx, no_expand).is_ok());
+        let r = prompt_past_window(&text(4096), false, ctx, no_expand);
+        assert!(
+            matches!(r, Err(EngineError::PromptTooLong(ref m)) if m.contains("context is 4096")),
+            "{r:?}"
+        );
+        // An image prompt is counted as it will be prefilled.
+        let grow = |ids: &[i64]| -> Result<Vec<i64>, String> {
+            Ok(ids
+                .iter()
+                .flat_map(|&t| if t == 9 { vec![9; 4000] } else { vec![t] })
+                .collect())
+        };
+        // 4000 soft tokens + 96 others = 4096: at the context once expanded.
+        let mut image_prompt = vec![1i64, 9];
+        image_prompt.extend(100..195);
+        let r = prompt_past_window(&image_prompt, true, ctx, grow);
+        assert!(
+            matches!(r, Err(EngineError::PromptTooLong(ref m)) if m.contains("images expanded")),
+            "{r:?}"
+        );
+        assert!(prompt_past_window(&[1, 9, 2], true, ctx, grow).is_ok());
+        // No readable context (or a packed tree / relay): nothing to check.
+        assert!(prompt_past_window(&text(100_000), false, None, no_expand).is_ok());
     }
 
     /// LLaVA-NeXT on packed slots follows Pixtral's rules (causal: no image
@@ -10975,6 +11061,7 @@ mod tests {
             rotary: Rotary::from_config_json(r#"{"head_dim":2}"#).unwrap(),
             hidden_size: 2,
             tokenizer: tokenizer.map(Arc::new),
+            max_ctx: None,
             eos_token_ids: Vec::new(),
             upstream: None,
             downstream: None,
