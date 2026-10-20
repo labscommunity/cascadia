@@ -406,16 +406,30 @@ def main() -> None:
                        is_gemma4(pipeline, config), args.packed_only)
     if err:
         raise SystemExit(err)
+    # A node's own one-stage tree (export_gemma4_text.py --stage I) lists only
+    # the stage it holds; it converts that stage alone.
+    listed = {s.get("stage", j): (s["layer_start"], s["layer_end"] - 1)
+              for j, s in enumerate(pipeline["stages"])}
+    partial = "only_stage" in pipeline
+    if partial and (args.stage is None or args.stage not in listed):
+        raise SystemExit(
+            f"{args.tree} holds only stage(s) {sorted(listed)} of {pipeline['num_stages']}; "
+            f"convert it with --stage {sorted(listed)[0]}")
     if args.stage is not None:
         if not 0 <= args.stage < pipeline["num_stages"]:
             raise SystemExit(f"--stage {args.stage} is not in 0..{pipeline['num_stages'] - 1}")
         # The output's other stages stay as they are: they must come from a
         # tree with this one's layout, or the result skips or repeats layers.
+        ranges = [(s["layer_start"], s["layer_end"] - 1) for s in pipeline["stages"]]
+        if partial:
+            # The stages not here follow the exporters' even split.
+            ranges = [listed.get(i, r) for i, r in enumerate(
+                g.stage_ranges(pipeline["num_stages"], pipeline["num_layers"]))]
         g.check_reused_tree(args.output_dir, pipeline["num_stages"], pipeline.get("num_layers"),
-                            pipeline.get("export_version"),
-                            [(s["layer_start"], s["layer_end"] - 1) for s in pipeline["stages"]],
-                            pipeline.get("hidden_size"))
-    g.check_contiguous(pipeline["stages"], pipeline.get("num_layers"), pipeline["num_stages"])
+                            pipeline.get("export_version"), ranges, pipeline.get("hidden_size"))
+    if not partial:
+        g.check_contiguous(pipeline["stages"], pipeline.get("num_layers"),
+                           pipeline["num_stages"])
     os.makedirs(args.output_dir, exist_ok=True)
     marker = os.path.join(args.output_dir, "pipeline_config.json")
     if os.path.exists(marker):
