@@ -73,6 +73,10 @@ struct PipelineConfig {
     /// [`VisionTree`]. Every rank must load the same block.
     #[serde(default)]
     vision: Option<PipelineVision>,
+    /// Tree-wide copy of `stage_config.packed_only` (see StageConfig); every
+    /// stage must agree with it.
+    #[serde(default)]
+    packed_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,6 +187,12 @@ struct StageConfig {
     /// `vision.mrope_rows`.
     #[serde(default)]
     position_rows: Option<u32>,
+    /// `tools/vlm_surgery/static_variant.py --packed-only` (Gemma 4): the KV
+    /// ring runs past the sliding window, which the static IR masks by ring
+    /// index, so only the packed IR (host-built sliding mask) serves it
+    /// correctly. Loading it without `--packed-slots` is refused.
+    #[serde(default)]
+    packed_only: bool,
 }
 
 fn read_pipeline_config(p: &Path) -> Result<PipelineConfig, EngineError> {
@@ -535,6 +545,50 @@ fn packed_check_then_encode<F, E>(
         )));
     }
     Ok((expanded, Some(rows)))
+}
+
+/// Why a stage cannot load given its `packed_only` marker, or None.
+///
+/// `stage` and `pipeline` are the stage's and the tree's markers, `packed`
+/// whether the load runs the packed variant (`--packed-slots`), `masks` the
+/// stage's `packed_masks`. A marked tree must load packed, from a packed IR
+/// with the host-built sliding mask, and its markers must agree.
+fn packed_only_error(
+    rank: u32,
+    stage: bool,
+    pipeline: bool,
+    packed: bool,
+    masks: Option<&std::collections::BTreeMap<String, String>>,
+) -> Option<String> {
+    if stage != pipeline {
+        return Some(format!(
+            "stage_{rank} packed_only={stage} but pipeline_config.json packed_only={pipeline}: \
+             the stage and the tree come from different static_variant.py runs (one with \
+             --packed-only); rebuild the whole static tree with one setting"
+        ));
+    }
+    if !stage {
+        return None;
+    }
+    if !packed {
+        return Some(format!(
+            "stage_{rank} is a packed-only tree (tools/vlm_surgery/static_variant.py \
+             --packed-only): its KV ring runs past the sliding window, which the static IR \
+             masks by ring index, so static mode would give wrong output. Serve it with \
+             --packed-slots N (after tools/packed_variant.py <stage_dir> --slots N), or \
+             rebuild the static tree without --packed-only"
+        ));
+    }
+    let sliding = masks.is_some_and(|m| m.values().any(|k| k == PACKED_SLIDING));
+    if !sliding {
+        return Some(format!(
+            "stage_{rank} is a packed-only tree but its packed variant has no \
+             sliding_attention mask port (stage_config.packed_masks), so the IR still masks \
+             the sliding window by ring index; rebuild it with tools/packed_variant.py, or \
+             rebuild the static tree without --packed-only"
+        ));
+    }
+    None
 }
 
 /// Mask kinds a packed IR can declare (`stage_config.packed_masks` values).
@@ -7312,6 +7366,16 @@ impl Builder for OvRuntimeBuilder {
             }
         };
 
+        if let Some(msg) = packed_only_error(
+            self.rank,
+            stage_cfg.packed_only,
+            pipeline_cfg.packed_only,
+            self.packed_params.is_some(),
+            stage_cfg.packed_masks.as_ref(),
+        ) {
+            return Err(EngineError::InvalidConfig(msg));
+        }
+
         // The packed variant does its own chunked prefill (a plan whose rows all
         // belong to one slot IS a causal chunk), so the separate prefill model
         // would never be used — skip compiling it and keep its weights off the
@@ -7394,6 +7458,16 @@ impl Builder for OvRuntimeBuilder {
                 // apply different sliding windows per stage — corrupted
                 // output, no error. Fail fast instead. (Differing
                 // static_prefill_seq alone is fine — relays sub-chunk.)
+                // A packed-only stage beside a static-servable one (2-machine
+                // trees each check theirs against pipeline_config above).
+                if cfg.packed_only != stage_cfg.packed_only {
+                    return Err(EngineError::ShardRejected(format!(
+                        "pipeline is not homogeneous: stage_{} packed_only={} but stage_{r} \
+                         packed_only={} — rebuild the whole static tree with one \
+                         static_variant.py --packed-only setting",
+                        self.rank, stage_cfg.packed_only, cfg.packed_only
+                    )));
+                }
                 if cfg.static_context != stage_cfg.static_context {
                     return Err(EngineError::ShardRejected(format!(
                         "pipeline is not homogeneous: stage_{} static_context={:?} but \
@@ -9553,6 +9627,144 @@ mod tests {
         assert!(
             !msg.contains("static_prefill") && !msg.contains("missing —"),
             "prefill validation should be skipped when disabled; got: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- packed-only trees (static_variant.py --packed-only) ----
+
+    fn sliding_masks() -> std::collections::BTreeMap<String, String> {
+        [
+            ("attn_mask_4d", "full_attention"),
+            ("attn_mask_sliding_4d", "sliding_attention"),
+        ]
+        .into_iter()
+        .map(|(p, k)| (p.to_string(), k.to_string()))
+        .collect()
+    }
+
+    #[test]
+    fn packed_only_error_cases() {
+        let masks = sliding_masks();
+        // Unmarked trees load either way, as before.
+        assert_eq!(packed_only_error(0, false, false, false, None), None);
+        assert_eq!(packed_only_error(0, false, false, true, None), None);
+        // A marked tree loads packed with a host-built sliding mask.
+        assert_eq!(packed_only_error(1, true, true, true, Some(&masks)), None);
+        let msg = packed_only_error(1, true, true, false, Some(&masks)).unwrap();
+        assert!(
+            msg.contains("stage_1") && msg.contains("--packed-slots"),
+            "{msg}"
+        );
+        assert!(msg.contains("without --packed-only"), "{msg}");
+        let full_only: std::collections::BTreeMap<String, String> =
+            [("attn_mask_4d".to_string(), "full_attention".to_string())].into();
+        for m in [None, Some(&full_only)] {
+            let msg = packed_only_error(0, true, true, true, m).unwrap();
+            assert!(msg.contains("sliding_attention"), "{msg}");
+        }
+        // Stage and tree markers must agree, whichever way they differ.
+        for (stage, tree) in [(true, false), (false, true)] {
+            let msg = packed_only_error(0, stage, tree, true, Some(&masks)).unwrap();
+            assert!(msg.contains("pipeline_config.json packed_only"), "{msg}");
+        }
+    }
+
+    /// A static stage dir (or two) with `packed_only` markers; stage 0 also
+    /// gets a packed variant (an empty IR file: the stub never compiles it).
+    fn write_packed_only_tree(tag: &str, tree: bool, stages: &[bool]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cascadia-packed-only-test-{}-{tag}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pipeline_config.json"),
+            format!(
+                r#"{{"model_id":"m","num_stages":{},"num_layers":2,"hidden_size":8,
+                    "packed_only":{tree}}}"#,
+                stages.len()
+            ),
+        )
+        .unwrap();
+        for (r, marked) in stages.iter().enumerate() {
+            let stage = dir.join(format!("stage_{r}"));
+            std::fs::create_dir_all(&stage).unwrap();
+            std::fs::write(
+                stage.join("stage_config.json"),
+                format!(
+                    r#"{{"layer_start":{r},"layer_end":{},"has_embed":{},"has_head":{},
+                        "stateful":false,"static_seq":1,"static_context":8,
+                        "num_kv_heads":2,"head_dim":4,"packed_only":{marked},
+                        "packed_slots":2,"packed_seq":4,"packed_context":11,
+                        "packed_dynamic":true,
+                        "packed_masks":{{"attn_mask_4d":"full_attention",
+                                         "attn_mask_sliding_4d":"sliding_attention"}},
+                        "packed_sliding_window":4}}"#,
+                    r + 1,
+                    r == 0,
+                    r + 1 == stages.len()
+                ),
+            )
+            .unwrap();
+            std::fs::write(stage.join("openvino_packed_model.xml"), "").unwrap();
+        }
+        dir
+    }
+
+    async fn load_err(dir: &Path, total: u32, packed_slots: u32) -> String {
+        let mut b = OvRuntimeBuilder::new(dir, 0, total, "CPU");
+        b.packed_slots = packed_slots;
+        let err = b
+            .load(ShardSpec::single_stage("m", "CPU"))
+            .await
+            .err()
+            .expect("the stub cannot compile, so load fails somewhere");
+        err.to_string()
+    }
+
+    #[tokio::test]
+    async fn packed_only_tree_refused_in_static_mode() {
+        let dir = write_packed_only_tree("static", true, &[true]);
+        let msg = load_err(&dir, 1, 0).await;
+        assert!(
+            msg.contains("packed-only tree") && msg.contains("--packed-slots"),
+            "got: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn packed_only_tree_passes_the_gate_in_packed_mode() {
+        let dir = write_packed_only_tree("packed", true, &[true]);
+        let msg = load_err(&dir, 1, 2).await;
+        assert!(
+            !msg.contains("packed_only") && !msg.contains("packed-only"),
+            "got: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn packed_only_stage_and_tree_must_agree() {
+        // A stage built with --packed-only under an unmarked pipeline_config
+        // (one machine's tree rebuilt, the other's not).
+        let dir = write_packed_only_tree("stage-vs-tree", false, &[true]);
+        let msg = load_err(&dir, 1, 2).await;
+        assert!(
+            msg.contains("pipeline_config.json packed_only=false"),
+            "got: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn packed_only_sibling_stages_must_agree() {
+        let dir = write_packed_only_tree("siblings", true, &[true, false]);
+        let msg = load_err(&dir, 2, 2).await;
+        assert!(
+            msg.contains("not homogeneous") && msg.contains("stage_1 packed_only=false"),
+            "got: {msg}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
