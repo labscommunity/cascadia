@@ -32,9 +32,17 @@ least one image wide (Gemma 4: 280, Gemma 3: 256), and context + prefill-seq wit
 window by ring index, which runs ahead of the real distance across the
 ring's padding.
 
+`--packed-only` (Gemma 4) lifts that window cap for a tree that will only be
+served on packed slots: `tools/packed_variant.py` replaces both of Gemma 4's
+mask producers with host-built masks (the sliding one from the real token
+distance), so the ring-index masking never runs there. The tree is then wrong
+in static mode, so the tool marks it `"packed_only": true` in every
+stage_config.json and in pipeline_config.json; ov-runtime refuses to load a
+marked stage without `--packed-slots`.
+
 Usage:
   python static_variant.py --tree <stateful tree> --output-dir <static tree> \
-      --context 2048 [--prefill-seq 256] [--stage I]
+      --context 2048 [--prefill-seq 256] [--stage I] [--packed-only]
 """
 
 from __future__ import annotations
@@ -228,7 +236,8 @@ def copy_file(src: str, dst: str) -> None:
 
 
 def convert_stage(tree: str, out: str, i: int, context: int, prefill_seq: int,
-                  shared_prefill: bool = False, deepstack_layers: int = 0) -> None:
+                  shared_prefill: bool = False, deepstack_layers: int = 0,
+                  packed_only: bool = False) -> None:
     sdir, odir = os.path.join(tree, f"stage_{i}"), os.path.join(out, f"stage_{i}")
     with open(os.path.join(sdir, "stage_config.json")) as f:
         meta = json.load(f)
@@ -258,6 +267,10 @@ def convert_stage(tree: str, out: str, i: int, context: int, prefill_seq: int,
         "target": "npu",
         "static_from": "tools/vlm_surgery/static_variant.py",
     })
+    # Only a --packed-only tree carries the marker (see the module docstring).
+    meta.pop("packed_only", None)
+    if packed_only:
+        meta["packed_only"] = True
     prefill = os.path.join(odir, "openvino_prefill_model.xml")
     for stale in (prefill, prefill[:-4] + ".bin"):
         if os.path.exists(stale):
@@ -297,6 +310,36 @@ def copy_root(tree: str, out: str) -> None:
             copy_file(src, os.path.join(out, name))
 
 
+def is_gemma4(pipeline: dict, config: dict) -> bool:
+    """A Gemma 4 tree: the vision block says so, or (text-only) config.json."""
+    family = (pipeline.get("vision") or {}).get("family")
+    return family == "gemma4" or config.get("model_type") in ("gemma4", "gemma4_text")
+
+
+def window_error(context: int, prefill_seq: int, window, gemma4: bool,
+                 packed_only: bool):
+    """Why `--context` / `--prefill-seq` cannot be built, or None.
+
+    The static IR masks the sliding window by KV ring index, so a ring past
+    the window would cut sliding layers off from tokens inside it. A
+    `--packed-only` Gemma 4 tree is exempt: its packed variant takes both masks
+    from the host. Other families keep the cap (their packed masks were never
+    checked against a ring past the window).
+    """
+    if packed_only and not gemma4:
+        return ("--packed-only is supported for Gemma 4 trees only (packed_variant.py "
+                "replaces both of their mask producers with host-built masks)")
+    if not window or context + max(prefill_seq, 1) <= window + 1 or packed_only:
+        return None
+    msg = (f"--context {context} + --prefill-seq {prefill_seq} exceeds the "
+           f"sliding window ({window}) + 1: the IR masks the window by ring index, so "
+           "a longer ring would cut sliding layers off from tokens inside their window")
+    if gemma4:
+        msg += ("; for a tree served only on packed slots (host-built masks), pass "
+                "--packed-only and serve it with --packed-slots")
+    return msg
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--tree", required=True, help="stateful tree (cut_vlm_lm.py output)")
@@ -310,6 +353,11 @@ def main() -> None:
                          "prefill (weights compiled once); NPU needs the separate static IRs")
     ap.add_argument("--stage", type=int, default=None,
                     help="convert only this stage (a worker holding one stage)")
+    ap.add_argument("--packed-only", action="store_true",
+                    help="Gemma 4: allow --context + --prefill-seq past the sliding window "
+                         "+ 1 for a tree served ONLY on packed slots (packed_variant.py "
+                         "builds both masks on the host). Marks the tree packed_only; "
+                         "ov-runtime refuses it without --packed-slots")
     args = ap.parse_args()
     tree, out = os.path.abspath(args.tree), os.path.abspath(args.output_dir)
     if out == tree or out.startswith(tree + os.sep) or tree.startswith(out + os.sep):
@@ -329,12 +377,11 @@ def main() -> None:
             "(token_type_ids): an image must sit whole in one inference, so pass "
             "--prefill-seq at least one image wide (Gemma 4: 280, Gemma 3: 256)")
     with open(os.path.join(args.tree, "config.json")) as f:
-        window = json.load(f).get("sliding_window")
-    if window and args.context + max(args.prefill_seq, 1) > window + 1:
-        raise SystemExit(
-            f"--context {args.context} + --prefill-seq {args.prefill_seq} exceeds the "
-            f"sliding window ({window}) + 1: the IR masks the window by ring index, so "
-            "a longer ring would cut sliding layers off from tokens inside their window")
+        config = json.load(f)
+    err = window_error(args.context, args.prefill_seq, config.get("sliding_window"),
+                       is_gemma4(pipeline, config), args.packed_only)
+    if err:
+        raise SystemExit(err)
     os.makedirs(args.output_dir, exist_ok=True)
     marker = os.path.join(args.output_dir, "pipeline_config.json")
     if os.path.exists(marker):
@@ -345,11 +392,15 @@ def main() -> None:
     stages = range(pipeline["num_stages"]) if args.stage is None else [args.stage]
     for i in stages:
         convert_stage(args.tree, args.output_dir, i, args.context, args.prefill_seq,
-                      args.shared_prefill, deepstack_layers)
+                      args.shared_prefill, deepstack_layers, args.packed_only)
     copy_root(args.tree, args.output_dir)
     for s in pipeline["stages"]:
         s.update({"stateful": False, "static_seq": 1, "static_context": args.context})
     pipeline["static_from"] = os.path.basename(os.path.abspath(args.tree))
+    pipeline.pop("packed_only", None)
+    if args.packed_only:
+        pipeline["packed_only"] = True
+        log("packed-only tree: serve it with --packed-slots after tools/packed_variant.py")
     # Written last, so its presence means every requested stage converted.
     # A worker that holds one stage converts just that one (--stage I).
     with open(marker, "w") as f:
