@@ -329,6 +329,7 @@ impl Builder for OvGenaiBuilder {
             return Ok(Box::new(OvGenaiCbEngine {
                 active: Vec::new(),
                 accepts_images: takes_images(Path::new(&self.model_path)),
+                max_ctx: crate::read_max_ctx(Path::new(&self.model_path), "ov-genai"),
                 pipe: Box::new(pipe),
                 prompt_pretemplated: self.prompt_pretemplated,
                 next_request_id: 0,
@@ -341,6 +342,7 @@ impl Builder for OvGenaiBuilder {
         Ok(Box::new(OvGenaiEngine {
             pipe,
             accepts_images: takes_images(Path::new(&self.model_path)),
+            max_ctx: crate::read_max_ctx(Path::new(&self.model_path), "ov-genai"),
             speculative_k: self.speculative_k,
             prompt_lookup_ngram: self.prompt_lookup_ngram,
             prompt_pretemplated: self.prompt_pretemplated,
@@ -441,6 +443,35 @@ fn shim_media(task: &GenerationTask) -> EngineResult<Vec<Media<'_>>> {
         .collect()
 }
 
+/// Refuse a text-only prompt at or past the model's window with
+/// [`EngineError::PromptTooLong`] (a 400 `context_length_exceeded`).
+///
+/// GenAI's CPU/GPU pipelines check no window themselves: an over-window prompt
+/// runs past `max_position_embeddings` or fails as a generic error (a 5xx).
+/// The tokenizer's count of the prompt text is exact for a pre-rendered prompt
+/// and a floor when GenAI applies its own template, so it never refuses a
+/// prompt that fits. A turn with media is not checked: GenAI expands each
+/// image and video inside `generate`, the shim reports that count only after
+/// the run, and a media tag's text tokens are no floor for a small image's.
+fn text_window_check(
+    task: &GenerationTask,
+    max_ctx: Option<usize>,
+    count_tokens: impl FnOnce(&str) -> Option<u32>,
+) -> EngineResult<()> {
+    let Some(max) = max_ctx else {
+        return Ok(());
+    };
+    if !task.media.is_empty() {
+        return Ok(());
+    }
+    match count_tokens(&task.prompt) {
+        Some(n) if n as usize >= max => Err(EngineError::PromptTooLong(format!(
+            "prompt is {n} tokens; the model's window is {max} (max_position_embeddings)"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// The rate a video's frames were sampled at, from their timestamps (the API
 /// spaces them evenly from 0): GenAI stamps Qwen3-VL's frames with their
 /// times from it. 0.0 (unknown) with fewer than two frames.
@@ -458,6 +489,8 @@ pub struct OvGenaiEngine {
     pipe: LlmPipeline,
     /// The export is a VLM layout with its vision encoder: see [`takes_images`].
     accepts_images: bool,
+    /// The model's window from its config.json; see [`text_window_check`].
+    max_ctx: Option<usize>,
     speculative_k: u32,
     prompt_lookup_ngram: u32,
     prompt_pretemplated: bool,
@@ -498,6 +531,7 @@ impl Engine for OvGenaiEngine {
         if !self.accepts_images {
             cascadia_engine::refuse_media(&task, "ov-genai (text-only export)")?;
         }
+        text_window_check(&task, self.max_ctx, |p| self.pipe.count_tokens(p))?;
         if self.pending.iter().any(|t| t.task_id == task.task_id) {
             return Ok(());
         }
@@ -735,6 +769,8 @@ pub struct OvGenaiCbEngine {
     active: Vec<ActiveCbTask>,
     /// See [`takes_images`].
     accepts_images: bool,
+    /// The model's window from its config.json; see [`text_window_check`].
+    max_ctx: Option<usize>,
     pipe: Box<dyn CbPipe>,
     prompt_pretemplated: bool,
     next_request_id: u64,
@@ -810,6 +846,7 @@ impl Engine for OvGenaiCbEngine {
         if !self.accepts_images {
             cascadia_engine::refuse_media(&task, "ov-genai (text-only export)")?;
         }
+        text_window_check(&task, self.max_ctx, |p| self.pipe.count_tokens(p))?;
         if self.active.iter().any(|t| t.task_id == task.task_id) {
             return Ok(());
         }
@@ -1311,6 +1348,7 @@ mod tests {
         OvGenaiCbEngine {
             active: Vec::new(),
             accepts_images: true,
+            max_ctx: None,
             pipe: Box::new(MockPipe { st: st.clone() }),
             prompt_pretemplated: false,
             next_request_id: 0,
@@ -1322,6 +1360,28 @@ mod tests {
 
     fn task(id: &str, max_tokens: u32) -> GenerationTask {
         GenerationTask::new(id, "hello").with_max_tokens(max_tokens)
+    }
+
+    /// A text prompt at or past the window is a 400 before anything is enrolled; one under it,
+    /// an unknown window, or a turn with media (counted only by GenAI, after the run) passes.
+    /// The mock tokenizer counts every prompt as 7 tokens.
+    #[test]
+    fn cb_submit_refuses_text_prompts_at_or_past_the_window() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        e.max_ctx = Some(7);
+        let err = e.submit(task("at", 4)).unwrap_err();
+        assert!(matches!(err, EngineError::PromptTooLong(_)), "{err:?}");
+        assert!(
+            st.lock().unwrap().added.is_empty(),
+            "refused before add_request"
+        );
+        assert!(e.submit(image_task("media")).is_ok());
+        e.max_ctx = Some(8);
+        assert!(e.submit(task("under", 4)).is_ok());
+        e.max_ctx = None;
+        assert!(e.submit(task("unknown", 4)).is_ok());
+        assert_eq!(st.lock().unwrap().added.len(), 3);
     }
 
     /// Option B: the CB engine has no forced-prefix path — a resumed submit

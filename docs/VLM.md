@@ -369,6 +369,12 @@ Pass the snapshot path to `--model` (a pinned download is not resolvable by repo
 offline). `--vision` takes the vision encoder IR and processor configs from the
 OpenVINO export.
 
+Rank 0 reads the window from `tokenizer/config.json` (`text_config.max_position_embeddings`,
+written by the export) and refuses a prompt at or past it with a 400
+`context_length_exceeded`, counted with every image and video expanded to its soft tokens
+(from their sizes, before anything is encoded); a turn's completion stops at the window.
+A tree without that file loads with the guard off and says so in its log.
+
 ### Pixtral (ov-runtime)
 
 ```bash
@@ -377,7 +383,10 @@ python tools/vlm_surgery/cut_vlm_lm.py --model <OpenVINO/pixtral-12b-int4-ov dir
 ```
 
 `--num-stages 1` cuts a one-stage tree for a single box. `--stage I` cuts one stage on a
-worker that holds only that one.
+worker that holds only that one. Every stage checks at load that its layer range matches
+the tree's `pipeline_config.json` `stages` list, that the list tiles the model's layers
+without a gap or overlap, and that the sibling stage configs on its disk agree, so a stage
+re-cut with another split into a reused tree is refused instead of serving garbage.
 
 ### Gemma 3 (ov-runtime)
 
@@ -524,7 +533,9 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
   image (2956 prompt tokens with the SDK test's text) must fit one slot's region, so a
   two-slot variant needs `--context` near 6016 (region 3007); a narrower context refuses
   such an image with a 400 `context_length_exceeded`. Verified static and packed on CPU (prompt_tokens 2956).
-- **Gemma 4** needs `--prefill-seq` at least one image wide (280), and `--context` plus
+- **Gemma 4** needs `--prefill-seq` at least one image wide (280) on every stage (each
+  stage checks its own at load against the tree root's processor configs, so a relay
+  converted narrower is refused there, not on its first large image), and `--context` plus
   `--prefill-seq` must stay within the sliding window + 1 (1025): for example
   `--context 736 --prefill-seq 288`, which holds about two images. The static IR masks
   the window by KV ring index, which a longer ring would get wrong. A tree served only on
@@ -668,6 +679,11 @@ IRs); a restart from the cache dir served in under a minute. See
   Qwen: about one per 1000 pixels, a 448x448 image is 196 tokens on Qwen3.5 / Qwen3-VL
   and 256 on Qwen2.5-VL). The counts match Hugging Face's processor for the same
   request (`ov-genai` counts 2956 for that LLaVA-NeXT request).
+- `ov-genai` checks the window (`config.json` `max_position_embeddings`) before generation
+  on text-only turns only, with a 400 `context_length_exceeded`. GenAI expands images and
+  videos inside the run and reports their token count only afterwards, so a turn with media
+  that overruns the window is not refused up front: GenAI runs it or fails it with a
+  server error.
 - Phi-3.5-vision and InternVL2: these exports carry Phi-3's RoPE frequencies as a traced
   constant, with no switch to the long factors past 4096 positions, so longer sequences
   differ from Hugging Face; ov-genai runs the same IRs. The load log says so.

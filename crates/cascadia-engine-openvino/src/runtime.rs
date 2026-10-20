@@ -77,6 +77,105 @@ struct PipelineConfig {
     /// stage must agree with it.
     #[serde(default)]
     packed_only: bool,
+    /// Every stage's layer range, as the surgery cutters list it
+    /// (`tools/vlm_surgery`, `tools/gemma4_surgery`); empty on trees that
+    /// do not (`tools/export_shards.py`). See [`check_stage_layers`].
+    #[serde(default)]
+    stages: Vec<ListedStage>,
+}
+
+/// One `stages` entry of pipeline_config.json: the stage and its half-open
+/// layer range.
+#[derive(Debug, Deserialize)]
+struct ListedStage {
+    stage: u32,
+    #[serde(default)]
+    layer_start: u32,
+    #[serde(default)]
+    layer_end: u32,
+}
+
+/// Refuse a tree whose stages' layer ranges leave a gap or overlap: it loads
+/// and serves garbage (a re-cut stage dropped into a tree cut another way).
+/// Each rank checks what it can see without a wire change: its own range
+/// against pipeline_config.json's `stages` list, that list (when it names a
+/// stage more than once, or neighbours), and the sibling stage configs on its
+/// disk (a single-host tree). Two machines each holding a self-consistent
+/// tree from different cuts are not caught here. A range of `0..0` is an
+/// export that never stated one and is not checked.
+fn check_stage_layers(
+    rank: u32,
+    pipeline: &PipelineConfig,
+    own: (u32, u32),
+    siblings: &[(u32, u32, u32)],
+) -> EngineResult<()> {
+    if own.1 == 0 {
+        return Ok(());
+    }
+    let reject = |msg: String| {
+        Err(EngineError::ShardRejected(format!(
+            "{msg}; the stages come from different cuts (re-cut the whole tree, or every \
+             stage with one split)"
+        )))
+    };
+    if own.0 >= own.1 {
+        return reject(format!(
+            "stage_{rank} holds layers {}..{}, an empty range",
+            own.0, own.1
+        ));
+    }
+    if let Some(l) = pipeline.stages.iter().find(|l| l.stage == rank) {
+        if (l.layer_start, l.layer_end) != own {
+            return reject(format!(
+                "stage_{rank}/stage_config.json holds layers {}..{} but pipeline_config.json \
+                 lists {}..{} for it",
+                own.0, own.1, l.layer_start, l.layer_end
+            ));
+        }
+    }
+    let listed: Vec<(u32, u32, u32)> = pipeline
+        .stages
+        .iter()
+        .map(|l| (l.stage, l.layer_start, l.layer_end))
+        .collect();
+    let mut on_disk = siblings.to_vec();
+    on_disk.push((rank, own.0, own.1));
+    for (ranges, source) in [
+        (listed, "pipeline_config.json lists"),
+        (on_disk, "the stage configs on disk hold"),
+    ] {
+        let mut by_stage = std::collections::BTreeMap::new();
+        for (s, a, b) in ranges {
+            if b == 0 {
+                continue;
+            }
+            if by_stage.insert(s, (a, b)).is_some() {
+                return reject(format!("{source} stage {s} twice"));
+            }
+        }
+        for (&s, &(a, b)) in &by_stage {
+            if s == 0 && a != 0 {
+                return reject(format!("{source} stage 0 starting at layer {a}, not 0"));
+            }
+            if s + 1 == pipeline.num_stages && pipeline.num_layers > 0 && b != pipeline.num_layers {
+                return reject(format!(
+                    "{source} the last stage ending at layer {b}, but the model has {} layers",
+                    pipeline.num_layers
+                ));
+            }
+            if let Some(&(next, _)) = by_stage.get(&(s + 1)) {
+                if next != b {
+                    return reject(format!(
+                        "{source} stage {s} ending at layer {b} and stage {} starting at layer \
+                         {next} ({})",
+                        s + 1,
+                        if next > b { "a gap" } else { "an overlap" }
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -2193,6 +2292,21 @@ fn check_mrope_tree(
     Ok(())
 }
 
+/// A stage whose `position_ids` take M-RoPE rows (a Qwen VL cut) in a
+/// pipeline without a `vision` block would be fed plain `[B, T]` positions
+/// and fail at its first inference (or, on a relay, as a generic downstream
+/// NACK); refuse it at load, as [`check_mrope_tree`] does for a vision tree.
+fn check_positions_without_vision(rank: u32, position_rows: Option<u32>) -> EngineResult<()> {
+    match position_rows {
+        Some(rows) => Err(EngineError::InvalidConfig(format!(
+            "stage_{rank} takes {rows}-row M-RoPE position_ids but pipeline_config.json has no \
+             `vision` block to say so; use the pipeline_config.json the tree was cut with \
+             (tools/vlm_surgery/cut_vlm_lm.py)"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// The family of a pipeline's `vision` block. A tree without the field is
 /// accepted only when it is a Gemma 4 vision surgery tree (written before the
 /// field existed); any other family is refused rather than fed another
@@ -2222,6 +2336,44 @@ pub(crate) fn vision_family(
              export; re-export the tree so it names its family"
         ))),
     }
+}
+
+/// The soft tokens of the widest image (or native-video frame) a
+/// `token_type_ids` vision tree can send, from the tree root's processor
+/// configs without loading the vision encoder: a relay stage's copy of what
+/// rank 0's front end reports (`max_image_tokens`). On Gemma 4 a frame counts
+/// whether or not native video is on, which is rank 0's figure as long as a
+/// frame is no wider than an image (70 and 280 in every export). `None` for
+/// families without bidirectional image blocks.
+fn widest_image_tokens(dir: &Path, family: VisionFamily) -> Result<Option<usize>, String> {
+    Ok(match family {
+        VisionFamily::Gemma4 => {
+            let image = crate::gemma4_vision::PreprocessConfig::from_model_dir(dir)?;
+            let video = crate::gemma4_vision::video::VideoConfig::from_model_dir(dir)?;
+            Some(image.max_soft_tokens.max(video.frame.max_soft_tokens) as usize)
+        }
+        VisionFamily::Gemma3 => Some(
+            crate::gemma3_vision::PreprocessConfig::from_model_dir(dir)?.image_seq_length as usize,
+        ),
+        VisionFamily::Pixtral
+        | VisionFamily::Phi3V
+        | VisionFamily::InternVL
+        | VisionFamily::LlavaNext
+        | VisionFamily::QwenVl(_) => None,
+    })
+}
+
+/// A static `token_type_ids` stage's chunked-prefill IR must hold the widest
+/// image whole: an image is attended both ways, so no chunk may end inside
+/// one, on rank 0 or on any relay.
+fn static_image_window_fits(pseq: usize, max: usize, rank: u32) -> EngineResult<()> {
+    if pseq < max {
+        return Err(EngineError::InvalidConfig(format!(
+            "stage_{rank}: static prefill IR takes {pseq} rows but an image can be {max} \
+             tokens; re-convert with --prefill-seq {max} or more"
+        )));
+    }
+    Ok(())
 }
 
 /// A vision tree: stage 0 takes `inputs_embeds` instead of ids (rank 0
@@ -4371,6 +4523,11 @@ impl OvRuntimeEngine {
                 break;
             };
             let task = self.pending.remove(0);
+            // The turn's images, encoded at submit. Taken off the map before
+            // any refusal below, so every `continue` (and `?`) drops them with
+            // the task instead of leaving them resident: a Qwen3-VL turn's
+            // DeepStack rows run to hundreds of MB.
+            let mut encoded = self.packed_images.remove(&task.task_id);
             // Option B: the packed path has no forced-prefix support — it neither
             // appends `resume_token_ids` to the prompt nor seeds `generated`/`emitted`.
             // Admitting a resume task here would regenerate the turn FROM SCRATCH and
@@ -4437,7 +4594,7 @@ impl OvRuntimeEngine {
                         rows,
                         mrope: positions,
                         deepstack,
-                    }) = self.packed_images.remove(&task.task_id)
+                    }) = encoded.take()
                     else {
                         let id = task.task_id.clone();
                         out.push((
@@ -6230,7 +6387,10 @@ impl Engine for OvRuntimeEngine {
         // caller gets a 400 before any stream is opened — a streaming client
         // rejected mid-stream would already have had its 200 committed and
         // would receive a non-standard error frame instead.
-        if let Some(packed) = self.packed.as_ref() {
+        // A resumed task skips it: admission refuses it (packed slots have no
+        // forced-prefix path), so encoding its images here would only spend
+        // encoder time under the engine lock on rows nobody reads.
+        if let Some(packed) = self.packed.as_ref().filter(|_| task.resume_ids().is_none()) {
             if let Some(tok) = self.tokenizer.as_ref() {
                 let ids = encode_prompt_ids(tok, self.vision.as_ref(), &task)
                     .map_err(EngineError::Backend)?;
@@ -7438,11 +7598,13 @@ impl Builder for OvRuntimeBuilder {
         // (single-host multi-process); for distributed deploys each node has
         // only its own stage dir, so the strict wire-frame validation in
         // recv_hidden_from_upstream is the backstop at the first activation.
+        let mut sibling_layers = Vec::new();
         for r in 0..pipeline_cfg.num_stages {
             if r == self.rank {
                 continue;
             }
             if let Ok(cfg) = read_stage_config(&self.pipeline_dir.join(format!("stage_{r}"))) {
+                sibling_layers.push((r, cfg.layer_start, cfg.layer_end));
                 if cfg.stateful != stage_cfg.stateful {
                     return Err(EngineError::ShardRejected(format!(
                         "pipeline is not homogeneous: stage_{} stateful={} but stage_{r} \
@@ -7457,7 +7619,10 @@ impl Builder for OvRuntimeBuilder {
                 // pipeline stitched from different exports would silently
                 // apply different sliding windows per stage — corrupted
                 // output, no error. Fail fast instead. (Differing
-                // static_prefill_seq alone is fine — relays sub-chunk.)
+                // static_prefill_seq alone is fine for text — relays
+                // sub-chunk — but on a `token_type_ids` vision tree every
+                // stage's must hold the widest image; the vision block below
+                // checks each stage's own.)
                 // A packed-only stage beside a static-servable one (2-machine
                 // trees each check theirs against pipeline_config above).
                 if cfg.packed_only != stage_cfg.packed_only {
@@ -7478,6 +7643,13 @@ impl Builder for OvRuntimeBuilder {
                 }
             }
         }
+
+        check_stage_layers(
+            self.rank,
+            &pipeline_cfg,
+            (stage_cfg.layer_start, stage_cfg.layer_end),
+            &sibling_layers,
+        )?;
 
         let is_first = stage_cfg.has_embed;
         let is_last = stage_cfg.has_head;
@@ -7566,6 +7738,16 @@ impl Builder for OvRuntimeBuilder {
                      serves prefill itself (prefill_shares_decode)"
                         .into(),
                 ));
+            }
+            // There is no second model to park: the decode IR stays resident.
+            if self.park_prefill {
+                warn!(
+                    "--park-prefill does nothing on this stage: its decode IR serves prefill \
+                     itself (prefill_shares_decode), so no separate prefill model is resident"
+                );
+                events.push(LoadProgress::message(String::from(
+                    "warning: --park-prefill has no effect (prefill runs on the decode IR)",
+                )));
             }
             events.push(LoadProgress::message(format!(
                 "chunked prefill (seq={pseq}) runs on the decode IR (one compiled model)"
@@ -7719,12 +7901,7 @@ impl Builder for OvRuntimeBuilder {
             let first = if is_first {
                 let f = VisionFirst::load(&self.pipeline_dir, v, family)?;
                 if let (Some(pseq), Some(max)) = (static_window, f.frontend.max_image_tokens()) {
-                    if pseq < max {
-                        return Err(EngineError::InvalidConfig(format!(
-                            "static prefill IR takes {pseq} rows but an image can be {max} \
-                             tokens; re-convert with --prefill-seq {max} or more"
-                        )));
-                    }
+                    static_image_window_fits(pseq, max, self.rank)?;
                 }
                 // Packed: an image wider than one packed inference is refused
                 // per request (submit), so a narrow variant still serves text
@@ -7751,6 +7928,23 @@ impl Builder for OvRuntimeBuilder {
                 )));
                 Some(f)
             } else {
+                // A relay sub-chunks the prefill too, and a chunk never ends
+                // inside an image: one narrower than the widest image loads
+                // fine and then fails every such image mid-pipeline. It has no
+                // front end, so it reads the figure from the processor configs
+                // every cut copies to the tree root.
+                if let Some(pseq) = static_window {
+                    let max = widest_image_tokens(&self.pipeline_dir, family).map_err(|e| {
+                        EngineError::InvalidConfig(format!(
+                            "static {family:?} vision tree: stage_{} cannot size the widest \
+                             image ({e}); every stage needs the tree root's processor configs",
+                            self.rank
+                        ))
+                    })?;
+                    if let Some(max) = max {
+                        static_image_window_fits(pseq, max, self.rank)?;
+                    }
+                }
                 events.push(LoadProgress::message(format!(
                     "vision tree ({family:?}): {}",
                     if token_types {
@@ -7769,6 +7963,8 @@ impl Builder for OvRuntimeBuilder {
                 full_blocks: !matches!(family, VisionFamily::Gemma4),
                 mrope,
             });
+        } else {
+            check_positions_without_vision(self.rank, stage_cfg.position_rows)?;
         }
 
         events.push(LoadProgress::ready());
@@ -10583,5 +10779,252 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tok, 8);
+    }
+
+    /// A relay of a static `token_type_ids` tree sizes the widest image from
+    /// the tree root, as rank 0's front end would, and a prefill IR narrower
+    /// than it is refused on any stage.
+    #[test]
+    fn relays_size_the_widest_image_from_the_tree_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        assert!(
+            widest_image_tokens(d, VisionFamily::Gemma4).is_err(),
+            "no processor config: refused, not skipped"
+        );
+        assert_eq!(widest_image_tokens(d, VisionFamily::Pixtral).unwrap(), None);
+        std::fs::write(
+            d.join("processor_config.json"),
+            r#"{"image_processor":{"max_soft_tokens":280},"image_seq_length":256}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            widest_image_tokens(d, VisionFamily::Gemma4).unwrap(),
+            Some(280)
+        );
+        std::fs::write(d.join("preprocessor_config.json"), "{}").unwrap();
+        assert_eq!(
+            widest_image_tokens(d, VisionFamily::Gemma3).unwrap(),
+            Some(256)
+        );
+
+        assert!(static_image_window_fits(280, 280, 1).is_ok());
+        let err = static_image_window_fits(256, 280, 1).unwrap_err();
+        assert!(
+            matches!(&err, EngineError::InvalidConfig(m) if m.contains("stage_1")),
+            "{err}"
+        );
+    }
+
+    /// One-box packed engine on a stub runtime: enough to run admission
+    /// without OpenVINO.
+    #[cfg(not(feature = "openvino"))]
+    fn packed_test_engine(tokenizer: Option<Tokenizer>) -> OvRuntimeEngine {
+        let kv = crate::packed::PackedKv::new(2, 32, 4, 1, 1, 2, ShimDType::F16, 0);
+        let masks = vec![crate::packed_exec::PackedMask::new(
+            "attn_mask_4d".into(),
+            ShimDType::F16,
+            None,
+        )];
+        let packed = crate::packed_exec::PackedState::new(
+            Box::new(OvRuntime::stub()),
+            kv,
+            Vec::new(),
+            "input_ids".into(),
+            String::new(),
+            0,
+            masks,
+            "position_ids".into(),
+        );
+        OvRuntimeEngine {
+            packed: Some(packed),
+            vision: None,
+            step_types: Vec::new(),
+            step_positions: Vec::new(),
+            static_ds_global: Vec::new(),
+            static_ds_total: 0,
+            static_ds_cursor: 0,
+            spec: ShardSpec {
+                model_id: "t".into(),
+                layer_start: 0,
+                layer_end: 1,
+                total_layers: 1,
+                device: "CPU".into(),
+                is_first_stage: true,
+                is_last_stage: true,
+                tp_size: 1,
+                tp_rank: 0,
+            },
+            runtime: OvRuntime::stub(),
+            rotary: Rotary::from_config_json(r#"{"head_dim":2}"#).unwrap(),
+            hidden_size: 2,
+            tokenizer: tokenizer.map(Arc::new),
+            eos_token_ids: Vec::new(),
+            upstream: None,
+            downstream: None,
+            runtime_handle: tokio::runtime::Handle::current(),
+            position: 0,
+            input_names: Vec::new(),
+            canonical_inputs: std::collections::HashMap::new(),
+            pending: Vec::new(),
+            packed_images: std::collections::HashMap::new(),
+            active: None,
+            static_kv: None,
+            prefill: None,
+            park_prefill: false,
+            prefill_reload: None,
+            step_warn: StepWarnLimiter::default(),
+            wire_dead: WireDeadLatch::default(),
+            awaiting_token_seq: 0,
+            inbound_seq: None,
+            consecutive_token_timeouts: 0,
+            #[cfg(feature = "kv_coord")]
+            kv: crate::kv_coordination::OvKvCache::default(),
+            #[cfg(feature = "kv_coord")]
+            kv_share: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::kv_coordination::OvKvCache::default(),
+            )),
+            #[cfg(feature = "kv_coord")]
+            kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
+            #[cfg(feature = "kv_coord")]
+            kv_warm_pending: false,
+            #[cfg(feature = "kv_coord")]
+            plane_restore: false,
+        }
+    }
+
+    /// A turn's encoded images (`packed_images`) leave the map with the task
+    /// on every admission refusal, not only when the task is admitted.
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test]
+    async fn packed_admission_refusals_drop_the_encoded_images() {
+        let turn = || PackedTurn {
+            ids: vec![1, 2],
+            rows: vec![vec![0.0; 1 << 16]],
+            mrope: None,
+            deepstack: vec![vec![0.0; 1 << 16]],
+        };
+        let tok = Tokenizer::from_bytes(
+            br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+                "normalizer":null,"pre_tokenizer":{"type":"Whitespace"},
+                "post_processor":null,"decoder":null,
+                "model":{"type":"WordLevel","vocab":{"hi":0},"unk_token":"hi"}}"#,
+        )
+        .unwrap();
+
+        let mut e = packed_test_engine(Some(tok));
+        let mut resumed = GenerationTask::new("resumed", "hi");
+        resumed.resume_token_ids = Some(vec![0]);
+        let empty = GenerationTask::new("empty", "");
+        for t in [resumed, empty] {
+            e.packed_images.insert(t.task_id.clone(), turn());
+            e.pending.push(t);
+        }
+        let out = e.step_first_packed().unwrap();
+        assert_eq!(out.len(), 2, "both refused with their own error chunk");
+        assert!(out.iter().all(|(_, c)| c.error.is_some()));
+        assert!(e.packed_images.is_empty(), "a refusal leaked its images");
+
+        // No tokenizer: the engine-level error drops the task's images too.
+        let mut e = packed_test_engine(None);
+        let t = GenerationTask::new("no-tok", "hi");
+        e.packed_images.insert(t.task_id.clone(), turn());
+        e.pending.push(t);
+        assert!(e.step_first_packed().is_err());
+        assert!(e.packed_images.is_empty());
+    }
+
+    /// A resumed task is refused at admission, so submit must not encode (and
+    /// park) its images first.
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test]
+    async fn packed_submit_leaves_a_resumed_task_to_admission() {
+        let tok = Tokenizer::from_bytes(
+            br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+                "normalizer":null,"pre_tokenizer":{"type":"Whitespace"},
+                "post_processor":null,"decoder":null,
+                "model":{"type":"WordLevel","vocab":{"hi":0},"unk_token":"hi"}}"#,
+        )
+        .unwrap();
+        let mut e = packed_test_engine(Some(tok));
+        // Over the 4-token-per-slot region: only checked for a fresh task.
+        let mut resumed = GenerationTask::new(
+            "resumed",
+            "hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi",
+        );
+        resumed.resume_token_ids = Some(vec![0]);
+        assert!(e.submit(resumed).is_ok(), "left for admission to refuse");
+        assert!(e.packed_images.is_empty());
+        let fresh = GenerationTask::new(
+            "fresh",
+            "hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi hi",
+        );
+        assert!(matches!(
+            e.submit(fresh),
+            Err(EngineError::PromptTooLong(_))
+        ));
+    }
+
+    fn layered_pipeline(stages: &str) -> PipelineConfig {
+        serde_json::from_str(&format!(
+            r#"{{"model_id":"m","num_stages":2,"num_layers":28,"stages":{stages}}}"#
+        ))
+        .unwrap()
+    }
+
+    /// A tree whose stage ranges leave a gap or overlap is refused at load,
+    /// from the pipeline's `stages` list or the sibling configs on disk; a
+    /// contiguous tree, or one that states no ranges, loads.
+    #[test]
+    fn stage_layer_ranges_must_tile_the_model() {
+        let whole = r#"[{"stage":0,"layer_start":0,"layer_end":14},
+                        {"stage":1,"layer_start":14,"layer_end":28}]"#;
+        let p = layered_pipeline(whole);
+        assert!(check_stage_layers(1, &p, (14, 28), &[(0, 0, 14)]).is_ok());
+        assert!(check_stage_layers(0, &p, (0, 14), &[]).is_ok());
+
+        // Own stage re-cut, pipeline list from the old cut.
+        let err = check_stage_layers(1, &p, (16, 28), &[]).unwrap_err();
+        assert!(err.to_string().contains("lists 14..28"), "{err}");
+
+        // Re-cut stage 1 rewrote the list; stage 0 on disk is the old cut.
+        let p = layered_pipeline(
+            r#"[{"stage":0,"layer_start":0,"layer_end":16},
+                {"stage":1,"layer_start":16,"layer_end":28}]"#,
+        );
+        let err = check_stage_layers(1, &p, (16, 28), &[(0, 0, 14)]).unwrap_err();
+        assert!(err.to_string().contains("a gap"), "{err}");
+        let err = check_stage_layers(1, &p, (16, 28), &[(0, 0, 18)]).unwrap_err();
+        assert!(err.to_string().contains("an overlap"), "{err}");
+
+        // A list that does not tile 0..num_layers.
+        let p = layered_pipeline(
+            r#"[{"stage":0,"layer_start":0,"layer_end":14},
+                {"stage":1,"layer_start":14,"layer_end":27}]"#,
+        );
+        assert!(check_stage_layers(0, &p, (0, 14), &[]).is_err());
+        let p = layered_pipeline(r#"[{"stage":0,"layer_start":2,"layer_end":14}]"#);
+        assert!(check_stage_layers(1, &p, (14, 28), &[]).is_err());
+
+        // No list (export_shards.py), no siblings, or no stated range.
+        let p = layered_pipeline("[]");
+        assert!(check_stage_layers(1, &p, (14, 28), &[]).is_ok());
+        assert!(check_stage_layers(1, &p, (14, 28), &[(0, 0, 0)]).is_ok());
+        assert!(check_stage_layers(1, &p, (0, 0), &[(0, 0, 3)]).is_ok());
+        assert!(
+            check_stage_layers(1, &p, (20, 20), &[]).is_err(),
+            "empty range"
+        );
+    }
+
+    /// A Qwen VL stage (`position_rows: 3`) in a pipeline without a `vision`
+    /// block is refused at load; a plain stage passes.
+    #[test]
+    fn mrope_stage_without_a_vision_block_is_refused() {
+        assert!(matches!(
+            check_positions_without_vision(1, Some(3)),
+            Err(EngineError::InvalidConfig(_))
+        ));
+        assert!(check_positions_without_vision(1, None).is_ok());
     }
 }
