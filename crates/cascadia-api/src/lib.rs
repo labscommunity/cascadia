@@ -299,6 +299,11 @@ pub struct Config {
     /// appended to the 400 that refuses them, so the caller learns what
     /// serves them instead (Pixtral on ov-genai).
     pub no_media_reason: Option<String>,
+    /// How long a media route's body may take to arrive once it holds an
+    /// in-flight slot (see `gate_media_body`): past it the slot is freed and
+    /// the request answered `408`. 30 s carries the largest allowed body
+    /// (about 69 MB) at under 20 Mbit/s.
+    pub media_body_timeout: std::time::Duration,
 }
 
 impl Default for Config {
@@ -312,6 +317,7 @@ impl Default for Config {
             marker_dialect: None,
             media: None,
             no_media_reason: None,
+            media_body_timeout: std::time::Duration::from_secs(30),
         }
     }
 }
@@ -670,22 +676,25 @@ pub fn make_router_with_stats(
     // The routes that carry images get the image allowance on top of the
     // text limit; every other route keeps the text limit alone.
     // A server that decodes videos adds their allowance too.
-    let image_body_limit = DefaultBodyLimit::max(cfg.max_body_bytes.saturating_add(
-        cfg.media.as_ref().map_or(0, |m| {
+    let image_body_bytes = cfg
+        .max_body_bytes
+        .saturating_add(cfg.media.as_ref().map_or(0, |m| {
             media::base64_len(m.max_request_image_bytes).saturating_add(if m.accepts_video() {
                 media::base64_len(m.max_request_video_bytes)
             } else {
                 0
             })
-        }),
-    ));
+        }));
+    let image_body_limit = DefaultBodyLimit::max(image_body_bytes);
     // The raised limit lets each such body be tens of MB, read and parsed
     // before the handler's in-flight gate: bound how many are in flight
     // before any is read (see `gate_media_body`).
     let media_gate = axum::middleware::from_fn_with_state(
-        cfg.media
-            .as_ref()
-            .map(|_| Arc::new(Semaphore::new(cfg.max_concurrent_requests))),
+        cfg.media.as_ref().map(|_| MediaGate {
+            slots: Arc::new(Semaphore::new(cfg.max_concurrent_requests)),
+            max_body_bytes: image_body_bytes,
+            body_timeout: cfg.media_body_timeout,
+        }),
         gate_media_body,
     );
     Router::new()
@@ -724,6 +733,17 @@ pub fn make_router_with_stats(
         .layer(axum::middleware::from_fn(track_http_metrics))
 }
 
+/// See [`gate_media_body`].
+#[derive(Clone)]
+struct MediaGate {
+    /// [`Config::max_concurrent_requests`] slots.
+    slots: Arc<Semaphore>,
+    /// The media routes' body limit; reading stops one byte past it.
+    max_body_bytes: usize,
+    /// See [`Config::media_body_timeout`].
+    body_timeout: std::time::Duration,
+}
+
 /// Request middleware on the routes whose body limit images raise: a slot
 /// out of [`Config::max_concurrent_requests`], taken before the body is
 /// read and held until the handler returns (by then the body is dropped; a
@@ -732,15 +752,22 @@ pub fn make_router_with_stats(
 /// allowance buffered and parsed before the in-flight gate refused them.
 /// No slot is the in-flight gate's capacity 503, the body never read. A
 /// server without images (`None`) passes every request through.
+///
+/// The body is read here, by [`Config::media_body_timeout`]: a client that
+/// sends its headers and then trickles (or stalls) would otherwise hold its
+/// slot for as long as it likes, and a few such clients every slot. Past the
+/// deadline the slot is freed and the request gets a `408`. Reading stops
+/// one byte past the route's limit; the handler's body limit then answers
+/// with its usual `413`.
 async fn gate_media_body(
-    State(gate): State<Option<Arc<Semaphore>>>,
+    State(gate): State<Option<MediaGate>>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
     let Some(gate) = gate else {
         return next.run(req).await;
     };
-    let Ok(permit) = gate.try_acquire_owned() else {
+    let Ok(permit) = gate.slots.try_acquire_owned() else {
         count_rejected("capacity");
         let mut resp = api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -750,7 +777,43 @@ async fn gate_media_body(
         resp.extensions_mut().insert(PreEngineFailure);
         return resp;
     };
-    let resp = next.run(req).await;
+    let (parts, body) = req.into_parts();
+    let read = async {
+        let mut buf = bytes::BytesMut::new();
+        let mut chunks = body.into_data_stream();
+        while let Some(chunk) = chunks.next().await {
+            buf.extend_from_slice(&chunk?);
+            if buf.len() > gate.max_body_bytes {
+                break;
+            }
+        }
+        Ok::<_, axum::Error>(buf.freeze())
+    };
+    let body = match tokio::time::timeout(gate.body_timeout, read).await {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => {
+            count_rejected("malformed_body");
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "could not read the request body",
+                None,
+            );
+        }
+        Err(_) => {
+            count_rejected("malformed_body");
+            return api_error(
+                StatusCode::REQUEST_TIMEOUT,
+                format!(
+                    "the request body did not arrive within {} s",
+                    gate.body_timeout.as_secs_f32()
+                ),
+                None,
+            );
+        }
+    };
+    let resp = next
+        .run(axum::extract::Request::from_parts(parts, Body::from(body)))
+        .await;
     drop(permit);
     resp
 }
@@ -5881,6 +5944,49 @@ mod tests {
             .await;
             assert_eq!(status, StatusCode::OK, "{v}");
         }
+        // A client that sends its headers and stalls holds its slot only
+        // until the body deadline: then it gets a 408 and the slot is free.
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let router = make_router_with_config(
+            Arc::new(runner),
+            "mock-model",
+            Config {
+                media: Some(MediaConfig::ov_genai(None)),
+                max_concurrent_requests: 1,
+                media_body_timeout: std::time::Duration::from_millis(300),
+                ..Config::default()
+            },
+        );
+        let started = std::time::Instant::now();
+        let stalled_req = tokio::spawn(router.clone().oneshot(post(
+            "/v1/chat/completions",
+            stalled(Arc::new(AtomicBool::new(false))),
+        )));
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), stalled_req)
+            .await
+            .expect("the stalled body is cut off at its deadline")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+        let (status, v) = post_chat(
+            router,
+            serde_json::json!({"model": "mock-model", "max_tokens": 2,
+                "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+
         // Without images the body limit is the text one: no early gate.
         let router = app(false).await;
         let first_read = Arc::new(AtomicBool::new(false));
