@@ -3347,13 +3347,14 @@ async fn collect_generation(
         inflight,
     }: AdmittedChat,
     stops: &[String],
+    prompt_param: &str,
 ) -> Result<Collected, Response> {
     let _permit = permit;
     let _inflight = inflight;
     let task_id = task.task_id.clone();
     let mut chunk_stream = match state.runner.generate_async(task).await {
         Ok(s) => s,
-        Err(err) => return Err(engine_error_response(err)),
+        Err(err) => return Err(engine_error_response(err, prompt_param)),
     };
     let mut marker = state.marker_dialect.clone().map(MarkerFilter::new);
     let mut buf = String::new();
@@ -3487,7 +3488,7 @@ async fn chat_completions(
         mut finish_reason,
         logprobs: logprobs_content,
         ..
-    } = match collect_generation(&state, admitted, &req.sampling_params().stop).await {
+    } = match collect_generation(&state, admitted, &req.sampling_params().stop, "messages").await {
         Ok(c) => c,
         Err(resp) => return resp,
     };
@@ -3638,7 +3639,7 @@ async fn completions(
     let _inflight = inflight;
     let mut chunk_stream = match state.runner.generate_async(task).await {
         Ok(s) => s,
-        Err(err) => return engine_error_response(err),
+        Err(err) => return engine_error_response(err, "prompt"),
     };
     let mut marker = state.marker_dialect.clone().map(MarkerFilter::new);
     let mut buf = String::new();
@@ -3740,7 +3741,7 @@ async fn stream_text_completion(
         Ok(s) => s,
         Err(err) => {
             warn!(error = %err, "completions-stream: generate failed");
-            return engine_error_response(err);
+            return engine_error_response(err, "prompt");
         }
     };
     let stats = state.stats.clone();
@@ -3866,7 +3867,7 @@ async fn stream_completion(
         Ok(s) => s,
         Err(err) => {
             warn!(error = %err, "ov-stream: generate failed");
-            return engine_error_response(err);
+            return engine_error_response(err, "messages");
         }
     };
     // Buffer + emit one tool delta only when tools are present and not disabled.
@@ -4129,7 +4130,13 @@ impl Stream for StreamWithPermit {
     }
 }
 
-fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::Response {
+/// `prompt_param` is the request field that carries the prompt
+/// (`messages`, `prompt`, `input`): OpenAI names it in `param` when the
+/// prompt does not fit the context.
+fn engine_error_response(
+    err: cascadia_engine::EngineError,
+    prompt_param: &str,
+) -> axum::response::Response {
     use cascadia_engine::EngineError;
     // An engine-queue-full 503 is the same "at capacity" experience as the
     // permit-gate 503 (engines cap pending tasks BELOW the default permit
@@ -4171,9 +4178,11 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
         EngineError::QueueFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
         EngineError::NotLoaded | EngineError::NotConnected => StatusCode::SERVICE_UNAVAILABLE,
         // Permanent for this request: retrying sends the identical prompt into
-        // the identical window. 413 is what every SDK treats as non-retryable.
-        EngineError::PromptTooLong(_) => StatusCode::PAYLOAD_TOO_LARGE,
-        EngineError::InvalidConfig(_)
+        // the identical window. OpenAI answers an over-context prompt with a
+        // 400, and its SDKs retry neither a 400 nor a 413 (only 408, 409, 429
+        // and 5xx). 413 stays for the byte limits on the request itself.
+        EngineError::PromptTooLong(_)
+        | EngineError::InvalidConfig(_)
         | EngineError::PeerRejected(_)
         | EngineError::ShardRejected(_)
         | EngineError::UnsupportedInput(_) => StatusCode::BAD_REQUEST,
@@ -4186,10 +4195,18 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
         // this node's to explain, like any other engine failure.
         EngineError::BatchAborted(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    // OpenAI's code for a prompt over the model's window; SDKs and agents
-    // key retries/truncation off it.
-    let code = matches!(err, EngineError::PromptTooLong(_)).then_some("context_length_exceeded");
-    api_error(status, err.to_string(), code)
+    // OpenAI's shape for a prompt over the model's window: 400,
+    // `invalid_request_error`, `context_length_exceeded`, and `param` naming
+    // the prompt field. SDKs and agents key truncate-and-retry off the code.
+    if matches!(err, EngineError::PromptTooLong(_)) {
+        return api_error_for(
+            status,
+            err.to_string(),
+            Some(prompt_param),
+            Some("context_length_exceeded"),
+        );
+    }
+    api_error(status, err.to_string(), None)
 }
 
 async fn cancel(State(state): State<AppState>, Path(task_id): Path<String>) -> impl IntoResponse {
@@ -4248,23 +4265,50 @@ mod tests {
     /// map to 503: the official SDKs retry 5xx with backoff, so a request that
     /// can never succeed would be sent three times before surfacing, and the
     /// operator could not tell it apart from genuine "engine at capacity".
+    /// OpenAI answers it with a 400, not a 413 (that is for byte limits).
     #[test]
-    fn prompt_too_long_maps_to_413_not_503() {
-        let r = engine_error_response(cascadia_engine::EngineError::PromptTooLong(
-            "prompt is 207 tokens but this worker's per-slot KV region holds 127".into(),
-        ));
-        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    fn prompt_too_long_maps_to_400_not_503() {
+        let r = engine_error_response(
+            cascadia_engine::EngineError::PromptTooLong(
+                "prompt is 207 tokens but this worker's per-slot KV region holds 127".into(),
+            ),
+            "messages",
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// Over-window is OpenAI's `context_length_exceeded`; clients key
-    /// truncate-and-retry off that code, not off the message text.
+    /// Over-window is OpenAI's `context_length_exceeded`, with `param`
+    /// naming the prompt field; clients key truncate-and-retry off that
+    /// code, not off the message text.
     #[tokio::test]
     async fn prompt_too_long_carries_context_length_exceeded() {
-        let r = engine_error_response(cascadia_engine::EngineError::PromptTooLong("x".into()));
+        let r = engine_error_response(
+            cascadia_engine::EngineError::PromptTooLong("x".into()),
+            "messages",
+        );
         let body = to_bytes(r.into_body(), 4096).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["error"]["type"], "invalid_request_error");
         assert_eq!(v["error"]["code"], "context_length_exceeded");
+        assert_eq!(v["error"]["param"], "messages");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("prompt too long"));
+    }
+
+    /// Only the window refusal carries `param` and a code; every other
+    /// engine error keeps both null.
+    #[tokio::test]
+    async fn other_engine_errors_carry_no_context_code() {
+        let r = engine_error_response(
+            cascadia_engine::EngineError::UnsupportedInput("img".into()),
+            "messages",
+        );
+        let v: Value =
+            serde_json::from_slice(&to_bytes(r.into_body(), 4096).await.unwrap()).unwrap();
+        assert!(v["error"]["code"].is_null(), "{v}");
+        assert!(v["error"]["param"].is_null(), "{v}");
     }
 
     /// The window rejection is a rejection, and it must be countable on its
@@ -4303,7 +4347,7 @@ mod tests {
             let before = cascadia_metrics::API_REJECTED_TOTAL
                 .with_label_values(&[reason])
                 .get();
-            let status = engine_error_response(err).status();
+            let status = engine_error_response(err, "messages").status();
             let after = cascadia_metrics::API_REJECTED_TOTAL
                 .with_label_values(&[reason])
                 .get();
@@ -4315,7 +4359,7 @@ mod tests {
     }
 
     /// Strictly-greater, not an exact delta: the registry is process-global
-    /// and `prompt_too_long_maps_to_413_not_503` drives the same arm on
+    /// and `prompt_too_long_maps_to_400_not_503` drives the same arm on
     /// another test thread, so an `== before + 1` assertion races it. That
     /// this is NOT also booked as `capacity` needs no assertion — the two
     /// live in exclusive arms of one `match`.
@@ -4324,10 +4368,13 @@ mod tests {
         let before = cascadia_metrics::API_REJECTED_TOTAL
             .with_label_values(&["prompt_over_window"])
             .get();
-        let r = engine_error_response(cascadia_engine::EngineError::PromptTooLong(
-            "prompt is 207 tokens but this worker's per-slot KV region holds 127".into(),
-        ));
-        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let r = engine_error_response(
+            cascadia_engine::EngineError::PromptTooLong(
+                "prompt is 207 tokens but this worker's per-slot KV region holds 127".into(),
+            ),
+            "messages",
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
         let after = cascadia_metrics::API_REJECTED_TOTAL
             .with_label_values(&["prompt_over_window"])
             .get();
@@ -5240,9 +5287,12 @@ mod tests {
         let msg = v["error"]["message"].as_str().unwrap();
         assert!(msg.contains("does not accept image input"), "{msg}");
 
-        let r = engine_error_response(cascadia_engine::EngineError::UnsupportedInput(
-            "the gemma4 engine does not accept image input (1 image(s) in the request)".into(),
-        ));
+        let r = engine_error_response(
+            cascadia_engine::EngineError::UnsupportedInput(
+                "the gemma4 engine does not accept image input (1 image(s) in the request)".into(),
+            ),
+            "messages",
+        );
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -5304,6 +5354,121 @@ mod tests {
         let msg = v["error"]["message"].as_str().unwrap();
         assert!(msg.contains("larger than this server accepts"), "{msg}");
         assert!(msg.contains("input_modalities"), "{msg}");
+        // A byte limit is not the context window.
+        assert!(v["error"]["code"].is_null(), "{v}");
+    }
+
+    /// A prompt the engine refuses as over its window is OpenAI's 400
+    /// `context_length_exceeded` on every route, streamed or not, with
+    /// `param` naming the route's prompt field. A streamed request is
+    /// refused at submit, before the stream opens, so it too gets a plain
+    /// JSON 400 and not an SSE error frame.
+    #[tokio::test]
+    async fn over_window_prompts_are_openai_400_on_every_route() {
+        let p = "__prompt_too_long__";
+        let cases = [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model",
+                    "messages": [{"role": "user", "content": p}]}),
+                "messages",
+            ),
+            (
+                "/v1/completions",
+                serde_json::json!({"model": "mock-model", "prompt": p}),
+                "prompt",
+            ),
+            (
+                "/v1/responses",
+                serde_json::json!({"model": "mock-model", "input": p}),
+                "input",
+            ),
+        ];
+        for (uri, body, param) in cases {
+            for stream in [false, true] {
+                let mut body = body.clone();
+                body["stream"] = serde_json::json!(stream);
+                let response = make_app()
+                    .await
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let ctx = format!("{uri} stream={stream}");
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{ctx}");
+                let ct = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                assert!(ct.starts_with("application/json"), "{ctx}: {ct}");
+                let v: Value =
+                    serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap())
+                        .unwrap();
+                assert_eq!(v["error"]["type"], "invalid_request_error", "{ctx}: {v}");
+                assert_eq!(v["error"]["code"], "context_length_exceeded", "{ctx}: {v}");
+                assert_eq!(v["error"]["param"], param, "{ctx}: {v}");
+                assert!(
+                    v["error"]["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains("window")),
+                    "{ctx}: {v}"
+                );
+            }
+        }
+    }
+
+    /// `max_prompt_bytes` bounds the rendered prompt's BYTES, a transport
+    /// limit rather than the context window: it stays a 413 and does not
+    /// claim `context_length_exceeded`.
+    #[tokio::test]
+    async fn prompt_byte_limit_stays_413_without_context_code() {
+        let mut runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            max_prompt_bytes: 64,
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let long = "word ".repeat(40);
+        for (uri, body) in [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model",
+                    "messages": [{"role": "user", "content": long}]}),
+            ),
+            (
+                "/v1/completions",
+                serde_json::json!({"model": "mock-model", "prompt": long}),
+            ),
+            (
+                "/v1/responses",
+                serde_json::json!({"model": "mock-model", "input": long}),
+            ),
+        ] {
+            let (status, v) = post_to(app.clone(), uri, body).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{uri}: {v}");
+            assert!(v["error"]["code"].is_null(), "{uri}: {v}");
+            assert!(
+                v["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("max_prompt_bytes")),
+                "{uri}: {v}"
+            );
+        }
     }
 
     /// On a server that takes images, an image tag is refused in every
@@ -8109,6 +8274,7 @@ level={{ effort_map[eff] }}";
             "messages": [{"role": "user", "content": long}]});
         let (status, v) = post_to(app.clone(), "/v1/chat/completions", chat).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+        assert!(v["error"]["code"].is_null(), "{v}");
         assert!(v["error"]["message"]
             .as_str()
             .unwrap()
@@ -8124,8 +8290,9 @@ level={{ effort_map[eff] }}";
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         // `/v1/completions` carries no images: the body limit itself holds.
         let cmpl = serde_json::json!({"model": "mock-model", "prompt": long});
-        let (status, _) = post_to(app.clone(), "/v1/completions", cmpl).await;
+        let (status, v) = post_to(app.clone(), "/v1/completions", cmpl).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_ne!(v["error"]["code"], "context_length_exceeded", "{v}");
 
         // A 300x300 noise PNG is well over 4 KiB of base64.
         let img = image::RgbImage::from_fn(300, 300, |x, y| {
