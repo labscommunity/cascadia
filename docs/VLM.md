@@ -543,9 +543,11 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
 - `--prefill-seq C` adds a chunked prefill (C rows per inference). On CPU/GPU,
   `--shared-prefill` writes one IR that serves both decode and prefill, so the weights
   are compiled once; the NPU needs the two separate static IRs (omit the flag).
-- An image or video prompt whose expanded length passes a static tree's KV window
-  (`--context` - 1) is refused at submit with a 400 `context_length_exceeded`, since image
-  tokens cannot slide out of the window; a text-only prompt past it still slides.
+- A prompt longer than a static tree's KV window (`--context` - 1), text or images
+  (counted with each image expanded), is refused at submit with a 400
+  `context_length_exceeded`, as OpenAI does. Sliding it through the window would drop its
+  start (the system prompt first) and answer 200 from what is left, one token per inference
+  past the window, holding the tree's only slot. Generation past the window still slides.
 - **LLaVA-NeXT** spends up to 2928 tokens on an image, so give it `--context 4096` or
   more; it attends causally, so any `--prefill-seq` works. For packed slots a 448x448
   image (2956 prompt tokens with the SDK test's text) must fit one slot's region, so a

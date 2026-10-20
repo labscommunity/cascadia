@@ -101,8 +101,8 @@ single chunk-wide mask cannot express the per-token eviction the seq=1
 sliding window performs, so any prompt tail whose rows would sit past
 position `static_context − 1` steps one token at a time through the decode
 model. So the cap itself adds no divergence beyond what the seq=1 sliding
-window already does, in every regime — including prompts longer than the window
-(both degrade to the same warned behavior). Output is *near-tie-tolerant*
+window already does, in every regime. (A prompt longer than the window itself is refused
+at submit with a 400 `context_length_exceeded`; only generation past the window slides.) Output is *near-tie-tolerant*
 parity, not guaranteed token-identical: the seq=`C` prefill graph and the seq=1
 graph accumulate FP differently, so greedy decoding can fork at an argmax
 near-tie (see `assert_parity`).
@@ -175,6 +175,8 @@ issue #41):
 
 - **Context fixed at export time** (`--static-context`, default 1024); usable
   past = `context - 1`. Re-export for a longer window.
+  A prompt past `context - 1` gets a 400 `context_length_exceeded`; generation past
+  it slides (the oldest entries after the sink tokens drop out).
 - **Decode is `seq=1`** — one token per forward pass. Prefill is chunked only
   when the export ships a `--static-prefill-seq` variant (chunk ≤
   `static_context - 1`, so a chunk can't evict its own tokens); without one,
