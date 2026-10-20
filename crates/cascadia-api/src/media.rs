@@ -15,7 +15,10 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use cascadia_types::{MediaInput, MediaKind};
-use image::{imageops::FilterType, ImageFormat, ImageReader, Limits};
+use image::{
+    imageops::FilterType, metadata::Orientation, DynamicImage, ImageDecoder as _, ImageFormat,
+    ImageReader, Limits,
+};
 use sha2::{Digest, Sha256};
 
 /// Per-engine image settings. Present on the router only when the served
@@ -638,12 +641,20 @@ pub fn decode_image_bytes(
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_SIDE);
     limits.max_image_height = Some(MAX_SIDE);
-    limits.max_alloc = Some(cfg.max_source_pixels * 4 + (64 << 20));
+    limits.max_alloc = Some(decode_alloc_limit(cfg));
     reader.limits(limits);
-    let mut rgb = reader
-        .decode()
-        .map_err(|e| format!("could not decode the image: {e}"))?
-        .to_rgb8();
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|e| format!("could not decode the image: {e}"))?;
+    // HF's `load_image` applies the EXIF orientation (`exif_transpose`), so
+    // a phone photo reaches the model upright. Unreadable metadata is no
+    // rotation, as there. A quarter turn swaps the sides; every size check
+    // (per side, total, aspect ratio) is the same either way round.
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let mut image = DynamicImage::from_decoder(decoder)
+        .map_err(|e| format!("could not decode the image: {e}"))?;
+    image.apply_orientation(orientation);
+    let mut rgb = image.into_rgb8();
 
     let (w, h) = rgb.dimensions();
     let pixels = u64::from(w) * u64::from(h);
@@ -654,6 +665,14 @@ pub fn decode_image_bytes(
 
     let (width, height) = rgb.dimensions();
     Ok(rgb_image(width, height, rgb.into_raw()))
+}
+
+/// The most a decoder may allocate: a source at the pixel limit in 16-bit
+/// RGBA (8 bytes a pixel, the widest a PNG decodes to), plus headroom.
+fn decode_alloc_limit(cfg: &MediaConfig) -> u64 {
+    cfg.max_source_pixels
+        .saturating_mul(8)
+        .saturating_add(64 << 20)
 }
 
 /// One RGB8 image as the engine takes it, hashed (size and pixels) so the
@@ -746,7 +765,19 @@ pub(crate) fn data_url_payload(
     if !fields.any(|f| f == "base64") {
         return Err("data URL must be base64-encoded (`;base64,`)".into());
     }
+    // Line-wrapped base64 (MIME's 76 columns, `base64` without `-w0`) is
+    // the same payload: drop its whitespace, copying only when there is any.
     let payload = payload.trim();
+    let unwrapped: String;
+    let payload = if payload.bytes().any(|b| b.is_ascii_whitespace()) {
+        unwrapped = payload
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect();
+        unwrapped.as_str()
+    } else {
+        payload
+    };
     base64::engine::general_purpose::STANDARD
         .decode(payload)
         .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(payload))
@@ -1093,6 +1124,86 @@ mod tests {
         assert_eq!(m.sha256, again.sha256);
         let other = decode_image_url(&png_data_url(30, 40), None, &cfg).unwrap();
         assert_ne!(m.sha256, other.sha256);
+    }
+
+    /// A JPEG whose EXIF says to turn it a quarter (Orientation 6, as a
+    /// phone held upright writes) is decoded upright, as HF's `load_image`
+    /// (`exif_transpose`) gives it to the model: its sides swap and its left
+    /// half becomes its top.
+    #[test]
+    fn exif_orientation_is_applied() {
+        use image::ImageEncoder as _;
+        let img = image::RgbImage::from_fn(32, 16, |x, _| {
+            if x < 16 {
+                image::Rgb([255, 0, 0])
+            } else {
+                image::Rgb([0, 0, 255])
+            }
+        });
+        // Big-endian TIFF, one IFD entry: Orientation (0x0112), SHORT, 6.
+        let exif = [
+            b'M', b'M', 0, 42, 0, 0, 0, 8, 0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0,
+            0,
+        ];
+        let jpeg = |exif: Option<&[u8]>| {
+            let mut buf = Vec::new();
+            let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 95);
+            if let Some(e) = exif {
+                enc.set_exif_metadata(e.to_vec()).unwrap();
+            }
+            enc.write_image(img.as_raw(), 32, 16, image::ExtendedColorType::Rgb8)
+                .unwrap();
+            buf
+        };
+        let cfg = MediaConfig::ov_genai(None);
+        let plain = decode_image_bytes(&jpeg(None), None, &cfg).unwrap();
+        assert_eq!((plain.width, plain.height), (32, 16));
+        let m = decode_image_bytes(&jpeg(Some(&exif)), None, &cfg).unwrap();
+        assert_eq!((m.width, m.height), (16, 32));
+        let px = |x: usize, y: usize| &m.pixels[(y * 16 + x) * 3..][..3];
+        assert!(px(8, 4)[0] > 200 && px(8, 4)[2] < 60, "{:?}", px(8, 4));
+        assert!(px(8, 27)[2] > 200 && px(8, 27)[0] < 60, "{:?}", px(8, 27));
+        // The header size is still checked either way round.
+        assert_eq!(source_size(&jpeg(Some(&exif)), &cfg), Ok((32, 16)));
+    }
+
+    /// A source at the pixel limit may decode to 16-bit RGBA (8 bytes a
+    /// pixel); the decoder's allocation limit leaves room for it.
+    #[test]
+    fn the_decode_alloc_limit_fits_16_bit_rgba() {
+        let cfg = MediaConfig::ov_genai(None);
+        assert!(decode_alloc_limit(&cfg) >= cfg.max_source_pixels * 8);
+        // A 16-bit RGBA PNG within the limit decodes.
+        let img = image::ImageBuffer::<image::Rgba<u16>, _>::from_pixel(
+            8,
+            4,
+            image::Rgba([65535, 0, 0, 65535]),
+        );
+        let mut buf = Vec::new();
+        img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+            .unwrap();
+        let m = decode_image_bytes(&buf, None, &cfg).unwrap();
+        assert_eq!(
+            (m.width, m.height, &m.pixels[..3]),
+            (8, 4, &[255, 0, 0][..])
+        );
+    }
+
+    /// Line-wrapped base64 (MIME's 76 columns) is the same payload.
+    #[test]
+    fn wrapped_base64_is_accepted() {
+        let cfg = MediaConfig::ov_genai(None);
+        let url = png_data_url(40, 30);
+        let (head, b64) = url.split_once(',').unwrap();
+        let wrapped: Vec<String> = b64
+            .as_bytes()
+            .chunks(76)
+            .map(|c| String::from_utf8(c.to_vec()).unwrap())
+            .collect();
+        for sep in ["\n", "\r\n", " "] {
+            let m = decode_image_url(&format!("{head},{}", wrapped.join(sep)), None, &cfg).unwrap();
+            assert_eq!((m.width, m.height), (40, 30), "{sep:?}");
+        }
     }
 
     #[test]

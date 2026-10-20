@@ -17,6 +17,10 @@ whole where the engine takes it natively (see [Video](#video)); audio is not sup
 
 - `data:` URLs (PNG, JPEG, WEBP, GIF) work by default. `https://` URLs only with
   `--api-allow-image-urls` (public addresses only, each redirect re-checked).
+- Images are decoded as Hugging Face's `load_image` reads them: turned upright by their EXIF
+  orientation (a phone photo's sides swap), then converted to RGB with any alpha dropped
+  (not composited onto white, as the processors of the families served here do it).
+  Line-wrapped base64 (MIME's 76 columns) is accepted.
 - Up to 8 images per request (`--api-max-images`). An image over about 1 MP is downscaled (`detail: "low"`:
   512x512; `"original"` is served as `"high"`). The chat and Responses bodies may carry
   20 MiB of images on top of the text limit; the text itself (everything but image URLs)
