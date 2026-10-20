@@ -530,6 +530,46 @@ fn prefill_chunk() -> usize {
     }
 }
 
+/// Tokens admission prefills for `task`: the rendered prompt (each native video's `<|video|>`
+/// expanded in the text, as `step_first` does), each image placeholder expanded by `expand`, and
+/// the Option-B resume prefix. `None` when the prompt does not tokenize or `expand` refuses it;
+/// admission refuses those itself, with the reason.
+fn admitted_len(
+    tok: &Tokenizer,
+    vision: Option<&crate::gemma4_vision::ImageFrontend>,
+    task: &GenerationTask,
+    expand: impl FnOnce(&[i64]) -> Result<Vec<i64>, String>,
+) -> Option<usize> {
+    let text = match vision {
+        Some(v) => v.prompt_text(&task.prompt, &task.media),
+        None => std::borrow::Cow::Borrowed(task.prompt.as_str()),
+    };
+    let ids: Vec<i64> = tok
+        .encode(text.as_ref(), false)
+        .ok()?
+        .get_ids()
+        .iter()
+        .map(|&u| i64::from(u))
+        .collect();
+    let ids = if task.media.is_empty() {
+        ids
+    } else {
+        expand(&ids).ok()?
+    };
+    Some(ids.len() + task.resume_ids().map_or(0, <[i32]>::len))
+}
+
+/// "At or past" the window is refused: the first generated token needs a position too.
+fn window_check(n: usize, max: usize) -> EngineResult<()> {
+    if n >= max {
+        return Err(EngineError::PromptTooLong(format!(
+            "prompt is {n} tokens with its images and videos expanded; the model's window is \
+             {max} (max_position_embeddings)"
+        )));
+    }
+    Ok(())
+}
+
 /// The task's last chunk. The API reads `prompt_tokens` and `finish_reason` off
 /// the chunk with `is_final` set, so leaving them None reported
 /// `usage.prompt_tokens: 0` and a hardcoded `"stop"` on every gemma4 response.
@@ -579,6 +619,9 @@ pub struct Gemma4Engine {
     num_stages: u32,
     runtime: OvRuntime,
     tokenizer: Option<Arc<Tokenizer>>,
+    /// `max_position_embeddings` from `tokenizer/config.json` (rank 0 only; `None` = unknown, no
+    /// guard). `submit` refuses a prompt at or past it, counted after image and video expansion.
+    max_ctx: Option<usize>,
     /// All EOS token ids configured for the model. Generation stops on
     /// the first token that matches ANY of these. See `lookup_eos`.
     eos_token_ids: Vec<u32>,
@@ -1528,6 +1571,15 @@ impl Gemma4Engine {
         };
 
         let max_tokens = active.task.max_tokens.max(1) as usize;
+        // The window bounds prompt + completion: `submit` refuses prompts at or past `max_ctx`,
+        // and this ends the turn AT the window instead of decoding past it. `generated` is
+        // pre-seeded with the resume tokens, which `prompt_ids` already carries.
+        let max_tokens = match self.max_ctx {
+            Some(max) => max_tokens
+                .min(active.resume_seed_len + max.saturating_sub(active.prompt_ids.len()))
+                .max(1),
+            None => max_tokens,
+        };
         let is_eos = self.eos_token_ids.contains(&(next_token as u32));
         let is_final = active.generated.len() >= max_tokens || is_eos;
 
@@ -1710,6 +1762,21 @@ impl Engine for Gemma4Engine {
                 queued: self.pending.len(),
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
             });
+        }
+        // The API bounds request BYTES; this bounds tokens against the model's window, so an
+        // over-window prompt is a 400 `context_length_exceeded` rather than a step-time error
+        // (a 5xx) after encoding every image and prefilling every soft token in one pass.
+        // Images and videos count expanded, from their sizes, without encoding anything.
+        if let (Some(max), Some(tok)) = (self.max_ctx, self.tokenizer.as_deref()) {
+            let vision = self.vision.as_ref();
+            let n = admitted_len(tok, vision, &task, |ids| match vision {
+                Some(v) => v.expand_ids(&task.media, ids),
+                None => Ok(ids.to_vec()),
+            });
+            // A prompt the expansion refuses is refused again, with its reason, at admission.
+            if let Some(n) = n {
+                window_check(n, max)?;
+            }
         }
         self.pending.push(task);
         Ok(())
@@ -2165,6 +2232,7 @@ pub struct Gemma4Builder {
     /// [`Gemma4Engine::num_kv_shared_layers`].
     num_kv_shared_layers: u32,
     tokenizer: Option<Arc<Tokenizer>>,
+    max_ctx: Option<usize>,
     eos_token_ids: Vec<u32>,
     upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
@@ -2419,6 +2487,8 @@ impl Builder for Gemma4Builder {
                     "tokenizer loaded; eos_token_ids={:?}",
                     self.eos_token_ids
                 )));
+                // The exporter writes the full HF config beside the tokenizer.
+                self.max_ctx = crate::read_max_ctx(&tokenizer_dir, "gemma4");
             } else {
                 events.push(LoadProgress::message(format!(
                     "warning: no tokenizer.json at {tok_path:?}; first-stage tokenization will fail"
@@ -2588,6 +2658,7 @@ impl Builder for Gemma4Builder {
             num_stages: self.total,
             runtime,
             tokenizer: self.tokenizer,
+            max_ctx: self.max_ctx,
             eos_token_ids: self.eos_token_ids.clone(),
             upstream: self.upstream,
             downstream: self.downstream,
@@ -2614,6 +2685,67 @@ impl Builder for Gemma4Builder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whitespace tokenizer: `hi` is 0, `img` (the image placeholder) is 1.
+    fn tiny_tokenizer() -> Tokenizer {
+        let json = r#"{"version":"1.0","truncation":null,"padding":null,
+            "added_tokens":[],"normalizer":null,
+            "pre_tokenizer":{"type":"Whitespace"},
+            "post_processor":null,"decoder":null,
+            "model":{"type":"WordLevel","vocab":{"hi":0,"img":1},"unk_token":"[UNK]"}}"#;
+        Tokenizer::from_bytes(json.as_bytes()).expect("build tiny tokenizer")
+    }
+
+    /// Each `img` becomes a 10-token run, as an image's soft tokens do.
+    fn expand_images(ids: &[i64]) -> Result<Vec<i64>, String> {
+        Ok(ids
+            .iter()
+            .flat_map(|&t| if t == 1 { vec![1; 10] } else { vec![t] })
+            .collect())
+    }
+
+    fn image() -> cascadia_types::MediaInput {
+        cascadia_types::MediaInput {
+            kind: cascadia_types::MediaKind::Image,
+            pixels: std::sync::Arc::from(vec![0u8; 3]),
+            num_frames: 1,
+            width: 1,
+            height: 1,
+            timestamps_ms: None,
+            sha256: [0; 32],
+        }
+    }
+
+    /// The window guard counts what admission prefills: images expanded to their soft tokens
+    /// and the resume prefix, refused at or past `max_position_embeddings`.
+    #[test]
+    fn window_guard_counts_expanded_images_and_the_resume_prefix() {
+        let tok = tiny_tokenizer();
+        let text = GenerationTask::new("t", "hi hi hi");
+        assert_eq!(admitted_len(&tok, None, &text, expand_images), Some(3));
+        assert!(window_check(3, 4).is_ok());
+        assert!(matches!(
+            window_check(4, 4),
+            Err(EngineError::PromptTooLong(_))
+        ));
+
+        let mut img = GenerationTask::new("i", "hi img hi");
+        img.media = vec![image()];
+        let n = admitted_len(&tok, None, &img, expand_images).unwrap();
+        assert_eq!(n, 12, "the placeholder counts as its 10 soft tokens");
+        assert!(matches!(
+            window_check(n, 12),
+            Err(EngineError::PromptTooLong(_))
+        ));
+        assert!(window_check(n, 13).is_ok());
+
+        let mut resuming = GenerationTask::new("r", "hi hi");
+        resuming.resume_token_ids = Some(vec![0, 0, 0]);
+        assert_eq!(admitted_len(&tok, None, &resuming, expand_images), Some(5));
+
+        // An expansion refusal is left to admission, which states the reason.
+        assert_eq!(admitted_len(&tok, None, &img, |_| Err("bad".into())), None);
+    }
 
     #[test]
     fn image_rows_run_out_only_outside_an_image_prompt() {

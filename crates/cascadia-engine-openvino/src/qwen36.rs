@@ -689,7 +689,7 @@ impl Builder for Qwen36Builder {
                      to snapshot at and stays empty (every turn cold)"
                 );
             }
-            self.max_ctx = read_max_ctx(&dir);
+            self.max_ctx = crate::read_max_ctx(&dir, "qwen35");
             self.eos = read_eos(&dir);
         }
 
@@ -822,41 +822,6 @@ fn map_ov(err: cascadia_ov_genai_shim::Error) -> EngineError {
         cascadia_ov_genai_shim::Error::Utf8(s) => EngineError::InvalidConfig(s),
         cascadia_ov_genai_shim::Error::Native(s) => EngineError::Backend(s),
     }
-}
-
-/// `max_position_embeddings` from the tree's config.json (`text_config` when nested). `None` when
-/// the tree does not state it — the prompt-window guard in `submit` is then off, so say which of
-/// the three ways that happened rather than letting an unreadable config disable it silently.
-fn read_max_ctx(dir: &Path) -> Option<usize> {
-    let raw = match std::fs::read_to_string(dir.join("config.json")) {
-        Ok(raw) => raw,
-        Err(e) => {
-            warn!(error = %e, "qwen35: no readable config.json; the prompt-window guard is OFF");
-            return None;
-        }
-    };
-    let v: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "qwen35: config.json is not valid JSON; the prompt-window guard is OFF");
-            return None;
-        }
-    };
-    let cfg = if v.get("text_config").is_some() {
-        &v["text_config"]
-    } else {
-        &v
-    };
-    let max = cfg["max_position_embeddings"]
-        .as_u64()
-        .filter(|&m| m > 0)
-        .map(|m| m as usize);
-    if max.is_none() {
-        warn!(
-            "qwen35: config.json states no max_position_embeddings; the prompt-window guard is OFF"
-        );
-    }
-    max
 }
 
 /// The empty think block the official chat template injects for `enable_thinking=false`.
@@ -1004,7 +969,7 @@ pub struct Qwen36Engine {
     stages_dirty: bool,
     /// `max_position_embeddings` of the model (from the tree's config.json); prompts at or past it
     /// are refused at submit rather than prefilled for hours on the single batch=1 slot. `None`
-    /// when the tree does not state it (guard off; `read_max_ctx` warns which case it was).
+    /// when the tree does not state it (guard off; `crate::read_max_ctx` warns which case it was).
     max_ctx: Option<usize>,
     /// Measured prefill and snapshot-copy rates for the warm-turn refresh rule
     /// (`prefix_cache::RefreshCosts::refresh_pays`).
@@ -3624,23 +3589,35 @@ mod tests {
     #[test]
     fn read_max_ctx_prefers_nested_text_config_and_is_none_when_unstated() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(read_max_ctx(dir.path()), None, "no config.json");
+        assert_eq!(
+            crate::read_max_ctx(dir.path(), "qwen35"),
+            None,
+            "no config.json"
+        );
         std::fs::write(
             dir.path().join("config.json"),
             r#"{"model_type":"qwen3_5","text_config":{"max_position_embeddings":262144},"max_position_embeddings":4096}"#,
         )
         .unwrap();
-        assert_eq!(read_max_ctx(dir.path()), Some(262144));
+        assert_eq!(crate::read_max_ctx(dir.path(), "qwen35"), Some(262144));
         std::fs::write(
             dir.path().join("config.json"),
             r#"{"model_type":"qwen3_5_moe","max_position_embeddings":40960}"#,
         )
         .unwrap();
-        assert_eq!(read_max_ctx(dir.path()), Some(40960));
+        assert_eq!(crate::read_max_ctx(dir.path(), "qwen35"), Some(40960));
         std::fs::write(dir.path().join("config.json"), "{}").unwrap();
-        assert_eq!(read_max_ctx(dir.path()), None, "key absent");
+        assert_eq!(
+            crate::read_max_ctx(dir.path(), "qwen35"),
+            None,
+            "key absent"
+        );
         std::fs::write(dir.path().join("config.json"), "{ not json").unwrap();
-        assert_eq!(read_max_ctx(dir.path()), None, "unparseable config.json");
+        assert_eq!(
+            crate::read_max_ctx(dir.path(), "qwen35"),
+            None,
+            "unparseable config.json"
+        );
     }
 
     fn bare_engine(total: u32, manifest: &str) -> Qwen36Engine {
