@@ -1314,7 +1314,8 @@ already serves on one box.
   hidden-wide `image_newline`, and refuses the `full` feature strategy.
 - **Static and packed.** The family is causal, so Pixtral's rules apply: no image
   blocks, a prefill chunk may split an image, a packed prompt is sized from its images
-  and refused with a 413 before encoding when it outgrows a slot's region. A static
+  and refused with a 400 `context_length_exceeded` before encoding when it outgrows a
+  slot's region (a 413 until 2026-10-20). A static
   tree needs a context of 4096 or more for one image. Neither path has been run on
   hardware with this model.
 - **Not covered:** `ov-dist-spec` (refused at load: Pixtral / Mistral 3 targets only).
