@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 
 import pytest
@@ -197,3 +198,25 @@ def test_static_stage_refuses_an_output_of_another_layout(tmp_path, monkeypatch)
     # The same layout is accepted, stage by stage.
     _static(monkeypatch, three, out, "--stage", "2")
     assert _ranges(out) == [(0, 2), (2, 4), (4, 6)]
+
+
+def test_static_converts_a_nodes_one_stage_tree(tmp_path, monkeypatch):
+    # export_gemma4_text.py --stage I leaves a node a tree that lists only its
+    # own stage ("only_stage"); static_variant converts that stage alone.
+    src = export_dir(tmp_path, "qwen2_5_vl", layers=4, deepstack=0)
+    tree, out = tmp_path / "tree", tmp_path / "static"
+    _cut(src, tree, 2)
+    pipe = _read(tree / "pipeline_config.json")
+    pipe["stages"] = [s for s in pipe["stages"] if s["stage"] == 1]
+    pipe["only_stage"] = 1
+    (tree / "pipeline_config.json").write_text(json.dumps(pipe))
+    shutil.rmtree(tree / "stage_0")
+    with pytest.raises(SystemExit, match="holds only stage"):
+        _static(monkeypatch, tree, out)
+    with pytest.raises(SystemExit, match="holds only stage"):
+        _static(monkeypatch, tree, out, "--stage", "0")
+    _static(monkeypatch, tree, out, "--stage", "1")
+    got = _read(out / "pipeline_config.json")
+    assert got["only_stage"] == 1
+    assert [(s["layer_start"], s["layer_end"]) for s in got["stages"]] == [(2, 4)]
+    assert _read(out / "stage_1" / "stage_config.json")["logits"] == "all"
