@@ -464,10 +464,14 @@ fn shim_media(task: &GenerationTask) -> EngineResult<Vec<Media<'_>>> {
 /// count only after the run, so a media turn is sized here from the export's
 /// processor configs ([`MediaSizer`]): each item's soft tokens plus the text
 /// with its `<ov_genai_*>` tags removed, less one token per tag for a merge
-/// across it. That is a floor of GenAI's own count (no image framing, no
-/// timestamp text), so a prompt that fits is never refused. An export without
-/// a sizer (a family it has no math for, or configs it cannot read), or an
-/// item the sizer cannot size, is left to GenAI as before.
+/// across it. Each item's count is meant as a floor of what GenAI 2026.4.1
+/// builds: where GenAI preprocesses differently from Hugging Face (LLaVA-NeXT,
+/// InternVL2, Qwen VL), the smaller of the HF count and a mirror of GenAI's
+/// own code; image framing and timestamp text are not counted. The mirrors
+/// follow GenAI's sources and are swept against transcriptions of them in the
+/// tests; they have not been run against a live GenAI. An export without a
+/// sizer (a family it has no math for, or configs it cannot read), or an item
+/// the sizer cannot size, is left to GenAI as before.
 fn window_check(
     task: &GenerationTask,
     max_ctx: Option<usize>,
