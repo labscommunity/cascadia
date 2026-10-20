@@ -65,7 +65,9 @@ and serves no tools here: `store: true`, `previous_response_id`, `conversation`,
 `background`, `tools`, `include`, `prompt`, `stop`, structured `text.format`,
 `reasoning.summary`, `truncation: "auto"`, `file_id` images, `input_file` and
 `input_audio` parts and non-message input items are refused with a `400` whose `param`
-names the field.
+names the field. `metadata` is echoed back, held to OpenAI's limits (an object of at most
+16 string pairs, keys up to 64 characters, values up to 512); anything else is a `400`
+with `param: "metadata"`.
 
 ## Video
 

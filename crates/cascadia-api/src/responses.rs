@@ -51,7 +51,8 @@ pub struct ResponsesRequest {
     /// Only `"none"` or `"auto"`, which with no tools mean the same.
     #[serde(default)]
     pub tool_choice: Option<Value>,
-    /// Echoed back on the response object.
+    /// Echoed back on the response object; held to OpenAI's shape (see
+    /// [`check_metadata`]).
     #[serde(default)]
     pub metadata: Option<Value>,
     #[serde(default)]
@@ -88,6 +89,9 @@ struct Refusal {
     param: String,
     message: String,
     code: Option<&'static str>,
+    /// The `cascadia_api_rejected_total` reason: a field this endpoint does
+    /// not serve, unless the value itself is malformed.
+    reason: &'static str,
 }
 
 impl Refusal {
@@ -96,6 +100,15 @@ impl Refusal {
             param: param.into(),
             message: message.into(),
             code: None,
+            reason: "unsupported_field",
+        }
+    }
+
+    /// A served field whose value is not what the API takes.
+    fn malformed(param: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            reason: "malformed_body",
+            ..Self::new(param, message)
         }
     }
 
@@ -108,7 +121,7 @@ impl Refusal {
     }
 
     fn into_response(self) -> Response {
-        count_rejected("unsupported_field");
+        count_rejected(self.reason);
         api_error_for(
             StatusCode::BAD_REQUEST,
             self.message,
@@ -120,8 +133,52 @@ impl Refusal {
 
 const STATELESS: &str = "this server keeps no responses; send the whole conversation in `input`";
 
+/// OpenAI's limits on `metadata`: up to 16 pairs, keys up to 64
+/// characters, string values up to 512.
+const MAX_METADATA_PAIRS: usize = 16;
+const MAX_METADATA_KEY: usize = 64;
+const MAX_METADATA_VALUE: usize = 512;
+
+/// Refuse `metadata` OpenAI would refuse: anything but an object of at most
+/// [`MAX_METADATA_PAIRS`] string pairs within the length limits. It is
+/// echoed on every response object (and every streamed event's), so an
+/// unbounded one would be repeated for the whole stream.
+fn check_metadata(metadata: Option<&Value>) -> Result<(), Refusal> {
+    let refuse = |m: String| Err(Refusal::malformed("metadata", m));
+    let map = match metadata {
+        None | Some(Value::Null) => return Ok(()),
+        Some(Value::Object(map)) => map,
+        Some(_) => return refuse("`metadata` must be an object of string keys and values".into()),
+    };
+    if map.len() > MAX_METADATA_PAIRS {
+        return refuse(format!(
+            "`metadata` has {} pairs; at most {MAX_METADATA_PAIRS} are allowed",
+            map.len()
+        ));
+    }
+    for (k, v) in map {
+        if k.chars().count() > MAX_METADATA_KEY {
+            return refuse(format!(
+                "`metadata` keys must be at most {MAX_METADATA_KEY} characters"
+            ));
+        }
+        match v.as_str() {
+            Some(s) if s.chars().count() <= MAX_METADATA_VALUE => {}
+            Some(_) => {
+                return refuse(format!(
+                    "`metadata` values must be at most {MAX_METADATA_VALUE} characters \
+                     (`{k}` is longer)"
+                ))
+            }
+            None => return refuse(format!("`metadata` values must be strings (`{k}` is not)")),
+        }
+    }
+    Ok(())
+}
+
 /// Refuse every request field this endpoint cannot honor, by name.
 fn refuse_unsupported(req: &ResponsesRequest) -> Result<(), Refusal> {
+    check_metadata(req.metadata.as_ref())?;
     if req.store == Some(true) {
         return Err(Refusal::new(
             "store",
@@ -1209,6 +1266,56 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
         assert_eq!(v["metadata"], json!({"k": "v"}));
+    }
+
+    /// `metadata` is held to OpenAI's shape: an object of at most 16
+    /// string pairs, keys up to 64 characters and values up to 512.
+    #[tokio::test]
+    async fn metadata_is_held_to_openais_limits() {
+        let pairs = |n: usize| -> Value {
+            (0..n)
+                .map(|i| (format!("k{i}"), json!("v")))
+                .collect::<serde_json::Map<_, _>>()
+                .into()
+        };
+        let long_key = json!({ "k".repeat(65): "v" });
+        let long_value = json!({"k": "é".repeat(513)});
+        for bad in [
+            json!("text"),
+            json!([1]),
+            json!({"k": 1}),
+            json!({"k": {"nested": "v"}}),
+            pairs(17),
+            long_key,
+            long_value,
+        ] {
+            let (status, v) = post_json(
+                make_app().await,
+                json!({"model": "mock-model", "input": "hi", "metadata": bad}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {v}");
+            assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+            assert_eq!(v["error"]["param"], "metadata", "{v}");
+        }
+        let at_limits = {
+            let mut m = pairs(15);
+            m["k".repeat(64)] = json!("é".repeat(512));
+            m
+        };
+        for (good, echoed) in [
+            (at_limits.clone(), at_limits),
+            (json!({}), json!({})),
+            (Value::Null, json!({})),
+        ] {
+            let (status, v) = post_json(
+                make_app().await,
+                json!({"model": "mock-model", "input": "hi", "metadata": good}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{good}: {v}");
+            assert_eq!(v["metadata"], echoed, "{v}");
+        }
     }
 
     #[tokio::test]
