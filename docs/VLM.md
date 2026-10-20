@@ -703,11 +703,19 @@ IRs); a restart from the cache dir served in under a minute. See
   Qwen: about one per 1000 pixels, a 448x448 image is 196 tokens on Qwen3.5 / Qwen3-VL
   and 256 on Qwen2.5-VL). The counts match Hugging Face's processor for the same
   request (`ov-genai` counts 2956 for that LLaVA-NeXT request).
-- `ov-genai` checks the window (`config.json` `max_position_embeddings`) before generation
-  on text-only turns only, with a 400 `context_length_exceeded`. GenAI expands images and
-  videos inside the run and reports their token count only afterwards, so a turn with media
-  that overruns the window is not refused up front: GenAI runs it or fails it with a
-  server error.
+- `ov-genai` checks the window (`config.json` `max_position_embeddings`, InternVL's
+  `llm_config` one) before generation and refuses a prompt at or past it with a 400
+  `context_length_exceeded`. GenAI expands images and videos inside the run and reports
+  their count only afterwards, so a turn with media is sized before the run from the
+  export's processor configs, with the token math above: each image's and video's soft
+  tokens plus the text without its `<ov_genai_*>` tags (less one token per tag). That
+  leaves out the image framing and timestamp text GenAI adds, so it is a floor of
+  GenAI's own count and never refuses a prompt that fits; the message says "at least".
+  This covers Qwen2.5-VL, Qwen3-VL, InternVL2, LLaVA-NeXT, Phi-3.5-vision, Gemma 3 and
+  Gemma 4 exports (images, and native video on the Qwen and Gemma 4 types). On any other
+  `model_type` (LLaVA-1.5, MiniCPM-V, Qwen2-VL, Qwen3.5 / 3.6 and the rest), or an export
+  whose processor configs cannot be read, the load log says media prompts are not sized,
+  and an over-window media turn still runs or fails inside GenAI (a server error).
 - Phi-3.5-vision and InternVL2: these exports carry Phi-3's RoPE frequencies as a traced
   constant, with no switch to the long factors past 4096 positions, so longer sequences
   differ from Hugging Face; ov-genai runs the same IRs. The load log says so.
