@@ -73,7 +73,7 @@ cascadia run [OPTIONS] <MODEL>
 | `--engine <ENGINE>` | `ov-genai` | Inference engine. Use `ov-runtime` for a `cascadia shard` tree. |
 | `--api <API>` | `:8000` | API bind address. `127.0.0.1:8000` binds loopback only. |
 | `--prefix-cache-gb <GB>` | min(16, RAM/4) | `qwen35` only: budget of the in-process prefix cache (system-block + chat-boundary state snapshots, restored for prompts that extend a cached prefix). `0` disables. |
-| `--api-max-body-mb <MB>` | `1` | Largest chat-completions request body (MiB); the rendered prompt is capped at the same size (1 MiB ≈ 250K tokens of English). Only `qwen35` also bounds the prompt in tokens against the model window; on other engines this byte cap is the whole guard, so lower it on an exposed endpoint. |
+| `--api-max-body-mb <MB>` | `1` | Largest chat-completions request body (MiB); the rendered prompt is capped at the same size (1 MiB ≈ 250K tokens of English). `qwen35`, `gemma4`, `ov-genai`, `ov-runtime` and `ov-dist-spec` also bound the prompt in tokens (against the model window, or a static tree's KV window); on other engines this byte cap is the whole guard, so lower it on an exposed endpoint. |
 | `--ov-cache-dir <DIR>` | platform cache | Compiled-blob cache (plugin `CACHE_DIR`), as on `worker`; `""` disables. See the [`worker` note](#cascadia-worker). |
 
 Note the defaults differ from `worker` (`GPU`/`ov-genai` here, `CPU`/`mock`
