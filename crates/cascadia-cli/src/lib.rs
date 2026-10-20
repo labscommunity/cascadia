@@ -992,6 +992,11 @@ pub struct RunArgs {
     #[arg(long)]
     pub ep_placement: Option<PathBuf>,
 
+    /// OpenVINO compiled-blob cache dir (plugin CACHE_DIR). Unset uses the
+    /// platform cache; `""` disables. See `cascadia worker --help`.
+    #[arg(long)]
+    pub ov_cache_dir: Option<String>,
+
     /// Elastic memory posture — serve large allocations from file-backed
     /// mappings so RAM stays kernel-reclaimable (ramlab exp 198). See
     /// `cascadia worker --help` for `--elastic-min-mb` / `--elastic-pool-mb`
@@ -1092,6 +1097,7 @@ impl WorkerArgs {
         vision_device: Option<String>,
         ep_workers: Vec<String>,
         ep_placement: Option<PathBuf>,
+        ov_cache_dir: Option<String>,
     ) -> Self {
         WorkerArgs {
             rank: 0,
@@ -1114,7 +1120,7 @@ impl WorkerArgs {
             ep_worker_index: None,
             ep_worker_count: None,
             ep_placement,
-            ov_cache_dir: None,
+            ov_cache_dir,
             ov_kv_precision: None,
             ov_dyn_quant_group: None,
             ov_performance_mode: None,
@@ -1426,6 +1432,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         args.vision_device,
         args.ep_workers,
         args.ep_placement,
+        args.ov_cache_dir,
     );
     // Carry the elastic posture onto the worker so the OV memory-knob seeding
     // (ov_perf_properties) fires; the interposer itself was already activated
@@ -3538,6 +3545,7 @@ mod python_tests {
             None,
             Vec::new(),
             None,
+            None,
         );
         a.engine = engine;
         a
@@ -3985,6 +3993,7 @@ mod ov_property_tests {
             ApiMediaArgs::default(),
             None,
             Vec::new(),
+            None,
             None,
         )
     }
@@ -4656,6 +4665,7 @@ mod tests {
             args.vision_device,
             Vec::new(),
             args.ep_placement,
+            args.ov_cache_dir,
         );
         assert_eq!(worker.prefix_cache_gb, Some(0.0));
         assert_eq!(worker.api_max_body_mb, 2.0);
@@ -4687,6 +4697,7 @@ mod tests {
             args.vision_device,
             args.ep_workers,
             args.ep_placement,
+            args.ov_cache_dir,
         );
         assert!(worker.api_allow_image_urls);
     }
@@ -4732,6 +4743,7 @@ mod tests {
             args.vision_device,
             args.ep_workers,
             args.ep_placement,
+            args.ov_cache_dir,
         );
         let m = &worker.api_media;
         assert_eq!(
@@ -4827,9 +4839,42 @@ mod tests {
             args.vision_device,
             args.ep_workers,
             args.ep_placement,
+            args.ov_cache_dir,
         );
         assert_eq!(worker.ep_placement, Some(PathBuf::from("placement.json")));
         assert_eq!(worker.ep_workers, ["127.0.0.1:9201", "127.0.0.1:9202"]);
+    }
+
+    /// `run --ov-cache-dir` reaches the worker as `worker --ov-cache-dir`
+    /// would, `""` (disable) included; unset leaves the platform default.
+    #[test]
+    fn run_forwards_the_ov_cache_dir() {
+        for (argv, want) in [
+            (&["--ov-cache-dir", "/tmp/ovc"][..], Some("/tmp/ovc")),
+            (&["--ov-cache-dir", ""][..], Some("")),
+            (&[][..], None),
+        ] {
+            let cli = Cli::try_parse_from(["cascadia", "run", "m"].iter().chain(argv))
+                .expect("parse run argv");
+            let Command::Run(args) = cli.cmd else {
+                panic!("expected run");
+            };
+            let worker = WorkerArgs::single_node(
+                args.model,
+                args.device,
+                args.engine,
+                args.api,
+                args.prefix_cache_gb,
+                args.api_max_body_mb,
+                args.api_allow_image_urls,
+                args.api_media,
+                args.vision_device,
+                args.ep_workers,
+                args.ep_placement,
+                args.ov_cache_dir,
+            );
+            assert_eq!(worker.ov_cache_dir.as_deref(), want, "{argv:?}");
+        }
     }
 
     /// The engine renamed from `qwen36-moe` to `qwen35`; the old spelling is
