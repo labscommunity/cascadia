@@ -383,7 +383,10 @@ python tools/vlm_surgery/cut_vlm_lm.py --model <OpenVINO/pixtral-12b-int4-ov dir
 ```
 
 `--num-stages 1` cuts a one-stage tree for a single box. `--stage I` cuts one stage on a
-worker that holds only that one.
+worker that holds only that one. Every stage checks at load that its layer range matches
+the tree's `pipeline_config.json` `stages` list, that the list tiles the model's layers
+without a gap or overlap, and that the sibling stage configs on its disk agree, so a stage
+re-cut with another split into a reused tree is refused instead of serving garbage.
 
 ### Gemma 3 (ov-runtime)
 
