@@ -81,9 +81,11 @@ and in `/v1/responses` OpenRouter's `{"type": "input_video", "video_url": "data:
 - `data:video/mp4`, `video/webm`, `video/quicktime` and `video/x-matroska` URLs; `https://`
   only with `--api-allow-image-urls`, under the same checks as images (a fetched video may
   be typed `video/*`, `application/octet-stream` or not at all: its bytes are checked). The
-  container must be MP4/MOV or Matroska/WebM; anything else is a `400`. A WebM that states
-  no duration (as a browser's MediaRecorder writes it) has it read from its packets (first
-  to last); timestamps in labels count from the clip's start, whatever its first timestamp.
+  container must be MP4/MOV or Matroska/WebM; anything else is a `400`. The duration is the
+  video stream's; a video stream that states none (Matroska, a browser's MediaRecorder WebM)
+  has it read from its packets (first to last), and the container's duration, which spans
+  its longest track (often the audio), is used only when neither is known. Timestamps in
+  labels count from the clip's start, whatever its first timestamp.
 - The video becomes `ceil(duration x --api-video-fps)` frames (default 1 per second), at
   most `--api-max-video-frames` (default 16), spread uniformly from 0 s. Each frame enters
   the prompt where the video was, as `Frame k (t s): ` followed by one image (`Video j frame
@@ -92,7 +94,8 @@ and in `/v1/responses` OpenRouter's `{"type": "input_video", "video_url": "data:
 - Frame size: `detail: "auto"` (the default) fits each frame to
   `--api-max-video-frame-pixels` (default 448x448), `"low"` to a quarter of that (224x224,
   never more than the image low-detail budget), the smallest; `"high"` to the larger of that
-  and the image budget (about 1 MP). Aspect ratio is kept.
+  and the image budget (about 1 MP). Aspect ratio is kept (sides are rounded down to even,
+  and the long side trimmed if that would take the ratio past 200:1).
 - As frames, each costs one image's tokens on that family: Gemma 3, 256 per frame plus its
   markers (16 frames are over 4 K tokens); Qwen3-VL and Qwen3.5 (16x16 patches), about 196
   for a 448x448 frame; Qwen2.5-VL (14x14 patches), about 256. A video that does not fit the
@@ -109,11 +112,12 @@ and in `/v1/responses` OpenRouter's `{"type": "input_video", "video_url": "data:
   `--api-video-decode-timeout` (30 s for all of a request's videos; past it ffmpeg is
   killed and the request gets a `400` asking for a shorter or lower-resolution clip).
   Videos decode under the request's one decode slot.
-- A clip with more than 32 source frames per sampled frame (past about 16 s at 30 fps) and
-  at least one keyframe per sampled frame is read with one seek per frame instead of one
-  pass: 60 s of 4K30 with a 2 s GOP takes about 3.6 s instead of 9 s on an M-series Mac. A
-  clip with rare keyframes (a browser recording, `keyint=infinite`) is read in one pass,
-  since each seek would decode most of it. ffmpeg's memory follows the source frame size,
+- A clip with more than 32 source frames per sampled frame (past about 16 s at 30 fps), at
+  least one keyframe per sampled frame, and no gap between keyframes longer than the time
+  between sampled frames is read with one seek per frame instead of one pass: 60 s of 4K30
+  with a 2 s GOP takes about 3.6 s instead of 9 s on an M-series Mac. A clip with rare or
+  bunched keyframes (a browser recording, `keyint=infinite`, all keyframes in its first
+  second) is read in one pass, since each seek would decode most of it. ffmpeg's memory follows the source frame size,
   about 170 MB at 4K; it is not capped otherwise.
 - Decoding needs ffmpeg and ffprobe on the server: `--api-ffmpeg PATH`, else `ffmpeg` on
   `PATH` (ffprobe beside it or on `PATH`). A decode-only LGPL build is enough. ffmpeg runs
