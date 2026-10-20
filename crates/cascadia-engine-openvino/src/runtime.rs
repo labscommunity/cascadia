@@ -2224,6 +2224,44 @@ pub(crate) fn vision_family(
     }
 }
 
+/// The soft tokens of the widest image (or native-video frame) a
+/// `token_type_ids` vision tree can send, from the tree root's processor
+/// configs without loading the vision encoder: a relay stage's copy of what
+/// rank 0's front end reports (`max_image_tokens`). On Gemma 4 a frame counts
+/// whether or not native video is on, which is rank 0's figure as long as a
+/// frame is no wider than an image (70 and 280 in every export). `None` for
+/// families without bidirectional image blocks.
+fn widest_image_tokens(dir: &Path, family: VisionFamily) -> Result<Option<usize>, String> {
+    Ok(match family {
+        VisionFamily::Gemma4 => {
+            let image = crate::gemma4_vision::PreprocessConfig::from_model_dir(dir)?;
+            let video = crate::gemma4_vision::video::VideoConfig::from_model_dir(dir)?;
+            Some(image.max_soft_tokens.max(video.frame.max_soft_tokens) as usize)
+        }
+        VisionFamily::Gemma3 => Some(
+            crate::gemma3_vision::PreprocessConfig::from_model_dir(dir)?.image_seq_length as usize,
+        ),
+        VisionFamily::Pixtral
+        | VisionFamily::Phi3V
+        | VisionFamily::InternVL
+        | VisionFamily::LlavaNext
+        | VisionFamily::QwenVl(_) => None,
+    })
+}
+
+/// A static `token_type_ids` stage's chunked-prefill IR must hold the widest
+/// image whole: an image is attended both ways, so no chunk may end inside
+/// one, on rank 0 or on any relay.
+fn static_image_window_fits(pseq: usize, max: usize, rank: u32) -> EngineResult<()> {
+    if pseq < max {
+        return Err(EngineError::InvalidConfig(format!(
+            "stage_{rank}: static prefill IR takes {pseq} rows but an image can be {max} \
+             tokens; re-convert with --prefill-seq {max} or more"
+        )));
+    }
+    Ok(())
+}
+
 /// A vision tree: stage 0 takes `inputs_embeds` instead of ids (rank 0
 /// embeds the prompt and splices image rows). On a Gemma 4 tree every stage
 /// also takes `token_type_ids` (1 on image soft tokens: sliding-window layers
@@ -7457,7 +7495,10 @@ impl Builder for OvRuntimeBuilder {
                 // pipeline stitched from different exports would silently
                 // apply different sliding windows per stage — corrupted
                 // output, no error. Fail fast instead. (Differing
-                // static_prefill_seq alone is fine — relays sub-chunk.)
+                // static_prefill_seq alone is fine for text — relays
+                // sub-chunk — but on a `token_type_ids` vision tree every
+                // stage's must hold the widest image; the vision block below
+                // checks each stage's own.)
                 // A packed-only stage beside a static-servable one (2-machine
                 // trees each check theirs against pipeline_config above).
                 if cfg.packed_only != stage_cfg.packed_only {
@@ -7719,12 +7760,7 @@ impl Builder for OvRuntimeBuilder {
             let first = if is_first {
                 let f = VisionFirst::load(&self.pipeline_dir, v, family)?;
                 if let (Some(pseq), Some(max)) = (static_window, f.frontend.max_image_tokens()) {
-                    if pseq < max {
-                        return Err(EngineError::InvalidConfig(format!(
-                            "static prefill IR takes {pseq} rows but an image can be {max} \
-                             tokens; re-convert with --prefill-seq {max} or more"
-                        )));
-                    }
+                    static_image_window_fits(pseq, max, self.rank)?;
                 }
                 // Packed: an image wider than one packed inference is refused
                 // per request (submit), so a narrow variant still serves text
@@ -7751,6 +7787,23 @@ impl Builder for OvRuntimeBuilder {
                 )));
                 Some(f)
             } else {
+                // A relay sub-chunks the prefill too, and a chunk never ends
+                // inside an image: one narrower than the widest image loads
+                // fine and then fails every such image mid-pipeline. It has no
+                // front end, so it reads the figure from the processor configs
+                // every cut copies to the tree root.
+                if let Some(pseq) = static_window {
+                    let max = widest_image_tokens(&self.pipeline_dir, family).map_err(|e| {
+                        EngineError::InvalidConfig(format!(
+                            "static {family:?} vision tree: stage_{} cannot size the widest \
+                             image ({e}); every stage needs the tree root's processor configs",
+                            self.rank
+                        ))
+                    })?;
+                    if let Some(max) = max {
+                        static_image_window_fits(pseq, max, self.rank)?;
+                    }
+                }
                 events.push(LoadProgress::message(format!(
                     "vision tree ({family:?}): {}",
                     if token_types {
@@ -10583,5 +10636,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tok, 8);
+    }
+
+    /// A relay of a static `token_type_ids` tree sizes the widest image from
+    /// the tree root, as rank 0's front end would, and a prefill IR narrower
+    /// than it is refused on any stage.
+    #[test]
+    fn relays_size_the_widest_image_from_the_tree_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        assert!(
+            widest_image_tokens(d, VisionFamily::Gemma4).is_err(),
+            "no processor config: refused, not skipped"
+        );
+        assert_eq!(widest_image_tokens(d, VisionFamily::Pixtral).unwrap(), None);
+        std::fs::write(
+            d.join("processor_config.json"),
+            r#"{"image_processor":{"max_soft_tokens":280},"image_seq_length":256}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            widest_image_tokens(d, VisionFamily::Gemma4).unwrap(),
+            Some(280)
+        );
+        std::fs::write(d.join("preprocessor_config.json"), "{}").unwrap();
+        assert_eq!(
+            widest_image_tokens(d, VisionFamily::Gemma3).unwrap(),
+            Some(256)
+        );
+
+        assert!(static_image_window_fits(280, 280, 1).is_ok());
+        let err = static_image_window_fits(256, 280, 1).unwrap_err();
+        assert!(
+            matches!(&err, EngineError::InvalidConfig(m) if m.contains("stage_1")),
+            "{err}"
+        );
     }
 }
