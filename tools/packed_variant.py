@@ -22,7 +22,9 @@ replaced by its own Parameter: `attn_mask_4d` for full attention,
 `attn_mask_sliding_4d` for the sliding window. Inputs left with no consumer
 (`attention_mask`, `token_type_ids`) are dropped, and `stage_config.json`
 records the ports under `packed_masks` (plus `packed_sliding_window`) so the
-runtime knows what to feed. One full-attention producer (every family served
+runtime knows what to feed. A stage from `static_variant.py --packed-only`
+(`packed_only` in stage_config.json; its ring may run past the sliding
+window) keeps that marker and needs the host-built sliding mask. One full-attention producer (every family served
 before Gemma 4) takes the original edit unchanged and records nothing new.
 
 Reusable on an already-exported stage (no HF model, no torch, no re-trace):
@@ -450,6 +452,14 @@ def write_packed_variant(stage_dir: str, slots: int, packed_seq: int = None,
         raise RuntimeError(
             f"{stage_dir}: the stage has sliding-window layers but config.json gives "
             "no sliding_window"
+        )
+    if cfg.get("packed_only") and SLIDING not in (info.get("packed_masks") or {}).values():
+        # The ring may run past the window (static_variant.py --packed-only):
+        # only a host-built sliding mask keeps those layers correct.
+        raise RuntimeError(
+            f"{stage_dir} is a packed-only tree (static_variant.py --packed-only) but its "
+            "packed IR has no attn_mask_sliding_4d port, so the IR would still mask the "
+            "sliding window by ring index; rebuild the static tree without --packed-only"
         )
     out = os.path.join(stage_dir, "openvino_packed_model.xml")
     ov.save_model(packed, out, compress_to_fp16=True)

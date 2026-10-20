@@ -289,11 +289,11 @@ video request takes 17 to 23 s stateful and 30 to 36 s static. Packed slots
 both suites 11/11 with the same counts and answers, 35 to 42 s a video request; every stage
 logs `masks=attn_mask_sliding_4d (sliding window 1024), attn_mask_4d (full, causal)`. That
 run used `--context 1280` (a 639-token slot, room for the 561-token frames case and two
-images), which `static_variant.py` refuses for Gemma 4 because the static IR masks the
-window by ring index; the packed IR takes host-built masks, so the cap is not needed there,
-and the tool's guard was bypassed in a local copy for the run. At the allowed
-`--context 736` a slot holds 367 tokens: the 336-token clip and one image fit, the frames
-case and two images get a 413.
+images), past the sliding-window cap the static IR needs, so the tree is built packed-only
+(`static_variant.py --context 1280 --prefill-seq 288 --shared-prefill --packed-only`, see
+Gemma 4 on packed slots below): the packed IR takes host-built masks, so the cap does not
+apply there. Within the cap (`--context 736`, servable static too) a slot holds 367 tokens:
+the 336-token clip and one image fit, the frames case and two images get a 413.
 
 ## What takes images
 
@@ -524,7 +524,9 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
   such an image with a 413. Verified static and packed on CPU (prompt_tokens 2956).
 - **Gemma 4** needs `--prefill-seq` at least one image wide (280), and `--context` plus
   `--prefill-seq` must stay within the sliding window + 1 (1025): for example
-  `--context 736 --prefill-seq 288`, which holds about two images.
+  `--context 736 --prefill-seq 288`, which holds about two images. The static IR masks
+  the window by KV ring index, which a longer ring would get wrong. A tree served only on
+  packed slots may go past it with `--packed-only` (Gemma 4 on packed slots, below).
 - **Qwen2.5-VL / Qwen3-VL** carry M-RoPE `position_ids [3, T]` on every stage, which both
   the static IRs (`[3, 1, seq]`) and the packed IR (`[3, 1, S]`) now take; `static_variant.py`
   and `packed_variant.py` pin them from the stateful tree, and rank 0 computes each span's
@@ -573,6 +575,24 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
 
   The load log line `packed multi-slot decode active` names the mask ports, the window
   and the KV geometry (`8x256 x6, 2x512 x1`, ...) each stage loaded.
+
+  That tree also serves the static path, so its `--context` stays within the cap above
+  (two slots of 367 tokens at 736). For longer slots build the static tree with
+  `--packed-only`, which lifts the cap: the packed IR takes both masks from the host
+  (the sliding one from the real token distance), so the ring-index masking of the static
+  IR never runs. The tool marks every `stage_config.json` and the `pipeline_config.json`
+  `"packed_only": true`, `packed_variant.py` keeps the marker (and refuses a packed-only
+  stage whose packed IR lacks `attn_mask_sliding_4d`), and `ov-runtime` refuses to load
+  a marked stage without `--packed-slots`, or one whose marker disagrees with
+  `pipeline_config.json` or a sibling stage. On CPU, two slots of 639 tokens (the
+  two-machine run above, each node building its own stage):
+
+  ```bash
+  python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <static tree> \
+      --context 1280 --prefill-seq 288 --shared-prefill --packed-only [--stage I]
+  python tools/packed_variant.py <static tree>/stage_I --slots 2 --packed-seq 288 --dynamic-seq
+  cascadia worker ... --engine ov-runtime --model <static tree> --packed-slots 2
+  ```
 - **Gemma 3 on packed slots** takes the same two-producer recipe (sliding window + full
   attention, `token_type_ids`), so build its static tree with `--context 768
   --prefill-seq 256` (sliding window 1024) and `--packed-seq 256` (one image wide). Each
@@ -655,8 +675,10 @@ IRs); a restart from the cache dir served in under a minute. See
 - Gemma 4 packed slots: a request whose image is wider than `--packed-seq` rows is
   refused with a 400 (lower detail sends a smaller image). A 288-row variant decodes
   at a 288-row cost unless it was built with `--dynamic-seq` (CPU) or
-  `--decode-seq` (static shapes, meant for the NPU); `static_variant.py` still caps `--context` + `--prefill-seq` at the sliding
-  window + 1 (1025), which leaves two slots of 367 tokens at `--context 736`. Every
+  `--decode-seq` (static shapes, meant for the NPU). A tree that also serves the static
+  path caps `--context` + `--prefill-seq` at the sliding window + 1 (1025), two slots of
+  367 tokens at `--context 736`; a `--packed-only` tree (packed slots only) goes past it,
+  and the NPU has not run one yet. Every
   stage must run the same build and tree kind: the packed plan frame's tag says
   whether it carries image ids, and a stage refuses a frame of the other kind or of
   an older, untagged build.
