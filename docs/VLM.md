@@ -25,6 +25,9 @@ whole where the engine takes it natively (see [Video](#video)); audio is not sup
   512x512; `"original"` is served as `"high"`). The chat and Responses bodies may carry
   20 MiB of images on top of the text limit; the text itself (everything but image URLs)
   stays held to that limit (`413`), and `/v1/completions` gets no image allowance.
+  Because those bodies can be tens of MB, the chat and Responses routes of a server that
+  takes images admit at most the in-flight cap of requests (`CASCADIA_API_MAX_CONCURRENT`, default 16) before reading
+  any body; one past that gets the capacity `503` with its body unread.
 - A request's images may declare 100 MP of source pixels together (two images at the
   50 MP per-image cap), checked from their headers before any decode. Two images decode
   at once across the server; a request that waits more than 10 s for a decode slot gets
