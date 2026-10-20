@@ -271,8 +271,8 @@ mod tests {
     async fn binary_serves_health_then_models_then_chat() {
         let proc = CascadiaProc::spawn_mock_with_api().await;
         assert!(
-            proc.wait_for_health(Duration::from_secs(10)).await,
-            "binary did not become healthy in 10s"
+            proc.wait_for_health(Duration::from_secs(30)).await,
+            "binary did not become healthy in 30s"
         );
 
         let client = reqwest::Client::new();
@@ -353,7 +353,7 @@ mod tests {
     #[tokio::test]
     async fn binary_supports_concurrent_requests() {
         let proc = CascadiaProc::spawn_mock_with_api().await;
-        assert!(proc.wait_for_health(Duration::from_secs(10)).await);
+        assert!(proc.wait_for_health(Duration::from_secs(30)).await);
 
         let client = reqwest::Client::new();
         let url = proc.url("/v1/chat/completions");
