@@ -630,6 +630,80 @@ def stage_ranges(total: int, num_layers: int):
     return ranges
 
 
+def check_reused_tree(out_dir: str, num_stages: int, num_layers, export_version,
+                      ranges, hidden_size=None) -> None:
+    """Refuse a one-stage cut into a tree laid out differently.
+
+    A ``--stage I`` run writes one stage beside the ones already in
+    ``out_dir``. If those came from a cut with another stage count, split,
+    model or export version, the tree mixes two layouts (e.g. stage_0 from a
+    3-stage cut, stage_1 from a 2-stage one) and loads with layers missing or
+    run twice. ``ranges`` are this cut's inclusive (start, end) pairs, as
+    :func:`stage_ranges` returns them. Fields a file does not carry are not
+    compared.
+    """
+    want = {"num_stages": num_stages, "num_layers": num_layers,
+            "hidden_size": hidden_size, "export_version": export_version}
+    problems = []
+
+    def same_range(where: str, idx, cfg: dict) -> None:
+        if not isinstance(idx, int) or not 0 <= idx < num_stages:
+            problems.append(f"{where} is stage {idx}, outside 0..{num_stages - 1}")
+            return
+        a, b = ranges[idx]
+        got = (cfg.get("layer_start", a), cfg.get("layer_end", b + 1))
+        if got != (a, b + 1):
+            problems.append(f"{where} holds layers [{got[0]}, {got[1]}), this cut "
+                            f"[{a}, {b + 1})")
+
+    marker = os.path.join(out_dir, "pipeline_config.json")
+    if os.path.exists(marker):
+        with open(marker) as f:
+            pipe = json.load(f)
+        for k, v in want.items():
+            if v is not None and k in pipe and pipe[k] != v:
+                problems.append(f"pipeline_config.json has {k} {pipe[k]!r}, this cut {v!r}")
+        for j, s in enumerate(pipe.get("stages") or []):
+            same_range(f"pipeline_config.json stages[{j}]", s.get("stage", j), s)
+    if os.path.isdir(out_dir):
+        for name in sorted(os.listdir(out_dir)):
+            m = re.fullmatch(r"stage_(\d+)", name)
+            path = os.path.join(out_dir, name, "stage_config.json")
+            if not m or not os.path.exists(path):
+                continue
+            with open(path) as f:
+                cfg = json.load(f)
+            ver = cfg.get("export_version")
+            if export_version is not None and ver is not None and ver != export_version:
+                problems.append(f"{name} has export_version {ver!r}, this cut "
+                                f"{export_version!r}")
+            same_range(name, int(m.group(1)), cfg)
+    if problems:
+        raise SystemExit(
+            f"{out_dir} holds a different cut ({'; '.join(problems)}); a --stage run must "
+            f"use the same --num-stages, model and export as the stages already there. "
+            f"Cut into an empty directory, or delete the old tree first")
+
+
+def check_contiguous(stages, num_layers, num_stages=None) -> None:
+    """Refuse a pipeline_config.json whose stages do not cover layers
+    0..num_layers exactly once, in order (``layer_end`` half-open)."""
+    expect = 0
+    for j, s in enumerate(stages):
+        a, b = s.get("layer_start"), s.get("layer_end")
+        if a != expect or not isinstance(b, int) or b <= a:
+            raise SystemExit(
+                f"pipeline_config.json stages[{j}] holds layers [{a}, {b}), expected to "
+                f"start at {expect}: the stages would skip or repeat layers")
+        expect = b
+    if num_layers is not None and expect != num_layers:
+        raise SystemExit(f"pipeline_config.json stages end at layer {expect}, the model "
+                         f"has {num_layers}")
+    if num_stages is not None and len(stages) != num_stages:
+        raise SystemExit(f"pipeline_config.json lists {len(stages)} stages, num_stages "
+                         f"is {num_stages}")
+
+
 def layer_entry_output(model: ov.Model, idx: int, suffix: str):
     """Residual-stream Output ENTERING decoder layer ``idx``.
 
@@ -1116,6 +1190,11 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
             # attention); the runtime sends the third wire frame only then.
             "token_type_ids": vision_token_types,
         }
+    if only_stage is not None:
+        # Before the (long) cut: the stages already in out_dir must be this
+        # cut's, or the merged tree would skip or repeat layers.
+        check_reused_tree(out_dir, num_stages, num_layers, export_version, ranges,
+                          hidden_size)
 
     try:
         for i, (a, b) in enumerate(ranges):
@@ -1215,6 +1294,7 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
         # parity gate. --stage i is an incremental single-stage export: don't
         # clobber a complete pipeline_config.json.
         if only_stage is None:
+            check_contiguous(pipeline_config["stages"], num_layers, num_stages)
             with open(marker_path, "w") as f:
                 json.dump(pipeline_config, f, indent=2)
         elif not os.path.exists(marker_path):
@@ -1235,6 +1315,7 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
                 cut.update({s["stage"]: s for s in pipeline_config["stages"]})
                 existing["stages"] = [cut[k] for k in sorted(cut)]
                 if len(cut) == num_stages:
+                    check_contiguous(existing["stages"], num_layers, num_stages)
                     del existing["only_stage"]
                 with open(marker_path, "w") as f:
                     json.dump(existing, f, indent=2)

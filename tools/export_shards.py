@@ -2299,6 +2299,20 @@ def main():
         print(f"  Stage {s['stage']}: {' + '.join(parts)}", flush=True)
 
     output_dir = args.output_dir
+    if args.stage is not None:
+        # The other stages already in output_dir stay as they are, so they
+        # must be this plan's, or the tree skips or repeats layers.
+        _here = os.path.dirname(os.path.abspath(__file__))
+        sys.path.insert(0, os.path.join(_here, "gemma4_surgery"))
+        sys.path.insert(0, _here)
+        from export_gemma4_text import check_reused_tree
+
+        check_reused_tree(
+            output_dir, args.num_stages, config.num_hidden_layers,
+            "v5_canonical_inputs",
+            [(s["layer_start"], s["layer_end"] - 1) for s in plan],
+            config.hidden_size,
+        )
     os.makedirs(output_dir, exist_ok=True)
     copy_tokenizer(model_dir, output_dir)
 

@@ -852,6 +852,23 @@ def test_run_export_allows_stage_reexport_of_a_matching_tree(
     assert len(calls) == 1
 
 
+def test_run_export_refuses_stage_reexport_into_another_split(monkeypatch, tmp_path):
+    """Same version, other stage count: stage_0 of a 4-stage tree holds
+    layer 0 only, so a 2-stage stage 1 (layers 2..3) beside it would leave
+    layer 1 out of the tree."""
+    out = tmp_path / "tree"
+    write_pipeline_config(out, export_gemma4.EXPORT_VERSION)
+    (out / "stage_0").mkdir()
+    (out / "stage_0" / "stage_config.json").write_text(json.dumps(
+        {"layer_start": 0, "layer_end": 1, "export_version": export_gemma4.EXPORT_VERSION}))
+    calls = patch_run_export(monkeypatch, fake_text_config())
+    with pytest.raises(SystemExit, match="different cut"):
+        export_gemma4.run_export(
+            model_id="fake", output_dir=str(out), num_stages=2, stage=1
+        )
+    assert calls == []
+
+
 def test_run_export_full_export_overwrites_an_older_tree(monkeypatch, tmp_path):
     """Only `--stage` is refused: a full export rewrites every stage, so it
     may replace a v1 tree, and leaves it uniformly v1.1."""
