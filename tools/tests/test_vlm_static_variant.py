@@ -13,6 +13,7 @@ model's past fed explicitly gives the same output and present rows.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -289,3 +290,77 @@ def test_shared_prefill_ir_takes_any_query_width():
                          "attention_mask": np.ones((1, 15 + seq), np.int64),
                          "position_ids": np.arange(seq, dtype=np.int64)[None], **past})
         assert out["present.0.key"].shape == (1, KVH, 15 + seq, HD)
+
+
+# ---- --packed-only: lifting the Gemma 4 sliding-window cap ----
+
+
+def test_window_error_cap_and_packed_only():
+    # Within the window: fine either way (Gemma 4 280-row prefill, 1024 window).
+    assert sv.window_error(736, 288, 1024, True, False) is None
+    # Past it: refused, and on Gemma 4 the message names the flag.
+    err = sv.window_error(1280, 288, 1024, True, False)
+    assert "exceeds the sliding window (1024)" in err and "--packed-only" in err
+    assert "--packed-slots" in err
+    # --packed-only lifts the cap on Gemma 4 only.
+    assert sv.window_error(1280, 288, 1024, True, True) is None
+    other = sv.window_error(1280, 288, 1024, False, False)
+    assert "exceeds" in other and "--packed-only" not in other
+    assert "Gemma 4 trees only" in sv.window_error(1280, 288, 1024, False, True)
+    assert "Gemma 4 trees only" in sv.window_error(16, 0, None, False, True)
+    # No window: nothing to cap.
+    assert sv.window_error(4096, 256, None, False, False) is None
+
+
+def test_is_gemma4():
+    assert sv.is_gemma4({"vision": {"family": "gemma4"}}, {})
+    assert sv.is_gemma4({}, {"model_type": "gemma4_text"})
+    assert not sv.is_gemma4({"vision": {"family": "gemma3"}}, {"model_type": "gemma3"})
+
+
+def _toy_tree(root, window=8):
+    tree = root / "tree"
+    stage = tree / "stage_0"
+    stage.mkdir(parents=True)
+    ov.save_model(toy_stage(), str(stage / "openvino_model.xml"), compress_to_fp16=False)
+    (stage / "stage_config.json").write_text(json.dumps({
+        "stateful": True, "has_embed": True, "has_head": False,
+        "layer_start": 0, "layer_end": LAYERS}))
+    (tree / "pipeline_config.json").write_text(json.dumps({
+        "num_stages": 1, "stages": [{"layer_start": 0, "layer_end": LAYERS}],
+        "vision": {"family": "gemma4"}}))
+    (tree / "config.json").write_text(json.dumps({
+        "model_type": "gemma4", "sliding_window": window}))
+    return tree
+
+
+def _run(monkeypatch, tree, out, *extra):
+    monkeypatch.setattr(sys, "argv", [
+        "static_variant.py", "--tree", str(tree), "--output-dir", str(out),
+        "--context", "12", "--prefill-seq", "4", "--shared-prefill", *extra])
+    sv.main()
+
+
+def test_main_refuses_past_the_window_without_packed_only(tmp_path, monkeypatch):
+    tree = _toy_tree(tmp_path)
+    with pytest.raises(SystemExit, match="--packed-only"):
+        _run(monkeypatch, tree, tmp_path / "out")
+    assert not (tmp_path / "out" / "pipeline_config.json").exists()
+
+
+def test_main_packed_only_marks_every_stage_and_the_pipeline(tmp_path, monkeypatch):
+    tree = _toy_tree(tmp_path)
+    out = tmp_path / "out"
+    _run(monkeypatch, tree, out, "--packed-only")
+    stage = json.loads((out / "stage_0" / "stage_config.json").read_text())
+    pipeline = json.loads((out / "pipeline_config.json").read_text())
+    assert stage["packed_only"] is True and pipeline["packed_only"] is True
+    assert stage["static_context"] == 12 and stage["static_prefill_seq"] == 4
+    # A rebuild within the window, without the flag, drops the marker.
+    _toy_tree(tmp_path / "again", window=64)
+    monkeypatch.setattr(sys, "argv", [
+        "static_variant.py", "--tree", str(tmp_path / "again" / "tree"),
+        "--output-dir", str(out), "--context", "12", "--prefill-seq", "4", "--shared-prefill"])
+    sv.main()
+    assert "packed_only" not in json.loads((out / "stage_0" / "stage_config.json").read_text())
+    assert "packed_only" not in json.loads((out / "pipeline_config.json").read_text())

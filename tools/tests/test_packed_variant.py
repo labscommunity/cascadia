@@ -314,6 +314,32 @@ def test_write_packed_variant_records_mask_ports(tmp_path):
         pv.write_packed_variant(str(stage), slots=2, packed_seq=3)
 
 
+def test_packed_only_stage_keeps_its_marker_and_needs_the_sliding_mask(tmp_path):
+    # static_variant.py --packed-only: the ring may run past the sliding
+    # window, which only the host-built sliding mask keeps correct.
+    stage = tmp_path / "stage_0"
+    stage.mkdir()
+    ov.save_model(pinned(toy_stage(2)), str(stage / "openvino_model.xml"), compress_to_fp16=False)
+    base = {"stateful": False, "has_embed": True, "static_seq": 1,
+            "static_context": PAST + 1, "layer_start": 0, "layer_end": 3,
+            "packed_only": True}
+    (stage / "stage_config.json").write_text(json.dumps(base))
+    (tmp_path / "config.json").write_text(json.dumps({
+        "layer_types": LAYER_TYPES, "sliding_window": 4}))
+    cfg = pv.write_packed_variant(str(stage), slots=2, packed_seq=3)
+    assert cfg["packed_only"] is True
+    assert "sliding_attention" in cfg["packed_masks"].values()
+    # One full-attention mask: the ring-index window would stay in the IR.
+    ov.save_model(pinned(toy_stage(1)), str(stage / "openvino_model.xml"), compress_to_fp16=False)
+    (stage / "stage_config.json").write_text(json.dumps(base))
+    (tmp_path / "config.json").write_text(json.dumps({}))
+    with pytest.raises(RuntimeError, match="packed-only"):
+        pv.write_packed_variant(str(stage), slots=2, packed_seq=3)
+    # The same stage without the marker builds as before.
+    (stage / "stage_config.json").write_text(json.dumps({**base, "packed_only": False}))
+    assert "packed_masks" not in pv.write_packed_variant(str(stage), slots=2, packed_seq=3)
+
+
 def test_gemma_embed_stage_without_hidden_size(tmp_path):
     # Gemma 4 vision surgery stage 0: no hidden_size in stage_config, and its
     # embedding port is `grafted_inputs_embeds` (alias `inputs_embeds`).
