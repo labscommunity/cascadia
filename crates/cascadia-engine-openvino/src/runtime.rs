@@ -805,7 +805,7 @@ fn static_media_too_long(
             "prompt is {} tokens with its images expanded but this static tree's KV window \
              holds {past_len} (static_context - 1); image tokens cannot slide out of the \
              window, so send fewer or smaller images (lower detail) or a shorter prompt, or \
-             serve with a larger --static-context",
+             convert the tree with a larger tools/vlm_surgery/static_variant.py --context",
             planned.len()
         )));
     }
