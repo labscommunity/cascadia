@@ -147,7 +147,11 @@ fn config(r: &Value) -> VideoConfig {
         ]
         .contains(&k.as_str())
     });
-    let dir = std::env::temp_dir().join(format!("cascadia-g4v-{}", std::process::id()));
+    // One dir per call: the tests run in parallel, and a shared dir lets one
+    // test remove or rewrite the file while another reads it.
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("cascadia-g4v-{}-{call}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("processor_config.json"),
