@@ -679,18 +679,31 @@ pub fn make_router_with_stats(
             })
         }),
     ));
+    // The raised limit lets each such body be tens of MB, read and parsed
+    // before the handler's in-flight gate: bound how many are in flight
+    // before any is read (see `gate_media_body`).
+    let media_gate = axum::middleware::from_fn_with_state(
+        cfg.media
+            .as_ref()
+            .map(|_| Arc::new(Semaphore::new(cfg.max_concurrent_requests))),
+        gate_media_body,
+    );
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
         .route(
             "/v1/chat/completions",
-            post(chat_completions).layer(image_body_limit),
+            post(chat_completions)
+                .layer(image_body_limit)
+                .layer(media_gate.clone()),
         )
         .route("/v1/completions", post(completions))
         .route(
             "/v1/responses",
-            post(responses::create_response).layer(image_body_limit),
+            post(responses::create_response)
+                .layer(image_body_limit)
+                .layer(media_gate),
         )
         .route("/v1/cancel/:task_id", post(cancel))
         .with_state(state)
@@ -709,6 +722,37 @@ pub fn make_router_with_stats(
         // Outermost: request count + latency per matched route (#16), so it
         // observes rejections from the inner layers too.
         .layer(axum::middleware::from_fn(track_http_metrics))
+}
+
+/// Request middleware on the routes whose body limit images raise: a slot
+/// out of [`Config::max_concurrent_requests`], taken before the body is
+/// read and held until the handler returns (by then the body is dropped; a
+/// stream's generation holds the in-flight permit instead). Without
+/// it, any number of callers could each have a body of the full media
+/// allowance buffered and parsed before the in-flight gate refused them.
+/// No slot is the in-flight gate's capacity 503, the body never read. A
+/// server without images (`None`) passes every request through.
+async fn gate_media_body(
+    State(gate): State<Option<Arc<Semaphore>>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Some(gate) = gate else {
+        return next.run(req).await;
+    };
+    let Ok(permit) = gate.try_acquire_owned() else {
+        count_rejected("capacity");
+        let mut resp = api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "engine at capacity; retry after current requests complete",
+            None,
+        );
+        resp.extensions_mut().insert(PreEngineFailure);
+        return resp;
+    };
+    let resp = next.run(req).await;
+    drop(permit);
+    resp
 }
 
 /// Request middleware: per-route request counter + latency histogram. Uses
@@ -5738,6 +5782,123 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {v}");
+    }
+
+    /// On a server that takes images, the request past the in-flight cap
+    /// on a media route is refused before its body is read: a slow upload
+    /// holding the only slot leaves the next one a 503 whose body was never
+    /// polled. Text routes, and servers without images, are not gated.
+    #[tokio::test]
+    async fn media_bodies_are_gated_before_they_are_read() {
+        use std::sync::atomic::AtomicBool;
+        let app = |media: bool| async move {
+            let runner = Runner::new(Box::new(MockBuilder::new()));
+            runner
+                .start(
+                    PeerLayout::single_stage(),
+                    ShardSpec::single_stage("mock-model", "CPU"),
+                )
+                .await
+                .unwrap();
+            let cfg = Config {
+                media: media.then(|| MediaConfig::ov_genai(None)),
+                max_concurrent_requests: 1,
+                ..Config::default()
+            };
+            make_router_with_config(Arc::new(runner), "mock-model", cfg)
+        };
+        // A body that sends its first bytes, then never ends.
+        let stalled = |polled: Arc<AtomicBool>| {
+            let mut sent = false;
+            Body::from_stream(futures::stream::poll_fn(move |_| {
+                polled.store(true, Ordering::SeqCst);
+                if sent {
+                    std::task::Poll::Pending
+                } else {
+                    sent = true;
+                    std::task::Poll::Ready(Some(Ok::<_, std::io::Error>(Bytes::from_static(
+                        b"{\"model\": \"mock-model\", \"messages\": [",
+                    ))))
+                }
+            }))
+        };
+        let post = |uri: &str, body: Body| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(body)
+                .unwrap()
+        };
+        for uri in ["/v1/chat/completions", "/v1/responses"] {
+            let router = app(true).await;
+            let first_read = Arc::new(AtomicBool::new(false));
+            let first = tokio::spawn(
+                router
+                    .clone()
+                    .oneshot(post(uri, stalled(Arc::clone(&first_read)))),
+            );
+            while !first_read.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            let second_read = Arc::new(AtomicBool::new(false));
+            // Ungated, the second request would wait on its body forever.
+            let resp = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                router
+                    .clone()
+                    .oneshot(post(uri, stalled(Arc::clone(&second_read)))),
+            )
+            .await
+            .expect("refused without reading its body")
+            .unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            assert!(!second_read.load(Ordering::SeqCst), "{uri}: body was read");
+            let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            assert!(v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("at capacity"));
+            // The text-only route keeps its own gate, after the body.
+            let resp = router
+                .clone()
+                .oneshot(post(
+                    "/v1/completions",
+                    Body::from(r#"{"model": "mock-model", "prompt": "hi", "max_tokens": 2}"#),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            // The slot comes back when the stalled request ends.
+            first.abort();
+            let _ = first.await;
+            let (status, v) = post_chat(
+                router,
+                serde_json::json!({"model": "mock-model", "max_tokens": 2,
+                    "messages": [{"role": "user", "content": "hi"}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+        }
+        // Without images the body limit is the text one: no early gate.
+        let router = app(false).await;
+        let first_read = Arc::new(AtomicBool::new(false));
+        let first = tokio::spawn(router.clone().oneshot(post(
+            "/v1/chat/completions",
+            stalled(Arc::clone(&first_read)),
+        )));
+        while !first_read.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        let (status, v) = post_chat(
+            router,
+            serde_json::json!({"model": "mock-model", "max_tokens": 2,
+                "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        first.abort();
     }
 
     /// Without a chat template only the last user message is sent, so an
