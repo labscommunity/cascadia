@@ -674,6 +674,11 @@ IRs); a restart from the cache dir served in under a minute. See
   Qwen: about one per 1000 pixels, a 448x448 image is 196 tokens on Qwen3.5 / Qwen3-VL
   and 256 on Qwen2.5-VL). The counts match Hugging Face's processor for the same
   request (`ov-genai` counts 2956 for that LLaVA-NeXT request).
+- `ov-genai` checks the window (`config.json` `max_position_embeddings`) before generation
+  on text-only turns only, with a 400 `context_length_exceeded`. GenAI expands images and
+  videos inside the run and reports their token count only afterwards, so a turn with media
+  that overruns the window is not refused up front: GenAI runs it or fails it with a
+  server error.
 - Phi-3.5-vision and InternVL2: these exports carry Phi-3's RoPE frequencies as a traced
   constant, with no switch to the long factors past 4096 positions, so longer sequences
   differ from Hugging Face; ov-genai runs the same IRs. The load log says so.
