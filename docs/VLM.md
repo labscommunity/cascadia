@@ -530,7 +530,9 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
   image (2956 prompt tokens with the SDK test's text) must fit one slot's region, so a
   two-slot variant needs `--context` near 6016 (region 3007); a narrower context refuses
   such an image with a 400 `context_length_exceeded`. Verified static and packed on CPU (prompt_tokens 2956).
-- **Gemma 4** needs `--prefill-seq` at least one image wide (280), and `--context` plus
+- **Gemma 4** needs `--prefill-seq` at least one image wide (280) on every stage (each
+  stage checks its own at load against the tree root's processor configs, so a relay
+  converted narrower is refused there, not on its first large image), and `--context` plus
   `--prefill-seq` must stay within the sliding window + 1 (1025): for example
   `--context 736 --prefill-seq 288`, which holds about two images. The static IR masks
   the window by KV ring index, which a longer ring would get wrong. A tree served only on
