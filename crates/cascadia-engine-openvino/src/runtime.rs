@@ -77,6 +77,105 @@ struct PipelineConfig {
     /// stage must agree with it.
     #[serde(default)]
     packed_only: bool,
+    /// Every stage's layer range, as the surgery cutters list it
+    /// (`tools/vlm_surgery`, `tools/gemma4_surgery`); empty on trees that
+    /// do not (`tools/export_shards.py`). See [`check_stage_layers`].
+    #[serde(default)]
+    stages: Vec<ListedStage>,
+}
+
+/// One `stages` entry of pipeline_config.json: the stage and its half-open
+/// layer range.
+#[derive(Debug, Deserialize)]
+struct ListedStage {
+    stage: u32,
+    #[serde(default)]
+    layer_start: u32,
+    #[serde(default)]
+    layer_end: u32,
+}
+
+/// Refuse a tree whose stages' layer ranges leave a gap or overlap: it loads
+/// and serves garbage (a re-cut stage dropped into a tree cut another way).
+/// Each rank checks what it can see without a wire change: its own range
+/// against pipeline_config.json's `stages` list, that list (when it names a
+/// stage more than once, or neighbours), and the sibling stage configs on its
+/// disk (a single-host tree). Two machines each holding a self-consistent
+/// tree from different cuts are not caught here. A range of `0..0` is an
+/// export that never stated one and is not checked.
+fn check_stage_layers(
+    rank: u32,
+    pipeline: &PipelineConfig,
+    own: (u32, u32),
+    siblings: &[(u32, u32, u32)],
+) -> EngineResult<()> {
+    if own.1 == 0 {
+        return Ok(());
+    }
+    let reject = |msg: String| {
+        Err(EngineError::ShardRejected(format!(
+            "{msg}; the stages come from different cuts (re-cut the whole tree, or every \
+             stage with one split)"
+        )))
+    };
+    if own.0 >= own.1 {
+        return reject(format!(
+            "stage_{rank} holds layers {}..{}, an empty range",
+            own.0, own.1
+        ));
+    }
+    if let Some(l) = pipeline.stages.iter().find(|l| l.stage == rank) {
+        if (l.layer_start, l.layer_end) != own {
+            return reject(format!(
+                "stage_{rank}/stage_config.json holds layers {}..{} but pipeline_config.json \
+                 lists {}..{} for it",
+                own.0, own.1, l.layer_start, l.layer_end
+            ));
+        }
+    }
+    let listed: Vec<(u32, u32, u32)> = pipeline
+        .stages
+        .iter()
+        .map(|l| (l.stage, l.layer_start, l.layer_end))
+        .collect();
+    let mut on_disk = siblings.to_vec();
+    on_disk.push((rank, own.0, own.1));
+    for (ranges, source) in [
+        (listed, "pipeline_config.json lists"),
+        (on_disk, "the stage configs on disk hold"),
+    ] {
+        let mut by_stage = std::collections::BTreeMap::new();
+        for (s, a, b) in ranges {
+            if b == 0 {
+                continue;
+            }
+            if by_stage.insert(s, (a, b)).is_some() {
+                return reject(format!("{source} stage {s} twice"));
+            }
+        }
+        for (&s, &(a, b)) in &by_stage {
+            if s == 0 && a != 0 {
+                return reject(format!("{source} stage 0 starting at layer {a}, not 0"));
+            }
+            if s + 1 == pipeline.num_stages && pipeline.num_layers > 0 && b != pipeline.num_layers {
+                return reject(format!(
+                    "{source} the last stage ending at layer {b}, but the model has {} layers",
+                    pipeline.num_layers
+                ));
+            }
+            if let Some(&(next, _)) = by_stage.get(&(s + 1)) {
+                if next != b {
+                    return reject(format!(
+                        "{source} stage {s} ending at layer {b} and stage {} starting at layer \
+                         {next} ({})",
+                        s + 1,
+                        if next > b { "a gap" } else { "an overlap" }
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -7484,11 +7583,13 @@ impl Builder for OvRuntimeBuilder {
         // (single-host multi-process); for distributed deploys each node has
         // only its own stage dir, so the strict wire-frame validation in
         // recv_hidden_from_upstream is the backstop at the first activation.
+        let mut sibling_layers = Vec::new();
         for r in 0..pipeline_cfg.num_stages {
             if r == self.rank {
                 continue;
             }
             if let Ok(cfg) = read_stage_config(&self.pipeline_dir.join(format!("stage_{r}"))) {
+                sibling_layers.push((r, cfg.layer_start, cfg.layer_end));
                 if cfg.stateful != stage_cfg.stateful {
                     return Err(EngineError::ShardRejected(format!(
                         "pipeline is not homogeneous: stage_{} stateful={} but stage_{r} \
@@ -7527,6 +7628,13 @@ impl Builder for OvRuntimeBuilder {
                 }
             }
         }
+
+        check_stage_layers(
+            self.rank,
+            &pipeline_cfg,
+            (stage_cfg.layer_start, stage_cfg.layer_end),
+            &sibling_layers,
+        )?;
 
         let is_first = stage_cfg.has_embed;
         let is_last = stage_cfg.has_head;
@@ -10828,5 +10936,57 @@ mod tests {
             e.submit(fresh),
             Err(EngineError::PromptTooLong(_))
         ));
+    }
+
+    fn layered_pipeline(stages: &str) -> PipelineConfig {
+        serde_json::from_str(&format!(
+            r#"{{"model_id":"m","num_stages":2,"num_layers":28,"stages":{stages}}}"#
+        ))
+        .unwrap()
+    }
+
+    /// A tree whose stage ranges leave a gap or overlap is refused at load,
+    /// from the pipeline's `stages` list or the sibling configs on disk; a
+    /// contiguous tree, or one that states no ranges, loads.
+    #[test]
+    fn stage_layer_ranges_must_tile_the_model() {
+        let whole = r#"[{"stage":0,"layer_start":0,"layer_end":14},
+                        {"stage":1,"layer_start":14,"layer_end":28}]"#;
+        let p = layered_pipeline(whole);
+        assert!(check_stage_layers(1, &p, (14, 28), &[(0, 0, 14)]).is_ok());
+        assert!(check_stage_layers(0, &p, (0, 14), &[]).is_ok());
+
+        // Own stage re-cut, pipeline list from the old cut.
+        let err = check_stage_layers(1, &p, (16, 28), &[]).unwrap_err();
+        assert!(err.to_string().contains("lists 14..28"), "{err}");
+
+        // Re-cut stage 1 rewrote the list; stage 0 on disk is the old cut.
+        let p = layered_pipeline(
+            r#"[{"stage":0,"layer_start":0,"layer_end":16},
+                {"stage":1,"layer_start":16,"layer_end":28}]"#,
+        );
+        let err = check_stage_layers(1, &p, (16, 28), &[(0, 0, 14)]).unwrap_err();
+        assert!(err.to_string().contains("a gap"), "{err}");
+        let err = check_stage_layers(1, &p, (16, 28), &[(0, 0, 18)]).unwrap_err();
+        assert!(err.to_string().contains("an overlap"), "{err}");
+
+        // A list that does not tile 0..num_layers.
+        let p = layered_pipeline(
+            r#"[{"stage":0,"layer_start":0,"layer_end":14},
+                {"stage":1,"layer_start":14,"layer_end":27}]"#,
+        );
+        assert!(check_stage_layers(0, &p, (0, 14), &[]).is_err());
+        let p = layered_pipeline(r#"[{"stage":0,"layer_start":2,"layer_end":14}]"#);
+        assert!(check_stage_layers(1, &p, (14, 28), &[]).is_err());
+
+        // No list (export_shards.py), no siblings, or no stated range.
+        let p = layered_pipeline("[]");
+        assert!(check_stage_layers(1, &p, (14, 28), &[]).is_ok());
+        assert!(check_stage_layers(1, &p, (14, 28), &[(0, 0, 0)]).is_ok());
+        assert!(check_stage_layers(1, &p, (0, 0), &[(0, 0, 3)]).is_ok());
+        assert!(
+            check_stage_layers(1, &p, (20, 20), &[]).is_err(),
+            "empty range"
+        );
     }
 }
