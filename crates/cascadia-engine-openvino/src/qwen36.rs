@@ -3061,8 +3061,9 @@ impl Engine for Qwen36Engine {
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
             });
         }
-        // The API bounds request BYTES; this bounds tokens against the model's window so a
-        // multi-MB prompt is a 413, not an hours-long prefill holding the batch=1 slot.
+        // The API bounds request BYTES; this bounds tokens against the model's window so an
+        // over-window prompt is a 400 `context_length_exceeded`, not an hours-long prefill
+        // holding the batch=1 slot.
         if let Some(max) = self.max_ctx {
             if let Some(tok) = &self.tokenizer {
                 // The SEQUENCE admission prefills, not the bare prompt: it also carries the
