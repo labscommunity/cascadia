@@ -736,7 +736,9 @@ decision tasks share this path, so what follows holds for both.
 stage requests (`reset_all`, a native `recreate_request` per stage after a warm turn) when the
 next task is admitted. A scrub that blocked used to hold the error, the request and the engine.
 A decision pass that fails is the 503 `decision engine error` (or the capacity 503 or 413 an
-engine refusal maps to); chat gets its 5xx.
+engine refusal maps to); chat gets its 5xx. On a single box, a native infer failure is first
+retried once (below), so its 5xx now appears only when the retry fails too or the recovery fails
+the engine.
 
 **The engine's line.** Each failed task logs one `warn` line, `qwen36 task failed`: the task id,
 `phase` (`prefill`, `decode` or `head`), `prompt`, `warm_prefix` (prompt tokens resumed from the
@@ -745,6 +747,45 @@ single-box prefill, decode and decision head, and the pipeline head's prefill, d
 decision. The older per-site lines (`decode failed`, `prefill failed`, ...) remain. The error
 chunk carries the same `warm_prefix` (`Chunk::warm_prefix`, additive, omitted when unknown). The
 engine's text is logged and never returned to the client.
+
+### Retry after a failed infer
+
+On a single box (no pipeline), a task whose native infer fails during its prefill, its decode or
+its decision head is retried once instead of failed. These are the failures that start the
+recovery below (OpenVINO's `unknown C++ exception in infer`, BUG-1, is one). Greedy decode is
+deterministic and a recovered or recompiled stage answers as before, so the retry returns what
+the client would have got. The client sees only the extra latency and no chunk of the failed
+attempt.
+
+- **What is retried.** Only a native infer failure of the task being served. Tokenize errors,
+  refusals, budget and window limits, cancels, and a failure that fails the engine itself (a
+  recompiled stage's first infer) fail the task as before. Each task is retried at most once.
+- **Chat and completions** resume over the tokens already generated: the retry prefills the
+  prompt plus those tokens (the Option B resume path), so `max_tokens` still bounds the whole
+  answer, and decode continues from there. The bytes already sent to the client are carried
+  over, so no text is repeated or lost, even when an incomplete UTF-8 character was being held
+  back. The final chunk's `prompt_tokens` leaves the resumed tokens out, so usage matches an
+  uninterrupted run.
+- **Decision passes** re-run unchanged: a pass sends nothing before its final chunk. No head
+  reads a native infer that sets the failed-infer flag today (the joint head's own infer does
+  not), so in practice it is a failed prefill that a pass retries.
+- **When.** The retry is admitted at once, ahead of every queued task, in the same engine step as
+  the failure. That admission first runs the failed task's scrub and the recovery below (up to
+  30 s of idle wait, plus a recompile bounded by 180 s), exactly as the next task's admission
+  would. Doing it in the failing step keeps the stream alive: the runner closes a stream after 3
+  engine steps in a row that produce nothing (`MAX_CONSECUTIVE_EMPTY_STEPS`), and a decision
+  pass's failed head step is already its second. A step that waits on the recovery is still one
+  step, however long it waits.
+- **When it still fails.** If the recovery fails the engine, the retried task gets the usual
+  `qwen36 engine failed: ...; restart the server` refusal and the server exits for its
+  supervisor (below). If the retry itself fails, the task fails with the usual error plus `(on
+  the retry after an infer failure)`, and the next task's admission runs the scrub, as before.
+- **Logs.** A retry logs one `warn` line, `qwen36: retrying task after infer failure`, with the
+  task id, `phase`, `prompt`, `warm_prefix`, `generated` (tokens so far), `attempt` (2, the retry)
+  and the reason. `qwen36 task failed` is logged only when the task really fails. The per-site
+  `prefill failed` and `decode failed` lines still mark each failed infer.
+
+Pipeline mode does not retry: a failed task on the pipeline head fails as before.
 
 ### After a failed infer
 
@@ -883,7 +924,8 @@ The shim also guards itself:
 - Destroying a runtime leaks a busy request rather than waiting on it, and logs it
   (`action=abandon outcome=leaked`).
 
-**Pipeline mode.** A downstream rank runs the same recovery inside the head's RESET. It
+**Pipeline mode.** A pipeline task whose infer fails is not retried (see [Retry after a failed
+infer](#retry-after-a-failed-infer)). A downstream rank runs the same recovery inside the head's RESET. It
 abandons the stuck request and recompiles the stage the same way, and then acks, so the head's
 task is served. The head sees only a slower ack. The recovery takes up to 30 s of idle wait plus
 the compile (1 to 2 s cache-warm, up to 180 s) for each stuck stage, and the time adds up across
