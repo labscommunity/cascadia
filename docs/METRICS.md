@@ -56,10 +56,10 @@ The `model` label is the shard's `model_id`.
 
 | Name | Type | Labels | Description |
 |---|---|---|---|
-| `cascadia_generation_ttft_seconds` | histogram | `model` | Task submission → first token-bearing chunk **delivered to the consumer**. |
+| `cascadia_generation_ttft_seconds` | histogram | `model` | Task submission → first token-bearing or nonempty text chunk delivered to the consumer. |
 | `cascadia_generation_inter_token_seconds` | histogram | `model` | Gap between consecutive token-bearing chunks of one generation, at delivery. |
 | `cascadia_generation_duration_seconds` | histogram | `model`, `finish_reason` | Submission → terminal outcome. `finish_reason`: `stop`, `length`, `cancelled` (client gone / explicit cancel), `error` (engine fault), `teardown` (server shut down mid-generation). Every admitted generation books exactly one sample, so `sum(rate(..._count))` reconciles with admissions — including across restarts. |
-| `cascadia_tokens_generated_total` | counter | `model` | Model tokens **delivered to clients** (uses the engine's `n_tokens` when set — spec-decode and ov-genai report multi-token chunks correctly). Tokens ground out after a client disconnected, before the cancel lands, are not counted. |
+| `cascadia_tokens_generated_total` | counter | `model` | Tokens counted once at the terminal outcome. A successful engine-reported `completion_tokens` total takes precedence, including reasoning/tool generation; otherwise the runner sums delivered `n_tokens`. On cancellation or error it records only the known partial count, without estimating unseen tokens. |
 | `cascadia_tokens_prompt_total` | counter | `model` | Prompt tokens, for engines that report them on the final chunk. |
 | `cascadia_tasks_cancelled_total` | counter | `model` | Generations abandoned before completion: explicit `/v1/cancel` (including an engine acknowledging with a `Cancelled` final marker) or client disconnect mid-stream. Server teardown is never counted here — a restart is not a client cancellation, and the suppression is deterministic (`close()` flags the shutdown before emptying the engine slot, so poll-first and drop-first orderings agree). Those generations land on `finish_reason="teardown"` instead. |
 | `cascadia_tasks_failed_total` | counter | `model` | Generations that terminated with an engine error. |
@@ -70,6 +70,11 @@ TTFT sample equal to the full generation and no inter-token samples. Read
 `cascadia_generation_ttft_seconds` as generation latency there, not as
 time-to-first-token. Per-token producers (`ov-genai --cb`, `ov-runtime`,
 sparse-moe, mock) populate both histograms as named.
+
+`sycl-llama` SSE fragments are not necessarily individual model tokens. Its
+completion count is finalized from the child's usage; the first visible fragment
+records TTFT, but fragments with unknown token counts do not create inter-token
+samples. The generated-token counter updates at completion.
 
 Timing caveats: chunks carry no engine-side timestamps, so TTFT and
 inter-token gaps are measured when a chunk is **delivered** to the consumer.

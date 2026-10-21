@@ -3115,6 +3115,7 @@ impl OvRuntimeEngine {
                 logprobs: None,
                 n_tokens: None,
                 prompt_tokens: None,
+                completion_tokens: None,
                 error: None,
                 token_ids: Vec::new(),
                 // ov-runtime doesn't yet distinguish length vs stop here; the

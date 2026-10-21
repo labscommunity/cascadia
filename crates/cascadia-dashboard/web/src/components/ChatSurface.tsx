@@ -42,6 +42,7 @@ export function ChatSurface() {
     const startedAt = performance.now();
     let firstChunkAt: number | null = null;
     let totalTokens = 0;
+    let unknownTokenBoundaries = false;
     let assistantText = "";
 
     const controller = new AbortController();
@@ -55,9 +56,14 @@ export function ChatSurface() {
         if (chunk.object === "error") {
           throw new Error(chunk.error.message);
         }
-        if (firstChunkAt === null) firstChunkAt = performance.now();
-        totalTokens += chunk.n_tokens ?? 1;
         const delta = chunk.choices[0]?.delta.content ?? "";
+        if (firstChunkAt === null && delta) firstChunkAt = performance.now();
+        if (delta && chunk.n_tokens === 0) unknownTokenBoundaries = true;
+        if (chunk.completion_tokens != null) {
+          totalTokens = chunk.completion_tokens;
+        } else {
+          totalTokens += chunk.n_tokens ?? (delta ? 1 : 0);
+        }
         assistantText += delta;
 
         setMessages((prev) => {
@@ -69,14 +75,14 @@ export function ChatSurface() {
         const now = performance.now();
         const elapsed = (now - startedAt) / 1000;
         const ttft = firstChunkAt != null ? (firstChunkAt - startedAt) / 1000 : null;
-        // Decode tok/s — tokens AFTER the first (the first token's time is
-        // TTFT, not decode) over the post-TTFT window. Hold off until >1
-        // token AND >50 ms have elapsed so a tiny initial window can't
-        // divide into an absurd thousands-of-tok/s reading.
+        // Known per-token engines expose a decode rate after TTFT. A child
+        // SSE stream only exposes the final total (including hidden thinking),
+        // so use whole-request throughput rather than inventing token timing.
         const decodeWindow = ttft != null ? elapsed - ttft : null;
         const decodeTokens = totalTokens - 1;
-        const tokensPerSecond =
-          decodeWindow != null && decodeWindow > 0.05 && decodeTokens > 0
+        const tokensPerSecond = unknownTokenBoundaries
+          ? elapsed > 0.05 && totalTokens > 0 ? totalTokens / elapsed : null
+          : decodeWindow != null && decodeWindow > 0.05 && decodeTokens > 0
             ? decodeTokens / decodeWindow
             : null;
         setStats({

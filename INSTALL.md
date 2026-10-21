@@ -1,14 +1,15 @@
 # Installing Cascadia
 
-Three ways to run Cascadia, depending on what you want:
+Choose an installation path for your engine:
 
 | Goal | How | Needs |
 | --- | --- | --- |
 | Run it on Intel hardware | **Prebuilt bundle** (below) | an Intel driver; (Linux GPU) the runtime stack |
 | Try it / develop / CI | **Stub mode** build | Rust only |
 | Build real inference yourself | **OpenVINO mode** build | Rust + C++ toolchain + OpenVINO GenAI SDK + (Linux) GPU runtime |
+| Run GGUF models on Intel GPUs | **SYCL llama.cpp build** (below) | Rust + Intel oneAPI + patched `llama-server` + Intel GPU driver |
 
-After any install, run **`cascadia doctor`** — it checks your toolchain and tells you whether OpenVINO can actually see your GPU (a step that fails silently otherwise).
+After any install, run **`cascadia doctor`**. Its OpenVINO and sycl-llama sections check their separate runtime prerequisites.
 
 ---
 
@@ -37,9 +38,30 @@ Python is not needed for inference. It is needed only for `cascadia shard` — w
 
 ---
 
+## GGUF inference with sycl-llama
+
+This engine works in the default Rust build; it does not require OpenVINO.
+Install Intel oneAPI and the Intel GPU driver first, then build both executables:
+
+```bash
+cargo install --path crates/cascadia --locked
+scripts/build-llama-stream.sh ~/llama-stream
+source /opt/intel/oneapi/setvars.sh
+export CASCADIA_LLAMA_BIN=~/llama-stream/build/bin/llama-server
+cascadia doctor
+cascadia run /path/to/model.gguf --engine sycl-llama --elastic --api 127.0.0.1:8080
+```
+
+The existing OpenVINO release bundles do not include this child executable.
+On Windows, use `scripts\build-llama-stream-windows.bat` from a VS 2022 Developer
+Command Prompt with Intel oneAPI installed. See [the engine guide](docs/engines/sycl-llama.md)
+for GPU selection, weight budgets, limitations and runtime setup.
+
+---
+
 ## Stub mode (no OpenVINO)
 
-The fast path. Builds on macOS / Linux / Windows with nothing but Rust. The OpenVINO-backed engines return a clean runtime error; the `mock` engine works, so you can exercise the full API, transport, and multi-stage plumbing.
+The fast path. Builds on macOS / Linux / Windows with nothing but Rust. The OpenVINO-backed engines return a clean runtime error; the `mock` engine works, so you can exercise the full API, transport, and multi-stage plumbing. The same build also runs `sycl-llama` once a patched `llama-server` is available (see above).
 
 ```bash
 rustup default stable        # need 1.89+
