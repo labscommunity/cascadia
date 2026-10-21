@@ -417,7 +417,7 @@ def test_cli_jev_lora_from_adapter_dir_and_no_validate(cli, monkeypatch):
     ad = tmp / "jev" / "adapter_vllm"
     run("jev", "--base-ir", str(base), "--adapter-dir", str(ad), "--out", str(tmp / "t"))
     (_, a, kw, assets_first), = calls
-    assert a == (str(base), str(tmp / "t"), 8, False, None)
+    assert a == (str(base), str(tmp / "t"), 1, False, None)  # Task 58: a single box is one stage
     assert kw == {"weights": None, "lora": os.path.join(str(ad), "adapter_model.safetensors"),
                   "lora_scale": None, "final_hidden": False}
     assert assets_first
@@ -1208,3 +1208,127 @@ def test_cli_jev_without_a_tokenizer_refused_before_any_write(cli, capsys):
         run("jev", "--base-ir", str(base), "--adapter-dir", str(adapter), "--out", str(tmp / "t"))
     assert e.value.code == 2 and "tokenizer.json" in capsys.readouterr().err
     assert calls == [] and not (tmp / "t").exists()
+
+
+# ---------------------------------------------------------------------------
+# Task 58: single-box trees are one stage; the export's peak RAM is checked first
+# ---------------------------------------------------------------------------
+
+GB = 1e9
+# The 9B int8 IR: 8.3 GB of stage weights (docs/decisions.md) plus about 1 GB of text embeddings.
+IR_9B = 9.3 * GB
+
+
+def test_ir_weight_bytes_sums_the_language_model_and_embeddings_bins(tmp_path):
+    (tmp_path / "openvino_language_model.bin").write_bytes(b"x" * 300)
+    (tmp_path / "openvino_text_embeddings_model.bin").write_bytes(b"x" * 20)
+    (tmp_path / "openvino_vision_embeddings_model.bin").write_bytes(b"x" * 5000)  # not exported
+    assert de.ir_weight_bytes(str(tmp_path)) == 320
+    assert de.ir_weight_bytes(str(tmp_path / "missing")) == 0
+
+
+@pytest.mark.parametrize("stages,swap,measured", [
+    (1, False, 8.3), (1, True, 20.3), (1, True, 20.6),  # JEV graft; Kev, Clef --weights swap
+    (8, False, 3.1), (8, True, 5.1), (8, True, 5.3),
+])
+def test_peak_estimate_covers_the_measured_peaks(monkeypatch, stages, swap, measured):
+    # pawan-01, OpenVINO 2026.4.1: exporter process-tree working set, 1 vs 8 stages. The estimate
+    # may overshoot (a refusal names --skip-memory-check) but must not undershoot by much.
+    monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
+    est = de.export_peak_bytes("ir", stages, swap) / GB
+    assert measured <= est <= measured * 1.5, est
+
+
+def test_peak_estimate_shrinks_with_the_stage_count(monkeypatch):
+    monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
+    peaks = [de.export_peak_bytes("ir", n, True) for n in (1, 2, 4, 8)]
+    assert peaks == sorted(peaks, reverse=True) and peaks[0] == int(IR_9B * 2.3)
+
+
+def test_physical_ram_is_read_on_this_machine():
+    ram = de.physical_ram_bytes()
+    assert isinstance(ram, int) and ram > 2**30
+
+
+def test_memory_refusal_names_the_estimate_the_ram_and_the_fallback(monkeypatch):
+    monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
+    why = de.memory_refusal("ir", 1, True, 16 * GB)
+    assert why.startswith("the export needs about 21.4 GB of RAM at --stages 1 (the base IR's 9.3 GB "
+                          "of int8 weights, x2.3 for the --weights swap), but this machine has 16.0 GB")
+    assert "--stages 8" in why and "--skip-memory-check" in why
+    assert de.memory_refusal("ir", 1, True, 32 * GB) is None
+    assert de.memory_refusal("ir", 1, False, 16 * GB) is None  # JEV's graft: about 9.3 GB
+    assert de.memory_refusal("ir", 1, True, None) is None  # RAM unknown: not refused
+
+
+def _clef(monkeypatch):
+    monkeypatch.setattr(de, "write_clef_profile",
+                        lambda cd, out, max_tokens=None: de._write(out, {"family": "clef"}, {"kind": "joint"}))
+
+
+def test_cli_refuses_an_export_larger_than_ram_before_any_write(cli, monkeypatch, capsys):
+    run, calls, base, tmp = cli
+    monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
+    monkeypatch.setattr(de, "physical_ram_bytes", lambda: int(16 * GB))
+    monkeypatch.setattr(de, "write_clef_profile", lambda *a, **kw: pytest.fail("clef profile written"))
+    out = tmp / "t"
+    out.mkdir()
+    (out / "manifest.json").write_text("{}")  # an earlier tree stays as it was
+    with pytest.raises(SystemExit) as e:
+        run("clef", "--base-ir", str(base), "--clef-dir", "C", "--out", str(out))
+    err = capsys.readouterr().err
+    assert e.value.code == 2
+    assert "needs about 21.4 GB of RAM at --stages 1" in err and "this machine has 16.0 GB" in err
+    assert "--stages 8" in err
+    assert calls == [] and (out / "manifest.json").exists() and not (out / "decision.json").exists()
+
+
+def test_cli_exports_when_the_estimate_fits(cli, monkeypatch):
+    run, calls, base, tmp = cli
+    _clef(monkeypatch)
+    monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
+    monkeypatch.setattr(de, "physical_ram_bytes", lambda: int(32 * GB))
+    run("clef", "--base-ir", str(base), "--clef-dir", "C", "--out", str(tmp / "t"))
+    (_, a, _, _), = calls
+    assert a[2] == 1
+
+
+def test_cli_skip_memory_check_overrides_the_refusal(cli, monkeypatch):
+    run, calls, base, tmp = cli
+    _clef(monkeypatch)
+    monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
+    monkeypatch.setattr(de, "physical_ram_bytes", lambda: pytest.fail("RAM read with the check skipped"))
+    run("clef", "--base-ir", str(base), "--clef-dir", "C", "--out", str(tmp / "t"), "--skip-memory-check")
+    (_, a, _, _), = calls
+    assert a[2] == 1
+
+
+@pytest.mark.parametrize("stages", [2, 3, 8])
+def test_cli_stages_n_reaches_run_export_and_shrinks_the_estimate(cli, monkeypatch, stages):
+    # A pipeline passes one stage per rank, and --stages 8 is the low-memory single box: both
+    # unchanged, and each fits where the 1-stage export (21.4 GB) does not.
+    run, calls, base, tmp = cli
+    _clef(monkeypatch)
+    monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
+    monkeypatch.setattr(de, "physical_ram_bytes", lambda: int(16 * GB))
+    run("clef", "--base-ir", str(base), "--clef-dir", "C", "--out", str(tmp / "t"), "--stages", str(stages))
+    (_, a, _, _), = calls
+    assert a[2] == stages
+
+
+def test_cli_jev_graft_is_estimated_without_the_swap_factor(cli, monkeypatch):
+    run, calls, base, tmp = cli
+    monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
+    monkeypatch.setattr(de, "physical_ram_bytes", lambda: int(16 * GB))
+    monkeypatch.setattr(de, "write_jev_profile",
+                        lambda ad, cal, out, max_tokens, tokenizer=None: de._write(out, {"family": "jev"}, {"kind": "verbalizer"}))
+    run("jev", "--base-ir", str(base), "--adapter-dir", str(tmp / "jev" / "adapter_vllm"), "--out", str(tmp / "t"))
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_cli_stages_must_be_positive(cli, capsys, value):
+    run, calls, base, tmp = cli
+    with pytest.raises(SystemExit) as e:
+        run("clef", "--base-ir", str(base), "--clef-dir", "C", "--out", str(tmp / "t"), "--stages", value)
+    assert e.value.code == 2 and "--stages" in capsys.readouterr().err and calls == []
