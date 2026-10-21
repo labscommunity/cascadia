@@ -752,10 +752,16 @@ engine's text is logged and never returned to the client.
 
 On a single box (no pipeline), a task whose native infer fails during its prefill, its decode or
 its decision head is retried once instead of failed. These are the failures that start the
-recovery below (OpenVINO's `unknown C++ exception in infer`, BUG-1, is one). Greedy decode is
-deterministic and a recovered or recompiled stage answers as before, so the retry returns what
-the client would have got. The client sees only the extra latency and no chunk of the failed
-attempt.
+recovery below (OpenVINO's `unknown C++ exception in infer`, BUG-1, is one). The client sees only
+the extra latency and no chunk of the failed attempt. A decision pass re-runs from the start, so
+its answer is the one an uninterrupted pass gives. A chat keeps every byte already sent, but its
+continuation is not always byte-identical to an uninterrupted run: re-prefilling the generated
+tokens takes a different numeric path than decoding them one at a time, so a later near-tie can
+go the other way. On pawan-01 and pawan-03 (Arc 140V, OpenVINO 2026.4.0 as a fault source, 3
+real faults in 240 rounds of 1600 tokens) every retried chat returned 200 with all 1600 tokens
+and differed from the clean runs of the same prompt. A plain-OpenVINO replay of the same resume
+on the 8-stage IRs continued token-identically across the seam and first diverged 93 and 152
+tokens later, both times into a coherent alternative wording.
 
 - **What is retried.** Only a native infer failure of the task being served. Tokenize errors,
   refusals, budget and window limits, cancels, and a failure that fails the engine itself (a
