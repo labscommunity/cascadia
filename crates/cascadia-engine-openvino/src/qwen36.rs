@@ -66,16 +66,22 @@ const STAGE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// for stage6 and 2.5 GB for stage7 of the 9B int8 tree, on a GPU that shares system RAM), so a
 /// fault that recurs cannot exhaust memory: the abandon past this marks the engine failed.
 const MAX_RECOMPILES: usize = 2;
-/// [`MAX_RECOMPILES`] for an engine that runs a single local stage on a single box (a 1-stage
-/// tree, Task 58): its one stage is the whole model, so a recompile leaks about 9 GB on the 9B
-/// int8 tree, and two such leaks are not safe on a box that shares system RAM with the GPU. The
-/// first fault recovers (and the request is retried, Task 57); the second fails the engine, and
-/// the server exits for a supervisor restart (Task 56).
-const SINGLE_STAGE_MAX_RECOMPILES: usize = 1;
+/// [`MAX_RECOMPILES`] for an engine whose recompile would leak more than [`LARGE_LEAK_BYTES`]
+/// (Task 58): two such leaks are not safe on a box that shares system RAM with the GPU. The first
+/// fault recovers (and the request is retried, Task 57); the second fails the engine, and the
+/// server exits for a supervisor restart (Task 56).
+const LARGE_LEAK_MAX_RECOMPILES: usize = 1;
+/// The weight bytes of a local stage (the copy one recompile leaks) above which the engine
+/// recompiles at most [`LARGE_LEAK_MAX_RECOMPILES`] times (Task 58). Measured stage weight files:
+/// the 8-stage 9B int8 tree's largest are 1.49 GB (stage6) and 2.47 GB (stage7), which keep
+/// [`MAX_RECOMPILES`]; a 1-stage 9B tree's one stage is the whole model (about 8.4 GiB), and a
+/// 27B 2-stage pipeline rank's stage is 12-15 GB, which both get the cap of 1 (two leaks of
+/// either can exhaust a 32 GB box).
+const LARGE_LEAK_BYTES: u64 = 4 << 30;
 /// Successful recompiles at which the engine is flagged degraded (Task 54 fix round 3): each one
 /// leaves one leaked stage copy, and two leaked copies cost decode about 16%. A recompile that
 /// fails also leaks a copy, but it fails the engine, so no later recompile can warn. Under
-/// [`SINGLE_STAGE_MAX_RECOMPILES`] only one recompile can succeed, so this never warns there.
+/// [`LARGE_LEAK_MAX_RECOMPILES`] only one recompile can succeed, so this never warns there.
 const DEGRADED_AT_RECOMPILES: usize = 2;
 /// Bound on one stage recompile, run on a helper thread (Task 54 fix round 2). A cold compile
 /// without the model cache can take tens of seconds; a cache-warm one measured 1.2-1.7 s on p01.
@@ -875,10 +881,12 @@ impl Builder for Qwen36Builder {
             .into_iter()
             .map(OvStage::Ov)
             .collect();
-        let cap = recompile_cap(self.total, stages.len());
+        let largest_leak_bytes = largest_leak_bytes(self.emb_recipe.as_ref(), &self.stage_recipes);
+        let cap = recompile_cap(largest_leak_bytes);
         info!(
             total = self.total,
             local_stages = stages.len(),
+            largest_leak_bytes,
             cap,
             "qwen36: stage recompile cap"
         );
@@ -1253,12 +1261,22 @@ impl StageRecipe {
     }
 }
 
-/// The recompile cap of an engine with `local_stages` stages in a pipeline of `total` ranks:
-/// [`SINGLE_STAGE_MAX_RECOMPILES`] for a single box running one stage (each recompile leaks the
-/// whole model), [`MAX_RECOMPILES`] otherwise (each leaks one stage of several).
-fn recompile_cap(total: u32, local_stages: usize) -> usize {
-    if total == 1 && local_stages == 1 {
-        SINGLE_STAGE_MAX_RECOMPILES
+/// The most one recompile of this engine can leak: the largest weight file among its local slots
+/// (the embeddings and its stages; 0 for a file whose size could not be read).
+fn largest_leak_bytes(emb: Option<&StageRecipe>, stages: &[StageRecipe]) -> u64 {
+    emb.into_iter()
+        .chain(stages)
+        .map(|r| r.weight_bytes)
+        .max()
+        .unwrap_or(0)
+}
+
+/// The recompile cap for an engine whose largest recompile leaks `largest_leak_bytes`:
+/// [`LARGE_LEAK_MAX_RECOMPILES`] above [`LARGE_LEAK_BYTES`] (a 1-stage tree, a big pipeline
+/// stage), [`MAX_RECOMPILES`] otherwise.
+fn recompile_cap(largest_leak_bytes: u64) -> usize {
+    if largest_leak_bytes > LARGE_LEAK_BYTES {
+        LARGE_LEAK_MAX_RECOMPILES
     } else {
         MAX_RECOMPILES
     }
@@ -5541,7 +5559,7 @@ mod tests {
             engine_failed: None,
             failure: Default::default(),
             stage_idle_timeout: STAGE_IDLE_TIMEOUT,
-            rebuild: Rebuild::new(None, Vec::new(), recompile_cap(total, 0)),
+            rebuild: Rebuild::new(None, Vec::new(), MAX_RECOMPILES),
             fresh_requests: Vec::new(),
             max_ctx: None,
             refresh_costs: Default::default(),
@@ -7382,6 +7400,15 @@ mod tests {
     /// fresh mock of the same shape that logs into the same event list (with a `recompile` event)
     /// and has its own drop counter. Returns the control for the next compiles.
     fn arm_recompile(e: &mut Qwen36Engine) -> Arc<std::sync::Mutex<RecompileCtl>> {
+        arm_recompile_sized(e, 1000)
+    }
+
+    /// [`arm_recompile`] with every slot's weight file `weight_bytes` long (Task 58: the cap
+    /// follows the largest).
+    fn arm_recompile_sized(
+        e: &mut Qwen36Engine,
+        weight_bytes: u64,
+    ) -> Arc<std::sync::Mutex<RecompileCtl>> {
         type Template = (
             Vec<String>,
             usize,
@@ -7393,7 +7420,7 @@ mod tests {
             xml: xml.to_string(),
             device: "MOCK".to_string(),
             plugin: PluginConfig::new(),
-            weight_bytes: 1000,
+            weight_bytes,
         };
         let mut template = |xml: &str, st: &OvStage| {
             if let OvStage::Mock(m) = st {
@@ -7405,7 +7432,7 @@ mod tests {
             recipe(xml)
         };
         let emb = e.emb.as_ref().map(|st| template("emb", st));
-        let stages = e
+        let stages: Vec<StageRecipe> = e
             .stages
             .iter()
             .enumerate()
@@ -7413,7 +7440,8 @@ mod tests {
             .collect();
         let ctl = Arc::new(std::sync::Mutex::new(RecompileCtl::default()));
         let c = Arc::clone(&ctl);
-        e.rebuild = Rebuild::new(emb, stages, recompile_cap(e.total, e.stages.len()));
+        let cap = recompile_cap(largest_leak_bytes(emb.as_ref(), &stages));
+        e.rebuild = Rebuild::new(emb, stages, cap);
         e.rebuild.factory = Arc::new(move |r: &StageRecipe| {
             let (_, (inputs, width, peak, events)) = templates
                 .iter()
@@ -7973,22 +8001,64 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_recompile_cap_is_one_only_for_a_single_stage_on_a_single_box() {
-        // Task 58: a 1-stage tree's recompile leaks the whole model (about 9 GB on the 9B int8
-        // tree), so a single box running one stage recompiles once; a multi-stage tree or a
-        // pipeline rank (one stage of several) keeps two.
-        assert_eq!(SINGLE_STAGE_MAX_RECOMPILES, 1);
-        assert_eq!(recompile_cap(1, 1), 1);
-        for (total, local) in [(1, 2), (1, 8), (2, 1), (8, 1), (4, 2), (1, 0)] {
-            assert_eq!(
-                recompile_cap(total, local),
-                MAX_RECOMPILES,
-                "{total}/{local}"
-            );
+    /// Task 58: measured stage weight files (bytes).
+    const STAGE6_9B: u64 = 1_490_000_000;
+    const STAGE7_9B: u64 = 2_470_000_000;
+    const WHOLE_9B: u64 = 8_966_000_000; // 7.398 + 0.948 GiB
+    const STAGE_27B: u64 = 13_000_000_000;
+
+    fn recipe_of(weight_bytes: u64) -> StageRecipe {
+        StageRecipe {
+            xml: String::new(),
+            device: "MOCK".to_string(),
+            plugin: PluginConfig::new(),
+            weight_bytes,
         }
-        assert_eq!(mock_box().rebuild.cap, 2, "two local stages");
-        assert_eq!(mock_one_stage_box().rebuild.cap, 1, "one local stage");
+    }
+
+    #[test]
+    fn small_stages_keep_the_cap_of_two() {
+        // Task 58: the 8-stage 9B tree's stages leak at most 2.47 GB each.
+        let stages: Vec<_> = [STAGE6_9B, STAGE7_9B, STAGE6_9B]
+            .into_iter()
+            .map(recipe_of)
+            .collect();
+        let leak = largest_leak_bytes(Some(&recipe_of(1_018_000_000)), &stages);
+        assert_eq!(leak, STAGE7_9B);
+        assert_eq!(recompile_cap(leak), MAX_RECOMPILES);
+        assert_eq!(
+            recompile_cap(LARGE_LEAK_BYTES),
+            2,
+            "the threshold itself keeps 2"
+        );
+        assert_eq!(recompile_cap(0), 2, "unknown sizes keep 2");
+        assert_eq!(mock_box().rebuild.cap, 2);
+    }
+
+    #[test]
+    fn one_big_local_stage_gets_the_cap_of_one() {
+        // Task 58: a 1-stage 9B tree's one stage is the whole model.
+        assert_eq!(LARGE_LEAK_MAX_RECOMPILES, 1);
+        assert_eq!(largest_leak_bytes(None, &[recipe_of(WHOLE_9B)]), WHOLE_9B);
+        assert_eq!(recompile_cap(WHOLE_9B), 1);
+        assert_eq!(mock_one_stage_box().rebuild.cap, 1);
+    }
+
+    #[test]
+    fn a_pipeline_rank_with_a_big_stage_gets_the_cap_of_one() {
+        // Task 58: a 27B 2-stage pipeline rank leaks 12-15 GB per recompile; two of those on a
+        // 32 GB box that shares RAM with the GPU are not safe either.
+        assert_eq!(recompile_cap(STAGE_27B), 1);
+        for (bytes, cap) in [(STAGE_27B, 1), (STAGE7_9B, 2)] {
+            let mut relay = bare_engine(2, "{}");
+            relay.stages = vec![OvStage::Mock(MockStage::new(
+                &LAST_STAGE_INPUTS,
+                MOCK_VOCAB,
+                Some(1),
+            ))];
+            arm_recompile_sized(&mut relay, bytes);
+            assert_eq!(relay.rebuild.cap, cap, "{bytes}");
+        }
     }
 
     /// Task 58: a single box over one mock IR (a 1-stage tree), recompile armed.
@@ -8003,7 +8073,7 @@ mod tests {
         let s0 = MockStage::new(&FIRST_STAGE_INPUTS, MOCK_VOCAB, Some(1));
         e.emb = Some(OvStage::Mock(emb));
         e.stages = vec![OvStage::Mock(s0)];
-        arm_recompile(&mut e);
+        arm_recompile_sized(&mut e, WHOLE_9B);
         e
     }
 
@@ -8020,13 +8090,13 @@ mod tests {
     }
 
     #[test]
-    fn a_single_stage_box_recovers_once_and_its_second_abandon_fails_the_engine() {
+    fn a_box_with_one_big_stage_recovers_once_and_its_second_abandon_fails_the_engine() {
         // Task 58: the first fault recovers (one recompile) and Task 57 retries the request, which
         // is served; the second abandon is past the cap of one, so the engine fails (Task 56: the
         // server exits for a supervisor restart) instead of leaking a second whole-model copy.
         let mut e = mock_one_stage_box();
         e.stage_idle_timeout = Duration::from_millis(100);
-        let ctl = arm_recompile(&mut e);
+        let ctl = arm_recompile_sized(&mut e, WHOLE_9B);
         assert_eq!(e.rebuild.cap, 1);
         let watched = e.failure();
 
@@ -8066,7 +8136,10 @@ mod tests {
         assert!(e.engine_failed.is_some());
         assert_eq!(watched.reason(), e.engine_failed);
         assert!(matches!(e.stages[0], OvStage::Gone("recovery")));
-        assert_eq!((e.rebuild.leaked_copies, e.rebuild.leaked_bytes), (2, 2000));
+        assert_eq!(
+            (e.rebuild.leaked_copies, e.rebuild.leaked_bytes),
+            (2, 2 * WHOLE_9B)
+        );
     }
 
     #[test]

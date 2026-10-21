@@ -654,13 +654,15 @@ python tools/decision_export.py clef --base-ir STOCK_INT8_IR \
   IR's int8 weight files (`openvino_language_model.bin` plus `openvino_text_embeddings_model.bin`,
   7.40 + 0.95 = 8.35 GiB for Qwen3.5-9B): 2.5 times their size with `--weights` (Kev, Clef; the
   measured peaks are 2.43 and 2.47 times), 1.0 times without (JEV's graft; measured 0.99 times),
-  divided by `--stages N` down to a floor of 0.38 of that (the 8-stage peaks are 0.25-0.37 of the
-  1-stage ones). That covers every measured peak above: 20.9 GiB for a 1-stage swap, 8.35 GiB for
+  times the largest stage's share of the layers (1/N for `--stages N`; with an uneven
+  `--layer-split`, the biggest stage's layers over all layers), down to a floor of 0.38 (the
+  8-stage peaks are 0.25-0.37 of the 1-stage ones). That covers every measured peak above: 20.9 GiB for a 1-stage swap, 8.35 GiB for
   JEV, 7.9 and 3.2 GiB at 8 stages. When the estimate exceeds the machine's physical RAM, the
   export is refused: `the export needs about 20.9 GiB of RAM at --stages 1 (the base IR's 8.3 GiB
   of int8 weights, x2.5 for the --weights swap), but this machine has 16.0 GiB: export with
-  --stages 8 instead ...`.
-  `--skip-memory-check` exports anyway. When the RAM cannot be read, nothing is refused. The check
+  --stages 8 instead ...`. An export that already uses 8 or more stages is told to use more stages
+  (or an even split) or `--skip-memory-check` instead, since the estimate does not fall below the
+  floor. `--skip-memory-check` exports anyway. When the RAM cannot be read, nothing is refused. The check
   uses only the Python standard library (`sysconf` on Linux and macOS, `GlobalMemoryStatusEx` on
   Windows).
 - A 1-stage tree also loads slower (warm load to `API serving` 21-24 s against 7-13 s for 8
@@ -885,15 +887,17 @@ so its supervisor restarts it (below):
   a second recompile might have served.
 - This engine has already recompiled as many stages as its cap, and another request is
   abandoned. The cap is per engine (one engine per process in production). Each recompile leaks
-  a stage's weights, so the cap stops a fault that recurs from exhausting memory. It is 2
-  (`MAX_RECOMPILES`), or 1 (`SINGLE_STAGE_MAX_RECOMPILES`) when the engine runs a single local
-  stage on a single box (a 1-stage tree), where a recompile leaks the whole model (about 9 GB)
-  and two such leaks are not safe on a GPU that shares the host's RAM. There the first fault
-  recovers and the request is retried (above); the second fails the engine, and the server exits
-  for a supervisor restart (below), about 22 s warm for a 1-stage tree. A multi-stage tree, and a
-  pipeline rank that runs one stage of several, keep 2. The engine logs its cap at load
-  (`qwen36: stage recompile cap`, with `total`, `local_stages` and `cap`), and every `recompile`
-  recovery line carries `recompiled` and `cap`.
+  a stage's weights, so the cap stops a fault that recurs from exhausting memory. The cap follows
+  the size of what one recompile would leak, the largest weight file among the engine's local
+  stages and embeddings: 1 (`LARGE_LEAK_MAX_RECOMPILES`) above 4 GiB (`LARGE_LEAK_BYTES`), else 2
+  (`MAX_RECOMPILES`). The 8-stage 9B tree's stages (1.49 GB for stage6, 2.47 GB for stage7) keep
+  2. A 1-stage 9B tree (the single-box default; its one stage is the whole model, about 9 GB) and
+  a 27B 2-stage pipeline rank (12-15 GB per stage) get 1: two such leaks are not safe on a GPU
+  that shares the host's RAM. There the first fault recovers and the request is retried (above);
+  the second fails the engine, and the server exits for a supervisor restart (below), about 22 s
+  warm for a 1-stage 9B tree. The engine logs its cap at load (`qwen36: stage recompile cap`, with
+  `total`, `local_stages`, `largest_leak_bytes` and `cap`), and every `recompile` recovery line
+  carries `recompiled` and `cap`.
 - The request could not be abandoned (the shim is out of memory), or its state cannot be read.
 
 A failed engine fails the task that ran the recovery, and every later one at once, with
@@ -933,8 +937,8 @@ degraded: 2 stage copies leaked by fault recovery (N bytes); decode is slower un
 restarts (measured +16% with two on an Arc 140V); restart recommended`, with `leaked_copies`,
 `leaked_bytes` and `cap` fields. The rule keys on successful recompiles: a recovery that fails
 also leaks a copy, but it fails the engine, so no later recompile can warn. With the cap of 1 (a
-1-stage tree) only one recompile can succeed, so this warning never fires there: the one leaked
-whole-model copy (about 9 GB) stays until the restart, and the next fault fails the engine instead
+1-stage tree, or a big pipeline stage) only one recompile can succeed, so this warning never fires
+there: the one leaked copy (about 9 GB for a 1-stage 9B tree) stays until the restart, and the next fault fails the engine instead
 of leaking a second. Its decode cost was not measured. The code would name a
 helper thread leaked by a timed-out recompile in the text, but that cannot happen today: a
 timed-out recompile fails the engine. The API process's `/metrics` exposes
