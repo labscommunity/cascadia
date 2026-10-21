@@ -649,15 +649,17 @@ python tools/decision_export.py clef --base-ir STOCK_INT8_IR \
   A pipeline passes one per rank (`--stages 2` for two machines), as before. `--stages 8` cuts a
   single-box tree for a machine with too little RAM for the 1-stage export: the export then holds
   one stage at a time. Exporter peak RAM (process tree working set) measured on pawan-01, 1 stage
-  against 8: JEV 8.3 against 3.1 GB, Kev 20.3 against 5.1 GB, Clef-flash 20.6 against 5.3 GB.
+  against 8: JEV 8.25 against 3.1 GiB, Kev 20.3 against 5.1 GiB, Clef-flash 20.6 against 5.3 GiB.
 - The exporter checks its memory before it writes anything. It estimates its peak RAM from the base
   IR's int8 weight files (`openvino_language_model.bin` plus `openvino_text_embeddings_model.bin`,
-  about 9.3 GB for Qwen3.5-9B): 2.3 times their size with `--weights` (Kev, Clef), 1.0 times
-  without (JEV's graft), divided by `--stages N` down to a floor of 0.35 of that (the 8-stage
-  peaks are about a third of the 1-stage ones). That covers the measured peaks above with a few
-  percent to spare. When the estimate exceeds the machine's physical RAM, the export is refused:
-  `the export needs about 21.4 GB of RAM at --stages 1 (the base IR's 9.3 GB of int8 weights, x2.3
-  for the --weights swap), but this machine has 16.0 GB: export with --stages 8 instead ...`.
+  7.40 + 0.95 = 8.35 GiB for Qwen3.5-9B): 2.5 times their size with `--weights` (Kev, Clef; the
+  measured peaks are 2.43 and 2.47 times), 1.0 times without (JEV's graft; measured 0.99 times),
+  divided by `--stages N` down to a floor of 0.38 of that (the 8-stage peaks are 0.25-0.37 of the
+  1-stage ones). That covers every measured peak above: 20.9 GiB for a 1-stage swap, 8.35 GiB for
+  JEV, 7.9 and 3.2 GiB at 8 stages. When the estimate exceeds the machine's physical RAM, the
+  export is refused: `the export needs about 20.9 GiB of RAM at --stages 1 (the base IR's 8.3 GiB
+  of int8 weights, x2.5 for the --weights swap), but this machine has 16.0 GiB: export with
+  --stages 8 instead ...`.
   `--skip-memory-check` exports anyway. When the RAM cannot be read, nothing is refused. The check
   uses only the Python standard library (`sysconf` on Linux and macOS, `GlobalMemoryStatusEx` on
   Windows).
@@ -1048,8 +1050,8 @@ weights exported both ways:
 | Clef-flash | 1.38 → 1.17 s (-15.0%) | 188.7 → 174.2 s (-7.7%) | 82/82 |
 
 `bench_cases.py compare` found no confident flips between the two layouts. The costs: warm load
-to `API serving` 21-24 s against 7-13 s; exporter peak RAM 8.3 / 20.3 / 20.6 GB against 3.1 / 5.1
-/ 5.3 GB (JEV / Kev / Clef-flash), which is why a low-memory machine exports `--stages 8`; and a
+to `API serving` 21-24 s against 7-13 s; exporter peak RAM 8.25 / 20.3 / 20.6 GiB against 3.1 / 5.1
+/ 5.3 GiB (JEV / Kev / Clef-flash), which is why a low-memory machine exports `--stages 8`; and a
 fault recovery leaks the whole model (about 9 GB) instead of one stage (1.5-2.5 GB), so the engine
 recompiles at most once (see [Engine failures](#engine-failures)). On OpenVINO 2026.4.0 the
 1-stage tree also ran 0 BUG-1 faults in 100 rounds, where 8 stages fault in about 3% of rounds.
@@ -1297,8 +1299,9 @@ python tools/decision_export.py clef --base-ir ~/models/qwen38-27b-int8 --weight
 ```
 
 The export holds a whole stage's new int8 constants (12–15 GB) and needs about 16 GB free. The exporter's
-memory check, calibrated on the 9B exports, estimates about 32 GB here (2.3 times the 28 GB of int8
-weights, halved for 2 stages), at the limit of a 32 GB host; if it refuses, pass `--skip-memory-check`. Serve it with the two `cascadia worker` commands shown for JEV-27B.
+memory check, calibrated on the 9B exports, estimates 31.3 GiB here (2.5 times the 25.1 GiB of int8
+weights, 23.88 + 1.19 GiB, halved for 2 stages): just under pawan-01's 31.58 GiB, so it passes there; on a
+host with less, pass `--skip-memory-check`. Serve it with the two `cascadia worker` commands shown for JEV-27B.
 
 **Measured parity** (same two hosts and set as JEV-27B; one joint pass per record, 50 passes for 82
 questions):
