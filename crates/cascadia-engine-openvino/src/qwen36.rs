@@ -911,6 +911,7 @@ impl Builder for Qwen36Builder {
             decision_scrub_deferred: false,
             infer_failed: false,
             engine_failed: None,
+            failure: Default::default(),
             stage_idle_timeout: STAGE_IDLE_TIMEOUT,
             rebuild: Rebuild::new(self.emb_recipe, self.stage_recipes),
             fresh_requests: Vec::new(),
@@ -1818,6 +1819,11 @@ pub struct Qwen36Engine {
     /// `backend error`, a 5xx at the API), and nothing touches the stage requests again. Only a
     /// restart clears it.
     engine_failed: Option<String>,
+    /// Task 56: rank 0 / single box marks this with the `engine_failed` reason
+    /// ([`Self::fail_engine`]) so the server exits for a supervisor restart. Handed out by
+    /// `failure()`, read without the engine lock. A relay rank exits through
+    /// [`Self::relay_engine_failed`] instead and never marks it.
+    failure: cascadia_engine::EngineFailure,
     /// [`STAGE_IDLE_TIMEOUT`]; shorter in tests.
     stage_idle_timeout: Duration,
     /// How to recompile a faulted stage, and how many times this engine has (Task 54 fix round 2).
@@ -2118,7 +2124,7 @@ impl Qwen36Engine {
             if let Err((e, why)) = first_infer_bounded(Slot::Emb, emb, self.stage_idle_timeout) {
                 self.rebuild.note_leaked(Slot::Emb);
                 self.infer_failed = true;
-                self.engine_failed = Some(why);
+                self.fail_engine(why);
                 return Err(map_ov(e));
             }
         } else if let Err(e) = emb.infer() {
@@ -2210,20 +2216,19 @@ impl Qwen36Engine {
             let r = if fresh {
                 // A recompiled stage's first infer: bounded, and any failure fails the engine (Task 54).
                 self.fresh_requests.retain(|s| *s != Slot::Stage(j));
-                first_infer_bounded(Slot::Stage(j), st, self.stage_idle_timeout).map_err(
-                    |(e, why)| {
-                        self.rebuild.note_leaked(Slot::Stage(j));
-                        self.engine_failed = Some(why);
-                        e
-                    },
-                )
+                first_infer_bounded(Slot::Stage(j), st, self.stage_idle_timeout)
+                    .map_err(|(e, why)| (e, Some(why)))
             } else {
-                st.infer()
+                st.infer().map_err(|e| (e, None))
             };
             if let Some(s) = self.timing.stage_infer.get_mut(j) {
                 *s += t_inf.elapsed();
             }
-            if let Err(e) = r {
+            if let Err((e, failed)) = r {
+                if let Some(why) = failed {
+                    self.rebuild.note_leaked(Slot::Stage(j));
+                    self.fail_engine(why);
+                }
                 self.infer_failed = true;
                 return Err(map_ov(e));
             }
@@ -2399,11 +2404,21 @@ impl Qwen36Engine {
                 );
             }
             error!(reason = %failed, "qwen36: engine failed; every later task is refused until a restart");
-            self.engine_failed = Some(failed);
+            self.fail_engine(failed);
             return false;
         }
         self.infer_failed = false;
         true
+    }
+
+    /// Fail the engine (`engine_failed`) with `why`. Rank 0 / single box also marks `failure`, so
+    /// the server exits and the supervisor restarts it (Task 56); a relay rank already exits
+    /// through [`Self::relay_engine_failed`].
+    fn fail_engine(&mut self, why: String) {
+        if self.rank == 0 {
+            self.failure.set(why.clone());
+        }
+        self.engine_failed = Some(why);
     }
 
     /// The refusal every task gets once the engine has failed (`engine_failed`): at once, as a
@@ -4711,6 +4726,10 @@ impl Engine for Qwen36Engine {
         Some(std::sync::Arc::clone(&self.kv_handoff)
             as std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>)
     }
+
+    fn failure(&self) -> cascadia_engine::EngineFailure {
+        self.failure.clone()
+    }
 }
 
 #[cfg(feature = "kv_coord")]
@@ -5378,6 +5397,7 @@ mod tests {
             decision_scrub_deferred: false,
             infer_failed: false,
             engine_failed: None,
+            failure: Default::default(),
             stage_idle_timeout: STAGE_IDLE_TIMEOUT,
             rebuild: Rebuild::new(None, Vec::new()),
             fresh_requests: Vec::new(),
@@ -6953,6 +6973,8 @@ mod tests {
         residue: bool,
         /// Task 55: `set_state_blob` refuses, as the shim does on a state-count mismatch.
         refuse_set: bool,
+        /// Task 56: `abandon_request` fails, so the request can be neither idled nor abandoned.
+        refuse_abandon: bool,
     }
 
     impl Drop for MockStage {
@@ -6982,6 +7004,7 @@ mod tests {
                 ran: false,
                 residue: false,
                 refuse_set: false,
+                refuse_abandon: false,
             }
         }
         pub(super) fn input_names(&self) -> cascadia_ov_genai_shim::Result<Vec<String>> {
@@ -7046,6 +7069,11 @@ mod tests {
         }
         pub(super) fn abandon_request(&mut self) -> cascadia_ov_genai_shim::Result<()> {
             self.events.lock().unwrap().push("abandon");
+            if self.refuse_abandon {
+                return Err(cascadia_ov_genai_shim::Error::Native(
+                    "abandon refused (test)".into(),
+                ));
+            }
             self.abandoned = true;
             Ok(())
         }
@@ -7634,6 +7662,11 @@ mod tests {
                 "{what}: recompiled, then served: {after:?}"
             );
             assert!(e.engine_failed.is_none() && !e.stages_dirty, "{what}");
+            assert_eq!(
+                e.failure().reason(),
+                None,
+                "{what}: a recovery is not a failure"
+            );
             assert_eq!(e.rebuild.recompiled, 1, "{what}");
             assert!(
                 e.fresh_requests.is_empty(),
@@ -7718,6 +7751,7 @@ mod tests {
         assert_eq!((e.rebuild.cap, MAX_RECOMPILES), (2, 2));
         e.stage_idle_timeout = Duration::from_millis(100);
         let ctl = arm_recompile(&mut e);
+        let watched = e.failure();
         for round in 1..=2 {
             stuck_on_next_infer(&mut e);
             e.submit(chat("fails")).unwrap();
@@ -7726,6 +7760,7 @@ mod tests {
             let c = run_to_final(&mut e);
             assert!(c.error.is_none(), "round {round}: {c:?}");
             assert_eq!(e.rebuild.recompiled, round);
+            assert_eq!(watched.reason(), None, "round {round}: recovered");
         }
         let events = stuck_on_next_infer(&mut e);
         let old_drops = drops_of(mock1(&mut e));
@@ -7747,6 +7782,8 @@ mod tests {
         assert_eq!(ctl.lock().unwrap().built, ["stage1", "stage1"]);
         assert_eq!(e.rebuild.recompiled, 2);
         assert!(e.engine_failed.is_some());
+        // Task 56: the handle grabbed before the failure carries the same reason.
+        assert_eq!(watched.reason(), e.engine_failed);
 
         // Every later task, either route: refused at once, nothing touches a stage.
         let n = events.lock().unwrap().len();
@@ -7774,6 +7811,35 @@ mod tests {
             0,
             "the cap-refused copy is never dropped, even with the engine"
         );
+    }
+
+    #[test]
+    fn a_request_that_cannot_be_abandoned_fails_the_engine_and_reports_it() {
+        // Task 56: a stuck request whose abandon fails is not recompiled; the engine fails, and
+        // rank 0 reports it on the handle the server watches, with the same reason.
+        let mut e = mock_box();
+        e.stage_idle_timeout = Duration::from_millis(100);
+        let watched = e.failure();
+        stuck_on_next_infer(&mut e);
+        mock1(&mut e).refuse_abandon = true;
+        e.submit(chat("c1")).unwrap();
+        assert!(run_to_final(&mut e).error.is_some());
+        assert_eq!(
+            watched.reason(),
+            None,
+            "a failed task alone is not a failed engine"
+        );
+        e.submit(chat("c2")).unwrap();
+        let c = run_to_final(&mut e);
+        let why = c.error.as_deref().expect("refused");
+        assert!(
+            why.contains("abandon failed: ") && why.contains("abandon refused (test)"),
+            "{why}"
+        );
+        let reason = e.engine_failed.clone().expect("the engine is failed");
+        assert!(reason.contains("abandon failed"), "{reason}");
+        assert_eq!(watched.reason(), Some(reason));
+        assert_eq!(e.rebuild.recompiled, 0);
     }
 
     #[test]
@@ -7837,6 +7903,8 @@ mod tests {
         assert_eq!((e.rebuild.leaked_copies, e.rebuild.leaked_bytes), (1, 1000));
         assert_eq!(e.rebuild.recompiles_ok, 0);
         assert!(!e.rebuild.degraded_warned);
+        assert!(e.engine_failed.is_some());
+        assert_eq!(e.failure().reason(), e.engine_failed);
         let t0 = Instant::now();
         e.submit(chat("c3")).unwrap();
         assert_eq!(run_to_final(&mut e).error.as_deref(), Some(why));
@@ -7874,6 +7942,8 @@ mod tests {
         );
         assert!(matches!(e.stages[1], OvStage::Gone("recompile")));
         assert_eq!(dropped(&old_drops), 0);
+        assert!(e.engine_failed.is_some());
+        assert_eq!(e.failure().reason(), e.engine_failed);
         let t0 = Instant::now();
         e.submit(chat("c3")).unwrap();
         assert_eq!(run_to_final(&mut e).error.as_deref(), Some(why));
@@ -7900,6 +7970,7 @@ mod tests {
             reason.starts_with("stage1 was recompiled and its first infer failed"),
             "{reason}"
         );
+        assert_eq!(e.failure().reason(), Some(reason));
         e.submit(chat("c3")).unwrap();
         let c = run_to_final(&mut e);
         assert!(
@@ -8034,6 +8105,7 @@ mod tests {
             "{reason}"
         );
         assert!(matches!(e.emb, Some(OvStage::Gone("first_infer"))));
+        assert_eq!(e.failure().reason().as_deref(), Some(reason.as_str()));
         assert_eq!(ctl.lock().unwrap().built, ["emb"]);
         let ev = events.lock().unwrap().clone();
         let i = ev
@@ -8494,6 +8566,8 @@ mod tests {
             match relay.step() {
                 Err(e) if e.is_connection_fatal() => {
                     let failed = relay.engine_failed.is_some();
+                    // Task 56: a relay exits through this error, never through the handle.
+                    assert_eq!(relay.failure().reason(), None);
                     drop(relay); // the process exit closes the socket
                     return (e.to_string(), failed);
                 }

@@ -49,6 +49,10 @@ NSSM's graceful-stop sequence (console event, then `WM_CLOSE`, then `TerminatePr
 
 > Note: Windows OpenSSH spawns processes in Session 0 / Services context that die when the SSH session closes. Always use NSSM (or Task Scheduler `/RU SYSTEM`) for production workers — never rely on `start /B` over SSH.
 
+## Engine failure restarts
+
+A rank-0 qwen35 engine that fails for good (a stage fault recovery that cannot recover; see [Engine failures](../decisions.md#engine-failures)) makes the worker log `engine failed; exiting so the supervisor restarts the server`, give in-flight responses 3 s, close, and exit non-zero. Both units above already restart on a non-zero exit (systemd `Restart=on-failure`, NSSM `AppExit Default Restart`); nothing needs changing. A warm restart measured about 5 s to `API serving`, after the unit's own `RestartSec=5` under systemd. Under systemd the 3-starts-per-minute cap still applies, so an engine that fails again at once is left stopped after the third start. A relay rank already exits non-zero on its own engine failure. Pass `--keep-serving-on-engine-failure` to keep a failed engine up for debugging instead (every request then gets a 5xx).
+
 ## macOS (launchd)
 
 For dev only — there is no Intel GPU runtime on macOS, so use the `mock` engine (or a stub build). A minimal `~/Library/LaunchAgents/com.cascadia.worker.plist`:

@@ -800,7 +800,8 @@ If either does not return in time, its thread and whatever it holds are leaked, 
 and the engine fails. The scrub's `reset_state` and `recreate_request` on the other stages are
 not bounded: they run on compiled models that did not fault.
 
-**When a restart is still needed.** The engine fails in these cases:
+**When a restart is still needed.** The engine fails in these cases, and the server then exits
+so its supervisor restarts it (below):
 
 - The recompile fails, does not return within 180 s, or its helper thread dies.
 - A recompiled stage's first infer fails, or does not return within 30 s. The device is then
@@ -816,8 +817,23 @@ A failed engine fails the task that ran the recovery, and every later one at onc
 `backend error: qwen36 engine failed: <reason>; restart the server`. For example: `stage6's
 infer request was still Cancelled ... abandoned; this engine has already recompiled 2 stages,
 the cap of 2, so stage6 is not recompiled`, or `...; recompiling stage6 timed out after 180000
-ms`. Chat and decisions return their 5xx. `/health` keeps answering, and reports `degraded`
-after a failed completion. Only a restart recovers it.
+ms`. Chat and decisions return their 5xx. Only a restart recovers it.
+
+**The server exits so the supervisor restarts it.** On rank 0 or a single box (`cascadia worker
+--api` and `cascadia run`), the server notices the failure within 200 ms and logs one `error`
+line: `engine failed; exiting so the supervisor restarts the server`, with the reason. It stops
+accepting connections, gives the responses already in flight 3 s to reach their clients (the
+failing request's 5xx and any requests already refused), runs the same bounded close as a
+SIGTERM (up to 10 s), and exits non-zero. Both production units restart on a non-zero exit:
+systemd's `Restart=on-failure` and NSSM's `AppExit Default Restart` (see
+[docs/deploy/README.md](deploy/README.md)). A warm restart (model cache warm) measured about 5 s
+to `API serving` on pawan-03, after the supervisor's own delay (systemd `RestartSec=5`). Requests that arrive while the server is down get a connection
+refused, so clients should retry. A SIGTERM or SIGINT still exits 0. Only qwen35 reports a
+failed engine; the other engines never do.
+
+To debug a failed engine in place, pass `--keep-serving-on-engine-failure` (worker and `run`).
+The server then stays up as before Task 56: it refuses every request with a 5xx, and `/health`
+keeps answering and reports `degraded` after a failed completion.
 
 **After a second recovery the engine is slower.** On pawan-01 (Arc 140V), an engine that holds two
 leaked stage copies (about 3.2 GB) decodes 12-20% slower per stage, the embeddings about 2x, and a
@@ -855,8 +871,9 @@ Its outcome is `ok`, `failed`, `timeout` or `refused: cap`. The recompiled stage
 logs `first_infer` with `ok`, `failed`, `timeout` or `helper thread died`. The scrub logs
 `skipped: recompiled` for the fresh stage. A worst-case recovery therefore takes up to 30 s for
 the idle wait plus 180 s for the compile plus 30 s for the first infer, and each wait is
-bounded. A failed engine also logs `qwen36: engine failed` once, and `refusing task (engine
-failed)` per task.
+bounded. A failed engine also logs `qwen36: engine failed` once, `refusing task (engine
+failed)` per task, and, unless the server keeps serving, the server's `engine failed; exiting`
+line.
 
 The shim also guards itself:
 
