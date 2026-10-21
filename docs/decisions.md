@@ -827,9 +827,11 @@ failing request's 5xx and any requests already refused), runs the same bounded c
 SIGTERM (up to 10 s), and exits non-zero. Both production units restart on a non-zero exit:
 systemd's `Restart=on-failure` and NSSM's `AppExit Default Restart` (see
 [docs/deploy/README.md](deploy/README.md)). A warm restart (model cache warm) measured about 5 s
-to `API serving` on pawan-03, after the supervisor's own delay (systemd `RestartSec=5`). Requests that arrive while the server is down get a connection
-refused, so clients should retry. A SIGTERM or SIGINT still exits 0. Only qwen35 reports a
-failed engine; the other engines never do.
+to `API serving` on pawan-03, after the supervisor's own delay (systemd `RestartSec=5`). If
+the close overruns its 10 s, the process exits non-zero at once instead of waiting on it.
+Requests that arrive while the server is down get a connection refused, so clients should
+retry. A SIGTERM or SIGINT still exits 0. Only qwen35 reports a failed engine; the other
+engines never do.
 
 To debug a failed engine in place, pass `--keep-serving-on-engine-failure` (worker and `run`).
 The server then stays up as before Task 56: it refuses every request with a 5xx, and `/health`
