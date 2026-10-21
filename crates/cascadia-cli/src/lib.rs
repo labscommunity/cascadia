@@ -1972,14 +1972,39 @@ async fn engine_failed(failure: Option<cascadia_engine::EngineFailure>) -> Strin
     }
 }
 
+/// Bound on `runner.close()` at shutdown, signal or engine failure alike.
+const SHUTDOWN_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The `--keep-serving-on-engine-failure` wiring: the failure handle the serve loop watches, or
+/// `None` when the operator asked to keep a failed engine up. The handle was grabbed once at load,
+/// so watching it never takes the engine lock.
+fn watched_failure(args: &WorkerArgs, runner: &Runner) -> Option<cascadia_engine::EngineFailure> {
+    (!args.keep_serving_on_engine_failure).then(|| runner.engine_failure())
+}
+
+/// Task 56 fix round 1: end the process at once with a non-zero code. Used only when the close
+/// after an engine failure overruns its bound: returning would let `main` drop the tokio runtime,
+/// and that drop waits on the still-blocked close task (after a native fault a request's
+/// destructor can block forever), so the process would never exit and never be restarted.
+fn force_exit_after_engine_failure() {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(1);
+}
+
 /// Serve the API until a SIGTERM/SIGINT (`Ok`, exit 0) or, with `failure` watched, until the
 /// engine fails for good (`Err`, a non-zero exit, so systemd `Restart=on-failure` and NSSM restart
-/// the server). Either way the same bounded `runner.close()` runs last.
+/// the server). Either way the same bounded `runner.close()` runs last. After an engine failure,
+/// a close that overruns `close_timeout` calls `force_exit` ([`force_exit_after_engine_failure`]
+/// in production) instead of returning; the signal path keeps today's behaviour.
 async fn serve_until_shutdown(
     serve: impl std::future::Future<Output = Result<()>>,
     shutdown_signal: impl std::future::Future<Output = ShutdownSignal>,
     failure: Option<cascadia_engine::EngineFailure>,
     grace: std::time::Duration,
+    close_timeout: std::time::Duration,
+    force_exit: impl FnOnce(),
     runner: Arc<Runner>,
 ) -> Result<()> {
     // Race the axum serve against SIGTERM/SIGINT. Without this,
@@ -2018,20 +2043,32 @@ async fn serve_until_shutdown(
     // sync (parking_lot::Mutex) and may block_on async transport
     // teardown internally; dispatch via spawn_blocking so the timer
     // can actually fire, then await with a deadline. On timeout we
-    // log loudly and return — the process exit will SIGKILL any
-    // straggler threads, which is the right outcome at that point.
-    const SHUTDOWN_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    // log loudly and stop waiting here, but the close task keeps its
+    // thread: when `main` drops the tokio runtime, that drop waits for
+    // it. A close that never returns therefore still holds the process
+    // up on the signal path (the supervisor's stop timeout kills it).
+    // After an engine failure nobody is stopping the process, so the
+    // overrun forces the exit instead (`force_exit`).
     let close_task = tokio::task::spawn_blocking(move || runner.close());
-    match tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, close_task).await {
+    match tokio::time::timeout(close_timeout, close_task).await {
         Ok(Ok(())) => info!("runner.close() complete"),
         Ok(Err(join_err)) => tracing::warn!(
             error = %join_err,
             "runner.close() task panicked"
         ),
-        Err(_) => tracing::warn!(
-            timeout_s = SHUTDOWN_CLOSE_TIMEOUT.as_secs(),
-            "runner.close() exceeded timeout; abandoning teardown"
-        ),
+        Err(_) => {
+            tracing::warn!(
+                timeout_s = close_timeout.as_secs_f64(),
+                "runner.close() exceeded timeout; abandoning teardown"
+            );
+            if let Some(reason) = &engine_failure {
+                error!(
+                    reason = %reason,
+                    "engine failed and runner.close() overran; forcing a non-zero exit"
+                );
+                force_exit();
+            }
+        }
     }
     match engine_failure {
         Some(reason) => Err(anyhow!(
@@ -2651,14 +2688,16 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // orphaned processes under systemd / k8s.
         let shutdown_signal =
             install_shutdown_signal_handler().context("install_shutdown_signal_handler")?;
-        // Task 56: watch the engine's failure handle (grabbed once at load, so never the engine
-        // lock) unless the operator asked to keep a failed engine up.
-        let failure = (!args.keep_serving_on_engine_failure).then(|| runner.engine_failure());
+        // Task 56: watch the engine's failure handle unless the operator asked to keep a failed
+        // engine up.
+        let failure = watched_failure(&args, &runner);
         return serve_until_shutdown(
             serve_with_nodelay(listener, app),
             shutdown_signal,
             failure,
             ENGINE_FAILED_GRACE,
+            SHUTDOWN_CLOSE_TIMEOUT,
+            force_exit_after_engine_failure,
             runner,
         )
         .await;
@@ -3765,8 +3804,9 @@ mod engine_failure_tests {
     use cascadia_types::{Chunk, TaskId};
     use std::time::{Duration, Instant};
 
-    /// A fake engine whose failure handle the test sets, as qwen36 sets its own.
-    struct FailingLater(EngineFailure);
+    /// A fake engine whose failure handle the test sets, as qwen36 sets its own. Its `close`
+    /// takes the given time, standing in for a teardown stuck on a faulted request.
+    struct FailingLater(EngineFailure, Duration);
 
     impl Engine for FailingLater {
         fn warmup(&mut self) {}
@@ -3779,9 +3819,12 @@ mod engine_failure_tests {
         fn failure(&self) -> EngineFailure {
             self.0.clone()
         }
+        fn close(&mut self) {
+            std::thread::sleep(self.1);
+        }
     }
 
-    struct FailingLaterBuilder(EngineFailure);
+    struct FailingLaterBuilder(EngineFailure, Duration);
 
     #[async_trait::async_trait]
     impl Builder for FailingLaterBuilder {
@@ -3795,12 +3838,19 @@ mod engine_failure_tests {
             Ok(Box::pin(futures::stream::empty()))
         }
         fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
-            Ok(Box::new(FailingLater(self.0)))
+            Ok(Box::new(FailingLater(self.0, self.1)))
         }
     }
 
     async fn started(handle: &EngineFailure) -> Arc<Runner> {
-        let runner = Arc::new(Runner::new(Box::new(FailingLaterBuilder(handle.clone()))));
+        started_with_close(handle, Duration::ZERO).await
+    }
+
+    async fn started_with_close(handle: &EngineFailure, close: Duration) -> Arc<Runner> {
+        let runner = Arc::new(Runner::new(Box::new(FailingLaterBuilder(
+            handle.clone(),
+            close,
+        ))));
         runner
             .start(
                 PeerLayout::single_stage(),
@@ -3842,6 +3892,8 @@ mod engine_failure_tests {
             shutdown,
             Some(runner.engine_failure()),
             grace,
+            SHUTDOWN_CLOSE_TIMEOUT,
+            || panic!("the close finished in time"),
             runner.clone(),
         )
         .await;
@@ -3877,6 +3929,8 @@ mod engine_failure_tests {
             shutdown,
             None,
             Duration::from_millis(50),
+            SHUTDOWN_CLOSE_TIMEOUT,
+            || panic!("the close finished in time"),
             runner,
         ));
         tokio::time::sleep(ENGINE_FAILURE_POLL * 3).await;
@@ -3898,11 +3952,126 @@ mod engine_failure_tests {
             shutdown,
             Some(runner.engine_failure()),
             Duration::from_secs(30),
+            SHUTDOWN_CLOSE_TIMEOUT,
+            || panic!("the close finished in time"),
             runner,
         )
         .await
         .expect("a signal shutdown exits 0");
         assert!(t0.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Fix round 1: after an engine failure, a close that overruns its bound forces the exit
+    /// (`force_exit`; `process::exit(1)` in production) rather than return into a runtime drop
+    /// that would wait on the stuck close forever.
+    #[tokio::test]
+    async fn an_overrunning_close_after_an_engine_failure_forces_the_exit() {
+        let handle = EngineFailure::default();
+        let runner = started_with_close(&handle, Duration::from_secs(1)).await;
+        handle.set("stage1 could not be recovered");
+        let (_tx, shutdown) = signal();
+        let forced = std::sync::atomic::AtomicBool::new(false);
+        let t0 = Instant::now();
+        let r = serve_until_shutdown(
+            std::future::pending(),
+            shutdown,
+            Some(runner.engine_failure()),
+            Duration::ZERO,
+            Duration::from_millis(100),
+            || forced.store(true, std::sync::atomic::Ordering::SeqCst),
+            runner,
+        )
+        .await;
+        assert!(forced.load(std::sync::atomic::Ordering::SeqCst), "forced");
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "did not wait out the close"
+        );
+        assert!(r.is_err());
+    }
+
+    /// Fix round 1: the signal path keeps today's behaviour. An overrunning close is abandoned
+    /// with a warning and the shutdown still returns `Ok`; nothing is forced.
+    #[tokio::test]
+    async fn an_overrunning_close_after_a_signal_is_not_forced() {
+        let handle = EngineFailure::default();
+        let runner = started_with_close(&handle, Duration::from_millis(500)).await;
+        let (tx, shutdown) = signal();
+        tx.send(()).unwrap();
+        serve_until_shutdown(
+            std::future::pending(),
+            shutdown,
+            Some(runner.engine_failure()),
+            Duration::ZERO,
+            Duration::from_millis(100),
+            || panic!("a signal shutdown is never forced"),
+            runner,
+        )
+        .await
+        .expect("a signal shutdown exits 0");
+    }
+
+    /// Fix round 1: the opt-out wiring `cmd_worker` uses. With
+    /// `--keep-serving-on-engine-failure` nothing is watched, and a reported failure does not end
+    /// the serve; without it the same failure does.
+    #[tokio::test]
+    async fn the_opt_out_flag_stops_a_reported_failure_from_ending_the_serve() {
+        let single = || {
+            WorkerArgs::single_node(
+                "m".into(),
+                "GPU".into(),
+                EngineKind::Mock,
+                ":8000".into(),
+                None,
+                1.0,
+                Vec::new(),
+                None,
+                None,
+            )
+        };
+        let mut keep = single();
+        keep.keep_serving_on_engine_failure = true;
+        let handle = EngineFailure::default();
+        let runner = started(&handle).await;
+        handle.set("stage1 could not be recovered");
+
+        let watched = watched_failure(&keep, &runner);
+        assert!(watched.is_none(), "the opt-out watches nothing");
+        let (tx, shutdown) = signal();
+        let serving = tokio::spawn(serve_until_shutdown(
+            std::future::pending(),
+            shutdown,
+            watched,
+            Duration::ZERO,
+            SHUTDOWN_CLOSE_TIMEOUT,
+            || panic!("the close finished in time"),
+            runner.clone(),
+        ));
+        tokio::time::sleep(ENGINE_FAILURE_POLL * 3).await;
+        assert!(!serving.is_finished(), "still serving after the failure");
+        tx.send(()).unwrap();
+        serving.await.unwrap().expect("a signal shutdown exits 0");
+
+        let handle = EngineFailure::default();
+        let runner = started(&handle).await;
+        handle.set("stage1 could not be recovered");
+        let watched = watched_failure(&single(), &runner);
+        assert_eq!(
+            watched.as_ref().and_then(|f| f.reason()).as_deref(),
+            Some("stage1 could not be recovered")
+        );
+        let (_tx, shutdown) = signal();
+        let r = serve_until_shutdown(
+            std::future::pending(),
+            shutdown,
+            watched,
+            Duration::ZERO,
+            SHUTDOWN_CLOSE_TIMEOUT,
+            || panic!("the close finished in time"),
+            runner,
+        )
+        .await;
+        assert!(r.is_err(), "the default exits on the failure");
     }
 
     #[test]
