@@ -52,13 +52,26 @@ pub const DEFAULT_MAX_PROMPT_BYTES: usize = 32 * 1024;
 /// this whole HTTP-server crate.
 pub use cascadia_types::ApiStats;
 
-/// Tokens a chunk contributes to the cumulative counter. The convention
-/// (engine `n_tokens` authoritative, else one per non-empty chunk — #55)
-/// lives on [`cascadia_types::Chunk::token_count`] so the API's `usage`,
-/// the dashboard counters, and the runner's Prometheus metrics can never
-/// drift apart; this alias keeps the historical call sites and tests.
-fn chunk_token_count(chunk: &cascadia_types::Chunk) -> u32 {
-    chunk.token_count()
+/// Reconcile per-request and global streaming counters together. A final
+/// authoritative count replaces estimates, including when it is lower.
+fn record_stream_tokens(
+    chunk: &cascadia_types::Chunk,
+    stats: &ApiStats,
+    completion: &std::sync::atomic::AtomicU32,
+) {
+    let before = completion.load(Ordering::Relaxed);
+    let mut after = before;
+    chunk.accumulate_tokens(&mut after);
+    completion.store(after, Ordering::Relaxed);
+    if after >= before {
+        stats
+            .tokens_total
+            .fetch_add(u64::from(after - before), Ordering::Relaxed);
+    } else {
+        stats
+            .tokens_total
+            .fetch_sub(u64::from(before - after), Ordering::Relaxed);
+    }
 }
 
 /// RAII guard: bumps `requests_in_flight` on construction and decrements it
@@ -2514,12 +2527,8 @@ async fn chat_completions(
             )
                 .into_response();
         }
-        // Count tokens for EVERY chunk including the final one — engines
-        // like ov-genai deliver their whole output on a single final
-        // chunk, and spec-decode carries its last round there too; gating
-        // on `!is_final` dropped them (tokens_total stuck at 0 for
-        // ov-genai). chunk_token_count contributes 0 for the empty final
-        // markers other engines emit, so there's no phantom over-count.
+        // Count every chunk, but replace the running sum when the final
+        // carries authoritative usage (including hidden thinking/tools).
         match marker.as_mut() {
             Some(f) => {
                 buf.push_str(&f.feed(&chunk));
@@ -2529,7 +2538,7 @@ async fn chat_completions(
             }
             None => buf.push_str(&chunk.text),
         }
-        completion_tokens += chunk_token_count(&chunk);
+        chunk.accumulate_tokens(&mut completion_tokens);
         if let Some(lp) = &chunk.logprobs {
             logprobs_content.push(lp.clone());
         }
@@ -2732,7 +2741,7 @@ async fn completions(
             }
             None => buf.push_str(&chunk.text),
         }
-        completion_tokens += chunk_token_count(&chunk);
+        chunk.accumulate_tokens(&mut completion_tokens);
         if let Some(lp) = &chunk.logprobs {
             logprobs_content.push(lp.clone());
         }
@@ -2818,6 +2827,8 @@ async fn stream_text_completion(
     let stats = state.stats.clone();
     let usage_completion = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let usage_prompt = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let usage_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let final_finished = usage_finished.clone();
     let final_completion = usage_completion.clone();
     let final_prompt = usage_prompt.clone();
     let usage_model = model.clone();
@@ -2836,6 +2847,7 @@ async fn stream_text_completion(
             let stats = stats.clone();
             let usage_completion = usage_completion.clone();
             let usage_prompt = usage_prompt.clone();
+            let usage_finished = usage_finished.clone();
             let echo_pending = echo_pending.clone();
             async move {
                 // A progress marker (a long prompt still going down the
@@ -2845,11 +2857,10 @@ async fn stream_text_completion(
                     return Ok::<Bytes, std::convert::Infallible>(Bytes::new());
                 }
                 if chunk.error.is_none() {
-                    let n = chunk_token_count(&chunk);
-                    stats.tokens_total.fetch_add(n as u64, Ordering::Relaxed);
-                    usage_completion.fetch_add(n, Ordering::Relaxed);
+                    record_stream_tokens(&chunk, &stats, &usage_completion);
                     if chunk.is_final {
                         usage_prompt.store(chunk.prompt_tokens.unwrap_or(0), Ordering::Relaxed);
+                        usage_finished.store(chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled), Ordering::Relaxed);
                     }
                 }
                 if let Some(reason) = &chunk.error {
@@ -2872,7 +2883,8 @@ async fn stream_text_completion(
                     "object": "text_completion",
                     "created": now_unix(),
                     "model": model,
-                    "n_tokens": chunk.n_tokens.unwrap_or(1),
+                    "n_tokens": chunk.token_count(),
+                    "completion_tokens": chunk.completion_tokens,
                     "choices": [{
                         "index": 0,
                         "text": text,
@@ -2890,7 +2902,7 @@ async fn stream_text_completion(
         })
         .chain(stream::once(async move {
             let mut out = String::new();
-            if include_usage {
+            if include_usage && final_finished.load(Ordering::Relaxed) {
                 let prompt = final_prompt.load(Ordering::Relaxed);
                 let completion = final_completion.load(Ordering::Relaxed);
                 let usage = serde_json::json!({
@@ -2955,12 +2967,25 @@ async fn stream_completion(
         let _inflight = inflight; // hold the in-flight gauge until generation completes
         let mut buf = String::new();
         let mut err: Option<String> = None;
+        let mut completion_tokens = 0;
+        let mut prompt_tokens = 0;
+        let mut finished = false;
+        let mut finish_reason = "stop";
         let mut stream = chunk_stream;
         let mut marker = state.marker_dialect.clone().map(MarkerFilter::new);
         while let Some(chunk) = stream.next().await {
             if let Some(reason) = &chunk.error {
                 err = Some(reason.clone());
                 break;
+            }
+            chunk.accumulate_tokens(&mut completion_tokens);
+            if chunk.is_final {
+                prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
+                finished = chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled);
+                finish_reason = chunk
+                    .finish_reason
+                    .map(|f| f.as_openai_str())
+                    .unwrap_or("stop");
             }
             match marker.as_mut() {
                 Some(f) => {
@@ -2972,7 +2997,11 @@ async fn stream_completion(
                 None => buf.push_str(&chunk.text),
             }
         }
-        let frames: Vec<Bytes> = if let Some(reason) = err {
+        state
+            .stats
+            .tokens_total
+            .fetch_add(u64::from(completion_tokens), Ordering::Relaxed);
+        let mut frames: Vec<Bytes> = if let Some(reason) = &err {
             warn!(task = %task_id, reason = %reason, "engine failed tool task mid-stream; SSE error");
             vec![Bytes::from(format!(
                 "data: {}\n\n",
@@ -2999,9 +3028,21 @@ async fn stream_completion(
         } else {
             let delta = serde_json::json!({ "id": task_id.clone(), "object": "chat.completion.chunk",
                 "created": now_unix(), "model": model.clone(), "choices": [{ "index": 0,
-                "delta": { "role": "assistant", "content": buf }, "finish_reason": "stop" }] });
+                "delta": { "role": "assistant", "content": buf }, "finish_reason": finish_reason }] });
             vec![Bytes::from(format!("data: {delta}\n\n"))]
         };
+        if include_usage && finished && err.is_none() {
+            let usage = serde_json::json!({
+                "id": task_id, "object": "chat.completion.chunk",
+                "created": now_unix(), "model": model, "choices": [],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                },
+            });
+            frames.push(Bytes::from(format!("data: {usage}\n\n")));
+        }
         let body = stream::iter(
             frames
                 .into_iter()
@@ -3028,6 +3069,8 @@ async fn stream_completion(
     // stream drains; the per-chunk closure gets the originals.
     let usage_completion = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let usage_prompt = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let usage_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let final_finished = usage_finished.clone();
     let final_completion = usage_completion.clone();
     let final_prompt = usage_prompt.clone();
     let usage_model = model.clone();
@@ -3063,23 +3106,20 @@ async fn stream_completion(
             let stats = stats.clone();
             let usage_completion = usage_completion.clone();
             let usage_prompt = usage_prompt.clone();
+            let usage_finished = usage_finished.clone();
             let marker = marker.clone();
             async move {
-                // Count model tokens as they stream so the dashboard's
-                // tokens_total advances live (not just at request end).
-                // Counts the final chunk too (ov-genai emits its whole
-                // output there); chunk_token_count yields 0 for empty
-                // markers, so no phantom token.
+                // Publish real per-chunk counts live; authoritative-only
+                // engines reconcile their full model count at completion.
                 if chunk.is_progress() {
                     return Ok::<Bytes, std::convert::Infallible>(Bytes::new());
                 }
                 if chunk.error.is_none() {
-                    let n = chunk_token_count(&chunk);
-                    stats.tokens_total.fetch_add(n as u64, Ordering::Relaxed);
-                    usage_completion.fetch_add(n, Ordering::Relaxed);
+                    record_stream_tokens(&chunk, &stats, &usage_completion);
                     if chunk.is_final {
                         usage_prompt
                             .store(chunk.prompt_tokens.unwrap_or(0), Ordering::Relaxed);
+                        usage_finished.store(chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled), Ordering::Relaxed);
                     }
                 }
                 // A failed task carries `error` on its final chunk. The 200
@@ -3123,7 +3163,8 @@ async fn stream_completion(
                     "object": "chat.completion.chunk",
                     "created": now_unix(),
                     "model": model,
-                    "n_tokens": chunk.n_tokens.unwrap_or(1),
+                    "n_tokens": chunk.token_count(),
+                    "completion_tokens": chunk.completion_tokens,
                     "choices": [{
                         "index": 0,
                         "delta": {
@@ -3159,7 +3200,7 @@ async fn stream_completion(
             // Combined into a single HTTP frame with [DONE] (SSE events are
             // delimited by \n\n regardless of HTTP chunk boundaries).
             let mut out = String::new();
-            if include_usage {
+            if include_usage && final_finished.load(Ordering::Relaxed) {
                 let prompt = final_prompt.load(Ordering::Relaxed);
                 let completion = final_completion.load(Ordering::Relaxed);
                 let usage = serde_json::json!({
@@ -3402,20 +3443,20 @@ mod tests {
     fn chunk_token_count_honors_engine_count() {
         // ov-genai's shape: whole response on one final chunk, n_tokens set.
         let c = Chunk::final_marker("t", "The capital of France is Paris.").with_n_tokens(8);
-        assert_eq!(chunk_token_count(&c), 8);
+        assert_eq!(c.token_count(), 8);
 
         // Same shape WITHOUT n_tokens falls back to 1 (the pre-#55 behavior
         // that under-counted ov-genai) — documents why the engine must set it.
         let c = Chunk::final_marker("t", "The capital of France is Paris.");
-        assert_eq!(chunk_token_count(&c), 1);
+        assert_eq!(c.token_count(), 1);
 
         // Empty final marker (mock/runtime) contributes 0 — no phantom token.
         let c = Chunk::final_marker("t", "");
-        assert_eq!(chunk_token_count(&c), 0);
+        assert_eq!(c.token_count(), 0);
 
         // A normal per-token chunk counts as 1.
         let c = Chunk::token("t", 123, "Paris");
-        assert_eq!(chunk_token_count(&c), 1);
+        assert_eq!(c.token_count(), 1);
     }
 
     // The R1-family chat template the exporter (tools/export_deepseek_v4.py,
@@ -3549,6 +3590,239 @@ mod tests {
             ..Config::default()
         };
         make_router_with_config(Arc::new(runner), "mock-model", cfg)
+    }
+
+    /// A subprocess-style stream: final usage includes hidden thinking/tools;
+    /// transport fragments deliberately contribute zero model-token counts.
+    struct UsageTailEngine {
+        text: String,
+        fail: bool,
+        pending: Option<cascadia_types::TaskId>,
+    }
+
+    impl cascadia_engine::Engine for UsageTailEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            self.pending = Some(task.task_id);
+            Ok(())
+        }
+        fn step(&mut self) -> cascadia_engine::EngineResult<Vec<(cascadia_types::TaskId, Chunk)>> {
+            let Some(id) = self.pending.take() else {
+                return Ok(Vec::new());
+            };
+            let final_chunk = if self.fail {
+                Chunk::error(&id, "child failed before usage")
+            } else {
+                Chunk::final_marker(&id, "")
+                    .with_n_tokens(0)
+                    .with_prompt_tokens(42)
+                    .with_completion_tokens(38)
+            };
+            Ok(vec![
+                (id.clone(), Chunk::progress(id.clone())),
+                (
+                    id.clone(),
+                    Chunk::token(&id, 0, &self.text).with_n_tokens(0),
+                ),
+                (id, final_chunk),
+            ])
+        }
+    }
+
+    struct UsageTailBuilder {
+        text: String,
+        fail: bool,
+    }
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for UsageTailBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> cascadia_engine::EngineResult<()> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> cascadia_engine::EngineResult<cascadia_engine::LoadStream> {
+            Ok(Box::pin(stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> cascadia_engine::EngineResult<Box<dyn cascadia_engine::Engine>> {
+            Ok(Box::new(UsageTailEngine {
+                text: self.text,
+                fail: self.fail,
+                pending: None,
+            }))
+        }
+    }
+
+    async fn usage_tail_app(tool: bool, fail: bool) -> (Router, Arc<ApiStats>) {
+        let text = if tool {
+            r#"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>"#
+        } else {
+            "visible answer"
+        };
+        let runner = Runner::new(Box::new(UsageTailBuilder {
+            text: text.into(),
+            fail,
+        }));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let stats = Arc::new(ApiStats::default());
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        (
+            make_router_with_stats(Arc::new(runner), "mock-model", cfg, stats.clone()),
+            stats,
+        )
+    }
+
+    #[tokio::test]
+    async fn authoritative_usage_reaches_chat_legacy_tools_and_stats() {
+        for (legacy, tool, streaming) in [
+            (false, false, false),
+            (false, false, true),
+            (true, false, false),
+            (true, false, true),
+            (false, true, false),
+            (false, true, true),
+        ] {
+            let (app, stats) = usage_tail_app(tool, false).await;
+            let mut request = serde_json::json!({
+                "model": "mock-model", "stream": streaming,
+                "stream_options": {"include_usage": true},
+            });
+            if legacy {
+                request["prompt"] = serde_json::json!("hi");
+            } else {
+                request["messages"] = serde_json::json!([{"role":"user","content":"hi"}]);
+            }
+            if tool {
+                request["tools"] =
+                    serde_json::json!([{"type":"function","function":{"name":"get_weather"}}]);
+            }
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(if legacy {
+                            "/v1/completions"
+                        } else {
+                            "/v1/chat/completions"
+                        })
+                        .header("content-type", "application/json")
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+            let usage = if streaming {
+                let body = String::from_utf8(bytes.to_vec()).unwrap();
+                assert!(body.trim_end().ends_with("data: [DONE]"));
+                let events: Vec<Value> = body
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|line| *line != "[DONE]")
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                let tails: Vec<_> = events
+                    .iter()
+                    .filter(|event| event.get("usage").is_some())
+                    .collect();
+                assert_eq!(tails.len(), 1, "{body}");
+                assert!(tails[0]["choices"].as_array().unwrap().is_empty());
+                assert_eq!(events.last().unwrap()["usage"], tails[0]["usage"]);
+                if tool {
+                    assert!(body.contains("\"finish_reason\":\"tool_calls\""), "{body}");
+                }
+                tails[0]["usage"].clone()
+            } else {
+                let response: Value = serde_json::from_slice(&bytes).unwrap();
+                if tool {
+                    assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
+                }
+                response["usage"].clone()
+            };
+            assert_eq!(
+                usage,
+                serde_json::json!({"prompt_tokens":42,"completion_tokens":38,"total_tokens":80})
+            );
+            assert_eq!(stats.tokens_total.load(Ordering::Relaxed), 38);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_streams_never_emit_successful_usage_tail() {
+        for (legacy, tool) in [(false, false), (true, false), (false, true)] {
+            let (app, stats) = usage_tail_app(tool, true).await;
+            let mut request = serde_json::json!({"model":"mock-model","stream":true,
+                "stream_options":{"include_usage":true}});
+            if legacy {
+                request["prompt"] = serde_json::json!("hi");
+            } else {
+                request["messages"] = serde_json::json!([{"role":"user","content":"hi"}]);
+            }
+            if tool {
+                request["tools"] =
+                    serde_json::json!([{"type":"function","function":{"name":"get_weather"}}]);
+            }
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(if legacy {
+                            "/v1/completions"
+                        } else {
+                            "/v1/chat/completions"
+                        })
+                        .header("content-type", "application/json")
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = String::from_utf8(
+                to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(body.contains("\"object\":\"error\""), "{body}");
+            assert!(!body.contains("\"usage\""), "{body}");
+            assert_eq!(stats.tokens_total.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn streaming_stats_replace_not_add_lower_authoritative_total() {
+        let stats = ApiStats::default();
+        let completion = std::sync::atomic::AtomicU32::new(0);
+        record_stream_tokens(
+            &Chunk::token("t", 0, "partial").with_n_tokens(5),
+            &stats,
+            &completion,
+        );
+        record_stream_tokens(
+            &Chunk::final_marker("t", "").with_completion_tokens(3),
+            &stats,
+            &completion,
+        );
+        assert_eq!(completion.load(Ordering::Relaxed), 3);
+        assert_eq!(stats.tokens_total.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]
@@ -5081,7 +5355,7 @@ mod tests {
     async fn oversized_tool_turns_get_413() {
         // max_prompt_bytes small enough that the rendered prompt passes but
         // the tool-result turn does not — content + tool fields must count.
-        let mut runner = Runner::new(Box::new(MockBuilder::new()));
+        let runner = Runner::new(Box::new(MockBuilder::new()));
         runner
             .start(
                 PeerLayout::single_stage(),
