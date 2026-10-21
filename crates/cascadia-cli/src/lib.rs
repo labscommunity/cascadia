@@ -22,7 +22,7 @@ use cascadia_types::{GenerationTask, PeerEndpoint, PeerLayout, ShardSpec};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use futures::StreamExt;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 pub mod discover;
@@ -380,6 +380,13 @@ pub struct WorkerArgs {
     /// pending queue.
     #[arg(long, value_name = "N", default_value_t = cascadia_api::DEFAULT_MAX_CONCURRENT_DECISIONS, value_parser = parse_max_decision_requests)]
     pub max_decision_requests: usize,
+
+    /// Keep serving after the engine fails for good (qwen35 only: a stage that cannot be
+    /// recovered), refusing every request with a 5xx and `/health` degraded. Default off: the
+    /// process exits non-zero after a short grace so the supervisor restarts it. For debugging a
+    /// failed engine in place.
+    #[arg(long)]
+    pub keep_serving_on_engine_failure: bool,
 
     /// OV performance hint (PERFORMANCE_HINT). LATENCY suits single-user
     /// decode; THROUGHPUT enables NUM_STREAMS auto-tuning. See OpenVINO
@@ -769,6 +776,11 @@ pub struct RunArgs {
     #[arg(long, value_name = "N", default_value_t = cascadia_api::DEFAULT_MAX_CONCURRENT_DECISIONS, value_parser = parse_max_decision_requests)]
     pub max_decision_requests: usize,
 
+    /// Stay up after the engine fails, refusing with a 5xx, instead of exiting for a restart.
+    /// See `cascadia worker --help`.
+    #[arg(long)]
+    pub keep_serving_on_engine_failure: bool,
+
     /// Expert placement JSON (requires --ep-workers). See worker --help.
     #[arg(long)]
     pub ep_placement: Option<PathBuf>,
@@ -826,6 +838,7 @@ impl WorkerArgs {
             decision_dump,
             decision_dump_max_bytes: None,
             max_decision_requests: cascadia_api::DEFAULT_MAX_CONCURRENT_DECISIONS,
+            keep_serving_on_engine_failure: false,
             ep_workers,
             ep_worker_index: None,
             ep_worker_count: None,
@@ -1127,6 +1140,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     );
     worker.decision_dump_max_bytes = args.decision_dump_max_bytes;
     worker.max_decision_requests = args.max_decision_requests;
+    worker.keep_serving_on_engine_failure = args.keep_serving_on_engine_failure;
     // Carry the elastic posture onto the worker so the OV memory-knob seeding
     // (ov_perf_properties) fires; the interposer itself was already activated
     // in main before the async runtime started.
@@ -1937,6 +1951,96 @@ fn install_shutdown_signal_handler(
     })
 }
 
+/// Task 56: how long in-flight responses get to reach their clients once the engine has failed
+/// (the failing request's 5xx, and any requests it already refused) before the process exits.
+const ENGINE_FAILED_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Task 56: how often the API serve loop reads the engine's failure handle.
+const ENGINE_FAILURE_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Resolve with the reason once the engine reports a permanent failure. `None` (the
+/// `--keep-serving-on-engine-failure` opt-out) never resolves.
+async fn engine_failed(failure: Option<cascadia_engine::EngineFailure>) -> String {
+    let Some(failure) = failure else {
+        return std::future::pending().await;
+    };
+    loop {
+        if let Some(reason) = failure.reason() {
+            return reason;
+        }
+        tokio::time::sleep(ENGINE_FAILURE_POLL).await;
+    }
+}
+
+/// Serve the API until a SIGTERM/SIGINT (`Ok`, exit 0) or, with `failure` watched, until the
+/// engine fails for good (`Err`, a non-zero exit, so systemd `Restart=on-failure` and NSSM restart
+/// the server). Either way the same bounded `runner.close()` runs last.
+async fn serve_until_shutdown(
+    serve: impl std::future::Future<Output = Result<()>>,
+    shutdown_signal: impl std::future::Future<Output = ShutdownSignal>,
+    failure: Option<cascadia_engine::EngineFailure>,
+    grace: std::time::Duration,
+    runner: Arc<Runner>,
+) -> Result<()> {
+    // Race the axum serve against SIGTERM/SIGINT. Without this,
+    // `kill <pid>` exits the tokio runtime before `Runner::close()`
+    // runs, which silently drops any teardown work close() does
+    // (flushing caches, draining transports, etc.). On signal we
+    // fall through to runner.close() below.
+    let mut engine_failure = None;
+    tokio::select! {
+        res = serve => {
+            res.context("serve_with_nodelay")?;
+        }
+        sig = shutdown_signal => {
+            info!(
+                signal = %sig,
+                pid = std::process::id(),
+                "shutdown signal received; running graceful close"
+            );
+        }
+        reason = engine_failed(failure) => {
+            error!(
+                reason = %reason,
+                pid = std::process::id(),
+                "engine failed; exiting so the supervisor restarts the server"
+            );
+            engine_failure = Some(reason);
+        }
+    }
+    // The serve future (and its listener) is dropped: no new connection is accepted. The
+    // connections already open run on their own tasks; give their responses a moment to land.
+    if engine_failure.is_some() {
+        tokio::time::sleep(grace).await;
+    }
+    // Bounded close so a stuck peer / transport doesn't force the
+    // operator to escalate `kill` → `kill -9`. `Runner::close()` is
+    // sync (parking_lot::Mutex) and may block_on async transport
+    // teardown internally; dispatch via spawn_blocking so the timer
+    // can actually fire, then await with a deadline. On timeout we
+    // log loudly and return — the process exit will SIGKILL any
+    // straggler threads, which is the right outcome at that point.
+    const SHUTDOWN_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let close_task = tokio::task::spawn_blocking(move || runner.close());
+    match tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, close_task).await {
+        Ok(Ok(())) => info!("runner.close() complete"),
+        Ok(Err(join_err)) => tracing::warn!(
+            error = %join_err,
+            "runner.close() task panicked"
+        ),
+        Err(_) => tracing::warn!(
+            timeout_s = SHUTDOWN_CLOSE_TIMEOUT.as_secs(),
+            "runner.close() exceeded timeout; abandoning teardown"
+        ),
+    }
+    match engine_failure {
+        Some(reason) => Err(anyhow!(
+            "engine failed: {reason}; exiting so the supervisor restarts the server"
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Reject phase-split flag combinations before a worker binds any socket. Pure
 /// function of the args so it is unit-testable (the guards were inline in the
 /// async `cmd_worker`, reachable only by running a full worker).
@@ -2547,45 +2651,17 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // orphaned processes under systemd / k8s.
         let shutdown_signal =
             install_shutdown_signal_handler().context("install_shutdown_signal_handler")?;
-        // Race the axum serve against SIGTERM/SIGINT. Without this,
-        // `kill <pid>` exits the tokio runtime before `Runner::close()`
-        // runs, which silently drops any teardown work close() does
-        // (flushing caches, draining transports, etc.). On signal we
-        // fall through to runner.close() below.
-        tokio::select! {
-            res = serve_with_nodelay(listener, app) => {
-                res.context("serve_with_nodelay")?;
-            }
-            sig = shutdown_signal => {
-                info!(
-                    signal = %sig,
-                    pid = std::process::id(),
-                    "shutdown signal received; running graceful close"
-                );
-            }
-        }
-        // Bounded close so a stuck peer / transport doesn't force the
-        // operator to escalate `kill` → `kill -9`. `Runner::close()` is
-        // sync (parking_lot::Mutex) and may block_on async transport
-        // teardown internally; dispatch via spawn_blocking so the timer
-        // can actually fire, then await with a deadline. On timeout we
-        // log loudly and return — the process exit will SIGKILL any
-        // straggler threads, which is the right outcome at that point.
-        const SHUTDOWN_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-        let r = runner.clone();
-        let close_task = tokio::task::spawn_blocking(move || r.close());
-        match tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, close_task).await {
-            Ok(Ok(())) => info!("runner.close() complete"),
-            Ok(Err(join_err)) => tracing::warn!(
-                error = %join_err,
-                "runner.close() task panicked"
-            ),
-            Err(_) => tracing::warn!(
-                timeout_s = SHUTDOWN_CLOSE_TIMEOUT.as_secs(),
-                "runner.close() exceeded timeout; abandoning teardown"
-            ),
-        }
-        return Ok(());
+        // Task 56: watch the engine's failure handle (grabbed once at load, so never the engine
+        // lock) unless the operator asked to keep a failed engine up.
+        let failure = (!args.keep_serving_on_engine_failure).then(|| runner.engine_failure());
+        return serve_until_shutdown(
+            serve_with_nodelay(listener, app),
+            shutdown_signal,
+            failure,
+            ENGINE_FAILED_GRACE,
+            runner,
+        )
+        .await;
     }
 
     // No API — read prompts from stdin.
@@ -3679,6 +3755,192 @@ mod cli_version_tests {
             .expect_err("--version stops parsing with a DisplayVersion error");
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
+}
+
+#[cfg(test)]
+mod engine_failure_tests {
+    use super::*;
+    use cascadia_engine::{Engine, EngineError, EngineFailure};
+    use cascadia_types::{Chunk, TaskId};
+    use std::time::{Duration, Instant};
+
+    /// A fake engine whose failure handle the test sets, as qwen36 sets its own.
+    struct FailingLater(EngineFailure);
+
+    impl Engine for FailingLater {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _task: GenerationTask) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            Ok(Vec::new())
+        }
+        fn failure(&self) -> EngineFailure {
+            self.0.clone()
+        }
+    }
+
+    struct FailingLaterBuilder(EngineFailure);
+
+    #[async_trait::async_trait]
+    impl Builder for FailingLaterBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            Ok(Box::new(FailingLater(self.0)))
+        }
+    }
+
+    async fn started(handle: &EngineFailure) -> Arc<Runner> {
+        let runner = Arc::new(Runner::new(Box::new(FailingLaterBuilder(handle.clone()))));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("m", "CPU"),
+            )
+            .await
+            .unwrap();
+        runner
+    }
+
+    /// A shutdown future the test fires by hand, standing in for SIGTERM.
+    fn signal() -> (
+        tokio::sync::oneshot::Sender<()>,
+        impl std::future::Future<Output = ShutdownSignal>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        (tx, async move {
+            let _ = rx.await;
+            ShutdownSignal::Sigterm
+        })
+    }
+
+    /// The default: the engine fails mid-serve, the serve loop stops, waits out the grace, closes
+    /// the runner and returns `Err` (a non-zero exit) carrying the reason.
+    #[tokio::test]
+    async fn an_engine_failure_returns_err_after_the_grace_and_closes_the_runner() {
+        let handle = EngineFailure::default();
+        let runner = started(&handle).await;
+        let (_tx, shutdown) = signal();
+        let grace = Duration::from_millis(300);
+        let setter = handle.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            setter.set("stage1 could not be recovered");
+        });
+        let t0 = Instant::now();
+        let r = serve_until_shutdown(
+            std::future::pending(),
+            shutdown,
+            Some(runner.engine_failure()),
+            grace,
+            runner.clone(),
+        )
+        .await;
+        let took = t0.elapsed();
+        let err = r.expect_err("an engine failure exits non-zero").to_string();
+        assert!(
+            err.contains("engine failed: stage1 could not be recovered")
+                && err.contains("supervisor restarts the server"),
+            "{err}"
+        );
+        assert!(
+            took >= Duration::from_millis(50) + grace && took < Duration::from_secs(5),
+            "noticed, then the grace: {took:?}"
+        );
+        assert!(
+            runner
+                .submit(GenerationTask::new("after", "hello"))
+                .is_err(),
+            "the runner is closed"
+        );
+    }
+
+    /// `--keep-serving-on-engine-failure`: a failed engine keeps the server up (it refuses with a
+    /// 5xx), and a SIGTERM still exits 0.
+    #[tokio::test]
+    async fn with_the_opt_out_a_failed_engine_keeps_serving_and_a_signal_exits_ok() {
+        let handle = EngineFailure::default();
+        let runner = started(&handle).await;
+        handle.set("stage1 could not be recovered");
+        let (tx, shutdown) = signal();
+        let serving = tokio::spawn(serve_until_shutdown(
+            std::future::pending(),
+            shutdown,
+            None,
+            Duration::from_millis(50),
+            runner,
+        ));
+        tokio::time::sleep(ENGINE_FAILURE_POLL * 3).await;
+        assert!(!serving.is_finished(), "still serving");
+        tx.send(()).unwrap();
+        serving.await.unwrap().expect("a signal shutdown exits 0");
+    }
+
+    /// A healthy engine, watched: a SIGTERM exits 0 at once, with no grace.
+    #[tokio::test]
+    async fn a_signal_with_a_healthy_engine_exits_ok_without_the_grace() {
+        let handle = EngineFailure::default();
+        let runner = started(&handle).await;
+        let (tx, shutdown) = signal();
+        tx.send(()).unwrap();
+        let t0 = Instant::now();
+        serve_until_shutdown(
+            std::future::pending(),
+            shutdown,
+            Some(runner.engine_failure()),
+            Duration::from_secs(30),
+            runner,
+        )
+        .await
+        .expect("a signal shutdown exits 0");
+        assert!(t0.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_opt_out_flag_parses_on_worker_and_run_and_defaults_off() {
+        let run = |extra: &[&str]| {
+            let mut argv = vec!["cascadia", "run", "some-model-dir"];
+            argv.extend_from_slice(extra);
+            match Cli::try_parse_from(argv).expect("parse run argv").cmd {
+                Command::Run(args) => args.keep_serving_on_engine_failure,
+                _ => panic!("expected run subcommand"),
+            }
+        };
+        assert!(!run(&[]));
+        assert!(run(&["--keep-serving-on-engine-failure"]));
+        let worker = |extra: &[&str]| {
+            let mut argv = vec![
+                "cascadia", "worker", "--rank", "0", "--total", "1", "--model", "m",
+            ];
+            argv.extend_from_slice(extra);
+            match Cli::try_parse_from(argv).expect("parse worker argv").cmd {
+                Command::Worker(args) => args.keep_serving_on_engine_failure,
+                _ => panic!("expected worker subcommand"),
+            }
+        };
+        assert!(!worker(&[]));
+        assert!(worker(&["--keep-serving-on-engine-failure"]));
+        let single = WorkerArgs::single_node(
+            "m".into(),
+            "GPU".into(),
+            EngineKind::Mock,
+            ":8000".into(),
+            None,
+            1.0,
+            Vec::new(),
+            None,
+            None,
+        );
+        assert!(!single.keep_serving_on_engine_failure);
     }
 }
 

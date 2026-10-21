@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use cascadia_engine::{Builder, Engine, EngineError};
+use cascadia_engine::{Builder, Engine, EngineError, EngineFailure};
 use cascadia_types::{Chunk, FinishReason, GenerationTask, PeerLayout, ShardSpec, TaskId};
 use futures::Stream;
 use parking_lot::Mutex;
@@ -354,6 +354,9 @@ pub struct Runner {
     /// between a stream's next poll and its `Drop`, and every restart books
     /// a nondeterministic number of client cancellations.
     closing: Arc<AtomicBool>,
+    /// Task 56: the engine's [`Engine::failure`] handle, grabbed once at `start()` so the server
+    /// can watch it without the engine lock. A handle nothing sets until then.
+    failure: Mutex<EngineFailure>,
 }
 
 impl Runner {
@@ -363,7 +366,14 @@ impl Runner {
             slot: Arc::new(EngineSlot::new(None)),
             model: Mutex::new(None),
             closing: Arc::new(AtomicBool::new(false)),
+            failure: Mutex::new(EngineFailure::default()),
         }
+    }
+
+    /// Task 56: the engine's failure handle (see [`Engine::failure`]). Never takes the engine
+    /// lock. Before `start()` it is a handle nothing sets.
+    pub fn engine_failure(&self) -> EngineFailure {
+        self.failure.lock().clone()
     }
 
     /// `model` label for generation metrics; "unknown" before `start()`.
@@ -420,6 +430,7 @@ impl Runner {
         info!("runner ready");
 
         *self.model.lock() = Some(Arc::from(model));
+        *self.failure.lock() = engine.failure();
         self.slot.lock().set(Some(engine));
         Ok(())
     }
@@ -1311,6 +1322,76 @@ mod tests {
         }
     }
 
+    /// Task 56: an engine that hands out a failure handle the test controls.
+    struct ReportingEngine(EngineFailure);
+
+    impl Engine for ReportingEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _task: GenerationTask) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            Ok(Vec::new())
+        }
+        fn failure(&self) -> EngineFailure {
+            self.0.clone()
+        }
+    }
+
+    struct ReportingBuilder(EngineFailure);
+
+    #[async_trait::async_trait]
+    impl Builder for ReportingBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            Ok(Box::new(ReportingEngine(self.0)))
+        }
+    }
+
+    /// Task 56: the runner carries the engine's own failure handle from `start()`, and reading it
+    /// never takes the engine lock (a long step holds it). An engine that never reports one
+    /// (the mock) reads as not failed.
+    #[tokio::test]
+    async fn engine_failure_is_the_engines_handle_and_skips_the_engine_lock() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        assert_eq!(runner.engine_failure().reason(), None, "before start");
+        let runner = make_runner().await;
+        assert_eq!(
+            runner.engine_failure().reason(),
+            None,
+            "the mock never fails"
+        );
+
+        let handle = EngineFailure::default();
+        let runner = Runner::new(Box::new(ReportingBuilder(handle.clone())));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("m", "CPU"),
+            )
+            .await
+            .unwrap();
+        let watched = runner.engine_failure();
+        assert_eq!(watched.reason(), None);
+        // Hold the engine lock, as a step in flight does, while the engine fails and the
+        // server reads the handle.
+        let _step = runner.slot.lock();
+        handle.set("stage1 could not be recovered");
+        assert_eq!(
+            runner.engine_failure().reason().as_deref(),
+            Some("stage1 could not be recovered")
+        );
+        assert_eq!(watched.reason(), handle.reason());
+    }
+
     /// A failing engine that counts `step()` calls, so a test can assert
     /// the relay loop throttled instead of hot-spinning.
     struct CountingFailingEngine(Arc<std::sync::atomic::AtomicUsize>);
@@ -1336,6 +1417,7 @@ mod tests {
             slot: Arc::new(EngineSlot::new(Some(engine))),
             model: Mutex::new(None),
             closing: Arc::new(AtomicBool::new(false)),
+            failure: Mutex::new(EngineFailure::default()),
         });
 
         // Drive the relay loop on a worker thread, let it run for a window
@@ -1387,6 +1469,7 @@ mod tests {
             slot: Arc::new(EngineSlot::new(Some(engine))),
             model: Mutex::new(None),
             closing: Arc::new(AtomicBool::new(false)),
+            failure: Mutex::new(EngineFailure::default()),
         });
 
         // No external stop: the loop must terminate on its own. A timed join
@@ -1435,6 +1518,7 @@ mod tests {
                 slot: Arc::new(EngineSlot::new(Some(engine))),
                 model: Mutex::new(None),
                 closing: Arc::new(AtomicBool::new(false)),
+                failure: Mutex::new(EngineFailure::default()),
             });
             let driver = runner.clone();
             let handle = std::thread::spawn(move || driver.run_relay_loop());
