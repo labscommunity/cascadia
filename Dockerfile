@@ -18,7 +18,7 @@
 # symbols, so it cannot be linked here. The ubuntu22 libs run fine on the
 # Ubuntu 24.04 runtime image.
 #   docker build --target openvino \
-#     --build-arg OPENVINO_URL=https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/2026.2/linux/openvino_genai_ubuntu22_2026.2.0.0_x86_64.tar.gz \
+#     --build-arg OPENVINO_URL=https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/2026.4.1/linux/openvino_genai_ubuntu22_2026.4.1.0_x86_64.tar.gz \
 #     -t cascadia:ov .
 # Run (GPU). Mount a model directory — cascadia serves pre-exported models
 # from disk (an OpenVINO IR, or a `cascadia shard` tree); it does not download

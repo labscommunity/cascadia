@@ -90,13 +90,27 @@ source /opt/intel/oneapi/setvars.sh
 # 3. serve a GGUF through cascadia
 cascadia run /path/to/model.gguf --engine sycl-llama --elastic --api 127.0.0.1:8080
 
-# 4. talk to it like any cascadia engine. The "model" field is required and
-#    must equal the id /v1/models reports (the model path's basename by
-#    default, or --served-model-name on the worker):
+# 4. talk to it like any cascadia engine. Send the "model" field; use the id
+#    /v1/models reports (the model path's basename by default, or
+#    --served-model-name on the worker). The API serves one model and echoes
+#    the requested name; it does not reject other names.
 curl http://127.0.0.1:8080/v1/models
 curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d \
   '{"model":"model.gguf","messages":[{"role":"user","content":"hi"}]}'
 ```
+For a standalone Linux child bundle, install `patchelf`, source oneAPI, then run:
+
+```bash
+scripts/package-llama-stream.sh ~/llama-stream llama-sycl.tar.gz
+tar -xzf llama-sycl.tar.gz
+export CASCADIA_LLAMA_BIN="$PWD/cascadia-llama-sycl/llama-server"
+```
+
+Packaging includes dependencies of the selected SYCL runtime and its plugins,
+then checks the staged executable without `LD_LIBRARY_PATH`. Missing runtime
+dependencies or failed relocation stop packaging. The host still provides the
+Intel GPU driver, Level Zero/OpenCL loaders and standard OS libraries.
+
 
 `--device` defaults to `GPU`, which maps to `SYCL0` — no flag needed on a
 one-GPU box.
@@ -152,10 +166,13 @@ The reverse also holds: if the *child* dies mid-session (driver reset,
 OOM kill), the engine brings it back instead of failing every later
 request. The next queued task triggers a reload on a fresh port under
 the same `--llama-load-timeout` / `--llama-load-retries` policy and waits
-on progress markers while the model reloads; a task in flight when the
-child exits still fails with `llama-server exited mid-task`. When the
-reload itself fails, that task fails with `llama-server respawn failed`
-and the next one gets a fresh attempt.
+on progress markers while the model reloads. A request the child had not
+answered when it died — including one sent just as it died — is retried
+on the reloaded child, so the client sees only the reload delay. A request
+that already streamed output fails with `llama-server exited mid-task`;
+it is not replayed. When the reload itself fails, the waiting request
+fails with `llama-server respawn failed` and the next one gets a fresh
+attempt.
 
 Sampling knobs (`top_p`, `top_k`, `seed`, `frequency_penalty`,
 `presence_penalty`, `stop`) are forwarded to the child only when they differ
@@ -342,6 +359,11 @@ runs within 2.5% of the median). Chart: [fig17](../perf/sycl-elastic/fig17_mtp.p
   so streaming and non-streaming clients get the same structured
   `tool_calls` the API produces for other engines. Multimodal parts are not
   plumbed; `prompt` remains the fallback for non-chat engines.
+The API uses the child's final completion-token count when available, including
+reasoning and tool generation that does not appear as visible content. Tool-enabled
+streams buffer their output before emitting structured calls; they include a final
+usage event when `stream_options.include_usage` is true.
+
 
 ## Doctor
 

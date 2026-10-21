@@ -1,5 +1,9 @@
 # sycl-llama engine + `--elastic` device-side mapping — 2026-10-03
 
+> Superseded in part: the child no longer inherits Cascadia's host-elastic
+> interposer. The current environment contract is in
+> [docs/engines/sycl-llama.md](../engines/sycl-llama.md).
+
 ## What this is
 
 `crates/cascadia-engine-llamacpp` — a subprocess-backed engine. Cascadia's

@@ -415,8 +415,8 @@ fn check_ov_devices(r: &mut Report) {
             "OpenVINO runtime",
             "this binary was built WITHOUT --features openvino (stub mode)",
         );
-        r.note("Stub mode runs the `mock` engine only. Rebuild with --features openvino");
-        r.note("for real inference on Intel hardware. See INSTALL.md.");
+        r.note("OpenVINO engines need --features openvino; `mock` and `sycl-llama` do not.");
+        r.note("For GGUF inference, build the patched SYCL child and check the sycl-llama section below. See INSTALL.md.");
         return;
     }
 
