@@ -1,0 +1,320 @@
+{
+ "_source": "experiments/2026-10-05-placement-b70/ (B-results.txt, C-*.json/.mem, A-*.json); medians of 3; card SYCL0 0000:0b:00.0; 27B = Qwen3.8-27B-UD-Q4_K_S, MoE = Qwen3.6-35B-A3B-UD-Q4_K_XL",
+ "link": {
+  "pcie": "4.0 x8",
+  "theoretical_gbps": 15.75
+ },
+ "A": {
+  "arms": [
+   "resident",
+   "--elastic-vram 12 (62/65)",
+   "--elastic-vram 0 (0/65)",
+   "--elastic auto (fits)"
+  ],
+  "tps": [
+   17.58,
+   8.33,
+   0.55,
+   17.49
+  ],
+  "moe": {
+   "arms": [
+    "resident",
+    "--elastic-vram 0",
+    "--elastic-vram 10"
+   ],
+   "tps": [
+    74.22,
+    2.5,
+    4.72
+   ]
+  }
+ },
+ "B": {
+  "resident_tps": 17.22,
+  "auto_tps": 17.17,
+  "resident_peak_gib": 16.15,
+  "N_stream": [
+   62,
+   55,
+   34,
+   0
+  ],
+  "N_host": [
+   62,
+   55,
+   33,
+   0
+  ],
+  "stream_tps": [
+   8.25,
+   2.8,
+   1.1,
+   0.54
+  ],
+  "host_tps": [
+   6.36,
+   3.29,
+   1.46,
+   0.45
+  ],
+  "stream_peak_gib": [
+   15.01,
+   14.39,
+   9.28,
+   3.05
+  ],
+  "host_peak_gib": [
+   15.6,
+   14.01,
+   9.73,
+   3.43
+  ],
+  "offdev_gb_stream": [
+   0.86,
+   2.57,
+   6.98,
+   13.72
+  ],
+  "offdev_gb_host": [
+   0.86,
+   2.57,
+   7.19,
+   13.72
+  ],
+  "stream_gbps": [
+   13.6,
+   8.6,
+   8.2,
+   7.7
+  ],
+  "host_gbps": [
+   8.7,
+   10.5,
+   11.5,
+   6.3
+  ],
+  "law_13gbps_tps": [
+   8.05,
+   3.91,
+   1.68,
+   0.9
+  ],
+  "cascadia_host_layers_tps": 6.25
+ },
+ "D": {
+  "_note": "async stream pool (bb6dcb55) vs the section-A/B sync build, same host, llama-server on SYCL0, ctx 4096, -ctk q8_0 -fa on, temp 0, n_predict 32, model on tmpfs (warm reads), median of 6 (2 rounds x 3 prompts). n0 = GGML_STREAM_RESIDENT_LAYERS=0, n62 = 62/65.",
+  "sync_server": "placement-b70/llama-stack build (sections A/B binary)",
+  "async_server": "llama-stream-v3 build of the bb6dcb55 patch pair",
+  "arms": [
+   "27B n0",
+   "27B n62",
+   "MoE n0",
+   "2x 27B n0 (window)"
+  ],
+  "sync_tps": [
+   0.448,
+   7.531,
+   5.537,
+   0.9
+  ],
+  "async_tps": [
+   0.595,
+   17.211,
+   7.555,
+   1.28
+  ],
+  "sync_range": [
+   [
+    0.447,
+    0.448
+   ],
+   [
+    7.427,
+    7.657
+   ],
+   [
+    5.486,
+    5.562
+   ],
+   null
+  ],
+  "async_range": [
+   [
+    0.593,
+    0.597
+   ],
+   [
+    17.023,
+    17.285
+   ],
+   [
+    7.424,
+    7.689
+   ],
+   null
+  ],
+  "window": {
+   "_note": "common-window aggregate: 4 concurrent 96-token requests across 2 servers, total tokens / elapsed wall seconds. Replaces per-instance t/s sums which overstate steady-state.",
+   "sync": {
+    "seconds": 424.5,
+    "tokens": 384,
+    "agg_tps": 0.9,
+    "per_instance": [
+     0.234,
+     0.236,
+     0.231,
+     0.231
+    ]
+   },
+   "async": {
+    "seconds": 300.0,
+    "tokens": 384,
+    "agg_tps": 1.28,
+    "per_instance": [
+     0.327,
+     0.331,
+     0.33,
+     0.327
+    ]
+   }
+  },
+  "delivered": {
+   "n0_gib": 2865.38,
+   "n0_uploads": 92048,
+   "n0_h2d_gbps": 7.9,
+   "n62_gib": 0.48,
+   "n62_uploads": 13,
+   "moe_gib": 127.9,
+   "moe_uploads": 43392,
+   "moe_expert_gib": 99.6,
+   "moe_routed_tensors": 72,
+   "moe_cache_hit_pct": 0.0,
+   "_accounting_window": "cumulative pool-lifetime counters (pool build -> teardown), not a decode window; includes warmup, prompt processing and decode. n0_h2d_gbps is bytes/whole-lifetime seconds (~390 s implied), not a steady-state PCIe utilization measurement - hardware PCIe counters are unavailable on this host (xe PMU exposes GT events only; sysman pci stats stubbed)"
+  },
+  "parity": "streamed output byte-identical sync vs async (24 tokens, temp 0)",
+  "multidevice": "tensor-split 1.5B over SYCL0+SYCL1: per-device pools (84/70 tensors), decode 9.2 t/s, pools drained 13.39/11.27 GiB per card",
+  "models": {
+   "dense_27b": "Qwen3.8-27B-UD-Q4_K_S.gguf (65 layers; sections A-D)",
+   "moe": "Qwen1.5-MoE-14.3B-A2.7B Q3_K_M (24 layers; section D only - NOT the Qwen3.6-35B-A3B used in sections A-C)",
+   "multidevice": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf, tensor-split SYCL0+SYCL1"
+  },
+  "warmup": "1 discarded request per server start; 6 timed requests per arm (2 rounds x 3 prompts)"
+ },
+ "C": {
+  "card_capacity_gib": 31.89,
+  "arms": [
+   "auto x3",
+   "budgets 12/12/0",
+   "no --elastic (driver oversub)",
+   "2 resident + 1 all-host",
+   "3 x one-third host"
+  ],
+  "per_instance_tps": [
+   [
+    3.49,
+    5.4,
+    0.5
+   ],
+   [
+    1.88,
+    1.87,
+    0.48
+   ],
+   [
+    3.21,
+    4.22,
+    4.15
+   ],
+   [
+    1.18,
+    1.18,
+    0.4
+   ],
+   [
+    0.54,
+    0.54,
+    0.54
+   ]
+  ],
+  "peak_gib": [
+   31.89,
+   31.89,
+   31.7,
+   31.84,
+   31.71
+  ]
+ },
+ "E": {
+  "_note": "reader pool + share cap update (cascadia#171 v2, commit abbd246f6-equivalent patches). 27B = Qwen3.8-27B-UD-Q4_K_S, MoE = Qwen3.6-35B-A3B-UD-Q4_K_XL, ctx 4096, -ctk q8_0 -fa on, SYCL0, single n_predict=32 greedy decode after warmup. Streamed = GGML_STREAM_VRAM_MB=0 unless noted.",
+  "reader_pool_27b": {
+   "threads": [
+    0,
+    1,
+    2,
+    4,
+    8
+   ],
+   "tps": [
+    0.734,
+    0.753,
+    0.8,
+    0.781,
+    0.785
+   ],
+   "note": "fully streamed (0/65 resident, 13087 MiB/token). rt0 = inline serial pread (pre-pool path). rt2 best; H2D copy bandwidth is the residual limit, not reads"
+  },
+  "reader_pool_moe": {
+   "arms": [
+    "rt0 ec0",
+    "rt4 ec0",
+    "rt4 ec1024"
+   ],
+   "tps": [
+    3.85,
+    3.287,
+    3.946
+   ],
+   "note": "fully streamed 35B-A3B. Small expert slices (0.56 MiB stride) lose ~15% on the pool alone; adding the 1 GiB hot-expert cache recovers and beats rt0 (3.95 vs 3.85)"
+  },
+  "share_cap": {
+   "n": [
+    1,
+    3,
+    4294967295
+   ],
+   "budget_mib": [
+    26567,
+    8919,
+    0
+   ],
+   "uncapped_mib": 26567,
+   "formula": "min(free-overhead, floor((total-overhead)/N)); free-overhead 26567, total-overhead 26756 at load time",
+   "explicit_overrides": "GGML_STREAM_VRAM_MB=8192 with SHARE=3 warned and kept 8192; GGML_STREAM_RESIDENT_LAYERS=30 with SHARE=3 warned and kept 30; SHARE=4294967295 capped auto to 0 (full streaming)"
+  },
+  "dispatch_relief": {
+   "pread64_sync_run": {
+    "calls": 17240,
+    "secs": 57.37,
+    "window_s": 59.0,
+    "note": "serial pread ~100% of decode wall on rt0 (2026-10-07 strace)"
+   },
+   "io_window": {
+    "logical_read_gbps": 9.7,
+    "link_effective_gbps": 13.6,
+    "cold_eq_warm": true
+   },
+   "reader_run_rt4": {
+    "reader_threads": {
+     "872361": 9759,
+     "872362": 9649,
+     "872363": 9702,
+     "872364": 9756
+    },
+    "dispatch_threads_preads": 6,
+    "total_pread64": 38872,
+    "note": "strace -f -e pread64 during a 48-token streamed decode: all reads on the 4 pool threads; the dispatch thread performed none"
+   }
+  }
+ }
+}
