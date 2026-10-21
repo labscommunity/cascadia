@@ -81,10 +81,11 @@ inter-token gaps are measured when a chunk is **delivered** to the consumer.
 For the typical single-stream case this tracks engine cadence closely; under
 concurrent serving (several streams sharing one engine) a chunk can sit in
 the cross-task buffer, so samples include that residency. Empty final
-markers never contribute timing samples. For tool-call streaming requests
-the API buffers the whole generation before responding, so
-`cascadia_http_request_duration_seconds` for those requests spans the full
-generation rather than time-to-head.
+markers never contribute timing samples. Chat streams with `tools` send
+content as it is generated, so `cascadia_http_request_duration_seconds`
+tracks time-to-head as for any stream; only text that may be a tool call
+(from a `<tool_call>` marker, or a whole reply that opens like a bare-JSON /
+`<|python_tag|>` call) is withheld until the final chunk.
 
 ## Engine-level
 
