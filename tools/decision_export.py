@@ -318,15 +318,16 @@ def _positive_int(s):
 
 
 # Export peak RAM (process tree working set) as a multiple of the base IR's int8 weights
-# (openvino_language_model.bin + openvino_text_embeddings_model.bin, about 8.3 + 1 GB for
-# Qwen3.5-9B), measured on pawan-01 (Task 58): 1 stage peaked at 8.3 GB for JEV's graft (no
-# --weights) and 20.3 / 20.6 GB for Kev's / Clef's --weights swap; 8 stages at 3.1 / 5.1 / 5.3 GB.
-# run_export holds one stage at a time, so the peak divides by the stage count, down to
-# PEAK_MIN_SHARE of the 1-stage peak: the 8-stage peaks are about a third of it (the process's
-# own memory, and stages that are not all 1/N of the model).
+# (openvino_language_model.bin + openvino_text_embeddings_model.bin: 7.40 + 0.95 = 8.35 GiB for
+# Qwen3.5-9B), measured on pawan-01 (Task 58): 1 stage peaked at 8.25 GiB for JEV's graft (no
+# --weights, 0.99x) and 20.3 / 20.6 GiB for Kev's / Clef's --weights swap (2.43x / 2.47x);
+# 8 stages at 3.1 / 5.1 / 5.3 GiB. run_export holds one stage at a time, so the peak divides by
+# the stage count, down to PEAK_MIN_SHARE of the 1-stage peak: the 8-stage peaks are 0.25-0.37
+# of it (the process's own memory, and stages that are not all 1/N of the model).
 PEAK_PER_WEIGHT_BYTE_GRAFT = 1.0
-PEAK_PER_WEIGHT_BYTE_SWAP = 2.3
-PEAK_MIN_SHARE = 0.35
+PEAK_PER_WEIGHT_BYTE_SWAP = 2.5
+PEAK_MIN_SHARE = 0.38
+GIB = 1 << 30
 IR_WEIGHT_FILES = ("openvino_language_model.bin", "openvino_text_embeddings_model.bin")
 
 
@@ -380,9 +381,9 @@ def memory_refusal(base_ir, stages, swap, ram):
     if ram is None or need <= ram:
         return None
     how = f"x{PEAK_PER_WEIGHT_BYTE_SWAP} for the --weights swap" if swap else f"x{PEAK_PER_WEIGHT_BYTE_GRAFT}"
-    return (f"the export needs about {need / 1e9:.1f} GB of RAM at --stages {stages} (the base IR's "
-            f"{ir_weight_bytes(base_ir) / 1e9:.1f} GB of int8 weights, {how}), but this machine has "
-            f"{ram / 1e9:.1f} GB: export with --stages 8 instead (a tree for a low-memory machine, one "
+    return (f"the export needs about {need / GIB:.1f} GiB of RAM at --stages {stages} (the base IR's "
+            f"{ir_weight_bytes(base_ir) / GIB:.1f} GiB of int8 weights, {how}), but this machine has "
+            f"{ram / GIB:.1f} GiB: export with --stages 8 instead (a tree for a low-memory machine, one "
             f"stage in memory at a time), or pass --skip-memory-check to try anyway")
 
 
