@@ -895,7 +895,8 @@ so its supervisor restarts it (below):
   a 27B 2-stage pipeline rank (12-15 GB per stage) get 1: two such leaks are not safe on a GPU
   that shares the host's RAM. There the first fault recovers and the request is retried (above);
   the second fails the engine, and the server exits for a supervisor restart (below), about 22 s
-  warm for a 1-stage 9B tree. The engine logs its cap at load (`qwen36: stage recompile cap`, with
+  warm for a 1-stage 9B tree. If a stage's weight file size cannot be read at load, the cap
+  stays 2, the pre-Task 58 behaviour. The engine logs its cap at load (`qwen36: stage recompile cap`, with
   `total`, `local_stages`, `largest_leak_bytes` and `cap`), and every `recompile` recovery line
   carries `recompiled` and `cap`.
 - The request could not be abandoned (the shim is out of memory), or its state cannot be read.
