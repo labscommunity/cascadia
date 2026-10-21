@@ -8,6 +8,9 @@
         not the Base checkpoint's; --tokenizer FILE overrides that for any family)
   clef: python tools/decision_export.py clef --base-ir STOCK_INT8_IR --weights CLEF_DIR --clef-dir CLEF_DIR --out TREE
   any family: --max-tokens N sets decision.json max_tokens (default: resolve_max_tokens)
+  any family: --stages N (default 1, a single box; one per rank for a pipeline; 8 for a low-memory
+              single box). The export is refused before any work when its estimated peak RAM
+              (export_peak_bytes) exceeds the machine's (--skip-memory-check overrides).
 
 The stage IRs come from export_qwen36_moe.run_export (one stage in memory at a time).
 The decision profile and head assets are written BEFORE the stage export, so the
@@ -314,6 +317,75 @@ def _positive_int(s):
     return n
 
 
+# Export peak RAM (process tree working set) as a multiple of the base IR's int8 weights
+# (openvino_language_model.bin + openvino_text_embeddings_model.bin, about 8.3 + 1 GB for
+# Qwen3.5-9B), measured on pawan-01 (Task 58): 1 stage peaked at 8.3 GB for JEV's graft (no
+# --weights) and 20.3 / 20.6 GB for Kev's / Clef's --weights swap; 8 stages at 3.1 / 5.1 / 5.3 GB.
+# run_export holds one stage at a time, so the peak divides by the stage count, down to
+# PEAK_MIN_SHARE of the 1-stage peak: the 8-stage peaks are about a third of it (the process's
+# own memory, and stages that are not all 1/N of the model).
+PEAK_PER_WEIGHT_BYTE_GRAFT = 1.0
+PEAK_PER_WEIGHT_BYTE_SWAP = 2.3
+PEAK_MIN_SHARE = 0.35
+IR_WEIGHT_FILES = ("openvino_language_model.bin", "openvino_text_embeddings_model.bin")
+
+
+def ir_weight_bytes(base_ir):
+    """Bytes of the base IR's int8 weight files the export reads (0 for a missing file)."""
+    return sum(os.path.getsize(p) for p in (os.path.join(base_ir, f) for f in IR_WEIGHT_FILES)
+               if os.path.isfile(p))
+
+
+def export_peak_bytes(base_ir, stages, swap):
+    """Estimated peak RAM of an export of `base_ir` cut into `stages` stages; `swap` when
+    --weights replaces the IR's weights (Kev, Clef), else the IR keeps its own (JEV's graft)."""
+    per_byte = PEAK_PER_WEIGHT_BYTE_SWAP if swap else PEAK_PER_WEIGHT_BYTE_GRAFT
+    share = max(1 / stages, PEAK_MIN_SHARE)
+    return int(ir_weight_bytes(base_ir) * per_byte * share)
+
+
+def physical_ram_bytes():
+    """This machine's physical RAM in bytes, or None when it cannot be read (stdlib only)."""
+    if sys.platform == "win32":
+        import ctypes
+
+        class MemoryStatusEx(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        st = MemoryStatusEx()
+        st.dwLength = ctypes.sizeof(st)
+        return int(st.ullTotalPhys) if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)) else None
+    try:  # Linux and macOS
+        n = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        if n > 0:
+            return n
+    except (ValueError, OSError, AttributeError):
+        pass
+    if sys.platform == "darwin":
+        import subprocess
+        try:
+            return int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True,
+                                      check=True).stdout.strip())
+        except (OSError, ValueError, subprocess.CalledProcessError):
+            return None
+    return None
+
+
+def memory_refusal(base_ir, stages, swap, ram):
+    """Why the export would not fit in `ram` bytes, or None when it fits (or `ram` is unknown)."""
+    need = export_peak_bytes(base_ir, stages, swap)
+    if ram is None or need <= ram:
+        return None
+    how = f"x{PEAK_PER_WEIGHT_BYTE_SWAP} for the --weights swap" if swap else f"x{PEAK_PER_WEIGHT_BYTE_GRAFT}"
+    return (f"the export needs about {need / 1e9:.1f} GB of RAM at --stages {stages} (the base IR's "
+            f"{ir_weight_bytes(base_ir) / 1e9:.1f} GB of int8 weights, {how}), but this machine has "
+            f"{ram / 1e9:.1f} GB: export with --stages 8 instead (a tree for a low-memory machine, one "
+            f"stage in memory at a time), or pass --skip-memory-check to try anyway")
+
+
 def write_clef_profile(clef_dir, out_dir, max_tokens=16384, chunk=8192):
     from safetensors import safe_open
     from weight_swap import Weights
@@ -340,7 +412,11 @@ def main():
     ap.add_argument("family", choices=["jev", "kev", "clef"])
     ap.add_argument("--base-ir", required=True, help="Intel stock int8 IR dir (OpenVINO/Qwen3.5-9B-int8-ov or Qwen3.8-27B-int8-ov)")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--stages", type=int, default=8, help="stage cut count: 8 for a single box, one per rank for a pipeline")
+    ap.add_argument("--stages", type=_positive_int, default=1,
+                    help="stage cut count: 1 for a single box (default), one per rank for a pipeline; "
+                         "8 for a single box with too little RAM to export one stage (see --skip-memory-check)")
+    ap.add_argument("--skip-memory-check", action="store_true",
+                    help="export even when the estimated peak RAM exceeds this machine's physical RAM")
     ap.add_argument("--layer-split", default=None)
     ap.add_argument("--weights", default=None, help="HF checkpoint whose weights replace the IR's (clef: defaults to --clef-dir)")
     ap.add_argument("--lora", default=None)
@@ -422,6 +498,12 @@ def main():
         max_tokens = resolve_max_tokens(a.family, a.max_tokens, _max_position_embeddings(src), src, hidden)
     except ValueError as e:
         ap.error(str(e))
+    # Before any heavy work (asset writers, the stage export): a 1-stage export holds the whole
+    # model at once, which a low-memory machine cannot.
+    if not a.skip_memory_check:
+        why = memory_refusal(a.base_ir, a.stages, bool(weights), physical_ram_bytes())
+        if why:
+            ap.error(why)
     from export_qwen36_moe import run_export
 
     # The decision assets below are written before run_export; drop any manifest from an

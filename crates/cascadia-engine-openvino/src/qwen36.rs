@@ -66,9 +66,16 @@ const STAGE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// for stage6 and 2.5 GB for stage7 of the 9B int8 tree, on a GPU that shares system RAM), so a
 /// fault that recurs cannot exhaust memory: the abandon past this marks the engine failed.
 const MAX_RECOMPILES: usize = 2;
+/// [`MAX_RECOMPILES`] for an engine that runs a single local stage on a single box (a 1-stage
+/// tree, Task 58): its one stage is the whole model, so a recompile leaks about 9 GB on the 9B
+/// int8 tree, and two such leaks are not safe on a box that shares system RAM with the GPU. The
+/// first fault recovers (and the request is retried, Task 57); the second fails the engine, and
+/// the server exits for a supervisor restart (Task 56).
+const SINGLE_STAGE_MAX_RECOMPILES: usize = 1;
 /// Successful recompiles at which the engine is flagged degraded (Task 54 fix round 3): each one
 /// leaves one leaked stage copy, and two leaked copies cost decode about 16%. A recompile that
-/// fails also leaks a copy, but it fails the engine, so no later recompile can warn.
+/// fails also leaks a copy, but it fails the engine, so no later recompile can warn. Under
+/// [`SINGLE_STAGE_MAX_RECOMPILES`] only one recompile can succeed, so this never warns there.
 const DEGRADED_AT_RECOMPILES: usize = 2;
 /// Bound on one stage recompile, run on a helper thread (Task 54 fix round 2). A cold compile
 /// without the model cache can take tens of seconds; a cache-warm one measured 1.2-1.7 s on p01.
@@ -862,14 +869,22 @@ impl Builder for Qwen36Builder {
             max_ctx = ?self.max_ctx,
             "qwen35 prefix cache"
         );
+        let stages: Vec<OvStage> = self
+            .stages
+            .ok_or(EngineError::NotLoaded)?
+            .into_iter()
+            .map(OvStage::Ov)
+            .collect();
+        let cap = recompile_cap(self.total, stages.len());
+        info!(
+            total = self.total,
+            local_stages = stages.len(),
+            cap,
+            "qwen36: stage recompile cap"
+        );
         Ok(Box::new(Qwen36Engine {
             emb: self.emb.map(OvStage::Ov),
-            stages: self
-                .stages
-                .ok_or(EngineError::NotLoaded)?
-                .into_iter()
-                .map(OvStage::Ov)
-                .collect(),
+            stages,
             tokenizer: self.tokenizer,
             eos: self.eos,
             max_tokens_default: self.max_tokens_default,
@@ -916,7 +931,7 @@ impl Builder for Qwen36Builder {
             engine_failed: None,
             failure: Default::default(),
             stage_idle_timeout: STAGE_IDLE_TIMEOUT,
-            rebuild: Rebuild::new(self.emb_recipe, self.stage_recipes),
+            rebuild: Rebuild::new(self.emb_recipe, self.stage_recipes, cap),
             fresh_requests: Vec::new(),
             max_ctx: self.max_ctx,
             refresh_costs: Default::default(),
@@ -1238,6 +1253,17 @@ impl StageRecipe {
     }
 }
 
+/// The recompile cap of an engine with `local_stages` stages in a pipeline of `total` ranks:
+/// [`SINGLE_STAGE_MAX_RECOMPILES`] for a single box running one stage (each recompile leaks the
+/// whole model), [`MAX_RECOMPILES`] otherwise (each leaks one stage of several).
+fn recompile_cap(total: u32, local_stages: usize) -> usize {
+    if total == 1 && local_stages == 1 {
+        SINGLE_STAGE_MAX_RECOMPILES
+    } else {
+        MAX_RECOMPILES
+    }
+}
+
 /// The compile `load` runs, and the one a recompile repeats.
 fn compile_runtime(r: &StageRecipe) -> cascadia_ov_genai_shim::Result<Runtime> {
     Runtime::compile(&r.xml, &r.device, &r.plugin)
@@ -1254,7 +1280,7 @@ struct Rebuild {
     factory: StageFactory,
     /// [`RECOMPILE_TIMEOUT`]; shorter in tests.
     timeout: Duration,
-    /// [`MAX_RECOMPILES`]; changed in tests.
+    /// [`recompile_cap`]; changed in tests.
     cap: usize,
     /// Recompiles this engine has started.
     recompiled: usize,
@@ -1276,13 +1302,13 @@ struct Rebuild {
 }
 
 impl Rebuild {
-    fn new(emb: Option<StageRecipe>, stages: Vec<StageRecipe>) -> Self {
+    fn new(emb: Option<StageRecipe>, stages: Vec<StageRecipe>, cap: usize) -> Self {
         Self {
             emb,
             stages,
             factory: Arc::new(|r: &StageRecipe| compile_runtime(r).map(OvStage::Ov)),
             timeout: RECOMPILE_TIMEOUT,
-            cap: MAX_RECOMPILES,
+            cap,
             recompiled: 0,
             recompiles_ok: 0,
             leaked_copies: 0,
@@ -5515,7 +5541,7 @@ mod tests {
             engine_failed: None,
             failure: Default::default(),
             stage_idle_timeout: STAGE_IDLE_TIMEOUT,
-            rebuild: Rebuild::new(None, Vec::new()),
+            rebuild: Rebuild::new(None, Vec::new(), recompile_cap(total, 0)),
             fresh_requests: Vec::new(),
             max_ctx: None,
             refresh_costs: Default::default(),
@@ -7387,7 +7413,7 @@ mod tests {
             .collect();
         let ctl = Arc::new(std::sync::Mutex::new(RecompileCtl::default()));
         let c = Arc::clone(&ctl);
-        e.rebuild = Rebuild::new(emb, stages);
+        e.rebuild = Rebuild::new(emb, stages, recompile_cap(e.total, e.stages.len()));
         e.rebuild.factory = Arc::new(move |r: &StageRecipe| {
             let (_, (inputs, width, peak, events)) = templates
                 .iter()
@@ -7945,6 +7971,102 @@ mod tests {
             0,
             "the cap-refused copy is never dropped, even with the engine"
         );
+    }
+
+    #[test]
+    fn the_recompile_cap_is_one_only_for_a_single_stage_on_a_single_box() {
+        // Task 58: a 1-stage tree's recompile leaks the whole model (about 9 GB on the 9B int8
+        // tree), so a single box running one stage recompiles once; a multi-stage tree or a
+        // pipeline rank (one stage of several) keeps two.
+        assert_eq!(SINGLE_STAGE_MAX_RECOMPILES, 1);
+        assert_eq!(recompile_cap(1, 1), 1);
+        for (total, local) in [(1, 2), (1, 8), (2, 1), (8, 1), (4, 2), (1, 0)] {
+            assert_eq!(
+                recompile_cap(total, local),
+                MAX_RECOMPILES,
+                "{total}/{local}"
+            );
+        }
+        assert_eq!(mock_box().rebuild.cap, 2, "two local stages");
+        assert_eq!(mock_one_stage_box().rebuild.cap, 1, "one local stage");
+    }
+
+    /// Task 58: a single box over one mock IR (a 1-stage tree), recompile armed.
+    fn mock_one_stage_box() -> Qwen36Engine {
+        let mut e = bare_engine(1, "{}");
+        e.rank = 0;
+        e.hidden = MOCK_HIDDEN;
+        e.tokenizer = Some(tiny_tokenizer());
+        e.vocab = Some(MOCK_VOCAB);
+        e.decision_assets = Some(crate::decision::HeadAssets::Verbalizer);
+        let emb = MockStage::new(&["input_ids"], MOCK_HIDDEN, None);
+        let s0 = MockStage::new(&FIRST_STAGE_INPUTS, MOCK_VOCAB, Some(1));
+        e.emb = Some(OvStage::Mock(emb));
+        e.stages = vec![OvStage::Mock(s0)];
+        arm_recompile(&mut e);
+        e
+    }
+
+    /// Stage 0's next infer fails and its request never goes idle (abandoned, then recompiled).
+    fn stage0_stuck_on_next_infer(
+        e: &mut Qwen36Engine,
+    ) -> Arc<std::sync::Mutex<Vec<&'static str>>> {
+        let OvStage::Mock(m) = &mut e.stages[0] else {
+            unreachable!()
+        };
+        m.fail_infer_at = Some(m.infers);
+        m.busy_after_fail = u32::MAX;
+        Arc::clone(&m.events)
+    }
+
+    #[test]
+    fn a_single_stage_box_recovers_once_and_its_second_abandon_fails_the_engine() {
+        // Task 58: the first fault recovers (one recompile) and Task 57 retries the request, which
+        // is served; the second abandon is past the cap of one, so the engine fails (Task 56: the
+        // server exits for a supervisor restart) instead of leaking a second whole-model copy.
+        let mut e = mock_one_stage_box();
+        e.stage_idle_timeout = Duration::from_millis(100);
+        let ctl = arm_recompile(&mut e);
+        assert_eq!(e.rebuild.cap, 1);
+        let watched = e.failure();
+
+        let mut clean = mock_one_stage_box();
+        clean.submit(chat("c1")).unwrap();
+        let (want, _) = drive(&mut clean);
+        assert!(want.iter().all(|c| c.error.is_none()), "{want:?}");
+
+        stage0_stuck_on_next_infer(&mut e);
+        e.submit(chat("c1")).unwrap();
+        let (got, _) = drive(&mut e);
+        assert!(
+            got.iter().all(|c| c.error.is_none()),
+            "retried and served: {got:?}"
+        );
+        assert_eq!(text(&got), text(&want));
+        assert_eq!(e.rebuild.recompiled, 1);
+        assert_eq!(e.rebuild.recompiles_ok, 1);
+        assert!(
+            !e.rebuild.degraded_warned,
+            "one recompile is below DEGRADED_AT_RECOMPILES"
+        );
+        assert_eq!(watched.reason(), None, "recovered");
+
+        let events = stage0_stuck_on_next_infer(&mut e);
+        e.submit(chat("c2")).unwrap();
+        let (got, _) = drive(&mut e);
+        let why = got.last().and_then(|c| c.error.as_deref()).expect("fails");
+        assert!(
+            why.contains("this engine has already recompiled 1 stages, the cap of 1")
+                && why.ends_with("restart the server"),
+            "{why}"
+        );
+        assert_eq!(ctl.lock().unwrap().built, ["stage0"], "no second recompile");
+        assert_eq!(events.lock().unwrap().last(), Some(&"abandon"));
+        assert_eq!(e.rebuild.recompiled, 1);
+        assert!(e.engine_failed.is_some());
+        assert_eq!(watched.reason(), e.engine_failed);
+        assert!(matches!(e.stages[0], OvStage::Gone("recovery")));
+        assert_eq!((e.rebuild.leaked_copies, e.rebuild.leaked_bytes), (2, 2000));
     }
 
     #[test]

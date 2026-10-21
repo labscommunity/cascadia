@@ -644,7 +644,26 @@ python tools/decision_export.py clef --base-ir STOCK_INT8_IR \
   --clef-dir CLEF_DIR --out /models/clef-flash-int8
 ```
 
-- `--stages N` sets the stage cut count: 8 for a single box, one per rank for a pipeline.
+- `--stages N` sets the stage cut count. The default, 1, is the tree for a single box: one stage
+  holds the whole model, which serves faster (see [One stage or eight](#one-stage-or-eight)).
+  A pipeline passes one per rank (`--stages 2` for two machines), as before. `--stages 8` cuts a
+  single-box tree for a machine with too little RAM for the 1-stage export: the export then holds
+  one stage at a time. Exporter peak RAM (process tree working set) measured on pawan-01, 1 stage
+  against 8: JEV 8.3 against 3.1 GB, Kev 20.3 against 5.1 GB, Clef-flash 20.6 against 5.3 GB.
+- The exporter checks its memory before it writes anything. It estimates its peak RAM from the base
+  IR's int8 weight files (`openvino_language_model.bin` plus `openvino_text_embeddings_model.bin`,
+  about 9.3 GB for Qwen3.5-9B): 2.3 times their size with `--weights` (Kev, Clef), 1.0 times
+  without (JEV's graft), divided by `--stages N` down to a floor of 0.35 of that (the 8-stage
+  peaks are about a third of the 1-stage ones). That covers the measured peaks above with a few
+  percent to spare. When the estimate exceeds the machine's physical RAM, the export is refused:
+  `the export needs about 21.4 GB of RAM at --stages 1 (the base IR's 9.3 GB of int8 weights, x2.3
+  for the --weights swap), but this machine has 16.0 GB: export with --stages 8 instead ...`.
+  `--skip-memory-check` exports anyway. When the RAM cannot be read, nothing is refused. The check
+  uses only the Python standard library (`sysconf` on Linux and macOS, `GlobalMemoryStatusEx` on
+  Windows).
+- A 1-stage tree also loads slower (warm load to `API serving` 21-24 s against 7-13 s for 8
+  stages), and a fault recovery leaks the whole model, so its engine recompiles at most once (see
+  [Engine failures](#engine-failures)).
 - `--max-tokens N` sets `decision.json` `max_tokens` for any family. The default is 32,768 for
   JEV, 73,728 for Kev and 16,384 for Clef, each lowered to the tree's `max_position_embeddings`
   (from the `config.json` the tree ships: the one in `--weights`, which for Clef defaults to
@@ -834,7 +853,9 @@ the whole old copy (compiled model and weights) is leaked, whatever the recompil
 holds when the engine fails instead (cap reached, no recipe, a request that cannot be abandoned)
 and for a recompiled copy whose first infer fails or does not return: that copy is leaked too,
 never left to drop with the engine. **Each recovery costs about one stage of memory**: the stage's weight file, 1.49 GB for stage6 and
-2.47 GB for stage7 of the 9B int8 tree, on a GPU that shares the host's RAM (31.6 GB on p01).
+2.47 GB for stage7 of the 8-stage 9B int8 tree, on a GPU that shares the host's RAM (31.6 GB on p01).
+On a 1-stage tree (the single-box default) the one stage is the whole model, so a recovery leaks
+about 9 GB.
 
 A recompiled stage needs nothing re-bound. Every input is set on each infer, and its variable
 state starts empty. The scrub skips its reset and rebuild (it is fresh and has never run). The
@@ -860,15 +881,24 @@ so its supervisor restarts it (below):
   suspect, not the stage. This is a deliberate choice: a single recurrence of the intermittent
   fault on that first infer looks the same as a broken device, so it fails the engine even when
   a second recompile might have served.
-- This engine has already recompiled 2 stages (`MAX_RECOMPILES`), and a third request is
+- This engine has already recompiled as many stages as its cap, and another request is
   abandoned. The cap is per engine (one engine per process in production). Each recompile leaks
-  a stage's weights, so this cap stops a fault that recurs from exhausting memory.
+  a stage's weights, so the cap stops a fault that recurs from exhausting memory. It is 2
+  (`MAX_RECOMPILES`), or 1 (`SINGLE_STAGE_MAX_RECOMPILES`) when the engine runs a single local
+  stage on a single box (a 1-stage tree), where a recompile leaks the whole model (about 9 GB)
+  and two such leaks are not safe on a GPU that shares the host's RAM. There the first fault
+  recovers and the request is retried (above); the second fails the engine, and the server exits
+  for a supervisor restart (below), about 22 s warm for a 1-stage tree. A multi-stage tree, and a
+  pipeline rank that runs one stage of several, keep 2. The engine logs its cap at load
+  (`qwen36: stage recompile cap`, with `total`, `local_stages` and `cap`), and every `recompile`
+  recovery line carries `recompiled` and `cap`.
 - The request could not be abandoned (the shim is out of memory), or its state cannot be read.
 
 A failed engine fails the task that ran the recovery, and every later one at once, with
 `backend error: qwen36 engine failed: <reason>; restart the server`. For example: `stage6's
 infer request was still Cancelled ... abandoned; this engine has already recompiled 2 stages,
-the cap of 2, so stage6 is not recompiled`, or `...; recompiling stage6 timed out after 180000
+the cap of 2, so stage6 is not recompiled` (`... recompiled 1 stages, the cap of 1, so stage0 is
+not recompiled` on a 1-stage tree), or `...; recompiling stage6 timed out after 180000
 ms`. Chat and decisions return their 5xx. Only a restart recovers it.
 
 **The server exits so the supervisor restarts it.** On rank 0 or a single box (`cascadia worker
@@ -879,7 +909,8 @@ failing request's 5xx and any requests already refused), runs the same bounded c
 SIGTERM (up to 10 s), and exits non-zero. Both production units restart on a non-zero exit:
 systemd's `Restart=on-failure` and NSSM's `AppExit Default Restart` (see
 [docs/deploy/README.md](deploy/README.md)). A warm restart (model cache warm) measured about 5 s
-to `API serving` on pawan-03, after the supervisor's own delay (systemd `RestartSec=5`). If
+to `API serving` on pawan-03 for an 8-stage tree, and 21-24 s (about 22 s) on pawan-01 for a
+1-stage tree, after the supervisor's own delay (systemd `RestartSec=5`). If
 the close overruns its 10 s, the process exits non-zero at once instead of waiting on it.
 Requests that arrive while the server is down get a connection refused, so clients should
 retry. A SIGTERM or SIGINT still exits 0. Only qwen35 reports a failed engine; the other
@@ -899,7 +930,10 @@ engine's second successful recompile it logs one `warn` line, once per engine: `
 degraded: 2 stage copies leaked by fault recovery (N bytes); decode is slower until the server
 restarts (measured +16% with two on an Arc 140V); restart recommended`, with `leaked_copies`,
 `leaked_bytes` and `cap` fields. The rule keys on successful recompiles: a recovery that fails
-also leaks a copy, but it fails the engine, so no later recompile can warn. The code would name a
+also leaks a copy, but it fails the engine, so no later recompile can warn. With the cap of 1 (a
+1-stage tree) only one recompile can succeed, so this warning never fires there: the one leaked
+whole-model copy (about 9 GB) stays until the restart, and the next fault fails the engine instead
+of leaking a second. Its decode cost was not measured. The code would name a
 helper thread leaked by a timed-out recompile in the text, but that cannot happen today: a
 timed-out recompile fails the engine. The API process's `/metrics` exposes
 `cascadia_engine_stage_recompiles_total` (counter: successful recompiles) and
@@ -970,7 +1004,8 @@ request on the same compiled model then failed its first infer. The engine now r
 stage (above). On pawan-01 (build 0c61635a, chat soak) the fault hit stage3 and later stage6 in
 one run; both times the recompile took under 0.4 s, the recompiled stage's first infer
 succeeded, and the next request was served. If a recompiled stage's first infer ever fails, the
-engine fails.
+engine fails. On OpenVINO 2026.4.0 a 1-stage tree ran 0 faults in 100 rounds on pawan-01, where
+the 8-stage tree faults in about 3% of rounds.
 
 ## Devices
 
@@ -999,6 +1034,25 @@ static or bounded shapes. Cascadia's existing NPU path, for other engines, compi
 static decode and prefill-chunk variants. Bringing decision trees to it would need the same for
 every qwen35 stage: a static prefill chunk with padding, a static readout, and a bounded
 linear-attention and KV state. That is a separate project, not a flag.
+
+### One stage or eight
+
+A single box serves a 1-stage tree (the exporter's default) faster than the same weights cut into
+8 stages. Measured on pawan-01 (Arc 140V, `--device GPU`, OpenVINO 2026.4.1, build bd02a0f5), same
+weights exported both ways:
+
+| Model | td40 decision p50, 8 → 1 stage | 1600-token chat, 8 → 1 stage | GPU parity (both) |
+|---|---|---|---|
+| JEV-9B | 3.46 → 2.51 s (-27.7%) | 211.7 → 184.9 s (-12.7%) | 80/82 |
+| Kev-9B | 2.52 → 1.92 s (-23.8%) | 211.6 → 185.6 s (-12.3%) | 82/82 |
+| Clef-flash | 1.38 → 1.17 s (-15.0%) | 188.7 → 174.2 s (-7.7%) | 82/82 |
+
+`bench_cases.py compare` found no confident flips between the two layouts. The costs: warm load
+to `API serving` 21-24 s against 7-13 s; exporter peak RAM 8.3 / 20.3 / 20.6 GB against 3.1 / 5.1
+/ 5.3 GB (JEV / Kev / Clef-flash), which is why a low-memory machine exports `--stages 8`; and a
+fault recovery leaks the whole model (about 9 GB) instead of one stage (1.5-2.5 GB), so the engine
+recompiles at most once (see [Engine failures](#engine-failures)). On OpenVINO 2026.4.0 the
+1-stage tree also ran 0 BUG-1 faults in 100 rounds, where 8 stages fault in about 3% of rounds.
 
 ### Measuring
 
@@ -1091,7 +1145,7 @@ hf download OpenVINO/Qwen3.5-9B-int8-ov --include "openvino_language_model.*" --
 hf download autotrust/JEV-9B --include "adapter_vllm/*" --include calibration.json --include tokenizer.json \
     --include tokenizer_config.json --local-dir ~/models/jev9b
 python tools/decision_export.py jev --base-ir ~/models/qwen35-9b-int8 --adapter-dir ~/models/jev9b/adapter_vllm \
-    --out ~/trees/jev9b-int8           # 8 stages; 201 LoRA branches grafted (25 per stage, 26 on the last)
+    --out ~/trees/jev9b-int8           # 1 stage; 201 LoRA branches grafted (--stages 8: 25 per stage, 26 on the last)
 cascadia run ~/trees/jev9b-int8 --engine qwen35 --device CPU --api 127.0.0.1:8080
 ```
 
@@ -1110,7 +1164,8 @@ The warmup measured the prefix-cache snapshot model at 53.5 MB fixed + 64 KiB pe
 
 **Apple Silicon:** OpenVINO's ARM CPU plugin expands quantized weights when it compiles, so one process
 serving all 8 stages needs far more than the 8.3 GB of int8 weights (it went to ~37 GB of swap on a 36 GB
-M4 Max). Serve the 9B models on x86 (Intel) hosts; on a Mac, only one stage per process fits.
+M4 Max). Serve the 9B models on x86 (Intel) hosts; on a Mac, only one stage per process fits (export
+with `--stages 8`).
 
 ### Kev-9B
 
@@ -1124,7 +1179,7 @@ hf download Qwen/Qwen3.5-9B-Base --revision 68c46c4b3498877f3ef123c856ecfde50c39
 hf download jaredpalmer/kev-9b adapter_model.safetensors adapter_config.json head.pt tokenizer.json --local-dir ~/models/kev9b
 python tools/decision_export.py kev --base-ir ~/models/qwen35-9b-int8 --weights ~/models/qwen35-9b-base \
     --lora ~/models/kev9b/adapter_model.safetensors --head-pt ~/models/kev9b/head.pt \
-    --out ~/trees/kev9b-int8           # 8 stages; 248 LoRA branches grafted (31 per stage)
+    --out ~/trees/kev9b-int8           # 1 stage; 248 LoRA branches grafted (--stages 8: 31 per stage)
 cascadia run ~/trees/kev9b-int8 --engine qwen35 --device CPU --api 127.0.0.1:8080
 ```
 
@@ -1241,8 +1296,9 @@ python tools/decision_export.py clef --base-ir ~/models/qwen38-27b-int8 --weight
     --clef-dir ~/models/clef --stages 2 --out ~/trees/clef-int8
 ```
 
-The export holds a whole stage's new int8 constants (12–15 GB) and needs about 16 GB free; it is the one
-export above the 7 GB cap. Serve it with the two `cascadia worker` commands shown for JEV-27B.
+The export holds a whole stage's new int8 constants (12–15 GB) and needs about 16 GB free. The exporter's
+memory check, calibrated on the 9B exports, estimates about 32 GB here (2.3 times the 28 GB of int8
+weights, halved for 2 stages), at the limit of a 32 GB host; if it refuses, pass `--skip-memory-check`. Serve it with the two `cascadia worker` commands shown for JEV-27B.
 
 **Measured parity** (same two hosts and set as JEV-27B; one joint pass per record, 50 passes for 82
 questions):
