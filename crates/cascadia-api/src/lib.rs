@@ -1931,6 +1931,10 @@ struct ToolStreamSplitter {
     scan_start: usize,
     /// Thinking on, no `</think>` yet: where the next search for it starts.
     think_from: Option<usize>,
+    /// First non-whitespace byte at/after `scan_start` (`buf.len()` while
+    /// only whitespace has arrived). Advanced per feed, so a long leading
+    /// whitespace run is scanned once, not on every feed.
+    lead: usize,
 }
 
 /// The decision at the end of a tools-active stream.
@@ -1954,6 +1958,7 @@ impl ToolStreamSplitter {
             enable_thinking,
             scan_start: 0,
             think_from: enable_thinking.then_some(0),
+            lead: 0,
         }
     }
 
@@ -1985,30 +1990,32 @@ impl ToolStreamSplitter {
 
     fn push(&mut self, text: &str) {
         self.buf.push_str(text);
-        let Some(from) = self.think_from else {
-            return;
-        };
-        match self.buf[from..].find(THINK_CLOSE) {
-            Some(i) => {
-                self.scan_start = from + i + THINK_CLOSE.len();
-                self.think_from = None;
-            }
-            // Only the last `len - 1` bytes can start a delimiter that the
-            // next feed completes.
-            None => {
-                let mut next = self.buf.len().saturating_sub(THINK_CLOSE.len() - 1);
-                while !self.buf.is_char_boundary(next) {
-                    next -= 1;
+        if let Some(from) = self.think_from {
+            match self.buf[from..].find(THINK_CLOSE) {
+                Some(i) => {
+                    self.scan_start = from + i + THINK_CLOSE.len();
+                    self.think_from = None;
+                    self.lead = self.scan_start;
                 }
-                self.think_from = Some(next.max(from));
+                // Only the last `len - 1` bytes can start a delimiter that the
+                // next feed completes.
+                None => {
+                    let mut next = self.buf.len().saturating_sub(THINK_CLOSE.len() - 1);
+                    while !self.buf.is_char_boundary(next) {
+                        next -= 1;
+                    }
+                    self.think_from = Some(next.max(from));
+                }
             }
         }
+        let rest = &self.buf[self.lead..];
+        self.lead += rest.len() - rest.trim_start().len();
     }
 
     /// First byte that may still belong to a tool call.
     fn hold_point(&self) -> usize {
         let start = self.scan_start;
-        let lead = self.buf[start..].trim_start();
+        let lead = &self.buf[self.lead..];
         if lead.is_empty()
             || lead.starts_with(['{', '['])
             || lead.starts_with(PYTHON_TAG)
@@ -3448,16 +3455,11 @@ impl ToolStream {
                 Some(finish_reason),
             ),
             ToolStreamEnd::ToolCalls { content, calls } => {
+                // The held tokens are the call's: they ride the tool_calls
+                // delta, so each model token is counted in exactly one frame.
                 let mut out = String::new();
                 if !content.is_empty() {
-                    out.push_str(&content_frame(
-                        task_id,
-                        model,
-                        content,
-                        n_tokens,
-                        completion_tokens,
-                        None,
-                    ));
+                    out.push_str(&content_frame(task_id, model, content, 0, None, None));
                 }
                 let tool_calls: Vec<serde_json::Value> = calls
                     .into_iter()
@@ -3472,6 +3474,7 @@ impl ToolStream {
                 let delta = serde_json::json!({
                     "id": task_id, "object": "chat.completion.chunk",
                     "created": now_unix(), "model": model,
+                    "n_tokens": n_tokens, "completion_tokens": completion_tokens,
                     "choices": [{ "index": 0,
                         "delta": { "role": "assistant", "tool_calls": tool_calls },
                         "finish_reason": serde_json::Value::Null }],
@@ -6610,6 +6613,11 @@ level={{ effort_map[eff] }}";
         let (out, calls) = run_splitter(&["a <", "b>bold</b>", ""], false);
         assert_eq!(out, ["a ", "<b>bold</b>", ""]);
         assert!(calls.is_none());
+        // Leading whitespace is held across feeds until the first real
+        // byte decides, then released with it.
+        let (out, calls) = run_splitter(&[" ", "\n", "  ", "Hi", " there", ""], false);
+        assert_eq!(out, ["", "", "", " \n  Hi", " there", ""]);
+        assert!(calls.is_none());
     }
 
     #[test]
@@ -6712,6 +6720,8 @@ level={{ effort_map[eff] }}";
             format!("<think>plan</think>\n{WEATHER_CALL}"),
             "  {\"name\":\"Alice\",\"age\":30}".to_owned(),
             "<|python_tag|>{\"name\":\"f\",\"parameters\":{}}".to_owned(),
+            "<think>plan</think> \n {\"name\":\"f\",\"arguments\":{}}".to_owned(),
+            "<think> plan</think>  \n then text".to_owned(),
         ];
         // Call ids are random; the decision is the (name, arguments) list.
         let functions = |calls: Option<Vec<ToolCall>>| {
@@ -6923,6 +6933,66 @@ level={{ effort_map[eff] }}";
             usage["usage"],
             serde_json::json!({"prompt_tokens":5,"completion_tokens":3,"total_tokens":8})
         );
+    }
+
+    /// Sum of the custom per-frame `n_tokens` across an SSE body.
+    fn frame_tokens(events: &[Value]) -> u64 {
+        events.iter().filter_map(|e| e["n_tokens"].as_u64()).sum()
+    }
+
+    #[tokio::test]
+    async fn streaming_tools_counts_every_token_in_exactly_one_frame() {
+        let pieces: Vec<&str> = WEATHER_CALL.split_inclusive([',', ':']).collect();
+        assert!(pieces.len() >= 5, "{pieces:?}");
+        let mut with_text = vec!["Checking ", "the weather. "];
+        with_text.extend(&pieces);
+        for parts in [pieces.clone(), with_text] {
+            let (app, release) = gated_app(&parts, false).await;
+            release.store(true, Ordering::SeqCst);
+            let resp = app.oneshot(tool_stream_request()).await.unwrap();
+            let body = String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec())
+                .unwrap();
+            assert!(body.contains("\"finish_reason\":\"tool_calls\""), "{body}");
+            let events = sse_events(&body);
+            // The gated engine emits one token per part.
+            assert_eq!(frame_tokens(&events), parts.len() as u64, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_tools_sends_two_calls_in_one_indexed_delta() {
+        let second = r#"<tool_call>{"name":"get_time","arguments":{"tz":"CET"}}</tool_call>"#;
+        let (app, release) = gated_app(&[WEATHER_CALL, "\n", second], false).await;
+        release.store(true, Ordering::SeqCst);
+        let resp = app.oneshot(tool_stream_request()).await.unwrap();
+        let body =
+            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        let events = sse_events(&body);
+        let call_events: Vec<_> = events
+            .iter()
+            .filter(|e| e["choices"][0]["delta"].get("tool_calls").is_some())
+            .collect();
+        assert_eq!(call_events.len(), 1, "{body}");
+        let calls = call_events[0]["choices"][0]["delta"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        let summary: Vec<_> = calls
+            .iter()
+            .map(|c| {
+                (
+                    c["index"].as_u64().unwrap(),
+                    c["function"]["name"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(summary, [(0, "get_weather"), (1, "get_time")], "{body}");
+        assert_ne!(calls[0]["id"], calls[1]["id"], "{body}");
+        let finishes: Vec<_> = events
+            .iter()
+            .filter_map(|e| e["choices"][0]["finish_reason"].as_str())
+            .collect();
+        assert_eq!(finishes, ["tool_calls"], "{body}");
+        assert_eq!(streamed_content(&events), "", "{body}");
     }
 
     #[tokio::test]
