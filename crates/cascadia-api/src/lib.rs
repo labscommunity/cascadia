@@ -1897,6 +1897,145 @@ fn tool_call_scan_text(buf: &str, enable_thinking: bool) -> &str {
         .map_or(buf, |idx| &buf[idx + THINK_CLOSE.len()..])
 }
 
+/// Opening marker of the `<tool_call>…</tool_call>` block dialects
+/// (Hermes/Qwen JSON, Qwen3 `<function=…>` XML, GLM arg-kv).
+const TOOL_CALL_OPEN: &str = "<tool_call>";
+
+/// Llama-3.1's explicit whole-output tool-call marker.
+const PYTHON_TAG: &str = "<|python_tag|>";
+
+/// Incremental content/tool-call split for a streamed chat reply with tools
+/// active. Fed the same translated text the non-streaming path accumulates,
+/// it releases every byte that can no longer become part of a tool call and
+/// withholds the rest, so content streams live while the final decision is
+/// still exactly `parse_tool_calls(tool_call_scan_text(full_text, …))`.
+///
+/// Withheld from the hold point on, where scanning starts at 0 or (thinking
+/// on) just past the first `</think>`, mirroring `tool_call_scan_text`:
+/// * from the scan start, while the first non-whitespace text there is
+///   undecided or starts a whole-output call (`{`, `[`, `<|python_tag|>` or
+///   a prefix of it) — the bare-JSON / Llama-3.1 dialects parse the whole
+///   scan text, so none of it is content until the reply ends;
+/// * otherwise from the first `<tool_call>`, or from a trailing proper
+///   prefix of it (a marker split across chunks).
+///
+/// Before `</think>` arrives the rules apply from 0; once it does, text held
+/// only for a scratchpad draft is released. Released text is never taken
+/// back, and every boundary sits on an ASCII byte, so no UTF-8 char splits.
+struct ToolStreamSplitter {
+    buf: String,
+    /// Bytes of `buf` already released as content.
+    emitted: usize,
+    enable_thinking: bool,
+    /// Where tool-call scanning starts: 0, or just past the first `</think>`.
+    scan_start: usize,
+    /// Thinking on, no `</think>` yet: where the next search for it starts.
+    think_from: Option<usize>,
+    /// First non-whitespace byte at/after `scan_start` (`buf.len()` while
+    /// only whitespace has arrived). Advanced per feed, so a long leading
+    /// whitespace run is scanned once, not on every feed.
+    lead: usize,
+}
+
+/// The decision at the end of a tools-active stream.
+enum ToolStreamEnd<'a> {
+    /// No call: the text not yet released, so the content deltas add up to
+    /// the whole reply.
+    Content(&'a str),
+    /// Calls parsed: `content` is the text still releasable before the hold
+    /// point; everything from the hold point on is dropped.
+    ToolCalls {
+        content: &'a str,
+        calls: Vec<ToolCall>,
+    },
+}
+
+impl ToolStreamSplitter {
+    fn new(enable_thinking: bool) -> Self {
+        Self {
+            buf: String::new(),
+            emitted: 0,
+            enable_thinking,
+            scan_start: 0,
+            think_from: enable_thinking.then_some(0),
+            lead: 0,
+        }
+    }
+
+    /// Append `text`; return the newly releasable content (possibly empty).
+    fn feed(&mut self, text: &str) -> &str {
+        self.push(text);
+        let start = self.emitted;
+        self.emitted = self.hold_point().max(start);
+        &self.buf[start..self.emitted]
+    }
+
+    /// Append the final `text` and decide: calls, or the rest as content.
+    fn finish(&mut self, text: &str) -> ToolStreamEnd<'_> {
+        self.push(text);
+        let start = self.emitted;
+        let calls = parse_tool_calls(tool_call_scan_text(&self.buf, self.enable_thinking));
+        let end = if calls.is_some() {
+            self.hold_point().max(start)
+        } else {
+            self.buf.len()
+        };
+        self.emitted = self.buf.len();
+        let content = &self.buf[start..end];
+        match calls {
+            Some(calls) => ToolStreamEnd::ToolCalls { content, calls },
+            None => ToolStreamEnd::Content(content),
+        }
+    }
+
+    fn push(&mut self, text: &str) {
+        self.buf.push_str(text);
+        if let Some(from) = self.think_from {
+            match self.buf[from..].find(THINK_CLOSE) {
+                Some(i) => {
+                    self.scan_start = from + i + THINK_CLOSE.len();
+                    self.think_from = None;
+                    self.lead = self.scan_start;
+                }
+                // Only the last `len - 1` bytes can start a delimiter that the
+                // next feed completes.
+                None => {
+                    let mut next = self.buf.len().saturating_sub(THINK_CLOSE.len() - 1);
+                    while !self.buf.is_char_boundary(next) {
+                        next -= 1;
+                    }
+                    self.think_from = Some(next.max(from));
+                }
+            }
+        }
+        let rest = &self.buf[self.lead..];
+        self.lead += rest.len() - rest.trim_start().len();
+    }
+
+    /// First byte that may still belong to a tool call.
+    fn hold_point(&self) -> usize {
+        let start = self.scan_start;
+        let lead = &self.buf[self.lead..];
+        if lead.is_empty()
+            || lead.starts_with(['{', '['])
+            || lead.starts_with(PYTHON_TAG)
+            || PYTHON_TAG.starts_with(lead)
+        {
+            return start;
+        }
+        // Released text holds no marker at/after `start`, so the search can
+        // resume at the release point.
+        let from = start.max(self.emitted);
+        let rest = &self.buf[from..];
+        from + rest.find(TOOL_CALL_OPEN).unwrap_or_else(|| {
+            (1..TOOL_CALL_OPEN.len())
+                .rev()
+                .find(|&k| rest.ends_with(&TOOL_CALL_OPEN[..k]))
+                .map_or(rest.len(), |k| rest.len() - k)
+        })
+    }
+}
+
 /// Parse model tool-call output into structured calls; None when none found.
 /// Shape-based + engine-agnostic; never panics (each block parsed independently,
 /// malformed blocks skipped).
@@ -2959,98 +3098,34 @@ async fn stream_completion(
             return engine_error_response(err);
         }
     };
-    // Buffer + emit one tool delta only when tools are present and not disabled.
+    // Tools present and not disabled: content streams as the splitter
+    // releases it; whether the reply is a tool call is decided at the final
+    // chunk, on the same text and parse as the non-streaming path.
     let tools_active =
         tools_present && tool_choice.as_ref().and_then(|v| v.as_str()) != Some("none");
     if tools_active {
-        let _permit = permit; // hold the slot until generation completes
-        let _inflight = inflight; // hold the in-flight gauge until generation completes
-        let mut buf = String::new();
-        let mut err: Option<String> = None;
-        let mut completion_tokens = 0;
-        let mut prompt_tokens = 0;
-        let mut finished = false;
-        let mut finish_reason = "stop";
-        let mut stream = chunk_stream;
-        let mut marker = state.marker_dialect.clone().map(MarkerFilter::new);
-        while let Some(chunk) = stream.next().await {
-            if let Some(reason) = &chunk.error {
-                err = Some(reason.clone());
-                break;
-            }
-            chunk.accumulate_tokens(&mut completion_tokens);
-            if chunk.is_final {
-                prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
-                finished = chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled);
-                finish_reason = chunk
-                    .finish_reason
-                    .map(|f| f.as_openai_str())
-                    .unwrap_or("stop");
-            }
-            match marker.as_mut() {
-                Some(f) => {
-                    buf.push_str(&f.feed(&chunk));
-                    if chunk.is_final {
-                        buf.push_str(&f.finish());
-                    }
-                }
-                None => buf.push_str(&chunk.text),
-            }
-        }
-        state
-            .stats
-            .tokens_total
-            .fetch_add(u64::from(completion_tokens), Ordering::Relaxed);
-        let mut frames: Vec<Bytes> = if let Some(reason) = &err {
-            warn!(task = %task_id, reason = %reason, "engine failed tool task mid-stream; SSE error");
-            vec![Bytes::from(format!(
-                "data: {}\n\n",
-                serde_json::json!({
-                    "id": task_id.clone(), "object": "error",
-                    "error": { "message": reason, "type": "engine_error" },
-                })
-            ))]
-        } else if let Some(calls) = parse_tool_calls(tool_call_scan_text(&buf, enable_thinking)) {
-            let tool_calls: Vec<serde_json::Value> = calls.iter().enumerate().map(|(i, c)| {
-                serde_json::json!({ "index": i, "id": c.id.clone(), "type": c.r#type.clone(),
-                    "function": { "name": c.function.name.clone(), "arguments": c.function.arguments.clone() } })
-            }).collect();
-            let delta = serde_json::json!({ "id": task_id.clone(), "object": "chat.completion.chunk",
-                "created": now_unix(), "model": model.clone(), "choices": [{ "index": 0,
-                "delta": { "role": "assistant", "tool_calls": tool_calls }, "finish_reason": serde_json::Value::Null }] });
-            let finish = serde_json::json!({ "id": task_id.clone(), "object": "chat.completion.chunk",
-                "created": now_unix(), "model": model.clone(), "choices": [{ "index": 0,
-                "delta": {}, "finish_reason": "tool_calls" }] });
-            vec![
-                Bytes::from(format!("data: {delta}\n\n")),
-                Bytes::from(format!("data: {finish}\n\n")),
-            ]
-        } else {
-            let delta = serde_json::json!({ "id": task_id.clone(), "object": "chat.completion.chunk",
-                "created": now_unix(), "model": model.clone(), "choices": [{ "index": 0,
-                "delta": { "role": "assistant", "content": buf }, "finish_reason": finish_reason }] });
-            vec![Bytes::from(format!("data: {delta}\n\n"))]
+        let tool_stream = ToolStream {
+            chunks: StreamWithPermit {
+                inner: chunk_stream,
+                _permit: permit,
+                _inflight: inflight,
+            },
+            marker: state.marker_dialect.clone().map(MarkerFilter::new),
+            splitter: ToolStreamSplitter::new(enable_thinking),
+            stats: state.stats.clone(),
+            completion: std::sync::atomic::AtomicU32::new(0),
+            held_tokens: 0,
+            prompt_tokens: 0,
+            finished: false,
+            phase: ToolStreamPhase::Streaming,
+            task_id,
+            model,
+            include_usage,
         };
-        if include_usage && finished && err.is_none() {
-            let usage = serde_json::json!({
-                "id": task_id, "object": "chat.completion.chunk",
-                "created": now_unix(), "model": model, "choices": [],
-                "usage": {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": prompt_tokens + completion_tokens,
-                },
-            });
-            frames.push(Bytes::from(format!("data: {usage}\n\n")));
-        }
-        let body = stream::iter(
-            frames
-                .into_iter()
-                .map(Ok::<Bytes, std::convert::Infallible>),
-        )
-        .chain(stream::once(async {
-            Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"data: [DONE]\n\n"))
-        }));
+        let body = stream::unfold(tool_stream, |mut s| async move {
+            let frame = s.next_frame().await?;
+            Some((Ok::<Bytes, std::convert::Infallible>(frame), s))
+        });
         return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/event-stream")
@@ -3249,6 +3324,217 @@ impl Stream for StreamWithPermit {
     ) -> std::task::Poll<Option<Self::Item>> {
         std::pin::Pin::new(&mut self.inner).poll_next(cx)
     }
+}
+
+/// Body state of a tools-active chat stream. Owns the permit + in-flight
+/// guard through `chunks`, so dropping the body (client disconnect) releases
+/// both and cancels the engine task, exactly like the plain stream.
+struct ToolStream {
+    chunks: StreamWithPermit,
+    marker: Option<MarkerFilter>,
+    splitter: ToolStreamSplitter,
+    stats: Arc<ApiStats>,
+    completion: std::sync::atomic::AtomicU32,
+    /// Model tokens not yet reported in a frame's `n_tokens` (their text is
+    /// still held).
+    held_tokens: u32,
+    prompt_tokens: u32,
+    /// Completed normally (not failed, not cancelled): gates the usage frame.
+    finished: bool,
+    phase: ToolStreamPhase,
+    task_id: String,
+    model: String,
+    include_usage: bool,
+}
+
+enum ToolStreamPhase {
+    Streaming,
+    /// The choice is closed (or failed); the usage frame + `[DONE]` are next.
+    Tail,
+    Done,
+}
+
+impl ToolStream {
+    /// Next SSE frame; `None` once `[DONE]` has been sent.
+    async fn next_frame(&mut self) -> Option<Bytes> {
+        loop {
+            match self.phase {
+                ToolStreamPhase::Streaming => {}
+                ToolStreamPhase::Tail => {
+                    self.phase = ToolStreamPhase::Done;
+                    return Some(self.tail());
+                }
+                ToolStreamPhase::Done => return None,
+            }
+            let Some(chunk) = self.chunks.next().await else {
+                // Ended without a final chunk (cancelled): settle what is
+                // held instead of dropping it.
+                self.phase = ToolStreamPhase::Tail;
+                return Some(self.close_choice("", None, "stop"));
+            };
+            // Progress chunks carry nothing to send or count.
+            if chunk.is_progress() {
+                continue;
+            }
+            // The 200 headers are already on the wire: surface the failure
+            // as an SSE error event. No tool_calls or usage follow it.
+            if let Some(reason) = &chunk.error {
+                warn!(task = %self.task_id, reason = %reason, "engine failed tool task mid-stream; SSE error");
+                self.phase = ToolStreamPhase::Tail;
+                let payload = serde_json::json!({
+                    "id": self.task_id,
+                    "object": "error",
+                    "error": { "message": reason, "type": "engine_error" },
+                });
+                tokio::task::yield_now().await;
+                return Some(Bytes::from(format!("data: {payload}\n\n")));
+            }
+            record_stream_tokens(&chunk, &self.stats, &self.completion);
+            self.held_tokens += chunk.token_count();
+            let translated = self.marker.as_mut().map(|f| {
+                let mut t = f.feed(&chunk);
+                if chunk.is_final {
+                    t.push_str(&f.finish());
+                }
+                t
+            });
+            let text = translated.as_deref().unwrap_or(&chunk.text);
+            let frame = if chunk.is_final {
+                self.prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
+                self.finished =
+                    chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled);
+                self.phase = ToolStreamPhase::Tail;
+                let reason = chunk
+                    .finish_reason
+                    .map(|f| f.as_openai_str())
+                    .unwrap_or("stop");
+                Some(self.close_choice(text, chunk.completion_tokens, reason))
+            } else {
+                let content = self.splitter.feed(text);
+                if content.is_empty() {
+                    None
+                } else {
+                    let n_tokens = std::mem::take(&mut self.held_tokens);
+                    Some(Bytes::from(content_frame(
+                        &self.task_id,
+                        &self.model,
+                        content,
+                        n_tokens,
+                        chunk.completion_tokens,
+                        None,
+                    )))
+                }
+            };
+            // Same per-chunk yield as the plain stream (see the comment
+            // there): lets the body sink drain each frame to TCP.
+            tokio::task::yield_now().await;
+            if let Some(frame) = frame {
+                return Some(frame);
+            }
+        }
+    }
+
+    /// Close the choice: the rest as content with the engine's
+    /// finish_reason, or the still-releasable content, one indexed
+    /// tool_calls delta, and a `tool_calls` finish.
+    fn close_choice(
+        &mut self,
+        text: &str,
+        completion_tokens: Option<u32>,
+        finish_reason: &str,
+    ) -> Bytes {
+        let n_tokens = std::mem::take(&mut self.held_tokens);
+        let (task_id, model) = (&self.task_id, &self.model);
+        let out = match self.splitter.finish(text) {
+            ToolStreamEnd::Content(content) => content_frame(
+                task_id,
+                model,
+                content,
+                n_tokens,
+                completion_tokens,
+                Some(finish_reason),
+            ),
+            ToolStreamEnd::ToolCalls { content, calls } => {
+                // The held tokens are the call's: they ride the tool_calls
+                // delta, so each model token is counted in exactly one frame.
+                let mut out = String::new();
+                if !content.is_empty() {
+                    out.push_str(&content_frame(task_id, model, content, 0, None, None));
+                }
+                let tool_calls: Vec<serde_json::Value> = calls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        serde_json::json!({
+                            "index": i, "id": c.id, "type": c.r#type,
+                            "function": { "name": c.function.name, "arguments": c.function.arguments },
+                        })
+                    })
+                    .collect();
+                let delta = serde_json::json!({
+                    "id": task_id, "object": "chat.completion.chunk",
+                    "created": now_unix(), "model": model,
+                    "n_tokens": n_tokens, "completion_tokens": completion_tokens,
+                    "choices": [{ "index": 0,
+                        "delta": { "role": "assistant", "tool_calls": tool_calls },
+                        "finish_reason": serde_json::Value::Null }],
+                });
+                let finish = serde_json::json!({
+                    "id": task_id, "object": "chat.completion.chunk",
+                    "created": now_unix(), "model": model,
+                    "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }],
+                });
+                out.push_str(&format!("data: {delta}\n\ndata: {finish}\n\n"));
+                out
+            }
+        };
+        Bytes::from(out)
+    }
+
+    /// OpenAI `include_usage` frame (successful completions only) + `[DONE]`.
+    fn tail(&self) -> Bytes {
+        let mut out = String::new();
+        if self.include_usage && self.finished {
+            let completion = self.completion.load(Ordering::Relaxed);
+            let usage = serde_json::json!({
+                "id": self.task_id, "object": "chat.completion.chunk",
+                "created": now_unix(), "model": self.model, "choices": [],
+                "usage": {
+                    "prompt_tokens": self.prompt_tokens,
+                    "completion_tokens": completion,
+                    "total_tokens": self.prompt_tokens + completion,
+                },
+            });
+            out.push_str(&format!("data: {usage}\n\n"));
+        }
+        out.push_str("data: [DONE]\n\n");
+        Bytes::from(out)
+    }
+}
+
+/// One `chat.completion.chunk` content delta, in the plain stream's shape.
+fn content_frame(
+    task_id: &str,
+    model: &str,
+    content: &str,
+    n_tokens: u32,
+    completion_tokens: Option<u32>,
+    finish_reason: Option<&str>,
+) -> String {
+    let payload = serde_json::json!({
+        "id": task_id,
+        "object": "chat.completion.chunk",
+        "created": now_unix(),
+        "model": model,
+        "n_tokens": n_tokens,
+        "completion_tokens": completion_tokens,
+        "choices": [{
+            "index": 0,
+            "delta": { "role": "assistant", "content": content },
+            "finish_reason": finish_reason,
+        }],
+    });
+    format!("data: {payload}\n\n")
 }
 
 fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::Response {
@@ -6242,6 +6528,8 @@ level={{ effort_map[eff] }}";
         }
         assert!(saw_tool, "no tool_calls delta: {body}");
         assert!(saw_finish, "no tool_calls finish: {body}");
+        // The call's own text is withheld, never sent as content.
+        assert!(!body.contains("<tool_call>"), "marker leaked: {body}");
     }
 
     #[tokio::test]
@@ -6293,6 +6581,456 @@ level={{ effort_map[eff] }}";
             "expected SSE error event: {body}"
         );
         assert!(!body.contains("tool_calls"), "{body}");
+    }
+
+    /// Feed every piece but the last, finish with the last. Returns each
+    /// released content piece (the finish content last) and parsed calls.
+    fn run_splitter(pieces: &[&str], thinking: bool) -> (Vec<String>, Option<Vec<ToolCall>>) {
+        let mut s = ToolStreamSplitter::new(thinking);
+        let (last, body) = pieces.split_last().unwrap();
+        let mut out: Vec<String> = body.iter().map(|p| s.feed(p).to_owned()).collect();
+        match s.finish(last) {
+            ToolStreamEnd::Content(c) => {
+                out.push(c.to_owned());
+                (out, None)
+            }
+            ToolStreamEnd::ToolCalls { content, calls } => {
+                out.push(content.to_owned());
+                (out, Some(calls))
+            }
+        }
+    }
+
+    const WEATHER_CALL: &str =
+        r#"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>"#;
+
+    #[test]
+    fn tool_splitter_streams_plain_text_as_it_arrives() {
+        let (out, calls) = run_splitter(&["Hello ", "world", "!", ""], false);
+        assert_eq!(out, ["Hello ", "world", "!", ""]);
+        assert!(calls.is_none());
+        // A `<` that turns out not to open a marker is held, then released.
+        let (out, calls) = run_splitter(&["a <", "b>bold</b>", ""], false);
+        assert_eq!(out, ["a ", "<b>bold</b>", ""]);
+        assert!(calls.is_none());
+        // Leading whitespace is held across feeds until the first real
+        // byte decides, then released with it.
+        let (out, calls) = run_splitter(&[" ", "\n", "  ", "Hi", " there", ""], false);
+        assert_eq!(out, ["", "", "", " \n  Hi", " there", ""]);
+        assert!(calls.is_none());
+    }
+
+    #[test]
+    fn tool_splitter_streams_text_before_a_split_marker_and_parses_the_call() {
+        let call_rest = &WEATHER_CALL["<tool_".len()..];
+        let (out, calls) = run_splitter(&["Let me check. <tool_", call_rest, "\n"], false);
+        assert_eq!(out, ["Let me check. ", "", ""]);
+        let calls = calls.expect("call parsed");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(
+            serde_json::from_str::<Value>(&calls[0].function.arguments).unwrap(),
+            serde_json::json!({"city":"Paris"})
+        );
+    }
+
+    #[test]
+    fn tool_splitter_releases_a_malformed_call_as_content() {
+        let pieces = ["Try <tool_call>{\"name\":", "\"oops\"", " and more"];
+        let (out, calls) = run_splitter(&pieces, false);
+        assert!(calls.is_none());
+        assert_eq!(out[..2], ["Try ", ""]);
+        assert_eq!(out.concat(), pieces.concat());
+    }
+
+    #[test]
+    fn tool_splitter_holds_whole_output_dialects_until_the_end() {
+        // Bare-JSON call: nothing streams, the call is parsed at the end.
+        let (out, calls) = run_splitter(
+            &["\n", "{\"name\":\"get_weather\",", "\"arguments\":{}}", ""],
+            false,
+        );
+        assert_eq!(out, ["", "", "", ""]);
+        assert_eq!(
+            calls.expect("bare JSON call")[0].function.name,
+            "get_weather"
+        );
+        // Bare JSON that is data, not a call: held, then released whole.
+        let (out, calls) = run_splitter(&["{\"name\":", "\"Alice\",\"age\":30}", ""], false);
+        assert!(calls.is_none());
+        assert_eq!(out, ["", "", "{\"name\":\"Alice\",\"age\":30}"]);
+        // Llama-3.1 `<|python_tag|>`, split mid-marker.
+        let (out, calls) = run_splitter(
+            &[
+                "<|py",
+                "thon_tag|>{\"name\":\"f\",",
+                "\"parameters\":{}}",
+                "",
+            ],
+            false,
+        );
+        assert_eq!(out, ["", "", "", ""]);
+        assert_eq!(calls.expect("python_tag call")[0].function.name, "f");
+    }
+
+    #[test]
+    fn tool_splitter_releases_a_scratchpad_draft_and_parses_the_real_call() {
+        let draft = r#"<tool_call>{"name":"draft","arguments":{}}</tool_call>"#;
+        // Draft held while reasoning, released once `</think>` (split across
+        // chunks) closes the scratchpad; no real call follows.
+        let pieces = ["<think>maybe ", draft, " no.</thi", "nk>Answer: 42", ""];
+        let (out, calls) = run_splitter(&pieces, true);
+        assert!(calls.is_none());
+        assert_eq!(out[0], "<think>maybe ");
+        assert_eq!(out[1], "");
+        assert_eq!(out[2], "");
+        assert_eq!(out[3], format!("{draft} no.</think>Answer: 42"));
+        assert_eq!(out.concat(), pieces.concat());
+        // Draft in the scratchpad, real call after it: only the real call.
+        let real = r#"<tool_call>{"name":"real","arguments":{}}</tool_call>"#;
+        let (out, calls) = run_splitter(&["<think>", draft, "</think>", real, ""], true);
+        let calls = calls.expect("real call parsed");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "real");
+        assert_eq!(out.concat(), format!("<think>{draft}</think>"));
+        // Thinking off: `</think>` means nothing, the first call is the call.
+        let (_, calls) = run_splitter(&["<think>", draft, "</think>", real, ""], false);
+        assert_eq!(calls.expect("calls")[0].function.name, "draft");
+    }
+
+    #[test]
+    fn tool_splitter_keeps_multibyte_chars_whole() {
+        let call_rest = &WEATHER_CALL["<tool".len()..];
+        let (out, calls) = run_splitter(&["héllo ", "日本", "語 <tool", call_rest, ""], false);
+        assert_eq!(out.concat(), "héllo 日本語 ");
+        assert!(calls.is_some());
+        let (out, calls) = run_splitter(&["日", "本語 <", "ü>", ""], false);
+        assert!(calls.is_none());
+        assert_eq!(out, ["日", "本語 ", "<ü>", ""]);
+    }
+
+    #[test]
+    fn tool_splitter_decision_matches_the_buffered_parse_at_every_split() {
+        let draft = r#"<tool_call>{"name":"draft","arguments":{}}</tool_call>"#;
+        let inputs = [
+            "plain answer with <b>tags</b>, 日本 and a lone <".to_owned(),
+            "Use <tool_call> tags like this: <tool_call>{broken</tool_call>".to_owned(),
+            format!("Sure — {WEATHER_CALL} trailing"),
+            format!("<think>plan {draft}</think>Done."),
+            format!("<think>plan</think>\n{WEATHER_CALL}"),
+            "  {\"name\":\"Alice\",\"age\":30}".to_owned(),
+            "<|python_tag|>{\"name\":\"f\",\"parameters\":{}}".to_owned(),
+            "<think>plan</think> \n {\"name\":\"f\",\"arguments\":{}}".to_owned(),
+            "<think> plan</think>  \n then text".to_owned(),
+        ];
+        // Call ids are random; the decision is the (name, arguments) list.
+        let functions = |calls: Option<Vec<ToolCall>>| {
+            calls.map(|c| {
+                c.into_iter()
+                    .map(|c| (c.function.name, c.function.arguments))
+                    .collect::<Vec<_>>()
+            })
+        };
+        for input in &inputs {
+            for thinking in [false, true] {
+                let expected = functions(parse_tool_calls(tool_call_scan_text(input, thinking)));
+                for i in (0..=input.len()).filter(|&i| input.is_char_boundary(i)) {
+                    let (out, calls) = run_splitter(&[&input[..i], &input[i..], ""], thinking);
+                    let streamed = out.concat();
+                    assert_eq!(functions(calls), expected, "{input:?} split at {i}");
+                    if expected.is_none() {
+                        assert_eq!(&streamed, input, "split at {i}");
+                    } else {
+                        assert!(input.starts_with(&streamed), "{input:?} split at {i}");
+                        let scanned = input.len() - tool_call_scan_text(input, thinking).len();
+                        assert!(
+                            streamed.len() <= scanned
+                                || !streamed[scanned..].contains(TOOL_CALL_OPEN),
+                            "{input:?} split at {i} leaked a marker: {streamed:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Emits `parts[0]`, then nothing until `release` is set, then the rest
+    /// and a final chunk (an error chunk when `fail`), so a test can read
+    /// frames while generation is provably still running.
+    struct GatedEngine {
+        parts: Vec<String>,
+        release: Arc<std::sync::atomic::AtomicBool>,
+        fail: bool,
+        pending: Option<(cascadia_types::TaskId, usize)>,
+    }
+
+    impl cascadia_engine::Engine for GatedEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            self.pending = Some((task.task_id, 0));
+            Ok(())
+        }
+        fn step(&mut self) -> cascadia_engine::EngineResult<Vec<(cascadia_types::TaskId, Chunk)>> {
+            let Some((id, i)) = self.pending.take() else {
+                return Ok(Vec::new());
+            };
+            if i > 0 && !self.release.load(Ordering::SeqCst) {
+                self.pending = Some((id, i));
+                return Ok(Vec::new());
+            }
+            if let Some(part) = self.parts.get(i) {
+                let chunk = Chunk::token(&id, i as i64, part.clone());
+                self.pending = Some((id.clone(), i + 1));
+                return Ok(vec![(id, chunk)]);
+            }
+            let last = if self.fail {
+                Chunk::error(&id, "gated engine failure")
+            } else {
+                Chunk::final_marker(&id, "")
+                    .with_finish_reason(cascadia_types::FinishReason::Stop)
+                    .with_prompt_tokens(5)
+                    .with_completion_tokens(self.parts.len() as u32)
+            };
+            Ok(vec![(id, last)])
+        }
+    }
+
+    struct GatedBuilder(GatedEngine);
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for GatedBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> cascadia_engine::EngineResult<()> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> cascadia_engine::EngineResult<cascadia_engine::LoadStream> {
+            Ok(Box::pin(stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> cascadia_engine::EngineResult<Box<dyn cascadia_engine::Engine>> {
+            Ok(Box::new(self.0))
+        }
+    }
+
+    /// Router over a [`GatedEngine`] with a template that renders tools, so
+    /// tool requests are accepted. Returns the gate.
+    async fn gated_app(parts: &[&str], fail: bool) -> (Router, Arc<std::sync::atomic::AtomicBool>) {
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runner = Runner::new(Box::new(GatedBuilder(GatedEngine {
+            parts: parts.iter().map(|p| (*p).to_owned()).collect(),
+            release: release.clone(),
+            fail,
+            pending: None,
+        })));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        (
+            make_router_with_config(Arc::new(runner), "mock-model", cfg),
+            release,
+        )
+    }
+
+    fn tool_stream_request() -> Request<Body> {
+        let payload = serde_json::json!({"model":"mock-model",
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"get_weather"}}],
+            "stream":true,"stream_options":{"include_usage":true}});
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap()
+    }
+
+    /// JSON events of an SSE body, `[DONE]` excluded.
+    fn sse_events(body: &str) -> Vec<Value> {
+        body.lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|l| l.trim() != "[DONE]")
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    fn streamed_content(events: &[Value]) -> String {
+        events
+            .iter()
+            .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn streaming_tools_sends_content_before_generation_ends() {
+        let (app, release) = gated_app(&["Checking ", "the weather. ", WEATHER_CALL], false).await;
+        let resp = app.oneshot(tool_stream_request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body().into_data_stream();
+        // The engine is gated after its first token: this frame can only
+        // arrive if content streams while generation is still running.
+        let first = loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(10), body.next())
+                .await
+                .expect("content frame while generation is gated")
+                .expect("body still open")
+                .unwrap();
+            if !frame.is_empty() {
+                break String::from_utf8(frame.to_vec()).unwrap();
+            }
+        };
+        let events = sse_events(&first);
+        assert_eq!(events.len(), 1, "{first}");
+        assert_eq!(events[0]["choices"][0]["delta"]["content"], "Checking ");
+        assert!(
+            events[0]["choices"][0]["finish_reason"].is_null(),
+            "{first}"
+        );
+        release.store(true, Ordering::SeqCst);
+        let mut rest = String::new();
+        while let Some(frame) = body.next().await {
+            rest.push_str(std::str::from_utf8(&frame.unwrap()).unwrap());
+        }
+        assert!(rest.trim_end().ends_with("data: [DONE]"), "{rest}");
+        assert!(!rest.contains("<tool_call>"), "marker leaked: {rest}");
+        let events = sse_events(&rest);
+        assert_eq!(streamed_content(&events), "the weather. ");
+        let call_events: Vec<_> = events
+            .iter()
+            .filter(|e| e["choices"][0]["delta"].get("tool_calls").is_some())
+            .collect();
+        assert_eq!(call_events.len(), 1, "{rest}");
+        let call = &call_events[0]["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(call["index"], 0);
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "get_weather");
+        assert_eq!(
+            serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap()).unwrap(),
+            serde_json::json!({"city":"Paris"})
+        );
+        let finishes: Vec<_> = events
+            .iter()
+            .filter_map(|e| e["choices"][0]["finish_reason"].as_str())
+            .collect();
+        assert_eq!(finishes, ["tool_calls"], "{rest}");
+        let usage = events.last().unwrap();
+        assert!(usage["choices"].as_array().unwrap().is_empty(), "{rest}");
+        assert_eq!(
+            usage["usage"],
+            serde_json::json!({"prompt_tokens":5,"completion_tokens":3,"total_tokens":8})
+        );
+    }
+
+    /// Sum of the custom per-frame `n_tokens` across an SSE body.
+    fn frame_tokens(events: &[Value]) -> u64 {
+        events.iter().filter_map(|e| e["n_tokens"].as_u64()).sum()
+    }
+
+    #[tokio::test]
+    async fn streaming_tools_counts_every_token_in_exactly_one_frame() {
+        let pieces: Vec<&str> = WEATHER_CALL.split_inclusive([',', ':']).collect();
+        assert!(pieces.len() >= 5, "{pieces:?}");
+        let mut with_text = vec!["Checking ", "the weather. "];
+        with_text.extend(&pieces);
+        for parts in [pieces.clone(), with_text] {
+            let (app, release) = gated_app(&parts, false).await;
+            release.store(true, Ordering::SeqCst);
+            let resp = app.oneshot(tool_stream_request()).await.unwrap();
+            let body = String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec())
+                .unwrap();
+            assert!(body.contains("\"finish_reason\":\"tool_calls\""), "{body}");
+            let events = sse_events(&body);
+            // The gated engine emits one token per part.
+            assert_eq!(frame_tokens(&events), parts.len() as u64, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_tools_sends_two_calls_in_one_indexed_delta() {
+        let second = r#"<tool_call>{"name":"get_time","arguments":{"tz":"CET"}}</tool_call>"#;
+        let (app, release) = gated_app(&[WEATHER_CALL, "\n", second], false).await;
+        release.store(true, Ordering::SeqCst);
+        let resp = app.oneshot(tool_stream_request()).await.unwrap();
+        let body =
+            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        let events = sse_events(&body);
+        let call_events: Vec<_> = events
+            .iter()
+            .filter(|e| e["choices"][0]["delta"].get("tool_calls").is_some())
+            .collect();
+        assert_eq!(call_events.len(), 1, "{body}");
+        let calls = call_events[0]["choices"][0]["delta"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        let summary: Vec<_> = calls
+            .iter()
+            .map(|c| {
+                (
+                    c["index"].as_u64().unwrap(),
+                    c["function"]["name"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(summary, [(0, "get_weather"), (1, "get_time")], "{body}");
+        assert_ne!(calls[0]["id"], calls[1]["id"], "{body}");
+        let finishes: Vec<_> = events
+            .iter()
+            .filter_map(|e| e["choices"][0]["finish_reason"].as_str())
+            .collect();
+        assert_eq!(finishes, ["tool_calls"], "{body}");
+        assert_eq!(streamed_content(&events), "", "{body}");
+    }
+
+    #[tokio::test]
+    async fn streaming_tools_without_a_call_streams_every_chunk() {
+        let (app, release) = gated_app(&["Hello ", "world", "!"], false).await;
+        release.store(true, Ordering::SeqCst);
+        let resp = app.oneshot(tool_stream_request()).await.unwrap();
+        let body =
+            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        assert!(!body.contains("tool_calls"), "{body}");
+        let events = sse_events(&body);
+        let pieces: Vec<_> = events
+            .iter()
+            .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+            .filter(|c| !c.is_empty())
+            .collect();
+        assert_eq!(pieces, ["Hello ", "world", "!"], "{body}");
+        let finishes: Vec<_> = events
+            .iter()
+            .filter_map(|e| e["choices"][0]["finish_reason"].as_str())
+            .collect();
+        assert_eq!(finishes, ["stop"], "{body}");
+        assert_eq!(events.last().unwrap()["usage"]["total_tokens"], 8, "{body}");
+    }
+
+    #[tokio::test]
+    async fn streaming_tools_error_after_content_ends_with_error_event() {
+        let (app, release) = gated_app(&["Checking ", "more "], true).await;
+        release.store(true, Ordering::SeqCst);
+        let resp = app.oneshot(tool_stream_request()).await.unwrap();
+        let body =
+            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
+        let events = sse_events(&body);
+        assert_eq!(streamed_content(&events), "Checking more ");
+        assert_eq!(events.last().unwrap()["object"], "error", "{body}");
+        assert!(!body.contains("tool_calls"), "{body}");
+        assert!(!body.contains("\"usage\""), "{body}");
     }
 
     // Helper: GET /metrics, return the exposition text.
