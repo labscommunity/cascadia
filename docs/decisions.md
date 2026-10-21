@@ -770,12 +770,17 @@ attempt.
   reads a native infer that sets the failed-infer flag today (the joint head's own infer does
   not), so in practice it is a failed prefill that a pass retries.
 - **When.** The retry is admitted at once, ahead of every queued task, in the same engine step as
-  the failure. That admission first runs the failed task's scrub and the recovery below (up to
-  30 s of idle wait, plus a recompile bounded by 180 s), exactly as the next task's admission
-  would. Doing it in the failing step keeps the stream alive: the runner closes a stream after 3
-  engine steps in a row that produce nothing (`MAX_CONSECUTIVE_EMPTY_STEPS`), and a decision
-  pass's failed head step is already its second. A step that waits on the recovery is still one
-  step, however long it waits.
+  the failure. That admission first runs the failed task's scrub and the recovery below, exactly
+  as the next task's admission would, and then prefills the prompt again. In the worst case the
+  failing step therefore waits for the 30 s idle wait (`STAGE_IDLE_TIMEOUT`), then the recompile
+  (up to 180 s, `RECOMPILE_TIMEOUT`), then the recompiled stage's first infer (up to 30 s), so up
+  to 240 s for each stuck stage (at most 2 recompiles per engine). After that comes the
+  re-prefill of the prompt plus the tokens already generated. No timer bounds the re-prefill; it
+  takes as long as a prefill of that length. (The recompiled stage's first infer is the first
+  infer of that re-prefill.) Doing it in the failing step keeps the stream alive: the runner
+  closes a stream after 3 engine steps in a row that produce nothing
+  (`MAX_CONSECUTIVE_EMPTY_STEPS`), and a decision pass's failed head step is already its second.
+  A step that waits on the recovery is still one step, however long it waits.
 - **When it still fails.** If the recovery fails the engine, the retried task gets the usual
   `qwen36 engine failed: ...; restart the server` refusal and the server exits for its
   supervisor (below). If the retry itself fails, the task fails with the usual error plus `(on
