@@ -337,11 +337,26 @@ def ir_weight_bytes(base_ir):
                if os.path.isfile(p))
 
 
-def export_peak_bytes(base_ir, stages, swap):
-    """Estimated peak RAM of an export of `base_ir` cut into `stages` stages; `swap` when
-    --weights replaces the IR's weights (Kev, Clef), else the IR keeps its own (JEV's graft)."""
+def largest_stage_share(base_ir, stages, layer_split=None):
+    """The largest stage's share of the layers, as run_export will cut them (stage_ranges, with
+    --layer-split when given); 1/stages when the base IR's config.json does not give the layer
+    count or the split is invalid (run_export then refuses it itself)."""
+    from export_qwen36_moe import stage_ranges
+
+    try:
+        layers = int(_text_config(base_ir)["num_hidden_layers"])
+        ranges = stage_ranges(layers, stages, layer_split)
+    except (OSError, KeyError, TypeError, ValueError):
+        return 1 / stages
+    return max(last - first + 1 for first, last in ranges) / layers
+
+
+def export_peak_bytes(base_ir, stages, swap, layer_split=None):
+    """Estimated peak RAM of an export of `base_ir` cut into `stages` stages (by `layer_split`
+    when given); `swap` when --weights replaces the IR's weights (Kev, Clef), else the IR keeps
+    its own (JEV's graft)."""
     per_byte = PEAK_PER_WEIGHT_BYTE_SWAP if swap else PEAK_PER_WEIGHT_BYTE_GRAFT
-    share = max(1 / stages, PEAK_MIN_SHARE)
+    share = max(largest_stage_share(base_ir, stages, layer_split), PEAK_MIN_SHARE)
     return int(ir_weight_bytes(base_ir) * per_byte * share)
 
 
@@ -375,16 +390,23 @@ def physical_ram_bytes():
     return None
 
 
-def memory_refusal(base_ir, stages, swap, ram):
+def memory_refusal(base_ir, stages, swap, ram, layer_split=None):
     """Why the export would not fit in `ram` bytes, or None when it fits (or `ram` is unknown)."""
-    need = export_peak_bytes(base_ir, stages, swap)
+    need = export_peak_bytes(base_ir, stages, swap, layer_split)
     if ram is None or need <= ram:
         return None
     how = f"x{PEAK_PER_WEIGHT_BYTE_SWAP} for the --weights swap" if swap else f"x{PEAK_PER_WEIGHT_BYTE_GRAFT}"
-    return (f"the export needs about {need / GIB:.1f} GiB of RAM at --stages {stages} (the base IR's "
+    cut = f"--stages {stages}" + (f" --layer-split {layer_split}" if layer_split else "")
+    if stages < 8:
+        fix = ("export with --stages 8 instead (a tree for a low-memory machine, one stage in memory "
+               "at a time), or pass --skip-memory-check to try anyway")
+    else:
+        fix = (f"export with more stages than {stages} (or an even split), or pass --skip-memory-check "
+               f"to try anyway (the estimate does not fall below {PEAK_MIN_SHARE} of the 1-stage peak, "
+               f"about what the 8-stage exports measured)")
+    return (f"the export needs about {need / GIB:.1f} GiB of RAM at {cut} (the base IR's "
             f"{ir_weight_bytes(base_ir) / GIB:.1f} GiB of int8 weights, {how}), but this machine has "
-            f"{ram / GIB:.1f} GiB: export with --stages 8 instead (a tree for a low-memory machine, one "
-            f"stage in memory at a time), or pass --skip-memory-check to try anyway")
+            f"{ram / GIB:.1f} GiB: {fix}")
 
 
 def write_clef_profile(clef_dir, out_dir, max_tokens=16384, chunk=8192):
@@ -502,7 +524,7 @@ def main():
     # Before any heavy work (asset writers, the stage export): a 1-stage export holds the whole
     # model at once, which a low-memory machine cannot.
     if not a.skip_memory_check:
-        why = memory_refusal(a.base_ir, a.stages, bool(weights), physical_ram_bytes())
+        why = memory_refusal(a.base_ir, a.stages, bool(weights), physical_ram_bytes(), a.layer_split)
         if why:
             ap.error(why)
     from export_qwen36_moe import run_export

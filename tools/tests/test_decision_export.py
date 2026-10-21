@@ -1344,3 +1344,62 @@ def test_cli_stages_must_be_positive(cli, capsys, value):
     with pytest.raises(SystemExit) as e:
         run("clef", "--base-ir", str(base), "--clef-dir", "C", "--out", str(tmp / "t"), "--stages", value)
     assert e.value.code == 2 and "--stages" in capsys.readouterr().err and calls == []
+
+
+# Fix round 1: no --stages 8 advice at 8 or more stages; an uneven --layer-split is sized by its
+# largest stage.
+
+def _ir_with_layers(tmp_path, layers=32):
+    ir = tmp_path / "ir"
+    ir.mkdir()
+    (ir / "config.json").write_text(json.dumps({"text_config": {"num_hidden_layers": layers}}))
+    return str(ir)
+
+
+@pytest.mark.parametrize("stages", [8, 16])
+def test_refusal_at_8_or_more_stages_does_not_suggest_stages_8(monkeypatch, stages):
+    monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
+    why = de.memory_refusal("ir", stages, True, 4 * GiB)
+    assert why.startswith(f"the export needs about 7.9 GiB of RAM at --stages {stages} ")
+    fix = why.split("GiB: ", 1)[1]
+    assert "--stages 8" not in fix
+    assert f"more stages than {stages}" in fix and "--skip-memory-check" in why
+
+
+def test_refusal_below_8_stages_suggests_stages_8(monkeypatch):
+    monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
+    assert "export with --stages 8 instead" in de.memory_refusal("ir", 2, True, 4 * GiB)
+
+
+def test_largest_stage_share_follows_the_layer_split(tmp_path):
+    ir = _ir_with_layers(tmp_path)
+    assert de.largest_stage_share(ir, 2) == 0.5
+    assert de.largest_stage_share(ir, 2, "24") == 0.75  # layers 0-23 | 24-31
+    assert de.largest_stage_share(ir, 8, "4,8,12,16,20,24,28") == 0.125
+    assert de.largest_stage_share(ir, 3) == 12 / 32  # 10 + 10 + 12: the last stage takes the rest
+    # No config.json or an invalid split: 1/N (run_export refuses a bad split itself)
+    assert de.largest_stage_share(str(tmp_path / "none"), 4) == 0.25
+    assert de.largest_stage_share(ir, 2, "40") == 0.5
+
+
+def test_uneven_layer_split_is_estimated_from_its_largest_stage(tmp_path, monkeypatch):
+    ir = _ir_with_layers(tmp_path)
+    monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
+    even = de.export_peak_bytes(ir, 2, True)
+    uneven = de.export_peak_bytes(ir, 2, True, "24")
+    assert uneven == int(IR_9B * 2.5 * 0.75) and uneven > even == int(IR_9B * 2.5 * 0.5)
+    why = de.memory_refusal(ir, 2, True, 14 * GiB, "24")
+    assert why.startswith("the export needs about 15.6 GiB of RAM at --stages 2 --layer-split 24 ")
+    assert de.memory_refusal(ir, 2, True, 14 * GiB) is None  # the even split fits (10.4 GiB)
+
+
+def test_cli_passes_the_layer_split_to_the_check(cli, monkeypatch, capsys):
+    run, calls, base, tmp = cli
+    (base / "config.json").write_text(json.dumps({"text_config": {
+        "max_position_embeddings": 262144, "hidden_size": 8, "num_hidden_layers": 32}}))
+    monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
+    monkeypatch.setattr(de, "physical_ram_bytes", lambda: int(14 * GiB))
+    with pytest.raises(SystemExit):
+        run("clef", "--base-ir", str(base), "--clef-dir", "C", "--out", str(tmp / "t"),
+            "--stages", "2", "--layer-split", "24")
+    assert "--layer-split 24" in capsys.readouterr().err and calls == []
