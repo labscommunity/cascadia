@@ -20,6 +20,7 @@ if "%LLAMA_REPO%"=="" set "LLAMA_REPO=https://github.com/ggml-org/llama.cpp"
 if "%LLAMA_BASE%"=="" set "LLAMA_BASE=1692f9e50bb20fd96b963af38a282daf78feea64"
 set "PATCH1=%REPO_ROOT%\patches\llama.cpp\0001-sycl-stream-weights.patch"
 set "PATCH2=%REPO_ROOT%\patches\llama.cpp\0002-sycl-router-aware-moe.patch"
+set "PATCH3=%REPO_ROOT%\patches\llama.cpp\0003-sycl-host-buffer-compute.patch"
 
 if not exist "%DEST%\.git" (
   git clone "%LLAMA_REPO%" "%DEST%" || exit /b 1
@@ -31,7 +32,7 @@ REM per-patch skip checks below; pin the exact revision set in a manifest and
 REM refuse to build on top of a stale one (same guard as the .sh).
 set "MANIFEST=.cascadia-patches.manifest"
 > "%MANIFEST%.new" echo base=%LLAMA_BASE%
-for %%P in ("%PATCH1%" "%PATCH2%") do (
+for %%P in ("%PATCH1%" "%PATCH2%" "%PATCH3%") do (
   for /f "usebackq delims=" %%H in (`certutil -hashfile "%%~P" SHA256 ^| findstr /v /c:"CertUtil" /c:"hash of"`) do (
     >> "%MANIFEST%.new" echo %%~nxP sha256:%%H
   )
@@ -78,6 +79,21 @@ if errorlevel 1 (
   )
 ) else (
   echo patch2 already applied; continuing
+)
+findstr /m /c:"CASCADIA_HOST_BUFT" ggml\src\ggml-sycl\ggml-sycl.cpp >nul 2>&1
+if errorlevel 1 (
+  git apply --check "%PATCH3%"
+  if errorlevel 1 (
+    echo ERROR: patch3 does not apply to %LLAMA_BASE% and its marker is absent
+    exit /b 1
+  )
+  git apply "%PATCH3%"
+  if errorlevel 1 (
+    echo ERROR: patch3 failed to apply
+    exit /b 1
+  )
+) else (
+  echo patch3 already applied; continuing
 )
 move /y "%MANIFEST%.new" "%MANIFEST%" >nul
 
