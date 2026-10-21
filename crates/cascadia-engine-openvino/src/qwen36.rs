@@ -910,6 +910,9 @@ impl Builder for Qwen36Builder {
             scrub_pending: false,
             decision_scrub_deferred: false,
             infer_failed: false,
+            retry: None,
+            #[cfg(test)]
+            no_retry: false,
             engine_failed: None,
             failure: Default::default(),
             stage_idle_timeout: STAGE_IDLE_TIMEOUT,
@@ -1812,6 +1815,14 @@ pub struct Qwen36Engine {
     /// request may still be marked busy, and OpenVINO blocks forever releasing a busy request.
     /// The next `reset_all` makes every request idle first ([`make_idle`]), Task 46.
     infer_failed: bool,
+    /// Task 57, single box: the task [`Self::fail_local`] just re-queued at the front of `pending`
+    /// after a native infer failure. Taken by the next admission, which is the retry and runs in
+    /// the same `step`.
+    retry: Option<Retry>,
+    /// Tests of the failed-task path (Task 45/46/54): a native infer failure fails the task, as
+    /// before Task 57, so the NEXT task runs the recovery.
+    #[cfg(test)]
+    no_retry: bool,
     /// Set when the engine cannot keep serving after a failed infer (Task 46, narrowed by Task
     /// 54): a request that could not be made idle could not be recovered either (the stage's
     /// recompile failed or timed out, or [`Rebuild::cap`] recompiles were already used), or a
@@ -1918,6 +1929,38 @@ struct ActiveTask {
     decision: Option<cascadia_types::DecisionReadout>,
     /// Hidden rows the decision head reads, gathered per prefill span (head-owning process).
     collector: Option<crate::decision::Collector>,
+    /// Task 57, single box: the task as admitted, kept so a native infer failure can re-queue it
+    /// once ([`Qwen36Engine::fail_local`]). `None` on pipeline rank 0, which never retries.
+    retry_source: Option<GenerationTask>,
+    /// Task 57: this admission is that retry, so its failure fails the task.
+    retried: bool,
+    /// Task 57: the tokens a retried chat's failed attempt generated, which the retry prefills as
+    /// part of `prompt_ids`. Not prompt tokens to the client: the final chunk's `prompt_tokens`
+    /// leaves them out, so usage matches an uninterrupted run.
+    retry_resumed: usize,
+}
+
+/// Task 57: what a retried task's admission needs from its failed attempt.
+struct Retry {
+    task_id: TaskId,
+    /// The bytes the failed attempt had already handed to the client; `None` for a decision pass,
+    /// which emits nothing before its final chunk.
+    emitted: Option<Vec<u8>>,
+    /// The tokens the failed attempt generated, now part of the retry's prompt (`retry_resumed`).
+    generated: usize,
+}
+
+impl ActiveTask {
+    /// Where the task is: `prefill`, `head` (a decision pass past its prefill) or `decode`.
+    fn phase(&self) -> &'static str {
+        if self.prefill_idx < self.prompt_ids.len() {
+            "prefill"
+        } else if self.decision.is_some() {
+            "head"
+        } else {
+            "decode"
+        }
+    }
 }
 
 fn le_bytes_i64(vals: &[i64]) -> Vec<u8> {
@@ -2572,7 +2615,7 @@ impl Qwen36Engine {
         let reset_s = reset_t0.elapsed().as_secs_f64();
         info!(
             task = %t.task_id,
-            prompt_tokens = t.prompt_ids.len(),
+            prompt_tokens = t.prompt_ids.len() - t.retry_resumed,
             warm_prefix = t.warm_prefix,
             tokens = t.gen_ids.len(),
             elapsed_s = elapsed,
@@ -2599,7 +2642,7 @@ impl Qwen36Engine {
         vec![(
             t.task_id.clone(),
             Chunk::final_marker(t.task_id, "")
-                .with_prompt_tokens(t.prompt_ids.len() as u32)
+                .with_prompt_tokens((t.prompt_ids.len() - t.retry_resumed) as u32)
                 .with_finish_reason(reason),
         )]
     }
@@ -2702,7 +2745,7 @@ impl Qwen36Engine {
                 self.last_timing = Some(self.timing.clone());
                 vec![decision_final_chunk(id, n, logits)]
             }
-            Err(e) => self.finalize_error(head_failure_reason(e)),
+            Err(e) => self.fail_local(head_failure_reason(e)),
         }
     }
 
@@ -2759,16 +2802,9 @@ impl Qwen36Engine {
         let Some(t) = self.active.take() else {
             return Vec::new();
         };
-        let phase = if t.prefill_idx < t.prompt_ids.len() {
-            "prefill"
-        } else if t.decision.is_some() {
-            "head"
-        } else {
-            "decode"
-        };
         warn!(
             task = %t.task_id,
-            phase,
+            phase = t.phase(),
             prompt = t.prompt_ids.len(),
             warm_prefix = t.warm_prefix,
             generated = t.gen_ids.len(),
@@ -2778,6 +2814,67 @@ impl Qwen36Engine {
         self.scrub_pending = true;
         let chunk = Chunk::error(t.task_id.clone(), reason).with_warm_prefix(t.warm_prefix);
         vec![(t.task_id, chunk)]
+    }
+
+    /// Task 57: fail the active single-box task, or retry it once. A native infer failure
+    /// (`infer_failed` set, the engine not failed) of a task that has not been retried yet
+    /// re-queues it at the front of `pending` and admits it again in this same `step`: the
+    /// admission runs the failed task's scrub first (`scrub_failed_task`: the Task 46/54 recovery,
+    /// bounded) and then the prefill, exactly as a new admission would. A chat resumes over the
+    /// tokens it already generated (Option B, so `max_tokens` still bounds prefix + new) and
+    /// carries the bytes already emitted; a decision pass re-runs unchanged. Greedy decode is
+    /// deterministic and a recovered stage answers as before, so the client sees only latency, and
+    /// no chunk of the failed attempt. Re-admitting here, not at the next step, keeps the retried
+    /// task's stream inside the runner's empty-step limit (`MAX_CONSECUTIVE_EMPTY_STEPS`, 3): a
+    /// decision pass's head failure is its second empty step, and the retried prefill rides it.
+    /// Anything else, and a failure of the retry, fails the task (`finalize_error`); the
+    /// retry's reason says so. Pipeline rank 0 never comes here (`finalize_error` directly).
+    fn fail_local(&mut self, reason: String) -> Vec<(TaskId, Chunk)> {
+        let Some(t) = self.active.as_ref() else {
+            return Vec::new();
+        };
+        if t.retried {
+            return self.finalize_error(format!("{reason} (on the retry after an infer failure)"));
+        }
+        let native = self.infer_failed && self.engine_failed.is_none();
+        #[cfg(test)]
+        let native = native && !self.no_retry;
+        if self.total > 1 || !native || t.retry_source.is_none() {
+            return self.finalize_error(reason);
+        }
+        let mut t = self.active.take().expect("checked above");
+        self.want_final_hidden = false;
+        self.last_final_hidden = None;
+        let mut task = t.retry_source.take().expect("checked above");
+        // A decision pass emits nothing before its final chunk and refuses a resume prefix
+        // (`decision_resume_conflict`), so it re-runs as it came. A chat resumes over every token
+        // it generated, any resume seed it came with included (`gen_ids` starts with it).
+        let emitted = if t.decision.is_none() {
+            task.resume_token_ids =
+                (!t.gen_ids.is_empty()).then(|| t.gen_ids.iter().map(|&id| id as i32).collect());
+            Some(std::mem::take(&mut t.emitted))
+        } else {
+            None
+        };
+        let generated = t.gen_ids.len() - t.resume_seed_len;
+        warn!(
+            task = %t.task_id,
+            phase = t.phase(),
+            prompt = t.prompt_ids.len(),
+            warm_prefix = t.warm_prefix,
+            generated = t.gen_ids.len(),
+            attempt = 2,
+            reason = %reason,
+            "qwen36: retrying task after infer failure"
+        );
+        self.scrub_pending = true;
+        self.retry = Some(Retry {
+            task_id: task.task_id.clone(),
+            emitted,
+            generated,
+        });
+        self.pending.insert(0, task);
+        self.step_local()
     }
 
     /// The scrub a failed task left (see [`Self::finalize_error`]), before anything reads or
@@ -3498,6 +3595,9 @@ impl Qwen36Engine {
                 wire_ms: Vec::new(),
                 decision: task.decision.clone(),
                 collector: None,
+                retry_source: None,
+                retried: false,
+                retry_resumed: 0,
             });
         }
         let t = self.active.as_ref().unwrap();
@@ -4165,6 +4265,9 @@ impl Qwen36Engine {
             }
             self.scrub_failed_task();
             let task = self.pending.remove(0);
+            // Task 57: the retry `fail_local` re-queued in this same step, if this is it. Taken
+            // by every admission, so a stale one can never reach a later task.
+            let retry = self.retry.take().filter(|r| r.task_id == task.task_id);
             // Task 55: only a decision pass may restore over the previous pass's live requests
             // (`local_warm_or_cold`); chat, completion and the kv_coord restore start scrubbed.
             if task.decision.is_none() {
@@ -4238,7 +4341,15 @@ impl Qwen36Engine {
                 .map(|t| t as u32)
                 .collect();
             let resume_seed_len = resume_gen_ids.len();
-            let resume_emitted: Vec<u8> = if resume_gen_ids.is_empty() {
+            // Task 57: a retried chat carries the bytes its failed attempt already handed to the
+            // client. Re-decoding the seed could differ from them: the U+FFFD holdback keeps an
+            // incomplete UTF-8 char out of `emitted`, and that char would then be lost.
+            let retried = retry.is_some();
+            let retry_resumed = retry.as_ref().map_or(0, |r| r.generated);
+            let carried = retry.and_then(|r| r.emitted);
+            let resume_emitted: Vec<u8> = if let Some(bytes) = carried {
+                bytes
+            } else if resume_gen_ids.is_empty() {
                 Vec::new()
             } else {
                 match tokenizer.decode(&resume_gen_ids, true) {
@@ -4384,8 +4495,8 @@ impl Qwen36Engine {
             self.timing.warm_prefix = warm_prefix;
             self.timing.admit = admit_started.elapsed();
             self.active = Some(ActiveTask {
-                task_id: task.task_id,
-                tenant: task.tenant,
+                task_id: task.task_id.clone(),
+                tenant: task.tenant.clone(),
                 prompt_ids,
                 prefill_idx: warm_prefix,
                 step: warm_prefix,
@@ -4405,6 +4516,9 @@ impl Qwen36Engine {
                     .as_ref()
                     .map(|d| crate::decision::Collector::new(d.head.hidden_need(), self.hidden)),
                 decision: task.decision.clone(),
+                retry_source: Some(task),
+                retried,
+                retry_resumed,
             });
         }
         let t = self.active.as_ref().unwrap();
@@ -4472,7 +4586,7 @@ impl Qwen36Engine {
                     }
                     Err(e) => {
                         warn!(task = %task_id, error = %e, "prefill failed");
-                        return self.finalize_error(format!("prefill failed: {e}"));
+                        return self.fail_local(format!("prefill failed: {e}"));
                     }
                 }
             }
@@ -4562,7 +4676,7 @@ impl Qwen36Engine {
                 }
                 Err(e) => {
                     warn!(task = %task_id, error = %e, "decode failed");
-                    self.finalize_error(format!("decode failed: {e}"))
+                    self.fail_local(format!("decode failed: {e}"))
                 }
             }
         }
@@ -5396,6 +5510,8 @@ mod tests {
             scrub_pending: false,
             decision_scrub_deferred: false,
             infer_failed: false,
+            retry: None,
+            no_retry: false,
             engine_failed: None,
             failure: Default::default(),
             stage_idle_timeout: STAGE_IDLE_TIMEOUT,
@@ -5659,6 +5775,9 @@ mod tests {
             wire_ms: Vec::new(),
             decision: None,
             collector: None,
+            retry_source: None,
+            retried: false,
+            retry_resumed: 0,
         });
 
         let out = e.finalize_error("pipeline decode failed: wire closed".into());
@@ -5693,6 +5812,9 @@ mod tests {
             wire_ms: Vec::new(),
             decision: None,
             collector: None,
+            retry_source: None,
+            retried: false,
+            retry_resumed: 0,
         }
     }
 
@@ -5778,6 +5900,9 @@ mod tests {
             wire_ms: Vec::new(),
             decision: None,
             collector: None,
+            retry_source: None,
+            retried: false,
+            retry_resumed: 0,
         });
 
         let id: TaskId = "t0".into();
@@ -6944,6 +7069,8 @@ mod tests {
         state: Vec<u8>,
         /// The infer (counted from 0) that fails, as the GPU plugin's did on hardware.
         fail_infer_at: Option<usize>,
+        /// Task 57: a second infer that fails the same way (the retry's).
+        fail_infer_again: Option<usize>,
         infers: usize,
         /// Every infer and reset, in order; and the recovery's cancel, wait and abandon (Task 46).
         events: Arc<std::sync::Mutex<Vec<&'static str>>>,
@@ -6989,6 +7116,7 @@ mod tests {
                 n: 0,
                 state: vec![3u8; 64],
                 fail_infer_at: None,
+                fail_infer_again: None,
                 infers: 0,
                 events: Default::default(),
                 busy_after_fail: 0,
@@ -7094,7 +7222,8 @@ mod tests {
             if self.hang_infer_at == Some(self.infers - 1) {
                 hang_forever();
             }
-            if self.fail_infer_at == Some(self.infers - 1) {
+            let at = Some(self.infers - 1);
+            if self.fail_infer_at == at || self.fail_infer_again == at {
                 self.busy = self.busy_after_fail;
                 return Err(cascadia_ov_genai_shim::Error::Native(
                     "unknown C++ exception in infer".into(),
@@ -7491,6 +7620,7 @@ mod tests {
         // was logged, and the scrub that ran before the error chunk was returned did not return.
         // The error chunk now comes first; the next admission scrubs before it touches a stage.
         let mut e = mock_box();
+        e.no_retry = true; // Task 57 off: the task fails, the next one recovers
         let events = match &mut e.stages[1] {
             OvStage::Mock(m) => {
                 m.fail_infer_at = Some(1); // the prefill is infer 0, the first decode infer 1
@@ -7553,6 +7683,7 @@ mod tests {
         // the request back to idle (bounded) before it resets anything. A decision pass fails
         // here; the chat task after it gets the recovery.
         let mut e = mock_box();
+        e.no_retry = true; // Task 57 off: the task fails, the next one recovers
         let events = busy_after_failed_infer(&mut e, 0, 3); // the pass's prefill infer
         e.submit(verbalizer_pass("d1")).unwrap();
         let c = run_to_final(&mut e);
@@ -7618,6 +7749,7 @@ mod tests {
         ] {
             let what = format!("{} then {}", fail.task_id, next.task_id);
             let mut e = mock_box();
+            e.no_retry = true; // Task 57 off: the task fails, the next one recovers
             e.stage_idle_timeout = Duration::from_millis(200);
             let events = stuck_on_next_infer(&mut e);
             let old_drops = drops_of(mock1(&mut e));
@@ -7701,6 +7833,7 @@ mod tests {
         // lower-bound deltas; the engine's own totals are exact.
         use cascadia_metrics::{ENGINE_LEAKED_STAGE_BYTES, ENGINE_STAGE_RECOMPILES_TOTAL};
         let mut e = mock_box();
+        e.no_retry = true; // Task 57 off: the task fails, the next one recovers
         e.stage_idle_timeout = Duration::from_millis(100);
         arm_recompile(&mut e);
         let (c0, b0) = (
@@ -7745,6 +7878,7 @@ mod tests {
         // Task 54 fix round 2: each recompile leaks a whole stage (about 1.5-2.5 GB on the 9B
         // tree), so an engine recompiles at most twice; the third abandon fails it.
         let mut e = mock_box();
+        e.no_retry = true; // Task 57 off: the task fails, the next one recovers
         assert_eq!((e.rebuild.cap, MAX_RECOMPILES), (2, 2));
         e.stage_idle_timeout = Duration::from_millis(100);
         let ctl = arm_recompile(&mut e);
@@ -7815,6 +7949,7 @@ mod tests {
         // Task 56: a stuck request whose abandon fails is not recompiled; the engine fails, and
         // rank 0 reports it on the handle the server watches, with the same reason.
         let mut e = mock_box();
+        e.no_retry = true; // Task 57 off: the task fails, the next one recovers
         e.stage_idle_timeout = Duration::from_millis(100);
         let watched = e.failure();
         stuck_on_next_infer(&mut e);
@@ -7914,6 +8049,7 @@ mod tests {
         // `RECOMPILE_TIMEOUT` (short here); a compile that never returns fails the engine after
         // the bound instead of hanging, and later tasks are refused at once.
         let mut e = mock_box();
+        e.no_retry = true; // Task 57 off: the task fails, the next one recovers
         e.stage_idle_timeout = Duration::from_millis(150);
         let ctl = arm_recompile(&mut e);
         e.rebuild.timeout = Duration::from_millis(150);
@@ -7996,6 +8132,7 @@ mod tests {
         // `spawn` drops the closure that owns the copy. The copy is wrapped in `Forget` first, so
         // it is leaked, and the engine fails as before.
         let mut e = mock_box();
+        e.no_retry = true; // Task 57 off: the task fails, the next one recovers
         e.stage_idle_timeout = Duration::from_millis(100);
         let ctl = arm_recompile(&mut e);
         stuck_on_next_infer(&mut e);
@@ -8030,6 +8167,7 @@ mod tests {
         for next in [chat("c2"), verbalizer_pass("d2")] {
             let id = next.task_id.clone();
             let mut e = mock_box();
+            e.no_retry = true; // Task 57 off: the task fails, the next one recovers
             e.stage_idle_timeout = Duration::from_millis(150);
             let ctl = arm_recompile(&mut e);
             ctl.lock().unwrap().hang_first_infer = true;
@@ -8073,6 +8211,7 @@ mod tests {
         // Task 54 re-review: the embeddings take the same path as a stage. A stuck emb request is
         // abandoned and the emb recompiled; its first infer is bounded too.
         let mut e = mock_box();
+        e.no_retry = true; // Task 57 off: the task fails, the next one recovers
         e.stage_idle_timeout = Duration::from_millis(150);
         let ctl = arm_recompile(&mut e);
         ctl.lock().unwrap().hang_first_infer = true;
@@ -8158,6 +8297,7 @@ mod tests {
         // Task 45: the BUG-1 shape, a warm restore and then a throw in the suffix's prefill. The
         // error chunk says how much was resumed, so the API's failure line can say "hit".
         let mut e = mock_box();
+        e.no_retry = true; // Task 57 off: the task fails, the next one recovers
         e.prefix_cache = crate::prefix_cache::PrefixCache::new(1 << 20);
         let min = crate::prefix_cache::MIN_PREFIX_TOKENS;
         let pass = |id: &str, first: bool| {
@@ -8375,6 +8515,7 @@ mod tests {
     #[test]
     fn a_failed_decision_pass_still_scrubs() {
         let mut e = cached_box();
+        e.no_retry = true; // Task 57 off: the task fails, the next one recovers
         answer(&mut e, shared_prefix_pass("q0", 0, true));
         // The warm pass restores over the live requests, then its suffix infer throws.
         let at = infers(&e, 1);
@@ -8458,6 +8599,7 @@ mod tests {
         // dropped (the mock drops it too, which would change the answer), so the restore must
         // prime it with one fold first, bounded as its first infer.
         let mut e = cached_box();
+        e.no_retry = true; // Task 57 off: the task fails, the next one recovers
         e.stage_idle_timeout = Duration::from_millis(200);
         answer(&mut e, shared_prefix_pass("q0", 0, true));
         let events = stuck_on_next_infer(&mut e); // q1's suffix (no priming fold since Task 55)
@@ -8751,5 +8893,332 @@ mod tests {
         }
         rt.block_on(fake).unwrap();
         assert_eq!(infers(&e, 0), 2);
+    }
+
+    // ---- Task 57: retry a request once after a native infer failure recovers ----
+
+    /// cascadia-runner's `MAX_CONSECUTIVE_EMPTY_STEPS`: a stream closes at this many empty steps
+    /// in a row.
+    const RUNNER_EMPTY_LIMIT: usize = 3;
+
+    /// Step as the runner does until the task's final chunk: every chunk, and the longest run of
+    /// consecutive empty steps.
+    fn drive(e: &mut Qwen36Engine) -> (Vec<Chunk>, usize) {
+        let (mut chunks, mut run, mut longest) = (Vec::new(), 0, 0);
+        for _ in 0..50 {
+            let out = e.step().expect("step");
+            if out.is_empty() {
+                run += 1;
+                longest = longest.max(run);
+                continue;
+            }
+            run = 0;
+            for (_, c) in out {
+                let last = c.is_final;
+                chunks.push(c);
+                if last {
+                    return (chunks, longest);
+                }
+            }
+        }
+        panic!("no final chunk");
+    }
+
+    fn text(chunks: &[Chunk]) -> String {
+        chunks.iter().map(|c| c.text.as_str()).collect()
+    }
+
+    fn long_chat(id: &str) -> GenerationTask {
+        let mut t = chat(id);
+        t.max_tokens = 4;
+        t
+    }
+
+    #[test]
+    fn a_decode_failure_mid_chat_is_retried_and_the_stream_matches_an_uninterrupted_run() {
+        let mut clean = mock_box();
+        clean.submit(long_chat("c1")).unwrap();
+        let (want, _) = drive(&mut clean);
+        assert_eq!(want.len(), 5, "4 tokens and the final marker: {want:?}");
+        // Stage 1's infers: the prefill 0, decodes 1 and 2; decode 2 fails, one token in. The
+        // request idles after 3 waits (kept and reset), or never: abandoned after the full idle
+        // bound and recompiled. Either way inside the failing step, so the stream sees one empty
+        // step (the retry's prefill) between two tokens.
+        for stuck in [false, true] {
+            let mut e = mock_box();
+            if stuck {
+                e.stage_idle_timeout = Duration::from_millis(200);
+            }
+            let events = busy_after_failed_infer(&mut e, 2, if stuck { u32::MAX } else { 3 });
+            e.submit(long_chat("c1")).unwrap();
+            let t0 = Instant::now();
+            let (got, longest) = drive(&mut e);
+            assert!(
+                got.iter().all(|c| c.error.is_none()),
+                "stuck={stuck}: {got:?}"
+            );
+            assert_eq!(text(&got), text(&want), "stuck={stuck}");
+            assert_eq!(got.len(), want.len(), "max_tokens bounds prefix + new");
+            let fin = got.last().unwrap();
+            assert_eq!(fin.finish_reason, want.last().unwrap().finish_reason);
+            assert_eq!(fin.finish_reason, Some(FinishReason::Length));
+            let usage = want.last().unwrap().prompt_tokens;
+            assert_eq!(
+                fin.prompt_tokens, usage,
+                "the resumed tokens are not prompt tokens"
+            );
+            assert_eq!(longest, 1, "stuck={stuck}: one empty step at a time");
+            let ev = events.lock().unwrap().clone();
+            assert!(ev.contains(&"cancel"), "the recovery ran: {ev:?}");
+            assert_eq!(ev.contains(&"recompile"), stuck, "{ev:?}");
+            if stuck {
+                assert!(t0.elapsed() >= Duration::from_millis(200));
+            }
+            assert!(e.retry.is_none() && e.pending.is_empty() && !e.scrub_pending);
+            assert!(!e.infer_failed && e.engine_failed.is_none());
+        }
+    }
+
+    #[test]
+    fn a_prefill_failure_is_retried_and_served() {
+        let mut clean = mock_box();
+        clean.submit(chat("c1")).unwrap();
+        let (want, _) = drive(&mut clean);
+        let mut e = mock_box();
+        busy_after_failed_infer(&mut e, 0, 3);
+        e.submit(chat("c1")).unwrap();
+        let (got, longest) = drive(&mut e);
+        assert!(got.iter().all(|c| c.error.is_none()), "{got:?}");
+        assert_eq!(text(&got), text(&want));
+        assert_eq!(got.len(), want.len());
+        assert_eq!(
+            longest, 1,
+            "the failed prefill and the retried one are one step"
+        );
+        assert_eq!(
+            infers(&e, 1),
+            1 + 1 + 2,
+            "failed prefill, prefill, 2 decodes"
+        );
+    }
+
+    #[test]
+    fn a_failed_decision_pass_is_retried_unchanged_and_answers_as_an_uninterrupted_pass() {
+        let mut clean = mock_box();
+        clean.submit(verbalizer_pass("d1")).unwrap();
+        let (want, _) = drive(&mut clean);
+        let want = want[0].decision_logits.clone().expect("the pass's logits");
+
+        // Prefill: the pass's stage-1 infer 0 fails.
+        let mut e = mock_box();
+        busy_after_failed_infer(&mut e, 0, 3);
+        e.submit(verbalizer_pass("d1")).unwrap();
+        let (got, longest) = drive(&mut e);
+        assert_eq!(
+            got.len(),
+            1,
+            "one final chunk, no chunk for the failed attempt: {got:?}"
+        );
+        assert!(got[0].error.is_none(), "{got:?}");
+        assert_eq!(got[0].decision_logits.as_ref(), Some(&want));
+        assert_eq!(longest, 1);
+
+        // Head: no head reads a native infer today (the joint head's does not set
+        // `infer_failed`), so this simulates one: the flag is set and this pass's head cannot
+        // read its answer. The re-queued task is the original, so the retry answers.
+        let mut e = mock_box();
+        e.submit(verbalizer_pass("d2")).unwrap();
+        assert!(e.step().unwrap().is_empty(), "admission and prefill");
+        e.infer_failed = true;
+        let t = e.active.as_mut().unwrap();
+        let Some(cascadia_types::ReadoutHead::Verbalizer { token_ids }) =
+            t.decision.as_mut().map(|d| &mut d.head)
+        else {
+            unreachable!()
+        };
+        token_ids[0] = 99;
+        assert!(
+            e.step().unwrap().is_empty(),
+            "the head failed; the retry's prefill rides the same step"
+        );
+        let (got, longest) = drive(&mut e);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].error.is_none(), "{got:?}");
+        assert_eq!(got[0].decision_logits.as_ref(), Some(&want));
+        assert_eq!(
+            longest, 0,
+            "prefill, head failure + retried prefill, then the answer"
+        );
+        assert!(e.retry.is_none() && e.pending.is_empty());
+    }
+
+    #[test]
+    fn a_failure_of_the_retry_fails_the_task_and_says_it_was_the_retry() {
+        let mut e = mock_box();
+        // Stage 1: prefill 0, decode 1, decode 2 fails; the retry's prefill 3, its decode 4 fails.
+        busy_after_failed_infer(&mut e, 2, 3);
+        mock1(&mut e).fail_infer_again = Some(4);
+        e.submit(long_chat("c1")).unwrap();
+        let (got, longest) = drive(&mut e);
+        assert_eq!(got.len(), 2, "one token, then the error: {got:?}");
+        assert!(got[0].error.is_none());
+        assert_eq!(
+            got[1].error.as_deref(),
+            Some(
+                "decode failed: backend error: unknown C++ exception in infer (on the retry after \
+                 an infer failure)"
+            )
+        );
+        assert!(longest < RUNNER_EMPTY_LIMIT);
+        assert!(
+            e.pending.is_empty() && e.retry.is_none(),
+            "no third attempt"
+        );
+        assert!(
+            e.scrub_pending,
+            "the next admission recovers, as before Task 57"
+        );
+        e.submit(chat("c2")).unwrap();
+        let c = run_to_final(&mut e);
+        assert!(c.error.is_none(), "{c:?}");
+    }
+
+    #[test]
+    fn pipeline_rank0_does_not_retry_a_failed_infer() {
+        let rt = pipe_rt();
+        let (mut e, mut server) = pipe_rank0(&rt);
+        e.hidden = MOCK_HIDDEN;
+        e.tokenizer = Some(tiny_tokenizer());
+        let emb = MockStage::new(&["input_ids"], MOCK_HIDDEN, None);
+        let mut s0 = MockStage::new(&FIRST_STAGE_INPUTS, MOCK_HIDDEN, None);
+        s0.fail_infer_at = Some(0);
+        let events = Arc::clone(&s0.events);
+        e.emb = Some(OvStage::Mock(emb));
+        e.stages = vec![OvStage::Mock(s0)];
+        let fake = rt.spawn(async move {
+            let s = &mut server;
+            let (k, ep, _) = parse_header(&s.recv_raw(12).await.unwrap());
+            assert_eq!((k, ep), (FRAME_RESET, 1));
+            fake_ack(s, FRAME_RESET_ACK, 1).await;
+        });
+        e.pending.push(chat("p1"));
+        let out = e.step().unwrap();
+        rt.block_on(fake).unwrap();
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            out[0].1.error.as_deref(),
+            Some("pipeline prefill failed: backend error: unknown C++ exception in infer")
+        );
+        assert!(e.infer_failed, "a native failure, and still no retry");
+        assert!(e.active.is_none() && e.pending.is_empty() && e.retry.is_none());
+        assert!(e.scrub_pending, "the next admission recovers, as before");
+        let ev = events.lock().unwrap().clone();
+        assert_eq!(ev, ["reset", "infer"], "one attempt: {ev:?}");
+    }
+
+    #[test]
+    fn a_retry_whose_recovery_fails_the_engine_gets_the_refusal_and_nothing_loops() {
+        let mut e = mock_box();
+        e.stage_idle_timeout = Duration::from_millis(100);
+        let ctl = arm_recompile(&mut e);
+        ctl.lock().unwrap().fail = true;
+        busy_after_failed_infer(&mut e, 1, u32::MAX); // the first decode, stuck for good
+        e.submit(chat("c1")).unwrap();
+        assert!(e.step().unwrap().is_empty(), "admission and prefill");
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 1, "{out:?}");
+        let why = out[0].1.error.as_deref().expect("refused");
+        assert!(
+            why.starts_with("backend error: qwen36 engine failed: stage1's infer request")
+                && why.ends_with("restart the server"),
+            "the normal engine-failed refusal: {why}"
+        );
+        assert!(e.engine_failed.is_some());
+        assert_eq!(e.failure().reason(), e.engine_failed);
+        assert!(e.active.is_none() && e.pending.is_empty() && e.retry.is_none());
+        assert!(e.step().unwrap().is_empty(), "nothing left to run");
+    }
+
+    #[test]
+    fn a_failure_that_fails_the_engine_is_not_retried() {
+        // A recompiled stage whose first infer fails fails the engine at the failure itself
+        // (Task 54): no retry, the task's own error.
+        let mut e = mock_box();
+        e.stage_idle_timeout = Duration::from_millis(100);
+        let ctl = arm_recompile(&mut e);
+        ctl.lock().unwrap().fail_first_infer = true;
+        let events = stuck_on_next_infer(&mut e);
+        e.no_retry = true;
+        e.submit(chat("c1")).unwrap();
+        assert!(run_to_final(&mut e).error.is_some());
+        e.no_retry = false;
+        e.submit(chat("c2")).unwrap();
+        let (got, _) = drive(&mut e);
+        assert_eq!(got.len(), 1, "{got:?}");
+        let why = got[0].error.as_deref().expect("fails");
+        assert!(
+            why.starts_with("prefill failed: ") && !why.contains("retry"),
+            "{why}"
+        );
+        assert!(e.engine_failed.is_some());
+        assert!(e.pending.is_empty() && e.retry.is_none());
+        let recompiles = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&a| a == "recompile")
+            .count();
+        assert_eq!(recompiles, 1, "no second recovery");
+    }
+
+    /// Byte-fallback tokens for "€" (E2 82 AC) after `hi`: a partial sequence decodes to one
+    /// U+FFFD per byte, as a byte-level vocab does mid-character.
+    fn byte_tokenizer() -> Tokenizer {
+        let json = r#"{"version":"1.0","truncation":null,"padding":null,
+            "added_tokens":[],"normalizer":null,
+            "pre_tokenizer":{"type":"Whitespace"},
+            "post_processor":null,"decoder":{"type":"ByteFallback"},
+            "model":{"type":"WordLevel",
+                "vocab":{"hi":0,"<0xE2>":1,"<0x82>":2,"<0xAC>":3},"unk_token":"[UNK]"}}"#;
+        Tokenizer::from_bytes(json.as_bytes()).expect("build byte tokenizer")
+    }
+
+    #[test]
+    fn a_retried_chat_carries_the_bytes_already_emitted_across_a_held_back_partial_char() {
+        // The chat generates E2, 82 (both held back: an incomplete char), then AC, whose decode
+        // infer fails. The retry resumes over [E2, 82] with the bytes emitted so far (none). A
+        // re-decoded seed would be two U+FFFD (6 bytes), and "€" would then be dropped as a
+        // diverged decode.
+        let run = |fail: bool| {
+            let mut e = mock_box();
+            e.tokenizer = Some(byte_tokenizer());
+            if fail {
+                busy_after_failed_infer(&mut e, 3, 3); // prefill 0, decodes 1 (E2), 2 (82), 3 (AC)
+            }
+            let mut task = chat("u1");
+            task.max_tokens = 3;
+            e.submit(task).unwrap();
+            let mut chunks = Vec::new();
+            // Stage 1's peak is the argmax its next infer outputs: the prefill's picks E2, the
+            // first decode's 82, every later one AC.
+            for i in 0..20usize {
+                mock1(&mut e).peak = Some((i + 1).min(3));
+                for (_, c) in e.step().expect("step") {
+                    let last = c.is_final;
+                    chunks.push(c);
+                    if last {
+                        return chunks;
+                    }
+                }
+            }
+            panic!("no final chunk");
+        };
+        let want = run(false);
+        assert_eq!(text(&want), "€");
+        let got = run(true);
+        assert!(got.iter().all(|c| c.error.is_none()), "{got:?}");
+        assert_eq!(text(&got), "€", "{got:?}");
+        assert_eq!(got.len(), want.len());
+        assert_eq!(got.last().unwrap().prompt_tokens, Some(3));
     }
 }
