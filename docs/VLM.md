@@ -158,7 +158,7 @@ sampled; each model described it correctly.
 | `qwen3_5_moe` (Qwen3.6-35B-A3B) | yes | 451 |
 | `qwen2_5_vl` (Qwen2.5-VL-7B) | yes | 565 |
 | `qwen2_vl`, `qwen3_5` | yes (GenAI's Qwen video path; not measured) | |
-| `llava_next_video` | yes (in GenAI's video list; untested) | |
+| `llava_next_video` (LLaVA-NeXT-Video-7B) | yes | 619 (as frames: 5900) |
 | `internvl_chat` (InternVL2-4B), `llava_next`, every other type | no: GenAI has no video preprocessing for them | as frames (InternVL2-4B: 1117) |
 
 Cascadia passes each video's frame indices and sampling rate (`VideoMetadata`), so GenAI
@@ -323,6 +323,7 @@ the context (400 `context_length_exceeded`).
 | Qwen3.5 / Qwen3.6 VLM | `qwen35` | 2+ machines | `tools/qwen36_surgery/export_qwen36_moe.py`; the vision IRs in the source dir are carried into the tree |
 | Gemma 4 26B-A4B / 31B | `ov-genai` | one box | the OpenVINO VLM export as published |
 | Qwen2.5-VL, Qwen3-VL, InternVL2, Phi-3.5-vision, LLaVA-NeXT (llava-v1.6), Gemma 3 | `ov-genai` | one box | the OpenVINO exports as published (`OpenVINO/<model>-int4-ov`) |
+| LLaVA-1.5 (llava-1.5-7b), LLaVA-NeXT-Video (7B) | `ov-genai` | one box | no published OpenVINO export: `optimum-cli export openvino --task image-text-to-text --weight-format int4` from `llava-hf/…` (LLaVA-NeXT-Video needs transformers <= 4.57.6, and its tokenizer IRs and chat template come from the source repo's tokenizer files and `chat_template.json`) |
 | Gemma 4 26B-A4B / 31B | `ov-runtime` | 2+ machines, stateful, static or packed | `tools/gemma4_surgery/export_gemma4_text.py --vision` |
 | Gemma 4 E2B / E4B | `gemma4` | 1+ machines | `tools/export_gemma4.py --vision DIR` |
 | Gemma 3 (4B / 12B / 27B) | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family gemma3` |
