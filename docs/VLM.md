@@ -682,7 +682,9 @@ Verified on the Lunar Lake NPU with Pixtral (one 12B stage per 32 GB node) and M
 a node
 needs RAM for both the decode and prefill IRs of every stage it holds. Gemma 4 26B-A4B
 is not practical on the NPU: one stage's decode IR had not compiled after 90 minutes
-(its mixture-of-experts layers); serve it from CPU static or stateful trees. Qwen3-VL 4B
+(its mixture-of-experts layers), and a second, uncapped try was stopped after about 85
+minutes, once the compile had grown to 27 GB and the 32 GB node started paging; serve it
+from CPU static or stateful trees. Qwen3-VL 4B
 static and packed (`--packed-slots 2`) trees passed the SDK image suite on CPU — one box and
 two machines (the M-RoPE positions ride the stage wire) — with the prompt-token count
 matching the stateful tree (223), and the packed concurrent test too. Gemma 3 12B packed
@@ -752,8 +754,10 @@ IRs); a restart from the cache dir served in under a minute. See
   at a 288-row cost unless it was built with `--dynamic-seq` (CPU) or
   `--decode-seq` (static shapes, meant for the NPU). A tree that also serves the static
   path caps `--context` + `--prefill-seq` at the sliding window + 1 (1025), two slots of
-  367 tokens at `--context 736`; a `--packed-only` tree (packed slots only) goes past it,
-  and the NPU has not run one yet. Every
+  367 tokens at `--context 736`; a `--packed-only` tree (packed slots only) goes past it.
+  On the NPU, all four stages of a Gemma 4 31B packed-only tree (text only) compile, 24-39
+  minutes each, but four ranks on two 32 GB nodes run out of RAM at load because each node
+  compiles two stages at once; serving it needs precompiled blobs, not yet tried. Every
   stage must run the same build and tree kind: the packed plan frame's tag says
   whether it carries image ids, and a stage refuses a frame of the other kind or of
   an older, untagged build.
