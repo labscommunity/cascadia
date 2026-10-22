@@ -38,8 +38,8 @@ least one image wide (Gemma 4: 280, Gemma 3: 256), and context + prefill-seq wit
 window by ring index, which runs ahead of the real distance across the
 ring's padding.
 
-`--packed-only` (Gemma 4) lifts that window cap for a tree that will only be
-served on packed slots: `tools/packed_variant.py` replaces both of Gemma 4's
+`--packed-only` (Gemma 4, Gemma 3) lifts that window cap for a tree that will
+only be served on packed slots: `tools/packed_variant.py` replaces both of their
 mask producers with host-built masks (the sliding one from the real token
 distance), so the ring-index masking never runs there. The tree is then wrong
 in static mode, so the tool marks it `"packed_only": true` in every
@@ -334,31 +334,33 @@ def copy_root(tree: str, out: str) -> None:
             copy_file(src, os.path.join(out, name))
 
 
-def is_gemma4(pipeline: dict, config: dict) -> bool:
-    """A Gemma 4 tree: the vision block says so, or (text-only) config.json."""
+def is_gemma(pipeline: dict, config: dict) -> bool:
+    """A Gemma 4 or Gemma 3 tree: the vision block says so, or config.json."""
     family = (pipeline.get("vision") or {}).get("family")
-    return family == "gemma4" or config.get("model_type") in ("gemma4", "gemma4_text")
+    return family in ("gemma4", "gemma3") or config.get("model_type") in (
+        "gemma4", "gemma4_text", "gemma3", "gemma3_text")
 
 
-def window_error(context: int, prefill_seq: int, window, gemma4: bool,
+def window_error(context: int, prefill_seq: int, window, gemma: bool,
                  packed_only: bool):
     """Why `--context` / `--prefill-seq` cannot be built, or None.
 
     The static IR masks the sliding window by KV ring index, so a ring past
     the window would cut sliding layers off from tokens inside it. A
-    `--packed-only` Gemma 4 tree is exempt: its packed variant takes both masks
-    from the host. Other families keep the cap (their packed masks were never
-    checked against a ring past the window).
+    `--packed-only` Gemma 4 or Gemma 3 tree is exempt: its packed variant takes
+    both masks from the host. Other families keep the cap (their packed masks
+    were never checked against a ring past the window).
     """
-    if packed_only and not gemma4:
-        return ("--packed-only is supported for Gemma 4 trees only (packed_variant.py "
-                "replaces both of their mask producers with host-built masks)")
+    if packed_only and not gemma:
+        return ("--packed-only is supported for Gemma 4 and Gemma 3 trees only "
+                "(packed_variant.py replaces both of their mask producers with host-built "
+                "masks)")
     if not window or context + max(prefill_seq, 1) <= window + 1 or packed_only:
         return None
     msg = (f"--context {context} + --prefill-seq {prefill_seq} exceeds the "
            f"sliding window ({window}) + 1: the IR masks the window by ring index, so "
            "a longer ring would cut sliding layers off from tokens inside their window")
-    if gemma4:
+    if gemma:
         msg += ("; for a tree served only on packed slots (host-built masks), pass "
                 "--packed-only and serve it with --packed-slots")
     return msg
@@ -378,8 +380,8 @@ def main() -> None:
     ap.add_argument("--stage", type=int, default=None,
                     help="convert only this stage (a worker holding one stage)")
     ap.add_argument("--packed-only", action="store_true",
-                    help="Gemma 4: allow --context + --prefill-seq past the sliding window "
-                         "+ 1 for a tree served ONLY on packed slots (packed_variant.py "
+                    help="Gemma 4 / Gemma 3: allow --context + --prefill-seq past the sliding "
+                         "window + 1 for a tree served ONLY on packed slots (packed_variant.py "
                          "builds both masks on the host). Marks the tree packed_only; "
                          "ov-runtime refuses it without --packed-slots")
     args = ap.parse_args()
@@ -403,7 +405,7 @@ def main() -> None:
     with open(os.path.join(args.tree, "config.json")) as f:
         config = json.load(f)
     err = window_error(args.context, args.prefill_seq, config.get("sliding_window"),
-                       is_gemma4(pipeline, config), args.packed_only)
+                       is_gemma(pipeline, config), args.packed_only)
     if err:
         raise SystemExit(err)
     # A node's own one-stage tree (export_gemma4_text.py --stage I) lists only
