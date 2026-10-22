@@ -373,11 +373,12 @@ pub struct WorkerArgs {
 
     /// Decision requests (/v1/decisions and /v1/systemone) admitted at once; one more is a 503
     /// `engine at capacity`. A pool of its own: decisions and chat never take each other's
-    /// permits, so up to 16 chat + N decision requests are admitted at once. The engine still
-    /// runs one pass at a time, so N sets queue depth, not parallelism. With Kev and the prefix
-    /// cache, more admitted requests (chat included) evict more shared-prefix snapshots, and an
-    /// evicted one is also a 503. 1 to 240: chat's 16 plus N must fit the engine's 256-task
-    /// pending queue.
+    /// permits, so up to C chat + N decision requests are admitted at once, where C is chat's
+    /// pool (16, unless CASCADIA_API_MAX_CONCURRENT sets it). The engine still runs one pass at a
+    /// time, so N sets queue depth, not parallelism. With Kev and the prefix cache, more admitted
+    /// requests (chat included) evict more shared-prefix snapshots, and an evicted one is also a
+    /// 503. 1 to 240: C plus N must fit the engine's 256-task pending queue, and a server that
+    /// serves decisions refuses to start when it does not.
     #[arg(long, value_name = "N", default_value_t = cascadia_api::DEFAULT_MAX_CONCURRENT_DECISIONS, value_parser = parse_max_decision_requests)]
     pub max_decision_requests: usize,
 
@@ -771,8 +772,8 @@ pub struct RunArgs {
     #[arg(long, value_name = "BYTES")]
     pub decision_dump_max_bytes: Option<u64>,
 
-    /// Decision requests admitted at once, a pool separate from chat's. See
-    /// `cascadia worker --help`. 1 to 240.
+    /// Decision requests admitted at once, a pool separate from chat's; chat's pool plus N must
+    /// fit the engine's 256-task pending queue. See `cascadia worker --help`. 1 to 240.
     #[arg(long, value_name = "N", default_value_t = cascadia_api::DEFAULT_MAX_CONCURRENT_DECISIONS, value_parser = parse_max_decision_requests)]
     pub max_decision_requests: usize,
 
@@ -1393,8 +1394,9 @@ fn ov_perf_properties(args: &WorkerArgs) -> Vec<(String, String)> {
 }
 
 /// Largest `--max-decision-requests`: every admitted request can have a pass queued in the
-/// engine, so the decision pool plus chat's (fixed at [`cascadia_api::DEFAULT_MAX_CONCURRENT`])
-/// must fit its pending queue, or decisions would fill it and chat would get `QueueFull` 503s.
+/// engine, so the decision pool plus chat's must fit its pending queue, or decisions would fill
+/// it and chat would get `QueueFull` 503s. This bound assumes chat's default pool
+/// ([`cascadia_api::DEFAULT_MAX_CONCURRENT`]); [`check_admission_fits`] checks the real one.
 const MAX_DECISION_REQUESTS: usize =
     cascadia_engine_openvino::dist_spec::MAX_PENDING_TASKS - cascadia_api::DEFAULT_MAX_CONCURRENT;
 
@@ -1405,8 +1407,8 @@ fn parse_max_decision_requests(s: &str) -> Result<usize, String> {
     match s.parse::<usize>() {
         Ok(0) => Err("must be at least 1 (0 would refuse every decision request)".into()),
         Ok(n) if n > MAX_DECISION_REQUESTS => Err(format!(
-            "must be at most {MAX_DECISION_REQUESTS}: the {} chat permits plus N must fit the \
-             engine's {}-task pending queue",
+            "must be at most {MAX_DECISION_REQUESTS}: chat's {} permits (by default) plus N must \
+             fit the engine's {}-task pending queue",
             cascadia_api::DEFAULT_MAX_CONCURRENT,
             cascadia_engine_openvino::dist_spec::MAX_PENDING_TASKS,
         )),
@@ -1417,6 +1419,21 @@ fn parse_max_decision_requests(s: &str) -> Result<usize, String> {
         }
         Err(_) => Err(format!("{s:?} is not {range}")),
     }
+}
+
+/// Chat's pool (`CASCADIA_API_MAX_CONCURRENT`) plus the decision pool must fit the engine's
+/// pending queue, for the same reason as [`MAX_DECISION_REQUESTS`]. Only a server that serves
+/// /v1/decisions has a decision pool to fit; without one any chat pool is accepted.
+fn check_admission_fits(chat: usize, decisions: usize, decisions_served: bool) -> Result<()> {
+    let queue = cascadia_engine_openvino::dist_spec::MAX_PENDING_TASKS;
+    if decisions_served && chat.saturating_add(decisions) > queue {
+        return Err(anyhow!(
+            "CASCADIA_API_MAX_CONCURRENT ({chat}) plus --max-decision-requests ({decisions}) must \
+             be at most {queue}, the engine's pending-task queue, or decisions could fill it and \
+             chat would get QueueFull 503s; lower one of them"
+        ));
+    }
+    Ok(())
 }
 
 /// clap value-parser for `--ov-config`: require a `KEY=VALUE` shape with a
@@ -2621,6 +2638,11 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         );
         // Decision admission, separate from chat's `max_concurrent_requests` above.
         cfg.max_concurrent_decisions = args.max_decision_requests;
+        check_admission_fits(
+            cfg.max_concurrent_requests,
+            cfg.max_concurrent_decisions,
+            cfg.decisions.is_some(),
+        )?;
         let max_concurrent = cfg.max_concurrent_requests as u64;
         // Shared live counters: the API bumps them on the chat hot path,
         // the dashboard's /api/stats reads them — same Arc, so the cluster
@@ -4125,6 +4147,28 @@ mod tests {
         assert_eq!(api_max_concurrent(Some("0"), 64), 64);
         assert_eq!(api_max_concurrent(Some("-1"), 64), 64);
         assert_eq!(api_max_concurrent(Some("8"), 64), 8);
+    }
+
+    #[test]
+    fn check_admission_fits_keeps_chat_plus_decisions_within_the_queue() {
+        assert!(check_admission_fits(16, 16, true).is_ok());
+        assert!(check_admission_fits(16, 240, true).is_ok());
+        assert!(check_admission_fits(64, 192, true).is_ok(), "exactly 256");
+        for (chat, decisions) in [(64, 193), (300, 1), (usize::MAX, 240)] {
+            let err = check_admission_fits(chat, decisions, true)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("CASCADIA_API_MAX_CONCURRENT ({chat})"))
+                    && err.contains(&format!("--max-decision-requests ({decisions})"))
+                    && err.contains("at most 256"),
+                "{err}"
+            );
+        }
+        // Without /v1/decisions there is no decision pool: any chat pool starts.
+        for (chat, decisions) in [(64, 193), (300, 240), (usize::MAX, 240)] {
+            assert!(check_admission_fits(chat, decisions, false).is_ok());
+        }
     }
 
     /// Parse a `cascadia shard …` argv into its `ShardArgs` (panics on a
