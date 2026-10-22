@@ -16,6 +16,20 @@
 //!   stays a floor if either one is what the running GenAI does. Where GenAI's
 //!   choice depends on an order its sources leave unspecified (InternVL's
 //!   unstable sort), the mirror takes the smallest choice it could make.
+//! - Qwen3.5 / 3.6 (`qwen3_5`, `qwen3_5_moe`): as Qwen3-VL. GenAI's
+//!   `VisionEncoderQwen3_5` is `VisionEncoderQwen3VL` with no overrides
+//!   (`qwen3_5/classes.hpp:15`, `vision_encoder.cpp:137-138`), and the exports
+//!   ship Qwen3-VL's processor.
+//! - LLaVA-NeXT-Video: images as LLaVA-NeXT (the same `select_best_resolution`,
+//!   and `get_unpadded_features` counts what the LLaVA-NeXT mirror counts,
+//!   `llava_next_video/classes.cpp:201-221,384-404`); a video is
+//!   `(crop / patch)² / 4` per frame (lines 569-570), every frame kept since
+//!   Cascadia passes each frame's index (`sample_video_if_needed`,
+//!   `inputs_embedder.cpp:193-240`).
+//! - LLaVA-1.5 (`llava` with a CLIP tower): `(crop / patch)²` per image, the
+//!   vision IR's rows (`llava/classes.cpp:59,99-110`); a `full` feature
+//!   strategy adds the CLS row, so this stays a floor. A `llava` export with a
+//!   Pixtral tower is not sized: `ov-genai` serves it text only.
 //! - Phi-3.5-vision, Gemma 3, Gemma 4: the HF math, which never exceeds
 //!   GenAI's (its f32 HD transform for Phi-3.5, the fixed view for Gemma 3,
 //!   the same aspect-preserving resize for Gemma 4). A Gemma 4 video keeps at
@@ -158,6 +172,24 @@ pub(crate) enum MediaSizer {
     InternVL(crate::internvl_vision::PreprocessConfig),
     Phi3V(crate::phi3v_vision::PreprocessConfig),
     LlavaNext(crate::llava_next_vision::PreprocessConfig),
+    LlavaNextVideo {
+        image: crate::llava_next_vision::PreprocessConfig,
+        /// Soft tokens per video frame: the base view pooled 2x2.
+        per_frame: usize,
+    },
+    Llava {
+        /// Soft tokens per image: the vision IR's rows.
+        per_image: usize,
+    },
+}
+
+/// `crop_size` as `(height, width)`: an object, or one number for both.
+fn crop_size(pre: &serde_json::Value) -> Option<(u64, u64)> {
+    let c = pre.get("crop_size")?;
+    if let Some(n) = c.as_u64() {
+        return Some((n, n));
+    }
+    Some((c.get("height")?.as_u64()?, c.get("width")?.as_u64()?))
 }
 
 fn read_json(path: &Path) -> Result<serde_json::Value, String> {
@@ -282,9 +314,18 @@ impl MediaSizer {
                 genai_video,
             })
         };
+        let llava_next = || -> Result<crate::llava_next_vision::PreprocessConfig, String> {
+            let pre = read_json(&dir.join("preprocessor_config.json"))?;
+            let proc_path = dir.join("processor_config.json");
+            let proc = proc_path
+                .exists()
+                .then(|| read_json(&proc_path))
+                .transpose()?;
+            crate::llava_next_vision::PreprocessConfig::from_export(&pre, proc.as_ref(), &cfg)
+        };
         let sizer = match model_type {
             "qwen2_5_vl" => qwen(crate::qwen_vl_vision::Kind::Qwen25Vl)?,
-            "qwen3_vl" => qwen(crate::qwen_vl_vision::Kind::Qwen3Vl)?,
+            "qwen3_vl" | "qwen3_5" | "qwen3_5_moe" => qwen(crate::qwen_vl_vision::Kind::Qwen3Vl)?,
             "gemma3" => {
                 let p = crate::gemma3_vision::PreprocessConfig::from_model_dir(dir)?;
                 if let Some(n) = cfg
@@ -315,18 +356,37 @@ impl MediaSizer {
             "phi3_v" => Self::Phi3V(crate::phi3v_vision::PreprocessConfig::from_json_file(
                 &dir.join("preprocessor_config.json"),
             )?),
-            "llava_next" => {
+            "llava_next" => Self::LlavaNext(llava_next()?),
+            "llava_next_video" => {
+                let image = llava_next()?;
+                if image.patch_size == 0 {
+                    return Err("vision patch_size is 0".into());
+                }
+                let side = (image.tile / image.patch_size) as usize;
+                Self::LlavaNextVideo {
+                    image,
+                    per_frame: side * side / 4,
+                }
+            }
+            "llava" => {
+                let tower = cfg.get("vision_config");
+                let tower_type = tower
+                    .and_then(|t| t.get("model_type"))
+                    .and_then(serde_json::Value::as_str);
+                if tower_type == Some("pixtral") {
+                    return Ok(None);
+                }
                 let pre = read_json(&dir.join("preprocessor_config.json"))?;
-                let proc_path = dir.join("processor_config.json");
-                let proc = proc_path
-                    .exists()
-                    .then(|| read_json(&proc_path))
-                    .transpose()?;
-                Self::LlavaNext(crate::llava_next_vision::PreprocessConfig::from_export(
-                    &pre,
-                    proc.as_ref(),
-                    &cfg,
-                )?)
+                let (h, w) =
+                    crop_size(&pre).ok_or("preprocessor_config.json states no crop_size")?;
+                let patch = tower
+                    .and_then(|t| t.get("patch_size"))
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|&p| p > 0)
+                    .ok_or("config.json states no vision_config.patch_size")?;
+                Self::Llava {
+                    per_image: ((h / patch) * (w / patch)) as usize,
+                }
             }
             _ => return Ok(None),
         };
@@ -342,6 +402,8 @@ impl MediaSizer {
             Self::InternVL(_) => "InternVL",
             Self::Phi3V(_) => "Phi-3.5-vision",
             Self::LlavaNext(_) => "LLaVA-NeXT",
+            Self::LlavaNextVideo { .. } => "LLaVA-NeXT-Video",
+            Self::Llava { .. } => "LLaVA",
         }
     }
 
@@ -388,10 +450,11 @@ impl MediaSizer {
                 genai_internvl_tokens(w, h, c.tokens_per_tile),
             ),
             Self::Phi3V(c) => crate::phi3v_vision::num_image_tokens(w, h, c),
-            Self::LlavaNext(c) => floor_of(
+            Self::LlavaNext(c) | Self::LlavaNextVideo { image: c, .. } => floor_of(
                 crate::llava_next_vision::image_tokens(h, w, c),
                 genai_llava_next_tokens(w, h, c),
             ),
+            Self::Llava { per_image } => Ok(*per_image),
         }
     }
 
@@ -424,6 +487,12 @@ impl MediaSizer {
             Self::Gemma4 { video, .. } => {
                 let l = crate::gemma4_vision::video::layout(m, video)?;
                 Ok(l.frames.len() * l.soft_tokens)
+            }
+            Self::LlavaNextVideo { per_frame, .. } => {
+                if m.num_frames == 0 {
+                    return Err("a video with no frames".into());
+                }
+                Ok(m.num_frames as usize * per_frame)
             }
             _ => Err(format!("{} takes no native video", self.name())),
         }
@@ -525,7 +594,7 @@ mod tests {
 
     #[test]
     fn unknown_families_are_not_sized() {
-        for t in ["llava", "minicpmv", "qwen2_vl", "qwen3_5_moe", "qwen3"] {
+        for t in ["minicpmv", "qwen2_vl", "qwen3", "llava_onevision"] {
             let dir = export(&[("config.json", json!({ "model_type": t }))]);
             assert!(
                 MediaSizer::from_export(dir.path()).unwrap().is_none(),
@@ -741,6 +810,42 @@ mod tests {
 
     /// Sizes for the sweeps: every size up to 200 a side, then a coarser grid
     /// up to 2048, within the API's 1 MP image budget.
+    /// Qwen3.5 / 3.6 exports (`qwen3_5`, `qwen3_5_moe`) size as Qwen3-VL:
+    /// GenAI runs Qwen3-VL's vision encoder for them unchanged.
+    #[test]
+    fn qwen3_5_sizes_as_qwen3_vl() {
+        let r = fixture("qwen_vl_vision/reference.json");
+        let rv = fixture("qwen_vl_vision/video_reference.json");
+        let base = qwen_export(&r, &rv, "qwen3_vl");
+        let q3 = sizer(&base);
+        for t in ["qwen3_5", "qwen3_5_moe"] {
+            let mut cfg = read_json(&base.path().join("config.json")).unwrap();
+            cfg["model_type"] = json!(t);
+            let files: Vec<(&str, Value)> =
+                ["preprocessor_config.json", "video_preprocessor_config.json"]
+                    .into_iter()
+                    .map(|n| (n, read_json(&base.path().join(n)).unwrap()))
+                    .chain([("config.json", cfg)])
+                    .collect();
+            let s = sizer(&export(&files));
+            assert_eq!(s.name(), q3.name(), "{t}");
+            for (w, h) in sweep() {
+                assert_eq!(
+                    s.image_tokens(w, h).ok(),
+                    q3.image_tokens(w, h).ok(),
+                    "{t} {w}x{h}"
+                );
+            }
+            let clip = video(4, 448, 448, vec![0, 500, 1000, 1500]);
+            assert_eq!(
+                s.soft_tokens(std::slice::from_ref(&clip)).ok(),
+                q3.soft_tokens(&[clip]).ok(),
+                "{t} video"
+            );
+            assert_eq!(s.soft_tokens(&[image(448, 448)]).unwrap(), 196, "{t}");
+        }
+    }
+
     fn sweep() -> impl Iterator<Item = (u32, u32)> {
         let fine = (1..=200u32).flat_map(|w| (1..=200u32).map(move |h| (w, h)));
         let coarse = (200..=2048u32)
@@ -1026,6 +1131,89 @@ mod tests {
                 Err(e) => panic!("{w}x{h}: GenAI sizes it ({g}) but the sizer does not: {e}"),
             }
         }
+    }
+
+    /// LLaVA-NeXT-Video sizes its images as LLaVA-NeXT does (the same GenAI
+    /// pinpoint reading and unpadding) and a native video at 144 per frame
+    /// for 336 px views of 14 px patches: 576 for the SDK's 4-frame clip,
+    /// whose GenAI run reported 619 prompt tokens with its text.
+    #[test]
+    fn llava_next_video_sizes_images_as_llava_next_and_frames_pooled() {
+        let (r, next) = llava_export();
+        let mut cfg = read_json(&next.path().join("config.json")).unwrap();
+        cfg["model_type"] = json!("llava_next_video");
+        let dir = export(&[
+            ("config.json", cfg),
+            ("preprocessor_config.json", r["processor"].clone()),
+        ]);
+        let (nv, n) = (sizer(&dir), sizer(&next));
+        assert_eq!(nv.name(), "LLaVA-NeXT-Video");
+        for (w, h) in sweep() {
+            assert_eq!(
+                nv.image_tokens(w, h).ok(),
+                n.image_tokens(w, h).ok(),
+                "{w}x{h}"
+            );
+        }
+        assert_eq!(nv.soft_tokens(&[image(448, 448)]).unwrap(), 2928);
+        let clip = video(4, 448, 448, vec![0, 1000, 2000, 3000]);
+        assert_eq!(nv.soft_tokens(std::slice::from_ref(&clip)).unwrap(), 576);
+        assert_eq!(
+            nv.soft_tokens(&[clip, image(448, 448)]).unwrap(),
+            576 + 2928
+        );
+        assert!(n
+            .soft_tokens(&[video(4, 448, 448, vec![0, 1, 2, 3])])
+            .is_err());
+    }
+
+    /// LLaVA-1.5: the vision IR's rows per image whatever its size, 576 for
+    /// 336 px crops of 14 px patches; no native video. A `llava` export with
+    /// a Pixtral tower is not sized (`ov-genai` serves it text only), and one
+    /// without a crop size or patch is an error.
+    #[test]
+    fn llava_sizes_a_fixed_count_per_image() {
+        let cfg = json!({
+            "model_type": "llava",
+            "vision_config": { "model_type": "clip_vision_model", "patch_size": 14 },
+        });
+        let pre = json!({ "crop_size": { "height": 336, "width": 336 }, "size": { "shortest_edge": 336 } });
+        let s = sizer(&export(&[
+            ("config.json", cfg.clone()),
+            ("preprocessor_config.json", pre),
+        ]));
+        assert_eq!(s.name(), "LLaVA");
+        for (w, h) in [(448, 448), (40, 30), (1500, 4), (3000, 2000)] {
+            assert_eq!(s.soft_tokens(&[image(w, h)]).unwrap(), 576, "{w}x{h}");
+        }
+        assert_eq!(
+            s.soft_tokens(&[image(448, 448), image(64, 64)]).unwrap(),
+            1152
+        );
+        assert!(s
+            .soft_tokens(&[video(4, 448, 448, vec![0, 1, 2, 3])])
+            .is_err());
+        let int_crop = export(&[
+            ("config.json", cfg.clone()),
+            ("preprocessor_config.json", json!({ "crop_size": 224 })),
+        ]);
+        assert_eq!(
+            sizer(&int_crop).soft_tokens(&[image(448, 448)]).unwrap(),
+            256
+        );
+
+        let pixtral = export(&[(
+            "config.json",
+            json!({ "model_type": "llava", "vision_config": { "model_type": "pixtral" } }),
+        )]);
+        assert!(MediaSizer::from_export(pixtral.path()).unwrap().is_none());
+        let no_crop = export(&[
+            ("config.json", cfg),
+            ("preprocessor_config.json", json!({})),
+        ]);
+        assert!(MediaSizer::from_export(no_crop.path()).is_err());
+        let no_files = export(&[("config.json", json!({ "model_type": "llava" }))]);
+        assert!(MediaSizer::from_export(no_files.path()).is_err());
     }
 
     /// Gemma 3: `image_seq_length` per image whatever its size; 256 of
