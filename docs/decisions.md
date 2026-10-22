@@ -827,11 +827,12 @@ tokens later, both times into a coherent alternative wording.
   to 240 s for each stuck stage (at most the engine's recompile cap: 2, or 1 when its largest stage
   is over 4 GiB, as on a 1-stage tree). After that comes the re-prefill of the prompt plus the
   tokens already generated. No timer bounds the re-prefill; it takes as long as a prefill of that
-  length. (The recompiled stage's first infer is the first infer of that re-prefill.) That step returns nothing, and the engine reports it to the runner
-  as progress (`Engine::progressed_without_chunks`). The runner closes a stream after 3 engine
-  steps in a row that produce nothing (`MAX_CONSECUTIVE_EMPTY_STEPS`); neither the retried
-  stream nor a stream queued behind it counts the retry step toward that. A step that waits on
-  the recovery is still one step, however long it waits.
+  length. (The recompiled stage's first infer is the first infer of that re-prefill.) That step
+  returns nothing, and the engine reports it to the runner as progress
+  (`Engine::progressed_without_chunks`). The runner closes a stream after 3 engine steps in a row
+  that produce nothing (`MAX_CONSECUTIVE_EMPTY_STEPS`); neither the retried stream nor a stream
+  queued behind it counts the retry step toward that. A step that waits on the recovery is still
+  one step, however long it waits.
 - **When it still fails.** If the recovery fails the engine, the retried task gets the usual
   `qwen36 engine failed: ...; restart the server` refusal and the server exits for its
   supervisor (below). If the retry itself fails, the task fails with the usual error plus `(on
@@ -880,10 +881,10 @@ on stage3 and on stage6, and served the next request each time.
 the whole old copy (compiled model and weights) is leaked, whatever the recompile does. The same
 holds when the engine fails instead (cap reached, no recipe, a request that cannot be abandoned)
 and for a recompiled copy whose first infer fails or does not return: that copy is leaked too,
-never left to drop with the engine. **Each recovery costs about one stage of memory**: the stage's weight file, 1.49 GB for stage6 and
-2.47 GB for stage7 of the 8-stage 9B int8 tree, on a GPU that shares the host's RAM (31.6 GB on p01).
-On a 1-stage tree (the single-box default) the one stage is the whole model, so a recovery leaks
-about 9 GB.
+never left to drop with the engine. **Each recovery costs about one stage of memory**: the
+stage's weight file, 1.49 GB for stage6 and 2.47 GB for stage7 of the 8-stage 9B int8 tree, on a
+GPU that shares the host's RAM (31.6 GB on p01). On a 1-stage tree (the single-box default) the
+one stage is the whole model, so a recovery leaks about 9 GB.
 
 A recompiled stage needs nothing re-bound. Every input is set on each infer, and its variable
 state starts empty. The scrub skips its reset and rebuild (it is fresh and has never run). The
@@ -920,9 +921,9 @@ so its supervisor restarts it (below):
   that shares the host's RAM. There the first fault recovers and the request is retried (above);
   the second fails the engine, and the server exits for a supervisor restart (below), about 22 s
   warm for a 1-stage 9B tree. If a stage's weight file size cannot be read at load, the cap
-  stays 2, the pre-Task 58 behaviour. The engine logs its cap at load (`qwen36: stage recompile cap`, with
-  `total`, `local_stages`, `largest_leak_bytes` and `cap`), and every `recompile` recovery line
-  carries `recompiled` and `cap`.
+  stays 2, the pre-Task 58 behaviour. The engine logs its cap at load (`qwen36: stage recompile
+  cap`, with `total`, `local_stages`, `largest_leak_bytes` and `cap`), and every `recompile`
+  recovery line carries `recompiled` and `cap`.
 - The request could not be abandoned (the shim is out of memory), or its state cannot be read.
 
 A failed engine fails the task that ran the recovery, and every later one at once, with
@@ -935,17 +936,19 @@ ms`. Chat and decisions return their 5xx. Only a restart recovers it.
 **The server exits so the supervisor restarts it.** On rank 0 or a single box (`cascadia worker
 --api` and `cascadia run`), the server notices the failure within 200 ms and logs one `error`
 line: `engine failed; exiting so the supervisor restarts the server`, with the reason. It stops
-accepting connections, gives the responses already in flight 3 s to reach their clients (the
-failing request's 5xx and any requests already refused), runs the same bounded close as a
-SIGTERM (up to 10 s), and exits non-zero. Both production units restart on a non-zero exit:
-systemd's `Restart=on-failure` and NSSM's `AppExit Default Restart` (see
-[docs/deploy/README.md](deploy/README.md)). A warm restart (model cache warm) measured about 5 s
-to `API serving` on pawan-03 for an 8-stage tree, and 21-24 s (about 22 s) on pawan-01 for a
-1-stage tree, after the supervisor's own delay (systemd `RestartSec=5`). If
-the close overruns its 10 s, the process exits non-zero at once instead of waiting on it.
+accepting connections and new requests: an idle keep-alive connection is closed at once, and a
+connection with a response in flight is closed after that response. It gives the responses
+already in flight 3 s to reach their clients (the failing request's 5xx and any requests already
+refused), runs the same bounded close as a SIGTERM (up to 10 s), and exits non-zero. Both
+production units restart on a non-zero exit: systemd's `Restart=on-failure` and NSSM's `AppExit
+Default Restart` (see [docs/deploy/README.md](deploy/README.md)). A warm restart (model cache
+warm) measured about 5 s to `API serving` on pawan-03 for an 8-stage tree, and 21-24 s (about
+22 s) on pawan-01 for a 1-stage tree, after the supervisor's own delay (systemd `RestartSec=5`).
+If the close overruns its 10 s, the process exits non-zero at once instead of waiting on it.
 Requests that arrive while the server is down get a connection refused, so clients should
-retry. A SIGTERM or SIGINT still exits 0. Only qwen35 reports a failed engine; the other
-engines never do.
+retry. A SIGTERM or SIGINT still exits 0; if its close overruns the same 10 s, the process logs
+`runner.close() overran after a shutdown signal; forcing a non-zero exit` and exits non-zero at
+once too. Only qwen35 reports a failed engine; the other engines never do.
 
 To debug a failed engine in place, pass `--keep-serving-on-engine-failure` (worker and `run`).
 The server then stays up as before Task 56: it refuses every request with a 5xx, and `/health`
@@ -963,10 +966,10 @@ restarts (measured +16% with two on an Arc 140V); restart recommended`, with `le
 `leaked_bytes` and `cap` fields. The rule keys on successful recompiles: a recovery that fails
 also leaks a copy, but it fails the engine, so no later recompile can warn. With the cap of 1 (a
 1-stage tree, or a big pipeline stage) only one recompile can succeed, so this warning never fires
-there: the one leaked copy (about 9 GB for a 1-stage 9B tree) stays until the restart, and the next fault fails the engine instead
-of leaking a second. Its decode cost was not measured. The code would name a
-helper thread leaked by a timed-out recompile in the text, but that cannot happen today: a
-timed-out recompile fails the engine. The API process's `/metrics` exposes
+there: the one leaked copy (about 9 GB for a 1-stage 9B tree) stays until the restart, and the
+next fault fails the engine instead of leaking a second. Its decode cost was not measured. The
+code would name a helper thread leaked by a timed-out recompile in the text, but that cannot
+happen today: a timed-out recompile fails the engine. The API process's `/metrics` exposes
 `cascadia_engine_stage_recompiles_total` (counter: successful recompiles) and
 `cascadia_engine_leaked_stage_bytes` (gauge: the weight bytes of every stage copy fault recovery
 leaked, whether or not its recompile succeeded). Only the API process (rank 0) serves `/metrics`,
@@ -1001,19 +1004,19 @@ The shim also guards itself:
   (`action=abandon outcome=leaked`).
 
 **Pipeline mode.** A pipeline task whose infer fails is not retried (see [Retry after a failed
-infer](#retry-after-a-failed-infer)). A downstream rank runs the same recovery inside the head's RESET. It
-abandons the stuck request and recompiles the stage the same way, and then acks, so the head's
-task is served. The head sees only a slower ack. The recovery takes up to 30 s of idle wait plus
-the compile (1 to 2 s cache-warm, up to 180 s) for each stuck stage, and the time adds up across
-ranks: a middle rank recovers before it forwards the RESET downstream. One stuck stage with a
-cache-warm compile fits under the head's default 60 s reply bound. A cold compile, two stuck
-stages (on one rank, or on two), or a lower configured bound can exceed it. The head then fails
-that task with `RESET not acked`. The protocol does not desync: acks carry the task's epoch, and
-the head skips a late one. The next task is served on the recompiled stage.
+infer](#retry-after-a-failed-infer)). A downstream rank runs the same recovery inside the head's
+RESET. It abandons the stuck request and recompiles the stage the same way, and then acks, so the
+head's task is served. The head sees only a slower ack. The recovery takes up to 30 s of idle wait
+plus the compile (1 to 2 s cache-warm, up to 180 s) for each stuck stage, and the time adds up
+across ranks: a middle rank recovers before it forwards the RESET downstream. One stuck stage with a
+cache-warm compile fits under the head's default 60 s reply bound. A cold compile, two stuck stages
+(on one rank, or on two), or a lower configured bound can exceed it. The head then fails that task
+with `RESET not acked`. The protocol does not desync: acks carry the task's epoch, and the head
+skips a late one. The next task is served on the recompiled stage.
 
 A downstream rank whose engine failed (one of the cases above, or a desynced downstream link of
-its own; see [Pipeline reply timeouts](#pipeline-reply-timeouts)) does not ack the next RESET. Its step
-returns a connection-fatal error, so the stage process exits for its supervisor to rebuild it.
+its own; see [Pipeline reply timeouts](#pipeline-reply-timeouts)) does not ack the next RESET. Its
+step returns a connection-fatal error, so the stage process exits for its supervisor to rebuild it.
 The head sees the socket close and fails the task at once with `qwen36 pipeline RESET not acked:
 socket closed`, instead of waiting out its reply bound on every task. The reason is in the
 downstream rank's log. No frame changed, so a peer without this change handles it as any closed
