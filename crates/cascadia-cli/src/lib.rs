@@ -2086,7 +2086,16 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
 /// cadence instead of being Nagle-aggregated into ~3500 B bursts
 /// every ~1 s — the original demo's bursty token feel was driven
 /// almost entirely by this default.
-async fn serve_with_nodelay(listener: tokio::net::TcpListener, app: axum::Router) -> Result<()> {
+///
+/// Task 61: once `stop` reads `true`, every open connection shuts down
+/// gracefully (hyper's `graceful_shutdown`): an idle keep-alive connection
+/// closes at once, and one with a response in flight closes after that
+/// response, so no new request is admitted while in-flight ones finish.
+async fn serve_with_nodelay(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     use hyper::server::conn::http1;
     use hyper_util::rt::TokioIo;
     use std::convert::Infallible;
@@ -2120,12 +2129,22 @@ async fn serve_with_nodelay(listener: tokio::net::TcpListener, app: axum::Router
                 Ok::<_, Infallible>(res.unwrap_or_else(|e: Infallible| match e {}))
             }
         });
+        let mut stop = stop.clone();
         tokio::spawn(async move {
-            if let Err(e) = http1::Builder::new()
+            let conn = http1::Builder::new()
                 .keep_alive(true)
-                .serve_connection(io, svc)
-                .await
-            {
+                .serve_connection(io, svc);
+            let mut conn = std::pin::pin!(conn);
+            // A dropped sender never stops a connection (`false`: the arm is disabled).
+            let stopped = async { stop.wait_for(|&s| s).await.is_ok() };
+            let res = tokio::select! {
+                res = conn.as_mut() => res,
+                true = stopped => {
+                    conn.as_mut().graceful_shutdown();
+                    conn.await
+                }
+            };
+            if let Err(e) = res {
                 tracing::debug!(error = %e, "connection serve ended");
             }
         });
@@ -2226,10 +2245,11 @@ fn watched_failure(args: &WorkerArgs, runner: &Runner) -> Option<cascadia_engine
 }
 
 /// Task 56 fix round 1: end the process at once with a non-zero code. Used only when the close
-/// after an engine failure overruns its bound: returning would let `main` drop the tokio runtime,
-/// and that drop waits on the still-blocked close task (after a native fault a request's
-/// destructor can block forever), so the process would never exit and never be restarted.
-fn force_exit_after_engine_failure() {
+/// overruns its bound, after an engine failure or a signal alike (Task 61): returning would let
+/// `main` drop the tokio runtime, and that drop waits on the still-blocked close task (after a
+/// native fault a request's destructor can block forever), so the process would never exit and,
+/// after an engine failure, never be restarted.
+fn force_exit_after_close_overrun() {
     use std::io::Write;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
@@ -2238,11 +2258,14 @@ fn force_exit_after_engine_failure() {
 
 /// Serve the API until a SIGTERM/SIGINT (`Ok`, exit 0) or, with `failure` watched, until the
 /// engine fails for good (`Err`, a non-zero exit, so systemd `Restart=on-failure` and NSSM restart
-/// the server). Either way the same bounded `runner.close()` runs last. After an engine failure,
-/// a close that overruns `close_timeout` calls `force_exit` ([`force_exit_after_engine_failure`]
-/// in production) instead of returning; the signal path keeps today's behaviour.
+/// the server). Either way the open connections are told to stop admitting requests
+/// (`stop_connections`, see [`serve_with_nodelay`]) and the same bounded `runner.close()` runs
+/// last. A close that overruns `close_timeout` calls `force_exit`
+/// ([`force_exit_after_close_overrun`] in production) instead of returning.
+#[allow(clippy::too_many_arguments)]
 async fn serve_until_shutdown(
     serve: impl std::future::Future<Output = Result<()>>,
+    stop_connections: tokio::sync::watch::Sender<bool>,
     shutdown_signal: impl std::future::Future<Output = ShutdownSignal>,
     failure: Option<cascadia_engine::EngineFailure>,
     grace: std::time::Duration,
@@ -2277,7 +2300,9 @@ async fn serve_until_shutdown(
         }
     }
     // The serve future (and its listener) is dropped: no new connection is accepted. The
-    // connections already open run on their own tasks; give their responses a moment to land.
+    // connections already open run on their own tasks: each stops admitting requests and closes
+    // once its response in flight, if any, is done. Give those responses a moment to land.
+    let _ = stop_connections.send(true);
     if engine_failure.is_some() {
         tokio::time::sleep(grace).await;
     }
@@ -2285,13 +2310,11 @@ async fn serve_until_shutdown(
     // operator to escalate `kill` → `kill -9`. `Runner::close()` is
     // sync (parking_lot::Mutex) and may block_on async transport
     // teardown internally; dispatch via spawn_blocking so the timer
-    // can actually fire, then await with a deadline. On timeout we
-    // log loudly and stop waiting here, but the close task keeps its
-    // thread: when `main` drops the tokio runtime, that drop waits for
-    // it. A close that never returns therefore still holds the process
-    // up on the signal path (the supervisor's stop timeout kills it).
-    // After an engine failure nobody is stopping the process, so the
-    // overrun forces the exit instead (`force_exit`).
+    // can actually fire, then await with a deadline. On timeout the
+    // close task keeps its thread, and when `main` drops the tokio
+    // runtime that drop waits for it, so a close that never returns
+    // would hold the process up. The overrun therefore forces the exit
+    // (`force_exit`), after a signal and after an engine failure alike.
     let close_task = tokio::task::spawn_blocking(move || runner.close());
     match tokio::time::timeout(close_timeout, close_task).await {
         Ok(Ok(())) => info!("runner.close() complete"),
@@ -2304,13 +2327,16 @@ async fn serve_until_shutdown(
                 timeout_s = close_timeout.as_secs_f64(),
                 "runner.close() exceeded timeout; abandoning teardown"
             );
-            if let Some(reason) = &engine_failure {
-                error!(
+            match &engine_failure {
+                Some(reason) => error!(
                     reason = %reason,
                     "engine failed and runner.close() overran; forcing a non-zero exit"
-                );
-                force_exit();
+                ),
+                None => error!(
+                    "runner.close() overran after a shutdown signal; forcing a non-zero exit"
+                ),
             }
+            force_exit();
         }
     }
     match engine_failure {
@@ -2962,13 +2988,15 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // Task 56: watch the engine's failure handle unless the operator asked to keep a failed
         // engine up.
         let failure = watched_failure(&args, &runner);
+        let (stop_connections, stop) = tokio::sync::watch::channel(false);
         return serve_until_shutdown(
-            serve_with_nodelay(listener, app),
+            serve_with_nodelay(listener, app, stop),
+            stop_connections,
             shutdown_signal,
             failure,
             ENGINE_FAILED_GRACE,
             SHUTDOWN_CLOSE_TIMEOUT,
-            force_exit_after_engine_failure,
+            force_exit_after_close_overrun,
             runner,
         )
         .await;
@@ -4135,6 +4163,11 @@ mod engine_failure_tests {
         runner
     }
 
+    /// A connection-stop sender no connection watches (the serve here is a pending future).
+    fn unwatched() -> tokio::sync::watch::Sender<bool> {
+        tokio::sync::watch::channel(false).0
+    }
+
     /// A shutdown future the test fires by hand, standing in for SIGTERM.
     fn signal() -> (
         tokio::sync::oneshot::Sender<()>,
@@ -4163,6 +4196,7 @@ mod engine_failure_tests {
         let t0 = Instant::now();
         let r = serve_until_shutdown(
             std::future::pending(),
+            unwatched(),
             shutdown,
             Some(runner.engine_failure()),
             grace,
@@ -4200,6 +4234,7 @@ mod engine_failure_tests {
         let (tx, shutdown) = signal();
         let serving = tokio::spawn(serve_until_shutdown(
             std::future::pending(),
+            unwatched(),
             shutdown,
             None,
             Duration::from_millis(50),
@@ -4223,6 +4258,7 @@ mod engine_failure_tests {
         let t0 = Instant::now();
         serve_until_shutdown(
             std::future::pending(),
+            unwatched(),
             shutdown,
             Some(runner.engine_failure()),
             Duration::from_secs(30),
@@ -4248,6 +4284,7 @@ mod engine_failure_tests {
         let t0 = Instant::now();
         let r = serve_until_shutdown(
             std::future::pending(),
+            unwatched(),
             shutdown,
             Some(runner.engine_failure()),
             Duration::ZERO,
@@ -4264,25 +4301,113 @@ mod engine_failure_tests {
         assert!(r.is_err());
     }
 
-    /// Fix round 1: the signal path keeps today's behaviour. An overrunning close is abandoned
-    /// with a warning and the shutdown still returns `Ok`; nothing is forced.
+    /// Task 61: the signal path forces the exit on an overrun too, instead of returning into a
+    /// runtime drop that would wait on the stuck close. A close in time is never forced (the
+    /// tests above).
     #[tokio::test]
-    async fn an_overrunning_close_after_a_signal_is_not_forced() {
+    async fn an_overrunning_close_after_a_signal_forces_the_exit() {
         let handle = EngineFailure::default();
-        let runner = started_with_close(&handle, Duration::from_millis(500)).await;
+        let runner = started_with_close(&handle, Duration::from_secs(1)).await;
         let (tx, shutdown) = signal();
         tx.send(()).unwrap();
+        let forced = std::sync::atomic::AtomicBool::new(false);
+        let t0 = Instant::now();
         serve_until_shutdown(
             std::future::pending(),
+            unwatched(),
             shutdown,
             Some(runner.engine_failure()),
             Duration::ZERO,
             Duration::from_millis(100),
-            || panic!("a signal shutdown is never forced"),
+            || forced.store(true, std::sync::atomic::Ordering::SeqCst),
             runner,
         )
         .await
-        .expect("a signal shutdown exits 0");
+        .expect("no engine failure: the signal path returns Ok when force_exit returns");
+        assert!(forced.load(std::sync::atomic::Ordering::SeqCst), "forced");
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "did not wait out the close"
+        );
+    }
+
+    /// Read from `conn` until `needle` has arrived (`true`) or the peer closed (`false`).
+    async fn read_until(
+        conn: &mut tokio::net::TcpStream,
+        seen: &mut Vec<u8>,
+        needle: &str,
+    ) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 1024];
+        loop {
+            if String::from_utf8_lossy(seen).contains(needle) {
+                return true;
+            }
+            let n = tokio::time::timeout(Duration::from_secs(5), conn.read(&mut buf))
+                .await
+                .expect("read timed out")
+                .expect("read");
+            if n == 0 {
+                return false;
+            }
+            seen.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    /// Task 61: once the connections are told to stop, an idle keep-alive connection is closed
+    /// at once, so it cannot send a new request into the grace, while a response in flight on
+    /// another connection still streams to its end.
+    #[tokio::test]
+    async fn stopped_connections_admit_no_new_request_and_finish_the_one_in_flight() {
+        use tokio::io::AsyncWriteExt;
+        let slow = || async {
+            let parts = futures::stream::unfold(0, |i| async move {
+                match i {
+                    0 => Some((Ok::<_, std::io::Error>("first;".to_string()), 1)),
+                    1 => {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Some((Ok("last.".to_string()), 2))
+                    }
+                    _ => None,
+                }
+            });
+            axum::body::Body::from_stream(parts)
+        };
+        let app = axum::Router::new()
+            .route("/quick", axum::routing::get(|| async { "quick." }))
+            .route("/slow", axum::routing::get(slow));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop_connections, stop) = tokio::sync::watch::channel(false);
+        tokio::spawn(serve_with_nodelay(listener, app, stop));
+
+        // A keep-alive connection that has finished its request, and one streaming a response.
+        let mut idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+        idle.write_all(b"GET /quick HTTP/1.1\r\nHost: t\r\n\r\n")
+            .await
+            .unwrap();
+        let mut idle_seen = Vec::new();
+        assert!(read_until(&mut idle, &mut idle_seen, "quick.").await);
+        let mut busy = tokio::net::TcpStream::connect(addr).await.unwrap();
+        busy.write_all(b"GET /slow HTTP/1.1\r\nHost: t\r\n\r\n")
+            .await
+            .unwrap();
+        let mut busy_seen = Vec::new();
+        assert!(read_until(&mut busy, &mut busy_seen, "first;").await);
+
+        stop_connections.send(true).unwrap();
+        assert!(
+            !read_until(&mut idle, &mut idle_seen, "never").await,
+            "the idle keep-alive connection is closed"
+        );
+        assert!(
+            read_until(&mut busy, &mut busy_seen, "last.").await,
+            "the response in flight finished"
+        );
+        assert!(
+            !read_until(&mut busy, &mut busy_seen, "never").await,
+            "then its connection closed"
+        );
     }
 
     /// Fix round 1: the opt-out wiring `cmd_worker` uses. With
@@ -4314,6 +4439,7 @@ mod engine_failure_tests {
         let (tx, shutdown) = signal();
         let serving = tokio::spawn(serve_until_shutdown(
             std::future::pending(),
+            unwatched(),
             shutdown,
             watched,
             Duration::ZERO,
@@ -4337,6 +4463,7 @@ mod engine_failure_tests {
         let (_tx, shutdown) = signal();
         let r = serve_until_shutdown(
             std::future::pending(),
+            unwatched(),
             shutdown,
             watched,
             Duration::ZERO,
