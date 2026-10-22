@@ -726,9 +726,18 @@ wait stopped:
   error. The desync also fails the engine with that reason, so rank 0 exits for its supervisor
   (see [Engine failures](#engine-failures)); until it exits, every task, chat and decisions
   alike, fails at once with `qwen36 engine failed: <the desync message>; restart the server`.
-  With the relays under restart-on-exit supervisors too, the pipeline reconnects on its own: on
-  pawan-03 (2 ranks on one host), killing rank 0 had the pipeline serving again 4.1 s later.
-  Before this, killing rank 1 left rank 0 up, desynced, and answering 503 until a manual restart.
+  With the relays under restart-on-exit supervisors too, the pipeline reconnects on its own.
+  Measured on pawan-03 (two ranks on one host, kev9b-int8-2st, warm model cache):
+  - Rank 0 killed: the pipeline served again about 4 s after the kill.
+  - Rank 1 killed: about 12 s. Rank 1 restarted within 3 s. Rank 0 failed its next exchange,
+    answered 503 while it gave in-flight responses the 3 s grace, then exited, restarted and
+    reconnected. Before this change, rank 0 stayed up, desynced, and answered 503 for 15 minutes
+    until a manual restart.
+
+  Each restart counts against the supervisor's start limit (the systemd unit allows 3 starts per
+  minute). If one rank cannot come back, the ranks around it keep failing their link and exiting
+  until they hit that limit too, and then they stay stopped. Fix the dead rank, then reset and
+  start the units (`systemctl reset-failed` and `systemctl start`).
 - **The startup handshake** (HELLO). A rank 1 that is still loading can answer after the timeout.
   The first request then fails, and the next one waits for that HELLO's reply instead of sending a
   second HELLO. In the served 2-rank topology a long load therefore costs one failed request
