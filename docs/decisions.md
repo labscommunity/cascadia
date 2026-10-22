@@ -793,10 +793,10 @@ engine's text is logged and never returned to the client.
 
 ### Retry after a failed infer
 
-On a single box (no pipeline), a task whose native infer fails during its prefill, its decode or
-its decision head is retried once instead of failed. These are the failures that start the
-recovery below (OpenVINO's `unknown C++ exception in infer`, BUG-1, is one). The client sees only
-the extra latency and no chunk of the failed attempt. A decision pass re-runs from the start, so
+On a single box (no pipeline), a task whose native infer fails during its prefill or its decode is
+retried once instead of failed. These are the failures that start the recovery below (OpenVINO's
+`unknown C++ exception in infer`, BUG-1, is one). The client sees only the extra latency and no
+chunk of the failed attempt. A decision pass re-runs from the start, so
 its answer is the one an uninterrupted pass gives. A chat keeps every byte already sent, but its
 continuation is not always byte-identical to an uninterrupted run: re-prefilling the generated
 tokens takes a different numeric path than decoding them one at a time, so a later near-tie can
@@ -815,9 +815,10 @@ tokens later, both times into a coherent alternative wording.
   over, so no text is repeated or lost, even when an incomplete UTF-8 character was being held
   back. The final chunk's `prompt_tokens` leaves the resumed tokens out, so usage matches an
   uninterrupted run.
-- **Decision passes** re-run unchanged: a pass sends nothing before its final chunk. No head
-  reads a native infer that sets the failed-infer flag today (the joint head's own infer does
-  not), so in practice it is a failed prefill that a pass retries.
+- **Decision passes** re-run unchanged: a pass sends nothing before its final chunk. Only a
+  failed prefill is retried. A failure of the decision head fails the pass as before: no head
+  runs an infer the recovery covers (the verbalizer and pointer heads are host math, and the
+  joint head's own infer is not recovered), so a re-run could not be trusted to answer.
 - **When.** The retry is admitted at once, ahead of every queued task, in the same engine step as
   the failure. That admission first runs the failed task's scrub and the recovery below, exactly
   as the next task's admission would, and then prefills the prompt again. In the worst case the
@@ -825,20 +826,22 @@ tokens later, both times into a coherent alternative wording.
   (up to 180 s, `RECOMPILE_TIMEOUT`), then the recompiled stage's first infer (up to 30 s), so up
   to 240 s for each stuck stage (at most the engine's recompile cap: 2, or 1 when its largest stage
   is over 4 GiB, as on a 1-stage tree). After that comes the re-prefill of the prompt plus the
-  tokens already generated. No timer bounds the re-prefill; it
-  takes as long as a prefill of that length. (The recompiled stage's first infer is the first
-  infer of that re-prefill.) Doing it in the failing step keeps the stream alive: the runner
-  closes a stream after 3 engine steps in a row that produce nothing
-  (`MAX_CONSECUTIVE_EMPTY_STEPS`), and a decision pass's failed head step is already its second.
-  A step that waits on the recovery is still one step, however long it waits.
+  tokens already generated. No timer bounds the re-prefill; it takes as long as a prefill of that
+  length. (The recompiled stage's first infer is the first infer of that re-prefill.) That step returns nothing, and the engine reports it to the runner
+  as progress (`Engine::progressed_without_chunks`). The runner closes a stream after 3 engine
+  steps in a row that produce nothing (`MAX_CONSECUTIVE_EMPTY_STEPS`); neither the retried
+  stream nor a stream queued behind it counts the retry step toward that. A step that waits on
+  the recovery is still one step, however long it waits.
 - **When it still fails.** If the recovery fails the engine, the retried task gets the usual
   `qwen36 engine failed: ...; restart the server` refusal and the server exits for its
   supervisor (below). If the retry itself fails, the task fails with the usual error plus `(on
   the retry after an infer failure)`, and the next task's admission runs the scrub, as before.
 - **Logs.** A retry logs one `warn` line, `qwen36: retrying task after infer failure`, with the
-  task id, `phase`, `prompt`, `warm_prefix`, `generated` (tokens so far), `attempt` (2, the retry)
-  and the reason. `qwen36 task failed` is logged only when the task really fails. The per-site
-  `prefill failed` and `decode failed` lines still mark each failed infer.
+  task id, `phase`, `prompt`, `warm_prefix`, `generated` (the tokens the failed attempt
+  generated), `resume_seed` (the tokens of a peer resume it came with, not counted in
+  `generated`), `attempt` (2, the retry) and the reason. `qwen36 task failed` is logged only when
+  the task really fails. The per-site `prefill failed` and `decode failed` lines still mark each
+  failed infer.
 
 Pipeline mode does not retry: a failed task on the pipeline head fails as before.
 

@@ -1076,7 +1076,9 @@ impl Stream for ChunkStream {
                     None => None,
                     Some(engine) => Some(match engine.step() {
                         Ok(produced) => {
-                            let empty = produced.is_empty();
+                            // A step that did real work without a chunk (qwen36's retry,
+                            // Task 61) is progress for every stream, not an empty step.
+                            let empty = produced.is_empty() && !engine.progressed_without_chunks();
                             let mut bufs = this.slot.buffers.lock();
                             for (tid, chunk) in produced {
                                 if bufs.cancelled.contains(&tid) {
@@ -2482,6 +2484,70 @@ mod tests {
             }
         }
         assert!(saw_progress && saw_final);
+    }
+
+    /// Task 61: the steps a stream queued behind a retried task drives, as qwen36 runs them. The
+    /// steps that produce chunks for the other tasks are driven by those tasks' own streams and
+    /// left out. Step 2 fails task "a" and admits its retry, all in one step that returns nothing;
+    /// that step does real work, and the engine says so.
+    struct RetryingEngine {
+        step: usize,
+    }
+
+    impl Engine for RetryingEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _task: GenerationTask) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            self.step += 1;
+            Ok(match self.step {
+                // 1: a decision pass's prefill; 2: "a"'s failure, recovery and retried prefill;
+                // 3: "b"'s admission and prefill; 4: "b"'s final.
+                4 => vec![("b".into(), Chunk::final_marker("b", "b done"))],
+                _ => Vec::new(),
+            })
+        }
+        fn progressed_without_chunks(&self) -> bool {
+            self.step == 2
+        }
+    }
+
+    struct RetryingBuilder;
+
+    #[async_trait::async_trait]
+    impl Builder for RetryingBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            Ok(Box::new(RetryingEngine { step: 0 }))
+        }
+    }
+
+    /// Task 61: a stream queued behind a retried task must not count the retry step as empty.
+    /// Counted, steps 1-3 are three empty steps in a row and "b" closes with "no progress"
+    /// before its own answer; the engine's progress report keeps it alive.
+    #[tokio::test]
+    async fn a_retry_step_does_not_push_a_queued_stream_toward_the_empty_step_limit() {
+        let runner = Runner::new(Box::new(RetryingBuilder));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("m", "CPU"),
+            )
+            .await
+            .unwrap();
+        let mut b = runner.generate(GenerationTask::new("b", "second")).unwrap();
+        let last = b.next().await.expect("b's final chunk");
+        assert!(last.error.is_none(), "b closed early: {:?}", last.error);
+        assert_eq!(last.text, "b done");
     }
 
     /// Engine that emits a chunk for EVERY in-flight task on every step — the
