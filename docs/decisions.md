@@ -650,20 +650,19 @@ python tools/decision_export.py clef --base-ir STOCK_INT8_IR \
   single-box tree for a machine with too little RAM for the 1-stage export: the export then holds
   one stage at a time. Exporter peak RAM (process tree working set) measured on pawan-01, 1 stage
   against 8: JEV 8.25 against 3.1 GiB, Kev 20.3 against 5.1 GiB, Clef-flash 20.6 against 5.3 GiB.
-- The exporter checks its memory before it writes anything. It estimates its peak RAM from the base
-  IR's int8 weight files (`openvino_language_model.bin` plus `openvino_text_embeddings_model.bin`,
-  7.40 + 0.95 = 8.35 GiB for Qwen3.5-9B): 2.5 times their size with `--weights` (Kev, Clef; the
-  measured peaks are 2.43 and 2.47 times), 1.0 times without (JEV's graft; measured 0.99 times),
-  times the largest stage's share of the layers (1/N for `--stages N`; with an uneven
-  `--layer-split`, the biggest stage's layers over all layers), down to a floor of 0.38 (the
-  8-stage peaks are 0.25-0.37 of the 1-stage ones). That covers every measured peak above: 20.9 GiB for a 1-stage swap, 8.35 GiB for
-  JEV, 7.9 and 3.2 GiB at 8 stages. When the estimate exceeds the machine's physical RAM, the
-  export is refused: `the export needs about 20.9 GiB of RAM at --stages 1 (the base IR's 8.3 GiB
-  of int8 weights, x2.5 for the --weights swap), but this machine has 16.0 GiB: export with
-  --stages 8 instead ...`. An export that already uses 8 or more stages is told to use more stages
-  (or an even split) or `--skip-memory-check` instead, since the estimate does not fall below the
-  floor. `--skip-memory-check` exports anyway. When the RAM cannot be read, nothing is refused. The check
-  uses only the Python standard library (`sysconf` on Linux and macOS, `GlobalMemoryStatusEx` on
+- A 1-stage export checks its memory before it writes anything. It estimates its peak RAM from
+  the base IR's int8 weight files (`openvino_language_model.bin` plus
+  `openvino_text_embeddings_model.bin`, 7.40 + 0.95 = 8.35 GiB for Qwen3.5-9B): 2.5 times their
+  size with `--weights` (Kev, Clef; the measured peaks are 2.43 and 2.47 times), 1.0 times without
+  (JEV's graft; measured 0.99 times). That is 20.9 GiB for a 9B swap and 8.35 GiB for JEV, above
+  every measured 1-stage peak. When the estimate exceeds the machine's physical RAM, the export is
+  refused: `the export needs about 20.9 GiB of RAM at --stages 1 (the base IR's 8.3 GiB of int8
+  weights, x2.5 for the --weights swap), but this machine has 16.0 GiB: export with --stages 8
+  instead ...`. `--skip-memory-check` exports anyway. When the RAM cannot be read, nothing is
+  refused. Multi-stage exports (`--stages 2` and up: pipelines, and the low-memory single box) are
+  not checked, as before: only the 1-stage peaks were measured, and multi-stage peaks do not scale
+  from them (Clef-27B at `--stages 2` needs about 16 GB). The check uses only the Python standard
+  library (`sysconf` on Linux and macOS, `GlobalMemoryStatusEx` on
   Windows).
 - A 1-stage tree also loads slower (warm load to `API serving` 21-24 s against 7-13 s for 8
   stages), and a fault recovery leaks the whole model, so its engine recompiles at most once (see
@@ -803,7 +802,8 @@ tokens later, both times into a coherent alternative wording.
   as the next task's admission would, and then prefills the prompt again. In the worst case the
   failing step therefore waits for the 30 s idle wait (`STAGE_IDLE_TIMEOUT`), then the recompile
   (up to 180 s, `RECOMPILE_TIMEOUT`), then the recompiled stage's first infer (up to 30 s), so up
-  to 240 s for each stuck stage (at most 2 recompiles per engine). After that comes the
+  to 240 s for each stuck stage (at most the engine's recompile cap: 2, or 1 when its largest stage
+is over 4 GiB, as on a 1-stage tree). After that comes the
   re-prefill of the prompt plus the tokens already generated. No timer bounds the re-prefill; it
   takes as long as a prefill of that length. (The recompiled stage's first infer is the first
   infer of that re-prefill.) Doing it in the failing step keeps the stream alive: the runner
@@ -956,7 +956,7 @@ its slot (cap reached, no recipe, or a request that could not be abandoned), wit
 and `process_leaked`. The `recompile` line also carries:
 
 - `recompiled`: this engine's count of recompiles, this one included;
-- `cap`: the limit, 2;
+- `cap`: the engine's recompile cap (2, or 1 when its largest stage is over 4 GiB);
 - `leaked_bytes`: the size of the leaked stage's weight file;
 - `process_leaked`: the stage copies this process has leaked on purpose (a copy left with a
   helper thread that timed out or died is not included);
@@ -1304,9 +1304,7 @@ python tools/decision_export.py clef --base-ir ~/models/qwen38-27b-int8 --weight
 ```
 
 The export holds a whole stage's new int8 constants (12–15 GB) and needs about 16 GB free. The exporter's
-memory check, calibrated on the 9B exports, estimates 31.3 GiB here (2.5 times the 25.1 GiB of int8
-weights, 23.88 + 1.19 GiB, halved for 2 stages): just under pawan-01's 31.58 GiB, so it passes there; on a
-host with less, pass `--skip-memory-check`. Serve it with the two `cascadia worker` commands shown for JEV-27B.
+memory check applies to 1-stage exports only, so this 2-stage export is not checked. Serve it with the two `cascadia worker` commands shown for JEV-27B.
 
 **Measured parity** (same two hosts and set as JEV-27B; one joint pass per record, 50 passes for 82
 questions):
