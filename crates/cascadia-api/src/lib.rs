@@ -611,6 +611,15 @@ pub fn load_chat_template_config_at(tok_dir: &std::path::Path) -> ChatTemplateCo
         .and_then(|t| t.as_str())
         .map(|s| s.to_owned())
         .or_else(|| std::fs::read_to_string(tok_dir.join("chat_template.jinja")).ok())
+        // Processor exports (LLaVA-NeXT-Video) keep the template only in
+        // chat_template.json, as `{"chat_template": "..."}`; transformers
+        // reads it from there too.
+        .or_else(|| {
+            std::fs::read(tok_dir.join("chat_template.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|j| j.get("chat_template")?.as_str().map(str::to_owned))
+        })
         // An empty / whitespace-only template (a zero-byte placeholder, or a
         // download truncated to empty) must NOT be treated as usable: rendering
         // through it produces an empty prompt, which is worse than the legacy
@@ -7022,6 +7031,28 @@ mod tests {
                 .contains("mock injected"),
             "5xx body should carry the engine's failure reason, got {v}"
         );
+    }
+
+    #[test]
+    fn load_chat_template_reads_processor_chat_template_json() {
+        // LLaVA-NeXT-Video: no inline field, no .jinja, the template only in
+        // the processor's chat_template.json.
+        let dir = std::env::temp_dir().join(format!("cascadia_lnv_tmpl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tokenizer_config.json"), r#"{"bos_token": "<s>"}"#).unwrap();
+        std::fs::write(
+            dir.join("chat_template.json"),
+            r#"{"chat_template": "{% for m in messages %}{{ m['role'] }}{% endfor %}"}"#,
+        )
+        .unwrap();
+        let cfg = load_chat_template_config_at(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            cfg.template.as_deref(),
+            Some("{% for m in messages %}{{ m['role'] }}{% endfor %}")
+        );
+        assert_eq!(cfg.bos_token.as_deref(), Some("<s>"));
     }
 
     #[test]
