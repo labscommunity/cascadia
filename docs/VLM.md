@@ -651,7 +651,12 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
   `static_variant.py --context 4096 --prefill-seq 256 --shared-prefill --packed-only` and
   `packed_variant.py <stage> --slots 2 --packed-seq 256 --dynamic-seq` give two slots of
   2047 tokens, which hold two images (550) and a 4-second video as frames (1117). Gemma 3 4B passed the
-  SDK image and video suites on such a tree, answering as its stateful tree does.
+  SDK image suite on such a tree, on CPU and on the Lunar Lake NPU. For the NPU, build the
+  static tree without `--shared-prefill` and the packed variant with `--decode-seq 2` in
+  place of `--dynamic-seq`; the first load compiles for about 15 minutes, then one image
+  takes about 19 s. The 4B's video answers name both shapes in order but get their colours
+  wrong (both blue on CPU, the first left uncoloured on the NPU), as on its stateful tree;
+  the 12B names the colours right.
 - On CPU/GPU the packed variant is built from the same `--shared-prefill` static tree as
   the static path, so one tree serves both.
 
