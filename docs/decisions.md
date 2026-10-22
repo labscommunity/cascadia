@@ -835,8 +835,10 @@ tokens later, both times into a coherent alternative wording.
   one step, however long it waits.
 - **When it still fails.** If the recovery fails the engine, the retried task gets the usual
   `qwen36 engine failed: ...; restart the server` refusal and the server exits for its
-  supervisor (below). If the retry itself fails, the task fails with the usual error plus `(on
-  the retry after an infer failure)`, and the next task's admission runs the scrub, as before.
+  supervisor (below). If the retry of a chat or prefill pass itself fails, the task fails with
+  the usual error plus `(on the retry after an infer failure)`; a decision head that fails on the
+  retry fails with the head's own error, without the suffix. Either way the next task's admission
+  runs the scrub, as before.
 - **Logs.** A retry logs one `warn` line, `qwen36: retrying task after infer failure`, with the
   task id, `phase`, `prompt`, `warm_prefix`, `generated` (the tokens the failed attempt
   generated), `resume_seed` (the tokens of a peer resume it came with, not counted in
