@@ -2886,8 +2886,9 @@ pub async fn prepare_media_with(
                             continue;
                         }
                         for (k, frame) in frames.into_iter().enumerate() {
+                            // The label goes with its frame (`join_parts`).
                             let label = video::frame_label(video_no, k + 1, frame.secs);
-                            pieces.push((false, decode_cfg.text_part(label)));
+                            pieces.push((true, decode_cfg.text_part(label)));
                             pieces.push((true, decode_cfg.placeholder(image_index)));
                             image_index += 1;
                             inputs.push(frame.input);
