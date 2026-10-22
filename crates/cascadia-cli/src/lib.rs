@@ -1729,108 +1729,17 @@ fn parse_ov_config(entries: &[String]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The API's image settings for a vision tree of `family` served by `engine`
-/// (the tag rank 0 expands), or `None` where that engine has no image path for
-/// the family. `video_token`: the tree's tokenizer has `<|video|>`
-/// ([`tree_has_video_token`]), which a Gemma 4 tree needs to take video.
-fn vision_tree_media(
-    engine: EngineKind,
-    family: &str,
-    video_token: bool,
-) -> Option<cascadia_api::MediaConfig> {
-    match (engine, family) {
-        // A Gemma 4 tree's rank 0 also takes each video whole (Gemma 4's
-        // per-frame `mm:ss` markup) when its tokenizer has `<|video|>`, the
-        // engines' own condition (gemma4.rs and runtime.rs load): the gemma4
-        // engine's E2B / E4B trees and ov-runtime's 26B / 31B trees (each
-        // frame its own bidirectional block). Otherwise a video arrives as
-        // frames.
-        (EngineKind::Gemma4 | EngineKind::OvRuntime, "gemma4") if video_token => {
-            Some(cascadia_api::MediaConfig::gemma4_native().staged_native_video(family))
-        }
-        (EngineKind::Gemma4 | EngineKind::OvRuntime, "gemma4") => {
-            Some(cascadia_api::MediaConfig::gemma4_native())
-        }
-        (EngineKind::OvRuntime, "gemma3") => Some(cascadia_api::MediaConfig::gemma3_native()),
-        (EngineKind::OvRuntime | EngineKind::OvDistSpec, "pixtral" | "mistral3") => {
-            Some(cascadia_api::MediaConfig::pixtral_native())
-        }
-        // Causal families with 1-D positions: staged ov-runtime and
-        // ov-dist-spec (whose draft stays text-only) alike.
-        (EngineKind::OvRuntime | EngineKind::OvDistSpec, "phi3_v") => {
-            Some(cascadia_api::MediaConfig::phi3v_native())
-        }
-        (EngineKind::OvRuntime | EngineKind::OvDistSpec, "internvl_chat") => {
-            Some(cascadia_api::MediaConfig::internvl_native())
-        }
-        (EngineKind::OvRuntime | EngineKind::OvDistSpec, "llava_next") => {
-            Some(cascadia_api::MediaConfig::llava_next_native())
-        }
-        // Qwen2.5-VL / Qwen3-VL: Qwen's native tags, as the staged qwen35
-        // engine; rank 0 expands `<|image_pad|>` and takes each video whole
-        // behind `<|video_pad|>`. ov-runtime only: dist-spec feeds 1-D
-        // positions and refuses these trees.
-        (EngineKind::OvRuntime, "qwen2_5_vl" | "qwen3_vl") => {
-            Some(cascadia_api::MediaConfig::qwen35_native().staged_native_video(family))
-        }
-        _ => None,
+/// The engine as the API's media setup sees it ([`cascadia_api::media_setup`]).
+fn media_engine(engine: EngineKind) -> cascadia_api::MediaEngine {
+    use cascadia_api::MediaEngine as M;
+    match engine {
+        EngineKind::OvGenai => M::OvGenai,
+        EngineKind::OvRuntime => M::OvRuntime,
+        EngineKind::Gemma4 => M::Gemma4,
+        EngineKind::Qwen36Moe => M::Qwen35,
+        EngineKind::OvDistSpec => M::OvDistSpec,
+        _ => M::Other,
     }
-}
-
-/// The image family of a pipeline dir: its `pipeline_config.json` `vision`
-/// block's `family`, or `gemma4` for a block written by the Gemma 4 vision
-/// surgery before the field existed. `None` without a `vision` block.
-fn pipeline_vision_family(model: &str) -> Option<String> {
-    let v: serde_json::Value =
-        std::fs::read(std::path::Path::new(model).join("pipeline_config.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())?;
-    let block = v.get("vision").filter(|x| x.is_object())?;
-    match block.get("family").and_then(serde_json::Value::as_str) {
-        Some(f) => Some(f.to_string()),
-        None if v.get("export_version").and_then(serde_json::Value::as_str)
-            == Some("gemma4_vision_surgery_v1") =>
-        {
-            Some("gemma4".into())
-        }
-        None => Some(String::new()),
-    }
-}
-
-/// Whether a tree's `tokenizer/tokenizer.json` knows `<|video|>` (an added
-/// token or a vocabulary entry), as the gemma4 and ov-runtime engines check
-/// at load before a Gemma 4 tree takes video whole.
-fn tree_has_video_token(model: &str) -> bool {
-    const TOKEN: &str = "<|video|>";
-    let path = std::path::Path::new(model)
-        .join("tokenizer")
-        .join("tokenizer.json");
-    let Some(v) = std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-    else {
-        return false;
-    };
-    let added = v
-        .get("added_tokens")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|a| {
-            a.iter()
-                .any(|t| t.get("content").and_then(serde_json::Value::as_str) == Some(TOKEN))
-        });
-    added
-        || v.pointer("/model/vocab")
-            .and_then(|x| x.get(TOKEN))
-            .is_some()
-}
-
-/// An export's `config.json` `model_type` (`qwen2_5_vl`, `gemma3`, ...),
-/// which picks the native image tags ov-genai reads in a prompt.
-fn export_model_type(model: &str) -> Option<String> {
-    let v: serde_json::Value = std::fs::read(std::path::Path::new(model).join("config.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())?;
-    v.get("model_type")?.as_str().map(str::to_owned)
 }
 
 /// Load a whole-model chat template for ov-genai, tolerating both layouts:
@@ -2887,78 +2796,23 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // `ov-dist-spec` serves them on a causal 1-D-position target tree
         // (Pixtral / Mistral 3, Phi-3.5-vision, InternVL2, LLaVA-NeXT; cut
         // with cut_vlm_lm.py --all-logits): rank 0 encodes, the draft stays text.
-        let has_vision = std::path::Path::new(&args.model)
-            .join("openvino_vision_embeddings_model.xml")
-            .exists();
-        // GenAI mishandles some families' images (Pixtral): text only there.
-        let genai_gap = matches!(args.engine, EngineKind::OvGenai)
-            .then(|| {
-                cascadia_engine_openvino::genai::unsupported_vision(std::path::Path::new(
-                    &args.model,
-                ))
-            })
-            .flatten();
-        if let (true, Some(why)) = (has_vision, genai_gap.as_ref()) {
-            warn!(reason = %why, "ov-genai: serving this VLM export text only");
-            // The 400 that refuses its images names the alternative too.
-            cfg.no_media_reason = Some(why.clone());
+        let setup =
+            cascadia_api::media_setup(media_engine(args.engine), std::path::Path::new(&args.model));
+        for note in &setup.notes {
+            warn!("{note}");
         }
-        let media_kind = match args.engine {
-            // GenAI also reads the family's native tags as image slots, so
-            // the API refuses them in caller text by the export's model type.
-            EngineKind::OvGenai if has_vision && genai_gap.is_none() => Some(
-                cascadia_api::MediaConfig::ov_genai(export_model_type(&args.model).as_deref()),
-            ),
-            // Rank 0 also takes each video whole (Qwen3.5's frame pairs and
-            // timestamps), by the export's model type.
-            EngineKind::Qwen36Moe if has_vision => Some(
-                cascadia_api::MediaConfig::qwen35_native().staged_native_video(
-                    export_model_type(&args.model)
-                        .as_deref()
-                        .unwrap_or("qwen3_5_moe"),
-                ),
-            ),
-            // ov-runtime (Gemma 4 surgery trees) and gemma4 (gemma4_cached E2B/E4B
-            // trees from export_gemma4.py --vision) both carry a `vision` block.
-            EngineKind::OvRuntime | EngineKind::Gemma4 | EngineKind::OvDistSpec if has_vision => {
-                match pipeline_vision_family(&args.model) {
-                    Some(f) => {
-                        let gemma4 = f == "gemma4"
-                            && matches!(args.engine, EngineKind::Gemma4 | EngineKind::OvRuntime);
-                        let video_token = gemma4 && tree_has_video_token(&args.model);
-                        if gemma4 && !video_token {
-                            warn!(
-                                "gemma4 tree tokenizer has no <|video|>; videos arrive as frames"
-                            );
-                        }
-                        let media = vision_tree_media(args.engine, &f, video_token);
-                        if media.is_none() {
-                            warn!(family = %f, "pipeline vision family has no API image tag; serving text only");
-                        }
-                        media
-                    }
-                    None => None,
-                }
-            }
-            _ => None,
-        };
-        if let Some(mut media) = media_kind {
+        cfg.no_media_reason = setup.no_media_reason;
+        if let Some(mut media) = setup.config {
             media.allow_remote_urls = args.api_allow_image_urls;
             args.api_media.apply(&mut media)?;
             // Video is served as frames through the image path, or whole
             // where the engine takes it natively (`MediaConfig::native_video`),
             // decoded by ffmpeg: on when one is found. A path the operator named must
             // work; a missing default is one line, not a failure.
-            match (
-                cascadia_api::Ffmpeg::locate(args.api_media.api_ffmpeg.as_deref()),
-                &args.api_media.api_ffmpeg,
-            ) {
-                (Ok(f), _) => media.ffmpeg = Some(f),
-                (Err(why), Some(_)) => return Err(anyhow!("--api-ffmpeg: {why}")),
-                (Err(why), None) => info!(
-                    reason = %why,
-                    "video input off: no ffmpeg found (pass --api-ffmpeg to enable it)"
-                ),
+            match cascadia_api::attach_ffmpeg(&mut media, args.api_media.api_ffmpeg.as_deref()) {
+                Ok(None) => {}
+                Ok(Some(note)) => info!("{note} (pass --api-ffmpeg to enable it)"),
+                Err(why) => return Err(anyhow!("--api-ffmpeg: {why}")),
             }
             info!(
                 max_images = media.max_images,
@@ -4202,162 +4056,6 @@ mod cli_version_tests {
 #[cfg(test)]
 mod tests {
     /// ov-genai's reserved tags follow the export's `config.json` model type.
-    #[test]
-    fn ov_genai_media_reads_the_export_model_type() {
-        use super::export_model_type;
-        let dir = tempfile::tempdir().unwrap();
-        let model = dir.path().to_str().unwrap();
-        assert_eq!(export_model_type(model), None);
-        std::fs::write(
-            dir.path().join("config.json"),
-            r#"{"model_type": "qwen2_5_vl", "vision_config": {"model_type": "x"}}"#,
-        )
-        .unwrap();
-        let t = export_model_type(model);
-        assert_eq!(t.as_deref(), Some("qwen2_5_vl"));
-        let media = cascadia_api::MediaConfig::ov_genai(t.as_deref());
-        assert!(media.reserved_in("<|image_pad|>").is_some());
-        assert!(media.reserved_in("<image>").is_none());
-    }
-
-    #[test]
-    fn vision_tree_media_per_engine() {
-        use super::{vision_tree_media, EngineKind};
-        let tag = |e, f| vision_tree_media(e, f, true).map(|m| m.image_placeholder);
-        assert_eq!(
-            tag(EngineKind::OvRuntime, "gemma4").as_deref(),
-            Some("<|image|>")
-        );
-        assert_eq!(
-            tag(EngineKind::Gemma4, "gemma4").as_deref(),
-            Some("<|image|>")
-        );
-        assert_eq!(
-            tag(EngineKind::OvRuntime, "pixtral").as_deref(),
-            Some("[IMG]")
-        );
-        assert_eq!(
-            tag(EngineKind::OvDistSpec, "pixtral").as_deref(),
-            Some("[IMG]")
-        );
-        assert_eq!(
-            tag(EngineKind::OvDistSpec, "mistral3").as_deref(),
-            Some("[IMG]")
-        );
-        assert_eq!(
-            tag(EngineKind::OvRuntime, "phi3_v").as_deref(),
-            Some("<|image_{n}|>\n")
-        );
-        assert_eq!(
-            tag(EngineKind::OvRuntime, "internvl_chat").as_deref(),
-            Some("<img><IMG_CONTEXT></img>\n")
-        );
-        // dist-spec takes the causal 1-D-position families too.
-        assert_eq!(
-            tag(EngineKind::OvDistSpec, "phi3_v").as_deref(),
-            Some("<|image_{n}|>\n")
-        );
-        assert_eq!(
-            tag(EngineKind::OvDistSpec, "internvl_chat").as_deref(),
-            Some("<img><IMG_CONTEXT></img>\n")
-        );
-        assert_eq!(
-            tag(EngineKind::OvDistSpec, "llava_next"),
-            tag(EngineKind::OvRuntime, "llava_next")
-        );
-        assert!(tag(EngineKind::OvDistSpec, "llava_next").is_some());
-        assert_eq!(
-            tag(EngineKind::OvRuntime, "gemma3").as_deref(),
-            Some("<start_of_image>")
-        );
-        // dist-spec refuses Gemma 3 / 4 targets at load; the gemma4 engine
-        // serves only its own family.
-        assert_eq!(tag(EngineKind::OvDistSpec, "gemma3"), None);
-        assert_eq!(tag(EngineKind::Gemma4, "gemma3"), None);
-        assert_eq!(tag(EngineKind::OvDistSpec, "gemma4"), None);
-        assert_eq!(tag(EngineKind::Gemma4, "pixtral"), None);
-        assert_eq!(tag(EngineKind::OvDistSpec, "qwen35"), None);
-        let qwen = "<|vision_start|><|image_pad|><|vision_end|>";
-        assert_eq!(
-            tag(EngineKind::OvRuntime, "qwen2_5_vl").as_deref(),
-            Some(qwen)
-        );
-        assert_eq!(
-            tag(EngineKind::OvRuntime, "qwen3_vl").as_deref(),
-            Some(qwen)
-        );
-        assert_eq!(tag(EngineKind::OvDistSpec, "qwen2_5_vl"), None);
-        assert_eq!(tag(EngineKind::OvDistSpec, "qwen3_vl"), None);
-        assert_eq!(
-            tag(EngineKind::OvRuntime, "llava_next").as_deref(),
-            Some("<image>\n")
-        );
-        // Native video: the ov-runtime Qwen VL trees and Gemma 4 trees on
-        // either engine, behind Gemma 4's own `<|video|>`.
-        let native = |e, f| vision_tree_media(e, f, true).is_some_and(|m| m.native_video);
-        assert!(native(EngineKind::OvRuntime, "qwen2_5_vl"));
-        assert!(native(EngineKind::OvRuntime, "qwen3_vl"));
-        for e in [EngineKind::Gemma4, EngineKind::OvRuntime] {
-            assert!(native(e, "gemma4"));
-            assert_eq!(
-                vision_tree_media(e, "gemma4", true)
-                    .map(|m| (m.video_placeholder, m.video_frame_multiple)),
-                Some(("<|video|>".to_string(), 1))
-            );
-            // Without `<|video|>` in its tokenizer the engine refuses native
-            // video, so the API keeps sending frames (images still served).
-            let plain = vision_tree_media(e, "gemma4", false).unwrap();
-            assert!(!plain.native_video);
-            assert_eq!(plain.image_placeholder, "<|image|>");
-        }
-        for f in ["gemma3", "pixtral", "phi3_v", "internvl_chat", "llava_next"] {
-            assert!(!native(EngineKind::OvRuntime, f), "{f}");
-        }
-        assert!(!native(EngineKind::OvDistSpec, "pixtral"));
-    }
-
-    #[test]
-    fn video_token_is_read_from_the_tree_tokenizer() {
-        use super::tree_has_video_token;
-        let dir = std::env::temp_dir().join(format!("cascadia-vt-{}", std::process::id()));
-        let tok = dir.join("tokenizer");
-        std::fs::create_dir_all(&tok).unwrap();
-        let d = dir.to_str().unwrap();
-        let write = |s: &str| std::fs::write(tok.join("tokenizer.json"), s).unwrap();
-        assert!(!tree_has_video_token(d), "no tokenizer.json");
-        write(r#"{"added_tokens":[{"id":1,"content":"<|image|>"}],"model":{"vocab":{"a":0}}}"#);
-        assert!(!tree_has_video_token(d));
-        write(r#"{"added_tokens":[{"id":7,"content":"<|video|>"}],"model":{"vocab":{}}}"#);
-        assert!(tree_has_video_token(d));
-        write(r#"{"added_tokens":[],"model":{"vocab":{"<|video|>":7}}}"#);
-        assert!(tree_has_video_token(d));
-        write("not json");
-        assert!(!tree_has_video_token(d));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn pipeline_vision_family_is_read() {
-        let dir = std::env::temp_dir().join(format!("cascadia-pv-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let d = dir.to_str().unwrap();
-        let write = |s: &str| std::fs::write(dir.join("pipeline_config.json"), s).unwrap();
-        assert_eq!(pipeline_vision_family(d), None, "no pipeline_config.json");
-        write(r#"{"num_stages":2}"#);
-        assert_eq!(pipeline_vision_family(d), None);
-        write(r#"{"vision":{"family":"gemma4"}}"#);
-        assert_eq!(pipeline_vision_family(d).as_deref(), Some("gemma4"));
-        write(r#"{"export_version":"gemma4_vision_surgery_v1","vision":{"text_embeddings":"t"}}"#);
-        assert_eq!(
-            pipeline_vision_family(d).as_deref(),
-            Some("gemma4"),
-            "pre-field trees"
-        );
-        write(r#"{"vision":{"family":"mistral3"}}"#);
-        assert_eq!(pipeline_vision_family(d).as_deref(), Some("mistral3"));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
     use super::*;
 
     #[test]
