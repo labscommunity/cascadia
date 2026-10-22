@@ -4435,11 +4435,195 @@ mod tests {
             ),
         ];
         for (app, app_oa, body, body_oa, e, e_oa) in cases {
-            let (status, v, _) = post_decisions(app, body).await;
-            assert_eq!(decisions::systemone_error(e), (status, v), "{body}");
-            let (status, v) = post_openai(app_oa, body_oa).await;
-            assert_eq!(decisions::openai_error(e_oa), (status, v), "{body_oa}");
+            let (status, text) =
+                post_raw(app, "/v1/systemone", Some("application/json"), body).await;
+            assert_eq!(
+                json_bytes(decisions::systemone_error(e)),
+                (status, text),
+                "{body}"
+            );
+            let (status, text) =
+                post_raw(app_oa, "/v1/decisions", Some("application/json"), body_oa).await;
+            assert_eq!(
+                json_bytes(decisions::openai_error(e_oa)),
+                (status, text),
+                "{body_oa}"
+            );
         }
+    }
+
+    /// POST `body` to `uri` with `content_type`: the status and the body bytes as text, plus a
+    /// check that the body is JSON exactly when the route says so.
+    async fn post_raw(
+        app: Router,
+        uri: &str,
+        content_type: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, String) {
+        let mut req = Request::builder().method("POST").uri(uri);
+        if let Some(ct) = content_type {
+            req = req.header("content-type", ct);
+        }
+        let response = app
+            .oneshot(req.body(Body::from(body.to_owned())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let ct = response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let json = serde_json::from_str::<Value>(&text).is_ok();
+        assert_eq!(ct == "application/json", json, "{ct}: {text}");
+        (status, text)
+    }
+
+    /// The bytes `Json(value)` sends.
+    fn json_bytes((status, v): (StatusCode, Value)) -> (StatusCode, String) {
+        (status, serde_json::to_string(&v).unwrap())
+    }
+
+    /// Raw-body parsing for embedders: for a malformed body, one that does not fit the schema and
+    /// a valid one, `systemone_parse` / `openai_parse` give the route's status and bytes.
+    #[tokio::test]
+    async fn raw_body_parsers_match_the_routes() {
+        // SystemOne: the extractor's syntax (400) and data (422) rejections, as text/plain.
+        for body in [
+            r#"{"model": "m", "#,
+            r#"{"model": "m", "state": "s", "strategy": "vote", "questions": {"u": {"type": "noul"}}}"#,
+            r#"{"model": "m", "state": "s", "questions": {"u": {"type": "maybe"}}}"#,
+        ] {
+            let route = post_raw(
+                make_decision_app().await,
+                "/v1/systemone",
+                Some("application/json"),
+                body,
+            )
+            .await;
+            assert_ne!(route.0, StatusCode::OK, "{body}");
+            assert_eq!(
+                decisions::systemone_parse(body.as_bytes()).unwrap_err(),
+                route,
+                "{body}"
+            );
+        }
+        // OpenAI: the extractor's syntax rejection in the envelope, then `parse_request`'s 400s.
+        for body in [
+            r#"{"input": "x", "#,
+            r#"{"input": "x", "questions": [{"type": "rank", "name": "u", "instructions": "x"}]}"#,
+            r#"{"input": "x", "input": "y", "questions": []}"#,
+        ] {
+            let route = post_raw(
+                make_decision_app().await,
+                "/v1/decisions",
+                Some("application/json"),
+                body,
+            )
+            .await;
+            assert_ne!(route.0, StatusCode::OK, "{body}");
+            assert_eq!(
+                json_bytes(decisions::openai_parse(body.as_bytes()).unwrap_err()),
+                route,
+                "{body}"
+            );
+        }
+        // Valid bodies: parsed, evaluated and rendered through the seam, the route's 200 bytes.
+        let so = r#"{"model": "m", "state": "a b", "questions": {"u": {"type": "noul"}, "c": {"type": "choice", "criteria": {"x": "1", "y": "2"}}}}"#;
+        let req = decisions::systemone_parse(so.as_bytes()).unwrap();
+        let (answers, n) =
+            evaluate_fake(&kev_service(1000, 4000), 1, &FakePasses::new(false), &req)
+                .await
+                .unwrap();
+        let body = decisions::systemone_body("mock-model", answers, n);
+        let route = post_raw(
+            make_decision_app().await,
+            "/v1/systemone",
+            Some("application/json"),
+            so,
+        )
+        .await;
+        assert_eq!(
+            (StatusCode::OK, serde_json::to_string(&body).unwrap()),
+            route
+        );
+        let oa = r#"{"input": "a b", "questions": [{"type": "predicate", "name": "u", "instructions": "x"}, {"type": "choice", "name": "c", "instructions": "x", "choices": [{"value": 10000000000000000000000001}, {"value": "y"}]}]}"#;
+        let (req, meta) =
+            decisions::openai::to_internal(&decisions::openai_parse(oa.as_bytes()).unwrap())
+                .unwrap();
+        let (answers, n) =
+            evaluate_fake(&kev_service(1000, 4000), 1, &FakePasses::new(false), &req)
+                .await
+                .unwrap();
+        let mine =
+            serde_json::to_string(&decisions::openai::to_openai(&answers, &meta, n)).unwrap();
+        let (status, route) = post_raw(
+            make_decision_app().await,
+            "/v1/decisions",
+            Some("application/json"),
+            oa,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // The response id is fresh per response (`dec-` + 32 hex digits); the rest is the same bytes.
+        let strip = |t: &str| t[t.find(r#""answers""#).unwrap()..].to_string();
+        assert_eq!(strip(&mine), strip(&route));
+        assert!(route.contains("10000000000000000000000001"), "{route}");
+    }
+
+    /// The rejections that come before the body is read, which an embedder's gateway owns: the
+    /// texts docs/decisions.md ("Embedding the decision core") quotes.
+    #[tokio::test]
+    async fn pre_parse_rejections_are_the_documented_ones() {
+        let ok = r#"{"model": "m", "state": "a b", "questions": {"u": {"type": "noul"}}}"#;
+        const CT: &str = "Expected request with `Content-Type: application/json`";
+        const BIG: &str = "Failed to buffer the request body: length limit exceeded";
+        let route = post_raw(make_decision_app().await, "/v1/systemone", None, ok).await;
+        assert_eq!(route, (StatusCode::UNSUPPORTED_MEDIA_TYPE, CT.to_string()));
+        let route = post_raw(
+            make_decision_app().await,
+            "/v1/decisions",
+            Some("text/plain"),
+            ok,
+        )
+        .await;
+        assert_eq!(
+            route,
+            json_bytes(decisions::openai_envelope(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "invalid_request_error",
+                CT.into()
+            ))
+        );
+        // The decision test app's body limit is 1 MiB (`max_body_bytes`).
+        let big = format!(
+            r#"{{"model": "m", "state": "{}", "questions": {{}}}}"#,
+            "x".repeat(1 << 20)
+        );
+        let route = post_raw(
+            make_decision_app().await,
+            "/v1/systemone",
+            Some("application/json"),
+            &big,
+        )
+        .await;
+        assert_eq!(route, (StatusCode::PAYLOAD_TOO_LARGE, BIG.to_string()));
+        let route = post_raw(
+            make_decision_app().await,
+            "/v1/decisions",
+            Some("application/json"),
+            &big,
+        )
+        .await;
+        assert_eq!(
+            route,
+            json_bytes(decisions::openai_envelope(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "invalid_request_error",
+                BIG.into()
+            ))
+        );
     }
 
     #[tokio::test]
