@@ -1280,8 +1280,12 @@ pub fn prepare_resume(
         return Ok(None);
     };
     let vocab = resume_vocab_bound(tokenizer);
-    cascadia_types::validate_resume_ids(r, Some(vocab))
-        .map_err(|e| format!("invalid resume prefix: {e}"))?;
+    cascadia_types::validate_resume_ids(r, Some(vocab)).map_err(|e| {
+        format!(
+            "{}invalid resume prefix: {e}",
+            cascadia_engine::CLIENT_ERROR_PREFIX
+        )
+    })?;
     cascadia_types::append_resume_ids(prompt_ids_i64, Some(r));
     let generated_u32: Vec<u32> = r.iter().map(|&i| i as u32).collect();
     let prefix_text = tokenizer
@@ -1845,7 +1849,13 @@ impl SparseMoEEngine {
                 let id = task.task_id.clone();
                 return vec![(
                     id.clone(),
-                    Chunk::error(id, format!("invalid resume prefix: {e}")),
+                    Chunk::error(
+                        id,
+                        format!(
+                            "{}invalid resume prefix: {e}",
+                            cascadia_engine::CLIENT_ERROR_PREFIX
+                        ),
+                    ),
                 )];
             }
         }

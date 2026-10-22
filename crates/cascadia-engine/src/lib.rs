@@ -215,6 +215,94 @@ impl EngineError {
             _ => false,
         }
     }
+
+    /// The HTTP status a request rejected with this error gets. One table for
+    /// every caller that fronts an engine (cascadia-api's server, and any
+    /// gateway that submits tasks itself), so they classify alike. Permanent
+    /// rejections are 4xx: retrying the identical request (on this or any peer)
+    /// cannot succeed. OpenAI answers an over-context prompt with a 400 and its
+    /// SDKs retry neither a 400 nor a 413. Exhaustive on purpose: a new variant
+    /// must be classified here before it compiles.
+    pub fn http_status(&self) -> u16 {
+        match self {
+            EngineError::QueueFull { .. } | EngineError::NotLoaded | EngineError::NotConnected => {
+                503
+            }
+            EngineError::PromptTooLong(_)
+            | EngineError::InvalidConfig(_)
+            | EngineError::PeerRejected(_)
+            | EngineError::ShardRejected(_)
+            | EngineError::UnsupportedInput(_) => 400,
+            EngineError::ModelNotFound(_) => 404,
+            EngineError::Backend(_)
+            | EngineError::Io(_)
+            | EngineError::Task { .. }
+            | EngineError::BatchAborted(_) => 500,
+        }
+    }
+
+    /// The request is at fault (a 4xx [`http_status`](Self::http_status)): a
+    /// caller must not retry it unchanged or count it against the peer's health.
+    pub fn is_client_error(&self) -> bool {
+        (400..500).contains(&self.http_status())
+    }
+
+    /// The rejection-metric reason, named for the knob that fixes it:
+    /// `capacity`, `prompt_over_window` (a sizing change), `engine_unavailable`
+    /// (bring the stage or its peer up), `engine_error` (read that node's logs),
+    /// `invalid_request` (the caller sent something this worker can't serve).
+    pub fn rejection_reason(&self) -> &'static str {
+        match self {
+            EngineError::QueueFull { .. } => "capacity",
+            EngineError::PromptTooLong(_) => "prompt_over_window",
+            EngineError::NotLoaded | EngineError::NotConnected => "engine_unavailable",
+            EngineError::Backend(_)
+            | EngineError::Io(_)
+            | EngineError::Task { .. }
+            | EngineError::BatchAborted(_) => "engine_error",
+            EngineError::InvalidConfig(_)
+            | EngineError::PeerRejected(_)
+            | EngineError::ShardRejected(_)
+            | EngineError::UnsupportedInput(_)
+            | EngineError::ModelNotFound(_) => "invalid_request",
+        }
+    }
+}
+
+/// Prefix of a [`Chunk::error`](cascadia_types::Chunk::error) reason that the
+/// request caused after admission (a malformed resume prefix, an empty prompt):
+/// permanent for the request, so not a reason to retry it or demote the peer.
+pub const CLIENT_ERROR_PREFIX: &str = "invalid_request: ";
+
+/// Whether a stream's error reason (a [`Chunk`](cascadia_types::Chunk)'s
+/// `error`) is the request's fault. Engines refuse a request they cannot serve
+/// at submit with a typed [`EngineError`] (use
+/// [`is_client_error`](EngineError::is_client_error) there); a refusal that
+/// reaches a stream as text carries one of these stable prefixes: an
+/// [`EngineError`]'s own `Display` prefix for a client variant (`prompt too
+/// long:`, `unsupported input:`, ...), [`CLIENT_ERROR_PREFIX`], or
+/// `resume_unsupported:`, optionally behind a `task <id>: ` attribution and a
+/// `backend error: ` wrapper.
+pub fn is_client_error_reason(reason: &str) -> bool {
+    const PREFIXES: [&str; 8] = [
+        CLIENT_ERROR_PREFIX,
+        "resume_unsupported:",
+        "prompt too long: ",
+        "unsupported input: ",
+        "invalid configuration: ",
+        "peer layout rejected: ",
+        "shard rejected: ",
+        "model not found at ",
+    ];
+    let mut r = reason;
+    if let Some(rest) = r.strip_prefix("task ") {
+        r = rest.split_once(": ").map_or(r, |(_, after)| after);
+    }
+    // A step-path refusal reaches the stream as a `Backend` error's text.
+    if let Some(rest) = r.strip_prefix("backend error: ") {
+        r = rest;
+    }
+    PREFIXES.iter().any(|p| r.starts_with(p))
 }
 
 pub type EngineResult<T> = Result<T, EngineError>;
@@ -648,5 +736,81 @@ mod refuse_media_tests {
             "{e}"
         );
         assert!(!e.is_connection_fatal());
+    }
+}
+
+#[cfg(test)]
+mod client_error_tests {
+    use super::*;
+
+    #[test]
+    fn statuses_and_client_faults_follow_one_table() {
+        let client = [
+            EngineError::PromptTooLong("x".into()),
+            EngineError::UnsupportedInput("x".into()),
+            EngineError::InvalidConfig("x".into()),
+            EngineError::PeerRejected("x".into()),
+            EngineError::ShardRejected("x".into()),
+            EngineError::ModelNotFound("x".into()),
+        ];
+        for e in &client {
+            assert!(e.is_client_error(), "{e}");
+            assert!(is_client_error_reason(&e.to_string()), "{e}");
+        }
+        assert_eq!(EngineError::PromptTooLong("x".into()).http_status(), 400);
+        assert_eq!(EngineError::ModelNotFound("x".into()).http_status(), 404);
+        let server = [
+            EngineError::QueueFull { queued: 1, cap: 1 },
+            EngineError::NotLoaded,
+            EngineError::NotConnected,
+            EngineError::Backend("boom".into()),
+            EngineError::BatchAborted("x".into()),
+            EngineError::Task {
+                task_id: "t".into(),
+                source: Box::new(EngineError::Backend("x".into())),
+            },
+        ];
+        for e in &server {
+            assert!(!e.is_client_error(), "{e}");
+            assert!(!is_client_error_reason(&e.to_string()), "{e}");
+        }
+        assert_eq!(
+            EngineError::QueueFull { queued: 1, cap: 1 }.http_status(),
+            503
+        );
+        assert_eq!(EngineError::Backend("x".into()).http_status(), 500);
+        assert_eq!(
+            EngineError::PromptTooLong("x".into()).rejection_reason(),
+            "prompt_over_window"
+        );
+    }
+
+    /// The texts engines put on a stream for a request's own fault, as they
+    /// reach a caller: bare, attributed to a task, or wrapped as a step's
+    /// backend error.
+    #[test]
+    fn stream_reasons_from_client_faults_are_recognised() {
+        let empty = EngineError::Backend(format!(
+            "{CLIENT_ERROR_PREFIX}empty prompt: no tokens to prefill"
+        ))
+        .for_task("t-1".into());
+        for r in [
+            format!("{CLIENT_ERROR_PREFIX}invalid resume prefix: id 9 out of range"),
+            format!("{CLIENT_ERROR_PREFIX}empty prompt after tokenize"),
+            empty.to_string(),
+            "unsupported input: resume_unsupported: a resumed turn cannot carry images".into(),
+            "resume_unsupported: ov-genai has no forced-prefix path".into(),
+            "task t-2: prompt too long: prompt is at least 5875 tokens".into(),
+        ] {
+            assert!(is_client_error_reason(&r), "{r}");
+        }
+        for r in [
+            "tokenize failed: bad utf8",
+            "image rows missing at admission",
+            "task t-3: backend error: stage 1 hung up",
+            "batch aborted: NACK",
+        ] {
+            assert!(!is_client_error_reason(r), "{r}");
+        }
     }
 }
