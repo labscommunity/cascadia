@@ -3437,13 +3437,6 @@ impl Qwen36Engine {
                 let reason = format!("qwen36 pipeline poisoned by handshake mismatch: {reason}");
                 return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
             }
-            if let DownLink::Desynced(reason) = &self.down_link {
-                warn!(task = %task.task_id, "qwen36: refusing task (pipeline link desynced)");
-                return vec![(
-                    task.task_id.clone(),
-                    Chunk::error(task.task_id, reason.clone()),
-                )];
-            }
             if !self.handshake_done {
                 if let Err(e) = self.handshake_a() {
                     warn!(task = %task.task_id, error = %e, "qwen36: handshake failed");
