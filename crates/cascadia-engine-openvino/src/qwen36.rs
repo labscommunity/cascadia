@@ -1670,10 +1670,7 @@ type PendingDecision = Option<(
 /// The last rank's DECIDE_RUN lookup: always takes the entry (a stale one must not leak into
 /// the next task), and turns a missing, stale or invalid readout into the error rank 0 reports.
 fn take_pending(
-    pending: &mut Option<(
-        u32,
-        Result<(cascadia_types::DecisionReadout, crate::decision::Collector), String>,
-    )>,
+    pending: &mut PendingDecision,
     epoch: u32,
 ) -> Result<(cascadia_types::DecisionReadout, crate::decision::Collector), String> {
     match pending.take() {
@@ -2987,7 +2984,7 @@ impl Qwen36Engine {
         }
         let caps = combine_caps(own_caps(self.serves_decisions()), down_cap);
         self.chain_caps = caps;
-        self.chain_capture_v2 = (caps & CAP_CAPTURE_V2).min(CAPTURE_V2_CAP);
+        self.chain_capture_v2 = caps & CAP_CAPTURE_V2 & CAPTURE_V2_CAP;
         self.handshake_done = true;
         info!(
             caps,
@@ -3945,7 +3942,7 @@ impl Qwen36Engine {
                     }
                 }
                 self.chain_caps = cap;
-                self.chain_capture_v2 = (cap & CAP_CAPTURE_V2).min(CAPTURE_V2_CAP);
+                self.chain_capture_v2 = cap & CAP_CAPTURE_V2 & CAPTURE_V2_CAP;
                 let h = self.handle()?;
                 let upstream = self.upstream.clone().unwrap();
                 match reason {
@@ -6669,10 +6666,7 @@ mod tests {
             Ok((r, crate::decision::Collector::new(HiddenNeed::None, 4))),
         ));
         assert!(take_pending(&mut p, 7).is_ok());
-        let mut p: Option<(
-            u32,
-            Result<(DecisionReadout, crate::decision::Collector), String>,
-        )> = Some((7, Err("decision_invalid: x".into())));
+        let mut p: PendingDecision = Some((7, Err("decision_invalid: x".into())));
         assert_eq!(take_pending(&mut p, 7).unwrap_err(), "decision_invalid: x");
         assert!(take_pending(&mut None, 7).is_err(), "nothing pending");
     }
