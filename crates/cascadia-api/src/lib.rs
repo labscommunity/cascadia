@@ -4520,7 +4520,7 @@ mod tests {
     async fn kev_state_at_the_pass_cap_is_413() {
         // 10 state tokens + <fim_prefix> = 11 >= max_tokens 11: rejected right after the state is
         // tokenized, before it is cloned into any question's row.
-        let state = vec!["a"; 10].join(" ");
+        let state = ["a"; 10].join(" ");
         let body = format!(
             r#"{{"model": "m", "state": "{state}", "questions": {{"u": {{"type": "noul"}}}}}}"#
         );
@@ -4719,6 +4719,8 @@ mod tests {
     }
 
     #[tokio::test]
+    // Holding the dump's lock across the awaits is the stalled disk this test simulates.
+    #[allow(clippy::await_holding_lock)]
     async fn decisions_disconnect_keeps_the_permit_until_the_dump_write_ends() {
         // P3-SEC-1: a client that leaves while its request waits on the dump must not free its
         // permit while the detached write still holds a request-sized clone.

@@ -149,7 +149,7 @@ pub(crate) fn state_size_model(parts: &[Vec<u8>]) -> Option<(usize, usize)> {
                 return None;
             }
             if rank >= 3 && !recurrent {
-                if seq == 0 || nb % seq != 0 {
+                if seq == 0 || !nb.is_multiple_of(seq) {
                     return None;
                 }
                 per_token = per_token.checked_add(nb / seq)?;
