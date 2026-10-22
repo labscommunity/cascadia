@@ -2274,7 +2274,7 @@ fn load_decisions(
                     max_total_tokens = svc.max_total_tokens,
                     max_questions = svc.max_questions,
                     prefix_reuse = svc.prefix_reuse,
-                    "decision.json found; serving /v1/decisions (OpenAI format) and /v1/systemone"
+                    "decision.json loaded; /v1/decisions (OpenAI format) and /v1/systemone will be served"
                 );
                 Some(Arc::new(svc))
             }
@@ -2406,15 +2406,21 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     preflight_model_path(&args)?;
     // Loaded before the model, like the sizing flags above: it reads only the tree's json files,
     // and whether decisions are served decides the admission check below.
-    let decisions = load_decisions(&args, is_first && args.api.is_some(), prefix_cache_bytes);
+    let serves_api = is_first && args.api.is_some();
+    let decisions = load_decisions(&args, serves_api, prefix_cache_bytes);
     // `CASCADIA_API_MAX_CONCURRENT`: in-flight request cap (backpressure is
     // 503 beyond it). A multi-stream engine serves `CASCADIA_STREAMS` at
     // once, so a client that sends that many requests at once needs the
-    // cap above it.
-    let max_concurrent_requests = api_max_concurrent(
-        std::env::var("CASCADIA_API_MAX_CONCURRENT").ok().as_deref(),
-        cascadia_api::DEFAULT_MAX_CONCURRENT,
-    );
+    // cap above it. Read only on the rank that serves the API, so no other
+    // rank warns about a value it never uses.
+    let max_concurrent_requests = if serves_api {
+        api_max_concurrent(
+            std::env::var("CASCADIA_API_MAX_CONCURRENT").ok().as_deref(),
+            cascadia_api::DEFAULT_MAX_CONCURRENT,
+        )
+    } else {
+        cascadia_api::DEFAULT_MAX_CONCURRENT
+    };
     check_admission_fits(
         max_concurrent_requests,
         args.max_decision_requests,
@@ -4321,14 +4327,37 @@ mod tests {
 
     #[test]
     fn load_decisions_serves_only_a_usable_tree_on_the_api_rank() {
-        // An unusable decision.json: the admission check must then see no decision pool.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("decision.json"), "{").unwrap();
-        let model = dir.path().to_str().unwrap();
-        let worker = |engine: &str| {
+        // A usable tree: a Clef decision.json (no family section needed) and a word-level
+        // tokenizer.json, so only the gates can turn it off.
+        let usable = tempfile::tempdir().unwrap();
+        std::fs::write(
+            usable.path().join("decision.json"),
+            r#"{"family": "clef", "max_tokens": 64}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            usable.path().join("tokenizer.json"),
+            r#"{"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+                "normalizer": null, "pre_tokenizer": {"type": "Whitespace"},
+                "post_processor": null, "decoder": null,
+                "model": {"type": "WordLevel", "vocab": {"[unk]": 0, "a": 1},
+                          "unk_token": "[unk]"}}"#,
+        )
+        .unwrap();
+        let unusable = tempfile::tempdir().unwrap();
+        std::fs::write(unusable.path().join("decision.json"), "{").unwrap();
+        let worker = |engine: &str, model: &std::path::Path| {
             let cli = Cli::try_parse_from([
-                "cascadia", "worker", "--rank", "0", "--total", "1", "--engine", engine, "--model",
-                model,
+                "cascadia",
+                "worker",
+                "--rank",
+                "0",
+                "--total",
+                "1",
+                "--engine",
+                engine,
+                "--model",
+                model.to_str().unwrap(),
             ])
             .expect("parse worker argv");
             let Command::Worker(args) = cli.cmd else {
@@ -4337,16 +4366,21 @@ mod tests {
             args
         };
         assert!(
-            load_decisions(&worker("qwen35"), true, 0).is_none(),
-            "unusable"
+            load_decisions(&worker("qwen35", usable.path()), true, 0).is_some(),
+            "a usable tree on the API rank"
         );
         assert!(
-            load_decisions(&worker("qwen35"), false, 0).is_none(),
+            load_decisions(&worker("qwen35", usable.path()), false, 0).is_none(),
             "not the API rank"
         );
         assert!(
-            load_decisions(&worker("mock"), true, 0).is_none(),
+            load_decisions(&worker("mock", usable.path()), true, 0).is_none(),
             "not qwen35"
+        );
+        // The admission check then sees no decision pool.
+        assert!(
+            load_decisions(&worker("qwen35", unusable.path()), true, 0).is_none(),
+            "unusable"
         );
     }
 
