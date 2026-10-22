@@ -727,7 +727,9 @@ wait stopped:
   (see [Engine failures](#engine-failures)); until it exits, every task, chat and decisions
   alike, fails at once with `qwen36 engine failed: <the desync message>; restart the server`.
   With the relays under restart-on-exit supervisors too, the pipeline reconnects on its own.
-  Measured on pawan-03 (two ranks on one host, kev9b-int8-2st, warm model cache):
+  Measured on pawan-03 (two ranks on one host, kev9b-int8-2st, warm model cache, a test
+  supervisor that restarts a rank 2 s after it exits; the systemd unit's `RestartSec=5` adds
+  about 3 s to each restart):
   - Rank 0 killed: the pipeline served again about 4 s after the kill.
   - Rank 1 killed: about 12 s. Rank 1 restarted within 3 s. Rank 0 failed its next exchange,
     answered 503 while it gave in-flight responses the 3 s grace, then exited, restarted and
