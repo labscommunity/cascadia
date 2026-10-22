@@ -1835,12 +1835,37 @@ fn build_chat_env(template_src: &str) -> Result<minijinja::Environment<'static>,
     // hits this; without the rewrite the whole template fails to parse and the
     // API silently drops to the legacy formatter.
     let src = sanitize_numeric_dot_index(template_src);
+    // transformers' `{% generation %}` / `{% endgeneration %}` (the LLaVA
+    // templates) only mark the assistant span for training masks; at
+    // inference the block renders its body as is. Minijinja has no such
+    // statement and refuses the whole template, so drop the tags.
+    let src = strip_generation_tags(&src);
 
     // add_template_owned (not add_template) so the Environment owns the source
     // and is 'static — it can then live in AppState behind an Arc.
-    env.add_template_owned("chat", src.into_owned())
+    env.add_template_owned("chat", src)
         .map_err(|e| format!("template parse: {e}"))?;
     Ok(env)
+}
+
+/// Remove transformers' `{% generation %}` and `{% endgeneration %}` tags
+/// (any whitespace-control form), keeping what sits between them.
+fn strip_generation_tags(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(start) = rest.find("{%") {
+        let Some(len) = rest[start..].find("%}") else {
+            break;
+        };
+        let inner = rest[start + 2..start + len].trim_matches(|c: char| c == '-' || c == '+');
+        out.push_str(&rest[..start]);
+        if !matches!(inner.trim(), "generation" | "endgeneration") {
+            out.push_str(&rest[start..start + len + 2]);
+        }
+        rest = &rest[start + len + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Rewrite Jinja2 numeric dot-index (`foo.0`, `bar.12`) to bracket-index
@@ -1895,6 +1920,34 @@ fn render_with_chat_env(
     reasoning_effort: Option<&str>,
     tools: Option<&[Tool]>,
 ) -> Result<String, PromptRenderError> {
+    render_chat_env_as(
+        env,
+        messages,
+        bos_token,
+        eos_token,
+        enable_thinking,
+        reasoning_effort,
+        tools,
+        false,
+    )
+}
+
+/// [`render_with_chat_env`], with each message's content handed to the
+/// template as one `{"type": "text", "text": …}` part when `content_parts`:
+/// the LLaVA templates read only typed parts (`selectattr('type', 'equalto',
+/// 'text')`), so a plain string renders an empty turn. Image placeholders are
+/// already inside the text, so no image part is needed.
+#[allow(clippy::too_many_arguments)]
+fn render_chat_env_as(
+    env: &minijinja::Environment<'static>,
+    messages: &[ChatMessage],
+    bos_token: &str,
+    eos_token: &str,
+    enable_thinking: bool,
+    reasoning_effort: Option<&str>,
+    tools: Option<&[Tool]>,
+    content_parts: bool,
+) -> Result<String, PromptRenderError> {
     use minijinja::context;
     use minijinja::value::Value;
     let tmpl = env
@@ -1903,7 +1956,12 @@ fn render_with_chat_env(
     let messages_value: Vec<Value> = messages
         .iter()
         .map(|m| {
-            let mut obj = serde_json::json!({ "role": m.role, "content": m.content });
+            let content = if content_parts {
+                serde_json::json!([{ "type": "text", "text": m.content }])
+            } else {
+                serde_json::json!(m.content)
+            };
+            let mut obj = serde_json::json!({ "role": m.role, "content": content });
             if let Some(tc) = &m.tool_calls {
                 // HF chat templates (Qwen3 etc.) iterate `tool_call.arguments | items`,
                 // expecting a JSON object; OpenAI ships `arguments` as a string. Parse it for
@@ -2067,6 +2125,18 @@ pub fn template_speaks_effort_words(
     }
 }
 
+/// Whether a render dropped every user message's text (each non-empty one
+/// is missing from it): the sign of a template that reads only typed parts.
+fn user_text_lost(messages: &[ChatMessage], rendered: &str) -> bool {
+    let mut users = messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .map(|m| m.content.trim())
+        .filter(|c| !c.is_empty())
+        .peekable();
+    users.peek().is_some() && users.all(|c| !rendered.contains(c))
+}
+
 fn render_or_fallback(
     env: Option<&minijinja::Environment<'static>>,
     messages: &[ChatMessage],
@@ -2148,7 +2218,9 @@ fn render_or_fallback(
     // The caller's own word, when it is not also the API's.
     let callers = raw.filter(|r| Some(*r) != mapped);
     let mut first = Err(PromptRenderError::Failed("no render attempted".into()));
+    let mut used = None;
     for (i, candidate) in order.iter().enumerate() {
+        used = *candidate;
         first = render_with_chat_env(
             env,
             messages,
@@ -2171,6 +2243,26 @@ fn render_or_fallback(
                 next = ?order[i + 1],
                 "chat_template rejected a reasoning_effort word; rendering again"
             );
+        }
+    }
+    // A template that reads only typed content parts renders every message
+    // empty from plain strings; render it again with the text as one part.
+    if let Ok(s) = &first {
+        if user_text_lost(messages, s) {
+            if let Ok(p) = render_chat_env_as(
+                env,
+                messages,
+                bos_token,
+                eos_token,
+                enable_thinking,
+                used,
+                tools,
+                true,
+            ) {
+                if !user_text_lost(messages, &p) {
+                    first = Ok(p);
+                }
+            }
         }
     }
     match first {
@@ -7202,6 +7294,69 @@ mod tests {
             .map(|(c, _)| *c)
             .collect();
         assert!(!cases.contains(&"system"), "rejection reported: {cases:?}");
+    }
+
+    /// llava-hf/llava-1.5-7b-hf's chat template: `{% generation %}` tags and
+    /// typed content parts only. It used to fail to parse (legacy formatter,
+    /// no role markers); a plain-string render would leave every turn empty.
+    #[test]
+    fn llava_parts_template_renders_the_messages() {
+        let tmpl = "{% for message in messages %}{% if message['role'] != 'system' %}{{ message['role'].upper() + ': '}}{% endif %}{# Render all images first #}{% for content in message['content'] | selectattr('type', 'equalto', 'image') %}{{ '<image>\n' }}{% endfor %}{# Render all text next #}{% if message['role'] != 'assistant' %}{% for content in message['content'] | selectattr('type', 'equalto', 'text') %}{{ content['text'] + ' '}}{% endfor %}{% else %}{% for content in message['content'] | selectattr('type', 'equalto', 'text') %}{% generation %}{{ content['text'] + ' '}}{% endgeneration %}{% endfor %}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ 'ASSISTANT:' }}{% endif %}";
+        let env = build_chat_env(tmpl).expect("generation tags are stripped");
+        let msg = |role: &str, content: &str| ChatMessage {
+            role: role.into(),
+            content: content.into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            parts: Vec::new(),
+        };
+        let msgs = vec![
+            msg("user", "<ov_genai_image_0>What colour is it?"),
+            msg("assistant", "Red."),
+            msg("user", "And the shape?"),
+        ];
+        let out = render_or_fallback(
+            Some(&env),
+            &msgs,
+            "",
+            "",
+            false,
+            EffortArgs {
+                mapped: None,
+                raw: None,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "USER: <ov_genai_image_0>What colour is it? ASSISTANT: Red. USER: And the shape? ASSISTANT:"
+        );
+        // A template that reads plain strings keeps the plain-string render.
+        let plain =
+            build_chat_env("{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}")
+                .unwrap();
+        let out = render_or_fallback(
+            Some(&plain),
+            &msgs[..1],
+            "",
+            "",
+            false,
+            EffortArgs {
+                mapped: None,
+                raw: None,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(out, "user: <ov_genai_image_0>What colour is it?\n");
+        assert_eq!(
+            strip_generation_tags("a{%- generation -%}b{% endgeneration %}c{% if x %}d{% endif %}"),
+            "abc{% if x %}d{% endif %}"
+        );
     }
 
     #[test]
