@@ -731,18 +731,23 @@ IRs); a restart from the cache dir served in under a minute. See
   what GenAI builds, and GenAI 2026.4.1 does not preprocess every family as Hugging Face
   does: it reads LLaVA-NeXT's grid pinpoints as (width, height), picks InternVL2's tiles
   in f32 over a fixed 1..12 tiles, and rounds Qwen's resize half away from zero. So
-  LLaVA-NeXT, InternVL2, Qwen2.5-VL and Qwen3-VL (images, and native video on the Qwen
-  types) count the smaller of the count above and a mirror of GenAI's own code (a small
-  landscape LLaVA-NeXT image is 1026 tokens in GenAI where the processor counts 1368, a
-  700x600 InternVL2 image 1280 where it counts 3328); Phi-3.5-vision, Gemma 3 and
-  Gemma 4 (images and native video) count as above, which GenAI's sources match. The
-  mirrors are checked against transcriptions of GenAI's sources over a sweep of sizes,
-  not against a running GenAI. An item GenAI's own code would refuse or fail on (an
-  aspect past 200:1 on Qwen, a strip that unpads to nothing on LLaVA-NeXT) is not sized.
-  On any other `model_type` (LLaVA-1.5, MiniCPM-V, Qwen2-VL, Qwen3.5 / 3.6 and the rest),
-  or an export whose processor configs cannot be read, the load log says media prompts
-  are not sized, and an over-window media turn still runs or fails inside GenAI (a server
-  error).
+  LLaVA-NeXT, InternVL2, Qwen2.5-VL, Qwen3-VL and Qwen3.5 / 3.6 (images, and native video
+  on the Qwen types) count the smaller of the count above and a mirror of GenAI's own code
+  (a small landscape LLaVA-NeXT image is 1026 tokens in GenAI where the processor counts
+  1368, a 700x600 InternVL2 image 1280 where it counts 3328); GenAI runs Qwen3-VL's
+  vision encoder for Qwen3.5 / 3.6 unchanged. LLaVA-NeXT-Video sizes its images as
+  LLaVA-NeXT and a native video at 144 tokens per frame (336 px views pooled 2x2);
+  LLaVA-1.5 is 576 per image whatever its size. Phi-3.5-vision, Gemma 3 and Gemma 4
+  (images and native video) count as above, which GenAI's sources match. The mirrors are
+  checked against transcriptions of GenAI's sources over a sweep of sizes, not against a
+  running GenAI. An item GenAI's own code would refuse or fail on (an aspect past 200:1
+  on Qwen, a strip that unpads to nothing on LLaVA-NeXT) is not sized. On any other
+  `model_type` (MiniCPM-V, Qwen2-VL and the rest), or an export whose processor configs
+  cannot be read, the load log says media prompts are not sized, and an over-window media
+  turn still runs or fails inside GenAI (a server error). Two 448x448 images on
+  LLaVA-NeXT or LLaVA-NeXT-Video come to about 5,900 tokens, past their 4096 window, so
+  they are refused; before LLaVA-NeXT-Video was sized, GenAI ran such a prompt past the
+  window and described the second picture wrongly.
 - Phi-3.5-vision and InternVL2: these exports carry Phi-3's RoPE frequencies as a traced
   constant, with no switch to the long factors past 4096 positions, so longer sequences
   differ from Hugging Face; ov-genai runs the same IRs. The load log says so.
