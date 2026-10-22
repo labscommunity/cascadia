@@ -1157,15 +1157,29 @@ A server that embeds the crates with its own router and engine backend serves bo
 the same code as the OSS routes, from `cascadia_api::decisions`:
 
 - `PassRunner`: one method, `run_pass(task)`, which submits a decision pass and returns that task's
-  chunk stream (a boxed stream of `Chunk`s). The OSS server implements it on its `Runner`.
+  chunk stream (a boxed stream of `Chunk`s); dropping the future or the stream must cancel the
+  engine task. Implement it with `#[async_trait::async_trait]`. The OSS server implements it on
+  its `Runner`.
+- Setup: `DecisionService::load(model_dir)`, then set `prefix_reuse` to
+  `DecisionService::prefix_reuse_for(total_ranks, prefix_cache_bytes)` as the CLI does; without it
+  a single box gets the stricter pipeline budget.
 - `evaluate_with(&DecisionContext, &DecisionRequest)`: validation, admission, encode, the prefill
   budget, prefix reuse, the second round, every pass and the error mapping, returning the answers
   and prompt tokens. The context carries the `DecisionService`, the decision permits, an optional
   dump (`DecisionDump::open`), the pass runner and optional `ApiStats`. Dropping its future
   cancels the request as a client disconnect does on the OSS server.
-- Rendering: `systemone_body` and `systemone_error` for `/v1/systemone`; `openai::parse_request`,
-  `openai::to_internal`, `openai::to_openai` and `openai_error` (on `openai_envelope`) for
-  `/v1/decisions`. Each returns a status and a JSON value, no framework response.
+- Parsing raw body bytes: `systemone_parse` and `openai_parse` read a body as the routes do once
+  the content type and size have passed. A failure carries the route's status and body:
+  `systemone_parse` gives 400 (syntax) or 422 (schema) with a `text/plain` text; `openai_parse`
+  gives an error envelope. `openai::to_internal` then maps an OpenAI request to the core's.
+- Rendering: `systemone_body` and `systemone_error` for `/v1/systemone`; `openai::to_openai`,
+  `openai_error` and `openai_rejection` (all on `openai_envelope`) for `/v1/decisions`. Each
+  returns a status and a JSON value (a string for SystemOne's parse errors), no framework response.
+- Before the body is read, the gateway owns two refusals. A content type other than JSON is 415
+  ``Expected request with `Content-Type: application/json` ``. A body over `--api-max-body-mb` is
+  413 `Failed to buffer the request body: length limit exceeded`. `/v1/systemone` sends both as
+  `text/plain`; `/v1/decisions` wraps them in `openai_envelope(status, "invalid_request_error",
+  text)`.
 
 Pipelines need no change: the pass runner submits rank-0 tasks, and how the frames travel down the
 chain is the engine's business. The codecs and their prompts are internals, not a stable interface.

@@ -2,7 +2,8 @@
 //! openai.rs) and POST /v1/systemone (Jev/SystemOne format, handler.rs), sharing one core.
 //!
 //! Embedding: a server with its own router and engine backend serves both formats through
-//! [`evaluate_with`], running passes through its own [`PassRunner`], and renders replies with
+//! [`evaluate_with`], running passes through its own [`PassRunner`]. It reads raw bodies with
+//! [`systemone_parse`] / [`openai_parse`] and renders replies with
 //! [`systemone_body`] / [`systemone_error`] or [`openai::to_openai`] / [`openai_error`]: the same
 //! code the OSS routes run, so the bodies, statuses and messages are the same. Only these and the
 //! request/response types are meant for embedders; codecs and their prompts are internals.
@@ -16,8 +17,10 @@ pub mod profile;
 pub mod pyrandom;
 pub mod schema;
 
-pub use handler::{evaluate_with, systemone_body, systemone_error, DecisionContext, PassRunner};
-pub use openai::{openai_envelope, openai_error};
+pub use handler::{
+    evaluate_with, systemone_body, systemone_error, systemone_parse, DecisionContext, PassRunner,
+};
+pub use openai::{openai_envelope, openai_error, openai_parse, openai_rejection};
 
 use std::ops::Range;
 use std::path::Path;
@@ -248,6 +251,13 @@ impl DecisionService {
             prefix_reuse: false,
             encode_slots: default_encode_slots(),
         })
+    }
+
+    /// The [`DecisionService::prefix_reuse`] the OSS server sets: the shared-prefix budget discount
+    /// needs real reuse, a single box (`total_ranks <= 1`) with the prefix cache on. Pipeline ranks
+    /// re-prefill Kev's state per question. [`DecisionService::load`] leaves it `false`.
+    pub fn prefix_reuse_for(total_ranks: u32, prefix_cache_bytes: usize) -> bool {
+        total_ranks <= 1 && prefix_cache_bytes > 0
     }
 
     /// The codec's option limits with the deployment's question cap.
