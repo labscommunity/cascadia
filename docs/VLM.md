@@ -335,6 +335,11 @@ the context (400 `context_length_exceeded`).
 | Qwen2.5-VL (7B) | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family qwen2_5_vl` |
 | Qwen3-VL (4B) | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family qwen3_vl` |
 
+On `ov-genai` a message's images go where the caller put them, except on LLaVA-NeXT
+(`model_type` `llava_next`): its chat template writes every image before the text, so
+`ov-genai` puts the image tags first there too, as `ov-runtime` does. Given the question
+first, llava-v1.6 described a picture instead of answering it.
+
 Every other engine and tree refuses images with a `400`: `ov-dist-spec` on a v5 (text)
 target, `sparse-moe`, `ov-genai` on a text-only export, any tree without a `vision`
 block. `ov-dist-spec` refuses a Gemma 4 target tree at load. Not supported:
