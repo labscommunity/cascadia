@@ -2,8 +2,10 @@
 
 Operator guide (models, export commands, flags, limits): [../VLM.md](../VLM.md).
 
-**Status:** research draft, 2026-10-14. Based on `feat/qwen35-moe-gptq-ir-builder`
-(PR #174, HEAD `9ecc2083`). Nothing here is implemented. Claims marked
+**Status:** research draft, 2026-10-14, written on `feat/qwen35-moe-gptq-ir-builder`
+(PR #174, HEAD `9ecc2083`) and kept as written; it describes the code as it was then.
+What has since been implemented, and how to use it, is in [../VLM.md](../VLM.md). The
+GPTQ builder it mentions is PR #174's, not part of this tree. Claims marked
 **[verified]** were read in this tree or in the cited upstream source; claims
 marked **[inferred]** still need checking (see [Open questions](#open-questions)).
 
