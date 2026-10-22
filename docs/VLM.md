@@ -101,7 +101,10 @@ and in `/v1/responses` OpenRouter's `{"type": "input_video", "video_url": "data:
   most `--api-max-video-frames` (default 16), spread uniformly from 0 s. Each frame enters
   the prompt where the video was, as `Frame k (t s): ` followed by one image (`Video j frame
   k (t s): ` when a request has several videos), exactly as if the caller had sent those
-  parts. Frames do not count against `--api-max-images`.
+  parts. A model that writes every image before its text (LLaVA-NeXT, on `ov-genai` and
+  `ov-runtime`) would get those labels after all the frames, so it gets one line instead:
+  `The video is shown as N frames, in order, at 0.0s, 1.0s, ... ` (`Video j is shown as
+  ...` for several). Frames do not count against `--api-max-images`.
 - Frame size: `detail: "auto"` (the default) fits each frame to
   `--api-max-video-frame-pixels` (default 448x448), `"low"` to a quarter of that (224x224,
   never more than the image low-detail budget), the smallest; `"high"` to the larger of that

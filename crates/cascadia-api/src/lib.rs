@@ -2672,11 +2672,24 @@ async fn prepare_media(
                         pieces.push((true, decode_cfg.video_tag(j)));
                     }
                     // Each frame as the caller would have sent it: a text
-                    // part naming it, then the image.
+                    // part naming it, then the image. A model that writes
+                    // its images first gets one line naming every frame
+                    // instead (the labels would all land after the images).
                     ContentPart::VideoUrl { .. } => {
                         let frames = video_frames.next().expect("frames for every video");
                         let video_no = several_videos.then_some(video_index + 1);
                         video_index += 1;
+                        if decode_cfg.images_first {
+                            let secs: Vec<f64> = frames.iter().map(|f| f.secs).collect();
+                            let note = video::frames_note(video_no, &secs);
+                            pieces.push((false, decode_cfg.text_part(note)));
+                            for frame in frames {
+                                pieces.push((true, decode_cfg.placeholder(image_index)));
+                                image_index += 1;
+                                inputs.push(frame.input);
+                            }
+                            continue;
+                        }
                         for (k, frame) in frames.into_iter().enumerate() {
                             let label = video::frame_label(video_no, k + 1, frame.secs);
                             pieces.push((false, decode_cfg.text_part(label)));

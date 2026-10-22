@@ -587,6 +587,24 @@ pub fn frame_label(video: Option<usize>, k: usize, secs: f64) -> String {
     }
 }
 
+/// The one text part a video's frames get when the model writes every image
+/// before its text ([`MediaConfig::images_first`]): a per-frame label would
+/// land after all the images, away from its frame, so one line names the
+/// frames' count and times instead. `video` as in [`frame_label`].
+pub fn frames_note(video: Option<usize>, secs: &[f64]) -> String {
+    let times: Vec<String> = secs.iter().map(|s| format!("{s:.1}s")).collect();
+    let which = match video {
+        Some(j) => format!("Video {j}"),
+        None => "The video".to_string(),
+    };
+    let n = secs.len();
+    let frames = if n == 1 { "frame" } else { "frames" };
+    format!(
+        "{which} is shown as {n} {frames}, in order, at {}. ",
+        times.join(", ")
+    )
+}
+
 /// `file:` and the path: ffmpeg reads it as a local file whatever it looks
 /// like (a `C:` drive is not a protocol).
 fn file_url(file: &Path) -> OsString {
@@ -1105,6 +1123,14 @@ mod tests {
         assert_eq!(Plan::new(&probe(3.0, 320, 240), None, &fast).frames, 6);
         assert_eq!(frame_label(None, 2, 1.04), "Frame 2 (1.0s): ");
         assert_eq!(frame_label(Some(2), 1, 0.0), "Video 2 frame 1 (0.0s): ");
+        assert_eq!(
+            frames_note(None, &[0.0, 1.04, 2.0]),
+            "The video is shown as 3 frames, in order, at 0.0s, 1.0s, 2.0s. "
+        );
+        assert_eq!(
+            frames_note(Some(2), &[0.5]),
+            "Video 2 is shown as 1 frame, in order, at 0.5s. "
+        );
     }
 
     /// A native Qwen video rounds an odd frame count up to the next pair
