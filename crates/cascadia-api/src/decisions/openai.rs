@@ -492,14 +492,30 @@ pub fn openai_error(e: &DecisionError) -> (StatusCode, serde_json::Value) {
     openai_envelope(e.status(), kind, e.to_string())
 }
 
-fn oa_envelope(status: StatusCode, kind: &str, message: String) -> Response {
-    let (status, body) = openai_envelope(status, kind, message);
+/// A body the OSS route's `Json` extractor rejected (content type, body size, JSON syntax), as
+/// the route returns it: the rejection's own status and text in [`openai_envelope`].
+pub fn openai_rejection(r: &JsonRejection) -> (StatusCode, serde_json::Value) {
+    openai_envelope(r.status(), "invalid_request_error", r.body_text())
+}
+
+/// The `/v1/decisions` request from the raw body, exactly as the OSS route reads it once the
+/// content type and body size have passed (the extractor's JSON read, then [`parse_request`]);
+/// on failure, the status and envelope the route returns. The 415 and 413 the route sends before
+/// reading the body are the embedder's own (see docs/decisions.md, "Embedding the decision core").
+pub fn openai_parse(body: &[u8]) -> Result<OaRequest, (StatusCode, serde_json::Value)> {
+    let raw = match Json::<Box<serde_json::value::RawValue>>::from_bytes(body) {
+        Ok(Json(raw)) => raw,
+        Err(r) => return Err(openai_rejection(&r)),
+    };
+    parse_request(raw.get()).map_err(|e| openai_error(&e))
+}
+
+fn oa_response((status, body): (StatusCode, serde_json::Value)) -> Response {
     (status, Json(body)).into_response()
 }
 
 fn oa_err(e: DecisionError) -> Response {
-    let (status, body) = openai_error(&e);
-    (status, Json(body)).into_response()
+    oa_response(openai_error(&e))
 }
 
 /// How much of a caller's unknown content-part or question `type` an error message echoes, in
@@ -583,7 +599,7 @@ pub async fn decide(
 ) -> Response {
     let raw = match body {
         Ok(Json(raw)) => raw,
-        Err(r) => return oa_envelope(r.status(), "invalid_request_error", r.body_text()),
+        Err(r) => return oa_response(openai_rejection(&r)),
     };
     let r = match parse_request(raw.get()) {
         Ok(r) => r,
