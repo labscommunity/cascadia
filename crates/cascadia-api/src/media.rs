@@ -45,6 +45,14 @@ pub struct MediaConfig {
     /// order, as LLaVA-NeXT's processor template does (`<image>\n` per image,
     /// then the text parts back to back).
     pub images_first: bool,
+    /// Write a message laid out as text then media (a question, then images
+    /// or a video) media first, each frame keeping its label; a message with
+    /// text between or after its media keeps its order. Phi-4-multimodal
+    /// under GenAI 2026.4.1 degenerates ("blue blue blue ...") on a question
+    /// written before two or more images, and answers it after them, as its
+    /// processor's examples write it; GenAI's own Python pipeline does the
+    /// same, so this is the model's layout, not a Cascadia fault.
+    pub text_after_media: bool,
     /// Images allowed in one request. A video's frames do not count
     /// against it ([`MediaConfig::max_video_frames`] bounds those).
     pub max_images: usize,
@@ -245,6 +253,13 @@ const STAGED_NATIVE_VIDEO: &[(&str, &str, usize, u32)] = &[
 /// described the picture instead of answering it.
 const GENAI_IMAGES_FIRST: &[&str] = &["llava", "llava_next", "llava_next_video"];
 
+/// The export `model_type`s whose question goes after the message's media
+/// ([`MediaConfig::text_after_media`]). Phi-4-multimodal, asked about a
+/// video's two frames through GenAI 2026.4.1 (its Python pipeline too):
+/// question first gave "red square square square ...", frames labelled and
+/// the question last named both shapes and colours right.
+const GENAI_TEXT_AFTER_MEDIA: &[&str] = &["phi4mm"];
+
 /// The video tag HF's Qwen chat templates render.
 const QWEN_VIDEO_TAG: &str = "<|vision_start|><|video_pad|><|vision_end|>";
 
@@ -283,6 +298,7 @@ impl MediaConfig {
             reserved_text: genai_reserved_text(model_type),
             trim_text_parts: false,
             images_first: model_type.is_some_and(|t| GENAI_IMAGES_FIRST.contains(&t)),
+            text_after_media: model_type.is_some_and(|t| GENAI_TEXT_AFTER_MEDIA.contains(&t)),
             max_images: 8,
             // 1024x1024: about 1000 image tokens on Qwen3.5.
             max_image_pixels: 1 << 20,
@@ -448,14 +464,25 @@ impl MediaConfig {
     }
 
     /// A message's content once its parts are joined: back to back in order,
-    /// or (`images_first`) every image tag first, then the text parts. Each
-    /// part is `(is_image, text)`.
-    pub fn join_parts(&self, parts: Vec<(bool, String)>) -> String {
-        if !self.images_first {
-            return parts.into_iter().map(|(_, t)| t).collect();
+    /// (`images_first`) every image tag first, then the text parts, or
+    /// (`text_after_media`) a message written as text then media turned
+    /// round, media first; a message with text of its own between or after
+    /// its media keeps its order (the caller laid it out). Each part is
+    /// `(is_media, text)`; a video frame's label counts as media, so it stays
+    /// with its frame.
+    pub fn join_parts(&self, mut parts: Vec<(bool, String)>) -> String {
+        if self.images_first {
+            let (images, texts): (Vec<_>, Vec<_>) = parts.into_iter().partition(|(img, _)| *img);
+            return images.into_iter().chain(texts).map(|(_, t)| t).collect();
         }
-        let (images, texts): (Vec<_>, Vec<_>) = parts.into_iter().partition(|(img, _)| *img);
-        images.into_iter().chain(texts).map(|(_, t)| t).collect()
+        if self.text_after_media {
+            if let Some(first) = parts.iter().position(|(media, _)| *media) {
+                if parts[first..].iter().all(|(media, _)| *media) {
+                    parts.rotate_left(first);
+                }
+            }
+        }
+        parts.into_iter().map(|(_, t)| t).collect()
     }
 
     /// One text part of a message with images, as it enters the prompt.
@@ -1788,6 +1815,48 @@ mod tests {
                 "Q<ov_genai_image_0><ov_genai_image_1>"
             );
         }
+    }
+
+    /// ov-genai on Phi-4-multimodal moves a question written before the
+    /// media after it: a video's labelled frames come first, each label with
+    /// its frame; a caller's own interleaved layout is kept as sent.
+    #[test]
+    fn ov_genai_phi4mm_writes_the_question_after_the_media() {
+        let c = MediaConfig::ov_genai(Some("phi4mm"));
+        let video = vec![
+            (false, "Q".to_string()),
+            (true, "Frame 1 (0.0s): ".to_string()),
+            (true, c.placeholder(0)),
+            (true, "Frame 2 (2.0s): ".to_string()),
+            (true, c.placeholder(1)),
+        ];
+        assert_eq!(
+            c.join_parts(video),
+            "Frame 1 (0.0s): <ov_genai_image_0>Frame 2 (2.0s): <ov_genai_image_1>Q"
+        );
+        let images = vec![
+            (false, "Q".to_string()),
+            (true, c.placeholder(0)),
+            (true, c.placeholder(1)),
+        ];
+        assert_eq!(
+            c.join_parts(images),
+            "<ov_genai_image_0><ov_genai_image_1>Q"
+        );
+        let labelled = vec![
+            (false, "First:".to_string()),
+            (true, c.placeholder(0)),
+            (false, "Second:".to_string()),
+            (true, c.placeholder(1)),
+            (false, "Compare.".to_string()),
+        ];
+        assert_eq!(
+            c.join_parts(labelled),
+            "First:<ov_genai_image_0>Second:<ov_genai_image_1>Compare.",
+            "the caller's layout is kept"
+        );
+        assert_eq!(c.join_parts(vec![(false, "hi".into())]), "hi", "text only");
+        assert!(!MediaConfig::ov_genai(Some("phi3_v")).text_after_media);
     }
 
     /// LLaVA-NeXT's processor template writes `<image>\n` per image, then the
