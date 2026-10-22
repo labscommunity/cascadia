@@ -1760,10 +1760,8 @@ mod tests {
         assert_eq!(x.reserved_in("plain text"), None);
     }
 
-    /// LLaVA-NeXT's processor template writes `<image>\n` per image, then the
-    /// text parts back to back, whatever the parts' order; HF renders
-    /// `[INST] <image>\n<image>\nA:B:Compare. [/INST]` for this message
-    /// (tests/fixtures/llava_next_vision in the OpenVINO engine crate).
+    /// ov-genai on a LLaVA-NeXT export writes the image tags first too;
+    /// other export types keep the parts' order.
     #[test]
     fn ov_genai_writes_llava_next_images_first() {
         let l = MediaConfig::ov_genai(Some("llava_next"));
@@ -1789,6 +1787,10 @@ mod tests {
         }
     }
 
+    /// LLaVA-NeXT's processor template writes `<image>\n` per image, then the
+    /// text parts back to back, whatever the parts' order; HF renders
+    /// `[INST] <image>\n<image>\nA:B:Compare. [/INST]` for this message
+    /// (tests/fixtures/llava_next_vision in the OpenVINO engine crate).
     #[test]
     fn llava_next_writes_images_first() {
         let l = MediaConfig::llava_next_native();

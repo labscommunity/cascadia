@@ -645,10 +645,10 @@ python tools/vlm_surgery/static_variant.py --tree <stateful tree> --output-dir <
   --prefill-seq 256` (sliding window 1024) and `--packed-seq 256` (one image wide). Each
   slot's region is `(context - 1) / slots`, so two images do not fit one slot of a
   two-slot 768-context tree (they are refused per request with a 400 `context_length_exceeded`); one 448x448 image
-  (286 tokens) fits. For longer slots build it `--packed-only`, as Gemma 4 below: on CPU,
+  (286 tokens) fits. For longer slots build it `--packed-only`, as Gemma 4 above: on CPU,
   `static_variant.py --context 4096 --prefill-seq 256 --shared-prefill --packed-only` and
   `packed_variant.py <stage> --slots 2 --packed-seq 256 --dynamic-seq` give two slots of
-  2047 tokens, which hold two images (550) and a native video (1117). Gemma 3 4B passed the
+  2047 tokens, which hold two images (550) and a 4-second video as frames (1117). Gemma 3 4B passed the
   SDK image and video suites on such a tree, answering as its stateful tree does.
 - On CPU/GPU the packed variant is built from the same `--shared-prefill` static tree as
   the static path, so one tree serves both.
