@@ -1,5 +1,11 @@
 //! Typed decisions over decision models (docs/decisions.md): POST /v1/decisions (OpenAI format,
 //! openai.rs) and POST /v1/systemone (Jev/SystemOne format, handler.rs), sharing one core.
+//!
+//! Embedding: a server with its own router and engine backend serves both formats through
+//! [`evaluate_with`], running passes through its own [`PassRunner`], and renders replies with
+//! [`systemone_body`] / [`systemone_error`] or [`openai::to_openai`] / [`openai_error`]: the same
+//! code the OSS routes run, so the bodies, statuses and messages are the same. Only these and the
+//! request/response types are meant for embedders; codecs and their prompts are internals.
 
 pub mod clef;
 pub mod handler;
@@ -9,6 +15,9 @@ pub mod openai;
 pub mod profile;
 pub mod pyrandom;
 pub mod schema;
+
+pub use handler::{evaluate_with, systemone_body, systemone_error, DecisionContext, PassRunner};
+pub use openai::{openai_envelope, openai_error};
 
 use std::ops::Range;
 use std::path::Path;
