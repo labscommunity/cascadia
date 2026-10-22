@@ -186,6 +186,17 @@ impl DecisionDump {
         }
     }
 
+    /// Open `path` as the OSS server opens `--decision-dump` (append, mode 0600; a symlink, a
+    /// non-regular file, a file with other hard links or another user's file is refused),
+    /// appending after what the file already holds, closing once it reaches `max_bytes` when set.
+    /// For embedders passing a dump to [`decisions::evaluate_with`]; the line format is the
+    /// tools' (docs/decisions.md), not a stable interface.
+    pub fn open(path: &std::path::Path, max_bytes: Option<u64>) -> std::io::Result<Self> {
+        let file = open_decision_dump(path)?;
+        let len = file.metadata().map_or(0, |m| m.len());
+        Ok(Self::new(Box::new(file), len, max_bytes))
+    }
+
     /// No later request is written: skip the clone and the serialization.
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(std::sync::atomic::Ordering::Acquire)
@@ -634,14 +645,10 @@ pub fn make_router_with_stats(
     stats: Arc<ApiStats>,
 ) -> Router {
     let decision_dump = cfg.decision_dump.as_ref().map(|p| {
-        let file = open_decision_dump(p)
-            .unwrap_or_else(|e| panic!("--decision-dump {}: {e}", p.display()));
-        let len = file.metadata().map_or(0, |m| m.len());
-        Arc::new(DecisionDump::new(
-            Box::new(file),
-            len,
-            cfg.decision_dump_max_bytes,
-        ))
+        Arc::new(
+            DecisionDump::open(p, cfg.decision_dump_max_bytes)
+                .unwrap_or_else(|e| panic!("--decision-dump {}: {e}", p.display())),
+        )
     });
     make_router_inner(runner, model_id, cfg, stats, decision_dump)
 }
@@ -3753,6 +3760,221 @@ mod tests {
         let status = response.status();
         let body = to_bytes(response.into_body(), 65536).await.unwrap();
         (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    /// The Kev service `make_decision_app_with` serves, for driving the core without a router.
+    fn kev_service(max_tokens: usize, max_total_tokens: usize) -> Arc<decisions::DecisionService> {
+        let codec = decisions::kev::KevCodec::new(
+            kev_test_tokenizer(),
+            decisions::profile::KevProfile { temperature: 1.0 },
+            max_tokens,
+            max_total_tokens,
+        )
+        .unwrap();
+        Arc::new(decisions::DecisionService {
+            family: decisions::profile::Family::Kev,
+            codec: Box::new(codec),
+            max_tokens,
+            max_total_tokens,
+            max_questions: 32,
+            prefix_reuse: true,
+            encode_slots: decisions::default_encode_slots(),
+        })
+    }
+
+    /// An embedder's pass runner, not the OSS `Runner`: answers every pass with the mock engine's
+    /// logits (`[0, -1, ...]`) and prompt count, or fails it, and records each pass's length.
+    struct FakePasses {
+        fail: bool,
+        prompts: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl FakePasses {
+        fn new(fail: bool) -> Self {
+            Self {
+                fail,
+                prompts: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl decisions::PassRunner for FakePasses {
+        async fn run_pass(
+            &self,
+            task: GenerationTask,
+        ) -> Result<futures::stream::BoxStream<'static, Chunk>, cascadia_engine::EngineError>
+        {
+            let d = task.decision.expect("a decision pass");
+            self.prompts.lock().unwrap().push(d.prompt_ids.len());
+            let last = if self.fail {
+                Chunk::error(task.task_id.clone(), "fake engine failure")
+            } else {
+                Chunk::final_marker(task.task_id.clone(), "")
+                    .with_prompt_tokens(d.prompt_ids.len() as u32)
+                    .with_decision_logits((0..d.head.output_len()).map(|i| -(i as f32)).collect())
+            };
+            // A non-final chunk first: the core reads the stream to its end.
+            let first = Chunk::token(task.task_id, 0, "");
+            Ok(futures::stream::iter([first, last]).boxed())
+        }
+    }
+
+    async fn evaluate_fake(
+        svc: &Arc<decisions::DecisionService>,
+        permits: usize,
+        runner: &FakePasses,
+        req: &decisions::schema::DecisionRequest,
+    ) -> Result<
+        (indexmap::IndexMap<String, decisions::schema::Answer>, u64),
+        decisions::DecisionError,
+    > {
+        let permits = Arc::new(Semaphore::new(permits));
+        let ctx = decisions::DecisionContext {
+            service: svc,
+            permits: &permits,
+            dump: None,
+            runner,
+            stats: None,
+        };
+        decisions::evaluate_with(&ctx, req).await
+    }
+
+    /// The embedder seam: `evaluate_with` on a fake pass runner (no OSS `Runner`, no stats, no
+    /// dump) answers exactly as `/v1/systemone` does on the mock engine, and `systemone_body`
+    /// renders the same bytes.
+    #[tokio::test]
+    async fn evaluate_with_on_an_embedders_pass_runner_matches_the_route() {
+        let so = r#"{"model": "m", "state": "a b", "questions": {
+            "team": {"type": "choice", "instructions": "who", "criteria": {"billing": "x", "tech": "y"}},
+            "urgent": {"type": "noul"},
+            "sev": {"type": "score", "criteria": ["lo", "mid", "hi"]}}}"#;
+        let req: decisions::schema::DecisionRequest = serde_json::from_str(so).unwrap();
+        let runner = FakePasses::new(false);
+        let (answers, input_tokens) = evaluate_fake(&kev_service(1000, 4000), 1, &runner, &req)
+            .await
+            .unwrap();
+        let prompts = runner.prompts.lock().unwrap().clone();
+        assert_eq!(prompts.len(), 3, "one Kev pass per question");
+        assert_eq!(input_tokens, prompts.iter().sum::<usize>() as u64);
+        assert_eq!(
+            answers.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["team", "urgent", "sev"]
+        );
+        // mock logits [0, -1, ...] => the first option wins
+        assert_eq!(
+            serde_json::to_value(&answers["team"]).unwrap()["choice"],
+            "billing"
+        );
+        let (status, _, text) = post_decisions(make_decision_app().await, so).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = decisions::systemone_body("mock-model", answers, input_tokens);
+        assert_eq!(serde_json::to_string(&body).unwrap(), text);
+    }
+
+    /// The rendering helpers are what the routes return, for each error class: not served (501),
+    /// capacity (503), validation (400) and an engine failure (503), in both formats.
+    #[tokio::test]
+    async fn decision_error_helpers_match_the_routes() {
+        let svc = kev_service(1000, 4000);
+        let ok = r#"{"model": "m", "state": "a b", "questions": {"u": {"type": "noul"}}}"#;
+        let ok_oa = r#"{"input": "a b", "questions": [{"type": "predicate", "name": "u", "instructions": "x"}]}"#;
+        let failing =
+            r#"{"model": "m", "state": "__engine_error__", "questions": {"u": {"type": "noul"}}}"#;
+        let failing_oa = r#"{"input": "__engine_error__", "questions": [{"type": "predicate", "name": "u", "instructions": "x"}]}"#;
+        let empty = r#"{"model": "m", "state": "a b", "questions": {}}"#;
+        let empty_oa = r#"{"input": "a b", "questions": []}"#;
+        let so = |s: &str| serde_json::from_str::<decisions::schema::DecisionRequest>(s).unwrap();
+        let oa = |s: &str| {
+            decisions::openai::to_internal(&decisions::openai::parse_request(s).unwrap())
+                .unwrap()
+                .0
+        };
+
+        // Each error as the core returns it to an embedder, on the fake runner.
+        let capacity = evaluate_fake(&svc, 0, &FakePasses::new(false), &so(ok))
+            .await
+            .unwrap_err();
+        let capacity_oa = evaluate_fake(&svc, 0, &FakePasses::new(false), &oa(ok_oa))
+            .await
+            .unwrap_err();
+        let invalid = evaluate_fake(&svc, 1, &FakePasses::new(false), &so(empty))
+            .await
+            .unwrap_err();
+        let invalid_oa = evaluate_fake(&svc, 1, &FakePasses::new(false), &oa(empty_oa))
+            .await
+            .unwrap_err();
+        let engine = evaluate_fake(&svc, 1, &FakePasses::new(true), &so(ok))
+            .await
+            .unwrap_err();
+        let engine_oa = evaluate_fake(&svc, 1, &FakePasses::new(true), &oa(ok_oa))
+            .await
+            .unwrap_err();
+        assert_eq!(capacity.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            matches!(engine, decisions::DecisionError::Engine(_)),
+            "{engine:?}"
+        );
+
+        // ... and what the routes answer for the same request.
+        let capacity_app = || async {
+            let runner = Runner::new(Box::new(MockBuilder::new()));
+            runner
+                .start(
+                    PeerLayout::single_stage(),
+                    ShardSpec::single_stage("mock-model", "CPU"),
+                )
+                .await
+                .unwrap();
+            let cfg = Config {
+                decisions: Some(kev_service(1000, 4000)),
+                max_concurrent_decisions: 0,
+                ..Config::default()
+            };
+            make_router_with_config(Arc::new(runner), "mock-model", cfg)
+        };
+        let not_served = decisions::DecisionError::NotServed;
+        let cases = [
+            (
+                make_app().await,
+                make_app().await,
+                ok,
+                ok_oa,
+                &not_served,
+                &not_served,
+            ),
+            (
+                capacity_app().await,
+                capacity_app().await,
+                ok,
+                ok_oa,
+                &capacity,
+                &capacity_oa,
+            ),
+            (
+                make_decision_app().await,
+                make_decision_app().await,
+                empty,
+                empty_oa,
+                &invalid,
+                &invalid_oa,
+            ),
+            (
+                make_decision_app().await,
+                make_decision_app().await,
+                failing,
+                failing_oa,
+                &engine,
+                &engine_oa,
+            ),
+        ];
+        for (app, app_oa, body, body_oa, e, e_oa) in cases {
+            let (status, v, _) = post_decisions(app, body).await;
+            assert_eq!(decisions::systemone_error(e), (status, v), "{body}");
+            let (status, v) = post_openai(app_oa, body_oa).await;
+            assert_eq!(decisions::openai_error(e_oa), (status, v), "{body_oa}");
+        }
     }
 
     #[tokio::test]

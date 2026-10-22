@@ -1,23 +1,77 @@
-//! The decision core shared by both wire formats (`evaluate`) and `POST /v1/systemone` (`decide`,
-//! the Jev/SystemOne format).
+//! The decision core shared by both wire formats (`evaluate_with`, behind the server's
+//! `evaluate`) and `POST /v1/systemone` (`decide`, the Jev/SystemOne format).
 
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use cascadia_engine::EngineError;
+use cascadia_runner::Runner;
+use cascadia_types::{ApiStats, Chunk, GenerationTask};
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use indexmap::IndexMap;
+use tokio::sync::Semaphore;
 
 use super::schema::{self, answer_with_legend, Answer, DecisionRequest, DecisionResponse, Usage};
-use super::DecisionError;
-use crate::AppState;
+use super::{DecisionError, DecisionService};
+use crate::{AppState, DecisionDump};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+
+/// Runs one decision pass: submits `task` (a prefill-only task whose `decision` readout is set)
+/// and returns that task's chunk stream. The OSS server runs passes through its [`Runner`];
+/// an embedder with its own backend implements this to serve decisions through
+/// [`evaluate_with`].
+///
+/// The stream is read until it ends. A chunk with `error` set fails the pass (the engine's
+/// `decision_*` reasons map to the same statuses as on the OSS server); the `is_final` chunk
+/// carries `decision_logits` and, when the engine knows it, `prompt_tokens`. Dropping the
+/// returned stream, or this future before it resolves, must cancel the task: [`evaluate_with`]
+/// drops both when its own future is dropped.
+#[async_trait::async_trait]
+pub trait PassRunner: Send + Sync {
+    async fn run_pass(
+        &self,
+        task: GenerationTask,
+    ) -> Result<BoxStream<'static, Chunk>, EngineError>;
+}
+
+/// The server's runner: [`Runner::generate_async`], whose stream cancels its task on drop.
+#[async_trait::async_trait]
+impl PassRunner for Arc<Runner> {
+    async fn run_pass(
+        &self,
+        task: GenerationTask,
+    ) -> Result<BoxStream<'static, Chunk>, EngineError> {
+        Ok(self.generate_async(task).await?.boxed())
+    }
+}
+
+/// What [`evaluate_with`] runs a request against. The OSS server builds one per request from
+/// its `AppState`; an embedder builds it from its own.
+pub struct DecisionContext<'a> {
+    /// The loaded decision model: codec, limits and whether the engine resumes shared prefixes.
+    pub service: &'a Arc<DecisionService>,
+    /// Admission: a request takes one permit before it tokenizes and keeps it until its last
+    /// pass (and any blocking encode or dump write it left behind) ends. None free is the
+    /// capacity 503; requests never wait for one.
+    pub permits: &'a Arc<Semaphore>,
+    /// `--decision-dump`: one JSON line per pass when set (see [`DecisionDump::open`]).
+    pub dump: Option<&'a Arc<DecisionDump>>,
+    /// Runs each pass, one at a time (the OSS server's [`Runner`]).
+    pub runner: &'a dyn PassRunner,
+    /// Counters the request bumps once admitted: `requests_total`, and `requests_in_flight`
+    /// (mirrored into the Prometheus in-flight gauge) while it holds its permit. `None` moves
+    /// neither; a capacity refusal is counted in `cascadia_api_rejected_total` either way.
+    pub stats: Option<&'a Arc<ApiStats>>,
+}
 
 /// What one admitted decision request holds until both its handler future and its blocking
 /// encode are finished.
 struct Held {
     _permit: tokio::sync::OwnedSemaphorePermit,
-    _inflight: crate::InFlightGuard,
+    _inflight: Option<crate::InFlightGuard>,
 }
 
 /// Sets the flag when dropped: the request future ended (finished, failed or disconnected).
@@ -29,18 +83,39 @@ impl Drop for CancelOnDrop {
     }
 }
 
-fn err(e: DecisionError) -> Response {
-    (
-        e.status(),
-        Json(serde_json::json!({ "error": e.to_string() })),
-    )
-        .into_response()
+fn err(e: &DecisionError) -> Response {
+    let (status, body) = systemone_error(e);
+    (status, Json(body)).into_response()
+}
+
+/// A `/v1/systemone` error as the OSS server returns it: the status and `{"error": message}`.
+/// Stable: these are the route's documented statuses and messages.
+pub fn systemone_error(e: &DecisionError) -> (StatusCode, serde_json::Value) {
+    (e.status(), serde_json::json!({ "error": e.to_string() }))
+}
+
+/// A `/v1/systemone` 200 body as the OSS server returns it, from [`evaluate_with`]'s answers and
+/// prompt tokens; `model` is the served model's id (the OSS server's `model_id`), not the
+/// request's.
+pub fn systemone_body(
+    model: &str,
+    answers: IndexMap<String, Answer>,
+    input_tokens: u64,
+) -> DecisionResponse {
+    DecisionResponse {
+        model: model.to_string(),
+        answers,
+        usage: Usage {
+            input_tokens,
+            output_tokens: 0,
+        },
+    }
 }
 
 /// `generate_async` failures: log the EngineError (it can carry paths, peer and OpenVINO text),
 /// return a fixed message per category. The chat handlers' `engine_error_response` echoes
 /// `err.to_string()` and must not be reused here.
-fn decision_engine_error(e: cascadia_engine::EngineError) -> DecisionError {
+fn decision_engine_error(e: EngineError) -> DecisionError {
     use cascadia_engine::EngineError as E;
     tracing::warn!(error = %e, "decision submit failed");
     match e {
@@ -87,30 +162,47 @@ fn uncacheable(passes: &[super::Pass], max_total: usize) -> DecisionError {
 /// POST /v1/systemone: the Jev/SystemOne wire format.
 pub async fn decide(State(state): State<AppState>, Json(req): Json<DecisionRequest>) -> Response {
     match evaluate(&state, &req).await {
-        Ok((answers, input_tokens)) => Json(DecisionResponse {
-            model: state.model_id.clone(),
-            answers,
-            usage: Usage {
-                input_tokens,
-                output_tokens: 0,
-            },
-        })
-        .into_response(),
-        Err(e) => err(e),
+        Ok((answers, input_tokens)) => {
+            Json(systemone_body(&state.model_id, answers, input_tokens)).into_response()
+        }
+        Err(e) => err(&e),
     }
 }
 
-/// The core both wire formats share: validate, encode, budget, run every pass, and return the
-/// answers in request order plus the prompt tokens prefilled. Errors are `DecisionError`s, so each
-/// route renders them in its own format (SystemOne `{"error": msg}`, OpenAI `{"error": {...}}`).
+/// [`evaluate_with`] on the server's state; `NotServed` for a model without `decision.json`.
 pub(crate) async fn evaluate(
     state: &AppState,
     req: &DecisionRequest,
 ) -> Result<(IndexMap<String, Answer>, u64), DecisionError> {
-    let started = std::time::Instant::now();
-    let Some(svc) = state.decisions.clone() else {
+    let Some(service) = &state.decisions else {
         return Err(DecisionError::NotServed);
     };
+    let ctx = DecisionContext {
+        service,
+        permits: &state.decision_permits,
+        dump: state.decision_dump.as_ref(),
+        runner: &state.runner,
+        stats: Some(&state.stats),
+    };
+    evaluate_with(&ctx, req).await
+}
+
+/// The core both wire formats share: validate, encode, budget, run every pass, and return the
+/// answers in request order plus the prompt tokens prefilled. Errors are `DecisionError`s, so each
+/// route renders them in its own format ([`systemone_error`], [`super::openai::openai_error`]).
+///
+/// This is the whole of what `/v1/systemone` and `/v1/decisions` do between parsing the body and
+/// rendering the reply, so an embedder calling it gets the OSS server's answers, statuses,
+/// messages, budget, dump lines and logs. Dropping the returned future (a client gone) stops the
+/// request: the running pass's task is cancelled through the [`PassRunner`]'s stream, a running
+/// encode stops between questions, and the permit is released once any blocking encode or dump
+/// write it left behind ends.
+pub async fn evaluate_with(
+    ctx: &DecisionContext<'_>,
+    req: &DecisionRequest,
+) -> Result<(IndexMap<String, Answer>, u64), DecisionError> {
+    let started = std::time::Instant::now();
+    let svc = ctx.service.clone();
     req.validate(&svc.limits())?;
     // `strategy` picks among JEV's multi-pass plans; Kev and Clef read any option count in one
     // pass and have none.
@@ -123,23 +215,24 @@ pub(crate) async fn evaluate(
     // Take the permit BEFORE tokenizing: encode() is CPU work proportional to the request.
     // Decisions have their own pool: they never take chat's permits, nor chat theirs.
     // Counted like chat (SEC-5): a capacity refusal, the request total and the in-flight gauge.
-    let permit = match state.decision_permits.clone().try_acquire_owned() {
+    let permit = match ctx.permits.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
             crate::count_rejected("capacity");
             return Err(DecisionError::Engine(CAPACITY.into()));
         }
     };
-    state
-        .stats
-        .requests_total
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(stats) = ctx.stats {
+        stats
+            .requests_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     // The permit (and the in-flight gauge) is shared with the blocking encode below: a client
     // disconnect drops this future but not a running `spawn_blocking` closure, so the permit is
     // released only once both are done (SEC-2). Orphaned encodes stay bounded by the permit count.
     let held = Arc::new(Held {
         _permit: permit,
-        _inflight: crate::InFlightGuard::new(state.stats.clone()),
+        _inflight: ctx.stats.map(|s| crate::InFlightGuard::new(s.clone())),
     });
     // Set when this future is dropped (client gone): the codec stops between questions.
     let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
@@ -178,12 +271,12 @@ pub(crate) async fn evaluate(
             svc.max_total_tokens
         )));
     }
-    dump_passes(state, &svc, &req, &held, &passes, 1).await;
+    dump_passes(ctx.dump, &svc, &req, &held, &passes, 1).await;
     super::mark_required_reuse(&mut passes, svc.max_total_tokens, svc.prefix_reuse);
     // Every question's per-pass probabilities, in submission order.
     let mut probs: IndexMap<String, Vec<Vec<f64>>> = IndexMap::new();
     let passes_started = std::time::Instant::now();
-    let mut input_tokens = run_passes(state, &svc, &req, &passes, &mut probs).await?;
+    let mut input_tokens = run_passes(ctx.runner, &svc, &req, &passes, &mut probs).await?;
     let mut passes_d = passes_started.elapsed();
     // Only a request that reserved tokens has a second round (a final is never empty), so every
     // other request skips this encode.
@@ -209,9 +302,9 @@ pub(crate) async fn evaluate(
                 svc.max_total_tokens
             )));
         }
-        dump_passes(state, &svc, &req, &held, &second, 2).await;
+        dump_passes(ctx.dump, &svc, &req, &held, &second, 2).await;
         let second_started = std::time::Instant::now();
-        input_tokens += run_passes(state, &svc, &req, &second, &mut probs).await?;
+        input_tokens += run_passes(ctx.runner, &svc, &req, &second, &mut probs).await?;
         passes_d += second_started.elapsed();
     }
     let mut answers = IndexMap::with_capacity(req.questions.len());
@@ -263,7 +356,7 @@ pub(crate) async fn evaluate(
 /// permit. The closure keeps the slot and the request's permit (SEC-2), so an orphaned encode
 /// keeps both until it ends.
 async fn off_executor<T: Send + 'static>(
-    svc: &Arc<super::DecisionService>,
+    svc: &Arc<DecisionService>,
     held: &Arc<Held>,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, DecisionError> {
@@ -300,14 +393,14 @@ fn check_pass_lengths(passes: &[super::Pass], max_tokens: usize) -> Result<(), D
 /// Append `passes` to `--decision-dump`, if it is open. A JEV choice pass's line also names its
 /// plan (`strategy`) and `round`, so the tools can rebuild the combination.
 async fn dump_passes(
-    state: &AppState,
-    svc: &super::DecisionService,
+    dump: Option<&Arc<DecisionDump>>,
+    svc: &DecisionService,
     req: &DecisionRequest,
     held: &Arc<Held>,
     passes: &[super::Pass],
     round: u32,
 ) {
-    let Some(dump) = state.decision_dump.clone().filter(|d| !d.is_closed()) else {
+    let Some(dump) = dump.filter(|d| !d.is_closed()).cloned() else {
         return;
     };
     let tags: Vec<Option<&'static str>> = passes
@@ -359,8 +452,8 @@ async fn dump_passes(
 /// Run `passes` one after another (the engine runs one decision pass at a time) and append
 /// each part's probabilities to its question's list. Returns the prompt tokens prefilled.
 async fn run_passes(
-    state: &AppState,
-    svc: &super::DecisionService,
+    runner: &dyn PassRunner,
+    svc: &DecisionService,
     req: &DecisionRequest,
     passes: &[super::Pass],
     probs: &mut IndexMap<String, Vec<Vec<f64>>>,
@@ -369,7 +462,7 @@ async fn run_passes(
     for pass in passes {
         let task_id = format!("dec-{}", uuid::Uuid::new_v4().simple());
         let perf_task = task_id.clone();
-        let task = cascadia_types::GenerationTask {
+        let task = GenerationTask {
             task_id,
             prompt: String::new(),
             max_tokens: 1,
@@ -384,7 +477,7 @@ async fn run_passes(
             decision: Some(pass.readout.clone()),
         };
         let started = std::time::Instant::now();
-        let mut stream = match state.runner.generate_async(task).await {
+        let mut stream = match runner.run_pass(task).await {
             Ok(s) => s,
             Err(e) => return Err(decision_engine_error(e)),
         };
