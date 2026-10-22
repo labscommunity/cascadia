@@ -11,7 +11,7 @@ Combines pipeline parallelism with speculative decoding: the **driver** holds a 
 
 ## Shard format
 
-Requires **v5 shards** (or a Pixtral / Mistral 3 VLM tree, see [Image input](#image-input-pixtral-target)) (canonical optimum-style inputs: `input_ids|hidden_states, attention_mask, position_ids, beam_idx`). v3 shards are rejected at load time. Generate via `cascadia shard` — its exporter (`tools/export_shards.py`) emits `v5_canonical_inputs` shards; see [../SHARDING.md](../SHARDING.md).
+Requires **v5 shards** (or a causal VLM tree: Pixtral / Mistral 3, Phi-3.5-vision, InternVL2, LLaVA-NeXT; see [Image input](#image-input-pixtral-target)) (canonical optimum-style inputs: `input_ids|hidden_states, attention_mask, position_ids, beam_idx`). v3 shards are rejected at load time. Generate via `cascadia shard` — its exporter (`tools/export_shards.py`) emits `v5_canonical_inputs` shards; see [../SHARDING.md](../SHARDING.md).
 
 Driver expects the full pipeline directory:
 ```text
@@ -70,8 +70,10 @@ cascadia worker --rank 0 --total 2 --engine ov-dist-spec --device GPU \
 
 ## Image input (Pixtral target)
 
-`ov-dist-spec` takes `image_url` parts when the target is a Pixtral or Mistral 3 tree
-cut by `tools/vlm_surgery/cut_vlm_lm.py --all-logits`. Only the target sees images:
+`ov-dist-spec` takes `image_url` parts when the target is a causal tree with 1-D positions
+(Pixtral or Mistral 3, Phi-3.5-vision, InternVL2, LLaVA-NeXT) cut by
+`tools/vlm_surgery/cut_vlm_lm.py --all-logits`; Gemma 3 / 4 (token types) and Qwen VL
+(M-RoPE) targets are refused at load. Only the target sees images:
 
 - **Rank 0** expands each `[IMG]` placeholder into the image's rows of `[IMG]` closed by
   `[IMG_BREAK]` / `[IMG_END]`, runs the vision encoder (CPU, cached per tenant by image

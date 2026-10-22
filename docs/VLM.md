@@ -333,6 +333,7 @@ the context (400 `context_length_exceeded`).
 | InternVL2 (Phi-3 text tower, e.g. InternVL2-4B) | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family internvl_chat` on `OpenVINO/InternVL2-4B-int4-ov` |
 | LLaVA-NeXT (llava-v1.6-mistral-7b) | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family llava_next` on `OpenVINO/llava-v1.6-mistral-7b-hf-int4-ov` |
 | Pixtral 12B target, Ministral-3-3B draft | `ov-dist-spec` | 2+ machines, stateful | `cut_vlm_lm.py --family pixtral --all-logits` for the target, `tools/vlm_surgery/make_text_draft.py` for the draft |
+| Phi-3.5-vision, InternVL2, LLaVA-NeXT targets | `ov-dist-spec` | 2+ ranks, stateful | `cut_vlm_lm.py --family phi3_v\|internvl_chat\|llava_next --all-logits`; any text draft with the target's token ids (`make_text_draft.py` on the same export works) |
 | Qwen2.5-VL (7B) | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family qwen2_5_vl` |
 | Qwen3-VL (4B) | `ov-runtime` | 1+ machines, stateful, static or packed | `tools/vlm_surgery/cut_vlm_lm.py --family qwen3_vl` |
 
@@ -359,9 +360,9 @@ block. `ov-dist-spec` refuses a Gemma 4 target tree at load. Not supported:
 - **Llama 3.2 Vision** (`mllama`), refused at export: its text tower has cross-attention.
 - **MiniCPM-V 4.7**: GenAI 2026.4.1 does not know its model type (`minicpmv4_7`) and the
   engine fails to load.
-- Images on `ov-dist-spec` for any target but Pixtral / Mistral 3 (Gemma 3, Phi-3.5-vision,
-  InternVL2, LLaVA-NeXT, Qwen2.5-VL, Qwen3-VL): such a tree is refused at load. Serve
-  these on `ov-runtime`.
+- Images on `ov-dist-spec` for Gemma 3, Gemma 4, Qwen2.5-VL and Qwen3-VL targets: such a
+  tree is refused at load (the FORWARD wire carries no token types or M-RoPE positions).
+  Serve these on `ov-runtime`.
 - Trees made with `export_shards.py` carry no vision tower (it notes when it drops one);
   cut vision trees with `tools/vlm_surgery/cut_vlm_lm.py`.
 
@@ -515,7 +516,11 @@ refuses a split that puts them elsewhere, and the features never cross the wire.
 ### Pixtral with speculative decoding (ov-dist-spec)
 
 Only the target sees images; the draft is a text model fed the prompt without its
-image ids, so it changes the acceptance rate, never the answer.
+image ids, so it changes the acceptance rate, never the answer. Any causal target with
+1-D positions works the same way: Pixtral / Mistral 3, Phi-3.5-vision, InternVL2 and
+LLaVA-NeXT (`--family phi3_v|internvl_chat|llava_next --all-logits`). A Phi-3.5-vision
+target (two stages on one box) with a draft made from the same export by
+`make_text_draft.py` passed the SDK image suite 11/11.
 The target's last stage must return logits for every position (`--all-logits`), and the
 draft must be one IR that takes `input_ids`:
 
@@ -713,6 +718,30 @@ step (9.2 tok/s total for three text requests at once; 0.46 s and 6.4 tok/s
 without the narrow decode IR). The first start compiled about 18 minutes (three
 IRs); a restart from the cache dir served in under a minute. See
 [perf/NPU_PACKED_SLOTS.md](perf/NPU_PACKED_SLOTS.md).
+
+### Serving media from your own gateway
+
+A caller that renders the chat template and builds the `GenerationTask` itself (not through
+`cascadia-api`'s HTTP server) uses the same pieces the server does:
+
+1. `cascadia_api::media_setup(MediaEngine, model_dir)`: the model's `MediaConfig` (or why it
+   serves text only), then its own limits on that config and `attach_ffmpeg` for video.
+2. `cascadia_api::prepare_media_with(config, decode_slots, messages)`: validates, fetches and
+   decodes the request's `image_url` / `video_url` parts. It returns the messages with
+   placeholders and the decoded `MediaInput`s, or a `MediaError` (`Invalid` 400, `Busy` 503,
+   `Internal` 500).
+3. Render the messages with the model's template (thinking on or off as asked), check the
+   rendered prompt with `PreparedMedia::check_placeholders`, and send the task with
+   `media = inputs` and `prompt_rendered = true` (ov-genai then skips its own template; the
+   other engines never template).
+4. Classify failures with `EngineError::is_client_error` / `http_status` at submit, and with
+   `cascadia_engine::is_client_error_reason` on a stream's error text: a client fault
+   (`invalid_request: ...`, `prompt too long: ...`, `unsupported input: ...`) is not a reason to
+   retry the request or demote the peer.
+
+Each `MediaInput` carries the SHA-256 of its decoded pixels; the engines' image caches and
+warm resume key on it together with the task's `tenant`, so set `tenant` per caller who must
+not share them.
 
 ## Limits worth knowing
 
