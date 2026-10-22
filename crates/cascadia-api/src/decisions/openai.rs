@@ -467,21 +467,39 @@ pub fn to_openai(
     }
 }
 
-/// OpenAI's error envelope, which its SDKs parse into typed errors.
-fn oa_envelope(status: StatusCode, kind: &str, message: String) -> Response {
+/// OpenAI's error envelope, which its SDKs parse into typed errors: `status` and
+/// `{"error": {"message", "type", "code": null}}`. `kind` is `invalid_request_error` for the
+/// caller's fault, `server_error` otherwise. For errors that are not a [`DecisionError`] (the
+/// OSS route wraps the framework's body rejections in it); a `DecisionError` is [`openai_error`].
+pub fn openai_envelope(
+    status: StatusCode,
+    kind: &str,
+    message: String,
+) -> (StatusCode, serde_json::Value) {
     (
         status,
-        Json(serde_json::json!({"error": {"message": message, "type": kind, "code": null}})),
+        serde_json::json!({"error": {"message": message, "type": kind, "code": null}}),
     )
-        .into_response()
 }
 
-fn oa_err(e: DecisionError) -> Response {
+/// A `/v1/decisions` error as the OSS server returns it, in [`openai_envelope`]. Stable: these
+/// are the route's documented statuses, types and messages.
+pub fn openai_error(e: &DecisionError) -> (StatusCode, serde_json::Value) {
     let kind = match e {
         DecisionError::BadRequest(_) | DecisionError::TooLong(_) => "invalid_request_error",
         DecisionError::NotServed | DecisionError::Engine(_) => "server_error",
     };
-    oa_envelope(e.status(), kind, e.to_string())
+    openai_envelope(e.status(), kind, e.to_string())
+}
+
+fn oa_envelope(status: StatusCode, kind: &str, message: String) -> Response {
+    let (status, body) = openai_envelope(status, kind, message);
+    (status, Json(body)).into_response()
+}
+
+fn oa_err(e: DecisionError) -> Response {
+    let (status, body) = openai_error(&e);
+    (status, Json(body)).into_response()
 }
 
 /// How much of a caller's unknown content-part or question `type` an error message echoes, in
