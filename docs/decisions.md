@@ -721,9 +721,14 @@ wait stopped:
 - **Mid-frame, mid-request, or on a reply with no task tag** (CAPTURE_ACK, used only with KV
   coordination), or after any other wire error on the link. Rank 0 can no longer find frame
   boundaries, so it marks the link desynced and logs one error,
-  `qwen36 pipeline link desynced after …; restart the pipeline`. Every later task, chat and
-  decisions alike, fails at once with that message, and nothing more is written to the link.
-  Restart both ranks to recover.
+  `qwen36 pipeline link desynced after …; restart the pipeline`. Nothing more is written to the
+  link. A lost link ends the same way: when rank 1 dies, rank 0's next reply fails with a wire
+  error. The desync also fails the engine with that reason, so rank 0 exits for its supervisor
+  (see [Engine failures](#engine-failures)); until it exits, every task, chat and decisions
+  alike, fails at once with `qwen36 engine failed: <the desync message>; restart the server`.
+  With the relays under restart-on-exit supervisors too, the pipeline reconnects on its own: on
+  pawan-03 (2 ranks on one host), killing rank 0 had the pipeline serving again 4.1 s later.
+  Before this, killing rank 1 left rank 0 up, desynced, and answering 503 until a manual restart.
 - **The startup handshake** (HELLO). A rank 1 that is still loading can answer after the timeout.
   The first request then fails, and the next one waits for that HELLO's reply instead of sending a
   second HELLO. In the served 2-rank topology a long load therefore costs one failed request
@@ -735,8 +740,10 @@ These guarantees are for the served 2-rank topology. In a longer chain:
 - A slow-loading rank below a middle rank makes the middle's own HELLO forward time out. The
   middle then answers rank 0 with a handshake refusal, which poisons rank 0 until restart, so
   there a long load costs a restart.
-- A middle rank drains late replies on its own downstream link by the same rules. But a desynced
-  middle cannot pass the restart message upstream, so rank 0 sees only timeouts.
+- A middle rank drains late replies on its own downstream link by the same rules. A desynced
+  middle cannot pass the restart message upstream, but it fails its engine and exits for its
+  supervisor like any relay whose engine failed (below), so rank 0 sees its link close, desyncs,
+  and exits too. The desync reason is in the middle rank's log.
 
 The wire format is unchanged, so ranks of older builds work with this one as before. Every rank
 of a chain must be built with the same features: a chain that mixes builds with and without KV
@@ -987,7 +994,8 @@ stages (on one rank, or on two), or a lower configured bound can exceed it. The 
 that task with `RESET not acked`. The protocol does not desync: acks carry the task's epoch, and
 the head skips a late one. The next task is served on the recompiled stage.
 
-A downstream rank whose engine failed (one of the cases above) does not ack the next RESET. Its step
+A downstream rank whose engine failed (one of the cases above, or a desynced downstream link of
+its own; see [Pipeline reply timeouts](#pipeline-reply-timeouts)) does not ack the next RESET. Its step
 returns a connection-fatal error, so the stage process exits for its supervisor to rebuild it.
 The head sees the socket close and fails the task at once with `qwen36 pipeline RESET not acked:
 socket closed`, instead of waiting out its reply bound on every task. The reason is in the
