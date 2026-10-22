@@ -2448,6 +2448,50 @@ fn decision_dump_target(dump: Option<&std::path::Path>, decisions_loaded: bool) 
     }
 }
 
+/// Decision models: a `decision.json` beside the shard tree turns on /v1/decisions and
+/// /v1/systemone, on the rank that serves the API (`serves_api`). Only qwen35 implements decision
+/// passes; other engines would run them as empty chats. Reads only the tree's json files, so it
+/// runs before the model load.
+fn load_decisions(
+    args: &WorkerArgs,
+    serves_api: bool,
+    prefix_cache_bytes: usize,
+) -> Option<Arc<cascadia_api::decisions::DecisionService>> {
+    if !serves_api {
+        None
+    } else if matches!(args.engine, EngineKind::Qwen36Moe) {
+        match cascadia_api::decisions::DecisionService::load(std::path::Path::new(&args.model)) {
+            Ok(Some(mut svc)) => {
+                // The shared-prefix budget discount needs real reuse: a single box with the
+                // prefix cache on. Pipeline ranks re-prefill Kev's state per question.
+                svc.prefix_reuse = args.total <= 1 && prefix_cache_bytes > 0;
+                // The values every 413 and the docs' limits table depend on. For Clef,
+                // max_tokens is the effective joint prompt cap after the head-input clamp.
+                info!(
+                    model = %args.model,
+                    family = ?svc.family,
+                    max_tokens = svc.max_tokens,
+                    max_total_tokens = svc.max_total_tokens,
+                    max_questions = svc.max_questions,
+                    prefix_reuse = svc.prefix_reuse,
+                    "decision.json found; serving /v1/decisions (OpenAI format) and /v1/systemone"
+                );
+                Some(Arc::new(svc))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!(model = %args.model, error = %e, "decision.json present but unusable; /v1/decisions disabled");
+                None
+            }
+        }
+    } else {
+        if cascadia_api::decisions::decision_json_present(std::path::Path::new(&args.model)) {
+            warn!(engine = ?args.engine, "decision.json ignored: only --engine qwen35 serves /v1/decisions");
+        }
+        None
+    }
+}
+
 async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     if args.rank >= args.total {
         return Err(anyhow!(
@@ -2560,6 +2604,22 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     };
 
     preflight_model_path(&args)?;
+    // Loaded before the model, like the sizing flags above: it reads only the tree's json files,
+    // and whether decisions are served decides the admission check below.
+    let decisions = load_decisions(&args, is_first && args.api.is_some(), prefix_cache_bytes);
+    // `CASCADIA_API_MAX_CONCURRENT`: in-flight request cap (backpressure is
+    // 503 beyond it). A multi-stream engine serves `CASCADIA_STREAMS` at
+    // once, so a client that sends that many requests at once needs the
+    // cap above it.
+    let max_concurrent_requests = api_max_concurrent(
+        std::env::var("CASCADIA_API_MAX_CONCURRENT").ok().as_deref(),
+        cascadia_api::DEFAULT_MAX_CONCURRENT,
+    );
+    check_admission_fits(
+        max_concurrent_requests,
+        args.max_decision_requests,
+        decisions.is_some(),
+    )?;
     let builder = build_builder(&args, prefix_cache_bytes)?;
     let runner = Arc::new(Runner::new(builder));
     let listen = if !is_first {
@@ -2809,37 +2869,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             chat_template.template.as_deref(),
         );
         cfg.chat_template = chat_template;
-        // Decision models: a `decision.json` beside the shard tree turns on /v1/decisions and /v1/systemone.
-        // Only qwen35 implements decision passes; other engines would run them as empty chats.
-        if matches!(args.engine, EngineKind::Qwen36Moe) {
-            match cascadia_api::decisions::DecisionService::load(std::path::Path::new(&args.model))
-            {
-                Ok(Some(mut svc)) => {
-                    // The shared-prefix budget discount needs real reuse: a single box with the
-                    // prefix cache on. Pipeline ranks re-prefill Kev's state per question.
-                    svc.prefix_reuse = args.total <= 1 && prefix_cache_bytes > 0;
-                    // The values every 413 and the docs' limits table depend on. For Clef,
-                    // max_tokens is the effective joint prompt cap after the head-input clamp.
-                    info!(
-                        model = %args.model,
-                        family = ?svc.family,
-                        max_tokens = svc.max_tokens,
-                        max_total_tokens = svc.max_total_tokens,
-                        max_questions = svc.max_questions,
-                        prefix_reuse = svc.prefix_reuse,
-                        "decision.json found; serving /v1/decisions (OpenAI format) and /v1/systemone"
-                    );
-                    cfg.decisions = Some(std::sync::Arc::new(svc));
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!(model = %args.model, error = %e, "decision.json present but unusable; /v1/decisions disabled")
-                }
-            }
-        } else if cascadia_api::decisions::decision_json_present(std::path::Path::new(&args.model))
-        {
-            warn!(engine = ?args.engine, "decision.json ignored: only --engine qwen35 serves /v1/decisions");
-        }
+        cfg.decisions = decisions;
         if let Some(p) =
             decision_dump_target(args.decision_dump.as_deref(), cfg.decisions.is_some())
         {
@@ -2859,21 +2889,9 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // forwards the structured turns + tools); the API-side render is
         // only a placeholder so tool requests are not refused here
         cfg.engine_applies_template = matches!(args.engine, EngineKind::SyclLlama);
-        // `CASCADIA_API_MAX_CONCURRENT`: in-flight request cap (backpressure is
-        // 503 beyond it). A multi-stream engine serves `CASCADIA_STREAMS` at
-        // once, so a client that sends that many requests at once needs the
-        // cap above it.
-        cfg.max_concurrent_requests = api_max_concurrent(
-            std::env::var("CASCADIA_API_MAX_CONCURRENT").ok().as_deref(),
-            cfg.max_concurrent_requests,
-        );
-        // Decision admission, separate from chat's `max_concurrent_requests` above.
+        // Chat's pool and decision admission, sized and checked before the model load.
+        cfg.max_concurrent_requests = max_concurrent_requests;
         cfg.max_concurrent_decisions = args.max_decision_requests;
-        check_admission_fits(
-            cfg.max_concurrent_requests,
-            cfg.max_concurrent_decisions,
-            cfg.decisions.is_some(),
-        )?;
         let max_concurrent = cfg.max_concurrent_requests as u64;
         // Shared live counters: the API bumps them on the chat hot path,
         // the dashboard's /api/stats reads them — same Arc, so the cluster
@@ -4395,7 +4413,10 @@ mod tests {
             assert!(
                 err.contains(&format!("CASCADIA_API_MAX_CONCURRENT ({chat})"))
                     && err.contains(&format!("--max-decision-requests ({decisions})"))
-                    && err.contains("at most 256"),
+                    && err.contains(&format!(
+                        "at most {}",
+                        cascadia_engine_openvino::dist_spec::MAX_PENDING_TASKS
+                    )),
                 "{err}"
             );
         }
@@ -4403,6 +4424,37 @@ mod tests {
         for (chat, decisions) in [(64, 193), (300, 240), (usize::MAX, 240)] {
             assert!(check_admission_fits(chat, decisions, false).is_ok());
         }
+    }
+
+    #[test]
+    fn load_decisions_serves_only_a_usable_tree_on_the_api_rank() {
+        // An unusable decision.json: the admission check must then see no decision pool.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("decision.json"), "{").unwrap();
+        let model = dir.path().to_str().unwrap();
+        let worker = |engine: &str| {
+            let cli = Cli::try_parse_from([
+                "cascadia", "worker", "--rank", "0", "--total", "1", "--engine", engine, "--model",
+                model,
+            ])
+            .expect("parse worker argv");
+            let Command::Worker(args) = cli.cmd else {
+                panic!("expected worker subcommand");
+            };
+            args
+        };
+        assert!(
+            load_decisions(&worker("qwen35"), true, 0).is_none(),
+            "unusable"
+        );
+        assert!(
+            load_decisions(&worker("qwen35"), false, 0).is_none(),
+            "not the API rank"
+        );
+        assert!(
+            load_decisions(&worker("mock"), true, 0).is_none(),
+            "not qwen35"
+        );
     }
 
     /// Parse a `cascadia shard …` argv into its `ShardArgs` (panics on a
