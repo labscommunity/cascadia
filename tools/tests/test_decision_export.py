@@ -1229,32 +1229,12 @@ def test_ir_weight_bytes_sums_the_language_model_and_embeddings_bins(tmp_path):
     assert de.ir_weight_bytes(str(tmp_path / "missing")) == 0
 
 
-@pytest.mark.parametrize("stages,swap,measured", [
-    (1, False, 8.25), (1, True, 20.3), (1, True, 20.6),  # GiB. JEV graft; Kev, Clef --weights swap
-    (8, False, 3.1), (8, True, 5.1), (8, True, 5.3),
-])
-def test_peak_estimate_covers_the_measured_peaks(monkeypatch, stages, swap, measured):
-    # pawan-01, OpenVINO 2026.4.1: exporter process-tree working set, 1 vs 8 stages. The estimate
-    # may overshoot (a refusal names --skip-memory-check) but must not undershoot by much.
+@pytest.mark.parametrize("swap,measured", [(False, 8.25), (True, 20.3), (True, 20.6)])
+def test_peak_estimate_covers_the_measured_one_stage_peaks(monkeypatch, swap, measured):
+    # pawan-01, OpenVINO 2026.4.1, GiB: JEV's graft; Kev's and Clef's --weights swap.
     monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
-    est = de.export_peak_bytes("ir", stages, swap) / GiB
-    assert measured <= est <= measured * 1.6, est
-
-
-def test_the_documented_27b_two_stage_exports_fit_a_32_gb_host(monkeypatch):
-    # Not measured by the 9B calibration: Clef 27B (--weights) at --stages 2 estimates 31.3 GiB,
-    # just under pawan-01's 31.58 GiB; JEV 27B (graft) 12.5 GiB.
-    monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_27B)
-    assert de.export_peak_bytes("ir", 2, True) / GiB == pytest.approx(31.33, abs=0.01)
-    assert de.memory_refusal("ir", 2, True, PAWAN01_RAM) is None
-    assert de.memory_refusal("ir", 2, False, PAWAN01_RAM) is None
-    assert de.memory_refusal("ir", 1, True, PAWAN01_RAM) is not None
-
-
-def test_peak_estimate_shrinks_with_the_stage_count(monkeypatch):
-    monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
-    peaks = [de.export_peak_bytes("ir", n, True) for n in (1, 2, 4, 8)]
-    assert peaks == sorted(peaks, reverse=True) and peaks[0] == int(IR_9B * 2.5)
+    est = de.export_peak_bytes("ir", swap) / GiB
+    assert measured <= est <= measured * 1.1, est
 
 
 def test_physical_ram_is_read_on_this_machine():
@@ -1264,13 +1244,14 @@ def test_physical_ram_is_read_on_this_machine():
 
 def test_memory_refusal_names_the_estimate_the_ram_and_the_fallback(monkeypatch):
     monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
-    why = de.memory_refusal("ir", 1, True, 16 * GiB)
-    assert why.startswith("the export needs about 20.9 GiB of RAM at --stages 1 (the base IR's 8.3 GiB "
-                          "of int8 weights, x2.5 for the --weights swap), but this machine has 16.0 GiB")
-    assert "--stages 8" in why and "--skip-memory-check" in why
-    assert de.memory_refusal("ir", 1, True, PAWAN01_RAM) is None
-    assert de.memory_refusal("ir", 1, False, 16 * GiB) is None  # JEV's graft: about 8.3 GiB
-    assert de.memory_refusal("ir", 1, True, None) is None  # RAM unknown: not refused
+    why = de.memory_refusal("ir", True, 16 * GiB)
+    assert why == ("the export needs about 20.9 GiB of RAM at --stages 1 (the base IR's 8.3 GiB of int8 "
+                   "weights, x2.5 for the --weights swap), but this machine has 16.0 GiB: export with "
+                   "--stages 8 instead (a single-box tree for a low-memory machine, one stage in memory "
+                   "at a time), or pass --skip-memory-check to try anyway")
+    assert de.memory_refusal("ir", True, PAWAN01_RAM) is None
+    assert de.memory_refusal("ir", False, 16 * GiB) is None  # JEV's graft: about 8.3 GiB
+    assert de.memory_refusal("ir", True, None) is None  # RAM unknown: not refused
 
 
 def _clef(monkeypatch):
@@ -1278,7 +1259,7 @@ def _clef(monkeypatch):
                         lambda cd, out, max_tokens=None: de._write(out, {"family": "clef"}, {"kind": "joint"}))
 
 
-def test_cli_refuses_an_export_larger_than_ram_before_any_write(cli, monkeypatch, capsys):
+def test_cli_refuses_a_one_stage_export_larger_than_ram_before_any_write(cli, monkeypatch, capsys):
     run, calls, base, tmp = cli
     monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
     monkeypatch.setattr(de, "physical_ram_bytes", lambda: int(16 * GiB))
@@ -1315,15 +1296,16 @@ def test_cli_skip_memory_check_overrides_the_refusal(cli, monkeypatch):
     assert a[2] == 1
 
 
-@pytest.mark.parametrize("stages", [2, 3, 8])
-def test_cli_stages_n_reaches_run_export_and_shrinks_the_estimate(cli, monkeypatch, stages):
-    # A pipeline passes one stage per rank, and --stages 8 is the low-memory single box: both
-    # unchanged, and each fits where the 1-stage export (20.9 GiB) does not.
+@pytest.mark.parametrize("stages", [2, 8])
+def test_cli_multi_stage_exports_are_never_checked(cli, monkeypatch, stages):
+    # A pipeline passes one stage per rank and --stages 8 is the low-memory single box: neither is
+    # checked (only 1-stage peaks were measured), even where the 1-stage estimate would refuse.
     run, calls, base, tmp = cli
     _clef(monkeypatch)
-    monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
-    monkeypatch.setattr(de, "physical_ram_bytes", lambda: int(16 * GiB))
-    run("clef", "--base-ir", str(base), "--clef-dir", "C", "--out", str(tmp / "t"), "--stages", str(stages))
+    monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_27B)
+    monkeypatch.setattr(de, "physical_ram_bytes", lambda: pytest.fail("RAM read for a multi-stage export"))
+    run("clef", "--base-ir", str(base), "--clef-dir", "C", "--out", str(tmp / "t"), "--stages", str(stages),
+        *(["--layer-split", "4"] if stages == 2 else []))
     (_, a, _, _), = calls
     assert a[2] == stages
 
@@ -1344,62 +1326,3 @@ def test_cli_stages_must_be_positive(cli, capsys, value):
     with pytest.raises(SystemExit) as e:
         run("clef", "--base-ir", str(base), "--clef-dir", "C", "--out", str(tmp / "t"), "--stages", value)
     assert e.value.code == 2 and "--stages" in capsys.readouterr().err and calls == []
-
-
-# Fix round 1: no --stages 8 advice at 8 or more stages; an uneven --layer-split is sized by its
-# largest stage.
-
-def _ir_with_layers(tmp_path, layers=32):
-    ir = tmp_path / "ir"
-    ir.mkdir()
-    (ir / "config.json").write_text(json.dumps({"text_config": {"num_hidden_layers": layers}}))
-    return str(ir)
-
-
-@pytest.mark.parametrize("stages", [8, 16])
-def test_refusal_at_8_or_more_stages_does_not_suggest_stages_8(monkeypatch, stages):
-    monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
-    why = de.memory_refusal("ir", stages, True, 4 * GiB)
-    assert why.startswith(f"the export needs about 7.9 GiB of RAM at --stages {stages} ")
-    fix = why.split("GiB: ", 1)[1]
-    assert "--stages 8" not in fix
-    assert f"more stages than {stages}" in fix and "--skip-memory-check" in why
-
-
-def test_refusal_below_8_stages_suggests_stages_8(monkeypatch):
-    monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
-    assert "export with --stages 8 instead" in de.memory_refusal("ir", 2, True, 4 * GiB)
-
-
-def test_largest_stage_share_follows_the_layer_split(tmp_path):
-    ir = _ir_with_layers(tmp_path)
-    assert de.largest_stage_share(ir, 2) == 0.5
-    assert de.largest_stage_share(ir, 2, "24") == 0.75  # layers 0-23 | 24-31
-    assert de.largest_stage_share(ir, 8, "4,8,12,16,20,24,28") == 0.125
-    assert de.largest_stage_share(ir, 3) == 12 / 32  # 10 + 10 + 12: the last stage takes the rest
-    # No config.json or an invalid split: 1/N (run_export refuses a bad split itself)
-    assert de.largest_stage_share(str(tmp_path / "none"), 4) == 0.25
-    assert de.largest_stage_share(ir, 2, "40") == 0.5
-
-
-def test_uneven_layer_split_is_estimated_from_its_largest_stage(tmp_path, monkeypatch):
-    ir = _ir_with_layers(tmp_path)
-    monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
-    even = de.export_peak_bytes(ir, 2, True)
-    uneven = de.export_peak_bytes(ir, 2, True, "24")
-    assert uneven == int(IR_9B * 2.5 * 0.75) and uneven > even == int(IR_9B * 2.5 * 0.5)
-    why = de.memory_refusal(ir, 2, True, 14 * GiB, "24")
-    assert why.startswith("the export needs about 15.6 GiB of RAM at --stages 2 --layer-split 24 ")
-    assert de.memory_refusal(ir, 2, True, 14 * GiB) is None  # the even split fits (10.4 GiB)
-
-
-def test_cli_passes_the_layer_split_to_the_check(cli, monkeypatch, capsys):
-    run, calls, base, tmp = cli
-    (base / "config.json").write_text(json.dumps({"text_config": {
-        "max_position_embeddings": 262144, "hidden_size": 8, "num_hidden_layers": 32}}))
-    monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
-    monkeypatch.setattr(de, "physical_ram_bytes", lambda: int(14 * GiB))
-    with pytest.raises(SystemExit):
-        run("clef", "--base-ir", str(base), "--clef-dir", "C", "--out", str(tmp / "t"),
-            "--stages", "2", "--layer-split", "24")
-    assert "--layer-split 24" in capsys.readouterr().err and calls == []
