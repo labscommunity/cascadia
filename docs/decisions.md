@@ -287,7 +287,7 @@ Error messages are deliberately terse:
 | Tokens in the joint pass (Clef) | `MAX_JOINT_PROMPT` and the head's input limit | the smaller of `max_tokens`, 16,384 and 320 MiB ÷ (4 × width): 16,384 for both Clef-flash (width 4096) and Clef-27B (width 5120) |
 | Levels per score | per model family | JEV: 2 to 256; Clef: 1 to 256; Kev: 1 to 255 |
 | State tokens (Kev) | Kev's `SERVE_MAX_STATE` | 65,536, `<state>` included; only the whole pass may reach `max_tokens`. The rendered state is also capped at 8 bytes per token (524,288 bytes) before tokenizing |
-| Concurrent decision requests | `--max-decision-requests` | 16 (1 to 240), a pool separate from chat's 16; one more is a 503 |
+| Concurrent decision requests | `--max-decision-requests` | 16 (1 to 240), a pool separate from chat's (16 unless `CASCADIA_API_MAX_CONCURRENT` sets it); the two together at most 256; one more is a 503 |
 | Concurrent tokenizations | fixed | min(4, CPU cores), separate from the decision permits |
 | Request body | `--api-max-body-mb` | 1 MiB |
 
@@ -359,14 +359,17 @@ Error messages are deliberately terse:
   The flag applies to every route, chat included.
 - **A separate admission pool.** Decision requests take permits from a pool of their own, sized
   by `--max-decision-requests N` on `cascadia run` and `cascadia worker` (default 16). Chat
-  requests keep their own pool of 16. Decisions and chat never take each other's permits, so a
-  burst of decisions never uses up chat's permits, and a burst of chat never uses up the
-  decisions'. The server as a whole admits up to 16 chat + N decision requests at once: 32 by
-  default, where both used to share 16. Each one holds its body (up to `--api-max-body-mb`) and,
-  for a decision, its tokenized passes, so size memory for 16 + N. N runs from 1 to 240, and
+  requests keep their own pool of C: 16, unless the `CASCADIA_API_MAX_CONCURRENT` environment
+  variable sets it. Decisions and chat never take each other's permits, so a burst of decisions
+  never uses up chat's permits, and a burst of chat never uses up the decisions'. The server as a
+  whole admits up to C chat + N decision requests at once: 32 by default, where both used to
+  share 16. Each one holds its body (up to `--api-max-body-mb`) and, for a decision, its tokenized
+  passes, so size memory for C + N. N runs from 1 to 240, and
   anything else is a startup error that names the limit. The reason: every admitted request can
-  have a pass waiting in the engine's 256-task pending queue, and 16 + N must fit there.
-  Otherwise decisions would fill the queue and chat would get `QueueFull` 503s. A decision
+  have a pass waiting in the engine's 256-task pending queue, and C + N must fit there.
+  Otherwise decisions would fill the queue and chat would get `QueueFull` 503s. So with
+  decisions enabled, a server whose C + N exceeds 256 (a raised C with a large N) refuses to
+  start, naming both knobs. A decision
   request that finds no permit free gets 503 (`engine at capacity; retry after current requests
   complete`) at once rather than queueing. A request holds its permit until its last pass and
   tokenization have finished, even if the client disconnects first. Decision requests count in
@@ -379,9 +382,9 @@ Error messages are deliberately terse:
   evict each other's snapshots more often, and so does a burst of chat. A request whose snapshot
   was evicted stops with the capacity 503 (see above), so chat traffic can still cause decision
   503s. Raise `--max-decision-requests` together with `--prefix-cache-gb`, or keep it small.
-- **Dashboard.** `/api/stats` `max_concurrent` is chat's pool only (16), while
+- **Dashboard.** `/api/stats` `max_concurrent` is chat's pool only (C), while
   `requests_in_flight` counts chat and decision requests together. It can therefore read up to
-  16 + N against a ceiling of 16.
+  C + N against a ceiling of C.
 - **Bounded tokenizer memory.** Tokenizing a long state takes a few hundred MB of transient memory,
   so at most min(4, CPU cores) decision requests tokenize at once; the others wait their turn
   (holding their decision permit) rather than failing. Kev also refuses a state that renders to more than
