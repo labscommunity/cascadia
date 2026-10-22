@@ -1582,13 +1582,15 @@ fn vision_tree_media(
         (EngineKind::OvRuntime | EngineKind::OvDistSpec, "pixtral" | "mistral3") => {
             Some(cascadia_api::MediaConfig::pixtral_native())
         }
-        // Staged ov-runtime only: ov-dist-spec takes Pixtral targets alone.
-        (EngineKind::OvRuntime, "phi3_v") => Some(cascadia_api::MediaConfig::phi3v_native()),
-        (EngineKind::OvRuntime, "internvl_chat") => {
+        // Causal families with 1-D positions: staged ov-runtime and
+        // ov-dist-spec (whose draft stays text-only) alike.
+        (EngineKind::OvRuntime | EngineKind::OvDistSpec, "phi3_v") => {
+            Some(cascadia_api::MediaConfig::phi3v_native())
+        }
+        (EngineKind::OvRuntime | EngineKind::OvDistSpec, "internvl_chat") => {
             Some(cascadia_api::MediaConfig::internvl_native())
         }
-        // ov-dist-spec refuses a LLaVA-NeXT target at load.
-        (EngineKind::OvRuntime, "llava_next") => {
+        (EngineKind::OvRuntime | EngineKind::OvDistSpec, "llava_next") => {
             Some(cascadia_api::MediaConfig::llava_next_native())
         }
         // Qwen2.5-VL / Qwen3-VL: Qwen's native tags, as the staged qwen35
@@ -2651,8 +2653,9 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // rank that serves this API) and take Qwen's native tag.
         // `ov-runtime` serves images on a Gemma 4 vision tree (a `vision` block
         // in pipeline_config.json; rank 0 encodes them) with Gemma's own tag.
-        // `ov-dist-spec` serves them on a Pixtral / Mistral 3 target tree
-        // (cut_vlm_lm.py --all-logits): rank 0 encodes, the draft stays text.
+        // `ov-dist-spec` serves them on a causal 1-D-position target tree
+        // (Pixtral / Mistral 3, Phi-3.5-vision, InternVL2, LLaVA-NeXT; cut
+        // with cut_vlm_lm.py --all-logits): rank 0 encodes, the draft stays text.
         let has_vision = std::path::Path::new(&args.model)
             .join("openvino_vision_embeddings_model.xml")
             .exists();
@@ -4015,8 +4018,20 @@ mod tests {
             tag(EngineKind::OvRuntime, "internvl_chat").as_deref(),
             Some("<img><IMG_CONTEXT></img>\n")
         );
-        assert_eq!(tag(EngineKind::OvDistSpec, "phi3_v"), None);
-        assert_eq!(tag(EngineKind::OvDistSpec, "internvl_chat"), None);
+        // dist-spec takes the causal 1-D-position families too.
+        assert_eq!(
+            tag(EngineKind::OvDistSpec, "phi3_v").as_deref(),
+            Some("<|image_{n}|>\n")
+        );
+        assert_eq!(
+            tag(EngineKind::OvDistSpec, "internvl_chat").as_deref(),
+            Some("<img><IMG_CONTEXT></img>\n")
+        );
+        assert_eq!(
+            tag(EngineKind::OvDistSpec, "llava_next"),
+            tag(EngineKind::OvRuntime, "llava_next")
+        );
+        assert!(tag(EngineKind::OvDistSpec, "llava_next").is_some());
         assert_eq!(
             tag(EngineKind::OvRuntime, "gemma3").as_deref(),
             Some("<start_of_image>")
@@ -4043,7 +4058,6 @@ mod tests {
             tag(EngineKind::OvRuntime, "llava_next").as_deref(),
             Some("<image>\n")
         );
-        assert_eq!(tag(EngineKind::OvDistSpec, "llava_next"), None);
         // Native video: the ov-runtime Qwen VL trees and Gemma 4 trees on
         // either engine, behind Gemma 4's own `<|video|>`.
         let native = |e, f| vision_tree_media(e, f, true).is_some_and(|m| m.native_video);

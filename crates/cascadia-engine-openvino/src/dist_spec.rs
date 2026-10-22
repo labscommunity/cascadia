@@ -329,6 +329,26 @@ fn draft_prompt_ids(ids: &[i64], image_ids: &[i64]) -> Vec<i64> {
         .collect()
 }
 
+/// The target's prompt ids: on an image turn the vision family's own layout
+/// ([`crate::runtime::Frontend::encode_prompt`]: Phi-3.5-vision tokenizes each
+/// chunk between its `<|image_N|>` tags with its BOS), else the prompt encoded
+/// whole without special tokens (the template writes them).
+fn target_prompt_ids(
+    tok: &Tokenizer,
+    vision: Option<&crate::runtime::VisionFirst>,
+    task: &GenerationTask,
+) -> Result<Vec<i64>, String> {
+    match vision {
+        Some(v) if !task.media.is_empty() => v
+            .frontend
+            .encode_prompt(tok, &v.frontend.prompt_text(&task.prompt, &task.media)),
+        _ => tok
+            .encode(task.prompt.as_str(), false)
+            .map(|e| e.get_ids().iter().map(|&u| i64::from(u)).collect())
+            .map_err(|e| format!("tokenizer encode: {e}")),
+    }
+}
+
 /// The `vocab_size` in `dir/config.json` (top level or `text_config`).
 fn config_vocab(dir: &std::path::Path) -> Option<usize> {
     let v: serde_json::Value =
@@ -1815,10 +1835,8 @@ impl Engine for OvDistSpecEngine {
         // before anything runs. An image turn is sized from its images'
         // dimensions (their token grids), before any image is encoded.
         if let Some(max) = self.max_ctx {
-            let n = self
-                .tokenizer
-                .encode(task.prompt.as_str(), false)
-                .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?
+            let n = target_prompt_ids(&self.tokenizer, self.target.vision.as_ref(), &task)
+                .map_err(EngineError::Backend)?
                 .len()
                 + task.resume_ids().map_or(0, <[i32]>::len);
             let n = match self.target.vision.as_ref() {
@@ -1877,16 +1895,16 @@ impl Engine for OvDistSpecEngine {
                 return Ok(Vec::new());
             }
             let task = self.pending.remove(0);
-            let enc = match self.tokenizer.encode(task.prompt.clone(), false) {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!(error = %e, "tokenize failed");
-                    let task_id = task.task_id.clone();
-                    let c = Chunk::error(task.task_id, format!("tokenize failed: {e}"));
-                    return Ok(vec![(task_id, c)]);
-                }
-            };
-            let mut prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
+            let mut prompt_ids =
+                match target_prompt_ids(&self.tokenizer, self.target.vision.as_ref(), &task) {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        warn!(error = %e, "tokenize failed");
+                        let task_id = task.task_id.clone();
+                        let c = Chunk::error(task.task_id, format!("tokenize failed: {e}"));
+                        return Ok(vec![(task_id, c)]);
+                    }
+                };
             // Option B forced-prefix resume: append the already-emitted assistant
             // tokens after the rendered prompt (concat, not replace) — flows into
             // BOTH the draft and target prefill via start_task's shared feed_ids.
@@ -2544,15 +2562,18 @@ impl Builder for OvDistSpecBuilder {
         }
         if let Some(v) = pipeline_cfg.vision.as_ref() {
             let family = crate::runtime::vision_family(v, pipeline_cfg.export_version.as_deref())?;
-            // The FORWARD wire carries hidden states and the mask only, and the
-            // draft reads the prompt as plain ids: families that attend
-            // bidirectionally inside an image (token_type_ids) cannot ride it.
-            if family != crate::runtime::VisionFamily::Pixtral || v.token_type_ids.unwrap_or(false)
-            {
+            // The FORWARD wire carries hidden states and the mask only, every
+            // rank counts 1-D positions, and the draft reads the prompt as plain
+            // ids: only causal families with 1-D positions ride it. Families that
+            // attend bidirectionally inside an image (token_type_ids: Gemma 3/4)
+            // or take M-RoPE positions (Qwen VL) cannot.
+            use crate::runtime::VisionFamily as F;
+            let causal_1d = matches!(family, F::Pixtral | F::Phi3V | F::InternVL | F::LlavaNext);
+            if !causal_1d || v.token_type_ids.unwrap_or(false) {
                 return Err(EngineError::ShardRejected(format!(
-                    "ov-dist-spec takes a VLM target only for Pixtral / Mistral 3 trees \
-                     (tools/vlm_surgery/cut_vlm_lm.py --family pixtral|mistral3); this tree's \
-                     vision family is {family:?}{}",
+                    "ov-dist-spec takes a VLM target only for causal 1-D-position trees \
+                     (tools/vlm_surgery/cut_vlm_lm.py --family pixtral|mistral3|phi3_v|\
+                     internvl_chat|llava_next); this tree's vision family is {family:?}{}",
                     if v.token_type_ids.unwrap_or(false) {
                         " with token_type_ids"
                     } else {
