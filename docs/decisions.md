@@ -9,8 +9,8 @@ it carries a `decision.json` next to the shard tree:
 cascadia run /models/kev-9b-int8 --engine qwen35 --device CPU --api 127.0.0.1:8000
 ```
 
-The server logs `decision.json found; serving /v1/decisions (OpenAI format) and /v1/systemone` and
-exposes two routes over the same core:
+The server logs `decision.json loaded; /v1/decisions (OpenAI format) and /v1/systemone will be
+served` before the model load, and once the API is up it exposes two routes over the same core:
 
 | Route | Wire format |
 |---|---|
