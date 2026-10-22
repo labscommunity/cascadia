@@ -241,7 +241,7 @@ struct StageConfig {
     #[serde(default)]
     packed_context: Option<u32>,
     /// Mask ports of a packed IR built from several mask producers
-    /// (`tools/packed_variant.py`, Gemma 4): port name -> `full_attention` or
+    /// (`tools/packed_variant.py`, Gemma 4 and Gemma 3): port name -> `full_attention` or
     /// `sliding_attention`. Absent = the one full-attention `attn_mask_4d`.
     #[serde(default)]
     packed_masks: Option<std::collections::BTreeMap<String, String>>,
@@ -286,7 +286,7 @@ struct StageConfig {
     /// `vision.mrope_rows`.
     #[serde(default)]
     position_rows: Option<u32>,
-    /// `tools/vlm_surgery/static_variant.py --packed-only` (Gemma 4): the KV
+    /// `tools/vlm_surgery/static_variant.py --packed-only` (Gemma 4, Gemma 3): the KV
     /// ring runs past the sliding window, which the static IR masks by ring
     /// index, so only the packed IR (host-built sliding mask) serves it
     /// correctly. Loading it without `--packed-slots` is refused.
@@ -563,7 +563,7 @@ fn packed_width_error(
 }
 
 /// Refuse a prompt holding an image wider than one packed inference: its rows
-/// attend to each other both ways (Gemma 4), so the image must sit whole in
+/// attend to each other both ways (Gemma 4, Gemma 3), so the image must sit whole in
 /// one inference of `packed_seq` rows, the packed analogue of the static
 /// path's `image_safe_take` refusal.
 fn packed_image_too_wide(
@@ -594,7 +594,7 @@ fn packed_image_too_wide(
 /// `front` end). Returns the served ids and the encoded rows (None without
 /// media).
 ///
-/// On a tree whose masks open image blocks (`image_blocks`, Gemma 4) a prompt
+/// On a tree whose masks open image blocks (`image_blocks`, Gemma 4 and Gemma 3) a prompt
 /// without media must not hold the image soft token: typed as text (e.g. a
 /// `/v1/completions` prompt of literal `<|image|>`), its run would be masked
 /// as an image and could be wider than any packed inference.
